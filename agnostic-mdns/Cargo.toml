@@ -60,7 +60,7 @@ rustix = { version = "1", features = ["system", "net"] }
 
 [target.'cfg(windows)'.dependencies]
 hostname = "0.4"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 paste = "1"
