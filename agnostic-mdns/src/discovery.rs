@@ -41,6 +41,11 @@ use crate::{Endpoint, QueryEvent, error::StartQueryError, query::Query};
 /// or the in-flight sub-query set without bound.
 pub const DEFAULT_MAX_ENTRIES: usize = 64;
 
+/// Cap on the addresses kept per host per family (and per instance), so a
+/// responder flooding distinct A/AAAA records for one host cannot grow the
+/// address vectors (in the host cache or any builder) without bound.
+const MAX_ADDRS_PER_HOST: usize = 16;
+
 /// A resolved DNS-SD service instance.
 ///
 /// Produced by [`Lookup::next`] once the instance's SRV (host + port), TXT, and
@@ -181,6 +186,7 @@ struct Tagged {
 
 /// A follow-up query the driver should launch as a result of feeding the
 /// [`Resolver`] an answer.
+#[derive(Clone)]
 struct Start {
   name: Name,
   step: Step,
@@ -310,18 +316,14 @@ impl Resolver {
       b.port = port;
       if let Some(addrs) = cached {
         for &a in &addrs.ipv4 {
-          if !b.ipv4.contains(&a) {
-            b.ipv4.push(a);
-          }
+          push_capped(&mut b.ipv4, a);
         }
         for &a in &addrs.ipv6 {
-          if !b.ipv6.contains(&a) {
-            b.ipv6.push(a);
-          }
+          push_capped(&mut b.ipv6, a);
         }
       }
     }
-    self.maybe_emit(inst_key);
+    self.try_emit(inst_key, false);
     if self.hosts_queried.insert(host_key.clone()) {
       vec![
         Start {
@@ -342,25 +344,18 @@ impl Resolver {
     if let Some(b) = self.builders.get_mut(inst_key) {
       b.txt = Some(segs);
     }
-    self.maybe_emit(inst_key);
+    self.try_emit(inst_key, false);
   }
 
-  /// An A/AAAA answer for a host: cache it and apply it to every instance whose
-  /// SRV already pointed at that host.
+  /// An A/AAAA answer for a host: cache it (capped) and apply it to every
+  /// instance whose SRV already pointed at that host. A newly-added address may
+  /// re-emit an already-surfaced instance with the fuller address set.
   fn on_addr(&mut self, host_key: &str, addr: IpAddr) {
     let cache = self.host_addrs.entry(host_key.to_owned()).or_default();
     match addr {
-      IpAddr::V4(a) => {
-        if !cache.ipv4.contains(&a) {
-          cache.ipv4.push(a);
-        }
-      }
-      IpAddr::V6(a) => {
-        if !cache.ipv6.contains(&a) {
-          cache.ipv6.push(a);
-        }
-      }
-    }
+      IpAddr::V4(a) => push_capped(&mut cache.ipv4, a),
+      IpAddr::V6(a) => push_capped(&mut cache.ipv6, a),
+    };
     let keys: Vec<String> = self
       .builders
       .iter()
@@ -368,29 +363,34 @@ impl Resolver {
       .map(|(k, _)| k.clone())
       .collect();
     for k in keys {
-      if let Some(b) = self.builders.get_mut(&k) {
-        match addr {
-          IpAddr::V4(a) => {
-            if !b.ipv4.contains(&a) {
-              b.ipv4.push(a);
-            }
-          }
-          IpAddr::V6(a) => {
-            if !b.ipv6.contains(&a) {
-              b.ipv6.push(a);
-            }
-          }
-        }
+      let added = match self.builders.get_mut(&k) {
+        Some(b) => match addr {
+          IpAddr::V4(a) => push_capped(&mut b.ipv4, a),
+          IpAddr::V6(a) => push_capped(&mut b.ipv6, a),
+        },
+        None => false,
+      };
+      if added {
+        self.try_emit(&k, true);
       }
-      self.maybe_emit(&k);
     }
   }
 
-  fn maybe_emit(&mut self, inst_key: &str) {
+  /// Emit the instance if it is complete: the first time it completes, or — when
+  /// `allow_reemit` — again with an updated snapshot (e.g. a late AAAA after the
+  /// entry was first surfaced on its A address).
+  fn try_emit(&mut self, inst_key: &str, allow_reemit: bool) {
     if let Some(b) = self.builders.get_mut(inst_key) {
-      if !b.emitted && b.complete() {
+      if !b.complete() {
+        return;
+      }
+      if !b.emitted {
         if let Some(entry) = b.finalize() {
           b.emitted = true;
+          self.ready.push_back(entry);
+        }
+      } else if allow_reemit {
+        if let Some(entry) = b.finalize() {
           self.ready.push_back(entry);
         }
       }
@@ -411,6 +411,10 @@ pub struct Lookup {
   endpoint: Endpoint,
   streams: SelectAll<futures::stream::BoxStream<'static, Tagged>>,
   resolver: Resolver,
+  /// Follow-up queries discovered but not yet launched. Queued (rather than
+  /// launched inline) so that dropping the `next()` future mid-launch does not
+  /// lose them — they are retried on the next call.
+  pending_starts: VecDeque<Start>,
   resolve_timeout: Duration,
   unicast: bool,
 }
@@ -418,13 +422,27 @@ pub struct Lookup {
 impl Lookup {
   /// Wait for the next resolved service instance, or `None` when the lookup is
   /// finished (all queries timed out).
+  ///
+  /// An instance may be yielded more than once as additional addresses resolve
+  /// (e.g. a late AAAA after the entry was first surfaced on its A address); a
+  /// later yield for the same [`ServiceEntry::instance_name`] supersedes the
+  /// earlier one. This method is cancellation-safe: dropping the future does
+  /// not lose queued follow-up queries.
   pub async fn next(&mut self) -> Option<ServiceEntry> {
     loop {
       if let Some(entry) = self.resolver.take_ready() {
         return Some(entry);
       }
+      // Launch queued follow-ups before polling for more answers. Peek-then-pop
+      // so a cancellation mid-launch leaves the start queued for a retry rather
+      // than dropping it (a benign double-start at worst).
+      if let Some(start) = self.pending_starts.front().cloned() {
+        self.launch(start).await;
+        self.pending_starts.pop_front();
+        continue;
+      }
       let tagged = self.streams.next().await?;
-      self.process(tagged).await;
+      self.process(tagged);
     }
   }
 
@@ -434,7 +452,7 @@ impl Lookup {
     self.resolver.dropped
   }
 
-  async fn process(&mut self, tagged: Tagged) {
+  fn process(&mut self, tagged: Tagged) {
     let answer = match tagged.event {
       QueryEvent::Answer(a) => a,
       QueryEvent::Terminal(_) => return,
@@ -486,9 +504,7 @@ impl Lookup {
         Vec::new()
       }
     };
-    for start in starts {
-      self.launch(start).await;
-    }
+    self.pending_starts.extend(starts);
   }
 
   /// Start a resolve sub-query and fold its answers into the merged stream.
@@ -518,6 +534,7 @@ impl Endpoint {
       endpoint: self.clone(),
       streams,
       resolver: Resolver::new(param.max_entries),
+      pending_starts: VecDeque::new(),
       resolve_timeout,
       unicast: param.unicast_response,
     })
@@ -544,6 +561,16 @@ fn tagged_stream(query: Query, step: Step) -> futures::stream::BoxStream<'static
     Some((tagged, (query, step)))
   })
   .boxed()
+}
+
+/// Push `item` into `v` if it is new and `v` is under [`MAX_ADDRS_PER_HOST`].
+/// Returns `true` if it was added (so the caller can decide to (re)emit).
+fn push_capped<T: PartialEq>(v: &mut Vec<T>, item: T) -> bool {
+  if v.len() >= MAX_ADDRS_PER_HOST || v.contains(&item) {
+    return false;
+  }
+  v.push(item);
+  true
 }
 
 /// Case-fold a name to its lookup key (DNS names are case-insensitive,
@@ -716,5 +743,87 @@ mod tests {
     // TXT arrives → now complete.
     r.on_txt(&k, vec![Vec::new()]); // empty TXT (single empty segment) counts
     assert!(r.take_ready().is_some(), "complete once TXT present");
+  }
+
+  #[test]
+  fn address_fans_out_to_all_instances_on_shared_host() {
+    // Three instances share one host; the host's single A answer must complete
+    // all of them (each already had SRV + TXT).
+    let mut r = Resolver::new(16);
+    let host = Name::try_from_str("h.local.").unwrap();
+    let hk = fold(&host);
+    for label in ["i1", "i2", "i3"] {
+      let inst = Name::try_from_str(&format!("{label}._x._tcp.local.")).unwrap();
+      let k = fold(&inst);
+      r.on_ptr(inst);
+      r.on_srv(&k, host.clone(), 7000);
+      r.on_txt(&k, vec![b"k=v".to_vec()]);
+    }
+    assert!(
+      r.take_ready().is_none(),
+      "incomplete until an address arrives"
+    );
+    r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+    let mut emitted = HashSet::new();
+    while let Some(e) = r.take_ready() {
+      assert_eq!(e.ipv4_addresses(), [Ipv4Addr::new(192, 0, 2, 1)]);
+      emitted.insert(e.instance_name().as_str().to_owned());
+    }
+    assert_eq!(emitted.len(), 3, "all three shared-host instances resolve");
+  }
+
+  #[test]
+  fn late_address_reemits_updated_entry() {
+    // An entry first surfaces on its A address; a later AAAA re-emits it with
+    // the fuller address set rather than being dropped.
+    let mut r = Resolver::new(16);
+    let inst = Name::try_from_str("i._x._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let k = fold(&inst);
+    let hk = fold(&host);
+    r.on_ptr(inst);
+    r.on_srv(&k, host, 7000);
+    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+    let first = r.take_ready().expect("first emit on A");
+    assert_eq!(first.ipv4_addresses().len(), 1);
+    assert!(first.ipv6_addresses().is_empty());
+    // Late AAAA → re-emit with both families.
+    r.on_addr(&hk, IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+    let second = r.take_ready().expect("re-emit on late AAAA");
+    assert_eq!(second.ipv4_addresses().len(), 1);
+    assert_eq!(second.ipv6_addresses().len(), 1);
+    // A duplicate address must NOT re-emit again.
+    r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+    assert!(
+      r.take_ready().is_none(),
+      "duplicate address must not re-emit"
+    );
+  }
+
+  #[test]
+  fn addresses_capped_per_host() {
+    // A responder flooding distinct A records for one host cannot grow the
+    // address vector past MAX_ADDRS_PER_HOST.
+    let mut r = Resolver::new(16);
+    let inst = Name::try_from_str("i._x._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let k = fold(&inst);
+    let hk = fold(&host);
+    r.on_ptr(inst);
+    r.on_srv(&k, host, 7000);
+    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    for i in 0..(MAX_ADDRS_PER_HOST as u32 + 8) {
+      let o = i.to_be_bytes();
+      r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(10, o[1], o[2], o[3])));
+    }
+    let mut last = None;
+    while let Some(e) = r.take_ready() {
+      last = Some(e);
+    }
+    assert_eq!(
+      last.expect("at least one emit").ipv4_addresses().len(),
+      MAX_ADDRS_PER_HOST
+    );
   }
 }

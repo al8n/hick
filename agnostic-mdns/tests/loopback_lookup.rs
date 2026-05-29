@@ -305,11 +305,16 @@ async fn loopback_browse_resolves_service_entry() {
         e.port(),
         e.ipv4_addresses()
       );
+      // Wait for an instance of our type whose A address has resolved. On
+      // loopback the responder emits both A (127.0.0.1) and AAAA (::1) over
+      // IPv4, so the first emission for an instance may be AAAA-only; a later
+      // re-emission carries the A address.
       if e
         .instance_name()
         .as_str()
         .to_ascii_lowercase()
         .ends_with(&suffix)
+        && e.ipv4_addresses().contains(&ADVERTISED_V4.into())
       {
         return Some(e);
       }
