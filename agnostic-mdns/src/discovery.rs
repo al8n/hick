@@ -46,7 +46,11 @@ use mdns_proto::{
   wire::{ARecord, AaaaRecord, NameRef, PtrRecord, ResourceType, SrvRecord, TxtRecord},
 };
 
-use crate::{Endpoint, QueryEvent, error::StartQueryError, query::Query};
+use crate::{
+  Endpoint, QueryEvent,
+  error::StartQueryError,
+  query::{DroppedHandle, Query},
+};
 
 /// Default cap on the number of distinct instances a [`Lookup`] tracks, so a
 /// chatty or hostile responder flooding PTR answers cannot grow the builder map
@@ -383,10 +387,16 @@ impl Resolver {
   }
 
   fn on_txt(&mut self, inst_key: &str, segs: Vec<Vec<u8>>) {
+    let mut changed = false;
     if let Some(b) = self.builders.get_mut(inst_key) {
+      // A TXT change to an already-surfaced instance must re-emit so the
+      // consumer sees the new metadata; a duplicate TXT must not (no spurious
+      // re-emit). First TXT flips this from `None`, driving the first emit once
+      // the instance is otherwise complete.
+      changed = b.txt.as_deref() != Some(segs.as_slice());
       b.txt = Some(segs);
     }
-    self.try_emit(inst_key, false);
+    self.try_emit(inst_key, changed);
   }
 
   /// An A/AAAA answer for a host: cache it (capped) and apply it to every
@@ -498,6 +508,11 @@ struct LookupDriver {
   endpoint: Endpoint,
   streams: SelectAll<futures::stream::BoxStream<'static, Tagged>>,
   resolver: Resolver,
+  /// Drop counter of the browse (PTR) query. Surplus instances evicted by the
+  /// PTR query's bounded answer pool before [`Resolver::on_ptr`] sees them are
+  /// counted here rather than in `resolver.dropped`; folding both into
+  /// [`Lookup::dropped`] keeps the partial-view signal complete.
+  ptr_drops: DroppedHandle,
   queue: Arc<Mutex<LookupQueue>>,
   /// Capacity-1 wakeup the consumer parks on; rung after the queue changes.
   doorbell: async_channel::Sender<()>,
@@ -532,7 +547,7 @@ impl LookupDriver {
     {
       let mut q = lock(&self.queue);
       q.done = true;
-      q.dropped = self.resolver.dropped;
+      q.dropped = self.dropped_total();
     }
     let _ = self.doorbell.try_send(());
   }
@@ -600,6 +615,13 @@ impl LookupDriver {
         Vec::new()
       }
     }
+  }
+
+  /// Total observable drops surfaced via [`Lookup::dropped`]: instances refused
+  /// by the resolver caps plus surplus PTR answers the browse query's bounded
+  /// answer pool evicted before the resolver could see them (disjoint counts).
+  fn dropped_total(&self) -> u64 {
+    self.resolver.dropped.saturating_add(self.ptr_drops.get())
   }
 
   /// Move newly-resolved entries into the shared queue and wake the consumer.
@@ -673,10 +695,11 @@ impl Lookup {
     }
   }
 
-  /// Number of discoveries dropped because a [`QueryParam`] cap was reached —
-  /// either the distinct-instance cap ([`QueryParam::with_max_entries`]) or the
-  /// distinct-host cap that bounds an SRV-target flood. A non-zero value means
-  /// the result set is a partial view.
+  /// Number of discoveries dropped because a bound was reached: the
+  /// distinct-instance cap ([`QueryParam::with_max_entries`]), the distinct-host
+  /// cap that bounds an SRV-target flood, or surplus PTR answers evicted by the
+  /// browse query's bounded answer pool before they could be tracked. A non-zero
+  /// value means the result set is a partial view.
   pub fn dropped(&self) -> u64 {
     lock(&self.queue).dropped
   }
@@ -699,6 +722,9 @@ impl Endpoint {
     // Start the browse query up front so a start failure surfaces synchronously
     // to the caller rather than vanishing inside the spawned task.
     let ptr_query = self.start_query(ptr_spec).await?;
+    // Capture the browse query's drop counter before it is moved into the
+    // merged stream, so the driver can fold its evictions into `Lookup::dropped`.
+    let ptr_drops = ptr_query.dropped_handle();
 
     let mut streams = SelectAll::new();
     streams.push(tagged_stream(ptr_query, Step::Ptr));
@@ -711,6 +737,7 @@ impl Endpoint {
       endpoint: self.clone(),
       streams,
       resolver: Resolver::new(param.max_entries),
+      ptr_drops,
       queue: Arc::clone(&queue),
       doorbell: doorbell_tx,
       cancel: cancel_rx,
@@ -1065,6 +1092,31 @@ mod tests {
       [Ipv4Addr::new(10, 0, 0, 2)],
       "stale h1 address must not survive the retarget"
     );
+  }
+
+  #[test]
+  fn txt_change_after_emit_reemits() {
+    // A TXT update after the instance was surfaced must re-emit with the new
+    // metadata (a responder may refresh TXT while the lookup is still running);
+    // a duplicate TXT must not.
+    let mut r = Resolver::new(16);
+    let inst = Name::try_from_str("i._x._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let k = fold(&inst);
+    let hk = fold(&host);
+    r.on_ptr(inst);
+    r.on_srv(&k, host, 7000);
+    r.on_txt(&k, vec![b"v=1".to_vec()]);
+    r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    let first = r.take_ready().expect("first emit");
+    assert_eq!(first.txt(), [b"v=1".to_vec()]);
+    // Changed TXT → re-emit with the new metadata.
+    r.on_txt(&k, vec![b"v=2".to_vec()]);
+    let second = r.take_ready().expect("re-emit on TXT change");
+    assert_eq!(second.txt(), [b"v=2".to_vec()]);
+    // Duplicate TXT → no re-emit.
+    r.on_txt(&k, vec![b"v=2".to_vec()]);
+    assert!(r.take_ready().is_none(), "duplicate TXT must not re-emit");
   }
 
   #[test]

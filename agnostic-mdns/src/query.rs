@@ -183,6 +183,17 @@ impl Query {
     lock(&self.mailbox).dropped
   }
 
+  /// A cheap, cloneable view of this query's dropped-answer counter that stays
+  /// valid after the `Query` is moved (e.g. into a stream adapter). Shares the
+  /// mailbox, so it reports the same count as [`Self::dropped_answers`]. Used by
+  /// the discovery layer to fold the browse query's drops into
+  /// [`crate::Lookup::dropped`].
+  pub(crate) fn dropped_handle(&self) -> DroppedHandle {
+    DroppedHandle {
+      mailbox: Arc::clone(&self.mailbox),
+    }
+  }
+
   /// Wait for the next answer or terminal. Returns `None` once the query has
   /// ended (terminal delivered) or the driver task has exited.
   ///
@@ -233,6 +244,19 @@ impl Drop for Query {
     let _ = self.cmd.try_send(Command::CancelQuery {
       handle: self.handle,
     });
+  }
+}
+
+/// A cloneable view of a query's dropped-answer counter, decoupled from the
+/// [`Query`] handle's lifetime (see [`Query::dropped_handle`]).
+pub(crate) struct DroppedHandle {
+  mailbox: Arc<Mutex<QueryMailbox>>,
+}
+
+impl DroppedHandle {
+  /// The query's current dropped-answer count.
+  pub(crate) fn get(&self) -> u64 {
+    lock(&self.mailbox).dropped
   }
 }
 
@@ -398,5 +422,24 @@ mod tests {
     let (answers, got_terminal) = consumer.await.expect("consumer task panicked");
     assert_eq!(answers, 5);
     assert!(got_terminal);
+  }
+
+  #[test]
+  fn dropped_handle_tracks_mailbox_drops() {
+    // The handle shares the mailbox, so it keeps reflecting drops after the
+    // `Query` it came from has been moved away (e.g. into a stream adapter).
+    let (mailbox, _tx, _rx) = new_mailbox();
+    let handle = DroppedHandle {
+      mailbox: Arc::clone(&mailbox),
+    };
+    assert_eq!(handle.get(), 0);
+    // Upstream (proto-cap) evictions.
+    lock(&mailbox).record_dropped(4);
+    assert_eq!(handle.get(), 4);
+    // Mailbox drop-oldest under a flood folds into the same counter.
+    for i in 0..(MAX_QUERY_EVENT_BACKLOG as u16 + 3) {
+      lock(&mailbox).push_answer(answer(i));
+    }
+    assert_eq!(handle.get(), 4 + 3);
   }
 }
