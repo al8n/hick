@@ -225,6 +225,10 @@ struct Builder {
   instance: Name,
   host: Option<Name>,
   host_key: Option<String>,
+  /// Whether an SRV record has been seen. Tracked separately from `port`
+  /// because `0` is a valid SRV port (the full `u16` range is parsed and the
+  /// registration API does not reject it), so it cannot double as a sentinel.
+  has_srv: bool,
   port: u16,
   ipv4: Vec<Ipv4Addr>,
   ipv6: Vec<Ipv6Addr>,
@@ -238,6 +242,7 @@ impl Builder {
       instance,
       host: None,
       host_key: None,
+      has_srv: false,
       port: 0,
       ipv4: Vec::new(),
       ipv6: Vec::new(),
@@ -246,9 +251,9 @@ impl Builder {
     }
   }
 
-  /// Complete once it has a port (SRV), TXT, and at least one address.
+  /// Complete once it has an SRV (host + port), TXT, and at least one address.
   fn complete(&self) -> bool {
-    self.port != 0 && self.txt.is_some() && !(self.ipv4.is_empty() && self.ipv6.is_empty())
+    self.has_srv && self.txt.is_some() && !(self.ipv4.is_empty() && self.ipv6.is_empty())
   }
 
   fn finalize(&self) -> Option<ServiceEntry> {
@@ -351,6 +356,7 @@ impl Resolver {
       // will arrive to trigger the re-emit, so without this the consumer keeps a
       // stale host/port.
       changed = host_changed || b.port != port;
+      b.has_srv = true;
       b.host = Some(host.clone());
       b.host_key = Some(host_key.clone());
       b.port = port;
@@ -632,7 +638,7 @@ impl LookupDriver {
       q.enqueue(entry);
       woke = true;
     }
-    q.dropped = self.resolver.dropped;
+    q.dropped = self.dropped_total();
     drop(q);
     if woke {
       let _ = self.doorbell.try_send(());
@@ -1092,6 +1098,25 @@ mod tests {
       [Ipv4Addr::new(10, 0, 0, 2)],
       "stale h1 address must not survive the retarget"
     );
+  }
+
+  #[test]
+  fn srv_port_zero_still_completes() {
+    // Port 0 is a valid SRV port; an instance advertising it must still surface
+    // once it has SRV (presence), TXT, and an address — `0` is not a "missing
+    // SRV" sentinel.
+    let mut r = Resolver::new(16);
+    let inst = Name::try_from_str("i._x._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let k = fold(&inst);
+    let hk = fold(&host);
+    r.on_ptr(inst);
+    r.on_srv(&k, host, 0);
+    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    let e = r.take_ready().expect("an SRV with port 0 must still complete");
+    assert_eq!(e.port(), 0);
+    assert_eq!(e.ipv4_addresses(), [Ipv4Addr::new(10, 0, 0, 1)]);
   }
 
   #[test]
