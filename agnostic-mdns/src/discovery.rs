@@ -37,7 +37,7 @@ use std::{
   collections::{HashMap, HashSet, VecDeque},
   net::{IpAddr, Ipv4Addr, Ipv6Addr},
   sync::{Arc, Mutex, MutexGuard},
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use futures::{FutureExt, StreamExt, pin_mut, select_biased, stream::SelectAll};
@@ -784,16 +784,22 @@ impl Endpoint {
     instance: Name,
     timeout: Duration,
   ) -> Result<Option<ServiceEntry>, StartQueryError> {
+    // One deadline shared across stages: follow-up A/AAAA queries get the
+    // REMAINING budget, not a fresh full `timeout`, so the whole call stays
+    // bounded by `timeout` as documented (an SRV arriving late can't grant the
+    // address queries a second full window).
+    let deadline = Instant::now() + timeout;
+    let remaining = || deadline.saturating_duration_since(Instant::now());
     let mut resolver = Resolver::new(1);
     let mut streams = SelectAll::new();
     // Seed the resolver with the instance and issue its SRV + TXT (no PTR).
     for start in resolver.on_ptr(instance) {
-      streams.push(self.launch_resolve(start, timeout).await?);
+      streams.push(self.launch_resolve(start, remaining()).await?);
     }
     // Drive inline until the instance completes or every sub-query times out.
     while let Some(tagged) = streams.next().await {
       for start in feed(&mut resolver, tagged) {
-        streams.push(self.launch_resolve(start, timeout).await?);
+        streams.push(self.launch_resolve(start, remaining()).await?);
       }
       if let Some(entry) = resolver.take_ready() {
         return Ok(Some(entry));
