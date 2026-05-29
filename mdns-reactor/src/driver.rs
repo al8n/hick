@@ -184,7 +184,8 @@ struct PendingGoodbye {
 impl<N: Net> DriverState<N> {
   fn new(opts: &ServerOptions, sockets: BoundSockets<N>) -> Self {
     use rand::SeedableRng;
-    let rng = rand::rngs::StdRng::from_entropy();
+    // rand 0.10 removed `from_entropy`; seed StdRng from the OS-seeded thread RNG.
+    let rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
     let endpoint = ProtoEndpoint::try_new(*opts.endpoint_config(), rng);
     let bound_interface = sockets.interface_index;
     Self {

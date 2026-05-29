@@ -1225,7 +1225,7 @@ where
               }
             }
           } else {
-            use rand_core::RngCore;
+            use rand_core::Rng as _;
             // record this meta questioner so a later meta known-answer
             // from the SAME source can suppress our reply (§9 + §7.1). Mirrors
             // the normal cycle's `questioner_srcs` gate.
@@ -1323,7 +1323,7 @@ where
         // multiple packets. Delay 400–500 ms instead of 20–120 ms so the
         // follow-up known-answer packets (routed as `KnownAnswer` hints from the
         // same source) arrive and accumulate before we decide what to suppress.
-        use rand_core::RngCore;
+        use rand_core::Rng as _;
         let jitter_ms = if sq.truncated() {
           400u32.saturating_add(self.rng.next_u32() % 101) // [400, 500]
         } else {

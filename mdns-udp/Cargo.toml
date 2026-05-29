@@ -12,12 +12,12 @@ categories = ["network-programming"]
 
 [dependencies]
 thiserror = "2.0"
-derive_more = { version = "1.0", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
+derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
 getifs = "0.6"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "0.38", features = ["net", "system"] }
+rustix = { version = "1", features = ["net", "system"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

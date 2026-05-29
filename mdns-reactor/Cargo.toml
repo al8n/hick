@@ -26,21 +26,21 @@ tracing = ["mdns-proto/tracing"]
 
 [dependencies]
 mdns-proto = { workspace = true, features = ["std", "slab"] }
-mdns-udp = { version = "0.5", path = "../mdns-udp" }
-agnostic-net = { version = "0.2" }
-agnostic-lite = { version = "0.5" }
+mdns-udp.workspace = true
+agnostic-net = { version = "0.3" }
+agnostic-lite = { version = "0.6" }
 async-channel = "2"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 getifs = "0.6"
 pin-project-lite = "0.2"
-rand = "0.8"
+rand = "0.10"
 slab = "0.4"
 smol_str = "0.3"
 thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
-agnostic-net = { version = "0.2", features = ["tokio", "smol"] }
+agnostic-net = { version = "0.3", features = ["tokio", "smol"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 tokio = { version = "1", features = ["full"] }
 smol = "2"

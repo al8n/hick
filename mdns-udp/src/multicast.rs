@@ -245,7 +245,7 @@ pub fn try_bind_v4(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
   // unicast sends (legacy §6.7 responses) must ALSO egress with IP
   // TTL 255 per RFC 6762 §11 — the multicast TTL option does not affect them.
   // Without this a §11-enforcing receiver would drop our legacy replies.
-  sock.set_ttl(255)?;
+  sock.set_ttl_v4(255)?;
 
   let std_sock: UdpSocket = sock.into();
   platform::set_multicast_loop_v4(&std_sock, opts.multicast_loop())?;
@@ -472,7 +472,7 @@ pub fn recv_with_meta(
   // `crate::platform::unix` module docs for the full list of what rustix is
   // missing on the matching send/sockopt side.
   // Peer address storage, filled by recvmsg.
-  let mut storage: libc::sockaddr_storage = unsafe_zeroed_sockaddr_storage();
+  let mut storage = socket2::SockAddrStorage::zeroed();
   let mut iov = libc::iovec {
     iov_base: buf.as_mut_ptr().cast(),
     iov_len: buf.len(),
@@ -488,7 +488,12 @@ pub fn recv_with_meta(
   // meaningful field below.
   #[allow(unsafe_code)]
   let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
-  msg.msg_name = core::ptr::addr_of_mut!(storage).cast();
+  // SAFETY: view the zeroed storage as the platform `sockaddr_storage` it wraps
+  // to hand `recvmsg` a pointer to fill; recvmsg writes a valid sockaddr within
+  // `msg_namelen` before we read it back via `SockAddr::new`.
+  #[allow(unsafe_code)]
+  let storage_ptr = unsafe { storage.view_as::<libc::sockaddr_storage>() } as *mut libc::sockaddr_storage;
+  msg.msg_name = storage_ptr.cast();
   msg.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
   msg.msg_iov = core::ptr::addr_of_mut!(iov);
   msg.msg_iovlen = 1;
@@ -738,17 +743,6 @@ fn parse_rx_time(_cmsgs: &[u8]) -> Option<SystemTime> {
   None
 }
 
-/// Build a zeroed `sockaddr_storage`. Split out so the surrounding function
-/// keeps a single, narrowly-scoped `unsafe` block per concern.
-#[cfg(unix)]
-fn unsafe_zeroed_sockaddr_storage() -> libc::sockaddr_storage {
-  // SAFETY: `sockaddr_storage` is a plain-old-data C struct whose all-zero bit
-  // pattern is valid; recvmsg fills it before we read it.
-  #[allow(unsafe_code)]
-  unsafe {
-    core::mem::zeroed()
-  }
-}
 
 /// One parsed cmsg header + data slice.
 #[cfg(unix)]

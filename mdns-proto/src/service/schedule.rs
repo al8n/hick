@@ -2,7 +2,7 @@
 
 use core::time::Duration;
 
-use rand_core::RngCore;
+use rand_core::Rng;
 
 use crate::Instant;
 
@@ -26,7 +26,7 @@ pub(crate) mod rfc {
 /// Compute the next probe deadline given the current probe count (0..3).
 /// Probe 0 uses a random offset ∈ [0, 250 ms]; probes 1 and 2 use `PROBE_INTERVAL`.
 #[allow(clippy::arithmetic_side_effects, dead_code)]
-pub(crate) fn probe_deadline<I: Instant, R: RngCore>(
+pub(crate) fn probe_deadline<I: Instant, R: Rng>(
   now: I,
   probe_count: u8,
   rng: &mut R,

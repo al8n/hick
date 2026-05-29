@@ -5,7 +5,7 @@
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use rand_core::RngCore;
+use rand_core::Rng;
 
 use crate::{
   Instant, Name, Pool, QueryHandle, ServiceHandle,
@@ -158,7 +158,7 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
 impl<I, R, C, SR, QS, EV, AN, EvQ> Endpoint<I, R, C, SR, QS, EV, AN, EvQ>
 where
   I: Instant,
-  R: RngCore,
+  R: Rng,
   C: Pool<CacheEntry<I>>,
   SR: Pool<ServiceRoute>,
   QS: Pool<Query<I, AN, EvQ>>,
@@ -4399,7 +4399,7 @@ mod tests {
 pub struct RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ>
 where
   I: Instant,
-  R: RngCore,
+  R: Rng,
   C: Pool<CacheEntry<I>>,
   SR: Pool<ServiceRoute>,
   QS: Pool<Query<I, AN, EvQ>>,
@@ -4509,7 +4509,7 @@ enum Section {
 impl<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ> RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ>
 where
   I: Instant,
-  R: RngCore,
+  R: Rng,
   C: Pool<CacheEntry<I>>,
   SR: Pool<ServiceRoute>,
   QS: Pool<Query<I, AN, EvQ>>,
@@ -4567,7 +4567,7 @@ impl<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ> Iterator
   for RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ>
 where
   I: Instant,
-  R: RngCore,
+  R: Rng,
   C: Pool<CacheEntry<I>>,
   SR: Pool<ServiceRoute>,
   QS: Pool<Query<I, AN, EvQ>>,

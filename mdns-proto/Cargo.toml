@@ -18,7 +18,7 @@ categories = ["network-programming", "no-std", "embedded"]
 # typically pass `default-features = false, features = ["heapless"]`.
 [features]
 default = ["std", "slab"]
-std = ["alloc", "thiserror/std", "rand_core/std", "smol_str?/std"]
+std = ["alloc", "thiserror/std", "smol_str?/std"]
 alloc = ["smol_str", "dep:rand"]
 slab = ["dep:slab"]
 heapless = ["dep:heapless"]
@@ -32,19 +32,19 @@ test-no-panic = []
 
 [dependencies]
 thiserror = { version = "2.0", default-features = false }
-derive_more = { version = "1.0", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
-rand_core = { version = "0.6", default-features = false }
+derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
+rand_core = { version = "0.10", default-features = false }
 smol_str = { version = "0.3", default-features = false, optional = true }
-rand = { version = "0.8", default-features = false, features = ["std_rng"], optional = true }
+rand = { version = "0.10", default-features = false, features = ["std_rng"], optional = true }
 slab = { version = "0.4", default-features = false, optional = true }
-heapless = { version = "0.8", optional = true }
+heapless = { version = "0.9", optional = true }
 tracing = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
-rand_core = { version = "0.6", features = ["std"] }
+rand_core = { version = "0.10" }
 proptest = "1.5"
 no-panic = "0.1"
-rand = "0.8"
+rand = "0.10"
 
 [package.metadata.docs.rs]
 all-features = true
