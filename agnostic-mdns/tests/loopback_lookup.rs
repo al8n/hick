@@ -82,22 +82,23 @@ struct LoopbackPair {
 /// responder publishing the canonical test service. The responder is given
 /// `setup_wait` to finish probing + announcing before the function returns.
 async fn build_pair(setup_wait: Duration) -> Option<LoopbackPair> {
-  build_pair_named(setup_wait, UNIQUE_INSTANCE, UNIQUE_HOST).await
+  build_pair_named(setup_wait, UNIQUE_SERVICE, UNIQUE_INSTANCE, UNIQUE_HOST).await
 }
 
-/// Like [`build_pair`] but with caller-chosen instance and host names. Tests
-/// that resolve a *specific* instance/host name (rather than browsing the type)
-/// pass unique names so concurrent tests cannot conflict-rename the record out
-/// from under them.
+/// Like [`build_pair`] but with a caller-chosen service type, instance, and host
+/// name. Tests that resolve a *specific* name (rather than browsing the shared
+/// type) pass unique values so they neither conflict-rename a shared record nor
+/// leak their instance into another test's browse results.
 async fn build_pair_named(
   setup_wait: Duration,
+  service: &str,
   instance: &str,
   host: &str,
 ) -> Option<LoopbackPair> {
   let idx = loopback_index()?;
 
   let responder = try_endpoint(loopback_opts(idx)).await?;
-  let stype = Name::try_from_str(UNIQUE_SERVICE).unwrap();
+  let stype = Name::try_from_str(service).unwrap();
   let instance = Name::try_from_str(instance).unwrap();
   let host = Name::try_from_str(host).unwrap();
   let mut recs = ServiceRecords::new(stype, instance, host, SERVICE_PORT, 120);
@@ -400,9 +401,13 @@ async fn loopback_resolve_host_returns_addresses() {
 /// can't conflict-rename them — this responder reliably owns the queried name.
 #[tokio::test]
 async fn loopback_resolve_instance_returns_entry() {
-  const INST: &str = "ResolveOne._agnostic-mdns-test-v06._tcp.local.";
+  // A dedicated service type (not UNIQUE_SERVICE) so this responder's PTR never
+  // appears in `loopback_browse_resolves_service_entry`, which would otherwise
+  // be able to pick this instance and then fail its UNIQUE_HOST assertion.
+  const SVC: &str = "_agnostic-mdns-resolve-v06._tcp.local.";
+  const INST: &str = "ResolveOne._agnostic-mdns-resolve-v06._tcp.local.";
   const HOST: &str = "resolve-one-host.local.";
-  let pair = match build_pair_named(Duration::from_millis(1300), INST, HOST).await {
+  let pair = match build_pair_named(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
