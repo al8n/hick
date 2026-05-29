@@ -282,6 +282,13 @@ impl<N: Net> DriverState<N> {
         let _ = self.endpoint.cancel_query(handle);
         self.queries.remove(&handle);
       }
+      Command::SpawnLookup { task } => {
+        // spawn from WITHIN the driver task so the child inherits this task's
+        // runtime context — the endpoint may have been created on a different
+        // executor/thread than the caller of `browse()`, where a direct
+        // ambient `spawn` would panic (no entered runtime).
+        <N::Runtime as RuntimeLite>::spawn_detach(task);
+      }
     }
   }
 

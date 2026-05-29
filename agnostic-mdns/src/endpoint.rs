@@ -1,5 +1,7 @@
 //! Caller-side handle for an mDNS endpoint.
 
+use std::future::Future;
+
 use agnostic_net::Net;
 use mdns_proto::{QuerySpec, ServiceSpec};
 use mdns_udp::{
@@ -102,6 +104,26 @@ impl Endpoint {
     driver::spawn::<N>(opts, sockets, cmd_rx);
 
     Ok(Self { cmd: cmd_tx })
+  }
+
+  /// Hand a detached discovery-lookup driver task to the driver to spawn (via
+  /// [`Command::SpawnLookup`]).
+  ///
+  /// Spawning happens inside the driver task, which always runs in the runtime
+  /// context the endpoint was created on. Routing it this way — rather than
+  /// spawning from the caller — means `browse()` works from any executor or
+  /// thread, even one with no entered runtime of its own, matching the
+  /// runtime-agnostic, channel-only nature of the rest of the endpoint API.
+  pub(crate) fn spawn_lookup<F>(&self, fut: F) -> Result<(), StartQueryError>
+  where
+    F: Future<Output = ()> + Send + 'static,
+  {
+    self
+      .cmd
+      .try_send(Command::SpawnLookup {
+        task: Box::pin(fut),
+      })
+      .map_err(|_| StartQueryError::DriverGone)
   }
 
   /// Register a new service with the responder. The returned [`Service`]

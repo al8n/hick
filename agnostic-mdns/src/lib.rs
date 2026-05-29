@@ -31,6 +31,7 @@
 #![cfg_attr(docsrs, allow(unused_attributes))]
 
 mod command;
+mod discovery;
 mod driver;
 mod endpoint;
 mod error;
@@ -39,6 +40,7 @@ mod proto;
 mod query;
 mod service;
 
+pub use discovery::{Lookup, QueryParam, ServiceEntry};
 pub use endpoint::Endpoint;
 pub use error::{CancelError, RegisterError, ServerError, StartQueryError};
 pub use options::ServerOptions;

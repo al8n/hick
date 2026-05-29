@@ -21,7 +21,7 @@
 use std::{net::Ipv6Addr, time::Duration};
 
 use agnostic_mdns::{
-  CollectedAnswer, Name, QueryEvent, QuerySpec, ServerOptions, Service, ServiceRecords,
+  CollectedAnswer, Name, QueryEvent, QueryParam, QuerySpec, ServerOptions, Service, ServiceRecords,
   ServiceSpec, tokio as tokio_drv, wire::ResourceType,
 };
 
@@ -267,4 +267,85 @@ async fn loopback_any_query_returns_full_record_set() {
   let saw_srv = answers.iter().any(|a| a.rtype() == ResourceType::Srv);
   let saw_txt = answers.iter().any(|a| a.rtype() == ResourceType::Txt);
   assert!(saw_srv && saw_txt, "expected SRV+TXT; got {answers:?}");
+}
+
+/// End-to-end DNS-SD discovery: browse the service type and resolve the
+/// published instance into a fully-populated `ServiceEntry` (PTR → SRV/TXT →
+/// A/AAAA chained by the `Lookup`).
+#[tokio::test]
+async fn loopback_browse_resolves_service_entry() {
+  let pair = match build_pair(Duration::from_millis(1300)).await {
+    Some(p) => p,
+    None => return,
+  };
+  let param = QueryParam::new(Name::try_from_str(UNIQUE_SERVICE).unwrap())
+    .with_timeout(Duration::from_secs(2));
+  let mut lookup = match pair.querier.browse(param).await {
+    Ok(l) => l,
+    Err(e) => {
+      eprintln!("skipping: browse failed: {e:?}");
+      return;
+    }
+  };
+
+  // Resolve until an instance of our service type appears (or a hard cap).
+  // Breaking on the first match keeps the test fast — the entry resolves long
+  // before the per-query timeouts elapse. We match on the service-type suffix,
+  // not the exact instance label: parallel tests publish the same instance name
+  // on loopback, so §9 conflict resolution renames clones (`Test` → `test-2`),
+  // and responders lowercase names on the wire. The host/port/addr/TXT are
+  // identical across the renamed clones, so any resolved entry validates them.
+  let suffix = UNIQUE_SERVICE.to_ascii_lowercase();
+  let entry = tokio::time::timeout(Duration::from_secs(5), async {
+    while let Some(e) = lookup.next().await {
+      eprintln!(
+        "browse entry: {} host={} port={} v4={:?}",
+        e.instance_name(),
+        e.host(),
+        e.port(),
+        e.ipv4_addresses()
+      );
+      // Wait for an instance of our type whose A address has resolved. On
+      // loopback the responder emits both A (127.0.0.1) and AAAA (::1) over
+      // IPv4, so the first emission for an instance may be AAAA-only; a later
+      // re-emission carries the A address.
+      if e
+        .instance_name()
+        .as_str()
+        .to_ascii_lowercase()
+        .ends_with(&suffix)
+        && e.ipv4_addresses().contains(&ADVERTISED_V4.into())
+      {
+        return Some(e);
+      }
+    }
+    None
+  })
+  .await
+  .ok()
+  .flatten();
+
+  let entry = match entry {
+    Some(e) => e,
+    None => panic!("browse did not resolve any instance of {UNIQUE_SERVICE}"),
+  };
+  assert_eq!(entry.port(), SERVICE_PORT, "wrong port");
+  assert!(
+    entry.host().as_str().eq_ignore_ascii_case(UNIQUE_HOST),
+    "wrong host: {}",
+    entry.host()
+  );
+  assert!(
+    entry.ipv4_addresses().contains(&ADVERTISED_V4.into()),
+    "expected {ADVERTISED_V4:?} in {:?}",
+    entry.ipv4_addresses()
+  );
+  assert!(
+    entry
+      .txt()
+      .iter()
+      .any(|t| t.as_slice() == b"Local web server"),
+    "expected TXT 'Local web server' in {:?}",
+    entry.txt()
+  );
 }
