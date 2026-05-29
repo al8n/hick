@@ -26,7 +26,7 @@ tracing = ["mdns-proto/tracing"]
 
 [dependencies]
 mdns-proto = { workspace = true, features = ["std", "slab"] }
-mdns-udp = { path = "../mdns-udp" }
+mdns-udp = { version = "0.5", path = "../mdns-udp" }
 agnostic-net = { version = "0.2" }
 agnostic-lite = { version = "0.5" }
 async-channel = "2"
