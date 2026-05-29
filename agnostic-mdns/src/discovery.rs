@@ -37,7 +37,7 @@ use std::{
   collections::{HashMap, HashSet, VecDeque},
   net::{IpAddr, Ipv4Addr, Ipv6Addr},
   sync::{Arc, Mutex, MutexGuard},
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use futures::{FutureExt, StreamExt, pin_mut, select_biased, stream::SelectAll};
@@ -561,66 +561,13 @@ impl LookupDriver {
   /// Feed one answer to the resolver, launch any follow-up queries it requests,
   /// then flush newly-resolved entries to the consumer.
   async fn process(&mut self, tagged: Tagged) {
-    for start in self.feed(tagged) {
+    for start in feed(&mut self.resolver, tagged) {
       // Launch inline. If the handle was dropped mid-launch the `start_query`
       // round-trip still completes promptly (the main driver replies regardless),
       // and the next loop iteration's `cancel` arm stops the task.
       self.launch(start).await;
     }
     self.flush();
-  }
-
-  /// Decode `tagged`, feed the resolver, and return the follow-up queries.
-  fn feed(&mut self, tagged: Tagged) -> Vec<Start> {
-    let answer = match tagged.event {
-      QueryEvent::Answer(a) => a,
-      QueryEvent::Terminal(_) => return Vec::new(),
-    };
-    match tagged.step {
-      Step::Ptr => {
-        if answer.rtype() != ResourceType::Ptr {
-          return Vec::new();
-        }
-        match parse_name(answer.rdata_slice()) {
-          Some(instance) => self.resolver.on_ptr(instance),
-          None => Vec::new(),
-        }
-      }
-      Step::Srv(inst_key) => {
-        if answer.rtype() != ResourceType::Srv {
-          return Vec::new();
-        }
-        match parse_srv(answer.rdata_slice()) {
-          Some((host, port)) => self.resolver.on_srv(&inst_key, host, port),
-          None => Vec::new(),
-        }
-      }
-      Step::Txt(inst_key) => {
-        if answer.rtype() != ResourceType::Txt {
-          return Vec::new();
-        }
-        self
-          .resolver
-          .on_txt(&inst_key, parse_txt(answer.rdata_slice()));
-        Vec::new()
-      }
-      Step::A(host_key) => {
-        if let Ok(r) = ARecord::try_from_rdata(answer.rdata_slice()) {
-          if answer.rtype() == ResourceType::A {
-            self.resolver.on_addr(&host_key, IpAddr::V4(r.addr()));
-          }
-        }
-        Vec::new()
-      }
-      Step::Aaaa(host_key) => {
-        if let Ok(r) = AaaaRecord::try_from_rdata(answer.rdata_slice()) {
-          if answer.rtype() == ResourceType::Aaaa {
-            self.resolver.on_addr(&host_key, IpAddr::V6(r.addr()));
-          }
-        }
-        Vec::new()
-      }
-    }
   }
 
   /// Total observable drops surfaced via [`Lookup::dropped`]: instances refused
@@ -765,6 +712,172 @@ impl Endpoint {
     self
       .browse(QueryParam::new(service).with_timeout(timeout))
       .await
+  }
+
+  /// Resolve a host name to its addresses via mDNS A / AAAA queries (RFC 6762),
+  /// without the DNS-SD browse/resolve chain.
+  ///
+  /// Issues both queries and collects every advertised address for the
+  /// `timeout` window (the answer window for multicast responses), returning
+  /// them IPv4 first then IPv6, deduplicated and capped per family. The result
+  /// is empty if nothing answers. Unlike [`Self::resolve_instance`] this does
+  /// not require — or interpret — DNS-SD records; it is the multicast analogue
+  /// of resolving a hostname.
+  pub async fn resolve_host(
+    &self,
+    host: Name,
+    timeout: Duration,
+  ) -> Result<Vec<IpAddr>, StartQueryError> {
+    let host_key = fold(&host);
+    let a = self
+      .start_query(QuerySpec::new(host.clone(), ResourceType::A).with_timeout(timeout))
+      .await?;
+    let aaaa = self
+      .start_query(QuerySpec::new(host, ResourceType::Aaaa).with_timeout(timeout))
+      .await?;
+    let mut streams = SelectAll::new();
+    streams.push(tagged_stream(a, Step::A(host_key.clone())));
+    streams.push(tagged_stream(aaaa, Step::Aaaa(host_key)));
+
+    // Drive both queries to their terminal (the timeout), gathering addresses.
+    // The consumer here is this future itself, so the streams drain promptly.
+    let mut ipv4: Vec<Ipv4Addr> = Vec::new();
+    let mut ipv6: Vec<Ipv6Addr> = Vec::new();
+    while let Some(tagged) = streams.next().await {
+      let ans = match tagged.event {
+        QueryEvent::Answer(a) => a,
+        QueryEvent::Terminal(_) => continue,
+      };
+      match ans.rtype() {
+        ResourceType::A => {
+          if let Ok(r) = ARecord::try_from_rdata(ans.rdata_slice()) {
+            push_capped(&mut ipv4, r.addr());
+          }
+        }
+        ResourceType::Aaaa => {
+          if let Ok(r) = AaaaRecord::try_from_rdata(ans.rdata_slice()) {
+            push_capped(&mut ipv6, r.addr());
+          }
+        }
+        _ => {}
+      }
+    }
+    Ok(
+      ipv4
+        .into_iter()
+        .map(IpAddr::V4)
+        .chain(ipv6.into_iter().map(IpAddr::V6))
+        .collect(),
+    )
+  }
+
+  /// Resolve a *known* DNS-SD service instance directly into a [`ServiceEntry`],
+  /// skipping the PTR browse step (e.g.
+  /// `Name::try_from_str("Office._ipp._tcp.local.")`).
+  ///
+  /// Issues SRV + TXT for the instance and A / AAAA for the SRV target host, and
+  /// returns the first complete resolution — host + port, TXT, and at least one
+  /// address — or `None` if it does not complete within `timeout`. Use
+  /// [`Self::browse`] instead when the instance names are not known in advance.
+  pub async fn resolve_instance(
+    &self,
+    instance: Name,
+    timeout: Duration,
+  ) -> Result<Option<ServiceEntry>, StartQueryError> {
+    // One deadline shared across stages: follow-up A/AAAA queries get the
+    // REMAINING budget, not a fresh full `timeout`, so the whole call stays
+    // bounded by `timeout` as documented (an SRV arriving late can't grant the
+    // address queries a second full window).
+    // `checked_add` so a pathological `timeout` (e.g. `Duration::MAX`) cannot
+    // panic the way `Instant + Duration` would. An overflow means "no effective
+    // deadline", so each stage just receives the full (huge) `timeout`, which
+    // `QuerySpec` clamps with its own checked arithmetic.
+    let deadline = Instant::now().checked_add(timeout);
+    let remaining = || deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
+    let mut resolver = Resolver::new(1);
+    let mut streams = SelectAll::new();
+    // Seed the resolver with the instance and issue its SRV + TXT (no PTR).
+    for start in resolver.on_ptr(instance) {
+      streams.push(self.launch_resolve(start, remaining()).await?);
+    }
+    // Drive inline until the instance completes or every sub-query times out.
+    while let Some(tagged) = streams.next().await {
+      for start in feed(&mut resolver, tagged) {
+        streams.push(self.launch_resolve(start, remaining()).await?);
+      }
+      if let Some(entry) = resolver.take_ready() {
+        return Ok(Some(entry));
+      }
+    }
+    Ok(resolver.take_ready())
+  }
+
+  /// Start a resolve sub-query and wrap it as a tagged stream. Used by the
+  /// one-shot resolve conveniences, which drive the merged streams inline rather
+  /// than via a spawned [`LookupDriver`].
+  async fn launch_resolve(
+    &self,
+    start: Start,
+    timeout: Duration,
+  ) -> Result<futures::stream::BoxStream<'static, Tagged>, StartQueryError> {
+    let qtype = start.qtype();
+    let query = self
+      .start_query(QuerySpec::new(start.name, qtype).with_timeout(timeout))
+      .await?;
+    Ok(tagged_stream(query, start.step))
+  }
+}
+
+/// Decode one tagged answer, fold it into `resolver`, and return any follow-up
+/// queries it requests. Shared by the streaming [`LookupDriver`] and the
+/// one-shot [`Endpoint::resolve_instance`] convenience.
+fn feed(resolver: &mut Resolver, tagged: Tagged) -> Vec<Start> {
+  let answer = match tagged.event {
+    QueryEvent::Answer(a) => a,
+    QueryEvent::Terminal(_) => return Vec::new(),
+  };
+  match tagged.step {
+    Step::Ptr => {
+      if answer.rtype() != ResourceType::Ptr {
+        return Vec::new();
+      }
+      match parse_name(answer.rdata_slice()) {
+        Some(instance) => resolver.on_ptr(instance),
+        None => Vec::new(),
+      }
+    }
+    Step::Srv(inst_key) => {
+      if answer.rtype() != ResourceType::Srv {
+        return Vec::new();
+      }
+      match parse_srv(answer.rdata_slice()) {
+        Some((host, port)) => resolver.on_srv(&inst_key, host, port),
+        None => Vec::new(),
+      }
+    }
+    Step::Txt(inst_key) => {
+      if answer.rtype() != ResourceType::Txt {
+        return Vec::new();
+      }
+      resolver.on_txt(&inst_key, parse_txt(answer.rdata_slice()));
+      Vec::new()
+    }
+    Step::A(host_key) => {
+      if let Ok(r) = ARecord::try_from_rdata(answer.rdata_slice()) {
+        if answer.rtype() == ResourceType::A {
+          resolver.on_addr(&host_key, IpAddr::V4(r.addr()));
+        }
+      }
+      Vec::new()
+    }
+    Step::Aaaa(host_key) => {
+      if let Ok(r) = AaaaRecord::try_from_rdata(answer.rdata_slice()) {
+        if answer.rtype() == ResourceType::Aaaa {
+          resolver.on_addr(&host_key, IpAddr::V6(r.addr()));
+        }
+      }
+      Vec::new()
+    }
   }
 }
 

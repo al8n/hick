@@ -18,7 +18,10 @@
 #![cfg(feature = "tokio")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::{net::Ipv6Addr, time::Duration};
+use std::{
+  net::{IpAddr, Ipv6Addr},
+  time::Duration,
+};
 
 use agnostic_mdns::{
   CollectedAnswer, Name, QueryEvent, QueryParam, QuerySpec, ServerOptions, Service, ServiceRecords,
@@ -79,12 +82,25 @@ struct LoopbackPair {
 /// responder publishing the canonical test service. The responder is given
 /// `setup_wait` to finish probing + announcing before the function returns.
 async fn build_pair(setup_wait: Duration) -> Option<LoopbackPair> {
+  build_pair_named(setup_wait, UNIQUE_SERVICE, UNIQUE_INSTANCE, UNIQUE_HOST).await
+}
+
+/// Like [`build_pair`] but with a caller-chosen service type, instance, and host
+/// name. Tests that resolve a *specific* name (rather than browsing the shared
+/// type) pass unique values so they neither conflict-rename a shared record nor
+/// leak their instance into another test's browse results.
+async fn build_pair_named(
+  setup_wait: Duration,
+  service: &str,
+  instance: &str,
+  host: &str,
+) -> Option<LoopbackPair> {
   let idx = loopback_index()?;
 
   let responder = try_endpoint(loopback_opts(idx)).await?;
-  let stype = Name::try_from_str(UNIQUE_SERVICE).unwrap();
-  let instance = Name::try_from_str(UNIQUE_INSTANCE).unwrap();
-  let host = Name::try_from_str(UNIQUE_HOST).unwrap();
+  let stype = Name::try_from_str(service).unwrap();
+  let instance = Name::try_from_str(instance).unwrap();
+  let host = Name::try_from_str(host).unwrap();
   let mut recs = ServiceRecords::new(stype, instance, host, SERVICE_PORT, 120);
   recs.add_a(ADVERTISED_V4.into());
   recs.add_aaaa(ADVERTISED_V6);
@@ -340,6 +356,97 @@ async fn loopback_browse_resolves_service_entry() {
     "expected {ADVERTISED_V4:?} in {:?}",
     entry.ipv4_addresses()
   );
+  assert!(
+    entry
+      .txt()
+      .iter()
+      .any(|t| t.as_slice() == b"Local web server"),
+    "expected TXT 'Local web server' in {:?}",
+    entry.txt()
+  );
+}
+
+/// `resolve_host`: plain mDNS hostname resolution (A/AAAA), no DNS-SD chain. The
+/// host name carries identical A rdata across any concurrent responders, so this
+/// is robust under parallel tests (no §9 conflict on shared, identical records).
+#[tokio::test]
+async fn loopback_resolve_host_returns_addresses() {
+  let pair = match build_pair(Duration::from_millis(1300)).await {
+    Some(p) => p,
+    None => return,
+  };
+  let addrs = match pair
+    .querier
+    .resolve_host(
+      Name::try_from_str(UNIQUE_HOST).unwrap(),
+      Duration::from_secs(2),
+    )
+    .await
+  {
+    Ok(a) => a,
+    Err(e) => {
+      eprintln!("skipping: resolve_host failed: {e:?}");
+      return;
+    }
+  };
+  eprintln!("resolve_host: {addrs:?}");
+  assert!(
+    addrs.contains(&IpAddr::V4(ADVERTISED_V4.into())),
+    "expected {ADVERTISED_V4:?} in {addrs:?}"
+  );
+}
+
+/// `resolve_instance`: resolve a *known* instance directly (SRV/TXT + A/AAAA),
+/// skipping the PTR browse. Uses unique instance/host names so a concurrent test
+/// can't conflict-rename them — this responder reliably owns the queried name.
+#[tokio::test]
+async fn loopback_resolve_instance_returns_entry() {
+  // A dedicated service type (not UNIQUE_SERVICE) so this responder's PTR never
+  // appears in `loopback_browse_resolves_service_entry`, which would otherwise
+  // be able to pick this instance and then fail its UNIQUE_HOST assertion.
+  const SVC: &str = "_agnostic-mdns-resolve-v06._tcp.local.";
+  const INST: &str = "ResolveOne._agnostic-mdns-resolve-v06._tcp.local.";
+  const HOST: &str = "resolve-one-host.local.";
+  let pair = match build_pair_named(Duration::from_millis(1300), SVC, INST, HOST).await {
+    Some(p) => p,
+    None => return,
+  };
+  let resolved = tokio::time::timeout(
+    Duration::from_secs(6),
+    pair
+      .querier
+      .resolve_instance(Name::try_from_str(INST).unwrap(), Duration::from_secs(2)),
+  )
+  .await;
+  let entry = match resolved {
+    Ok(Ok(Some(e))) => e,
+    other => panic!("resolve_instance did not resolve {INST}: {other:?}"),
+  };
+  eprintln!(
+    "resolve_instance: host={} port={} v4={:?} v6={:?}",
+    entry.host(),
+    entry.port(),
+    entry.ipv4_addresses(),
+    entry.ipv6_addresses()
+  );
+  assert_eq!(entry.port(), SERVICE_PORT, "wrong port");
+  assert!(
+    entry.host().as_str().eq_ignore_ascii_case(HOST),
+    "wrong host: {}",
+    entry.host()
+  );
+  // First complete resolution carries >= 1 address; family/order isn't fixed on
+  // loopback, so assert presence + that every address is one we advertised.
+  assert!(
+    entry.addresses().next().is_some(),
+    "expected at least one address"
+  );
+  for a in entry.addresses() {
+    assert!(
+      a == IpAddr::V4(ADVERTISED_V4.into()) || a == IpAddr::V6(ADVERTISED_V6),
+      "unexpected address {a}"
+    );
+  }
   assert!(
     entry
       .txt()
