@@ -1,6 +1,10 @@
 //! Driver-task command/response channel types.
 
-use std::sync::{Arc, Mutex};
+use std::{
+  future::Future,
+  pin::Pin,
+  sync::{Arc, Mutex},
+};
 
 use mdns_proto::{QueryHandle, QuerySpec, ServiceHandle, ServiceSpec};
 
@@ -39,5 +43,10 @@ pub(crate) enum Command {
   },
   CancelQuery {
     handle: QueryHandle,
+  },
+  /// Spawn a detached discovery-lookup driver task from within the driver, so
+  /// it inherits the driver's runtime context (see [`crate::Endpoint::browse`]).
+  SpawnLookup {
+    task: Pin<Box<dyn Future<Output = ()> + Send>>,
   },
 }

@@ -1,8 +1,7 @@
 //! Caller-side handle for an mDNS endpoint.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::future::Future;
 
-use agnostic_lite::RuntimeLite;
 use agnostic_net::Net;
 use mdns_proto::{QuerySpec, ServiceSpec};
 use mdns_udp::{
@@ -18,13 +17,6 @@ use crate::{
   service::Service,
 };
 
-/// Type-erased detached-task spawner captured at [`Endpoint::server`] time. It
-/// lets the runtime-agnostic `Endpoint` spawn background tasks (e.g. a discovery
-/// [`Lookup`](crate::Lookup) driver) without itself being generic over the
-/// runtime — the concrete `N::Runtime` is closed over here, exactly as quinn's
-/// `Arc<dyn Runtime>` erases its spawner.
-type SpawnFn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
-
 /// Handle to a running mDNS endpoint.
 ///
 /// Cloneable; every clone shares the same underlying driver task. The driver
@@ -33,7 +25,6 @@ type SpawnFn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Syn
 #[derive(Clone)]
 pub struct Endpoint {
   cmd: async_channel::Sender<Command>,
-  spawn: SpawnFn,
 }
 
 impl Endpoint {
@@ -112,21 +103,27 @@ impl Endpoint {
     };
     driver::spawn::<N>(opts, sockets, cmd_rx);
 
-    // close over the concrete runtime so type-erased clones of this endpoint
-    // can spawn background tasks (e.g. discovery lookups).
-    let spawn: SpawnFn = Arc::new(|fut: Pin<Box<dyn Future<Output = ()> + Send>>| {
-      <N::Runtime as RuntimeLite>::spawn_detach(fut);
-    });
-
-    Ok(Self { cmd: cmd_tx, spawn })
+    Ok(Self { cmd: cmd_tx })
   }
 
-  /// Spawn a detached background task on this endpoint's runtime.
-  pub(crate) fn spawn_task<F>(&self, fut: F)
+  /// Hand a detached discovery-lookup driver task to the driver to spawn (via
+  /// [`Command::SpawnLookup`]).
+  ///
+  /// Spawning happens inside the driver task, which always runs in the runtime
+  /// context the endpoint was created on. Routing it this way — rather than
+  /// spawning from the caller — means `browse()` works from any executor or
+  /// thread, even one with no entered runtime of its own, matching the
+  /// runtime-agnostic, channel-only nature of the rest of the endpoint API.
+  pub(crate) fn spawn_lookup<F>(&self, fut: F) -> Result<(), StartQueryError>
   where
     F: Future<Output = ()> + Send + 'static,
   {
-    (self.spawn)(Box::pin(fut));
+    self
+      .cmd
+      .try_send(Command::SpawnLookup {
+        task: Box::pin(fut),
+      })
+      .map_err(|_| StartQueryError::DriverGone)
   }
 
   /// Register a new service with the responder. The returned [`Service`]

@@ -332,6 +332,14 @@ impl Resolver {
     let host_key = fold(&host);
     let cached = self.host_addrs.get(&host_key);
     if let Some(b) = self.builders.get_mut(inst_key) {
+      // SRV retargeting the instance to a DIFFERENT host invalidates the old
+      // host's addresses — drop them before adopting the new host's, so a
+      // re-emit never yields an entry whose host is the new target but whose
+      // addresses still belong to the old one.
+      if b.host_key.as_deref() != Some(host_key.as_str()) {
+        b.ipv4.clear();
+        b.ipv6.clear();
+      }
       b.host = Some(host.clone());
       b.host_key = Some(host_key.clone());
       b.port = port;
@@ -696,7 +704,7 @@ impl Endpoint {
       resolve_timeout,
       unicast: param.unicast_response,
     };
-    self.spawn_task(driver.run());
+    self.spawn_lookup(driver.run())?;
 
     Ok(Lookup {
       queue,
@@ -1011,6 +1019,39 @@ mod tests {
     assert_eq!(launched, 4 * 2);
     // The 16 over-cap target hosts are counted so the partial view is observable.
     assert_eq!(r.dropped, 16);
+  }
+
+  #[test]
+  fn srv_retarget_drops_old_host_addresses() {
+    // An instance first resolves on host h1 (address A1). A later SRV retargets
+    // it to host h2; once h2's address arrives, the re-emitted entry must carry
+    // h2 and ONLY h2's address — never the stale h1 address.
+    let mut r = Resolver::new(16);
+    let inst = Name::try_from_str("i._x._tcp.local.").unwrap();
+    let h1 = Name::try_from_str("h1.local.").unwrap();
+    let h2 = Name::try_from_str("h2.local.").unwrap();
+    let k = fold(&inst);
+    let hk1 = fold(&h1);
+    let hk2 = fold(&h2);
+    r.on_ptr(inst);
+    r.on_srv(&k, h1, 8000);
+    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    r.on_addr(&hk1, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    let first = r.take_ready().expect("resolves on h1");
+    assert_eq!(first.host().as_str(), "h1.local.");
+    assert_eq!(first.ipv4_addresses(), [Ipv4Addr::new(10, 0, 0, 1)]);
+
+    // Retarget to h2; the old h1 address must be dropped immediately.
+    r.on_srv(&k, h2, 8000);
+    // h2's address arrives → re-emit with h2 and only the h2 address.
+    r.on_addr(&hk2, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+    let second = r.take_ready().expect("re-emits on h2 address");
+    assert_eq!(second.host().as_str(), "h2.local.");
+    assert_eq!(
+      second.ipv4_addresses(),
+      [Ipv4Addr::new(10, 0, 0, 2)],
+      "stale h1 address must not survive the retarget"
+    );
   }
 
   #[test]
