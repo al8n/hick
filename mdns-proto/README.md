@@ -6,7 +6,7 @@ This crate implements the full RFC 6762 protocol behavior (probing, conflict res
 
 ## Target audiences
 
-- **`std`** users on tokio, smol, or async-std (via the companion `agnostic-mdns` crate, or any driver of their choosing).
+- **`std`** users on tokio, smol, or async-std (via the companion `mdns-reactor` crate, or any driver of their choosing).
 - **`no_std + alloc`** users on Embassy, RTIC, ESP-IDF, wasm32.
 - **`no_std + no_alloc`** users on bare-metal microcontrollers without a heap.
 

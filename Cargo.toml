@@ -1,5 +1,5 @@
 [workspace]
-members = ["mdns-proto", "mdns-udp", "agnostic-mdns"]
+members = ["mdns-proto", "mdns-udp", "mdns-reactor"]
 resolver = "3"
 
 

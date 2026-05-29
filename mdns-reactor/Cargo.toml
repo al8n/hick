@@ -1,11 +1,11 @@
 [package]
-name = "agnostic-mdns"
+name = "mdns-reactor"
 version = "0.6.0"
 edition = "2024"
 publish = false
 repository = "https://github.com/al8n/agnostic-mdns"
 homepage = "https://github.com/al8n/agnostic-mdns"
-documentation = "https://docs.rs/agnostic-mdns"
+documentation = "https://docs.rs/mdns-reactor"
 description = "Async mDNS driver layered on `mdns-proto` + `mdns-udp`, runtime-agnostic via `agnostic-net` (tokio & smol)."
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"

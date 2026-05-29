@@ -23,7 +23,7 @@ use std::{
   time::Duration,
 };
 
-use agnostic_mdns::{
+use mdns_reactor::{
   CollectedAnswer, Name, QueryEvent, QueryParam, QuerySpec, ServerOptions, Service, ServiceRecords,
   ServiceSpec, tokio as tokio_drv, wire::ResourceType,
 };

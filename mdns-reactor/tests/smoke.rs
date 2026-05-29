@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use agnostic_mdns::{
+use mdns_reactor::{
   Name, QuerySpec, ServerOptions, ServiceRecords, ServiceSpec, tokio as tokio_drv,
   wire::ResourceType,
 };
@@ -91,8 +91,8 @@ async fn start_query_then_cancel() {
   let result = tokio::time::timeout(Duration::from_secs(2), async {
     loop {
       match q.next().await {
-        Some(agnostic_mdns::QueryEvent::Terminal(t)) => return Some(t),
-        Some(agnostic_mdns::QueryEvent::Answer(_)) => continue,
+        Some(mdns_reactor::QueryEvent::Terminal(t)) => return Some(t),
+        Some(mdns_reactor::QueryEvent::Answer(_)) => continue,
         None => return None,
       }
     }

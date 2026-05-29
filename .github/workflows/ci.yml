@@ -57,7 +57,7 @@ jobs:
   # These are the capability families behind `mdns-udp/build.rs`.
   #
   # NetBSD is scoped to the sans-io crates (mdns-proto + mdns-udp): the
-  # agnostic-mdns tokio driver depends on mio, which does not build on NetBSD.
+  # mdns-reactor tokio driver depends on mio, which does not build on NetBSD.
   # The NetBSD portability target is the sans-io mechanism + socket layer, not
   # the tokio policy layer. FreeBSD/Android check the whole workspace.
   cross-check:

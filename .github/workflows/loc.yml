@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crates: ["mdns-proto", "agnostic-mdns"]
+        crates: ["mdns-proto", "mdns-reactor"]
     steps:
       - uses: actions/checkout@v4
 

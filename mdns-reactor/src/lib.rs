@@ -1,4 +1,4 @@
-//! `agnostic-mdns` — async mDNS driver.
+//! `mdns-reactor` — async mDNS driver.
 //!
 //! Layered on [`mdns-proto`] (Sans-I/O state machines) and [`mdns-udp`]
 //! (multicast socket setup). The driver task is generic over an
@@ -6,7 +6,7 @@
 //! `tokio` and `smol` runtimes.
 //!
 //! ```ignore
-//! use agnostic_mdns::{ServerOptions, tokio::Endpoint};
+//! use mdns_reactor::{ServerOptions, tokio::Endpoint};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let endpoint = Endpoint::server(ServerOptions::default()).await?;
@@ -18,8 +18,8 @@
 //!     .await?;
 //! while let Some(event) = query.next().await {
 //!     match event {
-//!         agnostic_mdns::QueryEvent::Answer(a) => println!("{:?}", a),
-//!         agnostic_mdns::QueryEvent::Terminal(_) => break,
+//!         mdns_reactor::QueryEvent::Answer(a) => println!("{:?}", a),
+//!         mdns_reactor::QueryEvent::Terminal(_) => break,
 //!     }
 //! }
 //! # Ok(()) }
