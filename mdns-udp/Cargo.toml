@@ -1,0 +1,28 @@
+[package]
+name = "mdns-udp"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+description = "Sync multicast UDP helpers + interface enumeration for mDNS. Cross-platform shim used by the async wrapper crates."
+repository = "https://github.com/al8n/agnostic-mdns"
+readme = "README.md"
+keywords = ["mdns", "udp", "multicast", "networking"]
+categories = ["network-programming"]
+
+[dependencies]
+thiserror = "2.0"
+derive_more = { version = "1.0", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
+getifs = "0.6"
+socket2 = { version = "0.5", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "0.38", features = ["net", "system"] }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_IO"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -1,79 +1,49 @@
 [package]
 name = "agnostic-mdns"
-version = "0.4.2"
+version = "0.6.0"
 edition = "2024"
+publish = false
 repository = "https://github.com/al8n/agnostic-mdns"
 homepage = "https://github.com/al8n/agnostic-mdns"
 documentation = "https://docs.rs/agnostic-mdns"
-description = "Simple and lightweight mDNS client/server library for any async runtime."
+description = "Async mDNS driver layered on `mdns-proto` + `mdns-udp`, runtime-agnostic via `agnostic-net` (tokio & smol)."
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
 categories = ["network-programming"]
 keywords = ["mdns", "dns-sd", "zeroconf", "agnostic", "async-mdns"]
 readme = "README.md"
 
-[[example]]
-name = "tokio"
-path = "examples/tokio.rs"
-required-features = ["tokio"]
-
-[[example]]
-name = "async-std"
-path = "examples/async_std.rs"
-required-features = ["async-std"]
-
-[[example]]
-name = "smol"
-path = "examples/smol.rs"
-required-features = ["smol"]
-
 [features]
-default = ["std"]
-std = ["scopeguard/default", "auto_enums/default"]
-
-worksteal = ["parking_lot"]
-tokio = ["worksteal", "agnostic-net/tokio", "std"]
-async-std = ["worksteal", "agnostic-net/async-std", "std"]
-smol = ["worksteal", "agnostic-net/smol", "std"]
+default = ["tokio"]
+tokio = ["agnostic-net/tokio"]
+smol = ["agnostic-net/smol"]
+# Forward to `mdns-proto`'s `tracing` feature so callers can opt in.
+# The driver itself already emits `tracing::debug!` on socket errors
+# regardless of this feature; turning it on additionally surfaces the
+# proto-layer trace points (Endpoint::handle, observe_send, Service::poll,
+# etc.) at trace/debug levels.
+tracing = ["mdns-proto/tracing"]
 
 [dependencies]
-auto_enums = { version = "0.8", default-features = false }
+mdns-proto = { workspace = true, features = ["std", "slab"] }
+mdns-udp = { path = "../mdns-udp" }
 agnostic-net = { version = "0.2" }
-atomic_refcell = "0.1"
+agnostic-lite = { version = "0.5" }
 async-channel = "2"
-either = "1"
-futures = "0.3"
-iprobe = "0.1"
-mdns-proto = { workspace = true, features = ["slab"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+getifs = "0.6"
 pin-project-lite = "0.2"
-parking_lot = { version = "0.12", optional = true }
-smol_str = "0.3"
-smallvec-wrapper = "0.3"
-scopeguard = { version = "1", default-features = false }
+rand = "0.8"
 slab = "0.4"
-triomphe = "0.1"
+smol_str = "0.3"
 thiserror = "2"
 tracing = "0.1"
 
-[target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["system", "net"] }
-
-[target.'cfg(windows)'.dependencies]
-hostname = "0.4"
-socket2 = { version = "0.5", features = ["all"] }
-
 [dev-dependencies]
-paste = "1"
-agnostic-net = { version = "0.2", features = ["tokio", "async-std", "smol"] }
-tracing-subscriber = { version = "0.3", features = [
-  "env-filter",
-  "tracing-log",
-] }
+agnostic-net = { version = "0.2", features = ["tokio", "smol"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 tokio = { version = "1", features = ["full"] }
 smol = "2"
-async-std = "1"
-scopeguard = "1"
-
 
 [package.metadata.docs.rs]
 all-features = true
@@ -82,4 +52,3 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lints.rust]
 rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
-

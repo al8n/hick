@@ -5,164 +5,147 @@
 #![allow(unexpected_cfgs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
-#![allow(clippy::needless_return)]
-#![allow(unreachable_code)]
+#![deny(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::panic_in_result_fn,
+  clippy::indexing_slicing,
+  clippy::integer_division,
+  clippy::arithmetic_side_effects,
+  clippy::unreachable,
+  clippy::todo,
+  clippy::unimplemented,
+  clippy::string_slice
+)]
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+extern crate alloc;
+
+/// Protocol-level constants (RFC 1035 + RFC 6762 limits).
+pub mod constants;
+
+mod trace;
+
+/// Pluggable backing storage for protocol state machines.
+pub mod pool;
+
+pub use pool::Pool;
+
+/// Monotonic time abstraction.
+pub mod time;
+
+pub use time::Instant;
 
 #[cfg(feature = "slab")]
+#[cfg_attr(docsrs, doc(cfg(feature = "slab")))]
 pub use slab;
-pub use srv::*;
-pub use txt::*;
 
-/// The error type for the mDNS protocol
+/// Opaque handles for services and queries.
+pub mod handle;
+
+pub use handle::{QueryHandle, ServiceHandle};
+
+/// Owned, canonical DNS name.
+pub mod name;
+
+pub use name::{LabelTooLongDetail, NameError, NameTooLongDetail};
+
+#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
+)]
+pub use name::Name;
+
+/// Cross-cutting error types.
 pub mod error;
 
-/// The server endpoint
-pub mod server;
+pub use error::{
+  BufferTooShortDetail, BufferTooSmallDetail, EncodeError, HandleError, HandleTimeoutError,
+  ParseError, PointerForwardDetail, RdlengthOverrunDetail, StartQueryError, StorageFullError,
+  TransmitError,
+};
 
-/// The client endpoint
-pub mod client;
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub use error::{CancelQueryError, HandleServiceRenamedError, RegisterServiceError};
 
-/// An implementation of the mDNS protocol
-pub mod proto {
-  pub use super::srv::Srv;
-  pub use super::txt::{Str, Strings, Txt};
-  pub use dns_protocol::{
-    Cursor, Deserialize, Flags, Header, Label, LabelSegment, Message, MessageType, Opcode,
-    Question, ResourceRecord, ResourceType, ResponseCode, Serialize,
-  };
-}
+/// mDNS wire format — panic-free parser and encoder.
+pub mod wire;
 
-mod srv;
-mod txt;
+/// Event types between Endpoint, Service, and Query.
+pub mod event;
+/// Outgoing-datagram descriptor.
+pub mod transmit;
 
-/// Internal identifier for a `Connection` currently associated with an endpoint
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct ConnectionHandle(pub usize);
+pub use event::{
+  EndpointEvent, HostConflict, KnownAnswer, ProbeConflict, QueryEvent, QueryUpdate, RouteEvent,
+  ServiceEvent, ServiceQuestion, ToQuery, ToService,
+};
+pub use transmit::Transmit;
 
-impl From<ConnectionHandle> for usize {
-  fn from(x: ConnectionHandle) -> Self {
-    x.0
-  }
-}
+#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
+)]
+pub use event::{ServiceRenamed, ServiceUpdate};
 
-impl core::fmt::Display for ConnectionHandle {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    write!(f, "{}", self.0)
-  }
-}
+/// Configuration types.
+pub mod config;
+/// Records published by a registered Service.
+pub mod records;
 
-/// Pre-allocated storage for a uniform data type.
-pub trait Pool<V> {
-  /// The type of the errors that can occur when interacting with the slab.
-  type Error: core::error::Error;
+pub use config::EndpointConfig;
 
-  /// The iterator type for the slab.
-  type Iter<'a>: Iterator<Item = (usize, &'a V)>
-  where
-    Self: 'a,
-    V: 'a;
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub use records::ServiceRecords;
 
-  /// Returns a new, empty slab.
-  fn new() -> Self;
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub use config::ServiceSpec;
 
-  /// Returns a new slab with the specified capacity.
-  ///
-  /// Returns an error if the slab cannot hold the specified number of entries.
-  fn with_capacity(capacity: usize) -> Result<Self, Self::Error>
-  where
-    Self: Sized;
+#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
+)]
+pub use config::QuerySpec;
 
-  /// Returns the key of the next vacant entry.
-  ///
-  /// If the slab cannot hold any more entries, an error is returned.
-  fn vacant_key(&self) -> Result<usize, Self::Error>;
+/// Passive record cache.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub mod cache;
 
-  /// Returns `true` if the slab is empty.
-  fn is_empty(&self) -> bool;
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub use cache::{Cache, CacheEntry};
 
-  /// Returns the number of entries in the slab.
-  fn len(&self) -> usize;
+/// Service state machine.
+pub mod service;
 
-  /// Return a reference to the value associated with the given key.
-  ///
-  /// If the given key is not associated with a value, then `None` is
-  /// returned.
-  fn get(&self, key: usize) -> Option<&V>;
+pub use service::ServiceState;
 
-  /// Return a mutable reference to the value associated with the given key.
-  ///
-  /// If the given key is not associated with a value, then `None` is
-  /// returned.
-  fn get_mut(&mut self, key: usize) -> Option<&mut V>;
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub use service::Service;
 
-  /// Insert a value in the slab, returning key assigned to the value.
-  ///
-  /// The returned key can later be used to retrieve or remove the value using indexed
-  /// lookup and `remove`.
-  ///
-  /// Returns an error if the slab cannot hold any more entries.
-  fn insert(&mut self, value: V) -> Result<usize, Self::Error>;
+/// Query state machine.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub mod query;
 
-  /// Tries to remove the value associated with the given key,
-  /// returning the value if the key existed.
-  ///
-  /// The key is then released and may be associated with future stored
-  /// values.
-  fn try_remove(&mut self, key: usize) -> Option<V>;
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub use query::{CollectedAnswer, Query};
 
-  /// Returns an iterator over the slab.
-  fn iter(&self) -> Self::Iter<'_>;
-}
+/// Endpoint orchestrator.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub mod endpoint;
 
-#[cfg(feature = "slab")]
-impl<T> Pool<T> for slab::Slab<T> {
-  type Error = core::convert::Infallible;
-
-  type Iter<'a>
-    = slab::Iter<'a, T>
-  where
-    Self: 'a;
-
-  fn new() -> Self {
-    slab::Slab::new()
-  }
-
-  fn with_capacity(capacity: usize) -> Result<Self, Self::Error>
-  where
-    Self: Sized,
-  {
-    Ok(slab::Slab::with_capacity(capacity))
-  }
-
-  fn vacant_key(&self) -> Result<usize, Self::Error> {
-    Ok(slab::Slab::vacant_key(self))
-  }
-
-  fn is_empty(&self) -> bool {
-    slab::Slab::is_empty(self)
-  }
-
-  fn len(&self) -> usize {
-    slab::Slab::len(self)
-  }
-
-  fn get(&self, key: usize) -> Option<&T> {
-    slab::Slab::get(self, key)
-  }
-
-  fn get_mut(&mut self, key: usize) -> Option<&mut T> {
-    slab::Slab::get_mut(self, key)
-  }
-
-  fn insert(&mut self, value: T) -> Result<usize, Self::Error> {
-    Ok(slab::Slab::insert(self, value))
-  }
-
-  fn try_remove(&mut self, key: usize) -> Option<T> {
-    slab::Slab::try_remove(self, key)
-  }
-
-  fn iter(&self) -> Self::Iter<'_> {
-    slab::Slab::iter(self)
-  }
-}
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+pub use endpoint::{Endpoint, EndpointEventEntry, RouteEvents, ServiceRoute};

@@ -1,28 +1,51 @@
 [package]
 name = "mdns-proto"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/al8n/agnostic-mdns"
-homepage = "https://github.com/al8n/agnostic-mdns"
-documentation = "https://docs.rs/agnostic-mdns"
-description = "Sans-I/O mDNS protocol implementation"
-readme = "README.md"
 rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+description = "Sans-I/O mDNS protocol state machines (no_std, no_alloc capable, panic-free)."
+repository = "https://github.com/al8n/agnostic-mdns"
+readme = "README.md"
+keywords = ["mdns", "no-std", "sans-io", "embedded", "dns"]
+categories = ["network-programming", "no-std", "embedded"]
 
-
+# Features
+#
+# At least one of `alloc` (transitively via `std`) or `heapless` must be enabled,
+# because `Name` and the protocol state machines need string/collection backing.
+# Default features include `std` (implies `alloc`); embedded `no_std` users
+# typically pass `default-features = false, features = ["heapless"]`.
 [features]
-default = ["std"]
-std = ["slab?/default", "dns-protocol/default", "thiserror/default", "simdutf8/default"]
-alloc = []
+default = ["std", "slab"]
+std = ["alloc", "thiserror/std", "rand_core/std", "smol_str?/std"]
+alloc = ["smol_str", "dep:rand"]
+slab = ["dep:slab"]
+heapless = ["dep:heapless"]
+tracing = ["dep:tracing"]
+
+# Opt-in stretch test that link-checks panic-freedom via `no-panic`.
+# Disabled by default because std-feature builds transitively pull in
+# Display/formatter paths that no-panic flags even when unreachable in
+# practice. CI's cargo-bloat scan is the primary panic-freedom check.
+test-no-panic = []
 
 [dependencies]
-auto_enums = { version = "0.8", default-features = false }
-derive_more = { version = "2", features = ["is_variant", "display", "from_str"] }
-dns-protocol = { version = "0.1", package = "dns-protocol-patch", default-features = false }
-either = { version = "1", default-features = false }
-simdutf8 = { version = "0.1", default-features = false }
-thiserror = { version = "2", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+derive_more = { version = "1.0", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
+rand_core = { version = "0.6", default-features = false }
+smol_str = { version = "0.3", default-features = false, optional = true }
+rand = { version = "0.8", default-features = false, features = ["std_rng"], optional = true }
+slab = { version = "0.4", default-features = false, optional = true }
+heapless = { version = "0.8", optional = true }
+tracing = { version = "0.1", default-features = false, optional = true }
 
-slab = { version = "0.4", optional = true, default-features = false }
-tracing = { version = "0.1", optional = true }
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["std"] }
+proptest = "1.5"
+no-panic = "0.1"
+rand = "0.8"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
