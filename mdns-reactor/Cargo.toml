@@ -2,7 +2,7 @@
 name = "mdns-reactor"
 version = "0.6.0"
 edition = "2024"
-publish = false
+publish = true
 repository = "https://github.com/al8n/agnostic-mdns"
 homepage = "https://github.com/al8n/agnostic-mdns"
 documentation = "https://docs.rs/mdns-reactor"

@@ -19,3 +19,6 @@ Cargo.lock
 
 # Local design docs / specs / planning notes — keep out of the repo.
 /docs/
+
+# macOS Finder metadata
+.DS_Store
