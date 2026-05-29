@@ -1,5 +1,8 @@
 //! Caller-side handle for an mDNS endpoint.
 
+use std::{future::Future, pin::Pin, sync::Arc};
+
+use agnostic_lite::RuntimeLite;
 use agnostic_net::Net;
 use mdns_proto::{QuerySpec, ServiceSpec};
 use mdns_udp::{
@@ -15,6 +18,13 @@ use crate::{
   service::Service,
 };
 
+/// Type-erased detached-task spawner captured at [`Endpoint::server`] time. It
+/// lets the runtime-agnostic `Endpoint` spawn background tasks (e.g. a discovery
+/// [`Lookup`](crate::Lookup) driver) without itself being generic over the
+/// runtime — the concrete `N::Runtime` is closed over here, exactly as quinn's
+/// `Arc<dyn Runtime>` erases its spawner.
+type SpawnFn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
+
 /// Handle to a running mDNS endpoint.
 ///
 /// Cloneable; every clone shares the same underlying driver task. The driver
@@ -23,6 +33,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Endpoint {
   cmd: async_channel::Sender<Command>,
+  spawn: SpawnFn,
 }
 
 impl Endpoint {
@@ -101,7 +112,21 @@ impl Endpoint {
     };
     driver::spawn::<N>(opts, sockets, cmd_rx);
 
-    Ok(Self { cmd: cmd_tx })
+    // close over the concrete runtime so type-erased clones of this endpoint
+    // can spawn background tasks (e.g. discovery lookups).
+    let spawn: SpawnFn = Arc::new(|fut: Pin<Box<dyn Future<Output = ()> + Send>>| {
+      <N::Runtime as RuntimeLite>::spawn_detach(fut);
+    });
+
+    Ok(Self { cmd: cmd_tx, spawn })
+  }
+
+  /// Spawn a detached background task on this endpoint's runtime.
+  pub(crate) fn spawn_task<F>(&self, fut: F)
+  where
+    F: Future<Output = ()> + Send + 'static,
+  {
+    (self.spawn)(Box::pin(fut));
   }
 
   /// Register a new service with the responder. The returned [`Service`]

@@ -18,6 +18,17 @@
 //! and by [`QueryParam::with_max_entries`], and is cancelled by dropping the
 //! [`Lookup`].
 //!
+//! # Design
+//!
+//! Modeled on quinn's `ConnectionDriver`: a spawned [`LookupDriver`] task owns
+//! the browse/resolve sub-queries and the aggregation state machine, and pushes
+//! resolved entries into shared state ([`LookupQueue`]) that the [`Lookup`]
+//! handle drains — mirroring the [`crate::Query`] mailbox/doorbell split. Driving
+//! the aggregation in its own task (rather than only while the caller awaits
+//! [`Lookup::next`]) means the sub-query mailboxes are drained promptly, so a
+//! slow consumer cannot stall resolution; the shared queue stays bounded by
+//! coalescing repeated snapshots of an instance.
+//!
 //! Instance/host names that the [`Name`] type cannot represent faithfully — a
 //! label containing a `.` or a non-ASCII byte — are skipped rather than
 //! silently corrupted (`Name` is an ASCII, dot-separated, no-escaping type).
@@ -25,10 +36,11 @@
 use std::{
   collections::{HashMap, HashSet, VecDeque},
   net::{IpAddr, Ipv4Addr, Ipv6Addr},
+  sync::{Arc, Mutex, MutexGuard},
   time::Duration,
 };
 
-use futures::{StreamExt, stream::SelectAll};
+use futures::{FutureExt, StreamExt, pin_mut, select_biased, stream::SelectAll};
 use mdns_proto::{
   Name, QuerySpec,
   wire::{ARecord, AaaaRecord, NameRef, PtrRecord, ResourceType, SrvRecord, TxtRecord},
@@ -256,14 +268,21 @@ struct HostAddrs {
   ipv6: Vec<Ipv6Addr>,
 }
 
-/// Pure browse/resolve aggregation state machine — no I/O. The [`Lookup`] feeds
-/// it parsed answers and launches the follow-up queries it requests.
+/// Pure browse/resolve aggregation state machine — no I/O. The [`LookupDriver`]
+/// feeds it parsed answers and launches the follow-up queries it requests.
 struct Resolver {
   builders: HashMap<String, Builder>,
   host_addrs: HashMap<String, HostAddrs>,
   hosts_queried: HashSet<String>,
   ready: VecDeque<ServiceEntry>,
+  /// Cap on distinct instances tracked.
   max_entries: usize,
+  /// Cap on distinct hosts A/AAAA-queried. Set equal to `max_entries`: honest
+  /// browsing has at most one host per instance, so this never bites a real
+  /// responder, but it bounds an instance that floods distinct SRV targets
+  /// (which would otherwise grow `hosts_queried`/`host_addrs` and the in-flight
+  /// A/AAAA sub-query set without limit).
+  max_hosts: usize,
   dropped: u64,
 }
 
@@ -275,6 +294,7 @@ impl Resolver {
       hosts_queried: HashSet::new(),
       ready: VecDeque::new(),
       max_entries,
+      max_hosts: max_entries,
       dropped: 0,
     }
   }
@@ -306,7 +326,8 @@ impl Resolver {
   }
 
   /// An instance's SRV: record host + port, adopt any addresses already learned
-  /// for that host, and request A/AAAA the first time we see the host.
+  /// for that host, and request A/AAAA the first time we see the host — subject
+  /// to the distinct-host cap, which bounds an SRV-target flood.
   fn on_srv(&mut self, inst_key: &str, host: Name, port: u16) -> Vec<Start> {
     let host_key = fold(&host);
     let cached = self.host_addrs.get(&host_key);
@@ -324,20 +345,26 @@ impl Resolver {
       }
     }
     self.try_emit(inst_key, false);
-    if self.hosts_queried.insert(host_key.clone()) {
-      vec![
-        Start {
-          name: host.clone(),
-          step: Step::A(host_key.clone()),
-        },
-        Start {
-          name: host,
-          step: Step::Aaaa(host_key),
-        },
-      ]
-    } else {
-      Vec::new()
+    if self.hosts_queried.contains(&host_key) {
+      return Vec::new(); // already querying this host
     }
+    if self.hosts_queried.len() >= self.max_hosts {
+      // SRV-target flood guard: refuse to query an unbounded set of hosts.
+      // Counted so the resulting partial view is observable via `dropped`.
+      self.dropped = self.dropped.saturating_add(1);
+      return Vec::new();
+    }
+    self.hosts_queried.insert(host_key.clone());
+    vec![
+      Start {
+        name: host.clone(),
+        step: Step::A(host_key.clone()),
+      },
+      Start {
+        name: host,
+        step: Step::Aaaa(host_key),
+      },
+    ]
   }
 
   fn on_txt(&mut self, inst_key: &str, segs: Vec<Vec<u8>>) {
@@ -350,6 +377,9 @@ impl Resolver {
   /// An A/AAAA answer for a host: cache it (capped) and apply it to every
   /// instance whose SRV already pointed at that host. A newly-added address may
   /// re-emit an already-surfaced instance with the fuller address set.
+  ///
+  /// Only called for a host we actually launched A/AAAA queries for (a step key
+  /// from a query we started), so `host_addrs` stays bounded by `hosts_queried`.
   fn on_addr(&mut self, host_key: &str, addr: IpAddr) {
     let cache = self.host_addrs.entry(host_key.to_owned()).or_default();
     match addr {
@@ -402,83 +432,136 @@ impl Resolver {
   }
 }
 
-/// A running DNS-SD lookup.
-///
-/// Call [`Self::next`] to receive resolved [`ServiceEntry`] values as they
-/// complete; it returns `None` once every query (browse + resolves) has timed
-/// out. Dropping the `Lookup` cancels all of its in-flight queries.
-pub struct Lookup {
+/// Bounded, instance-coalescing queue of resolved entries shared between the
+/// spawned [`LookupDriver`] (which fills it) and the [`Lookup`] handle (which
+/// drains it via [`Lookup::next`]). Mirrors the [`crate::Query`] mailbox.
+struct LookupQueue {
+  ready: VecDeque<ServiceEntry>,
+  /// Set once the driver task has finished (all sub-queries terminated, or the
+  /// handle was dropped). A drained-empty queue with `done` set is end-of-stream.
+  done: bool,
+  /// Snapshot of the resolver's drop counter, surfaced via [`Lookup::dropped`].
+  dropped: u64,
+}
+
+impl LookupQueue {
+  fn new() -> Self {
+    Self {
+      ready: VecDeque::new(),
+      done: false,
+      dropped: 0,
+    }
+  }
+
+  /// Enqueue a resolved entry, coalescing by instance so a slow consumer cannot
+  /// grow the queue past the live instance set: a newer snapshot for an instance
+  /// supersedes any still-pending one (matching the "later yield supersedes
+  /// earlier" contract on [`Lookup::next`]).
+  fn enqueue(&mut self, entry: ServiceEntry) {
+    if let Some(slot) = self
+      .ready
+      .iter_mut()
+      .find(|e| e.instance.as_str() == entry.instance.as_str())
+    {
+      *slot = entry;
+    } else {
+      self.ready.push_back(entry);
+    }
+  }
+}
+
+/// Lock the shared queue, recovering the guard if a previous holder panicked
+/// (the lock is never held across a fallible operation, so the data is sound).
+fn lock(q: &Mutex<LookupQueue>) -> MutexGuard<'_, LookupQueue> {
+  q.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Spawned task that owns the browse/resolve sub-queries and the [`Resolver`],
+/// feeding resolved entries into the shared [`LookupQueue`]. Quinn's
+/// `ConnectionDriver`, scoped to a single lookup.
+struct LookupDriver {
   endpoint: Endpoint,
   streams: SelectAll<futures::stream::BoxStream<'static, Tagged>>,
   resolver: Resolver,
-  /// Follow-up queries discovered but not yet launched. Queued (rather than
-  /// launched inline) so that dropping the `next()` future mid-launch does not
-  /// lose them — they are retried on the next call.
-  pending_starts: VecDeque<Start>,
+  queue: Arc<Mutex<LookupQueue>>,
+  /// Capacity-1 wakeup the consumer parks on; rung after the queue changes.
+  doorbell: async_channel::Sender<()>,
+  /// Closes when the [`Lookup`] handle is dropped, which stops the task and
+  /// (by dropping the sub-query [`Query`] handles) cancels every sub-query.
+  cancel: async_channel::Receiver<()>,
   resolve_timeout: Duration,
   unicast: bool,
 }
 
-impl Lookup {
-  /// Wait for the next resolved service instance, or `None` when the lookup is
-  /// finished (all queries timed out).
-  ///
-  /// An instance may be yielded more than once as additional addresses resolve
-  /// (e.g. a late AAAA after the entry was first surfaced on its A address); a
-  /// later yield for the same [`ServiceEntry::instance_name`] supersedes the
-  /// earlier one. This method is cancellation-safe: dropping the future does
-  /// not lose queued follow-up queries.
-  pub async fn next(&mut self) -> Option<ServiceEntry> {
+impl LookupDriver {
+  async fn run(mut self) {
     loop {
-      if let Some(entry) = self.resolver.take_ready() {
-        return Some(entry);
+      // Wait for the next answer or for the handle to be dropped. The futures
+      // borrow disjoint fields; act on `self` only after the select resolves
+      // (mirrors the main driver loop's borrow discipline).
+      let tagged = {
+        let next = self.streams.next().fuse();
+        let stop = self.cancel.recv().fuse();
+        pin_mut!(next, stop);
+        select_biased! {
+          _ = stop => None,   // handle dropped → stop
+          t = next => t,      // Some(answer), or None when all sub-queries end
+        }
+      };
+      match tagged {
+        Some(t) => self.process(t).await,
+        None => break,
       }
-      // Launch queued follow-ups before polling for more answers. Peek-then-pop
-      // so a cancellation mid-launch leaves the start queued for a retry rather
-      // than dropping it (a benign double-start at worst).
-      if let Some(start) = self.pending_starts.front().cloned() {
-        self.launch(start).await;
-        self.pending_starts.pop_front();
-        continue;
-      }
-      let tagged = self.streams.next().await?;
-      self.process(tagged);
     }
+    // Signal end-of-stream and wake any parked consumer.
+    {
+      let mut q = lock(&self.queue);
+      q.done = true;
+      q.dropped = self.resolver.dropped;
+    }
+    let _ = self.doorbell.try_send(());
   }
 
-  /// Number of distinct instances dropped because the [`QueryParam`] cap was
-  /// reached. A non-zero value means the result set is a partial view.
-  pub fn dropped(&self) -> u64 {
-    self.resolver.dropped
+  /// Feed one answer to the resolver, launch any follow-up queries it requests,
+  /// then flush newly-resolved entries to the consumer.
+  async fn process(&mut self, tagged: Tagged) {
+    for start in self.feed(tagged) {
+      // Launch inline. If the handle was dropped mid-launch the `start_query`
+      // round-trip still completes promptly (the main driver replies regardless),
+      // and the next loop iteration's `cancel` arm stops the task.
+      self.launch(start).await;
+    }
+    self.flush();
   }
 
-  fn process(&mut self, tagged: Tagged) {
+  /// Decode `tagged`, feed the resolver, and return the follow-up queries.
+  fn feed(&mut self, tagged: Tagged) -> Vec<Start> {
     let answer = match tagged.event {
       QueryEvent::Answer(a) => a,
-      QueryEvent::Terminal(_) => return,
+      QueryEvent::Terminal(_) => return Vec::new(),
     };
-    let starts = match tagged.step {
+    match tagged.step {
       Step::Ptr => {
         if answer.rtype() != ResourceType::Ptr {
-          return;
+          return Vec::new();
         }
         match parse_name(answer.rdata_slice()) {
           Some(instance) => self.resolver.on_ptr(instance),
-          None => return,
+          None => Vec::new(),
         }
       }
       Step::Srv(inst_key) => {
         if answer.rtype() != ResourceType::Srv {
-          return;
+          return Vec::new();
         }
         match parse_srv(answer.rdata_slice()) {
           Some((host, port)) => self.resolver.on_srv(&inst_key, host, port),
-          None => return,
+          None => Vec::new(),
         }
       }
       Step::Txt(inst_key) => {
         if answer.rtype() != ResourceType::Txt {
-          return;
+          return Vec::new();
         }
         self
           .resolver
@@ -486,25 +569,37 @@ impl Lookup {
         Vec::new()
       }
       Step::A(host_key) => {
-        match ARecord::try_from_rdata(answer.rdata_slice()) {
-          Ok(r) if answer.rtype() == ResourceType::A => {
+        if let Ok(r) = ARecord::try_from_rdata(answer.rdata_slice()) {
+          if answer.rtype() == ResourceType::A {
             self.resolver.on_addr(&host_key, IpAddr::V4(r.addr()));
           }
-          _ => return,
         }
         Vec::new()
       }
       Step::Aaaa(host_key) => {
-        match AaaaRecord::try_from_rdata(answer.rdata_slice()) {
-          Ok(r) if answer.rtype() == ResourceType::Aaaa => {
+        if let Ok(r) = AaaaRecord::try_from_rdata(answer.rdata_slice()) {
+          if answer.rtype() == ResourceType::Aaaa {
             self.resolver.on_addr(&host_key, IpAddr::V6(r.addr()));
           }
-          _ => return,
         }
         Vec::new()
       }
-    };
-    self.pending_starts.extend(starts);
+    }
+  }
+
+  /// Move newly-resolved entries into the shared queue and wake the consumer.
+  fn flush(&mut self) {
+    let mut woke = false;
+    let mut q = lock(&self.queue);
+    while let Some(entry) = self.resolver.take_ready() {
+      q.enqueue(entry);
+      woke = true;
+    }
+    q.dropped = self.resolver.dropped;
+    drop(q);
+    if woke {
+      let _ = self.doorbell.try_send(());
+    }
   }
 
   /// Start a resolve sub-query and fold its answers into the merged stream.
@@ -519,6 +614,59 @@ impl Lookup {
   }
 }
 
+/// A running DNS-SD lookup.
+///
+/// Call [`Self::next`] to receive resolved [`ServiceEntry`] values as they
+/// complete; it returns `None` once every query (browse + resolves) has timed
+/// out. Resolution is driven by a spawned [`LookupDriver`] task, so it proceeds
+/// even between calls to `next`. Dropping the `Lookup` stops that task and
+/// cancels all of its in-flight queries.
+pub struct Lookup {
+  queue: Arc<Mutex<LookupQueue>>,
+  /// Capacity-1 wakeup the driver rings after filling the queue.
+  doorbell: async_channel::Receiver<()>,
+  /// Held only so dropping the `Lookup` closes the driver's `cancel` channel.
+  _cancel: async_channel::Sender<()>,
+}
+
+impl Lookup {
+  /// Wait for the next resolved service instance, or `None` when the lookup is
+  /// finished (all queries timed out).
+  ///
+  /// An instance may be yielded more than once as additional addresses resolve
+  /// (e.g. a late AAAA after the entry was first surfaced on its A address); a
+  /// later yield for the same [`ServiceEntry::instance_name`] supersedes the
+  /// earlier one. Single-consumer: takes `&mut self`, so there is at most one
+  /// in-flight `next()` per `Lookup`, matching the single-waiter doorbell.
+  pub async fn next(&mut self) -> Option<ServiceEntry> {
+    loop {
+      {
+        let mut q = lock(&self.queue);
+        if let Some(entry) = q.ready.pop_front() {
+          return Some(entry);
+        }
+        if q.done {
+          return None;
+        }
+      }
+      // Nothing ready: park until the driver rings. A closed doorbell means the
+      // driver task exited — do one final drain (entries or the `done` flag it
+      // set just before exiting are already visible under the lock).
+      if self.doorbell.recv().await.is_err() {
+        return lock(&self.queue).ready.pop_front();
+      }
+    }
+  }
+
+  /// Number of discoveries dropped because a [`QueryParam`] cap was reached —
+  /// either the distinct-instance cap ([`QueryParam::with_max_entries`]) or the
+  /// distinct-host cap that bounds an SRV-target flood. A non-zero value means
+  /// the result set is a partial view.
+  pub fn dropped(&self) -> u64 {
+    lock(&self.queue).dropped
+  }
+}
+
 impl Endpoint {
   /// Browse for instances of a DNS-SD service type, resolving each into a
   /// [`ServiceEntry`]. See [`Lookup`] and [`QueryParam`].
@@ -527,16 +675,33 @@ impl Endpoint {
     let ptr_spec = QuerySpec::new(param.service, ResourceType::Ptr)
       .with_timeout(param.timeout)
       .with_unicast_response(param.unicast_response);
+    // Start the browse query up front so a start failure surfaces synchronously
+    // to the caller rather than vanishing inside the spawned task.
     let ptr_query = self.start_query(ptr_spec).await?;
+
     let mut streams = SelectAll::new();
     streams.push(tagged_stream(ptr_query, Step::Ptr));
-    Ok(Lookup {
+
+    let queue = Arc::new(Mutex::new(LookupQueue::new()));
+    let (doorbell_tx, doorbell_rx) = async_channel::bounded(1);
+    let (cancel_tx, cancel_rx) = async_channel::bounded(1);
+
+    let driver = LookupDriver {
       endpoint: self.clone(),
       streams,
       resolver: Resolver::new(param.max_entries),
-      pending_starts: VecDeque::new(),
+      queue: Arc::clone(&queue),
+      doorbell: doorbell_tx,
+      cancel: cancel_rx,
       resolve_timeout,
       unicast: param.unicast_response,
+    };
+    self.spawn_task(driver.run());
+
+    Ok(Lookup {
+      queue,
+      doorbell: doorbell_rx,
+      _cancel: cancel_tx,
     })
   }
 
@@ -825,5 +990,52 @@ mod tests {
       last.expect("at least one emit").ipv4_addresses().len(),
       MAX_ADDRS_PER_HOST
     );
+  }
+
+  #[test]
+  fn srv_target_flood_is_capped() {
+    // One instance whose SRV target host changes on every answer (a hostile or
+    // pathological responder) must not grow the host-query set without bound.
+    let mut r = Resolver::new(4); // max_hosts == max_entries == 4
+    let inst = Name::try_from_str("i._x._tcp.local.").unwrap();
+    let k = fold(&inst);
+    r.on_ptr(inst);
+    let mut launched = 0usize;
+    for i in 0..20u16 {
+      let host = Name::try_from_str(&format!("h{i}.local.")).unwrap();
+      launched += r.on_srv(&k, host, 8000 + i).len();
+    }
+    // At most max_hosts distinct hosts get A+AAAA launches (2 starts each).
+    assert_eq!(r.hosts_queried.len(), 4);
+    assert_eq!(r.host_addrs.len(), 0, "no addresses arrived yet");
+    assert_eq!(launched, 4 * 2);
+    // The 16 over-cap target hosts are counted so the partial view is observable.
+    assert_eq!(r.dropped, 16);
+  }
+
+  #[test]
+  fn srv_txt_mutation_after_emit_stays_bounded() {
+    // After an instance is surfaced, further SRV/TXT answers (new target hosts,
+    // changed metadata) must not grow the host-query set past the cap or panic.
+    let mut r = Resolver::new(2); // max_hosts == 2
+    let inst = Name::try_from_str("i._x._tcp.local.").unwrap();
+    let h1 = Name::try_from_str("h1.local.").unwrap();
+    let k = fold(&inst);
+    let hk1 = fold(&h1);
+    r.on_ptr(inst);
+    r.on_srv(&k, h1, 8000);
+    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    r.on_addr(&hk1, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    assert!(r.take_ready().is_some(), "instance completes on h1");
+
+    // SRV now mutates to a flood of new target hosts, and TXT keeps changing.
+    for i in 0..10u16 {
+      let h = Name::try_from_str(&format!("m{i}.local.")).unwrap();
+      r.on_srv(&k, h, 9000 + i);
+      r.on_txt(&k, vec![format!("v={i}").into_bytes()]);
+    }
+    // h1 took one host slot; at most one more (cap 2) is ever queried.
+    assert!(r.hosts_queried.len() <= 2, "host set stays bounded");
+    assert!(r.host_addrs.len() <= 2, "host cache stays bounded");
   }
 }
