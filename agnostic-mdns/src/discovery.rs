@@ -331,15 +331,22 @@ impl Resolver {
   fn on_srv(&mut self, inst_key: &str, host: Name, port: u16) -> Vec<Start> {
     let host_key = fold(&host);
     let cached = self.host_addrs.get(&host_key);
+    let mut changed = false;
     if let Some(b) = self.builders.get_mut(inst_key) {
+      let host_changed = b.host_key.as_deref() != Some(host_key.as_str());
       // SRV retargeting the instance to a DIFFERENT host invalidates the old
       // host's addresses — drop them before adopting the new host's, so a
       // re-emit never yields an entry whose host is the new target but whose
       // addresses still belong to the old one.
-      if b.host_key.as_deref() != Some(host_key.as_str()) {
+      if host_changed {
         b.ipv4.clear();
         b.ipv6.clear();
       }
+      // A host or port change to an already-surfaced instance must re-emit even
+      // when the new host's addresses are already cached — no fresh A/AAAA event
+      // will arrive to trigger the re-emit, so without this the consumer keeps a
+      // stale host/port.
+      changed = host_changed || b.port != port;
       b.host = Some(host.clone());
       b.host_key = Some(host_key.clone());
       b.port = port;
@@ -352,7 +359,7 @@ impl Resolver {
         }
       }
     }
-    self.try_emit(inst_key, false);
+    self.try_emit(inst_key, changed);
     if self.hosts_queried.contains(&host_key) {
       return Vec::new(); // already querying this host
     }
@@ -682,7 +689,13 @@ impl Endpoint {
     let resolve_timeout = param.resolve_timeout.unwrap_or(param.timeout);
     let ptr_spec = QuerySpec::new(param.service, ResourceType::Ptr)
       .with_timeout(param.timeout)
-      .with_unicast_response(param.unicast_response);
+      .with_unicast_response(param.unicast_response)
+      // Size the PTR answer pool to the requested instance cap so a max_entries
+      // above the query's default answer cap is actually reachable, and the
+      // Resolver — not the query's answer pool — is what bounds and counts
+      // instances (`Lookup::dropped`). Without this, surplus PTR answers would be
+      // evicted before `on_ptr` could track or count them.
+      .with_max_answers(param.max_entries);
     // Start the browse query up front so a start failure surfaces synchronously
     // to the caller rather than vanishing inside the spawned task.
     let ptr_query = self.start_query(ptr_spec).await?;
@@ -1051,6 +1064,55 @@ mod tests {
       second.ipv4_addresses(),
       [Ipv4Addr::new(10, 0, 0, 2)],
       "stale h1 address must not survive the retarget"
+    );
+  }
+
+  #[test]
+  fn srv_retarget_to_cached_host_reemits() {
+    // An already-emitted instance retargets to a host whose addresses are
+    // ALREADY cached (shared with another instance). No fresh A/AAAA event will
+    // arrive, so the SRV change itself must re-emit the new host/port + adopted
+    // address rather than leaving the consumer with a stale entry.
+    let mut r = Resolver::new(16);
+    let i1 = Name::try_from_str("i1._x._tcp.local.").unwrap();
+    let i2 = Name::try_from_str("i2._x._tcp.local.").unwrap();
+    let shared = Name::try_from_str("shared.local.").unwrap();
+    let other = Name::try_from_str("other.local.").unwrap();
+    let k1 = fold(&i1);
+    let k2 = fold(&i2);
+    let shk = fold(&shared);
+    let ohk = fold(&other);
+
+    // i1 resolves on `shared`, populating the host-address cache.
+    r.on_ptr(i1);
+    r.on_srv(&k1, shared.clone(), 8000);
+    r.on_txt(&k1, vec![b"a=1".to_vec()]);
+    r.on_addr(&shk, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)));
+    r.take_ready().expect("i1 resolves on shared");
+
+    // i2 first resolves on a DIFFERENT host.
+    r.on_ptr(i2);
+    r.on_srv(&k2, other, 9000);
+    r.on_txt(&k2, vec![b"b=2".to_vec()]);
+    r.on_addr(&ohk, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8)));
+    let i2_first = r.take_ready().expect("i2 resolves on other");
+    assert_eq!(i2_first.host().as_str(), "other.local.");
+
+    // i2's SRV now retargets to `shared` (already cached, already queried).
+    let starts = r.on_srv(&k2, shared, 9001);
+    assert!(
+      starts.is_empty(),
+      "shared host already queried — no new A/AAAA launched"
+    );
+    let i2_re = r
+      .take_ready()
+      .expect("i2 must re-emit on the cached host without a fresh address event");
+    assert_eq!(i2_re.host().as_str(), "shared.local.");
+    assert_eq!(i2_re.port(), 9001);
+    assert_eq!(
+      i2_re.ipv4_addresses(),
+      [Ipv4Addr::new(10, 0, 0, 9)],
+      "adopts the shared host's cached address, not the stale one"
     );
   }
 
