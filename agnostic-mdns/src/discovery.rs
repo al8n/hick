@@ -788,8 +788,12 @@ impl Endpoint {
     // REMAINING budget, not a fresh full `timeout`, so the whole call stays
     // bounded by `timeout` as documented (an SRV arriving late can't grant the
     // address queries a second full window).
-    let deadline = Instant::now() + timeout;
-    let remaining = || deadline.saturating_duration_since(Instant::now());
+    // `checked_add` so a pathological `timeout` (e.g. `Duration::MAX`) cannot
+    // panic the way `Instant + Duration` would. An overflow means "no effective
+    // deadline", so each stage just receives the full (huge) `timeout`, which
+    // `QuerySpec` clamps with its own checked arithmetic.
+    let deadline = Instant::now().checked_add(timeout);
+    let remaining = || deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
     let mut resolver = Resolver::new(1);
     let mut streams = SelectAll::new();
     // Seed the resolver with the instance and issue its SRV + TXT (no PTR).
