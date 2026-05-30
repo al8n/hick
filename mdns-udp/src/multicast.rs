@@ -492,7 +492,8 @@ pub fn recv_with_meta(
   // to hand `recvmsg` a pointer to fill; recvmsg writes a valid sockaddr within
   // `msg_namelen` before we read it back via `SockAddr::new`.
   #[allow(unsafe_code)]
-  let storage_ptr = unsafe { storage.view_as::<libc::sockaddr_storage>() } as *mut libc::sockaddr_storage;
+  let storage_ptr =
+    unsafe { storage.view_as::<libc::sockaddr_storage>() } as *mut libc::sockaddr_storage;
   msg.msg_name = storage_ptr.cast();
   msg.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
   msg.msg_iov = core::ptr::addr_of_mut!(iov);
@@ -742,7 +743,6 @@ fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {
 fn parse_rx_time(_cmsgs: &[u8]) -> Option<SystemTime> {
   None
 }
-
 
 /// One parsed cmsg header + data slice.
 #[cfg(unix)]

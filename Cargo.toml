@@ -1,9 +1,9 @@
 [workspace]
-members = ["mdns-proto", "mdns-udp", "mdns-reactor"]
+members = ["mdns-proto", "mdns-udp", "mdns-reactor", "mdns-compio"]
 resolver = "3"
-
 
 [workspace.dependencies]
 mdns-proto = { version = "0.5", path = "mdns-proto", default-features = false }
 mdns-udp = { version = "0.5", path = "mdns-udp", default-features = false }
-mdns-reactor = { version = "0.5", path = "mdns-reactor", default-features = false }
+mdns-reactor = { version = "0.6", path = "mdns-reactor", default-features = false }
+mdns-compio = { version = "0.1", path = "mdns-compio", default-features = false }

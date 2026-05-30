@@ -1262,9 +1262,11 @@ fn packet_is_response(data: &[u8]) -> bool {
 /// single link, so a link-local source counts as on-link ONLY when it arrived
 /// on the bound interface. When `recv_iface` is `0` (provenance unavailable)
 /// we cannot scope it and accept it (degraded) rather than drop legitimate
-/// link-local discovery. Loopback is always on-link. When the subnet list is
-/// empty (enumeration failed) we likewise accept, so a discovery never breaks
-/// just because interface lookup failed.
+/// link-local discovery. Loopback is always on-link. A global (routable)
+/// source is accepted only when it matches a cached local subnet; with no
+/// match — including when no subnets were enumerated — it is dropped as
+/// off-link (fail-closed per §11), so a global sender is never admitted
+/// without positive on-link evidence.
 fn src_on_local_link(
   local_subnets: &[(IpAddr, u8)],
   bound_iface: u32,
@@ -1284,9 +1286,9 @@ fn src_on_local_link(
     // (degraded) rather than drop.
     return recv_iface == 0 || recv_iface == bound_iface;
   }
-  if local_subnets.is_empty() {
-    return true; // couldn't enumerate — don't wrongly drop
-  }
+  // Global (routable) source: admit only with positive on-link evidence. An
+  // empty `local_subnets` makes `any` return `false`, so a global source is
+  // dropped as off-link (fail-closed per §11) when nothing was enumerated.
   local_subnets
     .iter()
     .any(|&(net, prefix)| addr_in_subnet(net, prefix, src))
@@ -2451,12 +2453,33 @@ mod tests {
       BOUND,
       IpAddr::V4(Ipv4Addr::LOCALHOST)
     ));
-    // No enumerated subnets → conservatively accept (can't determine).
-    assert!(src_on_local_link(
+    // §11 fail-closed: a global source with no enumerated subnets has no
+    // on-link evidence and is dropped (was previously fail-open).
+    assert!(!src_on_local_link(
       &[],
       BOUND,
       BOUND,
       IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))
+    ));
+    assert!(!src_on_local_link(
+      &[],
+      BOUND,
+      BOUND,
+      IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
+    ));
+    // A global source inside a cached /8 is on-link; outside it is dropped.
+    let wide = vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8u8)];
+    assert!(src_on_local_link(
+      &wide,
+      BOUND,
+      BOUND,
+      IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))
+    ));
+    assert!(!src_on_local_link(
+      &wide,
+      BOUND,
+      BOUND,
+      IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
     ));
   }
 
@@ -2486,8 +2509,8 @@ mod tests {
   fn collect_local_subnets_rejects_zero_index() {
     // the fallback is scoped to the BOUND interface. Index 0 is
     // "no interface" — it must NOT enumerate every NIC, so the result is
-    // empty (which makes src_on_local_link conservatively fail open rather
-    // than treat another NIC's subnet as on-link).
+    // empty (which makes src_on_local_link fail closed for a global source
+    // rather than treat another NIC's subnet as on-link).
     assert!(collect_local_subnets(0).is_empty());
   }
 
