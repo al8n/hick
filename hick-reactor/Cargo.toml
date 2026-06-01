@@ -1,0 +1,56 @@
+[package]
+name = "hick-reactor"
+version = "0.6.0"
+edition = "2024"
+publish = true
+repository = "https://github.com/al8n/hick"
+homepage = "https://github.com/al8n/hick"
+documentation = "https://docs.rs/hick-reactor"
+description = "Async mDNS driver layered on `mdns-proto` + `hick-udp`, runtime-agnostic via `agnostic-net` (tokio & smol)."
+license = "MIT OR Apache-2.0"
+rust-version = "1.91.0"
+categories = ["network-programming"]
+keywords = ["mdns", "dns-sd", "zeroconf", "agnostic", "async-mdns"]
+readme = "README.md"
+
+[features]
+default = ["tokio"]
+tokio = ["agnostic-net/tokio"]
+smol = ["agnostic-net/smol"]
+
+# Forward to `mdns-proto`'s `tracing` feature so callers can opt in.
+# The driver itself already emits `tracing::debug!` on socket errors
+# regardless of this feature; turning it on additionally surfaces the
+# proto-layer trace points (Endpoint::handle, observe_send, Service::poll,
+# etc.) at trace/debug levels.
+tracing = ["mdns-proto/tracing"]
+
+[dependencies]
+mdns-proto = { workspace = true, features = ["std", "slab"] }
+hick-udp.workspace = true
+agnostic-net = { version = "0.3" }
+agnostic-lite = { version = "0.6" }
+async-channel = "2"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+getifs = "0.6"
+pin-project-lite = "0.2"
+rand = "0.10"
+slab = "0.4"
+smol_str = "0.3"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+agnostic-net = { version = "0.3", features = ["tokio", "smol"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+tokio = { version = "1", features = ["full"] }
+smol = "2"
+# Pin the loopback interface in the end-to-end driver integration tests.
+getifs = "0.6"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

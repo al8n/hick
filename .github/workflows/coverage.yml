@@ -1,0 +1,142 @@
+name: coverage
+
+on:
+  push:
+    branches: [main, refactor/sansio]
+    paths-ignore:
+      - "**.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.txt"
+      - "art/**"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.txt"
+      - "art/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Per-OS coverage so the platform `cfg`s are actually exercised: the Apple
+  # `target_vendor` cmsg quirks (macOS), the Windows receive path, and the
+  # shared unix path (Linux) each only compile — and so are only measurable — on
+  # their own host. Each job emits a Cobertura report and uploads it as an
+  # artifact; `upload-codecov` merges them so codecov.io reflects every platform.
+  #
+  # cargo-llvm-cov (not tarpaulin) is the tool: tarpaulin's engine does not
+  # credit coverage executed in `spawn_detach`'d async tasks, where the driver
+  # run/recv loops live, so it under-reports those files by ~20 points.
+  coverage-report:
+    name: Coverage (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Linux leg is the hard gate: it builds the platform-agnostic bulk
+          # plus the Linux socket paths, and must stay >= 90% line coverage.
+          - os: ubuntu-latest
+            gate: "--fail-under-lines 90"
+            exclude: ""
+          # macOS / Windows add their platform-specific lines to the merge but do
+          # not hard-gate: merging surfaces cfg'd-out code that a single host can
+          # never count, so the per-OS number is not directly comparable to 90%.
+          - os: macos-latest
+            gate: ""
+            exclude: ""
+          # hick-embassy is no_std: its host-test build needs a critical-section
+          # impl that doesn't link with the Windows MSVC toolchain, and its
+          # coverage is already captured on the Linux/macOS legs, so skip it here.
+          - os: windows-latest
+            gate: ""
+            exclude: "--exclude hick-embassy"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Generate coverage (Cobertura)
+        shell: bash
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov --all-features --workspace ${{ matrix.exclude }} \
+            --cobertura --output-path coverage/cobertura.xml ${{ matrix.gate }}
+      - name: Upload coverage artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.os }}
+          path: coverage/cobertura.xml
+
+  # Pure-musl coverage of the socket layer: hick-udp talks to libc directly for
+  # the cmsg / multicast plumbing, so building against musl-libc (instead of
+  # glibc) exercises a distinct libc-struct path. Scoped to mdns-proto +
+  # hick-udp. The musl test binary is statically linked and runs natively on the
+  # runner, so no emulator is needed — only the musl linker and the rustup
+  # target. (FreeBSD coverage was dropped: its synth-cmsg parse tests assume the
+  # Linux/Apple cmsg ABI and don't round-trip on the BSD layout; FreeBSD remains
+  # compile-verified by the `cross-check` job in ci.yml.)
+  coverage-linux-musl:
+    name: Coverage (linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: llvm-tools-preview
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Generate coverage (Cobertura)
+        shell: bash
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov -p mdns-proto -p hick-udp --all-features \
+            --target x86_64-unknown-linux-musl \
+            --cobertura --output-path coverage/cobertura.xml
+      - name: Upload coverage artifact
+        if: hashFiles('coverage/cobertura.xml') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-musl
+          path: coverage/cobertura.xml
+
+  # Merge every platform's report into one codecov.io upload. `always() &&
+  # !cancelled()` lets the merge run even if a producer failed or was skipped;
+  # `download-artifact` then picks up whatever reports were actually produced, so
+  # a missing platform just drops that platform's data for the commit rather than
+  # killing the whole coverage signal.
+  upload-codecov:
+    needs: [coverage-report, coverage-linux-musl]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download all coverage reports
+        uses: actions/download-artifact@v8
+        with:
+          path: reports/
+      - name: List downloaded reports
+        run: ls -aR reports || true
+      - name: Upload to codecov.io
+        uses: codecov/codecov-action@v6
+        with:
+          directory: reports
+          fail_ci_if_error: false
+          slug: ${{ github.repository }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

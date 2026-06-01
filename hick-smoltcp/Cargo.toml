@@ -1,0 +1,36 @@
+[package]
+name = "hick-smoltcp"
+version = "0.1.0"
+edition = "2024"
+publish = true
+repository = "https://github.com/al8n/hick"
+homepage = "https://github.com/al8n/hick"
+documentation = "https://docs.rs/hick-smoltcp"
+description = "Runtime-agnostic mDNS / DNS-SD engine over smoltcp: the `mdns-proto` Sans-I/O core wired to smoltcp UDP. `no_std` + `alloc`."
+license = "MIT OR Apache-2.0"
+rust-version = "1.91.0"
+categories = ["network-programming", "no-std::no-alloc", "embedded"]
+keywords = ["mdns", "dns-sd", "smoltcp", "no-std", "zeroconf"]
+readme = "README.md"
+
+[dependencies]
+mdns-proto = { workspace = true, features = ["alloc", "slab"] }
+rand_core = { version = "0.10", default-features = false }
+smoltcp = { version = "0.13", default-features = false, features = [
+  "medium-ethernet",
+  "medium-ip",
+  "proto-ipv4",
+  "proto-ipv6",
+  "socket-udp",
+  "multicast",
+] }
+
+[dev-dependencies]
+# `alloc` enables smoltcp's `Loopback` device (it heap-buffers frames), used by
+# the host integration tests only — production builds stay no-alloc.
+smoltcp = { version = "0.13", default-features = false, features = ["alloc"] }
+# A seeded RNG for the engine tests (matches mdns-proto's own test RNG).
+rand = "0.10"
+
+[lints]
+workspace = true

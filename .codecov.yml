@@ -1,0 +1,29 @@
+codecov:
+  require_ci_to_pass: false
+
+# Coverage is uploaded per platform (Linux/macOS/Windows/FreeBSD) and merged by
+# codecov, so the project view reflects the union of all platforms' code. The
+# hard >= 90% line floor is enforced in CI on the Linux leg (`coverage.yml`);
+# here `auto` guards against regressions on the merged number.
+ignore:
+  - "**/tests/**" # integration-test crates (loopback drivers, no_panic, etc.)
+  - "**/tests.rs" # split-out in-crate test modules (e.g. service/tests.rs)
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        if_not_found: success
+        only_pulls: false
+    patch:
+      default:
+        target: auto
+        if_not_found: success
+        only_pulls: true
+    changes: false
+
+comment:
+  layout: "header, diff, files, footer"
+  behavior: default
+  require_changes: false

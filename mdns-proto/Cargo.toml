@@ -1,28 +1,61 @@
 [package]
 name = "mdns-proto"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
+rust-version = "1.91.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/al8n/agnostic-mdns"
-homepage = "https://github.com/al8n/agnostic-mdns"
-documentation = "https://docs.rs/agnostic-mdns"
-description = "Sans-I/O mDNS protocol implementation"
+description = "Sans-I/O mDNS protocol state machines (no_std, no_alloc capable, panic-free)."
+repository = "https://github.com/al8n/hick"
 readme = "README.md"
-rust-version = "1.85.0"
+keywords = ["mdns", "no-std", "sans-io", "embedded", "dns"]
+categories = ["network-programming", "no-std", "embedded"]
 
-
+# Features
+#
+# `std` and `alloc` are INDEPENDENT (neither implies the other), per the
+# `rust-no-std` golden rule. Both supply the heap backing `Name` and the protocol
+# state machines need, so each enables the heap deps directly; `std` additionally
+# layers each dep's `std` feature. This makes `--features std`, `--features
+# alloc`, and `--features std,alloc` all valid self-contained configs. Heap items
+# are gated `#[cfg(any(feature = "std", feature = "alloc"))]` so neither config
+# loses them, and `lib.rs` aliases `alloc as std` in the `not(std)+alloc` tier so
+# heap paths are spelled `std::` uniformly. Embedded users pass
+# `default-features = false` with `alloc` (heap, no OS) or `heapless` (no-alloc,
+# fixed capacity). At least one of `std` / `alloc` / `heapless` must be on, since
+# `Name` needs string/collection backing.
 [features]
-default = ["std"]
-std = ["slab?/default", "dns-protocol/default", "thiserror/default", "simdutf8/default"]
-alloc = []
+default = ["std", "slab"]
+std = ["smol_str/std", "rand/std", "thiserror/std"]
+alloc = ["dep:smol_str", "dep:rand"]
+slab = ["dep:slab"]
+heapless = ["dep:heapless"]
+tracing = ["dep:tracing"]
+
+# Opt-in stretch test that link-checks panic-freedom via `no-panic`.
+# Disabled by default because std-feature builds transitively pull in
+# Display/formatter paths that no-panic flags even when unreachable in
+# practice. CI's cargo-bloat scan is the primary panic-freedom check.
+test-no-panic = []
 
 [dependencies]
-auto_enums = { version = "0.8", default-features = false }
-derive_more = { version = "2", features = ["is_variant", "display", "from_str"] }
-dns-protocol = { version = "0.1", package = "dns-protocol-patch", default-features = false }
-either = { version = "1", default-features = false }
-simdutf8 = { version = "0.1", default-features = false }
-thiserror = { version = "2", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
+rand_core = { version = "0.10", default-features = false }
+smol_str = { version = "0.3", default-features = false, optional = true }
+rand = { version = "0.10", default-features = false, features = ["std_rng"], optional = true }
+slab = { version = "0.4", default-features = false, optional = true }
+heapless = { version = "0.9", optional = true }
+tracing = { version = "0.1", default-features = false, optional = true }
 
-slab = { version = "0.4", optional = true, default-features = false }
-tracing = { version = "0.1", optional = true }
+[dev-dependencies]
+rand_core = { version = "0.10" }
+proptest = "1.5"
+no-panic = "0.1"
+rand = "0.10"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
