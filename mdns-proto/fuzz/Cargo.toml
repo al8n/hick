@@ -1,0 +1,29 @@
+[package]
+name = "mdns-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mdns-proto = { path = "..", features = ["std", "slab"] }
+
+[[bin]]
+name = "parse_message"
+path = "fuzz_targets/parse_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_name"
+path = "fuzz_targets/parse_name.rs"
+test = false
+doc = false
+bench = false
+
+# Exclude this nested crate from the workspace.
+[workspace]

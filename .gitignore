@@ -16,3 +16,15 @@
 
 /target
 Cargo.lock
+
+# Local design docs / specs / planning notes — keep out of the repo.
+/docs/
+
+# macOS Finder metadata
+.DS_Store
+
+# Coverage artifacts (cargo-llvm-cov / cargo-tarpaulin output)
+/cobertura.xml
+/tarpaulin-report.html
+/lcov.info
+/coverage/

@@ -1,0 +1,57 @@
+[package]
+name = "hick"
+version = "0.1.0"
+edition = "2024"
+publish = true
+repository = "https://github.com/al8n/hick"
+homepage = "https://github.com/al8n/hick"
+documentation = "https://docs.rs/hick"
+description = "Batteries-included, runtime-agnostic mDNS / DNS-SD: the `mdns-proto` Sans-I/O core wired to a default async driver (tokio & smol)."
+license = "MIT OR Apache-2.0"
+rust-version = "1.91.0"
+categories = ["network-programming"]
+keywords = ["mdns", "dns-sd", "zeroconf", "service-discovery"]
+readme = "README.md"
+
+[features]
+default = ["tokio"]
+# `std` runtimes. Each pulls `mdns-proto/std` (via `std`); the proto core's
+# alloc-tier is always on (the `mdns-proto` dependency below enables `alloc`).
+tokio = ["std", "hick-reactor/tokio"]
+smol = ["std", "hick-reactor/smol"]
+
+compio = ["std", "hick-compio"]
+
+# Enables the `std` build of the proto core. Pulled by the std runtimes above; NOT
+# by the bare-metal features, so `default-features = false` + a bare-metal feature
+# stays `no_std`.
+std = ["mdns-proto/std"]
+
+# Bare-metal (`no_std` + `alloc`) drivers. `smoltcp` exposes the runtime-agnostic
+# engine; `embassy` adds the embassy-net async driver (and pulls `smoltcp`). These
+# do NOT enable `std`, so they remain usable on `no_std` targets.
+smoltcp = ["hick-smoltcp"]
+embassy = ["hick-embassy", "smoltcp"]
+
+# Forward `tracing` instrumentation. The proto core's `tracing` is no_std-safe
+# (the `tracing` crate is pulled with default-features off). The driver
+# forwards are WEAK (`?`): they instrument hick-reactor / hick-compio only when a
+# std runtime already enabled them, so `--features embassy,tracing` does NOT pull
+# a std driver (and thus no std) into a bare-metal build.
+tracing = ["mdns-proto/tracing", "hick-reactor?/tracing", "hick-compio?/tracing"]
+
+[dependencies]
+# Always the alloc-tier core (every driver needs it); the `std` feature adds the
+# std build on top for std runtimes, so a bare-metal feature alone never pulls std.
+mdns-proto = { workspace = true, features = ["alloc", "slab"] }
+hick-reactor = { optional = true, workspace = true }
+hick-compio = { optional = true, workspace = true }
+hick-smoltcp = { optional = true, workspace = true }
+hick-embassy = { optional = true, workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

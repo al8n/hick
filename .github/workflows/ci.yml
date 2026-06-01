@@ -2,249 +2,174 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main, refactor/sansio]
     paths-ignore:
-      - 'README'
-      - 'COPYRIGHT'
-      - 'LICENSE-*'
-      - '**.md'
-      - '**.txt'
+      - "**.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.txt"
+      - "art/**"
   pull_request:
     paths-ignore:
-      - 'README'
-      - 'COPYRIGHT'
-      - 'LICENSE-*'
-      - '**.md'
-      - '**.txt'
+      - "**.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.txt"
+      - "art/**"
   workflow_dispatch:
-  schedule: [cron: "0 1 */7 * *"]
+  # Monthly run catches toolchain / dependency drift even with no pushes.
+  schedule:
+    - cron: "0 1 1 * *"
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
+  RUSTFLAGS: -D warnings
   RUST_BACKTRACE: 1
-  nightly: nightly
-  stable: stable
 
 jobs:
-  # Check formatting
-  rustfmt:
-    name: rustfmt
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
+  fmt:
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - name: Install Rust
-      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
-      run: rustup update stable --no-self-update && rustup default stable
-    - name: Check formatting
-      run: cargo fmt --all -- --check
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-
-  # Apply clippy lints
   clippy:
-    name: clippy
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-    - uses: actions/checkout@v4
-    - name: Install Rust
-      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
-      run: rustup update stable --no-self-update && rustup default stable
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
-    - name: Apply clippy lints
-      run: cargo hack clippy --each-feature --exclude-no-default-features
-
-  build-agnostic-mdns:
-    name: build
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-    - uses: actions/checkout@v4
-    - name: Cache cargo build and registry
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-build-
-    - name: Install Rust
-      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
-      run: rustup update stable --no-self-update && rustup default stable
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
-    - name: Cache ~/.cargo
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo
-        key: ${{ runner.os }}-coverage-dotcargo
-    - name: Run build
-      run: cargo hack build --feature-powerset --exclude-no-default-features
-      working-directory: agnostic-mdns
-
-  build-mdns-proto:
-    name: mdns-proto
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-    - uses: actions/checkout@v4
-    - name: Cache cargo build and registry
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-test-
-    - name: Install Rust
-      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
-      run: rustup update stable --no-self-update && rustup default stable
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
-    - name: Cache ~/.cargo
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo
-        key: ${{ runner.os }}-coverage-dotcargo
-    - name: Run build
-      run: cargo hack build --feature-powerset
-      working-directory: mdns-proto
-  
-  test:
-    name: test
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-        runtime:
-          - tokio
-          - async-std
-          - smol
-    runs-on: ${{ matrix.os }}
-    steps:
-    - uses: actions/checkout@v4
-    - name: Cache cargo build and registry
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-test-
-    - name: Install Rust
-      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
-      run: rustup update stable --no-self-update && rustup default stable
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
-    - name: Cache ~/.cargo
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo
-        key: ${{ runner.os }}-coverage-dotcargo
-    - name: Run test
-      run: cargo test --features ${{matrix.runtime}}
-      working-directory: agnostic-mdns
-
-  docs:
-    name: docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Cache cargo build and registry
-        uses: actions/cache@v4
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ubuntu-latest-docs-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ubuntu-latest-docs-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ env.nightly }}
-          override: true
-      - name: "agnostic-mdns doc --lib"
-        run: cargo doc --lib --no-deps
-        env:
-          RUSTFLAGS: --cfg docsrs
-        working-directory: agnostic-mdns
-      - name: "mdns-proto doc --lib"
-        run: cargo doc --lib --no-deps
-        env:
-          RUSTFLAGS: --cfg docsrs
-        working-directory: mdns-proto
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-features --tests -- -D warnings
+      - run: cargo clippy -p mdns-proto --no-default-features -- -D warnings
+      - run: cargo clippy -p mdns-proto --no-default-features --features alloc -- -D warnings
+      - run: cargo clippy -p mdns-proto --no-default-features --features heapless -- -D warnings
 
-  coverage:
-    name: coverage
-    runs-on: ubuntu-latest
-    needs:
-      - rustfmt
-      - clippy
-      - build-agnostic-mdns
-      - build-mdns-proto
-      - test
-      - docs
+  # Native compile coverage on the other two tier-1 host families so the
+  # platform `cfg`s (Apple `target_vendor`, Windows) and the `hick-udp/build.rs`
+  # capability matrix are exercised, not just Linux.
+  os-clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Install latest nightly
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly
-          override: true
-      - uses: actions-rs/install@v0.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+  # Cross-compile-check the supported non-host targets so a libc-constant /
+  # cfg-availability regression is caught before release.
+  # FreeBSD covers freebsdlike (incl. DragonFly); NetBSD covers netbsdlike (incl.
+  # OpenBSD, which has no rustup std); Android covers the linux_like NDK build.
+  # These are the capability families behind `hick-udp/build.rs`.
+  #
+  # NetBSD is scoped to the sans-io crates (mdns-proto + hick-udp): the
+  # hick-reactor tokio driver depends on mio, which does not build on NetBSD.
+  # The NetBSD portability target is the sans-io mechanism + socket layer, not
+  # the tokio policy layer. FreeBSD/Android check the whole workspace.
+  cross-check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-freebsd
+            scope: --workspace
+          - target: x86_64-unknown-netbsd
+            scope: -p mdns-proto -p hick-udp
+          - target: aarch64-linux-android
+            scope: --workspace
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          crate: cargo-tarpaulin
-          version: latest
-      - name: Cache ~/.cargo
-        uses: actions/cache@v4
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check ${{ matrix.scope }} --target ${{ matrix.target }}
+
+  # Bare-metal proof: the `no_std` + `alloc` engine (`hick-smoltcp`) and its
+  # embassy driver (`hick-embassy`) must build for a real embedded target. A
+  # `no_std` lib also compiles on a `std` host, so the `--workspace` jobs above
+  # don't actually exercise the no_std path; this does. `cargo check` doesn't
+  # link, so no embedded runtime or cross-linker is required.
+  embedded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          path: ~/.cargo
-          key: ${{ runner.os }}-coverage-dotcargo
-      - name: Cache cargo build
-        uses: actions/cache@v4
+          targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p hick-smoltcp -p hick-embassy --target thumbv7em-none-eabihf
+      # The `mdns-proto` no_std + alloc tier must also build for wasm32 (claimed in
+      # its feature-tier table); the thumbv7em check above does not exercise it.
+      - run: cargo check -p mdns-proto --no-default-features --features alloc --target wasm32-unknown-unknown
+
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # nightly: the crates gate `feature(doc_cfg)` behind `--cfg docsrs`, and
+      # that feature (like docs.rs itself) is nightly-only.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - env:
+          RUSTDOCFLAGS: -D warnings --cfg docsrs
+        run: cargo doc --workspace --all-features --no-deps
+
+  hack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
         with:
-          path: target
-          key: ${{ runner.os }}-coverage-cargo-build-target
-      - name: Run tarpaulin
-        uses: actions-rs/cargo@v1
+          tool: cargo-hack
+      - run: cargo hack build -p mdns-proto --each-feature
+      - run: cargo hack test -p mdns-proto --each-feature
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          command: tarpaulin
-          args: --features tokio --run-types tests --run-types doctests --workspace --out xml
-      - name: Upload to codecov.io
-        uses: codecov/codecov-action@v5
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri setup
+      - env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: cargo miri test -p mdns-proto --all-features
+
+  bloat-panic-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          slug: ${{ github.repository }}
-          fail_ci_if_error: true
+          tool: cargo-bloat
+      - name: Build optimized
+        run: cargo build -p mdns-proto --release --all-features
+      - name: Scan release symbols for panic landing pads
+        run: |
+          if cargo bloat --release -n 0 -p mdns-proto 2>&1 | grep -E 'core::panicking::(panic|panic_fmt|panic_bounds_check)' ; then
+            echo "::error::Release binary contains panic-landing-pad symbols. mdns-proto must be panic-free."
+            exit 1
+          fi
+
+  # Multi-platform coverage lives in its own workflow (`coverage.yml`): it runs
+  # cargo-llvm-cov on a Linux/macOS/Windows + FreeBSD matrix and merges the
+  # per-platform reports into one codecov upload, with the Linux leg as the
+  # >= 90% hard gate.

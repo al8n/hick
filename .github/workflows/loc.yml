@@ -1,63 +1,76 @@
-name: loc 
+name: loc
 
 on:
   push:
     branches:
       - main
     paths-ignore:
-      - 'README.md'
-      - 'COPYRIGHT'
-      - 'LICENSE*'
-      - '**.md'
-      - '**.txt'
-      - 'art'
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
   pull_request:
     paths-ignore:
-      - 'README.md'
-      - 'COPYRIGHT'
-      - 'LICENSE*'
-      - '**.md'
-      - '**.txt'
-      - 'art'
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
   workflow_dispatch:
 
 jobs:
+  # Single job, single gist write. Counting each crate separately (the old
+  # matrix) issued one gist PATCH per crate plus one for the workspace total —
+  # seven rapid writes to the same gist, which trips GitHub's secondary rate
+  # limit. The gists API accepts every file in one PATCH, so collect all the
+  # counts first and upload them together.
   loc:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        crates: ["mdns-proto", "agnostic-mdns"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
-        run: |
-          rustup update stable && rustup default stable
-          rustup component add clippy
-          rustup component add rustfmt
-      
-      - name: Install tokeit
-        run: |
-          cargo install tokeit --force
-      
-      - name: Count lines of code in subcrates
-        run: |
-          tokeit
-        working-directory: ${{ matrix.crates }}
+        run: rustup update stable && rustup default stable
 
-      - name: Upload subcrates loc to GitHub Gist
-        uses: actions/github-script@v7
+      - name: Install tokeit
+        run: cargo install tokeit --force
+
+      - name: Count lines of code (workspace total + each crate)
+        run: |
+          set -euo pipefail
+          tokeit
+          mv tokeit.json loc-hick.json
+          for c in mdns-proto hick-udp hick-reactor hick-compio hick-smoltcp hick-embassy; do
+            ( cd "$c" && tokeit )
+            mv "$c/tokeit.json" "loc-$c.json"
+          done
+
+      - name: Upload all loc to the gist in one request
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GIST_PAT }}
           script: |
             const fs = require('fs');
-            const output = fs.readFileSync('${{ matrix.crates }}/tokeit.json', 'utf8');
             const gistId = '327b2a8aef9003246e45c6e47fe63937';
-            await github.rest.gists.update({
-              gist_id: gistId,
-              files: {
-                "${{ matrix.crates }}": {
-                  content: output
-                }
-              }
-            });
+            // Gist file name -> LoC json. `hick` is the workspace total; the
+            // rest are per-crate. These names match the LoC badge URLs in the
+            // crate READMEs (…/raw/<name>).
+            const crates = [
+              'mdns-proto',
+              'hick-udp',
+              'hick-reactor',
+              'hick-compio',
+              'hick-smoltcp',
+              'hick-embassy',
+            ];
+            const files = {
+              hick: { content: fs.readFileSync('loc-hick.json', 'utf8') },
+            };
+            for (const c of crates) {
+              files[c] = { content: fs.readFileSync(`loc-${c}.json`, 'utf8') };
+            }
+            // One PATCH for every file -> no per-crate rate-limit storm.
+            await github.rest.gists.update({ gist_id: gistId, files });

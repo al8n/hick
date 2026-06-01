@@ -1,0 +1,49 @@
+[package]
+name = "hick-compio"
+version = "0.1.0"
+edition = "2024"
+publish = true
+repository = "https://github.com/al8n/hick"
+homepage = "https://github.com/al8n/hick"
+documentation = "https://docs.rs/hick-compio"
+description = "compio-native async mDNS driver (responder + querier + DNS-SD discovery), thread-per-core."
+license = "MIT OR Apache-2.0"
+rust-version = "1.91.0"
+categories = ["network-programming", "asynchronous"]
+keywords = ["mdns", "dns-sd", "zeroconf", "compio"]
+readme = "README.md"
+
+[features]
+default = []
+tracing = ["mdns-proto/tracing"]
+
+[dependencies]
+mdns-proto = { workspace = true, features = ["std", "slab"] }
+hick-udp.workspace = true
+compio = { version = "0.18", features = ["time"] }
+compio-net = "0.11"
+compio-io = "0.9"
+compio-runtime = "0.11"
+compio-buf = "0.8"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+event-listener = "5"
+getifs = "0.6"
+slab = "0.4"
+rand = "0.10"
+thiserror = "2"
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+compio = { version = "0.18", features = ["macros", "time"] }
+# Pin the loopback interface in the end-to-end driver integration tests.
+getifs = "0.6"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
