@@ -20,7 +20,7 @@ tracing = ["mdns-proto/tracing"]
 [dependencies]
 mdns-proto = { workspace = true, features = ["std", "slab"] }
 hick-udp.workspace = true
-compio = { version = "0.18", features = ["time"] }
+compio = { version = "0.19", features = ["time"] }
 compio-net = "0.11"
 compio-io = "0.9"
 compio-runtime = "0.11"
@@ -37,7 +37,7 @@ tracing = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
-compio = { version = "0.18", features = ["macros", "time"] }
+compio = { version = "0.19", features = ["macros", "time"] }
 # Pin the loopback interface in the end-to-end driver integration tests.
 getifs = "0.6"
 
