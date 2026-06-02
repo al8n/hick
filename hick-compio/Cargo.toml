@@ -22,7 +22,7 @@ mdns-proto = { workspace = true, features = ["std", "slab"] }
 hick-udp.workspace = true
 compio = { version = "0.18", features = ["time"] }
 compio-net = "0.11"
-compio-io = "0.9"
+compio-io = "0.10"
 compio-runtime = "0.11"
 compio-buf = "0.8"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
