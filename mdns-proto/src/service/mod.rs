@@ -363,9 +363,9 @@ enum AwaitingConfirm {
 /// Goodbye ownership: which CONCRETE records peers may have cached FROM US, and
 /// therefore what a graceful goodbye (TTL=0) must withdraw. The granularity is
 /// per record — each instance-owned record (PTR/SRV/TXT) independently, and each
-/// host-owned address (A/AAAA) independently — matching what
-/// [`Service::encode_goodbye`] withdraws (host addresses are further filtered
-/// against sibling-retained addresses).
+/// host-owned address (A/AAAA) independently — matching what the endpoint's
+/// withdrawal (built from [`Service::withdrawal_snapshot`]) withdraws (host
+/// addresses are further filtered against sibling-retained addresses).
 ///
 /// INVARIANT: a record becomes "advertised" ONLY through a CONFIRMED send that
 /// actually emitted THAT record ([`Self::record_emitted`], driven by the
@@ -928,107 +928,6 @@ where
     self.note_transmit_result(now, true);
   }
 
-  /// Encode a TTL=0 goodbye (RFC 6762 §10.1) for graceful withdrawal.
-  ///
-  /// The instance records (PTR/SRV/TXT) and the host A/AAAA are withdrawn
-  /// independently, since they are owned by different names:
-  ///
-  /// * Instance records are withdrawn only if the CURRENT instance has actually
-  ///   emitted an announcement (gated on `announce_emitted`, not on
-  ///   lifecycle state — `Announcing(0)` is reached before the first
-  ///   announcement, and budget pressure can delay sends). Until then peers
-  ///   cannot have cached them, and a goodbye would risk withdrawing a
-  ///   different responder's record for the same name.
-  /// * Host A/AAAA are withdrawn PER ADDRESS: each of this
-  ///   service's host addresses is retracted UNLESS it appears in
-  ///   `retained_host_addrs` — the set of addresses some OTHER local service
-  ///   still advertises for the same host name. Same-host services may carry
-  ///   different/overlapping address sets, so withdrawing a shared address
-  ///   would wrongly evict it from peer caches. Only addresses this service
-  ///   actually advertised count (gated on `host_advertised`, which
-  ///   survives a conflict rename), so a renamed-but-not-yet-reannounced
-  ///   service still withdraws the addresses it previously announced.
-  ///
-  /// Returns `Ok(None)` when nothing is withdrawable (nothing was cached).
-  /// This is mechanism only: the caller decides how many times / how often.
-  pub fn encode_goodbye(
-    &self,
-    buf: &mut [u8],
-    retained_host_addrs: &[core::net::IpAddr],
-  ) -> Result<Option<usize>, TransmitError> {
-    self.encode_goodbye_filtered(buf, |addr| retained_host_addrs.contains(&addr))
-  }
-
-  /// Like [`Self::encode_goodbye`], but the shared-host retention set is supplied
-  /// as a PREDICATE rather than a materialised slice: `is_retained(addr)` returns
-  /// whether some OTHER same-host service still advertises `addr` (so this service
-  /// must NOT withdraw it). A driver that would otherwise build an O(siblings)
-  /// `Vec` of retained addresses on every unregister can instead pass an
-  /// allocation-free closure that checks its service table on the fly — keeping a
-  /// constrained (`no_std`) withdrawal path heap-stable regardless of how many
-  /// same-host siblings exist. Semantics are otherwise identical to
-  /// [`Self::encode_goodbye`].
-  pub fn encode_goodbye_filtered(
-    &self,
-    buf: &mut [u8],
-    is_retained: impl Fn(core::net::IpAddr) -> bool,
-  ) -> Result<Option<usize>, TransmitError> {
-    // withdraw exactly the records we confirmed-emitted — each of
-    // PTR/SRV/TXT independently, and host addresses from the per-address
-    // ownership set (NOT the full records slice). §7.1 KAS may have put only a
-    // subset on the wire; withdrawing more would cache-flush a peer's matching
-    // shared record.
-    let include_ptr = self.goodbye.ptr;
-    let include_srv = self.goodbye.srv;
-    let include_txt = self.goodbye.txt;
-    let include_subtypes = self.goodbye.subtypes;
-    // Of the addresses we advertised, withdraw any NOT retained by a same-host
-    // sibling (per-address diff). Evaluate the predicate as filtered ITERATORS,
-    // not materialised Vecs, so encoding a goodbye allocates nothing proportional
-    // to the advertised-address count — the writer streams straight into `buf`
-    //. A cheap predicate-only pass answers "is anything withdrawable?".
-    let any_a = self
-      .goodbye
-      .a
-      .iter()
-      .any(|ip| !is_retained(core::net::IpAddr::V4(*ip)));
-    let any_aaaa = self
-      .goodbye
-      .aaaa
-      .iter()
-      .any(|ip| !is_retained(core::net::IpAddr::V6(*ip)));
-    if !include_ptr && !include_srv && !include_txt && !include_subtypes && !any_a && !any_aaaa {
-      return Ok(None);
-    }
-    respond::write_goodbye(
-      &self.records,
-      buf,
-      include_ptr,
-      include_srv,
-      include_txt,
-      include_subtypes,
-      self
-        .goodbye
-        .a
-        .iter()
-        .copied()
-        .filter(|ip| !is_retained(core::net::IpAddr::V4(*ip))),
-      self
-        .goodbye
-        .aaaa
-        .iter()
-        .copied()
-        .filter(|ip| !is_retained(core::net::IpAddr::V6(*ip))),
-    )
-    .map(Some)
-    .map_err(|_| {
-      TransmitError::BufferTooSmall(crate::error::BufferTooSmallDetail::new(
-        buf.len(),
-        buf.len(),
-      ))
-    })
-  }
-
   /// Capture everything the endpoint needs to re-encode a TTL=0 goodbye for
   /// this service without holding the [`Service`] alive.
   ///
@@ -1072,42 +971,6 @@ where
       owned,
       host_a: self.goodbye.a.clone(),
       host_aaaa: self.goodbye.aaaa.clone(),
-    }
-  }
-
-  /// Take any pending conflict-rename goodbye: encode the queued
-  /// withdrawal of the OLD instance records (instance-only, no host A/AAAA —
-  /// see `respond::write_rename_goodbye`) into `buf`, clear the pending
-  /// state, and return its length.
-  ///
-  /// `poll_transmit` normally drives these resends on a timer, but a service
-  /// removed mid-rename never gets polled again — its proto state is dropped.
-  /// The driver calls this on removal to hand the withdrawal off to its own
-  /// goodbye queue so the old name is still retracted from peer caches.
-  ///
-  /// Peek-then-pop (matching `poll_transmit`'s invariant):
-  /// encode from the still-queued record first and clear the pending state ONLY
-  /// after a successful encode. Returns `Ok(None)` when nothing is pending; a
-  /// too-small `buf` surfaces `Err(BufferTooSmall)` and PRESERVES the pending
-  /// withdrawal so a larger-buffer retry still emits it, rather than silently
-  /// destroying it.
-  pub fn take_pending_rename_goodbye(
-    &mut self,
-    buf: &mut [u8],
-  ) -> Result<Option<usize>, TransmitError> {
-    let (old, owned) = match self.pending_rename_goodbye.as_ref() {
-      Some((old, _, owned)) => (old, owned),
-      None => return Ok(None),
-    };
-    match respond::write_rename_goodbye(old, owned, buf) {
-      Ok(n) => {
-        self.pending_rename_goodbye = None;
-        self.rename_goodbye_deadline = None;
-        Ok(Some(n))
-      }
-      Err(_) => Err(TransmitError::BufferTooSmall(
-        crate::error::BufferTooSmallDetail::new(buf.len(), buf.len()),
-      )),
     }
   }
 

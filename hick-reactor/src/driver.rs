@@ -117,6 +117,16 @@ struct ServiceCtx {
   /// (`Established`/`Conflict`/`HostConflict`) dedup by kind — so the deque
   /// holds at most one of each kind (≤ 4 entries) regardless of churn.
   pending: VecDeque<ServiceUpdate>,
+  /// Set when this service has been RETIRED into an endpoint-owned RFC 6762
+  /// §10.1 withdrawal (graceful unregister/drop, an encode-failure escalation,
+  /// or a rename-collision teardown). The proto state machine is finished, so
+  /// every subsequent loop skips it for transmits, deadlines, and the
+  /// orphan-sweep — but the ctx is KEPT (the endpoint holds the route, reserving
+  /// the name) until [`Endpoint::drain_completed_withdrawals`] reports the
+  /// withdrawal complete and the driver GCs the slot. Any
+  /// `ServiceUpdate::Conflict` queued at an internal retirement is already in the
+  /// (decoupled) `updates` channel, so it survives the ctx GC.
+  withdrawing: bool,
 }
 
 /// Driver-side state for a single active query.
@@ -154,15 +164,12 @@ struct DriverState<N: Net> {
   /// Keyed on OUR sends only, so its size tracks our (coalescing-bounded)
   /// send rate, not peer traffic.
   recent_sends: Vec<(u64, SystemTime)>,
-  /// TTL=0 goodbye packets queued by `UnregisterService`, resent a
-  /// few times for reliability before being dropped. Each entry is a fully
-  /// encoded datagram (the proto Service is removed immediately; these bytes
-  /// are self-contained), so withdrawal proceeds even though the service
-  /// state machine is gone.
-  goodbyes: Vec<PendingGoodbye>,
-  /// Max datagram size, used to size the scratch buffer for encoding a
-  /// goodbye in the (infrequent) unregister path.
-  max_payload: usize,
+  /// Reusable scratch for the handles of endpoint-owned withdrawals that
+  /// completed in a loop iteration, so [`Endpoint::drain_completed_withdrawals`]
+  /// can push into it and the loop can GC each one's driver ctx. Kept on the
+  /// state and `clear()`ed each iteration so the per-iteration GC allocates
+  /// nothing in steady state.
+  completed_withdrawals: Vec<ServiceHandle>,
   /// this host's directly-attached subnets, the source-address
   /// fallback for the RFC 6762 §11 on-link check on platforms that can't
   /// supply a TTL/Hop-Limit. Empty if interface discovery failed (the
@@ -175,32 +182,6 @@ struct DriverState<N: Net> {
   /// is on-link only when it arrived on this interface. Always ≥ 1 (the
   /// endpoint always resolves a concrete interface index at bind time).
   bound_interface: u32,
-}
-
-/// A pending RFC 6762 §10.1 goodbye broadcast.
-struct PendingGoodbye {
-  /// Fully encoded TTL=0 datagram (records of the withdrawn service).
-  data: Vec<u8>,
-  /// Remaining sends; the entry is dropped once this reaches zero. Decremented
-  /// ONLY on a round that actually reached the wire (Part A) — a round in which
-  /// every family's `send_to` failed leaves this untouched.
-  remaining: u8,
-  /// Earliest wall-clock instant at which the next send may go out.
-  next_at: StdInstant,
-  /// `false` until the FIRST round of this goodbye reaches the wire (at least one
-  /// family sent). While `false` — and before [`Self::expires_at`] — this entry
-  /// is a PENDING BARRIER: a free-name (retirement/rename) TTL=0 withdrawal that
-  /// must precede any positive-TTL transmit, so a same-name replacement under
-  /// `with_probe_unique_names(false)` cannot announce a fresh positive TTL ahead
-  /// of the stale TTL=0 and evict itself from peer caches. Set once, never cleared.
-  sent_once: bool,
-  /// Hard deadline after which the entry is force-cleared even if it never sent —
-  /// the anti-pin bound for both the [`Self::sent_once`] barrier and the entry's
-  /// lifetime. Set at queue time to `now + GOODBYE_BARRIER_MAX`. Because Part A
-  /// stops advancing `remaining` on a never-delivered round, this bound (not
-  /// `remaining`) prevents an undeliverable goodbye pinning the queue / blocking
-  /// transmits forever.
-  expires_at: StdInstant,
 }
 
 impl<N: Net> DriverState<N> {
@@ -217,8 +198,7 @@ impl<N: Net> DriverState<N> {
       services: HashMap::new(),
       queries: HashMap::new(),
       recent_sends: Vec::new(),
-      goodbyes: Vec::new(),
-      max_payload: opts.max_payload_size(),
+      completed_withdrawals: Vec::new(),
       // scope the §11 source-subnet fallback to the BOUND
       // interface only — not every local NIC (per-packet interface index for
       // delivered PKTINFO is handled separately in recv_with_meta).
@@ -232,9 +212,18 @@ impl<N: Net> DriverState<N> {
   }
 
   /// Compute the earliest deadline across endpoint, services, and queries.
+  ///
+  /// Endpoint-owned withdrawal deadlines (the next due goodbye round and the 2 s
+  /// anti-pin ceiling) are already folded into [`Endpoint::poll_timeout`], so the
+  /// driver no longer tracks them here. A `withdrawing` service is skipped: its
+  /// proto state machine is finished, and its withdrawal schedule lives in the
+  /// endpoint.
   fn next_deadline(&self) -> Option<StdInstant> {
     let mut best: Option<StdInstant> = self.endpoint.poll_timeout();
     for ctx in self.services.values() {
+      if ctx.withdrawing {
+        continue;
+      }
       if let Some(t) = ctx.proto.poll_timeout() {
         best = Some(min_opt(best, t));
       }
@@ -242,17 +231,6 @@ impl<N: Net> DriverState<N> {
     for handle in self.queries.keys() {
       if let Some(t) = self.endpoint.poll_query_timeout(*handle) {
         best = Some(min_opt(best, t));
-      }
-    }
-    // wake to resend any pending goodbye when it comes due. `next_at` is short
-    // (GOODBYE_RETRY_BACKOFF) after a failed round, so a deferred barrier wakes
-    // promptly. While still an un-sent barrier, also wake at its `expires_at`
-    // ceiling so a never-sendable barrier releases the deferred positive
-    // transmits no later than that bound.
-    for g in &self.goodbyes {
-      best = Some(min_opt(best, g.next_at));
-      if !g.sent_once {
-        best = Some(min_opt(best, g.expires_at));
       }
     }
     best
@@ -274,10 +252,10 @@ impl<N: Net> DriverState<N> {
             // channel, but the proto Service still lives in our map
             // until we GC it explicitly here.
             drop(returned);
-            // go through the shared removal path. The service
-            // was just registered (still probing, never announced), so
-            // `encode_goodbye` yields None and no goodbye is queued — the
-            // rollback stays silent, as it should.
+            // go through the shared retirement path. The service was just
+            // registered (still probing, never announced), so its withdrawal
+            // snapshot is empty and the endpoint completes it immediately with no
+            // goodbye on the wire — the rollback stays silent, as it should.
             self.remove_service(handle, now);
             hick_trace::debug!(
               ?handle,
@@ -289,9 +267,9 @@ impl<N: Net> DriverState<N> {
         }
       }
       Command::UnregisterService { handle } => {
-        // graceful withdrawal goes through the shared
-        // removal helper so an explicit unregister and a dropped-handle sweep
-        // both emit the TTL=0 goodbye.
+        // graceful withdrawal goes through the shared retirement helper so an
+        // explicit unregister and a dropped-handle sweep both begin the
+        // endpoint-owned §10.1 withdrawal.
         self.remove_service(handle, now);
       }
       Command::StartQuery { spec, reply } => {
@@ -353,6 +331,7 @@ impl<N: Net> DriverState<N> {
         last_pushed: None,
         encode_failures: 0,
         pending: VecDeque::new(),
+        withdrawing: false,
       },
     );
     Ok(ServiceRegistered {
@@ -553,11 +532,11 @@ impl<N: Net> DriverState<N> {
   /// closed even when there is no event to push (e.g. caller dropped a
   /// Query handle that never collected any answer).
   async fn push_updates(&mut self, now: StdInstant) {
-    // services to remove this pass. Collected here and removed
-    // AFTER the split borrow ends so every removal goes through
-    // `remove_service`, which emits the TTL=0 goodbye for an established
-    // service. (A service still probing / mid-rename yields no goodbye —
-    // `encode_goodbye` returns None — so this is safe for all cases.)
+    // services to retire this pass. Collected here and retired AFTER the split
+    // borrow ends so every retirement goes through `remove_service`, which begins
+    // the endpoint-owned §10.1 withdrawal (the endpoint holds the route + drives
+    // the goodbye schedule; a service still probing / mid-rename has an empty
+    // snapshot and completes with nothing on the wire — safe for all cases).
     let mut removed_services: Vec<ServiceHandle> = Vec::new();
     {
       // Split-borrow so we can mutate self.endpoint inside the loops.
@@ -570,6 +549,12 @@ impl<N: Net> DriverState<N> {
 
       // ── Service updates ───────────────────────────────────────────────
       for (handle, ctx) in services.iter_mut() {
+        // A service already withdrawing has a finished proto state machine and
+        // the endpoint owns its goodbye schedule; skip it (the ctx is GC'd by
+        // `drain_withdrawals` once the withdrawal completes).
+        if ctx.withdrawing {
+          continue;
+        }
         // even if no event is pending, a closed receiver means the
         // caller dropped their handle — withdraw the service gracefully.
         if ctx.updates.is_closed() {
@@ -592,6 +577,16 @@ impl<N: Net> DriverState<N> {
               match endpoint.handle_service_renamed(*handle, renamed.new_name().clone()) {
                 Ok(()) => upd,
                 Err(_) => {
+                  // The new name collides with another local service; the Service
+                  // has already rebranded and can't be kept. Surface Conflict (into
+                  // the decoupled channel), then retire it: `remove_service` begins
+                  // the endpoint-owned withdrawal, whose snapshot prioritises the
+                  // pending OLD-name rename goodbye and holds the route (keeping the
+                  // OLD name reserved) while it resends, freeing the name on
+                  // completion. The ctx is kept until then so this Conflict still
+                  // reaches the host. Only this rename-COLLISION teardown goes
+                  // through begin_withdrawal; a SURVIVING renamed service's old-name
+                  // goodbye is auto-emitted by the proto's own poll_transmit.
                   hick_trace::warn!(
                     handle = ?handle,
                     new_name = %renamed.new_name(),
@@ -755,10 +750,12 @@ impl<N: Net> DriverState<N> {
       }
       // re-check liveness AT this handle so a drop / cancel
       // command racing with the per-loop sweep does not still emit a
-      // transmit for an already-orphaned handle.
+      // transmit for an already-orphaned handle. A `withdrawing` service is
+      // also skipped: its proto state machine is finished and the endpoint
+      // owns the TTL=0 goodbye schedule (pumped by `drain_withdrawals`).
       let live = services
         .get(&h)
-        .map(|c| !c.updates.is_closed())
+        .map(|c| !c.updates.is_closed() && !c.withdrawing)
         .unwrap_or(false);
       if !live {
         continue;
@@ -833,19 +830,26 @@ impl<N: Net> DriverState<N> {
         if escalate {
           hick_trace::warn!(
             handle = ?h,
-            "Service exceeded MAX_CONSECUTIVE_ENCODE_ERRORS; emitting Conflict and unregistering"
+            "Service exceeded MAX_CONSECUTIVE_ENCODE_ERRORS; emitting Conflict and withdrawing"
           );
+          // Surface Conflict (into the decoupled channel) and begin the
+          // endpoint-owned withdrawal. The endpoint KEEPS the route (holding the
+          // name) and frees it on withdrawal completion; the ctx is kept (marked
+          // `withdrawing`) so the queued Conflict still reaches the host and is
+          // GC'd by `drain_withdrawals`. A service that persistently failed to
+          // ENCODE never reached Established, so its snapshot is empty and the
+          // withdrawal completes on the next iteration with no datagram on the
+          // wire (the records are fixed at registration and the scratch is fixed,
+          // so an encode failure is permanent, not transient). `begin_withdrawal`
+          // is idempotent. Inlined (not via `begin_service_withdrawal`) because
+          // `self` is split-borrowed here into `endpoint` + `services`.
           if let Some(ctx) = services.get_mut(&h) {
             let _ = deliver_service_update(ctx, ServiceUpdate::Conflict);
             ctx.last_pushed = Some(UpdateMark::Conflict);
+            ctx.withdrawing = true;
+            let snap = ctx.proto.withdrawal_snapshot();
+            endpoint.begin_withdrawal(h, snap, now);
           }
-          // direct removal (no goodbye) is correct here — a
-          // service that persistently fails to ENCODE its announcement never
-          // reached Established, so peers cached nothing to withdraw. (The
-          // records are fixed at registration and the scratch buffer is
-          // fixed, so an encode failure is permanent, not transient.)
-          services.remove(&h);
-          let _ = endpoint.unregister_service(h);
         }
       }
     }
@@ -940,140 +944,6 @@ impl<N: Net> DriverState<N> {
     more_pending
   }
 
-  /// Resend any due TTL=0 goodbye packets and drop those that are finished. Each
-  /// goodbye fans out to BOTH multicast families via `send_via` (the `MDNS_V4_DST`
-  /// sentinel triggers the dual-stack path) and is recorded in the self-send
-  /// tracker like any other transmit, so its loopback isn't misclassified.
-  ///
-  /// ## Part A — round advancement is gated on a real send (live path)
-  ///
-  /// `send_via` returns the number of families that actually sent. When `force`
-  /// is `false` (the live driver loop) a round is counted ONLY if at least one
-  /// family sent: the first such round latches [`PendingGoodbye::sent_once`]
-  /// (clearing the transmit barrier), spends one resend, and re-arms at
-  /// [`GOODBYE_INTERVAL`]; an all-failing round re-arms at the short
-  /// [`GOODBYE_RETRY_BACKOFF`] without consuming the budget, so a transiently-
-  /// undeliverable free-name goodbye (and the positive transmit its barrier
-  /// blocks) retries promptly. Entries past their `expires_at` anti-pin bound are
-  /// force-cleared regardless of `remaining` so a never-deliverable barrier cannot
-  /// pin the queue forever.
-  ///
-  /// ## `force` — the shutdown flush
-  ///
-  /// [`Self::flush_goodbyes`] passes `force = true`: the driver is exiting, the
-  /// barrier/ordering is moot, and the burst must TERMINATE best-effort even with
-  /// no reachable socket. There, a round spends a resend on every attempt (the
-  /// pre-Part-A semantics) so the queue drains in at most `GOODBYE_SENDS` passes
-  /// per entry rather than spinning to `expires_at`.
-  async fn drain_goodbyes(&mut self, now: StdInstant, force: bool) {
-    if self.goodbyes.is_empty() {
-      return;
-    }
-    #[cfg(feature = "stats")]
-    let stats = self.stats.clone();
-    let Self {
-      goodbyes,
-      recent_sends,
-      v4,
-      v6,
-      ..
-    } = self;
-    for g in goodbyes.iter_mut() {
-      if g.remaining > 0 && g.next_at <= now {
-        let credits = send_via::<N>(
-          recent_sends,
-          v4,
-          v6,
-          MDNS_V4_DST,
-          &g.data,
-          #[cfg(feature = "stats")]
-          &stats,
-        )
-        .await;
-        let any_sent = credits > 0;
-        #[cfg(feature = "stats")]
-        if any_sent {
-          stats.goodbyes_tx(1);
-        }
-        if any_sent {
-          // Part A: a real send latches the barrier and spends a resend.
-          g.sent_once = true;
-          g.remaining = g.remaining.saturating_sub(1);
-          g.next_at = now + GOODBYE_INTERVAL;
-        } else if force {
-          // Shutdown flush: terminate the burst even with nothing on the wire.
-          g.remaining = g.remaining.saturating_sub(1);
-          g.next_at = now + GOODBYE_INTERVAL;
-        } else {
-          // Live path, all-failing round: keep the budget, retry soon.
-          g.next_at = now + GOODBYE_RETRY_BACKOFF;
-        }
-      }
-    }
-    // Drop finished entries; force-clear any past its anti-pin `expires_at`
-    // REGARDLESS of `remaining` (a never-delivered barrier must not pin the queue
-    // or block transmits forever now that Part A stops spending its budget on
-    // failed rounds).
-    let mut force_cleared = 0usize;
-    goodbyes.retain(|g| {
-      if g.expires_at <= now {
-        if g.remaining > 0 {
-          force_cleared += 1;
-        }
-        return false;
-      }
-      g.remaining > 0
-    });
-    if force_cleared > 0 {
-      hick_trace::debug!(
-        count = force_cleared,
-        "force-cleared undeliverable goodbye(s) past the barrier/retention bound"
-      );
-    }
-  }
-
-  /// Part B — `true` if any pending goodbye is still a barrier: it has not yet
-  /// reached the wire (`!sent_once`) AND has not passed its `expires_at` ceiling.
-  /// The driver loop defers phase D (the positive-TTL transmit drain) while this
-  /// holds.
-  ///
-  /// The barrier is intentionally GLOBAL — ANY pending un-sent free-name goodbye
-  /// defers ALL positive transmits, not just same-name ones. This is acceptable
-  /// (and far simpler than name-scoping the proto transmit queue) because a
-  /// SENDABLE barrier clears in the same loop iteration's pre-transmit
-  /// `drain_goodbyes`, so normal operation only gains a goodbye-before-transmit
-  /// ordering; only an UN-sendable (all-failing) barrier actually defers
-  /// transmits, bounded by `expires_at`.
-  fn has_pending_barrier(&self, now: StdInstant) -> bool {
-    self
-      .goodbyes
-      .iter()
-      .any(|g| !g.sent_once && g.expires_at > now)
-  }
-
-  /// Drive the remaining goodbye burst to completion, sleeping
-  /// between resends per [`GOODBYE_INTERVAL`]. Called once on driver shutdown
-  /// so a withdrawal queued just before the endpoint dropped is fully sent
-  /// rather than abandoned after its first packet. Bounded: each pass sends
-  /// at least the earliest-due entry and decrements its count, so this
-  /// completes in at most `GOODBYE_SENDS` iterations per entry.
-  async fn flush_goodbyes(&mut self) {
-    while !self.goodbyes.is_empty() {
-      // `force = true`: we are exiting, so terminate the burst best-effort even
-      // with no reachable socket (the barrier/ordering no longer matters).
-      self.drain_goodbyes(StdInstant::now(), true).await;
-      match self.goodbyes.iter().map(|g| g.next_at).min() {
-        Some(next) => {
-          let dur = next.saturating_duration_since(StdInstant::now());
-          if dur > Duration::ZERO {
-            <N::Runtime as RuntimeLite>::sleep(dur).await;
-          }
-        }
-        None => break,
-      }
-    }
-  }
-
   /// GC handles whose caller has dropped the receiver. Runs at
   /// the TOP of the driver loop (before `fire_timeouts` /
   /// `drain_transmits`) so an orphan query cancelled between its
@@ -1082,13 +952,16 @@ impl<N: Net> DriverState<N> {
   fn sweep_closed_handles(&mut self, now: StdInstant) {
     // a dropped Service handle closes `updates` AND enqueues
     // UnregisterService. This sweep can win the race and collect the service
-    // first, so it MUST route through `remove_service` (which queues the
-    // goodbye) — otherwise the dropped service is silently withdrawn with no
-    // TTL=0 goodbye and peers keep stale records until TTL expiry.
+    // first, so it MUST route through `remove_service` (which begins the
+    // endpoint-owned §10.1 withdrawal) — otherwise the dropped service is
+    // silently withdrawn with no TTL=0 goodbye and peers keep stale records until
+    // TTL expiry. A service ALREADY withdrawing is skipped (its ctx is GC'd by
+    // `drain_withdrawals` on completion); re-beginning would be an idempotent
+    // no-op anyway.
     let dead_svc: Vec<ServiceHandle> = self
       .services
       .iter()
-      .filter(|(_, ctx)| ctx.updates.is_closed())
+      .filter(|(_, ctx)| ctx.updates.is_closed() && !ctx.withdrawing)
       .map(|(h, _)| *h)
       .collect();
     for h in dead_svc {
@@ -1106,90 +979,122 @@ impl<N: Net> DriverState<N> {
     }
   }
 
-  /// Remove a service, queuing its TTL=0 goodbye from
-  /// the still-present records BEFORE dropping the driver ctx and proto
-  /// route. Shared by explicit `UnregisterService` and the dropped-handle
-  /// sweep so withdrawal is graceful regardless of which path removes it.
-  /// `encode_goodbye` yields `None` for a service that never announced
-  /// (still probing / conflicted) — nothing is cached, so nothing to send.
+  /// Retire a service into its endpoint-owned RFC 6762 §10.1 withdrawal. Shared
+  /// by explicit `UnregisterService` and the dropped-handle sweep so withdrawal
+  /// is graceful regardless of which path removes it.
+  ///
+  /// The endpoint KEEPS the route (holding the name against a same-name
+  /// re-registration) and drives the TTL=0 goodbye resend schedule; the driver
+  /// loop pumps each due goodbye datagram and, on completion, frees the route and
+  /// GCs the driver ctx. The withdrawal covers whatever the service must retract:
+  /// the records it confirmed-emitted under its current name (host A/AAAA filtered
+  /// against same-host siblings by the endpoint), OR — if a conflict rename left
+  /// an old-name withdrawal pending — that old instance name first
+  /// ([`Service::withdrawal_snapshot`] prioritises the rename goodbye). A
+  /// never-announced service has an empty snapshot and completes on the next loop
+  /// iteration with no datagram on the wire.
+  ///
+  /// The driver ctx is NOT removed here: it is kept (marked `withdrawing`) so any
+  /// already-queued `ServiceUpdate::Conflict` (delivered into the decoupled
+  /// `updates` channel) still reaches the host, and is GC'd when the endpoint
+  /// reports the withdrawal complete.
   fn remove_service(&mut self, handle: ServiceHandle, now: StdInstant) {
-    let cap = self.max_payload.max(512);
-    // if another service still advertises this service's host name,
-    // its host A/AAAA records are shared. Withdrawing them would evict a
-    // sibling's still-valid addresses from peer caches, so emit an
-    // instance-only goodbye (PTR/SRV/TXT, no A/AAAA) in that case. Host names
-    // are canonical-lowercase, so `==` is already case-insensitive (RFC §16).
-    //
-    // host A/AAAA ownership is PER ADDRESS, not per host
-    // name. Two services sharing a host name may advertise different address
-    // sets, so collect the exact addresses OTHER same-host services have
-    // actually ADVERTISED — `advertised_a_addrs`/`advertised_aaaa_addrs`, the
-    // confirmed-emitted set, NOT `records()` (the configured set: a §7.1
-    // KAS-filtered send may have emitted only a subset). Building from the
-    // configured set would over-retain — suppressing withdrawal of an address
-    // no remaining service actually advertised, leaving it stale in peer caches
-    // until TTL. The removed service then withdraws only its own host addresses
-    // that no sibling still owns; a shared address is retained, a unique one is
-    // retracted.
-    let retained_host_addrs: Vec<IpAddr> = if let Some(ctx) = self.services.get(&handle) {
-      let host = ctx.proto.records().host().clone();
-      let mut set: Vec<IpAddr> = Vec::new();
-      for (h, other) in self.services.iter() {
-        if *h != handle && other.proto.records().host() == &host {
-          set.extend(
-            other
-              .proto
-              .advertised_a_addrs()
-              .iter()
-              .map(|a| IpAddr::V4(*a)),
-          );
-          set.extend(
-            other
-              .proto
-              .advertised_aaaa_addrs()
-              .iter()
-              .map(|a| IpAddr::V6(*a)),
-          );
-        }
+    self.begin_service_withdrawal(handle, now);
+  }
+
+  /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: mark the
+  /// ctx `withdrawing` (so every subsequent loop skips it for transmits,
+  /// deadlines, and the orphan-sweep), snapshot what its goodbye must retract
+  /// ([`Service::withdrawal_snapshot`], which prioritises a pending conflict-rename
+  /// old-name goodbye over the current state), and hand it to
+  /// [`Endpoint::begin_withdrawal`]. The endpoint holds the route and drives the
+  /// resend schedule; the route is freed and the driver ctx GC'd when
+  /// [`Endpoint::drain_completed_withdrawals`] reports completion in the loop.
+  ///
+  /// `begin_withdrawal` is idempotent, so calling this for an already-withdrawing
+  /// service is a no-op. A no-op for an unknown driver handle.
+  fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: StdInstant) {
+    // Scope the `ctx` borrow so it ends before `self.endpoint` is touched (the
+    // snapshot is owned, so no borrow of `self.services` outlives this block).
+    let snap = match self.services.get_mut(&handle) {
+      Some(ctx) => {
+        ctx.withdrawing = true;
+        ctx.proto.withdrawal_snapshot()
       }
-      set
-    } else {
-      Vec::new()
+      None => return,
     };
-    // Encode the withdrawals while the proto state is still present, then
-    // queue them. Collected into a local Vec first so the borrow of
-    // `self.services` is released before pushing into `self.goodbyes`.
-    let mut pending: Vec<Vec<u8>> = Vec::new();
-    if let Some(ctx) = self.services.get_mut(&handle) {
-      let mut buf = vec![0u8; cap];
-      if let Ok(Some(len)) = ctx.proto.encode_goodbye(&mut buf, &retained_host_addrs) {
-        buf.truncate(len);
-        pending.push(buf);
+    self.endpoint.begin_withdrawal(handle, snap, now);
+  }
+
+  /// Pump every due endpoint-owned withdrawal goodbye, then free + GC every
+  /// completed withdrawal.
+  ///
+  /// The endpoint encodes each TTL=0 goodbye (with fresh sibling host-address
+  /// retention computed internally), hands back the multicast datagram + the
+  /// withdrawing handle; the driver fans it to BOTH groups via `send_via` (the
+  /// `MDNS_V4_DST` sentinel triggers the dual-stack path), reports back whether at
+  /// least one family sent so the endpoint can spend / re-arm the resend round,
+  /// and bumps `goodbyes_tx` once per DELIVERED round. After draining transmits,
+  /// [`Endpoint::drain_completed_withdrawals`] frees each completed route
+  /// (decrementing `services_active`) and the driver GCs its ctx — the queued
+  /// `Conflict` already lives in the decoupled `updates` channel, so it survives.
+  async fn drain_withdrawals(&mut self, now: StdInstant, scratch: &mut [u8]) {
+    #[cfg(feature = "stats")]
+    let stats = self.stats.clone();
+    // Split-borrow disjoint fields so `send_via` can borrow `recent_sends`/`v4`/
+    // `v6` while `endpoint` is borrowed for the withdrawal pump.
+    let Self {
+      endpoint,
+      recent_sends,
+      v4,
+      v6,
+      ..
+    } = self;
+    while let Some((dst, len, handle)) = endpoint.poll_withdrawal_transmit(now, scratch) {
+      // The endpoint always returns the multicast marker; the driver fans the
+      // datagram to both groups regardless. Assert the contract in debug builds.
+      debug_assert!(
+        matches!(dst, SocketAddr::V4(v4a) if v4a.ip().is_multicast() && v4a.port() == 5353),
+        "withdrawal dst must be the IPv4 multicast marker"
+      );
+      let _ = dst;
+      let credits = send_via::<N>(
+        recent_sends,
+        v4,
+        v6,
+        MDNS_V4_DST,
+        &scratch[..len],
+        #[cfg(feature = "stats")]
+        &stats,
+      )
+      .await;
+      // `delivered` = at least one family put the datagram on the wire. A
+      // delivered round spends one resend; a fully-failed round is re-armed by
+      // the endpoint (short backoff) WITHOUT spending. `send_via` already bumps
+      // packets_tx/bytes_tx per Sent family and send_errors per failed family, so
+      // here we add only the per-round goodbyes_tx (one per DELIVERED round).
+      let delivered = credits > 0;
+      #[cfg(feature = "stats")]
+      if delivered {
+        stats.goodbyes_tx(1);
       }
-      // a conflict-rename may have queued an unsent withdrawal of
-      // the OLD instance records in the proto, resent on a timer by
-      // `poll_transmit`. Removal drops that proto state, so drain the bytes
-      // here and hand them to our own goodbye queue — otherwise the old name
-      // lingers in peer caches until TTL expiry. `cap` (>=512) always fits an
-      // instance-only goodbye, so the BufferTooSmall arm is unreachable here;
-      // treat it as best-effort (the old records otherwise TTL-expire).
-      let mut rbuf = vec![0u8; cap];
-      if let Ok(Some(rlen)) = ctx.proto.take_pending_rename_goodbye(&mut rbuf) {
-        rbuf.truncate(rlen);
-        pending.push(rbuf);
-      }
+      endpoint.note_withdrawal_result(handle, now, delivered);
     }
-    for data in pending {
-      self.goodbyes.push(PendingGoodbye {
-        data,
-        remaining: GOODBYE_SENDS,
-        next_at: now,
-        sent_once: false,
-        expires_at: now + GOODBYE_BARRIER_MAX,
-      });
+    // Free completed withdrawals (budget spent or 2 s ceiling reached): the
+    // endpoint releases each route (decrementing services_active) and reports the
+    // handle; GC its driver ctx. The scratch Vec is reused across iterations.
+    self.completed_withdrawals.clear();
+    self
+      .endpoint
+      .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
+    while let Some(handle) = self.completed_withdrawals.pop() {
+      // GC the driver ctx. The reactor delivers `ServiceUpdate`s through a
+      // DECOUPLED `async_channel`, so any `Conflict` queued at an internal
+      // retirement is already buffered in the channel and remains readable by the
+      // caller after the ctx (and its `updates` Sender) is dropped — no
+      // smoltcp-style deferred `route_freed` GC is needed.
+      self.services.remove(&handle);
     }
-    self.services.remove(&handle);
-    let _ = self.endpoint.unregister_service(handle);
   }
 }
 
@@ -1330,31 +1235,6 @@ const SELF_SEND_TTL: Duration = Duration::from_secs(2);
 /// declines to add more rather than evicting a still-live entry, which
 /// would let a real loopback be misclassified as a peer.
 const MAX_SELF_SEND_ENTRIES: usize = 65536;
-
-/// How many times a TTL=0 goodbye is multicast on unregister.
-/// RFC 6762 §10.1 allows sending a goodbye two or three times for
-/// reliability over lossy multicast.
-const GOODBYE_SENDS: u8 = 3;
-
-/// Spacing between goodbye resends.
-const GOODBYE_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Short re-attempt delay for a goodbye round that put NOTHING on the wire (every
-/// family's `send_to` failed). Much smaller than [`GOODBYE_INTERVAL`] so a
-/// transiently-undeliverable free-name goodbye is retried promptly — WITHOUT
-/// consuming a resend round and WITHOUT busy-spinning — and a positive transmit
-/// deferred behind its [`PendingGoodbye::sent_once`] barrier wakes again soon.
-/// Kept consistent with `hick-smoltcp`/`hick-compio`'s `GOODBYE_RETRY_BACKOFF`.
-const GOODBYE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
-
-/// Hard ceiling on how long an un-sent free-name goodbye may act as a transmit
-/// barrier (see [`PendingGoodbye::sent_once`]) AND on its retention. Because Part
-/// A no longer decrements a goodbye's resend budget on a round that never reached
-/// the wire, a permanently-undeliverable entry would otherwise pin the goodbye
-/// queue — and block positive transmits — forever. Past this age the entry is
-/// force-cleared so it can neither block transmits nor leak. Kept consistent with
-/// `hick-smoltcp`/`hick-compio`'s `GOODBYE_BARRIER_MAX`.
-const GOODBYE_BARRIER_MAX: Duration = Duration::from_secs(2);
 
 /// FNV-1a 64-bit hash of a datagram body. Used only to fingerprint our
 /// own sends for loopback matching — not a security primitive, so a fast
@@ -1791,28 +1671,22 @@ async fn driver_task<N: Net>(
     let now = StdInstant::now();
     state.sweep_closed_handles(now);
     state.fire_timeouts(now);
-    // FREE-NAME GOODBYE BARRIER (pre-transmit). Before phase D (the positive-TTL
-    // transmit drain), (1) attempt the due goodbyes so a SENDABLE free-name
-    // (retirement/rename) TTL=0 withdrawal reaches the wire FIRST — clearing such
-    // a barrier this tick — then (2) if a goodbye is still an un-sent, unexpired
-    // barrier, SKIP phase D so a same-name replacement registered under
-    // `with_probe_unique_names(false)` cannot announce a fresh positive TTL ahead
-    // of the stale TTL=0 (which would evict it from peer caches). Only an
-    // UN-sendable (all-failing) barrier actually defers transmits, bounded by each
-    // entry's `expires_at`; `next_deadline` wakes on GOODBYE_RETRY_BACKOFF /
-    // `expires_at` so a deferred barrier retries promptly. The post-`push_updates`
-    // drain (phase F, below) is KEPT so a newly-queued rename goodbye still flushes
-    // this tick.
-    state.drain_goodbyes(now, false).await;
-    let transmit_barred = state.has_pending_barrier(now);
-    let more_transmits_pending = if transmit_barred {
-      false
-    } else {
-      state.drain_transmits(now, &mut scratch).await
-    };
+    // Positive-TTL transmits (probes/announcements/responses). The old free-name
+    // goodbye barrier is GONE: the §10.1 ordering (a stale TTL=0 must precede a
+    // same-name replacement's fresh positive TTL) is now enforced by the endpoint,
+    // which KEEPS the route while a withdrawal is in flight, so a same-name
+    // `register_service` is rejected (`NameAlreadyRegistered`) until the
+    // withdrawal frees the name. No replacement can announce ahead of the
+    // withdrawal, so this drain runs unconditionally.
+    let more_transmits_pending = state.drain_transmits(now, &mut scratch).await;
+    // `push_updates` may retire services (orphan drop, encode escalation, or a
+    // rename collision), each beginning an endpoint-owned withdrawal.
     state.push_updates(now).await;
-    // emit any due TTL=0 goodbye resends for unregistered services (phase F).
-    state.drain_goodbyes(now, false).await;
+    // Pump every due endpoint-owned TTL=0 goodbye and GC each completed
+    // withdrawal (route freed → driver ctx removed). `Endpoint::poll_timeout`
+    // folds the withdrawal deadlines into `next_deadline`, so a due resend wakes
+    // the loop.
+    state.drain_withdrawals(now, &mut scratch).await;
 
     // if drain_transmits stopped at its per-tick budget,
     // don't sleep — loop back immediately so the packet pump can
@@ -1839,7 +1713,8 @@ async fn driver_task<N: Net>(
         }
       }
       // don't bail straight out on a closed command channel —
-      // fall through to flush any queued goodbye burst before exiting.
+      // fall through to drive any in-flight withdrawal to completion before
+      // exiting (the shutdown sequence below).
       if cmd_closed {
         break;
       }
@@ -1887,19 +1762,40 @@ async fn driver_task<N: Net>(
     }
   }
 
-  // graceful shutdown — withdraw EVERY still-registered service
-  // (the endpoint is going away), queuing each one's TTL=0 goodbye via the
-  // shared removal helper. Without this, services that were live at shutdown
-  // would linger in peers' caches until TTL expiry.
+  // graceful shutdown — begin the endpoint-owned §10.1 withdrawal for EVERY
+  // still-registered service (the endpoint is going away). Without this, services
+  // that were live at shutdown would linger in peers' caches until TTL expiry.
   let shutdown_now = StdInstant::now();
   let live_services: Vec<ServiceHandle> = state.services.keys().copied().collect();
   for h in live_services {
     state.remove_service(h, shutdown_now);
   }
-  // then finish any in-flight TTL=0 goodbye burst — both the ones
-  // just queued above and any from an unregister/drop right before shutdown —
-  // before the task ends.
-  state.flush_goodbyes().await;
+  // Drive the in-flight withdrawals (the ones just begun plus any from an
+  // unregister/drop right before shutdown) to completion: pump each due TTL=0
+  // goodbye and free completed routes until none remain. Each withdrawal finishes
+  // when its resend budget is spent OR at its 2 s anti-pin ceiling, so this
+  // terminates without an explicit per-entry bound — `Endpoint::poll_timeout`
+  // returns `None` once every withdrawal route is freed. A wall-clock backstop
+  // (a few ceilings) guards against a clock anomaly so the task can never hang.
+  let shutdown_deadline = StdInstant::now() + Duration::from_secs(10);
+  loop {
+    let now = StdInstant::now();
+    state.drain_withdrawals(now, &mut scratch).await;
+    // No remaining withdrawal (or any other) deadline → every route is freed.
+    let Some(next) = state.next_deadline() else {
+      break;
+    };
+    if now >= shutdown_deadline {
+      hick_trace::debug!("shutdown withdrawal flush hit its wall-clock backstop; exiting");
+      break;
+    }
+    let dur = next
+      .saturating_duration_since(now)
+      .min(shutdown_deadline.saturating_duration_since(now));
+    if dur > Duration::ZERO {
+      <N::Runtime as RuntimeLite>::sleep(dur).await;
+    }
+  }
 }
 
 /// Bump stats for a datagram that was consumed off the socket but is unusable
@@ -2385,252 +2281,18 @@ mod tests {
     assert_eq!(snap.packets_dropped, 1, "exactly one reject counter");
   }
 
-  /// unregistering one service must NOT withdraw the host A/AAAA
-  /// records while another registered service still advertises the same host
-  /// — otherwise the sibling's addresses are evicted from peer caches. The
-  /// sole remaining owner's withdrawal DOES include the host addresses.
-  #[cfg(feature = "tokio")]
-  #[tokio::test]
-  async fn unregister_shared_host_preserves_sibling_addresses() {
-    use std::{net::Ipv4Addr, time::Duration};
-
-    let opts = crate::options::ServerOptions::default();
-    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
-      v4: None,
-      v6: None,
-      interface_index: 0,
-    };
-    let mut state = DriverState::new(&opts, sockets);
-    let now = StdInstant::now();
-
-    // Two services with distinct instance/type names but the SAME host.
-    let mk = |stype: &str, inst: &str| {
-      let mut r = mdns_proto::ServiceRecords::new(
-        mdns_proto::Name::try_from_str(stype).unwrap(),
-        mdns_proto::Name::try_from_str(inst).unwrap(),
-        mdns_proto::Name::try_from_str("shared.local.").unwrap(),
-        631,
-        120,
-      );
-      r.add_a(Ipv4Addr::new(192, 168, 1, 10));
-      mdns_proto::ServiceSpec::new(r)
-    };
-    let reg_a = state
-      .register_service(mk("_ipp._tcp.local.", "one._ipp._tcp.local."), now)
-      .unwrap();
-    let reg_b = state
-      .register_service(mk("_http._tcp.local.", "two._http._tcp.local."), now)
-      .unwrap();
-    let (a, b) = (reg_a.handle, reg_b.handle);
-
-    // Drive both proto services to an announced state so encode_goodbye fires.
-    for h in [a, b] {
-      let ctx = state.services.get_mut(&h).unwrap();
-      let mut buf = vec![0u8; 4096];
-      let mut t = now;
-      for _ in 0..40 {
-        t += Duration::from_millis(300);
-        let _ = ctx.proto.handle_timeout(t);
-        // Simulate a successful send so the proto latches its announce/host
-        // guards (delivery is confirmed via note_transmit_delivered).
-        while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-          ctx.proto.note_transmit_delivered(t);
-        }
-      }
-    }
-
-    // Remove A while B still uses "shared.local." → instance-only goodbye.
-    state.goodbyes.clear();
-    state.remove_service(a, now);
-    assert_eq!(state.goodbyes.len(), 1, "removal must queue one goodbye");
-    assert!(
-      !goodbye_withdraws_addr(&state.goodbyes[0].data),
-      "shared-host removal must omit host A/AAAA (sibling still advertises them)"
-    );
-
-    // Remove B (now the sole owner of the host) → full goodbye with A/AAAA.
-    state.goodbyes.clear();
-    state.remove_service(b, now);
-    assert_eq!(state.goodbyes.len(), 1);
-    assert!(
-      goodbye_withdraws_addr(&state.goodbyes[0].data),
-      "sole-owner removal must withdraw the host A/AAAA"
-    );
-  }
-
-  /// a same-host sibling that is merely registered but has NOT
-  /// announced does not keep peers' host records alive, so removing an
-  /// announced service next to such a sibling must STILL withdraw the host
-  /// A/AAAA (a full goodbye) — otherwise the only advertised host records
-  /// linger in peer caches until TTL expiry.
-  #[cfg(feature = "tokio")]
-  #[tokio::test]
-  async fn unregister_with_unannounced_same_host_sibling_withdraws_addresses() {
-    use std::{net::Ipv4Addr, time::Duration};
-
-    let opts = crate::options::ServerOptions::default();
-    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
-      v4: None,
-      v6: None,
-      interface_index: 0,
-    };
-    let mut state = DriverState::new(&opts, sockets);
-    let now = StdInstant::now();
-
-    let mk = |stype: &str, inst: &str| {
-      let mut r = mdns_proto::ServiceRecords::new(
-        mdns_proto::Name::try_from_str(stype).unwrap(),
-        mdns_proto::Name::try_from_str(inst).unwrap(),
-        mdns_proto::Name::try_from_str("shared.local.").unwrap(),
-        631,
-        120,
-      );
-      r.add_a(Ipv4Addr::new(192, 168, 1, 10));
-      mdns_proto::ServiceSpec::new(r)
-    };
-    let reg_a = state
-      .register_service(mk("_ipp._tcp.local.", "one._ipp._tcp.local."), now)
-      .unwrap();
-    let reg_b = state
-      .register_service(mk("_http._tcp.local.", "two._http._tcp.local."), now)
-      .unwrap();
-    let (a, _b) = (reg_a.handle, reg_b.handle);
-
-    // Drive ONLY A to an announced state; B stays registered but never
-    // announces (still probing), so it has not advertised the host records.
-    {
-      let ctx = state.services.get_mut(&a).unwrap();
-      let mut buf = vec![0u8; 4096];
-      let mut t = now;
-      for _ in 0..40 {
-        t += Duration::from_millis(300);
-        let _ = ctx.proto.handle_timeout(t);
-        // Simulate a successful send so the proto latches its announce/host
-        // guards (delivery is confirmed via note_transmit_delivered).
-        while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-          ctx.proto.note_transmit_delivered(t);
-        }
-      }
-    }
-
-    // Removing A must withdraw the host A/AAAA: B never advertised them, so A
-    // is the only peer-visible advertiser of "shared.local.".
-    state.goodbyes.clear();
-    state.remove_service(a, now);
-    assert_eq!(state.goodbyes.len(), 1, "removal must queue one goodbye");
-    assert!(
-      goodbye_withdraws_addr(&state.goodbyes[0].data),
-      "removal must withdraw host A/AAAA when the same-host sibling never announced"
-    );
-  }
-
-  /// two services sharing a host NAME but advertising DISJOINT
-  /// addresses. Removing one must withdraw only its own host address, never the
-  /// sibling's still-advertised one (host ownership is per-address, not per
-  /// host name).
-  #[cfg(feature = "tokio")]
-  #[tokio::test]
-  async fn unregister_disjoint_host_addrs_withdraws_only_own() {
-    use std::{net::Ipv4Addr, time::Duration};
-
-    let opts = crate::options::ServerOptions::default();
-    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
-      v4: None,
-      v6: None,
-      interface_index: 0,
-    };
-    let mut state = DriverState::new(&opts, sockets);
-    let now = StdInstant::now();
-
-    let mk = |stype: &str, inst: &str, addr: Ipv4Addr| {
-      let mut r = mdns_proto::ServiceRecords::new(
-        mdns_proto::Name::try_from_str(stype).unwrap(),
-        mdns_proto::Name::try_from_str(inst).unwrap(),
-        mdns_proto::Name::try_from_str("shared.local.").unwrap(),
-        631,
-        120,
-      );
-      r.add_a(addr);
-      mdns_proto::ServiceSpec::new(r)
-    };
-    let a_addr = Ipv4Addr::new(192, 168, 1, 10);
-    let b_addr = Ipv4Addr::new(192, 168, 1, 11);
-    let reg_a = state
-      .register_service(mk("_ipp._tcp.local.", "one._ipp._tcp.local.", a_addr), now)
-      .unwrap();
-    let reg_b = state
-      .register_service(
-        mk("_http._tcp.local.", "two._http._tcp.local.", b_addr),
-        now,
-      )
-      .unwrap();
-    let (a, b) = (reg_a.handle, reg_b.handle);
-    for h in [a, b] {
-      let ctx = state.services.get_mut(&h).unwrap();
-      let mut buf = vec![0u8; 4096];
-      let mut t = now;
-      for _ in 0..40 {
-        t += Duration::from_millis(300);
-        let _ = ctx.proto.handle_timeout(t);
-        // Simulate a successful send so the proto latches its announce/host
-        // guards (delivery is confirmed via note_transmit_delivered).
-        while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-          ctx.proto.note_transmit_delivered(t);
-        }
-      }
-    }
-
-    // Remove A: its own .10 is withdrawn, B's disjoint .11 is preserved.
-    state.goodbyes.clear();
-    state.remove_service(a, now);
-    assert_eq!(state.goodbyes.len(), 1);
-    let withdrawn = goodbye_v4_addrs(&state.goodbyes[0].data);
-    assert!(
-      withdrawn.contains(&a_addr),
-      "A's own host address must be withdrawn"
-    );
-    assert!(
-      !withdrawn.contains(&b_addr),
-      "the sibling's disjoint host address must NOT be withdrawn"
-    );
-
-    // Remove B (now sole owner): its own .11 is withdrawn.
-    state.goodbyes.clear();
-    state.remove_service(b, now);
-    assert_eq!(state.goodbyes.len(), 1);
-    let withdrawn = goodbye_v4_addrs(&state.goodbyes[0].data);
-    assert!(
-      withdrawn.contains(&b_addr),
-      "B's own host address must be withdrawn when it leaves"
-    );
-  }
-
-  #[cfg(feature = "tokio")]
-  fn goodbye_v4_addrs(data: &[u8]) -> Vec<std::net::Ipv4Addr> {
-    let reader = mdns_proto::wire::MessageReader::try_parse(data).unwrap();
-    let mut out = Vec::new();
-    for r in reader.answers().filter_map(Result::ok) {
-      if r.rtype() == mdns_proto::wire::ResourceType::A {
-        let rd = r.rdata();
-        if rd.len() == 4 {
-          out.push(std::net::Ipv4Addr::new(rd[0], rd[1], rd[2], rd[3]));
-        }
-      }
-    }
-    out
-  }
-
-  #[cfg(feature = "tokio")]
-  fn goodbye_withdraws_addr(data: &[u8]) -> bool {
-    let reader = mdns_proto::wire::MessageReader::try_parse(data).unwrap();
-    reader.answers().filter_map(Result::ok).any(|r| {
-      matches!(
-        r.rtype(),
-        mdns_proto::wire::ResourceType::A | mdns_proto::wire::ResourceType::AAAA
-      )
-    })
-  }
-
+  // NOTE: the same-host sibling-address RETENTION tests
+  // (`unregister_shared_host_preserves_sibling_addresses`,
+  // `unregister_with_unannounced_same_host_sibling_withdraws_addresses`,
+  // `unregister_disjoint_host_addrs_withdraws_only_own`) and their
+  // `goodbye_v4_addrs` / `goodbye_withdraws_addr` helpers were REMOVED in the
+  // endpoint-owned-withdrawal migration. They inspected the encoded bytes of the
+  // deleted driver-side goodbye queue (`state.goodbyes[0].data`), produced by the
+  // deleted `retained_host_addrs` sibling scan in `remove_service`. Sibling
+  // retention now lives in the endpoint (`Endpoint::sibling_retained_addrs`,
+  // recomputed FRESH each round in `poll_withdrawal_transmit` from the route
+  // table) and is covered by the proto-level
+  // `poll_withdrawal_transmit ... sibling retention` test.
   #[test]
   fn overflow_buffer_preserves_insertion_order_and_coalesces() {
     use mdns_proto::{ServiceUpdate, event::ServiceRenamed};
@@ -3237,14 +2899,40 @@ mod tests {
     assert!(take_self_send(&mut tracker, b"live", t, MatchMode::Ordered));
   }
 
-  // on shutdown, flush_goodbyes must drive a queued goodbye burst
-  // to completion rather than abandoning it after the first send. No sockets
-  // are needed — `drain_goodbyes` advances the burst regardless of send
-  // outcome — so this also asserts the flush always terminates (no hang).
+  // NOTE: the deleted driver-goodbye-queue seam tests
+  // (`flush_goodbyes_completes_the_burst`,
+  // `live_goodbye_round_with_no_send_keeps_budget_and_backs_off`,
+  // `live_drain_force_clears_expired_barrier`) asserted the removed per-driver
+  // `goodbyes` queue + `sent_once` transmit barrier (`drain_goodbyes` Part A
+  // re-arm, the `expires_at` anti-pin force-clear, and `has_pending_barrier`).
+  // The endpoint now owns the resend schedule, the spend/re-arm bookkeeping, and
+  // the 2 s anti-pin ceiling — covered by the proto-level withdrawal tests
+  // (`note_withdrawal_result` spend/backoff, `drain_completed_withdrawals`
+  // ceiling). The replacement-survival test below is the driver-seam observation
+  // that a withdrawal HOLDS the name and frees it on completion.
+
+  /// Endpoint-owned-withdrawal replacement survival (supersedes the old free-name
+  /// goodbye BARRIER test). Under `with_probe_unique_names(false)` a same-name
+  /// replacement would announce a positive TTL directly (no §8.1 probe) — exactly
+  /// the configuration in which a stale TTL=0 goodbye could be overtaken. The old
+  /// driver enforced ordering with a transmit barrier; the endpoint now enforces
+  /// it structurally — it KEEPS the route (holding the name) for the whole §10.1
+  /// withdrawal, so a same-name `register_service` is REJECTED until the goodbye
+  /// completes and frees the name. No replacement can announce ahead of the
+  /// withdrawal because no replacement can even be registered until it is done.
+  ///
+  /// Driven through `DriverState` directly (no sockets — the reactor's multi-task
+  /// loop cannot be stepped deterministically). With no bound family every
+  /// withdrawal round fails to deliver, so the withdrawal is force-completed at
+  /// its 2 s anti-pin ceiling rather than by spending its resend budget; the
+  /// name-held → name-freed observation is identical either way.
   #[cfg(feature = "tokio")]
   #[tokio::test]
-  async fn flush_goodbyes_completes_the_burst() {
-    let opts = crate::options::ServerOptions::default();
+  async fn same_name_replacement_is_rejected_until_withdrawal_completes() {
+    use std::{net::Ipv4Addr, time::Duration};
+
+    let opts = crate::options::ServerOptions::default()
+      .with_endpoint_config(mdns_proto::EndpointConfig::new().with_probe_unique_names(false));
     let sockets = BoundSockets::<agnostic_net::tokio::Net> {
       v4: None,
       v6: None,
@@ -3252,120 +2940,84 @@ mod tests {
     };
     let mut state = DriverState::new(&opts, sockets);
     let now = StdInstant::now();
-    state.goodbyes.push(PendingGoodbye {
-      data: vec![0xde, 0xad],
-      remaining: GOODBYE_SENDS,
-      next_at: now,
-      sent_once: false,
-      expires_at: now + GOODBYE_BARRIER_MAX,
-    });
-    state.flush_goodbyes().await;
-    assert!(
-      state.goodbyes.is_empty(),
-      "the goodbye burst must fully drain before shutdown"
-    );
-  }
 
-  /// Part A (live path, State seam): a goodbye round that reached NO family
-  /// (here: no socket bound, so `send_via` reports zero sends) must NOT spend the
-  /// resend budget, must NOT flip `sent_once`, and must re-arm at the short
-  /// `GOODBYE_RETRY_BACKOFF` — not a full `GOODBYE_INTERVAL`. The all-failing case
-  /// is reachable deterministically without sockets; the full async barrier-skip
-  /// ordering is exercised end-to-end in the deterministic `hick-smoltcp` engine
-  /// test (the reactor's multi-task loop cannot be stepped deterministically here).
-  #[cfg(feature = "tokio")]
-  #[tokio::test]
-  async fn live_goodbye_round_with_no_send_keeps_budget_and_backs_off() {
-    let opts = crate::options::ServerOptions::default();
-    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
-      v4: None,
-      v6: None,
-      interface_index: 0,
+    let mk = || {
+      let mut r = mdns_proto::ServiceRecords::new(
+        mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+        mdns_proto::Name::try_from_str("repl._ipp._tcp.local.").unwrap(),
+        mdns_proto::Name::try_from_str("repl.local.").unwrap(),
+        631,
+        120,
+      );
+      r.add_a(Ipv4Addr::new(192, 168, 1, 10));
+      mdns_proto::ServiceSpec::new(r)
     };
-    let mut state = DriverState::new(&opts, sockets);
-    let now = StdInstant::now();
-    state.goodbyes.push(PendingGoodbye {
-      data: vec![0xde, 0xad],
-      remaining: GOODBYE_SENDS,
-      next_at: now,
-      sent_once: false,
-      expires_at: now + GOODBYE_BARRIER_MAX,
-    });
 
-    // `force = false`: the live path. With no socket nothing reaches the wire.
-    state.drain_goodbyes(now, false).await;
-    let g = &state.goodbyes[0];
-    assert_eq!(
-      g.remaining, GOODBYE_SENDS,
-      "an all-failing live round must not consume the resend budget"
-    );
-    assert!(
-      !g.sent_once,
-      "an all-failing round must not flip sent_once — the barrier still holds"
-    );
-    assert_eq!(
-      g.next_at,
-      now + GOODBYE_RETRY_BACKOFF,
-      "a failed live round must re-arm at GOODBYE_RETRY_BACKOFF"
-    );
-    assert!(
-      g.next_at < now + GOODBYE_INTERVAL,
-      "a failed live round must NOT push next_at out by a full GOODBYE_INTERVAL"
-    );
-    assert!(
-      state.has_pending_barrier(now),
-      "an un-sent goodbye remains a pending transmit barrier"
-    );
-  }
+    // 1. Register A and drive its proto to an announced state so the withdrawal
+    //    snapshot is NON-empty (records were confirmed-emitted). Delivery is
+    //    simulated via `note_transmit_delivered` so the announce/host guards
+    //    latch (no sockets are bound).
+    let a = state.register_service(mk(), now).unwrap().handle;
+    {
+      let ctx = state.services.get_mut(&a).unwrap();
+      let mut buf = vec![0u8; 4096];
+      let mut t = now;
+      for _ in 0..40 {
+        t += Duration::from_millis(300);
+        let _ = ctx.proto.handle_timeout(t);
+        while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
+          ctx.proto.note_transmit_delivered(t);
+        }
+      }
+    }
 
-  /// Anti-pin (State seam): a goodbye past its `expires_at` is force-cleared by
-  /// `drain_goodbyes` REGARDLESS of remaining sends, so a permanently-
-  /// undeliverable barrier cannot pin the queue or block transmits forever. A
-  /// live, un-expired entry survives and keeps barring transmits until its bound.
-  #[cfg(feature = "tokio")]
-  #[tokio::test]
-  async fn live_drain_force_clears_expired_barrier() {
-    let opts = crate::options::ServerOptions::default();
-    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
-      v4: None,
-      v6: None,
-      interface_index: 0,
-    };
-    let mut state = DriverState::new(&opts, sockets);
-    let now = StdInstant::now();
-    // Already past its anti-pin bound while still owing sends.
-    state.goodbyes.push(PendingGoodbye {
-      data: vec![1],
-      remaining: GOODBYE_SENDS,
-      next_at: now,
-      sent_once: false,
-      expires_at: now - Duration::from_millis(1),
-    });
-    // Live, un-expired, still owing → retained.
-    state.goodbyes.push(PendingGoodbye {
-      data: vec![3],
-      remaining: GOODBYE_SENDS,
-      next_at: now + GOODBYE_INTERVAL, // not due, so no send is attempted
-      sent_once: false,
-      expires_at: now + GOODBYE_BARRIER_MAX,
-    });
+    // 2. Unregister A → begins the endpoint-owned withdrawal (name held). The ctx
+    //    is KEPT (marked withdrawing) and the route is reserved.
+    state.remove_service(a, now);
+    assert!(
+      state
+        .services
+        .get(&a)
+        .map(|c| c.withdrawing)
+        .unwrap_or(false),
+      "unregister must begin the withdrawal and keep the ctx (withdrawing)"
+    );
 
-    state.drain_goodbyes(now, false).await;
-    assert_eq!(
-      state.goodbyes.len(),
-      1,
-      "the expired barrier must be force-cleared; only the live entry survives"
-    );
-    assert_eq!(state.goodbyes[0].data, vec![3]);
+    // 3. While the withdrawal is in flight the SAME name must be rejected — the
+    //    endpoint holds the route, so a replacement cannot announce a fresh
+    //    positive TTL ahead of the stale TTL=0.
+    match state.register_service(mk(), now) {
+      Err(crate::error::RegisterError::NameAlreadyRegistered(_)) => {}
+      Err(e) => panic!("a same-name registration must be rejected while withdrawing; got {e:?}"),
+      Ok(_) => {
+        panic!("a same-name registration must be rejected while the withdrawal holds the name")
+      }
+    }
+
+    // 4. Drive the withdrawal to completion. With no bound family each round fails
+    //    to deliver, so the endpoint force-completes it at the 2 s anti-pin
+    //    ceiling; `drain_withdrawals` then frees the route and GCs the ctx.
+    let mut scratch = vec![0u8; 4096];
+    let mut t = now;
+    let mut completed = false;
+    for _ in 0..64 {
+      t += Duration::from_millis(250);
+      state.drain_withdrawals(t, &mut scratch).await;
+      if !state.services.contains_key(&a) {
+        completed = true;
+        break;
+      }
+    }
     assert!(
-      state.has_pending_barrier(now),
-      "the surviving un-sent entry is still a barrier"
+      completed,
+      "the withdrawal must complete (route freed + driver ctx GC'd) — by its 2 s \
+       anti-pin ceiling when no family can deliver"
     );
-    let later = now + GOODBYE_BARRIER_MAX + Duration::from_millis(1);
-    assert!(
-      !state.has_pending_barrier(later),
-      "an entry past its expires_at no longer bars transmits"
-    );
+
+    // 5. The name is freed → a same-name replacement now registers successfully.
+    state
+      .register_service(mk(), t)
+      .expect("the same name must be re-registerable once the withdrawal completes");
   }
 
   /// Registering the same instance name twice maps the proto

@@ -439,9 +439,8 @@ where
     // no advertised host addresses) completes immediately: `remaining = 0` makes
     // the next `drain_completed_withdrawals` free the name at once, with no
     // spurious goodbye and no 2 s ceiling wait.
-    let nothing_to_withdraw = snapshot.owned.is_empty()
-      && snapshot.host_a.is_empty()
-      && snapshot.host_aaaa.is_empty();
+    let nothing_to_withdraw =
+      snapshot.owned.is_empty() && snapshot.host_a.is_empty() && snapshot.host_aaaa.is_empty();
     let remaining = if nothing_to_withdraw {
       0
     } else {
@@ -450,9 +449,7 @@ where
 
     // next_at = now (first send fires immediately); ceiling_at = now +
     // WITHDRAWAL_CEILING (hard anti-pin deadline).
-    let ceiling_at = now
-      .checked_add_duration(WITHDRAWAL_CEILING)
-      .unwrap_or(now);
+    let ceiling_at = now.checked_add_duration(WITHDRAWAL_CEILING).unwrap_or(now);
     self.withdrawals.push((
       handle,
       Withdrawal {
@@ -587,9 +584,7 @@ where
     };
     if delivered {
       w.remaining = w.remaining.saturating_sub(1);
-      w.next_at = now
-        .checked_add_duration(WITHDRAWAL_INTERVAL)
-        .unwrap_or(now);
+      w.next_at = now.checked_add_duration(WITHDRAWAL_INTERVAL).unwrap_or(now);
     } else {
       w.next_at = now
         .checked_add_duration(WITHDRAWAL_RETRY_BACKOFF)
@@ -5282,11 +5277,10 @@ mod tests {
     let inst2 = inst; // same name
     let host2 = Name::try_from_str("printer-host.local.").unwrap();
     let recs2 = ServiceRecords::new(st2, inst2, host2, 631, 120);
-    let result = ep
-      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-        ServiceSpec::new(recs2),
-        now,
-      );
+    let result = ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs2),
+      now,
+    );
     assert!(
       matches!(result, Err(RegisterServiceError::NameAlreadyRegistered(_))),
       "same-name re-registration must be rejected while withdrawal route is held"
@@ -5327,7 +5321,9 @@ mod tests {
     let unique = Ipv4Addr::new(192, 168, 1, 6);
     let host = Name::try_from_str("h.local.").unwrap();
 
-    // Service A (host h) advertises BOTH the shared and the unique address.
+    // Service A (host h) advertises BOTH the shared and the unique address, plus
+    // a `_printer` subtype (RFC 6763 §7.1) so the withdrawal must also retract
+    // the subtype PTR at TTL 0.
     let mut recs_a = ServiceRecords::new(
       Name::try_from_str("_ipp._tcp.local.").unwrap(),
       Name::try_from_str("A._ipp._tcp.local.").unwrap(),
@@ -5337,6 +5333,8 @@ mod tests {
     );
     recs_a.add_a(shared);
     recs_a.add_a(unique);
+    recs_a.add_subtype("_printer").unwrap();
+    let sub = Name::try_from_str("_printer._sub._ipp._tcp.local.").unwrap();
     let (a_handle, _svc_a) = ep
       .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
         ServiceSpec::new(recs_a.clone()),
@@ -5360,7 +5358,8 @@ mod tests {
       )
       .unwrap();
 
-    // A's withdrawal snapshot: owns PTR/SRV/TXT and both host A addresses.
+    // A's withdrawal snapshot: owns PTR/SRV/TXT, the subtype PTR, and both host
+    // A addresses.
     let snap = crate::service::WithdrawalSnapshot {
       records: recs_a,
       owned: crate::service::EmittedRecords::new(
@@ -5369,7 +5368,7 @@ mod tests {
         true,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
-        false,
+        true,
       ),
       host_a: std::vec![shared, unique],
       host_aaaa: std::vec::Vec::new(),
@@ -5384,6 +5383,7 @@ mod tests {
 
     let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
     let mut saw_instance = false;
+    let mut saw_subtype = false;
     let mut withdrawn_v4: std::vec::Vec<Ipv4Addr> = std::vec::Vec::new();
     for rec in reader.answers() {
       let rec = rec.unwrap();
@@ -5394,9 +5394,14 @@ mod tests {
           assert_eq!(d.len(), 4, "A rdata is 4 bytes");
           withdrawn_v4.push(Ipv4Addr::new(d[0], d[1], d[2], d[3]));
         }
-        crate::wire::ResourceType::Ptr
-        | crate::wire::ResourceType::Srv
-        | crate::wire::ResourceType::Txt => saw_instance = true,
+        crate::wire::ResourceType::Ptr => {
+          if names_match(&sub, rec.name()) {
+            saw_subtype = true;
+          } else {
+            saw_instance = true;
+          }
+        }
+        crate::wire::ResourceType::Srv | crate::wire::ResourceType::Txt => saw_instance = true,
         _ => {}
       }
     }
@@ -5404,6 +5409,7 @@ mod tests {
       saw_instance,
       "instance records (PTR/SRV/TXT) must be withdrawn at TTL 0"
     );
+    assert!(saw_subtype, "the subtype PTR must be withdrawn at TTL 0");
     assert!(
       withdrawn_v4.contains(&unique),
       "A's unique address must be withdrawn"
@@ -5461,10 +5467,15 @@ mod tests {
     let backoff_at = ep.withdrawal_next_at(h).unwrap();
     assert_eq!(
       backoff_at,
-      now.checked_add_duration(super::WITHDRAWAL_RETRY_BACKOFF).unwrap()
+      now
+        .checked_add_duration(super::WITHDRAWAL_RETRY_BACKOFF)
+        .unwrap()
     );
     assert!(
-      backoff_at < now.checked_add_duration(super::WITHDRAWAL_INTERVAL).unwrap(),
+      backoff_at
+        < now
+          .checked_add_duration(super::WITHDRAWAL_INTERVAL)
+          .unwrap(),
       "a failed round must NOT delay a full interval"
     );
 
@@ -5477,7 +5488,9 @@ mod tests {
     );
     assert_eq!(
       ep.withdrawal_next_at(h).unwrap(),
-      now.checked_add_duration(super::WITHDRAWAL_INTERVAL).unwrap()
+      now
+        .checked_add_duration(super::WITHDRAWAL_INTERVAL)
+        .unwrap()
     );
   }
 
@@ -5513,7 +5526,11 @@ mod tests {
     let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
     ep.drain_completed_withdrawals(now, &mut done);
 
-    assert_eq!(done, std::vec![h], "the completed handle is returned for GC");
+    assert_eq!(
+      done,
+      std::vec![h],
+      "the completed handle is returned for GC"
+    );
     assert_eq!(
       ep.stats().services_active,
       before - 1,

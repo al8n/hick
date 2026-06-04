@@ -479,324 +479,35 @@ fn drive_to_established(
 }
 
 #[test]
-fn encode_goodbye_none_before_announce() {
-  // a service that never announced has nothing peers cached, so
-  // there is no goodbye to send.
-  let svc = make_service(120);
-  assert_eq!(svc.state(), ServiceState::Init);
-  let mut buf = std::vec![0u8; 4096];
-  assert!(matches!(svc.encode_goodbye(&mut buf, &[]), Ok(None)));
-}
-
-#[test]
-fn encode_goodbye_records_have_zero_ttl_when_established() {
-  // once established, the goodbye carries the service's records
-  // with TTL 0 so receivers withdraw them.
-  let mut svc = make_service(120);
-  drive_to_established(&mut svc);
-  let mut buf = std::vec![0u8; 4096];
-  let len = svc
-    .encode_goodbye(&mut buf, &[])
-    .unwrap()
-    .expect("an established service must produce a goodbye");
-  let msg = buf.get(..len).unwrap();
-  let reader = crate::wire::MessageReader::try_parse(msg).unwrap();
-  let mut count = 0usize;
-  for rec in reader.answers() {
-    let rec = rec.unwrap();
-    assert_eq!(rec.ttl(), 0, "every goodbye record must carry TTL 0");
-    count += 1;
-  }
-  assert!(count > 0, "goodbye must contain the withdrawn records");
-}
-
-#[test]
 fn empty_txt_encodes_as_single_zero_length_string() {
   // RFC 6763 §6.1: a service with no TXT data must still emit a TXT record
   // whose rdata is a SINGLE zero-length string (one 0x00 byte), never empty
   // rdata (an empty TXT RR is invalid). make_records adds no TXT segments.
+  // Drive an announcement (positive-TTL) and inspect its TXT record — the TXT
+  // encoding is the same writer the withdrawal path reuses.
   let mut svc = make_service(120);
-  drive_to_established(&mut svc);
   let mut buf = std::vec![0u8; 4096];
-  let len = svc
-    .encode_goodbye(&mut buf, &[])
-    .unwrap()
-    .expect("an established service must produce a goodbye");
-  let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
+  let mut now = FakeInstant::zero();
   let mut txt_rdata: Option<std::vec::Vec<u8>> = None;
-  for rec in reader.answers() {
-    let rec = rec.unwrap();
-    if rec.rtype() == crate::wire::ResourceType::Txt {
-      txt_rdata = Some(rec.rdata().to_vec());
+  'drive: for _ in 0..20 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(tx)) = svc.poll_transmit(now, &mut buf) {
+      let reader = crate::wire::MessageReader::try_parse(buf.get(..tx.size()).unwrap()).unwrap();
+      for rec in reader.answers() {
+        let rec = rec.unwrap();
+        if rec.rtype() == crate::wire::ResourceType::Txt {
+          txt_rdata = Some(rec.rdata().to_vec());
+          break 'drive;
+        }
+      }
+      svc.note_transmit_result(now, true);
     }
   }
   assert_eq!(
     txt_rdata.as_deref(),
     Some(&[0u8][..]),
     "an empty TXT record must encode as a single zero-length string (one 0x00 byte)"
-  );
-}
-
-#[test]
-fn encode_goodbye_withdraws_only_unretained_host_addrs() {
-  // host A/AAAA ownership is per-address. When the removed
-  // service's host address is still advertised by a sibling (in
-  // retained_host_addrs), the goodbye carries the instance records (PTR/SRV/
-  // TXT) at TTL 0 but NOT that address; when no sibling retains it, the
-  // address IS withdrawn.
-  let host_addr = core::net::IpAddr::V4(core::net::Ipv4Addr::new(192, 168, 1, 10));
-  let mut svc = make_service(120); // make_records advertises 192.168.1.10
-  drive_to_established(&mut svc);
-  let mut buf = std::vec![0u8; 4096];
-
-  // Address retained by a sibling → instance-only withdrawal (no A/AAAA).
-  let len = svc
-    .encode_goodbye(&mut buf, &[host_addr])
-    .unwrap()
-    .expect("established service must produce a goodbye");
-  let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
-  let mut saw_instance = false;
-  let mut saw_addr = false;
-  for rec in reader.answers() {
-    let rec = rec.unwrap();
-    assert_eq!(rec.ttl(), 0, "every goodbye record must carry TTL 0");
-    match rec.rtype() {
-      crate::wire::ResourceType::A | crate::wire::ResourceType::AAAA => saw_addr = true,
-      crate::wire::ResourceType::Ptr
-      | crate::wire::ResourceType::Srv
-      | crate::wire::ResourceType::Txt => saw_instance = true,
-      _ => {}
-    }
-  }
-  assert!(
-    saw_instance,
-    "instance records (PTR/SRV/TXT) must still be present"
-  );
-  assert!(
-    !saw_addr,
-    "a host address still advertised by a sibling must NOT be withdrawn"
-  );
-
-  // No sibling retains it → the host A (192.168.1.10) is withdrawn too.
-  let len = svc
-    .encode_goodbye(&mut buf, &[])
-    .unwrap()
-    .expect("established service must produce a goodbye");
-  let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
-  let saw_addr = reader.answers().filter_map(Result::ok).any(|r| {
-    matches!(
-      r.rtype(),
-      crate::wire::ResourceType::A | crate::wire::ResourceType::AAAA
-    )
-  });
-  assert!(saw_addr, "an unretained host address must be withdrawn");
-}
-
-#[test]
-fn take_pending_rename_goodbye_drains_and_clears() {
-  // a service removed mid-rename never gets polled again, so its
-  // queued old-name withdrawal would be lost. take_pending_rename_goodbye
-  // lets the driver drain those bytes (instance-only, no host A/AAAA) into
-  // its own goodbye queue, and clears the pending state.
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
-  svc.goodbye.mark_instance(); // the original name was announced
-
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc
-    .handle_timeout(FakeInstant::zero().advance(500))
-    .unwrap(); // rename
-  assert!(
-    svc.name().as_str().contains("-1"),
-    "service should have renamed"
-  );
-
-  // Drain the queued old-name withdrawal.
-  let mut out = std::vec![0u8; 4096];
-  let len = svc
-    .take_pending_rename_goodbye(&mut out)
-    .unwrap()
-    .expect("a pending rename goodbye must be drained on removal");
-  let reader = crate::wire::MessageReader::try_parse(out.get(..len).unwrap()).unwrap();
-  let mut old_srv_goodbye = false;
-  let mut saw_host_addr = false;
-  for rr in reader.answers() {
-    let rr = rr.unwrap();
-    match rr.rtype() {
-      crate::wire::ResourceType::Srv => {
-        if rr.name().labels().next().and_then(Result::ok) == Some(&b"myprinter"[..])
-          && rr.ttl() == 0
-        {
-          old_srv_goodbye = true;
-        }
-      }
-      crate::wire::ResourceType::A | crate::wire::ResourceType::AAAA => saw_host_addr = true,
-      _ => {}
-    }
-  }
-  assert!(
-    old_srv_goodbye,
-    "drained goodbye must carry the OLD instance SRV (owner 'myprinter') at TTL=0"
-  );
-  assert!(
-    !saw_host_addr,
-    "drained rename goodbye must NOT withdraw the still-valid host A/AAAA"
-  );
-
-  // The pending state must be cleared: a second take yields nothing, and
-  // poll_transmit no longer re-emits the old-name goodbye.
-  assert!(
-    svc.take_pending_rename_goodbye(&mut out).unwrap().is_none(),
-    "pending rename goodbye must be cleared after being taken"
-  );
-}
-
-#[test]
-fn take_pending_rename_goodbye_preserves_on_too_small_buffer() {
-  // a too-small buffer must NOT destroy the pending withdrawal.
-  // take_pending_rename_goodbye surfaces BufferTooSmall and keeps the state,
-  // so a later larger-buffer call still emits the old-name goodbye.
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
-  svc.goodbye.mark_instance(); // the original name was announced
-
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc
-    .handle_timeout(FakeInstant::zero().advance(500))
-    .unwrap(); // rename
-
-  // Too-small buffer → BufferTooSmall, state preserved.
-  let mut tiny = std::vec![0u8; 4];
-  assert!(
-    matches!(
-      svc.take_pending_rename_goodbye(&mut tiny),
-      Err(TransmitError::BufferTooSmall(_))
-    ),
-    "a too-small buffer must surface BufferTooSmall, not silently drop"
-  );
-
-  // A later adequately-sized buffer still emits the withdrawal.
-  let mut out = std::vec![0u8; 4096];
-  assert!(
-    svc.take_pending_rename_goodbye(&mut out).unwrap().is_some(),
-    "the preserved withdrawal must still be drainable with a larger buffer"
-  );
-}
-
-#[test]
-fn host_advertisement_survives_rename_and_drives_host_goodbye() {
-  // host A/AAAA are owned by the host name, which does NOT change
-  // on a conflict rename. A service that announced (advertising the host
-  // records) then renamed has announce_emitted=false for the NEW name but
-  // advertises_host()=true. Removing it as the last host owner must still
-  // withdraw the host A/AAAA (host-only goodbye — the never-announced new
-  // instance records are NOT emitted); if the host is still shared
-  // (include_host_addrs=false) it emits nothing.
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
-  svc.goodbye.mark_instance();
-  // the original name announced the host A/AAAA (per-address ownership)
-  svc.goodbye.a = svc.records.a_addrs_slice().to_vec();
-  svc.goodbye.aaaa = svc.records.aaaa_addrs_slice().to_vec();
-
-  // Drive a losing §8.2 tiebreak (peer SRV port 9999 > ours 631) → rename.
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc
-    .handle_timeout(FakeInstant::zero().advance(500))
-    .unwrap();
-  assert!(
-    svc.name().as_str().contains("-1"),
-    "service should have renamed"
-  );
-  assert!(
-    !svc.goodbye.any_instance(),
-    "the new instance name has not been announced after the rename"
-  );
-  assert!(
-    svc.advertises_host(),
-    "host advertisement must survive the instance rename"
-  );
-
-  // Last host owner (no addresses retained) → withdraw host A/AAAA only.
-  let mut out = std::vec![0u8; 4096];
-  let len = svc
-    .encode_goodbye(&mut out, &[])
-    .unwrap()
-    .expect("must emit a host-only goodbye for the previously-advertised host");
-  let reader = crate::wire::MessageReader::try_parse(out.get(..len).unwrap()).unwrap();
-  let mut saw_host_addr = false;
-  let mut saw_instance = false;
-  for rr in reader.answers() {
-    let rr = rr.unwrap();
-    assert_eq!(rr.ttl(), 0, "every goodbye record must carry TTL 0");
-    match rr.rtype() {
-      crate::wire::ResourceType::A | crate::wire::ResourceType::AAAA => saw_host_addr = true,
-      crate::wire::ResourceType::Ptr
-      | crate::wire::ResourceType::Srv
-      | crate::wire::ResourceType::Txt => saw_instance = true,
-      _ => {}
-    }
-  }
-  assert!(
-    saw_host_addr,
-    "the previously-advertised host A/AAAA must be withdrawn"
-  );
-  assert!(
-    !saw_instance,
-    "the never-announced new instance records must NOT be emitted"
-  );
-
-  // Host address still owned by a sibling (retained) → nothing to do: the
-  // new instance never announced and the host address must not be withdrawn.
-  let host_addr = core::net::IpAddr::V4(core::net::Ipv4Addr::new(192, 168, 1, 10));
-  assert!(
-    matches!(svc.encode_goodbye(&mut out, &[host_addr]), Ok(None)),
-    "a renamed service whose host address is still owned by a sibling emits no goodbye"
   );
 }
 
@@ -949,20 +660,13 @@ fn announce_guards_latch_only_on_confirmed_delivery() {
     !svc.advertises_host(),
     "host ownership must NOT latch until a send is confirmed"
   );
-  assert!(
-    matches!(svc.encode_goodbye(&mut buf, &[]), Ok(None)),
-    "no goodbye for an announcement that never reached the link"
-  );
 
-  // Confirm delivery → guards latch and a goodbye is now produced.
+  // Confirm delivery → guards latch (a goodbye is now produced; the
+  // datagram-level withdrawal is covered by the endpoint withdrawal tests).
   svc.note_transmit_delivered(now);
   assert!(
     svc.advertises_host(),
     "host ownership must latch on confirmed delivery"
-  );
-  assert!(
-    svc.encode_goodbye(&mut buf, &[]).unwrap().is_some(),
-    "a confirmed-delivered service must produce a goodbye on removal"
   );
 }
 
@@ -1127,8 +831,17 @@ fn no_goodbye_after_final_probe_before_first_announcement() {
     reached,
     "service should reach Announcing(0) within 20 ticks"
   );
+  // Reaching Announcing(0) without an emitted announcement must leave nothing
+  // withdrawable: the goodbye-ownership latch (captured by the withdrawal
+  // snapshot) owns no records and no host addresses.
+  let snap = svc.withdrawal_snapshot();
   assert!(
-    matches!(svc.encode_goodbye(&mut buf, &[]), Ok(None)),
+    !snap.owned.ptr()
+      && !snap.owned.srv()
+      && !snap.owned.txt()
+      && !snap.owned.subtypes()
+      && snap.host_a.is_empty()
+      && snap.host_aaaa.is_empty(),
     "no goodbye until an announcement has actually been emitted"
   );
 }
@@ -1161,7 +874,7 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
   }
   assert!(matches!(svc.state(), ServiceState::Announcing(0)));
   assert!(
-    !svc.advertises_host() && matches!(svc.encode_goodbye(&mut buf, &[]), Ok(None)),
+    !svc.advertises_host() && !svc.goodbye.any_instance(),
     "precondition: nothing advertised/withdrawable before any send"
   );
 
@@ -1219,10 +932,6 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
   assert!(
     svc.goodbye.any_host(),
     "the legacy reply also emitted the host A, so host ownership latches"
-  );
-  assert!(
-    svc.encode_goodbye(&mut buf, &[]).unwrap().is_some(),
-    "a service that answered a query must produce a goodbye on removal"
   );
   assert!(
     matches!(svc.state(), ServiceState::Announcing(0)),
@@ -4010,10 +3719,11 @@ fn failed_established_reannounce_retries_within_one_second() {
 }
 
 #[test]
-fn subtype_ptr_advertised_in_response_and_withdrawn_on_goodbye() {
+fn subtype_ptr_advertised_in_response() {
   // §7.1: a registered subtype is advertised as a shared PTR
-  // (`_printer._sub._ipp._tcp.local.` → instance) in responses, and withdrawn
-  // at TTL 0 on unregister.
+  // (`_printer._sub._ipp._tcp.local.` → instance) in responses at positive TTL.
+  // The TTL=0 withdrawal of the subtype PTR on unregister is covered at the
+  // endpoint level by `poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr`.
   use crate::wire::{MessageReader, ResourceType};
   let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
   let inst = Name::try_from_str("myprinter._ipp._tcp.local.").unwrap();
@@ -4055,25 +3765,6 @@ fn subtype_ptr_advertised_in_response_and_withdrawn_on_goodbye() {
     "a response must include the subtype PTR at positive TTL"
   );
   svc.note_transmit_result(now2, true);
-
-  // Unregister goodbye withdraws the subtype PTR at TTL 0.
-  let len = svc
-    .encode_goodbye(&mut buf, &[])
-    .unwrap()
-    .expect("a goodbye must be emitted");
-  let reader = MessageReader::try_parse(&buf[..len]).unwrap();
-  let saw_subtype_goodbye = reader.answers().any(|rr| {
-    rr.map(|rec| {
-      rec.rtype() == ResourceType::Ptr
-        && crate::endpoint::names_match(&sub, rec.name())
-        && rec.ttl() == 0
-    })
-    .unwrap_or(false)
-  });
-  assert!(
-    saw_subtype_goodbye,
-    "the goodbye must withdraw the subtype PTR at TTL 0"
-  );
 }
 
 #[test]
@@ -4482,18 +4173,6 @@ fn canonical_rdata_for_hash_handles_nsec_and_unknown() {
   let oview = orec.rdata_view().unwrap();
   let mut scratch2 = std::vec::Vec::new();
   respond::canonical_rdata_for_hash(&oview, &mut scratch2).unwrap();
-}
-
-#[test]
-fn encode_goodbye_surfaces_buffer_too_small() {
-  let mut svc = make_service(120);
-  drive_to_established(&mut svc);
-  // Header-only buffer — no room for the withdrawal records.
-  let mut tiny = std::vec![0u8; 12];
-  assert!(matches!(
-    svc.encode_goodbye(&mut tiny, &[]),
-    Err(TransmitError::BufferTooSmall(_))
-  ));
 }
 
 #[test]
@@ -5069,11 +4748,11 @@ fn withdrawal_snapshot_of_never_announced_service_is_empty() {
   assert!(!snap.owned.ptr(), "unanounced: PTR must not be owned");
   assert!(!snap.owned.srv(), "unannounced: SRV must not be owned");
   assert!(!snap.owned.txt(), "unannounced: TXT must not be owned");
-  assert!(!snap.owned.subtypes(), "unannounced: subtypes must not be owned");
   assert!(
-    snap.host_a.is_empty(),
-    "unannounced: host_a must be empty"
+    !snap.owned.subtypes(),
+    "unannounced: subtypes must not be owned"
   );
+  assert!(snap.host_a.is_empty(), "unannounced: host_a must be empty");
   assert!(
     snap.host_aaaa.is_empty(),
     "unannounced: host_aaaa must be empty"
@@ -5107,7 +4786,9 @@ fn withdrawal_snapshot_of_pending_rename_goodbye_takes_old_name() {
     ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
     FakeInstant::zero(),
   );
-  svc.handle_timeout(FakeInstant::zero().advance(500)).unwrap();
+  svc
+    .handle_timeout(FakeInstant::zero().advance(500))
+    .unwrap();
   assert!(
     svc.pending_rename_goodbye.is_some(),
     "rename must install a pending_rename_goodbye"
