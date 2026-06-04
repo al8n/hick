@@ -25,6 +25,62 @@ use crate::{
   wire::{MessageReader, NameRef, ResourceClass, ResourceType},
 };
 
+/// Number of goodbye sends during an orderly withdrawal (RFC 6762 §10.1).
+#[cfg(any(feature = "alloc", feature = "std"))]
+// Used by `begin_withdrawal`; `remaining` consumption is wired in Task 4.
+#[allow(dead_code)]
+const WITHDRAWAL_SENDS: u8 = 3;
+
+/// Spacing between successive withdrawal goodbye resends (loss resilience).
+// Used by `poll_withdrawal_transmit` (Task 3).
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[allow(dead_code)]
+const WITHDRAWAL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(250);
+
+/// Back-off added to `next_at` on a missed send (delivery not yet confirmed).
+// Used by `note_withdrawal_result` (Task 4).
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[allow(dead_code)]
+const WITHDRAWAL_RETRY_BACKOFF: core::time::Duration = core::time::Duration::from_millis(20);
+
+/// Hard deadline by which a withdrawal is force-completed regardless of
+/// pending sends, to prevent a stale withdrawing route from pinning the name
+/// slot indefinitely.
+#[cfg(any(feature = "alloc", feature = "std"))]
+const WITHDRAWAL_CEILING: core::time::Duration = core::time::Duration::from_secs(2);
+
+/// In-progress withdrawal state for a single service.  Stored in
+/// [`Endpoint::withdrawals`] keyed by [`ServiceHandle`].  The `I` type
+/// parameter is the [`Instant`] type of the enclosing endpoint.
+///
+/// Stored as a parallel `Vec` rather than inline on [`ServiceRoute`] because
+/// `ServiceRoute` has no generic parameter: it is a public struct used by
+/// every downstream crate as `Pool<ServiceRoute>`, and adding `I` would
+/// require updating every type alias / `Slab<ServiceRoute>` declaration
+/// across the whole workspace — including external users.
+#[cfg(any(feature = "alloc", feature = "std"))]
+struct Withdrawal<I> {
+  /// The service records snapshot for the goodbye sends.
+  // Read by `poll_withdrawal_transmit` (Task 3).
+  #[allow(dead_code)]
+  snapshot: crate::service::WithdrawalSnapshot,
+  /// Number of goodbye sends still to perform.  Decremented only when a
+  /// send is confirmed delivered (Task 4).
+  // Read and decremented by `note_withdrawal_result` (Task 4).
+  #[allow(dead_code)]
+  remaining: u8,
+  /// When the next send is due.  Set to `now` at construction so the first
+  /// send fires immediately.
+  // Read by `poll_withdrawal_transmit` (Task 3).
+  #[allow(dead_code)]
+  next_at: I,
+  /// Hard force-complete deadline.  The withdrawal is terminated at or after
+  /// this instant regardless of `remaining` (anti-pin guard, Task 5).
+  // Read by `drain_completed_withdrawals` (Task 5).
+  #[allow(dead_code)]
+  ceiling_at: I,
+}
+
 /// Routing metadata for a registered service.
 #[derive(Debug, Clone)]
 pub struct ServiceRoute {
@@ -56,6 +112,13 @@ pub struct ServiceRoute {
   /// question for any of these routes to this service so it can answer with the
   /// shared subtype PTR.
   subtypes: std::vec::Vec<Name>,
+  /// `true` once [`Endpoint::begin_withdrawal`] has been called for this
+  /// service.  The route is kept alive (name guard + dispatch) until the
+  /// goodbye sequence completes; this flag lets downstream code distinguish a
+  /// live service from one that is in the process of being torn down.
+  // Read by `poll_timeout` dispatch skip (Task 6).
+  #[allow(dead_code)]
+  withdrawing: bool,
 }
 
 impl ServiceRoute {
@@ -152,6 +215,16 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   next_service_handle: u32,
   next_query_handle: u32,
   next_txid: u16,
+  /// In-progress withdrawals, keyed by `ServiceHandle`.  The route in
+  /// `self.services` is kept alive until the goodbye sequence completes
+  /// (Task 5) so the name guard continues to reject same-name re-registration.
+  ///
+  /// Stored as a `Vec` rather than as an inline field on [`ServiceRoute`]
+  /// because `ServiceRoute` is non-generic (adding `I` there would require
+  /// updating every `Pool<ServiceRoute>` / `Slab<ServiceRoute>` site across
+  /// the whole workspace, including external users).
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  withdrawals: std::vec::Vec<(ServiceHandle, Withdrawal<I>)>,
   #[cfg(feature = "stats")]
   stats: std::sync::Arc<hick_trace::stats::Stats>,
   _phantom: core::marker::PhantomData<(AN, EvQ)>,
@@ -190,6 +263,8 @@ where
       next_service_handle: 0,
       next_query_handle: 0,
       next_txid,
+      #[cfg(any(feature = "alloc", feature = "std"))]
+      withdrawals: std::vec::Vec::new(),
       #[cfg(feature = "stats")]
       stats,
       _phantom: core::marker::PhantomData,
@@ -249,6 +324,7 @@ where
         aaaa_addrs: spec.records().aaaa_addrs_slice().to_vec(),
         aaaa_scopes: spec.records().aaaa_scopes_slice().to_vec(),
         subtypes: spec.records().subtype_names().to_vec(),
+        withdrawing: false,
       })
       .map_err(|_| RegisterServiceError::StorageFull(StorageFullError))?;
 
@@ -310,6 +386,276 @@ where
     } else {
       false
     }
+  }
+
+  /// Begin terminal withdrawal for `handle`.
+  ///
+  /// Marks the route as withdrawing and queues a resend schedule so the
+  /// goodbye datagrams can be sent by a later `poll_withdrawal_transmit` call
+  /// (Task 3).
+  ///
+  /// # Route retention
+  ///
+  /// The route is **kept** in `self.services`: the name guard continues to
+  /// reject a same-name re-registration while the goodbye sequence is in
+  /// flight.  `services_active` is **not** decremented here — that happens
+  /// in Task 5 when the withdrawal completes.
+  ///
+  /// # Timing
+  ///
+  /// `next_at` is set to `now` so the first goodbye fires immediately.
+  /// `ceiling_at` is `now + WITHDRAWAL_CEILING` (2 s) — if the sequence
+  /// has not completed by then it is force-finished to avoid pinning the
+  /// name slot indefinitely.
+  ///
+  /// If `handle` has no registered route the call is a silent no-op.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  pub fn begin_withdrawal(
+    &mut self,
+    handle: ServiceHandle,
+    snapshot: crate::service::WithdrawalSnapshot,
+    now: I,
+  ) {
+    // Locate the route.
+    let route_key = self
+      .services
+      .iter()
+      .find(|(_, route)| route.handle() == handle)
+      .map(|(k, _)| k);
+    let Some(key) = route_key else { return };
+
+    // Idempotency: a service already withdrawing must not enqueue a second
+    // schedule (a driver may retire the same service more than once — e.g. an
+    // encode-failure escalation on an already-cancelled service).
+    let Some(route) = self.services.get_mut(key) else {
+      return;
+    };
+    if route.withdrawing {
+      return;
+    }
+    route.withdrawing = true;
+
+    // A service with NOTHING to withdraw (never announced — empty owned set and
+    // no advertised host addresses) completes immediately: `remaining = 0` makes
+    // the next `drain_completed_withdrawals` free the name at once, with no
+    // spurious goodbye and no 2 s ceiling wait.
+    let nothing_to_withdraw = snapshot.owned.is_empty()
+      && snapshot.host_a.is_empty()
+      && snapshot.host_aaaa.is_empty();
+    let remaining = if nothing_to_withdraw {
+      0
+    } else {
+      WITHDRAWAL_SENDS
+    };
+
+    // next_at = now (first send fires immediately); ceiling_at = now +
+    // WITHDRAWAL_CEILING (hard anti-pin deadline).
+    let ceiling_at = now
+      .checked_add_duration(WITHDRAWAL_CEILING)
+      .unwrap_or(now);
+    self.withdrawals.push((
+      handle,
+      Withdrawal {
+        snapshot,
+        remaining,
+        next_at: now,
+        ceiling_at,
+      },
+    ));
+    crate::trace::debug!(
+      target: "mdns_proto::endpoint",
+      handle = handle.raw(),
+      "begin_withdrawal: route held, goodbye schedule queued"
+    );
+  }
+
+  /// Pump one due withdrawal datagram.  Mirrors [`Self::poll_query_transmit`]:
+  /// the driver sends the returned datagram (fanned to every bound family) and
+  /// then confirms it via [`Self::note_withdrawal_result`].
+  ///
+  /// Encodes the snapshot's TTL=0 goodbye, withdrawing a host address ONLY if no
+  /// OTHER live route still advertises it — same-host sibling retention is
+  /// recomputed FRESH each call from the route table, so siblings joining or
+  /// leaving during the multi-round window are always honoured.
+  ///
+  /// Returns `(multicast dst, datagram length, the withdrawing handle)`, or
+  /// `None` when no withdrawal is due or nothing remains withdrawable this round.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  pub fn poll_withdrawal_transmit(
+    &mut self,
+    now: I,
+    scratch: &mut [u8],
+  ) -> Option<(SocketAddr, usize, ServiceHandle)> {
+    // A withdrawal is due when it still owes a round, its `next_at` has arrived,
+    // and it has not passed its anti-pin ceiling (a past-ceiling withdrawal is
+    // left for `drain_completed_withdrawals` to force-finish, not pumped).
+    let handle = self.withdrawals.iter().find_map(|(h, w)| {
+      (w.remaining > 0 && w.next_at <= now && now < w.ceiling_at).then_some(*h)
+    })?;
+
+    // Sibling-retained host addresses, recomputed each round into an owned Vec
+    // (releasing the `self.services` borrow before we read the snapshot + write
+    // `scratch`).  An address some OTHER same-host route still advertises must
+    // NOT be withdrawn.
+    let retained = self.sibling_retained_addrs(handle);
+
+    let (_, w) = self.withdrawals.iter().find(|(h, _)| *h == handle)?;
+    let owned = &w.snapshot.owned;
+
+    // Nothing left to withdraw (no owned instance records and every advertised
+    // host address still retained by a sibling) → emit no datagram this round.
+    let any_a = w
+      .snapshot
+      .host_a
+      .iter()
+      .any(|ip| !retained.contains(&core::net::IpAddr::V4(*ip)));
+    let any_aaaa = w
+      .snapshot
+      .host_aaaa
+      .iter()
+      .any(|ip| !retained.contains(&core::net::IpAddr::V6(*ip)));
+    if !owned.ptr() && !owned.srv() && !owned.txt() && !owned.subtypes() && !any_a && !any_aaaa {
+      return None;
+    }
+
+    let len = crate::service::write_goodbye(
+      &w.snapshot.records,
+      scratch,
+      owned.ptr(),
+      owned.srv(),
+      owned.txt(),
+      owned.subtypes(),
+      w.snapshot
+        .host_a
+        .iter()
+        .copied()
+        .filter(|ip| !retained.contains(&core::net::IpAddr::V4(*ip))),
+      w.snapshot
+        .host_aaaa
+        .iter()
+        .copied()
+        .filter(|ip| !retained.contains(&core::net::IpAddr::V6(*ip))),
+    )
+    .ok()?;
+    Some((crate::service::multicast_dst(), len, handle))
+  }
+
+  /// Host addresses that a same-host SIBLING route (any route other than
+  /// `handle`'s) still advertises — these must be RETAINED (not withdrawn) by
+  /// `handle`'s goodbye, since another live service still owns them.  This is the
+  /// per-driver `retained_host_addrs` scan, centralised here where the endpoint
+  /// holds every route's advertised addresses.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  fn sibling_retained_addrs(&self, handle: ServiceHandle) -> std::vec::Vec<core::net::IpAddr> {
+    let Some(host) = self
+      .services
+      .iter()
+      .find_map(|(_, r)| (r.handle() == handle).then(|| r.host().clone()))
+    else {
+      return std::vec::Vec::new();
+    };
+    let mut retained = std::vec::Vec::new();
+    for (_, route) in self.services.iter() {
+      if route.handle() != handle && route.host() == &host {
+        retained.extend(route.a_addrs().iter().copied().map(core::net::IpAddr::V4));
+        retained.extend(
+          route
+            .aaaa_addrs()
+            .iter()
+            .copied()
+            .map(core::net::IpAddr::V6),
+        );
+      }
+    }
+    retained
+  }
+
+  /// Confirm the datagram most recently produced by
+  /// [`Self::poll_withdrawal_transmit`] for `handle`.  `delivered` is `true` when
+  /// at least one socket send succeeded: a delivered round spends one resend and
+  /// re-arms at the full `WITHDRAWAL_INTERVAL`; a fully-failed round re-arms at
+  /// the short `WITHDRAWAL_RETRY_BACKOFF` WITHOUT spending — so a transiently
+  /// undeliverable goodbye keeps its budget and retries soon rather than being
+  /// delayed a full interval. Completion (budget spent or ceiling reached) is
+  /// observed via `drain_completed_withdrawals` (added in the next task).
+  ///
+  /// No-op for an unknown handle.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  pub fn note_withdrawal_result(&mut self, handle: ServiceHandle, now: I, delivered: bool) {
+    let Some((_, w)) = self.withdrawals.iter_mut().find(|(h, _)| *h == handle) else {
+      return;
+    };
+    if delivered {
+      w.remaining = w.remaining.saturating_sub(1);
+      w.next_at = now
+        .checked_add_duration(WITHDRAWAL_INTERVAL)
+        .unwrap_or(now);
+    } else {
+      w.next_at = now
+        .checked_add_duration(WITHDRAWAL_RETRY_BACKOFF)
+        .unwrap_or(now);
+    }
+  }
+
+  /// Remove every withdrawal that has COMPLETED — its resend budget is spent
+  /// (`remaining == 0`) OR it has passed its anti-pin ceiling (`now >=
+  /// ceiling_at`). For each completed withdrawal the route is freed (releasing
+  /// the name for re-registration and decrementing `services_active`), and its
+  /// handle is pushed into `out` so the driver can GC its driver-side slot. Call
+  /// once per pump, after draining withdrawal transmits.
+  ///
+  /// The ceiling guarantees that a withdrawal whose families are permanently
+  /// unreachable still releases the name — a down family has no reachable peers
+  /// to evict, so force-completing it is benign.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  pub fn drain_completed_withdrawals<E: Extend<ServiceHandle>>(&mut self, now: I, out: &mut E) {
+    // Collect completed handles first so the route/withdrawal removals below do
+    // not fight the iteration borrow.
+    let completed: std::vec::Vec<ServiceHandle> = self
+      .withdrawals
+      .iter()
+      .filter(|(_, w)| w.remaining == 0 || now >= w.ceiling_at)
+      .map(|(h, _)| *h)
+      .collect();
+    for handle in completed {
+      // Free the proto route: releases the name and decrements services_active.
+      let key = self
+        .services
+        .iter()
+        .find(|(_, route)| route.handle() == handle)
+        .map(|(k, _)| k);
+      if let Some(k) = key {
+        let removed = self.services.try_remove(k).is_some();
+        #[cfg(feature = "stats")]
+        if removed {
+          self.stats.decr_services_active(1);
+        }
+        #[cfg(not(feature = "stats"))]
+        let _ = removed;
+      }
+      self.withdrawals.retain(|(h, _)| *h != handle);
+      out.extend(core::iter::once(handle));
+    }
+  }
+
+  /// Test-only: the remaining resend budget for a withdrawing handle.
+  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  fn withdrawal_remaining(&self, handle: ServiceHandle) -> Option<u8> {
+    self
+      .withdrawals
+      .iter()
+      .find(|(h, _)| *h == handle)
+      .map(|(_, w)| w.remaining)
+  }
+
+  /// Test-only: the next scheduled send time for a withdrawing handle.
+  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  fn withdrawal_next_at(&self, handle: ServiceHandle) -> Option<I> {
+    self
+      .withdrawals
+      .iter()
+      .find(|(h, _)| *h == handle)
+      .map(|(_, w)| w.next_at)
   }
 
   /// Start a new query.
@@ -937,7 +1283,24 @@ where
 
   /// Next deadline (next cache expiration), if any.
   pub fn poll_timeout(&self) -> Option<I> {
-    self.cache.next_expiration()
+    let cache = self.cache.next_expiration();
+    // Endpoint-owned withdrawals have no driver-side `Service` to report their
+    // deadlines, so the endpoint surfaces the earliest time a withdrawal needs
+    // to be pumped (`next_at`) or force-completed (`ceiling_at`) — otherwise the
+    // driver could park past a due goodbye round.
+    #[cfg(any(feature = "alloc", feature = "std"))]
+    let withdrawal = self
+      .withdrawals
+      .iter()
+      .map(|(_, w)| w.next_at.min(w.ceiling_at))
+      .min();
+    #[cfg(not(any(feature = "alloc", feature = "std")))]
+    let withdrawal: Option<I> = None;
+    match (cache, withdrawal) {
+      (Some(c), Some(w)) => Some(c.min(w)),
+      (Some(c), None) => Some(c),
+      (None, w) => w,
+    }
   }
 
   /// Drive timer-based work (cache TTL sweep).
@@ -4879,6 +5242,482 @@ mod tests {
   // `cancel_query` on an unknown handle returns
   // `CancelQueryError::QueryNotFound`; covered alongside the basic
   // removal path in `cancel_query_removes_route` above.
+
+  // ── begin_withdrawal ─────────────────────────────────────────────────
+
+  /// `begin_withdrawal` must leave `services_active` unchanged (it is
+  /// decremented later in Task 5) and keep the route in `self.services` so
+  /// that a same-name re-registration is still rejected.
+  #[cfg(feature = "stats")]
+  #[test]
+  fn begin_withdrawal_holds_the_name_and_keeps_services_active() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+
+    let st = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("printer-host.local.").unwrap();
+    let recs = ServiceRecords::new(st, inst.clone(), host, 631, 120);
+    let (handle, mut svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+
+    let before = ep.stats().services_active;
+
+    let snap = svc.withdrawal_snapshot();
+    ep.begin_withdrawal(handle, snap, now);
+
+    // services_active must NOT have changed.
+    assert_eq!(
+      ep.stats().services_active,
+      before,
+      "begin_withdrawal must not decrement services_active"
+    );
+
+    // The route is still present — same-name re-registration is rejected.
+    let st2 = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let inst2 = inst; // same name
+    let host2 = Name::try_from_str("printer-host.local.").unwrap();
+    let recs2 = ServiceRecords::new(st2, inst2, host2, 631, 120);
+    let result = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs2),
+        now,
+      );
+    assert!(
+      matches!(result, Err(RegisterServiceError::NameAlreadyRegistered(_))),
+      "same-name re-registration must be rejected while withdrawal route is held"
+    );
+  }
+
+  /// `begin_withdrawal` with an unknown handle is a silent no-op.
+  #[test]
+  fn begin_withdrawal_unknown_handle_is_noop() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    // Build a dummy snapshot via a temporary service.
+    let st = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let inst = Name::try_from_str("Ghost._ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("ghost-host.local.").unwrap();
+    let recs = ServiceRecords::new(st, inst, host, 631, 120);
+    let (_, mut svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+    let snap = svc.withdrawal_snapshot();
+    // Use a handle that was never registered.
+    let bogus = ServiceHandle::from_raw(0xDEAD);
+    ep.begin_withdrawal(bogus, snap, now); // must not panic
+  }
+
+  /// `poll_withdrawal_transmit` encodes the snapshot's TTL=0 goodbye and RETAINS
+  /// a host address that a same-host sibling still advertises, while withdrawing
+  /// the withdrawing service's unique address (Task 3 — sibling retention is
+  /// computed fresh from the route table).
+  #[test]
+  fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let shared = Ipv4Addr::new(192, 168, 1, 5);
+    let unique = Ipv4Addr::new(192, 168, 1, 6);
+    let host = Name::try_from_str("h.local.").unwrap();
+
+    // Service A (host h) advertises BOTH the shared and the unique address.
+    let mut recs_a = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+      host.clone(),
+      631,
+      120,
+    );
+    recs_a.add_a(shared);
+    recs_a.add_a(unique);
+    let (a_handle, _svc_a) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs_a.clone()),
+        now,
+      )
+      .unwrap();
+
+    // Service B (SAME host h) advertises ONLY the shared address.
+    let mut recs_b = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("B._ipp._tcp.local.").unwrap(),
+      host.clone(),
+      632,
+      120,
+    );
+    recs_b.add_a(shared);
+    let (_b_handle, _svc_b) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs_b),
+        now,
+      )
+      .unwrap();
+
+    // A's withdrawal snapshot: owns PTR/SRV/TXT and both host A addresses.
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs_a,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec![shared, unique],
+      host_aaaa: std::vec::Vec::new(),
+    };
+    ep.begin_withdrawal(a_handle, snap, now);
+
+    let mut buf = std::vec![0u8; 4096];
+    let (_dst, len, got) = ep
+      .poll_withdrawal_transmit(now, &mut buf)
+      .expect("a due withdrawal must produce a datagram");
+    assert_eq!(got, a_handle, "the withdrawing handle is reported");
+
+    let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
+    let mut saw_instance = false;
+    let mut withdrawn_v4: std::vec::Vec<Ipv4Addr> = std::vec::Vec::new();
+    for rec in reader.answers() {
+      let rec = rec.unwrap();
+      assert_eq!(rec.ttl(), 0, "every goodbye record must carry TTL 0");
+      match rec.rtype() {
+        crate::wire::ResourceType::A => {
+          let d = rec.rdata();
+          assert_eq!(d.len(), 4, "A rdata is 4 bytes");
+          withdrawn_v4.push(Ipv4Addr::new(d[0], d[1], d[2], d[3]));
+        }
+        crate::wire::ResourceType::Ptr
+        | crate::wire::ResourceType::Srv
+        | crate::wire::ResourceType::Txt => saw_instance = true,
+        _ => {}
+      }
+    }
+    assert!(
+      saw_instance,
+      "instance records (PTR/SRV/TXT) must be withdrawn at TTL 0"
+    );
+    assert!(
+      withdrawn_v4.contains(&unique),
+      "A's unique address must be withdrawn"
+    );
+    assert!(
+      !withdrawn_v4.contains(&shared),
+      "the sibling-shared address must be RETAINED (not withdrawn)"
+    );
+  }
+
+  /// `note_withdrawal_result` spends a resend round only on a delivered send; a
+  /// fully-failed round re-arms at the short backoff WITHOUT spending the budget
+  /// (Task 4).
+  #[test]
+  fn note_withdrawal_delivered_spends_failed_rearms() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs.clone()),
+        now,
+      )
+      .unwrap();
+    // A NON-empty snapshot (owns PTR/SRV/TXT) so the resend budget is non-zero
+    // and the spend/backoff schedule is actually exercised.
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+    };
+    ep.begin_withdrawal(h, snap, now);
+
+    // A failed round spends nothing and re-arms at the short backoff.
+    ep.note_withdrawal_result(h, now, false);
+    assert_eq!(
+      ep.withdrawal_remaining(h),
+      Some(super::WITHDRAWAL_SENDS),
+      "a failed round must not spend the resend budget"
+    );
+    let backoff_at = ep.withdrawal_next_at(h).unwrap();
+    assert_eq!(
+      backoff_at,
+      now.checked_add_duration(super::WITHDRAWAL_RETRY_BACKOFF).unwrap()
+    );
+    assert!(
+      backoff_at < now.checked_add_duration(super::WITHDRAWAL_INTERVAL).unwrap(),
+      "a failed round must NOT delay a full interval"
+    );
+
+    // A delivered round spends exactly one and re-arms at the full interval.
+    ep.note_withdrawal_result(h, now, true);
+    assert_eq!(
+      ep.withdrawal_remaining(h),
+      Some(super::WITHDRAWAL_SENDS - 1),
+      "a delivered round spends exactly one"
+    );
+    assert_eq!(
+      ep.withdrawal_next_at(h).unwrap(),
+      now.checked_add_duration(super::WITHDRAWAL_INTERVAL).unwrap()
+    );
+  }
+
+  /// A withdrawal that spends its whole budget COMPLETES: the route is freed,
+  /// `services_active` is decremented, the handle is returned for GC, and the
+  /// name is re-registerable (Task 5).
+  #[cfg(feature = "stats")]
+  #[test]
+  fn withdrawal_completes_frees_name_and_decrements_active() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst.clone(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, mut svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+    let before = ep.stats().services_active;
+    ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+
+    // Spend the whole resend budget via delivered confirmations.
+    for _ in 0..super::WITHDRAWAL_SENDS {
+      ep.note_withdrawal_result(h, now, true);
+    }
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+
+    assert_eq!(done, std::vec![h], "the completed handle is returned for GC");
+    assert_eq!(
+      ep.stats().services_active,
+      before - 1,
+      "services_active is decremented on completion"
+    );
+
+    // The name is now re-registerable.
+    let recs2 = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst,
+      Name::try_from_str("h2.local.").unwrap(),
+      631,
+      120,
+    );
+    assert!(
+      ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs2),
+        now,
+      )
+      .is_ok(),
+      "the withdrawn name is re-registerable after completion"
+    );
+  }
+
+  /// A withdrawal whose families never deliver is force-completed at its ceiling
+  /// (anti-pin), so the name is eventually released (Task 5).
+  #[test]
+  fn withdrawal_force_completes_at_ceiling() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, mut svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+    ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+
+    // Never deliver; advance to the ceiling (now + WITHDRAWAL_CEILING).
+    let at_ceiling = now.checked_add_duration(super::WITHDRAWAL_CEILING).unwrap();
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(at_ceiling, &mut done);
+    assert_eq!(
+      done,
+      std::vec![h],
+      "ceiling force-completes a wedged withdrawal"
+    );
+  }
+
+  /// A withdrawing route is NOT routed an incoming question (its service is gone,
+  /// only its goodbye is draining), but the route is still present so a same-name
+  /// re-registration is rejected (Task 6).
+  #[test]
+  fn withdrawing_route_is_not_answered_but_still_blocks_reregister() {
+    use core::net::SocketAddr;
+    let mut e = build_endpoint();
+    let now = StdInstant::now();
+    let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst.clone(),
+      Name::try_from_str("printer-host.local.").unwrap(),
+      631,
+      120,
+    );
+    let (handle, mut svc) = e
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+    e.begin_withdrawal(handle, svc.withdrawal_snapshot(), now);
+
+    // A question for the (withdrawing) host must NOT route to the service.
+    let src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 55), 5353));
+    let local_ip = core::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+    let mut buf = [0u8; 512];
+    let n = build_query_for_host(&mut buf, "printer-host.local.");
+    let routed_to_service = e
+      .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+      .unwrap()
+      .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+    assert!(
+      !routed_to_service,
+      "a withdrawing service must not be routed a question"
+    );
+
+    // The name is still held (route present for the guard).
+    let recs2 = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst,
+      Name::try_from_str("h2.local.").unwrap(),
+      631,
+      120,
+    );
+    assert!(
+      matches!(
+        e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+          ServiceSpec::new(recs2),
+          now
+        ),
+        Err(RegisterServiceError::NameAlreadyRegistered(_))
+      ),
+      "the withdrawing name must still be held"
+    );
+  }
+
+  /// `poll_timeout` accounts for a due endpoint-owned withdrawal so the driver
+  /// wakes to pump it (Task 6).
+  #[test]
+  fn poll_timeout_accounts_for_due_withdrawal() {
+    let mut e = build_endpoint();
+    let now = StdInstant::now();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, mut svc) = e
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+    e.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+    assert_eq!(
+      e.poll_timeout(),
+      Some(now),
+      "a due-now withdrawal makes poll_timeout return now"
+    );
+  }
+
+  /// A never-announced service (empty withdrawal snapshot) completes on the FIRST
+  /// `drain_completed_withdrawals` — no spurious goodbye, no 2 s ceiling wait.
+  #[cfg(feature = "stats")]
+  #[test]
+  fn empty_withdrawal_completes_immediately() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, mut svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+    let before = ep.stats().services_active;
+    // Never announced → empty snapshot → remaining == 0.
+    ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert_eq!(
+      done,
+      std::vec![h],
+      "an empty withdrawal completes on the first drain (no ceiling wait)"
+    );
+    assert_eq!(ep.stats().services_active, before - 1);
+  }
+
+  /// `begin_withdrawal` is idempotent: a second call for an already-withdrawing
+  /// handle does not enqueue a duplicate (so the handle is GC-reported once).
+  #[test]
+  fn begin_withdrawal_is_idempotent() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, mut svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+    ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+    // Second retire of the same handle must be a no-op (no duplicate schedule).
+    ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert_eq!(
+      done,
+      std::vec![h],
+      "idempotent begin_withdrawal must report the handle exactly once"
+    );
+  }
 }
 
 // ── RouteEvents iterator ─────────────────────────────────────────────
@@ -5125,6 +5964,14 @@ where
           let mut found: Option<(usize, RouteEvent<'a>)> = None;
           for (key, route) in self.endpoint.services.iter() {
             if key < cursor {
+              continue;
+            }
+            // A withdrawing route's service is gone (only its goodbye is still
+            // draining) — never route an incoming question to it, or it could
+            // emit a positive-TTL answer contradicting its own TTL=0 goodbye.
+            // The route is still present for the name guard, just not answered.
+            #[cfg(any(feature = "alloc", feature = "std"))]
+            if route.withdrawing {
               continue;
             }
             if names_match(route.name(), q.qname())
