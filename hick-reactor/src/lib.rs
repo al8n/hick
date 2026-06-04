@@ -39,7 +39,7 @@ mod options;
 mod proto;
 mod query;
 mod service;
-#[cfg(all(test, feature = "tracing"))]
+#[cfg(all(test, feature = "tracing", not(miri)))]
 mod trace_cov;
 
 pub use discovery::{Lookup, QueryParam, ServiceEntry};

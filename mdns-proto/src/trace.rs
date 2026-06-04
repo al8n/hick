@@ -20,7 +20,10 @@ pub(crate) use hick_trace::trace_span;
 /// suite already exercises every code path, so installing an always-enabled
 /// subscriber as the process-wide default *before* the tests run gives those
 /// call sites coverage credit without duplicating a single behavioural test.
-#[cfg(all(test, feature = "tracing"))]
+///
+/// Excluded under miri: `ctor`'s static-initializer mechanism is not supported
+/// by the interpreter, and coverage is irrelevant to a UB check anyway.
+#[cfg(all(test, feature = "tracing", not(miri)))]
 mod cov {
   use tracing_core::{
     Event, LevelFilter, Metadata, Subscriber,

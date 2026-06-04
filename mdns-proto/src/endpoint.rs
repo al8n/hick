@@ -4760,6 +4760,10 @@ mod tests {
     let host = Name::try_from_str("multihomed.local.").unwrap();
 
     // Seed cache with two OLD A records — received 5 minutes ago.
+    // Windows' `Instant` counts from boot, so `now` can be < 300s on a freshly
+    // booted runner — subtracting would underflow. Advance the base first; the
+    // relative timing (long_ago is 300s before now) is unchanged.
+    let now = now + Duration::from_secs(300);
     let long_ago = now.checked_sub(Duration::from_secs(300)).unwrap();
     e.cache
       .try_insert(
@@ -4865,6 +4869,10 @@ mod tests {
 
     // Seed an OLD IN-class A record (5 min ago) that is eligible for
     // the deferred-expiry clamp.
+    // Windows' `Instant` counts from boot, so `now` can be < 300s on a freshly
+    // booted runner — subtracting would underflow. Advance the base first; the
+    // relative timing (long_ago is 300s before now) is unchanged.
+    let now = now + Duration::from_secs(300);
     let long_ago = now.checked_sub(Duration::from_secs(300)).unwrap();
     e.cache
       .try_insert(
