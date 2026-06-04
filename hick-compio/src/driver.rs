@@ -899,6 +899,16 @@ impl State {
     woke
   }
 
+  /// The earliest endpoint-owned WITHDRAWAL deadline (next due goodbye round or
+  /// the 2 s anti-pin ceiling), or `None` when no withdrawal is in flight —
+  /// EXCLUDING cache, query, and service deadlines. The last-handle shutdown flush
+  /// uses this (not [`Self::poll_deadline`]) so it exits as soon as every goodbye
+  /// is sent rather than parking on unrelated cache expiry or the wall-clock
+  /// backstop.
+  pub(crate) fn next_withdrawal_deadline(&self) -> Option<StdInstant> {
+    self.endpoint.next_withdrawal_deadline()
+  }
+
   /// Earliest deadline across the endpoint (which already folds in the
   /// endpoint-owned withdrawal deadlines — the next due goodbye round and the 2 s
   /// anti-pin ceiling — via [`ProtoEndpoint::poll_timeout`]), services, and
@@ -1399,9 +1409,23 @@ pub(crate) async fn run(
       let shutdown_deadline = StdInstant::now() + Duration::from_secs(10);
       loop {
         drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch).await;
+        // Sweep any service whose handle dropped since the last pass — INCLUDING
+        // one that raced the awaited drain above — into a withdrawal BEFORE
+        // deciding whether any remain. The 1a-pre sweep only ran for cancellations
+        // seen up to the main-loop park; a last-handle drop during this shutdown
+        // drain would otherwise be GC'd with no §10.1 goodbye, leaking a
+        // positive-TTL record — the exact teardown this refactor protects. Idempotent: a service already withdrawing is skipped.
+        inner
+          .state
+          .borrow_mut()
+          .sweep_cancelled_services(StdInstant::now());
         let now = StdInstant::now();
-        // No remaining withdrawal (or any other) deadline → every route is freed.
-        let Some(next) = ({ inner.state.borrow().poll_deadline() }) else {
+        // Sleep on (and exit when there are no) WITHDRAWAL deadlines only — NOT
+        // the aggregate `poll_deadline`, which folds in cache expiry and query
+        // timers. Otherwise, once every goodbye is sent, a still-populated cache
+        // would keep this flush parked until that unrelated deadline (or the 10 s
+        // backstop) instead of exiting promptly.
+        let Some(next) = ({ inner.state.borrow().next_withdrawal_deadline() }) else {
           break;
         };
         if now >= shutdown_deadline {
@@ -2195,6 +2219,52 @@ mod tests {
       !s.has_pending_withdrawal(),
       "after the sweep the cancelled service is already withdrawing (errored), so \
        it is no longer reported as an unswept pending withdrawal"
+    );
+  }
+
+  /// Regression: a service handle dropped AFTER the normal
+  /// cancellation sweep — racing the last-handle shutdown drain — must still be
+  /// swept into a §10.1 withdrawal. The shutdown loop now sweeps each iteration
+  /// (after the drain, before deciding whether any remain), so the raced drop is
+  /// never GC'd without its TTL=0 goodbye.
+  #[test]
+  fn shutdown_loop_sweeps_a_drop_that_raced_the_prior_sweep() {
+    use mdns_proto::{Name, ServiceRecords, ServiceSpec};
+    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+    let t = std::time::Instant::now();
+
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("Svc._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let a = s.register_service(ServiceSpec::new(recs), t).unwrap();
+
+    // A normal sweep finds nothing — A's handle is still held.
+    assert!(
+      !s.sweep_cancelled_services(t),
+      "nothing is cancelled before the drop"
+    );
+
+    // A's handle drops AFTER that sweep — the exact race the shutdown loop closes.
+    s.flag_service_unregistered(a);
+    assert!(
+      s.has_pending_withdrawal(),
+      "the post-sweep drop is an unswept pending withdrawal"
+    );
+
+    // The shutdown loop's per-iteration sweep retires the raced drop into a
+    // withdrawal BEFORE deciding whether any remain — without it the loop would
+    // exit and GC the service with no goodbye.
+    assert!(
+      s.sweep_cancelled_services(t),
+      "the shutdown-loop sweep retires the raced cancellation"
+    );
+    assert!(
+      s.next_withdrawal_deadline().is_some(),
+      "a withdrawal now exists for the raced drop — not GC'd goodbye-less"
     );
   }
 

@@ -218,6 +218,16 @@ impl<N: Net> DriverState<N> {
   /// driver no longer tracks them here. A `withdrawing` service is skipped: its
   /// proto state machine is finished, and its withdrawal schedule lives in the
   /// endpoint.
+  /// The earliest endpoint-owned WITHDRAWAL deadline (next due goodbye round or
+  /// the 2 s anti-pin ceiling), or `None` when no withdrawal is in flight —
+  /// EXCLUDING cache, query, and service deadlines. The last-handle shutdown flush
+  /// uses this (not [`Self::next_deadline`]) so it exits as soon as every goodbye
+  /// is sent rather than parking on unrelated cache expiry or the wall-clock
+  /// backstop.
+  fn next_withdrawal_deadline(&self) -> Option<StdInstant> {
+    self.endpoint.next_withdrawal_deadline()
+  }
+
   fn next_deadline(&self) -> Option<StdInstant> {
     let mut best: Option<StdInstant> = self.endpoint.poll_timeout();
     for ctx in self.services.values() {
@@ -1932,8 +1942,12 @@ async fn driver_task<N: Net>(
   loop {
     let now = StdInstant::now();
     state.drain_withdrawals(now, &mut scratch).await;
-    // No remaining withdrawal (or any other) deadline → every route is freed.
-    let Some(next) = state.next_deadline() else {
+    // Sleep on (and exit when there are no) WITHDRAWAL deadlines only — NOT the
+    // aggregate `next_deadline`, which folds in cache expiry and query/service
+    // timers. Otherwise, once every goodbye is sent, a still-populated cache would
+    // keep this flush parked until that unrelated deadline (or the 10 s backstop)
+    // instead of exiting promptly.
+    let Some(next) = state.next_withdrawal_deadline() else {
       break;
     };
     if now >= shutdown_deadline {

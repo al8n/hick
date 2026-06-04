@@ -563,6 +563,16 @@ where
       .map(|(k, _)| k);
     if let Some(k) = key {
       let removed = self.services.try_remove(k).is_some();
+      // Force-remove is a NO-goodbye primitive: also drop any ROUTE-attached
+      // withdrawal item for this handle. Otherwise removing the route (and thus
+      // the name guard) would let the same name be re-registered while a stale
+      // route-attached item still owes a TTL=0 goodbye — a late goodbye would
+      // then flush the same-name replacement, contradicting "no goodbye". Detached items (renamed-away OLD names) are independent of this
+      // handle's route and are left to drain / be cancelled on reclaim.
+      #[cfg(any(feature = "alloc", feature = "std"))]
+      self
+        .withdrawals
+        .retain(|(_, item)| item.route != Some(handle));
       #[cfg(feature = "stats")]
       if removed {
         self.stats.decr_services_active(1);
@@ -1896,11 +1906,7 @@ where
     // to be pumped (`next_at`) or force-completed (`ceiling_at`) — otherwise the
     // driver could park past a due goodbye round.
     #[cfg(any(feature = "alloc", feature = "std"))]
-    let withdrawal = self
-      .withdrawals
-      .iter()
-      .map(|(_, w)| w.next_at.min(w.ceiling_at))
-      .min();
+    let withdrawal = self.next_withdrawal_deadline();
     #[cfg(not(any(feature = "alloc", feature = "std")))]
     let withdrawal: Option<I> = None;
     match (cache, withdrawal) {
@@ -1908,6 +1914,30 @@ where
       (Some(c), None) => Some(c),
       (None, w) => w,
     }
+  }
+
+  /// The earliest time an in-flight withdrawal needs to be pumped (`next_at`) or
+  /// force-completed (`ceiling_at`), or `None` when no withdrawal is pending.
+  ///
+  /// Unlike [`Self::poll_timeout`] this EXCLUDES cache and query deadlines, so a
+  /// last-handle shutdown flush can sleep precisely on the next withdrawal action
+  /// — and exit as soon as none remain — instead of parking on unrelated cache
+  /// expiry (or the driver's wall-clock backstop) after every goodbye is sent.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  pub fn next_withdrawal_deadline(&self) -> Option<I> {
+    self
+      .withdrawals
+      .iter()
+      .map(|(_, w)| w.next_at.min(w.ceiling_at))
+      .min()
+  }
+
+  /// Whether any endpoint-owned withdrawal is still in flight (its TTL=0 goodbye
+  /// not yet fully sent or force-completed). A shutdown flush loops until this is
+  /// `false`, rather than on the aggregate driver deadline.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  pub fn has_pending_withdrawals(&self) -> bool {
+    !self.withdrawals.is_empty()
   }
 
   /// Drive timer-based work (cache TTL sweep).
@@ -7623,6 +7653,73 @@ mod tests {
     );
   }
 
+  /// Regression: `unregister_service` is a force-remove, NO-goodbye
+  /// primitive — it must ALSO drop the handle's ROUTE-attached withdrawal item.
+  /// Otherwise removing the route (and its name guard) lets the same name be
+  /// re-registered while a stale route-attached item still owes a TTL=0 goodbye,
+  /// which would later flush the same-name replacement from peer caches.
+  #[test]
+  fn unregister_service_drops_route_attached_withdrawal_no_stale_goodbye() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let inst = Name::try_from_str("Svc._ipp._tcp.local.").unwrap();
+
+    let recs = ServiceRecords::new(stype.clone(), inst.clone(), host, 631, 120);
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs.clone()),
+        now,
+      )
+      .unwrap();
+
+    // Begin a ROUTE-attached withdrawal: a goodbye item now owes for `inst`.
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+    };
+    ep.begin_withdrawal(h, snap, now);
+    assert!(
+      ep.route_withdrawal_owed(h).is_some(),
+      "a route-attached withdrawal item owes a goodbye for the name"
+    );
+
+    // Force-remove must drop the route-attached withdrawal item (no goodbye).
+    assert!(ep.unregister_service(h), "the route was found and removed");
+    assert!(
+      ep.route_withdrawal_owed(h).is_none(),
+      "force-remove dropped the route-attached withdrawal item"
+    );
+
+    // The SAME name is reusable, and no stale withdrawal exists to flush it.
+    ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(ServiceRecords::new(
+        stype,
+        inst,
+        Name::try_from_str("other.local.").unwrap(),
+        700,
+        120,
+      )),
+      now,
+    )
+    .expect("the name is reusable after force-remove");
+    let mut buf = std::vec![0u8; 1500];
+    assert!(
+      ep.poll_withdrawal_transmit(now, &mut buf).is_none(),
+      "no stale TTL=0 goodbye is emitted for the force-removed-then-reused name"
+    );
+  }
+
   /// Regression: a renamed-away old name held by an in-flight
   /// DETACHED withdrawal item is RECLAIMED by a new registration — the detached
   /// goodbye is CANCELLED (the renamed-away service no longer owns the name, and
@@ -8397,6 +8494,62 @@ mod tests {
       "an empty withdrawal completes on the first drain (no ceiling wait)"
     );
     assert_eq!(ep.stats().services_active, before - 1);
+  }
+
+  /// Regression: `next_withdrawal_deadline` / `has_pending_withdrawals`
+  /// reflect ONLY in-flight withdrawals — excluding cache and query deadlines — so
+  /// a last-handle shutdown flush exits as soon as every goodbye is sent instead
+  /// of parking on an unrelated cache deadline (or the wall-clock backstop).
+  #[test]
+  fn next_withdrawal_deadline_reflects_only_withdrawals() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    assert_eq!(
+      ep.next_withdrawal_deadline(),
+      None,
+      "no withdrawal in flight → no withdrawal deadline"
+    );
+    assert!(!ep.has_pending_withdrawals());
+
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let inst = Name::try_from_str("Svc._ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let recs = ServiceRecords::new(stype, inst, host, 631, 120);
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs.clone()),
+        now,
+      )
+      .unwrap();
+
+    // A route-attached withdrawal that owns instance records is due NOW.
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+    };
+    ep.begin_withdrawal(h, snap, now);
+    assert_eq!(
+      ep.next_withdrawal_deadline(),
+      Some(now),
+      "a due-now withdrawal sets the withdrawal deadline"
+    );
+    assert!(ep.has_pending_withdrawals());
+
+    // Force-remove drops the route-attached item → the withdrawal deadline is gone
+    // again, so a shutdown flush would exit (None) rather than wait on any cache
+    // or query deadline.
+    assert!(ep.unregister_service(h));
+    assert_eq!(ep.next_withdrawal_deadline(), None);
+    assert!(!ep.has_pending_withdrawals());
   }
 
   /// `begin_withdrawal` is idempotent: a second call for an already-withdrawing
