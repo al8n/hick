@@ -40,7 +40,7 @@ use std::{
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
   QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate, WithdrawalSend,
-  query::Query as ProtoQuery, service::Service as ProtoSvc, transmit::Transmit,
+  WithdrawalToken, query::Query as ProtoQuery, service::Service as ProtoSvc, transmit::Transmit,
 };
 
 /// Per-iteration cap on the transmit pump.  Mirrors
@@ -399,20 +399,21 @@ impl State {
 
   /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: mark the
   /// ctx `errored` (so every subsequent pump skips it for transmits, deadlines,
-  /// and ticks — its proto state machine is finished), snapshot what its goodbye
-  /// must retract ([`mdns_proto::service::Service::withdrawal_snapshot`], which
-  /// captures both the current records and any pending conflict-rename old-name
-  /// goodbye), and hand it to [`ProtoEndpoint::begin_withdrawal`]. The endpoint KEEPS
-  /// the route (holding the name against a same-name re-registration) and drives
-  /// the TTL=0 goodbye resend schedule; the run loop pumps each due goodbye
-  /// datagram and, on completion, frees the route and GCs the driver ctx.
+  /// and ticks — its proto state machine is finished), snapshot what its CURRENT
+  /// name's goodbye must retract
+  /// ([`mdns_proto::service::Service::withdrawal_snapshot`]), and hand it to
+  /// [`ProtoEndpoint::begin_withdrawal`]. The endpoint KEEPS the route (holding
+  /// the name against a same-name re-registration) and drives the TTL=0 goodbye
+  /// resend schedule; the run loop pumps each due goodbye datagram and, on
+  /// completion, frees the route and GCs the driver ctx.
   ///
-  /// The withdrawal covers whatever the service must retract: the records it
-  /// confirmed-emitted under its current name (host A/AAAA filtered against
-  /// same-host siblings by the endpoint), AND — if a conflict rename left an
-  /// old-name withdrawal still pending — that old instance name too, in the SAME
-  /// goodbye. A never-announced service has an empty snapshot and completes on the
-  /// next loop iteration with no datagram on the wire.
+  /// This withdrawal covers the records the service confirmed-emitted under its
+  /// CURRENT name (host A/AAAA filtered against same-host siblings by the
+  /// endpoint). An in-flight conflict-rename old-name goodbye is a SEPARATE
+  /// detached withdrawal item, enqueued the instant the rename happened via
+  /// [`ProtoEndpoint::enqueue_rename_withdrawal`]. A never-announced service has an
+  /// empty snapshot and completes on the next loop iteration with no datagram on
+  /// the wire.
   ///
   /// The driver ctx is NOT removed here: it is kept (marked `errored`) so any
   /// already-queued `ServiceUpdate::Conflict` still reaches the host before the ctx
@@ -421,44 +422,54 @@ impl State {
   pub(crate) fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: StdInstant) {
     // Scope the `ctx` borrow so it ends before `self.endpoint` is touched (the
     // snapshot is owned, so no borrow of `self.services` outlives this block).
-    let snap = match self.services.get_mut(&handle) {
+    // ALSO take any pending §9 rename handoff here: a retirement that races a
+    // queued `Renamed` update (closed receiver / explicit unregister) never
+    // reaches the update-drain site that normally enqueues it, which would strand
+    // the old-name goodbye in a proto being GC'd. `.take()` makes the handoff
+    // exactly-once vs the update-drain path.
+    let (snap, handoff) = match self.services.get_mut(&handle) {
       Some(ctx) => {
         ctx.errored = true;
-        ctx.proto.withdrawal_snapshot()
+        let handoff = ctx.proto.take_rename_goodbye_handoff();
+        (ctx.proto.withdrawal_snapshot(), handoff)
       }
       None => return,
     };
+    if let Some(handoff) = handoff {
+      self.endpoint.enqueue_rename_withdrawal(handoff, now);
+    }
     self.endpoint.begin_withdrawal(handle, snap, now);
   }
 
   /// Pump every due endpoint-owned withdrawal datagram into `scratch`, returning
-  /// `Some((dst, len, handle))` for ONE due TTL=0 goodbye or `None` when none is
+  /// `Some((dst, len, token))` for ONE due TTL=0 goodbye or `None` when none is
   /// due. Mirrors [`Self::poll_one_transmit`]: the run loop sends `scratch[..len]`
   /// (fanned to BOTH families — `dst` is always the IPv4 multicast marker) and
-  /// then confirms via [`Self::note_withdrawal_result`]. The endpoint encodes the
-  /// goodbye with fresh sibling host-address retention computed internally.
+  /// then confirms via [`Self::note_withdrawal_result`], round-tripping the opaque
+  /// [`WithdrawalToken`]. The endpoint encodes the goodbye with fresh sibling
+  /// host-address retention computed internally.
   pub(crate) fn poll_one_withdrawal(
     &mut self,
     now: StdInstant,
     scratch: &mut [u8],
-  ) -> Option<(core::net::SocketAddr, usize, ServiceHandle)> {
+  ) -> Option<(core::net::SocketAddr, usize, WithdrawalToken)> {
     self.endpoint.poll_withdrawal_transmit(now, scratch)
   }
 
-  /// Confirm a withdrawal goodbye round, reporting EACH family's
-  /// [`WithdrawalSend`] outcome so the endpoint tracks per-family debt: a
-  /// withdrawal frees only once every reachable family has withdrawn its records.
+  /// Confirm a withdrawal goodbye round for `token`, reporting EACH family's
+  /// [`WithdrawalSend`] outcome so the endpoint tracks per-family debt: an
+  /// item frees only once every reachable family has withdrawn its records.
   /// A family that `Sent` spends one of its resend rounds; a busy family `Retry`s
   /// (keeps its debt); an absent-socket / permanent-error family is written off.
-  /// No-op for an unknown handle.
+  /// No-op for an unknown token.
   pub(crate) fn note_withdrawal_result(
     &mut self,
-    handle: ServiceHandle,
+    token: WithdrawalToken,
     now: StdInstant,
     v4: WithdrawalSend,
     v6: WithdrawalSend,
   ) {
-    self.endpoint.note_withdrawal_result(handle, now, v4, v6);
+    self.endpoint.note_withdrawal_result(token, now, v4, v6);
   }
 
   /// Free + GC every endpoint-owned withdrawal that COMPLETED (its resend budget
@@ -599,47 +610,51 @@ impl State {
         // every pump skips it, and stop draining it.
         if let ServiceUpdate::Renamed(ref renamed) = upd {
           let new_name = renamed.new_name().clone();
-          match self.endpoint.handle_service_renamed(h, new_name) {
-            Ok(()) => {}
-            Err(_e) => {
-              hick_trace::warn!(
-                handle = ?h,
-                error = ?_e,
-                "auto-rename collided with another local service; emitting Conflict and beginning withdrawal"
-              );
-              // The new name collides with another LOCAL service; this service has
-              // already rebranded and can't be kept. Surface `Conflict` into the
-              // in-ctx deque (drained directly by `Service::next`) and arm the
-              // one-shot wake, then begin the endpoint-owned withdrawal. Its
-              // snapshot captures the proto's pending OLD-name rename goodbye
-              // alongside the current records
-              // ([`mdns_proto::service::Service::withdrawal_snapshot`]); the
-              // endpoint holds the route (keeping the OLD name reserved) while it
-              // resends, freeing the name on completion. This is the conformant RFC
-              // 6762 §10.1 old-name withdrawal — sent while the name still belongs
-              // to THIS service, so a same-name replacement cannot register (and
-              // evict it from peer caches) until the goodbye completes. The ctx is
-              // KEPT (not removed) so this queued `Conflict` still reaches the host;
-              // it is GC'd by `drain_completed_withdrawals` once the withdrawal
-              // completes (deferred via `route_freed` while the `Conflict` is
-              // undrained). Only this rename-COLLISION teardown goes through
-              // begin_withdrawal — a SURVIVING renamed service's old-name goodbye is
-              // auto-emitted by the proto's own `poll_transmit`.
-              if let Some(ctx) = self.services.get_mut(&h) {
-                push_service_update_coalesced(&mut ctx.updates, ServiceUpdate::Conflict);
-                ctx.conflict_wake_pending = true;
-              }
-              // The `ctx` borrow above ends at the closing `}`. Begin the
-              // endpoint-owned withdrawal IN-ITERATION (non-bypassable — this
-              // `while let` only borrows `self.services` transiently and there is no
-              // transmit early-return here). `begin_service_withdrawal` sets
-              // `errored`, snapshots the pending rename goodbye, and holds the
-              // route; it touches `self.services`/`self.endpoint` only, no iterator
-              // invalidation, and `begin_withdrawal` is idempotent.
-              self.begin_service_withdrawal(h, now);
-              pushed_any = true;
-              break;
+          let rename_result = self.endpoint.handle_service_renamed(h, new_name);
+          // The §9 rename of an announced service hands its OLD-name TTL=0 goodbye
+          // off as an INDEPENDENT detached withdrawal item, both for a SURVIVING
+          // rename and a COLLISION teardown. Take it from the proto the instant the
+          // rename is observed (releasing the `self.services` borrow into a local
+          // before re-borrowing `self.endpoint`) and enqueue it — the Service no
+          // longer drains the old-name goodbye itself.
+          let handoff = self
+            .services
+            .get_mut(&h)
+            .and_then(|c| c.proto.take_rename_goodbye_handoff());
+          if let Some(handoff) = handoff {
+            self.endpoint.enqueue_rename_withdrawal(handoff, now);
+          }
+          if let Err(_e) = rename_result {
+            hick_trace::warn!(
+              handle = ?h,
+              error = ?_e,
+              "auto-rename collided with another local service; emitting Conflict and beginning withdrawal"
+            );
+            // The new name collides with another LOCAL service; this service has
+            // already rebranded and can't be kept. Surface `Conflict` into the
+            // in-ctx deque (drained directly by `Service::next`) and arm the
+            // one-shot wake, then begin the endpoint-owned withdrawal for the
+            // CURRENT name; the endpoint holds the route (keeping the name reserved)
+            // while it resends, freeing the name on completion. The OLD name's
+            // goodbye was already enqueued above as its own detached item. The ctx
+            // is KEPT (not removed) so this queued `Conflict` still reaches the host;
+            // it is GC'd by `drain_completed_withdrawals` once the withdrawal
+            // completes (deferred via `route_freed` while the `Conflict` is
+            // undrained).
+            if let Some(ctx) = self.services.get_mut(&h) {
+              push_service_update_coalesced(&mut ctx.updates, ServiceUpdate::Conflict);
+              ctx.conflict_wake_pending = true;
             }
+            // The `ctx` borrow above ends at the closing `}`. Begin the
+            // endpoint-owned withdrawal IN-ITERATION (non-bypassable — this
+            // `while let` only borrows `self.services` transiently and there is no
+            // transmit early-return here). `begin_service_withdrawal` sets
+            // `errored` and holds the route; it touches `self.services`/
+            // `self.endpoint` only, no iterator invalidation, and `begin_withdrawal`
+            // is idempotent.
+            self.begin_service_withdrawal(h, now);
+            pushed_any = true;
+            break;
           }
         }
         if let Some(ctx) = self.services.get_mut(&h) {
@@ -1562,7 +1577,7 @@ async fn drain_withdrawals(
       let now = StdInstant::now();
       s.poll_one_withdrawal(now, scratch)
     };
-    let Some((_dst, len, handle)) = due else {
+    let Some((_dst, len, token)) = due else {
       break;
     };
     // Fan out to every bound family on the mDNS multicast group.
@@ -1638,7 +1653,7 @@ async fn drain_withdrawals(
       inner
         .state
         .borrow_mut()
-        .note_withdrawal_result(handle, now, v4_out, v6_out);
+        .note_withdrawal_result(token, now, v4_out, v6_out);
     }
   }
   // Free + GC every completed withdrawal (budget spent or 2 s ceiling reached).
@@ -2091,13 +2106,13 @@ mod tests {
     let mut completed = false;
     for _ in 0..64 {
       t += Duration::from_millis(250);
-      while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
+      while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
         // No sockets bound in this State-level test: model BOTH families as
         // transiently undeliverable (Retry) so the per-family budget stays intact
         // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
         // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
         // instead, defeating the ceiling assertion.)
-        s.note_withdrawal_result(h, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+        s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
       }
       s.drain_completed_withdrawals(t);
       if !s.services.contains_key(&handle) {
@@ -2251,13 +2266,13 @@ mod tests {
     let mut completed = false;
     for _ in 0..64 {
       t += Duration::from_millis(250);
-      while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
+      while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
         // No sockets bound in this State-level test: model BOTH families as
         // transiently undeliverable (Retry) so the per-family budget stays intact
         // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
         // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
         // instead, defeating the ceiling assertion.)
-        s.note_withdrawal_result(h, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+        s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
       }
       s.drain_completed_withdrawals(t);
       if !s.services.contains_key(&a) {
@@ -3025,13 +3040,13 @@ mod tests {
     let mut completed = false;
     for _ in 0..64 {
       t += Duration::from_millis(250);
-      while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
+      while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
         // No sockets bound in this State-level test: model BOTH families as
         // transiently undeliverable (Retry) so the per-family budget stays intact
         // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
         // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
         // instead, defeating the ceiling assertion.)
-        s.note_withdrawal_result(h, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+        s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
       }
       s.drain_completed_withdrawals(t);
       if !s.services.contains_key(&handle_a) {
@@ -3064,19 +3079,20 @@ mod tests {
 
   /// regression (endpoint-owned-withdrawal form): when an ANNOUNCED service A
   /// is driven to auto-rename and its candidate new name collides with a local
-  /// service B, the proto has already queued a `pending_rename_goodbye` (TTL=0
-  /// withdrawal of A's OLD instance name). The OLD driver stole that goodbye into
-  /// its own queue before freeing the old name, then guarded against replaying it
-  /// on A's drop. The endpoint now enforces this STRUCTURALLY: the rename-collision
-  /// teardown begins an endpoint-owned withdrawal whose snapshot captures the
-  /// pending rename goodbye (alongside the current records), and the endpoint
-  /// HOLDS the OLD name for the whole withdrawal — so a replacement R cannot
-  /// register (and evict the old name from peer caches) until the goodbye
-  /// completes. No steal, no replay-guard needed.
+  /// service B, the proto hands off A's OLD instance name goodbye (TTL=0). The OLD
+  /// driver stole that goodbye into its own queue before freeing the old name,
+  /// then guarded against replaying it on A's drop. The endpoint now enforces this
+  /// STRUCTURALLY: the driver takes the handoff and enqueues it as an INDEPENDENT
+  /// detached withdrawal item (`Endpoint::enqueue_rename_withdrawal`) that HOLDS
+  /// the OLD name for the whole withdrawal — so a replacement R cannot register
+  /// (and evict the old name from peer caches) until that goodbye completes. The
+  /// rename-collision teardown additionally begins an endpoint-owned withdrawal
+  /// for the CURRENT name. No steal, no replay-guard needed.
   ///
-  /// (That the withdrawal snapshot CONSUMES the proto's `pending_rename_goodbye`
-  /// is covered at the proto level by
-  /// `withdrawal_snapshot_of_pending_rename_goodbye_captures_old_name_in_rename_field`.)
+  /// (That the proto hands off the OLD name's records + ownership is covered at the
+  /// proto level by `conflict_rename_hands_off_old_announced_name`, and that the
+  /// handoff becomes a detached item by
+  /// `rename_enqueues_a_detached_withdrawal_for_the_old_name`.)
   ///
   /// Asserts:
   /// 1. After collision retirement A is errored + the endpoint holds the OLD name,
@@ -3141,7 +3157,7 @@ mod tests {
       }
     }
 
-    // Advance A to Established so the proto queues a pending_rename_goodbye on
+    // Advance A to Established so the proto hands off an old-name goodbye on
     // rename (only an ANNOUNCED service has one — that's the bug scenario).
     let mut buf = [0u8; 1500];
     let mut t = now;
@@ -3238,13 +3254,13 @@ mod tests {
     let mut completed = false;
     for _ in 0..64 {
       t += Duration::from_millis(250);
-      while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
+      while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
         // No sockets bound in this State-level test: model BOTH families as
         // transiently undeliverable (Retry) so the per-family budget stays intact
         // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
         // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
         // instead, defeating the ceiling assertion.)
-        s.note_withdrawal_result(h, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+        s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
       }
       s.drain_completed_withdrawals(t);
       if !s.services.contains_key(&handle_a) {
@@ -3678,9 +3694,10 @@ mod tests {
   /// pump (`drain_withdrawals`) MUST run AFTER `push_service_updates`, not before.
   ///
   /// When a rename collision is detected inside `push_service_updates`, the
-  /// teardown begins an endpoint-owned withdrawal (`begin_service_withdrawal`)
-  /// whose snapshot captures `proto.pending_rename_goodbye` (with the current
-  /// records) and whose first goodbye round is due IMMEDIATELY (`next_at = now`).
+  /// teardown enqueues the old name's detached goodbye
+  /// (`enqueue_rename_withdrawal`) AND begins an endpoint-owned withdrawal for the
+  /// current name (`begin_service_withdrawal`), each due IMMEDIATELY
+  /// (`next_at = now`).
   /// Under the wrong order —
   /// withdrawal pump first, then `push_service_updates` — the pump would run
   /// before the withdrawal exists, deferring its first goodbye to the NEXT
@@ -3761,7 +3778,7 @@ mod tests {
       s.poll_one_withdrawal(t, scratch).is_some()
     }
 
-    // Advance A to Established so the proto queues pending_rename_goodbye on
+    // Advance A to Established so the proto hands off an old-name goodbye on
     // rename (only an ANNOUNCED service has one).
     let mut buf = [0u8; 1500];
     let mut t = now;

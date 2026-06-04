@@ -89,19 +89,6 @@ const MAX_PEER_PROBES: usize = 8;
 #[cfg(any(feature = "alloc", feature = "std"))]
 const CONFLICT_REPROBE_MIN_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
 
-/// how many times the conflict-rename goodbye for the OLD instance
-/// name is (re)sent for loss resilience (RFC 6762 §8.4 / §10.1 recommend
-/// sending a goodbye more than once). Drained across successive `poll_transmit`
-/// calls.
-#[cfg(any(feature = "alloc", feature = "std"))]
-const RENAME_GOODBYE_SENDS: u8 = 2;
-
-/// spacing between successive conflict-rename goodbyes, so the
-/// resends are not drained as a single same-tick burst (which a correlated loss
-/// burst could take out together).
-#[cfg(any(feature = "alloc", feature = "std"))]
-const RENAME_GOODBYE_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
-
 /// One record from a peer's simultaneous probe, retained for the RFC §8.2
 /// tiebreak comparison (lexicographic comparison of proposed RR sets).
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -166,7 +153,7 @@ fn hash_rdata(bytes: &[u8]) -> u64 {
 
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[allow(unused_imports)]
-pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye_with_rename};
+pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye};
 #[allow(unused_imports)]
 pub(crate) use schedule::{announce_deadline, probe_deadline, re_announce_deadline};
 pub use state::ServiceState;
@@ -346,12 +333,6 @@ enum AwaitingConfirm {
   /// suppression); it is bumped into `answers_suppressed_kas` ONLY on a
   /// confirmed delivery so a socket failure cannot inflate the counter.
   Response(respond::EmittedRecords, u64),
-  /// A conflict-rename goodbye (TTL=0 withdrawal of the OLD instance records) is
-  /// awaiting confirmation. Its resend budget (`pending_rename_goodbye.remaining`)
-  /// is spent ONLY on a confirmed send — an all-family-busy attempt re-arms it
-  /// instead of consuming the withdrawal. It withdraws records it never
-  /// re-advertises, so it latches NO new goodbye ownership.
-  RenameGoodbye,
   /// A RFC 6763 §9 service-type enumeration meta-response (multicast or legacy
   /// unicast) is awaiting confirmation. The meta-PTR is a shared record — it
   /// advertises no instance-owned records and is never withdrawn — so a confirmed
@@ -472,21 +453,36 @@ pub struct WithdrawalSnapshot {
   pub host_a: std::vec::Vec<core::net::Ipv4Addr>,
   /// Host AAAA (IPv6) addresses this service confirmed-emitted.
   pub host_aaaa: std::vec::Vec<core::net::Ipv6Addr>,
-  /// An IN-FLIGHT §9 conflict-rename goodbye for the OLD instance name that has
-  /// not finished draining (`pending_rename_goodbye` was still `Some` when this
-  /// snapshot was taken). After a rename A→B the service clears its old instance
-  /// ownership and re-announces B, so the `records`/`owned`/`host_*` fields above
-  /// describe the CURRENT name B — but the OLD name A's instance PTR/SRV/TXT are
-  /// still cached by peers until the spaced rename goodbyes finish. If the
-  /// service is unregistered in that window the endpoint must withdraw BOTH: this
-  /// carries the old name's `ServiceRecords` plus its per-record ownership
-  /// (instance-only — a rename never withdraws host A/AAAA, the host name is
-  /// invariant), matching `write_rename_goodbye` semantics. `None` when no rename
-  /// goodbye was in flight.
-  ///
-  /// `pub(crate)`: `EmittedRecords` is a crate-internal type, so the endpoint
-  /// (same crate) reads the tuple directly.
-  pub(crate) rename: Option<(crate::records::ServiceRecords, respond::EmittedRecords)>,
+}
+
+/// The one-shot §9 conflict-rename goodbye handoff: the OLD instance name's
+/// records plus the per-record ownership of what that name actually advertised.
+///
+/// Produced by
+/// [`Service::take_rename_goodbye_handoff`] the instant a conflict rename
+/// happens, and handed straight to
+/// [`Endpoint::enqueue_rename_withdrawal`](crate::Endpoint::enqueue_rename_withdrawal),
+/// which turns it into an independent DETACHED withdrawal item (the renamed-away
+/// old name's TTL=0 goodbye). It is **opaque** to the driver — both fields are
+/// crate-internal (`EmittedRecords` is `pub(crate)`) — so a driver only ever
+/// moves the whole value between the two calls, exactly like
+/// [`WithdrawalSnapshot`]. A rename never withdraws host A/AAAA (the host name is
+/// invariant), so this carries no host addresses.
+///
+/// The `#[cfg]` gate matches the goodbye code it supports.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+#[derive(Debug, Clone)]
+pub struct RenameGoodbyeHandoff {
+  /// The OLD instance name's records (names, port, TXT), captured BEFORE the
+  /// rename mutated the instance name. `pub(crate)`: the endpoint (same crate)
+  /// reads it directly.
+  pub(crate) records: crate::records::ServiceRecords,
+  /// Which instance records (PTR/SRV/TXT/subtypes) the OLD name actually put on
+  /// the wire — only these are withdrawn (§7.1 KAS can suppress a subset). The
+  /// address lists are always empty (a rename never withdraws host A/AAAA).
+  /// `pub(crate)`: `EmittedRecords` is a crate-internal type.
+  pub(crate) owned: respond::EmittedRecords,
 }
 
 /// Service state machine. One per registered service.
@@ -565,24 +561,20 @@ pub struct Service<I, TQ, EV> {
   /// instant of the last conflict-driven revert-to-probe, used to
   /// rate-limit RFC 6762 §9 re-probing under a conflict flood.
   last_conflict_reprobe: Option<I>,
-  /// a snapshot of the OLD (previously
-  /// announced) records, a remaining-sends counter, and WHICH instance records
-  /// the old name actually advertised, for a TTL=0 goodbye when a conflict
-  /// renames an ANNOUNCED service. Without this the old PTR/SRV/TXT linger in
-  /// peer caches until TTL, producing a ghost/duplicate service. The third
-  /// element carries the per-record ownership (`EmittedRecords` with the
-  /// instance bits set, addresses empty) so `write_rename_goodbye` withdraws
-  /// only the records §7.1 KAS actually let onto the wire — never a record this
-  /// responder didn't send. Drained first by `poll_transmit` and re-sent
-  /// [`RENAME_GOODBYE_SENDS`] times for loss resilience (RFC 6762 §8.4 / §10.1).
-  /// `None` when the renamed name had never been announced.
-  pending_rename_goodbye: Option<(crate::records::ServiceRecords, u8, respond::EmittedRecords)>,
-  /// deadline at which the NEXT rename goodbye may be sent. The first
-  /// send is due immediately (set to `now` on rename); after each send it is
-  /// pushed out by [`RENAME_GOODBYE_INTERVAL`] so the resends are temporally
-  /// independent (a single loss burst can't drop them all) rather than a
-  /// same-tick burst. Surfaced via `poll_timeout`.
-  rename_goodbye_deadline: Option<I>,
+  /// One-shot handoff of the OLD instance name's TTL=0 goodbye when a §9 conflict
+  /// renames an ANNOUNCED service. Set at the rename site (`handle_timeout`) with
+  /// the OLD records and WHICH instance records that name actually advertised
+  /// (`EmittedRecords` with the instance bits set, addresses empty — a rename
+  /// never withdraws host A/AAAA, the host name is invariant). The Service no
+  /// longer drains this itself: the driver takes it via
+  /// [`Self::take_rename_goodbye_handoff`] immediately after observing the
+  /// `Renamed` update and hands it to
+  /// [`crate::Endpoint::enqueue_rename_withdrawal`], which models the old-name
+  /// goodbye as an INDEPENDENT detached withdrawal item (its own per-family debt,
+  /// schedule, and loss-resilience resends). `None` when the renamed name had
+  /// never advertised an instance record (nothing for peers to evict) or after
+  /// the handoff has been taken.
+  rename_goodbye_handoff: Option<RenameGoodbyeHandoff>,
   /// §9: jittered deadline for a pending RFC 6763 service-type
   /// enumeration (`_services._dns-sd._udp.<domain>`) reply. Set when a meta-query
   /// arrives; `poll_transmit` emits a standalone shared meta-PTR when it fires.
@@ -656,8 +648,7 @@ where
       awaiting_confirm: None,
       pending_legacy: std::vec::Vec::new(),
       last_conflict_reprobe: None,
-      pending_rename_goodbye: None,
-      rename_goodbye_deadline: None,
+      rename_goodbye_handoff: None,
       meta_response_deadline: None,
       meta_questioner_srcs: std::vec::Vec::new(),
       meta_known_answered: false,
@@ -889,36 +880,6 @@ where
           self.goodbye.record_emitted(&emitted);
         }
       }
-      AwaitingConfirm::RenameGoodbye => {
-        if delivered {
-          // The withdrawal reached the link → count it, spend ONE resend, then
-          // schedule the next (RENAME_GOODBYE_INTERVAL apart) or finish.
-          #[cfg(feature = "stats")]
-          if let Some(s) = self.stat() {
-            s.goodbyes_tx(1);
-          }
-          if let Some((_, remaining, _)) = self.pending_rename_goodbye.as_mut() {
-            *remaining = remaining.saturating_sub(1);
-            if *remaining == 0 {
-              self.pending_rename_goodbye = None;
-              self.rename_goodbye_deadline = None;
-            } else {
-              self.rename_goodbye_deadline = now.checked_add_duration(RENAME_GOODBYE_INTERVAL);
-              if self.rename_goodbye_deadline.is_none() {
-                self.pending_rename_goodbye = None;
-              }
-            }
-          }
-        } else {
-          // Nothing reached the link — re-arm the SAME withdrawal at the resend
-          // interval (a FUTURE deadline, not `now`, so it is not re-offered within
-          // this same pump and busy-spin) WITHOUT spending the budget.
-          self.rename_goodbye_deadline = now.checked_add_duration(RENAME_GOODBYE_INTERVAL);
-          if self.rename_goodbye_deadline.is_none() {
-            self.pending_rename_goodbye = None;
-          }
-        }
-      }
       AwaitingConfirm::MetaResponse => {
         // A §9 meta-response (multicast or legacy) put a shared meta-PTR on the
         // wire.  No instance-owned records were emitted, so goodbye ownership is
@@ -952,37 +913,19 @@ where
   /// confirmed-emitted. The endpoint further filters host addresses against
   /// same-host siblings before encoding the actual goodbye datagram.
   ///
-  /// **Also captures an in-flight rename goodbye, if any:** if a §9 conflict
-  /// rename installed a `pending_rename_goodbye` (the OLD instance name A still
-  /// needs withdrawing) and it has not finished draining, the OLD name's records
-  /// (with their per-record ownership) are ALSO captured into
-  /// `WithdrawalSnapshot::rename`, and `pending_rename_goodbye` is taken
-  /// (`= None`) — the endpoint's withdrawal machine owns the resend loop from
-  /// here. This is NOT an either/or with the
-  /// current state: after a rename A→B the service re-announces and confirms B's
-  /// instance records on the wire while A's goodbye is still spaced out, so a
-  /// teardown in that window must withdraw BOTH A's old instance records AND B's
-  /// current instance records (plus the still-owned host A/AAAA). Returning only
-  /// A (the old behaviour) leaked B's confirmed PTR/SRV/TXT and the host
-  /// addresses until their TTLs expired. The rename capture is instance-only —
-  /// a rename never withdraws host A/AAAA (the host name is invariant across an
-  /// instance rename), matching `write_rename_goodbye` semantics.
+  /// The OLD instance name of an in-flight §9 conflict rename is NOT carried
+  /// here. A rename now hands its old-name goodbye off via
+  /// [`Self::take_rename_goodbye_handoff`] the instant it happens, and the driver
+  /// enqueues it as an INDEPENDENT detached withdrawal item
+  /// ([`crate::Endpoint::enqueue_rename_withdrawal`]). A teardown during that
+  /// window is therefore simply two independent items — the detached old-name
+  /// item already enqueued, plus the route-attached current-name item this
+  /// snapshot produces — with no `snapshot.rename` inheritance.
   pub fn withdrawal_snapshot(&mut self) -> WithdrawalSnapshot {
-    // Capture any in-flight rename goodbye for the OLD instance name (instance
-    // records only — a rename never withdraws host A/AAAA). Taken here so it is
-    // consumed exactly once; the endpoint owns the resend loop from now on.
-    let rename = self
-      .pending_rename_goodbye
-      .take()
-      .map(|(old_records, _, old_owned)| {
-        self.rename_goodbye_deadline = None;
-        (old_records, old_owned)
-      });
-
     // Snapshot the CURRENT goodbye-ownership latch (the live name's records).
-    // This is captured unconditionally, ALONGSIDE any `rename` above: after a
-    // rename the current name is the freshly re-announced one, and its confirmed
-    // instance + host records still need withdrawing.
+    // After a rename the current name is the freshly re-announced one, and its
+    // confirmed instance + host records still need withdrawing; the OLD name is
+    // handled separately as its own detached item.
     let owned = respond::EmittedRecords::new(
       self.goodbye.ptr,
       self.goodbye.srv,
@@ -996,8 +939,24 @@ where
       owned,
       host_a: self.goodbye.a.clone(),
       host_aaaa: self.goodbye.aaaa.clone(),
-      rename,
     }
+  }
+
+  /// Take the one-shot §9 rename goodbye handoff, if a conflict rename installed
+  /// one (the OLD instance name advertised ≥1 instance record and so still needs
+  /// a TTL=0 withdrawal so peers evict it).
+  ///
+  /// Returns the OLD name's `ServiceRecords` plus the per-record ownership
+  /// (`EmittedRecords` with the instance bits the old name actually put on the
+  /// wire; host A/AAAA empty — a rename never withdraws host addresses). The
+  /// driver MUST call this immediately after observing
+  /// [`ServiceUpdate::Renamed`](crate::event::ServiceUpdate) from [`Self::poll`]
+  /// and hand the result to [`crate::Endpoint::enqueue_rename_withdrawal`], which
+  /// models the old-name goodbye as an independent detached withdrawal item. The
+  /// field is consumed (`.take()`) so the handoff happens exactly once. Returns
+  /// `None` when the renamed name had never advertised an instance record.
+  pub fn take_rename_goodbye_handoff(&mut self) -> Option<RenameGoodbyeHandoff> {
+    self.rename_goodbye_handoff.take()
   }
 
   /// Returns the next deadline at which `handle_timeout` should be called.
@@ -1010,13 +969,14 @@ where
     if !self.pending_legacy.is_empty() {
       return self.last_now;
     }
-    // Earliest of: lifecycle, response, and the rename-goodbye resend deadline
-    // (so a Sans-I/O caller wakes to send each spaced resend).
+    // Earliest of: lifecycle, response, and the meta-response deadline. The §9
+    // rename goodbye is no longer drained by the Service — it is handed off to
+    // the endpoint as a detached withdrawal item — so it contributes no wakeup
+    // here.
     let mut best: Option<I> = None;
     for d in [
       self.lifecycle_deadline,
       self.response_deadline,
-      self.rename_goodbye_deadline,
       self.meta_response_deadline,
     ]
     .into_iter()
@@ -1676,6 +1636,10 @@ where
           // goodbye withdraws exactly those — not all of PTR/SRV/TXT, which
           // could flush a peer's matching same-name record we never sent. Host
           // A/AAAA are not withdrawn by a rename (the host name is unchanged).
+          // Captured BEFORE `set_instance(new_name)` below, so `self.records`
+          // still names the OLD instance. The Service no longer drains this —
+          // it is handed off (`take_rename_goodbye_handoff`) to the endpoint as
+          // an independent detached withdrawal item.
           let owned = respond::EmittedRecords::new(
             self.goodbye.ptr,
             self.goodbye.srv,
@@ -1684,8 +1648,10 @@ where
             std::vec::Vec::new(),
             self.goodbye.subtypes,
           );
-          self.pending_rename_goodbye = Some((self.records.clone(), RENAME_GOODBYE_SENDS, owned));
-          self.rename_goodbye_deadline = Some(now); // first send due immediately
+          self.rename_goodbye_handoff = Some(RenameGoodbyeHandoff {
+            records: self.records.clone(),
+            owned,
+          });
         }
         self.rename_attempt = self.rename_attempt.saturating_add(1);
         let new_name_str =
@@ -1873,54 +1839,10 @@ where
     // confirms after each send). The token is cleared by `note_transmit_result`
     // (`.take()`), so the next poll after a confirm proceeds normally; a probe/
     // announce/response branch below re-stamps it, while the early-return
-    // datagrams (rename goodbye, legacy) only stamp where they own lifecycle/
-    // ownership state.
+    // datagram (legacy unicast) only stamps where it owns lifecycle/ownership
+    // state.
     if self.awaiting_confirm.is_some() {
       return Ok(None);
-    }
-    // withdraw the OLD instance records first —
-    // when a conflict renamed an announced service, peers still cache the old
-    // PTR/SRV/TXT. Emit a TTL=0 multicast goodbye for ONLY the old instance
-    // records (write_rename_goodbye omits the still-valid host A/AAAA) before
-    // the new-name probe. The first send is due immediately; subsequent sends
-    // are gated by `rename_goodbye_deadline` (RENAME_GOODBYE_INTERVAL apart) so
-    // the resends are temporally independent, not a same-tick burst.
-    if self.pending_rename_goodbye.is_some()
-      && self.rename_goodbye_deadline.is_some_and(|due| now >= due)
-    {
-      // peek-then-pop — encode WITHOUT consuming, so a transient
-      // too-small buffer preserves the withdrawal (surfaced as BufferTooSmall,
-      // matching probe/announce/response) instead of silently dropping it.
-      let encoded = match self.pending_rename_goodbye.as_ref() {
-        Some((old, _, owned)) => respond::write_rename_goodbye(old, owned, buf),
-        None => Ok(0), // unreachable (guarded by is_some above)
-      };
-      match encoded {
-        Ok(n) => {
-          crate::trace::debug!(
-            target: "mdns_proto::service",
-            handle = self.handle.raw(),
-            "service: poll_transmit emitting rename goodbye (TTL=0)"
-          );
-          // goodbyes_tx is bumped in note_transmit_result on confirmed delivery.
-          // Confirm-on-send: stamp the commit token and DEFER spending the resend
-          // budget (and scheduling the next resend) to `note_transmit_result`. An
-          // all-family-busy send must NOT consume the withdrawal — the budget is
-          // spent only on a delivered send, and a failed one re-arms it.
-          self.awaiting_confirm = Some(AwaitingConfirm::RenameGoodbye);
-          return Ok(Some(Transmit::new(respond::multicast_dst(), None, n)));
-        }
-        Err(_) => {
-          crate::trace::warn!(
-            target: "mdns_proto::service",
-            handle = self.handle.raw(),
-            "service: poll_transmit rename goodbye BufferTooSmall"
-          );
-          return Err(TransmitError::BufferTooSmall(
-            crate::error::BufferTooSmallDetail::new(buf.len(), buf.len()),
-          ));
-        }
-      }
     }
     // §9: emit a pending service-type enumeration reply (a single shared
     // meta-PTR). Standalone like the rename goodbye — stamps NO awaiting_confirm

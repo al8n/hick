@@ -581,19 +581,27 @@ impl<N: Net> DriverState<N> {
           // records — we cannot safely keep it. Emit Conflict, then remove.
           let final_upd = match upd {
             ServiceUpdate::Renamed(ref renamed) => {
-              match endpoint.handle_service_renamed(*handle, renamed.new_name().clone()) {
+              let rename_result =
+                endpoint.handle_service_renamed(*handle, renamed.new_name().clone());
+              // The §9 rename of an announced service hands its OLD-name TTL=0
+              // goodbye off as an INDEPENDENT detached withdrawal item, both for a
+              // SURVIVING rename and a COLLISION teardown. Take it the instant the
+              // rename is observed and enqueue it on the endpoint — the Service no
+              // longer drains the old-name goodbye itself.
+              if let Some(h) = ctx.proto.take_rename_goodbye_handoff() {
+                endpoint.enqueue_rename_withdrawal(h, now);
+              }
+              match rename_result {
                 Ok(()) => upd,
                 Err(_) => {
                   // The new name collides with another local service; the Service
                   // has already rebranded and can't be kept. Surface Conflict (into
                   // the decoupled channel), then retire it: `remove_service` begins
-                  // the endpoint-owned withdrawal, whose snapshot prioritises the
-                  // pending OLD-name rename goodbye and holds the route (keeping the
-                  // OLD name reserved) while it resends, freeing the name on
-                  // completion. The ctx is kept until then so this Conflict still
-                  // reaches the host. Only this rename-COLLISION teardown goes
-                  // through begin_withdrawal; a SURVIVING renamed service's old-name
-                  // goodbye is auto-emitted by the proto's own poll_transmit.
+                  // the endpoint-owned withdrawal for the CURRENT name and holds the
+                  // route (keeping it reserved) while it resends, freeing the name on
+                  // completion. The OLD name's goodbye was already enqueued above as
+                  // its own detached item. The ctx is kept until then so this
+                  // Conflict still reaches the host.
                   hick_trace::warn!(
                     handle = ?handle,
                     new_name = %renamed.new_name(),
@@ -867,6 +875,12 @@ impl<N: Net> DriverState<N> {
             let _ = deliver_service_update(ctx, ServiceUpdate::Conflict);
             ctx.last_pushed = Some(UpdateMark::Conflict);
             ctx.withdrawing = true;
+            // Enqueue any pending §9 rename handoff before snapshotting: keep the old-name goodbye exactly-once on every retirement
+            // path, not just the update-drain site. (A persistently-encode-failing
+            // service never announced, so this is usually `None` — but uniform.)
+            if let Some(handoff) = ctx.proto.take_rename_goodbye_handoff() {
+              endpoint.enqueue_rename_withdrawal(handoff, now);
+            }
             let snap = ctx.proto.withdrawal_snapshot();
             endpoint.begin_withdrawal(h, snap, now);
           }
@@ -1006,11 +1020,11 @@ impl<N: Net> DriverState<N> {
   /// The endpoint KEEPS the route (holding the name against a same-name
   /// re-registration) and drives the TTL=0 goodbye resend schedule; the driver
   /// loop pumps each due goodbye datagram and, on completion, frees the route and
-  /// GCs the driver ctx. The withdrawal covers whatever the service must retract:
-  /// the records it confirmed-emitted under its current name (host A/AAAA filtered
-  /// against same-host siblings by the endpoint), AND — if a conflict rename left
-  /// an old-name withdrawal still pending — that old instance name too, in the
-  /// SAME goodbye ([`Service::withdrawal_snapshot`] captures both). A
+  /// GCs the driver ctx. This withdrawal covers the records the service
+  /// confirmed-emitted under its CURRENT name (host A/AAAA filtered against
+  /// same-host siblings by the endpoint). An in-flight conflict-rename old-name
+  /// goodbye is a SEPARATE detached withdrawal item, enqueued the instant the
+  /// rename happened via [`Endpoint::enqueue_rename_withdrawal`]. A
   /// never-announced service has an empty snapshot and completes on the next loop
   /// iteration with no datagram on the wire.
   ///
@@ -1024,25 +1038,35 @@ impl<N: Net> DriverState<N> {
 
   /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: mark the
   /// ctx `withdrawing` (so every subsequent loop skips it for transmits,
-  /// deadlines, and the orphan-sweep), snapshot what its goodbye must retract
-  /// ([`Service::withdrawal_snapshot`], which captures both the current records
-  /// and any pending conflict-rename old-name goodbye), and hand it to
+  /// deadlines, and the orphan-sweep), snapshot what its CURRENT name's goodbye
+  /// must retract ([`Service::withdrawal_snapshot`]), and hand it to
   /// [`Endpoint::begin_withdrawal`]. The endpoint holds the route and drives the
   /// resend schedule; the route is freed and the driver ctx GC'd when
-  /// [`Endpoint::drain_completed_withdrawals`] reports completion in the loop.
+  /// [`Endpoint::drain_completed_withdrawals`] reports completion in the loop. Any
+  /// in-flight §9 rename old-name goodbye is a SEPARATE detached item already
+  /// enqueued via [`Endpoint::enqueue_rename_withdrawal`].
   ///
   /// `begin_withdrawal` is idempotent, so calling this for an already-withdrawing
   /// service is a no-op. A no-op for an unknown driver handle.
   fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: StdInstant) {
     // Scope the `ctx` borrow so it ends before `self.endpoint` is touched (the
     // snapshot is owned, so no borrow of `self.services` outlives this block).
-    let snap = match self.services.get_mut(&handle) {
+    // ALSO take any pending §9 rename handoff here: a retirement that races a
+    // queued `Renamed` update (closed receiver / explicit unregister) never
+    // reaches the update-drain site that normally enqueues it, which would strand
+    // the old-name goodbye in a proto being GC'd. `.take()` makes the handoff
+    // exactly-once vs the update-drain path.
+    let (snap, handoff) = match self.services.get_mut(&handle) {
       Some(ctx) => {
         ctx.withdrawing = true;
-        ctx.proto.withdrawal_snapshot()
+        let handoff = ctx.proto.take_rename_goodbye_handoff();
+        (ctx.proto.withdrawal_snapshot(), handoff)
       }
       None => return,
     };
+    if let Some(handoff) = handoff {
+      self.endpoint.enqueue_rename_withdrawal(handoff, now);
+    }
     self.endpoint.begin_withdrawal(handle, snap, now);
   }
 
@@ -1071,7 +1095,7 @@ impl<N: Net> DriverState<N> {
       v6,
       ..
     } = self;
-    while let Some((dst, len, handle)) = endpoint.poll_withdrawal_transmit(now, scratch) {
+    while let Some((dst, len, token)) = endpoint.poll_withdrawal_transmit(now, scratch) {
       // The endpoint always returns the multicast marker; the driver fans the
       // datagram to both groups regardless. Assert the contract in debug builds.
       debug_assert!(
@@ -1101,7 +1125,7 @@ impl<N: Net> DriverState<N> {
       if matches!(v4_out, WithdrawalSend::Sent) || matches!(v6_out, WithdrawalSend::Sent) {
         stats.goodbyes_tx(1);
       }
-      endpoint.note_withdrawal_result(handle, now, v4_out, v6_out);
+      endpoint.note_withdrawal_result(token, now, v4_out, v6_out);
     }
     // Free completed withdrawals (budget spent or 2 s ceiling reached): the
     // endpoint releases each route (decrementing services_active) and reports the

@@ -463,10 +463,9 @@ pub(crate) fn write_goodbye(
 }
 
 /// Append one service's TTL=0 goodbye records (selected per-record) into an
-/// EXISTING [`MessageBuilder`]. Factored out of [`write_goodbye`] so a single
-/// goodbye datagram can withdraw more than one name (the current instance + an
-/// in-flight rename's OLD instance) in the SAME message — see
-/// [`write_goodbye_with_rename`].
+/// EXISTING [`MessageBuilder`]. Factored out of [`write_goodbye`] so the
+/// per-record goodbye selection (PTR/SRV/TXT/subtypes + host A/AAAA) lives in
+/// one place.
 #[allow(clippy::too_many_arguments)]
 fn push_goodbye_records<const COMP_N: usize>(
   b: &mut MessageBuilder<'_, COMP_N>,
@@ -514,93 +513,6 @@ fn push_goodbye_records<const COMP_N: usize>(
     b.push_aaaa_answer(records.host(), 0, a, true)?;
   }
   Ok(())
-}
-
-/// Write a goodbye for the CURRENT instance (per-record + host-address selected,
-/// exactly like [`write_goodbye`]) and, when `rename` is `Some`, ALSO append the
-/// OLD instance name's TTL=0 PTR/SRV/TXT/subtype withdrawals into the SAME
-/// datagram.
-///
-/// This is the teardown-during-rename path: after a §9 conflict
-/// rename A→B the service re-announces B and confirms B's instance + host
-/// records on the wire while A's rename goodbye is still draining (spaced
-/// resends). A retire/unregister in that window must withdraw BOTH — B's current
-/// records (so they don't linger until TTL) AND A's old instance records (so the
-/// renamed-away name doesn't ghost). Both go into one message: the current
-/// goodbye first, then the old-name instance records appended (TTL=0). The
-/// old-name records are instance-only — a rename never withdraws host A/AAAA
-/// (the host name is invariant across an instance rename).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_goodbye_with_rename(
-  records: &ServiceRecords,
-  out: &mut [u8],
-  include_ptr: bool,
-  include_srv: bool,
-  include_txt: bool,
-  include_subtypes: bool,
-  a_addrs: impl Iterator<Item = Ipv4Addr>,
-  aaaa_addrs: impl Iterator<Item = Ipv6Addr>,
-  rename: Option<(&ServiceRecords, &EmittedRecords)>,
-) -> Result<usize, EncodeError> {
-  let header = Header::new().with_flags(
-    crate::wire::Flags::new()
-      .with_response()
-      .with_authoritative(),
-  );
-  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> = MessageBuilder::try_new(out, header)?;
-  // Current instance + (sibling-filtered) host records.
-  push_goodbye_records(
-    &mut b,
-    records,
-    include_ptr,
-    include_srv,
-    include_txt,
-    include_subtypes,
-    a_addrs,
-    aaaa_addrs,
-  )?;
-  // The OLD instance name's records (instance-only, no host A/AAAA) appended
-  // into the SAME message — mirrors `write_rename_goodbye`'s per-record select.
-  if let Some((old_records, owned)) = rename {
-    push_goodbye_records(
-      &mut b,
-      old_records,
-      owned.ptr,
-      owned.srv,
-      owned.txt,
-      owned.subtypes,
-      core::iter::empty(),
-      core::iter::empty(),
-    )?;
-  }
-  b.finish()
-}
-
-/// Write a RENAME goodbye: withdraws ONLY the instance
-/// records the OLD name actually advertised — `owned.ptr` / `owned.srv` /
-/// `owned.txt` (PTR/SRV/TXT, all TTL 0). §7.1 known-answer suppression may have
-/// put only a SUBSET of them on the wire before the rename, so withdrawing all
-/// three unconditionally could flush a peer's matching same-name record this
-/// responder never sent. It deliberately OMITS the host A/AAAA: a conflict
-/// rename invalidates only the instance name, while the host address records
-/// remain valid (the renamed service, and any other local service sharing the
-/// host name, still use them).
-#[inline]
-pub(crate) fn write_rename_goodbye(
-  records: &ServiceRecords,
-  owned: &EmittedRecords,
-  out: &mut [u8],
-) -> Result<usize, EncodeError> {
-  write_goodbye(
-    records,
-    out,
-    owned.ptr,
-    owned.srv,
-    owned.txt,
-    owned.subtypes,
-    core::iter::empty(),
-    core::iter::empty(),
-  )
 }
 
 /// Which CONCRETE records a filtered/legacy response actually put on the wire

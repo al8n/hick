@@ -161,4 +161,6 @@ pub mod endpoint;
 
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub use endpoint::{Endpoint, EndpointEventEntry, RouteEvents, ServiceRoute, WithdrawalSend};
+pub use endpoint::{
+  Endpoint, EndpointEventEntry, RouteEvents, ServiceRoute, WithdrawalSend, WithdrawalToken,
+};

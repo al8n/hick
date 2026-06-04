@@ -512,11 +512,13 @@ fn empty_txt_encodes_as_single_zero_length_string() {
 }
 
 #[test]
-fn rename_goodbye_withdraws_only_advertised_instance_records() {
+fn rename_handoff_withdraws_only_advertised_instance_records() {
   // if §7.1 KAS let only a SUBSET of the instance records onto the wire
   // before a conflict rename, the rename goodbye must withdraw exactly that
   // subset — not all of PTR/SRV/TXT, which would flush a peer's matching
-  // same-name record this responder never sent.
+  // same-name record this responder never sent. The Service captures that subset
+  // into the handoff (instance ownership latched at rename time); the endpoint's
+  // detached item then emits only those records.
   let mut svc = make_service(120);
   svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
   // The old name advertised ONLY its PTR (SRV/TXT were KAS-suppressed on the one
@@ -547,30 +549,24 @@ fn rename_goodbye_withdraws_only_advertised_instance_records() {
     "service should have renamed"
   );
 
-  // poll_transmit drains the rename goodbye (multicast, withdraws the OLD
-  // instance records) before the new-name probe. Only the advertised PTR may
-  // appear, at TTL 0.
-  let mut out = std::vec![0u8; 4096];
-  let tx = svc
-    .poll_transmit(now, &mut out)
-    .unwrap()
-    .expect("a rename goodbye must be emitted for the announced old name");
-  let reader = crate::wire::MessageReader::try_parse(out.get(..tx.size()).unwrap()).unwrap();
-  let mut saw_ptr = false;
-  let mut saw_srv_or_txt = false;
-  for rr in reader.answers() {
-    let rr = rr.unwrap();
-    assert_eq!(rr.ttl(), 0, "every rename-goodbye record must carry TTL 0");
-    match rr.rtype() {
-      crate::wire::ResourceType::Ptr => saw_ptr = true,
-      crate::wire::ResourceType::Srv | crate::wire::ResourceType::Txt => saw_srv_or_txt = true,
-      _ => {}
-    }
-  }
-  assert!(saw_ptr, "the advertised PTR must be withdrawn");
+  // The handoff carries ONLY the advertised PTR — the KAS-suppressed SRV/TXT are
+  // not in the ownership set, so the endpoint's goodbye never withdraws them.
+  let RenameGoodbyeHandoff {
+    owned: old_owned, ..
+  } = svc
+    .take_rename_goodbye_handoff()
+    .expect("a rename of an (PTR-)announced service must hand off the old-name goodbye");
   assert!(
-    !saw_srv_or_txt,
-    "the KAS-suppressed SRV/TXT must NOT be withdrawn"
+    old_owned.ptr(),
+    "the advertised PTR is in the handoff ownership"
+  );
+  assert!(
+    !old_owned.srv() && !old_owned.txt(),
+    "the KAS-suppressed SRV/TXT must NOT be in the handoff ownership"
+  );
+  assert!(
+    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
+    "a rename handoff is instance-only — never host A/AAAA"
   );
 }
 
@@ -1938,11 +1934,15 @@ fn section9_reprobe_clears_queued_legacy_reply() {
   );
 }
 
-/// a conflict rename of an ANNOUNCED service must emit a TTL=0
-/// goodbye for the OLD records, or peers keep the old PTR/SRV/TXT cached as a
-/// ghost until TTL.
+/// a conflict rename of an ANNOUNCED service must HAND OFF the OLD name's records
+/// for a TTL=0 goodbye, or peers keep the old PTR/SRV/TXT cached as a ghost until
+/// TTL. The Service no longer drains the goodbye itself — it surfaces the old
+/// name + its instance-only ownership via `take_rename_goodbye_handoff`, which the
+/// driver feeds to `Endpoint::enqueue_rename_withdrawal` (the actual TTL=0
+/// emission is covered by the endpoint's withdrawal tests, including
+/// `rename_enqueues_a_detached_withdrawal_for_the_old_name`).
 #[test]
-fn conflict_rename_emits_goodbye_for_old_announced_name() {
+fn conflict_rename_hands_off_old_announced_name() {
   let mut svc = make_service(120);
   svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
   svc.goodbye.mark_instance(); // the original name was announced
@@ -1971,178 +1971,59 @@ fn conflict_rename_emits_goodbye_for_old_announced_name() {
     "service should have renamed"
   );
 
-  // The FIRST transmit after the rename must be the old-name goodbye.
+  // The rename installs a one-shot handoff for the OLD announced name.
+  let RenameGoodbyeHandoff {
+    records: old_records,
+    owned: old_owned,
+  } = svc
+    .take_rename_goodbye_handoff()
+    .expect("a rename of an announced service must hand off the old-name goodbye");
+  assert_eq!(
+    old_records.instance().as_str(),
+    "myprinter._ipp._tcp.local.",
+    "the handoff carries the OLD instance name (captured before set_instance)"
+  );
+  assert!(
+    old_owned.ptr() && old_owned.srv() && old_owned.txt(),
+    "the OLD name's advertised instance records (PTR/SRV/TXT) are handed off"
+  );
+  assert!(
+    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
+    "a rename never withdraws host A/AAAA — the handoff is instance-only"
+  );
+
+  // The handoff is one-shot: taken exactly once.
+  assert!(
+    svc.take_rename_goodbye_handoff().is_none(),
+    "the handoff is consumed by the first take"
+  );
+
+  // The Service itself emits NO goodbye now (the old-name withdrawal is the
+  // endpoint's detached item). The next transmit is the new-name probe sequence,
+  // never a TTL=0 record for `myprinter`.
   let mut out = std::vec![0u8; 4096];
-  let t = svc
-    .poll_transmit(FakeInstant::zero().advance(500), &mut out)
-    .unwrap()
-    .expect("a goodbye for the old announced name must be emitted");
-  let reader = crate::wire::MessageReader::try_parse(&out[..t.size()]).unwrap();
-  let mut old_srv_goodbye = false;
-  let mut saw_host_addr = false;
-  for rr in reader.answers() {
-    let rr = rr.unwrap();
-    match rr.rtype() {
-      crate::wire::ResourceType::Srv => {
-        if rr.name().labels().next().and_then(Result::ok) == Some(&b"myprinter"[..])
-          && rr.ttl() == 0
-        {
-          old_srv_goodbye = true;
-        }
-      }
-      // the rename goodbye must NOT withdraw the host address
-      // records — they are still valid for the renamed (and any co-hosted)
-      // service.
-      crate::wire::ResourceType::A | crate::wire::ResourceType::AAAA => saw_host_addr = true,
-      _ => {}
+  if let Ok(Some(t)) = svc.poll_transmit(FakeInstant::zero().advance(500), &mut out) {
+    let reader = crate::wire::MessageReader::try_parse(&out[..t.size()]).unwrap();
+    for rr in reader.answers() {
+      let rr = rr.unwrap();
+      assert!(
+        rr.ttl() != 0,
+        "the Service must not emit any TTL=0 goodbye after a rename — that moved to the endpoint"
+      );
     }
   }
-  assert!(
-    old_srv_goodbye,
-    "goodbye must carry the OLD instance's SRV (owner 'myprinter') with TTL=0"
-  );
-  assert!(
-    !saw_host_addr,
-    "rename goodbye must NOT withdraw the still-valid host A/AAAA records"
-  );
 }
 
-/// the rename-goodbye resends are SPACED by RENAME_GOODBYE_INTERVAL,
-/// not drained as a same-tick burst — so a correlated loss burst can't take
-/// all copies.
-#[test]
-fn rename_goodbye_resends_are_spaced_not_a_burst() {
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
-  svc.goodbye.mark_instance();
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  let t = FakeInstant::zero().advance(500);
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc.handle_timeout(t).unwrap(); // rename at t → first goodbye due at t
-
-  let mut out = std::vec![0u8; 4096];
-  assert!(
-    svc.poll_transmit(t, &mut out).unwrap().is_some(),
-    "first rename goodbye is due immediately"
-  );
-  // Confirm-on-send: the resend budget is spent and the NEXT resend scheduled on
-  // delivery confirmation, not at poll time (so an all-busy send cannot consume
-  // the withdrawal). The next send is then spaced by RENAME_GOODBYE_INTERVAL.
-  svc.note_transmit_delivered(t);
-  assert!(
-    svc.poll_transmit(t, &mut out).unwrap().is_none(),
-    "the 2nd rename goodbye must NOT burst in the same tick — it is spaced out"
-  );
-  // After the interval the 2nd send is due.
-  let t2 = t.advance(1000);
-  assert!(
-    svc.poll_transmit(t2, &mut out).unwrap().is_some(),
-    "the spaced 2nd rename goodbye is due after RENAME_GOODBYE_INTERVAL"
-  );
-}
-
-/// a rename goodbye's resend budget is spent ONLY on a CONFIRMED send. An
-/// all-family-busy send (`note_transmit_result(false)`) must NOT consume it — the
-/// withdrawal is re-armed and retried until a real send reaches the link, so a
-/// transiently-busy transport cannot silently lose the old-name withdrawal.
-#[test]
-fn rename_goodbye_retained_on_failed_send() {
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
-  svc.goodbye.mark_instance();
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  let t = FakeInstant::zero().advance(500);
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc.handle_timeout(t).unwrap(); // rename → first goodbye due at t
-
-  let mut out = std::vec![0u8; 4096];
-  // Far MORE busy (failed) send attempts than RENAME_GOODBYE_SENDS (2), each spaced
-  // past RENAME_GOODBYE_INTERVAL. Under confirm-on-send NONE consumes the budget,
-  // so the withdrawal is still pending every round. (Spending at poll time — the
-  // bug — would exhaust the 2-send budget after two polls and drop it, and the
-  // third poll would return None.)
-  let mut now = t;
-  for _ in 0..4 {
-    assert!(
-      svc.poll_transmit(now, &mut out).unwrap().is_some(),
-      "the rename goodbye must survive busy (failed) sends, not be consumed by them"
-    );
-    svc.note_transmit_result(now, false); // all families busy → not delivered
-    now = now.advance(1000); // past RENAME_GOODBYE_INTERVAL
-  }
-  // A CONFIRMED send finally spends one of the budget and advances the withdrawal.
-  assert!(svc.poll_transmit(now, &mut out).unwrap().is_some());
-  svc.note_transmit_delivered(now);
-}
-
-/// a transient too-small buffer must NOT silently drop the rename
-/// goodbye — it surfaces BufferTooSmall (peek-then-pop) and a later larger
-/// buffer still emits the old-instance withdrawal.
-#[test]
-fn rename_goodbye_preserved_on_too_small_buffer() {
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
-  svc.goodbye.mark_instance();
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  let t = FakeInstant::zero().advance(500);
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc.handle_timeout(t).unwrap();
-
-  let mut tiny = [0u8; 4];
-  let err = svc.poll_transmit(t, &mut tiny);
-  assert!(
-    matches!(err, Err(crate::error::TransmitError::BufferTooSmall(_))),
-    "a too-small buffer must surface BufferTooSmall, got {err:?}"
-  );
-  // The withdrawal is preserved — a larger buffer still emits it.
-  let mut big = std::vec![0u8; 4096];
-  assert!(
-    svc.poll_transmit(t, &mut big).unwrap().is_some(),
-    "the rename goodbye must survive a transient too-small buffer"
-  );
-}
+// NOTE: the Service-side rename-goodbye DRAIN tests (spaced resends,
+// retain-on-failed-send, too-small-buffer preservation) were removed with the
+// Service `poll_transmit` rename-goodbye path. That loss-resilience machinery now
+// lives in the endpoint's withdrawal pump (the renamed-away old name is a
+// DETACHED `WithdrawalItem`); it is exercised by the endpoint withdrawal tests in
+// `endpoint.rs` (per-family debt, retain-on-busy, encode-failure scan progress,
+// ceiling). The Service's sole remaining rename-goodbye responsibility — handing
+// off the OLD name's records + ownership — is covered by
+// `conflict_rename_hands_off_old_announced_name` and
+// `rename_handoff_withdraws_only_advertised_instance_records` above/below.
 
 /// a link-local host A is scope-ambiguous — the same raw address on
 /// a different interface is a real conflict — so it must surface a HostConflict
@@ -4222,78 +4103,15 @@ fn poll_transmit_question_response_surfaces_buffer_too_small() {
   panic!("expected the question response to surface BufferTooSmall on a header-only buffer");
 }
 
+/// After a rename, the OLD name's goodbye is an INDEPENDENT detached item (handed
+/// off + enqueued on the endpoint), so a later teardown `withdrawal_snapshot`
+/// captures ONLY the CURRENT (re-announced) name — it no longer carries the old
+/// name. This is the post-Commit-2 shape of the old
+/// `withdrawal_snapshot_during_rename_captures_old_and_current` test: the two
+/// names are now two independent items (handoff for old, snapshot for current),
+/// not one combined snapshot.
 #[test]
-fn rename_goodbye_burst_exhausts_and_clears_pending() {
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
-  svc.goodbye.ptr = true; // the old name advertised its PTR
-
-  // Losing §8.2 tiebreak (peer SRV port 9999 > ours 631) → rename.
-  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut sbuf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&sbuf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  let mut now = FakeInstant::zero().advance(500);
-  svc.handle_timeout(now).unwrap();
-  assert!(
-    svc.name().as_str().contains("-1"),
-    "service should have renamed"
-  );
-
-  // Drain the whole rename-goodbye burst: each poll emits one withdrawal and
-  // decrements the burst; the deadline re-arms it until the count reaches 0,
-  // which clears `pending_rename_goodbye`.
-  let mut out = std::vec![0u8; 4096];
-  let mut emitted = 0usize;
-  for _ in 0..20 {
-    now = now.advance(2000);
-    svc.handle_timeout(now).unwrap();
-    if let Ok(Some(_)) = svc.poll_transmit(now, &mut out) {
-      emitted += 1;
-      // The burst is spent in note_transmit_result's RenameGoodbye confirm arm.
-      svc.note_transmit_result(now, true);
-    }
-    if svc.pending_rename_goodbye.is_none() {
-      break;
-    }
-  }
-  assert!(
-    emitted >= 1,
-    "the rename goodbye must be emitted at least once"
-  );
-  assert!(
-    svc.pending_rename_goodbye.is_none(),
-    "the burst must clear pending_rename_goodbye once exhausted"
-  );
-}
-
-/// `withdrawal_snapshot` taken DURING a still-draining
-/// conflict-rename goodbye must capture BOTH the OLD instance name's goodbye AND
-/// the CURRENT (re-announced) instance + host ownership — NOT just the old name.
-///
-/// Drive a real Service through a §8.2 losing tiebreak (renames `myprinter` →
-/// `myprinter-1`, sets `pending_rename_goodbye` for the OLD name and
-/// `reset_instance`s the latch), then simulate the renamed name's confirmed
-/// re-announce by re-latching its instance ownership (`mark_instance`, exactly
-/// what a delivered announce does). With the rename goodbye STILL pending, the
-/// snapshot must carry: `rename = Some(old `myprinter` records, instance-only)`
-/// AND `owned` with the current name's instance bits AND `host_a` with the
-/// host address that survived the rename. The earlier behaviour returned ONLY
-/// the old name (instance-only, empty host), leaking the re-announced records.
-#[test]
-fn withdrawal_snapshot_during_rename_captures_old_and_current() {
+fn withdrawal_snapshot_after_rename_captures_only_current() {
   let mut svc = make_service(120);
   svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
   // The original name `myprinter` was announced (instance records + its host A).
@@ -4324,10 +4142,30 @@ fn withdrawal_snapshot_during_rename_captures_old_and_current() {
     svc.name().as_str().contains("-1"),
     "service should have renamed to `myprinter-1`"
   );
-  assert!(
-    svc.pending_rename_goodbye.is_some(),
-    "the rename must queue a goodbye for the OLD announced name"
+
+  // The rename installs a one-shot handoff for the OLD name; the driver would take
+  // it and enqueue it as the endpoint's detached item. Take it here so the rest of
+  // the test models the post-handoff state.
+  let RenameGoodbyeHandoff {
+    records: old_records,
+    owned: old_owned,
+  } = svc
+    .take_rename_goodbye_handoff()
+    .expect("the rename hands off the OLD announced name's goodbye");
+  assert_eq!(
+    old_records.instance().as_str(),
+    "myprinter._ipp._tcp.local.",
+    "the handoff carries the OLD instance name"
   );
+  assert!(
+    old_owned.ptr() && old_owned.srv() && old_owned.txt(),
+    "the OLD name's advertised instance records are handed off"
+  );
+  assert!(
+    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
+    "the OLD-name handoff is instance-only (a rename never withdraws host addrs)"
+  );
+
   // The rename cleared the instance latch (the new name has not announced yet),
   // but the host address survives (the host name is invariant across a rename).
   assert!(
@@ -4343,47 +4181,26 @@ fn withdrawal_snapshot_during_rename_captures_old_and_current() {
   // back on the wire (a delivered announce re-latches the instance ownership).
   svc.goodbye.mark_instance();
 
-  // Snapshot while the rename goodbye is STILL pending: must capture BOTH names.
+  // A teardown snapshot now captures ONLY the CURRENT (re-announced) name — the
+  // OLD name is already its own detached item.
   let snap = svc.withdrawal_snapshot();
-
-  // Current (re-announced) name: records = `myprinter-1`, instance bits set,
-  // host address retained.
   assert!(
     snap.records.instance().as_str().contains("-1"),
-    "the snapshot's CURRENT records must be the re-announced `myprinter-1`"
+    "the snapshot's records must be the re-announced `myprinter-1`"
   );
   assert!(
     snap.owned.ptr() && snap.owned.srv() && snap.owned.txt(),
-    "the CURRENT name's confirmed instance records must be captured"
+    "the CURRENT name's confirmed instance records are captured"
   );
   assert!(
     snap.host_a.contains(&host_addr),
-    "the CURRENT (still-owned) host A address must be captured for withdrawal"
+    "the CURRENT (still-owned) host A address is captured for withdrawal"
   );
 
-  // OLD name: rename = Some, records = `myprinter`, instance-only ownership.
-  let (old_records, old_owned) = snap
-    .rename
-    .as_ref()
-    .expect("the in-flight rename goodbye for the OLD name must be captured");
-  assert_eq!(
-    old_records.instance().as_str(),
-    "myprinter._ipp._tcp.local.",
-    "the rename capture must carry the OLD instance name"
-  );
+  // The handoff was one-shot — already consumed above, so a second take is empty.
   assert!(
-    old_owned.ptr() && old_owned.srv() && old_owned.txt(),
-    "the OLD name's advertised instance records must be captured for withdrawal"
-  );
-  assert!(
-    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
-    "a rename never withdraws host addrs — the OLD-name capture is instance-only"
-  );
-
-  // The pending rename goodbye was CONSUMED exactly once by the snapshot.
-  assert!(
-    svc.pending_rename_goodbye.is_none(),
-    "withdrawal_snapshot must take() the pending rename goodbye"
+    svc.take_rename_goodbye_handoff().is_none(),
+    "the rename handoff is consumed exactly once"
   );
 }
 
@@ -4867,67 +4684,8 @@ fn withdrawal_snapshot_of_never_announced_service_is_empty() {
   );
 }
 
-#[test]
-fn withdrawal_snapshot_of_pending_rename_goodbye_captures_old_name_in_rename_field() {
-  // When a rename is in-flight, withdrawal_snapshot() must capture the queued
-  // OLD-name goodbye in the `rename` field (instance-only, no host addresses)
-  // and clear pending_rename_goodbye.
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
-  // Simulate that the old name had its PTR announced.
-  svc.goodbye.ptr = true;
-
-  // Force a rename by injecting a tiebreak-losing probe conflict.
-  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut sbuf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&sbuf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc
-    .handle_timeout(FakeInstant::zero().advance(500))
-    .unwrap();
-  assert!(
-    svc.pending_rename_goodbye.is_some(),
-    "rename must install a pending_rename_goodbye"
-  );
-
-  let snap = svc.withdrawal_snapshot();
-
-  // The OLD name is now carried in the dedicated `rename` field (instance-only).
-  let (old_records, old_owned) = snap
-    .rename
-    .as_ref()
-    .expect("the in-flight rename goodbye must be captured in `rename`");
-  assert!(old_owned.ptr(), "rename capture must own the old PTR");
-  assert_eq!(
-    old_records.instance().as_str(),
-    "myprinter._ipp._tcp.local.",
-    "rename capture must carry the OLD instance name"
-  );
-  assert!(
-    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
-    "the rename capture is instance-only (a rename never withdraws host addrs)"
-  );
-  // The rename reset the CURRENT instance latch and the new name has not
-  // re-announced in this scenario, so the current `owned` is empty here.
-  assert!(
-    !snap.owned.ptr() && !snap.owned.srv() && !snap.owned.txt(),
-    "the reset current-name latch carries no instance records yet"
-  );
-  // The pending rename goodbye must have been consumed exactly once.
-  assert!(
-    svc.pending_rename_goodbye.is_none(),
-    "withdrawal_snapshot must take pending_rename_goodbye"
-  );
-}
+// NOTE: the old `withdrawal_snapshot_of_pending_rename_goodbye_captures_old_name_in_rename_field`
+// asserted the deleted `WithdrawalSnapshot.rename` field. Post-Commit-2 the old
+// name is handed off as its own detached item, so `withdrawal_snapshot` captures
+// only the CURRENT name — covered by `withdrawal_snapshot_after_rename_captures_only_current`
+// (snapshot side) and `conflict_rename_hands_off_old_announced_name` (handoff side).
