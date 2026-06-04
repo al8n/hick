@@ -193,9 +193,11 @@ pub(crate) fn write_probe(records: &ServiceRecords, out: &mut [u8]) -> Result<us
     records.port(),
     records.host(),
   )?;
-  // TXT — collect segments into a Vec to avoid lifetime issues with the closure
-  let txt: std::vec::Vec<std::vec::Vec<u8>> = records.txt_segments().map(|s| s.to_vec()).collect();
-  b.push_txt_authority(records.instance(), records.ttl_secs(), &txt)?;
+  b.push_txt_authority(
+    records.instance(),
+    records.ttl_secs(),
+    records.txt_segments(),
+  )?;
   for a in records.a_addrs_slice() {
     b.push_a_authority(records.host(), records.ttl_secs(), *a)?;
   }
@@ -282,8 +284,12 @@ pub(crate) fn write_announce(
     true,
   )?;
   // TXT — unique record: set cache-flush bit.
-  let txt: std::vec::Vec<std::vec::Vec<u8>> = records.txt_segments().map(|s| s.to_vec()).collect();
-  b.push_txt_answer(records.instance(), records.ttl_secs(), &txt, true)?;
+  b.push_txt_answer(
+    records.instance(),
+    records.ttl_secs(),
+    records.txt_segments(),
+    true,
+  )?;
   // A records (one per address) — unique: set cache-flush bit.
   for a in records.a_addrs_slice() {
     b.push_a_answer(records.host(), records.ttl_secs(), *a, true)?;
@@ -386,8 +392,7 @@ pub(crate) fn write_legacy_response(
     records.host(),
     false,
   )?;
-  let txt: std::vec::Vec<std::vec::Vec<u8>> = records.txt_segments().map(|s| s.to_vec()).collect();
-  b.push_txt_answer(records.instance(), ttl, &txt, false)?;
+  b.push_txt_answer(records.instance(), ttl, records.txt_segments(), false)?;
   for a in records.a_addrs_slice() {
     b.push_a_answer(records.host(), ttl, *a, false)?;
   }
@@ -701,11 +706,14 @@ where
   {
     scratch.clear();
     write_canonical_txt(records.txt_segments(), &mut scratch);
-    let txt: std::vec::Vec<std::vec::Vec<u8>> =
-      records.txt_segments().map(|s| s.to_vec()).collect();
     if !hint_matches(ResourceType::Txt, &scratch) {
       // TXT — unique record: set cache-flush bit.
-      b.push_txt_answer(records.instance(), records.ttl_secs(), &txt, true)?;
+      b.push_txt_answer(
+        records.instance(),
+        records.ttl_secs(),
+        records.txt_segments(),
+        true,
+      )?;
       emitted.txt = true;
     }
   }
