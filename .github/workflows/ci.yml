@@ -48,6 +48,8 @@ jobs:
       - run: cargo clippy -p mdns-proto --no-default-features -- -D warnings
       - run: cargo clippy -p mdns-proto --no-default-features --features alloc -- -D warnings
       - run: cargo clippy -p mdns-proto --no-default-features --features heapless -- -D warnings
+      # Observability feature legs: verify tracing + metrics + stats compile clean.
+      - run: cargo clippy --workspace --features tracing,metrics,stats -- -D warnings
 
   # Native compile coverage on the other two tier-1 host families so the
   # platform `cfg`s (Apple `target_vendor`, Windows) and the `hick-udp/build.rs`
@@ -111,6 +113,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p hick-smoltcp -p hick-embassy --target thumbv7em-none-eabihf
       - run: cargo check -p hick-trace --features stats --target thumbv7em-none-eabihf
+      # Verify defmt + stats compile together on embedded target.
+      - run: cargo check -p hick-smoltcp -p hick-embassy --features defmt,stats --target thumbv7em-none-eabihf
       # The `mdns-proto` no_std + alloc tier must also build for wasm32 (claimed in
       # its feature-tier table); the thumbv7em check above does not exercise it.
       - run: cargo check -p mdns-proto --no-default-features --features alloc --target wasm32-unknown-unknown
@@ -138,6 +142,18 @@ jobs:
           tool: cargo-hack
       - run: cargo hack build -p mdns-proto --each-feature
       - run: cargo hack test -p mdns-proto --each-feature
+
+  # Exercise the tracing + stats feature legs in tests so the counters and
+  # subscriber wiring are verified on every CI run.
+  test-observability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p mdns-proto --features tracing,stats
+      - run: cargo test -p mdns-proto --all-features
+      - run: cargo test -p hick-reactor --features stats
 
   miri:
     runs-on: ubuntu-latest

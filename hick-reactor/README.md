@@ -92,7 +92,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 - `tokio` *(default)* — `tokio` runtime via `agnostic-net`.
 - `smol` — `smol` runtime.
-- `tracing` — forward `tracing` spans/events from the driver and the proto core.
+- `tracing` — forward structured `tracing` spans/events from the driver and the proto core.
+- `stats` — enable `no_std`-safe atomic counters; read a snapshot via `endpoint.stats()`.
+- `metrics` — bridge counters to the [`metrics`] facade (Prometheus/StatsD). Implies `stats`.
+
+## Observability
+
+### `tracing`
+
+Enable `features = ["tracing"]` and install a subscriber. The driver emits
+`tracing` events during socket I/O, protocol state transitions, and errors.
+
+### `stats` and `metrics`
+
+Enable `features = ["stats"]` and call `endpoint.stats()` to obtain a
+`hick_trace::stats::StatsSnapshot`:
+
+```rust,ignore
+let snap = endpoint.stats();
+println!("packets_rx={} queries_active={}", snap.packets_rx, snap.queries_active);
+```
+
+Enable `features = ["metrics"]` to additionally forward every counter/gauge
+update to the [`metrics`] facade automatically.
 
 ## The hick family
 
@@ -121,6 +143,7 @@ Copyright (c) 2025 Al Liu.
 [`hick-smoltcp`]: https://crates.io/crates/hick-smoltcp
 [`hick-embassy`]: https://crates.io/crates/hick-embassy
 [`agnostic-net`]: https://crates.io/crates/agnostic-net
+[`metrics`]: https://crates.io/crates/metrics
 [HashiCorp's mdns]: https://github.com/hashicorp/mdns
 [Github-url]: https://github.com/al8n/hick/
 [CI-url]: https://github.com/al8n/hick/actions/workflows/ci.yml

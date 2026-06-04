@@ -48,8 +48,14 @@ thin layers over this crate. Most applications want one of those, or the
 | `heapless` | `no_std`, fixed-capacity collections, no allocator |
 | *(none)* | bare-metal `no_std`, no heap at all |
 
-Other features: `slab` *(default)* — slab-backed state pools; `tracing` —
-opt-in instrumentation.
+Other features:
+
+| Feature | Description |
+|---------|-------------|
+| `slab` *(default)* | Slab-backed state pools for the protocol machines. |
+| `tracing` | Emit structured `tracing` events/spans internally (queries, cache, probing, conflicts). |
+| `stats` | Enable `no_std`-safe atomic counters; expose a snapshot via `endpoint.stats()`. Requires `alloc`. |
+| `metrics` | Bridge counters to the [`metrics`] facade (Prometheus/StatsD). Implies `stats`. Requires `alloc`. |
 
 ## Installation
 
@@ -63,6 +69,43 @@ mdns-proto = { version = "0.5", default-features = false, features = ["alloc"] }
 # bare no_std (no allocator):
 mdns-proto = { version = "0.5", default-features = false }
 ```
+
+## Observability
+
+### `tracing`
+
+Enable `mdns-proto = { …, features = ["tracing"] }`. The state machine emits
+structured `tracing` events (at `DEBUG` / `INFO` / `WARN`) during probing,
+conflict resolution, cache inserts/evictions, query state transitions, and
+service registration. Wire a subscriber in your application:
+
+```rust,ignore
+tracing_subscriber::fmt().init();
+```
+
+### `stats` — atomic counters
+
+Enable `features = ["stats"]` (requires `alloc`). `Endpoint::stats()` returns
+a `hick_trace::stats::StatsSnapshot`:
+
+```rust,ignore
+let snap = endpoint.stats();
+println!("packets_rx={} cache_size={}", snap.packets_rx, snap.cache_size);
+```
+
+`StatsSnapshot` is a plain `Copy` struct of `u64` fields. Counters include
+`packets_rx/tx`, `bytes_rx/tx`, `packets_dropped`, `parse_errors`,
+`questions_rx`, `answers_rx/collected`, `cache_inserts/refreshes/evictions/
+expirations`, `queries_started/done/timeout`, `services_registered/
+established`, `conflicts`, `renames`, `responses_tx`, `probes_tx`,
+`announcements_tx`, `goodbyes_tx`, and gauges `cache_size`, `queries_active`,
+`services_active`.
+
+### `metrics`
+
+Enable `features = ["metrics"]` (implies `stats`; requires `alloc`). Every
+counter/gauge update is forwarded to the [`metrics`] facade so Prometheus,
+StatsD, or any other exporter receives the data automatically.
 
 ## The hick family
 
@@ -86,6 +129,7 @@ Copyright (c) 2025 Al Liu.
 [`hick-smoltcp`]: https://crates.io/crates/hick-smoltcp
 [`hick-embassy`]: https://crates.io/crates/hick-embassy
 [`quinn-proto`]: https://crates.io/crates/quinn-proto
+[`metrics`]: https://crates.io/crates/metrics
 [hick]: https://github.com/al8n/hick
 [RFC 6762]: https://www.rfc-editor.org/rfc/rfc6762
 [RFC 6763]: https://www.rfc-editor.org/rfc/rfc6763

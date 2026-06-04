@@ -74,6 +74,37 @@ async fn mdns_task(
 }
 ```
 
+## Feature flags
+
+| Feature | Description |
+|---------|-------------|
+| `tracing` | Forward structured `tracing` events from `mdns-proto` and `hick-smoltcp` (no-op on bare-metal without a subscriber). |
+| `stats` | Enable `no_std`-safe atomic counters; read a snapshot via `state.stats()`. |
+| `metrics` | Bridge counters to the [`metrics`] facade. Implies `stats`. |
+| `defmt` | Emit `defmt` log events — the idiomatic choice for embassy bare-metal targets. |
+
+## Observability
+
+For embassy targets the recommended logging path is `defmt`:
+
+```toml
+hick-embassy = { version = "0.1", features = ["defmt", "stats"] }
+```
+
+Enable `defmt` to have the driver emit structured log events through the
+`defmt` framework alongside embassy's own logging.
+
+Enable `stats` and call `state.stats()` to obtain a
+`hick_trace::stats::StatsSnapshot`:
+
+```rust,ignore
+let snap = state.stats();
+// snap.packets_rx, snap.services_active, snap.cache_size, etc.
+```
+
+The `tracing` feature is available but is a no-op on bare-metal targets that
+do not set up a `tracing` subscriber.
+
 ## Design
 
 - **Single-executor `!Send`**: no `Arc`, no atomics. `MdnsState` holds the engine
@@ -109,6 +140,7 @@ Copyright (c) 2025 Al Liu.
 [embassy]: https://embassy.dev
 [`embassy-net`]: https://crates.io/crates/embassy-net
 [`embassy-time`]: https://crates.io/crates/embassy-time
+[`metrics`]: https://crates.io/crates/metrics
 [Github-url]: https://github.com/al8n/hick/
 [CI-url]: https://github.com/al8n/hick/actions/workflows/ci.yml
 [codecov-url]: https://app.codecov.io/gh/al8n/hick/
