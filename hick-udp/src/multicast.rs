@@ -1175,6 +1175,55 @@ mod tests {
     );
   }
 
+  /// Recovery half of issue #2 ("Weird log on `windows` and `macos`"): after an
+  /// oversized datagram is rejected, the socket must NOT be wedged — the very
+  /// next in-bounds datagram is received intact. The old monolith spun /
+  /// ERROR-spammed on the rejected read; the receive path must instead drop the
+  /// bad datagram and keep serving.
+  #[test]
+  fn recv_with_meta_recovers_after_oversized() {
+    use std::{net::UdpSocket as StdUdp, os::fd::AsRawFd};
+
+    // Retry a non-blocking read past a brief loopback-delivery race.
+    fn recv_settled(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<RecvMeta> {
+      let mut result = recv_with_meta(fd, buf, true);
+      for _ in 0..100 {
+        match &result {
+          Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            result = recv_with_meta(fd, buf, true);
+          }
+          _ => break,
+        }
+      }
+      result
+    }
+
+    let recv = StdUdp::bind("127.0.0.1:0").unwrap();
+    recv.set_nonblocking(true).unwrap();
+    let addr = recv.local_addr().unwrap();
+    let send = StdUdp::bind("127.0.0.1:0").unwrap();
+    let mut buf = [0u8; 64];
+
+    // 1) Oversized datagram (2048 > 64-byte buffer) → rejected as InvalidData.
+    send.send_to(&vec![0xABu8; 2048], addr).unwrap();
+    assert_eq!(
+      recv_settled(recv.as_raw_fd(), &mut buf)
+        .expect_err("oversized must be rejected")
+        .kind(),
+      std::io::ErrorKind::InvalidData,
+    );
+
+    // 2) The socket is NOT wedged: a subsequent in-bounds datagram is received
+    //    intact, proving the receive path keeps serving after the drop.
+    let normal = [0x42u8; 32];
+    send.send_to(&normal, addr).unwrap();
+    let meta = recv_settled(recv.as_raw_fd(), &mut buf)
+      .expect("normal datagram must be received after an oversized drop");
+    assert_eq!(meta.len(), normal.len(), "received length must match");
+    assert_eq!(&buf[..meta.len()], &normal, "received bytes must match");
+  }
+
   #[cfg(unix)]
   #[test]
   #[allow(unsafe_code)]
