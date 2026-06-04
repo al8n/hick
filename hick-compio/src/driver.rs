@@ -593,15 +593,28 @@ impl State {
             break;
           }
         }
+        // Route by kind: `push_update` forwards terminals to the reserved slot
+        // and coalesces non-terminals into the bounded ring.
+        let is_terminal = upd.is_conflict() || upd.is_host_conflict();
         if let Some(ctx) = self.services.get(&h) {
-          // Route by kind: `push_update` forwards terminals to the reserved slot
-          // and coalesces non-terminals into the bounded ring.
           ctx.mailbox.borrow_mut().push_update(upd);
         }
         // Wake on every drained proto update regardless of whether coalescing
         // dropped it, so a parked `Service::next` still re-checks state. This
         // matches the pre-coalescing wake semantics.
         pushed_any = true;
+        // A terminal emitted DIRECTLY by the proto state machine (an unresolvable
+        // §9 conflict, or the host name claimed during probing) RETIRES the
+        // service, exactly like the rebrand-collision path above: begin the
+        // endpoint-owned §10.1 withdrawal so the ctx/route are GC'd and the proto
+        // stops serving, instead of leaving a zombie live — still answering
+        // queries, with `Service::next` reporting end-of-stream — until the caller
+        // drops the handle. The handle-owned mailbox outlives the ctx,
+        // so the terminal still reaches the host after the completion GC.
+        if is_terminal {
+          self.begin_service_withdrawal(h, now);
+          break;
+        }
       }
     }
     pushed_any
@@ -3327,6 +3340,148 @@ mod tests {
     recs_r.add_a([192, 168, 1, 10].into());
     s.test_register_service(ServiceSpec::new(recs_r), t)
       .expect("replacement R must register under A's old name once the withdrawal completes");
+  }
+
+  /// a terminal emitted DIRECTLY by the proto state machine —
+  /// here a `HostConflict` (a peer claimed our host name with a different address,
+  /// RFC 6762 §9) — must RETIRE the service through the SAME path as a synthesized
+  /// rename-collision Conflict: deliver the terminal into the handle-owned mailbox,
+  /// begin the endpoint-owned §10.1 withdrawal (so the proto stops serving), and GC
+  /// the ctx UNCONDITIONALLY once the withdrawal completes. Before the fix a
+  /// proto-emitted terminal was only pushed into the mailbox: `errored` was never
+  /// set and the withdrawal never began, so `Service::next` reported end-of-stream
+  /// while the ctx/route stayed live (still answering queries) until the handle
+  /// dropped.
+  #[test]
+  fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
+    use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use mdns_proto::{
+      Name, ServiceRecords, ServiceSpec, WithdrawalSend,
+      wire::{Header, MessageBuilder},
+    };
+
+    use crate::socket::RecvMeta;
+
+    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+    s.local_subnets = vec![(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)), 24)];
+    s.bound_interface = 1;
+    let now = std::time::Instant::now();
+
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("printer.local.").unwrap();
+    let mut recs = ServiceRecords::new(stype, inst, host.clone(), 631, 120);
+    recs.add_a([192, 168, 1, 10].into());
+    let handle = s
+      .test_register_service(ServiceSpec::new(recs), now)
+      .unwrap();
+    let mailbox = Rc::clone(&s.services.get(&handle).unwrap().mailbox);
+
+    fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
+      loop {
+        match s.poll_one_transmit(t, buf) {
+          Some((_, _, TransmitOrigin::Service(h))) => s.note_service_transmit_result(h, t, true),
+          Some(_) => {}
+          None => break,
+        }
+      }
+    }
+
+    // Drive the service to Established (advertising its host A record), so the
+    // host conflict hits a SERVING service with a non-empty withdrawal snapshot.
+    let mut buf = [0u8; 1500];
+    let mut t = now;
+    let mut established = false;
+    for _ in 0..60 {
+      t += Duration::from_millis(300);
+      s.fire_timeouts(t);
+      pump_transmits(&mut s, t, &mut buf);
+      s.push_service_updates(t);
+      while let Some(u) = mailbox.borrow_mut().drain_for_test() {
+        if matches!(u, ServiceUpdate::Established) {
+          established = true;
+        }
+      }
+      if established {
+        break;
+      }
+    }
+    assert!(
+      established,
+      "service must reach Established before the host conflict"
+    );
+
+    // A peer claims our host name with a DIFFERENT address (10.0.0.99): a genuine
+    // §9 host conflict. The proto does NOT auto-rename a host conflict — it emits
+    // `ServiceUpdate::HostConflict` via `poll()`.
+    let conflict = {
+      let mut cbuf = [0u8; 512];
+      let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
+      b.push_a_authority(&host, 120, Ipv4Addr::new(10, 0, 0, 99))
+        .unwrap();
+      let n = b.finish().unwrap();
+      cbuf[..n].to_vec()
+    };
+    let peer = RecvMeta::new(
+      SocketAddr::from(([192, 168, 1, 200], 5353)),
+      IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)),
+      1,
+      Some(255), // on-link
+      None,
+      conflict.len(),
+    );
+
+    // Feed the conflict; `push_service_updates` drains the proto's HostConflict and
+    // (with the fix) begins the withdrawal — `errored` flips true.
+    let mut retired = false;
+    for _ in 0..40 {
+      t += Duration::from_millis(300);
+      s.fire_timeouts(t);
+      s.handle_datagram(&peer, &conflict);
+      pump_transmits(&mut s, t, &mut buf);
+      s.push_service_updates(t);
+      if s.services.get(&handle).map(|c| c.errored).unwrap_or(false) {
+        retired = true;
+        break;
+      }
+    }
+    assert!(
+      retired,
+      "a proto-emitted HostConflict must begin the endpoint-owned withdrawal (errored)"
+    );
+
+    // The terminal HostConflict reached the handle-owned mailbox's reserved slot.
+    let mut saw_host_conflict = false;
+    while let Some(u) = mailbox.borrow_mut().drain_for_test() {
+      if u.is_host_conflict() {
+        saw_host_conflict = true;
+      }
+    }
+    assert!(
+      saw_host_conflict,
+      "the HostConflict terminal must reach the handle-owned mailbox"
+    );
+
+    // Drive the withdrawal to completion (no bound family → both Retry → force-
+    // complete at the 2 s anti-pin ceiling); the ctx must be GC'd UNCONDITIONALLY.
+    let mut scratch = vec![0u8; 4096];
+    let mut gced = false;
+    for _ in 0..64 {
+      t += Duration::from_millis(250);
+      while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
+        s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+      }
+      s.drain_completed_withdrawals(t);
+      if !s.services.contains_key(&handle) {
+        gced = true;
+        break;
+      }
+    }
+    assert!(
+      gced,
+      "the withdrawn service ctx must be GC'd after the §10.1 goodbye completes"
+    );
   }
 
   /// a query whose question can't be encoded into `max_payload` (here

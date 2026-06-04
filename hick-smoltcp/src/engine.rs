@@ -1096,8 +1096,24 @@ where
             break;
           }
         }
+        // A terminal emitted DIRECTLY by the proto state machine (an unresolvable
+        // §9 conflict, or the host name claimed during probing) RETIRES the
+        // service, exactly like the rebrand-collision path above: queue the
+        // terminal, mark the slot errored so every pump skips it, begin the
+        // endpoint-owned §10.1 withdrawal (which holds the route and drives the
+        // goodbye resend, GC'ing the slot on completion), and stop draining.
+        // Without this a proto-emitted terminal left the smoltcp route registered
+        // and still answered/driven after the caller saw the terminal.
+        let is_terminal = update.is_conflict() || update.is_host_conflict();
         if let Some(slot) = self.services.get_mut(&handle) {
           slot.push_update(update);
+          if is_terminal {
+            slot.errored = true;
+          }
+        }
+        if is_terminal {
+          self.begin_service_withdrawal(handle, now);
+          break;
         }
       }
     }
@@ -1864,6 +1880,21 @@ mod tests {
     buf[..n].to_vec()
   }
 
+  /// Build a probe-shaped message carrying a CONFLICTING A authority record for
+  /// `host_str` (a peer claiming our host name with a DIFFERENT address). From an
+  /// mDNS peer this routes a §9 host conflict; the proto does NOT auto-rename a host
+  /// conflict — it queues a `ServiceUpdate::HostConflict`.
+  fn build_conflict_a_authority(host_str: &str, addr: [u8; 4]) -> Vec<u8> {
+    use mdns_proto::wire::{Header, MessageBuilder};
+    let mut buf = [0u8; 512];
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    let name = Name::try_from_str(host_str).unwrap();
+    b.push_a_authority(&name, 120, Ipv4Addr::from(addr))
+      .unwrap();
+    let n = b.finish().unwrap();
+    buf[..n].to_vec()
+  }
+
   // NOTE: the per-family rename-goodbye regressions
   // (active_rename_goodbye_keeps_a_busy_family_owed_not_global_budget, its
   // assert_rename_goodbye_keeps_busy_family_owed helper, and
@@ -2067,6 +2098,97 @@ mod tests {
       !reacted,
       "off-link unicast must NOT drive a conflict rename when no hop-limit or subnet \
        vouches for it — only link-scoped multicast is trusted by default"
+    );
+  }
+
+  /// a terminal emitted DIRECTLY by the proto state machine — here a
+  /// HostConflict (a peer claims our host name with a different address, RFC 6762
+  /// §9) — must RETIRE the smoltcp service through the SAME path as a synthesized
+  /// rename-collision Conflict: queue the terminal, mark the slot errored, begin the
+  /// endpoint-owned §10.1 withdrawal (so the route stops being driven/answered), and
+  /// GC the slot once the goodbye completes and the caller has drained the terminal.
+  /// Before the fix a proto-emitted terminal was only queued (errored stayed false,
+  /// no withdrawal), leaving a zombie route that kept answering after the caller saw
+  /// the terminal.
+  #[test]
+  fn proto_emitted_host_conflict_retires_and_gcs_the_smoltcp_service() {
+    let mut engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(83));
+    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+    let mut io = MockUdp::default();
+    let mut scratch = [0u8; 1500];
+
+    // Drive to Established (advertising test.local. -> 192.168.1.10), so the host
+    // conflict hits a SERVING service with a non-empty withdrawal snapshot.
+    let mut established = false;
+    for micros in pump_schedule() {
+      engine.pump(at(micros), &mut io, &mut scratch);
+      while let Some(u) = engine.poll_service_update(handle) {
+        established |= matches!(u, ServiceUpdate::Established);
+      }
+    }
+    assert!(
+      established,
+      "service must reach Established before the host conflict"
+    );
+
+    // A peer claims our HOST name with a DIFFERENT address: a genuine §9 host
+    // conflict. The proto emits ServiceUpdate::HostConflict via poll(), which
+    // drain_service_updates must now route through retirement.
+    let conflict = build_conflict_a_authority("test.local.", [10, 0, 0, 99]);
+    let mut t = 6_000_000i64;
+    let mut retired = false;
+    for _ in 0..16 {
+      io.inbound.push_back((
+        conflict.clone(),
+        RecvMeta {
+          src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
+          local: Some(MDNS_SOCKET_V4.ip()),
+          hop_limit: None,
+          len: 0,
+        },
+      ));
+      engine.pump(at(t), &mut io, &mut scratch);
+      t += 250_000;
+      if engine
+        .services
+        .get(&handle)
+        .map(|s| s.errored)
+        .unwrap_or(false)
+      {
+        retired = true;
+        break;
+      }
+    }
+    assert!(
+      retired,
+      "a proto-emitted HostConflict must begin the endpoint-owned withdrawal (errored)"
+    );
+
+    // The HostConflict terminal is observable by the caller (queued in the slot
+    // before GC); draining it lets the slot GC once the withdrawal completes.
+    let mut saw_host_conflict = false;
+    while let Some(u) = engine.poll_service_update(handle) {
+      saw_host_conflict |= u.is_host_conflict();
+    }
+    assert!(
+      saw_host_conflict,
+      "the HostConflict terminal must reach the caller via poll_service_update"
+    );
+
+    // Drive the withdrawal to completion; the slot must be GC'd (route freed).
+    let mut gced = false;
+    for _ in 0..64 {
+      t += 250_000;
+      engine.pump(at(t), &mut io, &mut scratch);
+      if !engine.services.contains_key(&handle) {
+        gced = true;
+        break;
+      }
+    }
+    assert!(
+      gced,
+      "the withdrawn slot must be GC'd after the §10.1 goodbye completes"
     );
   }
 
