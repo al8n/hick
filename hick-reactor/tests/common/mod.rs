@@ -35,7 +35,7 @@ impl Subscriber for AlwaysOn {
   }
 }
 
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn install() {
   let _ = dispatcher::set_global_default(Dispatch::new(AlwaysOn));
 }

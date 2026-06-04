@@ -25,7 +25,7 @@ defmt = ["dep:defmt"]
 hick-trace = { workspace = true }
 mdns-proto = { workspace = true, features = ["alloc", "slab"] }
 defmt = { workspace = true, optional = true }
-rand_core = { version = "0.10", default-features = false }
+rand_core = { workspace = true }
 smoltcp = { version = "0.13", default-features = false, features = [
   "medium-ethernet",
   "medium-ip",
@@ -40,7 +40,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
 # the host integration tests only — production builds stay no-alloc.
 smoltcp = { version = "0.13", default-features = false, features = ["alloc"] }
 # A seeded RNG for the engine tests (matches mdns-proto's own test RNG).
-rand = "0.10"
+rand = { workspace = true, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 
 [lints]
 workspace = true

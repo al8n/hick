@@ -14,7 +14,25 @@ hick-embassy = { version = "0.1", path = "hick-embassy", default-features = fals
 tracing = { version = "0.1", default-features = false }
 metrics = { version = "0.24", default-features = false }
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
-defmt = { version = "0.3", default-features = false }
+defmt = { version = "1", default-features = false }
+# Shared third-party deps. Bases are `default-features = false` (so the no_std
+# crates can use them); std crates re-add the features they need, since a
+# workspace member may add features but cannot override `default-features`.
+thiserror = { version = "2", default-features = false }
+derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
+rand = { version = "0.10", default-features = false }
+rand_core = { version = "0.10", default-features = false }
+smol_str = { version = "0.3", default-features = false }
+slab = { version = "0.4", default-features = false }
+futures = { version = "0.3", default-features = false }
+getifs = { version = "0.6" }
+libc = { version = "0.2" }
+tracing-core = { version = "0.1" }
+# ctor 1.0's `#[ctor(unsafe)]` macro emits `#[allow(unsafe_code)]`. The crates
+# keep `#![forbid(unsafe_code)]` in production builds but test-gate it (deny +
+# a local allow at the test-only ctor subscriber sites), so the unsafe-free
+# guarantee is unchanged for users.
+ctor = { version = "1" }
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"

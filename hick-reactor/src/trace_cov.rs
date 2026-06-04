@@ -36,7 +36,7 @@ impl Subscriber for AlwaysOn {
   }
 }
 
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn install() {
   // Runs once at test-binary load, before libtest spawns any test thread.
   let _ = tracing::subscriber::set_global_default(AlwaysOn);
