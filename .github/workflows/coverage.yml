@@ -49,12 +49,18 @@ jobs:
           - os: macos-latest
             gate: ""
             exclude: ""
-          # hick-embassy is no_std: its host-test build needs a critical-section
-          # impl that doesn't link with the Windows MSVC toolchain, and its
-          # coverage is already captured on the Linux/macOS legs, so skip it here.
+          # The bare-metal crates (hick-smoltcp, hick-embassy) and the hick facade
+          # (whose embassy + defmt features pull them in) reference embassy-time,
+          # critical-section, and defmt symbols whose providers only exist on an
+          # embedded target. Their host-test binaries therefore fail to link with
+          # the Windows MSVC toolchain (LNK2019 unresolved externals). cargo
+          # check / clippy don't link a final binary, which is why os-clippy
+          # passes; only the coverage job (cargo test) links test binaries and
+          # trips link.exe. Their coverage is already captured on the Linux/macOS
+          # legs, so skip all three here.
           - os: windows-latest
             gate: ""
-            exclude: "--exclude hick-embassy"
+            exclude: "--exclude hick --exclude hick-smoltcp --exclude hick-embassy"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
