@@ -166,7 +166,7 @@ fn hash_rdata(bytes: &[u8]) -> u64 {
 
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[allow(unused_imports)]
-pub(crate) use respond::multicast_dst;
+pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye};
 #[allow(unused_imports)]
 pub(crate) use schedule::{announce_deadline, probe_deadline, re_announce_deadline};
 pub use state::ServiceState;
@@ -439,6 +439,39 @@ impl GoodbyeOwnership {
   fn any_host(&self) -> bool {
     !self.a.is_empty() || !self.aaaa.is_empty()
   }
+}
+
+/// A point-in-time snapshot of everything the [`crate::Endpoint`] needs to re-encode
+/// the TTL=0 goodbye for a service being withdrawn.
+///
+/// Produced by [`Service::withdrawal_snapshot`] and consumed by the endpoint's
+/// withdrawal state machine (added in a later task). Each resend round calls the
+/// encoder with the same snapshot so the goodbye is idempotent over multiple
+/// attempts (RFC 6762 §10.1 recommends at least two sends for loss resilience).
+///
+/// The `#[cfg]` gate matches the goodbye code it supports — the goodbye path is
+/// only compiled when heap allocation is available.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+#[derive(Debug, Clone)]
+pub struct WithdrawalSnapshot {
+  /// The service records (names, port, TXT) for this withdrawal. Carried so
+  /// the encoder can re-encode PTR/SRV/TXT at TTL=0 without a live `Service`.
+  pub records: crate::records::ServiceRecords,
+  /// Which record kinds (PTR/SRV/TXT/subtypes) this service actually put on the
+  /// wire (per-record, not per-group). Mirrors the [`GoodbyeOwnership`] latch
+  /// semantics: only records that reached a peer cache need to be withdrawn.
+  /// `pub(crate)` because `EmittedRecords` is a crate-internal type; the
+  /// endpoint (same crate) reads this directly.
+  // `allow(dead_code)`: the field is read by the endpoint withdrawal state
+  // machine added in a later task; suppress the false positive here.
+  #[allow(dead_code)]
+  pub(crate) owned: respond::EmittedRecords,
+  /// Host A (IPv4) addresses this service confirmed-emitted. The endpoint will
+  /// further filter these against same-host siblings before re-encoding.
+  pub host_a: std::vec::Vec<core::net::Ipv4Addr>,
+  /// Host AAAA (IPv6) addresses this service confirmed-emitted.
+  pub host_aaaa: std::vec::Vec<core::net::Ipv6Addr>,
 }
 
 /// Service state machine. One per registered service.
@@ -994,6 +1027,52 @@ where
         buf.len(),
       ))
     })
+  }
+
+  /// Capture everything the endpoint needs to re-encode a TTL=0 goodbye for
+  /// this service without holding the [`Service`] alive.
+  ///
+  /// **Rename-goodbye priority:** if a conflict rename installed a
+  /// `pending_rename_goodbye` (the OLD instance name needs withdrawing), that
+  /// snapshot is returned instead of the current name's state, and
+  /// `pending_rename_goodbye` is taken (`= None`) — the endpoint's withdrawal
+  /// machine owns the resend loop from here. The rename-goodbye snapshot carries
+  /// the old instance's record ownership with EMPTY host addresses (a rename
+  /// never withdraws A/AAAA because the host name is unchanged).
+  ///
+  /// **Normal withdrawal:** returns a snapshot of the CURRENT confirmed-emitted
+  /// state: the current `ServiceRecords`, which record kinds (PTR/SRV/TXT/
+  /// subtypes) were actually put on the wire, and which host A/AAAA addresses
+  /// were confirmed-emitted. The endpoint will further filter host addresses
+  /// against same-host siblings before encoding the actual goodbye datagram.
+  pub fn withdrawal_snapshot(&mut self) -> WithdrawalSnapshot {
+    // Priority: take any pending rename-goodbye (old instance records only;
+    // host A/AAAA are intentionally empty — a rename never withdraws host addrs).
+    if let Some((old_records, _, old_owned)) = self.pending_rename_goodbye.take() {
+      self.rename_goodbye_deadline = None;
+      return WithdrawalSnapshot {
+        records: old_records,
+        owned: old_owned,
+        host_a: std::vec::Vec::new(),
+        host_aaaa: std::vec::Vec::new(),
+      };
+    }
+
+    // Normal case: snapshot the current goodbye-ownership latch.
+    let owned = respond::EmittedRecords::new(
+      self.goodbye.ptr,
+      self.goodbye.srv,
+      self.goodbye.txt,
+      std::vec::Vec::new(), // addresses are passed separately below
+      std::vec::Vec::new(),
+      self.goodbye.subtypes,
+    );
+    WithdrawalSnapshot {
+      records: self.records.clone(),
+      owned,
+      host_a: self.goodbye.a.clone(),
+      host_aaaa: self.goodbye.aaaa.clone(),
+    }
   }
 
   /// Take any pending conflict-rename goodbye: encode the queued

@@ -5030,3 +5030,105 @@ fn legacy_meta_response_counts_responses_tx() {
     before + 1
   );
 }
+
+// ── withdrawal_snapshot tests ─────────────────────────────────────────────────
+
+#[test]
+fn withdrawal_snapshot_of_established_service_owns_its_records() {
+  // An established (fully announced) service must snapshot PTR, SRV, TXT
+  // ownership and the host A address it advertised.
+  let mut svc = make_service(120);
+  drive_to_established(&mut svc);
+
+  let snap = svc.withdrawal_snapshot();
+
+  // PTR/SRV/TXT must all be owned after a full announcement cycle.
+  assert!(snap.owned.ptr(), "snapshot must own PTR");
+  assert!(snap.owned.srv(), "snapshot must own SRV");
+  assert!(snap.owned.txt(), "snapshot must own TXT");
+
+  // make_records adds 192.168.1.10 — it must appear in the snapshot.
+  let expected = core::net::Ipv4Addr::new(192, 168, 1, 10);
+  assert!(
+    snap.host_a.contains(&expected),
+    "snapshot host_a must contain {expected}"
+  );
+}
+
+#[test]
+fn withdrawal_snapshot_of_never_announced_service_is_empty() {
+  // A service that has not yet been announced (still in Init/Probing) has
+  // emitted nothing, so the snapshot must carry an empty owned mask and no
+  // host addresses.
+  let mut svc = make_service(120);
+  // Kick off probing (Init → Probing) but do NOT confirm any sends.
+  svc.handle_timeout(FakeInstant::zero()).unwrap();
+
+  let snap = svc.withdrawal_snapshot();
+
+  assert!(!snap.owned.ptr(), "unanounced: PTR must not be owned");
+  assert!(!snap.owned.srv(), "unannounced: SRV must not be owned");
+  assert!(!snap.owned.txt(), "unannounced: TXT must not be owned");
+  assert!(!snap.owned.subtypes(), "unannounced: subtypes must not be owned");
+  assert!(
+    snap.host_a.is_empty(),
+    "unannounced: host_a must be empty"
+  );
+  assert!(
+    snap.host_aaaa.is_empty(),
+    "unannounced: host_aaaa must be empty"
+  );
+}
+
+#[test]
+fn withdrawal_snapshot_of_pending_rename_goodbye_takes_old_name() {
+  // When a rename is in-flight, withdrawal_snapshot() must take the queued
+  // old-name snapshot (instance-only, no host addresses) and clear
+  // pending_rename_goodbye.
+  let mut svc = make_service(120);
+  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
+  // Simulate that the old name had its PTR announced.
+  svc.goodbye.ptr = true;
+
+  // Force a rename by injecting a tiebreak-losing probe conflict.
+  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut sbuf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (rec, _) = Ref::try_parse(&sbuf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
+    FakeInstant::zero(),
+  );
+  svc.handle_timeout(FakeInstant::zero().advance(500)).unwrap();
+  assert!(
+    svc.pending_rename_goodbye.is_some(),
+    "rename must install a pending_rename_goodbye"
+  );
+
+  let snap = svc.withdrawal_snapshot();
+
+  // The rename-goodbye snapshot carries the old instance's PTR ownership.
+  assert!(snap.owned.ptr(), "rename snapshot must own old PTR");
+  // Host addresses are intentionally empty for a rename goodbye.
+  assert!(
+    snap.host_a.is_empty(),
+    "rename snapshot must not carry host_a"
+  );
+  assert!(
+    snap.host_aaaa.is_empty(),
+    "rename snapshot must not carry host_aaaa"
+  );
+  // The pending rename goodbye must have been consumed.
+  assert!(
+    svc.pending_rename_goodbye.is_none(),
+    "withdrawal_snapshot must take pending_rename_goodbye"
+  );
+}

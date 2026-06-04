@@ -51,6 +51,23 @@ pub(crate) const GOODBYE_SENDS: u8 = 3;
 /// `hick-reactor::driver::GOODBYE_INTERVAL`.
 pub(crate) const GOODBYE_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Short re-attempt delay for a goodbye round that put NOTHING on the wire (every
+/// family's `send_to` failed). Much smaller than [`GOODBYE_INTERVAL`] so a
+/// transiently-undeliverable free-name goodbye is retried promptly — WITHOUT
+/// consuming a resend round and WITHOUT busy-spinning — and a positive transmit
+/// deferred behind its [`PendingGoodbye::sent_once`] barrier wakes again soon.
+/// Kept consistent with `hick-smoltcp`/`hick-reactor`'s `GOODBYE_RETRY_BACKOFF`.
+pub(crate) const GOODBYE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Hard ceiling on how long an un-sent free-name goodbye may act as a transmit
+/// barrier (see [`PendingGoodbye::sent_once`]) AND on its retention. Because Part
+/// A no longer decrements a goodbye's resend budget on a round that never reached
+/// the wire, a permanently-undeliverable (all-failing) entry would otherwise pin
+/// the goodbye queue — and block positive transmits — forever. Past this age the
+/// entry is force-cleared so it can neither block transmits nor leak. Kept
+/// consistent with `hick-smoltcp`/`hick-reactor`'s `GOODBYE_BARRIER_MAX`.
+pub(crate) const GOODBYE_BARRIER_MAX: Duration = Duration::from_secs(2);
+
 /// Per-iteration cap on the transmit pump.  Mirrors
 /// `hick-reactor::driver::MAX_SEND_CREDITS_PER_DRAIN` (64) so a misbehaving
 /// proto-state machine — or a transmit yielded for an unbound address family
@@ -270,10 +287,26 @@ pub(crate) struct QueryCtx {
 pub(crate) struct PendingGoodbye {
   /// Fully encoded TTL=0 datagram (records of the withdrawn service).
   pub(crate) data: Vec<u8>,
-  /// Remaining sends; the entry is dropped once this reaches zero.
+  /// Remaining sends; the entry is dropped once this reaches zero. Decremented
+  /// ONLY on a round that actually reached the wire (Part A) — a round in which
+  /// every family's `send_to` failed leaves this untouched.
   pub(crate) remaining: u8,
   /// Earliest wall-clock instant at which the next send may go out.
   pub(crate) next_at: StdInstant,
+  /// `false` until the FIRST round of this goodbye reaches the wire (at least one
+  /// family sent). While `false` — and before [`Self::expires_at`] — this entry
+  /// is a PENDING BARRIER: a free-name (retirement/rename) TTL=0 withdrawal that
+  /// must precede any positive-TTL transmit, so a same-name replacement under
+  /// `with_probe_unique_names(false)` cannot announce a fresh positive TTL ahead
+  /// of the stale TTL=0 and evict itself from peer caches. Set once, never cleared.
+  pub(crate) sent_once: bool,
+  /// Hard deadline after which the entry is force-cleared even if it never sent —
+  /// the anti-pin bound for both the [`Self::sent_once`] barrier and the entry's
+  /// lifetime. Set at queue time to `now + GOODBYE_BARRIER_MAX`. Because Part A
+  /// stops advancing `remaining` on a never-delivered round, this bound (not
+  /// `remaining`) is what prevents an undeliverable goodbye pinning the queue /
+  /// blocking transmits forever.
+  pub(crate) expires_at: StdInstant,
 }
 
 /// All state owned by the compio driver task. Held behind the `RefCell` in
@@ -472,6 +505,8 @@ impl State {
         data,
         remaining: GOODBYE_SENDS,
         next_at: now,
+        sent_once: false,
+        expires_at: now + GOODBYE_BARRIER_MAX,
       });
     }
 
@@ -641,6 +676,8 @@ impl State {
                   data,
                   remaining: GOODBYE_SENDS,
                   next_at: now,
+                  sent_once: false,
+                  expires_at: now + GOODBYE_BARRIER_MAX,
                 });
               }
               // The `ctx` borrow from `self.services.get_mut` above ends at the
@@ -909,11 +946,79 @@ impl State {
       }
     }
     // Wake to resend any pending TTL=0 goodbye when it comes due so the
-    // §10.1 burst completes even between recv / timer events.
+    // §10.1 burst completes even between recv / timer events. `next_at` is short
+    // (GOODBYE_RETRY_BACKOFF) after a failed round, so a deferred barrier wakes
+    // promptly. While the entry is still an un-sent barrier, also wake at its
+    // `expires_at` ceiling so a never-sendable barrier releases the deferred
+    // positive transmits no later than that bound.
     for g in &self.goodbyes {
-      best = Some(best.map_or(g.next_at, |b| b.min(g.next_at)));
+      let mut wake = g.next_at;
+      if !g.sent_once {
+        wake = wake.min(g.expires_at);
+      }
+      best = Some(best.map_or(wake, |b| b.min(wake)));
     }
     best
+  }
+
+  /// Part A — apply the post-send advancement for the goodbye at `idx`.
+  ///
+  /// `any_sent` is `true` iff at least one family's `send_to` succeeded this
+  /// round. ONLY then is the round counted: latch [`PendingGoodbye::sent_once`]
+  /// (clearing the barrier), spend one resend (`remaining -= 1`), and re-arm at
+  /// the full [`GOODBYE_INTERVAL`]. A round that reached NO family must NOT spend
+  /// the budget or push `next_at` out a full interval — re-arm at the short
+  /// [`GOODBYE_RETRY_BACKOFF`] so the §10.1 withdrawal (and any positive transmit
+  /// its barrier blocks) retries soon. Extracted so the rule is unit-testable
+  /// without sockets.
+  pub(crate) fn advance_goodbye_after_send(&mut self, idx: usize, any_sent: bool, now: StdInstant) {
+    if let Some(g) = self.goodbyes.get_mut(idx) {
+      if any_sent {
+        g.sent_once = true;
+        g.remaining = g.remaining.saturating_sub(1);
+        g.next_at = now + GOODBYE_INTERVAL;
+      } else {
+        g.next_at = now + GOODBYE_RETRY_BACKOFF;
+      }
+    }
+  }
+
+  /// GC the goodbye queue: drop fully-sent entries (`remaining == 0`) and
+  /// force-clear any entry past its `expires_at` anti-pin bound REGARDLESS of
+  /// `remaining` (a never-delivered barrier must not pin the queue / block
+  /// transmits forever now that Part A no longer spends its budget on failed
+  /// rounds). Returns the count force-cleared while still owing sends, for a
+  /// debug log at the call site.
+  pub(crate) fn gc_goodbyes(&mut self, now: StdInstant) -> usize {
+    let mut force_cleared = 0usize;
+    self.goodbyes.retain(|g| {
+      if g.expires_at <= now {
+        if g.remaining > 0 {
+          force_cleared += 1;
+        }
+        return false;
+      }
+      g.remaining > 0
+    });
+    force_cleared
+  }
+
+  /// Part B — `true` if any pending goodbye is still a barrier: it has not yet
+  /// reached the wire (`!sent_once`) AND has not passed its `expires_at` ceiling.
+  /// The run loop defers the positive-TTL transmit pump while this holds.
+  ///
+  /// The barrier is intentionally GLOBAL — ANY pending un-sent free-name goodbye
+  /// defers ALL positive transmits, not just same-name ones. This is acceptable
+  /// (and far simpler than name-scoping the proto transmit queue) because a
+  /// SENDABLE barrier clears in the same loop iteration's pre-transmit goodbye
+  /// drain, so normal operation only gains a goodbye-before-transmit ordering;
+  /// only an UN-sendable (all-failing) barrier actually defers transmits, bounded
+  /// by `expires_at`.
+  pub(crate) fn has_pending_barrier(&self, now: StdInstant) -> bool {
+    self
+      .goodbyes
+      .iter()
+      .any(|g| !g.sent_once && g.expires_at > now)
   }
 
   /// Apply §11 + self-send + `proto.handle` for one received datagram.
@@ -1133,10 +1238,32 @@ pub(crate) async fn run(
   };
 
   loop {
+    // 0. FREE-NAME GOODBYE BARRIER (pre-transmit). Before placing ANY positive-TTL
+    //    transmit this iteration, (1) attempt the due goodbyes so a SENDABLE
+    //    free-name (retirement/rename) TTL=0 withdrawal reaches the wire FIRST —
+    //    this clears such a barrier in THIS iteration — then (2) if a goodbye is
+    //    still an un-sent, unexpired barrier (`has_pending_barrier`), SKIP the
+    //    Phase-1 transmit pump so a same-name replacement registered under
+    //    `with_probe_unique_names(false)` cannot announce a fresh positive TTL
+    //    ahead of the stale TTL=0 (which would evict it from peer caches). Only an
+    //    UN-sendable (all-failing) barrier actually defers transmits, bounded by
+    //    each entry's `expires_at`; the deadline below wakes on
+    //    GOODBYE_RETRY_BACKOFF / `expires_at` so a deferred barrier retries
+    //    promptly. The post-`push_service_updates` drain (1a, below) is KEPT so a
+    //    newly-queued rename goodbye still flushes the same iteration.
+    drain_goodbye_bursts(&inner, &sock_v4, &sock_v6).await;
+    let transmit_barred = {
+      let now = StdInstant::now();
+      inner.state.borrow().has_pending_barrier(now)
+    };
+
     // 1. extract-then-await transmit pump.  Borrow only long enough to pull
     //    one datagram into `scratch`; drop the borrow before awaiting the
     //    socket send.  The self-send record runs inside a second short
     //    borrow after the send completes.
+    //
+    //    SKIPPED entirely while `transmit_barred` (a pending free-name goodbye has
+    //    not reached the wire) — see step 0.
     //
     //    Bounded by [`MAX_TRANSMIT_CREDITS_PER_PASS`] (mirrors the reactor's
     //    `MAX_SEND_CREDITS_PER_DRAIN`): when `poll_one_transmit` yields a
@@ -1148,130 +1275,136 @@ pub(crate) async fn run(
     //    select! so timers / recv can make progress, and the deadline-driven
     //    re-entry will retry.
     let mut credits = MAX_TRANSMIT_CREDITS_PER_PASS;
-    loop {
-      if credits == 0 {
-        break;
-      }
-      credits -= 1;
-      let pumped = {
-        let mut s = inner.state.borrow_mut();
-        let now = StdInstant::now();
-        s.poll_one_transmit(now, &mut scratch)
-      };
-      let Some((dst, n, origin)) = pumped else {
-        break;
-      };
-      // `mdns-proto` always hands back the IPv4 multicast group for BOTH the
-      // v4 and v6 service groups (multicast_dst()), so we cannot route
-      // multicast by the destination's address family. Detect an mDNS
-      // multicast destination and fan the SAME body out to every bound
-      // family's multicast group (RFC 6762 §6); a dual-stack endpoint then
-      // reaches both `224.0.0.251` and `ff02::fb`, and a v6-only endpoint
-      // actually transmits (instead of routing to an absent v4 socket and
-      // marking the send undelivered).
-      //
-      // Self-send credit: record ONE tracker entry per ACTUAL successful
-      // send. Take-once self-suppression consumes a single entry per matching
-      // loopback, and dual-stack fan-out yields TWO loopback copies (one per
-      // joined socket), so a successful v4+v6 send records two entries.
-      //
-      // Timestamp: capture `when` IMMEDIATELY BEFORE each `.await`. compio is
-      // completion-based — the buffer moves into the op on `.await`, so we
-      // can't stamp "at the syscall" the way the readiness-I/O reactor does
-      // inside `poll_send_to`. Stamping before the await guarantees
-      // `when <= kernel_send_time <= echo_rx_time`, keeping our own loopback
-      // inside the 1 ms Ordered match window even when task-resume latency is
-      // high. (Stamping AFTER the await — the previous bug — could push the
-      // recorded time past the kernel's rx stamp and misclassify our own
-      // announce/probe as a peer packet.)
-      let delivered = if is_mdns_multicast_dst(dst) {
-        let mut sent_any = false;
-        if let Some(s4) = sock_v4.as_ref() {
-          let when = SystemTime::now();
-          let res = s4.send_to(&scratch[..n], MDNS_V4_DST, None).await;
-          if res.is_ok() {
-            hick_trace::trace!(dst = %MDNS_V4_DST, len = n, "send_to v4");
-            let mut state = inner.state.borrow_mut();
-            crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
-            #[cfg(feature = "stats")]
-            {
-              state.stats.packets_tx(1);
-              state.stats.bytes_tx(n as u64);
-            }
-            sent_any = true;
-          } else {
-            hick_trace::debug!(dst = %MDNS_V4_DST, "send_to v4 failed");
-            #[cfg(feature = "stats")]
-            inner.state.borrow().stats.send_errors(1);
-          }
+    // Skip the whole positive-TTL pump while a free-name goodbye barrier holds
+    // (step 0). `credits` then stays at its cap, so `pump_budget_exhausted` below
+    // is `false` and the deferred barrier is rewoken by the deadline, not by a
+    // forced same-iteration re-spin.
+    if !transmit_barred {
+      loop {
+        if credits == 0 {
+          break;
         }
-        if let Some(s6) = sock_v6.as_ref() {
-          let when = SystemTime::now();
-          let res = s6.send_to(&scratch[..n], MDNS_V6_DST, None).await;
-          if res.is_ok() {
-            hick_trace::trace!(dst = %MDNS_V6_DST, len = n, "send_to v6");
-            let mut state = inner.state.borrow_mut();
-            crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
-            #[cfg(feature = "stats")]
-            {
-              state.stats.packets_tx(1);
-              state.stats.bytes_tx(n as u64);
-            }
-            sent_any = true;
-          } else {
-            hick_trace::debug!(dst = %MDNS_V6_DST, "send_to v6 failed");
-            #[cfg(feature = "stats")]
-            inner.state.borrow().stats.send_errors(1);
-          }
-        }
-        // `delivered` ⇔ at least one family reached the wire.
-        sent_any
-      } else {
-        // Unicast: pick the socket matching the destination family, single
-        // send. No socket for this family → count as failed delivery so the
-        // proto re-arms the probe / announce without advancing lifecycle
-        // state (unchanged semantics).
-        let sock = match dst {
-          core::net::SocketAddr::V4(_) => sock_v4.as_ref(),
-          core::net::SocketAddr::V6(_) => sock_v6.as_ref(),
+        credits -= 1;
+        let pumped = {
+          let mut s = inner.state.borrow_mut();
+          let now = StdInstant::now();
+          s.poll_one_transmit(now, &mut scratch)
         };
-        if let Some(s) = sock {
-          let when = SystemTime::now();
-          let res = s.send_to(&scratch[..n], dst, None).await;
-          // Record the self-send credit under a fresh short borrow so the next
-          // inbound copy of this datagram (from the loopback / multicast echo)
-          // is classified as our own.  Only record on a successful send.
-          if res.is_ok() {
-            hick_trace::trace!(dst = %dst, len = n, "send_to");
-            let mut state = inner.state.borrow_mut();
-            crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
-            #[cfg(feature = "stats")]
-            {
-              state.stats.packets_tx(1);
-              state.stats.bytes_tx(n as u64);
+        let Some((dst, n, origin)) = pumped else {
+          break;
+        };
+        // `mdns-proto` always hands back the IPv4 multicast group for BOTH the
+        // v4 and v6 service groups (multicast_dst()), so we cannot route
+        // multicast by the destination's address family. Detect an mDNS
+        // multicast destination and fan the SAME body out to every bound
+        // family's multicast group (RFC 6762 §6); a dual-stack endpoint then
+        // reaches both `224.0.0.251` and `ff02::fb`, and a v6-only endpoint
+        // actually transmits (instead of routing to an absent v4 socket and
+        // marking the send undelivered).
+        //
+        // Self-send credit: record ONE tracker entry per ACTUAL successful
+        // send. Take-once self-suppression consumes a single entry per matching
+        // loopback, and dual-stack fan-out yields TWO loopback copies (one per
+        // joined socket), so a successful v4+v6 send records two entries.
+        //
+        // Timestamp: capture `when` IMMEDIATELY BEFORE each `.await`. compio is
+        // completion-based — the buffer moves into the op on `.await`, so we
+        // can't stamp "at the syscall" the way the readiness-I/O reactor does
+        // inside `poll_send_to`. Stamping before the await guarantees
+        // `when <= kernel_send_time <= echo_rx_time`, keeping our own loopback
+        // inside the 1 ms Ordered match window even when task-resume latency is
+        // high. (Stamping AFTER the await — the previous bug — could push the
+        // recorded time past the kernel's rx stamp and misclassify our own
+        // announce/probe as a peer packet.)
+        let delivered = if is_mdns_multicast_dst(dst) {
+          let mut sent_any = false;
+          if let Some(s4) = sock_v4.as_ref() {
+            let when = SystemTime::now();
+            let res = s4.send_to(&scratch[..n], MDNS_V4_DST, None).await;
+            if res.is_ok() {
+              hick_trace::trace!(dst = %MDNS_V4_DST, len = n, "send_to v4");
+              let mut state = inner.state.borrow_mut();
+              crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
+              #[cfg(feature = "stats")]
+              {
+                state.stats.packets_tx(1);
+                state.stats.bytes_tx(n as u64);
+              }
+              sent_any = true;
+            } else {
+              hick_trace::debug!(dst = %MDNS_V4_DST, "send_to v4 failed");
+              #[cfg(feature = "stats")]
+              inner.state.borrow().stats.send_errors(1);
             }
-          } else {
-            hick_trace::debug!(dst = %dst, "send_to failed");
-            #[cfg(feature = "stats")]
-            inner.state.borrow().stats.send_errors(1);
           }
-          res.is_ok()
+          if let Some(s6) = sock_v6.as_ref() {
+            let when = SystemTime::now();
+            let res = s6.send_to(&scratch[..n], MDNS_V6_DST, None).await;
+            if res.is_ok() {
+              hick_trace::trace!(dst = %MDNS_V6_DST, len = n, "send_to v6");
+              let mut state = inner.state.borrow_mut();
+              crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
+              #[cfg(feature = "stats")]
+              {
+                state.stats.packets_tx(1);
+                state.stats.bytes_tx(n as u64);
+              }
+              sent_any = true;
+            } else {
+              hick_trace::debug!(dst = %MDNS_V6_DST, "send_to v6 failed");
+              #[cfg(feature = "stats")]
+              inner.state.borrow().stats.send_errors(1);
+            }
+          }
+          // `delivered` ⇔ at least one family reached the wire.
+          sent_any
         } else {
-          false
-        }
-      };
-      // Confirm the pending transmit so the §8.1 probe sequence / §8.3 announce
-      // phase advance (services), or so the §5.2 backoff + retry budget
-      // advance only on a confirmed-delivered send (queries).  Anchored to
-      // post-send time so the next deadline is relative to actual on-wire send.
-      match origin {
-        TransmitOrigin::Service(h) => {
-          let mut state = inner.state.borrow_mut();
-          state.note_service_transmit_result(h, StdInstant::now(), delivered);
-        }
-        TransmitOrigin::Query(h) => {
-          let mut state = inner.state.borrow_mut();
-          state.note_query_transmit_result(h, StdInstant::now(), delivered);
+          // Unicast: pick the socket matching the destination family, single
+          // send. No socket for this family → count as failed delivery so the
+          // proto re-arms the probe / announce without advancing lifecycle
+          // state (unchanged semantics).
+          let sock = match dst {
+            core::net::SocketAddr::V4(_) => sock_v4.as_ref(),
+            core::net::SocketAddr::V6(_) => sock_v6.as_ref(),
+          };
+          if let Some(s) = sock {
+            let when = SystemTime::now();
+            let res = s.send_to(&scratch[..n], dst, None).await;
+            // Record the self-send credit under a fresh short borrow so the next
+            // inbound copy of this datagram (from the loopback / multicast echo)
+            // is classified as our own.  Only record on a successful send.
+            if res.is_ok() {
+              hick_trace::trace!(dst = %dst, len = n, "send_to");
+              let mut state = inner.state.borrow_mut();
+              crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
+              #[cfg(feature = "stats")]
+              {
+                state.stats.packets_tx(1);
+                state.stats.bytes_tx(n as u64);
+              }
+            } else {
+              hick_trace::debug!(dst = %dst, "send_to failed");
+              #[cfg(feature = "stats")]
+              inner.state.borrow().stats.send_errors(1);
+            }
+            res.is_ok()
+          } else {
+            false
+          }
+        };
+        // Confirm the pending transmit so the §8.1 probe sequence / §8.3 announce
+        // phase advance (services), or so the §5.2 backoff + retry budget
+        // advance only on a confirmed-delivered send (queries).  Anchored to
+        // post-send time so the next deadline is relative to actual on-wire send.
+        match origin {
+          TransmitOrigin::Service(h) => {
+            let mut state = inner.state.borrow_mut();
+            state.note_service_transmit_result(h, StdInstant::now(), delivered);
+          }
+          TransmitOrigin::Query(h) => {
+            let mut state = inner.state.borrow_mut();
+            state.note_query_transmit_result(h, StdInstant::now(), delivered);
+          }
         }
       }
     }
@@ -1330,95 +1463,14 @@ pub(crate) async fn run(
 
     // 1a. RFC 6762 §10.1 goodbye-burst pump. `sweep_cancelled_services` (1a-pre)
     //     and a conflict-rename withdrawal (1b above) both encode TTL=0 records
-    //     and push them onto `state.goodbyes`; this loop fans each due entry out
-    //     to BOTH multicast families' sockets [`GOODBYE_SENDS`] times, spaced by
-    //     [`GOODBYE_INTERVAL`]. Running AFTER `push_service_updates` (1b) ensures
-    //     that a goodbye stolen from `pending_rename_goodbye` during a rename
-    //     collision is flushed on-wire in the same iteration it was queued —
-    //     before the loop parks and a same-name replacement can announce.
-    //     The borrow discipline matches the main pump: snapshot the bytes under a
-    //     brief borrow, send under no borrow, and update remaining/next_at under
-    //     another short borrow.
-    loop {
-      let now = StdInstant::now();
-      let due_entry: Option<(usize, Vec<u8>)> = {
-        let s = inner.state.borrow();
-        s.goodbyes
-          .iter()
-          .enumerate()
-          .find(|(_, g)| g.remaining > 0 && g.next_at <= now)
-          .map(|(i, g)| (i, g.data.clone()))
-      };
-      let Some((idx, data)) = due_entry else {
-        break;
-      };
-      // Fan out to every bound family on the mDNS multicast group.
-      // Capture `when` BEFORE each `.await` (completion-I/O equivalent of
-      // stamping at the syscall) so `when <= kernel_send_time <=
-      // echo_rx_time` and the kernel-looped goodbye stays inside the 1 ms
-      // Ordered self-send match window.
-      // Track whether at least one family succeeded (for goodbyes_tx counter).
-      #[cfg(feature = "stats")]
-      let mut goodbye_sent_any = false;
-      if let Some(s4) = sock_v4.as_ref() {
-        let when = SystemTime::now();
-        let res = s4.send_to(&data, MDNS_V4_DST, None).await;
-        if res.is_ok() {
-          hick_trace::trace!(dst = %MDNS_V4_DST, len = data.len(), "goodbye send_to v4");
-          let mut state = inner.state.borrow_mut();
-          crate::selfsend::record_self_send(&mut state.recent_sends, &data, when);
-          #[cfg(feature = "stats")]
-          {
-            state.stats.packets_tx(1);
-            state.stats.bytes_tx(data.len() as u64);
-            goodbye_sent_any = true;
-          }
-        } else {
-          hick_trace::debug!(dst = %MDNS_V4_DST, "goodbye send_to v4 failed");
-          #[cfg(feature = "stats")]
-          inner.state.borrow().stats.send_errors(1);
-        }
-      }
-      if let Some(s6) = sock_v6.as_ref() {
-        let when = SystemTime::now();
-        let res = s6.send_to(&data, MDNS_V6_DST, None).await;
-        if res.is_ok() {
-          hick_trace::trace!(dst = %MDNS_V6_DST, len = data.len(), "goodbye send_to v6");
-          let mut state = inner.state.borrow_mut();
-          crate::selfsend::record_self_send(&mut state.recent_sends, &data, when);
-          #[cfg(feature = "stats")]
-          {
-            state.stats.packets_tx(1);
-            state.stats.bytes_tx(data.len() as u64);
-            goodbye_sent_any = true;
-          }
-        } else {
-          hick_trace::debug!(dst = %MDNS_V6_DST, "goodbye send_to v6 failed");
-          #[cfg(feature = "stats")]
-          inner.state.borrow().stats.send_errors(1);
-        }
-      }
-      // Count the goodbye as delivered when at least one family succeeded.
-      #[cfg(feature = "stats")]
-      if goodbye_sent_any {
-        inner.state.borrow().stats.goodbyes_tx(1);
-      }
-      // Decrement remaining and re-arm next_at regardless of send outcome —
-      // an entry that can't reach the wire still drains its budget so it
-      // doesn't pin the goodbye queue forever.
-      {
-        let mut state = inner.state.borrow_mut();
-        if let Some(g) = state.goodbyes.get_mut(idx) {
-          g.remaining = g.remaining.saturating_sub(1);
-          g.next_at = now + GOODBYE_INTERVAL;
-        }
-      }
-    }
-    // GC fully drained goodbye entries.
-    {
-      let mut state = inner.state.borrow_mut();
-      state.goodbyes.retain(|g| g.remaining > 0);
-    }
+    //     and push them onto `state.goodbyes`; this drains each due entry, fanning
+    //     it out to BOTH multicast families' sockets [`GOODBYE_SENDS`] times,
+    //     spaced by [`GOODBYE_INTERVAL`]. Running AFTER `push_service_updates`
+    //     (1b) ensures a goodbye stolen from `pending_rename_goodbye` during a
+    //     rename collision is flushed on-wire in the same iteration it was queued.
+    //     The SAME drain runs at the TOP of the loop (the barrier retry, below) so
+    //     a pre-existing un-sent free-name goodbye sends before the positive pump.
+    drain_goodbye_bursts(&inner, &sock_v4, &sock_v6).await;
 
     // 1b'. fire one-shot wakes for queries that just transitioned to `errored`
     //      (un-encodable question, see `QueryCtx::errored`). Such a query has no
@@ -1586,6 +1638,113 @@ pub(crate) async fn run(
     if woke_state {
       inner.notify.notify();
     }
+  }
+}
+
+/// Drain every DUE RFC 6762 §10.1 goodbye once, fanning each out to both bound
+/// multicast families. Shared by the run loop's pre-transmit barrier retry (step
+/// 0) and its post-`push_service_updates` flush (1a) so both use identical
+/// send + accounting + Part A advancement.
+///
+/// ## Part A — round advancement is gated on a real send
+///
+/// `goodbye_sent_any` (a plain correctness variable, not stats-only) is `true`
+/// iff at least one family's `send_to` succeeded. [`State::advance_goodbye_after_send`]
+/// then spends a resend + re-arms at [`GOODBYE_INTERVAL`] ONLY when something
+/// reached the wire; an all-failing round re-arms at the short
+/// [`GOODBYE_RETRY_BACKOFF`] without consuming the resend budget. The first
+/// successful round latches [`PendingGoodbye::sent_once`], clearing the barrier.
+///
+/// Each due entry is re-found by scanning for the earliest `next_at <= now`, and
+/// advancing it pushes `next_at` into the future (interval or backoff), so this
+/// drains at most one round per entry per call and cannot busy-spin.
+async fn drain_goodbye_bursts(
+  inner: &Rc<EndpointInner>,
+  sock_v4: &Option<Rc<Socket>>,
+  sock_v6: &Option<Rc<Socket>>,
+) {
+  loop {
+    let now = StdInstant::now();
+    let due_entry: Option<(usize, Vec<u8>)> = {
+      let s = inner.state.borrow();
+      s.goodbyes
+        .iter()
+        .enumerate()
+        .find(|(_, g)| g.remaining > 0 && g.next_at <= now)
+        .map(|(i, g)| (i, g.data.clone()))
+    };
+    let Some((idx, data)) = due_entry else {
+      break;
+    };
+    // Fan out to every bound family on the mDNS multicast group.
+    // Capture `when` BEFORE each `.await` (completion-I/O equivalent of
+    // stamping at the syscall) so `when <= kernel_send_time <= echo_rx_time`
+    // and the kernel-looped goodbye stays inside the 1 ms Ordered self-send
+    // match window.
+    // `goodbye_sent_any` is load-bearing for Part A (not stats-only): it decides
+    // whether this round counts.
+    let mut goodbye_sent_any = false;
+    if let Some(s4) = sock_v4.as_ref() {
+      let when = SystemTime::now();
+      let res = s4.send_to(&data, MDNS_V4_DST, None).await;
+      if res.is_ok() {
+        hick_trace::trace!(dst = %MDNS_V4_DST, len = data.len(), "goodbye send_to v4");
+        let mut state = inner.state.borrow_mut();
+        crate::selfsend::record_self_send(&mut state.recent_sends, &data, when);
+        #[cfg(feature = "stats")]
+        {
+          state.stats.packets_tx(1);
+          state.stats.bytes_tx(data.len() as u64);
+        }
+        goodbye_sent_any = true;
+      } else {
+        hick_trace::debug!(dst = %MDNS_V4_DST, "goodbye send_to v4 failed");
+        #[cfg(feature = "stats")]
+        inner.state.borrow().stats.send_errors(1);
+      }
+    }
+    if let Some(s6) = sock_v6.as_ref() {
+      let when = SystemTime::now();
+      let res = s6.send_to(&data, MDNS_V6_DST, None).await;
+      if res.is_ok() {
+        hick_trace::trace!(dst = %MDNS_V6_DST, len = data.len(), "goodbye send_to v6");
+        let mut state = inner.state.borrow_mut();
+        crate::selfsend::record_self_send(&mut state.recent_sends, &data, when);
+        #[cfg(feature = "stats")]
+        {
+          state.stats.packets_tx(1);
+          state.stats.bytes_tx(data.len() as u64);
+        }
+        goodbye_sent_any = true;
+      } else {
+        hick_trace::debug!(dst = %MDNS_V6_DST, "goodbye send_to v6 failed");
+        #[cfg(feature = "stats")]
+        inner.state.borrow().stats.send_errors(1);
+      }
+    }
+    // Count the goodbye as a delivered round when at least one family succeeded.
+    #[cfg(feature = "stats")]
+    if goodbye_sent_any {
+      inner.state.borrow().stats.goodbyes_tx(1);
+    }
+    // Part A: spend a resend + re-arm at GOODBYE_INTERVAL only on a real send;
+    // otherwise re-arm at the short GOODBYE_RETRY_BACKOFF with the budget intact.
+    inner
+      .state
+      .borrow_mut()
+      .advance_goodbye_after_send(idx, goodbye_sent_any, now);
+  }
+  // GC fully-sent entries and force-clear any past its `expires_at` anti-pin
+  // bound (a never-delivered barrier, regardless of `remaining`).
+  let force_cleared = {
+    let now = StdInstant::now();
+    inner.state.borrow_mut().gc_goodbyes(now)
+  };
+  if force_cleared > 0 {
+    hick_trace::debug!(
+      count = force_cleared,
+      "force-cleared undeliverable goodbye(s) past the barrier/retention bound"
+    );
   }
 }
 
@@ -2146,11 +2305,145 @@ mod tests {
       data: vec![0xde, 0xad],
       remaining: GOODBYE_SENDS,
       next_at: now,
+      sent_once: false,
+      expires_at: now + GOODBYE_BARRIER_MAX,
     });
     assert_eq!(
       s.poll_deadline(),
       Some(now),
       "a queued goodbye must surface its next_at on poll_deadline"
+    );
+  }
+
+  /// Part A (State seam): a goodbye round that reached NO family must NOT spend
+  /// the resend budget, must NOT flip `sent_once`, and must re-arm at the short
+  /// `GOODBYE_RETRY_BACKOFF` — not a full `GOODBYE_INTERVAL`. This is the
+  /// allocation-free advancement the driver applies after every burst; the full
+  /// async barrier-skip ordering is exercised end-to-end in the deterministic
+  /// `hick-smoltcp` engine test (the compio run loop cannot be stepped
+  /// deterministically here).
+  #[test]
+  fn goodbye_round_with_no_send_keeps_budget_and_backs_off() {
+    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+    let now = std::time::Instant::now();
+    s.goodbyes.push(PendingGoodbye {
+      data: vec![0xde, 0xad],
+      remaining: GOODBYE_SENDS,
+      next_at: now,
+      sent_once: false,
+      expires_at: now + GOODBYE_BARRIER_MAX,
+    });
+
+    // any_sent = false: nothing reached the wire this round.
+    s.advance_goodbye_after_send(0, false, now);
+    let g = &s.goodbyes[0];
+    assert_eq!(
+      g.remaining, GOODBYE_SENDS,
+      "an all-failing round must not consume the resend budget"
+    );
+    assert!(
+      !g.sent_once,
+      "an all-failing round must not flip sent_once — the barrier still holds"
+    );
+    assert_eq!(
+      g.next_at,
+      now + GOODBYE_RETRY_BACKOFF,
+      "a failed round must re-arm at GOODBYE_RETRY_BACKOFF"
+    );
+    assert!(
+      g.next_at < now + GOODBYE_INTERVAL,
+      "a failed round must NOT push next_at out by a full GOODBYE_INTERVAL"
+    );
+    assert!(
+      s.has_pending_barrier(now),
+      "an un-sent goodbye remains a pending transmit barrier"
+    );
+  }
+
+  /// Part A/B (State seam): the FIRST round that reaches the wire latches
+  /// `sent_once` (clearing the barrier), spends exactly one resend, and re-arms at
+  /// the full `GOODBYE_INTERVAL`.
+  #[test]
+  fn goodbye_round_with_a_send_spends_one_and_clears_barrier() {
+    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+    let now = std::time::Instant::now();
+    s.goodbyes.push(PendingGoodbye {
+      data: vec![0xde, 0xad],
+      remaining: GOODBYE_SENDS,
+      next_at: now,
+      sent_once: false,
+      expires_at: now + GOODBYE_BARRIER_MAX,
+    });
+
+    s.advance_goodbye_after_send(0, true, now);
+    let g = &s.goodbyes[0];
+    assert_eq!(
+      g.remaining,
+      GOODBYE_SENDS - 1,
+      "a delivered round must spend exactly one resend"
+    );
+    assert!(g.sent_once, "a delivered round latches sent_once");
+    assert_eq!(
+      g.next_at,
+      now + GOODBYE_INTERVAL,
+      "a delivered round re-arms at the full GOODBYE_INTERVAL"
+    );
+    assert!(
+      !s.has_pending_barrier(now),
+      "once it has sent, the goodbye no longer bars positive transmits"
+    );
+  }
+
+  /// Anti-pin (State seam): `gc_goodbyes` force-clears an entry past its
+  /// `expires_at` REGARDLESS of remaining sends, so a permanently-undeliverable
+  /// barrier cannot pin the queue or block transmits forever. A still-live entry
+  /// is retained; a fully-sent one is dropped.
+  #[test]
+  fn gc_force_clears_expired_barrier_and_drops_sent_entries() {
+    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+    let now = std::time::Instant::now();
+    // Expired barrier still owing sends → force-cleared (counted).
+    s.goodbyes.push(PendingGoodbye {
+      data: vec![1],
+      remaining: GOODBYE_SENDS,
+      next_at: now,
+      sent_once: false,
+      expires_at: now - Duration::from_millis(1),
+    });
+    // Fully-sent entry → dropped (not counted as a force-clear).
+    s.goodbyes.push(PendingGoodbye {
+      data: vec![2],
+      remaining: 0,
+      next_at: now,
+      sent_once: true,
+      expires_at: now + GOODBYE_BARRIER_MAX,
+    });
+    // Live, un-expired, still owing → retained.
+    s.goodbyes.push(PendingGoodbye {
+      data: vec![3],
+      remaining: GOODBYE_SENDS,
+      next_at: now,
+      sent_once: false,
+      expires_at: now + GOODBYE_BARRIER_MAX,
+    });
+
+    let force_cleared = s.gc_goodbyes(now);
+    assert_eq!(
+      force_cleared, 1,
+      "exactly the expired-while-owing entry is force-cleared"
+    );
+    assert_eq!(s.goodbyes.len(), 1, "only the live entry survives");
+    assert_eq!(s.goodbyes[0].data, vec![3]);
+    assert!(
+      s.has_pending_barrier(now),
+      "the surviving un-sent entry is still a barrier"
+    );
+
+    // Past its own expiry, even the survivor stops barring transmits.
+    let later = now + GOODBYE_BARRIER_MAX + Duration::from_millis(1);
+    assert!(
+      !s.has_pending_barrier(later),
+      "an entry past its expires_at no longer bars transmits"
     );
   }
 

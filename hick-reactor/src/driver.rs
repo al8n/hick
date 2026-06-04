@@ -181,10 +181,26 @@ struct DriverState<N: Net> {
 struct PendingGoodbye {
   /// Fully encoded TTL=0 datagram (records of the withdrawn service).
   data: Vec<u8>,
-  /// Remaining sends; the entry is dropped once this reaches zero.
+  /// Remaining sends; the entry is dropped once this reaches zero. Decremented
+  /// ONLY on a round that actually reached the wire (Part A) — a round in which
+  /// every family's `send_to` failed leaves this untouched.
   remaining: u8,
   /// Earliest wall-clock instant at which the next send may go out.
   next_at: StdInstant,
+  /// `false` until the FIRST round of this goodbye reaches the wire (at least one
+  /// family sent). While `false` — and before [`Self::expires_at`] — this entry
+  /// is a PENDING BARRIER: a free-name (retirement/rename) TTL=0 withdrawal that
+  /// must precede any positive-TTL transmit, so a same-name replacement under
+  /// `with_probe_unique_names(false)` cannot announce a fresh positive TTL ahead
+  /// of the stale TTL=0 and evict itself from peer caches. Set once, never cleared.
+  sent_once: bool,
+  /// Hard deadline after which the entry is force-cleared even if it never sent —
+  /// the anti-pin bound for both the [`Self::sent_once`] barrier and the entry's
+  /// lifetime. Set at queue time to `now + GOODBYE_BARRIER_MAX`. Because Part A
+  /// stops advancing `remaining` on a never-delivered round, this bound (not
+  /// `remaining`) prevents an undeliverable goodbye pinning the queue / blocking
+  /// transmits forever.
+  expires_at: StdInstant,
 }
 
 impl<N: Net> DriverState<N> {
@@ -228,9 +244,16 @@ impl<N: Net> DriverState<N> {
         best = Some(min_opt(best, t));
       }
     }
-    // wake to resend any pending goodbye when it comes due.
+    // wake to resend any pending goodbye when it comes due. `next_at` is short
+    // (GOODBYE_RETRY_BACKOFF) after a failed round, so a deferred barrier wakes
+    // promptly. While still an un-sent barrier, also wake at its `expires_at`
+    // ceiling so a never-sendable barrier releases the deferred positive
+    // transmits no later than that bound.
     for g in &self.goodbyes {
       best = Some(min_opt(best, g.next_at));
+      if !g.sent_once {
+        best = Some(min_opt(best, g.expires_at));
+      }
     }
     best
   }
@@ -917,12 +940,32 @@ impl<N: Net> DriverState<N> {
     more_pending
   }
 
-  /// Resend any due TTL=0 goodbye packets and drop those that have been sent
-  /// [`GOODBYE_SENDS`] times. Each goodbye fans out to BOTH
-  /// multicast families via `send_via` (the `MDNS_V4_DST` sentinel triggers
-  /// the dual-stack path) and is recorded in the self-send tracker like any
-  /// other transmit, so its loopback isn't misclassified.
-  async fn drain_goodbyes(&mut self, now: StdInstant) {
+  /// Resend any due TTL=0 goodbye packets and drop those that are finished. Each
+  /// goodbye fans out to BOTH multicast families via `send_via` (the `MDNS_V4_DST`
+  /// sentinel triggers the dual-stack path) and is recorded in the self-send
+  /// tracker like any other transmit, so its loopback isn't misclassified.
+  ///
+  /// ## Part A — round advancement is gated on a real send (live path)
+  ///
+  /// `send_via` returns the number of families that actually sent. When `force`
+  /// is `false` (the live driver loop) a round is counted ONLY if at least one
+  /// family sent: the first such round latches [`PendingGoodbye::sent_once`]
+  /// (clearing the transmit barrier), spends one resend, and re-arms at
+  /// [`GOODBYE_INTERVAL`]; an all-failing round re-arms at the short
+  /// [`GOODBYE_RETRY_BACKOFF`] without consuming the budget, so a transiently-
+  /// undeliverable free-name goodbye (and the positive transmit its barrier
+  /// blocks) retries promptly. Entries past their `expires_at` anti-pin bound are
+  /// force-cleared regardless of `remaining` so a never-deliverable barrier cannot
+  /// pin the queue forever.
+  ///
+  /// ## `force` — the shutdown flush
+  ///
+  /// [`Self::flush_goodbyes`] passes `force = true`: the driver is exiting, the
+  /// barrier/ordering is moot, and the burst must TERMINATE best-effort even with
+  /// no reachable socket. There, a round spends a resend on every attempt (the
+  /// pre-Part-A semantics) so the queue drains in at most `GOODBYE_SENDS` passes
+  /// per entry rather than spinning to `expires_at`.
+  async fn drain_goodbyes(&mut self, now: StdInstant, force: bool) {
     if self.goodbyes.is_empty() {
       return;
     }
@@ -937,7 +980,7 @@ impl<N: Net> DriverState<N> {
     } = self;
     for g in goodbyes.iter_mut() {
       if g.remaining > 0 && g.next_at <= now {
-        let _credits = send_via::<N>(
+        let credits = send_via::<N>(
           recent_sends,
           v4,
           v6,
@@ -947,15 +990,65 @@ impl<N: Net> DriverState<N> {
           &stats,
         )
         .await;
+        let any_sent = credits > 0;
         #[cfg(feature = "stats")]
-        if _credits > 0 {
+        if any_sent {
           stats.goodbyes_tx(1);
         }
-        g.remaining = g.remaining.saturating_sub(1);
-        g.next_at = now + GOODBYE_INTERVAL;
+        if any_sent {
+          // Part A: a real send latches the barrier and spends a resend.
+          g.sent_once = true;
+          g.remaining = g.remaining.saturating_sub(1);
+          g.next_at = now + GOODBYE_INTERVAL;
+        } else if force {
+          // Shutdown flush: terminate the burst even with nothing on the wire.
+          g.remaining = g.remaining.saturating_sub(1);
+          g.next_at = now + GOODBYE_INTERVAL;
+        } else {
+          // Live path, all-failing round: keep the budget, retry soon.
+          g.next_at = now + GOODBYE_RETRY_BACKOFF;
+        }
       }
     }
-    goodbyes.retain(|g| g.remaining > 0);
+    // Drop finished entries; force-clear any past its anti-pin `expires_at`
+    // REGARDLESS of `remaining` (a never-delivered barrier must not pin the queue
+    // or block transmits forever now that Part A stops spending its budget on
+    // failed rounds).
+    let mut force_cleared = 0usize;
+    goodbyes.retain(|g| {
+      if g.expires_at <= now {
+        if g.remaining > 0 {
+          force_cleared += 1;
+        }
+        return false;
+      }
+      g.remaining > 0
+    });
+    if force_cleared > 0 {
+      hick_trace::debug!(
+        count = force_cleared,
+        "force-cleared undeliverable goodbye(s) past the barrier/retention bound"
+      );
+    }
+  }
+
+  /// Part B — `true` if any pending goodbye is still a barrier: it has not yet
+  /// reached the wire (`!sent_once`) AND has not passed its `expires_at` ceiling.
+  /// The driver loop defers phase D (the positive-TTL transmit drain) while this
+  /// holds.
+  ///
+  /// The barrier is intentionally GLOBAL — ANY pending un-sent free-name goodbye
+  /// defers ALL positive transmits, not just same-name ones. This is acceptable
+  /// (and far simpler than name-scoping the proto transmit queue) because a
+  /// SENDABLE barrier clears in the same loop iteration's pre-transmit
+  /// `drain_goodbyes`, so normal operation only gains a goodbye-before-transmit
+  /// ordering; only an UN-sendable (all-failing) barrier actually defers
+  /// transmits, bounded by `expires_at`.
+  fn has_pending_barrier(&self, now: StdInstant) -> bool {
+    self
+      .goodbyes
+      .iter()
+      .any(|g| !g.sent_once && g.expires_at > now)
   }
 
   /// Drive the remaining goodbye burst to completion, sleeping
@@ -966,7 +1059,9 @@ impl<N: Net> DriverState<N> {
   /// completes in at most `GOODBYE_SENDS` iterations per entry.
   async fn flush_goodbyes(&mut self) {
     while !self.goodbyes.is_empty() {
-      self.drain_goodbyes(StdInstant::now()).await;
+      // `force = true`: we are exiting, so terminate the burst best-effort even
+      // with no reachable socket (the barrier/ordering no longer matters).
+      self.drain_goodbyes(StdInstant::now(), true).await;
       match self.goodbyes.iter().map(|g| g.next_at).min() {
         Some(next) => {
           let dur = next.saturating_duration_since(StdInstant::now());
@@ -1089,6 +1184,8 @@ impl<N: Net> DriverState<N> {
         data,
         remaining: GOODBYE_SENDS,
         next_at: now,
+        sent_once: false,
+        expires_at: now + GOODBYE_BARRIER_MAX,
       });
     }
     self.services.remove(&handle);
@@ -1241,6 +1338,23 @@ const GOODBYE_SENDS: u8 = 3;
 
 /// Spacing between goodbye resends.
 const GOODBYE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Short re-attempt delay for a goodbye round that put NOTHING on the wire (every
+/// family's `send_to` failed). Much smaller than [`GOODBYE_INTERVAL`] so a
+/// transiently-undeliverable free-name goodbye is retried promptly — WITHOUT
+/// consuming a resend round and WITHOUT busy-spinning — and a positive transmit
+/// deferred behind its [`PendingGoodbye::sent_once`] barrier wakes again soon.
+/// Kept consistent with `hick-smoltcp`/`hick-compio`'s `GOODBYE_RETRY_BACKOFF`.
+const GOODBYE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Hard ceiling on how long an un-sent free-name goodbye may act as a transmit
+/// barrier (see [`PendingGoodbye::sent_once`]) AND on its retention. Because Part
+/// A no longer decrements a goodbye's resend budget on a round that never reached
+/// the wire, a permanently-undeliverable entry would otherwise pin the goodbye
+/// queue — and block positive transmits — forever. Past this age the entry is
+/// force-cleared so it can neither block transmits nor leak. Kept consistent with
+/// `hick-smoltcp`/`hick-compio`'s `GOODBYE_BARRIER_MAX`.
+const GOODBYE_BARRIER_MAX: Duration = Duration::from_secs(2);
 
 /// FNV-1a 64-bit hash of a datagram body. Used only to fingerprint our
 /// own sends for loopback matching — not a security primitive, so a fast
@@ -1677,10 +1791,28 @@ async fn driver_task<N: Net>(
     let now = StdInstant::now();
     state.sweep_closed_handles(now);
     state.fire_timeouts(now);
-    let more_transmits_pending = state.drain_transmits(now, &mut scratch).await;
+    // FREE-NAME GOODBYE BARRIER (pre-transmit). Before phase D (the positive-TTL
+    // transmit drain), (1) attempt the due goodbyes so a SENDABLE free-name
+    // (retirement/rename) TTL=0 withdrawal reaches the wire FIRST — clearing such
+    // a barrier this tick — then (2) if a goodbye is still an un-sent, unexpired
+    // barrier, SKIP phase D so a same-name replacement registered under
+    // `with_probe_unique_names(false)` cannot announce a fresh positive TTL ahead
+    // of the stale TTL=0 (which would evict it from peer caches). Only an
+    // UN-sendable (all-failing) barrier actually defers transmits, bounded by each
+    // entry's `expires_at`; `next_deadline` wakes on GOODBYE_RETRY_BACKOFF /
+    // `expires_at` so a deferred barrier retries promptly. The post-`push_updates`
+    // drain (phase F, below) is KEPT so a newly-queued rename goodbye still flushes
+    // this tick.
+    state.drain_goodbyes(now, false).await;
+    let transmit_barred = state.has_pending_barrier(now);
+    let more_transmits_pending = if transmit_barred {
+      false
+    } else {
+      state.drain_transmits(now, &mut scratch).await
+    };
     state.push_updates(now).await;
-    // emit any due TTL=0 goodbye resends for unregistered services.
-    state.drain_goodbyes(now).await;
+    // emit any due TTL=0 goodbye resends for unregistered services (phase F).
+    state.drain_goodbyes(now, false).await;
 
     // if drain_transmits stopped at its per-tick budget,
     // don't sleep — loop back immediately so the packet pump can
@@ -3119,15 +3251,120 @@ mod tests {
       interface_index: 0,
     };
     let mut state = DriverState::new(&opts, sockets);
+    let now = StdInstant::now();
     state.goodbyes.push(PendingGoodbye {
       data: vec![0xde, 0xad],
       remaining: GOODBYE_SENDS,
-      next_at: StdInstant::now(),
+      next_at: now,
+      sent_once: false,
+      expires_at: now + GOODBYE_BARRIER_MAX,
     });
     state.flush_goodbyes().await;
     assert!(
       state.goodbyes.is_empty(),
       "the goodbye burst must fully drain before shutdown"
+    );
+  }
+
+  /// Part A (live path, State seam): a goodbye round that reached NO family
+  /// (here: no socket bound, so `send_via` reports zero sends) must NOT spend the
+  /// resend budget, must NOT flip `sent_once`, and must re-arm at the short
+  /// `GOODBYE_RETRY_BACKOFF` — not a full `GOODBYE_INTERVAL`. The all-failing case
+  /// is reachable deterministically without sockets; the full async barrier-skip
+  /// ordering is exercised end-to-end in the deterministic `hick-smoltcp` engine
+  /// test (the reactor's multi-task loop cannot be stepped deterministically here).
+  #[cfg(feature = "tokio")]
+  #[tokio::test]
+  async fn live_goodbye_round_with_no_send_keeps_budget_and_backs_off() {
+    let opts = crate::options::ServerOptions::default();
+    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+      v4: None,
+      v6: None,
+      interface_index: 0,
+    };
+    let mut state = DriverState::new(&opts, sockets);
+    let now = StdInstant::now();
+    state.goodbyes.push(PendingGoodbye {
+      data: vec![0xde, 0xad],
+      remaining: GOODBYE_SENDS,
+      next_at: now,
+      sent_once: false,
+      expires_at: now + GOODBYE_BARRIER_MAX,
+    });
+
+    // `force = false`: the live path. With no socket nothing reaches the wire.
+    state.drain_goodbyes(now, false).await;
+    let g = &state.goodbyes[0];
+    assert_eq!(
+      g.remaining, GOODBYE_SENDS,
+      "an all-failing live round must not consume the resend budget"
+    );
+    assert!(
+      !g.sent_once,
+      "an all-failing round must not flip sent_once — the barrier still holds"
+    );
+    assert_eq!(
+      g.next_at,
+      now + GOODBYE_RETRY_BACKOFF,
+      "a failed live round must re-arm at GOODBYE_RETRY_BACKOFF"
+    );
+    assert!(
+      g.next_at < now + GOODBYE_INTERVAL,
+      "a failed live round must NOT push next_at out by a full GOODBYE_INTERVAL"
+    );
+    assert!(
+      state.has_pending_barrier(now),
+      "an un-sent goodbye remains a pending transmit barrier"
+    );
+  }
+
+  /// Anti-pin (State seam): a goodbye past its `expires_at` is force-cleared by
+  /// `drain_goodbyes` REGARDLESS of remaining sends, so a permanently-
+  /// undeliverable barrier cannot pin the queue or block transmits forever. A
+  /// live, un-expired entry survives and keeps barring transmits until its bound.
+  #[cfg(feature = "tokio")]
+  #[tokio::test]
+  async fn live_drain_force_clears_expired_barrier() {
+    let opts = crate::options::ServerOptions::default();
+    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+      v4: None,
+      v6: None,
+      interface_index: 0,
+    };
+    let mut state = DriverState::new(&opts, sockets);
+    let now = StdInstant::now();
+    // Already past its anti-pin bound while still owing sends.
+    state.goodbyes.push(PendingGoodbye {
+      data: vec![1],
+      remaining: GOODBYE_SENDS,
+      next_at: now,
+      sent_once: false,
+      expires_at: now - Duration::from_millis(1),
+    });
+    // Live, un-expired, still owing → retained.
+    state.goodbyes.push(PendingGoodbye {
+      data: vec![3],
+      remaining: GOODBYE_SENDS,
+      next_at: now + GOODBYE_INTERVAL, // not due, so no send is attempted
+      sent_once: false,
+      expires_at: now + GOODBYE_BARRIER_MAX,
+    });
+
+    state.drain_goodbyes(now, false).await;
+    assert_eq!(
+      state.goodbyes.len(),
+      1,
+      "the expired barrier must be force-cleared; only the live entry survives"
+    );
+    assert_eq!(state.goodbyes[0].data, vec![3]);
+    assert!(
+      state.has_pending_barrier(now),
+      "the surviving un-sent entry is still a barrier"
+    );
+    let later = now + GOODBYE_BARRIER_MAX + Duration::from_millis(1);
+    assert!(
+      !state.has_pending_barrier(later),
+      "an entry past its expires_at no longer bars transmits"
     );
   }
 

@@ -41,6 +41,22 @@ use hick_trace::stats::{Stats, StatsSnapshot};
 const GOODBYE_SENDS: u8 = 2;
 /// Spacing between goodbye repeats.
 const GOODBYE_INTERVAL: Duration = Duration::from_secs(1);
+/// Short re-attempt delay for a goodbye whose round put NOTHING on the wire (an
+/// all-`Busy`/all-error attempt). Much smaller than [`GOODBYE_INTERVAL`] so a
+/// transiently-undeliverable free-name goodbye is retried promptly — without
+/// busy-spinning and without consuming a resend round — and a positive transmit
+/// blocked behind it (the [`PendingGoodbye::sent_once`] barrier) is deferred only
+/// briefly. Kept consistent with `hick-compio::driver::GOODBYE_RETRY_BACKOFF` and
+/// `hick-reactor::driver::GOODBYE_RETRY_BACKOFF`.
+const GOODBYE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+/// Hard ceiling on how long an un-sent free-name goodbye may act as a transmit
+/// barrier (see [`PendingGoodbye::sent_once`]). An entry that has never reached
+/// the wire by this age stops blocking positive transmits, so a permanently-
+/// undeliverable (all-`Busy`) barrier cannot pin the TX loop forever. The entry
+/// itself is still retained for its withdrawal until [`MAX_GOODBYE_AGE`]; this
+/// bound governs only the barrier, not the entry's lifetime. Kept consistent
+/// with `hick-compio`/`hick-reactor`'s `GOODBYE_BARRIER_MAX`.
+const GOODBYE_BARRIER_MAX: Duration = Duration::from_secs(2);
 /// RFC 6762 §17 single-message ceiling — the size of the reusable goodbye encode
 /// scratch, so a service announced with a large record set is still withdrawn
 /// rather than silently dropped.
@@ -119,6 +135,19 @@ struct PendingGoodbye<I> {
   next_at: I,
   /// Hard deadline after which the entry is given up even if never delivered.
   expires_at: I,
+  /// `false` until the FIRST round of this goodbye reaches the wire (at least one
+  /// family `Sent`). While `false` — and before [`Self::barrier_expires_at`] —
+  /// this entry is a PENDING BARRIER: a free-name (retirement/rename) TTL=0
+  /// withdrawal that must precede any positive-TTL transmit, so a same-name
+  /// replacement under `with_probe_unique_names(false)` cannot announce a fresh
+  /// positive TTL ahead of the stale TTL=0 and evict itself from peer caches.
+  /// Set once and never cleared.
+  sent_once: bool,
+  /// Hard ceiling on the barrier role only (NOT the entry's retention, which is
+  /// [`Self::expires_at`]). Once `now` passes this, an entry that has still not
+  /// `sent_once` stops blocking positive transmits, so a permanently-`Busy`
+  /// barrier cannot pin the TX loop forever.
+  barrier_expires_at: I,
 }
 
 /// A recent multicast datagram we put on the wire, kept (exact bytes + send time)
@@ -866,7 +895,22 @@ where
 
     self.drain_service_updates(now);
 
-    while let Some((dst, len, origin)) = self.poll_one_transmit(now, scratch) {
+    // ── Free-name goodbye barrier (RFC 6762 §10.1 ordering) ──────────────────
+    // Before placing ANY positive-TTL transmit, attempt the due goodbyes so a
+    // SENDABLE free-name (retirement/rename) TTL=0 withdrawal reaches the wire
+    // FIRST — this drain clears such a barrier in THIS pump. If a goodbye still
+    // has not sent once AND has not passed its barrier ceiling, it is an
+    // un-sendable barrier (all-`Busy`): skip the positive-TTL TX loop this pump
+    // so a same-name replacement registered under `with_probe_unique_names(false)`
+    // cannot announce a fresh positive TTL ahead of the stale TTL=0 (which would
+    // evict the replacement from peer caches). The post-TX `drain_goodbyes` below
+    // is KEPT so newly-queued goodbyes still flush this pump. `poll_deadline`
+    // wakes on `GOODBYE_RETRY_BACKOFF`/`barrier_expires_at`, so a deferred barrier
+    // re-attempts promptly and is released no later than its ceiling.
+    self.drain_goodbyes(now, io);
+    let transmit_barred = self.has_pending_barrier(now);
+
+    while !transmit_barred && let Some((dst, len, origin)) = self.poll_one_transmit(now, scratch) {
       if dst == MDNS_SOCKET_V4 || dst == MDNS_SOCKET_V6 {
         // Multicast: fan out to BOTH groups and confirm synchronously this pump
         // (honors the proto's confirm-on-send contract). `fanout` carries the
@@ -1275,6 +1319,7 @@ where
   fn commit_goodbye(&mut self, len: usize, now: I) {
     self.make_goodbye_room(len, now);
     let expires_at = now.checked_add_duration(MAX_GOODBYE_AGE).unwrap_or(now);
+    let barrier_expires_at = now.checked_add_duration(GOODBYE_BARRIER_MAX).unwrap_or(now);
     let data = self.goodbye_scratch[..len].to_vec();
     self.goodbyes.push(PendingGoodbye {
       data,
@@ -1285,7 +1330,27 @@ where
       rounds_counted: 0,
       next_at: now,
       expires_at,
+      sent_once: false,
+      barrier_expires_at,
     });
+  }
+
+  /// `true` if any pending goodbye is still a barrier: it has not yet reached the
+  /// wire (`!sent_once`) AND has not passed its [`PendingGoodbye::barrier_expires_at`]
+  /// ceiling. The pump defers positive transmits while this holds.
+  ///
+  /// The barrier is intentionally GLOBAL — ANY pending un-sent free-name goodbye
+  /// defers ALL positive transmits, not just same-name ones. This is acceptable
+  /// (and far simpler than name-scoping the proto's transmit queue) because a
+  /// SENDABLE barrier clears in the same pump's pre-TX [`Self::drain_goodbyes`]
+  /// call, so normal operation only gains a goodbye-before-transmit ordering;
+  /// only an UN-sendable (all-`Busy`) barrier actually defers transmits, and that
+  /// is bounded by `barrier_expires_at`.
+  fn has_pending_barrier(&self, now: I) -> bool {
+    self
+      .goodbyes
+      .iter()
+      .any(|g| !g.sent_once && g.barrier_expires_at > now)
   }
 
   /// Send any due §10.1 goodbyes, fanned out to both mDNS groups in priority
@@ -1352,8 +1417,19 @@ where
         // `self` — which would fuse it with the `tx` borrow.
         {
           let entry = &mut goodbyes[idx];
-          #[cfg_attr(not(feature = "stats"), allow(unused_variables))]
           let fanout = tx.burst(io, &entry.data, &mut entry.owed, now);
+          // Part A: this round counts as a real resend ONLY if at least one
+          // family actually put the datagram on the wire. The per-family `owed`
+          // budget is already send-gated by `burst` (a `Busy` family keeps its
+          // count), so the round-advancement here is purely about `next_at`
+          // spacing and the `sent_once` barrier latch.
+          let any_sent = fanout.any_sent();
+          // Part B: latch the barrier the first time the goodbye reaches the wire.
+          // Once `sent_once` is true the entry no longer defers positive transmits
+          // (`has_pending_barrier`).
+          if any_sent {
+            entry.sent_once = true;
+          }
 
           #[cfg(feature = "stats")]
           {
@@ -1403,7 +1479,19 @@ where
             }
           }
 
-          entry.next_at = now.checked_add_duration(GOODBYE_INTERVAL).unwrap_or(now);
+          // Part A: advance to the full `GOODBYE_INTERVAL` spacing only when the
+          // round reached the wire. An all-`Busy`/all-error round (`!any_sent`)
+          // must NOT push `next_at` out by a whole interval — that would stall a
+          // transiently-undeliverable free-name goodbye (and any positive transmit
+          // its barrier blocks) for a full second. Re-attempt soon via the short
+          // `GOODBYE_RETRY_BACKOFF` instead — no busy-spin, no consumed round (the
+          // `owed` budget is untouched because nothing was `Sent`).
+          let next_gap = if any_sent {
+            GOODBYE_INTERVAL
+          } else {
+            GOODBYE_RETRY_BACKOFF
+          };
+          entry.next_at = now.checked_add_duration(next_gap).unwrap_or(now);
         }
         if goodbyes[idx].owed == [0, 0] {
           goodbyes.remove(idx);
@@ -1434,7 +1522,15 @@ where
       }
     }
     for goodbye in &self.goodbyes {
-      let wake = goodbye.next_at.min(goodbye.expires_at);
+      // Wake at the soonest of: the next send attempt (`next_at`, already short
+      // via `GOODBYE_RETRY_BACKOFF` after a failed round), the entry's retention
+      // deadline (`expires_at`), and — while it is still an un-sent barrier — its
+      // `barrier_expires_at` ceiling, so a never-sendable barrier releases the
+      // deferred positive transmits no later than that bound.
+      let mut wake = goodbye.next_at.min(goodbye.expires_at);
+      if !goodbye.sent_once {
+        wake = wake.min(goodbye.barrier_expires_at);
+      }
       best = Some(best.map_or(wake, |b| b.min(wake)));
     }
     best
@@ -1806,6 +1902,173 @@ mod tests {
     assert!(
       !io.sent.is_empty(),
       "the goodbye must go out once the transport frees"
+    );
+  }
+
+  /// Classify a sent datagram by its answer-record TTLs:
+  /// `Some(true)`  — it carries at least one TTL=0 answer (a §10.1 goodbye),
+  /// `Some(false)` — it carries answers, all with TTL>0 (a positive announce),
+  /// `None`        — no parseable answer records (e.g. a probe/query).
+  fn datagram_kind(bytes: &[u8]) -> Option<bool> {
+    use mdns_proto::wire::MessageReader;
+    let reader = MessageReader::try_parse(bytes).ok()?;
+    let mut saw_answer = false;
+    let mut saw_zero_ttl = false;
+    for rec in reader.answers().flatten() {
+      saw_answer = true;
+      if rec.ttl() == 0 {
+        saw_zero_ttl = true;
+      }
+    }
+    if !saw_answer {
+      return None;
+    }
+    Some(saw_zero_ttl)
+  }
+
+  /// Barrier-goodbye regression (Part A + Part B). A free-name TTL=0 goodbye must
+  /// reach the wire BEFORE any positive-TTL transmit of a subsequent pump, so a
+  /// same-name replacement registered under `with_probe_unique_names(false)`
+  /// cannot announce a fresh positive TTL ahead of the stale withdrawal and evict
+  /// itself from peer caches. The sans-I/O mock forces `Busy` on the first goodbye
+  /// round, proving the round is NOT consumed (Part A) and the replacement's
+  /// announce is barrier-deferred until the goodbye sends (Part B).
+  #[test]
+  fn free_name_goodbye_barrier_precedes_a_same_name_replacement_announce() {
+    // `with_probe_unique_names(false)`: both the original and the replacement
+    // announce a positive TTL directly (no §8.1 probe), which is exactly the
+    // configuration in which a stale TTL=0 could be overtaken.
+    let cfg = EndpointConfig::new().with_probe_unique_names(false);
+    let mut engine: Engine<SmoltcpInstant, StdRng> = Engine::new(cfg, StdRng::seed_from_u64(101));
+    let mut io = MockUdp::default();
+    let mut scratch = [0u8; 1500];
+
+    // 1. Register service A and drive it to Established so its instance records
+    //    are confirmed-advertised (goodbye ownership latched).
+    let a = engine.register_service(sample_spec(), at(0)).unwrap();
+    let mut established = false;
+    let mut t = 0i64;
+    for _ in 0..16 {
+      engine.pump(at(t), &mut io, &mut scratch);
+      while let Some(u) = engine.poll_service_update(a) {
+        established |= matches!(u, ServiceUpdate::Established);
+      }
+      t += 250_000;
+    }
+    assert!(
+      established,
+      "service A must reach Established before retirement"
+    );
+
+    // 2. Retire A via a normal unregister → a §10.1 TTL=0 goodbye for A's name.
+    engine.unregister_service(a, at(t));
+    assert_eq!(
+      engine.goodbyes.len(),
+      1,
+      "unregistering an announced service must queue exactly one §10.1 goodbye"
+    );
+    assert!(
+      !engine.goodbyes[0].sent_once,
+      "a freshly-queued goodbye has not sent once — it is a pending barrier"
+    );
+    assert!(
+      engine.has_pending_barrier(at(t)),
+      "an un-sent free-name goodbye is a pending transmit barrier"
+    );
+    let budget_before = engine.goodbyes[0].owed;
+    assert!(budget_before.iter().any(|&n| n > 0));
+
+    // ── Part A: an all-Busy goodbye round consumes nothing and re-arms SHORT ──
+    // Force `Busy` on every family for one due goodbye round (no replacement is
+    // registered yet, so this isolates Part A from any positive transmit). The
+    // round must not spend the per-family budget and must re-arm within the short
+    // GOODBYE_RETRY_BACKOFF rather than a full GOODBYE_INTERVAL.
+    io.v4_fail = Some(SendError::Busy);
+    io.v6_fail = Some(SendError::Busy);
+    io.sent.clear();
+    let busy_at = t + 1; // > next_at (== t) so the round is due
+    engine.pump(at(busy_at), &mut io, &mut scratch);
+    assert_eq!(
+      engine.goodbyes.first().map(|g| g.owed),
+      Some(budget_before),
+      "Part A: an all-Busy goodbye round must not spend the per-family budget"
+    );
+    assert!(
+      !engine.goodbyes.is_empty() && !engine.goodbyes[0].sent_once,
+      "Part A: an all-Busy round must not flip sent_once — the barrier still holds"
+    );
+    let backoff_deadline = at(busy_at)
+      .checked_add_duration(GOODBYE_RETRY_BACKOFF)
+      .unwrap();
+    let interval_deadline = at(busy_at).checked_add_duration(GOODBYE_INTERVAL).unwrap();
+    assert!(
+      engine.goodbyes[0].next_at <= backoff_deadline,
+      "Part A: a failed round must re-arm within GOODBYE_RETRY_BACKOFF"
+    );
+    assert!(
+      engine.goodbyes[0].next_at < interval_deadline,
+      "Part A: a failed round must NOT push next_at out by a full GOODBYE_INTERVAL"
+    );
+
+    // ── Part B: the goodbye precedes a same-name replacement's positive TTL ──
+    // Recover the transport, then register the same-name replacement R under A's
+    // freed name and pump ONCE. Registering R here (rather than earlier) keeps R's
+    // §8.3 announce freshly due (FIRST_ANNOUNCE_DELAY = 0) and never pushed out by
+    // a failed Busy attempt — so this single pump is an apples-to-apples ordering
+    // test: the goodbye and R's announce are BOTH due. With the barrier + pre-TX
+    // drain, the TTL=0 withdrawal is placed FIRST and the barrier clears in the
+    // SAME pump, so the now-unblocked TX loop emits R's positive TTL AFTER it.
+    // Under the pre-fix order (post-TX-only goodbye drain) R's positive TTL would
+    // have reached the wire FIRST, evicting R from peer caches.
+    io.v4_fail = None;
+    io.v6_fail = None;
+    io.sent.clear();
+    // The goodbye re-armed at `busy_at + GOODBYE_RETRY_BACKOFF`; pump just past it
+    // so its next round is due alongside R's freshly-registered announce.
+    let recover_at = backoff_deadline.0.total_micros() + 1;
+    let _r = engine
+      .register_service(sample_spec(), at(recover_at))
+      .unwrap();
+    engine.pump(at(recover_at), &mut io, &mut scratch);
+
+    let first_goodbye = io
+      .sent
+      .iter()
+      .position(|(_, d)| datagram_kind(d) == Some(true));
+    let first_positive = io
+      .sent
+      .iter()
+      .position(|(_, d)| datagram_kind(d) == Some(false));
+    assert!(
+      first_goodbye.is_some(),
+      "the recovered free-name goodbye (TTL=0) must reach the wire; sent kinds = {:?}",
+      io.sent
+        .iter()
+        .map(|(_, d)| datagram_kind(d))
+        .collect::<Vec<_>>()
+    );
+    assert!(
+      first_positive.is_some(),
+      "R's positive-TTL announcement must reach the wire on the recovery pump; \
+       sent kinds = {:?}",
+      io.sent
+        .iter()
+        .map(|(_, d)| datagram_kind(d))
+        .collect::<Vec<_>>()
+    );
+    assert!(
+      first_goodbye < first_positive,
+      "the free-name TTL=0 goodbye must precede R's positive-TTL announcement on \
+       the wire; first_goodbye={first_goodbye:?} first_positive={first_positive:?}, \
+       sent kinds = {:?}",
+      io.sent
+        .iter()
+        .map(|(_, d)| datagram_kind(d))
+        .collect::<Vec<_>>()
+    );
+    assert!(
+      engine.goodbyes.first().is_none_or(|g| g.sent_once),
+      "Part B: once it has sent at least once, the goodbye is no longer a barrier"
     );
   }
 
@@ -2280,6 +2543,8 @@ mod tests {
         rounds_counted: 0,
         next_at: at(0),
         expires_at: at(60_000_000),
+        sent_once: false,
+        barrier_expires_at: at(60_000_000),
       });
     }
     let before: usize = engine.goodbyes.iter().map(|g| g.data.len()).sum();
@@ -2343,6 +2608,8 @@ mod tests {
       rounds_counted: 0,
       next_at: at(5_000_000),
       expires_at: at(60_000_000),
+      sent_once: false,
+      barrier_expires_at: at(60_000_000),
     });
     // No rename: just a graceful unregister. The large main goodbye must be committed
     // by its EXACT size — the pre-existing entry must NOT be evicted by a speculative
