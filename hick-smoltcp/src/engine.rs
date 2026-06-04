@@ -1077,7 +1077,13 @@ where
             .get_mut(&handle)
             .and_then(|slot| slot.proto.take_rename_goodbye_handoff());
           if let Some(handoff) = handoff {
-            self.endpoint.enqueue_rename_withdrawal(handoff, now);
+            // A rename COLLISION (rename_result Err) tears the service down: its old
+            // name must HOLD until the goodbye completes so a quick re-register
+            // cannot cancel the only retraction. A SURVIVING rename
+            // stays reclaimable.
+            self
+              .endpoint
+              .enqueue_rename_withdrawal(handoff, now, rename_result.is_err());
           }
           if rename_result.is_err() {
             // The new name collides with another local service; the service has
@@ -1148,7 +1154,9 @@ where
       None => return,
     };
     if let Some(handoff) = handoff {
-      self.endpoint.enqueue_rename_withdrawal(handoff, now);
+      // Retirement = the service is dead: hold its old name until the goodbye
+      // completes so a re-register cannot cancel it.
+      self.endpoint.enqueue_rename_withdrawal(handoff, now, true);
     }
     self.endpoint.begin_withdrawal(handle, snap, now);
   }
@@ -1248,6 +1256,7 @@ where
               handle,
               slot.proto.advertised_a_addrs(),
               slot.proto.advertised_aaaa_addrs(),
+              slot.proto.advertises_instance(),
             );
           }
         }
