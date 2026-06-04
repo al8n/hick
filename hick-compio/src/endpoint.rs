@@ -180,9 +180,13 @@ impl Endpoint {
   /// [`ServiceUpdate`]: mdns_proto::ServiceUpdate
   pub async fn register_service(&self, spec: ServiceSpec) -> Result<Service, RegisterError> {
     let now = std::time::Instant::now();
+    // The handle-owned delivery mailbox: the driver ctx holds one clone (fills
+    // it), the returned `Service` handle holds the other (drains it). Created
+    // before the proto registration so both sides share the same buffer.
+    let mailbox = crate::service::new_service_mailbox();
     let handle = {
       let mut st = self.inner.state.borrow_mut();
-      st.register_service(spec, now)
+      st.register_service(spec, now, std::rc::Rc::clone(&mailbox))
         .map_err(RegisterError::from)?
     };
     // Durable wake: a bare `notify()` can be lost across the driver's
@@ -192,6 +196,7 @@ impl Endpoint {
     Ok(Service {
       inner: self.inner.clone(),
       handle,
+      mailbox,
     })
   }
 
