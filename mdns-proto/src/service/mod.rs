@@ -5,6 +5,9 @@ mod respond;
 mod schedule;
 mod state;
 
+#[cfg(any(feature = "alloc", feature = "std"))]
+use bytes::Bytes;
+
 /// Which of OUR owner names a known-answer's record name matched. §7.1
 /// suppression is per RRset, and an RRset is identified by (name, type, class,
 /// rdata). A known-answer with our rtype + rdata but a DIFFERENT owner name is a
@@ -96,7 +99,7 @@ const CONFLICT_REPROBE_MIN_INTERVAL: core::time::Duration = core::time::Duration
 struct PeerRecord {
   rtype: crate::wire::ResourceType,
   /// Canonical byte form of the rdata (same encoding used by KAS hashing).
-  canonical: std::vec::Vec<u8>,
+  canonical: Bytes,
 }
 
 /// A per-source bucket of probe records observed during the current probe round.
@@ -275,7 +278,7 @@ fn compare_rr_sets_we_lose(
       .map(|p| {
         let mut buf = std::vec::Vec::new();
         buf.extend_from_slice(&p.rtype.to_u16().to_be_bytes());
-        buf.extend_from_slice(&p.canonical);
+        buf.extend_from_slice(&p.canonical[..]);
         buf
       })
       .collect();
@@ -1186,7 +1189,7 @@ where
         };
         let mut scratch = std::vec::Vec::new();
         let canonical = match respond::canonical_rdata_for_hash(&view, &mut scratch) {
-          Ok(c) => c.to_vec(),
+          Ok(c) => Bytes::copy_from_slice(c),
           Err(_) => return, // canonicalization error — drop without touching buckets
         };
         let rtype = pc.record().rtype();
