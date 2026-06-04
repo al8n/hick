@@ -17,7 +17,7 @@ use core::{net::SocketAddr, time::Duration};
 use mdns_proto::{
   CollectedAnswer, EndpointConfig, Instant, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec,
   cache::CacheEntry,
-  endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
+  endpoint::{Endpoint, EndpointEventEntry, ServiceRoute, WithdrawalSend},
   error::{RegisterServiceError, StartQueryError},
   event::{EndpointEvent, QueryUpdate, RouteEvent, ServiceUpdate},
   query::Query,
@@ -179,6 +179,20 @@ impl FamilySend {
   /// Whether the datagram actually reached this family's socket.
   fn is_sent(self) -> bool {
     matches!(self, FamilySend::Sent(_))
+  }
+
+  /// Map this family's send outcome to the per-family withdrawal debt result the
+  /// endpoint consumes: a queued send spends one of the family's owed rounds
+  /// (`Sent`); a transiently-full socket keeps its debt to retry (`Busy` →
+  /// `Retry`); an absent socket or a real I/O failure writes the debt off
+  /// (`Unsupported`/`Failed` → `WriteOff`), since that family has no reachable
+  /// peers to withdraw from.
+  fn withdrawal_send(self) -> WithdrawalSend {
+    match self {
+      FamilySend::Sent(_) => WithdrawalSend::Sent,
+      FamilySend::Busy => WithdrawalSend::Retry,
+      FamilySend::Unsupported | FamilySend::Failed => WithdrawalSend::WriteOff,
+    }
   }
 }
 
@@ -615,11 +629,11 @@ where
   ///
   /// The withdrawal covers whatever the service must retract: the records it
   /// confirmed-emitted under its current name (host A/AAAA filtered against
-  /// same-host siblings by the endpoint), OR — if a conflict rename left an
-  /// old-name withdrawal pending — that old instance name first
-  /// ([`Service::withdrawal_snapshot`] prioritises the rename goodbye). A
-  /// never-announced service has an empty snapshot and completes on the next
-  /// pump with no datagram on the wire.
+  /// same-host siblings by the endpoint), AND — if a conflict rename left an
+  /// old-name withdrawal still pending — that old instance name too, in the SAME
+  /// goodbye ([`Service::withdrawal_snapshot`] captures both). A never-announced
+  /// service has an empty snapshot and completes on the next pump with no
+  /// datagram on the wire.
   ///
   /// The driver slot is NOT removed here: it is kept (marked `errored`) so any
   /// already-queued `ServiceUpdate::Conflict` still reaches the host, and is GC'd
@@ -894,9 +908,16 @@ where
           fanout.sent_count()
         );
       }
-      self
-        .endpoint
-        .note_withdrawal_result(handle, now, fanout.any_sent());
+      // Report EACH family's outcome so the endpoint tracks per-family debt: a
+      // withdrawal frees only once every reachable family has withdrawn its
+      // records. v4-Sent + v6-Busy keeps v6's debt so a v6 recovery before
+      // the 2 s ceiling still emits its TTL=0 goodbye.
+      self.endpoint.note_withdrawal_result(
+        handle,
+        now,
+        fanout.v4.withdrawal_send(),
+        fanout.v6.withdrawal_send(),
+      );
     }
     // Free completed withdrawals (budget spent or ceiling reached): the endpoint
     // releases each route (decrementing services_active) and reports the handle;
@@ -1048,8 +1069,8 @@ where
 
   /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: snapshot
   /// what its goodbye must retract ([`Service::withdrawal_snapshot`], which
-  /// prioritises a pending conflict-rename old-name goodbye over the current
-  /// state) and hand it to [`Endpoint::begin_withdrawal`]. The endpoint KEEPS the
+  /// captures both the current records and any pending conflict-rename old-name
+  /// goodbye) and hand it to [`Endpoint::begin_withdrawal`]. The endpoint KEEPS the
   /// route (holding the name) and drives the resend schedule; the route is freed
   /// and the driver slot GC'd when [`Endpoint::drain_completed_withdrawals`]
   /// reports completion in [`Self::pump`].
@@ -1152,6 +1173,19 @@ where
       Origin::Service(handle) => {
         if let Some(slot) = self.services.get_mut(&handle) {
           slot.proto.note_transmit_result(now, delivered);
+          // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
+          // route so sibling host-address retention (during a same-host
+          // withdrawal) honours what this service ACTUALLY announced, not its
+          // configured addresses. Idempotent overwrite; only meaningful after a
+          // delivered announce, harmless otherwise. `slot.proto` (read) and
+          // `self.endpoint` (mut) are disjoint fields, so this borrow is fine.
+          if delivered {
+            self.endpoint.note_service_advertised(
+              handle,
+              slot.proto.advertised_a_addrs(),
+              slot.proto.advertised_aaaa_addrs(),
+            );
+          }
         }
       }
       Origin::Query(handle) => {
@@ -2706,6 +2740,80 @@ mod tests {
       snap_after.send_errors - snap_before.send_errors,
       0,
       "dual-stack healthy: send_errors must be 0"
+    );
+  }
+
+  /// regression: per-family withdrawal debt at the driver level.
+  /// With v4 healthy but v6 transiently BUSY, the withdrawal must NOT free before
+  /// v6 sends — v6 peers still hold the records. v4 drains its debt (and keeps
+  /// re-withdrawing harmlessly), yet the route stays held WITHIN the 2 s ceiling
+  /// until v6 recovers and emits its own TTL=0 goodbyes, at which point it
+  /// completes (well before the ceiling).
+  #[cfg(feature = "stats")]
+  #[test]
+  fn stats_withdrawal_v6_busy_until_recovery_not_freed_before_v6_sends() {
+    let mut engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(2006));
+    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+    let mut io = MockUdp::default();
+    let mut scratch = [0u8; 1500];
+    for micros in pump_schedule() {
+      engine.pump(at(micros), &mut io, &mut scratch);
+    }
+    // Drain announce-phase updates so the slot's only remaining lifecycle is the
+    // withdrawal (a completed slot is GC'd only after its updates are read).
+    while engine.poll_service_update(handle).is_some() {}
+    engine.unregister_service(handle, at(5_000_000)); // ceiling at 7_000_000
+    // Only count withdrawal-phase datagrams (the announce phase already put v4+v6
+    // POSITIVE-TTL records on the wire).
+    io.sent.clear();
+
+    // v6 transiently busy, v4 healthy. Pump rounds 250 ms apart (WITHDRAWAL_INTERVAL,
+    // since v4 keeps making progress) but WELL within the 2 s ceiling. v4 spends its
+    // whole debt; v6's debt is untouched, so the withdrawal stays HELD.
+    io.v6_fail = Some(SendError::Busy);
+    for micros in [5_250_001, 5_500_001, 5_750_001, 6_000_001] {
+      engine.pump(at(micros), &mut io, &mut scratch);
+      while engine.poll_service_update(handle).is_some() {}
+    }
+    assert!(
+      engine.services.contains_key(&handle),
+      "a withdrawal whose v6 family is still busy must NOT be freed before the \
+       2 s ceiling — v6 peers still hold the records"
+    );
+    let v6_before = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V6).count();
+    assert_eq!(
+      v6_before, 0,
+      "no v6 goodbye can have reached the wire while v6 was busy; got {v6_before}"
+    );
+    // v4 DID withdraw (its debt drained), proving the route is held on v6 alone.
+    assert!(
+      io.sent.iter().any(|(d, _)| *d == MDNS_SOCKET_V4),
+      "v4 must have emitted its TTL=0 goodbyes while v6 was busy"
+    );
+
+    // v6 recovers: pump until the withdrawal completes (route freed). Still inside
+    // the 2 s ceiling, so completion is a real per-family budget spend, not the
+    // anti-pin backstop.
+    io.v6_fail = None;
+    let mut completed = false;
+    for micros in [6_250_001, 6_500_001, 6_750_001, 6_900_001] {
+      engine.pump(at(micros), &mut io, &mut scratch);
+      while engine.poll_service_update(handle).is_some() {}
+      if !engine.services.contains_key(&handle) {
+        completed = true;
+        break;
+      }
+    }
+    assert!(
+      completed,
+      "once v6 recovers and sends its goodbyes the withdrawal completes (before \
+       the 2 s ceiling)"
+    );
+    let v6_after = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V6).count();
+    assert!(
+      v6_after >= 1,
+      "v6 must have emitted at least one TTL=0 goodbye after recovery; got {v6_after}"
     );
   }
 

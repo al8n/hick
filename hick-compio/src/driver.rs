@@ -39,8 +39,8 @@ use std::{
 
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
-  QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate, query::Query as ProtoQuery,
-  service::Service as ProtoSvc, transmit::Transmit,
+  QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate, WithdrawalSend,
+  query::Query as ProtoQuery, service::Service as ProtoSvc, transmit::Transmit,
 };
 
 /// Per-iteration cap on the transmit pump.  Mirrors
@@ -401,18 +401,18 @@ impl State {
   /// ctx `errored` (so every subsequent pump skips it for transmits, deadlines,
   /// and ticks — its proto state machine is finished), snapshot what its goodbye
   /// must retract ([`mdns_proto::service::Service::withdrawal_snapshot`], which
-  /// prioritises a pending conflict-rename old-name goodbye over the current
-  /// state), and hand it to [`ProtoEndpoint::begin_withdrawal`]. The endpoint KEEPS
+  /// captures both the current records and any pending conflict-rename old-name
+  /// goodbye), and hand it to [`ProtoEndpoint::begin_withdrawal`]. The endpoint KEEPS
   /// the route (holding the name against a same-name re-registration) and drives
   /// the TTL=0 goodbye resend schedule; the run loop pumps each due goodbye
   /// datagram and, on completion, frees the route and GCs the driver ctx.
   ///
   /// The withdrawal covers whatever the service must retract: the records it
   /// confirmed-emitted under its current name (host A/AAAA filtered against
-  /// same-host siblings by the endpoint), OR — if a conflict rename left an
-  /// old-name withdrawal pending — that old instance name first. A never-announced
-  /// service has an empty snapshot and completes on the next loop iteration with no
-  /// datagram on the wire.
+  /// same-host siblings by the endpoint), AND — if a conflict rename left an
+  /// old-name withdrawal still pending — that old instance name too, in the SAME
+  /// goodbye. A never-announced service has an empty snapshot and completes on the
+  /// next loop iteration with no datagram on the wire.
   ///
   /// The driver ctx is NOT removed here: it is kept (marked `errored`) so any
   /// already-queued `ServiceUpdate::Conflict` still reaches the host before the ctx
@@ -445,17 +445,20 @@ impl State {
     self.endpoint.poll_withdrawal_transmit(now, scratch)
   }
 
-  /// Confirm a withdrawal goodbye round: `delivered` is `true` iff at least one
-  /// family put the datagram on the wire. A delivered round spends one resend; a
-  /// fully-failed round is re-armed by the endpoint (short backoff) WITHOUT
-  /// spending. No-op for an unknown handle.
+  /// Confirm a withdrawal goodbye round, reporting EACH family's
+  /// [`WithdrawalSend`] outcome so the endpoint tracks per-family debt: a
+  /// withdrawal frees only once every reachable family has withdrawn its records.
+  /// A family that `Sent` spends one of its resend rounds; a busy family `Retry`s
+  /// (keeps its debt); an absent-socket / permanent-error family is written off.
+  /// No-op for an unknown handle.
   pub(crate) fn note_withdrawal_result(
     &mut self,
     handle: ServiceHandle,
     now: StdInstant,
-    delivered: bool,
+    v4: WithdrawalSend,
+    v6: WithdrawalSend,
   ) {
-    self.endpoint.note_withdrawal_result(handle, now, delivered);
+    self.endpoint.note_withdrawal_result(handle, now, v4, v6);
   }
 
   /// Free + GC every endpoint-owned withdrawal that COMPLETED (its resend budget
@@ -608,7 +611,8 @@ impl State {
               // already rebranded and can't be kept. Surface `Conflict` into the
               // in-ctx deque (drained directly by `Service::next`) and arm the
               // one-shot wake, then begin the endpoint-owned withdrawal. Its
-              // snapshot prioritises the proto's pending OLD-name rename goodbye
+              // snapshot captures the proto's pending OLD-name rename goodbye
+              // alongside the current records
               // ([`mdns_proto::service::Service::withdrawal_snapshot`]); the
               // endpoint holds the route (keeping the OLD name reserved) while it
               // resends, freeing the name on completion. This is the conformant RFC
@@ -816,6 +820,19 @@ impl State {
   ) {
     if let Some(ctx) = self.services.get_mut(&h) {
       ctx.proto.note_transmit_result(now, delivered);
+      // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
+      // route so sibling host-address retention (during a same-host withdrawal)
+      // honours what this service ACTUALLY announced, not its configured
+      // addresses. Idempotent overwrite; only meaningful after a delivered send.
+      // `self.services` (via `ctx`) and `self.endpoint` are disjoint fields, so
+      // this borrow split is sound.
+      if delivered {
+        self.endpoint.note_service_advertised(
+          h,
+          ctx.proto.advertised_a_addrs(),
+          ctx.proto.advertised_aaaa_addrs(),
+        );
+      }
     }
   }
 
@@ -1483,6 +1500,26 @@ pub(crate) async fn run(
   }
 }
 
+/// Map a PRESENT (bound) family's `send_to` result to its per-family withdrawal
+/// outcome: `Ok` → [`WithdrawalSend::Sent`] (spend one owed round); ANY
+/// `Err` → [`WithdrawalSend::Retry`] (keep the debt, retry until success or the
+/// 2 s ceiling).
+///
+/// The classification is deliberately NOT by `io::ErrorKind`: a BOUND UDP socket
+/// can fail transiently with a kind other than `WouldBlock`/`Interrupted` (e.g.
+/// `ENOBUFS` buffer pressure, transient route/interface churn). Writing such a
+/// family off would zero its goodbye debt and free the route as soon as the OTHER
+/// family drained, leaving this family's peers pinned to stale positive-TTL
+/// records. [`WithdrawalSend::WriteOff`] is reserved for an ABSENT socket (handled
+/// by the caller, which only invokes this for a present one); the ceiling is the
+/// backstop for a genuinely-wedged bound socket.
+fn present_socket_send_outcome<T>(res: &std::io::Result<T>) -> WithdrawalSend {
+  match res {
+    Ok(_) => WithdrawalSend::Sent,
+    Err(_) => WithdrawalSend::Retry,
+  }
+}
+
 /// Pump every DUE endpoint-owned RFC 6762 §10.1 withdrawal goodbye once, fanning
 /// each out to both bound multicast families, then free + GC every completed
 /// withdrawal.
@@ -1501,6 +1538,18 @@ pub(crate) async fn run(
 /// (decrementing `services_active`) and GCs its driver ctx — deferring the GC of a
 /// ctx that still holds an undrained `Conflict` (`route_freed`), so that `Conflict`
 /// survives a withdrawal completing in the same iteration that began it.
+///
+/// Per-family [`WithdrawalSend`] is mapped by socket PRESENCE, not error kind:
+///   * present socket, `Ok` → [`WithdrawalSend::Sent`] (spend one owed round);
+///   * present socket, ANY `Err` → [`WithdrawalSend::Retry`] (keep the debt and
+///     retry until success or the 2 s ceiling). A BOUND UDP socket can fail
+///     transiently (e.g. `ENOBUFS` buffer pressure, route/interface churn) with an
+///     error kind other than `WouldBlock`/`Interrupted`; treating those as a
+///     permanent write-off would free the route after the OTHER family drains and
+///     leave this family's peers pinned to stale positive-TTL records. The ceiling
+///     is the backstop for a genuinely-wedged bound socket;
+///   * absent socket (family not bound) → [`WithdrawalSend::WriteOff`] (no reachable
+///     peers on it), so its debt never pins the withdrawal past the other family.
 async fn drain_withdrawals(
   inner: &Rc<EndpointInner>,
   sock_v4: &Option<Rc<Socket>>,
@@ -1521,62 +1570,75 @@ async fn drain_withdrawals(
     // stamping at the syscall) so `when <= kernel_send_time <= echo_rx_time`
     // and the kernel-looped goodbye stays inside the 1 ms Ordered self-send
     // match window.
-    // `goodbye_sent_any` is load-bearing (not stats-only): `delivered` decides
-    // whether the endpoint spends this round.
-    let mut goodbye_sent_any = false;
+    // Per-family outcome is load-bearing (not stats-only): the endpoint tracks
+    // per-family debt, so a withdrawal frees only once EVERY reachable family
+    // has withdrawn its records. A family with no bound socket is `WriteOff` (no
+    // peers reachable on it to withdraw from) so its debt never pins the other.
+    let mut v4_out = WithdrawalSend::WriteOff;
+    let mut v6_out = WithdrawalSend::WriteOff;
     if let Some(s4) = sock_v4.as_ref() {
       let when = SystemTime::now();
       let res = s4.send_to(&scratch[..len], MDNS_V4_DST, None).await;
-      if res.is_ok() {
-        hick_trace::trace!(dst = %MDNS_V4_DST, len, "withdrawal send_to v4");
-        let mut state = inner.state.borrow_mut();
-        crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
-        #[cfg(feature = "stats")]
-        {
-          state.stats.packets_tx(1);
-          state.stats.bytes_tx(len as u64);
+      // Present socket: Ok → Sent, ANY Err → Retry (never WriteOff). See
+      // `present_socket_send_outcome`.
+      v4_out = present_socket_send_outcome(&res);
+      match res {
+        Ok(_) => {
+          hick_trace::trace!(dst = %MDNS_V4_DST, len, "withdrawal send_to v4");
+          let mut state = inner.state.borrow_mut();
+          crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
+          #[cfg(feature = "stats")]
+          {
+            state.stats.packets_tx(1);
+            state.stats.bytes_tx(len as u64);
+          }
         }
-        goodbye_sent_any = true;
-      } else {
-        hick_trace::debug!(dst = %MDNS_V4_DST, "withdrawal send_to v4 failed");
-        #[cfg(feature = "stats")]
-        inner.state.borrow().stats.send_errors(1);
+        Err(_e) => {
+          hick_trace::debug!(error = %_e, dst = %MDNS_V4_DST, "withdrawal send_to v4 failed");
+          #[cfg(feature = "stats")]
+          inner.state.borrow().stats.send_errors(1);
+        }
       }
     }
     if let Some(s6) = sock_v6.as_ref() {
       let when = SystemTime::now();
       let res = s6.send_to(&scratch[..len], MDNS_V6_DST, None).await;
-      if res.is_ok() {
-        hick_trace::trace!(dst = %MDNS_V6_DST, len, "withdrawal send_to v6");
-        let mut state = inner.state.borrow_mut();
-        crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
-        #[cfg(feature = "stats")]
-        {
-          state.stats.packets_tx(1);
-          state.stats.bytes_tx(len as u64);
+      // Present socket: Ok → Sent, ANY Err → Retry (never WriteOff). See
+      // `present_socket_send_outcome`.
+      v6_out = present_socket_send_outcome(&res);
+      match res {
+        Ok(_) => {
+          hick_trace::trace!(dst = %MDNS_V6_DST, len, "withdrawal send_to v6");
+          let mut state = inner.state.borrow_mut();
+          crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
+          #[cfg(feature = "stats")]
+          {
+            state.stats.packets_tx(1);
+            state.stats.bytes_tx(len as u64);
+          }
         }
-        goodbye_sent_any = true;
-      } else {
-        hick_trace::debug!(dst = %MDNS_V6_DST, "withdrawal send_to v6 failed");
-        #[cfg(feature = "stats")]
-        inner.state.borrow().stats.send_errors(1);
+        Err(_e) => {
+          hick_trace::debug!(error = %_e, dst = %MDNS_V6_DST, "withdrawal send_to v6 failed");
+          #[cfg(feature = "stats")]
+          inner.state.borrow().stats.send_errors(1);
+        }
       }
     }
-    // Count the goodbye as a delivered round when at least one family succeeded;
+    // Count the goodbye as a delivered round when at least one family Sent;
     // `send_to` already bumped packets_tx/bytes_tx/send_errors per family above.
     #[cfg(feature = "stats")]
-    if goodbye_sent_any {
+    if matches!(v4_out, WithdrawalSend::Sent) || matches!(v6_out, WithdrawalSend::Sent) {
       inner.state.borrow().stats.goodbyes_tx(1);
     }
-    // The endpoint spends a resend + re-arms at WITHDRAWAL_INTERVAL on a delivered
-    // round; an all-failing round re-arms at the short backoff with the budget
-    // intact.
+    // The endpoint spends a resend per Sent family + re-arms at WITHDRAWAL_INTERVAL
+    // on a round with progress; a no-send round re-arms at the short backoff with
+    // the family's budget intact (busy → Retry) or written off (permanent error).
     {
       let now = StdInstant::now();
       inner
         .state
         .borrow_mut()
-        .note_withdrawal_result(handle, now, goodbye_sent_any);
+        .note_withdrawal_result(handle, now, v4_out, v6_out);
     }
   }
   // Free + GC every completed withdrawal (budget spent or 2 s ceiling reached).
@@ -1659,6 +1721,40 @@ mod tests {
     n.notify();
     compio::time::sleep(std::time::Duration::from_millis(10)).await;
     assert!(woken.get(), "listener woken by notify()");
+  }
+
+  /// regression: a PRESENT (bound) family's `send_to` failure
+  /// must map to `Retry` (keep the debt, retry until the 2 s ceiling), NOT
+  /// `WriteOff`. A bound UDP socket can return transient errors whose kind is
+  /// NOT `WouldBlock`/`Interrupted` (e.g. `ENOBUFS`, route/interface churn);
+  /// writing that family off would free the route once the OTHER family drained
+  /// and strand this family's peers on stale positive-TTL records. `WriteOff` is
+  /// reserved for an ABSENT socket (the caller's `let mut … = WriteOff` default),
+  /// never produced by this present-socket classifier.
+  #[test]
+  fn present_socket_send_error_is_retry_not_writeoff() {
+    // Ok → Sent.
+    assert_eq!(
+      present_socket_send_outcome::<usize>(&Ok(42)),
+      WithdrawalSend::Sent,
+    );
+    // Every non-WouldBlock/Interrupted error kind a bound socket might surface
+    // must still be Retry (NEVER WriteOff).
+    for kind in [
+      std::io::ErrorKind::WouldBlock,
+      std::io::ErrorKind::Interrupted,
+      std::io::ErrorKind::OutOfMemory, // stands in for ENOBUFS buffer pressure
+      std::io::ErrorKind::AddrNotAvailable, // transient interface/route churn
+      std::io::ErrorKind::PermissionDenied,
+      std::io::ErrorKind::Other,
+    ] {
+      let res: std::io::Result<usize> = Err(std::io::Error::from(kind));
+      assert_eq!(
+        present_socket_send_outcome(&res),
+        WithdrawalSend::Retry,
+        "a present (bound) socket error ({kind:?}) must be Retry, not WriteOff"
+      );
+    }
   }
 
   /// `is_mdns_multicast_dst` must accept BOTH multicast service groups on
@@ -1996,7 +2092,12 @@ mod tests {
     for _ in 0..64 {
       t += Duration::from_millis(250);
       while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
-        s.note_withdrawal_result(h, t, false);
+        // No sockets bound in this State-level test: model BOTH families as
+        // transiently undeliverable (Retry) so the per-family budget stays intact
+        // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
+        // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
+        // instead, defeating the ceiling assertion.)
+        s.note_withdrawal_result(h, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
       }
       s.drain_completed_withdrawals(t);
       if !s.services.contains_key(&handle) {
@@ -2151,7 +2252,12 @@ mod tests {
     for _ in 0..64 {
       t += Duration::from_millis(250);
       while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
-        s.note_withdrawal_result(h, t, false);
+        // No sockets bound in this State-level test: model BOTH families as
+        // transiently undeliverable (Retry) so the per-family budget stays intact
+        // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
+        // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
+        // instead, defeating the ceiling assertion.)
+        s.note_withdrawal_result(h, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
       }
       s.drain_completed_withdrawals(t);
       if !s.services.contains_key(&a) {
@@ -2920,7 +3026,12 @@ mod tests {
     for _ in 0..64 {
       t += Duration::from_millis(250);
       while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
-        s.note_withdrawal_result(h, t, false);
+        // No sockets bound in this State-level test: model BOTH families as
+        // transiently undeliverable (Retry) so the per-family budget stays intact
+        // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
+        // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
+        // instead, defeating the ceiling assertion.)
+        s.note_withdrawal_result(h, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
       }
       s.drain_completed_withdrawals(t);
       if !s.services.contains_key(&handle_a) {
@@ -2957,14 +3068,15 @@ mod tests {
   /// withdrawal of A's OLD instance name). The OLD driver stole that goodbye into
   /// its own queue before freeing the old name, then guarded against replaying it
   /// on A's drop. The endpoint now enforces this STRUCTURALLY: the rename-collision
-  /// teardown begins an endpoint-owned withdrawal whose snapshot prioritises the
-  /// pending rename goodbye, and the endpoint HOLDS the OLD name for the whole
-  /// withdrawal — so a replacement R cannot register (and evict the old name from
-  /// peer caches) until the goodbye completes. No steal, no replay-guard needed.
+  /// teardown begins an endpoint-owned withdrawal whose snapshot captures the
+  /// pending rename goodbye (alongside the current records), and the endpoint
+  /// HOLDS the OLD name for the whole withdrawal — so a replacement R cannot
+  /// register (and evict the old name from peer caches) until the goodbye
+  /// completes. No steal, no replay-guard needed.
   ///
   /// (That the withdrawal snapshot CONSUMES the proto's `pending_rename_goodbye`
   /// is covered at the proto level by
-  /// `withdrawal_snapshot_of_pending_rename_goodbye_takes_old_name`.)
+  /// `withdrawal_snapshot_of_pending_rename_goodbye_captures_old_name_in_rename_field`.)
   ///
   /// Asserts:
   /// 1. After collision retirement A is errored + the endpoint holds the OLD name,
@@ -3127,7 +3239,12 @@ mod tests {
     for _ in 0..64 {
       t += Duration::from_millis(250);
       while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
-        s.note_withdrawal_result(h, t, false);
+        // No sockets bound in this State-level test: model BOTH families as
+        // transiently undeliverable (Retry) so the per-family budget stays intact
+        // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
+        // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
+        // instead, defeating the ceiling assertion.)
+        s.note_withdrawal_result(h, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
       }
       s.drain_completed_withdrawals(t);
       if !s.services.contains_key(&handle_a) {
@@ -3562,8 +3679,9 @@ mod tests {
   ///
   /// When a rename collision is detected inside `push_service_updates`, the
   /// teardown begins an endpoint-owned withdrawal (`begin_service_withdrawal`)
-  /// whose snapshot prioritises `proto.pending_rename_goodbye` and whose first
-  /// goodbye round is due IMMEDIATELY (`next_at = now`). Under the wrong order —
+  /// whose snapshot captures `proto.pending_rename_goodbye` (with the current
+  /// records) and whose first goodbye round is due IMMEDIATELY (`next_at = now`).
+  /// Under the wrong order —
   /// withdrawal pump first, then `push_service_updates` — the pump would run
   /// before the withdrawal exists, deferring its first goodbye to the NEXT
   /// iteration (whose Phase-1 transmit pump runs first). The endpoint holds the
