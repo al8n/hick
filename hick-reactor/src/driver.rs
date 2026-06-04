@@ -225,19 +225,21 @@ impl<N: Net> DriverState<N> {
         // sending the command and awaiting the reply, `reply.send`
         // will fail. Roll back the proto/driver-side state so no
         // orphan Service is left probing/announcing without a handle.
+        //
+        // The renamed-away old-name goodbye this registration RECLAIMS is no longer
+        // cancelled at register time: the reclaim-cancel moved to the endpoint's
+        // CANCEL-ON-ANNOUNCE (`note_service_advertised`), a certain live event, so a
+        // dropped registration here cannot lose it — an orphan that never announces
+        // simply lets the old goodbye complete. The rollback therefore
+        // only removes the orphan service.
         let result = self.register_service(spec, now);
         if let Ok(ref ok) = result {
           let handle = ok.handle;
           if let Err(returned) = reply.send(result) {
             // returned is the (now-unowned) Result<ServiceRegistered, _>;
-            // dropping it drops the receiver half of the per-handle
-            // channel, but the proto Service still lives in our map
-            // until we GC it explicitly here.
+            // dropping it drops the receiver half of the per-handle channel, but the
+            // proto Service still lives in our map until we GC it here.
             drop(returned);
-            // go through the shared retirement path. The service was just
-            // registered (still probing, never announced), so its withdrawal
-            // snapshot is empty and the endpoint completes it immediately with no
-            // goodbye on the wire — the rollback stays silent, as it should.
             self.remove_service(handle, now);
             hick_trace::debug!(
               ?handle,
@@ -570,7 +572,11 @@ impl<N: Net> DriverState<N> {
               // rename is observed and enqueue it on the endpoint — the Service no
               // longer drains the old-name goodbye itself.
               if let Some(h) = ctx.proto.take_rename_goodbye_handoff() {
-                endpoint.enqueue_rename_withdrawal(h, now);
+                // A rename COLLISION (rename_result Err) tears the service down: its
+                // old name must HOLD until the goodbye completes so a quick
+                // re-register cannot cancel the only retraction. A
+                // SURVIVING rename stays reclaimable.
+                endpoint.enqueue_rename_withdrawal(h, now, rename_result.is_err());
               }
               match rename_result {
                 Ok(()) => upd,
@@ -822,6 +828,7 @@ impl<N: Net> DriverState<N> {
               h,
               ctx.proto.advertised_a_addrs(),
               ctx.proto.advertised_aaaa_addrs(),
+              ctx.proto.advertises_instance(),
             );
           }
         }
@@ -858,7 +865,9 @@ impl<N: Net> DriverState<N> {
             // path, not just the update-drain site. (A persistently-encode-failing
             // service never announced, so this is usually `None` — but uniform.)
             if let Some(handoff) = ctx.proto.take_rename_goodbye_handoff() {
-              endpoint.enqueue_rename_withdrawal(handoff, now);
+              // Retirement = the service is dead: hold its old name until the
+              // goodbye completes.
+              endpoint.enqueue_rename_withdrawal(handoff, now, true);
             }
             let snap = ctx.proto.withdrawal_snapshot();
             endpoint.begin_withdrawal(h, snap, now);
@@ -1045,7 +1054,9 @@ impl<N: Net> DriverState<N> {
       None => return,
     };
     if let Some(handoff) = handoff {
-      self.endpoint.enqueue_rename_withdrawal(handoff, now);
+      // Retirement = the service is dead: hold its old name until the goodbye
+      // completes so a re-register cannot cancel it.
+      self.endpoint.enqueue_rename_withdrawal(handoff, now, true);
     }
     self.endpoint.begin_withdrawal(handle, snap, now);
   }
@@ -3072,6 +3083,163 @@ mod tests {
       matches!(drained, Some(ServiceUpdate::Conflict)),
       "the Conflict queued at retirement must survive the unconditional ctx GC and \
        stay readable from the handle-owned mailbox; got {drained:?}"
+    );
+
+    drop(reg);
+  }
+
+  /// a reactor RegisterService that RECLAIMS a renamed-away old
+  /// name's detached goodbye must not LOSE that goodbye if the caller drops the
+  /// reply receiver. Under cancel-on-announce the goodbye is cancelled only when the
+  /// reclaiming service confirms advertising the name; a dropped-reply orphan is
+  /// removed before it ever announces, so the goodbye is never cancelled and still
+  /// emits the TTL=0 retraction. Seeds a real detached old-name goodbye by driving
+  /// an announced service through a §9 rename, then re-registers the OLD name with a
+  /// dropped reply and asserts the goodbye survives.
+  #[cfg(feature = "tokio")]
+  #[tokio::test]
+  async fn dropped_reply_reclaiming_register_keeps_old_name_goodbye() {
+    use std::{
+      net::{IpAddr, Ipv4Addr, SocketAddr},
+      time::Duration,
+    };
+
+    use mdns_proto::{
+      Name, ServiceRecords, ServiceSpec,
+      event::RouteEvent,
+      wire::{Header, MessageBuilder},
+    };
+
+    use crate::command::Command;
+
+    let opts = crate::options::ServerOptions::default();
+    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+      v4: None,
+      v6: None,
+      interface_index: 0,
+    };
+    let mut state = DriverState::new(&opts, sockets);
+    let now = StdInstant::now();
+
+    let old_inst = Name::try_from_str("Old._ipp._tcp.local.").unwrap();
+    let mut r = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      old_inst.clone(),
+      Name::try_from_str("old-host.local.").unwrap(),
+      631,
+      120,
+    );
+    r.add_a(Ipv4Addr::new(192, 168, 1, 10));
+    // Keep `reg` alive for the whole test: dropping it closes the doorbell, which
+    // the driver reads as caller-gone and would withdraw the service mid-rename.
+    let reg = state.register_service(ServiceSpec::new(r), now).unwrap();
+    let handle = reg.handle;
+
+    let mut buf = std::vec![0u8; 4096];
+
+    // Drive "Old" to announced, so its rename hands off a NON-empty goodbye.
+    {
+      let ctx = state.services.get_mut(&handle).unwrap();
+      let mut t = now;
+      for _ in 0..40 {
+        t += Duration::from_millis(300);
+        let _ = ctx.proto.handle_timeout(t);
+        while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
+          ctx.proto.note_transmit_delivered(t);
+        }
+      }
+      assert!(
+        ctx.proto.advertises_host(),
+        "Old must announce before the rename (so the goodbye is non-empty)"
+      );
+    }
+
+    // A conflicting SRV authority for "Old" with rival rdata (port 9999): we lose
+    // the §8.2 tiebreak and rename away.
+    let conflict = {
+      let target = Name::try_from_str("rival-host.local.").unwrap();
+      let mut cbuf = [0u8; 512];
+      let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
+      b.push_srv_authority(&old_inst, 120, 0, 0, 9999, &target)
+        .unwrap();
+      let n = b.finish().unwrap();
+      cbuf[..n].to_vec()
+    };
+    let src = SocketAddr::from(([192, 168, 1, 200], 5353));
+    let local_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+
+    // Feed the conflict + drive the proto until "Old" renames away (seeding the
+    // detached old-name goodbye via push_updates' surviving-rename handoff).
+    let mut t = now;
+    let mut renamed = false;
+    for _ in 0..80 {
+      t += Duration::from_millis(250);
+      {
+        let ctx = state.services.get_mut(&handle).unwrap();
+        let _ = ctx.proto.handle_timeout(t);
+        while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
+          ctx.proto.note_transmit_delivered(t);
+        }
+      }
+      {
+        let DriverState {
+          endpoint, services, ..
+        } = &mut state;
+        if let Ok(evs) = endpoint.handle(t, src, local_ip, 0, &conflict, false) {
+          for ev in evs {
+            if let Ok(RouteEvent::ToService(ts)) = ev
+              && let Some(ctx) = services.get_mut(&ts.handle())
+            {
+              ctx.proto.handle_event(ts.into_event(), t);
+            }
+          }
+        }
+      }
+      state.push_updates(t).await;
+      if state
+        .services
+        .get(&handle)
+        .map(|c| c.proto.name().as_str() != old_inst.as_str())
+        .unwrap_or(true)
+      {
+        renamed = true;
+        break;
+      }
+    }
+    assert!(
+      renamed,
+      "Old must rename away under sustained conflict (seeding the detached goodbye)"
+    );
+
+    // Re-register the OLD name with a DROPPED reply receiver: `reply.send` fails, so
+    // the rollback must RESTORE the reclaimed old-name goodbye.
+    let (reply_tx, reply_rx) = futures::channel::oneshot::channel();
+    drop(reply_rx);
+    let mut r2 = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      old_inst.clone(),
+      Name::try_from_str("new-host.local.").unwrap(),
+      631,
+      120,
+    );
+    r2.add_a(Ipv4Addr::new(192, 168, 1, 11));
+    state.handle_command(
+      Command::RegisterService {
+        spec: ServiceSpec::new(r2),
+        reply: reply_tx,
+      },
+      t,
+    );
+
+    // The reclaimed old-name goodbye SURVIVED the dropped-reply rollback: a TTL=0
+    // goodbye is still emitted (without the fix it would have been cancelled and
+    // nothing would be due — the new orphan service's withdrawal is empty).
+    assert!(
+      state
+        .endpoint
+        .poll_withdrawal_transmit(t, &mut buf)
+        .is_some(),
+      "the reclaimed old-name goodbye must survive the dropped-reply rollback and still emit"
     );
 
     drop(reg);

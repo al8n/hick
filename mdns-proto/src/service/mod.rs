@@ -715,6 +715,17 @@ where
     self.goodbye.any_host()
   }
 
+  /// Whether this service has CONFIRMED-EMITTED at least one INSTANCE record
+  /// (PTR/SRV/TXT) on the wire — i.e. it has truly advertised its name, not merely
+  /// probed for it. Unlike [`Self::advertises_host`] this is set even for an
+  /// address-less service. Drivers gate the endpoint's cancel-on-announce reclaim
+  /// on this so a probe alone cannot cancel a renamed-away old name's goodbye
+  /// before the reclaiming service has actually announced.
+  #[inline(always)]
+  pub fn advertises_instance(&self) -> bool {
+    self.goodbye.any_instance()
+  }
+
   /// The host IPv4 addresses this service has actually ADVERTISED (confirmed-
   /// emitted), per address. This is the set a sibling truly owns in peer
   /// caches — NOT [`ServiceRecords::a_addrs_slice`], which is the configured set

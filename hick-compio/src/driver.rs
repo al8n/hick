@@ -378,7 +378,9 @@ impl State {
       None => return,
     };
     if let Some(handoff) = handoff {
-      self.endpoint.enqueue_rename_withdrawal(handoff, now);
+      // Retirement = the service is dead: hold its old name until the goodbye
+      // completes so a re-register cannot cancel it.
+      self.endpoint.enqueue_rename_withdrawal(handoff, now, true);
     }
     self.endpoint.begin_withdrawal(handle, snap, now);
   }
@@ -558,7 +560,13 @@ impl State {
             .get_mut(&h)
             .and_then(|c| c.proto.take_rename_goodbye_handoff());
           if let Some(handoff) = handoff {
-            self.endpoint.enqueue_rename_withdrawal(handoff, now);
+            // A rename COLLISION (rename_result Err) tears the service down: its old
+            // name must HOLD until the goodbye completes so a quick re-register
+            // cannot cancel the only retraction. A SURVIVING rename
+            // stays reclaimable.
+            self
+              .endpoint
+              .enqueue_rename_withdrawal(handoff, now, rename_result.is_err());
           }
           if let Err(_e) = rename_result {
             hick_trace::warn!(
@@ -800,6 +808,7 @@ impl State {
           h,
           ctx.proto.advertised_a_addrs(),
           ctx.proto.advertised_aaaa_addrs(),
+          ctx.proto.advertises_instance(),
         );
       }
     }
