@@ -6,11 +6,10 @@
 //! events or flag cancellation, then parks on the shared driver notifier when
 //! no update is ready.
 //!
-//! Dropping a [`Service`] encodes the RFC 6762 §10.1 goodbye records under a
-//! brief synchronous borrow (while the proto state still exists), pushes the
-//! encoded datagrams onto the driver's goodbye queue, frees the proto route
-//! slot, and wakes the driver — the driver's goodbye pump then multicasts the
-//! TTL=0 burst over the bound sockets before the entries drop.
+//! Dropping a [`Service`] flags the service cancelled and wakes the driver; the
+//! driver's post-pump sweep then begins the endpoint-owned RFC 6762 §10.1
+//! withdrawal (the endpoint holds the route + drives the TTL=0 goodbye resend
+//! schedule, freeing the route on completion).
 //!
 //! [`Endpoint::register_service`]: crate::Endpoint::register_service
 
@@ -22,10 +21,10 @@ use crate::driver::EndpointInner;
 
 /// Handle to a registered service.
 ///
-/// Dropping the handle implicitly unregisters the service: the proto-layer
-/// goodbye records are encoded immediately, the proto state machine is
-/// destroyed, and the driver's goodbye pump multicasts the queued TTL=0
-/// datagrams a few times (RFC 6762 §10.1) before the entries drop.
+/// Dropping the handle implicitly unregisters the service: it is flagged
+/// cancelled and the driver's post-pump sweep begins the endpoint-owned RFC 6762
+/// §10.1 withdrawal — the endpoint holds the route (reserving the name) while it
+/// multicasts the TTL=0 goodbye a few times, then frees the route.
 pub struct Service {
   pub(crate) inner: Rc<EndpointInner>,
   pub(crate) handle: ServiceHandle,
@@ -50,15 +49,27 @@ impl Service {
         let mut st = self.inner.state.borrow_mut();
         let ctx = st.services.get_mut(&self.handle)?;
         if let Some(u) = ctx.updates.pop_front() {
+          // Deferred GC: if this drained the LAST update of a ctx whose
+          // endpoint-owned withdrawal already completed (`route_freed`), reclaim
+          // the ctx now. This is the lazy half of the `route_freed` deferred GC
+          // that lets a retirement `Conflict` survive a withdrawal which completed
+          // in the same loop iteration that began it (see
+          // `driver::ServiceCtx::route_freed`). The other half runs in
+          // `State::drain_completed_withdrawals`.
+          if ctx.route_freed && ctx.updates.is_empty() {
+            st.services.remove(&self.handle);
+          }
           return Some(u);
         }
         // End-of-stream once the service is withdrawn (cancelled) OR
         // structurally dead (errored: its records can't encode into
-        // `max_payload`, see `driver::ServiceCtx::errored`). An errored service
-        // queues exactly one `Conflict` then is skipped by every driver pump and
-        // contributes no deadline or further wake — so after that `Conflict` is
-        // drained above, parking again would hang a `while let Some(u) =
-        // service.next().await` consumer forever. Surface `None` instead (symmetric with the errored-query terminal in `Query::next`).
+        // `max_payload`, or it was retired into an endpoint-owned withdrawal,
+        // see `driver::ServiceCtx::errored`). Such a service queues exactly one
+        // `Conflict` then is skipped by every driver pump and contributes no
+        // deadline or further wake — so after that `Conflict` is drained above,
+        // parking again would hang a `while let Some(u) = service.next().await`
+        // consumer forever. Surface `None` instead (symmetric with the
+        // errored-query terminal in `Query::next`).
         if ctx.cancelled || ctx.errored {
           return None;
         }
@@ -73,19 +84,19 @@ impl Service {
 impl Drop for Service {
   fn drop(&mut self) {
     // RFC 6762 §10.1 graceful withdrawal is DRIVER-OWNED: flag the service
-    // cancelled and let the driver encode the TTL=0 goodbye + free the proto
-    // slot on its next loop iteration (`State::sweep_cancelled_services`),
-    // AFTER any send that was in flight when this handle dropped has latched
-    // its records via `note_service_transmit_result`.
+    // cancelled and let the driver begin the endpoint-owned withdrawal on its
+    // next loop iteration (`State::sweep_cancelled_services` →
+    // `begin_service_withdrawal`), AFTER any send that was in flight when this
+    // handle dropped has latched its records via `note_service_transmit_result`.
     //
-    // Encoding the goodbye synchronously here (the previous approach) raced the
-    // driver's completion-based send pump: in the thread-per-core model another
-    // task can drop this handle while the driver is parked mid-`send_to().await`
-    // for THIS service's own announce. Encoding the goodbye at that instant
-    // captures state BEFORE the announce latched as advertised, then removes the
-    // service — so when the send completes `note_service_transmit_result` is a
-    // no-op and a positive-TTL record reaches peers with no withdrawal. Deferring
-    // to the post-pump sweep closes that window.
+    // Snapshotting the withdrawal synchronously here (the previous approach)
+    // raced the driver's completion-based send pump: in the thread-per-core model
+    // another task can drop this handle while the driver is parked
+    // mid-`send_to().await` for THIS service's own announce. Snapshotting at that
+    // instant captures state BEFORE the announce latched as advertised, then
+    // retires the service — so when the send completes `note_service_transmit_result`
+    // is a no-op and a positive-TTL record reaches peers with no withdrawal.
+    // Deferring to the post-pump sweep closes that window.
     {
       let mut st = self.inner.state.borrow_mut();
       st.flag_service_unregistered(self.handle);

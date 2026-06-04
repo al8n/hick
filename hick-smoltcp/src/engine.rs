@@ -37,52 +37,12 @@ use crate::{
 #[cfg(feature = "stats")]
 use hick_trace::stats::{Stats, StatsSnapshot};
 
-/// RFC 6762 §10.1: repeat the TTL=0 goodbye a few times to improve delivery.
-const GOODBYE_SENDS: u8 = 2;
-/// Spacing between goodbye repeats.
-const GOODBYE_INTERVAL: Duration = Duration::from_secs(1);
-/// Short re-attempt delay for a goodbye whose round put NOTHING on the wire (an
-/// all-`Busy`/all-error attempt). Much smaller than [`GOODBYE_INTERVAL`] so a
-/// transiently-undeliverable free-name goodbye is retried promptly — without
-/// busy-spinning and without consuming a resend round — and a positive transmit
-/// blocked behind it (the [`PendingGoodbye::sent_once`] barrier) is deferred only
-/// briefly. Kept consistent with `hick-compio::driver::GOODBYE_RETRY_BACKOFF` and
-/// `hick-reactor::driver::GOODBYE_RETRY_BACKOFF`.
-const GOODBYE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
-/// Hard ceiling on how long an un-sent free-name goodbye may act as a transmit
-/// barrier (see [`PendingGoodbye::sent_once`]). An entry that has never reached
-/// the wire by this age stops blocking positive transmits, so a permanently-
-/// undeliverable (all-`Busy`) barrier cannot pin the TX loop forever. The entry
-/// itself is still retained for its withdrawal until [`MAX_GOODBYE_AGE`]; this
-/// bound governs only the barrier, not the entry's lifetime. Kept consistent
-/// with `hick-compio`/`hick-reactor`'s `GOODBYE_BARRIER_MAX`.
-const GOODBYE_BARRIER_MAX: Duration = Duration::from_secs(2);
-/// RFC 6762 §17 single-message ceiling — the size of the reusable goodbye encode
-/// scratch, so a service announced with a large record set is still withdrawn
-/// rather than silently dropped.
+/// RFC 6762 §17 single-message ceiling — the cap applied to every encoded
+/// multicast in the normal TX path, so a service announced with a large record
+/// set can never advertise records that the endpoint-owned TTL=0 withdrawal
+/// (which encodes into the caller's `scratch`, capped to this same ceiling)
+/// could not later retract.
 const MAX_MDNS_MESSAGE: usize = 9000;
-/// How long a queued goodbye keeps retrying before it is given up — bounds the
-/// lifetime of an undeliverable withdrawal WITHOUT dropping a transiently-busy
-/// one before it can send (a permanently-unroutable transport means the node is
-/// effectively offline and the records expire by TTL anyway).
-const MAX_GOODBYE_AGE: Duration = Duration::from_secs(30);
-/// Max pending goodbyes retained at once. With `MAX_GOODBYE_BYTES` this bounds
-/// the backlog under unregister churn: the age bound only caps an entry's
-/// lifetime once `drain_goodbyes` runs, so a burst of register/unregister (or a
-/// jammed transport) could otherwise grow the queue until the heap is exhausted
-/// on a `no_std + alloc` target. Past the cap the OLDEST best-effort goodbyes are
-/// evicted (their records expire by TTL — acceptable under resource pressure).
-const MAX_GOODBYE_ENTRIES: usize = 32;
-/// Byte budget across all pending goodbyes (each datagram up to
-/// `MAX_MDNS_MESSAGE`). At least `2 * MAX_MDNS_MESSAGE` so a single service's TWO
-/// independently-required TTL=0 withdrawals — the old-name conflict-rename goodbye
-/// (queued via `drain_service_updates`) and a later unregister/current-name
-/// goodbye — BOTH at the §17 ceiling, coexist without `make_goodbye_room` evicting
-/// one to fit the other. A tighter budget (< 2×) drops a required withdrawal with NO
-/// unrelated churn, reintroducing the stale-name-until-TTL failure the rename-goodbye
-/// work prevents. Beyond a pair, the OLDEST best-effort entries are still
-/// evicted under genuine multi-service churn (their records expire by TTL).
-const MAX_GOODBYE_BYTES: usize = 2 * MAX_MDNS_MESSAGE;
 /// Per-service cap on queued app-facing updates, so a peer flooding conflict
 /// events cannot drive unbounded allocation on the receive path.
 const MAX_SERVICE_UPDATES: usize = 16;
@@ -103,52 +63,6 @@ const RECENT_SEND_BYTES: usize = 16 * 1024;
 /// How long a recorded self-send stays eligible to match a loopback — bounds the
 /// window in which a byte-identical peer datagram could be misread as self.
 const RECENT_SEND_TTL: Duration = Duration::from_secs(5);
-
-/// A pending TTL=0 goodbye, (re)sent a few times after a service is removed.
-struct PendingGoodbye<I> {
-  data: Vec<u8>,
-  /// Per-family sends still owed ([0]=v4, [1]=v6), each decremented only on a
-  /// REAL send to that family. Tracking the burst budget per family — rather than
-  /// per all-families attempt — lets a one-datagram-per-cycle transport deliver
-  /// v4 on one cycle and v6 on the next and still complete the budget, instead of
-  /// wedging until the age bound. A family with no socket is written off
-  /// (set to 0); a busy family keeps its count and is retried until the age bound.
-  owed: [u8; 2],
-  /// Per-family count of sends that actually went on the wire ([0]=v4, [1]=v6).
-  /// Used ONLY for stats: `goodbyes_tx` counts each logical retransmit round
-  /// exactly once — a round is emitted (for accounting purposes) the FIRST time
-  /// any family's `sent[family]` count crosses a new threshold (i.e., when
-  /// `max(sent)` increases). This approach is immune to write-offs: `Unsupported`
-  /// and `Busy` never increment `sent`, so they never trigger a round count.
-  ///
-  /// Contrast with the old `min(owed)` approach: decrementing `owed` for
-  /// Unsupported write-offs made `min(owed)` drop even with nothing on the wire,
-  /// producing phantom round counts.
-  #[cfg(feature = "stats")]
-  sent: [u8; 2],
-  /// How many logical rounds have already been counted in `goodbyes_tx` for this
-  /// entry. Latches the `max(sent)` high-water mark so split pumps (v4 in one
-  /// pump, v6 in another for the same round) only count the round once.
-  #[cfg(feature = "stats")]
-  rounds_counted: u8,
-  /// When the next (re)send attempt is due.
-  next_at: I,
-  /// Hard deadline after which the entry is given up even if never delivered.
-  expires_at: I,
-  /// `false` until the FIRST round of this goodbye reaches the wire (at least one
-  /// family `Sent`). While `false` — and before [`Self::barrier_expires_at`] —
-  /// this entry is a PENDING BARRIER: a free-name (retirement/rename) TTL=0
-  /// withdrawal that must precede any positive-TTL transmit, so a same-name
-  /// replacement under `with_probe_unique_names(false)` cannot announce a fresh
-  /// positive TTL ahead of the stale TTL=0 and evict itself from peer caches.
-  /// Set once and never cleared.
-  sent_once: bool,
-  /// Hard ceiling on the barrier role only (NOT the entry's retention, which is
-  /// [`Self::expires_at`]). Once `now` passes this, an entry that has still not
-  /// `sent_once` stops blocking positive transmits, so a permanently-`Busy`
-  /// barrier cannot pin the TX loop forever.
-  barrier_expires_at: I,
-}
 
 /// A recent multicast datagram we put on the wire, kept (exact bytes + send time)
 /// for self-loopback detection.
@@ -180,6 +94,14 @@ struct ServiceSlot<I: Instant> {
   proto: ProtoService<I>,
   updates: VecDeque<ServiceUpdate>,
   errored: bool,
+  /// Set when the endpoint-owned withdrawal for this service has COMPLETED (its
+  /// route is already freed) but the slot is RETAINED because it still holds
+  /// un-polled app-facing updates — typically the `Conflict` queued at an internal
+  /// retirement. Such a slot is GC'd lazily: by [`Engine::pump`] (or
+  /// [`Engine::poll_service_update`]) once its `updates` queue drains. This keeps
+  /// the `Conflict` deliverable even when the withdrawal completes in the SAME pump
+  /// that began it (an empty, never-announced withdrawal completes immediately).
+  route_freed: bool,
 }
 
 impl<I: Instant> ServiceSlot<I> {
@@ -456,9 +378,9 @@ impl<I: Instant> Multicaster<I> {
   /// a probe/announce and latching nothing for a response that never left the
   /// host.
   ///
-  /// The driver-owned goodbye queue uses the stricter all-families rule instead
-  /// ([`Self::burst`]) — there the driver, not the proto, owns retry, so it keeps
-  /// re-bursting until every family flushes (age-bounded).
+  /// The endpoint-owned withdrawal send uses [`Self::burst`] instead — the
+  /// endpoint owns that retry schedule, so the driver just fans one due goodbye
+  /// datagram to both families per round and reports `any_sent` back.
   ///
   /// Records a self-send credit for every family that sent. Uses `data.len()` as
   /// the byte count for both families (they encode the same datagram).
@@ -504,21 +426,23 @@ impl<I: Instant> Multicaster<I> {
     (fanout.into_multicast_outcome(any_too_large), fanout)
   }
 
-  /// Attempt this goodbye on every family that still OWES a send, in priority
-  /// order ([`family_order`], so a one-slot transport stays fair), decrementing a
-  /// family's `owed` count when it actually queues. A family with NO socket
-  /// (`Unsupported`) or a permanently-too-large datagram (`TooLarge`) is written
-  /// off (set to 0) so a single-stack node does not wait on an absent family; a
-  /// busy family keeps its count and is retried on the next call — a family that
-  /// frees within the age bound, including one that recovers after a long stall,
-  /// still gets its withdrawal. Maintains `failing_since` so the prioritisation
-  /// favours whichever family is behind. Not fingerprinted (a goodbye loopback is
-  /// harmless — it withdraws records already being withdrawn).
+  /// Fan ONE endpoint-owned withdrawal (TTL=0 goodbye) datagram out to every
+  /// family that still owes a send this round, in priority order ([`family_order`],
+  /// so a one-slot transport stays fair). `owed` is a per-family one-shot gate for
+  /// THIS round (the driver passes `[1, 1]` and discards the result) — the
+  /// multi-round resend schedule is owned by [`Endpoint::note_withdrawal_result`],
+  /// NOT by this method. A family that queues decrements its gate (to 0); a family
+  /// with NO socket (`Unsupported`) or a permanently-too-large datagram (`TooLarge`)
+  /// is written off; a busy family keeps its gate but, since the driver discards
+  /// `owed`, simply reports `Busy` for this round (the endpoint re-arms it).
+  /// Maintains `failing_since` so the prioritisation favours whichever family is
+  /// behind. Not fingerprinted (a goodbye loopback is harmless — it withdraws
+  /// records already being withdrawn).
   ///
   /// Returns a [`Fanout`] with the per-family outcome so the caller can derive
   /// EXACT stats: `packets_tx`/`bytes_tx` for `Sent`, `send_errors` for `Failed`,
-  /// nothing for `Unsupported`/`Busy`. Families whose `owed` count is already
-  /// zero return `Unsupported` (their slot is finished, not an error).
+  /// nothing for `Unsupported`/`Busy`, and `any_sent` for the
+  /// [`Endpoint::note_withdrawal_result`] delivery confirmation.
   fn burst<T: UdpIo>(&mut self, io: &mut T, data: &[u8], owed: &mut [u8; 2], now: I) -> Fanout {
     let mut results = [FamilySend::Unsupported; 2];
     for (idx, group) in family_order(&self.failing_since) {
@@ -581,65 +505,6 @@ impl<I: Instant> Multicaster<I> {
   }
 }
 
-/// Encode a §10.1 goodbye into `scratch` (the engine's reusable buffer, sized to
-/// the §17 ceiling `MAX_MDNS_MESSAGE`). Returns the encoded length (the caller
-/// copies `scratch[..len]` out), `None` when nothing is withdrawable, or `None` on
-/// `BufferTooSmall` — a goodbye that exceeds even the ceiling cannot be sent.
-/// Writing into the pre-allocated shared buffer — not a fresh per-call `Vec` —
-/// means a large unregister never reallocates while the backlog is full.
-/// `is_retained` is the shared-host retention PREDICATE (not a materialised set),
-/// so unregister allocates no retention `Vec` regardless of sibling count.
-fn encode_goodbye_into<I: Instant>(
-  proto: &ProtoService<I>,
-  is_retained: impl Fn(core::net::IpAddr) -> bool,
-  scratch: &mut [u8],
-) -> Option<usize> {
-  match proto.encode_goodbye_filtered(scratch, is_retained) {
-    Ok(Some(len)) => Some(len),
-    Ok(None) | Err(_) => None,
-  }
-}
-
-/// Drain a pending conflict-rename goodbye into `scratch` (the ceiling-sized
-/// reusable buffer). Returns the encoded length, or `None` when there is no
-/// pending rename goodbye (or it exceeds the ceiling). On `BufferTooSmall` the
-/// proto preserves the pending state, but the service is being removed, so a
-/// rename goodbye larger than the ceiling is dropped (its records expire by TTL).
-fn take_rename_goodbye_into<I: Instant>(
-  proto: &mut ProtoService<I>,
-  scratch: &mut [u8],
-) -> Option<usize> {
-  match proto.take_pending_rename_goodbye(scratch) {
-    Ok(Some(len)) => Some(len),
-    Ok(None) | Err(_) => None,
-  }
-}
-
-/// Whether some OTHER same-host service in `services` still advertises `addr` —
-/// the RFC 6762 §10.1 shared-host retention check, evaluated as a PREDICATE over
-/// the service table rather than by materialising a retained-address set. So a
-/// withdrawing service retracts only addresses no remaining same-host service
-/// announced, while allocating nothing for retention regardless of how many
-/// same-host siblings (or addresses) exist.
-fn host_addr_retained<I: Instant>(
-  services: &BTreeMap<ServiceHandle, ServiceSlot<I>>,
-  handle: ServiceHandle,
-  addr: core::net::IpAddr,
-) -> bool {
-  let host = match services.get(&handle) {
-    Some(slot) => slot.proto.records().host(),
-    None => return false,
-  };
-  services.iter().any(|(other, slot)| {
-    *other != handle
-      && slot.proto.records().host() == host
-      && match addr {
-        core::net::IpAddr::V4(v4) => slot.proto.advertised_a_addrs().contains(&v4),
-        core::net::IpAddr::V6(v6) => slot.proto.advertised_aaaa_addrs().contains(&v6),
-      }
-  })
-}
-
 /// The runtime-agnostic mDNS engine.
 ///
 /// Generic over the monotonic clock `I` (an [`mdns_proto::Instant`]) and the
@@ -649,16 +514,11 @@ pub struct Engine<I: Instant, R> {
   services: BTreeMap<ServiceHandle, ServiceSlot<I>>,
   queries: BTreeMap<QueryHandle, QuerySlot>,
   subnets: Vec<IpCidr>,
-  goodbyes: Vec<PendingGoodbye<I>>,
-  /// Reusable buffer for encoding a §10.1 goodbye before it is copied (exactly
-  /// sized) into `goodbyes`. PRE-ALLOCATED to the §17 ceiling (`MAX_MDNS_MESSAGE`)
-  /// at construction — a FIXED footprint, never grown or shrunk during operation.
-  /// Encoding into this shared buffer rather than a fresh per-call `Vec` means the
-  /// goodbye subsystem's peak is exactly `MAX_GOODBYE_BYTES` plus this buffer, with
-  /// no per-unregister datagram spike and — because it is sized up front,
-  /// before any backlog accumulates — no reallocation while the backlog is full on
-  /// the first large goodbye.
-  goodbye_scratch: Vec<u8>,
+  /// Reusable scratch for the handles of endpoint-owned withdrawals that
+  /// completed in a pump (so [`Endpoint::drain_completed_withdrawals`] can push
+  /// into it and the pump can GC each one's driver slot). Kept on the engine and
+  /// `clear()`ed each pump so the per-pump GC allocates nothing in steady state.
+  completed_withdrawals: Vec<ServiceHandle>,
   /// The multicast transmit path: per-family fan-out, fan-out ordering, and
   /// self-loopback detection.
   tx: Multicaster<I>,
@@ -689,10 +549,7 @@ where
       services: BTreeMap::new(),
       queries: BTreeMap::new(),
       subnets: Vec::new(),
-      goodbyes: Vec::new(),
-      // Fixed footprint, sized up front so a large goodbye never reallocates the
-      // scratch while the backlog is full.
-      goodbye_scratch: alloc::vec![0u8; MAX_MDNS_MESSAGE],
+      completed_withdrawals: Vec::new(),
       tx: Multicaster::new(),
       #[cfg(feature = "stats")]
       stats,
@@ -744,56 +601,37 @@ where
         proto,
         updates: VecDeque::new(),
         errored: false,
+        route_freed: false,
       },
     );
     Ok(handle)
   }
 
-  /// Unregister a service, emitting its RFC 6762 §10.1 goodbyes before releasing
-  /// the route slot. Two withdrawals may be queued, each bursted `GOODBYE_SENDS`
-  /// times by the pump:
+  /// Unregister a service, beginning its RFC 6762 §10.1 endpoint-owned
+  /// withdrawal. The endpoint KEEPS the route (holding the name against a
+  /// same-name re-registration) and drives the TTL=0 goodbye resend schedule;
+  /// [`Self::pump`] pumps each due goodbye datagram and, on completion, frees the
+  /// route and GCs the driver slot.
   ///
-  /// * a TTL=0 goodbye for the records it announced — but host addresses a
-  ///   same-host sibling still advertises are RETAINED (withdrawing them would
-  ///   evict a record peers legitimately still hold for the shared host);
-  /// * any queued conflict-rename goodbye for an old instance name. A service
-  ///   removed mid-rename is never polled again, so its proto state would
-  ///   otherwise drop that pending withdrawal silently.
+  /// The withdrawal covers whatever the service must retract: the records it
+  /// confirmed-emitted under its current name (host A/AAAA filtered against
+  /// same-host siblings by the endpoint), OR — if a conflict rename left an
+  /// old-name withdrawal pending — that old instance name first
+  /// ([`Service::withdrawal_snapshot`] prioritises the rename goodbye). A
+  /// never-announced service has an empty snapshot and completes on the next
+  /// pump with no datagram on the wire.
+  ///
+  /// The driver slot is NOT removed here: it is kept (marked `errored`) so any
+  /// already-queued `ServiceUpdate::Conflict` still reaches the host, and is GC'd
+  /// when the endpoint reports the withdrawal complete.
   pub fn unregister_service(&mut self, handle: ServiceHandle, now: I) {
-    // Encode each goodbye into the reusable scratch FIRST, then — only if one was
-    // produced — make exact backlog room and queue an owned copy (commit_goodbye).
-    // Deciding eviction after a successful encode, by exact size, means a service
-    // with nothing to withdraw never evicts a queued goodbye; reusing the
-    // pre-allocated scratch avoids a fresh per-unregister datagram allocation
-    //; and shared-host retention is a PREDICATE over the service table,
-    // not a materialised set, so unregister allocates no retention Vec however many
-    // same-host siblings exist. The slot borrow is scoped to each encode so
-    // it ends before `self.goodbyes` and `self.goodbye_scratch` are touched
-    // together; the main goodbye is copied out before the rename encode reuses the
-    // scratch.
-    let main_len = match self.services.get(&handle) {
-      Some(slot) => {
-        let services = &self.services;
-        encode_goodbye_into(
-          &slot.proto,
-          |addr| host_addr_retained(services, handle, addr),
-          &mut self.goodbye_scratch,
-        )
-      }
-      None => None,
-    };
-    if let Some(len) = main_len {
-      self.commit_goodbye(len, now);
+    // Mark the slot errored so no further pump polls the (now gone) service for
+    // transmits, then begin its endpoint-owned withdrawal. The slot itself stays
+    // until the withdrawal completes (GC'd in `pump`).
+    if let Some(slot) = self.services.get_mut(&handle) {
+      slot.errored = true;
     }
-    let rename_len = match self.services.get_mut(&handle) {
-      Some(slot) => take_rename_goodbye_into(&mut slot.proto, &mut self.goodbye_scratch),
-      None => None,
-    };
-    if let Some(len) = rename_len {
-      self.commit_goodbye(len, now);
-    }
-    self.services.remove(&handle);
-    let _ = self.endpoint.unregister_service(handle);
+    self.begin_service_withdrawal(handle, now);
   }
 
   /// Start a query. Updates are read via [`Self::poll_query_update`].
@@ -830,7 +668,16 @@ where
 
   /// Step the engine once: fire due timers, drain all ready RX through the
   /// §11 gate into the proto, surface service updates, drain all pending TX via
-  /// `io`, and return the next deadline to sleep until.
+  /// `io`, pump any due endpoint-owned withdrawal goodbyes, and return the next
+  /// deadline to sleep until.
+  ///
+  /// **Graceful shutdown.** There is no separate flush path: `unregister_service`
+  /// begins each service's endpoint-owned §10.1 withdrawal, and `pump` drives the
+  /// goodbye sends + frees the route on completion. To flush all pending
+  /// withdrawals before exiting, drive `pump` until [`Self::poll_deadline`] returns
+  /// `None` (no service, query, cache, or withdrawal deadline remains) — at which
+  /// point every withdrawal has completed (sent its budget or hit its 2 s anti-pin
+  /// ceiling) and its route is freed.
   pub fn pump<T: UdpIo>(&mut self, now: I, io: &mut T, scratch: &mut [u8]) -> Option<I> {
     self.fire_timeouts(now);
 
@@ -895,22 +742,13 @@ where
 
     self.drain_service_updates(now);
 
-    // ── Free-name goodbye barrier (RFC 6762 §10.1 ordering) ──────────────────
-    // Before placing ANY positive-TTL transmit, attempt the due goodbyes so a
-    // SENDABLE free-name (retirement/rename) TTL=0 withdrawal reaches the wire
-    // FIRST — this drain clears such a barrier in THIS pump. If a goodbye still
-    // has not sent once AND has not passed its barrier ceiling, it is an
-    // un-sendable barrier (all-`Busy`): skip the positive-TTL TX loop this pump
-    // so a same-name replacement registered under `with_probe_unique_names(false)`
-    // cannot announce a fresh positive TTL ahead of the stale TTL=0 (which would
-    // evict the replacement from peer caches). The post-TX `drain_goodbyes` below
-    // is KEPT so newly-queued goodbyes still flush this pump. `poll_deadline`
-    // wakes on `GOODBYE_RETRY_BACKOFF`/`barrier_expires_at`, so a deferred barrier
-    // re-attempts promptly and is released no later than its ceiling.
-    self.drain_goodbyes(now, io);
-    let transmit_barred = self.has_pending_barrier(now);
-
-    while !transmit_barred && let Some((dst, len, origin)) = self.poll_one_transmit(now, scratch) {
+    // The free-name goodbye ORDERING (a stale TTL=0 must precede a same-name
+    // replacement's fresh positive TTL) is now enforced by the endpoint: it KEEPS
+    // the route while a withdrawal is in flight, so a same-name `register_service`
+    // is rejected (`NameAlreadyRegistered`) until `drain_completed_withdrawals`
+    // frees the name. No replacement can announce ahead of the withdrawal, so the
+    // old pre-TX barrier gate is gone and the normal TX loop runs unconditionally.
+    while let Some((dst, len, origin)) = self.poll_one_transmit(now, scratch) {
       if dst == MDNS_SOCKET_V4 || dst == MDNS_SOCKET_V6 {
         // Multicast: fan out to BOTH groups and confirm synchronously this pump
         // (honors the proto's confirm-on-send contract). `fanout` carries the
@@ -925,7 +763,7 @@ where
         // A partial fan-out (v4 Sent + v6 TooLarge) yields MulticastOutcome::Delivered
         // but still has failed_count() == 1. Counting only inside the Undeliverable
         // arm would silently drop that error. Count here, unconditionally, before the
-        // outcome match — consistent with drain_goodbyes and reactor/compio
+        // outcome match — consistent with the withdrawal send below and reactor/compio
         // (Busy/Unsupported are never errors; only Failed counts).
         #[cfg(feature = "stats")]
         {
@@ -965,7 +803,7 @@ where
             // all-Unsupported case (no socket on any family) is NOT a send error —
             // Unsupported is never an error, consistent with the per-family rule
             // and reactor/compio; "nothing sent" is visible as zero packets_tx.
-            self.retire_origin(origin);
+            self.retire_origin(origin, now);
           }
         }
       } else {
@@ -1007,14 +845,81 @@ where
     // again so confirmed transitions are visible to `poll_service_update` now.
     self.drain_service_updates(now);
 
-    #[cfg(feature = "defmt")]
-    {
-      let n = self.goodbyes.len();
-      if n > 0 {
-        defmt::trace!("goodbye drain: {} pending entries", n);
+    // ── Endpoint-owned withdrawals (RFC 6762 §10.1 goodbyes) ─────────────────
+    // Pump every due TTL=0 goodbye datagram. The endpoint encodes each (with
+    // fresh sibling host-address retention computed internally), hands back the
+    // multicast datagram + the withdrawing handle; the driver fans it out to BOTH
+    // groups (`tx.burst`, the SAME per-family send path the old goodbye burst
+    // used) and reports back whether at least one family sent so the endpoint can
+    // spend / re-arm the resend round.
+    while let Some((dst, len, handle)) = self.endpoint.poll_withdrawal_transmit(now, scratch) {
+      // The endpoint always returns the multicast marker; the driver fans the
+      // datagram to both groups regardless. Assert the contract in debug builds.
+      debug_assert_eq!(
+        dst, MDNS_SOCKET_V4,
+        "withdrawal dst must be the multicast marker"
+      );
+      let _ = dst;
+      // `owed = [1, 1]` is a throwaway one-shot-per-family gate for THIS round —
+      // the endpoint owns the multi-round schedule, so the mutation is discarded.
+      let mut owed = [1u8; 2];
+      // Split borrow: `tx` and `endpoint` are disjoint fields. Re-borrow `scratch`
+      // immutably here (the `poll_withdrawal_transmit` borrow ended on return).
+      let fanout = self.tx.burst(io, &scratch[..len], &mut owed, now);
+      #[cfg(feature = "stats")]
+      {
+        // packets_tx / bytes_tx: one per family that returned Sent.
+        let sent_count = fanout.sent_count();
+        if sent_count > 0 {
+          self.stats.packets_tx(u64::from(sent_count));
+          self.stats.bytes_tx(fanout.bytes_on_wire());
+        }
+        // send_errors: real I/O failures only (Failed = TooLarge write-off).
+        let failed_count = fanout.failed_count();
+        if failed_count > 0 {
+          self.stats.send_errors(u64::from(failed_count));
+        }
+        // goodbyes_tx: one logical RFC 6762 retransmit round per DELIVERED round
+        // (at least one family on the wire); a fully-failed round is re-armed by
+        // the endpoint without spending and must NOT be counted.
+        if fanout.any_sent() {
+          self.stats.goodbyes_tx(1);
+        }
+      }
+      #[cfg(feature = "defmt")]
+      if fanout.any_sent() {
+        defmt::trace!(
+          "tx withdrawal {} bytes ({} families)",
+          len,
+          fanout.sent_count()
+        );
+      }
+      self
+        .endpoint
+        .note_withdrawal_result(handle, now, fanout.any_sent());
+    }
+    // Free completed withdrawals (budget spent or ceiling reached): the endpoint
+    // releases each route (decrementing services_active) and reports the handle;
+    // GC its driver slot. The scratch Vec is reused across pumps — `endpoint` and
+    // `completed_withdrawals` are disjoint fields, so the borrow is accepted.
+    self.completed_withdrawals.clear();
+    self
+      .endpoint
+      .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
+    while let Some(handle) = self.completed_withdrawals.pop() {
+      // GC the driver slot — but ONLY once its app-facing updates are drained, so a
+      // `Conflict` queued at an internal retirement still reaches the host even
+      // when the (empty, never-announced) withdrawal completes in the same pump
+      // that began it. A slot with pending updates is marked `route_freed` and GC'd
+      // lazily (here on a later pump, or by `poll_service_update` when it drains).
+      match self.services.get_mut(&handle) {
+        Some(slot) if slot.updates.is_empty() => {
+          self.services.remove(&handle);
+        }
+        Some(slot) => slot.route_freed = true,
+        None => {}
       }
     }
-    self.drain_goodbyes(now, io);
 
     let deadline = self.poll_deadline();
     if rx_capped {
@@ -1087,30 +992,21 @@ where
 
   /// Drain each service's proto updates into its app-facing queue, performing
   /// the RFC 6762 §9 auto-rename routing (`handle_service_renamed`) before
-  /// surfacing a `Renamed` update, then stealing any conflict-rename goodbye into
-  /// the per-family-owed queue.
+  /// surfacing a `Renamed` update.
   ///
   /// A §9 rename of an ANNOUNCED service queues a TTL=0 withdrawal of the OLD
-  /// instance name. After draining each service's updates this hands that
-  /// withdrawal to the per-family-owed goodbye queue (`commit_goodbye`) rather than
-  /// leaving it to the proto's single global resend budget. The engine fans every
-  /// multicast to BOTH groups and confirms on `delivered = sent_any`, so on that
-  /// global budget a partial fan-out — one family queues both rename-goodbye sends
-  /// while the other stays busy through the window — would exhaust the budget and
-  /// clear the pending withdrawal even though the busy family never saw a TTL=0
-  /// record, leaving its peers caching the ghost old name until TTL. The
-  /// queue tracks each family's sends independently, so a busy family keeps its
-  /// budget until it actually transmits — the same per-family path the
-  /// mid-rename-removal goodbye takes in `unregister_service`.
+  /// instance name. For a service that KEEPS running under the new name (rename
+  /// success) or that goes Conflicting on an invalid suffix, that old-name goodbye
+  /// is emitted by the proto's own `poll_transmit` on its `rename_goodbye_deadline`
+  /// schedule, confirmed via the normal confirm-on-send path in the TX loop — the
+  /// driver no longer steals it into a side queue.
   ///
-  /// The steal is per service AFTER its update drain — NOT gated on the `Renamed`
-  /// update — because the proto sets `pending_rename_goodbye` BEFORE it knows the
-  /// suffixed name is valid: an announced near-length-limit instance whose `-1`
-  /// suffix overflows the 63-byte label surfaces `Conflict` (not `Renamed`) yet
-  /// still leaves the old-name withdrawal pending. Stealing it for every terminal
-  /// path (rename success, invalid-suffix `Conflict`, and the local-collision
-  /// `Conflict` from a failed `handle_service_renamed`) — and before the TX loop —
-  /// guarantees it can never reach `poll_transmit`'s global-budget fallback.
+  /// The ONE case the proto cannot drive itself is a rename whose NEW name
+  /// collides with another LOCAL service (`handle_service_renamed` returns Err):
+  /// the service is torn down, so its old-name withdrawal is handed to the
+  /// endpoint-owned withdrawal lifecycle ([`Self::begin_service_withdrawal`],
+  /// whose snapshot prioritises the pending rename goodbye), which holds the route
+  /// and resends the goodbye before freeing the name.
   fn drain_service_updates(&mut self, now: I) {
     let handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
     for handle in handles {
@@ -1128,19 +1024,18 @@ where
             .is_err()
           {
             // The new name collides with another local service; the service has
-            // already rebranded and can't be kept. Surface `Conflict` and mark
-            // it errored so every pump skips it. The old-name withdrawal it queued
-            // is still stolen below (the steal does not skip errored slots).
+            // already rebranded and can't be kept. Surface `Conflict` and mark it
+            // errored so every pump skips it for transmits. Its OLD-name withdrawal
+            // is pending in the proto; begin the endpoint-owned withdrawal, which
+            // snapshots that pending rename goodbye, holds the route (keeping the
+            // OLD name reserved) while it resends, and frees the name on
+            // completion. The slot stays until then so this queued `Conflict`
+            // still reaches the host (GC'd in `pump`).
             if let Some(slot) = self.services.get_mut(&handle) {
               slot.push_update(ServiceUpdate::Conflict);
               slot.errored = true;
             }
-            // Free the proto route under the (old) name that `handle` still
-            // holds — `handle_service_renamed` returned Err, meaning the new
-            // name collided and the rename was rejected; the old route is still
-            // present in the endpoint and must be freed so services_active is
-            // decremented and the name slot becomes reusable.
-            let _ = self.endpoint.unregister_service(handle);
+            self.begin_service_withdrawal(handle, now);
             break;
           }
         }
@@ -1148,18 +1043,29 @@ where
           slot.push_update(update);
         }
       }
-      // Steal any pending conflict-rename withdrawal into the per-family queue —
-      // for ANY terminal path (success or either `Conflict`), errored or not — so
-      // it never falls through to the proto's `poll_transmit` global budget. A
-      // no-op (`take` returns `None`) for the services that did not just rename.
-      let rename_len = match self.services.get_mut(&handle) {
-        Some(slot) => take_rename_goodbye_into(&mut slot.proto, &mut self.goodbye_scratch),
-        None => None,
-      };
-      if let Some(len) = rename_len {
-        self.commit_goodbye(len, now);
-      }
     }
+  }
+
+  /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: snapshot
+  /// what its goodbye must retract ([`Service::withdrawal_snapshot`], which
+  /// prioritises a pending conflict-rename old-name goodbye over the current
+  /// state) and hand it to [`Endpoint::begin_withdrawal`]. The endpoint KEEPS the
+  /// route (holding the name) and drives the resend schedule; the route is freed
+  /// and the driver slot GC'd when [`Endpoint::drain_completed_withdrawals`]
+  /// reports completion in [`Self::pump`].
+  ///
+  /// The driver slot is left in place (the caller marks it `errored`) so a queued
+  /// `ServiceUpdate::Conflict` still reaches the host before the slot is GC'd.
+  /// `begin_withdrawal` is idempotent, so calling this for an already-withdrawing
+  /// service is a no-op. A no-op for an unknown driver handle.
+  fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: I) {
+    // Scope the `slot` borrow so it ends before `self.endpoint` is touched (the
+    // snapshot is owned, so no borrow of `self.services` outlives this block).
+    let snap = match self.services.get_mut(&handle) {
+      Some(slot) => slot.proto.withdrawal_snapshot(),
+      None => return,
+    };
+    self.endpoint.begin_withdrawal(handle, snap, now);
   }
 
   /// Extract one outgoing datagram into `scratch`: services first, then
@@ -1171,7 +1077,7 @@ where
     scratch: &mut [u8],
   ) -> Option<(SocketAddr, usize, Origin)> {
     // Cap every encoded multicast at the RFC 6762 §17 ceiling, so the normal
-    // transmit path never emits a datagram larger than the fixed goodbye scratch
+    // transmit path never emits a datagram larger than the goodbye encode scratch
     // can later withdraw. A record set that would exceed MAX_MDNS_MESSAGE
     // then fails to encode here and the service is retired below (the `Err` arm),
     // rather than being advertised with records no §10.1 goodbye could retract.
@@ -1180,7 +1086,7 @@ where
     let service_handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
     for handle in service_handles {
       // NLL note: the `slot` borrow is scoped to the `match` block so it ends
-      // before the post-match in-iteration `unregister_service` call below.
+      // before the post-match in-iteration `begin_withdrawal` call below.
       let escalated = {
         let Some(slot) = self.services.get_mut(&handle) else {
           continue;
@@ -1196,10 +1102,10 @@ where
           Err(_) => {
             // The pending datagram can't be encoded into `scratch`; the proto
             // re-offers it forever, so retire the service to avoid a stall.
-            // Queue Conflict for the caller and mark the slot errored so every
-            // subsequent pump skips it (no busy-spin). The `slot` borrow ends
-            // here (its last use is `slot.errored = true`), so the in-iteration
-            // `unregister_service` call below is borrow-safe.
+            // Queue Conflict for the caller (unchanged — the host still learns the
+            // service died) and mark the slot errored so every subsequent pump
+            // skips it (no busy-spin). The `slot` borrow ends here, so the
+            // in-iteration `begin_withdrawal` call below is borrow-safe.
             slot.push_update(ServiceUpdate::Conflict);
             slot.errored = true;
             true
@@ -1207,13 +1113,14 @@ where
         }
       };
       if escalated {
-        // Free the proto route immediately — in-iteration and non-bypassable —
-        // so an `Ok(Some)` early-return for a LATER service cannot skip this
-        // unregister. `unregister_service` touches only `self.endpoint`, not
-        // `self.services`, so there is no iterator invalidation. It is
-        // idempotent (returns false for unknown handles), so a double call is
-        // safe.
-        let _ = self.endpoint.unregister_service(handle);
+        // Begin the endpoint-owned withdrawal immediately — in-iteration and
+        // non-bypassable — so an `Ok(Some)` early-return for a LATER service
+        // cannot skip it. The endpoint KEEPS the route (holding the name) and
+        // frees it when the goodbye completes; the slot is GC'd then. This
+        // touches only `self.endpoint`, not `self.services`, so there is no
+        // iterator invalidation, and `begin_withdrawal` is idempotent. The slot
+        // is NOT removed here, so a queued `Conflict` still reaches the host.
+        self.begin_service_withdrawal(handle, now);
       }
     }
 
@@ -1260,19 +1167,20 @@ where
   /// The producer is marked errored so every pump skips it, and a service surfaces
   /// an actionable `Conflict` (the same retirement signal as an un-encodable
   /// datagram) instead of probing/announcing forever.
-  fn retire_origin(&mut self, origin: Origin) {
+  fn retire_origin(&mut self, origin: Origin, now: I) {
     match origin {
       Origin::Service(handle) => {
         if let Some(slot) = self.services.get_mut(&handle) {
           slot.push_update(ServiceUpdate::Conflict);
           slot.errored = true;
         }
-        // Free the proto route and decrement services_active. Called
-        // unconditionally (the slot check above is for the driver slot, which
-        // may already be gone if the service was double-retired — but
-        // unregister_service is idempotent and returns false for an unknown
-        // handle, so this is safe).
-        let _ = self.endpoint.unregister_service(handle);
+        // Begin the endpoint-owned withdrawal: it KEEPS the route (holding the
+        // name) and frees it on goodbye completion, decrementing services_active
+        // then. The slot is NOT removed here, so the queued `Conflict` still
+        // reaches the host; it is GC'd in `pump` on completion.
+        // `begin_withdrawal` is idempotent (safe on a double retirement) and a
+        // no-op for an unknown handle.
+        self.begin_service_withdrawal(handle, now);
       }
       Origin::Query(handle) => self.retire_query(handle),
     }
@@ -1291,218 +1199,11 @@ where
     }
   }
 
-  /// Prune expired goodbyes, then evict the OLDEST best-effort entries until the
-  /// backlog has room for an `incoming`-byte datagram within BOTH the count and
-  /// byte budgets (evicted withdrawals expire by TTL — acceptable under resource
-  /// pressure). Call this BEFORE the (infallible) encode that allocates the new
-  /// datagram, reserving `MAX_MDNS_MESSAGE`, so the backlog is never held at full
-  /// cap WHILE a freshly-encoded goodbye is also live: the byte budget then bounds
-  /// the actual peak on a `no_std + alloc` target, not just the retained set after
-  /// the fact. Each entry owns a datagram up to `MAX_MDNS_MESSAGE`.
-  fn make_goodbye_room(&mut self, incoming: usize, now: I) {
-    self.goodbyes.retain(|g| g.expires_at > now);
-    let mut cur_bytes: usize = self.goodbyes.iter().map(|g| g.data.len()).sum();
-    while !self.goodbyes.is_empty()
-      && (self.goodbyes.len() >= MAX_GOODBYE_ENTRIES
-        || cur_bytes.saturating_add(incoming) > MAX_GOODBYE_BYTES)
-    {
-      let evicted = self.goodbyes.remove(0);
-      cur_bytes = cur_bytes.saturating_sub(evicted.data.len());
-    }
-  }
-
-  /// Queue an owned copy of the `len`-byte goodbye currently in `goodbye_scratch`.
-  /// Makes EXACT room first (see [`Self::make_goodbye_room`]), then allocates the
-  /// copy — so a full backlog is trimmed before the owned datagram exists, not
-  /// after. Called ONLY after an encode produced `len` bytes, so a service with
-  /// nothing to withdraw never triggers eviction of a queued goodbye.
-  fn commit_goodbye(&mut self, len: usize, now: I) {
-    self.make_goodbye_room(len, now);
-    let expires_at = now.checked_add_duration(MAX_GOODBYE_AGE).unwrap_or(now);
-    let barrier_expires_at = now.checked_add_duration(GOODBYE_BARRIER_MAX).unwrap_or(now);
-    let data = self.goodbye_scratch[..len].to_vec();
-    self.goodbyes.push(PendingGoodbye {
-      data,
-      owed: [GOODBYE_SENDS; 2],
-      #[cfg(feature = "stats")]
-      sent: [0; 2],
-      #[cfg(feature = "stats")]
-      rounds_counted: 0,
-      next_at: now,
-      expires_at,
-      sent_once: false,
-      barrier_expires_at,
-    });
-  }
-
-  /// `true` if any pending goodbye is still a barrier: it has not yet reached the
-  /// wire (`!sent_once`) AND has not passed its [`PendingGoodbye::barrier_expires_at`]
-  /// ceiling. The pump defers positive transmits while this holds.
-  ///
-  /// The barrier is intentionally GLOBAL — ANY pending un-sent free-name goodbye
-  /// defers ALL positive transmits, not just same-name ones. This is acceptable
-  /// (and far simpler than name-scoping the proto's transmit queue) because a
-  /// SENDABLE barrier clears in the same pump's pre-TX [`Self::drain_goodbyes`]
-  /// call, so normal operation only gains a goodbye-before-transmit ordering;
-  /// only an UN-sendable (all-`Busy`) barrier actually defers transmits, and that
-  /// is bounded by `barrier_expires_at`.
-  fn has_pending_barrier(&self, now: I) -> bool {
-    self
-      .goodbyes
-      .iter()
-      .any(|g| !g.sent_once && g.barrier_expires_at > now)
-  }
-
-  /// Send any due §10.1 goodbyes, fanned out to both mDNS groups in priority
-  /// order. Each family independently spends down its burst budget on a real send
-  /// (tracked per family across attempts, so a one-datagram-per-cycle transport
-  /// still completes the budget instead of wedging); an all-busy attempt spends
-  /// nothing. The entry drops once every family is done — delivered its budget,
-  /// or written off for having no socket. A hard age bound (`MAX_GOODBYE_AGE`)
-  /// gives up an entry still owed by a never-freeing family without dropping a
-  /// transiently-busy one before it can send.
-  ///
-  /// ## No-clone split-borrow
-  ///
-  /// `self.tx` (the [`Multicaster`]) and `self.goodbyes` are disjoint fields.
-  /// Destructuring `self` into its parts lets the borrow checker see them as
-  /// separate items, so `burst` can receive `&entry.data` and `&mut entry.owed`
-  /// directly — no transient clone of the datagram payload in the send path.
-  ///
-  /// ## Per-family `goodbyes_tx` accounting (root-cause fix)
-  ///
-  /// RFC 6762 §10.1 retransmits each goodbye `GOODBYE_SENDS` times ("rounds").
-  /// `owed[family]` starts at `GOODBYE_SENDS` and is decremented ONLY on an
-  /// actual send to that family; `Unsupported`/`Busy` families never decrement it.
-  ///
-  /// **Root-cause bug (old `min(owed)` approach):** `Unsupported` write-offs
-  /// decremented `owed[family]` to 0, making `min(owed)` drop even though
-  /// nothing was sent — producing phantom `goodbyes_tx` round counts for entries
-  /// that were never put on the wire.
-  ///
-  /// **Fix:** track `sent[family]` — the number of datagrams actually put on the
-  /// wire per family — separately from `owed`. A logical round is emitted the
-  /// FIRST time `max(sent)` increases to a new value (i.e. when at least one
-  /// family's send count passes a threshold). `Unsupported`/`Busy`/`Failed` never
-  /// increment `sent`, so they never trigger a round count.
-  ///
-  /// Accounting rules applied here (matching reactor/compio):
-  /// - `packets_tx(1)` + `bytes_tx(n)` for each family that returned `Sent(n)`.
-  /// - `send_errors(1)` for each family that returned `Failed` (real I/O error).
-  ///   `Unsupported` (no socket) and `Busy` (transient) are NOT counted as errors.
-  /// - `goodbyes_tx` increments once per retransmit round actually put on wire
-  ///   (at least one family `Sent`); never for write-offs.
-  fn drain_goodbyes<T: UdpIo>(&mut self, now: I, io: &mut T) {
-    // Destructure self into disjoint fields so the borrow checker allows
-    // passing `&entry.data` + `&mut entry.owed` to `tx.burst` at the same time
-    // as `tx` is mutably borrowed — no clone of the datagram payload needed.
-    let Engine {
-      tx,
-      goodbyes,
-      #[cfg(feature = "stats")]
-      stats,
-      ..
-    } = self;
-
-    let mut idx = 0;
-    while idx < goodbyes.len() {
-      if goodbyes[idx].expires_at <= now {
-        goodbyes.remove(idx);
-        continue;
-      }
-      if goodbyes[idx].next_at <= now {
-        // Split-borrow: `entry.data` (shared) and `entry.owed` (exclusive) are
-        // disjoint fields of the same PendingGoodbye element. The compiler
-        // accepts this once `goodbyes` is a plain slice ref, not a reborrow of
-        // `self` — which would fuse it with the `tx` borrow.
-        {
-          let entry = &mut goodbyes[idx];
-          let fanout = tx.burst(io, &entry.data, &mut entry.owed, now);
-          // Part A: this round counts as a real resend ONLY if at least one
-          // family actually put the datagram on the wire. The per-family `owed`
-          // budget is already send-gated by `burst` (a `Busy` family keeps its
-          // count), so the round-advancement here is purely about `next_at`
-          // spacing and the `sent_once` barrier latch.
-          let any_sent = fanout.any_sent();
-          // Part B: latch the barrier the first time the goodbye reaches the wire.
-          // Once `sent_once` is true the entry no longer defers positive transmits
-          // (`has_pending_barrier`).
-          if any_sent {
-            entry.sent_once = true;
-          }
-
-          #[cfg(feature = "stats")]
-          {
-            // ── packets_tx / bytes_tx ──────────────────────────────────────
-            // One increment per family that actually returned Sent. This is the
-            // per-family datagram count — consistent with reactor/compio.
-            let sent_count = fanout.sent_count();
-            if sent_count > 0 {
-              stats.packets_tx(u64::from(sent_count));
-              stats.bytes_tx(fanout.bytes_on_wire());
-            }
-
-            // ── send_errors ────────────────────────────────────────────────
-            // Count real I/O failures (Failed = TooLarge write-off from burst).
-            // Do NOT count Unsupported (absent socket) or Busy (transient) —
-            // only permanent per-family failures are errors.
-            let failed_count = fanout.failed_count();
-            if failed_count > 0 {
-              stats.send_errors(u64::from(failed_count));
-            }
-
-            // ── goodbyes_tx: emitted-round counting (root-cause fix) ───────
-            //
-            // Track `sent[family]` — the cumulative per-family on-wire count.
-            // A logical round is counted the FIRST time any family's sent count
-            // crosses a new threshold: when `max(sent)` exceeds `rounds_counted`,
-            // that means at least one family just put round #(rounds_counted+1)
-            // on the wire. Latch by updating `rounds_counted` so split pumps
-            // (v4 sends round N in one pump, v6 sends it in the next) only count
-            // the round once.
-            //
-            // This is immune to write-offs: Unsupported/Busy/Failed never
-            // increment `sent`, so they never trigger a round count — fixing the
-            // old `min(owed)` bug where Unsupported write-offs (owed→0) made
-            // min(owed) drop without any datagram going on the wire.
-            if matches!(fanout.v4, FamilySend::Sent(_)) {
-              entry.sent[0] = entry.sent[0].saturating_add(1);
-            }
-            if matches!(fanout.v6, FamilySend::Sent(_)) {
-              entry.sent[1] = entry.sent[1].saturating_add(1);
-            }
-            let max_sent = entry.sent[0].max(entry.sent[1]);
-            let new_rounds = max_sent.saturating_sub(entry.rounds_counted);
-            if new_rounds > 0 {
-              stats.goodbyes_tx(u64::from(new_rounds));
-              entry.rounds_counted = max_sent;
-            }
-          }
-
-          // Part A: advance to the full `GOODBYE_INTERVAL` spacing only when the
-          // round reached the wire. An all-`Busy`/all-error round (`!any_sent`)
-          // must NOT push `next_at` out by a whole interval — that would stall a
-          // transiently-undeliverable free-name goodbye (and any positive transmit
-          // its barrier blocks) for a full second. Re-attempt soon via the short
-          // `GOODBYE_RETRY_BACKOFF` instead — no busy-spin, no consumed round (the
-          // `owed` budget is untouched because nothing was `Sent`).
-          let next_gap = if any_sent {
-            GOODBYE_INTERVAL
-          } else {
-            GOODBYE_RETRY_BACKOFF
-          };
-          entry.next_at = now.checked_add_duration(next_gap).unwrap_or(now);
-        }
-        if goodbyes[idx].owed == [0, 0] {
-          goodbyes.remove(idx);
-          continue;
-        }
-      }
-      idx = idx.saturating_add(1);
-    }
-  }
-
   /// The earliest deadline across the endpoint, services, and queries.
+  ///
+  /// Endpoint-owned withdrawal deadlines (the next due goodbye round and the
+  /// anti-pin ceiling) are already folded into [`Endpoint::poll_timeout`], so the
+  /// driver no longer tracks them here.
   pub fn poll_deadline(&self) -> Option<I> {
     let mut best = self.endpoint.poll_timeout();
     for slot in self.services.values() {
@@ -1521,27 +1222,22 @@ where
         best = Some(best.map_or(deadline, |b| b.min(deadline)));
       }
     }
-    for goodbye in &self.goodbyes {
-      // Wake at the soonest of: the next send attempt (`next_at`, already short
-      // via `GOODBYE_RETRY_BACKOFF` after a failed round), the entry's retention
-      // deadline (`expires_at`), and — while it is still an un-sent barrier — its
-      // `barrier_expires_at` ceiling, so a never-sendable barrier releases the
-      // deferred positive transmits no later than that bound.
-      let mut wake = goodbye.next_at.min(goodbye.expires_at);
-      if !goodbye.sent_once {
-        wake = wake.min(goodbye.barrier_expires_at);
-      }
-      best = Some(best.map_or(wake, |b| b.min(wake)));
-    }
     best
   }
 
   /// Pop one app-facing update for a registered service.
+  ///
+  /// If this drains the LAST update of a slot whose endpoint-owned withdrawal has
+  /// already completed (`route_freed`), the slot is GC'd here — the deferred GC
+  /// that lets a retirement `Conflict` survive a withdrawal which completed in the
+  /// same pump that began it (see the `ServiceSlot::route_freed` field).
   pub fn poll_service_update(&mut self, handle: ServiceHandle) -> Option<ServiceUpdate> {
-    self
-      .services
-      .get_mut(&handle)
-      .and_then(|slot| slot.updates.pop_front())
+    let slot = self.services.get_mut(&handle)?;
+    let update = slot.updates.pop_front();
+    if update.is_some() && slot.route_freed && slot.updates.is_empty() {
+      self.services.remove(&handle);
+    }
+    update
   }
 
   /// Pop one app-facing update for a query. A query the driver RETIRED (its
@@ -1685,9 +1381,11 @@ mod tests {
     }
     io.sent.clear();
 
-    // Unregister → an RFC 6762 §10.1 TTL=0 goodbye burst.
+    // Unregister → begins the endpoint-owned §10.1 TTL=0 goodbye sequence. The
+    // first round is due immediately; resends are WITHDRAWAL_INTERVAL (250 ms)
+    // apart. Pump across the sequence so at least one goodbye reaches the wire.
     engine.unregister_service(handle, at(5_000_000));
-    for micros in [5_000_000, 5_000_001, 6_000_001, 7_000_001] {
+    for micros in [5_000_000, 5_000_001, 5_250_001, 5_500_001, 5_750_001] {
       engine.pump(at(micros), &mut io, &mut scratch);
     }
 
@@ -1697,103 +1395,14 @@ mod tests {
     );
   }
 
-  #[test]
-  fn same_host_sibling_addresses_are_retained_on_unregister() {
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(3));
-    let shared = Ipv4Addr::new(192, 168, 1, 10);
-    let a = engine
-      .register_service(
-        spec_for(
-          "_ipp._tcp.local.",
-          "Dev._ipp._tcp.local.",
-          "dev.local.",
-          shared,
-        ),
-        at(0),
-      )
-      .unwrap();
-    let b = engine
-      .register_service(
-        spec_for(
-          "_http._tcp.local.",
-          "Dev._http._tcp.local.",
-          "dev.local.",
-          shared,
-        ),
-        at(0),
-      )
-      .unwrap();
-
-    let mut io = MockUdp::default();
-    let mut scratch = [0u8; 1500];
-    // Drive both services through probing + announcing so the shared host
-    // address is confirmed-advertised by each.
-    for micros in [
-      0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
-      5_000_000,
-    ] {
-      engine.pump(at(micros), &mut io, &mut scratch);
-    }
-
-    // Withdrawing A must RETAIN the shared address: same-host sibling B still
-    // advertises it (RFC 6762 §10.1 shared-host records).
-    let shared_addr = core::net::IpAddr::V4(shared);
-    assert!(
-      host_addr_retained(&engine.services, a, shared_addr),
-      "shared host address must be retained while sibling B advertises it"
-    );
-
-    // Once B is gone too, nothing retains the address any more.
-    engine.unregister_service(b, at(6_000_000));
-    assert!(
-      !host_addr_retained(&engine.services, a, shared_addr),
-      "with no sibling advertising it, the address is not retained"
-    );
-  }
-
-  #[test]
-  fn unregister_retention_scales_to_many_same_host_siblings() {
-    // shared-host retention is a predicate over the service table, so an
-    // unregister handles many same-host siblings without materialising a
-    // retained-address set. Verify retention stays correct at scale — a shared
-    // address is retained while ANY sibling still advertises it, dropped once none
-    // do — exercising the allocation-free path with many siblings.
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(29));
-    let shared = Ipv4Addr::new(192, 168, 1, 50);
-    let mut handles = Vec::new();
-    for i in 0..8u32 {
-      let instance = alloc::format!("Svc{i}._ipp._tcp.local.");
-      handles.push(
-        engine
-          .register_service(
-            spec_for("_ipp._tcp.local.", &instance, "shared.local.", shared),
-            at(0),
-          )
-          .unwrap(),
-      );
-    }
-    let mut io = MockUdp::default();
-    let mut scratch = [0u8; 1500];
-    for micros in pump_schedule() {
-      engine.pump(at(micros), &mut io, &mut scratch);
-    }
-    let shared_addr = core::net::IpAddr::V4(shared);
-    let a = handles[0];
-    assert!(
-      host_addr_retained(&engine.services, a, shared_addr),
-      "the shared address must be retained while sibling services advertise it"
-    );
-    // Drop every sibling but `a`; the shared address is retained until the last.
-    for &h in &handles[1..] {
-      engine.unregister_service(h, at(6_000_000));
-    }
-    assert!(
-      !host_addr_retained(&engine.services, a, shared_addr),
-      "once every same-host sibling is gone, the shared address is not retained"
-    );
-  }
+  // NOTE: the same-host sibling-address RETENTION tests
+  // (`same_host_sibling_addresses_are_retained_on_unregister` and
+  // `unregister_retention_scales_to_many_same_host_siblings`) were REMOVED in the
+  // endpoint-owned-withdrawal migration. They asserted against the deleted
+  // driver-side `host_addr_retained` predicate; sibling retention now lives in the
+  // endpoint (`Endpoint::poll_withdrawal_transmit` recomputes it fresh each round
+  // from the route table) and is covered by the proto-level
+  // `poll_withdrawal_transmit ... sibling retention` test.
 
   /// A generous probe-then-announce pump schedule that reaches `Established`.
   fn pump_schedule() -> [i64; 10] {
@@ -1861,6 +1470,13 @@ mod tests {
     );
   }
 
+  /// A busy transport must not consume the endpoint-owned withdrawal's resend
+  /// budget: an all-`Busy` goodbye round is reported as not-delivered, so the
+  /// endpoint re-arms it (short backoff) WITHOUT spending — and once the transport
+  /// recovers the goodbye still reaches the wire. (The per-family `owed` budget is
+  /// now endpoint-owned; this is the black-box observation of that property
+  /// through the driver's `poll_withdrawal_transmit` → `note_withdrawal_result`
+  /// loop. The proto-level test exercises the spend/re-arm bookkeeping directly.)
   #[test]
   fn goodbye_budget_is_not_consumed_while_transport_is_busy() {
     let mut engine: Engine<SmoltcpInstant, StdRng> =
@@ -1874,34 +1490,34 @@ mod tests {
       engine.pump(at(micros), &mut io, &mut scratch);
     }
     engine.unregister_service(handle, at(5_000_000));
-    assert_eq!(engine.goodbyes.len(), 1, "a goodbye should be queued");
-    let budget = engine.goodbyes[0].owed;
-    assert!(budget.iter().any(|&n| n > 0));
 
-    // All-busy transport: the per-family send budget must NOT be spent.
+    // All-busy transport: nothing reaches the wire, and the withdrawal must NOT
+    // complete (a fully-failed round is re-armed, not spent). Stay within the 2 s
+    // anti-pin ceiling (begin at 5 s) so completion here would be a real spend,
+    // not a forced finish.
     io.v4_fail = Some(SendError::Busy);
     io.v6_fail = Some(SendError::Busy);
     io.sent.clear();
-    for micros in [5_000_000, 6_000_001, 7_000_001] {
+    for micros in [5_000_000, 5_250_001, 5_500_001, 5_750_001, 6_000_001] {
       engine.pump(at(micros), &mut io, &mut scratch);
     }
     assert!(
       io.sent.is_empty(),
       "no goodbye should be recorded while busy"
     );
-    assert_eq!(
-      engine.goodbyes.first().map(|g| g.owed),
-      Some(budget),
-      "the per-family send budget must be unchanged after all-busy attempts"
+    assert!(
+      engine.services.contains_key(&handle),
+      "an all-busy withdrawal must not complete (its budget is re-armed, not spent), \
+       so the driver slot is still held"
     );
 
-    // Transport recovers → the goodbye finally goes out.
+    // Transport recovers → the goodbye finally goes out (budget was preserved).
     io.v4_fail = None;
     io.v6_fail = None;
-    engine.pump(at(8_000_001), &mut io, &mut scratch);
+    engine.pump(at(6_250_001), &mut io, &mut scratch);
     assert!(
-      !io.sent.is_empty(),
-      "the goodbye must go out once the transport frees"
+      io.sent.iter().any(|(_, d)| datagram_kind(d) == Some(true)),
+      "the TTL=0 goodbye must go out once the transport frees"
     );
   }
 
@@ -1926,25 +1542,24 @@ mod tests {
     Some(saw_zero_ttl)
   }
 
-  /// Barrier-goodbye regression (Part A + Part B). A free-name TTL=0 goodbye must
-  /// reach the wire BEFORE any positive-TTL transmit of a subsequent pump, so a
-  /// same-name replacement registered under `with_probe_unique_names(false)`
-  /// cannot announce a fresh positive TTL ahead of the stale withdrawal and evict
-  /// itself from peer caches. The sans-I/O mock forces `Busy` on the first goodbye
-  /// round, proving the round is NOT consumed (Part A) and the replacement's
-  /// announce is barrier-deferred until the goodbye sends (Part B).
+  /// Endpoint-owned-withdrawal replacement survival (supersedes the old free-name
+  /// goodbye BARRIER test). Under `with_probe_unique_names(false)` a same-name
+  /// replacement announces a positive TTL directly (no §8.1 probe) — exactly the
+  /// configuration in which a stale TTL=0 goodbye could be overtaken. The old
+  /// driver enforced ordering with a transmit barrier; the endpoint now enforces
+  /// it structurally: it KEEPS the route (holding the name) for the whole §10.1
+  /// withdrawal, so a same-name `register_service` is REJECTED until the goodbye
+  /// completes and frees the name. No replacement can announce ahead of the
+  /// withdrawal because no replacement can even be registered until it is done.
   #[test]
-  fn free_name_goodbye_barrier_precedes_a_same_name_replacement_announce() {
-    // `with_probe_unique_names(false)`: both the original and the replacement
-    // announce a positive TTL directly (no §8.1 probe), which is exactly the
-    // configuration in which a stale TTL=0 could be overtaken.
+  fn same_name_replacement_is_rejected_until_withdrawal_completes() {
     let cfg = EndpointConfig::new().with_probe_unique_names(false);
     let mut engine: Engine<SmoltcpInstant, StdRng> = Engine::new(cfg, StdRng::seed_from_u64(101));
     let mut io = MockUdp::default();
     let mut scratch = [0u8; 1500];
 
     // 1. Register service A and drive it to Established so its instance records
-    //    are confirmed-advertised (goodbye ownership latched).
+    //    are confirmed-advertised (the withdrawal will have records to retract).
     let a = engine.register_service(sample_spec(), at(0)).unwrap();
     let mut established = false;
     let mut t = 0i64;
@@ -1957,119 +1572,57 @@ mod tests {
     }
     assert!(
       established,
-      "service A must reach Established before retirement"
+      "service A must reach Established before withdrawal"
     );
 
-    // 2. Retire A via a normal unregister → a §10.1 TTL=0 goodbye for A's name.
+    // 2. Unregister A → begins the endpoint-owned withdrawal (name held).
     engine.unregister_service(a, at(t));
-    assert_eq!(
-      engine.goodbyes.len(),
-      1,
-      "unregistering an announced service must queue exactly one §10.1 goodbye"
-    );
-    assert!(
-      !engine.goodbyes[0].sent_once,
-      "a freshly-queued goodbye has not sent once — it is a pending barrier"
-    );
-    assert!(
-      engine.has_pending_barrier(at(t)),
-      "an un-sent free-name goodbye is a pending transmit barrier"
-    );
-    let budget_before = engine.goodbyes[0].owed;
-    assert!(budget_before.iter().any(|&n| n > 0));
 
-    // ── Part A: an all-Busy goodbye round consumes nothing and re-arms SHORT ──
-    // Force `Busy` on every family for one due goodbye round (no replacement is
-    // registered yet, so this isolates Part A from any positive transmit). The
-    // round must not spend the per-family budget and must re-arm within the short
-    // GOODBYE_RETRY_BACKOFF rather than a full GOODBYE_INTERVAL.
-    io.v4_fail = Some(SendError::Busy);
-    io.v6_fail = Some(SendError::Busy);
+    // 3. While the withdrawal is in flight the SAME name must be rejected — the
+    //    endpoint holds the route, so a replacement cannot announce a fresh
+    //    positive TTL ahead of the stale TTL=0.
+    let rejected = engine.register_service(sample_spec(), at(t + 1));
+    assert!(
+      matches!(
+        rejected,
+        Err(RegisterServiceError::NameAlreadyRegistered(_))
+      ),
+      "a same-name registration must be rejected while the withdrawal holds the \
+       name; got {rejected:?}"
+    );
+
+    // 4. Pump with a WORKING transport until the withdrawal completes (its budget
+    //    is spent and `drain_completed_withdrawals` frees the route + GCs the
+    //    slot). The first goodbye is due immediately; resends are 250 ms apart.
     io.sent.clear();
-    let busy_at = t + 1; // > next_at (== t) so the round is due
-    engine.pump(at(busy_at), &mut io, &mut scratch);
-    assert_eq!(
-      engine.goodbyes.first().map(|g| g.owed),
-      Some(budget_before),
-      "Part A: an all-Busy goodbye round must not spend the per-family budget"
-    );
+    let mut completed = false;
+    for _ in 0..32 {
+      t += 250_000;
+      engine.pump(at(t), &mut io, &mut scratch);
+      if !engine.services.contains_key(&a) {
+        completed = true;
+        break;
+      }
+    }
     assert!(
-      !engine.goodbyes.is_empty() && !engine.goodbyes[0].sent_once,
-      "Part A: an all-Busy round must not flip sent_once — the barrier still holds"
+      completed,
+      "the withdrawal must complete (route freed + driver slot GC'd) on a working \
+       transport"
     );
-    let backoff_deadline = at(busy_at)
-      .checked_add_duration(GOODBYE_RETRY_BACKOFF)
-      .unwrap();
-    let interval_deadline = at(busy_at).checked_add_duration(GOODBYE_INTERVAL).unwrap();
+    // The withdrawal put at least one TTL=0 goodbye on the wire.
     assert!(
-      engine.goodbyes[0].next_at <= backoff_deadline,
-      "Part A: a failed round must re-arm within GOODBYE_RETRY_BACKOFF"
-    );
-    assert!(
-      engine.goodbyes[0].next_at < interval_deadline,
-      "Part A: a failed round must NOT push next_at out by a full GOODBYE_INTERVAL"
+      io.sent.iter().any(|(_, d)| datagram_kind(d) == Some(true)),
+      "the withdrawal must emit a TTL=0 §10.1 goodbye; sent kinds = {:?}",
+      io.sent
+        .iter()
+        .map(|(_, d)| datagram_kind(d))
+        .collect::<Vec<_>>()
     );
 
-    // ── Part B: the goodbye precedes a same-name replacement's positive TTL ──
-    // Recover the transport, then register the same-name replacement R under A's
-    // freed name and pump ONCE. Registering R here (rather than earlier) keeps R's
-    // §8.3 announce freshly due (FIRST_ANNOUNCE_DELAY = 0) and never pushed out by
-    // a failed Busy attempt — so this single pump is an apples-to-apples ordering
-    // test: the goodbye and R's announce are BOTH due. With the barrier + pre-TX
-    // drain, the TTL=0 withdrawal is placed FIRST and the barrier clears in the
-    // SAME pump, so the now-unblocked TX loop emits R's positive TTL AFTER it.
-    // Under the pre-fix order (post-TX-only goodbye drain) R's positive TTL would
-    // have reached the wire FIRST, evicting R from peer caches.
-    io.v4_fail = None;
-    io.v6_fail = None;
-    io.sent.clear();
-    // The goodbye re-armed at `busy_at + GOODBYE_RETRY_BACKOFF`; pump just past it
-    // so its next round is due alongside R's freshly-registered announce.
-    let recover_at = backoff_deadline.0.total_micros() + 1;
-    let _r = engine
-      .register_service(sample_spec(), at(recover_at))
-      .unwrap();
-    engine.pump(at(recover_at), &mut io, &mut scratch);
-
-    let first_goodbye = io
-      .sent
-      .iter()
-      .position(|(_, d)| datagram_kind(d) == Some(true));
-    let first_positive = io
-      .sent
-      .iter()
-      .position(|(_, d)| datagram_kind(d) == Some(false));
-    assert!(
-      first_goodbye.is_some(),
-      "the recovered free-name goodbye (TTL=0) must reach the wire; sent kinds = {:?}",
-      io.sent
-        .iter()
-        .map(|(_, d)| datagram_kind(d))
-        .collect::<Vec<_>>()
-    );
-    assert!(
-      first_positive.is_some(),
-      "R's positive-TTL announcement must reach the wire on the recovery pump; \
-       sent kinds = {:?}",
-      io.sent
-        .iter()
-        .map(|(_, d)| datagram_kind(d))
-        .collect::<Vec<_>>()
-    );
-    assert!(
-      first_goodbye < first_positive,
-      "the free-name TTL=0 goodbye must precede R's positive-TTL announcement on \
-       the wire; first_goodbye={first_goodbye:?} first_positive={first_positive:?}, \
-       sent kinds = {:?}",
-      io.sent
-        .iter()
-        .map(|(_, d)| datagram_kind(d))
-        .collect::<Vec<_>>()
-    );
-    assert!(
-      engine.goodbyes.first().is_none_or(|g| g.sent_once),
-      "Part B: once it has sent at least once, the goodbye is no longer a barrier"
-    );
+    // 5. The name is freed → a same-name replacement now registers successfully.
+    engine
+      .register_service(sample_spec(), at(t))
+      .expect("the same name must be re-registerable once the withdrawal completes");
   }
 
   #[test]
@@ -2139,18 +1692,30 @@ mod tests {
       io.sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
     );
     // The v4-only announcement latched goodbye ownership, so a graceful
-    // unregister MUST queue a §10.1 withdrawal for those records.
+    // unregister MUST withdraw those records: pump once (v6 still busy) and a
+    // TTL=0 §10.1 goodbye must reach v4 (the records v4 peers cached). If v4 had
+    // never latched ownership, the withdrawal snapshot would be empty and nothing
+    // would go on the wire.
     engine.unregister_service(handle, at(4_500_000));
+    io.sent.clear();
+    engine.pump(at(4_500_001), &mut io, &mut scratch);
     assert!(
-      !engine.goodbyes.is_empty(),
-      "a v4-only advertisement must still latch goodbye ownership, so unregister \
-       withdraws the records v4 peers cached"
+      io.sent
+        .iter()
+        .any(|(dst, d)| *dst == MDNS_SOCKET_V4 && datagram_kind(d) == Some(true)),
+      "a v4-only advertisement must still latch goodbye ownership, so the \
+       withdrawal emits a TTL=0 goodbye to v4; sent = {:?}",
+      io.sent
+        .iter()
+        .map(|(dst, d)| (*dst, datagram_kind(d)))
+        .collect::<Vec<_>>()
     );
-    // v6 recovers → the goodbye fan-out reaches it too (the busy family catches
-    // up on the next driver-owned send).
+    // v6 recovers BEFORE the withdrawal's resend budget is spent → a later
+    // goodbye round reaches v6 too (the busy family catches up). Resends are
+    // 250 ms apart; recover v6 and pump the next due round.
     io.v6_fail = None;
     io.sent.clear();
-    for micros in [4_600_000, 4_700_000, 5_700_000] {
+    for micros in [4_750_001, 5_000_001] {
       engine.pump(at(micros), &mut io, &mut scratch);
     }
     assert!(
@@ -2176,210 +1741,16 @@ mod tests {
     buf[..n].to_vec()
   }
 
-  #[test]
-  fn active_rename_goodbye_keeps_a_busy_family_owed_not_global_budget() {
-    // A §9 conflict rename of an ANNOUNCED service withdraws the
-    // OLD instance name with a TTL=0 goodbye. The engine fans every multicast to
-    // BOTH groups and confirms on `sent_any`, so if that withdrawal rode the
-    // proto's single global resend budget, a partial fan-out (v4 queues both sends
-    // while v6 stays busy through the whole window) would spend the entire budget
-    // on v4 and clear the pending withdrawal — leaving v6 peers caching the ghost
-    // old name until TTL. The driver must instead route the rename goodbye through
-    // the per-family-owed queue, so v6 keeps its full send budget until it actually
-    // transmits.
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(37));
-    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
-    let mut io = MockUdp::default();
-    let mut scratch = [0u8; 1500];
-
-    // Establish on BOTH families so the instance name is confirmed-advertised
-    // (goodbye ownership latched) — only an announced name's rename emits a goodbye.
-    let mut established = false;
-    for micros in pump_schedule() {
-      engine.pump(at(micros), &mut io, &mut scratch);
-      while let Some(u) = engine.poll_service_update(handle) {
-        established |= matches!(u, ServiceUpdate::Established);
-      }
-    }
-    assert!(
-      established,
-      "service must be Established before the conflict"
-    );
-
-    // v6 is busy for the entire rename-goodbye window; v4 is reachable.
-    io.sent.clear();
-    io.v6_fail = Some(SendError::Busy);
-
-    // A peer (port 5353) keeps claiming our instance name with different SRV rdata.
-    // The first conflict reverts us to probing; a further conflict loses the §8.2
-    // tiebreak (our TXT sorts before the peer's SRV, so any peer SRV wins) and
-    // renames, queuing the old-name goodbye. Inject until the goodbye appears.
-    let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
-    let mut t = 6_000_000i64;
-    let mut renamed = false;
-    for _ in 0..16 {
-      io.inbound.push_back((
-        conflict.clone(),
-        RecvMeta {
-          src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
-          local: None,
-          hop_limit: Some(255),
-          len: 0,
-        },
-      ));
-      engine.pump(at(t), &mut io, &mut scratch);
-      t += 250_000;
-      if !engine.goodbyes.is_empty() {
-        renamed = true;
-        break;
-      }
-    }
-    assert!(
-      renamed,
-      "a §9 conflict must rename the announced service and queue an old-name goodbye"
-    );
-    // Only the rename goodbye is queued (no unregister happened, and a re-probe of
-    // the never-announced new name latches no further goodbye ownership).
-    assert_eq!(
-      engine.goodbyes.len(),
-      1,
-      "exactly the old-name rename goodbye should be queued"
-    );
-
-    // v6 Busy throughout: v4 must drain while v6 keeps its full per-family budget,
-    // then complete once v6 recovers — the property the global budget would break.
-    assert_rename_goodbye_keeps_busy_family_owed(&mut engine, &mut io, &mut scratch, t);
-  }
-
-  /// Shared tail for the rename-goodbye partial-fan-out regressions: the
-  /// old-name withdrawal is already queued and v6 is Busy. Asserts v4 drains its
-  /// send budget while v6 keeps its FULL share (the per-family `owed` property the
-  /// proto's single global budget would break), then that v6's recovery completes
-  /// the budget and drops the entry. `t` is the current pump clock (microseconds).
-  fn assert_rename_goodbye_keeps_busy_family_owed(
-    engine: &mut Engine<SmoltcpInstant, StdRng>,
-    io: &mut MockUdp,
-    scratch: &mut [u8],
-    mut t: i64,
-  ) {
-    // Spend several GOODBYE_INTERVALs with v6 still busy. v4 drains its full budget,
-    // but v6's share MUST be untouched: under the global-budget bug v4's two
-    // deliveries would have exhausted the budget and dropped the whole withdrawal.
-    for _ in 0..5 {
-      t += 1_000_000;
-      engine.pump(at(t), io, scratch);
-    }
-    let owed = engine.goodbyes.first().map(|g| g.owed);
-    assert_eq!(
-      owed,
-      Some([0, GOODBYE_SENDS]),
-      "v4 must drain to 0 while v6 keeps its FULL budget — v4 delivery must not \
-       consume v6's share of the rename goodbye; got {owed:?}"
-    );
-
-    // v6 recovers → it finally receives the withdrawal and the entry drains. The
-    // empty queue proves v6 spent its full per-family budget on real sends.
-    io.v6_fail = None;
-    io.sent.clear();
-    for _ in 0..3 {
-      t += 1_000_000;
-      engine.pump(at(t), io, scratch);
-    }
-    assert!(
-      engine.goodbyes.is_empty(),
-      "once v6 recovers, its rename-goodbye budget completes and the entry drops"
-    );
-    assert!(
-      io.sent.iter().any(|(dst, _)| *dst == MDNS_SOCKET_V6),
-      "the old-name withdrawal must finally reach v6; got {:?}",
-      io.sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
-    );
-  }
-
-  #[test]
-  fn invalid_suffix_rename_goodbye_also_routes_through_per_family_queue() {
-    // The proto sets `pending_rename_goodbye` BEFORE it knows the
-    // suffixed name is valid. An announced instance whose first label is the max 63
-    // bytes renames to a 65-byte label ("-1" appended) → invalid → the proto goes
-    // Conflicting and surfaces `Conflict` (NOT `Renamed`) while leaving the old-name
-    // withdrawal pending. The engine must STILL route that withdrawal through the
-    // per-family-owed queue, not the proto's global `poll_transmit` budget, or a
-    // v4-delivered / v6-Busy fan-out drops it before v6 ever sends.
-    let long_label = "a".repeat(63);
-    let instance = alloc::format!("{long_label}._ipp._tcp.local.");
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(41));
-    let handle = engine
-      .register_service(
-        spec_for(
-          "_ipp._tcp.local.",
-          &instance,
-          "host.local.",
-          Ipv4Addr::new(192, 168, 1, 10),
-        ),
-        at(0),
-      )
-      .unwrap();
-    let mut io = MockUdp::default();
-    let mut scratch = [0u8; 1500];
-
-    // Establish on both families (goodbye ownership latched on the long name).
-    let mut established = false;
-    for micros in pump_schedule() {
-      engine.pump(at(micros), &mut io, &mut scratch);
-      while let Some(u) = engine.poll_service_update(handle) {
-        established |= matches!(u, ServiceUpdate::Established);
-      }
-    }
-    assert!(
-      established,
-      "the long-named service must Establish before the conflict"
-    );
-
-    io.sent.clear();
-    io.v6_fail = Some(SendError::Busy);
-
-    // A peer claims the long instance name with different SRV rdata. Reverting to
-    // probe then losing the §8.2 tiebreak attempts a rename; the "-1" suffix is an
-    // invalid 65-byte label, so the proto goes Conflicting and surfaces `Conflict` —
-    // but the old-name withdrawal is still queued and must reach the family queue.
-    let conflict = build_conflict_srv_authority(&instance);
-    let mut t = 6_000_000i64;
-    let mut conflicted = false;
-    for _ in 0..16 {
-      io.inbound.push_back((
-        conflict.clone(),
-        RecvMeta {
-          src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
-          local: None,
-          hop_limit: Some(255),
-          len: 0,
-        },
-      ));
-      engine.pump(at(t), &mut io, &mut scratch);
-      while let Some(u) = engine.poll_service_update(handle) {
-        conflicted |= matches!(u, ServiceUpdate::Conflict);
-      }
-      t += 250_000;
-      if !engine.goodbyes.is_empty() {
-        break;
-      }
-    }
-    assert!(
-      conflicted,
-      "an invalid-suffix rename must surface Conflict (not Renamed)"
-    );
-    assert_eq!(
-      engine.goodbyes.len(),
-      1,
-      "the old-name withdrawal must be queued even though the rename suffix was invalid"
-    );
-
-    // The withdrawal rode the Conflict path, not Renamed — verify it still gets the
-    // per-family-owed treatment (v6 Busy keeps its share, completes on recovery).
-    assert_rename_goodbye_keeps_busy_family_owed(&mut engine, &mut io, &mut scratch, t);
-  }
+  // NOTE: the per-family rename-goodbye regressions
+  // (active_rename_goodbye_keeps_a_busy_family_owed_not_global_budget, its
+  // assert_rename_goodbye_keeps_busy_family_owed helper, and
+  // invalid_suffix_rename_goodbye_also_routes_through_per_family_queue) were
+  // REMOVED in the endpoint-owned-withdrawal migration. They asserted against the
+  // deleted driver-side goodbye queue (engine.goodbyes + per-family owed budget).
+  // A rename of a SURVIVING service now emits its old-name goodbye via the proto's
+  // own poll_transmit schedule (confirmed in the normal TX loop); a rename whose
+  // new name collides locally is torn down through the endpoint-owned withdrawal
+  // lifecycle, whose spend/re-arm bookkeeping is covered by the proto-level tests.
 
   #[test]
   fn a_constrained_transport_does_not_starve_either_family() {
@@ -2419,13 +1790,22 @@ mod tests {
     );
   }
 
+  /// A one-datagram-per-cycle (capacity-1) transport must still complete the
+  /// endpoint-owned withdrawal: each goodbye round fans out, and even though only
+  /// one family queues per pump the withdrawal is driven to completion across
+  /// pumps (each delivered round spends one of the endpoint resend budget). The
+  /// per-family burst BOOKKEEPING now lives in the endpoint (covered by the
+  /// proto-level tests); this is the driver black-box observation that the
+  /// withdrawal-transmit loop drains on a constrained transport. (The old
+  /// goodbye-queue capacity/byte-budget tests — drains_after_each_family,
+  /// the_goodbye_queue_stays_bounded_under_unregister_churn,
+  /// make_goodbye_room_evicts_to_fit_an_incoming_datagram,
+  /// a_large_main_goodbye_survives_when_no_rename_follows, and
+  /// goodbye_budget_holds_two_near_ceiling_withdrawals — were REMOVED: the driver
+  /// no longer owns a goodbye QUEUE, so its eviction/byte-budget machinery is
+  /// gone. The endpoint holds exactly one in-flight withdrawal per route.)
   #[test]
-  fn a_constrained_transport_drains_a_goodbye_after_each_family_gets_the_budget() {
-    // On a one-datagram-per-cycle transport the goodbye fan-out
-    // delivers v4 on one cycle and v6 on the next, so no single attempt queues
-    // BOTH families. The per-family `owed` budget must spend down across attempts:
-    // the entry drains once GOODBYE_SENDS have reached EACH family, rather than
-    // lingering to MAX_GOODBYE_AGE and emitting one datagram per interval until.
+  fn a_constrained_transport_drains_a_withdrawal_after_each_family_gets_a_round() {
     let mut engine: Engine<SmoltcpInstant, StdRng> =
       Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(23));
     let handle = engine.register_service(sample_spec(), at(0)).unwrap();
@@ -2439,230 +1819,35 @@ mod tests {
     }
     engine.unregister_service(handle, at(5_000_000));
     io.sent.clear();
-    // One datagram of TX room per cycle: each pump, only the first family queues.
+    // One datagram of TX room per cycle, pumps 250 ms apart (a WITHDRAWAL_INTERVAL),
+    // all within the 2 s anti-pin ceiling so completion is a real budget spend.
     let mut t = 5_000_000i64;
+    let mut completed = false;
     for _ in 0..16 {
-      t += 1_000_000; // a GOODBYE_INTERVAL apart, all within MAX_GOODBYE_AGE
+      t += 250_000;
       io.capacity = Some(1);
       engine.pump(at(t), &mut io, &mut scratch);
-      if engine.goodbyes.is_empty() {
+      // Drain updates like a real host loop, so the slot is GC'd once its
+      // withdrawal completes (a completed slot is reclaimed only after its
+      // app-facing updates are read — see ServiceSlot::route_freed).
+      while engine.poll_service_update(handle).is_some() {}
+      if !engine.services.contains_key(&handle) {
+        completed = true;
         break;
       }
     }
     assert!(
-      engine.goodbyes.is_empty(),
-      "the goodbye must drain via its per-family budget, not linger to its max age"
+      completed,
+      "the withdrawal must drain via the endpoint resend schedule on a one-slot \
+       transport, not linger"
     );
+    // Both families received at least one goodbye datagram across the rounds.
     let v4 = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V4).count();
     let v6 = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V6).count();
-    assert_eq!(
-      (v4, v6),
-      (usize::from(GOODBYE_SENDS), usize::from(GOODBYE_SENDS)),
-      "each reachable family must receive exactly the configured goodbye burst \
-       count; v4={v4} v6={v6}"
-    );
-  }
-
-  #[test]
-  fn the_goodbye_queue_stays_bounded_under_unregister_churn() {
-    // Each unregister queues an OWNED goodbye datagram. The age
-    // bound only caps an entry's lifetime once drain_goodbyes runs, so churning
-    // register/unregister faster than the transport drains — here it is jammed —
-    // would otherwise grow the queue until the heap is exhausted on a no_std
-    // target. The backlog must stay within its count + byte budget.
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(24));
-    let mut io = MockUdp::default();
-    let mut scratch = [0u8; 1500];
-    // Register more services than the cap and advertise them on a healthy
-    // transport so each OWNS records — only then does unregister queue a goodbye.
-    let n = MAX_GOODBYE_ENTRIES + 8;
-    let mut handles = Vec::new();
-    for i in 0..n {
-      let instance = alloc::format!("Dev{i}._ipp._tcp.local.");
-      let host = alloc::format!("dev{i}.local.");
-      handles.push(
-        engine
-          .register_service(
-            spec_for(
-              "_ipp._tcp.local.",
-              &instance,
-              &host,
-              Ipv4Addr::new(192, 168, 1, 10),
-            ),
-            at(0),
-          )
-          .unwrap(),
-      );
-    }
-    for micros in [
-      0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
-    ] {
-      engine.pump(at(micros), &mut io, &mut scratch);
-    }
-    // The transport jams and every service is unregistered before anything drains.
-    io.v4_fail = Some(SendError::Busy);
-    io.v6_fail = Some(SendError::Busy);
-    for handle in handles {
-      engine.unregister_service(handle, at(5_000_000));
-    }
     assert!(
-      engine.goodbyes.len() <= MAX_GOODBYE_ENTRIES,
-      "the goodbye backlog count must stay capped under churn; got {}",
-      engine.goodbyes.len()
-    );
-    let bytes: usize = engine.goodbyes.iter().map(|g| g.data.len()).sum();
-    assert!(
-      bytes <= MAX_GOODBYE_BYTES,
-      "the goodbye backlog bytes must stay capped under churn; got {bytes}"
-    );
-    // Eviction must have bitten: far more services churned than the bounded
-    // backlog retains.
-    assert!(
-      engine.goodbyes.len() < n,
-      "eviction should hold the backlog below the number churned; queued {} of {n}",
-      engine.goodbyes.len()
-    );
-  }
-
-  #[test]
-  fn make_goodbye_room_evicts_to_fit_an_incoming_datagram() {
-    // make_goodbye_room(incoming) must evict the oldest entries until the retained
-    // bytes leave room for an `incoming`-byte datagram within the byte budget — so
-    // commit_goodbye(len) can copy the encoded goodbye in without breaching the cap.
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(25));
-    let chunk = 2000usize;
-    while engine.goodbyes.iter().map(|g| g.data.len()).sum::<usize>() + chunk <= MAX_GOODBYE_BYTES {
-      engine.goodbyes.push(PendingGoodbye {
-        data: alloc::vec![0u8; chunk],
-        owed: [GOODBYE_SENDS; 2],
-        #[cfg(feature = "stats")]
-        sent: [0; 2],
-        #[cfg(feature = "stats")]
-        rounds_counted: 0,
-        next_at: at(0),
-        expires_at: at(60_000_000),
-        sent_once: false,
-        barrier_expires_at: at(60_000_000),
-      });
-    }
-    let before: usize = engine.goodbyes.iter().map(|g| g.data.len()).sum();
-    assert!(
-      before + MAX_MDNS_MESSAGE > MAX_GOODBYE_BYTES,
-      "precondition: backlog must be too full to also hold a max-size datagram"
-    );
-    engine.make_goodbye_room(MAX_MDNS_MESSAGE, at(0));
-    let after: usize = engine.goodbyes.iter().map(|g| g.data.len()).sum();
-    assert!(
-      after + MAX_MDNS_MESSAGE <= MAX_GOODBYE_BYTES && engine.goodbyes.len() < MAX_GOODBYE_ENTRIES,
-      "make_goodbye_room must evict to fit an incoming datagram; retained {after} \
-       bytes leaves no room for {MAX_MDNS_MESSAGE}"
-    );
-  }
-
-  #[test]
-  fn a_large_main_goodbye_survives_when_no_rename_follows() {
-    // Eviction (make_goodbye_room) must run only AFTER an encode
-    // produces a goodbye, by its EXACT size — never speculatively reserving a
-    // worst-case MAX_MDNS_MESSAGE for a rename goodbye that may not exist. With a
-    // near-full backlog, a speculative reserve would evict an older still-owed
-    // withdrawal to make room for a rename that never comes; the exact-size commit
-    // must not. At MAX_GOODBYE_BYTES = 2 * MAX_MDNS_MESSAGE this is observable only
-    // when the backlog already holds a near-ceiling entry, so prime one first.
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(27));
-    // Many host addresses → a large main goodbye (still under the §17 ceiling).
-    let mut records = ServiceRecords::new(
-      Name::try_from_str("_ipp._tcp.local.").unwrap(),
-      Name::try_from_str("Big._ipp._tcp.local.").unwrap(),
-      Name::try_from_str("big.local.").unwrap(),
-      631,
-      120,
-    );
-    for i in 0..280u16 {
-      records.add_aaaa(core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i));
-    }
-    let handle = engine
-      .register_service(ServiceSpec::new(records), at(0))
-      .unwrap();
-    let mut io = MockUdp::default();
-    // The announcement carries every address, so the scratch must reach the §17
-    // ceiling for the records to be advertised (hence owned for the goodbye).
-    let mut scratch = [0u8; MAX_MDNS_MESSAGE];
-    for micros in [
-      0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
-    ] {
-      engine.pump(at(micros), &mut io, &mut scratch);
-    }
-    // Prime a pre-existing near-ceiling withdrawal still owed by a busy family (added
-    // AFTER establishment, with no pump before the unregister, so drain_goodbyes can't
-    // send/drop it first). main + this fits the budget, but main + this + a speculative
-    // MAX_MDNS_MESSAGE reserve would NOT — so a speculative reserve would evict it.
-    engine.goodbyes.push(PendingGoodbye {
-      data: alloc::vec![0u8; MAX_MDNS_MESSAGE],
-      owed: [GOODBYE_SENDS; 2],
-      #[cfg(feature = "stats")]
-      sent: [0; 2],
-      #[cfg(feature = "stats")]
-      rounds_counted: 0,
-      next_at: at(5_000_000),
-      expires_at: at(60_000_000),
-      sent_once: false,
-      barrier_expires_at: at(60_000_000),
-    });
-    // No rename: just a graceful unregister. The large main goodbye must be committed
-    // by its EXACT size — the pre-existing entry must NOT be evicted by a speculative
-    // reserve for the absent rename goodbye. Both withdrawals survive.
-    engine.unregister_service(handle, at(5_000_000));
-    assert_eq!(
-      engine.goodbyes.len(),
-      2,
-      "exact-size commit must keep BOTH the pre-existing withdrawal and the large main \
-       goodbye; a speculative rename reserve would have evicted one"
-    );
-    // Precondition: the two real withdrawals fit the budget, but together with a
-    // speculative MAX_MDNS_MESSAGE reserve they would not — so a speculative reserve
-    // WOULD have evicted one (what this guards against).
-    let queued: usize = engine.goodbyes.iter().map(|g| g.data.len()).sum();
-    assert!(
-      queued <= MAX_GOODBYE_BYTES && queued + MAX_MDNS_MESSAGE > MAX_GOODBYE_BYTES,
-      "precondition: both fit ({queued} <= {MAX_GOODBYE_BYTES}) but a speculative \
-       reserve would not ({queued} + {MAX_MDNS_MESSAGE} > {MAX_GOODBYE_BYTES})"
-    );
-    // Encoding the large goodbye must NOT have grown the scratch — it is a fixed
-    // footprint, so it never reallocates while the backlog is full.
-    assert_eq!(
-      engine.goodbye_scratch.len(),
-      MAX_MDNS_MESSAGE,
-      "the goodbye scratch is a fixed footprint and must not grow during operation"
-    );
-  }
-
-  #[test]
-  fn goodbye_budget_holds_two_near_ceiling_withdrawals() {
-    // A single service can leave TWO independently-required TTL=0 withdrawals
-    // queued — an old-name conflict-rename goodbye (routed through this queue by
-    // drain_service_updates) plus a later unregister/current-name goodbye —
-    // each up to the §17 ceiling. If MAX_GOODBYE_BYTES < 2 * MAX_MDNS_MESSAGE,
-    // make_goodbye_room evicts the first to fit the second with NO unrelated churn,
-    // dropping a required withdrawal before still-owed families see it (the
-    // stale-name-until-TTL failure). The budget must hold the pair.
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(43));
-    // commit_goodbye copies `len` bytes from the pre-sized scratch (MAX_MDNS_MESSAGE).
-    let near_ceiling = MAX_MDNS_MESSAGE - 8;
-    engine.commit_goodbye(near_ceiling, at(0));
-    engine.commit_goodbye(near_ceiling, at(1_000));
-    assert_eq!(
-      engine.goodbyes.len(),
-      2,
-      "the byte budget must hold two near-ceiling withdrawals without evicting one"
-    );
-    let queued: usize = engine.goodbyes.iter().map(|g| g.data.len()).sum();
-    assert!(
-      queued <= MAX_GOODBYE_BYTES,
-      "queued goodbye bytes ({queued}) must stay within budget ({MAX_GOODBYE_BYTES})"
+      v4 >= 1 && v6 >= 1,
+      "each reachable family must receive at least one goodbye on a constrained \
+       transport; v4={v4} v6={v6}"
     );
   }
 
@@ -2673,8 +1858,8 @@ mod tests {
     // no local subnets. The §11 gate must NOT then drop every inbound datagram — a
     // default node could announce but never see a query, answer, or conflict. Feed a
     // conflict with the real supplied-transport metadata shape (hop_limit None) and NO
-    // set_local_subnets; it must be PROCESSED (the service renames and queues an
-    // old-name goodbye), not silently dropped.
+    // set_local_subnets; it must be PROCESSED (the service renames), not silently
+    // dropped. The rename is the observable that the conflict reached the proto.
     let mut engine: Engine<SmoltcpInstant, StdRng> =
       Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(47));
     let handle = engine.register_service(sample_spec(), at(0)).unwrap();
@@ -2688,6 +1873,7 @@ mod tests {
     // The default deaf scenario: no subnets configured, hop_limit None on every RX.
     let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
     let mut t = 6_000_000i64;
+    let mut reacted = false;
     for _ in 0..16 {
       io.inbound.push_back((
         conflict.clone(),
@@ -2702,12 +1888,15 @@ mod tests {
       ));
       engine.pump(at(t), &mut io, &mut scratch);
       t += 250_000;
-      if !engine.goodbyes.is_empty() {
+      while let Some(u) = engine.poll_service_update(handle) {
+        reacted |= matches!(u, ServiceUpdate::Renamed(_) | ServiceUpdate::Conflict);
+      }
+      if reacted {
         break;
       }
     }
     assert!(
-      !engine.goodbyes.is_empty(),
+      reacted,
       "a default node (hop_limit None, no subnets) must PROCESS inbound mDNS — the §11 \
        gate dropping everything would leave it deaf to queries, answers, and conflicts"
     );
@@ -2733,6 +1922,7 @@ mod tests {
 
     let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
     let mut t = 6_000_000i64;
+    let mut reacted = false;
     for _ in 0..16 {
       io.inbound.push_back((
         conflict.clone(),
@@ -2746,9 +1936,12 @@ mod tests {
       ));
       engine.pump(at(t), &mut io, &mut scratch);
       t += 250_000;
+      while let Some(u) = engine.poll_service_update(handle) {
+        reacted |= matches!(u, ServiceUpdate::Renamed(_) | ServiceUpdate::Conflict);
+      }
     }
     assert!(
-      engine.goodbyes.is_empty(),
+      !reacted,
       "off-link unicast must NOT drive a conflict rename when no hop-limit or subnet \
        vouches for it — only link-scoped multicast is trusted by default"
     );
@@ -2800,27 +1993,18 @@ mod tests {
     );
   }
 
-  #[test]
-  fn the_goodbye_scratch_is_a_fixed_preallocated_footprint() {
-    // the goodbye encode scratch is sized to the §17 ceiling at construction,
-    // before any backlog can accumulate, so a large goodbye never reallocates it
-    // while the backlog is full.
-    let engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(28));
-    assert_eq!(
-      engine.goodbye_scratch.len(),
-      MAX_MDNS_MESSAGE,
-      "the goodbye scratch must be pre-allocated to the §17 ceiling"
-    );
-  }
+  // NOTE: `the_goodbye_scratch_is_a_fixed_preallocated_footprint` was REMOVED — the
+  // driver no longer keeps a goodbye encode scratch (`goodbye_scratch`); the
+  // endpoint encodes each withdrawal goodbye into the caller's `scratch`, capped to
+  // the §17 ceiling by `poll_one_transmit`'s `MAX_MDNS_MESSAGE` slice.
 
   #[test]
   fn an_oversized_service_is_not_advertised_so_it_is_never_unwithdrawable() {
-    // the normal multicast path honors the SAME §17 ceiling as the fixed
-    // goodbye scratch. A record set that would encode above MAX_MDNS_MESSAGE must
-    // NOT be advertised — even when the caller's pump scratch is larger — so the
-    // engine can never latch goodbye ownership for records it could not later
-    // withdraw (which would leave peers caching them until TTL).
+    // the normal multicast path honors the §17 ceiling (MAX_MDNS_MESSAGE). A record
+    // set that would encode above it must NOT be advertised — even when the caller's
+    // pump scratch is larger — so the engine can never latch goodbye ownership for
+    // records it could not later withdraw (which would leave peers caching them
+    // until TTL).
     let mut engine: Engine<SmoltcpInstant, StdRng> =
       Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(30));
     let mut records = ServiceRecords::new(
@@ -2853,12 +2037,22 @@ mod tests {
       "an oversized service must not reach Established (it cannot be encoded \
        within the §17 ceiling, even with a larger caller scratch)"
     );
-    // It never advertised, so unregister latches no ownership and queues no
-    // goodbye — there are no unwithdrawable records on the wire.
+    // It never advertised, so the withdrawal snapshot is empty and the endpoint
+    // completes it immediately with NO datagram on the wire — no unwithdrawable
+    // records were ever advertised. Pump the withdrawal and assert no goodbye.
+    io.sent.clear();
     engine.unregister_service(handle, at(6_000_000));
+    for micros in [6_000_001, 6_250_001, 6_500_001] {
+      engine.pump(at(micros), &mut io, &mut scratch);
+    }
     assert!(
-      engine.goodbyes.is_empty(),
-      "an oversized service that never advertised must not produce a goodbye"
+      io.sent.iter().all(|(_, d)| datagram_kind(d) != Some(true)),
+      "an oversized service that never advertised must not emit any TTL=0 goodbye; \
+       sent kinds = {:?}",
+      io.sent
+        .iter()
+        .map(|(_, d)| datagram_kind(d))
+        .collect::<Vec<_>>()
     );
   }
 
@@ -2963,8 +2157,13 @@ mod tests {
     );
   }
 
+  /// A permanently-busy withdrawal is held (route kept, name reserved) while it
+  /// keeps failing, then FORCE-completed at the endpoint's anti-pin ceiling
+  /// (`WITHDRAWAL_CEILING` = 2 s) so an undeliverable goodbye cannot pin the name
+  /// slot forever. (Supersedes the old 30 s `MAX_GOODBYE_AGE` driver-queue test;
+  /// the ceiling/age bookkeeping now lives in the endpoint.)
   #[test]
-  fn busy_goodbye_survives_many_attempts_then_age_bounds_it() {
+  fn busy_goodbye_is_held_then_force_completed_at_the_ceiling() {
     let mut engine: Engine<SmoltcpInstant, StdRng> =
       Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(11));
     let handle = engine.register_service(sample_spec(), at(0)).unwrap();
@@ -2975,24 +2174,30 @@ mod tests {
     ] {
       engine.pump(at(micros), &mut io, &mut scratch);
     }
+    // Drain the announce-phase updates so the slot's only lifecycle left is the
+    // withdrawal (a completed slot is GC'd only after its updates are read).
+    while engine.poll_service_update(handle).is_some() {}
     engine.unregister_service(handle, at(5_000_000));
-    // Busy for many attempts (well past the old 8-attempt cap), all within
-    // MAX_GOODBYE_AGE: a never-delivered goodbye must NOT be dropped early.
+    // Permanently busy: nothing reaches the wire and no round is spent. WITHIN the
+    // 2 s ceiling (begin at 5 s → ceiling 7 s) the withdrawal is HELD, so the route
+    // is still reserved and the slot still present.
     io.v4_fail = Some(SendError::Busy);
     io.v6_fail = Some(SendError::Busy);
-    for s in 5..=20 {
-      engine.pump(at(s * 1_000_000), &mut io, &mut scratch);
+    for micros in [5_250_001, 5_500_001, 6_000_001, 6_500_001] {
+      engine.pump(at(micros), &mut io, &mut scratch);
+      while engine.poll_service_update(handle).is_some() {}
     }
-    assert_eq!(
-      engine.goodbyes.len(),
-      1,
-      "a never-delivered goodbye must survive busy attempts within its age window"
-    );
-    // Past MAX_GOODBYE_AGE (queued at 5 s) the undeliverable entry is given up.
-    engine.pump(at(36_000_000), &mut io, &mut scratch);
     assert!(
-      engine.goodbyes.is_empty(),
-      "an undeliverable goodbye must be given up after its max age"
+      engine.services.contains_key(&handle),
+      "a never-delivered withdrawal must be HELD (route reserved + slot present) \
+       within the 2 s anti-pin ceiling"
+    );
+    // PAST the ceiling (7 s) `drain_completed_withdrawals` force-completes it — the
+    // route is freed and the driver slot GC'd even though nothing ever sent.
+    engine.pump(at(7_500_001), &mut io, &mut scratch);
+    assert!(
+      !engine.services.contains_key(&handle),
+      "an undeliverable withdrawal must be force-completed at its anti-pin ceiling"
     );
   }
 
@@ -3425,323 +2630,82 @@ mod tests {
     );
   }
 
-  /// Stats-feature-gated: `packets_tx` / `bytes_tx` are counted per ACTUAL
-  /// datagram sent (one per family that succeeded), and `goodbyes_tx` counts each
-  /// logical RFC 6762 retransmit ROUND exactly once — regardless of whether that
-  /// round's per-family sends complete in the same pump or across separate pumps.
-  ///
-  /// Scenario: capacity-1 transport — only one family can send per pump. v4 and
-  /// v6 alternate across pumps so each goodbye repeat takes two pumps. With
-  /// `GOODBYE_SENDS = 2` repeats, the transport places 4 datagrams total.
-  /// `packets_tx` must equal 4 (per-family datagram count). `goodbyes_tx` must
-  /// equal `GOODBYE_SENDS = 2` (logical rounds), NOT 4 — the counter is
-  /// transport-timing-independent and records only how many RFC retransmit rounds
-  /// the local node completed.
+  // NOTE: the per-family goodbye-accounting stats tests
+  // (fan_out_tx_accounting_is_per_datagram_and_goodbye_rounds_are_logical,
+  // stats_goodbye_single_stack_unsupported_v6, stats_goodbye_v4_sent_v6_failed_per_round,
+  // and stats_goodbye_busy_until_expiry_no_overcount) were REMOVED in the
+  // endpoint-owned-withdrawal migration: they asserted the deleted drain_goodbyes
+  // per-family GOODBYE_SENDS bookkeeping (engine.goodbyes + owed). The endpoint now
+  // owns the resend schedule; the driver bumps goodbyes_tx once per DELIVERED round
+  // (>= 1 family on the wire), packets_tx/bytes_tx per Sent family, and send_errors
+  // per Failed family in the withdrawal send. The dual-stack happy path below pins
+  // that driver-side accounting; both-families-failed pins the no-send case.
+
+  /// Dual-stack withdrawal stats (replaces the old per-family goodbye-accounting
+  /// suite). With WITHDRAWAL_SENDS resend rounds and both families healthy, each
+  /// round fans to v4+v6, so across the completed withdrawal: goodbyes_tx rises by
+  /// the number of DELIVERED rounds, packets_tx by twice that (one Sent per family
+  /// per round), and send_errors stays 0.
   #[cfg(feature = "stats")]
   #[test]
-  fn fan_out_tx_accounting_is_per_datagram_and_goodbye_rounds_are_logical() {
-    // Register a service and drive it to Established on dual-stack so we have
-    // a real goodbye to work with.
+  fn stats_withdrawal_dual_stack_counts_rounds_and_per_family_datagrams() {
     let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(90));
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1005));
     let handle = engine.register_service(sample_spec(), at(0)).unwrap();
     let mut io = MockUdp::default();
     let mut scratch = [0u8; 1500];
-    let mut established = false;
     for micros in pump_schedule() {
       engine.pump(at(micros), &mut io, &mut scratch);
-      while let Some(u) = engine.poll_service_update(handle) {
-        established |= matches!(u, ServiceUpdate::Established);
-      }
     }
-    assert!(
-      established,
-      "service must reach Established before the goodbye test"
-    );
-
-    // --- packets_tx accounting ---
-    //
-    // io.sent tracks every per-family successful send; packets_tx must equal that
-    // count (unicast + multicast per-family). After probing + announcing on
-    // dual-stack, packets_tx must equal the total number of entries in io.sent.
-    let snap_after_establish = engine.stats();
-    let total_sends = io.sent.len() as u64;
-    assert_eq!(
-      snap_after_establish.packets_tx, total_sends,
-      "packets_tx ({}) must equal the per-family successful-send count ({total_sends})",
-      snap_after_establish.packets_tx
-    );
-    assert!(
-      snap_after_establish.bytes_tx >= snap_after_establish.packets_tx,
-      "bytes_tx ({}) must be >= packets_tx ({}) — each datagram is at least 1 byte",
-      snap_after_establish.bytes_tx,
-      snap_after_establish.packets_tx
-    );
-
-    // --- goodbyes_tx logical-round accounting ---
-    //
-    // Unregister: queue the §10.1 goodbye. Then drain it on a capacity-1
-    // transport so v4 and v6 deliver in SEPARATE pumps (each pump can only
-    // place one datagram). `goodbyes_tx` must equal the number of logical
-    // RFC 6762 retransmit rounds (`GOODBYE_SENDS`), NOT the number of
-    // per-family datagrams sent. On capacity-1, two pumps are needed per
-    // logical round (one for v4, one for v6), but `goodbyes_tx` must still
-    // count only the number of rounds — not the number of pumps.
     engine.unregister_service(handle, at(5_000_000));
+    let snap_before = engine.stats();
     io.sent.clear();
 
-    let goodbyes_tx_before = engine.stats().goodbyes_tx;
+    // Unlimited capacity, pumps 250 ms apart (WITHDRAWAL_INTERVAL), within the 2 s
+    // ceiling so completion is a real budget spend. Drive until the endpoint frees
+    // the route (services_active drops to 0) — the authoritative completion signal.
     let mut t = 5_000_000i64;
-    // One datagram of TX room per pump, one GOODBYE_INTERVAL (1 s) between pumps.
-    // With GOODBYE_SENDS = 2 and dual-stack, this gives 4 pumps:
-    //   t+1s: v4 sends (round 1 starts — first family delivered), goodbyes_tx +=1
-    //   t+2s: v6 sends (round 1 still in progress), goodbyes_tx unchanged
-    //   t+3s: v4 sends (round 2 starts — first family delivered), goodbyes_tx +=1
-    //   t+4s: v6 sends (round 2 still in progress), entry drained, goodbyes_tx unchanged
-    // Total goodbyes_tx delta = GOODBYE_SENDS = 2, NOT 4 (the datagram count).
+    let mut completed = false;
     for _ in 0..16 {
-      t += 1_000_000; // GOODBYE_INTERVAL apart so next_at is always reached
-      io.capacity = Some(1);
+      t += 250_000;
       engine.pump(at(t), &mut io, &mut scratch);
-      if engine.goodbyes.is_empty() {
+      if engine.stats().services_active == 0 {
+        completed = true;
         break;
       }
     }
-    assert!(
-      engine.goodbyes.is_empty(),
-      "goodbye must drain to completion on a capacity-1 transport"
-    );
-    let v4_goodbye = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V4).count();
-    let v6_goodbye = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V6).count();
-    // Each family must receive the full GOODBYE_SENDS burst.
-    assert_eq!(
-      (v4_goodbye, v6_goodbye),
-      (usize::from(GOODBYE_SENDS), usize::from(GOODBYE_SENDS)),
-      "each family must receive GOODBYE_SENDS datagrams; v4={v4_goodbye} v6={v6_goodbye}"
-    );
-    // packets_tx must have grown by the number of goodbye datagrams sent
-    // (v4_goodbye + v6_goodbye per-family sends).
-    let packets_tx_after_goodbye = engine.stats().packets_tx;
-    let goodbye_datagrams = (v4_goodbye + v6_goodbye) as u64;
-    assert_eq!(
-      packets_tx_after_goodbye - snap_after_establish.packets_tx,
-      goodbye_datagrams,
-      "packets_tx delta ({}) must equal per-family goodbye sends ({goodbye_datagrams})",
-      packets_tx_after_goodbye - snap_after_establish.packets_tx
-    );
-    // goodbyes_tx counts logical RFC 6762 retransmit rounds, not per-family
-    // sends. Each round covers both families; with GOODBYE_SENDS = 2 there are
-    // exactly 2 rounds regardless of how many pumps each round takes. On a
-    // capacity-1 transport each round takes 2 pumps, giving 4 total datagrams
-    // but only GOODBYE_SENDS = 2 logical rounds counted.
-    let goodbyes_tx_delta = engine.stats().goodbyes_tx - goodbyes_tx_before;
-    assert_eq!(
-      goodbyes_tx_delta,
-      u64::from(GOODBYE_SENDS),
-      "goodbyes_tx delta ({goodbyes_tx_delta}) must equal the number of logical \
-       RFC 6762 retransmit rounds (GOODBYE_SENDS = {}), not per-family datagrams \
-       ({goodbye_datagrams}) — the count must be transport-timing-independent",
-      GOODBYE_SENDS
-    );
-  }
-
-  // ── Mandatory per-family accounting tests (correctness gate) ────────────────
-  //
-  // These tests exercise the exact cases the root-cause redesign was meant to
-  // fix: partial-failure, Unsupported (single-stack), Failed, Busy-until-expiry,
-  // and dual-stack. They MUST all pass for the fix to be considered correct.
-
-  /// Single-stack / Unsupported family: v6 absent, v4 sends all GOODBYE_SENDS
-  /// rounds. `goodbyes_tx` must equal `GOODBYE_SENDS` (not 0, not 2*GOODBYE_SENDS).
-  /// `send_errors` must be 0 (Unsupported is not an error).
-  /// `packets_tx` must count only v4 datagrams.
-  #[cfg(feature = "stats")]
-  #[test]
-  fn stats_goodbye_single_stack_unsupported_v6() {
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1001));
-    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
-    // v6 is absent (Unsupported): only v4 is reachable.
-    let mut io = MockUdp {
-      v6_fail: Some(SendError::Unsupported),
-      ..Default::default()
-    };
-    let mut scratch = [0u8; 1500];
-    // Drive to Established on v4 only.
-    for micros in pump_schedule() {
-      engine.pump(at(micros), &mut io, &mut scratch);
-    }
-    // Unregister to queue a goodbye.
-    engine.unregister_service(handle, at(5_500_000));
-    let snap_before = engine.stats();
-    io.sent.clear();
-
-    // Drain the goodbye completely within age bound.
-    let mut t = 5_500_000i64;
-    for _ in 0..16 {
-      t += 1_000_000;
-      engine.pump(at(t), &mut io, &mut scratch);
-      if engine.goodbyes.is_empty() {
-        break;
-      }
-    }
-    assert!(
-      engine.goodbyes.is_empty(),
-      "goodbye must drain on a v4-only node"
-    );
+    assert!(completed, "the withdrawal must drain on dual-stack");
 
     let snap_after = engine.stats();
     let v4 = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V4).count();
     let v6 = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V6).count();
-
-    assert_eq!(v6, 0, "v6 is Unsupported — no v6 datagrams expected");
-    assert_eq!(
-      v4,
-      usize::from(GOODBYE_SENDS),
-      "v4 must receive exactly GOODBYE_SENDS datagrams; got {v4}"
+    assert!(
+      v4 >= 1 && v6 >= 1,
+      "both families must carry goodbyes; v4={v4} v6={v6}"
     );
+    assert_eq!(
+      v4, v6,
+      "dual-stack: each round fans to both families equally"
+    );
+
+    // goodbyes_tx == number of delivered rounds; on healthy dual-stack each round
+    // delivers, so == v4 (one round per v4 datagram).
+    let rounds = v4 as u64;
     assert_eq!(
       snap_after.goodbyes_tx - snap_before.goodbyes_tx,
-      u64::from(GOODBYE_SENDS),
-      "goodbyes_tx must equal GOODBYE_SENDS on a single-stack node (Unsupported \
-       must NOT be counted as a round); delta={}",
-      snap_after.goodbyes_tx - snap_before.goodbyes_tx
+      rounds,
+      "goodbyes_tx must count one per delivered round (== {rounds})"
     );
+    // packets_tx delta == per-family datagrams (v4 + v6).
     assert_eq!(
       snap_after.packets_tx - snap_before.packets_tx,
-      v4 as u64,
-      "packets_tx delta must equal v4 datagram count only"
+      (v4 + v6) as u64,
+      "packets_tx delta must equal per-family goodbye datagrams"
     );
     assert_eq!(
       snap_after.send_errors - snap_before.send_errors,
       0,
-      "Unsupported must NOT increment send_errors; got {}",
-      snap_after.send_errors - snap_before.send_errors
-    );
-  }
-
-  /// Partial failure: v4 `Sent`, v6 `Failed` (TooLarge write-off) on every round.
-  /// `send_errors` must count the v6 failures (one per round). `goodbyes_tx`
-  /// counts each round once (v4 emitted it). `packets_tx` counts only v4.
-  #[cfg(feature = "stats")]
-  #[test]
-  fn stats_goodbye_v4_sent_v6_failed_per_round() {
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1002));
-    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
-    // v6 is TooLarge: a real I/O failure (but v4 succeeds).
-    let mut io = MockUdp {
-      v6_fail: Some(SendError::TooLarge),
-      ..Default::default()
-    };
-    let mut scratch = [0u8; 1500];
-    // Drive to Established; v4 handles it.
-    for micros in pump_schedule() {
-      engine.pump(at(micros), &mut io, &mut scratch);
-    }
-    engine.unregister_service(handle, at(5_500_000));
-    let snap_before = engine.stats();
-    io.sent.clear();
-
-    let mut t = 5_500_000i64;
-    for _ in 0..16 {
-      t += 1_000_000;
-      engine.pump(at(t), &mut io, &mut scratch);
-      if engine.goodbyes.is_empty() {
-        break;
-      }
-    }
-    assert!(
-      engine.goodbyes.is_empty(),
-      "goodbye must drain; v4 delivers, v6 written off"
-    );
-
-    let snap_after = engine.stats();
-    let v4 = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V4).count();
-    let v6 = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V6).count();
-
-    assert_eq!(v6, 0, "v6 TooLarge: no v6 datagrams should be sent");
-    assert_eq!(
-      v4,
-      usize::from(GOODBYE_SENDS),
-      "v4 must send exactly GOODBYE_SENDS datagrams; got {v4}"
-    );
-    assert_eq!(
-      snap_after.goodbyes_tx - snap_before.goodbyes_tx,
-      u64::from(GOODBYE_SENDS),
-      "goodbyes_tx must count each round once (v4 delivered it); delta={}",
-      snap_after.goodbyes_tx - snap_before.goodbyes_tx
-    );
-    assert_eq!(
-      snap_after.packets_tx - snap_before.packets_tx,
-      v4 as u64,
-      "packets_tx delta must equal v4 datagram count only"
-    );
-    // v6 gets written off (TooLarge → Failed) on the FIRST burst call, so
-    // send_errors is bumped once (not once per round — the write-off is immediate).
-    let errors_delta = snap_after.send_errors - snap_before.send_errors;
-    assert!(
-      errors_delta >= 1,
-      "v6 TooLarge must increment send_errors at least once; delta={errors_delta}"
-    );
-  }
-
-  /// Busy-until-expiry: v4 sends, v6 stays Busy until the entry expires.
-  /// `goodbyes_tx` must count only the rounds v4 actually put on the wire —
-  /// no overcount from the expired rounds that v6 never completed.
-  #[cfg(feature = "stats")]
-  #[test]
-  fn stats_goodbye_busy_until_expiry_no_overcount() {
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1003));
-    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
-    let mut io = MockUdp::default();
-    let mut scratch = [0u8; 1500];
-    for micros in pump_schedule() {
-      engine.pump(at(micros), &mut io, &mut scratch);
-    }
-    engine.unregister_service(handle, at(5_500_000));
-    // v6 goes Busy right after unregister and STAYS busy past MAX_GOODBYE_AGE.
-    io.v6_fail = Some(SendError::Busy);
-    let snap_before = engine.stats();
-    io.sent.clear();
-
-    // Drive past MAX_GOODBYE_AGE (30 s from unregister at 5.5 s → expire at 35.5 s).
-    let mut t = 5_500_000i64;
-    for _ in 0..40 {
-      t += 1_000_000;
-      engine.pump(at(t), &mut io, &mut scratch);
-      if engine.goodbyes.is_empty() {
-        break;
-      }
-    }
-    assert!(
-      engine.goodbyes.is_empty(),
-      "goodbye must be age-expired eventually"
-    );
-
-    let snap_after = engine.stats();
-    let v4 = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V4).count();
-
-    // v4 delivered its rounds; goodbyes_tx must equal exactly those rounds.
-    // It must NOT exceed GOODBYE_SENDS (no phantom counts from v6 Busy).
-    let goodbyes_delta = snap_after.goodbyes_tx - snap_before.goodbyes_tx;
-    assert_eq!(
-      goodbyes_delta,
-      u64::from(GOODBYE_SENDS),
-      "goodbyes_tx must count exactly GOODBYE_SENDS rounds (v4 sent them); \
-       must NOT overcount due to v6 Busy-until-expiry; delta={goodbyes_delta}"
-    );
-    assert_eq!(
-      snap_after.packets_tx - snap_before.packets_tx,
-      v4 as u64,
-      "packets_tx delta must equal v4 datagram count only"
-    );
-    assert_eq!(
-      snap_after.send_errors - snap_before.send_errors,
-      0,
-      "Busy must NOT increment send_errors; delta={}",
-      snap_after.send_errors - snap_before.send_errors
+      "dual-stack healthy: send_errors must be 0"
     );
   }
 
@@ -3753,20 +2717,22 @@ mod tests {
     let mut engine: Engine<SmoltcpInstant, StdRng> =
       Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1004));
     let handle = engine.register_service(sample_spec(), at(0)).unwrap();
-    // Both families healthy during announce so records are owned (goodbye queued).
+    // Both families healthy during announce so records are owned (the withdrawal
+    // snapshot is non-empty, so a goodbye send is attempted).
     let mut io = MockUdp::default();
     let mut scratch = [0u8; 1500];
     for micros in pump_schedule() {
       engine.pump(at(micros), &mut io, &mut scratch);
     }
     engine.unregister_service(handle, at(5_500_000));
-    // NOW make both fail with TooLarge (goodbye burst path).
+    // NOW make both fail with TooLarge (the endpoint-owned withdrawal send path).
     io.v4_fail = Some(SendError::TooLarge);
     io.v6_fail = Some(SendError::TooLarge);
     let snap_before = engine.stats();
     io.sent.clear();
 
-    // One pump: both families will be written off immediately.
+    // One pump (within the 2 s ceiling): both families are written off — nothing
+    // reaches the wire, so the round is not delivered (re-armed, not spent).
     engine.pump(at(6_500_000), &mut io, &mut scratch);
 
     let snap_after = engine.stats();
@@ -3788,64 +2754,10 @@ mod tests {
     );
   }
 
-  /// Dual-stack happy path: both families send all GOODBYE_SENDS rounds.
-  /// `goodbyes_tx == GOODBYE_SENDS`, `packets_tx == 2 * GOODBYE_SENDS`.
-  #[cfg(feature = "stats")]
-  #[test]
-  fn stats_goodbye_dual_stack_happy_path() {
-    let mut engine: Engine<SmoltcpInstant, StdRng> =
-      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1005));
-    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
-    let mut io = MockUdp::default();
-    let mut scratch = [0u8; 1500];
-    for micros in pump_schedule() {
-      engine.pump(at(micros), &mut io, &mut scratch);
-    }
-    engine.unregister_service(handle, at(5_500_000));
-    let snap_before = engine.stats();
-    io.sent.clear();
-
-    // Unlimited capacity: both families can send in each pump.
-    let mut t = 5_500_000i64;
-    for _ in 0..16 {
-      t += 1_000_000;
-      engine.pump(at(t), &mut io, &mut scratch);
-      if engine.goodbyes.is_empty() {
-        break;
-      }
-    }
-    assert!(
-      engine.goodbyes.is_empty(),
-      "goodbye must drain on dual-stack"
-    );
-
-    let snap_after = engine.stats();
-    let v4 = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V4).count();
-    let v6 = io.sent.iter().filter(|(d, _)| *d == MDNS_SOCKET_V6).count();
-
-    assert_eq!(
-      (v4, v6),
-      (usize::from(GOODBYE_SENDS), usize::from(GOODBYE_SENDS)),
-      "dual-stack: each family must receive GOODBYE_SENDS datagrams; v4={v4} v6={v6}"
-    );
-    assert_eq!(
-      snap_after.goodbyes_tx - snap_before.goodbyes_tx,
-      u64::from(GOODBYE_SENDS),
-      "goodbyes_tx must equal GOODBYE_SENDS (logical rounds), not 2*GOODBYE_SENDS; \
-       delta={}",
-      snap_after.goodbyes_tx - snap_before.goodbyes_tx
-    );
-    assert_eq!(
-      snap_after.packets_tx - snap_before.packets_tx,
-      (v4 + v6) as u64,
-      "packets_tx delta must equal per-family datagrams (2 * GOODBYE_SENDS)"
-    );
-    assert_eq!(
-      snap_after.send_errors - snap_before.send_errors,
-      0,
-      "dual-stack healthy: send_errors must be 0"
-    );
-  }
+  // NOTE: `stats_goodbye_dual_stack_happy_path` was REMOVED — it is superseded by
+  // `stats_withdrawal_dual_stack_counts_rounds_and_per_family_datagrams` above,
+  // which pins the same dual-stack accounting against the endpoint-owned
+  // withdrawal send (and no longer reads the deleted `engine.goodbyes` queue).
 
   /// Normal multicast TX path (probes/announcements): per-family `packets_tx`
   /// and `send_errors` correctness when one family fails permanently (TooLarge).
@@ -4188,11 +3100,12 @@ mod tests {
   /// regression: when `poll_one_transmit` retires a service due to a
   /// permanently-unencodable datagram (scratch too small to encode any probe),
   /// the proto route must be freed (`services_active == 0`) and the name must
-  /// be immediately re-registerable (route was released).
+  /// be re-registerable. The service never advertised, so its withdrawal snapshot
+  /// is empty and completes on the same pump (freeing the route).
   ///
   /// This covers the `Err(_)` arm in `Engine::poll_one_transmit` that now
-  /// calls `endpoint.unregister_service(handle)` in addition to setting
-  /// `slot.errored = true`.
+  /// calls `begin_service_withdrawal(handle, now)` in addition to setting
+  /// `slot.errored = true` (the endpoint frees the route on withdrawal completion).
   #[cfg(feature = "stats")]
   #[test]
   fn encode_failure_retirement_frees_proto_route_and_decrements_services_active() {
@@ -4307,10 +3220,12 @@ mod tests {
     );
 
     // Pump with a tiny (1-byte) scratch. smoltcp retires on the FIRST encode
-    // failure; both services have pending probes, so both should be retired
-    // within a few pump cycles. The key assertion (the fix) is that
-    // both routes are freed — services_active reaches 0 and both names are
-    // re-registerable — not leaked by the deferred-Vec bypass.
+    // failure; both services have pending probes, so both begin an (empty,
+    // never-announced) endpoint-owned withdrawal in the same `poll_one_transmit`
+    // sweep. An empty withdrawal completes on the same pump, freeing both routes.
+    // The key assertion (the fix) is that BOTH routes are freed —
+    // services_active reaches 0 and both names re-registerable — not leaked by an
+    // early-return for a sibling bypassing one service's in-iteration withdrawal.
     let mut io = MockUdp::default();
     let mut tiny = [0u8; 1];
     let mut got_conflict_a = false;
@@ -4319,6 +3234,8 @@ mod tests {
     for i in 0..30i64 {
       let t = at(i * 100_000);
       engine.pump(t, &mut io, &mut tiny);
+      // Draining the Conflict GCs the (route-already-freed) slot, so observe the
+      // Conflict here rather than via a `slot.errored` peek (the slot may be gone).
       while let Some(u) = engine.poll_service_update(handle_a) {
         if matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict) {
           got_conflict_a = true;
@@ -4329,41 +3246,13 @@ mod tests {
           got_conflict_b = true;
         }
       }
-      // Stop once both are retired.
-      let a_done = engine
-        .services
-        .get(&handle_a)
-        .map(|s| s.errored)
-        .unwrap_or(false);
-      let b_done = engine
-        .services
-        .get(&handle_b)
-        .map(|s| s.errored)
-        .unwrap_or(false);
-      if a_done && b_done {
+      if got_conflict_a && got_conflict_b {
         break;
       }
     }
 
-    // Both services must have been retired.
-    assert!(
-      engine
-        .services
-        .get(&handle_a)
-        .map(|s| s.errored)
-        .unwrap_or(false),
-      "A must be retired by encode failure"
-    );
-    assert!(
-      engine
-        .services
-        .get(&handle_b)
-        .map(|s| s.errored)
-        .unwrap_or(false),
-      "B must be retired by encode failure"
-    );
-
-    // Conflicts surfaced.
+    // Conflicts surfaced for BOTH (each internal retirement still notifies the
+    // host, even though it now begins a withdrawal instead of freeing immediately).
     assert!(
       got_conflict_a,
       "A's Conflict must be surfaced via poll_service_update"
@@ -4373,15 +3262,15 @@ mod tests {
       "B's Conflict must be surfaced via poll_service_update"
     );
 
-    // fix: both routes freed → services_active == 0.
-    // With the buggy deferred-Vec drain, an early-return from B (if B returned
-    // Ok(Some) before A retired in the same call) would bypass A's unregister,
-    // leaving services_active > 0 and A's name not re-registerable.
+    // fix (endpoint-owned form): both routes freed → services_active == 0.
+    // Each service's empty withdrawal completes (frees its route) in the pump that
+    // began it; the in-iteration `begin_service_withdrawal` is non-bypassable, so
+    // an early-return for a sibling cannot leak the other's route.
     assert_eq!(
       engine.stats().services_active,
       0,
       "services_active must be 0 after both services are retired by encode failure \
-       (regression: deferred-drain bypass would leave routes leaked)"
+       (each begins + completes an empty withdrawal; no route leak)"
     );
 
     // Both names must be immediately re-registerable (routes were freed).
@@ -4407,12 +3296,15 @@ mod tests {
     );
   }
 
-  /// regression (send-too-large path): when `retire_origin` retires a service because every send
-  /// returned a permanent error (`SendError::TooLarge`), the proto route must
-  /// be freed (`services_active == 0`) and the name must be re-registerable.
+  /// regression (send-too-large path): when `retire_origin` retires a service
+  /// because every send returned a permanent error (`SendError::TooLarge`), the
+  /// proto route must be freed (`services_active == 0`) and the name must be
+  /// re-registerable. The service never confirmed-emitted anything (all sends
+  /// failed), so its withdrawal snapshot is empty and completes immediately.
   ///
   /// This covers the `Origin::Service` arm in `Engine::retire_origin` that now
-  /// calls `endpoint.unregister_service(handle)`.
+  /// calls `begin_service_withdrawal(handle, now)` (the endpoint frees the route
+  /// when the withdrawal completes — here on the same pump, an empty snapshot).
   #[cfg(feature = "stats")]
   #[test]
   fn send_too_large_retirement_frees_proto_route_and_decrements_services_active() {

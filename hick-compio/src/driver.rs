@@ -43,31 +43,6 @@ use mdns_proto::{
   service::Service as ProtoSvc, transmit::Transmit,
 };
 
-/// RFC 6762 §10.1: a goodbye is multicast a few times for loss resilience.
-/// Matches `hick-reactor::driver::GOODBYE_SENDS`.
-pub(crate) const GOODBYE_SENDS: u8 = 3;
-
-/// Spacing between successive goodbye resends. Matches
-/// `hick-reactor::driver::GOODBYE_INTERVAL`.
-pub(crate) const GOODBYE_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Short re-attempt delay for a goodbye round that put NOTHING on the wire (every
-/// family's `send_to` failed). Much smaller than [`GOODBYE_INTERVAL`] so a
-/// transiently-undeliverable free-name goodbye is retried promptly — WITHOUT
-/// consuming a resend round and WITHOUT busy-spinning — and a positive transmit
-/// deferred behind its [`PendingGoodbye::sent_once`] barrier wakes again soon.
-/// Kept consistent with `hick-smoltcp`/`hick-reactor`'s `GOODBYE_RETRY_BACKOFF`.
-pub(crate) const GOODBYE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
-
-/// Hard ceiling on how long an un-sent free-name goodbye may act as a transmit
-/// barrier (see [`PendingGoodbye::sent_once`]) AND on its retention. Because Part
-/// A no longer decrements a goodbye's resend budget on a round that never reached
-/// the wire, a permanently-undeliverable (all-failing) entry would otherwise pin
-/// the goodbye queue — and block positive transmits — forever. Past this age the
-/// entry is force-cleared so it can neither block transmits nor leak. Kept
-/// consistent with `hick-smoltcp`/`hick-reactor`'s `GOODBYE_BARRIER_MAX`.
-pub(crate) const GOODBYE_BARRIER_MAX: Duration = Duration::from_secs(2);
-
 /// Per-iteration cap on the transmit pump.  Mirrors
 /// `hick-reactor::driver::MAX_SEND_CREDITS_PER_DRAIN` (64) so a misbehaving
 /// proto-state machine — or a transmit yielded for an unbound address family
@@ -75,14 +50,14 @@ pub(crate) const GOODBYE_BARRIER_MAX: Duration = Duration::from_secs(2);
 /// cannot spin the driver in a tight unbounded loop.
 pub(crate) const MAX_TRANSMIT_CREDITS_PER_PASS: usize = 64;
 
-/// IPv4 mDNS multicast destination (224.0.0.251:5353). Used by the goodbye
-/// pump (which doesn't go through `poll_one_transmit`).
+/// IPv4 mDNS multicast destination (224.0.0.251:5353). Used by the transmit
+/// pump's dual-stack fan-out and the endpoint-owned withdrawal pump.
 pub(crate) const MDNS_V4_DST: core::net::SocketAddr = core::net::SocketAddr::V4(
   core::net::SocketAddrV4::new(core::net::Ipv4Addr::new(224, 0, 0, 251), 5353),
 );
 
-/// IPv6 mDNS multicast destination ([ff02::fb]:5353). Used by the goodbye
-/// pump.
+/// IPv6 mDNS multicast destination ([ff02::fb]:5353). Used by the transmit
+/// pump's dual-stack fan-out and the endpoint-owned withdrawal pump.
 pub(crate) const MDNS_V6_DST: core::net::SocketAddr =
   core::net::SocketAddr::V6(core::net::SocketAddrV6::new(
     core::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb),
@@ -241,8 +216,10 @@ pub(crate) struct ServiceCtx {
   /// read it (the exact silent-failure this fix closes), so instead the ctx is
   /// kept but flagged `errored`: every proto-polling pump skips it (so a dead
   /// proto can't be re-polled into a busy-spin) while the already-queued
-  /// `Conflict` stays readable. The slot is freed normally when the `Service`
-  /// handle is dropped (the `flag_service_unregistered` → sweep path).
+  /// `Conflict` stays readable. The route is freed (and the ctx GC'd) when the
+  /// endpoint-owned withdrawal that this retirement begins completes (the
+  /// `begin_service_withdrawal` → `drain_completed_withdrawals` path), or — for a
+  /// graceful drop — once that withdrawal's [`Self::route_freed`] GC fires.
   pub(crate) errored: bool,
   /// One-shot "wake a parked `Service::next` for the escalation `Conflict`"
   /// flag. The escalation pushes `Conflict` into `updates` from inside the
@@ -251,9 +228,18 @@ pub(crate) struct ServiceCtx {
   /// it as needing a wake. Set this once at escalation;
   /// [`State::push_service_updates`] consumes it to fire exactly one `notify`,
   /// so a handle parked on an otherwise-idle endpoint (no other service / query
-  /// / goodbye deadline) still gets woken to read the `Conflict`. Cleared after
+  /// / withdrawal deadline) still gets woken to read the `Conflict`. Cleared after
   /// that single wake so an undrained `Conflict` can't drive a notify busy-spin.
   pub(crate) conflict_wake_pending: bool,
+  /// Set when this service's endpoint-owned RFC 6762 §10.1 withdrawal has already
+  /// COMPLETED (its route is freed) but the ctx is RETAINED because it still holds
+  /// un-drained app-facing updates — typically the `Conflict` queued at an internal
+  /// retirement. Such a ctx is GC'd LAZILY: by [`State::drain_completed_withdrawals`]
+  /// on a later iteration, or by `Service::next` the moment it pops the last update.
+  /// This keeps the `Conflict` deliverable even when the withdrawal completes in the
+  /// SAME loop iteration that began it (an empty, never-announced withdrawal
+  /// completes immediately). Mirrors `hick-smoltcp`'s `ServiceSlot::route_freed`.
+  pub(crate) route_freed: bool,
 }
 
 /// Driver-side per-query context: last-delivered sequence number and a
@@ -281,34 +267,6 @@ pub(crate) struct QueryCtx {
   pub(crate) terminal_wake_pending: bool,
 }
 
-/// A pending RFC 6762 §10.1 goodbye broadcast queued by service withdrawal.
-/// The encoded datagram is self-contained; the proto `Service` is removed
-/// immediately so withdrawal proceeds even after the state machine is gone.
-pub(crate) struct PendingGoodbye {
-  /// Fully encoded TTL=0 datagram (records of the withdrawn service).
-  pub(crate) data: Vec<u8>,
-  /// Remaining sends; the entry is dropped once this reaches zero. Decremented
-  /// ONLY on a round that actually reached the wire (Part A) — a round in which
-  /// every family's `send_to` failed leaves this untouched.
-  pub(crate) remaining: u8,
-  /// Earliest wall-clock instant at which the next send may go out.
-  pub(crate) next_at: StdInstant,
-  /// `false` until the FIRST round of this goodbye reaches the wire (at least one
-  /// family sent). While `false` — and before [`Self::expires_at`] — this entry
-  /// is a PENDING BARRIER: a free-name (retirement/rename) TTL=0 withdrawal that
-  /// must precede any positive-TTL transmit, so a same-name replacement under
-  /// `with_probe_unique_names(false)` cannot announce a fresh positive TTL ahead
-  /// of the stale TTL=0 and evict itself from peer caches. Set once, never cleared.
-  pub(crate) sent_once: bool,
-  /// Hard deadline after which the entry is force-cleared even if it never sent —
-  /// the anti-pin bound for both the [`Self::sent_once`] barrier and the entry's
-  /// lifetime. Set at queue time to `now + GOODBYE_BARRIER_MAX`. Because Part A
-  /// stops advancing `remaining` on a never-delivered round, this bound (not
-  /// `remaining`) is what prevents an undeliverable goodbye pinning the queue /
-  /// blocking transmits forever.
-  pub(crate) expires_at: StdInstant,
-}
-
 /// All state owned by the compio driver task. Held behind the `RefCell` in
 /// `EndpointInner` (T9) — no `Arc` / `Mutex` / atomics: every borrower is on the
 /// same `!Send` runtime thread.
@@ -319,16 +277,19 @@ pub(crate) struct State {
   /// Self-send tracker — `(content_hash, body_len, send_wall_time)` for every
   /// datagram we recently transmitted, used by T16's loopback-self detection.
   pub(crate) recent_sends: crate::selfsend::SelfSends,
-  /// TTL=0 goodbye packets resent a few times before being dropped.
-  pub(crate) goodbyes: Vec<PendingGoodbye>,
+  /// Reusable scratch for the handles of endpoint-owned withdrawals that
+  /// completed in a loop iteration, so [`ProtoEndpoint::drain_completed_withdrawals`]
+  /// can push into it and the loop can GC each one's driver ctx. Kept on the
+  /// state and `clear()`ed each iteration so the per-iteration GC allocates
+  /// nothing in steady state.
+  pub(crate) completed_withdrawals: Vec<ServiceHandle>,
   /// Bound interface index (1-based) used for §11 link-local scoping.
   pub(crate) bound_interface: u32,
   /// Cached local subnets used for the §11 source-address fallback when the
   /// kernel didn't deliver an IPv4 TTL / IPv6 hop-limit cmsg.
   pub(crate) local_subnets: Vec<(core::net::IpAddr, u8)>,
   /// Max datagram size; used to size the scratch buffer for the encode/send
-  /// path (T8/T9) and the goodbye-encoding path. Sourced from
-  /// [`crate::ServerOptions::max_payload_size`].
+  /// path (T8/T9). Sourced from [`crate::ServerOptions::max_payload_size`].
   pub(crate) max_payload: usize,
   /// Max inbound-datagram size accepted without truncation. Sourced from
   /// [`crate::ServerOptions::max_recv_packet_size`] (RFC 6762 §17 requires
@@ -343,10 +304,10 @@ pub(crate) struct State {
 }
 
 impl State {
-  /// Build a fresh driver state with no services, queries, or goodbye queue
-  /// entries, seeded with an OS-derived [`rand::rngs::StdRng`]. Bound
-  /// interface and local-subnet snapshot stay empty until T9 wires them in
-  /// from the bound sockets / interface discovery.
+  /// Build a fresh driver state with no services or queries, seeded with an
+  /// OS-derived [`rand::rngs::StdRng`]. Bound interface and local-subnet
+  /// snapshot stay empty until T9 wires them in from the bound sockets /
+  /// interface discovery.
   pub(crate) fn new(cfg: EndpointConfig, max_payload: usize, max_recv: usize) -> Self {
     use rand::SeedableRng;
     // rand 0.10 removed `from_entropy`; seed StdRng from the OS-seeded
@@ -360,7 +321,7 @@ impl State {
       services: HashMap::new(),
       queries: HashMap::new(),
       recent_sends: Vec::new(),
-      goodbyes: Vec::new(),
+      completed_withdrawals: Vec::new(),
       bound_interface: 0,
       local_subnets: Vec::new(),
       max_payload,
@@ -389,6 +350,7 @@ impl State {
         encode_failures: 0,
         errored: false,
         conflict_wake_pending: false,
+        route_freed: false,
       },
     );
     Ok(handle)
@@ -423,95 +385,113 @@ impl State {
   }
 
   /// Flag a service as withdrawn (called from [`Service::drop`]). The actual
-  /// proto-state removal + RFC 6762 §10.1 goodbye encoding is deferred to the
-  /// driver loop's [`Self::sweep_cancelled_services`], which runs after the
-  /// transmit pump so any in-flight send latches first. The `cancelled` flag is
-  /// meanwhile honoured by [`Self::poll_one_transmit`] and [`Self::fire_timeouts`]
-  /// so a withdrawn service emits no further probes/announces before the sweep.
+  /// retirement — beginning the endpoint-owned RFC 6762 §10.1 withdrawal — is
+  /// deferred to the driver loop's [`Self::sweep_cancelled_services`], which runs
+  /// after the transmit pump so any in-flight send latches first. The `cancelled`
+  /// flag is meanwhile honoured by [`Self::poll_one_transmit`] and
+  /// [`Self::fire_timeouts`] so a withdrawn service emits no further
+  /// probes/announces before the sweep.
   pub(crate) fn flag_service_unregistered(&mut self, h: ServiceHandle) {
     if let Some(s) = self.services.get_mut(&h) {
       s.cancelled = true;
     }
   }
 
-  /// Remove a service: encode its RFC 6762 §10.1 goodbye (TTL=0) records
-  /// while the proto state is still present, drop the proto state, and
-  /// release the endpoint's route slot.
+  /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: mark the
+  /// ctx `errored` (so every subsequent pump skips it for transmits, deadlines,
+  /// and ticks — its proto state machine is finished), snapshot what its goodbye
+  /// must retract ([`mdns_proto::service::Service::withdrawal_snapshot`], which
+  /// prioritises a pending conflict-rename old-name goodbye over the current
+  /// state), and hand it to [`ProtoEndpoint::begin_withdrawal`]. The endpoint KEEPS
+  /// the route (holding the name against a same-name re-registration) and drives
+  /// the TTL=0 goodbye resend schedule; the run loop pumps each due goodbye
+  /// datagram and, on completion, frees the route and GCs the driver ctx.
   ///
-  /// Mirrors `hick-reactor::driver::DriverState::remove_service` (per-record
-  /// goodbye ownership, sibling-host address retention, drained
-  /// conflict-rename withdrawal). The encoded datagrams are pushed onto
-  /// `self.goodbyes` — the driver loop's goodbye pump fans each one out to
-  /// the bound multicast sockets [`GOODBYE_SENDS`] times spaced by
-  /// [`GOODBYE_INTERVAL`]. A service that never reached the announced state
-  /// yields `None` from `encode_goodbye`, so nothing is queued.
-  pub(crate) fn remove_service(&mut self, handle: ServiceHandle, now: StdInstant) {
-    let cap = self.max_payload.max(512);
-
-    // Per-address sibling retention: another local service may still own a
-    // subset of THIS service's host addresses. Collect each sibling's
-    // confirmed-emitted (advertised) addresses; the goodbye encoder
-    // withdraws only the addresses this service advertised that no sibling
-    // is still keeping in peer caches.
-    let retained_host_addrs: Vec<core::net::IpAddr> = if let Some(ctx) = self.services.get(&handle)
-    {
-      let host = ctx.proto.records().host().clone();
-      let mut set: Vec<core::net::IpAddr> = Vec::new();
-      for (h, other) in self.services.iter() {
-        if *h != handle && other.proto.records().host() == &host {
-          set.extend(
-            other
-              .proto
-              .advertised_a_addrs()
-              .iter()
-              .map(|a| core::net::IpAddr::V4(*a)),
-          );
-          set.extend(
-            other
-              .proto
-              .advertised_aaaa_addrs()
-              .iter()
-              .map(|a| core::net::IpAddr::V6(*a)),
-          );
-        }
+  /// The withdrawal covers whatever the service must retract: the records it
+  /// confirmed-emitted under its current name (host A/AAAA filtered against
+  /// same-host siblings by the endpoint), OR — if a conflict rename left an
+  /// old-name withdrawal pending — that old instance name first. A never-announced
+  /// service has an empty snapshot and completes on the next loop iteration with no
+  /// datagram on the wire.
+  ///
+  /// The driver ctx is NOT removed here: it is kept (marked `errored`) so any
+  /// already-queued `ServiceUpdate::Conflict` still reaches the host before the ctx
+  /// is GC'd. `begin_withdrawal` is idempotent, so calling this for an
+  /// already-withdrawing service is a no-op. A no-op for an unknown driver handle.
+  pub(crate) fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: StdInstant) {
+    // Scope the `ctx` borrow so it ends before `self.endpoint` is touched (the
+    // snapshot is owned, so no borrow of `self.services` outlives this block).
+    let snap = match self.services.get_mut(&handle) {
+      Some(ctx) => {
+        ctx.errored = true;
+        ctx.proto.withdrawal_snapshot()
       }
-      set
-    } else {
-      Vec::new()
+      None => return,
     };
+    self.endpoint.begin_withdrawal(handle, snap, now);
+  }
 
-    // Encode withdrawals while proto state is still present. Collect into a
-    // local Vec first so the borrow of `self.services` is released before
-    // pushing into `self.goodbyes`.
-    let mut pending_datagrams: Vec<Vec<u8>> = Vec::new();
-    if let Some(ctx) = self.services.get_mut(&handle) {
-      let mut buf = vec![0u8; cap];
-      if let Ok(Some(len)) = ctx.proto.encode_goodbye(&mut buf, &retained_host_addrs) {
-        buf.truncate(len);
-        pending_datagrams.push(buf);
-      }
-      // A conflict-rename may have queued an unsent withdrawal of the OLD
-      // instance records inside the proto. Removal drops that proto state,
-      // so drain those bytes here too — otherwise the old name lingers in
-      // peer caches until TTL expiry.
-      let mut rbuf = vec![0u8; cap];
-      if let Ok(Some(rlen)) = ctx.proto.take_pending_rename_goodbye(&mut rbuf) {
-        rbuf.truncate(rlen);
-        pending_datagrams.push(rbuf);
+  /// Pump every due endpoint-owned withdrawal datagram into `scratch`, returning
+  /// `Some((dst, len, handle))` for ONE due TTL=0 goodbye or `None` when none is
+  /// due. Mirrors [`Self::poll_one_transmit`]: the run loop sends `scratch[..len]`
+  /// (fanned to BOTH families — `dst` is always the IPv4 multicast marker) and
+  /// then confirms via [`Self::note_withdrawal_result`]. The endpoint encodes the
+  /// goodbye with fresh sibling host-address retention computed internally.
+  pub(crate) fn poll_one_withdrawal(
+    &mut self,
+    now: StdInstant,
+    scratch: &mut [u8],
+  ) -> Option<(core::net::SocketAddr, usize, ServiceHandle)> {
+    self.endpoint.poll_withdrawal_transmit(now, scratch)
+  }
+
+  /// Confirm a withdrawal goodbye round: `delivered` is `true` iff at least one
+  /// family put the datagram on the wire. A delivered round spends one resend; a
+  /// fully-failed round is re-armed by the endpoint (short backoff) WITHOUT
+  /// spending. No-op for an unknown handle.
+  pub(crate) fn note_withdrawal_result(
+    &mut self,
+    handle: ServiceHandle,
+    now: StdInstant,
+    delivered: bool,
+  ) {
+    self.endpoint.note_withdrawal_result(handle, now, delivered);
+  }
+
+  /// Free + GC every endpoint-owned withdrawal that COMPLETED (its resend budget
+  /// is spent or it hit the 2 s anti-pin ceiling). The endpoint releases each
+  /// route (decrementing `services_active`); the driver then GCs its ctx — but
+  /// DEFERS the GC for a ctx whose `updates` deque still holds an undrained
+  /// app-facing update (typically the `Conflict` queued at an internal
+  /// retirement), marking it [`ServiceCtx::route_freed`] so `Service::next` GCs it
+  /// the moment it pops the last update. This preserves the `Conflict` even when
+  /// the (empty, never-announced) withdrawal completes in the SAME iteration that
+  /// began it. Call once per loop iteration, after draining withdrawal transmits.
+  /// Returns `true` if at least one ctx was GC'd immediately (so the caller can
+  /// wake any handle parked on an otherwise-idle endpoint).
+  pub(crate) fn drain_completed_withdrawals(&mut self, now: StdInstant) -> bool {
+    // `completed_withdrawals` and `endpoint` are disjoint fields; clear the
+    // reused scratch and let the endpoint push the completed handles into it.
+    self.completed_withdrawals.clear();
+    self
+      .endpoint
+      .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
+    let mut gcd_any = false;
+    while let Some(handle) = self.completed_withdrawals.pop() {
+      match self.services.get_mut(&handle) {
+        // No pending updates: GC the ctx now.
+        Some(ctx) if ctx.updates.is_empty() => {
+          self.services.remove(&handle);
+          gcd_any = true;
+        }
+        // Pending updates (e.g. a retirement `Conflict`): defer the GC. Mark
+        // `route_freed` so `Service::next` reclaims the ctx once it drains the
+        // last update, keeping that `Conflict` deliverable.
+        Some(ctx) => ctx.route_freed = true,
+        None => {}
       }
     }
-    for data in pending_datagrams {
-      self.goodbyes.push(PendingGoodbye {
-        data,
-        remaining: GOODBYE_SENDS,
-        next_at: now,
-        sent_once: false,
-        expires_at: now + GOODBYE_BARRIER_MAX,
-      });
-    }
-
-    self.services.remove(&handle);
-    let _ = self.endpoint.unregister_service(handle);
+    gcd_any
   }
 
   /// Drive endpoint + per-query timer-based work.  Per-service lifecycle
@@ -540,58 +520,34 @@ impl State {
     }
   }
 
-  /// Remove every service flagged `cancelled` by [`Service::drop`], encoding
-  /// each one's RFC 6762 §10.1 goodbye via [`Self::remove_service`]. Returns
-  /// `true` if at least one service was swept.
+  /// Begin the endpoint-owned withdrawal for every service flagged `cancelled` by
+  /// [`Service::drop`], via [`Self::begin_service_withdrawal`]. Returns `true` if
+  /// at least one service was swept.
   ///
   /// The driver calls this AFTER the transmit pump, never from `Service::drop`
-  /// directly. The ordering is load-bearing: a service whose announce/response
-  /// was in flight (mid-`send_to().await`) when its handle dropped only latches
-  /// those records as advertised once the send completes and the pump calls
-  /// [`Self::note_service_transmit_result`]. Sweeping after the pump guarantees
-  /// `remove_service` sees the latched records and includes them in the
-  /// goodbye. Encoding the goodbye synchronously in `Drop` — before the await
-  /// completed — would miss the just-sent record and leak a positive-TTL entry
-  /// into peer caches with no TTL=0 withdrawal (the §10.1 violation this fixes).
+  /// directly. The ordering is load-bearing: a service whose announce/response was
+  /// in flight (mid-`send_to().await`) when its handle dropped only latches those
+  /// records as advertised once the send completes and the pump calls
+  /// [`Self::note_service_transmit_result`]. Sweeping after the pump guarantees the
+  /// withdrawal snapshot sees the latched records and includes them in the goodbye.
+  /// Snapshotting synchronously in `Drop` — before the await completed — would miss
+  /// the just-sent record and leak a positive-TTL entry into peer caches with no
+  /// TTL=0 withdrawal (the §10.1 violation this fixes).
   pub(crate) fn sweep_cancelled_services(&mut self, now: StdInstant) -> bool {
+    // Only sweep a cancelled service that is NOT already withdrawing (`errored`
+    // is set by `begin_service_withdrawal`), so a second sweep pass before the
+    // withdrawal completes is a no-op rather than a redundant idempotent call.
     let cancelled: Vec<ServiceHandle> = self
       .services
       .iter()
-      .filter(|(_, ctx)| ctx.cancelled)
+      .filter(|(_, ctx)| ctx.cancelled && !ctx.errored)
       .map(|(h, _)| *h)
       .collect();
     let swept = !cancelled.is_empty();
     for h in cancelled {
-      self.remove_service(h, now);
+      self.begin_service_withdrawal(h, now);
     }
     swept
-  }
-
-  /// Final withdrawal flush for driver shutdown. Sweeps any still-cancelled
-  /// service (encoding its RFC 6762 §10.1 goodbye) and then DRAINS the entire
-  /// goodbye queue into a flat list of datagrams — each pending entry expanded
-  /// to its `remaining` burst copies — leaving `self.goodbyes` empty.
-  ///
-  /// The driver calls this on the last-handle-drop path INSTEAD of the normal
-  /// timer-spaced goodbye pump. Once every external handle is gone the driver
-  /// is about to exit and can't stay alive for the inter-burst
-  /// [`GOODBYE_INTERVAL`] spacing, so it flushes all remaining bursts
-  /// back-to-back to get the TTL=0 records on the wire before teardown. Without
-  /// this, a service whose handle was the last `Rc` would be flagged cancelled
-  /// but never swept — the loop's bottom-of-iteration shutdown check would exit
-  /// before the next top-of-loop sweep ran — leaking a positive-TTL record into
-  /// peer caches with no withdrawal (the §10.1 violation this closes).
-  ///
-  /// Returns owned datagrams so the caller sends them under no `RefCell` borrow.
-  pub(crate) fn take_shutdown_goodbyes(&mut self, now: StdInstant) -> Vec<Vec<u8>> {
-    self.sweep_cancelled_services(now);
-    let mut out = Vec::new();
-    for g in self.goodbyes.drain(..) {
-      for _ in 0..g.remaining {
-        out.push(g.data.clone());
-      }
-    }
-    out
   }
 
   /// Drain pending `ServiceUpdate`s out of each per-service proto state machine
@@ -646,52 +602,37 @@ impl State {
               hick_trace::warn!(
                 handle = ?h,
                 error = ?_e,
-                "auto-rename collided with another local service; emitting Conflict and marking errored"
+                "auto-rename collided with another local service; emitting Conflict and beginning withdrawal"
               );
-              // Steal the OLD-name TTL=0 goodbye the proto queued at rename time
-              // and queue it for sending BEFORE we free the route. The slot is
-              // now `errored`, so the transmit pump skips it and the proto's
-              // deadline auto-emit can never fire; and `unregister_service` is
-              // about to free the old name for reuse. If the goodbye were left
-              // to drain on handle-drop (`remove_service`), it would emit a
-              // TTL=0 for a name a replacement service may already own, evicting
-              // it from peer caches. Draining it here sends the conformant RFC
-              // 6762 §10.1 old-name withdrawal while the name still belongs to
-              // THIS service.
-              let mut stolen: Option<Vec<u8>> = None;
+              // The new name collides with another LOCAL service; this service has
+              // already rebranded and can't be kept. Surface `Conflict` into the
+              // in-ctx deque (drained directly by `Service::next`) and arm the
+              // one-shot wake, then begin the endpoint-owned withdrawal. Its
+              // snapshot prioritises the proto's pending OLD-name rename goodbye
+              // ([`mdns_proto::service::Service::withdrawal_snapshot`]); the
+              // endpoint holds the route (keeping the OLD name reserved) while it
+              // resends, freeing the name on completion. This is the conformant RFC
+              // 6762 §10.1 old-name withdrawal — sent while the name still belongs
+              // to THIS service, so a same-name replacement cannot register (and
+              // evict it from peer caches) until the goodbye completes. The ctx is
+              // KEPT (not removed) so this queued `Conflict` still reaches the host;
+              // it is GC'd by `drain_completed_withdrawals` once the withdrawal
+              // completes (deferred via `route_freed` while the `Conflict` is
+              // undrained). Only this rename-COLLISION teardown goes through
+              // begin_withdrawal — a SURVIVING renamed service's old-name goodbye is
+              // auto-emitted by the proto's own `poll_transmit`.
               if let Some(ctx) = self.services.get_mut(&h) {
                 push_service_update_coalesced(&mut ctx.updates, ServiceUpdate::Conflict);
-                ctx.errored = true;
                 ctx.conflict_wake_pending = true;
-                // Capture the pending rename goodbye while we hold the ctx borrow.
-                let cap = self.max_payload.max(512);
-                let mut rbuf = vec![0u8; cap];
-                if let Ok(Some(rlen)) = ctx.proto.take_pending_rename_goodbye(&mut rbuf) {
-                  rbuf.truncate(rlen);
-                  stolen = Some(rbuf);
-                }
               }
-              if let Some(data) = stolen {
-                self.goodbyes.push(PendingGoodbye {
-                  data,
-                  remaining: GOODBYE_SENDS,
-                  next_at: now,
-                  sent_once: false,
-                  expires_at: now + GOODBYE_BARRIER_MAX,
-                });
-              }
-              // The `ctx` borrow from `self.services.get_mut` above ends at the
-              // closing `}` of the `if let Some(ctx)` block. Free the proto
-              // route under the (old) name immediately — mirroring the smoltcp
-              // `drain_service_updates` rename-collision path — so
-              // `services_active` is decremented and the name slot becomes
-              // reusable. This site is inside a `while let` that only borrows
-              // `self.services` transiently (re-evaluating the condition each
-              // iteration), and there is no transmit early-return here, so the
-              // unregister is non-bypassable. `unregister_service` touches only
-              // `self.endpoint`, not `self.services`. It is idempotent (returns
-              // false for an unknown handle), so a double call is safe.
-              let _ = self.endpoint.unregister_service(h);
+              // The `ctx` borrow above ends at the closing `}`. Begin the
+              // endpoint-owned withdrawal IN-ITERATION (non-bypassable — this
+              // `while let` only borrows `self.services` transiently and there is no
+              // transmit early-return here). `begin_service_withdrawal` sets
+              // `errored`, snapshots the pending rename goodbye, and holds the
+              // route; it touches `self.services`/`self.endpoint` only, no iterator
+              // invalidation, and `begin_withdrawal` is idempotent.
+              self.begin_service_withdrawal(h, now);
               pushed_any = true;
               break;
             }
@@ -743,7 +684,7 @@ impl State {
       // escalate to `ServiceUpdate::Conflict` once they cross the threshold.
       //
       // NLL note: `ctx` is scoped to the `match` block below so its borrow on
-      // `self.services` ends before the post-match `unregister_service` call.
+      // `self.services` ends before the post-match `begin_service_withdrawal` call.
       let escalated = {
         let ctx = self
           .services
@@ -764,26 +705,25 @@ impl State {
             if ctx.encode_failures >= MAX_CONSECUTIVE_ENCODE_ERRORS {
               // Persistent encode failure: the records can't fit `max_payload`.
               // Push `Conflict` into the in-ctx update deque (the handle drains
-              // it directly via `Service::next`), flag the service `errored` so
-              // every proto-polling pump skips it from here on, and arm the
-              // one-shot `conflict_wake_pending` so the next
-              // `push_service_updates` fires a single wake for the queued
-              // `Conflict`. Do NOT remove the ctx — that would destroy the
-              // `Conflict` before the handle reads it. The slot is freed
-              // normally when the `Service` handle drops.
+              // it directly via `Service::next`) and arm the one-shot
+              // `conflict_wake_pending` so the next `push_service_updates` fires a
+              // single wake for the queued `Conflict`. Do NOT remove the ctx — that
+              // would destroy the `Conflict` before the handle reads it; the ctx is
+              // GC'd by `drain_completed_withdrawals` once the withdrawal completes.
+              // The post-match `begin_service_withdrawal` marks it `errored` so
+              // every proto-polling pump skips it from here on.
               hick_trace::warn!(
                 handle = ?h,
                 error = ?_e,
                 scratch_size = scratch.len(),
                 consecutive_failures = ctx.encode_failures,
-                "Service::poll_transmit failed; escalating to Conflict and marking the service errored"
+                "Service::poll_transmit failed; escalating to Conflict and beginning withdrawal"
               );
               push_service_update_coalesced(&mut ctx.updates, ServiceUpdate::Conflict);
-              ctx.errored = true;
               ctx.conflict_wake_pending = true;
               // `ctx` (and its borrow of `self.services`) ends here at the
               // closing brace of this block, before the post-match
-              // `unregister_service` call below.
+              // `begin_service_withdrawal` call below.
               true
             } else {
               false
@@ -794,13 +734,18 @@ impl State {
         }
       };
       if escalated {
-        // Free the proto route immediately — in-iteration and non-bypassable —
-        // so an `Ok(Some)` early-return for a LATER service in this same loop
-        // cannot skip the unregister. `unregister_service` touches only
-        // `self.endpoint`, not `self.services`, so there is no iterator
-        // invalidation. It is idempotent (returns false for an unknown handle),
-        // so a double call is safe.
-        let _ = self.endpoint.unregister_service(h);
+        // Begin the endpoint-owned withdrawal immediately — in-iteration and
+        // non-bypassable — so an `Ok(Some)` early-return for a LATER service in
+        // this same loop cannot skip it. A service that persistently fails to
+        // ENCODE never reached Established, so its snapshot is empty and the
+        // withdrawal completes on the next iteration with no datagram on the wire
+        // (the records + scratch are fixed, so the failure is permanent). The
+        // endpoint KEEPS the route (holding the name) and frees it on completion;
+        // the ctx is kept (marked `errored` by `begin_service_withdrawal`) so the
+        // queued `Conflict` still reaches the host. Touches only
+        // `self.endpoint`/`self.services` (no iterator invalidation), and
+        // `begin_withdrawal` is idempotent.
+        self.begin_service_withdrawal(h, now);
       }
     }
 
@@ -888,14 +833,20 @@ impl State {
   }
 
   /// Whether any service is flagged cancelled but not yet swept by
-  /// [`Self::sweep_cancelled_services`]. The driver uses this to force an
-  /// immediate (zero-duration) timer instead of parking. `Service::drop` flags
-  /// the service and calls `notify()`, but the shared `LocalNotify` wake is lost
-  /// when it lands while the driver is mid-`send_to` await with no listener
-  /// armed, so the wake alone cannot be relied on to run the withdrawal sweep
-  /// and its §10.1 goodbye — the forced timer is what guarantees it.
+  /// [`Self::sweep_cancelled_services`] (i.e. `cancelled` but the withdrawal has
+  /// not yet been begun — `!errored`). The driver uses this to force an immediate
+  /// (zero-duration) timer instead of parking. `Service::drop` flags the service
+  /// and calls `notify()`, but the shared `LocalNotify` wake is lost when it lands
+  /// while the driver is mid-`send_to` await with no listener armed, so the wake
+  /// alone cannot be relied on to run the withdrawal sweep — the forced timer is
+  /// what guarantees it. Once the sweep has begun the withdrawal, its resend
+  /// schedule lives in the endpoint and is folded into [`Self::poll_deadline`], so
+  /// this no longer needs to report it.
   pub(crate) fn has_pending_withdrawal(&self) -> bool {
-    self.services.values().any(|ctx| ctx.cancelled)
+    self
+      .services
+      .values()
+      .any(|ctx| ctx.cancelled && !ctx.errored)
   }
 
   /// Consume every armed [`QueryCtx::terminal_wake_pending`], returning `true`
@@ -916,14 +867,18 @@ impl State {
     woke
   }
 
-  /// Earliest deadline across the endpoint, services, queries, and the
-  /// pending-goodbye resend queue.
+  /// Earliest deadline across the endpoint (which already folds in the
+  /// endpoint-owned withdrawal deadlines — the next due goodbye round and the 2 s
+  /// anti-pin ceiling — via [`ProtoEndpoint::poll_timeout`]), services, and
+  /// queries.
   pub(crate) fn poll_deadline(&self) -> Option<StdInstant> {
     let mut best = self.endpoint.poll_timeout();
     for ctx in self.services.values() {
-      // A structurally-dead service (see `ServiceCtx::errored`) must not
-      // contribute a deadline — otherwise its proto could report an immediate
-      // (or no) timeout that pins the driver awake despite never being polled.
+      // A structurally-dead / withdrawing service (see `ServiceCtx::errored`)
+      // must not contribute a deadline — its proto state machine is finished and
+      // its withdrawal schedule lives in the endpoint (folded into
+      // `poll_timeout` above); contributing its proto's stale timeout would pin
+      // the driver awake despite it never being polled.
       if ctx.errored {
         continue;
       }
@@ -945,80 +900,7 @@ impl State {
         best = Some(best.map_or(t, |b| b.min(t)));
       }
     }
-    // Wake to resend any pending TTL=0 goodbye when it comes due so the
-    // §10.1 burst completes even between recv / timer events. `next_at` is short
-    // (GOODBYE_RETRY_BACKOFF) after a failed round, so a deferred barrier wakes
-    // promptly. While the entry is still an un-sent barrier, also wake at its
-    // `expires_at` ceiling so a never-sendable barrier releases the deferred
-    // positive transmits no later than that bound.
-    for g in &self.goodbyes {
-      let mut wake = g.next_at;
-      if !g.sent_once {
-        wake = wake.min(g.expires_at);
-      }
-      best = Some(best.map_or(wake, |b| b.min(wake)));
-    }
     best
-  }
-
-  /// Part A — apply the post-send advancement for the goodbye at `idx`.
-  ///
-  /// `any_sent` is `true` iff at least one family's `send_to` succeeded this
-  /// round. ONLY then is the round counted: latch [`PendingGoodbye::sent_once`]
-  /// (clearing the barrier), spend one resend (`remaining -= 1`), and re-arm at
-  /// the full [`GOODBYE_INTERVAL`]. A round that reached NO family must NOT spend
-  /// the budget or push `next_at` out a full interval — re-arm at the short
-  /// [`GOODBYE_RETRY_BACKOFF`] so the §10.1 withdrawal (and any positive transmit
-  /// its barrier blocks) retries soon. Extracted so the rule is unit-testable
-  /// without sockets.
-  pub(crate) fn advance_goodbye_after_send(&mut self, idx: usize, any_sent: bool, now: StdInstant) {
-    if let Some(g) = self.goodbyes.get_mut(idx) {
-      if any_sent {
-        g.sent_once = true;
-        g.remaining = g.remaining.saturating_sub(1);
-        g.next_at = now + GOODBYE_INTERVAL;
-      } else {
-        g.next_at = now + GOODBYE_RETRY_BACKOFF;
-      }
-    }
-  }
-
-  /// GC the goodbye queue: drop fully-sent entries (`remaining == 0`) and
-  /// force-clear any entry past its `expires_at` anti-pin bound REGARDLESS of
-  /// `remaining` (a never-delivered barrier must not pin the queue / block
-  /// transmits forever now that Part A no longer spends its budget on failed
-  /// rounds). Returns the count force-cleared while still owing sends, for a
-  /// debug log at the call site.
-  pub(crate) fn gc_goodbyes(&mut self, now: StdInstant) -> usize {
-    let mut force_cleared = 0usize;
-    self.goodbyes.retain(|g| {
-      if g.expires_at <= now {
-        if g.remaining > 0 {
-          force_cleared += 1;
-        }
-        return false;
-      }
-      g.remaining > 0
-    });
-    force_cleared
-  }
-
-  /// Part B — `true` if any pending goodbye is still a barrier: it has not yet
-  /// reached the wire (`!sent_once`) AND has not passed its `expires_at` ceiling.
-  /// The run loop defers the positive-TTL transmit pump while this holds.
-  ///
-  /// The barrier is intentionally GLOBAL — ANY pending un-sent free-name goodbye
-  /// defers ALL positive transmits, not just same-name ones. This is acceptable
-  /// (and far simpler than name-scoping the proto transmit queue) because a
-  /// SENDABLE barrier clears in the same loop iteration's pre-transmit goodbye
-  /// drain, so normal operation only gains a goodbye-before-transmit ordering;
-  /// only an UN-sendable (all-failing) barrier actually defers transmits, bounded
-  /// by `expires_at`.
-  pub(crate) fn has_pending_barrier(&self, now: StdInstant) -> bool {
-    self
-      .goodbyes
-      .iter()
-      .any(|g| !g.sent_once && g.expires_at > now)
   }
 
   /// Apply §11 + self-send + `proto.handle` for one received datagram.
@@ -1238,32 +1120,19 @@ pub(crate) async fn run(
   };
 
   loop {
-    // 0. FREE-NAME GOODBYE BARRIER (pre-transmit). Before placing ANY positive-TTL
-    //    transmit this iteration, (1) attempt the due goodbyes so a SENDABLE
-    //    free-name (retirement/rename) TTL=0 withdrawal reaches the wire FIRST —
-    //    this clears such a barrier in THIS iteration — then (2) if a goodbye is
-    //    still an un-sent, unexpired barrier (`has_pending_barrier`), SKIP the
-    //    Phase-1 transmit pump so a same-name replacement registered under
-    //    `with_probe_unique_names(false)` cannot announce a fresh positive TTL
-    //    ahead of the stale TTL=0 (which would evict it from peer caches). Only an
-    //    UN-sendable (all-failing) barrier actually defers transmits, bounded by
-    //    each entry's `expires_at`; the deadline below wakes on
-    //    GOODBYE_RETRY_BACKOFF / `expires_at` so a deferred barrier retries
-    //    promptly. The post-`push_service_updates` drain (1a, below) is KEPT so a
-    //    newly-queued rename goodbye still flushes the same iteration.
-    drain_goodbye_bursts(&inner, &sock_v4, &sock_v6).await;
-    let transmit_barred = {
-      let now = StdInstant::now();
-      inner.state.borrow().has_pending_barrier(now)
-    };
-
     // 1. extract-then-await transmit pump.  Borrow only long enough to pull
     //    one datagram into `scratch`; drop the borrow before awaiting the
     //    socket send.  The self-send record runs inside a second short
     //    borrow after the send completes.
     //
-    //    SKIPPED entirely while `transmit_barred` (a pending free-name goodbye has
-    //    not reached the wire) — see step 0.
+    //    The old free-name goodbye BARRIER (a pre-transmit gate that skipped this
+    //    pump while an un-sent TTL=0 withdrawal was pending) is GONE: the §10.1
+    //    ordering (a stale TTL=0 must precede a same-name replacement's fresh
+    //    positive TTL) is now enforced by the ENDPOINT, which KEEPS the route
+    //    while a withdrawal is in flight, so a same-name `register_service` is
+    //    rejected (`NameAlreadyRegistered`) until the withdrawal frees the name.
+    //    No replacement can announce ahead of the withdrawal, so this pump runs
+    //    unconditionally.
     //
     //    Bounded by [`MAX_TRANSMIT_CREDITS_PER_PASS`] (mirrors the reactor's
     //    `MAX_SEND_CREDITS_PER_DRAIN`): when `poll_one_transmit` yields a
@@ -1275,136 +1144,130 @@ pub(crate) async fn run(
     //    select! so timers / recv can make progress, and the deadline-driven
     //    re-entry will retry.
     let mut credits = MAX_TRANSMIT_CREDITS_PER_PASS;
-    // Skip the whole positive-TTL pump while a free-name goodbye barrier holds
-    // (step 0). `credits` then stays at its cap, so `pump_budget_exhausted` below
-    // is `false` and the deferred barrier is rewoken by the deadline, not by a
-    // forced same-iteration re-spin.
-    if !transmit_barred {
-      loop {
-        if credits == 0 {
-          break;
-        }
-        credits -= 1;
-        let pumped = {
-          let mut s = inner.state.borrow_mut();
-          let now = StdInstant::now();
-          s.poll_one_transmit(now, &mut scratch)
-        };
-        let Some((dst, n, origin)) = pumped else {
-          break;
-        };
-        // `mdns-proto` always hands back the IPv4 multicast group for BOTH the
-        // v4 and v6 service groups (multicast_dst()), so we cannot route
-        // multicast by the destination's address family. Detect an mDNS
-        // multicast destination and fan the SAME body out to every bound
-        // family's multicast group (RFC 6762 §6); a dual-stack endpoint then
-        // reaches both `224.0.0.251` and `ff02::fb`, and a v6-only endpoint
-        // actually transmits (instead of routing to an absent v4 socket and
-        // marking the send undelivered).
-        //
-        // Self-send credit: record ONE tracker entry per ACTUAL successful
-        // send. Take-once self-suppression consumes a single entry per matching
-        // loopback, and dual-stack fan-out yields TWO loopback copies (one per
-        // joined socket), so a successful v4+v6 send records two entries.
-        //
-        // Timestamp: capture `when` IMMEDIATELY BEFORE each `.await`. compio is
-        // completion-based — the buffer moves into the op on `.await`, so we
-        // can't stamp "at the syscall" the way the readiness-I/O reactor does
-        // inside `poll_send_to`. Stamping before the await guarantees
-        // `when <= kernel_send_time <= echo_rx_time`, keeping our own loopback
-        // inside the 1 ms Ordered match window even when task-resume latency is
-        // high. (Stamping AFTER the await — the previous bug — could push the
-        // recorded time past the kernel's rx stamp and misclassify our own
-        // announce/probe as a peer packet.)
-        let delivered = if is_mdns_multicast_dst(dst) {
-          let mut sent_any = false;
-          if let Some(s4) = sock_v4.as_ref() {
-            let when = SystemTime::now();
-            let res = s4.send_to(&scratch[..n], MDNS_V4_DST, None).await;
-            if res.is_ok() {
-              hick_trace::trace!(dst = %MDNS_V4_DST, len = n, "send_to v4");
-              let mut state = inner.state.borrow_mut();
-              crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
-              #[cfg(feature = "stats")]
-              {
-                state.stats.packets_tx(1);
-                state.stats.bytes_tx(n as u64);
-              }
-              sent_any = true;
-            } else {
-              hick_trace::debug!(dst = %MDNS_V4_DST, "send_to v4 failed");
-              #[cfg(feature = "stats")]
-              inner.state.borrow().stats.send_errors(1);
+    loop {
+      if credits == 0 {
+        break;
+      }
+      credits -= 1;
+      let pumped = {
+        let mut s = inner.state.borrow_mut();
+        let now = StdInstant::now();
+        s.poll_one_transmit(now, &mut scratch)
+      };
+      let Some((dst, n, origin)) = pumped else {
+        break;
+      };
+      // `mdns-proto` always hands back the IPv4 multicast group for BOTH the
+      // v4 and v6 service groups (multicast_dst()), so we cannot route
+      // multicast by the destination's address family. Detect an mDNS
+      // multicast destination and fan the SAME body out to every bound
+      // family's multicast group (RFC 6762 §6); a dual-stack endpoint then
+      // reaches both `224.0.0.251` and `ff02::fb`, and a v6-only endpoint
+      // actually transmits (instead of routing to an absent v4 socket and
+      // marking the send undelivered).
+      //
+      // Self-send credit: record ONE tracker entry per ACTUAL successful
+      // send. Take-once self-suppression consumes a single entry per matching
+      // loopback, and dual-stack fan-out yields TWO loopback copies (one per
+      // joined socket), so a successful v4+v6 send records two entries.
+      //
+      // Timestamp: capture `when` IMMEDIATELY BEFORE each `.await`. compio is
+      // completion-based — the buffer moves into the op on `.await`, so we
+      // can't stamp "at the syscall" the way the readiness-I/O reactor does
+      // inside `poll_send_to`. Stamping before the await guarantees
+      // `when <= kernel_send_time <= echo_rx_time`, keeping our own loopback
+      // inside the 1 ms Ordered match window even when task-resume latency is
+      // high. (Stamping AFTER the await — the previous bug — could push the
+      // recorded time past the kernel's rx stamp and misclassify our own
+      // announce/probe as a peer packet.)
+      let delivered = if is_mdns_multicast_dst(dst) {
+        let mut sent_any = false;
+        if let Some(s4) = sock_v4.as_ref() {
+          let when = SystemTime::now();
+          let res = s4.send_to(&scratch[..n], MDNS_V4_DST, None).await;
+          if res.is_ok() {
+            hick_trace::trace!(dst = %MDNS_V4_DST, len = n, "send_to v4");
+            let mut state = inner.state.borrow_mut();
+            crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
+            #[cfg(feature = "stats")]
+            {
+              state.stats.packets_tx(1);
+              state.stats.bytes_tx(n as u64);
             }
-          }
-          if let Some(s6) = sock_v6.as_ref() {
-            let when = SystemTime::now();
-            let res = s6.send_to(&scratch[..n], MDNS_V6_DST, None).await;
-            if res.is_ok() {
-              hick_trace::trace!(dst = %MDNS_V6_DST, len = n, "send_to v6");
-              let mut state = inner.state.borrow_mut();
-              crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
-              #[cfg(feature = "stats")]
-              {
-                state.stats.packets_tx(1);
-                state.stats.bytes_tx(n as u64);
-              }
-              sent_any = true;
-            } else {
-              hick_trace::debug!(dst = %MDNS_V6_DST, "send_to v6 failed");
-              #[cfg(feature = "stats")]
-              inner.state.borrow().stats.send_errors(1);
-            }
-          }
-          // `delivered` ⇔ at least one family reached the wire.
-          sent_any
-        } else {
-          // Unicast: pick the socket matching the destination family, single
-          // send. No socket for this family → count as failed delivery so the
-          // proto re-arms the probe / announce without advancing lifecycle
-          // state (unchanged semantics).
-          let sock = match dst {
-            core::net::SocketAddr::V4(_) => sock_v4.as_ref(),
-            core::net::SocketAddr::V6(_) => sock_v6.as_ref(),
-          };
-          if let Some(s) = sock {
-            let when = SystemTime::now();
-            let res = s.send_to(&scratch[..n], dst, None).await;
-            // Record the self-send credit under a fresh short borrow so the next
-            // inbound copy of this datagram (from the loopback / multicast echo)
-            // is classified as our own.  Only record on a successful send.
-            if res.is_ok() {
-              hick_trace::trace!(dst = %dst, len = n, "send_to");
-              let mut state = inner.state.borrow_mut();
-              crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
-              #[cfg(feature = "stats")]
-              {
-                state.stats.packets_tx(1);
-                state.stats.bytes_tx(n as u64);
-              }
-            } else {
-              hick_trace::debug!(dst = %dst, "send_to failed");
-              #[cfg(feature = "stats")]
-              inner.state.borrow().stats.send_errors(1);
-            }
-            res.is_ok()
+            sent_any = true;
           } else {
-            false
+            hick_trace::debug!(dst = %MDNS_V4_DST, "send_to v4 failed");
+            #[cfg(feature = "stats")]
+            inner.state.borrow().stats.send_errors(1);
           }
+        }
+        if let Some(s6) = sock_v6.as_ref() {
+          let when = SystemTime::now();
+          let res = s6.send_to(&scratch[..n], MDNS_V6_DST, None).await;
+          if res.is_ok() {
+            hick_trace::trace!(dst = %MDNS_V6_DST, len = n, "send_to v6");
+            let mut state = inner.state.borrow_mut();
+            crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
+            #[cfg(feature = "stats")]
+            {
+              state.stats.packets_tx(1);
+              state.stats.bytes_tx(n as u64);
+            }
+            sent_any = true;
+          } else {
+            hick_trace::debug!(dst = %MDNS_V6_DST, "send_to v6 failed");
+            #[cfg(feature = "stats")]
+            inner.state.borrow().stats.send_errors(1);
+          }
+        }
+        // `delivered` ⇔ at least one family reached the wire.
+        sent_any
+      } else {
+        // Unicast: pick the socket matching the destination family, single
+        // send. No socket for this family → count as failed delivery so the
+        // proto re-arms the probe / announce without advancing lifecycle
+        // state (unchanged semantics).
+        let sock = match dst {
+          core::net::SocketAddr::V4(_) => sock_v4.as_ref(),
+          core::net::SocketAddr::V6(_) => sock_v6.as_ref(),
         };
-        // Confirm the pending transmit so the §8.1 probe sequence / §8.3 announce
-        // phase advance (services), or so the §5.2 backoff + retry budget
-        // advance only on a confirmed-delivered send (queries).  Anchored to
-        // post-send time so the next deadline is relative to actual on-wire send.
-        match origin {
-          TransmitOrigin::Service(h) => {
+        if let Some(s) = sock {
+          let when = SystemTime::now();
+          let res = s.send_to(&scratch[..n], dst, None).await;
+          // Record the self-send credit under a fresh short borrow so the next
+          // inbound copy of this datagram (from the loopback / multicast echo)
+          // is classified as our own.  Only record on a successful send.
+          if res.is_ok() {
+            hick_trace::trace!(dst = %dst, len = n, "send_to");
             let mut state = inner.state.borrow_mut();
-            state.note_service_transmit_result(h, StdInstant::now(), delivered);
+            crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
+            #[cfg(feature = "stats")]
+            {
+              state.stats.packets_tx(1);
+              state.stats.bytes_tx(n as u64);
+            }
+          } else {
+            hick_trace::debug!(dst = %dst, "send_to failed");
+            #[cfg(feature = "stats")]
+            inner.state.borrow().stats.send_errors(1);
           }
-          TransmitOrigin::Query(h) => {
-            let mut state = inner.state.borrow_mut();
-            state.note_query_transmit_result(h, StdInstant::now(), delivered);
-          }
+          res.is_ok()
+        } else {
+          false
+        }
+      };
+      // Confirm the pending transmit so the §8.1 probe sequence / §8.3 announce
+      // phase advance (services), or so the §5.2 backoff + retry budget
+      // advance only on a confirmed-delivered send (queries).  Anchored to
+      // post-send time so the next deadline is relative to actual on-wire send.
+      match origin {
+        TransmitOrigin::Service(h) => {
+          let mut state = inner.state.borrow_mut();
+          state.note_service_transmit_result(h, StdInstant::now(), delivered);
+        }
+        TransmitOrigin::Query(h) => {
+          let mut state = inner.state.borrow_mut();
+          state.note_query_transmit_result(h, StdInstant::now(), delivered);
         }
       }
     }
@@ -1425,13 +1288,14 @@ pub(crate) async fn run(
     let pump_budget_exhausted = credits == 0;
 
     // 1a-pre. Sweep services whose handle was dropped. `Service::drop` only
-    //     flags `cancelled`; the proto-state removal + §10.1 goodbye encoding
-    //     happens HERE, after the transmit pump, so a send that was in flight
-    //     when the handle dropped has already latched its records via
+    //     flags `cancelled`; beginning the endpoint-owned §10.1 withdrawal happens
+    //     HERE, after the transmit pump, so a send that was in flight when the
+    //     handle dropped has already latched its records via
     //     `note_service_transmit_result` and is therefore captured in the
-    //     goodbye. The freshly-queued goodbyes are sent by the 1a pump later in
-    //     this same iteration (their `next_at` is `now`), after 1b has also had
-    //     a chance to queue any rename-collision goodbye.
+    //     withdrawal snapshot. The endpoint holds the route + drives the goodbye
+    //     schedule; the first round is due immediately and is pumped by
+    //     `drain_withdrawals` (1a) later in this same iteration, after 1b has also
+    //     had a chance to begin any rename-collision withdrawal.
     {
       let now = StdInstant::now();
       inner.state.borrow_mut().sweep_cancelled_services(now);
@@ -1442,17 +1306,14 @@ pub(crate) async fn run(
     //     parked on `Service::next` can pop them.  The borrow is brief and is
     //     dropped before any `.await`.
     //
-    //     ORDERING NOTE: this MUST run before the goodbye-burst pump (1a) below.
-    //     When a rename collision is detected here, `push_service_updates` steals
-    //     `pending_rename_goodbye` into `state.goodbyes` and calls
-    //     `unregister_service` to free the old name.  The goodbye pump (1a) then
-    //     drains it on-wire in this SAME iteration — BEFORE the loop parks and a
-    //     same-name replacement can register + announce under
-    //     `probe_unique_names(false)`.  If 1a ran first (old order), the stolen
-    //     goodbye would sit unsent until the NEXT iteration's 1a, which runs after
-    //     that iteration's Phase-1 transmit pump — so a replacement's positive-TTL
-    //     announcement could reach the wire BEFORE the stale TTL=0 goodbye,
-    //     evicting the replacement from peer caches.
+    //     ORDERING NOTE: this runs before the withdrawal pump (1a) below so a
+    //     rename-collision withdrawal begun HERE (`push_service_updates` calls
+    //     `begin_service_withdrawal`, whose first goodbye round is due immediately)
+    //     is pumped on-wire in this SAME iteration. The endpoint holds the OLD name
+    //     for the whole withdrawal, so a same-name replacement cannot register (and
+    //     evict the old name from peer caches) until the goodbye completes —
+    //     structurally enforcing the stale-TTL0-before-replacement ordering the old
+    //     pre-transmit barrier used to.
     {
       let now = StdInstant::now();
       let pushed = inner.state.borrow_mut().push_service_updates(now);
@@ -1461,16 +1322,14 @@ pub(crate) async fn run(
       }
     }
 
-    // 1a. RFC 6762 §10.1 goodbye-burst pump. `sweep_cancelled_services` (1a-pre)
-    //     and a conflict-rename withdrawal (1b above) both encode TTL=0 records
-    //     and push them onto `state.goodbyes`; this drains each due entry, fanning
-    //     it out to BOTH multicast families' sockets [`GOODBYE_SENDS`] times,
-    //     spaced by [`GOODBYE_INTERVAL`]. Running AFTER `push_service_updates`
-    //     (1b) ensures a goodbye stolen from `pending_rename_goodbye` during a
-    //     rename collision is flushed on-wire in the same iteration it was queued.
-    //     The SAME drain runs at the TOP of the loop (the barrier retry, below) so
-    //     a pre-existing un-sent free-name goodbye sends before the positive pump.
-    drain_goodbye_bursts(&inner, &sock_v4, &sock_v6).await;
+    // 1a. RFC 6762 §10.1 endpoint-owned withdrawal pump. `sweep_cancelled_services`
+    //     (1a-pre), a conflict-rename teardown (1b above), and the transmit-pump /
+    //     encode-failure escalations all begin endpoint-owned withdrawals; this
+    //     pumps each due TTL=0 goodbye datagram (fanned to BOTH families) and, after
+    //     draining, frees each completed route + GCs its driver ctx. Running AFTER
+    //     `push_service_updates` (1b) ensures a rename-collision withdrawal begun
+    //     this iteration flushes its first goodbye on-wire the same iteration.
+    drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch).await;
 
     // 1b'. fire one-shot wakes for queries that just transitioned to `errored`
     //      (un-encodable question, see `QueryCtx::errored`). Such a query has no
@@ -1484,9 +1343,9 @@ pub(crate) async fn run(
     }
 
     // 1c. SHUTDOWN SETTLE (pre-park). All pending work for this iteration is now
-    //     drained (transmits, goodbye burst, cancellation sweep, updates). If no
-    //     external handle remains, exit — but FIRST flush every queued §10.1
-    //     goodbye so a withdrawal is never lost at teardown.
+    //     drained (transmits, withdrawal pump, cancellation sweep, updates). If no
+    //     external handle remains, exit — but FIRST drive every in-flight §10.1
+    //     withdrawal to completion so a withdrawal is never lost at teardown.
     //
     //     This check lives HERE, before arming `select!`, not after the park.
     //     `Service::drop` / `Query::drop` only flag + `notify()`, and the shared
@@ -1496,49 +1355,32 @@ pub(crate) async fn run(
     //     (task + sockets leaked) or defer the goodbye to some unrelated later
     //     wake. Settling pre-park makes the last-handle exit deterministic and
     //     independent of whether that notify was delivered.
+    //
+    //     The sweep (1a-pre) already began a withdrawal for every cancelled
+    //     service; drive `drain_withdrawals` and sleep on the next withdrawal
+    //     deadline (`poll_deadline`, which folds in the endpoint's withdrawal
+    //     `next_at`/`ceiling_at` via `poll_timeout`) until none remains. Each
+    //     withdrawal finishes when its resend budget is spent OR at its 2 s
+    //     anti-pin ceiling, so this terminates; a wall-clock backstop guards
+    //     against a clock anomaly so the task can never hang.
     if Rc::strong_count(&inner) == 1 {
-      let datagrams = {
+      let shutdown_deadline = StdInstant::now() + Duration::from_secs(10);
+      loop {
+        drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch).await;
         let now = StdInstant::now();
-        inner.state.borrow_mut().take_shutdown_goodbyes(now)
-      };
-      for data in datagrams {
-        #[cfg(feature = "stats")]
-        let mut goodbye_sent_any = false;
-        if let Some(s4) = sock_v4.as_ref() {
-          if s4.send_to(&data, MDNS_V4_DST, None).await.is_ok() {
-            hick_trace::trace!(dst = %MDNS_V4_DST, len = data.len(), "shutdown goodbye send_to v4");
-            #[cfg(feature = "stats")]
-            {
-              inner.state.borrow().stats.packets_tx(1);
-              inner.state.borrow().stats.bytes_tx(data.len() as u64);
-              goodbye_sent_any = true;
-            }
-          } else {
-            hick_trace::debug!(dst = %MDNS_V4_DST, "shutdown goodbye send_to v4 failed");
-            #[cfg(feature = "stats")]
-            inner.state.borrow().stats.send_errors(1);
-          }
+        // No remaining withdrawal (or any other) deadline → every route is freed.
+        let Some(next) = ({ inner.state.borrow().poll_deadline() }) else {
+          break;
+        };
+        if now >= shutdown_deadline {
+          hick_trace::debug!("shutdown withdrawal flush hit its wall-clock backstop; exiting");
+          break;
         }
-        if let Some(s6) = sock_v6.as_ref() {
-          if s6.send_to(&data, MDNS_V6_DST, None).await.is_ok() {
-            hick_trace::trace!(dst = %MDNS_V6_DST, len = data.len(), "shutdown goodbye send_to v6");
-            #[cfg(feature = "stats")]
-            {
-              inner.state.borrow().stats.packets_tx(1);
-              inner.state.borrow().stats.bytes_tx(data.len() as u64);
-              goodbye_sent_any = true;
-            }
-          } else {
-            hick_trace::debug!(dst = %MDNS_V6_DST, "shutdown goodbye send_to v6 failed");
-            #[cfg(feature = "stats")]
-            inner.state.borrow().stats.send_errors(1);
-          }
-        }
-        // Count the logical goodbye once per datagrams entry (one entry = one
-        // RFC 6762 §10.1 retransmit attempt) when at least one family succeeded.
-        #[cfg(feature = "stats")]
-        if goodbye_sent_any {
-          inner.state.borrow().stats.goodbyes_tx(1);
+        let dur = next
+          .saturating_duration_since(now)
+          .min(shutdown_deadline.saturating_duration_since(now));
+        if dur > Duration::ZERO {
+          compio::time::sleep(dur).await;
         }
       }
       break;
@@ -1641,39 +1483,37 @@ pub(crate) async fn run(
   }
 }
 
-/// Drain every DUE RFC 6762 §10.1 goodbye once, fanning each out to both bound
-/// multicast families. Shared by the run loop's pre-transmit barrier retry (step
-/// 0) and its post-`push_service_updates` flush (1a) so both use identical
-/// send + accounting + Part A advancement.
+/// Pump every DUE endpoint-owned RFC 6762 §10.1 withdrawal goodbye once, fanning
+/// each out to both bound multicast families, then free + GC every completed
+/// withdrawal.
 ///
-/// ## Part A — round advancement is gated on a real send
+/// Borrow discipline (mirrors the run loop's transmit pump): pull ONE due
+/// `(dst, len, handle)` under a brief `borrow_mut` (`poll_one_withdrawal` encodes
+/// the goodbye into `scratch`), send `scratch[..len]` to BOTH families under NO
+/// borrow, then under another brief borrow report the result via
+/// `note_withdrawal_result` and bump per-round stats. `dst` is always the IPv4
+/// multicast marker; the driver fans to every bound family regardless. The
+/// endpoint owns the resend schedule — a delivered round spends one resend; a
+/// fully-failed round is re-armed (short backoff) WITHOUT spending — so this
+/// drains at most one round per withdrawal per call and cannot busy-spin.
 ///
-/// `goodbye_sent_any` (a plain correctness variable, not stats-only) is `true`
-/// iff at least one family's `send_to` succeeded. [`State::advance_goodbye_after_send`]
-/// then spends a resend + re-arms at [`GOODBYE_INTERVAL`] ONLY when something
-/// reached the wire; an all-failing round re-arms at the short
-/// [`GOODBYE_RETRY_BACKOFF`] without consuming the resend budget. The first
-/// successful round latches [`PendingGoodbye::sent_once`], clearing the barrier.
-///
-/// Each due entry is re-found by scanning for the earliest `next_at <= now`, and
-/// advancing it pushes `next_at` into the future (interval or backoff), so this
-/// drains at most one round per entry per call and cannot busy-spin.
-async fn drain_goodbye_bursts(
+/// After the pump, `drain_completed_withdrawals` frees each completed route
+/// (decrementing `services_active`) and GCs its driver ctx — deferring the GC of a
+/// ctx that still holds an undrained `Conflict` (`route_freed`), so that `Conflict`
+/// survives a withdrawal completing in the same iteration that began it.
+async fn drain_withdrawals(
   inner: &Rc<EndpointInner>,
   sock_v4: &Option<Rc<Socket>>,
   sock_v6: &Option<Rc<Socket>>,
+  scratch: &mut [u8],
 ) {
   loop {
-    let now = StdInstant::now();
-    let due_entry: Option<(usize, Vec<u8>)> = {
-      let s = inner.state.borrow();
-      s.goodbyes
-        .iter()
-        .enumerate()
-        .find(|(_, g)| g.remaining > 0 && g.next_at <= now)
-        .map(|(i, g)| (i, g.data.clone()))
+    let due = {
+      let mut s = inner.state.borrow_mut();
+      let now = StdInstant::now();
+      s.poll_one_withdrawal(now, scratch)
     };
-    let Some((idx, data)) = due_entry else {
+    let Some((_dst, len, handle)) = due else {
       break;
     };
     // Fan out to every bound family on the mDNS multicast group.
@@ -1681,70 +1521,74 @@ async fn drain_goodbye_bursts(
     // stamping at the syscall) so `when <= kernel_send_time <= echo_rx_time`
     // and the kernel-looped goodbye stays inside the 1 ms Ordered self-send
     // match window.
-    // `goodbye_sent_any` is load-bearing for Part A (not stats-only): it decides
-    // whether this round counts.
+    // `goodbye_sent_any` is load-bearing (not stats-only): `delivered` decides
+    // whether the endpoint spends this round.
     let mut goodbye_sent_any = false;
     if let Some(s4) = sock_v4.as_ref() {
       let when = SystemTime::now();
-      let res = s4.send_to(&data, MDNS_V4_DST, None).await;
+      let res = s4.send_to(&scratch[..len], MDNS_V4_DST, None).await;
       if res.is_ok() {
-        hick_trace::trace!(dst = %MDNS_V4_DST, len = data.len(), "goodbye send_to v4");
+        hick_trace::trace!(dst = %MDNS_V4_DST, len, "withdrawal send_to v4");
         let mut state = inner.state.borrow_mut();
-        crate::selfsend::record_self_send(&mut state.recent_sends, &data, when);
+        crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
         #[cfg(feature = "stats")]
         {
           state.stats.packets_tx(1);
-          state.stats.bytes_tx(data.len() as u64);
+          state.stats.bytes_tx(len as u64);
         }
         goodbye_sent_any = true;
       } else {
-        hick_trace::debug!(dst = %MDNS_V4_DST, "goodbye send_to v4 failed");
+        hick_trace::debug!(dst = %MDNS_V4_DST, "withdrawal send_to v4 failed");
         #[cfg(feature = "stats")]
         inner.state.borrow().stats.send_errors(1);
       }
     }
     if let Some(s6) = sock_v6.as_ref() {
       let when = SystemTime::now();
-      let res = s6.send_to(&data, MDNS_V6_DST, None).await;
+      let res = s6.send_to(&scratch[..len], MDNS_V6_DST, None).await;
       if res.is_ok() {
-        hick_trace::trace!(dst = %MDNS_V6_DST, len = data.len(), "goodbye send_to v6");
+        hick_trace::trace!(dst = %MDNS_V6_DST, len, "withdrawal send_to v6");
         let mut state = inner.state.borrow_mut();
-        crate::selfsend::record_self_send(&mut state.recent_sends, &data, when);
+        crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
         #[cfg(feature = "stats")]
         {
           state.stats.packets_tx(1);
-          state.stats.bytes_tx(data.len() as u64);
+          state.stats.bytes_tx(len as u64);
         }
         goodbye_sent_any = true;
       } else {
-        hick_trace::debug!(dst = %MDNS_V6_DST, "goodbye send_to v6 failed");
+        hick_trace::debug!(dst = %MDNS_V6_DST, "withdrawal send_to v6 failed");
         #[cfg(feature = "stats")]
         inner.state.borrow().stats.send_errors(1);
       }
     }
-    // Count the goodbye as a delivered round when at least one family succeeded.
+    // Count the goodbye as a delivered round when at least one family succeeded;
+    // `send_to` already bumped packets_tx/bytes_tx/send_errors per family above.
     #[cfg(feature = "stats")]
     if goodbye_sent_any {
       inner.state.borrow().stats.goodbyes_tx(1);
     }
-    // Part A: spend a resend + re-arm at GOODBYE_INTERVAL only on a real send;
-    // otherwise re-arm at the short GOODBYE_RETRY_BACKOFF with the budget intact.
-    inner
-      .state
-      .borrow_mut()
-      .advance_goodbye_after_send(idx, goodbye_sent_any, now);
+    // The endpoint spends a resend + re-arms at WITHDRAWAL_INTERVAL on a delivered
+    // round; an all-failing round re-arms at the short backoff with the budget
+    // intact.
+    {
+      let now = StdInstant::now();
+      inner
+        .state
+        .borrow_mut()
+        .note_withdrawal_result(handle, now, goodbye_sent_any);
+    }
   }
-  // GC fully-sent entries and force-clear any past its `expires_at` anti-pin
-  // bound (a never-delivered barrier, regardless of `remaining`).
-  let force_cleared = {
+  // Free + GC every completed withdrawal (budget spent or 2 s ceiling reached).
+  // GC'ing a ctx whose updates drained wakes any handle parked on an
+  // otherwise-idle endpoint to observe its end-of-stream (the cancelled/errored
+  // ctx is gone → `Service::next` returns `None`).
+  let gcd_any = {
     let now = StdInstant::now();
-    inner.state.borrow_mut().gc_goodbyes(now)
+    inner.state.borrow_mut().drain_completed_withdrawals(now)
   };
-  if force_cleared > 0 {
-    hick_trace::debug!(
-      count = force_cleared,
-      "force-cleared undeliverable goodbye(s) past the barrier/retention bound"
-    );
+  if gcd_any {
+    inner.notify.notify();
   }
 }
 
@@ -1855,7 +1699,7 @@ mod tests {
     let s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
     assert_eq!(s.services.len(), 0);
     assert_eq!(s.queries.len(), 0);
-    assert!(s.goodbyes.is_empty());
+    assert!(s.completed_withdrawals.is_empty());
   }
 
   #[test]
@@ -2073,33 +1917,16 @@ mod tests {
     s.handle_datagram(&meta, &data);
   }
 
-  /// `remove_service` MUST: (a) free the proto-layer route slot so re-
-  /// registering the same instance name doesn't surface
-  /// `NameAlreadyRegistered`, (b) evict the driver-side `ServiceCtx` from
-  /// `state.services`, and (c) queue a TTL=0 goodbye burst for any
-  /// confirmed-emitted records — the RFC 6762 §10.1 graceful-withdrawal
-  /// contract.  Without (a) + (b) every dropped service permanently leaks a
-  /// slot until endpoint shutdown.
-  #[test]
-  fn remove_service_queues_goodbye_and_frees_proto_slot() {
-    use std::time::Duration;
-
-    use mdns_proto::{Name, ServiceRecords, ServiceSpec};
-
-    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
-    let mut t = std::time::Instant::now();
-
-    let stype = Name::try_from_str("_gb._tcp.local.").unwrap();
-    let inst = Name::try_from_str("G._gb._tcp.local.").unwrap();
-    let host = Name::try_from_str("g.local.").unwrap();
-    let mut recs = ServiceRecords::new(stype, inst.clone(), host, 1234, 120);
-    recs.add_a([127, 0, 0, 1].into());
-    let handle = s.register_service(ServiceSpec::new(recs), t).unwrap();
-
-    // Drive the proto state machine through probe + announce so the goodbye
-    // ownership latches are set — otherwise `encode_goodbye` returns
-    // `Ok(None)` and nothing is queued.  Each `poll_transmit` stamps the
-    // commit token; `note_transmit_delivered` advances the lifecycle.
+  /// Drive a service through probe + announce until it advertises its host
+  /// record (goodbye ownership latched), so a withdrawal snapshot is non-empty.
+  /// Shared by the State-seam withdrawal tests below.
+  #[cfg(test)]
+  fn establish_service(
+    s: &mut State,
+    handle: ServiceHandle,
+    t0: std::time::Instant,
+  ) -> std::time::Instant {
+    let mut t = t0;
     let mut buf = vec![0u8; 4096];
     for _ in 0..40 {
       t += Duration::from_millis(300);
@@ -2109,92 +1936,119 @@ mod tests {
         ctx.proto.note_transmit_delivered(t);
       }
     }
-    // Sanity: the service did reach a state that advertises records.
     assert!(
       s.services
         .get(&handle)
         .map(|c| c.proto.advertises_host())
         .unwrap_or(false),
-      "service must have advertised at least one record before removal"
+      "service must advertise at least one record before withdrawal"
+    );
+    t
+  }
+
+  /// `begin_service_withdrawal` MUST: (a) KEEP the driver-side `ServiceCtx`
+  /// (marked `errored`) so a queued `Conflict` still reaches the host, (b) hold
+  /// the proto-layer route (so a same-name re-register is rejected) while the
+  /// withdrawal is in flight, and (c) on completion (`drain_completed_withdrawals`)
+  /// free the route + GC the ctx so the same instance name is re-registerable —
+  /// the RFC 6762 §10.1 graceful-withdrawal contract under the endpoint-owned
+  /// lifecycle. (The TTL=0 goodbye bytes + sibling retention + resend schedule are
+  /// covered by the proto-level withdrawal tests; this is the driver-State seam.)
+  #[test]
+  fn begin_service_withdrawal_holds_name_then_frees_on_completion() {
+    use mdns_proto::{Name, ServiceRecords, ServiceSpec, error::RegisterServiceError};
+
+    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+    let t0 = std::time::Instant::now();
+
+    let stype = Name::try_from_str("_gb._tcp.local.").unwrap();
+    let inst = Name::try_from_str("G._gb._tcp.local.").unwrap();
+    let host = Name::try_from_str("g.local.").unwrap();
+    let mut recs = ServiceRecords::new(stype.clone(), inst.clone(), host.clone(), 1234, 120);
+    recs.add_a([127, 0, 0, 1].into());
+    let handle = s.register_service(ServiceSpec::new(recs), t0).unwrap();
+    let mut t = establish_service(&mut s, handle, t0);
+
+    // Begin the withdrawal: the ctx is KEPT (errored) and the route is held.
+    s.begin_service_withdrawal(handle, t);
+    assert!(
+      s.services.get(&handle).map(|c| c.errored).unwrap_or(false),
+      "begin_service_withdrawal must keep the ctx and mark it errored"
     );
 
-    // Remove: the driver-side ctx must vanish AND a goodbye must be queued.
-    s.remove_service(handle, t);
+    // While the withdrawal holds the route, the same instance name is rejected.
+    let mut dup = ServiceRecords::new(stype.clone(), inst.clone(), host.clone(), 1234, 120);
+    dup.add_a([127, 0, 0, 1].into());
     assert!(
-      !s.services.contains_key(&handle),
-      "remove_service must evict the driver-side ServiceCtx"
+      matches!(
+        s.register_service(ServiceSpec::new(dup), t),
+        Err(RegisterServiceError::NameAlreadyRegistered(_))
+      ),
+      "a same-name registration must be rejected while the withdrawal holds the name"
     );
+
+    // Drive the withdrawal to completion. With no sockets every round fails to
+    // deliver (`poll_one_withdrawal` writes the goodbye; we report not-delivered),
+    // so the endpoint force-completes at its 2 s anti-pin ceiling; then
+    // `drain_completed_withdrawals` frees the route + GCs the ctx.
+    let mut scratch = vec![0u8; 4096];
+    let mut completed = false;
+    for _ in 0..64 {
+      t += Duration::from_millis(250);
+      while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
+        s.note_withdrawal_result(h, t, false);
+      }
+      s.drain_completed_withdrawals(t);
+      if !s.services.contains_key(&handle) {
+        completed = true;
+        break;
+      }
+    }
     assert!(
-      !s.goodbyes.is_empty(),
-      "remove_service must queue a TTL=0 goodbye for the confirmed-emitted records"
+      completed,
+      "the withdrawal must complete (route freed + driver ctx GC'd) by its 2 s \
+       anti-pin ceiling when no family can deliver"
     );
-    let g = &s.goodbyes[0];
-    assert_eq!(
-      g.remaining, GOODBYE_SENDS,
-      "burst budget must be initialised"
-    );
-    // The proto-layer route slot must be released too: re-registering the
-    // same instance name must succeed (otherwise we'd hit NameAlreadyRegistered).
-    let mut recs2 = ServiceRecords::new(
-      Name::try_from_str("_gb._tcp.local.").unwrap(),
-      inst,
-      Name::try_from_str("g.local.").unwrap(),
-      1234,
-      120,
-    );
+
+    // The proto-layer route slot must now be freed: re-registering the same
+    // instance name must succeed.
+    let mut recs2 = ServiceRecords::new(stype, inst, host, 1234, 120);
     recs2.add_a([127, 0, 0, 1].into());
     assert!(
       s.register_service(ServiceSpec::new(recs2), t).is_ok(),
-      "the proto-layer route slot must be freed by remove_service"
+      "the proto-layer route slot must be freed once the withdrawal completes"
     );
   }
 
-  /// `Service::drop` must NOT remove the proto state or encode the goodbye
-  /// synchronously — it only flags `cancelled` (via `flag_service_unregistered`).
-  /// The driver's post-pump `sweep_cancelled_services` is what evicts the entry
-  /// and queues the §10.1 goodbye. This split is load-bearing: it lets a send
-  /// that was in flight when the handle dropped latch its records (via
-  /// `note_service_transmit_result`) BEFORE the goodbye is encoded, so a service
-  /// dropped mid-send still withdraws every record it actually put on the wire.
+  /// `Service::drop` must NOT retire the service synchronously — it only flags
+  /// `cancelled` (via `flag_service_unregistered`). The driver's post-pump
+  /// `sweep_cancelled_services` is what begins the endpoint-owned §10.1
+  /// withdrawal. This split is load-bearing: it lets a send that was in flight
+  /// when the handle dropped latch its records (via `note_service_transmit_result`)
+  /// BEFORE the withdrawal snapshot is taken, so a service dropped mid-send still
+  /// withdraws every record it actually put on the wire.
   #[compio::test]
-  async fn drop_defers_goodbye_to_driver_sweep() {
+  async fn drop_defers_withdrawal_to_driver_sweep() {
     use mdns_proto::{Name, ServiceRecords, ServiceSpec};
     let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
-    let mut t = std::time::Instant::now();
+    let t0 = std::time::Instant::now();
     let stype = Name::try_from_str("_sw._tcp.local.").unwrap();
     let inst = Name::try_from_str("s._sw._tcp.local.").unwrap();
     let host = Name::try_from_str("s.local.").unwrap();
     let mut recs = ServiceRecords::new(stype, inst, host, 1234, 120);
     recs.add_a([127, 0, 0, 1].into());
-    let handle = s.register_service(ServiceSpec::new(recs), t).unwrap();
+    let handle = s.register_service(ServiceSpec::new(recs), t0).unwrap();
+    let t = establish_service(&mut s, handle, t0);
 
-    // Drive probe + announce so the service has confirmed-emitted records.
-    let mut buf = vec![0u8; 4096];
-    for _ in 0..40 {
-      t += Duration::from_millis(300);
-      let ctx = s.services.get_mut(&handle).unwrap();
-      let _ = ctx.proto.handle_timeout(t);
-      while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        ctx.proto.note_transmit_delivered(t);
-      }
-    }
-    assert!(
-      s.services
-        .get(&handle)
-        .map(|c| c.proto.advertises_host())
-        .unwrap_or(false),
-      "service must advertise before withdrawal"
-    );
-
-    // What `Service::drop` does — flag only, no removal, no goodbye encoding.
+    // What `Service::drop` does — flag only, no retirement.
     s.flag_service_unregistered(handle);
     assert!(
       s.services.contains_key(&handle),
       "drop must NOT remove the service synchronously"
     );
     assert!(
-      s.goodbyes.is_empty(),
-      "drop must NOT encode the goodbye synchronously — the driver sweep does"
+      !s.services.get(&handle).map(|c| c.errored).unwrap_or(true),
+      "drop must NOT begin the withdrawal synchronously — the driver sweep does"
     );
     assert!(
       s.services
@@ -2207,245 +2061,134 @@ mod tests {
     // `has_pending_withdrawal` must report the cancelled-but-unswept service so
     // the driver forces an immediate wake instead of parking (the lost-notify
     // guard): a drop's `notify` can be lost mid-`send_to`, so the forced timer
-    // is what guarantees the next iteration sweeps + sends the goodbye.
+    // is what guarantees the next iteration sweeps + begins the withdrawal.
     assert!(
       s.has_pending_withdrawal(),
       "a cancelled-but-unswept service must report a pending withdrawal"
     );
 
-    // What the driver's post-pump sweep does — evict + queue the §10.1 goodbye.
+    // What the driver's post-pump sweep does — begin the endpoint-owned
+    // withdrawal: the ctx is KEPT (errored) and the route is held by the endpoint.
     let swept = s.sweep_cancelled_services(t);
-    assert!(swept, "sweep must report it removed a cancelled service");
+    assert!(swept, "sweep must report it retired a cancelled service");
     assert!(
-      !s.services.contains_key(&handle),
-      "sweep must evict the cancelled service's ServiceCtx"
-    );
-    assert!(
-      !s.goodbyes.is_empty(),
-      "sweep must queue a TTL=0 goodbye for the confirmed-emitted records"
+      s.services.get(&handle).map(|c| c.errored).unwrap_or(false),
+      "sweep must begin the withdrawal (ctx kept, marked errored)"
     );
     assert!(
       !s.has_pending_withdrawal(),
-      "after the sweep there is no pending withdrawal left"
+      "after the sweep the cancelled service is already withdrawing (errored), so \
+       it is no longer reported as an unswept pending withdrawal"
     );
   }
 
-  /// On the last-handle-drop shutdown path the driver can't stay alive for the
-  /// timer-spaced goodbye bursts, so it calls `take_shutdown_goodbyes`: this
-  /// must (a) sweep a service that was flagged cancelled but never swept (the
-  /// race where the shutdown check would otherwise exit before the
-  /// next top-of-loop sweep) and (b) drain every queued burst into a flat
-  /// datagram list so all TTL=0 copies reach the wire before exit, leaving the
-  /// goodbye queue empty.
-  #[compio::test]
-  async fn shutdown_drain_sweeps_and_flushes_all_bursts() {
-    use mdns_proto::{Name, ServiceRecords, ServiceSpec};
-    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
-    let mut t = std::time::Instant::now();
-    let stype = Name::try_from_str("_sd._tcp.local.").unwrap();
-    let inst = Name::try_from_str("s._sd._tcp.local.").unwrap();
-    let host = Name::try_from_str("s.local.").unwrap();
-    let mut recs = ServiceRecords::new(stype, inst, host, 1234, 120);
-    recs.add_a([127, 0, 0, 1].into());
-    let handle = s.register_service(ServiceSpec::new(recs), t).unwrap();
+  /// Endpoint-owned-withdrawal replacement survival (supersedes the old free-name
+  /// goodbye BARRIER test). Under `with_probe_unique_names(false)` a same-name
+  /// replacement would announce a positive TTL directly (no §8.1 probe) — exactly
+  /// the configuration in which a stale TTL=0 goodbye could be overtaken. The old
+  /// compio driver enforced ordering with a pre-transmit barrier; the endpoint now
+  /// enforces it STRUCTURALLY — it KEEPS the route (holding the name) for the whole
+  /// §10.1 withdrawal, so a same-name `register_service` is REJECTED until the
+  /// goodbye completes and frees the name. No replacement can announce ahead of the
+  /// withdrawal because no replacement can even be registered until it is done.
+  ///
+  /// Driven through `State` directly (no sockets — the compio run loop cannot be
+  /// stepped deterministically). The full graceful path is exercised:
+  /// `flag_service_unregistered` (what `Service::drop` does) → the driver's
+  /// `sweep_cancelled_services` (begins the withdrawal) → `poll_one_withdrawal` /
+  /// `note_withdrawal_result` / `drain_completed_withdrawals` (the run loop's
+  /// `drain_withdrawals`). With no bound family every round fails to deliver, so the
+  /// withdrawal force-completes at its 2 s anti-pin ceiling; the name-held →
+  /// name-freed observation is identical either way.
+  #[test]
+  fn same_name_replacement_is_rejected_until_withdrawal_completes() {
+    use mdns_proto::{Name, ServiceRecords, ServiceSpec, error::RegisterServiceError};
 
-    let mut buf = vec![0u8; 4096];
-    for _ in 0..40 {
-      t += Duration::from_millis(300);
-      let ctx = s.services.get_mut(&handle).unwrap();
-      let _ = ctx.proto.handle_timeout(t);
-      while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        ctx.proto.note_transmit_delivered(t);
+    let cfg = mdns_proto::EndpointConfig::new().with_probe_unique_names(false);
+    let mut s = State::new(cfg, 1500, 9000);
+    let t0 = std::time::Instant::now();
+
+    let mk = || {
+      let mut r = ServiceRecords::new(
+        Name::try_from_str("_ipp._tcp.local.").unwrap(),
+        Name::try_from_str("repl._ipp._tcp.local.").unwrap(),
+        Name::try_from_str("repl.local.").unwrap(),
+        631,
+        120,
+      );
+      r.add_a([192, 168, 1, 10].into());
+      ServiceSpec::new(r)
+    };
+
+    // 1. Register A and drive it to an announced state so its withdrawal snapshot
+    //    is non-empty (records were confirmed-emitted).
+    let a = s.register_service(mk(), t0).unwrap();
+    let mut t = establish_service(&mut s, a, t0);
+
+    // 2. Drop A: flag cancelled (what `Service::drop` does), then the driver's
+    //    post-pump sweep begins the endpoint-owned withdrawal (name held).
+    s.flag_service_unregistered(a);
+    s.sweep_cancelled_services(t);
+    assert!(
+      s.services.get(&a).map(|c| c.errored).unwrap_or(false),
+      "the sweep must begin the withdrawal and keep the ctx (errored)"
+    );
+
+    // 3. While the withdrawal is in flight the SAME name must be rejected.
+    assert!(
+      matches!(
+        s.register_service(mk(), t),
+        Err(RegisterServiceError::NameAlreadyRegistered(_))
+      ),
+      "a same-name registration must be rejected while the withdrawal holds the name"
+    );
+
+    // 4. Drive the withdrawal to completion (no family → force-finished at the 2 s
+    //    anti-pin ceiling); `drain_completed_withdrawals` then frees the route + GCs
+    //    the ctx.
+    let mut scratch = vec![0u8; 4096];
+    let mut completed = false;
+    for _ in 0..64 {
+      t += Duration::from_millis(250);
+      while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
+        s.note_withdrawal_result(h, t, false);
+      }
+      s.drain_completed_withdrawals(t);
+      if !s.services.contains_key(&a) {
+        completed = true;
+        break;
       }
     }
     assert!(
-      s.services
-        .get(&handle)
-        .map(|c| c.proto.advertises_host())
-        .unwrap_or(false),
-      "service must advertise before withdrawal"
+      completed,
+      "the withdrawal must complete (route freed + driver ctx GC'd) by its 2 s \
+       anti-pin ceiling when no family can deliver"
     );
 
-    // Service::drop on the last handle: flag only. The sweep never ran (the
-    // driver is about to exit), so the shutdown drain must cover it.
-    s.flag_service_unregistered(handle);
-
-    let datagrams = s.take_shutdown_goodbyes(t);
-    assert!(
-      !s.services.contains_key(&handle),
-      "shutdown drain must sweep the cancelled service"
-    );
-    assert!(
-      s.goodbyes.is_empty(),
-      "shutdown drain must leave the goodbye queue empty"
-    );
-    // One service worth of goodbye, expanded to its full burst count.
-    assert_eq!(
-      datagrams.len(),
-      GOODBYE_SENDS as usize,
-      "every remaining burst copy must be flushed back-to-back, got {}",
-      datagrams.len()
-    );
-    assert!(
-      datagrams.iter().all(|d| !d.is_empty()),
-      "flushed goodbye datagrams must be non-empty"
-    );
+    // 5. The name is freed → a same-name replacement now registers successfully.
+    s.register_service(mk(), t)
+      .expect("the same name must be re-registerable once the withdrawal completes");
   }
 
-  /// `poll_deadline` must include pending goodbyes' `next_at` so the driver
-  /// wakes to fan out a queued §10.1 burst even when no other deadline is
-  /// pending.  A regression here would let a goodbye burst silently stall
-  /// after the first send.
-  #[test]
-  fn poll_deadline_sees_pending_goodbye() {
-    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
-    let now = std::time::Instant::now();
-    assert!(s.poll_deadline().is_none(), "empty state has no deadline");
-    s.goodbyes.push(PendingGoodbye {
-      data: vec![0xde, 0xad],
-      remaining: GOODBYE_SENDS,
-      next_at: now,
-      sent_once: false,
-      expires_at: now + GOODBYE_BARRIER_MAX,
-    });
-    assert_eq!(
-      s.poll_deadline(),
-      Some(now),
-      "a queued goodbye must surface its next_at on poll_deadline"
-    );
-  }
-
-  /// Part A (State seam): a goodbye round that reached NO family must NOT spend
-  /// the resend budget, must NOT flip `sent_once`, and must re-arm at the short
-  /// `GOODBYE_RETRY_BACKOFF` — not a full `GOODBYE_INTERVAL`. This is the
-  /// allocation-free advancement the driver applies after every burst; the full
-  /// async barrier-skip ordering is exercised end-to-end in the deterministic
-  /// `hick-smoltcp` engine test (the compio run loop cannot be stepped
-  /// deterministically here).
-  #[test]
-  fn goodbye_round_with_no_send_keeps_budget_and_backs_off() {
-    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
-    let now = std::time::Instant::now();
-    s.goodbyes.push(PendingGoodbye {
-      data: vec![0xde, 0xad],
-      remaining: GOODBYE_SENDS,
-      next_at: now,
-      sent_once: false,
-      expires_at: now + GOODBYE_BARRIER_MAX,
-    });
-
-    // any_sent = false: nothing reached the wire this round.
-    s.advance_goodbye_after_send(0, false, now);
-    let g = &s.goodbyes[0];
-    assert_eq!(
-      g.remaining, GOODBYE_SENDS,
-      "an all-failing round must not consume the resend budget"
-    );
-    assert!(
-      !g.sent_once,
-      "an all-failing round must not flip sent_once — the barrier still holds"
-    );
-    assert_eq!(
-      g.next_at,
-      now + GOODBYE_RETRY_BACKOFF,
-      "a failed round must re-arm at GOODBYE_RETRY_BACKOFF"
-    );
-    assert!(
-      g.next_at < now + GOODBYE_INTERVAL,
-      "a failed round must NOT push next_at out by a full GOODBYE_INTERVAL"
-    );
-    assert!(
-      s.has_pending_barrier(now),
-      "an un-sent goodbye remains a pending transmit barrier"
-    );
-  }
-
-  /// Part A/B (State seam): the FIRST round that reaches the wire latches
-  /// `sent_once` (clearing the barrier), spends exactly one resend, and re-arms at
-  /// the full `GOODBYE_INTERVAL`.
-  #[test]
-  fn goodbye_round_with_a_send_spends_one_and_clears_barrier() {
-    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
-    let now = std::time::Instant::now();
-    s.goodbyes.push(PendingGoodbye {
-      data: vec![0xde, 0xad],
-      remaining: GOODBYE_SENDS,
-      next_at: now,
-      sent_once: false,
-      expires_at: now + GOODBYE_BARRIER_MAX,
-    });
-
-    s.advance_goodbye_after_send(0, true, now);
-    let g = &s.goodbyes[0];
-    assert_eq!(
-      g.remaining,
-      GOODBYE_SENDS - 1,
-      "a delivered round must spend exactly one resend"
-    );
-    assert!(g.sent_once, "a delivered round latches sent_once");
-    assert_eq!(
-      g.next_at,
-      now + GOODBYE_INTERVAL,
-      "a delivered round re-arms at the full GOODBYE_INTERVAL"
-    );
-    assert!(
-      !s.has_pending_barrier(now),
-      "once it has sent, the goodbye no longer bars positive transmits"
-    );
-  }
-
-  /// Anti-pin (State seam): `gc_goodbyes` force-clears an entry past its
-  /// `expires_at` REGARDLESS of remaining sends, so a permanently-undeliverable
-  /// barrier cannot pin the queue or block transmits forever. A still-live entry
-  /// is retained; a fully-sent one is dropped.
-  #[test]
-  fn gc_force_clears_expired_barrier_and_drops_sent_entries() {
-    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
-    let now = std::time::Instant::now();
-    // Expired barrier still owing sends → force-cleared (counted).
-    s.goodbyes.push(PendingGoodbye {
-      data: vec![1],
-      remaining: GOODBYE_SENDS,
-      next_at: now,
-      sent_once: false,
-      expires_at: now - Duration::from_millis(1),
-    });
-    // Fully-sent entry → dropped (not counted as a force-clear).
-    s.goodbyes.push(PendingGoodbye {
-      data: vec![2],
-      remaining: 0,
-      next_at: now,
-      sent_once: true,
-      expires_at: now + GOODBYE_BARRIER_MAX,
-    });
-    // Live, un-expired, still owing → retained.
-    s.goodbyes.push(PendingGoodbye {
-      data: vec![3],
-      remaining: GOODBYE_SENDS,
-      next_at: now,
-      sent_once: false,
-      expires_at: now + GOODBYE_BARRIER_MAX,
-    });
-
-    let force_cleared = s.gc_goodbyes(now);
-    assert_eq!(
-      force_cleared, 1,
-      "exactly the expired-while-owing entry is force-cleared"
-    );
-    assert_eq!(s.goodbyes.len(), 1, "only the live entry survives");
-    assert_eq!(s.goodbyes[0].data, vec![3]);
-    assert!(
-      s.has_pending_barrier(now),
-      "the surviving un-sent entry is still a barrier"
-    );
-
-    // Past its own expiry, even the survivor stops barring transmits.
-    let later = now + GOODBYE_BARRIER_MAX + Duration::from_millis(1);
-    assert!(
-      !s.has_pending_barrier(later),
-      "an entry past its expires_at no longer bars transmits"
-    );
-  }
+  // NOTE: the driver-goodbye-queue + barrier seam tests
+  // (`remove_service_queues_goodbye_and_frees_proto_slot`,
+  // `shutdown_drain_sweeps_and_flushes_all_bursts`, `poll_deadline_sees_pending_goodbye`,
+  // `goodbye_round_with_no_send_keeps_budget_and_backs_off`,
+  // `goodbye_round_with_a_send_spends_one_and_clears_barrier`, and
+  // `gc_force_clears_expired_barrier_and_drops_sent_entries`) were REMOVED in the
+  // endpoint-owned-withdrawal migration. They asserted against the deleted
+  // driver-side `goodbyes` queue + `sent_once` transmit barrier (the `PendingGoodbye`
+  // struct, `advance_goodbye_after_send` Part-A re-arm, the `gc_goodbyes` `expires_at`
+  // anti-pin force-clear, `has_pending_barrier`, `take_shutdown_goodbyes`, and the
+  // `poll_deadline` goodbye loop). The endpoint now owns the resend schedule, the
+  // spend/re-arm bookkeeping, the 2 s anti-pin ceiling, and the goodbye-deadline
+  // contribution to `poll_timeout` — covered by the proto-level withdrawal tests
+  // (`note_withdrawal_result` spend/backoff, `drain_completed_withdrawals` ceiling,
+  // `poll_withdrawal_transmit` sibling retention). The
+  // `begin_service_withdrawal_holds_name_then_frees_on_completion` test above is the
+  // driver-State-seam observation that a withdrawal HOLDS the name and frees it on
+  // completion, and `drop_defers_withdrawal_to_driver_sweep` covers the deferred-
+  // snapshot timing the old `drop_defers_goodbye_to_driver_sweep` test guarded.
 
   /// Build a `ServiceUpdate::Renamed` carrying `name` (a `*.local.` instance
   /// name). `ServiceRenamed::new` is `#[doc(hidden)]` but public — the same
@@ -2788,18 +2531,33 @@ mod tests {
       "Conflict must be queued in the service's update deque"
     );
 
+    // The escalation began an endpoint-owned withdrawal. A service that never
+    // reached Established has an EMPTY snapshot, so the withdrawal completes
+    // immediately (`remaining == 0`) and `drain_completed_withdrawals` frees the
+    // route on the next call (with no datagram on the wire). The ctx is kept
+    // (route_freed deferred) because its Conflict is still queued.
+    s.drain_completed_withdrawals(t);
+
     // Proto route freed — services_active must be 0.
     assert_eq!(
       s.stats.snapshot().services_active,
       0,
-      "services_active must be 0 after encode-failure escalation (proto route freed)"
+      "services_active must be 0 after the encode-failure withdrawal completes (route freed)"
+    );
+    // The ctx is retained (route_freed) until its queued Conflict is drained.
+    assert!(
+      s.services
+        .get(&handle)
+        .map(|c| c.route_freed)
+        .unwrap_or(false),
+      "the ctx must be retained (route_freed) while its Conflict is undrained"
     );
 
     // The same service name must be re-registerable (route was released).
     let mut recs2 = ServiceRecords::new(stype, inst, host, 80, 120);
     recs2.add_a([10, 0, 0, 2].into());
     s.register_service(ServiceSpec::new(recs2), t)
-      .expect("same service name must be re-registerable after encode-failure escalation");
+      .expect("same service name must be re-registerable after encode-failure withdrawal");
 
     assert_eq!(
       s.stats.snapshot().services_active,
@@ -2911,14 +2669,16 @@ mod tests {
         .map(|c| c.errored)
         .unwrap_or(false)
       {
-        // fix: A's route was freed in-iteration, so services_active == 1
-        // even though B may have returned Ok(Some) in the same call.
+        // fix: A's withdrawal was BEGUN in-iteration (non-bypassable), even
+        // though B may have returned Ok(Some) in the same call. The route is now
+        // HELD by the withdrawal, so services_active stays 2 (A withdrawing + B
+        // live) — the route frees on withdrawal completion, asserted below.
         assert_eq!(
           s.stats.snapshot().services_active,
-          1,
-          "services_active must be 1 immediately when A escalates, \
-           even if B returned Ok(Some) in the same poll_one_transmit call \
-           (regression: deferred-drain bypass)"
+          2,
+          "services_active must be 2 when A escalates (A's route held by its \
+           in-iteration-begun withdrawal + B live), even if B returned Ok(Some) in \
+           the same poll_one_transmit call (regression: deferred-drain bypass)"
         );
         a_retired = true;
         break;
@@ -2941,11 +2701,22 @@ mod tests {
       "Conflict must be queued in A's update deque"
     );
 
-    // A's name must be immediately re-registerable (proto route was freed).
+    // A never reached Established → its withdrawal snapshot is empty and completes
+    // immediately; `drain_completed_withdrawals` frees A's route. If the bug
+    // were present (escalation marked A errored but its withdrawal was never
+    // begun), the route would leak and services_active would stay 2 here.
+    s.drain_completed_withdrawals(t);
+    assert_eq!(
+      s.stats.snapshot().services_active,
+      1,
+      "services_active must be 1 once A's (empty) withdrawal completes (B still live)"
+    );
+
+    // A's name must now be re-registerable (proto route was freed).
     let mut recs_a2 = ServiceRecords::new(stype_a, inst_a, host_a, 80, 120);
     recs_a2.add_a([10, 0, 0, 3].into());
     s.register_service(ServiceSpec::new(recs_a2), t)
-      .expect("A's name must be re-registerable after in-iteration unregister (fix)");
+      .expect("A's name must be re-registerable after its in-iteration-begun withdrawal completes");
 
     // B is still live: services_active == 2 after re-registering A.
     assert_eq!(
@@ -2961,24 +2732,23 @@ mod tests {
     );
   }
 
-  /// regression: when a service's auto-rename (§9 conflict) collides
-  /// with another LOCAL service that already owns the candidate name, the proto
-  /// route for the colliding service must be freed immediately by
-  /// `push_service_updates` — the same site that detects the collision — so
-  /// `services_active` is decremented and the old name becomes re-registerable.
+  /// regression (endpoint-owned-withdrawal form): when a service's
+  /// auto-rename (§9 conflict) collides with another LOCAL service that already
+  /// owns the candidate name, `push_service_updates` retires the colliding service
+  /// into an endpoint-owned withdrawal. The endpoint HOLDS the route (reserving the
+  /// old name) until the withdrawal completes, THEN frees it — so `services_active`
+  /// is decremented and the old name becomes re-registerable on COMPLETION, not at
+  /// the collision instant. A's `Conflict` is queued in-ctx regardless.
   ///
-  /// The bug: the compio `push_service_updates` break'd out of the rename loop
-  /// without calling `unregister_service`, leaking the proto route for the
-  /// colliding service. (The smoltcp `drain_service_updates` already had the
-  /// fix; compio was missed in R19.)
+  /// The original bug: the compio `push_service_updates` break'd out of the rename
+  /// loop without retiring the service, leaking the proto route for the colliding
+  /// service. The migration replaces the immediate `unregister_service` with
+  /// `begin_service_withdrawal` (route held → freed on completion).
   ///
-  /// The fix: after the `if let Some(ctx) = self.services.get_mut(&h) { ... }`
-  /// block closes (ctx borrow released), `unregister_service(h)` is called
-  /// unconditionally before the `break`.
-  ///
-  /// Verification: after injecting a peer conflict that drives A to rename to
-  /// B's name, `services_active` drops by 1, A's old name is re-registerable,
-  /// and A's `Conflict` is queued.
+  /// Verification: after the collision A is errored + `Conflict` is queued and the
+  /// route is still HELD (services_active stays 2, old name rejected); after
+  /// driving the withdrawal to completion, services_active drops to 1 and A's old
+  /// name is re-registerable.
   #[cfg(feature = "stats")]
   #[test]
   fn rename_collision_with_local_service_frees_proto_route() {
@@ -3119,16 +2889,14 @@ mod tests {
       "A must be driven to rename-collision-Conflict within 60 iterations"
     );
 
-    // fix: proto route freed immediately in push_service_updates —
-    // services_active must be 1 (B still live, A's route freed).
+    // A's route is HELD by the in-flight withdrawal — services_active stays 2
+    // (B live + A withdrawing), and A's Conflict is queued for Service::next.
     assert_eq!(
       s.stats.snapshot().services_active,
-      1,
-      "services_active must be 1 after rename collision retirement \
-       (regression: compio push_service_updates must call unregister_service)"
+      2,
+      "services_active must still be 2 while A's rename-collision withdrawal holds \
+       the route (B live + A withdrawing)"
     );
-
-    // A's Conflict must be queued for Service::next to drain.
     assert!(
       s.services
         .get(&handle_a)
@@ -3138,8 +2906,38 @@ mod tests {
         .any(|u| matches!(u, ServiceUpdate::Conflict)),
       "Conflict must be queued in A's update deque"
     );
+    // Drain A's queued updates (a host loop reads them via Service::next) so the
+    // ctx is GC'd cleanly on withdrawal completion — a completed ctx that still
+    // holds an undrained update is RETAINED (route_freed) until the host reads it.
+    if let Some(ctx) = s.services.get_mut(&handle_a) {
+      ctx.updates.clear();
+    }
 
-    // A's old name must be re-registerable (route was freed).
+    // Drive A's withdrawal to completion (no sockets → force-finished at the 2 s
+    // ceiling), then GC the freed ctx.
+    let mut scratch = vec![0u8; 4096];
+    let mut completed = false;
+    for _ in 0..64 {
+      t += Duration::from_millis(250);
+      while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
+        s.note_withdrawal_result(h, t, false);
+      }
+      s.drain_completed_withdrawals(t);
+      if !s.services.contains_key(&handle_a) {
+        completed = true;
+        break;
+      }
+    }
+    assert!(completed, "A's rename-collision withdrawal must complete");
+
+    // On completion the route is freed: services_active drops to 1 (B only).
+    assert_eq!(
+      s.stats.snapshot().services_active,
+      1,
+      "services_active must be 1 once A's withdrawal completes (B still live)"
+    );
+
+    // A's old name must now be re-registerable (route was freed on completion).
     let mut recs_a2 = ServiceRecords::new(
       Name::try_from_str("_ipp._tcp.local.").unwrap(),
       inst_a,
@@ -3148,26 +2946,32 @@ mod tests {
       120,
     );
     recs_a2.add_a([192, 168, 1, 10].into());
-    s.register_service(ServiceSpec::new(recs_a2), t)
-      .expect("A's old name must be re-registerable after rename-collision unregister (fix)");
+    s.register_service(ServiceSpec::new(recs_a2), t).expect(
+      "A's old name must be re-registerable once the rename-collision withdrawal completes",
+    );
   }
 
-  /// regression: when an ANNOUNCED service A is driven to auto-rename and
-  /// its candidate new name collides with a local service B, the proto has
-  /// already queued a `pending_rename_goodbye` (TTL=0 withdrawal of A's OLD
-  /// instance name). The fix ensures `push_service_updates` steals and enqueues
-  /// that goodbye IMMEDIATELY on the collision path — before freeing the old
-  /// name slot — so that if a REPLACEMENT service R later takes the freed old
-  /// name, the goodbye is not replayed on A's drop (which would evict R from
-  /// peer caches).
+  /// regression (endpoint-owned-withdrawal form): when an ANNOUNCED service A
+  /// is driven to auto-rename and its candidate new name collides with a local
+  /// service B, the proto has already queued a `pending_rename_goodbye` (TTL=0
+  /// withdrawal of A's OLD instance name). The OLD driver stole that goodbye into
+  /// its own queue before freeing the old name, then guarded against replaying it
+  /// on A's drop. The endpoint now enforces this STRUCTURALLY: the rename-collision
+  /// teardown begins an endpoint-owned withdrawal whose snapshot prioritises the
+  /// pending rename goodbye, and the endpoint HOLDS the OLD name for the whole
+  /// withdrawal — so a replacement R cannot register (and evict the old name from
+  /// peer caches) until the goodbye completes. No steal, no replay-guard needed.
+  ///
+  /// (That the withdrawal snapshot CONSUMES the proto's `pending_rename_goodbye`
+  /// is covered at the proto level by
+  /// `withdrawal_snapshot_of_pending_rename_goodbye_takes_old_name`.)
   ///
   /// Asserts:
-  /// 1. After collision retirement the old-name goodbye is queued in
-  ///    `state.goodbyes` promptly (not deferred to drop).
-  /// 2. The proto's `pending_rename_goodbye` is cleared at that point.
-  /// 3. After R is registered under A's freed old name, dropping A's handle
-  ///    (sweeping the cancelled slot) does NOT emit any additional goodbye for
-  ///    the old name (so R is not withdrawn from peer caches).
+  /// 1. After collision retirement A is errored + the endpoint holds the OLD name,
+  ///    so a same-name re-register is rejected (`NameAlreadyRegistered`).
+  /// 2. Once the withdrawal completes (route freed + ctx GC'd), the OLD name is
+  ///    re-registerable — and re-registering R THEN does not depend on any
+  ///    driver-side replayed goodbye.
   #[cfg(feature = "stats")]
   #[test]
   fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
@@ -3270,7 +3074,6 @@ mod tests {
       conflict.len(),
     );
     let mut conflicted = false;
-    let mut goodbyes_before: usize = 0;
     for _ in 0..80 {
       t += Duration::from_millis(300);
       s.fire_timeouts(t);
@@ -3285,7 +3088,6 @@ mod tests {
         .unwrap_or(false)
       {
         conflicted = true;
-        goodbyes_before = s.goodbyes.len();
         break;
       }
     }
@@ -3294,73 +3096,54 @@ mod tests {
       "A must be driven to rename-collision-Conflict within 80 iterations"
     );
 
-    // FIX ASSERTION 1: the old-name goodbye must already be queued at collision
-    // time (not deferred to drop). Before the fix, goodbyes_before == initial
-    // count (no new goodbye queued).
-    assert!(
-      s.goodbyes.len() > goodbyes_before
-        || s
-          .goodbyes
-          .iter()
-          .any(|g| g.remaining == GOODBYE_SENDS && g.next_at <= t),
-      "old-name TTL=0 goodbye must be queued into state.goodbyes immediately on collision \
-       (before A's drop)"
-    );
-
-    // FIX ASSERTION 2: the proto's pending_rename_goodbye must be cleared now.
-    // Verify by attempting to steal it again — a second steal must yield None.
+    // ASSERTION 1: the endpoint holds A's OLD name for the whole withdrawal, so a
+    // same-name re-register is rejected — a replacement cannot announce a fresh
+    // positive TTL ahead of the stale TTL=0 (and evict the old name from peer
+    // caches). This is the structural ordering guarantee that replaces the old
+    // steal-before-reuse dance.
     {
-      let mut rbuf = vec![0u8; 1500];
-      let second_steal = s
-        .services
-        .get_mut(&handle_a)
-        .and_then(|c| c.proto.take_pending_rename_goodbye(&mut rbuf).ok())
-        .flatten();
+      let mut dup = ServiceRecords::new(stype.clone(), inst_a.clone(), host_a.clone(), 80, 120);
+      dup.add_a([192, 168, 1, 1].into());
       assert!(
-        second_steal.is_none(),
-        "proto pending_rename_goodbye must be cleared after collision-path steal \
-         (a second take must return None)"
+        matches!(
+          s.register_service(ServiceSpec::new(dup), t),
+          Err(mdns_proto::error::RegisterServiceError::NameAlreadyRegistered(_))
+        ),
+        "A's OLD name must be held by the in-flight withdrawal (NameAlreadyRegistered)"
       );
     }
 
-    // Snapshot goodbye queue length before registering R and sweeping A.
-    // NOTE: sweeping A may legitimately add a goodbye from encode_goodbye for
-    // A's host-address records (first.local. A 192.168.1.1) — that is correct
-    // RFC 6762 §10.1 behaviour.  What must NOT happen is an ADDITIONAL goodbye
-    // from take_pending_rename_goodbye, which was already stolen at collision
-    // time.  We verify this by giving R a DIFFERENT host name so we can cleanly
-    // count the expected goodbye deltas:
-    //   - encode_goodbye for A's host (first.local.): expected +1 (A announced its
-    //     host record, no sibling retains that address)
-    //   - take_pending_rename_goodbye: expected +0 (stolen already — the fix)
-    // If take_pending_rename_goodbye were still pending at sweep time (bug), the
-    // count would be +2 instead of +1.
-    let goodbyes_after_collision = s.goodbyes.len();
+    // Drain A's queued updates (the collision Conflict) so the ctx is GC'd cleanly
+    // on completion — a completed ctx with an undrained update is RETAINED
+    // (route_freed) until the host reads it.
+    if let Some(ctx) = s.services.get_mut(&handle_a) {
+      ctx.updates.clear();
+    }
 
-    // Register replacement R under A's freed old name with a DIFFERENT host so
-    // A's encode_goodbye for first.local. is not ambiguously shared.
+    // Drive A's withdrawal to completion (no sockets → force-finished at the 2 s
+    // anti-pin ceiling), then GC the freed ctx.
+    let mut scratch = vec![0u8; 4096];
+    let mut completed = false;
+    for _ in 0..64 {
+      t += Duration::from_millis(250);
+      while let Some((_, _, h)) = s.poll_one_withdrawal(t, &mut scratch) {
+        s.note_withdrawal_result(h, t, false);
+      }
+      s.drain_completed_withdrawals(t);
+      if !s.services.contains_key(&handle_a) {
+        completed = true;
+        break;
+      }
+    }
+    assert!(completed, "A's rename-collision withdrawal must complete");
+
+    // ASSERTION 2: once the withdrawal completes, A's OLD name is freed → a
+    // replacement R registers successfully under it.
     let host_r = Name::try_from_str("replacement.local.").unwrap();
     let mut recs_r = ServiceRecords::new(stype, inst_a, host_r, 80, 120);
     recs_r.add_a([192, 168, 1, 10].into());
     s.register_service(ServiceSpec::new(recs_r), t)
-      .expect("replacement R must be registerable under A's freed old name");
-
-    // Drop A's handle: flag it cancelled and sweep.
-    s.flag_service_unregistered(handle_a);
-    s.sweep_cancelled_services(t);
-
-    // FIX ASSERTION 3: the sweep may add a goodbye from encode_goodbye for A's
-    // host addresses (at most +1), but must NOT add a goodbye from
-    // take_pending_rename_goodbye (+0, already stolen). The delta must be ≤ 1.
-    let goodbyes_after_sweep = s.goodbyes.len();
-    let delta = goodbyes_after_sweep.saturating_sub(goodbyes_after_collision);
-    assert!(
-      delta <= 1,
-      "A's drop must add at most one goodbye (host-address encode_goodbye); \
-       take_pending_rename_goodbye must contribute 0 (it was stolen at collision time). \
-       Got delta={delta} (before={goodbyes_after_collision}, after={goodbyes_after_sweep}). \
-       delta > 1 means take_pending_rename_goodbye was NOT cleared — the R21 bug is present."
-    );
+      .expect("replacement R must register under A's old name once the withdrawal completes");
   }
 
   /// a query whose question can't be encoded into `max_payload` (here
@@ -3774,39 +3557,33 @@ mod tests {
     );
   }
 
-  /// Loop-ordering guard: the goodbye-burst pump MUST run AFTER
-  /// `push_service_updates`, not before.
+  /// Loop-ordering guard (endpoint-owned-withdrawal form): the withdrawal
+  /// pump (`drain_withdrawals`) MUST run AFTER `push_service_updates`, not before.
   ///
   /// When a rename collision is detected inside `push_service_updates`, the
-  /// OLD-name TTL=0 goodbye is stolen from `proto.pending_rename_goodbye` and
-  /// pushed into `state.goodbyes` with `next_at = now`. Under the PREVIOUS
-  /// (buggy) order — goodbye pump first, then `push_service_updates` — the pump
-  /// would run when the goodbye was NOT YET in `state.goodbyes`, so it was
-  /// deferred to the NEXT iteration.  In the next iteration the Phase-1 transmit
-  /// pump runs first, meaning a replacement service registered during the park
-  /// could announce with a positive TTL BEFORE the stale TTL=0 goodbye reached
-  /// the wire — evicting the replacement from peer caches.
+  /// teardown begins an endpoint-owned withdrawal (`begin_service_withdrawal`)
+  /// whose snapshot prioritises `proto.pending_rename_goodbye` and whose first
+  /// goodbye round is due IMMEDIATELY (`next_at = now`). Under the wrong order —
+  /// withdrawal pump first, then `push_service_updates` — the pump would run
+  /// before the withdrawal exists, deferring its first goodbye to the NEXT
+  /// iteration (whose Phase-1 transmit pump runs first). The endpoint holds the
+  /// OLD name throughout, so a replacement still cannot overtake the goodbye, but
+  /// running the pump after push keeps the stale TTL=0 promptly on the wire.
   ///
-  /// This test proves the ordering guarantee at the State seam by stopping the
-  /// drive loop ONE STEP before calling `push_service_updates` on the decisive
-  /// iteration and then:
+  /// This test proves the ordering at the State seam by stopping the drive loop
+  /// on the decisive (collision) iteration and probing whether a withdrawal
+  /// datagram is DUE before vs after `push_service_updates`. `poll_one_withdrawal`
+  /// is non-destructive to the resend schedule (it only encodes into scratch;
+  /// `next_at` advances only in `note_withdrawal_result`, which we do NOT call
+  /// here), so before/after probes are side-effect-free:
   ///
-  ///   OLD (buggy) order: goodbye-pump snapshot → `push_service_updates`
-  ///     asserts pump_before_push saw 0 new due goodbyes (the collision goodbye
-  ///     did not exist yet — the pump would have sent nothing for it).
-  ///
-  ///   NEW (correct) order: `push_service_updates` → goodbye-pump snapshot
-  ///     asserts pump_after_push saw ≥ 1 due goodbye (collision goodbye was
-  ///     queued by push and is now ready to drain in the same iteration).
-  ///
-  /// The test FAILS on the pre-reorder code: `pump_before_push > 0` would hold
-  /// if there were a goodbye before push (meaning the old order could drain it),
-  /// but then `pump_after_push == 0` would fail (no NEW goodbye appeared after
-  /// push in the old order, so the seam is broken).  With the fix both steps
-  /// hold as designed.
+  ///   before push: no withdrawal exists yet → `poll_one_withdrawal` == None.
+  ///   after push: the collision withdrawal is queued, first round due now →
+  ///                `poll_one_withdrawal` == Some (the pump would drain it this
+  ///                iteration).
   #[cfg(feature = "stats")]
   #[test]
-  fn goodbye_pump_runs_after_push_service_updates_loop_order() {
+  fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     use std::time::Duration;
 
     use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -3861,12 +3638,9 @@ mod tests {
       }
     }
 
-    // Returns the number of due goodbye entries (remaining > 0 AND next_at <= t).
-    fn count_due_goodbyes(s: &State, t: StdInstant) -> usize {
-      s.goodbyes
-        .iter()
-        .filter(|g| g.remaining > 0 && g.next_at <= t)
-        .count()
+    // Whether a withdrawal datagram is DUE (non-destructively to the schedule).
+    fn withdrawal_due(s: &mut State, t: StdInstant, scratch: &mut [u8]) -> bool {
+      s.poll_one_withdrawal(t, scratch).is_some()
     }
 
     // Advance A to Established so the proto queues pending_rename_goodbye on
@@ -3901,11 +3675,8 @@ mod tests {
       ctx.updates.clear();
     }
 
-    // Inject peer conflicts. Drive all but the DECISIVE iteration with full
-    // pump-transmits + push_service_updates. On the decisive iteration (the one
-    // that WILL collide A with B), run only fire_timeouts + handle_datagram +
-    // pump_transmits — omitting push_service_updates — so we can manually probe
-    // the goodbye queue BEFORE and AFTER push_service_updates.
+    // Inject peer conflicts. On the decisive iteration (the one that WILL collide
+    // A with B), probe withdrawal-due BEFORE and AFTER push_service_updates.
     let conflict = conflict_for("Alpha._ipp._tcp.local.");
     let peer = RecvMeta::new(
       SocketAddr::from(([192, 168, 1, 200], 5353)),
@@ -3916,20 +3687,9 @@ mod tests {
       conflict.len(),
     );
 
-    // Phase 1: drive with FULL iterations until the PREVIOUS iteration before
-    // the collision. We detect "just before" by running one PEEK iteration:
-    // if A becomes errored AFTER push_service_updates, that IS the decisive one.
-    // So we run iterations including push_service_updates until A IS errored,
-    // then use the before/after counts captured at that decisive iteration.
-    //
-    // The decisive-iteration split: on the iteration that collides A, record
-    // goodbye-pump state (a) right before push_service_updates and (b) right
-    // after push_service_updates. The assertion then is:
-    //   (a) == 0 new due entries: goodbye was NOT queued before push → OLD order
-    //       would have missed it.
-    //   (b) >= 1 new due entries: goodbye WAS queued by push → NEW order sees it.
-    let mut decisive_before: Option<usize> = None;
-    let mut decisive_after: Option<usize> = None;
+    let mut scratch = [0u8; 1500];
+    let mut decisive_before: Option<bool> = None;
+    let mut decisive_after: Option<bool> = None;
 
     for _ in 0..80 {
       t += Duration::from_millis(300);
@@ -3937,11 +3697,11 @@ mod tests {
       s.handle_datagram(&peer, &conflict);
       pump_transmits(&mut s, t, &mut buf);
 
-      // Snapshot BEFORE push_service_updates (old-order pump position).
-      let before = count_due_goodbyes(&s, t);
+      // Probe BEFORE push_service_updates (wrong-order pump position).
+      let before = withdrawal_due(&mut s, t, &mut scratch);
       s.push_service_updates(t);
-      // Snapshot AFTER push_service_updates (new-order pump position).
-      let after = count_due_goodbyes(&s, t);
+      // Probe AFTER push_service_updates (correct-order pump position).
+      let after = withdrawal_due(&mut s, t, &mut scratch);
 
       if s
         .services
@@ -3959,32 +3719,20 @@ mod tests {
       .expect("A must be driven to rename-collision-Conflict within the iteration limit");
     let after = decisive_after.unwrap();
 
-    // CORE ORDERING ASSERTION:
-    //
-    // The collision goodbye is queued BY push_service_updates (after > before).
-    // OLD order (pump first): the pump sees `before` due entries — no new entry
-    // from the just-about-to-happen collision — so the stale TTL=0 is deferred.
-    // NEW order (push first): the pump sees `after` due entries — the collision
-    // goodbye is already present — so it flushes on-wire in the same iteration.
+    // CORE ORDERING ASSERTION: the collision withdrawal is begun BY
+    // push_service_updates. Before push no withdrawal is due (would have drained
+    // nothing); after push its first goodbye round is due, so the pump (which runs
+    // after push) flushes it this iteration.
     assert!(
-      after > before,
-      "push_service_updates must queue the rename-collision goodbye (due_after={after} \
-       must be > due_before={before}). \
-       If equal, either the goodbye was already due before push (pre-existing goodbye, \
-       test setup issue) or push did not queue it (ordering fix is broken)."
+      after,
+      "a withdrawal datagram must be DUE after push_service_updates begins the \
+       rename-collision withdrawal (so the post-push withdrawal pump drains it this \
+       iteration)"
     );
-    // Explicitly assert the pre-push count was zero NEW entries from this
-    // collision: the goodbye did not exist before push on the decisive iteration.
-    // (A pre-existing goodbye from sweep_cancelled_services would show up in
-    // `before` — but the test drives services to collision, not drop, so none
-    // should be present from sweep. If this assertion fires it means the test
-    // setup changed and `before` includes a sweep-goodbye, which invalidates the
-    // ordering proof; adjust accordingly.)
-    assert_eq!(
-      before, 0,
-      "no due goodbye must exist before push_service_updates on the decisive iteration \
-       (the collision goodbye is created by push, not by sweep or prior state). \
-       before={before} — if nonzero a sweep-goodbye leaked into the probe window"
+    assert!(
+      !before,
+      "no withdrawal must be due BEFORE push_service_updates on the decisive \
+       iteration (the collision withdrawal is begun by push, not by a prior sweep)"
     );
   }
 }

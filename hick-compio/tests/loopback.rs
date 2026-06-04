@@ -541,20 +541,24 @@ async fn resolve_host_returns_addresses() {
   );
 }
 
-/// RFC 6762 §10.1: dropping a registered service must release the
-/// proto-layer route slot (so the same instance name can be re-registered
-/// immediately) AND queue the TTL=0 goodbye burst — the regression Service
-/// Drop used to skip, leaking a slot per drop until endpoint shutdown.
+/// RFC 6762 §10.1: dropping a registered service must EVENTUALLY release the
+/// proto-layer route slot so the same instance name can be re-registered — but,
+/// under the endpoint-owned withdrawal lifecycle, the name is released only AFTER
+/// the withdrawal completes, not synchronously on drop.
 ///
-/// We can't directly observe the goodbye datagrams on the wire from a
-/// caller-level test (multicast loopback may not echo to the same process
-/// in every environment), so the assertion is the proto-side one: an
-/// immediate re-register of the same instance name on the same endpoint
-/// must succeed. Before the fix this returned `NameAlreadyRegistered`
-/// because the proto route was never released on Drop.
+/// `Service::drop` flags the service cancelled; the driver's post-pump sweep
+/// begins the endpoint-owned withdrawal, which HOLDS the route (reserving the
+/// name) while it multicasts the TTL=0 goodbye, then frees the route on
+/// completion (its resend budget spent, or its 2 s anti-pin ceiling). So a
+/// same-name re-registration may be REJECTED (`NameAlreadyRegistered`) for a
+/// brief window while the withdrawal is in flight, and SUCCEEDS once it
+/// completes. This test drives an ANNOUNCED service to that withdrawal (so the
+/// snapshot is non-empty and the name is genuinely held) and then retries
+/// re-registration until it succeeds, asserting the slot is released after the
+/// withdrawal — not leaked (the original Drop bug) and not held forever.
 #[compio::test]
 async fn dropping_service_releases_proto_slot_for_reregister() {
-  use hick_compio::{Endpoint, Name, ServerOptions, ServiceRecords, ServiceSpec};
+  use hick_compio::{Endpoint, Name, RegisterError, ServerOptions, ServiceRecords, ServiceSpec};
   let idx = match super_loopback_index() {
     Some(i) => i,
     None => return,
@@ -581,21 +585,40 @@ async fn dropping_service_releases_proto_slot_for_reregister() {
     ServiceSpec::new(r)
   };
   let svc = ep.register_service(mk()).await.unwrap();
-  // Give the driver one loop iteration to pick up the registration before
-  // dropping it.
-  compio::time::sleep(Duration::from_millis(50)).await;
+  // Let the service probe + announce so it reaches the advertised state — only
+  // then does its withdrawal snapshot carry records, so the §10.1 withdrawal
+  // genuinely HOLDS the name (the case this test must exercise).
+  compio::time::sleep(Duration::from_millis(1200)).await;
   drop(svc);
-  // Withdrawal is DRIVER-OWNED: `Service::drop` only flags the service
-  // cancelled (so a send in flight when the handle dropped can latch before the
-  // §10.1 goodbye is encoded); the driver's post-pump sweep then frees the
-  // proto route slot. Yield so that sweep runs before we re-register the same
-  // instance name — otherwise the slot is still held and re-registration would
-  // hit NameAlreadyRegistered.
-  compio::time::sleep(Duration::from_millis(100)).await;
-  let svc2 = ep
-    .register_service(mk())
-    .await
-    .expect("re-register after drop must succeed once the driver sweep frees the slot");
+
+  // Re-registration is released only once the endpoint-owned withdrawal
+  // completes. Retry on a bounded schedule: it may be `NameAlreadyRegistered`
+  // while the withdrawal holds the route, and must EVENTUALLY succeed once the
+  // withdrawal finishes (budget spent on the loopback goodbye sends, or its 2 s
+  // anti-pin ceiling). The 5 s bound comfortably covers both.
+  let mut svc2 = None;
+  let mut saw_held = false;
+  for _ in 0..50 {
+    match ep.register_service(mk()).await {
+      Ok(s) => {
+        svc2 = Some(s);
+        break;
+      }
+      Err(RegisterError::NameAlreadyRegistered(_)) => {
+        // The withdrawal still holds the name — expected for a brief window.
+        saw_held = true;
+        compio::time::sleep(Duration::from_millis(100)).await;
+      }
+      Err(e) => panic!("unexpected re-register error while withdrawing: {e:?}"),
+    }
+  }
+  // Whether or not we observed the held window (timing-dependent on the loopback
+  // goodbye delivery), the slot MUST eventually be released.
+  let _ = saw_held;
+  assert!(
+    svc2.is_some(),
+    "the same instance name must be re-registerable once the §10.1 withdrawal completes"
+  );
   drop(svc2);
 }
 
