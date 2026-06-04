@@ -74,7 +74,7 @@ impl CMsgRef<'_> {
 ///
 /// The buffer must be aligned to `align_of::<cmsghdr>()` — see
 /// [`CMsgIter::new`]. In production this is satisfied by routing the kernel's
-/// fill through a `cmsghdr`-aligned scratch buffer (see Task 5).
+/// fill through a `cmsghdr`-aligned scratch buffer.
 #[cfg(unix)]
 pub(crate) struct CMsgIter<'a> {
   msg: msghdr,
@@ -132,7 +132,7 @@ impl<'a> Iterator for CMsgIter<'a> {
 }
 
 // Windows iteration mirrors this shape over WSACMSGHDR / `WSA_CMSG_*` macros;
-// added in Task 5 alongside the Windows recv path.
+// added alongside the Windows recv path.
 
 /// Encode outbound cmsgs into a caller-provided byte buffer.
 ///

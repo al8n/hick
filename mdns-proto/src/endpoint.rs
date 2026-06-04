@@ -31,13 +31,13 @@ use crate::{
 const WITHDRAWAL_SENDS: u8 = 3;
 
 /// Spacing between successive withdrawal goodbye resends (loss resilience).
-// Used by `poll_withdrawal_transmit` (Task 3).
+// Used by `poll_withdrawal_transmit`.
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[allow(dead_code)]
 const WITHDRAWAL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(250);
 
 /// Back-off added to `next_at` on a missed send (delivery not yet confirmed).
-// Used by `note_withdrawal_result` (Task 4).
+// Used by `note_withdrawal_result`.
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[allow(dead_code)]
 const WITHDRAWAL_RETRY_BACKOFF: core::time::Duration = core::time::Duration::from_millis(20);
@@ -244,7 +244,7 @@ pub struct ServiceRoute {
   /// service.  The route is kept alive (name guard + dispatch) until the
   /// goodbye sequence completes; this flag lets downstream code distinguish a
   /// live service from one that is in the process of being torn down.
-  // Read by `poll_timeout` dispatch skip (Task 6).
+  // Read by `poll_timeout` dispatch skip.
   #[allow(dead_code)]
   withdrawing: bool,
 }
@@ -6020,7 +6020,7 @@ mod tests {
   // ── begin_withdrawal ─────────────────────────────────────────────────
 
   /// `begin_withdrawal` must leave `services_active` unchanged (it is
-  /// decremented later in Task 5) and keep the route in `self.services` so
+  /// decremented later) and keep the route in `self.services` so
   /// that a same-name re-registration is still rejected.
   #[cfg(feature = "stats")]
   #[test]
@@ -6456,7 +6456,7 @@ mod tests {
 
   /// `note_withdrawal_result` spends a resend round per family that `Sent`; a
   /// round where neither family sent (both `Retry`) re-arms at the short backoff
-  /// WITHOUT spending either family's budget (Task 4).
+  /// WITHOUT spending either family's budget.
   #[test]
   fn note_withdrawal_delivered_spends_failed_rearms() {
     let mut ep = build_endpoint();
@@ -8499,7 +8499,7 @@ mod tests {
 
   /// A withdrawal that spends its whole budget COMPLETES: the route is freed,
   /// `services_active` is decremented, the handle is returned for GC, and the
-  /// name is re-registerable (Task 5).
+  /// name is re-registerable.
   #[cfg(feature = "stats")]
   #[test]
   fn withdrawal_completes_frees_name_and_decrements_active() {
@@ -8565,7 +8565,7 @@ mod tests {
   }
 
   /// A withdrawal whose families never deliver is force-completed at its ceiling
-  /// (anti-pin), so the name is eventually released (Task 5).
+  /// (anti-pin), so the name is eventually released.
   #[test]
   fn withdrawal_force_completes_at_ceiling() {
     let mut ep = build_endpoint();
@@ -8803,7 +8803,7 @@ mod tests {
 
   /// A withdrawing route is NOT routed an incoming question (its service is gone,
   /// only its goodbye is draining), but the route is still present so a same-name
-  /// re-registration is rejected (Task 6).
+  /// re-registration is rejected.
   #[test]
   fn withdrawing_route_is_not_answered_but_still_blocks_reregister() {
     use core::net::SocketAddr;
@@ -9007,7 +9007,7 @@ mod tests {
   }
 
   /// `poll_timeout` accounts for a due endpoint-owned withdrawal so the driver
-  /// wakes to pump it (Task 6).
+  /// wakes to pump it.
   #[test]
   fn poll_timeout_accounts_for_due_withdrawal() {
     let mut e = build_endpoint();

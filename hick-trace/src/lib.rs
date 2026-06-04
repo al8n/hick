@@ -433,8 +433,6 @@ pub mod stats {
   }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
   /// Verify span macros compile and that `.entered()` yields a usable drop-guard
