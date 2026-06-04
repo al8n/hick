@@ -137,6 +137,12 @@ struct DriverState<N: Net> {
   queries: HashMap<QueryHandle, QueryCtx>,
   v4: Option<Arc<N::UdpSocket>>,
   v6: Option<Arc<N::UdpSocket>>,
+  /// Shared stats handle — cloned into recv subtasks and the send path so
+  /// all I/O counters land in the same [`hick_trace::stats::Stats`] the
+  /// proto uses.  Gated on the `stats` feature; the field is absent when
+  /// the feature is disabled so zero overhead in the no-stats build.
+  #[cfg(feature = "stats")]
+  stats: std::sync::Arc<hick_trace::stats::Stats>,
   /// self-send tracker — `(content_hash, send_wall_time)` for every
   /// datagram we recently transmitted. The driver (std layer) owns this
   /// because deciding "is this inbound packet our own loopback?" needs the
@@ -188,6 +194,8 @@ impl<N: Net> DriverState<N> {
     let rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
     let endpoint = ProtoEndpoint::try_new(*opts.endpoint_config(), rng);
     let bound_interface = sockets.interface_index;
+    #[cfg(feature = "stats")]
+    let stats = endpoint.stats_handle();
     Self {
       endpoint,
       services: HashMap::new(),
@@ -202,6 +210,8 @@ impl<N: Net> DriverState<N> {
       bound_interface,
       v4: sockets.v4.map(Arc::new),
       v6: sockets.v6.map(Arc::new),
+      #[cfg(feature = "stats")]
+      stats,
     }
   }
 
@@ -378,6 +388,8 @@ impl<N: Net> DriverState<N> {
         hop_limit = ?pkt.hop_limit,
         "dropping off-link packet (RFC 6762 §11 trust boundary)"
       );
+      #[cfg(feature = "stats")]
+      self.stats.packets_dropped(1);
       return;
     }
 
@@ -395,6 +407,8 @@ impl<N: Net> DriverState<N> {
         src = %pkt.src,
         "dropping untrusted response (source port != 5353) before self-send match"
       );
+      #[cfg(feature = "stats")]
+      self.stats.packets_dropped(1);
       return;
     }
 
@@ -675,6 +689,8 @@ impl<N: Net> DriverState<N> {
   /// transmits are pending so the driver loop knows to schedule another
   /// drain pass on the next tick rather than sleeping.
   async fn drain_transmits(&mut self, now: StdInstant, scratch: &mut [u8]) -> bool {
+    #[cfg(feature = "stats")]
+    let stats = self.stats.clone();
     let Self {
       endpoint,
       services,
@@ -742,7 +758,16 @@ impl<N: Net> DriverState<N> {
           None => break,
         };
         let body_len = tx.size();
-        let used = send_via::<N>(recent_sends, v4, v6, tx.dst(), &scratch[..body_len]).await;
+        let used = send_via::<N>(
+          recent_sends,
+          v4,
+          v6,
+          tx.dst(),
+          &scratch[..body_len],
+          #[cfg(feature = "stats")]
+          &stats,
+        )
+        .await;
         // report the send RESULT so the
         // proto advances its lifecycle — the §8.1 probe sequence, the §8.3
         // announce phase, and the goodbye-ownership guards — ONLY on a
@@ -812,7 +837,16 @@ impl<N: Net> DriverState<N> {
           }
         };
         let body_len = tx.size();
-        let used = send_via::<N>(recent_sends, v4, v6, tx.dst(), &scratch[..body_len]).await;
+        let used = send_via::<N>(
+          recent_sends,
+          v4,
+          v6,
+          tx.dst(),
+          &scratch[..body_len],
+          #[cfg(feature = "stats")]
+          &stats,
+        )
+        .await;
         // report the send result so the query advances its retry
         // budget only on a confirmed-delivered send. On all-socket failure
         // (`used == 0`) the query re-attempts without burning the budget rather
@@ -836,6 +870,8 @@ impl<N: Net> DriverState<N> {
     if self.goodbyes.is_empty() {
       return;
     }
+    #[cfg(feature = "stats")]
+    let stats = self.stats.clone();
     let Self {
       goodbyes,
       recent_sends,
@@ -845,7 +881,16 @@ impl<N: Net> DriverState<N> {
     } = self;
     for g in goodbyes.iter_mut() {
       if g.remaining > 0 && g.next_at <= now {
-        let _ = send_via::<N>(recent_sends, v4, v6, MDNS_V4_DST, &g.data).await;
+        let _ = send_via::<N>(
+          recent_sends,
+          v4,
+          v6,
+          MDNS_V4_DST,
+          &g.data,
+          #[cfg(feature = "stats")]
+          &stats,
+        )
+        .await;
         g.remaining = g.remaining.saturating_sub(1);
         g.next_at = now + GOODBYE_INTERVAL;
       }
@@ -1355,6 +1400,7 @@ async fn send_via<N: Net>(
   v6: &Option<Arc<N::UdpSocket>>,
   dst: SocketAddr,
   body: &[u8],
+  #[cfg(feature = "stats")] stats: &std::sync::Arc<hick_trace::stats::Stats>,
 ) -> usize {
   // proto-layer transmits use multicast_dst() which always
   // returns the IPv4 group. Detect mDNS multicast destinations and fan
@@ -1388,20 +1434,40 @@ async fn send_via<N: Net>(
         // failed send produces no loopback; a stale entry would suppress
         // a later byte-identical peer packet.
         Ok(_) => {
+          hick_trace::trace!(dst = %MDNS_V4_DST, len = body.len(), "send_to v4");
           record_self_send(tracker, body, send_wall);
+          #[cfg(feature = "stats")]
+          {
+            stats.packets_tx(1);
+            stats.bytes_tx(body.len() as u64);
+          }
           credits += 1;
         }
-        Err(_e) => hick_trace::debug!(error = %_e, dst = %MDNS_V4_DST, "send_to v4 failed"),
+        Err(_e) => {
+          hick_trace::debug!(error = %_e, dst = %MDNS_V4_DST, "send_to v4 failed");
+          #[cfg(feature = "stats")]
+          stats.send_errors(1);
+        }
       }
     }
     if let Some(s) = v6 {
       let (res, send_wall) = send_to_at::<N>(s, body, MDNS_V6_DST).await;
       match res {
         Ok(_) => {
+          hick_trace::trace!(dst = %MDNS_V6_DST, len = body.len(), "send_to v6");
           record_self_send(tracker, body, send_wall);
+          #[cfg(feature = "stats")]
+          {
+            stats.packets_tx(1);
+            stats.bytes_tx(body.len() as u64);
+          }
           credits += 1;
         }
-        Err(_e) => hick_trace::debug!(error = %_e, dst = %MDNS_V6_DST, "send_to v6 failed"),
+        Err(_e) => {
+          hick_trace::debug!(error = %_e, dst = %MDNS_V6_DST, "send_to v6 failed");
+          #[cfg(feature = "stats")]
+          stats.send_errors(1);
+        }
       }
     }
     return credits;
@@ -1416,10 +1482,20 @@ async fn send_via<N: Net>(
     let (res, send_wall) = send_to_at::<N>(s, body, dst).await;
     match res {
       Ok(_) => {
+        hick_trace::trace!(dst = %dst, len = body.len(), "send_to");
         record_self_send(tracker, body, send_wall);
+        #[cfg(feature = "stats")]
+        {
+          stats.packets_tx(1);
+          stats.bytes_tx(body.len() as u64);
+        }
         credits += 1;
       }
-      Err(_e) => hick_trace::debug!(error = %_e, dst = %dst, "send_to failed"),
+      Err(_e) => {
+        hick_trace::debug!(error = %_e, dst = %dst, "send_to failed");
+        #[cfg(feature = "stats")]
+        stats.send_errors(1);
+      }
     }
   }
   credits
@@ -1453,10 +1529,15 @@ pub(crate) fn spawn<N: Net>(
   opts: ServerOptions,
   sockets: BoundSockets<N>,
   cmd_rx: async_channel::Receiver<Command>,
+  #[cfg(feature = "stats")] stats_out: &mut Option<std::sync::Arc<hick_trace::stats::Stats>>,
 ) {
   let max_send = opts.max_payload_size();
   let max_recv = opts.max_recv_packet_size();
   let state = DriverState::<N>::new(&opts, sockets);
+  #[cfg(feature = "stats")]
+  {
+    *stats_out = Some(state.stats.clone());
+  }
   <N::Runtime as RuntimeLite>::spawn_detach(driver_task::<N>(state, cmd_rx, max_send, max_recv));
 }
 
@@ -1479,12 +1560,32 @@ async fn driver_task<N: Net>(
   if let Some(sock) = state.v4.clone() {
     let tx = packet_tx.clone();
     let sd = shutdown_rx.clone();
-    <N::Runtime as RuntimeLite>::spawn_detach(recv_loop::<N>(sock, tx, sd, true, max_recv));
+    #[cfg(feature = "stats")]
+    let stats = state.stats.clone();
+    <N::Runtime as RuntimeLite>::spawn_detach(recv_loop::<N>(
+      sock,
+      tx,
+      sd,
+      true,
+      max_recv,
+      #[cfg(feature = "stats")]
+      stats,
+    ));
   }
   if let Some(sock) = state.v6.clone() {
     let tx = packet_tx.clone();
     let sd = shutdown_rx.clone();
-    <N::Runtime as RuntimeLite>::spawn_detach(recv_loop::<N>(sock, tx, sd, false, max_recv));
+    #[cfg(feature = "stats")]
+    let stats = state.stats.clone();
+    <N::Runtime as RuntimeLite>::spawn_detach(recv_loop::<N>(
+      sock,
+      tx,
+      sd,
+      false,
+      max_recv,
+      #[cfg(feature = "stats")]
+      stats,
+    ));
   }
   drop(packet_tx);
   drop(shutdown_rx); // recv loops hold their own clones; the sender stays with us.
@@ -1614,6 +1715,7 @@ async fn recv_loop<N: Net>(
   shutdown: async_channel::Receiver<()>,
   via_v4: bool,
   max_recv: usize,
+  #[cfg(feature = "stats")] stats: std::sync::Arc<hick_trace::stats::Stats>,
 ) {
   // RFC 6762 §17: outgoing mDNS messages should fit in the path MTU
   // (~1500 bytes for Ethernet), but receivers MUST be prepared to accept
@@ -1655,6 +1757,12 @@ async fn recv_loop<N: Net>(
       match hick_udp::recv_with_meta(fd, &mut buf, via_v4) {
         Ok(meta) => {
           let n = meta.len();
+          hick_trace::trace!(src = %meta.peer(), len = n, via_v4, "recv datagram");
+          #[cfg(feature = "stats")]
+          {
+            stats.packets_rx(1);
+            stats.bytes_rx(n as u64);
+          }
           let data = buf.get(..n).unwrap_or(&buf).to_vec();
           let pkt = Packet {
             src: meta.peer(),
@@ -1686,6 +1794,8 @@ async fn recv_loop<N: Net>(
         // receive task.
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
           hick_trace::debug!(error = %e, via_v4, "dropping unusable datagram");
+          #[cfg(feature = "stats")]
+          stats.packets_dropped(1);
           continue;
         }
         Err(_e) => {
@@ -1736,6 +1846,12 @@ async fn recv_loop<N: Net>(
       match hick_udp::recv_with_meta(raw, &mut buf, via_v4) {
         Ok(meta) => {
           let n = meta.len();
+          hick_trace::trace!(src = %meta.peer(), len = n, via_v4, "recv datagram");
+          #[cfg(feature = "stats")]
+          {
+            stats.packets_rx(1);
+            stats.bytes_rx(n as u64);
+          }
           let data = buf.get(..n).unwrap_or(&buf).to_vec();
           let pkt = Packet {
             src: meta.peer(),
@@ -1757,6 +1873,8 @@ async fn recv_loop<N: Net>(
         // keep serving rather than killing the receive task.
         Err(ref e) if e.raw_os_error() == Some(WSAEMSGSIZE) => {
           hick_trace::debug!(via_v4, "dropping oversized datagram (WSAEMSGSIZE)");
+          #[cfg(feature = "stats")]
+          stats.packets_dropped(1);
           continue;
         }
         Err(_e) => {
@@ -1780,6 +1898,12 @@ async fn recv_loop<N: Net>(
       };
       match recv_result {
         Ok((n, src)) => {
+          hick_trace::trace!(src = %src, len = n, via_v4, "recv datagram");
+          #[cfg(feature = "stats")]
+          {
+            stats.packets_rx(1);
+            stats.bytes_rx(n as u64);
+          }
           let data = buf.get(..n).unwrap_or(&buf).to_vec();
           let local_ip = if via_v4 {
             IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)

@@ -27,17 +27,21 @@ use crate::udpio::{RecvMeta, SendError, UdpIo};
 /// (so the engine still counts it against the per-pump RX cap — see below).
 fn recv_from(socket: &mut udp::Socket<'_>, buf: &mut [u8]) -> Option<RecvMeta> {
   match socket.recv_slice(buf) {
-    Ok((len, meta)) => Some(RecvMeta {
-      src: meta.endpoint.into(),
-      local: meta.local_address.map(Into::into),
-      // smoltcp's `udp::Socket` UDP metadata (`UdpMetadata`) exposes no received
-      // hop-limit — verified against 0.13.1 (only `endpoint` / `local_address` /
-      // `meta`) — so this is `None` and the engine's §11 RECEIVE gate falls back to
-      // the source-subnet heuristic (`onlink::on_link`). The §11 TRANSMIT invariant
-      // (TTL 255 out) is enforced separately in `send_from`, not here.
-      hop_limit: None,
-      len,
-    }),
+    Ok((len, meta)) => {
+      #[cfg(feature = "defmt")]
+      defmt::trace!("smoltcp recv_from: {} bytes", len);
+      Some(RecvMeta {
+        src: meta.endpoint.into(),
+        local: meta.local_address.map(Into::into),
+        // smoltcp's `udp::Socket` UDP metadata (`UdpMetadata`) exposes no received
+        // hop-limit — verified against 0.13.1 (only `endpoint` / `local_address` /
+        // `meta`) — so this is `None` and the engine's §11 RECEIVE gate falls back to
+        // the source-subnet heuristic (`onlink::on_link`). The §11 TRANSMIT invariant
+        // (TTL 255 out) is enforced separately in `send_from`, not here.
+        hop_limit: None,
+        len,
+      })
+    }
     Err(udp::RecvError::Exhausted) => None,
     // An oversized datagram was DROPPED (recv_slice already dequeued it). Surface a
     // zero-length marker rather than looping here to find the next fitting datagram:
@@ -63,6 +67,8 @@ fn send_from(socket: &mut udp::Socket<'_>, buf: &[u8], dst: SocketAddr) -> Resul
   if buf.len() > socket.payload_send_capacity() {
     return Err(SendError::TooLarge);
   }
+  #[cfg(feature = "defmt")]
+  defmt::trace!("smoltcp send_from: {} bytes", buf.len());
   // RFC 6762 §11: EVERY outgoing mDNS packet MUST leave with IP TTL / hop-limit 255,
   // and a conformant receiver rejects anything else (it is the multicast on-link
   // guard — the same gate `onlink::on_link` applies on RX). smoltcp dispatches a UDP

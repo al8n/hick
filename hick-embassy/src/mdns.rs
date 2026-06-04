@@ -117,6 +117,12 @@ impl<R: Rng> MdnsState<R> {
     self.engine.borrow_mut().poll_endpoint_event()
   }
 
+  /// Take a consistent point-in-time snapshot of every I/O counter and gauge.
+  #[cfg(feature = "stats")]
+  pub fn stats(&self) -> hick_trace::stats::StatsSnapshot {
+    self.engine.borrow().stats()
+  }
+
   /// Run the mDNS driver loop over the given v4 and/or v6 sockets until the task
   /// is dropped. Never returns; spawn it as an embassy task.
   ///
@@ -133,9 +139,13 @@ impl<R: Rng> MdnsState<R> {
     // RFC 6762 §11: force hop-limit 255 on egress while we still hold `&mut`.
     if let Some(s) = v4.as_deref_mut() {
       s.set_hop_limit(Some(255));
+      #[cfg(feature = "defmt")]
+      defmt::debug!("hick-embassy MdnsState: v4 hop-limit set to 255 (RFC 6762 §11)");
     }
     if let Some(s) = v6.as_deref_mut() {
       s.set_hop_limit(Some(255));
+      #[cfg(feature = "defmt")]
+      defmt::debug!("hick-embassy MdnsState: v6 hop-limit set to 255 (RFC 6762 §11)");
     }
     loop {
       let deadline = {
@@ -147,6 +157,8 @@ impl<R: Rng> MdnsState<R> {
       // deadline elapses, or a handle signals new work.
       match deadline {
         Some(d) => {
+          #[cfg(feature = "defmt")]
+          defmt::trace!("hick-embassy MdnsState: waiting for recv, deadline, or wake signal");
           let _ = select3(
             wait_either_recv(v4.as_deref(), v6.as_deref()),
             Timer::at(d.0),
@@ -155,6 +167,8 @@ impl<R: Rng> MdnsState<R> {
           .await;
         }
         None => {
+          #[cfg(feature = "defmt")]
+          defmt::trace!("hick-embassy MdnsState: no deadline, waiting for recv or wake signal");
           let _ = select(
             wait_either_recv(v4.as_deref(), v6.as_deref()),
             self.wake.wait(),

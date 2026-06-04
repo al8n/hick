@@ -301,6 +301,12 @@ pub(crate) struct State {
   /// [`crate::ServerOptions::max_recv_packet_size`] (RFC 6762 §17 requires
   /// implementations to accept up to 9000 bytes by default).
   pub(crate) max_recv: usize,
+  /// Shared stats handle cloned from the proto endpoint. Present only when
+  /// the `stats` Cargo feature is enabled. Stored here so the public
+  /// `Endpoint::stats()` accessor can reach it without a command-channel
+  /// round-trip.
+  #[cfg(feature = "stats")]
+  pub(crate) stats: std::sync::Arc<hick_trace::stats::Stats>,
 }
 
 impl State {
@@ -313,8 +319,11 @@ impl State {
     // rand 0.10 removed `from_entropy`; seed StdRng from the OS-seeded
     // thread RNG (same idiom as `hick-reactor::driver::DriverState::new`).
     let rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
+    let endpoint = ProtoEndpoint::try_new(cfg, rng);
+    #[cfg(feature = "stats")]
+    let stats = endpoint.stats_handle();
     Self {
-      endpoint: ProtoEndpoint::try_new(cfg, rng),
+      endpoint,
       services: HashMap::new(),
       queries: HashMap::new(),
       recent_sends: Vec::new(),
@@ -323,6 +332,8 @@ impl State {
       local_subnets: Vec::new(),
       max_payload,
       max_recv,
+      #[cfg(feature = "stats")]
+      stats,
     }
   }
 
@@ -853,6 +864,13 @@ impl State {
       )
     };
     if !on_link {
+      hick_trace::debug!(
+        src = %meta.peer(),
+        hop_limit = ?meta.hop_limit(),
+        "dropping off-link packet (RFC 6762 §11 trust boundary)"
+      );
+      #[cfg(feature = "stats")]
+      self.stats.packets_dropped(1);
       return;
     }
 
@@ -864,6 +882,12 @@ impl State {
     if data.get(2).is_some_and(|b| b & 0x80 != 0)
       && meta.peer().port() != hick_udp::constants::MDNS_PORT
     {
+      hick_trace::debug!(
+        src = %meta.peer(),
+        "dropping untrusted response (source port != 5353) before self-send match"
+      );
+      #[cfg(feature = "stats")]
+      self.stats.packets_dropped(1);
       return;
     }
 
@@ -1076,18 +1100,40 @@ pub(crate) async fn run(
         let mut sent_any = false;
         if let Some(s4) = sock_v4.as_ref() {
           let when = SystemTime::now();
-          if s4.send_to(&scratch[..n], MDNS_V4_DST, None).await.is_ok() {
+          let res = s4.send_to(&scratch[..n], MDNS_V4_DST, None).await;
+          if res.is_ok() {
+            hick_trace::trace!(dst = %MDNS_V4_DST, len = n, "send_to v4");
             let mut state = inner.state.borrow_mut();
             crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
+            #[cfg(feature = "stats")]
+            {
+              state.stats.packets_tx(1);
+              state.stats.bytes_tx(n as u64);
+            }
             sent_any = true;
+          } else {
+            hick_trace::debug!(dst = %MDNS_V4_DST, "send_to v4 failed");
+            #[cfg(feature = "stats")]
+            inner.state.borrow().stats.send_errors(1);
           }
         }
         if let Some(s6) = sock_v6.as_ref() {
           let when = SystemTime::now();
-          if s6.send_to(&scratch[..n], MDNS_V6_DST, None).await.is_ok() {
+          let res = s6.send_to(&scratch[..n], MDNS_V6_DST, None).await;
+          if res.is_ok() {
+            hick_trace::trace!(dst = %MDNS_V6_DST, len = n, "send_to v6");
             let mut state = inner.state.borrow_mut();
             crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
+            #[cfg(feature = "stats")]
+            {
+              state.stats.packets_tx(1);
+              state.stats.bytes_tx(n as u64);
+            }
             sent_any = true;
+          } else {
+            hick_trace::debug!(dst = %MDNS_V6_DST, "send_to v6 failed");
+            #[cfg(feature = "stats")]
+            inner.state.borrow().stats.send_errors(1);
           }
         }
         // `delivered` ⇔ at least one family reached the wire.
@@ -1108,8 +1154,18 @@ pub(crate) async fn run(
           // inbound copy of this datagram (from the loopback / multicast echo)
           // is classified as our own.  Only record on a successful send.
           if res.is_ok() {
+            hick_trace::trace!(dst = %dst, len = n, "send_to");
             let mut state = inner.state.borrow_mut();
             crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
+            #[cfg(feature = "stats")]
+            {
+              state.stats.packets_tx(1);
+              state.stats.bytes_tx(n as u64);
+            }
+          } else {
+            hick_trace::debug!(dst = %dst, "send_to failed");
+            #[cfg(feature = "stats")]
+            inner.state.borrow().stats.send_errors(1);
           }
           res.is_ok()
         } else {
@@ -1187,21 +1243,43 @@ pub(crate) async fn run(
       let mut sent_any = false;
       if let Some(s4) = sock_v4.as_ref() {
         let when = SystemTime::now();
-        if s4.send_to(&data, MDNS_V4_DST, None).await.is_ok() {
+        let res = s4.send_to(&data, MDNS_V4_DST, None).await;
+        if res.is_ok() {
+          hick_trace::trace!(dst = %MDNS_V4_DST, len = data.len(), "goodbye send_to v4");
           let mut state = inner.state.borrow_mut();
           crate::selfsend::record_self_send(&mut state.recent_sends, &data, when);
+          #[cfg(feature = "stats")]
+          {
+            state.stats.packets_tx(1);
+            state.stats.bytes_tx(data.len() as u64);
+          }
           sent_any = true;
+        } else {
+          hick_trace::debug!(dst = %MDNS_V4_DST, "goodbye send_to v4 failed");
+          #[cfg(feature = "stats")]
+          inner.state.borrow().stats.send_errors(1);
         }
       }
       if let Some(s6) = sock_v6.as_ref() {
         let when = SystemTime::now();
-        if s6.send_to(&data, MDNS_V6_DST, None).await.is_ok() {
+        let res = s6.send_to(&data, MDNS_V6_DST, None).await;
+        if res.is_ok() {
+          hick_trace::trace!(dst = %MDNS_V6_DST, len = data.len(), "goodbye send_to v6");
           let mut state = inner.state.borrow_mut();
           crate::selfsend::record_self_send(&mut state.recent_sends, &data, when);
+          #[cfg(feature = "stats")]
+          {
+            state.stats.packets_tx(1);
+            state.stats.bytes_tx(data.len() as u64);
+          }
           sent_any = true;
+        } else {
+          hick_trace::debug!(dst = %MDNS_V6_DST, "goodbye send_to v6 failed");
+          #[cfg(feature = "stats")]
+          inner.state.borrow().stats.send_errors(1);
         }
       }
-      let _ = sent_any; // Failure-to-send is logged via send_to's Result.
+      let _ = sent_any; // Failure-to-send logged above.
       // Decrement remaining and re-arm next_at regardless of send outcome —
       // an entry that can't reach the wire still drains its budget so it
       // doesn't pin the goodbye queue forever.
@@ -1369,9 +1447,23 @@ pub(crate) async fn run(
 
 #[inline]
 fn handle_recv(inner: &Rc<EndpointInner>, r: std::io::Result<(Vec<u8>, RecvMeta)>) {
-  if let Ok((data, meta)) = r {
-    let mut s = inner.state.borrow_mut();
-    s.handle_datagram(&meta, &data);
+  match r {
+    Ok((data, meta)) => {
+      hick_trace::trace!(src = %meta.peer(), len = data.len(), "recv datagram");
+      #[cfg(feature = "stats")]
+      {
+        let s = inner.state.borrow();
+        s.stats.packets_rx(1);
+        s.stats.bytes_rx(data.len() as u64);
+      }
+      let mut s = inner.state.borrow_mut();
+      s.handle_datagram(&meta, &data);
+    }
+    Err(_e) => {
+      hick_trace::debug!(error = %_e, "socket recv failed; dropping datagram");
+      #[cfg(feature = "stats")]
+      inner.state.borrow().stats.packets_dropped(1);
+    }
   }
 }
 
