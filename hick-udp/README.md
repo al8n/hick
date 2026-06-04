@@ -46,6 +46,20 @@ capability matrix gates the platform-specific `cmsg` paths.
 hick-udp = "0.5"
 ```
 
+## Feature flags
+
+| Feature | Description |
+|---------|-------------|
+| `tracing` | Emit `tracing` warn events on socket bind or multicast-join failures. |
+| `stats` | Enable `hick-trace` stats counters (forwarded from the driver layer; `no_std`-safe). |
+| `metrics` | Bridge stats counters to the [`metrics`] facade. Implies `stats`. |
+
+## Observability
+
+When `tracing` is enabled, `hick-udp` emits `WARN`-level `tracing` events
+when a socket bind or multicast group join fails. These help diagnose
+interface-selection and permission issues without requiring a debugger.
+
 ## The hick family
 
 [`hick`] (facade) · [`mdns-proto`] (Sans-I/O core) · **`hick-udp`** (this crate)
@@ -67,6 +81,7 @@ Copyright (c) 2025 Al Liu.
 [`hick-compio`]: https://crates.io/crates/hick-compio
 [`hick-smoltcp`]: https://crates.io/crates/hick-smoltcp
 [`hick-embassy`]: https://crates.io/crates/hick-embassy
+[`metrics`]: https://crates.io/crates/metrics
 [hick]: https://github.com/al8n/hick
 [Github-url]: https://github.com/al8n/hick/
 [CI-url]: https://github.com/al8n/hick/actions/workflows/ci.yml

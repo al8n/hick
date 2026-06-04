@@ -69,6 +69,37 @@ loop {
 }
 ```
 
+## Feature flags
+
+| Feature | Description |
+|---------|-------------|
+| `tracing` | Forward structured `tracing` events from `mdns-proto` (requires a `std` subscriber; a no-op on bare-metal without one). |
+| `stats` | Enable `no_std`-safe atomic counters; read a snapshot via `engine.stats()`. |
+| `metrics` | Bridge counters to the [`metrics`] facade. Implies `stats`. |
+| `defmt` | Emit `defmt` log events — the idiomatic choice for bare-metal targets. |
+
+## Observability
+
+For bare-metal targets the recommended logging path is `defmt`:
+
+```toml
+hick-smoltcp = { version = "0.1", features = ["defmt", "stats"] }
+```
+
+Enable `defmt` to have the engine emit structured log events through the
+`defmt` framework at the level your firmware configures.
+
+Enable `stats` and call `engine.stats()` to obtain a
+`hick_trace::stats::StatsSnapshot`:
+
+```rust,ignore
+let snap = engine.stats();
+// snap.packets_rx, snap.cache_size, etc.
+```
+
+The `tracing` feature is available but is a no-op in bare-metal builds that
+do not set up a `tracing` subscriber.
+
 ## Design
 
 - **`no_std` + `alloc`**, panic-free hot path: slab-backed protocol pools, no
@@ -107,6 +138,7 @@ Copyright (c) 2025 Al Liu.
 [`hick-compio`]: https://crates.io/crates/hick-compio
 [`hick-embassy`]: https://crates.io/crates/hick-embassy
 [smoltcp]: https://crates.io/crates/smoltcp
+[`metrics`]: https://crates.io/crates/metrics
 [Github-url]: https://github.com/al8n/hick/
 [CI-url]: https://github.com/al8n/hick/actions/workflows/ci.yml
 [codecov-url]: https://app.codecov.io/gh/al8n/hick/

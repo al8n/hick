@@ -76,6 +76,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Feature flags
+
+| Feature | Description |
+|---------|-------------|
+| `tracing` | Forward structured `tracing` spans/events from the driver and `mdns-proto`. |
+| `stats` | Enable atomic counters; read a snapshot via `endpoint.stats()`. |
+| `metrics` | Bridge counters to the [`metrics`] facade (Prometheus/StatsD). Implies `stats`. |
+
+## Observability
+
+Enable `features = ["tracing"]` to have the driver emit `tracing` events
+during socket I/O, service probing, and query state transitions.
+
+Enable `features = ["stats"]` and call `endpoint.stats()` to obtain a
+`hick_trace::stats::StatsSnapshot`:
+
+```rust,ignore
+let snap = endpoint.stats();
+println!("packets_rx={} services_active={}", snap.packets_rx, snap.services_active);
+```
+
+Enable `features = ["metrics"]` to additionally forward every counter/gauge
+update to the [`metrics`] facade automatically.
+
 ## Design
 
 - `!Send` throughout: no `Arc`, no `Mutex`, no atomics, no MPSC channels.
@@ -107,6 +131,7 @@ Copyright (c) 2025 Al Liu.
 [`hick-smoltcp`]: https://crates.io/crates/hick-smoltcp
 [`hick-embassy`]: https://crates.io/crates/hick-embassy
 [`compio`]: https://crates.io/crates/compio
+[`metrics`]: https://crates.io/crates/metrics
 [Github-url]: https://github.com/al8n/hick/
 [CI-url]: https://github.com/al8n/hick/actions/workflows/ci.yml
 [codecov-url]: https://app.codecov.io/gh/al8n/hick/

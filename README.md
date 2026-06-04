@@ -116,7 +116,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `compio` — drive the `compio` (thread-per-core) runtime via [`hick-compio`].
 - `smoltcp` — expose the bare-metal [`hick-smoltcp`] engine (`no_std` + `alloc`).
 - `embassy` — expose the [`hick-embassy`] async driver (`no_std` + `alloc`).
-- `tracing` — forward `tracing` spans/events from the driver and the proto core.
+- `tracing` — forward structured `tracing` spans/events from every enabled driver and the proto core.
+- `stats` — enable `no_std`-safe atomic counters; read a snapshot via `endpoint.stats()`.
+- `metrics` — bridge counters to the [`metrics`] facade (Prometheus/StatsD exporters). Implies `stats`.
+- `defmt` — forward `defmt` log events to the bare-metal drivers (`hick-smoltcp` / `hick-embassy`). Has no effect when only std drivers are enabled.
+
+## Observability
+
+### `tracing` — structured events and spans
+
+Add `features = ["tracing"]` and install a subscriber in `main`:
+
+```rust,ignore
+fn main() {
+    tracing_subscriber::fmt().init();
+    // … start your endpoint …
+}
+```
+
+The driver task and `mdns-proto` emit `tracing` events at `DEBUG` / `INFO` /
+`WARN` level during probing, service registration, conflict resolution, cache
+updates, and query completion.
+
+### `metrics` — Prometheus / StatsD counters
+
+Add `features = ["metrics"]` and install a recorder before starting the
+endpoint:
+
+```rust,ignore
+// Example using the prometheus exporter from the `metrics-exporter-prometheus` crate:
+metrics_exporter_prometheus::PrometheusBuilder::new().install().unwrap();
+```
+
+All mDNS counters (packets, bytes, cache hits, queries, …) are forwarded
+automatically under `mdns_*` metric names.
+
+### `stats` — polling counters without a recorder
+
+When you only need periodic read-outs without a full metrics exporter,
+enable `stats` and call `endpoint.stats()`:
+
+```rust,ignore
+use hick::tokio::{server, ServerOptions};
+
+let endpoint = server(ServerOptions::default()).await?;
+// … run for a while …
+let snap = endpoint.stats();
+println!("rx={} tx={} cache_size={}", snap.packets_rx, snap.packets_tx, snap.cache_size);
+```
+
+`stats()` returns a `hick_trace::stats::StatsSnapshot` — a plain `Copy`
+struct of `u64` fields covering packets, bytes, cache, queries, services,
+probes, conflicts, and more. See the [`hick-trace`] crate for the full list.
+
+### `defmt` — bare-metal embedded logging
+
+For `no_std` targets using `hick-smoltcp` or `hick-embassy`, enable `defmt`
+instead of (or alongside) `stats`. Log events are forwarded through the
+`defmt` framework. On std drivers this feature is a no-op.
+
+Per-crate observability details: [`hick-trace`] (shim) · [`mdns-proto`] ·
+[`hick-reactor`] · [`hick-compio`] · [`hick-smoltcp`] · [`hick-embassy`] ·
+[`hick-udp`].
 
 ## License
 
@@ -129,11 +190,13 @@ Copyright (c) 2025 Al Liu.
 
 [`hick`]: https://crates.io/crates/hick
 [`mdns-proto`]: https://crates.io/crates/mdns-proto
+[`hick-trace`]: https://crates.io/crates/hick-trace
 [`hick-udp`]: https://crates.io/crates/hick-udp
 [`hick-reactor`]: https://crates.io/crates/hick-reactor
 [`hick-compio`]: https://crates.io/crates/hick-compio
 [`hick-smoltcp`]: https://crates.io/crates/hick-smoltcp
 [`hick-embassy`]: https://crates.io/crates/hick-embassy
+[`metrics`]: https://crates.io/crates/metrics
 [RFC 6762]: https://www.rfc-editor.org/rfc/rfc6762
 [RFC 6763]: https://www.rfc-editor.org/rfc/rfc6763
 [Github-url]: https://github.com/al8n/hick/

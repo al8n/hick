@@ -54,6 +54,10 @@ rand_core = { version = "0.10" }
 proptest = "1.5"
 no-panic = "0.1"
 rand = "0.10"
+slab = "0.4"
+# Used only by the tracing smoke test (gated #[cfg(feature = "tracing")]).
+tracing = { version = "0.1", optional = false, default-features = false, features = ["std"] }
+tracing-core = { version = "0.1", default-features = false }
 
 [package.metadata.docs.rs]
 all-features = true
