@@ -4,6 +4,9 @@
 use core::time::Duration;
 
 #[cfg(any(feature = "alloc", feature = "std"))]
+use bytes::Bytes;
+
+#[cfg(any(feature = "alloc", feature = "std"))]
 use crate::Instant;
 #[cfg(any(feature = "alloc", feature = "std"))]
 use crate::Name;
@@ -25,7 +28,7 @@ pub struct CacheEntry<I: Instant> {
   /// but class != IN could corrupt the cache across protocol identity
   /// boundaries.
   rclass: ResourceClass,
-  rdata: std::vec::Vec<u8>,
+  rdata: Bytes,
   expires_at: I,
   /// When this record was last received / refreshed.  used to
   /// implement the RFC 6762 §10.2 "1-second grace" on cache-flush —
@@ -44,7 +47,7 @@ impl<I: Instant> CacheEntry<I> {
     name: Name,
     rtype: ResourceType,
     rclass: ResourceClass,
-    rdata: std::vec::Vec<u8>,
+    rdata: Bytes,
     expires_at: I,
     received_at: I,
   ) -> Self {
@@ -79,7 +82,7 @@ impl<I: Instant> CacheEntry<I> {
   /// The record's raw rdata bytes.
   #[inline(always)]
   pub fn rdata_slice(&self) -> &[u8] {
-    &self.rdata
+    self.rdata.as_ref()
   }
 
   /// Absolute expiration deadline.
@@ -206,7 +209,7 @@ where
     name: Name,
     rtype: ResourceType,
     rclass: ResourceClass,
-    rdata: std::vec::Vec<u8>,
+    rdata: impl Into<Bytes>,
     ttl: Duration,
     now: I,
     cache_flush: bool,
@@ -221,6 +224,7 @@ where
       // here (the cache is empty by construction), so just bail.
       return Ok(None);
     }
+    let rdata: Bytes = rdata.into();
     // TTL=0 → goodbye (RFC 6762 §10.1). Do NOT delete immediately: shorten the
     // matching entry to expire in ONE SECOND. This gives any responder still
     // using the record a window to rescue it (a positive-TTL re-announce before
@@ -235,7 +239,7 @@ where
           if entry.rtype() == rtype
             && entry.rclass() == rclass
             && entry.name().as_str() == name.as_str()
-            && entry.rdata_slice() == rdata.as_slice()
+            && entry.rdata_slice() == rdata.as_ref()
           {
             victim = Some(key);
             break;
@@ -283,7 +287,7 @@ where
             Some(d) => d < Duration::from_secs(1),
             None => true, // received_at in the future — treat as recent
           };
-          if recent || entry.rdata_slice() == rdata.as_slice() {
+          if recent || entry.rdata_slice() == rdata.as_ref() {
             continue;
           }
           // Only clamp if it would shorten the deadline.
@@ -309,7 +313,7 @@ where
       if entry.rtype() == rtype
         && entry.rclass() == rclass
         && entry.name().as_str() == name.as_str()
-        && entry.rdata_slice() == rdata.as_slice()
+        && entry.rdata_slice() == rdata.as_ref()
       {
         update_key = Some(key);
         break;
