@@ -1,0 +1,87 @@
+name: interop-parity
+
+# Real-daemon interop: drive hick against the actual reference implementations
+# (Apple Bonjour / mDNSResponder on macOS, Avahi on Linux) over real multicast,
+# both directions. This is the highest-fidelity parity signal but is
+# environment-sensitive (multicast on a shared CI runner), so it lives in its
+# own workflow and is intended to be NON-REQUIRED (allowed-failure) in branch
+# protection — a transient multicast hiccup must not block unrelated PRs. Each
+# test step retries once to absorb transient timing flakiness.
+#
+# Deterministic, always-required parity lives elsewhere: the golden-replay test
+# (`mdns-proto/tests/golden_parity.rs`) asserts hick parses a real captured
+# Bonjour announcement byte-for-byte, with no network, in the normal CI run.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.txt"
+      - "art/**"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.txt"
+      - "art/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Opt-in switch the parity tests check; without it they self-skip.
+  HICK_PARITY: "1"
+
+jobs:
+  bonjour-macos:
+    name: Parity (Bonjour / macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Bonjour (mDNSResponder) is built in on macOS; nothing to install. hick
+      # and the daemon coexist on :5353 via SO_REUSEPORT.
+      - name: hick <-> Bonjour (dns-sd) interop
+        run: |
+          for attempt in 1 2; do
+            if cargo test -p hick-reactor --test parity_bonjour -- --test-threads=1 --nocapture; then
+              exit 0
+            fi
+            echo "::warning::Bonjour parity attempt $attempt failed; retrying"
+            sleep 3
+          done
+          exit 1
+
+  avahi-linux:
+    name: Parity (Avahi / Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install + start Avahi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y avahi-daemon avahi-utils
+          # The daemon needs the system D-Bus; start both, tolerating either
+          # systemd or sysv-init on the runner image.
+          sudo systemctl start dbus avahi-daemon \
+            || (sudo service dbus start && sudo service avahi-daemon start) \
+            || true
+          sleep 3
+          avahi-browse --version || true
+          systemctl is-active avahi-daemon || true
+      - name: hick <-> Avahi (avahi-utils) interop
+        run: |
+          for attempt in 1 2; do
+            if cargo test -p hick-reactor --test parity_avahi -- --test-threads=1 --nocapture; then
+              exit 0
+            fi
+            echo "::warning::Avahi parity attempt $attempt failed; retrying"
+            sleep 3
+          done
+          exit 1
