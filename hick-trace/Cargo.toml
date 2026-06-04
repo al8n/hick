@@ -1,0 +1,23 @@
+[package]
+name = "hick-trace"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+license = "MIT OR Apache-2.0"
+description = "Tracing-or-noop diagnostic macro shim and backend-agnostic stats/metrics primitives for the hick mDNS stack."
+repository = "https://github.com/al8n/hick"
+readme = "README.md"
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+metrics = ["dep:metrics", "stats"]
+stats = ["dep:portable-atomic"]
+
+[dependencies]
+tracing = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+portable-atomic = { workspace = true, optional = true }
+
+[lints]
+workspace = true

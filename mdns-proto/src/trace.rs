@@ -1,30 +1,9 @@
-//! Tracing-feature shim. Exposes a small set of macros (`trace!`, `debug!`,
-//! `info!`, `warn!`) that compile to actual `tracing` calls when the
-//! `tracing` Cargo feature is enabled and to no-ops otherwise.
+//! Tracing shim. Delegates to `hick_trace` which resolves to real `tracing`
+//! calls when the `tracing` Cargo feature is enabled, and to token-discarding
+//! no-ops otherwise.
 //!
-//! Using this shim keeps `tracing` truly optional — no transitive `tracing`
-//! dep is pulled in on default builds — while letting trace sites read
-//! naturally at the call site.
+//! The re-exports are only compiled when at least one of `std` or `alloc` is
+//! active — those are the only build tiers that have call sites.
 
-#[cfg(feature = "tracing")]
-#[allow(unused_imports)]
-pub(crate) use tracing::{debug, info, trace, warn};
-
-#[cfg(not(feature = "tracing"))]
-#[allow(unused_macros)]
-macro_rules! trace_noop {
-  ($($tt:tt)*) => {{}};
-}
-
-#[cfg(not(feature = "tracing"))]
-#[allow(unused_imports)]
-pub(crate) use trace_noop as trace;
-#[cfg(not(feature = "tracing"))]
-#[allow(unused_imports)]
-pub(crate) use trace_noop as debug;
-#[cfg(not(feature = "tracing"))]
-#[allow(unused_imports)]
-pub(crate) use trace_noop as info;
-#[cfg(not(feature = "tracing"))]
-#[allow(unused_imports)]
-pub(crate) use trace_noop as warn;
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub(crate) use hick_trace::{debug, trace};

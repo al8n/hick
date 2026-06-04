@@ -15,11 +15,14 @@ readme = "README.md"
 
 [features]
 default = []
-tracing = ["mdns-proto/tracing"]
+tracing = ["mdns-proto/tracing", "hick-trace/tracing"]
+metrics = ["mdns-proto/metrics", "hick-trace/metrics"]
+stats = ["mdns-proto/stats", "hick-trace/stats"]
 
 [dependencies]
 mdns-proto = { workspace = true, features = ["std", "slab"] }
 hick-udp.workspace = true
+hick-trace = { workspace = true }
 compio = { version = "0.18", features = ["time"] }
 compio-net = "0.11"
 compio-io = "0.9"
@@ -31,7 +34,6 @@ getifs = "0.6"
 slab = "0.4"
 rand = "0.10"
 thiserror = "2"
-tracing = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

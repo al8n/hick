@@ -1,15 +1,19 @@
 [workspace]
-members = ["hick", "mdns-proto", "hick-udp", "hick-reactor", "hick-compio", "hick-smoltcp", "hick-embassy"]
+members = ["hick", "hick-trace", "mdns-proto", "hick-udp", "hick-reactor", "hick-compio", "hick-smoltcp", "hick-embassy"]
 resolver = "3"
 
 [workspace.dependencies]
 hick = { version = "0.1", path = "hick", default-features = false }
+hick-trace = { version = "0.1", path = "hick-trace", default-features = false }
 mdns-proto = { version = "0.5", path = "mdns-proto", default-features = false }
 hick-udp = { version = "0.5", path = "hick-udp", default-features = false }
 hick-reactor = { version = "0.6", path = "hick-reactor", default-features = false }
 hick-compio = { version = "0.1", path = "hick-compio", default-features = false }
 hick-smoltcp = { version = "0.1", path = "hick-smoltcp", default-features = false }
 hick-embassy = { version = "0.1", path = "hick-embassy", default-features = false }
+tracing = { version = "0.1", default-features = false }
+metrics = { version = "0.24", default-features = false }
+portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"
