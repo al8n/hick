@@ -32,25 +32,25 @@ tracing = { workspace = true, optional = true, features = ["attributes", "std"] 
 agnostic-net = { version = "0.3" }
 agnostic-lite = { version = "0.6" }
 async-channel = "2"
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-getifs = "0.6"
+futures = { workspace = true, features = ["std", "async-await"] }
+getifs = { workspace = true }
 pin-project-lite = "0.2"
-rand = "0.10"
-slab = "0.4"
-smol_str = "0.3"
-thiserror = "2"
+rand = { workspace = true, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
+slab = { workspace = true, features = ["std"] }
+smol_str = { workspace = true, features = ["std"] }
+thiserror = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 agnostic-net = { version = "0.3", features = ["tokio", "smol"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 # Always-enabled subscriber installed before the unit-test run (see trace_cov)
 # so the instrumentation call sites evaluate their fields and earn coverage.
-tracing-core = "0.1"
-ctor = "0.2"
+tracing-core = { workspace = true }
+ctor = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 smol = "2"
 # Pin the loopback interface in the end-to-end driver integration tests.
-getifs = "0.6"
+getifs = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -44,28 +44,28 @@ stats = ["hick-trace/stats", "alloc"]
 test-no-panic = []
 
 [dependencies]
-thiserror = { version = "2.0", default-features = false }
-derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
-rand_core = { version = "0.10", default-features = false }
-smol_str = { version = "0.3", default-features = false, optional = true }
+thiserror = { workspace = true }
+derive_more = { workspace = true }
+rand_core = { workspace = true }
+smol_str = { workspace = true, optional = true }
 bytes = { version = "1", default-features = false, optional = true }
-rand = { version = "0.10", default-features = false, features = ["std_rng"], optional = true }
-slab = { version = "0.4", default-features = false, optional = true }
+rand = { workspace = true, features = ["std_rng"], optional = true }
+slab = { workspace = true, optional = true }
 heapless = { version = "0.9", optional = true }
 hick-trace = { workspace = true }
 
 [dev-dependencies]
-rand_core = { version = "0.10" }
-proptest = "1.5"
+rand_core = { workspace = true }
+proptest = "1"
 no-panic = "0.1"
-rand = "0.10"
-slab = "0.4"
+rand = { workspace = true, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
+slab = { workspace = true, features = ["std"] }
 # Used only by the tracing smoke test (gated #[cfg(feature = "tracing")]).
-tracing = { version = "0.1", optional = false, default-features = false, features = ["std"] }
-tracing-core = { version = "0.1", default-features = false }
+tracing = { workspace = true, features = ["std"] }
+tracing-core = { workspace = true }
 # Installs an always-enabled subscriber before the unit-test run (see trace::cov)
 # so the instrumentation call sites evaluate their fields and earn coverage.
-ctor = "0.2"
+ctor = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

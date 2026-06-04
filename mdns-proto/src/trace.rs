@@ -54,7 +54,7 @@ mod cov {
     }
   }
 
-  #[ctor::ctor]
+  #[ctor::ctor(unsafe)]
   fn install() {
     // Runs once at test-binary load, before libtest spawns any test thread.
     // Ignore the error: another global default would only mean coverage is

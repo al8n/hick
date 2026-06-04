@@ -18,14 +18,14 @@ stats = ["hick-trace/stats"]
 
 [dependencies]
 hick-trace = { workspace = true }
-thiserror = "2.0"
-derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
-getifs = "0.6"
+thiserror = { workspace = true, features = ["std"] }
+derive_more = { workspace = true }
+getifs = { workspace = true }
 socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["net", "system"] }
-libc = "0.2"
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_IO"] }
