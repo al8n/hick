@@ -2067,17 +2067,33 @@ where
         return Err(HandleServiceRenamedError::NameAlreadyRegistered(new_name));
       }
     }
-    // A rename onto a renamed-away old name reclaims it — but the reclaim-cancel of
-    // that name's in-flight DETACHED goodbye is NOT done here. Like a registration
-    //, a rename only RESERVES the name; the renamed service still probes
-    // (~750 ms, RFC 6762 §8.1) before it advertises, and may conflict/rename away
-    // again before announcing. Cancelling now would lose the old records' retraction
-    // if it never announces (the same premature-cancel class). The
-    // cancel instead fires on the certain live event — `note_service_advertised`
-    // gated on `advertised_instance`, when the renamed service confirms advertising
-    // this name. The rename is still NOT rejected: a detached item holds
-    // no route, so the duplicate-name scan above does not see it, and reuse
-    // proceeds.
+    // Also reject if new_name is HELD by a rename-COLLISION detached goodbye
+    // (holds_name): that dead service's records must be retracted before the name is
+    // reused, and a held item is intentionally NOT cancelled on
+    // advertise — so letting a rename claim it would leave the held goodbye to later
+    // flush the renamed service's records. Treat it like a live-route
+    // collision (the driver retires the renamer, whose caller re-registers). This
+    // mirrors the `try_register_service` holds_name guard.
+    #[cfg(any(feature = "alloc", feature = "std"))]
+    for (_, item) in self.withdrawals.iter() {
+      if item.route.is_none()
+        && item.holds_name
+        && item.records.instance().as_str() == new_name.as_str()
+      {
+        return Err(HandleServiceRenamedError::NameAlreadyRegistered(new_name));
+      }
+    }
+    // A rename onto a RECLAIMABLE (not held) renamed-away old name reclaims it — but
+    // the reclaim-cancel of that name's in-flight DETACHED goodbye is NOT done here.
+    // Like a registration, a rename only RESERVES the name; the renamed
+    // service still probes (~750 ms, RFC 6762 §8.1) before it advertises, and may
+    // conflict/rename away again before announcing. Cancelling now would lose the old
+    // records' retraction if it never announces (the same premature-cancel class as
+    //). The cancel instead fires on the certain live event —
+    // `note_service_advertised` gated on `advertised_instance`, when the renamed
+    // service confirms advertising this name. The rename is still NOT rejected for a
+    // reclaimable name: a detached item holds no route, so the
+    // duplicate-name scan above does not see it, and reuse proceeds.
 
     // Apply the rename.
     if let Some(route) = self.services.get_mut(key) {
@@ -8184,6 +8200,73 @@ mod tests {
     assert!(
       ep.detached_withdrawal_owed_for(&target).is_none(),
       "the detached goodbye is cancelled once S advertises the reclaimed name"
+    );
+  }
+
+  /// an auto-rename onto a HELD (collision) detached name must be
+  /// REJECTED — the held goodbye must complete (retract the dead service's records)
+  /// before reuse, and a held item is intentionally NOT cancelled on advertise,
+  /// so letting a rename claim it would leave the held item to later flush the
+  /// renamed service's records. A RECLAIMABLE detached name stays reusable by rename
+  ///. Mirrors the `try_register_service` holds_name guard.
+  #[test]
+  fn rename_onto_a_held_detached_name_is_rejected_reclaimable_is_not() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let held = Name::try_from_str("Held._ipp._tcp.local.").unwrap();
+    let reclaimable = Name::try_from_str("Reclaim._ipp._tcp.local.").unwrap();
+
+    // A live service S that will try to rename.
+    let s_recs = ServiceRecords::new(
+      stype.clone(),
+      Name::try_from_str("S._ipp._tcp.local.").unwrap(),
+      host.clone(),
+      631,
+      120,
+    );
+    let (s, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(s_recs),
+        now,
+      )
+      .unwrap();
+
+    let mk = |name: &Name| crate::service::RenameGoodbyeHandoff {
+      records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+    };
+    // A HELD (collision) detached goodbye for `held`, and a RECLAIMABLE one.
+    ep.enqueue_rename_withdrawal(mk(&held), now, true);
+    ep.enqueue_rename_withdrawal(mk(&reclaimable), now, false);
+
+    // Renaming S onto the HELD name is REJECTED (retract-before-reuse, ); the
+    // held goodbye is left intact.
+    assert!(
+      ep.handle_service_renamed(s, held.clone()).is_err(),
+      "a rename onto a HELD collision name must be rejected"
+    );
+    assert!(
+      ep.detached_withdrawal_owed_for(&held).is_some(),
+      "the held goodbye is untouched by the rejected rename"
+    );
+
+    // Renaming S onto the RECLAIMABLE name SUCCEEDS.
+    assert!(
+      ep.handle_service_renamed(s, reclaimable.clone()).is_ok(),
+      "a rename onto a RECLAIMABLE detached name must succeed"
+    );
+    assert!(
+      ep.detached_withdrawal_owed_for(&reclaimable).is_some(),
+      "the reclaimable goodbye survives the rename (cancelled only on advertise)"
     );
   }
 
