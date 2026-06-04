@@ -9,6 +9,8 @@
 #![cfg(all(feature = "stats", feature = "tokio"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::{net::Ipv4Addr, time::Duration};
 
 use hick_reactor::{Name, ServerOptions, ServiceRecords, ServiceSpec};

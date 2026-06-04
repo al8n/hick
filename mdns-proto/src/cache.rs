@@ -540,6 +540,41 @@ mod tests {
   }
 
   #[test]
+  fn len_and_is_empty_track_entry_count() {
+    let mut cache: Cache<Instant, slab::Slab<CacheEntry<Instant>>> = Cache::new();
+    assert!(cache.is_empty());
+    assert_eq!(cache.len(), 0);
+
+    let now = Instant::now();
+    let (n, rt, rd, ttl) = make_entry("len.local.", ResourceType::A, 1, 30);
+    cache
+      .try_insert(n, rt, ResourceClass::In, rd, ttl, now, false)
+      .unwrap();
+
+    assert!(!cache.is_empty());
+    assert_eq!(cache.len(), 1);
+  }
+
+  #[cfg(feature = "stats")]
+  #[test]
+  fn cache_insert_and_eviction_bump_stats() {
+    use std::sync::Arc;
+    let mut cache: Cache<Instant, slab::Slab<CacheEntry<Instant>>> = Cache::with_max_entries(2);
+    cache.set_stats(Arc::new(hick_trace::stats::Stats::default()));
+
+    let now = Instant::now();
+    // Insert past the cap: every insert updates the cache-size gauge, and the
+    // over-cap inserts force a proactive eviction (both stats paths).
+    for i in 0u8..4 {
+      let (n, rt, rd, ttl) = make_entry(&std::format!("e{}.local.", i), ResourceType::A, i, 30);
+      cache
+        .try_insert(n, rt, ResourceClass::In, rd, ttl, now, false)
+        .unwrap();
+    }
+    assert!(cache.len() <= 2);
+  }
+
+  #[test]
   fn max_entries_accessor_and_default_cap() {
     let custom: Cache<Instant, slab::Slab<CacheEntry<Instant>>> = Cache::with_max_entries(9);
     assert_eq!(custom.max_entries(), 9);

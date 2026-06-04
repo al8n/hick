@@ -14,6 +14,8 @@ pub mod error;
 pub mod options;
 pub mod query;
 pub mod service;
+#[cfg(all(test, feature = "tracing"))]
+mod trace_cov;
 
 pub use discovery::{DEFAULT_MAX_ENTRIES, Lookup, QueryParam, ServiceEntry};
 pub use endpoint::Endpoint;

@@ -2419,6 +2419,42 @@ mod tests {
   }
 
   #[test]
+  fn handle_rejects_a_malformed_packet_with_a_parse_error() {
+    let mut e = build_endpoint();
+    let now = StdInstant::now();
+    let src = "192.0.2.1:5353".parse().unwrap();
+    let local = "192.0.2.20".parse().unwrap();
+    // A single byte cannot hold a DNS header — parsing must fail and the
+    // endpoint must surface it as `HandleError::Parse`.
+    let res = e.handle(now, src, local, 0, &[0u8], false);
+    assert!(matches!(res, Err(HandleError::Parse(_))));
+  }
+
+  #[test]
+  fn note_service_advertised_is_a_noop_for_an_unknown_handle() {
+    let mut e = build_endpoint();
+    // No registered service → the route lookup misses and the call returns early.
+    e.note_service_advertised(ServiceHandle::from_raw(0xDEAD), &[], &[], false);
+  }
+
+  #[test]
+  fn sibling_retained_addrs_is_empty_for_an_unknown_handle() {
+    let e = build_endpoint();
+    assert!(
+      e.sibling_retained_addrs(ServiceHandle::from_raw(0xBEEF))
+        .is_empty()
+    );
+  }
+
+  #[test]
+  fn advance_after_encode_failure_is_a_noop_for_an_unknown_index() {
+    let mut e = build_endpoint();
+    let now = StdInstant::now();
+    // No withdrawal item at this index → the lookup misses and it returns early.
+    e.advance_after_encode_failure(9999, now, false);
+  }
+
+  #[test]
   fn query_delegation_tolerates_unknown_handles() {
     let mut e = build_endpoint();
     let bogus = QueryHandle::from_raw(0xDEAD);

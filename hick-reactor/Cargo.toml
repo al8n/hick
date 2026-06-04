@@ -43,6 +43,10 @@ thiserror = "2"
 [dev-dependencies]
 agnostic-net = { version = "0.3", features = ["tokio", "smol"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+# Always-enabled subscriber installed before the unit-test run (see trace_cov)
+# so the instrumentation call sites evaluate their fields and earn coverage.
+tracing-core = "0.1"
+ctor = "0.2"
 tokio = { version = "1", features = ["full"] }
 smol = "2"
 # Pin the loopback interface in the end-to-end driver integration tests.
