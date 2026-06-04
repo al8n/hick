@@ -170,6 +170,19 @@ struct DriverState<N: Net> {
   /// state and `clear()`ed each iteration so the per-iteration GC allocates
   /// nothing in steady state.
   completed_withdrawals: Vec<ServiceHandle>,
+  /// Handles whose endpoint withdrawal has COMPLETED (route already freed) but
+  /// whose ctx still holds an un-flushed terminal `ServiceUpdate` in `pending`
+  /// because the bounded `updates` channel was FULL at GC time and the caller is
+  /// still alive (the channel is NOT closed). GCing the ctx now would drop a
+  /// terminal `Conflict`/`HostConflict` that explains the retirement, so the ctx
+  /// is parked here instead. [`Self::drain_withdrawals`] retries the
+  /// flush at the START of every call: as soon as the slow caller drains the
+  /// channel the terminal is delivered and the ctx is GC'd; if the caller drops
+  /// the receiver first, the now-CLOSED channel lets the ctx be GC'd too. While
+  /// this set is non-empty [`Self::next_deadline`] returns a short retry deadline
+  /// — a slow reader draining the channel does NOT wake the driver (we `try_send`,
+  /// never `send().await`), so an otherwise-idle driver must self-wake to retry.
+  deferred_gc: Vec<ServiceHandle>,
   /// this host's directly-attached subnets, the source-address
   /// fallback for the RFC 6762 §11 on-link check on platforms that can't
   /// supply a TTL/Hop-Limit. Empty if interface discovery failed (the
@@ -199,6 +212,7 @@ impl<N: Net> DriverState<N> {
       queries: HashMap::new(),
       recent_sends: Vec::new(),
       completed_withdrawals: Vec::new(),
+      deferred_gc: Vec::new(),
       // scope the §11 source-subnet fallback to the BOUND
       // interface only — not every local NIC (per-packet interface index for
       // delivered PKTINFO is handled separately in recv_with_meta).
@@ -242,6 +256,14 @@ impl<N: Net> DriverState<N> {
       if let Some(t) = self.endpoint.poll_query_timeout(*handle) {
         best = Some(min_opt(best, t));
       }
+    }
+    // A ctx parked for deferred GC holds an un-flushed terminal in a
+    // FULL channel whose caller is still alive. A slow reader draining the
+    // channel does NOT wake us (we `try_send`), so an otherwise-idle driver would
+    // never retry the flush. Fold in a short self-wake deadline so the loop ticks
+    // back into `drain_withdrawals` to re-attempt delivery.
+    if !self.deferred_gc.is_empty() {
+      best = Some(min_opt(best, StdInstant::now() + DEFERRED_GC_RETRY));
     }
     best
   }
@@ -1091,9 +1113,23 @@ impl<N: Net> DriverState<N> {
   /// reachable family has withdrawn its records), and bumps `goodbyes_tx` once per
   /// DELIVERED round. After draining transmits,
   /// [`Endpoint::drain_completed_withdrawals`] frees each completed route
-  /// (decrementing `services_active`) and the driver GCs its ctx — the queued
-  /// `Conflict` already lives in the decoupled `updates` channel, so it survives.
+  /// (decrementing `services_active`) and the driver GCs its ctx.
+  ///
+  /// GC of a completed ctx is conditional on its terminal update being delivered
+  /// or undeliverable: a terminal `Conflict`/`HostConflict` queued at
+  /// an internal retirement lands in `ctx.pending` (not the channel) when the
+  /// channel was FULL at that moment. The best-effort flush here moves it into the
+  /// decoupled channel where it survives the GC — but if the channel is STILL full
+  /// and the caller is STILL alive, the terminal is undelivered, so the ctx is
+  /// parked in [`Self::deferred_gc`] and retried (at the top of every call) rather
+  /// than dropped. A closed channel (caller gone) or an emptied `pending`
+  /// (everything delivered) GCs immediately.
   async fn drain_withdrawals(&mut self, now: StdInstant, scratch: &mut [u8]) {
+    // Retry parked ctxs FIRST: a slow reader may have drained the channel since
+    // the last tick (making room for the terminal), or dropped the receiver
+    // (closing the channel). Either resolves the deferral; otherwise the ctx
+    // stays parked and `next_deadline` keeps the retry timer armed.
+    self.retry_deferred_gc();
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
     // Split-borrow disjoint fields so `send_via` can borrow `recent_sends`/`v4`/
@@ -1145,23 +1181,72 @@ impl<N: Net> DriverState<N> {
       .endpoint
       .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
     while let Some(handle) = self.completed_withdrawals.pop() {
-      // Best-effort flush of this ctx's overflow buffer into the (decoupled)
-      // `async_channel` BEFORE the ctx is dropped. A `Conflict` delivered at an
-      // internal retirement (rename-collision / encode-failure) lands in
-      // `ctx.pending` instead of the channel when the channel was FULL at that
-      // moment; once the ctx is `withdrawing`, `push_updates` skips it, so this is
-      // the last chance to move that buffered `Conflict` into the channel where it
-      // survives the ctx GC and stays readable by the caller. The flush is
-      // best-effort: if the channel is still full it can't help (an inherent
-      // backpressure limit), and a `false` (channel CLOSED — caller already
-      // dropped the receiver) just means there is nobody left to deliver to. We GC
-      // the ctx unconditionally either way: the endpoint has already freed the
-      // route, so unlike smoltcp's coupled queue there is no lazily-held slot to
-      // keep alive.
-      if let Some(ctx) = self.services.get_mut(&handle) {
-        let _ = flush_pending_service_update(ctx);
+      // Flush this ctx's overflow buffer into the (decoupled) `async_channel`
+      // BEFORE deciding whether to drop the ctx. A terminal `Conflict`/
+      // `HostConflict` delivered at an internal retirement (rename-collision /
+      // encode-failure) lands in `ctx.pending` instead of the channel when the
+      // channel was FULL at that moment; once the ctx is `withdrawing`,
+      // `push_updates` skips it, so this is the last chance to move that buffered
+      // terminal into the channel where it survives the ctx GC and stays readable
+      // by the caller. `try_gc_completed_ctx` GCs immediately when the terminal is
+      // delivered (`pending` emptied) or undeliverable-to-nobody (channel CLOSED),
+      // and otherwise PARKS the ctx for a later retry rather than dropping its
+      // un-flushed terminal. The route is already freed either way, so
+      // unlike smoltcp's coupled queue there is no lazily-held slot to keep alive.
+      self.try_gc_completed_ctx(handle);
+    }
+  }
+
+  /// Flush a completed-withdrawal ctx's overflow and either GC it or PARK it for
+  /// a later retry. Shared by the post-pump GC loop and the
+  /// start-of-call deferred retry so both classify the three cases identically:
+  ///
+  /// * channel CLOSED (`flush` returns `false`) — caller dropped the receiver;
+  ///   nobody to deliver to, GC now.
+  /// * `pending` EMPTY after the flush — every update (incl. the terminal) made
+  ///   it into the channel; it survives the GC, GC now.
+  /// * `pending` NON-EMPTY (channel still FULL, caller still alive) — the terminal
+  ///   is undelivered; park the handle in [`Self::deferred_gc`] (the route is
+  ///   already freed, so the ctx is otherwise inert) and retry next tick.
+  fn try_gc_completed_ctx(&mut self, handle: ServiceHandle) {
+    let park = match self.services.get_mut(&handle) {
+      // Channel still has the terminal undelivered (full) but the caller is alive:
+      // `flush` returned `true` AND `pending` is non-empty. Keep the ctx alive.
+      Some(ctx) => flush_pending_service_update(ctx) && !ctx.pending.is_empty(),
+      // Unknown handle (already GC'd) — nothing to do, and never park it.
+      None => false,
+    };
+    if park {
+      // Avoid duplicate parking if this handle is somehow re-completed.
+      if !self.deferred_gc.contains(&handle) {
+        self.deferred_gc.push(handle);
       }
-      self.services.remove(&handle);
+      return;
+    }
+    self.deferred_gc.retain(|h| *h != handle);
+    self.services.remove(&handle);
+  }
+
+  /// Retry every ctx parked for deferred GC. Re-flush each: if the
+  /// channel closed (caller gone) or `pending` drained (terminal delivered), GC
+  /// it and drop it from the parked set; otherwise keep it parked. Runs at the
+  /// top of every [`Self::drain_withdrawals`]; `next_deadline` keeps the loop
+  /// waking on [`DEFERRED_GC_RETRY`] while the set is non-empty.
+  fn retry_deferred_gc(&mut self) {
+    if self.deferred_gc.is_empty() {
+      return;
+    }
+    // Drain into a scratch so `try_gc_completed_ctx` can re-park the still-stuck
+    // ones without aliasing the vector we are iterating. Swapping leaves an empty
+    // `deferred_gc` that `try_gc_completed_ctx` re-populates with only the ctxs
+    // that are still undeliverable.
+    let mut parked = core::mem::take(&mut self.deferred_gc);
+    for handle in parked.drain(..) {
+      self.try_gc_completed_ctx(handle);
+    }
+    // Reuse the now-empty allocation as the next scratch to avoid churn.
+    if self.deferred_gc.is_empty() {
+      self.deferred_gc = parked;
     }
   }
 }
@@ -1195,6 +1280,17 @@ const MAX_CONSECUTIVE_ENCODE_ERRORS: u8 = 3;
 /// overflow slot rather than growing memory without bound under
 /// attacker-driven conflict-rename churn.
 const SERVICE_UPDATE_CAPACITY: usize = 16;
+
+/// Wake interval for retrying a DEFERRED ctx GC. When a service's
+/// withdrawal completes while its bounded `updates` channel is full AND the
+/// caller is still alive, the un-flushed terminal must not be dropped, so the
+/// ctx is parked in [`DriverState::deferred_gc`] and re-flushed on a timer. A
+/// slow reader draining the channel does not wake the driver (sends are
+/// `try_send`, never `send().await`), so the driver self-wakes this often to
+/// retry. Short enough that the terminal reaches a reader promptly once it
+/// makes room, long enough that a wedged (never-draining, never-dropping)
+/// reader only costs a trivial periodic re-check.
+const DEFERRED_GC_RETRY: Duration = Duration::from_millis(50);
 
 /// Try to flush a service's ordered overflow into its bounded channel
 ///. Updates are sent front-to-back in insertion order, stopping
@@ -3346,6 +3442,163 @@ mod tests {
          readable; got {other:?}"
       ),
     }
+
+    drop(reg);
+  }
+
+  /// regression: when a service's withdrawal COMPLETES while its
+  /// bounded `updates` channel is STILL FULL and the caller is STILL ALIVE, the
+  /// terminal `Conflict` queued at retirement sits in `ctx.pending` with no room
+  /// in the channel. The old GC removed the ctx unconditionally, dropping that
+  /// un-flushed Conflict — a slow reader later drained the channel, saw closure,
+  /// and never learned WHY the service was retired. The fix DEFERS the ctx GC:
+  /// the terminal is parked until the reader makes room (or drops the receiver),
+  /// then delivered and the ctx GC'd. This test keeps the channel full PAST
+  /// withdrawal completion, asserts the ctx is NOT dropped (deferred), then frees
+  /// one channel slot, re-pumps, and asserts the Conflict is delivered and the
+  /// ctx is finally GC'd.
+  #[cfg(feature = "tokio")]
+  #[tokio::test]
+  async fn full_channel_retirement_conflict_is_not_lost() {
+    use std::{net::Ipv4Addr, time::Duration};
+
+    use mdns_proto::ServiceUpdate;
+
+    let opts = crate::options::ServerOptions::default();
+    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+      v4: None,
+      v6: None,
+      interface_index: 0,
+    };
+    let mut state = DriverState::new(&opts, sockets);
+    let now = StdInstant::now();
+
+    let mut r = mdns_proto::ServiceRecords::new(
+      mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      mdns_proto::Name::try_from_str("stuck._ipp._tcp.local.").unwrap(),
+      mdns_proto::Name::try_from_str("stuck.local.").unwrap(),
+      631,
+      120,
+    );
+    r.add_a(Ipv4Addr::new(192, 168, 1, 10));
+    let reg = state
+      .register_service(mdns_proto::ServiceSpec::new(r), now)
+      .unwrap();
+    let handle = reg.handle;
+
+    // 1. Drive the proto to an announced state so the withdrawal snapshot is
+    //    NON-empty (otherwise the withdrawal completes instantly and the GC race
+    //    we are testing never arises).
+    {
+      let ctx = state.services.get_mut(&handle).unwrap();
+      let mut buf = vec![0u8; 4096];
+      let mut t = now;
+      for _ in 0..40 {
+        t += Duration::from_millis(300);
+        let _ = ctx.proto.handle_timeout(t);
+        while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
+          ctx.proto.note_transmit_delivered(t);
+        }
+      }
+    }
+
+    // 2. Fill the channel to capacity so the next delivery overflows into
+    //    `pending`, then deliver a `Conflict` — the retirement terminal lands in
+    //    `pending`, NOT the channel. CRUCIALLY we never drain the channel here, so
+    //    it stays full across withdrawal completion (the case).
+    {
+      let ctx = state.services.get_mut(&handle).unwrap();
+      for _ in 0..SERVICE_UPDATE_CAPACITY {
+        assert!(deliver_service_update(ctx, ServiceUpdate::HostConflict));
+      }
+      assert!(deliver_service_update(ctx, ServiceUpdate::Conflict));
+      assert!(
+        ctx
+          .pending
+          .iter()
+          .any(|u| matches!(u, ServiceUpdate::Conflict)),
+        "the Conflict must be buffered in `pending` while the channel is full"
+      );
+    }
+
+    // 3. Begin the endpoint-owned withdrawal — what the rename-collision /
+    //    encode-failure retirement arms do. `push_updates` now skips this ctx.
+    {
+      let ctx = state.services.get_mut(&handle).unwrap();
+      ctx.withdrawing = true;
+      let snap = ctx.proto.withdrawal_snapshot();
+      state.endpoint.begin_withdrawal(handle, snap, now);
+    }
+
+    // 4. Drive the withdrawal to completion WITHOUT draining the channel. With no
+    //    bound family each round fails to deliver, so the endpoint force-completes
+    //    at the 2 s anti-pin ceiling. The GC must NOT drop the ctx: the channel is
+    //    full and the caller is alive, so the terminal is undelivered and the ctx
+    //    is parked for deferred GC instead.
+    let mut scratch = vec![0u8; 4096];
+    let mut t = now;
+    let mut deferred = false;
+    for _ in 0..64 {
+      t += Duration::from_millis(250);
+      state.drain_withdrawals(t, &mut scratch).await;
+      // Once the endpoint has freed the route the ctx is parked, not removed.
+      if state.deferred_gc.contains(&handle) {
+        deferred = true;
+        break;
+      }
+    }
+    assert!(
+      deferred,
+      "a completed withdrawal whose terminal can't be delivered (full channel, \
+       live caller) must PARK the ctx for deferred GC, not drop it"
+    );
+    assert!(
+      state.services.contains_key(&handle),
+      "the parked ctx must still be present (its un-flushed terminal lives in it)"
+    );
+    // While parked, `next_deadline` must arm a short retry timer so a purely-idle
+    // driver still wakes to retry the flush (a slow reader draining the channel
+    // does NOT wake us — sends are `try_send`).
+    let nd = state
+      .next_deadline()
+      .expect("deferred GC must yield a retry deadline");
+    assert!(
+      nd <= StdInstant::now() + DEFERRED_GC_RETRY,
+      "the deferred-GC retry deadline must be within DEFERRED_GC_RETRY"
+    );
+
+    // 5. The slow reader finally drains ONE slot, making room for the terminal.
+    //    Re-pump: `retry_deferred_gc` (top of `drain_withdrawals`) flushes the
+    //    Conflict into the channel and GCs the now-empty ctx.
+    assert!(
+      matches!(reg.updates.try_recv(), Ok(ServiceUpdate::HostConflict)),
+      "draining one slot must surface a buffered filler update"
+    );
+    t += Duration::from_millis(250);
+    state.drain_withdrawals(t, &mut scratch).await;
+    assert!(
+      !state.services.contains_key(&handle),
+      "once the terminal is delivered the parked ctx must finally be GC'd"
+    );
+    assert!(
+      state.deferred_gc.is_empty(),
+      "the GC'd handle must be removed from the deferred set"
+    );
+
+    // 6. The terminal Conflict reached the still-alive reader. Drain the remaining
+    //    fillers, then the Conflict must be present (and is the last meaningful
+    //    update before the channel closes).
+    let mut saw_conflict = false;
+    while let Ok(upd) = reg.updates.try_recv() {
+      if matches!(upd, ServiceUpdate::Conflict) {
+        saw_conflict = true;
+      }
+    }
+    assert!(
+      saw_conflict,
+      "the retirement Conflict must reach the live reader once the full channel \
+       drains — it must NOT be lost to the ctx GC"
+    );
 
     drop(reg);
   }

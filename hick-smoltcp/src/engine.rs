@@ -102,6 +102,13 @@ struct ServiceSlot<I: Instant> {
   /// the `Conflict` deliverable even when the withdrawal completes in the SAME pump
   /// that began it (an empty, never-announced withdrawal completes immediately).
   route_freed: bool,
+  /// Set when the CALLER explicitly retired this service via
+  /// [`Engine::unregister_service`] and may discard the handle WITHOUT polling its
+  /// updates. Unlike an internal retirement, no reader is guaranteed, so the
+  /// completed-withdrawal GC removes the slot regardless of pending updates —
+  /// `route_freed` deferral would otherwise pin it forever and grow `services`
+  /// without bound under register/unregister churn.
+  caller_gone: bool,
 }
 
 impl<I: Instant> ServiceSlot<I> {
@@ -616,6 +623,7 @@ where
         updates: VecDeque::new(),
         errored: false,
         route_freed: false,
+        caller_gone: false,
       },
     );
     Ok(handle)
@@ -639,13 +647,27 @@ where
   /// already-queued `ServiceUpdate::Conflict` still reaches the host, and is GC'd
   /// when the endpoint reports the withdrawal complete.
   pub fn unregister_service(&mut self, handle: ServiceHandle, now: I) {
-    // Mark the slot errored so no further pump polls the (now gone) service for
-    // transmits, then begin its endpoint-owned withdrawal. The slot itself stays
-    // until the withdrawal completes (GC'd in `pump`).
-    if let Some(slot) = self.services.get_mut(&handle) {
-      slot.errored = true;
+    // An already-`route_freed` slot (an internal retirement whose withdrawal
+    // completed, retained only for an un-polled update) has its route freed
+    // already, so an explicit retire that may discard the handle GCs it now rather
+    // than leak it. Otherwise mark the slot errored (so no further pump polls the
+    // now-gone service for transmits) and `caller_gone` (so the completed-
+    // withdrawal GC removes it regardless of pending updates — no reader is
+    // guaranteed), then begin its endpoint-owned withdrawal.
+    let route_freed = match self.services.get_mut(&handle) {
+      Some(slot) if slot.route_freed => true,
+      Some(slot) => {
+        slot.errored = true;
+        slot.caller_gone = true;
+        false
+      }
+      None => return,
+    };
+    if route_freed {
+      self.services.remove(&handle);
+    } else {
+      self.begin_service_withdrawal(handle, now);
     }
-    self.begin_service_withdrawal(handle, now);
   }
 
   /// Start a query. Updates are read via [`Self::poll_query_update`].
@@ -934,7 +956,10 @@ where
       // that began it. A slot with pending updates is marked `route_freed` and GC'd
       // lazily (here on a later pump, or by `poll_service_update` when it drains).
       match self.services.get_mut(&handle) {
-        Some(slot) if slot.updates.is_empty() => {
+        // No pending updates, OR the caller explicitly retired and may have
+        // discarded the handle (`caller_gone`): GC now. Deferring a caller-gone
+        // slot via `route_freed` would leak it forever — no reader remains.
+        Some(slot) if slot.updates.is_empty() || slot.caller_gone => {
           self.services.remove(&handle);
         }
         Some(slot) => slot.route_freed = true,
@@ -1680,6 +1705,47 @@ mod tests {
     engine
       .register_service(sample_spec(), at(t))
       .expect("the same name must be re-registerable once the withdrawal completes");
+  }
+
+  /// Regression: a caller that `unregister_service`s and then discards
+  /// the handle WITHOUT polling a queued update (e.g. an unread `Established`) must
+  /// not leak the slot. `unregister_service` marks it `caller_gone`, so the
+  /// completed-withdrawal GC removes it regardless of pending updates — the
+  /// `route_freed` deferral (which waits for a reader that is now gone) would
+  /// otherwise grow `services` without bound under register/unregister churn.
+  #[test]
+  fn unregister_then_discard_with_unread_update_gc_s_the_slot() {
+    let mut engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(202));
+    let mut io = MockUdp::default();
+    let mut scratch = [0u8; 1500];
+
+    let a = engine.register_service(sample_spec(), at(0)).unwrap();
+    // An app-facing update the caller never polls.
+    engine
+      .services
+      .get_mut(&a)
+      .unwrap()
+      .push_update(ServiceUpdate::Established);
+
+    // Retire A and discard the handle WITHOUT polling the update; the (empty,
+    // never-announced) withdrawal completes and the slot must be GC'd anyway.
+    engine.unregister_service(a, at(1));
+    let mut t = 1i64;
+    let mut gcd = false;
+    for _ in 0..4 {
+      t += 250_000;
+      engine.pump(at(t), &mut io, &mut scratch);
+      if !engine.services.contains_key(&a) {
+        gcd = true;
+        break;
+      }
+    }
+    assert!(
+      gcd,
+      "an unregistered service with an unread update must be GC'd (caller_gone), \
+       not deferred forever and leaked"
+    );
   }
 
   #[test]
