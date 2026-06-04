@@ -8436,6 +8436,153 @@ mod tests {
     );
   }
 
+  /// a withdrawing route must receive NO `ToService` dispatch on ANY
+  /// path — HostConflict, ProbeConflict, AND the QR=0 meta-PTR known-answer fanout
+  /// — not just no question. The route is retained for the name guard, but
+  /// dispatching to a service the driver no longer drains (it skips
+  /// withdrawing/errored contexts) lets a peer flood the proto event slab of a
+  /// retiring service until GC — a bounded-time but unbounded-size growth path. A
+  /// positive control feeds the SAME packets while the service is LIVE (they must
+  /// route), so the negative assertions are not vacuous; the name must still be held
+  /// afterwards (dispatch-only skip).
+  #[test]
+  fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() {
+    use core::net::SocketAddr;
+
+    use crate::wire::{Header, MessageBuilder};
+
+    let mut e = build_endpoint();
+    let now = StdInstant::now();
+    let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("printer-host.local.").unwrap();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst.clone(),
+      host.clone(),
+      631,
+      120,
+    );
+    let (handle, mut svc) = e
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+
+    let src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 55), 5353));
+    let local_ip = core::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+
+    // A peer claiming our HOST name with a DIFFERENT address → §9 HostConflict.
+    let host_pkt = {
+      let mut buf = [0u8; 512];
+      let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+      b.push_a_authority(&host, 120, Ipv4Addr::new(10, 0, 0, 99))
+        .unwrap();
+      let n = b.finish().unwrap();
+      buf[..n].to_vec()
+    };
+    // A peer claiming our INSTANCE name with rival rdata → §9 ProbeConflict.
+    let inst_pkt = {
+      let target = Name::try_from_str("rival.local.").unwrap();
+      let mut buf = [0u8; 512];
+      let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+      b.push_srv_authority(&inst, 120, 0, 0, 9999, &target)
+        .unwrap();
+      let n = b.finish().unwrap();
+      buf[..n].to_vec()
+    };
+    // A QR=0 meta-PTR known-answer (DNS-SD service-type enumeration) fans out to
+    // EVERY service; a withdrawing route must be excluded from that fanout too.
+    let ka_pkt = {
+      let meta = Name::try_from_str("_services._dns-sd._udp.local.").unwrap();
+      let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+      let mut buf = [0u8; 512];
+      let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+      b.push_ptr_answer(&meta, 120, &stype).unwrap();
+      let n = b.finish().unwrap();
+      buf[..n].to_vec()
+    };
+    // (inline handle-and-check: a closure capturing `&mut e` would conflict with
+    // the direct `e` uses between calls, and naming the generic Endpoint type for a
+    // by-ref-param closure is brittle.)
+
+    // POSITIVE CONTROL: while LIVE, both conflicts DO route a ToService — so the
+    // negative assertions below actually exercise the withdrawing skip.
+    let live_host = e
+      .handle(StdInstant::now(), src, local_ip, 0, &host_pkt, false)
+      .unwrap()
+      .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+    assert!(
+      live_host,
+      "sanity: a LIVE service must receive the HostConflict dispatch"
+    );
+    let live_inst = e
+      .handle(StdInstant::now(), src, local_ip, 0, &inst_pkt, false)
+      .unwrap()
+      .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+    assert!(
+      live_inst,
+      "sanity: a LIVE service must receive the ProbeConflict dispatch"
+    );
+    let live_ka = e
+      .handle(StdInstant::now(), src, local_ip, 0, &ka_pkt, false)
+      .unwrap()
+      .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+    assert!(
+      live_ka,
+      "sanity: a LIVE service must receive the meta-PTR KnownAnswer dispatch"
+    );
+
+    // Now retire the route via the endpoint-owned withdrawal.
+    e.begin_withdrawal(handle, svc.withdrawal_snapshot(), now);
+
+    // While WITHDRAWING, neither conflict routes any ToService.
+    let wd_host = e
+      .handle(StdInstant::now(), src, local_ip, 0, &host_pkt, false)
+      .unwrap()
+      .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+    assert!(
+      !wd_host,
+      "a withdrawing service must not receive a HostConflict dispatch"
+    );
+    let wd_inst = e
+      .handle(StdInstant::now(), src, local_ip, 0, &inst_pkt, false)
+      .unwrap()
+      .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+    assert!(
+      !wd_inst,
+      "a withdrawing service must not receive a ProbeConflict dispatch"
+    );
+    let wd_ka = e
+      .handle(StdInstant::now(), src, local_ip, 0, &ka_pkt, false)
+      .unwrap()
+      .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+    assert!(
+      !wd_ka,
+      "a withdrawing service must not receive a KnownAnswer dispatch"
+    );
+
+    // The name is still held (route present for the guard) — the skip is
+    // dispatch-only, not a release of the name reservation.
+    let recs2 = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst,
+      Name::try_from_str("h2.local.").unwrap(),
+      631,
+      120,
+    );
+    assert!(
+      matches!(
+        e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+          ServiceSpec::new(recs2),
+          now
+        ),
+        Err(RegisterServiceError::NameAlreadyRegistered(_))
+      ),
+      "the withdrawing name must still be held"
+    );
+  }
+
   /// `poll_timeout` accounts for a due endpoint-owned withdrawal so the driver
   /// wakes to pump it (Task 6).
   #[test]
@@ -8737,6 +8884,17 @@ where
       if key < start {
         continue;
       }
+      // A withdrawing route's service is being torn down (only its goodbye is still
+      // draining) — never route a conflict to it. The route is retained for the
+      // name guard, but dispatching ProbeConflict/HostConflict here would feed
+      // terminal events into a proto the driver no longer drains (it skips
+      // withdrawing/errored contexts), letting a peer flood the proto event slab of
+      // a retiring service until GC — a bounded-time but unbounded-size growth path
+      //. Mirrors the question-dispatch and known-answer skips.
+      #[cfg(any(feature = "alloc", feature = "std"))]
+      if route.withdrawing {
+        continue;
+      }
       if names_match_record(route.name(), r) && is_instance_conflict_rtype(r.rtype()) {
         return Some((
           key,
@@ -8974,6 +9132,13 @@ where
               let mut found: Option<(usize, RouteEvent<'a>)> = None;
               for (key, route) in self.endpoint.services.iter() {
                 if key < start {
+                  continue;
+                }
+                // A withdrawing route's service is being torn down — never route a
+                // known-answer to it either, matching the question-dispatch and
+                // conflict skips (no dispatch after retirement).
+                #[cfg(any(feature = "alloc", feature = "std"))]
+                if route.withdrawing {
                   continue;
                 }
                 if names_match_record(route.name(), &r)

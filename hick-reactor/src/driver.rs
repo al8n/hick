@@ -465,7 +465,15 @@ impl<N: Net> DriverState<N> {
     for ev in route_events {
       match ev {
         Ok(RouteEvent::ToService(ts)) => {
-          if let Some(ctx) = services.get_mut(&ts.handle()) {
+          // Defense-in-depth for the no-dispatch-after-retirement invariant: the
+          // endpoint already skips withdrawing routes in every ToService path
+          // (question, conflict, known-answer), so this guards against a future
+          // dispatch regression feeding events into a proto whose updates the
+          // driver no longer drains — which would let a peer grow the proto event
+          // slab of a retiring service until GC.
+          if let Some(ctx) = services.get_mut(&ts.handle())
+            && !ctx.withdrawing
+          {
             ctx.proto.handle_event(ts.into_event(), now);
           }
         }
