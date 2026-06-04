@@ -862,11 +862,11 @@ where
     // ── Endpoint-owned withdrawals (RFC 6762 §10.1 goodbyes) ─────────────────
     // Pump every due TTL=0 goodbye datagram. The endpoint encodes each (with
     // fresh sibling host-address retention computed internally), hands back the
-    // multicast datagram + the withdrawing handle; the driver fans it out to BOTH
-    // groups (`tx.burst`, the SAME per-family send path the old goodbye burst
-    // used) and reports back whether at least one family sent so the endpoint can
-    // spend / re-arm the resend round.
-    while let Some((dst, len, handle)) = self.endpoint.poll_withdrawal_transmit(now, scratch) {
+    // multicast datagram + the item's opaque withdrawal token; the driver fans it
+    // out to BOTH groups (`tx.burst`, the SAME per-family send path the old goodbye
+    // burst used) and reports back whether at least one family sent so the endpoint
+    // can spend / re-arm the resend round.
+    while let Some((dst, len, token)) = self.endpoint.poll_withdrawal_transmit(now, scratch) {
       // The endpoint always returns the multicast marker; the driver fans the
       // datagram to both groups regardless. Assert the contract in debug builds.
       debug_assert_eq!(
@@ -913,7 +913,7 @@ where
       // records. v4-Sent + v6-Busy keeps v6's debt so a v6 recovery before
       // the 2 s ceiling still emits its TTL=0 goodbye.
       self.endpoint.note_withdrawal_result(
-        handle,
+        token,
         now,
         fanout.v4.withdrawal_send(),
         fanout.v6.withdrawal_send(),
@@ -1015,19 +1015,20 @@ where
   /// the RFC 6762 §9 auto-rename routing (`handle_service_renamed`) before
   /// surfacing a `Renamed` update.
   ///
-  /// A §9 rename of an ANNOUNCED service queues a TTL=0 withdrawal of the OLD
-  /// instance name. For a service that KEEPS running under the new name (rename
-  /// success) or that goes Conflicting on an invalid suffix, that old-name goodbye
-  /// is emitted by the proto's own `poll_transmit` on its `rename_goodbye_deadline`
-  /// schedule, confirmed via the normal confirm-on-send path in the TX loop — the
-  /// driver no longer steals it into a side queue.
+  /// A §9 rename of an ANNOUNCED service needs a TTL=0 withdrawal of the OLD
+  /// instance name. The proto hands it off the instant the rename happens
+  /// (`Service::take_rename_goodbye_handoff`); this driver enqueues it as an
+  /// INDEPENDENT detached withdrawal item via
+  /// [`Endpoint::enqueue_rename_withdrawal`], for BOTH a surviving rename and a
+  /// collision teardown. The endpoint drives that item's goodbye schedule on the
+  /// normal withdrawal pump; the proto no longer emits the old-name goodbye from
+  /// its own `poll_transmit`.
   ///
-  /// The ONE case the proto cannot drive itself is a rename whose NEW name
-  /// collides with another LOCAL service (`handle_service_renamed` returns Err):
-  /// the service is torn down, so its old-name withdrawal is handed to the
-  /// endpoint-owned withdrawal lifecycle ([`Self::begin_service_withdrawal`],
-  /// whose snapshot prioritises the pending rename goodbye), which holds the route
-  /// and resends the goodbye before freeing the name.
+  /// When the NEW name additionally collides with another LOCAL service
+  /// (`handle_service_renamed` returns Err) the service is also torn down: its
+  /// CURRENT name is withdrawn via the endpoint-owned withdrawal lifecycle
+  /// ([`Self::begin_service_withdrawal`]), which holds the route and resends
+  /// before freeing the name. (The old-name detached item was already enqueued.)
   fn drain_service_updates(&mut self, now: I) {
     let handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
     for handle in handles {
@@ -1039,19 +1040,29 @@ where
       {
         if let ServiceUpdate::Renamed(ref renamed) = update {
           let new_name = renamed.new_name().clone();
-          if self
-            .endpoint
-            .handle_service_renamed(handle, new_name)
-            .is_err()
-          {
+          let rename_result = self.endpoint.handle_service_renamed(handle, new_name);
+          // The §9 rename of an announced service hands its OLD-name TTL=0 goodbye
+          // off as an INDEPENDENT detached withdrawal item, both for a SURVIVING
+          // rename and a COLLISION teardown. Take it from the proto the instant the
+          // rename is observed (into a local, releasing the `self.services` borrow
+          // before re-borrowing `self.endpoint`) and enqueue it — the Service no
+          // longer drains the old-name goodbye itself.
+          let handoff = self
+            .services
+            .get_mut(&handle)
+            .and_then(|slot| slot.proto.take_rename_goodbye_handoff());
+          if let Some(handoff) = handoff {
+            self.endpoint.enqueue_rename_withdrawal(handoff, now);
+          }
+          if rename_result.is_err() {
             // The new name collides with another local service; the service has
             // already rebranded and can't be kept. Surface `Conflict` and mark it
-            // errored so every pump skips it for transmits. Its OLD-name withdrawal
-            // is pending in the proto; begin the endpoint-owned withdrawal, which
-            // snapshots that pending rename goodbye, holds the route (keeping the
-            // OLD name reserved) while it resends, and frees the name on
-            // completion. The slot stays until then so this queued `Conflict`
-            // still reaches the host (GC'd in `pump`).
+            // errored so every pump skips it for transmits. Begin the endpoint-owned
+            // withdrawal for the CURRENT name, which holds the route (keeping the
+            // name reserved) while it resends, and frees the name on completion. The
+            // OLD name's goodbye was already enqueued above as its own detached item.
+            // The slot stays until then so this queued `Conflict` still reaches the
+            // host (GC'd in `pump`).
             if let Some(slot) = self.services.get_mut(&handle) {
               slot.push_update(ServiceUpdate::Conflict);
               slot.errored = true;
@@ -1068,12 +1079,13 @@ where
   }
 
   /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: snapshot
-  /// what its goodbye must retract ([`Service::withdrawal_snapshot`], which
-  /// captures both the current records and any pending conflict-rename old-name
-  /// goodbye) and hand it to [`Endpoint::begin_withdrawal`]. The endpoint KEEPS the
-  /// route (holding the name) and drives the resend schedule; the route is freed
-  /// and the driver slot GC'd when [`Endpoint::drain_completed_withdrawals`]
-  /// reports completion in [`Self::pump`].
+  /// what its CURRENT name's goodbye must retract
+  /// ([`Service::withdrawal_snapshot`]) and hand it to
+  /// [`Endpoint::begin_withdrawal`]. The endpoint KEEPS the route (holding the
+  /// name) and drives the resend schedule; the route is freed and the driver slot
+  /// GC'd when [`Endpoint::drain_completed_withdrawals`] reports completion in
+  /// [`Self::pump`]. Any in-flight §9 rename old-name goodbye is a SEPARATE
+  /// detached item already enqueued via [`Endpoint::enqueue_rename_withdrawal`].
   ///
   /// The driver slot is left in place (the caller marks it `errored`) so a queued
   /// `ServiceUpdate::Conflict` still reaches the host before the slot is GC'd.
@@ -1082,10 +1094,21 @@ where
   fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: I) {
     // Scope the `slot` borrow so it ends before `self.endpoint` is touched (the
     // snapshot is owned, so no borrow of `self.services` outlives this block).
-    let snap = match self.services.get_mut(&handle) {
-      Some(slot) => slot.proto.withdrawal_snapshot(),
+    // ALSO take any pending §9 rename handoff here: a retirement that races a
+    // queued `Renamed` update (closed receiver / explicit unregister) never
+    // reaches the update-drain site that normally enqueues it, which would strand
+    // the old-name goodbye in a proto being GC'd. `.take()` makes the handoff
+    // exactly-once vs the update-drain path.
+    let (snap, handoff) = match self.services.get_mut(&handle) {
+      Some(slot) => {
+        let handoff = slot.proto.take_rename_goodbye_handoff();
+        (slot.proto.withdrawal_snapshot(), handoff)
+      }
       None => return,
     };
+    if let Some(handoff) = handoff {
+      self.endpoint.enqueue_rename_withdrawal(handoff, now);
+    }
     self.endpoint.begin_withdrawal(handle, snap, now);
   }
 

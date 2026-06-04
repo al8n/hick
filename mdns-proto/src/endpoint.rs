@@ -77,9 +77,41 @@ impl WithdrawalSend {
   }
 }
 
-/// In-progress withdrawal state for a single service.  Stored in
-/// [`Endpoint::withdrawals`] keyed by [`ServiceHandle`].  The `I` type
-/// parameter is the [`Instant`] type of the enclosing endpoint.
+/// Opaque identity for a single in-progress `WithdrawalItem`, handed back by
+/// [`Endpoint::poll_withdrawal_transmit`] and round-tripped to
+/// [`Endpoint::note_withdrawal_result`] to confirm exactly that item's send.
+///
+/// A monotonic counter (`next_withdrawal_token`) mints a fresh value
+/// per item and never reuses one, so a token can only ever name the item it was
+/// minted for (or no item, once that item has been drained). It is deliberately
+/// distinct from [`ServiceHandle`]: one teardown can spawn TWO items (a
+/// route-attached current-name goodbye and a detached old-name rename goodbye),
+/// so the poll/note key cannot be the handle.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WithdrawalToken(u64);
+
+/// In-progress withdrawal state for ONE name (one TTL=0 goodbye lifecycle).
+/// Stored in [`Endpoint::withdrawals`] keyed by an opaque [`WithdrawalToken`].
+/// The `I` type parameter is the [`Instant`] type of the enclosing endpoint.
+///
+/// A single name — never a dual current+rename pair. A teardown DURING a §9
+/// rename therefore enqueues TWO independent items: a route-attached one for the
+/// current (re-announced) name, and a detached one for the old name still draining
+/// its rename goodbye. Modelling each goodbye as its own item means neither can
+/// starve the other, and two names that each fit `scratch` individually are both
+/// emitted even when their combined message would not.
+///
+/// `route` carries the item's relationship to a [`ServiceRoute`]:
+///   * `Some(handle)` — a TEARDOWN item. It HOLDS the route `handle`: the name
+///     stays blocked against re-registration until the item settles, and on
+///     completion [`Endpoint::drain_completed_withdrawals`] frees the route
+///     (releasing the name, decrementing `services_active`) and reports `handle`
+///     to the driver. Only these items withdraw host A/AAAA (and so honour
+///     sibling host-address retention).
+///   * `None` — a DETACHED item (a renamed-away OLD name). It owns no route and
+///     no host addresses (`host_a`/`host_aaaa` are always empty); when it settles
+///     it is simply removed, reported to NOBODY.
 ///
 /// Stored as a parallel `Vec` rather than inline on [`ServiceRoute`] because
 /// `ServiceRoute` has no generic parameter: it is a public struct used by
@@ -87,48 +119,64 @@ impl WithdrawalSend {
 /// require updating every type alias / `Slab<ServiceRoute>` declaration
 /// across the whole workspace — including external users.
 #[cfg(any(feature = "alloc", feature = "std"))]
-struct Withdrawal<I> {
-  /// The service records snapshot for the goodbye sends.
-  // Read by `poll_withdrawal_transmit` (Task 3).
+struct WithdrawalItem<I> {
+  /// The service records (names, port, TXT) for this name's goodbye sends.
+  // Read by `poll_withdrawal_transmit`.
   #[allow(dead_code)]
-  snapshot: crate::service::WithdrawalSnapshot,
-  /// PER-FAMILY goodbye-send debt: `owed[0]` for IPv4, `owed[1]` for IPv6,
-  /// each initialised to `WITHDRAWAL_SENDS`.  A family's counter is
-  /// decremented only when THAT family confirms a send ([`WithdrawalSend::Sent`])
-  /// and zeroed when it is permanently written off ([`WithdrawalSend::WriteOff`]).
-  /// The withdrawal is complete once `owed == [0, 0]` (every reachable family
-  /// withdrew its records), so a family that is busy/down does not let the route
-  /// free while another family still owes peers a TTL=0 goodbye — capped by
-  /// `ceiling_at`.  A nothing-to-withdraw snapshot starts at `[0, 0]`.
-  // Read and mutated by `note_withdrawal_result` (Task 4).
+  records: crate::records::ServiceRecords,
+  /// Which instance record kinds (PTR/SRV/TXT/subtypes) this name put on the
+  /// wire — only these are withdrawn (§7.1 KAS can suppress a subset).
+  #[allow(dead_code)]
+  owned: crate::service::EmittedRecords,
+  /// Host A (IPv4) addresses confirmed-emitted; sibling-filtered per round before
+  /// encoding. ALWAYS empty for a detached item (`route == None`) — a rename
+  /// never withdraws host A/AAAA (the host name is invariant across renames).
+  #[allow(dead_code)]
+  host_a: std::vec::Vec<Ipv4Addr>,
+  /// Host AAAA (IPv6) addresses confirmed-emitted. Always empty for a detached
+  /// item (see `host_a`).
+  #[allow(dead_code)]
+  host_aaaa: std::vec::Vec<Ipv6Addr>,
+  /// PER-FAMILY goodbye-send debt: `[0]` IPv4, `[1]` IPv6, each initialised to
+  /// `WITHDRAWAL_SENDS` (or `[0, 0]` when this name has nothing to withdraw —
+  /// never announced, no host addrs). A family's counter is decremented only when
+  /// THAT family confirms a send ([`WithdrawalSend::Sent`]) and zeroed on a
+  /// permanent write-off ([`WithdrawalSend::WriteOff`]).
+  // Read and mutated by `note_withdrawal_result`.
   #[allow(dead_code)]
   owed: [u8; 2],
   /// When the next send is due.  Set to `now` at construction so the first
   /// send fires immediately.
-  // Read by `poll_withdrawal_transmit` (Task 3).
+  // Read by `poll_withdrawal_transmit`.
   #[allow(dead_code)]
   next_at: I,
-  /// Hard force-complete deadline.  The withdrawal is terminated at or after
-  /// this instant regardless of `owed` (anti-pin guard, Task 5).
-  // Read by `drain_completed_withdrawals` (Task 5).
+  /// Hard force-complete deadline.  The item is terminated at or after this
+  /// instant regardless of debt (anti-pin guard).
+  // Read by `drain_completed_withdrawals`.
   #[allow(dead_code)]
   ceiling_at: I,
   /// `true` once a FINAL goodbye has been emitted AT/just-before the ceiling for
-  /// a still-owed withdrawal.  Without this, a family that becomes
+  /// a still-owed item.  Without this, a family that becomes
   /// reachable only in the `[last_attempt, ceiling]` window — because the last
   /// backoff overshot `ceiling_at` — would never get a try: `poll_withdrawal_transmit`
   /// only emits while `now < ceiling_at`, so the route would be force-completed
-  /// with debt still owed.  When a withdrawal is past its ceiling but still owes
-  /// AND has not yet been final-attempted, `poll_withdrawal_transmit` emits ONE
-  /// last goodbye and sets this flag; `drain_completed_withdrawals` then
-  /// force-completes a past-ceiling withdrawal only once this is set (or its
-  /// `owed` already reached `[0, 0]`).  The flag also guarantees termination:
-  /// the past-ceiling branch fires at most once per withdrawal, so the pump loop
-  /// can never re-select the same withdrawal for another final attempt.
+  /// with debt still owed.  When an item is past its ceiling but still owes AND
+  /// has not yet been final-attempted, `poll_withdrawal_transmit` emits ONE last
+  /// goodbye and sets this flag; `drain_completed_withdrawals` then force-completes
+  /// a past-ceiling item only once this is set (or its debt already reached
+  /// `[0, 0]`).  The flag also guarantees termination: the past-ceiling branch
+  /// fires at most once per item, so the pump loop can never re-select the same
+  /// item for another final attempt.
   // Read/written by `poll_withdrawal_transmit`; read by
   // `drain_completed_withdrawals`.
   #[allow(dead_code)]
   final_attempt: bool,
+  /// The route this item relates to. `Some(handle)` is a teardown item HOLDING
+  /// the route (blocks name-reuse, freed + reported on completion, withdraws host
+  /// addresses); `None` is a detached old-name item (no route, no host, completes
+  /// silently). See the type-level docs.
+  #[allow(dead_code)]
+  route: Option<ServiceHandle>,
 }
 
 /// Routing metadata for a registered service.
@@ -298,16 +346,22 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   next_service_handle: u32,
   next_query_handle: u32,
   next_txid: u16,
-  /// In-progress withdrawals, keyed by `ServiceHandle`.  The route in
-  /// `self.services` is kept alive until the goodbye sequence completes
-  /// (Task 5) so the name guard continues to reject same-name re-registration.
+  /// In-progress withdrawal items, keyed by an opaque [`WithdrawalToken`].  Each
+  /// entry is ONE name's TTL=0 goodbye lifecycle; a route-attached item keeps its
+  /// route in `self.services` alive until the goodbye sequence completes (so the
+  /// name guard continues to reject same-name re-registration).
   ///
   /// Stored as a `Vec` rather than as an inline field on [`ServiceRoute`]
   /// because `ServiceRoute` is non-generic (adding `I` there would require
   /// updating every `Pool<ServiceRoute>` / `Slab<ServiceRoute>` site across
   /// the whole workspace, including external users).
   #[cfg(any(feature = "alloc", feature = "std"))]
-  withdrawals: std::vec::Vec<(ServiceHandle, Withdrawal<I>)>,
+  withdrawals: std::vec::Vec<(WithdrawalToken, WithdrawalItem<I>)>,
+  /// Monotonic source of [`WithdrawalToken`] values. Incremented on every item
+  /// insert and NEVER reused, so a token names exactly the item it was minted for
+  /// (or nothing, once that item drained) — there is no ABA on the poll/note key.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  next_withdrawal_token: u64,
   #[cfg(feature = "stats")]
   stats: std::sync::Arc<hick_trace::stats::Stats>,
   _phantom: core::marker::PhantomData<(AN, EvQ)>,
@@ -348,6 +402,8 @@ where
       next_txid,
       #[cfg(any(feature = "alloc", feature = "std"))]
       withdrawals: std::vec::Vec::new(),
+      #[cfg(any(feature = "alloc", feature = "std"))]
+      next_withdrawal_token: 0,
       #[cfg(feature = "stats")]
       stats,
       _phantom: core::marker::PhantomData,
@@ -391,7 +447,6 @@ where
         ));
       }
     }
-
     let new_h = self.next_service_handle;
     self.next_service_handle = self.next_service_handle.saturating_add(1);
     let handle = ServiceHandle::from_raw(new_h);
@@ -417,6 +472,24 @@ where
         withdrawing: false,
       })
       .map_err(|_| RegisterServiceError::StorageFull(StorageFullError))?;
+
+    // Only AFTER the route insertion SUCCEEDS — the name is now committed in the
+    // route table — reclaim it from any in-flight DETACHED withdrawal by CANCELLING
+    // that goodbye. Doing this before the insert would drop a graceful withdrawal
+    // even when registration fails with StorageFull, leaving stale old-name records
+    // until TTL. A detached item withdraws a renamed-away old instance
+    // with no live owner; the reclaiming service probes (~750 ms, RFC 6762 §8.1)
+    // before announcing, and re-announces (§8.3), so no already-sent TTL=0 goodbye
+    // can durably flush it. Rejecting instead would also wrongly kill an
+    // auto-renaming service that picked this transiently-reserved suffix (drivers
+    // treat a rename error as fatal —). Route-attached withdrawing names
+    // stay reserved by the duplicate-name scan above — the unchanged R21–R24
+    // teardown closure (a LEAVING service).
+    #[cfg(any(feature = "alloc", feature = "std"))]
+    self.withdrawals.retain(|(_, item)| {
+      !(item.route.is_none()
+        && item.records.instance().as_str() == spec.records().instance().as_str())
+    });
 
     let mut seed = [0u8; 32];
     self.rng.fill_bytes(&mut seed);
@@ -500,27 +573,48 @@ where
     }
   }
 
+  /// Mint the next monotonic [`WithdrawalToken`]. Never reused.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  fn mint_withdrawal_token(&mut self) -> WithdrawalToken {
+    let t = WithdrawalToken(self.next_withdrawal_token);
+    self.next_withdrawal_token = self.next_withdrawal_token.saturating_add(1);
+    t
+  }
+
   /// Begin terminal withdrawal for `handle`.
   ///
-  /// Marks the route as withdrawing and queues a resend schedule so the
-  /// goodbye datagrams can be sent by a later `poll_withdrawal_transmit` call
-  /// (Task 3).
+  /// Enqueues ONE route-attached withdrawal item for the current (live /
+  /// re-announced) name. The OLD instance name of an in-flight §9 rename is NOT
+  /// handled here — a rename hands its old-name goodbye off the instant it
+  /// happens (the driver calls [`Self::enqueue_rename_withdrawal`] after
+  /// [`Self::handle_service_renamed`]), so it is already its own INDEPENDENT
+  /// detached item. A teardown DURING the rename window is therefore simply two
+  /// independent single-name items — that earlier detached old-name one plus this
+  /// route-attached current-name one: the two never share a
+  /// schedule or a datagram, so the old-name goodbye can never be starved by the
+  /// current one nor dropped because their combined message overflowed `scratch`.
   ///
   /// # Route retention
   ///
   /// The route is **kept** in `self.services`: the name guard continues to
-  /// reject a same-name re-registration while the goodbye sequence is in
-  /// flight.  `services_active` is **not** decremented here — that happens
-  /// in Task 5 when the withdrawal completes.
+  /// reject a same-name re-registration while the route-attached item is in
+  /// flight.  `services_active` is **not** decremented here — that happens in
+  /// [`Self::drain_completed_withdrawals`] when that item completes.
   ///
   /// # Timing
   ///
-  /// `next_at` is set to `now` so the first goodbye fires immediately.
-  /// `ceiling_at` is `now + WITHDRAWAL_CEILING` (2 s) — if the sequence
-  /// has not completed by then it is force-finished to avoid pinning the
+  /// The item's `next_at` is set to `now` so its first goodbye fires
+  /// immediately. `ceiling_at` is `now + WITHDRAWAL_CEILING` (2 s) — if a
+  /// sequence has not completed by then it is force-finished to avoid pinning the
   /// name slot indefinitely.
   ///
-  /// If `handle` has no registered route the call is a silent no-op.
+  /// # Idempotency
+  ///
+  /// If a route-attached item already exists for `handle` (`route ==
+  /// Some(handle)`) the call is a no-op: a driver may retire the same service
+  /// more than once (e.g. an encode-failure escalation on an already-cancelled
+  /// service) and must not enqueue a duplicate. If `handle` has no registered
+  /// route the call is likewise a silent no-op.
   #[cfg(any(feature = "alloc", feature = "std"))]
   pub fn begin_withdrawal(
     &mut self,
@@ -536,43 +630,60 @@ where
       .map(|(k, _)| k);
     let Some(key) = route_key else { return };
 
-    // Idempotency: a service already withdrawing must not enqueue a second
-    // schedule (a driver may retire the same service more than once — e.g. an
-    // encode-failure escalation on an already-cancelled service).
+    // Idempotency: a route-attached item already exists for this handle → do not
+    // enqueue a second (a driver may retire the same service more than once).
+    if self
+      .withdrawals
+      .iter()
+      .any(|(_, w)| w.route == Some(handle))
+    {
+      return;
+    }
+
     let Some(route) = self.services.get_mut(key) else {
       return;
     };
-    if route.withdrawing {
-      return;
-    }
     route.withdrawing = true;
-
-    // A service with NOTHING to withdraw (never announced — empty owned set and
-    // no advertised host addresses) completes immediately: `owed = [0, 0]` makes
-    // the next `drain_completed_withdrawals` free the name at once, with no
-    // spurious goodbye and no 2 s ceiling wait.  Otherwise every family starts
-    // owing the full WITHDRAWAL_SENDS budget (per-family debt, F2).
-    let nothing_to_withdraw =
-      snapshot.owned.is_empty() && snapshot.host_a.is_empty() && snapshot.host_aaaa.is_empty();
-    let owed = if nothing_to_withdraw {
-      [0, 0]
-    } else {
-      [WITHDRAWAL_SENDS, WITHDRAWAL_SENDS]
-    };
 
     // next_at = now (first send fires immediately); ceiling_at = now +
     // WITHDRAWAL_CEILING (hard anti-pin deadline).
     let ceiling_at = now.checked_add_duration(WITHDRAWAL_CEILING).unwrap_or(now);
+
+    // ── route-attached item: the CURRENT (live / re-announced) name ──────────
+    // Owes a goodbye iff it actually advertised an instance record OR a host
+    // address; otherwise `[0, 0]` so the next `drain_completed_withdrawals` frees
+    // the name at once with no spurious goodbye and no 2 s ceiling wait.
+    let current_has_something =
+      !snapshot.owned.is_empty() || !snapshot.host_a.is_empty() || !snapshot.host_aaaa.is_empty();
+    let current_owed = if current_has_something {
+      [WITHDRAWAL_SENDS, WITHDRAWAL_SENDS]
+    } else {
+      [0, 0]
+    };
+
+    let crate::service::WithdrawalSnapshot {
+      records,
+      owned,
+      host_a,
+      host_aaaa,
+    } = snapshot;
+
+    let token = self.mint_withdrawal_token();
     self.withdrawals.push((
-      handle,
-      Withdrawal {
-        snapshot,
-        owed,
+      token,
+      WithdrawalItem {
+        records,
+        owned,
+        host_a,
+        host_aaaa,
+        owed: current_owed,
         next_at: now,
         ceiling_at,
         final_attempt: false,
+        route: Some(handle),
       },
     ));
+
     crate::trace::debug!(
       target: "mdns_proto::endpoint",
       handle = handle.raw(),
@@ -580,127 +691,187 @@ where
     );
   }
 
+  /// Enqueue a DETACHED withdrawal item for the OLD instance name of a §9
+  /// conflict rename (the renamed-away old name's TTL=0 goodbye).
+  ///
+  /// The driver calls this immediately after [`Self::handle_service_renamed`],
+  /// passing the
+  /// [`RenameGoodbyeHandoff`](crate::service::RenameGoodbyeHandoff) it took from
+  /// [`Service::take_rename_goodbye_handoff`](crate::service::Service::take_rename_goodbye_handoff)
+  /// (the old name's records + the per-record ownership of what it advertised).
+  /// This models the old-name goodbye as an INDEPENDENT single-name withdrawal
+  /// item — its own per-family debt, schedule, ceiling, and loss-resilience
+  /// resends — exactly like a teardown's detached item. A teardown DURING the
+  /// rename window is therefore simply two independent items (this detached
+  /// old-name one, plus the route-attached current-name one from
+  /// [`Self::begin_withdrawal`]); neither can starve the other nor be dropped
+  /// because their combined message overflowed `scratch`.
+  ///
+  /// The item holds NO route (it frees nothing and is reported to nobody on
+  /// completion) and NO host addresses (a rename never withdraws host A/AAAA —
+  /// the host name is invariant across an instance rename). It is a **no-op when
+  /// the handoff owned nothing** (the old name never advertised an instance
+  /// record, so there is nothing for peers to evict).
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  pub fn enqueue_rename_withdrawal(
+    &mut self,
+    handoff: crate::service::RenameGoodbyeHandoff,
+    now: I,
+  ) {
+    let crate::service::RenameGoodbyeHandoff { records, owned } = handoff;
+    // Nothing for peers to evict → no item.
+    if owned.is_empty() {
+      return;
+    }
+    let ceiling_at = now.checked_add_duration(WITHDRAWAL_CEILING).unwrap_or(now);
+    let token = self.mint_withdrawal_token();
+    self.withdrawals.push((
+      token,
+      WithdrawalItem {
+        records,
+        owned,
+        host_a: std::vec::Vec::new(),
+        host_aaaa: std::vec::Vec::new(),
+        owed: [WITHDRAWAL_SENDS, WITHDRAWAL_SENDS],
+        next_at: now,
+        ceiling_at,
+        final_attempt: false,
+        route: None,
+      },
+    ));
+    crate::trace::debug!(
+      target: "mdns_proto::endpoint",
+      "enqueue_rename_withdrawal: detached old-name goodbye queued"
+    );
+  }
+
   /// Pump one due withdrawal datagram.  Mirrors [`Self::poll_query_transmit`]:
   /// the driver sends the returned datagram (fanned to every bound family) and
   /// then confirms it via [`Self::note_withdrawal_result`].
   ///
-  /// Encodes the snapshot's TTL=0 goodbye, withdrawing a host address ONLY if no
+  /// Encodes a SINGLE `WithdrawalItem`'s TTL=0 goodbye per call. For a
+  /// route-attached item (`route == Some`) a host address is withdrawn ONLY if no
   /// OTHER live route still advertises it — same-host sibling retention is
   /// recomputed FRESH each call from the route table, so siblings joining or
-  /// leaving during the multi-round window are always honoured.
+  /// leaving during the multi-round window are always honoured. A detached item
+  /// (`route == None`) holds no host addresses, so retention does not apply and
+  /// its goodbye is purely instance-only (the renamed-away old name).
   ///
-  /// # Retained-only / empty withdrawals do not head-of-line block
+  /// # Independent single-name items
   ///
-  /// A due withdrawal can have NOTHING left to put on the wire — it owns no
+  /// A teardown DURING a still-draining §9 rename owes goodbyes for TWO names —
+  /// but each is its OWN item with its OWN per-family debt and schedule, so they
+  /// are emitted as SEPARATE datagrams chosen independently by this scan. That
+  /// fixes two bugs at the root:
+  ///   * a rename-ONLY teardown still emits the old name (it is a separate
+  ///     detached item that owes a full budget, never folded into an empty
+  ///     current item); and
+  ///   * neither datagram can be "combined too large" — each carries one name, so
+  ///     two names that each fit `scratch` individually are BOTH emitted even when
+  ///     their combined message would not, and an unencodable item never starves
+  ///     the other.
+  ///
+  /// # Retained-only / empty items do not head-of-line block
+  ///
+  /// A route-attached item can have NOTHING left to put on the wire — it owns no
   /// instance records and every host address it advertised is still retained by
-  /// a LIVE same-host sibling.  Such a withdrawal is COMPLETED in place
+  /// a LIVE same-host sibling.  Such an item is COMPLETED in place
   /// (`owed = [0, 0]`, freed by the next [`Self::drain_completed_withdrawals`])
-  /// and the scan CONTINUES to the next due withdrawal, rather than returning
-  /// `None`.  Completing it at once is correct: a live sibling legitimately
-  /// still advertises those addresses, and when that sibling later leaves ITS
-  /// own withdrawal withdraws them.  Returning `None` here would (a) leave the
-  /// withdrawal due forever — re-waking `poll_timeout` until its 2 s ceiling —
-  /// and (b) stop the driver's `while let Some(..)` pump loop, starving any
-  /// later same-time withdrawal that genuinely needs a TTL=0 goodbye.
+  /// and the scan CONTINUES, rather than returning `None`.  Completing it at once
+  /// is correct: a live sibling legitimately still advertises those addresses, and
+  /// when that sibling later leaves ITS own item withdraws them.  Returning `None`
+  /// here would (a) leave the item due forever — re-waking `poll_timeout` until its
+  /// 2 s ceiling — and (b) stop the driver's `while let Some(..)` pump loop,
+  /// starving any later same-time item that genuinely needs a TTL=0 goodbye.
   ///
-  /// # An encode failure ADVANCES the withdrawal rather than blocking
+  /// # An encode failure ADVANCES the item rather than blocking
   ///
-  /// If the goodbye encoder returns an error for the chosen withdrawal (e.g. its
+  /// If the goodbye encoder returns an error for the chosen item (e.g. its
   /// goodbye does not fit `scratch`), this does NOT return
-  /// `None` — that would leave the failing withdrawal first-due at this `now`
-  /// and stop the driver pump loop before later due withdrawals are reached.
-  /// Instead the failing withdrawal's `next_at` is pushed past `now`
-  /// (`now + WITHDRAWAL_RETRY_BACKOFF`, its `owed` budget intact) and the scan
-  /// CONTINUES, so a sibling that genuinely has an emittable goodbye is still
-  /// served this pass.  The 2 s ceiling remains the backstop for a withdrawal
+  /// `None` — that would leave the failing item first-due at this `now`
+  /// and stop the driver pump loop before later due items are reached.
+  /// Instead the failing item's `next_at` is pushed past `now`
+  /// (`now + WITHDRAWAL_RETRY_BACKOFF`, its debt budget intact) and the scan
+  /// CONTINUES, so another item that genuinely has an emittable goodbye is still
+  /// served this pass.  The 2 s ceiling remains the backstop for an item
   /// whose goodbye can never be encoded.  The loop still terminates: every
-  /// iteration either returns a datagram, completes a withdrawal, or pushes one
+  /// iteration either returns a datagram, completes an item, or pushes one
   /// past `now`.
   ///
-  /// Returns `(multicast dst, datagram length, the withdrawing handle)` for the
-  /// first due withdrawal that actually has records to emit, or `None` when no
-  /// due withdrawal has anything to send (the empty/retained-only ones having
-  /// been marked complete; the encode-failing ones having been pushed past
-  /// `now`).
+  /// Returns `(multicast dst, datagram length, the item's [`WithdrawalToken`])`
+  /// for the first due item that actually has records to emit, or `None` when no
+  /// due item has anything to send (the empty/retained-only ones having been
+  /// marked complete; the encode-failing ones having been pushed past `now`).
   #[cfg(any(feature = "alloc", feature = "std"))]
   pub fn poll_withdrawal_transmit(
     &mut self,
     now: I,
     scratch: &mut [u8],
-  ) -> Option<(SocketAddr, usize, ServiceHandle)> {
+  ) -> Option<(SocketAddr, usize, WithdrawalToken)> {
     loop {
-      // A withdrawal is selectable when at least one family still owes a round
-      // (`owed != [0, 0]`) AND either:
+      // An item is selectable when it still owes a round (`owed != [0, 0]`) AND
+      // either:
       //   * it is DUE within the normal window — `next_at <= now < ceiling_at`; or
       //   * it is PAST the ceiling but has not yet had its one FINAL ceiling
       //     attempt (`now >= ceiling_at && !final_attempt`).  This is the
       //     guarantee: if the last backoff overshot `ceiling_at`, the still-owed
       //     family would otherwise never be tried in the `[last_attempt, ceiling]`
       //     window and the route would be force-freed with debt owed.  The
-      //     `!final_attempt` guard makes this branch fire AT MOST ONCE per
-      //     withdrawal, so the loop always terminates (drain then force-completes
-      //     it).  A withdrawal marked complete below (`owed == [0, 0]`) no longer
-      //     matches, so the scan advances past it on the next turn.
-      let (idx, handle, is_final) =
+      //     `!final_attempt` guard makes this branch fire AT MOST ONCE per item,
+      //     so the loop always terminates (drain then force-completes it).  An
+      //     item whose debt is `[0, 0]` no longer matches, so the scan advances
+      //     past it on the next turn.
+      let (idx, token, route, is_final) =
         self
           .withdrawals
           .iter()
           .enumerate()
-          .find_map(|(i, (h, w))| {
+          .find_map(|(i, (tok, w))| {
             if w.owed == [0, 0] {
               return None;
             }
             if w.next_at <= now && now < w.ceiling_at {
-              Some((i, *h, false))
+              Some((i, *tok, w.route, false))
             } else if now >= w.ceiling_at && !w.final_attempt {
-              Some((i, *h, true))
+              Some((i, *tok, w.route, true))
             } else {
               None
             }
           })?;
 
       // Sibling-retained host addresses, recomputed each round into an owned Vec
-      // (releasing the `self.services` borrow before we read the snapshot +
-      // write `scratch`).  An address some OTHER same-host route still
-      // advertises must NOT be withdrawn.
-      let retained = self.sibling_retained_addrs(handle);
+      // (releasing the `self.services` borrow before we read the item + write
+      // `scratch`).  An address some OTHER same-host route still advertises must
+      // NOT be withdrawn.  ONLY a route-attached item withdraws host addresses; a
+      // detached item has empty host lists, so skip the (route-table) scan for it.
+      let retained = match route {
+        Some(handle) => self.sibling_retained_addrs(handle),
+        None => std::vec::Vec::new(),
+      };
 
-      // Decide whether this withdrawal has anything to emit under a SCOPED
-      // borrow, dropped before any mutation of `owed`. (`.get(idx)` cannot
-      // be `None` — `idx` came from the scan above — but it sidesteps the
-      // `indexing_slicing` lint with no panic path.)
+      // Read the item under a SCOPED borrow dropped before any mutation.
+      // (`.get(idx)` cannot be `None` — `idx` came from the scan above — but it
+      // sidesteps the `indexing_slicing` lint with no panic path.)
       let (_, w) = self.withdrawals.get(idx)?;
-      let owned = &w.snapshot.owned;
-      // The in-flight rename (OLD instance name A) also contributes records to
-      // withdraw — a teardown during the rename window must retract BOTH the
-      // current name's records AND A's old instance records.
-      let rename_has_something = w
-        .snapshot
-        .rename
-        .as_ref()
-        .is_some_and(|(_, old_owned)| !old_owned.is_empty());
+      let owned = &w.owned;
       let has_something = owned.ptr()
         || owned.srv()
         || owned.txt()
         || owned.subtypes()
-        || rename_has_something
         || w
-          .snapshot
           .host_a
           .iter()
           .any(|ip| !retained.contains(&core::net::IpAddr::V4(*ip)))
         || w
-          .snapshot
           .host_aaaa
           .iter()
           .any(|ip| !retained.contains(&core::net::IpAddr::V6(*ip)));
 
-      // Nothing left to withdraw (no owned instance records, no in-flight rename
-      // records, and every advertised host address still retained by a sibling)
-      // → COMPLETE it now and keep scanning for a withdrawal that genuinely has
-      // records to emit.  (A final-ceiling selection with nothing to emit is also
-      // completed here — zeroing `owed` makes drain free it; no need to set
-      // `final_attempt` since `owed == [0, 0]` already short-circuits the scan.)
+      // Nothing left to withdraw (no owned instance records and every advertised
+      // host address still retained by a sibling) → COMPLETE this item now
+      // (`owed = [0, 0]`) and keep scanning; drain frees it. A final-ceiling
+      // selection with nothing to emit is also handled here — zeroing the debt
+      // lets drain free it without needing `final_attempt`.
       if !has_something {
         if let Some((_, w)) = self.withdrawals.get_mut(idx) {
           w.owed = [0, 0];
@@ -708,74 +879,77 @@ where
         continue;
       }
 
-      // Encode the goodbye (`w` re-borrowed from the same valid `idx`): the
-      // current instance + sibling-filtered host addrs, AND — when a rename is in
-      // flight — the OLD instance name's TTL=0 records appended into the SAME
-      // datagram.
-      let encoded = crate::service::write_goodbye_with_rename(
-        &w.snapshot.records,
+      // Encode this name's single-name goodbye via the existing single-name
+      // encoder: its emitted instance records + the sibling-filtered host
+      // addresses. A detached item passes EMPTY host iterators (its lists are
+      // empty), so `write_goodbye` produces an instance-only old-name goodbye —
+      // no separate `write_rename_goodbye` path is needed.
+      let encoded = crate::service::write_goodbye(
+        &w.records,
         scratch,
         owned.ptr(),
         owned.srv(),
         owned.txt(),
         owned.subtypes(),
-        w.snapshot
-          .host_a
+        w.host_a
           .iter()
           .copied()
           .filter(|ip| !retained.contains(&core::net::IpAddr::V4(*ip))),
-        w.snapshot
-          .host_aaaa
+        w.host_aaaa
           .iter()
           .copied()
           .filter(|ip| !retained.contains(&core::net::IpAddr::V6(*ip))),
-        w.snapshot
-          .rename
-          .as_ref()
-          .map(|(old_records, old_owned)| (old_records, old_owned)),
       );
       match encoded {
         Ok(len) => {
-          // A final-ceiling attempt: mark it so the past-ceiling scan
-          // branch never re-selects this withdrawal — the next
-          // `drain_completed_withdrawals` force-completes it.  A normal in-window
-          // send leaves the flag clear; `note_withdrawal_result` advances `next_at`.
           if is_final && let Some((_, w)) = self.withdrawals.get_mut(idx) {
             w.final_attempt = true;
           }
-          return Some((crate::service::multicast_dst(), len, handle));
+          return Some((crate::service::multicast_dst(), len, token));
         }
-        // Encode failure: do NOT return None — that would head-of-line block
-        // the pump on this withdrawal at `now`. Push it past `now` (budget intact)
-        // so it is no longer first-due, then keep scanning later due withdrawals.
-        // The 2 s ceiling still backstops a permanently-unencodable goodbye.
         Err(_) => {
-          if let Some((_, w)) = self.withdrawals.get_mut(idx) {
-            if is_final {
-              // This WAS the final-ceiling attempt and it could not be encoded:
-              // burn it so the past-ceiling scan branch cannot re-select this
-              // withdrawal forever (its goodbye is unencodable). The next
-              // `drain_completed_withdrawals` force-completes it — benign, as a
-              // permanently-unencodable goodbye is abandoned anyway.
-              w.final_attempt = true;
-            } else {
-              let next = now.checked_add_duration(WITHDRAWAL_RETRY_BACKOFF);
-              match next {
-                // Advanced strictly past `now`: the due scan won't re-select it this
-                // call, so the loop makes progress.
-                Some(t) if t > now => w.next_at = t,
-                // The Instant saturated (backoff cannot advance past `now`): zero the
-                // debt so it can never be re-selected as due — otherwise this same
-                // withdrawal would be re-chosen and re-fail forever. Abandoning a
-                // goodbye we can neither encode nor reschedule is benign (the ceiling
-                // would force-complete it anyway).
-                _ => w.owed = [0, 0],
-              }
-            }
-          }
+          self.advance_after_encode_failure(idx, now, is_final);
           continue;
         }
       }
+    }
+  }
+
+  /// Encode-failure scan-progress for one withdrawal item.
+  ///
+  /// An item whose goodbye does not fit `scratch` must NOT head-of-line block the
+  /// pump at `now`. For a NORMAL (non-final) attempt this pushes `next_at`
+  /// strictly past `now` (`now + WITHDRAWAL_RETRY_BACKOFF`, the item's debt budget
+  /// intact) so the due scan won't re-select it this call; if the `Instant`
+  /// saturated (the backoff cannot advance past `now`) the item's debt is zeroed
+  /// so it can never be re-selected as due and re-fail forever (abandoning a
+  /// goodbye we can neither encode nor reschedule is benign — the ceiling would
+  /// force-complete it anyway). For the one FINAL ceiling attempt that could not
+  /// be encoded, `final_attempt` is set so the past-ceiling scan branch cannot
+  /// re-select this item forever; the next `drain_completed_withdrawals`
+  /// force-completes it.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  fn advance_after_encode_failure(&mut self, idx: usize, now: I, is_final: bool) {
+    let Some((_, w)) = self.withdrawals.get_mut(idx) else {
+      return;
+    };
+    if is_final {
+      // This WAS the final-ceiling attempt and it could not be encoded: burn it
+      // so the past-ceiling scan branch cannot re-select this item forever (its
+      // goodbye is unencodable). The next `drain_completed_withdrawals`
+      // force-completes it — benign, as a permanently-unencodable goodbye is
+      // abandoned anyway.
+      w.final_attempt = true;
+      return;
+    }
+    match now.checked_add_duration(WITHDRAWAL_RETRY_BACKOFF) {
+      // Advanced strictly past `now`: the due scan won't re-select it this call,
+      // so the loop makes progress.
+      Some(t) if t > now => w.next_at = t,
+      // The Instant saturated (backoff cannot advance past `now`): zero the
+      // item's debt so it can never be re-selected as due — otherwise this same
+      // item would be re-chosen and re-fail forever.
+      _ => w.owed = [0, 0],
     }
   }
 
@@ -857,9 +1031,10 @@ where
   }
 
   /// Confirm the datagram most recently produced by
-  /// [`Self::poll_withdrawal_transmit`] for `handle`, reporting the outcome for
+  /// [`Self::poll_withdrawal_transmit`] for `token`, reporting the outcome for
   /// EACH address family ([`WithdrawalSend`] for `v4` and `v6`) so withdrawal
-  /// debt is tracked PER FAMILY.
+  /// debt is tracked PER FAMILY. The token names exactly one
+  /// `WithdrawalItem`, so no in-flight-part disambiguation is needed.
   ///
   /// Per family `f`:
   ///   * [`WithdrawalSend::Sent`] — the goodbye reached that family's wire, so
@@ -883,21 +1058,21 @@ where
   /// than delayed a full interval.  Completion (every family's debt cleared, or the
   /// ceiling) is observed via `drain_completed_withdrawals`.
   ///
-  /// A withdrawal therefore frees its route only once EVERY reachable family has
-  /// withdrawn its records: v4-success while v6 stays busy does NOT complete it,
-  /// so if v6 recovers before the 2 s ceiling its peers still receive the TTL=0
-  /// goodbye.
+  /// An item therefore frees its route (route-attached) only once EVERY reachable
+  /// family has withdrawn its records: v4-success while v6 stays busy does NOT
+  /// complete it, so if v6 recovers before the 2 s ceiling its peers still receive
+  /// the TTL=0 goodbye.
   ///
-  /// No-op for an unknown handle.
+  /// No-op for an unknown token.
   #[cfg(any(feature = "alloc", feature = "std"))]
   pub fn note_withdrawal_result(
     &mut self,
-    handle: ServiceHandle,
+    token: WithdrawalToken,
     now: I,
     v4: WithdrawalSend,
     v6: WithdrawalSend,
   ) {
-    let Some((_, w)) = self.withdrawals.iter_mut().find(|(h, _)| *h == handle) else {
+    let Some((_, w)) = self.withdrawals.iter_mut().find(|(t, _)| *t == token) else {
       return;
     };
     let mut progressed = false;
@@ -911,7 +1086,8 @@ where
     // starve a still-busy family of its short-backoff retry, risking a missed
     // last-interval recovery before the ceiling. So a `Sent` on an already-paid
     // family changes nothing — neither the debt nor the schedule.
-    for (debt, outcome) in w.owed.iter_mut().zip([v4, v6]) {
+    let owed = &mut w.owed;
+    for (debt, outcome) in owed.iter_mut().zip([v4, v6]) {
       match outcome {
         WithdrawalSend::Sent if *debt > 0 => {
           // `*debt > 0` here, so this is `-= 1`; `saturating_sub` keeps it free of
@@ -947,24 +1123,33 @@ where
       .min(w.ceiling_at);
   }
 
-  /// Remove every withdrawal that has COMPLETED — either every family's resend
-  /// budget is spent or written off (`owed == [0, 0]`), OR it has passed its
-  /// anti-pin ceiling (`now >= ceiling_at`) AND its one final ceiling attempt has
-  /// been made (`final_attempt`). For each completed withdrawal the route is freed
-  /// (releasing the name for re-registration and decrementing `services_active`),
-  /// and its handle is pushed into `out` so the driver can GC its driver-side
-  /// slot. Call once per pump, after draining withdrawal transmits.
+  /// Remove every withdrawal ITEM that has COMPLETED — either every family's
+  /// resend budget is spent or written off (`owed == [0, 0]`), OR it has passed
+  /// its anti-pin ceiling (`now >= ceiling_at`) AND its one final ceiling attempt
+  /// has been made (`final_attempt`).
   ///
-  /// The ceiling guarantees that a withdrawal whose families are permanently
-  /// unreachable still releases the name — a down family has no reachable peers
-  /// to evict, so force-completing it is benign.
+  /// For each completed item:
+  ///   * a ROUTE-attached item (`route == Some(handle)`) frees its proto route —
+  ///     releasing the name for re-registration and decrementing
+  ///     `services_active` — and pushes `handle` into `out` so the driver can GC
+  ///     its driver-side slot;
+  ///   * a DETACHED item (`route == None`, a renamed-away old name) is simply
+  ///     removed: it owns no route, holds no name, and is reported to NOBODY (push
+  ///     nothing into `out`).
+  ///
+  /// Call once per pump, after draining withdrawal transmits.
+  ///
+  /// The ceiling guarantees that an item whose families are permanently
+  /// unreachable still completes (and a route-attached one releases its name) — a
+  /// down family has no reachable peers to evict, so force-completing it is
+  /// benign.
   ///
   /// The `final_attempt` conjunct gives an owed family ONE last
-  /// goodbye AT the ceiling before the route is freed: a withdrawal that is past
+  /// goodbye AT the ceiling before the item is removed: an item that is past
   /// `ceiling_at` but still owes a family AND has not yet been final-attempted is
   /// NOT completed here — it is left for the very next `poll_withdrawal_transmit`,
   /// whose past-ceiling branch emits that final goodbye and sets `final_attempt`,
-  /// after which this method frees it. The drivers always pump
+  /// after which this method removes it. The drivers always pump
   /// `poll_withdrawal_transmit` (then `note_withdrawal_result`) before this call,
   /// so the final attempt and the free happen within the same pump cycle. An
   /// unencodable / nothing-to-emit goodbye sets `final_attempt` (or zeroes `owed`)
@@ -972,15 +1157,25 @@ where
   /// ceiling waiting for a final attempt that can't be made.
   #[cfg(any(feature = "alloc", feature = "std"))]
   pub fn drain_completed_withdrawals<E: Extend<ServiceHandle>>(&mut self, now: I, out: &mut E) {
-    // Collect completed handles first so the route/withdrawal removals below do
+    // Collect completed tokens first so the route/withdrawal removals below do
     // not fight the iteration borrow.
-    let completed: std::vec::Vec<ServiceHandle> = self
+    let completed: std::vec::Vec<WithdrawalToken> = self
       .withdrawals
       .iter()
       .filter(|(_, w)| w.owed == [0, 0] || (now >= w.ceiling_at && w.final_attempt))
-      .map(|(h, _)| *h)
+      .map(|(t, _)| *t)
       .collect();
-    for handle in completed {
+    for token in completed {
+      // Take the item out; a route-attached one frees its route + reports the
+      // handle, a detached one just vanishes.
+      let Some(pos) = self.withdrawals.iter().position(|(t, _)| *t == token) else {
+        continue;
+      };
+      let (_, item) = self.withdrawals.remove(pos);
+      let Some(handle) = item.route else {
+        // Detached (renamed-away old name): no route, no name, report to nobody.
+        continue;
+      };
       // Free the proto route: releases the name and decrements services_active.
       let key = self
         .services
@@ -996,29 +1191,77 @@ where
         #[cfg(not(feature = "stats"))]
         let _ = removed;
       }
-      self.withdrawals.retain(|(h, _)| *h != handle);
       out.extend(core::iter::once(handle));
     }
   }
 
-  /// Test-only: the PER-FAMILY resend budget (`[v4, v6]`) for a withdrawing
-  /// handle.
+  /// Test-only: the opaque token of the ROUTE-attached withdrawal item for
+  /// `handle`, so a test can confirm/round-trip exactly that item's send. `None`
+  /// if no route-attached item exists for `handle`.
   #[cfg(all(test, any(feature = "alloc", feature = "std")))]
-  fn withdrawal_owed(&self, handle: ServiceHandle) -> Option<[u8; 2]> {
+  fn route_withdrawal_token(&self, handle: ServiceHandle) -> Option<WithdrawalToken> {
     self
       .withdrawals
       .iter()
-      .find(|(h, _)| *h == handle)
+      .find(|(_, w)| w.route == Some(handle))
+      .map(|(t, _)| *t)
+  }
+
+  /// Test-only: confirm a send for the ROUTE-attached item of `handle` by looking
+  /// up its token internally (a no-op if the item is gone). Lets handle-oriented
+  /// tests spend a route withdrawal's debt without threading the token through.
+  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  fn note_route_withdrawal_result(
+    &mut self,
+    handle: ServiceHandle,
+    now: I,
+    v4: WithdrawalSend,
+    v6: WithdrawalSend,
+  ) {
+    if let Some(tok) = self.route_withdrawal_token(handle) {
+      self.note_withdrawal_result(tok, now, v4, v6);
+    }
+  }
+
+  /// Test-only: the PER-FAMILY resend budget (`[v4, v6]`) of the ROUTE-attached
+  /// withdrawal item for `handle` (the current-name goodbye), or `None` if no
+  /// such item exists.
+  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  fn route_withdrawal_owed(&self, handle: ServiceHandle) -> Option<[u8; 2]> {
+    self
+      .withdrawals
+      .iter()
+      .find(|(_, w)| w.route == Some(handle))
       .map(|(_, w)| w.owed)
   }
 
-  /// Test-only: the next scheduled send time for a withdrawing handle.
+  /// Test-only: the PER-FAMILY resend budget (`[v4, v6]`) of the DETACHED
+  /// withdrawal item whose records name `instance` (the renamed-away old-name
+  /// goodbye), or `None` if no such item exists.
   #[cfg(all(test, any(feature = "alloc", feature = "std")))]
-  fn withdrawal_next_at(&self, handle: ServiceHandle) -> Option<I> {
+  fn detached_withdrawal_owed_for(&self, instance: &Name) -> Option<[u8; 2]> {
     self
       .withdrawals
       .iter()
-      .find(|(h, _)| *h == handle)
+      .find(|(_, w)| {
+        w.route.is_none()
+          && w
+            .records
+            .instance()
+            .as_str()
+            .eq_ignore_ascii_case(instance.as_str())
+      })
+      .map(|(_, w)| w.owed)
+  }
+
+  /// Test-only: the next scheduled send time of the ROUTE-attached withdrawal
+  /// item for `handle`.
+  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  fn route_withdrawal_next_at(&self, handle: ServiceHandle) -> Option<I> {
+    self
+      .withdrawals
+      .iter()
+      .find(|(_, w)| w.route == Some(handle))
       .map(|(_, w)| w.next_at)
   }
 
@@ -1728,6 +1971,15 @@ where
         return Err(HandleServiceRenamedError::NameAlreadyRegistered(new_name));
       }
     }
+    // A rename onto a renamed-away old name reclaims it: CANCEL its in-flight
+    // DETACHED goodbye rather than rejecting (same reasoning as the registration
+    // gate — no live owner, the renamed service probes before announcing). This
+    // is the fix: rejecting made the drivers treat a TRANSIENT detached
+    // reservation as a permanent collision and kill the auto-renaming service.
+    #[cfg(any(feature = "alloc", feature = "std"))]
+    self.withdrawals.retain(|(_, item)| {
+      !(item.route.is_none() && item.records.instance().as_str() == new_name.as_str())
+    });
 
     // Apply the rename.
     if let Some(route) = self.services.get_mut(key) {
@@ -5745,7 +5997,6 @@ mod tests {
       ),
       host_a: std::vec![shared, unique],
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
     ep.begin_withdrawal(a_handle, snap, now);
 
@@ -5753,7 +6004,11 @@ mod tests {
     let (_dst, len, got) = ep
       .poll_withdrawal_transmit(now, &mut buf)
       .expect("a due withdrawal must produce a datagram");
-    assert_eq!(got, a_handle, "the withdrawing handle is reported");
+    assert_eq!(
+      Some(got),
+      ep.route_withdrawal_token(a_handle),
+      "the route-attached item for the withdrawing handle is the one emitted"
+    );
 
     let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
     let mut saw_instance = false;
@@ -5833,9 +6088,9 @@ mod tests {
   fn poll_withdrawn_v4(
     ep: &mut TestEndp,
     now: StdInstant,
-  ) -> (std::vec::Vec<Ipv4Addr>, ServiceHandle) {
+  ) -> (std::vec::Vec<Ipv4Addr>, WithdrawalToken) {
     let mut buf = std::vec![0u8; 4096];
-    let (_dst, len, got) = ep
+    let (_dst, len, token) = ep
       .poll_withdrawal_transmit(now, &mut buf)
       .expect("a due withdrawal must produce a datagram");
     let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
@@ -5847,7 +6102,7 @@ mod tests {
         withdrawn.push(Ipv4Addr::new(d[0], d[1], d[2], d[3]));
       }
     }
-    (withdrawn, got)
+    (withdrawn, token)
   }
 
   /// Build a withdrawal snapshot owning PTR/SRV/TXT plus the given host A set.
@@ -5878,7 +6133,6 @@ mod tests {
       ),
       host_a: host_a.to_vec(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     }
   }
 
@@ -5911,8 +6165,12 @@ mod tests {
       now,
     );
 
-    let (withdrawn, got) = poll_withdrawn_v4(&mut ep, now);
-    assert_eq!(got, a);
+    let (withdrawn, token) = poll_withdrawn_v4(&mut ep, now);
+    assert_eq!(
+      token,
+      ep.route_withdrawal_token(a).unwrap(),
+      "the datagram is A's route-attached withdrawal item"
+    );
     assert!(
       withdrawn.contains(&shared),
       "shared addr must be WITHDRAWN: no LIVE sibling actually advertised it"
@@ -5957,8 +6215,12 @@ mod tests {
       now,
     );
 
-    let (withdrawn, got) = poll_withdrawn_v4(&mut ep, now);
-    assert_eq!(got, a);
+    let (withdrawn, token) = poll_withdrawn_v4(&mut ep, now);
+    assert_eq!(
+      token,
+      ep.route_withdrawal_token(a).unwrap(),
+      "the datagram is A's route-attached withdrawal item"
+    );
     assert!(
       !withdrawn.contains(&shared),
       "shared addr must be RETAINED: live sibling B still advertises it"
@@ -6010,27 +6272,27 @@ mod tests {
     );
 
     // Each one's next due round must WITHDRAW the shared address. Confirm the
-    // round so the second poll advances to the other handle.
-    let (withdrawn_1, h1) = poll_withdrawn_v4(&mut ep, now);
+    // round so the second poll advances to the other withdrawer's item.
+    let (withdrawn_1, tok1) = poll_withdrawn_v4(&mut ep, now);
     assert!(
       withdrawn_1.contains(&shared),
-      "first withdrawer ({h1:?}) must withdraw the shared addr (sibling is also leaving)"
+      "first withdrawer ({tok1:?}) must withdraw the shared addr (sibling is also leaving)"
     );
     ep.note_withdrawal_result(
-      h1,
+      tok1,
       now,
       super::WithdrawalSend::Sent,
       super::WithdrawalSend::Sent,
     );
 
-    let (withdrawn_2, h2) = poll_withdrawn_v4(&mut ep, now);
+    let (withdrawn_2, tok2) = poll_withdrawn_v4(&mut ep, now);
     assert_ne!(
-      h1, h2,
-      "the second poll must advance to the OTHER withdrawer"
+      tok1, tok2,
+      "the second poll must advance to the OTHER withdrawer's item"
     );
     assert!(
       withdrawn_2.contains(&shared),
-      "second withdrawer ({h2:?}) must ALSO withdraw the shared addr"
+      "second withdrawer ({tok2:?}) must ALSO withdraw the shared addr"
     );
   }
 
@@ -6068,24 +6330,24 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
     ep.begin_withdrawal(h, snap, now);
+    let token = ep.route_withdrawal_token(h).unwrap();
 
     // A round where NEITHER family sent (both Retry) spends nothing and re-arms at
     // the short backoff.
     ep.note_withdrawal_result(
-      h,
+      token,
       now,
       super::WithdrawalSend::Retry,
       super::WithdrawalSend::Retry,
     );
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
       "a no-send round must not spend either family's resend budget"
     );
-    let backoff_at = ep.withdrawal_next_at(h).unwrap();
+    let backoff_at = ep.route_withdrawal_next_at(h).unwrap();
     assert_eq!(
       backoff_at,
       now
@@ -6103,18 +6365,18 @@ mod tests {
     // A dual-stack delivered round spends exactly one PER family and re-arms at
     // the full interval (progress made).
     ep.note_withdrawal_result(
-      h,
+      token,
       now,
       super::WithdrawalSend::Sent,
       super::WithdrawalSend::Sent,
     );
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([super::WITHDRAWAL_SENDS - 1, super::WITHDRAWAL_SENDS - 1]),
       "a dual-stack delivered round spends exactly one per family"
     );
     assert_eq!(
-      ep.withdrawal_next_at(h).unwrap(),
+      ep.route_withdrawal_next_at(h).unwrap(),
       now
         .checked_add_duration(super::WITHDRAWAL_INTERVAL)
         .unwrap()
@@ -6122,19 +6384,19 @@ mod tests {
 
     // A mixed round (v4 Sent, v6 Retry) spends only v4 and STILL counts as
     // progress (>= 1 Sent), so it re-arms at the full interval.
-    ep.note_withdrawal_result(
+    ep.note_route_withdrawal_result(
       h,
       now,
       super::WithdrawalSend::Sent,
       super::WithdrawalSend::Retry,
     );
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([super::WITHDRAWAL_SENDS - 2, super::WITHDRAWAL_SENDS - 1]),
       "a v4-only round spends only v4's budget; v6 keeps its debt"
     );
     assert_eq!(
-      ep.withdrawal_next_at(h).unwrap(),
+      ep.route_withdrawal_next_at(h).unwrap(),
       now
         .checked_add_duration(super::WITHDRAWAL_INTERVAL)
         .unwrap(),
@@ -6192,22 +6454,22 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
     ep.begin_withdrawal(h, snap, now);
+    let token = ep.route_withdrawal_token(h).unwrap();
 
     // v4 sends every round, v6 is transiently busy (Retry) every round: v4's debt
     // drains, v6's is untouched.
     for _ in 0..super::WITHDRAWAL_SENDS {
       ep.note_withdrawal_result(
-        h,
+        token,
         now,
         super::WithdrawalSend::Sent,
         super::WithdrawalSend::Retry,
       );
     }
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([0, super::WITHDRAWAL_SENDS]),
       "v4 fully sent but v6 (busy) still owes its whole budget"
     );
@@ -6243,14 +6505,14 @@ mod tests {
     // is a no-op there). owed reaches [0, 0] → it completes and frees the name.
     for _ in 0..super::WITHDRAWAL_SENDS {
       ep.note_withdrawal_result(
-        h,
+        token,
         now,
         super::WithdrawalSend::Sent,
         super::WithdrawalSend::Sent,
       );
     }
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([0, 0]),
       "once v6 sends its budget every family's debt is cleared"
     );
@@ -6310,20 +6572,20 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
     ep.begin_withdrawal(h, snap, now);
+    let token = ep.route_withdrawal_token(h).unwrap();
 
     // v6 has no socket (WriteOff zeroes its debt immediately); v4 still owes its
     // full budget after one Sent.
     ep.note_withdrawal_result(
-      h,
+      token,
       now,
       super::WithdrawalSend::Sent,
       super::WithdrawalSend::WriteOff,
     );
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([super::WITHDRAWAL_SENDS - 1, 0]),
       "WriteOff zeroes v6's debt; v4 spent exactly one"
     );
@@ -6331,14 +6593,14 @@ mod tests {
     // v4 sends out its remaining budget; v6 stays written off.
     for _ in 0..(super::WITHDRAWAL_SENDS - 1) {
       ep.note_withdrawal_result(
-        h,
+        token,
         now,
         super::WithdrawalSend::Sent,
         super::WithdrawalSend::WriteOff,
       );
     }
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([0, 0]),
       "v4 fully sent + v6 written off → every family's debt cleared"
     );
@@ -6388,23 +6650,23 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
     ep.begin_withdrawal(h, snap, now);
+    let token = ep.route_withdrawal_token(h).unwrap();
 
     // Drain v4's whole budget while v6 is transiently busy (Retry): v4 → 0, v6
     // keeps its full debt. Each of these rounds DID make real progress on v4
     // (its owed was > 0), so they legitimately re-arm at the full interval.
     for _ in 0..super::WITHDRAWAL_SENDS {
       ep.note_withdrawal_result(
-        h,
+        token,
         now,
         super::WithdrawalSend::Sent,
         super::WithdrawalSend::Retry,
       );
     }
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([0, super::WITHDRAWAL_SENDS]),
       "v4 fully paid; v6 (busy) still owes its whole budget"
     );
@@ -6415,17 +6677,17 @@ mod tests {
     // must re-arm at the SHORT backoff to retry the still-owed v6 soon, NOT wait a
     // full interval (which could miss a late v6 recovery before the 2 s ceiling).
     ep.note_withdrawal_result(
-      h,
+      token,
       now,
       super::WithdrawalSend::Sent,
       super::WithdrawalSend::Retry,
     );
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([0, super::WITHDRAWAL_SENDS]),
       "a redundant `Sent` on the already-paid v4 must not change any debt"
     );
-    let backoff_at = ep.withdrawal_next_at(h).unwrap();
+    let backoff_at = ep.route_withdrawal_next_at(h).unwrap();
     assert_eq!(
       backoff_at,
       now
@@ -6445,14 +6707,14 @@ mod tests {
     // decrements and — v4 already 0 — owed reaches [0, 0] once v6 drains.
     for _ in 0..super::WITHDRAWAL_SENDS {
       ep.note_withdrawal_result(
-        h,
+        token,
         now,
         super::WithdrawalSend::Sent,
         super::WithdrawalSend::Sent,
       );
     }
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([0, 0]),
       "v6 draining its budget clears every family's debt"
     );
@@ -6497,19 +6759,18 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
     ep.begin_withdrawal(h, snap, now);
 
     // v4 written off (its debt → 0); v6 transiently busy (Retry, debt intact).
-    ep.note_withdrawal_result(
+    ep.note_route_withdrawal_result(
       h,
       now,
       super::WithdrawalSend::WriteOff,
       super::WithdrawalSend::Retry,
     );
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([0, super::WITHDRAWAL_SENDS]),
       "WriteOff zeroes ONLY v4; v6's full budget is untouched"
     );
@@ -6560,7 +6821,6 @@ mod tests {
       ),
       host_a: big_a,
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
 
     // B (registered after A): owns only a single PTR — a minimal goodbye that
@@ -6591,7 +6851,6 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
 
     ep.begin_withdrawal(a, snap_a, now);
@@ -6605,13 +6864,14 @@ mod tests {
     let (_dst, _len, got_handle) =
       got.expect("the pump must scan past the encode-failing A and return B's goodbye");
     assert_eq!(
-      got_handle, b,
+      Some(got_handle),
+      ep.route_withdrawal_token(b),
       "B (encodable) is returned; A (encode-failing) did not head-of-line block"
     );
 
     // A was advanced past `now` (no longer first-due at this instant) with its
     // per-family budget intact — the 2 s ceiling remains its backstop.
-    let a_next = ep.withdrawal_next_at(a).unwrap();
+    let a_next = ep.route_withdrawal_next_at(a).unwrap();
     assert!(
       a_next > now,
       "the encode-failing A must have its next_at pushed past now, not left due"
@@ -6624,25 +6884,28 @@ mod tests {
       "A re-arms at the short backoff after an encode failure"
     );
     assert_eq!(
-      ep.withdrawal_owed(a),
+      ep.route_withdrawal_owed(a),
       Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
       "an encode failure must NOT spend A's resend budget"
     );
   }
 
-  /// regression: a teardown DURING a still-draining §9
-  /// conflict-rename goodbye must withdraw BOTH the OLD instance name AND the
-  /// CURRENT (re-announced) instance records + host addresses in ONE datagram.
+  /// Regression: a teardown DURING a still-draining §9 conflict-rename
+  /// goodbye must withdraw BOTH the OLD instance name AND the CURRENT
+  /// (re-announced) instance records + host addresses — emitted as TWO SEPARATE
+  /// single-name datagrams (the current part first, then the rename part), never
+  /// one combined message.
   ///
   /// After a rename A→B the service clears its old instance ownership and
   /// re-announces B, confirming B's PTR/SRV/TXT + host A/AAAA while A's rename
   /// goodbye is still spaced out. If the service is retired in that window the
   /// snapshot carries the CURRENT name B (records + owned + host addrs) PLUS the
-  /// rename's OLD name A (instance-only). The emitted goodbye must retract, at
-  /// TTL 0: A's instance records (PTR/SRV under owner `A`), B's instance records
-  /// (PTR/SRV under owner `B`), and the host A/AAAA — but NOT A's host (a rename
-  /// never withdraws host addrs). The earlier bug withdrew ONLY A, leaking B's
-  /// confirmed records and the host addresses until their TTLs expired.
+  /// rename's OLD name A (instance-only). Both must be retracted at TTL 0: B's
+  /// instance records + host A/AAAA in the current datagram, then A's instance
+  /// records (PTR/SRV under owner `A`, NO host — a rename never withdraws host
+  /// addrs) in the rename datagram. The earlier single combined encoder could
+  /// drop the rename when current ownership was empty, and could fail entirely
+  /// when the combined message exceeded the scratch buffer.
   #[test]
   fn teardown_during_rename_goodbye_withdraws_old_and_new_name() {
     let mut ep = build_endpoint();
@@ -6678,9 +6941,17 @@ mod tests {
       false,
     );
 
-    // Snapshot carries BOTH: current B (records + owned + host addrs) AND the
-    // rename's old A. This is exactly what `Service::withdrawal_snapshot` now
-    // produces when `pending_rename_goodbye` is still set after a re-announce.
+    // A teardown DURING a still-draining rename is now two SEPARATE calls, each
+    // producing one independent item. The rename happened first, so its old-name
+    // (A) goodbye was already enqueued as a DETACHED item; the teardown then
+    // begins the route-attached (B) withdrawal from a current-only snapshot.
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: old_records,
+        owned: old_owned,
+      },
+      now,
+    );
     let snap = crate::service::WithdrawalSnapshot {
       records: recs_b,
       owned: crate::service::EmittedRecords::new(
@@ -6693,64 +6964,833 @@ mod tests {
       ),
       host_a: std::vec![host_v4],
       host_aaaa: std::vec![host_v6],
-      rename: Some((old_records, old_owned)),
     };
     ep.begin_withdrawal(h, snap, now);
 
-    let mut buf = std::vec![0u8; 4096];
-    let (_dst, len, got) = ep
-      .poll_withdrawal_transmit(now, &mut buf)
-      .expect("a due rename-window withdrawal must produce a datagram");
-    assert_eq!(got, h, "the withdrawing handle is reported");
+    // Both items owe a full per-family budget: the route item for B (it advertised
+    // instance + host) and the detached item for A.
+    assert_eq!(
+      ep.route_withdrawal_owed(h),
+      Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
+      "the route-attached current-name (B) item owes a full budget"
+    );
+    assert_eq!(
+      ep.detached_withdrawal_owed_for(&old_name),
+      Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
+      "the detached old-name (A) item owes a full budget independently"
+    );
 
+    let mut buf = std::vec![0u8; 4096];
+
+    // Parse one goodbye datagram into (saw old-A SRV, saw new-B SRV, v4 addrs,
+    // v6 addrs). SRV is owned by the INSTANCE name, so it disambiguates A vs B
+    // directly (the instance PTR is owned by the shared service-type, so it
+    // cannot).
+    let parse = |bytes: &[u8]| {
+      let reader = crate::wire::MessageReader::try_parse(bytes).unwrap();
+      let mut saw_old = false;
+      let mut saw_new = false;
+      let mut v4: std::vec::Vec<Ipv4Addr> = std::vec::Vec::new();
+      let mut v6: std::vec::Vec<std::net::Ipv6Addr> = std::vec::Vec::new();
+      for rec in reader.answers() {
+        let rec = rec.unwrap();
+        assert_eq!(rec.ttl(), 0, "every goodbye record must carry TTL 0");
+        match rec.rtype() {
+          crate::wire::ResourceType::A => {
+            let d = rec.rdata();
+            assert_eq!(d.len(), 4, "A rdata is 4 bytes");
+            v4.push(Ipv4Addr::new(d[0], d[1], d[2], d[3]));
+          }
+          crate::wire::ResourceType::AAAA => {
+            let d = rec.rdata();
+            assert_eq!(d.len(), 16, "AAAA rdata is 16 bytes");
+            let mut o = [0u8; 16];
+            o.copy_from_slice(d);
+            v6.push(std::net::Ipv6Addr::from(o));
+          }
+          crate::wire::ResourceType::Srv => {
+            if names_match(&old_name, rec.name()) {
+              saw_old = true;
+            } else if names_match(&new_name, rec.name()) {
+              saw_new = true;
+            }
+          }
+          _ => {}
+        }
+      }
+      (saw_old, saw_new, v4, v6)
+    };
+
+    // The two items are INDEPENDENT, each emitting its own single-name datagram —
+    // never combined. Drive each by the token the poll returns and classify the
+    // datagram by which name's SRV it carries. Both are due at `now`, so two polls
+    // yield the two names in some order.
+    let token_b = ep.route_withdrawal_token(h).expect("B's route token");
+    let token_a_owed = ep.detached_withdrawal_owed_for(&old_name);
+    assert!(token_a_owed.is_some(), "A's detached item exists");
+
+    let mut saw_new_datagram = false;
+    let mut saw_old_datagram = false;
+    for _ in 0..2 {
+      let (_dst, len, token) = ep
+        .poll_withdrawal_transmit(now, &mut buf)
+        .expect("each rename-window item is due at now and emits its own datagram");
+      let (saw_old, saw_new, withdrawn_v4, withdrawn_v6) = parse(buf.get(..len).unwrap());
+      if saw_new {
+        assert_eq!(token, token_b, "B's datagram round-trips B's route token");
+        assert!(!saw_old, "B's datagram does NOT carry the old name A");
+        assert!(
+          withdrawn_v4.contains(&host_v4) && withdrawn_v6.contains(&host_v6),
+          "the confirmed host A/AAAA addresses are withdrawn with B"
+        );
+        saw_new_datagram = true;
+      } else {
+        assert!(saw_old, "the other datagram carries the old name A");
+        assert_ne!(
+          token, token_b,
+          "A's datagram is a DIFFERENT (detached) item"
+        );
+        assert!(
+          withdrawn_v4.is_empty() && withdrawn_v6.is_empty(),
+          "a rename (old-name) goodbye never withdraws host addresses"
+        );
+        saw_old_datagram = true;
+      }
+      // Confirm this round so the same item is not re-selected before the other.
+      ep.note_withdrawal_result(
+        token,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Sent,
+      );
+    }
+    assert!(
+      saw_new_datagram && saw_old_datagram,
+      "BOTH the current name B and the old name A are withdrawn, as separate datagrams"
+    );
+
+    // The two items are independent: spending B's first round did not touch A's
+    // debt, and vice versa.
+    assert_eq!(
+      ep.route_withdrawal_owed(h),
+      Some([super::WITHDRAWAL_SENDS - 1, super::WITHDRAWAL_SENDS - 1]),
+      "B's route item spent exactly one round of its own budget"
+    );
+    assert_eq!(
+      ep.detached_withdrawal_owed_for(&old_name),
+      Some([super::WITHDRAWAL_SENDS - 1, super::WITHDRAWAL_SENDS - 1]),
+      "A's detached item spent exactly one round of its own budget"
+    );
+  }
+
+  /// Commit 2: a §9 rename enqueues the OLD name's goodbye as an INDEPENDENT
+  /// DETACHED withdrawal item via [`Endpoint::enqueue_rename_withdrawal`] (the
+  /// handoff the driver takes from `Service::take_rename_goodbye_handoff`). The
+  /// item owns the old name, `poll_withdrawal_transmit` emits its TTL=0 instance
+  /// goodbye (no host addresses), and it drains independently — freeing no route
+  /// and reported to nobody on completion.
+  #[test]
+  fn rename_enqueues_a_detached_withdrawal_for_the_old_name() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let old_name = Name::try_from_str("Old._ipp._tcp.local.").unwrap();
+    let new_name = Name::try_from_str("Old-1._ipp._tcp.local.").unwrap();
+
+    // A live service that has just renamed Old → Old-1 (registered under the new
+    // name). The rename produced a handoff for the OLD name's instance goodbye.
+    let recs = ServiceRecords::new(stype.clone(), new_name.clone(), host.clone(), 631, 120);
+    let (_h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now,
+      )
+      .unwrap();
+
+    // No detached item yet.
+    assert!(
+      ep.detached_withdrawal_owed_for(&old_name).is_none(),
+      "no detached item exists before the rename handoff is enqueued"
+    );
+
+    // The driver feeds the rename handoff (old name + instance-only ownership) to
+    // the endpoint — modelling `take_rename_goodbye_handoff()` → enqueue.
+    let old_records = ServiceRecords::new(stype, old_name.clone(), host, 631, 120);
+    let old_owned = crate::service::EmittedRecords::new(
+      true,
+      true,
+      true,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    );
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: old_records,
+        owned: old_owned,
+      },
+      now,
+    );
+
+    // A detached item now owns the OLD name with a full per-family budget.
+    assert_eq!(
+      ep.detached_withdrawal_owed_for(&old_name),
+      Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
+      "the rename enqueues a detached item owning the old name with a full budget"
+    );
+
+    // It emits a TTL=0 instance goodbye for the OLD name (PTR/SRV/TXT), no host
+    // addresses; the returned token is NOT a route token (it holds no route).
+    let mut buf = std::vec![0u8; 4096];
+    let (_dst, len, token) = ep
+      .poll_withdrawal_transmit(now, &mut buf)
+      .expect("the detached old-name item is due and emits its goodbye");
     let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
-    let mut saw_old_instance = false; // PTR/SRV owned by the OLD name A
-    let mut saw_new_instance = false; // PTR/SRV owned by the CURRENT name B
-    let mut withdrawn_v4: std::vec::Vec<Ipv4Addr> = std::vec::Vec::new();
-    let mut withdrawn_v6: std::vec::Vec<std::net::Ipv6Addr> = std::vec::Vec::new();
+    let mut saw_old_srv = false;
+    let mut saw_host_addr = false;
     for rec in reader.answers() {
       let rec = rec.unwrap();
-      assert_eq!(rec.ttl(), 0, "every goodbye record must carry TTL 0");
+      assert_eq!(rec.ttl(), 0, "every rename-goodbye record carries TTL 0");
       match rec.rtype() {
-        crate::wire::ResourceType::A => {
-          let d = rec.rdata();
-          assert_eq!(d.len(), 4, "A rdata is 4 bytes");
-          withdrawn_v4.push(Ipv4Addr::new(d[0], d[1], d[2], d[3]));
-        }
-        crate::wire::ResourceType::AAAA => {
-          let d = rec.rdata();
-          assert_eq!(d.len(), 16, "AAAA rdata is 16 bytes");
-          let mut o = [0u8; 16];
-          o.copy_from_slice(d);
-          withdrawn_v6.push(std::net::Ipv6Addr::from(o));
-        }
-        // SRV is owned by the INSTANCE name, so it disambiguates A vs B directly.
-        // (The instance PTR is owned by the shared service-type, so it cannot.)
         crate::wire::ResourceType::Srv => {
           if names_match(&old_name, rec.name()) {
-            saw_old_instance = true;
-          } else if names_match(&new_name, rec.name()) {
-            saw_new_instance = true;
+            saw_old_srv = true;
           }
         }
+        crate::wire::ResourceType::A | crate::wire::ResourceType::AAAA => saw_host_addr = true,
         _ => {}
       }
     }
     assert!(
-      saw_old_instance,
-      "the OLD name A's instance records (SRV owner A) must be withdrawn at TTL 0"
+      saw_old_srv,
+      "the detached goodbye withdraws the OLD instance's SRV at TTL 0"
     );
     assert!(
-      saw_new_instance,
-      "the CURRENT name B's instance records (SRV owner B) must ALSO be withdrawn at TTL 0"
+      !saw_host_addr,
+      "a rename (old-name) goodbye never withdraws host A/AAAA"
+    );
+
+    // Drain BEFORE the item completes: it holds no route, so nothing is reported.
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert!(
+      done.is_empty(),
+      "a detached item reports no handle while still in flight"
     );
     assert!(
-      withdrawn_v4.contains(&host_v4),
-      "the confirmed host A address must be withdrawn (it was leaking before the fix)"
+      ep.detached_withdrawal_owed_for(&old_name).is_some(),
+      "the detached item is still owed after one (unconfirmed-by-drain) round"
+    );
+
+    // Spend its budget by its own token; it completes and is removed silently.
+    for _ in 0..super::WITHDRAWAL_SENDS {
+      ep.note_withdrawal_result(
+        token,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Sent,
+      );
+    }
+    assert_eq!(
+      ep.detached_withdrawal_owed_for(&old_name),
+      Some([0, 0]),
+      "the detached old-name budget is fully spent"
+    );
+    let mut done2: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done2);
+    assert!(
+      done2.is_empty(),
+      "a completed detached item frees no route and reports to nobody"
     );
     assert!(
-      withdrawn_v6.contains(&host_v6),
-      "the confirmed host AAAA address must be withdrawn"
+      ep.detached_withdrawal_owed_for(&old_name).is_none(),
+      "the completed detached item is removed"
+    );
+
+    // No-op guard: an empty-ownership handoff enqueues nothing.
+    let empty_owned = crate::service::EmittedRecords::new(
+      false,
+      false,
+      false,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    );
+    let empty_records = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("Empty._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: empty_records,
+        owned: empty_owned,
+      },
+      now,
+    );
+    assert!(
+      ep.detached_withdrawal_owed_for(&Name::try_from_str("Empty._ipp._tcp.local.").unwrap())
+        .is_none(),
+      "an empty-ownership handoff is a no-op (nothing for peers to evict)"
+    );
+  }
+
+  /// Regression: a RENAME-ONLY withdrawal snapshot — empty current
+  /// ownership and no host addresses, but a pending OLD-name rename goodbye — must
+  /// NOT be treated as nothing-to-withdraw. `Service::withdrawal_snapshot` has
+  /// already consumed the pending rename, so if `begin_withdrawal` zeroed every
+  /// part's debt the old name would be freed WITHOUT ever sending its goodbye (it
+  /// would ghost until TTL). The current part owes nothing (`[0, 0]`) while the
+  /// rename part owes a full budget, and `poll_withdrawal_transmit` emits the old
+  /// name's instance goodbye.
+  #[test]
+  fn rename_only_withdrawal_emits_old_name_goodbye() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let old_name = Name::try_from_str("Old._ipp._tcp.local.").unwrap();
+    let cur_name = Name::try_from_str("Cur._ipp._tcp.local.").unwrap();
+
+    // A registered service whose CURRENT records own nothing on the wire (it
+    // renamed away before re-announcing) — its snapshot has empty current
+    // ownership and no host addresses.
+    let cur_recs = ServiceRecords::new(stype.clone(), cur_name, host.clone(), 631, 120);
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(cur_recs.clone()),
+        now,
+      )
+      .unwrap();
+
+    // The OLD name's still-in-flight rename goodbye (instance-only PTR+SRV).
+    let old_records = ServiceRecords::new(stype, old_name.clone(), host, 631, 120);
+    let old_owned = crate::service::EmittedRecords::new(
+      true,
+      true,
+      false,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    );
+
+    // The rename happened first: enqueue the old name's goodbye as its own
+    // detached item. The teardown then begins a current-only withdrawal whose
+    // snapshot owns nothing on the wire.
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: old_records,
+        owned: old_owned,
+      },
+      now,
+    );
+    let snap = crate::service::WithdrawalSnapshot {
+      records: cur_recs,
+      // CURRENT owns nothing on the wire.
+      owned: crate::service::EmittedRecords::new(
+        false,
+        false,
+        false,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+    };
+    ep.begin_withdrawal(h, snap, now);
+
+    // The route-attached current-name item owes nothing (it advertised nothing on
+    // the wire). The DETACHED old-name item owes a full budget — so the old name
+    // is NOT treated as nothing-to-withdraw and will actually be emitted.
+    assert_eq!(
+      ep.route_withdrawal_owed(h),
+      Some([0, 0]),
+      "the route-attached current-name item owes nothing"
+    );
+    assert_eq!(
+      ep.detached_withdrawal_owed_for(&old_name),
+      Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
+      "the detached old-name item owes a full per-family budget"
+    );
+
+    // The OLD name's goodbye MUST be emitted (the core regression: a rename-only
+    // teardown must not drop it). Poll until a datagram carrying the old name's
+    // SRV appears; the empty route item produces no datagram (it head-of-line
+    // completes in place), so the only datagram is the detached old-name goodbye.
+    let mut buf = std::vec![0u8; 4096];
+    let detached_token = {
+      let (_dst, len, token) = ep
+        .poll_withdrawal_transmit(now, &mut buf)
+        .expect("the detached old-name item must still produce the old-name goodbye");
+      let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
+      let mut saw_old = false;
+      for rec in reader.answers() {
+        let rec = rec.unwrap();
+        assert_eq!(rec.ttl(), 0);
+        if rec.rtype() == crate::wire::ResourceType::Srv && names_match(&old_name, rec.name()) {
+          saw_old = true;
+        }
+      }
+      assert!(
+        saw_old,
+        "the OLD name's instance records are withdrawn at TTL 0 (separate detached item)"
+      );
+      token
+    };
+
+    // The empty route item completes immediately — its handle IS reported on this
+    // drain (it owns no records to withdraw). The detached old-name item is
+    // independent: it is still owed, so it is NOT freed here, and it reports to
+    // NOBODY when it eventually completes (it holds no route/name).
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert!(
+      done.contains(&h),
+      "the (empty) route-attached item completes immediately and reports its handle"
+    );
+    assert!(
+      ep.detached_withdrawal_owed_for(&old_name).is_some(),
+      "the detached old-name item is still in flight (not yet fully sent)"
+    );
+
+    // Spend the detached item's budget by its own token; it then completes and is
+    // removed silently (reported to nobody — it owns no route).
+    for _ in 0..super::WITHDRAWAL_SENDS {
+      ep.note_withdrawal_result(
+        detached_token,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Sent,
+      );
+    }
+    assert_eq!(
+      ep.detached_withdrawal_owed_for(&old_name),
+      Some([0, 0]),
+      "the detached old-name budget is fully spent"
+    );
+    let mut done2: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done2);
+    assert!(
+      done2.is_empty(),
+      "a detached old-name item completes silently — no handle reported"
+    );
+    assert!(
+      ep.detached_withdrawal_owed_for(&old_name).is_none(),
+      "the detached old-name item is removed once fully sent"
+    );
+  }
+
+  /// Regression: a rename-window teardown where the current
+  /// goodbye and the old-name goodbye EACH fit the driver scratch individually
+  /// but their COMBINED message would not. The old single-datagram encoder failed
+  /// to encode (combined > scratch) and the ceiling then freed the route having
+  /// sent NEITHER name. Emitting the two as SEPARATE single-name datagrams
+  /// withdraws both. The `len1 + len2 > scratch` assertion proves a combined
+  /// message would not have fit — i.e. the split was necessary.
+  #[test]
+  fn dual_name_each_fits_but_combined_would_not() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let old_name = Name::try_from_str("Old._ipp._tcp.local.").unwrap();
+    let new_name = Name::try_from_str("New._ipp._tcp.local.").unwrap();
+
+    // A big TXT on BOTH names so each single-name goodbye is sizeable; sized so
+    // each fits a modest scratch but the two combined do not.
+    let big_seg = || std::vec![b'x'; 240];
+    let mut recs_b = ServiceRecords::new(stype.clone(), new_name.clone(), host.clone(), 631, 120);
+    for _ in 0..4 {
+      recs_b.add_txt_segment(big_seg());
+    }
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs_b.clone()),
+        now,
+      )
+      .unwrap();
+
+    let mut old_records = ServiceRecords::new(stype, old_name.clone(), host, 631, 120);
+    for _ in 0..4 {
+      old_records.add_txt_segment(big_seg());
+    }
+    let owned_full = crate::service::EmittedRecords::new(
+      true,
+      true,
+      true,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    );
+
+    // The rename happened first → its old-name goodbye is its own detached item;
+    // the teardown then begins the route-attached current-name withdrawal. Two
+    // independent items, each its own single-name datagram.
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: old_records,
+        owned: owned_full.clone(),
+      },
+      now,
+    );
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs_b,
+      owned: owned_full,
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+    };
+    ep.begin_withdrawal(h, snap, now);
+
+    // A scratch that fits each single-name goodbye but NOT their combined message.
+    let mut buf = std::vec![0u8; 1600];
+
+    // Both items are due at `now` and each emits its OWN single-name datagram.
+    // Capture each name's length regardless of poll order, driving each by its
+    // returned token.
+    let mut len_new = 0usize;
+    let mut len_old = 0usize;
+    for _ in 0..2 {
+      let (_d, len, token) = ep
+        .poll_withdrawal_transmit(now, &mut buf)
+        .expect("each single-name goodbye fits its own datagram");
+      let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
+      let mut saw_new = false;
+      let mut saw_old = false;
+      for r in reader.answers() {
+        let r = r.unwrap();
+        if r.rtype() == crate::wire::ResourceType::Srv {
+          if names_match(&new_name, r.name()) {
+            saw_new = true;
+          } else if names_match(&old_name, r.name()) {
+            saw_old = true;
+          }
+        }
+      }
+      if saw_new {
+        assert!(!saw_old, "the current name rides its OWN datagram");
+        len_new = len;
+      } else {
+        assert!(saw_old, "the other datagram carries the old name");
+        len_old = len;
+      }
+      ep.note_withdrawal_result(
+        token,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Sent,
+      );
+    }
+    assert!(
+      len_new > 0 && len_old > 0,
+      "BOTH names were withdrawn, each in its own datagram"
+    );
+
+    // Each single-name datagram fits the scratch, but their COMBINED size would
+    // overflow it — proving the split into independent items was necessary (the
+    // old combined encoder would have failed and dropped both names).
+    assert!(len_new <= buf.len() && len_old <= buf.len());
+    assert!(
+      len_new + len_old > buf.len(),
+      "combined message ({len_new} + {len_old} = {}) would exceed the {}-byte scratch",
+      len_new + len_old,
+      buf.len()
+    );
+  }
+
+  /// Regression: with INDEPENDENT items, an UNENCODABLE current-name
+  /// goodbye (too large for the driver scratch) cannot starve the renamed-away
+  /// old-name goodbye. The detached old-name item is scheduled on its own, so the
+  /// pump emits it despite the route item being unencodable, and the route is
+  /// still force-freed at its own ceiling. The old dual-part design (shared
+  /// schedule + single final-attempt) dropped the old name in exactly this case.
+  #[test]
+  fn independent_items_unencodable_current_does_not_starve_rename() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let old_name = Name::try_from_str("Old._ipp._tcp.local.").unwrap();
+    let cur_name = Name::try_from_str("Cur._ipp._tcp.local.").unwrap();
+
+    // CURRENT name with a big TXT → its goodbye will NOT fit a small scratch.
+    let mut cur_recs = ServiceRecords::new(stype.clone(), cur_name.clone(), host.clone(), 631, 120);
+    for _ in 0..4 {
+      cur_recs.add_txt_segment(std::vec![b'x'; 240]);
+    }
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(cur_recs.clone()),
+        now,
+      )
+      .unwrap();
+
+    // OLD (renamed-away) name, instance-only and small → fits a small scratch.
+    let old_records = ServiceRecords::new(stype, old_name.clone(), host, 631, 120);
+    let old_owned = crate::service::EmittedRecords::new(
+      true,
+      true,
+      false,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    );
+    // The rename happened first → its old-name goodbye is its own detached item;
+    // the teardown then begins the route-attached (huge current) withdrawal.
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: old_records,
+        owned: old_owned,
+      },
+      now,
+    );
+    let snap = crate::service::WithdrawalSnapshot {
+      records: cur_recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+    };
+    ep.begin_withdrawal(h, snap, now);
+
+    // Two independent items: a route-attached (huge current) + a detached (old).
+    assert!(
+      ep.route_withdrawal_owed(h).is_some(),
+      "the current name is a route-attached item"
+    );
+    assert_eq!(
+      ep.detached_withdrawal_owed_for(&old_name),
+      Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
+      "the renamed-away old name is a detached item owing a full budget"
+    );
+
+    // A scratch too small for the current goodbye but big enough for the old one.
+    let mut small = std::vec![0u8; 300];
+    let (_d, len, tok) = ep
+      .poll_withdrawal_transmit(now, &mut small)
+      .expect("the small old-name goodbye is emitted even though the current is unencodable");
+    let reader = crate::wire::MessageReader::try_parse(small.get(..len).unwrap()).unwrap();
+    let saw_old = reader.answers().any(|r| {
+      let r = r.unwrap();
+      r.rtype() == crate::wire::ResourceType::Srv && names_match(&old_name, r.name())
+    });
+    assert!(
+      saw_old,
+      "the renamed-away old name is withdrawn — NOT starved by the unencodable current"
+    );
+    assert_ne!(
+      Some(tok),
+      ep.route_withdrawal_token(h),
+      "the emitted item is the detached old-name item, not the unencodable route item"
+    );
+
+    // The route is held while its withdrawal is in flight (not freed yet).
+    let mut done = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert!(
+      !done.contains(&h),
+      "the route is held while its withdrawal item is still in flight"
+    );
+
+    // Past the ceiling: the route item's goodbye stays unencodable, so its final
+    // ceiling attempt cannot encode but still force-completes the item; the
+    // detached item reaches its own ceiling too. Both terminate; the route frees.
+    let past = now
+      .checked_add_duration(super::WITHDRAWAL_CEILING + core::time::Duration::from_millis(1))
+      .unwrap();
+    let mut guard = 0;
+    while ep.poll_withdrawal_transmit(past, &mut small).is_some() {
+      guard += 1;
+      assert!(
+        guard < 16,
+        "the past-ceiling pump must terminate (each item's final attempt fires once)"
+      );
+    }
+    let mut done2 = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(past, &mut done2);
+    assert!(
+      done2.contains(&h),
+      "the route is force-freed at its ceiling even though the current goodbye never encoded"
+    );
+  }
+
+  /// Regression: a renamed-away old name held by an in-flight
+  /// DETACHED withdrawal item is RECLAIMED by a new registration — the detached
+  /// goodbye is CANCELLED (the renamed-away service no longer owns the name, and
+  /// the reclaiming service probes before announcing, so no late TTL=0 goodbye can
+  /// flush it) rather than the name being rejected. Rejecting would needlessly
+  /// fail a legitimate reuse (and, on the auto-rename path, kill the service).
+  #[test]
+  fn reclaiming_a_detached_name_cancels_its_goodbye() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let old_name = Name::try_from_str("Old._ipp._tcp.local.").unwrap();
+    let cur_name = Name::try_from_str("Cur._ipp._tcp.local.").unwrap();
+
+    let cur_recs = ServiceRecords::new(stype.clone(), cur_name, host.clone(), 631, 120);
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(cur_recs.clone()),
+        now,
+      )
+      .unwrap();
+
+    // Teardown during a rename window: the rename enqueued a DETACHED item owning
+    // `old_name`, and the teardown began a current-only withdrawal that owns
+    // nothing here (isolating the detached item). Keep the current item alive so
+    // the route is still held — the focus is the detached old-name reservation.
+    let old_records = ServiceRecords::new(stype, old_name.clone(), host, 631, 120);
+    let old_owned = crate::service::EmittedRecords::new(
+      true,
+      true,
+      false,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    );
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: old_records,
+        owned: old_owned,
+      },
+      now,
+    );
+    let snap = crate::service::WithdrawalSnapshot {
+      records: cur_recs,
+      owned: crate::service::EmittedRecords::new(
+        false,
+        false,
+        false,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+    };
+    ep.begin_withdrawal(h, snap, now);
+    assert!(
+      ep.detached_withdrawal_owed_for(&old_name).is_some(),
+      "a detached item owns the renamed-away old name"
+    );
+
+    // Reclaiming the old name SUCCEEDS and cancels the detached goodbye.
+    let dup = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      old_name.clone(),
+      Name::try_from_str("other.local.").unwrap(),
+      700,
+      120,
+    );
+    ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(dup),
+      now,
+    )
+    .expect("reclaiming a detached-reserved name succeeds (the goodbye is cancelled)");
+    assert!(
+      ep.detached_withdrawal_owed_for(&old_name).is_none(),
+      "the detached old-name goodbye was cancelled by the reclaim, so no late TTL=0 \
+       goodbye can flush the new registration"
+    );
+  }
+
+  /// Regression: an auto-rename onto a name held only by an in-flight
+  /// DETACHED withdrawal must NOT be rejected — the drivers treat a rename error
+  /// as fatal and would move the service into withdrawal (kill it). The reclaim
+  /// cancels the detached goodbye and the rename succeeds.
+  #[test]
+  fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let target = Name::try_from_str("Target._ipp._tcp.local.").unwrap();
+
+    // A live service that will auto-rename onto `target`.
+    let s_recs = ServiceRecords::new(
+      stype.clone(),
+      Name::try_from_str("S._ipp._tcp.local.").unwrap(),
+      host.clone(),
+      631,
+      120,
+    );
+    let (s, _svc_s) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(s_recs),
+        now,
+      )
+      .unwrap();
+
+    // A second service whose teardown-during-rename leaves a DETACHED item owning
+    // `target` — the name S is about to rename onto.
+    let c2_recs = ServiceRecords::new(
+      stype.clone(),
+      Name::try_from_str("C2._ipp._tcp.local.").unwrap(),
+      host.clone(),
+      632,
+      120,
+    );
+    let (h2, _svc2) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(c2_recs.clone()),
+        now,
+      )
+      .unwrap();
+    let target_records = ServiceRecords::new(stype, target.clone(), host, 633, 120);
+    let target_owned = crate::service::EmittedRecords::new(
+      true,
+      true,
+      false,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    );
+    // C2's rename enqueued a DETACHED item owning `target`; its teardown then
+    // began a current-only withdrawal (owns nothing here).
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: target_records,
+        owned: target_owned,
+      },
+      now,
+    );
+    let snap2 = crate::service::WithdrawalSnapshot {
+      records: c2_recs,
+      owned: crate::service::EmittedRecords::new(
+        false,
+        false,
+        false,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+    };
+    ep.begin_withdrawal(h2, snap2, now);
+    assert!(
+      ep.detached_withdrawal_owed_for(&target).is_some(),
+      "a detached item owns `target`"
+    );
+
+    // S auto-renames onto `target`: the endpoint must NOT reject (the driver would
+    // treat that as fatal) — it cancels the detached goodbye and applies the rename.
+    ep.handle_service_renamed(s, target.clone())
+      .expect("an auto-rename onto a detached-reserved name succeeds (cancels the goodbye)");
+    assert!(
+      ep.detached_withdrawal_owed_for(&target).is_none(),
+      "the detached goodbye for the reclaimed name was cancelled, not left to flush S"
     );
   }
 
@@ -6797,14 +7837,13 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
     ep.begin_withdrawal(h, snap, t0);
     let ceiling = t0.checked_add_duration(super::WITHDRAWAL_CEILING).unwrap();
 
     // Pay v4 fully; v6 is busy each round. v4's debt drains to 0, v6 still owes.
     for _ in 0..super::WITHDRAWAL_SENDS {
-      ep.note_withdrawal_result(
+      ep.note_route_withdrawal_result(
         h,
         t0,
         super::WithdrawalSend::Sent,
@@ -6812,7 +7851,7 @@ mod tests {
       );
     }
     assert_eq!(
-      ep.withdrawal_owed(h),
+      ep.route_withdrawal_owed(h),
       Some([0, super::WITHDRAWAL_SENDS]),
       "v4 paid; v6 still owes its whole budget"
     );
@@ -6823,14 +7862,14 @@ mod tests {
     let t_near = t0
       .checked_add_duration(super::WITHDRAWAL_CEILING - core::time::Duration::from_millis(1))
       .unwrap();
-    ep.note_withdrawal_result(
+    ep.note_route_withdrawal_result(
       h,
       t_near,
       super::WithdrawalSend::Sent,
       super::WithdrawalSend::Retry,
     );
     assert_eq!(
-      ep.withdrawal_next_at(h),
+      ep.route_withdrawal_next_at(h),
       Some(ceiling),
       "the re-arm must be CLAMPED to ceiling_at, not pushed past it"
     );
@@ -6841,7 +7880,11 @@ mod tests {
     let first = ep.poll_withdrawal_transmit(ceiling, &mut buf);
     let (_dst, _len, got) =
       first.expect("the owed family must get a FINAL goodbye attempt at the ceiling");
-    assert_eq!(got, h, "the final attempt is for the owed withdrawal");
+    assert_eq!(
+      Some(got),
+      ep.route_withdrawal_token(h),
+      "the final attempt is for the owed withdrawal"
+    );
 
     // A second poll at the SAME instant must NOT re-emit (final_attempt guards it)
     // — proving the past-ceiling branch fires at most once (no infinite emission).
@@ -6908,7 +7951,6 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
     ep.begin_withdrawal(h, snap, t0);
     let ceiling = t0.checked_add_duration(super::WITHDRAWAL_CEILING).unwrap();
@@ -6963,7 +8005,7 @@ mod tests {
     // Spend the whole per-family resend budget via dual-stack delivered
     // confirmations (both families Sent each round → owed reaches [0, 0]).
     for _ in 0..super::WITHDRAWAL_SENDS {
-      ep.note_withdrawal_result(
+      ep.note_route_withdrawal_result(
         h,
         now,
         super::WithdrawalSend::Sent,
@@ -7063,7 +8105,6 @@ mod tests {
       ),
       host_a: host_a.to_vec(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     }
   }
 
@@ -7127,7 +8168,6 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
-      rename: None,
     };
 
     // Both withdraw at the SAME time (A first in the vec, then B).
@@ -7144,7 +8184,11 @@ mod tests {
     let (_dst, len, got) = ep
       .poll_withdrawal_transmit(now, &mut buf)
       .expect("the pump must scan past the retained-only A and return B's goodbye");
-    assert_eq!(got, b, "the genuine withdrawal B is the one that emits");
+    assert_eq!(
+      Some(got),
+      ep.route_withdrawal_token(b),
+      "the genuine withdrawal B is the one that emits"
+    );
     let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
     assert!(
       reader.answers().count() > 0,
@@ -7154,7 +8198,7 @@ mod tests {
     // A was marked complete in that scan (owed set to [0, 0]), so the NEXT drain
     // frees it AT ONCE — without waiting for the 2 s ceiling.
     assert_eq!(
-      ep.withdrawal_owed(a),
+      ep.route_withdrawal_owed(a),
       Some([0, 0]),
       "the retained-only A must be COMPLETED (owed = [0, 0]) by the scan"
     );
@@ -7224,7 +8268,7 @@ mod tests {
     );
     // But it is COMPLETED — `owed` is [0, 0], so the drain frees it immediately.
     assert_eq!(
-      ep.withdrawal_owed(a),
+      ep.route_withdrawal_owed(a),
       Some([0, 0]),
       "the retained-only withdrawal must be completed (owed = [0, 0]), not left due"
     );
