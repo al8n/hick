@@ -392,7 +392,20 @@ impl State {
   /// [`Self::fire_timeouts`] so a withdrawn service emits no further
   /// probes/announces before the sweep.
   pub(crate) fn flag_service_unregistered(&mut self, h: ServiceHandle) {
-    if let Some(s) = self.services.get_mut(&h) {
+    // If this ctx's withdrawal ALREADY completed and its GC was DEFERRED waiting
+    // for `Service::next` to drain pending updates (`route_freed` — e.g. an
+    // internal §9 conflict retirement), the reader is now gone: GC it immediately
+    // rather than leak the slot forever (the leak class, complete-then-
+    // drop ordering; the cancel-then-complete ordering is GC'd in
+    // `drain_completed_withdrawals`). Otherwise mark it cancelled and let the
+    // driver sweep begin its withdrawal.
+    let route_freed = match self.services.get(&h) {
+      Some(s) => s.route_freed,
+      None => return,
+    };
+    if route_freed {
+      self.services.remove(&h);
+    } else if let Some(s) = self.services.get_mut(&h) {
       s.cancelled = true;
     }
   }
@@ -493,14 +506,20 @@ impl State {
     let mut gcd_any = false;
     while let Some(handle) = self.completed_withdrawals.pop() {
       match self.services.get_mut(&handle) {
-        // No pending updates: GC the ctx now.
-        Some(ctx) if ctx.updates.is_empty() => {
+        // No pending updates, OR the service was DROPPED (cancelled): GC the ctx
+        // now. A cancelled ctx has no `Service` reader left to drain its queue, so
+        // deferring it via `route_freed` would leak the slot forever — later
+        // sweeps skip it (it is already `errored`), so the `services` map would
+        // grow without bound under register/drop churn. Discarding the
+        // undrained updates is safe: the handle is gone (the app no longer reads
+        // them), and any pending rename handoff was already taken at retirement.
+        Some(ctx) if ctx.updates.is_empty() || ctx.cancelled => {
           self.services.remove(&handle);
           gcd_any = true;
         }
-        // Pending updates (e.g. a retirement `Conflict`): defer the GC. Mark
-        // `route_freed` so `Service::next` reclaims the ctx once it drains the
-        // last update, keeping that `Conflict` deliverable.
+        // Pending updates on a STILL-LIVE service (e.g. a retirement `Conflict`):
+        // defer the GC. Mark `route_freed` so `Service::next` reclaims the ctx once
+        // it drains the last update, keeping that `Conflict` deliverable.
         Some(ctx) => ctx.route_freed = true,
         None => {}
       }
@@ -2265,6 +2284,85 @@ mod tests {
     assert!(
       s.next_withdrawal_deadline().is_some(),
       "a withdrawal now exists for the raced drop — not GC'd goodbye-less"
+    );
+  }
+
+  /// Regression: a service DROPPED with an undrained update (e.g. an
+  /// `Established` the app never read) must still be GC'd when its withdrawal
+  /// completes — a cancelled ctx has no `Service::next` reader, so deferring its
+  /// GC on pending updates would leak the slot forever (the `services` map grows
+  /// without bound under register/establish/drop churn).
+  #[test]
+  fn dropped_ctx_with_undrained_update_is_gc_d_not_leaked() {
+    use mdns_proto::{Name, ServiceRecords, ServiceSpec};
+    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+    let t = std::time::Instant::now();
+
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("Svc._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let a = s.register_service(ServiceSpec::new(recs), t).unwrap();
+
+    // An update the app never drained (it dropped the handle without reading).
+    s.services
+      .get_mut(&a)
+      .unwrap()
+      .updates
+      .push_back(ServiceUpdate::Established);
+
+    // Drop the handle (cancel) WITHOUT draining the update; the driver sweep then
+    // begins the (empty, never-announced) withdrawal, which completes on the first
+    // drain.
+    s.flag_service_unregistered(a);
+    s.sweep_cancelled_services(t);
+    s.drain_completed_withdrawals(t);
+
+    assert!(
+      !s.services.contains_key(&a),
+      "a cancelled ctx with an undrained update must be GC'd on withdrawal \
+       completion, not deferred forever (no reader remains) and leaked"
+    );
+  }
+
+  /// Regression: a ctx whose withdrawal
+  /// already completed with its GC DEFERRED (`route_freed`, e.g. an internal §9
+  /// conflict retirement awaiting a `Conflict` read) and is THEN dropped must be
+  /// GC'd — the reader is gone, so deferring it would leak the slot. The
+  /// drain-completed path cannot catch this (the withdrawal already finished and
+  /// is not re-reported), so the drop itself must reclaim it.
+  #[test]
+  fn dropping_a_route_freed_ctx_gc_s_it_not_leaked() {
+    use mdns_proto::{Name, ServiceRecords, ServiceSpec};
+    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+    let t = std::time::Instant::now();
+
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("Svc._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let a = s.register_service(ServiceSpec::new(recs), t).unwrap();
+
+    // Simulate an internally-retired ctx whose withdrawal completed and was
+    // deferred (route_freed) pending a Conflict the app hasn't read.
+    {
+      let ctx = s.services.get_mut(&a).unwrap();
+      ctx.errored = true;
+      ctx.route_freed = true;
+      ctx.updates.push_back(ServiceUpdate::Conflict);
+    }
+
+    // The handle drops before the app reads the Conflict → GC now (no reader).
+    s.flag_service_unregistered(a);
+    assert!(
+      !s.services.contains_key(&a),
+      "dropping a route_freed ctx GCs it (no reader remains), not a leak"
     );
   }
 
