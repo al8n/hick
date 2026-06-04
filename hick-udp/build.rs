@@ -8,11 +8,11 @@
 //! and other Unixes are intentionally out of scope and get none of these cfgs.
 //!
 //! Capability → enabling libc constants (verified against libc 0.2):
-//!   * has_ip_pktinfo     IP_PKTINFO / IP_RECVPKTINFO (+ in_pktinfo parse)
-//!   * has_ipv6_pktinfo   IPV6_PKTINFO + IPV6_RECVPKTINFO
-//!   * has_recv_hoplimit  IP_RECVTTL + IPV6_HOPLIMIT + IPV6_RECVHOPLIMIT (§11)
+//!   * has_ip_pktinfo IP_PKTINFO / IP_RECVPKTINFO (+ in_pktinfo parse)
+//!   * has_ipv6_pktinfo IPV6_PKTINFO + IPV6_RECVPKTINFO
+//!   * has_recv_hoplimit IP_RECVTTL + IPV6_HOPLIMIT + IPV6_RECVHOPLIMIT (§11)
 //!   * has_recv_timestamp SO_TIMESTAMP[NS] + SCM_TIMESTAMP[NS]
-//!   * recv_timestamp_ns  the timestamp cmsg is nanosecond SO_TIMESTAMPNS
+//!   * recv_timestamp_ns the timestamp cmsg is nanosecond SO_TIMESTAMPNS
 //!     (Linux/Android); otherwise it is microsecond SO_TIMESTAMP.
 
 fn main() {

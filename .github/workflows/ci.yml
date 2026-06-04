@@ -110,6 +110,7 @@ jobs:
           targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p hick-smoltcp -p hick-embassy --target thumbv7em-none-eabihf
+      - run: cargo check -p hick-trace --features stats --target thumbv7em-none-eabihf
       # The `mdns-proto` no_std + alloc tier must also build for wasm32 (claimed in
       # its feature-tier table); the thumbv7em check above does not exercise it.
       - run: cargo check -p mdns-proto --no-default-features --features alloc --target wasm32-unknown-unknown

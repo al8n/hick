@@ -246,7 +246,7 @@ impl<N: Net> DriverState<N> {
             // `encode_goodbye` yields None and no goodbye is queued — the
             // rollback stays silent, as it should.
             self.remove_service(handle, now);
-            tracing::debug!(
+            hick_trace::debug!(
               ?handle,
               "RegisterService caller cancelled before reply; rolled back orphan state"
             );
@@ -270,7 +270,7 @@ impl<N: Net> DriverState<N> {
             drop(returned);
             let _ = self.endpoint.cancel_query(handle);
             self.queries.remove(&handle);
-            tracing::debug!(
+            hick_trace::debug!(
               ?handle,
               "StartQuery caller cancelled before reply; rolled back orphan state"
             );
@@ -373,7 +373,7 @@ impl<N: Net> DriverState<N> {
       ),
     };
     if !on_link {
-      tracing::debug!(
+      hick_trace::debug!(
         src = %pkt.src,
         hop_limit = ?pkt.hop_limit,
         "dropping off-link packet (RFC 6762 §11 trust boundary)"
@@ -391,7 +391,7 @@ impl<N: Net> DriverState<N> {
     // untrusted responses here so they never touch `recent_sends`. (Queries,
     // QR=0, are exempt — legacy unicast queriers use ephemeral ports.)
     if packet_is_response(&pkt.data) && pkt.src.port() != hick_udp::constants::MDNS_PORT {
-      tracing::debug!(
+      hick_trace::debug!(
         src = %pkt.src,
         "dropping untrusted response (source port != 5353) before self-send match"
       );
@@ -446,8 +446,8 @@ impl<N: Net> DriverState<N> {
       caller_is_self,
     ) {
       Ok(it) => it,
-      Err(e) => {
-        tracing::debug!(error = %e, src = %pkt.src, "endpoint.handle failed");
+      Err(_e) => {
+        hick_trace::debug!(error = %_e, src = %pkt.src, "endpoint.handle failed");
         return;
       }
     };
@@ -464,8 +464,8 @@ impl<N: Net> DriverState<N> {
         // RouteEvent variant added by mdns-proto is ignored until we wire
         // it up here.
         Ok(_) => {}
-        Err(e) => {
-          tracing::debug!(error = %e, "route event error mid-packet; bailing");
+        Err(_e) => {
+          hick_trace::debug!(error = %_e, "route event error mid-packet; bailing");
           break;
         }
       }
@@ -540,7 +540,7 @@ impl<N: Net> DriverState<N> {
               match endpoint.handle_service_renamed(*handle, renamed.new_name().clone()) {
                 Ok(()) => upd,
                 Err(_) => {
-                  tracing::warn!(
+                  hick_trace::warn!(
                     handle = ?handle,
                     new_name = %renamed.new_name(),
                     "auto-rename collided with another registered service; emitting Conflict"
@@ -726,11 +726,11 @@ impl<N: Net> DriverState<N> {
               ctx.encode_failures = 0;
               break;
             }
-            Err(e) => {
+            Err(_e) => {
               ctx.encode_failures = ctx.encode_failures.saturating_add(1);
-              tracing::warn!(
+              hick_trace::warn!(
                 handle = ?h,
-                error = ?e,
+                error = ?_e,
                 scratch_size = scratch.len(),
                 consecutive_failures = ctx.encode_failures,
                 "Service::poll_transmit failed"
@@ -764,7 +764,7 @@ impl<N: Net> DriverState<N> {
           .map(|c| c.encode_failures >= MAX_CONSECUTIVE_ENCODE_ERRORS)
           .unwrap_or(false);
         if escalate {
-          tracing::warn!(
+          hick_trace::warn!(
             handle = ?h,
             "Service exceeded MAX_CONSECUTIVE_ENCODE_ERRORS; emitting Conflict and unregistering"
           );
@@ -801,10 +801,10 @@ impl<N: Net> DriverState<N> {
         let tx = match endpoint.poll_query_transmit(h, now, scratch) {
           Ok(Some(t)) => t,
           Ok(None) => break,
-          Err(e) => {
-            tracing::warn!(
+          Err(_e) => {
+            hick_trace::warn!(
               handle = ?h,
-              error = ?e,
+              error = ?_e,
               scratch_size = scratch.len(),
               "Endpoint::poll_query_transmit failed; skipping handle this pass"
             );
@@ -1391,7 +1391,7 @@ async fn send_via<N: Net>(
           record_self_send(tracker, body, send_wall);
           credits += 1;
         }
-        Err(e) => tracing::debug!(error = %e, dst = %MDNS_V4_DST, "send_to v4 failed"),
+        Err(_e) => hick_trace::debug!(error = %_e, dst = %MDNS_V4_DST, "send_to v4 failed"),
       }
     }
     if let Some(s) = v6 {
@@ -1401,7 +1401,7 @@ async fn send_via<N: Net>(
           record_self_send(tracker, body, send_wall);
           credits += 1;
         }
-        Err(e) => tracing::debug!(error = %e, dst = %MDNS_V6_DST, "send_to v6 failed"),
+        Err(_e) => hick_trace::debug!(error = %_e, dst = %MDNS_V6_DST, "send_to v6 failed"),
       }
     }
     return credits;
@@ -1419,7 +1419,7 @@ async fn send_via<N: Net>(
         record_self_send(tracker, body, send_wall);
         credits += 1;
       }
-      Err(e) => tracing::debug!(error = %e, dst = %dst, "send_to failed"),
+      Err(_e) => hick_trace::debug!(error = %_e, dst = %dst, "send_to failed"),
     }
   }
   credits
@@ -1645,8 +1645,8 @@ async fn recv_loop<N: Net>(
           r = peek_fut => r,
         }
       };
-      if let Err(e) = ready {
-        tracing::debug!(error = %e, via_v4, "peek_from failed");
+      if let Err(_e) = ready {
+        hick_trace::debug!(error = %_e, via_v4, "peek_from failed");
         return;
       }
       // Data is ready in the socket queue; consume it with PKTINFO.
@@ -1685,11 +1685,11 @@ async fn recv_loop<N: Net>(
         // consumed by recvmsg, so drop+log+continue rather than killing the
         // receive task.
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-          tracing::debug!(error = %e, via_v4, "dropping unusable datagram");
+          hick_trace::debug!(error = %e, via_v4, "dropping unusable datagram");
           continue;
         }
-        Err(e) => {
-          tracing::debug!(error = %e, via_v4, "recv_with_meta failed");
+        Err(_e) => {
+          hick_trace::debug!(error = %_e, via_v4, "recv_with_meta failed");
           return;
         }
       }
@@ -1727,8 +1727,8 @@ async fn recv_loop<N: Net>(
         // through to WSARecvMsg, which consumes it so we make progress.
         Err(ref e) if e.raw_os_error() == Some(WSAEMSGSIZE) => {}
         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-        Err(e) => {
-          tracing::debug!(error = %e, via_v4, "peek_from failed");
+        Err(_e) => {
+          hick_trace::debug!(error = %_e, via_v4, "peek_from failed");
           return;
         }
       }
@@ -1756,11 +1756,11 @@ async fn recv_loop<N: Net>(
         // Oversized datagram consumed + truncated by WSARecvMsg: drop it and
         // keep serving rather than killing the receive task.
         Err(ref e) if e.raw_os_error() == Some(WSAEMSGSIZE) => {
-          tracing::debug!(via_v4, "dropping oversized datagram (WSAEMSGSIZE)");
+          hick_trace::debug!(via_v4, "dropping oversized datagram (WSAEMSGSIZE)");
           continue;
         }
-        Err(e) => {
-          tracing::debug!(error = %e, via_v4, "recv_with_meta (windows) failed");
+        Err(_e) => {
+          hick_trace::debug!(error = %_e, via_v4, "recv_with_meta (windows) failed");
           return;
         }
       }
@@ -1799,8 +1799,8 @@ async fn recv_loop<N: Net>(
             return;
           }
         }
-        Err(e) => {
-          tracing::debug!(error = %e, via_v4, "recv_from failed");
+        Err(_e) => {
+          hick_trace::debug!(error = %_e, via_v4, "recv_from failed");
           return;
         }
       }

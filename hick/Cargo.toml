@@ -35,10 +35,32 @@ embassy = ["hick-embassy", "smoltcp"]
 
 # Forward `tracing` instrumentation. The proto core's `tracing` is no_std-safe
 # (the `tracing` crate is pulled with default-features off). The driver
-# forwards are WEAK (`?`): they instrument hick-reactor / hick-compio only when a
-# std runtime already enabled them, so `--features embassy,tracing` does NOT pull
-# a std driver (and thus no std) into a bare-metal build.
-tracing = ["mdns-proto/tracing", "hick-reactor?/tracing", "hick-compio?/tracing"]
+# forwards are WEAK (`?`): they instrument the drivers only when the relevant
+# driver feature is already enabled, so `--features embassy,tracing` does NOT
+# pull a std driver into a bare-metal build.
+tracing = [
+  "mdns-proto/tracing",
+  "hick-reactor?/tracing",
+  "hick-compio?/tracing",
+  "hick-smoltcp?/tracing",
+  "hick-embassy?/tracing",
+]
+# Forward metrics / stats feature flags across all drivers (same weak-dep
+# discipline as `tracing`: bare-metal builds are unaffected).
+metrics = [
+  "mdns-proto/metrics",
+  "hick-reactor?/metrics",
+  "hick-compio?/metrics",
+  "hick-smoltcp?/metrics",
+  "hick-embassy?/metrics",
+]
+stats = [
+  "mdns-proto/stats",
+  "hick-reactor?/stats",
+  "hick-compio?/stats",
+  "hick-smoltcp?/stats",
+  "hick-embassy?/stats",
+]
 
 [dependencies]
 # Always the alloc-tier core (every driver needs it); the `std` feature adds the

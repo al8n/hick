@@ -597,7 +597,7 @@ impl State {
           match self.endpoint.handle_service_renamed(h, new_name) {
             Ok(()) => {}
             Err(_e) => {
-              tracing::warn!(
+              hick_trace::warn!(
                 handle = ?h,
                 error = ?_e,
                 "auto-rename collided with another local service; emitting Conflict and marking errored"
@@ -674,7 +674,7 @@ impl State {
             // single wake for the queued `Conflict`. Do NOT remove the ctx —
             // that would destroy the `Conflict` before the handle reads it. The
             // slot is freed normally when the `Service` handle drops.
-            tracing::warn!(
+            hick_trace::warn!(
               handle = ?h,
               error = ?_e,
               scratch_size = scratch.len(),
@@ -726,7 +726,7 @@ impl State {
               ctx.terminal_wake_pending = true;
             }
           }
-          tracing::warn!(
+          hick_trace::warn!(
             handle = ?h,
             error = ?_e,
             scratch_size = scratch.len(),

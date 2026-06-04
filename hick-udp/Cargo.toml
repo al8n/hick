@@ -10,7 +10,14 @@ readme = "README.md"
 keywords = ["mdns", "udp", "multicast", "networking"]
 categories = ["network-programming"]
 
+[features]
+default = []
+tracing = ["hick-trace/tracing"]
+metrics = ["hick-trace/metrics"]
+stats = ["hick-trace/stats"]
+
 [dependencies]
+hick-trace = { workspace = true }
 thiserror = "2.0"
 derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
 getifs = "0.6"

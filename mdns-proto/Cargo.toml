@@ -29,7 +29,9 @@ std = ["smol_str/std", "rand/std", "thiserror/std"]
 alloc = ["dep:smol_str", "dep:rand"]
 slab = ["dep:slab"]
 heapless = ["dep:heapless"]
-tracing = ["dep:tracing"]
+tracing = ["hick-trace/tracing"]
+metrics = ["hick-trace/metrics"]
+stats = ["hick-trace/stats"]
 
 # Opt-in stretch test that link-checks panic-freedom via `no-panic`.
 # Disabled by default because std-feature builds transitively pull in
@@ -45,7 +47,7 @@ smol_str = { version = "0.3", default-features = false, optional = true }
 rand = { version = "0.10", default-features = false, features = ["std_rng"], optional = true }
 slab = { version = "0.4", default-features = false, optional = true }
 heapless = { version = "0.9", optional = true }
-tracing = { version = "0.1", default-features = false, optional = true }
+hick-trace = { workspace = true }
 
 [dev-dependencies]
 rand_core = { version = "0.10" }

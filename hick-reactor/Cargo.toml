@@ -18,16 +18,16 @@ default = ["tokio"]
 tokio = ["agnostic-net/tokio"]
 smol = ["agnostic-net/smol"]
 
-# Forward to `mdns-proto`'s `tracing` feature so callers can opt in.
-# The driver itself already emits `tracing::debug!` on socket errors
-# regardless of this feature; turning it on additionally surfaces the
-# proto-layer trace points (Endpoint::handle, observe_send, Service::poll,
-# etc.) at trace/debug levels.
-tracing = ["mdns-proto/tracing"]
+# Enable tracing instrumentation (driver call sites + proto layer).
+tracing = ["mdns-proto/tracing", "hick-trace/tracing"]
+# Forward metrics / stats feature flags.
+metrics = ["mdns-proto/metrics", "hick-trace/metrics"]
+stats = ["mdns-proto/stats", "hick-trace/stats"]
 
 [dependencies]
 mdns-proto = { workspace = true, features = ["std", "slab"] }
 hick-udp.workspace = true
+hick-trace = { workspace = true }
 agnostic-net = { version = "0.3" }
 agnostic-lite = { version = "0.6" }
 async-channel = "2"
@@ -38,7 +38,6 @@ rand = "0.10"
 slab = "0.4"
 smol_str = "0.3"
 thiserror = "2"
-tracing = "0.1"
 
 [dev-dependencies]
 agnostic-net = { version = "0.3", features = ["tokio", "smol"] }

@@ -13,7 +13,14 @@ categories = ["network-programming", "no-std::no-alloc", "embedded"]
 keywords = ["mdns", "dns-sd", "smoltcp", "no-std", "zeroconf"]
 readme = "README.md"
 
+[features]
+default = []
+tracing = ["mdns-proto/tracing", "hick-trace/tracing"]
+metrics = ["mdns-proto/metrics", "hick-trace/metrics"]
+stats = ["mdns-proto/stats", "hick-trace/stats"]
+
 [dependencies]
+hick-trace = { workspace = true }
 mdns-proto = { workspace = true, features = ["alloc", "slab"] }
 rand_core = { version = "0.10", default-features = false }
 smoltcp = { version = "0.13", default-features = false, features = [
