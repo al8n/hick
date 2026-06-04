@@ -12,6 +12,8 @@ use std::vec::Vec;
 
 #[cfg(any(feature = "alloc", feature = "std"))]
 use crate::Name;
+#[cfg(any(feature = "alloc", feature = "std"))]
+use bytes::Bytes;
 
 /// Records advertised by a single registered service.
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -38,7 +40,7 @@ pub struct ServiceRecords {
   /// classified as self.  Set via [`Self::add_aaaa_scoped`].  Always the
   /// same length as `aaaa_addrs`.
   aaaa_scopes: Vec<u32>,
-  txt: Vec<Vec<u8>>,
+  txt: Vec<Bytes>,
   /// RFC 6763 §7.1 subtype browse names, e.g. `_printer._sub._ipp._tcp.local.`.
   /// Each is the full `<sub>._sub.<service_type>` name (derived from
   /// `service_type` at [`Self::add_subtype`] time, so it survives an instance
@@ -141,7 +143,7 @@ impl ServiceRecords {
 
   /// TXT segments as an iterator over byte slices.
   pub fn txt_segments(&self) -> impl Iterator<Item = &[u8]> {
-    self.txt.iter().map(Vec::as_slice)
+    self.txt.iter().map(Bytes::as_ref)
   }
 
   /// Append an IPv4 address.
@@ -180,7 +182,7 @@ impl ServiceRecords {
 
   /// Append a TXT segment.
   pub fn add_txt_segment(&mut self, segment: Vec<u8>) -> &mut Self {
-    self.txt.push(segment);
+    self.txt.push(segment.into());
     self
   }
 

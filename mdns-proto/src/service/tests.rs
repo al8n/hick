@@ -3320,7 +3320,7 @@ fn tiebreak_always_includes_empty_txt() {
         .to_vec();
       peer_probes_a[0].records.push(PeerRecord {
         rtype: rref.rtype(),
-        canonical,
+        canonical: canonical.into(),
       });
     }
 
@@ -3362,7 +3362,7 @@ fn tiebreak_always_includes_empty_txt() {
       .to_vec();
     peer_probes_b[0].records.push(PeerRecord {
       rtype: srv_ref.rtype(),
-      canonical,
+      canonical: canonical.into(),
     });
 
     // peer set {SRV(631)} starts with 0x0021; our set starts with 0x0010 (TXT)
