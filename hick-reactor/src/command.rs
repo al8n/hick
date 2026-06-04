@@ -11,12 +11,16 @@ use mdns_proto::{QueryHandle, QuerySpec, ServiceHandle, ServiceSpec};
 use crate::{
   error::{RegisterError, StartQueryError},
   query::QueryMailbox,
+  service::ServiceMailbox,
 };
 
 /// Reply payload for a successful service registration.
 pub(crate) struct ServiceRegistered {
   pub(crate) handle: ServiceHandle,
-  pub(crate) updates: async_channel::Receiver<mdns_proto::ServiceUpdate>,
+  /// Shared bounded/coalescing update buffer with a reserved terminal slot.
+  pub(crate) mailbox: Arc<Mutex<ServiceMailbox>>,
+  /// Capacity-1 wakeup the driver rings after filling the mailbox.
+  pub(crate) doorbell: async_channel::Receiver<()>,
 }
 
 /// Reply payload for a successful query start.

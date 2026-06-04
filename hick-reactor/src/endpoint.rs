@@ -198,9 +198,12 @@ impl Endpoint {
       })
       .await
       .map_err(|_| RegisterError::DriverGone)?;
-    let ServiceRegistered { handle, updates } =
-      reply_rx.await.map_err(|_| RegisterError::DriverGone)??;
-    Ok(Service::new(handle, updates, self.cmd.clone()))
+    let ServiceRegistered {
+      handle,
+      mailbox,
+      doorbell,
+    } = reply_rx.await.map_err(|_| RegisterError::DriverGone)??;
+    Ok(Service::new(handle, mailbox, doorbell, self.cmd.clone()))
   }
 
   /// Start a new query. The returned [`Query`] streams

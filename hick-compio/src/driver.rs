@@ -33,7 +33,7 @@ impl LocalNotify {
 }
 
 use std::{
-  collections::{HashMap, VecDeque},
+  collections::HashMap,
   time::{Duration, Instant as StdInstant, SystemTime},
 };
 
@@ -108,28 +108,6 @@ pub(crate) enum TransmitOrigin {
   Query(QueryHandle),
 }
 
-/// Whether `upd` is a known lifecycle kind that the coalescer collapses to its
-/// latest occurrence (vs an unknown future `#[non_exhaustive]` variant, which
-/// the bounded backstop in [`push_service_update_coalesced`] handles instead).
-///
-/// `ServiceUpdate` is `#[non_exhaustive]`, so a variant added upstream falls
-/// through to `false` and is bounded by [`MAX_PENDING_SERVICE_UPDATES`] rather
-/// than silently coalescing under semantics we can't know yet.
-fn is_markable(upd: &ServiceUpdate) -> bool {
-  matches!(
-    upd,
-    ServiceUpdate::Established
-      | ServiceUpdate::Renamed(_)
-      | ServiceUpdate::Conflict
-      | ServiceUpdate::HostConflict
-  )
-}
-
-/// Hard cap on a service's pending-update deque. Known lifecycle kinds coalesce
-/// to ≤4 entries; this only bounds hypothetical future `#[non_exhaustive]`
-/// `ServiceUpdate` variants that [`is_markable`] doesn't recognise.
-const MAX_PENDING_SERVICE_UPDATES: usize = 16;
-
 /// Maximum consecutive `Service::poll_transmit` errors before the driver gives
 /// up on a registered service, surfaces [`ServiceUpdate::Conflict`] to the
 /// caller, and marks the service permanently inert (`ServiceCtx::errored`).
@@ -146,61 +124,24 @@ const MAX_PENDING_SERVICE_UPDATES: usize = 16;
 /// indefinitely.
 pub(crate) const MAX_CONSECUTIVE_ENCODE_ERRORS: u8 = 3;
 
-/// Append `upd` to a service's update deque, coalescing so memory stays
-/// bounded under churn while preserving the freshest lifecycle signal:
+/// Driver-side per-service context: the owned proto state machine, the
+/// handle-owned delivery mailbox, and a cancellation flag.
 ///
-/// * markable kinds (`Established` / `Renamed` / `Conflict` / `HostConflict`)
-///   keep only the LATEST update of their kind — drop any prior pending update
-///   of the SAME kind (compared by enum discriminant, so a new `Renamed(b)`
-///   supersedes a pending `Renamed(a)` and a fresh `Established` supersedes a
-///   stale earlier one), then append the new event at the back.
-/// * any future non-markable variant — append but stay bounded by dropping the
-///   oldest entry past [`MAX_PENDING_SERVICE_UPDATES`] (defensive backstop,
-///   unreachable with today's enum).
-///
-/// Dedup is by KIND, not by position, so a genuinely new event of a kind seen
-/// earlier survives: the second `Established` in
-/// `Established -> Renamed -> Established` (the §9 conflict-rename re-probe path,
-/// `mdns_proto::service`) drops the STALE first `Established`, not the new one —
-/// a by-kind-keep-first policy would wrongly discard the post-rename
-/// confirmation that the renamed service is now advertised. The deque therefore
-/// holds at most one entry per kind (≤ 4) regardless of how much an on-link peer
-/// churns conflict-renames. Mirrors the latest-of-kind contract of
-/// `hick-reactor::driver`'s service-update coalescing.
-fn push_service_update_coalesced(updates: &mut VecDeque<ServiceUpdate>, upd: ServiceUpdate) {
-  if is_markable(&upd) {
-    // Known lifecycle event: keep only the latest of its kind.
-    let kind = core::mem::discriminant(&upd);
-    updates.retain(|u| core::mem::discriminant(u) != kind);
-    updates.push_back(upd);
-  } else {
-    // Future non-markable variant: append, bounded by a hard cap (drop oldest
-    // to preserve recency) — defensive backstop, unreachable with today's enum.
-    if updates.len() >= MAX_PENDING_SERVICE_UPDATES {
-      updates.pop_front();
-    }
-    updates.push_back(upd);
-  }
-}
-
-/// Driver-side per-service context: the owned proto state machine, a bounded
-/// and coalescing update queue, and a cancellation flag. Methods land in T8
-/// and the driver loop consumes them in T9.
-///
-/// `updates` is bounded by coalescing in [`push_service_update_coalesced`]:
-/// every known lifecycle kind (`Established` / `Renamed` / `Conflict` /
-/// `HostConflict`) keeps only the LATEST entry of its kind (a new one drops the
-/// prior of the same kind and re-appends at the back) — so the deque holds at
-/// most one of each kind (≤ 4 entries) regardless of churn, with
-/// [`MAX_PENDING_SERVICE_UPDATES`] as a hard-cap backstop for any future
-/// `#[non_exhaustive]` variant that [`is_markable`] doesn't recognise. Keeping
-/// the LATEST (not the first) preserves the post-rename `Established` across an
-/// `Established -> Renamed -> Established` sequence. This stops a hostile on-link
-/// peer from growing the deque without bound by spamming conflict-bearing
-/// packets while the app isn't draining `Service::next`.
+/// App-facing [`ServiceUpdate`]s are delivered through [`ServiceCtx::mailbox`], a
+/// `Rc<RefCell<ServiceMailbox>>` shared with the [`crate::Service`] handle (the
+/// `!Send` analogue of the reactor's `Arc<Mutex<_>>` mailbox). The mailbox bounds
+/// and coalesces non-terminal updates by kind and reserves a slot for the
+/// terminal retirement update, so a hostile on-link peer cannot grow it without
+/// bound and the `Conflict`/`HostConflict` is never dropped. Because the mailbox
+/// is owned by the HANDLE, the driver GCs this ctx UNCONDITIONALLY once its
+/// withdrawal completes — a pending terminal is still delivered to a live reader.
 pub(crate) struct ServiceCtx {
   pub(crate) proto: ProtoService,
-  pub(crate) updates: VecDeque<ServiceUpdate>,
+  /// Handle-owned delivery buffer the driver fills with [`ServiceUpdate`]s and
+  /// the [`crate::Service`] handle drains via [`crate::Service::next`]. Shared
+  /// `Rc<RefCell<_>>`; outlives this ctx (held by the handle), so the reserved
+  /// terminal survives an immediate ctx GC.
+  pub(crate) mailbox: Rc<RefCell<crate::service::ServiceMailbox>>,
   pub(crate) cancelled: bool,
   /// Count of consecutive `proto.poll_transmit` errors for this service. Reset
   /// to 0 on any `Ok` (a successful encode or an empty queue); incremented on
@@ -208,38 +149,13 @@ pub(crate) struct ServiceCtx {
   /// is escalated to [`ServiceUpdate::Conflict`] and marked [`Self::errored`].
   pub(crate) encode_failures: u8,
   /// Terminal "this service is structurally dead" flag. Set once a persistent
-  /// encode failure escalated to `Conflict`. Unlike the reactor — which removes
-  /// the `ServiceCtx` immediately after emitting `Conflict` because its updates
-  /// live in an independently-buffered channel — the compio `ServiceUpdate`s
-  /// live INSIDE `ServiceCtx.updates`, which `Service::next` drains directly.
-  /// Removing the ctx here would destroy the `Conflict` before the handle could
-  /// read it (the exact silent-failure this fix closes), so instead the ctx is
-  /// kept but flagged `errored`: every proto-polling pump skips it (so a dead
-  /// proto can't be re-polled into a busy-spin) while the already-queued
-  /// `Conflict` stays readable. The route is freed (and the ctx GC'd) when the
-  /// endpoint-owned withdrawal that this retirement begins completes (the
-  /// `begin_service_withdrawal` → `drain_completed_withdrawals` path), or — for a
-  /// graceful drop — once that withdrawal's [`Self::route_freed`] GC fires.
+  /// encode failure escalated to `Conflict` (or the service was retired into an
+  /// endpoint-owned withdrawal). The escalation routes the `Conflict` into the
+  /// handle-owned mailbox's reserved terminal slot — which outlives the ctx — so
+  /// the driver GCs the ctx UNCONDITIONALLY on withdrawal completion without
+  /// losing the `Conflict`. Meanwhile `errored` makes every proto-polling pump
+  /// skip this ctx so a finished proto can't be re-polled into a busy-spin.
   pub(crate) errored: bool,
-  /// One-shot "wake a parked `Service::next` for the escalation `Conflict`"
-  /// flag. The escalation pushes `Conflict` into `updates` from inside the
-  /// transmit pump, which is NOT the wake-bearing path: [`Self::errored`] makes
-  /// every later pump skip this ctx, so `push_service_updates` no longer reports
-  /// it as needing a wake. Set this once at escalation;
-  /// [`State::push_service_updates`] consumes it to fire exactly one `notify`,
-  /// so a handle parked on an otherwise-idle endpoint (no other service / query
-  /// / withdrawal deadline) still gets woken to read the `Conflict`. Cleared after
-  /// that single wake so an undrained `Conflict` can't drive a notify busy-spin.
-  pub(crate) conflict_wake_pending: bool,
-  /// Set when this service's endpoint-owned RFC 6762 §10.1 withdrawal has already
-  /// COMPLETED (its route is freed) but the ctx is RETAINED because it still holds
-  /// un-drained app-facing updates — typically the `Conflict` queued at an internal
-  /// retirement. Such a ctx is GC'd LAZILY: by [`State::drain_completed_withdrawals`]
-  /// on a later iteration, or by `Service::next` the moment it pops the last update.
-  /// This keeps the `Conflict` deliverable even when the withdrawal completes in the
-  /// SAME loop iteration that began it (an empty, never-announced withdrawal
-  /// completes immediately). Mirrors `hick-smoltcp`'s `ServiceSlot::route_freed`.
-  pub(crate) route_freed: bool,
 }
 
 /// Driver-side per-query context: last-delivered sequence number and a
@@ -262,8 +178,10 @@ pub(crate) struct QueryCtx {
   /// One-shot: armed when `errored` is first set, consumed by the run loop to
   /// fire exactly one `notify` so a `Query::next` parked on an otherwise-idle
   /// endpoint wakes to observe the end-of-stream. Cleared after firing so an
-  /// undrained terminal can't drive a notify busy-spin (mirrors
-  /// `ServiceCtx::conflict_wake_pending`).
+  /// undrained terminal can't drive a notify busy-spin. (A retiring SERVICE has
+  /// no equivalent flag: its terminal lands in the handle-owned mailbox and the
+  /// withdrawal it begins carries the wake — its deadline re-settles the driver
+  /// and the completion GC notifies.)
   pub(crate) terminal_wake_pending: bool,
 }
 
@@ -331,12 +249,16 @@ impl State {
     }
   }
 
-  /// Register a service spec with the endpoint and create an empty driver-side
-  /// context for it. T11 wires the per-service update channel into [`ServiceCtx`].
+  /// Register a service spec with the endpoint and create a driver-side context
+  /// for it, holding the driver's clone of the handle-owned delivery `mailbox`
+  /// (the [`crate::Service`] handle holds the other clone). The driver fills the
+  /// mailbox in [`Self::push_service_updates`] / the escalation paths; the handle
+  /// drains it via [`crate::Service::next`].
   pub(crate) fn register_service(
     &mut self,
     spec: mdns_proto::ServiceSpec,
     now: StdInstant,
+    mailbox: Rc<RefCell<crate::service::ServiceMailbox>>,
   ) -> Result<ServiceHandle, mdns_proto::error::RegisterServiceError> {
     let (handle, svc) = self
       .endpoint
@@ -345,15 +267,28 @@ impl State {
       handle,
       ServiceCtx {
         proto: svc,
-        updates: VecDeque::new(),
+        mailbox,
         cancelled: false,
         encode_failures: 0,
         errored: false,
-        conflict_wake_pending: false,
-        route_freed: false,
       },
     );
     Ok(handle)
+  }
+
+  /// Test-only: register a service with a freshly-created handle-owned mailbox.
+  /// The mailbox is stashed in the resulting [`ServiceCtx`], so a test inspects
+  /// what the driver delivered via `s.services.get(&h).unwrap().mailbox` (the
+  /// `*_for_test` mailbox helpers). Lets the State-seam tests register without
+  /// threading a mailbox through.
+  #[cfg(test)]
+  pub(crate) fn test_register_service(
+    &mut self,
+    spec: mdns_proto::ServiceSpec,
+    now: StdInstant,
+  ) -> Result<ServiceHandle, mdns_proto::error::RegisterServiceError> {
+    let mailbox = crate::service::new_service_mailbox();
+    self.register_service(spec, now, mailbox)
   }
 
   /// Start a query against the endpoint and create an empty driver-side context
@@ -384,28 +319,22 @@ impl State {
     }
   }
 
-  /// Flag a service as withdrawn (called from [`Service::drop`]). The actual
-  /// retirement — beginning the endpoint-owned RFC 6762 §10.1 withdrawal — is
-  /// deferred to the driver loop's [`Self::sweep_cancelled_services`], which runs
-  /// after the transmit pump so any in-flight send latches first. The `cancelled`
-  /// flag is meanwhile honoured by [`Self::poll_one_transmit`] and
+  /// Flag a service as withdrawn (called from [`crate::Service::drop`]). The
+  /// actual retirement — beginning the endpoint-owned RFC 6762 §10.1 withdrawal —
+  /// is deferred to the driver loop's [`Self::sweep_cancelled_services`], which
+  /// runs after the transmit pump so any in-flight send latches first. The
+  /// `cancelled` flag is meanwhile honoured by [`Self::poll_one_transmit`] and
   /// [`Self::fire_timeouts`] so a withdrawn service emits no further
   /// probes/announces before the sweep.
+  ///
+  /// A dropped handle is simply marked `cancelled`: its ctx is reclaimed
+  /// UNCONDITIONALLY when the withdrawal completes
+  /// ([`Self::drain_completed_withdrawals`]). Any pending terminal lives in the
+  /// handle-owned mailbox, which outlives the ctx, so there is no GC-defer arm to
+  /// keep here (the former `route_freed` special-case is gone — it existed only
+  /// because updates used to live in the ctx).
   pub(crate) fn flag_service_unregistered(&mut self, h: ServiceHandle) {
-    // If this ctx's withdrawal ALREADY completed and its GC was DEFERRED waiting
-    // for `Service::next` to drain pending updates (`route_freed` — e.g. an
-    // internal §9 conflict retirement), the reader is now gone: GC it immediately
-    // rather than leak the slot forever (the leak class, complete-then-
-    // drop ordering; the cancel-then-complete ordering is GC'd in
-    // `drain_completed_withdrawals`). Otherwise mark it cancelled and let the
-    // driver sweep begin its withdrawal.
-    let route_freed = match self.services.get(&h) {
-      Some(s) => s.route_freed,
-      None => return,
-    };
-    if route_freed {
-      self.services.remove(&h);
-    } else if let Some(s) = self.services.get_mut(&h) {
+    if let Some(s) = self.services.get_mut(&h) {
       s.cancelled = true;
     }
   }
@@ -487,15 +416,21 @@ impl State {
 
   /// Free + GC every endpoint-owned withdrawal that COMPLETED (its resend budget
   /// is spent or it hit the 2 s anti-pin ceiling). The endpoint releases each
-  /// route (decrementing `services_active`); the driver then GCs its ctx — but
-  /// DEFERS the GC for a ctx whose `updates` deque still holds an undrained
-  /// app-facing update (typically the `Conflict` queued at an internal
-  /// retirement), marking it [`ServiceCtx::route_freed`] so `Service::next` GCs it
-  /// the moment it pops the last update. This preserves the `Conflict` even when
-  /// the (empty, never-announced) withdrawal completes in the SAME iteration that
-  /// began it. Call once per loop iteration, after draining withdrawal transmits.
-  /// Returns `true` if at least one ctx was GC'd immediately (so the caller can
-  /// wake any handle parked on an otherwise-idle endpoint).
+  /// route (decrementing `services_active`); the driver then GCs its driver ctx
+  /// UNCONDITIONALLY.
+  ///
+  /// The GC is unconditional because app-facing updates no longer live in the ctx:
+  /// any pending terminal (`Conflict`/`HostConflict`) sits in the handle-owned
+  /// mailbox, which is owned by the [`crate::Service`] handle and OUTLIVES this
+  /// ctx. Removing the ctx therefore cannot lose a terminal — a still-live reader
+  /// drains it from the mailbox, and a dropped handle has no reader to lose it to.
+  /// This is what closes the former leak class (a cancelled ctx with an
+  /// undrained update used to be deferred via `route_freed` and leaked forever)
+  /// AND the lost-terminal class (the `Conflict` survives a withdrawal completing
+  /// in the SAME iteration that began it). Call once per loop iteration, after
+  /// draining withdrawal transmits. Returns `true` if at least one ctx was GC'd
+  /// (so the caller can wake any handle parked on an otherwise-idle endpoint to
+  /// observe its end-of-stream).
   pub(crate) fn drain_completed_withdrawals(&mut self, now: StdInstant) -> bool {
     // `completed_withdrawals` and `endpoint` are disjoint fields; clear the
     // reused scratch and let the endpoint push the completed handles into it.
@@ -505,23 +440,10 @@ impl State {
       .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
     let mut gcd_any = false;
     while let Some(handle) = self.completed_withdrawals.pop() {
-      match self.services.get_mut(&handle) {
-        // No pending updates, OR the service was DROPPED (cancelled): GC the ctx
-        // now. A cancelled ctx has no `Service` reader left to drain its queue, so
-        // deferring it via `route_freed` would leak the slot forever — later
-        // sweeps skip it (it is already `errored`), so the `services` map would
-        // grow without bound under register/drop churn. Discarding the
-        // undrained updates is safe: the handle is gone (the app no longer reads
-        // them), and any pending rename handoff was already taken at retirement.
-        Some(ctx) if ctx.updates.is_empty() || ctx.cancelled => {
-          self.services.remove(&handle);
-          gcd_any = true;
-        }
-        // Pending updates on a STILL-LIVE service (e.g. a retirement `Conflict`):
-        // defer the GC. Mark `route_freed` so `Service::next` reclaims the ctx once
-        // it drains the last update, keeping that `Conflict` deliverable.
-        Some(ctx) => ctx.route_freed = true,
-        None => {}
+      // Unconditional GC: the handle-owned mailbox carries any pending terminal,
+      // so reclaiming the ctx never loses an app-facing update.
+      if self.services.remove(&handle).is_some() {
+        gcd_any = true;
       }
     }
     gcd_any
@@ -584,9 +506,11 @@ impl State {
   }
 
   /// Drain pending `ServiceUpdate`s out of each per-service proto state machine
-  /// into the driver-side `ctx.updates` deque so `Service::next` can pop them.
-  /// Returns `true` if at least one update was pushed (so the caller knows to
-  /// bump `notify` and wake any parked listener).
+  /// into the handle-owned [`crate::service::ServiceMailbox`] so
+  /// [`crate::Service::next`] can pop them: terminal kinds (`Conflict` /
+  /// `HostConflict`) go to the reserved terminal slot, everything else to the
+  /// coalescing non-terminal ring. Returns `true` if at least one update was
+  /// pushed (so the caller knows to bump `notify` and wake any parked listener).
   pub(crate) fn push_service_updates(&mut self, now: StdInstant) -> bool {
     let mut pushed_any = false;
     // Iterate by handle (not `values_mut`) so each iteration can take DISJOINT
@@ -595,38 +519,31 @@ impl State {
     // `self.endpoint` out.
     let handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
     for h in handles {
-      // A structurally-dead proto (see `ServiceCtx::errored`) is never polled —
-      // it can't produce more updates. Its escalation `Conflict` was already
-      // queued into `ctx.updates` by the transmit pump and is drained directly
-      // by `Service::next`, not through this pump. But the pump IS the
-      // wake-bearing path, so consume the one-shot `conflict_wake_pending` here
-      // to fire exactly one `notify` for that queued `Conflict` (so a handle
-      // parked on an otherwise-idle endpoint still wakes), then skip the proto.
+      // A structurally-dead proto (see `ServiceCtx::errored`) is never polled — it
+      // can't produce more updates. Its escalation `Conflict` already sits in the
+      // handle-owned mailbox's reserved terminal slot and is drained directly by
+      // `Service::next`; the wake for it is carried by the withdrawal the
+      // escalation began (its deadline re-settles the driver, and the completion
+      // GC notifies), so there is nothing to do here but skip the proto.
       if self.services.get(&h).is_some_and(|c| c.errored) {
-        if let Some(ctx) = self.services.get_mut(&h)
-          && ctx.conflict_wake_pending
-        {
-          ctx.conflict_wake_pending = false;
-          pushed_any = true;
-        }
         continue;
       }
       // Drain this service's proto events one at a time. A `Renamed` requires
       // routing the endpoint to the new instance name BEFORE the update is
       // surfaced; everything else is queued directly.
-      // Each `proto.poll()` returns an owned `Option<ServiceUpdate>` and drops
-      // its `&mut` borrow before the body runs, so the body can re-borrow
+      // Each `proto.poll()` returns an owned `Option<ServiceUpdate>` and drops its
+      // `&mut` borrow before the body runs, so the body can re-borrow
       // `self.services` / `self.endpoint` freely.
       while let Some(upd) = self.services.get_mut(&h).and_then(|c| c.proto.poll()) {
         // RFC 6762 §9 auto-rename: the proto picked a new instance name after a
         // probe conflict and has already mutated its own records to it. The
-        // endpoint's route table still points at the OLD name, so datagrams for
-        // the new name (and local rename-collision detection) won't route until
-        // we call `handle_service_renamed`. Do it BEFORE surfacing the update,
-        // mirroring `hick-reactor::driver`. If the proto rejects the new name
-        // (already owned by another local service), the service has already
-        // rebranded and can't be kept: surface `Conflict`, flag it errored so
-        // every pump skips it, and stop draining it.
+        // endpoint's route table still points at the OLD name, so datagrams for the
+        // new name (and local rename-collision detection) won't route until we call
+        // `handle_service_renamed`. Do it BEFORE surfacing the update, mirroring
+        // `hick-reactor::driver`. If the proto rejects the new name (already owned
+        // by another local service), the service has already rebranded and can't be
+        // kept: surface `Conflict`, flag it errored so every pump skips it, and stop
+        // draining it.
         if let ServiceUpdate::Renamed(ref renamed) = upd {
           let new_name = renamed.new_name().clone();
           let rename_result = self.endpoint.handle_service_renamed(h, new_name);
@@ -650,34 +567,36 @@ impl State {
               "auto-rename collided with another local service; emitting Conflict and beginning withdrawal"
             );
             // The new name collides with another LOCAL service; this service has
-            // already rebranded and can't be kept. Surface `Conflict` into the
-            // in-ctx deque (drained directly by `Service::next`) and arm the
-            // one-shot wake, then begin the endpoint-owned withdrawal for the
+            // already rebranded and can't be kept. Record `Conflict` in the
+            // handle-owned mailbox's reserved terminal slot (drained directly by
+            // `Service::next`), then begin the endpoint-owned withdrawal for the
             // CURRENT name; the endpoint holds the route (keeping the name reserved)
             // while it resends, freeing the name on completion. The OLD name's
             // goodbye was already enqueued above as its own detached item. The ctx
-            // is KEPT (not removed) so this queued `Conflict` still reaches the host;
-            // it is GC'd by `drain_completed_withdrawals` once the withdrawal
-            // completes (deferred via `route_freed` while the `Conflict` is
-            // undrained).
-            if let Some(ctx) = self.services.get_mut(&h) {
-              push_service_update_coalesced(&mut ctx.updates, ServiceUpdate::Conflict);
-              ctx.conflict_wake_pending = true;
+            // is GC'd UNCONDITIONALLY by `drain_completed_withdrawals` once the
+            // withdrawal completes — the mailbox outlives it, so the `Conflict`
+            // survives.
+            if let Some(ctx) = self.services.get(&h) {
+              ctx
+                .mailbox
+                .borrow_mut()
+                .set_terminal(ServiceUpdate::Conflict);
             }
             // The `ctx` borrow above ends at the closing `}`. Begin the
             // endpoint-owned withdrawal IN-ITERATION (non-bypassable — this
             // `while let` only borrows `self.services` transiently and there is no
-            // transmit early-return here). `begin_service_withdrawal` sets
-            // `errored` and holds the route; it touches `self.services`/
-            // `self.endpoint` only, no iterator invalidation, and `begin_withdrawal`
-            // is idempotent.
+            // transmit early-return here). `begin_service_withdrawal` sets `errored`
+            // and holds the route; it touches `self.services`/`self.endpoint` only,
+            // no iterator invalidation, and `begin_withdrawal` is idempotent.
             self.begin_service_withdrawal(h, now);
             pushed_any = true;
             break;
           }
         }
-        if let Some(ctx) = self.services.get_mut(&h) {
-          push_service_update_coalesced(&mut ctx.updates, upd);
+        if let Some(ctx) = self.services.get(&h) {
+          // Route by kind: `push_update` forwards terminals to the reserved slot
+          // and coalesces non-terminals into the bounded ring.
+          ctx.mailbox.borrow_mut().push_update(upd);
         }
         // Wake on every drained proto update regardless of whether coalescing
         // dropped it, so a parked `Service::next` still re-checks state. This
@@ -742,14 +661,15 @@ impl State {
             ctx.encode_failures = ctx.encode_failures.saturating_add(1);
             if ctx.encode_failures >= MAX_CONSECUTIVE_ENCODE_ERRORS {
               // Persistent encode failure: the records can't fit `max_payload`.
-              // Push `Conflict` into the in-ctx update deque (the handle drains
-              // it directly via `Service::next`) and arm the one-shot
-              // `conflict_wake_pending` so the next `push_service_updates` fires a
-              // single wake for the queued `Conflict`. Do NOT remove the ctx — that
-              // would destroy the `Conflict` before the handle reads it; the ctx is
-              // GC'd by `drain_completed_withdrawals` once the withdrawal completes.
-              // The post-match `begin_service_withdrawal` marks it `errored` so
-              // every proto-polling pump skips it from here on.
+              // Record `Conflict` in the handle-owned mailbox's reserved terminal
+              // slot (the handle drains it directly via `Service::next`). Do NOT
+              // remove the ctx — but unlike before, the mailbox outlives the ctx, so
+              // the `Conflict` survives the UNCONDITIONAL GC the post-match
+              // `begin_service_withdrawal` → `drain_completed_withdrawals` performs
+              // on completion. The withdrawal it begins also carries the wake (its
+              // deadline re-settles the driver; the completion GC notifies).
+              // `begin_service_withdrawal` marks the ctx `errored` so every
+              // proto-polling pump skips it from here on.
               hick_trace::warn!(
                 handle = ?h,
                 error = ?_e,
@@ -757,10 +677,12 @@ impl State {
                 consecutive_failures = ctx.encode_failures,
                 "Service::poll_transmit failed; escalating to Conflict and beginning withdrawal"
               );
-              push_service_update_coalesced(&mut ctx.updates, ServiceUpdate::Conflict);
-              ctx.conflict_wake_pending = true;
-              // `ctx` (and its borrow of `self.services`) ends here at the
-              // closing brace of this block, before the post-match
+              ctx
+                .mailbox
+                .borrow_mut()
+                .set_terminal(ServiceUpdate::Conflict);
+              // `ctx` (and its borrow of `self.services`) ends here at the closing
+              // brace of this block, before the post-match
               // `begin_service_withdrawal` call below.
               true
             } else {
@@ -1363,9 +1285,9 @@ pub(crate) async fn run(
     }
 
     // 1b. drain pending `ServiceUpdate`s out of each per-service proto state
-    //     machine and into the driver-side `ctx.updates` deque so listeners
-    //     parked on `Service::next` can pop them.  The borrow is brief and is
-    //     dropped before any `.await`.
+    //     machine and into the handle-owned `ServiceMailbox` so listeners parked
+    //     on `Service::next` can pop them.  The borrow is brief and is dropped
+    //     before any `.await`.
     //
     //     ORDERING NOTE: this runs before the withdrawal pump (1a) below so a
     //     rename-collision withdrawal begun HERE (`push_service_updates` calls
@@ -1593,9 +1515,10 @@ fn present_socket_send_outcome<T>(res: &std::io::Result<T>) -> WithdrawalSend {
 /// drains at most one round per withdrawal per call and cannot busy-spin.
 ///
 /// After the pump, `drain_completed_withdrawals` frees each completed route
-/// (decrementing `services_active`) and GCs its driver ctx — deferring the GC of a
-/// ctx that still holds an undrained `Conflict` (`route_freed`), so that `Conflict`
-/// survives a withdrawal completing in the same iteration that began it.
+/// (decrementing `services_active`) and GCs its driver ctx UNCONDITIONALLY. The
+/// terminal `Conflict` lives in the handle-owned mailbox (which outlives the ctx),
+/// so it survives a withdrawal completing in the same iteration that began it
+/// without any GC-defer.
 ///
 /// Per-family [`WithdrawalSend`] is mapped by socket PRESENCE, not error kind:
 ///   * present socket, `Ok` → [`WithdrawalSend::Sent`] (spend one owed round);
@@ -2120,7 +2043,7 @@ mod tests {
     let host = Name::try_from_str("g.local.").unwrap();
     let mut recs = ServiceRecords::new(stype.clone(), inst.clone(), host.clone(), 1234, 120);
     recs.add_a([127, 0, 0, 1].into());
-    let handle = s.register_service(ServiceSpec::new(recs), t0).unwrap();
+    let handle = s.test_register_service(ServiceSpec::new(recs), t0).unwrap();
     let mut t = establish_service(&mut s, handle, t0);
 
     // Begin the withdrawal: the ctx is KEPT (errored) and the route is held.
@@ -2135,7 +2058,7 @@ mod tests {
     dup.add_a([127, 0, 0, 1].into());
     assert!(
       matches!(
-        s.register_service(ServiceSpec::new(dup), t),
+        s.test_register_service(ServiceSpec::new(dup), t),
         Err(RegisterServiceError::NameAlreadyRegistered(_))
       ),
       "a same-name registration must be rejected while the withdrawal holds the name"
@@ -2174,7 +2097,7 @@ mod tests {
     let mut recs2 = ServiceRecords::new(stype, inst, host, 1234, 120);
     recs2.add_a([127, 0, 0, 1].into());
     assert!(
-      s.register_service(ServiceSpec::new(recs2), t).is_ok(),
+      s.test_register_service(ServiceSpec::new(recs2), t).is_ok(),
       "the proto-layer route slot must be freed once the withdrawal completes"
     );
   }
@@ -2196,7 +2119,7 @@ mod tests {
     let host = Name::try_from_str("s.local.").unwrap();
     let mut recs = ServiceRecords::new(stype, inst, host, 1234, 120);
     recs.add_a([127, 0, 0, 1].into());
-    let handle = s.register_service(ServiceSpec::new(recs), t0).unwrap();
+    let handle = s.test_register_service(ServiceSpec::new(recs), t0).unwrap();
     let t = establish_service(&mut s, handle, t0);
 
     // What `Service::drop` does — flag only, no retirement.
@@ -2259,7 +2182,7 @@ mod tests {
       631,
       120,
     );
-    let a = s.register_service(ServiceSpec::new(recs), t).unwrap();
+    let a = s.test_register_service(ServiceSpec::new(recs), t).unwrap();
 
     // A normal sweep finds nothing — A's handle is still held.
     assert!(
@@ -2287,11 +2210,13 @@ mod tests {
     );
   }
 
-  /// Regression: a service DROPPED with an undrained update (e.g. an
-  /// `Established` the app never read) must still be GC'd when its withdrawal
-  /// completes — a cancelled ctx has no `Service::next` reader, so deferring its
-  /// GC on pending updates would leak the slot forever (the `services` map grows
-  /// without bound under register/establish/drop churn).
+  /// Regression: a service DROPPED with an undrained
+  /// update (e.g. an `Established` the app never read) must still be GC'd when its
+  /// withdrawal completes. The ctx GC is now UNCONDITIONAL — there is no
+  /// pending-update defer arm to leak the slot — and the undrained update lives in
+  /// the handle-owned mailbox, so discarding the (dropped) handle's mailbox loses
+  /// nothing. This closes the original leak class at the root: the `services`
+  /// map cannot grow without bound under register/establish/drop churn.
   #[test]
   fn dropped_ctx_with_undrained_update_is_gc_d_not_leaked() {
     use mdns_proto::{Name, ServiceRecords, ServiceSpec};
@@ -2305,14 +2230,16 @@ mod tests {
       631,
       120,
     );
-    let a = s.register_service(ServiceSpec::new(recs), t).unwrap();
+    let a = s.test_register_service(ServiceSpec::new(recs), t).unwrap();
 
-    // An update the app never drained (it dropped the handle without reading).
+    // An update the app never drained (it dropped the handle without reading). It
+    // lives in the handle-owned mailbox now, not the ctx.
     s.services
-      .get_mut(&a)
+      .get(&a)
       .unwrap()
-      .updates
-      .push_back(ServiceUpdate::Established);
+      .mailbox
+      .borrow_mut()
+      .push_update(ServiceUpdate::Established);
 
     // Drop the handle (cancel) WITHOUT draining the update; the driver sweep then
     // begins the (empty, never-announced) withdrawal, which completes on the first
@@ -2323,19 +2250,20 @@ mod tests {
 
     assert!(
       !s.services.contains_key(&a),
-      "a cancelled ctx with an undrained update must be GC'd on withdrawal \
-       completion, not deferred forever (no reader remains) and leaked"
+      "a cancelled ctx with an undrained update must be GC'd UNCONDITIONALLY on \
+       withdrawal completion, never deferred and leaked"
     );
   }
 
-  /// Regression: a ctx whose withdrawal
-  /// already completed with its GC DEFERRED (`route_freed`, e.g. an internal §9
-  /// conflict retirement awaiting a `Conflict` read) and is THEN dropped must be
-  /// GC'd — the reader is gone, so deferring it would leak the slot. The
-  /// drain-completed path cannot catch this (the withdrawal already finished and
-  /// is not re-reported), so the drop itself must reclaim it.
+  /// Regression: a ctx
+  /// whose withdrawal already completed and is THEN dropped must be GC'd — and its
+  /// terminal `Conflict`, recorded in the HANDLE-OWNED mailbox, must STILL be
+  /// observable by a live reader. The mailbox outlives the ctx, so unconditional
+  /// ctx GC at withdrawal completion cannot lose the terminal: a still-live
+  /// `Service` handle drains it. This is the observable property the old
+  /// `route_freed` drop-GC defer existed to protect, now structural.
   #[test]
-  fn dropping_a_route_freed_ctx_gc_s_it_not_leaked() {
+  fn completed_ctx_gc_keeps_terminal_observable_by_live_reader() {
     use mdns_proto::{Name, ServiceRecords, ServiceSpec};
     let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
     let t = std::time::Instant::now();
@@ -2347,22 +2275,101 @@ mod tests {
       631,
       120,
     );
-    let a = s.register_service(ServiceSpec::new(recs), t).unwrap();
+    let a = s.test_register_service(ServiceSpec::new(recs), t).unwrap();
 
-    // Simulate an internally-retired ctx whose withdrawal completed and was
-    // deferred (route_freed) pending a Conflict the app hasn't read.
-    {
-      let ctx = s.services.get_mut(&a).unwrap();
-      ctx.errored = true;
-      ctx.route_freed = true;
-      ctx.updates.push_back(ServiceUpdate::Conflict);
-    }
+    // The live reader's clone of the handle-owned mailbox (what the `Service`
+    // handle holds). The internal retirement records the terminal `Conflict` here.
+    let reader_mailbox = Rc::clone(&s.services.get(&a).unwrap().mailbox);
 
-    // The handle drops before the app reads the Conflict → GC now (no reader).
-    s.flag_service_unregistered(a);
+    // Simulate an internally-retired service: record the terminal `Conflict` in
+    // the reserved slot and begin its (empty, never-announced) withdrawal, which
+    // completes on the first drain.
+    reader_mailbox
+      .borrow_mut()
+      .set_terminal(ServiceUpdate::Conflict);
+    s.begin_service_withdrawal(a, t);
+    s.drain_completed_withdrawals(t);
+
+    // The ctx is GC'd UNCONDITIONALLY on completion (no defer) ...
     assert!(
       !s.services.contains_key(&a),
-      "dropping a route_freed ctx GCs it (no reader remains), not a leak"
+      "the completed ctx is GC'd unconditionally — no pending-terminal defer"
+    );
+    // ... yet the reserved `Conflict` is STILL observable by the live reader,
+    // because the mailbox is handle-owned and outlives the ctx.
+    assert!(
+      matches!(
+        reader_mailbox.borrow_mut().drain_for_test(),
+        Some(ServiceUpdate::Conflict)
+      ),
+      "the terminal Conflict must survive the immediate ctx GC and be drainable \
+       by a live reader (mailbox outlives the ctx)"
+    );
+  }
+
+  /// Task-required: a FULL non-terminal ring plus a reserved terminal must both
+  /// survive an immediate ctx GC and be fully drainable by a live reader. Fill the
+  /// ring to the cap WITHOUT draining, `set_terminal(Conflict)`, complete the
+  /// withdrawal so the ctx is GC'd immediately, then drain from the live handle —
+  /// the `Conflict` IS observed and the ctx is gone from `services`.
+  #[test]
+  fn terminal_survives_full_mailbox_and_immediate_ctx_gc() {
+    use mdns_proto::{Name, ServiceRecords, ServiceSpec};
+    let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+    let t = std::time::Instant::now();
+
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("Svc._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let a = s.test_register_service(ServiceSpec::new(recs), t).unwrap();
+
+    // The live reader's clone of the handle-owned mailbox.
+    let reader_mailbox = Rc::clone(&s.services.get(&a).unwrap().mailbox);
+
+    // Fill the non-terminal ring to the cap (no draining) and reserve the terminal.
+    {
+      let mut mb = reader_mailbox.borrow_mut();
+      mb.fill_non_terminal_to_cap_for_test();
+      mb.set_terminal(ServiceUpdate::Conflict);
+      assert_eq!(
+        mb.non_terminal_len(),
+        crate::service::SERVICE_UPDATE_CAPACITY,
+        "the non-terminal ring is full"
+      );
+      assert!(mb.has_terminal(), "the terminal slot is reserved");
+    }
+
+    // Complete the (empty, never-announced) withdrawal so the ctx is GC'd at once.
+    s.begin_service_withdrawal(a, t);
+    s.drain_completed_withdrawals(t);
+    assert!(
+      !s.services.contains_key(&a),
+      "the ctx must be gone from `services` after the withdrawal completes"
+    );
+
+    // Drain from the LIVE handle: every non-terminal first, then the reserved
+    // Conflict — none lost to the immediate ctx GC.
+    let mut non_terminal = 0usize;
+    let mut got_terminal = false;
+    while let Some(upd) = reader_mailbox.borrow_mut().drain_for_test() {
+      match upd {
+        ServiceUpdate::Conflict => got_terminal = true,
+        _ => non_terminal += 1,
+      }
+    }
+    assert_eq!(
+      non_terminal,
+      crate::service::SERVICE_UPDATE_CAPACITY,
+      "every buffered non-terminal update survives the ctx GC"
+    );
+    assert!(
+      got_terminal,
+      "the reserved Conflict IS observed by the live reader after the immediate \
+       ctx GC (mailbox is handle-owned and outlives the ctx)"
     );
   }
 
@@ -2406,7 +2413,7 @@ mod tests {
 
     // 1. Register A and drive it to an announced state so its withdrawal snapshot
     //    is non-empty (records were confirmed-emitted).
-    let a = s.register_service(mk(), t0).unwrap();
+    let a = s.test_register_service(mk(), t0).unwrap();
     let mut t = establish_service(&mut s, a, t0);
 
     // 2. Drop A: flag cancelled (what `Service::drop` does), then the driver's
@@ -2421,7 +2428,7 @@ mod tests {
     // 3. While the withdrawal is in flight the SAME name must be rejected.
     assert!(
       matches!(
-        s.register_service(mk(), t),
+        s.test_register_service(mk(), t),
         Err(RegisterServiceError::NameAlreadyRegistered(_))
       ),
       "a same-name registration must be rejected while the withdrawal holds the name"
@@ -2455,7 +2462,7 @@ mod tests {
     );
 
     // 5. The name is freed → a same-name replacement now registers successfully.
-    s.register_service(mk(), t)
+    s.test_register_service(mk(), t)
       .expect("the same name must be re-registerable once the withdrawal completes");
   }
 
@@ -2479,128 +2486,16 @@ mod tests {
   // completion, and `drop_defers_withdrawal_to_driver_sweep` covers the deferred-
   // snapshot timing the old `drop_defers_goodbye_to_driver_sweep` test guarded.
 
-  /// Build a `ServiceUpdate::Renamed` carrying `name` (a `*.local.` instance
-  /// name). `ServiceRenamed::new` is `#[doc(hidden)]` but public — the same
-  /// constructor the reactor's tests use to synthesize renames.
-  fn renamed(name: &str) -> ServiceUpdate {
-    ServiceUpdate::Renamed(mdns_proto::ServiceRenamed::new(
-      mdns_proto::Name::try_from_str(name).unwrap(),
-    ))
-  }
-
-  /// One-time/idempotent kinds (`Established` / `Conflict` / `HostConflict`)
-  /// must dedup by kind: repeated pushes of the same kind never grow the
-  /// deque past one entry of that kind. This is the core memory-DoS guard —
-  /// a peer spamming conflict-bearing packets can't inflate the queue.
-  #[test]
-  fn coalesce_dedups_one_time_kinds() {
-    let mut d: VecDeque<ServiceUpdate> = VecDeque::new();
-
-    for _ in 0..5 {
-      push_service_update_coalesced(&mut d, ServiceUpdate::Established);
-    }
-    assert_eq!(d.len(), 1, "Established must dedup to a single entry");
-
-    for _ in 0..3 {
-      push_service_update_coalesced(&mut d, ServiceUpdate::Conflict);
-    }
-    assert_eq!(
-      d.iter()
-        .filter(|u| matches!(u, ServiceUpdate::Conflict))
-        .count(),
-      1,
-      "Conflict must be present exactly once after 3 pushes"
-    );
-
-    push_service_update_coalesced(&mut d, ServiceUpdate::HostConflict);
-    push_service_update_coalesced(&mut d, ServiceUpdate::HostConflict);
-    assert_eq!(
-      d.iter()
-        .filter(|u| matches!(u, ServiceUpdate::HostConflict))
-        .count(),
-      1,
-      "HostConflict must be present exactly once"
-    );
-
-    // Established + Conflict + HostConflict = 3 distinct kinds, one each.
-    assert_eq!(d.len(), 3, "three distinct one-time kinds, one entry each");
-  }
-
-  /// A new `Renamed` must drop any prior pending `Renamed` and re-append at the
-  /// back, so the deque keeps exactly one rename carrying the LATEST name —
-  /// the only one the caller acts on.
-  #[test]
-  fn coalesce_keeps_latest_rename() {
-    let mut d: VecDeque<ServiceUpdate> = VecDeque::new();
-    push_service_update_coalesced(&mut d, renamed("a.local."));
-    push_service_update_coalesced(&mut d, renamed("b.local."));
-
-    assert_eq!(
-      d.iter()
-        .filter(|u| matches!(u, ServiceUpdate::Renamed(_)))
-        .count(),
-      1,
-      "only the latest Renamed must remain"
-    );
-    match d.back() {
-      Some(ServiceUpdate::Renamed(r)) => {
-        assert_eq!(
-          r.new_name().as_str(),
-          "b.local.",
-          "the surviving Renamed must carry the latest name"
-        );
-      }
-      other => panic!("expected a Renamed at the back, got {other:?}"),
-    }
-  }
-
-  /// RFC 6762 §9 conflict path: a service reaches `Established`, a peer
-  /// conflict drives a `Renamed`, then the renamed service re-announces and the
-  /// proto emits a SECOND `Established`. The coalescer must surface that final
-  /// `Established` — dropping the STALE first one and keeping the new one. A
-  /// by-kind-keep-first policy would wrongly discard the post-rename
-  /// confirmation that the renamed service is now advertised.
-  #[test]
-  fn coalesce_keeps_post_rename_established() {
-    let mut d: VecDeque<ServiceUpdate> = VecDeque::new();
-    push_service_update_coalesced(&mut d, ServiceUpdate::Established);
-    push_service_update_coalesced(&mut d, renamed("renamed.local."));
-    push_service_update_coalesced(&mut d, ServiceUpdate::Established);
-
-    assert!(
-      d.iter().any(|u| matches!(u, ServiceUpdate::Established)),
-      "post-rename Established must survive coalescing, got {d:?}"
-    );
-    assert!(
-      d.iter().any(|u| matches!(u, ServiceUpdate::Renamed(_))),
-      "the rename must also survive, got {d:?}"
-    );
-    assert_eq!(
-      d.iter()
-        .filter(|u| matches!(u, ServiceUpdate::Established))
-        .count(),
-      1,
-      "exactly one Established retained (latest), got {d:?}"
-    );
-  }
-
-  /// Under realistic churn — a peer interleaving every update kind many times —
-  /// the deque must stay bounded to the ≤4-distinct-kinds invariant.
-  #[test]
-  fn coalesce_bounds_total() {
-    let mut d: VecDeque<ServiceUpdate> = VecDeque::new();
-    for i in 0..50 {
-      push_service_update_coalesced(&mut d, ServiceUpdate::Established);
-      push_service_update_coalesced(&mut d, ServiceUpdate::Conflict);
-      push_service_update_coalesced(&mut d, ServiceUpdate::HostConflict);
-      push_service_update_coalesced(&mut d, renamed(&format!("r-{i}.local.")));
-    }
-    assert!(
-      d.len() <= 4,
-      "coalesced deque must stay within the ≤4-kind bound, got {}",
-      d.len()
-    );
-  }
+  // The per-kind coalescing + drop-oldest backstop + reserved-terminal contract
+  // now lives in `crate::service::ServiceMailbox`; its unit tests
+  // (`mailbox_coalesces_established_and_renamed_by_kind`,
+  // `mailbox_rename_churn_coalesces_within_cap`, `mailbox_hard_cap_drops_oldest`,
+  // `mailbox_terminal_reserved_under_non_terminal_pressure`, …) own that surface.
+  // The driver-side `push_service_update_coalesced` free function + its
+  // `coalesce_*` tests were removed in the handle-owned-mailbox migration: the
+  // driver now routes proto updates straight into the mailbox
+  // (`push_update` for non-terminal kinds, `set_terminal` for Conflict/HostConflict),
+  // so there is no driver-local deque to coalesce.
 
   /// transmit-liveness regression: a service whose records cannot be
   /// encoded into the configured `max_payload` must NOT silently stall. The
@@ -2611,13 +2506,13 @@ mod tests {
   ///
   /// The fix counts consecutive encode failures per service and, at
   /// [`MAX_CONSECUTIVE_ENCODE_ERRORS`], escalates to `ServiceUpdate::Conflict`
-  /// (queued in the in-ctx `updates` deque, NOT dropped) and flags the service
-  /// `errored` so it is skipped by every later proto-polling pump. This test
-  /// drives `poll_one_transmit` with a deliberately tiny scratch buffer and
-  /// asserts: (a) the failure counter climbs one per call, (b) at the threshold
-  /// a `Conflict` lands in `updates` and `errored` is set, and (c) a subsequent
-  /// `poll_one_transmit` skips the errored service (returns `None` when it's the
-  /// only one) rather than re-polling its dead proto.
+  /// (recorded in the handle-owned mailbox's reserved terminal slot, NOT dropped)
+  /// and flags the service `errored` so it is skipped by every later proto-polling
+  /// pump. This test drives `poll_one_transmit` with a deliberately tiny scratch
+  /// buffer and asserts: (a) the failure counter climbs one per call, (b) at the
+  /// threshold the reserved terminal `Conflict` is set and `errored` is set, and
+  /// (c) a subsequent `poll_one_transmit` skips the errored service (returns `None`
+  /// when it's the only one) rather than re-polling its dead proto.
   #[test]
   fn oversized_service_escalates_to_conflict_not_silent_stall() {
     use mdns_proto::{Name, ServiceRecords, ServiceSpec};
@@ -2635,7 +2530,9 @@ mod tests {
     recs.add_a([192, 168, 1, 42].into());
     recs.add_aaaa([0xfe80, 0, 0, 0, 0, 0, 0, 0x1234].into());
     recs.add_txt_segment(b"path=/health".to_vec());
-    let handle = s.register_service(ServiceSpec::new(recs), now).unwrap();
+    let handle = s
+      .test_register_service(ServiceSpec::new(recs), now)
+      .unwrap();
 
     // A 1-byte scratch buffer guarantees `proto.poll_transmit` returns
     // `Err(BufferTooSmall)` once a probe is queued (a probe is many bytes).
@@ -2688,8 +2585,9 @@ mod tests {
       );
     }
 
-    // At the threshold the service must be escalated: a `Conflict` queued in the
-    // in-ctx deque, the terminal `errored` flag set, and the one-shot wake armed.
+    // At the threshold the service must be escalated: the reserved terminal
+    // `Conflict` set in the handle-owned mailbox, and the terminal `errored` flag
+    // set on the ctx.
     {
       let ctx = s.services.get(&handle).unwrap();
       assert!(
@@ -2697,23 +2595,14 @@ mod tests {
         "reaching MAX_CONSECUTIVE_ENCODE_ERRORS must mark the service errored"
       );
       assert!(
-        ctx
-          .updates
-          .iter()
-          .any(|u| matches!(u, ServiceUpdate::Conflict)),
-        "the escalation must queue a ServiceUpdate::Conflict for Service::next, \
-         got {:?}",
-        ctx.updates
-      );
-      assert!(
-        ctx.conflict_wake_pending,
-        "the escalation must arm the one-shot wake so a parked handle is notified"
+        ctx.mailbox.borrow().has_terminal(),
+        "the escalation must record a reserved-slot Conflict for Service::next"
       );
     }
 
-    // A subsequent pump must SKIP the errored service. With it the only
-    // registered service (and no queries), the result is `None` — proving the
-    // dead proto is no longer re-polled (no busy-spin) and the counter is frozen.
+    // A subsequent pump must SKIP the errored service. With it the only registered
+    // service (and no queries), the result is `None` — proving the dead proto is
+    // no longer re-polled (no busy-spin) and the counter is frozen.
     assert!(
       s.poll_one_transmit(now, &mut scratch).is_none(),
       "an errored service must be skipped by poll_one_transmit"
@@ -2724,30 +2613,19 @@ mod tests {
       "a skipped errored service must not have its failure counter advanced further"
     );
 
-    // `push_service_updates` must consume the one-shot wake exactly once (so a
-    // parked handle is woken), then report no further wake for the same queued
-    // Conflict — i.e. an undrained Conflict cannot drive a notify busy-spin.
+    // The reserved `Conflict` is still drainable by the handle, and draining it
+    // (then end-of-stream) is exactly what `Service::next` does.
+    let mailbox = Rc::clone(&s.services.get(&handle).unwrap().mailbox);
     assert!(
-      s.push_service_updates(t),
-      "push_service_updates must report a wake for the freshly-escalated Conflict"
+      matches!(
+        mailbox.borrow_mut().drain_for_test(),
+        Some(ServiceUpdate::Conflict)
+      ),
+      "the reserved Conflict must remain readable by Service::next"
     );
     assert!(
-      !s.services.get(&handle).unwrap().conflict_wake_pending,
-      "the one-shot wake flag must be cleared after the single notify"
-    );
-    assert!(
-      !s.push_service_updates(t),
-      "a second push must NOT re-wake for the same undrained Conflict (no spin)"
-    );
-    // The Conflict is still queued for the handle to drain.
-    assert!(
-      s.services
-        .get(&handle)
-        .unwrap()
-        .updates
-        .iter()
-        .any(|u| matches!(u, ServiceUpdate::Conflict)),
-      "the queued Conflict must remain readable by Service::next after the wake"
+      mailbox.borrow_mut().drain_for_test().is_none(),
+      "after the terminal Conflict the mailbox reports end-of-stream"
     );
   }
 
@@ -2775,7 +2653,9 @@ mod tests {
     let host = Name::try_from_str("f2test.local.").unwrap();
     let mut recs = ServiceRecords::new(stype.clone(), inst.clone(), host.clone(), 80, 120);
     recs.add_a([10, 0, 0, 1].into());
-    let handle = s.register_service(ServiceSpec::new(recs), now).unwrap();
+    let handle = s
+      .test_register_service(ServiceSpec::new(recs), now)
+      .unwrap();
 
     // Confirm services_active == 1 after registration.
     assert_eq!(
@@ -2809,22 +2689,19 @@ mod tests {
       s.services.get(&handle).unwrap().errored,
       "service must be errored after escalation"
     );
-    // Conflict must be queued.
+    // The terminal Conflict must be set in the handle-owned mailbox. Grab the
+    // reader's clone now (it outlives the ctx GC below).
+    let mailbox = Rc::clone(&s.services.get(&handle).unwrap().mailbox);
     assert!(
-      s.services
-        .get(&handle)
-        .unwrap()
-        .updates
-        .iter()
-        .any(|u| matches!(u, ServiceUpdate::Conflict)),
-      "Conflict must be queued in the service's update deque"
+      mailbox.borrow().has_terminal(),
+      "the escalation must record a reserved-slot Conflict for Service::next"
     );
 
     // The escalation began an endpoint-owned withdrawal. A service that never
     // reached Established has an EMPTY snapshot, so the withdrawal completes
     // immediately (`remaining == 0`) and `drain_completed_withdrawals` frees the
-    // route on the next call (with no datagram on the wire). The ctx is kept
-    // (route_freed deferred) because its Conflict is still queued.
+    // route AND GCs the ctx UNCONDITIONALLY on the next call (with no datagram on
+    // the wire).
     s.drain_completed_withdrawals(t);
 
     // Proto route freed — services_active must be 0.
@@ -2833,19 +2710,24 @@ mod tests {
       0,
       "services_active must be 0 after the encode-failure withdrawal completes (route freed)"
     );
-    // The ctx is retained (route_freed) until its queued Conflict is drained.
+    // The ctx is GC'd unconditionally on completion — but the terminal Conflict
+    // survives in the handle-owned mailbox and is still drainable by a live reader.
     assert!(
-      s.services
-        .get(&handle)
-        .map(|c| c.route_freed)
-        .unwrap_or(false),
-      "the ctx must be retained (route_freed) while its Conflict is undrained"
+      !s.services.contains_key(&handle),
+      "the ctx must be GC'd unconditionally once its withdrawal completes"
+    );
+    assert!(
+      matches!(
+        mailbox.borrow_mut().drain_for_test(),
+        Some(ServiceUpdate::Conflict)
+      ),
+      "the reserved Conflict survives the ctx GC and is drainable by Service::next"
     );
 
     // The same service name must be re-registerable (route was released).
     let mut recs2 = ServiceRecords::new(stype, inst, host, 80, 120);
     recs2.add_a([10, 0, 0, 2].into());
-    s.register_service(ServiceSpec::new(recs2), t)
+    s.test_register_service(ServiceSpec::new(recs2), t)
       .expect("same service name must be re-registerable after encode-failure withdrawal");
 
     assert_eq!(
@@ -2906,7 +2788,9 @@ mod tests {
     recs_a.add_txt_segment(vec![b'w'; 255]);
     recs_a.add_txt_segment(vec![b'v'; 255]);
     recs_a.add_txt_segment(vec![b'u'; 255]);
-    let handle_a = s.register_service(ServiceSpec::new(recs_a), now).unwrap();
+    let handle_a = s
+      .test_register_service(ServiceSpec::new(recs_a), now)
+      .unwrap();
 
     // Service B: small records that fit in the 1500-byte scratch.
     let stype_b = Name::try_from_str("_grpc._tcp.local.").unwrap();
@@ -2914,7 +2798,9 @@ mod tests {
     let host_b = Name::try_from_str("active.local.").unwrap();
     let mut recs_b = ServiceRecords::new(stype_b, inst_b.clone(), host_b.clone(), 443, 120);
     recs_b.add_a([10, 0, 0, 2].into());
-    let handle_b = s.register_service(ServiceSpec::new(recs_b), now).unwrap();
+    let handle_b = s
+      .test_register_service(ServiceSpec::new(recs_b), now)
+      .unwrap();
 
     // Both services registered: services_active == 2.
     assert_eq!(
@@ -2979,22 +2865,27 @@ mod tests {
       "A must be retired by encode-failure escalation within 40 pumps"
     );
 
-    // A's Conflict must be queued for Service::next to drain.
+    // A's terminal Conflict must be recorded in the handle-owned mailbox for
+    // Service::next to drain. Grab the reader's clone now (it outlives the GC).
+    let a_mailbox = Rc::clone(&s.services.get(&handle_a).unwrap().mailbox);
     assert!(
-      s.services
-        .get(&handle_a)
-        .unwrap()
-        .updates
-        .iter()
-        .any(|u| matches!(u, ServiceUpdate::Conflict)),
-      "Conflict must be queued in A's update deque"
+      a_mailbox.borrow().has_terminal(),
+      "A's reserved-slot Conflict must be set for Service::next"
     );
 
     // A never reached Established → its withdrawal snapshot is empty and completes
-    // immediately; `drain_completed_withdrawals` frees A's route. If the bug
-    // were present (escalation marked A errored but its withdrawal was never
-    // begun), the route would leak and services_active would stay 2 here.
+    // immediately; `drain_completed_withdrawals` frees A's route AND GCs its ctx
+    // unconditionally. If the bug were present (escalation marked A errored but
+    // its withdrawal was never begun), the route would leak and services_active
+    // would stay 2 here. A's terminal Conflict survives in `a_mailbox` regardless.
     s.drain_completed_withdrawals(t);
+    assert!(
+      matches!(
+        a_mailbox.borrow_mut().drain_for_test(),
+        Some(ServiceUpdate::Conflict)
+      ),
+      "A's reserved Conflict survives its ctx GC and is drainable by Service::next"
+    );
     assert_eq!(
       s.stats.snapshot().services_active,
       1,
@@ -3004,7 +2895,7 @@ mod tests {
     // A's name must now be re-registerable (proto route was freed).
     let mut recs_a2 = ServiceRecords::new(stype_a, inst_a, host_a, 80, 120);
     recs_a2.add_a([10, 0, 0, 3].into());
-    s.register_service(ServiceSpec::new(recs_a2), t)
+    s.test_register_service(ServiceSpec::new(recs_a2), t)
       .expect("A's name must be re-registerable after its in-iteration-begun withdrawal completes");
 
     // B is still live: services_active == 2 after re-registering A.
@@ -3027,7 +2918,8 @@ mod tests {
   /// into an endpoint-owned withdrawal. The endpoint HOLDS the route (reserving the
   /// old name) until the withdrawal completes, THEN frees it — so `services_active`
   /// is decremented and the old name becomes re-registerable on COMPLETION, not at
-  /// the collision instant. A's `Conflict` is queued in-ctx regardless.
+  /// the collision instant. A's `Conflict` lands in the handle-owned mailbox
+  /// regardless.
   ///
   /// The original bug: the compio `push_service_updates` break'd out of the rename
   /// loop without retiring the service, leaking the proto route for the colliding
@@ -3078,7 +2970,9 @@ mod tests {
     let host_a = Name::try_from_str("first.local.").unwrap();
     let mut recs_a = ServiceRecords::new(stype.clone(), inst_a.clone(), host_a.clone(), 80, 120);
     recs_a.add_a([192, 168, 1, 1].into());
-    let handle_a = s.register_service(ServiceSpec::new(recs_a), now).unwrap();
+    let handle_a = s
+      .test_register_service(ServiceSpec::new(recs_a), now)
+      .unwrap();
 
     // Service B: pre-register "First-1._ipp._tcp.local." so the rename
     // collision fires when A tries to rename to it.
@@ -3088,7 +2982,8 @@ mod tests {
     let host_b = Name::try_from_str("second.local.").unwrap();
     let mut recs_b = ServiceRecords::new(stype, inst_b, host_b, 80, 120);
     recs_b.add_a([192, 168, 1, 2].into());
-    s.register_service(ServiceSpec::new(recs_b), now).unwrap();
+    s.test_register_service(ServiceSpec::new(recs_b), now)
+      .unwrap();
 
     // Both registered: services_active == 2.
     assert_eq!(
@@ -3113,6 +3008,7 @@ mod tests {
 
     // Establish A (and advance B) by driving probe + announce with confirmed
     // delivery so the lifecycle states advance properly.
+    let a_mailbox = Rc::clone(&s.services.get(&handle_a).unwrap().mailbox);
     let mut buf = [0u8; 1500];
     let mut t = now;
     let mut a_established = false;
@@ -3121,30 +3017,22 @@ mod tests {
       s.fire_timeouts(t);
       pump_transmits(&mut s, t, &mut buf);
       s.push_service_updates(t);
-      if s
-        .services
-        .get(&handle_a)
-        .map(|c| {
-          c.updates
-            .iter()
-            .any(|u| matches!(u, ServiceUpdate::Established))
-        })
-        .unwrap_or(false)
-      {
-        a_established = true;
+      // Drain the handle-owned mailbox (what Service::next reads); detect the
+      // Established and discard the rest so a fresh Conflict is detectable below.
+      while let Some(u) = a_mailbox.borrow_mut().drain_for_test() {
+        if matches!(u, ServiceUpdate::Established) {
+          a_established = true;
+        }
+      }
+      if a_established {
         break;
       }
-    }
-    // Whether or not A fully established, we've advanced the proto far enough.
-    // Drain A's pending updates so we can detect a new Conflict below.
-    if let Some(ctx) = s.services.get_mut(&handle_a) {
-      ctx.updates.clear();
     }
     let _ = a_established;
 
     // Inject a peer conflict for "First._ipp._tcp.local." repeatedly until
-    // `push_service_updates` drives A to rename and collide with B, at which
-    // point A's Conflict is queued and A is flagged errored.
+    // `push_service_updates` drives A to rename and collide with B, at which point
+    // A's terminal Conflict is set in the mailbox and A is flagged errored.
     let conflict = conflict_for("First._ipp._tcp.local.");
     let peer = RecvMeta::new(
       SocketAddr::from(([192, 168, 1, 200], 5353)),
@@ -3179,7 +3067,7 @@ mod tests {
     );
 
     // A's route is HELD by the in-flight withdrawal — services_active stays 2
-    // (B live + A withdrawing), and A's Conflict is queued for Service::next.
+    // (B live + A withdrawing), and A's terminal Conflict is set for Service::next.
     assert_eq!(
       s.stats.snapshot().services_active,
       2,
@@ -3187,20 +3075,11 @@ mod tests {
        the route (B live + A withdrawing)"
     );
     assert!(
-      s.services
-        .get(&handle_a)
-        .unwrap()
-        .updates
-        .iter()
-        .any(|u| matches!(u, ServiceUpdate::Conflict)),
-      "Conflict must be queued in A's update deque"
+      a_mailbox.borrow().has_terminal(),
+      "A's reserved-slot Conflict must be set for Service::next"
     );
-    // Drain A's queued updates (a host loop reads them via Service::next) so the
-    // ctx is GC'd cleanly on withdrawal completion — a completed ctx that still
-    // holds an undrained update is RETAINED (route_freed) until the host reads it.
-    if let Some(ctx) = s.services.get_mut(&handle_a) {
-      ctx.updates.clear();
-    }
+    // The GC is UNCONDITIONAL now, so the ctx need not be drained first — but the
+    // terminal Conflict survives in `a_mailbox` regardless (asserted after).
 
     // Drive A's withdrawal to completion (no sockets → force-finished at the 2 s
     // ceiling), then GC the freed ctx.
@@ -3230,6 +3109,15 @@ mod tests {
       1,
       "services_active must be 1 once A's withdrawal completes (B still live)"
     );
+    // A's terminal Conflict survived the unconditional ctx GC and is drainable by
+    // a live reader.
+    assert!(
+      matches!(
+        a_mailbox.borrow_mut().drain_for_test(),
+        Some(ServiceUpdate::Conflict)
+      ),
+      "A's reserved Conflict survives the ctx GC and is drainable by Service::next"
+    );
 
     // A's old name must now be re-registerable (route was freed on completion).
     let mut recs_a2 = ServiceRecords::new(
@@ -3240,9 +3128,10 @@ mod tests {
       120,
     );
     recs_a2.add_a([192, 168, 1, 10].into());
-    s.register_service(ServiceSpec::new(recs_a2), t).expect(
-      "A's old name must be re-registerable once the rename-collision withdrawal completes",
-    );
+    s.test_register_service(ServiceSpec::new(recs_a2), t)
+      .expect(
+        "A's old name must be re-registerable once the rename-collision withdrawal completes",
+      );
   }
 
   /// regression (endpoint-owned-withdrawal form): when an ANNOUNCED service A
@@ -3304,14 +3193,17 @@ mod tests {
     let host_a = Name::try_from_str("first.local.").unwrap();
     let mut recs_a = ServiceRecords::new(stype.clone(), inst_a.clone(), host_a.clone(), 80, 120);
     recs_a.add_a([192, 168, 1, 1].into());
-    let handle_a = s.register_service(ServiceSpec::new(recs_a), now).unwrap();
+    let handle_a = s
+      .test_register_service(ServiceSpec::new(recs_a), now)
+      .unwrap();
 
     // Service B: owns the name A will try to rename to.
     let inst_b = Name::try_from_str("First-1._ipp._tcp.local.").unwrap();
     let host_b = Name::try_from_str("second.local.").unwrap();
     let mut recs_b = ServiceRecords::new(stype.clone(), inst_b, host_b, 80, 120);
     recs_b.add_a([192, 168, 1, 2].into());
-    s.register_service(ServiceSpec::new(recs_b), now).unwrap();
+    s.test_register_service(ServiceSpec::new(recs_b), now)
+      .unwrap();
 
     fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
       loop {
@@ -3327,6 +3219,7 @@ mod tests {
 
     // Advance A to Established so the proto hands off an old-name goodbye on
     // rename (only an ANNOUNCED service has one — that's the bug scenario).
+    let a_mailbox = Rc::clone(&s.services.get(&handle_a).unwrap().mailbox);
     let mut buf = [0u8; 1500];
     let mut t = now;
     let mut a_established = false;
@@ -3335,17 +3228,14 @@ mod tests {
       s.fire_timeouts(t);
       pump_transmits(&mut s, t, &mut buf);
       s.push_service_updates(t);
-      if s
-        .services
-        .get(&handle_a)
-        .map(|c| {
-          c.updates
-            .iter()
-            .any(|u| matches!(u, ServiceUpdate::Established))
-        })
-        .unwrap_or(false)
-      {
-        a_established = true;
+      // Drain the handle-owned mailbox; detect Established and discard the rest so
+      // a fresh Conflict is detectable below.
+      while let Some(u) = a_mailbox.borrow_mut().drain_for_test() {
+        if matches!(u, ServiceUpdate::Established) {
+          a_established = true;
+        }
+      }
+      if a_established {
         break;
       }
     }
@@ -3353,13 +3243,9 @@ mod tests {
       a_established,
       "A must reach Established before the rename-collision test can verify the goodbye"
     );
-    // Drain A's pending updates so we can detect a new Conflict below.
-    if let Some(ctx) = s.services.get_mut(&handle_a) {
-      ctx.updates.clear();
-    }
 
-    // Inject peer conflicts for A's original name until push_service_updates
-    // drives the rename and detects the local collision.
+    // Inject peer conflicts for A's original name until push_service_updates drives
+    // the rename and detects the local collision.
     let conflict = conflict_for("First._ipp._tcp.local.");
     let peer = RecvMeta::new(
       SocketAddr::from(([192, 168, 1, 200], 5353)),
@@ -3402,19 +3288,15 @@ mod tests {
       dup.add_a([192, 168, 1, 1].into());
       assert!(
         matches!(
-          s.register_service(ServiceSpec::new(dup), t),
+          s.test_register_service(ServiceSpec::new(dup), t),
           Err(mdns_proto::error::RegisterServiceError::NameAlreadyRegistered(_))
         ),
         "A's OLD name must be held by the in-flight withdrawal (NameAlreadyRegistered)"
       );
     }
 
-    // Drain A's queued updates (the collision Conflict) so the ctx is GC'd cleanly
-    // on completion — a completed ctx with an undrained update is RETAINED
-    // (route_freed) until the host reads it.
-    if let Some(ctx) = s.services.get_mut(&handle_a) {
-      ctx.updates.clear();
-    }
+    // The collision Conflict lives in the handle-owned mailbox; the ctx GC is now
+    // UNCONDITIONAL, so it need not be drained first.
 
     // Drive A's withdrawal to completion (no sockets → force-finished at the 2 s
     // anti-pin ceiling), then GC the freed ctx.
@@ -3443,7 +3325,7 @@ mod tests {
     let host_r = Name::try_from_str("replacement.local.").unwrap();
     let mut recs_r = ServiceRecords::new(stype, inst_a, host_r, 80, 120);
     recs_r.add_a([192, 168, 1, 10].into());
-    s.register_service(ServiceSpec::new(recs_r), t)
+    s.test_register_service(ServiceSpec::new(recs_r), t)
       .expect("replacement R must register under A's old name once the withdrawal completes");
   }
 
@@ -3534,8 +3416,8 @@ mod tests {
       ServiceSpec::new(r)
     };
 
-    s.register_service(mk(), t).unwrap();
-    let err = s.register_service(mk(), t).unwrap_err();
+    s.test_register_service(mk(), t).unwrap();
+    let err = s.test_register_service(mk(), t).unwrap_err();
     assert!(
       matches!(err, RegisterServiceError::NameAlreadyRegistered(_)),
       "second registration of the same instance name must be rejected as NameAlreadyRegistered, got {err:?}"
@@ -3920,14 +3802,17 @@ mod tests {
     let host_a = Name::try_from_str("alpha.local.").unwrap();
     let mut recs_a = ServiceRecords::new(stype.clone(), inst_a.clone(), host_a, 80, 120);
     recs_a.add_a([192, 168, 1, 1].into());
-    let handle_a = s.register_service(ServiceSpec::new(recs_a), now).unwrap();
+    let handle_a = s
+      .test_register_service(ServiceSpec::new(recs_a), now)
+      .unwrap();
 
     // Service B: already owns the name A will try to rename into.
     let inst_b = Name::try_from_str("Alpha-1._ipp._tcp.local.").unwrap();
     let host_b = Name::try_from_str("beta.local.").unwrap();
     let mut recs_b = ServiceRecords::new(stype, inst_b, host_b, 80, 120);
     recs_b.add_a([192, 168, 1, 2].into());
-    s.register_service(ServiceSpec::new(recs_b), now).unwrap();
+    s.test_register_service(ServiceSpec::new(recs_b), now)
+      .unwrap();
 
     fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
       loop {
@@ -3948,6 +3833,7 @@ mod tests {
 
     // Advance A to Established so the proto hands off an old-name goodbye on
     // rename (only an ANNOUNCED service has one).
+    let a_mailbox = Rc::clone(&s.services.get(&handle_a).unwrap().mailbox);
     let mut buf = [0u8; 1500];
     let mut t = now;
     let mut a_established = false;
@@ -3956,17 +3842,13 @@ mod tests {
       s.fire_timeouts(t);
       pump_transmits(&mut s, t, &mut buf);
       s.push_service_updates(t);
-      if s
-        .services
-        .get(&handle_a)
-        .map(|c| {
-          c.updates
-            .iter()
-            .any(|u| matches!(u, ServiceUpdate::Established))
-        })
-        .unwrap_or(false)
-      {
-        a_established = true;
+      // Drain the handle-owned mailbox; detect Established and discard the rest.
+      while let Some(u) = a_mailbox.borrow_mut().drain_for_test() {
+        if matches!(u, ServiceUpdate::Established) {
+          a_established = true;
+        }
+      }
+      if a_established {
         break;
       }
     }
@@ -3974,9 +3856,6 @@ mod tests {
       a_established,
       "A must reach Established before the ordering test can verify the goodbye timing"
     );
-    if let Some(ctx) = s.services.get_mut(&handle_a) {
-      ctx.updates.clear();
-    }
 
     // Inject peer conflicts. On the decisive iteration (the one that WILL collide
     // A with B), probe withdrawal-due BEFORE and AFTER push_service_updates.

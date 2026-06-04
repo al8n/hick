@@ -2,7 +2,7 @@
 //! per-query state machines and pumps the I/O loop.
 
 use std::{
-  collections::{HashMap, VecDeque},
+  collections::HashMap,
   net::{IpAddr, SocketAddr},
   sync::{Arc, Mutex},
   time::{Duration, Instant as StdInstant, SystemTime},
@@ -22,6 +22,7 @@ use crate::{
   options::ServerOptions,
   proto::{ProtoEndpoint, ProtoService},
   query::{QueryMailbox, new_mailbox},
+  service::{ServiceMailbox, new_service_mailbox},
 };
 
 /// V4/V6 socket pair handed to the driver task.
@@ -66,40 +67,20 @@ struct Packet {
   hop_limit: Option<u8>,
 }
 
-/// Marker for [`ServiceUpdate`] deduplication. Two updates with the same
-/// mark carry the same actionable information; the driver coalesces
-/// consecutive duplicates so a hostile peer cannot inflate an unbounded
-/// per-handle queue by spamming HostConflict/Conflict-bearing packets.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum UpdateMark {
-  Established,
-  Renamed(mdns_proto::Name),
-  Conflict,
-  HostConflict,
-}
-
-impl UpdateMark {
-  fn of(upd: &ServiceUpdate) -> Option<Self> {
-    match upd {
-      ServiceUpdate::Established => Some(Self::Established),
-      ServiceUpdate::Renamed(r) => Some(Self::Renamed(r.new_name().clone())),
-      ServiceUpdate::Conflict => Some(Self::Conflict),
-      ServiceUpdate::HostConflict => Some(Self::HostConflict),
-      _ => None,
-    }
-  }
-}
-
 /// Driver-side state for a single registered service.
 struct ServiceCtx {
   proto: ProtoService,
-  updates: async_channel::Sender<ServiceUpdate>,
-  /// marker of the last update we pushed into `updates`.
-  /// Consecutive `ServiceUpdate`s that map to the same mark are
-  /// coalesced (skipped) so a hostile peer cannot grow the channel
-  /// without bound by repeating an event the caller has already
-  /// observed.
-  last_pushed: Option<UpdateMark>,
+  /// bounded/coalescing delivery buffer shared with the `Service` handle. The
+  /// driver fills it (`push_update` for non-terminal updates, `set_terminal`
+  /// for the `Conflict`/`HostConflict` retirement update) and rings `doorbell`.
+  /// The mailbox is owned by the HANDLE (an `Arc` clone outlives this ctx), so
+  /// a terminal placed in its reserved slot is delivered to a live reader even
+  /// after the ctx is GC'd — which is what lets the withdrawal GC be
+  /// unconditional (mirrors the query path's `QueryMailbox`).
+  mailbox: Arc<Mutex<ServiceMailbox>>,
+  /// Capacity-1 wakeup; closure of its receiver (handle dropped) is how the
+  /// driver detects the consumer is gone and withdraws/ GCs the service.
+  doorbell: async_channel::Sender<()>,
   /// count of consecutive `poll_transmit` errors for this
   /// service. Once it crosses [`MAX_CONSECUTIVE_ENCODE_ERRORS`] the
   /// driver assumes the registration is structurally unusable (e.g.
@@ -107,16 +88,6 @@ struct ServiceCtx {
   /// the caller is notified instead of seeing a misleading
   /// `Established` later.
   encode_failures: u8,
-  /// bounded, INSERTION-ORDERED overflow for service updates
-  /// when the `updates` channel is full (a slow/non-draining consumer). Updates
-  /// are appended in arrival order and flushed front-to-back, so causal order
-  /// (e.g. a `Renamed` that arrived before `Established`, or vice-versa) is
-  /// preserved. It stays bounded by coalescing: a new `Renamed` removes any
-  /// prior pending `Renamed` and re-appends at the latest position (the caller
-  /// only needs the current name), while the one-time/idempotent kinds
-  /// (`Established`/`Conflict`/`HostConflict`) dedup by kind — so the deque
-  /// holds at most one of each kind (≤ 4 entries) regardless of churn.
-  pending: VecDeque<ServiceUpdate>,
   /// Set when this service has been RETIRED into an endpoint-owned RFC 6762
   /// §10.1 withdrawal (graceful unregister/drop, an encode-failure escalation,
   /// or a rename-collision teardown). The proto state machine is finished, so
@@ -124,8 +95,9 @@ struct ServiceCtx {
   /// orphan-sweep — but the ctx is KEPT (the endpoint holds the route, reserving
   /// the name) until [`Endpoint::drain_completed_withdrawals`] reports the
   /// withdrawal complete and the driver GCs the slot. Any
-  /// `ServiceUpdate::Conflict` queued at an internal retirement is already in the
-  /// (decoupled) `updates` channel, so it survives the ctx GC.
+  /// `ServiceUpdate::Conflict` queued at an internal retirement already sits in
+  /// the handle-owned mailbox's reserved terminal slot, so it survives the ctx
+  /// GC and reaches a live reader.
   withdrawing: bool,
 }
 
@@ -170,19 +142,6 @@ struct DriverState<N: Net> {
   /// state and `clear()`ed each iteration so the per-iteration GC allocates
   /// nothing in steady state.
   completed_withdrawals: Vec<ServiceHandle>,
-  /// Handles whose endpoint withdrawal has COMPLETED (route already freed) but
-  /// whose ctx still holds an un-flushed terminal `ServiceUpdate` in `pending`
-  /// because the bounded `updates` channel was FULL at GC time and the caller is
-  /// still alive (the channel is NOT closed). GCing the ctx now would drop a
-  /// terminal `Conflict`/`HostConflict` that explains the retirement, so the ctx
-  /// is parked here instead. [`Self::drain_withdrawals`] retries the
-  /// flush at the START of every call: as soon as the slow caller drains the
-  /// channel the terminal is delivered and the ctx is GC'd; if the caller drops
-  /// the receiver first, the now-CLOSED channel lets the ctx be GC'd too. While
-  /// this set is non-empty [`Self::next_deadline`] returns a short retry deadline
-  /// — a slow reader draining the channel does NOT wake the driver (we `try_send`,
-  /// never `send().await`), so an otherwise-idle driver must self-wake to retry.
-  deferred_gc: Vec<ServiceHandle>,
   /// this host's directly-attached subnets, the source-address
   /// fallback for the RFC 6762 §11 on-link check on platforms that can't
   /// supply a TTL/Hop-Limit. Empty if interface discovery failed (the
@@ -212,7 +171,6 @@ impl<N: Net> DriverState<N> {
       queries: HashMap::new(),
       recent_sends: Vec::new(),
       completed_withdrawals: Vec::new(),
-      deferred_gc: Vec::new(),
       // scope the §11 source-subnet fallback to the BOUND
       // interface only — not every local NIC (per-packet interface index for
       // delivered PKTINFO is handled separately in recv_with_meta).
@@ -256,14 +214,6 @@ impl<N: Net> DriverState<N> {
       if let Some(t) = self.endpoint.poll_query_timeout(*handle) {
         best = Some(min_opt(best, t));
       }
-    }
-    // A ctx parked for deferred GC holds an un-flushed terminal in a
-    // FULL channel whose caller is still alive. A slow reader draining the
-    // channel does NOT wake us (we `try_send`), so an otherwise-idle driver would
-    // never retry the flush. Fold in a short self-wake deadline so the loop ticks
-    // back into `drain_withdrawals` to re-attempt delivery.
-    if !self.deferred_gc.is_empty() {
-      best = Some(min_opt(best, StdInstant::now() + DEFERRED_GC_RETRY));
     }
     best
   }
@@ -344,31 +294,28 @@ impl<N: Net> DriverState<N> {
     let (handle, svc) = self
       .endpoint
       .try_register_service::<slab::Slab<_>, slab::Slab<_>>(spec, now)?;
-    // the per-service update channel delivers every
-    // Established/Renamed/Conflict/HostConflict transition, but it is BOUNDED:
-    // an on-link peer can force endless conflict-renames, and each
-    // `Renamed(new_name)` is a distinct event (so consecutive-duplicate
-    // coalescing does not collapse it). An unbounded channel + a non-draining
-    // caller would then grow memory without bound. With a bounded channel the
-    // driver distinguishes a full channel (slow consumer — coalesce into the
-    // single `pending` overflow slot, keeping the latest state) from a closed
-    // one (dropped handle — withdraw the service), so memory is bounded to
-    // capacity + 1 per service while the current state still reaches the caller.
-    let (tx, rx) = async_channel::bounded(SERVICE_UPDATE_CAPACITY);
+    // handle-owned, reserved-terminal mailbox + capacity-1 doorbell — exactly
+    // the query wiring. The mailbox bounds + coalesces non-terminal updates
+    // (`Established`/`Renamed`) so an on-link peer forcing endless
+    // conflict-renames cannot grow memory, while the terminal retirement update
+    // (`Conflict`/`HostConflict`) keeps a reserved slot. Because the `Service`
+    // handle holds an `Arc` clone of the mailbox, that terminal is delivered to
+    // a live reader even after the driver GCs this ctx.
+    let (mailbox, doorbell_tx, doorbell_rx) = new_service_mailbox();
     self.services.insert(
       handle,
       ServiceCtx {
         proto: svc,
-        updates: tx,
-        last_pushed: None,
+        mailbox: Arc::clone(&mailbox),
+        doorbell: doorbell_tx,
         encode_failures: 0,
-        pending: VecDeque::new(),
         withdrawing: false,
       },
     );
     Ok(ServiceRegistered {
       handle,
-      updates: rx,
+      mailbox,
+      doorbell: doorbell_rx,
     })
   }
 
@@ -594,15 +541,9 @@ impl<N: Net> DriverState<N> {
         if ctx.withdrawing {
           continue;
         }
-        // even if no event is pending, a closed receiver means the
+        // even if no event is pending, a closed doorbell receiver means the
         // caller dropped their handle — withdraw the service gracefully.
-        if ctx.updates.is_closed() {
-          removed_services.push(*handle);
-          continue;
-        }
-        // opportunistically flush a coalesced overflow update now
-        // that the caller may have drained the channel.
-        if !flush_pending_service_update(ctx) {
+        if ctx.doorbell.is_closed() {
           removed_services.push(*handle);
           continue;
         }
@@ -628,23 +569,19 @@ impl<N: Net> DriverState<N> {
                 Err(_) => {
                   // The new name collides with another local service; the Service
                   // has already rebranded and can't be kept. Surface Conflict (into
-                  // the decoupled channel), then retire it: `remove_service` begins
-                  // the endpoint-owned withdrawal for the CURRENT name and holds the
-                  // route (keeping it reserved) while it resends, freeing the name on
-                  // completion. The OLD name's goodbye was already enqueued above as
-                  // its own detached item. The ctx is kept until then so this
-                  // Conflict still reaches the host.
+                  // the handle-owned mailbox's reserved terminal slot), then retire
+                  // it: `remove_service` begins the endpoint-owned withdrawal for
+                  // the CURRENT name and holds the route (keeping it reserved) while
+                  // it resends, freeing the name on completion. The OLD name's
+                  // goodbye was already enqueued above as its own detached item. The
+                  // mailbox outlives the ctx, so this Conflict still reaches the
+                  // host even after the withdrawal GCs the ctx.
                   hick_trace::warn!(
                     handle = ?handle,
                     new_name = %renamed.new_name(),
                     "auto-rename collided with another registered service; emitting Conflict"
                   );
-                  let conflict = ServiceUpdate::Conflict;
-                  let mark = UpdateMark::of(&conflict);
-                  if ctx.last_pushed != mark {
-                    let _ = deliver_service_update(ctx, conflict);
-                    ctx.last_pushed = mark;
-                  }
+                  deliver_service_update(ctx, ServiceUpdate::Conflict);
                   removed_services.push(*handle);
                   break;
                 }
@@ -652,19 +589,10 @@ impl<N: Net> DriverState<N> {
             }
             _ => upd,
           };
-          // coalesce consecutive duplicates so a hostile peer cannot
-          // grow the per-service channel by repeating an event the caller has
-          // already observed. Distinct (non-consecutive) events route
-          // through the bounded, overflow-coalescing delivery path.
-          let mark = UpdateMark::of(&final_upd);
-          if mark.is_some() && mark == ctx.last_pushed {
-            continue;
-          }
-          if !deliver_service_update(ctx, final_upd) {
-            removed_services.push(*handle);
-            break;
-          }
-          ctx.last_pushed = mark;
+          // The mailbox coalesces by kind (one Established, latest Renamed) and
+          // reserves the terminal, so a hostile peer repeating an event cannot
+          // grow it — no consecutive-duplicate bookkeeping needed here.
+          deliver_service_update(ctx, final_upd);
         }
       }
 
@@ -802,7 +730,7 @@ impl<N: Net> DriverState<N> {
       // owns the TTL=0 goodbye schedule (pumped by `drain_withdrawals`).
       let live = services
         .get(&h)
-        .map(|c| !c.updates.is_closed() && !c.withdrawing)
+        .map(|c| !c.doorbell.is_closed() && !c.withdrawing)
         .unwrap_or(false);
       if !live {
         continue;
@@ -892,20 +820,21 @@ impl<N: Net> DriverState<N> {
             handle = ?h,
             "Service exceeded MAX_CONSECUTIVE_ENCODE_ERRORS; emitting Conflict and withdrawing"
           );
-          // Surface Conflict (into the decoupled channel) and begin the
-          // endpoint-owned withdrawal. The endpoint KEEPS the route (holding the
-          // name) and frees it on withdrawal completion; the ctx is kept (marked
-          // `withdrawing`) so the queued Conflict still reaches the host and is
-          // GC'd by `drain_withdrawals`. A service that persistently failed to
-          // ENCODE never reached Established, so its snapshot is empty and the
-          // withdrawal completes on the next iteration with no datagram on the
-          // wire (the records are fixed at registration and the scratch is fixed,
-          // so an encode failure is permanent, not transient). `begin_withdrawal`
-          // is idempotent. Inlined (not via `begin_service_withdrawal`) because
-          // `self` is split-borrowed here into `endpoint` + `services`.
+          // Surface Conflict (into the handle-owned mailbox's reserved terminal
+          // slot) and begin the endpoint-owned withdrawal. The endpoint KEEPS the
+          // route (holding the name) and frees it on withdrawal completion; the
+          // ctx is marked `withdrawing` and GC'd unconditionally by
+          // `drain_withdrawals` once the withdrawal completes — the Conflict still
+          // reaches the host because the mailbox outlives the ctx. A service that
+          // persistently failed to ENCODE never reached Established, so its
+          // snapshot is empty and the withdrawal completes on the next iteration
+          // with no datagram on the wire (the records are fixed at registration
+          // and the scratch is fixed, so an encode failure is permanent, not
+          // transient). `begin_withdrawal` is idempotent. Inlined (not via
+          // `begin_service_withdrawal`) because `self` is split-borrowed here into
+          // `endpoint` + `services`.
           if let Some(ctx) = services.get_mut(&h) {
-            let _ = deliver_service_update(ctx, ServiceUpdate::Conflict);
-            ctx.last_pushed = Some(UpdateMark::Conflict);
+            deliver_service_update(ctx, ServiceUpdate::Conflict);
             ctx.withdrawing = true;
             // Enqueue any pending §9 rename handoff before snapshotting: keep the old-name goodbye exactly-once on every retirement
             // path, not just the update-drain site. (A persistently-encode-failing
@@ -1016,7 +945,7 @@ impl<N: Net> DriverState<N> {
   /// `StartQuery` reply and the caller receiving the handle cannot
   /// multicast a question before being collected.
   fn sweep_closed_handles(&mut self, now: StdInstant) {
-    // a dropped Service handle closes `updates` AND enqueues
+    // a dropped Service handle closes its doorbell receiver AND enqueues
     // UnregisterService. This sweep can win the race and collect the service
     // first, so it MUST route through `remove_service` (which begins the
     // endpoint-owned §10.1 withdrawal) — otherwise the dropped service is
@@ -1027,7 +956,7 @@ impl<N: Net> DriverState<N> {
     let dead_svc: Vec<ServiceHandle> = self
       .services
       .iter()
-      .filter(|(_, ctx)| ctx.updates.is_closed() && !ctx.withdrawing)
+      .filter(|(_, ctx)| ctx.doorbell.is_closed() && !ctx.withdrawing)
       .map(|(h, _)| *h)
       .collect();
     for h in dead_svc {
@@ -1060,10 +989,11 @@ impl<N: Net> DriverState<N> {
   /// never-announced service has an empty snapshot and completes on the next loop
   /// iteration with no datagram on the wire.
   ///
-  /// The driver ctx is NOT removed here: it is kept (marked `withdrawing`) so any
-  /// already-queued `ServiceUpdate::Conflict` (delivered into the decoupled
-  /// `updates` channel) still reaches the host, and is GC'd when the endpoint
-  /// reports the withdrawal complete.
+  /// The driver ctx is NOT removed here: it is kept (marked `withdrawing`) until
+  /// the endpoint reports the withdrawal complete, then GC'd unconditionally. Any
+  /// already-queued `ServiceUpdate::Conflict` lives in the handle-owned mailbox's
+  /// reserved terminal slot (which outlives the ctx), so it still reaches the host
+  /// after the GC.
   fn remove_service(&mut self, handle: ServiceHandle, now: StdInstant) {
     self.begin_service_withdrawal(handle, now);
   }
@@ -1115,21 +1045,15 @@ impl<N: Net> DriverState<N> {
   /// [`Endpoint::drain_completed_withdrawals`] frees each completed route
   /// (decrementing `services_active`) and the driver GCs its ctx.
   ///
-  /// GC of a completed ctx is conditional on its terminal update being delivered
-  /// or undeliverable: a terminal `Conflict`/`HostConflict` queued at
-  /// an internal retirement lands in `ctx.pending` (not the channel) when the
-  /// channel was FULL at that moment. The best-effort flush here moves it into the
-  /// decoupled channel where it survives the GC — but if the channel is STILL full
-  /// and the caller is STILL alive, the terminal is undelivered, so the ctx is
-  /// parked in [`Self::deferred_gc`] and retried (at the top of every call) rather
-  /// than dropped. A closed channel (caller gone) or an emptied `pending`
-  /// (everything delivered) GCs immediately.
+  /// GC of a completed ctx is UNCONDITIONAL: any terminal `Conflict`/
+  /// `HostConflict` queued at an internal retirement already lives in the
+  /// HANDLE-owned [`ServiceMailbox`]'s reserved terminal slot, and the handle's
+  /// `Arc` clone outlives this ctx, so the terminal is still delivered to a live
+  /// reader after the ctx is dropped. A dropped reader means the handle's `Arc`
+  /// (and its doorbell receiver) are gone and the buffered terminal is simply
+  /// collected with the mailbox. No flag, no park, no retry (mirrors the query
+  /// path, whose terminal also lives in a handle-owned mailbox).
   async fn drain_withdrawals(&mut self, now: StdInstant, scratch: &mut [u8]) {
-    // Retry parked ctxs FIRST: a slow reader may have drained the channel since
-    // the last tick (making room for the terminal), or dropped the receiver
-    // (closing the channel). Either resolves the deferral; otherwise the ctx
-    // stays parked and `next_deadline` keeps the retry timer armed.
-    self.retry_deferred_gc();
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
     // Split-borrow disjoint fields so `send_via` can borrow `recent_sends`/`v4`/
@@ -1181,72 +1105,14 @@ impl<N: Net> DriverState<N> {
       .endpoint
       .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
     while let Some(handle) = self.completed_withdrawals.pop() {
-      // Flush this ctx's overflow buffer into the (decoupled) `async_channel`
-      // BEFORE deciding whether to drop the ctx. A terminal `Conflict`/
-      // `HostConflict` delivered at an internal retirement (rename-collision /
-      // encode-failure) lands in `ctx.pending` instead of the channel when the
-      // channel was FULL at that moment; once the ctx is `withdrawing`,
-      // `push_updates` skips it, so this is the last chance to move that buffered
-      // terminal into the channel where it survives the ctx GC and stays readable
-      // by the caller. `try_gc_completed_ctx` GCs immediately when the terminal is
-      // delivered (`pending` emptied) or undeliverable-to-nobody (channel CLOSED),
-      // and otherwise PARKS the ctx for a later retry rather than dropping its
-      // un-flushed terminal. The route is already freed either way, so
-      // unlike smoltcp's coupled queue there is no lazily-held slot to keep alive.
-      self.try_gc_completed_ctx(handle);
-    }
-  }
-
-  /// Flush a completed-withdrawal ctx's overflow and either GC it or PARK it for
-  /// a later retry. Shared by the post-pump GC loop and the
-  /// start-of-call deferred retry so both classify the three cases identically:
-  ///
-  /// * channel CLOSED (`flush` returns `false`) — caller dropped the receiver;
-  ///   nobody to deliver to, GC now.
-  /// * `pending` EMPTY after the flush — every update (incl. the terminal) made
-  ///   it into the channel; it survives the GC, GC now.
-  /// * `pending` NON-EMPTY (channel still FULL, caller still alive) — the terminal
-  ///   is undelivered; park the handle in [`Self::deferred_gc`] (the route is
-  ///   already freed, so the ctx is otherwise inert) and retry next tick.
-  fn try_gc_completed_ctx(&mut self, handle: ServiceHandle) {
-    let park = match self.services.get_mut(&handle) {
-      // Channel still has the terminal undelivered (full) but the caller is alive:
-      // `flush` returned `true` AND `pending` is non-empty. Keep the ctx alive.
-      Some(ctx) => flush_pending_service_update(ctx) && !ctx.pending.is_empty(),
-      // Unknown handle (already GC'd) — nothing to do, and never park it.
-      None => false,
-    };
-    if park {
-      // Avoid duplicate parking if this handle is somehow re-completed.
-      if !self.deferred_gc.contains(&handle) {
-        self.deferred_gc.push(handle);
-      }
-      return;
-    }
-    self.deferred_gc.retain(|h| *h != handle);
-    self.services.remove(&handle);
-  }
-
-  /// Retry every ctx parked for deferred GC. Re-flush each: if the
-  /// channel closed (caller gone) or `pending` drained (terminal delivered), GC
-  /// it and drop it from the parked set; otherwise keep it parked. Runs at the
-  /// top of every [`Self::drain_withdrawals`]; `next_deadline` keeps the loop
-  /// waking on [`DEFERRED_GC_RETRY`] while the set is non-empty.
-  fn retry_deferred_gc(&mut self) {
-    if self.deferred_gc.is_empty() {
-      return;
-    }
-    // Drain into a scratch so `try_gc_completed_ctx` can re-park the still-stuck
-    // ones without aliasing the vector we are iterating. Swapping leaves an empty
-    // `deferred_gc` that `try_gc_completed_ctx` re-populates with only the ctxs
-    // that are still undeliverable.
-    let mut parked = core::mem::take(&mut self.deferred_gc);
-    for handle in parked.drain(..) {
-      self.try_gc_completed_ctx(handle);
-    }
-    // Reuse the now-empty allocation as the next scratch to avoid churn.
-    if self.deferred_gc.is_empty() {
-      self.deferred_gc = parked;
+      // UNCONDITIONAL GC: the route is freed, and any terminal queued at an
+      // internal retirement (rename-collision / encode-failure) already sits in
+      // the HANDLE-owned mailbox's reserved terminal slot. Because the `Service`
+      // handle holds an `Arc` clone of that mailbox, dropping this ctx (and its
+      // doorbell sender) does NOT drop the terminal — a live reader still drains
+      // it via `Service::next`; a dropped reader means the mailbox `Arc` is gone
+      // and the buffered terminal is collected with it. No park, no retry.
+      self.services.remove(&handle);
     }
   }
 }
@@ -1273,94 +1139,32 @@ const MAX_SEND_CREDITS_PER_DRAIN: usize = 64;
 /// (e.g. records exceed `max_payload_size`).
 const MAX_CONSECUTIVE_ENCODE_ERRORS: u8 = 3;
 
-/// Capacity of the per-service [`ServiceUpdate`] channel. Large
-/// enough to hold the rare legitimate burst (Established + a few probe-time
-/// renames + a terminal event) without overflowing; beyond it a slow/non-
-/// draining consumer causes updates to coalesce into the single `pending`
-/// overflow slot rather than growing memory without bound under
-/// attacker-driven conflict-rename churn.
-const SERVICE_UPDATE_CAPACITY: usize = 16;
-
-/// Wake interval for retrying a DEFERRED ctx GC. When a service's
-/// withdrawal completes while its bounded `updates` channel is full AND the
-/// caller is still alive, the un-flushed terminal must not be dropped, so the
-/// ctx is parked in [`DriverState::deferred_gc`] and re-flushed on a timer. A
-/// slow reader draining the channel does not wake the driver (sends are
-/// `try_send`, never `send().await`), so the driver self-wakes this often to
-/// retry. Short enough that the terminal reaches a reader promptly once it
-/// makes room, long enough that a wedged (never-draining, never-dropping)
-/// reader only costs a trivial periodic re-check.
-const DEFERRED_GC_RETRY: Duration = Duration::from_millis(50);
-
-/// Try to flush a service's ordered overflow into its bounded channel
-///. Updates are sent front-to-back in insertion order, stopping
-/// at the first that does not fit (kept at the front for a later attempt).
-/// Returns `false` only when the channel is CLOSED (caller dropped the handle).
-fn flush_pending_service_update(ctx: &mut ServiceCtx) -> bool {
-  use async_channel::TrySendError;
-  while let Some(upd) = ctx.pending.pop_front() {
-    match ctx.updates.try_send(upd) {
-      Ok(()) => {}
-      Err(TrySendError::Full(upd)) => {
-        ctx.pending.push_front(upd);
-        return true;
-      }
-      Err(TrySendError::Closed(_)) => return false,
-    }
-  }
-  true
-}
-
-/// Buffer `upd` into the ordered overflow when the bounded channel is full,
-/// preserving insertion order while staying bounded:
+/// Deliver a `ServiceUpdate` to a service's caller via its handle-owned mailbox,
+/// then ring the doorbell.
 ///
-/// * `Renamed` — drop any prior pending `Renamed` and append the new one, so
-///   only the LATEST name is kept, at its true (most recent) position.
-/// * `Established` / `Conflict` / `HostConflict` — append only if no update of
-///   that kind is already pending (one-time / idempotent), never displacing an
-///   earlier-queued update.
+/// Routes by kind: the terminal retirement update (`Conflict`/`HostConflict`)
+/// goes to the reserved [`ServiceMailbox`] slot (idempotent — first terminal
+/// wins, never dropped under non-terminal pressure), every other update is
+/// buffered into the bounded, coalescing non-terminal ring. A non-draining
+/// caller therefore cannot grow memory beyond the mailbox cap, while the
+/// retirement reason always survives.
 ///
-/// The deque therefore holds at most one entry per kind (≤ 4) regardless of
-/// how much an on-link peer churns conflict-renames.
-fn buffer_overflow_service_update(pending: &mut VecDeque<ServiceUpdate>, upd: ServiceUpdate) {
-  if matches!(upd, ServiceUpdate::Renamed(_)) {
-    pending.retain(|u| !matches!(u, ServiceUpdate::Renamed(_)));
-    pending.push_back(upd);
-    return;
-  }
-  let kind = core::mem::discriminant(&upd);
-  if !pending.iter().any(|u| core::mem::discriminant(u) == kind) {
-    pending.push_back(upd);
-  }
-}
-
-/// Deliver a `ServiceUpdate` to a service's caller, bounding memory
-/// while preserving insertion order.
-///
-/// Flushes the ordered overflow first, then sends `upd`. When the bounded
-/// channel is FULL the update is appended to the ordered overflow (see
-/// [`buffer_overflow_service_update`]), so a non-draining caller cannot grow
-/// memory beyond capacity + 4. Returns `false` only when the channel is CLOSED
-/// (the caller dropped the handle), signalling the driver to withdraw it.
-fn deliver_service_update(ctx: &mut ServiceCtx, upd: ServiceUpdate) -> bool {
-  use async_channel::TrySendError;
-  if !flush_pending_service_update(ctx) {
-    return false; // closed
-  }
-  // Overflow still present after the flush (channel full): append `upd` so it
-  // stays ordered behind the existing overflow.
-  if !ctx.pending.is_empty() {
-    buffer_overflow_service_update(&mut ctx.pending, upd);
-    return true;
-  }
-  match ctx.updates.try_send(upd) {
-    Ok(()) => true,
-    Err(TrySendError::Full(upd)) => {
-      buffer_overflow_service_update(&mut ctx.pending, upd);
-      true
-    }
-    Err(TrySendError::Closed(_)) => false,
-  }
+/// Unlike the old bounded channel this can never "fail closed": the mailbox is
+/// owned by the `Service` handle's `Arc`, so a dropped handle just leaves the
+/// doorbell receiver gone. The update is still buffered (the orphan sweep / the
+/// withdrawal GC then drops the whole ctx). A closed doorbell is treated as "no
+/// reader to wake" — `try_send` fails silently and we move on.
+fn deliver_service_update(ctx: &mut ServiceCtx, upd: ServiceUpdate) {
+  ctx
+    .mailbox
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+    .push_update(upd);
+  // Capacity-1, coalescing wakeup. A closed receiver (handle dropped) means
+  // there is no reader to wake — the buffered update stays in the mailbox until
+  // the ctx is GC'd. We never `send().await`, so a slow reader never blocks the
+  // driver.
+  let _ = ctx.doorbell.try_send(());
 }
 
 fn min_opt(prev: Option<StdInstant>, t: StdInstant) -> StdInstant {
@@ -2304,6 +2108,19 @@ async fn recv_loop<N: Net>(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::service::{SERVICE_UPDATE_CAPACITY, ServiceMailbox};
+
+  /// Drain one [`ServiceUpdate`] from a shared mailbox (the handle side), used by
+  /// the service-update tests to assert delivery without awaiting the async
+  /// [`crate::Service::next`].
+  fn lock_mailbox_for_test(
+    mailbox: &std::sync::Arc<std::sync::Mutex<ServiceMailbox>>,
+  ) -> Option<ServiceUpdate> {
+    mailbox
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .drain_for_test()
+  }
 
   #[test]
   fn on_link_check_rejects_non_255_ttl() {
@@ -2588,127 +2405,22 @@ mod tests {
   // recomputed FRESH each round in `poll_withdrawal_transmit` from the route
   // table) and is covered by the proto-level
   // `poll_withdrawal_transmit ... sibling retention` test.
-  #[test]
-  fn overflow_buffer_preserves_insertion_order_and_coalesces() {
-    use mdns_proto::{ServiceUpdate, event::ServiceRenamed};
-    let renamed = |n: &str| {
-      ServiceUpdate::Renamed(ServiceRenamed::new(
-        mdns_proto::Name::try_from_str(n).unwrap(),
-      ))
-    };
+  // NOTE: the non-terminal coalescing + bound + drop-oldest semantics for
+  // service updates (one Established, latest Renamed, bounded ring, reserved
+  // terminal) moved out of the driver's per-ctx overflow deque into the
+  // handle-owned `ServiceMailbox` and are unit-tested at that seam in
+  // `crate::service::tests` (`mailbox_coalesces_established_and_renamed_by_kind`,
+  // `mailbox_hard_cap_drops_oldest`,
+  // `mailbox_terminal_reserved_under_non_terminal_pressure`, …). The driver-level
+  // tests below assert the END-TO-END contract through `deliver_service_update` +
+  // the live `Service` handle.
 
-    // Renamed arriving BEFORE Established keeps insertion order
-    // (Renamed first) — it is NOT forced behind Established.
-    let mut d = VecDeque::new();
-    buffer_overflow_service_update(&mut d, renamed("a-1._ipp._tcp.local."));
-    buffer_overflow_service_update(&mut d, ServiceUpdate::Established);
-    assert!(
-      matches!(d.front(), Some(ServiceUpdate::Renamed(_))),
-      "the Renamed inserted first must stay at the front"
-    );
-    assert!(matches!(d.back(), Some(ServiceUpdate::Established)));
-
-    // Established then a terminal: order preserved.
-    let mut d2 = VecDeque::new();
-    buffer_overflow_service_update(&mut d2, ServiceUpdate::Established);
-    buffer_overflow_service_update(&mut d2, ServiceUpdate::Conflict);
-    assert!(matches!(d2.front(), Some(ServiceUpdate::Established)));
-    assert!(matches!(d2.back(), Some(ServiceUpdate::Conflict)));
-
-    // Rename churn coalesces to the LATEST name, kept at its most-recent
-    // position (after Established, since those renames arrived after it).
-    let mut d3 = VecDeque::new();
-    buffer_overflow_service_update(&mut d3, ServiceUpdate::Established);
-    buffer_overflow_service_update(&mut d3, renamed("a-1._ipp._tcp.local."));
-    buffer_overflow_service_update(&mut d3, renamed("a-2._ipp._tcp.local."));
-    buffer_overflow_service_update(&mut d3, renamed("a-3._ipp._tcp.local."));
-    assert_eq!(
-      d3.iter()
-        .filter(|u| matches!(u, ServiceUpdate::Renamed(_)))
-        .count(),
-      1,
-      "rename churn must coalesce to a single pending Renamed"
-    );
-    assert!(matches!(d3.front(), Some(ServiceUpdate::Established)));
-    match d3.back() {
-      Some(ServiceUpdate::Renamed(r)) => assert!(r.new_name().as_str().contains("a-3")),
-      other => panic!("latest Renamed must be at the back; got {other:?}"),
-    }
-
-    // Idempotent/one-time kinds dedup, so the deque stays bounded under churn.
-    let mut d4 = VecDeque::new();
-    for _ in 0..100 {
-      buffer_overflow_service_update(&mut d4, ServiceUpdate::Established);
-      buffer_overflow_service_update(&mut d4, ServiceUpdate::HostConflict);
-      buffer_overflow_service_update(&mut d4, renamed("x._ipp._tcp.local."));
-    }
-    assert!(
-      d4.len() <= 4,
-      "overflow deque must stay bounded (≤ one per kind); got {}",
-      d4.len()
-    );
-  }
-
-  /// a non-draining caller cannot grow memory without bound — a
-  /// flood of service updates is held by the bounded channel plus a single
-  /// coalescing overflow slot (capacity + 1), not an unbounded backlog.
+  /// a non-draining caller cannot grow memory without bound — a flood of service
+  /// updates is bounded + coalesced by the handle-owned mailbox (one Established,
+  /// latest Renamed, reserved terminal), never an unbounded backlog.
   #[cfg(feature = "tokio")]
   #[tokio::test]
   async fn service_update_delivery_is_bounded_for_non_draining_caller() {
-    use mdns_proto::ServiceUpdate;
-
-    let opts = crate::options::ServerOptions::default();
-    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
-      v4: None,
-      v6: None,
-      interface_index: 0,
-    };
-    let mut state = DriverState::new(&opts, sockets);
-    let now = StdInstant::now();
-
-    let mut r = mdns_proto::ServiceRecords::new(
-      mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
-      mdns_proto::Name::try_from_str("svc._ipp._tcp.local.").unwrap(),
-      mdns_proto::Name::try_from_str("host.local.").unwrap(),
-      631,
-      120,
-    );
-    r.add_a(std::net::Ipv4Addr::new(192, 168, 1, 10));
-    let reg = state
-      .register_service(mdns_proto::ServiceSpec::new(r), now)
-      .unwrap();
-    let handle = reg.handle;
-
-    // `reg` (the receiver) is kept alive but NEVER drained — a non-draining
-    // caller. Push far more updates than the channel can hold.
-    {
-      let ctx = state.services.get_mut(&handle).unwrap();
-      for _ in 0..1000 {
-        assert!(
-          deliver_service_update(ctx, ServiceUpdate::Established),
-          "an alive (undropped) receiver must not report closed"
-        );
-      }
-      assert!(
-        ctx.updates.len() <= SERVICE_UPDATE_CAPACITY,
-        "the bounded channel must stay within capacity; got {}",
-        ctx.updates.len()
-      );
-      assert!(
-        !ctx.pending.is_empty() && ctx.pending.len() <= 4,
-        "beyond capacity, updates coalesce into the bounded ordered overflow; len {}",
-        ctx.pending.len()
-      );
-    }
-    drop(reg);
-  }
-
-  /// when both an Established and a later Renamed overflow, the
-  /// overflow preserves insertion order — Established is NOT dropped, and a
-  /// Renamed that arrived AFTER it is delivered after it (not reordered ahead).
-  #[cfg(feature = "tokio")]
-  #[tokio::test]
-  async fn established_then_renamed_overflow_preserves_order() {
     use mdns_proto::{ServiceUpdate, event::ServiceRenamed};
 
     let opts = crate::options::ServerOptions::default();
@@ -2719,6 +2431,7 @@ mod tests {
     };
     let mut state = DriverState::new(&opts, sockets);
     let now = StdInstant::now();
+
     let mut r = mdns_proto::ServiceRecords::new(
       mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
       mdns_proto::Name::try_from_str("svc._ipp._tcp.local.").unwrap(),
@@ -2727,116 +2440,41 @@ mod tests {
       120,
     );
     r.add_a(std::net::Ipv4Addr::new(192, 168, 1, 10));
-    let reg = state
-      .register_service(mdns_proto::ServiceSpec::new(r), now)
-      .unwrap();
-    let handle = reg.handle;
-    {
-      let ctx = state.services.get_mut(&handle).unwrap();
-      // Fill the bounded channel so subsequent updates overflow.
-      for _ in 0..SERVICE_UPDATE_CAPACITY {
-        assert!(deliver_service_update(ctx, ServiceUpdate::HostConflict));
-      }
-      // Overflow Established, then a Renamed that arrived AFTER it.
-      assert!(deliver_service_update(ctx, ServiceUpdate::Established));
-      let renamed = ServiceUpdate::Renamed(ServiceRenamed::new(
-        mdns_proto::Name::try_from_str("svc-1._ipp._tcp.local.").unwrap(),
-      ));
-      assert!(deliver_service_update(ctx, renamed));
-      // The Established was not dropped, and order is Established then Renamed.
-      let kinds: Vec<&ServiceUpdate> = ctx.pending.iter().collect();
-      assert!(
-        matches!(kinds.first(), Some(ServiceUpdate::Established)),
-        "Established (inserted first) must remain at the front; overflow = {kinds:?}"
-      );
-      assert!(
-        matches!(kinds.last(), Some(ServiceUpdate::Renamed(_))),
-        "the later Renamed must be delivered after Established; overflow = {kinds:?}"
-      );
-    }
-    drop(reg);
-  }
-
-  /// liveness: a terminal update that overflowed into the ordered
-  /// buffer is NOT stranded. Once the caller drains the bounded channel, the
-  /// driver's opportunistic per-tick `flush_pending_service_update` (the
-  /// service-update loop runs it for every service even with no new proto
-  /// event) delivers the buffered update. This drives that flush directly,
-  /// with no packets or commands in flight.
-  #[cfg(feature = "tokio")]
-  #[tokio::test]
-  async fn overflow_terminal_update_is_delivered_after_drain() {
-    use mdns_proto::ServiceUpdate;
-
-    let opts = crate::options::ServerOptions::default();
-    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
-      v4: None,
-      v6: None,
-      interface_index: 0,
-    };
-    let mut state = DriverState::new(&opts, sockets);
-    let now = StdInstant::now();
-    let mut r = mdns_proto::ServiceRecords::new(
-      mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
-      mdns_proto::Name::try_from_str("svc._ipp._tcp.local.").unwrap(),
-      mdns_proto::Name::try_from_str("host.local.").unwrap(),
-      631,
-      120,
-    );
-    r.add_a(std::net::Ipv4Addr::new(192, 168, 1, 10));
+    // `reg` (the mailbox `Arc` + the doorbell receiver) is kept alive but NEVER
+    // drained — a non-draining caller. The driver ctx shares the same mailbox.
     let reg = state
       .register_service(mdns_proto::ServiceSpec::new(r), now)
       .unwrap();
     let handle = reg.handle;
 
-    // Fill the bounded channel, then overflow a terminal Conflict into the
-    // ordered buffer.
+    // Push a churn of Established + distinct Renamed far past the cap.
     {
       let ctx = state.services.get_mut(&handle).unwrap();
-      for _ in 0..SERVICE_UPDATE_CAPACITY {
-        assert!(deliver_service_update(ctx, ServiceUpdate::HostConflict));
+      for i in 0..1000u32 {
+        deliver_service_update(ctx, ServiceUpdate::Established);
+        deliver_service_update(
+          ctx,
+          ServiceUpdate::Renamed(ServiceRenamed::new(
+            mdns_proto::Name::try_from_str(&format!("svc-{i}._ipp._tcp.local.")).unwrap(),
+          )),
+        );
       }
-      assert!(deliver_service_update(ctx, ServiceUpdate::Conflict));
+      // The mailbox coalesces to one Established + the latest Renamed — at most
+      // the cap, regardless of how much the peer churns.
+      let mb = ctx.mailbox.lock().unwrap_or_else(|e| e.into_inner());
       assert!(
-        ctx
-          .pending
-          .iter()
-          .any(|u| matches!(u, ServiceUpdate::Conflict)),
-        "the terminal Conflict must be buffered while the channel is full"
+        mb.non_terminal_len() <= SERVICE_UPDATE_CAPACITY,
+        "the mailbox must stay within capacity under churn; got {}",
+        mb.non_terminal_len()
+      );
+      // Established + Renamed coalesce by kind, so exactly two non-terminal
+      // updates survive.
+      assert_eq!(
+        mb.non_terminal_len(),
+        2,
+        "Established and the latest Renamed coalesce to two pending updates"
       );
     }
-
-    // Drain the receiver completely — no driver packet/command activity.
-    let mut drained = 0usize;
-    while reg.updates.try_recv().is_ok() {
-      drained += 1;
-    }
-    assert_eq!(
-      drained, SERVICE_UPDATE_CAPACITY,
-      "draining must recover exactly the channel-buffered updates"
-    );
-
-    // The per-tick opportunistic flush now delivers the buffered terminal
-    // update (liveness): it is not stranded behind a previously-full channel.
-    {
-      let ctx = state.services.get_mut(&handle).unwrap();
-      assert!(
-        flush_pending_service_update(ctx),
-        "flush must succeed against an alive receiver"
-      );
-      assert!(
-        ctx.pending.is_empty(),
-        "the buffered update must have been flushed into the channel"
-      );
-    }
-
-    match reg.updates.try_recv() {
-      Ok(ServiceUpdate::Conflict) => {}
-      other => {
-        panic!("the buffered Conflict must be delivered after drain+flush; got {other:?}")
-      }
-    }
-
     drop(reg);
   }
 
@@ -3315,21 +2953,19 @@ mod tests {
       .expect("the same name must be re-registerable once the withdrawal completes");
   }
 
-  /// A `Conflict` queued at an internal retirement must still reach the host even
-  /// when, at the moment of retirement, the bounded `updates` channel was FULL so
-  /// the `Conflict` landed in the ctx's ordered overflow (`pending`) rather than
-  /// the channel. Once the ctx is `withdrawing`, `push_updates` skips it, so the
-  /// overflow would never be flushed again — and `drain_withdrawals` GCs the ctx
-  /// when the withdrawal completes, dropping the buffered `Conflict`. The
-  /// best-effort flush in `drain_withdrawals` (just before `services.remove`)
-  /// closes that window: it moves the buffered `Conflict` into the (decoupled)
-  /// channel, where it survives the ctx GC and stays readable by the caller.
+  /// A `Conflict` queued at an internal retirement must still reach the host
+  /// after the withdrawal GCs the ctx. With the handle-owned reserved-terminal
+  /// mailbox this is now TRIVIAL (formerly ): `deliver_service_update` routes
+  /// the `Conflict` to the mailbox's reserved terminal slot, the mailbox `Arc` is
+  /// shared with the live `Service` handle, and the withdrawal GC removes the ctx
+  /// UNCONDITIONALLY — yet the terminal is still drainable by the live reader
+  /// because the mailbox outlives the ctx. No overflow deque, no deferral.
   ///
   /// Driven through `DriverState` directly (no sockets). With no bound family the
   /// withdrawal force-completes at its 2 s anti-pin ceiling.
   #[cfg(feature = "tokio")]
   #[tokio::test]
-  async fn queued_conflict_survives_withdrawal_gc_after_channel_overflow() {
+  async fn queued_conflict_survives_withdrawal_gc() {
     use std::{net::Ipv4Addr, time::Duration};
 
     use mdns_proto::ServiceUpdate;
@@ -3351,10 +2987,13 @@ mod tests {
       120,
     );
     r.add_a(Ipv4Addr::new(192, 168, 1, 10));
+    // Keep `reg` (the mailbox `Arc` + doorbell receiver) alive: this is the live
+    // reader that must still observe the Conflict after the ctx is GC'd.
     let reg = state
       .register_service(mdns_proto::ServiceSpec::new(r), now)
       .unwrap();
     let handle = reg.handle;
+    let mailbox = Arc::clone(&reg.mailbox);
 
     // 1. Drive the proto to an announced state so the withdrawal snapshot is
     //    NON-empty (otherwise the withdrawal completes instantly with nothing to
@@ -3372,28 +3011,16 @@ mod tests {
       }
     }
 
-    // 2. Fill the bounded channel to capacity so the next delivery overflows into
-    //    `pending`, then deliver a `Conflict` — it lands in `pending`, NOT the
-    //    channel. This reproduces the retirement-under-backpressure state.
+    // 2. Deliver a `Conflict` at retirement — it lands in the mailbox's RESERVED
+    //    terminal slot (not the non-terminal ring).
     {
       let ctx = state.services.get_mut(&handle).unwrap();
-      for _ in 0..SERVICE_UPDATE_CAPACITY {
-        assert!(deliver_service_update(ctx, ServiceUpdate::HostConflict));
-      }
-      assert!(deliver_service_update(ctx, ServiceUpdate::Conflict));
-      assert!(
-        ctx
-          .pending
-          .iter()
-          .any(|u| matches!(u, ServiceUpdate::Conflict)),
-        "the Conflict must be buffered in `pending` while the channel is full"
-      );
+      deliver_service_update(ctx, ServiceUpdate::Conflict);
     }
 
     // 3. Begin the endpoint-owned withdrawal — exactly what the rename-collision /
     //    encode-failure retirement arms do (mark `withdrawing`, snapshot, hand to
-    //    the endpoint). From here `push_updates` skips this ctx, so its `pending`
-    //    would never be flushed again on its own.
+    //    the endpoint). From here `push_updates` skips this ctx.
     {
       let ctx = state.services.get_mut(&handle).unwrap();
       ctx.withdrawing = true;
@@ -3401,22 +3028,9 @@ mod tests {
       state.endpoint.begin_withdrawal(handle, snap, now);
     }
 
-    // 4. Drain the channel of the filler updates so there is room for the flushed
-    //    Conflict (a still-full channel is an inherent backpressure limit the
-    //    best-effort flush cannot beat — not what we are testing here).
-    let mut drained = 0usize;
-    while reg.updates.try_recv().is_ok() {
-      drained += 1;
-    }
-    assert_eq!(
-      drained, SERVICE_UPDATE_CAPACITY,
-      "draining must recover exactly the channel-buffered filler updates"
-    );
-
-    // 5. Drive the withdrawal to completion. With no bound family each round fails
-    //    to deliver, so the endpoint force-completes at the 2 s ceiling;
-    //    `drain_withdrawals` then flushes `pending` into the channel and GCs the
-    //    ctx (dropping the `updates` Sender).
+    // 4. Drive the withdrawal to completion. With no bound family each round
+    //    fails to deliver, so the endpoint force-completes at the 2 s ceiling;
+    //    `drain_withdrawals` then GCs the ctx UNCONDITIONALLY (no deferral).
     let mut scratch = vec![0u8; 4096];
     let mut t = now;
     let mut completed = false;
@@ -3430,36 +3044,31 @@ mod tests {
     }
     assert!(
       completed,
-      "the withdrawal must complete (route freed + driver ctx GC'd)"
+      "the withdrawal must complete (route freed + driver ctx GC'd unconditionally)"
     );
 
-    // 6. The buffered Conflict survived the ctx GC: it was flushed into the
-    //    decoupled channel before the Sender was dropped and is still readable.
-    match reg.updates.try_recv() {
-      Ok(ServiceUpdate::Conflict) => {}
-      other => panic!(
-        "the Conflict queued at retirement must survive the withdrawal GC and stay \
-         readable; got {other:?}"
-      ),
-    }
+    // 5. The Conflict survived the ctx GC: it lives in the handle-owned mailbox's
+    //    reserved slot and is still drainable by the live reader.
+    let drained = lock_mailbox_for_test(&mailbox);
+    assert!(
+      matches!(drained, Some(ServiceUpdate::Conflict)),
+      "the Conflict queued at retirement must survive the unconditional ctx GC and \
+       stay readable from the handle-owned mailbox; got {drained:?}"
+    );
 
     drop(reg);
   }
 
-  /// regression: when a service's withdrawal COMPLETES while its
-  /// bounded `updates` channel is STILL FULL and the caller is STILL ALIVE, the
-  /// terminal `Conflict` queued at retirement sits in `ctx.pending` with no room
-  /// in the channel. The old GC removed the ctx unconditionally, dropping that
-  /// un-flushed Conflict — a slow reader later drained the channel, saw closure,
-  /// and never learned WHY the service was retired. The fix DEFERS the ctx GC:
-  /// the terminal is parked until the reader makes room (or drops the receiver),
-  /// then delivered and the ctx GC'd. This test keeps the channel full PAST
-  /// withdrawal completion, asserts the ctx is NOT dropped (deferred), then frees
-  /// one channel slot, re-pumps, and asserts the Conflict is delivered and the
-  /// ctx is finally GC'd.
+  /// The terminal retirement update survives BOTH a saturated non-terminal ring
+  /// AND an immediate, unconditional ctx GC (the design-doc scenario; formerly
+  /// the deferral case). Fill the mailbox's non-terminal `updates` to the cap
+  /// WITHOUT draining, `set_terminal(Conflict)`, complete the withdrawal so the
+  /// ctx is GC'd immediately, then drain from the LIVE handle and assert the
+  /// `Conflict` IS observed and the ctx is gone from `services` — no park, no
+  /// leak.
   #[cfg(feature = "tokio")]
   #[tokio::test]
-  async fn full_channel_retirement_conflict_is_not_lost() {
+  async fn terminal_survives_full_mailbox_and_immediate_ctx_gc() {
     use std::{net::Ipv4Addr, time::Duration};
 
     use mdns_proto::ServiceUpdate;
@@ -3481,14 +3090,15 @@ mod tests {
       120,
     );
     r.add_a(Ipv4Addr::new(192, 168, 1, 10));
+    // Keep `reg` alive across the GC — it is the live reader.
     let reg = state
       .register_service(mdns_proto::ServiceSpec::new(r), now)
       .unwrap();
     let handle = reg.handle;
+    let mailbox = Arc::clone(&reg.mailbox);
 
     // 1. Drive the proto to an announced state so the withdrawal snapshot is
-    //    NON-empty (otherwise the withdrawal completes instantly and the GC race
-    //    we are testing never arises).
+    //    NON-empty (otherwise the withdrawal completes instantly).
     {
       let ctx = state.services.get_mut(&handle).unwrap();
       let mut buf = vec![0u8; 4096];
@@ -3502,27 +3112,21 @@ mod tests {
       }
     }
 
-    // 2. Fill the channel to capacity so the next delivery overflows into
-    //    `pending`, then deliver a `Conflict` — the retirement terminal lands in
-    //    `pending`, NOT the channel. CRUCIALLY we never drain the channel here, so
-    //    it stays full across withdrawal completion (the case).
+    // 2. Saturate the non-terminal ring to the cap WITHOUT draining, then reserve
+    //    the terminal. The terminal slot is independent of the (full) ring.
     {
-      let ctx = state.services.get_mut(&handle).unwrap();
-      for _ in 0..SERVICE_UPDATE_CAPACITY {
-        assert!(deliver_service_update(ctx, ServiceUpdate::HostConflict));
-      }
-      assert!(deliver_service_update(ctx, ServiceUpdate::Conflict));
-      assert!(
-        ctx
-          .pending
-          .iter()
-          .any(|u| matches!(u, ServiceUpdate::Conflict)),
-        "the Conflict must be buffered in `pending` while the channel is full"
+      let mut mb = mailbox.lock().unwrap_or_else(|e| e.into_inner());
+      mb.fill_non_terminal_to_cap_for_test();
+      assert_eq!(
+        mb.non_terminal_len(),
+        SERVICE_UPDATE_CAPACITY,
+        "the non-terminal ring must be saturated at the cap"
       );
+      mb.set_terminal(ServiceUpdate::Conflict);
     }
 
-    // 3. Begin the endpoint-owned withdrawal — what the rename-collision /
-    //    encode-failure retirement arms do. `push_updates` now skips this ctx.
+    // 3. Begin the endpoint-owned withdrawal (rename-collision / encode-failure
+    //    retirement arm). `push_updates` now skips this ctx.
     {
       let ctx = state.services.get_mut(&handle).unwrap();
       ctx.withdrawing = true;
@@ -3530,74 +3134,53 @@ mod tests {
       state.endpoint.begin_withdrawal(handle, snap, now);
     }
 
-    // 4. Drive the withdrawal to completion WITHOUT draining the channel. With no
-    //    bound family each round fails to deliver, so the endpoint force-completes
-    //    at the 2 s anti-pin ceiling. The GC must NOT drop the ctx: the channel is
-    //    full and the caller is alive, so the terminal is undelivered and the ctx
-    //    is parked for deferred GC instead.
+    // 4. Drive the withdrawal to completion. The ctx is GC'd IMMEDIATELY on
+    //    completion — no park, no deferral, regardless of the full ring + the
+    //    still-undrained reader.
     let mut scratch = vec![0u8; 4096];
     let mut t = now;
-    let mut deferred = false;
+    let mut completed = false;
     for _ in 0..64 {
       t += Duration::from_millis(250);
       state.drain_withdrawals(t, &mut scratch).await;
-      // Once the endpoint has freed the route the ctx is parked, not removed.
-      if state.deferred_gc.contains(&handle) {
-        deferred = true;
+      if !state.services.contains_key(&handle) {
+        completed = true;
         break;
       }
     }
     assert!(
-      deferred,
-      "a completed withdrawal whose terminal can't be delivered (full channel, \
-       live caller) must PARK the ctx for deferred GC, not drop it"
+      completed,
+      "the ctx must be GC'd unconditionally on withdrawal completion"
     );
-    assert!(
-      state.services.contains_key(&handle),
-      "the parked ctx must still be present (its un-flushed terminal lives in it)"
-    );
-    // While parked, `next_deadline` must arm a short retry timer so a purely-idle
-    // driver still wakes to retry the flush (a slow reader draining the channel
-    // does NOT wake us — sends are `try_send`).
-    let nd = state
-      .next_deadline()
-      .expect("deferred GC must yield a retry deadline");
-    assert!(
-      nd <= StdInstant::now() + DEFERRED_GC_RETRY,
-      "the deferred-GC retry deadline must be within DEFERRED_GC_RETRY"
-    );
-
-    // 5. The slow reader finally drains ONE slot, making room for the terminal.
-    //    Re-pump: `retry_deferred_gc` (top of `drain_withdrawals`) flushes the
-    //    Conflict into the channel and GCs the now-empty ctx.
-    assert!(
-      matches!(reg.updates.try_recv(), Ok(ServiceUpdate::HostConflict)),
-      "draining one slot must surface a buffered filler update"
-    );
-    t += Duration::from_millis(250);
-    state.drain_withdrawals(t, &mut scratch).await;
     assert!(
       !state.services.contains_key(&handle),
-      "once the terminal is delivered the parked ctx must finally be GC'd"
-    );
-    assert!(
-      state.deferred_gc.is_empty(),
-      "the GC'd handle must be removed from the deferred set"
+      "no leak: the ctx must be gone from `services` after the withdrawal"
     );
 
-    // 6. The terminal Conflict reached the still-alive reader. Drain the remaining
-    //    fillers, then the Conflict must be present (and is the last meaningful
-    //    update before the channel closes).
+    // 5. Drain from the live handle: all cap non-terminal updates, then the
+    //    reserved Conflict — it was NEVER dropped despite the full ring and the
+    //    immediate GC.
+    let mut non_terminal = 0usize;
     let mut saw_conflict = false;
-    while let Ok(upd) = reg.updates.try_recv() {
-      if matches!(upd, ServiceUpdate::Conflict) {
-        saw_conflict = true;
+    loop {
+      let drained = lock_mailbox_for_test(&mailbox);
+      match drained {
+        Some(ServiceUpdate::Conflict) => {
+          saw_conflict = true;
+          break;
+        }
+        Some(_) => non_terminal += 1,
+        None => break,
       }
     }
+    assert_eq!(
+      non_terminal, SERVICE_UPDATE_CAPACITY,
+      "the saturated non-terminal ring must drain in full before the terminal"
+    );
     assert!(
       saw_conflict,
-      "the retirement Conflict must reach the live reader once the full channel \
-       drains — it must NOT be lost to the ctx GC"
+      "the reserved terminal Conflict must survive a full mailbox + an immediate, \
+       unconditional ctx GC and reach the live reader"
     );
 
     drop(reg);
