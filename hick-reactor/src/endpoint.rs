@@ -25,6 +25,10 @@ use crate::{
 #[derive(Clone)]
 pub struct Endpoint {
   cmd: async_channel::Sender<Command>,
+  /// Shared stats handle cloned from the driver's proto endpoint. Present
+  /// only when the `stats` Cargo feature is enabled.
+  #[cfg(feature = "stats")]
+  stats: std::sync::Arc<hick_trace::stats::Stats>,
 }
 
 impl Endpoint {
@@ -69,23 +73,53 @@ impl Endpoint {
     }
 
     let v4 = if bind_v4 {
-      let std_sock =
-        try_bind_v4(MulticastOptionsV4::new(interface_index)).map_err(ServerError::BindV4)?;
-      try_join_v4(&std_sock, interface_index).map_err(map_join_to_bind_v4)?;
-      std_sock.set_nonblocking(true)?;
-      let async_sock = N::UdpSocket::try_from(std_sock).map_err(ServerError::WrapSocket)?;
-      Some(async_sock)
+      match try_bind_v4(MulticastOptionsV4::new(interface_index)) {
+        Ok(std_sock) => {
+          hick_trace::debug!(interface_index, "bound v4 mDNS socket");
+          match try_join_v4(&std_sock, interface_index) {
+            Ok(()) => {
+              hick_trace::debug!(interface_index, "joined v4 mDNS multicast group");
+            }
+            Err(e) => {
+              hick_trace::warn!(error = %e, interface_index, "failed to join v4 mDNS multicast group");
+              return Err(map_join_to_bind_v4(e));
+            }
+          }
+          std_sock.set_nonblocking(true)?;
+          let async_sock = N::UdpSocket::try_from(std_sock).map_err(ServerError::WrapSocket)?;
+          Some(async_sock)
+        }
+        Err(e) => {
+          hick_trace::warn!(error = %e, interface_index, "failed to bind v4 mDNS socket");
+          return Err(ServerError::BindV4(e));
+        }
+      }
     } else {
       None
     };
 
     let v6 = if bind_v6 {
-      let std_sock =
-        try_bind_v6(MulticastOptionsV6::new(interface_index)).map_err(ServerError::BindV6)?;
-      try_join_v6(&std_sock, interface_index).map_err(map_join_to_bind_v6)?;
-      std_sock.set_nonblocking(true)?;
-      let async_sock = N::UdpSocket::try_from(std_sock).map_err(ServerError::WrapSocket)?;
-      Some(async_sock)
+      match try_bind_v6(MulticastOptionsV6::new(interface_index)) {
+        Ok(std_sock) => {
+          hick_trace::debug!(interface_index, "bound v6 mDNS socket");
+          match try_join_v6(&std_sock, interface_index) {
+            Ok(()) => {
+              hick_trace::debug!(interface_index, "joined v6 mDNS multicast group");
+            }
+            Err(e) => {
+              hick_trace::warn!(error = %e, interface_index, "failed to join v6 mDNS multicast group");
+              return Err(map_join_to_bind_v6(e));
+            }
+          }
+          std_sock.set_nonblocking(true)?;
+          let async_sock = N::UdpSocket::try_from(std_sock).map_err(ServerError::WrapSocket)?;
+          Some(async_sock)
+        }
+        Err(e) => {
+          hick_trace::warn!(error = %e, interface_index, "failed to bind v6 mDNS socket");
+          return Err(ServerError::BindV6(e));
+        }
+      }
     } else {
       None
     };
@@ -101,9 +135,34 @@ impl Endpoint {
       v6,
       interface_index,
     };
-    driver::spawn::<N>(opts, sockets, cmd_rx);
+    #[cfg(feature = "stats")]
+    let mut stats_slot: Option<std::sync::Arc<hick_trace::stats::Stats>> = None;
+    driver::spawn::<N>(
+      opts,
+      sockets,
+      cmd_rx,
+      #[cfg(feature = "stats")]
+      &mut stats_slot,
+    );
 
-    Ok(Self { cmd: cmd_tx })
+    Ok(Self {
+      cmd: cmd_tx,
+      #[cfg(feature = "stats")]
+      stats: stats_slot.expect("spawn always populates stats_slot when stats feature is enabled"),
+    })
+  }
+
+  /// Return a point-in-time snapshot of the I/O + protocol counters for this
+  /// endpoint.
+  ///
+  /// The snapshot includes both counters incremented by the `mdns-proto` layer
+  /// (parse errors, cache operations, service/query lifecycle) and counters
+  /// added by the driver layer (raw wire rx/tx byte counts, socket-level send
+  /// errors). All counters share the same [`hick_trace::stats::Stats`] instance
+  /// so the snapshot is a single consistent view.
+  #[cfg(feature = "stats")]
+  pub fn stats(&self) -> hick_trace::stats::StatsSnapshot {
+    self.stats.snapshot()
   }
 
   /// Hand a detached discovery-lookup driver task to the driver to spawn (via

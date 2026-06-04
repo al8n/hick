@@ -6,6 +6,8 @@
 //! whenever a packet arrives or a timer fires, sends nothing itself, and reads
 //! back the next deadline to sleep until.
 
+#[cfg(feature = "stats")]
+use alloc::sync::Arc;
 use alloc::{
   collections::{BTreeMap, VecDeque},
   vec::Vec,
@@ -31,6 +33,9 @@ use crate::{
   onlink,
   udpio::{SendError, UdpIo},
 };
+
+#[cfg(feature = "stats")]
+use hick_trace::stats::{Stats, StatsSnapshot};
 
 /// RFC 6762 §10.1: repeat the TTL=0 goodbye a few times to improve delivery.
 const GOODBYE_SENDS: u8 = 2;
@@ -489,6 +494,11 @@ pub struct Engine<I: Instant, R> {
   /// The multicast transmit path: per-family fan-out, fan-out ordering, and
   /// self-loopback detection.
   tx: Multicaster<I>,
+  /// Shared I/O counters. Constructed once in [`Engine::new`] and handed out via
+  /// [`Engine::stats_handle`] so callers (e.g. an embassy task, a metrics poller)
+  /// can read the same counters without borrowing the engine.
+  #[cfg(feature = "stats")]
+  stats: Arc<Stats>,
 }
 
 impl<I, R> Engine<I, R>
@@ -509,7 +519,25 @@ where
       // scratch while the backlog is full.
       goodbye_scratch: alloc::vec![0u8; MAX_MDNS_MESSAGE],
       tx: Multicaster::new(),
+      #[cfg(feature = "stats")]
+      stats: Arc::new(Stats::default()),
     }
+  }
+
+  /// Return a cloned handle to the shared I/O stats for this engine.
+  ///
+  /// All I/O counter increments happen on the same [`Stats`] instance that was
+  /// created in [`Engine::new`], so a caller can hold this `Arc` and read the
+  /// counters at any time without borrowing the engine.
+  #[cfg(feature = "stats")]
+  pub fn stats_handle(&self) -> Arc<Stats> {
+    self.stats.clone()
+  }
+
+  /// Take a consistent point-in-time snapshot of every counter and gauge.
+  #[cfg(feature = "stats")]
+  pub fn stats(&self) -> StatsSnapshot {
+    self.stats.snapshot()
   }
 
   /// Set the device's local subnets — the RFC 6762 §11 on-link heuristic used when
@@ -648,8 +676,19 @@ where
       // oversized packets can't drain the whole socket backlog in one uncapped pass
       //, but there is nothing to deliver.
       if len == 0 {
+        #[cfg(feature = "stats")]
+        self.stats.packets_dropped(1);
+        #[cfg(feature = "defmt")]
+        defmt::debug!("rx drop: oversized/truncated datagram (len=0 marker)");
         continue;
       }
+      #[cfg(feature = "stats")]
+      {
+        self.stats.packets_rx(1);
+        self.stats.bytes_rx(len as u64);
+      }
+      #[cfg(feature = "defmt")]
+      defmt::trace!("rx {} bytes", len);
       if onlink::on_link(meta.hop_limit, meta.src.ip(), meta.local, &self.subnets) {
         self.handle_one(now, meta.src, meta.local, &scratch[..len]);
       }
@@ -665,17 +704,39 @@ where
         // Multicast: fan out to BOTH groups and confirm synchronously this pump
         // (honors the proto's confirm-on-send contract).
         match self.tx.send_multicast(io, &scratch[..len], now) {
-          MulticastOutcome::Delivered => self.note_transmit_result(origin, now, true),
+          MulticastOutcome::Delivered => {
+            #[cfg(feature = "stats")]
+            {
+              self.stats.packets_tx(1);
+              self.stats.bytes_tx(len as u64);
+            }
+            #[cfg(feature = "defmt")]
+            defmt::trace!("tx multicast {} bytes delivered", len);
+            self.note_transmit_result(origin, now, true);
+          }
           MulticastOutcome::Retry => self.note_transmit_result(origin, now, false),
           // Permanently undeliverable (too large for every reachable socket): retire
           // the producer so it stops re-offering forever and the app sees an
           // actionable update, instead of probing/announcing indefinitely.
-          MulticastOutcome::Undeliverable => self.retire_origin(origin),
+          MulticastOutcome::Undeliverable => {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("tx multicast {} bytes undeliverable (too large)", len);
+            self.retire_origin(origin);
+          }
         }
       } else {
         // Unicast (legacy §6.7 reply): one destination, no fan-out. A failed
         // one-shot reply is best-effort (the querier re-asks), never service-fatal.
         let delivered = io.try_send(&scratch[..len], dst).is_ok();
+        if delivered {
+          #[cfg(feature = "stats")]
+          {
+            self.stats.packets_tx(1);
+            self.stats.bytes_tx(len as u64);
+          }
+          #[cfg(feature = "defmt")]
+          defmt::trace!("tx unicast {} bytes delivered", len);
+        }
         self.note_transmit_result(origin, now, delivered);
       }
     }
@@ -687,6 +748,13 @@ where
     // again so confirmed transitions are visible to `poll_service_update` now.
     self.drain_service_updates(now);
 
+    #[cfg(feature = "defmt")]
+    {
+      let n = self.goodbyes.len();
+      if n > 0 {
+        defmt::trace!("goodbye drain: {} pending entries", n);
+      }
+    }
     self.drain_goodbyes(now, io);
 
     let deadline = self.poll_deadline();

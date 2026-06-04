@@ -18,11 +18,13 @@ default = []
 tracing = ["mdns-proto/tracing", "hick-smoltcp/tracing", "hick-trace/tracing"]
 metrics = ["mdns-proto/metrics", "hick-smoltcp/metrics", "hick-trace/metrics"]
 stats = ["mdns-proto/stats", "hick-smoltcp/stats", "hick-trace/stats"]
+defmt = ["dep:defmt", "hick-smoltcp/defmt"]
 
 [dependencies]
 hick-trace = { workspace = true }
 mdns-proto = { workspace = true, features = ["alloc", "slab"] }
 hick-smoltcp = { workspace = true }
+defmt = { workspace = true, optional = true }
 embassy-net = { version = "0.9", default-features = false, features = [
   "udp",
   "multicast",

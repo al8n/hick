@@ -221,6 +221,12 @@ impl RecvMeta {
 /// interface is set via `IP_MULTICAST_IF` so that sends leave on the caller's
 /// chosen interface rather than the OS default.
 pub fn try_bind_v4(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
+  try_bind_v4_inner(opts).inspect_err(|_e| {
+    hick_trace::warn!(error = %_e, "try_bind_v4 failed");
+  })
+}
+
+fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
   let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
   sock.set_reuse_address(true)?;
   #[cfg(unix)]
@@ -273,6 +279,12 @@ pub fn try_bind_v4(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
 /// interface is set via `IPV6_MULTICAST_IF` so that sends leave on the caller's
 /// chosen interface rather than the OS default.
 pub fn try_bind_v6(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
+  try_bind_v6_inner(opts).inspect_err(|_e| {
+    hick_trace::warn!(error = %_e, "try_bind_v6 failed");
+  })
+}
+
+fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
   // make this an IPv6-ONLY socket BEFORE bind. On dual-stack-default
   // systems (e.g. Linux `bindv6only=0`) a `[::]:5353` socket would otherwise
@@ -324,6 +336,12 @@ pub fn try_bind_v6(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
 /// `JoinError::InterfaceNotFound` if the index does not resolve to an
 /// interface or the interface carries no IPv4 addresses.
 pub fn try_join_v4(sock: &UdpSocket, interface_index: u32) -> Result<(), JoinError> {
+  try_join_v4_inner(sock, interface_index).inspect_err(|_e| {
+    hick_trace::warn!(error = %_e, interface_index, "try_join_v4 failed");
+  })
+}
+
+fn try_join_v4_inner(sock: &UdpSocket, interface_index: u32) -> Result<(), JoinError> {
   let iface = match getifs::interface_by_index(interface_index) {
     Ok(Some(i)) => i,
     _ => {
@@ -346,6 +364,12 @@ pub fn try_join_v4(sock: &UdpSocket, interface_index: u32) -> Result<(), JoinErr
 
 /// Join the IPv6 mDNS multicast group on a specific interface.
 pub fn try_join_v6(sock: &UdpSocket, interface_index: u32) -> Result<(), JoinError> {
+  try_join_v6_inner(sock, interface_index).inspect_err(|_e| {
+    hick_trace::warn!(error = %_e, interface_index, "try_join_v6 failed");
+  })
+}
+
+fn try_join_v6_inner(sock: &UdpSocket, interface_index: u32) -> Result<(), JoinError> {
   sock.join_multicast_v6(&MDNS_IPV6_GROUP, interface_index)?;
   Ok(())
 }

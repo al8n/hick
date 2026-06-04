@@ -75,22 +75,50 @@ impl Endpoint {
     }
 
     let std_v4 = if bind_v4 {
-      let s = try_bind_v4(MulticastOptionsV4::new(interface_index)).map_err(ServerError::BindV4)?;
-      // Fail construction on a join error: a bound-but-unjoined socket can send
-      // but never receives multicast, making the endpoint silently
-      // non-functional. Mirrors the reactor's fatal-join setup.
-      try_join_v4(&s, interface_index).map_err(ServerError::JoinV4)?;
-      s.set_nonblocking(true).map_err(ServerError::Io)?;
-      Some(s)
+      match try_bind_v4(MulticastOptionsV4::new(interface_index)) {
+        Ok(s) => {
+          hick_trace::debug!(interface_index, "bound v4 mDNS socket");
+          // Fail construction on a join error: a bound-but-unjoined socket can
+          // send but never receives multicast, making the endpoint silently
+          // non-functional. Mirrors the reactor's fatal-join setup.
+          match try_join_v4(&s, interface_index) {
+            Ok(()) => hick_trace::debug!(interface_index, "joined v4 mDNS multicast group"),
+            Err(e) => {
+              hick_trace::warn!(error = %e, interface_index, "failed to join v4 mDNS multicast group");
+              return Err(ServerError::JoinV4(e));
+            }
+          }
+          s.set_nonblocking(true).map_err(ServerError::Io)?;
+          Some(s)
+        }
+        Err(e) => {
+          hick_trace::warn!(error = %e, interface_index, "failed to bind v4 mDNS socket");
+          return Err(ServerError::BindV4(e));
+        }
+      }
     } else {
       None
     };
 
     let std_v6 = if bind_v6 {
-      let s = try_bind_v6(MulticastOptionsV6::new(interface_index)).map_err(ServerError::BindV6)?;
-      try_join_v6(&s, interface_index).map_err(ServerError::JoinV6)?;
-      s.set_nonblocking(true).map_err(ServerError::Io)?;
-      Some(s)
+      match try_bind_v6(MulticastOptionsV6::new(interface_index)) {
+        Ok(s) => {
+          hick_trace::debug!(interface_index, "bound v6 mDNS socket");
+          match try_join_v6(&s, interface_index) {
+            Ok(()) => hick_trace::debug!(interface_index, "joined v6 mDNS multicast group"),
+            Err(e) => {
+              hick_trace::warn!(error = %e, interface_index, "failed to join v6 mDNS multicast group");
+              return Err(ServerError::JoinV6(e));
+            }
+          }
+          s.set_nonblocking(true).map_err(ServerError::Io)?;
+          Some(s)
+        }
+        Err(e) => {
+          hick_trace::warn!(error = %e, interface_index, "failed to bind v6 mDNS socket");
+          return Err(ServerError::BindV6(e));
+        }
+      }
     } else {
       None
     };
@@ -128,6 +156,17 @@ impl Endpoint {
     compio_runtime::spawn(driver_fut).detach();
 
     Ok(Self { inner })
+  }
+
+  /// Return a point-in-time snapshot of the I/O + protocol counters for this
+  /// endpoint.
+  ///
+  /// Delegates to the shared [`hick_trace::stats::Stats`] instance owned by
+  /// the proto endpoint (and shared with the driver I/O paths), so the
+  /// snapshot covers wire-level rx/tx as well as protocol-level events.
+  #[cfg(feature = "stats")]
+  pub fn stats(&self) -> hick_trace::stats::StatsSnapshot {
+    self.inner.state.borrow().stats.snapshot()
   }
 
   /// Register a new service.

@@ -61,6 +61,10 @@ stats = [
   "hick-smoltcp?/stats",
   "hick-embassy?/stats",
 ]
+# Forward defmt instrumentation to the bare-metal drivers only. mdns-proto has
+# no defmt support (its events are tracing-only). The weak-dep (`?`) discipline
+# means this never pulls a driver that is not already enabled.
+defmt = ["hick-smoltcp?/defmt", "hick-embassy?/defmt"]
 
 [dependencies]
 # Always the alloc-tier core (every driver needs it); the `std` feature adds the

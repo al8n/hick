@@ -14,6 +14,7 @@ hick-embassy = { version = "0.1", path = "hick-embassy", default-features = fals
 tracing = { version = "0.1", default-features = false }
 metrics = { version = "0.24", default-features = false }
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+defmt = { version = "0.3", default-features = false }
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"

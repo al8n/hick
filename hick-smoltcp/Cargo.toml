@@ -18,10 +18,12 @@ default = []
 tracing = ["mdns-proto/tracing", "hick-trace/tracing"]
 metrics = ["mdns-proto/metrics", "hick-trace/metrics"]
 stats = ["mdns-proto/stats", "hick-trace/stats"]
+defmt = ["dep:defmt"]
 
 [dependencies]
 hick-trace = { workspace = true }
 mdns-proto = { workspace = true, features = ["alloc", "slab"] }
+defmt = { workspace = true, optional = true }
 rand_core = { version = "0.10", default-features = false }
 smoltcp = { version = "0.13", default-features = false, features = [
   "medium-ethernet",

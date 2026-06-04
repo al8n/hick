@@ -44,9 +44,13 @@ pub async fn run<R: Rng>(
   // `DualUdp` send path has only shared `&UdpSocket`, and `set_hop_limit` needs `&mut`).
   if let Some(s) = v4.as_deref_mut() {
     s.set_hop_limit(Some(255));
+    #[cfg(feature = "defmt")]
+    defmt::debug!("hick-embassy: v4 hop-limit set to 255 (RFC 6762 §11)");
   }
   if let Some(s) = v6.as_deref_mut() {
     s.set_hop_limit(Some(255));
+    #[cfg(feature = "defmt")]
+    defmt::debug!("hick-embassy: v6 hop-limit set to 255 (RFC 6762 §11)");
   }
   loop {
     let now = EmbassyInstant(Instant::now());
@@ -56,6 +60,8 @@ pub async fn run<R: Rng>(
     };
     match deadline {
       Some(d) => {
+        #[cfg(feature = "defmt")]
+        defmt::trace!("hick-embassy: waiting for recv or deadline timer");
         let _ = select(
           wait_either_recv(v4.as_deref(), v6.as_deref()),
           Timer::at(d.0),
@@ -63,7 +69,11 @@ pub async fn run<R: Rng>(
         .await;
       }
       // No scheduled work — wake only when a datagram arrives.
-      None => wait_either_recv(v4.as_deref(), v6.as_deref()).await,
+      None => {
+        #[cfg(feature = "defmt")]
+        defmt::trace!("hick-embassy: no deadline, waiting for recv");
+        wait_either_recv(v4.as_deref(), v6.as_deref()).await;
+      }
     }
   }
 }
