@@ -23,8 +23,8 @@ same pattern. Without `tracing` they return a `NoopSpan` that supports
 | Feature | Description |
 |---------|-------------|
 | `tracing` | Delegate macros to the real [`tracing`] crate (emit structured events/spans). |
-| `stats` | Enable [`stats::Stats`] and [`stats::StatsSnapshot`]: `no_std`-safe atomic counters and gauges. Requires `portable-atomic` on targets without native 64-bit atomics. |
-| `metrics` | Forward every counter/gauge update to the [`metrics`] facade (Prometheus/StatsD exporters). Implies `stats`; requires `std`. |
+| `stats` | Enable [`stats::Stats`] and [`stats::StatsSnapshot`]: `no_std`-safe atomic counters and gauges. Requires `portable-atomic` on targets without native 64-bit atomics. Available on bare-metal. |
+| `metrics` | Forward every counter/gauge update to the [`metrics`] facade (Prometheus/StatsD exporters). Implies `stats`; **requires `std`**. Not available on bare-metal (`no_std`) targets — use `stats` + `defmt` for embedded observability instead. |
 
 ## `stats` module
 
@@ -46,10 +46,13 @@ get a `StatsSnapshot` (plain `Copy` struct of `u64` fields). All loads use
 
 ## Feature-forwarding in downstream crates
 
-Each crate in the hick family (`mdns-proto`, `hick-reactor`, `hick-compio`,
-`hick-smoltcp`, `hick-embassy`, `hick-udp`) exposes the same feature names
-(`tracing`, `stats`, `metrics`) and forwards them to `hick-trace`. The
-[`hick`] facade additionally exposes `defmt` for the bare-metal drivers.
+Each crate in the hick family exposes feature names that forward to `hick-trace`:
+
+- **`std` crates** (`hick-reactor`, `hick-compio`, the [`hick`] facade for std
+  targets): expose `tracing`, `stats`, and `metrics`.
+- **bare-metal crates** (`hick-smoltcp`, `hick-embassy`, `mdns-proto`): expose
+  `tracing`, `stats`, and `defmt`. The `metrics` feature is **not forwarded**
+  from bare-metal crates because it requires `std`.
 
 ## License
 

@@ -80,12 +80,12 @@ async fn mdns_task(
 |---------|-------------|
 | `tracing` | Forward structured `tracing` events from `mdns-proto` and `hick-smoltcp` (no-op on bare-metal without a subscriber). |
 | `stats` | Enable `no_std`-safe atomic counters; read a snapshot via `state.stats()`. |
-| `metrics` | Bridge counters to the [`metrics`] facade. Implies `stats`. |
 | `defmt` | Emit `defmt` log events — the idiomatic choice for embassy bare-metal targets. |
 
 ## Observability
 
-For embassy targets the recommended logging path is `defmt`:
+For embassy targets the recommended logging path is `defmt` combined with
+`stats`:
 
 ```toml
 hick-embassy = { version = "0.1", features = ["defmt", "stats"] }
@@ -104,6 +104,10 @@ let snap = state.stats();
 
 The `tracing` feature is available but is a no-op on bare-metal targets that
 do not set up a `tracing` subscriber.
+
+The `metrics` feature (bridging counters to the [`metrics`] facade) requires
+`std` and is not available on embassy bare-metal targets. Use `stats` + `defmt`
+instead for observability on embedded.
 
 ## Design
 

@@ -341,14 +341,23 @@ enum AwaitingConfirm {
   Announcement(respond::EmittedRecords),
   /// A question/legacy response is awaiting confirmation. Carries the concrete
   /// records actually emitted (§7.1 KAS may have trimmed any subset), so only
-  /// those latch goodbye ownership on a confirmed send.
-  Response(respond::EmittedRecords),
+  /// those latch goodbye ownership on a confirmed send.  The second field is
+  /// the count of records §7.1 KAS suppressed from THIS response (partial
+  /// suppression); it is bumped into `answers_suppressed_kas` ONLY on a
+  /// confirmed delivery so a socket failure cannot inflate the counter.
+  Response(respond::EmittedRecords, u64),
   /// A conflict-rename goodbye (TTL=0 withdrawal of the OLD instance records) is
   /// awaiting confirmation. Its resend budget (`pending_rename_goodbye.remaining`)
   /// is spent ONLY on a confirmed send — an all-family-busy attempt re-arms it
   /// instead of consuming the withdrawal. It withdraws records it never
   /// re-advertises, so it latches NO new goodbye ownership.
   RenameGoodbye,
+  /// A RFC 6763 §9 service-type enumeration meta-response (multicast or legacy
+  /// unicast) is awaiting confirmation. The meta-PTR is a shared record — it
+  /// advertises no instance-owned records and is never withdrawn — so a confirmed
+  /// delivery bumps `responses_tx` WITHOUT touching goodbye ownership or any
+  /// lifecycle state.
+  MetaResponse,
 }
 
 /// Goodbye ownership: which CONCRETE records peers may have cached FROM US, and
@@ -440,7 +449,7 @@ pub struct Service<I, TQ, EV> {
   state: ServiceState,
   records: ServiceRecords,
   #[cfg(feature = "stats")]
-  stats: std::sync::Arc<hick_trace::stats::Stats>,
+  stats: Option<std::sync::Arc<hick_trace::stats::Stats>>,
   /// The next scheduled lifecycle deadline (probe, announce, re-announce).
   /// Never modified by response scheduling — only advanced by lifecycle logic.
   lifecycle_deadline: Option<I>,
@@ -579,7 +588,7 @@ where
       state,
       records,
       #[cfg(feature = "stats")]
-      stats: std::sync::Arc::new(hick_trace::stats::Stats::default()),
+      stats: None,
       lifecycle_deadline,
       response_deadline: None,
       probe_count: 0,
@@ -607,13 +616,22 @@ where
     }
   }
 
-  /// Replace the shared [`Stats`] handle with one from the owning [`Endpoint`].
-  ///
-  /// Called immediately after construction by `Endpoint::try_register_service`
-  /// so that all per-service counters accumulate into the endpoint-level stats.
+  /// Attach the shared [`hick_trace::stats::Stats`] handle from the owning
+  /// [`crate::endpoint::Endpoint`]. No allocation — the Arc is cloned from the
+  /// endpoint's existing single Arc. Called immediately after construction by
+  /// `Endpoint::try_register_service` so that all per-service counters accumulate
+  /// into the endpoint-level stats. Before this is called, stats bumps are no-ops
+  /// (the field is `None`).
   #[cfg(feature = "stats")]
   pub(crate) fn set_stats(&mut self, stats: std::sync::Arc<hick_trace::stats::Stats>) {
-    self.stats = stats;
+    self.stats = Some(stats);
+  }
+
+  /// Borrow the stats handle if one has been attached.
+  #[cfg(feature = "stats")]
+  #[inline]
+  fn stat(&self) -> Option<&hick_trace::stats::Stats> {
+    self.stats.as_deref()
   }
 
   /// Returns the handle assigned at registration.
@@ -710,17 +728,24 @@ where
             // retries, rather than the service progressing toward Announcing
             // with nothing on the wire.
             self.lifecycle_deadline = probe_deadline(now, n, &mut self.rng);
-          } else if n >= 2 {
-            // Third probe confirmed (§8.1: exactly three) → begin announcing.
-            self.state = ServiceState::Announcing(0);
-            self.probe_count = 3;
-            self.lifecycle_deadline = announce_deadline(now, 0);
           } else {
-            // Probe confirmed → schedule the next one PROBE_INTERVAL later.
-            let new_n = n.saturating_add(1);
-            self.state = ServiceState::Probing(new_n);
-            self.probe_count = new_n;
-            self.lifecycle_deadline = probe_deadline(now, new_n, &mut self.rng);
+            // Probe reached the link — count it now (confirmed delivery).
+            #[cfg(feature = "stats")]
+            if let Some(s) = self.stat() {
+              s.probes_tx(1);
+            }
+            if n >= 2 {
+              // Third probe confirmed (§8.1: exactly three) → begin announcing.
+              self.state = ServiceState::Announcing(0);
+              self.probe_count = 3;
+              self.lifecycle_deadline = announce_deadline(now, 0);
+            } else {
+              // Probe confirmed → schedule the next one PROBE_INTERVAL later.
+              let new_n = n.saturating_add(1);
+              self.state = ServiceState::Probing(new_n);
+              self.probe_count = new_n;
+              self.lifecycle_deadline = probe_deadline(now, new_n, &mut self.rng);
+            }
           }
         }
       }
@@ -741,11 +766,15 @@ where
           }
           return;
         }
-        // Confirmed announcement → latch goodbye ownership for the records it
-        // carried (peers can only have cached our records once a send truly
-        // reached the link). Driven by the encoder's per-record report, same as
-        // a response: a full announcement emits all of
+        // Confirmed announcement → count it, then latch goodbye ownership for
+        // the records it carried (peers can only have cached our records once a
+        // send truly reached the link). Driven by the encoder's per-record
+        // report, same as a response: a full announcement emits all of
         // PTR/SRV/TXT plus every host address.
+        #[cfg(feature = "stats")]
+        if let Some(s) = self.stat() {
+          s.announcements_tx(1);
+        }
         self.goodbye.record_emitted(&emitted);
         if let ServiceState::Announcing(n) = self.state {
           if n >= 1 {
@@ -761,7 +790,9 @@ where
               "service: Announcing → Established"
             );
             #[cfg(feature = "stats")]
-            self.stats.services_established(1);
+            if let Some(s) = self.stat() {
+              s.services_established(1);
+            }
           } else {
             // First announcement confirmed → schedule the second one (§8.3: ≥1 s
             // later).
@@ -778,7 +809,9 @@ where
           }
         }
       }
-      AwaitingConfirm::Response(emitted) => {
+      AwaitingConfirm::Response(emitted, _kas_suppressed_count) => {
+        #[cfg(feature = "stats")]
+        let kas_suppressed_count = _kas_suppressed_count;
         // a DELIVERED response (multicast question reply or §6.7
         // legacy unicast reply) put our positive-TTL records on the wire, so
         // peers may now cache them — even before the first §8.3 announcement is
@@ -792,14 +825,30 @@ where
         // group would let a later TTL=0 goodbye withdraw records this service
         // never put on the wire, potentially cache-flushing a peer's matching
         // shared record. NOT a lifecycle PHASE change.
+        //
+        // answers_suppressed_kas (partial suppression) is also deferred here:
+        // a socket failure must not inflate the suppression counter — the
+        // records were encoded but never left the host, so from the network's
+        // perspective they were NOT suppressed.
         if delivered {
+          #[cfg(feature = "stats")]
+          if let Some(s) = self.stat() {
+            s.responses_tx(1);
+            if kas_suppressed_count > 0 {
+              s.answers_suppressed_kas(kas_suppressed_count);
+            }
+          }
           self.goodbye.record_emitted(&emitted);
         }
       }
       AwaitingConfirm::RenameGoodbye => {
         if delivered {
-          // The withdrawal reached the link → spend ONE resend, then schedule the
-          // next (RENAME_GOODBYE_INTERVAL apart) or finish.
+          // The withdrawal reached the link → count it, spend ONE resend, then
+          // schedule the next (RENAME_GOODBYE_INTERVAL apart) or finish.
+          #[cfg(feature = "stats")]
+          if let Some(s) = self.stat() {
+            s.goodbyes_tx(1);
+          }
           if let Some((_, remaining, _)) = self.pending_rename_goodbye.as_mut() {
             *remaining = remaining.saturating_sub(1);
             if *remaining == 0 {
@@ -819,6 +868,18 @@ where
           self.rename_goodbye_deadline = now.checked_add_duration(RENAME_GOODBYE_INTERVAL);
           if self.rename_goodbye_deadline.is_none() {
             self.pending_rename_goodbye = None;
+          }
+        }
+      }
+      AwaitingConfirm::MetaResponse => {
+        // A §9 meta-response (multicast or legacy) put a shared meta-PTR on the
+        // wire.  No instance-owned records were emitted, so goodbye ownership is
+        // NOT touched.  On a confirmed delivery bump responses_tx so the
+        // *_tx counters reflect every datagram that left the host.
+        if delivered {
+          #[cfg(feature = "stats")]
+          if let Some(s) = self.stat() {
+            s.responses_tx(1);
           }
         }
       }
@@ -1277,7 +1338,9 @@ where
           "service: ProbeConflict (§9 post-establishment) — reverting to probe"
         );
         #[cfg(feature = "stats")]
-        self.stats.conflicts(1);
+        if let Some(s) = self.stat() {
+          s.conflicts(1);
+        }
         self.last_conflict_reprobe = Some(now);
         self.state = ServiceState::Init;
         self.probe_count = 0;
@@ -1581,7 +1644,9 @@ where
           "service: HostConflict — peer claimed our host name with different rdata"
         );
         #[cfg(feature = "stats")]
-        self.stats.conflicts(1);
+        if let Some(s) = self.stat() {
+          s.conflicts(1);
+        }
         let _ = self.pending_updates.insert(ServiceUpdate::HostConflict);
       }
       _ => {}
@@ -1633,9 +1698,9 @@ where
           "service: probe tiebreak lost (§8.2) — renaming"
         );
         #[cfg(feature = "stats")]
-        {
-          self.stats.conflicts(1);
-          self.stats.renames(1);
+        if let Some(s) = self.stat() {
+          s.conflicts(1);
+          s.renames(1);
         }
         if self.goodbye.any_instance() {
           // capture WHICH instance records the old name actually put on
@@ -1869,8 +1934,7 @@ where
             handle = self.handle.raw(),
             "service: poll_transmit emitting rename goodbye (TTL=0)"
           );
-          #[cfg(feature = "stats")]
-          self.stats.goodbyes_tx(1);
+          // goodbyes_tx is bumped in note_transmit_result on confirmed delivery.
           // Confirm-on-send: stamp the commit token and DEFER spending the resend
           // budget (and scheduling the next resend) to `note_transmit_result`. An
           // all-family-busy send must NOT consume the withdrawal — the budget is
@@ -1912,6 +1976,10 @@ where
         && let Ok(meta) = crate::Name::try_from_str(crate::endpoint::DNS_SD_META_QUERY_NAME)
         && let Ok(n) = respond::write_meta_response(&self.records, &meta, buf)
       {
+        // Stamp the MetaResponse token so note_transmit_result can count
+        // responses_tx on a confirmed delivery.  No goodbye ownership is
+        // latched (the meta-PTR is shared and never withdrawn).
+        self.awaiting_confirm = Some(AwaitingConfirm::MetaResponse);
         return Ok(Some(Transmit::new(respond::multicast_dst(), None, n)));
       }
       // Suppressed, or name build (impossible) / encode failed — drop the reply
@@ -1953,9 +2021,14 @@ where
           // KAS-filtered. Stamp the Response commit token with exactly what the
           // encoder reported it emitted; a confirmed delivery then latches
           // goodbye ownership for those records via `note_transmit_result`. A
-          // meta reply (`emitted` is None) latches nothing — the meta-PTR is
-          // shared and never withdrawn.
-          self.awaiting_confirm = emitted.map(AwaitingConfirm::Response);
+          // meta reply (`emitted` is None) uses MetaResponse — shared PTR, no
+          // goodbye ownership — but still counts responses_tx on delivery.
+          // Legacy replies are not KAS-filtered, so the partial-suppression
+          // count is always 0.
+          self.awaiting_confirm = match emitted {
+            Some(e) => Some(AwaitingConfirm::Response(e, 0)),
+            None => Some(AwaitingConfirm::MetaResponse),
+          };
           return Ok(Some(Transmit::new(resp.dst, None, n)));
         }
         // a legacy reply echoes the question, so it can exceed the
@@ -2003,8 +2076,7 @@ where
           bytes = n,
           "service: poll_transmit emitting probe"
         );
-        #[cfg(feature = "stats")]
-        self.stats.probes_tx(1);
+        // probes_tx is bumped in note_transmit_result on confirmed delivery.
         n
       }
       PendingTransmitKind::Announcement => {
@@ -2028,8 +2100,7 @@ where
           bytes = n,
           "service: poll_transmit emitting announcement"
         );
-        #[cfg(feature = "stats")]
-        self.stats.announcements_tx(1);
+        // announcements_tx is bumped in note_transmit_result on confirmed delivery.
         n
       }
       PendingTransmitKind::Response => {
@@ -2101,14 +2172,6 @@ where
           bytes = encoded,
           "service: poll_transmit emitting response"
         );
-        #[cfg(feature = "stats")]
-        {
-          self.stats.responses_tx(1);
-          let s = kas_suppressed.get();
-          if s > 0 {
-            self.stats.answers_suppressed_kas(s);
-          }
-        }
         encoded
       }
     };
@@ -2141,14 +2204,37 @@ where
         // and questioner set now that this Response consumed it.
         self.kas_hints = [None; KAS_RING_SIZE];
         self.questioner_srcs.clear();
-        // / §7.1: if KAS suppressed EVERY record the response is
-        // header-only — do not put an empty response on the wire, and latch
-        // nothing (a header-only datagram advertises nothing to withdraw).
+        // §7.1: if KAS suppressed EVERY record the response is header-only —
+        // do not put an empty response on the wire, and latch nothing (a
+        // header-only datagram advertises nothing to withdraw).
+        //
+        // Full suppression: no datagram leaves the host, so there is no
+        // delivery to wait for. Count answers_suppressed_kas immediately at
+        // the point of suppression — this is a genuine suppression event, not
+        // a send failure. Document: this is the ONLY counter bump in
+        // poll_transmit that is NOT deferred to note_transmit_result, because
+        // Ok(None) means no datagram (and thus no AwaitingConfirm token) is
+        // ever produced.
         if resp_emitted.is_empty() {
+          #[cfg(feature = "stats")]
+          if let Some(s) = self.stat() {
+            let suppressed = kas_suppressed.get();
+            if suppressed > 0 {
+              s.answers_suppressed_kas(suppressed);
+            }
+          }
           return Ok(None);
         }
+        // Partial suppression: carry the suppressed count in the AwaitingConfirm
+        // token and defer the answers_suppressed_kas bump to note_transmit_result
+        // so a socket failure does NOT inflate the counter.
+        // responses_tx is also deferred there.
+        #[cfg(feature = "stats")]
+        let partial_suppressed = kas_suppressed.get();
+        #[cfg(not(feature = "stats"))]
+        let partial_suppressed = 0u64;
         // Latch goodbye ownership only for the concrete records actually emitted.
-        Some(AwaitingConfirm::Response(resp_emitted))
+        Some(AwaitingConfirm::Response(resp_emitted, partial_suppressed))
       }
       None => None,
     };

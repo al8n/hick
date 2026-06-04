@@ -202,7 +202,7 @@ where
     self.stats.snapshot()
   }
 
-  /// Return a cloned handle to the shared [`Stats`] so the I/O driver can
+  /// Return a cloned handle to the shared [`hick_trace::stats::Stats`] so the I/O driver can
   /// bump transport-level counters (e.g. `bytes_tx`, `packets_tx`).
   #[cfg(feature = "stats")]
   pub fn stats_handle(&self) -> std::sync::Arc<hick_trace::stats::Stats> {
@@ -275,7 +275,10 @@ where
       "try_register_service: service registered"
     );
     #[cfg(feature = "stats")]
-    self.stats.services_registered(1);
+    {
+      self.stats.services_registered(1);
+      self.stats.incr_services_active(1);
+    }
     Ok((handle, svc))
   }
 
@@ -298,7 +301,12 @@ where
       .find(|(_, route)| route.handle() == handle)
       .map(|(k, _)| k);
     if let Some(k) = key {
-      self.services.try_remove(k).is_some()
+      let removed = self.services.try_remove(k).is_some();
+      #[cfg(feature = "stats")]
+      if removed {
+        self.stats.decr_services_active(1);
+      }
+      removed
     } else {
       false
     }
@@ -367,7 +375,10 @@ where
       "try_start_query: query started"
     );
     #[cfg(feature = "stats")]
-    self.stats.queries_started(1);
+    {
+      self.stats.queries_started(1);
+      self.stats.incr_queries_active(1);
+    }
     Ok(handle)
   }
 
@@ -479,9 +490,13 @@ where
       HandleError::Parse(e)
     })?;
     if !reader.header().flags().opcode().is_query() {
+      #[cfg(feature = "stats")]
+      self.stats.packets_dropped(1);
       return Err(HandleError::InvalidOpcode(reader.header().flags().opcode()));
     }
     if !reader.header().flags().response_code().is_no_error() {
+      #[cfg(feature = "stats")]
+      self.stats.packets_dropped(1);
       return Err(HandleError::InvalidResponseCode(
         reader.header().flags().response_code(),
       ));
@@ -522,6 +537,88 @@ where
     // same all-side-effects suppression as a self packet.
     let untrusted_response = is_response && src.port() != crate::constants::MDNS_PORT;
     let suppress_side_effects = is_self_packet || untrusted_response;
+
+    // ── Single eager section-validation latch ──────────────────────────────
+    // Walk ALL FOUR sections (questions, answers, authority, additional) once
+    // to detect whether any record in any section fails to parse.  If so,
+    // bump `parse_errors(1)` exactly once per datagram.
+    //
+    // Precedence rule (exactly-one reject counter invariant):
+    //   Suppression (`packets_dropped`) takes precedence over malformed-section
+    //   `parse_errors`.  A suppressed datagram (self-loopback or untrusted
+    //   QR=1 response from a non-5353 source) is dropped wholesale — we never
+    //   process it — so `packets_dropped` is the sole meaningful reject counter
+    //   and the malformation is moot.  Running the latch for a suppressed packet
+    //   would bump BOTH `parse_errors` AND `packets_dropped`, violating the
+    //   exactly-one-reject-per-packets_rx invariant.  Therefore the latch only
+    //   runs when `!suppress_side_effects`.
+    //
+    // Counters per case:
+    //   • suppressed (self-loopback or untrusted QR=1), malformed or not
+    //       → `packets_dropped(1)` only (latch skipped)
+    //   • not-suppressed, malformed section
+    //       → `parse_errors(1)` only (latch fires)
+    //   • not-suppressed, well-formed
+    //       → 0 reject counters (latch fires, finds nothing)
+    //   • header parse fail / invalid opcode / invalid rcode
+    //       → their own single counter (unchanged, precede this point)
+    //
+    // The latch also catches errors in sections skipped by the routing iterator:
+    //   • `answer_questions=false` → Questions arm skipped; latch still walks it
+    //   • non-5353 source port → Authority conflict-routing skipped; latch walks
+    //     authority regardless (port gate governs routing, not byte-validity)
+    //
+    // Protocol-behaviour contract: this validation ONLY adds accounting.
+    // It does NOT introduce new drops or change which records get processed
+    // by the routing iterator — lenient routing (process valid parts) is
+    // preserved.
+    //
+    // NOTE on non-5353-source authority suppression: a well-formed
+    // authority record from a non-5353 source is suppressed by the routing
+    // iterator's Authority gate, but the DATAGRAM is still processed (its
+    // question/answer/additional sections are still routed).  A section-level
+    // suppression where the datagram's OTHER sections continue to be
+    // processed is NOT a datagram drop, so no `packets_dropped` is bumped.
+    // `packets_dropped` counts only whole-datagram rejects (invalid opcode,
+    // invalid rcode, self-loopback, untrusted response).  A code comment
+    // in the Authority arm documents this decision.
+    #[cfg(feature = "stats")]
+    if !suppress_side_effects {
+      let mut section_parse_error = false;
+      // Questions: walk regardless of `answer_questions` config —
+      // a malformed question byte-stream is a datagram-level error.
+      if !section_parse_error {
+        for q in reader.questions() {
+          if q.is_err() {
+            section_parse_error = true;
+            break;
+          }
+        }
+      }
+      // Answers + Additional: chained, matching the eager walk below.
+      if !section_parse_error {
+        for r in reader.answers().chain(reader.additional()) {
+          if r.is_err() {
+            section_parse_error = true;
+            break;
+          }
+        }
+      }
+      // Authority: walk regardless of `src.port()` — the port gate only
+      // governs conflict routing, not whether the bytes are well-formed.
+      if !section_parse_error {
+        for r in reader.authority() {
+          if r.is_err() {
+            section_parse_error = true;
+            break;
+          }
+        }
+      }
+      if section_parse_error {
+        self.stats.parse_errors(1);
+      }
+    }
+
     crate::trace::trace!(
       target: "mdns_proto::endpoint",
       src = %src,
@@ -588,11 +685,17 @@ where
       for r in reader.answers().chain(reader.additional()) {
         let r = match r {
           Ok(r) => r,
-          // Stop on first malformed record; partial side effects are OK.
-          Err(_) => break,
+          // Malformed record — the single upfront section-validation latch
+          // (above, before routing) has already bumped `parse_errors(1)` for
+          // this datagram.  Do NOT bump it again here — that would double-count.
+          // Stop walking: a malformed record means subsequent cursors are
+          // unreliable (the MessageReader's skip_records / skip_questions
+          // helpers return None on failure, and the Records iterator latches
+          // remaining=0 after the first error).
+          Err(_) => {
+            break;
+          }
         };
-        #[cfg(feature = "stats")]
-        self.stats.answers_rx(1);
 
         // eager query state update.  Apply this answer to every
         // matching owned Query in a single mutable pass.  iter_mut is
@@ -609,6 +712,10 @@ where
         // collected_answers or trigger FIFO eviction of pre-terminal
         // results.
         if is_response {
+          // answers_rx counts only actual QR=1 response records, not
+          // QR=0 known-answer hints which should not inflate the counter.
+          #[cfg(feature = "stats")]
+          self.stats.answers_rx(1);
           for (_, q) in self.queries.iter_mut() {
             // skip on `is_done` AND `terminal_emitted`, not
             // just the latter.  `handle_query_timeout` flips
@@ -728,6 +835,21 @@ where
     // avoid adding a redundant query to the link. Self / untrusted packets are
     // already excluded by `suppress_side_effects`.
     //
+    // questions_rx is bumped for EVERY question in any QR=0 query from port 5353
+    // (multicast querier), regardless of whether the answer section is empty.
+    // Queries that carry a known-answer section (TC=0, answer_count>0) are still
+    // genuine queries whose questions deserve to be counted; only the
+    // duplicate-suppression side effect is gated on answer_count==0.
+    if !suppress_side_effects && !is_response && src.port() == crate::constants::MDNS_PORT {
+      #[cfg(feature = "stats")]
+      for q in reader.questions() {
+        match q {
+          Ok(_) => self.stats.questions_rx(1),
+          Err(_) => break,
+        }
+      }
+    }
+
     // only a query from UDP source port 5353 counts. A query from an
     // ephemeral port is a legacy/one-shot resolver (RFC 6762 §6.7) whose request
     // may be answered by UNICAST straight to it — answers we would never see —
@@ -744,8 +866,6 @@ where
           Ok(q) => q,
           Err(_) => break,
         };
-        #[cfg(feature = "stats")]
-        self.stats.questions_rx(1);
         // A QU (unicast-response) question is answered unicast to the asker, so
         // it does NOT elicit the multicast answers our query needs — only a
         // shared QM question is a genuine duplicate of ours. Class-gate to IN.
@@ -762,9 +882,14 @@ where
             && query.qclass() == q.qclass()
             && names_match(query.qname(), q.qname())
           {
-            query.note_duplicate_question(now);
             #[cfg(feature = "stats")]
-            self.stats.duplicate_questions_suppressed(1);
+            let suppressed = query.note_duplicate_question(now);
+            #[cfg(not(feature = "stats"))]
+            let _suppressed = query.note_duplicate_question(now);
+            #[cfg(feature = "stats")]
+            if suppressed {
+              self.stats.duplicate_questions_suppressed(1);
+            }
           }
         }
       }
@@ -886,11 +1011,10 @@ where
         new_name = new_name.as_str(),
         "handle_service_renamed: service renamed due to conflict"
       );
-      #[cfg(feature = "stats")]
-      {
-        self.stats.conflicts(1);
-        self.stats.renames(1);
-      }
+      // NOTE: conflicts/renames counters are NOT bumped here.
+      // They are bumped in Service::handle_timeout (service/mod.rs) at the
+      // single canonical site — the Service state machine is the authority.
+      // Bumping here too would double-count on the shared Arc.
       route.name = new_name;
     }
     Ok(())
@@ -1081,6 +1205,20 @@ where
     let key = self
       .query_key(handle)
       .ok_or(CancelQueryError::QueryNotFound(handle))?;
+    // Apply terminal accounting for a live cancel.  If the query has NOT yet
+    // reached a terminal state (done=false), this cancel IS the terminal
+    // transition, so we must bump `queries_done` AND decrement `queries_active`
+    // — exactly as `Query::terminate` would.  If the query is already done,
+    // `Query::terminate` already performed both adjustments; do nothing here to
+    // avoid double-counting.  This maintains the invariant:
+    //   queries_started == queries_done + queries_timeout + queries_active
+    #[cfg(feature = "stats")]
+    if let Some(q) = self.queries.get(key)
+      && !q.is_done()
+    {
+      self.stats.queries_done(1);
+      self.stats.decr_queries_active(1);
+    }
     self.queries.try_remove(key);
     Ok(())
   }
@@ -4346,6 +4484,169 @@ mod tests {
     );
   }
 
+  // ── Stats invariant: queries_started == queries_done + queries_active ──────
+
+  /// The invariant `queries_started == queries_done + queries_active` must
+  /// hold at all times.  (`queries_timeout` is a sub-counter of `queries_done`
+  /// — both are bumped by `terminate(Timeout)` — so it is NOT a third term.)
+  ///
+  /// This test verifies two paths:
+  ///   (i)  live cancel — `cancel_query` IS the terminal transition, so it
+  ///        must bump `queries_done` AND decrement `queries_active`.
+  ///   (ii) cancel-after-terminal — `Query::terminate` already performed both
+  ///        adjustments; `cancel_query` must NOT repeat them.
+  #[cfg(feature = "stats")]
+  #[test]
+  fn cancel_query_stats_invariant() {
+    use crate::{config::QuerySpec, wire::ResourceType};
+    use core::time::Duration;
+
+    // Helper: assert the fundamental counter invariant.
+    let check_invariant = |label: &str, snap: &hick_trace::stats::StatsSnapshot| {
+      assert_eq!(
+        snap.queries_started,
+        snap.queries_done + snap.queries_active,
+        "invariant queries_started == queries_done + queries_active \
+         violated at '{label}': {snap:?}"
+      );
+    };
+
+    // ── (i) live cancel ────────────────────────────────────────────────────
+    let mut e = build_endpoint();
+    let now = StdInstant::now();
+    let qname = Name::try_from_str("printer.local.").unwrap();
+    let spec = QuerySpec::new(qname.clone(), ResourceType::A);
+    let h = e.try_start_query(spec, now).unwrap();
+
+    let before = e.stats();
+    assert_eq!(before.queries_started, 1);
+    assert_eq!(before.queries_active, 1);
+    assert_eq!(before.queries_done, 0);
+    check_invariant("after-start", &before);
+
+    // Cancel while still live (done=false).
+    e.cancel_query(h).unwrap();
+    let after_live_cancel = e.stats();
+    assert_eq!(
+      after_live_cancel.queries_done, 1,
+      "live cancel must bump queries_done; got {after_live_cancel:?}"
+    );
+    assert_eq!(
+      after_live_cancel.queries_active, 0,
+      "live cancel must decrement queries_active; got {after_live_cancel:?}"
+    );
+    check_invariant("after-live-cancel", &after_live_cancel);
+
+    // ── (ii) cancel after terminal ─────────────────────────────────────────
+    let mut e2 = build_endpoint();
+    let mut now2 = StdInstant::now();
+    let spec2 = QuerySpec::new(qname, ResourceType::A).with_timeout(Duration::from_millis(50));
+    let h2 = e2.try_start_query(spec2, now2).unwrap();
+
+    // Drive past absolute timeout → query terminates inside handle_query_timeout.
+    now2 += Duration::from_millis(100);
+    e2.handle_query_timeout(h2, now2).unwrap();
+    let _ = e2.poll_query(h2); // drain terminal update
+
+    let snap_terminal = e2.stats();
+    check_invariant("after-terminal", &snap_terminal);
+
+    // cancel_query on an already-done query must be a no-op for stats.
+    e2.cancel_query(h2).unwrap();
+    let snap_after_cancel = e2.stats();
+    assert_eq!(
+      snap_after_cancel.queries_done, snap_terminal.queries_done,
+      "cancel-after-terminal must not bump queries_done again; {snap_after_cancel:?}"
+    );
+    assert_eq!(
+      snap_after_cancel.queries_active, snap_terminal.queries_active,
+      "cancel-after-terminal must not decrement queries_active again; {snap_after_cancel:?}"
+    );
+    check_invariant("after-cancel-of-terminal", &snap_after_cancel);
+  }
+
+  // ── duplicate_questions_suppressed increments only on real suppression ──
+
+  /// `duplicate_questions_suppressed` must ONLY be incremented when
+  /// `note_duplicate_question` actually consumed a transmit slot.
+  ///
+  /// Two sub-cases:
+  ///   (a) When the query is `awaiting_send_confirm` (initial datagram sent but
+  ///       not yet confirmed), `note_duplicate_question` returns false and the
+  ///       counter must NOT advance.
+  ///   (b) After confirmation + timeout arms the next retry,
+  ///       `note_duplicate_question` returns true and the counter advances.
+  #[cfg(feature = "stats")]
+  #[test]
+  fn duplicate_questions_suppressed_only_on_real_suppression() {
+    use crate::{
+      config::QuerySpec,
+      wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
+    };
+    use core::{
+      net::{IpAddr, Ipv4Addr, SocketAddr},
+      time::Duration,
+    };
+
+    let mut e = build_endpoint();
+    let mut now = StdInstant::now();
+    let qname = Name::try_from_str("printer.local.").unwrap();
+    let spec = QuerySpec::new(qname.clone(), ResourceType::A);
+    let h = e.try_start_query(spec, now).unwrap();
+
+    // Build a peer QM question packet matching our query (QR=0, source port 5353).
+    let mut pkt_buf = [0u8; 512];
+    let hdr = Header::new();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(&mut pkt_buf, hdr).unwrap();
+    b.push_question(&qname, ResourceType::A, ResourceClass::In, false)
+      .unwrap();
+    let n = b.finish().unwrap();
+    let pkt = pkt_buf[..n].to_vec();
+
+    let multicast_ip: IpAddr = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+    let peer_src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 2), 5353u16));
+
+    // (a) Drain the initial transmit without confirming → awaiting_send_confirm=true.
+    let mut tx_buf = std::vec![0u8; 512];
+    let tx = e.poll_query_transmit(h, now, &mut tx_buf).unwrap();
+    assert!(
+      tx.is_some(),
+      "newly-started query must have an initial transmit pending"
+    );
+    // Do NOT call note_query_transmit_result — leave the query awaiting confirm.
+    // Now feed the peer question: note_duplicate_question → returns false → no bump.
+    {
+      let mut events = e
+        .handle(now, peer_src, multicast_ip, 0, &pkt, false)
+        .unwrap();
+      while events.next().is_some() {}
+    }
+    let snap_awaiting = e.stats();
+    assert_eq!(
+      snap_awaiting.duplicate_questions_suppressed, 0,
+      "(a) no suppression while awaiting send confirm; got {snap_awaiting:?}"
+    );
+
+    // (b) Confirm the send, advance time to arm next retry, then feed the peer
+    // question again → note_duplicate_question returns true → counter advances.
+    e.note_query_transmit_result(h, now, true); // confirm
+    now += Duration::from_secs(10); // past the first retry deadline (~1s)
+    e.handle_query_timeout(h, now).unwrap(); // arms transmit_pending = true
+
+    {
+      let mut events = e
+        .handle(now, peer_src, multicast_ip, 0, &pkt, false)
+        .unwrap();
+      while events.next().is_some() {}
+    }
+    let snap_suppressed = e.stats();
+    assert_eq!(
+      snap_suppressed.duplicate_questions_suppressed, 1,
+      "(b) one suppression expected after arming next retry; got {snap_suppressed:?}"
+    );
+  }
+
   // ── IPv6 link-local self-check is interface-scoped ──────────
 
   /// IPv6 link-local addresses (`fe80::/10`) are scoped per interface.
@@ -4807,6 +5108,8 @@ where
               // skip the rest of the questions section after a
               // parse error so the iterator terminates instead of
               // looping on the same error indefinitely.
+              // parse_errors was already bumped by the upfront section-
+              // validation latch in Endpoint::handle — do NOT bump again.
               self.section = Section::Answers;
               return Some(Err(HandleError::Parse(e)));
             }
@@ -4887,6 +5190,9 @@ where
               // skip the rest of the answers section after a
               // parse error so the iterator terminates instead of
               // looping on the same error indefinitely.
+              // parse_errors was already bumped in the eager walk in
+              // Endpoint::handle (which covers answers AND additionals);
+              // do NOT bump it here to avoid double-counting.
               self.section = Section::Authority;
               return Some(Err(HandleError::Parse(e)));
             }
@@ -5038,6 +5344,15 @@ where
           // ports are already fully suppressed upstream; this closes the QR=0
           // query path, where the Question section has ALREADY been routed
           // above so legacy unicast repliers are unaffected.)
+          //
+          // accounting rule: suppressing conflict routing for a non-5353
+          // source is a SECTION-LEVEL suppression — the datagram's other
+          // sections (questions, answers, additional) are still processed.
+          // This is NOT a whole-datagram reject, so `packets_dropped` is NOT
+          // bumped here.  Parse errors in the authority section ARE still
+          // counted by the upfront section-validation latch (which walks
+          // authority regardless of source port), so malformed bytes are
+          // always accounted even when conflict routing is suppressed.
           if self.src.port() != crate::constants::MDNS_PORT {
             self.section = Section::Additional;
             continue;
@@ -5056,6 +5371,8 @@ where
               // skip the rest of the authority section after a
               // parse error so the iterator terminates instead of
               // looping on the same error indefinitely.
+              // parse_errors was already bumped by the upfront section-
+              // validation latch in Endpoint::handle — do NOT bump again.
               self.section = Section::Done;
               return Some(Err(HandleError::Parse(e)));
             }
@@ -5113,6 +5430,9 @@ where
           let r = match add.next() {
             Some(Ok(r)) => r,
             Some(Err(e)) => {
+              // parse_errors was already bumped in the eager walk in
+              // Endpoint::handle (which covers answers AND additionals);
+              // do NOT bump it here to avoid double-counting.
               self.section = Section::Done;
               return Some(Err(HandleError::Parse(e)));
             }

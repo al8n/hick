@@ -75,12 +75,12 @@ loop {
 |---------|-------------|
 | `tracing` | Forward structured `tracing` events from `mdns-proto` (requires a `std` subscriber; a no-op on bare-metal without one). |
 | `stats` | Enable `no_std`-safe atomic counters; read a snapshot via `engine.stats()`. |
-| `metrics` | Bridge counters to the [`metrics`] facade. Implies `stats`. |
 | `defmt` | Emit `defmt` log events — the idiomatic choice for bare-metal targets. |
 
 ## Observability
 
-For bare-metal targets the recommended logging path is `defmt`:
+For bare-metal targets the recommended logging path is `defmt` combined with
+`stats`:
 
 ```toml
 hick-smoltcp = { version = "0.1", features = ["defmt", "stats"] }
@@ -99,6 +99,10 @@ let snap = engine.stats();
 
 The `tracing` feature is available but is a no-op in bare-metal builds that
 do not set up a `tracing` subscriber.
+
+The `metrics` feature (bridging counters to the [`metrics`] facade) requires
+`std` and is not available on bare-metal targets. Use `stats` + `defmt`
+instead for observability on embedded.
 
 ## Design
 

@@ -47,12 +47,19 @@ tracing = [
 ]
 # Forward metrics / stats feature flags across all drivers (same weak-dep
 # discipline as `tracing`: bare-metal builds are unaffected).
+# `metrics` implies `std` (the `metrics` facade crate requires std) AND
+# `stats` (so a metrics-only build still constructs the Stats objects that emit
+# the counters — without `stats` the metrics backend is linked but nothing
+# ever calls it). Bare-metal observability: use `stats` (+ `defmt`) instead.
 metrics = [
+  "std",
+  "stats",
   "mdns-proto/metrics",
   "hick-reactor?/metrics",
   "hick-compio?/metrics",
-  "hick-smoltcp?/metrics",
-  "hick-embassy?/metrics",
+  # hick-smoltcp and hick-embassy are `no_std` crates; their `metrics` feature
+  # was removed because the `metrics` facade requires `std`. Their atomic-only
+  # stats are still available via the `stats` feature.
 ]
 stats = [
   "mdns-proto/stats",

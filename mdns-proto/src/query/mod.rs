@@ -116,7 +116,7 @@ impl CollectedAnswer {
 pub struct Query<I, AN, EV> {
   handle: QueryHandle,
   #[cfg(feature = "stats")]
-  stats: std::sync::Arc<hick_trace::stats::Stats>,
+  stats: Option<std::sync::Arc<hick_trace::stats::Stats>>,
   qname: Name,
   qtype: ResourceType,
   qclass: ResourceClass,
@@ -189,7 +189,7 @@ where
     Self {
       handle,
       #[cfg(feature = "stats")]
-      stats: std::sync::Arc::new(hick_trace::stats::Stats::default()),
+      stats: None,
       qname,
       qtype,
       qclass,
@@ -215,13 +215,22 @@ where
     }
   }
 
-  /// Replace the shared [`Stats`] handle with one from the owning [`Endpoint`].
-  ///
-  /// Called immediately after construction by `Endpoint::try_start_query`
-  /// so that all per-query counters accumulate into the endpoint-level stats.
+  /// Attach the shared [`hick_trace::stats::Stats`] handle from the owning
+  /// [`crate::endpoint::Endpoint`]. No allocation — the Arc is cloned from the
+  /// endpoint's existing single Arc. Called immediately after construction by
+  /// `Endpoint::try_start_query` so that all per-query counters accumulate into
+  /// the endpoint-level stats. Before this is called, stats bumps are no-ops
+  /// (the field is `None`).
   #[cfg(feature = "stats")]
   pub(crate) fn set_stats(&mut self, stats: std::sync::Arc<hick_trace::stats::Stats>) {
-    self.stats = stats;
+    self.stats = Some(stats);
+  }
+
+  /// Borrow the stats handle if one has been attached.
+  #[cfg(feature = "stats")]
+  #[inline]
+  fn stat(&self) -> Option<&hick_trace::stats::Stats> {
+    self.stats.as_deref()
   }
 
   /// Override the maximum number of collected answers (default 256).
@@ -400,7 +409,9 @@ where
             "query: answer collected"
           );
           #[cfg(feature = "stats")]
-          self.stats.answers_collected(1);
+          if let Some(s) = self.stat() {
+            s.answers_collected(1);
+          }
         }
       }
       QueryEvent::Truncated => {
@@ -424,6 +435,35 @@ where
     }
   }
 
+  /// Route EVERY terminal transition through here. Idempotent: a no-op if
+  /// the query is already `done`. Sets `done = true`, queues the terminal
+  /// `QueryUpdate`, and under `#[cfg(feature="stats")]` bumps the correct
+  /// counter (`queries_timeout` or `queries_done`) and decrements
+  /// `queries_active` exactly once.
+  ///
+  /// Callers must pass the appropriate `update`:
+  /// * [`QueryUpdate::Timeout`] for timeout/retry-exhaustion/duplicate-question paths.
+  /// * [`QueryUpdate::Done`] for voluntary "done" paths (if/when added).
+  fn terminate(&mut self, update: QueryUpdate) {
+    if self.done {
+      return;
+    }
+    self.done = true;
+    self.transmit_pending = false;
+    let _ = self.pending_updates.insert(update);
+    self.next_deadline = None;
+    self.timeout_deadline = None;
+    #[cfg(feature = "stats")]
+    if let Some(s) = self.stat() {
+      match update {
+        QueryUpdate::Timeout => s.queries_timeout(1),
+        QueryUpdate::Done => {}
+      }
+      s.queries_done(1);
+      s.decr_queries_active(1);
+    }
+  }
+
   /// Drive timer-based transitions.
   pub fn handle_timeout(&mut self, now: I) -> Result<(), HandleTimeoutError> {
     #[cfg(feature = "tracing")]
@@ -442,16 +482,7 @@ where
         handle = self.handle.raw(),
         "query: absolute timeout deadline reached"
       );
-      self.done = true;
-      self.transmit_pending = false;
-      let _ = self.pending_updates.insert(QueryUpdate::Timeout);
-      self.next_deadline = None;
-      self.timeout_deadline = None;
-      #[cfg(feature = "stats")]
-      {
-        self.stats.queries_timeout(1);
-        self.stats.queries_done(1);
-      }
+      self.terminate(QueryUpdate::Timeout);
       return Ok(());
     }
 
@@ -472,16 +503,7 @@ where
         retry_count = self.retry_count,
         "query: retry budget exhausted — timeout"
       );
-      self.done = true;
-      self.transmit_pending = false;
-      let _ = self.pending_updates.insert(QueryUpdate::Timeout);
-      self.next_deadline = None;
-      self.timeout_deadline = None;
-      #[cfg(feature = "stats")]
-      {
-        self.stats.queries_timeout(1);
-        self.stats.queries_done(1);
-      }
+      self.terminate(QueryUpdate::Timeout);
     } else {
       // Mark a transmit due now and clear the deadline; `poll_transmit` emits
       // the datagram and schedules the following retry. Clearing the deadline
@@ -507,19 +529,7 @@ where
   /// answers) and queues a terminal [`QueryUpdate::Timeout`]. The collected answers
   /// stay readable until the caller cancels. No-op if already done.
   pub(crate) fn retire(&mut self) {
-    if self.done {
-      return;
-    }
-    self.done = true;
-    self.transmit_pending = false;
-    let _ = self.pending_updates.insert(QueryUpdate::Timeout);
-    self.next_deadline = None;
-    self.timeout_deadline = None;
-    #[cfg(feature = "stats")]
-    {
-      self.stats.queries_timeout(1);
-      self.stats.queries_done(1);
-    }
+    self.terminate(QueryUpdate::Timeout);
   }
 
   /// Produce the next outgoing datagram, if any. Writes into `buf`.
@@ -620,26 +630,33 @@ where
   /// retires via `MAX_RETRIES` here too), so a continuously-duplicated query
   /// still progresses to its terminal timeout instead of being
   /// deferred forever. An in-flight (awaiting-confirm) send is left alone.
-  pub fn note_duplicate_question(&mut self, now: I) {
+  ///
+  /// Returns `true` if a transmit slot was actually consumed (i.e. real
+  /// suppression happened) and `false` if the call was a no-op (query is
+  /// done, awaiting send confirmation, or no send was imminent). Callers use
+  /// the return value to decide whether to bump the
+  /// `duplicate_questions_suppressed` counter.
+  pub fn note_duplicate_question(&mut self, now: I) -> bool {
     if self.done || self.awaiting_send_confirm {
-      return;
+      return false;
     }
     let imminent = self.transmit_pending || self.next_deadline.is_some_and(|d| now >= d);
     if !imminent {
-      return;
+      return false;
     }
     self.transmit_pending = false;
     self.retry_count = self.retry_count.saturating_add(1);
     if self.retry_count > MAX_RETRIES {
       // Budget spent (counting suppressed slots as our sends) — retire exactly
-      // as `handle_timeout` would after the final retransmit.
-      self.done = true;
-      self.next_deadline = None;
-      self.timeout_deadline = None;
-      let _ = self.pending_updates.insert(QueryUpdate::Timeout);
-      return;
+      // as `handle_timeout` would after the final retransmit. Route through
+      // `terminate` so stats (queries_timeout, queries_done, decr_queries_active)
+      // are bumped exactly once on this path too.
+      self.terminate(QueryUpdate::Timeout);
+      // The slot was consumed even though the query is now terminal.
+      return true;
     }
     self.next_deadline = retry::next_deadline(now, self.retry_count);
+    true
   }
 
   /// Drain a pending app-level update.
@@ -1725,5 +1742,85 @@ mod tests {
       }
     }
     assert!(saw_timeout, "budget exhaustion queues a Timeout terminal");
+  }
+
+  /// regression test: a query terminated via the duplicate-question path
+  /// (MAX_RETRIES suppressed slots exhausted) must
+  ///   1. emit exactly one QueryUpdate::Timeout, and
+  ///   2. leave queries_active == 0 and bump queries_timeout once
+  ///      (verified via the Stats snapshot when the `stats` feature is on).
+  #[test]
+  fn duplicate_question_exhaustion_produces_timeout_and_correct_stats() {
+    #[cfg(feature = "stats")]
+    use std::sync::Arc;
+
+    let handle = QueryHandle::from_raw(0);
+    let qname = Name::try_from_str("host.local.").unwrap();
+    let now = StdInstant::now();
+    let mut q: TestQuery = TestQuery::try_new(
+      handle,
+      qname,
+      ResourceType::A,
+      ResourceClass::In,
+      1,
+      false,
+      None,
+    );
+
+    // Wire up a Stats instance so we can inspect the gauges/counters.
+    #[cfg(feature = "stats")]
+    let stats: Arc<hick_trace::stats::Stats> = Arc::default();
+    #[cfg(feature = "stats")]
+    {
+      // Simulate what Endpoint::try_start_query does: bump active, attach stats.
+      stats.queries_started(1);
+      stats.incr_queries_active(1);
+      q.set_stats(stats.clone());
+    }
+
+    // Drive `note_duplicate_question` until the budget is exhausted.
+    // Each call that finds an imminent transmit consumes one retry slot.
+    let mut advanced_now = now;
+    for _ in 0..(MAX_RETRIES as usize + 2) {
+      if q.is_done() {
+        break;
+      }
+      // Arm the next deadline so the "imminent" check fires.
+      // After the first call transmit_pending is false; subsequent calls
+      // need the deadline to be due.
+      advanced_now += std::time::Duration::from_secs(120);
+      q.note_duplicate_question(advanced_now);
+    }
+
+    assert!(
+      q.is_done(),
+      "duplicate-question exhaustion must set done=true"
+    );
+
+    // Exactly one Timeout terminal must be queued.
+    let mut timeout_count = 0u32;
+    while let Some(u) = q.poll() {
+      if matches!(u, QueryUpdate::Timeout) {
+        timeout_count += 1;
+      }
+    }
+    assert_eq!(
+      timeout_count, 1,
+      "duplicate-question exhaustion must queue exactly one Timeout"
+    );
+
+    // Verify stats are consistent (queries_active back to 0, queries_timeout = 1).
+    #[cfg(feature = "stats")]
+    {
+      let snap = stats.snapshot();
+      assert_eq!(
+        snap.queries_active, 0,
+        "queries_active must be 0 after duplicate-question termination"
+      );
+      assert_eq!(
+        snap.queries_timeout, 1,
+        "queries_timeout must be 1 after duplicate-question termination"
+      );
+    }
   }
 }

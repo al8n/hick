@@ -881,7 +881,7 @@ impl<N: Net> DriverState<N> {
     } = self;
     for g in goodbyes.iter_mut() {
       if g.remaining > 0 && g.next_at <= now {
-        let _ = send_via::<N>(
+        let _credits = send_via::<N>(
           recent_sends,
           v4,
           v6,
@@ -891,6 +891,10 @@ impl<N: Net> DriverState<N> {
           &stats,
         )
         .await;
+        #[cfg(feature = "stats")]
+        if _credits > 0 {
+          stats.goodbyes_tx(1);
+        }
         g.remaining = g.remaining.saturating_sub(1);
         g.next_at = now + GOODBYE_INTERVAL;
       }
@@ -1758,11 +1762,8 @@ async fn recv_loop<N: Net>(
         Ok(meta) => {
           let n = meta.len();
           hick_trace::trace!(src = %meta.peer(), len = n, via_v4, "recv datagram");
-          #[cfg(feature = "stats")]
-          {
-            stats.packets_rx(1);
-            stats.bytes_rx(n as u64);
-          }
+          // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
+          // on the shared Arc — do NOT bump them here too (double-count).
           let data = buf.get(..n).unwrap_or(&buf).to_vec();
           let pkt = Packet {
             src: meta.peer(),
@@ -1847,11 +1848,8 @@ async fn recv_loop<N: Net>(
         Ok(meta) => {
           let n = meta.len();
           hick_trace::trace!(src = %meta.peer(), len = n, via_v4, "recv datagram");
-          #[cfg(feature = "stats")]
-          {
-            stats.packets_rx(1);
-            stats.bytes_rx(n as u64);
-          }
+          // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
+          // on the shared Arc — do NOT bump them here too (double-count).
           let data = buf.get(..n).unwrap_or(&buf).to_vec();
           let pkt = Packet {
             src: meta.peer(),
@@ -1899,11 +1897,8 @@ async fn recv_loop<N: Net>(
       match recv_result {
         Ok((n, src)) => {
           hick_trace::trace!(src = %src, len = n, via_v4, "recv datagram");
-          #[cfg(feature = "stats")]
-          {
-            stats.packets_rx(1);
-            stats.bytes_rx(n as u64);
-          }
+          // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
+          // on the shared Arc — do NOT bump them here too (double-count).
           let data = buf.get(..n).unwrap_or(&buf).to_vec();
           let local_ip = if via_v4 {
             IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)

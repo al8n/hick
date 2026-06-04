@@ -1240,7 +1240,9 @@ pub(crate) async fn run(
       // stamping at the syscall) so `when <= kernel_send_time <=
       // echo_rx_time` and the kernel-looped goodbye stays inside the 1 ms
       // Ordered self-send match window.
-      let mut sent_any = false;
+      // Track whether at least one family succeeded (for goodbyes_tx counter).
+      #[cfg(feature = "stats")]
+      let mut goodbye_sent_any = false;
       if let Some(s4) = sock_v4.as_ref() {
         let when = SystemTime::now();
         let res = s4.send_to(&data, MDNS_V4_DST, None).await;
@@ -1252,8 +1254,8 @@ pub(crate) async fn run(
           {
             state.stats.packets_tx(1);
             state.stats.bytes_tx(data.len() as u64);
+            goodbye_sent_any = true;
           }
-          sent_any = true;
         } else {
           hick_trace::debug!(dst = %MDNS_V4_DST, "goodbye send_to v4 failed");
           #[cfg(feature = "stats")]
@@ -1271,15 +1273,19 @@ pub(crate) async fn run(
           {
             state.stats.packets_tx(1);
             state.stats.bytes_tx(data.len() as u64);
+            goodbye_sent_any = true;
           }
-          sent_any = true;
         } else {
           hick_trace::debug!(dst = %MDNS_V6_DST, "goodbye send_to v6 failed");
           #[cfg(feature = "stats")]
           inner.state.borrow().stats.send_errors(1);
         }
       }
-      let _ = sent_any; // Failure-to-send logged above.
+      // Count the goodbye as delivered when at least one family succeeded.
+      #[cfg(feature = "stats")]
+      if goodbye_sent_any {
+        inner.state.borrow().stats.goodbyes_tx(1);
+      }
       // Decrement remaining and re-arm next_at regardless of send outcome —
       // an entry that can't reach the wire still drains its budget so it
       // doesn't pin the goodbye queue forever.
@@ -1338,11 +1344,43 @@ pub(crate) async fn run(
         inner.state.borrow_mut().take_shutdown_goodbyes(now)
       };
       for data in datagrams {
+        #[cfg(feature = "stats")]
+        let mut goodbye_sent_any = false;
         if let Some(s4) = sock_v4.as_ref() {
-          let _ = s4.send_to(&data, MDNS_V4_DST, None).await;
+          if s4.send_to(&data, MDNS_V4_DST, None).await.is_ok() {
+            hick_trace::trace!(dst = %MDNS_V4_DST, len = data.len(), "shutdown goodbye send_to v4");
+            #[cfg(feature = "stats")]
+            {
+              inner.state.borrow().stats.packets_tx(1);
+              inner.state.borrow().stats.bytes_tx(data.len() as u64);
+              goodbye_sent_any = true;
+            }
+          } else {
+            hick_trace::debug!(dst = %MDNS_V4_DST, "shutdown goodbye send_to v4 failed");
+            #[cfg(feature = "stats")]
+            inner.state.borrow().stats.send_errors(1);
+          }
         }
         if let Some(s6) = sock_v6.as_ref() {
-          let _ = s6.send_to(&data, MDNS_V6_DST, None).await;
+          if s6.send_to(&data, MDNS_V6_DST, None).await.is_ok() {
+            hick_trace::trace!(dst = %MDNS_V6_DST, len = data.len(), "shutdown goodbye send_to v6");
+            #[cfg(feature = "stats")]
+            {
+              inner.state.borrow().stats.packets_tx(1);
+              inner.state.borrow().stats.bytes_tx(data.len() as u64);
+              goodbye_sent_any = true;
+            }
+          } else {
+            hick_trace::debug!(dst = %MDNS_V6_DST, "shutdown goodbye send_to v6 failed");
+            #[cfg(feature = "stats")]
+            inner.state.borrow().stats.send_errors(1);
+          }
+        }
+        // Count the logical goodbye once per datagrams entry (one entry = one
+        // RFC 6762 §10.1 retransmit attempt) when at least one family succeeded.
+        #[cfg(feature = "stats")]
+        if goodbye_sent_any {
+          inner.state.borrow().stats.goodbyes_tx(1);
         }
       }
       break;
@@ -1450,12 +1488,8 @@ fn handle_recv(inner: &Rc<EndpointInner>, r: std::io::Result<(Vec<u8>, RecvMeta)
   match r {
     Ok((data, meta)) => {
       hick_trace::trace!(src = %meta.peer(), len = data.len(), "recv datagram");
-      #[cfg(feature = "stats")]
-      {
-        let s = inner.state.borrow();
-        s.stats.packets_rx(1);
-        s.stats.bytes_rx(data.len() as u64);
-      }
+      // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
+      // on the shared Arc — do NOT bump them here too (double-count).
       let mut s = inner.state.borrow_mut();
       s.handle_datagram(&meta, &data);
     }

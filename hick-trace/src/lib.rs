@@ -22,15 +22,106 @@
 #[cfg(feature = "tracing")]
 pub use tracing::{debug, debug_span, error, info, info_span, trace, trace_span, warn};
 
-/// Token-discarding no-op for all five diagnostic macros when `tracing` is
-/// disabled. Every argument form accepted by the real macros (structured
-/// key-value pairs, positional format strings, bare expressions) is silently
-/// consumed by the `$($tt:tt)*` pattern.
+/// Token-consuming no-op for all five diagnostic macros when `tracing` is
+/// disabled. Every argument expression is type-checked but **never executed**:
+/// each value is referenced inside an `if false { }` block, which the compiler
+/// eliminates entirely while still seeing the expression as "used" (no
+/// `unused_variables` warning, no side effects, no alloc, no panics).
+///
+/// # Supported forms
+///
+/// | Form | Example |
+/// |------|---------|
+/// | Positional format string | `debug!("n={}", n)` |
+/// | `key = value` | `debug!(x = val, "msg")` |
+/// | `key = %value` (Display) | `debug!(x = %val, "msg")` |
+/// | `key = ?value` (Debug) | `debug!(x = ?val, "msg")` |
+/// | Bare `%value` / `?value` | `debug!(%val)` |
+/// | Bare `ident` shorthand | `debug!(x, "msg")` |
+/// | `target: "t", ...` prefix | `debug!(target: "t", x = 1, "m")` |
+///
+/// # Unsupported forms
+///
+/// The following `tracing` forms are deliberately **not** supported:
+/// `name: "..."`, `parent: span`, dotted field names (`a.b`), and
+/// string-literal field keys (`"k" = v`). The codebase stays within the
+/// subset above; any violation is caught as a compile error in the default
+/// (no-tracing) build.
+///
+/// # Implementation note
+///
+/// Each value expression `$val` expands to `if false { let _ = &$val; }`.
+/// The compiler eliminates the dead branch during MIR building, so there is
+/// zero runtime cost. A plain `let _ = &$val;` (the previous approach)
+/// evaluated the expression to produce the reference even though it was
+/// discarded, causing side effects (allocs, panics, counter bumps) to run
+/// in disabled builds.
 #[doc(hidden)]
 #[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! __hick_trace_noop {
-  ($($tt:tt)*) => {{}};
+  // ── Entry: strip an optional `target: <expr>,` prefix ───────────────────
+  (target: $tgt:expr, $($rest:tt)*) => {
+    { if false { let _ = &$tgt; } $crate::__hick_trace_noop!($($rest)*) }
+  };
+
+  // ── Structured field: `key = %value` (Display) ──────────────────────────
+  ($key:ident = %$val:expr, $($rest:tt)*) => {
+    { if false { let _ = &$val; } $crate::__hick_trace_noop!($($rest)*) }
+  };
+  ($key:ident = %$val:expr) => {
+    { if false { let _ = &$val; } }
+  };
+
+  // ── Structured field: `key = ?value` (Debug) ────────────────────────────
+  ($key:ident = ?$val:expr, $($rest:tt)*) => {
+    { if false { let _ = &$val; } $crate::__hick_trace_noop!($($rest)*) }
+  };
+  ($key:ident = ?$val:expr) => {
+    { if false { let _ = &$val; } }
+  };
+
+  // ── Structured field: `key = value` (plain) ─────────────────────────────
+  ($key:ident = $val:expr, $($rest:tt)*) => {
+    { if false { let _ = &$val; } $crate::__hick_trace_noop!($($rest)*) }
+  };
+  ($key:ident = $val:expr) => {
+    { if false { let _ = &$val; } }
+  };
+
+  // ── Bare field shorthand: `key` (equivalent to `key = key`) ─────────────
+  // Matches BEFORE the format-string literal arm so that a bare ident that
+  // is NOT a string literal is consumed correctly.
+  ($key:ident, $($rest:tt)*) => {
+    { if false { let _ = &$key; } $crate::__hick_trace_noop!($($rest)*) }
+  };
+  ($key:ident) => {
+    { if false { let _ = &$key; } }
+  };
+
+  // ── Bare `%value` ────────────────────────────────────────────────────────
+  (%$val:expr, $($rest:tt)*) => {
+    { if false { let _ = &$val; } $crate::__hick_trace_noop!($($rest)*) }
+  };
+  (%$val:expr) => {
+    { if false { let _ = &$val; } }
+  };
+
+  // ── Bare `?value` ────────────────────────────────────────────────────────
+  (?$val:expr, $($rest:tt)*) => {
+    { if false { let _ = &$val; } $crate::__hick_trace_noop!($($rest)*) }
+  };
+  (?$val:expr) => {
+    { if false { let _ = &$val; } }
+  };
+
+  // ── Format string + zero or more positional args (terminal) ─────────────
+  ($fmt:literal $(, $arg:expr)* $(,)?) => {
+    { if false { let _ = ::core::format_args!($fmt $(, $arg)*); } }
+  };
+
+  // ── No-arg / empty call ──────────────────────────────────────────────────
+  () => {{}};
 }
 
 #[cfg(not(feature = "tracing"))]
@@ -69,15 +160,33 @@ impl NoopSpan {
   }
 }
 
-/// Token-discarding no-op for span macros when `tracing` is disabled.
+/// Token-consuming no-op for span macros when `tracing` is disabled.
 /// Returns a [`NoopSpan`] so callers may use `.entered()` / `.enter()`
-/// without compile errors.
+/// without compile errors. Uses the same field-consuming grammar as
+/// [`__hick_trace_noop`] so variables passed as span fields are not flagged
+/// as unused.
 #[doc(hidden)]
 #[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! __hick_trace_noop_span {
-  ($($tt:tt)*) => {
+  // Strip target prefix.
+  (target: $tgt:expr, $($rest:tt)*) => {
+    { if false { let _ = &$tgt; } $crate::__hick_trace_noop_span!($($rest)*) }
+  };
+
+  // Span name only (the required first argument after an optional target).
+  // Any remaining tokens are field key=value pairs — consume them via the
+  // diagnostic no-op and return the NoopSpan.
+  ($name:literal, $($fields:tt)*) => {
+    { $crate::__hick_trace_noop!($($fields)*); $crate::NoopSpan }
+  };
+  ($name:literal) => {
     $crate::NoopSpan
+  };
+
+  // Fallback: consume everything, return NoopSpan.
+  ($($tt:tt)*) => {
+    { $crate::__hick_trace_noop!($($tt)*); $crate::NoopSpan }
   };
 }
 
@@ -352,6 +461,119 @@ mod tests {
     // Verify both invocation styles (structured key=value and positional).
     crate::debug!(x = 1u32, "msg");
     crate::warn!(field = 2u32, "msg");
+  }
+
+  /// Correctness gate: the no-op macros must CONSUME their arguments
+  /// so that non-`_`-prefixed variables used only in macro calls do not
+  /// trigger `unused_variables` warnings under `-D warnings`.
+  ///
+  /// This test is compiled under the crate's lint config (which includes
+  /// `-D warnings` via `[lints] workspace = true`). If any macro expansion
+  /// leaves a variable unconsumed this test produces a compile error.
+  #[test]
+  fn noop_macros_consume_non_underscore_vars() {
+    // Non-underscore locals — the test fails to compile if the no-op macros
+    // do not consume them.
+    let count = 42_u64;
+    let err = "oops";
+    let detail = core::f64::consts::E; // use a named constant to avoid approx_constant lint
+
+    crate::trace!(count = count, "count is {}", count);
+    crate::debug!(err = %err, "error detail: {}", err);
+    crate::info!(detail = ?detail, "detail = {}", detail);
+    crate::warn!(err = err, count = count, "warn: {} {}", err, count);
+    crate::error!("error: {} {} {}", err, count, detail);
+
+    // Display / Debug bare forms.
+    crate::debug!(%err);
+    crate::warn!(?detail);
+
+    // target: prefix.
+    crate::info!(target: "my_target", count = count, "msg");
+
+    // Span macros: fields must also be consumed.
+    let span_field = 99_u32;
+    let _guard = crate::trace_span!("my_span", field = span_field).entered();
+    let _guard2 = crate::debug_span!("x", a = span_field).entered();
+    let _guard3 = crate::info_span!("y").entered();
+  }
+
+  /// Correctness gate: a non-literal `target:` expression must not
+  /// produce an `unused_variables` warning and must not be evaluated.
+  ///
+  /// Uses a non-underscore-prefixed local whose only use is as the `target:`
+  /// expression. Under `-D warnings` (enforced by `workspace = true` lints)
+  /// this would be a compile error if the no-op macro did not consume `$tgt`.
+  #[cfg(not(feature = "tracing"))]
+  #[test]
+  fn noop_macros_consume_non_literal_target() {
+    use core::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    // A non-underscore local used ONLY as a target expression. This test
+    // fails to compile if `target:` is not consumed.
+    let tgt = "my_module";
+    crate::debug!(target: tgt, "message");
+    crate::warn!(target: tgt, x = 1u32, "msg {}", 42u32);
+
+    // Also verify the target expression is NOT evaluated (no side effects).
+    static TARGET_EVALED: AtomicBool = AtomicBool::new(false);
+    fn make_target() -> &'static str {
+      TARGET_EVALED.store(true, SeqCst);
+      "side_effect_target"
+    }
+    crate::info!(target: make_target(), "message");
+    assert!(
+      !TARGET_EVALED.load(SeqCst),
+      "target: expression must not be evaluated in no-op build"
+    );
+  }
+
+  /// Correctness gate: the no-op macros must NOT evaluate their
+  /// argument expressions — side effects must be completely suppressed.
+  ///
+  /// Uses an `AtomicBool` sentinel and a function that sets it, then asserts
+  /// the sentinel was never touched after calling all macro forms.
+  ///
+  /// Gated `cfg(not(feature = "tracing"))` because in tracing builds the
+  /// real macros DO evaluate their args (that's the whole point), so this
+  /// invariant only applies to the noop path.
+  #[cfg(not(feature = "tracing"))]
+  #[test]
+  fn noop_macros_do_not_evaluate_args() {
+    use core::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    static RAN: AtomicBool = AtomicBool::new(false);
+
+    fn side_effect() -> u32 {
+      RAN.store(true, SeqCst);
+      42
+    }
+
+    // key = value form.
+    crate::debug!(value = side_effect(), "msg");
+    assert!(!RAN.load(SeqCst), "key=value form evaluated side_effect()");
+
+    // positional format-string form.
+    crate::debug!("positional {}", side_effect());
+    assert!(!RAN.load(SeqCst), "positional form evaluated side_effect()");
+
+    // Display form.
+    crate::info!(v = %side_effect(), "msg");
+    assert!(!RAN.load(SeqCst), "display form evaluated side_effect()");
+
+    // Debug form.
+    crate::warn!(v = ?side_effect(), "msg");
+    assert!(!RAN.load(SeqCst), "debug form evaluated side_effect()");
+
+    // Bare %/? form.
+    crate::error!(%side_effect());
+    assert!(!RAN.load(SeqCst), "bare % form evaluated side_effect()");
+    crate::trace!(?side_effect());
+    assert!(!RAN.load(SeqCst), "bare ? form evaluated side_effect()");
+
+    // Span macro with side-effecting field.
+    let _g = crate::info_span!("s", field = side_effect()).entered();
+    assert!(!RAN.load(SeqCst), "span macro evaluated side_effect()");
   }
 
   /// Verify Stats construction, counter increment, gauge incr/decr, and snapshot.
