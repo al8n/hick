@@ -1274,7 +1274,7 @@ where
   /// Test-only: the opaque token of the ROUTE-attached withdrawal item for
   /// `handle`, so a test can confirm/round-trip exactly that item's send. `None`
   /// if no route-attached item exists for `handle`.
-  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   fn route_withdrawal_token(&self, handle: ServiceHandle) -> Option<WithdrawalToken> {
     self
       .withdrawals
@@ -1286,7 +1286,7 @@ where
   /// Test-only: confirm a send for the ROUTE-attached item of `handle` by looking
   /// up its token internally (a no-op if the item is gone). Lets handle-oriented
   /// tests spend a route withdrawal's debt without threading the token through.
-  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   fn note_route_withdrawal_result(
     &mut self,
     handle: ServiceHandle,
@@ -1302,7 +1302,7 @@ where
   /// Test-only: the PER-FAMILY resend budget (`[v4, v6]`) of the ROUTE-attached
   /// withdrawal item for `handle` (the current-name goodbye), or `None` if no
   /// such item exists.
-  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   fn route_withdrawal_owed(&self, handle: ServiceHandle) -> Option<[u8; 2]> {
     self
       .withdrawals
@@ -1314,7 +1314,7 @@ where
   /// Test-only: the PER-FAMILY resend budget (`[v4, v6]`) of the DETACHED
   /// withdrawal item whose records name `instance` (the renamed-away old-name
   /// goodbye), or `None` if no such item exists.
-  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   fn detached_withdrawal_owed_for(&self, instance: &Name) -> Option<[u8; 2]> {
     self
       .withdrawals
@@ -1332,7 +1332,7 @@ where
 
   /// Test-only: the next scheduled send time of the ROUTE-attached withdrawal
   /// item for `handle`.
-  #[cfg(all(test, any(feature = "alloc", feature = "std")))]
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   fn route_withdrawal_next_at(&self, handle: ServiceHandle) -> Option<I> {
     self
       .withdrawals
