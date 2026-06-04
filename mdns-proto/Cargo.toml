@@ -62,6 +62,9 @@ slab = "0.4"
 # Used only by the tracing smoke test (gated #[cfg(feature = "tracing")]).
 tracing = { version = "0.1", optional = false, default-features = false, features = ["std"] }
 tracing-core = { version = "0.1", default-features = false }
+# Installs an always-enabled subscriber before the unit-test run (see trace::cov)
+# so the instrumentation call sites evaluate their fields and earn coverage.
+ctor = "0.2"
 
 [package.metadata.docs.rs]
 all-features = true

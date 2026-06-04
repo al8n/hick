@@ -1473,6 +1473,118 @@ mod tests {
   }
 
   #[test]
+  fn a_goodbye_with_no_socket_on_any_family_writes_off_without_error() {
+    let mut engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(101));
+    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+    let mut io = MockUdp::default();
+    let mut scratch = [0u8; 1500];
+    // Announce so there are records to retract.
+    for micros in [
+      0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
+    ] {
+      engine.pump(at(micros), &mut io, &mut scratch);
+    }
+    // Every family now reports "no socket": the goodbye burst must write each
+    // family off as Unsupported — no error, no datagram, no infinite retry.
+    io.v4_fail = Some(SendError::Unsupported);
+    io.v6_fail = Some(SendError::Unsupported);
+    io.sent.clear();
+    engine.unregister_service(handle, at(5_000_000));
+    for micros in [5_000_000, 5_250_001, 5_500_001, 5_750_001, 6_000_001] {
+      engine.pump(at(micros), &mut io, &mut scratch);
+    }
+    assert!(
+      io.sent.is_empty(),
+      "nothing can leave when every family is Unsupported; sent = {:?}",
+      io.sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
+    );
+  }
+
+  #[cfg(feature = "stats")]
+  #[test]
+  fn stats_handle_exposes_the_shared_counter() {
+    let engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(102));
+    // The returned Arc aliases the engine's own counter (shared, not a copy).
+    let s = engine.stats_handle();
+    assert!(Arc::strong_count(&s) >= 2);
+  }
+
+  /// A browse (PTR) query for `qname`, as a legacy querier would send it.
+  fn build_ptr_query(qname: &Name) -> Vec<u8> {
+    use mdns_proto::wire::{Header, MessageBuilder, ResourceClass, ResourceType};
+    let mut buf = [0u8; 512];
+    let mut b: MessageBuilder<'_, 0> = MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(qname, ResourceType::Ptr, ResourceClass::In, false)
+      .unwrap();
+    let n = b.finish().unwrap();
+    buf[..n].to_vec()
+  }
+
+  /// Announce `sample_spec`, then feed a query from `querier`, pump, and return
+  /// the sent log so a caller can assert how the (legacy → unicast) reply fared.
+  fn unicast_reply_scenario(seed: u64, v4_fail: Option<SendError>) -> Vec<(SocketAddr, Vec<u8>)> {
+    let mut engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(seed));
+    engine.register_service(sample_spec(), at(0)).unwrap();
+    let mut io = MockUdp::default();
+    let mut scratch = [0u8; 1500];
+    for micros in [
+      0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
+    ] {
+      engine.pump(at(micros), &mut io, &mut scratch);
+    }
+    io.sent.clear();
+    io.v4_fail = v4_fail;
+    // A browse query from a LEGACY source port (!= 5353), delivered to the mDNS
+    // group so the §11 gate accepts it. §6.7: the reply must be UNICAST.
+    let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 6000));
+    io.inbound.push_back((
+      build_ptr_query(&Name::try_from_str("_ipp._tcp.local.").unwrap()),
+      RecvMeta {
+        src: querier,
+        local: Some(MDNS_SOCKET_V4.ip()),
+        hop_limit: None,
+        len: 0,
+      },
+    ));
+    for micros in [5_000_000, 5_250_000, 5_500_000] {
+      engine.pump(at(micros), &mut io, &mut scratch);
+    }
+    io.sent
+  }
+
+  #[test]
+  fn a_legacy_unicast_query_gets_a_unicast_reply() {
+    let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 6000));
+    let sent = unicast_reply_scenario(201, None);
+    assert!(
+      sent.iter().any(|(dst, _)| *dst == querier),
+      "expected a unicast reply to the legacy querier; sent = {:?}",
+      sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
+    );
+  }
+
+  #[test]
+  fn a_unicast_reply_too_large_is_handled_without_panicking() {
+    // A permanent TooLarge failure on the one-shot reply: the engine writes it
+    // off (real send error) and stays healthy. Nothing reaches the wire.
+    let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 6000));
+    let sent = unicast_reply_scenario(202, Some(SendError::TooLarge));
+    assert!(sent.iter().all(|(dst, _)| *dst != querier));
+  }
+
+  #[test]
+  fn a_unicast_reply_busy_is_best_effort_not_fatal() {
+    // Busy is transient/not-an-error: the one-shot reply is dropped (the querier
+    // re-asks) and the engine stays healthy.
+    let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 6000));
+    let sent = unicast_reply_scenario(203, Some(SendError::Busy));
+    assert!(sent.iter().all(|(dst, _)| *dst != querier));
+  }
+
+  #[test]
   fn unregistering_an_announced_service_emits_a_goodbye() {
     let mut engine: Engine<SmoltcpInstant, StdRng> =
       Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(2));

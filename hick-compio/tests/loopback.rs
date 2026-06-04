@@ -2,6 +2,8 @@
 #![cfg(any(unix, windows))]
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::time::Duration;
 
 fn super_loopback_index() -> Option<u32> {

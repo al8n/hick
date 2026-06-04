@@ -39,6 +39,8 @@ mod options;
 mod proto;
 mod query;
 mod service;
+#[cfg(all(test, feature = "tracing"))]
+mod trace_cov;
 
 pub use discovery::{Lookup, QueryParam, ServiceEntry};
 pub use endpoint::Endpoint;

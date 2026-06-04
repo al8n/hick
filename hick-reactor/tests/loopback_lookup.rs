@@ -18,6 +18,8 @@
 #![cfg(feature = "tokio")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::{
   net::{IpAddr, Ipv6Addr},
   time::Duration,

@@ -8,6 +8,8 @@
 #![cfg(feature = "tokio")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::time::Duration;
 
 use hick_reactor::{
