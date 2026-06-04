@@ -1811,7 +1811,7 @@ where
         // the stored and incoming bytes makes those comparisons encoding- and
         // case-independent (the cache never surfaces rdata for display). A
         // malformed / over-length name-bearing record is dropped, not cached.
-        let rdata: std::vec::Vec<u8> = match r.canonical_rdata_folded() {
+        let rdata = match r.canonical_rdata_folded() {
           Ok(v) => v,
           Err(_) => continue,
         };

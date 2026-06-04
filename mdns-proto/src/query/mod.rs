@@ -11,6 +11,8 @@ use crate::{
   transmit::Transmit,
   wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
 };
+#[cfg(any(feature = "alloc", feature = "std"))]
+use bytes::Bytes;
 
 /// Maximum retries before giving up.
 const MAX_RETRIES: u32 = 8;
@@ -29,7 +31,7 @@ const DEFAULT_MAX_ANSWERS: usize = 256;
 pub struct CollectedAnswer {
   rtype: ResourceType,
   rclass: ResourceClass,
-  rdata: std::vec::Vec<u8>,
+  rdata: Bytes,
   /// the case-FOLDED identity form of `rdata` (PTR/SRV/NSEC/CNAME
   /// names lowercased) used for dedup, cap accounting, and mailbox coalescing —
   /// while `rdata` keeps the original case for display. Two answers that are
@@ -41,7 +43,7 @@ pub struct CollectedAnswer {
   /// common case: A/AAAA/TXT/unknown rdata, or a name already lowercase), so we
   /// store ONLY one buffer — folding a large TXT/unknown flood does not double
   /// per-answer memory. [`Self::rdata_key`] resolves `None` to `rdata`.
-  rdata_key: Option<std::vec::Vec<u8>>,
+  rdata_key: Option<Bytes>,
   /// Monotonically increasing insertion sequence number within a single Query.
   /// Used to identify the oldest entry for FIFO eviction.
   seq: u64,
@@ -60,13 +62,13 @@ impl CollectedAnswer {
   pub fn from_parts(
     rtype: ResourceType,
     rclass: ResourceClass,
-    rdata: std::vec::Vec<u8>,
+    rdata: impl Into<Bytes>,
     seq: u64,
   ) -> Self {
     Self {
       rtype,
       rclass,
-      rdata,
+      rdata: rdata.into(),
       rdata_key: None,
       seq,
     }
@@ -88,7 +90,7 @@ impl CollectedAnswer {
   /// display). For identity/dedup comparisons use [`Self::rdata_key`].
   #[inline(always)]
   pub fn rdata_slice(&self) -> &[u8] {
-    &self.rdata
+    self.rdata.as_ref()
   }
 
   /// The case-FOLDED identity form of the rdata. Equal for two
@@ -98,7 +100,7 @@ impl CollectedAnswer {
   /// to `rdata` when the folded form is identical (no separate buffer stored).
   #[inline(always)]
   pub fn rdata_key(&self) -> &[u8] {
-    self.rdata_key.as_deref().unwrap_or(&self.rdata)
+    self.rdata_key.as_deref().unwrap_or(self.rdata.as_ref())
   }
 
   /// Insertion sequence number (monotonically increasing per-Query).
@@ -336,7 +338,7 @@ where
         // and names already lowercase — the folded form equals `owned`, so we
         // store None and avoid doubling memory under a large-rdata flood.
         let rdata_key = if folded == owned { None } else { Some(folded) };
-        let key: &[u8] = rdata_key.as_deref().unwrap_or(&owned);
+        let key: &[u8] = rdata_key.as_deref().unwrap_or(owned.as_ref());
 
         // Dedupe: skip if a matching (rtype, rclass, folded-rdata) already in.
         for (_, existing) in self.answers.iter() {

@@ -25,8 +25,8 @@ categories = ["network-programming", "no-std", "embedded"]
 # `Name` needs string/collection backing.
 [features]
 default = ["std", "slab"]
-std = ["smol_str/std", "rand/std", "thiserror/std"]
-alloc = ["dep:smol_str", "dep:rand"]
+std = ["smol_str/std", "rand/std", "thiserror/std", "bytes/std"]
+alloc = ["dep:smol_str", "dep:rand", "dep:bytes"]
 slab = ["dep:slab"]
 heapless = ["dep:heapless"]
 tracing = ["hick-trace/tracing"]
@@ -48,6 +48,7 @@ thiserror = { version = "2.0", default-features = false }
 derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
 rand_core = { version = "0.10", default-features = false }
 smol_str = { version = "0.3", default-features = false, optional = true }
+bytes = { version = "1", default-features = false, optional = true }
 rand = { version = "0.10", default-features = false, features = ["std_rng"], optional = true }
 slab = { version = "0.4", default-features = false, optional = true }
 heapless = { version = "0.9", optional = true }
