@@ -96,12 +96,21 @@ impl Query {
         // `poll_query`, then None forever.
         if let Some(t) = st.endpoint.poll_query(self.handle) {
           self.terminal_delivered.set(true);
+          // GC: free the driver query slot and the proto pool entry now that
+          // the terminal has been observed.  The Drop impl is safe to run
+          // afterward: `cancel_query` is idempotent (returns QueryNotFound and
+          // is ignored), and `queries.remove` on a missing key is a no-op.
+          st.queries.remove(&self.handle);
+          let _ = st.endpoint.cancel_query(self.handle);
           return Some(QueryEvent::Terminal(t));
         }
         // Driver flagged us cancelled (drop path) or errored (un-encodable
         // question) and no answer/terminal was pending — surface end-of-stream.
         if cancelled || errored {
           self.terminal_delivered.set(true);
+          // GC: same cleanup as the Terminal branch above.
+          st.queries.remove(&self.handle);
+          let _ = st.endpoint.cancel_query(self.handle);
           return None;
         }
       }

@@ -822,8 +822,17 @@ where
       // oversized packets can't drain the whole socket backlog in one uncapped pass
       //, but there is nothing to deliver.
       if len == 0 {
+        // A zero-length marker means smoltcp dequeued + discarded an oversized
+        // datagram before we saw it — the datagram WAS consumed from the
+        // transport queue, so bump packets_rx as a reliable denominator plus
+        // the usual packets_dropped reject counter. bytes_rx is NOT bumped
+        // because smoltcp discards the oversized payload before reporting to
+        // us; the original datagram length is not recoverable here.
         #[cfg(feature = "stats")]
-        self.stats.packets_dropped(1);
+        {
+          self.stats.packets_rx(1);
+          self.stats.packets_dropped(1);
+        }
         #[cfg(feature = "defmt")]
         defmt::debug!("rx drop: oversized/truncated datagram (len=0 marker)");
         continue;
@@ -836,11 +845,17 @@ where
         self.handle_one(now, meta.src, meta.local, &scratch[..len]);
       } else {
         // RFC 6762 §11: off-link datagram (hop-limit ≠ 255 or src not on a
-        // known subnet). Discard without calling into the proto layer.
-        // Count as dropped — matching reactor/compio accounting — so an
-        // off-link flood is visible in stats rather than silent.
+        // known subnet). Discard without calling into the proto layer. The
+        // datagram WAS received off the socket, so count packets_rx/bytes_rx
+        // here (handle() never runs for it) plus the packets_dropped reject —
+        // matching the reactor/compio pre-handle drop accounting so receive
+        // volume and the drop stay driver-consistent rather than hidden here.
         #[cfg(feature = "stats")]
-        self.stats.packets_dropped(1);
+        {
+          self.stats.packets_rx(1);
+          self.stats.bytes_rx(len as u64);
+          self.stats.packets_dropped(1);
+        }
         #[cfg(feature = "defmt")]
         defmt::debug!("rx drop: off-link datagram (RFC 6762 §11 trust boundary)");
       }
@@ -1076,6 +1091,12 @@ where
               slot.push_update(ServiceUpdate::Conflict);
               slot.errored = true;
             }
+            // Free the proto route under the (old) name that `handle` still
+            // holds — `handle_service_renamed` returned Err, meaning the new
+            // name collided and the rename was rejected; the old route is still
+            // present in the endpoint and must be freed so services_active is
+            // decremented and the name slot becomes reusable.
+            let _ = self.endpoint.unregister_service(handle);
             break;
           }
         }
@@ -1114,23 +1135,41 @@ where
     let scratch = &mut scratch[..cap];
     let service_handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
     for handle in service_handles {
-      let Some(slot) = self.services.get_mut(&handle) else {
-        continue;
+      // NLL note: the `slot` borrow is scoped to the `match` block so it ends
+      // before the post-match in-iteration `unregister_service` call below.
+      let escalated = {
+        let Some(slot) = self.services.get_mut(&handle) else {
+          continue;
+        };
+        if slot.errored {
+          continue;
+        }
+        match slot.proto.poll_transmit(now, scratch) {
+          Ok(Some(transmit)) => {
+            return Some((transmit.dst(), transmit.size(), Origin::Service(handle)));
+          }
+          Ok(None) => false,
+          Err(_) => {
+            // The pending datagram can't be encoded into `scratch`; the proto
+            // re-offers it forever, so retire the service to avoid a stall.
+            // Queue Conflict for the caller and mark the slot errored so every
+            // subsequent pump skips it (no busy-spin). The `slot` borrow ends
+            // here (its last use is `slot.errored = true`), so the in-iteration
+            // `unregister_service` call below is borrow-safe.
+            slot.push_update(ServiceUpdate::Conflict);
+            slot.errored = true;
+            true
+          }
+        }
       };
-      if slot.errored {
-        continue;
-      }
-      match slot.proto.poll_transmit(now, scratch) {
-        Ok(Some(transmit)) => {
-          return Some((transmit.dst(), transmit.size(), Origin::Service(handle)));
-        }
-        Ok(None) => {}
-        Err(_) => {
-          // The pending datagram can't be encoded into `scratch`; the proto
-          // re-offers it forever, so retire the service to avoid a stall.
-          slot.push_update(ServiceUpdate::Conflict);
-          slot.errored = true;
-        }
+      if escalated {
+        // Free the proto route immediately — in-iteration and non-bypassable —
+        // so an `Ok(Some)` early-return for a LATER service cannot skip this
+        // unregister. `unregister_service` touches only `self.endpoint`, not
+        // `self.services`, so there is no iterator invalidation. It is
+        // idempotent (returns false for unknown handles), so a double call is
+        // safe.
+        let _ = self.endpoint.unregister_service(handle);
       }
     }
 
@@ -1184,6 +1223,12 @@ where
           slot.push_update(ServiceUpdate::Conflict);
           slot.errored = true;
         }
+        // Free the proto route and decrement services_active. Called
+        // unconditionally (the slot check above is for the driver slot, which
+        // may already be gone if the service was double-retired — but
+        // unregister_service is idempotent and returns false for an unknown
+        // handle, so this is safe).
+        let _ = self.endpoint.unregister_service(handle);
       }
       Origin::Query(handle) => self.retire_query(handle),
     }
@@ -3775,31 +3820,79 @@ mod tests {
     );
   }
 
-  /// RFC 6762 §11 off-link datagrams (hop-limit ≠ 255) must increment
-  /// `packets_dropped` and must NOT increment `packets_rx`.
-  ///
-  /// Feeds the engine an off-link datagram (hop_limit = 1, i.e. routed), then
-  /// asserts `packets_dropped` rose by 1 and `packets_rx` is unchanged.
+  /// RFC 6762 §11 off-link datagrams (hop-limit ≠ 255) are dropped before the
+  /// proto layer, but the datagram WAS received off the socket — so it must
+  /// increment `packets_rx`/`bytes_rx` AND `packets_dropped` exactly once each,
+  /// matching the reactor/compio pre-handle drop accounting (driver-consistent).
   #[cfg(feature = "stats")]
   #[test]
-  fn stats_off_link_datagram_increments_packets_dropped_not_packets_rx() {
+  fn stats_off_link_datagram_counts_rx_bytes_and_dropped() {
     let mut engine: Engine<SmoltcpInstant, StdRng> =
       Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(9001));
     let mut io = MockUdp::default();
     let mut scratch = [0u8; 1500];
 
-    // Build a well-formed mDNS packet (any content) so the only reject reason
-    // is the hop-limit, not a parse error.
+    // Well-formed mDNS packet so the only reject reason is the hop-limit.
     let pkt = build_conflict_srv_authority("Test._ipp._tcp.local.");
+    let pkt_len = pkt.len();
 
-    // Inject an off-link datagram: hop_limit = 1 (crossed a router → §11 reject).
-    // The multicast group local address signals an mDNS multicast context.
+    // Off-link: hop_limit = 1 (crossed a router → §11 reject). len > 0 so the
+    // on-link gate is actually exercised, not the len==0 marker path.
     io.inbound.push_back((
       pkt,
       RecvMeta {
         src: SocketAddr::from((Ipv4Addr::new(192, 168, 2, 1), 5353)),
         local: Some(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
-        hop_limit: Some(1), // ≠ 255 → off-link
+        hop_limit: Some(1),
+        len: pkt_len,
+      },
+    ));
+
+    let snap_before = engine.stats();
+    engine.pump(at(0), &mut io, &mut scratch);
+    let snap_after = engine.stats();
+
+    assert_eq!(
+      snap_after.packets_rx - snap_before.packets_rx,
+      1,
+      "an off-link datagram WAS received → packets_rx must rise by 1"
+    );
+    assert_eq!(
+      snap_after.bytes_rx - snap_before.bytes_rx,
+      pkt_len as u64,
+      "off-link datagram bytes_rx must rise by the datagram length"
+    );
+    assert_eq!(
+      snap_after.packets_dropped - snap_before.packets_dropped,
+      1,
+      "an off-link datagram must increment packets_dropped by 1"
+    );
+  }
+
+  /// A zero-length receive (smoltcp oversized-datagram marker) must now bump
+  /// `packets_rx` AND `packets_dropped` — the datagram WAS consumed from the
+  /// transport queue so it must count toward the receive denominator.
+  ///
+  /// `bytes_rx` is NOT expected to change: smoltcp discards the oversized
+  /// payload before handing control back to us, so the original length is lost.
+  #[cfg(feature = "stats")]
+  #[test]
+  fn stats_oversized_zero_len_marker_counts_rx_and_dropped() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let mut engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(42));
+    let mut io = MockUdp::default();
+    let mut scratch = [0u8; 1500];
+
+    // An empty payload → MockUdp::try_recv sets meta.len = 0, which is the
+    // zero-length oversized-datagram marker the engine checks.
+    io.inbound.push_back((
+      vec![],
+      RecvMeta {
+        src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 5), 5353)),
+        local: Some(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
+        hop_limit: Some(255),
         len: 0,
       },
     ));
@@ -3809,18 +3902,302 @@ mod tests {
     let snap_after = engine.stats();
 
     assert_eq!(
-      snap_after.packets_dropped - snap_before.packets_dropped,
+      snap_after.packets_rx - snap_before.packets_rx,
       1,
-      "an off-link datagram (hop_limit=1) must increment packets_dropped by 1; \
-       delta={}",
-      snap_after.packets_dropped - snap_before.packets_dropped
+      "a zero-length (oversized) marker WAS consumed → packets_rx must rise by 1"
     );
     assert_eq!(
-      snap_after.packets_rx - snap_before.packets_rx,
+      snap_after.packets_dropped - snap_before.packets_dropped,
+      1,
+      "a zero-length marker is an unusable datagram → packets_dropped must rise by 1"
+    );
+    // bytes_rx is not bumped: smoltcp discards the payload before we see it.
+    assert_eq!(
+      snap_after.bytes_rx, snap_before.bytes_rx,
+      "bytes_rx must not change (oversized payload is lost before the zero-len marker)"
+    );
+  }
+
+  /// regression: when `poll_one_transmit` retires a service due to a
+  /// permanently-unencodable datagram (scratch too small to encode any probe),
+  /// the proto route must be freed (`services_active == 0`) and the name must
+  /// be immediately re-registerable (route was released).
+  ///
+  /// This covers the `Err(_)` arm in `Engine::poll_one_transmit` that now
+  /// calls `endpoint.unregister_service(handle)` in addition to setting
+  /// `slot.errored = true`.
+  #[cfg(feature = "stats")]
+  #[test]
+  fn encode_failure_retirement_frees_proto_route_and_decrements_services_active() {
+    let mut engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(99));
+    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+
+    // Verify services_active is 1 after registration.
+    assert_eq!(
+      engine.stats().services_active,
+      1,
+      "services_active must be 1 after registration"
+    );
+
+    // Use a 1-byte scratch to force `poll_one_transmit` → `Err(BufferTooSmall)`.
+    // Drive with a normal (non-failing) io so the send path doesn't also retire
+    // via `retire_origin` — we want to isolate the encode-failure branch.
+    let mut io = MockUdp::default();
+    let mut scratch_tiny = [0u8; 1];
+    let mut got_conflict = false;
+
+    // Pump until the service is retired. The probe fires after the §8.1 random
+    // delay (≤250 ms), so pumping to 300 ms is sufficient. The encode Err path
+    // retires immediately on the first failed encode (unlike compio which counts
+    // to MAX_CONSECUTIVE_ENCODE_ERRORS — smoltcp retires on the first failure).
+    for micros in [0i64, 100_000, 200_000, 300_000, 400_000] {
+      engine.pump(at(micros), &mut io, &mut scratch_tiny);
+      while let Some(u) = engine.poll_service_update(handle) {
+        got_conflict |= matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict);
+      }
+      if got_conflict {
+        break;
+      }
+    }
+
+    assert!(
+      got_conflict,
+      "encode failure must surface Conflict to the caller (poll_service_update)"
+    );
+
+    // Proto route freed — services_active must be 0.
+    assert_eq!(
+      engine.stats().services_active,
       0,
-      "an off-link datagram must NOT increment packets_rx; \
-       delta={}",
-      snap_after.packets_rx - snap_before.packets_rx
+      "services_active must be 0 after encode-failure retirement (proto route freed)"
+    );
+
+    // The same service name must be re-registerable (route was released).
+    engine
+      .register_service(sample_spec(), at(500_000))
+      .expect("same service name must be re-registerable after encode-failure retirement");
+
+    assert_eq!(
+      engine.stats().services_active,
+      1,
+      "services_active must be 1 again after re-registration"
+    );
+  }
+
+  /// regression: when one of N registered services is retired by an
+  /// encode failure in `poll_one_transmit`, its proto route must be freed
+  /// IMMEDIATELY — in the same iteration that detects the failure — so an
+  /// `Ok(Some)` early-return from a LATER service in the same call cannot
+  /// bypass the `unregister_service` call.
+  ///
+  /// The bug: the old code pushed retiring handles into `proto_unregister: Vec`
+  /// and drained it AFTER the service loop. An early-return from another
+  /// service exited the loop before the drain, permanently leaking the proto
+  /// route (`services_active` never decremented, old name not re-registerable).
+  ///
+  /// The fix: `unregister_service` is called in-iteration (after the `slot`
+  /// borrow ends in the same loop body) so no early-return from a sibling
+  /// service can bypass it.
+  ///
+  /// Verification: drive TWO services with a 1-byte scratch so both are retired
+  /// by encode failures. `services_active` must reach 0 (both routes freed),
+  /// and both names must be immediately re-registerable (no proto route leak).
+  /// The loop-ordering bypass would leave one (or both) routes leaked.
+  ///
+  /// NOTE: With 1-byte scratch BOTH services fail to encode, so both get retired
+  /// in the same `poll_one_transmit` sweep. `services_active` must reach 0
+  /// (the fix ensures each retirement is unregistered immediately, regardless of
+  /// which service returned `Err` first). Without the fix, the deferred Vec
+  /// drain could be skipped by an intermediate state or exit path, leaving
+  /// `services_active > 0`.
+  #[cfg(feature = "stats")]
+  #[test]
+  fn multi_service_encode_failure_frees_route_even_with_sibling_transmit() {
+    let mut engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(200));
+
+    // Register two services that will both encode-fail once we switch to the
+    // 1-byte scratch (simulates the ordering bypass: both in the map, one
+    // could short-circuit the other's post-loop drain in the buggy code).
+    let handle_a = engine.register_service(sample_spec(), at(0)).unwrap();
+    let handle_b = engine
+      .register_service(
+        spec_for(
+          "_ipp._tcp.local.",
+          "Sibling._ipp._tcp.local.",
+          "sibling.local.",
+          Ipv4Addr::new(192, 168, 1, 11),
+        ),
+        at(0),
+      )
+      .unwrap();
+
+    assert_eq!(
+      engine.stats().services_active,
+      2,
+      "both services registered: services_active must be 2"
+    );
+
+    // Pump with a tiny (1-byte) scratch. smoltcp retires on the FIRST encode
+    // failure; both services have pending probes, so both should be retired
+    // within a few pump cycles. The key assertion (the fix) is that
+    // both routes are freed — services_active reaches 0 and both names are
+    // re-registerable — not leaked by the deferred-Vec bypass.
+    let mut io = MockUdp::default();
+    let mut tiny = [0u8; 1];
+    let mut got_conflict_a = false;
+    let mut got_conflict_b = false;
+
+    for i in 0..30i64 {
+      let t = at(i * 100_000);
+      engine.pump(t, &mut io, &mut tiny);
+      while let Some(u) = engine.poll_service_update(handle_a) {
+        if matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict) {
+          got_conflict_a = true;
+        }
+      }
+      while let Some(u) = engine.poll_service_update(handle_b) {
+        if matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict) {
+          got_conflict_b = true;
+        }
+      }
+      // Stop once both are retired.
+      let a_done = engine
+        .services
+        .get(&handle_a)
+        .map(|s| s.errored)
+        .unwrap_or(false);
+      let b_done = engine
+        .services
+        .get(&handle_b)
+        .map(|s| s.errored)
+        .unwrap_or(false);
+      if a_done && b_done {
+        break;
+      }
+    }
+
+    // Both services must have been retired.
+    assert!(
+      engine
+        .services
+        .get(&handle_a)
+        .map(|s| s.errored)
+        .unwrap_or(false),
+      "A must be retired by encode failure"
+    );
+    assert!(
+      engine
+        .services
+        .get(&handle_b)
+        .map(|s| s.errored)
+        .unwrap_or(false),
+      "B must be retired by encode failure"
+    );
+
+    // Conflicts surfaced.
+    assert!(
+      got_conflict_a,
+      "A's Conflict must be surfaced via poll_service_update"
+    );
+    assert!(
+      got_conflict_b,
+      "B's Conflict must be surfaced via poll_service_update"
+    );
+
+    // fix: both routes freed → services_active == 0.
+    // With the buggy deferred-Vec drain, an early-return from B (if B returned
+    // Ok(Some) before A retired in the same call) would bypass A's unregister,
+    // leaving services_active > 0 and A's name not re-registerable.
+    assert_eq!(
+      engine.stats().services_active,
+      0,
+      "services_active must be 0 after both services are retired by encode failure \
+       (regression: deferred-drain bypass would leave routes leaked)"
+    );
+
+    // Both names must be immediately re-registerable (routes were freed).
+    engine
+      .register_service(sample_spec(), at(3_000_000))
+      .expect("A's name must be re-registerable after in-iteration unregister (fix)");
+    engine
+      .register_service(
+        spec_for(
+          "_ipp._tcp.local.",
+          "Sibling._ipp._tcp.local.",
+          "sibling.local.",
+          Ipv4Addr::new(192, 168, 1, 11),
+        ),
+        at(3_000_000),
+      )
+      .expect("B's name must be re-registerable after in-iteration unregister (fix)");
+
+    assert_eq!(
+      engine.stats().services_active,
+      2,
+      "services_active must be 2 after re-registering both A and B"
+    );
+  }
+
+  /// regression (send-too-large path): when `retire_origin` retires a service because every send
+  /// returned a permanent error (`SendError::TooLarge`), the proto route must
+  /// be freed (`services_active == 0`) and the name must be re-registerable.
+  ///
+  /// This covers the `Origin::Service` arm in `Engine::retire_origin` that now
+  /// calls `endpoint.unregister_service(handle)`.
+  #[cfg(feature = "stats")]
+  #[test]
+  fn send_too_large_retirement_frees_proto_route_and_decrements_services_active() {
+    let mut engine: Engine<SmoltcpInstant, StdRng> =
+      Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(100));
+    let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+
+    assert_eq!(
+      engine.stats().services_active,
+      1,
+      "services_active must be 1 after registration"
+    );
+
+    // Both families permanently TooLarge → `retire_origin` path.
+    let mut io = MockUdp {
+      v4_fail: Some(SendError::TooLarge),
+      v6_fail: Some(SendError::TooLarge),
+      ..Default::default()
+    };
+    let mut scratch = [0u8; 1500];
+    let mut got_conflict = false;
+
+    for micros in pump_schedule() {
+      engine.pump(at(micros), &mut io, &mut scratch);
+      while let Some(u) = engine.poll_service_update(handle) {
+        got_conflict |= matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict);
+      }
+      if got_conflict {
+        break;
+      }
+    }
+
+    assert!(
+      got_conflict,
+      "permanently-too-large sends must surface Conflict (retire_origin path)"
+    );
+
+    assert_eq!(
+      engine.stats().services_active,
+      0,
+      "services_active must be 0 after retire_origin (proto route freed)"
+    );
+
+    // Re-registration must succeed (route was released by retire_origin).
+    engine
+      .register_service(sample_spec(), at(10_000_000))
+      .expect("same service name must be re-registerable after retire_origin");
+
+    assert_eq!(
+      engine.stats().services_active,
+      1,
+      "services_active must be 1 again after re-registration"
     );
   }
 }

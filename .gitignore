@@ -28,3 +28,7 @@ Cargo.lock
 /tarpaulin-report.html
 /lcov.info
 /coverage/
+
+# Stray compiled artifacts that escape target/ (e.g. proc-macro / no-panic build products)
+*.rlib
+*.rmeta
