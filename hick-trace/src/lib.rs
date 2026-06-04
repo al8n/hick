@@ -20,7 +20,7 @@
 // ── Tracing shim ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "tracing")]
-pub use tracing::{debug, error, info, trace, warn};
+pub use tracing::{debug, debug_span, error, info, info_span, trace, trace_span, warn};
 
 /// Token-discarding no-op for all five diagnostic macros when `tracing` is
 /// disabled. Every argument form accepted by the real macros (structured
@@ -43,6 +43,50 @@ pub use __hick_trace_noop as info;
 pub use __hick_trace_noop as warn;
 #[cfg(not(feature = "tracing"))]
 pub use __hick_trace_noop as error;
+
+// ── Span macros ─────────────────────────────────────────────────────────────
+
+/// No-op span returned when the `tracing` feature is disabled.
+///
+/// Implements `.entered()` and `.enter()` so that
+/// `hick_trace::info_span!(...).entered()` compiles in both tracing and
+/// no-tracing builds.
+#[cfg(not(feature = "tracing"))]
+#[derive(Debug)]
+pub struct NoopSpan;
+
+#[cfg(not(feature = "tracing"))]
+impl NoopSpan {
+  /// Enters the span (no-op). Returns `self` so it acts as a drop-guard.
+  #[inline]
+  pub fn entered(self) -> Self {
+    self
+  }
+  /// Borrows the span and returns a new no-op guard (matches tracing's API).
+  #[inline]
+  pub fn enter(&self) -> Self {
+    NoopSpan
+  }
+}
+
+/// Token-discarding no-op for span macros when `tracing` is disabled.
+/// Returns a [`NoopSpan`] so callers may use `.entered()` / `.enter()`
+/// without compile errors.
+#[doc(hidden)]
+#[cfg(not(feature = "tracing"))]
+#[macro_export]
+macro_rules! __hick_trace_noop_span {
+  ($($tt:tt)*) => {
+    $crate::NoopSpan
+  };
+}
+
+#[cfg(not(feature = "tracing"))]
+pub use __hick_trace_noop_span as trace_span;
+#[cfg(not(feature = "tracing"))]
+pub use __hick_trace_noop_span as debug_span;
+#[cfg(not(feature = "tracing"))]
+pub use __hick_trace_noop_span as info_span;
 
 // ── Stats / Metrics ─────────────────────────────────────────────────────────
 
@@ -284,6 +328,15 @@ pub mod stats {
 
 #[cfg(test)]
 mod tests {
+  /// Verify span macros compile and that `.entered()` yields a usable drop-guard
+  /// in both tracing and no-tracing builds.
+  #[test]
+  fn span_macros_compile() {
+    let _g = crate::trace_span!("my_span", field = 1u32).entered();
+    let _g2 = crate::debug_span!("x", a = 1u32).entered();
+    let _g3 = crate::info_span!("y").entered();
+  }
+
   /// Verify that every macro accepts both structured (key=value) and positional
   /// format-string invocations, and that they compile regardless of whether
   /// `tracing` is enabled.

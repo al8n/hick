@@ -6,4 +6,7 @@
 //! active — those are the only build tiers that have call sites.
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-pub(crate) use hick_trace::{debug, trace};
+pub(crate) use hick_trace::{debug, trace, warn};
+
+#[cfg(all(any(feature = "std", feature = "alloc"), feature = "tracing"))]
+pub(crate) use hick_trace::trace_span;

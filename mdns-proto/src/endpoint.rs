@@ -152,6 +152,8 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   next_service_handle: u32,
   next_query_handle: u32,
   next_txid: u16,
+  #[cfg(feature = "stats")]
+  stats: std::sync::Arc<hick_trace::stats::Stats>,
   _phantom: core::marker::PhantomData<(AN, EvQ)>,
 }
 
@@ -170,18 +172,41 @@ where
   pub fn try_new(config: EndpointConfig, mut rng: R) -> Self {
     let raw_txid = rng.next_u32() as u16;
     let next_txid = if raw_txid == 0 { 1 } else { raw_txid };
+    #[cfg(feature = "stats")]
+    let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
+    #[cfg(feature = "stats")]
+    let mut cache = Cache::new();
+    #[cfg(feature = "stats")]
+    cache.set_stats(stats.clone());
+    #[cfg(not(feature = "stats"))]
+    let cache = Cache::new();
     Self {
       config,
       rng,
       services: SR::new(),
       queries: QS::new(),
-      cache: Cache::new(),
+      cache,
       pending_events: EV::new(),
       next_service_handle: 0,
       next_query_handle: 0,
       next_txid,
+      #[cfg(feature = "stats")]
+      stats,
       _phantom: core::marker::PhantomData,
     }
+  }
+
+  /// Return a point-in-time snapshot of all counters and gauges.
+  #[cfg(feature = "stats")]
+  pub fn stats(&self) -> hick_trace::stats::StatsSnapshot {
+    self.stats.snapshot()
+  }
+
+  /// Return a cloned handle to the shared [`Stats`] so the I/O driver can
+  /// bump transport-level counters (e.g. `bytes_tx`, `packets_tx`).
+  #[cfg(feature = "stats")]
+  pub fn stats_handle(&self) -> std::sync::Arc<hick_trace::stats::Stats> {
+    self.stats.clone()
   }
 
   /// Returns the configuration.
@@ -231,18 +256,26 @@ where
     self.rng.fill_bytes(&mut seed);
     // honor EndpointConfig::probe_unique_names — when disabled the
     // service skips the §8.1 probe sequence and announces immediately.
-    let svc = Service::try_new(
-      handle,
-      spec.into_records(),
-      now,
-      seed,
-      self.config.probe_unique_names(),
-    );
+    let svc = {
+      #[allow(unused_mut)]
+      let mut s = Service::try_new(
+        handle,
+        spec.into_records(),
+        now,
+        seed,
+        self.config.probe_unique_names(),
+      );
+      #[cfg(feature = "stats")]
+      s.set_stats(self.stats.clone());
+      s
+    };
     crate::trace::debug!(
       target: "mdns_proto::endpoint",
       handle = handle.raw(),
       "try_register_service: service registered"
     );
+    #[cfg(feature = "stats")]
+    self.stats.services_registered(1);
     Ok((handle, svc))
   }
 
@@ -315,9 +348,12 @@ where
       spec.unicast_response(),
       timeout_deadline,
     );
+    #[cfg(feature = "stats")]
+    q.set_stats(self.stats.clone());
     if let Some(m) = spec.max_answers() {
       q.set_max_answers(m);
     }
+    // q must be `mut` for set_max_answers above; allow for stats-only build.
 
     self
       .queries
@@ -330,6 +366,8 @@ where
       txid,
       "try_start_query: query started"
     );
+    #[cfg(feature = "stats")]
+    self.stats.queries_started(1);
     Ok(handle)
   }
 
@@ -420,7 +458,26 @@ where
     data: &'a [u8],
     caller_is_self: bool,
   ) -> Result<RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ>, HandleError> {
-    let reader = MessageReader::try_parse(data).map_err(HandleError::Parse)?;
+    // ── entry span + Rx counters ────────────────────────────────────────────
+    #[cfg(feature = "tracing")]
+    let _span = crate::trace::trace_span!("handle", src = %src, len = data.len()).entered();
+    #[cfg(feature = "stats")]
+    {
+      self.stats.packets_rx(1);
+      #[allow(clippy::cast_possible_truncation)]
+      self.stats.bytes_rx(data.len() as u64);
+    }
+
+    let reader = MessageReader::try_parse(data).map_err(|e| {
+      crate::trace::warn!(
+        target: "mdns_proto::endpoint",
+        src = %src,
+        "handle: failed to parse incoming datagram"
+      );
+      #[cfg(feature = "stats")]
+      self.stats.parse_errors(1);
+      HandleError::Parse(e)
+    })?;
     if !reader.header().flags().opcode().is_query() {
       return Err(HandleError::InvalidOpcode(reader.header().flags().opcode()));
     }
@@ -475,6 +532,17 @@ where
       data_len = data.len(),
       "handle: routing inbound packet"
     );
+    if suppress_side_effects {
+      crate::trace::debug!(
+        target: "mdns_proto::endpoint",
+        src = %src,
+        is_self_packet,
+        untrusted_response,
+        "handle: suppressed self/untrusted packet"
+      );
+      #[cfg(feature = "stats")]
+      self.stats.packets_dropped(1);
+    }
     // + cache population: walk the answer section ONCE, eagerly
     // applying side effects so that dropping the returned `RouteEvents`
     // iterator early cannot lose state:
@@ -523,6 +591,8 @@ where
           // Stop on first malformed record; partial side effects are OK.
           Err(_) => break,
         };
+        #[cfg(feature = "stats")]
+        self.stats.answers_rx(1);
 
         // eager query state update.  Apply this answer to every
         // matching owned Query in a single mutable pass.  iter_mut is
@@ -674,6 +744,8 @@ where
           Ok(q) => q,
           Err(_) => break,
         };
+        #[cfg(feature = "stats")]
+        self.stats.questions_rx(1);
         // A QU (unicast-response) question is answered unicast to the asker, so
         // it does NOT elicit the multicast answers our query needs — only a
         // shared QM question is a genuine duplicate of ours. Class-gate to IN.
@@ -691,6 +763,8 @@ where
             && names_match(query.qname(), q.qname())
           {
             query.note_duplicate_question(now);
+            #[cfg(feature = "stats")]
+            self.stats.duplicate_questions_suppressed(1);
           }
         }
       }
@@ -805,6 +879,18 @@ where
 
     // Apply the rename.
     if let Some(route) = self.services.get_mut(key) {
+      crate::trace::warn!(
+        target: "mdns_proto::endpoint",
+        handle = handle.raw(),
+        old_name = route.name.as_str(),
+        new_name = new_name.as_str(),
+        "handle_service_renamed: service renamed due to conflict"
+      );
+      #[cfg(feature = "stats")]
+      {
+        self.stats.conflicts(1);
+        self.stats.renames(1);
+      }
       route.name = new_name;
     }
     Ok(())

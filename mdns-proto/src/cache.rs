@@ -106,6 +106,8 @@ pub struct Cache<I, P> {
   entries: P,
   max_entries: usize,
   _phantom: core::marker::PhantomData<I>,
+  #[cfg(feature = "stats")]
+  stats: std::sync::Arc<hick_trace::stats::Stats>,
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -120,6 +122,8 @@ where
       entries: P::new(),
       max_entries: DEFAULT_MAX_ENTRIES,
       _phantom: core::marker::PhantomData,
+      #[cfg(feature = "stats")]
+      stats: std::sync::Arc::new(hick_trace::stats::Stats::default()),
     }
   }
 
@@ -134,13 +138,36 @@ where
       entries: P::new(),
       max_entries: max,
       _phantom: core::marker::PhantomData,
+      #[cfg(feature = "stats")]
+      stats: std::sync::Arc::new(hick_trace::stats::Stats::default()),
     }
+  }
+
+  /// Replace the shared [`Stats`] handle with one from the owning [`Endpoint`].
+  ///
+  /// Called immediately after construction by the `Endpoint` so that all
+  /// per-cache counters accumulate into the endpoint-level stats.
+  #[cfg(feature = "stats")]
+  pub(crate) fn set_stats(&mut self, stats: std::sync::Arc<hick_trace::stats::Stats>) {
+    self.stats = stats;
   }
 
   /// The configured maximum number of entries.
   #[inline(always)]
   pub const fn max_entries(&self) -> usize {
     self.max_entries
+  }
+
+  /// The current number of cached entries.
+  #[inline(always)]
+  pub fn len(&self) -> usize {
+    self.entries.len()
+  }
+
+  /// Whether the cache is empty.
+  #[inline(always)]
+  pub fn is_empty(&self) -> bool {
+    self.entries.len() == 0
   }
 
   /// Insert (or update / remove) a record observation.
@@ -284,13 +311,36 @@ where
         entry.expires_at = expires_at;
         entry.received_at = now;
       }
+      crate::trace::trace!(
+        target: "mdns_proto::cache",
+        rtype = ?rtype,
+        "cache: refreshed existing entry (dedup)"
+      );
+      #[cfg(feature = "stats")]
+      {
+        self.stats.cache_refreshes(1);
+        self.stats.set_cache_size(self.entries.len() as u64);
+      }
       return Ok(Some(key));
     }
 
     // Insert through the bounded helper (proactive cap eviction + reactive retry).
-    self
+    let result = self
       .bounded_insert(CacheEntry::new(name, rtype, rclass, rdata, expires_at, now))
-      .map(Some)
+      .map(Some);
+    if result.is_ok() {
+      crate::trace::trace!(
+        target: "mdns_proto::cache",
+        rtype = ?rtype,
+        "cache: inserted new entry"
+      );
+      #[cfg(feature = "stats")]
+      {
+        self.stats.cache_inserts(1);
+        self.stats.set_cache_size(self.entries.len() as u64);
+      }
+    }
+    result
   }
 
   /// Insert `entry` into the backing pool while respecting `max_entries`.
@@ -315,6 +365,12 @@ where
       }
       if let Some((vk, _)) = victim {
         self.entries.try_remove(vk);
+        crate::trace::trace!(
+          target: "mdns_proto::cache",
+          "cache: proactive eviction (cap reached)"
+        );
+        #[cfg(feature = "stats")]
+        self.stats.cache_evictions(1);
       }
     }
 
@@ -332,6 +388,12 @@ where
         }
         if let Some((vk, _)) = victim {
           self.entries.try_remove(vk);
+          crate::trace::trace!(
+            target: "mdns_proto::cache",
+            "cache: reactive eviction (pool capacity error)"
+          );
+          #[cfg(feature = "stats")]
+          self.stats.cache_evictions(1);
         }
         self.entries.insert(entry)
       }
@@ -350,6 +412,19 @@ where
     for key in to_remove {
       if self.entries.try_remove(key).is_some() {
         removed = removed.saturating_add(1);
+      }
+    }
+    if removed > 0 {
+      crate::trace::trace!(
+        target: "mdns_proto::cache",
+        removed,
+        "cache: swept expired entries"
+      );
+      #[cfg(feature = "stats")]
+      {
+        #[allow(clippy::cast_possible_truncation)]
+        self.stats.cache_expirations(removed as u64);
+        self.stats.set_cache_size(self.entries.len() as u64);
       }
     }
     removed
