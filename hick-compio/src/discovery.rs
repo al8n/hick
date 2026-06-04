@@ -22,6 +22,7 @@ use mdns_proto::{
   Name, QuerySpec,
   wire::{A, AAAA, NameRef, Ptr, ResourceType, Srv, Txt},
 };
+use smol_str::SmolStr;
 
 use crate::{
   endpoint::Endpoint,
@@ -173,8 +174,12 @@ pub(crate) fn push_capped<T: PartialEq>(v: &mut Vec<T>, item: T) -> bool {
 /// Case-fold a [`Name`] to its lookup key. DNS names are case-insensitive
 /// (RFC 6762 §16), so the lower-cased string form is the canonical key for
 /// the resolver's per-instance / per-host maps.
-pub(crate) fn fold(name: &Name) -> String {
-  name.as_str().to_ascii_lowercase()
+pub(crate) fn fold(name: &Name) -> SmolStr {
+  name
+    .as_str()
+    .chars()
+    .map(|c| c.to_ascii_lowercase())
+    .collect()
 }
 
 /// Decode an owner-less wire-form domain name (a decompressed PTR/SRV target as
@@ -236,10 +241,10 @@ pub(crate) fn parse_txt(rdata: &[u8]) -> Vec<Vec<u8>> {
 #[allow(clippy::upper_case_acronyms)] // `AAAA` mirrors the DNS record-type name
 pub(crate) enum Step {
   Ptr,
-  Srv(String),
-  Txt(String),
-  A(String),
-  AAAA(String),
+  Srv(SmolStr),
+  Txt(SmolStr),
+  A(SmolStr),
+  AAAA(SmolStr),
 }
 
 /// A follow-up query the driver should launch as a result of feeding the
@@ -275,7 +280,7 @@ pub(crate) struct HostAddrs {
 pub(crate) struct Builder {
   pub(crate) instance: Name,
   pub(crate) host: Option<Name>,
-  pub(crate) host_key: Option<String>,
+  pub(crate) host_key: Option<SmolStr>,
   /// Whether an SRV record has been seen. Tracked separately from `port`
   /// because `0` is a valid SRV port (the full `u16` range is parsed and the
   /// registration API does not reject it), so it cannot double as a sentinel.
@@ -322,9 +327,9 @@ impl Builder {
 /// Pure browse/resolve aggregation state machine — no I/O. The lookup driver
 /// feeds it parsed answers and launches the follow-up queries it requests.
 pub(crate) struct Resolver {
-  pub(crate) builders: HashMap<String, Builder>,
-  pub(crate) host_addrs: HashMap<String, HostAddrs>,
-  pub(crate) hosts_queried: HashSet<String>,
+  pub(crate) builders: HashMap<SmolStr, Builder>,
+  pub(crate) host_addrs: HashMap<SmolStr, HostAddrs>,
+  pub(crate) hosts_queried: HashSet<SmolStr>,
   pub(crate) ready: VecDeque<ServiceEntry>,
   /// Cap on distinct instances tracked.
   pub(crate) max_entries: usize,
@@ -450,7 +455,7 @@ impl Resolver {
   }
 
   pub(crate) fn on_addr(&mut self, host_key: &str, addr: IpAddr) {
-    let cache = self.host_addrs.entry(host_key.to_owned()).or_default();
+    let cache = self.host_addrs.entry(SmolStr::from(host_key)).or_default();
     match addr {
       IpAddr::V4(a) => {
         push_capped(&mut cache.ipv4, a);
@@ -459,7 +464,7 @@ impl Resolver {
         push_capped(&mut cache.ipv6, a);
       }
     }
-    let keys: Vec<String> = self
+    let keys: Vec<SmolStr> = self
       .builders
       .iter()
       .filter(|(_, b)| b.host_key.as_deref() == Some(host_key))

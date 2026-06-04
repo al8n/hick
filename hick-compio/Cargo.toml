@@ -33,6 +33,7 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 event-listener = "5"
 getifs = "0.6"
 slab = "0.4"
+smol_str = "0.3"
 rand = "0.10"
 thiserror = "2"
 
