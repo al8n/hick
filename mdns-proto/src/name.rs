@@ -184,9 +184,13 @@ const _: () = {
     /// total length, normalizing to canonical lowercase.
     pub fn try_from_str(s: &str) -> Result<Self, NameError> {
       validate_name(s)?;
+      // Case-fold ASCII only (DNS case-insensitivity is ASCII-only, RFC 4343)
+      // and iterate CHARS so non-ASCII UTF-8 — DNS-SD instance names are UTF-8
+      // (RFC 6763 §4.1) — is preserved. `byte as char` would Latin-1-reinterpret
+      // each byte and double-encode multi-byte sequences.
       let mut buf = String::with_capacity(s.len());
-      for byte in s.bytes() {
-        buf.push(byte.to_ascii_lowercase() as char);
+      for ch in s.chars() {
+        buf.push(ch.to_ascii_lowercase());
       }
       Ok(Self(NameInner::from(buf)))
     }
@@ -201,11 +205,12 @@ const _: () = {
     /// total length, normalizing to canonical lowercase.
     pub fn try_from_str(s: &str) -> Result<Self, NameError> {
       validate_name(s)?;
+      // ASCII-only case-fold (RFC 4343); iterate CHARS so non-ASCII UTF-8
+      // (RFC 6763 §4.1 instance names) is preserved, not double-encoded.
       let mut buf: NameInner = heapless::String::new();
-      for byte in s.bytes() {
-        let lowered = byte.to_ascii_lowercase() as char;
+      for ch in s.chars() {
         buf
-          .push(lowered)
+          .push(ch.to_ascii_lowercase())
           .map_err(|_| NameError::NameTooLong(NameTooLongDetail::new(s.len())))?;
       }
       Ok(Self(buf))
