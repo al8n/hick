@@ -232,6 +232,13 @@ pub struct RecvMeta {
   kernel_rx_time: Option<SystemTime>,
   /// Bytes of payload received.
   len: usize,
+  /// True when the datagram exceeded `max_recv_packet_size`, indicating it was
+  /// truncated by the kernel (compio's `recv_msg` does not expose `msg_flags`,
+  /// so a `data_len > max_recv_packet_size` overflow into the one-byte sentinel
+  /// the buffer is over-allocated by is the proxy for `MSG_TRUNC`). The driver
+  /// treats such datagrams as consumed-but-unusable (bumps `packets_rx` +
+  /// `packets_dropped`) without routing them to proto.
+  truncated: bool,
 }
 
 impl RecvMeta {
@@ -247,6 +254,7 @@ impl RecvMeta {
       hop_limit: None,
       kernel_rx_time: None,
       len: 0,
+      truncated: false,
     }
   }
 
@@ -280,6 +288,17 @@ impl RecvMeta {
     self.kernel_rx_time
   }
 
+  /// True when the datagram exceeded the socket's configured
+  /// `max_recv_packet_size` (overflowing into the one-byte over-allocation
+  /// sentinel) and was therefore silently truncated by the kernel. A legal
+  /// datagram of exactly `max_recv_packet_size` bytes is NOT flagged. The driver
+  /// treats flagged datagrams as consumed-but-unusable (stats counted, not
+  /// routed to proto).
+  #[inline(always)]
+  pub(crate) const fn truncated(&self) -> bool {
+    self.truncated
+  }
+
   /// Full constructor. Test-only: production code builds a `RecvMeta` via
   /// [`Self::empty`] plus in-module cmsg decoding.
   #[cfg(test)]
@@ -298,7 +317,16 @@ impl RecvMeta {
       hop_limit,
       kernel_rx_time,
       len,
+      truncated: false,
     }
+  }
+
+  /// Mark the datagram as truncated. Test-only: production code sets this flag
+  /// inside `Socket::recv` via the full-buffer heuristic.
+  #[cfg(test)]
+  pub(crate) const fn with_truncated(mut self) -> Self {
+    self.truncated = true;
+    self
   }
 }
 
@@ -337,7 +365,15 @@ impl Socket {
   /// `cmsghdr` alignment that [`CMsgIter::new`] / `compio-net`'s `recv_msg`
   /// both require.
   pub async fn recv(&self, max: usize) -> std::io::Result<(Vec<u8>, RecvMeta)> {
-    let buf: Vec<u8> = Vec::with_capacity(max);
+    // Over-allocate by one sentinel byte beyond `max` (= max_recv_packet_size).
+    // A legal datagram of up to and including `max` bytes then fits without
+    // touching the sentinel (`data_len <= max`), while an oversized datagram
+    // overflows into it (`data_len == max + 1`, the kernel having truncated the
+    // tail). Testing `data_len > max` therefore distinguishes a truncated
+    // datagram from a legal exactly-`max`-byte one — keeping
+    // `max_recv_packet_size` a true *inclusive* ceiling rather than dropping a
+    // perfectly-sized packet.
+    let buf: Vec<u8> = Vec::with_capacity(max + 1);
     #[cfg(unix)]
     {
       let ctrl = AlignedCtrlBuf::new();
@@ -351,6 +387,14 @@ impl Socket {
       }
       let mut meta = RecvMeta::empty(peer);
       meta.len = data_len;
+      // compio-net's `recv_msg` does not expose `msghdr::msg_flags`, so we
+      // cannot check `MSG_TRUNC` directly (unlike `hick-udp`'s `recvmsg`
+      // path, which can). Use the next-best proxy: the buffer is sized to
+      // `max + 1`, so the kernel can only write more than `max` bytes when the
+      // datagram exceeded `max_recv_packet_size` and was silently truncated. A
+      // legal datagram of exactly `max` bytes lands as `data_len == max` and is
+      // NOT flagged. The driver treats a flagged datagram as consumed-but-unusable.
+      meta.truncated = data_len > max;
       let ctrl_bytes = ctrl.filled(ctrl_len);
       decode_unix_cmsgs(ctrl_bytes, &mut meta);
       Ok((data, meta))
@@ -369,6 +413,12 @@ impl Socket {
       }
       let mut meta = RecvMeta::empty(peer);
       meta.len = data_len;
+      // Same truncation proxy as the Unix path: `recv_from` doesn't expose
+      // `WSAEMSGSIZE`/`MSG_TRUNC` as a flag, so the `max + 1` sentinel buffer +
+      // `data_len > max` test stands in for it (a legal exactly-`max`-byte
+      // datagram is preserved). The Windows WSARecvMsg port (follow-up task)
+      // will use `dwFlags & MSG_TRUNC` once landed.
+      meta.truncated = data_len > max;
       Ok((data, meta))
     }
   }

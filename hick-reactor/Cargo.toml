@@ -19,7 +19,7 @@ tokio = ["agnostic-net/tokio"]
 smol = ["agnostic-net/smol"]
 
 # Enable tracing instrumentation (driver call sites + proto layer).
-tracing = ["mdns-proto/tracing", "hick-trace/tracing"]
+tracing = ["dep:tracing", "mdns-proto/tracing", "hick-trace/tracing"]
 # Forward metrics / stats feature flags.
 metrics = ["stats", "mdns-proto/metrics", "hick-trace/metrics"]
 stats = ["mdns-proto/stats", "hick-trace/stats"]
@@ -28,6 +28,7 @@ stats = ["mdns-proto/stats", "hick-trace/stats"]
 mdns-proto = { workspace = true, features = ["std", "slab"] }
 hick-udp.workspace = true
 hick-trace = { workspace = true }
+tracing = { workspace = true, optional = true, features = ["attributes", "std"] }
 agnostic-net = { version = "0.3" }
 agnostic-lite = { version = "0.6" }
 async-channel = "2"
