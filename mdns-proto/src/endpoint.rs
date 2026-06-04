@@ -25,10 +25,9 @@ use crate::{
   wire::{MessageReader, NameRef, ResourceClass, ResourceType},
 };
 
-/// Number of goodbye sends during an orderly withdrawal (RFC 6762 §10.1).
+/// Number of goodbye sends during an orderly withdrawal (RFC 6762 §10.1),
+/// counted PER FAMILY so each reachable family withdraws its records.
 #[cfg(any(feature = "alloc", feature = "std"))]
-// Used by `begin_withdrawal`; `remaining` consumption is wired in Task 4.
-#[allow(dead_code)]
 const WITHDRAWAL_SENDS: u8 = 3;
 
 /// Spacing between successive withdrawal goodbye resends (loss resilience).
@@ -49,6 +48,35 @@ const WITHDRAWAL_RETRY_BACKOFF: core::time::Duration = core::time::Duration::fro
 #[cfg(any(feature = "alloc", feature = "std"))]
 const WITHDRAWAL_CEILING: core::time::Duration = core::time::Duration::from_secs(2);
 
+/// Per-family result of sending one withdrawal (RFC 6762 §10.1 goodbye)
+/// datagram, reported to [`Endpoint::note_withdrawal_result`] for EACH address
+/// family so a withdrawal only completes once every reachable family has
+/// withdrawn its records.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
+#[display("{}", self.as_str())]
+pub enum WithdrawalSend {
+  /// The datagram reached the wire on this family — spend one of its owed rounds.
+  Sent,
+  /// Transiently undeliverable (socket busy) — keep this family's debt, retry.
+  Retry,
+  /// This family is permanently unavailable (no socket / permanent send error) —
+  /// write its debt off (it has no reachable peers to withdraw from).
+  WriteOff,
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+impl WithdrawalSend {
+  /// Canonical lowercase slug for this per-family send outcome.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Sent => "sent",
+      Self::Retry => "retry",
+      Self::WriteOff => "write_off",
+    }
+  }
+}
+
 /// In-progress withdrawal state for a single service.  Stored in
 /// [`Endpoint::withdrawals`] keyed by [`ServiceHandle`].  The `I` type
 /// parameter is the [`Instant`] type of the enclosing endpoint.
@@ -64,21 +92,43 @@ struct Withdrawal<I> {
   // Read by `poll_withdrawal_transmit` (Task 3).
   #[allow(dead_code)]
   snapshot: crate::service::WithdrawalSnapshot,
-  /// Number of goodbye sends still to perform.  Decremented only when a
-  /// send is confirmed delivered (Task 4).
-  // Read and decremented by `note_withdrawal_result` (Task 4).
+  /// PER-FAMILY goodbye-send debt: `owed[0]` for IPv4, `owed[1]` for IPv6,
+  /// each initialised to `WITHDRAWAL_SENDS`.  A family's counter is
+  /// decremented only when THAT family confirms a send ([`WithdrawalSend::Sent`])
+  /// and zeroed when it is permanently written off ([`WithdrawalSend::WriteOff`]).
+  /// The withdrawal is complete once `owed == [0, 0]` (every reachable family
+  /// withdrew its records), so a family that is busy/down does not let the route
+  /// free while another family still owes peers a TTL=0 goodbye — capped by
+  /// `ceiling_at`.  A nothing-to-withdraw snapshot starts at `[0, 0]`.
+  // Read and mutated by `note_withdrawal_result` (Task 4).
   #[allow(dead_code)]
-  remaining: u8,
+  owed: [u8; 2],
   /// When the next send is due.  Set to `now` at construction so the first
   /// send fires immediately.
   // Read by `poll_withdrawal_transmit` (Task 3).
   #[allow(dead_code)]
   next_at: I,
   /// Hard force-complete deadline.  The withdrawal is terminated at or after
-  /// this instant regardless of `remaining` (anti-pin guard, Task 5).
+  /// this instant regardless of `owed` (anti-pin guard, Task 5).
   // Read by `drain_completed_withdrawals` (Task 5).
   #[allow(dead_code)]
   ceiling_at: I,
+  /// `true` once a FINAL goodbye has been emitted AT/just-before the ceiling for
+  /// a still-owed withdrawal.  Without this, a family that becomes
+  /// reachable only in the `[last_attempt, ceiling]` window — because the last
+  /// backoff overshot `ceiling_at` — would never get a try: `poll_withdrawal_transmit`
+  /// only emits while `now < ceiling_at`, so the route would be force-completed
+  /// with debt still owed.  When a withdrawal is past its ceiling but still owes
+  /// AND has not yet been final-attempted, `poll_withdrawal_transmit` emits ONE
+  /// last goodbye and sets this flag; `drain_completed_withdrawals` then
+  /// force-completes a past-ceiling withdrawal only once this is set (or its
+  /// `owed` already reached `[0, 0]`).  The flag also guarantees termination:
+  /// the past-ceiling branch fires at most once per withdrawal, so the pump loop
+  /// can never re-select the same withdrawal for another final attempt.
+  // Read/written by `poll_withdrawal_transmit`; read by
+  // `drain_completed_withdrawals`.
+  #[allow(dead_code)]
+  final_attempt: bool,
 }
 
 /// Routing metadata for a registered service.
@@ -112,6 +162,20 @@ pub struct ServiceRoute {
   /// question for any of these routes to this service so it can answer with the
   /// shared subtype PTR.
   subtypes: std::vec::Vec<Name>,
+  /// IPv4 host addresses this service has actually CONFIRMED-ADVERTISED on the
+  /// wire — the subset of `a_addrs` a peer truly holds in its cache.  EMPTY at
+  /// registration (a never-announced service has advertised nothing); the
+  /// driver mirrors the live `Service::advertised_a_addrs` set here via
+  /// [`Endpoint::note_service_advertised`] after each confirmed announce.  This
+  /// (NOT the configured `a_addrs`) is what `sibling_retained_addrs` honours so
+  /// a withdrawing service only retains addresses a LIVE same-host sibling
+  /// genuinely owns in peer caches.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  advertised_a: std::vec::Vec<Ipv4Addr>,
+  /// IPv6 host addresses this service has actually CONFIRMED-ADVERTISED.  See
+  /// `advertised_a`; this is the AAAA counterpart, also EMPTY at registration.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  advertised_aaaa: std::vec::Vec<Ipv6Addr>,
   /// `true` once [`Endpoint::begin_withdrawal`] has been called for this
   /// service.  The route is kept alive (name guard + dispatch) until the
   /// goodbye sequence completes; this flag lets downstream code distinguish a
@@ -165,6 +229,25 @@ impl ServiceRoute {
   #[inline(always)]
   pub fn aaaa_scopes(&self) -> &[u32] {
     &self.aaaa_scopes
+  }
+
+  /// IPv4 host addresses this service has CONFIRMED-ADVERTISED on the wire.
+  /// Distinct from [`Self::a_addrs`] (the configured set used for self-/
+  /// loopback detection): this is the subset peers actually hold in cache, kept
+  /// current by [`Endpoint::note_service_advertised`] and consumed by
+  /// sibling host-address retention during withdrawal.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  #[inline(always)]
+  pub(crate) fn advertised_a(&self) -> &[Ipv4Addr] {
+    &self.advertised_a
+  }
+
+  /// IPv6 host addresses this service has CONFIRMED-ADVERTISED on the wire (the
+  /// AAAA counterpart of [`Self::advertised_a`]).
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  #[inline(always)]
+  pub(crate) fn advertised_aaaa(&self) -> &[Ipv6Addr] {
+    &self.advertised_aaaa
   }
 }
 
@@ -324,6 +407,13 @@ where
         aaaa_addrs: spec.records().aaaa_addrs_slice().to_vec(),
         aaaa_scopes: spec.records().aaaa_scopes_slice().to_vec(),
         subtypes: spec.records().subtype_names().to_vec(),
+        // EMPTY at registration: a service has CONFIRMED-ADVERTISED nothing
+        // until its first announce is delivered (then mirrored in here via
+        // `note_service_advertised`).
+        #[cfg(any(feature = "alloc", feature = "std"))]
+        advertised_a: std::vec::Vec::new(),
+        #[cfg(any(feature = "alloc", feature = "std"))]
+        advertised_aaaa: std::vec::Vec::new(),
         withdrawing: false,
       })
       .map_err(|_| RegisterServiceError::StorageFull(StorageFullError))?;
@@ -358,18 +448,40 @@ where
     Ok((handle, svc))
   }
 
-  /// Remove the registered service for `handle`.
+  /// **Force-remove** the registered service for `handle` IMMEDIATELY, with NO
+  /// RFC 6762 §10.1 goodbye.
   ///
-  /// callers MUST invoke this when dropping the corresponding
-  /// `Service` state machine so the routing table releases the slot. Otherwise
-  /// re-registering the same instance name is rejected by
-  /// [`Self::try_register_service`] as
-  /// [`RegisterServiceError::NameAlreadyRegistered`], and inbound packets
-  /// matching the stale route continue to be classified as `ToService`
-  /// events targeting a handle the driver no longer tracks.
+  /// This drops the route and decrements `services_active` at once: it does NOT
+  /// send a TTL=0 goodbye, so peers keep the service in their caches until the
+  /// records' own TTLs expire, AND the instance name is released for re-use the
+  /// moment this returns. It is intended ONLY for forced / non-graceful removal
+  /// (e.g. an abort path, or after a confirmed goodbye has already drained).
+  ///
+  /// # Prefer the graceful withdrawal lifecycle
+  ///
+  /// For normal teardown use the withdrawal lifecycle, which announces a §10.1
+  /// goodbye AND holds the name until that goodbye is confirmed-sent — closing
+  /// the same-name-reuse race this primitive deliberately does not guard:
+  ///
+  /// 1. [`Service::withdrawal_snapshot`](crate::service::Service::withdrawal_snapshot)
+  ///    — capture the goodbye-owned records.
+  /// 2. [`Self::begin_withdrawal`] — mark the route withdrawing and queue the
+  ///    goodbye schedule (the route, and thus the name guard, is KEPT).
+  /// 3. Pump [`Self::poll_withdrawal_transmit`] / confirm each round via
+  ///    [`Self::note_withdrawal_result`] until the budget is spent.
+  /// 4. [`Self::drain_completed_withdrawals`] — frees the route (releasing the
+  ///    name and decrementing `services_active`) only AFTER the goodbye is
+  ///    confirmed-sent, and returns the handle for driver-side GC.
+  ///
+  /// The drivers retire services via that lifecycle, NOT this method.
+  ///
+  /// # Behaviour
   ///
   /// Returns `true` if a route was found and removed, `false` if the handle
-  /// was already unknown (idempotent).
+  /// was already unknown (idempotent). When this returns, re-registering the
+  /// same instance name via [`Self::try_register_service`] succeeds immediately
+  /// (no [`RegisterServiceError::NameAlreadyRegistered`] guard remains), and
+  /// inbound packets no longer match the removed route.
   pub fn unregister_service(&mut self, handle: ServiceHandle) -> bool {
     let key = self
       .services
@@ -436,15 +548,16 @@ where
     route.withdrawing = true;
 
     // A service with NOTHING to withdraw (never announced — empty owned set and
-    // no advertised host addresses) completes immediately: `remaining = 0` makes
+    // no advertised host addresses) completes immediately: `owed = [0, 0]` makes
     // the next `drain_completed_withdrawals` free the name at once, with no
-    // spurious goodbye and no 2 s ceiling wait.
+    // spurious goodbye and no 2 s ceiling wait.  Otherwise every family starts
+    // owing the full WITHDRAWAL_SENDS budget (per-family debt, F2).
     let nothing_to_withdraw =
       snapshot.owned.is_empty() && snapshot.host_a.is_empty() && snapshot.host_aaaa.is_empty();
-    let remaining = if nothing_to_withdraw {
-      0
+    let owed = if nothing_to_withdraw {
+      [0, 0]
     } else {
-      WITHDRAWAL_SENDS
+      [WITHDRAWAL_SENDS, WITHDRAWAL_SENDS]
     };
 
     // next_at = now (first send fires immediately); ceiling_at = now +
@@ -454,9 +567,10 @@ where
       handle,
       Withdrawal {
         snapshot,
-        remaining,
+        owed,
         next_at: now,
         ceiling_at,
+        final_attempt: false,
       },
     ));
     crate::trace::debug!(
@@ -475,73 +589,242 @@ where
   /// recomputed FRESH each call from the route table, so siblings joining or
   /// leaving during the multi-round window are always honoured.
   ///
-  /// Returns `(multicast dst, datagram length, the withdrawing handle)`, or
-  /// `None` when no withdrawal is due or nothing remains withdrawable this round.
+  /// # Retained-only / empty withdrawals do not head-of-line block
+  ///
+  /// A due withdrawal can have NOTHING left to put on the wire — it owns no
+  /// instance records and every host address it advertised is still retained by
+  /// a LIVE same-host sibling.  Such a withdrawal is COMPLETED in place
+  /// (`owed = [0, 0]`, freed by the next [`Self::drain_completed_withdrawals`])
+  /// and the scan CONTINUES to the next due withdrawal, rather than returning
+  /// `None`.  Completing it at once is correct: a live sibling legitimately
+  /// still advertises those addresses, and when that sibling later leaves ITS
+  /// own withdrawal withdraws them.  Returning `None` here would (a) leave the
+  /// withdrawal due forever — re-waking `poll_timeout` until its 2 s ceiling —
+  /// and (b) stop the driver's `while let Some(..)` pump loop, starving any
+  /// later same-time withdrawal that genuinely needs a TTL=0 goodbye.
+  ///
+  /// # An encode failure ADVANCES the withdrawal rather than blocking
+  ///
+  /// If the goodbye encoder returns an error for the chosen withdrawal (e.g. its
+  /// goodbye does not fit `scratch`), this does NOT return
+  /// `None` — that would leave the failing withdrawal first-due at this `now`
+  /// and stop the driver pump loop before later due withdrawals are reached.
+  /// Instead the failing withdrawal's `next_at` is pushed past `now`
+  /// (`now + WITHDRAWAL_RETRY_BACKOFF`, its `owed` budget intact) and the scan
+  /// CONTINUES, so a sibling that genuinely has an emittable goodbye is still
+  /// served this pass.  The 2 s ceiling remains the backstop for a withdrawal
+  /// whose goodbye can never be encoded.  The loop still terminates: every
+  /// iteration either returns a datagram, completes a withdrawal, or pushes one
+  /// past `now`.
+  ///
+  /// Returns `(multicast dst, datagram length, the withdrawing handle)` for the
+  /// first due withdrawal that actually has records to emit, or `None` when no
+  /// due withdrawal has anything to send (the empty/retained-only ones having
+  /// been marked complete; the encode-failing ones having been pushed past
+  /// `now`).
   #[cfg(any(feature = "alloc", feature = "std"))]
   pub fn poll_withdrawal_transmit(
     &mut self,
     now: I,
     scratch: &mut [u8],
   ) -> Option<(SocketAddr, usize, ServiceHandle)> {
-    // A withdrawal is due when it still owes a round, its `next_at` has arrived,
-    // and it has not passed its anti-pin ceiling (a past-ceiling withdrawal is
-    // left for `drain_completed_withdrawals` to force-finish, not pumped).
-    let handle = self.withdrawals.iter().find_map(|(h, w)| {
-      (w.remaining > 0 && w.next_at <= now && now < w.ceiling_at).then_some(*h)
-    })?;
+    loop {
+      // A withdrawal is selectable when at least one family still owes a round
+      // (`owed != [0, 0]`) AND either:
+      //   * it is DUE within the normal window — `next_at <= now < ceiling_at`; or
+      //   * it is PAST the ceiling but has not yet had its one FINAL ceiling
+      //     attempt (`now >= ceiling_at && !final_attempt`).  This is the
+      //     guarantee: if the last backoff overshot `ceiling_at`, the still-owed
+      //     family would otherwise never be tried in the `[last_attempt, ceiling]`
+      //     window and the route would be force-freed with debt owed.  The
+      //     `!final_attempt` guard makes this branch fire AT MOST ONCE per
+      //     withdrawal, so the loop always terminates (drain then force-completes
+      //     it).  A withdrawal marked complete below (`owed == [0, 0]`) no longer
+      //     matches, so the scan advances past it on the next turn.
+      let (idx, handle, is_final) =
+        self
+          .withdrawals
+          .iter()
+          .enumerate()
+          .find_map(|(i, (h, w))| {
+            if w.owed == [0, 0] {
+              return None;
+            }
+            if w.next_at <= now && now < w.ceiling_at {
+              Some((i, *h, false))
+            } else if now >= w.ceiling_at && !w.final_attempt {
+              Some((i, *h, true))
+            } else {
+              None
+            }
+          })?;
 
-    // Sibling-retained host addresses, recomputed each round into an owned Vec
-    // (releasing the `self.services` borrow before we read the snapshot + write
-    // `scratch`).  An address some OTHER same-host route still advertises must
-    // NOT be withdrawn.
-    let retained = self.sibling_retained_addrs(handle);
+      // Sibling-retained host addresses, recomputed each round into an owned Vec
+      // (releasing the `self.services` borrow before we read the snapshot +
+      // write `scratch`).  An address some OTHER same-host route still
+      // advertises must NOT be withdrawn.
+      let retained = self.sibling_retained_addrs(handle);
 
-    let (_, w) = self.withdrawals.iter().find(|(h, _)| *h == handle)?;
-    let owned = &w.snapshot.owned;
+      // Decide whether this withdrawal has anything to emit under a SCOPED
+      // borrow, dropped before any mutation of `owed`. (`.get(idx)` cannot
+      // be `None` — `idx` came from the scan above — but it sidesteps the
+      // `indexing_slicing` lint with no panic path.)
+      let (_, w) = self.withdrawals.get(idx)?;
+      let owned = &w.snapshot.owned;
+      // The in-flight rename (OLD instance name A) also contributes records to
+      // withdraw — a teardown during the rename window must retract BOTH the
+      // current name's records AND A's old instance records.
+      let rename_has_something = w
+        .snapshot
+        .rename
+        .as_ref()
+        .is_some_and(|(_, old_owned)| !old_owned.is_empty());
+      let has_something = owned.ptr()
+        || owned.srv()
+        || owned.txt()
+        || owned.subtypes()
+        || rename_has_something
+        || w
+          .snapshot
+          .host_a
+          .iter()
+          .any(|ip| !retained.contains(&core::net::IpAddr::V4(*ip)))
+        || w
+          .snapshot
+          .host_aaaa
+          .iter()
+          .any(|ip| !retained.contains(&core::net::IpAddr::V6(*ip)));
 
-    // Nothing left to withdraw (no owned instance records and every advertised
-    // host address still retained by a sibling) → emit no datagram this round.
-    let any_a = w
-      .snapshot
-      .host_a
-      .iter()
-      .any(|ip| !retained.contains(&core::net::IpAddr::V4(*ip)));
-    let any_aaaa = w
-      .snapshot
-      .host_aaaa
-      .iter()
-      .any(|ip| !retained.contains(&core::net::IpAddr::V6(*ip)));
-    if !owned.ptr() && !owned.srv() && !owned.txt() && !owned.subtypes() && !any_a && !any_aaaa {
-      return None;
+      // Nothing left to withdraw (no owned instance records, no in-flight rename
+      // records, and every advertised host address still retained by a sibling)
+      // → COMPLETE it now and keep scanning for a withdrawal that genuinely has
+      // records to emit.  (A final-ceiling selection with nothing to emit is also
+      // completed here — zeroing `owed` makes drain free it; no need to set
+      // `final_attempt` since `owed == [0, 0]` already short-circuits the scan.)
+      if !has_something {
+        if let Some((_, w)) = self.withdrawals.get_mut(idx) {
+          w.owed = [0, 0];
+        }
+        continue;
+      }
+
+      // Encode the goodbye (`w` re-borrowed from the same valid `idx`): the
+      // current instance + sibling-filtered host addrs, AND — when a rename is in
+      // flight — the OLD instance name's TTL=0 records appended into the SAME
+      // datagram.
+      let encoded = crate::service::write_goodbye_with_rename(
+        &w.snapshot.records,
+        scratch,
+        owned.ptr(),
+        owned.srv(),
+        owned.txt(),
+        owned.subtypes(),
+        w.snapshot
+          .host_a
+          .iter()
+          .copied()
+          .filter(|ip| !retained.contains(&core::net::IpAddr::V4(*ip))),
+        w.snapshot
+          .host_aaaa
+          .iter()
+          .copied()
+          .filter(|ip| !retained.contains(&core::net::IpAddr::V6(*ip))),
+        w.snapshot
+          .rename
+          .as_ref()
+          .map(|(old_records, old_owned)| (old_records, old_owned)),
+      );
+      match encoded {
+        Ok(len) => {
+          // A final-ceiling attempt: mark it so the past-ceiling scan
+          // branch never re-selects this withdrawal — the next
+          // `drain_completed_withdrawals` force-completes it.  A normal in-window
+          // send leaves the flag clear; `note_withdrawal_result` advances `next_at`.
+          if is_final && let Some((_, w)) = self.withdrawals.get_mut(idx) {
+            w.final_attempt = true;
+          }
+          return Some((crate::service::multicast_dst(), len, handle));
+        }
+        // Encode failure: do NOT return None — that would head-of-line block
+        // the pump on this withdrawal at `now`. Push it past `now` (budget intact)
+        // so it is no longer first-due, then keep scanning later due withdrawals.
+        // The 2 s ceiling still backstops a permanently-unencodable goodbye.
+        Err(_) => {
+          if let Some((_, w)) = self.withdrawals.get_mut(idx) {
+            if is_final {
+              // This WAS the final-ceiling attempt and it could not be encoded:
+              // burn it so the past-ceiling scan branch cannot re-select this
+              // withdrawal forever (its goodbye is unencodable). The next
+              // `drain_completed_withdrawals` force-completes it — benign, as a
+              // permanently-unencodable goodbye is abandoned anyway.
+              w.final_attempt = true;
+            } else {
+              let next = now.checked_add_duration(WITHDRAWAL_RETRY_BACKOFF);
+              match next {
+                // Advanced strictly past `now`: the due scan won't re-select it this
+                // call, so the loop makes progress.
+                Some(t) if t > now => w.next_at = t,
+                // The Instant saturated (backoff cannot advance past `now`): zero the
+                // debt so it can never be re-selected as due — otherwise this same
+                // withdrawal would be re-chosen and re-fail forever. Abandoning a
+                // goodbye we can neither encode nor reschedule is benign (the ceiling
+                // would force-complete it anyway).
+                _ => w.owed = [0, 0],
+              }
+            }
+          }
+          continue;
+        }
+      }
     }
-
-    let len = crate::service::write_goodbye(
-      &w.snapshot.records,
-      scratch,
-      owned.ptr(),
-      owned.srv(),
-      owned.txt(),
-      owned.subtypes(),
-      w.snapshot
-        .host_a
-        .iter()
-        .copied()
-        .filter(|ip| !retained.contains(&core::net::IpAddr::V4(*ip))),
-      w.snapshot
-        .host_aaaa
-        .iter()
-        .copied()
-        .filter(|ip| !retained.contains(&core::net::IpAddr::V6(*ip))),
-    )
-    .ok()?;
-    Some((crate::service::multicast_dst(), len, handle))
   }
 
-  /// Host addresses that a same-host SIBLING route (any route other than
-  /// `handle`'s) still advertises — these must be RETAINED (not withdrawn) by
-  /// `handle`'s goodbye, since another live service still owns them.  This is the
-  /// per-driver `retained_host_addrs` scan, centralised here where the endpoint
-  /// holds every route's advertised addresses.
+  /// Record the host addresses a service has CONFIRMED-ADVERTISED on the wire,
+  /// overwriting the route's advertised set.  The driver calls this after a
+  /// confirmed-delivered service announce with the Service's current
+  /// [`Service::advertised_a_addrs`]/[`Service::advertised_aaaa_addrs`] sets
+  /// (the confirmed-emitted / goodbye-owned host addresses).
+  ///
+  /// This is the set sibling host-address retention consults to decide which
+  /// host addresses a withdrawing same-host sibling must RETAIN — distinct from
+  /// the configured [`ServiceRoute::a_addrs`] captured at registration (which a
+  /// never-announced service has, despite having advertised nothing).
+  ///
+  /// Idempotent overwrite (the advertised set only grows as the service
+  /// announces), and a no-op for an unknown handle.
+  ///
+  /// [`Service::advertised_a_addrs`]: crate::service::Service::advertised_a_addrs
+  /// [`Service::advertised_aaaa_addrs`]: crate::service::Service::advertised_aaaa_addrs
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  pub fn note_service_advertised(
+    &mut self,
+    handle: ServiceHandle,
+    a: &[Ipv4Addr],
+    aaaa: &[Ipv6Addr],
+  ) {
+    let Some((_, route)) = self.services.iter_mut().find(|(_, r)| r.handle() == handle) else {
+      return;
+    };
+    route.advertised_a.clear();
+    route.advertised_a.extend_from_slice(a);
+    route.advertised_aaaa.clear();
+    route.advertised_aaaa.extend_from_slice(aaaa);
+  }
+
+  /// Host addresses that a LIVE same-host SIBLING route (any non-withdrawing
+  /// route other than `handle`'s) still ADVERTISES — these must be RETAINED (not
+  /// withdrawn) by `handle`'s goodbye, since another live service still owns
+  /// them in peer caches.  This is the per-driver `retained_host_addrs` scan,
+  /// centralised here where the endpoint holds every route's advertised set.
+  ///
+  /// Two exclusions matter for correctness:
+  ///   * `route.withdrawing` siblings are SKIPPED — a sibling that is itself
+  ///     leaving owns nothing to retain (e.g. a simultaneous same-host shutdown:
+  ///     neither service must pin the shared address for the other).
+  ///   * the CONFIRMED-ADVERTISED set (`advertised_a`/`advertised_aaaa`) is used,
+  ///     NOT the configured `a_addrs`/`aaaa_addrs` — a registered-but-never-
+  ///     announced sibling has configured addresses but advertised none, so it
+  ///     retains nothing.
   #[cfg(any(feature = "alloc", feature = "std"))]
   fn sibling_retained_addrs(&self, handle: ServiceHandle) -> std::vec::Vec<core::net::IpAddr> {
     let Some(host) = self
@@ -553,11 +836,17 @@ where
     };
     let mut retained = std::vec::Vec::new();
     for (_, route) in self.services.iter() {
-      if route.handle() != handle && route.host() == &host {
-        retained.extend(route.a_addrs().iter().copied().map(core::net::IpAddr::V4));
+      if route.handle() != handle && !route.withdrawing && route.host() == &host {
         retained.extend(
           route
-            .aaaa_addrs()
+            .advertised_a()
+            .iter()
+            .copied()
+            .map(core::net::IpAddr::V4),
+        );
+        retained.extend(
+          route
+            .advertised_aaaa()
             .iter()
             .copied()
             .map(core::net::IpAddr::V6),
@@ -568,40 +857,119 @@ where
   }
 
   /// Confirm the datagram most recently produced by
-  /// [`Self::poll_withdrawal_transmit`] for `handle`.  `delivered` is `true` when
-  /// at least one socket send succeeded: a delivered round spends one resend and
-  /// re-arms at the full `WITHDRAWAL_INTERVAL`; a fully-failed round re-arms at
-  /// the short `WITHDRAWAL_RETRY_BACKOFF` WITHOUT spending — so a transiently
-  /// undeliverable goodbye keeps its budget and retries soon rather than being
-  /// delayed a full interval. Completion (budget spent or ceiling reached) is
-  /// observed via `drain_completed_withdrawals` (added in the next task).
+  /// [`Self::poll_withdrawal_transmit`] for `handle`, reporting the outcome for
+  /// EACH address family ([`WithdrawalSend`] for `v4` and `v6`) so withdrawal
+  /// debt is tracked PER FAMILY.
+  ///
+  /// Per family `f`:
+  ///   * [`WithdrawalSend::Sent`] — the goodbye reached that family's wire, so
+  ///     spend one of its owed rounds (`owed[f] = owed[f].saturating_sub(1)`).
+  ///   * [`WithdrawalSend::Retry`] — transiently undeliverable (socket busy):
+  ///     keep that family's debt for a later retry.
+  ///   * [`WithdrawalSend::WriteOff`] — that family is permanently unavailable
+  ///     (no socket / permanent send error): zero its debt (`owed[f] = 0`), since
+  ///     it has no reachable peers to withdraw from.
+  ///
+  /// `next_at` re-arms at the full `WITHDRAWAL_INTERVAL` when a family made REAL
+  /// progress this round — a `Sent` for a family that still OWED a goodbye
+  /// (`owed[f] > 0` before this round). A `Sent` for an already-paid family
+  /// (`owed[f] == 0`) is a redundant fan-out and is NOT progress: otherwise a
+  /// paid v4 echoing `Sent` every round would keep re-arming at the full interval
+  /// and starve a still-busy v6 of its short-backoff retry (risking a missed
+  /// last-interval v6 recovery before the ceiling).  When no family made real
+  /// progress (both `Retry`, or `Retry`+`WriteOff`, or only an already-paid family
+  /// `Sent` while the other is busy) it re-arms at the short
+  /// `WITHDRAWAL_RETRY_BACKOFF` so the still-owed family is retried soon rather
+  /// than delayed a full interval.  Completion (every family's debt cleared, or the
+  /// ceiling) is observed via `drain_completed_withdrawals`.
+  ///
+  /// A withdrawal therefore frees its route only once EVERY reachable family has
+  /// withdrawn its records: v4-success while v6 stays busy does NOT complete it,
+  /// so if v6 recovers before the 2 s ceiling its peers still receive the TTL=0
+  /// goodbye.
   ///
   /// No-op for an unknown handle.
   #[cfg(any(feature = "alloc", feature = "std"))]
-  pub fn note_withdrawal_result(&mut self, handle: ServiceHandle, now: I, delivered: bool) {
+  pub fn note_withdrawal_result(
+    &mut self,
+    handle: ServiceHandle,
+    now: I,
+    v4: WithdrawalSend,
+    v6: WithdrawalSend,
+  ) {
     let Some((_, w)) = self.withdrawals.iter_mut().find(|(h, _)| *h == handle) else {
       return;
     };
-    if delivered {
-      w.remaining = w.remaining.saturating_sub(1);
-      w.next_at = now.checked_add_duration(WITHDRAWAL_INTERVAL).unwrap_or(now);
-    } else {
-      w.next_at = now
-        .checked_add_duration(WITHDRAWAL_RETRY_BACKOFF)
-        .unwrap_or(now);
+    let mut progressed = false;
+    // Zip each family's debt counter (by mutable reference) with its outcome to
+    // avoid dynamic indexing (clippy::indexing_slicing) into `owed`.
+    //
+    // A `Sent` counts as progress ONLY when that family still OWED a goodbye
+    // before this round (`*debt > 0`). Drivers fan every round's datagram to BOTH
+    // families, so a family whose debt is already 0 keeps reporting `Sent`; if that
+    // redundant send counted as progress it would re-arm at the FULL interval and
+    // starve a still-busy family of its short-backoff retry, risking a missed
+    // last-interval recovery before the ceiling. So a `Sent` on an already-paid
+    // family changes nothing — neither the debt nor the schedule.
+    for (debt, outcome) in w.owed.iter_mut().zip([v4, v6]) {
+      match outcome {
+        WithdrawalSend::Sent if *debt > 0 => {
+          // `*debt > 0` here, so this is `-= 1`; `saturating_sub` keeps it free of
+          // `clippy::arithmetic_side_effects` (denied workspace-wide).
+          *debt = debt.saturating_sub(1);
+          progressed = true;
+        }
+        // Redundant send on an already-paid family (`*debt == 0`): no progress.
+        WithdrawalSend::Sent => {}
+        WithdrawalSend::Retry => {}
+        WithdrawalSend::WriteOff => *debt = 0,
+      }
     }
+    // Progress (>= 1 family sent) → full interval; otherwise the short backoff so
+    // a transiently-busy family is retried soon. A pure write-off round (no Sent)
+    // also takes the short backoff, but its `owed` is already cleared so it will
+    // not be re-selected as due unless the OTHER family still owes.
+    //
+    // CLAMP the re-arm to `ceiling_at`: a backoff that overshot the
+    // ceiling would skip the `[last_attempt, ceiling]` window entirely, so a
+    // family recovering in that window would never be retried in the normal due
+    // window — the route would be force-freed with debt owed. Clamping keeps the
+    // last scheduled attempt at the ceiling, where `poll_withdrawal_transmit`'s
+    // past-ceiling branch then emits exactly one final goodbye.
+    let gap = if progressed {
+      WITHDRAWAL_INTERVAL
+    } else {
+      WITHDRAWAL_RETRY_BACKOFF
+    };
+    w.next_at = now
+      .checked_add_duration(gap)
+      .unwrap_or(now)
+      .min(w.ceiling_at);
   }
 
-  /// Remove every withdrawal that has COMPLETED — its resend budget is spent
-  /// (`remaining == 0`) OR it has passed its anti-pin ceiling (`now >=
-  /// ceiling_at`). For each completed withdrawal the route is freed (releasing
-  /// the name for re-registration and decrementing `services_active`), and its
-  /// handle is pushed into `out` so the driver can GC its driver-side slot. Call
-  /// once per pump, after draining withdrawal transmits.
+  /// Remove every withdrawal that has COMPLETED — either every family's resend
+  /// budget is spent or written off (`owed == [0, 0]`), OR it has passed its
+  /// anti-pin ceiling (`now >= ceiling_at`) AND its one final ceiling attempt has
+  /// been made (`final_attempt`). For each completed withdrawal the route is freed
+  /// (releasing the name for re-registration and decrementing `services_active`),
+  /// and its handle is pushed into `out` so the driver can GC its driver-side
+  /// slot. Call once per pump, after draining withdrawal transmits.
   ///
   /// The ceiling guarantees that a withdrawal whose families are permanently
   /// unreachable still releases the name — a down family has no reachable peers
   /// to evict, so force-completing it is benign.
+  ///
+  /// The `final_attempt` conjunct gives an owed family ONE last
+  /// goodbye AT the ceiling before the route is freed: a withdrawal that is past
+  /// `ceiling_at` but still owes a family AND has not yet been final-attempted is
+  /// NOT completed here — it is left for the very next `poll_withdrawal_transmit`,
+  /// whose past-ceiling branch emits that final goodbye and sets `final_attempt`,
+  /// after which this method frees it. The drivers always pump
+  /// `poll_withdrawal_transmit` (then `note_withdrawal_result`) before this call,
+  /// so the final attempt and the free happen within the same pump cycle. An
+  /// unencodable / nothing-to-emit goodbye sets `final_attempt` (or zeroes `owed`)
+  /// in `poll_withdrawal_transmit` too, so a route can never be pinned past the
+  /// ceiling waiting for a final attempt that can't be made.
   #[cfg(any(feature = "alloc", feature = "std"))]
   pub fn drain_completed_withdrawals<E: Extend<ServiceHandle>>(&mut self, now: I, out: &mut E) {
     // Collect completed handles first so the route/withdrawal removals below do
@@ -609,7 +977,7 @@ where
     let completed: std::vec::Vec<ServiceHandle> = self
       .withdrawals
       .iter()
-      .filter(|(_, w)| w.remaining == 0 || now >= w.ceiling_at)
+      .filter(|(_, w)| w.owed == [0, 0] || (now >= w.ceiling_at && w.final_attempt))
       .map(|(h, _)| *h)
       .collect();
     for handle in completed {
@@ -633,14 +1001,15 @@ where
     }
   }
 
-  /// Test-only: the remaining resend budget for a withdrawing handle.
+  /// Test-only: the PER-FAMILY resend budget (`[v4, v6]`) for a withdrawing
+  /// handle.
   #[cfg(all(test, any(feature = "alloc", feature = "std")))]
-  fn withdrawal_remaining(&self, handle: ServiceHandle) -> Option<u8> {
+  fn withdrawal_owed(&self, handle: ServiceHandle) -> Option<[u8; 2]> {
     self
       .withdrawals
       .iter()
       .find(|(h, _)| *h == handle)
-      .map(|(_, w)| w.remaining)
+      .map(|(_, w)| w.owed)
   }
 
   /// Test-only: the next scheduled send time for a withdrawing handle.
@@ -5310,9 +5679,9 @@ mod tests {
   }
 
   /// `poll_withdrawal_transmit` encodes the snapshot's TTL=0 goodbye and RETAINS
-  /// a host address that a same-host sibling still advertises, while withdrawing
-  /// the withdrawing service's unique address (Task 3 — sibling retention is
-  /// computed fresh from the route table).
+  /// a host address that a live same-host sibling still ADVERTISES, while
+  /// withdrawing the withdrawing service's unique address (sibling retention is
+  /// computed fresh from the route table's CONFIRMED-ADVERTISED set).
   #[test]
   fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
     let mut ep = build_endpoint();
@@ -5351,12 +5720,16 @@ mod tests {
       120,
     );
     recs_b.add_a(shared);
-    let (_b_handle, _svc_b) = ep
+    let (b_handle, _svc_b) = ep
       .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
         ServiceSpec::new(recs_b),
         now,
       )
       .unwrap();
+    // B has CONFIRMED-ADVERTISED the shared address (its announce was delivered),
+    // so the route's advertised set is non-empty — otherwise retention would
+    // honour nothing and A would (wrongly) withdraw the shared address.
+    ep.note_service_advertised(b_handle, &[shared], &[]);
 
     // A's withdrawal snapshot: owns PTR/SRV/TXT, the subtype PTR, and both host
     // A addresses.
@@ -5372,6 +5745,7 @@ mod tests {
       ),
       host_a: std::vec![shared, unique],
       host_aaaa: std::vec::Vec::new(),
+      rename: None,
     };
     ep.begin_withdrawal(a_handle, snap, now);
 
@@ -5420,9 +5794,249 @@ mod tests {
     );
   }
 
-  /// `note_withdrawal_result` spends a resend round only on a delivered send; a
-  /// fully-failed round re-arms at the short backoff WITHOUT spending the budget
-  /// (Task 4).
+  /// Helper: register a same-host service advertising the given A addresses and
+  /// (optionally) mirror an advertised set into its route, returning its handle.
+  /// `advertised == None` models a registered-but-never-announced sibling (its
+  /// route advertised set stays EMPTY); `Some(addrs)` mirrors a confirmed
+  /// announce via `note_service_advertised`.
+  fn register_host_service(
+    ep: &mut TestEndp,
+    instance: &str,
+    host: &Name,
+    configured_a: &[Ipv4Addr],
+    advertised: Option<&[Ipv4Addr]>,
+  ) -> ServiceHandle {
+    let mut recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str(instance).unwrap(),
+      host.clone(),
+      631,
+      120,
+    );
+    for a in configured_a {
+      recs.add_a(*a);
+    }
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        StdInstant::now(),
+      )
+      .unwrap();
+    if let Some(adv) = advertised {
+      ep.note_service_advertised(h, adv, &[]);
+    }
+    h
+  }
+
+  /// Collect the A addresses a withdrawal datagram WITHDRAWS (TTL 0) for the
+  /// next due round of `handle`.
+  fn poll_withdrawn_v4(
+    ep: &mut TestEndp,
+    now: StdInstant,
+  ) -> (std::vec::Vec<Ipv4Addr>, ServiceHandle) {
+    let mut buf = std::vec![0u8; 4096];
+    let (_dst, len, got) = ep
+      .poll_withdrawal_transmit(now, &mut buf)
+      .expect("a due withdrawal must produce a datagram");
+    let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
+    let mut withdrawn = std::vec::Vec::new();
+    for rec in reader.answers() {
+      let rec = rec.unwrap();
+      if rec.rtype() == crate::wire::ResourceType::A {
+        let d = rec.rdata();
+        withdrawn.push(Ipv4Addr::new(d[0], d[1], d[2], d[3]));
+      }
+    }
+    (withdrawn, got)
+  }
+
+  /// Build a withdrawal snapshot owning PTR/SRV/TXT plus the given host A set.
+  fn host_a_snapshot(
+    host: &Name,
+    instance: &str,
+    host_a: &[Ipv4Addr],
+  ) -> crate::service::WithdrawalSnapshot {
+    let mut recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str(instance).unwrap(),
+      host.clone(),
+      631,
+      120,
+    );
+    for a in host_a {
+      recs.add_a(*a);
+    }
+    crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: host_a.to_vec(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    }
+  }
+
+  /// Regression: a withdrawing service MUST withdraw a host
+  /// address when the only same-host sibling holding it CONFIGURED but NEVER
+  /// ADVERTISED it. The old scan keyed on configured `a_addrs`, so the real
+  /// owner wrongly RETAINED the address and left stale records in peer caches.
+  #[test]
+  fn withdrawal_withdraws_addr_when_sibling_never_advertised() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let shared = Ipv4Addr::new(192, 168, 1, 5);
+    let unique = Ipv4Addr::new(192, 168, 1, 6);
+
+    // A advertises BOTH .5 and .6 (confirmed announce mirrored in).
+    let a = register_host_service(
+      &mut ep,
+      "A._ipp._tcp.local.",
+      &host,
+      &[shared, unique],
+      Some(&[shared, unique]),
+    );
+    // B is CONFIGURED with .5 but NEVER announced — its advertised set is EMPTY.
+    let _b = register_host_service(&mut ep, "B._ipp._tcp.local.", &host, &[shared], None);
+
+    ep.begin_withdrawal(
+      a,
+      host_a_snapshot(&host, "A._ipp._tcp.local.", &[shared, unique]),
+      now,
+    );
+
+    let (withdrawn, got) = poll_withdrawn_v4(&mut ep, now);
+    assert_eq!(got, a);
+    assert!(
+      withdrawn.contains(&shared),
+      "shared addr must be WITHDRAWN: no LIVE sibling actually advertised it"
+    );
+    assert!(
+      withdrawn.contains(&unique),
+      "A's unique addr must be withdrawn"
+    );
+  }
+
+  /// A host address a LIVE same-host sibling has actually ADVERTISED is RETAINED
+  /// (not withdrawn) by the withdrawing service, while its unique address is
+  /// withdrawn. This is the correct-retention counterpart of the regression.
+  #[test]
+  fn withdrawal_retains_addr_advertised_by_live_sibling() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let shared = Ipv4Addr::new(192, 168, 1, 5);
+    let unique = Ipv4Addr::new(192, 168, 1, 6);
+
+    // A advertises .5 + .6; B (LIVE) advertises .5.
+    let a = register_host_service(
+      &mut ep,
+      "A._ipp._tcp.local.",
+      &host,
+      &[shared, unique],
+      Some(&[shared, unique]),
+    );
+    let _b = register_host_service(
+      &mut ep,
+      "B._ipp._tcp.local.",
+      &host,
+      &[shared],
+      Some(&[shared]),
+    );
+
+    // Only A withdraws; B stays live (not withdrawing).
+    ep.begin_withdrawal(
+      a,
+      host_a_snapshot(&host, "A._ipp._tcp.local.", &[shared, unique]),
+      now,
+    );
+
+    let (withdrawn, got) = poll_withdrawn_v4(&mut ep, now);
+    assert_eq!(got, a);
+    assert!(
+      !withdrawn.contains(&shared),
+      "shared addr must be RETAINED: live sibling B still advertises it"
+    );
+    assert!(
+      withdrawn.contains(&unique),
+      "A's unique addr must be withdrawn"
+    );
+  }
+
+  /// Regression: two same-host services withdrawing TOGETHER must
+  /// EACH withdraw the shared address. The old scan did not exclude withdrawing
+  /// siblings, so each retained the other's leaving address and neither emitted
+  /// the TTL=0 A — leaving the record stale in peer caches until its TTL.
+  #[test]
+  fn simultaneous_same_host_withdrawals_each_withdraw_shared_addr() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let shared = Ipv4Addr::new(192, 168, 1, 5);
+
+    // Both A and B advertised the shared address (confirmed announces mirrored).
+    let a = register_host_service(
+      &mut ep,
+      "A._ipp._tcp.local.",
+      &host,
+      &[shared],
+      Some(&[shared]),
+    );
+    let b = register_host_service(
+      &mut ep,
+      "B._ipp._tcp.local.",
+      &host,
+      &[shared],
+      Some(&[shared]),
+    );
+
+    // BOTH withdraw — each marks its route `withdrawing`, so each is excluded
+    // from the other's retention scan.
+    ep.begin_withdrawal(
+      a,
+      host_a_snapshot(&host, "A._ipp._tcp.local.", &[shared]),
+      now,
+    );
+    ep.begin_withdrawal(
+      b,
+      host_a_snapshot(&host, "B._ipp._tcp.local.", &[shared]),
+      now,
+    );
+
+    // Each one's next due round must WITHDRAW the shared address. Confirm the
+    // round so the second poll advances to the other handle.
+    let (withdrawn_1, h1) = poll_withdrawn_v4(&mut ep, now);
+    assert!(
+      withdrawn_1.contains(&shared),
+      "first withdrawer ({h1:?}) must withdraw the shared addr (sibling is also leaving)"
+    );
+    ep.note_withdrawal_result(
+      h1,
+      now,
+      super::WithdrawalSend::Sent,
+      super::WithdrawalSend::Sent,
+    );
+
+    let (withdrawn_2, h2) = poll_withdrawn_v4(&mut ep, now);
+    assert_ne!(
+      h1, h2,
+      "the second poll must advance to the OTHER withdrawer"
+    );
+    assert!(
+      withdrawn_2.contains(&shared),
+      "second withdrawer ({h2:?}) must ALSO withdraw the shared addr"
+    );
+  }
+
+  /// `note_withdrawal_result` spends a resend round per family that `Sent`; a
+  /// round where neither family sent (both `Retry`) re-arms at the short backoff
+  /// WITHOUT spending either family's budget (Task 4).
   #[test]
   fn note_withdrawal_delivered_spends_failed_rearms() {
     let mut ep = build_endpoint();
@@ -5454,15 +6068,22 @@ mod tests {
       ),
       host_a: std::vec::Vec::new(),
       host_aaaa: std::vec::Vec::new(),
+      rename: None,
     };
     ep.begin_withdrawal(h, snap, now);
 
-    // A failed round spends nothing and re-arms at the short backoff.
-    ep.note_withdrawal_result(h, now, false);
+    // A round where NEITHER family sent (both Retry) spends nothing and re-arms at
+    // the short backoff.
+    ep.note_withdrawal_result(
+      h,
+      now,
+      super::WithdrawalSend::Retry,
+      super::WithdrawalSend::Retry,
+    );
     assert_eq!(
-      ep.withdrawal_remaining(h),
-      Some(super::WITHDRAWAL_SENDS),
-      "a failed round must not spend the resend budget"
+      ep.withdrawal_owed(h),
+      Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
+      "a no-send round must not spend either family's resend budget"
     );
     let backoff_at = ep.withdrawal_next_at(h).unwrap();
     assert_eq!(
@@ -5476,21 +6097,841 @@ mod tests {
         < now
           .checked_add_duration(super::WITHDRAWAL_INTERVAL)
           .unwrap(),
-      "a failed round must NOT delay a full interval"
+      "a no-send round must NOT delay a full interval"
     );
 
-    // A delivered round spends exactly one and re-arms at the full interval.
-    ep.note_withdrawal_result(h, now, true);
+    // A dual-stack delivered round spends exactly one PER family and re-arms at
+    // the full interval (progress made).
+    ep.note_withdrawal_result(
+      h,
+      now,
+      super::WithdrawalSend::Sent,
+      super::WithdrawalSend::Sent,
+    );
     assert_eq!(
-      ep.withdrawal_remaining(h),
-      Some(super::WITHDRAWAL_SENDS - 1),
-      "a delivered round spends exactly one"
+      ep.withdrawal_owed(h),
+      Some([super::WITHDRAWAL_SENDS - 1, super::WITHDRAWAL_SENDS - 1]),
+      "a dual-stack delivered round spends exactly one per family"
     );
     assert_eq!(
       ep.withdrawal_next_at(h).unwrap(),
       now
         .checked_add_duration(super::WITHDRAWAL_INTERVAL)
         .unwrap()
+    );
+
+    // A mixed round (v4 Sent, v6 Retry) spends only v4 and STILL counts as
+    // progress (>= 1 Sent), so it re-arms at the full interval.
+    ep.note_withdrawal_result(
+      h,
+      now,
+      super::WithdrawalSend::Sent,
+      super::WithdrawalSend::Retry,
+    );
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([super::WITHDRAWAL_SENDS - 2, super::WITHDRAWAL_SENDS - 1]),
+      "a v4-only round spends only v4's budget; v6 keeps its debt"
+    );
+    assert_eq!(
+      ep.withdrawal_next_at(h).unwrap(),
+      now
+        .checked_add_duration(super::WITHDRAWAL_INTERVAL)
+        .unwrap(),
+      "a round with >= 1 Sent re-arms at the full interval"
+    );
+  }
+
+  /// Every [`super::WithdrawalSend`] variant has a canonical lowercase slug (and
+  /// `Display` renders it), per the workspace unit-only-enum convention.
+  #[test]
+  fn withdrawal_send_as_str_slug_for_every_variant() {
+    assert_eq!(super::WithdrawalSend::Sent.as_str(), "sent");
+    assert_eq!(super::WithdrawalSend::Retry.as_str(), "retry");
+    assert_eq!(super::WithdrawalSend::WriteOff.as_str(), "write_off");
+    assert_eq!(
+      std::format!("{}", super::WithdrawalSend::WriteOff),
+      "write_off"
+    );
+  }
+
+  /// regression: a withdrawal is NOT freed until EVERY reachable
+  /// family has sent the goodbye. Pump WITHDRAWAL_SENDS rounds with `v4 = Sent,
+  /// v6 = Retry`: v4's debt drains to 0 but v6 still owes, so the withdrawal is
+  /// held (route still reserved, name still rejected) and does NOT complete. Only
+  /// once v6 also sends its full budget does it complete and free the name — so a
+  /// v6 that recovers before the 2 s ceiling still withdraws its records.
+  #[test]
+  fn withdrawal_not_freed_until_every_family_sent() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst.clone(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs.clone()),
+        now,
+      )
+      .unwrap();
+    // Owns instance records (PTR/SRV/TXT), so the withdrawal has a real goodbye.
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    };
+    ep.begin_withdrawal(h, snap, now);
+
+    // v4 sends every round, v6 is transiently busy (Retry) every round: v4's debt
+    // drains, v6's is untouched.
+    for _ in 0..super::WITHDRAWAL_SENDS {
+      ep.note_withdrawal_result(
+        h,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Retry,
+      );
+    }
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([0, super::WITHDRAWAL_SENDS]),
+      "v4 fully sent but v6 (busy) still owes its whole budget"
+    );
+
+    // A drain WELL within the 2 s ceiling must NOT free it: v6 has peers that never
+    // got the TTL=0 goodbye.
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert!(
+      done.is_empty(),
+      "a withdrawal whose v6 family still owes must NOT be freed before the ceiling"
+    );
+    // The name is still held (route present for the guard).
+    let dup = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst.clone(),
+      Name::try_from_str("h2.local.").unwrap(),
+      631,
+      120,
+    );
+    assert!(
+      matches!(
+        ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+          ServiceSpec::new(dup),
+          now,
+        ),
+        Err(RegisterServiceError::NameAlreadyRegistered(_))
+      ),
+      "the name must stay held while v6's goodbye debt is unpaid"
+    );
+
+    // Now v6 recovers and sends its whole budget (v4 already at 0 → reported Sent
+    // is a no-op there). owed reaches [0, 0] → it completes and frees the name.
+    for _ in 0..super::WITHDRAWAL_SENDS {
+      ep.note_withdrawal_result(
+        h,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Sent,
+      );
+    }
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([0, 0]),
+      "once v6 sends its budget every family's debt is cleared"
+    );
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert!(
+      done.contains(&h),
+      "the withdrawal completes once every family has withdrawn its records"
+    );
+    // The name is now re-registerable.
+    let recs2 = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst,
+      Name::try_from_str("h2.local.").unwrap(),
+      631,
+      120,
+    );
+    assert!(
+      ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs2),
+        now,
+      )
+      .is_ok(),
+      "the withdrawn name is re-registerable once all families have sent"
+    );
+  }
+
+  /// a family reported `WriteOff` (no socket / permanent error) has its debt
+  /// zeroed, so the withdrawal can complete via the OTHER family alone — a down
+  /// family has no reachable peers to withdraw from, so it must not pin the name.
+  #[test]
+  fn withdrawal_writeoff_family_completes() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst,
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs.clone()),
+        now,
+      )
+      .unwrap();
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    };
+    ep.begin_withdrawal(h, snap, now);
+
+    // v6 has no socket (WriteOff zeroes its debt immediately); v4 still owes its
+    // full budget after one Sent.
+    ep.note_withdrawal_result(
+      h,
+      now,
+      super::WithdrawalSend::Sent,
+      super::WithdrawalSend::WriteOff,
+    );
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([super::WITHDRAWAL_SENDS - 1, 0]),
+      "WriteOff zeroes v6's debt; v4 spent exactly one"
+    );
+
+    // v4 sends out its remaining budget; v6 stays written off.
+    for _ in 0..(super::WITHDRAWAL_SENDS - 1) {
+      ep.note_withdrawal_result(
+        h,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::WriteOff,
+      );
+    }
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([0, 0]),
+      "v4 fully sent + v6 written off → every family's debt cleared"
+    );
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert!(
+      done.contains(&h),
+      "the withdrawal completes via v4 alone once v6 is written off"
+    );
+  }
+
+  /// regression: an already-PAID family's redundant `Sent`
+  /// must NOT count as withdrawal progress. Drivers fan every round to BOTH
+  /// families, so once v4's debt is 0 it keeps reporting `Sent`; if that counted
+  /// as progress the schedule would re-arm at the FULL interval and starve a
+  /// still-busy v6 of its short-backoff retry (risking a missed last-interval v6
+  /// recovery before the ceiling). Drive v4 to `owed == 0` while v6 stays busy,
+  /// then a `v4 = Sent (paid), v6 = Retry` round must re-arm at
+  /// `WITHDRAWAL_RETRY_BACKOFF`, NOT the full interval. A subsequent `v6 = Sent`
+  /// then decrements v6 and (with v4 already 0) completes the withdrawal.
+  #[test]
+  fn withdrawal_retries_owed_family_at_backoff_when_other_is_paid() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs.clone()),
+        now,
+      )
+      .unwrap();
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    };
+    ep.begin_withdrawal(h, snap, now);
+
+    // Drain v4's whole budget while v6 is transiently busy (Retry): v4 → 0, v6
+    // keeps its full debt. Each of these rounds DID make real progress on v4
+    // (its owed was > 0), so they legitimately re-arm at the full interval.
+    for _ in 0..super::WITHDRAWAL_SENDS {
+      ep.note_withdrawal_result(
+        h,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Retry,
+      );
+    }
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([0, super::WITHDRAWAL_SENDS]),
+      "v4 fully paid; v6 (busy) still owes its whole budget"
+    );
+
+    // The crux: v4 is already paid (owed 0) but the driver still fans the round to
+    // it, so it reports `Sent` again; v6 is still busy (`Retry`). NO family made
+    // real progress this round — the paid v4 `Sent` is redundant — so the schedule
+    // must re-arm at the SHORT backoff to retry the still-owed v6 soon, NOT wait a
+    // full interval (which could miss a late v6 recovery before the 2 s ceiling).
+    ep.note_withdrawal_result(
+      h,
+      now,
+      super::WithdrawalSend::Sent,
+      super::WithdrawalSend::Retry,
+    );
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([0, super::WITHDRAWAL_SENDS]),
+      "a redundant `Sent` on the already-paid v4 must not change any debt"
+    );
+    let backoff_at = ep.withdrawal_next_at(h).unwrap();
+    assert_eq!(
+      backoff_at,
+      now
+        .checked_add_duration(super::WITHDRAWAL_RETRY_BACKOFF)
+        .unwrap(),
+      "an already-paid family's `Sent` is not progress: re-arm at the short backoff"
+    );
+    assert!(
+      backoff_at
+        < now
+          .checked_add_duration(super::WITHDRAWAL_INTERVAL)
+          .unwrap(),
+      "the still-owed v6 must be retried at the short backoff, not a full interval"
+    );
+
+    // v6 now recovers: its `Sent` IS real progress (its owed was > 0), so it
+    // decrements and — v4 already 0 — owed reaches [0, 0] once v6 drains.
+    for _ in 0..super::WITHDRAWAL_SENDS {
+      ep.note_withdrawal_result(
+        h,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Sent,
+      );
+    }
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([0, 0]),
+      "v6 draining its budget clears every family's debt"
+    );
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert!(
+      done.contains(&h),
+      "the withdrawal completes once the previously-owed v6 has sent its budget"
+    );
+  }
+
+  /// corollary: `WriteOff` zeroes ONLY its own family's debt and leaves the
+  /// other family's owed untouched — a down family must not drag the live one's
+  /// budget down with it. (Complements `withdrawal_writeoff_family_completes`,
+  /// which checks the completion path.)
+  #[test]
+  fn writeoff_only_zeroes_its_own_family() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs.clone()),
+        now,
+      )
+      .unwrap();
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    };
+    ep.begin_withdrawal(h, snap, now);
+
+    // v4 written off (its debt → 0); v6 transiently busy (Retry, debt intact).
+    ep.note_withdrawal_result(
+      h,
+      now,
+      super::WithdrawalSend::WriteOff,
+      super::WithdrawalSend::Retry,
+    );
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([0, super::WITHDRAWAL_SENDS]),
+      "WriteOff zeroes ONLY v4; v6's full budget is untouched"
+    );
+  }
+
+  /// regression: an encode-failing withdrawal must NOT
+  /// head-of-line block a sibling. Two due withdrawals share one `scratch`: A
+  /// (first in the vec) owns a goodbye too large for the buffer (many host A
+  /// records) so `write_goodbye` errors; B owns a minimal goodbye that fits. A
+  /// single `poll_withdrawal_transmit` must scan PAST the encode-failing A —
+  /// advancing A's `next_at` past `now` (budget intact) — and RETURN B's
+  /// datagram, not `None`.
+  #[test]
+  fn encode_failing_withdrawal_does_not_block_a_sibling() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+
+    // A (registered FIRST → withdrawals index 0): owns PTR + a LARGE host A set so
+    // its goodbye overflows the small shared scratch below.
+    let inst_a = Name::try_from_str("A._ipp._tcp.local.").unwrap();
+    let host_a = Name::try_from_str("ha.local.").unwrap();
+    let recs_a = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst_a,
+      host_a,
+      631,
+      120,
+    );
+    // The goodbye's size is driven by the snapshot's host_a (60 A records), which
+    // `write_goodbye` emits from the iterator using the host name — no need to
+    // register the addresses on the route.
+    let big_a: std::vec::Vec<Ipv4Addr> = (0..60u8).map(|i| Ipv4Addr::new(10, 0, 0, i)).collect();
+    let (a, _svc_a) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs_a.clone()),
+        now,
+      )
+      .unwrap();
+    let snap_a = crate::service::WithdrawalSnapshot {
+      records: recs_a,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        false,
+        false,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: big_a,
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    };
+
+    // B (registered after A): owns only a single PTR — a minimal goodbye that
+    // fits the small scratch.
+    let inst_b = Name::try_from_str("B._ipp._tcp.local.").unwrap();
+    let recs_b = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst_b,
+      Name::try_from_str("hb.local.").unwrap(),
+      632,
+      120,
+    );
+    let (b, _svc_b) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs_b.clone()),
+        now,
+      )
+      .unwrap();
+    let snap_b = crate::service::WithdrawalSnapshot {
+      records: recs_b,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        false,
+        false,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    };
+
+    ep.begin_withdrawal(a, snap_a, now);
+    ep.begin_withdrawal(b, snap_b, now);
+
+    // A scratch big enough for B's single-PTR goodbye but far too small for A's
+    // 60-address goodbye. A single pump must scan past the encode-failing A and
+    // return B's datagram.
+    let mut scratch = std::vec![0u8; 128];
+    let got = ep.poll_withdrawal_transmit(now, &mut scratch);
+    let (_dst, _len, got_handle) =
+      got.expect("the pump must scan past the encode-failing A and return B's goodbye");
+    assert_eq!(
+      got_handle, b,
+      "B (encodable) is returned; A (encode-failing) did not head-of-line block"
+    );
+
+    // A was advanced past `now` (no longer first-due at this instant) with its
+    // per-family budget intact — the 2 s ceiling remains its backstop.
+    let a_next = ep.withdrawal_next_at(a).unwrap();
+    assert!(
+      a_next > now,
+      "the encode-failing A must have its next_at pushed past now, not left due"
+    );
+    assert_eq!(
+      a_next,
+      now
+        .checked_add_duration(super::WITHDRAWAL_RETRY_BACKOFF)
+        .unwrap(),
+      "A re-arms at the short backoff after an encode failure"
+    );
+    assert_eq!(
+      ep.withdrawal_owed(a),
+      Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
+      "an encode failure must NOT spend A's resend budget"
+    );
+  }
+
+  /// regression: a teardown DURING a still-draining §9
+  /// conflict-rename goodbye must withdraw BOTH the OLD instance name AND the
+  /// CURRENT (re-announced) instance records + host addresses in ONE datagram.
+  ///
+  /// After a rename A→B the service clears its old instance ownership and
+  /// re-announces B, confirming B's PTR/SRV/TXT + host A/AAAA while A's rename
+  /// goodbye is still spaced out. If the service is retired in that window the
+  /// snapshot carries the CURRENT name B (records + owned + host addrs) PLUS the
+  /// rename's OLD name A (instance-only). The emitted goodbye must retract, at
+  /// TTL 0: A's instance records (PTR/SRV under owner `A`), B's instance records
+  /// (PTR/SRV under owner `B`), and the host A/AAAA — but NOT A's host (a rename
+  /// never withdraws host addrs). The earlier bug withdrew ONLY A, leaking B's
+  /// confirmed records and the host addresses until their TTLs expired.
+  #[test]
+  fn teardown_during_rename_goodbye_withdraws_old_and_new_name() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let old_name = Name::try_from_str("A._ipp._tcp.local.").unwrap();
+    let new_name = Name::try_from_str("A-1._ipp._tcp.local.").unwrap();
+    let host_v4 = Ipv4Addr::new(192, 168, 1, 7);
+    let host_v6 = std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+
+    // The CURRENT (re-announced) records under the renamed name B = `A-1`, owning
+    // a full instance set + both host addresses.
+    let mut recs_b = ServiceRecords::new(stype.clone(), new_name.clone(), host.clone(), 631, 120);
+    recs_b.add_a(host_v4);
+    recs_b.add_aaaa(host_v6);
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs_b.clone()),
+        now,
+      )
+      .unwrap();
+
+    // The OLD name A's still-in-flight rename goodbye (instance-only: PTR+SRV;
+    // host addrs are intentionally absent — a rename never withdraws them).
+    let old_records = ServiceRecords::new(stype, old_name.clone(), host.clone(), 631, 120);
+    let old_owned = crate::service::EmittedRecords::new(
+      true,
+      true,
+      false,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    );
+
+    // Snapshot carries BOTH: current B (records + owned + host addrs) AND the
+    // rename's old A. This is exactly what `Service::withdrawal_snapshot` now
+    // produces when `pending_rename_goodbye` is still set after a re-announce.
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs_b,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec![host_v4],
+      host_aaaa: std::vec![host_v6],
+      rename: Some((old_records, old_owned)),
+    };
+    ep.begin_withdrawal(h, snap, now);
+
+    let mut buf = std::vec![0u8; 4096];
+    let (_dst, len, got) = ep
+      .poll_withdrawal_transmit(now, &mut buf)
+      .expect("a due rename-window withdrawal must produce a datagram");
+    assert_eq!(got, h, "the withdrawing handle is reported");
+
+    let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
+    let mut saw_old_instance = false; // PTR/SRV owned by the OLD name A
+    let mut saw_new_instance = false; // PTR/SRV owned by the CURRENT name B
+    let mut withdrawn_v4: std::vec::Vec<Ipv4Addr> = std::vec::Vec::new();
+    let mut withdrawn_v6: std::vec::Vec<std::net::Ipv6Addr> = std::vec::Vec::new();
+    for rec in reader.answers() {
+      let rec = rec.unwrap();
+      assert_eq!(rec.ttl(), 0, "every goodbye record must carry TTL 0");
+      match rec.rtype() {
+        crate::wire::ResourceType::A => {
+          let d = rec.rdata();
+          assert_eq!(d.len(), 4, "A rdata is 4 bytes");
+          withdrawn_v4.push(Ipv4Addr::new(d[0], d[1], d[2], d[3]));
+        }
+        crate::wire::ResourceType::AAAA => {
+          let d = rec.rdata();
+          assert_eq!(d.len(), 16, "AAAA rdata is 16 bytes");
+          let mut o = [0u8; 16];
+          o.copy_from_slice(d);
+          withdrawn_v6.push(std::net::Ipv6Addr::from(o));
+        }
+        // SRV is owned by the INSTANCE name, so it disambiguates A vs B directly.
+        // (The instance PTR is owned by the shared service-type, so it cannot.)
+        crate::wire::ResourceType::Srv => {
+          if names_match(&old_name, rec.name()) {
+            saw_old_instance = true;
+          } else if names_match(&new_name, rec.name()) {
+            saw_new_instance = true;
+          }
+        }
+        _ => {}
+      }
+    }
+    assert!(
+      saw_old_instance,
+      "the OLD name A's instance records (SRV owner A) must be withdrawn at TTL 0"
+    );
+    assert!(
+      saw_new_instance,
+      "the CURRENT name B's instance records (SRV owner B) must ALSO be withdrawn at TTL 0"
+    );
+    assert!(
+      withdrawn_v4.contains(&host_v4),
+      "the confirmed host A address must be withdrawn (it was leaking before the fix)"
+    );
+    assert!(
+      withdrawn_v6.contains(&host_v6),
+      "the confirmed host AAAA address must be withdrawn"
+    );
+  }
+
+  /// regression: a family that recovers in the FINAL window
+  /// before the ceiling (because the last backoff overshot `ceiling_at`) must
+  /// still get ONE last goodbye attempt before the route is force-freed.
+  ///
+  /// v4 is paid; v6 stays busy (Retry). The last `note_withdrawal_result` clamps
+  /// `next_at` to `ceiling_at` (the schedule cannot skip past the ceiling). AT
+  /// the ceiling, `poll_withdrawal_transmit` must return a datagram for the owed
+  /// withdrawal EXACTLY ONCE (the final attempt) — the normal due window
+  /// (`now < ceiling_at`) no longer matches, so without the final-attempt branch
+  /// the owed family would never be tried. A SECOND poll at the same instant must
+  /// return `None` (no infinite emission), and `drain_completed_withdrawals` then
+  /// force-completes the route.
+  #[test]
+  fn owed_family_gets_a_final_attempt_at_ceiling() {
+    let mut ep = build_endpoint();
+    let t0 = StdInstant::now();
+    let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst.clone(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs.clone()),
+        t0,
+      )
+      .unwrap();
+    // Owns instance records, so the withdrawal has a real goodbye to emit.
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    };
+    ep.begin_withdrawal(h, snap, t0);
+    let ceiling = t0.checked_add_duration(super::WITHDRAWAL_CEILING).unwrap();
+
+    // Pay v4 fully; v6 is busy each round. v4's debt drains to 0, v6 still owes.
+    for _ in 0..super::WITHDRAWAL_SENDS {
+      ep.note_withdrawal_result(
+        h,
+        t0,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Retry,
+      );
+    }
+    assert_eq!(
+      ep.withdrawal_owed(h),
+      Some([0, super::WITHDRAWAL_SENDS]),
+      "v4 paid; v6 still owes its whole budget"
+    );
+
+    // A round JUST before the ceiling with no real progress (v4 already paid →
+    // redundant Sent, v6 still Retry) re-arms at the short backoff — which the
+    // clamp pins to `ceiling_at` (the backoff would otherwise overshoot it).
+    let t_near = t0
+      .checked_add_duration(super::WITHDRAWAL_CEILING - core::time::Duration::from_millis(1))
+      .unwrap();
+    ep.note_withdrawal_result(
+      h,
+      t_near,
+      super::WithdrawalSend::Sent,
+      super::WithdrawalSend::Retry,
+    );
+    assert_eq!(
+      ep.withdrawal_next_at(h),
+      Some(ceiling),
+      "the re-arm must be CLAMPED to ceiling_at, not pushed past it"
+    );
+
+    // AT the ceiling: the normal due window (`now < ceiling_at`) no longer
+    // matches, but the owed family still gets ONE final attempt.
+    let mut buf = std::vec![0u8; 4096];
+    let first = ep.poll_withdrawal_transmit(ceiling, &mut buf);
+    let (_dst, _len, got) =
+      first.expect("the owed family must get a FINAL goodbye attempt at the ceiling");
+    assert_eq!(got, h, "the final attempt is for the owed withdrawal");
+
+    // A second poll at the SAME instant must NOT re-emit (final_attempt guards it)
+    // — proving the past-ceiling branch fires at most once (no infinite emission).
+    assert!(
+      ep.poll_withdrawal_transmit(ceiling, &mut buf).is_none(),
+      "the final attempt fires exactly once; a second poll must return None"
+    );
+
+    // The route is now force-completed (past the ceiling AND final-attempted).
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(ceiling, &mut done);
+    assert!(
+      done.contains(&h),
+      "after its final ceiling attempt the route is force-completed and freed"
+    );
+    // The name is re-registerable once the route is freed.
+    let recs2 = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      inst,
+      Name::try_from_str("h2.local.").unwrap(),
+      631,
+      120,
+    );
+    assert!(
+      ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs2),
+        ceiling,
+      )
+      .is_ok(),
+      "the withdrawn name is re-registerable after the route is force-freed"
+    );
+  }
+
+  /// before the ceiling-attempt fix, a withdrawal past its ceiling with debt
+  /// still owed but no final attempt must NOT be force-completed — it is held for
+  /// the final attempt. This pins down the `drain` guard: past the ceiling but
+  /// `!final_attempt` and `owed != [0,0]` → not yet drained.
+  #[test]
+  fn past_ceiling_owed_withdrawal_is_held_until_final_attempt() {
+    let mut ep = build_endpoint();
+    let t0 = StdInstant::now();
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("Printer._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h.local.").unwrap(),
+      631,
+      120,
+    );
+    let (h, _svc) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs.clone()),
+        t0,
+      )
+      .unwrap();
+    let snap = crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    };
+    ep.begin_withdrawal(h, snap, t0);
+    let ceiling = t0.checked_add_duration(super::WITHDRAWAL_CEILING).unwrap();
+
+    // A drain PAST the ceiling, with v6 still owed and NO final attempt yet made,
+    // must NOT free the route — the owed family is still entitled to its last try.
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(ceiling, &mut done);
+    assert!(
+      done.is_empty(),
+      "a past-ceiling owed withdrawal must be HELD until its final attempt is made"
+    );
+
+    // The final attempt happens on the next poll; THEN drain frees it.
+    let mut buf = std::vec![0u8; 4096];
+    assert!(
+      ep.poll_withdrawal_transmit(ceiling, &mut buf).is_some(),
+      "the final ceiling attempt is emitted"
+    );
+    ep.drain_completed_withdrawals(ceiling, &mut done);
+    assert!(
+      done.contains(&h),
+      "after the final attempt the held route is force-completed"
     );
   }
 
@@ -5519,9 +6960,15 @@ mod tests {
     let before = ep.stats().services_active;
     ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
 
-    // Spend the whole resend budget via delivered confirmations.
+    // Spend the whole per-family resend budget via dual-stack delivered
+    // confirmations (both families Sent each round → owed reaches [0, 0]).
     for _ in 0..super::WITHDRAWAL_SENDS {
-      ep.note_withdrawal_result(h, now, true);
+      ep.note_withdrawal_result(
+        h,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Sent,
+      );
     }
     let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
     ep.drain_completed_withdrawals(now, &mut done);
@@ -5584,6 +7031,209 @@ mod tests {
       done,
       std::vec![h],
       "ceiling force-completes a wedged withdrawal"
+    );
+  }
+
+  /// Build a withdrawal snapshot owning NO instance records, withdrawing only
+  /// the given host A set (models a host-record-only withdrawal).
+  fn host_only_snapshot(
+    host: &Name,
+    instance: &str,
+    host_a: &[Ipv4Addr],
+  ) -> crate::service::WithdrawalSnapshot {
+    let mut recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str(instance).unwrap(),
+      host.clone(),
+      631,
+      120,
+    );
+    for a in host_a {
+      recs.add_a(*a);
+    }
+    crate::service::WithdrawalSnapshot {
+      records: recs,
+      owned: crate::service::EmittedRecords::new(
+        false,
+        false,
+        false,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: host_a.to_vec(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    }
+  }
+
+  /// Regression: a retained-only withdrawal must NOT head-of-line
+  /// block the pump. Two same-time withdrawals: A is retained-only (its single
+  /// host address is still advertised by a LIVE non-withdrawing sibling C, and A
+  /// owns no instance records) and B genuinely needs a TTL=0 goodbye. The pump
+  /// must scan PAST A (returning B's datagram, not `None`) in the SAME pass, and
+  /// a subsequent drain must complete/free A at once (not leave it pinned to the
+  /// 2 s ceiling).
+  #[test]
+  fn retained_only_withdrawal_completes_and_does_not_block_a_sibling() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let shared = Ipv4Addr::new(192, 168, 1, 5);
+
+    // C: a LIVE same-host sibling that has CONFIRMED-ADVERTISED `shared` and is
+    // NOT withdrawing — it legitimately keeps the address in peer caches.
+    let _c = register_host_service(
+      &mut ep,
+      "C._ipp._tcp.local.",
+      &host,
+      &[shared],
+      Some(&[shared]),
+    );
+
+    // A (registered FIRST → lower withdrawals index): withdraws only `shared`,
+    // owns no instance records. Since C retains `shared`, A has NOTHING to emit.
+    let a = register_host_service(
+      &mut ep,
+      "A._ipp._tcp.local.",
+      &host,
+      &[shared],
+      Some(&[shared]),
+    );
+    // B (registered after A): genuinely needs a goodbye (owns PTR/SRV/TXT, no
+    // host addresses so it is independent of host retention).
+    let recs_b = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("B._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("hb.local.").unwrap(),
+      632,
+      120,
+    );
+    let (b, _svc_b) = ep
+      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs_b.clone()),
+        now,
+      )
+      .unwrap();
+    let snap_b = crate::service::WithdrawalSnapshot {
+      records: recs_b,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+      host_a: std::vec::Vec::new(),
+      host_aaaa: std::vec::Vec::new(),
+      rename: None,
+    };
+
+    // Both withdraw at the SAME time (A first in the vec, then B).
+    ep.begin_withdrawal(
+      a,
+      host_only_snapshot(&host, "A._ipp._tcp.local.", &[shared]),
+      now,
+    );
+    ep.begin_withdrawal(b, snap_b, now);
+
+    // A single pump must scan PAST the retained-only A and RETURN B's datagram —
+    // NOT `None`. (Pre-fix it returned `None` on A, starving B.)
+    let mut buf = std::vec![0u8; 4096];
+    let (_dst, len, got) = ep
+      .poll_withdrawal_transmit(now, &mut buf)
+      .expect("the pump must scan past the retained-only A and return B's goodbye");
+    assert_eq!(got, b, "the genuine withdrawal B is the one that emits");
+    let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
+    assert!(
+      reader.answers().count() > 0,
+      "B's goodbye must carry its TTL=0 instance records"
+    );
+
+    // A was marked complete in that scan (owed set to [0, 0]), so the NEXT drain
+    // frees it AT ONCE — without waiting for the 2 s ceiling.
+    assert_eq!(
+      ep.withdrawal_owed(a),
+      Some([0, 0]),
+      "the retained-only A must be COMPLETED (owed = [0, 0]) by the scan"
+    );
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert!(
+      done.contains(&a),
+      "the retained-only A must be freed immediately, not pinned to the ceiling"
+    );
+    // A's route is gone, so its name is re-registerable now (no ceiling wait).
+    let recs_a2 = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("h2.local.").unwrap(),
+      633,
+      120,
+    );
+    assert!(
+      ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs_a2),
+        now,
+      )
+      .is_ok(),
+      "A's name is released the moment its retained-only withdrawal completes"
+    );
+  }
+
+  /// Regression: a LONE retained-only withdrawal returns `None`
+  /// from `poll_withdrawal_transmit` (nothing to emit) but is COMPLETED in place
+  /// (`owed` set to [0, 0]), so the next drain frees it AT ONCE rather than
+  /// pinning the name to the 2 s ceiling and re-waking `poll_timeout` until then.
+  #[test]
+  fn retained_only_withdrawal_completes_immediately() {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let host = Name::try_from_str("h.local.").unwrap();
+    let shared = Ipv4Addr::new(192, 168, 1, 5);
+
+    // C: a LIVE same-host sibling that still advertises `shared`.
+    let _c = register_host_service(
+      &mut ep,
+      "C._ipp._tcp.local.",
+      &host,
+      &[shared],
+      Some(&[shared]),
+    );
+    // A: retained-only (owns no instance records; its only host addr is retained
+    // by C).
+    let a = register_host_service(
+      &mut ep,
+      "A._ipp._tcp.local.",
+      &host,
+      &[shared],
+      Some(&[shared]),
+    );
+    ep.begin_withdrawal(
+      a,
+      host_only_snapshot(&host, "A._ipp._tcp.local.", &[shared]),
+      now,
+    );
+
+    // A lone retained-only withdrawal emits no datagram.
+    let mut buf = std::vec![0u8; 4096];
+    assert!(
+      ep.poll_withdrawal_transmit(now, &mut buf).is_none(),
+      "a retained-only withdrawal has nothing to emit"
+    );
+    // But it is COMPLETED — `owed` is [0, 0], so the drain frees it immediately.
+    assert_eq!(
+      ep.withdrawal_owed(a),
+      Some([0, 0]),
+      "the retained-only withdrawal must be completed (owed = [0, 0]), not left due"
+    );
+    let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+    ep.drain_completed_withdrawals(now, &mut done);
+    assert_eq!(
+      done,
+      std::vec![a],
+      "the retained-only withdrawal is freed at once, not at the 2 s ceiling"
     );
   }
 
@@ -5693,7 +7343,7 @@ mod tests {
       )
       .unwrap();
     let before = ep.stats().services_active;
-    // Never announced → empty snapshot → remaining == 0.
+    // Never announced → empty snapshot → owed == [0, 0].
     ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
     let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
     ep.drain_completed_withdrawals(now, &mut done);

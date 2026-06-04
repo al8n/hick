@@ -24,11 +24,11 @@ mdns-proto = { workspace = true, features = ["std", "slab"] }
 hick-udp.workspace = true
 hick-trace = { workspace = true }
 tracing = { workspace = true, optional = true, features = ["attributes", "std"] }
-compio = { version = "0.18", features = ["time"] }
-compio-net = "0.11"
-compio-io = "0.9"
-compio-runtime = "0.11"
-compio-buf = "0.8"
+compio = { version = "0.19", features = ["time"] }
+compio-net = "0.12"
+compio-io = "0.10"
+compio-runtime = "0.12"
+compio-buf = "0.8.2"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 event-listener = "5"
 getifs = "0.6"
@@ -40,7 +40,7 @@ thiserror = "2"
 libc = "0.2"
 
 [dev-dependencies]
-compio = { version = "0.18", features = ["macros", "time"] }
+compio = { version = "0.19", features = ["macros", "time"] }
 # Pin the loopback interface in the end-to-end driver integration tests.
 getifs = "0.6"
 

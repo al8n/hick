@@ -166,7 +166,7 @@ fn hash_rdata(bytes: &[u8]) -> u64 {
 
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[allow(unused_imports)]
-pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye};
+pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye_with_rename};
 #[allow(unused_imports)]
 pub(crate) use schedule::{announce_deadline, probe_deadline, re_announce_deadline};
 pub use state::ServiceState;
@@ -472,6 +472,21 @@ pub struct WithdrawalSnapshot {
   pub host_a: std::vec::Vec<core::net::Ipv4Addr>,
   /// Host AAAA (IPv6) addresses this service confirmed-emitted.
   pub host_aaaa: std::vec::Vec<core::net::Ipv6Addr>,
+  /// An IN-FLIGHT §9 conflict-rename goodbye for the OLD instance name that has
+  /// not finished draining (`pending_rename_goodbye` was still `Some` when this
+  /// snapshot was taken). After a rename A→B the service clears its old instance
+  /// ownership and re-announces B, so the `records`/`owned`/`host_*` fields above
+  /// describe the CURRENT name B — but the OLD name A's instance PTR/SRV/TXT are
+  /// still cached by peers until the spaced rename goodbyes finish. If the
+  /// service is unregistered in that window the endpoint must withdraw BOTH: this
+  /// carries the old name's `ServiceRecords` plus its per-record ownership
+  /// (instance-only — a rename never withdraws host A/AAAA, the host name is
+  /// invariant), matching `write_rename_goodbye` semantics. `None` when no rename
+  /// goodbye was in flight.
+  ///
+  /// `pub(crate)`: `EmittedRecords` is a crate-internal type, so the endpoint
+  /// (same crate) reads the tuple directly.
+  pub(crate) rename: Option<(crate::records::ServiceRecords, respond::EmittedRecords)>,
 }
 
 /// Service state machine. One per registered service.
@@ -931,33 +946,43 @@ where
   /// Capture everything the endpoint needs to re-encode a TTL=0 goodbye for
   /// this service without holding the [`Service`] alive.
   ///
-  /// **Rename-goodbye priority:** if a conflict rename installed a
-  /// `pending_rename_goodbye` (the OLD instance name needs withdrawing), that
-  /// snapshot is returned instead of the current name's state, and
-  /// `pending_rename_goodbye` is taken (`= None`) — the endpoint's withdrawal
-  /// machine owns the resend loop from here. The rename-goodbye snapshot carries
-  /// the old instance's record ownership with EMPTY host addresses (a rename
-  /// never withdraws A/AAAA because the host name is unchanged).
+  /// **Always captures the CURRENT confirmed-emitted state:** the current
+  /// `ServiceRecords`, which instance record kinds (PTR/SRV/TXT/subtypes) were
+  /// actually put on the wire, and which host A/AAAA addresses were
+  /// confirmed-emitted. The endpoint further filters host addresses against
+  /// same-host siblings before encoding the actual goodbye datagram.
   ///
-  /// **Normal withdrawal:** returns a snapshot of the CURRENT confirmed-emitted
-  /// state: the current `ServiceRecords`, which record kinds (PTR/SRV/TXT/
-  /// subtypes) were actually put on the wire, and which host A/AAAA addresses
-  /// were confirmed-emitted. The endpoint will further filter host addresses
-  /// against same-host siblings before encoding the actual goodbye datagram.
+  /// **Also captures an in-flight rename goodbye, if any:** if a §9 conflict
+  /// rename installed a `pending_rename_goodbye` (the OLD instance name A still
+  /// needs withdrawing) and it has not finished draining, the OLD name's records
+  /// (with their per-record ownership) are ALSO captured into
+  /// `WithdrawalSnapshot::rename`, and `pending_rename_goodbye` is taken
+  /// (`= None`) — the endpoint's withdrawal machine owns the resend loop from
+  /// here. This is NOT an either/or with the
+  /// current state: after a rename A→B the service re-announces and confirms B's
+  /// instance records on the wire while A's goodbye is still spaced out, so a
+  /// teardown in that window must withdraw BOTH A's old instance records AND B's
+  /// current instance records (plus the still-owned host A/AAAA). Returning only
+  /// A (the old behaviour) leaked B's confirmed PTR/SRV/TXT and the host
+  /// addresses until their TTLs expired. The rename capture is instance-only —
+  /// a rename never withdraws host A/AAAA (the host name is invariant across an
+  /// instance rename), matching `write_rename_goodbye` semantics.
   pub fn withdrawal_snapshot(&mut self) -> WithdrawalSnapshot {
-    // Priority: take any pending rename-goodbye (old instance records only;
-    // host A/AAAA are intentionally empty — a rename never withdraws host addrs).
-    if let Some((old_records, _, old_owned)) = self.pending_rename_goodbye.take() {
-      self.rename_goodbye_deadline = None;
-      return WithdrawalSnapshot {
-        records: old_records,
-        owned: old_owned,
-        host_a: std::vec::Vec::new(),
-        host_aaaa: std::vec::Vec::new(),
-      };
-    }
+    // Capture any in-flight rename goodbye for the OLD instance name (instance
+    // records only — a rename never withdraws host A/AAAA). Taken here so it is
+    // consumed exactly once; the endpoint owns the resend loop from now on.
+    let rename = self
+      .pending_rename_goodbye
+      .take()
+      .map(|(old_records, _, old_owned)| {
+        self.rename_goodbye_deadline = None;
+        (old_records, old_owned)
+      });
 
-    // Normal case: snapshot the current goodbye-ownership latch.
+    // Snapshot the CURRENT goodbye-ownership latch (the live name's records).
+    // This is captured unconditionally, ALONGSIDE any `rename` above: after a
+    // rename the current name is the freshly re-announced one, and its confirmed
+    // instance + host records still need withdrawing.
     let owned = respond::EmittedRecords::new(
       self.goodbye.ptr,
       self.goodbye.srv,
@@ -971,6 +996,7 @@ where
       owned,
       host_a: self.goodbye.a.clone(),
       host_aaaa: self.goodbye.aaaa.clone(),
+      rename,
     }
   }
 

@@ -4279,6 +4279,114 @@ fn rename_goodbye_burst_exhausts_and_clears_pending() {
   );
 }
 
+/// `withdrawal_snapshot` taken DURING a still-draining
+/// conflict-rename goodbye must capture BOTH the OLD instance name's goodbye AND
+/// the CURRENT (re-announced) instance + host ownership — NOT just the old name.
+///
+/// Drive a real Service through a §8.2 losing tiebreak (renames `myprinter` →
+/// `myprinter-1`, sets `pending_rename_goodbye` for the OLD name and
+/// `reset_instance`s the latch), then simulate the renamed name's confirmed
+/// re-announce by re-latching its instance ownership (`mark_instance`, exactly
+/// what a delivered announce does). With the rename goodbye STILL pending, the
+/// snapshot must carry: `rename = Some(old `myprinter` records, instance-only)`
+/// AND `owned` with the current name's instance bits AND `host_a` with the
+/// host address that survived the rename. The earlier behaviour returned ONLY
+/// the old name (instance-only, empty host), leaking the re-announced records.
+#[test]
+fn withdrawal_snapshot_during_rename_captures_old_and_current() {
+  let mut svc = make_service(120);
+  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
+  // The original name `myprinter` was announced (instance records + its host A).
+  svc.goodbye.mark_instance();
+  let host_addr = core::net::Ipv4Addr::new(192, 168, 1, 10); // matches make_records
+  svc.goodbye.a.push(host_addr);
+
+  // Losing §8.2 tiebreak (peer SRV port 9999 > ours 631) → rename to `myprinter-1`.
+  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut sbuf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (rec, _) = Ref::try_parse(&sbuf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
+    FakeInstant::zero(),
+  );
+  let now = FakeInstant::zero().advance(500);
+  svc.handle_timeout(now).unwrap();
+  assert!(
+    svc.name().as_str().contains("-1"),
+    "service should have renamed to `myprinter-1`"
+  );
+  assert!(
+    svc.pending_rename_goodbye.is_some(),
+    "the rename must queue a goodbye for the OLD announced name"
+  );
+  // The rename cleared the instance latch (the new name has not announced yet),
+  // but the host address survives (the host name is invariant across a rename).
+  assert!(
+    !svc.goodbye.any_instance(),
+    "reset_instance must clear the instance latch after a rename"
+  );
+  assert!(
+    svc.goodbye.a.contains(&host_addr),
+    "the host A address survives the instance rename"
+  );
+
+  // Simulate the renamed name's CONFIRMED re-announce: its instance records are
+  // back on the wire (a delivered announce re-latches the instance ownership).
+  svc.goodbye.mark_instance();
+
+  // Snapshot while the rename goodbye is STILL pending: must capture BOTH names.
+  let snap = svc.withdrawal_snapshot();
+
+  // Current (re-announced) name: records = `myprinter-1`, instance bits set,
+  // host address retained.
+  assert!(
+    snap.records.instance().as_str().contains("-1"),
+    "the snapshot's CURRENT records must be the re-announced `myprinter-1`"
+  );
+  assert!(
+    snap.owned.ptr() && snap.owned.srv() && snap.owned.txt(),
+    "the CURRENT name's confirmed instance records must be captured"
+  );
+  assert!(
+    snap.host_a.contains(&host_addr),
+    "the CURRENT (still-owned) host A address must be captured for withdrawal"
+  );
+
+  // OLD name: rename = Some, records = `myprinter`, instance-only ownership.
+  let (old_records, old_owned) = snap
+    .rename
+    .as_ref()
+    .expect("the in-flight rename goodbye for the OLD name must be captured");
+  assert_eq!(
+    old_records.instance().as_str(),
+    "myprinter._ipp._tcp.local.",
+    "the rename capture must carry the OLD instance name"
+  );
+  assert!(
+    old_owned.ptr() && old_owned.srv() && old_owned.txt(),
+    "the OLD name's advertised instance records must be captured for withdrawal"
+  );
+  assert!(
+    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
+    "a rename never withdraws host addrs — the OLD-name capture is instance-only"
+  );
+
+  // The pending rename goodbye was CONSUMED exactly once by the snapshot.
+  assert!(
+    svc.pending_rename_goodbye.is_none(),
+    "withdrawal_snapshot must take() the pending rename goodbye"
+  );
+}
+
 #[test]
 fn duplicate_legacy_question_is_deduped() {
   use crate::{event::ServiceQuestion, wire::QuestionRef};
@@ -4760,10 +4868,10 @@ fn withdrawal_snapshot_of_never_announced_service_is_empty() {
 }
 
 #[test]
-fn withdrawal_snapshot_of_pending_rename_goodbye_takes_old_name() {
-  // When a rename is in-flight, withdrawal_snapshot() must take the queued
-  // old-name snapshot (instance-only, no host addresses) and clear
-  // pending_rename_goodbye.
+fn withdrawal_snapshot_of_pending_rename_goodbye_captures_old_name_in_rename_field() {
+  // When a rename is in-flight, withdrawal_snapshot() must capture the queued
+  // OLD-name goodbye in the `rename` field (instance-only, no host addresses)
+  // and clear pending_rename_goodbye.
   let mut svc = make_service(120);
   svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
   // Simulate that the old name had its PTR announced.
@@ -4796,18 +4904,28 @@ fn withdrawal_snapshot_of_pending_rename_goodbye_takes_old_name() {
 
   let snap = svc.withdrawal_snapshot();
 
-  // The rename-goodbye snapshot carries the old instance's PTR ownership.
-  assert!(snap.owned.ptr(), "rename snapshot must own old PTR");
-  // Host addresses are intentionally empty for a rename goodbye.
-  assert!(
-    snap.host_a.is_empty(),
-    "rename snapshot must not carry host_a"
+  // The OLD name is now carried in the dedicated `rename` field (instance-only).
+  let (old_records, old_owned) = snap
+    .rename
+    .as_ref()
+    .expect("the in-flight rename goodbye must be captured in `rename`");
+  assert!(old_owned.ptr(), "rename capture must own the old PTR");
+  assert_eq!(
+    old_records.instance().as_str(),
+    "myprinter._ipp._tcp.local.",
+    "rename capture must carry the OLD instance name"
   );
   assert!(
-    snap.host_aaaa.is_empty(),
-    "rename snapshot must not carry host_aaaa"
+    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
+    "the rename capture is instance-only (a rename never withdraws host addrs)"
   );
-  // The pending rename goodbye must have been consumed.
+  // The rename reset the CURRENT instance latch and the new name has not
+  // re-announced in this scenario, so the current `owned` is empty here.
+  assert!(
+    !snap.owned.ptr() && !snap.owned.srv() && !snap.owned.txt(),
+    "the reset current-name latch carries no instance records yet"
+  );
+  // The pending rename goodbye must have been consumed exactly once.
   assert!(
     svc.pending_rename_goodbye.is_none(),
     "withdrawal_snapshot must take pending_rename_goodbye"

@@ -378,7 +378,14 @@ impl Socket {
     {
       let ctrl = AlignedCtrlBuf::new();
       let compio_buf::BufResult(res, (buf, ctrl)) = self.inner.recv_msg(buf, ctrl).await;
-      let (data_len, ctrl_len, peer) = res?;
+      // compio-net 0.12's `recv_msg` returns a 4-tuple
+      // `(data_len, ctrl_len, peer, ReturnFlags)` — the trailing `ReturnFlags`
+      // (recvmsg `msg_flags`) was added in #935. We deliberately keep using the
+      // `data_len > max` sentinel proxy below rather than `flags.contains(TRUNC)`:
+      // the sentinel is a true *inclusive* ceiling (a legal exactly-`max`-byte
+      // datagram is preserved), whereas `MSG_TRUNC` would flag it. Bind the flags
+      // to `_` to preserve the existing truncation semantics byte-for-byte.
+      let (data_len, ctrl_len, peer, _recv_flags) = res?;
       let mut data = buf;
       // `compio-buf`'s `advance_vec_to` already set `data.len() = data_len`
       // through the `[Vec<u8>; 1]` SetLen impl, but truncate defensively.
@@ -387,9 +394,8 @@ impl Socket {
       }
       let mut meta = RecvMeta::empty(peer);
       meta.len = data_len;
-      // compio-net's `recv_msg` does not expose `msghdr::msg_flags`, so we
-      // cannot check `MSG_TRUNC` directly (unlike `hick-udp`'s `recvmsg`
-      // path, which can). Use the next-best proxy: the buffer is sized to
+      // We do NOT read `msghdr::msg_flags` / `ReturnFlags::TRUNC` here (see the
+      // note above). Use the buffer-sentinel proxy: the buffer is sized to
       // `max + 1`, so the kernel can only write more than `max` bytes when the
       // datagram exceeded `max_recv_packet_size` and was silently truncated. A
       // legal datagram of exactly `max` bytes lands as `data_len == max` and is

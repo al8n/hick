@@ -13,7 +13,7 @@ use agnostic_net::{Net, UdpSocket};
 use futures::{FutureExt, pin_mut, select_biased};
 use mdns_proto::{
   CollectedAnswer, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate,
-  event::RouteEvent,
+  endpoint::WithdrawalSend, event::RouteEvent,
 };
 
 use crate::{
@@ -506,6 +506,13 @@ impl<N: Net> DriverState<N> {
   fn fire_timeouts(&mut self, now: StdInstant) {
     let _ = self.endpoint.handle_timeout(now);
     for ctx in self.services.values_mut() {
+      // Don't tick a withdrawing service's proto: its lifecycle is finished and
+      // its goodbye schedule lives in the endpoint, so driving the dead driver
+      // proto here is pure waste. Mirrors the smoltcp/compio timeout paths, which
+      // skip errored/cancelled services.
+      if ctx.withdrawing {
+        continue;
+      }
       let _ = ctx.proto.handle_timeout(now);
     }
     let query_handles: Vec<QueryHandle> = self.queries.keys().copied().collect();
@@ -818,6 +825,19 @@ impl<N: Net> DriverState<N> {
         // (a long `send_via` await would put a pre-send deadline in the past).
         if let Some(ctx) = services.get_mut(&h) {
           ctx.proto.note_transmit_result(StdInstant::now(), used > 0);
+          // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
+          // route so sibling host-address retention (during a same-host
+          // withdrawal) honours what this service ACTUALLY announced, not its
+          // configured addresses. Idempotent overwrite; only meaningful after a
+          // delivered send. `endpoint` and `services` are disjointly borrowed
+          // from `self` above, so this borrow split is sound.
+          if used > 0 {
+            endpoint.note_service_advertised(
+              h,
+              ctx.proto.advertised_a_addrs(),
+              ctx.proto.advertised_aaaa_addrs(),
+            );
+          }
         }
         credits_remaining = credits_remaining.saturating_sub(used);
       }
@@ -988,9 +1008,9 @@ impl<N: Net> DriverState<N> {
   /// loop pumps each due goodbye datagram and, on completion, frees the route and
   /// GCs the driver ctx. The withdrawal covers whatever the service must retract:
   /// the records it confirmed-emitted under its current name (host A/AAAA filtered
-  /// against same-host siblings by the endpoint), OR — if a conflict rename left
-  /// an old-name withdrawal pending — that old instance name first
-  /// ([`Service::withdrawal_snapshot`] prioritises the rename goodbye). A
+  /// against same-host siblings by the endpoint), AND — if a conflict rename left
+  /// an old-name withdrawal still pending — that old instance name too, in the
+  /// SAME goodbye ([`Service::withdrawal_snapshot`] captures both). A
   /// never-announced service has an empty snapshot and completes on the next loop
   /// iteration with no datagram on the wire.
   ///
@@ -1005,8 +1025,8 @@ impl<N: Net> DriverState<N> {
   /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: mark the
   /// ctx `withdrawing` (so every subsequent loop skips it for transmits,
   /// deadlines, and the orphan-sweep), snapshot what its goodbye must retract
-  /// ([`Service::withdrawal_snapshot`], which prioritises a pending conflict-rename
-  /// old-name goodbye over the current state), and hand it to
+  /// ([`Service::withdrawal_snapshot`], which captures both the current records
+  /// and any pending conflict-rename old-name goodbye), and hand it to
   /// [`Endpoint::begin_withdrawal`]. The endpoint holds the route and drives the
   /// resend schedule; the route is freed and the driver ctx GC'd when
   /// [`Endpoint::drain_completed_withdrawals`] reports completion in the loop.
@@ -1031,10 +1051,11 @@ impl<N: Net> DriverState<N> {
   ///
   /// The endpoint encodes each TTL=0 goodbye (with fresh sibling host-address
   /// retention computed internally), hands back the multicast datagram + the
-  /// withdrawing handle; the driver fans it to BOTH groups via `send_via` (the
-  /// `MDNS_V4_DST` sentinel triggers the dual-stack path), reports back whether at
-  /// least one family sent so the endpoint can spend / re-arm the resend round,
-  /// and bumps `goodbyes_tx` once per DELIVERED round. After draining transmits,
+  /// withdrawing handle; the driver fans it to BOTH groups via
+  /// `send_withdrawal_via`, reports back EACH family's `WithdrawalSend` outcome so
+  /// the endpoint tracks per-family debt (a withdrawal frees only once every
+  /// reachable family has withdrawn its records), and bumps `goodbyes_tx` once per
+  /// DELIVERED round. After draining transmits,
   /// [`Endpoint::drain_completed_withdrawals`] frees each completed route
   /// (decrementing `services_active`) and the driver GCs its ctx — the queued
   /// `Conflict` already lives in the decoupled `updates` channel, so it survives.
@@ -1058,27 +1079,29 @@ impl<N: Net> DriverState<N> {
         "withdrawal dst must be the IPv4 multicast marker"
       );
       let _ = dst;
-      let credits = send_via::<N>(
+      // Fan to both families and capture EACH family's outcome so the endpoint
+      // tracks per-family debt: a withdrawal frees only once every reachable
+      // family has withdrawn its records. `send_withdrawal_via` already bumps
+      // packets_tx/bytes_tx per Sent family and send_errors per failed family, so
+      // here we add only the per-round goodbyes_tx (one per DELIVERED round).
+      let (v4_out, v6_out) = send_withdrawal_via::<N>(
         recent_sends,
         v4,
         v6,
-        MDNS_V4_DST,
         &scratch[..len],
         #[cfg(feature = "stats")]
         &stats,
       )
       .await;
-      // `delivered` = at least one family put the datagram on the wire. A
-      // delivered round spends one resend; a fully-failed round is re-armed by
-      // the endpoint (short backoff) WITHOUT spending. `send_via` already bumps
-      // packets_tx/bytes_tx per Sent family and send_errors per failed family, so
-      // here we add only the per-round goodbyes_tx (one per DELIVERED round).
-      let delivered = credits > 0;
+      // A delivered round (>= 1 family Sent) bumps goodbyes_tx; a v4-Sent + v6-busy
+      // round keeps v6's debt so a v6 recovery before the 2 s ceiling still emits
+      // its TTL=0 goodbye. A fully-undeliverable round is re-armed (short backoff)
+      // by the endpoint WITHOUT spending.
       #[cfg(feature = "stats")]
-      if delivered {
+      if matches!(v4_out, WithdrawalSend::Sent) || matches!(v6_out, WithdrawalSend::Sent) {
         stats.goodbyes_tx(1);
       }
-      endpoint.note_withdrawal_result(handle, now, delivered);
+      endpoint.note_withdrawal_result(handle, now, v4_out, v6_out);
     }
     // Free completed withdrawals (budget spent or 2 s ceiling reached): the
     // endpoint releases each route (decrementing services_active) and reports the
@@ -1088,11 +1111,22 @@ impl<N: Net> DriverState<N> {
       .endpoint
       .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
     while let Some(handle) = self.completed_withdrawals.pop() {
-      // GC the driver ctx. The reactor delivers `ServiceUpdate`s through a
-      // DECOUPLED `async_channel`, so any `Conflict` queued at an internal
-      // retirement is already buffered in the channel and remains readable by the
-      // caller after the ctx (and its `updates` Sender) is dropped — no
-      // smoltcp-style deferred `route_freed` GC is needed.
+      // Best-effort flush of this ctx's overflow buffer into the (decoupled)
+      // `async_channel` BEFORE the ctx is dropped. A `Conflict` delivered at an
+      // internal retirement (rename-collision / encode-failure) lands in
+      // `ctx.pending` instead of the channel when the channel was FULL at that
+      // moment; once the ctx is `withdrawing`, `push_updates` skips it, so this is
+      // the last chance to move that buffered `Conflict` into the channel where it
+      // survives the ctx GC and stays readable by the caller. The flush is
+      // best-effort: if the channel is still full it can't help (an inherent
+      // backpressure limit), and a `false` (channel CLOSED — caller already
+      // dropped the receiver) just means there is nobody left to deliver to. We GC
+      // the ctx unconditionally either way: the endpoint has already freed the
+      // route, so unlike smoltcp's coupled queue there is no lazily-held slot to
+      // keep alive.
+      if let Some(ctx) = self.services.get_mut(&handle) {
+        let _ = flush_pending_service_update(ctx);
+      }
       self.services.remove(&handle);
     }
   }
@@ -1553,6 +1587,99 @@ async fn send_via<N: Net>(
     }
   }
   credits
+}
+
+/// Fan ONE endpoint-owned withdrawal (TTL=0 goodbye) datagram out to BOTH bound
+/// multicast families and report EACH family's [`WithdrawalSend`] outcome so the
+/// endpoint tracks per-family debt. Mirrors [`send_via`]'s multicast branch
+/// (same self-send tracking and `packets_tx`/`bytes_tx`/`send_errors` accounting)
+/// but, unlike the coarse `credits` count, distinguishes a PRESENT family's send
+/// result from an ABSENT socket. The mapping is by socket presence, not error kind:
+///   * present socket, `Ok` → [`WithdrawalSend::Sent`] (spend one owed round);
+///   * present socket, ANY `Err` → [`WithdrawalSend::Retry`] (keep the debt and
+///     retry until success or the 2 s ceiling). A BOUND UDP socket can fail
+///     transiently (e.g. `ENOBUFS` buffer pressure, route/interface churn) with an
+///     error kind other than `WouldBlock`/`Interrupted`; treating those as a
+///     permanent write-off would free the route after the OTHER family drains and
+///     leave this family's peers pinned to stale positive-TTL records. The ceiling
+///     is the backstop for a genuinely-wedged bound socket;
+///   * absent socket (family not bound) → [`WithdrawalSend::WriteOff`] (no reachable
+///     peers on it), so its debt never pins the withdrawal past the other family.
+async fn send_withdrawal_via<N: Net>(
+  tracker: &mut Vec<(u64, SystemTime)>,
+  v4: &Option<Arc<N::UdpSocket>>,
+  v6: &Option<Arc<N::UdpSocket>>,
+  body: &[u8],
+  #[cfg(feature = "stats")] stats: &std::sync::Arc<hick_trace::stats::Stats>,
+) -> (WithdrawalSend, WithdrawalSend) {
+  // No socket for a family → WriteOff (no peers reachable on it to withdraw from).
+  let mut v4_out = WithdrawalSend::WriteOff;
+  let mut v6_out = WithdrawalSend::WriteOff;
+  if let Some(s) = v4 {
+    let (res, send_wall) = send_to_at::<N>(s, body, MDNS_V4_DST).await;
+    // Present socket: Ok → Sent, ANY Err → Retry (never WriteOff). See
+    // `present_socket_send_outcome`.
+    v4_out = present_socket_send_outcome(&res);
+    match res {
+      Ok(_) => {
+        hick_trace::trace!(dst = %MDNS_V4_DST, len = body.len(), "withdrawal send_to v4");
+        record_self_send(tracker, body, send_wall);
+        #[cfg(feature = "stats")]
+        {
+          stats.packets_tx(1);
+          stats.bytes_tx(body.len() as u64);
+        }
+      }
+      Err(_e) => {
+        hick_trace::debug!(error = %_e, dst = %MDNS_V4_DST, "withdrawal send_to v4 failed");
+        #[cfg(feature = "stats")]
+        stats.send_errors(1);
+      }
+    }
+  }
+  if let Some(s) = v6 {
+    let (res, send_wall) = send_to_at::<N>(s, body, MDNS_V6_DST).await;
+    // Present socket: Ok → Sent, ANY Err → Retry (never WriteOff). See
+    // `present_socket_send_outcome`.
+    v6_out = present_socket_send_outcome(&res);
+    match res {
+      Ok(_) => {
+        hick_trace::trace!(dst = %MDNS_V6_DST, len = body.len(), "withdrawal send_to v6");
+        record_self_send(tracker, body, send_wall);
+        #[cfg(feature = "stats")]
+        {
+          stats.packets_tx(1);
+          stats.bytes_tx(body.len() as u64);
+        }
+      }
+      Err(_e) => {
+        hick_trace::debug!(error = %_e, dst = %MDNS_V6_DST, "withdrawal send_to v6 failed");
+        #[cfg(feature = "stats")]
+        stats.send_errors(1);
+      }
+    }
+  }
+  (v4_out, v6_out)
+}
+
+/// Map a PRESENT (bound) family's `send_to` result to its per-family withdrawal
+/// outcome: `Ok` → [`WithdrawalSend::Sent`] (spend one owed round); ANY
+/// `Err` → [`WithdrawalSend::Retry`] (keep the debt, retry until success or the
+/// 2 s ceiling).
+///
+/// The classification is deliberately NOT by `io::ErrorKind`: a BOUND UDP socket
+/// can fail transiently with a kind other than `WouldBlock`/`Interrupted` (e.g.
+/// `ENOBUFS` buffer pressure, transient route/interface churn). Writing such a
+/// family off would zero its goodbye debt and free the route as soon as the OTHER
+/// family drained, leaving this family's peers pinned to stale positive-TTL
+/// records. [`WithdrawalSend::WriteOff`] is reserved for an ABSENT socket (handled
+/// by the caller, which only invokes this for a present one); the ceiling is the
+/// backstop for a genuinely-wedged bound socket.
+fn present_socket_send_outcome<T>(res: &std::io::Result<T>) -> WithdrawalSend {
+  match res {
+    Ok(_) => WithdrawalSend::Sent,
+    Err(_) => WithdrawalSend::Retry,
+  }
 }
 
 /// Send `buf` to `dst`, returning the send result paired with the wall
@@ -2053,6 +2180,40 @@ mod tests {
     assert!(!is_on_link(Some(254)));
     assert!(!is_on_link(Some(1)));
     assert!(!is_on_link(Some(0)));
+  }
+
+  /// regression: a PRESENT (bound) family's `send_to` failure
+  /// must map to `Retry` (keep the debt, retry until the 2 s ceiling), NOT
+  /// `WriteOff`. A bound UDP socket can return transient errors whose kind is
+  /// NOT `WouldBlock`/`Interrupted` (e.g. `ENOBUFS`, route/interface churn);
+  /// writing that family off would free the route once the OTHER family drained
+  /// and strand this family's peers on stale positive-TTL records. `WriteOff` is
+  /// reserved for an ABSENT socket (the caller's `let mut … = WriteOff` default),
+  /// never produced by this present-socket classifier.
+  #[test]
+  fn present_socket_send_error_is_retry_not_writeoff() {
+    // Ok → Sent.
+    assert_eq!(
+      present_socket_send_outcome::<usize>(&Ok(42)),
+      WithdrawalSend::Sent,
+    );
+    // Every non-WouldBlock/Interrupted error kind a bound socket might surface
+    // must still be Retry (NEVER WriteOff).
+    for kind in [
+      std::io::ErrorKind::WouldBlock,
+      std::io::ErrorKind::Interrupted,
+      std::io::ErrorKind::OutOfMemory, // stands in for ENOBUFS buffer pressure
+      std::io::ErrorKind::AddrNotAvailable, // transient interface/route churn
+      std::io::ErrorKind::PermissionDenied,
+      std::io::ErrorKind::Other,
+    ] {
+      let res: std::io::Result<usize> = Err(std::io::Error::from(kind));
+      assert_eq!(
+        present_socket_send_outcome(&res),
+        WithdrawalSend::Retry,
+        "a present (bound) socket error ({kind:?}) must be Retry, not WriteOff"
+      );
+    }
   }
 
   #[test]
@@ -3018,6 +3179,137 @@ mod tests {
     state
       .register_service(mk(), t)
       .expect("the same name must be re-registerable once the withdrawal completes");
+  }
+
+  /// A `Conflict` queued at an internal retirement must still reach the host even
+  /// when, at the moment of retirement, the bounded `updates` channel was FULL so
+  /// the `Conflict` landed in the ctx's ordered overflow (`pending`) rather than
+  /// the channel. Once the ctx is `withdrawing`, `push_updates` skips it, so the
+  /// overflow would never be flushed again — and `drain_withdrawals` GCs the ctx
+  /// when the withdrawal completes, dropping the buffered `Conflict`. The
+  /// best-effort flush in `drain_withdrawals` (just before `services.remove`)
+  /// closes that window: it moves the buffered `Conflict` into the (decoupled)
+  /// channel, where it survives the ctx GC and stays readable by the caller.
+  ///
+  /// Driven through `DriverState` directly (no sockets). With no bound family the
+  /// withdrawal force-completes at its 2 s anti-pin ceiling.
+  #[cfg(feature = "tokio")]
+  #[tokio::test]
+  async fn queued_conflict_survives_withdrawal_gc_after_channel_overflow() {
+    use std::{net::Ipv4Addr, time::Duration};
+
+    use mdns_proto::ServiceUpdate;
+
+    let opts = crate::options::ServerOptions::default();
+    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+      v4: None,
+      v6: None,
+      interface_index: 0,
+    };
+    let mut state = DriverState::new(&opts, sockets);
+    let now = StdInstant::now();
+
+    let mut r = mdns_proto::ServiceRecords::new(
+      mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      mdns_proto::Name::try_from_str("cflt._ipp._tcp.local.").unwrap(),
+      mdns_proto::Name::try_from_str("cflt.local.").unwrap(),
+      631,
+      120,
+    );
+    r.add_a(Ipv4Addr::new(192, 168, 1, 10));
+    let reg = state
+      .register_service(mdns_proto::ServiceSpec::new(r), now)
+      .unwrap();
+    let handle = reg.handle;
+
+    // 1. Drive the proto to an announced state so the withdrawal snapshot is
+    //    NON-empty (otherwise the withdrawal completes instantly with nothing to
+    //    retract — we want the Conflict to outlive an in-flight withdrawal).
+    {
+      let ctx = state.services.get_mut(&handle).unwrap();
+      let mut buf = vec![0u8; 4096];
+      let mut t = now;
+      for _ in 0..40 {
+        t += Duration::from_millis(300);
+        let _ = ctx.proto.handle_timeout(t);
+        while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
+          ctx.proto.note_transmit_delivered(t);
+        }
+      }
+    }
+
+    // 2. Fill the bounded channel to capacity so the next delivery overflows into
+    //    `pending`, then deliver a `Conflict` — it lands in `pending`, NOT the
+    //    channel. This reproduces the retirement-under-backpressure state.
+    {
+      let ctx = state.services.get_mut(&handle).unwrap();
+      for _ in 0..SERVICE_UPDATE_CAPACITY {
+        assert!(deliver_service_update(ctx, ServiceUpdate::HostConflict));
+      }
+      assert!(deliver_service_update(ctx, ServiceUpdate::Conflict));
+      assert!(
+        ctx
+          .pending
+          .iter()
+          .any(|u| matches!(u, ServiceUpdate::Conflict)),
+        "the Conflict must be buffered in `pending` while the channel is full"
+      );
+    }
+
+    // 3. Begin the endpoint-owned withdrawal — exactly what the rename-collision /
+    //    encode-failure retirement arms do (mark `withdrawing`, snapshot, hand to
+    //    the endpoint). From here `push_updates` skips this ctx, so its `pending`
+    //    would never be flushed again on its own.
+    {
+      let ctx = state.services.get_mut(&handle).unwrap();
+      ctx.withdrawing = true;
+      let snap = ctx.proto.withdrawal_snapshot();
+      state.endpoint.begin_withdrawal(handle, snap, now);
+    }
+
+    // 4. Drain the channel of the filler updates so there is room for the flushed
+    //    Conflict (a still-full channel is an inherent backpressure limit the
+    //    best-effort flush cannot beat — not what we are testing here).
+    let mut drained = 0usize;
+    while reg.updates.try_recv().is_ok() {
+      drained += 1;
+    }
+    assert_eq!(
+      drained, SERVICE_UPDATE_CAPACITY,
+      "draining must recover exactly the channel-buffered filler updates"
+    );
+
+    // 5. Drive the withdrawal to completion. With no bound family each round fails
+    //    to deliver, so the endpoint force-completes at the 2 s ceiling;
+    //    `drain_withdrawals` then flushes `pending` into the channel and GCs the
+    //    ctx (dropping the `updates` Sender).
+    let mut scratch = vec![0u8; 4096];
+    let mut t = now;
+    let mut completed = false;
+    for _ in 0..64 {
+      t += Duration::from_millis(250);
+      state.drain_withdrawals(t, &mut scratch).await;
+      if !state.services.contains_key(&handle) {
+        completed = true;
+        break;
+      }
+    }
+    assert!(
+      completed,
+      "the withdrawal must complete (route freed + driver ctx GC'd)"
+    );
+
+    // 6. The buffered Conflict survived the ctx GC: it was flushed into the
+    //    decoupled channel before the Sender was dropped and is still readable.
+    match reg.updates.try_recv() {
+      Ok(ServiceUpdate::Conflict) => {}
+      other => panic!(
+        "the Conflict queued at retirement must survive the withdrawal GC and stay \
+         readable; got {other:?}"
+      ),
+    }
+
+    drop(reg);
   }
 
   /// Registering the same instance name twice maps the proto
