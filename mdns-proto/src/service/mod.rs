@@ -439,6 +439,8 @@ pub struct Service<I, TQ, EV> {
   handle: ServiceHandle,
   state: ServiceState,
   records: ServiceRecords,
+  #[cfg(feature = "stats")]
+  stats: std::sync::Arc<hick_trace::stats::Stats>,
   /// The next scheduled lifecycle deadline (probe, announce, re-announce).
   /// Never modified by response scheduling — only advanced by lifecycle logic.
   lifecycle_deadline: Option<I>,
@@ -576,6 +578,8 @@ where
       handle,
       state,
       records,
+      #[cfg(feature = "stats")]
+      stats: std::sync::Arc::new(hick_trace::stats::Stats::default()),
       lifecycle_deadline,
       response_deadline: None,
       probe_count: 0,
@@ -601,6 +605,15 @@ where
       meta_questioner_srcs: std::vec::Vec::new(),
       meta_known_answered: false,
     }
+  }
+
+  /// Replace the shared [`Stats`] handle with one from the owning [`Endpoint`].
+  ///
+  /// Called immediately after construction by `Endpoint::try_register_service`
+  /// so that all per-service counters accumulate into the endpoint-level stats.
+  #[cfg(feature = "stats")]
+  pub(crate) fn set_stats(&mut self, stats: std::sync::Arc<hick_trace::stats::Stats>) {
+    self.stats = stats;
   }
 
   /// Returns the handle assigned at registration.
@@ -742,6 +755,13 @@ where
             self.announce_count = 2;
             let _ = self.pending_updates.insert(ServiceUpdate::Established);
             self.lifecycle_deadline = re_announce_deadline(now, self.records.ttl_secs());
+            crate::trace::debug!(
+              target: "mdns_proto::service",
+              handle = self.handle.raw(),
+              "service: Announcing → Established"
+            );
+            #[cfg(feature = "stats")]
+            self.stats.services_established(1);
           } else {
             // First announcement confirmed → schedule the second one (§8.3: ≥1 s
             // later).
@@ -749,6 +769,12 @@ where
             self.state = ServiceState::Announcing(new_n);
             self.announce_count = new_n;
             self.lifecycle_deadline = announce_deadline(now, new_n);
+            crate::trace::debug!(
+              target: "mdns_proto::service",
+              handle = self.handle.raw(),
+              announce_n = new_n,
+              "service: Announcing — first announcement confirmed, scheduling second"
+            );
           }
         }
       }
@@ -1119,10 +1145,19 @@ where
   /// compute KAS-hint expiration times and schedule the jittered response
   /// deadline without needing `handle_timeout` to have fired first.
   pub fn handle_event(&mut self, event: ServiceEvent<'_>, now: I) {
+    #[cfg(feature = "tracing")]
+    let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
     // always refresh last_now so that subsequent calls (e.g.
     // Question→response_deadline, KnownAnswer→expiry) use a current reference
     // even when handle_timeout has not recently fired.
     self.last_now = Some(now);
+    crate::trace::trace!(
+      target: "mdns_proto::service",
+      handle = self.handle.raw(),
+      state = ?self.state,
+      event = ?core::mem::discriminant(&event),
+      "service: handle_event"
+    );
     match (self.state, event) {
       (ServiceState::Probing(_) | ServiceState::Init, ServiceEvent::ProbeConflict(pc)) => {
         // RFC 6762 §8.2 SIMULTANEOUS-PROBE tiebreak: don't rename immediately.
@@ -1234,6 +1269,15 @@ where
         // cycle (queued legacy replies drained before any state check, plus KAS
         // / questioner suppression state) so the re-probe window doesn't answer
         // the very name we reverted to re-verify.
+        crate::trace::warn!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          state = ?self.state,
+          rtype = ?pc.record().rtype(),
+          "service: ProbeConflict (§9 post-establishment) — reverting to probe"
+        );
+        #[cfg(feature = "stats")]
+        self.stats.conflicts(1);
         self.last_conflict_reprobe = Some(now);
         self.state = ServiceState::Init;
         self.probe_count = 0;
@@ -1505,6 +1549,12 @@ where
         if let Some(slot) = self.kas_hints.get_mut(self.kas_next_slot) {
           *slot = Some(hint);
           self.kas_next_slot = self.kas_next_slot.saturating_add(1) % KAS_RING_SIZE;
+          crate::trace::trace!(
+            target: "mdns_proto::service",
+            handle = self.handle.raw(),
+            rtype = ?ka.record().rtype(),
+            "service: KnownAnswer hint stored (§7.1 KAS)"
+          );
         }
       }
       (_, ServiceEvent::HostConflict(hc)) => {
@@ -1523,6 +1573,15 @@ where
         // be incorrect. Surface the event to the caller via
         // ServiceUpdate::HostConflict; the caller must intervene (e.g. choose a
         // new host name and re-register).
+        crate::trace::warn!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          state = ?self.state,
+          rtype = ?hc.record().rtype(),
+          "service: HostConflict — peer claimed our host name with different rdata"
+        );
+        #[cfg(feature = "stats")]
+        self.stats.conflicts(1);
         let _ = self.pending_updates.insert(ServiceUpdate::HostConflict);
       }
       _ => {}
@@ -1532,6 +1591,8 @@ where
   /// Drive timer-based transitions. Returns Ok unless arithmetic overflowed.
   #[allow(clippy::arithmetic_side_effects)]
   pub fn handle_timeout(&mut self, now: I) -> Result<(), HandleTimeoutError> {
+    #[cfg(feature = "tracing")]
+    let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
     // Cache latest `now` for use by poll_transmit's KAS filtering closure.
     // handle_event now receives `now` directly, so this is only needed
     // for the filtering closure in poll_transmit.
@@ -1564,6 +1625,18 @@ where
         // Snapshot the old records now (records are about to be mutated /
         // instance ownership about to be reset). Probe-time names that were
         // never announced have nothing cached, so no goodbye.
+        crate::trace::warn!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          state = ?self.state,
+          rename_attempt = self.rename_attempt.saturating_add(1),
+          "service: probe tiebreak lost (§8.2) — renaming"
+        );
+        #[cfg(feature = "stats")]
+        {
+          self.stats.conflicts(1);
+          self.stats.renames(1);
+        }
         if self.goodbye.any_instance() {
           // capture WHICH instance records the old name actually put on
           // the wire (§7.1 KAS may have emitted only a subset), so the rename
@@ -1660,6 +1733,11 @@ where
             // No transmit yet — the probe fires when the delay elapses.
             self.state = ServiceState::Probing(0);
             self.lifecycle_deadline = probe_deadline(now, 0, &mut self.rng);
+            crate::trace::debug!(
+              target: "mdns_proto::service",
+              handle = self.handle.raw(),
+              "service: Init → Probing(0)"
+            );
             // Init→Probing(0) schedules the NEXT deadline; no transmit this tick.
             false // no lifecycle transmit this tick
           }
@@ -1673,11 +1751,17 @@ where
             // probe interval instead of the service silently marching toward
             // Announcing with nothing on the wire (RFC 6762 §8.1: a name must be
             // probed before it is claimed).
+            crate::trace::debug!(
+              target: "mdns_proto::service",
+              handle = self.handle.raw(),
+              probe_n = n,
+              "service: Probing — enqueueing probe"
+            );
             self.push_pending(PendingTransmitKind::Probe);
             self.lifecycle_deadline = probe_deadline(now, n, &mut self.rng);
             true
           }
-          ServiceState::Announcing(_) => {
+          ServiceState::Announcing(_n) => {
             // an announce deadline fired — schedule the announcement
             // transmit but do NOT advance the phase here. The phase progression
             // and the Established update happen on CONFIRMED delivery
@@ -1686,12 +1770,23 @@ where
             // unconfirmed (all-socket-failed) send is retried rather than the
             // service silently progressing to Established with nothing on the
             // wire. A confirmed send overwrites this deadline.
+            crate::trace::debug!(
+              target: "mdns_proto::service",
+              handle = self.handle.raw(),
+              announce_n = _n,
+              "service: Announcing — enqueueing announcement"
+            );
             self.push_pending(PendingTransmitKind::Announcement);
             self.lifecycle_deadline = announce_deadline(now, 1);
             true
           }
           ServiceState::Established => {
             // The lifecycle deadline that fired is the periodic re-announce.
+            crate::trace::debug!(
+              target: "mdns_proto::service",
+              handle = self.handle.raw(),
+              "service: Established — enqueueing periodic re-announce"
+            );
             self.push_pending(PendingTransmitKind::Announcement);
             self.lifecycle_deadline = re_announce_deadline(now, self.records.ttl_secs());
             true
@@ -1733,6 +1828,8 @@ where
     now: I,
     buf: &mut [u8],
   ) -> Result<Option<Transmit>, TransmitError> {
+    #[cfg(feature = "tracing")]
+    let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
     // the commit token is a SINGLE slot. If a previously produced
     // datagram has not yet been confirmed via `note_transmit_result`, do NOT
     // hand out (and silently overwrite the token of) another one — that would
@@ -1767,6 +1864,13 @@ where
       };
       match encoded {
         Ok(n) => {
+          crate::trace::debug!(
+            target: "mdns_proto::service",
+            handle = self.handle.raw(),
+            "service: poll_transmit emitting rename goodbye (TTL=0)"
+          );
+          #[cfg(feature = "stats")]
+          self.stats.goodbyes_tx(1);
           // Confirm-on-send: stamp the commit token and DEFER spending the resend
           // budget (and scheduling the next resend) to `note_transmit_result`. An
           // all-family-busy send must NOT consume the withdrawal — the budget is
@@ -1775,6 +1879,11 @@ where
           return Ok(Some(Transmit::new(respond::multicast_dst(), None, n)));
         }
         Err(_) => {
+          crate::trace::warn!(
+            target: "mdns_proto::service",
+            handle = self.handle.raw(),
+            "service: poll_transmit rename goodbye BufferTooSmall"
+          );
           return Err(TransmitError::BufferTooSmall(
             crate::error::BufferTooSmallDetail::new(buf.len(), buf.len()),
           ));
@@ -1871,23 +1980,57 @@ where
     };
     // which owner groups a Response actually emitted (after KAS).
     let mut resp_emitted = respond::EmittedRecords::default();
+    // Per-response KAS suppression count (incremented inside the filter closure
+    // via shared Cell, then bumped into stats after encoding).
+    #[cfg(feature = "stats")]
+    let kas_suppressed = core::cell::Cell::new(0u64);
     let n = match kind {
-      PendingTransmitKind::Probe => respond::write_probe(&self.records, buf).map_err(|_| {
-        TransmitError::BufferTooSmall(crate::error::BufferTooSmallDetail::new(
-          buf.len(),
-          buf.len(),
-        ))
-      })?,
-      PendingTransmitKind::Announcement => {
-        // Unsolicited announcements (Announcing(_) phase and periodic re-announce
-        // from Established) are sent without KAS filtering. RFC 6762 §7.1
-        // known-answer suppression only applies to question responses.
-        respond::write_announce(&self.records, buf).map_err(|_| {
+      PendingTransmitKind::Probe => {
+        let n = respond::write_probe(&self.records, buf).map_err(|_| {
+          crate::trace::warn!(
+            target: "mdns_proto::service",
+            handle = self.handle.raw(),
+            "service: poll_transmit probe BufferTooSmall"
+          );
           TransmitError::BufferTooSmall(crate::error::BufferTooSmallDetail::new(
             buf.len(),
             buf.len(),
           ))
-        })?
+        })?;
+        crate::trace::debug!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          bytes = n,
+          "service: poll_transmit emitting probe"
+        );
+        #[cfg(feature = "stats")]
+        self.stats.probes_tx(1);
+        n
+      }
+      PendingTransmitKind::Announcement => {
+        // Unsolicited announcements (Announcing(_) phase and periodic re-announce
+        // from Established) are sent without KAS filtering. RFC 6762 §7.1
+        // known-answer suppression only applies to question responses.
+        let n = respond::write_announce(&self.records, buf).map_err(|_| {
+          crate::trace::warn!(
+            target: "mdns_proto::service",
+            handle = self.handle.raw(),
+            "service: poll_transmit announcement BufferTooSmall"
+          );
+          TransmitError::BufferTooSmall(crate::error::BufferTooSmallDetail::new(
+            buf.len(),
+            buf.len(),
+          ))
+        })?;
+        crate::trace::debug!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          bytes = n,
+          "service: poll_transmit emitting announcement"
+        );
+        #[cfg(feature = "stats")]
+        self.stats.announcements_tx(1);
+        n
       }
       PendingTransmitKind::Response => {
         // Jittered question responses normally apply KAS filtering
@@ -1925,7 +2068,7 @@ where
               crate::wire::ResourceType::A | crate::wire::ResourceType::AAAA => KasOwner::Host,
               _ => return false,
             };
-            hints.iter().any(|slot| match slot {
+            let suppressed = hints.iter().any(|slot| match slot {
               Some(hint) => {
                 hint.owner == owner
                   && hint.rtype == rtype
@@ -1933,15 +2076,39 @@ where
                   && hint.expires_at > now_ref
               }
               None => false,
-            })
+            });
+            #[cfg(feature = "stats")]
+            if suppressed {
+              kas_suppressed.set(kas_suppressed.get().saturating_add(1));
+            }
+            suppressed
           })
           .map_err(|_| {
+            crate::trace::warn!(
+              target: "mdns_proto::service",
+              handle = self.handle.raw(),
+              "service: poll_transmit response BufferTooSmall"
+            );
             TransmitError::BufferTooSmall(crate::error::BufferTooSmallDetail::new(
               buf.len(),
               buf.len(),
             ))
           })?;
         resp_emitted = emitted;
+        crate::trace::debug!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          bytes = encoded,
+          "service: poll_transmit emitting response"
+        );
+        #[cfg(feature = "stats")]
+        {
+          self.stats.responses_tx(1);
+          let s = kas_suppressed.get();
+          if s > 0 {
+            self.stats.answers_suppressed_kas(s);
+          }
+        }
         encoded
       }
     };

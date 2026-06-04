@@ -31,7 +31,7 @@ slab = ["dep:slab"]
 heapless = ["dep:heapless"]
 tracing = ["hick-trace/tracing"]
 metrics = ["hick-trace/metrics"]
-stats = ["hick-trace/stats"]
+stats = ["hick-trace/stats", "alloc"]
 
 # Opt-in stretch test that link-checks panic-freedom via `no-panic`.
 # Disabled by default because std-feature builds transitively pull in

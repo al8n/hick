@@ -115,6 +115,8 @@ impl CollectedAnswer {
 #[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 pub struct Query<I, AN, EV> {
   handle: QueryHandle,
+  #[cfg(feature = "stats")]
+  stats: std::sync::Arc<hick_trace::stats::Stats>,
   qname: Name,
   qtype: ResourceType,
   qclass: ResourceClass,
@@ -186,6 +188,8 @@ where
   ) -> Self {
     Self {
       handle,
+      #[cfg(feature = "stats")]
+      stats: std::sync::Arc::new(hick_trace::stats::Stats::default()),
       qname,
       qtype,
       qclass,
@@ -209,6 +213,15 @@ where
       unicast_response,
       timeout_deadline,
     }
+  }
+
+  /// Replace the shared [`Stats`] handle with one from the owning [`Endpoint`].
+  ///
+  /// Called immediately after construction by `Endpoint::try_start_query`
+  /// so that all per-query counters accumulate into the endpoint-level stats.
+  #[cfg(feature = "stats")]
+  pub(crate) fn set_stats(&mut self, stats: std::sync::Arc<hick_trace::stats::Stats>) {
+    self.stats = stats;
   }
 
   /// Override the maximum number of collected answers (default 256).
@@ -258,6 +271,14 @@ where
 
   /// Process an event routed to this query by the Endpoint.
   pub fn handle_event(&mut self, event: QueryEvent<'_>) {
+    #[cfg(feature = "tracing")]
+    let _span = hick_trace::trace_span!("query", handle = self.handle.raw()).entered();
+    crate::trace::trace!(
+      target: "mdns_proto::query",
+      handle = self.handle.raw(),
+      event = ?core::mem::discriminant(&event),
+      "query: handle_event"
+    );
     match event {
       QueryEvent::Answer(record) => {
         // TTL=0 records are mDNS "goodbye" / deletion records
@@ -314,6 +335,12 @@ where
             && existing.rclass() == record.rclass()
             && existing.rdata_key() == key
           {
+            crate::trace::trace!(
+              target: "mdns_proto::query",
+              handle = self.handle.raw(),
+              rtype = ?record.rtype(),
+              "query: answer deduped (already collected)"
+            );
             return;
           }
         }
@@ -339,6 +366,11 @@ where
             });
           }
           if let Some((victim_key, _)) = victim {
+            crate::trace::trace!(
+              target: "mdns_proto::query",
+              handle = self.handle.raw(),
+              "query: evicting oldest answer (cap reached)"
+            );
             self.answers.try_remove(victim_key);
           }
         }
@@ -360,6 +392,15 @@ where
           .is_ok()
         {
           self.next_seq = self.next_seq.saturating_add(1);
+          crate::trace::trace!(
+            target: "mdns_proto::query",
+            handle = self.handle.raw(),
+            rtype = ?record.rtype(),
+            seq = new_seq,
+            "query: answer collected"
+          );
+          #[cfg(feature = "stats")]
+          self.stats.answers_collected(1);
         }
       }
       QueryEvent::Truncated => {
@@ -385,6 +426,8 @@ where
 
   /// Drive timer-based transitions.
   pub fn handle_timeout(&mut self, now: I) -> Result<(), HandleTimeoutError> {
+    #[cfg(feature = "tracing")]
+    let _span = hick_trace::trace_span!("query", handle = self.handle.raw()).entered();
     if self.done {
       return Ok(());
     }
@@ -394,11 +437,21 @@ where
     if let Some(td) = self.timeout_deadline
       && now >= td
     {
+      crate::trace::trace!(
+        target: "mdns_proto::query",
+        handle = self.handle.raw(),
+        "query: absolute timeout deadline reached"
+      );
       self.done = true;
       self.transmit_pending = false;
       let _ = self.pending_updates.insert(QueryUpdate::Timeout);
       self.next_deadline = None;
       self.timeout_deadline = None;
+      #[cfg(feature = "stats")]
+      {
+        self.stats.queries_timeout(1);
+        self.stats.queries_done(1);
+      }
       return Ok(());
     }
 
@@ -413,16 +466,33 @@ where
     // actually sent (`retry_count`, incremented by `poll_transmit`); once the
     // full budget is spent, retire the query instead of scheduling more.
     if self.retry_count > MAX_RETRIES {
+      crate::trace::trace!(
+        target: "mdns_proto::query",
+        handle = self.handle.raw(),
+        retry_count = self.retry_count,
+        "query: retry budget exhausted — timeout"
+      );
       self.done = true;
       self.transmit_pending = false;
       let _ = self.pending_updates.insert(QueryUpdate::Timeout);
       self.next_deadline = None;
       self.timeout_deadline = None;
+      #[cfg(feature = "stats")]
+      {
+        self.stats.queries_timeout(1);
+        self.stats.queries_done(1);
+      }
     } else {
       // Mark a transmit due now and clear the deadline; `poll_transmit` emits
       // the datagram and schedules the following retry. Clearing the deadline
       // makes repeated `handle_timeout` calls before the drain no-ops, so a
       // single fired tick yields exactly one retransmit.
+      crate::trace::trace!(
+        target: "mdns_proto::query",
+        handle = self.handle.raw(),
+        retry_count = self.retry_count,
+        "query: retry due — arming transmit"
+      );
       self.transmit_pending = true;
       self.next_deadline = None;
     }
@@ -445,6 +515,11 @@ where
     let _ = self.pending_updates.insert(QueryUpdate::Timeout);
     self.next_deadline = None;
     self.timeout_deadline = None;
+    #[cfg(feature = "stats")]
+    {
+      self.stats.queries_timeout(1);
+      self.stats.queries_done(1);
+    }
   }
 
   /// Produce the next outgoing datagram, if any. Writes into `buf`.
@@ -459,6 +534,8 @@ where
     _now: I,
     buf: &mut [u8],
   ) -> Result<Option<Transmit>, TransmitError> {
+    #[cfg(feature = "tracing")]
+    let _span = hick_trace::trace_span!("query", handle = self.handle.raw()).entered();
     if self.done || !self.transmit_pending {
       return Ok(None);
     }
@@ -482,6 +559,14 @@ where
     // result (`note_transmit_result`), which schedules the backoff on a
     // confirmed send and re-attempts (without burning the budget) on failure.
     self.awaiting_send_confirm = true;
+    crate::trace::debug!(
+      target: "mdns_proto::query",
+      handle = self.handle.raw(),
+      qname = self.qname.as_str(),
+      qtype = ?self.qtype,
+      bytes = n,
+      "query: poll_transmit emitting question"
+    );
     Ok(Some(Transmit::new(
       crate::service::multicast_dst(),
       None,
