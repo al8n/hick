@@ -115,6 +115,14 @@ jobs:
       - run: cargo check -p hick-trace --features stats --target thumbv7em-none-eabihf
       # Verify defmt + stats compile together on embedded target.
       - run: cargo check -p hick-smoltcp -p hick-embassy --features defmt,stats --target thumbv7em-none-eabihf
+      # F4 guard: valid bare-metal observability (stats without metrics facade).
+      - run: cargo build -p hick --no-default-features --features embassy,stats
+      # F4 guard: `mdns-proto` no_std + alloc + stats must check on embedded.
+      - run: cargo check -p mdns-proto --no-default-features --features alloc,stats --target thumbv7em-none-eabihf
+      # F4 guard: `hick --features embassy,metrics` must FAIL on bare-metal because
+      # metrics implies std and the metrics facade requires std. The `!` prefix
+      # inverts the exit code so CI fails if the check unexpectedly succeeds.
+      - run: "! cargo check -p hick --no-default-features --features embassy,metrics --target thumbv7em-none-eabihf 2>/dev/null"
       # The `mdns-proto` no_std + alloc tier must also build for wasm32 (claimed in
       # its feature-tier table); the thumbv7em check above does not exercise it.
       - run: cargo check -p mdns-proto --no-default-features --features alloc --target wasm32-unknown-unknown
@@ -154,6 +162,13 @@ jobs:
       - run: cargo test -p mdns-proto --features tracing,stats
       - run: cargo test -p mdns-proto --all-features
       - run: cargo test -p hick-reactor --features stats
+      # F1 guard: a metrics-only build must compile the stats code (metrics
+      # implies stats).  If the implication is missing, `metrics` links the
+      # backend but constructs no Stats objects and emits nothing.
+      - run: cargo build -p mdns-proto --features metrics
+      - run: cargo build -p hick-reactor --features metrics
+      # Verify the hick-trace no-op tests run clean (default = no tracing).
+      - run: cargo test -p hick-trace
 
   miri:
     runs-on: ubuntu-latest

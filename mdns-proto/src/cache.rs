@@ -107,7 +107,7 @@ pub struct Cache<I, P> {
   max_entries: usize,
   _phantom: core::marker::PhantomData<I>,
   #[cfg(feature = "stats")]
-  stats: std::sync::Arc<hick_trace::stats::Stats>,
+  stats: Option<std::sync::Arc<hick_trace::stats::Stats>>,
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -123,7 +123,7 @@ where
       max_entries: DEFAULT_MAX_ENTRIES,
       _phantom: core::marker::PhantomData,
       #[cfg(feature = "stats")]
-      stats: std::sync::Arc::new(hick_trace::stats::Stats::default()),
+      stats: None,
     }
   }
 
@@ -139,17 +139,26 @@ where
       max_entries: max,
       _phantom: core::marker::PhantomData,
       #[cfg(feature = "stats")]
-      stats: std::sync::Arc::new(hick_trace::stats::Stats::default()),
+      stats: None,
     }
   }
 
-  /// Replace the shared [`Stats`] handle with one from the owning [`Endpoint`].
-  ///
-  /// Called immediately after construction by the `Endpoint` so that all
-  /// per-cache counters accumulate into the endpoint-level stats.
+  /// Attach the shared [`hick_trace::stats::Stats`] handle from the owning
+  /// [`crate::endpoint::Endpoint`]. No allocation — the Arc is cloned from the
+  /// endpoint's existing single Arc. Called immediately after construction by
+  /// the `Endpoint` so that all per-cache counters accumulate into the
+  /// endpoint-level stats. Before this is called, stats bumps are no-ops
+  /// (the field is `None`).
   #[cfg(feature = "stats")]
   pub(crate) fn set_stats(&mut self, stats: std::sync::Arc<hick_trace::stats::Stats>) {
-    self.stats = stats;
+    self.stats = Some(stats);
+  }
+
+  /// Borrow the stats handle if one has been attached.
+  #[cfg(feature = "stats")]
+  #[inline]
+  fn stat(&self) -> Option<&hick_trace::stats::Stats> {
+    self.stats.as_deref()
   }
 
   /// The configured maximum number of entries.
@@ -317,9 +326,9 @@ where
         "cache: refreshed existing entry (dedup)"
       );
       #[cfg(feature = "stats")]
-      {
-        self.stats.cache_refreshes(1);
-        self.stats.set_cache_size(self.entries.len() as u64);
+      if let Some(s) = self.stat() {
+        s.cache_refreshes(1);
+        s.set_cache_size(self.entries.len() as u64);
       }
       return Ok(Some(key));
     }
@@ -335,9 +344,9 @@ where
         "cache: inserted new entry"
       );
       #[cfg(feature = "stats")]
-      {
-        self.stats.cache_inserts(1);
-        self.stats.set_cache_size(self.entries.len() as u64);
+      if let Some(s) = self.stat() {
+        s.cache_inserts(1);
+        s.set_cache_size(self.entries.len() as u64);
       }
     }
     result
@@ -370,7 +379,9 @@ where
           "cache: proactive eviction (cap reached)"
         );
         #[cfg(feature = "stats")]
-        self.stats.cache_evictions(1);
+        if let Some(s) = self.stat() {
+          s.cache_evictions(1);
+        }
       }
     }
 
@@ -393,7 +404,9 @@ where
             "cache: reactive eviction (pool capacity error)"
           );
           #[cfg(feature = "stats")]
-          self.stats.cache_evictions(1);
+          if let Some(s) = self.stat() {
+            s.cache_evictions(1);
+          }
         }
         self.entries.insert(entry)
       }
@@ -421,10 +434,10 @@ where
         "cache: swept expired entries"
       );
       #[cfg(feature = "stats")]
-      {
+      if let Some(s) = self.stat() {
         #[allow(clippy::cast_possible_truncation)]
-        self.stats.cache_expirations(removed as u64);
-        self.stats.set_cache_size(self.entries.len() as u64);
+        s.cache_expirations(removed as u64);
+        s.set_cache_size(self.entries.len() as u64);
       }
     }
     removed

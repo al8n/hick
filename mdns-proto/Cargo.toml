@@ -30,7 +30,11 @@ alloc = ["dep:smol_str", "dep:rand"]
 slab = ["dep:slab"]
 heapless = ["dep:heapless"]
 tracing = ["hick-trace/tracing"]
-metrics = ["hick-trace/metrics"]
+# `metrics` forwards to the `metrics` facade crate (std-only). It implies
+# `std` explicitly so that bare-metal builds fail clearly ("metrics requires
+# std") rather than silently pulling a std feature into a no_std target.
+# Bare-metal observability: use `stats` (+ `defmt`) instead.
+metrics = ["std", "stats", "hick-trace/metrics"]
 stats = ["hick-trace/stats", "alloc"]
 
 # Opt-in stretch test that link-checks panic-freedom via `no-panic`.

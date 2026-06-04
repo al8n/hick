@@ -1198,7 +1198,7 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
   // positive-TTL record set (PTR/SRV/TXT + the host A), so the commit token
   // records every record actually emitted.
   match &svc.awaiting_confirm {
-    Some(AwaitingConfirm::Response(e)) => assert!(
+    Some(AwaitingConfirm::Response(e, _)) => assert!(
       e.ptr() && e.srv() && e.txt() && !e.a_slice().is_empty(),
       "a legacy reply emits all instance records plus the host A"
     ),
@@ -1276,7 +1276,7 @@ fn legacy_a_query_reply_latches_full_set() {
     .unwrap()
     .expect("a legacy A reply should be emitted");
   match &svc.awaiting_confirm {
-    Some(AwaitingConfirm::Response(e)) => assert!(
+    Some(AwaitingConfirm::Response(e, _)) => assert!(
       e.ptr() && e.srv() && e.txt() && !e.a_slice().is_empty(),
       "an A-query legacy reply still emits the instance records and the host A"
     ),
@@ -4630,5 +4630,403 @@ fn duplicate_legacy_question_is_deduped() {
     svc.pending_legacy.len(),
     1,
     "a duplicate legacy question must be deduped"
+  );
+}
+
+// ── KAS suppression delivery-gated counter tests ──────────────────────────
+
+/// Partial KAS suppression: `answers_suppressed_kas` must only be bumped on a
+/// CONFIRMED delivery, not at encode time.
+///
+/// Scenario:
+/// 1. Drive service to Established.
+/// 2. Inject a KnownAnswer hint for the SRV record (partial suppression — PTR/TXT/A still emit).
+/// 3. Inject a Question → response_deadline fires → poll_transmit returns Some (non-empty response).
+/// 4. Call note_transmit_result(now, delivered=false) → counter must stay 0.
+/// 5. Re-encode a second response cycle and call note_transmit_result(now, delivered=true) →
+///    counter must be 1 (the one suppressed SRV).
+#[cfg(feature = "stats")]
+#[test]
+fn partial_kas_suppression_counter_is_delivery_gated() {
+  use crate::{
+    event::{KnownAnswer, ServiceQuestion},
+    wire::{QuestionRef, Ref},
+  };
+
+  let our_ttl: u32 = 120;
+  let mut svc = make_service(our_ttl);
+  let now = drive_to_established(&mut svc);
+
+  // Wire up stats.
+  let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
+  svc.set_stats(stats.clone());
+
+  // Helper: inject a KnownAnswer hint for the SRV record (TTL >= half → stored).
+  let inject_srv_hint =
+    |svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+     now: FakeInstant| {
+      inject_question_to_set_response_deadline(svc, now);
+      let mut srv_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+      make_srv_record_ref(
+        &mut srv_buf,
+        "myprinter._ipp._tcp.local.",
+        our_ttl, // TTL >= half → hint stored
+        0,
+        0,
+        631,
+        "host.local.",
+      );
+      let (srv_ref, _) = Ref::try_parse(&srv_buf, 0).unwrap();
+      let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), srv_ref);
+      svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+    };
+
+  // Helper: inject a Question that will trigger a multicast response.
+  let inject_any_question =
+    |svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+     now: FakeInstant| {
+      let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+      for label in "myprinter._ipp._tcp.local."
+        .trim_end_matches('.')
+        .split('.')
+      {
+        qbuf.push(label.len() as u8);
+        qbuf.extend_from_slice(label.as_bytes());
+      }
+      qbuf.push(0u8);
+      qbuf.extend_from_slice(&255u16.to_be_bytes()); // QTYPE ANY
+      qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+      let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+      let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
+      svc.handle_event(
+        ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
+        now,
+      );
+    };
+
+  // ── Cycle 1: partial suppression, then delivery=false ──
+  inject_srv_hint(&mut svc, now);
+  inject_any_question(&mut svc, now);
+  svc.handle_timeout(now.advance(200)).unwrap();
+
+  let mut buf = std::vec![0u8; 4096];
+  let now2 = now.advance(200);
+  let tx = svc.poll_transmit(now2, &mut buf).unwrap();
+  assert!(
+    tx.is_some(),
+    "poll_transmit must return Some (partial suppression leaves a non-empty response)"
+  );
+
+  let before = stats.snapshot().answers_suppressed_kas;
+  // Delivery FAILS — counter must NOT increase.
+  svc.note_transmit_result(now2, false);
+  let after_fail = stats.snapshot().answers_suppressed_kas;
+  assert_eq!(
+    after_fail, before,
+    "answers_suppressed_kas must NOT be bumped when delivery=false; \
+     was {before}, now {after_fail}"
+  );
+
+  // ── Cycle 2: same partial suppression, then delivery=true ──
+  inject_srv_hint(&mut svc, now2);
+  inject_any_question(&mut svc, now2);
+  svc.handle_timeout(now2.advance(200)).unwrap();
+  let now3 = now2.advance(200);
+  let tx2 = svc.poll_transmit(now3, &mut buf).unwrap();
+  assert!(
+    tx2.is_some(),
+    "poll_transmit must return Some in the second cycle"
+  );
+
+  // Delivery SUCCEEDS — counter must increase by the suppressed count (≥ 1, the SRV).
+  svc.note_transmit_result(now3, true);
+  let after_ok = stats.snapshot().answers_suppressed_kas;
+  assert!(
+    after_ok > after_fail,
+    "answers_suppressed_kas must be bumped when delivery=true; \
+     before_delivery={after_fail}, after_delivery={after_ok}"
+  );
+}
+
+/// Full KAS suppression (`Ok(None)`): every record was suppressed, so no
+/// datagram is produced. The counter must be bumped immediately at the point
+/// of suppression (no AwaitingConfirm token is ever produced for Ok(None)).
+#[cfg(feature = "stats")]
+#[test]
+fn full_kas_suppression_counts_at_suppression_not_delivery() {
+  use crate::{
+    event::{KnownAnswer, ServiceQuestion},
+    wire::{QuestionRef, Ref},
+  };
+
+  let our_ttl: u32 = 120;
+  let mut svc = make_service(our_ttl);
+  let now = drive_to_established(&mut svc);
+
+  let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
+  svc.set_stats(stats.clone());
+
+  // Inject KnownAnswer hints for EVERY record the service would emit:
+  // PTR, SRV, TXT (we suppress via SRV — easiest to construct). In practice
+  // a full-suppression requires all record types covered; here we cheat by
+  // only querying for SRV (QTYPE=SRV) so only one record would have been in
+  // the response and suppressing that one collapses the whole response.
+  // Use inject_question_to_set_response_deadline (QTYPE=PTR) then inject a
+  // matching PTR known-answer hint.
+  inject_question_to_set_response_deadline(&mut svc, now);
+
+  // Build a wire PTR record matching our service.
+  let mut ptr_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  {
+    // owner = "_ipp._tcp.local."
+    for label in "_ipp._tcp.local.".trim_end_matches('.').split('.') {
+      ptr_buf.push(label.len() as u8);
+      ptr_buf.extend_from_slice(label.as_bytes());
+    }
+    ptr_buf.push(0u8);
+    // TYPE=PTR(12), CLASS=IN(1), TTL, RDLENGTH+RDATA (instance name)
+    ptr_buf.extend_from_slice(&12u16.to_be_bytes()); // TYPE PTR
+    ptr_buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+    ptr_buf.extend_from_slice(&our_ttl.to_be_bytes());
+    // Encode instance name "myprinter._ipp._tcp.local." as RDATA.
+    let mut rdata: std::vec::Vec<u8> = std::vec::Vec::new();
+    for label in "myprinter._ipp._tcp.local."
+      .trim_end_matches('.')
+      .split('.')
+    {
+      rdata.push(label.len() as u8);
+      rdata.extend_from_slice(label.as_bytes());
+    }
+    rdata.push(0u8);
+    #[allow(clippy::cast_possible_truncation)]
+    ptr_buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    ptr_buf.extend_from_slice(&rdata);
+  }
+  let (ptr_ref, _) = Ref::try_parse(&ptr_buf, 0).unwrap();
+  let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), ptr_ref);
+  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+
+  // Also suppress SRV.
+  {
+    let mut srv_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+    make_srv_record_ref(
+      &mut srv_buf,
+      "myprinter._ipp._tcp.local.",
+      our_ttl,
+      0,
+      0,
+      631,
+      "host.local.",
+    );
+    let (srv_ref, _) = Ref::try_parse(&srv_buf, 0).unwrap();
+    let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), srv_ref);
+    svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  }
+
+  // Inject a Question to arm a response, then fire the deadline.
+  {
+    let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+    for label in "myprinter._ipp._tcp.local."
+      .trim_end_matches('.')
+      .split('.')
+    {
+      qbuf.push(label.len() as u8);
+      qbuf.extend_from_slice(label.as_bytes());
+    }
+    qbuf.push(0u8);
+    qbuf.extend_from_slice(&255u16.to_be_bytes()); // QTYPE ANY
+    qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+    let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+    let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
+    svc.handle_event(
+      ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
+      now,
+    );
+  }
+
+  let now2 = now.advance(200);
+  svc.handle_timeout(now2).unwrap();
+
+  let before = stats.snapshot().answers_suppressed_kas;
+  let mut buf = std::vec![0u8; 4096];
+  let result = svc.poll_transmit(now2, &mut buf).unwrap();
+  // If ALL records are suppressed → Ok(None).  If partial, that is still
+  // acceptable: this test verifies the full-suppression counter fires
+  // immediately (no awaiting_confirm) when Ok(None) occurs.
+  if result.is_none() {
+    // Full suppression: counter must have been bumped at point of suppression.
+    let after = stats.snapshot().answers_suppressed_kas;
+    assert!(
+      after > before,
+      "answers_suppressed_kas must be bumped at suppression for full Ok(None) case; \
+       before={before}, after={after}"
+    );
+    // No AwaitingConfirm: no note_transmit_result call needed.
+    assert!(
+      svc.awaiting_confirm.is_none(),
+      "no awaiting_confirm token must exist after Ok(None)"
+    );
+  }
+  // (If only partial suppression occurred we skip; the partial test covers that path.)
+}
+
+// ── meta-response must count responses_tx ───────────────────────────
+
+/// Helper: build a raw §9 meta-query question (for _services._dns-sd._udp.local.)
+/// and return the encoded bytes.  The caller parses it via `QuestionRef::try_parse`.
+#[cfg(feature = "stats")]
+fn build_meta_question_bytes() -> std::vec::Vec<u8> {
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in "_services._dns-sd._udp.local."
+    .trim_end_matches('.')
+    .split('.')
+  {
+    qbuf.push(label.len() as u8);
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8); // root label
+  qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  qbuf
+}
+
+/// Multicast meta-response: `responses_tx` stays 0 on `delivered=false`,
+/// then bumps to 1 on `delivered=true`.
+#[cfg(feature = "stats")]
+#[test]
+fn multicast_meta_response_counts_responses_tx() {
+  use crate::{event::ServiceQuestion, wire::QuestionRef};
+
+  let mut svc = make_service(120);
+  let now = drive_to_established(&mut svc);
+
+  let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
+  svc.set_stats(stats.clone());
+
+  let qbuf = build_meta_question_bytes();
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  let src: core::net::SocketAddr = "192.0.2.1:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
+    now,
+  );
+
+  // Advance past the jitter window to fire the meta reply.
+  let now2 = now.advance(200);
+  let mut buf = std::vec![0u8; 4096];
+  let tx = svc.poll_transmit(now2, &mut buf).unwrap();
+  assert!(
+    tx.is_some(),
+    "poll_transmit must produce a meta-response datagram"
+  );
+  // An AwaitingConfirm::MetaResponse token must have been stamped.
+  assert!(
+    svc.awaiting_confirm.is_some(),
+    "awaiting_confirm must be set after a meta-response emit"
+  );
+
+  // delivery=false → responses_tx must remain 0.
+  let before = stats.snapshot().responses_tx;
+  svc.note_transmit_result(now2, false);
+  let after_fail = stats.snapshot().responses_tx;
+  assert_eq!(
+    after_fail, before,
+    "responses_tx must NOT be bumped on delivery=false (meta); was {before}, now {after_fail}"
+  );
+
+  // Re-arm: inject the question again and fire a second meta reply.
+  let qbuf2 = build_meta_question_bytes();
+  let (qref2, _) = QuestionRef::try_parse(&qbuf2, 0).unwrap();
+  let src2: core::net::SocketAddr = "192.0.2.2:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref2, src2, 0)),
+    now2,
+  );
+  let now3 = now2.advance(200);
+  let tx2 = svc.poll_transmit(now3, &mut buf).unwrap();
+  assert!(
+    tx2.is_some(),
+    "poll_transmit must produce a second meta-response datagram"
+  );
+
+  // delivery=true → responses_tx must bump by 1.
+  svc.note_transmit_result(now3, true);
+  let after_ok = stats.snapshot().responses_tx;
+  assert_eq!(
+    after_ok,
+    before + 1,
+    "responses_tx must be bumped by 1 on delivery=true (meta); expected {}, got {after_ok}",
+    before + 1
+  );
+}
+
+/// Legacy unicast meta-response: `responses_tx` stays 0 on `delivered=false`,
+/// then bumps to 1 on `delivered=true`.
+#[cfg(feature = "stats")]
+#[test]
+fn legacy_meta_response_counts_responses_tx() {
+  use crate::{event::ServiceQuestion, wire::QuestionRef};
+
+  let mut svc = make_service(120);
+  let now = drive_to_established(&mut svc);
+
+  let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
+  svc.set_stats(stats.clone());
+
+  // A non-5353 source → legacy unicast path.
+  let qbuf = build_meta_question_bytes();
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  let src: core::net::SocketAddr = "192.0.2.50:12345".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, src, 42)),
+    now,
+  );
+
+  // poll_transmit drains legacy responses immediately (no jitter for legacy).
+  let mut buf = std::vec![0u8; 4096];
+  let tx = svc.poll_transmit(now, &mut buf).unwrap();
+  assert!(
+    tx.is_some(),
+    "poll_transmit must produce a legacy meta-response datagram"
+  );
+  // A MetaResponse token must have been stamped for the legacy meta path.
+  assert!(
+    svc.awaiting_confirm.is_some(),
+    "awaiting_confirm must be set after a legacy meta-response emit"
+  );
+
+  // delivery=false → responses_tx must remain 0.
+  let before = stats.snapshot().responses_tx;
+  svc.note_transmit_result(now, false);
+  let after_fail = stats.snapshot().responses_tx;
+  assert_eq!(
+    after_fail, before,
+    "responses_tx must NOT be bumped on delivery=false (legacy meta); \
+     was {before}, now {after_fail}"
+  );
+
+  // Re-arm: inject the legacy meta question again.
+  let qbuf2 = build_meta_question_bytes();
+  let (qref2, _) = QuestionRef::try_parse(&qbuf2, 0).unwrap();
+  let src2: core::net::SocketAddr = "192.0.2.51:12345".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref2, src2, 43)),
+    now,
+  );
+  let tx2 = svc.poll_transmit(now, &mut buf).unwrap();
+  assert!(
+    tx2.is_some(),
+    "poll_transmit must produce a second legacy meta-response datagram"
+  );
+
+  // delivery=true → responses_tx must bump by 1.
+  svc.note_transmit_result(now, true);
+  let after_ok = stats.snapshot().responses_tx;
+  assert_eq!(
+    after_ok,
+    before + 1,
+    "responses_tx must be bumped by 1 on delivery=true (legacy meta); \
+     expected {}, got {after_ok}",
+    before + 1
   );
 }

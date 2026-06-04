@@ -16,7 +16,8 @@ readme = "README.md"
 [features]
 default = []
 tracing = ["mdns-proto/tracing", "hick-smoltcp/tracing", "hick-trace/tracing"]
-metrics = ["mdns-proto/metrics", "hick-smoltcp/metrics", "hick-trace/metrics"]
+# `metrics` is intentionally absent: hick-embassy is a `no_std` crate and the
+# `metrics` facade requires `std`. Enable stats-only instrumentation via `stats`.
 stats = ["mdns-proto/stats", "hick-smoltcp/stats", "hick-trace/stats"]
 defmt = ["dep:defmt", "hick-smoltcp/defmt"]
 
