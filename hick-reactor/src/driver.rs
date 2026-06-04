@@ -568,22 +568,16 @@ impl<N: Net> DriverState<N> {
                 Ok(()) => upd,
                 Err(_) => {
                   // The new name collides with another local service; the Service
-                  // has already rebranded and can't be kept. Surface Conflict (into
-                  // the handle-owned mailbox's reserved terminal slot), then retire
-                  // it: `remove_service` begins the endpoint-owned withdrawal for
-                  // the CURRENT name and holds the route (keeping it reserved) while
-                  // it resends, freeing the name on completion. The OLD name's
-                  // goodbye was already enqueued above as its own detached item. The
-                  // mailbox outlives the ctx, so this Conflict still reaches the
-                  // host even after the withdrawal GCs the ctx.
+                  // has already rebranded and can't be kept. Synthesize a terminal
+                  // Conflict and fall through to the UNIFIED retirement below — the
+                  // OLD name's goodbye was already enqueued above as its own
+                  // detached item.
                   hick_trace::warn!(
                     handle = ?handle,
                     new_name = %renamed.new_name(),
                     "auto-rename collided with another registered service; emitting Conflict"
                   );
-                  deliver_service_update(ctx, ServiceUpdate::Conflict);
-                  removed_services.push(*handle);
-                  break;
+                  ServiceUpdate::Conflict
                 }
               }
             }
@@ -592,7 +586,23 @@ impl<N: Net> DriverState<N> {
           // The mailbox coalesces by kind (one Established, latest Renamed) and
           // reserves the terminal, so a hostile peer repeating an event cannot
           // grow it — no consecutive-duplicate bookkeeping needed here.
+          //
+          // A terminal update — Conflict/HostConflict, whether emitted directly by
+          // the proto state machine (e.g. unresolvable §9 conflict, host-name
+          // claimed during probing) or synthesized above for a rebrand collision —
+          // RETIRES the service: deliver it into the reserved terminal slot, then
+          // begin the endpoint-owned §10.1 withdrawal so the ctx/route are GC'd and
+          // the proto stops serving. Without this a proto-emitted terminal left the
+          // service live (still answering queries) until the caller dropped the
+          // handle, and `Service::next` reported end-of-stream on a still-serving
+          // ctx. The mailbox outlives the ctx, so the terminal still
+          // reaches the host even after the withdrawal GCs the ctx.
+          let is_terminal = final_upd.is_conflict() || final_upd.is_host_conflict();
           deliver_service_update(ctx, final_upd);
+          if is_terminal {
+            removed_services.push(*handle);
+            break;
+          }
         }
       }
 
@@ -3054,6 +3064,152 @@ mod tests {
       matches!(drained, Some(ServiceUpdate::Conflict)),
       "the Conflict queued at retirement must survive the unconditional ctx GC and \
        stay readable from the handle-owned mailbox; got {drained:?}"
+    );
+
+    drop(reg);
+  }
+
+  /// a terminal emitted DIRECTLY by the proto state machine — here
+  /// a `HostConflict` (a peer claimed our host name with a different address, RFC
+  /// 6762 §9) — must RETIRE the service through the SAME path as a synthesized
+  /// rename-collision Conflict: deliver the terminal into the handle-owned mailbox,
+  /// begin the endpoint-owned §10.1 withdrawal (so the proto stops serving), and GC
+  /// the ctx UNCONDITIONALLY once the withdrawal completes. Before the fix the
+  /// proto-emitted terminal was delivered to the mailbox but `withdrawing` was never
+  /// set and the withdrawal never began, so a HostConflict left a zombie ctx/route
+  /// (still answering queries) until the caller dropped the handle.
+  #[cfg(feature = "tokio")]
+  #[tokio::test]
+  async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
+    use std::{
+      net::{IpAddr, Ipv4Addr, SocketAddr},
+      time::Duration,
+    };
+
+    use mdns_proto::{
+      event::RouteEvent,
+      wire::{Header, MessageBuilder},
+    };
+
+    let opts = crate::options::ServerOptions::default();
+    let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+      v4: None,
+      v6: None,
+      interface_index: 0,
+    };
+    let mut state = DriverState::new(&opts, sockets);
+    let now = StdInstant::now();
+
+    let host = mdns_proto::Name::try_from_str("printer.local.").unwrap();
+    let mut r = mdns_proto::ServiceRecords::new(
+      mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      mdns_proto::Name::try_from_str("Printer._ipp._tcp.local.").unwrap(),
+      host.clone(),
+      631,
+      120,
+    );
+    r.add_a(Ipv4Addr::new(192, 168, 1, 10));
+    // Keep `reg` (the mailbox Arc + doorbell) alive: the live reader that must
+    // still observe the HostConflict after the ctx is GC'd.
+    let reg = state
+      .register_service(mdns_proto::ServiceSpec::new(r), now)
+      .unwrap();
+    let handle = reg.handle;
+    let mailbox = Arc::clone(&reg.mailbox);
+
+    // 1. Drive the proto to announced (non-empty withdrawal snapshot; the conflict
+    //    hits a SERVING service).
+    {
+      let ctx = state.services.get_mut(&handle).unwrap();
+      let mut buf = vec![0u8; 4096];
+      let mut t = now;
+      for _ in 0..40 {
+        t += Duration::from_millis(300);
+        let _ = ctx.proto.handle_timeout(t);
+        while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
+          ctx.proto.note_transmit_delivered(t);
+        }
+      }
+    }
+
+    // 2. Feed a §9 host conflict (a peer claims our host name with a DIFFERENT
+    //    address) through the REAL inbound path, so the proto emits a HostConflict
+    //    via poll() — the proto-emitted terminal `push_updates` must retire. This
+    //    mirrors the driver's own receive routing (split-borrow + ToService).
+    let conflict = {
+      let mut cbuf = [0u8; 512];
+      let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
+      b.push_a_authority(&host, 120, Ipv4Addr::new(10, 0, 0, 99))
+        .unwrap();
+      let n = b.finish().unwrap();
+      cbuf[..n].to_vec()
+    };
+    {
+      let DriverState {
+        endpoint, services, ..
+      } = &mut state;
+      let route_events = endpoint
+        .handle(
+          now,
+          SocketAddr::from(([192, 168, 1, 200], 5353)),
+          IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+          0,
+          &conflict,
+          false,
+        )
+        .expect("endpoint.handle must accept the host-conflict packet");
+      for ev in route_events {
+        if let Ok(RouteEvent::ToService(ts)) = ev
+          && let Some(ctx) = services.get_mut(&ts.handle())
+        {
+          ctx.proto.handle_event(ts.into_event(), now);
+        }
+      }
+    }
+
+    // 3. push_updates drains the proto's HostConflict; the fix routes the terminal
+    //    through retirement (deliver + begin the endpoint-owned withdrawal).
+    state.push_updates(now).await;
+    assert!(
+      state
+        .services
+        .get(&handle)
+        .map(|c| c.withdrawing)
+        .unwrap_or(false),
+      "a proto-emitted HostConflict must begin the withdrawal (withdrawing)"
+    );
+
+    // 4. Drive the withdrawal to completion; the ctx must be GC'd UNCONDITIONALLY
+    //    (no bound family → force-complete at the 2 s anti-pin ceiling).
+    let mut scratch = vec![0u8; 4096];
+    let mut t = now;
+    let mut gced = false;
+    for _ in 0..64 {
+      t += Duration::from_millis(250);
+      state.drain_withdrawals(t, &mut scratch).await;
+      if !state.services.contains_key(&handle) {
+        gced = true;
+        break;
+      }
+    }
+    assert!(
+      gced,
+      "the withdrawn ctx must be GC'd after the §10.1 goodbye completes"
+    );
+
+    // 5. The HostConflict terminal survived the unconditional ctx GC: it lives in
+    //    the handle-owned mailbox and is still drained by the live reader (the
+    //    non-terminal Established, if any, drains first; the terminal is last).
+    let mut saw_host_conflict = false;
+    while let Some(u) = lock_mailbox_for_test(&mailbox) {
+      if u.is_host_conflict() {
+        saw_host_conflict = true;
+      }
+    }
+    assert!(
+      saw_host_conflict,
+      "the HostConflict terminal must survive the ctx GC and stay readable from the \
+       handle-owned mailbox"
     );
 
     drop(reg);

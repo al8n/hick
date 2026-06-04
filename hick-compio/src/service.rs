@@ -89,15 +89,18 @@ impl ServiceMailbox {
   /// * `Renamed` — drop any prior pending `Renamed` and append the new one, so
   ///   only the LATEST name is kept, at its true (most recent) position (the
   ///   caller only needs the current name).
-  /// * `Established` — append only if no `Established` is already pending
-  ///   (one-time), never displacing an earlier-queued update.
+  /// * `Established` — drop any prior pending `Established` and append, keeping
+  ///   only the LATEST at its most-recent position, never displacing a pending
+  ///   `Renamed`.
   ///
-  /// Keeping the LATEST `Established` at its most-recent position preserves the
-  /// post-rename confirmation across an `Established -> Renamed -> Established`
-  /// sequence (RFC 6762 §9 conflict re-probe): the deque holds at most one entry
-  /// per non-terminal kind regardless of how much an on-link peer churns
-  /// conflict-renames; the [`SERVICE_UPDATE_CAPACITY`] cap is a hard backstop that
-  /// drops the oldest pending update if it is ever reached.
+  /// Keeping only the latest `Established` preserves the post-rename confirmation
+  /// across an `Established -> Renamed -> Established` sequence (RFC 6762 §9
+  /// conflict re-probe): the second `Established` lands AFTER the `Renamed`, so
+  /// the caller learns the new name became advertised, while a duplicate or
+  /// pre-rename `Established` coalesces away. Renamed churn still coalesces to a
+  /// single pending `Renamed`; the [`SERVICE_UPDATE_CAPACITY`] cap is a hard
+  /// backstop that drops the oldest pending update if a future non-terminal kind
+  /// ever fills it.
   ///
   /// A terminal update passed here is ROUTED to [`Self::set_terminal`] instead
   /// (terminals belong in the reserved slot); the driver routes by kind, so this
@@ -115,16 +118,22 @@ impl ServiceMailbox {
       self.bounded_push_back(upd);
       return;
     }
-    // Established (or any future non-terminal kind): dedup by discriminant so the
-    // ring holds at most one of each kind.
-    let kind = core::mem::discriminant(&upd);
-    if !self
-      .updates
-      .iter()
-      .any(|u| core::mem::discriminant(u) == kind)
-    {
+    if upd.is_established() {
+      // Keep only the LATEST `Established`, at its most-recent position: drop any
+      // prior `Established`, then append. A post-rename `Established` (the
+      // `Established -> Renamed -> Established` lifecycle: established, conflict,
+      // auto-rename, re-establish under the new name) therefore lands AFTER the
+      // pending `Renamed`, so a slow reader observes "renamed, then established
+      // under the new name" — not just that a rename happened.
+      // Globally deduping by kind instead kept the EARLIER `Established` at the
+      // front and dropped this post-rename one. Bounds the ring to one `Renamed`
+      // plus one trailing `Established` under conflict-rename churn.
+      self.updates.retain(|u| !u.is_established());
       self.bounded_push_back(upd);
+      return;
     }
+    // Any future non-terminal kind: append (bounded by the cap).
+    self.bounded_push_back(upd);
   }
 
   /// Append `upd`, evicting the oldest pending non-terminal update first if the
@@ -326,6 +335,37 @@ mod tests {
       }
       other => panic!("expected the latest Renamed; got {other:?}"),
     }
+    assert!(matches!(mb.drain(), Drained::Empty));
+  }
+
+  #[test]
+  fn mailbox_preserves_post_rename_established() {
+    // Established -> Renamed -> Established (establish, conflict, auto-rename,
+    // re-establish under the new name). A slow reader MUST still observe the
+    // post-rename Established AFTER the Renamed, so it learns the new name became
+    // advertised — not merely that a rename happened. The earlier
+    // (pre-rename) Established coalesces away: it was for the now-stale name.
+    let mut mb = ServiceMailbox::new();
+    mb.push_update(ServiceUpdate::Established); // established under the orig name
+    mb.push_update(ServiceUpdate::Established); // duplicate: coalesces
+    mb.push_update(renamed("svc-2._ipp._tcp.local.")); // §9 conflict rename
+    mb.push_update(ServiceUpdate::Established); // re-established under svc-2
+    assert_eq!(
+      mb.non_terminal_len(),
+      2,
+      "latest Renamed + the trailing post-rename Established"
+    );
+    // Drains in order: Renamed(svc-2) first, then the post-rename Established.
+    match mb.drain() {
+      Drained::Update(ServiceUpdate::Renamed(r)) => {
+        assert!(r.new_name().as_str().contains("svc-2"))
+      }
+      other => panic!("expected Renamed(svc-2) first; got {other:?}"),
+    }
+    assert!(
+      matches!(mb.drain(), Drained::Update(ServiceUpdate::Established)),
+      "the post-rename Established must survive, after the Renamed"
+    );
     assert!(matches!(mb.drain(), Drained::Empty));
   }
 
