@@ -241,7 +241,7 @@ fn tick(
   (ok, advanced)
 }
 
-/// F1 gate (all-socket-failure): drive the service through probe, announce,
+/// All-socket-failure: drive the service through probe, announce,
 /// and response, feeding `delivered=false` to every `note_transmit_result`.
 /// After N ticks, NONE of the `*_tx` counters should have advanced.
 #[test]
@@ -282,7 +282,7 @@ fn tx_counters_stay_zero_on_all_socket_failure() {
   );
 }
 
-/// F1 gate (confirmed delivery): drive the service through probe and two
+/// Confirmed delivery: drive the service through probe and two
 /// announce cycles with `delivered=true`. Each confirmed send must increment
 /// the matching `*_tx` counter exactly once.
 #[test]
@@ -495,8 +495,8 @@ fn handle_lazy_section_parse_error_bumps_parse_errors() {
 // ── regression: exactly-once parse_errors across ALL skip gates ──────────
 //
 // For every section (answer, authority, additional) and both QR values, a
-// malformed record must bump `parse_errors` exactly once — never zero (the
-// R10 bug), never twice (double-count).  The skip gates under audit:
+// malformed record must bump `parse_errors` exactly once — never zero,
+// never twice (double-count). The skip gates:
 //   • Section::Additional    – skipped for QR=0 (!is_response)
 //   • Section::Questions     – skipped when answer_questions=false
 //   • Section::Authority     – only reached when src.port()==5353
@@ -613,7 +613,7 @@ fn assert_parse_error_exactly_once(e: &mut Endp, pkt: &[u8], src_port: u16, labe
   );
 }
 
-/// R10 gate: QR=0 query with a malformed ADDITIONAL record.
+/// QR=0 query with a malformed ADDITIONAL record.
 /// Previously: packets_rx bumped, parse_errors stayed zero (the Section::Additional
 /// lazy arm was skipped by the !is_response gate, so the error was never counted).
 #[test]
@@ -623,7 +623,7 @@ fn r10_qr0_malformed_additional_bumps_parse_errors_exactly_once() {
   assert_parse_error_exactly_once(&mut e, &pkt, 5353, "QR=0 malformed additional");
 }
 
-/// R10 gate: QR=1 response with a malformed ADDITIONAL record.
+/// QR=1 response with a malformed ADDITIONAL record.
 #[test]
 fn r10_qr1_malformed_additional_bumps_parse_errors_exactly_once() {
   let mut e = make_endpoint(21);
@@ -631,7 +631,7 @@ fn r10_qr1_malformed_additional_bumps_parse_errors_exactly_once() {
   assert_parse_error_exactly_once(&mut e, &pkt, 5353, "QR=1 malformed additional");
 }
 
-/// R10 gate: QR=1 response with a malformed ANSWER record.
+/// QR=1 response with a malformed ANSWER record.
 #[test]
 fn r10_qr1_malformed_answer_bumps_parse_errors_exactly_once() {
   let mut e = make_endpoint(22);
@@ -639,7 +639,7 @@ fn r10_qr1_malformed_answer_bumps_parse_errors_exactly_once() {
   assert_parse_error_exactly_once(&mut e, &pkt, 5353, "QR=1 malformed answer");
 }
 
-/// R10 gate: QR=0 query with a malformed ANSWER (known-answer) record.
+/// QR=0 query with a malformed ANSWER (known-answer) record.
 #[test]
 fn r10_qr0_malformed_answer_bumps_parse_errors_exactly_once() {
   let mut e = make_endpoint(23);
@@ -647,7 +647,7 @@ fn r10_qr0_malformed_answer_bumps_parse_errors_exactly_once() {
   assert_parse_error_exactly_once(&mut e, &pkt, 5353, "QR=0 malformed answer");
 }
 
-/// R10 gate: QR=0 probe with a malformed AUTHORITY record (from port 5353).
+/// QR=0 probe with a malformed AUTHORITY record (from port 5353).
 #[test]
 fn r10_qr0_malformed_authority_bumps_parse_errors_exactly_once() {
   let mut e = make_endpoint(24);
@@ -655,7 +655,7 @@ fn r10_qr0_malformed_authority_bumps_parse_errors_exactly_once() {
   assert_parse_error_exactly_once(&mut e, &pkt, 5353, "QR=0 malformed authority");
 }
 
-/// R10 gate: QR=0 query with answer_questions=false and a malformed ADDITIONAL
+/// QR=0 query with answer_questions=false and a malformed ADDITIONAL
 /// record.  The Questions section is skipped entirely; the additional-record
 /// parse error must still bump parse_errors exactly once (via the eager walk).
 #[test]
@@ -759,7 +759,7 @@ fn assert_parse_error_exactly_once_port(e: &mut Endp, pkt: &[u8], src_port: u16,
   );
 }
 
-/// R11 gate: answer_questions=false + malformed QUESTION in a QR=0 packet.
+/// answer_questions=false + malformed QUESTION in a QR=0 packet.
 /// Previously the Section::Questions arm was skipped entirely so the
 /// malformed bytes were never detected by the routing iterator.  The upfront
 /// section-validation latch must catch it regardless.
@@ -778,7 +778,7 @@ fn r11_answer_questions_false_malformed_question_qr0_bumps_parse_errors() {
   );
 }
 
-/// R11 gate: answer_questions=false + malformed QUESTION in a QR=1 packet.
+/// answer_questions=false + malformed QUESTION in a QR=1 packet.
 #[test]
 fn r11_answer_questions_false_malformed_question_qr1_bumps_parse_errors() {
   use rand::SeedableRng;
@@ -794,7 +794,7 @@ fn r11_answer_questions_false_malformed_question_qr1_bumps_parse_errors() {
   );
 }
 
-/// R11 gate: answer_questions=true + malformed QUESTION in a QR=0 packet.
+/// answer_questions=true + malformed QUESTION in a QR=0 packet.
 /// With answer_questions=true the routing iterator DOES enter the Questions
 /// arm and would have returned Err from there — the latch must still count
 /// exactly once (no double-count).
@@ -810,7 +810,7 @@ fn r11_answer_questions_true_malformed_question_bumps_parse_errors_exactly_once(
   );
 }
 
-/// R11 gate: non-5353 source + malformed AUTHORITY record (QR=0).
+/// non-5353 source + malformed AUTHORITY record (QR=0).
 /// Previously the Section::Authority arm was skipped for non-5353 sources,
 /// so the malformed bytes escaped accounting.  The upfront latch walks
 /// authority regardless of source port.
@@ -826,7 +826,7 @@ fn r11_non_5353_malformed_authority_bumps_parse_errors() {
   );
 }
 
-/// R11 gate: 5353 source + malformed AUTHORITY (keep existing test passing,
+/// 5353 source + malformed AUTHORITY (keep existing test passing,
 /// and verify no double-count now that the latch is the single bump point).
 #[test]
 fn r11_5353_malformed_authority_bumps_parse_errors_exactly_once() {
@@ -835,7 +835,7 @@ fn r11_5353_malformed_authority_bumps_parse_errors_exactly_once() {
   assert_parse_error_exactly_once_port(&mut e, &pkt, 5353, "5353 source QR=0 malformed authority");
 }
 
-/// R11 no-false-positive: a well-formed packet through the non-5353 authority
+/// No-false-positive: a well-formed packet through the non-5353 authority
 /// gate must NOT bump parse_errors or packets_dropped.  The authority records
 /// are well-formed bytes; only conflict ROUTING is suppressed, not accounting.
 ///
@@ -875,7 +875,7 @@ fn r11_well_formed_non_5353_authority_no_false_positive() {
   );
 }
 
-/// R11 no-false-positive: a well-formed packet must NOT bump any reject
+/// No-false-positive: a well-formed packet must NOT bump any reject
 /// counter (parse_errors or packets_dropped).
 #[test]
 fn r11_well_formed_packet_does_not_bump_reject_counters() {
@@ -908,7 +908,7 @@ fn r11_well_formed_packet_does_not_bump_reject_counters() {
   );
 }
 
-/// R11 no-false-positive gate: a well-formed packet must NOT bump any reject
+/// No-false-positive: a well-formed packet must NOT bump any reject
 /// counter (parse_errors or packets_dropped).
 #[test]
 fn r10_well_formed_packet_does_not_bump_reject_counters() {
@@ -951,7 +951,7 @@ fn r10_well_formed_packet_does_not_bump_reject_counters() {
 // malformed. Running the section-validation latch for a suppressed packet
 // would yield two reject counters for one packets_rx.
 
-/// R12 gate: malformed datagram with caller_is_self=true (self-loopback).
+/// malformed datagram with caller_is_self=true (self-loopback).
 /// Suppression takes precedence: packets_dropped +1, parse_errors +0.
 #[test]
 fn r12_malformed_self_loopback_bumps_dropped_not_parse_errors() {
@@ -987,7 +987,7 @@ fn r12_malformed_self_loopback_bumps_dropped_not_parse_errors() {
   );
 }
 
-/// R12 gate: malformed QR=1 response from a non-5353 source (untrusted response).
+/// malformed QR=1 response from a non-5353 source (untrusted response).
 /// Suppression takes precedence: packets_dropped +1, parse_errors +0.
 #[test]
 fn r12_malformed_untrusted_response_bumps_dropped_not_parse_errors() {

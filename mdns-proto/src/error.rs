@@ -240,15 +240,11 @@ pub enum TransmitError {
   BufferTooSmall(BufferTooSmallDetail),
 }
 
-// ── StorageFullError ─────────────────────────────────────────────────
-
 /// Returned when an internal pool is at capacity.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 #[error("pool capacity exceeded")]
 pub struct StorageFullError;
-
-// ── HandleError ──────────────────────────────────────────────────────
 
 /// Errors raised by [`Endpoint::handle`](crate::endpoint::Endpoint::handle).
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
@@ -269,8 +265,6 @@ pub enum HandleError {
   InvalidResponseCode(crate::wire::ResponseCode),
 }
 
-// ── RegisterServiceError ─────────────────────────────────────────────
-
 /// Errors raised by `Endpoint::try_register_service`.
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
@@ -288,8 +282,6 @@ pub enum RegisterServiceError {
   StorageFull(#[from] StorageFullError),
 }
 
-// ── StartQueryError ──────────────────────────────────────────────────
-
 /// Errors raised by `Endpoint::try_start_query`.
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
@@ -300,8 +292,6 @@ pub enum StartQueryError {
   #[error(transparent)]
   StorageFull(#[from] StorageFullError),
 }
-
-// ── HandleServiceRenamedError ────────────────────────────────────────
 
 /// Errors raised by
 /// [`Endpoint::handle_service_renamed`](crate::endpoint::Endpoint::handle_service_renamed).
@@ -320,8 +310,6 @@ pub enum HandleServiceRenamedError {
   #[error("service handle {0} not found")]
   ServiceNotFound(crate::ServiceHandle),
 }
-
-// ── CancelQueryError ──────────────────────────────────────────────────
 
 /// Errors raised by query-handle lookups on `Endpoint` (`poll_query_*`,
 /// `handle_query_timeout`, `cancel_query`, …) when the handle no longer

@@ -894,8 +894,6 @@ mod tests {
     );
   }
 
-  // ── qtype filter ─────────────────────────────────────────────────────
-
   #[test]
   fn qtype_filter_drops_non_matching_records() {
     // Query is for AAAA; inject an A record — should be dropped.
