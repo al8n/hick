@@ -1773,31 +1773,12 @@ where
         if !populate_cache || !is_response {
           continue;
         }
-        // Build an owned Name from the wire label sequence.
-        let name_opt: Option<Name> = {
-          let mut s = std::string::String::new();
-          let mut ok = true;
-          for label in r.name().labels() {
-            match label {
-              Ok(bytes) => {
-                for &b in bytes {
-                  s.push(b.to_ascii_lowercase() as char);
-                }
-                s.push('.');
-              }
-              Err(_) => {
-                ok = false;
-                break;
-              }
-            }
-          }
-          if ok {
-            Name::try_from_str(&s).ok()
-          } else {
-            None
-          }
-        };
-        let name = match name_opt {
+        // Build an owned Name directly from the wire label sequence. Bails
+        // (drops the record) on a malformed label, non-UTF-8 bytes — DNS-SD
+        // names are UTF-8 (RFC 6763 §4.1) — or a length violation. Avoids the
+        // throwaway presentation `String` the old loop assembled, and unlike a
+        // `byte as char` join never Latin-1-mangles a multi-byte UTF-8 label.
+        let name = match Name::from_wire_labels(r.name().labels()) {
           Some(n) => n,
           None => continue,
         };
@@ -9809,14 +9790,16 @@ pub(crate) const DNS_SD_META_QUERY_NAME: &str = "_services._dns-sd._udp.local.";
 /// matching question is routed to every registered service so each can answer
 /// with a shared PTR `_services._dns-sd._udp.local. -> <its service type>`.
 pub(crate) fn is_meta_query_name(qname: &NameRef<'_>) -> bool {
-  match Name::try_from_str(DNS_SD_META_QUERY_NAME) {
-    Ok(meta) => names_match(&meta, qname),
-    Err(_) => false,
-  }
+  // Compare against the &'static meta-query name directly — no need to
+  // allocate a `Name` (29 bytes, heap-backed) on every routed question.
+  names_match_str(DNS_SD_META_QUERY_NAME, qname)
 }
 
 pub(crate) fn names_match(stored: &Name, incoming: &NameRef<'_>) -> bool {
-  let stored_str = stored.as_str();
+  names_match_str(stored.as_str(), incoming)
+}
+
+pub(crate) fn names_match_str(stored_str: &str, incoming: &NameRef<'_>) -> bool {
   let stored_trim = match stored_str.strip_suffix('.') {
     Some(s) => s,
     None => stored_str,
