@@ -114,6 +114,7 @@ pub struct ServiceSpec {
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 impl ServiceSpec {
   /// Wrap a `ServiceRecords` bundle as a spec.
   pub const fn new(records: ServiceRecords) -> Self {
@@ -150,6 +151,10 @@ pub struct QuerySpec {
 }
 
 #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
+)]
 impl QuerySpec {
   /// Build a new spec for an mDNS query.
   pub fn new(qname: Name, qtype: ResourceType) -> Self {

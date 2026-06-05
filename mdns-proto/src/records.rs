@@ -4,18 +4,13 @@
 //! addresses, the SRV target/port, and the TXT segments. Building the wire
 //! response is then a mechanical traversal.
 
-#[cfg(any(feature = "alloc", feature = "std"))]
 use core::net::{Ipv4Addr, Ipv6Addr};
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-use std::vec::Vec;
-
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::Name;
-#[cfg(any(feature = "alloc", feature = "std"))]
 use bytes::Bytes;
-#[cfg(any(feature = "alloc", feature = "std"))]
-use std::sync::Arc;
+
+use std::{sync::Arc, vec::Vec};
+
+use crate::Name;
 
 /// Append `item` to a read-only `Arc<[T]>`, returning a freshly sealed slice.
 /// `ServiceRecords`' collections are built incrementally via the `add_*`
@@ -23,7 +18,6 @@ use std::sync::Arc;
 /// time (n is a handful of addresses / subtypes) — in exchange the derived
 /// `ServiceRecords::clone` is O(1) on the withdrawal-snapshot and rename-handoff
 /// paths, which previously deep-copied all five collections.
-#[cfg(any(feature = "alloc", feature = "std"))]
 fn arc_push<T: Clone>(slice: &[T], item: T) -> Arc<[T]> {
   slice
     .iter()
@@ -33,8 +27,6 @@ fn arc_push<T: Clone>(slice: &[T], item: T) -> Arc<[T]> {
 }
 
 /// Records advertised by a single registered service.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ServiceRecords {
@@ -67,7 +59,6 @@ pub struct ServiceRecords {
   ttl_secs: u32,
 }
 
-#[cfg(any(feature = "alloc", feature = "std"))]
 impl ServiceRecords {
   /// Construct a new record bundle with the required fields. Optional fields
   /// (records, txt, priority, weight) start empty/default.

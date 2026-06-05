@@ -60,12 +60,10 @@ pub use tracing::{debug, debug_span, error, info, info_span, trace, trace_span, 
 #[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! __hick_trace_noop {
-  // ── Entry: strip an optional `target: <expr>,` prefix ───────────────────
   (target: $tgt:expr, $($rest:tt)*) => {
     { if false { let _ = &$tgt; } $crate::__hick_trace_noop!($($rest)*) }
   };
 
-  // ── Structured field: `key = %value` (Display) ──────────────────────────
   ($key:ident = %$val:expr, $($rest:tt)*) => {
     { if false { let _ = &$val; } $crate::__hick_trace_noop!($($rest)*) }
   };
@@ -73,7 +71,6 @@ macro_rules! __hick_trace_noop {
     { if false { let _ = &$val; } }
   };
 
-  // ── Structured field: `key = ?value` (Debug) ────────────────────────────
   ($key:ident = ?$val:expr, $($rest:tt)*) => {
     { if false { let _ = &$val; } $crate::__hick_trace_noop!($($rest)*) }
   };
@@ -81,7 +78,6 @@ macro_rules! __hick_trace_noop {
     { if false { let _ = &$val; } }
   };
 
-  // ── Structured field: `key = value` (plain) ─────────────────────────────
   ($key:ident = $val:expr, $($rest:tt)*) => {
     { if false { let _ = &$val; } $crate::__hick_trace_noop!($($rest)*) }
   };
@@ -89,7 +85,6 @@ macro_rules! __hick_trace_noop {
     { if false { let _ = &$val; } }
   };
 
-  // ── Bare field shorthand: `key` (equivalent to `key = key`) ─────────────
   // Matches BEFORE the format-string literal arm so that a bare ident that
   // is NOT a string literal is consumed correctly.
   ($key:ident, $($rest:tt)*) => {
@@ -107,7 +102,6 @@ macro_rules! __hick_trace_noop {
     { if false { let _ = &$val; } }
   };
 
-  // ── Bare `?value` ────────────────────────────────────────────────────────
   (?$val:expr, $($rest:tt)*) => {
     { if false { let _ = &$val; } $crate::__hick_trace_noop!($($rest)*) }
   };
@@ -115,12 +109,10 @@ macro_rules! __hick_trace_noop {
     { if false { let _ = &$val; } }
   };
 
-  // ── Format string + zero or more positional args (terminal) ─────────────
   ($fmt:literal $(, $arg:expr)* $(,)?) => {
     { if false { let _ = ::core::format_args!($fmt $(, $arg)*); } }
   };
 
-  // ── No-arg / empty call ──────────────────────────────────────────────────
   () => {{}};
 }
 
@@ -134,8 +126,6 @@ pub use __hick_trace_noop as info;
 pub use __hick_trace_noop as warn;
 #[cfg(not(feature = "tracing"))]
 pub use __hick_trace_noop as error;
-
-// ── Span macros ─────────────────────────────────────────────────────────────
 
 /// No-op span returned when the `tracing` feature is disabled.
 ///
@@ -196,8 +186,6 @@ pub use __hick_trace_noop_span as trace_span;
 pub use __hick_trace_noop_span as debug_span;
 #[cfg(not(feature = "tracing"))]
 pub use __hick_trace_noop_span as info_span;
-
-// ── Stats / Metrics ─────────────────────────────────────────────────────────
 
 #[cfg(feature = "stats")]
 pub mod stats {

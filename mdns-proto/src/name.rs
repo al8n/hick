@@ -174,7 +174,6 @@ impl core::fmt::Display for Name {
   }
 }
 
-// ── try_from_str — alloc/std path (SmolStr) ───────────────────────────
 #[cfg(any(feature = "alloc", feature = "std"))]
 const _: () = {
   use std::string::String;
@@ -252,7 +251,6 @@ const _: () = {
   }
 };
 
-// ── try_from_str — no_alloc heapless path ─────────────────────────────
 #[cfg(all(feature = "heapless", not(any(feature = "alloc", feature = "std"))))]
 const _: () = {
   impl Name {

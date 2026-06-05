@@ -20,16 +20,6 @@
   clippy::string_slice
 )]
 
-// no_std (+alloc) preamble (see the `rust-no-std` golden rule). In the
-// `not(std) + alloc` tier the `alloc` crate is aliased to the name `std`, so
-// every genuine-heap path the code writes as `std::` (`std::vec::Vec`,
-// `std::string::String`, `std::boxed::Box`, `std::collections::BTreeMap`,
-// `std::borrow::Cow`, …) resolves to its `alloc::` home with no edit. The
-// `heapless` / core-only tiers activate NEITHER line: there is no `std` name,
-// and every heap item is gated `#[cfg(any(feature = "std", feature = "alloc"))]`
-// so it compiles out. Core-resident paths (`core::net`, `core::time::Duration`,
-// `core::sync::atomic`, …) are always imported from `core::`, never via this
-// alias.
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
 extern crate alloc as std;
 

@@ -1,5 +1,6 @@
 //! Error types for `hick-udp` operations.
 
+use core::net::IpAddr;
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
 /// Detail for [`BindError::InterfaceNotFound`].
@@ -25,19 +26,19 @@ impl InterfaceNotFoundDetail {
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Display, thiserror::Error)]
 #[display("address {addr} already in use on interface {iface}")]
 pub struct AddressInUseDetail {
-  addr: std::net::IpAddr,
+  addr: IpAddr,
   iface: u32,
 }
 impl AddressInUseDetail {
   /// Build a new detail payload.
   #[expect(dead_code, reason = "used by socket-bind helpers not yet wired in")]
   #[inline(always)]
-  pub(crate) const fn new(addr: std::net::IpAddr, iface: u32) -> Self {
+  pub(crate) const fn new(addr: IpAddr, iface: u32) -> Self {
     Self { addr, iface }
   }
   /// The address that was already in use.
   #[inline(always)]
-  pub const fn addr(&self) -> std::net::IpAddr {
+  pub const fn addr(&self) -> IpAddr {
     self.addr
   }
   /// The interface index involved.

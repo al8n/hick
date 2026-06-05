@@ -8,7 +8,7 @@
 
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
-use crate::name::LabelTooLongDetail;
+use crate::{Name, QueryHandle, ServiceHandle, name::LabelTooLongDetail, wire::*};
 
 /// Detail payload for "buffer too short": a parser ran out of bytes.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
@@ -162,11 +162,11 @@ pub enum ParseError {
   #[error(transparent)]
   BufferTooShort(BufferTooShortDetail),
 
-  /// A label length byte exceeded [`crate::constants::MAX_LABEL_BYTES`].
+  /// A label length byte exceeded [`MAX_LABEL_BYTES`](crate::constants::MAX_LABEL_BYTES).
   #[error(transparent)]
   LabelTooLong(LabelTooLongDetail),
 
-  /// A fully-resolved name exceeded [`crate::constants::MAX_NAME_BYTES`].
+  /// A fully-resolved name exceeded [`MAX_NAME_BYTES`](crate::constants::MAX_NAME_BYTES).
   #[error("name exceeds max length {0} bytes")]
   NameTooLong(usize),
 
@@ -174,7 +174,7 @@ pub enum ParseError {
   #[error("name compression pointer cycle detected")]
   PointerCycle,
 
-  /// A compression pointer chain exceeded [`crate::constants::MAX_POINTER_HOPS`] hops.
+  /// A compression pointer chain exceeded [`MAX_POINTER_HOPS`](crate::constants::MAX_POINTER_HOPS) hops.
   #[error("name compression pointer chain exceeded {0} hops")]
   PointerChainTooLong(u8),
 
@@ -258,16 +258,14 @@ pub enum HandleError {
 
   /// The incoming opcode is not `Query` (mDNS only supports Query).
   #[error("incoming opcode `{0}` is not Query")]
-  InvalidOpcode(crate::wire::Opcode),
+  InvalidOpcode(Opcode),
 
   /// The incoming response code is not `NoError` (mDNS requires NoError).
   #[error("incoming response code `{0}` is not NoError")]
-  InvalidResponseCode(crate::wire::ResponseCode),
+  InvalidResponseCode(ResponseCode),
 }
 
 /// Errors raised by `Endpoint::try_register_service`.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
@@ -295,8 +293,6 @@ pub enum StartQueryError {
 
 /// Errors raised by
 /// [`Endpoint::handle_service_renamed`](crate::endpoint::Endpoint::handle_service_renamed).
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
@@ -304,11 +300,11 @@ pub enum StartQueryError {
 pub enum HandleServiceRenamedError {
   /// The new name is already registered to a different service.
   #[error("name `{0}` is already registered to a different service")]
-  NameAlreadyRegistered(crate::Name),
+  NameAlreadyRegistered(Name),
 
   /// The handle does not refer to a registered service.
   #[error("service handle {0} not found")]
-  ServiceNotFound(crate::ServiceHandle),
+  ServiceNotFound(ServiceHandle),
 }
 
 /// Errors raised by query-handle lookups on `Endpoint` (`poll_query_*`,
@@ -316,8 +312,6 @@ pub enum HandleServiceRenamedError {
 /// corresponds to an active query.  A query disappears from the endpoint
 /// when its terminal update has been drained via `Endpoint::poll_query`
 /// (auto-prune) or after an explicit `Endpoint::cancel_query` call.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
@@ -325,7 +319,7 @@ pub enum HandleServiceRenamedError {
 pub enum CancelQueryError {
   /// The handle does not refer to a currently registered query.
   #[error("query handle {0} not found")]
-  QueryNotFound(crate::QueryHandle),
+  QueryNotFound(QueryHandle),
 }
 
 #[cfg(test)]

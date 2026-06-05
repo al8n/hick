@@ -12,8 +12,6 @@ use crate::{
   wire::{QuestionRef, Ref},
 };
 
-// ── From Endpoint::handle() → borrowed, consumed in scope ─────────────
-
 /// A question routed to a registered service.
 #[derive(Debug, Copy, Clone)]
 pub struct ServiceQuestion<'a> {
@@ -253,8 +251,6 @@ pub enum RouteEvent<'a> {
   CacheUpdated,
 }
 
-// ── Owned events from poll() ───────────────────────────────────────────
-
 /// Detail payload for [`ServiceUpdate::Renamed`].
 #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
 #[cfg_attr(
@@ -265,24 +261,31 @@ pub enum RouteEvent<'a> {
 pub struct ServiceRenamed {
   new_name: Name,
 }
+
 #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-impl ServiceRenamed {
-  /// Construct a `ServiceRenamed` from a new name.
-  ///
-  /// Hidden from the documented surface: the proto state machine builds these
-  /// internally on a conflict rename, but downstream crates need a way to
-  /// synthesize them for tests (mirroring [`crate::CollectedAnswer::from_parts`]).
-  #[doc(hidden)]
-  #[inline(always)]
-  pub fn new(new_name: Name) -> Self {
-    Self { new_name }
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
+)]
+const _: () = {
+  impl ServiceRenamed {
+    /// Construct a `ServiceRenamed` from a new name.
+    ///
+    /// Hidden from the documented surface: the proto state machine builds these
+    /// internally on a conflict rename, but downstream crates need a way to
+    /// synthesize them for tests (mirroring [`crate::CollectedAnswer::from_parts`]).
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn new(new_name: Name) -> Self {
+      Self { new_name }
+    }
+    /// Returns the new canonical name assigned after conflict resolution.
+    #[inline(always)]
+    pub fn new_name(&self) -> &Name {
+      &self.new_name
+    }
   }
-  /// Returns the new canonical name assigned after conflict resolution.
-  #[inline(always)]
-  pub fn new_name(&self) -> &Name {
-    &self.new_name
-  }
-}
+};
 
 /// App-level events emitted by `Service::poll()`.
 #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]

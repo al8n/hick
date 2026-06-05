@@ -1,5 +1,7 @@
 //! Service state machine — probing, announcing, response generation.
 
+use crate::trace::*;
+
 #[cfg(any(feature = "alloc", feature = "std"))]
 mod respond;
 mod schedule;
@@ -837,7 +839,7 @@ where
             self.announce_count = 2;
             let _ = self.pending_updates.insert(ServiceUpdate::Established);
             self.lifecycle_deadline = re_announce_deadline(now, self.records.ttl_secs());
-            crate::trace::debug!(
+            debug!(
               target: "mdns_proto::service",
               handle = self.handle.raw(),
               "service: Announcing → Established"
@@ -853,7 +855,7 @@ where
             self.state = ServiceState::Announcing(new_n);
             self.announce_count = new_n;
             self.lifecycle_deadline = announce_deadline(now, new_n);
-            crate::trace::debug!(
+            debug!(
               target: "mdns_proto::service",
               handle = self.handle.raw(),
               announce_n = new_n,
@@ -1053,7 +1055,7 @@ where
     let entry = self.pending_updates.iter().next().map(|(k, _)| k)?;
     let upd = self.pending_updates.try_remove(entry);
     if upd.is_some() {
-      crate::trace::debug!(
+      debug!(
         target: "mdns_proto::service",
         handle = self.handle.raw(),
         update = ?upd,
@@ -1154,7 +1156,7 @@ where
     // Question→response_deadline, KnownAnswer→expiry) use a current reference
     // even when handle_timeout has not recently fired.
     self.last_now = Some(now);
-    crate::trace::trace!(
+    trace!(
       target: "mdns_proto::service",
       handle = self.handle.raw(),
       state = ?self.state,
@@ -1272,7 +1274,7 @@ where
         // cycle (queued legacy replies drained before any state check, plus KAS
         // / questioner suppression state) so the re-probe window doesn't answer
         // the very name we reverted to re-verify.
-        crate::trace::warn!(
+        warn!(
           target: "mdns_proto::service",
           handle = self.handle.raw(),
           state = ?self.state,
@@ -1554,7 +1556,7 @@ where
         if let Some(slot) = self.kas_hints.get_mut(self.kas_next_slot) {
           *slot = Some(hint);
           self.kas_next_slot = self.kas_next_slot.saturating_add(1) % KAS_RING_SIZE;
-          crate::trace::trace!(
+          trace!(
             target: "mdns_proto::service",
             handle = self.handle.raw(),
             rtype = ?ka.record().rtype(),
@@ -1578,7 +1580,7 @@ where
         // be incorrect. Surface the event to the caller via
         // ServiceUpdate::HostConflict; the caller must intervene (e.g. choose a
         // new host name and re-register).
-        crate::trace::warn!(
+        warn!(
           target: "mdns_proto::service",
           handle = self.handle.raw(),
           state = ?self.state,
@@ -1632,7 +1634,7 @@ where
         // Snapshot the old records now (records are about to be mutated /
         // instance ownership about to be reset). Probe-time names that were
         // never announced have nothing cached, so no goodbye.
-        crate::trace::warn!(
+        warn!(
           target: "mdns_proto::service",
           handle = self.handle.raw(),
           state = ?self.state,
@@ -1746,7 +1748,7 @@ where
             // No transmit yet — the probe fires when the delay elapses.
             self.state = ServiceState::Probing(0);
             self.lifecycle_deadline = probe_deadline(now, 0, &mut self.rng);
-            crate::trace::debug!(
+            debug!(
               target: "mdns_proto::service",
               handle = self.handle.raw(),
               "service: Init → Probing(0)"
@@ -1764,7 +1766,7 @@ where
             // probe interval instead of the service silently marching toward
             // Announcing with nothing on the wire (RFC 6762 §8.1: a name must be
             // probed before it is claimed).
-            crate::trace::debug!(
+            debug!(
               target: "mdns_proto::service",
               handle = self.handle.raw(),
               probe_n = n,
@@ -1783,7 +1785,7 @@ where
             // unconfirmed (all-socket-failed) send is retried rather than the
             // service silently progressing to Established with nothing on the
             // wire. A confirmed send overwrites this deadline.
-            crate::trace::debug!(
+            debug!(
               target: "mdns_proto::service",
               handle = self.handle.raw(),
               announce_n = _n,
@@ -1795,7 +1797,7 @@ where
           }
           ServiceState::Established => {
             // The lifecycle deadline that fired is the periodic re-announce.
-            crate::trace::debug!(
+            debug!(
               target: "mdns_proto::service",
               handle = self.handle.raw(),
               "service: Established — enqueueing periodic re-announce"
@@ -1964,7 +1966,7 @@ where
     let n = match kind {
       PendingTransmitKind::Probe => {
         let n = respond::write_probe(&self.records, buf).map_err(|_| {
-          crate::trace::warn!(
+          warn!(
             target: "mdns_proto::service",
             handle = self.handle.raw(),
             "service: poll_transmit probe BufferTooSmall"
@@ -1974,7 +1976,7 @@ where
             buf.len(),
           ))
         })?;
-        crate::trace::debug!(
+        debug!(
           target: "mdns_proto::service",
           handle = self.handle.raw(),
           bytes = n,
@@ -1988,7 +1990,7 @@ where
         // from Established) are sent without KAS filtering. RFC 6762 §7.1
         // known-answer suppression only applies to question responses.
         let n = respond::write_announce(&self.records, buf).map_err(|_| {
-          crate::trace::warn!(
+          warn!(
             target: "mdns_proto::service",
             handle = self.handle.raw(),
             "service: poll_transmit announcement BufferTooSmall"
@@ -1998,7 +2000,7 @@ where
             buf.len(),
           ))
         })?;
-        crate::trace::debug!(
+        debug!(
           target: "mdns_proto::service",
           handle = self.handle.raw(),
           bytes = n,
@@ -2059,7 +2061,7 @@ where
             suppressed
           })
           .map_err(|_| {
-            crate::trace::warn!(
+            warn!(
               target: "mdns_proto::service",
               handle = self.handle.raw(),
               "service: poll_transmit response BufferTooSmall"
@@ -2070,7 +2072,7 @@ where
             ))
           })?;
         resp_emitted = emitted;
-        crate::trace::debug!(
+        debug!(
           target: "mdns_proto::service",
           handle = self.handle.raw(),
           bytes = encoded,
@@ -2149,15 +2151,6 @@ where
   }
 }
 
-// ── Unit tests ─────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 #[cfg(all(any(feature = "alloc", feature = "std"), feature = "slab"))]
-#[allow(
-  clippy::unwrap_used,
-  clippy::expect_used,
-  clippy::panic,
-  clippy::indexing_slicing,
-  clippy::arithmetic_side_effects
-)]
 mod tests;

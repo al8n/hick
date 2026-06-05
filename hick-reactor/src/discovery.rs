@@ -40,8 +40,12 @@ use std::{
   time::{Duration, Instant},
 };
 
+use async_channel::{Receiver, Sender};
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt, pin_mut, select_biased, stream::SelectAll};
+use futures::{
+  FutureExt, StreamExt, pin_mut, select_biased,
+  stream::{BoxStream, SelectAll},
+};
 use mdns_proto::{
   Name, QuerySpec,
   wire::{A, AAAA, NameRef, Ptr, ResourceType, Srv, Txt},
@@ -477,7 +481,8 @@ struct LookupQueue {
 }
 
 impl LookupQueue {
-  fn new() -> Self {
+  #[inline(always)]
+  const fn new() -> Self {
     Self {
       ready: VecDeque::new(),
       done: false,
@@ -513,7 +518,7 @@ fn lock(q: &Mutex<LookupQueue>) -> MutexGuard<'_, LookupQueue> {
 /// `ConnectionDriver`, scoped to a single lookup.
 struct LookupDriver {
   endpoint: Endpoint,
-  streams: SelectAll<futures::stream::BoxStream<'static, Tagged>>,
+  streams: SelectAll<BoxStream<'static, Tagged>>,
   resolver: Resolver,
   /// Drop counter of the browse (PTR) query. Surplus instances evicted by the
   /// PTR query's bounded answer pool before [`Resolver::on_ptr`] sees them are
@@ -522,10 +527,10 @@ struct LookupDriver {
   ptr_drops: DroppedHandle,
   queue: Arc<Mutex<LookupQueue>>,
   /// Capacity-1 wakeup the consumer parks on; rung after the queue changes.
-  doorbell: async_channel::Sender<()>,
+  doorbell: Sender<()>,
   /// Closes when the [`Lookup`] handle is dropped, which stops the task and
   /// (by dropping the sub-query [`Query`] handles) cancels every sub-query.
-  cancel: async_channel::Receiver<()>,
+  cancel: Receiver<()>,
   resolve_timeout: Duration,
   unicast: bool,
 }

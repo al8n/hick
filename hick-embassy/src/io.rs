@@ -10,7 +10,7 @@
 //! socket explicitly (leave one `None` for a single-stack node).
 
 use core::{
-  net::SocketAddr,
+  net::{IpAddr, Ipv4Addr, SocketAddr},
   task::{Context, Poll, Waker},
 };
 
@@ -40,7 +40,7 @@ fn recv_from(socket: &UdpSocket<'_>, buf: &mut [u8]) -> Option<RecvMeta> {
     // the drain continues instead of stopping early; the engine treats len 0 as
     // nothing to deliver.
     Poll::Ready(Err(_)) => Some(RecvMeta {
-      src: SocketAddr::new(core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED), 0),
+      src: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
       local: None,
       hop_limit: None,
       len: 0,

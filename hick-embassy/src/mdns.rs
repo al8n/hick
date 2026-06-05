@@ -119,6 +119,7 @@ impl<R: Rng> MdnsState<R> {
 
   /// Take a consistent point-in-time snapshot of every I/O counter and gauge.
   #[cfg(feature = "stats")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "stats")))]
   pub fn stats(&self) -> hick_trace::stats::StatsSnapshot {
     self.engine.borrow().stats()
   }

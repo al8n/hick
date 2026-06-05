@@ -1,23 +1,17 @@
 //! Passive record cache observed from incoming traffic.
 
-#[cfg(any(feature = "alloc", feature = "std"))]
 use core::time::Duration;
 
-#[cfg(any(feature = "alloc", feature = "std"))]
 use bytes::Bytes;
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::Instant;
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::Name;
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::Pool;
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::wire::{ResourceClass, ResourceType};
+use crate::{
+  Instant, Name, Pool,
+  trace::*,
+  wire::{ResourceClass, ResourceType},
+};
 
 /// One cached resource record.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
+
 #[derive(Debug, Clone)]
 pub struct CacheEntry<I: Instant> {
   name: Name,
@@ -38,7 +32,6 @@ pub struct CacheEntry<I: Instant> {
   received_at: I,
 }
 
-#[cfg(any(feature = "alloc", feature = "std"))]
 impl<I: Instant> CacheEntry<I> {
   /// Build a new cache entry.  `received_at` is the wall instant at
   /// which this record arrived; `expires_at` is the TTL-derived
@@ -99,12 +92,9 @@ impl<I: Instant> CacheEntry<I> {
 }
 
 /// Default maximum number of cache entries before eviction kicks in.
-#[cfg(any(feature = "alloc", feature = "std"))]
 const DEFAULT_MAX_ENTRIES: usize = 1024;
 
 /// Passive record cache.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 pub struct Cache<I, P> {
   entries: P,
   max_entries: usize,
@@ -113,7 +103,6 @@ pub struct Cache<I, P> {
   stats: Option<std::sync::Arc<hick_trace::stats::Stats>>,
 }
 
-#[cfg(any(feature = "alloc", feature = "std"))]
 impl<I, P> Cache<I, P>
 where
   I: Instant,
@@ -136,7 +125,7 @@ where
   /// `max`, the soonest-expiring entry is evicted proactively before the new
   /// entry is inserted. This bounds memory usage even when the backing
   /// [`Pool`] grows without error (e.g. `slab::Slab`).
-  pub fn with_max_entries(max: usize) -> Self {
+  pub const fn with_max_entries(max: usize) -> Self {
     Self {
       entries: P::new(),
       max_entries: max,
@@ -324,7 +313,7 @@ where
         entry.expires_at = expires_at;
         entry.received_at = now;
       }
-      crate::trace::trace!(
+      trace!(
         target: "mdns_proto::cache",
         rtype = ?rtype,
         "cache: refreshed existing entry (dedup)"
@@ -342,7 +331,7 @@ where
       .bounded_insert(CacheEntry::new(name, rtype, rclass, rdata, expires_at, now))
       .map(Some);
     if result.is_ok() {
-      crate::trace::trace!(
+      trace!(
         target: "mdns_proto::cache",
         rtype = ?rtype,
         "cache: inserted new entry"
@@ -378,7 +367,7 @@ where
       }
       if let Some((vk, _)) = victim {
         self.entries.try_remove(vk);
-        crate::trace::trace!(
+        trace!(
           target: "mdns_proto::cache",
           "cache: proactive eviction (cap reached)"
         );
@@ -403,7 +392,7 @@ where
         }
         if let Some((vk, _)) = victim {
           self.entries.try_remove(vk);
-          crate::trace::trace!(
+          trace!(
             target: "mdns_proto::cache",
             "cache: reactive eviction (pool capacity error)"
           );
@@ -432,7 +421,7 @@ where
       }
     }
     if removed > 0 {
-      crate::trace::trace!(
+      trace!(
         target: "mdns_proto::cache",
         removed,
         "cache: swept expired entries"
@@ -485,7 +474,6 @@ where
   }
 }
 
-#[cfg(any(feature = "alloc", feature = "std"))]
 impl<I, P> Default for Cache<I, P>
 where
   I: Instant,
@@ -496,11 +484,6 @@ where
   }
 }
 
-// Gated to `std` (not `any(alloc, std)`): these tests drive the cache against
-// the REAL `std::time::Instant` clock (`Instant::now()`), which is std-only
-// (no-std golden rule §4). The cache logic is generic over `I: Instant` and is
-// type-checked in the alloc tier by the library build; only this clock-backed
-// coverage needs `std`. `Duration` stays `core::time::Duration` (core-first).
 #[cfg(all(test, feature = "std", feature = "slab"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

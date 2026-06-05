@@ -7,15 +7,23 @@ use std::{
   time::{Duration, Instant as StdInstant, SystemTime},
 };
 
+use core::{
+  cell::RefCell,
+  net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+};
+use hick_trace::*;
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
   QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate, WithdrawalSend,
   WithdrawalToken, query::Query as ProtoQuery, service::Service as ProtoSvc, transmit::Transmit,
 };
+use rand::{SeedableRng, rngs::StdRng};
+use slab::Slab;
 
-use core::cell::RefCell;
-
-use crate::socket::{RecvMeta, Socket};
+use crate::{
+  service::ServiceMailbox,
+  socket::{RecvMeta, Socket},
+};
 
 #[cfg(test)]
 mod tests;
@@ -29,19 +37,17 @@ pub(crate) const MAX_TRANSMIT_CREDITS_PER_PASS: usize = 64;
 
 /// IPv4 mDNS multicast destination (224.0.0.251:5353). Used by the transmit
 /// pump's dual-stack fan-out and the endpoint-owned withdrawal pump.
-pub(crate) const MDNS_V4_DST: core::net::SocketAddr = core::net::SocketAddr::V4(
-  core::net::SocketAddrV4::new(core::net::Ipv4Addr::new(224, 0, 0, 251), 5353),
-);
+pub(crate) const MDNS_V4_DST: SocketAddr =
+  SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), 5353));
 
 /// IPv6 mDNS multicast destination ([ff02::fb]:5353). Used by the transmit
 /// pump's dual-stack fan-out and the endpoint-owned withdrawal pump.
-pub(crate) const MDNS_V6_DST: core::net::SocketAddr =
-  core::net::SocketAddr::V6(core::net::SocketAddrV6::new(
-    core::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb),
-    5353,
-    0,
-    0,
-  ));
+pub(crate) const MDNS_V6_DST: SocketAddr = SocketAddr::V6(SocketAddrV6::new(
+  Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb),
+  5353,
+  0,
+  0,
+));
 
 /// Whether `dst` is an mDNS multicast destination (multicast IP on port
 /// 5353).  `mdns-proto`'s `multicast_dst()` ALWAYS returns the IPv4 group
@@ -50,10 +56,10 @@ pub(crate) const MDNS_V6_DST: core::net::SocketAddr =
 /// it detects an mDNS multicast destination here and fans the SAME payload
 /// out to BOTH bound families' multicast groups (RFC 6762 §6: a dual-stack
 /// host answers on each). Mirrors the reactor's `send_via` predicate.
-pub(crate) fn is_mdns_multicast_dst(dst: core::net::SocketAddr) -> bool {
+pub(crate) fn is_mdns_multicast_dst(dst: SocketAddr) -> bool {
   use hick_udp::constants::MDNS_PORT;
-  matches!(dst, core::net::SocketAddr::V4(a) if a.ip().is_multicast() && a.port() == MDNS_PORT)
-    || matches!(dst, core::net::SocketAddr::V6(a) if a.ip().is_multicast() && a.port() == MDNS_PORT)
+  matches!(dst, SocketAddr::V4(a) if a.ip().is_multicast() && a.port() == MDNS_PORT)
+    || matches!(dst, SocketAddr::V6(a) if a.ip().is_multicast() && a.port() == MDNS_PORT)
 }
 
 /// Concrete `mdns-proto::Endpoint` instantiation used by the compio driver.
@@ -61,20 +67,19 @@ pub(crate) fn is_mdns_multicast_dst(dst: core::net::SocketAddr) -> bool {
 /// growable storage rather than heapless fixed buffers.
 pub(crate) type ProtoEndpoint = ProtoEp<
   StdInstant,
-  rand::rngs::StdRng,
-  slab::Slab<CacheEntry<StdInstant>>,
-  slab::Slab<ServiceRoute>,
-  slab::Slab<ProtoQuery<StdInstant, slab::Slab<CollectedAnswer>, slab::Slab<QueryUpdate>>>,
-  slab::Slab<EndpointEventEntry>,
-  slab::Slab<CollectedAnswer>,
-  slab::Slab<QueryUpdate>,
+  StdRng,
+  Slab<CacheEntry<StdInstant>>,
+  Slab<ServiceRoute>,
+  Slab<ProtoQuery<StdInstant, Slab<CollectedAnswer>, Slab<QueryUpdate>>>,
+  Slab<EndpointEventEntry>,
+  Slab<CollectedAnswer>,
+  Slab<QueryUpdate>,
 >;
 
 /// Concrete `mdns-proto::Service` instantiation used by the compio driver. The
 /// state machine is owned per-`ServiceCtx`; the endpoint only tracks routing
 /// metadata via `ServiceRoute`.
-pub(crate) type ProtoService =
-  ProtoSvc<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>;
+pub(crate) type ProtoService = ProtoSvc<StdInstant, Slab<Transmit>, Slab<ServiceUpdate>>;
 
 /// Non-atomic notify for waking the driver from handle-side mutations.
 /// Single-thread (`!Send`) by design — built on `event-listener`'s `Event`
@@ -142,7 +147,7 @@ pub(crate) struct ServiceCtx {
   /// the [`crate::Service`] handle drains via [`crate::Service::next`]. Shared
   /// `Rc<RefCell<_>>`; outlives this ctx (held by the handle), so the reserved
   /// terminal survives an immediate ctx GC.
-  pub(crate) mailbox: Rc<RefCell<crate::service::ServiceMailbox>>,
+  pub(crate) mailbox: Rc<RefCell<ServiceMailbox>>,
   pub(crate) cancelled: bool,
   /// Count of consecutive `proto.poll_transmit` errors for this service. Reset
   /// to 0 on any `Ok` (a successful encode or an empty queue); incremented on
@@ -213,7 +218,7 @@ pub(crate) struct State {
   pub(crate) bound_interface: u32,
   /// Cached local subnets used for the §11 source-address fallback when the
   /// kernel didn't deliver an IPv4 TTL / IPv6 hop-limit cmsg.
-  pub(crate) local_subnets: Vec<(core::net::IpAddr, u8)>,
+  pub(crate) local_subnets: Vec<(IpAddr, u8)>,
   /// Max datagram size; used to size the scratch buffer for the encode/send
   /// path. Sourced from [`crate::ServerOptions::max_payload_size`].
   pub(crate) max_payload: usize,
@@ -226,19 +231,18 @@ pub(crate) struct State {
   /// `Endpoint::stats()` accessor can reach it without a command-channel
   /// round-trip.
   #[cfg(feature = "stats")]
-  pub(crate) stats: std::sync::Arc<hick_trace::stats::Stats>,
+  pub(crate) stats: std::sync::Arc<stats::Stats>,
 }
 
 impl State {
   /// Build a fresh driver state with no services or queries, seeded with an
-  /// OS-derived [`rand::rngs::StdRng`]. Bound interface and local-subnet
+  /// OS-derived [`StdRng`]. Bound interface and local-subnet
   /// snapshot stay empty until wired in from the bound sockets /
   /// interface discovery.
   pub(crate) fn new(cfg: EndpointConfig, max_payload: usize, max_recv: usize) -> Self {
-    use rand::SeedableRng;
     // rand 0.10 removed `from_entropy`; seed StdRng from the OS-seeded
     // thread RNG (same idiom as `hick-reactor::driver::DriverState::new`).
-    let rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
+    let rng = StdRng::from_rng(&mut rand::rng());
     let endpoint = ProtoEndpoint::try_new(cfg, rng);
     #[cfg(feature = "stats")]
     let stats = endpoint.stats_handle();
@@ -268,11 +272,11 @@ impl State {
     &mut self,
     spec: mdns_proto::ServiceSpec,
     now: StdInstant,
-    mailbox: Rc<RefCell<crate::service::ServiceMailbox>>,
+    mailbox: Rc<RefCell<ServiceMailbox>>,
   ) -> Result<ServiceHandle, mdns_proto::error::RegisterServiceError> {
     let (handle, svc) = self
       .endpoint
-      .try_register_service::<slab::Slab<_>, slab::Slab<_>>(spec, now)?;
+      .try_register_service::<Slab<_>, Slab<_>>(spec, now)?;
     self.services.insert(
       handle,
       ServiceCtx {
@@ -297,7 +301,9 @@ impl State {
     spec: mdns_proto::ServiceSpec,
     now: StdInstant,
   ) -> Result<ServiceHandle, mdns_proto::error::RegisterServiceError> {
-    let mailbox = crate::service::new_service_mailbox();
+    use crate::service::new_service_mailbox;
+
+    let mailbox = new_service_mailbox();
     self.register_service(spec, now, mailbox)
   }
 
@@ -406,7 +412,7 @@ impl State {
     &mut self,
     now: StdInstant,
     scratch: &mut [u8],
-  ) -> Option<(core::net::SocketAddr, usize, WithdrawalToken)> {
+  ) -> Option<(SocketAddr, usize, WithdrawalToken)> {
     self.endpoint.poll_withdrawal_transmit(now, scratch)
   }
 
@@ -522,7 +528,7 @@ impl State {
   }
 
   /// Drain pending `ServiceUpdate`s out of each per-service proto state machine
-  /// into the handle-owned [`crate::service::ServiceMailbox`] so
+  /// into the handle-owned [`ServiceMailbox`] so
   /// [`crate::Service::next`] can pop them: terminal kinds (`Conflict` /
   /// `HostConflict`) go to the reserved terminal slot, everything else to the
   /// coalescing non-terminal ring. Returns `true` if at least one update was
@@ -589,7 +595,7 @@ impl State {
               .enqueue_rename_withdrawal(handoff, now, rename_result.is_err());
           }
           if let Err(_e) = rename_result {
-            hick_trace::warn!(
+            warn!(
               handle = ?h,
               error = ?_e,
               "auto-rename collided with another local service; emitting Conflict and beginning withdrawal"
@@ -659,7 +665,7 @@ impl State {
     &mut self,
     now: StdInstant,
     scratch: &mut [u8],
-  ) -> Option<(core::net::SocketAddr, usize, TransmitOrigin)> {
+  ) -> Option<(SocketAddr, usize, TransmitOrigin)> {
     self.svc_handle_scratch.clear();
     self
       .svc_handle_scratch
@@ -717,7 +723,7 @@ impl State {
               // deadline re-settles the driver; the completion GC notifies).
               // `begin_service_withdrawal` marks the ctx `errored` so every
               // proto-polling pump skips it from here on.
-              hick_trace::warn!(
+              warn!(
                 handle = ?h,
                 error = ?_e,
                 scratch_size = scratch.len(),
@@ -804,7 +810,7 @@ impl State {
           // surface the `QueryUpdate::Timeout` terminal via `endpoint.poll_query`
           // before falling through to the errored-path end-of-stream `None`.
           self.endpoint.retire_query(h);
-          hick_trace::warn!(
+          warn!(
             handle = ?h,
             error = ?_e,
             scratch_size = scratch.len(),
@@ -961,7 +967,7 @@ impl State {
       )
     };
     if !on_link {
-      hick_trace::debug!(
+      debug!(
         src = %meta.peer(),
         hop_limit = ?meta.hop_limit(),
         "dropping off-link packet (RFC 6762 §11 trust boundary)"
@@ -987,7 +993,7 @@ impl State {
     if data.get(2).is_some_and(|b| b & 0x80 != 0)
       && meta.peer().port() != hick_udp::constants::MDNS_PORT
     {
-      hick_trace::debug!(
+      debug!(
         src = %meta.peer(),
         "dropping untrusted response (source port != 5353) before self-send match"
       );
@@ -1229,7 +1235,7 @@ pub(crate) async fn run(
           let when = SystemTime::now();
           let res = s4.send_to(&scratch[..n], MDNS_V4_DST, None).await;
           if res.is_ok() {
-            hick_trace::trace!(dst = %MDNS_V4_DST, len = n, "send_to v4");
+            trace!(dst = %MDNS_V4_DST, len = n, "send_to v4");
             let mut state = inner.state.borrow_mut();
             crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
             #[cfg(feature = "stats")]
@@ -1239,7 +1245,7 @@ pub(crate) async fn run(
             }
             sent_any = true;
           } else {
-            hick_trace::debug!(dst = %MDNS_V4_DST, "send_to v4 failed");
+            debug!(dst = %MDNS_V4_DST, "send_to v4 failed");
             #[cfg(feature = "stats")]
             inner.state.borrow().stats.send_errors(1);
           }
@@ -1248,7 +1254,7 @@ pub(crate) async fn run(
           let when = SystemTime::now();
           let res = s6.send_to(&scratch[..n], MDNS_V6_DST, None).await;
           if res.is_ok() {
-            hick_trace::trace!(dst = %MDNS_V6_DST, len = n, "send_to v6");
+            trace!(dst = %MDNS_V6_DST, len = n, "send_to v6");
             let mut state = inner.state.borrow_mut();
             crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
             #[cfg(feature = "stats")]
@@ -1258,7 +1264,7 @@ pub(crate) async fn run(
             }
             sent_any = true;
           } else {
-            hick_trace::debug!(dst = %MDNS_V6_DST, "send_to v6 failed");
+            debug!(dst = %MDNS_V6_DST, "send_to v6 failed");
             #[cfg(feature = "stats")]
             inner.state.borrow().stats.send_errors(1);
           }
@@ -1271,8 +1277,8 @@ pub(crate) async fn run(
         // proto re-arms the probe / announce without advancing lifecycle
         // state (unchanged semantics).
         let sock = match dst {
-          core::net::SocketAddr::V4(_) => sock_v4.as_ref(),
-          core::net::SocketAddr::V6(_) => sock_v6.as_ref(),
+          SocketAddr::V4(_) => sock_v4.as_ref(),
+          SocketAddr::V6(_) => sock_v6.as_ref(),
         };
         if let Some(s) = sock {
           let when = SystemTime::now();
@@ -1281,7 +1287,7 @@ pub(crate) async fn run(
           // inbound copy of this datagram (from the loopback / multicast echo)
           // is classified as our own.  Only record on a successful send.
           if res.is_ok() {
-            hick_trace::trace!(dst = %dst, len = n, "send_to");
+            trace!(dst = %dst, len = n, "send_to");
             let mut state = inner.state.borrow_mut();
             crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
             #[cfg(feature = "stats")]
@@ -1290,7 +1296,7 @@ pub(crate) async fn run(
               state.stats.bytes_tx(n as u64);
             }
           } else {
-            hick_trace::debug!(dst = %dst, "send_to failed");
+            debug!(dst = %dst, "send_to failed");
             #[cfg(feature = "stats")]
             inner.state.borrow().stats.send_errors(1);
           }
@@ -1430,7 +1436,7 @@ pub(crate) async fn run(
           break;
         };
         if now >= shutdown_deadline {
-          hick_trace::debug!("shutdown withdrawal flush hit its wall-clock backstop; exiting");
+          debug!("shutdown withdrawal flush hit its wall-clock backstop; exiting");
           break;
         }
         let dur = next
@@ -1625,7 +1631,7 @@ async fn drain_withdrawals(
       v4_out = present_socket_send_outcome(&res);
       match res {
         Ok(_) => {
-          hick_trace::trace!(dst = %MDNS_V4_DST, len, "withdrawal send_to v4");
+          trace!(dst = %MDNS_V4_DST, len, "withdrawal send_to v4");
           let mut state = inner.state.borrow_mut();
           crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
           #[cfg(feature = "stats")]
@@ -1635,7 +1641,7 @@ async fn drain_withdrawals(
           }
         }
         Err(_e) => {
-          hick_trace::debug!(error = %_e, dst = %MDNS_V4_DST, "withdrawal send_to v4 failed");
+          debug!(error = %_e, dst = %MDNS_V4_DST, "withdrawal send_to v4 failed");
           #[cfg(feature = "stats")]
           inner.state.borrow().stats.send_errors(1);
         }
@@ -1649,7 +1655,7 @@ async fn drain_withdrawals(
       v6_out = present_socket_send_outcome(&res);
       match res {
         Ok(_) => {
-          hick_trace::trace!(dst = %MDNS_V6_DST, len, "withdrawal send_to v6");
+          trace!(dst = %MDNS_V6_DST, len, "withdrawal send_to v6");
           let mut state = inner.state.borrow_mut();
           crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
           #[cfg(feature = "stats")]
@@ -1659,7 +1665,7 @@ async fn drain_withdrawals(
           }
         }
         Err(_e) => {
-          hick_trace::debug!(error = %_e, dst = %MDNS_V6_DST, "withdrawal send_to v6 failed");
+          debug!(error = %_e, dst = %MDNS_V6_DST, "withdrawal send_to v6 failed");
           #[cfg(feature = "stats")]
           inner.state.borrow().stats.send_errors(1);
         }
@@ -1699,7 +1705,7 @@ async fn drain_withdrawals(
 fn handle_recv(inner: &Rc<EndpointInner>, r: std::io::Result<(Vec<u8>, RecvMeta)>) {
   match r {
     Ok((data, meta)) => {
-      hick_trace::trace!(src = %meta.peer(), len = data.len(), truncated = meta.truncated(), "recv datagram");
+      trace!(src = %meta.peer(), len = data.len(), truncated = meta.truncated(), "recv datagram");
       if meta.truncated() {
         // The datagram exceeded `max_recv_packet_size` (it overflowed the
         // one-byte sentinel the recv buffer is over-allocated by), so the
@@ -1710,7 +1716,7 @@ fn handle_recv(inner: &Rc<EndpointInner>, r: std::io::Result<(Vec<u8>, RecvMeta)
         // Count as consumed (packets_rx + bytes_rx) but also dropped — feeding
         // the truncated prefix to proto could trigger protocol side effects from
         // an incomplete message. Do NOT call handle_datagram.
-        hick_trace::debug!(
+        debug!(
           src = %meta.peer(),
           len = data.len(),
           "dropping truncated (oversized) datagram before proto routing"
@@ -1734,7 +1740,7 @@ fn handle_recv(inner: &Rc<EndpointInner>, r: std::io::Result<(Vec<u8>, RecvMeta)
       // dropped datagram — so do NOT count it as packets_dropped.  Only known
       // consumed-unusable datagrams (oversized/truncated/InvalidData) map to
       // packets_dropped, matching the reactor recv-error accounting.
-      hick_trace::debug!(error = %_e, "socket recv failed");
+      debug!(error = %_e, "socket recv failed");
     }
   }
 }
