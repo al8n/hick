@@ -43,10 +43,7 @@ libc.workspace = true
 
 [dev-dependencies]
 compio = { version = "0.19", features = ["macros", "time"] }
-# Pin the loopback interface in the end-to-end driver integration tests.
 getifs.workspace = true
-# Always-enabled subscriber installed before the unit-test run (see trace_cov)
-# so the instrumentation call sites evaluate their fields and earn coverage.
 tracing-core.workspace = true
 ctor.workspace = true
 

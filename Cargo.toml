@@ -6,9 +6,9 @@ resolver = "3"
 bytes = { version = "1", default-features = false }
 hick = { version = "0.1", path = "hick", default-features = false }
 hick-trace = { version = "0.1", path = "hick-trace", default-features = false }
-mdns-proto = { version = "0.5", path = "mdns-proto", default-features = false }
-hick-udp = { version = "0.5", path = "hick-udp", default-features = false }
-hick-reactor = { version = "0.6", path = "hick-reactor", default-features = false }
+mdns-proto = { version = "0.2", path = "mdns-proto", default-features = false }
+hick-udp = { version = "0.1", path = "hick-udp", default-features = false }
+hick-reactor = { version = "0.1", path = "hick-reactor", default-features = false }
 hick-compio = { version = "0.1", path = "hick-compio", default-features = false }
 hick-smoltcp = { version = "0.1", path = "hick-smoltcp", default-features = false }
 hick-embassy = { version = "0.1", path = "hick-embassy", default-features = false }
@@ -16,9 +16,6 @@ tracing = { version = "0.1", default-features = false }
 metrics = { version = "0.24", default-features = false }
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 defmt = { version = "1", default-features = false }
-# Shared third-party deps. Bases are `default-features = false` (so the no_std
-# crates can use them); std crates re-add the features they need, since a
-# workspace member may add features but cannot override `default-features`.
 thiserror = { version = "2", default-features = false }
 derive_more = { version = "2", default-features = false, features = ["display", "from", "is_variant", "unwrap", "try_unwrap"] }
 rand = { version = "0.10", default-features = false }
@@ -29,15 +26,9 @@ futures = { version = "0.3", default-features = false }
 getifs = { version = "0.6" }
 libc = { version = "0.2" }
 tracing-core = { version = "0.1" }
-# ctor 1.0's `#[ctor(unsafe)]` macro emits `#[allow(unsafe_code)]`. The crates
-# keep `#![forbid(unsafe_code)]` in production builds but test-gate it (deny +
-# a local allow at the test-only ctor subscriber sites), so the unsafe-free
-# guarantee is unchanged for users.
 ctor = { version = "1" }
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
-# `coverage` is set by cargo-llvm-cov (`--cfg coverage`); the no_panic test gates
-# on it (instrument-coverage is incompatible with no-panic's link assertion).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }

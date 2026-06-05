@@ -31,6 +31,25 @@ service discovery. Note that many cloud and shared-infrastructure networks
 restrict multicast, so mDNS is best suited to office, home, or private
 networks.
 
+## Highlights
+
+- **Sans-I/O core.** All protocol logic lives in [`mdns-proto`] as pure state
+  machines — no sockets, threads, or clocks — making it deterministic and
+  exhaustively unit-tested. The drivers only shuttle bytes and time in and out.
+- **Runtime-agnostic.** Drive it from `tokio`, `smol`, or `compio`
+  (thread-per-core) with no change to protocol behavior.
+- **`no_std` and bare-metal.** The core runs on `alloc` — or `heapless`, with no
+  allocator at all — and [`hick-smoltcp`] / [`hick-embassy`] bring full mDNS to
+  embedded targets over smoltcp.
+- **RFC 6762 / 6763 conformant.** Probing and announcing, name-conflict
+  detection with automatic renaming, known-answer and duplicate-question
+  suppression, TTL-accurate caching, and TTL=0 goodbyes on withdrawal.
+- **`unsafe`-minimal.** The protocol core is `#![forbid(unsafe_code)]`; `unsafe`
+  is confined to the platform socket and control-message plumbing.
+- **Observable, à la carte.** Opt into `tracing` spans, `metrics` counters,
+  pollable `stats`, or `defmt` on embedded — each behind a feature flag and
+  compiled out when unused.
+
 ## The family
 
 The crates split protocol logic from I/O, mirroring the `quinn` layering:
@@ -59,11 +78,25 @@ For `smol` instead of `tokio`:
 hick = { version = "0.1", default-features = false, features = ["smol"] }
 ```
 
-For the `compio` (completion-based, thread-per-core) runtime, depend on
-[`hick-compio`] directly.
+For the `compio` (completion-based, thread-per-core) runtime:
 
-For bare-metal (`no_std`) targets, enable the `smoltcp` (engine) or `embassy`
-(async driver) features, or depend on [`hick-smoltcp`] / [`hick-embassy`].
+```toml
+[dependencies]
+hick = { version = "0.1", default-features = false, features = ["compio"] }
+```
+
+For bare-metal (`no_std`) targets, enable `smoltcp` (the runtime-agnostic
+engine) or `embassy` (the embassy-net async driver) — neither pulls in `std`:
+
+```toml
+[dependencies]
+hick = { version = "0.1", default-features = false, features = ["embassy"] }
+```
+
+Each driver is also published as a standalone crate ([`hick-compio`],
+[`hick-smoltcp`], [`hick-embassy`]) if you would rather depend on it directly.
+
+The minimum supported Rust version (MSRV) is **1.91.0** (edition 2024).
 
 ## Example
 

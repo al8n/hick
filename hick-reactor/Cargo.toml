@@ -1,6 +1,6 @@
 [package]
 name = "hick-reactor"
-version = "0.6.0"
+version = "0.1.0"
 edition = "2024"
 publish = true
 repository = "https://github.com/al8n/hick"
@@ -18,9 +18,7 @@ default = ["tokio"]
 tokio = ["agnostic-net/tokio"]
 smol = ["agnostic-net/smol"]
 
-# Enable tracing instrumentation (driver call sites + proto layer).
 tracing = ["dep:tracing", "mdns-proto/tracing", "hick-trace/tracing"]
-# Forward metrics / stats feature flags.
 metrics = ["stats", "mdns-proto/metrics", "hick-trace/metrics"]
 stats = ["mdns-proto/stats", "hick-trace/stats"]
 
@@ -44,13 +42,10 @@ thiserror = { workspace = true, features = ["std"] }
 [dev-dependencies]
 agnostic-net = { version = "0.3", features = ["tokio", "smol"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
-# Always-enabled subscriber installed before the unit-test run (see trace_cov)
-# so the instrumentation call sites evaluate their fields and earn coverage.
 tracing-core = { workspace = true }
 ctor = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 smol = "2"
-# Pin the loopback interface in the end-to-end driver integration tests.
 getifs = { workspace = true }
 
 [package.metadata.docs.rs]
