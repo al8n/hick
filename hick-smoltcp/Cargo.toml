@@ -16,8 +16,6 @@ readme = "README.md"
 [features]
 default = []
 tracing = ["mdns-proto/tracing", "hick-trace/tracing"]
-# `metrics` is intentionally absent: hick-smoltcp is a `no_std` crate and the
-# `metrics` facade requires `std`. Enable stats-only instrumentation via `stats`.
 stats = ["mdns-proto/stats", "hick-trace/stats"]
 defmt = ["dep:defmt"]
 
@@ -36,10 +34,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-# `alloc` enables smoltcp's `Loopback` device (it heap-buffers frames), used by
-# the host integration tests only — production builds stay no-alloc.
 smoltcp = { version = "0.13", default-features = false, features = ["alloc"] }
-# A seeded RNG for the engine tests (matches mdns-proto's own test RNG).
 rand = { workspace = true, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 
 [lints]

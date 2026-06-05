@@ -61,13 +61,13 @@ Other features:
 
 ```toml
 [dependencies]
-mdns-proto = "0.5"                                                # std + slab
+mdns-proto = "0.2"                                                # std + slab
 
 # no_std + alloc:
-mdns-proto = { version = "0.5", default-features = false, features = ["alloc"] }
+mdns-proto = { version = "0.2", default-features = false, features = ["alloc"] }
 
 # bare no_std (no allocator):
-mdns-proto = { version = "0.5", default-features = false }
+mdns-proto = { version = "0.2", default-features = false }
 ```
 
 ## Observability

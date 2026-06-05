@@ -1,6 +1,6 @@
 [package]
 name = "mdns-proto"
-version = "0.5.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91.0"
 license = "MIT OR Apache-2.0"
@@ -17,17 +17,9 @@ alloc = ["dep:smol_str", "dep:rand", "dep:bytes"]
 slab = ["dep:slab"]
 heapless = ["dep:heapless"]
 tracing = ["hick-trace/tracing"]
-# `metrics` forwards to the `metrics` facade crate (std-only). It implies
-# `std` explicitly so that bare-metal builds fail clearly ("metrics requires
-# std") rather than silently pulling a std feature into a no_std target.
-# Bare-metal observability: use `stats` (+ `defmt`) instead.
 metrics = ["std", "stats", "hick-trace/metrics"]
 stats = ["hick-trace/stats", "alloc"]
 
-# Opt-in stretch test that link-checks panic-freedom via `no-panic`.
-# Disabled by default because std-feature builds transitively pull in
-# Display/formatter paths that no-panic flags even when unreachable in
-# practice. CI's cargo-bloat scan is the primary panic-freedom check.
 test-no-panic = []
 
 [dependencies]
@@ -47,11 +39,8 @@ proptest = "1"
 no-panic = "0.1"
 rand = { workspace = true, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 slab = { workspace = true, features = ["std"] }
-# Used only by the tracing smoke test (gated #[cfg(feature = "tracing")]).
 tracing = { workspace = true, features = ["std"] }
 tracing-core = { workspace = true }
-# Installs an always-enabled subscriber before the unit-test run (see trace::cov)
-# so the instrumentation call sites evaluate their fields and earn coverage.
 ctor = { workspace = true }
 
 [package.metadata.docs.rs]
