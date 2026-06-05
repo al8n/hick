@@ -27,11 +27,66 @@
 //! libc backend regardless, so the direct dep costs nothing extra there).
 
 use std::{
-  net::UdpSocket,
+  net::{Ipv4Addr, SocketAddrV4, SocketAddrV6, UdpSocket},
   os::fd::{AsFd, AsRawFd},
 };
 
-use rustix::net::sockopt;
+use rustix::net::{AddressFamily, SocketType, sockopt};
+
+/// Map a rustix `Errno` to a `std::io::Error`, preserving the OS errno.
+fn to_io(e: rustix::io::Errno) -> std::io::Error {
+  std::io::Error::from_raw_os_error(e.raw_os_error())
+}
+
+/// Create and bind an IPv4 mDNS UDP socket via rustix.
+///
+/// `SO_REUSEADDR` + `SO_REUSEPORT` are set BEFORE bind so port 5353 can be
+/// shared with another responder already on it. When `multicast_if` is `Some`,
+/// outbound multicast egresses that interface address (`IP_MULTICAST_IF`).
+/// `unicast_ttl` sets `IP_TTL` (255 for the legacy §6.7 unicast replies, which
+/// the multicast TTL option does not cover — RFC 6762 §11). The returned
+/// `UdpSocket` owns the fd.
+pub(crate) fn bind_v4(
+  local: SocketAddrV4,
+  multicast_if: Option<Ipv4Addr>,
+  unicast_ttl: u8,
+) -> std::io::Result<UdpSocket> {
+  // `None` protocol: the kernel selects UDP for an INET/INET6 DGRAM socket (the
+  // explicit `IPPROTO_UDP` socket2 passed is the same value).
+  let fd = rustix::net::socket(AddressFamily::INET, SocketType::DGRAM, None).map_err(to_io)?;
+  sockopt::set_socket_reuseaddr(&fd, true).map_err(to_io)?;
+  sockopt::set_socket_reuseport(&fd, true).map_err(to_io)?;
+  rustix::net::bind(&fd, &local).map_err(to_io)?;
+  if let Some(ip) = multicast_if {
+    sockopt::set_ip_multicast_if(&fd, &ip).map_err(to_io)?;
+  }
+  sockopt::set_ip_ttl(&fd, unicast_ttl as u32).map_err(to_io)?;
+  Ok(UdpSocket::from(fd))
+}
+
+/// Create and bind an IPv6 mDNS UDP socket via rustix.
+///
+/// `IPV6_V6ONLY` is set BEFORE bind so a `[::]:5353` socket does not also accept
+/// v4-mapped traffic and collide with the separate IPv4 socket; `SO_REUSEADDR` +
+/// `SO_REUSEPORT` likewise precede bind. A non-zero `multicast_if_index` pins the
+/// outbound multicast interface (`IPV6_MULTICAST_IF`). `unicast_hops` sets
+/// `IPV6_UNICAST_HOPS` (255 for legacy unicast replies — RFC 6762 §11).
+pub(crate) fn bind_v6(
+  local: SocketAddrV6,
+  multicast_if_index: u32,
+  unicast_hops: u8,
+) -> std::io::Result<UdpSocket> {
+  let fd = rustix::net::socket(AddressFamily::INET6, SocketType::DGRAM, None).map_err(to_io)?;
+  sockopt::set_ipv6_v6only(&fd, true).map_err(to_io)?;
+  sockopt::set_socket_reuseaddr(&fd, true).map_err(to_io)?;
+  sockopt::set_socket_reuseport(&fd, true).map_err(to_io)?;
+  rustix::net::bind(&fd, &local).map_err(to_io)?;
+  if multicast_if_index != 0 {
+    sockopt::set_ipv6_multicast_if(&fd, multicast_if_index).map_err(to_io)?;
+  }
+  sockopt::set_ipv6_unicast_hops(&fd, Some(unicast_hops)).map_err(to_io)?;
+  Ok(UdpSocket::from(fd))
+}
 
 pub(crate) fn set_multicast_loop_v4(sock: &UdpSocket, on: bool) -> std::io::Result<()> {
   sockopt::set_ip_multicast_loop(sock.as_fd(), on)

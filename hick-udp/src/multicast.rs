@@ -5,8 +5,6 @@ use std::{
   time::SystemTime,
 };
 
-use socket2::{Domain, Protocol, Socket, Type};
-
 use crate::{
   constants::{MDNS_IPV4_GROUP, MDNS_IPV6_GROUP, MDNS_PORT},
   error::{BindError, JoinError},
@@ -227,33 +225,30 @@ pub fn try_bind_v4(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
 }
 
 fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
-  let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-  sock.set_reuse_address(true)?;
-  #[cfg(unix)]
-  sock.set_reuse_port(true)?;
-  let addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT).into();
-  sock.bind(&addr.into())?;
-
-  // Set IP_MULTICAST_IF so outbound multicast uses the requested interface.
-  let iface_index = opts.interface_index();
-  if iface_index != 0 {
-    let ip = match ipv4_addr_for_index(iface_index) {
-      Some(ip) => ip,
+  // Resolve the requested egress interface (if any) to an IPv4 address for
+  // IP_MULTICAST_IF; a non-zero index that doesn't resolve is a hard error.
+  let multicast_if = if opts.interface_index() != 0 {
+    match ipv4_addr_for_index(opts.interface_index()) {
+      Some(ip) => Some(ip),
       None => {
         return Err(BindError::InterfaceNotFound(
-          crate::error::InterfaceNotFoundDetail::new(iface_index),
+          crate::error::InterfaceNotFoundDetail::new(opts.interface_index()),
         ));
       }
-    };
-    sock.set_multicast_if_v4(&ip)?;
-  }
+    }
+  } else {
+    None
+  };
 
-  // unicast sends (legacy §6.7 responses) must ALSO egress with IP
-  // TTL 255 per RFC 6762 §11 — the multicast TTL option does not affect them.
-  // Without this a §11-enforcing receiver would drop our legacy replies.
-  sock.set_ttl_v4(255)?;
-
-  let std_sock: UdpSocket = sock.into();
+  // Create + bind the socket: SO_REUSEADDR/REUSEPORT before bind, IP_MULTICAST_IF
+  // for the egress interface, and IP_TTL=255 for the legacy §6.7 unicast replies
+  // (the multicast TTL option does not cover them — RFC 6762 §11). All applied
+  // inside `platform::bind_v4`.
+  let std_sock = platform::bind_v4(
+    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT),
+    multicast_if,
+    255,
+  )?;
   platform::set_multicast_loop_v4(&std_sock, opts.multicast_loop())?;
   platform::set_multicast_ttl_v4(&std_sock, opts.ttl())?;
   // Best-effort: enabling IP_PKTINFO must not fail the bind on platforms that
@@ -285,31 +280,17 @@ pub fn try_bind_v6(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
 }
 
 fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
-  let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-  // make this an IPv6-ONLY socket BEFORE bind. On dual-stack-default
-  // systems (e.g. Linux `bindv6only=0`) a `[::]:5353` socket would otherwise
-  // also accept IPv4 (as v4-mapped), colliding with the separate IPv4 socket
-  // bound to `0.0.0.0:5353` (bind conflict / duplicate delivery). IPV6_V6ONLY
-  // confines this socket to IPv6 so the two families stay on their own paths.
-  sock.set_only_v6(true)?;
-  sock.set_reuse_address(true)?;
-  #[cfg(unix)]
-  sock.set_reuse_port(true)?;
-  let addr: SocketAddr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0).into();
-  sock.bind(&addr.into())?;
-
-  // Set IPV6_MULTICAST_IF so outbound multicast uses the requested interface.
-  let iface_index = opts.interface_index();
-  if iface_index != 0 {
-    sock.set_multicast_if_v6(iface_index)?;
-  }
-
-  // unicast sends (legacy §6.7 responses) must ALSO egress with
-  // Hop Limit 255 per RFC 6762 §11 — the multicast-hops option does not affect
-  // them. Without this a §11-enforcing receiver would drop our legacy replies.
-  sock.set_unicast_hops_v6(255)?;
-
-  let std_sock: UdpSocket = sock.into();
+  // Create + bind the socket. IPV6_V6ONLY is set before bind so a `[::]:5353`
+  // socket doesn't also accept IPv4 (as v4-mapped) and collide with the separate
+  // IPv4 socket bound to `0.0.0.0:5353` on dual-stack-default systems (e.g. Linux
+  // `bindv6only=0`); SO_REUSEADDR/REUSEPORT likewise precede bind. The egress
+  // interface (IPV6_MULTICAST_IF) and the legacy-reply hop limit 255
+  // (IPV6_UNICAST_HOPS, RFC 6762 §11) are applied inside `platform::bind_v6`.
+  let std_sock = platform::bind_v6(
+    SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0),
+    opts.interface_index(),
+    255,
+  )?;
   // honor with_multicast_loop(false) for IPv6 too (the IPv4 path
   // applies the analogous IP_MULTICAST_LOOP). Without this the option was
   // silently ignored and self-loopback could not be disabled on v6.
@@ -474,6 +455,47 @@ pub fn parse_pktinfo_v6(
 #[repr(align(8))]
 struct CmsgBuf([u8; 256]);
 
+/// Reconstruct a [`SocketAddr`] from a `sockaddr_storage` filled by `recvmsg`.
+///
+/// Returns `None` for a truncated address or a family other than `AF_INET` /
+/// `AF_INET6` (mDNS handles only IPv4/IPv6 peers). Mirrors the prior
+/// `socket2::SockAddr::as_socket` behavior: the v6 `flowinfo` / `scope_id` are
+/// passed through verbatim (the latter carries the link-local zone the RFC 6762
+/// §11 fallback relies on).
+#[cfg(unix)]
+fn sockaddr_storage_to_socketaddr(
+  storage: &libc::sockaddr_storage,
+  len: libc::socklen_t,
+) -> Option<SocketAddr> {
+  let len = len as usize;
+  match storage.ss_family as libc::c_int {
+    libc::AF_INET if len >= core::mem::size_of::<libc::sockaddr_in>() => {
+      // SAFETY: ss_family is AF_INET and recvmsg wrote at least
+      // size_of::<sockaddr_in>() bytes, so the sin_addr/sin_port reads stay
+      // within the initialized storage; sockaddr_storage is suitably aligned.
+      #[allow(unsafe_code)]
+      let sin = unsafe { &*core::ptr::from_ref(storage).cast::<libc::sockaddr_in>() };
+      Some(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)),
+        u16::from_be(sin.sin_port),
+      )))
+    }
+    libc::AF_INET6 if len >= core::mem::size_of::<libc::sockaddr_in6>() => {
+      // SAFETY: ss_family is AF_INET6 and recvmsg wrote at least
+      // size_of::<sockaddr_in6>() bytes.
+      #[allow(unsafe_code)]
+      let sin6 = unsafe { &*core::ptr::from_ref(storage).cast::<libc::sockaddr_in6>() };
+      Some(SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::from(sin6.sin6_addr.s6_addr),
+        u16::from_be(sin6.sin6_port),
+        sin6.sin6_flowinfo,
+        sin6.sin6_scope_id,
+      )))
+    }
+    _ => None,
+  }
+}
+
 /// Receive one datagram from `fd` (must be non-blocking) together with its
 /// PKTINFO ancillary metadata. `is_v4` selects the parser. Returns the
 /// datagram bytes written into `buf` plus the recovered [`RecvMeta`].
@@ -496,7 +518,10 @@ pub fn recv_with_meta(
   // `crate::platform::unix` module docs for the full list of what rustix is
   // missing on the matching send/sockopt side.
   // Peer address storage, filled by recvmsg.
-  let mut storage = socket2::SockAddrStorage::zeroed();
+  // SAFETY: `libc::sockaddr_storage` is plain-old-data; an all-zero bit pattern
+  // is a valid (empty) storage that recvmsg overwrites before we read it.
+  #[allow(unsafe_code)]
+  let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
   let mut iov = libc::iovec {
     iov_base: buf.as_mut_ptr().cast(),
     iov_len: buf.len(),
@@ -512,13 +537,9 @@ pub fn recv_with_meta(
   // meaningful field below.
   #[allow(unsafe_code)]
   let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
-  // SAFETY: view the zeroed storage as the platform `sockaddr_storage` it wraps
-  // to hand `recvmsg` a pointer to fill; recvmsg writes a valid sockaddr within
-  // `msg_namelen` before we read it back via `SockAddr::new`.
-  #[allow(unsafe_code)]
-  let storage_ptr =
-    unsafe { storage.view_as::<libc::sockaddr_storage>() } as *mut libc::sockaddr_storage;
-  msg.msg_name = storage_ptr.cast();
+  // `storage` is already a `sockaddr_storage`; hand recvmsg a pointer to it to
+  // fill (it writes a valid sockaddr within `msg_namelen` before we read back).
+  msg.msg_name = core::ptr::addr_of_mut!(storage).cast();
   msg.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
   msg.msg_iov = core::ptr::addr_of_mut!(iov);
   msg.msg_iovlen = 1;
@@ -554,11 +575,7 @@ pub fn recv_with_meta(
 
   // Reconstruct the peer SocketAddr from the filled sockaddr_storage. This is
   // REQUIRED: it identifies the datagram source.
-  // SAFETY: `recvmsg` filled `storage` with `msg.msg_namelen` valid bytes of a
-  // sockaddr; socket2 only inspects bytes within that length.
-  #[allow(unsafe_code)]
-  let sockaddr = unsafe { socket2::SockAddr::new(storage, msg.msg_namelen) };
-  let peer = sockaddr.as_socket().ok_or_else(|| {
+  let peer = sockaddr_storage_to_socketaddr(&storage, msg.msg_namelen).ok_or_else(|| {
     std::io::Error::new(
       std::io::ErrorKind::InvalidData,
       "recvmsg returned an unrecognized peer address family",
@@ -863,6 +880,8 @@ impl<'a> Iterator for CmsgIter<'a> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod r4_f5_tests {
+  use socket2::Socket;
+
   use super::*;
 
   #[test]
