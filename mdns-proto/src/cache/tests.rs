@@ -437,3 +437,230 @@ fn zero_cap_cache_rejects_inserts() {
     "zero-cap cache must remain empty after cache_flush insert"
   );
 }
+
+// ── TTL=0 goodbye: no matching entry / sooner-expiry no-op ────
+
+/// A TTL=0 goodbye (RFC 6762 §10.1) for a record that is NOT in the cache
+/// must be a harmless no-op: the goodbye walks the entries, finds no
+/// matching `(name, rtype, rclass, rdata)` victim, and returns `Ok(None)`
+/// without inserting or mutating anything.  This drives the
+/// "victim stays `None`" path of the goodbye-clamp guard.
+#[test]
+fn ttl_zero_goodbye_for_absent_record_is_noop() {
+  let mut c: Cache<Instant, slab::Slab<CacheEntry<Instant>>> = Cache::new();
+  let now = Instant::now();
+
+  // Cache holds an unrelated record.
+  let (n, rt, rd, ttl) = make_entry("present.local.", ResourceType::A, 1, 120);
+  c.try_insert(n, rt, ResourceClass::In, rd, ttl, now, false)
+    .unwrap();
+  assert_eq!(c.entries.len(), 1);
+
+  // Goodbye for a DIFFERENT name that the cache has never seen.
+  let absent = Name::try_from_str("absent.local.").unwrap();
+  let key = c
+    .try_insert(
+      absent.clone(),
+      ResourceType::A,
+      ResourceClass::In,
+      std::vec![9],
+      Duration::ZERO,
+      now,
+      false,
+    )
+    .unwrap();
+  assert!(key.is_none(), "TTL=0 goodbye must return Ok(None)");
+  assert_eq!(
+    c.entries.len(),
+    1,
+    "a goodbye for an absent record must not insert or remove anything"
+  );
+  assert!(
+    !c.contains(&absent, ResourceType::A, ResourceClass::In),
+    "the absent record must remain absent after its goodbye"
+  );
+}
+
+/// A TTL=0 goodbye must only ever SHORTEN an entry's deadline, never push it
+/// out.  When the matching entry already expires at or before the 1-second
+/// rescue deadline (`now + 1s`), the `expires_at() > deadline` guard is false
+/// and the entry is left exactly as-is.  This drives the guard's false branch
+/// and asserts the no-extension invariant.
+#[test]
+fn ttl_zero_goodbye_does_not_extend_a_sooner_expiry() {
+  let mut c: Cache<Instant, slab::Slab<CacheEntry<Instant>>> = Cache::new();
+  let now = Instant::now();
+
+  // Insert with a 1-second TTL: expires_at == now + 1s, exactly the goodbye
+  // rescue deadline, so `expires_at() > deadline` is false.
+  let (n, rt, rd, ttl) = make_entry("brief.local.", ResourceType::A, 1, 1);
+  c.try_insert(
+    n.clone(),
+    rt,
+    ResourceClass::In,
+    rd.clone(),
+    ttl,
+    now,
+    false,
+  )
+  .unwrap();
+  let before = c
+    .entries
+    .iter()
+    .next()
+    .map(|(_, e)| e.expires_at())
+    .unwrap();
+
+  // Goodbye for the same record. The clamp would set expires_at to now + 1s,
+  // but the existing deadline is already now + 1s, so nothing changes.
+  c.try_insert(n, rt, ResourceClass::In, rd, Duration::ZERO, now, false)
+    .unwrap();
+  let after = c
+    .entries
+    .iter()
+    .next()
+    .map(|(_, e)| e.expires_at())
+    .unwrap();
+  assert_eq!(
+    before, after,
+    "a goodbye must never push a sooner-or-equal expiry further out"
+  );
+}
+
+// ── cache-flush §10.2 grace: future received_at counts as recent ──
+
+/// RFC 6762 §10.2 grace skips siblings received within the last second.  A
+/// sibling whose `received_at` is in the FUTURE relative to the flush's `now`
+/// (e.g. clock instants arriving out of order) yields `None` from
+/// `checked_duration_since` and must be treated as "recent" — i.e. left
+/// untouched, not clamped.  This drives the `None => true` grace arm.
+#[test]
+fn cache_flush_grace_treats_future_received_at_as_recent() {
+  let mut c: Cache<Instant, slab::Slab<CacheEntry<Instant>>> = Cache::new();
+  let base = Instant::now();
+  let ttl = Duration::from_secs(120);
+  let name = Name::try_from_str("host.local.").unwrap();
+
+  // Sibling A record received at a FUTURE instant relative to the flush below.
+  let future = base.checked_add(Duration::from_secs(10)).unwrap();
+  c.try_insert(
+    name.clone(),
+    ResourceType::A,
+    ResourceClass::In,
+    std::vec![10, 0, 0, 1],
+    ttl,
+    future,
+    false,
+  )
+  .unwrap();
+
+  // Cache-flush a DIFFERENT rdata at the earlier `base` instant. The existing
+  // sibling's received_at (future) is newer than `base`, so the grace check
+  // sees it as recent and does NOT clamp it.
+  c.try_insert(
+    name.clone(),
+    ResourceType::A,
+    ResourceClass::In,
+    std::vec![10, 0, 0, 2],
+    ttl,
+    base,
+    true,
+  )
+  .unwrap();
+
+  // The future-received sibling keeps its full TTL: a sweep at base + 5s (well
+  // past a hypothetical base + 1s clamp) must NOT drop it.
+  c.sweep_expired(base.checked_add(Duration::from_secs(5)).unwrap());
+  assert_eq!(
+    c.count_matching(&name, ResourceType::A, ResourceClass::In),
+    2,
+    "a future-received sibling must be treated as recent (no §10.2 clamp)"
+  );
+}
+
+// ── reactive eviction: fallible pool capacity error + retry ──
+
+/// When the backing [`Pool`] is fixed-capacity and FALLIBLE (here a
+/// `heapless::Vec`, whose `insert` returns `Err` once full), an insert that
+/// overflows the pool must trigger `bounded_insert`'s reactive eviction:
+/// evict the soonest-expiring entry, then retry the insert once (which now
+/// succeeds).
+///
+/// `max_entries` is set ABOVE the pool's fixed capacity so the proactive
+/// `len >= max_entries` eviction (Step 1) never fires — the only thing that
+/// can make room is the reactive Step 3 driven by the pool's capacity error.
+#[cfg(feature = "heapless")]
+#[test]
+fn fallible_pool_capacity_error_triggers_reactive_eviction() {
+  // Fixed capacity 2; cap deliberately higher so proactive eviction is inert.
+  let mut c: Cache<Instant, heapless::Vec<Option<CacheEntry<Instant>>, 2>> =
+    Cache::with_max_entries(100);
+  // Attach stats so the reactive-eviction counter bump is exercised too.
+  #[cfg(feature = "stats")]
+  c.set_stats(std::sync::Arc::new(hick_trace::stats::Stats::default()));
+  let now = Instant::now();
+  let name = Name::try_from_str("host.local.").unwrap();
+
+  // Entry A: soonest expiry (10s) — this is the reactive-eviction victim.
+  c.try_insert(
+    name.clone(),
+    ResourceType::A,
+    ResourceClass::In,
+    std::vec![10, 0, 0, 1],
+    Duration::from_secs(10),
+    now,
+    false,
+  )
+  .unwrap();
+  // Entry B: later expiry (300s) — must survive.
+  c.try_insert(
+    name.clone(),
+    ResourceType::A,
+    ResourceClass::In,
+    std::vec![10, 0, 0, 2],
+    Duration::from_secs(300),
+    now,
+    false,
+  )
+  .unwrap();
+  assert_eq!(c.len(), 2, "pool is now at its fixed capacity of 2");
+
+  // Entry C: a third distinct record. The pool is full, so the underlying
+  // `insert` returns Err and reactive eviction kicks in: the soonest-expiring
+  // entry (A) is evicted, then C is inserted on retry.
+  let key = c
+    .try_insert(
+      name.clone(),
+      ResourceType::A,
+      ResourceClass::In,
+      std::vec![10, 0, 0, 3],
+      Duration::from_secs(300),
+      now,
+      false,
+    )
+    .unwrap();
+  assert!(
+    key.is_some(),
+    "reactive eviction + retry must insert the new entry successfully"
+  );
+  assert_eq!(c.len(), 2, "cache must stay at the pool's fixed capacity");
+
+  // A (the soonest-expiring victim) was evicted; B and C remain.
+  let surviving: std::vec::Vec<std::vec::Vec<u8>> = c
+    .entries
+    .iter()
+    .map(|(_, e)| e.rdata_slice().to_vec())
+    .collect();
+  assert!(
+    !surviving.contains(&std::vec![10, 0, 0, 1]),
+    "the soonest-expiring entry must be the reactive-eviction victim"
+  );
+  assert!(
+    surviving.contains(&std::vec![10, 0, 0, 2]),
+    "the later-expiring sibling must survive reactive eviction"
+  );
+  assert!(
+    surviving.contains(&std::vec![10, 0, 0, 3]),
+    "the newly inserted entry must be present after the retry"
+  );
+}

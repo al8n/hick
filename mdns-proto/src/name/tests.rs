@@ -122,3 +122,72 @@ fn enforces_wire_length_not_string_length() {
     "a name whose wire form exceeds 255 octets must be rejected despite a string length <= 255"
   );
 }
+
+/// The very first check in `validate_name` rejects any presentation string
+/// longer than MAX_NAME_BYTES outright, before label splitting — distinct from
+/// the wire-length accumulation path. A 256-byte input trips this guard and the
+/// reported `NameTooLongDetail` carries the offending string length.
+#[test]
+#[cfg(any(feature = "alloc", feature = "std"))]
+fn rejects_string_longer_than_max_name_bytes() {
+  let over = "a".repeat(256);
+  let err = Name::try_from_str(&over).unwrap_err();
+  match err {
+    NameError::NameTooLong(detail) => assert_eq!(detail.len(), 256),
+    other => panic!("expected NameTooLong, got {other:?}"),
+  }
+}
+
+#[test]
+fn name_len_reports_byte_length() {
+  let n = Name::try_from_str("foo.local.").unwrap();
+  assert_eq!(n.len(), 10);
+  assert_eq!(n.len(), n.as_str().len());
+  // The empty name has zero length but is still a valid `Name`.
+  let empty = Name::try_from_str("").unwrap();
+  assert_eq!(empty.len(), 0);
+}
+
+/// `LabelTooLongDetail` is the payload of `NameError::LabelTooLong`; its `len()`
+/// reports the rejected label's byte count and `is_empty()` is always false in
+/// practice (a zero-length label is reported as `EmptyLabel`, not here).
+#[test]
+fn label_too_long_detail_accessors() {
+  // A single label over MAX_LABEL_BYTES (63). Assert the detail reports the
+  // literal's exact byte length rather than a hard-coded constant.
+  let long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 64 'a'
+  assert_eq!(long.len(), 64);
+  let err = Name::try_from_str(long).unwrap_err();
+  match err {
+    NameError::LabelTooLong(detail) => {
+      assert_eq!(detail.len(), long.len());
+      assert!(!detail.is_empty());
+    }
+    other => panic!("expected LabelTooLong, got {other:?}"),
+  }
+}
+
+/// `NameTooLongDetail` is the payload of `NameError::NameTooLong`; its `len()`
+/// reports the rejected name's byte count and `is_empty()` is always false in
+/// practice (empty names pass validation).
+#[test]
+#[cfg(any(feature = "alloc", feature = "std"))]
+fn name_too_long_detail_accessors() {
+  // 63/63/63/62 = 251 + 3 dots = 254 string bytes → wire form = 256 octets,
+  // exercising the wire-length accumulation path whose detail carries 256.
+  let over_limit = std::format!(
+    "{}.{}.{}.{}",
+    "a".repeat(63),
+    "a".repeat(63),
+    "a".repeat(63),
+    "a".repeat(62)
+  );
+  let err = Name::try_from_str(&over_limit).unwrap_err();
+  match err {
+    NameError::NameTooLong(detail) => {
+      assert_eq!(detail.len(), 256);
+      assert!(!detail.is_empty());
+    }
+    other => panic!("expected NameTooLong, got {other:?}"),
+  }
+}
