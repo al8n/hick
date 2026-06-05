@@ -192,6 +192,51 @@ fn canonical_rdata_rejects_overlong_encoded_name() {
 }
 
 #[test]
+fn rdata_view_propagates_malformed_cname() {
+  // CNAME rdata MUST consume EXACTLY RDLENGTH (cname.rs §3.3.1): a
+  // self-contained name "svc.local." (11 bytes) plus one trailing garbage
+  // octet, declared RDLENGTH = 12. `consumed (11) != rdata_len (12)` so
+  // `Cname::try_from_message` returns Err and `rdata_view` propagates it
+  // (the `?` on the CNAME arm). The existing CNAME test only hits the success
+  // path, so this covers the error branch.
+  let mut rdata = std::vec::Vec::from(SVC_LOCAL_WIRE);
+  rdata.push(0xFF); // one trailing byte inside RDLENGTH
+  let msg = message_with_pointered_record(5 /* CNAME */, &rdata);
+  let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+  assert!(
+    matches!(rec.rdata_view(), Err(ParseError::BufferTooShort(_))),
+    "a CNAME whose name does not exactly fill RDLENGTH must be rejected"
+  );
+  // canonical_rdata routes through rdata_view, so it surfaces the same error.
+  assert!(rec.canonical_rdata().is_err());
+}
+
+#[test]
+fn rdata_view_propagates_malformed_nsec() {
+  // NSEC next_name MUST NOT overrun the declared RDLENGTH (nsec.rs:
+  // `bitmap_start > rdata_end`). Hand-build the record so RDLENGTH (1) is
+  // smaller than the bytes the next_name consumes (a pointer = 2 bytes), which
+  // the `message_with_pointered_record` helper cannot express (it forces
+  // RDLENGTH == rdata.len()). The NSEC arm's `?` in `rdata_view` then fires.
+  let mut m = std::vec::Vec::new();
+  m.extend_from_slice(&[0u8; 12]); // header region (pointer base 12)
+  m.extend_from_slice(SVC_LOCAL_WIRE); // "svc.local." at offset 12
+  debug_assert_eq!(m.len(), 23);
+  m.extend_from_slice(&[0xC0, 0x0C]); // owner name = pointer to offset 12
+  m.extend_from_slice(&47u16.to_be_bytes()); // TYPE = NSEC
+  m.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+  m.extend_from_slice(&120u32.to_be_bytes()); // TTL
+  m.extend_from_slice(&1u16.to_be_bytes()); // RDLENGTH = 1 (too small)
+  m.extend_from_slice(&[0xC0, 0x0C]); // next_name pointer (consumes 2 bytes)
+  let (rec, _) = Ref::try_parse(&m, 23).unwrap();
+  assert!(
+    matches!(rec.rdata_view(), Err(ParseError::BufferTooShort(_))),
+    "an NSEC whose next_name overruns RDLENGTH must be rejected"
+  );
+  assert!(rec.canonical_rdata().is_err());
+}
+
+#[test]
 fn try_parse_rejects_message_too_short_for_fixed_header() {
   // "x.local." parses, but fewer than the 10 fixed type/class/ttl/rdlen
   // header bytes follow — the record header read must fail cleanly.

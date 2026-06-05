@@ -6795,3 +6795,184 @@ fn begin_withdrawal_is_idempotent() {
     "idempotent begin_withdrawal must report the handle exactly once"
   );
 }
+
+// ── route iterator: known-answer fan-out across multiple services ──
+
+/// a QR=0 ANSWER record (a known-answer hint) that matches ONLY a
+/// later-registered service must still reach that service as
+/// ServiceEvent::KnownAnswer. The service-side KAS scan walks every registered
+/// service in slab order; an earlier non-matching service must not short-circuit
+/// the fan-out before the actual owner is found. (Positive single-service
+/// controls are `query_answer_for_instance_name_emits_known_answer_only` and
+/// `qr0_answer_for_host_name_emits_host_conflict_not_probe_conflict`; this drives
+/// the multi-service walk so the loop visits a non-matching service first.)
+#[test]
+fn qr0_known_answer_fans_out_to_a_later_matching_service() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+
+  // Service 0 (lower slab key): Alpha / alpha.local. — must NOT match the hint.
+  let st0 = Name::try_from_str("_http._tcp.local.").unwrap();
+  let inst0 = Name::try_from_str("Alpha._http._tcp.local.").unwrap();
+  let host0 = Name::try_from_str("alpha.local.").unwrap();
+  let recs0 = ServiceRecords::new(st0, inst0, host0, 80, 120);
+  let (_h0, _s0) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs0),
+      now,
+    )
+    .unwrap();
+
+  // Service 1 (higher slab key): Beta / beta.local. under a DISTINCT
+  // service-type so service 0's names share nothing with the hint record.
+  let st1 = Name::try_from_str("_other._tcp.local.").unwrap();
+  let inst1 = Name::try_from_str("Beta._other._tcp.local.").unwrap();
+  let host1 = Name::try_from_str("beta.local.").unwrap();
+  let recs1 = ServiceRecords::new(st1, inst1.clone(), host1, 81, 120);
+  let (h1, _s1) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs1),
+      now,
+    )
+    .unwrap();
+
+  // QR=0 query packet; ANSWER = A record owned by Beta's instance name only.
+  let mut buf = [0u8; 512];
+  let header = Header::new(); // QR=0 (known-answer hint, not a response)
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, header).unwrap();
+  b.push_a_answer(&inst1, 120, Ipv4Addr::new(10, 0, 0, 2), false)
+    .unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let known_answers: std::vec::Vec<_> = e
+    .handle(now, src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter_map(|ev| match ev {
+      RouteEvent::ToService(ts) if ts.event().is_known_answer() => Some(ts.handle()),
+      _ => None,
+    })
+    .collect();
+
+  // Exactly one KnownAnswer, addressed to the later-registered Beta service —
+  // proving the scan fell through the non-matching service 0 to find the owner.
+  assert_eq!(
+    known_answers,
+    std::vec![h1],
+    "the KAS hint must fan out past the non-matching first service to Beta"
+  );
+}
+
+// ── route iterator: ADDITIONAL-section parse error + TTL=0 withdrawal ──
+
+/// a malformed record in the ADDITIONAL section of a QR=1 response
+/// must surface as `HandleError::Parse` from the route iterator (after any
+/// well-formed earlier additionals are delivered), not be silently swallowed.
+/// The header overstates ARCOUNT, so the iterator walks into truncated bytes.
+#[test]
+fn additional_section_malformed_record_surfaces_parse_error() {
+  use crate::{config::QuerySpec, event::RouteEvent, wire::ResourceType};
+  use core::net::SocketAddr;
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let _h = e
+    .try_start_query(QuerySpec::new(qname.clone(), ResourceType::A), now)
+    .unwrap();
+
+  // QR=1 response, ARCOUNT=2: record 0 is a well-formed A for the query name,
+  // record 1 is a truncated name (label length 16 with a single trailing byte).
+  let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
+  msg.extend_from_slice(&[0, 0, 0x84, 0x00, 0, 0, 0, 0, 0, 0, 0, 2]); // QR=1, ar=2
+  msg.extend_from_slice(&[
+    7, b'p', b'r', b'i', b'n', b't', b'e', b'r', 5, b'l', b'o', b'c', b'a', b'l', 0,
+  ]);
+  msg.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+  msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  msg.extend_from_slice(&120u32.to_be_bytes()); // TTL
+  msg.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+  msg.extend_from_slice(&[10, 0, 0, 7]);
+  msg.extend_from_slice(&[0x10, b'x']); // record 1: label len 16, only 1 byte → parse error
+
+  let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let mut saw_to_query = false;
+  let mut saw_parse_err = false;
+  for ev in e.handle(now, src, local_ip, 0, &msg, false).unwrap() {
+    match ev {
+      Ok(RouteEvent::ToQuery(_)) => saw_to_query = true,
+      Err(HandleError::Parse(_)) => saw_parse_err = true,
+      _ => {}
+    }
+  }
+  assert!(
+    saw_to_query,
+    "the well-formed first additional must still reach the active query"
+  );
+  assert!(
+    saw_parse_err,
+    "a malformed additional record must surface HandleError::Parse from the iterator"
+  );
+}
+
+/// a TTL=0 record in the ADDITIONAL section (a goodbye/withdrawal) must
+/// be skipped by the route-level TTL=0 guard — no ghost answer is surfaced for
+/// it — while a following positive-TTL additional for the same query name is
+/// still delivered. This exercises the additional-section per-record skip plus
+/// the resume-from-cursor advance across two records.
+#[test]
+fn additional_section_ttl0_withdrawal_skipped_then_later_record_delivered() {
+  use crate::{config::QuerySpec, event::RouteEvent, wire::ResourceType};
+  use core::net::SocketAddr;
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let _h = e
+    .try_start_query(QuerySpec::new(qname.clone(), ResourceType::A), now)
+    .unwrap();
+
+  let owner: [u8; 15] = [
+    7, b'p', b'r', b'i', b'n', b't', b'e', b'r', 5, b'l', b'o', b'c', b'a', b'l', 0,
+  ];
+  // QR=1 response, ARCOUNT=2: record 0 is a TTL=0 A (withdrawal) for the query
+  // name; record 1 is a positive-TTL A for the same name.
+  let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
+  msg.extend_from_slice(&[0, 0, 0x84, 0x00, 0, 0, 0, 0, 0, 0, 0, 2]); // QR=1, ar=2
+  msg.extend_from_slice(&owner);
+  msg.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+  msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  msg.extend_from_slice(&0u32.to_be_bytes()); // TTL=0 (goodbye)
+  msg.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+  msg.extend_from_slice(&[10, 0, 0, 8]);
+  msg.extend_from_slice(&owner);
+  msg.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+  msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  msg.extend_from_slice(&120u32.to_be_bytes()); // positive TTL
+  msg.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+  msg.extend_from_slice(&[10, 0, 0, 9]);
+
+  let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let to_query = e
+    .handle(now, src, local_ip, 0, &msg, false)
+    .unwrap()
+    .filter(|r| matches!(r, Ok(RouteEvent::ToQuery(_))))
+    .count();
+  // Exactly one ToQuery: the TTL=0 record 0 is skipped (no ghost answer), the
+  // positive-TTL record 1 is delivered.
+  assert_eq!(
+    to_query, 1,
+    "a TTL=0 additional must be skipped while the following positive-TTL one is delivered"
+  );
+}
