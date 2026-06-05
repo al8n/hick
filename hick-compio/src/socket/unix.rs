@@ -468,7 +468,7 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta) {
 /// `from_std` bubbled the error — breaking v6-only and dual-stack endpoint
 /// construction before any datagram could flow. `from_std` must now succeed on
 /// a v6 socket by applying only the v6 cmsg options.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 #[compio::test]
 async fn from_std_enables_cmsgs_on_v6_socket() {
   use crate::socket::Socket;
@@ -488,7 +488,7 @@ async fn from_std_enables_cmsgs_on_v6_socket() {
 
 /// Companion to [`from_std_enables_cmsgs_on_v6_socket`]: the per-family gating
 /// must not regress the v4 path.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 #[compio::test]
 async fn from_std_enables_cmsgs_on_v4_socket() {
   use crate::socket::Socket;
@@ -509,7 +509,7 @@ async fn from_std_enables_cmsgs_on_v4_socket() {
 /// The constant + payload are chosen by `recv_timestamp_ns`: nanosecond
 /// SCM_TIMESTAMPNS/timespec on Linux/Android, microsecond SCM_TIMESTAMP/timeval
 /// on Apple/BSD.
-#[cfg(all(unix, has_recv_timestamp))]
+#[cfg(all(unix, has_recv_timestamp, test))]
 #[test]
 fn cmsg_iter_walks_a_single_timestamp_cmsg() {
   #[cfg(not(recv_timestamp_ns))]
@@ -571,7 +571,7 @@ fn cmsg_iter_walks_a_single_timestamp_cmsg() {
 /// Round-trip an `IP_PKTINFO` cmsg through `CMsgBuilder` and `CMsgIter`:
 /// the builder encodes the header + payload, then the iterator must read
 /// back the same level/type/payload.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 #[test]
 fn cmsg_builder_emits_a_round_trippable_pktinfo() {
   use libc::{IP_PKTINFO, IPPROTO_IP, in_addr, in_pktinfo};
@@ -617,7 +617,7 @@ fn cmsg_builder_emits_a_round_trippable_pktinfo() {
 /// not read: reading `in_pktinfo` out of it would run past the bytes the
 /// kernel deposited. `decode_unix_cmsgs` must return without panicking and
 /// leave `local_ip` / `interface_index` at their `RecvMeta::empty` defaults.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 #[test]
 fn truncated_pktinfo_cmsg_is_skipped_not_read() {
   use libc::{IP_PKTINFO, IPPROTO_IP, cmsghdr};
@@ -674,7 +674,7 @@ fn truncated_pktinfo_cmsg_is_skipped_not_read() {
 /// reachable with a seconds value larger than `i64` can hold, which a real
 /// kernel timestamp field cannot carry. The fix's guarantee is "no panic",
 /// not a forced `None`.
-#[cfg(all(unix, has_recv_timestamp))]
+#[cfg(all(unix, has_recv_timestamp, test))]
 #[test]
 fn absurd_timestamp_does_not_panic() {
   use libc::{SOL_SOCKET, cmsghdr};
