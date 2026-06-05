@@ -21,7 +21,6 @@ hick-trace = { workspace = true }
 thiserror = { workspace = true, features = ["std"] }
 derive_more = { workspace = true }
 getifs = { workspace = true }
-socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["net", "system"] }
@@ -29,6 +28,14 @@ libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_IO"] }
+socket2 = { version = "0.6", features = ["all"] }
+
+[dev-dependencies]
+# socket2 is no longer a production dependency on unix (the socket setup moved
+# to rustix). The golden-capture parity test still uses it to bind a REUSEPORT
+# sniffer joined on the default interface, which the index-based public API
+# (try_join_v4) cannot express.
+socket2 = { version = "0.6", features = ["all"] }
 
 [package.metadata.docs.rs]
 all-features = true

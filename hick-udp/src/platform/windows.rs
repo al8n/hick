@@ -13,7 +13,7 @@ use std::{
   sync::OnceLock,
 };
 
-use socket2::Socket;
+use socket2::{Domain, Protocol, Socket, Type};
 use windows_sys::Win32::Networking::WinSock::{
   AF_INET, AF_INET6, IP_PKTINFO, IPPROTO_IP, IPPROTO_IPV6, IPV6_PKTINFO, MSG_CTRUNC,
   SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, WSABUF,
@@ -24,6 +24,44 @@ use crate::multicast::RecvMeta;
 
 fn as_socket(s: &UdpSocket) -> std::io::Result<Socket> {
   Ok(Socket::from(s.try_clone()?))
+}
+
+/// Create and bind an IPv4 mDNS UDP socket via socket2 (Windows mirror of
+/// `crate::platform::unix::bind_v4`). `SO_REUSEADDR` precedes bind; the optional
+/// `IP_MULTICAST_IF` and the `IP_TTL` (=255 for legacy unicast replies, RFC 6762
+/// §11) follow. Windows has no `SO_REUSEPORT`.
+pub(crate) fn bind_v4(
+  local: SocketAddrV4,
+  multicast_if: Option<Ipv4Addr>,
+  unicast_ttl: u8,
+) -> std::io::Result<UdpSocket> {
+  let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+  sock.set_reuse_address(true)?;
+  sock.bind(&SocketAddr::V4(local).into())?;
+  if let Some(ip) = multicast_if {
+    sock.set_multicast_if_v4(&ip)?;
+  }
+  sock.set_ttl_v4(unicast_ttl as u32)?;
+  Ok(sock.into())
+}
+
+/// Create and bind an IPv6 mDNS UDP socket via socket2 (Windows mirror of
+/// `crate::platform::unix::bind_v6`): `IPV6_V6ONLY` + `SO_REUSEADDR` before bind,
+/// optional `IPV6_MULTICAST_IF`, then `IPV6_UNICAST_HOPS` (=255, RFC 6762 §11).
+pub(crate) fn bind_v6(
+  local: SocketAddrV6,
+  multicast_if_index: u32,
+  unicast_hops: u8,
+) -> std::io::Result<UdpSocket> {
+  let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+  sock.set_only_v6(true)?;
+  sock.set_reuse_address(true)?;
+  sock.bind(&SocketAddr::V6(local).into())?;
+  if multicast_if_index != 0 {
+    sock.set_multicast_if_v6(multicast_if_index)?;
+  }
+  sock.set_unicast_hops_v6(unicast_hops as u32)?;
+  Ok(sock.into())
 }
 
 pub(crate) fn set_multicast_loop_v4(sock: &UdpSocket, on: bool) -> std::io::Result<()> {
