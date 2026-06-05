@@ -382,7 +382,7 @@ impl Endpoint {
 }
 
 /// Wake the driver when an `Endpoint` clone is dropped so it can promptly
-/// observe `Rc::strong_count(&inner) == 1` and exit (per the T9 exit-condition
+/// observe `Rc::strong_count(&inner) == 1` and exit (per the exit-condition
 /// contract). Without this notify, the driver would only notice the dropped
 /// handle the next time it woke for a recv / timer event.
 impl Drop for Endpoint {
