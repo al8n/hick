@@ -20,9 +20,10 @@ metrics = ["stats", "mdns-proto/metrics", "hick-trace/metrics"]
 stats = ["mdns-proto/stats", "hick-trace/stats"]
 
 [dependencies]
+bytes = { workspace = true, features = ["default"] }
 mdns-proto = { workspace = true, features = ["std", "slab"] }
 hick-udp.workspace = true
-hick-trace = { workspace = true }
+hick-trace.workspace = true
 tracing = { workspace = true, optional = true, features = ["attributes", "std"] }
 compio = { version = "0.19", features = ["time"] }
 compio-net = "0.12"
@@ -31,23 +32,23 @@ compio-runtime = "0.12"
 compio-buf = "0.8.2"
 futures = { workspace = true, features = ["std", "async-await"] }
 event-listener = "5"
-getifs = { workspace = true }
+getifs.workspace = true
 slab = { workspace = true, features = ["std"] }
 smol_str = { workspace = true, features = ["std"] }
 rand = { workspace = true, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 thiserror = { workspace = true, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+libc.workspace = true
 
 [dev-dependencies]
 compio = { version = "0.19", features = ["macros", "time"] }
 # Pin the loopback interface in the end-to-end driver integration tests.
-getifs = { workspace = true }
+getifs.workspace = true
 # Always-enabled subscriber installed before the unit-test run (see trace_cov)
 # so the instrumentation call sites evaluate their fields and earn coverage.
-tracing-core = { workspace = true }
-ctor = { workspace = true }
+tracing-core.workspace = true
+ctor.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

@@ -40,6 +40,7 @@ use std::{
   time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use futures::{FutureExt, StreamExt, pin_mut, select_biased, stream::SelectAll};
 use mdns_proto::{
   Name, QuerySpec,
@@ -72,9 +73,9 @@ pub struct ServiceEntry {
   instance: Name,
   host: Name,
   port: u16,
-  ipv4: Vec<Ipv4Addr>,
-  ipv6: Vec<Ipv6Addr>,
-  txt: Vec<Vec<u8>>,
+  ipv4: Arc<[Ipv4Addr]>,
+  ipv6: Arc<[Ipv6Addr]>,
+  txt: Arc<[Bytes]>,
 }
 
 impl ServiceEntry {
@@ -123,7 +124,7 @@ impl ServiceEntry {
   /// DNS-SD usage, but treated as opaque bytes since TXT data may be binary). A
   /// service with no metadata has a single empty segment (RFC 6763 §6.1).
   #[inline]
-  pub fn txt(&self) -> &[Vec<u8>] {
+  pub fn txt(&self) -> &[Bytes] {
     &self.txt
   }
 }
@@ -234,7 +235,7 @@ struct Builder {
   port: u16,
   ipv4: Vec<Ipv4Addr>,
   ipv6: Vec<Ipv6Addr>,
-  txt: Option<Vec<Vec<u8>>>,
+  txt: Option<Vec<Bytes>>,
   emitted: bool,
 }
 
@@ -263,9 +264,9 @@ impl Builder {
       instance: self.instance.clone(),
       host: self.host.clone()?,
       port: self.port,
-      ipv4: self.ipv4.clone(),
-      ipv6: self.ipv6.clone(),
-      txt: self.txt.clone()?,
+      ipv4: self.ipv4.as_slice().into(),
+      ipv6: self.ipv6.as_slice().into(),
+      txt: self.txt.as_deref()?.into(),
     })
   }
 }
@@ -394,7 +395,7 @@ impl Resolver {
     ]
   }
 
-  fn on_txt(&mut self, inst_key: &str, segs: Vec<Vec<u8>>) {
+  fn on_txt(&mut self, inst_key: &str, segs: Vec<Bytes>) {
     let mut changed = false;
     if let Some(b) = self.builders.get_mut(inst_key) {
       // A TXT change to an already-surfaced instance must re-emit so the
@@ -908,11 +909,10 @@ fn push_capped<T: PartialEq>(v: &mut Vec<T>, item: T) -> bool {
 /// Case-fold a name to its lookup key (DNS names are case-insensitive,
 /// RFC 6762 §16).
 fn fold(name: &Name) -> SmolStr {
-  name
-    .as_str()
-    .chars()
-    .map(|c| c.to_ascii_lowercase())
-    .collect()
+  // `Name` is already stored canonical-lowercase (RFC 6762 §16), so a plain
+  // `SmolStr::new` suffices — and inlines names ≤23 bytes, whereas collecting
+  // from a `char` iterator always takes SmolStr's heap path.
+  SmolStr::new(name.as_str())
 }
 
 /// Decode an owner-less wire-form domain name (a decompressed PTR/SRV target as
@@ -955,11 +955,11 @@ fn parse_srv(rdata: &[u8]) -> Option<(Name, u16)> {
 }
 
 /// Parse a TXT rdata slice into its segments (dropping a malformed tail).
-fn parse_txt(rdata: &[u8]) -> Vec<Vec<u8>> {
+fn parse_txt(rdata: &[u8]) -> Vec<Bytes> {
   Txt::from_rdata(rdata)
     .segments()
     .map_while(Result::ok)
-    .map(<[u8]>::to_vec)
+    .map(Bytes::copy_from_slice)
     .collect()
 }
 
@@ -1039,7 +1039,7 @@ mod tests {
     r.on_ptr(i2);
     // i1 resolves: host + port, then its host gets an address.
     r.on_srv(&k1, host.clone(), 8080);
-    r.on_txt(&k1, vec![b"a=1".to_vec()]);
+    r.on_txt(&k1, vec![b"a=1".to_vec().into()]);
     r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
     // i1 is now complete.
     let first = r.take_ready().expect("i1 should complete");
@@ -1048,7 +1048,7 @@ mod tests {
 
     // i2's SRV arrives AFTER the A answer. It must adopt the cached address.
     r.on_srv(&k2, host, 8081);
-    r.on_txt(&k2, vec![b"b=2".to_vec()]);
+    r.on_txt(&k2, vec![b"b=2".to_vec().into()]);
     let second = r
       .take_ready()
       .expect("i2 should complete from the host cache");
@@ -1077,7 +1077,7 @@ mod tests {
     r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
     assert!(r.take_ready().is_none(), "must not emit without TXT");
     // TXT arrives → now complete.
-    r.on_txt(&k, vec![Vec::new()]); // empty TXT (single empty segment) counts
+    r.on_txt(&k, vec![Bytes::new()]); // empty TXT (single empty segment) counts
     assert!(r.take_ready().is_some(), "complete once TXT present");
   }
 
@@ -1093,7 +1093,7 @@ mod tests {
       let k = fold(&inst);
       r.on_ptr(inst);
       r.on_srv(&k, host.clone(), 7000);
-      r.on_txt(&k, vec![b"k=v".to_vec()]);
+      r.on_txt(&k, vec![b"k=v".to_vec().into()]);
     }
     assert!(
       r.take_ready().is_none(),
@@ -1119,7 +1119,7 @@ mod tests {
     let hk = fold(&host);
     r.on_ptr(inst);
     r.on_srv(&k, host, 7000);
-    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    r.on_txt(&k, vec![b"k=v".to_vec().into()]);
     r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
     let first = r.take_ready().expect("first emit on A");
     assert_eq!(first.ipv4_addresses().len(), 1);
@@ -1148,7 +1148,7 @@ mod tests {
     let hk = fold(&host);
     r.on_ptr(inst);
     r.on_srv(&k, host, 7000);
-    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    r.on_txt(&k, vec![b"k=v".to_vec().into()]);
     for i in 0..(MAX_ADDRS_PER_HOST as u32 + 8) {
       let o = i.to_be_bytes();
       r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(10, o[1], o[2], o[3])));
@@ -1198,7 +1198,7 @@ mod tests {
     let hk2 = fold(&h2);
     r.on_ptr(inst);
     r.on_srv(&k, h1, 8000);
-    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    r.on_txt(&k, vec![b"k=v".to_vec().into()]);
     r.on_addr(&hk1, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
     let first = r.take_ready().expect("resolves on h1");
     assert_eq!(first.host().as_str(), "h1.local.");
@@ -1229,7 +1229,7 @@ mod tests {
     let hk = fold(&host);
     r.on_ptr(inst);
     r.on_srv(&k, host, 0);
-    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    r.on_txt(&k, vec![b"k=v".to_vec().into()]);
     r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
     let e = r
       .take_ready()
@@ -1250,16 +1250,16 @@ mod tests {
     let hk = fold(&host);
     r.on_ptr(inst);
     r.on_srv(&k, host, 7000);
-    r.on_txt(&k, vec![b"v=1".to_vec()]);
+    r.on_txt(&k, vec![b"v=1".to_vec().into()]);
     r.on_addr(&hk, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
     let first = r.take_ready().expect("first emit");
-    assert_eq!(first.txt(), [b"v=1".to_vec()]);
+    assert_eq!(first.txt(), [Bytes::from_static(b"v=1")]);
     // Changed TXT → re-emit with the new metadata.
-    r.on_txt(&k, vec![b"v=2".to_vec()]);
+    r.on_txt(&k, vec![b"v=2".to_vec().into()]);
     let second = r.take_ready().expect("re-emit on TXT change");
-    assert_eq!(second.txt(), [b"v=2".to_vec()]);
+    assert_eq!(second.txt(), [Bytes::from_static(b"v=2")]);
     // Duplicate TXT → no re-emit.
-    r.on_txt(&k, vec![b"v=2".to_vec()]);
+    r.on_txt(&k, vec![b"v=2".to_vec().into()]);
     assert!(r.take_ready().is_none(), "duplicate TXT must not re-emit");
   }
 
@@ -1282,14 +1282,14 @@ mod tests {
     // i1 resolves on `shared`, populating the host-address cache.
     r.on_ptr(i1);
     r.on_srv(&k1, shared.clone(), 8000);
-    r.on_txt(&k1, vec![b"a=1".to_vec()]);
+    r.on_txt(&k1, vec![b"a=1".to_vec().into()]);
     r.on_addr(&shk, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)));
     r.take_ready().expect("i1 resolves on shared");
 
     // i2 first resolves on a DIFFERENT host.
     r.on_ptr(i2);
     r.on_srv(&k2, other, 9000);
-    r.on_txt(&k2, vec![b"b=2".to_vec()]);
+    r.on_txt(&k2, vec![b"b=2".to_vec().into()]);
     r.on_addr(&ohk, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8)));
     let i2_first = r.take_ready().expect("i2 resolves on other");
     assert_eq!(i2_first.host().as_str(), "other.local.");
@@ -1323,7 +1323,7 @@ mod tests {
     let hk1 = fold(&h1);
     r.on_ptr(inst);
     r.on_srv(&k, h1, 8000);
-    r.on_txt(&k, vec![b"k=v".to_vec()]);
+    r.on_txt(&k, vec![b"k=v".to_vec().into()]);
     r.on_addr(&hk1, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
     assert!(r.take_ready().is_some(), "instance completes on h1");
 
@@ -1331,7 +1331,7 @@ mod tests {
     for i in 0..10u16 {
       let h = Name::try_from_str(&format!("m{i}.local.")).unwrap();
       r.on_srv(&k, h, 9000 + i);
-      r.on_txt(&k, vec![format!("v={i}").into_bytes()]);
+      r.on_txt(&k, vec![format!("v={i}").into_bytes().into()]);
     }
     // h1 took one host slot; at most one more (cap 2) is ever queried.
     assert!(r.hosts_queried.len() <= 2, "host set stays bounded");

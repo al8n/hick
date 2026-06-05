@@ -201,6 +201,13 @@ pub(crate) struct State {
   /// state and `clear()`ed each iteration so the per-iteration GC allocates
   /// nothing in steady state.
   pub(crate) completed_withdrawals: Vec<ServiceHandle>,
+  /// Reusable scratch for the service/query handle snapshots taken by the
+  /// transmit pump (`poll_one_transmit`) and `push_service_updates`: those loops
+  /// early-`return` and call `&mut self` withdrawal methods mid-iteration, so they
+  /// can't hold a map borrow across the body — they reuse these buffers instead of
+  /// allocating a fresh `Vec` per pump call. `clear()`ed at the start of each use.
+  pub(crate) svc_handle_scratch: Vec<ServiceHandle>,
+  pub(crate) query_handle_scratch: Vec<QueryHandle>,
   /// Bound interface index (1-based) used for §11 link-local scoping.
   pub(crate) bound_interface: u32,
   /// Cached local subnets used for the §11 source-address fallback when the
@@ -240,6 +247,8 @@ impl State {
       queries: HashMap::new(),
       recent_sends: Vec::new(),
       completed_withdrawals: Vec::new(),
+      svc_handle_scratch: Vec::new(),
+      query_handle_scratch: Vec::new(),
       bound_interface: 0,
       local_subnets: Vec::new(),
       max_payload,
@@ -456,23 +465,27 @@ impl State {
   /// at T8 only the endpoint cache sweep and query timeouts are exposed.
   pub(crate) fn fire_timeouts(&mut self, now: StdInstant) {
     let _ = self.endpoint.handle_timeout(now);
-    let handles: Vec<QueryHandle> = self.queries.keys().copied().collect();
-    for h in handles {
+    // Split-borrow so the query sweep reads `queries` in place and ticks via the
+    // disjoint `endpoint` field — no per-tick Vec snapshot, and the `errored`
+    // guard reuses the iterator's `ctx` instead of a second map lookup.
+    let Self {
+      endpoint, queries, ..
+    } = &mut *self;
+    for (&h, ctx) in queries.iter() {
       // Don't tick a structurally-dead query's proto (see `QueryCtx::errored`).
-      if self.queries.get(&h).is_some_and(|c| c.errored) {
+      if ctx.errored {
         continue;
       }
-      let _ = self.endpoint.handle_query_timeout(h, now);
+      let _ = endpoint.handle_query_timeout(h, now);
     }
-    let svc_handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
-    for h in svc_handles {
-      if let Some(ctx) = self.services.get_mut(&h) {
-        // Don't tick a withdrawn (cancelled) or structurally-dead (errored)
-        // service's proto — a dead proto must not be driven (see
-        // `ServiceCtx::errored`).
-        if !ctx.cancelled && !ctx.errored {
-          let _ = ctx.proto.handle_timeout(now);
-        }
+    // The proto tick touches only the service's own ctx, so iterate
+    // `values_mut()` in place rather than snapshotting handles into a Vec.
+    for ctx in self.services.values_mut() {
+      // Don't tick a withdrawn (cancelled) or structurally-dead (errored)
+      // service's proto — a dead proto must not be driven (see
+      // `ServiceCtx::errored`).
+      if !ctx.cancelled && !ctx.errored {
+        let _ = ctx.proto.handle_timeout(now);
       }
     }
   }
@@ -519,8 +532,14 @@ impl State {
     // `&mut` access to `self.endpoint` (for `handle_service_renamed`) and
     // `self.services.get_mut(&h)` — a single `values_mut()` borrow would lock
     // `self.endpoint` out.
-    let handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
-    for h in handles {
+    self.svc_handle_scratch.clear();
+    self
+      .svc_handle_scratch
+      .extend(self.services.keys().copied());
+    let mut i = 0;
+    while i < self.svc_handle_scratch.len() {
+      let h = self.svc_handle_scratch[i];
+      i += 1;
       // A structurally-dead proto (see `ServiceCtx::errored`) is never polled — it
       // can't produce more updates. Its escalation `Conflict` already sits in the
       // handle-owned mailbox's reserved terminal slot and is drained directly by
@@ -640,8 +659,14 @@ impl State {
     now: StdInstant,
     scratch: &mut [u8],
   ) -> Option<(core::net::SocketAddr, usize, TransmitOrigin)> {
-    let svc_handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
-    for h in svc_handles {
+    self.svc_handle_scratch.clear();
+    self
+      .svc_handle_scratch
+      .extend(self.services.keys().copied());
+    let mut i = 0;
+    while i < self.svc_handle_scratch.len() {
+      let h = self.svc_handle_scratch[i];
+      i += 1;
       // Skip a cancelled (withdrawn, awaiting sweep) or errored (structurally
       // dead, see `ServiceCtx::errored`) service so neither is re-polled into a
       // busy-spin.
@@ -730,8 +755,14 @@ impl State {
       }
     }
 
-    let q_handles: Vec<QueryHandle> = self.queries.keys().copied().collect();
-    for h in q_handles {
+    self.query_handle_scratch.clear();
+    self
+      .query_handle_scratch
+      .extend(self.queries.keys().copied());
+    let mut i = 0;
+    while i < self.query_handle_scratch.len() {
+      let h = self.query_handle_scratch[i];
+      i += 1;
       let Some(ctx) = self.queries.get_mut(&h) else {
         continue;
       };

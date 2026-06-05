@@ -359,10 +359,7 @@ async fn loopback_browse_resolves_service_entry() {
     entry.ipv4_addresses()
   );
   assert!(
-    entry
-      .txt()
-      .iter()
-      .any(|t| t.as_slice() == b"Local web server"),
+    entry.txt().iter().any(|t| &t[..] == b"Local web server"),
     "expected TXT 'Local web server' in {:?}",
     entry.txt()
   );
@@ -450,10 +447,7 @@ async fn loopback_resolve_instance_returns_entry() {
     );
   }
   assert!(
-    entry
-      .txt()
-      .iter()
-      .any(|t| t.as_slice() == b"Local web server"),
+    entry.txt().iter().any(|t| &t[..] == b"Local web server"),
     "expected TXT 'Local web server' in {:?}",
     entry.txt()
   );

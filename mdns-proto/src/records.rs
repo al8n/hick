@@ -14,6 +14,23 @@ use std::vec::Vec;
 use crate::Name;
 #[cfg(any(feature = "alloc", feature = "std"))]
 use bytes::Bytes;
+#[cfg(any(feature = "alloc", feature = "std"))]
+use std::sync::Arc;
+
+/// Append `item` to a read-only `Arc<[T]>`, returning a freshly sealed slice.
+/// `ServiceRecords`' collections are built incrementally via the `add_*`
+/// builders then frozen, so the O(n) reseal per append is paid only at build
+/// time (n is a handful of addresses / subtypes) — in exchange the derived
+/// `ServiceRecords::clone` is O(1) on the withdrawal-snapshot and rename-handoff
+/// paths, which previously deep-copied all five collections.
+#[cfg(any(feature = "alloc", feature = "std"))]
+fn arc_push<T: Clone>(slice: &[T], item: T) -> Arc<[T]> {
+  slice
+    .iter()
+    .cloned()
+    .chain(core::iter::once(item))
+    .collect()
+}
 
 /// Records advertised by a single registered service.
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -29,8 +46,8 @@ pub struct ServiceRecords {
   port: u16,
   priority: u16,
   weight: u16,
-  a_addrs: Vec<Ipv4Addr>,
-  aaaa_addrs: Vec<Ipv6Addr>,
+  a_addrs: Arc<[Ipv4Addr]>,
+  aaaa_addrs: Arc<[Ipv6Addr]>,
   /// Parallel to `aaaa_addrs`: per-AAAA interface scope id (0 = "any").
   ///
   /// Used by [`Endpoint`](crate::endpoint::Endpoint) to disambiguate IPv6
@@ -39,14 +56,14 @@ pub struct ServiceRecords {
   /// the same link-local on a different interface would be wrongly
   /// classified as self.  Set via [`Self::add_aaaa_scoped`].  Always the
   /// same length as `aaaa_addrs`.
-  aaaa_scopes: Vec<u32>,
-  txt: Vec<Bytes>,
+  aaaa_scopes: Arc<[u32]>,
+  txt: Arc<[Bytes]>,
   /// RFC 6763 §7.1 subtype browse names, e.g. `_printer._sub._ipp._tcp.local.`.
   /// Each is the full `<sub>._sub.<service_type>` name (derived from
   /// `service_type` at [`Self::add_subtype`] time, so it survives an instance
   /// rename — the service type does not change). The service emits a shared PTR
   /// `<browse_name> -> instance` for each, and answers browse queries for them.
-  subtypes: Vec<Name>,
+  subtypes: Arc<[Name]>,
   ttl_secs: u32,
 }
 
@@ -65,11 +82,11 @@ impl ServiceRecords {
       port,
       priority: 0,
       weight: 0,
-      a_addrs: Vec::new(),
-      aaaa_addrs: Vec::new(),
-      aaaa_scopes: Vec::new(),
-      txt: Vec::new(),
-      subtypes: Vec::new(),
+      a_addrs: Arc::from([]),
+      aaaa_addrs: Arc::from([]),
+      aaaa_scopes: Arc::from([]),
+      txt: Arc::from([]),
+      subtypes: Arc::from([]),
       ttl_secs,
     }
   }
@@ -148,7 +165,7 @@ impl ServiceRecords {
 
   /// Append an IPv4 address.
   pub fn add_a(&mut self, addr: Ipv4Addr) -> &mut Self {
-    self.a_addrs.push(addr);
+    self.a_addrs = arc_push(&self.a_addrs, addr);
     self
   }
 
@@ -175,14 +192,14 @@ impl ServiceRecords {
   /// interface).  For global / unique-local IPv6 the scope is
   /// effectively ignored.
   pub fn add_aaaa_scoped(&mut self, addr: Ipv6Addr, scope_id: u32) -> &mut Self {
-    self.aaaa_addrs.push(addr);
-    self.aaaa_scopes.push(scope_id);
+    self.aaaa_addrs = arc_push(&self.aaaa_addrs, addr);
+    self.aaaa_scopes = arc_push(&self.aaaa_scopes, scope_id);
     self
   }
 
   /// Append a TXT segment.
   pub fn add_txt_segment(&mut self, segment: Vec<u8>) -> &mut Self {
-    self.txt.push(segment.into());
+    self.txt = arc_push(&self.txt, segment.into());
     self
   }
 
@@ -209,7 +226,7 @@ impl ServiceRecords {
       self.service_type.as_str()
     );
     let name = Name::try_from_str(&browse)?;
-    self.subtypes.push(name);
+    self.subtypes = arc_push(&self.subtypes, name);
     Ok(self)
   }
 

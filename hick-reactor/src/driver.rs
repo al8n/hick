@@ -504,9 +504,14 @@ impl<N: Net> DriverState<N> {
       }
       let _ = ctx.proto.handle_timeout(now);
     }
-    let query_handles: Vec<QueryHandle> = self.queries.keys().copied().collect();
-    for h in query_handles {
-      let _ = self.endpoint.handle_query_timeout(h, now);
+    // Split-borrow `endpoint` from `queries` so the sweep iterates the query map
+    // in place — `handle_query_timeout` touches only the disjoint `endpoint`
+    // field — instead of snapshotting every handle into a fresh per-tick Vec.
+    let Self {
+      endpoint, queries, ..
+    } = &mut *self;
+    for &h in queries.keys() {
+      let _ = endpoint.handle_query_timeout(h, now);
     }
   }
 
