@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 use std::time::Instant as StdInstant;
 
 use super::*;

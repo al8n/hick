@@ -180,14 +180,9 @@ impl<'a> Iterator for Records<'a> {
 }
 
 #[cfg(all(test, any(feature = "alloc", feature = "std")))]
-#[allow(
-  clippy::unwrap_used,
-  clippy::expect_used,
-  clippy::panic,
-  clippy::indexing_slicing,
-  clippy::arithmetic_side_effects
-)]
+#[allow(warnings)]
 mod tests {
+
   use super::*;
 
   /// Build a 12-byte header with the given section counts.

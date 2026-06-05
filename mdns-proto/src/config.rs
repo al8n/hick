@@ -3,12 +3,13 @@
 #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
 use core::time::Duration;
 
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-use crate::Name;
 #[cfg(any(feature = "alloc", feature = "std"))]
 use crate::records::ServiceRecords;
 #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-use crate::wire::{ResourceClass, ResourceType};
+use crate::{
+  Name,
+  wire::{ResourceClass, ResourceType},
+};
 
 /// Configuration for an `Endpoint`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

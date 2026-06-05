@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 use core::time::Duration;
 
 use super::*;

@@ -125,7 +125,7 @@ where
   /// `max`, the soonest-expiring entry is evicted proactively before the new
   /// entry is inserted. This bounds memory usage even when the backing
   /// [`Pool`] grows without error (e.g. `slab::Slab`).
-  pub const fn with_max_entries(max: usize) -> Self {
+  pub fn with_max_entries(max: usize) -> Self {
     Self {
       entries: P::new(),
       max_entries: max,
