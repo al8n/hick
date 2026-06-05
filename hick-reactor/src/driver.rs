@@ -12,8 +12,8 @@ use agnostic_lite::RuntimeLite;
 use agnostic_net::{Net, UdpSocket};
 use futures::{FutureExt, pin_mut, select_biased};
 use mdns_proto::{
-  CollectedAnswer, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate,
-  endpoint::WithdrawalSend, event::RouteEvent,
+  QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate, endpoint::WithdrawalSend,
+  event::RouteEvent,
 };
 
 use crate::{
@@ -142,6 +142,13 @@ struct DriverState<N: Net> {
   /// state and `clear()`ed each iteration so the per-iteration GC allocates
   /// nothing in steady state.
   completed_withdrawals: Vec<ServiceHandle>,
+  /// Reusable scratch for the per-wakeup service/query handle snapshots taken by
+  /// `drain_transmits` and `push_updates`: those loops `get_mut` the same map
+  /// they iterate while driving the disjoint `endpoint`, so they snapshot the
+  /// keys first — but reuse these buffers (`clear()`ed each pass) instead of
+  /// allocating a fresh `Vec` per wakeup, matching the compio / smoltcp drivers.
+  svc_handle_scratch: Vec<ServiceHandle>,
+  query_handle_scratch: Vec<QueryHandle>,
   /// this host's directly-attached subnets, the source-address
   /// fallback for the RFC 6762 §11 on-link check on platforms that can't
   /// supply a TTL/Hop-Limit. Empty if interface discovery failed (the
@@ -171,6 +178,8 @@ impl<N: Net> DriverState<N> {
       queries: HashMap::new(),
       recent_sends: Vec::new(),
       completed_withdrawals: Vec::new(),
+      svc_handle_scratch: Vec::new(),
+      query_handle_scratch: Vec::new(),
       // scope the §11 source-subnet fallback to the BOUND
       // interface only — not every local NIC (per-packet interface index for
       // delivered PKTINFO is handled separately in recv_with_meta).
@@ -545,6 +554,7 @@ impl<N: Net> DriverState<N> {
         endpoint,
         services,
         queries,
+        query_handle_scratch,
         ..
       } = self;
 
@@ -627,8 +637,9 @@ impl<N: Net> DriverState<N> {
 
       // ── Query answers + terminals ─────────────────────────────────────
       let mut terminated: Vec<QueryHandle> = Vec::new();
-      let handles: Vec<QueryHandle> = queries.keys().copied().collect();
-      for h in handles {
+      query_handle_scratch.clear();
+      query_handle_scratch.extend(queries.keys().copied());
+      for &h in query_handle_scratch.iter() {
         // sweep: GC queries whose consumer dropped the handle (the
         // doorbell receiver closes when the `Query` is dropped).
         if let Some(ctx) = queries.get(&h)
@@ -643,38 +654,45 @@ impl<N: Net> DriverState<N> {
           Some(c) => c.last_seq,
           None => continue,
         };
-        let new_answers: Vec<CollectedAnswer> = endpoint
-          .collected_answers(h)
-          .filter(|a| a.seq() >= last_seq)
-          .cloned()
-          .collect();
-        // `collected_answers` is proto's BOUNDED snapshot — the
-        // `max_answers` cap evicts oldest entries before we scan. Answers
-        // accepted since our last scan but no longer present were evicted
-        // before delivery; count them so the loss is observable via
-        // `Query::dropped_answers` rather than silently vanishing.
+        // `collected_answers` is proto's BOUNDED snapshot — the `max_answers`
+        // cap evicts oldest entries before we scan. Answers accepted since our
+        // last scan but no longer present were evicted before delivery; count
+        // them so the loss is observable via `Query::dropped_answers` rather
+        // than silently vanishing.
         let accepted = endpoint.query_accepted_count(h).unwrap_or(last_seq);
         let expected = accepted.saturating_sub(last_seq);
-        let evicted_before_seen = expected.saturating_sub(new_answers.len() as u64);
-        if let Some(ctx) = queries.get_mut(&h)
-          && (!new_answers.is_empty() || evicted_before_seen > 0)
+        // Only touch the mailbox when the proto accepted something since our last
+        // scan (`expected > 0`); otherwise there is nothing to deliver and
+        // nothing to account for. This is exactly the old
+        // new-answers-or-eviction gate: the delivered count is always <=
+        // expected, so `expected > 0` holds iff there was a new answer or an
+        // eviction.
+        if expected > 0
+          && let Some(ctx) = queries.get_mut(&h)
         {
-          let had_new = !new_answers.is_empty();
-          // push into the bounded/coalescing mailbox (never
-          // fails / never blocks; over-capacity coalesces or drops oldest).
+          // Push each new answer STRAIGHT into the bounded/coalescing mailbox
+          // (never fails / never blocks; over-capacity coalesces or drops
+          // oldest) — no intermediate `Vec<CollectedAnswer>` — counting
+          // deliveries so the evicted-before-seen loss is `expected - delivered`.
+          let mut delivered: u64 = 0;
           {
             let mut mb = ctx.mailbox.lock().unwrap_or_else(|e| e.into_inner());
-            mb.record_dropped(evicted_before_seen);
-            for ans in new_answers {
+            for ans in endpoint
+              .collected_answers(h)
+              .filter(|a| a.seq() >= last_seq)
+              .cloned()
+            {
               mb.push_answer(ans);
+              delivered += 1;
             }
+            mb.record_dropped(expected.saturating_sub(delivered));
           }
           // Advance past everything proto has accepted: delivered answers and
           // evicted-before-seen ones are now all accounted for.
           ctx.last_seq = accepted;
           // Ring ONCE for the batch — only when there's an answer to drain
           // (a pure-eviction bookkeeping bump has nothing for the consumer).
-          if had_new {
+          if delivered > 0 {
             let _ = ctx.doorbell.try_send(());
           }
         }
@@ -739,6 +757,8 @@ impl<N: Net> DriverState<N> {
       recent_sends,
       v4,
       v6,
+      svc_handle_scratch,
+      query_handle_scratch,
       ..
     } = self;
     // Plain fairness cap: bound the work per drain pass so a very large
@@ -747,8 +767,9 @@ impl<N: Net> DriverState<N> {
     // SystemTime-keyed `recent_sends` tracker + kernel rx timestamps.)
     let mut credits_remaining = MAX_SEND_CREDITS_PER_DRAIN;
     // Service transmits.
-    let service_handles: Vec<mdns_proto::ServiceHandle> = services.keys().copied().collect();
-    for h in service_handles {
+    svc_handle_scratch.clear();
+    svc_handle_scratch.extend(services.keys().copied());
+    for &h in svc_handle_scratch.iter() {
       if credits_remaining == 0 {
         return true;
       }
@@ -881,7 +902,8 @@ impl<N: Net> DriverState<N> {
       }
     }
     // Query transmits.
-    let handles: Vec<QueryHandle> = queries.keys().copied().collect();
+    query_handle_scratch.clear();
+    query_handle_scratch.extend(queries.keys().copied());
     // Collect queries that were retired due to encode failures so they can be
     // GC'd after the loop (matching the terminated-handle cleanup in push_updates).
     let mut encode_retired: Vec<QueryHandle> = Vec::new();
@@ -891,7 +913,7 @@ impl<N: Net> DriverState<N> {
     // would bypass the cleanup below and leave the retired handle resident in
     // both `queries` and proto storage until the user drops the stream.
     let mut more_pending = false;
-    'query_loop: for h in handles {
+    'query_loop: for &h in query_handle_scratch.iter() {
       if credits_remaining == 0 {
         more_pending = true;
         break 'query_loop;
