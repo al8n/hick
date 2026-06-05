@@ -25,6 +25,7 @@ metrics = ["stats", "mdns-proto/metrics", "hick-trace/metrics"]
 stats = ["mdns-proto/stats", "hick-trace/stats"]
 
 [dependencies]
+bytes = { workspace = true, features = ["default"] }
 mdns-proto = { workspace = true, features = ["std", "slab"] }
 hick-udp.workspace = true
 hick-trace = { workspace = true }

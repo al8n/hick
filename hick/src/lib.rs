@@ -5,15 +5,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 
-// `hick` is a thin, batteries-included facade over the family: it wires the
-// Sans-I/O protocol core (`mdns-proto`) to the default async driver
-// (`hick-reactor`). The driver's public surface is flattened to the crate root
-// so the common path is `hick::Endpoint` / `hick::tokio::server(..)`, while the
-// `proto` and `reactor` modules expose the underlying crates in full for power
-// users. Pick the `compio` runtime by depending on `hick-compio` directly, or
-// enable the `smoltcp` / `embassy` features for the bare-metal (`no_std`) engine
-// and its embassy driver.
-
 /// The Sans-I/O mDNS protocol core ([`mdns_proto`]).
 ///
 /// Re-exported in full for direct access to the wire codec, the record cache,

@@ -3,6 +3,7 @@ members = ["hick", "hick-trace", "mdns-proto", "hick-udp", "hick-reactor", "hick
 resolver = "3"
 
 [workspace.dependencies]
+bytes = { version = "1", default-features = false }
 hick = { version = "0.1", path = "hick", default-features = false }
 hick-trace = { version = "0.1", path = "hick-trace", default-features = false }
 mdns-proto = { version = "0.5", path = "mdns-proto", default-features = false }

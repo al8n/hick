@@ -540,6 +540,13 @@ pub struct Engine<I: Instant, R> {
   /// into it and the pump can GC each one's driver slot). Kept on the engine and
   /// `clear()`ed each pump so the per-pump GC allocates nothing in steady state.
   completed_withdrawals: Vec<ServiceHandle>,
+  /// Reusable scratch for the service/query handle snapshots taken by the
+  /// transmit pump (`poll_one_transmit`) and `drain_service_updates`: those loops
+  /// early-`return` and call `&mut self` withdrawal methods mid-iteration, so they
+  /// can't hold a map borrow across the body — they reuse these buffers instead of
+  /// allocating a fresh `Vec` per pump call. `clear()`ed at the start of each use.
+  svc_handle_scratch: Vec<ServiceHandle>,
+  query_handle_scratch: Vec<QueryHandle>,
   /// The multicast transmit path: per-family fan-out, fan-out ordering, and
   /// self-loopback detection.
   tx: Multicaster<I>,
@@ -571,6 +578,8 @@ where
       queries: BTreeMap::new(),
       subnets: Vec::new(),
       completed_withdrawals: Vec::new(),
+      svc_handle_scratch: Vec::new(),
+      query_handle_scratch: Vec::new(),
       tx: Multicaster::new(),
       #[cfg(feature = "stats")]
       stats,
@@ -1019,14 +1028,16 @@ where
   fn fire_timeouts(&mut self, now: I) {
     let _ = self.endpoint.handle_timeout(now);
 
-    let query_handles: Vec<QueryHandle> = self
-      .queries
-      .iter()
-      .filter(|(_, slot)| !slot.errored)
-      .map(|(handle, _)| *handle)
-      .collect();
-    for handle in query_handles {
-      let _ = self.endpoint.handle_query_timeout(handle, now);
+    // Split-borrow so the query sweep reads `queries` in place and ticks via the
+    // disjoint `endpoint` field — no per-tick Vec snapshot.
+    let Self {
+      endpoint, queries, ..
+    } = &mut *self;
+    for (&handle, slot) in queries.iter() {
+      if slot.errored {
+        continue;
+      }
+      let _ = endpoint.handle_query_timeout(handle, now);
     }
 
     for slot in self.services.values_mut() {
@@ -1055,8 +1066,14 @@ where
   /// ([`Self::begin_service_withdrawal`]), which holds the route and resends
   /// before freeing the name. (The old-name detached item was already enqueued.)
   fn drain_service_updates(&mut self, now: I) {
-    let handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
-    for handle in handles {
+    self.svc_handle_scratch.clear();
+    self
+      .svc_handle_scratch
+      .extend(self.services.keys().copied());
+    let mut i = 0;
+    while i < self.svc_handle_scratch.len() {
+      let handle = self.svc_handle_scratch[i];
+      i += 1;
       while let Some(update) = self
         .services
         .get_mut(&handle)
@@ -1176,8 +1193,14 @@ where
     // rather than being advertised with records no §10.1 goodbye could retract.
     let cap = scratch.len().min(MAX_MDNS_MESSAGE);
     let scratch = &mut scratch[..cap];
-    let service_handles: Vec<ServiceHandle> = self.services.keys().copied().collect();
-    for handle in service_handles {
+    self.svc_handle_scratch.clear();
+    self
+      .svc_handle_scratch
+      .extend(self.services.keys().copied());
+    let mut i = 0;
+    while i < self.svc_handle_scratch.len() {
+      let handle = self.svc_handle_scratch[i];
+      i += 1;
       // NLL note: the `slot` borrow is scoped to the `match` block so it ends
       // before the post-match in-iteration `begin_withdrawal` call below.
       let escalated = {
@@ -1217,8 +1240,14 @@ where
       }
     }
 
-    let query_handles: Vec<QueryHandle> = self.queries.keys().copied().collect();
-    for handle in query_handles {
+    self.query_handle_scratch.clear();
+    self
+      .query_handle_scratch
+      .extend(self.queries.keys().copied());
+    let mut i = 0;
+    while i < self.query_handle_scratch.len() {
+      let handle = self.query_handle_scratch[i];
+      i += 1;
       if self.queries.get(&handle).is_some_and(|slot| slot.errored) {
         continue;
       }
