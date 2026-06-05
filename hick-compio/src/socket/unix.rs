@@ -1,6 +1,14 @@
 use libc::{cmsghdr, msghdr};
 
-use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+// Each address type is used only inside its matching capability-gated cmsg arm
+// below (`IpAddr` in both); gate the imports the same way so platforms that lack
+// a pktinfo layout (e.g. BSDs have no `in_pktinfo`) don't see an unused import.
+#[cfg(any(has_ip_pktinfo, has_ipv6_pktinfo))]
+use core::net::IpAddr;
+#[cfg(has_ip_pktinfo)]
+use core::net::Ipv4Addr;
+#[cfg(has_ipv6_pktinfo)]
+use core::net::Ipv6Addr;
 
 use super::RecvMeta;
 
