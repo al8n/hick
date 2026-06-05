@@ -429,7 +429,7 @@ impl GoodbyeOwnership {
 /// the TTL=0 goodbye for a service being withdrawn.
 ///
 /// Produced by [`Service::withdrawal_snapshot`] and consumed by the endpoint's
-/// withdrawal state machine (added in a later task). Each resend round calls the
+/// withdrawal state machine. Each resend round calls the
 /// encoder with the same snapshot so the goodbye is idempotent over multiple
 /// attempts (RFC 6762 §10.1 recommends at least two sends for loss resilience).
 ///
@@ -448,7 +448,7 @@ pub struct WithdrawalSnapshot {
   /// `pub(crate)` because `EmittedRecords` is a crate-internal type; the
   /// endpoint (same crate) reads this directly.
   // `allow(dead_code)`: the field is read by the endpoint withdrawal state
-  // machine added in a later task; suppress the false positive here.
+  // machine; suppress the false positive here.
   #[allow(dead_code)]
   pub(crate) owned: respond::EmittedRecords,
   /// Host A (IPv4) addresses this service confirmed-emitted. The endpoint will

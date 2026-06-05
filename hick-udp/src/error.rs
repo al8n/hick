@@ -30,7 +30,7 @@ pub struct AddressInUseDetail {
 }
 impl AddressInUseDetail {
   /// Build a new detail payload.
-  #[expect(dead_code, reason = "used by socket-bind helpers in a later task")]
+  #[expect(dead_code, reason = "used by socket-bind helpers not yet wired in")]
   #[inline(always)]
   pub(crate) const fn new(addr: std::net::IpAddr, iface: u32) -> Self {
     Self { addr, iface }

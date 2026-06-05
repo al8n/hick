@@ -4,8 +4,8 @@
 //! practical (`NameRef<'a>` borrows into the input datagram); encoding writes
 //! into a caller-supplied `&mut [u8]` with a bounded compression table.
 
-// Submodules and re-exports are added incrementally by tasks 3-15 of the
-// wire plan. Each task appends its `mod x;` line and one `pub use` line.
+// Each wire submodule is declared below with its `mod x;` line and a matching
+// `pub use` re-export.
 
 mod opcode;
 pub use opcode::Opcode;
