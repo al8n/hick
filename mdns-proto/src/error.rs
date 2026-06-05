@@ -8,7 +8,12 @@
 
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
-use crate::{Name, QueryHandle, ServiceHandle, name::LabelTooLongDetail, wire::*};
+use crate::{name::LabelTooLongDetail, wire::*};
+// `Name`/`QueryHandle`/`ServiceHandle` are only carried by the alloc/std-gated
+// error enums below, so gate the import to match (no_std + bare no-default have
+// no `Name`).
+#[cfg(any(feature = "alloc", feature = "std"))]
+use crate::{Name, QueryHandle, ServiceHandle};
 
 /// Detail payload for "buffer too short": a parser ran out of bytes.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
@@ -266,6 +271,8 @@ pub enum HandleError {
 }
 
 /// Errors raised by `Endpoint::try_register_service`.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
@@ -293,6 +300,8 @@ pub enum StartQueryError {
 
 /// Errors raised by
 /// [`Endpoint::handle_service_renamed`](crate::endpoint::Endpoint::handle_service_renamed).
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
@@ -312,6 +321,8 @@ pub enum HandleServiceRenamedError {
 /// corresponds to an active query.  A query disappears from the endpoint
 /// when its terminal update has been drained via `Endpoint::poll_query`
 /// (auto-prune) or after an explicit `Endpoint::cancel_query` call.
+#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
