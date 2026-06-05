@@ -4,13 +4,10 @@
 //! addresses, the SRV target/port, and the TXT segments. Building the wire
 //! response is then a mechanical traversal.
 
-use core::net::{Ipv4Addr, Ipv6Addr};
-
-use bytes::Bytes;
-
-use std::{sync::Arc, vec::Vec};
-
 use crate::Name;
+use bytes::Bytes;
+use core::net::{Ipv4Addr, Ipv6Addr};
+use std::{sync::Arc, vec::Vec};
 
 /// Append `item` to a read-only `Arc<[T]>`, returning a freshly sealed slice.
 /// `ServiceRecords`' collections are built incrementally via the `add_*`
@@ -247,7 +244,6 @@ impl ServiceRecords {
 }
 
 #[cfg(test)]
-#[cfg(any(feature = "alloc", feature = "std"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
   use super::*;

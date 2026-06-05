@@ -1,5 +1,6 @@
 //! Service state machine — probing, announcing, response generation.
 
+#[cfg(any(feature = "alloc", feature = "std"))]
 use crate::trace::*;
 
 #[cfg(any(feature = "alloc", feature = "std"))]

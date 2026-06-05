@@ -6,18 +6,24 @@
 #![allow(unexpected_cfgs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
-#![deny(
-  clippy::unwrap_used,
-  clippy::expect_used,
-  clippy::panic,
-  clippy::panic_in_result_fn,
-  clippy::indexing_slicing,
-  clippy::integer_division,
-  clippy::arithmetic_side_effects,
-  clippy::unreachable,
-  clippy::todo,
-  clippy::unimplemented,
-  clippy::string_slice
+// Panic-freedom restriction lints are a PRODUCTION concern (this is a no_std /
+// no-panic-capable core); test code legitimately uses unwrap/expect/panic/etc.,
+// so gate the denies on `not(test)` (mirrors the `unsafe_code` split above).
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::panic_in_result_fn,
+    clippy::indexing_slicing,
+    clippy::integer_division,
+    clippy::arithmetic_side_effects,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::string_slice
+  )
 )]
 
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
@@ -99,6 +105,7 @@ pub use event::{ServiceRenamed, ServiceUpdate};
 /// Configuration types.
 pub mod config;
 /// Records published by a registered Service.
+#[cfg(any(feature = "alloc", feature = "std"))]
 pub mod records;
 
 pub use config::EndpointConfig;
