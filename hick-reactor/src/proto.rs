@@ -12,22 +12,23 @@ use mdns_proto::{
   service::Service,
   transmit::Transmit,
 };
+use rand::rngs::StdRng;
+use slab::Slab;
 
 /// The concrete `mdns-proto::Query` instantiation.
-pub(crate) type ProtoQuery =
-  Query<StdInstant, slab::Slab<CollectedAnswer>, slab::Slab<QueryUpdate>>;
+pub(crate) type ProtoQuery = Query<StdInstant, Slab<CollectedAnswer>, Slab<QueryUpdate>>;
 
 /// The concrete `mdns-proto::Service` instantiation.
-pub(crate) type ProtoService = Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>;
+pub(crate) type ProtoService = Service<StdInstant, Slab<Transmit>, Slab<ServiceUpdate>>;
 
 /// The concrete `mdns-proto::Endpoint` instantiation.
 pub(crate) type ProtoEndpoint = Endpoint<
   StdInstant,
-  rand::rngs::StdRng,
-  slab::Slab<CacheEntry<StdInstant>>,
-  slab::Slab<ServiceRoute>,
-  slab::Slab<ProtoQuery>,
-  slab::Slab<EndpointEventEntry>,
-  slab::Slab<CollectedAnswer>,
-  slab::Slab<QueryUpdate>,
+  StdRng,
+  Slab<CacheEntry<StdInstant>>,
+  Slab<ServiceRoute>,
+  Slab<ProtoQuery>,
+  Slab<EndpointEventEntry>,
+  Slab<CollectedAnswer>,
+  Slab<QueryUpdate>,
 >;

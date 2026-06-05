@@ -1,5 +1,6 @@
 //! Error types for `hick-udp` operations.
 
+use core::net::IpAddr;
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
 /// Detail for [`BindError::InterfaceNotFound`].
@@ -25,19 +26,19 @@ impl InterfaceNotFoundDetail {
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Display, thiserror::Error)]
 #[display("address {addr} already in use on interface {iface}")]
 pub struct AddressInUseDetail {
-  addr: std::net::IpAddr,
+  addr: IpAddr,
   iface: u32,
 }
 impl AddressInUseDetail {
   /// Build a new detail payload.
-  #[expect(dead_code, reason = "used by socket-bind helpers in a later task")]
+  #[expect(dead_code, reason = "used by socket-bind helpers not yet wired in")]
   #[inline(always)]
-  pub(crate) const fn new(addr: std::net::IpAddr, iface: u32) -> Self {
+  pub(crate) const fn new(addr: IpAddr, iface: u32) -> Self {
     Self { addr, iface }
   }
   /// The address that was already in use.
   #[inline(always)]
-  pub const fn addr(&self) -> std::net::IpAddr {
+  pub const fn addr(&self) -> IpAddr {
     self.addr
   }
   /// The interface index involved.
@@ -125,45 +126,4 @@ pub enum ParseRecvMetaError {
 }
 
 #[cfg(test)]
-mod tests {
-  use super::{
-    BindError, BufferTooShortDetail, InterfaceNotFoundDetail, JoinError, ParseRecvMetaError,
-  };
-
-  #[test]
-  fn detail_accessors_and_display() {
-    let d = InterfaceNotFoundDetail::new(7);
-    assert_eq!(d.index(), 7);
-    assert_eq!(d.to_string(), "interface index 7 not found");
-
-    let b = BufferTooShortDetail::new(20, 8);
-    assert_eq!(b.needed(), 20);
-    assert_eq!(b.have(), 8);
-    assert_eq!(
-      b.to_string(),
-      "cmsg buffer too short: needed 20 bytes, had 8"
-    );
-  }
-
-  #[test]
-  fn error_enum_display_and_is_variant() {
-    let bind = BindError::InterfaceNotFound(InterfaceNotFoundDetail::new(3));
-    assert!(bind.is_interface_not_found());
-    assert_eq!(bind.to_string(), "interface index 3 not found");
-
-    let join = JoinError::InterfaceNotFound(InterfaceNotFoundDetail::new(4));
-    assert!(join.is_interface_not_found());
-    assert_eq!(join.to_string(), "interface index 4 not found");
-
-    let parse = ParseRecvMetaError::BufferTooShort(BufferTooShortDetail::new(16, 4));
-    assert!(parse.is_buffer_too_short());
-    assert_eq!(
-      parse.to_string(),
-      "cmsg buffer too short: needed 16 bytes, had 4"
-    );
-
-    let missing = ParseRecvMetaError::MissingPktinfo;
-    assert!(missing.is_missing_pktinfo());
-    assert_eq!(missing.to_string(), "no pktinfo cmsg in ancillary buffer");
-  }
-}
+mod tests;

@@ -10,19 +10,6 @@ readme = "README.md"
 keywords = ["mdns", "no-std", "sans-io", "embedded", "dns"]
 categories = ["network-programming", "no-std", "embedded"]
 
-# Features
-#
-# `std` and `alloc` are INDEPENDENT (neither implies the other), per the
-# `rust-no-std` golden rule. Both supply the heap backing `Name` and the protocol
-# state machines need, so each enables the heap deps directly; `std` additionally
-# layers each dep's `std` feature. This makes `--features std`, `--features
-# alloc`, and `--features std,alloc` all valid self-contained configs. Heap items
-# are gated `#[cfg(any(feature = "std", feature = "alloc"))]` so neither config
-# loses them, and `lib.rs` aliases `alloc as std` in the `not(std)+alloc` tier so
-# heap paths are spelled `std::` uniformly. Embedded users pass
-# `default-features = false` with `alloc` (heap, no OS) or `heapless` (no-alloc,
-# fixed capacity). At least one of `std` / `alloc` / `heapless` must be on, since
-# `Name` needs string/collection backing.
 [features]
 default = ["std", "slab"]
 std = ["smol_str/std", "rand/std", "thiserror/std", "bytes/std"]

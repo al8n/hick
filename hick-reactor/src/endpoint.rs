@@ -3,10 +3,13 @@
 use std::future::Future;
 
 use agnostic_net::Net;
+use async_channel::Sender;
 use hick_udp::{
   MulticastOptionsV4, MulticastOptionsV6, try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
 use mdns_proto::{QuerySpec, ServiceSpec};
+
+use hick_trace::*;
 
 use crate::{
   command::{Command, QueryStarted, ServiceRegistered},
@@ -24,11 +27,11 @@ use crate::{
 /// dropped (the command channel closes).
 #[derive(Clone)]
 pub struct Endpoint {
-  cmd: async_channel::Sender<Command>,
+  cmd: Sender<Command>,
   /// Shared stats handle cloned from the driver's proto endpoint. Present
   /// only when the `stats` Cargo feature is enabled.
   #[cfg(feature = "stats")]
-  stats: std::sync::Arc<hick_trace::stats::Stats>,
+  stats: std::sync::Arc<stats::Stats>,
 }
 
 impl Endpoint {
@@ -75,13 +78,13 @@ impl Endpoint {
     let v4 = if bind_v4 {
       match try_bind_v4(MulticastOptionsV4::new(interface_index)) {
         Ok(std_sock) => {
-          hick_trace::debug!(interface_index, "bound v4 mDNS socket");
+          debug!(interface_index, "bound v4 mDNS socket");
           match try_join_v4(&std_sock, interface_index) {
             Ok(()) => {
-              hick_trace::debug!(interface_index, "joined v4 mDNS multicast group");
+              debug!(interface_index, "joined v4 mDNS multicast group");
             }
             Err(e) => {
-              hick_trace::warn!(error = %e, interface_index, "failed to join v4 mDNS multicast group");
+              warn!(error = %e, interface_index, "failed to join v4 mDNS multicast group");
               return Err(map_join_to_bind_v4(e));
             }
           }
@@ -90,7 +93,7 @@ impl Endpoint {
           Some(async_sock)
         }
         Err(e) => {
-          hick_trace::warn!(error = %e, interface_index, "failed to bind v4 mDNS socket");
+          warn!(error = %e, interface_index, "failed to bind v4 mDNS socket");
           return Err(ServerError::BindV4(e));
         }
       }
@@ -101,13 +104,13 @@ impl Endpoint {
     let v6 = if bind_v6 {
       match try_bind_v6(MulticastOptionsV6::new(interface_index)) {
         Ok(std_sock) => {
-          hick_trace::debug!(interface_index, "bound v6 mDNS socket");
+          debug!(interface_index, "bound v6 mDNS socket");
           match try_join_v6(&std_sock, interface_index) {
             Ok(()) => {
-              hick_trace::debug!(interface_index, "joined v6 mDNS multicast group");
+              debug!(interface_index, "joined v6 mDNS multicast group");
             }
             Err(e) => {
-              hick_trace::warn!(error = %e, interface_index, "failed to join v6 mDNS multicast group");
+              warn!(error = %e, interface_index, "failed to join v6 mDNS multicast group");
               return Err(map_join_to_bind_v6(e));
             }
           }
@@ -116,7 +119,7 @@ impl Endpoint {
           Some(async_sock)
         }
         Err(e) => {
-          hick_trace::warn!(error = %e, interface_index, "failed to bind v6 mDNS socket");
+          warn!(error = %e, interface_index, "failed to bind v6 mDNS socket");
           return Err(ServerError::BindV6(e));
         }
       }
@@ -136,7 +139,7 @@ impl Endpoint {
       interface_index,
     };
     #[cfg(feature = "stats")]
-    let mut stats_slot: Option<std::sync::Arc<hick_trace::stats::Stats>> = None;
+    let mut stats_slot: Option<std::sync::Arc<stats::Stats>> = None;
     driver::spawn::<N>(
       opts,
       sockets,
@@ -158,10 +161,11 @@ impl Endpoint {
   /// The snapshot includes both counters incremented by the `mdns-proto` layer
   /// (parse errors, cache operations, service/query lifecycle) and counters
   /// added by the driver layer (raw wire rx/tx byte counts, socket-level send
-  /// errors). All counters share the same [`hick_trace::stats::Stats`] instance
+  /// errors). All counters share the same [`stats::Stats`] instance
   /// so the snapshot is a single consistent view.
   #[cfg(feature = "stats")]
-  pub fn stats(&self) -> hick_trace::stats::StatsSnapshot {
+  #[cfg_attr(docsrs, doc(cfg(feature = "stats")))]
+  pub fn stats(&self) -> stats::StatsSnapshot {
     self.stats.snapshot()
   }
 
@@ -285,23 +289,4 @@ fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
-  use super::{map_join_to_bind_v4, map_join_to_bind_v6};
-  use crate::error::ServerError;
-
-  /// A join I/O failure is surfaced as the matching family's bind I/O error —
-  /// the driver reports a failed multicast join as a bind failure.
-  #[test]
-  fn join_io_error_maps_to_family_bind_io_error() {
-    let v4 = map_join_to_bind_v4(std::io::Error::other("boom").into());
-    assert!(matches!(
-      v4,
-      ServerError::BindV4(hick_udp::BindError::Io(_))
-    ));
-    let v6 = map_join_to_bind_v6(std::io::Error::other("boom").into());
-    assert!(matches!(
-      v6,
-      ServerError::BindV6(hick_udp::BindError::Io(_))
-    ));
-  }
-}
+mod tests;

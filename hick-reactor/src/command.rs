@@ -6,6 +6,8 @@ use std::{
   sync::{Arc, Mutex},
 };
 
+use async_channel::Receiver;
+use futures::channel::oneshot;
 use mdns_proto::{QueryHandle, QuerySpec, ServiceHandle, ServiceSpec};
 
 use crate::{
@@ -20,7 +22,7 @@ pub(crate) struct ServiceRegistered {
   /// Shared bounded/coalescing update buffer with a reserved terminal slot.
   pub(crate) mailbox: Arc<Mutex<ServiceMailbox>>,
   /// Capacity-1 wakeup the driver rings after filling the mailbox.
-  pub(crate) doorbell: async_channel::Receiver<()>,
+  pub(crate) doorbell: Receiver<()>,
 }
 
 /// Reply payload for a successful query start.
@@ -29,21 +31,21 @@ pub(crate) struct QueryStarted {
   /// Shared bounded/coalescing answer + terminal buffer.
   pub(crate) mailbox: Arc<Mutex<QueryMailbox>>,
   /// Capacity-1 wakeup the driver rings after filling the mailbox.
-  pub(crate) doorbell: async_channel::Receiver<()>,
+  pub(crate) doorbell: Receiver<()>,
 }
 
 /// Messages flowing from caller-side handles into the driver task.
 pub(crate) enum Command {
   RegisterService {
     spec: ServiceSpec,
-    reply: futures::channel::oneshot::Sender<Result<ServiceRegistered, RegisterError>>,
+    reply: oneshot::Sender<Result<ServiceRegistered, RegisterError>>,
   },
   UnregisterService {
     handle: ServiceHandle,
   },
   StartQuery {
     spec: QuerySpec,
-    reply: futures::channel::oneshot::Sender<Result<QueryStarted, StartQueryError>>,
+    reply: oneshot::Sender<Result<QueryStarted, StartQueryError>>,
   },
   CancelQuery {
     handle: QueryHandle,

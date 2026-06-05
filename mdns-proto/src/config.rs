@@ -3,12 +3,13 @@
 #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
 use core::time::Duration;
 
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-use crate::Name;
 #[cfg(any(feature = "alloc", feature = "std"))]
 use crate::records::ServiceRecords;
 #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-use crate::wire::{ResourceClass, ResourceType};
+use crate::{
+  Name,
+  wire::{ResourceClass, ResourceType},
+};
 
 /// Configuration for an `Endpoint`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -114,6 +115,7 @@ pub struct ServiceSpec {
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
 impl ServiceSpec {
   /// Wrap a `ServiceRecords` bundle as a spec.
   pub const fn new(records: ServiceRecords) -> Self {
@@ -150,6 +152,10 @@ pub struct QuerySpec {
 }
 
 #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
+)]
 impl QuerySpec {
   /// Build a new spec for an mDNS query.
   pub fn new(qname: Name, qtype: ResourceType) -> Self {
@@ -238,27 +244,4 @@ impl QuerySpec {
 // gated to the tiers where they exist — `--no-default-features` is core-only.
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[allow(clippy::unwrap_used)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn endpoint_config_builders_and_accessors() {
-    let cfg = EndpointConfig::new()
-      .with_probe_unique_names(false)
-      .with_answer_questions(false)
-      .with_populate_cache(false);
-    assert!(!cfg.probe_unique_names());
-    assert!(!cfg.answer_questions());
-    assert!(!cfg.populate_cache());
-  }
-
-  #[test]
-  fn query_spec_with_qclass_overrides_class() {
-    let q = QuerySpec::new(
-      Name::try_from_str("_http._tcp.local.").unwrap(),
-      ResourceType::Ptr,
-    )
-    .with_qclass(ResourceClass::Any);
-    assert!(q.qclass().is_any());
-  }
-}
+mod tests;

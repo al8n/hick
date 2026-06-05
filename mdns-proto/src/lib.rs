@@ -6,30 +6,26 @@
 #![allow(unexpected_cfgs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
-#![deny(
-  clippy::unwrap_used,
-  clippy::expect_used,
-  clippy::panic,
-  clippy::panic_in_result_fn,
-  clippy::indexing_slicing,
-  clippy::integer_division,
-  clippy::arithmetic_side_effects,
-  clippy::unreachable,
-  clippy::todo,
-  clippy::unimplemented,
-  clippy::string_slice
+// Panic-freedom restriction lints are a PRODUCTION concern (this is a no_std /
+// no-panic-capable core); test code legitimately uses unwrap/expect/panic/etc.,
+// so gate the denies on `not(test)` (mirrors the `unsafe_code` split above).
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::panic_in_result_fn,
+    clippy::indexing_slicing,
+    clippy::integer_division,
+    clippy::arithmetic_side_effects,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::string_slice
+  )
 )]
 
-// no_std (+alloc) preamble (see the `rust-no-std` golden rule). In the
-// `not(std) + alloc` tier the `alloc` crate is aliased to the name `std`, so
-// every genuine-heap path the code writes as `std::` (`std::vec::Vec`,
-// `std::string::String`, `std::boxed::Box`, `std::collections::BTreeMap`,
-// `std::borrow::Cow`, …) resolves to its `alloc::` home with no edit. The
-// `heapless` / core-only tiers activate NEITHER line: there is no `std` name,
-// and every heap item is gated `#[cfg(any(feature = "std", feature = "alloc"))]`
-// so it compiles out. Core-resident paths (`core::net`, `core::time::Duration`,
-// `core::sync::atomic`, …) are always imported from `core::`, never via this
-// alias.
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
 extern crate alloc as std;
 
@@ -109,6 +105,7 @@ pub use event::{ServiceRenamed, ServiceUpdate};
 /// Configuration types.
 pub mod config;
 /// Records published by a registered Service.
+#[cfg(any(feature = "alloc", feature = "std"))]
 pub mod records;
 
 pub use config::EndpointConfig;

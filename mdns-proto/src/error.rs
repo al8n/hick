@@ -8,7 +8,12 @@
 
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
-use crate::name::LabelTooLongDetail;
+use crate::{name::LabelTooLongDetail, wire::*};
+// `Name`/`QueryHandle`/`ServiceHandle` are only carried by the alloc/std-gated
+// error enums below, so gate the import to match (no_std + bare no-default have
+// no `Name`).
+#[cfg(any(feature = "alloc", feature = "std"))]
+use crate::{Name, QueryHandle, ServiceHandle};
 
 /// Detail payload for "buffer too short": a parser ran out of bytes.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
@@ -162,11 +167,11 @@ pub enum ParseError {
   #[error(transparent)]
   BufferTooShort(BufferTooShortDetail),
 
-  /// A label length byte exceeded [`crate::constants::MAX_LABEL_BYTES`].
+  /// A label length byte exceeded [`MAX_LABEL_BYTES`](crate::constants::MAX_LABEL_BYTES).
   #[error(transparent)]
   LabelTooLong(LabelTooLongDetail),
 
-  /// A fully-resolved name exceeded [`crate::constants::MAX_NAME_BYTES`].
+  /// A fully-resolved name exceeded [`MAX_NAME_BYTES`](crate::constants::MAX_NAME_BYTES).
   #[error("name exceeds max length {0} bytes")]
   NameTooLong(usize),
 
@@ -174,7 +179,7 @@ pub enum ParseError {
   #[error("name compression pointer cycle detected")]
   PointerCycle,
 
-  /// A compression pointer chain exceeded [`crate::constants::MAX_POINTER_HOPS`] hops.
+  /// A compression pointer chain exceeded [`MAX_POINTER_HOPS`](crate::constants::MAX_POINTER_HOPS) hops.
   #[error("name compression pointer chain exceeded {0} hops")]
   PointerChainTooLong(u8),
 
@@ -258,11 +263,11 @@ pub enum HandleError {
 
   /// The incoming opcode is not `Query` (mDNS only supports Query).
   #[error("incoming opcode `{0}` is not Query")]
-  InvalidOpcode(crate::wire::Opcode),
+  InvalidOpcode(Opcode),
 
   /// The incoming response code is not `NoError` (mDNS requires NoError).
   #[error("incoming response code `{0}` is not NoError")]
-  InvalidResponseCode(crate::wire::ResponseCode),
+  InvalidResponseCode(ResponseCode),
 }
 
 /// Errors raised by `Endpoint::try_register_service`.
@@ -304,11 +309,11 @@ pub enum StartQueryError {
 pub enum HandleServiceRenamedError {
   /// The new name is already registered to a different service.
   #[error("name `{0}` is already registered to a different service")]
-  NameAlreadyRegistered(crate::Name),
+  NameAlreadyRegistered(Name),
 
   /// The handle does not refer to a registered service.
   #[error("service handle {0} not found")]
-  ServiceNotFound(crate::ServiceHandle),
+  ServiceNotFound(ServiceHandle),
 }
 
 /// Errors raised by query-handle lookups on `Endpoint` (`poll_query_*`,
@@ -325,56 +330,9 @@ pub enum HandleServiceRenamedError {
 pub enum CancelQueryError {
   /// The handle does not refer to a currently registered query.
   #[error("query handle {0} not found")]
-  QueryNotFound(crate::QueryHandle),
+  QueryNotFound(QueryHandle),
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
-  #[cfg(feature = "std")]
-  use super::ParseError;
-  use super::{BufferTooShortDetail, BufferTooSmallDetail};
-
-  #[test]
-  fn buffer_too_short_detail_accessors() {
-    let d = BufferTooShortDetail::new(4, 12, 1);
-    assert_eq!(d.needed(), 4);
-    assert_eq!(d.at(), 12);
-    assert_eq!(d.have(), 1);
-  }
-
-  #[test]
-  fn buffer_too_small_detail_accessors() {
-    let d = BufferTooSmallDetail::new(100, 32);
-    assert_eq!(d.needed(), 100);
-    assert_eq!(d.have(), 32);
-  }
-
-  #[cfg(feature = "std")]
-  #[test]
-  fn parse_error_buffer_too_short_display() {
-    let e = ParseError::BufferTooShort(BufferTooShortDetail::new(4, 12, 1));
-    assert_eq!(
-      std::format!("{e}"),
-      "buffer too short: needed 4 bytes at offset 12, had 1"
-    );
-  }
-
-  #[test]
-  fn is_empty_and_pointer_rdlength_accessors() {
-    use super::{PointerForwardDetail, RdlengthOverrunDetail};
-    assert!(!BufferTooShortDetail::new(4, 12, 1).is_empty());
-    assert!(BufferTooShortDetail::new(4, 12, 0).is_empty());
-    assert!(!BufferTooSmallDetail::new(100, 32).is_empty());
-    assert!(BufferTooSmallDetail::new(100, 0).is_empty());
-
-    let p = PointerForwardDetail::new(10, 5);
-    assert_eq!(p.ptr(), 10);
-    assert_eq!(p.at(), 5);
-
-    let r = RdlengthOverrunDetail::new(20, 12, 4);
-    assert_eq!(r.rdlen(), 20);
-    assert_eq!(r.at(), 12);
-    assert_eq!(r.rem(), 4);
-  }
-}
+mod tests;

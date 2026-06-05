@@ -4,9 +4,14 @@ use core::{
   net::{IpAddr, Ipv4Addr, Ipv6Addr},
   time::Duration,
 };
-use std::{rc::Rc, time::Instant};
+use std::{
+  io::{self, ErrorKind},
+  rc::Rc,
+  time::Instant,
+};
 
 use futures::future::select_all;
+use hick_trace::*;
 use hick_udp::{
   MulticastOptionsV4, MulticastOptionsV6, try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
@@ -47,8 +52,8 @@ impl Endpoint {
     let interface_index = match opts.interface_index() {
       Some(i) => i,
       None => pick_default_interface_index(opts.ipv4(), opts.ipv6()).ok_or_else(|| {
-        ServerError::Io(std::io::Error::new(
-          std::io::ErrorKind::NotFound,
+        ServerError::Io(io::Error::new(
+          ErrorKind::NotFound,
           "no multicast-capable interface found",
         ))
       })?,
@@ -68,8 +73,8 @@ impl Endpoint {
     let bind_v4 = opts.ipv4() && iface_has_v4;
     let bind_v6 = opts.ipv6() && iface_has_v6;
     if !bind_v4 && !bind_v6 {
-      return Err(ServerError::Io(std::io::Error::new(
-        std::io::ErrorKind::AddrNotAvailable,
+      return Err(ServerError::Io(io::Error::new(
+        ErrorKind::AddrNotAvailable,
         "interface has no address in any requested family",
       )));
     }
@@ -77,14 +82,14 @@ impl Endpoint {
     let std_v4 = if bind_v4 {
       match try_bind_v4(MulticastOptionsV4::new(interface_index)) {
         Ok(s) => {
-          hick_trace::debug!(interface_index, "bound v4 mDNS socket");
+          debug!(interface_index, "bound v4 mDNS socket");
           // Fail construction on a join error: a bound-but-unjoined socket can
           // send but never receives multicast, making the endpoint silently
           // non-functional. Mirrors the reactor's fatal-join setup.
           match try_join_v4(&s, interface_index) {
-            Ok(()) => hick_trace::debug!(interface_index, "joined v4 mDNS multicast group"),
+            Ok(()) => debug!(interface_index, "joined v4 mDNS multicast group"),
             Err(e) => {
-              hick_trace::warn!(error = %e, interface_index, "failed to join v4 mDNS multicast group");
+              warn!(error = %e, interface_index, "failed to join v4 mDNS multicast group");
               return Err(ServerError::JoinV4(e));
             }
           }
@@ -92,7 +97,7 @@ impl Endpoint {
           Some(s)
         }
         Err(e) => {
-          hick_trace::warn!(error = %e, interface_index, "failed to bind v4 mDNS socket");
+          warn!(error = %e, interface_index, "failed to bind v4 mDNS socket");
           return Err(ServerError::BindV4(e));
         }
       }
@@ -103,11 +108,11 @@ impl Endpoint {
     let std_v6 = if bind_v6 {
       match try_bind_v6(MulticastOptionsV6::new(interface_index)) {
         Ok(s) => {
-          hick_trace::debug!(interface_index, "bound v6 mDNS socket");
+          debug!(interface_index, "bound v6 mDNS socket");
           match try_join_v6(&s, interface_index) {
-            Ok(()) => hick_trace::debug!(interface_index, "joined v6 mDNS multicast group"),
+            Ok(()) => debug!(interface_index, "joined v6 mDNS multicast group"),
             Err(e) => {
-              hick_trace::warn!(error = %e, interface_index, "failed to join v6 mDNS multicast group");
+              warn!(error = %e, interface_index, "failed to join v6 mDNS multicast group");
               return Err(ServerError::JoinV6(e));
             }
           }
@@ -115,7 +120,7 @@ impl Endpoint {
           Some(s)
         }
         Err(e) => {
-          hick_trace::warn!(error = %e, interface_index, "failed to bind v6 mDNS socket");
+          warn!(error = %e, interface_index, "failed to bind v6 mDNS socket");
           return Err(ServerError::BindV6(e));
         }
       }
@@ -161,11 +166,12 @@ impl Endpoint {
   /// Return a point-in-time snapshot of the I/O + protocol counters for this
   /// endpoint.
   ///
-  /// Delegates to the shared [`hick_trace::stats::Stats`] instance owned by
+  /// Delegates to the shared [`stats::Stats`] instance owned by
   /// the proto endpoint (and shared with the driver I/O paths), so the
   /// snapshot covers wire-level rx/tx as well as protocol-level events.
   #[cfg(feature = "stats")]
-  pub fn stats(&self) -> hick_trace::stats::StatsSnapshot {
+  #[cfg_attr(docsrs, doc(cfg(feature = "stats")))]
+  pub fn stats(&self) -> stats::StatsSnapshot {
     self.inner.state.borrow().stats.snapshot()
   }
 
@@ -179,7 +185,7 @@ impl Endpoint {
   ///
   /// [`ServiceUpdate`]: mdns_proto::ServiceUpdate
   pub async fn register_service(&self, spec: ServiceSpec) -> Result<Service, RegisterError> {
-    let now = std::time::Instant::now();
+    let now = Instant::now();
     // The handle-owned delivery mailbox: the driver ctx holds one clone (fills
     // it), the returned `Service` handle holds the other (drains it). Created
     // before the proto registration so both sides share the same buffer.
@@ -206,7 +212,7 @@ impl Endpoint {
   /// events; dropping the handle implicitly cancels the query (the driver
   /// removes the proto state machine on its next loop iteration).
   pub async fn start_query(&self, spec: QuerySpec) -> Result<Query, StartQueryError> {
-    let now = std::time::Instant::now();
+    let now = Instant::now();
     let handle = {
       let mut st = self.inner.state.borrow_mut();
       st.start_query(spec, now)
@@ -382,7 +388,7 @@ impl Endpoint {
 }
 
 /// Wake the driver when an `Endpoint` clone is dropped so it can promptly
-/// observe `Rc::strong_count(&inner) == 1` and exit (per the T9 exit-condition
+/// observe `Rc::strong_count(&inner) == 1` and exit (per the exit-condition
 /// contract). Without this notify, the driver would only notice the dropped
 /// handle the next time it woke for a recv / timer event.
 impl Drop for Endpoint {
@@ -394,20 +400,20 @@ impl Drop for Endpoint {
 /// Snapshot the local IPv4 / IPv6 subnets owned by `iface_index`. Used by
 /// the §11 on-link source-address fallback when the kernel did not deliver
 /// an IPv4 TTL / IPv6 hop-limit cmsg.
-fn collect_local_subnets(iface_index: u32) -> Vec<(core::net::IpAddr, u8)> {
-  let mut out: Vec<(core::net::IpAddr, u8)> = Vec::new();
+fn collect_local_subnets(iface_index: u32) -> Vec<(IpAddr, u8)> {
+  let mut out: Vec<(IpAddr, u8)> = Vec::new();
   if iface_index == 0 {
     return out;
   }
   if let Ok(Some(i)) = getifs::interface_by_index(iface_index) {
     if let Ok(v4s) = i.ipv4_addrs() {
       for n in v4s.iter() {
-        out.push((core::net::IpAddr::V4(n.addr()), n.prefix_len()));
+        out.push((IpAddr::V4(n.addr()), n.prefix_len()));
       }
     }
     if let Ok(v6s) = i.ipv6_addrs() {
       for n in v6s.iter() {
-        out.push((core::net::IpAddr::V6(n.addr()), n.prefix_len()));
+        out.push((IpAddr::V6(n.addr()), n.prefix_len()));
       }
     }
   }
@@ -450,25 +456,4 @@ fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
-  use super::{collect_local_subnets, pick_default_interface_index};
-
-  #[test]
-  fn collect_local_subnets_is_empty_for_unspecified_index() {
-    // Index 0 means "unspecified" — no subnets are collected.
-    assert!(collect_local_subnets(0).is_empty());
-  }
-
-  #[test]
-  fn pick_default_interface_index_runs_for_every_family_combo() {
-    // Exercises the strict/loose, non-loopback/loopback fallback chain. The
-    // chosen index is environment dependent, so only the shape is asserted: any
-    // family combination yields an Option, and a returned index resolves to a
-    // (possibly empty) subnet list.
-    for (v4, v6) in [(true, true), (true, false), (false, true), (false, false)] {
-      if let Some(idx) = pick_default_interface_index(v4, v6) {
-        let _ = collect_local_subnets(idx);
-      }
-    }
-  }
-}
+mod tests;
