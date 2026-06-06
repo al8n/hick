@@ -5,6 +5,26 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 
+// `hick` is a batteries-included facade: it needs at least one runtime or
+// bare-metal driver. The proto core is pulled with only `slab` (no storage tier),
+// so a featureless build has neither a driver nor the storage tier the
+// crate-root proto types require — fail fast with guidance instead of emitting
+// cryptic unresolved-import errors.
+#[cfg(not(any(
+  feature = "tokio",
+  feature = "smol",
+  feature = "compio",
+  feature = "smoltcp",
+  feature = "smoltcp-no-atomic",
+  feature = "embassy",
+  feature = "embassy-no-atomic"
+)))]
+compile_error!(
+  "hick: enable a runtime (`tokio`, `smol`, or `compio`) or a bare-metal driver \
+   (`smoltcp` / `embassy`, or their `-no-atomic` variants for cores without \
+   native atomic CAS)"
+);
+
 /// The Sans-I/O mDNS protocol core ([`mdns_proto`]).
 ///
 /// Re-exported in full for direct access to the wire codec, the record cache,
@@ -13,14 +33,28 @@
 /// rest.
 pub use mdns_proto as proto;
 
+/// The wire codec ([`mdns_proto::wire`]) — parser and encoder. Available in every
+/// build tier (no storage tier required), so it is always re-exported.
+pub use mdns_proto::wire;
+
 /// Common, runtime-agnostic protocol types — re-exported from [`mdns_proto`] for
-/// ergonomics. Service / query specs, records, names, update events, and the wire
-/// codec are identical for every driver, so they live at the crate root; the
-/// runtime-specific entry points (the endpoint constructor and its handle types)
-/// live in the per-runtime driver modules ([`tokio`], [`smol`]) or driver crates
-/// ([`compio`], [`smoltcp`], [`embassy`]).
+/// ergonomics. Service / query specs, records, names, and update events are
+/// identical for every driver, so they live at the crate root; the runtime-specific
+/// entry points (the endpoint constructor and its handle types) live in the
+/// per-runtime driver modules ([`tokio`], [`smol`]) or driver crates ([`compio`],
+/// [`smoltcp`], [`embassy`]). These require a proto storage tier, which every
+/// runtime / driver feature enables, so the re-export is gated on having one.
+#[cfg(any(
+  feature = "tokio",
+  feature = "smol",
+  feature = "compio",
+  feature = "smoltcp",
+  feature = "smoltcp-no-atomic",
+  feature = "embassy",
+  feature = "embassy-no-atomic"
+))]
 pub use mdns_proto::{
-  CollectedAnswer, Name, QuerySpec, ServiceRecords, ServiceSpec, ServiceUpdate, wire,
+  CollectedAnswer, Name, QuerySpec, ServiceRecords, ServiceSpec, ServiceUpdate,
 };
 
 /// `tokio`-pinned mDNS driver: the endpoint constructor ([`server`](tokio::server))
@@ -51,13 +85,21 @@ pub mod smol {
 pub use hick_compio as compio;
 
 /// The runtime-agnostic bare-metal mDNS engine ([`hick_smoltcp`]) over smoltcp
-/// UDP (`no_std` + `alloc`). Enable the `smoltcp` feature.
-#[cfg(feature = "smoltcp")]
-#[cfg_attr(docsrs, doc(cfg(feature = "smoltcp")))]
+/// UDP (`no_std` + `alloc`). Enable `smoltcp` (atomic tier) or `smoltcp-no-atomic`
+/// (portable-atomic tier, for cores without native atomic CAS).
+#[cfg(any(feature = "smoltcp", feature = "smoltcp-no-atomic"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "smoltcp", feature = "smoltcp-no-atomic")))
+)]
 pub use hick_smoltcp as smoltcp;
 
 /// The embassy async mDNS driver ([`hick_embassy`]) built on the [`smoltcp`]
-/// engine (`no_std` + `alloc`). Enable the `embassy` feature.
-#[cfg(feature = "embassy")]
-#[cfg_attr(docsrs, doc(cfg(feature = "embassy")))]
+/// engine (`no_std` + `alloc`). Enable `embassy` (atomic tier) or
+/// `embassy-no-atomic` (portable-atomic tier, for cores without native atomic CAS).
+#[cfg(any(feature = "embassy", feature = "embassy-no-atomic"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "embassy", feature = "embassy-no-atomic")))
+)]
 pub use hick_embassy as embassy;

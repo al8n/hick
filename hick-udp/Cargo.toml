@@ -17,17 +17,21 @@ metrics = ["hick-trace/metrics"]
 stats = ["hick-trace/stats"]
 
 [dependencies]
-hick-trace = { workspace = true }
+hick-trace.workspace = true
 thiserror = { workspace = true, features = ["std"] }
-derive_more = { workspace = true }
-getifs = { workspace = true }
+derive_more.workspace = true
+getifs.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["net", "system"] }
-libc = { workspace = true }
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Networking_WinSock",
+  "Win32_Foundation",
+  "Win32_System_IO",
+] }
 socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]

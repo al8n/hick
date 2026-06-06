@@ -1,6 +1,6 @@
 [package]
 name = "hick"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = true
 repository = "https://github.com/al8n/hick"
@@ -27,11 +27,22 @@ compio = ["std", "hick-compio"]
 # stays `no_std`.
 std = ["mdns-proto/std"]
 
-# Bare-metal (`no_std` + `alloc`) drivers. `smoltcp` exposes the runtime-agnostic
-# engine; `embassy` adds the embassy-net async driver (and pulls `smoltcp`). These
-# do NOT enable `std`, so they remain usable on `no_std` targets.
-smoltcp = ["hick-smoltcp"]
-embassy = ["hick-embassy", "smoltcp"]
+# Bare-metal (`no_std` + `alloc`) drivers. Each engine has two storage tiers,
+# selected by SEPARATE features — Cargo features are additive, so a shared toggle
+# could not turn off the `atomic` tier the plain feature enables; the tier is
+# encoded in the feature name instead:
+#   `smoltcp`  / `embassy`           -> `atomic` tier (SmolStr names + Bytes rdata)
+#   `smoltcp-no-atomic` / `embassy-no-atomic`
+#                                    -> `no-atomic` tier (portable-atomic `Arc`)
+#                                       for cores without native atomic CAS
+#                                       (Cortex-M0+ / thumbv6m / RP2040).
+# `smoltcp*` exposes the runtime-agnostic engine; `embassy*` adds the embassy-net
+# async driver and pulls the matching engine tier. None enable `std`, so they stay
+# usable on `no_std` targets. (`stats` implies the `atomic` tier.)
+smoltcp = ["hick-smoltcp", "hick-smoltcp/atomic"]
+smoltcp-no-atomic = ["hick-smoltcp", "hick-smoltcp/no-atomic"]
+embassy = ["hick-embassy", "hick-embassy/atomic", "smoltcp"]
+embassy-no-atomic = ["hick-embassy", "hick-embassy/no-atomic", "smoltcp-no-atomic"]
 
 # Forward `tracing` instrumentation. The proto core's `tracing` is no_std-safe
 # (the `tracing` crate is pulled with default-features off). The driver
@@ -61,6 +72,12 @@ metrics = [
   # was removed because the `metrics` facade requires `std`. Their atomic-only
   # stats are still available via the `stats` feature.
 ]
+# NOTE: `stats` requires the `atomic` tier — `mdns-proto/stats` implies `alloc`, and
+# the bare-metal drivers' `stats` implies their `atomic` feature. So combining it
+# with a `*-no-atomic` driver re-selects the atomic tier (`alloc`/`std` win backend
+# precedence); on a core WITHOUT native atomic CAS (RP2040 / thumbv6m) that cannot
+# build (smol_str needs atomics) and fails loudly — same as `metrics` on bare-metal.
+# Do not enable `stats` on the no-atomic tier.
 stats = [
   "mdns-proto/stats",
   "hick-reactor?/stats",
@@ -74,13 +91,20 @@ stats = [
 defmt = ["hick-smoltcp?/defmt", "hick-embassy?/defmt"]
 
 [dependencies]
-# Always the alloc-tier core (every driver needs it); the `std` feature adds the
-# std build on top for std runtimes, so a bare-metal feature alone never pulls std.
-mdns-proto = { workspace = true, features = ["alloc", "slab"] }
+# The proto core is always pulled with `slab` (every driver's pools need it), but
+# the storage TIER is NOT fixed here: the `std` runtimes enable `mdns-proto/std`
+# and the bare-metal driver features enable the driver's `atomic` / `no-atomic`
+# tier (which pulls `mdns-proto/alloc` or `mdns-proto/no-atomic`). Forcing `alloc`
+# here would pin the atomic tier and make the `no-atomic` bare-metal path
+# impossible — `alloc`/`std` win mdns-proto's backend precedence over `no-atomic`.
+mdns-proto = { workspace = true, features = ["slab"] }
 hick-reactor = { optional = true, workspace = true }
 hick-compio = { optional = true, workspace = true }
-hick-smoltcp = { optional = true, workspace = true }
-hick-embassy = { optional = true, workspace = true }
+# `default-features = false`: the driver's default `atomic` tier is selected
+# explicitly by the facade's `smoltcp` / `embassy` features, leaving the
+# `*-no-atomic` features free to select the `no-atomic` tier instead.
+hick-smoltcp = { optional = true, workspace = true, default-features = false }
+hick-embassy = { optional = true, workspace = true, default-features = false }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -20,7 +20,7 @@ discovery on embassy-net, `no_std` + `alloc`.
 
 ## Introduction
 
-`hick-embassy` is the [embassy] async driver for the [hick] mDNS family. It
+`hick-embassy` is the [embassy] async driver for the [`hick`] mDNS family. It
 builds on the [`hick-smoltcp`] engine, supplying an [`embassy-net`] `UdpIo`
 transport, the [`embassy-time`] clock bridge, and an async driver future you
 spawn as an embassy task.
@@ -78,8 +78,10 @@ async fn mdns_task(
 
 | Feature | Description |
 |---------|-------------|
+| `atomic` *(default)* | The native-atomic alloc tier: `SmolStr` names + `Bytes` rdata. Needs pointer-width atomics. |
+| `no-atomic` | For cores **without** native atomic CAS (Cortex-M0+ / thumbv6m / RP2040): swaps the refcounted Name / rdata onto `portable-atomic`'s `Arc` (clone via a `critical-section` impl your binary provides), keeping the alloc-backed pools. Build with `--no-default-features --features no-atomic`. |
 | `tracing` | Forward structured `tracing` events from `mdns-proto` and `hick-smoltcp` (no-op on bare-metal without a subscriber). |
-| `stats` | Enable `no_std`-safe atomic counters; read a snapshot via `state.stats()`. |
+| `stats` | Enable `no_std`-safe atomic counters; read a snapshot via `state.stats()`. Implies `atomic`. |
 | `defmt` | Emit `defmt` log events — the idiomatic choice for embassy bare-metal targets. |
 
 ## Observability

@@ -6,10 +6,15 @@
 //! capacity are simply written uncompressed (legal — slightly larger output).
 //!
 //! Requires the `Name` type, so the `MessageBuilder` and `CompressionTable`
-//! are only available when one of `alloc` / `std` / `heapless` features is
-//! enabled.
+//! are only available when one of `alloc` / `std` / `heapless` / `no-atomic`
+//! features is enabled.
 
-#![cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
+#![cfg(any(
+  feature = "alloc",
+  feature = "std",
+  feature = "heapless",
+  feature = "no-atomic"
+))]
 
 use super::{HEADER_SIZE, Header, ResourceClass, ResourceType};
 use crate::{

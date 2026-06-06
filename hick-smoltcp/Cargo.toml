@@ -1,6 +1,6 @@
 [package]
 name = "hick-smoltcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = true
 repository = "https://github.com/al8n/hick"
@@ -14,16 +14,28 @@ keywords = ["mdns", "dns-sd", "smoltcp", "no-std", "zeroconf"]
 readme = "README.md"
 
 [features]
-default = []
+default = ["atomic"]
+# `atomic` (default): mdns-proto's alloc tier — SmolStr names + Bytes rdata over
+# slab pools. Needs pointer-width atomics (smol_str's `Arc`, bytes' atomic
+# refcount), so it does NOT build on cores like Cortex-M0+ / thumbv6m.
+atomic = ["mdns-proto/alloc", "mdns-proto/slab"]
+# `no-atomic`: path for cores without native atomic CAS (Cortex-M0+ / thumbv6m /
+# RP2040). mdns-proto's no-atomic tier swaps the refcounted Name / rdata onto
+# `portable_atomic_util::Arc` (cheap clone via portable-atomic + a
+# `critical-section` impl your binary provides) while keeping the alloc-backed
+# slab pools and the full Endpoint. Use `--no-default-features --features no-atomic`.
+no-atomic = ["mdns-proto/no-atomic", "mdns-proto/slab"]
 tracing = ["mdns-proto/tracing", "hick-trace/tracing"]
-stats = ["mdns-proto/stats", "hick-trace/stats"]
+# stats needs the alloc tier (counter storage + a shared `Arc<Stats>` handle), so
+# it implies `atomic` and is unavailable on the no-atomic `heapless` path.
+stats = ["atomic", "mdns-proto/stats", "hick-trace/stats"]
 defmt = ["dep:defmt"]
 
 [dependencies]
-hick-trace = { workspace = true }
-mdns-proto = { workspace = true, features = ["alloc", "slab"] }
+hick-trace.workspace = true
+mdns-proto.workspace = true
 defmt = { workspace = true, optional = true }
-rand_core = { workspace = true }
+rand_core.workspace = true
 smoltcp = { version = "0.13", default-features = false, features = [
   "medium-ethernet",
   "medium-ip",
@@ -35,7 +47,12 @@ smoltcp = { version = "0.13", default-features = false, features = [
 
 [dev-dependencies]
 smoltcp = { version = "0.13", default-features = false, features = ["alloc"] }
-rand = { workspace = true, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
+rand = { workspace = true, features = [
+  "std",
+  "std_rng",
+  "sys_rng",
+  "thread_rng",
+] }
 
 [lints]
 workspace = true

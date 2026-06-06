@@ -37,9 +37,19 @@ mod reader;
 pub use reader::{MessageReader, Questions, Records};
 
 mod builder;
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
+#[cfg(any(
+  feature = "alloc",
+  feature = "std",
+  feature = "heapless",
+  feature = "no-atomic"
+))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
+  doc(cfg(any(
+    feature = "alloc",
+    feature = "std",
+    feature = "heapless",
+    feature = "no-atomic"
+  )))
 )]
 pub use builder::{BuilderCheckpoint, CompressionTable, DEFAULT_COMPRESSION_TABLE, MessageBuilder};

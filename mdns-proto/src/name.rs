@@ -48,10 +48,11 @@ pub struct NameTooLongDetail {
 }
 
 impl NameTooLongDetail {
-  #[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
+  cfg_storage! {
   #[inline(always)]
   pub(crate) const fn new(len: usize) -> Self {
     Self { len }
+  }
   }
 
   /// Bytes in the rejected name.
@@ -89,10 +90,10 @@ pub enum NameError {
   EmptyLabel,
 }
 
+cfg_storage! {
 /// Validates that `s` is a syntactically acceptable DNS name (per-label and
 /// total length, no empty internal labels). Trailing `.` (FQDN form) is
 /// permitted.
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
 fn validate_name(s: &str) -> Result<(), NameError> {
   if s.len() > MAX_NAME_BYTES {
     return Err(NameError::NameTooLong(NameTooLongDetail::new(s.len())));
@@ -125,6 +126,7 @@ fn validate_name(s: &str) -> Result<(), NameError> {
   }
   Ok(())
 }
+}
 
 // ── Backing-type selection ────────────────────────────────────────────
 // Exactly one of these `cfg` arms is active in any valid build. Under
@@ -134,47 +136,59 @@ fn validate_name(s: &str) -> Result<(), NameError> {
 #[cfg(any(feature = "alloc", feature = "std"))]
 type NameInner = smol_str::SmolStr;
 
-#[cfg(all(feature = "heapless", not(any(feature = "alloc", feature = "std"))))]
+// No-atomic alloc tier: a portable-atomic `Arc<str>` (cheap clone without native
+// atomic CAS). Same heap-string shape as `SmolStr` minus the small-string
+// optimization; built through the same `NameInner::from` path.
+#[cfg(all(feature = "no-atomic", not(any(feature = "alloc", feature = "std"))))]
+type NameInner = portable_atomic_util::Arc<str>;
+
+#[cfg(all(
+  feature = "heapless",
+  not(any(feature = "alloc", feature = "std", feature = "no-atomic"))
+))]
 type NameInner = heapless::String<MAX_NAME_BYTES>;
 
+cfg_storage! {
 /// Owned, canonical DNS name (lowercased on construction).
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
-)]
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Name(NameInner);
 
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
 impl Name {
   /// Returns the canonical lowercase form of this name.
   #[inline(always)]
   pub fn as_str(&self) -> &str {
-    self.0.as_str()
+    // `as_ref` (not `as_str`) so the same body compiles whether `NameInner` is
+    // `SmolStr`, `heapless::String`, or the no-atomic `Arc<str>` (the latter has
+    // no inherent `as_str`).
+    self.0.as_ref()
   }
 
   /// Returns the length in bytes.
   #[inline(always)]
   pub fn len(&self) -> usize {
-    self.0.as_str().len()
+    self.as_str().len()
   }
 
   /// Returns `true` if this name is empty.
   #[inline(always)]
   pub fn is_empty(&self) -> bool {
-    self.0.as_str().is_empty()
+    self.as_str().is_empty()
   }
 }
 
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
 impl core::fmt::Display for Name {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.write_str(self.as_str())
   }
 }
+}
 
-#[cfg(any(feature = "alloc", feature = "std"))]
+// Heap-backed construction: active for the `SmolStr` (alloc/std) and the
+// no-atomic `Arc<str>` backings. Both build `NameInner` from an owned `String`
+// (`std` is the `extern crate alloc as std` alias under `no-atomic`), so a
+// single body serves both. The heapless block below is mutually exclusive (it
+// excludes `no-atomic`).
+cfg_heap! {
 const _: () = {
   use std::string::String;
 
@@ -250,8 +264,15 @@ const _: () = {
     }
   }
 };
+}
 
-#[cfg(all(feature = "heapless", not(any(feature = "alloc", feature = "std"))))]
+// Must match the heapless `NameInner` alias above: `no-atomic` outranks `heapless`
+// (heap-backed Arc<str> wins), so excluding it here keeps the heapless and no-atomic
+// construction impls mutually exclusive when both features are additively enabled.
+#[cfg(all(
+  feature = "heapless",
+  not(any(feature = "alloc", feature = "std", feature = "no-atomic"))
+))]
 const _: () = {
   impl Name {
     /// Constructs a [`Name`] from a string, validating label lengths and

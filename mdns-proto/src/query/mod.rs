@@ -4,12 +4,12 @@ mod retry;
 
 use crate::{
   Instant, Name, Pool, QueryHandle,
+  backend::RdataBuf,
   error::{HandleTimeoutError, TransmitError},
   event::{QueryEvent, QueryUpdate},
   transmit::Transmit,
   wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
 };
-use bytes::Bytes;
 
 #[cfg(all(test, feature = "std", feature = "slab"))]
 mod tests;
@@ -29,7 +29,7 @@ const DEFAULT_MAX_ANSWERS: usize = 256;
 pub struct CollectedAnswer {
   rtype: ResourceType,
   rclass: ResourceClass,
-  rdata: Bytes,
+  rdata: RdataBuf,
   /// the case-FOLDED identity form of `rdata` (PTR/SRV/NSEC/CNAME
   /// names lowercased) used for dedup, cap accounting, and mailbox coalescing —
   /// while `rdata` keeps the original case for display. Two answers that are
@@ -41,7 +41,7 @@ pub struct CollectedAnswer {
   /// common case: A/AAAA/TXT/unknown rdata, or a name already lowercase), so we
   /// store ONLY one buffer — folding a large TXT/unknown flood does not double
   /// per-answer memory. [`Self::rdata_key`] resolves `None` to `rdata`.
-  rdata_key: Option<Bytes>,
+  rdata_key: Option<RdataBuf>,
   /// Monotonically increasing insertion sequence number within a single Query.
   /// Used to identify the oldest entry for FIFO eviction.
   seq: u64,
@@ -59,7 +59,7 @@ impl CollectedAnswer {
   pub fn from_parts(
     rtype: ResourceType,
     rclass: ResourceClass,
-    rdata: impl Into<Bytes>,
+    rdata: impl Into<RdataBuf>,
     seq: u64,
   ) -> Self {
     Self {

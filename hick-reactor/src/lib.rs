@@ -1,30 +1,4 @@
-//! `hick-reactor` — async mDNS driver.
-//!
-//! Layered on `mdns-proto` (Sans-I/O state machines) and `hick-udp`
-//! (multicast socket setup). The driver task is generic over an
-//! [`agnostic_net::Net`] implementation, so a single codebase serves both
-//! `tokio` and `smol` runtimes.
-//!
-//! ```ignore
-//! use hick_reactor::{ServerOptions, tokio::Endpoint};
-//!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let endpoint = Endpoint::server(ServerOptions::default()).await?;
-//! let mut query = endpoint
-//!     .start_query(mdns_proto::QuerySpec::new(
-//!         mdns_proto::Name::try_from_str("_ipp._tcp.local.")?,
-//!         mdns_proto::wire::ResourceType::Any,
-//!     ))
-//!     .await?;
-//! while let Some(event) = query.next().await {
-//!     match event {
-//!         hick_reactor::QueryEvent::Answer(a) => println!("{:?}", a),
-//!         hick_reactor::QueryEvent::Terminal(_) => break,
-//!     }
-//! }
-//! # Ok(()) }
-//! ```
-
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![cfg_attr(test, deny(unsafe_code))]
 #![deny(missing_docs)]

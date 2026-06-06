@@ -1,15 +1,18 @@
 //! Configuration types passed to Endpoint/Service/Query constructors.
 
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-use core::time::Duration;
+cfg_storage! {
+  use core::time::Duration;
+}
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::records::ServiceRecords;
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-use crate::{
-  Name,
-  wire::{ResourceClass, ResourceType},
-};
+cfg_heap! {
+  use crate::records::ServiceRecords;
+}
+cfg_storage! {
+  use crate::{
+    Name,
+    wire::{ResourceClass, ResourceType},
+  };
+}
 
 /// Configuration for an `Endpoint`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -106,136 +109,126 @@ impl Default for EndpointConfig {
   }
 }
 
-/// Spec for registering a service.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ServiceSpec {
-  records: ServiceRecords,
-}
-
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-impl ServiceSpec {
-  /// Wrap a `ServiceRecords` bundle as a spec.
-  pub const fn new(records: ServiceRecords) -> Self {
-    Self { records }
+cfg_heap! {
+  /// Spec for registering a service.
+  #[derive(Debug, Clone, Eq, PartialEq)]
+  pub struct ServiceSpec {
+    records: ServiceRecords,
   }
 
-  /// Borrow the inner records.
-  #[inline(always)]
-  pub const fn records(&self) -> &ServiceRecords {
-    &self.records
-  }
+  impl ServiceSpec {
+    /// Wrap a `ServiceRecords` bundle as a spec.
+    pub const fn new(records: ServiceRecords) -> Self {
+      Self { records }
+    }
 
-  /// Consume the spec, returning the inner records.
-  #[inline(always)]
-  pub fn into_records(self) -> ServiceRecords {
-    self.records
-  }
-}
+    /// Borrow the inner records.
+    #[inline(always)]
+    pub const fn records(&self) -> &ServiceRecords {
+      &self.records
+    }
 
-/// Spec for starting a query.
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
-)]
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct QuerySpec {
-  qname: Name,
-  qtype: ResourceType,
-  qclass: ResourceClass,
-  unicast_response: bool,
-  timeout: Option<Duration>,
-  max_answers: Option<usize>,
-}
-
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
-)]
-impl QuerySpec {
-  /// Build a new spec for an mDNS query.
-  pub fn new(qname: Name, qtype: ResourceType) -> Self {
-    Self {
-      qname,
-      qtype,
-      qclass: ResourceClass::In,
-      unicast_response: false,
-      timeout: None,
-      max_answers: None,
+    /// Consume the spec, returning the inner records.
+    #[inline(always)]
+    pub fn into_records(self) -> ServiceRecords {
+      self.records
     }
   }
+}
 
-  /// The query name.
-  #[inline(always)]
-  pub fn qname(&self) -> &Name {
-    &self.qname
+cfg_storage! {
+  /// Spec for starting a query.
+  #[derive(Debug, Clone, Eq, PartialEq)]
+  pub struct QuerySpec {
+    qname: Name,
+    qtype: ResourceType,
+    qclass: ResourceClass,
+    unicast_response: bool,
+    timeout: Option<Duration>,
+    max_answers: Option<usize>,
   }
 
-  /// The query resource type.
-  #[inline(always)]
-  pub const fn qtype(&self) -> ResourceType {
-    self.qtype
-  }
+  impl QuerySpec {
+    /// Build a new spec for an mDNS query.
+    pub fn new(qname: Name, qtype: ResourceType) -> Self {
+      Self {
+        qname,
+        qtype,
+        qclass: ResourceClass::In,
+        unicast_response: false,
+        timeout: None,
+        max_answers: None,
+      }
+    }
 
-  /// The query class.
-  #[inline(always)]
-  pub const fn qclass(&self) -> ResourceClass {
-    self.qclass
-  }
+    /// The query name.
+    #[inline(always)]
+    pub fn qname(&self) -> &Name {
+      &self.qname
+    }
 
-  /// Whether to request unicast responses (RFC 6762 §5.4).
-  #[inline(always)]
-  pub const fn unicast_response(&self) -> bool {
-    self.unicast_response
-  }
+    /// The query resource type.
+    #[inline(always)]
+    pub const fn qtype(&self) -> ResourceType {
+      self.qtype
+    }
 
-  /// The absolute timeout for the query, if set.
-  #[inline(always)]
-  pub const fn timeout(&self) -> Option<Duration> {
-    self.timeout
-  }
+    /// The query class.
+    #[inline(always)]
+    pub const fn qclass(&self) -> ResourceClass {
+      self.qclass
+    }
 
-  /// Maximum number of collected answers, if explicitly overridden.
-  ///
-  /// When `None` the `Query` state machine uses its built-in default (256).
-  #[inline(always)]
-  pub const fn max_answers(&self) -> Option<usize> {
-    self.max_answers
-  }
+    /// Whether to request unicast responses (RFC 6762 §5.4).
+    #[inline(always)]
+    pub const fn unicast_response(&self) -> bool {
+      self.unicast_response
+    }
 
-  /// Override the query class.
-  #[must_use]
-  pub const fn with_qclass(mut self, v: ResourceClass) -> Self {
-    self.qclass = v;
-    self
-  }
+    /// The absolute timeout for the query, if set.
+    #[inline(always)]
+    pub const fn timeout(&self) -> Option<Duration> {
+      self.timeout
+    }
 
-  /// Request unicast responses (RFC 6762 §5.4).
-  #[must_use]
-  pub const fn with_unicast_response(mut self, v: bool) -> Self {
-    self.unicast_response = v;
-    self
-  }
+    /// Maximum number of collected answers, if explicitly overridden.
+    ///
+    /// When `None` the `Query` state machine uses its built-in default (256).
+    #[inline(always)]
+    pub const fn max_answers(&self) -> Option<usize> {
+      self.max_answers
+    }
 
-  /// Set an absolute timeout for the query.
-  #[must_use]
-  pub const fn with_timeout(mut self, v: Duration) -> Self {
-    self.timeout = Some(v);
-    self
-  }
+    /// Override the query class.
+    #[must_use]
+    pub const fn with_qclass(mut self, v: ResourceClass) -> Self {
+      self.qclass = v;
+      self
+    }
 
-  /// Override the maximum number of collected answers for this query.
-  ///
-  /// When the pool reaches `max`, the oldest entry (FIFO) is evicted to make
-  /// room.  Setting `max` to 0 disables answer collection entirely.
-  #[must_use]
-  pub const fn with_max_answers(mut self, max: usize) -> Self {
-    self.max_answers = Some(max);
-    self
+    /// Request unicast responses (RFC 6762 §5.4).
+    #[must_use]
+    pub const fn with_unicast_response(mut self, v: bool) -> Self {
+      self.unicast_response = v;
+      self
+    }
+
+    /// Set an absolute timeout for the query.
+    #[must_use]
+    pub const fn with_timeout(mut self, v: Duration) -> Self {
+      self.timeout = Some(v);
+      self
+    }
+
+    /// Override the maximum number of collected answers for this query.
+    ///
+    /// When the pool reaches `max`, the oldest entry (FIFO) is evicted to make
+    /// room.  Setting `max` to 0 disables answer collection entirely.
+    #[must_use]
+    pub const fn with_max_answers(mut self, max: usize) -> Self {
+      self.max_answers = Some(max);
+      self
+    }
   }
 }
 

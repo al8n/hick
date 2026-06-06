@@ -67,6 +67,7 @@ impl ResourceType {
     }
   }
 
+  cfg_heap! {
   /// Whether this is a standardized RR type whose RDATA contains a (potentially
   /// compressed) domain name but which this stack does NOT type-specifically
   /// parse. Per RFC 1035 §3.3 the compression-eligible
@@ -80,13 +81,13 @@ impl ResourceType {
   /// uncompressed, so genuinely-unknown opaque RDATA is safe to store verbatim.)
   ///
   /// Gated to the heap tiers: the sole caller is `Rdata::canonical_rdata_inner`
-  /// (`wire::record`, `#[cfg(any(feature = "alloc", feature = "std"))]`), so
-  /// without a matching gate this is dead code in the `heapless` / core-only
-  /// tiers and trips `#[deny(dead_code)]`.
-  #[cfg(any(feature = "alloc", feature = "std"))]
-  #[inline(always)]
-  pub(crate) const fn is_unhandled_compressible_name(self) -> bool {
-    matches!(self.to_u16(), 2 | 3 | 4 | 6 | 7 | 8 | 9 | 14 | 15 | 39)
+  /// (`wire::record`, gated on `alloc` / `std` / `no-atomic`), so without a
+  /// matching gate this is dead code in the `heapless` / core-only tiers and
+  /// trips `#[deny(dead_code)]`.
+    #[inline(always)]
+    pub(crate) const fn is_unhandled_compressible_name(self) -> bool {
+      matches!(self.to_u16(), 2 | 3 | 4 | 6 | 7 | 8 | 9 | 14 | 15 | 39)
+    }
   }
 
   /// Reconstructs a `ResourceType` from a wire-format `u16`. Always succeeds —

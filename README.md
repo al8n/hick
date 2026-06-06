@@ -93,6 +93,16 @@ engine) or `embassy` (the embassy-net async driver) — neither pulls in `std`:
 hick = { version = "0.1", default-features = false, features = ["embassy"] }
 ```
 
+On cores **without** native atomic CAS (Cortex-M0+ / thumbv6m / RP2040), use the
+`no-atomic` tier instead — `smoltcp-no-atomic` or `embassy-no-atomic` — which
+swaps the refcounted Name / rdata onto `portable-atomic` (clone via a
+`critical-section` impl your binary provides):
+
+```toml
+[dependencies]
+hick = { version = "0.1", default-features = false, features = ["embassy-no-atomic"] }
+```
+
 Each driver is also published as a standalone crate ([`hick-compio`],
 [`hick-smoltcp`], [`hick-embassy`]) if you would rather depend on it directly.
 
@@ -149,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `compio` — drive the `compio` (thread-per-core) runtime via [`hick-compio`].
 - `smoltcp` — expose the bare-metal [`hick-smoltcp`] engine (`no_std` + `alloc`).
 - `embassy` — expose the [`hick-embassy`] async driver (`no_std` + `alloc`).
+- `smoltcp-no-atomic` / `embassy-no-atomic` — the same engine / driver on the `no-atomic` tier, for cores **without** native atomic CAS (Cortex-M0+ / thumbv6m / RP2040). Refcounted Name / rdata use `portable-atomic` (clone via a `critical-section` impl your binary provides). Pick exactly one tier per engine.
 - `tracing` — forward structured `tracing` spans/events from every enabled driver and the proto core.
 - `stats` — enable `no_std`-safe atomic counters; read a snapshot via `endpoint.stats()`.
 - `metrics` — bridge counters to the [`metrics`] facade (Prometheus/StatsD exporters). Implies `stats`.

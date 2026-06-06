@@ -12,8 +12,9 @@ use crate::{name::LabelTooLongDetail, wire::*};
 // `Name`/`QueryHandle`/`ServiceHandle` are only carried by the alloc/std-gated
 // error enums below, so gate the import to match (no_std + bare no-default have
 // no `Name`).
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::{Name, QueryHandle, ServiceHandle};
+cfg_heap! {
+  use crate::{Name, QueryHandle, ServiceHandle};
+}
 
 /// Detail payload for "buffer too short": a parser ran out of bytes.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
@@ -270,21 +271,21 @@ pub enum HandleError {
   InvalidResponseCode(ResponseCode),
 }
 
-/// Errors raised by `Endpoint::try_register_service`.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-#[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
-#[try_unwrap(ref)]
-#[non_exhaustive]
-pub enum RegisterServiceError {
-  /// A service with this name is already registered.
-  #[error("service `{0}` already registered")]
-  NameAlreadyRegistered(crate::Name),
+cfg_heap! {
+  /// Errors raised by `Endpoint::try_register_service`.
+  #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
+  #[unwrap(ref)]
+  #[try_unwrap(ref)]
+  #[non_exhaustive]
+  pub enum RegisterServiceError {
+    /// A service with this name is already registered.
+    #[error("service `{0}` already registered")]
+    NameAlreadyRegistered(crate::Name),
 
-  /// The internal routing pool is full.
-  #[error(transparent)]
-  StorageFull(#[from] StorageFullError),
+    /// The internal routing pool is full.
+    #[error(transparent)]
+    StorageFull(#[from] StorageFullError),
+  }
 }
 
 /// Errors raised by `Endpoint::try_start_query`.
@@ -298,39 +299,37 @@ pub enum StartQueryError {
   StorageFull(#[from] StorageFullError),
 }
 
-/// Errors raised by
-/// [`Endpoint::handle_service_renamed`](crate::endpoint::Endpoint::handle_service_renamed).
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-#[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
-#[try_unwrap(ref)]
-#[non_exhaustive]
-pub enum HandleServiceRenamedError {
-  /// The new name is already registered to a different service.
-  #[error("name `{0}` is already registered to a different service")]
-  NameAlreadyRegistered(Name),
+cfg_heap! {
+  /// Errors raised by
+  /// [`Endpoint::handle_service_renamed`](crate::endpoint::Endpoint::handle_service_renamed).
+  #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
+  #[unwrap(ref)]
+  #[try_unwrap(ref)]
+  #[non_exhaustive]
+  pub enum HandleServiceRenamedError {
+    /// The new name is already registered to a different service.
+    #[error("name `{0}` is already registered to a different service")]
+    NameAlreadyRegistered(Name),
 
-  /// The handle does not refer to a registered service.
-  #[error("service handle {0} not found")]
-  ServiceNotFound(ServiceHandle),
-}
+    /// The handle does not refer to a registered service.
+    #[error("service handle {0} not found")]
+    ServiceNotFound(ServiceHandle),
+  }
 
-/// Errors raised by query-handle lookups on `Endpoint` (`poll_query_*`,
-/// `handle_query_timeout`, `cancel_query`, …) when the handle no longer
-/// corresponds to an active query.  A query disappears from the endpoint
-/// when its terminal update has been drained via `Endpoint::poll_query`
-/// (auto-prune) or after an explicit `Endpoint::cancel_query` call.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-#[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-#[unwrap(ref)]
-#[try_unwrap(ref)]
-#[non_exhaustive]
-pub enum CancelQueryError {
-  /// The handle does not refer to a currently registered query.
-  #[error("query handle {0} not found")]
-  QueryNotFound(QueryHandle),
+  /// Errors raised by query-handle lookups on `Endpoint` (`poll_query_*`,
+  /// `handle_query_timeout`, `cancel_query`, …) when the handle no longer
+  /// corresponds to an active query.  A query disappears from the endpoint
+  /// when its terminal update has been drained via `Endpoint::poll_query`
+  /// (auto-prune) or after an explicit `Endpoint::cancel_query` call.
+  #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
+  #[unwrap(ref)]
+  #[try_unwrap(ref)]
+  #[non_exhaustive]
+  pub enum CancelQueryError {
+    /// The handle does not refer to a currently registered query.
+    #[error("query handle {0} not found")]
+    QueryNotFound(QueryHandle),
+  }
 }
 
 #[cfg(test)]

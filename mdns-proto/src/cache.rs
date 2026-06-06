@@ -2,10 +2,9 @@
 
 use core::time::Duration;
 
-use bytes::Bytes;
-
 use crate::{
   Instant, Name, Pool,
+  backend::RdataBuf,
   trace::*,
   wire::{ResourceClass, ResourceType},
 };
@@ -22,7 +21,7 @@ pub struct CacheEntry<I: Instant> {
   /// but class != IN could corrupt the cache across protocol identity
   /// boundaries.
   rclass: ResourceClass,
-  rdata: Bytes,
+  rdata: RdataBuf,
   expires_at: I,
   /// When this record was last received / refreshed.  used to
   /// implement the RFC 6762 §10.2 "1-second grace" on cache-flush —
@@ -40,7 +39,7 @@ impl<I: Instant> CacheEntry<I> {
     name: Name,
     rtype: ResourceType,
     rclass: ResourceClass,
-    rdata: Bytes,
+    rdata: RdataBuf,
     expires_at: I,
     received_at: I,
   ) -> Self {
@@ -198,7 +197,7 @@ where
     name: Name,
     rtype: ResourceType,
     rclass: ResourceClass,
-    rdata: impl Into<Bytes>,
+    rdata: impl Into<RdataBuf>,
     ttl: Duration,
     now: I,
     cache_flush: bool,
@@ -213,7 +212,7 @@ where
       // here (the cache is empty by construction), so just bail.
       return Ok(None);
     }
-    let rdata: Bytes = rdata.into();
+    let rdata: RdataBuf = rdata.into();
     // TTL=0 → goodbye (RFC 6762 §10.1). Do NOT delete immediately: shorten the
     // matching entry to expire in ONE SECOND. This gives any responder still
     // using the record a window to rescue it (a positive-TTL re-announce before

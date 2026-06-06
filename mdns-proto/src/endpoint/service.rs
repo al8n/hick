@@ -37,7 +37,7 @@ where
     // goodbye and leave peers with stale PTR/SRV/TXT until TTL. A
     // SURVIVING rename's detached old name does NOT hold — it is reclaimed/
     // cancelled by the retain below.
-    #[cfg(any(feature = "alloc", feature = "std"))]
+    #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
     for (_, item) in self.withdrawals.iter() {
       if item.route.is_none()
         && item.holds_name
@@ -66,9 +66,9 @@ where
         // EMPTY at registration: a service has CONFIRMED-ADVERTISED nothing
         // until its first announce is delivered (then mirrored in here via
         // `note_service_advertised`).
-        #[cfg(any(feature = "alloc", feature = "std"))]
+        #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
         advertised_a: std::vec::Vec::new(),
-        #[cfg(any(feature = "alloc", feature = "std"))]
+        #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
         advertised_aaaa: std::vec::Vec::new(),
         withdrawing: false,
       })
@@ -166,7 +166,7 @@ where
       // route-attached item still owes a TTL=0 goodbye — a late goodbye would
       // then flush the same-name replacement, contradicting "no goodbye". Detached items (renamed-away OLD names) are independent of this
       // handle's route and are left to drain / be cancelled on reclaim.
-      #[cfg(any(feature = "alloc", feature = "std"))]
+      #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       self
         .withdrawals
         .retain(|(_, item)| item.route != Some(handle));
@@ -231,7 +231,7 @@ where
     // flush the renamed service's records. Treat it like a live-route
     // collision (the driver retires the renamer, whose caller re-registers). This
     // mirrors the `try_register_service` holds_name guard.
-    #[cfg(any(feature = "alloc", feature = "std"))]
+    #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
     for (_, item) in self.withdrawals.iter() {
       if item.route.is_none()
         && item.holds_name

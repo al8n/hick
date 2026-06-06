@@ -1,5 +1,33 @@
 # RELEASED
 
+## Bare-metal no-atomic tier (June 6th, 2026)
+
+Published crates: `mdns-proto` 0.2.1, `hick` 0.1.1, `hick-smoltcp` 0.1.1,
+`hick-embassy` 0.1.1.
+
+Support for bare-metal cores **without native atomic CAS** (Cortex-M0+ /
+thumbv6m / RP2040), fixing a build failure on those targets (#40). The default
+`atomic` tier is unchanged, so existing builds are unaffected.
+
+FEATURES
+
+- `mdns-proto` gains a `no-atomic` storage tier: the same alloc-backed
+  `Endpoint`, but the refcounted `Name` / rdata use `portable-atomic`'s `Arc`
+  (cheap clone via a `critical-section` impl the binary provides) instead of
+  `smol_str` + `bytes`, which require native pointer-width atomics.
+- `hick-smoltcp` and `hick-embassy` gain `atomic` (default) vs `no-atomic`
+  feature tiers. Build for RP2040-class targets with
+  `--no-default-features --features no-atomic`.
+- The `hick` facade gains `smoltcp-no-atomic` / `embassy-no-atomic` features
+  that reach the no-atomic tier through the umbrella crate.
+
+FIXES
+
+- `hick-embassy` and the rest of the bare-metal stack now build for
+  `thumbv6m-none-eabi`; previously `mdns-proto`'s alloc tier pulled `smol_str`
+  (`alloc::sync::Arc`) and `bytes` (atomic refcount), neither available without
+  native atomic CAS (#40).
+
 ## 0.1.0 (June 6th, 2026)
 
 First public release of the `hick` mDNS / DNS-SD family (the project formerly

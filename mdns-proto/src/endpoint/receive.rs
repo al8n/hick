@@ -553,9 +553,9 @@ where
     // deadlines, so the endpoint surfaces the earliest time a withdrawal needs
     // to be pumped (`next_at`) or force-completed (`ceiling_at`) — otherwise the
     // driver could park past a due goodbye round.
-    #[cfg(any(feature = "alloc", feature = "std"))]
+    #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
     let withdrawal = self.next_withdrawal_deadline();
-    #[cfg(not(any(feature = "alloc", feature = "std")))]
+    #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
     let withdrawal: Option<I> = None;
     match (cache, withdrawal) {
       (Some(c), Some(w)) => Some(c.min(w)),
@@ -564,28 +564,28 @@ where
     }
   }
 
-  /// The earliest time an in-flight withdrawal needs to be pumped (`next_at`) or
-  /// force-completed (`ceiling_at`), or `None` when no withdrawal is pending.
-  ///
-  /// Unlike [`Self::poll_timeout`] this EXCLUDES cache and query deadlines, so a
-  /// last-handle shutdown flush can sleep precisely on the next withdrawal action
-  /// — and exit as soon as none remain — instead of parking on unrelated cache
-  /// expiry (or the driver's wall-clock backstop) after every goodbye is sent.
-  #[cfg(any(feature = "alloc", feature = "std"))]
-  pub fn next_withdrawal_deadline(&self) -> Option<I> {
-    self
-      .withdrawals
-      .iter()
-      .map(|(_, w)| w.next_at.min(w.ceiling_at))
-      .min()
-  }
+  cfg_heap! {
+    /// The earliest time an in-flight withdrawal needs to be pumped (`next_at`) or
+    /// force-completed (`ceiling_at`), or `None` when no withdrawal is pending.
+    ///
+    /// Unlike [`Self::poll_timeout`] this EXCLUDES cache and query deadlines, so a
+    /// last-handle shutdown flush can sleep precisely on the next withdrawal action
+    /// — and exit as soon as none remain — instead of parking on unrelated cache
+    /// expiry (or the driver's wall-clock backstop) after every goodbye is sent.
+    pub fn next_withdrawal_deadline(&self) -> Option<I> {
+      self
+        .withdrawals
+        .iter()
+        .map(|(_, w)| w.next_at.min(w.ceiling_at))
+        .min()
+    }
 
-  /// Whether any endpoint-owned withdrawal is still in flight (its TTL=0 goodbye
-  /// not yet fully sent or force-completed). A shutdown flush loops until this is
-  /// `false`, rather than on the aggregate driver deadline.
-  #[cfg(any(feature = "alloc", feature = "std"))]
-  pub fn has_pending_withdrawals(&self) -> bool {
-    !self.withdrawals.is_empty()
+    /// Whether any endpoint-owned withdrawal is still in flight (its TTL=0 goodbye
+    /// not yet fully sent or force-completed). A shutdown flush loops until this is
+    /// `false`, rather than on the aggregate driver deadline.
+    pub fn has_pending_withdrawals(&self) -> bool {
+      !self.withdrawals.is_empty()
+    }
   }
 
   /// Drive timer-based work (cache TTL sweep).

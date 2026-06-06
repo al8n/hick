@@ -18,8 +18,9 @@ pub use srv::Srv;
 #[allow(unused_imports)]
 pub use txt::{Txt, TxtSegments};
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-use bytes::Bytes;
+cfg_heap! {
+  use crate::backend::{RdataBuf, rdata_from_vec};
+}
 
 use super::{NameRef, ResourceClass, ResourceType};
 use crate::error::{BufferTooShortDetail, ParseError, RdlengthOverrunDetail};
@@ -198,6 +199,7 @@ impl<'a> Ref<'a> {
     }
   }
 
+  cfg_heap! {
   /// Copies this record's rdata with internal DNS compression pointers
   /// EXPANDED to self-contained wire form, PRESERVING name case. PTR/SRV/NSEC
   /// rdata carries a domain name that responders — and this crate's own builder
@@ -212,8 +214,7 @@ impl<'a> Ref<'a> {
   /// For record IDENTITY comparison use [`Self::canonical_rdata_folded`], which
   /// additionally case-folds so two encodings differing only in name case (or
   /// compression) compare equal.
-  #[cfg(any(feature = "alloc", feature = "std"))]
-  pub(crate) fn canonical_rdata(&self) -> Result<Bytes, ParseError> {
+  pub(crate) fn canonical_rdata(&self) -> Result<RdataBuf, ParseError> {
     self.canonical_rdata_inner(false)
   }
 
@@ -225,23 +226,21 @@ impl<'a> Ref<'a> {
   /// case would leave a stale entry (and case variants could bloat the bounded
   /// cache). The cache never surfaces rdata for display, so folding is safe
   /// there.
-  #[cfg(any(feature = "alloc", feature = "std"))]
-  pub(crate) fn canonical_rdata_folded(&self) -> Result<Bytes, ParseError> {
+  pub(crate) fn canonical_rdata_folded(&self) -> Result<RdataBuf, ParseError> {
     self.canonical_rdata_inner(true)
   }
 
-  #[cfg(any(feature = "alloc", feature = "std"))]
-  fn canonical_rdata_inner(&self, fold_case: bool) -> Result<Bytes, ParseError> {
+  fn canonical_rdata_inner(&self, fold_case: bool) -> Result<RdataBuf, ParseError> {
     match self.rdata_view()? {
       Rdata::Ptr(p) => {
         let mut out = std::vec::Vec::new();
         p.target().write_wire(&mut out, fold_case)?;
-        Ok(Bytes::from(out))
+        Ok(rdata_from_vec(out))
       }
       Rdata::Cname(c) => {
         let mut out = std::vec::Vec::new();
         c.target().write_wire(&mut out, fold_case)?;
-        Ok(Bytes::from(out))
+        Ok(rdata_from_vec(out))
       }
       Rdata::Srv(s) => {
         let mut out = std::vec::Vec::new();
@@ -249,13 +248,13 @@ impl<'a> Ref<'a> {
         out.extend_from_slice(&s.weight().to_be_bytes());
         out.extend_from_slice(&s.port().to_be_bytes());
         s.target().write_wire(&mut out, fold_case)?;
-        Ok(Bytes::from(out))
+        Ok(rdata_from_vec(out))
       }
       Rdata::Nsec(n) => {
         let mut out = std::vec::Vec::new();
         n.next_name().write_wire(&mut out, fold_case)?;
         out.extend_from_slice(n.type_bitmap_slice());
-        Ok(Bytes::from(out))
+        Ok(rdata_from_vec(out))
       }
       // Truly-unknown types are opaque (RFC 3597 §4 forbids name compression in
       // them) so raw bytes are a stable identity — EXCEPT a well-known
@@ -266,7 +265,7 @@ impl<'a> Ref<'a> {
         if self.rtype.is_unhandled_compressible_name() {
           return Err(ParseError::UnsupportedNameBearingType(self.rtype.to_u16()));
         }
-        Ok(Bytes::copy_from_slice(bytes))
+        Ok(rdata_from_vec(bytes.to_vec()))
       }
       Rdata::Txt(t) => {
         // TXT rdata is a sequence of length-prefixed strings (RFC 6763
@@ -291,12 +290,13 @@ impl<'a> Ref<'a> {
         if !wrote_any {
           out.push(0);
         }
-        Ok(Bytes::from(out))
+        Ok(rdata_from_vec(out))
       }
       // A / AAAA carry no domain name and no internal structure — copy verbatim.
       // (`_` also satisfies the `#[non_exhaustive]` enum.)
-      _ => Ok(Bytes::copy_from_slice(self.rdata())),
+      _ => Ok(rdata_from_vec(self.rdata().to_vec())),
     }
+  }
   }
 }
 
