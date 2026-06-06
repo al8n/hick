@@ -109,7 +109,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
+          targets: thumbv7em-none-eabihf, thumbv6m-none-eabi, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p hick-smoltcp -p hick-embassy --target thumbv7em-none-eabihf
       - run: cargo check -p hick-trace --features stats --target thumbv7em-none-eabihf
@@ -126,6 +126,30 @@ jobs:
       # The `mdns-proto` no_std + alloc tier must also build for wasm32 (claimed in
       # its feature-tier table); the thumbv7em check above does not exercise it.
       - run: cargo check -p mdns-proto --no-default-features --features alloc --target wasm32-unknown-unknown
+      # No-atomic bare-metal tier (issue #40): Cortex-M0+ / thumbv6m-none-eabi
+      # (RP2040) has NO native atomic CAS, so the default `atomic` tier — smol_str's
+      # `Arc`, bytes' atomic refcount — cannot build there. The `no-atomic` feature
+      # swaps the refcounted Name / rdata onto `portable_atomic_util::Arc` (CAS via a
+      # `critical-section` impl the binary provides) while keeping the alloc-backed
+      # Endpoint. thumbv7em above HAS atomics, so it does not exercise this path.
+      - run: cargo check -p mdns-proto --no-default-features --features no-atomic,slab --target thumbv6m-none-eabi
+      - run: cargo check -p hick-smoltcp --no-default-features --features no-atomic --target thumbv6m-none-eabi
+      - run: cargo check -p hick-embassy --no-default-features --features no-atomic --target thumbv6m-none-eabi
+      # The `hick` umbrella crate must also reach the no-atomic tier on thumbv6m
+      # (`embassy-no-atomic` pulls `smoltcp-no-atomic` + the driver no-atomic tiers).
+      - run: cargo check -p hick --no-default-features --features embassy-no-atomic --target thumbv6m-none-eabi
+      # Feature-fence guards for contradictory bare-metal combinations (issue #40
+      # review). A featureless `hick` build has no driver and no proto storage tier,
+      # so it must fail with the crate's own compile_error (the `!` inverts the exit
+      # code, like the `embassy,metrics` guard above).
+      - run: "! cargo check -p hick --no-default-features 2>/dev/null"
+      # `no-atomic` + `heapless` is an additive combination; `no-atomic` outranks
+      # `heapless` and must resolve cleanly (no duplicate `Name` impls).
+      - run: cargo check -p mdns-proto --no-default-features --features no-atomic,heapless --target thumbv6m-none-eabi
+      # `stats` implies the atomic tier (it needs `alloc`), so combining it with the
+      # no-atomic facade tier on thumbv6m must fail loudly — there is no native
+      # atomic CAS for `bytes` / `smol_str` (same shape as `embassy,metrics`).
+      - run: "! cargo check -p hick --no-default-features --features embassy-no-atomic,stats --target thumbv6m-none-eabi 2>/dev/null"
 
   doc:
     runs-on: ubuntu-latest

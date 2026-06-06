@@ -286,6 +286,7 @@ mod heapless_impl {
 }
 
 #[cfg(feature = "heapless")]
+#[cfg_attr(docsrs, doc(cfg(feature = "heapless")))]
 pub use heapless_impl::HeaplessCapacityError;
 
 #[cfg(test)]

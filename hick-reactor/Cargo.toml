@@ -26,27 +26,38 @@ stats = ["mdns-proto/stats", "hick-trace/stats"]
 bytes = { workspace = true, features = ["default"] }
 mdns-proto = { workspace = true, features = ["std", "slab"] }
 hick-udp.workspace = true
-hick-trace = { workspace = true }
-tracing = { workspace = true, optional = true, features = ["attributes", "std"] }
+hick-trace.workspace = true
+tracing = { workspace = true, optional = true, features = [
+  "attributes",
+  "std",
+] }
 agnostic-net = { version = "0.3" }
 agnostic-lite = { version = "0.6" }
 async-channel = "2"
 futures = { workspace = true, features = ["std", "async-await"] }
-getifs = { workspace = true }
+getifs.workspace = true
 pin-project-lite = "0.2"
-rand = { workspace = true, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
+rand = { workspace = true, features = [
+  "std",
+  "std_rng",
+  "sys_rng",
+  "thread_rng",
+] }
 slab = { workspace = true, features = ["std"] }
 smol_str = { workspace = true, features = ["std"] }
 thiserror = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 agnostic-net = { version = "0.3", features = ["tokio", "smol"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
-tracing-core = { workspace = true }
-ctor = { workspace = true }
+tracing-subscriber = { version = "0.3", features = [
+  "env-filter",
+  "tracing-log",
+] }
+tracing-core.workspace = true
+ctor.workspace = true
 tokio = { version = "1", features = ["full"] }
 smol = "2"
-getifs = { workspace = true }
+getifs.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

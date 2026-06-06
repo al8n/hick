@@ -106,6 +106,7 @@ impl<'a> NameRef<'a> {
     self.start
   }
 
+  cfg_heap! {
   /// Writes this name's labels in DNS wire form (`len`-octet + label bytes …,
   /// terminating root `0x00`), following any compression pointers so the
   /// result is SELF-CONTAINED — it no longer references the source message.
@@ -122,38 +123,38 @@ impl<'a> NameRef<'a> {
   /// [`ParseError::NameTooLong`] from `label?` below; the redundant tally here
   /// is kept as defense-in-depth. Also errors if the label iterator is
   /// malformed (pointer cycle, forward pointer, or truncation).
-  #[cfg(any(feature = "alloc", feature = "std"))]
-  pub(crate) fn write_wire(
-    &self,
-    out: &mut std::vec::Vec<u8>,
-    fold_case: bool,
-  ) -> Result<(), crate::error::ParseError> {
-    let mut encoded = 1usize; // the trailing root terminator
-    for label in self.labels() {
-      let label = label?;
-      if label.is_empty() {
-        break; // root; terminator appended below
+    pub(crate) fn write_wire(
+      &self,
+      out: &mut std::vec::Vec<u8>,
+      fold_case: bool,
+    ) -> Result<(), crate::error::ParseError> {
+      let mut encoded = 1usize; // the trailing root terminator
+      for label in self.labels() {
+        let label = label?;
+        if label.is_empty() {
+          break; // root; terminator appended below
+        }
+        let len = label.len().min(usize::from(MAX_LABEL_BYTES));
+        encoded = encoded.saturating_add(1usize.saturating_add(len));
+        if encoded > MAX_NAME_BYTES {
+          return Err(crate::error::ParseError::NameTooLong(encoded));
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        out.push(len as u8);
+        if fold_case {
+          out.extend(
+            label
+              .iter()
+              .take(usize::from(MAX_LABEL_BYTES))
+              .map(u8::to_ascii_lowercase),
+          );
+        } else {
+          out.extend(label.iter().take(usize::from(MAX_LABEL_BYTES)).copied());
+        }
       }
-      let len = label.len().min(usize::from(MAX_LABEL_BYTES));
-      encoded = encoded.saturating_add(1usize.saturating_add(len));
-      if encoded > MAX_NAME_BYTES {
-        return Err(crate::error::ParseError::NameTooLong(encoded));
-      }
-      #[allow(clippy::cast_possible_truncation)]
-      out.push(len as u8);
-      if fold_case {
-        out.extend(
-          label
-            .iter()
-            .take(usize::from(MAX_LABEL_BYTES))
-            .map(u8::to_ascii_lowercase),
-        );
-      } else {
-        out.extend(label.iter().take(usize::from(MAX_LABEL_BYTES)).copied());
-      }
+      out.push(0);
+      Ok(())
     }
-    out.push(0);
-    Ok(())
   }
 
   /// Compares two names case-insensitively (mDNS rule, RFC 6762 §16).

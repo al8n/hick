@@ -26,16 +26,26 @@
   )
 )]
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[cfg(all(not(feature = "std"), any(feature = "alloc", feature = "no-atomic")))]
 extern crate alloc as std;
 
 #[cfg(feature = "std")]
 extern crate std;
 
+// `cfg_heap!` / `cfg_storage!` / `cfg_stats!` — declared first so they are in
+// textual scope for every module below.
+#[macro_use]
+mod macros;
+
 /// Protocol-level constants (RFC 1035 + RFC 6762 limits).
 pub mod constants;
 
 mod trace;
+
+cfg_heap! {
+  // Refcounted byte / `Arc` storage-backend aliases (atomic vs portable-atomic).
+  mod backend;
+}
 
 /// Pluggable backing storage for protocol state machines.
 pub mod pool;
@@ -61,12 +71,10 @@ pub mod name;
 
 pub use name::{LabelTooLongDetail, NameError, NameTooLongDetail};
 
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
-)]
-pub use name::Name;
+cfg_storage! {
+  /// Owned, canonical DNS name root re-export.
+  pub use name::Name;
+}
 
 /// Cross-cutting error types.
 pub mod error;
@@ -77,9 +85,9 @@ pub use error::{
   TransmitError,
 };
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub use error::{CancelQueryError, HandleServiceRenamedError, RegisterServiceError};
+cfg_heap! {
+  pub use error::{CancelQueryError, HandleServiceRenamedError, RegisterServiceError};
+}
 
 /// mDNS wire format — panic-free parser and encoder.
 pub mod wire;
@@ -95,70 +103,50 @@ pub use event::{
 };
 pub use transmit::Transmit;
 
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
-)]
-pub use event::{ServiceRenamed, ServiceUpdate};
+cfg_storage! {
+  pub use event::{ServiceRenamed, ServiceUpdate};
+}
 
 /// Configuration types.
 pub mod config;
-/// Records published by a registered Service.
-#[cfg(any(feature = "alloc", feature = "std"))]
-pub mod records;
+
+cfg_heap! {
+  /// Records published by a registered Service.
+  pub mod records;
+}
 
 pub use config::EndpointConfig;
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub use records::ServiceRecords;
+cfg_heap! {
+  pub use records::ServiceRecords;
+  pub use config::ServiceSpec;
+}
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub use config::ServiceSpec;
+cfg_storage! {
+  pub use config::QuerySpec;
+}
 
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
-)]
-pub use config::QuerySpec;
-
-/// Passive record cache.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub mod cache;
-
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub use cache::{Cache, CacheEntry};
+cfg_heap! {
+  /// Passive record cache.
+  pub mod cache;
+  pub use cache::{Cache, CacheEntry};
+}
 
 /// Service state machine.
 pub mod service;
 
 pub use service::ServiceState;
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub use service::Service;
+cfg_heap! {
+  pub use service::Service;
 
-/// Query state machine.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub mod query;
+  /// Query state machine.
+  pub mod query;
+  pub use query::{CollectedAnswer, Query};
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub use query::{CollectedAnswer, Query};
-
-/// Endpoint orchestrator.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub mod endpoint;
-
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub use endpoint::{
-  Endpoint, EndpointEventEntry, RouteEvents, ServiceRoute, WithdrawalSend, WithdrawalToken,
-};
+  /// Endpoint orchestrator.
+  pub mod endpoint;
+  pub use endpoint::{
+    Endpoint, EndpointEventEntry, RouteEvents, ServiceRoute, WithdrawalSend, WithdrawalToken,
+  };
+}

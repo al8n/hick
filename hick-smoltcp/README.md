@@ -73,8 +73,10 @@ loop {
 
 | Feature | Description |
 |---------|-------------|
+| `atomic` *(default)* | The native-atomic alloc tier: `SmolStr` names + `Bytes` rdata. Needs pointer-width atomics. |
+| `no-atomic` | For cores **without** native atomic CAS (Cortex-M0+ / thumbv6m / RP2040): swaps the refcounted Name / rdata onto `portable-atomic`'s `Arc` (clone via a `critical-section` impl your binary provides), keeping the alloc-backed pools. Build with `--no-default-features --features no-atomic`. |
 | `tracing` | Forward structured `tracing` events from `mdns-proto` (requires a `std` subscriber; a no-op on bare-metal without one). |
-| `stats` | Enable `no_std`-safe atomic counters; read a snapshot via `engine.stats()`. |
+| `stats` | Enable `no_std`-safe atomic counters; read a snapshot via `engine.stats()`. Implies `atomic`. |
 | `defmt` | Emit `defmt` log events — the idiomatic choice for bare-metal targets. |
 
 ## Observability

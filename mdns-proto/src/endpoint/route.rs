@@ -160,7 +160,7 @@ where
       // withdrawing/errored contexts), letting a peer flood the proto event slab of
       // a retiring service until GC — a bounded-time but unbounded-size growth path
       //. Mirrors the question-dispatch and known-answer skips.
-      #[cfg(any(feature = "alloc", feature = "std"))]
+      #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       if route.withdrawing {
         continue;
       }
@@ -261,7 +261,7 @@ where
             // draining) — never route an incoming question to it, or it could
             // emit a positive-TTL answer contradicting its own TTL=0 goodbye.
             // The route is still present for the name guard, just not answered.
-            #[cfg(any(feature = "alloc", feature = "std"))]
+            #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
             if route.withdrawing {
               continue;
             }
@@ -406,7 +406,7 @@ where
                 // A withdrawing route's service is being torn down — never route a
                 // known-answer to it either, matching the question-dispatch and
                 // conflict skips (no dispatch after retirement).
-                #[cfg(any(feature = "alloc", feature = "std"))]
+                #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
                 if route.withdrawing {
                   continue;
                 }

@@ -2,13 +2,17 @@
 //! calls when the `tracing` Cargo feature is enabled, and to token-discarding
 //! no-ops otherwise.
 //!
-//! The re-exports are only compiled when at least one of `std` or `alloc` is
-//! active — those are the only build tiers that have call sites.
+//! The re-exports are only compiled when at least one of `std`, `alloc`, or
+//! `no-atomic` is active — those are the only build tiers that have call sites.
 
-#[cfg(any(feature = "std", feature = "alloc"))]
-pub(crate) use hick_trace::{debug, trace, warn};
+cfg_heap! {
+  pub(crate) use hick_trace::{debug, trace, warn};
+}
 
-#[cfg(all(any(feature = "std", feature = "alloc"), feature = "tracing"))]
+#[cfg(all(
+  any(feature = "alloc", feature = "std", feature = "no-atomic"),
+  feature = "tracing"
+))]
 pub(crate) use hick_trace::trace_span;
 
 /// Test-only coverage support for the tracing instrumentation.

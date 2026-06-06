@@ -1,21 +1,23 @@
-//! Records published by a registered [`Service`](crate::service::Service).
+//! Records published by a registered [`Service`].
 //!
 //! `ServiceRecords` is the durable, post-validation bundle: a name, A/AAAA
 //! addresses, the SRV target/port, and the TXT segments. Building the wire
 //! response is then a mechanical traversal.
 
-use crate::Name;
-use bytes::Bytes;
+use crate::{
+  Name,
+  backend::{RdataBuf, Shared, rdata_from_vec},
+};
 use core::net::{Ipv4Addr, Ipv6Addr};
-use std::{sync::Arc, vec::Vec};
+use std::vec::Vec;
 
-/// Append `item` to a read-only `Arc<[T]>`, returning a freshly sealed slice.
+/// Append `item` to a read-only `Shared<[T]>`, returning a freshly sealed slice.
 /// `ServiceRecords`' collections are built incrementally via the `add_*`
 /// builders then frozen, so the O(n) reseal per append is paid only at build
 /// time (n is a handful of addresses / subtypes) — in exchange the derived
 /// `ServiceRecords::clone` is O(1) on the withdrawal-snapshot and rename-handoff
 /// paths, which previously deep-copied all five collections.
-fn arc_push<T: Clone>(slice: &[T], item: T) -> Arc<[T]> {
+fn arc_push<T: Clone>(slice: &[T], item: T) -> Shared<[T]> {
   slice
     .iter()
     .cloned()
@@ -35,8 +37,8 @@ pub struct ServiceRecords {
   port: u16,
   priority: u16,
   weight: u16,
-  a_addrs: Arc<[Ipv4Addr]>,
-  aaaa_addrs: Arc<[Ipv6Addr]>,
+  a_addrs: Shared<[Ipv4Addr]>,
+  aaaa_addrs: Shared<[Ipv6Addr]>,
   /// Parallel to `aaaa_addrs`: per-AAAA interface scope id (0 = "any").
   ///
   /// Used by [`Endpoint`](crate::endpoint::Endpoint) to disambiguate IPv6
@@ -45,14 +47,14 @@ pub struct ServiceRecords {
   /// the same link-local on a different interface would be wrongly
   /// classified as self.  Set via [`Self::add_aaaa_scoped`].  Always the
   /// same length as `aaaa_addrs`.
-  aaaa_scopes: Arc<[u32]>,
-  txt: Arc<[Bytes]>,
+  aaaa_scopes: Shared<[u32]>,
+  txt: Shared<[RdataBuf]>,
   /// RFC 6763 §7.1 subtype browse names, e.g. `_printer._sub._ipp._tcp.local.`.
   /// Each is the full `<sub>._sub.<service_type>` name (derived from
   /// `service_type` at [`Self::add_subtype`] time, so it survives an instance
   /// rename — the service type does not change). The service emits a shared PTR
   /// `<browse_name> -> instance` for each, and answers browse queries for them.
-  subtypes: Arc<[Name]>,
+  subtypes: Shared<[Name]>,
   ttl_secs: u32,
 }
 
@@ -70,11 +72,11 @@ impl ServiceRecords {
       port,
       priority: 0,
       weight: 0,
-      a_addrs: Arc::from([]),
-      aaaa_addrs: Arc::from([]),
-      aaaa_scopes: Arc::from([]),
-      txt: Arc::from([]),
-      subtypes: Arc::from([]),
+      a_addrs: Shared::from([]),
+      aaaa_addrs: Shared::from([]),
+      aaaa_scopes: Shared::from([]),
+      txt: Shared::from([]),
+      subtypes: Shared::from([]),
       ttl_secs,
     }
   }
@@ -148,7 +150,9 @@ impl ServiceRecords {
 
   /// TXT segments as an iterator over byte slices.
   pub fn txt_segments(&self) -> impl Iterator<Item = &[u8]> {
-    self.txt.iter().map(Bytes::as_ref)
+    // `|b| b.as_ref()` (not `Bytes::as_ref`) so this compiles for both the
+    // `bytes::Bytes` and no-atomic `Arc<[u8]>` `RdataBuf` flavors.
+    self.txt.iter().map(|b| b.as_ref())
   }
 
   /// Append an IPv4 address.
@@ -187,7 +191,7 @@ impl ServiceRecords {
 
   /// Append a TXT segment.
   pub fn add_txt_segment(&mut self, segment: Vec<u8>) -> &mut Self {
-    self.txt = arc_push(&self.txt, segment.into());
+    self.txt = arc_push(&self.txt, rdata_from_vec(segment));
     self
   }
 

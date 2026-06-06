@@ -1,19 +1,17 @@
-//! `hick-smoltcp` — runtime-agnostic mDNS / DNS-SD engine over smoltcp.
-//!
-//! This crate wires the Sans-I/O protocol core ([`mdns_proto`]) to smoltcp's
-//! UDP sockets without assuming an async runtime: it exposes a synchronous
-//! *pump* over a small [`UdpIo`] transport seam. `hick-embassy` builds on it
-//! for the embassy async runtime; a bare poll loop or RTIC can drive it
-//! directly.
-//!
-//! `no_std` + `alloc` — the [`mdns_proto`] `Endpoint` requires a heap.
-
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
 extern crate alloc;
+
+// At least one storage tier must be active. `atomic` (default) and `no-atomic`
+// select different mdns-proto Name/rdata backends; if both are enabled (e.g.
+// `--all-features`) `atomic` wins via mdns-proto's backend precedence, so the
+// no-atomic build must use `--no-default-features --features no-atomic`.
+#[cfg(not(any(feature = "atomic", feature = "no-atomic")))]
+compile_error!("hick-smoltcp: enable one storage tier — `atomic` (default) or `no-atomic`");
 
 pub mod constants;
 pub mod engine;

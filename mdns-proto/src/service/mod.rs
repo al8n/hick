@@ -1,500 +1,485 @@
 //! Service state machine — probing, announcing, response generation.
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::trace::*;
+cfg_heap! {
+  use crate::trace::*;
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-mod respond;
+  mod respond;
+}
 mod schedule;
 mod state;
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-use bytes::Bytes;
-
-/// Which of OUR owner names a known-answer's record name matched. §7.1
-/// suppression is per RRset, and an RRset is identified by (name, type, class,
-/// rdata). A known-answer with our rtype + rdata but a DIFFERENT owner name is a
-/// DIFFERENT RRset and must NOT suppress our record — otherwise a querier could
-/// silence our `host.local A x` by sending a same-rdata `_svc._tcp.local A x`.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KasOwner {
-  /// The shared service-type name (owns the PTR).
-  ServiceType,
-  /// The service instance name (owns SRV + TXT).
-  Instance,
-  /// The host name (owns A + AAAA).
-  Host,
+cfg_heap! {
+  use crate::backend::{RdataBuf, rdata_from_vec};
 }
 
-/// A single observed known-answer hint. KAS suppression checks records
-/// against this list before emitting.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[derive(Debug, Clone, Copy)]
-struct KasHint<I> {
-  owner: KasOwner,
-  rtype: crate::wire::ResourceType,
-  rdata_hash: u64,
-  expires_at: I,
-}
-
-/// Number of KAS hints we'll remember at once (per service).
-#[cfg(any(feature = "alloc", feature = "std"))]
-const KAS_RING_SIZE: usize = 16;
-
-/// Cap on the number of distinct questioner sources tracked per
-/// response cycle.  Mirrors `MAX_PEER_PROBES` — bursts of
-/// queries from more than this many distinct sources within one
-/// jitter window get the excess sources rejected (no hint storage
-/// for them), which is conservative but bounded.
-#[cfg(any(feature = "alloc", feature = "std"))]
-const MAX_QUESTIONER_SRCS: usize = 8;
-
-/// Maximum legacy unicast responses queued per response cycle. Each
-/// distinct legacy querier gets its own reply; beyond this cap, excess legacy
-/// queriers in the same window are dropped (bounded against a flood).
-#[cfg(any(feature = "alloc", feature = "std"))]
-const MAX_LEGACY_RESPONSES: usize = 8;
-
-/// A pending RFC 6762 §6.7 legacy unicast response: a non-mDNS querier (source
-/// port != 5353) gets a direct reply that echoes its query ID + question.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[derive(Debug, Clone)]
-struct LegacyResp {
-  dst: core::net::SocketAddr,
-  query_id: u16,
-  /// The matched owned name to echo in the response's question section (our
-  /// own canonical name; case-insensitively equal to the querier's qname). For
-  /// a meta reply (`is_meta`) this is the `_services._dns-sd._udp.<domain>`
-  /// meta-query name.
-  name: crate::Name,
-  qtype: crate::wire::ResourceType,
-  qclass: crate::wire::ResourceClass,
-  /// this is an RFC 6763 §9 service-type enumeration reply — emit the
-  /// shared meta-PTR (`<meta> -> service_type`) rather than the instance record
-  /// set. A legacy resolver isn't on the multicast group, so the §9 reply it
-  /// needs must go out as a unicast echo too.
-  is_meta: bool,
-}
-
-/// Maximum number of peer-probe records buffered per source for a single
-/// tiebreak decision (RFC §8.2). Incoming records beyond this cap are silently
-/// dropped.
-#[cfg(any(feature = "alloc", feature = "std"))]
-const MAX_PEER_PROBE_RECORDS: usize = 16;
-
-/// Maximum number of distinct peer sources we track per tiebreak round.
-/// Records from sources beyond this cap are silently dropped.
-#[cfg(any(feature = "alloc", feature = "std"))]
-const MAX_PEER_PROBES: usize = 8;
-
-/// minimum interval between conflict-driven re-probes of an
-/// Established/Announcing service (RFC 6762 §9 conflict rate-limiting). A
-/// conflict flood cannot reset us to Probing faster than this, so a hostile
-/// peer cannot prevent the service from ever (re)establishing.
-#[cfg(any(feature = "alloc", feature = "std"))]
-const CONFLICT_REPROBE_MIN_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
-
-/// One record from a peer's simultaneous probe, retained for the RFC §8.2
-/// tiebreak comparison (lexicographic comparison of proposed RR sets).
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[derive(Debug, Clone)]
-struct PeerRecord {
-  rtype: crate::wire::ResourceType,
-  /// Canonical byte form of the rdata (same encoding used by KAS hashing).
-  canonical: Bytes,
-}
-
-/// A per-source bucket of probe records observed during the current probe round.
-/// Each distinct peer source gets its own bucket so that the RFC §8.2 tiebreak
-/// compares against each peer independently (we lose if ANY peer wins).
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[derive(Debug)]
-struct PeerProbe {
-  src: core::net::SocketAddr,
-  records: std::vec::Vec<PeerRecord>,
-}
-
-/// Write a DNS name in canonical wire form (length-prefixed labels, root
-/// terminator). Used for SRV target encoding in RFC §8.2 tiebreak comparison.
-/// This produces byte-identical output for both OUR outgoing SRV and for a
-/// peer SRV parsed via `canonical_rdata_for_hash`, ensuring the bytewise
-/// comparison is correct.
-#[cfg(any(feature = "alloc", feature = "std"))]
-fn write_canonical_wire_name(name_str: &str, out: &mut std::vec::Vec<u8>) {
-  let trimmed = match name_str.strip_suffix('.') {
-    Some(t) => t,
-    None => name_str,
-  };
-  if trimmed.is_empty() {
-    out.push(0);
-    return;
+cfg_heap! {
+  /// Which of OUR owner names a known-answer's record name matched. §7.1
+  /// suppression is per RRset, and an RRset is identified by (name, type, class,
+  /// rdata). A known-answer with our rtype + rdata but a DIFFERENT owner name is a
+  /// DIFFERENT RRset and must NOT suppress our record — otherwise a querier could
+  /// silence our `host.local A x` by sending a same-rdata `_svc._tcp.local A x`.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  enum KasOwner {
+    /// The shared service-type name (owns the PTR).
+    ServiceType,
+    /// The service instance name (owns SRV + TXT).
+    Instance,
+    /// The host name (owns A + AAAA).
+    Host,
   }
-  for label in trimmed.split('.') {
-    if label.is_empty() {
-      continue;
+
+  /// A single observed known-answer hint. KAS suppression checks records
+  /// against this list before emitting.
+  #[derive(Debug, Clone, Copy)]
+  struct KasHint<I> {
+    owner: KasOwner,
+    rtype: crate::wire::ResourceType,
+    rdata_hash: u64,
+    expires_at: I,
+  }
+
+  /// Number of KAS hints we'll remember at once (per service).
+  const KAS_RING_SIZE: usize = 16;
+
+  /// Cap on the number of distinct questioner sources tracked per
+  /// response cycle.  Mirrors `MAX_PEER_PROBES` — bursts of
+  /// queries from more than this many distinct sources within one
+  /// jitter window get the excess sources rejected (no hint storage
+  /// for them), which is conservative but bounded.
+  const MAX_QUESTIONER_SRCS: usize = 8;
+
+  /// Maximum legacy unicast responses queued per response cycle. Each
+  /// distinct legacy querier gets its own reply; beyond this cap, excess legacy
+  /// queriers in the same window are dropped (bounded against a flood).
+  const MAX_LEGACY_RESPONSES: usize = 8;
+
+  /// A pending RFC 6762 §6.7 legacy unicast response: a non-mDNS querier (source
+  /// port != 5353) gets a direct reply that echoes its query ID + question.
+  #[derive(Debug, Clone)]
+  struct LegacyResp {
+    dst: core::net::SocketAddr,
+    query_id: u16,
+    /// The matched owned name to echo in the response's question section (our
+    /// own canonical name; case-insensitively equal to the querier's qname). For
+    /// a meta reply (`is_meta`) this is the `_services._dns-sd._udp.<domain>`
+    /// meta-query name.
+    name: crate::Name,
+    qtype: crate::wire::ResourceType,
+    qclass: crate::wire::ResourceClass,
+    /// this is an RFC 6763 §9 service-type enumeration reply — emit the
+    /// shared meta-PTR (`<meta> -> service_type`) rather than the instance record
+    /// set. A legacy resolver isn't on the multicast group, so the §9 reply it
+    /// needs must go out as a unicast echo too.
+    is_meta: bool,
+  }
+
+  /// Maximum number of peer-probe records buffered per source for a single
+  /// tiebreak decision (RFC §8.2). Incoming records beyond this cap are silently
+  /// dropped.
+  const MAX_PEER_PROBE_RECORDS: usize = 16;
+
+  /// Maximum number of distinct peer sources we track per tiebreak round.
+  /// Records from sources beyond this cap are silently dropped.
+  const MAX_PEER_PROBES: usize = 8;
+
+  /// minimum interval between conflict-driven re-probes of an
+  /// Established/Announcing service (RFC 6762 §9 conflict rate-limiting). A
+  /// conflict flood cannot reset us to Probing faster than this, so a hostile
+  /// peer cannot prevent the service from ever (re)establishing.
+  const CONFLICT_REPROBE_MIN_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
+
+  /// One record from a peer's simultaneous probe, retained for the RFC §8.2
+  /// tiebreak comparison (lexicographic comparison of proposed RR sets).
+  #[derive(Debug, Clone)]
+  struct PeerRecord {
+    rtype: crate::wire::ResourceType,
+    /// Canonical byte form of the rdata (same encoding used by KAS hashing).
+    canonical: RdataBuf,
+  }
+
+  /// A per-source bucket of probe records observed during the current probe round.
+  /// Each distinct peer source gets its own bucket so that the RFC §8.2 tiebreak
+  /// compares against each peer independently (we lose if ANY peer wins).
+  #[derive(Debug)]
+  struct PeerProbe {
+    src: core::net::SocketAddr,
+    records: std::vec::Vec<PeerRecord>,
+  }
+}
+
+cfg_heap! {
+  /// Write a DNS name in canonical wire form (length-prefixed labels, root
+  /// terminator). Used for SRV target encoding in RFC §8.2 tiebreak comparison.
+  /// This produces byte-identical output for both OUR outgoing SRV and for a
+  /// peer SRV parsed via `canonical_rdata_for_hash`, ensuring the bytewise
+  /// comparison is correct.
+  fn write_canonical_wire_name(name_str: &str, out: &mut std::vec::Vec<u8>) {
+    let trimmed = match name_str.strip_suffix('.') {
+      Some(t) => t,
+      None => name_str,
+    };
+    if trimmed.is_empty() {
+      out.push(0);
+      return;
     }
-    let len = label.len().min(63);
-    #[allow(clippy::cast_possible_truncation)]
-    out.push(len as u8);
-    for &b in label.as_bytes().iter().take(63) {
-      out.push(b.to_ascii_lowercase());
+    for label in trimmed.split('.') {
+      if label.is_empty() {
+        continue;
+      }
+      let len = label.len().min(63);
+      #[allow(clippy::cast_possible_truncation)]
+      out.push(len as u8);
+      for &b in label.as_bytes().iter().take(63) {
+        out.push(b.to_ascii_lowercase());
+      }
     }
+    out.push(0); // root terminator
   }
-  out.push(0); // root terminator
+
+  /// FNV-1a hash of rdata bytes — used to dedupe KAS hints without storing rdata.
+  fn hash_rdata(bytes: &[u8]) -> u64 {
+    const FNV_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h: u64 = FNV_BASIS;
+    for &b in bytes {
+      h ^= b as u64;
+      h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+  }
 }
 
-/// FNV-1a hash of rdata bytes — used to dedupe KAS hints without storing rdata.
-#[cfg(any(feature = "alloc", feature = "std"))]
-fn hash_rdata(bytes: &[u8]) -> u64 {
-  const FNV_BASIS: u64 = 0xcbf29ce484222325;
-  const FNV_PRIME: u64 = 0x100000001b3;
-  let mut h: u64 = FNV_BASIS;
-  for &b in bytes {
-    h ^= b as u64;
-    h = h.wrapping_mul(FNV_PRIME);
-  }
-  h
+cfg_heap! {
+  #[allow(unused_imports)]
+  pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye};
 }
-
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[allow(unused_imports)]
-pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye};
 #[allow(unused_imports)]
 pub(crate) use schedule::{announce_deadline, probe_deadline, re_announce_deadline};
 pub use state::ServiceState;
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-use rand::SeedableRng;
+cfg_heap! {
+  use rand::SeedableRng;
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::error::{HandleTimeoutError, TransmitError};
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::event::{ServiceEvent, ServiceUpdate};
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::records::ServiceRecords;
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::transmit::Transmit;
-#[cfg(any(feature = "alloc", feature = "std"))]
-use crate::{Instant, Pool, ServiceHandle};
+  use crate::error::{HandleTimeoutError, TransmitError};
+  use crate::event::{ServiceEvent, ServiceUpdate};
+  use crate::records::ServiceRecords;
+  use crate::transmit::Transmit;
+  use crate::{Instant, Pool, ServiceHandle};
 
-#[cfg(any(feature = "alloc", feature = "std"))]
-type Rng = rand::rngs::StdRng;
-
-/// Build a new instance-name string by appending (or replacing) a `-N` suffix
-/// on the first DNS label.
-///
-/// `current` is the full FQDN of the instance (e.g. `"myprinter._ipp._tcp.local."`).
-/// `attempt` is the rename counter (1, 2, …).
-///
-/// For a name like `"myprinter._ipp._tcp.local."` and attempt `2` the result
-/// is `"myprinter-2._ipp._tcp.local."`.  Any existing `-N` suffix on the
-/// instance label is stripped first so repeated conflicts don't accumulate.
-#[cfg(any(feature = "alloc", feature = "std"))]
-fn rename_with_suffix(current: &str, attempt: u32) -> std::string::String {
-  use std::string::ToString;
-  // Strip optional trailing dot so we can work with the plain label sequence.
-  let (body, trailing_dot) = match current.strip_suffix('.') {
-    Some(b) => (b, true),
-    None => (current, false),
-  };
-  // Split off the first label (the instance name) from the rest of the FQDN.
-  let (instance, rest) = match body.split_once('.') {
-    Some((i, r)) => (i, Some(r)),
-    None => (body, None),
-  };
-  // Strip any existing "-N" suffix from the instance label.
-  let base_instance = match instance.rsplit_once('-') {
-    Some((prefix, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => prefix,
-    _ => instance,
-  };
-  let mut out = std::string::String::new();
-  out.push_str(base_instance);
-  out.push('-');
-  out.push_str(&attempt.to_string());
-  if let Some(r) = rest {
-    out.push('.');
-    out.push_str(r);
-  }
-  if trailing_dot {
-    out.push('.');
-  }
-  out
+  type Rng = rand::rngs::StdRng;
 }
 
-/// RFC 6762 §8.2 tiebreak comparison.
-///
-/// Returns `true` if WE should lose (i.e. we must rename): the peer's
-/// proposed RR set is lexicographically >= ours when both sets are
-/// sorted and concatenated in canonical form. A tie (equal sets) also
-/// counts as a loss (§8.2.1 — "the host MUST rename itself").
-///
-/// Compares against EACH peer bucket independently; returns `true` (we lose)
-/// if ANY single peer's set is >= ours. This prevents a peer that claims a
-/// smaller set from masking a different peer that actually wins.
-///
-/// The local set is restricted to records owned by the service INSTANCE
-/// (SRV + TXT only) per RFC §8.2, which compares records "owned by the
-/// conflicting name". A/AAAA records are owned by the host name and are
-/// excluded from both sides.
-#[cfg(any(feature = "alloc", feature = "std"))]
-fn compare_rr_sets_we_lose(
-  our: &crate::records::ServiceRecords,
-  peer_probes: &[PeerProbe],
-) -> bool {
-  // Build OUR canonical RR set restricted to SRV + TXT (instance-owned records).
-  // RFC §8.2 says compare records owned by the conflicting NAME; the conflicting
-  // name is the service instance, which owns SRV and TXT — NOT A/AAAA (those
-  // are owned by the host name).
-  let mut our_set: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
-  // SRV — priority(2 BE) + weight(2 BE) + port(2 BE) + wire-form target name.
-  // Wire form: length-octet + label bytes, repeated, terminated by 0x00.
-  {
-    let mut buf = std::vec::Vec::new();
-    buf.extend_from_slice(&crate::wire::ResourceType::Srv.to_u16().to_be_bytes());
-    buf.extend_from_slice(&our.priority().to_be_bytes());
-    buf.extend_from_slice(&our.weight().to_be_bytes());
-    buf.extend_from_slice(&our.port().to_be_bytes());
-    write_canonical_wire_name(our.host().as_str(), &mut buf);
-    our_set.push(buf);
-  }
-  // TXT — always include (matches what write_probe emits unconditionally).
-  // write_probe sends a TXT authority record even with no segments, so a
-  // peer comparing against our probe sees the TXT we sent; omitting it from our
-  // local comparison set would bias the tiebreak. An empty TXT
-  // canonicalizes (like the wire form) to the rtype prefix + a single
-  // zero-length string (one 0x00), so both sides agree byte-for-byte.
-  {
-    let mut buf = std::vec::Vec::new();
-    buf.extend_from_slice(&crate::wire::ResourceType::Txt.to_u16().to_be_bytes());
-    respond::write_canonical_txt(our.txt_segments(), &mut buf);
-    our_set.push(buf);
-  }
-  our_set.sort();
-  let our_concat: std::vec::Vec<u8> = our_set.into_iter().flatten().collect();
-
-  // For EACH peer bucket: if that peer's sorted set >= ours, we lose.
-  for probe in peer_probes {
-    let mut peer_set: std::vec::Vec<std::vec::Vec<u8>> = probe
-      .records
-      .iter()
-      .map(|p| {
-        let mut buf = std::vec::Vec::new();
-        buf.extend_from_slice(&p.rtype.to_u16().to_be_bytes());
-        buf.extend_from_slice(&p.canonical[..]);
-        buf
-      })
-      .collect();
-    peer_set.sort();
-    let peer_concat: std::vec::Vec<u8> = peer_set.into_iter().flatten().collect();
-    // We LOSE when peer_concat >= our_concat (tie = loss per §8.2.1).
-    if peer_concat >= our_concat {
-      return true;
+cfg_heap! {
+  /// Build a new instance-name string by appending (or replacing) a `-N` suffix
+  /// on the first DNS label.
+  ///
+  /// `current` is the full FQDN of the instance (e.g. `"myprinter._ipp._tcp.local."`).
+  /// `attempt` is the rename counter (1, 2, …).
+  ///
+  /// For a name like `"myprinter._ipp._tcp.local."` and attempt `2` the result
+  /// is `"myprinter-2._ipp._tcp.local."`.  Any existing `-N` suffix on the
+  /// instance label is stripped first so repeated conflicts don't accumulate.
+  fn rename_with_suffix(current: &str, attempt: u32) -> std::string::String {
+    use std::string::ToString;
+    // Strip optional trailing dot so we can work with the plain label sequence.
+    let (body, trailing_dot) = match current.strip_suffix('.') {
+      Some(b) => (b, true),
+      None => (current, false),
+    };
+    // Split off the first label (the instance name) from the rest of the FQDN.
+    let (instance, rest) = match body.split_once('.') {
+      Some((i, r)) => (i, Some(r)),
+      None => (body, None),
+    };
+    // Strip any existing "-N" suffix from the instance label.
+    let base_instance = match instance.rsplit_once('-') {
+      Some((prefix, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => prefix,
+      _ => instance,
+    };
+    let mut out = std::string::String::new();
+    out.push_str(base_instance);
+    out.push('-');
+    out.push_str(&attempt.to_string());
+    if let Some(r) = rest {
+      out.push('.');
+      out.push_str(r);
     }
+    if trailing_dot {
+      out.push('.');
+    }
+    out
   }
-  false
-}
 
-/// What kind of transmit is pending for a service.
-///
-/// Capturing the kind at deadline-fire time (before state is advanced) ensures
-/// `poll_transmit` encodes the correct packet type even when state has already
-/// transitioned (e.g., Probing(2) → Announcing(0) on the final probe tick).
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum PendingTransmitKind {
-  /// Send a probe (state was Probing(_) when the deadline fired).
-  Probe,
-  /// Send an unsolicited announcement (state was Announcing(_) or Established
-  /// firing the periodic re-announce deadline). KAS filtering is NOT applied —
-  /// RFC 6762 §7.1 known-answer suppression only applies to question responses,
-  /// not to unsolicited multicast announcements.
-  Announcement,
-  /// Send a jittered question response (the response_pending path in Established
-  /// or Announcing(_) state). KAS filtering IS applied (RFC 6762 §7.1).
-  Response,
-}
+  /// RFC 6762 §8.2 tiebreak comparison.
+  ///
+  /// Returns `true` if WE should lose (i.e. we must rename): the peer's
+  /// proposed RR set is lexicographically >= ours when both sets are
+  /// sorted and concatenated in canonical form. A tie (equal sets) also
+  /// counts as a loss (§8.2.1 — "the host MUST rename itself").
+  ///
+  /// Compares against EACH peer bucket independently; returns `true` (we lose)
+  /// if ANY single peer's set is >= ours. This prevents a peer that claims a
+  /// smaller set from masking a different peer that actually wins.
+  ///
+  /// The local set is restricted to records owned by the service INSTANCE
+  /// (SRV + TXT only) per RFC §8.2, which compares records "owned by the
+  /// conflicting name". A/AAAA records are owned by the host name and are
+  /// excluded from both sides.
+  fn compare_rr_sets_we_lose(
+    our: &crate::records::ServiceRecords,
+    peer_probes: &[PeerProbe],
+  ) -> bool {
+    // Build OUR canonical RR set restricted to SRV + TXT (instance-owned records).
+    // RFC §8.2 says compare records owned by the conflicting NAME; the conflicting
+    // name is the service instance, which owns SRV and TXT — NOT A/AAAA (those
+    // are owned by the host name).
+    let mut our_set: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+    // SRV — priority(2 BE) + weight(2 BE) + port(2 BE) + wire-form target name.
+    // Wire form: length-octet + label bytes, repeated, terminated by 0x00.
+    {
+      let mut buf = std::vec::Vec::new();
+      buf.extend_from_slice(&crate::wire::ResourceType::Srv.to_u16().to_be_bytes());
+      buf.extend_from_slice(&our.priority().to_be_bytes());
+      buf.extend_from_slice(&our.weight().to_be_bytes());
+      buf.extend_from_slice(&our.port().to_be_bytes());
+      write_canonical_wire_name(our.host().as_str(), &mut buf);
+      our_set.push(buf);
+    }
+    // TXT — always include (matches what write_probe emits unconditionally).
+    // write_probe sends a TXT authority record even with no segments, so a
+    // peer comparing against our probe sees the TXT we sent; omitting it from our
+    // local comparison set would bias the tiebreak. An empty TXT
+    // canonicalizes (like the wire form) to the rtype prefix + a single
+    // zero-length string (one 0x00), so both sides agree byte-for-byte.
+    {
+      let mut buf = std::vec::Vec::new();
+      buf.extend_from_slice(&crate::wire::ResourceType::Txt.to_u16().to_be_bytes());
+      respond::write_canonical_txt(our.txt_segments(), &mut buf);
+      our_set.push(buf);
+    }
+    our_set.sort();
+    let our_concat: std::vec::Vec<u8> = our_set.into_iter().flatten().collect();
 
-/// The commit token stamped by `poll_transmit` and resolved by
-/// `note_transmit_result`. Unlike [`PendingTransmitKind`] (which is
-/// queued at deadline-fire time), this carries what was ACTUALLY encoded, so a
-/// response that known-answer-suppression (§7.1) trimmed latches goodbye
-/// ownership only for the concrete records it really put on the wire
-/// (per record, not per group).
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[derive(Debug, Clone)]
-enum AwaitingConfirm {
-  /// A probe is awaiting its delivery result (§8.1 sequence advance). A probe is
-  /// a QUESTION — it advertises no records, so it latches no goodbye ownership.
-  Probe,
-  /// An unsolicited announcement is awaiting confirmation (§8.3 phase advance).
-  /// Carries the concrete records it emitted (a full announcement: all of
-  /// PTR/SRV/TXT plus every host address) so a confirmed send latches exactly
-  /// those for goodbye ownership.
-  Announcement(respond::EmittedRecords),
-  /// A question/legacy response is awaiting confirmation. Carries the concrete
-  /// records actually emitted (§7.1 KAS may have trimmed any subset), so only
-  /// those latch goodbye ownership on a confirmed send.  The second field is
-  /// the count of records §7.1 KAS suppressed from THIS response (partial
-  /// suppression); it is bumped into `answers_suppressed_kas` ONLY on a
-  /// confirmed delivery so a socket failure cannot inflate the counter.
-  Response(respond::EmittedRecords, u64),
-  /// A RFC 6763 §9 service-type enumeration meta-response (multicast or legacy
-  /// unicast) is awaiting confirmation. The meta-PTR is a shared record — it
-  /// advertises no instance-owned records and is never withdrawn — so a confirmed
-  /// delivery bumps `responses_tx` WITHOUT touching goodbye ownership or any
-  /// lifecycle state.
-  MetaResponse,
-}
-
-/// Goodbye ownership: which CONCRETE records peers may have cached FROM US, and
-/// therefore what a graceful goodbye (TTL=0) must withdraw. The granularity is
-/// per record — each instance-owned record (PTR/SRV/TXT) independently, and each
-/// host-owned address (A/AAAA) independently — matching what the endpoint's
-/// withdrawal (built from [`Service::withdrawal_snapshot`]) withdraws (host
-/// addresses are further filtered against sibling-retained addresses).
-///
-/// INVARIANT: a record becomes "advertised" ONLY through a CONFIRMED send that
-/// actually emitted THAT record ([`Self::record_emitted`], driven by the
-/// encoder's per-record report via `note_transmit_result`). A send that never
-/// reaches the link — or whose record was known-answer-suppressed (§7.1) —
-/// advertises nothing, so a later goodbye never withdraws a record we did not
-/// put on the wire (which could otherwise flush a peer's matching shared
-/// record). Per-record (not per-group) granularity closes the over-withdrawal
-/// class where §7.1 trims a subset of a group or a legacy reply emits a whole
-/// group the per-group latch mis-attributed.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[derive(Debug, Default, Clone)]
-struct GoodbyeOwnership {
-  /// The instance PTR (service-type → instance) has been advertised. RESET on a
-  /// conflict rename (the new instance name has not been advertised).
-  ptr: bool,
-  /// The instance SRV has been advertised. Reset on rename.
-  srv: bool,
-  /// The instance TXT has been advertised. Reset on rename.
-  txt: bool,
-  /// The RFC 6763 §7.1 subtype PTRs (`<sub>._sub.<type>` → instance) have been
-  /// advertised. Instance-associated (target = instance), so RESET on rename and
-  /// withdrawn with the instance records. All-or-nothing — subtype PTRs are not
-  /// KAS-filtered, so they are always emitted together.
-  subtypes: bool,
-  /// Host A addresses advertised FROM US, tracked per address. SURVIVES a
-  /// conflict rename: the host name is invariant across instance renames, so
-  /// peers keep caching the host records.
-  a: std::vec::Vec<core::net::Ipv4Addr>,
-  /// Host AAAA addresses advertised FROM US, tracked per address. Survives rename.
-  aaaa: std::vec::Vec<core::net::Ipv6Addr>,
-}
-
-#[cfg(any(feature = "alloc", feature = "std"))]
-impl GoodbyeOwnership {
-  /// Latch the concrete records a confirmed-delivered send actually emitted — the
-  /// SOLE way ownership is gained (besides being reset to none on rename).
-  fn record_emitted(&mut self, e: &respond::EmittedRecords) {
-    self.ptr |= e.ptr();
-    self.srv |= e.srv();
-    self.txt |= e.txt();
-    self.subtypes |= e.subtypes();
-    for ip in e.a_slice() {
-      if !self.a.contains(ip) {
-        self.a.push(*ip);
+    // For EACH peer bucket: if that peer's sorted set >= ours, we lose.
+    for probe in peer_probes {
+      let mut peer_set: std::vec::Vec<std::vec::Vec<u8>> = probe
+        .records
+        .iter()
+        .map(|p| {
+          let mut buf = std::vec::Vec::new();
+          buf.extend_from_slice(&p.rtype.to_u16().to_be_bytes());
+          buf.extend_from_slice(&p.canonical[..]);
+          buf
+        })
+        .collect();
+      peer_set.sort();
+      let peer_concat: std::vec::Vec<u8> = peer_set.into_iter().flatten().collect();
+      // We LOSE when peer_concat >= our_concat (tie = loss per §8.2.1).
+      if peer_concat >= our_concat {
+        return true;
       }
     }
-    for ip in e.aaaa_slice() {
-      if !self.aaaa.contains(ip) {
-        self.aaaa.push(*ip);
+    false
+  }
+}
+
+cfg_heap! {
+  /// What kind of transmit is pending for a service.
+  ///
+  /// Capturing the kind at deadline-fire time (before state is advanced) ensures
+  /// `poll_transmit` encodes the correct packet type even when state has already
+  /// transitioned (e.g., Probing(2) → Announcing(0) on the final probe tick).
+  #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+  enum PendingTransmitKind {
+    /// Send a probe (state was Probing(_) when the deadline fired).
+    Probe,
+    /// Send an unsolicited announcement (state was Announcing(_) or Established
+    /// firing the periodic re-announce deadline). KAS filtering is NOT applied —
+    /// RFC 6762 §7.1 known-answer suppression only applies to question responses,
+    /// not to unsolicited multicast announcements.
+    Announcement,
+    /// Send a jittered question response (the response_pending path in Established
+    /// or Announcing(_) state). KAS filtering IS applied (RFC 6762 §7.1).
+    Response,
+  }
+
+  /// The commit token stamped by `poll_transmit` and resolved by
+  /// `note_transmit_result`. Unlike [`PendingTransmitKind`] (which is
+  /// queued at deadline-fire time), this carries what was ACTUALLY encoded, so a
+  /// response that known-answer-suppression (§7.1) trimmed latches goodbye
+  /// ownership only for the concrete records it really put on the wire
+  /// (per record, not per group).
+  #[derive(Debug, Clone)]
+  enum AwaitingConfirm {
+    /// A probe is awaiting its delivery result (§8.1 sequence advance). A probe is
+    /// a QUESTION — it advertises no records, so it latches no goodbye ownership.
+    Probe,
+    /// An unsolicited announcement is awaiting confirmation (§8.3 phase advance).
+    /// Carries the concrete records it emitted (a full announcement: all of
+    /// PTR/SRV/TXT plus every host address) so a confirmed send latches exactly
+    /// those for goodbye ownership.
+    Announcement(respond::EmittedRecords),
+    /// A question/legacy response is awaiting confirmation. Carries the concrete
+    /// records actually emitted (§7.1 KAS may have trimmed any subset), so only
+    /// those latch goodbye ownership on a confirmed send.  The second field is
+    /// the count of records §7.1 KAS suppressed from THIS response (partial
+    /// suppression); it is bumped into `answers_suppressed_kas` ONLY on a
+    /// confirmed delivery so a socket failure cannot inflate the counter.
+    Response(respond::EmittedRecords, u64),
+    /// A RFC 6763 §9 service-type enumeration meta-response (multicast or legacy
+    /// unicast) is awaiting confirmation. The meta-PTR is a shared record — it
+    /// advertises no instance-owned records and is never withdrawn — so a confirmed
+    /// delivery bumps `responses_tx` WITHOUT touching goodbye ownership or any
+    /// lifecycle state.
+    MetaResponse,
+  }
+
+  /// Goodbye ownership: which CONCRETE records peers may have cached FROM US, and
+  /// therefore what a graceful goodbye (TTL=0) must withdraw. The granularity is
+  /// per record — each instance-owned record (PTR/SRV/TXT) independently, and each
+  /// host-owned address (A/AAAA) independently — matching what the endpoint's
+  /// withdrawal (built from [`Service::withdrawal_snapshot`]) withdraws (host
+  /// addresses are further filtered against sibling-retained addresses).
+  ///
+  /// INVARIANT: a record becomes "advertised" ONLY through a CONFIRMED send that
+  /// actually emitted THAT record ([`Self::record_emitted`], driven by the
+  /// encoder's per-record report via `note_transmit_result`). A send that never
+  /// reaches the link — or whose record was known-answer-suppressed (§7.1) —
+  /// advertises nothing, so a later goodbye never withdraws a record we did not
+  /// put on the wire (which could otherwise flush a peer's matching shared
+  /// record). Per-record (not per-group) granularity closes the over-withdrawal
+  /// class where §7.1 trims a subset of a group or a legacy reply emits a whole
+  /// group the per-group latch mis-attributed.
+  #[derive(Debug, Default, Clone)]
+  struct GoodbyeOwnership {
+    /// The instance PTR (service-type → instance) has been advertised. RESET on a
+    /// conflict rename (the new instance name has not been advertised).
+    ptr: bool,
+    /// The instance SRV has been advertised. Reset on rename.
+    srv: bool,
+    /// The instance TXT has been advertised. Reset on rename.
+    txt: bool,
+    /// The RFC 6763 §7.1 subtype PTRs (`<sub>._sub.<type>` → instance) have been
+    /// advertised. Instance-associated (target = instance), so RESET on rename and
+    /// withdrawn with the instance records. All-or-nothing — subtype PTRs are not
+    /// KAS-filtered, so they are always emitted together.
+    subtypes: bool,
+    /// Host A addresses advertised FROM US, tracked per address. SURVIVES a
+    /// conflict rename: the host name is invariant across instance renames, so
+    /// peers keep caching the host records.
+    a: std::vec::Vec<core::net::Ipv4Addr>,
+    /// Host AAAA addresses advertised FROM US, tracked per address. Survives rename.
+    aaaa: std::vec::Vec<core::net::Ipv6Addr>,
+  }
+
+  impl GoodbyeOwnership {
+    /// Latch the concrete records a confirmed-delivered send actually emitted — the
+    /// SOLE way ownership is gained (besides being reset to none on rename).
+    fn record_emitted(&mut self, e: &respond::EmittedRecords) {
+      self.ptr |= e.ptr();
+      self.srv |= e.srv();
+      self.txt |= e.txt();
+      self.subtypes |= e.subtypes();
+      for ip in e.a_slice() {
+        if !self.a.contains(ip) {
+          self.a.push(*ip);
+        }
+      }
+      for ip in e.aaaa_slice() {
+        if !self.aaaa.contains(ip) {
+          self.aaaa.push(*ip);
+        }
       }
     }
-  }
-  /// Drop INSTANCE ownership (PTR/SRV/TXT) on a conflict rename; host A/AAAA
-  /// ownership persists (the host name does not change on an instance rename).
-  #[inline]
-  fn reset_instance(&mut self) {
-    self.ptr = false;
-    self.srv = false;
-    self.txt = false;
-    self.subtypes = false;
-  }
-  /// Whether ANY instance-owned record (PTR/SRV/TXT or a subtype PTR) has been
-  /// advertised.
-  #[inline]
-  fn any_instance(&self) -> bool {
-    self.ptr || self.srv || self.txt || self.subtypes
-  }
-  /// Whether ANY host-owned address (A/AAAA) has been advertised.
-  #[inline]
-  fn any_host(&self) -> bool {
-    !self.a.is_empty() || !self.aaaa.is_empty()
+    /// Drop INSTANCE ownership (PTR/SRV/TXT) on a conflict rename; host A/AAAA
+    /// ownership persists (the host name does not change on an instance rename).
+    #[inline]
+    fn reset_instance(&mut self) {
+      self.ptr = false;
+      self.srv = false;
+      self.txt = false;
+      self.subtypes = false;
+    }
+    /// Whether ANY instance-owned record (PTR/SRV/TXT or a subtype PTR) has been
+    /// advertised.
+    #[inline]
+    fn any_instance(&self) -> bool {
+      self.ptr || self.srv || self.txt || self.subtypes
+    }
+    /// Whether ANY host-owned address (A/AAAA) has been advertised.
+    #[inline]
+    fn any_host(&self) -> bool {
+      !self.a.is_empty() || !self.aaaa.is_empty()
+    }
   }
 }
 
-/// A point-in-time snapshot of everything the [`crate::Endpoint`] needs to re-encode
-/// the TTL=0 goodbye for a service being withdrawn.
-///
-/// Produced by [`Service::withdrawal_snapshot`] and consumed by the endpoint's
-/// withdrawal state machine. Each resend round calls the
-/// encoder with the same snapshot so the goodbye is idempotent over multiple
-/// attempts (RFC 6762 §10.1 recommends at least two sends for loss resilience).
-///
-/// The `#[cfg]` gate matches the goodbye code it supports — the goodbye path is
-/// only compiled when heap allocation is available.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-#[derive(Debug, Clone)]
-pub struct WithdrawalSnapshot {
-  /// The service records (names, port, TXT) for this withdrawal. Carried so
-  /// the encoder can re-encode PTR/SRV/TXT at TTL=0 without a live `Service`.
-  pub records: crate::records::ServiceRecords,
-  /// Which record kinds (PTR/SRV/TXT/subtypes) this service actually put on the
-  /// wire (per-record, not per-group). Mirrors the [`GoodbyeOwnership`] latch
-  /// semantics: only records that reached a peer cache need to be withdrawn.
-  /// `pub(crate)` because `EmittedRecords` is a crate-internal type; the
-  /// endpoint (same crate) reads this directly.
-  // `allow(dead_code)`: the field is read by the endpoint withdrawal state
-  // machine; suppress the false positive here.
-  #[allow(dead_code)]
-  pub(crate) owned: respond::EmittedRecords,
-  /// Host A (IPv4) addresses this service confirmed-emitted. The endpoint will
-  /// further filter these against same-host siblings before re-encoding.
-  pub host_a: std::vec::Vec<core::net::Ipv4Addr>,
-  /// Host AAAA (IPv6) addresses this service confirmed-emitted.
-  pub host_aaaa: std::vec::Vec<core::net::Ipv6Addr>,
+cfg_heap! {
+  /// A point-in-time snapshot of everything the [`crate::Endpoint`] needs to re-encode
+  /// the TTL=0 goodbye for a service being withdrawn.
+  ///
+  /// Produced by [`Service::withdrawal_snapshot`] and consumed by the endpoint's
+  /// withdrawal state machine. Each resend round calls the
+  /// encoder with the same snapshot so the goodbye is idempotent over multiple
+  /// attempts (RFC 6762 §10.1 recommends at least two sends for loss resilience).
+  ///
+  /// The `#[cfg]` gate matches the goodbye code it supports — the goodbye path is
+  /// only compiled when heap allocation is available.
+  #[derive(Debug, Clone)]
+  pub struct WithdrawalSnapshot {
+    /// The service records (names, port, TXT) for this withdrawal. Carried so
+    /// the encoder can re-encode PTR/SRV/TXT at TTL=0 without a live `Service`.
+    pub records: crate::records::ServiceRecords,
+    /// Which record kinds (PTR/SRV/TXT/subtypes) this service actually put on the
+    /// wire (per-record, not per-group). Mirrors the [`GoodbyeOwnership`] latch
+    /// semantics: only records that reached a peer cache need to be withdrawn.
+    /// `pub(crate)` because `EmittedRecords` is a crate-internal type; the
+    /// endpoint (same crate) reads this directly.
+    // `allow(dead_code)`: the field is read by the endpoint withdrawal state
+    // machine; suppress the false positive here.
+    #[allow(dead_code)]
+    pub(crate) owned: respond::EmittedRecords,
+    /// Host A (IPv4) addresses this service confirmed-emitted. The endpoint will
+    /// further filter these against same-host siblings before re-encoding.
+    pub host_a: std::vec::Vec<core::net::Ipv4Addr>,
+    /// Host AAAA (IPv6) addresses this service confirmed-emitted.
+    pub host_aaaa: std::vec::Vec<core::net::Ipv6Addr>,
+  }
 }
 
-/// The one-shot §9 conflict-rename goodbye handoff: the OLD instance name's
-/// records plus the per-record ownership of what that name actually advertised.
-///
-/// Produced by
-/// [`Service::take_rename_goodbye_handoff`] the instant a conflict rename
-/// happens, and handed straight to
-/// [`Endpoint::enqueue_rename_withdrawal`](crate::Endpoint::enqueue_rename_withdrawal),
-/// which turns it into an independent DETACHED withdrawal item (the renamed-away
-/// old name's TTL=0 goodbye). It is **opaque** to the driver — both fields are
-/// crate-internal (`EmittedRecords` is `pub(crate)`) — so a driver only ever
-/// moves the whole value between the two calls, exactly like
-/// [`WithdrawalSnapshot`]. A rename never withdraws host A/AAAA (the host name is
-/// invariant), so this carries no host addresses.
-///
-/// The `#[cfg]` gate matches the goodbye code it supports.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-#[derive(Debug, Clone)]
-pub struct RenameGoodbyeHandoff {
-  /// The OLD instance name's records (names, port, TXT), captured BEFORE the
-  /// rename mutated the instance name. `pub(crate)`: the endpoint (same crate)
-  /// reads it directly.
-  pub(crate) records: crate::records::ServiceRecords,
-  /// Which instance records (PTR/SRV/TXT/subtypes) the OLD name actually put on
-  /// the wire — only these are withdrawn (§7.1 KAS can suppress a subset). The
-  /// address lists are always empty (a rename never withdraws host A/AAAA).
-  /// `pub(crate)`: `EmittedRecords` is a crate-internal type.
-  pub(crate) owned: respond::EmittedRecords,
+cfg_heap! {
+  /// The one-shot §9 conflict-rename goodbye handoff: the OLD instance name's
+  /// records plus the per-record ownership of what that name actually advertised.
+  ///
+  /// Produced by
+  /// [`Service::take_rename_goodbye_handoff`] the instant a conflict rename
+  /// happens, and handed straight to
+  /// [`Endpoint::enqueue_rename_withdrawal`](crate::Endpoint::enqueue_rename_withdrawal),
+  /// which turns it into an independent DETACHED withdrawal item (the renamed-away
+  /// old name's TTL=0 goodbye). It is **opaque** to the driver — both fields are
+  /// crate-internal (`EmittedRecords` is `pub(crate)`) — so a driver only ever
+  /// moves the whole value between the two calls, exactly like
+  /// [`WithdrawalSnapshot`]. A rename never withdraws host A/AAAA (the host name is
+  /// invariant), so this carries no host addresses.
+  ///
+  /// The `#[cfg]` gate matches the goodbye code it supports.
+  #[derive(Debug, Clone)]
+  pub struct RenameGoodbyeHandoff {
+    /// The OLD instance name's records (names, port, TXT), captured BEFORE the
+    /// rename mutated the instance name. `pub(crate)`: the endpoint (same crate)
+    /// reads it directly.
+    pub(crate) records: crate::records::ServiceRecords,
+    /// Which instance records (PTR/SRV/TXT/subtypes) the OLD name actually put on
+    /// the wire — only these are withdrawn (§7.1 KAS can suppress a subset). The
+    /// address lists are always empty (a rename never withdraws host A/AAAA).
+    /// `pub(crate)`: `EmittedRecords` is a crate-internal type.
+    pub(crate) owned: respond::EmittedRecords,
+  }
 }
 
-/// Service state machine. One per registered service.
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "alloc", feature = "std"))))]
-pub struct Service<I, TQ, EV> {
+cfg_heap! {
+  /// Service state machine. One per registered service.
+  pub struct Service<I, TQ, EV> {
   handle: ServiceHandle,
   state: ServiceState,
   records: ServiceRecords,
@@ -598,9 +583,10 @@ pub struct Service<I, TQ, EV> {
   /// section already carries the meta-PTR for OUR service type — our pending
   /// meta reply is then suppressed. Reset each meta cycle.
   meta_known_answered: bool,
+  }
 }
 
-#[cfg(any(feature = "alloc", feature = "std"))]
+cfg_heap! {
 impl<I, TQ, EV> Service<I, TQ, EV>
 where
   I: Instant,
@@ -1192,7 +1178,7 @@ where
         };
         let mut scratch = std::vec::Vec::new();
         let canonical = match respond::canonical_rdata_for_hash(&view, &mut scratch) {
-          Ok(c) => Bytes::copy_from_slice(c),
+          Ok(c) => rdata_from_vec(c.to_vec()),
           Err(_) => return, // canonicalization error — drop without touching buckets
         };
         let rtype = pc.record().rtype();
@@ -2150,6 +2136,7 @@ where
     // queriers are handled separately via `pending_legacy`.
     Ok(Some(Transmit::new(respond::multicast_dst(), None, n)))
   }
+}
 }
 
 #[cfg(test)]

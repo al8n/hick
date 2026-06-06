@@ -5,8 +5,9 @@ use core::net::SocketAddr;
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-use crate::Name;
+cfg_storage! {
+  use crate::Name;
+}
 use crate::{
   QueryHandle, ServiceHandle,
   wire::{QuestionRef, Ref},
@@ -251,67 +252,54 @@ pub enum RouteEvent<'a> {
   CacheUpdated,
 }
 
-/// Detail payload for [`ServiceUpdate::Renamed`].
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
-)]
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ServiceRenamed {
-  new_name: Name,
-}
-
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
-)]
-const _: () = {
-  impl ServiceRenamed {
-    /// Construct a `ServiceRenamed` from a new name.
-    ///
-    /// Hidden from the documented surface: the proto state machine builds these
-    /// internally on a conflict rename, but downstream crates need a way to
-    /// synthesize them for tests (mirroring [`crate::CollectedAnswer::from_parts`]).
-    #[doc(hidden)]
-    #[inline(always)]
-    pub fn new(new_name: Name) -> Self {
-      Self { new_name }
-    }
-    /// Returns the new canonical name assigned after conflict resolution.
-    #[inline(always)]
-    pub fn new_name(&self) -> &Name {
-      &self.new_name
-    }
+cfg_storage! {
+  /// Detail payload for [`ServiceUpdate::Renamed`].
+  #[derive(Debug, Clone, Eq, PartialEq)]
+  pub struct ServiceRenamed {
+    new_name: Name,
   }
-};
 
-/// App-level events emitted by `Service::poll()`.
-#[cfg(any(feature = "alloc", feature = "std", feature = "heapless"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "alloc", feature = "std", feature = "heapless")))
-)]
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
-#[unwrap(ref)]
-#[try_unwrap(ref)]
-#[non_exhaustive]
-pub enum ServiceUpdate {
-  /// Probing completed without conflict; the service is now advertised.
-  Established,
-  /// Probing detected a conflict; the service rebranded to a new name.
-  Renamed(ServiceRenamed),
-  /// A conflict cannot be resolved automatically (e.g. tiebreak space
-  /// exhausted). The caller must intervene.
-  Conflict,
-  /// A peer claimed our **host** name (A/AAAA owner) during probing.
-  ///
-  /// The service does NOT rename itself automatically. The caller must
-  /// resolve the conflict by choosing a new host name and re-registering,
-  /// or by deferring to the peer.
-  HostConflict,
+  const _: () = {
+    impl ServiceRenamed {
+      /// Construct a `ServiceRenamed` from a new name.
+      ///
+      /// Hidden from the documented surface: the proto state machine builds these
+      /// internally on a conflict rename, but downstream crates need a way to
+      /// synthesize them for tests (mirroring [`crate::CollectedAnswer::from_parts`]).
+      #[doc(hidden)]
+      #[inline(always)]
+      pub fn new(new_name: Name) -> Self {
+        Self { new_name }
+      }
+      /// Returns the new canonical name assigned after conflict resolution.
+      #[inline(always)]
+      pub fn new_name(&self) -> &Name {
+        &self.new_name
+      }
+    }
+  };
+
+  /// App-level events emitted by `Service::poll()`.
+  #[allow(clippy::large_enum_variant)]
+  #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
+  #[unwrap(ref)]
+  #[try_unwrap(ref)]
+  #[non_exhaustive]
+  pub enum ServiceUpdate {
+    /// Probing completed without conflict; the service is now advertised.
+    Established,
+    /// Probing detected a conflict; the service rebranded to a new name.
+    Renamed(ServiceRenamed),
+    /// A conflict cannot be resolved automatically (e.g. tiebreak space
+    /// exhausted). The caller must intervene.
+    Conflict,
+    /// A peer claimed our **host** name (A/AAAA owner) during probing.
+    ///
+    /// The service does NOT rename itself automatically. The caller must
+    /// resolve the conflict by choosing a new host name and re-registering,
+    /// or by deferring to the peer.
+    HostConflict,
+  }
 }
 
 /// App-level events emitted by `Query::poll()`.

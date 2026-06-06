@@ -4,7 +4,7 @@ Tracing-or-noop diagnostic macro shim and backend-agnostic stats/metrics
 primitives for the hick mDNS stack.
 
 `hick-trace` is an internal support crate: all of the mDNS crates in the
-[hick] family depend on it, and downstream code normally enables its features
+hick family depend on it, and downstream code normally enables its features
 indirectly through those crates (e.g. `hick/tracing`, `mdns-proto/stats`).
 
 ## Macros
