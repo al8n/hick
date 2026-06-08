@@ -139,7 +139,7 @@ jobs:
       - name: List downloaded reports
         run: ls -aR reports || true
       - name: Upload to codecov.io
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           directory: reports
           fail_ci_if_error: false
