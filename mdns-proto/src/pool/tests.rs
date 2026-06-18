@@ -1,11 +1,12 @@
-#[cfg(feature = "heapless")]
+#[cfg(feature = "slab")]
 #[allow(clippy::unwrap_used)]
-mod tests_heapless {
+mod tests_fixed {
   use super::super::Pool;
-  // `heapless::Vec` has inherent `insert(index, element)` and derives `len()` / `get()`
-  // from `Deref<Target=[T]>`, so we must use UFCS to call the `Pool<V>` trait methods.
-  type P4 = heapless::Vec<Option<u32>, 4>;
-  type P2 = heapless::Vec<Option<u32>, 2>;
+  // The test-only `FixedPool` (a capacity-`N` slab) exercises the FALLIBLE `Pool`
+  // contract — `insert`/`vacant_key`/`with_capacity` error when full — which the
+  // infallible `slab::Slab` impl below cannot. UFCS keeps the call sites explicit.
+  type P4 = super::super::FixedPool<u32, 4>;
+  type P2 = super::super::FixedPool<u32, 2>;
 
   #[test]
   fn insert_get_remove_roundtrip() {

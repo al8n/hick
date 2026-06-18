@@ -47,7 +47,6 @@ jobs:
       - run: cargo clippy --workspace --all-features --tests -- -D warnings
       - run: cargo clippy -p mdns-proto --no-default-features -- -D warnings
       - run: cargo clippy -p mdns-proto --no-default-features --features alloc -- -D warnings
-      - run: cargo clippy -p mdns-proto --no-default-features --features heapless -- -D warnings
       # Observability feature legs: verify tracing + metrics + stats compile clean.
       - run: cargo clippy --workspace --features tracing,metrics,stats -- -D warnings
 
@@ -143,9 +142,6 @@ jobs:
       # so it must fail with the crate's own compile_error (the `!` inverts the exit
       # code, like the `embassy,metrics` guard above).
       - run: "! cargo check -p hick --no-default-features 2>/dev/null"
-      # `no-atomic` + `heapless` is an additive combination; `no-atomic` outranks
-      # `heapless` and must resolve cleanly (no duplicate `Name` impls).
-      - run: cargo check -p mdns-proto --no-default-features --features no-atomic,heapless --target thumbv6m-none-eabi
       # `stats` implies the atomic tier (it needs `alloc`), so combining it with the
       # no-atomic facade tier on thumbv6m must fail loudly — there is no native
       # atomic CAS for `bytes` / `smol_str` (same shape as `embassy,metrics`).

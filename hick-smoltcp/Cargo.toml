@@ -1,6 +1,6 @@
 [package]
 name = "hick-smoltcp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 publish = true
 repository = "https://github.com/al8n/hick"
@@ -27,7 +27,7 @@ atomic = ["mdns-proto/alloc", "mdns-proto/slab"]
 no-atomic = ["mdns-proto/no-atomic", "mdns-proto/slab"]
 tracing = ["mdns-proto/tracing", "hick-trace/tracing"]
 # stats needs the alloc tier (counter storage + a shared `Arc<Stats>` handle), so
-# it implies `atomic` and is unavailable on the no-atomic `heapless` path.
+# it implies `atomic` and is unavailable on the no-atomic tier.
 stats = ["atomic", "mdns-proto/stats", "hick-trace/stats"]
 defmt = ["dep:defmt"]
 

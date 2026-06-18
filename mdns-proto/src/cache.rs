@@ -352,7 +352,7 @@ where
   ///    usage even when the backing pool is infallible (e.g. `slab::Slab`).
   /// 2. Attempt the insert.
   /// 3. Reactive eviction + retry: if the pool returns a capacity error (e.g.
-  ///    `heapless` fixed-size collections), evict the soonest-expiring entry
+  ///    a fixed-capacity fallible pool), evict the soonest-expiring entry
   ///    and retry once.
   fn bounded_insert(&mut self, entry: CacheEntry<I>) -> Result<usize, P::Error> {
     // Step 1: proactive eviction when at or above the cap.

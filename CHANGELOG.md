@@ -1,5 +1,29 @@
 # RELEASED
 
+## Drop the `heapless` tier (June 8th, 2026)
+
+Published crates: `mdns-proto` 0.3.0, `hick` 0.2.0, `hick-reactor` 0.2.0,
+`hick-compio` 0.2.0, `hick-smoltcp` 0.2.0, `hick-embassy` 0.2.0.
+
+BREAKING
+
+- Removed `mdns-proto`'s `heapless` feature and its no-allocator owned-storage
+  tier. Owning variable-length protocol data without an allocator is inherently
+  either fat (a fixed `heapless::String<255>` inline per name) or complex (an
+  in-buffer sub-allocator), so the rule is now simply: **owning a `Name` /
+  `ServiceSpec` and building messages requires an allocator** (`alloc` / `std` /
+  `no-atomic`); the bare `--no-default-features` tier is **parse-only** (the
+  borrowed `wire::NameRef`). This drops the large fixed-capacity inline structs
+  that were a poor fit for `no_std` stack budgets.
+- As a result the internal `cfg_storage` / `cfg_heap` macro split collapses
+  (both predicates are now `any(alloc, std, no-atomic)`), and `Name`,
+  `QuerySpec`, `ServiceUpdate`, and `MessageBuilder` are gated on the allocator
+  tiers.
+
+The dependent crates (`hick`, `hick-reactor`, `hick-compio`, `hick-smoltcp`,
+`hick-embassy`) bump to 0.2.0 to track the `mdns-proto` 0.3 public dependency.
+`hick-udp` and `hick-trace` are unaffected.
+
 ## Bare-metal no-atomic tier (June 6th, 2026)
 
 Published crates: `mdns-proto` 0.2.1, `hick` 0.1.1, `hick-smoltcp` 0.1.1,

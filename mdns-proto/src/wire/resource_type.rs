@@ -82,7 +82,7 @@ impl ResourceType {
   ///
   /// Gated to the heap tiers: the sole caller is `Rdata::canonical_rdata_inner`
   /// (`wire::record`, gated on `alloc` / `std` / `no-atomic`), so without a
-  /// matching gate this is dead code in the `heapless` / core-only tiers and
+  /// matching gate this is dead code in the core-only (no-storage) tiers and
   /// trips `#[deny(dead_code)]`.
     #[inline(always)]
     pub(crate) const fn is_unhandled_compressible_name(self) -> bool {
