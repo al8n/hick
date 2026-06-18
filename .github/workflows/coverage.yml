@@ -62,7 +62,7 @@ jobs:
             gate: ""
             exclude: "--exclude hick --exclude hick-smoltcp --exclude hick-embassy"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -95,7 +95,7 @@ jobs:
     name: Coverage (linux-musl)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -131,7 +131,7 @@ jobs:
     if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Download all coverage reports
         uses: actions/download-artifact@v8
         with:
