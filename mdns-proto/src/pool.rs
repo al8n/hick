@@ -1,9 +1,8 @@
 //! Pluggable backing storage for the protocol state machines.
 //!
 //! [`Pool<V>`] abstracts over slab-like containers so the proto crate can
-//! support multiple storage strategies — `slab::Slab` on alloc-capable
-//! targets, `heapless::Vec<Option<V>, N>` on bare-metal `no_alloc`, or
-//! caller-defined types — without baking any one choice into the API.
+//! support multiple storage strategies — `slab::Slab` on alloc-capable targets,
+//! or caller-defined types — without baking any one choice into the API.
 
 /// Pre-allocated storage for a uniform data type.
 pub trait Pool<V> {
@@ -144,150 +143,97 @@ impl<T> Pool<T> for slab::Slab<T> {
   }
 }
 
-#[cfg(feature = "heapless")]
-#[cfg_attr(docsrs, doc(cfg(feature = "heapless")))]
-mod heapless_impl {
-  use super::Pool;
+/// Test-only fixed-capacity, FALLIBLE [`Pool`] — a [`slab::Slab`] capped at `N`.
+/// Stands in for the removed `heapless` backend so the `Pool` fallible contract
+/// and the cache's reactive-eviction-on-capacity-error path stay covered without
+/// a `heapless` dependency. Reuses slab's iterators.
+#[cfg(all(test, feature = "slab"))]
+pub(crate) struct FixedPool<V, const N: usize>(slab::Slab<V>);
 
-  /// Error returned by the heapless [`Pool`] impl when capacity is exhausted.
-  #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-  #[non_exhaustive]
-  #[error("heapless Pool capacity exhausted")]
-  pub struct HeaplessCapacityError;
+/// Capacity error for [`FixedPool`].
+#[cfg(all(test, feature = "slab"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FixedPoolFull;
 
-  /// Iterator over occupied `(key, &value)` pairs in a heapless pool.
-  pub struct HeaplessIter<'a, V> {
-    inner: core::iter::Enumerate<core::slice::Iter<'a, Option<V>>>,
-  }
-
-  impl<'a, V> Iterator for HeaplessIter<'a, V> {
-    type Item = (usize, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-      for (idx, slot) in self.inner.by_ref() {
-        if let Some(v) = slot {
-          return Some((idx, v));
-        }
-      }
-      None
-    }
-  }
-
-  /// Iterator over occupied `(key, &mut value)` pairs in a heapless pool.
-  pub struct HeaplessIterMut<'a, V> {
-    inner: core::iter::Enumerate<core::slice::IterMut<'a, Option<V>>>,
-  }
-
-  impl<'a, V> Iterator for HeaplessIterMut<'a, V> {
-    type Item = (usize, &'a mut V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-      for (idx, slot) in self.inner.by_ref() {
-        if let Some(v) = slot {
-          return Some((idx, v));
-        }
-      }
-      None
-    }
-  }
-
-  impl<V, const N: usize> Pool<V> for heapless::Vec<Option<V>, N> {
-    type Error = HeaplessCapacityError;
-
-    type Iter<'a>
-      = HeaplessIter<'a, V>
-    where
-      Self: 'a,
-      V: 'a;
-
-    type IterMut<'a>
-      = HeaplessIterMut<'a, V>
-    where
-      Self: 'a,
-      V: 'a;
-
-    #[inline]
-    fn new() -> Self {
-      heapless::Vec::new()
-    }
-
-    #[inline]
-    fn with_capacity(capacity: usize) -> Result<Self, Self::Error> {
-      if capacity > N {
-        return Err(HeaplessCapacityError);
-      }
-      Ok(heapless::Vec::new())
-    }
-
-    #[inline]
-    fn vacant_key(&self) -> Result<usize, Self::Error> {
-      for (idx, slot) in self.as_slice().iter().enumerate() {
-        if slot.is_none() {
-          return Ok(idx);
-        }
-      }
-      if heapless::Vec::len(self) < N {
-        return Ok(heapless::Vec::len(self));
-      }
-      Err(HeaplessCapacityError)
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-      self.as_slice().iter().all(Option::is_none)
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-      self.as_slice().iter().filter(|s| s.is_some()).count()
-    }
-
-    #[inline]
-    fn get(&self, key: usize) -> Option<&V> {
-      self.as_slice().get(key).and_then(Option::as_ref)
-    }
-
-    #[inline]
-    fn get_mut(&mut self, key: usize) -> Option<&mut V> {
-      self.as_mut_slice().get_mut(key).and_then(Option::as_mut)
-    }
-
-    fn insert(&mut self, value: V) -> Result<usize, Self::Error> {
-      for (idx, slot) in self.as_mut_slice().iter_mut().enumerate() {
-        if slot.is_none() {
-          *slot = Some(value);
-          return Ok(idx);
-        }
-      }
-      let idx = heapless::Vec::len(self);
-      heapless::Vec::push(self, Some(value)).map_err(|_| HeaplessCapacityError)?;
-      Ok(idx)
-    }
-
-    #[inline]
-    fn try_remove(&mut self, key: usize) -> Option<V> {
-      self.as_mut_slice().get_mut(key).and_then(Option::take)
-    }
-
-    #[inline]
-    fn iter(&self) -> Self::Iter<'_> {
-      HeaplessIter {
-        inner: self.as_slice().iter().enumerate(),
-      }
-    }
-
-    #[inline]
-    fn iter_mut(&mut self) -> Self::IterMut<'_> {
-      HeaplessIterMut {
-        inner: self.as_mut_slice().iter_mut().enumerate(),
-      }
-    }
+#[cfg(all(test, feature = "slab"))]
+impl core::fmt::Display for FixedPoolFull {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("fixed pool capacity exhausted")
   }
 }
 
-#[cfg(feature = "heapless")]
-#[cfg_attr(docsrs, doc(cfg(feature = "heapless")))]
-pub use heapless_impl::HeaplessCapacityError;
+#[cfg(all(test, feature = "slab"))]
+impl core::error::Error for FixedPoolFull {}
+
+#[cfg(all(test, feature = "slab"))]
+impl<V, const N: usize> Pool<V> for FixedPool<V, N> {
+  type Error = FixedPoolFull;
+
+  type Iter<'a>
+    = slab::Iter<'a, V>
+  where
+    Self: 'a;
+
+  type IterMut<'a>
+    = slab::IterMut<'a, V>
+  where
+    Self: 'a;
+
+  fn new() -> Self {
+    Self(slab::Slab::new())
+  }
+
+  fn with_capacity(capacity: usize) -> Result<Self, Self::Error> {
+    if capacity > N {
+      Err(FixedPoolFull)
+    } else {
+      Ok(Self(slab::Slab::new()))
+    }
+  }
+
+  fn vacant_key(&self) -> Result<usize, Self::Error> {
+    if slab::Slab::len(&self.0) >= N {
+      Err(FixedPoolFull)
+    } else {
+      Ok(slab::Slab::vacant_key(&self.0))
+    }
+  }
+
+  fn is_empty(&self) -> bool {
+    slab::Slab::is_empty(&self.0)
+  }
+
+  fn len(&self) -> usize {
+    slab::Slab::len(&self.0)
+  }
+
+  fn get(&self, key: usize) -> Option<&V> {
+    slab::Slab::get(&self.0, key)
+  }
+
+  fn get_mut(&mut self, key: usize) -> Option<&mut V> {
+    slab::Slab::get_mut(&mut self.0, key)
+  }
+
+  fn insert(&mut self, value: V) -> Result<usize, Self::Error> {
+    if slab::Slab::len(&self.0) >= N {
+      return Err(FixedPoolFull);
+    }
+    Ok(slab::Slab::insert(&mut self.0, value))
+  }
+
+  fn try_remove(&mut self, key: usize) -> Option<V> {
+    slab::Slab::try_remove(&mut self.0, key)
+  }
+
+  fn iter(&self) -> Self::Iter<'_> {
+    slab::Slab::iter(&self.0)
+  }
+
+  fn iter_mut(&mut self) -> Self::IterMut<'_> {
+    slab::Slab::iter_mut(&mut self.0)
+  }
+}
 
 #[cfg(test)]
 mod tests;

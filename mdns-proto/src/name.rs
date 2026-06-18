@@ -2,13 +2,12 @@
 //!
 //! [`Name`] stores names in **canonical lowercase form** (mDNS is
 //! case-insensitive per RFC 6762 §16) with a feature-conditional backing:
-//! [`smol_str::SmolStr`] under `alloc`/`std`, [`heapless::String<255>`]
-//! under `no_alloc` with the `heapless` feature.
+//! [`smol_str::SmolStr`] under `alloc`/`std`, or `portable_atomic_util::Arc<str>`
+//! under `no-atomic` (cores without native atomic CAS).
 //!
-//! Under bare `--no-default-features` (neither `alloc`/`std` nor `heapless`
-//! enabled) the `Name` type is absent. Callers compiling without backing
-//! must enable one of those features before using anything that depends on
-//! `Name`.
+//! Under bare `--no-default-features` (none of `alloc`/`std`/`no-atomic`) the
+//! owned `Name` type is absent — parse names as the borrowed `NameRef`
+//! instead, then enable a backing feature to own them.
 
 use crate::constants::{MAX_LABEL_BYTES, MAX_NAME_BYTES};
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
@@ -48,7 +47,7 @@ pub struct NameTooLongDetail {
 }
 
 impl NameTooLongDetail {
-  cfg_storage! {
+  cfg_heap! {
   #[inline(always)]
   pub(crate) const fn new(len: usize) -> Self {
     Self { len }
@@ -90,7 +89,7 @@ pub enum NameError {
   EmptyLabel,
 }
 
-cfg_storage! {
+cfg_heap! {
 /// Validates that `s` is a syntactically acceptable DNS name (per-label and
 /// total length, no empty internal labels). Trailing `.` (FQDN form) is
 /// permitted.
@@ -130,8 +129,8 @@ fn validate_name(s: &str) -> Result<(), NameError> {
 
 // ── Backing-type selection ────────────────────────────────────────────
 // Exactly one of these `cfg` arms is active in any valid build. Under
-// `--no-default-features` with neither `alloc`/`std` nor `heapless`,
-// **none** are active and `Name` itself is absent.
+// `--no-default-features` with none of `alloc`/`std`/`no-atomic`, **none** are
+// active and `Name` itself is absent.
 
 #[cfg(any(feature = "alloc", feature = "std"))]
 type NameInner = smol_str::SmolStr;
@@ -142,13 +141,7 @@ type NameInner = smol_str::SmolStr;
 #[cfg(all(feature = "no-atomic", not(any(feature = "alloc", feature = "std"))))]
 type NameInner = portable_atomic_util::Arc<str>;
 
-#[cfg(all(
-  feature = "heapless",
-  not(any(feature = "alloc", feature = "std", feature = "no-atomic"))
-))]
-type NameInner = heapless::String<MAX_NAME_BYTES>;
-
-cfg_storage! {
+cfg_heap! {
 /// Owned, canonical DNS name (lowercased on construction).
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Name(NameInner);
@@ -158,8 +151,8 @@ impl Name {
   #[inline(always)]
   pub fn as_str(&self) -> &str {
     // `as_ref` (not `as_str`) so the same body compiles whether `NameInner` is
-    // `SmolStr`, `heapless::String`, or the no-atomic `Arc<str>` (the latter has
-    // no inherent `as_str`).
+    // `SmolStr` (alloc/std) or the no-atomic `Arc<str>` (which has no inherent
+    // `as_str`).
     self.0.as_ref()
   }
 
@@ -186,8 +179,7 @@ impl core::fmt::Display for Name {
 // Heap-backed construction: active for the `SmolStr` (alloc/std) and the
 // no-atomic `Arc<str>` backings. Both build `NameInner` from an owned `String`
 // (`std` is the `extern crate alloc as std` alias under `no-atomic`), so a
-// single body serves both. The heapless block below is mutually exclusive (it
-// excludes `no-atomic`).
+// single body serves both.
 cfg_heap! {
 const _: () = {
   use std::string::String;
@@ -266,72 +258,6 @@ const _: () = {
 };
 }
 
-// Must match the heapless `NameInner` alias above: `no-atomic` outranks `heapless`
-// (heap-backed Arc<str> wins), so excluding it here keeps the heapless and no-atomic
-// construction impls mutually exclusive when both features are additively enabled.
-#[cfg(all(
-  feature = "heapless",
-  not(any(feature = "alloc", feature = "std", feature = "no-atomic"))
-))]
-const _: () = {
-  impl Name {
-    /// Constructs a [`Name`] from a string, validating label lengths and
-    /// total length, normalizing to canonical lowercase.
-    pub fn try_from_str(s: &str) -> Result<Self, NameError> {
-      validate_name(s)?;
-      // ASCII-only case-fold (RFC 4343); iterate CHARS so non-ASCII UTF-8
-      // (RFC 6763 §4.1 instance names) is preserved, not double-encoded.
-      let mut buf: NameInner = heapless::String::new();
-      for ch in s.chars() {
-        buf
-          .push(ch.to_ascii_lowercase())
-          .map_err(|_| NameError::NameTooLong(NameTooLongDetail::new(s.len())))?;
-      }
-      Ok(Self(buf))
-    }
-
-    /// Builds a canonical [`Name`] directly from a sequence of raw wire labels
-    /// (each the decompressed bytes of one DNS label, no length prefix),
-    /// joining them with `.` plus a trailing `.`. Labels are ASCII case-folded
-    /// (RFC 4343); non-ASCII bytes are preserved, and the assembled name must
-    /// be valid UTF-8 — DNS-SD names are UTF-8 (RFC 6763 §4.1). Returns `None`
-    /// on a malformed label (`Err` item), non-UTF-8 bytes, or a label/total
-    /// length violation. Wire-decode counterpart to [`Name::try_from_str`].
-    pub fn from_wire_labels<'a, E, I>(labels: I) -> Option<Self>
-    where
-      I: IntoIterator<Item = Result<&'a [u8], E>>,
-    {
-      let mut buf: NameInner = heapless::String::new();
-      let mut wire_len: usize = 1; // terminating root label (RFC 1035 §3.1)
-      for label in labels {
-        let label = label.ok()?;
-        // Enforce the length limits before decoding (see the alloc/std path);
-        // the heapless buffer is already capped at MAX_NAME_BYTES, but this
-        // rejects an oversized label without scanning it first.
-        if label.len() > MAX_LABEL_BYTES as usize {
-          return None;
-        }
-        wire_len = wire_len.saturating_add(1).saturating_add(label.len());
-        if wire_len > MAX_NAME_BYTES {
-          return None;
-        }
-        // Reject a label carrying a literal '.' (see the alloc/std path): with
-        // '.' as the join separator a dot-bearing label would alias a different
-        // label sequence and poison cache identity.
-        if label.contains(&b'.') {
-          return None;
-        }
-        for ch in core::str::from_utf8(label).ok()?.chars() {
-          buf.push(ch.to_ascii_lowercase()).ok()?;
-        }
-        buf.push('.').ok()?;
-      }
-      validate_name(&buf).ok()?;
-      Some(Self(buf))
-    }
-  }
-};
-
-#[cfg(all(test, any(feature = "alloc", feature = "std", feature = "heapless")))]
+#[cfg(all(test, any(feature = "alloc", feature = "std", feature = "no-atomic")))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

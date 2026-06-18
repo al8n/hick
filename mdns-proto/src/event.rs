@@ -5,7 +5,7 @@ use core::net::SocketAddr;
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 
-cfg_storage! {
+cfg_heap! {
   use crate::Name;
 }
 use crate::{
@@ -252,7 +252,7 @@ pub enum RouteEvent<'a> {
   CacheUpdated,
 }
 
-cfg_storage! {
+cfg_heap! {
   /// Detail payload for [`ServiceUpdate::Renamed`].
   #[derive(Debug, Clone, Eq, PartialEq)]
   pub struct ServiceRenamed {

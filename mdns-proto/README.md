@@ -46,8 +46,7 @@ thin layers over this crate. Most applications want one of those, or the
 | `std` *(default)* | `std` hosts (e.g. tokio, smol) |
 | `alloc` | `no_std` with a global allocator (Embassy, RTIC, ESP-IDF, wasm32) |
 | `no-atomic` | `no_std` + allocator on cores **without** native atomic CAS (Cortex-M0+ / thumbv6m / RP2040): same Endpoint as `alloc`, but the refcounted Name / rdata use `portable-atomic`'s `Arc` (clone via a `critical-section` impl the binary provides) instead of `smol_str` + `bytes`. Mutually exclusive with `alloc` / `std`; no `stats`. |
-| `heapless` | `no_std`, fixed-capacity collections, no allocator |
-| *(none)* | bare-metal `no_std`, no heap at all |
+| *(none)* | bare-metal `no_std`, no allocator: **parse-only** (borrowed `NameRef`); owned `Name` and the message builder need a tier above |
 
 Other features:
 
@@ -62,16 +61,16 @@ Other features:
 
 ```toml
 [dependencies]
-mdns-proto = "0.2"                                                # std + slab
+mdns-proto = "0.3"                                                # std + slab
 
 # no_std + alloc:
-mdns-proto = { version = "0.2", default-features = false, features = ["alloc"] }
+mdns-proto = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # no_std + alloc on a core WITHOUT native atomics (Cortex-M0+ / RP2040):
-mdns-proto = { version = "0.2", default-features = false, features = ["no-atomic"] }
+mdns-proto = { version = "0.3", default-features = false, features = ["no-atomic"] }
 
 # bare no_std (no allocator):
-mdns-proto = { version = "0.2", default-features = false }
+mdns-proto = { version = "0.3", default-features = false }
 ```
 
 ## Observability

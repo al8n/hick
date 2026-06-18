@@ -301,8 +301,8 @@ impl core::fmt::Display for CappedPoolFull {
 impl core::error::Error for CappedPoolFull {}
 
 /// A test-only [`Pool`] with a hard capacity of `N`, independent of the
-/// `Query`'s logical `max_answers`. Models a fixed-capacity backing (e.g.
-/// `heapless::Vec<_, N>`) whose `insert`/`vacant_key` fail once full — the
+/// `Query`'s logical `max_answers`. Models a fixed-capacity fallible pool
+/// whose `insert`/`vacant_key` fail once full — the
 /// scenario the `max_answers`-only eviction check cannot see.
 struct CappedPool<const N: usize> {
   slots: std::vec::Vec<Option<CollectedAnswer>>,

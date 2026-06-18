@@ -38,9 +38,9 @@ networks.
   exhaustively unit-tested. The drivers only shuttle bytes and time in and out.
 - **Runtime-agnostic.** Drive it from `tokio`, `smol`, or `compio`
   (thread-per-core) with no change to protocol behavior.
-- **`no_std` and bare-metal.** The core runs on `alloc` — or `heapless`, with no
-  allocator at all — and [`hick-smoltcp`] / [`hick-embassy`] bring full mDNS to
-  embedded targets over smoltcp.
+- **`no_std` and bare-metal.** The core runs on `alloc`, or `no-atomic` for cores
+  without native atomic CAS (Cortex-M0+ / RP2040), and [`hick-smoltcp`] /
+  [`hick-embassy`] bring full mDNS to embedded targets over smoltcp.
 - **RFC 6762 / 6763 conformant.** Probing and announcing, name-conflict
   detection with automatic renaming, known-answer and duplicate-question
   suppression, TTL-accurate caching, and TTL=0 goodbyes on withdrawal.

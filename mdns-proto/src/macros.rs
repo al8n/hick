@@ -10,13 +10,13 @@
 //! statements are not items, so a handful of those keep an explicit `#[cfg(...)]`.
 
 // Which helpers are invoked depends on the active feature tier — e.g. `cfg_stats`
-// is only used inside the heap-gated `endpoint` module, so it is dead in a
-// `heapless`-only build.
+// is only used inside the heap-gated `endpoint` module, so it is dead in a bare
+// build (none of `alloc` / `std` / `no-atomic`) where that module is absent.
 #![allow(unused_macros)]
 
 // Items that need a heap allocator — the dynamic-storage (Endpoint) tier:
 // `alloc`, `std`, or the `no-atomic` (portable-atomic) tier. Mirrors the
-// `NameInner` heap arms; deliberately excludes `heapless`.
+// `NameInner` heap arms.
 macro_rules! cfg_heap {
   ($($item:item)*) => {
     $(
@@ -24,31 +24,6 @@ macro_rules! cfg_heap {
       #[cfg_attr(
         docsrs,
         doc(cfg(any(feature = "alloc", feature = "std", feature = "no-atomic")))
-      )]
-      $item
-    )*
-  };
-}
-
-// Items available on *any* storage tier that can hold a `Name`: the heap tiers
-// (`alloc` / `std` / `no-atomic`) plus fixed-capacity `heapless`.
-macro_rules! cfg_storage {
-  ($($item:item)*) => {
-    $(
-      #[cfg(any(
-        feature = "alloc",
-        feature = "std",
-        feature = "heapless",
-        feature = "no-atomic"
-      ))]
-      #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-          feature = "alloc",
-          feature = "std",
-          feature = "heapless",
-          feature = "no-atomic"
-        )))
       )]
       $item
     )*

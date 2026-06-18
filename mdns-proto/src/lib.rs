@@ -32,8 +32,8 @@ extern crate alloc as std;
 #[cfg(feature = "std")]
 extern crate std;
 
-// `cfg_heap!` / `cfg_storage!` / `cfg_stats!` — declared first so they are in
-// textual scope for every module below.
+// `cfg_heap!` / `cfg_stats!` — declared first so they are in textual scope for
+// every module below.
 #[macro_use]
 mod macros;
 
@@ -71,7 +71,7 @@ pub mod name;
 
 pub use name::{LabelTooLongDetail, NameError, NameTooLongDetail};
 
-cfg_storage! {
+cfg_heap! {
   /// Owned, canonical DNS name root re-export.
   pub use name::Name;
 }
@@ -103,7 +103,7 @@ pub use event::{
 };
 pub use transmit::Transmit;
 
-cfg_storage! {
+cfg_heap! {
   pub use event::{ServiceRenamed, ServiceUpdate};
 }
 
@@ -122,7 +122,7 @@ cfg_heap! {
   pub use config::ServiceSpec;
 }
 
-cfg_storage! {
+cfg_heap! {
   pub use config::QuerySpec;
 }
 

@@ -581,19 +581,19 @@ fn cache_flush_grace_treats_future_received_at_as_recent() {
 // ── reactive eviction: fallible pool capacity error + retry ──
 
 /// When the backing [`Pool`] is fixed-capacity and FALLIBLE (here a
-/// `heapless::Vec`, whose `insert` returns `Err` once full), an insert that
-/// overflows the pool must trigger `bounded_insert`'s reactive eviction:
-/// evict the soonest-expiring entry, then retry the insert once (which now
-/// succeeds).
+/// [`FixedPool`](crate::pool::FixedPool), whose `insert` returns `Err` once
+/// full), an insert that overflows the pool must trigger `bounded_insert`'s
+/// reactive eviction: evict the soonest-expiring entry, then retry the insert
+/// once (which now succeeds).
 ///
 /// `max_entries` is set ABOVE the pool's fixed capacity so the proactive
 /// `len >= max_entries` eviction (Step 1) never fires — the only thing that
 /// can make room is the reactive Step 3 driven by the pool's capacity error.
-#[cfg(feature = "heapless")]
+#[cfg(feature = "slab")]
 #[test]
 fn fallible_pool_capacity_error_triggers_reactive_eviction() {
   // Fixed capacity 2; cap deliberately higher so proactive eviction is inert.
-  let mut c: Cache<Instant, heapless::Vec<Option<CacheEntry<Instant>>, 2>> =
+  let mut c: Cache<Instant, crate::pool::FixedPool<CacheEntry<Instant>, 2>> =
     Cache::with_max_entries(100);
   // Attach stats so the reactive-eviction counter bump is exercised too.
   #[cfg(feature = "stats")]

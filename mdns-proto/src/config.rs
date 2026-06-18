@@ -1,13 +1,13 @@
 //! Configuration types passed to Endpoint/Service/Query constructors.
 
-cfg_storage! {
+cfg_heap! {
   use core::time::Duration;
 }
 
 cfg_heap! {
   use crate::records::ServiceRecords;
 }
-cfg_storage! {
+cfg_heap! {
   use crate::{
     Name,
     wire::{ResourceClass, ResourceType},
@@ -136,7 +136,7 @@ cfg_heap! {
   }
 }
 
-cfg_storage! {
+cfg_heap! {
   /// Spec for starting a query.
   #[derive(Debug, Clone, Eq, PartialEq)]
   pub struct QuerySpec {
@@ -233,7 +233,7 @@ cfg_storage! {
 }
 
 #[cfg(test)]
-// QuerySpec / Name need a heap (or heapless) name store, so the test module is
+// QuerySpec / Name need a heap name store, so the test module is
 // gated to the tiers where they exist — `--no-default-features` is core-only.
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[allow(clippy::unwrap_used)]

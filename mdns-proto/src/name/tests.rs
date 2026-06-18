@@ -72,8 +72,8 @@ fn accepts_trailing_dot() {
 
 #[test]
 fn rejects_label_over_63_bytes() {
-  // Use a literal long label rather than `.repeat()` so the test runs
-  // under `--no-default-features --features heapless` (no alloc).
+  // Use a literal long label rather than `.repeat()` so the test stays
+  // valid in a parse-only build with no allocator.
   let long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 65 'a'
   let err = Name::try_from_str(long).unwrap_err();
   assert!(matches!(err, NameError::LabelTooLong(_)));

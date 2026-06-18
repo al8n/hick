@@ -1,6 +1,6 @@
 [package]
 name = "mdns-proto"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91.0"
 license = "MIT OR Apache-2.0"
@@ -15,7 +15,6 @@ default = ["std", "slab"]
 std = ["smol_str/std", "rand/std", "thiserror/std", "bytes/std"]
 alloc = ["dep:smol_str", "dep:rand", "dep:bytes"]
 slab = ["dep:slab"]
-heapless = ["dep:heapless"]
 # `no-atomic`: the alloc tier for cores WITHOUT native atomic CAS (Cortex-M0+ /
 # thumbv6m / RP2040). Same Endpoint state machine as `alloc`, but the
 # refcounted Name / rdata storage uses `portable_atomic_util::Arc` (cheap clone
@@ -42,7 +41,6 @@ smol_str = { workspace = true, optional = true }
 bytes = { version = "1", default-features = false, optional = true }
 rand = { workspace = true, features = ["std_rng"], optional = true }
 slab = { workspace = true, optional = true }
-heapless = { version = "0.9", optional = true }
 portable-atomic = { version = "1", default-features = false, optional = true }
 portable-atomic-util = { version = "0.2", default-features = false, features = [
   "alloc",
