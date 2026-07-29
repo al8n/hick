@@ -254,6 +254,20 @@ pub(crate) fn set_recv_hoplimit_v6(_sock: &UdpSocket) -> std::io::Result<()> {
 /// `unsafe` ffi for these options lives in one audited place. Always
 /// compiled — `set_recv_pktinfo_v6` is unconditional, so this is reached on
 /// every Unix target.
+///
+/// Valid ONLY for genuinely `int`-sized options: `optlen` below is hardcoded
+/// to `size_of::<c_int>()`, so do not route an option through here without
+/// first confirming it is `int`-sized on every target this crate supports —
+/// classic BSD sockets documentation specifies `IP_MULTICAST_TTL` /
+/// `IP_MULTICAST_LOOP` as `u_char`, and other BSDs are commonly strict about
+/// rejecting anything but `sizeof(u_char)` for them. (Direct `setsockopt`
+/// probing on one macOS host found it actually accepts either an
+/// exactly-1-byte or an at-least-4-byte value for both, rejecting 2/3 bytes —
+/// so a naive `c_int` would not silently corrupt anything there specifically,
+/// but that is one host's observed leniency, not a portable guarantee across
+/// every BSD this crate targets.) `set_multicast_ttl_v4`/`set_multicast_loop_v4`
+/// stay on the rustix path for exactly this reason — don't move them here
+/// without re-verifying the accepted width on every target.
 fn set_int_sockopt(
   sock: &UdpSocket,
   level: libc::c_int,
