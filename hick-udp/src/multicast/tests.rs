@@ -303,3 +303,134 @@ fn cmsg_iter_is_sound_on_crafted_and_unaligned_input() {
   );
   assert!(items[0].is_ok());
 }
+
+/// Regression test for the library-side `IPV6_MULTICAST_HOPS` read-back
+/// verification's COMPARISON logic (`verify_multicast_hops_v6`, wired into
+/// `try_bind_v6_inner` right after `platform::set_multicast_hops_v6`).
+///
+/// This test calls the private verifier directly, so it proves the
+/// comparison itself is correct in isolation; it does NOT prove
+/// `try_bind_v6_inner` still calls it — see
+/// `try_bind_v6_rejects_a_mismatch_forced_through_production_wiring` below
+/// for the test that exercises the real call sequence. (An earlier version
+/// of this doc comment claimed no such test was possible without a
+/// production-only seam; that seam now exists — `FORCE_APPLIED_HOPS_V6` in
+/// `multicast.rs` — so the claim was corrected rather than left stale.)
+///
+/// Uses `expect_bind_or_skip`, NOT a bare `Err(_) => skip`: a Codex review
+/// found that this test's initial bind previously matched every `BindError`
+/// as an environmental skip, which would have silently absorbed an inverted
+/// verifier comparison the moment `try_bind_v6`'s OWN internal check fired
+/// during the setup bind — the test would report a skip, not a failure, for
+/// the exact regression it exists to catch. `expect_bind_or_skip` panics
+/// loudly on any `BindError` that is not a recognized environment refusal,
+/// `MulticastHopsNotApplied` very much included.
+///
+/// The scenario reproduced below is honest, not fabricated: it uses the
+/// crate's own (correct) setter to move the real hop limit to a second value
+/// after binding, matching the historical bug's OBSERVABLE shape — a socket
+/// whose real hop limit does not match what was asked for — rather than
+/// lying about the `requested` argument. If `verify_multicast_hops_v6` is
+/// deleted, or its comparison is weakened to always succeed, this test
+/// fails.
+#[test]
+fn verify_multicast_hops_v6_rejects_a_kernel_value_that_drifted_from_the_request() {
+  let opts = MulticastOptionsV6::new(0);
+  let requested = opts.hops();
+  let Some(sock) = expect_bind_or_skip(
+    "verify_multicast_hops_v6_rejects_a_kernel_value_that_drifted_from_the_request",
+    try_bind_v6(opts),
+  ) else {
+    return;
+  };
+
+  // Sanity: immediately after a successful bind, the real kernel state
+  // already matches what was requested — try_bind_v6_inner's own call to
+  // verify_multicast_hops_v6 already confirmed this before returning `sock`,
+  // so this just re-derives the same fact through the same function the
+  // mismatch check below relies on.
+  verify_multicast_hops_v6(&sock, requested)
+    .expect("a freshly bound socket must verify against the hop limit it was bound with");
+
+  // Move the real kernel value away from `requested`, using the crate's own
+  // (correct) setter. `wrapping_add(1)` on a `u8` always yields a different
+  // value, so `drifted != requested` unconditionally.
+  let drifted = requested.wrapping_add(1);
+  platform::set_multicast_hops_v6(&sock, drifted)
+    .expect("re-applying a different hop limit for this simulation must itself succeed");
+
+  // The verifier must now reject `requested`: the kernel no longer holds it.
+  let err = verify_multicast_hops_v6(&sock, requested).expect_err(
+    "a socket whose real hop limit no longer matches `requested` must be rejected, not \
+     silently accepted",
+  );
+  let detail = err
+    .try_unwrap_multicast_hops_not_applied()
+    .expect("expected BindError::MulticastHopsNotApplied");
+  assert_eq!(detail.requested(), requested);
+  assert_eq!(detail.observed(), i32::from(drifted));
+}
+
+/// Regression test for the Codex R2 finding that no test proved
+/// `verify_multicast_hops_v6` is actually WIRED into `try_bind_v6_inner`'s
+/// production call sequence: the test above calls the verifier directly, so
+/// it would keep passing even if the call site at `multicast.rs` (right
+/// after `platform::set_multicast_hops_v6`) were deleted entirely, since the
+/// helper it calls would still exist and still work correctly in isolation.
+///
+/// This test goes through the PUBLIC `try_bind_v6` entry point — the same
+/// one every real caller uses — with the `FORCE_APPLIED_HOPS_V6` test-only
+/// seam forcing the value actually applied to the kernel to differ from the
+/// value the caller believes was requested. See that seam's doc in
+/// `multicast.rs` for why a seam is unavoidable here: no input reachable
+/// through `MulticastOptionsV6`/`try_bind_v6` alone can ever force this
+/// disagreement on a correctly functioning kernel, so there is no seam-free
+/// way to prove the WIRING (as opposed to the comparison) without
+/// reintroducing a real bug.
+///
+/// Uses `expect_bind_or_skip`'s allowlist for the one expected-and-legitimate
+/// non-regression outcome (the environment refuses IPv6 binding entirely),
+/// but — critically — does NOT hand `try_bind_v6`'s result to that helper
+/// directly: `expect_bind_or_skip` treats a `BindError::Io` matching
+/// `is_environment_refusal` as a skip and panics on everything else,
+/// including `MulticastHopsNotApplied` — the exact outcome this test expects
+/// to see on success. So this test open-codes the same allowlist check for
+/// the one “not the outcome under test but also not a bug” case (environment
+/// refusal), and treats every other outcome — an unexpected `Ok`, or any
+/// `BindError` variant other than `MulticastHopsNotApplied` — as the test's
+/// own failure, not a skip.
+///
+/// If `verify_multicast_hops_v6`'s call is deleted from `try_bind_v6_inner`,
+/// `try_bind_v6` returns `Ok` here (the forced-wrong value is never checked),
+/// and this test fails. If the comparison is inverted or neutered, same
+/// result: `Ok`, and this test fails.
+#[test]
+fn try_bind_v6_rejects_a_mismatch_forced_through_production_wiring() {
+  let opts = MulticastOptionsV6::new(0);
+  let requested = opts.hops();
+  let forced = requested.wrapping_add(1);
+
+  FORCE_APPLIED_HOPS_V6.with(|cell| cell.set(Some(forced)));
+  let result = try_bind_v6(opts);
+  // Reset before anything below can fail an assertion, so the override never
+  // leaks into a later test on this thread even on an early failure here.
+  FORCE_APPLIED_HOPS_V6.with(|cell| cell.set(None));
+
+  let err = match result {
+    Err(BindError::Io(e)) if is_environment_refusal(&e) => {
+      eprintln!("skipping: environment refused the IPv6 bind needed to exercise this seam ({e})");
+      return;
+    }
+    other => other.expect_err(
+      "try_bind_v6 must reject a bind where the production wiring's own requested/observed \
+       check disagrees — an Ok here means either the verifier call was removed from \
+       try_bind_v6_inner or its comparison no longer detects a real disagreement",
+    ),
+  };
+  let detail = err.try_unwrap_multicast_hops_not_applied().expect(
+    "expected BindError::MulticastHopsNotApplied — a different BindError variant means \
+     try_bind_v6 failed for a reason unrelated to the forced hops mismatch",
+  );
+  assert_eq!(detail.requested(), requested);
+  assert_eq!(detail.observed(), i32::from(forced));
+}

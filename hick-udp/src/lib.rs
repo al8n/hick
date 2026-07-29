@@ -22,7 +22,7 @@ pub mod error;
 
 pub use error::{
   AddressInUseDetail, BindError, BufferTooShortDetail, InterfaceNotFoundDetail, JoinError,
-  ParseRecvMetaError,
+  MulticastHopsNotAppliedDetail, ParseRecvMetaError,
 };
 
 /// Multicast socket configuration + cmsg parsing.

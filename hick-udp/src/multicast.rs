@@ -279,6 +279,64 @@ pub fn try_bind_v6(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   })
 }
 
+/// Read `IPV6_MULTICAST_HOPS` back immediately after
+/// `platform::set_multicast_hops_v6` and turn a mismatch into a distinct,
+/// diagnosable [`BindError`] instead of letting the bind silently return a
+/// socket configured differently than the caller asked for.
+///
+/// This is the ONLY sockopt `try_bind_v6`/`try_bind_v4` verify this way — see
+/// `crate::platform::unix::set_multicast_hops_v6` for why: it is the one
+/// option in this crate that has already failed silently in production (the
+/// rustix wrong-protocol-level defect landed on Linux's unrelated
+/// `IP_PASSSEC` boolean, reporting success while the real hop limit stayed at
+/// its default of 1, violating the 255 RFC 6762 §11 requires). Every other
+/// option these two functions set either has no comparable history, or is
+/// already explicitly best-effort (the receive-cmsg enablers below, which
+/// degrade gracefully when unavailable and so are never checked for success
+/// at all, let alone read back) — re-reading those would add a syscall
+/// without adding safety.
+///
+/// Unix-only: the read-back chokepoint (`get_int_sockopt`) only exists on
+/// this platform. Windows sets this option through `socket2`, which passes
+/// the correct protocol level — there is no known defect to detect there, so
+/// no equivalent verification is added.
+#[cfg(unix)]
+fn verify_multicast_hops_v6(sock: &UdpSocket, requested: u8) -> Result<(), BindError> {
+  let observed = platform::get_multicast_hops_v6(sock)?;
+  if observed != i32::from(requested) {
+    return Err(BindError::MulticastHopsNotApplied(
+      crate::error::MulticastHopsNotAppliedDetail::new(requested, observed),
+    ));
+  }
+  Ok(())
+}
+
+// Test-only seam for `try_bind_v6_inner`, below: when set with `.set(Some(v))`
+// from inside a test (on that test's own thread), makes the function apply
+// `v` to the kernel via `set_multicast_hops_v6` while still telling
+// `verify_multicast_hops_v6` that `opts.hops()` was requested — forcing a
+// genuine requested/observed disagreement through the REAL production call
+// sequence. This is the only way to do that: on a correctly functioning
+// kernel every value `MulticastOptionsV6::hops()` can hold (0..=255)
+// round-trips faithfully, so no input reachable through the public API alone
+// can ever make the setter and the verifier disagree — which is exactly why
+// `crate::multicast::tests::try_bind_v6_rejects_a_mismatch_forced_through_production_wiring`
+// needs this to exist at all, rather than only exercising
+// `verify_multicast_hops_v6` directly (see that test's doc for the Codex
+// review finding this seam closes: calling the verifier directly proves the
+// comparison works, but not that `try_bind_v6_inner` still calls it).
+//
+// `None` (the default) means "apply `opts.hops()` faithfully," identical to
+// production behavior; this is the ONLY possible value outside `#[cfg(test)]`
+// builds, since the item does not exist at all there. Thread-local, not a
+// plain global `static`, so tests running concurrently on separate threads
+// (the default `libtest` behavior) can never interfere with each other
+// through it.
+#[cfg(test)]
+thread_local! {
+  static FORCE_APPLIED_HOPS_V6: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
 fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   // Create + bind the socket. IPV6_V6ONLY is set before bind so a `[::]:5353`
   // socket doesn't also accept IPv4 (as v4-mapped) and collide with the separate
@@ -295,7 +353,21 @@ fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   // applies the analogous IP_MULTICAST_LOOP). Without this the option was
   // silently ignored and self-loopback could not be disabled on v6.
   platform::set_multicast_loop_v6(&std_sock, opts.multicast_loop())?;
-  platform::set_multicast_hops_v6(&std_sock, opts.hops())?;
+
+  // `hops_to_apply` is `opts.hops()` in every real build. See
+  // `FORCE_APPLIED_HOPS_V6` for why the `#[cfg(test)]` override exists.
+  let hops_to_apply = opts.hops();
+  #[cfg(test)]
+  let hops_to_apply = FORCE_APPLIED_HOPS_V6
+    .with(|cell| cell.get())
+    .unwrap_or(hops_to_apply);
+
+  platform::set_multicast_hops_v6(&std_sock, hops_to_apply)?;
+  // See `verify_multicast_hops_v6`'s doc for why this ONE option, and only
+  // this one, gets a read-back: it already failed silently in production
+  // despite `setsockopt` reporting success.
+  #[cfg(unix)]
+  verify_multicast_hops_v6(&std_sock, opts.hops())?;
   // Best-effort: enabling IPV6_PKTINFO must not fail the bind on platforms that
   // lack it. A missing PKTINFO just means the driver falls back to its
   // hash-ring self-detection.
@@ -877,6 +949,170 @@ impl<'a> Iterator for CmsgIter<'a> {
   }
 }
 
+// ============================================================================
+// PAIRED CLASSIFIER — this function has a sibling copy, `is_environment_refusal`,
+// in `hick-udp/tests/loopback.rs`. The two must classify identically. If you
+// change the allowlist here (add/remove an `ErrorKind` or a raw-errno arm),
+// make the SAME change there, and vice versa. This pairing is exactly what
+// let a Codex review catch a gap that existed in BOTH copies at once: neither
+// recognized Windows' `WSAEAFNOSUPPORT`, because the omission was copied along
+// with everything else. See the "why two copies, not one" note below before
+// "solving" this by deleting one of them.
+// ============================================================================
+/// Whether `e` represents a legitimate environment refusal to bind (not a
+/// hick-udp bug). Kept intentionally narrow: `PermissionDenied` /
+/// `AddrInUse` / `AddrNotAvailable`, plus an errno-matched
+/// "address family not supported" on the two platform families this crate
+/// compiles for (`EAFNOSUPPORT` on Unix, `WSAEAFNOSUPPORT` on Windows). A
+/// skip arm that accepts anything wider than this can absorb the exact
+/// regressions these tests exist to catch — see `expect_bind_or_skip`'s doc
+/// for the finding that made this explicit, and the module-level audit in
+/// this crate's Codex-review report for why `ErrorKind::Uncategorized` /
+/// `InvalidInput` are deliberately NOT in this allowlist: broadening to
+/// either would re-admit `EINVAL`, the exact errno the whole branch this
+/// file belongs to exists to stop silently skipping.
+///
+/// Why two copies instead of one shared definition: the library's own unit
+/// tests and `hick-udp/tests/loopback.rs` are separate compilation units — an
+/// integration-test binary links against the COMPILED library as an external
+/// crate, so it cannot see anything gated `#[cfg(test)]` inside the library
+/// (that cfg only applies when the library itself is being tested). Sharing
+/// for real would require either growing the library's real, public,
+/// always-compiled API purely to expose test-classification logic (this
+/// crate is otherwise disciplined about a tight public surface — see
+/// `#![deny(missing_docs)]` and the `pub(crate)` sockopt chokepoints in
+/// `platform/unix.rs`), or a new workspace member crate for ~20 lines of
+/// logic. Both costs seemed to outweigh removing one small duplication, so
+/// this stays two copies — kept honest by the pairing marker above, the
+/// identical structure, and a matching set of classifier regression tests in
+/// both files (see `is_environment_refusal_classifier_tests` below).
+#[cfg(test)]
+fn is_environment_refusal(e: &std::io::Error) -> bool {
+  use std::io::ErrorKind;
+  if matches!(
+    e.kind(),
+    ErrorKind::PermissionDenied | ErrorKind::AddrInUse | ErrorKind::AddrNotAvailable
+  ) {
+    return true;
+  }
+  #[cfg(unix)]
+  if e.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+    return true;
+  }
+  #[cfg(windows)]
+  if e.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT) {
+    return true;
+  }
+  false
+}
+
+/// Bind-or-skip helper for this crate's own unit tests, mirroring
+/// `hick-udp/tests/loopback.rs`'s `expect_bind_or_skip` exactly (same shape,
+/// same allowlist via `is_environment_refusal`).
+///
+/// Exists because of a Codex review finding on an earlier version of the
+/// `verify_multicast_hops_v6` regression test: it matched `Err(e) => skip`
+/// on the INITIAL bind — every `BindError` variant, not just `Io` ones. Had
+/// the verifier's comparison been inverted, `try_bind_v6` would have
+/// returned `Err(BindError::MulticastHopsNotApplied(_))` right there, and
+/// that bare `Err(e) => skip` would have absorbed it as if the environment
+/// had merely refused the bind — the test would report a skip, not a
+/// failure, for the exact regression it exists to catch. The same
+/// overly-broad shape was already present, independently, in every test
+/// below that pre-dates this file's `MulticastHopsNotApplied` variant: none
+/// of them could have swallowed THAT specific error before it existed, but
+/// all of them could swallow any other non-environmental `BindError` a
+/// future regression might introduce, which is the general class Codex
+/// asked this crate to close in one pass, not just the one instance.
+#[cfg(test)]
+#[allow(clippy::panic)]
+fn expect_bind_or_skip<T>(label: &str, result: Result<T, BindError>) -> Option<T> {
+  match result {
+    Ok(v) => Some(v),
+    Err(BindError::Io(e)) if is_environment_refusal(&e) => {
+      eprintln!("{label}: environment refused ({e}); skipping");
+      None
+    }
+    Err(e) => panic!(
+      "{label}: bind failed with an error that is not a recognized environment refusal — this \
+       indicates a bug in our own binding/verification code, not an environment limitation: \
+       {e:?}"
+    ),
+  }
+}
+
+// PAIRED CLASSIFIER TESTS — `hick-udp/tests/loopback.rs` has an identical
+// `is_environment_refusal_classifier_tests` module for its own copy of
+// `is_environment_refusal`. Extend both whenever a new platform/errno is
+// added to either classifier.
+#[cfg(test)]
+mod is_environment_refusal_classifier_tests {
+  use super::is_environment_refusal;
+
+  // The Codex R3 finding this module exists to guard against: an
+  // IPv6-unavailable Windows runner reports WSAEAFNOSUPPORT, which maps to no
+  // named, stable `ErrorKind` (std's internal bookkeeping calls this bucket
+  // `Uncategorized`, but that variant is `#[unstable]`/`#[doc(hidden)]` and
+  // cannot be named from this crate — which is exactly why the fix is a raw
+  // `raw_os_error()` match, not a broadened `ErrorKind` match). Without the
+  // `#[cfg(windows)]` arm in `is_environment_refusal`, this case fell through
+  // to `false`, and every all-platform unit test that binds v6 with no
+  // preceding IPv6-availability check would panic instead of skipping.
+  #[cfg(windows)]
+  #[test]
+  fn recognizes_wsaeafnosupport() {
+    let e =
+      std::io::Error::from_raw_os_error(windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT);
+    assert!(
+      is_environment_refusal(&e),
+      "WSAEAFNOSUPPORT (10047) must be recognized as an environment refusal, or an \
+       IPv6-unavailable Windows runner fails these tests instead of skipping them"
+    );
+  }
+
+  // The overcorrection this module ALSO guards against: broadening the
+  // allowlist to catch WSAEAFNOSUPPORT must not accidentally catch
+  // WSAEINVAL too — that is Windows' shape of the ORIGINAL defect this whole
+  // branch exists to stop hiding (rustix passing the wrong protocol level
+  // produced EINVAL on macOS; the equivalent wrong-level mistake on Windows
+  // would produce WSAEINVAL). A skip arm that swallows this is the R2 defect
+  // all over again, just on a different platform.
+  #[cfg(windows)]
+  #[test]
+  fn rejects_wsaeinval() {
+    let e = std::io::Error::from_raw_os_error(windows_sys::Win32::Networking::WinSock::WSAEINVAL);
+    assert!(
+      !is_environment_refusal(&e),
+      "WSAEINVAL (10022) must never be classified as an environment refusal"
+    );
+  }
+
+  // Unix-side mirror of the two Windows tests above, for symmetry: proves
+  // the allowlist is complete AND not overcorrected on this platform family
+  // too, with an executable check rather than only a source-level audit.
+  #[cfg(unix)]
+  #[test]
+  fn recognizes_eafnosupport() {
+    let e = std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
+    assert!(
+      is_environment_refusal(&e),
+      "EAFNOSUPPORT must be recognized as an environment refusal"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn rejects_einval() {
+    let e = std::io::Error::from_raw_os_error(libc::EINVAL);
+    assert!(
+      !is_environment_refusal(&e),
+      "EINVAL must never be classified as an environment refusal — it is the exact errno the \
+       rustix wrong-protocol-level bug produced on macOS, which this whole branch exists to \
+       stop silently skipping"
+    );
+  }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod r4_f5_tests {
@@ -890,9 +1126,11 @@ mod r4_f5_tests {
     // try_bind_v4 does not attempt IP_MULTICAST_IF (which would require a
     // real indexed interface).
     let opts = MulticastOptionsV4::new(0);
-    let sock = match try_bind_v4(opts) {
-      Ok(s) => s,
-      Err(_) => return, // env-specific (e.g. no IPv4 stack); skip gracefully
+    let Some(sock) = expect_bind_or_skip(
+      "try_join_v4_errors_on_nonexistent_interface_index",
+      try_bind_v4(opts),
+    ) else {
+      return;
     };
 
     // u32::MAX is reserved / unassignable — getifs::interface_by_index
@@ -926,9 +1164,11 @@ mod r4_f5_tests {
     // a bound v4 socket must egress unicast (legacy §6.7) AND
     // multicast sends with TTL 255 (RFC 6762 §11). These are distinct socket
     // options; both must be 255. Best-effort: skip if the env can't bind.
-    let sock = match try_bind_v4(MulticastOptionsV4::new(0)) {
-      Ok(s) => s,
-      Err(_) => return,
+    let Some(sock) = expect_bind_or_skip(
+      "try_bind_v4_sets_unicast_and_multicast_ttl_255",
+      try_bind_v4(MulticastOptionsV4::new(0)),
+    ) else {
+      return;
     };
     assert_eq!(sock.ttl().unwrap(), 255, "unicast IP_TTL must be 255");
     assert_eq!(
@@ -943,18 +1183,22 @@ mod r4_f5_tests {
     // with_multicast_loop(false) must actually disable IPv6
     // multicast loopback (it was previously ignored on v6). Best-effort: skip
     // if the env can't bind a v6 multicast socket.
-    let off = match try_bind_v6(MulticastOptionsV6::new(0).with_multicast_loop(false)) {
-      Ok(s) => s,
-      Err(_) => return,
+    let Some(off) = expect_bind_or_skip(
+      "try_bind_v6_applies_multicast_loop_option (loop=false)",
+      try_bind_v6(MulticastOptionsV6::new(0).with_multicast_loop(false)),
+    ) else {
+      return;
     };
     assert!(
       !off.multicast_loop_v6().unwrap(),
       "with_multicast_loop(false) must disable IPV6_MULTICAST_LOOP"
     );
 
-    let on = match try_bind_v6(MulticastOptionsV6::new(0)) {
-      Ok(s) => s,
-      Err(_) => return,
+    let Some(on) = expect_bind_or_skip(
+      "try_bind_v6_applies_multicast_loop_option (loop=true)",
+      try_bind_v6(MulticastOptionsV6::new(0)),
+    ) else {
+      return;
     };
     assert!(
       on.multicast_loop_v6().unwrap(),
@@ -967,9 +1211,11 @@ mod r4_f5_tests {
     // the v6 mDNS socket must be IPV6_V6ONLY so it does not also
     // receive IPv4 (v4-mapped) and collide with the separate IPv4 socket on
     // dual-stack-default systems. Best-effort: skip if the env can't bind v6.
-    let sock = match try_bind_v6(MulticastOptionsV6::new(0)) {
-      Ok(s) => s,
-      Err(_) => return,
+    let Some(sock) = expect_bind_or_skip(
+      "try_bind_v6_is_ipv6_only",
+      try_bind_v6(MulticastOptionsV6::new(0)),
+    ) else {
+      return;
     };
     let s2 = Socket::from(sock);
     assert!(

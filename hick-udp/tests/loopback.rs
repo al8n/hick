@@ -9,19 +9,36 @@ use hick_udp::{
   try_bind_v6,
 };
 
+// ============================================================================
+// PAIRED CLASSIFIER — this function has a sibling copy, `is_environment_refusal`,
+// in `hick-udp/src/multicast.rs` (the library's own unit tests). The two must
+// classify identically. If you change the allowlist here (add/remove an
+// `ErrorKind` or a raw-errno arm), make the SAME change there, and vice
+// versa. See that copy's doc for why this crate keeps two copies rather than
+// sharing one definition.
+// ============================================================================
 /// Whether `e` represents a legitimate environment refusal rather than our
 /// own bug: `PermissionDenied` (EPERM/EACCES), `AddrInUse`, `AddrNotAvailable`
-/// — or, on Unix only, `EAFNOSUPPORT` (errno-matched, not a broad `ErrorKind`:
-/// this is what a host with IPv6 disabled at the kernel level reports for an
-/// `AF_INET6` socket, e.g. Linux's `net.ipv6.conf.all.disable_ipv6=1`, and
-/// `std` does not map it to any of the three `ErrorKind`s above). Anything
-/// else — `EINVAL` above all — is our own bug, never an environment
-/// limitation: this crate had exactly that bug for its whole life, where
-/// `set_multicast_hops_v6` (`hick-udp/src/platform/unix.rs`) passed
-/// `IPV6_MULTICAST_HOPS` through a rustix helper that used the wrong protocol
-/// level, so `try_bind_v6` failed `EINVAL` on every interface and a
-/// swallow-all `Err(_) => skip` test could not tell that apart from a
-/// sandboxed CI environment.
+/// — or an errno-matched "address family not supported" on the two platform
+/// families this crate compiles for: Unix `EAFNOSUPPORT`, or Windows
+/// `WSAEAFNOSUPPORT`. Both are errno-matched, not a broad `ErrorKind`, and
+/// deliberately so: this is what a host with IPv6 disabled reports for an
+/// `AF_INET6` socket (e.g. Linux's `net.ipv6.conf.all.disable_ipv6=1`, or an
+/// IPv6-unavailable Windows runner), and `std` does not map either to any of
+/// the three `ErrorKind`s above — Windows' `WSAEAFNOSUPPORT` in particular
+/// maps to no NAMEABLE stable `ErrorKind` at all (std's internal bookkeeping
+/// calls that bucket `Uncategorized`, but that variant is
+/// `#[unstable]`/`#[doc(hidden)]`, so it cannot be matched from this crate —
+/// which is exactly why this is a raw `raw_os_error()` comparison, not an
+/// `ErrorKind` one). Anything else — `EINVAL`/`WSAEINVAL` above all — is our
+/// own bug, never an environment limitation: this crate had exactly that bug
+/// for its whole life, where `set_multicast_hops_v6`
+/// (`hick-udp/src/platform/unix.rs`) passed `IPV6_MULTICAST_HOPS` through a
+/// rustix helper that used the wrong protocol level, so `try_bind_v6` failed
+/// `EINVAL` on every interface and a swallow-all `Err(_) => skip` test could
+/// not tell that apart from a sandboxed CI environment. Do NOT widen this to
+/// `ErrorKind::Uncategorized` or `ErrorKind::InvalidInput` to "simplify" the
+/// Windows case — either would re-admit `EINVAL`/`WSAEINVAL`.
 fn is_environment_refusal(e: &std::io::Error) -> bool {
   if matches!(
     e.kind(),
@@ -33,7 +50,62 @@ fn is_environment_refusal(e: &std::io::Error) -> bool {
   if e.raw_os_error() == Some(libc::EAFNOSUPPORT) {
     return true;
   }
+  #[cfg(windows)]
+  if e.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT) {
+    return true;
+  }
   false
+}
+
+// PAIRED CLASSIFIER TESTS — `hick-udp/src/multicast.rs` has an identical
+// `is_environment_refusal_classifier_tests` module for its own copy. Extend
+// both whenever a new platform/errno is added to either classifier.
+mod is_environment_refusal_classifier_tests {
+  use super::is_environment_refusal;
+
+  #[cfg(windows)]
+  #[test]
+  fn recognizes_wsaeafnosupport() {
+    let e =
+      std::io::Error::from_raw_os_error(windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT);
+    assert!(
+      is_environment_refusal(&e),
+      "WSAEAFNOSUPPORT (10047) must be recognized as an environment refusal, or an \
+       IPv6-unavailable Windows runner fails these tests instead of skipping them"
+    );
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn rejects_wsaeinval() {
+    let e = std::io::Error::from_raw_os_error(windows_sys::Win32::Networking::WinSock::WSAEINVAL);
+    assert!(
+      !is_environment_refusal(&e),
+      "WSAEINVAL (10022) must never be classified as an environment refusal"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn recognizes_eafnosupport() {
+    let e = std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
+    assert!(
+      is_environment_refusal(&e),
+      "EAFNOSUPPORT must be recognized as an environment refusal"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn rejects_einval() {
+    let e = std::io::Error::from_raw_os_error(libc::EINVAL);
+    assert!(
+      !is_environment_refusal(&e),
+      "EINVAL must never be classified as an environment refusal — it is the exact errno the \
+       rustix wrong-protocol-level bug produced on macOS, which this whole branch exists to \
+       stop silently skipping"
+    );
+  }
 }
 
 /// Classify the result of a multicast-bind attempt via
@@ -80,6 +152,30 @@ fn expect_bind_or_skip<T>(label: &str, result: Result<T, BindError>) -> Option<T
 /// at its default of 1 instead of the 255 RFC 6762 §11 requires, which a bare
 /// `try_bind_v6(...).is_ok()` assertion cannot detect. Reading the value back
 /// through the correct level can.
+///
+/// `hick_udp` itself now performs the identical read-back internally (see
+/// `crate::multicast::verify_multicast_hops_v6` in `hick-udp/src/
+/// multicast.rs`) and fails the bind outright on a mismatch, so every check
+/// below that compares against this helper is, by construction, redundant
+/// with a check the library already made before returning `Ok`. It stays: an
+/// external, independent read-back is still worth having as defense in
+/// depth, and it is what lets this suite assert the OBSERVABLE property
+/// (`bind succeeded` ⇒ `hops are correct`) without reaching into the
+/// library's internals.
+///
+/// What this integration-test crate still cannot do is drive the library's
+/// verification down its failure path FROM HERE: no input reachable through
+/// the public API (`MulticastOptionsV6`/`try_bind_v6`) can make the setter
+/// and the verifier disagree on a correctly functioning kernel, since
+/// `try_bind_v6_inner` hands them the same `opts.hops()` value. That failure
+/// path — both the comparison logic in isolation, and the full production
+/// call sequence via a dedicated `#[cfg(test)]` seam
+/// (`FORCE_APPLIED_HOPS_V6`) — is exercised by
+/// `verify_multicast_hops_v6_rejects_a_kernel_value_that_drifted_from_the_request`
+/// and `try_bind_v6_rejects_a_mismatch_forced_through_production_wiring` in
+/// `hick-udp/src/multicast/tests.rs`, which have access to the crate's
+/// private internals that this file, as a separate integration-test crate,
+/// does not.
 #[cfg(unix)]
 fn read_multicast_hops_v6(sock: &std::net::UdpSocket) -> std::io::Result<u8> {
   use std::os::fd::AsRawFd;

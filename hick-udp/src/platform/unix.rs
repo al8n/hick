@@ -6,8 +6,11 @@
 //! below funnel through a SINGLE `libc::setsockopt` chokepoint
 //! (`set_int_sockopt`) because rustix models sockopts as a curated, typed set
 //! and — as of rustix 1.1.4 (the newest published) — exposes no setter for ANY
-//! of them, and no generic/raw `setsockopt` escape hatch. What rustix is
-//! missing here:
+//! of them, and no generic/raw `setsockopt` escape hatch. A second, matching
+//! chokepoint, `get_int_sockopt`, reads a `c_int`-valued sockopt back; it has
+//! exactly one caller, `get_multicast_hops_v6` — see the `IPV6_MULTICAST_HOPS`
+//! paragraph below for why that one option, and no other, is read back. What
+//! rustix is missing here:
 //!
 //!   * `IP_PKTINFO` / `IP_RECVPKTINFO`  — no `sockopt::set_ip_(recv)pktinfo`
 //!   * `IPV6_RECVPKTINFO`               — no `sockopt::set_ipv6_recvpktinfo`
@@ -125,6 +128,17 @@ pub(crate) fn set_multicast_ttl_v4(sock: &UdpSocket, ttl: u8) -> std::io::Result
 /// around it through the `set_int_sockopt` chokepoint instead of
 /// `sockopt::set_ipv6_multicast_hops`. Do NOT "simplify" this back to the
 /// rustix call without first confirming upstream has fixed the level.
+///
+/// The SAME wrong level is silent rather than loud on Linux: `IPPROTO_IP`/18
+/// there is `IP_PASSSEC`, a real, settable, unrelated boolean, so the
+/// wrong-level call would report success while the real hop limit stayed at
+/// its kernel default of 1 instead of the 255 RFC 6762 §11 requires — this is
+/// exactly the shape rustix's own bug had before this function routed around
+/// it. Because a `setsockopt` return code alone cannot distinguish "applied"
+/// from "silently hit the wrong option," `crate::multicast::try_bind_v6`
+/// reads this ONE option back with `get_multicast_hops_v6` immediately after
+/// calling this function, and fails the bind if the two disagree. No other
+/// sockopt in this crate gets that treatment — see `get_multicast_hops_v6`.
 pub(crate) fn set_multicast_hops_v6(sock: &UdpSocket, hops: u8) -> std::io::Result<()> {
   set_int_sockopt(
     sock,
@@ -253,7 +267,8 @@ pub(crate) fn set_recv_hoplimit_v6(_sock: &UdpSocket) -> std::io::Result<()> {
 /// rustix workaround in `set_multicast_hops_v6` directly — so all the
 /// `unsafe` ffi for these options lives in one audited place. Always
 /// compiled — `set_recv_pktinfo_v6` is unconditional, so this is reached on
-/// every Unix target.
+/// every Unix target. Its read-back sibling is `get_int_sockopt`, further
+/// down.
 ///
 /// Valid ONLY for genuinely `int`-sized options: `optlen` below is hardcoded
 /// to `size_of::<c_int>()`, so do not route an option through here without
@@ -305,4 +320,64 @@ fn set_bool_sockopt(
   optname: libc::c_int,
 ) -> std::io::Result<()> {
   set_int_sockopt(sock, level, optname, 1)
+}
+
+/// The SINGLE `libc::getsockopt` call site in the crate: read back an
+/// arbitrary `c_int`-valued sockopt. Its only caller is
+/// `get_multicast_hops_v6` just below, which exists solely so
+/// `crate::multicast::try_bind_v6` can confirm `set_multicast_hops_v6`
+/// actually took — see that function's doc for the RFC 6762 §11
+/// justification and the Linux wrong-level history that makes a read-back
+/// necessary for this ONE option. No other sockopt in this module is read
+/// back: every other rustix-covered setter has no comparable known defect,
+/// and the other `set_int_sockopt` consumers (the receive-cmsg enablers) are
+/// already deliberately best-effort, so confirming them would add a syscall
+/// without adding safety.
+///
+/// Valid ONLY for genuinely `int`-sized options — the same caveat as
+/// `set_int_sockopt` above applies to the read side. A `getsockopt` that
+/// writes back fewer bytes than `size_of::<c_int>()` is treated as failure
+/// (`Err`), never read as a partially valid value.
+fn get_int_sockopt(
+  sock: &UdpSocket,
+  level: libc::c_int,
+  optname: libc::c_int,
+) -> std::io::Result<libc::c_int> {
+  let mut value: libc::c_int = 0;
+  let mut len: libc::socklen_t = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+  // SAFETY: `sock` owns a valid UDP fd for the duration of the call; `value`
+  // and `len` are live locals sized exactly for a `c_int`, so pointers to
+  // them are sound. `getsockopt` writes at most `len` bytes into `value` and
+  // overwrites `len` with the size it actually wrote, both confined to the
+  // buffer we handed it, and it retains neither pointer past the call.
+  #[allow(unsafe_code)]
+  let rc = unsafe {
+    libc::getsockopt(
+      sock.as_raw_fd(),
+      level,
+      optname,
+      core::ptr::addr_of_mut!(value).cast(),
+      core::ptr::addr_of_mut!(len),
+    )
+  };
+  if rc != 0 {
+    return Err(std::io::Error::last_os_error());
+  }
+  if len != core::mem::size_of::<libc::c_int>() as libc::socklen_t {
+    // A short write is not a partially-valid c_int — reject it outright
+    // rather than reading uninitialized/stale bytes out of `value`.
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidData,
+      "getsockopt returned a shorter value than a c_int",
+    ));
+  }
+  Ok(value)
+}
+
+/// Read back the kernel's current `IPV6_MULTICAST_HOPS` value through the
+/// `get_int_sockopt` chokepoint above. The ONLY caller is
+/// `crate::multicast::try_bind_v6`, immediately after `set_multicast_hops_v6`,
+/// to confirm the value it just asked for is the value the kernel now holds.
+pub(crate) fn get_multicast_hops_v6(sock: &UdpSocket) -> std::io::Result<i32> {
+  get_int_sockopt(sock, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS)
 }
