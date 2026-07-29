@@ -1,11 +1,13 @@
 //! Unix socket option setters.
 //!
-//! Multicast TX-side options go through rustix (`rustix::net::sockopt`). The
-//! receive-side cmsg-enable options below funnel through a SINGLE
-//! `libc::setsockopt` chokepoint (`set_int_sockopt`) because rustix models
-//! sockopts as a curated, typed set and — as of rustix 1.1.4 (the newest
-//! published) — exposes no setter for ANY of them, and no generic/raw
-//! `setsockopt` escape hatch. What rustix is missing here:
+//! Multicast TX-side options mostly go through rustix (`rustix::net::sockopt`);
+//! `set_multicast_hops_v6` is one deliberate exception — see the
+//! `IPV6_MULTICAST_HOPS` paragraph below. The receive-side cmsg-enable options
+//! below funnel through a SINGLE `libc::setsockopt` chokepoint
+//! (`set_int_sockopt`) because rustix models sockopts as a curated, typed set
+//! and — as of rustix 1.1.4 (the newest published) — exposes no setter for ANY
+//! of them, and no generic/raw `setsockopt` escape hatch. What rustix is
+//! missing here:
 //!
 //!   * `IP_PKTINFO` / `IP_RECVPKTINFO`  — no `sockopt::set_ip_(recv)pktinfo`
 //!   * `IPV6_RECVPKTINFO`               — no `sockopt::set_ipv6_recvpktinfo`
@@ -15,6 +17,15 @@
 //!
 //! (rustix DOES have the siblings `set_ip_recvtos` / `set_ipv6_recvtclass`, so
 //! the gap is specific, not categorical.)
+//!
+//! `IPV6_MULTICAST_HOPS` is a DIFFERENT kind of defect, not a gap: rustix
+//! 1.1.4's `sockopt::set_ipv6_multicast_hops` / `ipv6_multicast_hops` DO exist,
+//! but both pass `IPPROTO_IP` instead of `IPPROTO_IPV6`
+//! (`backend/libc/net/sockopt.rs:618-624`) and so fail every call with
+//! `EINVAL` — the only `IPV6_*` sockopt in that file with the wrong level.
+//! `set_multicast_hops_v6` below routes around it through the same
+//! `set_int_sockopt` chokepoint instead of rustix; see that function for the
+//! full citation and the on-host verification.
 //!
 //! The matching RECEIVE path in `crate::multicast` likewise uses
 //! `libc::recvmsg` + manual `cmsghdr` parsing: rustix's `recvmsg` yields only
@@ -98,9 +109,29 @@ pub(crate) fn set_multicast_ttl_v4(sock: &UdpSocket, ttl: u8) -> std::io::Result
     .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
+/// Set the IPv6 multicast hop limit (`IPV6_MULTICAST_HOPS`, the v6 sibling of
+/// `IP_MULTICAST_TTL`).
+///
+/// Deliberately bypasses rustix: as of rustix 1.1.4 (the newest published),
+/// `sockopt::set_ipv6_multicast_hops` / `ipv6_multicast_hops`
+/// (`backend/libc/net/sockopt.rs:618` / `:623`) both pass `IPPROTO_IP` instead
+/// of `IPPROTO_IPV6` (the `setsockopt`/`getsockopt` calls at lines `:619` /
+/// `:624`) — the ONLY `IPV6_*` sockopt in that file with the wrong level;
+/// every sibling (`set_ipv6_unicast_hops`, `set_ipv6_multicast_loop`,
+/// `set_ipv6_v6only`, …) correctly uses `IPPROTO_IPV6`. The wrong level makes
+/// the kernel reject the call with `EINVAL` unconditionally — verified on
+/// macOS across every interface (including loopback) and every hop value (0,
+/// 1, 64, 255) — which fails `bind_v6` on every IPv6-capable host. Route
+/// around it through the `set_int_sockopt` chokepoint instead of
+/// `sockopt::set_ipv6_multicast_hops`. Do NOT "simplify" this back to the
+/// rustix call without first confirming upstream has fixed the level.
 pub(crate) fn set_multicast_hops_v6(sock: &UdpSocket, hops: u8) -> std::io::Result<()> {
-  sockopt::set_ipv6_multicast_hops(sock.as_fd(), hops as u32)
-    .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
+  set_int_sockopt(
+    sock,
+    libc::IPPROTO_IPV6,
+    libc::IPV6_MULTICAST_HOPS,
+    hops as libc::c_int,
+  )
 }
 
 pub(crate) fn set_multicast_loop_v6(sock: &UdpSocket, on: bool) -> std::io::Result<()> {
@@ -128,7 +159,7 @@ pub(crate) fn set_recv_pktinfo_v4(sock: &UdpSocket) -> std::io::Result<()> {
   let optname = libc::IP_RECVPKTINFO;
   #[cfg(not(target_os = "netbsd"))]
   let optname = libc::IP_PKTINFO;
-  set_int_sockopt(sock, libc::IPPROTO_IP, optname)
+  set_bool_sockopt(sock, libc::IPPROTO_IP, optname)
 }
 
 /// Fallback where IPv4 `IP_PKTINFO` isn't available (FreeBSD/OpenBSD/DragonFly):
@@ -148,7 +179,7 @@ pub(crate) fn set_recv_pktinfo_v4(_sock: &UdpSocket) -> std::io::Result<()> {
 /// `has_ipv6_pktinfo`). Keeping this unconditional also keeps the
 /// `set_int_sockopt` chokepoint reachable on every Unix target.
 pub(crate) fn set_recv_pktinfo_v6(sock: &UdpSocket) -> std::io::Result<()> {
-  set_int_sockopt(sock, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
+  set_bool_sockopt(sock, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
 }
 
 /// Enable delivery of a kernel receive-timestamp ancillary cmsg on a socket so
@@ -172,7 +203,7 @@ pub(crate) fn set_recv_timestamp(sock: &UdpSocket) -> std::io::Result<()> {
   let optname = libc::SO_TIMESTAMPNS;
   #[cfg(not(recv_timestamp_ns))]
   let optname = libc::SO_TIMESTAMP;
-  set_int_sockopt(sock, libc::SOL_SOCKET, optname)
+  set_bool_sockopt(sock, libc::SOL_SOCKET, optname)
 }
 
 /// Fallback where no receive-timestamp cmsg is wired up: no-op. See the
@@ -190,7 +221,7 @@ pub(crate) fn set_recv_timestamp(_sock: &UdpSocket) -> std::io::Result<()> {
 /// below — `hop_limit` stays `None` and the §11 check degrades to pass-through.
 #[cfg(has_recv_hoplimit)]
 pub(crate) fn set_recv_ttl_v4(sock: &UdpSocket) -> std::io::Result<()> {
-  set_int_sockopt(sock, libc::IPPROTO_IP, libc::IP_RECVTTL)
+  set_bool_sockopt(sock, libc::IPPROTO_IP, libc::IP_RECVTTL)
 }
 
 /// Fallback where `IP_RECVTTL` isn't available (OpenBSD/NetBSD): no-op.
@@ -205,7 +236,7 @@ pub(crate) fn set_recv_ttl_v4(_sock: &UdpSocket) -> std::io::Result<()> {
 /// `IPV6_RECVHOPLIMIT` on OpenBSD/NetBSD, so this is a no-op there.
 #[cfg(has_recv_hoplimit)]
 pub(crate) fn set_recv_hoplimit_v6(sock: &UdpSocket) -> std::io::Result<()> {
-  set_int_sockopt(sock, libc::IPPROTO_IPV6, libc::IPV6_RECVHOPLIMIT)
+  set_bool_sockopt(sock, libc::IPPROTO_IPV6, libc::IPV6_RECVHOPLIMIT)
 }
 
 /// Fallback where `IPV6_RECVHOPLIMIT` isn't available (OpenBSD/NetBSD): no-op.
@@ -214,28 +245,32 @@ pub(crate) fn set_recv_hoplimit_v6(_sock: &UdpSocket) -> std::io::Result<()> {
   Ok(())
 }
 
-/// The SINGLE `libc::setsockopt` call site in the crate: enable an `int`-valued
-/// boolean receive option (set to 1). Every receive-cmsg setter above
-/// (`set_recv_pktinfo_v4/v6`, `set_recv_timestamp`, `set_recv_ttl_v4`,
-/// `set_recv_hoplimit_v6`) funnels through here, so all the `unsafe` ffi for
-/// these options lives in one audited place. Always compiled — `set_recv_pktinfo_v6`
-/// is unconditional, so this is reached on every Unix target.
+/// The SINGLE `libc::setsockopt` call site in the crate: set an arbitrary
+/// `c_int`-valued sockopt. Every non-rustix option in this module funnels
+/// through here — the boolean receive-cmsg enablers via the `set_bool_sockopt`
+/// wrapper just below (`set_recv_pktinfo_v4/v6`, `set_recv_timestamp`,
+/// `set_recv_ttl_v4`, `set_recv_hoplimit_v6`), and the `IPV6_MULTICAST_HOPS`
+/// rustix workaround in `set_multicast_hops_v6` directly — so all the
+/// `unsafe` ffi for these options lives in one audited place. Always
+/// compiled — `set_recv_pktinfo_v6` is unconditional, so this is reached on
+/// every Unix target.
 fn set_int_sockopt(
   sock: &UdpSocket,
   level: libc::c_int,
   optname: libc::c_int,
+  value: libc::c_int,
 ) -> std::io::Result<()> {
-  let on: libc::c_int = 1;
-  // SAFETY: `sock` owns a valid UDP fd for the duration of the call; we pass a
-  // pointer to a live `c_int` with a matching `optlen`, and read no memory
-  // back. setsockopt does not retain the pointer past the call.
+  // SAFETY: `sock` owns a valid UDP fd for the duration of the call; `value`
+  // is a live `c_int` parameter, so a pointer to it paired with a matching
+  // `optlen` is sound, and we read no memory back. setsockopt does not retain
+  // the pointer past the call.
   #[allow(unsafe_code)]
   let rc = unsafe {
     libc::setsockopt(
       sock.as_raw_fd(),
       level,
       optname,
-      core::ptr::addr_of!(on).cast(),
+      core::ptr::addr_of!(value).cast(),
       core::mem::size_of::<libc::c_int>() as libc::socklen_t,
     )
   };
@@ -243,4 +278,17 @@ fn set_int_sockopt(
     return Err(std::io::Error::last_os_error());
   }
   Ok(())
+}
+
+/// `setsockopt(level, optname, 1)`: enable a boolean-valued receive-cmsg
+/// option. Thin, `unsafe`-free wrapper around the `set_int_sockopt` chokepoint
+/// above for the common "just turn this on" case; every receive-cmsg setter
+/// (`set_recv_pktinfo_v4/v6`, `set_recv_timestamp`, `set_recv_ttl_v4`,
+/// `set_recv_hoplimit_v6`) goes through this, not `set_int_sockopt` directly.
+fn set_bool_sockopt(
+  sock: &UdpSocket,
+  level: libc::c_int,
+  optname: libc::c_int,
+) -> std::io::Result<()> {
+  set_int_sockopt(sock, level, optname, 1)
 }
