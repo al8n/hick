@@ -57,6 +57,55 @@ fn expect_bind_or_skip<T>(label: &str, result: Result<T, BindError>) -> Option<T
   }
 }
 
+/// Read back the kernel's actual `IPV6_MULTICAST_HOPS` value for `sock` via a
+/// direct `libc::getsockopt` call at the CORRECT level (`IPPROTO_IPV6`).
+///
+/// Deliberately does NOT use `rustix::net::sockopt::ipv6_multicast_hops`:
+/// that getter carries the identical wrong-protocol-level defect as the
+/// setter this whole fix exists to work around (rustix 1.1.4
+/// `backend/libc/net/sockopt.rs:624`, `backend/linux_raw/net/sockopt.rs:575`
+/// — both read `IPPROTO_IP`/`IPV6_MULTICAST_HOPS` instead of
+/// `IPPROTO_IPV6`/`IPV6_MULTICAST_HOPS`). On Linux, `IPPROTO_IP` optname 18 is
+/// `IP_PASSSEC` — a live, unrelated boolean option — so reading back through
+/// rustix's getter would report that socket's own collateral state as if it
+/// were the hop limit: the exact trap a future reader would fall into, since
+/// it looks like a normal, working read-back while actually validating
+/// nothing about the real `IPPROTO_IPV6` hop limit at all. Route around
+/// rustix here too, for the read, not just the write.
+///
+/// This is what makes the regression test below able to catch the bug on
+/// Linux: there, the wrong-level `setsockopt` call does not fail (unlike
+/// macOS's `EINVAL`) because `IPPROTO_IP`/18 is a valid, settable option
+/// (`IP_PASSSEC`) — it just silently leaves the real IPv6 multicast hop limit
+/// at its default of 1 instead of the 255 RFC 6762 §11 requires, which a bare
+/// `try_bind_v6(...).is_ok()` assertion cannot detect. Reading the value back
+/// through the correct level can.
+#[cfg(unix)]
+fn read_multicast_hops_v6(sock: &std::net::UdpSocket) -> std::io::Result<u8> {
+  use std::os::fd::AsRawFd;
+
+  let mut value: libc::c_int = 0;
+  let mut len: libc::socklen_t = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+  // SAFETY: `sock` is a valid, open UDP socket for the duration of this call.
+  // `value` and `len` are live locals sized exactly for a `c_int`-valued
+  // option; getsockopt writes back at most `len` bytes into `value` and
+  // updates `len` to the size it actually wrote, both within the buffer we
+  // provided. No pointer is retained past the call.
+  let rc = unsafe {
+    libc::getsockopt(
+      sock.as_raw_fd(),
+      libc::IPPROTO_IPV6,
+      libc::IPV6_MULTICAST_HOPS,
+      core::ptr::addr_of_mut!(value).cast(),
+      core::ptr::addr_of_mut!(len),
+    )
+  };
+  if rc != 0 {
+    return Err(std::io::Error::last_os_error());
+  }
+  Ok(value as u8)
+}
+
 /// Address family a picked interface must actually carry (see
 /// `pick_interface_index`/`loopback_index`).
 #[derive(Clone, Copy)]
@@ -256,13 +305,32 @@ fn bind_v6_with_explicit_interface_index() {
     }
   };
   let opts = MulticastOptionsV6::new(idx);
-  if expect_bind_or_skip(
+  let expected_hops = opts.hops();
+  if let Some(sock) = expect_bind_or_skip(
     "bind_v6_with_explicit_interface_index",
     MulticastSocketV6::try_new(opts),
-  )
-  .is_some()
-  {
-    eprintln!("bound v6 with interface_index={idx}");
+  ) {
+    // Assert the OBSERVABLE effect, not just that the bind call returned Ok:
+    // see `read_multicast_hops_v6` for why a bare success check cannot catch
+    // the Linux form of the rustix bug.
+    #[cfg(unix)]
+    {
+      let actual_hops = read_multicast_hops_v6(sock.socket()).unwrap_or_else(|e| {
+        panic!(
+          "bind_v6_with_explicit_interface_index: bind succeeded but could not read back \
+           IPV6_MULTICAST_HOPS: {e}"
+        )
+      });
+      assert_eq!(
+        actual_hops, expected_hops,
+        "bind_v6_with_explicit_interface_index: IPV6_MULTICAST_HOPS was not actually applied \
+         — kernel reports {actual_hops}, expected {expected_hops}. A sockopt call can report \
+         success while silently hitting an unrelated option instead of the real hop limit."
+      );
+    }
+    #[cfg(not(unix))]
+    let _ = &sock;
+    eprintln!("bound v6 with interface_index={idx}, expected hops={expected_hops}");
   }
 }
 
@@ -270,13 +338,24 @@ fn bind_v6_with_explicit_interface_index() {
 /// bug (`IPPROTO_IP` instead of `IPPROTO_IPV6`; rustix 1.1.4
 /// `backend/libc/net/sockopt.rs:618-624`; see `hick-udp/src/platform/unix.rs`
 /// for the full writeup). That defect made `try_bind_v6` fail `EINVAL` on
-/// EVERY interface, including loopback — indistinguishable, under the old
-/// swallow-all `Err(_) => skip` pattern, from a sandboxed CI environment that
-/// legitimately refuses multicast. For every interface reporting at least one
-/// IPv6 address, `try_bind_v6` must succeed or fail only with an
+/// EVERY interface, including loopback, on macOS/BSD — indistinguishable,
+/// under the old swallow-all `Err(_) => skip` pattern, from a sandboxed CI
+/// environment that legitimately refuses multicast.
+///
+/// On Linux the SAME defect is silent, not loud, and a bare "did the call
+/// return Ok" check cannot catch it: `IPV6_MULTICAST_HOPS` is 18 there, and
+/// `IPPROTO_IP`/18 is `IP_PASSSEC`, a real, settable, unrelated boolean
+/// option — so the wrong-level `setsockopt` call succeeds, `try_bind_v6`
+/// returns `Ok`, and the real IPv6 multicast hop limit silently stays at its
+/// default of 1 instead of the 255 RFC 6762 §11 requires (conforming
+/// receivers, including this crate's own on-link check, drop anything else).
+/// This is why every bind below is followed by an OBSERVABLE-effect check —
+/// see `read_multicast_hops_v6` — not just a success check: for every
+/// interface reporting at least one IPv6 address, `try_bind_v6` must succeed
+/// with the requested hop limit actually applied, or fail only with an
 /// environment-refusal error kind (see `is_environment_refusal`); anything
-/// else — `EINVAL` above all — fails the test. Skips cleanly if the host has
-/// no IPv6-capable interface at all.
+/// else — `EINVAL`, or a successful bind with the wrong hop limit — fails the
+/// test. Skips cleanly if the host has no IPv6-capable interface at all.
 ///
 /// Reports how many of the checked interfaces actually bound, not just that
 /// none of them failed: on a fully sandboxed host every leg legitimately
@@ -301,13 +380,34 @@ fn try_bind_v6_succeeds_or_environment_refuses_on_every_ipv6_interface() {
       continue;
     }
     checked += 1;
+    let opts = MulticastOptionsV6::new(iface.index());
+    let expected_hops = opts.hops();
     let label = format!(
-      "try_bind_v6 on interface {} (index {})",
+      "try_bind_v6 on interface {} (index {}, expecting hops={expected_hops})",
       iface.name(),
       iface.index()
     );
-    if expect_bind_or_skip(&label, try_bind_v6(MulticastOptionsV6::new(iface.index()))).is_some() {
+    if let Some(sock) = expect_bind_or_skip(&label, try_bind_v6(opts)) {
       bound += 1;
+      // Assert the OBSERVABLE effect, not just that the call returned Ok —
+      // see this function's doc and `read_multicast_hops_v6` for why: on
+      // Linux, the wrong-level bug silently succeeds without ever touching
+      // the real hop limit.
+      #[cfg(unix)]
+      {
+        let actual_hops = read_multicast_hops_v6(&sock).unwrap_or_else(|e| {
+          panic!("{label}: bind succeeded but could not read back IPV6_MULTICAST_HOPS: {e}")
+        });
+        assert_eq!(
+          actual_hops, expected_hops,
+          "{label}: IPV6_MULTICAST_HOPS was not actually applied — kernel reports \
+           {actual_hops}, expected {expected_hops}. A sockopt call can report success while \
+           silently hitting an unrelated option (e.g. Linux IPPROTO_IP/18 = IP_PASSSEC) \
+           instead of the real hop limit."
+        );
+      }
+      #[cfg(not(unix))]
+      let _ = &sock;
     }
   }
 
