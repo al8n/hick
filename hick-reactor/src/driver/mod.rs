@@ -13,8 +13,8 @@ use agnostic_net::{Net, UdpSocket};
 use async_channel::Sender;
 use futures::{FutureExt, pin_mut, select_biased};
 use mdns_proto::{
-  QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate, endpoint::WithdrawalSend,
-  event::RouteEvent,
+  QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate, TransmitOutcome,
+  endpoint::WithdrawalSend, event::RouteEvent,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -105,6 +105,11 @@ struct ServiceCtx {
   /// the handle-owned mailbox's reserved terminal slot, so it survives the ctx
   /// GC and reaches a live reader.
   withdrawing: bool,
+  /// Consecutive [`TransmitOutcome::PartiallyDelivered`] fan-outs confirmed for
+  /// this service, driving [`bound_partial_delivery`] — this driver's half of the
+  /// [`TransmitOutcome`] contract. Reset by any fully-delivered fan-out and by the
+  /// excusal itself; left alone by a wholly-failed one.
+  partial_rounds: u8,
 }
 
 /// Driver-side state for a single active query.
@@ -116,6 +121,11 @@ struct QueryCtx {
   /// driver detects the consumer is gone and GCs the query.
   doorbell: Sender<()>,
   last_seq: u64,
+  /// Consecutive [`TransmitOutcome::PartiallyDelivered`] fan-outs confirmed for
+  /// this question, with the same rules as [`ServiceCtx::partial_rounds`]. A
+  /// partial §5.2 question freezes the retry budget, so without the bound a
+  /// half-reachable link would keep a query alive indefinitely.
+  partial_rounds: u8,
 }
 
 /// All state owned by the driver task.
@@ -242,7 +252,7 @@ impl<N: Net> DriverState<N> {
         //
         // The renamed-away old-name goodbye this registration RECLAIMS is no longer
         // cancelled at register time: the reclaim-cancel moved to the endpoint's
-        // CANCEL-ON-ANNOUNCE (`note_service_advertised`), a certain live event, so a
+        // CANCEL-ON-ANNOUNCE (`note_service_announced`), a certain live event, so a
         // dropped registration here cannot lose it — an orphan that never announces
         // simply lets the old goodbye complete. The rollback therefore
         // only removes the orphan service.
@@ -326,6 +336,7 @@ impl<N: Net> DriverState<N> {
         doorbell: doorbell_tx,
         encode_failures: 0,
         withdrawing: false,
+        partial_rounds: 0,
       },
     );
     Ok(ServiceRegistered {
@@ -353,6 +364,7 @@ impl<N: Net> DriverState<N> {
         mailbox: Arc::clone(&mailbox),
         doorbell: doorbell_tx,
         last_seq: 0,
+        partial_rounds: 0,
       },
     );
     Ok(QueryStarted {
@@ -593,9 +605,21 @@ impl<N: Net> DriverState<N> {
               // longer drains the old-name goodbye itself.
               if let Some(h) = ctx.proto.take_rename_goodbye_handoff() {
                 // A rename COLLISION (rename_result Err) tears the service down: its
-                // old name must HOLD until the goodbye completes so a quick
-                // re-register cannot cancel the only retraction. A
-                // SURVIVING rename stays reclaimable.
+                // old name must HOLD until the goodbye completes, because the dead
+                // service will never re-announce and the goodbye is the only
+                // retraction the old name will ever get.
+                //
+                // A SURVIVING rename stays RECLAIMABLE. That is sound only because
+                // the sole thing that can cancel a reclaimable goodbye —
+                // `Endpoint::note_service_announced` — is gated on
+                // `Service::has_fully_announced`: a complete §8.3 announcement of
+                // the reclaiming name that reached EVERY family this driver still
+                // obligates. For each such family §10.2's cache-flush announcement
+                // supersedes the stale unique records the goodbye exists to retract,
+                // so cancelling loses nothing. A partially-delivered replacement
+                // announcement leaves the gate shut and the old goodbye keeps
+                // draining its per-family debt — which is exactly the case where the
+                // unserved family has heard neither the goodbye nor the replacement.
                 endpoint.enqueue_rename_withdrawal(h, now, rename_result.is_err());
               }
               match rename_result {
@@ -736,13 +760,12 @@ impl<N: Net> DriverState<N> {
   /// Drain outgoing transmits across services + queries, up to
   /// [`MAX_TRANSMITS_PER_DRAIN`] per call.
   ///
-  /// every ACTUAL socket send records its own self-send tracker
-  /// entry via [`record_self_send`]. With the take-once suppression
-  /// introduced earlier, a single entry can match only one inbound
-  /// loopback. Dual-stack fan-out sends the same payload to BOTH v4 and v6
-  /// multicast sockets, so the tracker needs two entries to suppress both
-  /// copies — not one. The entry is therefore recorded inside `send_via`
-  /// per real send, not here.
+  /// Every ACTUAL socket send records its own self-send tracker
+  /// entry via [`record_self_send`]. Take-once suppression means a single entry
+  /// can match only one inbound loopback, and a dual-stack fan-out sends the same
+  /// payload to BOTH multicast sockets, so the tracker needs two entries to
+  /// suppress both copies — not one. The entry is therefore recorded inside
+  /// [`send_via`] per real send, not here.
   ///
   /// capped at [`MAX_SEND_CREDITS_PER_DRAIN`] sends per call so
   /// the work per drain pass stays bounded. Returns `true` if more
@@ -827,7 +850,7 @@ impl<N: Net> DriverState<N> {
           None => break,
         };
         let body_len = tx.size();
-        let used = send_via::<N>(
+        let fanout = send_via::<N>(
           recent_sends,
           v4,
           v6,
@@ -837,33 +860,19 @@ impl<N: Net> DriverState<N> {
           &stats,
         )
         .await;
-        // report the send RESULT so the
-        // proto advances its lifecycle — the §8.1 probe sequence, the §8.3
-        // announce phase, and the goodbye-ownership guards — ONLY on a
-        // confirmed-delivered send (`used > 0` = at least one socket send
-        // succeeded). On all-socket failure (`used == 0`) the proto re-arms and
-        // retries WITHOUT advancing, so a service can never claim a name it
-        // never probed, nor enable a goodbye for records peers never received.
+        // Report the honest per-family shape of the fan-out so the core — the only
+        // layer holding the lifecycle state — decides what it means: goodbye
+        // ownership (§10.1) latches for whatever reached a wire, while the §8.1
+        // probe sequence and §8.3 announce phase advance only once EVERY obligated
+        // family heard it. A one-family success therefore no longer lets a service
+        // claim a name it never probed on the other family.
         // `StdInstant::now()` anchors any scheduled deadline to post-send time
         // (a long `send_via` await would put a pre-send deadline in the past).
         if let Some(ctx) = services.get_mut(&h) {
-          ctx.proto.note_transmit_result(StdInstant::now(), used > 0);
-          // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
-          // route so sibling host-address retention (during a same-host
-          // withdrawal) honours what this service ACTUALLY announced, not its
-          // configured addresses. Idempotent overwrite; only meaningful after a
-          // delivered send. `endpoint` and `services` are disjointly borrowed
-          // from `self` above, so this borrow split is sound.
-          if used > 0 {
-            endpoint.note_service_advertised(
-              h,
-              ctx.proto.advertised_a_addrs(),
-              ctx.proto.advertised_aaaa_addrs(),
-              ctx.proto.advertises_instance(),
-            );
-          }
+          let outcome = bound_partial_delivery(&mut ctx.partial_rounds, fanout.transmit_outcome());
+          confirm_service_transmit(endpoint, ctx, h, StdInstant::now(), outcome);
         }
-        credits_remaining = credits_remaining.saturating_sub(used);
+        credits_remaining = credits_remaining.saturating_sub(fanout.sent_count());
       }
       // persistent encode failure → escalate to Conflict.
       if hit_encode_error {
@@ -965,7 +974,7 @@ impl<N: Net> DriverState<N> {
           }
         };
         let body_len = tx.size();
-        let used = send_via::<N>(
+        let fanout = send_via::<N>(
           recent_sends,
           v4,
           v6,
@@ -975,15 +984,19 @@ impl<N: Net> DriverState<N> {
           &stats,
         )
         .await;
-        // report the send result so the query advances its retry
-        // budget only on a confirmed-delivered send. On all-socket failure
-        // (`used == 0`) the query re-attempts without burning the budget rather
-        // than timing out having put nothing on the wire.
+        // The §5.2 retry budget is spent only once EVERY obligated family carried
+        // the question: a responder reachable on one family alone must not be able
+        // to consume the whole retry schedule of a question the other family never
+        // asked. A partial or wholly-failed round re-arms without burning a retry.
         // anchor the retry backoff to POST-send time — `send_via`
         // can await longer than the backoff interval, so the pre-send `now`
         // would schedule a deadline already in the past.
-        endpoint.note_query_transmit_result(h, StdInstant::now(), used > 0);
-        credits_remaining = credits_remaining.saturating_sub(used);
+        let outcome = match queries.get_mut(&h) {
+          Some(ctx) => bound_partial_delivery(&mut ctx.partial_rounds, fanout.transmit_outcome()),
+          None => fanout.transmit_outcome(),
+        };
+        endpoint.note_query_transmit_outcome(h, StdInstant::now(), outcome);
+        credits_remaining = credits_remaining.saturating_sub(fanout.sent_count());
       }
     }
     // GC queries retired by encode failure (mirrors the push_updates terminated
@@ -1178,15 +1191,13 @@ impl<N: Net> DriverState<N> {
   }
 }
 
-/// Per-drain cap on actual self-send tracker entries.
+/// Per-drain cap on actual socket sends.
 ///
-/// each real socket send records one self-send
-/// tracker entry via [`record_self_send`]. To keep the work per drain
-/// pass bounded — and to leave headroom for late loopbacks of older
-/// sends to be matched before we record more entries — we cap each
-/// `drain_transmits` pass at 64 entries. Dual-stack mDNS multicast
-/// generates two entries per Transmit, so this gives ≤ 64 actual sends
-/// regardless of family enablement. Forward progress is guaranteed:
+/// To keep the work per drain pass bounded — and to leave headroom for
+/// late loopbacks of older sends to be matched before we record more
+/// entries — we cap each `drain_transmits` pass at 64 sends. Dual-stack
+/// mDNS multicast charges two per Transmit, so this gives ≤ 64 actual
+/// sends regardless of family enablement. Forward progress is guaranteed:
 /// `drain_transmits` returns `true` when more is pending, and the driver
 /// loop re-enters the packet pump immediately.
 const MAX_SEND_CREDITS_PER_DRAIN: usize = 64;
@@ -1199,6 +1210,39 @@ const MAX_SEND_CREDITS_PER_DRAIN: usize = 64;
 /// payload simply cannot be encoded with the current scratch buffer
 /// (e.g. records exceed `max_payload_size`).
 const MAX_CONSECUTIVE_ENCODE_ERRORS: u8 = 3;
+
+/// How many consecutive [`TransmitOutcome::PartiallyDelivered`] fan-outs one
+/// origin may accumulate before [`bound_partial_delivery`] excuses the families
+/// that keep missing.
+///
+/// This is the driver half of the [`TransmitOutcome`] contract. A partial confirm
+/// re-arms the same logical datagram without advancing the phase, so a link that
+/// is up enough to be obligated but never carries anything would otherwise hold
+/// every service in probing forever. The core cannot own this bound: the only
+/// unilateral action it could take is to advance, and advancing unprobed is the
+/// §8.1 violation this whole change removes.
+///
+/// The bound is a per-origin ROUND COUNT on the CONFIRM stream, not a
+/// per-family failure streak and not a wall-clock degrade window, even though
+/// this crate has both a clock and an allocator:
+///
+/// * A per-family streak provably cannot fire in the case that matters. With a
+///   transport that has room for one datagram at a time, the two families can
+///   succeed alternately — every round is partial, yet neither family ever
+///   accumulates a streak, so the service pins forever with the bound never
+///   arming.
+/// * A duration is the wrong instrument, not an unavailable one: the re-offer
+///   cadence spans 250 ms while probing (§8.1's own interval) up to 64 s at the
+///   top of the core's §8.3 partial ladder, a factor of 256, so any single
+///   degrade window means ~120 attempts in one phase and one attempt in the
+///   other. Rounds are the unit the core's own re-arm schedule speaks.
+///
+/// Two rounds is the smallest count that separates contention from failure: a
+/// re-arm is lossless (the SAME probe index / announcement count is re-encoded),
+/// so a family that missed round 1 to transient buffer pressure gets that exact
+/// datagram again in round 2. It also caps the core's §8.3 doubling ladder at its
+/// second rung, delaying an announcement step by at most 1 s + 2 s.
+const MAX_PARTIAL_ROUNDS: u8 = 2;
 
 /// Deliver a `ServiceUpdate` to a service's caller via its handle-owned mailbox,
 /// then ring the doorbell.
@@ -1471,12 +1515,190 @@ fn collect_local_subnets(iface_index: u32) -> Vec<(IpAddr, u8)> {
   out
 }
 
-/// Send a datagram on the appropriate socket(s) and record one self-send
-/// tracker entry per ACTUAL successful send_to.
+/// One address family's result for one logical transmit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FamilySend {
+  /// No socket bound for this family, or the datagram was not addressed to it.
+  /// It was therefore never OBLIGATED to carry this transmit, and its absence
+  /// must not read as a failure — a v4-only host is fully delivered on v4 alone.
+  Unbound,
+  /// A bound socket accepted the datagram.
+  Sent,
+  /// A bound socket rejected it. Awaiting writability removes `EWOULDBLOCK` and
+  /// nothing else: `ENETUNREACH`/`EHOSTUNREACH` when a family's route goes away,
+  /// `ENOBUFS` under buffer pressure, `EPERM` from a local firewall,
+  /// `EADDRNOTAVAIL` when an interface loses its address, `EMSGSIZE`. Each of
+  /// those lands here on one family while the other returns `Ok` in the very
+  /// same fan-out.
+  Failed,
+}
+
+impl FamilySend {
+  /// Classify a PRESENT (bound) family's `send_to` result. Never yields
+  /// [`FamilySend::Unbound`] — that is the caller's default for a family it has
+  /// no socket for.
+  fn from_bound_result<T>(res: &std::io::Result<T>) -> Self {
+    match res {
+      Ok(_) => Self::Sent,
+      Err(_) => Self::Failed,
+    }
+  }
+}
+
+/// The per-family shape of one logical transmit's fan-out: the I/O answer, which
+/// the core alone turns into a protocol answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Fanout {
+  v4: FamilySend,
+  v6: FamilySend,
+}
+
+impl Fanout {
+  /// Neither family attempted — the starting value, and the honest report for an
+  /// endpoint with no bound socket at all.
+  const UNBOUND: Self = Self {
+    v4: FamilySend::Unbound,
+    v6: FamilySend::Unbound,
+  };
+
+  /// How many `send_to`s actually put bytes on a wire.
+  ///
+  /// This is the FAIRNESS-budget charge and nothing else. It deliberately does
+  /// not decide delivery: one datagram that reached one of two obligated
+  /// families costs one credit yet has discharged no obligation.
+  fn sent_count(self) -> usize {
+    usize::from(matches!(self.v4, FamilySend::Sent))
+      + usize::from(matches!(self.v6, FamilySend::Sent))
+  }
+
+  /// Project the fan-out onto the core's [`TransmitOutcome`] — the honest,
+  /// unexcused shape of what the sockets did.
+  ///
+  /// The obligated set is every family with a socket that this datagram was
+  /// offered to; `Unbound` means there is none, so that family was never
+  /// obligated. Delivery is `Sent` and nothing else — a `Failed` family did not
+  /// carry the datagram, so the core must not advance its §8.1 / §8.3 phase as if
+  /// it had.
+  ///
+  /// An empty obligated set yields [`TransmitOutcome::NoneDelivered`], never a
+  /// vacuous "all": nothing was delivered, so nothing may latch or advance.
+  ///
+  /// Write-off of a family that keeps missing is NOT applied here — that is
+  /// [`bound_partial_delivery`], which needs per-origin state this type does not
+  /// have, keeping this projection a pure function of the I/O facts.
+  fn transmit_outcome(self) -> TransmitOutcome {
+    let mut obligated = 0usize;
+    let mut delivered = 0usize;
+    for family in [self.v4, self.v6] {
+      if matches!(family, FamilySend::Unbound) {
+        continue;
+      }
+      obligated += 1;
+      if matches!(family, FamilySend::Sent) {
+        delivered += 1;
+      }
+    }
+    if delivered == 0 {
+      TransmitOutcome::NoneDelivered
+    } else if delivered == obligated {
+      TransmitOutcome::AllDelivered
+    } else {
+      TransmitOutcome::PartiallyDelivered
+    }
+  }
+}
+
+/// This driver's BOUNDED obligation policy, applied to one origin's confirm
+/// stream. See [`MAX_PARTIAL_ROUNDS`] for why the bound is a per-origin round
+/// count rather than a per-family streak or a duration.
 ///
-/// Returns the number of entries recorded (== number of successful
-/// `send_to`s), so [`DriverState::drain_transmits`] can budget against
-/// real tracker consumption rather than logical Transmits.
+/// Counts consecutive partial fan-outs and, once `rounds` has reached
+/// [`MAX_PARTIAL_ROUNDS`], EXCUSES the families that keep missing by reporting
+/// the next partial as [`TransmitOutcome::AllDelivered`] — dropping them from the
+/// obligated set for that ONE confirm, so the phase advances from exactly where
+/// it stood. Nothing is marked dead: the excused family is still fanned to on
+/// every later round, and the first round it accepts is all-delivered on its own
+/// merit. There is therefore no degraded state to get stuck in and no recovery
+/// edge to detect.
+///
+/// The write-off is confined to the PHASE. Excusal can only turn
+/// `PartiallyDelivered` into `AllDelivered`, and both are `any_delivered`, so it
+/// can never suppress a §10.1 goodbye-ownership latch: records that reached a
+/// wire stay owned and stay retractable.
+///
+/// `NoneDelivered` leaves the counter untouched rather than resetting it — no
+/// link was served, so no obligation was met and none may be written off. This
+/// mirrors the core, which likewise neither uses nor advances its §8.3 partial
+/// ladder on a round that reached no wire; resetting here would let an
+/// alternating partial/failed pattern evade the bound forever.
+fn bound_partial_delivery(rounds: &mut u8, outcome: TransmitOutcome) -> TransmitOutcome {
+  match outcome {
+    TransmitOutcome::PartiallyDelivered if *rounds >= MAX_PARTIAL_ROUNDS => {
+      *rounds = 0;
+      hick_trace::warn!(
+        rounds = MAX_PARTIAL_ROUNDS,
+        "excusing the family that missed every recent fan-out; the lifecycle phase advances without it"
+      );
+      TransmitOutcome::AllDelivered
+    }
+    TransmitOutcome::PartiallyDelivered => {
+      *rounds = rounds.saturating_add(1);
+      outcome
+    }
+    TransmitOutcome::AllDelivered => {
+      *rounds = 0;
+      outcome
+    }
+    TransmitOutcome::NoneDelivered => outcome,
+  }
+}
+
+/// Confirm one service transmit: hand the core the delivery shape, then mirror
+/// the service's CONFIRMED-ADVERTISED host set into its endpoint route.
+///
+/// The mirror exists so sibling host-address retention (during a same-host
+/// withdrawal) honours what this service ACTUALLY announced rather than its
+/// configured addresses. That set grows exactly when ownership latches — on any
+/// delivery — so a round that reached no wire has nothing to mirror.
+///
+/// The fourth argument is the reclaim-cancel gate, and it is the ALL-delivered
+/// announcement fact the CORE computes, ferried verbatim. It is emphatically NOT
+/// `Service::advertises_instance()`: that latch fires on any delivery by any
+/// transmit kind, so a v4-only announcement — or an RFC 6762 §6.7 legacy unicast
+/// reply, which has one obligated link and is therefore all-delivered by
+/// construction — would cancel a renamed-away name's goodbye that the unserved
+/// family still needs. `FullyAnnounced` has no public constructor precisely so
+/// that substitution cannot compile.
+///
+/// `endpoint` and `ctx` are disjoint fields of `DriverState`, so the split borrow
+/// this signature requires is sound at every call site.
+fn confirm_service_transmit(
+  endpoint: &mut ProtoEndpoint,
+  ctx: &mut ServiceCtx,
+  handle: ServiceHandle,
+  now: StdInstant,
+  outcome: TransmitOutcome,
+) {
+  ctx.proto.note_transmit_outcome(now, outcome);
+  if outcome.any_delivered() {
+    endpoint.note_service_announced(
+      handle,
+      ctx.proto.advertised_a_addrs(),
+      ctx.proto.advertised_aaaa_addrs(),
+      ctx.proto.has_fully_announced(),
+    );
+  }
+}
+
+/// Send a datagram on the appropriate socket(s), reporting each family's result
+/// and recording one self-send tracker entry per ACTUAL successful MULTICAST
+/// `send_to`.
+///
+/// Returns the per-family [`Fanout`], which the caller projects onto a
+/// [`TransmitOutcome`] for the confirm and reads `sent_count()` from for the
+/// fairness budget — the two are independent facts and must not be conflated:
+/// one datagram that reached one of two families costs one credit but has NOT
+/// discharged the transmit's obligation.
 async fn send_via<N: Net>(
   tracker: &mut Vec<(u64, SystemTime)>,
   v4: &Option<Arc<N::UdpSocket>>,
@@ -1484,7 +1706,7 @@ async fn send_via<N: Net>(
   dst: SocketAddr,
   body: &[u8],
   #[cfg(feature = "stats")] stats: &std::sync::Arc<hick_trace::stats::Stats>,
-) -> usize {
+) -> Fanout {
   // proto-layer transmits use multicast_dst() which always
   // returns the IPv4 group. Detect mDNS multicast destinations and fan
   // out the SAME payload to BOTH families' multicast groups (per RFC
@@ -1508,10 +1730,11 @@ async fn send_via<N: Net>(
   // in which a peer datagram could be stamped after our recorded time yet
   // before our packet is actually sent (which would let it steal the
   // take-once credit).
-  let mut credits = 0usize;
+  let mut fanout = Fanout::UNBOUND;
   if is_mdns_multicast {
     if let Some(s) = v4 {
       let (res, send_wall) = send_to_at::<N>(s, body, MDNS_V4_DST).await;
+      fanout.v4 = FamilySend::from_bound_result(&res);
       match res {
         // only record the tracker entry on a SUCCESSFUL send. A
         // failed send produces no loopback; a stale entry would suppress
@@ -1524,7 +1747,6 @@ async fn send_via<N: Net>(
             stats.packets_tx(1);
             stats.bytes_tx(body.len() as u64);
           }
-          credits += 1;
         }
         Err(_e) => {
           hick_trace::debug!(error = %_e, dst = %MDNS_V4_DST, "send_to v4 failed");
@@ -1535,6 +1757,7 @@ async fn send_via<N: Net>(
     }
     if let Some(s) = v6 {
       let (res, send_wall) = send_to_at::<N>(s, body, MDNS_V6_DST).await;
+      fanout.v6 = FamilySend::from_bound_result(&res);
       match res {
         Ok(_) => {
           hick_trace::trace!(dst = %MDNS_V6_DST, len = body.len(), "send_to v6");
@@ -1544,7 +1767,6 @@ async fn send_via<N: Net>(
             stats.packets_tx(1);
             stats.bytes_tx(body.len() as u64);
           }
-          credits += 1;
         }
         Err(_e) => {
           hick_trace::debug!(error = %_e, dst = %MDNS_V6_DST, "send_to v6 failed");
@@ -1553,16 +1775,23 @@ async fn send_via<N: Net>(
         }
       }
     }
-    return credits;
+    return fanout;
   }
 
-  // Unicast: pick the socket matching the destination family.
+  // Unicast: pick the socket matching the destination family. Exactly one family
+  // is obligated (an absent socket obligates none), so this branch can only be
+  // all- or none-delivered.
   let sock = match dst {
     SocketAddr::V4(_) => v4.as_ref(),
     SocketAddr::V6(_) => v6.as_ref(),
   };
   if let Some(s) = sock {
     let (res, send_wall) = send_to_at::<N>(s, body, dst).await;
+    let outcome = FamilySend::from_bound_result(&res);
+    match dst {
+      SocketAddr::V4(_) => fanout.v4 = outcome,
+      SocketAddr::V6(_) => fanout.v6 = outcome,
+    }
     match res {
       Ok(_) => {
         hick_trace::trace!(dst = %dst, len = body.len(), "send_to");
@@ -1572,7 +1801,6 @@ async fn send_via<N: Net>(
           stats.packets_tx(1);
           stats.bytes_tx(body.len() as u64);
         }
-        credits += 1;
       }
       Err(_e) => {
         hick_trace::debug!(error = %_e, dst = %dst, "send_to failed");
@@ -1581,15 +1809,15 @@ async fn send_via<N: Net>(
       }
     }
   }
-  credits
+  fanout
 }
 
 /// Fan ONE endpoint-owned withdrawal (TTL=0 goodbye) datagram out to BOTH bound
 /// multicast families and report EACH family's [`WithdrawalSend`] outcome so the
 /// endpoint tracks per-family debt. Mirrors [`send_via`]'s multicast branch
 /// (same self-send tracking and `packets_tx`/`bytes_tx`/`send_errors` accounting)
-/// but, unlike the coarse `credits` count, distinguishes a PRESENT family's send
-/// result from an ABSENT socket. The mapping is by socket presence, not error kind:
+/// distinguishing a PRESENT family's send result from an ABSENT socket. The
+/// mapping is by socket presence, not error kind:
 ///   * present socket, `Ok` → [`WithdrawalSend::Sent`] (spend one owed round);
 ///   * present socket, ANY `Err` → [`WithdrawalSend::Retry`] (keep the debt and
 ///     retry until success or the 2 s ceiling). A BOUND UDP socket can fail

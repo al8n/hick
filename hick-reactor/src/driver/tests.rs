@@ -1673,3 +1673,504 @@ fn generic_recv_error_does_not_increment_any_stats() {
     "packets_dropped must stay 0 on a generic recv error"
   );
 }
+
+// ── The dual-stack delivery boundary (`TransmitOutcome`) ────────────────────
+
+/// A driver state with NO bound family. The delivery-shape tests drive
+/// `confirm_service_transmit` / `bound_partial_delivery` directly — the exact
+/// seam `drain_transmits` uses — because the reactor's multi-task loop cannot be
+/// stepped deterministically and a real partial fan-out needs one family's socket
+/// to fail on demand.
+#[cfg(feature = "tokio")]
+fn delivery_test_state(probe: bool) -> DriverState<agnostic_net::tokio::Net> {
+  let opts = crate::options::ServerOptions::default()
+    .with_endpoint_config(mdns_proto::EndpointConfig::new().with_probe_unique_names(probe));
+  DriverState::new(
+    &opts,
+    BoundSockets::<agnostic_net::tokio::Net> {
+      v4: None,
+      v6: None,
+      interface_index: 0,
+    },
+  )
+}
+
+/// A minimal registerable service spec.
+#[cfg(feature = "tokio")]
+fn delivery_test_spec(instance: &str) -> mdns_proto::ServiceSpec {
+  let mut r = mdns_proto::ServiceRecords::new(
+    mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    mdns_proto::Name::try_from_str(&std::format!("{instance}._ipp._tcp.local.")).unwrap(),
+    mdns_proto::Name::try_from_str(&std::format!("{instance}.local.")).unwrap(),
+    631,
+    120,
+  );
+  r.add_a(std::net::Ipv4Addr::new(192, 168, 1, 10));
+  mdns_proto::ServiceSpec::new(r)
+}
+
+/// Drain one service's due transmits at `t`, confirming each through the SAME
+/// seam `drain_transmits` uses: the bounded obligation policy, then the confirm.
+/// Returns how many datagrams were confirmed.
+#[cfg(feature = "tokio")]
+fn confirm_service_round(
+  state: &mut DriverState<agnostic_net::tokio::Net>,
+  h: ServiceHandle,
+  t: StdInstant,
+  buf: &mut [u8],
+  fanout: Fanout,
+) -> usize {
+  let DriverState {
+    endpoint, services, ..
+  } = state;
+  let Some(ctx) = services.get_mut(&h) else {
+    return 0;
+  };
+  let _ = ctx.proto.handle_timeout(t);
+  let mut rounds = 0;
+  while let Ok(Some(_)) = ctx.proto.poll_transmit(t, buf) {
+    let outcome = bound_partial_delivery(&mut ctx.partial_rounds, fanout.transmit_outcome());
+    confirm_service_transmit(endpoint, ctx, h, t, outcome);
+    rounds += 1;
+  }
+  rounds
+}
+
+/// A dual-stack fan-out in which v4 carried the datagram and a BOUND v6 socket
+/// rejected it (`ENETUNREACH` and friends). Driving the behaviour tests from the
+/// per-family facts rather than a hand-fed [`TransmitOutcome`] keeps the
+/// projection inside the tested path.
+#[cfg(feature = "tokio")]
+const PARTIAL_FANOUT: Fanout = Fanout {
+  v4: FamilySend::Sent,
+  v6: FamilySend::Failed,
+};
+
+/// Both bound families carried the datagram.
+#[cfg(feature = "tokio")]
+const WHOLE_FANOUT: Fanout = Fanout {
+  v4: FamilySend::Sent,
+  v6: FamilySend::Sent,
+};
+
+/// Both bound families rejected it — nothing reached any wire.
+#[cfg(feature = "tokio")]
+const FAILED_FANOUT: Fanout = Fanout {
+  v4: FamilySend::Failed,
+  v6: FamilySend::Failed,
+};
+
+/// The projection is a pure function of the per-family facts, and the obligated
+/// set is "every family that HAS a socket". The three rows that matter: an absent
+/// family is not obligated (a single-stack host advances at full speed), a
+/// present-but-failing one is, and an empty obligated set is `NoneDelivered` —
+/// never a vacuous "all", which would let a torn-down endpoint advance its
+/// lifecycle on nothing.
+#[test]
+fn the_fan_out_projects_onto_the_delivery_shape() {
+  use FamilySend::{Failed, Sent, Unbound};
+  let cases = [
+    (Sent, Sent, TransmitOutcome::AllDelivered, 2),
+    (Sent, Unbound, TransmitOutcome::AllDelivered, 1),
+    (Unbound, Sent, TransmitOutcome::AllDelivered, 1),
+    (Sent, Failed, TransmitOutcome::PartiallyDelivered, 1),
+    (Failed, Sent, TransmitOutcome::PartiallyDelivered, 1),
+    (Failed, Failed, TransmitOutcome::NoneDelivered, 0),
+    (Failed, Unbound, TransmitOutcome::NoneDelivered, 0),
+    (Unbound, Unbound, TransmitOutcome::NoneDelivered, 0),
+  ];
+  for (v4, v6, want, credits) in cases {
+    let fanout = Fanout { v4, v6 };
+    assert_eq!(
+      fanout.transmit_outcome(),
+      want,
+      "({v4:?}, {v6:?}) must project onto {want:?}"
+    );
+    assert_eq!(
+      fanout.sent_count(),
+      credits,
+      "({v4:?}, {v6:?}) must charge {credits} fairness credit(s)"
+    );
+  }
+}
+
+/// The invariant pair at the driver seam. A partial fan-out means two DIFFERENT
+/// things to the core and must not be folded to one bit:
+///
+///   * goodbye ownership LATCHES — the served family's peers may now hold the
+///     records that reached the wire, so a later unregister owes them a §10.1
+///     TTL=0 withdrawal;
+///   * the §8.3 phase does NOT advance, and the reclaim-cancel gate stays shut —
+///     the unserved family was neither asked nor told.
+///
+/// The shipped `used > 0` boolean had no truthful value here: it advanced the
+/// phase on the unserved family's behalf.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
+  use mdns_proto::service::ServiceState;
+
+  let mut state = delivery_test_state(false);
+  let now = StdInstant::now();
+  let reg = state
+    .register_service(delivery_test_spec("partial"), now)
+    .unwrap();
+  let h = reg.handle;
+  let mut buf = std::vec![0u8; 4096];
+
+  // Exactly ONE confirm, so the bounded policy provably cannot have fired.
+  let rounds = confirm_service_round(&mut state, h, now, &mut buf, PARTIAL_FANOUT);
+  assert_eq!(rounds, 1, "one announcement should have been offered");
+
+  let ctx = state.services.get(&h).unwrap();
+  assert_eq!(
+    ctx.proto.state(),
+    ServiceState::Announcing(0),
+    "a partial announcement must re-arm the SAME announcement — the unserved \
+     family never heard it"
+  );
+  assert!(
+    ctx.proto.advertises_instance(),
+    "the served family's peers may now cache these records, so §10.1 goodbye \
+     ownership must latch on the PARTIAL round"
+  );
+  assert!(
+    !ctx.proto.has_fully_announced().get(),
+    "a partial announcement must NOT open the reclaim-cancel gate"
+  );
+  assert_eq!(ctx.partial_rounds, 1, "one partial round must be counted");
+
+  // The headline regression: ownership latched, so a graceful unregister really
+  // does retract. Had the partial round dropped ownership the snapshot would be
+  // empty and the wire silent.
+  state.remove_service(h, now);
+  assert!(
+    state
+      .endpoint
+      .poll_withdrawal_transmit(now, &mut buf)
+      .is_some(),
+    "a partially-announced service must still emit a §10.1 TTL=0 goodbye for the \
+     records the served family put into peer caches"
+  );
+
+  drop(reg);
+}
+
+/// The other half of the pair: when EVERY obligated family carried the datagram,
+/// the same confirm both latches ownership and advances the phase — and only
+/// then does the reclaim-cancel gate open.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
+  use mdns_proto::service::ServiceState;
+
+  let mut state = delivery_test_state(false);
+  let now = StdInstant::now();
+  let reg = state
+    .register_service(delivery_test_spec("full"), now)
+    .unwrap();
+  let h = reg.handle;
+  let mut buf = std::vec![0u8; 4096];
+
+  let rounds = confirm_service_round(&mut state, h, now, &mut buf, WHOLE_FANOUT);
+  assert_eq!(rounds, 1, "one announcement should have been offered");
+
+  let ctx = state.services.get(&h).unwrap();
+  assert_eq!(
+    ctx.proto.state(),
+    ServiceState::Announcing(1),
+    "an all-delivered announcement advances the §8.3 sequence"
+  );
+  assert!(
+    ctx.proto.advertises_instance(),
+    "a delivered announcement latches goodbye ownership"
+  );
+  assert!(
+    ctx.proto.has_fully_announced().get(),
+    "a complete announcement is the ONLY thing that opens the reclaim-cancel gate"
+  );
+  assert_eq!(
+    ctx.partial_rounds, 0,
+    "no round was partial, so the bounded policy must never have been engaged"
+  );
+
+  drop(reg);
+}
+
+/// A fan-out that reached NO wire neither latches nor advances: nothing was
+/// exposed to any peer, so there is nothing to retract, and no family heard the
+/// announcement, so the phase must not move.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
+  use mdns_proto::service::ServiceState;
+
+  let mut state = delivery_test_state(false);
+  let now = StdInstant::now();
+  let reg = state
+    .register_service(delivery_test_spec("failed"), now)
+    .unwrap();
+  let h = reg.handle;
+  let mut buf = std::vec![0u8; 4096];
+
+  let rounds = confirm_service_round(&mut state, h, now, &mut buf, FAILED_FANOUT);
+  assert_eq!(rounds, 1, "one announcement should have been offered");
+
+  let ctx = state.services.get(&h).unwrap();
+  assert_eq!(
+    ctx.proto.state(),
+    ServiceState::Announcing(0),
+    "a wholly-failed announcement must re-arm without advancing"
+  );
+  assert!(
+    !ctx.proto.advertises_instance(),
+    "nothing reached a wire, so no peer can hold these records and no goodbye \
+     ownership may latch"
+  );
+  assert_eq!(
+    ctx.partial_rounds, 0,
+    "a wholly-failed round must not spend the partial budget — otherwise an \
+     alternating partial/failed pattern would evade the bound forever"
+  );
+
+  state.remove_service(h, now);
+  assert!(
+    state
+      .endpoint
+      .poll_withdrawal_transmit(now, &mut buf)
+      .is_none(),
+    "an unadvertised service has nothing to retract, so its withdrawal must put \
+     no datagram on the wire"
+  );
+
+  drop(reg);
+}
+
+/// The bounded obligation policy: a family that keeps missing must eventually
+/// stop holding the lifecycle. Round-precise — `MAX_PARTIAL_ROUNDS` partials are
+/// reported honestly, and the next one is excused so the phase advances from
+/// exactly where it stood. Without the bound this service pins in `Announcing(0)`
+/// forever.
+#[cfg(feature = "tokio")]
+#[test]
+fn the_bounded_partial_policy_fires_instead_of_pinning_the_phase() {
+  use mdns_proto::service::ServiceState;
+
+  let mut state = delivery_test_state(false);
+  let now = StdInstant::now();
+  let reg = state
+    .register_service(delivery_test_spec("bounded"), now)
+    .unwrap();
+  let h = reg.handle;
+  let mut buf = std::vec![0u8; 4096];
+
+  // Steps larger than the top rung of the core's §8.3 partial ladder (64 s), so
+  // each round's re-arm is always due.
+  let step = Duration::from_secs(120);
+  let mut t = now;
+  for round in 0..u32::from(MAX_PARTIAL_ROUNDS) {
+    assert_eq!(
+      confirm_service_round(&mut state, h, t, &mut buf, PARTIAL_FANOUT),
+      1,
+      "round {round} should have offered one announcement"
+    );
+    assert_eq!(
+      state.services[&h].proto.state(),
+      ServiceState::Announcing(0),
+      "the first {MAX_PARTIAL_ROUNDS} partial rounds are reported honestly and \
+       must not advance the phase"
+    );
+    t += step;
+  }
+
+  // The next partial excuses the missing family for THIS ONE confirm.
+  confirm_service_round(&mut state, h, t, &mut buf, PARTIAL_FANOUT);
+  assert_eq!(
+    state.services[&h].proto.state(),
+    ServiceState::Announcing(1),
+    "the bounded policy must excuse the missing family rather than pin the phase"
+  );
+  assert_eq!(
+    state.services[&h].partial_rounds, 0,
+    "the excusal resets the budget, so the policy is per-confirm and not sticky"
+  );
+  assert!(
+    state.services[&h].proto.advertises_instance(),
+    "excusal is confined to the PHASE: it can only turn Partial into All, both \
+     of which latch §10.1 goodbye ownership"
+  );
+
+  // And it terminates: a permanently half-reachable link still establishes.
+  for _ in 0..12 {
+    t += step;
+    confirm_service_round(&mut state, h, t, &mut buf, PARTIAL_FANOUT);
+  }
+  assert_eq!(
+    state.services[&h].proto.state(),
+    ServiceState::Established,
+    "a permanently partial link must still reach Established under the bound"
+  );
+
+  drop(reg);
+}
+
+/// RFC 6762 §9 surviving rename: the renamed-away old name's detached goodbye is
+/// enqueued RECLAIMABLE, so a replacement that takes the vacated name can cancel
+/// it — but ONLY once that replacement has fully announced. A replacement that
+/// reached one family alone must not cancel a goodbye the OTHER family still
+/// needs; the shipped drivers cancelled on the any-delivered exposure latch and
+/// left every peer on the unserved family holding the old registration's records
+/// until their positive TTL expired.
+///
+/// The old goodbye's per-family debt is what makes "both families" concrete: this
+/// drives a v4-only goodbye round first, so the item still owes IPv6 when the
+/// replacement announces.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
+  use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+  use mdns_proto::{
+    Name,
+    event::RouteEvent,
+    wire::{Header, MessageBuilder},
+  };
+
+  let mut state = delivery_test_state(true);
+  let now = StdInstant::now();
+  let old_inst = Name::try_from_str("Old._ipp._tcp.local.").unwrap();
+  let reg = state
+    .register_service(delivery_test_spec("Old"), now)
+    .unwrap();
+  let handle = reg.handle;
+  let mut buf = std::vec![0u8; 4096];
+
+  // Drive "Old" to fully announced, so its rename hands off a NON-empty goodbye.
+  let mut t = now;
+  for _ in 0..40 {
+    t += Duration::from_millis(300);
+    confirm_service_round(&mut state, handle, t, &mut buf, WHOLE_FANOUT);
+  }
+  assert!(
+    state.services[&handle].proto.advertises_instance(),
+    "Old must announce before the rename (so the goodbye is non-empty)"
+  );
+
+  // A conflicting SRV authority for "Old" with rival rdata: we lose the §8.2
+  // tiebreak and rename away.
+  let conflict = {
+    let target = Name::try_from_str("rival-host.local.").unwrap();
+    let mut cbuf = [0u8; 512];
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
+    b.push_srv_authority(&old_inst, 120, 0, 0, 9999, &target)
+      .unwrap();
+    let n = b.finish().unwrap();
+    cbuf[..n].to_vec()
+  };
+  let src = SocketAddr::from(([192, 168, 1, 200], 5353));
+  let local_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+
+  let mut renamed = false;
+  for _ in 0..80 {
+    t += Duration::from_millis(250);
+    confirm_service_round(&mut state, handle, t, &mut buf, WHOLE_FANOUT);
+    {
+      let DriverState {
+        endpoint, services, ..
+      } = &mut state;
+      if let Ok(evs) = endpoint.handle(t, src, local_ip, 0, &conflict, false) {
+        for ev in evs {
+          if let Ok(RouteEvent::ToService(ts)) = ev
+            && let Some(ctx) = services.get_mut(&ts.handle())
+          {
+            ctx.proto.handle_event(ts.into_event(), t);
+          }
+        }
+      }
+    }
+    state.push_updates(t).await;
+    if state
+      .services
+      .get(&handle)
+      .map(|c| c.proto.name().as_str() != old_inst.as_str())
+      .unwrap_or(true)
+    {
+      renamed = true;
+      break;
+    }
+  }
+  assert!(
+    renamed,
+    "Old must rename away under sustained conflict (seeding the detached goodbye)"
+  );
+
+  // Goodbye round 1 reaches v4 only: IPv6's debt is still outstanding, which is
+  // exactly what a premature cancel would throw away.
+  let (_, _, token) = state
+    .endpoint
+    .poll_withdrawal_transmit(t, &mut buf)
+    .expect("the renamed-away old name must have a detached goodbye pending");
+  state
+    .endpoint
+    .note_withdrawal_result(token, t, WithdrawalSend::Sent, WithdrawalSend::Retry);
+
+  // The application reclaims the vacated name.
+  let replacement = state
+    .register_service(delivery_test_spec("Old"), t)
+    .expect("the vacated name must be re-registerable while its goodbye drains");
+  let rh = replacement.handle;
+
+  // Drive the replacement's §8.1 probes to completion (a probe is a question and
+  // opens no gate) so the next round is its FIRST announcement.
+  for _ in 0..12 {
+    t += Duration::from_millis(300);
+    confirm_service_round(&mut state, rh, t, &mut buf, WHOLE_FANOUT);
+    if state.services[&rh].proto.state() == mdns_proto::service::ServiceState::Announcing(0) {
+      break;
+    }
+  }
+  assert_eq!(
+    state.services[&rh].proto.state(),
+    mdns_proto::service::ServiceState::Announcing(0),
+    "the replacement must reach its first announcement"
+  );
+
+  // Exactly ONE partially-delivered announcement — the bounded policy provably
+  // cannot have excused anything yet.
+  t += Duration::from_millis(300);
+  confirm_service_round(&mut state, rh, t, &mut buf, PARTIAL_FANOUT);
+  assert_eq!(state.services[&rh].partial_rounds, 1);
+  assert!(
+    !state.services[&rh].proto.has_fully_announced().get(),
+    "a partial announcement must leave the reclaim-cancel gate shut"
+  );
+  assert!(
+    state
+      .endpoint
+      .poll_withdrawal_transmit(t, &mut buf)
+      .is_some(),
+    "a partially-announced replacement must NOT cancel the old name's goodbye — \
+     the unserved family has heard neither the goodbye nor the replacement, and \
+     its share of the per-family debt is still owed"
+  );
+
+  // Once the replacement reaches every obligated family, §10.2's cache-flush
+  // announcement supersedes the stale records and the goodbye may be cancelled.
+  t += Duration::from_secs(2);
+  confirm_service_round(&mut state, rh, t, &mut buf, WHOLE_FANOUT);
+  assert!(
+    state.services[&rh].proto.has_fully_announced().get(),
+    "the replacement must have fully announced by now"
+  );
+  assert!(
+    state
+      .endpoint
+      .poll_withdrawal_transmit(t, &mut buf)
+      .is_none(),
+    "a fully-announced replacement supersedes the old records on every obligated \
+     family, so the reclaimable goodbye is cancelled"
+  );
+
+  drop(replacement);
+  drop(reg);
+}
