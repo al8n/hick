@@ -61,6 +61,17 @@ where
   /// Process an incoming datagram. Returns an iterator over routing
   /// decisions; the iterator borrows from `data` and from `self`.
   ///
+  /// # Contract
+  ///
+  /// The routing decisions this yields are fed to
+  /// [`Service::handle_event`](crate::service::Service::handle_event) /
+  /// [`Query::handle_event`](crate::query::Query::handle_event), so the
+  /// confirm-before-anything contract reaches the receive path too: do not drive
+  /// this loop for a service or query whose datagram from `poll_transmit` has not
+  /// been confirmed via `note_transmit_outcome`. A driver that sends and confirms
+  /// as one step satisfies this by construction. See
+  /// [`Service::poll_transmit`](crate::service::Service::poll_transmit).
+  ///
   /// `local_ip` is the address of the interface that received the datagram
   /// (as reported by IP_PKTINFO / IPV6_PKTINFO on Unix).  When the packet's
   /// source IP equals `local_ip` the datagram is treated as a self-originated

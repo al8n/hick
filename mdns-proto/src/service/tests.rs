@@ -5747,6 +5747,22 @@ fn the_section9_revert_to_probe_clears_the_partial_bound() {
 
 // ── the commit token across a lifecycle regression ────────────────────
 
+/// Build a service exempted from the debug-build contract assertions.
+///
+/// A live commit token can only still be live when `handle_event` /
+/// `handle_timeout` run if the caller broke the confirm-before-anything contract
+/// documented on `Service::poll_transmit`, and `assert_no_live_commit_token`
+/// exists to catch exactly that. The `Stale` rewrite is the RELEASE-mode
+/// backstop for the same violation, so pinning its behaviour means reproducing
+/// the violation the assertions forbid.
+fn make_non_compliant_service(
+  ttl_secs: u32,
+) -> Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> {
+  let mut svc = make_service(ttl_secs);
+  svc.disable_contract_assertions();
+  svc
+}
+
 /// Deliver a probe conflict whose SRV rdata differs from ours (port 9999 vs our
 /// 631) — a genuine §9 conflict when established, and a tiebreak we LOSE when
 /// probing, since the peer's sorted set compares greater than ours.
@@ -5803,7 +5819,7 @@ fn regress_and_rename_with_a_parked_datagram(
 /// after TWO probes on the wire where RFC 6762 §8.1 requires three.
 #[test]
 fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
-  let mut svc = make_service(120);
+  let mut svc = make_non_compliant_service(120);
   let mut now = drive_to_probing_zero(&mut svc);
 
   // A probe for the ORIGINAL name is encoded and parked.
@@ -5859,7 +5875,7 @@ fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
 /// name and the old name is never retracted at all.
 #[test]
 fn a_stale_announcement_confirm_withdraws_under_the_old_name() {
-  let mut svc = make_service(120);
+  let mut svc = make_non_compliant_service(120);
   let now = drive_to_announcing_zero(&mut svc);
   // The first announcement of the ORIGINAL name is encoded and parked. Nothing
   // has latched yet, so this datagram is the ONLY thing that ever exposed it.
@@ -5903,7 +5919,7 @@ fn a_stale_announcement_confirm_withdraws_under_the_old_name() {
 /// §10.1 goodbye on that basis strands its records in every peer cache.
 #[test]
 fn a_stale_announcement_confirm_neither_establishes_nor_opens_the_reclaim_gate() {
-  let mut svc = make_service(120);
+  let mut svc = make_non_compliant_service(120);
   let now = drive_to_announcing_zero(&mut svc);
   let at = emit_announcement(&mut svc, now);
   let now = regress_and_rename_with_a_parked_datagram(&mut svc, at);
@@ -5933,7 +5949,7 @@ fn a_stale_announcement_confirm_neither_establishes_nor_opens_the_reclaim_gate()
 /// reset, because it now describes the fresh §8.1 sequence.
 #[test]
 fn a_stale_announcement_confirm_latches_ownership_without_recharging_the_sequence() {
-  let mut svc = make_service(120);
+  let mut svc = make_non_compliant_service(120);
   let now = drive_to_announcing_zero(&mut svc);
   let at = emit_announcement(&mut svc, now);
   assert!(!svc.advertises_instance());
@@ -5979,7 +5995,7 @@ fn a_stale_announcement_confirm_latches_ownership_without_recharging_the_sequenc
 fn a_regression_leaves_a_meta_response_token_alone() {
   use crate::{event::ServiceQuestion, wire::QuestionRef};
 
-  let mut svc = make_service(120);
+  let mut svc = make_non_compliant_service(120);
   let now = drive_to_established(&mut svc);
 
   let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
@@ -6092,6 +6108,164 @@ fn the_partial_ladder_neither_contracts_nor_outruns_the_refresh_interval() {
       *gap <= cap_ms,
       "a {gap} ms gap outruns the {cap_ms} ms periodic refresh of a {TTL_SECS} s \
        TTL, so the served link loses the records; gaps were {gaps:?} ms"
+    );
+  }
+}
+
+// ── the confirm-before-anything contract ──────────────────────────────
+
+/// A lifecycle deadline that fires while a datagram is still unconfirmed must
+/// queue NOTHING.
+///
+/// The transmit queue is drained by position, not by deadline, so an entry
+/// pushed under a live commit token survives the confirm and then fires the
+/// instant the token clears — ignoring the deadline the confirm installed for
+/// the phase it actually landed the service in.
+#[test]
+fn a_lifecycle_timeout_queues_nothing_while_a_datagram_is_unconfirmed() {
+  let mut svc = make_non_compliant_service(120);
+  let now = drive_to_probing_zero(&mut svc);
+  emit_probe(&mut svc, now);
+
+  // A driver that parks the datagram lets the re-armed probe deadline fire.
+  let due = svc
+    .poll_timeout()
+    .expect("the probe deadline is re-armed at the fire site");
+  svc.handle_timeout(due).unwrap();
+  assert!(
+    svc.peek_pending().is_none(),
+    "a lifecycle deadline firing under a live commit token must queue nothing; \
+     queue={:?}",
+    svc.pending_transmits
+  );
+
+  // The confirm advances §8.1 and installs the deadline that governs from here.
+  svc.note_transmit_outcome(due, TransmitOutcome::AllDelivered);
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(1)),
+    "the delivered probe advances one §8.1 step; got {:?}",
+    svc.state()
+  );
+  let armed = svc
+    .lifecycle_deadline
+    .expect("the confirm re-arms the next probe");
+  let mut buf = std::vec![0u8; 4096];
+  assert!(
+    svc.poll_transmit(due, &mut buf).unwrap().is_none(),
+    "no queued transmit may outlive the confirm and pre-empt the {armed:?} \
+     deadline it installed"
+  );
+}
+
+/// Several lifecycle deadlines can fire while one datagram sits unconfirmed, and
+/// `push_pending` does not deduplicate. Each fire would otherwise add another
+/// entry, so the confirm would be followed by a burst that walks the §8.1
+/// sequence at ~0 ms spacing — a queued probe carries no sequence index, so every
+/// drained entry advances a stage. RFC 6762 §8.1 wants 250 ms between probes and
+/// three probes on the wire before the name is claimed.
+#[test]
+fn accumulated_lifecycle_deadlines_cannot_burst_after_the_confirm() {
+  let mut svc = make_non_compliant_service(120);
+  let now = drive_to_probing_zero(&mut svc);
+  let mut at = emit_probe(&mut svc, now);
+
+  for _ in 0..3 {
+    at = svc.poll_timeout().expect("the probe deadline stays armed");
+    svc.handle_timeout(at).unwrap();
+  }
+  svc.note_transmit_outcome(at, TransmitOutcome::AllDelivered);
+  assert_eq!(
+    svc.probe_count, 1,
+    "exactly one probe reached the wire, so §8.1 advanced exactly one step"
+  );
+
+  let mut buf = std::vec![0u8; 4096];
+  let mut burst = 0usize;
+  while let Ok(Some(_)) = svc.poll_transmit(at, &mut buf) {
+    burst += 1;
+    svc.note_transmit_outcome(at, TransmitOutcome::AllDelivered);
+  }
+  assert_eq!(
+    burst, 0,
+    "the deadlines that fired under the live token left {burst} datagram(s) to \
+     drain at once"
+  );
+  assert_eq!(
+    svc.probe_count, 1,
+    "…and the §8.1 sequence stands where the single delivered probe left it"
+  );
+}
+
+/// The same guard on the `Established` periodic re-announce: a refresh deadline
+/// firing under a live token must not leave an announcement to fire the moment
+/// the confirm clears, which would put two unsolicited responses on the wire
+/// inside the one-second interval RFC 6762 §8.3 sets as the floor.
+#[test]
+fn an_established_refresh_queues_nothing_while_a_datagram_is_unconfirmed() {
+  let mut svc = make_non_compliant_service(120);
+  drive_to_established(&mut svc);
+  let due = svc
+    .poll_timeout()
+    .expect("an Established service re-announces periodically");
+  let at = emit_announcement(&mut svc, due);
+
+  let next = svc
+    .poll_timeout()
+    .expect("the refresh deadline is re-armed at the fire site");
+  svc.handle_timeout(next).unwrap();
+  assert!(
+    svc.peek_pending().is_none(),
+    "queue={:?}",
+    svc.pending_transmits
+  );
+
+  svc.note_transmit_outcome(at, TransmitOutcome::AllDelivered);
+  let mut buf = std::vec![0u8; 4096];
+  assert!(
+    svc.poll_transmit(at, &mut buf).unwrap().is_none(),
+    "the confirm's own re-arm governs the next refresh"
+  );
+}
+
+/// The ordering is not type-checkable, so the debug-build assertions are what a
+/// non-compliant driver actually trips. They are what turns a silent state
+/// corruption into a failure in that driver's own test suite.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "still awaiting Service::note_transmit_outcome")]
+fn handle_timeout_under_a_live_commit_token_trips_the_contract_assertion() {
+  let mut svc = make_service(120);
+  let now = drive_to_probing_zero(&mut svc);
+  let at = emit_probe(&mut svc, now);
+  let _ = svc.handle_timeout(at.advance(300));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "still awaiting Service::note_transmit_outcome")]
+fn handle_event_under_a_live_commit_token_trips_the_contract_assertion() {
+  let mut svc = make_service(120);
+  let now = drive_to_probing_zero(&mut svc);
+  let at = emit_probe(&mut svc, now);
+  deliver_losing_srv_conflict(&mut svc, at);
+}
+
+/// `periodic_refresh_secs` is `ttl * 80 / 100` with integer division, so TTL 0
+/// and TTL 1 both truncate to a ZERO-second refresh interval: an `Established`
+/// service re-arms at `now` and re-announces on every tick. Registration rejects
+/// those TTLs (`MIN_SERVICE_TTL_SECS`) and `Service` cannot be built any other
+/// way, so this floor is defence in depth behind that guard — and it mirrors the
+/// floor `partial_announce_deadline` already applies to the same quantity.
+#[test]
+fn the_periodic_refresh_interval_never_re_arms_at_now() {
+  let now = FakeInstant::zero();
+  for ttl in [0u32, 1, 2] {
+    let due = re_announce_deadline(now, ttl).expect("a 1 s offset is representable");
+    assert!(
+      due.0 >= 1_000,
+      "a {ttl} s TTL re-armed the periodic refresh {} ms out, so an Established \
+       service would repump every tick",
+      due.0
     );
   }
 }

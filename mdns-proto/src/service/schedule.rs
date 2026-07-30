@@ -210,7 +210,16 @@ pub(crate) fn later<I: Instant>(a: Option<I>, b: Option<I>) -> Option<I> {
 
 /// Compute the next re-announce deadline once Established. Returns the time at which
 /// records should be re-broadcast (~80% of TTL).
+///
+/// Floored at RFC 6762 §8.3's one-second minimum, exactly as
+/// [`partial_announce_deadline`] floors its cap. [`periodic_refresh_secs`]
+/// truncates toward zero, so a TTL below 2 s yields a zero-second interval and
+/// re-arms an `Established` service at `now` — a repump loop that emits an
+/// unsolicited response every tick, which §8.3 forbids outright. Registration
+/// rejects those TTLs ([`crate::constants::MIN_SERVICE_TTL_SECS`]); this floor is
+/// what keeps a future TTL path from reintroducing the zero interval behind it.
 #[allow(dead_code)]
 pub(crate) fn re_announce_deadline<I: Instant>(now: I, ttl_secs: u32) -> Option<I> {
-  now.checked_add_duration(Duration::from_secs(periodic_refresh_secs(ttl_secs)))
+  let secs = periodic_refresh_secs(ttl_secs).max(rfc::ANNOUNCE_INTERVAL.as_secs());
+  now.checked_add_duration(Duration::from_secs(secs))
 }

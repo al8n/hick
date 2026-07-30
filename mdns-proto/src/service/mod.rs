@@ -315,29 +315,36 @@ cfg_heap! {
   ///
   /// # Token lifecycle across every state-mutating entry point
   ///
-  /// A driver may park a datagram and confirm it arbitrarily later, so EVERY
-  /// entry point that mutates lifecycle state has to state what it does to a
-  /// token that is still live. The audit below is the whole matrix; the
-  /// non-trivial cells are the ones marked "rewrite".
+  /// The confirm-before-anything contract on [`Service::poll_transmit`] means no
+  /// state-mutating entry point may run while a token is live, so for a compliant
+  /// driver every row below except `poll_transmit` and `note_transmit_outcome` is
+  /// unreachable. The core cannot type-check the ordering, though, and a
+  /// violation must stay defined rather than silently corrupting state in
+  /// release — so each entry point still declares what it does to a live token.
+  /// Every cell marked "rewrite" is a BACKSTOP: unreachable for a compliant
+  /// driver, and what happens if the contract is broken.
   ///
   /// | entry point | live token | partial counters (`partial_rounds` / `partial_announce_streak`) | deadlines |
   /// |---|---|---|---|
   /// | `handle_event` §8.2 probe-conflict buffer | untouched — buffering a peer record is not a lifecycle move | untouched | untouched |
-  /// | `handle_event` §9 same-name revert (`Init`) | **rewrite** → `Stale`, name unchanged | `partial_rounds = 0` (fresh §8.1 sequence); streak untouched — same name, same §8.3 ladder | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
+  /// | `handle_event` §9 same-name revert (`Init`) | backstop: **rewrite** → `Stale`, name unchanged | `partial_rounds = 0` (fresh §8.1 sequence); streak untouched — same name, same §8.3 ladder | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
   /// | `handle_event` Question / KnownAnswer / HostConflict | untouched — none of them regress a phase | untouched | `response_deadline` / `meta_response_deadline` only |
-  /// | `handle_timeout` §8.2 tiebreak → rename (`Init`) | **rewrite** → `Stale`, old-name records captured | both zeroed by `reset_advertised_name_state` — a NEW name starts both sequences over | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
-  /// | `handle_timeout` §8.2 tiebreak → `Conflicting` (invalid new name) | **rewrite** → `Stale`, old-name records captured | streak zeroed; `partial_rounds` untouched — terminal, nothing left to excuse | all cleared |
+  /// | `handle_timeout` §8.2 tiebreak → rename (`Init`) | backstop: **rewrite** → `Stale`, old-name records captured | both zeroed by `reset_advertised_name_state` — a NEW name starts both sequences over | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
+  /// | `handle_timeout` §8.2 tiebreak → `Conflicting` (invalid new name) | backstop: **rewrite** → `Stale`, old-name records captured | streak zeroed; `partial_rounds` untouched — terminal, nothing left to excuse | all cleared |
   /// | `handle_timeout` `Init` → `Probing(0)` | untouched — a forward step, and it emits nothing | untouched | re-armed |
-  /// | `handle_timeout` `Probing`/`Announcing`/`Established` fire | untouched — only ENQUEUES; `poll_transmit` refuses to encode while a token is live | untouched | re-armed |
+  /// | `handle_timeout` `Probing`/`Announcing`/`Established` fire | untouched; backstop: `push_lifecycle_pending` queues NOTHING while a token is live, so no lifecycle transmit outlives the confirm | untouched | re-armed |
   /// | `handle_timeout` `Conflicting` | untouched — no progression | untouched | untouched |
   /// | `poll_transmit` | refuses (`Ok(None)`) while one is live — the single slot is what matches one confirm to one datagram | untouched | untouched |
   /// | `note_transmit_outcome` | consumed (`.take()`) | per the confirm arms | per the confirm arms |
   /// | `withdrawal_snapshot` / `take_rename_goodbye_handoff` | untouched — pure reads of the latch | untouched | untouched |
   ///
-  /// Records still in flight at teardown are a KNOWN residual:
-  /// [`Service::withdrawal_snapshot`] can only report what has already been
-  /// confirmed, so a datagram parked across the teardown withdraws nothing. The
-  /// harm is bounded — peers age those records out at TTL.
+  /// Teardown is the row where the contract is doing the most work.
+  /// [`Service::withdrawal_snapshot`] can only report what a confirm has already
+  /// latched, so a datagram outstanding across a teardown would put records in
+  /// peer caches that the §10.1 goodbye then never withdraws — and those records'
+  /// TTLs would only START at that late transmission, so the exposure is not
+  /// bounded by the teardown at all. Confirming before tearing down is what makes
+  /// the snapshot complete.
   #[derive(Debug, Clone)]
   enum AwaitingConfirm {
     /// A probe is awaiting its delivery result (§8.1 sequence advance). A probe is
@@ -672,6 +679,12 @@ cfg_heap! {
 
 cfg_heap! {
   /// Service state machine. One per registered service.
+  ///
+  /// Driving one means honouring two call-ordering contracts: drain
+  /// [`Service::poll_transmit`] until it returns `Ok(None)`, and confirm each
+  /// datagram it hands out — via [`Service::note_transmit_outcome`] — before
+  /// invoking any other state-mutating entry point on this service.
+  /// [`Service::poll_transmit`] documents the second one in full.
   pub struct Service<I, TQ, EV> {
   handle: ServiceHandle,
   state: ServiceState,
@@ -804,6 +817,14 @@ cfg_heap! {
   /// section already carries the meta-PTR for OUR service type — our pending
   /// meta reply is then suppressed. Reset each meta cycle.
   meta_known_answered: bool,
+  /// Test-only: silence [`Service::assert_no_live_commit_token`] so a test can
+  /// drive the entry points the way a NON-COMPLIANT driver would and pin what
+  /// the release-mode backstops actually do. Those backstops only exist for a
+  /// driver that breaks the contract, so the assertion that catches such a
+  /// driver in debug builds would otherwise make them untestable. `cfg(test)`:
+  /// it does not exist in a shipped build and no public API sets it.
+  #[cfg(test)]
+  contract_assertions_off: bool,
   }
 }
 
@@ -868,7 +889,19 @@ where
       meta_response_deadline: None,
       meta_questioner_srcs: std::vec::Vec::new(),
       meta_known_answered: false,
+      #[cfg(test)]
+      contract_assertions_off: false,
     }
+  }
+
+  /// Test-only: opt this service out of the debug-build contract assertions.
+  ///
+  /// The only callers are the backstop tests, which must reproduce a
+  /// non-compliant driver to observe what release builds do when the contract is
+  /// broken.
+  #[cfg(test)]
+  pub(crate) fn disable_contract_assertions(&mut self) {
+    self.contract_assertions_off = true;
   }
 
   /// Attach the shared [`hick_trace::stats::Stats`] handle from the owning
@@ -998,6 +1031,12 @@ where
 
   /// Report the delivery outcome of the datagram most recently produced by
   /// [`Self::poll_transmit`] (the confirm-on-send chokepoint).
+  ///
+  /// # Contract
+  ///
+  /// Must be called before ANY other state-mutating entry point for this service
+  /// — see [`Self::poll_transmit`], which documents the ordering and why a
+  /// datagram the transport refuses is dropped and confirmed rather than parked.
   ///
   /// This is the SOLE place service lifecycle state advances and the SOLE place
   /// goodbye ownership latches. `poll_transmit` only encodes bytes and stamps a
@@ -1518,6 +1557,15 @@ where
   /// window is therefore simply two independent items — the detached old-name
   /// item already enqueued, plus the route-attached current-name item this
   /// snapshot produces — with no `snapshot.rename` inheritance.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`]. This snapshot reports only
+  /// what a confirm has already latched, so an outstanding datagram's records are
+  /// missing from it: peers would cache records the goodbye never withdraws, and
+  /// their TTLs would only start at that late transmission — an exposure the
+  /// teardown does not bound. See [`Self::poll_transmit`] for the full contract.
   pub fn withdrawal_snapshot(&mut self) -> WithdrawalSnapshot {
     // Snapshot the CURRENT goodbye-ownership latch (the live name's records).
     // After a rename the current name is the freshly re-announced one, and its
@@ -1604,6 +1652,54 @@ where
       self.pending_transmits[1] = Some(kind);
     }
     // Both slots full — drop.
+  }
+
+  /// Fail loudly, in debug builds, when a state-mutating entry point runs while
+  /// a datagram produced by [`Self::poll_transmit`] is still awaiting its
+  /// [`Self::note_transmit_outcome`].
+  ///
+  /// The confirm-before-anything contract documented on [`Self::poll_transmit`]
+  /// is not something the core can type-check, so this is where a driver that
+  /// breaks it discovers the fact — in its own test suite, at the offending call,
+  /// instead of through corrupted lifecycle state in release. It compiles out of
+  /// release builds, where the structural backstops (the single-slot refusal in
+  /// `poll_transmit`, [`Self::push_lifecycle_pending`], and the `Stale` token
+  /// rewrite) absorb the violation.
+  #[inline]
+  fn assert_no_live_commit_token(&self, entry_point: &str) {
+    #[cfg(test)]
+    if self.contract_assertions_off {
+      return;
+    }
+    debug_assert!(
+      self.awaiting_confirm.is_none(),
+      "{entry_point} was called while a datagram from Service::poll_transmit is \
+       still awaiting Service::note_transmit_outcome",
+    );
+  }
+
+  /// Queue a LIFECYCLE transmit (a §8.1 probe or a §8.3 announcement), unless a
+  /// datagram is still awaiting its delivery result.
+  ///
+  /// A live commit token means the previous datagram's lifecycle effect has not
+  /// been applied yet, and [`Self::note_transmit_outcome`] re-arms
+  /// `lifecycle_deadline` from post-confirm time for exactly the phase the
+  /// confirm lands the service in. Queuing another lifecycle transmit here would
+  /// outlive that confirm and then ignore the deadline it installed: the queue
+  /// is drained by position, not by deadline, so the entry fires as soon as the
+  /// token clears. A queued `Probe` also carries no sequence index, so several
+  /// accumulated entries would advance the §8.1 sequence at ~0 ms spacing rather
+  /// than at §8.1's 250 ms cadence.
+  ///
+  /// The confirm's own re-arm governs instead. This is unreachable for a driver
+  /// that honours the confirm-before-anything contract documented on
+  /// [`Self::poll_transmit`] — nothing may call `handle_timeout` while a token is
+  /// live — and is the structural backstop for one that does not.
+  fn push_lifecycle_pending(&mut self, kind: PendingTransmitKind) {
+    if self.awaiting_confirm.is_some() {
+      return;
+    }
+    self.push_pending(kind);
   }
 
   /// Pop the head of the FIFO queue, compacting the tail down.
@@ -1738,9 +1834,18 @@ where
   /// `now` is the current time; it is cached so that `handle_event` can
   /// compute KAS-hint expiration times and schedule the jittered response
   /// deadline without needing `handle_timeout` to have fired first.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`] — an inbound RFC 6762 §9
+  /// conflict processed in that window regresses the exact state the pending
+  /// confirm is about to apply. See [`Self::poll_transmit`] for the full
+  /// contract; debug builds assert it.
   pub fn handle_event(&mut self, event: ServiceEvent<'_>, now: I) {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
+    self.assert_no_live_commit_token("Service::handle_event");
     // always refresh last_now so that subsequent calls (e.g.
     // Question→response_deadline, KnownAnswer→expiry) use a current reference
     // even when handle_timeout has not recently fired.
@@ -2202,10 +2307,21 @@ where
   }
 
   /// Drive timer-based transitions. Returns Ok unless arithmetic overflowed.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`]: the confirm installs the
+  /// deadline for the phase it lands the service in, so a lifecycle deadline
+  /// fired before it would queue a transmit that then ignores that deadline. See
+  /// [`Self::poll_transmit`] for the full contract; debug builds assert it, and
+  /// the lifecycle queue refuses to accept an entry under a live token in
+  /// release.
   #[allow(clippy::arithmetic_side_effects)]
   pub fn handle_timeout(&mut self, now: I) -> Result<(), HandleTimeoutError> {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
+    self.assert_no_live_commit_token("Service::handle_timeout");
     // Cache latest `now` for use by poll_transmit's KAS filtering closure.
     // handle_event now receives `now` directly, so this is only needed
     // for the filtering closure in poll_transmit.
@@ -2391,7 +2507,7 @@ where
               probe_n = n,
               "service: Probing — enqueueing probe"
             );
-            self.push_pending(PendingTransmitKind::Probe);
+            self.push_lifecycle_pending(PendingTransmitKind::Probe);
             self.lifecycle_deadline = probe_deadline(now, n, &mut self.rng);
             true
           }
@@ -2410,7 +2526,7 @@ where
               announce_n = _n,
               "service: Announcing — enqueueing announcement"
             );
-            self.push_pending(PendingTransmitKind::Announcement);
+            self.push_lifecycle_pending(PendingTransmitKind::Announcement);
             self.lifecycle_deadline = announce_deadline(now, 1);
             true
           }
@@ -2421,7 +2537,7 @@ where
               handle = self.handle.raw(),
               "service: Established — enqueueing periodic re-announce"
             );
-            self.push_pending(PendingTransmitKind::Announcement);
+            self.push_lifecycle_pending(PendingTransmitKind::Announcement);
             self.lifecycle_deadline = re_announce_deadline(now, self.records.ttl_secs());
             true
           }
@@ -2457,6 +2573,46 @@ where
   /// loop on this method until it returns `Ok(None)` to drain all pending
   /// transmits (at most 2 can be queued when both a response deadline and a
   /// lifecycle deadline fired at the same `now`).
+  ///
+  /// # The confirm-before-anything contract
+  ///
+  /// > Once this method returns a datagram, NO other state-mutating entry point
+  /// > for this service — [`Self::handle_event`], [`Self::handle_timeout`],
+  /// > [`Self::withdrawal_snapshot`] or any other teardown step — may be invoked
+  /// > until that datagram's [`Self::note_transmit_outcome`]. `poll_transmit`
+  /// > itself is excepted: it refuses (`Ok(None)`) while a datagram is
+  /// > outstanding, which is what makes one confirm resolve exactly one datagram.
+  ///
+  /// A driver therefore does `poll_transmit` → send → `note_transmit_outcome` as
+  /// one indivisible step. A send the transport cannot accept right now is
+  /// **dropped and confirmed** — `TransmitOutcome::NoneDelivered` — not parked:
+  /// every re-armed datagram is re-encoded from live state on the next poll, so
+  /// dropping one costs nothing but the re-encode.
+  ///
+  /// The reason parking looks attractive is a fidelity that does not exist.
+  /// "Delivered" at this layer already means only *the kernel accepted the
+  /// datagram synchronously* — a successful `sendto` says nothing about whether
+  /// anything reached the wire, let alone a peer, and UDP offers no way to learn
+  /// otherwise. Deferring the confirm to report a truer answer therefore buys
+  /// nothing, while everything the interim breaks is real: `poll_transmit` stamps
+  /// a commit token before returning, and that token is the ONLY record of what
+  /// the encoded bytes mean. An entry point that runs while it is live regresses
+  /// or re-encodes the very state the pending confirm is about to apply — a §9
+  /// conflict processed between the poll and the confirm voids the datagram's
+  /// whole generation, and a teardown between them takes a
+  /// [`Self::withdrawal_snapshot`] that cannot know about records the unconfirmed
+  /// datagram is putting in peer caches, so the goodbye never withdraws them and
+  /// their TTL only starts counting once that late datagram lands.
+  ///
+  /// The core cannot type-check the ordering, so it is enforced by cheap
+  /// backstops rather than assumed: a `debug_assert!` at each entry point fails a
+  /// non-compliant driver loudly in its own test suite, and in release the single
+  /// slot above, the lifecycle queue's own token check, and the `Stale` token
+  /// rewrite keep the damage defined. All are unreachable for a compliant driver.
+  ///
+  /// Precedent for call-ordering contracts on this type: the drain-to-`Ok(None)`
+  /// rule above, and the rename-handoff drain contract on
+  /// [`Self::note_transmit_outcome`].
   pub fn poll_transmit(
     &mut self,
     now: I,

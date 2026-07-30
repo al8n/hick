@@ -638,11 +638,12 @@ fn poll_timeout_reflects_absolute_timeout() {
     "initial poll_timeout must be <= timeout_deadline"
   );
 
-  // The first transmit schedules the first retry at now + ~1s (well past the
-  // 100 ms timeout). handle_timeout(now) is then a no-op: the retry is not
-  // yet due.
+  // The first transmit's CONFIRM schedules the first retry at now + ~1s (well
+  // past the 100 ms timeout). handle_timeout(now) is then a no-op: the retry is
+  // not yet due.
   let mut buf = [0u8; 512];
   let _ = q.poll_transmit(now, &mut buf).unwrap();
+  q.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
   q.handle_timeout(now).unwrap();
   assert!(!q.done, "query must not be done immediately");
 
@@ -1352,6 +1353,10 @@ fn duplicate_suppression_clears_the_partial_bound_like_a_delivered_send() {
 /// still awaiting its confirm. `terminate` clears both deadlines, so a late
 /// confirm that re-armed `next_deadline` would hand the driver a wakeup for a
 /// query that will never transmit again — `poll_timeout` does not screen `done`.
+///
+/// Reaching that state requires `handle_timeout` to run while the datagram is
+/// unconfirmed, which the contract on `Query::poll_transmit` forbids, so the
+/// debug-build assertion is off: this pins the RELEASE-mode backstop.
 #[test]
 fn a_late_confirm_on_a_terminated_query_arms_no_wakeup() {
   let handle = QueryHandle::from_raw(0);
@@ -1367,6 +1372,7 @@ fn a_late_confirm_on_a_terminated_query_arms_no_wakeup() {
     false,
     Some(deadline),
   );
+  q.disable_contract_assertions();
 
   emit_question(&mut q, start);
   assert!(q.awaiting_send_confirm);

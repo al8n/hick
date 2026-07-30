@@ -55,6 +55,16 @@ where
     /// more than once (e.g. an encode-failure escalation on an already-cancelled
     /// service) and must not enqueue a duplicate. If `handle` has no registered
     /// route the call is likewise a silent no-op.
+    ///
+    /// # Contract
+    ///
+    /// `snapshot` must come from a
+    /// [`Service::withdrawal_snapshot`](crate::service::Service::withdrawal_snapshot)
+    /// taken with no datagram outstanding — i.e. after the service's last
+    /// `poll_transmit` was confirmed. A snapshot taken mid-flight omits the
+    /// records that datagram is about to place in peer caches, and this goodbye
+    /// can only withdraw what the snapshot names. See
+    /// [`Service::poll_transmit`](crate::service::Service::poll_transmit).
     pub fn begin_withdrawal(
       &mut self,
       handle: ServiceHandle,

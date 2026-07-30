@@ -23,3 +23,18 @@ pub const MDNS_IPV6_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x
 
 /// mDNS UDP port (RFC 6762 §3).
 pub const MDNS_PORT: u16 = 5353;
+
+/// Smallest record TTL a service may be registered with.
+///
+/// Two seconds is the smallest TTL whose ~80 % periodic refresh (`ttl * 80 /
+/// 100`, integer division) still clears RFC 6762 §8.3's one-second floor on the
+/// interval between unsolicited responses. Below it:
+///
+/// * **TTL 0** is not an advertisement at all — a TTL-0 resource record is the
+///   §10.1 goodbye that DELETES the record from every peer cache, so publishing
+///   one as a positive record advertises a service that peers are told to forget
+///   in the same datagram.
+/// * **TTL 1** refreshes at 0.8 s, inside the §8.3 floor, so the responder
+///   cannot re-announce often enough to keep the record alive without violating
+///   the rate limit.
+pub const MIN_SERVICE_TTL_SECS: u32 = 2;

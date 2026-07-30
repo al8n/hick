@@ -56,6 +56,25 @@ BREAKING
   shape and nothing else. The split is normative on `TransmitOutcome`'s rustdoc:
   the driver owns the obligated set and link death; the core owns its own
   patience.
+- Confirm before anything else. Once `Service::poll_transmit` /
+  `Query::poll_transmit` returns a datagram, no other state-mutating entry point
+  for that service or query — `handle_event`, `handle_timeout`,
+  `withdrawal_snapshot` / teardown — may run until its `note_transmit_outcome`;
+  `poll_transmit` itself is excepted and refuses while one is outstanding. A
+  driver that cannot send right now DROPS the datagram and confirms
+  `NoneDelivered` in the same call rather than parking it: "delivered" here
+  already means only that the kernel accepted the datagram synchronously, so a
+  deferred confirm buys no fidelity while leaving the pending token's lifecycle
+  meaning undecided. Normative on `Service::poll_transmit`'s rustdoc, asserted in
+  debug builds. All four drivers in this workspace already comply.
+- `mdns-proto`: `Endpoint::try_register_service` rejects a record TTL below
+  `constants::MIN_SERVICE_TTL_SECS` (2 s) with the new
+  `RegisterServiceError::TtlTooSmall`. A TTL-0 positive record is the RFC 6762
+  §10.1 goodbye encoding — it deletes the record from peer caches instead of
+  publishing it — and TTL 1 refreshes at 0.8 s, inside §8.3's one-second floor on
+  unsolicited responses. Both also truncate the ~80 %-of-TTL periodic refresh to
+  a zero-second interval, which re-armed an `Established` service at `now` and
+  repumped an announcement every tick. The TTL is rejected rather than clamped.
 
 FIXES (dependent-crate behaviour; visible without any source change on the
 caller's part)

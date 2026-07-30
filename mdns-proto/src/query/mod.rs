@@ -111,6 +111,11 @@ impl CollectedAnswer {
 }
 
 /// Query state machine. One per outstanding query.
+///
+/// Driving one means confirming each datagram [`Query::poll_transmit`] hands out
+/// — via [`Query::note_transmit_outcome`] — before invoking any other
+/// state-mutating entry point on this query. [`Query::poll_transmit`] documents
+/// that contract in full.
 pub struct Query<I, AN, EV> {
   handle: QueryHandle,
   #[cfg(feature = "stats")]
@@ -175,6 +180,12 @@ pub struct Query<I, AN, EV> {
   /// Absolute instant at which this query should auto-cancel regardless of
   /// the retry budget (`None` means no hard deadline beyond the retry budget).
   timeout_deadline: Option<I>,
+  /// Test-only: silence [`Query::assert_no_live_send_confirm`] so a test can
+  /// drive the entry points the way a NON-COMPLIANT driver would and pin what a
+  /// release build actually does. `cfg(test)`: it does not exist in a shipped
+  /// build and no public API sets it.
+  #[cfg(test)]
+  contract_assertions_off: bool,
 }
 
 impl<I, AN, EV> Query<I, AN, EV>
@@ -227,7 +238,39 @@ where
       partial_rounds: 0,
       unicast_response,
       timeout_deadline,
+      #[cfg(test)]
+      contract_assertions_off: false,
     }
+  }
+
+  /// Test-only: opt this query out of the debug-build contract assertions.
+  ///
+  /// The only callers are tests that must reproduce a non-compliant driver to
+  /// observe what release builds do when the contract is broken.
+  #[cfg(test)]
+  pub(crate) fn disable_contract_assertions(&mut self) {
+    self.contract_assertions_off = true;
+  }
+
+  /// Fail loudly, in debug builds, when a state-mutating entry point runs while
+  /// the datagram [`Self::poll_transmit`] produced is still awaiting its
+  /// [`Self::note_transmit_outcome`].
+  ///
+  /// See [`Self::poll_transmit`] for the contract this enforces. It compiles out
+  /// of release builds, where `awaiting_send_confirm` alone absorbs the
+  /// violation: it makes at most one confirm resolve one datagram, but it cannot
+  /// undo state a mid-flight `handle_event` / `handle_timeout` already moved.
+  #[inline]
+  fn assert_no_live_send_confirm(&self, entry_point: &str) {
+    #[cfg(test)]
+    if self.contract_assertions_off {
+      return;
+    }
+    debug_assert!(
+      !self.awaiting_send_confirm,
+      "{entry_point} was called while a datagram from Query::poll_transmit is \
+       still awaiting Query::note_transmit_outcome",
+    );
   }
 
   /// Attach the shared [`hick_trace::stats::Stats`] handle from the owning
@@ -294,9 +337,15 @@ where
   }
 
   /// Process an event routed to this query by the Endpoint.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`]; see [`Self::poll_transmit`].
   pub fn handle_event(&mut self, event: QueryEvent<'_>) {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("query", handle = self.handle.raw()).entered();
+    self.assert_no_live_send_confirm("Query::handle_event");
     crate::trace::trace!(
       target: "mdns_proto::query",
       handle = self.handle.raw(),
@@ -480,9 +529,15 @@ where
   }
 
   /// Drive timer-based transitions.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`]; see [`Self::poll_transmit`].
   pub fn handle_timeout(&mut self, now: I) -> Result<(), HandleTimeoutError> {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("query", handle = self.handle.raw()).entered();
+    self.assert_no_live_send_confirm("Query::handle_timeout");
     if self.done {
       return Ok(());
     }
@@ -554,6 +609,29 @@ where
   /// deadline tick is guaranteed: the pending flag is cleared after the
   /// datagram is built, so a driver looping on this method will not
   /// re-send the query until the next `handle_timeout` fires.
+  ///
+  /// # The confirm-before-anything contract
+  ///
+  /// > Once this method returns a datagram, NO other state-mutating entry point
+  /// > for this query — [`Self::handle_event`], [`Self::handle_timeout`] — may be
+  /// > invoked until that datagram's [`Self::note_transmit_outcome`].
+  /// > `poll_transmit` itself is excepted: `transmit_pending` is already cleared,
+  /// > so it produces nothing further.
+  ///
+  /// A driver therefore does `poll_transmit` → send → `note_transmit_outcome` as
+  /// one indivisible step, and a send the transport cannot accept right now is
+  /// dropped and confirmed [`NoneDelivered`](TransmitOutcome::NoneDelivered)
+  /// rather than parked — nothing is lost, because a re-armed question is
+  /// re-encoded from live state on the next poll.
+  ///
+  /// The reason is the same as for a service: "delivered" here already means only
+  /// *the kernel accepted the datagram synchronously*, so deferring the confirm
+  /// buys no extra fidelity, while the §5.2 retry budget and backoff — which
+  /// [`Self::note_transmit_outcome`] alone advances — sit in an undecided state
+  /// for the whole interim. An absolute [`Self::poll_timeout`] deadline firing in
+  /// that window terminates the query with a question outstanding, and RFC 6762
+  /// §7.3 duplicate-question suppression arriving in it re-times a retransmission
+  /// the pending confirm is about to reschedule. Debug builds assert the ordering.
   pub fn poll_transmit(
     &mut self,
     _now: I,
@@ -606,6 +684,9 @@ where
 
   /// Report the delivery outcome of the datagram most recently produced by
   /// [`Self::poll_transmit`].
+  ///
+  /// Must be called before ANY other state-mutating entry point for this query —
+  /// see [`Self::poll_transmit`] for the ordering contract.
   ///
   /// The §5.2 retry BUDGET advances iff [`TransmitOutcome::all_delivered`] — a
   /// question that reached only some of the links the driver fans it onto has

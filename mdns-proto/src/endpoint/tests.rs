@@ -7251,3 +7251,106 @@ fn a_fully_announced_proof_cancels_only_its_own_services_goodbye() {
     "B has announced nothing, so B's goodbye MUST keep draining"
   );
 }
+
+// ── the minimum advertisable TTL ──────────────────────────────────────
+
+fn spec_with_ttl(instance: &str, ttl_secs: u32) -> ServiceSpec {
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let inst = Name::try_from_str(instance).unwrap();
+  let host = Name::try_from_str("h.local.").unwrap();
+  let mut recs = ServiceRecords::new(stype, inst, host, 631, ttl_secs);
+  recs.add_a(Ipv4Addr::new(10, 0, 0, 5));
+  ServiceSpec::new(recs)
+}
+
+/// A TTL-0 positive record is the RFC 6762 §10.1 goodbye encoding — it tells
+/// every peer to DELETE the record — so publishing a service at it advertises
+/// and retracts in the same datagram. TTL 1 refreshes at 0.8 s, inside §8.3's
+/// one-second floor on unsolicited responses, so the record cannot be kept alive
+/// at a legal rate; both also truncate the periodic refresh interval to zero,
+/// which re-arms an `Established` service at `now`.
+///
+/// `Service::try_new` is crate-private, so registration is the only way to build
+/// one and this guard is total.
+#[test]
+fn registration_rejects_a_ttl_below_the_advertisable_minimum() {
+  for ttl in [0u32, 1] {
+    let mut e = build_endpoint();
+    let err = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      spec_with_ttl("P._ipp._tcp.local.", ttl),
+      StdInstant::now(),
+    ) {
+      Ok(_) => panic!("a TTL of {ttl} s must be rejected, not clamped or accepted"),
+      Err(e) => e,
+    };
+    assert!(
+      matches!(err, RegisterServiceError::TtlTooSmall(t) if t == ttl),
+      "expected TtlTooSmall({ttl}), got {err:?}"
+    );
+    assert!(
+      e.services.iter().next().is_none(),
+      "a rejected registration must reserve no name"
+    );
+  }
+}
+
+/// The smallest TTL that IS advertisable, driven end-to-end: it registers, it
+/// reaches `Established`, and its periodic refresh re-arms a full RFC 6762 §8.3
+/// announce interval out rather than at `now`. A zero-length interval would make
+/// the service re-announce on every tick forever.
+#[test]
+fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
+  use core::time::Duration;
+
+  let mut e = build_endpoint();
+  let base = StdInstant::now();
+  let (_handle, mut svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      spec_with_ttl("P._ipp._tcp.local.", crate::constants::MIN_SERVICE_TTL_SECS),
+      base,
+    )
+    .expect("the minimum TTL is advertisable");
+
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = base;
+  for _ in 0..40 {
+    now = svc.poll_timeout().filter(|d| *d > now).unwrap_or(now);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+    }
+    if svc.state() == crate::ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(
+    svc.state(),
+    crate::ServiceState::Established,
+    "a minimum-TTL service must still complete the §8.1/§8.3 sequence"
+  );
+
+  // Two consecutive refresh rounds, each fired at its own deadline: both the
+  // deadline the announce phase left and the one the refresh confirm installs
+  // must clear the one-second floor.
+  for round in 0..2 {
+    let due = svc
+      .poll_timeout()
+      .expect("an Established service re-announces periodically");
+    assert!(
+      due >= now + Duration::from_secs(1),
+      "round {round}: the periodic refresh re-armed inside the §8.3 one-second \
+       floor, so the service repumps"
+    );
+    now = due;
+    svc.handle_timeout(now).unwrap();
+    let mut sent = 0usize;
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      sent += 1;
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+    }
+    assert_eq!(
+      sent, 1,
+      "round {round}: one fired refresh deadline is one unsolicited response"
+    );
+  }
+}
