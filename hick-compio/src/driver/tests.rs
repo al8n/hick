@@ -2828,3 +2828,53 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
      family, so the reclaimable goodbye is cancelled"
   );
 }
+
+/// RFC 6762 §6.7 legacy unicast reply: no self-send credit.
+///
+/// A unicast datagram leaves for the querier's own address and ephemeral port and
+/// never loops back through the multicast group we joined, so a credit recorded
+/// for it can never be consumed. It would occupy the linear-scanned tracker for
+/// `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines the
+/// NEW entry — so a legacy-query flood would starve the genuine multicast credits
+/// that loopback suppression depends on.
+#[compio::test]
+async fn a_legacy_unicast_reply_records_no_self_send_credit() {
+  use crate::socket::Socket;
+
+  let inner = Rc::new(EndpointInner::new(
+    mdns_proto::EndpointConfig::default(),
+    1500,
+    9000,
+  ));
+
+  // A real bound socket, so this exercises the actual send path rather than the
+  // absent-socket short circuit.
+  let sender = Socket::from_std(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+    .await
+    .expect("wrap a loopback sender");
+  let querier = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let querier_addr = querier.local_addr().unwrap();
+
+  let sock_v4 = Some(Rc::new(sender));
+  let sock_v6: Option<Rc<Socket>> = None;
+
+  let fanout = send_via(
+    &inner,
+    &sock_v4,
+    &sock_v6,
+    querier_addr,
+    b"legacy-unicast-reply",
+  )
+  .await;
+
+  assert_eq!(
+    fanout.transmit_outcome(),
+    TransmitOutcome::AllDelivered,
+    "a §6.7 reply has exactly one obligated link, so it is all-or-none by \
+     construction"
+  );
+  assert!(
+    inner.state.borrow().recent_sends.is_empty(),
+    "a unicast reply never loops back, so it must record NO self-send credit"
+  );
+}

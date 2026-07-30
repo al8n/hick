@@ -1664,9 +1664,10 @@ pub(crate) fn bound_partial_delivery(rounds: &mut u8, outcome: TransmitOutcome) 
 /// dual-stack host answers on each); a v6-only endpoint therefore actually
 /// transmits instead of routing to an absent v4 socket.
 ///
-/// Self-send credit: one tracker entry per ACTUAL successful send. Take-once
-/// suppression consumes a single entry per matching loopback, and a dual-stack
-/// fan-out yields two loopback copies (one per joined socket).
+/// Self-send credits are recorded ONLY on the multicast branch, one per ACTUAL
+/// successful send: take-once suppression consumes a single entry per matching
+/// loopback, and a dual-stack fan-out yields two loopback copies (one per joined
+/// socket). The unicast branch deliberately records none — see below.
 ///
 /// Timestamp: `when` is captured IMMEDIATELY BEFORE each `.await`. compio is
 /// completion-based — the buffer moves into the op on `.await`, so we cannot
@@ -1735,7 +1736,14 @@ async fn send_via(
     SocketAddr::V6(_) => sock_v6.as_ref(),
   };
   if let Some(s) = sock {
-    let when = SystemTime::now();
+    // NO self-send tracker entry here, unlike the multicast branch. A unicast
+    // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
+    // for the querier's own address and port and never loops back through the
+    // multicast group we joined, so a credit recorded for it can never be
+    // consumed. It would simply occupy the linear-scanned tracker for
+    // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
+    // the NEW entry — so a legacy-query flood would starve the genuine multicast
+    // credits that suppression actually depends on.
     let res = s.send_to(body, dst, None).await;
     let outcome = FamilySend::from_bound_result(&res);
     match dst {
@@ -1744,10 +1752,9 @@ async fn send_via(
     }
     if res.is_ok() {
       trace!(dst = %dst, len = n, "send_to");
-      let mut state = inner.state.borrow_mut();
-      crate::selfsend::record_self_send(&mut state.recent_sends, body, when);
       #[cfg(feature = "stats")]
       {
+        let state = inner.state.borrow();
         state.stats.packets_tx(1);
         state.stats.bytes_tx(n as u64);
       }

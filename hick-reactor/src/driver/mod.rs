@@ -760,7 +760,7 @@ impl<N: Net> DriverState<N> {
   /// Drain outgoing transmits across services + queries, up to
   /// [`MAX_TRANSMITS_PER_DRAIN`] per call.
   ///
-  /// Every ACTUAL socket send records its own self-send tracker
+  /// Every ACTUAL successful MULTICAST send records its own self-send tracker
   /// entry via [`record_self_send`]. Take-once suppression means a single entry
   /// can match only one inbound loopback, and a dual-stack fan-out sends the same
   /// payload to BOTH multicast sockets, so the tracker needs two entries to
@@ -1786,7 +1786,15 @@ async fn send_via<N: Net>(
     SocketAddr::V6(_) => v6.as_ref(),
   };
   if let Some(s) = sock {
-    let (res, send_wall) = send_to_at::<N>(s, body, dst).await;
+    // NO self-send tracker entry here, unlike the multicast branch. A unicast
+    // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
+    // for the querier's own address and port and never loops back through the
+    // multicast group we joined, so a credit recorded for it can never be
+    // consumed. It would simply occupy the linear-scanned tracker for
+    // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
+    // the NEW entry — so a legacy-query flood would starve the genuine multicast
+    // credits that suppression actually depends on.
+    let (res, _send_wall) = send_to_at::<N>(s, body, dst).await;
     let outcome = FamilySend::from_bound_result(&res);
     match dst {
       SocketAddr::V4(_) => fanout.v4 = outcome,
@@ -1795,7 +1803,6 @@ async fn send_via<N: Net>(
     match res {
       Ok(_) => {
         hick_trace::trace!(dst = %dst, len = body.len(), "send_to");
-        record_self_send(tracker, body, send_wall);
         #[cfg(feature = "stats")]
         {
           stats.packets_tx(1);

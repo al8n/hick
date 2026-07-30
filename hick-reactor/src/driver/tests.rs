@@ -2174,3 +2174,58 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   drop(replacement);
   drop(reg);
 }
+
+/// RFC 6762 §6.7 legacy unicast reply: no self-send credit.
+///
+/// A unicast datagram leaves for the querier's own address and ephemeral port and
+/// never loops back through the multicast group we joined, so a credit recorded
+/// for it can never be consumed. It would occupy the linear-scanned tracker for
+/// `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines the
+/// NEW entry — so a legacy-query flood would starve the genuine multicast credits
+/// that loopback suppression depends on.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn a_legacy_unicast_reply_records_no_self_send_credit() {
+  use agnostic_net::UdpSocket as _;
+
+  type Net = agnostic_net::tokio::Net;
+
+  // A real bound socket, so this exercises the actual send path rather than the
+  // absent-socket short circuit.
+  let sender = <Net as agnostic_net::Net>::UdpSocket::bind("127.0.0.1:0")
+    .await
+    .expect("bind a loopback sender");
+  let querier = <Net as agnostic_net::Net>::UdpSocket::bind("127.0.0.1:0")
+    .await
+    .expect("bind a loopback querier");
+  let querier_addr = querier.local_addr().expect("querier local addr");
+
+  let v4 = Some(Arc::new(sender));
+  let v6: Option<Arc<<Net as agnostic_net::Net>::UdpSocket>> = None;
+  let mut tracker: Vec<(u64, SystemTime)> = Vec::new();
+  #[cfg(feature = "stats")]
+  let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
+
+  let fanout = send_via::<Net>(
+    &mut tracker,
+    &v4,
+    &v6,
+    querier_addr,
+    b"legacy-unicast-reply",
+    #[cfg(feature = "stats")]
+    &stats,
+  )
+  .await;
+
+  assert_eq!(
+    fanout.transmit_outcome(),
+    TransmitOutcome::AllDelivered,
+    "a §6.7 reply has exactly one obligated link, so it is all-or-none by \
+     construction"
+  );
+  assert!(
+    tracker.is_empty(),
+    "a unicast reply never loops back, so it must record NO self-send credit; \
+     tracker = {tracker:?}"
+  );
+}
