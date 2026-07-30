@@ -891,7 +891,18 @@ where
               // the wire. Retire it, so the app sees an actionable update instead
               // of a silent stall. A query is always Sustained and so always lands
               // here.
-              TransmitObligation::Sustained => self.retire_origin(origin, now),
+              //
+              // Resolve the commit token FIRST — nothing reached a wire, so
+              // `NoneDelivered` is the honest confirm and it latches nothing.
+              // Retirement is a state mutation like any other: a service's
+              // `withdrawal_snapshot` reports only what a confirm has already
+              // latched, and a query's terminal transition is bound by the same
+              // contract, so retiring under a live token would build the §10.1
+              // goodbye from a service the core still considers mid-datagram.
+              TransmitObligation::Sustained => {
+                self.note_transmit_outcome(origin, now, TransmitOutcome::NoneDelivered);
+                self.retire_origin(origin, now);
+              }
               // One-shot: a §6 / §6.7 / RFC 6763 §9 reply is never re-armed, so an
               // undeliverable one costs exactly one unanswered question — the
               // querier re-asks. Resolve it as `NoneDelivered` so the commit token

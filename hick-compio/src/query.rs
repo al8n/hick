@@ -6,9 +6,10 @@
 //! under a brief borrow, then parks on the shared driver notifier when nothing
 //! is ready.
 //!
-//! Dropping a [`Query`] flags the registration as cancelled and removes it from
-//! the proto endpoint, then wakes the driver so any pending transmits queued for
-//! the handle stop firing.
+//! Dropping a [`Query`] flags the registration as cancelled and wakes the driver;
+//! the driver stops polling the handle immediately and removes it from the proto
+//! endpoint after its transmit pump has confirmed any send that was already in
+//! flight.
 //!
 //! [`Endpoint::start_query`]: crate::Endpoint::start_query
 
@@ -152,18 +153,22 @@ fn next_answer_by_seq<'a>(
 
 impl Drop for Query {
   fn drop(&mut self) {
-    // Flag cancellation, then remove the proto-layer query immediately so any
-    // pending transmits stop firing.  Wake the driver so it observes the
-    // change on its next loop iteration.
+    // Flag cancellation ONLY. Removing the proto query here would discard a
+    // commit token the driver is still holding: in the thread-per-core model this
+    // `Drop` can run while the driver is parked mid-`send_via().await` for THIS
+    // query's own question, and the `note_query_transmit_outcome` that follows
+    // would then land on a handle the endpoint no longer knows and silently do
+    // nothing — with the datagram it described still on its way out. The driver's
+    // `State::sweep_cancelled_queries` runs AFTER the transmit pump, so the
+    // in-flight send has confirmed by the time the query is removed. This mirrors
+    // what `Service::drop` already does for the §10.1 withdrawal snapshot.
     {
       let mut st = self.inner.state.borrow_mut();
       st.flag_query_cancelled(self.handle);
-      let _ = st.endpoint.cancel_query(self.handle);
-      st.queries.remove(&self.handle);
     }
-    // Durable wake (see `EndpointInner::dirty`): removing the query may free the
-    // last handle, and the driver must re-settle to observe the change even if a
-    // bare notify would be lost across its send-awaits.
+    // Durable wake (see `EndpointInner::dirty`): the sweep runs on the next driver
+    // settle, which `dirty` guarantees happens even if this notify is lost across
+    // the driver's send-awaits.
     self.inner.mark_dirty();
   }
 }

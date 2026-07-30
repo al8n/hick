@@ -155,8 +155,8 @@ cfg_heap! {
 }
 #[allow(unused_imports)]
 pub(crate) use schedule::{
-  MAX_PARTIAL_ROUNDS, PhaseAdvance, announce_deadline, classify_advance, later,
-  partial_announce_deadline, probe_deadline, re_announce_deadline,
+  MAX_PARTIAL_ROUNDS, PhaseAdvance, announce_deadline, classify_advance, partial_announce_deadline,
+  probe_deadline, re_announce_deadline,
 };
 pub use state::ServiceState;
 
@@ -336,7 +336,8 @@ cfg_heap! {
   /// | `handle_timeout` `Conflicting` | untouched — no progression | untouched | untouched |
   /// | `poll_transmit` | refuses (`Ok(None)`) while one is live — the single slot is what matches one confirm to one datagram | untouched | untouched |
   /// | `note_transmit_outcome` | consumed (`.take()`) | per the confirm arms | per the confirm arms |
-  /// | `withdrawal_snapshot` / `take_rename_goodbye_handoff` | untouched — pure reads of the latch | untouched | untouched |
+  /// | `withdrawal_snapshot` | untouched — a pure read of the latch, and it asserts rather than reporting a short goodbye | untouched | untouched |
+  /// | `take_rename_goodbye_handoff` | untouched — pure `.take()` of the handoff field | untouched | untouched |
   ///
   /// Teardown is the row where the contract is doing the most work.
   /// [`Service::withdrawal_snapshot`] can only report what a confirm has already
@@ -1145,7 +1146,7 @@ where
                 // unsolicited response from coming sooner than the last one did.
                 // The rung itself does not move — a probe is a question, not an
                 // unsolicited response, so it is not a step on that ladder.
-                _ => self.floor_on_partial_ladder(now),
+                _ => self.arm_on_partial_ladder(now),
               }
             } else {
               // Probe confirmed → schedule the next one PROBE_INTERVAL later.
@@ -1267,20 +1268,21 @@ where
         {
           // §8.3: the excused round still put a real unsolicited response on the
           // served link's wire, so the next one must be at least twice as far
-          // out. Floor the advance's own deadline at the rung already earned,
-          // then climb one — the ladder is CARRIED ACROSS the excuse point, never
-          // reset by it. Without the floor the advance would re-arm at the flat
-          // 1 s interval and the served link would observe 2 s → 1 s.
+          // out. Re-arm on the rung already earned, then climb one — the ladder
+          // is CARRIED ACROSS the excuse point, never reset by it. Without it the
+          // advance would re-arm at the flat 1 s interval and the served link
+          // would observe 2 s → 1 s.
           //
-          // `Established` needs no special case of its own. It is the terminal
-          // phase, so nothing advanced above; the floor then takes the LATER of
-          // the periodic re-announce `handle_timeout` pre-armed and the ladder's
-          // capped rung. Because the cap IS the periodic interval
-          // (`partial_announce_deadline`), the periodic always wins there — which
-          // is exactly the "stop laddering past the cadence the TTL affords"
-          // behaviour, obtained from the ladder's own rule instead of an
-          // exception to it.
-          self.floor_on_partial_ladder(now);
+          // `Established` needs no special case of its own, but it is where the
+          // rung has to REPLACE the pre-armed deadline rather than merely raise
+          // it. Nothing advanced above — it is the terminal phase — so what
+          // `handle_timeout` left armed is the periodic re-announce, always
+          // further out than the capped rung. Keeping the later of the two would
+          // hold the next attempt off for a whole refresh interval measured from
+          // an announcement that never reached every link, so the records the
+          // missing link is still owed expire from the caches that do hold them
+          // before the retry lands.
+          self.arm_on_partial_ladder(now);
           self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
         }
       }
@@ -1487,33 +1489,36 @@ where
     self.awaiting_confirm = Some(AwaitingConfirm::Stale { fact, records });
   }
 
-  /// Push `lifecycle_deadline` out to the rung the RFC 6762 §8.3 partial ladder
-  /// has already earned, if that is later than what the caller just armed.
+  /// Re-arm `lifecycle_deadline` on the rung the RFC 6762 §8.3 partial ladder has
+  /// already earned, DISCARDING whatever schedule the phase change pre-armed.
   ///
   /// Only an EXCUSED advance needs this. The phase moves without the link that
   /// kept missing, so the advance re-arms on the fresh phase's own schedule —
-  /// `announce_deadline`, a flat 1 s — while the SERVED link has been climbing
-  /// the doubling ladder all along. Letting the fresh schedule win would make
-  /// that link observe an interval SHORTER than the one before it, the exact
-  /// §8.3 violation ("increases by at least a factor of two with every response
-  /// sent") the ladder exists to prevent.
+  /// `announce_deadline`'s flat 1 s while announcing, the periodic re-announce
+  /// (~0.8·TTL) once `Established` — while the SERVED link has been climbing the
+  /// doubling ladder all along. Neither of those schedules is the right one for
+  /// it, and they are wrong in OPPOSITE directions: the flat 1 s comes sooner than
+  /// the rung the link already earned (§8.3: the interval "increases by at least a
+  /// factor of two with every response sent"), while the pre-armed periodic
+  /// deadline postpones the next attempt by up to a whole refresh interval,
+  /// stranding the missing link past the point where the records it never received
+  /// expire from every peer cache that did.
   ///
-  /// In `Established` there is no phase to advance into, so what stands is the
-  /// periodic re-announce `handle_timeout` pre-armed. The same `later` still
-  /// applies, and because the ladder is capped AT that periodic interval the
-  /// pre-armed cadence wins — the ladder can never hold an established service
-  /// off the wire longer than its own TTL affords.
+  /// The ladder's own rung is correct in both directions at once, which is why it
+  /// simply replaces them. It satisfies the invariant
+  /// [`partial_announce_deadline`] documents — non-decreasing across the excuse
+  /// because rungs are monotonic in the streak, and never beyond the periodic
+  /// refresh because the rung is capped AT that cadence.
   ///
-  /// A streak of zero means the ladder is not engaged, so the advance's own
+  /// A streak of zero means the ladder is not engaged (the patience bound was
+  /// spent on probes, which are questions and take no rung), so the advance's own
   /// deadline stands unchanged.
-  fn floor_on_partial_ladder(&mut self, now: I) {
+  fn arm_on_partial_ladder(&mut self, now: I) {
     if self.partial_announce_streak == 0 {
       return;
     }
-    self.lifecycle_deadline = later(
-      self.lifecycle_deadline,
-      partial_announce_deadline(now, self.partial_announce_streak, self.records.ttl_secs()),
-    );
+    self.lifecycle_deadline =
+      partial_announce_deadline(now, self.partial_announce_streak, self.records.ttl_secs());
   }
 
   /// The [`TransmitObligation`] of the datagram whose commit token is currently
@@ -1566,7 +1571,12 @@ where
   /// missing from it: peers would cache records the goodbye never withdraws, and
   /// their TTLs would only start at that late transmission — an exposure the
   /// teardown does not bound. See [`Self::poll_transmit`] for the full contract.
+  ///
+  /// Debug builds assert it HERE, at the teardown itself, because this is the one
+  /// place the violation is otherwise silent: the goodbye is simply built short,
+  /// and no later step can tell that it was.
   pub fn withdrawal_snapshot(&mut self) -> WithdrawalSnapshot {
+    self.assert_no_live_commit_token("Service::withdrawal_snapshot");
     // Snapshot the CURRENT goodbye-ownership latch (the live name's records).
     // After a rename the current name is the freshly re-announced one, and its
     // confirmed instance + host records still need withdrawing; the OLD name is

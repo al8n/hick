@@ -3264,6 +3264,53 @@ fn cancel_query_removes_route() {
   );
 }
 
+/// Query teardown is bound by the same confirm-before-anything contract as a
+/// service's. Removing the query DISCARDS the commit token, so the confirm that
+/// follows finds no handle and silently does nothing while the datagram it
+/// described is still on its way out — a driver that cancels from another task
+/// must flag the cancellation and sweep it after its transmit pump confirms.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "still awaiting Query::note_transmit_outcome")]
+fn cancel_query_under_a_live_send_confirm_trips_the_contract_assertion() {
+  use crate::{config::QuerySpec, wire::ResourceType};
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = e
+    .try_start_query(QuerySpec::new(qname, ResourceType::A), now)
+    .unwrap();
+  let mut buf = std::vec![0u8; 512];
+  e.poll_query_transmit(h, now, &mut buf)
+    .unwrap()
+    .expect("a newly-started query has its first question due");
+  let _ = e.cancel_query(h);
+}
+
+/// The retirement half of the same contract: forcing the query to its TIMEOUT
+/// terminal is a state mutation, so a driver that cannot send the question must
+/// resolve the outstanding datagram as `NoneDelivered` before retiring the query
+/// that produced it.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "still awaiting Query::note_transmit_outcome")]
+fn retire_query_under_a_live_send_confirm_trips_the_contract_assertion() {
+  use crate::{config::QuerySpec, wire::ResourceType};
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = e
+    .try_start_query(QuerySpec::new(qname, ResourceType::A), now)
+    .unwrap();
+  let mut buf = std::vec![0u8; 512];
+  e.poll_query_transmit(h, now, &mut buf)
+    .unwrap()
+    .expect("a newly-started query has its first question due");
+  e.retire_query(h);
+}
+
 // ── Stats invariant: queries_started == queries_done + queries_active ──────
 
 /// The invariant `queries_started == queries_done + queries_active` must

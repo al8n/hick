@@ -193,21 +193,6 @@ pub(crate) fn classify_advance(rounds: &mut u8, outcome: TransmitOutcome) -> Pha
   }
 }
 
-/// The later of two deadlines, treating `None` (an unrepresentable instant) as
-/// "no constraint" rather than as "immediately".
-///
-/// Used to floor an EXCUSED advance's re-arm at the rung the doubling ladder has
-/// already earned, so the served link never observes a SHORTER interval across
-/// the excuse point than it did before it.
-#[allow(dead_code)]
-pub(crate) fn later<I: Instant>(a: Option<I>, b: Option<I>) -> Option<I> {
-  match (a, b) {
-    (Some(x), Some(y)) => Some(x.max(y)),
-    (Some(x), None) => Some(x),
-    (None, b) => b,
-  }
-}
-
 /// Compute the next re-announce deadline once Established. Returns the time at which
 /// records should be re-broadcast (~80% of TTL).
 ///

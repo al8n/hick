@@ -260,8 +260,15 @@ where
   /// of release builds, where `awaiting_send_confirm` alone absorbs the
   /// violation: it makes at most one confirm resolve one datagram, but it cannot
   /// undo state a mid-flight `handle_event` / `handle_timeout` already moved.
+  ///
+  /// `pub(crate)` so the endpoint's teardown entry points ([`Endpoint::cancel_query`],
+  /// [`Endpoint::sweep_terminated_queries`]) can assert it for a query they are
+  /// about to drop, which is the case the query's own methods can no longer see.
+  ///
+  /// [`Endpoint::cancel_query`]: crate::Endpoint::cancel_query
+  /// [`Endpoint::sweep_terminated_queries`]: crate::Endpoint::sweep_terminated_queries
   #[inline]
-  fn assert_no_live_send_confirm(&self, entry_point: &str) {
+  pub(crate) fn assert_no_live_send_confirm(&self, entry_point: &str) {
     #[cfg(test)]
     if self.contract_assertions_off {
       return;
@@ -598,7 +605,14 @@ where
   /// `done` (so [`Self::is_done`] is true and `Endpoint::handle` freezes any late
   /// answers) and queues a terminal [`QueryUpdate::Timeout`]. The collected answers
   /// stay readable until the caller cancels. No-op if already done.
+  ///
+  /// A terminal transition is a state mutation like any other, so it is bound by
+  /// the same confirm-before-anything contract (see [`Self::poll_transmit`]): the
+  /// driver must resolve an outstanding datagram's commit token — a datagram it
+  /// cannot send is [`TransmitOutcome::NoneDelivered`](crate::transmit::TransmitOutcome::NoneDelivered)
+  /// — before retiring the query that produced it.
   pub(crate) fn retire(&mut self) {
+    self.assert_no_live_send_confirm("Endpoint::retire_query");
     self.terminate(QueryUpdate::Timeout);
   }
 

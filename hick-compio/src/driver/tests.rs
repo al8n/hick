@@ -1852,6 +1852,101 @@ fn unencodable_query_is_errored_not_spun_or_hung() {
   );
 }
 
+/// A `Query::drop` that lands while the pump is inside `send_via().await` must
+/// not cost the in-flight datagram its confirm.
+///
+/// The handle drops on the driver's own thread but from another task, so it can
+/// run at exactly this point — for THIS query's own question. Cancelling the
+/// proto query there DISCARDS the commit token, and the
+/// `note_query_transmit_outcome` that follows lands on a handle the endpoint no
+/// longer knows: a silent no-op, with the datagram still on its way out and the
+/// §5.2 schedule left in the undecided state the confirm was supposed to resolve.
+/// The drop therefore only FLAGS, and the removal waits for
+/// `sweep_cancelled_queries`, which the run loop calls after the pump.
+///
+/// This drives the State seam directly because the interleaving IS the test: the
+/// point between `poll_one_transmit` and `note_query_transmit_outcome` is exactly
+/// where a real `send_via` await parks and where `Drop` can interpose.
+#[test]
+fn a_query_dropped_mid_send_still_gets_its_confirm() {
+  use mdns_proto::{QuerySpec, wire::ResourceType};
+
+  let inner = EndpointInner::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+  let now = std::time::Instant::now();
+  let qname = mdns_proto::Name::try_from_str("printer.local.").unwrap();
+  let h = inner
+    .state
+    .borrow_mut()
+    .start_query(QuerySpec::new(qname, ResourceType::A), now)
+    .unwrap();
+  // The real app-facing handle, so this drives the real `Drop` impl.
+  let query = crate::Query {
+    inner: Rc::clone(&inner),
+    handle: h,
+    terminal_delivered: Cell::new(false),
+  };
+
+  let mut scratch = [0u8; 1500];
+  // The pump extracts the question and stamps the commit token; from here the
+  // driver is parked inside `send_via`, holding no borrow on the state.
+  {
+    let mut s = inner.state.borrow_mut();
+    let (_tx, origin) = s
+      .poll_one_transmit(now, &mut scratch)
+      .expect("a newly-started query has its first question due");
+    assert!(
+      matches!(origin, TransmitOrigin::Query(qh) if qh == h),
+      "the pending datagram must be attributed to the query that produced it"
+    );
+    assert!(
+      s.endpoint.poll_query_timeout(h).is_none(),
+      "the §5.2 retry is scheduled by the CONFIRM, not by the poll, so nothing \
+       is armed while the token is live — this is what the confirm resolves"
+    );
+  }
+
+  // `Query::drop` runs mid-send.
+  drop(query);
+  {
+    let mut s = inner.state.borrow_mut();
+    assert!(
+      s.queries.contains_key(&h),
+      "the drop must only FLAG — removing the query here would discard the \
+       commit token the pump still owes a confirm for"
+    );
+    assert!(
+      s.poll_one_transmit(now, &mut scratch).is_none(),
+      "a cancelled query asks nothing further, flag or no flag"
+    );
+
+    // The send completes and the pump confirms.
+    s.note_query_transmit_outcome(h, now, TransmitOutcome::AllDelivered);
+    assert!(
+      s.endpoint.poll_query_timeout(h).is_some(),
+      "the confirm must resolve the live token and advance the §5.2 schedule — \
+       it silently no-ops if the drop already removed the handle"
+    );
+
+    // Only now is the query freed, driver ctx and proto pool entry together.
+    assert!(
+      s.sweep_cancelled_queries(),
+      "the post-pump sweep is what removes a cancelled query"
+    );
+    assert!(
+      !s.queries.contains_key(&h),
+      "the driver ctx is gone after the sweep"
+    );
+    assert!(
+      s.endpoint.poll_query_timeout(h).is_none(),
+      "and so is the proto pool entry"
+    );
+    assert!(
+      !s.sweep_cancelled_queries(),
+      "a second sweep pass has nothing left to do"
+    );
+  }
+}
+
 /// Registering the same instance name twice (no intervening removal) must
 /// be rejected by the driver `State` with the proto
 /// `RegisterServiceError::NameAlreadyRegistered` — the duplicate-detection

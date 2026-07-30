@@ -6112,6 +6112,78 @@ fn the_partial_ladder_neither_contracts_nor_outruns_the_refresh_interval() {
   }
 }
 
+/// The other direction of the same invariant, which a long TTL is what exposes:
+/// an `Established` excusal must re-arm on the §8.3 ladder rung, NOT on the
+/// periodic re-announce deadline `handle_timeout` pre-armed before the datagram
+/// went out.
+///
+/// The cap keeps the rung at or below the periodic interval, so the pre-armed
+/// deadline is the later of the two for every TTL — taking it postpones the
+/// recovery attempt by a whole refresh interval, measured from an announcement
+/// that one obligated link never received. With a 120 s TTL and the last COMPLETE
+/// delivery at t = 0, the partial rounds land at 96, 97 and 99 s and the next
+/// attempt would not come until 195 s: a link that recovers at 100 s watches the
+/// records it is owed expire from every peer cache at 120 s and cannot rediscover
+/// the service for another 75 s. The outage scales with the TTL — at `u32::MAX` it
+/// exceeds 80 years — because it IS a refresh interval.
+///
+/// The `u32::MAX` row also pins that the rung, not the cap, is what the excusal
+/// arms: 0.8·`u32::MAX` is far beyond the ladder's own top rung, so a cap-derived
+/// deadline would be indistinguishable from the periodic one it must not use.
+#[test]
+fn an_established_excusal_recovers_on_the_ladder_not_the_pre_armed_periodic() {
+  for ttl_secs in [120u32, u32::MAX] {
+    let mut svc = make_service(ttl_secs);
+    drive_to_established(&mut svc);
+    let mut now = svc
+      .poll_timeout()
+      .expect("an Established service re-announces periodically");
+
+    // Climb the ladder honestly: rungs 1 s and 2 s, leaving the streak at 2.
+    for _ in 0..MAX_PARTIAL_ROUNDS {
+      let at = emit_announcement(&mut svc, now);
+      svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+      now = svc.lifecycle_deadline.expect("a partial round re-arms");
+    }
+
+    // The excusing round. `handle_timeout` has pre-armed the periodic
+    // re-announce for a phase that is already terminal.
+    let at = emit_announcement(&mut svc, now);
+    let pre_armed = svc
+      .lifecycle_deadline
+      .expect("the fired periodic deadline re-arms the next one");
+    let streak_before = svc.partial_announce_streak;
+    svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+
+    assert_eq!(
+      svc.state(),
+      ServiceState::Established,
+      "TTL {ttl_secs}: there is no phase beyond Established to advance into"
+    );
+    assert!(
+      svc.partial_announce_streak > streak_before,
+      "TTL {ttl_secs}: the ladder is carried across the excuse point"
+    );
+    let re_armed = svc
+      .lifecycle_deadline
+      .expect("an excused round re-arms too");
+    assert_eq!(
+      re_armed.0 - at.0,
+      4_000,
+      "TTL {ttl_secs}: the excused round must land on the rung the served link \
+       earned (streak {streak_before} → 4 s), not {} ms out on the pre-armed \
+       periodic deadline",
+      pre_armed.0 - at.0
+    );
+    assert!(
+      re_armed < pre_armed,
+      "TTL {ttl_secs}: the rung is capped AT the periodic cadence, so the \
+       pre-armed deadline is always the later of the two — keeping it is what \
+       strands the link that missed"
+    );
+  }
+}
+
 // ── the confirm-before-anything contract ──────────────────────────────
 
 /// A lifecycle deadline that fires while a datagram is still unconfirmed must
@@ -6248,6 +6320,21 @@ fn handle_event_under_a_live_commit_token_trips_the_contract_assertion() {
   let now = drive_to_probing_zero(&mut svc);
   let at = emit_probe(&mut svc, now);
   deliver_losing_srv_conflict(&mut svc, at);
+}
+
+/// Teardown is the row the contract does the most work on, and the only one whose
+/// violation leaves no trace: the snapshot reports what the latch holds, so an
+/// unconfirmed announcement is simply absent from the §10.1 goodbye and every
+/// later step sees a well-formed — merely incomplete — withdrawal. Nothing but
+/// this assertion can tell the difference.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "still awaiting Service::note_transmit_outcome")]
+fn withdrawal_snapshot_under_a_live_commit_token_trips_the_contract_assertion() {
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  emit_announcement(&mut svc, now);
+  let _ = svc.withdrawal_snapshot();
 }
 
 /// `periodic_refresh_secs` is `ttl * 80 / 100` with integer division, so TTL 0

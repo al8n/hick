@@ -328,8 +328,12 @@ impl State {
     Ok(h)
   }
 
-  /// Flag a query as cancelled.  The driver loop sweeps cancelled
-  /// queries on the next poll cycle and calls `endpoint.cancel_query`.
+  /// Flag a query as cancelled (called from [`crate::Query::drop`]). The actual
+  /// removal is deferred to the driver loop's [`Self::sweep_cancelled_queries`],
+  /// which runs after the transmit pump so any in-flight send confirms first. The
+  /// `cancelled` flag is meanwhile honoured by [`Self::poll_one_transmit`] and
+  /// [`Self::fire_timeouts`] so a cancelled query asks nothing further before the
+  /// sweep.
   pub(crate) fn flag_query_cancelled(&mut self, h: QueryHandle) {
     if let Some(q) = self.queries.get_mut(&h) {
       q.cancelled = true;
@@ -480,8 +484,11 @@ impl State {
       endpoint, queries, ..
     } = &mut *self;
     for (&h, ctx) in queries.iter() {
-      // Don't tick a structurally-dead query's proto (see `QueryCtx::errored`).
-      if ctx.errored {
+      // Don't tick a cancelled (handle dropped, awaiting sweep) or
+      // structurally-dead query's proto (see `QueryCtx::errored`) — a query that
+      // is on its way out must not retry its question or reach a terminal it will
+      // never surface.
+      if ctx.cancelled || ctx.errored {
         continue;
       }
       let _ = endpoint.handle_query_timeout(h, now);
@@ -524,6 +531,36 @@ impl State {
     let swept = !cancelled.is_empty();
     for h in cancelled {
       self.begin_service_withdrawal(h, now);
+    }
+    swept
+  }
+
+  /// Remove every query flagged `cancelled` by [`crate::Query::drop`], freeing its
+  /// driver ctx and its proto pool entry. Returns `true` if at least one was
+  /// swept.
+  ///
+  /// The driver calls this AFTER the transmit pump, never from `Query::drop`
+  /// directly, for the same reason [`Self::sweep_cancelled_services`] is deferred:
+  /// a question that was mid-`send_via().await` when the handle dropped still owes
+  /// the core its `note_query_transmit_outcome`. `Endpoint::cancel_query` DISCARDS
+  /// that commit token, so cancelling synchronously in `Drop` would leave the
+  /// confirm landing on a handle the endpoint no longer knows — a silent no-op,
+  /// with the datagram still going out — instead of resolving the token. Sweeping
+  /// after the pump means the confirm has always already happened.
+  ///
+  /// A query has no §10.1 obligation, so unlike a service there is nothing to
+  /// withdraw and the removal is immediate.
+  pub(crate) fn sweep_cancelled_queries(&mut self) -> bool {
+    let cancelled: Vec<QueryHandle> = self
+      .queries
+      .iter()
+      .filter(|(_, ctx)| ctx.cancelled)
+      .map(|(h, _)| *h)
+      .collect();
+    let swept = !cancelled.is_empty();
+    for h in cancelled {
+      self.queries.remove(&h);
+      let _ = self.endpoint.cancel_query(h);
     }
     swept
   }
@@ -1269,18 +1306,23 @@ pub(crate) async fn run(
     // the proto advances (§8.1 probe / §8.3 announce) and the queue drains.
     let pump_budget_exhausted = credits == 0;
 
-    // 1a-pre. Sweep services whose handle was dropped. `Service::drop` only
-    //     flags `cancelled`; beginning the endpoint-owned §10.1 withdrawal happens
-    //     HERE, after the transmit pump, so a send that was in flight when the
-    //     handle dropped has already latched its records via
-    //     `note_service_transmit_result` and is therefore captured in the
-    //     withdrawal snapshot. The endpoint holds the route + drives the goodbye
-    //     schedule; the first round is due immediately and is pumped by
-    //     `drain_withdrawals` (1a) later in this same iteration, after 1b has also
-    //     had a chance to begin any rename-collision withdrawal.
+    // 1a-pre. Sweep handles that were dropped. `Service::drop` / `Query::drop`
+    //     only flag `cancelled`; the teardown that resolves a producer's state
+    //     happens HERE, after the transmit pump, so a send that was in flight when
+    //     the handle dropped has already been confirmed. For a service that means
+    //     `note_service_transmit_outcome` latched its records before the
+    //     withdrawal snapshot reads them; for a query it means
+    //     `note_query_transmit_outcome` resolved the commit token before
+    //     `cancel_query` discards it. The endpoint holds each withdrawing
+    //     service's route + drives the goodbye schedule; the first round is due
+    //     immediately and is pumped by `drain_withdrawals` (1a) later in this same
+    //     iteration, after 1b has also had a chance to begin any rename-collision
+    //     withdrawal.
     {
       let now = StdInstant::now();
-      inner.state.borrow_mut().sweep_cancelled_services(now);
+      let mut state = inner.state.borrow_mut();
+      state.sweep_cancelled_services(now);
+      state.sweep_cancelled_queries();
     }
 
     // 1b. drain pending `ServiceUpdate`s out of each per-service proto state
