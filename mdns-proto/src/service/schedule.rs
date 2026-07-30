@@ -57,6 +57,15 @@ pub(crate) fn announce_deadline<I: Instant>(now: I, announce_count: u8) -> Optio
 /// climbs 1, 2, 4, 8, 16, 32, 64 s and then holds at its top rung.
 const MAX_PARTIAL_ANNOUNCE_SHIFT: u32 = 6;
 
+/// The periodic re-announce cadence: ~80 % of the record TTL.
+///
+/// Shared by [`re_announce_deadline`] and [`partial_announce_deadline`] so the
+/// cadence and the ladder cap that must never exceed it cannot drift apart.
+#[allow(clippy::integer_division, dead_code)]
+pub(crate) fn periodic_refresh_secs(ttl_secs: u32) -> u64 {
+  u64::from(ttl_secs).saturating_mul(80) / 100
+}
+
 /// Compute the re-announce deadline after a PARTIALLY-delivered announcement.
 ///
 /// Unlike a fully-failed send, a partial one put a real datagram on the served
@@ -69,13 +78,45 @@ const MAX_PARTIAL_ANNOUNCE_SHIFT: u32 = 6;
 ///
 /// A fully-failed send is deliberately NOT on this ladder: it reached no wire, so
 /// §8.3 counts no response and the flat `announce_deadline(now, 1)` retry stands.
+///
+/// # The invariant
+///
+/// > The served link's inter-refresh gap must be non-decreasing across an excuse
+/// > and must never exceed the periodic refresh interval.
+///
+/// The doubling gives the first half; the CAP at
+/// [`periodic_refresh_secs`] — floored at §8.3's one-second minimum so a
+/// sub-second TTL cannot produce a zero interval — gives the second. Without the
+/// cap the ladder starves the ONE link that is still being served: its rungs
+/// reach 16 / 32 / 64 s while a short-TTL record expires from peer caches at
+/// 0.8·TTL, so only TTL ≥ 80 s (where the cap never binds and behaviour is
+/// therefore unchanged) was ever sound. At TTL = 10 s the uncapped post-excuse
+/// cadence is 64, 64, 8, 64, 64, 8 … and the served link's records are absent for
+/// most of it.
+///
+/// Capping rather than releasing the ladder is what keeps the two halves of the
+/// invariant from contradicting each other: under persistent partial delivery the
+/// served link converges on exactly the healthy periodic rate, which is both the
+/// most §8.3 spacing that mechanism can justify and the least the TTL can afford.
+///
+/// The §8.3 doubling is read as governing the ANNOUNCEMENT BURST, not every
+/// unsolicited response forever: a constant-interval periodic refresh is flatly
+/// incompatible with the stronger reading — under it the periodic mechanism
+/// itself would be illegal. In `Established` the ladder is a rate limiter, and a
+/// rate limiter that outruns the TTL it protects has stopped limiting a rate and
+/// started dropping the service.
 #[allow(clippy::arithmetic_side_effects, dead_code)]
-pub(crate) fn partial_announce_deadline<I: Instant>(now: I, streak: u8) -> Option<I> {
+pub(crate) fn partial_announce_deadline<I: Instant>(
+  now: I,
+  streak: u8,
+  ttl_secs: u32,
+) -> Option<I> {
   let shift = u32::from(streak).min(MAX_PARTIAL_ANNOUNCE_SHIFT);
-  let secs = rfc::ANNOUNCE_INTERVAL
+  let rung = rfc::ANNOUNCE_INTERVAL
     .as_secs()
     .saturating_mul(1u64 << shift);
-  now.checked_add_duration(Duration::from_secs(secs))
+  let cap = periodic_refresh_secs(ttl_secs).max(rfc::ANNOUNCE_INTERVAL.as_secs());
+  now.checked_add_duration(Duration::from_secs(rung.min(cap)))
 }
 
 /// How many CONSECUTIVE partially-delivered confirms one producer (a service or
@@ -169,8 +210,7 @@ pub(crate) fn later<I: Instant>(a: Option<I>, b: Option<I>) -> Option<I> {
 
 /// Compute the next re-announce deadline once Established. Returns the time at which
 /// records should be re-broadcast (~80% of TTL).
-#[allow(clippy::integer_division, dead_code)]
+#[allow(dead_code)]
 pub(crate) fn re_announce_deadline<I: Instant>(now: I, ttl_secs: u32) -> Option<I> {
-  let secs = (ttl_secs as u64).saturating_mul(80) / 100;
-  now.checked_add_duration(Duration::from_secs(secs))
+  now.checked_add_duration(Duration::from_secs(periodic_refresh_secs(ttl_secs)))
 }

@@ -312,6 +312,32 @@ cfg_heap! {
   /// response that known-answer-suppression (§7.1) trimmed latches goodbye
   /// ownership only for the concrete records it really put on the wire
   /// (per record, not per group).
+  ///
+  /// # Token lifecycle across every state-mutating entry point
+  ///
+  /// A driver may park a datagram and confirm it arbitrarily later, so EVERY
+  /// entry point that mutates lifecycle state has to state what it does to a
+  /// token that is still live. The audit below is the whole matrix; the
+  /// non-trivial cells are the ones marked "rewrite".
+  ///
+  /// | entry point | live token | partial counters (`partial_rounds` / `partial_announce_streak`) | deadlines |
+  /// |---|---|---|---|
+  /// | `handle_event` §8.2 probe-conflict buffer | untouched — buffering a peer record is not a lifecycle move | untouched | untouched |
+  /// | `handle_event` §9 same-name revert (`Init`) | **rewrite** → `Stale`, name unchanged | `partial_rounds = 0` (fresh §8.1 sequence); streak untouched — same name, same §8.3 ladder | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
+  /// | `handle_event` Question / KnownAnswer / HostConflict | untouched — none of them regress a phase | untouched | `response_deadline` / `meta_response_deadline` only |
+  /// | `handle_timeout` §8.2 tiebreak → rename (`Init`) | **rewrite** → `Stale`, old-name records captured | both zeroed by `reset_advertised_name_state` — a NEW name starts both sequences over | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
+  /// | `handle_timeout` §8.2 tiebreak → `Conflicting` (invalid new name) | **rewrite** → `Stale`, old-name records captured | streak zeroed; `partial_rounds` untouched — terminal, nothing left to excuse | all cleared |
+  /// | `handle_timeout` `Init` → `Probing(0)` | untouched — a forward step, and it emits nothing | untouched | re-armed |
+  /// | `handle_timeout` `Probing`/`Announcing`/`Established` fire | untouched — only ENQUEUES; `poll_transmit` refuses to encode while a token is live | untouched | re-armed |
+  /// | `handle_timeout` `Conflicting` | untouched — no progression | untouched | untouched |
+  /// | `poll_transmit` | refuses (`Ok(None)`) while one is live — the single slot is what matches one confirm to one datagram | untouched | untouched |
+  /// | `note_transmit_outcome` | consumed (`.take()`) | per the confirm arms | per the confirm arms |
+  /// | `withdrawal_snapshot` / `take_rename_goodbye_handoff` | untouched — pure reads of the latch | untouched | untouched |
+  ///
+  /// Records still in flight at teardown are a KNOWN residual:
+  /// [`Service::withdrawal_snapshot`] can only report what has already been
+  /// confirmed, so a datagram parked across the teardown withdraws nothing. The
+  /// harm is bounded — peers age those records out at TTL.
   #[derive(Debug, Clone)]
   enum AwaitingConfirm {
     /// A probe is awaiting its delivery result (§8.1 sequence advance). A probe is
@@ -335,6 +361,66 @@ cfg_heap! {
     /// delivery bumps `responses_tx` WITHOUT touching goodbye ownership or any
     /// lifecycle state.
     MetaResponse,
+    /// A datagram whose LIFECYCLE meaning a regression to [`ServiceState::Init`]
+    /// has voided: it was encoded for a generation of the state machine that a
+    /// RFC 6763 §9 same-name revert-to-probe, or a RFC 6762 §8.2 conflict rename,
+    /// has since replaced.
+    ///
+    /// The datagram itself is real and may well be delivered, so the token keeps
+    /// exactly the two facts that outlive the generation — which counter the send
+    /// earned, and WHOSE records it put on the wire — and drops everything else.
+    /// See [`Service::stale_live_commit_token`] for why the second fact is
+    /// captured at the regression rather than reconstructed at confirm time.
+    Stale {
+      /// The wire fact the datagram still earns on delivery.
+      fact: StaleWireFact,
+      /// Where a delivered confirm must latch the records it carried.
+      records: StaleRecords,
+    },
+  }
+
+  /// Which counter a regression-voided datagram's confirm still owes.
+  ///
+  /// Only the counters: every LIFECYCLE effect of the original token is void. The
+  /// distinction is the code's own documented split between wire facts and
+  /// lifecycle facts — `responses_tx` reflects every datagram that left the host,
+  /// and `probes_tx` / `announcements_tx` mean "confirmed delivered by every
+  /// obligated link" — neither of which says anything about which generation the
+  /// datagram belonged to.
+  #[cfg_attr(not(feature = "stats"), allow(dead_code))]
+  #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+  enum StaleWireFact {
+    /// RFC 6762 §8.1 probe: `probes_tx` on a fully-delivered confirm.
+    Probe,
+    /// §8.3 unsolicited announcement: `announcements_tx` on a fully-delivered
+    /// confirm.
+    Announcement,
+    /// §6 multicast or §6.7 legacy-unicast response: `responses_tx` on ANY
+    /// delivery, plus the §7.1 partial-suppression count the response carried.
+    Response(u64),
+  }
+
+  /// Which name a regression-voided datagram advertised, and therefore where a
+  /// delivered confirm must latch its records so they can still be withdrawn.
+  #[derive(Debug, Clone)]
+  enum StaleRecords {
+    /// Nothing to latch. A probe is a QUESTION (§8.1) — it advertises no records
+    /// at all — and it is the only stale datagram that carries none.
+    None,
+    /// The service STILL holds the name these records were emitted under (the §9
+    /// same-name revert-to-probe): they latch into the live `goodbye` exactly as
+    /// they would have without the regression.
+    SameName(respond::EmittedRecords),
+    /// The service has RENAMED AWAY from the name these instance records were
+    /// emitted under. `records` is the OLD name, cloned at the regression site
+    /// before `ServiceRecords::set_instance` overwrote it, so the detached
+    /// old-name §10.1 goodbye can still withdraw them.
+    OldName {
+      /// The OLD instance name's records.
+      records: ServiceRecords,
+      /// What the datagram actually emitted under that name.
+      emitted: respond::EmittedRecords,
+    },
   }
 
   impl AwaitingConfirm {
@@ -356,8 +442,14 @@ cfg_heap! {
         // and the §8.3 announcement (startup phase AND periodic re-announce).
         Self::Probe | Self::Announcement(_) => TransmitObligation::Sustained,
         // A response is emitted once for the question that provoked it and is
-        // never re-armed, so no link can pin anything by missing it.
-        Self::Response(_, _) | Self::MetaResponse => TransmitObligation::OneShot,
+        // never re-armed, so no link can pin anything by missing it. A
+        // regression-voided datagram belongs to a generation that no longer
+        // exists, so nothing will ever re-arm it either. (Unreachable in
+        // practice: `stamped_obligation` reads the token `poll_transmit` just
+        // stamped, and `poll_transmit` never stamps `Stale`.)
+        Self::Response(_, _) | Self::MetaResponse | Self::Stale { .. } => {
+          TransmitObligation::OneShot
+        }
       }
     }
   }
@@ -408,6 +500,16 @@ cfg_heap! {
       self.srv |= e.srv();
       self.txt |= e.txt();
       self.subtypes |= e.subtypes();
+      self.record_host_emitted(e);
+    }
+    /// Latch ONLY the host-owned addresses of a confirmed-delivered send.
+    ///
+    /// Used when the send's INSTANCE records belong to a name the service has
+    /// since renamed away from: the host name is invariant across an instance
+    /// rename, so those addresses really are cached under a name this service
+    /// still holds and stay its to withdraw, while the instance records go to the
+    /// detached old-name goodbye instead.
+    fn record_host_emitted(&mut self, e: &respond::EmittedRecords) {
       for ip in e.a_slice() {
         if !self.a.contains(ip) {
           self.a.push(*ip);
@@ -929,7 +1031,24 @@ where
   ///   nothing, advance nothing, retry flat at the §8.3 one-second interval.
   /// * **Response / meta-response** — exposure is an any-delivered fact and no
   ///   phase exists, so partial and full delivery behave identically.
+  /// * **Stale** — the datagram belongs to a generation a regression to
+  ///   [`ServiceState::Init`] replaced. It still counts its wire fact, and its
+  ///   records still latch somewhere they can be withdrawn from, but it advances
+  ///   no phase, moves no deadline, and touches no counter of the generation that
+  ///   replaced it.
   /// * **Nothing pending** — no-op.
+  ///
+  /// # Drain contract for the rename goodbye handoff
+  ///
+  /// A driver MUST call [`Self::take_rename_goodbye_handoff`] after EVERY call to
+  /// this method, not only after observing
+  /// [`ServiceUpdate::Renamed`](crate::event::ServiceUpdate). A confirm that
+  /// resolves a datagram parked across a §9 conflict rename can INSTALL a handoff
+  /// — the old name's records really are in peer caches and something must
+  /// withdraw them — and by then the `Renamed` update is long since drained, so
+  /// nothing else will ever look. The call is free and returns `None` for a
+  /// driver that confirms each datagram before polling the next one, which is
+  /// every driver that cannot park.
   ///
   /// # The bounded-patience escape
   ///
@@ -1044,20 +1163,12 @@ where
             self.state,
             ServiceState::Announcing(_) | ServiceState::Established
           ) {
-            self.lifecycle_deadline = partial_announce_deadline(now, self.partial_announce_streak);
+            self.lifecycle_deadline = partial_announce_deadline(
+              now,
+              self.partial_announce_streak,
+              self.records.ttl_secs(),
+            );
           }
-          self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
-          return;
-        }
-        if matches!(advance, PhaseAdvance::Excused) && self.state == ServiceState::Established {
-          // Nothing to advance: `Established` IS the terminal phase, so the only
-          // effect the escape can have here is to STOP laddering. Leave
-          // `lifecycle_deadline` exactly as `handle_timeout` armed it when it
-          // enqueued this re-announce — the periodic ~80 %-of-TTL cadence — so the
-          // service returns to normal re-announcing instead of climbing the
-          // partial ladder to its 64 s cap forever. The rung still advances: this
-          // round did put an unsolicited response on the served link's wire, so
-          // §8.3 spaces the next partial retry out from it.
           self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
           return;
         }
@@ -1121,6 +1232,15 @@ where
           // then climb one — the ladder is CARRIED ACROSS the excuse point, never
           // reset by it. Without the floor the advance would re-arm at the flat
           // 1 s interval and the served link would observe 2 s → 1 s.
+          //
+          // `Established` needs no special case of its own. It is the terminal
+          // phase, so nothing advanced above; the floor then takes the LATER of
+          // the periodic re-announce `handle_timeout` pre-armed and the ladder's
+          // capped rung. Because the cap IS the periodic interval
+          // (`partial_announce_deadline`), the periodic always wins there — which
+          // is exactly the "stop laddering past the cadence the TTL affords"
+          // behaviour, obtained from the ladder's own rule instead of an
+          // exception to it.
           self.floor_on_partial_ladder(now);
           self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
         }
@@ -1174,7 +1294,158 @@ where
           }
         }
       }
+      AwaitingConfirm::Stale {
+        fact: _fact,
+        records,
+      } => {
+        // A regression to `Init` voided this datagram's place in the lifecycle,
+        // not the fact that it left the host. So the WIRE facts still count —
+        // `responses_tx` reflects every datagram that left the host, and
+        // `answers_suppressed_kas` is deferred to delivery precisely so it counts
+        // encode-facts that reached the wire — while every LIFECYCLE fact is left
+        // alone: no phase moves, no deadline is re-armed, and neither
+        // `partial_rounds` nor `partial_announce_streak` is read or written,
+        // because both now describe the generation that replaced this one.
+        // `classify_advance` is deliberately not called here for that reason.
+        #[cfg(feature = "stats")]
+        if let Some(s) = self.stat() {
+          match _fact {
+            // `probes_tx` / `announcements_tx` mean "confirmed delivered by every
+            // obligated link", so they hold to that bar here too.
+            StaleWireFact::Probe if outcome.all_delivered() => s.probes_tx(1),
+            StaleWireFact::Announcement if outcome.all_delivered() => s.announcements_tx(1),
+            StaleWireFact::Response(kas) if outcome.any_delivered() => {
+              s.responses_tx(1);
+              if kas > 0 {
+                s.answers_suppressed_kas(kas);
+              }
+            }
+            _ => {}
+          }
+        }
+        if !outcome.any_delivered() {
+          return;
+        }
+        match records {
+          // A probe is a QUESTION (§8.1): it advertised nothing, so there is
+          // nothing to withdraw — and the sequence it was a step of no longer
+          // exists, so it must not advance the fresh one either. That advance is
+          // the §8.1 violation this arm removes: `Init → Probing(0)` costs no
+          // datagram, so a parked old-generation probe confirming into it would
+          // claim the name after TWO probes on the wire instead of three.
+          StaleRecords::None => {}
+          // The name did not change (§9 same-name revert-to-probe): peers hold
+          // these records under the very name this service still owns, so
+          // ownership latches exactly as it would have without the regression.
+          // Discarding it would trade a false withdrawal for a MISSING one at
+          // unregister, which is the worse of the two.
+          StaleRecords::SameName(emitted) => self.goodbye.record_emitted(&emitted),
+          StaleRecords::OldName { records, emitted } => {
+            // The host name is invariant across an instance rename, so the
+            // addresses this datagram carried are cached under a name the service
+            // still holds: they latch into the live goodbye as usual.
+            self.goodbye.record_host_emitted(&emitted);
+            // The instance records are not. `self.records` names the NEW
+            // instance, so `withdrawal_snapshot` would encode them under a name
+            // that never carried them — they belong to the OLD name's detached
+            // §10.1 goodbye instead.
+            let instance = respond::EmittedRecords::new(
+              emitted.ptr(),
+              emitted.srv(),
+              emitted.txt(),
+              std::vec::Vec::new(),
+              std::vec::Vec::new(),
+              emitted.subtypes(),
+            );
+            if instance.is_empty() {
+              // §7.1 trimmed every instance record: the old name put nothing in
+              // any peer cache, so it has nothing to withdraw.
+              return;
+            }
+            match &mut self.rename_goodbye_handoff {
+              Some(h) => h.owned.merge_instance(&instance),
+              // The driver takes the handoff the instant it observes `Renamed`,
+              // and a parked confirm lands after that by construction, so
+              // installing a fresh one is the ordinary case rather than the
+              // exception. Draining it is the drain contract documented above.
+              None => {
+                self.rename_goodbye_handoff = Some(RenameGoodbyeHandoff {
+                  records,
+                  owned: instance,
+                });
+              }
+            }
+          }
+        }
+      }
     }
+  }
+
+  /// Void the LIFECYCLE meaning of a live commit token at a regression to
+  /// [`ServiceState::Init`], capturing WHOSE records the parked datagram put on
+  /// the wire.
+  ///
+  /// The capture has to happen HERE, at the regression, because the fact does not
+  /// survive to confirm time: by then `records` names the new instance,
+  /// `goodbye` has been reset, and `rename_goodbye_handoff` has very likely
+  /// already been drained — drivers take it the instant they observe
+  /// `Renamed`, while a parked confirm lands later by construction. A token that
+  /// only knew it was stale could tell that it must not advance, but not whose
+  /// records it exposed, which is the one fact that decides between withdrawing
+  /// them and stranding them in every peer cache on the link.
+  ///
+  /// The token is REWRITTEN, never dropped. The single-token slot is what matches
+  /// one confirm to one datagram by ordering: clearing it would let
+  /// `poll_transmit` stamp a fresh token that the parked datagram's confirm then
+  /// resolves against the wrong send.
+  ///
+  /// `renamed_from` is the OLD instance name's records when the regression
+  /// RENAMES (cloned before `ServiceRecords::set_instance`), and `None` when the
+  /// name is unchanged.
+  ///
+  /// # Two regressions in a row
+  ///
+  /// Safe by construction: `poll_transmit` returns `Ok(None)` while a token is
+  /// live, so between two regressions no datagram is produced and no confirm can
+  /// arrive. The second regression therefore finds exactly the token the first
+  /// rewrote, over an unchanged `goodbye` — in particular a rename that follows a
+  /// rename finds `goodbye.any_instance()` still `false` from the first, installs
+  /// no competing handoff, and leaves the older name's capture intact. Only a
+  /// SAME-name capture needs updating when a rename follows it, since the name it
+  /// referred to has just been left behind.
+  fn stale_live_commit_token(&mut self, renamed_from: Option<ServiceRecords>) {
+    let (fact, emitted) = match self.awaiting_confirm.take() {
+      None => return,
+      Some(AwaitingConfirm::Probe) => (StaleWireFact::Probe, None),
+      Some(AwaitingConfirm::Announcement(e)) => (StaleWireFact::Announcement, Some(e)),
+      Some(AwaitingConfirm::Response(e, kas)) => (StaleWireFact::Response(kas), Some(e)),
+      // The §9 meta-PTR names the SERVICE TYPE, which no instance rename or
+      // same-name revert touches, and it latches no ownership at all. Nothing
+      // about it can go stale, so it is put back exactly as it was.
+      Some(token @ AwaitingConfirm::MetaResponse) => {
+        self.awaiting_confirm = Some(token);
+        return;
+      }
+      // Already voided by an earlier regression. Its wire fact is unchanged; only
+      // a rename moves its records, and only if they were attributed to the name
+      // being renamed away from.
+      Some(AwaitingConfirm::Stale { fact, records }) => {
+        let records = match (records, renamed_from) {
+          (StaleRecords::SameName(emitted), Some(records)) => {
+            StaleRecords::OldName { records, emitted }
+          }
+          (records, _) => records,
+        };
+        self.awaiting_confirm = Some(AwaitingConfirm::Stale { fact, records });
+        return;
+      }
+    };
+    let records = match (emitted, renamed_from) {
+      (None, _) => StaleRecords::None,
+      (Some(emitted), None) => StaleRecords::SameName(emitted),
+      (Some(emitted), Some(records)) => StaleRecords::OldName { records, emitted },
+    };
+    self.awaiting_confirm = Some(AwaitingConfirm::Stale { fact, records });
   }
 
   /// Push `lifecycle_deadline` out to the rung the RFC 6762 §8.3 partial ladder
@@ -1188,6 +1459,12 @@ where
   /// §8.3 violation ("increases by at least a factor of two with every response
   /// sent") the ladder exists to prevent.
   ///
+  /// In `Established` there is no phase to advance into, so what stands is the
+  /// periodic re-announce `handle_timeout` pre-armed. The same `later` still
+  /// applies, and because the ladder is capped AT that periodic interval the
+  /// pre-armed cadence wins — the ladder can never hold an established service
+  /// off the wire longer than its own TTL affords.
+  ///
   /// A streak of zero means the ladder is not engaged, so the advance's own
   /// deadline stands unchanged.
   fn floor_on_partial_ladder(&mut self, now: I) {
@@ -1196,7 +1473,7 @@ where
     }
     self.lifecycle_deadline = later(
       self.lifecycle_deadline,
-      partial_announce_deadline(now, self.partial_announce_streak),
+      partial_announce_deadline(now, self.partial_announce_streak, self.records.ttl_secs()),
     );
   }
 
@@ -1603,6 +1880,11 @@ where
         self.announce_count = 0;
         self.pending_transmits = [None, None];
         self.response_deadline = None;
+        // A parked datagram belongs to the generation this revert just replaced,
+        // so its confirm must not advance the fresh §8.1 sequence. The NAME is
+        // unchanged, so whatever it emitted still latches into `goodbye` —
+        // see `stale_live_commit_token`.
+        self.stale_live_commit_token(None);
         // A fresh §8.1 sequence: the patience already spent waiting for a lagging
         // link must not excuse a probe of the name we are re-verifying. This is
         // the SAME name, so unlike a rename the per-advertised-name state stays
@@ -1994,8 +2276,13 @@ where
         self.rename_attempt = self.rename_attempt.saturating_add(1);
         let new_name_str =
           rename_with_suffix(self.records.instance().as_str(), self.rename_attempt);
+        // Capture the OLD name BEFORE `set_instance` overwrites it — a live
+        // commit token's records are cached under this name and nowhere else, and
+        // by confirm time nothing here still says so.
+        let renamed_from = self.records.clone();
         match crate::Name::try_from_str(&new_name_str) {
           Ok(new_name) => {
+            self.stale_live_commit_token(Some(renamed_from));
             self.records.set_instance(new_name.clone());
             let _ = self.pending_updates.insert(ServiceUpdate::Renamed(
               crate::event::ServiceRenamed::new(new_name),
@@ -2018,6 +2305,14 @@ where
             // name) — give up. Mirror the success-branch cleanup so no stale
             // transmit / response-cycle work can still be drained by
             // poll_transmit after we've declared Conflicting.
+            //
+            // The name is NOT mutated on this branch, but `goodbye.reset_instance`
+            // below moves its ownership into the handoff installed above, so a
+            // parked datagram's records must go to the same place: treating this
+            // as a rename-away is what keeps a late confirm from re-latching
+            // ownership the handoff now holds (a double withdrawal) and from
+            // opening the reclaim-cancel gate on a terminal service.
+            self.stale_live_commit_token(Some(renamed_from));
             self.state = ServiceState::Conflicting;
             let _ = self.pending_updates.insert(ServiceUpdate::Conflict);
             self.lifecycle_deadline = None;

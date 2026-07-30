@@ -6,6 +6,7 @@ use super::*;
 use crate::{
   Name, QueryHandle,
   event::QueryEvent,
+  service::MAX_PARTIAL_ROUNDS,
   wire::{MessageReader, ResourceClass, ResourceType},
 };
 
@@ -1295,5 +1296,95 @@ fn a_permanently_partial_question_still_reaches_its_terminal_timeout() {
   assert!(
     q.is_done(),
     "a permanently half-delivered question must still retire, not hang"
+  );
+}
+
+/// RFC 6762 §7.3 treats a peer's identical question as OUR send, so the slot it
+/// consumes must clear exactly what an all-delivered send clears — the core's
+/// patience counter included.
+///
+/// Leaving `partial_rounds` charged carries the previous slot's unmet obligation
+/// into a slot that met its own, so the NEXT genuine partial is EXCUSED early:
+/// a §5.2 retry slot spent on behalf of a link that was never asked.
+#[test]
+fn duplicate_suppression_clears_the_partial_bound_like_a_delivered_send() {
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+
+  // Charge the bound to exactly one round short of the excusal.
+  for _ in 0..MAX_PARTIAL_ROUNDS {
+    emit_question(&mut q, now);
+    q.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+    now = q.next_deadline.expect("a partial send always re-arms");
+    q.handle_timeout(now).unwrap();
+  }
+  assert_eq!(q.partial_rounds, MAX_PARTIAL_ROUNDS);
+
+  // A peer multicasts the same question just as ours becomes due.
+  assert!(
+    q.note_duplicate_question(now),
+    "a suppressed retransmit must actually consume the slot"
+  );
+  assert_eq!(
+    q.partial_rounds, 0,
+    "the peer's query was asked on every link, so nothing is left outstanding"
+  );
+  assert_eq!(
+    q.partial_send_streak, 0,
+    "…which is the same reason the §5.2 ladder resets here"
+  );
+
+  // The next honestly-partial round is therefore held, not excused.
+  now = q.next_deadline.expect("suppression arms the next slot");
+  q.handle_timeout(now).unwrap();
+  emit_question(&mut q, now);
+  let before = q.retry_count;
+  q.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+  assert_eq!(
+    q.retry_count, before,
+    "the first partial after a full slot must not be excused — the bound was \
+     cleared, so this round is held honestly"
+  );
+  assert_eq!(q.partial_rounds, 1);
+}
+
+/// The absolute `timeout_deadline` can terminate a query while a question is
+/// still awaiting its confirm. `terminate` clears both deadlines, so a late
+/// confirm that re-armed `next_deadline` would hand the driver a wakeup for a
+/// query that will never transmit again — `poll_timeout` does not screen `done`.
+#[test]
+fn a_late_confirm_on_a_terminated_query_arms_no_wakeup() {
+  let handle = QueryHandle::from_raw(0);
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let start = StdInstant::now();
+  let deadline = start + core::time::Duration::from_millis(500);
+  let mut q: TestQuery = TestQuery::try_new(
+    handle,
+    qname,
+    ResourceType::Any,
+    ResourceClass::Any,
+    1,
+    false,
+    Some(deadline),
+  );
+
+  emit_question(&mut q, start);
+  assert!(q.awaiting_send_confirm);
+
+  // The absolute deadline fires first: the query is terminal and quiescent.
+  let late = start + core::time::Duration::from_secs(1);
+  q.handle_timeout(late).unwrap();
+  assert!(q.is_done());
+  assert!(q.poll_timeout().is_none());
+
+  // The parked datagram's confirm finally lands.
+  q.note_transmit_outcome(late, TransmitOutcome::AllDelivered);
+  assert!(
+    !q.awaiting_send_confirm,
+    "the token is still resolved — a terminal query must not stay awaiting"
+  );
+  assert!(
+    q.poll_timeout().is_none(),
+    "a finished query must not re-arm a deadline the driver would wake for"
   );
 }

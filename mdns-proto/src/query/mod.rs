@@ -635,6 +635,14 @@ where
       return;
     }
     self.awaiting_send_confirm = false;
+    // The absolute `timeout_deadline` can terminate the query while a send is
+    // still awaiting its confirm, and `terminate` clears both deadlines. Re-arming
+    // `next_deadline` on a finished query would hand the driver one wakeup for a
+    // query that will never transmit again — `poll_timeout` does not screen `done`
+    // — so a terminal query resolves the token and stops there.
+    if self.done {
+      return;
+    }
     match classify_advance(&mut self.partial_rounds, outcome) {
       PhaseAdvance::Delivered => {
         self.retry_count = self.retry_count.saturating_add(1);
@@ -713,8 +721,13 @@ where
     self.transmit_pending = false;
     self.retry_count = self.retry_count.saturating_add(1);
     // The peer's query counts as ours, so this IS a budget advance: the §5.2
-    // partial ladder resets exactly as it does on an all-delivered send.
+    // partial ladder resets exactly as it does on an all-delivered send — and so
+    // does the core's patience counter, for the same reason. Leaving
+    // `partial_rounds` charged would carry the previous slot's unmet obligations
+    // into a slot that met its own, so the next genuine partial could be EXCUSED
+    // early — spending a retry slot for a link that was never asked.
     self.partial_send_streak = 0;
+    self.partial_rounds = 0;
     if self.retry_count > MAX_RETRIES {
       // Budget spent (counting suppressed slots as our sends) — retire exactly
       // as `handle_timeout` would after the final retransmit. Route through

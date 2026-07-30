@@ -4920,17 +4920,58 @@ fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
 fn the_partial_announce_ladder_doubles_to_its_cap() {
   // The rung table itself, independent of how many rounds the phase survives:
   // 1, 2, 4, 8, 16, 32, 64 s and then held. RFC 6762 §8.3 permits "up to eight
-  // unsolicited responses", i.e. seven intervals.
+  // unsolicited responses", i.e. seven intervals. A 120 s TTL refreshes at 96 s,
+  // so the periodic cap never binds and the doubling is the whole rule.
   let now = FakeInstant::zero();
   let expected_ms = [
     1_000u64, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 64_000, 64_000,
   ];
   for (streak, want_ms) in expected_ms.iter().enumerate() {
-    let at = partial_announce_deadline(now, streak as u8).expect("representable");
+    let at = partial_announce_deadline(now, streak as u8, 120).expect("representable");
     assert_eq!(
       at.0, *want_ms,
       "streak {streak} must re-arm {want_ms} ms out, got {} ms",
       at.0
+    );
+  }
+}
+
+#[test]
+fn the_partial_announce_ladder_never_outruns_the_periodic_refresh() {
+  // The rung is capped at the periodic refresh interval (0.8·TTL). Without the
+  // cap the ladder reaches 64 s while a short-TTL record expires from peer caches
+  // at 0.8·TTL, so the ONE link still being served loses the records the ladder
+  // exists to keep re-offering it.
+  let now = FakeInstant::zero();
+
+  // TTL 10 s → refresh at 8 s: the rung climbs 1, 2, 4 and then holds at 8.
+  let expected_ms = [1_000u64, 2_000, 4_000, 8_000, 8_000, 8_000, 8_000];
+  for (streak, want_ms) in expected_ms.iter().enumerate() {
+    let at = partial_announce_deadline(now, streak as u8, 10).expect("representable");
+    assert_eq!(
+      at.0, *want_ms,
+      "streak {streak} of a 10 s-TTL service must re-arm {want_ms} ms out, got {} ms",
+      at.0
+    );
+  }
+
+  // The cap is floored at §8.3's one-second minimum, so a TTL whose 80 % rounds
+  // below a second still spaces its retries out rather than spinning.
+  for streak in 0..8u8 {
+    let at = partial_announce_deadline(now, streak, 1).expect("representable");
+    assert_eq!(
+      at.0, 1_000,
+      "the cap never drops below the §8.3 one-second interval"
+    );
+  }
+
+  // A long TTL is untouched: 0.8·120 s = 96 s is beyond the ladder's own 64 s
+  // top rung, so the cap cannot bind and the schedule is bit-for-bit the old one.
+  for streak in 0..8u8 {
+    assert_eq!(
+      partial_announce_deadline(now, streak, 120),
+      partial_announce_deadline(now, streak, u32::MAX),
+      "streak {streak}: the cap must not bind for any TTL at or above 80 s"
     );
   }
 }
@@ -5704,33 +5745,320 @@ fn the_section9_revert_to_probe_clears_the_partial_bound() {
   );
 }
 
-/// `Established` is the terminal phase, so an excused round there has no phase to
-/// advance. Its only effect must be to STOP laddering: the periodic re-announce
-/// deadline `handle_timeout` pre-armed stands, instead of the partial ladder
-/// re-arming the service at its 64 s cap forever.
+// ── the commit token across a lifecycle regression ────────────────────
+
+/// Deliver a probe conflict whose SRV rdata differs from ours (port 9999 vs our
+/// 631) — a genuine §9 conflict when established, and a tiebreak we LOSE when
+/// probing, since the peer's sorted set compares greater than ours.
+fn deliver_losing_srv_conflict(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  now: FakeInstant,
+) {
+  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut sbuf,
+    svc.name().as_str(),
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec)),
+    now,
+  );
+}
+
+/// Drive an announcing service through a §9 revert and a lost §8.2 tiebreak, so
+/// it ends up renamed with the datagram encoded before the regression still
+/// parked. Returns the instant the rename completed at.
+fn regress_and_rename_with_a_parked_datagram(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  at: FakeInstant,
+) -> FakeInstant {
+  // §9: a genuine conflict reverts the established name to re-probing.
+  deliver_losing_srv_conflict(svc, at);
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "a §9 conflict must revert to re-probing"
+  );
+  // §8.2: the conflict persists during the re-probe and we lose the tiebreak.
+  deliver_losing_srv_conflict(svc, at);
+  let now = at.advance(300);
+  svc.handle_timeout(now).unwrap();
+  assert!(
+    svc.name().as_str().contains("-1"),
+    "the service must have lost the tiebreak and renamed; name={}",
+    svc.name().as_str()
+  );
+  now
+}
+
+/// `Init → Probing(0)` costs no datagram, so an old-generation probe confirming
+/// into the fresh sequence advances it for free: the new name would be claimed
+/// after TWO probes on the wire where RFC 6762 §8.1 requires three.
 #[test]
-fn an_excused_round_in_established_stops_laddering() {
-  // `Established` is the terminal phase, so an excused round there has no phase to
-  // advance. Its only effect must be to STOP laddering: the periodic re-announce
-  // deadline `handle_timeout` pre-armed stands, instead of the partial ladder
-  // holding the service off its cadence.
-  //
-  // A short TTL is what makes this observable. Re-announcing at ~80 % of a 10 s
-  // TTL is 8 s, so once the ladder has climbed past that rung, "release the
-  // ladder" and "take the later of the two" stop agreeing — and only releasing it
-  // keeps the records alive in peer caches.
-  let mut svc = make_service(10);
+fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_probing_zero(&mut svc);
+
+  // A probe for the ORIGINAL name is encoded and parked.
+  let at = emit_probe(&mut svc, now);
+  // We lose the §8.2 tiebreak and rename away while it is still in flight.
+  deliver_losing_srv_conflict(&mut svc, at);
+  now = at.advance(300);
+  svc.handle_timeout(now).unwrap();
+  assert!(
+    svc.name().as_str().contains("-1"),
+    "the service must have renamed; name={}",
+    svc.name().as_str()
+  );
+
+  // The fresh sequence takes its free step — no transmit, so the parked probe is
+  // still the only datagram outstanding.
+  now = svc.poll_timeout().expect("the renamed service re-probes");
+  svc.handle_timeout(now).unwrap();
+  assert!(matches!(svc.state(), ServiceState::Probing(0)));
+
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(0)),
+    "a probe of the name we renamed AWAY from is not a step of the new name's \
+     §8.1 sequence; got {:?}",
+    svc.state()
+  );
+  assert_eq!(svc.probe_count, 0, "…and it credits no probe either");
+
+  // The new name is claimed only after three probes actually reach the wire.
+  let mut buf = std::vec![0u8; 4096];
+  let mut wire_probes = 0usize;
+  for _ in 0..12 {
+    now = svc.poll_timeout().expect("still probing");
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      wire_probes += 1;
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+    }
+    if matches!(svc.state(), ServiceState::Announcing(_)) {
+      break;
+    }
+  }
+  assert_eq!(
+    wire_probes, 3,
+    "§8.1 requires three probes on the wire before the new name is claimed"
+  );
+}
+
+/// A datagram parked across a conflict rename put its records in peer caches
+/// under the OLD name. Latching them into the live `goodbye` would claim the NEW
+/// name owns records it never sent — so a later unregister withdraws the wrong
+/// name and the old name is never retracted at all.
+#[test]
+fn a_stale_announcement_confirm_withdraws_under_the_old_name() {
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  // The first announcement of the ORIGINAL name is encoded and parked. Nothing
+  // has latched yet, so this datagram is the ONLY thing that ever exposed it.
+  let at = emit_announcement(&mut svc, now);
+  assert!(!svc.advertises_instance());
+  assert!(svc.rename_goodbye_handoff.is_none());
+
+  let now = regress_and_rename_with_a_parked_datagram(&mut svc, at);
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+
+  assert!(
+    !svc.advertises_instance(),
+    "the NEW name has put nothing on any wire, so it owns nothing to withdraw"
+  );
+  assert!(
+    svc.advertises_host(),
+    "the host name is invariant across an instance rename, so the addresses the \
+     parked datagram carried stay this service's to withdraw"
+  );
+  let handoff = svc
+    .take_rename_goodbye_handoff()
+    .expect("the old name's records really are in peer caches and must be retracted");
+  assert_eq!(
+    handoff.records.instance().as_str(),
+    "myprinter._ipp._tcp.local.",
+    "the goodbye must name the instance the datagram actually advertised"
+  );
+  assert!(
+    handoff.owned.ptr() && handoff.owned.srv() && handoff.owned.txt(),
+    "an unfiltered announcement carries the whole instance record set"
+  );
+  assert!(
+    handoff.owned.a_slice().is_empty() && handoff.owned.aaaa_slice().is_empty(),
+    "a rename never withdraws host A/AAAA"
+  );
+}
+
+/// The reclaim-cancel gate and the `Established` update are the app-visible half:
+/// a confirm from a generation that was replaced must not report that the CURRENT
+/// name completed a §8.3 announcement, because cancelling the renamed-away name's
+/// §10.1 goodbye on that basis strands its records in every peer cache.
+#[test]
+fn a_stale_announcement_confirm_neither_establishes_nor_opens_the_reclaim_gate() {
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  let at = emit_announcement(&mut svc, now);
+  let now = regress_and_rename_with_a_parked_datagram(&mut svc, at);
+
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+
+  assert!(
+    !svc.has_fully_announced().get(),
+    "no announcement of the CURRENT name has reached any link, let alone all of \
+     them — the renamed-away name's goodbye must keep going"
+  );
+  let mut updates = std::vec::Vec::new();
+  while let Some(upd) = svc.poll() {
+    updates.push(upd);
+  }
+  assert!(
+    !updates
+      .iter()
+      .any(|u| matches!(u, ServiceUpdate::Established)),
+    "a name that was never announced must not be reported Established; got {updates:?}"
+  );
+}
+
+/// The §9 same-name revert is the other regression. The name did NOT change, so
+/// the records really are cached under the name this service still holds and must
+/// stay retractable — while every piece of lifecycle state the revert reset stays
+/// reset, because it now describes the fresh §8.1 sequence.
+#[test]
+fn a_stale_announcement_confirm_latches_ownership_without_recharging_the_sequence() {
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  let at = emit_announcement(&mut svc, now);
+  assert!(!svc.advertises_instance());
+
+  deliver_losing_srv_conflict(&mut svc, at);
+  assert_eq!(svc.state(), ServiceState::Init);
+  assert_eq!(
+    svc.partial_rounds, 0,
+    "the revert starts a fresh §8.1 sequence"
+  );
+
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+
+  assert!(
+    svc.advertises_instance(),
+    "the name did not change: peers hold these records under it, and discarding \
+     the latch would trade a false withdrawal for a missing one"
+  );
+  assert_eq!(
+    svc.partial_rounds, 0,
+    "the patience spent under the old generation may not excuse a probe of the \
+     name we are re-verifying"
+  );
+  assert_eq!(
+    svc.partial_announce_streak, 0,
+    "…nor may its §8.3 rung carry into a sequence that has announced nothing"
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "and no phase advances on a confirm from a replaced generation"
+  );
+  assert!(
+    svc.rename_goodbye_handoff.is_none(),
+    "a same-name revert hands nothing off — this name is still ours"
+  );
+}
+
+/// The RFC 6763 §9 meta-PTR names the SERVICE TYPE, which no instance rename or
+/// same-name revert touches, and it latches no ownership at all. Nothing about
+/// its token can go stale, so a regression must leave it exactly as it was.
+#[test]
+fn a_regression_leaves_a_meta_response_token_alone() {
+  use crate::{event::ServiceQuestion, wire::QuestionRef};
+
+  let mut svc = make_service(120);
+  let now = drive_to_established(&mut svc);
+
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in "_services._dns-sd._udp.local."
+    .trim_end_matches('.')
+    .split('.')
+  {
+    qbuf.push(label.len() as u8);
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8);
+  qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  let qsrc: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, qsrc, 0)),
+    now,
+  );
+
+  let at = now.advance(200); // past the 20–120 ms meta jitter window
+  svc.handle_timeout(at).unwrap();
+  let mut buf = std::vec![0u8; 4096];
+  svc
+    .poll_transmit(at, &mut buf)
+    .unwrap()
+    .expect("the fired meta deadline must produce a datagram");
+  assert!(matches!(
+    svc.awaiting_confirm,
+    Some(AwaitingConfirm::MetaResponse)
+  ));
+
+  deliver_losing_srv_conflict(&mut svc, at);
+  assert_eq!(svc.state(), ServiceState::Init);
+  assert!(
+    matches!(svc.awaiting_confirm, Some(AwaitingConfirm::MetaResponse)),
+    "a shared, never-withdrawn meta-PTR is name-independent; got {:?}",
+    svc.awaiting_confirm
+  );
+}
+
+/// The whole rule for an `Established` service under sustained partial delivery,
+/// stated as the invariant rather than as a deadline value:
+///
+/// > The served link's inter-refresh gap must be non-decreasing across an excuse
+/// > and must never exceed the periodic refresh interval.
+///
+/// Both halves are load-bearing and each catches a different defect. A
+/// CONTRACTING gap (the excused round re-arming earlier than the honest partial
+/// before it) violates RFC 6762 §8.3's "increases by at least a factor of two
+/// with every response sent". A gap that OUTRUNS the periodic refresh starves the
+/// one link still being served: its records expire from peer caches at 0.8·TTL
+/// while the ladder is off at 16 / 32 / 64 s.
+///
+/// Pinning a deadline VALUE instead codified the contraction rather than
+/// detecting it, so this walks the whole gap sequence across BOTH excuse cycles.
+#[test]
+fn the_partial_ladder_neither_contracts_nor_outruns_the_refresh_interval() {
+  // A short TTL is what makes the cap observable: 80 % of a 10 s TTL is 8 s, well
+  // below the ladder's uncapped 16 / 32 / 64 s rungs.
+  const TTL_SECS: u32 = 10;
+  let cap_ms = u64::from(TTL_SECS).saturating_mul(800).max(1_000);
+
+  let mut svc = make_service(TTL_SECS);
   drive_to_established(&mut svc);
   let mut now = svc
     .poll_timeout()
     .expect("an Established service re-announces periodically");
 
-  let mut released = None;
+  // Every gap the SERVED link observes: the honest partial re-arms and the
+  // excused round's, in order, over two full excuse cycles.
+  let mut gaps: std::vec::Vec<u64> = std::vec::Vec::new();
   for cycle in 0..2 {
     for _ in 0..MAX_PARTIAL_ROUNDS {
       let at = emit_announcement(&mut svc, now);
       svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
-      now = svc.lifecycle_deadline.expect("a partial round re-arms");
+      let re_armed = svc.lifecycle_deadline.expect("a partial round re-arms");
+      gaps.push(re_armed.0 - at.0);
+      now = re_armed;
     }
     let at = emit_announcement(&mut svc, now);
     let streak_before = svc.partial_announce_streak;
@@ -5747,18 +6075,23 @@ fn an_excused_round_in_established_stops_laddering() {
     );
     let re_armed = svc
       .lifecycle_deadline
-      .expect("the pre-armed periodic re-announce stands");
-    released = Some(re_armed.0 - at.0);
+      .expect("an excused round re-arms too");
+    gaps.push(re_armed.0 - at.0);
     now = re_armed;
   }
 
-  // Second cycle: the ladder is at its 32 s rung, well past the 8 s periodic
-  // cadence, so leaving the ladder in charge would starve peer caches of a
-  // 10 s-TTL record.
-  assert_eq!(
-    released,
-    Some(8_000),
-    "the excused round must release the ladder and let the periodic re-announce \
-     deadline stand (~80 % of a 10 s TTL)"
-  );
+  for pair in gaps.windows(2) {
+    assert!(
+      pair[1] >= pair[0],
+      "§8.3 forbids the next unsolicited response from coming sooner than the \
+       last one did; gaps were {gaps:?} ms"
+    );
+  }
+  for gap in &gaps {
+    assert!(
+      *gap <= cap_ms,
+      "a {gap} ms gap outruns the {cap_ms} ms periodic refresh of a {TTL_SECS} s \
+       TTL, so the served link loses the records; gaps were {gaps:?} ms"
+    );
+  }
 }
