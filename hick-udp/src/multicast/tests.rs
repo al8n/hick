@@ -312,17 +312,14 @@ fn cmsg_iter_is_sound_on_crafted_and_unaligned_input() {
 /// comparison itself is correct in isolation; it does NOT prove
 /// `try_bind_v6_inner` still calls it — see
 /// `try_bind_v6_rejects_a_mismatch_forced_through_production_wiring` below
-/// for the test that exercises the real call sequence. (An earlier version
-/// of this doc comment claimed no such test was possible without a
-/// production-only seam; that seam now exists — `FORCE_APPLIED_HOPS_V6` in
-/// `multicast.rs` — so the claim was corrected rather than left stale.)
+/// for the test that exercises the real call sequence.
 ///
-/// Uses `expect_bind_or_skip`, NOT a bare `Err(_) => skip`: a Codex review
-/// found that this test's initial bind previously matched every `BindError`
-/// as an environmental skip, which would have silently absorbed an inverted
-/// verifier comparison the moment `try_bind_v6`'s OWN internal check fired
-/// during the setup bind — the test would report a skip, not a failure, for
-/// the exact regression it exists to catch. `expect_bind_or_skip` panics
+/// Uses `expect_bind_or_skip`, NOT a bare `Err(_) => skip`: this test's
+/// initial bind previously matched every `BindError` as an environmental
+/// skip, which would have silently absorbed an inverted verifier comparison
+/// the moment `try_bind_v6`'s OWN internal check fired during the setup
+/// bind — the test would report a skip, not a failure, for the exact
+/// regression it exists to catch. `expect_bind_or_skip` panics
 /// loudly on any `BindError` that is not a recognized environment refusal,
 /// `MulticastHopsNotApplied` very much included.
 ///
@@ -371,12 +368,12 @@ fn verify_multicast_hops_v6_rejects_a_kernel_value_that_drifted_from_the_request
   assert_eq!(detail.observed(), i32::from(drifted));
 }
 
-/// Regression test for the Codex R2 finding that no test proved
-/// `verify_multicast_hops_v6` is actually WIRED into `try_bind_v6_inner`'s
-/// production call sequence: the test above calls the verifier directly, so
-/// it would keep passing even if the call site at `multicast.rs` (right
-/// after `platform::set_multicast_hops_v6`) were deleted entirely, since the
-/// helper it calls would still exist and still work correctly in isolation.
+/// Regression test proving `verify_multicast_hops_v6` is actually WIRED into
+/// `try_bind_v6_inner`'s production call sequence: the test above calls the
+/// verifier directly, so it would keep passing even if the call site at
+/// `multicast.rs` (right after `platform::set_multicast_hops_v6`) were
+/// deleted entirely, since the helper it calls would still exist and still
+/// work correctly in isolation.
 ///
 /// This test goes through the PUBLIC `try_bind_v6` entry point — the same
 /// one every real caller uses — with the `FORCE_APPLIED_HOPS_V6` test-only

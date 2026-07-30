@@ -322,9 +322,9 @@ fn verify_multicast_hops_v6(sock: &UdpSocket, requested: u8) -> Result<(), BindE
 // can ever make the setter and the verifier disagree — which is exactly why
 // `crate::multicast::tests::try_bind_v6_rejects_a_mismatch_forced_through_production_wiring`
 // needs this to exist at all, rather than only exercising
-// `verify_multicast_hops_v6` directly (see that test's doc for the Codex
-// review finding this seam closes: calling the verifier directly proves the
-// comparison works, but not that `try_bind_v6_inner` still calls it).
+// `verify_multicast_hops_v6` directly (see that test's doc: calling the
+// verifier directly proves the comparison works, but not that
+// `try_bind_v6_inner` still calls it).
 //
 // `None` (the default) means "apply `opts.hops()` faithfully," identical to
 // production behavior; this is the ONLY possible value outside `#[cfg(test)]`
@@ -953,10 +953,10 @@ impl<'a> Iterator for CmsgIter<'a> {
 // PAIRED CLASSIFIER — this function has a sibling copy, `is_environment_refusal`,
 // in `hick-udp/tests/loopback.rs`. The two must classify identically. If you
 // change the allowlist here (add/remove an `ErrorKind` or a raw-errno arm),
-// make the SAME change there, and vice versa. This pairing is exactly what
-// let a Codex review catch a gap that existed in BOTH copies at once: neither
-// recognized Windows' `WSAEAFNOSUPPORT`, because the omission was copied along
-// with everything else. See the "why two copies, not one" note below before
+// make the SAME change there, and vice versa. This pairing previously caught
+// a gap that existed in BOTH copies at once: neither recognized Windows'
+// `WSAEAFNOSUPPORT`, because the omission was copied along with everything
+// else. See the "why two copies, not one" note below before
 // "solving" this by deleting one of them.
 // ============================================================================
 /// Whether `e` represents a legitimate environment refusal to bind (not a
@@ -966,8 +966,7 @@ impl<'a> Iterator for CmsgIter<'a> {
 /// compiles for (`EAFNOSUPPORT` on Unix, `WSAEAFNOSUPPORT` on Windows). A
 /// skip arm that accepts anything wider than this can absorb the exact
 /// regressions these tests exist to catch — see `expect_bind_or_skip`'s doc
-/// for the finding that made this explicit, and the module-level audit in
-/// this crate's Codex-review report for why `ErrorKind::Uncategorized` /
+/// for the finding that made this explicit. `ErrorKind::Uncategorized` /
 /// `InvalidInput` are deliberately NOT in this allowlist: broadening to
 /// either would re-admit `EINVAL`, the exact errno the whole branch this
 /// file belongs to exists to stop silently skipping.
@@ -1010,8 +1009,8 @@ fn is_environment_refusal(e: &std::io::Error) -> bool {
 /// `hick-udp/tests/loopback.rs`'s `expect_bind_or_skip` exactly (same shape,
 /// same allowlist via `is_environment_refusal`).
 ///
-/// Exists because of a Codex review finding on an earlier version of the
-/// `verify_multicast_hops_v6` regression test: it matched `Err(e) => skip`
+/// Exists because an earlier version of the
+/// `verify_multicast_hops_v6` regression test matched `Err(e) => skip`
 /// on the INITIAL bind — every `BindError` variant, not just `Io` ones. Had
 /// the verifier's comparison been inverted, `try_bind_v6` would have
 /// returned `Err(BindError::MulticastHopsNotApplied(_))` right there, and
@@ -1022,8 +1021,8 @@ fn is_environment_refusal(e: &std::io::Error) -> bool {
 /// below that pre-dates this file's `MulticastHopsNotApplied` variant: none
 /// of them could have swallowed THAT specific error before it existed, but
 /// all of them could swallow any other non-environmental `BindError` a
-/// future regression might introduce, which is the general class Codex
-/// asked this crate to close in one pass, not just the one instance.
+/// future regression might introduce, which is the general class this
+/// helper exists to close in one pass, not just the one instance.
 #[cfg(test)]
 #[allow(clippy::panic)]
 fn expect_bind_or_skip<T>(label: &str, result: Result<T, BindError>) -> Option<T> {
@@ -1046,72 +1045,7 @@ fn expect_bind_or_skip<T>(label: &str, result: Result<T, BindError>) -> Option<T
 // `is_environment_refusal`. Extend both whenever a new platform/errno is
 // added to either classifier.
 #[cfg(test)]
-mod is_environment_refusal_classifier_tests {
-  use super::is_environment_refusal;
-
-  // The Codex R3 finding this module exists to guard against: an
-  // IPv6-unavailable Windows runner reports WSAEAFNOSUPPORT, which maps to no
-  // named, stable `ErrorKind` (std's internal bookkeeping calls this bucket
-  // `Uncategorized`, but that variant is `#[unstable]`/`#[doc(hidden)]` and
-  // cannot be named from this crate — which is exactly why the fix is a raw
-  // `raw_os_error()` match, not a broadened `ErrorKind` match). Without the
-  // `#[cfg(windows)]` arm in `is_environment_refusal`, this case fell through
-  // to `false`, and every all-platform unit test that binds v6 with no
-  // preceding IPv6-availability check would panic instead of skipping.
-  #[cfg(windows)]
-  #[test]
-  fn recognizes_wsaeafnosupport() {
-    let e =
-      std::io::Error::from_raw_os_error(windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT);
-    assert!(
-      is_environment_refusal(&e),
-      "WSAEAFNOSUPPORT (10047) must be recognized as an environment refusal, or an \
-       IPv6-unavailable Windows runner fails these tests instead of skipping them"
-    );
-  }
-
-  // The overcorrection this module ALSO guards against: broadening the
-  // allowlist to catch WSAEAFNOSUPPORT must not accidentally catch
-  // WSAEINVAL too — that is Windows' shape of the ORIGINAL defect this whole
-  // branch exists to stop hiding (rustix passing the wrong protocol level
-  // produced EINVAL on macOS; the equivalent wrong-level mistake on Windows
-  // would produce WSAEINVAL). A skip arm that swallows this is the R2 defect
-  // all over again, just on a different platform.
-  #[cfg(windows)]
-  #[test]
-  fn rejects_wsaeinval() {
-    let e = std::io::Error::from_raw_os_error(windows_sys::Win32::Networking::WinSock::WSAEINVAL);
-    assert!(
-      !is_environment_refusal(&e),
-      "WSAEINVAL (10022) must never be classified as an environment refusal"
-    );
-  }
-
-  // Unix-side mirror of the two Windows tests above, for symmetry: proves
-  // the allowlist is complete AND not overcorrected on this platform family
-  // too, with an executable check rather than only a source-level audit.
-  #[cfg(unix)]
-  #[test]
-  fn recognizes_eafnosupport() {
-    let e = std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
-    assert!(
-      is_environment_refusal(&e),
-      "EAFNOSUPPORT must be recognized as an environment refusal"
-    );
-  }
-
-  #[cfg(unix)]
-  #[test]
-  fn rejects_einval() {
-    let e = std::io::Error::from_raw_os_error(libc::EINVAL);
-    assert!(
-      !is_environment_refusal(&e),
-      "EINVAL must never be classified as an environment refusal — it is the exact errno the \
-       rustix wrong-protocol-level bug produced on macOS, which this whole branch exists to \
-       stop silently skipping"
-    );
-  }
-}
+mod is_environment_refusal_classifier_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
