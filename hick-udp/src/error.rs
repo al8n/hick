@@ -48,6 +48,43 @@ impl AddressInUseDetail {
   }
 }
 
+/// Detail for [`BindError::MulticastHopsNotApplied`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
+#[display("IPv6 multicast hop limit not applied: requested {requested}, observed {observed}")]
+pub struct MulticastHopsNotAppliedDetail {
+  requested: u8,
+  observed: i32,
+}
+impl MulticastHopsNotAppliedDetail {
+  /// Build a new detail payload.
+  // Constructed only by the Unix `try_bind_v6` read-back path; on Windows
+  // this option is set via `socket2` (no read-back), so suppress the
+  // dead-code warning there.
+  #[cfg_attr(not(unix), allow(dead_code))]
+  #[inline(always)]
+  pub(crate) const fn new(requested: u8, observed: i32) -> Self {
+    Self {
+      requested,
+      observed,
+    }
+  }
+  /// The IPv6 multicast hop limit that was requested via `setsockopt`.
+  #[inline(always)]
+  pub const fn requested(&self) -> u8 {
+    self.requested
+  }
+  /// The hop limit `getsockopt` reports the kernel actually holds, read back
+  /// immediately after the `setsockopt` call that was supposed to set
+  /// `requested`. Kept as the raw signed kernel value rather than clamped to
+  /// `u8`: this field exists only to describe a value that has already
+  /// failed to be what was asked for, and truncating it could mask how wrong
+  /// it is.
+  #[inline(always)]
+  pub const fn observed(&self) -> i32 {
+    self.observed
+  }
+}
+
 /// Detail for [`ParseRecvMetaError::BufferTooShort`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
 #[display("cmsg buffer too short: needed {needed} bytes, had {have}")]
@@ -89,6 +126,11 @@ pub enum BindError {
   /// The address was already in use on the chosen interface.
   #[error(transparent)]
   AddressInUse(AddressInUseDetail),
+
+  /// The kernel accepted the `IPV6_MULTICAST_HOPS` `setsockopt` call, but a
+  /// read-back shows it did not actually apply the requested value.
+  #[error(transparent)]
+  MulticastHopsNotApplied(MulticastHopsNotAppliedDetail),
 
   /// An I/O error occurred.
   #[error(transparent)]
