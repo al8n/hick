@@ -7,7 +7,7 @@ use crate::{
   backend::RdataBuf,
   error::{HandleTimeoutError, TransmitError},
   event::{QueryEvent, QueryUpdate},
-  transmit::{Transmit, TransmitOutcome},
+  transmit::{Transmit, TransmitObligation, TransmitOutcome},
   wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
 };
 
@@ -581,10 +581,15 @@ where
       bytes = n,
       "query: poll_transmit emitting question"
     );
+    // Sustained: a question that did not reach every obligated link re-arms
+    // WITHOUT spending a §5.2 retry slot (see `note_transmit_outcome`), so a link
+    // that keeps missing holds the query open indefinitely unless the driver's
+    // bounded obligation policy eventually excuses it.
     Ok(Some(Transmit::new(
       crate::service::multicast_dst(),
       None,
       n,
+      TransmitObligation::Sustained,
     )))
   }
 

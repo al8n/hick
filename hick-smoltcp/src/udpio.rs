@@ -23,12 +23,20 @@ pub struct RecvMeta {
 /// Why [`UdpIo::try_send`] did not queue a datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendError {
-  /// The transmit queue is momentarily full; retry on the next pump.
+  /// A socket for this family EXISTS but did not take the datagram this time, for
+  /// a reason that may clear: a momentarily-full transmit queue, a socket not yet
+  /// bound, or no route yet. The engine keeps the family in the obligated set —
+  /// so a fan-out where the other family succeeded projects to
+  /// [`TransmitOutcome::PartiallyDelivered`](mdns_proto::TransmitOutcome::PartiallyDelivered),
+  /// not `AllDelivered` — and retries on the next pump.
   Busy,
-  /// No socket or route for this datagram's address family — it will never be
-  /// queued on this transport (e.g. an IPv6 group on a v4-only stack). The
-  /// engine treats this as "this family is not applicable" rather than a
-  /// transient failure to retry.
+  /// No socket for this datagram's address family — it will never be queued on
+  /// this transport (e.g. an IPv6 group on a v4-only stack). The engine treats
+  /// this as "this family is not applicable" and drops it from the obligated set
+  /// entirely, so it must be reported ONLY for a family with no socket at all: an
+  /// error raised BY an existing socket is [`Self::Busy`] or [`Self::TooLarge`],
+  /// never this, or a half-broken dual-stack node would advertise as though it
+  /// were single-stack.
   Unsupported,
   /// The datagram is larger than this socket's transmit buffer can ever hold — a
   /// PERMANENT failure for this packet (e.g. embassy-net's `PacketTooLarge`), not
@@ -49,7 +57,7 @@ pub trait UdpIo {
   fn try_recv(&mut self, buf: &mut [u8]) -> Option<RecvMeta>;
 
   /// Enqueue one datagram for `dst`. Non-blocking; returns [`SendError::Busy`]
-  /// when the transmit queue is full, or [`SendError::Unsupported`] when there is
-  /// no socket / route for the datagram's address family.
+  /// when a socket for the family exists but did not take the datagram, or
+  /// [`SendError::Unsupported`] when there is no socket for that family at all.
   fn try_send(&mut self, buf: &[u8], dst: SocketAddr) -> Result<(), SendError>;
 }

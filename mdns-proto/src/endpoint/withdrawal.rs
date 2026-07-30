@@ -410,20 +410,96 @@ where
     /// never-announced service has, despite having advertised nothing).
     ///
     /// Idempotent overwrite (the advertised set only grows as the service
-    /// announces), and a no-op for an unknown handle.
+    /// announces), and a no-op for a handle the endpoint does not route.
     ///
-    /// # `fully_announced`
+    /// # `announced`
     ///
-    /// The RECLAIM-CANCEL gate. A [`FullyAnnounced`] that reads `true` retires any
-    /// reclaimable detached goodbye still draining for this instance name (see
-    /// below). The parameter is the opaque newtype rather than a `bool` because no
+    /// The RECLAIM-CANCEL gate, and the only place the target service is named.
+    /// A [`FullyAnnounced`] that reads `true` retires any reclaimable detached
+    /// goodbye still draining for that service's instance name (see below).
+    ///
+    /// The parameter is the opaque token rather than a `bool` because no
     /// driver-side formula is admissible here: it must be
     /// [`Service::has_fully_announced`] and nothing else. In particular it is NOT
     /// [`Service::advertises_instance`] — that latch fires on ANY delivery, so a
     /// v4-only announcement, or an RFC 6762 §6.7 legacy unicast reply (one
     /// obligated link, hence fully delivered by construction), would cancel a
     /// goodbye the unserved family still needs. Since [`FullyAnnounced`] has no
-    /// public constructor, that substitution no longer compiles.
+    /// public constructor, that substitution does not compile.
+    ///
+    /// The route is looked up through the token's own
+    /// [`ServiceHandle`] rather than a separate argument, so a genuine token from
+    /// one service cannot be applied to another. A caller CAN still pass `a` /
+    /// `aaaa` slices read from a different service; that mis-records an advertised
+    /// address set (a sibling-retention input) and is a strictly smaller fault
+    /// than cancelling the wrong service's goodbye.
+    ///
+    /// # Examples
+    ///
+    /// The token names its own service, so the confirm takes no separate handle:
+    ///
+    /// ```
+    /// # use core::net::{Ipv4Addr, Ipv6Addr};
+    /// # use std::time::Instant as StdInstant;
+    /// # use mdns_proto::{
+    /// #   CollectedAnswer, FullyAnnounced,
+    /// #   cache::CacheEntry,
+    /// #   endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
+    /// #   event::QueryUpdate,
+    /// #   query::Query,
+    /// # };
+    /// # use slab::Slab;
+    /// # type Q = Query<StdInstant, Slab<CollectedAnswer>, Slab<QueryUpdate>>;
+    /// # type Ep = Endpoint<
+    /// #   StdInstant,
+    /// #   rand::rngs::StdRng,
+    /// #   Slab<CacheEntry<StdInstant>>,
+    /// #   Slab<ServiceRoute>,
+    /// #   Slab<Q>,
+    /// #   Slab<EndpointEventEntry>,
+    /// #   Slab<CollectedAnswer>,
+    /// #   Slab<QueryUpdate>,
+    /// # >;
+    /// fn confirm(ep: &mut Ep, announced: FullyAnnounced, a: &[Ipv4Addr], aaaa: &[Ipv6Addr]) {
+    ///   ep.note_service_announced(announced, a, aaaa);
+    /// }
+    /// ```
+    ///
+    /// Pairing one service's proof with ANOTHER service's handle — the transplant
+    /// this signature exists to rule out — does not compile:
+    ///
+    /// ```compile_fail
+    /// # use core::net::{Ipv4Addr, Ipv6Addr};
+    /// # use std::time::Instant as StdInstant;
+    /// # use mdns_proto::{
+    /// #   CollectedAnswer, FullyAnnounced, ServiceHandle,
+    /// #   cache::CacheEntry,
+    /// #   endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
+    /// #   event::QueryUpdate,
+    /// #   query::Query,
+    /// # };
+    /// # use slab::Slab;
+    /// # type Q = Query<StdInstant, Slab<CollectedAnswer>, Slab<QueryUpdate>>;
+    /// # type Ep = Endpoint<
+    /// #   StdInstant,
+    /// #   rand::rngs::StdRng,
+    /// #   Slab<CacheEntry<StdInstant>>,
+    /// #   Slab<ServiceRoute>,
+    /// #   Slab<Q>,
+    /// #   Slab<EndpointEventEntry>,
+    /// #   Slab<CollectedAnswer>,
+    /// #   Slab<QueryUpdate>,
+    /// # >;
+    /// fn transplant(
+    ///   ep: &mut Ep,
+    ///   other: ServiceHandle,
+    ///   announced_by_someone_else: FullyAnnounced,
+    ///   a: &[Ipv4Addr],
+    ///   aaaa: &[Ipv6Addr],
+    /// ) {
+    ///   ep.note_service_announced(other, a, aaaa, announced_by_someone_else);
+    /// }
+    /// ```
     ///
     /// [`Service::advertised_a_addrs`]: crate::service::Service::advertised_a_addrs
     /// [`Service::advertised_aaaa_addrs`]: crate::service::Service::advertised_aaaa_addrs
@@ -431,12 +507,12 @@ where
     /// [`Service::advertises_instance`]: crate::service::Service::advertises_instance
     pub fn note_service_announced(
       &mut self,
-      handle: ServiceHandle,
+      announced: FullyAnnounced,
       a: &[Ipv4Addr],
       aaaa: &[Ipv6Addr],
-      fully_announced: FullyAnnounced,
     ) {
-      let fully_announced = fully_announced.get();
+      let handle = announced.handle();
+      let fully_announced = announced.get();
       let name = {
         let Some((_, route)) = self.services.iter_mut().find(|(_, r)| r.handle() == handle) else {
           return;

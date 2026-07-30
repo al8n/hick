@@ -14,9 +14,9 @@ use core::{
 use hick_trace::*;
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
-  QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate, TransmitOutcome,
-  WithdrawalSend, WithdrawalToken, query::Query as ProtoQuery, service::Service as ProtoSvc,
-  transmit::Transmit,
+  QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate, TransmitObligation,
+  TransmitOutcome, WithdrawalSend, WithdrawalToken, query::Query as ProtoQuery,
+  service::Service as ProtoSvc, transmit::Transmit,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -586,6 +586,22 @@ impl State {
         // kept: surface `Conflict`, flag it errored so every pump skips it, and stop
         // draining it.
         if let ServiceUpdate::Renamed(ref renamed) = upd {
+          // A rename restarts the whole §8.1/§8.3 lifecycle under a new name, so
+          // the partial-round evidence collected under the old one goes with it.
+          // This mirrors the core, which zeroes its own §8.3 partial-announce
+          // ladder on a rename (`reset_advertised_name_state`), and the
+          // conservatism is cheap: the worst case is ~750 ms of extra probing
+          // before the bound can excuse a family again.
+          //
+          // KNOWN RESIDUAL — the RFC 6763 §9 same-name revert-to-probe emits NO
+          // `ServiceUpdate` and is unobservable from here, so a revert can inherit
+          // up to `MAX_PARTIAL_ROUNDS` rounds. Accepted: the ladder's rungs are
+          // 1 s / 2 s, so that evidence is at most seconds old, and the conflict
+          // that triggered the revert was detected by RECEIVING a packet — the
+          // inherited rounds describe the same live links.
+          if let Some(ctx) = self.services.get_mut(&h) {
+            ctx.partial_rounds = 0;
+          }
           let new_name = renamed.new_name().clone();
           let rename_result = self.endpoint.handle_service_renamed(h, new_name);
           // The §9 rename of an announced service hands its OLD-name TTL=0 goodbye
@@ -680,18 +696,23 @@ impl State {
   }
 
   /// Extract one outgoing datagram into `scratch`. Returns
-  /// `Some((dst, used, origin))` or `None`. Walks services first, then queries.
+  /// `Some((transmit, origin))` or `None`. Walks services first, then queries.
   /// The driver loop repeatedly calls this until `None`, sending each
   /// datagram via the matching socket. The `origin` carries the service handle
   /// that produced the datagram so the driver can confirm it via
   /// [`State::note_service_transmit_outcome`] after the send completes — the §8.1
   /// probe sequence and §8.3 announce phase only advance once every obligated
   /// family carried the pending datagram.
+  ///
+  /// The whole [`Transmit`] is returned rather than just its destination and
+  /// length because [`Transmit::obligation`] must survive to the confirm: it
+  /// decides whether this driver's bounded obligation policy applies at all (see
+  /// [`bound_partial_delivery`]).
   pub(crate) fn poll_one_transmit(
     &mut self,
     now: StdInstant,
     scratch: &mut [u8],
-  ) -> Option<(SocketAddr, usize, TransmitOrigin)> {
+  ) -> Option<(Transmit, TransmitOrigin)> {
     self.svc_handle_scratch.clear();
     self
       .svc_handle_scratch
@@ -729,7 +750,7 @@ impl State {
         match ctx.proto.poll_transmit(now, scratch) {
           Ok(Some(t)) => {
             ctx.encode_failures = 0;
-            return Some((t.dst(), t.size(), TransmitOrigin::Service(h)));
+            return Some((t, TransmitOrigin::Service(h)));
           }
           Ok(None) => {
             ctx.encode_failures = 0;
@@ -806,7 +827,7 @@ impl State {
       }
       match self.endpoint.poll_query_transmit(h, now, scratch) {
         // A datagram is ready — hand it to the driver to send.
-        Ok(Some(t)) => return Some((t.dst(), t.size(), TransmitOrigin::Query(h))),
+        Ok(Some(t)) => return Some((t, TransmitOrigin::Query(h))),
         // Nothing due right now — try the next query.
         Ok(None) => {}
         // The question can't be encoded into `scratch` (e.g. `max_payload`
@@ -856,15 +877,19 @@ impl State {
   /// advance only once EVERY obligated family heard it.
   ///
   /// [`bound_partial_delivery`] is applied first, so a family that keeps missing
-  /// eventually stops holding the phase (see [`MAX_PARTIAL_ROUNDS`]).
+  /// eventually stops holding the phase (see [`MAX_PARTIAL_ROUNDS`]) — but only
+  /// for a [`TransmitObligation::Sustained`] datagram. `obligation` is
+  /// [`Transmit::obligation`], carried through from the poll that produced this
+  /// datagram.
   pub(crate) fn note_service_transmit_outcome(
     &mut self,
     h: ServiceHandle,
     now: StdInstant,
+    obligation: TransmitObligation,
     outcome: TransmitOutcome,
   ) {
     if let Some(ctx) = self.services.get_mut(&h) {
-      let outcome = bound_partial_delivery(&mut ctx.partial_rounds, outcome);
+      let outcome = bound_partial_delivery(&mut ctx.partial_rounds, obligation, outcome);
       ctx.proto.note_transmit_outcome(now, outcome);
       // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
       // route so sibling host-address retention (during a same-host withdrawal)
@@ -881,12 +906,13 @@ impl State {
         // unicast reply, which has one obligated link and is therefore
         // all-delivered by construction) would cancel a renamed-away name's
         // goodbye that the unserved family still needs. `FullyAnnounced` has no
-        // public constructor precisely so that substitution cannot compile.
+        // public constructor precisely so that substitution cannot compile, and it
+        // names the service it was minted from, so it cannot be applied to a
+        // different one either.
         self.endpoint.note_service_announced(
-          h,
+          ctx.proto.has_fully_announced(),
           ctx.proto.advertised_a_addrs(),
           ctx.proto.advertised_aaaa_addrs(),
-          ctx.proto.has_fully_announced(),
         );
       }
     }
@@ -902,10 +928,11 @@ impl State {
     &mut self,
     h: QueryHandle,
     now: StdInstant,
+    obligation: TransmitObligation,
     outcome: TransmitOutcome,
   ) {
     let outcome = match self.queries.get_mut(&h) {
-      Some(ctx) => bound_partial_delivery(&mut ctx.partial_rounds, outcome),
+      Some(ctx) => bound_partial_delivery(&mut ctx.partial_rounds, obligation, outcome),
       None => outcome,
     };
     self.endpoint.note_query_transmit_outcome(h, now, outcome);
@@ -1246,10 +1273,10 @@ pub(crate) async fn run(
         let now = StdInstant::now();
         s.poll_one_transmit(now, &mut scratch)
       };
-      let Some((dst, n, origin)) = pumped else {
+      let Some((tx, origin)) = pumped else {
         break;
       };
-      let fanout = send_via(&inner, &sock_v4, &sock_v6, dst, &scratch[..n]).await;
+      let fanout = send_via(&inner, &sock_v4, &sock_v6, tx.dst(), &scratch[..tx.size()]).await;
       // Confirm the pending transmit with the honest per-family shape of the
       // fan-out. The core latches §10.1 goodbye ownership for whatever reached a
       // wire and advances the §8.1 probe sequence / §8.3 announce phase / §5.2
@@ -1260,11 +1287,11 @@ pub(crate) async fn run(
       match origin {
         TransmitOrigin::Service(h) => {
           let mut state = inner.state.borrow_mut();
-          state.note_service_transmit_outcome(h, StdInstant::now(), outcome);
+          state.note_service_transmit_outcome(h, StdInstant::now(), tx.obligation(), outcome);
         }
         TransmitOrigin::Query(h) => {
           let mut state = inner.state.borrow_mut();
-          state.note_query_transmit_outcome(h, StdInstant::now(), outcome);
+          state.note_query_transmit_outcome(h, StdInstant::now(), tx.obligation(), outcome);
         }
       }
     }
@@ -1633,7 +1660,36 @@ pub(crate) const MAX_PARTIAL_ROUNDS: u8 = 2;
 /// mirrors the core, which likewise neither uses nor advances its §8.3 partial
 /// ladder on a round that reached no wire; resetting here would let an
 /// alternating partial/failed pattern evade the bound forever.
-pub(crate) fn bound_partial_delivery(rounds: &mut u8, outcome: TransmitOutcome) -> TransmitOutcome {
+///
+/// # Only sustained obligations are counted
+///
+/// A [`TransmitObligation::OneShot`] datagram — every response: the §6 multicast
+/// reply, the §6.7 legacy unicast reply, the RFC 6763 §9 meta reply — passes
+/// through VERBATIM, touching neither the counter nor the outcome. The counter
+/// tracks how long a link has been holding a re-armed lifecycle datagram hostage,
+/// and a response is never re-armed, so mixing responses in corrupts it in both
+/// directions:
+///
+/// * a legacy unicast reply has ONE obligated family, so it is `AllDelivered` by
+///   construction and would RESET the counter — alternating partial lifecycle
+///   sends with unicast replies would hold it at zero and the bound would never
+///   fire, pinning the service on a chronically half-broken link;
+/// * a partial multicast response would PRELOAD the counter, so the next partial
+///   probe would be excused and the RFC 6762 §8.1 sequence would advance although
+///   one family never heard the probe — the exact violation this contract exists
+///   to remove.
+///
+/// Passing the outcome through unchanged (rather than dropping the confirm) is
+/// required: the core still reads `any_delivered` from a response confirm to
+/// latch §10.1 goodbye ownership for the records it put on the wire.
+pub(crate) fn bound_partial_delivery(
+  rounds: &mut u8,
+  obligation: TransmitObligation,
+  outcome: TransmitOutcome,
+) -> TransmitOutcome {
+  if matches!(obligation, TransmitObligation::OneShot) {
+    return outcome;
+  }
   match outcome {
     TransmitOutcome::PartiallyDelivered if *rounds >= MAX_PARTIAL_ROUNDS => {
       *rounds = 0;

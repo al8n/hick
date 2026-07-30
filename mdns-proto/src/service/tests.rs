@@ -5112,3 +5112,180 @@ fn a_conflict_rename_closes_the_reclaim_cancel_gate() {
     "instance ownership resets alongside the gate on a rename"
   );
 }
+
+/// Build the wire bytes of a single question (`qname`, `qtype`, CLASS IN).
+fn question_bytes(qname: &str, qtype: u16) -> std::vec::Vec<u8> {
+  let mut q: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in qname.trim_end_matches('.').split('.') {
+    q.push(label.len() as u8);
+    q.extend_from_slice(label.as_bytes());
+  }
+  q.push(0u8);
+  q.extend_from_slice(&qtype.to_be_bytes());
+  q.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  q
+}
+
+/// The obligation tag a datagram carries is a function of the COMMIT TOKEN — of
+/// what was actually encoded — so it always states what `note_transmit_outcome`
+/// will do with the confirm: re-arm until every obligated link accepts it
+/// (`Sustained`), or never (`OneShot`).
+///
+/// The `Established` periodic re-announce is the row that rules out deriving the
+/// tag from the service PHASE. It advances no phase, yet a partial confirm
+/// re-arms it on the RFC 6762 §8.3 doubling ladder, so a driver that skipped its
+/// bounded obligation policy there would let a half-broken link hold the
+/// re-announce at the ladder's cap instead of at ~80 % of TTL.
+#[test]
+fn transmit_obligation_is_a_function_of_the_commit_token() {
+  use crate::{event::ServiceQuestion, wire::QuestionRef};
+
+  let mut svc = make_service(120);
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+
+  // ── The §8.1 probe sequence and the §8.3 startup announcements ───────────
+  let mut probes = 0u32;
+  let mut announcements = 0u32;
+  for _ in 0..40 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    while let Some(tx) = svc.poll_transmit(now, &mut buf).unwrap() {
+      match &svc.awaiting_confirm {
+        Some(AwaitingConfirm::Probe) => {
+          probes += 1;
+          assert_eq!(
+            tx.obligation(),
+            TransmitObligation::Sustained,
+            "§8.1: a probe is re-armed until every obligated link has been asked"
+          );
+        }
+        Some(AwaitingConfirm::Announcement(_)) => {
+          announcements += 1;
+          assert_eq!(
+            tx.obligation(),
+            TransmitObligation::Sustained,
+            "§8.3: an announcement is re-armed until every obligated link has been told"
+          );
+        }
+        other => panic!("unexpected commit token during the lifecycle: {other:?}"),
+      }
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+    }
+    if svc.state() == ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(probes, 3, "§8.1 sends exactly three probes");
+  assert_eq!(
+    announcements, 2,
+    "§8.3's startup sequence is two announcements"
+  );
+
+  // ── The Established periodic re-announce ────────────────────────────────
+  now = svc
+    .poll_timeout()
+    .expect("an Established service re-announces periodically");
+  svc.handle_timeout(now).unwrap();
+  let re_announce = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("the re-announce deadline fired");
+  assert!(matches!(
+    &svc.awaiting_confirm,
+    Some(AwaitingConfirm::Announcement(_))
+  ));
+  assert_eq!(
+    re_announce.obligation(),
+    TransmitObligation::Sustained,
+    "the periodic re-announce advances no phase, but a partial confirm still \
+     re-arms it on the §8.3 ladder — a phase-derived tag would get this wrong"
+  );
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+
+  // ── The jittered §6 multicast response ──────────────────────────────────
+  inject_question_to_set_response_deadline(&mut svc, now);
+  now = svc
+    .poll_timeout()
+    .expect("a question arms the jittered response deadline");
+  svc.handle_timeout(now).unwrap();
+  let response = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("the response deadline fired");
+  assert!(matches!(
+    &svc.awaiting_confirm,
+    Some(AwaitingConfirm::Response(_, _))
+  ));
+  assert_eq!(
+    response.obligation(),
+    TransmitObligation::OneShot,
+    "a response answers one question once and is never re-armed"
+  );
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+
+  // ── The §6.7 legacy unicast reply ───────────────────────────────────────
+  let legacy_src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
+  let qbuf = question_bytes("_ipp._tcp.local.", 12); // QTYPE PTR
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x55)),
+    now,
+  );
+  let legacy = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("a legacy unicast reply is queued");
+  assert_eq!(legacy.dst(), legacy_src);
+  assert!(matches!(
+    &svc.awaiting_confirm,
+    Some(AwaitingConfirm::Response(_, _))
+  ));
+  assert_eq!(
+    legacy.obligation(),
+    TransmitObligation::OneShot,
+    "§6.7: a legacy reply has one obligated link and is never re-armed, so \
+     feeding its confirm to a bounded obligation counter would reset it"
+  );
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+
+  // ── The RFC 6763 §9 meta-response, unicast then multicast ───────────────
+  let meta_q = question_bytes("_services._dns-sd._udp.local.", 12);
+  let (qref, _) = QuestionRef::try_parse(&meta_q, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x56)),
+    now,
+  );
+  let legacy_meta = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("a legacy meta reply is queued");
+  assert!(matches!(
+    &svc.awaiting_confirm,
+    Some(AwaitingConfirm::MetaResponse)
+  ));
+  assert_eq!(legacy_meta.obligation(), TransmitObligation::OneShot);
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+
+  let meta_src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
+  let (qref, _) = QuestionRef::try_parse(&meta_q, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, meta_src, 0)),
+    now,
+  );
+  now = now.advance(200); // past the 20–120 ms meta jitter window
+  svc.handle_timeout(now).unwrap();
+  let meta = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("the meta reply deadline fired");
+  assert!(matches!(
+    &svc.awaiting_confirm,
+    Some(AwaitingConfirm::MetaResponse)
+  ));
+  assert_eq!(
+    meta.obligation(),
+    TransmitObligation::OneShot,
+    "§9: the shared meta-PTR is emitted once per meta-query and never re-armed"
+  );
+}

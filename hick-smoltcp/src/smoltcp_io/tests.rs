@@ -402,3 +402,51 @@ fn try_recv_round_robins_handles_so_one_backlog_cannot_starve_the_other() {
     "handle B must interleave, not be starved behind A's backlog; order = {from_a:?}"
   );
 }
+
+#[test]
+fn a_present_but_unbound_socket_is_busy_not_unsupported() {
+  // `SendError::Unsupported` means the family has NO socket, and the engine
+  // therefore drops it from the obligated set entirely. smoltcp raises
+  // `Unaddressable` when the socket's own local port is still zero — a socket
+  // that plainly EXISTS — and also for an unspecified destination. Reporting
+  // either as `Unsupported` would make a bound-v4 + present-but-unbound-v6
+  // fan-out project to `AllDelivered`, advancing RFC 6762 §8.1 probing as though
+  // IPv6 did not exist on a node that has it. It must be `Busy`: the family
+  // stays obligated (so the fan-out is `PartiallyDelivered`) and is retried,
+  // which is also right for a binding that may still complete.
+  let mut rx4 = [udp::PacketMetadata::EMPTY; 1];
+  let mut rb4 = [0u8; 256];
+  let mut tx4 = [udp::PacketMetadata::EMPTY; 1];
+  let mut tb4 = [0u8; 256];
+  let mut rx6 = [udp::PacketMetadata::EMPTY; 1];
+  let mut rb6 = [0u8; 256];
+  let mut tx6 = [udp::PacketMetadata::EMPTY; 1];
+  let mut tb6 = [0u8; 256];
+  let s4 = udp_socket(&mut rx4, &mut rb4, &mut tx4, &mut tb4);
+  let s6 = udp_socket(&mut rx6, &mut rb6, &mut tx6, &mut tb6);
+  let mut storage: [_; 2] = Default::default();
+  let mut sockets = SocketSet::new(&mut storage[..]);
+  let h4 = sockets.add(s4);
+  let h6 = sockets.add(s6);
+  // v4 is bound; v6 is PRESENT but never bound (local port stays 0).
+  sockets.get_mut::<udp::Socket<'_>>(h4).bind(5353).unwrap();
+  assert!(
+    !sockets.get_mut::<udp::Socket<'_>>(h6).is_open(),
+    "the v6 socket must be present but unbound for this test to mean anything"
+  );
+
+  let mut io = DualStack::new(&mut sockets, Some(h4), Some(h6));
+  let v6 = SocketAddr::new(
+    IpAddr::V6(core::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
+    5353,
+  );
+  assert_eq!(
+    io.try_send(&[0u8; 8], v6),
+    Err(SendError::Busy),
+    "an unbound socket EXISTS, so its family stays obligated"
+  );
+  // The bound family still carries the same datagram, so the fan-out is a
+  // genuine partial rather than a single-stack success.
+  let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), 5353);
+  assert_eq!(io.try_send(&[0u8; 8], v4), Ok(()));
+}

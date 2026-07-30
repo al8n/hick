@@ -165,7 +165,7 @@ cfg_heap! {
   use crate::error::{HandleTimeoutError, TransmitError};
   use crate::event::{ServiceEvent, ServiceUpdate};
   use crate::records::ServiceRecords;
-  use crate::transmit::{Transmit, TransmitOutcome};
+  use crate::transmit::{Transmit, TransmitObligation, TransmitOutcome};
   use crate::{Instant, Pool, ServiceHandle};
 
   type Rng = rand::rngs::StdRng;
@@ -336,6 +336,32 @@ cfg_heap! {
     MetaResponse,
   }
 
+  impl AwaitingConfirm {
+    /// The [`TransmitObligation`] this token implies, i.e. whether
+    /// [`Service::note_transmit_outcome`] will re-arm the datagram until every
+    /// obligated link accepts it.
+    ///
+    /// Derived from the token — what was actually ENCODED — and never from
+    /// `self.state`. Two things make the state wrong here. The periodic
+    /// `Established` re-announce advances no phase yet is still re-armed on the
+    /// RFC 6762 §8.3 doubling ladder while a link keeps missing it, so a
+    /// phase-derived tag would call it fire-and-forget and let a half-broken link
+    /// hold it at the ladder's 64 s cap instead of re-announcing at ~80 % of TTL.
+    /// And the state can advance between the deadline firing and the datagram
+    /// being encoded — the drift [`PendingTransmitKind`] already exists to absorb.
+    #[inline]
+    fn obligation(&self) -> TransmitObligation {
+      match self {
+        // Re-armed until every obligated link hears it: the §8.1 probe sequence
+        // and the §8.3 announcement (startup phase AND periodic re-announce).
+        Self::Probe | Self::Announcement(_) => TransmitObligation::Sustained,
+        // A response is emitted once for the question that provoked it and is
+        // never re-armed, so no link can pin anything by missing it.
+        Self::Response(_, _) | Self::MetaResponse => TransmitObligation::OneShot,
+      }
+    }
+  }
+
   /// Goodbye ownership: which CONCRETE records peers may have cached FROM US, and
   /// therefore what a graceful goodbye (TTL=0) must withdraw. The granularity is
   /// per record — each instance-owned record (PTR/SRV/TXT) independently, and each
@@ -498,23 +524,46 @@ cfg_heap! {
   /// deleting the boolean confirm METHODS makes every other call site fail to
   /// compile, whereas a same-arity `bool` parameter whose MEANING changed would
   /// silently survive both the driver migration and any external upgrade.
+  ///
+  /// The token also NAMES the service it was minted from, and
+  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced)
+  /// takes no separate handle. An unforgeable fact is still transplantable while
+  /// the subject is a second argument: a genuine `true` from service A, paired
+  /// with service B's handle, would cancel B's reclaimable goodbye while an
+  /// obligated family still needs it. Carrying the subject inside the proof makes
+  /// that pairing unrepresentable rather than merely validated.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   #[must_use]
-  pub struct FullyAnnounced(bool);
+  pub struct FullyAnnounced {
+    handle: ServiceHandle,
+    fully_announced: bool,
+  }
 
   impl FullyAnnounced {
-    /// Wrap the fact. Crate-internal: [`Service::has_fully_announced`] is the sole
-    /// caller, which is what makes the type unforgeable outside this crate.
+    /// Wrap the fact together with the service it is a fact ABOUT.
+    /// Crate-internal: [`Service::has_fully_announced`] is the sole caller, which
+    /// is what makes the type unforgeable outside this crate.
     #[inline(always)]
-    pub(crate) const fn new(fully_announced: bool) -> Self {
-      Self(fully_announced)
+    pub(crate) const fn new(handle: ServiceHandle, fully_announced: bool) -> Self {
+      Self {
+        handle,
+        fully_announced,
+      }
+    }
+
+    /// The service this fact is about — the [`Service`] that minted it. The
+    /// endpoint routes on this instead of a caller-supplied handle, so the fact
+    /// and its subject cannot be separated.
+    #[inline(always)]
+    pub(crate) const fn handle(self) -> ServiceHandle {
+      self.handle
     }
 
     /// Whether a complete announcement of the service's current instance name has
     /// reached every obligated link.
     #[inline(always)]
     pub const fn get(self) -> bool {
-      self.0
+      self.fully_announced
     }
   }
 }
@@ -799,12 +848,13 @@ where
   ///
   /// The result is wrapped in [`FullyAnnounced`] precisely so that the wrong fact
   /// cannot be substituted at the call site; use [`FullyAnnounced::get`] to read
-  /// it.
+  /// it. The token is stamped with THIS service's handle, so it also cannot be
+  /// applied to a different service.
   ///
   /// Reset by a §9 conflict rename: the new name has announced nothing.
   #[inline(always)]
   pub const fn has_fully_announced(&self) -> FullyAnnounced {
-    FullyAnnounced::new(self.fully_announced)
+    FullyAnnounced::new(self.handle, self.fully_announced)
   }
 
   /// The host IPv4 addresses this service has actually ADVERTISED (confirmed-
@@ -1036,6 +1086,22 @@ where
           }
         }
       }
+    }
+  }
+
+  /// The [`TransmitObligation`] of the datagram whose commit token is currently
+  /// stamped — the tag [`Self::poll_transmit`] hands the driver.
+  ///
+  /// A pure function of the token, so the tag always describes what
+  /// [`Self::note_transmit_outcome`] will actually do with the confirm. A
+  /// datagram that stamped NO token obligates nothing at all (the confirm is a
+  /// no-op), so it reports `OneShot` and stays out of the driver's bounded
+  /// obligation counter.
+  #[inline]
+  fn stamped_obligation(&self) -> TransmitObligation {
+    match &self.awaiting_confirm {
+      Some(token) => token.obligation(),
+      None => TransmitObligation::OneShot,
     }
   }
 
@@ -2024,7 +2090,12 @@ where
         // responses_tx on a confirmed delivery.  No goodbye ownership is
         // latched (the meta-PTR is shared and never withdrawn).
         self.awaiting_confirm = Some(AwaitingConfirm::MetaResponse);
-        return Ok(Some(Transmit::new(respond::multicast_dst(), None, n)));
+        return Ok(Some(Transmit::new(
+          respond::multicast_dst(),
+          None,
+          n,
+          self.stamped_obligation(),
+        )));
       }
       // Suppressed, or name build (impossible) / encode failed — drop the reply
       // (state already cleared above), do not poison; fall through to the queue.
@@ -2073,7 +2144,12 @@ where
             Some(e) => Some(AwaitingConfirm::Response(e, 0)),
             None => Some(AwaitingConfirm::MetaResponse),
           };
-          return Ok(Some(Transmit::new(resp.dst, None, n)));
+          return Ok(Some(Transmit::new(
+            resp.dst,
+            None,
+            n,
+            self.stamped_obligation(),
+          )));
         }
         // a legacy reply echoes the question, so it can exceed the
         // buffer for a near-MTU service whose normal announcement still fits.
@@ -2285,7 +2361,12 @@ where
     let _ = self.pending_tx.iter().next(); // silence unused-field warning
     // Multicast response — serves QM and QU (§5.4) group members. Legacy unicast
     // queriers are handled separately via `pending_legacy`.
-    Ok(Some(Transmit::new(respond::multicast_dst(), None, n)))
+    Ok(Some(Transmit::new(
+      respond::multicast_dst(),
+      None,
+      n,
+      self.stamped_obligation(),
+    )))
   }
 }
 }

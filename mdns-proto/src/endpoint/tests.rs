@@ -77,7 +77,7 @@ fn handle_rejects_a_malformed_packet_with_a_parse_error() {
 fn note_service_announced_is_a_noop_for_an_unknown_handle() {
   let mut e = build_endpoint();
   // No registered service → the route lookup misses and the call returns early.
-  e.note_service_announced(ServiceHandle::from_raw(0xDEAD), &[], &[], FullyAnnounced::new(false));
+  e.note_service_announced(FullyAnnounced::new(ServiceHandle::from_raw(0xDEAD), false), &[], &[]);
 }
 
 #[test]
@@ -3782,7 +3782,7 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
   // B has CONFIRMED-ADVERTISED the shared address (its announce was delivered),
   // so the route's advertised set is non-empty — otherwise retention would
   // honour nothing and A would (wrongly) withdraw the shared address.
-  ep.note_service_announced(b_handle, &[shared], &[], FullyAnnounced::new(true));
+  ep.note_service_announced(FullyAnnounced::new(b_handle, true), &[shared], &[]);
 
   // A's withdrawal snapshot: owns PTR/SRV/TXT, the subtype PTR, and both host
   // A addresses.
@@ -3879,7 +3879,7 @@ fn register_host_service(
     )
     .unwrap();
   if let Some(adv) = advertised {
-    ep.note_service_announced(h, adv, &[], FullyAnnounced::new(true));
+    ep.note_service_announced(FullyAnnounced::new(h, true), adv, &[]);
   }
   h
 }
@@ -5021,10 +5021,9 @@ fn surviving_rename_old_name_is_reclaimable_on_announce() {
 
   // The reclaiming service CONFIRMS advertising its name → cancel-on-announce.
   ep.note_service_announced(
-    handle,
+    FullyAnnounced::new(handle, true),
     &[Ipv4Addr::new(192, 168, 1, 10)],
     &[],
-    FullyAnnounced::new(true),
   );
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
@@ -5075,7 +5074,7 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
   // emitted yet) — and ALSO an address-less shape (empty address slices). The
   // goodbye MUST survive: if the reclaiming service drops/conflicts after probing
   // but before announcing, the old records still need retracting.
-  ep.note_service_announced(handle, &[], &[], FullyAnnounced::new(false));
+  ep.note_service_announced(FullyAnnounced::new(handle, false), &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_some(),
     "a probe (fully_announced=false) must NOT cancel the reclaimed goodbye"
@@ -5083,7 +5082,7 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
 
   // A CONFIRMED instance-advertise (fully_announced=true, still address-less)
   // cancels it.
-  ep.note_service_announced(handle, &[], &[], FullyAnnounced::new(true));
+  ep.note_service_announced(FullyAnnounced::new(handle, true), &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "a confirmed instance-advertise cancels the reclaimed goodbye (even address-less)"
@@ -5790,7 +5789,7 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
 
   // The reclaiming service CONFIRMS advertising the name → cancel-on-announce
   // drops the goodbye, so no late TTL=0 goodbye can flush the new registration.
-  ep.note_service_announced(dup_h, &[], &[], FullyAnnounced::new(true));
+  ep.note_service_announced(FullyAnnounced::new(dup_h, true), &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "the detached old-name goodbye is cancelled when the reclaiming service announces"
@@ -5890,7 +5889,7 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
   );
   // When S CONFIRMS advertising its instance records under `target`,
   // cancel-on-announce drops the goodbye so no late TTL=0 send can flush S.
-  ep.note_service_announced(s, &[], &[], FullyAnnounced::new(true));
+  ep.note_service_announced(FullyAnnounced::new(s, true), &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&target).is_none(),
     "the detached goodbye is cancelled once S advertises the reclaimed name"
@@ -7052,10 +7051,11 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
     false,
   );
 
-  // A fresh service reclaims the vacated name.
+  // A fresh service reclaims the vacated name. The reclaim-cancel gate names its
+  // own service through the `FullyAnnounced` token, so no handle is needed here.
   let mut recs = ServiceRecords::new(stype, name.clone(), host, 631, 120);
   recs.add_a(Ipv4Addr::new(192, 168, 1, 10));
-  let (handle, mut svc) = ep
+  let (_handle, mut svc) = ep
     .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
       ServiceSpec::new(recs),
       now,
@@ -7074,10 +7074,9 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
       ep.note_service_announced(
-        handle,
+        svc.has_fully_announced(),
         svc.advertised_a_addrs(),
         svc.advertised_aaaa_addrs(),
-        svc.has_fully_announced(),
       );
     }
   }
@@ -7101,10 +7100,9 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
     "the v4 zone heard it, so ownership latched"
   );
   ep.note_service_announced(
-    handle,
+    svc.has_fully_announced(),
     svc.advertised_a_addrs(),
     svc.advertised_aaaa_addrs(),
-    svc.has_fully_announced(),
   );
   assert!(
     ep.detached_withdrawal_owed_for(&name).is_some(),
@@ -7118,10 +7116,9 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
   svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
   ep.note_service_announced(
-    handle,
+    svc.has_fully_announced(),
     svc.advertised_a_addrs(),
     svc.advertised_aaaa_addrs(),
-    svc.has_fully_announced(),
   );
   assert!(
     ep.detached_withdrawal_owed_for(&name).is_none(),
@@ -7171,7 +7168,7 @@ fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
     !fact.get(),
     "a freshly registered service has announced nothing"
   );
-  ep.note_service_announced(handle, &[], &[], fact);
+  ep.note_service_announced(fact, &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&name).is_some(),
     "a `false` fact cancels nothing"
@@ -7179,9 +7176,78 @@ fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
 
   // A directly-minted `true` fact is the same code path as one ferried from a
   // `Service` that has actually fully announced — it cancels.
-  ep.note_service_announced(handle, &[], &[], FullyAnnounced::new(true));
+  ep.note_service_announced(FullyAnnounced::new(handle, true), &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&name).is_none(),
     "a `true` fact cancels the reclaimable goodbye"
+  );
+}
+
+/// The reclaim-cancel gate routes on the handle INSIDE the `FullyAnnounced`, so
+/// one service's proof can only ever retire its OWN name's reclaimable goodbye.
+///
+/// An unforgeable fact is still transplantable while its subject is a separate
+/// argument: a genuine `true` from a service that fully announced, paired with a
+/// different service's handle, would cancel that other name's goodbye while an
+/// obligated family still needed it.
+#[test]
+fn a_fully_announced_proof_cancels_only_its_own_services_goodbye() {
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("shared.local.").unwrap();
+  let name_a = Name::try_from_str("A._ipp._tcp.local.").unwrap();
+  let name_b = Name::try_from_str("B._ipp._tcp.local.").unwrap();
+
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+
+  // Both names have a RECLAIMABLE detached goodbye still draining.
+  for name in [&name_a, &name_b] {
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+        owned: crate::service::EmittedRecords::new(
+          true,
+          true,
+          true,
+          std::vec::Vec::new(),
+          std::vec::Vec::new(),
+          false,
+        ),
+      },
+      now,
+      false,
+    );
+  }
+
+  // Both names are reclaimed by fresh services.
+  let (handle_a, _svc_a) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(ServiceRecords::new(
+        stype.clone(),
+        name_a.clone(),
+        host.clone(),
+        631,
+        120,
+      )),
+      now,
+    )
+    .unwrap();
+  let (_handle_b, _svc_b) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(ServiceRecords::new(stype, name_b.clone(), host, 631, 120)),
+      now,
+    )
+    .unwrap();
+
+  // Only A has fully announced. Its proof names A, and the endpoint has no other
+  // way to learn which service the fact is about.
+  ep.note_service_announced(FullyAnnounced::new(handle_a, true), &[], &[]);
+  assert!(
+    ep.detached_withdrawal_owed_for(&name_a).is_none(),
+    "A's own reclaimable goodbye is superseded by A's complete announcement"
+  );
+  assert!(
+    ep.detached_withdrawal_owed_for(&name_b).is_some(),
+    "B has announced nothing, so B's goodbye MUST keep draining"
   );
 }

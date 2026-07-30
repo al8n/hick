@@ -1144,14 +1144,14 @@ fn multi_service_encode_failure_frees_route_even_with_sibling_transmit() {
 
     // Note any Ok(Some) result (should always be B's transmit, never A's
     // since A's records can't be encoded).
-    if let Some((_, _, TransmitOrigin::Service(h))) = result {
+    if let Some((tx, TransmitOrigin::Service(h))) = result {
       // The returned transmit MUST belong to B (A's records are too large).
       assert_eq!(
         h, handle_b,
         "any returned transmit must be from B, never from A (A's records won't encode)"
       );
       // Confirm B's delivery so B advances its probe/announce lifecycle.
-      s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered);
+      s.note_service_transmit_outcome(h, t, tx.obligation(), TransmitOutcome::AllDelivered);
     }
 
     // Check if A just escalated.
@@ -1314,8 +1314,8 @@ fn rename_collision_with_local_service_frees_proto_route() {
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_, _, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered);
+        Some((tx, TransmitOrigin::Service(h))) => {
+          s.note_service_transmit_outcome(h, t, tx.obligation(), TransmitOutcome::AllDelivered);
         }
         Some(_) => {}
         None => break,
@@ -1523,8 +1523,8 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_, _, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered);
+        Some((tx, TransmitOrigin::Service(h))) => {
+          s.note_service_transmit_outcome(h, t, tx.obligation(), TransmitOutcome::AllDelivered);
         }
         Some(_) => {}
         None => break,
@@ -1683,8 +1683,8 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_, _, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered)
+        Some((tx, TransmitOrigin::Service(h))) => {
+          s.note_service_transmit_outcome(h, t, tx.obligation(), TransmitOutcome::AllDelivered)
         }
         Some(_) => {}
         None => break,
@@ -2276,8 +2276,8 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_, _, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered);
+        Some((tx, TransmitOrigin::Service(h))) => {
+          s.note_service_transmit_outcome(h, t, tx.obligation(), TransmitOutcome::AllDelivered);
         }
         Some(_) => {}
         None => break,
@@ -2405,14 +2405,17 @@ fn confirm_service_round(
   s.fire_timeouts(t);
   let outcome = fanout.transmit_outcome();
   let mut rounds = 0;
-  while let Some((_, _, origin)) = s.poll_one_transmit(t, buf) {
+  while let Some((tx, origin)) = s.poll_one_transmit(t, buf) {
+    let obligation = tx.obligation();
     match origin {
       TransmitOrigin::Service(origin_h) if origin_h == h => {
-        s.note_service_transmit_outcome(h, t, outcome);
+        s.note_service_transmit_outcome(h, t, obligation, outcome);
         rounds += 1;
       }
-      TransmitOrigin::Service(other) => s.note_service_transmit_outcome(other, t, outcome),
-      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, outcome),
+      TransmitOrigin::Service(other) => {
+        s.note_service_transmit_outcome(other, t, obligation, outcome)
+      }
+      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, obligation, outcome),
     }
   }
   rounds
@@ -2876,5 +2879,312 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   assert!(
     inner.state.borrow().recent_sends.is_empty(),
     "a unicast reply never loops back, so it must record NO self-send credit"
+  );
+}
+
+// ── The obligation tag (`TransmitObligation`) at the driver seam ────────────
+
+/// A §6.7 legacy unicast reply reaches exactly ONE family, so its fan-out is
+/// `AllDelivered` by construction.
+const UNICAST_FANOUT: Fanout = Fanout {
+  v4: FamilySend::Sent,
+  v6: FamilySend::Unbound,
+};
+
+/// Drain one service's due transmits at `t` through the SAME seam the run loop
+/// uses, choosing each datagram's fan-out the way `send_via` would: an mDNS
+/// MULTICAST destination is fanned onto both families (and so can be partial),
+/// while a §6.7 legacy UNICAST reply reaches the single family its destination
+/// names. Returns how many datagrams were confirmed.
+fn confirm_service_round_mixed(
+  s: &mut State,
+  h: ServiceHandle,
+  t: StdInstant,
+  buf: &mut [u8],
+  multicast_fanout: Fanout,
+) -> usize {
+  s.fire_timeouts(t);
+  let mut rounds = 0;
+  while let Some((tx, origin)) = s.poll_one_transmit(t, buf) {
+    let fanout = if tx.dst().ip().is_multicast() {
+      multicast_fanout
+    } else {
+      UNICAST_FANOUT
+    };
+    let outcome = fanout.transmit_outcome();
+    let obligation = tx.obligation();
+    match origin {
+      TransmitOrigin::Service(origin_h) => {
+        s.note_service_transmit_outcome(origin_h, t, obligation, outcome);
+        if origin_h == h {
+          rounds += 1;
+        }
+      }
+      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, obligation, outcome),
+    }
+  }
+  rounds
+}
+
+/// Feed a browse (PTR) query for the sample service type through the driver's
+/// own receive path. A `src` port of 5353 elicits a jittered §6 MULTICAST
+/// response; any other port elicits a §6.7 legacy UNICAST reply.
+fn inject_ptr_query(s: &mut State, src: core::net::SocketAddr, t: StdInstant) {
+  use core::net::{IpAddr, Ipv4Addr};
+
+  use mdns_proto::{
+    Name,
+    wire::{Header, MessageBuilder, ResourceClass, ResourceType},
+  };
+
+  use crate::socket::RecvMeta;
+
+  let qname = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let mut qbuf = [0u8; 512];
+  let n = {
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut qbuf, Header::new()).unwrap();
+    b.push_question(&qname, ResourceType::Ptr, ResourceClass::In, false)
+      .unwrap();
+    b.finish().unwrap()
+  };
+  let meta = RecvMeta::new(
+    src,
+    IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
+    1,
+    Some(255), // §11 on-link
+    None,
+    n,
+  );
+  let _ = t;
+  s.handle_datagram(&meta, &qbuf[..n]);
+}
+
+/// Answering legacy queriers must not let a chronically half-broken family evade
+/// the bounded obligation policy.
+///
+/// A §6.7 unicast reply is `TransmitObligation::OneShot` and has exactly ONE
+/// obligated family, so it is `AllDelivered` by construction. Counting it would
+/// RESET the partial-round budget, and a service that answers a legacy querier
+/// between lifecycle rounds would hold that budget at zero forever — the bound
+/// would never fire and the service would stay pinned in `Announcing` on the
+/// family that does work.
+#[test]
+fn delivered_unicast_replies_do_not_evade_the_bounded_partial_policy() {
+  use mdns_proto::service::ServiceState;
+
+  let mut s = State::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  let now = StdInstant::now();
+  let h = s
+    .test_register_service(delivery_test_spec("evade"), now)
+    .unwrap();
+  let mut buf = vec![0u8; 4096];
+  let legacy = core::net::SocketAddr::from(([192, 168, 1, 50], 6000));
+
+  // Steps larger than the top rung of the core's §8.3 partial ladder (64 s), so
+  // each round's re-arm is always due. Every round serves one legacy querier
+  // (delivered by construction) and then partially delivers one announcement.
+  let step = Duration::from_secs(120);
+  let mut t = now;
+  for round in 0..=u32::from(MAX_PARTIAL_ROUNDS) {
+    inject_ptr_query(&mut s, legacy, t);
+    assert_eq!(
+      confirm_service_round_mixed(&mut s, h, t, &mut buf, PARTIAL_FANOUT),
+      2,
+      "round {round} should have offered one unicast reply and one announcement"
+    );
+    t += step;
+  }
+
+  assert_eq!(
+    s.services[&h].proto.state(),
+    ServiceState::Announcing(1),
+    "the interleaved unicast replies must not have reset the partial-round \
+     budget — with them counted, the bound never fires and the service pins in \
+     Announcing(0) on a permanently half-broken link"
+  );
+}
+
+/// Partially-delivered multicast RESPONSES must not preload the partial-round
+/// budget, or the next partial LIFECYCLE datagram is excused and its phase
+/// advances although one family never heard it — the §8.1/§8.3 violation the
+/// `TransmitOutcome` contract exists to remove, reintroduced through the back
+/// door.
+#[test]
+fn partial_multicast_responses_do_not_preload_the_bounded_partial_policy() {
+  use mdns_proto::service::ServiceState;
+
+  let mut s = State::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  let now = StdInstant::now();
+  let h = s
+    .test_register_service(delivery_test_spec("preload"), now)
+    .unwrap();
+  let mut buf = vec![0u8; 4096];
+  let querier = core::net::SocketAddr::from(([192, 168, 1, 50], 5353));
+
+  // A clean first announcement, so the budget starts at zero and the next
+  // announcement is a full §8.3 interval (1 s) away.
+  assert_eq!(
+    confirm_service_round(&mut s, h, now, &mut buf, WHOLE_FANOUT),
+    1
+  );
+  assert_eq!(s.services[&h].proto.state(), ServiceState::Announcing(1));
+
+  // Partially-delivered multicast responses, well inside that 1 s window.
+  let mut t = now;
+  for round in 0..u32::from(MAX_PARTIAL_ROUNDS) {
+    inject_ptr_query(&mut s, querier, t);
+    t += Duration::from_millis(200); // past the §6 20–120 ms jitter
+    assert_eq!(
+      confirm_service_round(&mut s, h, t, &mut buf, PARTIAL_FANOUT),
+      1,
+      "round {round} should have offered exactly one response"
+    );
+    assert_eq!(
+      s.services[&h].partial_rounds, 0,
+      "a response is never re-armed, so a partial one is no evidence that a \
+       family is holding a lifecycle datagram hostage"
+    );
+  }
+
+  // The next partial ANNOUNCEMENT must therefore be reported honestly.
+  t += Duration::from_secs(2);
+  assert_eq!(
+    confirm_service_round(&mut s, h, t, &mut buf, PARTIAL_FANOUT),
+    1
+  );
+  assert_eq!(
+    s.services[&h].proto.state(),
+    ServiceState::Announcing(1),
+    "with the responses counted this announcement would be the budget-exhausting \
+     round, excusing the family that has been told nothing and advancing §8.3"
+  );
+  assert_eq!(s.services[&h].partial_rounds, 1);
+}
+
+/// Bypassing the bound for a one-shot datagram must not bypass the CORE confirm:
+/// the outcome still reaches `Service::note_transmit_outcome` verbatim, so a
+/// delivered response latches §10.1 goodbye ownership for the records it put on
+/// the wire.
+#[test]
+fn a_one_shot_confirm_still_latches_goodbye_ownership() {
+  let mut s = State::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  let now = StdInstant::now();
+  let h = s
+    .test_register_service(delivery_test_spec("oneshot"), now)
+    .unwrap();
+  let mut buf = vec![0u8; 4096];
+
+  // The lifecycle reaches no wire at all, so nothing it sends can latch.
+  confirm_service_round(&mut s, h, now, &mut buf, FAILED_FANOUT);
+  assert!(
+    !s.services[&h].proto.advertises_instance(),
+    "a wholly-failed announcement exposes nothing"
+  );
+
+  // A §6.7 legacy querier is served over the one family its destination names.
+  let legacy = core::net::SocketAddr::from(([192, 168, 1, 50], 6000));
+  let t = now + Duration::from_millis(50);
+  inject_ptr_query(&mut s, legacy, t);
+  assert_eq!(
+    confirm_service_round_mixed(&mut s, h, t, &mut buf, FAILED_FANOUT),
+    1,
+    "only the legacy reply is due this early"
+  );
+  assert!(
+    s.services[&h].proto.advertises_instance(),
+    "the reply put positive-TTL records on a wire, so §10.1 ownership latches — \
+     the confirm reaches the core unchanged, it just skips the bound"
+  );
+  assert!(
+    !s.services[&h].proto.has_fully_announced().get(),
+    "an all-delivered UNICAST reply is still not a complete announcement"
+  );
+}
+
+/// A rename restarts the lifecycle under a new name, so the partial-round
+/// evidence gathered under the old one is dropped with it — mirroring the core,
+/// which zeroes its own §8.3 partial-announce ladder on a rename.
+#[test]
+fn a_rename_clears_the_partial_round_evidence() {
+  use core::net::{IpAddr, Ipv4Addr};
+
+  use mdns_proto::{
+    Name,
+    wire::{Header, MessageBuilder},
+  };
+
+  use crate::socket::RecvMeta;
+
+  let mut s = State::new(mdns_proto::EndpointConfig::new(), 1500, 9000);
+  let now = StdInstant::now();
+  let h = s
+    .test_register_service(delivery_test_spec("Renamer"), now)
+    .unwrap();
+  let mut buf = vec![0u8; 4096];
+
+  // Spend one partial round, so there IS evidence for the rename to clear.
+  let mut t = now;
+  for _ in 0..8 {
+    t += Duration::from_millis(300);
+    if confirm_service_round(&mut s, h, t, &mut buf, PARTIAL_FANOUT) > 0 {
+      break;
+    }
+  }
+  assert_eq!(
+    s.services[&h].partial_rounds, 1,
+    "a partially-delivered probe must have been counted"
+  );
+
+  // A rival SRV authority for the same instance name with LARGER rdata: we lose
+  // the §8.2 tiebreak and rename away.
+  let inst = Name::try_from_str("Renamer._ipp._tcp.local.").unwrap();
+  let mut cbuf = [0u8; 512];
+  let n = {
+    let target = Name::try_from_str("rival-host.local.").unwrap();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
+    b.push_srv_authority(&inst, 120, 0, 0, 9999, &target)
+      .unwrap();
+    b.finish().unwrap()
+  };
+  let meta = RecvMeta::new(
+    core::net::SocketAddr::from(([192, 168, 1, 200], 5353)),
+    IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
+    1,
+    Some(255),
+    None,
+    n,
+  );
+  s.handle_datagram(&meta, &cbuf[..n]);
+
+  // Fire the §8.2 tiebreak WITHOUT confirming any transmit, so the counter can
+  // only be changed by the rename hook itself.
+  t += Duration::from_millis(300);
+  s.fire_timeouts(t);
+  assert_ne!(
+    s.services[&h].proto.name().as_str(),
+    inst.as_str(),
+    "the service must have lost the tiebreak and renamed"
+  );
+  assert_eq!(
+    s.services[&h].partial_rounds, 1,
+    "the reset belongs to the driver's rename hook, not to the proto"
+  );
+
+  s.push_service_updates(t);
+  assert_eq!(
+    s.services[&h].partial_rounds, 0,
+    "observing `Renamed` must clear the evidence gathered under the old name"
   );
 }

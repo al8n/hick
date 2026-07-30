@@ -2,22 +2,82 @@
 
 use core::net::{IpAddr, SocketAddr};
 
+/// Whether the core will KEEP RE-ARMING a datagram until every obligated link
+/// accepts it — and therefore whether a driver's bounded obligation policy (see
+/// [`TransmitOutcome`]) applies to that datagram's confirm.
+///
+/// The tag is a property of the DATAGRAM, not of the producing service's
+/// lifecycle phase. The two diverge in both directions: the periodic
+/// `Established` re-announce advances no phase yet is still re-armed on the RFC
+/// 6762 §8.3 doubling ladder while a link keeps missing it, and
+/// [`Query::poll_transmit`](crate::Query::poll_transmit) shares [`Transmit`]
+/// while having no service phase at all.
+///
+/// A driver MUST route the two variants differently, because feeding a
+/// [`OneShot`](Self::OneShot) confirm into a bounded obligation counter corrupts
+/// that counter in both directions:
+///
+/// * An RFC 6762 §6.7 legacy unicast reply has exactly one obligated link, so it
+///   is [`AllDelivered`](TransmitOutcome::AllDelivered) by construction and
+///   RESETS the counter. A stream of replies interleaved with partial lifecycle
+///   sends holds it at zero forever, and the bound never fires.
+/// * A partially-delivered multicast response PRELOADS the counter, so the next
+///   partial probe is excused and the §8.1 sequence advances although one family
+///   never heard the probe.
+///
+/// Deliberately NOT `#[non_exhaustive]`: a future transmit kind must break every
+/// driver's match and force it to choose a policy, rather than silently
+/// inheriting a wildcard arm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransmitObligation {
+  /// The core re-arms this datagram until every obligated link accepts it, so a
+  /// link that keeps missing pins the producer's progress. A driver's bounded
+  /// obligation policy APPLIES.
+  ///
+  /// Carried by the RFC 6762 §8.1 probe, by every §8.3 announcement (including
+  /// the periodic re-announce from `Established`), and by the §5.2 query
+  /// retransmission.
+  Sustained,
+  /// Fire-and-forget: the core never re-arms this datagram, so missing it pins
+  /// nothing. A driver's bounded obligation policy MUST NOT be applied — the
+  /// outcome must reach the core VERBATIM, since the core still reads
+  /// [`TransmitOutcome::any_delivered`] from it to latch §10.1 goodbye ownership
+  /// for the records the datagram carried.
+  ///
+  /// Carried by every response: the jittered multicast reply (§6), the legacy
+  /// unicast reply (§6.7), and the RFC 6763 §9 service-type enumeration reply.
+  OneShot,
+}
+
 /// Outgoing datagram metadata produced by the proto state machines.
 ///
 /// The proto writes the actual bytes into a caller-supplied `&mut [u8]`;
-/// this struct describes where the bytes go and how many were written.
+/// this struct describes where the bytes go, how many were written, and whether
+/// the core will re-arm it until every obligated link accepts it
+/// ([`TransmitObligation`]).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Transmit {
   dst: SocketAddr,
   src_ip: Option<IpAddr>,
   size: usize,
+  obligation: TransmitObligation,
 }
 
 impl Transmit {
   /// Creates a new transmit descriptor.
   #[inline(always)]
-  pub const fn new(dst: SocketAddr, src_ip: Option<IpAddr>, size: usize) -> Self {
-    Self { dst, src_ip, size }
+  pub const fn new(
+    dst: SocketAddr,
+    src_ip: Option<IpAddr>,
+    size: usize,
+    obligation: TransmitObligation,
+  ) -> Self {
+    Self {
+      dst,
+      src_ip,
+      size,
+      obligation,
+    }
   }
 
   /// Destination socket address (typically the mDNS multicast group).
@@ -37,6 +97,14 @@ impl Transmit {
   #[inline(always)]
   pub const fn size(&self) -> usize {
     self.size
+  }
+
+  /// Whether the core will re-arm this datagram until every obligated link
+  /// accepts it, and therefore whether the driver's bounded obligation policy
+  /// applies to its confirm. See [`TransmitObligation`].
+  #[inline(always)]
+  pub const fn obligation(&self) -> TransmitObligation {
+    self.obligation
   }
 }
 
@@ -78,6 +146,13 @@ impl Transmit {
 /// obligated set. Repeated `PartiallyDelivered` re-arms indefinitely, so without
 /// such a policy a chronically-failing link holds every service in probing or
 /// announcing forever.
+///
+/// That policy applies to [`TransmitObligation::Sustained`] datagrams and to
+/// those ONLY. A [`OneShot`](TransmitObligation::OneShot) datagram is never
+/// re-armed, so it has nothing to write off — and mixing its confirms into the
+/// same counter both hides a chronically half-broken link and advances phases the
+/// missing link never heard. Read [`Transmit::obligation`] and pass a `OneShot`
+/// outcome to the core verbatim.
 ///
 /// The bound cannot live in the core. Its only unilateral terminal action would
 /// be to advance the phase anyway, and advancing on a link that never heard the

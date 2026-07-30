@@ -23,7 +23,7 @@ use mdns_proto::{
   query::Query,
   service::Service,
   slab::Slab,
-  transmit::{Transmit, TransmitOutcome},
+  transmit::{Transmit, TransmitObligation, TransmitOutcome},
 };
 use rand_core::Rng;
 use smoltcp::wire::IpCidr;
@@ -883,7 +883,8 @@ where
     // is rejected (`NameAlreadyRegistered`) until `drain_completed_withdrawals`
     // frees the name. No replacement can announce ahead of the withdrawal, so the
     // old pre-TX barrier gate is gone and the normal TX loop runs unconditionally.
-    while let Some((dst, len, origin)) = self.poll_one_transmit(now, scratch) {
+    while let Some((transmit, origin)) = self.poll_one_transmit(now, scratch) {
+      let (dst, len) = (transmit.dst(), transmit.size());
       if dst == MDNS_SOCKET_V4 || dst == MDNS_SOCKET_V6 {
         // Multicast: fan out to BOTH groups and confirm synchronously this pump
         // (honors the proto's confirm-on-send contract). `fanout` carries the
@@ -926,8 +927,11 @@ where
           MulticastOutcome::Confirm(outcome) => {
             // The driver's bounded obligation policy runs between the fan-out and
             // the confirm: it may EXCUSE a family that keeps missing, which is the
-            // only way a repeated partial ever stops re-arming.
-            let outcome = self.bound_partial_delivery(origin, outcome);
+            // only way a repeated partial ever stops re-arming. It applies only to
+            // a SUSTAINED datagram — a multicast response (§6, or the RFC 6763 §9
+            // meta reply) is one-shot, so its outcome passes through verbatim and
+            // never touches the counter.
+            let outcome = self.bound_partial_delivery(origin, transmit.obligation(), outcome);
             self.note_transmit_outcome(origin, now, outcome);
           }
           // Permanently undeliverable (too large for every reachable socket): retire
@@ -951,6 +955,13 @@ where
         // construction and can never be partial. An absent socket
         // (`Unsupported`) is an EMPTY obligated set, which is NoneDelivered too —
         // never a vacuous "all".
+        //
+        // The bounded obligation policy is deliberately NOT applied: a legacy
+        // reply is `TransmitObligation::OneShot`, and an AllDelivered-by-
+        // construction confirm fed into the counter would reset it, so a stream of
+        // replies would hold it at zero and the bound would never fire for the
+        // sustained lifecycle sends interleaved with them.
+        debug_assert_eq!(transmit.obligation(), TransmitObligation::OneShot);
         let outcome = if result.is_ok() {
           TransmitOutcome::AllDelivered
         } else {
@@ -1178,6 +1189,22 @@ where
         .and_then(|slot| slot.proto.poll())
       {
         if let ServiceUpdate::Renamed(ref renamed) = update {
+          // A rename restarts the whole §8.1/§8.3 lifecycle under a new name, so
+          // the partial-round evidence collected under the old one goes with it.
+          // This mirrors the core, which zeroes its own §8.3 partial-announce
+          // ladder on a rename (`reset_advertised_name_state`), and the
+          // conservatism is cheap: the worst case is ~750 ms of extra probing
+          // before the bound can excuse a family again.
+          //
+          // KNOWN RESIDUAL — the RFC 6763 §9 same-name revert-to-probe emits NO
+          // `ServiceUpdate` and is unobservable from here, so a revert can inherit
+          // up to `MAX_PARTIAL_ROUNDS` rounds. Accepted: the ladder's rungs are
+          // 1 s / 2 s, so that evidence is at most seconds old, and the conflict
+          // that triggered the revert was detected by RECEIVING a packet — the
+          // inherited rounds describe the same live families.
+          if let Some(slot) = self.services.get_mut(&handle) {
+            slot.partial_rounds = 0;
+          }
           let new_name = renamed.new_name().clone();
           let rename_result = self.endpoint.handle_service_renamed(handle, new_name);
           // The §9 rename of an announced service hands its OLD-name TTL=0 goodbye
@@ -1278,11 +1305,11 @@ where
   /// Extract one outgoing datagram into `scratch`: services first, then
   /// queries. Skips errored state machines. Returns `None` when nothing is
   /// pending.
-  fn poll_one_transmit(
-    &mut self,
-    now: I,
-    scratch: &mut [u8],
-  ) -> Option<(SocketAddr, usize, Origin)> {
+  /// The whole [`Transmit`] is returned rather than just its destination and
+  /// length because [`Transmit::obligation`] must survive to the confirm: it
+  /// decides whether this driver's bounded obligation policy applies at all (see
+  /// [`Self::bound_partial_delivery`]).
+  fn poll_one_transmit(&mut self, now: I, scratch: &mut [u8]) -> Option<(Transmit, Origin)> {
     // Cap every encoded multicast at the RFC 6762 §17 ceiling, so the normal
     // transmit path never emits a datagram larger than the goodbye encode scratch
     // can later withdraw. A record set that would exceed MAX_MDNS_MESSAGE
@@ -1309,7 +1336,7 @@ where
         }
         match slot.proto.poll_transmit(now, scratch) {
           Ok(Some(transmit)) => {
-            return Some((transmit.dst(), transmit.size(), Origin::Service(handle)));
+            return Some((transmit, Origin::Service(handle)));
           }
           Ok(None) => false,
           Err(_) => {
@@ -1350,7 +1377,7 @@ where
       }
       match self.endpoint.poll_query_transmit(handle, now, scratch) {
         Ok(Some(transmit)) => {
-          return Some((transmit.dst(), transmit.size(), Origin::Query(handle)));
+          return Some((transmit, Origin::Query(handle)));
         }
         Ok(None) => {}
         Err(_) => {
@@ -1384,11 +1411,37 @@ where
   /// link was served, so no obligation was met and none may be written off. This
   /// mirrors the core, which likewise neither uses nor advances its §8.3 partial
   /// ladder on a round that reached no wire.
+  ///
+  /// # Only sustained obligations are counted
+  ///
+  /// A [`TransmitObligation::OneShot`] datagram — every response: the §6
+  /// multicast reply, the §6.7 legacy unicast reply, the RFC 6763 §9 meta reply —
+  /// passes through VERBATIM, touching neither the counter nor the outcome. The
+  /// counter tracks how long a family has been holding a re-armed lifecycle
+  /// datagram hostage, and a response is never re-armed, so mixing responses in
+  /// corrupts it in both directions:
+  ///
+  /// * a legacy unicast reply has ONE obligated family, so it is `AllDelivered` by
+  ///   construction and would RESET the counter — alternating partial lifecycle
+  ///   sends with unicast replies would hold it at zero and the bound would never
+  ///   fire, pinning the service on a chronically half-broken family;
+  /// * a partial multicast response would PRELOAD the counter, so the next partial
+  ///   probe would be excused and the RFC 6762 §8.1 sequence would advance although
+  ///   one family never heard the probe — the exact violation this contract exists
+  ///   to remove.
+  ///
+  /// Passing the outcome through unchanged (rather than dropping the confirm) is
+  /// required: the core still reads `any_delivered` from a response confirm to
+  /// latch §10.1 goodbye ownership for the records it put on the wire.
   fn bound_partial_delivery(
     &mut self,
     origin: Origin,
+    obligation: TransmitObligation,
     outcome: TransmitOutcome,
   ) -> TransmitOutcome {
+    if matches!(obligation, TransmitObligation::OneShot) {
+      return outcome;
+    }
     let rounds = match origin {
       Origin::Service(handle) => self
         .services
@@ -1448,12 +1501,13 @@ where
             // reply, which has one obligated link and is therefore all-delivered
             // by construction) would cancel a renamed-away name's goodbye that
             // the unserved family still needs. `FullyAnnounced` has no public
-            // constructor precisely so that substitution cannot compile.
+            // constructor precisely so that substitution cannot compile, and it
+            // names the service it was minted from, so it cannot be applied to a
+            // different one either.
             self.endpoint.note_service_announced(
-              handle,
+              slot.proto.has_fully_announced(),
               slot.proto.advertised_a_addrs(),
               slot.proto.advertised_aaaa_addrs(),
-              slot.proto.has_fully_announced(),
             );
           }
         }

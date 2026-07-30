@@ -13,8 +13,8 @@ use agnostic_net::{Net, UdpSocket};
 use async_channel::Sender;
 use futures::{FutureExt, pin_mut, select_biased};
 use mdns_proto::{
-  QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate, TransmitOutcome,
-  endpoint::WithdrawalSend, event::RouteEvent,
+  QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate, TransmitObligation,
+  TransmitOutcome, endpoint::WithdrawalSend, event::RouteEvent,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -596,6 +596,21 @@ impl<N: Net> DriverState<N> {
           // records — we cannot safely keep it. Emit Conflict, then remove.
           let final_upd = match upd {
             ServiceUpdate::Renamed(ref renamed) => {
+              // A rename restarts the whole §8.1/§8.3 lifecycle under a new name,
+              // so the partial-round evidence collected under the old one goes
+              // with it. This mirrors the core, which zeroes its own §8.3
+              // partial-announce ladder on a rename
+              // (`reset_advertised_name_state`), and the conservatism is cheap:
+              // the worst case is ~750 ms of extra probing before the bound can
+              // excuse a family again.
+              //
+              // KNOWN RESIDUAL — the RFC 6763 §9 same-name revert-to-probe emits
+              // NO `ServiceUpdate` and is unobservable from here, so a revert can
+              // inherit up to `MAX_PARTIAL_ROUNDS` rounds. Accepted: the ladder's
+              // rungs are 1 s / 2 s, so that evidence is at most seconds old, and
+              // the conflict that triggered the revert was detected by RECEIVING a
+              // packet — the inherited rounds describe the same live links.
+              ctx.partial_rounds = 0;
               let rename_result =
                 endpoint.handle_service_renamed(*handle, renamed.new_name().clone());
               // The §9 rename of an announced service hands its OLD-name TTL=0
@@ -869,8 +884,12 @@ impl<N: Net> DriverState<N> {
         // `StdInstant::now()` anchors any scheduled deadline to post-send time
         // (a long `send_via` await would put a pre-send deadline in the past).
         if let Some(ctx) = services.get_mut(&h) {
-          let outcome = bound_partial_delivery(&mut ctx.partial_rounds, fanout.transmit_outcome());
-          confirm_service_transmit(endpoint, ctx, h, StdInstant::now(), outcome);
+          let outcome = bound_partial_delivery(
+            &mut ctx.partial_rounds,
+            tx.obligation(),
+            fanout.transmit_outcome(),
+          );
+          confirm_service_transmit(endpoint, ctx, StdInstant::now(), outcome);
         }
         credits_remaining = credits_remaining.saturating_sub(fanout.sent_count());
       }
@@ -992,7 +1011,11 @@ impl<N: Net> DriverState<N> {
         // can await longer than the backoff interval, so the pre-send `now`
         // would schedule a deadline already in the past.
         let outcome = match queries.get_mut(&h) {
-          Some(ctx) => bound_partial_delivery(&mut ctx.partial_rounds, fanout.transmit_outcome()),
+          Some(ctx) => bound_partial_delivery(
+            &mut ctx.partial_rounds,
+            tx.obligation(),
+            fanout.transmit_outcome(),
+          ),
           None => fanout.transmit_outcome(),
         };
         endpoint.note_query_transmit_outcome(h, StdInstant::now(), outcome);
@@ -1631,7 +1654,36 @@ impl Fanout {
 /// mirrors the core, which likewise neither uses nor advances its §8.3 partial
 /// ladder on a round that reached no wire; resetting here would let an
 /// alternating partial/failed pattern evade the bound forever.
-fn bound_partial_delivery(rounds: &mut u8, outcome: TransmitOutcome) -> TransmitOutcome {
+///
+/// # Only sustained obligations are counted
+///
+/// A [`TransmitObligation::OneShot`] datagram — every response: the §6 multicast
+/// reply, the §6.7 legacy unicast reply, the RFC 6763 §9 meta reply — passes
+/// through VERBATIM, touching neither the counter nor the outcome. The counter
+/// tracks how long a link has been holding a re-armed lifecycle datagram
+/// hostage, and a response is never re-armed, so mixing responses in corrupts it
+/// in both directions:
+///
+/// * a legacy unicast reply has ONE obligated family, so it is `AllDelivered` by
+///   construction and would RESET the counter — alternating partial lifecycle
+///   sends with unicast replies would hold it at zero and the bound would never
+///   fire, pinning the service on a chronically half-broken link;
+/// * a partial multicast response would PRELOAD the counter, so the next partial
+///   probe would be excused and the RFC 6762 §8.1 sequence would advance although
+///   one family never heard the probe — the exact violation this contract exists
+///   to remove.
+///
+/// Passing the outcome through unchanged (rather than dropping the confirm) is
+/// required: the core still reads `any_delivered` from a response confirm to
+/// latch §10.1 goodbye ownership for the records it put on the wire.
+fn bound_partial_delivery(
+  rounds: &mut u8,
+  obligation: TransmitObligation,
+  outcome: TransmitOutcome,
+) -> TransmitOutcome {
+  if matches!(obligation, TransmitObligation::OneShot) {
+    return outcome;
+  }
   match outcome {
     TransmitOutcome::PartiallyDelivered if *rounds >= MAX_PARTIAL_ROUNDS => {
       *rounds = 0;
@@ -1661,31 +1713,30 @@ fn bound_partial_delivery(rounds: &mut u8, outcome: TransmitOutcome) -> Transmit
 /// configured addresses. That set grows exactly when ownership latches — on any
 /// delivery — so a round that reached no wire has nothing to mirror.
 ///
-/// The fourth argument is the reclaim-cancel gate, and it is the ALL-delivered
-/// announcement fact the CORE computes, ferried verbatim. It is emphatically NOT
+/// The reclaim-cancel gate is the ALL-delivered announcement fact the CORE
+/// computes, ferried verbatim. It is emphatically NOT
 /// `Service::advertises_instance()`: that latch fires on any delivery by any
 /// transmit kind, so a v4-only announcement — or an RFC 6762 §6.7 legacy unicast
 /// reply, which has one obligated link and is therefore all-delivered by
 /// construction — would cancel a renamed-away name's goodbye that the unserved
 /// family still needs. `FullyAnnounced` has no public constructor precisely so
-/// that substitution cannot compile.
+/// that substitution cannot compile, and it names the service it was minted from,
+/// so it cannot be applied to a different one either.
 ///
 /// `endpoint` and `ctx` are disjoint fields of `DriverState`, so the split borrow
 /// this signature requires is sound at every call site.
 fn confirm_service_transmit(
   endpoint: &mut ProtoEndpoint,
   ctx: &mut ServiceCtx,
-  handle: ServiceHandle,
   now: StdInstant,
   outcome: TransmitOutcome,
 ) {
   ctx.proto.note_transmit_outcome(now, outcome);
   if outcome.any_delivered() {
     endpoint.note_service_announced(
-      handle,
+      ctx.proto.has_fully_announced(),
       ctx.proto.advertised_a_addrs(),
       ctx.proto.advertised_aaaa_addrs(),
-      ctx.proto.has_fully_announced(),
     );
   }
 }

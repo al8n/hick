@@ -2801,3 +2801,142 @@ fn send_too_large_retirement_frees_proto_route_and_decrements_services_active() 
     "services_active must be 1 again after re-registration"
   );
 }
+
+// ── The obligation tag (`TransmitObligation`) at the driver seam ────────────
+
+/// Deliver `data` to the engine as an on-link datagram from `src` addressed to
+/// the IPv4 mDNS group.
+fn inbound_from(src: SocketAddr, data: Vec<u8>) -> (Vec<u8>, RecvMeta) {
+  (
+    data,
+    RecvMeta {
+      src,
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
+      len: 0,
+    },
+  )
+}
+
+/// Partially-delivered multicast RESPONSES must not preload the partial-round
+/// budget, or the next partial LIFECYCLE datagram is excused and its phase
+/// advances although one family never heard it — the RFC 6762 §8.1/§8.3
+/// violation the `TransmitOutcome` contract exists to remove, reintroduced
+/// through the back door.
+///
+/// A response is `TransmitObligation::OneShot`: the core never re-arms it, so a
+/// family that missed one is holding nothing hostage and the round is no
+/// evidence for a write-off.
+#[test]
+fn partial_multicast_responses_do_not_preload_the_bounded_partial_policy() {
+  let mut engine: TestEngine = Engine::new(
+    EndpointConfig::new().with_probe_unique_names(false),
+    StdRng::seed_from_u64(311),
+  );
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+
+  // A clean first announcement on both families, so the budget starts at zero
+  // and the next announcement is a full §8.3 interval (1 s) away.
+  engine.pump(at(0), &mut io, &mut scratch);
+  assert_eq!(
+    service_state(&engine, handle),
+    ServiceState::Announcing(1),
+    "the first announcement must have been fully delivered"
+  );
+  assert_eq!(engine.services[&handle].partial_rounds, 0);
+
+  // From here IPv6 accepts nothing, so every fan-out is partial.
+  io.v6_fail = Some(SendError::Busy);
+  let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 5353));
+  let qname = Name::try_from_str("_ipp._tcp.local.").unwrap();
+
+  let mut t = 0i64;
+  for round in 1..=u32::from(MAX_PARTIAL_ROUNDS) {
+    t += 100_000;
+    io.inbound
+      .push_back(inbound_from(querier, build_ptr_query(&qname)));
+    engine.pump(at(t), &mut io, &mut scratch); // arms the §6 20–120 ms jitter
+    t += 200_000;
+    engine.pump(at(t), &mut io, &mut scratch); // fires the response, partially
+    assert_eq!(
+      engine.services[&handle].partial_rounds, 0,
+      "round {round}: a response is never re-armed, so a partial one is no \
+       evidence that a family is holding a lifecycle datagram hostage"
+    );
+  }
+  assert!(
+    engine.services[&handle].proto.advertises_instance(),
+    "the responses still reached v4's wire, so §10.1 ownership stays latched — \
+     skipping the bound must not skip the core confirm"
+  );
+
+  // The next partial ANNOUNCEMENT must therefore be reported honestly.
+  engine.pump(at(1_500_000), &mut io, &mut scratch);
+  assert_eq!(
+    service_state(&engine, handle),
+    ServiceState::Announcing(1),
+    "with the responses counted this announcement would be the budget-exhausting \
+     round, excusing the family that has been told nothing and advancing §8.3"
+  );
+  assert_eq!(engine.services[&handle].partial_rounds, 1);
+}
+
+/// A rename restarts the lifecycle under a new name, so the partial-round
+/// evidence gathered under the old one is dropped with it — mirroring the core,
+/// which zeroes its own §8.3 partial-announce ladder on a rename.
+#[test]
+fn a_rename_clears_the_partial_round_evidence() {
+  use mdns_proto::wire::{Header, MessageBuilder};
+
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(312));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp {
+    v6_fail: Some(SendError::Busy),
+    ..Default::default()
+  };
+  let mut scratch = [0u8; 1500];
+
+  // Spend one partial round, so there IS evidence for the rename to clear.
+  let mut t = pump_to_next_round(&mut engine, &mut io, &mut scratch, 0);
+  assert_eq!(
+    engine.services[&handle].partial_rounds, 1,
+    "a partially-delivered probe must have been counted"
+  );
+
+  // A rival SRV authority for the same instance name with LARGER rdata: we lose
+  // the §8.2 tiebreak and rename away.
+  let inst = Name::try_from_str("Test._ipp._tcp.local.").unwrap();
+  let mut cbuf = [0u8; 512];
+  let conflict = {
+    let target = Name::try_from_str("rival-host.local.").unwrap();
+    let mut b: MessageBuilder<'_, 0> = MessageBuilder::try_new(&mut cbuf, Header::new()).unwrap();
+    b.push_srv_authority(&inst, 120, 0, 0, 9999, &target)
+      .unwrap();
+    let n = b.finish().unwrap();
+    cbuf[..n].to_vec()
+  };
+  let peer = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353));
+  t += 10_000;
+  io.inbound.push_back(inbound_from(peer, conflict));
+  engine.pump(at(t), &mut io, &mut scratch);
+  assert!(
+    engine.services[&handle].partial_rounds > 0,
+    "the conflict must not have cleared the evidence on its own"
+  );
+
+  // The next pump fires the §8.2 tiebreak, and the rename hook clears the budget
+  // in the very same pump (the drain runs before any new transmit).
+  t += 300_000;
+  engine.pump(at(t), &mut io, &mut scratch);
+  assert_ne!(
+    engine.services[&handle].proto.name().as_str(),
+    inst.as_str(),
+    "the service must have lost the tiebreak and renamed"
+  );
+  assert_eq!(
+    engine.services[&handle].partial_rounds, 0,
+    "observing `Renamed` must clear the evidence gathered under the old name"
+  );
+}

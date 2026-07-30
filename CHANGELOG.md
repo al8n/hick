@@ -27,14 +27,25 @@ BREAKING
   single bool could never carry independently, and exactly where the removed
   boolean API was unsound for a dual-stack send.
 - `mdns-proto`: new `FullyAnnounced` newtype (opaque; no public constructor)
-  replaces the raw `bool` 4th parameter of the reclaim-cancel confirm, which is
+  replaces the raw `bool` parameter of the reclaim-cancel confirm, which is
   renamed `Endpoint::note_service_announced` (from `note_service_advertised`,
   removed). The old bool's meaning had drifted to "the all-delivered
   announcement fact," but nothing stopped a driver from passing the
   any-delivered exposure latch (`Service::advertises_instance()`) instead —
   which every released driver did, until this release (see FIXES).
   `FullyAnnounced` has no public constructor, so that substitution no longer
-  compiles.
+  compiles. The token also carries the `ServiceHandle` it was minted from and
+  `note_service_announced` takes no separate handle, so one service's proof
+  cannot be applied to another (which would cancel that other name's goodbye
+  while an obligated family still needed it).
+- `mdns-proto`: new `TransmitObligation` enum (`Sustained` / `OneShot`), carried
+  on every `Transmit` and readable via `Transmit::obligation()`;
+  `Transmit::new` takes it as a fourth argument. It states whether the core will
+  re-arm that datagram until every obligated link accepts it, and a driver's
+  bounded obligation policy applies to `Sustained` datagrams only. The tag is a
+  function of what was encoded, not of the service's lifecycle phase: the
+  periodic `Established` re-announce advances no phase yet is still re-armed on
+  the §8.3 ladder, and `Query::poll_transmit` has no service phase at all.
 - A driver capable of reporting `PartiallyDelivered` **must** implement a
   bounded obligation policy (write-off / degradation of the missing family) —
   normative on `TransmitOutcome`'s rustdoc. All four drivers in this workspace
@@ -64,6 +75,23 @@ caller's part)
   advances anyway. A permanently half-reachable link now still reaches
   `Established` (at roughly 3x the round count) instead of pinning in probing
   forever.
+- All four drivers: the bounded-obligation counter now sees lifecycle datagrams
+  only. Responses (the §6 multicast reply, the §6.7 legacy unicast reply, the
+  RFC 6763 §9 meta reply) are never re-armed, so feeding their confirms to the
+  counter corrupted it in both directions: a unicast reply has one obligated
+  family and is all-delivered by construction, so it RESET the counter — a
+  service answering legacy queriers between lifecycle rounds held it at zero and
+  the bound never fired, pinning the service on a chronically half-broken link;
+  and a partially-delivered multicast response PRELOADED it, so the next partial
+  probe was excused and §8.1 advanced although one family never heard the probe.
+  Drivers also clear the counter when they observe `ServiceUpdate::Renamed`,
+  mirroring the core's own rename reset of its §8.3 partial-announce ladder.
+- `hick-smoltcp` / `hick-embassy`: a PRESENT but unbound (or unaddressable) UDP
+  socket is now `SendError::Busy`, not `SendError::Unsupported`. `Unsupported`
+  removes a family from the obligated set, so a bound-IPv4 + present-but-unbound
+  -IPv6 fan-out projected to `AllDelivered` and advanced §8.1 probing as though
+  the node had no IPv6 at all. It now projects to `PartiallyDelivered` and the
+  family is retried.
 - `hick-reactor` / `hick-compio` only: RFC 6762 §6.7 legacy unicast replies no
   longer record a self-send credit. A unicast reply never loops back to its
   sender, so the credit could never be consumed; under a legacy-query flood
