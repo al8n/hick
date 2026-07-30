@@ -1,5 +1,5 @@
-//! Event types flowing between [`Endpoint`](crate::Endpoint),
-//! [`Service`](crate::Service), and [`Query`](crate::Query).
+//! Event types flowing between [`Endpoint`],
+//! [`Service`], and [`Query`].
 
 use core::net::SocketAddr;
 
