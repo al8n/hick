@@ -706,7 +706,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
   );
   // the retry is scheduled on a CONFIRMED delivery, not at encode
   // time. Confirm the send.
-  q.note_transmit_result(now, true);
+  q.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
 
   // The driver now sleeps until poll_timeout. It must be exactly now + 1s —
   // not now — so the loop does not immediately re-fire at now.
@@ -737,7 +737,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
     q.poll_transmit(one_sec, &mut buf).unwrap().is_some(),
     "first retry must be sent at now + 1s"
   );
-  q.note_transmit_result(one_sec, true);
+  q.note_transmit_outcome(one_sec, TransmitOutcome::AllDelivered);
   let three_sec = now.checked_add(Duration::from_secs(3)).unwrap();
   assert_eq!(
     q.poll_timeout(),
@@ -775,7 +775,7 @@ fn failed_send_does_not_consume_retry_budget() {
   for _ in 0..50 {
     let sent = q.poll_transmit(t, &mut buf).unwrap().is_some();
     assert!(sent, "query must keep attempting to send while undelivered");
-    q.note_transmit_result(t, false); // all sockets failed
+    q.note_transmit_outcome(t, TransmitOutcome::NoneDelivered); // all sockets failed
     assert!(!q.is_done(), "an undelivered query must NOT time out");
     // Advance to the re-attempt deadline and fire it.
     let due = q.poll_timeout().expect("a re-attempt must be scheduled");
@@ -790,7 +790,7 @@ fn failed_send_does_not_consume_retry_budget() {
   // Now let a send succeed: the budget finally advances and normal backoff
   // resumes (first confirmed retry at +1s).
   assert!(q.poll_transmit(t, &mut buf).unwrap().is_some());
-  q.note_transmit_result(t, true);
+  q.note_transmit_outcome(t, TransmitOutcome::AllDelivered);
   let plus_1s = t.checked_add(Duration::from_secs(1)).unwrap();
   assert_eq!(
     q.poll_timeout(),
@@ -800,7 +800,7 @@ fn failed_send_does_not_consume_retry_budget() {
 }
 
 /// the retry backoff is anchored to the time passed to
-/// `note_transmit_result` (post-send), not the `poll_transmit` time — a send
+/// `note_transmit_outcome` (post-send), not the `poll_transmit` time — a send
 /// that takes longer than the backoff interval must not yield a past deadline.
 #[test]
 fn query_retry_anchored_to_confirmation_time() {
@@ -823,7 +823,7 @@ fn query_retry_anchored_to_confirmation_time() {
 
   // The send completes 5 s later — longer than the 1 s first backoff.
   let send_done = t0.checked_add(Duration::from_secs(5)).unwrap();
-  q.note_transmit_result(send_done, true);
+  q.note_transmit_outcome(send_done, TransmitOutcome::AllDelivered);
 
   // The next retry is 1 s AFTER the confirmed-send time, not after t0.
   assert_eq!(
@@ -971,10 +971,10 @@ fn retire_is_idempotent() {
 }
 
 #[test]
-fn note_transmit_result_without_a_pending_send_is_noop() {
+fn note_transmit_outcome_without_a_pending_send_is_noop() {
   let mut q = make_query(ResourceType::Any, ResourceClass::Any);
   // No poll_transmit happened → awaiting_send_confirm is false → no-op.
-  q.note_transmit_result(StdInstant::now(), true);
+  q.note_transmit_outcome(StdInstant::now(), TransmitOutcome::AllDelivered);
   assert_eq!(
     q.retry_count, 0,
     "a result with no in-flight send must not advance the retry budget"
@@ -999,7 +999,7 @@ fn retry_budget_exhaustion_retires_the_query() {
     now += std::time::Duration::from_secs(120); // past the 60s backoff cap
     q.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = q.poll_transmit(now, &mut buf) {
-      q.note_transmit_result(now, true); // confirmed send burns one retry slot
+      q.note_transmit_outcome(now, TransmitOutcome::AllDelivered); // confirmed send burns one retry slot
     }
     if q.is_done() {
       retired = true;

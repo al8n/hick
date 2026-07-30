@@ -65,7 +65,7 @@ where
         subtypes: spec.records().subtype_names().to_vec(),
         // EMPTY at registration: a service has CONFIRMED-ADVERTISED nothing
         // until its first announce is delivered (then mirrored in here via
-        // `note_service_advertised`).
+        // `note_service_announced`).
         #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
         advertised_a: std::vec::Vec::new(),
         #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
@@ -77,7 +77,7 @@ where
     // NOTE: a reclaimable detached old-name goodbye for this instance name is NOT
     // cancelled here. Registration only RESERVES the name; the reclaiming service
     // probes (~750 ms, RFC 6762 §8.1) before it advertises. The reclaim-cancel now
-    // fires on the CERTAIN live event — `note_service_advertised`, when this service
+    // fires on the CERTAIN live event — `note_service_announced`, when this service
     // confirms it is announcing the name — not at register time, because the
     // reactor only async-commits a registration across its reply boundary and
     // cancelling here could lose the goodbye when the caller drops the registration
@@ -247,7 +247,7 @@ where
     // conflict/rename away again before announcing. Cancelling now would lose the old
     // records' retraction if it never announces (the same premature-cancel class as
     //). The cancel instead fires on the certain live event —
-    // `note_service_advertised` gated on `Service::has_fully_announced`, when the
+    // `note_service_announced` gated on `Service::has_fully_announced`, when the
     // renamed service has announced this name on every obligated link. The rename is
     // still NOT rejected for a reclaimable name: a detached item holds no route, so
     // the duplicate-name scan above does not see it, and reuse proceeds.

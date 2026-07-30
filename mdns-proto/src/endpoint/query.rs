@@ -225,24 +225,6 @@ where
     }
   }
 
-  /// Boolean form of [`Self::note_query_transmit_outcome`], retained for the
-  /// migration to [`TransmitOutcome`] and scheduled for removal.
-  ///
-  /// `delivered = true` maps to [`TransmitOutcome::AllDelivered`] and `false` to
-  /// [`TransmitOutcome::NoneDelivered`]; a dual-stack driver has no truthful
-  /// value to pass for a half-delivered question.
-  pub fn note_query_transmit_result(&mut self, handle: QueryHandle, now: I, delivered: bool) {
-    self.note_query_transmit_outcome(
-      handle,
-      now,
-      if delivered {
-        TransmitOutcome::AllDelivered
-      } else {
-        TransmitOutcome::NoneDelivered
-      },
-    );
-  }
-
   /// Drive timer-based transitions on a registered query.
   ///
   /// Callers wake from [`Self::poll_query_timeout`] and invoke this with

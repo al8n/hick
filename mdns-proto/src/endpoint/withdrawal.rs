@@ -483,29 +483,6 @@ where
       }
     }
 
-    /// Boolean form of [`Self::note_service_announced`], retained for the
-    /// migration to [`FullyAnnounced`] and scheduled for removal alongside the
-    /// boolean confirm methods.
-    ///
-    /// Unlike those methods, deleting this one is the ONLY thing that will force
-    /// its call sites to be revisited: the parameter kept its arity and type while
-    /// its MEANING changed from the any-delivered exposure latch
-    /// ([`Service::advertises_instance`]) to the all-delivered announcement fact
-    /// ([`Service::has_fully_announced`]), so a driver that was never updated
-    /// still compiles and still cancels goodbyes it must not.
-    ///
-    /// [`Service::has_fully_announced`]: crate::service::Service::has_fully_announced
-    /// [`Service::advertises_instance`]: crate::service::Service::advertises_instance
-    pub fn note_service_advertised(
-      &mut self,
-      handle: ServiceHandle,
-      a: &[Ipv4Addr],
-      aaaa: &[Ipv6Addr],
-      fully_announced: bool,
-    ) {
-      self.note_service_announced(handle, a, aaaa, FullyAnnounced::new(fully_announced));
-    }
-
     /// Host addresses that a LIVE same-host SIBLING route (any non-withdrawing
     /// route other than `handle`'s) still ADVERTISES — these must be RETAINED (not
     /// withdrawn) by `handle`'s goodbye, since another live service still owns

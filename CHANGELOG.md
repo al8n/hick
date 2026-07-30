@@ -1,5 +1,80 @@
 # RELEASED
 
+## Dual-stack partial delivery (`TransmitOutcome`) (July 30th, 2026)
+
+Published crates: `mdns-proto` 0.4.0, `hick` 0.3.0, `hick-reactor` 0.3.0,
+`hick-compio` 0.3.0, `hick-smoltcp` 0.3.0, `hick-embassy` 0.3.0.
+
+`mdns-proto`'s confirm APIs took a single boolean doing two jobs — advancing
+the RFC 6762 lifecycle phase (§8.1 probing / §8.3 announcing, plus the §5.2
+query retry budget) and latching §10.1 TTL=0 goodbye ownership — which is
+unsound the moment a dual-stack multicast transmit succeeds on one address
+family and fails on the other: there is no truthful bool to pass. This release
+replaces the boolean with a lossless three-way outcome and fixes the resulting
+conformance and stranding defects in every released async driver.
+
+BREAKING
+
+- `mdns-proto`: new `TransmitOutcome` enum (`AllDelivered` / `PartiallyDelivered`
+  / `NoneDelivered`) reports the shape of a multicast fan-out instead of
+  collapsing it to one bool. `Service::note_transmit_outcome` /
+  `Query::note_transmit_outcome` / `Endpoint::note_query_transmit_outcome` are
+  now the sole confirm entry points; the boolean shims they were added
+  alongside — `note_transmit_result` (on both `Service` and `Query`) and
+  `Endpoint::note_query_transmit_result` — are removed. Lifecycle phase and the
+  query retry budget now advance only on `TransmitOutcome::all_delivered()`;
+  goodbye ownership latches on the weaker `any_delivered()` — the two facts a
+  single bool could never carry independently, and exactly where the removed
+  boolean API was unsound for a dual-stack send.
+- `mdns-proto`: new `FullyAnnounced` newtype (opaque; no public constructor)
+  replaces the raw `bool` 4th parameter of the reclaim-cancel confirm, which is
+  renamed `Endpoint::note_service_announced` (from `note_service_advertised`,
+  removed). The old bool's meaning had drifted to "the all-delivered
+  announcement fact," but nothing stopped a driver from passing the
+  any-delivered exposure latch (`Service::advertises_instance()`) instead —
+  which every released driver did, until this release (see FIXES).
+  `FullyAnnounced` has no public constructor, so that substitution no longer
+  compiles.
+- A driver capable of reporting `PartiallyDelivered` **must** implement a
+  bounded obligation policy (write-off / degradation of the missing family) —
+  normative on `TransmitOutcome`'s rustdoc. All four drivers in this workspace
+  ship one (see FIXES).
+
+FIXES (dependent-crate behaviour; visible without any source change on the
+caller's part)
+
+- All four drivers (`hick-reactor`, `hick-compio`, `hick-smoltcp`,
+  `hick-embassy`): a partially-delivered dual-stack transmit no longer advances
+  the §8.1 probe sequence or the §8.3 announce phase, and no longer burns a
+  §5.2 query retry. Previously any single successful socket send (e.g. IPv4
+  only) advanced the lifecycle even though the other family was never probed —
+  an RFC 6762 §8.1 conformance defect. A service on a host where one family is
+  unreachable now takes longer to establish instead of establishing a name it
+  never defended on that family.
+- All four drivers: the reclaim-cancel gate is now the all-delivered
+  announcement fact, not any single delivery. A replacement service reclaiming
+  a renamed-away name no longer cancels that name's still-draining TTL=0
+  goodbye until it has announced on every family the driver still obligates —
+  previously a single-family announcement, or even an RFC 6762 §6.7 legacy
+  unicast reply, could cancel it. Fixes stranded peers on the unserved family
+  holding withdrawn records until positive TTL.
+- All four drivers: new bounded-obligation policy — after two consecutive
+  partially-delivered fan-outs for the same service or query, the third
+  excuses the still-missing families for that one confirm so the phase
+  advances anyway. A permanently half-reachable link now still reaches
+  `Established` (at roughly 3x the round count) instead of pinning in probing
+  forever.
+- `hick-reactor` / `hick-compio` only: RFC 6762 §6.7 legacy unicast replies no
+  longer record a self-send credit. A unicast reply never loops back to its
+  sender, so the credit could never be consumed; under a legacy-query flood
+  the 65,536-entry tracker filled with dead entries and began refusing genuine
+  multicast credits, causing the responder to ingest its own loopback as peer
+  traffic.
+
+The dependent crates (`hick`, `hick-reactor`, `hick-compio`, `hick-smoltcp`,
+`hick-embassy`) bump to 0.3.0 to track the `mdns-proto` 0.4 public dependency;
+`hick-udp` and `hick-trace` are unaffected.
+
 ## Drop the `heapless` tier (June 8th, 2026)
 
 Published crates: `mdns-proto` 0.3.0, `hick` 0.2.0, `hick-reactor` 0.2.0,

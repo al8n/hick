@@ -74,10 +74,10 @@ fn handle_rejects_a_malformed_packet_with_a_parse_error() {
 }
 
 #[test]
-fn note_service_advertised_is_a_noop_for_an_unknown_handle() {
+fn note_service_announced_is_a_noop_for_an_unknown_handle() {
   let mut e = build_endpoint();
   // No registered service → the route lookup misses and the call returns early.
-  e.note_service_advertised(ServiceHandle::from_raw(0xDEAD), &[], &[], false);
+  e.note_service_announced(ServiceHandle::from_raw(0xDEAD), &[], &[], FullyAnnounced::new(false));
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn query_delegation_tolerates_unknown_handles() {
     e.poll_query_transmit(bogus, now, &mut buf),
     Ok(None)
   ));
-  e.note_query_transmit_result(bogus, now, true); // no-op on an unknown handle
+  e.note_query_transmit_outcome(bogus, now, TransmitOutcome::AllDelivered); // no-op on an unknown handle
   assert!(e.handle_query_timeout(bogus, now).is_ok());
 }
 
@@ -1144,7 +1144,7 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
   // (next_deadline ≈ now+1s) with transmit_pending cleared.
   let mut buf = [0u8; 512];
   assert!(e.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
-  e.note_query_transmit_result(h, now, true);
+  e.note_query_transmit_outcome(h, now, TransmitOutcome::AllDelivered);
   let t1 = e
     .poll_query_timeout(h)
     .expect("a retransmit must be scheduled");
@@ -3394,7 +3394,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
     tx.is_some(),
     "newly-started query must have an initial transmit pending"
   );
-  // Do NOT call note_query_transmit_result — leave the query awaiting confirm.
+  // Do NOT call note_query_transmit_outcome — leave the query awaiting confirm.
   // Now feed the peer question: note_duplicate_question → returns false → no bump.
   {
     let mut events = e
@@ -3410,7 +3410,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 
   // (b) Confirm the send, advance time to arm next retry, then feed the peer
   // question again → note_duplicate_question returns true → counter advances.
-  e.note_query_transmit_result(h, now, true); // confirm
+  e.note_query_transmit_outcome(h, now, TransmitOutcome::AllDelivered); // confirm
   now += Duration::from_secs(10); // past the first retry deadline (~1s)
   e.handle_query_timeout(h, now).unwrap(); // arms transmit_pending = true
 
@@ -3782,7 +3782,7 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
   // B has CONFIRMED-ADVERTISED the shared address (its announce was delivered),
   // so the route's advertised set is non-empty — otherwise retention would
   // honour nothing and A would (wrongly) withdraw the shared address.
-  ep.note_service_advertised(b_handle, &[shared], &[], true);
+  ep.note_service_announced(b_handle, &[shared], &[], FullyAnnounced::new(true));
 
   // A's withdrawal snapshot: owns PTR/SRV/TXT, the subtype PTR, and both host
   // A addresses.
@@ -3854,7 +3854,7 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
 /// (optionally) mirror an advertised set into its route, returning its handle.
 /// `advertised == None` models a registered-but-never-announced sibling (its
 /// route advertised set stays EMPTY); `Some(addrs)` mirrors a confirmed
-/// announce via `note_service_advertised`.
+/// announce via `note_service_announced`.
 fn register_host_service(
   ep: &mut TestEndp,
   instance: &str,
@@ -3879,7 +3879,7 @@ fn register_host_service(
     )
     .unwrap();
   if let Some(adv) = advertised {
-    ep.note_service_advertised(h, adv, &[], true);
+    ep.note_service_announced(h, adv, &[], FullyAnnounced::new(true));
   }
   h
 }
@@ -5020,19 +5020,26 @@ fn surviving_rename_old_name_is_reclaimable_on_announce() {
   );
 
   // The reclaiming service CONFIRMS advertising its name → cancel-on-announce.
-  ep.note_service_advertised(handle, &[Ipv4Addr::new(192, 168, 1, 10)], &[], true);
+  ep.note_service_announced(
+    handle,
+    &[Ipv4Addr::new(192, 168, 1, 10)],
+    &[],
+    FullyAnnounced::new(true),
+  );
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "the reclaimable goodbye is cancelled when the new service announces the name"
   );
 }
 
-/// cancel-on-announce must NOT fire on a PROBE. `note_service_advertised`
+/// cancel-on-announce must NOT fire on a PROBE. `note_service_announced`
 /// is called after EVERY delivered service transmit (including probes); the
-/// reclaim-cancel is gated on `advertised_instance` so a probe alone cannot cancel
-/// a renamed-away old name's goodbye before the reclaiming service has actually
-/// advertised. A service with NO host addresses still signals `advertised_instance`
-/// via its instance records, so the address args cannot serve as the guard.
+/// reclaim-cancel is gated on `Service::has_fully_announced`, which is set only
+/// by a fully-delivered §8.3 announcement — never a probe — so a probe alone
+/// cannot cancel a renamed-away old name's goodbye before the reclaiming service
+/// has actually announced. A service with NO host addresses still reaches this
+/// gate through its instance records, so the address args cannot serve as the
+/// guard.
 #[test]
 fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
   let mut ep = build_endpoint();
@@ -5064,19 +5071,19 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
     )
     .unwrap();
 
-  // A delivered PROBE reports advertised_instance=false (no instance records
+  // A delivered PROBE reports fully_announced=false (no instance records
   // emitted yet) — and ALSO an address-less shape (empty address slices). The
   // goodbye MUST survive: if the reclaiming service drops/conflicts after probing
   // but before announcing, the old records still need retracting.
-  ep.note_service_advertised(handle, &[], &[], false);
+  ep.note_service_announced(handle, &[], &[], FullyAnnounced::new(false));
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_some(),
-    "a probe (advertised_instance=false) must NOT cancel the reclaimed goodbye"
+    "a probe (fully_announced=false) must NOT cancel the reclaimed goodbye"
   );
 
-  // A CONFIRMED instance-advertise (advertised_instance=true, still address-less)
+  // A CONFIRMED instance-advertise (fully_announced=true, still address-less)
   // cancels it.
-  ep.note_service_advertised(handle, &[], &[], true);
+  ep.note_service_announced(handle, &[], &[], FullyAnnounced::new(true));
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "a confirmed instance-advertise cancels the reclaimed goodbye (even address-less)"
@@ -5783,7 +5790,7 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
 
   // The reclaiming service CONFIRMS advertising the name → cancel-on-announce
   // drops the goodbye, so no late TTL=0 goodbye can flush the new registration.
-  ep.note_service_advertised(dup_h, &[], &[], true);
+  ep.note_service_announced(dup_h, &[], &[], FullyAnnounced::new(true));
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "the detached old-name goodbye is cancelled when the reclaiming service announces"
@@ -5883,7 +5890,7 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
   );
   // When S CONFIRMS advertising its instance records under `target`,
   // cancel-on-announce drops the goodbye so no late TTL=0 send can flush S.
-  ep.note_service_advertised(s, &[], &[], true);
+  ep.note_service_announced(s, &[], &[], FullyAnnounced::new(true));
   assert!(
     ep.detached_withdrawal_owed_for(&target).is_none(),
     "the detached goodbye is cancelled once S advertises the reclaimed name"
@@ -7123,11 +7130,10 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
   );
 }
 
-/// The reclaim-cancel gate is reachable ONLY through a `FullyAnnounced` minted by
-/// `Service::has_fully_announced`. This pins the two halves of that contract that
-/// a compile-time check cannot state from inside the crate: the value round-trips
-/// its fact, and the retained boolean form is exactly the same code path (so the
-/// three drivers still on it keep their current behaviour until they migrate).
+/// The reclaim-cancel gate is reachable ONLY through a `FullyAnnounced`. This pins
+/// what a compile-time check cannot state from inside the crate: the fact round-
+/// trips whether it is ferried from `Service::has_fully_announced` or minted
+/// directly — `false` cancels nothing, `true` cancels, regardless of provenance.
 #[test]
 fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
   let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
@@ -7171,11 +7177,11 @@ fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
     "a `false` fact cancels nothing"
   );
 
-  // The retained boolean form is the same path: `true` still cancels, so the
-  // drivers that have not migrated behave exactly as before.
-  ep.note_service_advertised(handle, &[], &[], true);
+  // A directly-minted `true` fact is the same code path as one ferried from a
+  // `Service` that has actually fully announced — it cancels.
+  ep.note_service_announced(handle, &[], &[], FullyAnnounced::new(true));
   assert!(
     ep.detached_withdrawal_owed_for(&name).is_none(),
-    "the boolean shim must keep working until the drivers migrate"
+    "a `true` fact cancels the reclaimable goodbye"
   );
 }

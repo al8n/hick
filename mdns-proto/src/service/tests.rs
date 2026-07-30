@@ -503,7 +503,7 @@ fn empty_txt_encodes_as_single_zero_length_string() {
           break 'drive;
         }
       }
-      svc.note_transmit_result(now, true);
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
     }
   }
   assert_eq!(
@@ -623,7 +623,7 @@ fn advertised_host_addrs_are_the_emitted_subset_not_configured() {
 fn announce_guards_latch_only_on_confirmed_delivery() {
   // poll_transmit ENCODING an announcement must not
   // enable goodbye ownership — only a driver-confirmed delivery
-  // (note_transmit_result(.., true)) does. Otherwise an announcement that
+  // (note_transmit_outcome(.., TransmitOutcome::AllDelivered)) does. Otherwise an announcement that
   // fails to leave the host (all sockets error) could later emit a goodbye
   // that deletes a peer's same-name records.
   let mut svc = make_service(120);
@@ -645,7 +645,7 @@ fn announce_guards_latch_only_on_confirmed_delivery() {
         break 'drive;
       }
       // Confirm each probe so the lifecycle progresses to Announcing.
-      svc.note_transmit_result(now, true);
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
     }
   }
   assert!(
@@ -685,7 +685,7 @@ fn announce_phase_does_not_advance_without_confirmed_send() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_result(now, true);
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
     }
     if matches!(svc.state(), ServiceState::Announcing(0)) {
       break;
@@ -710,7 +710,7 @@ fn announce_phase_does_not_advance_without_confirmed_send() {
       svc.poll_transmit(now, &mut buf).unwrap().is_some(),
       "an announcement must be (re)emitted each cycle while unconfirmed"
     );
-    svc.note_transmit_result(now, false); // send failed — re-arm, do NOT advance
+    svc.note_transmit_outcome(now, TransmitOutcome::NoneDelivered); // send failed — re-arm, do NOT advance
     assert!(
       matches!(svc.state(), ServiceState::Announcing(0)),
       "phase must NOT advance without a confirmed send; got {:?}",
@@ -764,7 +764,7 @@ fn probe_sequence_does_not_advance_without_confirmed_send() {
       if matches!(svc.awaiting_confirm, Some(AwaitingConfirm::Probe)) {
         probes_emitted += 1;
       }
-      svc.note_transmit_result(now, false);
+      svc.note_transmit_outcome(now, TransmitOutcome::NoneDelivered);
     }
     assert!(
       matches!(svc.state(), ServiceState::Init | ServiceState::Probing(_)),
@@ -791,7 +791,7 @@ fn probe_sequence_does_not_advance_without_confirmed_send() {
   now = now.advance(500);
   svc.handle_timeout(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_transmit_result(now, true);
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
   assert!(
     matches!(svc.state(), ServiceState::Probing(1)),
     "a confirmed probe advances the sequence; got {:?}",
@@ -822,7 +822,7 @@ fn no_goodbye_after_final_probe_before_first_announcement() {
     // Drain + CONFIRM probes on the way to Announcing; probes
     // don't make a service cache-visible, so they must not enable a goodbye.
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_result(now, true);
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
     }
   }
   assert!(
@@ -864,7 +864,7 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_result(now, true);
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
       if matches!(svc.state(), ServiceState::Announcing(0)) {
         break 'drive;
       }
@@ -919,7 +919,7 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
 
   // Confirm delivery → goodbye ownership latches for every emitted record, even
   // though no announcement has been confirmed and the phase is unchanged.
-  svc.note_transmit_result(now, true);
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
   // a legacy reply emits the full set, so BOTH the instance records and
   // the host address latch (earlier the emitted host A was wrongly left
   // unlatched, leaving it unwithdrawn on a later goodbye).
@@ -953,7 +953,7 @@ fn legacy_a_query_reply_latches_full_set() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_result(now, true);
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
       if matches!(svc.state(), ServiceState::Announcing(0)) {
         break 'drive;
       }
@@ -989,7 +989,7 @@ fn legacy_a_query_reply_latches_full_set() {
     ),
     other => panic!("expected a Response commit token, got {other:?}"),
   }
-  svc.note_transmit_result(now, true);
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
   assert!(
     svc.goodbye.any_host(),
     "a host A reply latches host ownership"
@@ -1473,7 +1473,7 @@ fn coalesced_legacy_queriers_each_get_a_response() {
   let mut dsts: std::vec::Vec<core::net::SocketAddr> = std::vec::Vec::new();
   while let Some(t) = svc.poll_transmit(now, &mut buf).unwrap() {
     dsts.push(t.dst());
-    svc.note_transmit_result(now, true); // confirm before the next poll
+    svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered); // confirm before the next poll
   }
   assert!(
     dsts.contains(&a) && dsts.contains(&b),
@@ -1515,7 +1515,7 @@ fn same_source_distinct_legacy_transactions_each_reply() {
     assert_eq!(t.dst(), src);
     let msg = buf.get(..t.size()).unwrap();
     ids.push(MessageReader::try_parse(msg).unwrap().header().id());
-    svc.note_transmit_result(now, true); // confirm before the next poll
+    svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered); // confirm before the next poll
   }
   assert!(
     ids.contains(&11) && ids.contains(&22),
@@ -3166,10 +3166,10 @@ fn same_tick_both_transmits_are_queued_and_drained() {
     t1.is_some(),
     "first poll_transmit must return Some (Announcement)"
   );
-  // the single commit token requires a note_transmit_result between
+  // the single commit token requires a note_transmit_outcome between
   // polls — the driver confirms after each send, so it still drains both queued
   // transmits across the confirm boundary.
-  svc.note_transmit_result(announce_dl, true);
+  svc.note_transmit_outcome(announce_dl, TransmitOutcome::AllDelivered);
 
   // After draining slot 0 the tail compacts down (FIFO).  The
   // Response that was in slot 1 is now in slot 0, slot 1 is empty.  Either
@@ -3188,7 +3188,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
     t2.is_some(),
     "second poll_transmit must return Some (Response)"
   );
-  svc.note_transmit_result(announce_dl, true);
+  svc.note_transmit_outcome(announce_dl, TransmitOutcome::AllDelivered);
 
   // Queue is now empty.
   let t3 = svc.poll_transmit(announce_dl, &mut buf4096).unwrap();
@@ -3528,7 +3528,7 @@ fn pending_transmits_is_fifo_after_pop_and_push() {
 #[test]
 fn poll_transmit_blocks_until_confirmation() {
   // the commit token is a SINGLE slot. Once poll_transmit hands out a
-  // datagram, a second poll WITHOUT a note_transmit_result must return Ok(None)
+  // datagram, a second poll WITHOUT a note_transmit_outcome must return Ok(None)
   // — never a second datagram that would silently overwrite (and lose) the
   // first send's pending confirmation. Confirming frees the slot.
   let mut svc = make_service(120);
@@ -3551,7 +3551,7 @@ fn poll_transmit_blocks_until_confirmation() {
     "no datagram may be handed out while a prior send is unconfirmed"
   );
   // Confirming frees the single token slot.
-  svc.note_transmit_result(now, true);
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
   assert!(
     svc.awaiting_confirm.is_none(),
     "confirming must clear the commit token"
@@ -3583,7 +3583,7 @@ fn failed_established_reannounce_retries_within_one_second() {
       .is_some(),
     "the periodic re-announce must be emitted"
   );
-  svc.note_transmit_result(due, false);
+  svc.note_transmit_outcome(due, TransmitOutcome::NoneDelivered);
   assert!(
     matches!(svc.state(), ServiceState::Established),
     "a failed re-announce must not leave Established"
@@ -3647,7 +3647,7 @@ fn subtype_ptr_advertised_in_response() {
     saw_subtype,
     "a response must include the subtype PTR at positive TTL"
   );
-  svc.note_transmit_result(now2, true);
+  svc.note_transmit_outcome(now2, TransmitOutcome::AllDelivered);
 }
 
 #[test]
@@ -4068,7 +4068,7 @@ fn poll_transmit_announcement_surfaces_buffer_too_small() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_result(now, true);
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
       if matches!(svc.state(), ServiceState::Announcing(0)) {
         break 'drive;
       }
@@ -4248,9 +4248,10 @@ fn duplicate_legacy_question_is_deduped() {
 /// 1. Drive service to Established.
 /// 2. Inject a KnownAnswer hint for the SRV record (partial suppression — PTR/TXT/A still emit).
 /// 3. Inject a Question → response_deadline fires → poll_transmit returns Some (non-empty response).
-/// 4. Call note_transmit_result(now, delivered=false) → counter must stay 0.
-/// 5. Re-encode a second response cycle and call note_transmit_result(now, delivered=true) →
-///    counter must be 1 (the one suppressed SRV).
+/// 4. Call note_transmit_outcome(now, TransmitOutcome::NoneDelivered) → counter must stay 0.
+/// 5. Re-encode a second response cycle and call
+///    note_transmit_outcome(now, TransmitOutcome::AllDelivered) → counter must be 1 (the one
+///    suppressed SRV).
 #[cfg(feature = "stats")]
 #[test]
 fn partial_kas_suppression_counter_is_delivery_gated() {
@@ -4325,7 +4326,7 @@ fn partial_kas_suppression_counter_is_delivery_gated() {
 
   let before = stats.snapshot().answers_suppressed_kas;
   // Delivery FAILS — counter must NOT increase.
-  svc.note_transmit_result(now2, false);
+  svc.note_transmit_outcome(now2, TransmitOutcome::NoneDelivered);
   let after_fail = stats.snapshot().answers_suppressed_kas;
   assert_eq!(
     after_fail, before,
@@ -4345,7 +4346,7 @@ fn partial_kas_suppression_counter_is_delivery_gated() {
   );
 
   // Delivery SUCCEEDS — counter must increase by the suppressed count (≥ 1, the SRV).
-  svc.note_transmit_result(now3, true);
+  svc.note_transmit_outcome(now3, TransmitOutcome::AllDelivered);
   let after_ok = stats.snapshot().answers_suppressed_kas;
   assert!(
     after_ok > after_fail,
@@ -4467,7 +4468,7 @@ fn full_kas_suppression_counts_at_suppression_not_delivery() {
       "answers_suppressed_kas must be bumped at suppression for full Ok(None) case; \
        before={before}, after={after}"
     );
-    // No AwaitingConfirm: no note_transmit_result call needed.
+    // No AwaitingConfirm: no note_transmit_outcome call needed.
     assert!(
       svc.awaiting_confirm.is_none(),
       "no awaiting_confirm token must exist after Ok(None)"
@@ -4533,7 +4534,7 @@ fn multicast_meta_response_counts_responses_tx() {
 
   // delivery=false → responses_tx must remain 0.
   let before = stats.snapshot().responses_tx;
-  svc.note_transmit_result(now2, false);
+  svc.note_transmit_outcome(now2, TransmitOutcome::NoneDelivered);
   let after_fail = stats.snapshot().responses_tx;
   assert_eq!(
     after_fail, before,
@@ -4556,7 +4557,7 @@ fn multicast_meta_response_counts_responses_tx() {
   );
 
   // delivery=true → responses_tx must bump by 1.
-  svc.note_transmit_result(now3, true);
+  svc.note_transmit_outcome(now3, TransmitOutcome::AllDelivered);
   let after_ok = stats.snapshot().responses_tx;
   assert_eq!(
     after_ok,
@@ -4603,7 +4604,7 @@ fn legacy_meta_response_counts_responses_tx() {
 
   // delivery=false → responses_tx must remain 0.
   let before = stats.snapshot().responses_tx;
-  svc.note_transmit_result(now, false);
+  svc.note_transmit_outcome(now, TransmitOutcome::NoneDelivered);
   let after_fail = stats.snapshot().responses_tx;
   assert_eq!(
     after_fail, before,
@@ -4626,7 +4627,7 @@ fn legacy_meta_response_counts_responses_tx() {
   );
 
   // delivery=true → responses_tx must bump by 1.
-  svc.note_transmit_result(now, true);
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
   let after_ok = stats.snapshot().responses_tx;
   assert_eq!(
     after_ok,

@@ -204,7 +204,7 @@ cfg_heap! {
     /// goodbye, leaving peers with stale PTR/SRV/TXT until TTL. A held name is
     /// rejected by BOTH reuse paths — `try_register_service` and
     /// `handle_service_renamed` — and is never cancelled by
-    /// [`Endpoint::note_service_advertised`], so the dead service's goodbye always
+    /// [`Endpoint::note_service_announced`], so the dead service's goodbye always
     /// drains before the name can be claimed again.
     #[allow(dead_code)]
     holds_name: bool,
@@ -246,7 +246,7 @@ pub struct ServiceRoute {
   /// wire — the subset of `a_addrs` a peer truly holds in its cache.  EMPTY at
   /// registration (a never-announced service has advertised nothing); the
   /// driver mirrors the live `Service::advertised_a_addrs` set here via
-  /// [`Endpoint::note_service_advertised`] after each confirmed announce.  This
+  /// [`Endpoint::note_service_announced`] after each confirmed announce.  This
   /// (NOT the configured `a_addrs`) is what `sibling_retained_addrs` honours so
   /// a withdrawing service only retains addresses a LIVE same-host sibling
   /// genuinely owns in peer caches.
@@ -315,7 +315,7 @@ impl ServiceRoute {
     /// IPv4 host addresses this service has CONFIRMED-ADVERTISED on the wire.
     /// Distinct from [`Self::a_addrs`] (the configured set used for self-/
     /// loopback detection): this is the subset peers actually hold in cache, kept
-    /// current by [`Endpoint::note_service_advertised`] and consumed by
+    /// current by [`Endpoint::note_service_announced`] and consumed by
     /// sibling host-address retention during withdrawal.
     #[inline(always)]
     pub(crate) fn advertised_a(&self) -> &[Ipv4Addr] {

@@ -306,7 +306,7 @@ cfg_heap! {
   }
 
   /// The commit token stamped by `poll_transmit` and resolved by
-  /// `note_transmit_result`. Unlike [`PendingTransmitKind`] (which is
+  /// `note_transmit_outcome`. Unlike [`PendingTransmitKind`] (which is
   /// queued at deadline-fire time), this carries what was ACTUALLY encoded, so a
   /// response that known-answer-suppression (§7.1) trimmed latches goodbye
   /// ownership only for the concrete records it really put on the wire
@@ -345,7 +345,7 @@ cfg_heap! {
   ///
   /// INVARIANT: a record becomes "advertised" ONLY through a CONFIRMED send that
   /// actually emitted THAT record ([`Self::record_emitted`], driven by the
-  /// encoder's per-record report via `note_transmit_result`). A send that never
+  /// encoder's per-record report via `note_transmit_outcome`). A send that never
   /// reaches the link — or whose record was known-answer-suppressed (§7.1) —
   /// advertises nothing, so a later goodbye never withdraws a record we did not
   /// put on the wire (which could otherwise flush a peer's matching shared
@@ -594,7 +594,7 @@ cfg_heap! {
   /// delivery result, `None` otherwise. This is the structural heart of the
   /// confirm-on-send invariant: `poll_transmit` ONLY stamps this token and
   /// advances no lifecycle state; ALL lifecycle progression happens in
-  /// [`Self::note_transmit_result`], keyed on the token. Because of that a send
+  /// [`Self::note_transmit_outcome`], keyed on the token. Because of that a send
   /// that never reaches the link (all sockets error) advances nothing — neither
   /// the goodbye-ownership latches (`announce_emitted` / `host_advertised`) for
   /// an announcement, nor the probe sequence (RFC 6762 §8.1) for a probe.
@@ -1037,27 +1037,6 @@ where
         }
       }
     }
-  }
-
-  /// Boolean form of [`Self::note_transmit_outcome`], retained for the migration
-  /// to [`TransmitOutcome`] and scheduled for removal.
-  ///
-  /// `delivered = true` maps to [`TransmitOutcome::AllDelivered`] and `false` to
-  /// [`TransmitOutcome::NoneDelivered`]. Those two rows are exhaustive only for a
-  /// driver that never fans one logical transmit onto more than one link: a
-  /// dual-stack driver has no truthful value to pass when IPv4 succeeded and IPv6
-  /// failed, and BOTH answers are wrong — `true` over-advances the §8.1/§8.3
-  /// phase on a link that heard nothing, `false` drops the goodbye ownership of
-  /// records peers already cached. Use [`Self::note_transmit_outcome`].
-  pub fn note_transmit_result(&mut self, now: I, delivered: bool) {
-    self.note_transmit_outcome(
-      now,
-      if delivered {
-        TransmitOutcome::AllDelivered
-      } else {
-        TransmitOutcome::NoneDelivered
-      },
-    );
   }
 
   /// Convenience wrapper for a fully-delivered send — equivalent to
@@ -1916,7 +1895,7 @@ where
             // a probe deadline fired — ENQUEUE the probe and re-arm a
             // fallback retry deadline, but do NOT advance the probe sequence
             // here. The §8.1 progression (next probe, or entering Announcing
-            // after the third) happens in `note_transmit_result` ONLY once the
+            // after the third) happens in `note_transmit_outcome` ONLY once the
             // driver confirms the probe actually reached the link — mirroring
             // the Announcing arm below. An unconfirmed probe is retried at the
             // probe interval instead of the service silently marching toward
@@ -2002,13 +1981,13 @@ where
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
     // the commit token is a SINGLE slot. If a previously produced
-    // datagram has not yet been confirmed via `note_transmit_result`, do NOT
+    // datagram has not yet been confirmed via `note_transmit_outcome`, do NOT
     // hand out (and silently overwrite the token of) another one — that would
     // lose the first send's pending confirmation and mis-apply the next result
     // to the wrong datagram. Returning `Ok(None)` makes the documented
     // "poll until Ok(None)" drain contract enforce poll→confirm→poll ordering
     // for EVERY Sans-I/O caller, not just the tokio driver (which already
-    // confirms after each send). The token is cleared by `note_transmit_result`
+    // confirms after each send). The token is cleared by `note_transmit_outcome`
     // (`.take()`), so the next poll after a confirm proceeds normally; a probe/
     // announce/response branch below re-stamps it, while the early-return
     // datagram (legacy unicast) only stamps where it owns lifecycle/ownership
@@ -2041,7 +2020,7 @@ where
         && let Ok(meta) = crate::Name::try_from_str(crate::endpoint::DNS_SD_META_QUERY_NAME)
         && let Ok(n) = respond::write_meta_response(&self.records, &meta, buf)
       {
-        // Stamp the MetaResponse token so note_transmit_result can count
+        // Stamp the MetaResponse token so note_transmit_outcome can count
         // responses_tx on a confirmed delivery.  No goodbye ownership is
         // latched (the meta-PTR is shared and never withdrawn).
         self.awaiting_confirm = Some(AwaitingConfirm::MetaResponse);
@@ -2085,7 +2064,7 @@ where
           // the wire — the FULL record set, since legacy replies are not
           // KAS-filtered. Stamp the Response commit token with exactly what the
           // encoder reported it emitted; a confirmed delivery then latches
-          // goodbye ownership for those records via `note_transmit_result`. A
+          // goodbye ownership for those records via `note_transmit_outcome`. A
           // meta reply (`emitted` is None) uses MetaResponse — shared PTR, no
           // goodbye ownership — but still counts responses_tx on delivery.
           // Legacy replies are not KAS-filtered, so the partial-suppression
@@ -2141,7 +2120,7 @@ where
           bytes = n,
           "service: poll_transmit emitting probe"
         );
-        // probes_tx is bumped in note_transmit_result on confirmed delivery.
+        // probes_tx is bumped in note_transmit_outcome on confirmed delivery.
         n
       }
       PendingTransmitKind::Announcement => {
@@ -2165,7 +2144,7 @@ where
           bytes = n,
           "service: poll_transmit emitting announcement"
         );
-        // announcements_tx is bumped in note_transmit_result on confirmed delivery.
+        // announcements_tx is bumped in note_transmit_outcome on confirmed delivery.
         n
       }
       PendingTransmitKind::Response => {
@@ -2245,7 +2224,7 @@ where
     self.pop_pending();
     // the datagram has been
     // ENCODED, but no lifecycle state advances here. Map the queued kind to the
-    // commit token the driver resolves via `note_transmit_result` — the SOLE
+    // commit token the driver resolves via `note_transmit_outcome` — the SOLE
     // place probe/announce progression AND goodbye-ownership latching happen,
     // and only on a confirmed send.
     self.awaiting_confirm = match kind {
@@ -2277,7 +2256,7 @@ where
         // delivery to wait for. Count answers_suppressed_kas immediately at
         // the point of suppression — this is a genuine suppression event, not
         // a send failure. Document: this is the ONLY counter bump in
-        // poll_transmit that is NOT deferred to note_transmit_result, because
+        // poll_transmit that is NOT deferred to note_transmit_outcome, because
         // Ok(None) means no datagram (and thus no AwaitingConfirm token) is
         // ever produced.
         if resp_emitted.is_empty() {
@@ -2291,7 +2270,7 @@ where
           return Ok(None);
         }
         // Partial suppression: carry the suppressed count in the AwaitingConfirm
-        // token and defer the answers_suppressed_kas bump to note_transmit_result
+        // token and defer the answers_suppressed_kas bump to note_transmit_outcome
         // so a socket failure does NOT inflate the counter.
         // responses_tx is also deferred there.
         #[cfg(feature = "stats")]

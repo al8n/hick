@@ -146,7 +146,7 @@ pub struct Query<I, AN, EV> {
   /// sending the same query continuously instead of honoring the backoff.
   transmit_pending: bool,
   /// set by `poll_transmit` for the datagram it just produced, and
-  /// cleared by `note_transmit_result` once the driver reports the send result.
+  /// cleared by `note_transmit_outcome` once the driver reports the send result.
   /// The retry budget (`retry_count`) and the next-retry deadline are advanced
   /// ONLY on a confirmed-delivered send — a datagram that fails on every socket
   /// is re-attempted without consuming the budget, so a transient send failure
@@ -570,7 +570,7 @@ where
     self.transmit_pending = false;
     // do NOT advance the retry budget or schedule the next retry
     // here — the datagram has only been ENCODED. Await the driver's delivery
-    // result (`note_transmit_result`), which schedules the backoff on a
+    // result (`note_transmit_outcome`), which schedules the backoff on a
     // confirmed send and re-attempts (without burning the budget) on failure.
     self.awaiting_send_confirm = true;
     crate::trace::debug!(
@@ -635,23 +635,6 @@ where
       // driver's drain loop does not spin.
       self.next_deadline = retry::next_deadline(now, self.retry_count.saturating_add(1));
     }
-  }
-
-  /// Boolean form of [`Self::note_transmit_outcome`], retained for the migration
-  /// to [`TransmitOutcome`] and scheduled for removal.
-  ///
-  /// `delivered = true` maps to [`TransmitOutcome::AllDelivered`] and `false` to
-  /// [`TransmitOutcome::NoneDelivered`]; a dual-stack driver has no truthful
-  /// value to pass for a half-delivered question.
-  pub fn note_transmit_result(&mut self, now: I, delivered: bool) {
-    self.note_transmit_outcome(
-      now,
-      if delivered {
-        TransmitOutcome::AllDelivered
-      } else {
-        TransmitOutcome::NoneDelivered
-      },
-    );
   }
 
   /// RFC 6762 §7.3 duplicate-question suppression. Another host has multicast
