@@ -247,10 +247,10 @@ where
     // conflict/rename away again before announcing. Cancelling now would lose the old
     // records' retraction if it never announces (the same premature-cancel class as
     //). The cancel instead fires on the certain live event —
-    // `note_service_advertised` gated on `advertised_instance`, when the renamed
-    // service confirms advertising this name. The rename is still NOT rejected for a
-    // reclaimable name: a detached item holds no route, so the
-    // duplicate-name scan above does not see it, and reuse proceeds.
+    // `note_service_advertised` gated on `Service::has_fully_announced`, when the
+    // renamed service has announced this name on every obligated link. The rename is
+    // still NOT rejected for a reclaimable name: a detached item holds no route, so
+    // the duplicate-name scan above does not see it, and reuse proceeds.
 
     // Apply the rename.
     if let Some(route) = self.services.get_mut(key) {

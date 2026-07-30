@@ -154,7 +154,9 @@ cfg_heap! {
   pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye};
 }
 #[allow(unused_imports)]
-pub(crate) use schedule::{announce_deadline, probe_deadline, re_announce_deadline};
+pub(crate) use schedule::{
+  announce_deadline, partial_announce_deadline, probe_deadline, re_announce_deadline,
+};
 pub use state::ServiceState;
 
 cfg_heap! {
@@ -163,7 +165,7 @@ cfg_heap! {
   use crate::error::{HandleTimeoutError, TransmitError};
   use crate::event::{ServiceEvent, ServiceUpdate};
   use crate::records::ServiceRecords;
-  use crate::transmit::Transmit;
+  use crate::transmit::{Transmit, TransmitOutcome};
   use crate::{Instant, Pool, ServiceHandle};
 
   type Rng = rand::rngs::StdRng;
@@ -478,6 +480,46 @@ cfg_heap! {
 }
 
 cfg_heap! {
+  /// Unforgeable proof of [`Service::has_fully_announced`] — the reclaim-cancel
+  /// gate of
+  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced).
+  ///
+  /// There is NO public constructor and no `From<bool>`: the only way a driver can
+  /// obtain a value is to ask the `Service` that owns the fact. That is the whole
+  /// purpose of the type. The gate's predecessor took a plain `bool`, and every
+  /// shipped driver filled it with [`Service::advertises_instance`] — the
+  /// ANY-delivered exposure latch, which is a different fact and makes the cancel
+  /// unsound (a v4-only announcement, or an RFC 6762 §6.7 legacy unicast reply,
+  /// would retire a goodbye the unserved family still needs). A `bool` parameter
+  /// cannot reject that; this type can, at compile time.
+  ///
+  /// The distinction matters more here than at the other confirm boundaries
+  /// because this is the ONE migration leg with no compile-time forcing function:
+  /// deleting the boolean confirm METHODS makes every other call site fail to
+  /// compile, whereas a same-arity `bool` parameter whose MEANING changed would
+  /// silently survive both the driver migration and any external upgrade.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  #[must_use]
+  pub struct FullyAnnounced(bool);
+
+  impl FullyAnnounced {
+    /// Wrap the fact. Crate-internal: [`Service::has_fully_announced`] is the sole
+    /// caller, which is what makes the type unforgeable outside this crate.
+    #[inline(always)]
+    pub(crate) const fn new(fully_announced: bool) -> Self {
+      Self(fully_announced)
+    }
+
+    /// Whether a complete announcement of the service's current instance name has
+    /// reached every obligated link.
+    #[inline(always)]
+    pub const fn get(self) -> bool {
+      self.0
+    }
+  }
+}
+
+cfg_heap! {
   /// Service state machine. One per registered service.
   pub struct Service<I, TQ, EV> {
   handle: ServiceHandle,
@@ -532,6 +574,21 @@ cfg_heap! {
   /// [`GoodbyeOwnership`] for the invariants (confirmed-send-driven, instance
   /// resets on rename, host persists).
   goodbye: GoodbyeOwnership,
+  /// Whether a COMPLETE §8.3 announcement of the CURRENT instance name has
+  /// reached every obligated link. Set ONLY by an `AllDelivered` announcement
+  /// confirm; reset by a §9 conflict rename alongside
+  /// [`GoodbyeOwnership::reset_instance`], because the new name has announced
+  /// nothing. Distinct from `goodbye.any_instance()`, which is an ANY-delivered
+  /// exposure latch: see [`Service::has_fully_announced`] for why the endpoint's
+  /// reclaim-cancel needs the all-delivered fact and not the exposure one.
+  fully_announced: bool,
+  /// Consecutive `PartiallyDelivered` announcement confirms since the last phase
+  /// advance — the exponent of the RFC §8.3 doubling ladder
+  /// (`partial_announce_deadline`). A partial announcement puts a real datagram
+  /// on the served link's wire every re-arm, so its repetition must respect
+  /// §8.3's "increases by at least a factor of two with every response sent";
+  /// a fully-failed send reaches no wire and so neither uses nor advances this.
+  partial_announce_streak: u8,
   /// the commit token for the datagram `poll_transmit`
   /// most recently produced — `Some(kind)` while that send is awaiting a
   /// delivery result, `None` otherwise. This is the structural heart of the
@@ -637,6 +694,8 @@ where
       peer_probes: std::vec::Vec::new(),
       tiebreak_pending: false,
       goodbye: GoodbyeOwnership::default(),
+      fully_announced: false,
+      partial_announce_streak: 0,
       awaiting_confirm: None,
       pending_legacy: std::vec::Vec::new(),
       last_conflict_reprobe: None,
@@ -718,6 +777,36 @@ where
     self.goodbye.any_instance()
   }
 
+  /// Whether a COMPLETE §8.3 announcement of the CURRENT instance name has
+  /// reached EVERY obligated link — i.e. at least one announcement resolved
+  /// [`TransmitOutcome::AllDelivered`].
+  ///
+  /// This is the reclaim-cancel gate the driver ferries into
+  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced):
+  /// only once every link the driver still obligates has heard the reclaiming
+  /// name may that name's renamed-away predecessor stop sending its TTL=0
+  /// goodbye. For every such link §10.2's cache-flush announcement supersedes the
+  /// stale unique records, so the goodbye has nothing left to do.
+  ///
+  /// It is deliberately NOT [`Self::advertises_instance`], which latches on ANY
+  /// delivery and would make the gate unsound in two ways: a v4-only (partial)
+  /// announcement would cancel a goodbye the v6 zone still needs, and — because
+  /// an RFC 6762 §6.7 legacy UNICAST reply has a single obligated link and so
+  /// reports `AllDelivered` by construction — a mere unicast reply would satisfy
+  /// any "advertises_instance() && all_delivered()" formula without ever having
+  /// multicast the name. Only the Announcement confirm arm sets this, so no
+  /// response of any kind can.
+  ///
+  /// The result is wrapped in [`FullyAnnounced`] precisely so that the wrong fact
+  /// cannot be substituted at the call site; use [`FullyAnnounced::get`] to read
+  /// it.
+  ///
+  /// Reset by a §9 conflict rename: the new name has announced nothing.
+  #[inline(always)]
+  pub const fn has_fully_announced(&self) -> FullyAnnounced {
+    FullyAnnounced::new(self.fully_announced)
+  }
+
   /// The host IPv4 addresses this service has actually ADVERTISED (confirmed-
   /// emitted), per address. This is the set a sibling truly owns in peer
   /// caches — NOT [`ServiceRecords::a_addrs_slice`], which is the configured set
@@ -736,27 +825,43 @@ where
     &self.goodbye.aaaa
   }
 
-  /// Report the delivery result of the datagram most recently produced by
+  /// Report the delivery outcome of the datagram most recently produced by
   /// [`Self::poll_transmit`] (the confirm-on-send chokepoint).
   ///
-  /// This is the SOLE place service lifecycle state advances. `poll_transmit`
-  /// only encodes bytes and stamps a commit token (`awaiting_confirm`); the
-  /// driver then calls this with `delivered = true` when at least one socket
-  /// send succeeded (`used > 0`). Behaviour is keyed on the token:
+  /// This is the SOLE place service lifecycle state advances and the SOLE place
+  /// goodbye ownership latches. `poll_transmit` only encodes bytes and stamps a
+  /// commit token (`awaiting_confirm`); the driver then reports how the fan-out
+  /// went. Two invariants key every arm below:
   ///
-  /// * **Probe, delivered** — advance the §8.1 probe sequence (next probe, or
-  ///   enter `Announcing(0)` after the third). A name is therefore claimed only
-  ///   once a probe has actually reached the link.
-  /// * **Probe, NOT delivered** — re-arm the same probe WITHOUT advancing, so a
-  ///   service whose probes never leave the host never announces (the RFC 6762
-  ///   §8.1 guarantee; the fix).
-  /// * **Announcement, delivered** — latch the goodbye-ownership guards
-  ///   (`announce_emitted` / `host_advertised`) and advance the §8.3
-  ///   announce phase, reaching `Established` after the second.
-  /// * **Announcement, NOT delivered** — re-arm without advancing; the
-  ///   announcement is retried.
-  /// * **Response / nothing pending** — no lifecycle state to advance.
-  pub fn note_transmit_result(&mut self, now: I, delivered: bool) {
+  /// * **Goodbye ownership latches iff [`TransmitOutcome::any_delivered`]** —
+  ///   peers reachable over any link that accepted the datagram may hold the
+  ///   records it carried (RFC 6762 §10.1), whether or not every link did.
+  /// * **Phase advances iff [`TransmitOutcome::all_delivered`]** — a link that
+  ///   never saw the probe has not been asked (§8.1) and one that never saw the
+  ///   announcement has not been told (§8.3).
+  ///
+  /// Behaviour per commit token:
+  ///
+  /// * **Probe, all delivered** — advance the §8.1 probe sequence (next probe,
+  ///   or enter `Announcing(0)` after the third). A name is therefore claimed
+  ///   only once its probe reached every obligated link.
+  /// * **Probe, otherwise** — re-arm the SAME probe without advancing. A probe
+  ///   is a question: it advertises nothing, so a partial probe latches nothing
+  ///   either. Probes are exempt from the doubling ladders — §8.1's own 250 ms
+  ///   cadence governs them, and §6's one-second rule explicitly carves probing
+  ///   out.
+  /// * **Announcement, all delivered** — latch goodbye ownership for the records
+  ///   it emitted, mark [`Self::has_fully_announced`], and advance the §8.3
+  ///   phase, reaching `Established` after the second.
+  /// * **Announcement, partially delivered** — latch ownership (the served link
+  ///   heard it) but do NOT advance; re-arm on the §8.3 doubling ladder, since
+  ///   every such retry puts another real datagram on that link's wire.
+  /// * **Announcement, none delivered** — nothing reached any wire: latch
+  ///   nothing, advance nothing, retry flat at the §8.3 one-second interval.
+  /// * **Response / meta-response** — exposure is an any-delivered fact and no
+  ///   phase exists, so partial and full delivery behave identically.
+  /// * **Nothing pending** — no-op.
+  pub fn note_transmit_outcome(&mut self, now: I, outcome: TransmitOutcome) {
     let kind = match self.awaiting_confirm.take() {
       Some(k) => k,
       None => return,
@@ -764,11 +869,11 @@ where
     match kind {
       AwaitingConfirm::Probe => {
         if let ServiceState::Probing(n) = self.state {
-          if !delivered {
-            // §8.1: the probe never reached the link — do NOT advance the
-            // sequence. Re-arm the SAME probe from post-send time so it
-            // retries, rather than the service progressing toward Announcing
-            // with nothing on the wire.
+          if !outcome.all_delivered() {
+            // §8.1: the probe did not reach every obligated link — do NOT
+            // advance the sequence. Re-arm the SAME probe from post-send time so
+            // it retries, rather than the service progressing toward Announcing
+            // while a link that has never been asked might already hold the name.
             self.lifecycle_deadline = probe_deadline(now, n, &mut self.rng);
           } else {
             // Probe reached the link — count it now (confirmed delivery).
@@ -781,6 +886,8 @@ where
               self.state = ServiceState::Announcing(0);
               self.probe_count = 3;
               self.lifecycle_deadline = announce_deadline(now, 0);
+              // A fresh §8.3 announcement sequence starts from the bottom rung.
+              self.partial_announce_streak = 0;
             } else {
               // Probe confirmed → schedule the next one PROBE_INTERVAL later.
               let new_n = n.saturating_add(1);
@@ -792,14 +899,19 @@ where
         }
       }
       AwaitingConfirm::Announcement(emitted) => {
-        if !delivered {
-          // The announcement never reached the link — re-arm without advancing.
-          // Retry at the §8.3 inter-announce interval, anchored to
-          // post-send time. This MUST also cover the periodic
+        if !outcome.any_delivered() {
+          // The announcement never reached ANY link — re-arm without advancing
+          // and latch nothing. Retry at the §8.3 inter-announce interval,
+          // anchored to post-send time. This MUST also cover the periodic
           // `Established` re-announce — otherwise a single transient send failure
           // leaves the next attempt a full re-announce interval (~80% of TTL)
           // away, during which peers expire the records and the service silently
           // disappears. A short 1 s retry keeps the records alive.
+          //
+          // The §8.3 doubling ladder deliberately does NOT apply here: nothing
+          // hit any wire, so §8.3 counts no unsolicited response to space out,
+          // and the streak is neither used nor advanced. The delay a failed round
+          // adds is pure extra spacing on top of whatever rung the ladder is on.
           if matches!(
             self.state,
             ServiceState::Announcing(_) | ServiceState::Established
@@ -808,16 +920,40 @@ where
           }
           return;
         }
-        // Confirmed announcement → count it, then latch goodbye ownership for
-        // the records it carried (peers can only have cached our records once a
-        // send truly reached the link). Driven by the encoder's per-record
-        // report, same as a response: a full announcement emits all of
-        // PTR/SRV/TXT plus every host address.
+        // At least one obligated link accepted it → peers reachable over that
+        // link may now hold these records, so latch goodbye ownership for
+        // exactly what the encoder reported it emitted (a full announcement
+        // carries all of PTR/SRV/TXT plus every host address). This is the
+        // ANY-delivered half of the invariant pair and happens BEFORE the
+        // all-delivered phase check below: partial delivery owns what it exposed
+        // even though it advances nothing.
+        self.goodbye.record_emitted(&emitted);
+        if !outcome.all_delivered() {
+          // §8.3 phase does NOT advance — some obligated link has not been told.
+          // Re-arm on the doubling ladder: this retry will put another real
+          // datagram on the served link's wire, and §8.3 requires the interval
+          // between unsolicited responses to grow by ≥2× with every one sent.
+          // The re-arm is lossless — `announce_count` and the state are
+          // untouched, so the first all-delivered confirm resumes from here.
+          if matches!(
+            self.state,
+            ServiceState::Announcing(_) | ServiceState::Established
+          ) {
+            self.lifecycle_deadline = partial_announce_deadline(now, self.partial_announce_streak);
+          }
+          self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
+          return;
+        }
+        // Every obligated link accepted it: count it and advance the phase. The
+        // ladder resets — the next partial streak starts from the bottom rung.
         #[cfg(feature = "stats")]
         if let Some(s) = self.stat() {
           s.announcements_tx(1);
         }
-        self.goodbye.record_emitted(&emitted);
+        self.partial_announce_streak = 0;
+        // THE reclaim-cancel gate (see `has_fully_announced`): a complete
+        // announcement of the current name has now reached every obligated link.
+        self.fully_announced = true;
         if let ServiceState::Announcing(n) = self.state {
           if n >= 1 {
             // Second announcement confirmed → the §8.3 startup sequence is
@@ -872,7 +1008,11 @@ where
         // a socket failure must not inflate the suppression counter — the
         // records were encoded but never left the host, so from the network's
         // perspective they were NOT suppressed.
-        if delivered {
+        //
+        // Exposure is an ANY-delivered fact and a response carries no lifecycle
+        // phase, so a partial delivery is handled exactly like a full one: one
+        // link's peers heard the records, and that is the whole question here.
+        if outcome.any_delivered() {
           #[cfg(feature = "stats")]
           if let Some(s) = self.stat() {
             s.responses_tx(1);
@@ -886,9 +1026,10 @@ where
       AwaitingConfirm::MetaResponse => {
         // A §9 meta-response (multicast or legacy) put a shared meta-PTR on the
         // wire.  No instance-owned records were emitted, so goodbye ownership is
-        // NOT touched.  On a confirmed delivery bump responses_tx so the
-        // *_tx counters reflect every datagram that left the host.
-        if delivered {
+        // NOT touched.  Any delivery bumps responses_tx so the *_tx counters
+        // reflect every datagram that left the host; there is no phase here, so
+        // partial and full delivery are the same event.
+        if outcome.any_delivered() {
           #[cfg(feature = "stats")]
           if let Some(s) = self.stat() {
             s.responses_tx(1);
@@ -898,13 +1039,34 @@ where
     }
   }
 
-  /// Convenience wrapper for a CONFIRMED delivery — equivalent to
-  /// `note_transmit_result(now, true)`. Retained so call sites (and tests) that
-  /// always represent a successful send stay terse; all advancement logic lives
-  /// in [`Self::note_transmit_result`].
+  /// Boolean form of [`Self::note_transmit_outcome`], retained for the migration
+  /// to [`TransmitOutcome`] and scheduled for removal.
+  ///
+  /// `delivered = true` maps to [`TransmitOutcome::AllDelivered`] and `false` to
+  /// [`TransmitOutcome::NoneDelivered`]. Those two rows are exhaustive only for a
+  /// driver that never fans one logical transmit onto more than one link: a
+  /// dual-stack driver has no truthful value to pass when IPv4 succeeded and IPv6
+  /// failed, and BOTH answers are wrong — `true` over-advances the §8.1/§8.3
+  /// phase on a link that heard nothing, `false` drops the goodbye ownership of
+  /// records peers already cached. Use [`Self::note_transmit_outcome`].
+  pub fn note_transmit_result(&mut self, now: I, delivered: bool) {
+    self.note_transmit_outcome(
+      now,
+      if delivered {
+        TransmitOutcome::AllDelivered
+      } else {
+        TransmitOutcome::NoneDelivered
+      },
+    );
+  }
+
+  /// Convenience wrapper for a fully-delivered send — equivalent to
+  /// `note_transmit_outcome(now, TransmitOutcome::AllDelivered)`. Retained so
+  /// call sites (and tests) that always represent a successful send stay terse;
+  /// all advancement logic lives in [`Self::note_transmit_outcome`].
   #[inline]
   pub fn note_transmit_delivered(&mut self, now: I) {
-    self.note_transmit_result(now, true);
+    self.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
   }
 
   /// Capture everything the endpoint needs to re-encode a TTL=0 goodbye for
@@ -1102,6 +1264,11 @@ where
   /// name must not carry over either.
   fn reset_advertised_name_state(&mut self) {
     self.goodbye.reset_instance();
+    // The NEW name has announced nothing, so it cannot yet supersede the old
+    // name's in-flight goodbye — the reclaim-cancel gate must re-earn its `true`.
+    self.fully_announced = false;
+    // A fresh name restarts the §8.3 announcement sequence at the bottom rung.
+    self.partial_announce_streak = 0;
     self.clear_response_cycle_state();
   }
 
@@ -1689,6 +1856,8 @@ where
             self.pending_transmits = [None, None];
             self.response_deadline = None;
             self.goodbye.reset_instance();
+            self.fully_announced = false;
+            self.partial_announce_streak = 0;
             self.clear_response_cycle_state();
           }
         }
@@ -1848,10 +2017,13 @@ where
       return Ok(None);
     }
     // §9: emit a pending service-type enumeration reply (a single shared
-    // meta-PTR). Standalone like the rename goodbye — stamps NO awaiting_confirm
-    // (it advertises no instance records and is never withdrawn), so it gates no
-    // lifecycle/goodbye state. An un-encodable reply (near-MTU) is dropped, not
-    // surfaced as an error, so a remote meta-query can't poison the service.
+    // meta-PTR). It stamps a `MetaResponse` commit token — every datagram this
+    // method returns stamps exactly one token, which is what makes one outcome
+    // per datagram well defined — but that token gates no lifecycle or goodbye
+    // state: the meta-PTR is shared, advertises no instance records, and is never
+    // withdrawn, so its confirm only counts `responses_tx`. An un-encodable reply
+    // (near-MTU) is dropped, not surfaced as an error, so a remote meta-query
+    // can't poison the service.
     if self.meta_response_deadline.is_some_and(|due| now >= due) {
       // Consume the meta cycle up-front: clear the deadline, the questioner set,
       // and the suppression flag regardless of outcome.

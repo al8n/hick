@@ -7,7 +7,7 @@ use crate::{
   backend::RdataBuf,
   error::{HandleTimeoutError, TransmitError},
   event::{QueryEvent, QueryUpdate},
-  transmit::Transmit,
+  transmit::{Transmit, TransmitOutcome},
   wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
 };
 
@@ -152,6 +152,13 @@ pub struct Query<I, AN, EV> {
   /// is re-attempted without consuming the budget, so a transient send failure
   /// can never time out a query that never actually put a question on the wire.
   awaiting_send_confirm: bool,
+  /// Consecutive `PartiallyDelivered` sends since the last budget advance — the
+  /// extra doubling steps applied to the §5.2 backoff while the budget is frozen.
+  /// A partial send puts a real question on the served link's wire every re-arm,
+  /// and §5.2 requires "the intervals between successive queries MUST increase by
+  /// at least a factor of two"; a fully-failed send reaches no wire and so
+  /// neither uses nor advances this.
+  partial_send_streak: u32,
   /// When `true`, questions are emitted with the QU bit set (RFC 6762 §5.4):
   /// the sender prefers a unicast response rather than a multicast one.
   unicast_response: bool,
@@ -206,6 +213,7 @@ where
       next_seq: 0,
       transmit_pending: true,
       awaiting_send_confirm: false,
+      partial_send_streak: 0,
       unicast_response,
       timeout_deadline,
     }
@@ -580,30 +588,70 @@ where
     )))
   }
 
-  /// Report the result of sending the datagram most recently produced by
-  /// [`Self::poll_transmit`]. The driver calls this after a send,
-  /// with `delivered = true` when at least one socket send succeeded.
+  /// Report the delivery outcome of the datagram most recently produced by
+  /// [`Self::poll_transmit`].
   ///
-  /// On a delivered send this counts the transmission against the §5.2 retry
-  /// budget and schedules the next retransmit (backoff: +1s, doubling, capped
-  /// at 60s). On a failed send the budget is NOT consumed and the query is
-  /// re-armed to re-attempt at the same interval — so a transient or total send
-  /// failure retries with backoff (no tight spin) and a query can never reach
-  /// its retry-budget timeout having put nothing on the wire.
-  pub fn note_transmit_result(&mut self, now: I, delivered: bool) {
+  /// The §5.2 retry BUDGET advances iff [`TransmitOutcome::all_delivered`] — a
+  /// question that reached only some of the links the driver fans it onto has
+  /// not been asked everywhere, so spending a retry slot for it would time the
+  /// query out having never queried the missing link.
+  ///
+  /// * **All delivered** — count the transmission against the budget and
+  ///   schedule the next retransmit on the §5.2 backoff (+1 s, doubling, capped
+  ///   at 60 s).
+  /// * **Partially delivered** — the budget is NOT consumed, but the served
+  ///   link's wire did carry a real question, so the re-arm climbs the §5.2
+  ///   ladder: each consecutive partial doubles the interval, without ever
+  ///   burning a retry slot.
+  /// * **None delivered** — the budget is NOT consumed and the interval does not
+  ///   grow; the query re-attempts after the current backoff, so a transient or
+  ///   total send failure retries without a tight spin and can never reach the
+  ///   retry-budget timeout having put nothing on the wire.
+  pub fn note_transmit_outcome(&mut self, now: I, outcome: TransmitOutcome) {
     if !self.awaiting_send_confirm {
       return;
     }
     self.awaiting_send_confirm = false;
-    if delivered {
+    if outcome.all_delivered() {
       self.retry_count = self.retry_count.saturating_add(1);
+      self.partial_send_streak = 0;
       self.next_deadline = retry::next_deadline(now, self.retry_count);
+    } else if outcome.any_delivered() {
+      // §5.2 ladder: the served link heard this question, so the NEXT one must be
+      // at least twice as far out. `retry::next_deadline` derives the interval
+      // from a send index, so adding the partial streak to the (unspent) budget
+      // index walks the same doubling schedule — 1 s, 2 s, 4 s … — while
+      // `retry_count` itself stays frozen.
+      let index = self
+        .retry_count
+        .saturating_add(1)
+        .saturating_add(self.partial_send_streak);
+      self.next_deadline = retry::next_deadline(now, index);
+      self.partial_send_streak = self.partial_send_streak.saturating_add(1);
     } else {
-      // Re-attempt this (undelivered) send after its backoff interval without
-      // advancing `retry_count`. `transmit_pending` stays false until the
-      // deadline fires, so the driver's drain loop does not spin.
+      // Nothing reached any wire: §5.2 counts no query to space out. Re-attempt
+      // after the current backoff interval without advancing `retry_count` or the
+      // ladder. `transmit_pending` stays false until the deadline fires, so the
+      // driver's drain loop does not spin.
       self.next_deadline = retry::next_deadline(now, self.retry_count.saturating_add(1));
     }
+  }
+
+  /// Boolean form of [`Self::note_transmit_outcome`], retained for the migration
+  /// to [`TransmitOutcome`] and scheduled for removal.
+  ///
+  /// `delivered = true` maps to [`TransmitOutcome::AllDelivered`] and `false` to
+  /// [`TransmitOutcome::NoneDelivered`]; a dual-stack driver has no truthful
+  /// value to pass for a half-delivered question.
+  pub fn note_transmit_result(&mut self, now: I, delivered: bool) {
+    self.note_transmit_outcome(
+      now,
+      if delivered {
+        TransmitOutcome::AllDelivered
+      } else {
+        TransmitOutcome::NoneDelivered
+      },
+    );
   }
 
   /// RFC 6762 §7.3 duplicate-question suppression. Another host has multicast
@@ -642,6 +690,9 @@ where
     }
     self.transmit_pending = false;
     self.retry_count = self.retry_count.saturating_add(1);
+    // The peer's query counts as ours, so this IS a budget advance: the §5.2
+    // partial ladder resets exactly as it does on an all-delivered send.
+    self.partial_send_streak = 0;
     if self.retry_count > MAX_RETRIES {
       // Budget spent (counting suppressed slots as our sends) — retire exactly
       // as `handle_timeout` would after the final retransmit. Route through

@@ -1098,3 +1098,139 @@ fn duplicate_question_exhaustion_produces_timeout_and_correct_stats() {
     );
   }
 }
+
+// ── TransmitOutcome: the §5.2 retry budget and its ladder ─────────────
+
+/// Emit the query's pending datagram, leaving its confirm outstanding.
+fn emit_question(q: &mut TestQuery, now: StdInstant) {
+  let mut buf = std::vec![0u8; 512];
+  q.poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("a due query must produce a datagram");
+}
+
+#[test]
+fn partially_delivered_question_does_not_burn_the_retry_budget() {
+  // A question that reached only some of the links the driver fans it onto has
+  // not been asked everywhere. Burning a §5.2 retry slot for it would march the
+  // query to its retry-budget timeout having never queried the missing link —
+  // the same over-advance the §8.1/§8.3 phases suffer under `used > 0`.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let now = StdInstant::now();
+
+  emit_question(&mut q, now);
+  q.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+  assert_eq!(
+    q.retry_count, 0,
+    "a partially-delivered question must NOT consume a retry slot"
+  );
+  assert!(
+    q.next_deadline.is_some(),
+    "it must still re-arm, so the query keeps trying"
+  );
+  assert!(!q.is_done(), "and it must not be retired");
+}
+
+#[test]
+fn fully_delivered_question_burns_the_retry_budget() {
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let now = StdInstant::now();
+
+  emit_question(&mut q, now);
+  q.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+  assert_eq!(
+    q.retry_count, 1,
+    "a fully-delivered question advances the §5.2 budget"
+  );
+}
+
+#[test]
+fn undelivered_question_neither_burns_the_budget_nor_grows_the_interval() {
+  // Nothing reached any wire, so §5.2 counts no query to space out. This is the
+  // bit-for-bit parity row for the old `delivered = false`.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+
+  let mut previous = None;
+  for _ in 0..3 {
+    emit_question(&mut q, now);
+    q.note_transmit_outcome(now, TransmitOutcome::NoneDelivered);
+    assert_eq!(
+      q.retry_count, 0,
+      "an undelivered question must not consume a retry slot"
+    );
+    let gap = q.next_deadline.unwrap().duration_since(now);
+    if let Some(prev) = previous {
+      assert_eq!(
+        gap, prev,
+        "a fully-failed send does not climb the §5.2 ladder"
+      );
+    }
+    previous = Some(gap);
+    now = q.next_deadline.unwrap();
+    q.handle_timeout(now).unwrap();
+  }
+  assert_eq!(
+    previous,
+    Some(core::time::Duration::from_secs(1)),
+    "the undelivered retry stays at the initial §5.2 interval"
+  );
+}
+
+#[test]
+fn repeated_partial_questions_climb_the_rfc_5_2_doubling_ladder() {
+  // RFC 6762 §5.2: "the intervals between successive queries MUST increase by at
+  // least a factor of two". A partial send puts a real question on the served
+  // link's wire every round, so a flat-interval partial resend would violate that
+  // for the link that IS being served — while the budget stays frozen, because no
+  // slot was spent.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+
+  let expected_secs = [1u64, 2, 4, 8, 16, 32, 60, 60];
+  let mut previous = 0u64;
+  for (round, want) in expected_secs.iter().enumerate() {
+    emit_question(&mut q, now);
+    q.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+    let deadline = q.next_deadline.expect("a partial send always re-arms");
+    let gap = deadline.duration_since(now).as_secs();
+    assert_eq!(
+      gap, *want,
+      "partial resend {round} must re-arm {want} s out, got {gap} s"
+    );
+    assert_eq!(
+      q.retry_count, 0,
+      "no partial resend may consume a §5.2 retry slot"
+    );
+    if round > 0 && *want < 60 {
+      assert!(
+        gap >= previous.saturating_mul(2),
+        "§5.2 requires each interval to be at least double the previous one \
+         ({gap} s after {previous} s)"
+      );
+    }
+    previous = gap;
+    now = deadline;
+    q.handle_timeout(now).unwrap();
+  }
+  assert!(
+    !q.is_done(),
+    "the query is never retired by partial sends — the driver's obligation policy \
+     is what bounds this, not the retry budget"
+  );
+
+  // Recovery is immediate: the first fully-delivered question spends its slot and
+  // the ladder resets to the bottom rung.
+  emit_question(&mut q, now);
+  q.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+  assert_eq!(q.retry_count, 1, "recovery spends exactly one slot");
+  assert_eq!(
+    q.partial_send_streak, 0,
+    "a budget advance resets the partial ladder"
+  );
+  assert_eq!(
+    q.next_deadline.unwrap().duration_since(now),
+    core::time::Duration::from_secs(1),
+    "and the schedule returns to the §5.2 first-retry interval"
+  );
+}

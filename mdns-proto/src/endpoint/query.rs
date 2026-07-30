@@ -203,17 +203,44 @@ where
     }
   }
 
-  /// Report the send result for the datagram most recently produced by
-  /// [`Self::poll_query_transmit`] for `handle`. `delivered` is
-  /// `true` when at least one socket send succeeded; the query advances its
-  /// retry budget only on a confirmed-delivered send.
-  pub fn note_query_transmit_result(&mut self, handle: QueryHandle, now: I, delivered: bool) {
+  /// Report the delivery outcome of the datagram most recently produced by
+  /// [`Self::poll_query_transmit`] for `handle`.
+  ///
+  /// The query advances its RFC 6762 §5.2 retry budget only on
+  /// [`TransmitOutcome::all_delivered`]; a partially-delivered question climbs
+  /// the §5.2 doubling ladder without spending a slot. See
+  /// [`Query::note_transmit_outcome`] for the full contract. No-op for an
+  /// unknown handle.
+  pub fn note_query_transmit_outcome(
+    &mut self,
+    handle: QueryHandle,
+    now: I,
+    outcome: TransmitOutcome,
+  ) {
     let Some(key) = self.query_key(handle) else {
       return;
     };
     if let Some(q) = self.queries.get_mut(key) {
-      q.note_transmit_result(now, delivered);
+      q.note_transmit_outcome(now, outcome);
     }
+  }
+
+  /// Boolean form of [`Self::note_query_transmit_outcome`], retained for the
+  /// migration to [`TransmitOutcome`] and scheduled for removal.
+  ///
+  /// `delivered = true` maps to [`TransmitOutcome::AllDelivered`] and `false` to
+  /// [`TransmitOutcome::NoneDelivered`]; a dual-stack driver has no truthful
+  /// value to pass for a half-delivered question.
+  pub fn note_query_transmit_result(&mut self, handle: QueryHandle, now: I, delivered: bool) {
+    self.note_query_transmit_outcome(
+      handle,
+      now,
+      if delivered {
+        TransmitOutcome::AllDelivered
+      } else {
+        TransmitOutcome::NoneDelivered
+      },
+    );
   }
 
   /// Drive timer-based transitions on a registered query.

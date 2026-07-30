@@ -51,6 +51,32 @@ pub(crate) fn announce_deadline<I: Instant>(now: I, announce_count: u8) -> Optio
   now.checked_add_duration(wait)
 }
 
+/// Maximum doubling steps of the partial-announcement ladder. RFC §8.3 permits
+/// "up to eight unsolicited responses", i.e. seven intervals, so the ladder
+/// climbs 1, 2, 4, 8, 16, 32, 64 s and then holds at its top rung.
+const MAX_PARTIAL_ANNOUNCE_SHIFT: u32 = 6;
+
+/// Compute the re-announce deadline after a PARTIALLY-delivered announcement.
+///
+/// Unlike a fully-failed send, a partial one put a real datagram on the served
+/// link's wire, so its repetition is governed by RFC §8.3: the interval between
+/// unsolicited responses "increases by at least a factor of two with every
+/// response sent". `streak` is the number of consecutive partial announcements
+/// already confirmed BEFORE this one, so the first re-arms at the plain
+/// [`rfc::ANNOUNCE_INTERVAL`] and each subsequent one doubles, holding at
+/// [`MAX_PARTIAL_ANNOUNCE_SHIFT`] steps.
+///
+/// A fully-failed send is deliberately NOT on this ladder: it reached no wire, so
+/// §8.3 counts no response and the flat `announce_deadline(now, 1)` retry stands.
+#[allow(clippy::arithmetic_side_effects, dead_code)]
+pub(crate) fn partial_announce_deadline<I: Instant>(now: I, streak: u8) -> Option<I> {
+  let shift = u32::from(streak).min(MAX_PARTIAL_ANNOUNCE_SHIFT);
+  let secs = rfc::ANNOUNCE_INTERVAL
+    .as_secs()
+    .saturating_mul(1u64 << shift);
+  now.checked_add_duration(Duration::from_secs(secs))
+}
+
 /// Compute the next re-announce deadline once Established. Returns the time at which
 /// records should be re-broadcast (~80% of TTL).
 #[allow(clippy::integer_division, dead_code)]

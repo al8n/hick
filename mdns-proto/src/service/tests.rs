@@ -4691,3 +4691,423 @@ fn withdrawal_snapshot_of_never_announced_service_is_empty() {
 // name is handed off as its own detached item, so `withdrawal_snapshot` captures
 // only the CURRENT name — covered by `withdrawal_snapshot_after_rename_captures_only_current`
 // (snapshot side) and `conflict_rename_hands_off_old_announced_name` (handoff side).
+
+// ── TransmitOutcome: the invariant pair ───────────────────────────────
+//
+// Goodbye ownership latches iff `any_delivered()`; lifecycle phase advances iff
+// `all_delivered()`. Under a one-bit confirm those two answers were forced to be
+// the same, and every shipped driver resolved the collision wrongly in one
+// direction or the other.
+
+/// Drive a service from Init to `Announcing(0)` with every probe fully
+/// delivered, leaving no unconfirmed commit token. Returns the current instant.
+fn drive_to_announcing_zero(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+) -> FakeInstant {
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+  for _ in 0..20 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+    }
+    if matches!(svc.state(), ServiceState::Announcing(0)) {
+      return now;
+    }
+  }
+  panic!(
+    "service did not reach Announcing(0) within 20 ticks; state={:?}",
+    svc.state()
+  );
+}
+
+/// Fire the announce deadline and encode one announcement, leaving its commit
+/// token unresolved. Returns the instant the datagram was produced at.
+fn emit_announcement(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  now: FakeInstant,
+) -> FakeInstant {
+  let mut buf = std::vec![0u8; 4096];
+  let due = svc
+    .poll_timeout()
+    .expect("an announcing service always has a lifecycle deadline");
+  let at = if due > now { due } else { now };
+  svc.handle_timeout(at).unwrap();
+  svc
+    .poll_transmit(at, &mut buf)
+    .unwrap()
+    .expect("the fired announce deadline must produce a datagram");
+  assert!(
+    matches!(svc.awaiting_confirm, Some(AwaitingConfirm::Announcement(_))),
+    "expected an Announcement commit token, got {:?}",
+    svc.awaiting_confirm
+  );
+  at
+}
+
+#[test]
+fn partial_announcement_latches_ownership_without_advancing_the_phase() {
+  // The headline case. One logical announce fans out to IPv4 and IPv6; IPv4
+  // accepted it and IPv6 did not. Peers on the IPv4 link may now hold our
+  // records, so a later unregister MUST retract them (RFC 6762 §10.1) — but the
+  // IPv6 link has not been told, so the §8.3 phase must NOT advance.
+  //
+  // `used > 0` (the shipped hick-reactor policy) gets the ownership right and
+  // over-advances the phase; all-delivered (the hick-mio policy) gets the phase
+  // right and silently drops the goodbye. Only the enum satisfies both.
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  let at = emit_announcement(&mut svc, now);
+
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(0)),
+    "a partially-delivered announcement must NOT advance the §8.3 phase; got {:?}",
+    svc.state()
+  );
+  assert_eq!(
+    svc.announce_count, 0,
+    "the announcement count must not advance on a partial delivery"
+  );
+  assert!(
+    svc.advertises_instance(),
+    "the served link's peers may hold our instance records — ownership MUST latch"
+  );
+  assert!(
+    svc.advertises_host(),
+    "the served link's peers may hold our host records — ownership MUST latch"
+  );
+  // The regression the whole change exists to prevent: an unregister in this
+  // state must still produce a non-empty goodbye.
+  let snap = svc.withdrawal_snapshot();
+  assert!(
+    snap.owned.ptr() && snap.owned.srv() && snap.owned.txt(),
+    "a partially-announced service must still withdraw its instance records"
+  );
+  assert!(
+    !snap.host_a.is_empty(),
+    "a partially-announced service must still withdraw its host addresses"
+  );
+}
+
+#[test]
+fn fully_delivered_announcement_latches_ownership_and_advances_the_phase() {
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  let at = emit_announcement(&mut svc, now);
+
+  svc.note_transmit_outcome(at, TransmitOutcome::AllDelivered);
+
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(1)),
+    "a fully-delivered announcement advances the §8.3 phase; got {:?}",
+    svc.state()
+  );
+  assert!(
+    svc.advertises_instance() && svc.advertises_host(),
+    "a fully-delivered announcement also latches goodbye ownership"
+  );
+}
+
+#[test]
+fn undelivered_announcement_neither_latches_nor_advances() {
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  let at = emit_announcement(&mut svc, now);
+
+  svc.note_transmit_outcome(at, TransmitOutcome::NoneDelivered);
+
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(0)),
+    "an undelivered announcement must NOT advance the phase; got {:?}",
+    svc.state()
+  );
+  assert!(
+    !svc.advertises_instance(),
+    "nothing reached a wire, so no peer can hold our instance records"
+  );
+  assert!(
+    !svc.advertises_host(),
+    "nothing reached a wire, so no peer can hold our host records"
+  );
+  let snap = svc.withdrawal_snapshot();
+  assert!(
+    !snap.owned.ptr() && !snap.owned.srv() && !snap.owned.txt() && snap.host_a.is_empty(),
+    "an undelivered announcement must leave the goodbye empty"
+  );
+}
+
+#[test]
+fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
+  // RFC 6762 §8.3: a responder "MAY send up to eight unsolicited responses,
+  // provided that the interval between unsolicited responses increases by at
+  // least a factor of two with every response sent". A partial re-announce puts
+  // a REAL datagram on the served link's wire every round (unlike a fully-failed
+  // send, which puts nothing anywhere), so a flat 1 s partial retry would flood
+  // that link. Rungs: 1, 2, 4, 8, 16, 32, 64 s, then held.
+  let mut svc = make_service(120);
+  let mut now = drive_to_announcing_zero(&mut svc);
+
+  let expected_ms = [
+    1_000u64, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 64_000,
+  ];
+  let mut previous_gap = 0u64;
+  for (round, want_ms) in expected_ms.iter().enumerate() {
+    let at = emit_announcement(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+    let next = svc
+      .lifecycle_deadline
+      .expect("a partial announcement always re-arms");
+    let gap = next.0 - at.0;
+    assert_eq!(
+      gap, *want_ms,
+      "partial re-announce {round} must re-arm {want_ms} ms out, got {gap} ms"
+    );
+    if round > 0 && *want_ms != 64_000 {
+      assert!(
+        gap >= previous_gap.saturating_mul(2),
+        "§8.3 requires each interval to be at least double the previous one \
+         ({gap} ms after {previous_gap} ms)"
+      );
+    }
+    previous_gap = gap;
+    now = next;
+  }
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(0)),
+    "the whole ladder runs without the phase ever advancing; got {:?}",
+    svc.state()
+  );
+
+  // Recovery is immediate and lossless: the first fully-delivered announcement
+  // advances from exactly where the phase stood, and the ladder resets.
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::AllDelivered);
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(1)),
+    "recovery resumes the §8.3 sequence at the next step, not from the start; got {:?}",
+    svc.state()
+  );
+  assert_eq!(
+    svc.partial_announce_streak, 0,
+    "a phase advance resets the partial ladder to its bottom rung"
+  );
+}
+
+#[test]
+fn undelivered_announcement_keeps_the_flat_one_second_retry() {
+  // A fully-failed send reached no wire, so §8.3 counts no unsolicited response
+  // to space out: it keeps the flat 1 s retry and does not consume a ladder rung.
+  // This is also the bit-for-bit parity row for the old `delivered = false`.
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  let at = emit_announcement(&mut svc, now);
+
+  svc.note_transmit_outcome(at, TransmitOutcome::NoneDelivered);
+
+  let next = svc
+    .lifecycle_deadline
+    .expect("an undelivered announcement re-arms");
+  assert_eq!(
+    next.0 - at.0,
+    1_000,
+    "an undelivered announcement retries at the flat §8.3 interval"
+  );
+  assert_eq!(
+    svc.partial_announce_streak, 0,
+    "a fully-failed send does not climb the ladder"
+  );
+}
+
+#[test]
+fn partial_probe_re_arms_the_same_probe_and_latches_nothing() {
+  // A probe is a QUESTION (RFC 6762 §8.1): it advertises no records, so a partial
+  // probe latches no ownership. And a link that never saw the probe has not been
+  // asked, so the sequence must not advance — advancing here is precisely the
+  // §8.1 violation the `used > 0` driver policy produces.
+  let mut svc = make_service(120);
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+
+  // Reach Probing(1) with one fully-delivered probe, so a failure to advance is
+  // distinguishable from never having started.
+  'reach: for _ in 0..20 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+      if matches!(svc.state(), ServiceState::Probing(1)) {
+        break 'reach;
+      }
+    }
+  }
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(1)),
+    "expected Probing(1); got {:?}",
+    svc.state()
+  );
+
+  for _ in 0..5 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
+    svc.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+    assert!(
+      matches!(svc.state(), ServiceState::Probing(1)),
+      "a partially-delivered probe must NOT advance the §8.1 sequence; got {:?}",
+      svc.state()
+    );
+  }
+  assert!(
+    !svc.advertises_instance() && !svc.advertises_host(),
+    "a probe advertises nothing, so no delivery outcome may latch ownership"
+  );
+  assert!(
+    !svc.has_fully_announced().get(),
+    "probing is not announcing"
+  );
+
+  // Lossless recovery: the very next fully-delivered probe resumes at index 1.
+  now = now.advance(500);
+  svc.handle_timeout(now).unwrap();
+  assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(2)),
+    "recovery resumes the probe sequence where it stood; got {:?}",
+    svc.state()
+  );
+}
+
+// ── has_fully_announced: the reclaim-cancel gate ──────────────────────
+
+#[test]
+fn has_fully_announced_requires_a_fully_delivered_announcement() {
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  assert!(
+    !svc.has_fully_announced().get(),
+    "a probed-but-unannounced service has announced nothing"
+  );
+
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+  assert!(
+    svc.advertises_instance(),
+    "the partial announce DID expose the instance records (the any-fact)"
+  );
+  assert!(
+    !svc.has_fully_announced().get(),
+    "a partially-delivered announcement has not reached every obligated link, so it \
+     must not open the reclaim-cancel gate"
+  );
+
+  let at = emit_announcement(&mut svc, at);
+  svc.note_transmit_outcome(at, TransmitOutcome::AllDelivered);
+  assert!(
+    svc.has_fully_announced().get(),
+    "the first fully-delivered announcement opens the gate"
+  );
+}
+
+#[test]
+fn a_legacy_unicast_reply_never_opens_the_reclaim_cancel_gate() {
+  // RFC 6762 §6.7: a querier whose source port is not 5353 is a legacy resolver
+  // and gets a direct unicast reply. That reply has exactly ONE obligated link,
+  // so a driver reports it as `AllDelivered` by construction — which is why the
+  // gate cannot be `advertises_instance() && all_delivered()`. If it were, a
+  // single v4 legacy reply after a v4-only announce would cancel a renamed-away
+  // name's goodbye with the v6 debt unpaid and v6 having heard neither the
+  // goodbye nor the announcement.
+  let mut svc = make_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+
+  // A v4-only announce exposes the instance records without opening the gate.
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+  assert!(svc.advertises_instance() && !svc.has_fully_announced().get());
+
+  // A legacy querier (source port != 5353) asks; its unicast reply is fully
+  // delivered on its single obligated link.
+  let mut buf = std::vec![0u8; 4096];
+  let legacy_src: core::net::SocketAddr = "192.0.2.9:41234".parse().unwrap();
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in "_ipp._tcp.local.".trim_end_matches('.').split('.') {
+    qbuf.push(label.len() as u8);
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8);
+  qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  let (qref, _) = crate::wire::QuestionRef::try_parse(&qbuf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(crate::event::ServiceQuestion::new(qref, legacy_src, 0x4242)),
+    at,
+  );
+  let tx = svc
+    .poll_transmit(at, &mut buf)
+    .unwrap()
+    .expect("a legacy querier must get a unicast reply");
+  assert_eq!(tx.dst(), legacy_src, "the reply is unicast to the resolver");
+  svc.note_transmit_outcome(at, TransmitOutcome::AllDelivered);
+
+  assert!(
+    !svc.has_fully_announced().get(),
+    "a §6.7 legacy unicast reply is not an announcement — it must never open the \
+     reclaim-cancel gate, however it was delivered"
+  );
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(0)),
+    "a response carries no lifecycle phase; got {:?}",
+    svc.state()
+  );
+}
+
+#[test]
+fn a_conflict_rename_closes_the_reclaim_cancel_gate() {
+  // The gate names the CURRENT instance name. A §9 rename adopts a name that has
+  // announced nothing, so it must re-earn the gate exactly as a fresh service
+  // would — otherwise the renamed service would cancel its own old name's
+  // goodbye before ever announcing the replacement.
+  let mut svc = make_service(120);
+  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
+  // Precondition: the OLD name had fully announced (the state a §9 rename
+  // inherits from an Established service reverted to probing).
+  svc.goodbye.mark_instance();
+  svc.fully_announced = true;
+
+  // Lose an §8.2 tiebreak (peer SRV port 9999 > ours 631) → rename.
+  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut sbuf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (rec, _) = Ref::try_parse(&sbuf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
+    FakeInstant::zero(),
+  );
+  let later = FakeInstant::zero().advance(500);
+  svc.handle_timeout(later).unwrap();
+  assert!(
+    svc.name().as_str().contains("-1"),
+    "the service should have renamed; name={}",
+    svc.name().as_str()
+  );
+  assert!(
+    !svc.has_fully_announced().get(),
+    "the renamed-to name has announced nothing, so the gate must be closed again"
+  );
+  assert!(
+    !svc.advertises_instance(),
+    "instance ownership resets alongside the gate on a rename"
+  );
+}

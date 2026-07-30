@@ -412,15 +412,31 @@ where
     /// Idempotent overwrite (the advertised set only grows as the service
     /// announces), and a no-op for an unknown handle.
     ///
+    /// # `fully_announced`
+    ///
+    /// The RECLAIM-CANCEL gate. A [`FullyAnnounced`] that reads `true` retires any
+    /// reclaimable detached goodbye still draining for this instance name (see
+    /// below). The parameter is the opaque newtype rather than a `bool` because no
+    /// driver-side formula is admissible here: it must be
+    /// [`Service::has_fully_announced`] and nothing else. In particular it is NOT
+    /// [`Service::advertises_instance`] — that latch fires on ANY delivery, so a
+    /// v4-only announcement, or an RFC 6762 §6.7 legacy unicast reply (one
+    /// obligated link, hence fully delivered by construction), would cancel a
+    /// goodbye the unserved family still needs. Since [`FullyAnnounced`] has no
+    /// public constructor, that substitution no longer compiles.
+    ///
     /// [`Service::advertised_a_addrs`]: crate::service::Service::advertised_a_addrs
     /// [`Service::advertised_aaaa_addrs`]: crate::service::Service::advertised_aaaa_addrs
-    pub fn note_service_advertised(
+    /// [`Service::has_fully_announced`]: crate::service::Service::has_fully_announced
+    /// [`Service::advertises_instance`]: crate::service::Service::advertises_instance
+    pub fn note_service_announced(
       &mut self,
       handle: ServiceHandle,
       a: &[Ipv4Addr],
       aaaa: &[Ipv6Addr],
-      advertised_instance: bool,
+      fully_announced: FullyAnnounced,
     ) {
+      let fully_announced = fully_announced.get();
       let name = {
         let Some((_, route)) = self.services.iter_mut().find(|(_, r)| r.handle() == handle) else {
           return;
@@ -439,22 +455,55 @@ where
       // time could lose the goodbye if the caller dropped the registration before
       // owning the service — ).
       //
-      // The cancel is GATED on `advertised_instance`: this hook is called after EVERY
-      // delivered service transmit, INCLUDING probes, so cancelling on a probe would
-      // drop the goodbye before the reclaiming service ever announced — losing the
-      // retraction if it then drops, conflicts, or renames away. The
-      // address args cannot serve as the guard (an address-less service advertises no
-      // host addresses), so `Service::advertises_instance` is the precise signal. If
-      // the new service never announces, the goodbye is NEVER cancelled and completes
-      // normally. A name-HOLDING collision goodbye is left intact.
+      // The cancel is GATED on `fully_announced`: this hook is called after EVERY
+      // delivered service transmit, INCLUDING probes and responses, so cancelling on
+      // one of those would drop the goodbye before the reclaiming service ever
+      // announced — losing the retraction if it then drops, conflicts, or renames
+      // away. The address args cannot serve as the guard (an address-less service
+      // advertises no host addresses).
+      //
+      // The gate must be the ALL-delivered fact, not the any-delivered exposure
+      // latch: it may fire only once a complete announcement of this name has
+      // reached every link the driver still obligates, because only for such a link
+      // does §10.2's cache-flush announcement supersede the stale unique records the
+      // goodbye exists to retract. A partially-delivered announcement therefore
+      // leaves the old goodbye draining its per-family debt, which is exactly the
+      // case where the unserved family has heard neither the goodbye nor the
+      // replacement.
+      //
+      // If the new service never fully announces, the goodbye is NEVER cancelled and
+      // completes normally. A name-HOLDING collision goodbye is left intact.
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
-      if advertised_instance {
+      if fully_announced {
         self.withdrawals.retain(|(_, item)| {
           !(item.route.is_none()
             && !item.holds_name
             && item.records.instance().as_str() == name.as_str())
         });
       }
+    }
+
+    /// Boolean form of [`Self::note_service_announced`], retained for the
+    /// migration to [`FullyAnnounced`] and scheduled for removal alongside the
+    /// boolean confirm methods.
+    ///
+    /// Unlike those methods, deleting this one is the ONLY thing that will force
+    /// its call sites to be revisited: the parameter kept its arity and type while
+    /// its MEANING changed from the any-delivered exposure latch
+    /// ([`Service::advertises_instance`]) to the all-delivered announcement fact
+    /// ([`Service::has_fully_announced`]), so a driver that was never updated
+    /// still compiles and still cancels goodbyes it must not.
+    ///
+    /// [`Service::has_fully_announced`]: crate::service::Service::has_fully_announced
+    /// [`Service::advertises_instance`]: crate::service::Service::advertises_instance
+    pub fn note_service_advertised(
+      &mut self,
+      handle: ServiceHandle,
+      a: &[Ipv4Addr],
+      aaaa: &[Ipv6Addr],
+      fully_announced: bool,
+    ) {
+      self.note_service_announced(handle, a, aaaa, FullyAnnounced::new(fully_announced));
     }
 
     /// Host addresses that a LIVE same-host SIBLING route (any non-withdrawing

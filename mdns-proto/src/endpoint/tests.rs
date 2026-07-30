@@ -6976,3 +6976,206 @@ fn additional_section_ttl0_withdrawal_skipped_then_later_record_delivered() {
     "a TTL=0 additional must be skipped while the following positive-TTL one is delivered"
   );
 }
+
+// ── TransmitOutcome at the endpoint boundary ─────────────────────────
+
+#[test]
+fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = ep
+    .try_start_query(
+      crate::config::QuerySpec::new(qname, ResourceType::Any),
+      now,
+    )
+    .unwrap();
+  let mut buf = std::vec![0u8; 512];
+  assert!(ep.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
+
+  ep.note_query_transmit_outcome(h, now, TransmitOutcome::PartiallyDelivered);
+  let after_partial = ep.poll_query_timeout(h);
+  assert!(
+    after_partial.is_some(),
+    "a partially-delivered question must still re-arm"
+  );
+
+  // The budget is untouched, so the query survives far more partial rounds than
+  // MAX_RETRIES — the bound on this belongs to the driver's obligation policy.
+  for _ in 0..12 {
+    let due = ep.poll_query_timeout(h).unwrap();
+    ep.handle_query_timeout(h, due).unwrap();
+    assert!(ep.poll_query_transmit(h, due, &mut buf).unwrap().is_some());
+    ep.note_query_transmit_outcome(h, due, TransmitOutcome::PartiallyDelivered);
+  }
+  assert!(
+    ep.poll_query(h).is_none(),
+    "no partial send may retire the query"
+  );
+}
+
+/// Endpoint conformance for the driver-audit §2.3 reclaim sequence: a reclaiming
+/// service that has announced on only SOME obligated links must NOT cancel the
+/// renamed-away old name's in-flight goodbye. The gate is
+/// `Service::has_fully_announced`, ferried verbatim; the sequence dies at the
+/// step where a v4-only announce would previously have cancelled it, leaving the
+/// v6 zone with neither the goodbye nor the replacement announcement.
+#[test]
+fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
+  let mut ep = build_endpoint();
+  let mut now = StdInstant::now();
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let name = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("printer.local.").unwrap();
+
+  // A surviving rename left a RECLAIMABLE detached goodbye for the old name.
+  ep.enqueue_rename_withdrawal(
+    crate::service::RenameGoodbyeHandoff {
+      records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+    },
+    now,
+    false,
+  );
+
+  // A fresh service reclaims the vacated name.
+  let mut recs = ServiceRecords::new(stype, name.clone(), host, 631, 120);
+  recs.add_a(Ipv4Addr::new(192, 168, 1, 10));
+  let (handle, mut svc) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  // Drive its §8.1 probes, every one fully delivered, and ferry the gate after
+  // each confirm exactly as a driver does.
+  let mut buf = std::vec![0u8; 4096];
+  for _ in 0..20 {
+    if matches!(svc.state(), crate::ServiceState::Announcing(0)) {
+      break;
+    }
+    now = svc.poll_timeout().unwrap_or(now).max(now);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+      ep.note_service_announced(
+        handle,
+        svc.advertised_a_addrs(),
+        svc.advertised_aaaa_addrs(),
+        svc.has_fully_announced(),
+      );
+    }
+  }
+  assert!(
+    matches!(svc.state(), crate::ServiceState::Announcing(0)),
+    "expected the reclaiming service to finish probing; got {:?}",
+    svc.state()
+  );
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_some(),
+    "probing alone must never cancel the old name's goodbye"
+  );
+
+  // The first announcement reaches IPv4 only.
+  now = svc.poll_timeout().unwrap_or(now).max(now);
+  svc.handle_timeout(now).unwrap();
+  assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
+  svc.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+  assert!(
+    svc.advertises_instance(),
+    "the v4 zone heard it, so ownership latched"
+  );
+  ep.note_service_announced(
+    handle,
+    svc.advertised_a_addrs(),
+    svc.advertised_aaaa_addrs(),
+    svc.has_fully_announced(),
+  );
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_some(),
+    "the v6 zone has heard neither the goodbye nor the replacement — the old \
+     name's goodbye MUST keep draining"
+  );
+
+  // IPv6 recovers and the next announcement reaches every obligated link.
+  now = svc.poll_timeout().unwrap_or(now).max(now);
+  svc.handle_timeout(now).unwrap();
+  assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+  ep.note_service_announced(
+    handle,
+    svc.advertised_a_addrs(),
+    svc.advertised_aaaa_addrs(),
+    svc.has_fully_announced(),
+  );
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_none(),
+    "once every obligated link has heard the replacement, §10.2's cache-flush \
+     announcement supersedes the stale records and the goodbye is cancelled"
+  );
+}
+
+/// The reclaim-cancel gate is reachable ONLY through a `FullyAnnounced` minted by
+/// `Service::has_fully_announced`. This pins the two halves of that contract that
+/// a compile-time check cannot state from inside the crate: the value round-trips
+/// its fact, and the retained boolean form is exactly the same code path (so the
+/// three drivers still on it keep their current behaviour until they migrate).
+#[test]
+fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let name = Name::try_from_str("Ghost._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("ghost.local.").unwrap();
+
+  // A service that has announced nothing mints a `false` fact, which cancels
+  // nothing however it is delivered to the endpoint.
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+  ep.enqueue_rename_withdrawal(
+    crate::service::RenameGoodbyeHandoff {
+      records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+    },
+    now,
+    false,
+  );
+  let recs = ServiceRecords::new(stype, name.clone(), host, 631, 120);
+  let (handle, svc) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+  let fact = svc.has_fully_announced();
+  assert!(
+    !fact.get(),
+    "a freshly registered service has announced nothing"
+  );
+  ep.note_service_announced(handle, &[], &[], fact);
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_some(),
+    "a `false` fact cancels nothing"
+  );
+
+  // The retained boolean form is the same path: `true` still cancels, so the
+  // drivers that have not migrated behave exactly as before.
+  ep.note_service_advertised(handle, &[], &[], true);
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_none(),
+    "the boolean shim must keep working until the drivers migrate"
+  );
+}
