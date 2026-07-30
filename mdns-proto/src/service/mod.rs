@@ -155,7 +155,8 @@ cfg_heap! {
 }
 #[allow(unused_imports)]
 pub(crate) use schedule::{
-  announce_deadline, partial_announce_deadline, probe_deadline, re_announce_deadline,
+  MAX_PARTIAL_ROUNDS, PhaseAdvance, announce_deadline, classify_advance, later,
+  partial_announce_deadline, probe_deadline, re_announce_deadline,
 };
 pub use state::ServiceState;
 
@@ -345,10 +346,9 @@ cfg_heap! {
     /// `self.state`. Two things make the state wrong here. The periodic
     /// `Established` re-announce advances no phase yet is still re-armed on the
     /// RFC 6762 §8.3 doubling ladder while a link keeps missing it, so a
-    /// phase-derived tag would call it fire-and-forget and let a half-broken link
-    /// hold it at the ladder's 64 s cap instead of re-announcing at ~80 % of TTL.
-    /// And the state can advance between the deadline firing and the datagram
-    /// being encoded — the drift [`PendingTransmitKind`] already exists to absorb.
+    /// phase-derived tag would call it fire-and-forget. And the state can advance
+    /// between the deadline firing and the datagram being encoded — the drift
+    /// [`PendingTransmitKind`] already exists to absorb.
     #[inline]
     fn obligation(&self) -> TransmitObligation {
       match self {
@@ -638,6 +638,19 @@ cfg_heap! {
   /// §8.3's "increases by at least a factor of two with every response sent";
   /// a fully-failed send reaches no wire and so neither uses nor advances this.
   partial_announce_streak: u8,
+  /// Consecutive `PartiallyDelivered` LIFECYCLE confirms (§8.1 probe or §8.3
+  /// announcement) since the last phase advance — the core's own patience,
+  /// bounded by `MAX_PARTIAL_ROUNDS`. Reaching the bound EXCUSES the link that
+  /// keeps missing for one confirm, so the phase advances from exactly where it
+  /// stood instead of pinning forever.
+  ///
+  /// It lives beside the per-kind confirm arms that maintain it, so a §6 response
+  /// or a §9 meta reply — never re-armed, so evidence of nothing — structurally
+  /// cannot touch it. Reset by a fully-delivered confirm and by the excusal
+  /// itself; left ALONE by a wholly-failed one (see `classify_advance`); and
+  /// zeroed wherever the lifecycle regresses to `Init`, which starts a fresh
+  /// §8.1 sequence.
+  partial_rounds: u8,
   /// the commit token for the datagram `poll_transmit`
   /// most recently produced — `Some(kind)` while that send is awaiting a
   /// delivery result, `None` otherwise. This is the structural heart of the
@@ -745,6 +758,7 @@ where
       goodbye: GoodbyeOwnership::default(),
       fully_announced: false,
       partial_announce_streak: 0,
+      partial_rounds: 0,
       awaiting_confirm: None,
       pending_legacy: std::vec::Vec::new(),
       last_conflict_reprobe: None,
@@ -818,9 +832,14 @@ where
   /// Whether this service has CONFIRMED-EMITTED at least one INSTANCE record
   /// (PTR/SRV/TXT) on the wire — i.e. it has truly advertised its name, not merely
   /// probed for it. Unlike [`Self::advertises_host`] this is set even for an
-  /// address-less service. Drivers gate the endpoint's cancel-on-announce reclaim
-  /// on this so a probe alone cannot cancel a renamed-away old name's goodbye
-  /// before the reclaiming service has actually announced.
+  /// address-less service.
+  ///
+  /// This is the ANY-delivered EXPOSURE latch: it answers "may some peer hold
+  /// these records?", which is what a §10.1 goodbye must retract. It is
+  /// deliberately NOT the reclaim-cancel gate — that is
+  /// [`Self::has_fully_announced`], which requires EVERY obligated link to have
+  /// heard a complete announcement. See that method for why substituting this one
+  /// there is unsound, and why the fact is handed out wrapped so it cannot be.
   #[inline(always)]
   pub fn advertises_instance(&self) -> bool {
     self.goodbye.any_instance()
@@ -911,6 +930,26 @@ where
   /// * **Response / meta-response** — exposure is an any-delivered fact and no
   ///   phase exists, so partial and full delivery behave identically.
   /// * **Nothing pending** — no-op.
+  ///
+  /// # The bounded-patience escape
+  ///
+  /// Repeated partial delivery would otherwise re-arm forever, so after
+  /// `MAX_PARTIAL_ROUNDS` consecutive partial LIFECYCLE confirms the next one
+  /// is EXCUSED: the phase advances from exactly where it stood, without the link
+  /// that keeps missing. An excused advance is **not** a delivery, and this is
+  /// the whole of the distinction:
+  ///
+  /// * [`Self::has_fully_announced`] stays shut — no complete announcement
+  ///   reached every obligated link, so a renamed-away name's §10.1 goodbye must
+  ///   keep going;
+  /// * the §8.3 doubling ladder is preserved, and the re-arm is never EARLIER
+  ///   than the rung the served link already earned;
+  /// * `probes_tx` / `announcements_tx` do not count it — those counters mean
+  ///   "confirmed delivered by every obligated link", so an excused round is
+  ///   visible as an advance the counters never recorded.
+  ///
+  /// Goodbye ownership is unaffected either way: an excused round is still
+  /// `any_delivered`, so the records it put on a wire stay owned and retractable.
   pub fn note_transmit_outcome(&mut self, now: I, outcome: TransmitOutcome) {
     let kind = match self.awaiting_confirm.take() {
       Some(k) => k,
@@ -919,16 +958,20 @@ where
     match kind {
       AwaitingConfirm::Probe => {
         if let ServiceState::Probing(n) = self.state {
-          if !outcome.all_delivered() {
+          let advance = classify_advance(&mut self.partial_rounds, outcome);
+          if matches!(advance, PhaseAdvance::Partial | PhaseAdvance::Failed) {
             // §8.1: the probe did not reach every obligated link — do NOT
             // advance the sequence. Re-arm the SAME probe from post-send time so
             // it retries, rather than the service progressing toward Announcing
             // while a link that has never been asked might already hold the name.
             self.lifecycle_deadline = probe_deadline(now, n, &mut self.rng);
           } else {
-            // Probe reached the link — count it now (confirmed delivery).
+            // Only a genuine delivery counts: `probes_tx` means "reached every
+            // obligated link", so an excused advance must not inflate it.
             #[cfg(feature = "stats")]
-            if let Some(s) = self.stat() {
+            if matches!(advance, PhaseAdvance::Delivered)
+              && let Some(s) = self.stat()
+            {
               s.probes_tx(1);
             }
             if n >= 2 {
@@ -936,10 +979,21 @@ where
               self.state = ServiceState::Announcing(0);
               self.probe_count = 3;
               self.lifecycle_deadline = announce_deadline(now, 0);
-              // A fresh §8.3 announcement sequence starts from the bottom rung.
-              self.partial_announce_streak = 0;
+              match advance {
+                // A fresh §8.3 announcement sequence starts from the bottom rung.
+                PhaseAdvance::Delivered => self.partial_announce_streak = 0,
+                // An excused advance earns no reset: the served link is still on
+                // whatever rung it climbed to, and §8.3 forbids the next
+                // unsolicited response from coming sooner than the last one did.
+                // The rung itself does not move — a probe is a question, not an
+                // unsolicited response, so it is not a step on that ladder.
+                _ => self.floor_on_partial_ladder(now),
+              }
             } else {
               // Probe confirmed → schedule the next one PROBE_INTERVAL later.
+              // Probes stay off the ladders whether or not this one was excused:
+              // §8.1's own 250 ms cadence governs them and §6's one-second rule
+              // explicitly carves probing out.
               let new_n = n.saturating_add(1);
               self.state = ServiceState::Probing(new_n);
               self.probe_count = new_n;
@@ -949,7 +1003,8 @@ where
         }
       }
       AwaitingConfirm::Announcement(emitted) => {
-        if !outcome.any_delivered() {
+        let advance = classify_advance(&mut self.partial_rounds, outcome);
+        if matches!(advance, PhaseAdvance::Failed) {
           // The announcement never reached ANY link — re-arm without advancing
           // and latch nothing. Retry at the §8.3 inter-announce interval,
           // anchored to post-send time. This MUST also cover the periodic
@@ -978,7 +1033,7 @@ where
         // all-delivered phase check below: partial delivery owns what it exposed
         // even though it advances nothing.
         self.goodbye.record_emitted(&emitted);
-        if !outcome.all_delivered() {
+        if matches!(advance, PhaseAdvance::Partial) {
           // §8.3 phase does NOT advance — some obligated link has not been told.
           // Re-arm on the doubling ladder: this retry will put another real
           // datagram on the served link's wire, and §8.3 requires the interval
@@ -994,16 +1049,34 @@ where
           self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
           return;
         }
-        // Every obligated link accepted it: count it and advance the phase. The
-        // ladder resets — the next partial streak starts from the bottom rung.
-        #[cfg(feature = "stats")]
-        if let Some(s) = self.stat() {
-          s.announcements_tx(1);
+        if matches!(advance, PhaseAdvance::Excused) && self.state == ServiceState::Established {
+          // Nothing to advance: `Established` IS the terminal phase, so the only
+          // effect the escape can have here is to STOP laddering. Leave
+          // `lifecycle_deadline` exactly as `handle_timeout` armed it when it
+          // enqueued this re-announce — the periodic ~80 %-of-TTL cadence — so the
+          // service returns to normal re-announcing instead of climbing the
+          // partial ladder to its 64 s cap forever. The rung still advances: this
+          // round did put an unsolicited response on the served link's wire, so
+          // §8.3 spaces the next partial retry out from it.
+          self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
+          return;
         }
-        self.partial_announce_streak = 0;
-        // THE reclaim-cancel gate (see `has_fully_announced`): a complete
-        // announcement of the current name has now reached every obligated link.
-        self.fully_announced = true;
+        // The phase advances. Only a genuine delivery earns the credit that goes
+        // with it: `announcements_tx` counts confirmed-delivered datagrams, and
+        // the reclaim-cancel gate asserts that EVERY obligated link heard a
+        // complete announcement — neither of which an excused round did.
+        if matches!(advance, PhaseAdvance::Delivered) {
+          #[cfg(feature = "stats")]
+          if let Some(s) = self.stat() {
+            s.announcements_tx(1);
+          }
+          // The ladder resets — the next partial streak starts from the bottom
+          // rung.
+          self.partial_announce_streak = 0;
+          // THE reclaim-cancel gate (see `has_fully_announced`): a complete
+          // announcement of the current name has now reached every obligated link.
+          self.fully_announced = true;
+        }
         if let ServiceState::Announcing(n) = self.state {
           if n >= 1 {
             // Second announcement confirmed → the §8.3 startup sequence is
@@ -1035,6 +1108,21 @@ where
               "service: Announcing — first announcement confirmed, scheduling second"
             );
           }
+        }
+        if matches!(advance, PhaseAdvance::Excused)
+          && matches!(
+            self.state,
+            ServiceState::Announcing(_) | ServiceState::Established
+          )
+        {
+          // §8.3: the excused round still put a real unsolicited response on the
+          // served link's wire, so the next one must be at least twice as far
+          // out. Floor the advance's own deadline at the rung already earned,
+          // then climb one — the ladder is CARRIED ACROSS the excuse point, never
+          // reset by it. Without the floor the advance would re-arm at the flat
+          // 1 s interval and the served link would observe 2 s → 1 s.
+          self.floor_on_partial_ladder(now);
+          self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
         }
       }
       AwaitingConfirm::Response(emitted, _kas_suppressed_count) => {
@@ -1089,14 +1177,36 @@ where
     }
   }
 
+  /// Push `lifecycle_deadline` out to the rung the RFC 6762 §8.3 partial ladder
+  /// has already earned, if that is later than what the caller just armed.
+  ///
+  /// Only an EXCUSED advance needs this. The phase moves without the link that
+  /// kept missing, so the advance re-arms on the fresh phase's own schedule —
+  /// `announce_deadline`, a flat 1 s — while the SERVED link has been climbing
+  /// the doubling ladder all along. Letting the fresh schedule win would make
+  /// that link observe an interval SHORTER than the one before it, the exact
+  /// §8.3 violation ("increases by at least a factor of two with every response
+  /// sent") the ladder exists to prevent.
+  ///
+  /// A streak of zero means the ladder is not engaged, so the advance's own
+  /// deadline stands unchanged.
+  fn floor_on_partial_ladder(&mut self, now: I) {
+    if self.partial_announce_streak == 0 {
+      return;
+    }
+    self.lifecycle_deadline = later(
+      self.lifecycle_deadline,
+      partial_announce_deadline(now, self.partial_announce_streak),
+    );
+  }
+
   /// The [`TransmitObligation`] of the datagram whose commit token is currently
   /// stamped — the tag [`Self::poll_transmit`] hands the driver.
   ///
   /// A pure function of the token, so the tag always describes what
   /// [`Self::note_transmit_outcome`] will actually do with the confirm. A
   /// datagram that stamped NO token obligates nothing at all (the confirm is a
-  /// no-op), so it reports `OneShot` and stays out of the driver's bounded
-  /// obligation counter.
+  /// no-op), so it reports `OneShot`.
   #[inline]
   fn stamped_obligation(&self) -> TransmitObligation {
     match &self.awaiting_confirm {
@@ -1314,6 +1424,9 @@ where
     self.fully_announced = false;
     // A fresh name restarts the §8.3 announcement sequence at the bottom rung.
     self.partial_announce_streak = 0;
+    // …and restarts the §8.1 sequence, so the patience already spent waiting for
+    // a lagging link under the OLD name may not excuse a probe of the new one.
+    self.partial_rounds = 0;
     self.clear_response_cycle_state();
   }
 
@@ -1490,6 +1603,16 @@ where
         self.announce_count = 0;
         self.pending_transmits = [None, None];
         self.response_deadline = None;
+        // A fresh §8.1 sequence: the patience already spent waiting for a lagging
+        // link must not excuse a probe of the name we are re-verifying. This is
+        // the SAME name, so unlike a rename the per-advertised-name state stays
+        // put — `fully_announced` in particular. Ferrying it into the re-probe is
+        // sound: the only thing it can do is cancel a renamed-away predecessor's
+        // §10.1 goodbye, and any goodbye this name could cancel was already
+        // cancelled when it first fully announced. A NEW same-name detached
+        // goodbye cannot appear meanwhile — the endpoint's name guard rejects a
+        // same-name registration while this service holds the route.
+        self.partial_rounds = 0;
         self.clear_response_cycle_state();
         self.lifecycle_deadline = probe_deadline(now, 0, &mut self.rng);
       }

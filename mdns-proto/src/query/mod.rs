@@ -7,6 +7,7 @@ use crate::{
   backend::RdataBuf,
   error::{HandleTimeoutError, TransmitError},
   event::{QueryEvent, QueryUpdate},
+  service::{PhaseAdvance, classify_advance},
   transmit::{Transmit, TransmitObligation, TransmitOutcome},
   wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
 };
@@ -159,6 +160,15 @@ pub struct Query<I, AN, EV> {
   /// at least a factor of two"; a fully-failed send reaches no wire and so
   /// neither uses nor advances this.
   partial_send_streak: u32,
+  /// Consecutive `PartiallyDelivered` sends since the last budget advance — the
+  /// core's own patience, bounded by `MAX_PARTIAL_ROUNDS`. A partial send
+  /// freezes the §5.2 budget, so without the bound a half-reachable link would
+  /// keep a question re-asking on the growing partial interval and the query
+  /// would never reach its terminal timeout. Reaching the bound EXCUSES that link
+  /// for one confirm and the budget advances. Reset by a fully-delivered send and
+  /// by the excusal itself; left ALONE by a wholly-failed one (see
+  /// [`classify_advance`]).
+  partial_rounds: u8,
   /// When `true`, questions are emitted with the QU bit set (RFC 6762 §5.4):
   /// the sender prefers a unicast response rather than a multicast one.
   unicast_response: bool,
@@ -214,6 +224,7 @@ where
       transmit_pending: true,
       awaiting_send_confirm: false,
       partial_send_streak: 0,
+      partial_rounds: 0,
       unicast_response,
       timeout_deadline,
     }
@@ -582,9 +593,9 @@ where
       "query: poll_transmit emitting question"
     );
     // Sustained: a question that did not reach every obligated link re-arms
-    // WITHOUT spending a §5.2 retry slot (see `note_transmit_outcome`), so a link
-    // that keeps missing holds the query open indefinitely unless the driver's
-    // bounded obligation policy eventually excuses it.
+    // WITHOUT spending a §5.2 retry slot (see `note_transmit_outcome`), until the
+    // core's patience bound (`MAX_PARTIAL_ROUNDS`) excuses the link that keeps
+    // missing and the budget resumes.
     Ok(Some(Transmit::new(
       crate::service::multicast_dst(),
       None,
@@ -612,33 +623,56 @@ where
   ///   grow; the query re-attempts after the current backoff, so a transient or
   ///   total send failure retries without a tight spin and can never reach the
   ///   retry-budget timeout having put nothing on the wire.
+  ///
+  /// A frozen budget cannot stay frozen forever, or a chronically half-reachable
+  /// link would keep the query re-asking without ever reaching its terminal
+  /// timeout. After `MAX_PARTIAL_ROUNDS` consecutive partials the next one is
+  /// EXCUSED and spends a slot — but takes none of the credit a delivery earns:
+  /// the §5.2 ladder is carried across the excuse point rather than reset, so the
+  /// served link never sees a shorter interval than the one before it.
   pub fn note_transmit_outcome(&mut self, now: I, outcome: TransmitOutcome) {
     if !self.awaiting_send_confirm {
       return;
     }
     self.awaiting_send_confirm = false;
-    if outcome.all_delivered() {
-      self.retry_count = self.retry_count.saturating_add(1);
-      self.partial_send_streak = 0;
-      self.next_deadline = retry::next_deadline(now, self.retry_count);
-    } else if outcome.any_delivered() {
-      // §5.2 ladder: the served link heard this question, so the NEXT one must be
-      // at least twice as far out. `retry::next_deadline` derives the interval
-      // from a send index, so adding the partial streak to the (unspent) budget
-      // index walks the same doubling schedule — 1 s, 2 s, 4 s … — while
-      // `retry_count` itself stays frozen.
-      let index = self
-        .retry_count
-        .saturating_add(1)
-        .saturating_add(self.partial_send_streak);
-      self.next_deadline = retry::next_deadline(now, index);
-      self.partial_send_streak = self.partial_send_streak.saturating_add(1);
-    } else {
-      // Nothing reached any wire: §5.2 counts no query to space out. Re-attempt
-      // after the current backoff interval without advancing `retry_count` or the
-      // ladder. `transmit_pending` stays false until the deadline fires, so the
-      // driver's drain loop does not spin.
-      self.next_deadline = retry::next_deadline(now, self.retry_count.saturating_add(1));
+    match classify_advance(&mut self.partial_rounds, outcome) {
+      PhaseAdvance::Delivered => {
+        self.retry_count = self.retry_count.saturating_add(1);
+        self.partial_send_streak = 0;
+        self.next_deadline = retry::next_deadline(now, self.retry_count);
+      }
+      PhaseAdvance::Excused => {
+        // The slot is spent so the query can progress to its terminal, but the
+        // send was NOT delivered everywhere: the ladder keeps climbing from where
+        // it stood rather than resetting to the bottom rung. Indexing the backoff
+        // by budget + streak is the same walk the honest-partial arm below does,
+        // so the served link's intervals stay monotonically doubling across the
+        // excuse point.
+        self.retry_count = self.retry_count.saturating_add(1);
+        let index = self.retry_count.saturating_add(self.partial_send_streak);
+        self.next_deadline = retry::next_deadline(now, index);
+        self.partial_send_streak = self.partial_send_streak.saturating_add(1);
+      }
+      PhaseAdvance::Partial => {
+        // §5.2 ladder: the served link heard this question, so the NEXT one must
+        // be at least twice as far out. `retry::next_deadline` derives the
+        // interval from a send index, so adding the partial streak to the
+        // (unspent) budget index walks the same doubling schedule — 1 s, 2 s,
+        // 4 s … — while `retry_count` itself stays frozen.
+        let index = self
+          .retry_count
+          .saturating_add(1)
+          .saturating_add(self.partial_send_streak);
+        self.next_deadline = retry::next_deadline(now, index);
+        self.partial_send_streak = self.partial_send_streak.saturating_add(1);
+      }
+      PhaseAdvance::Failed => {
+        // Nothing reached any wire: §5.2 counts no query to space out. Re-attempt
+        // after the current backoff interval without advancing `retry_count` or
+        // the ladder. `transmit_pending` stays false until the deadline fires, so
+        // the driver's drain loop does not spin.
+        self.next_deadline = retry::next_deadline(now, self.retry_count.saturating_add(1));
+      }
     }
   }
 

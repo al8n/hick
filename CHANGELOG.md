@@ -41,15 +41,21 @@ BREAKING
 - `mdns-proto`: new `TransmitObligation` enum (`Sustained` / `OneShot`), carried
   on every `Transmit` and readable via `Transmit::obligation()`;
   `Transmit::new` takes it as a fourth argument. It states whether the core will
-  re-arm that datagram until every obligated link accepts it, and a driver's
-  bounded obligation policy applies to `Sustained` datagrams only. The tag is a
-  function of what was encoded, not of the service's lifecycle phase: the
-  periodic `Established` re-announce advances no phase yet is still re-armed on
-  the §8.3 ladder, and `Query::poll_transmit` has no service phase at all.
-- A driver capable of reporting `PartiallyDelivered` **must** implement a
-  bounded obligation policy (write-off / degradation of the missing family) —
-  normative on `TransmitOutcome`'s rustdoc. All four drivers in this workspace
-  ship one (see FIXES).
+  re-arm that datagram until every obligated link accepts it, which is what a
+  driver needs to know to decide what a PERMANENT send failure costs: a
+  `Sustained` datagram that can never be sent would be re-offered forever and so
+  retires its producer, while an undeliverable `OneShot` reply costs one
+  unanswered question. The tag is a function of what was encoded, not of the
+  service's lifecycle phase: the periodic `Established` re-announce advances no
+  phase yet is still re-armed on the §8.3 ladder, and `Query::poll_transmit` has
+  no service phase at all.
+- The bound on repeated partial delivery lives in `mdns-proto`, not in drivers.
+  Repeated `PartiallyDelivered` re-arms indefinitely, so the core bounds how many
+  consecutive re-arms one producer spends waiting for a link that never accepts
+  and then advances the phase without it. A driver reports the honest fan-out
+  shape and nothing else. The split is normative on `TransmitOutcome`'s rustdoc:
+  the driver owns the obligated set and link death; the core owns its own
+  patience.
 
 FIXES (dependent-crate behaviour; visible without any source change on the
 caller's part)
@@ -69,23 +75,40 @@ caller's part)
   previously a single-family announcement, or even an RFC 6762 §6.7 legacy
   unicast reply, could cancel it. Fixes stranded peers on the unserved family
   holding withdrawn records until positive TTL.
-- All four drivers: new bounded-obligation policy — after two consecutive
-  partially-delivered fan-outs for the same service or query, the third
-  excuses the still-missing families for that one confirm so the phase
-  advances anyway. A permanently half-reachable link now still reaches
-  `Established` (at roughly 3x the round count) instead of pinning in probing
-  forever.
-- All four drivers: the bounded-obligation counter now sees lifecycle datagrams
-  only. Responses (the §6 multicast reply, the §6.7 legacy unicast reply, the
-  RFC 6763 §9 meta reply) are never re-armed, so feeding their confirms to the
-  counter corrupted it in both directions: a unicast reply has one obligated
-  family and is all-delivered by construction, so it RESET the counter — a
-  service answering legacy queriers between lifecycle rounds held it at zero and
-  the bound never fired, pinning the service on a chronically half-broken link;
-  and a partially-delivered multicast response PRELOADED it, so the next partial
-  probe was excused and §8.1 advanced although one family never heard the probe.
-  Drivers also clear the counter when they observe `ServiceUpdate::Renamed`,
-  mirroring the core's own rename reset of its §8.3 partial-announce ladder.
+- `mdns-proto`: bounded patience — after two consecutive partially-delivered
+  lifecycle confirms for the same service or query, the third is EXCUSED and the
+  phase advances without the link that keeps missing. A permanently
+  half-reachable link now still reaches `Established` — after ~30 s, since the
+  served link's announcements stay on §8.3's doubling ladder throughout —
+  instead of pinning in probing forever. An excused advance is not a
+  delivery: it does not set `Service::has_fully_announced`, does not reset the
+  §8.3 / §5.2 doubling ladder (and never re-arms EARLIER than the rung the served
+  link already earned), and does not bump `probes_tx` / `announcements_tx` —
+  those counters mean "confirmed delivered by every obligated link", so a
+  permanently half-broken host no longer reports a healthy startup.
+  `NoneDelivered` leaves the count untouched, so an alternating partial/failed
+  pattern cannot evade the bound. The count is reset wherever the lifecycle
+  regresses to `Init` — both the §9 conflict rename and the RFC 6763 §9 same-name
+  revert-to-probe, the latter of which emits no `ServiceUpdate` and so was
+  unreachable from a driver.
+- Because the count lives inside the per-kind confirm arms, a response (the §6
+  multicast reply, the §6.7 legacy unicast reply, the RFC 6763 §9 meta reply)
+  structurally cannot move it. Those datagrams are never re-armed, so counting
+  them corrupts the bound in both directions: a unicast reply has one obligated
+  family and is all-delivered by construction, so it would RESET the count — a
+  service answering legacy queriers between lifecycle rounds would hold it at
+  zero and the bound would never fire; and a partially-delivered multicast
+  response would PRELOAD it, so the next partial probe would be excused and §8.1
+  would advance although one family never heard the probe.
+- `hick-smoltcp` / `hick-embassy`: a multicast RESPONSE that is permanently
+  undeliverable (too large for every reachable socket) no longer retires the
+  service. It resolves as `NoneDelivered` — nothing latched, nothing advanced,
+  the querier re-asks — matching the adjacent unicast branch. Previously any
+  on-link peer could tear down a healthy established service by asking it a
+  question whose answer did not fit the TX buffer: the service was marked
+  errored, surfaced `Conflict`, and began withdrawing. An undeliverable
+  `Sustained` datagram (probe, announcement, query) still retires its producer,
+  which is the case that reasoning was written for.
 - `hick-smoltcp` / `hick-embassy`: a PRESENT but unbound (or unaddressable) UDP
   socket is now `SendError::Busy`, not `SendError::Unsupported`. `Unsupported`
   removes a family from the obligated set, so a bound-IPv4 + present-but-unbound

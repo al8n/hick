@@ -1,10 +1,11 @@
-//! Computes deadlines for the probe → announce → re-announce sequence.
+//! Computes deadlines for the probe → announce → re-announce sequence, and the
+//! bound on how long the core keeps waiting for a link that never accepts.
 
 use core::time::Duration;
 
 use rand_core::Rng;
 
-use crate::Instant;
+use crate::{Instant, transmit::TransmitOutcome};
 
 /// Pre-computed timing constants from RFC 6762.
 pub(crate) mod rfc {
@@ -75,6 +76,95 @@ pub(crate) fn partial_announce_deadline<I: Instant>(now: I, streak: u8) -> Optio
     .as_secs()
     .saturating_mul(1u64 << shift);
   now.checked_add_duration(Duration::from_secs(secs))
+}
+
+/// How many CONSECUTIVE partially-delivered confirms one producer (a service or
+/// a query) re-arms for before the core stops waiting for the link that keeps
+/// missing and advances the phase without it.
+///
+/// This bounds the CORE'S OWN PATIENCE. The core re-arms a
+/// [`TransmitOutcome::PartiallyDelivered`] datagram losslessly and never advances
+/// on one, so without a bound a link that is up enough to be obligated but never
+/// carries anything holds every service in probing forever. The bound is
+/// lifecycle policy, made of facts the core already owns — the confirm shape and
+/// its own re-arm count — and needs nothing about sockets or link health. See
+/// [`TransmitOutcome`] for why the DRIVER still owns the obligated set.
+///
+/// The bound counts ROUNDS on the confirm stream rather than wall-clock time,
+/// because the re-offer cadence spans 250 ms while probing (RFC 6762 §8.1's own
+/// interval) up to 64 s at the top of the §8.3 partial ladder, a factor of 256:
+/// any single degrade window means ~120 attempts in one phase and one attempt in
+/// the other. Rounds are the unit the re-arm schedule already speaks.
+///
+/// Two rounds is the smallest count that separates contention from failure. A
+/// re-arm is lossless — the SAME probe index / announcement count is re-encoded —
+/// so a link that missed round 1 because the transport had room for one datagram
+/// gets that exact datagram again in round 2. It also caps the §8.3 doubling
+/// ladder at its second rung, delaying an announcement step by at most 1 s + 2 s.
+#[allow(dead_code)]
+pub(crate) const MAX_PARTIAL_ROUNDS: u8 = 2;
+
+/// What one confirm means for the producer's lifecycle phase, after the core's
+/// patience bound ([`MAX_PARTIAL_ROUNDS`]) has been applied to the driver's
+/// honest [`TransmitOutcome`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PhaseAdvance {
+  /// Every obligated link accepted the datagram. Advance the phase and take the
+  /// full credit a delivery earns.
+  Delivered,
+  /// An obligated link still has not accepted it, but the producer has already
+  /// re-armed [`MAX_PARTIAL_ROUNDS`] times waiting for it. Advance the phase —
+  /// and NOTHING else. An excused advance is not a delivery: it earns no
+  /// announcement proof, no ladder reset, and no delivered-datagram counter.
+  Excused,
+  /// An obligated link accepted the datagram, another did not, and the bound has
+  /// not fired. Hold the phase and re-arm on the doubling ladder — this retry
+  /// will put another real datagram on the served link's wire.
+  Partial,
+  /// Nothing reached any wire. Hold the phase and retry flat: no link was served,
+  /// so no interval needs spacing out.
+  Failed,
+}
+
+/// Apply the core's patience bound to one confirm, updating `rounds` in place.
+///
+/// `rounds` is the producer's own consecutive-partial counter. `NoneDelivered`
+/// deliberately leaves it UNTOUCHED rather than resetting it: nothing reached a
+/// wire, so no obligation was met and none may be written off — and resetting
+/// would let an alternating partial/failed pattern evade the bound forever.
+#[allow(dead_code)]
+pub(crate) fn classify_advance(rounds: &mut u8, outcome: TransmitOutcome) -> PhaseAdvance {
+  match outcome {
+    TransmitOutcome::AllDelivered => {
+      *rounds = 0;
+      PhaseAdvance::Delivered
+    }
+    TransmitOutcome::PartiallyDelivered if *rounds >= MAX_PARTIAL_ROUNDS => {
+      *rounds = 0;
+      PhaseAdvance::Excused
+    }
+    TransmitOutcome::PartiallyDelivered => {
+      *rounds = rounds.saturating_add(1);
+      PhaseAdvance::Partial
+    }
+    TransmitOutcome::NoneDelivered => PhaseAdvance::Failed,
+  }
+}
+
+/// The later of two deadlines, treating `None` (an unrepresentable instant) as
+/// "no constraint" rather than as "immediately".
+///
+/// Used to floor an EXCUSED advance's re-arm at the rung the doubling ladder has
+/// already earned, so the served link never observes a SHORTER interval across
+/// the excuse point than it did before it.
+#[allow(dead_code)]
+pub(crate) fn later<I: Instant>(a: Option<I>, b: Option<I>) -> Option<I> {
+  match (a, b) {
+    (Some(x), Some(y)) => Some(x.max(y)),
+    (Some(x), None) => Some(x),
+    (None, b) => b,
+  }
 }
 
 /// Compute the next re-announce deadline once Established. Returns the time at which

@@ -4844,16 +4844,20 @@ fn undelivered_announcement_neither_latches_nor_advances() {
 fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
   // RFC 6762 §8.3: a responder "MAY send up to eight unsolicited responses,
   // provided that the interval between unsolicited responses increases by at
-  // least a factor of two with every response sent". A partial re-announce puts
-  // a REAL datagram on the served link's wire every round (unlike a fully-failed
+  // least a factor of two with every response sent". A partial re-announce puts a
+  // REAL datagram on the served link's wire every round (unlike a fully-failed
   // send, which puts nothing anywhere), so a flat 1 s partial retry would flood
-  // that link. Rungs: 1, 2, 4, 8, 16, 32, 64 s, then held.
+  // that link.
+  //
+  // The ladder must survive the core's patience escape. Every third round here is
+  // EXCUSED — the phase advances without the link that keeps missing — and the
+  // served link must NOT then observe a shorter interval than the one before it:
+  // the excused round re-arms on the rung it earned (4 s), not on the fresh
+  // phase's flat `announce_deadline` (1 s).
   let mut svc = make_service(120);
   let mut now = drive_to_announcing_zero(&mut svc);
 
-  let expected_ms = [
-    1_000u64, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 64_000,
-  ];
+  let expected_ms = [1_000u64, 2_000, 4_000, 8_000, 16_000];
   let mut previous_gap = 0u64;
   for (round, want_ms) in expected_ms.iter().enumerate() {
     let at = emit_announcement(&mut svc, now);
@@ -4866,7 +4870,7 @@ fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
       gap, *want_ms,
       "partial re-announce {round} must re-arm {want_ms} ms out, got {gap} ms"
     );
-    if round > 0 && *want_ms != 64_000 {
+    if round > 0 {
       assert!(
         gap >= previous_gap.saturating_mul(2),
         "§8.3 requires each interval to be at least double the previous one \
@@ -4876,25 +4880,59 @@ fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
     previous_gap = gap;
     now = next;
   }
+  // Rounds 0-1 held the phase; round 2 was excused into Announcing(1); rounds 3-4
+  // held it again.
   assert!(
-    matches!(svc.state(), ServiceState::Announcing(0)),
-    "the whole ladder runs without the phase ever advancing; got {:?}",
+    matches!(svc.state(), ServiceState::Announcing(1)),
+    "exactly one excused advance may have happened across five partial rounds; \
+     got {:?}",
     svc.state()
   );
+  assert!(
+    !svc.has_fully_announced().get(),
+    "no announcement ever reached every obligated link, so the reclaim-cancel \
+     gate must still be shut — an excused advance is not a delivery"
+  );
+  assert!(
+    svc.advertises_instance(),
+    "every one of those rounds still put records on the served link's wire"
+  );
 
-  // Recovery is immediate and lossless: the first fully-delivered announcement
-  // advances from exactly where the phase stood, and the ladder resets.
+  // Recovery is immediate and resumes from exactly where the sequence stood.
   let at = emit_announcement(&mut svc, now);
   svc.note_transmit_outcome(at, TransmitOutcome::AllDelivered);
   assert!(
-    matches!(svc.state(), ServiceState::Announcing(1)),
+    matches!(svc.state(), ServiceState::Established),
     "recovery resumes the §8.3 sequence at the next step, not from the start; got {:?}",
     svc.state()
   );
   assert_eq!(
     svc.partial_announce_streak, 0,
-    "a phase advance resets the partial ladder to its bottom rung"
+    "a genuine delivery resets the partial ladder to its bottom rung"
   );
+  assert!(
+    svc.has_fully_announced().get(),
+    "and it is the delivery, not the excuse, that opens the reclaim-cancel gate"
+  );
+}
+
+#[test]
+fn the_partial_announce_ladder_doubles_to_its_cap() {
+  // The rung table itself, independent of how many rounds the phase survives:
+  // 1, 2, 4, 8, 16, 32, 64 s and then held. RFC 6762 §8.3 permits "up to eight
+  // unsolicited responses", i.e. seven intervals.
+  let now = FakeInstant::zero();
+  let expected_ms = [
+    1_000u64, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 64_000, 64_000,
+  ];
+  for (streak, want_ms) in expected_ms.iter().enumerate() {
+    let at = partial_announce_deadline(now, streak as u8).expect("representable");
+    assert_eq!(
+      at.0, *want_ms,
+      "streak {streak} must re-arm {want_ms} ms out, got {} ms",
+      at.0
+    );
+  }
 }
 
 #[test]
@@ -4950,7 +4988,9 @@ fn partial_probe_re_arms_the_same_probe_and_latches_nothing() {
     svc.state()
   );
 
-  for _ in 0..5 {
+  // Within the core's patience bound every partial round re-arms the SAME probe
+  // index. (The bound's own escape is asserted separately.)
+  for _ in 0..MAX_PARTIAL_ROUNDS {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
@@ -5133,9 +5173,8 @@ fn question_bytes(qname: &str, qtype: u16) -> std::vec::Vec<u8> {
 ///
 /// The `Established` periodic re-announce is the row that rules out deriving the
 /// tag from the service PHASE. It advances no phase, yet a partial confirm
-/// re-arms it on the RFC 6762 §8.3 doubling ladder, so a driver that skipped its
-/// bounded obligation policy there would let a half-broken link hold the
-/// re-announce at the ladder's cap instead of at ~80 % of TTL.
+/// re-arms it on the RFC 6762 §8.3 doubling ladder, so a phase-derived tag would
+/// call it fire-and-forget.
 #[test]
 fn transmit_obligation_is_a_function_of_the_commit_token() {
   use crate::{event::ServiceQuestion, wire::QuestionRef};
@@ -5245,7 +5284,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
     legacy.obligation(),
     TransmitObligation::OneShot,
     "§6.7: a legacy reply has one obligated link and is never re-armed, so \
-     feeding its confirm to a bounded obligation counter would reset it"
+     missing it pins nothing and costs one unanswered question"
   );
   svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
 
@@ -5287,5 +5326,439 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
     meta.obligation(),
     TransmitObligation::OneShot,
     "§9: the shared meta-PTR is emitted once per meta-query and never re-armed"
+  );
+}
+
+// ── The core's patience bound ───────────────────────────────────────────────
+
+/// Fire the probe deadline and encode one probe, leaving its commit token
+/// unresolved. Returns the instant the datagram was produced at.
+fn emit_probe(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  now: FakeInstant,
+) -> FakeInstant {
+  let mut buf = std::vec![0u8; 4096];
+  let due = svc
+    .poll_timeout()
+    .expect("a probing service always has a lifecycle deadline");
+  let at = if due > now { due } else { now };
+  svc.handle_timeout(at).unwrap();
+  svc
+    .poll_transmit(at, &mut buf)
+    .unwrap()
+    .expect("the fired probe deadline must produce a datagram");
+  assert!(
+    matches!(svc.awaiting_confirm, Some(AwaitingConfirm::Probe)),
+    "expected a Probe commit token, got {:?}",
+    svc.awaiting_confirm
+  );
+  at
+}
+
+/// Drive an Init service to `Probing(0)` with nothing yet confirmed.
+fn drive_to_probing_zero(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+) -> FakeInstant {
+  let mut now = FakeInstant::zero();
+  for _ in 0..8 {
+    now = now.advance(300);
+    svc.handle_timeout(now).unwrap();
+    if matches!(svc.state(), ServiceState::Probing(0)) {
+      return now;
+    }
+  }
+  panic!("service did not reach Probing(0); state={:?}", svc.state());
+}
+
+/// A link that is obligated but never accepts would pin the §8.1 sequence
+/// forever, because a partial probe re-arms losslessly and advances nothing. The
+/// core bounds its own patience: `MAX_PARTIAL_ROUNDS` partials are held honestly
+/// and the next is EXCUSED, advancing the sequence from exactly where it stood.
+///
+/// Round-precise, because both edges matter — advancing one round early would be
+/// the §8.1 violation ("it MUST send a Multicast DNS query … to see if any of
+/// them are already in use") the confirm contract exists to remove, and never
+/// advancing is the pin.
+#[test]
+fn the_partial_bound_excuses_the_probe_instead_of_pinning_the_sequence() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_probing_zero(&mut svc);
+
+  for round in 0..MAX_PARTIAL_ROUNDS {
+    let at = emit_probe(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+    assert!(
+      matches!(svc.state(), ServiceState::Probing(0)),
+      "round {round} is within the bound, so the §8.1 sequence must not advance; \
+       got {:?}",
+      svc.state()
+    );
+    assert_eq!(
+      svc.partial_rounds,
+      round + 1,
+      "each honest partial round spends exactly one unit of patience"
+    );
+    now = svc
+      .lifecycle_deadline
+      .expect("a partial probe always re-arms");
+  }
+
+  let at = emit_probe(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(1)),
+    "the bound must excuse the link that keeps missing rather than pin the \
+     sequence; got {:?}",
+    svc.state()
+  );
+  assert_eq!(
+    svc.partial_rounds, 0,
+    "the excusal restarts the patience budget — the write-off is per-confirm, \
+     never sticky"
+  );
+  assert!(
+    !svc.advertises_instance() && !svc.advertises_host(),
+    "a probe advertises nothing, so no outcome — excused or not — may latch \
+     ownership"
+  );
+  assert!(
+    !svc.has_fully_announced().get(),
+    "probing is not announcing"
+  );
+}
+
+/// The property the whole escape hangs on: an EXCUSED advance moves the phase
+/// and takes NONE of the credit a delivery earns. Conflating the two is what made
+/// the driver-side predecessor unsound — it reported the excused round as
+/// `AllDelivered`, which opened the reclaim-cancel gate for a name a whole family
+/// had never heard.
+#[test]
+fn an_excused_announcement_advance_is_not_a_delivery() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_announcing_zero(&mut svc);
+
+  for _ in 0..MAX_PARTIAL_ROUNDS {
+    let at = emit_announcement(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+    assert!(
+      matches!(svc.state(), ServiceState::Announcing(0)),
+      "within the bound the §8.3 phase must not advance; got {:?}",
+      svc.state()
+    );
+    now = svc
+      .lifecycle_deadline
+      .expect("a partial announcement always re-arms");
+  }
+  let streak_before = svc.partial_announce_streak;
+
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+
+  // It advances …
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(1)),
+    "the excused round must advance the §8.3 phase; got {:?}",
+    svc.state()
+  );
+  // … and nothing else.
+  assert!(
+    !svc.has_fully_announced().get(),
+    "an excused advance must NOT open the reclaim-cancel gate: no complete \
+     announcement reached every obligated link, so a renamed-away predecessor's \
+     §10.1 goodbye is still owed to the link that heard nothing"
+  );
+  assert!(
+    svc.partial_announce_streak > streak_before,
+    "the §8.3 ladder must be CARRIED ACROSS the excuse point, never reset by it \
+     ({} after {streak_before})",
+    svc.partial_announce_streak
+  );
+  let gap = svc
+    .lifecycle_deadline
+    .expect("the advance re-arms")
+    .0
+    .saturating_sub(at.0);
+  assert!(
+    gap >= 4_000,
+    "the served link must not observe a SHORTER interval across the excuse \
+     point than before it — the flat announce_deadline would give 1000 ms, got \
+     {gap} ms"
+  );
+  assert!(
+    svc.advertises_instance(),
+    "excusal is confined to the PHASE: the round still put records on the served \
+     link's wire, so §10.1 ownership latches exactly as an honest partial does"
+  );
+}
+
+/// `NoneDelivered` must LEAVE the patience budget alone rather than reset it. A
+/// reset would make an alternating partial/failed pattern evade the bound
+/// forever — the very pin the bound exists to break.
+#[test]
+fn a_wholly_failed_round_does_not_reset_the_partial_bound() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_announcing_zero(&mut svc);
+
+  for round in 0..MAX_PARTIAL_ROUNDS {
+    let at = emit_announcement(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+    now = svc.lifecycle_deadline.expect("re-armed");
+
+    let at = emit_announcement(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitOutcome::NoneDelivered);
+    assert_eq!(
+      svc.partial_rounds,
+      round + 1,
+      "a round that reached no wire met no obligation, so it may neither spend \
+       nor refund the budget"
+    );
+    now = svc.lifecycle_deadline.expect("re-armed");
+    assert!(
+      matches!(svc.state(), ServiceState::Announcing(0)),
+      "neither round may advance the phase; got {:?}",
+      svc.state()
+    );
+  }
+
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(1)),
+    "the bound must still fire through an alternating partial/failed pattern; \
+     got {:?}",
+    svc.state()
+  );
+}
+
+/// A response is `TransmitObligation::OneShot`: the core never re-arms it, so a
+/// family that missed one is holding nothing hostage and a family that carried
+/// one has discharged no re-armed obligation. Neither may move the budget.
+///
+/// The counter lives inside the per-kind confirm arms, so this is STRUCTURAL —
+/// a `Response` / `MetaResponse` confirm has no path to it at all. This test
+/// pins the observable consequence in both directions: an all-delivered §6.7
+/// legacy reply must not RESET the budget (which would hold it at zero forever
+/// for a service that answers queriers between lifecycle rounds), and a partial
+/// multicast response must not PRELOAD it (which would excuse the next partial
+/// probe and advance §8.1 although one link never heard the probe).
+#[test]
+fn a_response_confirm_cannot_move_the_partial_bound() {
+  use crate::{event::ServiceQuestion, wire::QuestionRef};
+
+  let mut svc = make_service(120);
+  let mut now = drive_to_announcing_zero(&mut svc);
+  let mut buf = std::vec![0u8; 4096];
+
+  // One honest partial announcement, so the budget is part-spent.
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+  assert_eq!(svc.partial_rounds, 1);
+  now = at;
+
+  // A §6.7 legacy unicast reply: exactly one obligated link, so AllDelivered by
+  // construction.
+  let legacy_src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
+  let qbuf = question_bytes("_ipp._tcp.local.", 12); // QTYPE PTR
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x55)),
+    now,
+  );
+  svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("a legacy unicast reply is queued");
+  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+  assert_eq!(
+    svc.partial_rounds, 1,
+    "an all-delivered one-shot reply must not RESET the budget"
+  );
+
+  // A jittered §6 multicast response, partially delivered.
+  inject_question_to_set_response_deadline(&mut svc, now);
+  now = svc
+    .response_deadline
+    .expect("the response deadline is armed");
+  svc.handle_timeout(now).unwrap();
+  svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("the response deadline fired");
+  assert!(matches!(
+    svc.awaiting_confirm,
+    Some(AwaitingConfirm::Response(_, _))
+  ));
+  svc.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+  assert_eq!(
+    svc.partial_rounds, 1,
+    "a partial one-shot response must not PRELOAD the budget"
+  );
+
+  // The lifecycle therefore still gets its full remaining patience.
+  now = svc.lifecycle_deadline.expect("still re-armed");
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(0)),
+    "with the responses counted this round would have been the excusing one; \
+     got {:?}",
+    svc.state()
+  );
+  assert_eq!(svc.partial_rounds, MAX_PARTIAL_ROUNDS);
+}
+
+/// A conflict rename restarts the whole §8.1/§8.3 lifecycle under a NEW name, so
+/// the patience already spent waiting for a lagging link under the old one must
+/// not excuse a probe of the new one.
+#[test]
+fn a_conflict_rename_clears_the_partial_bound() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_probing_zero(&mut svc);
+
+  let at = emit_probe(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+  assert_eq!(svc.partial_rounds, 1, "one partial probe must be counted");
+  now = at;
+
+  // A rival SRV authority with larger rdata (port 9999 > our 631): we lose the
+  // §8.2 tiebreak and rename away.
+  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut sbuf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec)),
+    now,
+  );
+  now = now.advance(300);
+  svc.handle_timeout(now).unwrap();
+
+  assert!(
+    svc.name().as_str().contains("-1"),
+    "the service must have lost the tiebreak and renamed; name={}",
+    svc.name().as_str()
+  );
+  assert_eq!(
+    svc.partial_rounds, 0,
+    "the new name starts a fresh §8.1 sequence with a fresh patience budget"
+  );
+}
+
+/// The RFC 6763 §9 same-name revert-to-probe is the other lifecycle regression.
+/// It emits no `ServiceUpdate`, so it was invisible to the driver-side
+/// predecessor and could inherit a nearly-spent budget; owning the counter in the
+/// core makes both regression sites reachable.
+#[test]
+fn the_section9_revert_to_probe_clears_the_partial_bound() {
+  let mut svc = make_service(120);
+  drive_to_established(&mut svc);
+  let now = FakeInstant::zero().advance(100_000);
+
+  // Spend a partial round on the periodic re-announce.
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+  assert_eq!(svc.partial_rounds, 1);
+
+  // A genuine §9 conflict (different SRV rdata) reverts to re-probing.
+  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut sbuf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec)),
+    at,
+  );
+
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "§9 conflict must revert to re-probing"
+  );
+  assert_eq!(
+    svc.partial_rounds, 0,
+    "the re-verified name starts a fresh §8.1 sequence, so the patience spent \
+     under the established name may not excuse its probes"
+  );
+  // The same-name revert deliberately keeps `fully_announced`: this name really
+  // did reach every obligated link, and any predecessor goodbye it could cancel
+  // was cancelled then.
+  assert!(
+    svc.has_fully_announced().get(),
+    "a same-name revert is not a rename — the announcement proof stands"
+  );
+}
+
+/// `Established` is the terminal phase, so an excused round there has no phase to
+/// advance. Its only effect must be to STOP laddering: the periodic re-announce
+/// deadline `handle_timeout` pre-armed stands, instead of the partial ladder
+/// re-arming the service at its 64 s cap forever.
+#[test]
+fn an_excused_round_in_established_stops_laddering() {
+  // `Established` is the terminal phase, so an excused round there has no phase to
+  // advance. Its only effect must be to STOP laddering: the periodic re-announce
+  // deadline `handle_timeout` pre-armed stands, instead of the partial ladder
+  // holding the service off its cadence.
+  //
+  // A short TTL is what makes this observable. Re-announcing at ~80 % of a 10 s
+  // TTL is 8 s, so once the ladder has climbed past that rung, "release the
+  // ladder" and "take the later of the two" stop agreeing — and only releasing it
+  // keeps the records alive in peer caches.
+  let mut svc = make_service(10);
+  drive_to_established(&mut svc);
+  let mut now = svc
+    .poll_timeout()
+    .expect("an Established service re-announces periodically");
+
+  let mut released = None;
+  for cycle in 0..2 {
+    for _ in 0..MAX_PARTIAL_ROUNDS {
+      let at = emit_announcement(&mut svc, now);
+      svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+      now = svc.lifecycle_deadline.expect("a partial round re-arms");
+    }
+    let at = emit_announcement(&mut svc, now);
+    let streak_before = svc.partial_announce_streak;
+    svc.note_transmit_outcome(at, TransmitOutcome::PartiallyDelivered);
+    assert_eq!(
+      svc.state(),
+      ServiceState::Established,
+      "there is no phase beyond Established to advance into"
+    );
+    assert!(
+      svc.partial_announce_streak > streak_before,
+      "cycle {cycle}: an excused round is still not a delivery — only a genuine \
+       all-delivered round resets the §8.3 ladder"
+    );
+    let re_armed = svc
+      .lifecycle_deadline
+      .expect("the pre-armed periodic re-announce stands");
+    released = Some(re_armed.0 - at.0);
+    now = re_armed;
+  }
+
+  // Second cycle: the ladder is at its 32 s rung, well past the 8 s periodic
+  // cadence, so leaving the ladder in charge would starve peer caches of a
+  // 10 s-TTL record.
+  assert_eq!(
+    released,
+    Some(8_000),
+    "the excused round must release the ladder and let the periodic re-announce \
+     deadline stand (~80 % of a 10 s TTL)"
   );
 }

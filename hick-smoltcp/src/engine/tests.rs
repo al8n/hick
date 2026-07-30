@@ -796,10 +796,6 @@ fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
     established,
     "a fully-delivered dual-stack service must reach Established"
   );
-  assert_eq!(
-    engine.services[&handle].partial_rounds, 0,
-    "no round was partial, so the bounded policy must never have been engaged"
-  );
   assert!(
     engine.services[&handle].proto.advertises_instance(),
     "a delivered announcement latches goodbye ownership"
@@ -866,13 +862,14 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
 
 #[test]
 fn the_bounded_partial_policy_fires_instead_of_pinning_the_phase() {
-  // The driver's half of the `TransmitOutcome` contract. The core re-arms a
-  // partial transmit losslessly and never advances on one, so a family that
-  // never accepts a datagram would hold this service in probing FOREVER unless
-  // the driver eventually writes it off. After `MAX_PARTIAL_ROUNDS` consecutive
-  // partial rounds the missing family is excused for one confirm, the phase
-  // advances from exactly where it stood, and the service establishes on the
-  // family it has.
+  // The core's patience bound, observed end to end through THIS transport. A
+  // partial transmit re-arms losslessly and advances nothing, so a family that
+  // never accepts a datagram would hold this service in probing forever if the
+  // core waited indefinitely. It does not: past its bound it advances without
+  // that family, and the service completes its lifecycle on the family it has.
+  // (Round-precision — how many partials are honest before one is excused, and
+  // what the excused round must NOT credit — is asserted in `mdns-proto`, where
+  // the bound lives.)
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(83));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp {
@@ -881,40 +878,29 @@ fn the_bounded_partial_policy_fires_instead_of_pinning_the_phase() {
   };
   let mut scratch = [0u8; 1500];
 
-  // Round-by-round through the first probe: the budget is spent before it fires.
-  let mut t = 0i64;
-  for round in 1..=u32::from(MAX_PARTIAL_ROUNDS) {
-    t = pump_to_next_round(&mut engine, &mut io, &mut scratch, t);
-    assert_eq!(
-      service_state(&engine, handle),
-      ServiceState::Probing(0),
-      "round {round} is still within the budget, so the phase must not advance"
-    );
-    assert_eq!(
-      engine.services[&handle].partial_rounds, round as u8,
-      "each partial round must spend exactly one unit of the budget"
-    );
-  }
-  // The next partial round exhausts the budget: v6 is excused and the §8.1
-  // sequence advances even though v6 has still sent nothing.
-  let t = pump_to_next_round(&mut engine, &mut io, &mut scratch, t);
+  // Within the budget the phase must NOT advance: the first partial probe re-arms
+  // the same probe index, because v6 has not been asked.
+  let t = pump_to_next_round(&mut engine, &mut io, &mut scratch, 0);
   assert_eq!(
     service_state(&engine, handle),
-    ServiceState::Probing(1),
-    "the bounded policy must excuse the family that keeps missing, so the phase \
-     advances instead of pinning"
-  );
-  assert_eq!(
-    engine.services[&handle].partial_rounds, 0,
-    "firing the bound restarts the budget for the next phase step"
+    ServiceState::Probing(0),
+    "the first partial round is within the budget, so the phase must not advance"
   );
 
   // End to end: the service reaches Established on v4 alone, and v6 — still
   // attempted on every round — never carries a byte.
-  let (established, _) = pump_for(&mut engine, &mut io, &mut scratch, handle, t, 120);
+  // The horizon is ~50 s because every round is partial: the served family's
+  // announcements are spaced on the §8.3 doubling ladder (1, 2, 4, 8, 16 s), which
+  // the excused advances carry across rather than reset.
+  let (established, _) = pump_for(&mut engine, &mut io, &mut scratch, handle, t, 200);
   assert!(
     established,
-    "a bounded partial policy must let the healthy family finish the lifecycle"
+    "the bound must let the healthy family finish the lifecycle"
+  );
+  assert!(
+    !engine.services[&handle].proto.has_fully_announced().get(),
+    "no announcement ever reached v6, so the excused advances must NOT have \
+     opened the reclaim-cancel gate — an excused advance is not a delivery"
   );
   assert!(
     io.sent.iter().all(|(dst, _)| *dst == MDNS_SOCKET_V4),
@@ -937,11 +923,12 @@ fn a_recovered_family_resumes_the_obligated_set_on_its_next_send() {
   };
   let mut scratch = [0u8; 1500];
 
-  // Burn partial rounds until the budget is part-spent, then recover v6.
+  // Burn partial rounds while v6 is busy, then recover it.
   let (_, t) = pump_for(&mut engine, &mut io, &mut scratch, handle, 0, 2);
-  assert!(
-    engine.services[&handle].partial_rounds > 0,
-    "the partial rounds must have been recorded"
+  assert_eq!(
+    service_state(&engine, handle),
+    ServiceState::Probing(0),
+    "a partial probe re-arms the same index — v6 has not been asked"
   );
   io.v6_fail = None;
   io.sent.clear();
@@ -950,14 +937,15 @@ fn a_recovered_family_resumes_the_obligated_set_on_its_next_send() {
     io.sent.iter().any(|(dst, _)| *dst == MDNS_SOCKET_V6),
     "the recovered family must be attempted and must send"
   );
-  assert_eq!(
-    engine.services[&handle].partial_rounds, 0,
-    "a fully-delivered round resets the budget — the write-off is not sticky"
-  );
   let (established, _) = pump_for(&mut engine, &mut io, &mut scratch, handle, t, 20);
   assert!(
     established,
     "the lifecycle resumes from where it stood once every family delivers"
+  );
+  assert!(
+    engine.services[&handle].proto.has_fully_announced().get(),
+    "the recovered family carries the announcements on their own merit, so the \
+     all-delivered credit an excused round never earns is earned here"
   );
 }
 
@@ -1018,7 +1006,10 @@ fn a_constrained_transport_does_not_starve_either_family() {
   let mut scratch = [0u8; 1500];
   let mut established = false;
   let mut t = 0i64;
-  for _ in 0..40 {
+  // ~50 s: one slot per cycle makes EVERY fan-out partial, so the served family's
+  // announcements walk the §8.3 doubling ladder (1, 2, 4, 8, 16 s) that the
+  // core's excused advances carry across rather than reset.
+  for _ in 0..200 {
     t += 250_000;
     // One datagram of TX room this cycle: the SECOND family in any fan-out is
     // busy, so only a fair order lets both groups eventually transmit.
@@ -1406,7 +1397,10 @@ fn permanently_failing_family_does_not_stall_the_healthy_one() {
   let mut scratch = [0u8; 1500];
   let mut established = false;
   let mut t = 0;
-  for _ in 0..80 {
+  // ~50 s: every round is partial, so the healthy family's announcements walk the
+  // §8.3 doubling ladder (1, 2, 4, 8, 16 s) that the core's excused advances carry
+  // across rather than reset.
+  for _ in 0..200 {
     t += 250_000;
     engine.pump(at(t), &mut io, &mut scratch);
     while let Some(update) = engine.poll_service_update(handle) {
@@ -1758,8 +1752,8 @@ fn a_too_large_family_does_not_retire_while_the_other_may_recover() {
   // v6 recovers → the service advertises on it and reaches Established, proving
   // it was never wrongly retired. Every round stays PARTIAL (v4 is permanently
   // TooLarge, so it is obligated and never delivers), so each phase step waits
-  // out the `MAX_PARTIAL_ROUNDS` budget plus the core's §8.3 partial ladder —
-  // hence the long tail here.
+  // out the core's patience bound plus its §8.3 partial ladder — hence the long
+  // tail here.
   io.v6_fail = None;
   for ms in 41..=200i64 {
     engine.pump(at(ms * 250_000), &mut io, &mut scratch);
@@ -2818,125 +2812,107 @@ fn inbound_from(src: SocketAddr, data: Vec<u8>) -> (Vec<u8>, RecvMeta) {
   )
 }
 
-/// Partially-delivered multicast RESPONSES must not preload the partial-round
-/// budget, or the next partial LIFECYCLE datagram is excused and its phase
-/// advances although one family never heard it — the RFC 6762 §8.1/§8.3
-/// violation the `TransmitOutcome` contract exists to remove, reintroduced
-/// through the back door.
+/// A datagram no reachable socket can carry retires its producer, so that a
+/// service does not probe/announce forever with nothing on the wire. That
+/// reasoning holds ONLY for a datagram the core RE-OFFERS.
 ///
-/// A response is `TransmitObligation::OneShot`: the core never re-arms it, so a
-/// family that missed one is holding nothing hostage and the round is no
-/// evidence for a write-off.
+/// A response is `TransmitObligation::OneShot`: the core emits it once for the
+/// question that provoked it and never re-arms it, so an undeliverable one costs
+/// exactly one unanswered question — the querier re-asks. Retiring on it would
+/// hand any on-link peer a remote kill switch: ask an established service a
+/// question whose answer does not fit the TX buffer and the service is marked
+/// errored, surfaces `Conflict`, and begins withdrawing.
 #[test]
-fn partial_multicast_responses_do_not_preload_the_bounded_partial_policy() {
-  let mut engine: TestEngine = Engine::new(
-    EndpointConfig::new().with_probe_unique_names(false),
-    StdRng::seed_from_u64(311),
-  );
+fn an_undeliverable_one_shot_reply_must_not_retire_the_service() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(91));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
 
-  // A clean first announcement on both families, so the budget starts at zero
-  // and the next announcement is a full §8.3 interval (1 s) away.
-  engine.pump(at(0), &mut io, &mut scratch);
-  assert_eq!(
-    service_state(&engine, handle),
-    ServiceState::Announcing(1),
-    "the first announcement must have been fully delivered"
+  // Healthy startup: the service reaches Established on both families.
+  let (established, mut t) = pump_for(&mut engine, &mut io, &mut scratch, handle, 0, 40);
+  assert!(
+    established,
+    "the service must be established before the attack"
   );
-  assert_eq!(engine.services[&handle].partial_rounds, 0);
 
-  // From here IPv6 accepts nothing, so every fan-out is partial.
-  io.v6_fail = Some(SendError::Busy);
+  // Now every socket rejects every datagram as permanently too large, and a peer
+  // asks a question. The only transmit due is the §6 multicast reply — the
+  // periodic re-announce is ~80 % of a 120 s TTL away.
+  io.v4_fail = Some(SendError::TooLarge);
+  io.v6_fail = Some(SendError::TooLarge);
   let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 5353));
   let qname = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  t += 100_000;
+  io.inbound
+    .push_back(inbound_from(querier, build_ptr_query(&qname)));
+  engine.pump(at(t), &mut io, &mut scratch); // arms the §6 20–120 ms jitter
+  t += 200_000;
+  engine.pump(at(t), &mut io, &mut scratch); // fires the reply — undeliverable
 
-  let mut t = 0i64;
-  for round in 1..=u32::from(MAX_PARTIAL_ROUNDS) {
-    t += 100_000;
-    io.inbound
-      .push_back(inbound_from(querier, build_ptr_query(&qname)));
-    engine.pump(at(t), &mut io, &mut scratch); // arms the §6 20–120 ms jitter
-    t += 200_000;
-    engine.pump(at(t), &mut io, &mut scratch); // fires the response, partially
-    assert_eq!(
-      engine.services[&handle].partial_rounds, 0,
-      "round {round}: a response is never re-armed, so a partial one is no \
-       evidence that a family is holding a lifecycle datagram hostage"
-    );
+  let mut conflict = false;
+  while let Some(u) = engine.poll_service_update(handle) {
+    conflict |= matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict);
   }
   assert!(
-    engine.services[&handle].proto.advertises_instance(),
-    "the responses still reached v4's wire, so §10.1 ownership stays latched — \
-     skipping the bound must not skip the core confirm"
+    !conflict,
+    "an unanswerable question must not tear down a healthy service"
   );
-
-  // The next partial ANNOUNCEMENT must therefore be reported honestly.
-  engine.pump(at(1_500_000), &mut io, &mut scratch);
+  assert!(
+    engine.services.contains_key(&handle),
+    "the service must still be registered"
+  );
+  assert!(
+    !engine.services[&handle].errored,
+    "the service must still be pumped — a one-shot reply is best-effort"
+  );
   assert_eq!(
     service_state(&engine, handle),
-    ServiceState::Announcing(1),
-    "with the responses counted this announcement would be the budget-exhausting \
-     round, excusing the family that has been told nothing and advancing §8.3"
+    ServiceState::Established,
+    "the lifecycle is untouched: the undeliverable reply clears its commit token \
+     with nothing latched and nothing advanced"
   );
-  assert_eq!(engine.services[&handle].partial_rounds, 1);
 }
 
-/// A rename restarts the lifecycle under a new name, so the partial-round
-/// evidence gathered under the old one is dropped with it — mirroring the core,
-/// which zeroes its own §8.3 partial-announce ladder on a rename.
+/// The precision the previous test must not cost: an undeliverable SUSTAINED
+/// datagram still retires its producer. A query is always `Sustained`, so a
+/// question too large for every reachable socket must still terminate the query
+/// rather than re-offer it forever.
 #[test]
-fn a_rename_clears_the_partial_round_evidence() {
-  use mdns_proto::wire::{Header, MessageBuilder};
+fn an_undeliverable_sustained_datagram_still_retires_its_producer() {
+  use mdns_proto::{QuerySpec, wire::ResourceType};
 
-  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(312));
-  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(92));
   let mut io = MockUdp {
-    v6_fail: Some(SendError::Busy),
+    v4_fail: Some(SendError::TooLarge),
+    v6_fail: Some(SendError::TooLarge),
     ..Default::default()
   };
   let mut scratch = [0u8; 1500];
+  let qname = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let q = engine
+    .start_query(QuerySpec::new(qname, ResourceType::Ptr), at(0))
+    .unwrap();
 
-  // Spend one partial round, so there IS evidence for the rename to clear.
-  let mut t = pump_to_next_round(&mut engine, &mut io, &mut scratch, 0);
-  assert_eq!(
-    engine.services[&handle].partial_rounds, 1,
-    "a partially-delivered probe must have been counted"
-  );
-
-  // A rival SRV authority for the same instance name with LARGER rdata: we lose
-  // the §8.2 tiebreak and rename away.
-  let inst = Name::try_from_str("Test._ipp._tcp.local.").unwrap();
-  let mut cbuf = [0u8; 512];
-  let conflict = {
-    let target = Name::try_from_str("rival-host.local.").unwrap();
-    let mut b: MessageBuilder<'_, 0> = MessageBuilder::try_new(&mut cbuf, Header::new()).unwrap();
-    b.push_srv_authority(&inst, 120, 0, 0, 9999, &target)
-      .unwrap();
-    let n = b.finish().unwrap();
-    cbuf[..n].to_vec()
-  };
-  let peer = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353));
-  t += 10_000;
-  io.inbound.push_back(inbound_from(peer, conflict));
-  engine.pump(at(t), &mut io, &mut scratch);
+  let mut terminal = false;
+  let mut t = 0i64;
+  for _ in 0..20 {
+    engine.pump(at(t), &mut io, &mut scratch);
+    while let Some(u) = engine.poll_query_update(q) {
+      terminal |= matches!(u, QueryUpdate::Timeout | QueryUpdate::Done);
+    }
+    if terminal {
+      break;
+    }
+    t += 250_000;
+  }
   assert!(
-    engine.services[&handle].partial_rounds > 0,
-    "the conflict must not have cleared the evidence on its own"
+    terminal,
+    "a question that can never be sent must retire the query, not re-offer it \
+     forever"
   );
-
-  // The next pump fires the §8.2 tiebreak, and the rename hook clears the budget
-  // in the very same pump (the drain runs before any new transmit).
-  t += 300_000;
-  engine.pump(at(t), &mut io, &mut scratch);
-  assert_ne!(
-    engine.services[&handle].proto.name().as_str(),
-    inst.as_str(),
-    "the service must have lost the tiebreak and renamed"
-  );
-  assert_eq!(
-    engine.services[&handle].partial_rounds, 0,
-    "observing `Renamed` must clear the evidence gathered under the old name"
+  assert!(
+    io.sent.is_empty(),
+    "nothing may reach a wire when every send is permanently too large"
   );
 }

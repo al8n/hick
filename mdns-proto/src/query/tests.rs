@@ -1184,53 +1184,116 @@ fn repeated_partial_questions_climb_the_rfc_5_2_doubling_ladder() {
   // link's wire every round, so a flat-interval partial resend would violate that
   // for the link that IS being served — while the budget stays frozen, because no
   // slot was spent.
+  //
+  // The budget cannot stay frozen forever, or a half-reachable link would keep
+  // the query alive past every terminal. After `MAX_PARTIAL_ROUNDS` honest
+  // partials the next is EXCUSED and spends a slot — carrying the ladder across
+  // rather than resetting it, so the served link never sees a shorter interval.
   let mut q = make_query(ResourceType::Any, ResourceClass::Any);
   let mut now = StdInstant::now();
 
-  let expected_secs = [1u64, 2, 4, 8, 16, 32, 60, 60];
   let mut previous = 0u64;
-  for (round, want) in expected_secs.iter().enumerate() {
+  let mut spent = 0u32;
+  let mut excused = 0u32;
+  for round in 0..8 {
     emit_question(&mut q, now);
+    let before = q.retry_count;
     q.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
     let deadline = q.next_deadline.expect("a partial send always re-arms");
     let gap = deadline.duration_since(now).as_secs();
-    assert_eq!(
-      gap, *want,
-      "partial resend {round} must re-arm {want} s out, got {gap} s"
-    );
-    assert_eq!(
-      q.retry_count, 0,
-      "no partial resend may consume a §5.2 retry slot"
-    );
-    if round > 0 && *want < 60 {
+    if q.retry_count == before {
+      assert!(
+        round % 3 != 2,
+        "round {round} is the budget-exhausting one and must have been excused"
+      );
+    } else {
+      assert_eq!(
+        q.retry_count,
+        before + 1,
+        "an excused round spends exactly one slot"
+      );
+      spent += 1;
+      excused += 1;
+    }
+    // §5.2 holds the interval at 60 s, so the doubling requirement only binds
+    // below that cap.
+    if round > 0 && gap < 60 {
       assert!(
         gap >= previous.saturating_mul(2),
         "§5.2 requires each interval to be at least double the previous one \
-         ({gap} s after {previous} s)"
+         ({gap} s after {previous} s) — round {round}"
       );
     }
     previous = gap;
     now = deadline;
     q.handle_timeout(now).unwrap();
   }
-  assert!(
-    !q.is_done(),
-    "the query is never retired by partial sends — the driver's obligation policy \
-     is what bounds this, not the retry budget"
+  assert_eq!(
+    (spent, excused),
+    (2, 2),
+    "two of eight partial rounds exhausted the bound and advanced the budget"
   );
 
   // Recovery is immediate: the first fully-delivered question spends its slot and
   // the ladder resets to the bottom rung.
   emit_question(&mut q, now);
+  let before = q.retry_count;
   q.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
-  assert_eq!(q.retry_count, 1, "recovery spends exactly one slot");
+  assert_eq!(q.retry_count, before + 1, "recovery spends exactly one slot");
   assert_eq!(
     q.partial_send_streak, 0,
-    "a budget advance resets the partial ladder"
+    "a genuine delivery resets the partial ladder — an excused one does not"
   );
   assert_eq!(
     q.next_deadline.unwrap().duration_since(now),
-    core::time::Duration::from_secs(1),
-    "and the schedule returns to the §5.2 first-retry interval"
+    core::time::Duration::from_secs(4),
+    "and the schedule returns to the plain §5.2 walk for the slots now spent"
+  );
+}
+
+#[test]
+fn the_first_partial_rungs_are_the_plain_5_2_intervals() {
+  // The head of the ladder, exactly: 1 s, then 2 s while the budget is frozen,
+  // then the EXCUSED round at 4 s — never back at the flat 1 s the freshly-spent
+  // budget slot would otherwise index.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+  for want in [1u64, 2, 4] {
+    emit_question(&mut q, now);
+    q.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+    let deadline = q.next_deadline.expect("a partial send always re-arms");
+    assert_eq!(
+      deadline.duration_since(now).as_secs(),
+      want,
+      "expected a {want} s rung"
+    );
+    now = deadline;
+    q.handle_timeout(now).unwrap();
+  }
+  assert_eq!(
+    q.retry_count, 1,
+    "only the excused third round may have spent a slot"
+  );
+}
+
+#[test]
+fn a_permanently_partial_question_still_reaches_its_terminal_timeout() {
+  // Without the bound the §5.2 budget never advances on a partial send, so a
+  // half-reachable link keeps a query re-asking on the growing partial interval
+  // forever and the caller's `QueryUpdate::Timeout` never arrives.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+  for _ in 0..64 {
+    if q.is_done() {
+      break;
+    }
+    emit_question(&mut q, now);
+    q.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+    now = q.next_deadline.expect("a partial send always re-arms");
+    q.handle_timeout(now).unwrap();
+  }
+  assert!(
+    q.is_done(),
+    "a permanently half-delivered question must still retire, not hang"
   );
 }

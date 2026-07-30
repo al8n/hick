@@ -435,11 +435,11 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
 
 #[test]
 fn the_bounded_partial_policy_fires_instead_of_pinning_the_phase() {
-  // The driver's half of the `TransmitOutcome` contract, observed through this
-  // crate's transport: a family that never accepts a datagram would otherwise
-  // hold the service in probing forever, because the core re-arms a partial
-  // transmit without ever advancing on it. Given enough rounds the engine
-  // excuses the missing family and the service establishes on the one it has.
+  // The core's patience bound, observed through this crate's transport: a family
+  // that never accepts a datagram would otherwise hold the service in probing
+  // forever, because a partial transmit re-arms losslessly and advances nothing.
+  // Given enough rounds the core excuses the missing family and the service
+  // establishes on the one it has.
   dual_stack_sockets!(v4, v6, 25, 0x5555_6666);
   v4.bind(5353).unwrap();
 
@@ -450,7 +450,7 @@ fn the_bounded_partial_policy_fires_instead_of_pinning_the_phase() {
   let (established, _) = pump_for(&mut engine, &mut io, handle, 0, 400);
   assert!(
     established,
-    "the bounded obligation policy must eventually excuse a family that never \
+    "the core's patience bound must eventually excuse a family that never \
      delivers, instead of pinning the lifecycle forever"
   );
   assert_eq!(

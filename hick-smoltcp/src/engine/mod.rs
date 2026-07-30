@@ -66,37 +66,6 @@ const RECENT_SEND_BYTES: usize = 16 * 1024;
 /// How long a recorded self-send stays eligible to match a loopback — bounds the
 /// window in which a byte-identical peer datagram could be misread as self.
 const RECENT_SEND_TTL: Duration = Duration::from_secs(5);
-/// How many CONSECUTIVE partially-delivered multicast fan-outs ONE service or
-/// query may report before this driver EXCUSES the families that missed — the
-/// bounded obligation policy [`TransmitOutcome`] requires of every driver that
-/// can report [`TransmitOutcome::PartiallyDelivered`].
-///
-/// The core re-arms a partial transmit losslessly and never advances the RFC 6762
-/// §8.1 probe / §8.3 announce phase on one, so without a bound a family that
-/// never accepts a datagram would hold every service in probing forever. Excusing
-/// drops that family from the obligated set for one confirm, which makes it
-/// [`TransmitOutcome::AllDelivered`] and advances the phase from exactly where it
-/// stood. The excused family is still ATTEMPTED on every later fan-out, so a
-/// recovery is picked up on the very next round.
-///
-/// The bound is a per-origin ROUND COUNT rather than a duration: it needs no
-/// allocator and no clock beyond the `now` the caller already passes to
-/// [`Engine::pump`], and rounds are the unit the core's own re-arm schedule
-/// speaks. A wall-clock degrade window would be the wrong instrument here — the
-/// re-offer cadence spans 250 ms while probing (§8.1) up to 64 s at the top of
-/// the core's §8.3 partial ladder, so one duration means ~120 attempts in one
-/// phase and one attempt in the other.
-///
-/// Two rounds is the smallest count that separates contention from failure.
-/// [`family_order`] hands the next fan-out's first slot to the family that has
-/// been waiting longest, and a lossless re-arm re-encodes the SAME logical
-/// datagram, so a family that missed round 1 only because the transport had room
-/// for a single datagram receives that datagram in round 2; one still missing
-/// after round 2 was offered priority and did not take it. It also caps the
-/// core's §8.3 doubling ladder at its second rung, so the bound delays an
-/// announcement step by at most 1 s + 2 s.
-const MAX_PARTIAL_ROUNDS: u8 = 2;
-
 /// A recent multicast datagram we put on the wire, kept (exact bytes + send time)
 /// for self-loopback detection.
 struct SelfSend<I> {
@@ -142,13 +111,6 @@ struct ServiceSlot<I: Instant> {
   /// `route_freed` deferral would otherwise pin it forever and grow `services`
   /// without bound under register/unregister churn.
   caller_gone: bool,
-  /// Consecutive multicast fan-outs this service has reported as
-  /// [`TransmitOutcome::PartiallyDelivered`] — the counter behind
-  /// [`MAX_PARTIAL_ROUNDS`]. Reset by any fully-delivered fan-out; left alone by
-  /// a fully-failed one (nothing reached a wire, so no obligation was met and
-  /// none may be written off) and by unicast, which has a single obligated link
-  /// and so can never be partial.
-  partial_rounds: u8,
 }
 
 impl<I: Instant> ServiceSlot<I> {
@@ -198,12 +160,6 @@ impl<I: Instant> ServiceSlot<I> {
 /// the proto, not a synthetic driver-side signal.
 struct QuerySlot {
   errored: bool,
-  /// Consecutive partially-delivered fan-outs for this query — the counter behind
-  /// [`MAX_PARTIAL_ROUNDS`], with the same reset rules as
-  /// [`ServiceSlot::partial_rounds`]. A partial §5.2 question freezes the retry
-  /// budget in the core, so an unbounded streak would leave a query re-asking on
-  /// the growing partial interval without ever reaching its timeout.
-  partial_rounds: u8,
 }
 
 /// The outcome of a single per-family send attempt in a multicast fan-out or
@@ -313,10 +269,10 @@ impl Fanout {
   /// An empty obligated set yields [`TransmitOutcome::NoneDelivered`], never a
   /// vacuous "all": nothing was delivered, so nothing may latch or advance.
   ///
-  /// Write-off of a family that keeps missing is NOT applied here. It is the
-  /// driver's bounded obligation policy ([`Engine::bound_partial_delivery`]),
-  /// which needs per-origin state this type does not have — keeping this
-  /// projection a pure function of the I/O facts.
+  /// A family that keeps missing is never written off here, and this driver has
+  /// no other place that could: the confirm is the honest I/O facts and nothing
+  /// more. Bounding how long the lifecycle waits for it is the core's own
+  /// patience, applied inside [`TransmitOutcome`]'s confirm.
   fn into_transmit_outcome(self) -> TransmitOutcome {
     let mut obligated = 0u32;
     let mut delivered = 0u32;
@@ -480,8 +436,8 @@ impl<I: Instant> Multicaster<I> {
   /// ([`family_order`]), so even a one-datagram-per-cycle transport reaches both
   /// groups instead of starving one, and the core's re-arm is lossless (same
   /// probe index, same announcement count). A family that keeps missing is
-  /// eventually excused by [`Engine::bound_partial_delivery`], which is this
-  /// driver's half of the [`TransmitOutcome`] contract.
+  /// eventually excused by the core's own patience bound, so a chronically
+  /// half-broken link cannot pin the lifecycle.
   ///
   /// The endpoint-owned withdrawal send uses [`Self::burst`] instead — the
   /// endpoint owns that retry schedule, so the driver just fans one due goodbye
@@ -716,7 +672,6 @@ where
         errored: false,
         route_freed: false,
         caller_gone: false,
-        partial_rounds: 0,
       },
     );
     Ok(handle)
@@ -766,13 +721,7 @@ where
   /// Start a query. Updates are read via [`Self::poll_query_update`].
   pub fn start_query(&mut self, spec: QuerySpec, now: I) -> Result<QueryHandle, StartQueryError> {
     let handle = self.endpoint.try_start_query(spec, now)?;
-    self.queries.insert(
-      handle,
-      QuerySlot {
-        errored: false,
-        partial_rounds: 0,
-      },
-    );
+    self.queries.insert(handle, QuerySlot { errored: false });
     Ok(handle)
   }
 
@@ -924,23 +873,36 @@ where
           );
         }
         match outcome {
+          // The honest per-family shape, verbatim. A family that keeps missing is
+          // eventually excused inside the confirm by the core's own patience
+          // bound, so nothing here needs to launder the outcome first.
           MulticastOutcome::Confirm(outcome) => {
-            // The driver's bounded obligation policy runs between the fan-out and
-            // the confirm: it may EXCUSE a family that keeps missing, which is the
-            // only way a repeated partial ever stops re-arming. It applies only to
-            // a SUSTAINED datagram — a multicast response (§6, or the RFC 6763 §9
-            // meta reply) is one-shot, so its outcome passes through verbatim and
-            // never touches the counter.
-            let outcome = self.bound_partial_delivery(origin, transmit.obligation(), outcome);
             self.note_transmit_outcome(origin, now, outcome);
           }
-          // Permanently undeliverable (too large for every reachable socket): retire
-          // the producer so it stops re-offering forever and the app sees an
-          // actionable update, instead of probing/announcing indefinitely.
+          // Permanently undeliverable: too large for every reachable socket, so
+          // re-offering it will never succeed. What that costs depends entirely on
+          // whether the core will re-offer it at all.
           MulticastOutcome::Undeliverable => {
             #[cfg(feature = "defmt")]
             defmt::warn!("tx multicast {} bytes undeliverable (too large)", len);
-            self.retire_origin(origin, now);
+            match transmit.obligation() {
+              // Sustained: the core re-arms this datagram forever, so the producer
+              // would probe/announce (or re-question) indefinitely with nothing on
+              // the wire. Retire it, so the app sees an actionable update instead
+              // of a silent stall. A query is always Sustained and so always lands
+              // here.
+              TransmitObligation::Sustained => self.retire_origin(origin, now),
+              // One-shot: a §6 / §6.7 / RFC 6763 §9 reply is never re-armed, so an
+              // undeliverable one costs exactly one unanswered question — the
+              // querier re-asks. Resolve it as `NoneDelivered` so the commit token
+              // clears with nothing latched and the service SURVIVES. Retiring here
+              // would let any remote peer tear down a healthy established service
+              // by asking it a question whose answer does not fit, and it is also
+              // what the adjacent unicast branch has always done.
+              TransmitObligation::OneShot => {
+                self.note_transmit_outcome(origin, now, TransmitOutcome::NoneDelivered);
+              }
+            }
           }
         }
       } else {
@@ -956,11 +918,10 @@ where
         // (`Unsupported`) is an EMPTY obligated set, which is NoneDelivered too —
         // never a vacuous "all".
         //
-        // The bounded obligation policy is deliberately NOT applied: a legacy
-        // reply is `TransmitObligation::OneShot`, and an AllDelivered-by-
-        // construction confirm fed into the counter would reset it, so a stream of
-        // replies would hold it at zero and the bound would never fire for the
-        // sustained lifecycle sends interleaved with them.
+        // A failed reply is reported as-is and costs the service nothing: this
+        // datagram is `TransmitObligation::OneShot`, so the core never re-arms it
+        // and the querier simply re-asks. The multicast branch above reaches the
+        // same conclusion for its own undeliverable one-shots.
         debug_assert_eq!(transmit.obligation(), TransmitObligation::OneShot);
         let outcome = if result.is_ok() {
           TransmitOutcome::AllDelivered
@@ -1189,22 +1150,6 @@ where
         .and_then(|slot| slot.proto.poll())
       {
         if let ServiceUpdate::Renamed(ref renamed) = update {
-          // A rename restarts the whole §8.1/§8.3 lifecycle under a new name, so
-          // the partial-round evidence collected under the old one goes with it.
-          // This mirrors the core, which zeroes its own §8.3 partial-announce
-          // ladder on a rename (`reset_advertised_name_state`), and the
-          // conservatism is cheap: the worst case is ~750 ms of extra probing
-          // before the bound can excuse a family again.
-          //
-          // KNOWN RESIDUAL — the RFC 6763 §9 same-name revert-to-probe emits NO
-          // `ServiceUpdate` and is unobservable from here, so a revert can inherit
-          // up to `MAX_PARTIAL_ROUNDS` rounds. Accepted: the ladder's rungs are
-          // 1 s / 2 s, so that evidence is at most seconds old, and the conflict
-          // that triggered the revert was detected by RECEIVING a packet — the
-          // inherited rounds describe the same live families.
-          if let Some(slot) = self.services.get_mut(&handle) {
-            slot.partial_rounds = 0;
-          }
           let new_name = renamed.new_name().clone();
           let rename_result = self.endpoint.handle_service_renamed(handle, new_name);
           // The §9 rename of an announced service hands its OLD-name TTL=0 goodbye
@@ -1306,9 +1251,9 @@ where
   /// queries. Skips errored state machines. Returns `None` when nothing is
   /// pending.
   /// The whole [`Transmit`] is returned rather than just its destination and
-  /// length because [`Transmit::obligation`] must survive to the confirm: it
-  /// decides whether this driver's bounded obligation policy applies at all (see
-  /// [`Self::bound_partial_delivery`]).
+  /// length because [`Transmit::obligation`] must survive to the send: it decides
+  /// what a PERMANENTLY undeliverable datagram means for the producer (see the
+  /// [`MulticastOutcome::Undeliverable`] arm of [`Self::pump`]).
   fn poll_one_transmit(&mut self, now: I, scratch: &mut [u8]) -> Option<(Transmit, Origin)> {
     // Cap every encoded multicast at the RFC 6762 §17 ceiling, so the normal
     // transmit path never emits a datagram larger than the goodbye encode scratch
@@ -1391,92 +1336,6 @@ where
     None
   }
 
-  /// This driver's BOUNDED obligation policy: the half of the [`TransmitOutcome`]
-  /// contract every driver that can report `PartiallyDelivered` must supply.
-  ///
-  /// Counts consecutive partial fan-outs per origin and, once an origin has spent
-  /// [`MAX_PARTIAL_ROUNDS`] of them, EXCUSES the families that keep missing by
-  /// reporting the next partial as [`TransmitOutcome::AllDelivered`] — dropping
-  /// them from the obligated set for that one confirm so the §8.1 / §8.3 phase
-  /// advances from exactly where it stood. Nothing else changes: the excused
-  /// family is still fanned to on every later round, and the first round it
-  /// accepts is all-delivered on its own merit.
-  ///
-  /// The write-off is deliberately confined to the PHASE. Excusal can only turn
-  /// `PartiallyDelivered` into `AllDelivered`, and both are `any_delivered`, so
-  /// it can never suppress a goodbye-ownership latch (§10.1) — the records that
-  /// reached a wire stay owned and stay retractable.
-  ///
-  /// `NoneDelivered` leaves the counter untouched rather than resetting it: no
-  /// link was served, so no obligation was met and none may be written off. This
-  /// mirrors the core, which likewise neither uses nor advances its §8.3 partial
-  /// ladder on a round that reached no wire.
-  ///
-  /// # Only sustained obligations are counted
-  ///
-  /// A [`TransmitObligation::OneShot`] datagram — every response: the §6
-  /// multicast reply, the §6.7 legacy unicast reply, the RFC 6763 §9 meta reply —
-  /// passes through VERBATIM, touching neither the counter nor the outcome. The
-  /// counter tracks how long a family has been holding a re-armed lifecycle
-  /// datagram hostage, and a response is never re-armed, so mixing responses in
-  /// corrupts it in both directions:
-  ///
-  /// * a legacy unicast reply has ONE obligated family, so it is `AllDelivered` by
-  ///   construction and would RESET the counter — alternating partial lifecycle
-  ///   sends with unicast replies would hold it at zero and the bound would never
-  ///   fire, pinning the service on a chronically half-broken family;
-  /// * a partial multicast response would PRELOAD the counter, so the next partial
-  ///   probe would be excused and the RFC 6762 §8.1 sequence would advance although
-  ///   one family never heard the probe — the exact violation this contract exists
-  ///   to remove.
-  ///
-  /// Passing the outcome through unchanged (rather than dropping the confirm) is
-  /// required: the core still reads `any_delivered` from a response confirm to
-  /// latch §10.1 goodbye ownership for the records it put on the wire.
-  fn bound_partial_delivery(
-    &mut self,
-    origin: Origin,
-    obligation: TransmitObligation,
-    outcome: TransmitOutcome,
-  ) -> TransmitOutcome {
-    if matches!(obligation, TransmitObligation::OneShot) {
-      return outcome;
-    }
-    let rounds = match origin {
-      Origin::Service(handle) => self
-        .services
-        .get_mut(&handle)
-        .map(|s| &mut s.partial_rounds),
-      Origin::Query(handle) => self.queries.get_mut(&handle).map(|s| &mut s.partial_rounds),
-    };
-    // No slot (already GC'd): nothing to bound, and the confirm below is a no-op
-    // for a handle the proto no longer knows.
-    let Some(rounds) = rounds else {
-      return outcome;
-    };
-    match outcome {
-      TransmitOutcome::PartiallyDelivered if *rounds >= MAX_PARTIAL_ROUNDS => {
-        *rounds = 0;
-        #[cfg(feature = "defmt")]
-        defmt::warn!(
-          "tx: excusing the family that missed {} consecutive fan-outs; the phase \
-           advances without it",
-          MAX_PARTIAL_ROUNDS
-        );
-        TransmitOutcome::AllDelivered
-      }
-      TransmitOutcome::PartiallyDelivered => {
-        *rounds = rounds.saturating_add(1);
-        outcome
-      }
-      TransmitOutcome::AllDelivered => {
-        *rounds = 0;
-        outcome
-      }
-      TransmitOutcome::NoneDelivered => outcome,
-    }
-  }
-
   /// Confirm a previously polled transmit, so the proto latches goodbye ownership
   /// for whatever reached a wire (§10.1) and advances its §8.1 probe / §8.3
   /// announce / §5.2 query-backoff lifecycle only once every obligated family
@@ -1520,11 +1379,16 @@ where
     }
   }
 
-  /// Retire the state machine that produced a permanently-undeliverable transmit
-  /// (a datagram too large for every reachable socket — a TX-buffer misconfig).
-  /// The producer is marked errored so every pump skips it, and a service surfaces
-  /// an actionable `Conflict` (the same retirement signal as an un-encodable
-  /// datagram) instead of probing/announcing forever.
+  /// Retire the state machine that produced a permanently-undeliverable
+  /// [`TransmitObligation::Sustained`] transmit (a datagram too large for every
+  /// reachable socket — a TX-buffer misconfig). The producer is marked errored so
+  /// every pump skips it, and a service surfaces an actionable `Conflict` (the
+  /// same retirement signal as an un-encodable datagram) instead of
+  /// probing/announcing forever.
+  ///
+  /// Reserved for `Sustained` producers. A one-shot reply that cannot be sent is
+  /// simply an unanswered question; retiring on one would make an established
+  /// service destructible by any peer that asks it something.
   fn retire_origin(&mut self, origin: Origin, now: I) {
     match origin {
       Origin::Service(handle) => {

@@ -1677,10 +1677,9 @@ fn generic_recv_error_does_not_increment_any_stats() {
 // ── The dual-stack delivery boundary (`TransmitOutcome`) ────────────────────
 
 /// A driver state with NO bound family. The delivery-shape tests drive
-/// `confirm_service_transmit` / `bound_partial_delivery` directly — the exact
-/// seam `drain_transmits` uses — because the reactor's multi-task loop cannot be
-/// stepped deterministically and a real partial fan-out needs one family's socket
-/// to fail on demand.
+/// `confirm_service_transmit` directly — the exact seam `drain_transmits` uses —
+/// because the reactor's multi-task loop cannot be stepped deterministically and
+/// a real partial fan-out needs one family's socket to fail on demand.
 #[cfg(feature = "tokio")]
 fn delivery_test_state(probe: bool) -> DriverState<agnostic_net::tokio::Net> {
   let opts = crate::options::ServerOptions::default()
@@ -1710,8 +1709,7 @@ fn delivery_test_spec(instance: &str) -> mdns_proto::ServiceSpec {
 }
 
 /// Drain one service's due transmits at `t`, confirming each through the SAME
-/// seam `drain_transmits` uses: the bounded obligation policy, then the confirm.
-/// Returns how many datagrams were confirmed.
+/// seam `drain_transmits` uses. Returns how many datagrams were confirmed.
 #[cfg(feature = "tokio")]
 fn confirm_service_round(
   state: &mut DriverState<agnostic_net::tokio::Net>,
@@ -1728,13 +1726,8 @@ fn confirm_service_round(
   };
   let _ = ctx.proto.handle_timeout(t);
   let mut rounds = 0;
-  while let Ok(Some(tx)) = ctx.proto.poll_transmit(t, buf) {
-    let outcome = bound_partial_delivery(
-      &mut ctx.partial_rounds,
-      tx.obligation(),
-      fanout.transmit_outcome(),
-    );
-    confirm_service_transmit(endpoint, ctx, t, outcome);
+  while ctx.proto.poll_transmit(t, buf).is_ok_and(|tx| tx.is_some()) {
+    confirm_service_transmit(endpoint, ctx, t, fanout.transmit_outcome());
     rounds += 1;
   }
   rounds
@@ -1842,7 +1835,6 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
     !ctx.proto.has_fully_announced().get(),
     "a partial announcement must NOT open the reclaim-cancel gate"
   );
-  assert_eq!(ctx.partial_rounds, 1, "one partial round must be counted");
 
   // The headline regression: ownership latched, so a graceful unregister really
   // does retract. Had the partial round dropped ownership the snapshot would be
@@ -1893,10 +1885,6 @@ fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
     ctx.proto.has_fully_announced().get(),
     "a complete announcement is the ONLY thing that opens the reclaim-cancel gate"
   );
-  assert_eq!(
-    ctx.partial_rounds, 0,
-    "no round was partial, so the bounded policy must never have been engaged"
-  );
 
   drop(reg);
 }
@@ -1931,11 +1919,6 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
     "nothing reached a wire, so no peer can hold these records and no goodbye \
      ownership may latch"
   );
-  assert_eq!(
-    ctx.partial_rounds, 0,
-    "a wholly-failed round must not spend the partial budget — otherwise an \
-     alternating partial/failed pattern would evade the bound forever"
-  );
 
   state.remove_service(h, now);
   assert!(
@@ -1945,74 +1928,6 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
       .is_none(),
     "an unadvertised service has nothing to retract, so its withdrawal must put \
      no datagram on the wire"
-  );
-
-  drop(reg);
-}
-
-/// The bounded obligation policy: a family that keeps missing must eventually
-/// stop holding the lifecycle. Round-precise — `MAX_PARTIAL_ROUNDS` partials are
-/// reported honestly, and the next one is excused so the phase advances from
-/// exactly where it stood. Without the bound this service pins in `Announcing(0)`
-/// forever.
-#[cfg(feature = "tokio")]
-#[test]
-fn the_bounded_partial_policy_fires_instead_of_pinning_the_phase() {
-  use mdns_proto::service::ServiceState;
-
-  let mut state = delivery_test_state(false);
-  let now = StdInstant::now();
-  let reg = state
-    .register_service(delivery_test_spec("bounded"), now)
-    .unwrap();
-  let h = reg.handle;
-  let mut buf = std::vec![0u8; 4096];
-
-  // Steps larger than the top rung of the core's §8.3 partial ladder (64 s), so
-  // each round's re-arm is always due.
-  let step = Duration::from_secs(120);
-  let mut t = now;
-  for round in 0..u32::from(MAX_PARTIAL_ROUNDS) {
-    assert_eq!(
-      confirm_service_round(&mut state, h, t, &mut buf, PARTIAL_FANOUT),
-      1,
-      "round {round} should have offered one announcement"
-    );
-    assert_eq!(
-      state.services[&h].proto.state(),
-      ServiceState::Announcing(0),
-      "the first {MAX_PARTIAL_ROUNDS} partial rounds are reported honestly and \
-       must not advance the phase"
-    );
-    t += step;
-  }
-
-  // The next partial excuses the missing family for THIS ONE confirm.
-  confirm_service_round(&mut state, h, t, &mut buf, PARTIAL_FANOUT);
-  assert_eq!(
-    state.services[&h].proto.state(),
-    ServiceState::Announcing(1),
-    "the bounded policy must excuse the missing family rather than pin the phase"
-  );
-  assert_eq!(
-    state.services[&h].partial_rounds, 0,
-    "the excusal resets the budget, so the policy is per-confirm and not sticky"
-  );
-  assert!(
-    state.services[&h].proto.advertises_instance(),
-    "excusal is confined to the PHASE: it can only turn Partial into All, both \
-     of which latch §10.1 goodbye ownership"
-  );
-
-  // And it terminates: a permanently half-reachable link still establishes.
-  for _ in 0..12 {
-    t += step;
-    confirm_service_round(&mut state, h, t, &mut buf, PARTIAL_FANOUT);
-  }
-  assert_eq!(
-    state.services[&h].proto.state(),
-    ServiceState::Established,
-    "a permanently partial link must still reach Established under the bound"
   );
 
   drop(reg);
@@ -2139,11 +2054,10 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     "the replacement must reach its first announcement"
   );
 
-  // Exactly ONE partially-delivered announcement — the bounded policy provably
-  // cannot have excused anything yet.
+  // Exactly ONE partially-delivered announcement — the core's patience bound
+  // provably cannot have excused anything yet.
   t += Duration::from_millis(300);
   confirm_service_round(&mut state, rh, t, &mut buf, PARTIAL_FANOUT);
-  assert_eq!(state.services[&rh].partial_rounds, 1);
   assert!(
     !state.services[&rh].proto.has_fully_announced().get(),
     "a partial announcement must leave the reclaim-cancel gate shut"
@@ -2271,12 +2185,7 @@ fn confirm_service_round_mixed(
     } else {
       UNICAST_FANOUT
     };
-    let outcome = bound_partial_delivery(
-      &mut ctx.partial_rounds,
-      tx.obligation(),
-      fanout.transmit_outcome(),
-    );
-    confirm_service_transmit(endpoint, ctx, t, outcome);
+    confirm_service_transmit(endpoint, ctx, t, fanout.transmit_outcome());
     rounds += 1;
   }
   rounds
@@ -2323,117 +2232,6 @@ fn inject_ptr_query(
   }
 }
 
-/// Answering legacy queriers must not let a chronically half-broken family evade
-/// the bounded obligation policy.
-///
-/// A §6.7 unicast reply is `TransmitObligation::OneShot` and has exactly ONE
-/// obligated family, so it is `AllDelivered` by construction. Counting it would
-/// RESET the partial-round budget, and a service that answers a legacy querier
-/// between lifecycle rounds would hold that budget at zero forever — the bound
-/// would never fire and the service would stay pinned in `Announcing` on the
-/// family that does work.
-#[cfg(feature = "tokio")]
-#[test]
-fn delivered_unicast_replies_do_not_evade_the_bounded_partial_policy() {
-  use mdns_proto::service::ServiceState;
-
-  let mut state = delivery_test_state(false);
-  let now = StdInstant::now();
-  let reg = state
-    .register_service(delivery_test_spec("evade"), now)
-    .unwrap();
-  let h = reg.handle;
-  let mut buf = std::vec![0u8; 4096];
-  let legacy = SocketAddr::from(([192, 168, 1, 50], 6000));
-
-  // Steps larger than the top rung of the core's §8.3 partial ladder (64 s), so
-  // each round's re-arm is always due. Every round serves one legacy querier
-  // (delivered by construction) and then partially delivers one announcement.
-  let step = Duration::from_secs(120);
-  let mut t = now;
-  for round in 0..=u32::from(MAX_PARTIAL_ROUNDS) {
-    inject_ptr_query(&mut state, legacy, t);
-    assert_eq!(
-      confirm_service_round_mixed(&mut state, h, t, &mut buf, PARTIAL_FANOUT),
-      2,
-      "round {round} should have offered one unicast reply and one announcement"
-    );
-    t += step;
-  }
-
-  assert_eq!(
-    state.services[&h].proto.state(),
-    ServiceState::Announcing(1),
-    "the interleaved unicast replies must not have reset the partial-round \
-     budget — with them counted, the bound never fires and the service pins in \
-     Announcing(0) on a permanently half-broken link"
-  );
-  drop(reg);
-}
-
-/// Partially-delivered multicast RESPONSES must not preload the partial-round
-/// budget, or the next partial LIFECYCLE datagram is excused and its phase
-/// advances although one family never heard it — the §8.1/§8.3 violation the
-/// `TransmitOutcome` contract exists to remove, reintroduced through the back
-/// door.
-#[cfg(feature = "tokio")]
-#[test]
-fn partial_multicast_responses_do_not_preload_the_bounded_partial_policy() {
-  use mdns_proto::service::ServiceState;
-
-  let mut state = delivery_test_state(false);
-  let now = StdInstant::now();
-  let reg = state
-    .register_service(delivery_test_spec("preload"), now)
-    .unwrap();
-  let h = reg.handle;
-  let mut buf = std::vec![0u8; 4096];
-  let querier = SocketAddr::from(([192, 168, 1, 50], 5353));
-
-  // A clean first announcement, so the budget starts at zero and the next
-  // announcement is a full §8.3 interval (1 s) away.
-  assert_eq!(
-    confirm_service_round(&mut state, h, now, &mut buf, WHOLE_FANOUT),
-    1
-  );
-  assert_eq!(
-    state.services[&h].proto.state(),
-    ServiceState::Announcing(1)
-  );
-
-  // Partially-delivered multicast responses, well inside that 1 s window.
-  let mut t = now;
-  for round in 0..u32::from(MAX_PARTIAL_ROUNDS) {
-    inject_ptr_query(&mut state, querier, t);
-    t += Duration::from_millis(200); // past the §6 20–120 ms jitter
-    assert_eq!(
-      confirm_service_round(&mut state, h, t, &mut buf, PARTIAL_FANOUT),
-      1,
-      "round {round} should have offered exactly one response"
-    );
-    assert_eq!(
-      state.services[&h].partial_rounds, 0,
-      "a response is never re-armed, so a partial one is no evidence that a \
-       family is holding a lifecycle datagram hostage"
-    );
-  }
-
-  // The next partial ANNOUNCEMENT must therefore be reported honestly.
-  t += Duration::from_secs(2);
-  assert_eq!(
-    confirm_service_round(&mut state, h, t, &mut buf, PARTIAL_FANOUT),
-    1
-  );
-  assert_eq!(
-    state.services[&h].proto.state(),
-    ServiceState::Announcing(1),
-    "with the responses counted this announcement would be the budget-exhausting \
-     round, excusing the family that has been told nothing and advancing §8.3"
-  );
-  assert_eq!(state.services[&h].partial_rounds, 1);
-  drop(reg);
-}
-
 /// Bypassing the bound for a one-shot datagram must not bypass the CORE confirm:
 /// the outcome still reaches `Service::note_transmit_outcome` verbatim, so a
 /// delivered response latches §10.1 goodbye ownership for the records it put on
@@ -2473,91 +2271,6 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
   assert!(
     !state.services[&h].proto.has_fully_announced().get(),
     "an all-delivered UNICAST reply is still not a complete announcement"
-  );
-  drop(reg);
-}
-
-/// A rename restarts the lifecycle under a new name, so the partial-round
-/// evidence gathered under the old one is dropped with it — mirroring the core,
-/// which zeroes its own §8.3 partial-announce ladder on a rename.
-#[cfg(feature = "tokio")]
-#[tokio::test]
-async fn a_rename_clears_the_partial_round_evidence() {
-  use mdns_proto::{
-    Name,
-    event::RouteEvent,
-    wire::{Header, MessageBuilder},
-  };
-
-  let mut state = delivery_test_state(true);
-  let now = StdInstant::now();
-  let reg = state
-    .register_service(delivery_test_spec("Renamer"), now)
-    .unwrap();
-  let h = reg.handle;
-  let mut buf = std::vec![0u8; 4096];
-
-  // Spend one partial round, so there IS evidence for the rename to clear.
-  let mut t = now;
-  for _ in 0..8 {
-    t += Duration::from_millis(300);
-    if confirm_service_round(&mut state, h, t, &mut buf, PARTIAL_FANOUT) > 0 {
-      break;
-    }
-  }
-  assert_eq!(
-    state.services[&h].partial_rounds, 1,
-    "a partially-delivered probe must have been counted"
-  );
-
-  // A rival SRV authority for the same instance name with LARGER rdata: we lose
-  // the §8.2 tiebreak and rename away.
-  let inst = Name::try_from_str("Renamer._ipp._tcp.local.").unwrap();
-  let conflict = {
-    let target = Name::try_from_str("rival-host.local.").unwrap();
-    let mut cbuf = [0u8; 512];
-    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
-    b.push_srv_authority(&inst, 120, 0, 0, 9999, &target)
-      .unwrap();
-    let n = b.finish().unwrap();
-    cbuf[..n].to_vec()
-  };
-  let src = SocketAddr::from(([192, 168, 1, 200], 5353));
-  let local_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 10));
-  {
-    let DriverState {
-      endpoint, services, ..
-    } = &mut state;
-    let evs = endpoint
-      .handle(t, src, local_ip, 0, &conflict, false)
-      .expect("the endpoint must accept the conflicting authority record");
-    for ev in evs {
-      if let Ok(RouteEvent::ToService(ts)) = ev
-        && let Some(ctx) = services.get_mut(&ts.handle())
-      {
-        ctx.proto.handle_event(ts.into_event(), t);
-      }
-    }
-  }
-
-  // Fire the §8.2 tiebreak WITHOUT confirming any transmit, so the counter can
-  // only be changed by the rename hook itself.
-  t += Duration::from_millis(300);
-  let _ = state.services.get_mut(&h).unwrap().proto.handle_timeout(t);
-  assert_ne!(
-    state.services[&h].proto.name().as_str(),
-    inst.as_str(),
-    "the service must have lost the tiebreak and renamed"
-  );
-  assert_eq!(
-    state.services[&h].partial_rounds, 1,
-    "the reset belongs to the driver's rename hook, not to the proto"
-  );
-
-  state.push_updates(t).await;
-  assert_eq!(
-    state.services[&h].partial_rounds, 0,
-    "observing `Renamed` must clear the evidence gathered under the old name"
   );
   drop(reg);
 }

@@ -13,8 +13,8 @@ use agnostic_net::{Net, UdpSocket};
 use async_channel::Sender;
 use futures::{FutureExt, pin_mut, select_biased};
 use mdns_proto::{
-  QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate, TransmitObligation,
-  TransmitOutcome, endpoint::WithdrawalSend, event::RouteEvent,
+  QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate, TransmitOutcome,
+  endpoint::WithdrawalSend, event::RouteEvent,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -105,11 +105,6 @@ struct ServiceCtx {
   /// the handle-owned mailbox's reserved terminal slot, so it survives the ctx
   /// GC and reaches a live reader.
   withdrawing: bool,
-  /// Consecutive [`TransmitOutcome::PartiallyDelivered`] fan-outs confirmed for
-  /// this service, driving [`bound_partial_delivery`] — this driver's half of the
-  /// [`TransmitOutcome`] contract. Reset by any fully-delivered fan-out and by the
-  /// excusal itself; left alone by a wholly-failed one.
-  partial_rounds: u8,
 }
 
 /// Driver-side state for a single active query.
@@ -121,11 +116,6 @@ struct QueryCtx {
   /// driver detects the consumer is gone and GCs the query.
   doorbell: Sender<()>,
   last_seq: u64,
-  /// Consecutive [`TransmitOutcome::PartiallyDelivered`] fan-outs confirmed for
-  /// this question, with the same rules as [`ServiceCtx::partial_rounds`]. A
-  /// partial §5.2 question freezes the retry budget, so without the bound a
-  /// half-reachable link would keep a query alive indefinitely.
-  partial_rounds: u8,
 }
 
 /// All state owned by the driver task.
@@ -336,7 +326,6 @@ impl<N: Net> DriverState<N> {
         doorbell: doorbell_tx,
         encode_failures: 0,
         withdrawing: false,
-        partial_rounds: 0,
       },
     );
     Ok(ServiceRegistered {
@@ -364,7 +353,6 @@ impl<N: Net> DriverState<N> {
         mailbox: Arc::clone(&mailbox),
         doorbell: doorbell_tx,
         last_seq: 0,
-        partial_rounds: 0,
       },
     );
     Ok(QueryStarted {
@@ -596,21 +584,6 @@ impl<N: Net> DriverState<N> {
           // records — we cannot safely keep it. Emit Conflict, then remove.
           let final_upd = match upd {
             ServiceUpdate::Renamed(ref renamed) => {
-              // A rename restarts the whole §8.1/§8.3 lifecycle under a new name,
-              // so the partial-round evidence collected under the old one goes
-              // with it. This mirrors the core, which zeroes its own §8.3
-              // partial-announce ladder on a rename
-              // (`reset_advertised_name_state`), and the conservatism is cheap:
-              // the worst case is ~750 ms of extra probing before the bound can
-              // excuse a family again.
-              //
-              // KNOWN RESIDUAL — the RFC 6763 §9 same-name revert-to-probe emits
-              // NO `ServiceUpdate` and is unobservable from here, so a revert can
-              // inherit up to `MAX_PARTIAL_ROUNDS` rounds. Accepted: the ladder's
-              // rungs are 1 s / 2 s, so that evidence is at most seconds old, and
-              // the conflict that triggered the revert was detected by RECEIVING a
-              // packet — the inherited rounds describe the same live links.
-              ctx.partial_rounds = 0;
               let rename_result =
                 endpoint.handle_service_renamed(*handle, renamed.new_name().clone());
               // The §9 rename of an announced service hands its OLD-name TTL=0
@@ -884,12 +857,7 @@ impl<N: Net> DriverState<N> {
         // `StdInstant::now()` anchors any scheduled deadline to post-send time
         // (a long `send_via` await would put a pre-send deadline in the past).
         if let Some(ctx) = services.get_mut(&h) {
-          let outcome = bound_partial_delivery(
-            &mut ctx.partial_rounds,
-            tx.obligation(),
-            fanout.transmit_outcome(),
-          );
-          confirm_service_transmit(endpoint, ctx, StdInstant::now(), outcome);
+          confirm_service_transmit(endpoint, ctx, StdInstant::now(), fanout.transmit_outcome());
         }
         credits_remaining = credits_remaining.saturating_sub(fanout.sent_count());
       }
@@ -1010,15 +978,7 @@ impl<N: Net> DriverState<N> {
         // anchor the retry backoff to POST-send time — `send_via`
         // can await longer than the backoff interval, so the pre-send `now`
         // would schedule a deadline already in the past.
-        let outcome = match queries.get_mut(&h) {
-          Some(ctx) => bound_partial_delivery(
-            &mut ctx.partial_rounds,
-            tx.obligation(),
-            fanout.transmit_outcome(),
-          ),
-          None => fanout.transmit_outcome(),
-        };
-        endpoint.note_query_transmit_outcome(h, StdInstant::now(), outcome);
+        endpoint.note_query_transmit_outcome(h, StdInstant::now(), fanout.transmit_outcome());
         credits_remaining = credits_remaining.saturating_sub(fanout.sent_count());
       }
     }
@@ -1233,39 +1193,6 @@ const MAX_SEND_CREDITS_PER_DRAIN: usize = 64;
 /// payload simply cannot be encoded with the current scratch buffer
 /// (e.g. records exceed `max_payload_size`).
 const MAX_CONSECUTIVE_ENCODE_ERRORS: u8 = 3;
-
-/// How many consecutive [`TransmitOutcome::PartiallyDelivered`] fan-outs one
-/// origin may accumulate before [`bound_partial_delivery`] excuses the families
-/// that keep missing.
-///
-/// This is the driver half of the [`TransmitOutcome`] contract. A partial confirm
-/// re-arms the same logical datagram without advancing the phase, so a link that
-/// is up enough to be obligated but never carries anything would otherwise hold
-/// every service in probing forever. The core cannot own this bound: the only
-/// unilateral action it could take is to advance, and advancing unprobed is the
-/// §8.1 violation this whole change removes.
-///
-/// The bound is a per-origin ROUND COUNT on the CONFIRM stream, not a
-/// per-family failure streak and not a wall-clock degrade window, even though
-/// this crate has both a clock and an allocator:
-///
-/// * A per-family streak provably cannot fire in the case that matters. With a
-///   transport that has room for one datagram at a time, the two families can
-///   succeed alternately — every round is partial, yet neither family ever
-///   accumulates a streak, so the service pins forever with the bound never
-///   arming.
-/// * A duration is the wrong instrument, not an unavailable one: the re-offer
-///   cadence spans 250 ms while probing (§8.1's own interval) up to 64 s at the
-///   top of the core's §8.3 partial ladder, a factor of 256, so any single
-///   degrade window means ~120 attempts in one phase and one attempt in the
-///   other. Rounds are the unit the core's own re-arm schedule speaks.
-///
-/// Two rounds is the smallest count that separates contention from failure: a
-/// re-arm is lossless (the SAME probe index / announcement count is re-encoded),
-/// so a family that missed round 1 to transient buffer pressure gets that exact
-/// datagram again in round 2. It also caps the core's §8.3 doubling ladder at its
-/// second rung, delaying an announcement step by at most 1 s + 2 s.
-const MAX_PARTIAL_ROUNDS: u8 = 2;
 
 /// Deliver a `ServiceUpdate` to a service's caller via its handle-owned mailbox,
 /// then ring the doorbell.
@@ -1606,9 +1533,10 @@ impl Fanout {
   /// An empty obligated set yields [`TransmitOutcome::NoneDelivered`], never a
   /// vacuous "all": nothing was delivered, so nothing may latch or advance.
   ///
-  /// Write-off of a family that keeps missing is NOT applied here — that is
-  /// [`bound_partial_delivery`], which needs per-origin state this type does not
-  /// have, keeping this projection a pure function of the I/O facts.
+  /// A family that keeps missing is never written off here, and this driver has
+  /// no other place that could: the confirm is the honest I/O facts and nothing
+  /// more. Bounding how long the lifecycle waits for it is the core's own
+  /// patience, applied inside [`TransmitOutcome`]'s confirm.
   fn transmit_outcome(self) -> TransmitOutcome {
     let mut obligated = 0usize;
     let mut delivered = 0usize;
@@ -1628,80 +1556,6 @@ impl Fanout {
     } else {
       TransmitOutcome::PartiallyDelivered
     }
-  }
-}
-
-/// This driver's BOUNDED obligation policy, applied to one origin's confirm
-/// stream. See [`MAX_PARTIAL_ROUNDS`] for why the bound is a per-origin round
-/// count rather than a per-family streak or a duration.
-///
-/// Counts consecutive partial fan-outs and, once `rounds` has reached
-/// [`MAX_PARTIAL_ROUNDS`], EXCUSES the families that keep missing by reporting
-/// the next partial as [`TransmitOutcome::AllDelivered`] — dropping them from the
-/// obligated set for that ONE confirm, so the phase advances from exactly where
-/// it stood. Nothing is marked dead: the excused family is still fanned to on
-/// every later round, and the first round it accepts is all-delivered on its own
-/// merit. There is therefore no degraded state to get stuck in and no recovery
-/// edge to detect.
-///
-/// The write-off is confined to the PHASE. Excusal can only turn
-/// `PartiallyDelivered` into `AllDelivered`, and both are `any_delivered`, so it
-/// can never suppress a §10.1 goodbye-ownership latch: records that reached a
-/// wire stay owned and stay retractable.
-///
-/// `NoneDelivered` leaves the counter untouched rather than resetting it — no
-/// link was served, so no obligation was met and none may be written off. This
-/// mirrors the core, which likewise neither uses nor advances its §8.3 partial
-/// ladder on a round that reached no wire; resetting here would let an
-/// alternating partial/failed pattern evade the bound forever.
-///
-/// # Only sustained obligations are counted
-///
-/// A [`TransmitObligation::OneShot`] datagram — every response: the §6 multicast
-/// reply, the §6.7 legacy unicast reply, the RFC 6763 §9 meta reply — passes
-/// through VERBATIM, touching neither the counter nor the outcome. The counter
-/// tracks how long a link has been holding a re-armed lifecycle datagram
-/// hostage, and a response is never re-armed, so mixing responses in corrupts it
-/// in both directions:
-///
-/// * a legacy unicast reply has ONE obligated family, so it is `AllDelivered` by
-///   construction and would RESET the counter — alternating partial lifecycle
-///   sends with unicast replies would hold it at zero and the bound would never
-///   fire, pinning the service on a chronically half-broken link;
-/// * a partial multicast response would PRELOAD the counter, so the next partial
-///   probe would be excused and the RFC 6762 §8.1 sequence would advance although
-///   one family never heard the probe — the exact violation this contract exists
-///   to remove.
-///
-/// Passing the outcome through unchanged (rather than dropping the confirm) is
-/// required: the core still reads `any_delivered` from a response confirm to
-/// latch §10.1 goodbye ownership for the records it put on the wire.
-fn bound_partial_delivery(
-  rounds: &mut u8,
-  obligation: TransmitObligation,
-  outcome: TransmitOutcome,
-) -> TransmitOutcome {
-  if matches!(obligation, TransmitObligation::OneShot) {
-    return outcome;
-  }
-  match outcome {
-    TransmitOutcome::PartiallyDelivered if *rounds >= MAX_PARTIAL_ROUNDS => {
-      *rounds = 0;
-      hick_trace::warn!(
-        rounds = MAX_PARTIAL_ROUNDS,
-        "excusing the family that missed every recent fan-out; the lifecycle phase advances without it"
-      );
-      TransmitOutcome::AllDelivered
-    }
-    TransmitOutcome::PartiallyDelivered => {
-      *rounds = rounds.saturating_add(1);
-      outcome
-    }
-    TransmitOutcome::AllDelivered => {
-      *rounds = 0;
-      outcome
-    }
-    TransmitOutcome::NoneDelivered => outcome,
   }
 }
 

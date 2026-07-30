@@ -3,8 +3,7 @@
 use core::net::{IpAddr, SocketAddr};
 
 /// Whether the core will KEEP RE-ARMING a datagram until every obligated link
-/// accepts it — and therefore whether a driver's bounded obligation policy (see
-/// [`TransmitOutcome`]) applies to that datagram's confirm.
+/// accepts it — i.e. whether missing this datagram pins the producer's progress.
 ///
 /// The tag is a property of the DATAGRAM, not of the producing service's
 /// lifecycle phase. The two diverge in both directions: the periodic
@@ -13,17 +12,12 @@ use core::net::{IpAddr, SocketAddr};
 /// [`Query::poll_transmit`](crate::Query::poll_transmit) shares [`Transmit`]
 /// while having no service phase at all.
 ///
-/// A driver MUST route the two variants differently, because feeding a
-/// [`OneShot`](Self::OneShot) confirm into a bounded obligation counter corrupts
-/// that counter in both directions:
-///
-/// * An RFC 6762 §6.7 legacy unicast reply has exactly one obligated link, so it
-///   is [`AllDelivered`](TransmitOutcome::AllDelivered) by construction and
-///   RESETS the counter. A stream of replies interleaved with partial lifecycle
-///   sends holds it at zero forever, and the bound never fires.
-/// * A partially-delivered multicast response PRELOADS the counter, so the next
-///   partial probe is excused and the §8.1 sequence advances although one family
-///   never heard the probe.
+/// A driver needs the distinction for any decision about what a FAILURE means.
+/// The concrete one in tree: a datagram no reachable socket can ever carry (too
+/// large for every one of them) retires a `Sustained` producer, because it would
+/// otherwise re-offer that same datagram forever — while the same failure on a
+/// `OneShot` reply is simply an unanswered question, and retiring on it would let
+/// a remote peer tear down a healthy service by asking one.
 ///
 /// Deliberately NOT `#[non_exhaustive]`: a future transmit kind must break every
 /// driver's match and force it to choose a policy, rather than silently
@@ -31,18 +25,17 @@ use core::net::{IpAddr, SocketAddr};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransmitObligation {
   /// The core re-arms this datagram until every obligated link accepts it, so a
-  /// link that keeps missing pins the producer's progress. A driver's bounded
-  /// obligation policy APPLIES.
+  /// link that keeps missing pins the producer's progress — until the core's own
+  /// patience bound excuses it (see [`TransmitOutcome`]).
   ///
   /// Carried by the RFC 6762 §8.1 probe, by every §8.3 announcement (including
   /// the periodic re-announce from `Established`), and by the §5.2 query
   /// retransmission.
   Sustained,
   /// Fire-and-forget: the core never re-arms this datagram, so missing it pins
-  /// nothing. A driver's bounded obligation policy MUST NOT be applied — the
-  /// outcome must reach the core VERBATIM, since the core still reads
-  /// [`TransmitOutcome::any_delivered`] from it to latch §10.1 goodbye ownership
-  /// for the records the datagram carried.
+  /// nothing and losing it costs nothing but one unanswered question. The core
+  /// still reads [`TransmitOutcome::any_delivered`] from its confirm to latch
+  /// §10.1 goodbye ownership for the records the datagram carried.
   ///
   /// Carried by every response: the jittered multicast reply (§6), the legacy
   /// unicast reply (§6.7), and the RFC 6763 §9 service-type enumeration reply.
@@ -100,8 +93,8 @@ impl Transmit {
   }
 
   /// Whether the core will re-arm this datagram until every obligated link
-  /// accepts it, and therefore whether the driver's bounded obligation policy
-  /// applies to its confirm. See [`TransmitObligation`].
+  /// accepts it, and therefore what a permanent send failure means for the
+  /// producer. See [`TransmitObligation`].
   #[inline(always)]
   pub const fn obligation(&self) -> TransmitObligation {
     self.obligation
@@ -138,33 +131,42 @@ impl Transmit {
 /// * An EMPTY obligated set (every link torn down mid-flight) reports
 ///   [`NoneDelivered`](Self::NoneDelivered) — never a vacuous "all".
 ///
-/// # Driver obligation (normative)
+/// # The split (normative)
 ///
-/// A driver that can ever report [`PartiallyDelivered`](Self::PartiallyDelivered)
-/// **MUST** implement a BOUNDED obligation policy — a consecutive-failure
-/// write-off or family degradation that eventually drops a dead link from the
-/// obligated set. Repeated `PartiallyDelivered` re-arms indefinitely, so without
-/// such a policy a chronically-failing link holds every service in probing or
-/// announcing forever.
+/// The DRIVER owns the obligated set and link death: which links a datagram is
+/// fanned onto, which have been permanently written off (no socket, a degraded
+/// family), and when a socket is torn down. It reports the honest aggregate shape
+/// and nothing else — no confirm is ever laundered into a different one, and a
+/// `OneShot` outcome in particular reaches the core verbatim, since the core
+/// reads `any_delivered` from it to latch §10.1 goodbye ownership.
 ///
-/// That policy applies to [`TransmitObligation::Sustained`] datagrams and to
-/// those ONLY. A [`OneShot`](TransmitObligation::OneShot) datagram is never
-/// re-armed, so it has nothing to write off — and mixing its confirms into the
-/// same counter both hides a chronically half-broken link and advances phases the
-/// missing link never heard. Read [`Transmit::obligation`] and pass a `OneShot`
-/// outcome to the core verbatim.
+/// The CORE owns its own patience. Repeated `PartiallyDelivered` re-arms
+/// indefinitely, so the core bounds how many consecutive re-arms one producer
+/// spends waiting for a link that never accepts; past that bound it advances the
+/// phase without that link (`MAX_PARTIAL_ROUNDS`). That is a decision about the
+/// core's own lifecycle, made of facts the core already holds — the confirm shape
+/// and its own re-arm count — with no socket or link-health knowledge involved,
+/// so it belongs where every other lifecycle rule lives. Its in-tree sibling is
+/// the withdrawal ceiling, which force-completes per-family goodbye debt the
+/// driver never paid.
 ///
-/// The bound cannot live in the core. Its only unilateral terminal action would
-/// be to advance the phase anyway, and advancing on a link that never heard the
-/// probe is precisely what §8.1 forbids ("it MUST send a Multicast DNS query …
-/// to see if any of them are already in use") — the defect this type exists to
-/// remove. Deciding that a lagging link no longer counts needs link-health
-/// knowledge only the driver has.
+/// The core does NOT thereby decide a link is dead: the excused link is fanned
+/// onto on every later round and the first round it accepts is `AllDelivered` on
+/// its own merit, so there is no degraded state to get stuck in and no recovery
+/// edge to detect. Nor is the escape a delivery — it advances the phase and
+/// nothing else. It earns no announcement proof
+/// ([`Service::has_fully_announced`](crate::Service::has_fully_announced) stays
+/// shut), no ladder reset, and no delivered-datagram counter. §8.1's requirement
+/// that a name be probed before it is claimed is honoured by the bound being
+/// spent on genuine re-arms of that probe, and by the excusal never being
+/// reachable from an outcome that put nothing on a wire
+/// ([`NoneDelivered`](Self::NoneDelivered) leaves the count untouched, so an
+/// alternating partial/failed pattern cannot walk into it).
 ///
-/// The core's half of that contract: a re-arm is LOSSLESS (same probe index,
+/// The core's other half of the contract: a re-arm is LOSSLESS (same probe index,
 /// same announcement count — nothing restarts) and recovery is IMMEDIATE — the
-/// first confirm after the driver stops obligating the dead link is
-/// `AllDelivered`, and the phase advances from exactly where it stood.
+/// first confirm after the lagging link starts accepting is `AllDelivered`, and
+/// the phase advances from exactly where it stood.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
 #[display("{}", self.as_str())]
 pub enum TransmitOutcome {
