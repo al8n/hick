@@ -2148,7 +2148,7 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   #[cfg(feature = "stats")]
   let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
 
-  let fanout = send_via::<Net>(
+  let (fanout, accepted_at) = send_via(
     &mut tracker,
     &v4,
     &v6,
@@ -2159,6 +2159,11 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   )
   .await;
 
+  assert!(
+    accepted_at.is_some(),
+    "the one obligated family accepted the datagram, so the confirm has a real \
+     acceptance instant to anchor at"
+  );
   assert_eq!(
     fanout.delivery(),
     mdns_proto::TransmitDelivery::new(
@@ -2172,6 +2177,390 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
     tracker.is_empty(),
     "a unicast reply never loops back, so it must record NO self-send credit; \
      tracker = {tracker:?}"
+  );
+}
+
+// ── The wedged family (per-family send bound) ───────────────────────────────
+
+/// How a [`TestSocket`] answers `poll_send_to`.
+#[cfg(feature = "tokio")]
+#[derive(Clone, Copy)]
+enum SendBehaviour {
+  /// Accepts immediately without touching the kernel, so the fan-out's timing is
+  /// the test's rather than the host's routing table.
+  Accepts,
+  /// Never becomes writable — the family whose transport is wedged. This is the
+  /// case no bound UDP socket can be coaxed into on a real host, and the only one
+  /// that distinguishes a bounded attempt from an unbounded one.
+  Wedged,
+}
+
+/// A bound socket whose write side is scripted. It owns a real `std::net`
+/// socket so the `Fd` supertrait is satisfied by an actual descriptor; every
+/// method the transmit fan-out does not call is left unimplemented rather than
+/// delegated, so a future call site cannot silently start depending on kernel
+/// behaviour this fixture does not model.
+#[cfg(feature = "tokio")]
+struct TestSocket {
+  fd: std::net::UdpSocket,
+  behaviour: SendBehaviour,
+}
+
+#[cfg(feature = "tokio")]
+impl TestSocket {
+  fn new(behaviour: SendBehaviour) -> Self {
+    Self {
+      fd: std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a loopback socket"),
+      behaviour,
+    }
+  }
+}
+
+#[cfg(feature = "tokio")]
+impl TryFrom<std::net::UdpSocket> for TestSocket {
+  type Error = std::io::Error;
+
+  fn try_from(fd: std::net::UdpSocket) -> std::io::Result<Self> {
+    Ok(Self {
+      fd,
+      behaviour: SendBehaviour::Accepts,
+    })
+  }
+}
+
+#[cfg(all(unix, feature = "tokio"))]
+impl std::os::fd::AsFd for TestSocket {
+  fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.fd.as_fd()
+  }
+}
+
+#[cfg(all(unix, feature = "tokio"))]
+impl std::os::fd::AsRawFd for TestSocket {
+  fn as_raw_fd(&self) -> std::os::fd::RawFd {
+    self.fd.as_raw_fd()
+  }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+impl std::os::windows::io::AsSocket for TestSocket {
+  fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+    self.fd.as_socket()
+  }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+impl std::os::windows::io::AsRawSocket for TestSocket {
+  fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+    self.fd.as_raw_socket()
+  }
+}
+
+#[cfg(feature = "tokio")]
+impl UdpSocket for TestSocket {
+  type Runtime = <<agnostic_net::tokio::Net as agnostic_net::Net>::UdpSocket as UdpSocket>::Runtime;
+
+  fn poll_send_to(
+    &self,
+    _cx: &mut core::task::Context<'_>,
+    buf: &[u8],
+    _target: SocketAddr,
+  ) -> core::task::Poll<std::io::Result<usize>> {
+    match self.behaviour {
+      SendBehaviour::Accepts => core::task::Poll::Ready(Ok(buf.len())),
+      // No waker is registered: a wedged family never wakes the task by itself,
+      // which is precisely why the attempt needs its own bound.
+      SendBehaviour::Wedged => core::task::Poll::Pending,
+    }
+  }
+
+  fn poll_recv_from(
+    &self,
+    _cx: &mut core::task::Context<'_>,
+    _buf: &mut [u8],
+  ) -> core::task::Poll<std::io::Result<(usize, SocketAddr)>> {
+    unimplemented!("the transmit fan-out never reads")
+  }
+
+  fn local_addr(&self) -> std::io::Result<SocketAddr> {
+    self.fd.local_addr()
+  }
+
+  async fn bind<A: agnostic_net::ToSocketAddrs<Self::Runtime>>(_addr: A) -> std::io::Result<Self>
+  where
+    Self: Sized,
+  {
+    unimplemented!("scripted sockets are constructed directly")
+  }
+
+  async fn connect<A: agnostic_net::ToSocketAddrs<Self::Runtime>>(
+    &self,
+    _addr: A,
+  ) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+    unimplemented!()
+  }
+
+  async fn recv(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+    unimplemented!()
+  }
+
+  async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+    unimplemented!()
+  }
+
+  async fn send(&self, _buf: &[u8]) -> std::io::Result<usize> {
+    unimplemented!()
+  }
+
+  async fn send_to<A: agnostic_net::ToSocketAddrs<Self::Runtime>>(
+    &self,
+    _buf: &[u8],
+    _target: A,
+  ) -> std::io::Result<usize> {
+    unimplemented!()
+  }
+
+  async fn peek(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+    unimplemented!()
+  }
+
+  async fn peek_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+    unimplemented!()
+  }
+
+  fn join_multicast_v4(
+    &self,
+    _multiaddr: std::net::Ipv4Addr,
+    _interface: std::net::Ipv4Addr,
+  ) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn join_multicast_v6(
+    &self,
+    _multiaddr: &std::net::Ipv6Addr,
+    _interface: u32,
+  ) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn leave_multicast_v4(
+    &self,
+    _multiaddr: std::net::Ipv4Addr,
+    _interface: std::net::Ipv4Addr,
+  ) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn leave_multicast_v6(
+    &self,
+    _multiaddr: &std::net::Ipv6Addr,
+    _interface: u32,
+  ) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn multicast_loop_v4(&self) -> std::io::Result<bool> {
+    unimplemented!()
+  }
+
+  fn set_multicast_loop_v4(&self, _on: bool) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn multicast_ttl_v4(&self) -> std::io::Result<u32> {
+    unimplemented!()
+  }
+
+  fn set_multicast_ttl_v4(&self, _ttl: u32) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn multicast_loop_v6(&self) -> std::io::Result<bool> {
+    unimplemented!()
+  }
+
+  fn set_multicast_loop_v6(&self, _on: bool) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn set_ttl(&self, _ttl: u32) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn ttl(&self) -> std::io::Result<u32> {
+    unimplemented!()
+  }
+
+  fn set_broadcast(&self, _broadcast: bool) -> std::io::Result<()> {
+    unimplemented!()
+  }
+
+  fn broadcast(&self) -> std::io::Result<bool> {
+    unimplemented!()
+  }
+}
+
+/// Fan one multicast datagram out to a healthy v4 and a wedged v6, returning the
+/// instant the fan-out STARTED (a lower bound on v4's true acceptance, taken
+/// independently of what the fan-out reports), the fan-out, the acceptance
+/// instant the confirm must use, and how long the whole fan-out took.
+#[cfg(feature = "tokio")]
+async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Option<StdInstant>, Duration) {
+  let v4 = Some(Arc::new(TestSocket::new(SendBehaviour::Accepts)));
+  let v6 = Some(Arc::new(TestSocket::new(SendBehaviour::Wedged)));
+  let mut tracker: Vec<(u64, SystemTime)> = Vec::new();
+  #[cfg(feature = "stats")]
+  let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
+
+  let started = StdInstant::now();
+  let out = tokio::time::timeout(
+    SEND_ATTEMPT_TIMEOUT * 20,
+    send_via(
+      &mut tracker,
+      &v4,
+      &v6,
+      MDNS_V4_DST,
+      body,
+      #[cfg(feature = "stats")]
+      &stats,
+    ),
+  )
+  .await
+  .expect(
+    "a family that never becomes writable must not park the fan-out: the driver \
+     loop cannot service a timer, a command, or any other family's transmit \
+     while it is suspended here",
+  );
+  let (fanout, accepted_at) = out;
+  (started, fanout, accepted_at, started.elapsed())
+}
+
+/// A wedged family must be given up on within the per-family bound, and must not
+/// move the healthy family's acceptance instant.
+///
+/// Both halves are the same defect seen from two sides. Serially awaiting an
+/// unbounded `send_to` suspends the whole driver task, so nothing else the loop
+/// owns runs; and confirming at post-fan-out time records the family that
+/// accepted at `t0` as having been served when the wedged one finally gave up,
+/// which is a lie about how fresh that family's peers are.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn a_wedged_family_is_bounded_and_leaves_the_healthy_anchor_alone() {
+  let (started, fanout, accepted_at, elapsed) = wedged_v6_round(b"announcement").await;
+
+  assert_eq!(
+    fanout.delivery(),
+    mdns_proto::TransmitDelivery::new(
+      mdns_proto::FamilyDelivery::Delivered,
+      mdns_proto::FamilyDelivery::Missed,
+    ),
+    "the wedged family put nothing on its wire, so the core must be told it \
+     missed — never that it was unobligated or that it carried the datagram"
+  );
+  assert!(
+    elapsed < SEND_ATTEMPT_TIMEOUT * 4,
+    "the fan-out must return once the bound expires; it took {elapsed:?}"
+  );
+
+  let anchor = accepted_at.expect("the healthy family accepted the datagram");
+  assert!(
+    anchor.saturating_duration_since(started) < SEND_ATTEMPT_TIMEOUT,
+    "the anchor must be the healthy family's OWN acceptance instant, not a time \
+     read after the wedged family's bound expired"
+  );
+}
+
+/// The consequence the anchor exists for: a wedged family must not push the
+/// healthy family's next refresh beyond the TTL its records were published with.
+///
+/// Run at [`mdns_proto::constants::MIN_SERVICE_TTL_SECS`], where the slack
+/// between the periodic refresh interval (`max(0.8 · TTL, 1 s)` = 1 s) and the
+/// TTL itself is at its smallest, so the bound has the least room it will ever
+/// have.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn a_wedged_family_cannot_push_the_healthy_refresh_past_its_ttl() {
+  const TTL_SECS: u32 = mdns_proto::constants::MIN_SERVICE_TTL_SECS;
+  /// `max(0.8 · TTL, RFC 6762 §8.3's one second)` at that TTL.
+  const REFRESH: Duration = Duration::from_secs(1);
+
+  // One periodic refresh in which v6 has wedged, taken first so the service's
+  // schedule can be laid out around the acceptance instant it reports.
+  let (started, fanout, accepted_at, _) = wedged_v6_round(b"refresh").await;
+  let anchor = accepted_at.expect("v4 accepted the refresh");
+  let base = anchor
+    .checked_sub(Duration::from_secs(3))
+    .expect("the monotonic clock is at least a few seconds old");
+
+  let mut state = delivery_test_state(false);
+  let mut records = mdns_proto::ServiceRecords::new(
+    mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    mdns_proto::Name::try_from_str("wedged._ipp._tcp.local.").unwrap(),
+    mdns_proto::Name::try_from_str("wedged.local.").unwrap(),
+    631,
+    TTL_SECS,
+  );
+  records.add_a(std::net::Ipv4Addr::new(192, 168, 1, 10));
+  let h = state
+    .register_service(mdns_proto::ServiceSpec::new(records), base)
+    .unwrap()
+    .handle;
+  let mut buf = std::vec![0u8; 4096];
+
+  // Two whole announcements reach Established, so the periodic refresh is the
+  // schedule under test and it is already due at `anchor`.
+  confirm_service_round(&mut state, h, base, &mut buf, WHOLE_FANOUT);
+  confirm_service_round(
+    &mut state,
+    h,
+    base + Duration::from_secs(1),
+    &mut buf,
+    WHOLE_FANOUT,
+  );
+  assert_eq!(
+    state.services[&h].proto.state(),
+    mdns_proto::service::ServiceState::Established
+  );
+
+  // Confirm the wedged round with exactly what the fan-out reported, the way
+  // `drain_transmits` does.
+  let DriverState {
+    endpoint, services, ..
+  } = &mut state;
+  let ctx = services.get_mut(&h).unwrap();
+  let _ = ctx.proto.handle_timeout(anchor);
+  assert!(
+    ctx
+      .proto
+      .poll_transmit(anchor, &mut buf)
+      .is_ok_and(|t| t.is_some()),
+    "the periodic re-announce must be due"
+  );
+  confirm_service_transmit(endpoint, ctx, anchor, fanout.delivery());
+
+  let due = ctx.proto.poll_timeout().expect("re-armed");
+  assert!(
+    due.saturating_duration_since(anchor) <= REFRESH,
+    "the core arms the next announcement one refresh interval after the confirm"
+  );
+  // Measured from a clock read the fan-out never touched, so a confirm instant
+  // that had absorbed the wedged family's bound cannot hide inside it.
+  let gap = due.saturating_duration_since(started);
+  assert!(
+    gap < REFRESH + SEND_ATTEMPT_TIMEOUT / 2,
+    "v4's gap is measured from ITS OWN acceptance, so a family that never \
+     accepted may add nothing to it; v4's next announcement was due {gap:?} after \
+     the fan-out began, against a refresh interval of {REFRESH:?}"
+  );
+  assert!(
+    gap < Duration::from_secs(u64::from(TTL_SECS)),
+    "…which is what keeps v4's peers from expiring these records: they hold them \
+     for {TTL_SECS} s from that same instant"
   );
 }
 

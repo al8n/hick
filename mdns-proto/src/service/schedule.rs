@@ -326,18 +326,34 @@ impl PhaseAdvance {
 /// advancing — the same three events that clear the aggregate counter this
 /// replaced, so the excusal cadence is unchanged.
 ///
-/// A round in which NOTHING was delivered leaves every counter untouched rather
-/// than resetting them: nothing reached a wire, so no obligation was met and none
-/// may be written off. It must not ADVANCE them either — that is what keeps the
-/// excusal unreachable from silence, which §8.1 requires of anything that lets a
-/// name be claimed. Resetting instead would let an alternating partial/failed
-/// pattern evade the bound forever.
+/// A round in which NOTHING was delivered leaves every MISSED family's counter
+/// untouched rather than resetting it: nothing reached a wire, so no obligation
+/// was met and none may be written off. It must not ADVANCE it either — that is
+/// what keeps the excusal unreachable from silence, which §8.1 requires of
+/// anything that lets a name be claimed. Resetting instead would let an
+/// alternating partial/failed pattern evade the bound forever.
+///
+/// A family reported `Unobligated` is the one exception, and it is not about the
+/// round at all: ceasing to be obligated is a TRANSITION, and the charge it
+/// leaves behind describes a family that no longer exists. Carrying it across the
+/// gap would excuse the family the moment it comes back — it would have spent the
+/// bound while unreachable and be written off after a single offer, which is the
+/// §8.1 violation this bound exists to prevent. Its `covered` bit is deliberately
+/// NOT set here: `covered` records an ACTUAL earlier delivery, and letting a
+/// silent round set it would let coverage — and therefore a phase — be completed
+/// out of silence.
 #[allow(dead_code)]
 pub(crate) fn classify_advance(
   patience: &mut [FamilyPatience; 2],
   delivery: TransmitDelivery,
 ) -> PhaseAdvance {
   if !delivery.any_delivered() {
+    for (p, family) in patience.iter_mut().zip(delivery.families().iter()) {
+      if matches!(family, FamilyDelivery::Unobligated) {
+        p.missed = 0;
+        p.stalled = false;
+      }
+    }
     return PhaseAdvance::Failed;
   }
   // Fold the round in. `excusable` tracks whether every family STILL OWED the

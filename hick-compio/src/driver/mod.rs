@@ -1271,22 +1271,29 @@ pub(crate) async fn run(
       let Some((tx, origin)) = pumped else {
         break;
       };
-      let fanout = send_via(&inner, &sock_v4, &sock_v6, tx.dst(), &scratch[..tx.size()]).await;
+      let (fanout, accepted_at) =
+        send_via(&inner, &sock_v4, &sock_v6, tx.dst(), &scratch[..tx.size()]).await;
       // Confirm the pending transmit with the honest per-family shape of the
       // fan-out. The core latches §10.1 goodbye ownership for whatever reached a
       // wire and advances the §8.1 probe sequence / §8.3 announce phase / §5.2
-      // retry budget only once every obligated family carried it. Anchored to
-      // post-send time so the next deadline is relative to the actual on-wire
-      // send.
+      // retry budget only once every obligated family carried it.
+      //
+      // Anchored at the EARLIEST family acceptance, which is the instant the core
+      // measures each delivered family's freshness from. Post-fan-out time would
+      // backdate every family by however long the slowest one took, pushing the
+      // healthy family's next refresh past its records' TTL. A round that reached
+      // no wire has no acceptance to anchor, and its re-arm is spaced from the
+      // attempt instead.
       let delivery = fanout.delivery();
+      let at = accepted_at.unwrap_or_else(StdInstant::now);
       match origin {
         TransmitOrigin::Service(h) => {
           let mut state = inner.state.borrow_mut();
-          state.note_service_transmit_outcome(h, StdInstant::now(), delivery);
+          state.note_service_transmit_outcome(h, at, delivery);
         }
         TransmitOrigin::Query(h) => {
           let mut state = inner.state.borrow_mut();
-          state.note_query_transmit_outcome(h, StdInstant::now(), delivery);
+          state.note_query_transmit_outcome(h, at, delivery);
         }
       }
     }
@@ -1530,12 +1537,13 @@ pub(crate) enum FamilySend {
   Unbound,
   /// A bound socket accepted the datagram.
   Sent,
-  /// A bound socket rejected it. A completion-based `send_to` removes
+  /// A bound socket did not carry it. A completion-based `send_to` removes
   /// `EWOULDBLOCK` and nothing else: `ENETUNREACH`/`EHOSTUNREACH` when a family's
   /// route goes away, `ENOBUFS` under buffer pressure, `EPERM` from a local
   /// firewall, `EADDRNOTAVAIL` when an interface loses its address, `EMSGSIZE`.
   /// Each of those lands here on one family while the other returns `Ok` in the
-  /// very same fan-out.
+  /// very same fan-out — as does an op that had not completed inside
+  /// [`SEND_ATTEMPT_TIMEOUT`].
   Failed,
 }
 
@@ -1547,6 +1555,17 @@ impl FamilySend {
     match res {
       Ok(_) => Self::Sent,
       Err(_) => Self::Failed,
+    }
+  }
+
+  /// Classify one bounded attempt. An attempt whose bound expired is reported as
+  /// a miss: the op is cancelled, so nothing observed it reach the wire, and the
+  /// core must not advance its §8.1 / §8.3 phase on an unobserved send.
+  fn from_attempt(attempt: &SendAttempt) -> Self {
+    match attempt {
+      SendAttempt::Unbound => Self::Unbound,
+      SendAttempt::Answered(res, _, _) => Self::from_bound_result(res),
+      SendAttempt::TimedOut => Self::Failed,
     }
   }
 
@@ -1600,6 +1619,146 @@ impl Fanout {
   }
 }
 
+/// How long ONE address family's `send_to` may stay unaccepted before the
+/// fan-out gives up on it for this round and reports that family `Missed`.
+///
+/// Without a bound a family whose transport is wedged parks the whole driver
+/// task — every timer, every dropped-handle sweep, every other family's transmit
+/// — for as long as it stays that way. Running the families concurrently removes
+/// the serialisation but bounds neither attempt.
+///
+/// The value is what the schedule can absorb. A family in good standing is due
+/// again `R = max(0.8 · TTL, 1 s)` after its own last delivery, and the only
+/// delay a wedged family can still add is the one fan-out in flight at that
+/// moment, so staying inside the record TTL needs `R + bound ≤ TTL`. The tightest
+/// case is the smallest registrable TTL
+/// ([`mdns_proto::constants::MIN_SERVICE_TTL_SECS`], 2 s), where the slack is
+/// 1 s; 250 ms keeps a four-fold margin against it. It is also RFC 6762 §8.1's
+/// inter-probe interval — the shortest cadence the protocol itself schedules —
+/// and far above any healthy datagram send, so it can neither pace the lifecycle
+/// nor manufacture the spurious misses that would spend the core's patience.
+/// Mirrors `hick-reactor::driver::SEND_ATTEMPT_TIMEOUT`.
+const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// The one socket capability the transmit and withdrawal fan-outs use.
+///
+/// Naming it keeps the fan-out's dependency on the socket to a single method, so
+/// the per-family bound can be exercised against a family that never accepts —
+/// a state no bound UDP socket can be coaxed into on a real host.
+trait SendDatagram {
+  fn send_to(
+    &self,
+    buf: &[u8],
+    dst: SocketAddr,
+  ) -> impl core::future::Future<Output = std::io::Result<usize>>;
+}
+
+impl SendDatagram for Socket {
+  fn send_to(
+    &self,
+    buf: &[u8],
+    dst: SocketAddr,
+  ) -> impl core::future::Future<Output = std::io::Result<usize>> {
+    Socket::send_to(self, buf, dst, None)
+  }
+}
+
+/// One address family's answer to ONE bounded send attempt.
+enum SendAttempt {
+  /// No socket bound for this family, so it was never offered the datagram.
+  Unbound,
+  /// The socket answered within [`SEND_ATTEMPT_TIMEOUT`]: the `send_to` result,
+  /// plus the wall time and the monotonic instant captured immediately before
+  /// the op was submitted.
+  Answered(std::io::Result<usize>, SystemTime, StdInstant),
+  /// The socket had still not accepted the datagram when the bound expired.
+  TimedOut,
+}
+
+impl SendAttempt {
+  /// The instant this family accepted the datagram, if it did.
+  ///
+  /// Read before submission, so it is at or before the true acceptance — the
+  /// only direction an anchor may be wrong in, since it may understate how fresh
+  /// a family's peers are but never overstate it.
+  fn accepted_at(&self) -> Option<StdInstant> {
+    match self {
+      Self::Answered(Ok(_), _, at) => Some(*at),
+      _ => None,
+    }
+  }
+}
+
+/// Offer one family its copy of the datagram, bounded by
+/// [`SEND_ATTEMPT_TIMEOUT`]. An absent socket is [`SendAttempt::Unbound`] — that
+/// family was never obligated — and is answered without touching the clock.
+///
+/// Both clocks are read IMMEDIATELY BEFORE the `.await`. compio is
+/// completion-based — the buffer moves into the op on `.await`, so we cannot
+/// stamp "at the syscall" the way readiness I/O does inside `poll_send_to`.
+/// Stamping before the await guarantees `when <= kernel_send_time <=
+/// echo_rx_time`, keeping our own loopback inside the 1 ms Ordered match window
+/// even when task-resume latency is high; stamping after it could push the
+/// recorded time past the kernel's rx stamp and misclassify our own
+/// announce/probe as a peer packet.
+async fn attempt_send_to<S: SendDatagram>(
+  sock: Option<&S>,
+  buf: &[u8],
+  dst: SocketAddr,
+) -> SendAttempt {
+  let Some(sock) = sock else {
+    return SendAttempt::Unbound;
+  };
+  let when = SystemTime::now();
+  let at = StdInstant::now();
+  match compio::time::timeout(SEND_ATTEMPT_TIMEOUT, sock.send_to(buf, dst)).await {
+    Ok(res) => SendAttempt::Answered(res, when, at),
+    Err(_) => SendAttempt::TimedOut,
+  }
+}
+
+/// Record the trace line, the self-send credit, and the stats for one MULTICAST
+/// family's completed attempt.
+///
+/// The credit is recorded only for an attempt that reported bytes on the wire. A
+/// failed send produces no loopback, and a stale entry would suppress a later
+/// byte-identical peer packet. A TIMED-OUT completion-based send is ambiguous —
+/// the kernel may still deliver it after the op is cancelled — and is treated as
+/// a failure in both directions: no credit, and `Missed` to the core. Both are
+/// the conservative reading; the cost of being wrong is one duplicate
+/// unsolicited response, which RFC 6762 §8.3 sends by design anyway.
+fn note_multicast_attempt(
+  inner: &Rc<EndpointInner>,
+  attempt: &SendAttempt,
+  body: &[u8],
+  _dst: SocketAddr,
+  _kind: &'static str,
+) {
+  match attempt {
+    SendAttempt::Unbound => {}
+    SendAttempt::Answered(Ok(_), when, _) => {
+      trace!(kind = _kind, dst = %_dst, len = body.len(), "send_to");
+      let mut state = inner.state.borrow_mut();
+      crate::selfsend::record_self_send(&mut state.recent_sends, body, *when);
+      #[cfg(feature = "stats")]
+      {
+        state.stats.packets_tx(1);
+        state.stats.bytes_tx(body.len() as u64);
+      }
+    }
+    SendAttempt::Answered(Err(_e), _, _) => {
+      debug!(kind = _kind, error = %_e, dst = %_dst, "send_to failed");
+      #[cfg(feature = "stats")]
+      inner.state.borrow().stats.send_errors(1);
+    }
+    SendAttempt::TimedOut => {
+      debug!(kind = _kind, dst = %_dst, "send_to did not complete within the per-family bound");
+      #[cfg(feature = "stats")]
+      inner.state.borrow().stats.send_errors(1);
+    }
+  }
+}
+
 /// Send one logical transmit and report each family's result.
 ///
 /// `mdns-proto` always hands back the IPv4 multicast group for BOTH the v4 and v6
@@ -1614,88 +1773,69 @@ impl Fanout {
 /// loopback, and a dual-stack fan-out yields two loopback copies (one per joined
 /// socket). The unicast branch deliberately records none — see below.
 ///
-/// Timestamp: `when` is captured IMMEDIATELY BEFORE each `.await`. compio is
-/// completion-based — the buffer moves into the op on `.await`, so we cannot
-/// stamp "at the syscall" the way readiness I/O does inside `poll_send_to`.
-/// Stamping before the await guarantees `when <= kernel_send_time <=
-/// echo_rx_time`, keeping our own loopback inside the 1 ms Ordered match window
-/// even when task-resume latency is high; stamping after it could push the
-/// recorded time past the kernel's rx stamp and misclassify our own
-/// announce/probe as a peer packet.
-async fn send_via(
+/// The second return value is the EARLIEST instant at which some family accepted
+/// the datagram, and it is what the caller must confirm with. The core anchors
+/// each delivered family's refresh schedule at the confirm instant, so a single
+/// post-fan-out `Instant::now()` would record a family that was served at `t0` as
+/// having been served when the SLOWEST family finished: its next refresh would
+/// then land a whole fan-out later than its records' TTL allows.
+async fn send_via<S: SendDatagram>(
   inner: &Rc<EndpointInner>,
-  sock_v4: &Option<Rc<Socket>>,
-  sock_v6: &Option<Rc<Socket>>,
+  sock_v4: &Option<Rc<S>>,
+  sock_v6: &Option<Rc<S>>,
   dst: SocketAddr,
   body: &[u8],
-) -> Fanout {
+) -> (Fanout, Option<StdInstant>) {
   let n = body.len();
   let mut fanout = Fanout::UNBOUND;
   if is_mdns_multicast_dst(dst) {
-    if let Some(s4) = sock_v4.as_ref() {
-      let when = SystemTime::now();
-      let res = s4.send_to(body, MDNS_V4_DST, None).await;
-      fanout.v4 = FamilySend::from_bound_result(&res);
-      if res.is_ok() {
-        trace!(dst = %MDNS_V4_DST, len = n, "send_to v4");
-        let mut state = inner.state.borrow_mut();
-        crate::selfsend::record_self_send(&mut state.recent_sends, body, when);
-        #[cfg(feature = "stats")]
-        {
-          state.stats.packets_tx(1);
-          state.stats.bytes_tx(n as u64);
-        }
-      } else {
-        debug!(dst = %MDNS_V4_DST, "send_to v4 failed");
-        #[cfg(feature = "stats")]
-        inner.state.borrow().stats.send_errors(1);
-      }
-    }
-    if let Some(s6) = sock_v6.as_ref() {
-      let when = SystemTime::now();
-      let res = s6.send_to(body, MDNS_V6_DST, None).await;
-      fanout.v6 = FamilySend::from_bound_result(&res);
-      if res.is_ok() {
-        trace!(dst = %MDNS_V6_DST, len = n, "send_to v6");
-        let mut state = inner.state.borrow_mut();
-        crate::selfsend::record_self_send(&mut state.recent_sends, body, when);
-        #[cfg(feature = "stats")]
-        {
-          state.stats.packets_tx(1);
-          state.stats.bytes_tx(n as u64);
-        }
-      } else {
-        debug!(dst = %MDNS_V6_DST, "send_to v6 failed");
-        #[cfg(feature = "stats")]
-        inner.state.borrow().stats.send_errors(1);
-      }
-    }
-    return fanout;
+    // Offer both families CONCURRENTLY. Serialising them made each family's
+    // acceptance instant depend on how long the other one took, and made a
+    // family that never accepts hold the whole fan-out — and with it the driver
+    // loop — for as long as it stayed wedged.
+    let (a4, a6) = futures::future::join(
+      attempt_send_to(sock_v4.as_deref(), body, MDNS_V4_DST),
+      attempt_send_to(sock_v6.as_deref(), body, MDNS_V6_DST),
+    )
+    .await;
+    fanout.v4 = FamilySend::from_attempt(&a4);
+    fanout.v6 = FamilySend::from_attempt(&a6);
+    let accepted_at = [a4.accepted_at(), a6.accepted_at()]
+      .into_iter()
+      .flatten()
+      .min();
+    // The tracker is written after the join, in family order, so the two entries
+    // a dual-stack fan-out needs are recorded exactly as the serial version
+    // recorded them — and under no borrow held across an await.
+    note_multicast_attempt(inner, &a4, body, MDNS_V4_DST, "transmit");
+    note_multicast_attempt(inner, &a6, body, MDNS_V6_DST, "transmit");
+    return (fanout, accepted_at);
   }
 
   // Unicast: pick the socket matching the destination family. Exactly one family
   // is obligated (an absent socket obligates none), so this branch can only be
   // all- or none-delivered.
   let sock = match dst {
-    SocketAddr::V4(_) => sock_v4.as_ref(),
-    SocketAddr::V6(_) => sock_v6.as_ref(),
+    SocketAddr::V4(_) => sock_v4.as_deref(),
+    SocketAddr::V6(_) => sock_v6.as_deref(),
   };
-  if let Some(s) = sock {
-    // NO self-send tracker entry here, unlike the multicast branch. A unicast
-    // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
-    // for the querier's own address and port and never loops back through the
-    // multicast group we joined, so a credit recorded for it can never be
-    // consumed. It would simply occupy the linear-scanned tracker for
-    // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
-    // the NEW entry — so a legacy-query flood would starve the genuine multicast
-    // credits that suppression actually depends on.
-    let res = s.send_to(body, dst, None).await;
-    let outcome = FamilySend::from_bound_result(&res);
-    match dst {
-      SocketAddr::V4(_) => fanout.v4 = outcome,
-      SocketAddr::V6(_) => fanout.v6 = outcome,
-    }
-    if res.is_ok() {
+  // NO self-send tracker entry here, unlike the multicast branch. A unicast
+  // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
+  // for the querier's own address and port and never loops back through the
+  // multicast group we joined, so a credit recorded for it can never be
+  // consumed. It would simply occupy the linear-scanned tracker for
+  // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
+  // the NEW entry — so a legacy-query flood would starve the genuine multicast
+  // credits that suppression actually depends on.
+  let attempt = attempt_send_to(sock, body, dst).await;
+  let outcome = FamilySend::from_attempt(&attempt);
+  match dst {
+    SocketAddr::V4(_) => fanout.v4 = outcome,
+    SocketAddr::V6(_) => fanout.v6 = outcome,
+  }
+  match &attempt {
+    SendAttempt::Unbound => {}
+    SendAttempt::Answered(Ok(_), _, _) => {
       trace!(dst = %dst, len = n, "send_to");
       #[cfg(feature = "stats")]
       {
@@ -1703,13 +1843,19 @@ async fn send_via(
         state.stats.packets_tx(1);
         state.stats.bytes_tx(n as u64);
       }
-    } else {
-      debug!(dst = %dst, "send_to failed");
+    }
+    SendAttempt::Answered(Err(_e), _, _) => {
+      debug!(error = %_e, dst = %dst, "send_to failed");
+      #[cfg(feature = "stats")]
+      inner.state.borrow().stats.send_errors(1);
+    }
+    SendAttempt::TimedOut => {
+      debug!(dst = %dst, "send_to did not complete within the per-family bound");
       #[cfg(feature = "stats")]
       inner.state.borrow().stats.send_errors(1);
     }
   }
-  fanout
+  (fanout, attempt.accepted_at())
 }
 
 /// Map a PRESENT (bound) family's `send_to` result to its per-family withdrawal
@@ -1778,65 +1924,29 @@ async fn drain_withdrawals(
     let Some((_dst, len, token)) = due else {
       break;
     };
-    // Fan out to every bound family on the mDNS multicast group.
-    // Capture `when` BEFORE each `.await` (completion-I/O equivalent of
-    // stamping at the syscall) so `when <= kernel_send_time <= echo_rx_time`
-    // and the kernel-looped goodbye stays inside the 1 ms Ordered self-send
-    // match window.
+    // Fan out to every bound family on the mDNS multicast group, concurrently
+    // and with each attempt bounded, for the same reason the positive-TTL
+    // fan-out is: this pump runs in the driver loop, so a family that never
+    // accepts would park every timer and every handle sweep behind it.
+    //
     // Per-family outcome is load-bearing (not stats-only): the endpoint tracks
     // per-family debt, so a withdrawal frees only once EVERY reachable family
     // has withdrawn its records. A family with no bound socket is `WriteOff` (no
-    // peers reachable on it to withdraw from) so its debt never pins the other.
-    let mut v4_out = WithdrawalSend::WriteOff;
-    let mut v6_out = WithdrawalSend::WriteOff;
-    if let Some(s4) = sock_v4.as_ref() {
-      let when = SystemTime::now();
-      let res = s4.send_to(&scratch[..len], MDNS_V4_DST, None).await;
-      // Present socket: Ok → Sent, ANY Err → Retry (never WriteOff). See
-      // `present_socket_send_outcome`.
-      v4_out = present_socket_send_outcome(&res);
-      match res {
-        Ok(_) => {
-          trace!(dst = %MDNS_V4_DST, len, "withdrawal send_to v4");
-          let mut state = inner.state.borrow_mut();
-          crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
-          #[cfg(feature = "stats")]
-          {
-            state.stats.packets_tx(1);
-            state.stats.bytes_tx(len as u64);
-          }
-        }
-        Err(_e) => {
-          debug!(error = %_e, dst = %MDNS_V4_DST, "withdrawal send_to v4 failed");
-          #[cfg(feature = "stats")]
-          inner.state.borrow().stats.send_errors(1);
-        }
-      }
-    }
-    if let Some(s6) = sock_v6.as_ref() {
-      let when = SystemTime::now();
-      let res = s6.send_to(&scratch[..len], MDNS_V6_DST, None).await;
-      // Present socket: Ok → Sent, ANY Err → Retry (never WriteOff). See
-      // `present_socket_send_outcome`.
-      v6_out = present_socket_send_outcome(&res);
-      match res {
-        Ok(_) => {
-          trace!(dst = %MDNS_V6_DST, len, "withdrawal send_to v6");
-          let mut state = inner.state.borrow_mut();
-          crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
-          #[cfg(feature = "stats")]
-          {
-            state.stats.packets_tx(1);
-            state.stats.bytes_tx(len as u64);
-          }
-        }
-        Err(_e) => {
-          debug!(error = %_e, dst = %MDNS_V6_DST, "withdrawal send_to v6 failed");
-          #[cfg(feature = "stats")]
-          inner.state.borrow().stats.send_errors(1);
-        }
-      }
-    }
+    // peers reachable on it to withdraw from) so its debt never pins the other;
+    // an expired bound keeps the debt, exactly as a transient error does.
+    let (a4, a6) = futures::future::join(
+      attempt_send_to(sock_v4.as_deref(), &scratch[..len], MDNS_V4_DST),
+      attempt_send_to(sock_v6.as_deref(), &scratch[..len], MDNS_V6_DST),
+    )
+    .await;
+    let outcome = |attempt: &SendAttempt| match attempt {
+      SendAttempt::Unbound => WithdrawalSend::WriteOff,
+      SendAttempt::Answered(res, _, _) => present_socket_send_outcome(res),
+      SendAttempt::TimedOut => WithdrawalSend::Retry,
+    };
+    let (v4_out, v6_out) = (outcome(&a4), outcome(&a6));
+    note_multicast_attempt(inner, &a4, &scratch[..len], MDNS_V4_DST, "withdrawal");
+    note_multicast_attempt(inner, &a6, &scratch[..len], MDNS_V6_DST, "withdrawal");
     // Count the goodbye as a delivered round when at least one family Sent;
     // `send_to` already bumped packets_tx/bytes_tx/send_errors per family above.
     #[cfg(feature = "stats")]

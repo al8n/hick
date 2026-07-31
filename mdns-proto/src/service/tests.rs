@@ -6468,6 +6468,144 @@ fn an_all_miss_round_advances_no_per_family_counter() {
   );
 }
 
+/// An all-miss round leaves counters alone because nothing was delivered — but a
+/// family reported `Unobligated` in that round is not describing the round, it is
+/// describing itself: its socket went away.
+///
+/// The charge it leaves behind belongs to a family that no longer exists. Carried
+/// across the gap it excuses the family the instant it returns — written off
+/// after a SINGLE offer, having spent the bound while unreachable — which is
+/// precisely the RFC 6762 §8.1 guarantee (the name is probed on the link before
+/// it is claimed) that the bound exists to protect.
+#[test]
+fn an_obligation_gap_in_an_all_miss_round_refunds_the_returning_family() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_probing_zero(&mut svc);
+
+  // Charge v6 to the bound with honest partials.
+  for _ in 0..MAX_PARTIAL_ROUNDS {
+    let at = emit_probe(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    now = at;
+  }
+  assert_eq!(svc.partial_rounds[V6].missed, MAX_PARTIAL_ROUNDS);
+  assert!(matches!(svc.state(), ServiceState::Probing(0)));
+
+  // v6's socket goes away in a round that reached NO wire.
+  let at = emit_probe(&mut svc, now);
+  svc.note_transmit_outcome(
+    at,
+    TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Unobligated),
+  );
+  now = at;
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(0)),
+    "nothing reached a wire, so no phase may move; got {:?}",
+    svc.state()
+  );
+  assert_eq!(
+    svc.partial_rounds[V6],
+    FamilyPatience::default(),
+    "the departed family owes nothing and is behind on nothing — and its \
+     coverage bit stays CLEAR, because coverage records an actual delivery and \
+     this round had none"
+  );
+
+  // v6 comes back. It is newly obligated, so it is owed the whole offer
+  // sequence, and the excusal lands only on the round after the bound is spent.
+  for round in 0..MAX_PARTIAL_ROUNDS {
+    let at = emit_probe(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    assert!(
+      matches!(svc.state(), ServiceState::Probing(0)),
+      "round {round}: the returned family has been asked at most {} times, so \
+       §8.1 forbids advancing past it; got {:?}",
+      round + 1,
+      svc.state()
+    );
+    now = at;
+  }
+  let at = emit_probe(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(1)),
+    "the bound is spent on genuine re-arms, so the excusal lands on the round \
+     after them; got {:?}",
+    svc.state()
+  );
+}
+
+/// The refund is for the family that TRANSITIONED, and nobody else: a family that
+/// genuinely missed the same silent round keeps every bit of its charge, or an
+/// alternating partial/silent pattern would evade the bound forever.
+#[test]
+fn an_obligation_gap_refunds_only_the_family_that_left() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_probing_zero(&mut svc);
+
+  // Charge v4 this time, so the family still obligated in the silent round is
+  // the one carrying a charge.
+  for _ in 0..MAX_PARTIAL_ROUNDS {
+    let at = emit_probe(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitDelivery::V6_ONLY);
+    now = at;
+  }
+  assert_eq!(svc.partial_rounds[V4].missed, MAX_PARTIAL_ROUNDS);
+
+  let at = emit_probe(&mut svc, now);
+  svc.note_transmit_outcome(
+    at,
+    TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Unobligated),
+  );
+  assert_eq!(
+    svc.partial_rounds[V4].missed, MAX_PARTIAL_ROUNDS,
+    "v4 is still obligated and still owed the datagram — silence neither spends \
+     nor refunds its bound"
+  );
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(0)),
+    "…and the phase still cannot move out of silence; got {:?}",
+    svc.state()
+  );
+}
+
+/// The same transition, seen through the latch that survives an advance: a family
+/// the core has STOPPED WAITING FOR loses the right to drive the per-family
+/// refresh schedule, and that latch must not outlive the family it describes.
+///
+/// A returned family has not been given up on; leaving it latched keeps it out of
+/// the refresh schedule indefinitely, so its own records would be left to expire
+/// in its peers' caches while the healthy family alone paced the announcements.
+#[test]
+fn an_obligation_gap_clears_the_stalled_latch() {
+  let mut svc = make_service(120);
+  drive_to_established(&mut svc);
+  let mut now = svc.poll_timeout().expect("periodic re-announce");
+
+  // Spend v6's patience: the round after the bound excuses it and latches it out
+  // of good standing.
+  for _ in 0..=MAX_PARTIAL_ROUNDS {
+    let at = emit_announcement(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    now = svc.lifecycle_deadline.expect("re-armed");
+  }
+  assert!(
+    !svc.partial_rounds[V6].in_good_standing(),
+    "v6 must be latched out of good standing before the gap"
+  );
+
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(
+    at,
+    TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Unobligated),
+  );
+  assert!(
+    svc.partial_rounds[V6].in_good_standing(),
+    "the latch describes a family the core gave up on; that family is gone, and \
+     the one that comes back is owed its refreshes like any newly obligated link"
+  );
+}
+
 /// The capacity-one transport at the CORE's own seam: the families take turns, so
 /// no single round reaches both and NEITHER family is failing.
 ///

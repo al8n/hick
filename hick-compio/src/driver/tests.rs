@@ -2927,7 +2927,7 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   let sock_v4 = Some(Rc::new(sender));
   let sock_v6: Option<Rc<Socket>> = None;
 
-  let fanout = send_via(
+  let (fanout, accepted_at) = send_via(
     &inner,
     &sock_v4,
     &sock_v6,
@@ -2936,6 +2936,11 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   )
   .await;
 
+  assert!(
+    accepted_at.is_some(),
+    "the one obligated family accepted the datagram, so the confirm has a real \
+     acceptance instant to anchor at"
+  );
   assert_eq!(
     fanout.delivery(),
     mdns_proto::TransmitDelivery::new(
@@ -2948,6 +2953,200 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   assert!(
     inner.state.borrow().recent_sends.is_empty(),
     "a unicast reply never loops back, so it must record NO self-send credit"
+  );
+}
+
+// ── The wedged family (per-family send bound) ───────────────────────────────
+
+/// How a [`TestSocket`] answers a send.
+#[derive(Clone, Copy)]
+enum SendBehaviour {
+  /// Accepts immediately without touching the kernel, so the fan-out's timing is
+  /// the test's rather than the host's routing table.
+  Accepts,
+  /// Never completes — the family whose transport is wedged. This is the case no
+  /// bound UDP socket can be coaxed into on a real host, and the only one that
+  /// distinguishes a bounded attempt from an unbounded one.
+  Wedged,
+}
+
+/// A socket whose write side is scripted.
+struct TestSocket(SendBehaviour);
+
+impl SendDatagram for TestSocket {
+  fn send_to(
+    &self,
+    buf: &[u8],
+    _dst: SocketAddr,
+  ) -> impl core::future::Future<Output = std::io::Result<usize>> {
+    let behaviour = self.0;
+    let n = buf.len();
+    async move {
+      match behaviour {
+        SendBehaviour::Accepts => Ok(n),
+        SendBehaviour::Wedged => core::future::pending::<std::io::Result<usize>>().await,
+      }
+    }
+  }
+}
+
+/// Fan one multicast datagram out to a healthy v4 and a wedged v6, returning the
+/// instant the fan-out STARTED (a lower bound on v4's true acceptance, taken
+/// independently of what the fan-out reports), the fan-out, the acceptance
+/// instant the confirm must use, and how long the whole fan-out took.
+async fn wedged_v6_round(
+  inner: &Rc<EndpointInner>,
+  body: &[u8],
+) -> (StdInstant, Fanout, Option<StdInstant>, Duration) {
+  let sock_v4 = Some(Rc::new(TestSocket(SendBehaviour::Accepts)));
+  let sock_v6 = Some(Rc::new(TestSocket(SendBehaviour::Wedged)));
+
+  let started = StdInstant::now();
+  let (fanout, accepted_at) = compio::time::timeout(
+    SEND_ATTEMPT_TIMEOUT * 20,
+    send_via(inner, &sock_v4, &sock_v6, MDNS_V4_DST, body),
+  )
+  .await
+  .expect(
+    "a family that never completes must not park the fan-out: the driver loop \
+     cannot service a timer, a dropped handle, or any other family's transmit \
+     while it is suspended here",
+  );
+  (started, fanout, accepted_at, started.elapsed())
+}
+
+/// A wedged family must be given up on within the per-family bound, and must not
+/// move the healthy family's acceptance instant.
+///
+/// Both halves are the same defect seen from two sides. Serially awaiting an
+/// unbounded send suspends the whole driver task, so nothing else the loop owns
+/// runs; and confirming at post-fan-out time records the family that accepted at
+/// `t0` as having been served when the wedged one finally gave up, which is a lie
+/// about how fresh that family's peers are.
+#[compio::test]
+async fn a_wedged_family_is_bounded_and_leaves_the_healthy_anchor_alone() {
+  let inner = Rc::new(EndpointInner::new(
+    mdns_proto::EndpointConfig::default(),
+    1500,
+    9000,
+  ));
+  let (started, fanout, accepted_at, elapsed) = wedged_v6_round(&inner, b"announcement").await;
+
+  assert_eq!(
+    fanout.delivery(),
+    mdns_proto::TransmitDelivery::new(
+      mdns_proto::FamilyDelivery::Delivered,
+      mdns_proto::FamilyDelivery::Missed,
+    ),
+    "the wedged family put nothing on its wire that anything observed, so the \
+     core must be told it missed — never that it was unobligated or that it \
+     carried the datagram"
+  );
+  assert!(
+    elapsed < SEND_ATTEMPT_TIMEOUT * 4,
+    "the fan-out must return once the bound expires; it took {elapsed:?}"
+  );
+
+  let anchor = accepted_at.expect("the healthy family accepted the datagram");
+  assert!(
+    anchor.saturating_duration_since(started) < SEND_ATTEMPT_TIMEOUT,
+    "the anchor must be the healthy family's OWN acceptance instant, not a time \
+     read after the wedged family's bound expired"
+  );
+  assert_eq!(
+    inner.state.borrow().recent_sends.len(),
+    1,
+    "one credit for the one family that actually sent; a wedged family's op is \
+     cancelled, so a credit for it could only ever suppress a genuine peer packet"
+  );
+}
+
+/// The consequence the anchor exists for: a wedged family must not push the
+/// healthy family's next refresh beyond the TTL its records were published with.
+///
+/// Run at [`mdns_proto::constants::MIN_SERVICE_TTL_SECS`], where the slack
+/// between the periodic refresh interval (`max(0.8 · TTL, 1 s)` = 1 s) and the
+/// TTL itself is at its smallest, so the bound has the least room it will ever
+/// have.
+#[compio::test]
+async fn a_wedged_family_cannot_push_the_healthy_refresh_past_its_ttl() {
+  const TTL_SECS: u32 = mdns_proto::constants::MIN_SERVICE_TTL_SECS;
+  /// `max(0.8 · TTL, RFC 6762 §8.3's one second)` at that TTL.
+  const REFRESH: Duration = Duration::from_secs(1);
+
+  let inner = Rc::new(EndpointInner::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  ));
+  // One periodic refresh in which v6 has wedged, taken first so the service's
+  // schedule can be laid out around the acceptance instant it reports.
+  let (started, fanout, accepted_at, _) = wedged_v6_round(&inner, b"refresh").await;
+  let anchor = accepted_at.expect("v4 accepted the refresh");
+  let base = anchor
+    .checked_sub(Duration::from_secs(3))
+    .expect("the monotonic clock is at least a few seconds old");
+
+  let mut s = State::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  let mut records = mdns_proto::ServiceRecords::new(
+    mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    mdns_proto::Name::try_from_str("wedged._ipp._tcp.local.").unwrap(),
+    mdns_proto::Name::try_from_str("wedged.local.").unwrap(),
+    631,
+    TTL_SECS,
+  );
+  records.add_a([192, 168, 1, 10].into());
+  let h = s
+    .test_register_service(mdns_proto::ServiceSpec::new(records), base)
+    .unwrap();
+  let mut buf = std::vec![0u8; 4096];
+
+  // Two whole announcements reach Established, so the periodic refresh is the
+  // schedule under test and it is already due at `anchor`.
+  confirm_service_round(&mut s, h, base, &mut buf, WHOLE_FANOUT);
+  confirm_service_round(
+    &mut s,
+    h,
+    base + Duration::from_secs(1),
+    &mut buf,
+    WHOLE_FANOUT,
+  );
+  assert_eq!(
+    s.services[&h].proto.state(),
+    mdns_proto::service::ServiceState::Established
+  );
+
+  // Confirm the wedged round with exactly what the fan-out reported, the way the
+  // run loop's transmit pump does.
+  s.fire_timeouts(anchor);
+  assert!(
+    s.poll_one_transmit(anchor, &mut buf).is_some(),
+    "the periodic re-announce must be due"
+  );
+  s.note_service_transmit_outcome(h, anchor, fanout.delivery());
+
+  let due = s.services[&h].proto.poll_timeout().expect("re-armed");
+  assert!(
+    due.saturating_duration_since(anchor) <= REFRESH,
+    "the core arms the next announcement one refresh interval after the confirm"
+  );
+  // Measured from a clock read the fan-out never touched, so a confirm instant
+  // that had absorbed the wedged family's bound cannot hide inside it.
+  let gap = due.saturating_duration_since(started);
+  assert!(
+    gap < REFRESH + SEND_ATTEMPT_TIMEOUT / 2,
+    "v4's gap is measured from ITS OWN acceptance, so a family that never \
+     accepted may add nothing to it; v4's next announcement was due {gap:?} after \
+     the fan-out began, against a refresh interval of {REFRESH:?}"
+  );
+  assert!(
+    gap < Duration::from_secs(u64::from(TTL_SECS)),
+    "…which is what keeps v4's peers from expiring these records: they hold them \
+     for {TTL_SECS} s from that same instant"
   );
 }
 
