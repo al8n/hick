@@ -3023,6 +3023,167 @@ fn the_wire_gate_holds_each_kind_to_its_own_minimum() {
   );
 }
 
+/// What a §5.2 question carries: "the interval between the first two queries
+/// MUST be at least one second", and the backoff only widens from there.
+/// Restated here for the same reason the other two are — the core's copy is
+/// crate-private.
+const QUERY_MIN_FAMILY_GAP: Duration = Duration::from_secs(1);
+
+/// A socket whose sends SUCCEED but only after sitting pending, recording the
+/// instant each one actually reached the wire.
+///
+/// The pending time is what no real host lets a test choose, and it is exactly
+/// the variable the wire gate must not be allowed to spend: a gate anchored
+/// before submission gives back every millisecond a send spent in flight.
+struct DelayedSender {
+  /// Per-call pending durations, consumed in order; exhausted calls complete
+  /// immediately.
+  pending: RefCell<std::collections::VecDeque<Duration>>,
+  /// When each successful send actually put bytes on the wire — read INSIDE the
+  /// socket, so it owes nothing to how the driver stamps anything.
+  wire_times: RefCell<Vec<StdInstant>>,
+}
+
+impl DelayedSender {
+  fn new(pending: &[Duration]) -> Self {
+    Self {
+      pending: RefCell::new(pending.iter().copied().collect()),
+      wire_times: RefCell::new(Vec::new()),
+    }
+  }
+}
+
+impl SendDatagram for DelayedSender {
+  async fn send_to(&self, buf: &[u8], _dst: SocketAddr) -> std::io::Result<usize> {
+    let pending = self
+      .pending
+      .borrow_mut()
+      .pop_front()
+      .unwrap_or(Duration::ZERO);
+    if !pending.is_zero() {
+      compio::time::sleep(pending).await;
+    }
+    self.wire_times.borrow_mut().push(StdInstant::now());
+    Ok(buf.len())
+  }
+}
+
+/// How often a gated round is retried, standing in for the run loop's own
+/// re-entry. Only granularity: a coarser value can delay a send but never let
+/// one out early.
+const GATED_RETRY_POLL: Duration = Duration::from_millis(5);
+
+/// Put `pending.len()` gated multicast datagrams from ONE producer onto ONE
+/// family through the real [`send_via`], retrying a gated round the way the run
+/// loop does, and return the instants the SOCKET recorded for them.
+///
+/// Only v4 is bound, so every wire time belongs to one family and the gaps
+/// between them are that family's own wire spacing.
+async fn same_family_wire_times(min_gap: Duration, pending: &[Duration]) -> Vec<StdInstant> {
+  let inner = Rc::new(EndpointInner::new(
+    mdns_proto::EndpointConfig::default(),
+    1500,
+    9000,
+  ));
+  let sender = Rc::new(DelayedSender::new(pending));
+  let sock_v4 = Some(sender.clone());
+  let sock_v6: Option<Rc<DelayedSender>> = None;
+  let mut gate = FamilyWireGate::default();
+
+  for i in 0..pending.len() {
+    // A distinct body per round, so nothing about self-send bookkeeping can
+    // make one round's datagram stand in for another's.
+    let body = [b'g', b'a', b'p', i as u8];
+    loop {
+      let (fanout, _) = send_via(
+        &inner,
+        &sock_v4,
+        &sock_v6,
+        MDNS_V4_DST,
+        &body,
+        &mut gate,
+        min_gap,
+        StdInstant::now(),
+      )
+      .await;
+      match fanout.v4 {
+        FamilySend::Sent => break,
+        FamilySend::Gated => compio::time::sleep(GATED_RETRY_POLL).await,
+        other => panic!("a delayed-but-successful send must be Sent or Gated, got {other:?}"),
+      }
+    }
+  }
+  sender.wire_times.take()
+}
+
+/// A send that stays PENDING must not buy back the wire gap it owes.
+///
+/// The gate exists to space one family's bytes on one wire, so its anchor has to
+/// be when the operation COMPLETED. Anchored before submission instead, a send
+/// pending `P` re-opens its own family `P` early: at §8.1's 250 ms inter-probe
+/// interval a 200 ms-pending probe leaves 50 ms of real spacing, and it does so
+/// on exactly the slow-socket path the spacing protects. Measured from inside
+/// the socket, so the assertion is the wire's own history and not the driver's
+/// account of it.
+async fn delayed_sends_keep_their_wire_gap(kind: &str, min_gap: Duration, pending: &[Duration]) {
+  let wire_times = same_family_wire_times(min_gap, pending).await;
+  assert_eq!(
+    wire_times.len(),
+    pending.len(),
+    "{kind}: every round must have reached the wire exactly once"
+  );
+  for (i, pair) in wire_times.windows(2).enumerate() {
+    let gap = pair[1].saturating_duration_since(pair[0]);
+    assert!(
+      gap >= min_gap,
+      "{kind}: consecutive datagrams were {gap:?} apart on one family's wire, \
+       inside the {min_gap:?} that kind owes it — the send pending {:?} before it \
+       succeeded was credited to the gap",
+      pending[i]
+    );
+  }
+}
+
+/// §8.1 probes: 250 ms apart on the wire, however long a probe sat pending. Two
+/// pending rounds in a row, so the anchor is exercised on a later send and not
+/// just the first.
+#[compio::test]
+async fn a_pending_probe_does_not_shorten_the_next_probes_wire_gap() {
+  delayed_sends_keep_their_wire_gap(
+    "probe",
+    PROBE_MIN_FAMILY_GAP,
+    &[
+      Duration::from_millis(200),
+      Duration::from_millis(200),
+      Duration::ZERO,
+    ],
+  )
+  .await;
+}
+
+/// §6 / §8.3 unsolicited announcements: one second apart on the wire.
+#[compio::test]
+async fn a_pending_announcement_does_not_shorten_the_next_ones_wire_gap() {
+  delayed_sends_keep_their_wire_gap(
+    "announcement",
+    ANNOUNCE_MIN_FAMILY_GAP,
+    &[Duration::from_millis(500), Duration::ZERO],
+  )
+  .await;
+}
+
+/// §5.2 questions: at least one second between the first two transmissions of
+/// the same question on one interface.
+#[compio::test]
+async fn a_pending_query_does_not_shorten_the_next_ones_wire_gap() {
+  delayed_sends_keep_their_wire_gap(
+    "query",
+    QUERY_MIN_FAMILY_GAP,
+    &[Duration::from_millis(500), Duration::ZERO],
+  )
+  .await;
+}
+
 // ── The obligation tag (`TransmitObligation`) at the driver seam ────────────
 
 /// A §6.7 legacy unicast reply reaches exactly ONE family, so its fan-out is

@@ -1294,11 +1294,37 @@ impl EndpointInner {
 /// backpressured local buffers — this task stalls entirely, including its
 /// shutdown goodbye flush, and is reclaimed only at runtime teardown. A stall
 /// that long is traced (see [`FANOUT_STALL_TRACE`]) so it is diagnosable rather
-/// than silent. Transient send stalls merely delay the loop by their own
-/// duration; RFC 6762's schedules tolerate that and the core recomputes on
-/// resume. At runtime teardown a still-pending operation is dropped with the
-/// task; a datagram that later reaches the wire is bounded by record TTLs,
+/// than silent. At runtime teardown a still-pending operation is dropped with
+/// the task; a datagram that later reaches the wire is bounded by record TTLs,
 /// exactly as a host crash is.
+///
+/// # The minimum TTL THIS driver can serve
+///
+/// A transient stall is not free, and RFC 6762's schedules do not tolerate it
+/// unconditionally. This driver's worst-case loop stall equals its slowest
+/// in-flight send, and that stall is added to the periodic re-announce interval,
+/// so a record stays fresh in peer caches only while
+///
+/// ```text
+/// TTL - max(floor(0.8 * TTL), 1 s)   >   the worst plausible send stall
+/// ```
+///
+/// The left side is the slack between a record's TTL and the ~80 % refresh the
+/// core schedules for it, floored at §8.3's one-second interval. Integer
+/// truncation makes that slack 1 s flat for every TTL from 2 s to 5 s, and at
+/// least a fifth of the TTL above that.
+///
+/// That makes a PER-DRIVER minimum, above the protocol's: at
+/// [`mdns_proto::constants::MIN_SERVICE_TTL_SECS`] the slack is exactly 1 s,
+/// which any multi-second stall overruns — and a multi-second stall is precisely
+/// the state this driver cannot bound. Services driven by `hick-compio` must
+/// therefore be registered at a TTL whose slack covers the deployment's worst
+/// plausible send, not at the 2 s floor.
+///
+/// The floor itself is correct where it lives — it is shared protocol math from
+/// §8.3's one-second interval — and no driver that bounds its attempts inherits
+/// this limitation. What is limited is awaiting an unbounded completion, not the
+/// constant.
 ///
 /// Awaiting the fan-out is also what makes the lifecycle ordering structural:
 /// every name-ownership transition — the dropped-handle sweep, a rename
@@ -1309,7 +1335,9 @@ impl EndpointInner {
 /// `hick-reactor` bounds each attempt instead, and that is correct THERE and not
 /// an inconsistency to harmonise away: it drives `poll_send_to` directly, so
 /// abandoning the future between polls abandons one whose last syscall returned
-/// `WouldBlock` — nothing was submitted, so its cancellation is definitive.
+/// `WouldBlock` — nothing was submitted, so its cancellation is definitive. That
+/// bound is also what lets it serve the 2 s TTL floor this driver cannot: no
+/// attempt can stall its loop for longer than the bound.
 ///
 /// [`Proactor::cancel`'s own contract]: https://docs.rs/compio-driver/0.12.1/compio_driver/struct.Proactor.html#method.cancel
 #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip_all))]
@@ -1686,7 +1714,7 @@ impl FamilySend {
     match attempt {
       SendAttempt::Unbound => Self::Unbound,
       SendAttempt::Gated => Self::Gated,
-      SendAttempt::Answered(res, _, _) => Self::from_bound_result(res),
+      SendAttempt::Answered { result, .. } => Self::from_bound_result(result),
     }
   }
 
@@ -1857,9 +1885,18 @@ impl FamilyWireGate {
 
   /// Record that family `idx` put a GATED datagram on its wire at `at`.
   ///
-  /// `at` is that family's OWN acceptance instant, not the fan-out's confirm
-  /// anchor — recording the anchor would re-introduce exactly the skew this gate
-  /// exists to absorb.
+  /// `at` must be that family's OWN COMPLETION instant. Two ways to get it
+  /// wrong, and this gate tolerates neither:
+  ///
+  /// * the fan-out's confirm anchor (the EARLIEST family's) would re-introduce
+  ///   exactly the inter-family skew this gate exists to absorb;
+  /// * a PRE-submit instant would spend the gap on time the datagram was still
+  ///   pending. The next `open` would then pass while the true spacing was only
+  ///   `min_gap` minus that pending time — §8.1 / §8.3 measure the wire, and the
+  ///   wire only saw bytes when the operation completed.
+  ///
+  /// The core's own confirm anchor is a pre-submit instant and correctly so; the
+  /// two anchors are wrong in opposite directions and are not interchangeable.
   fn record(&mut self, idx: usize, at: StdInstant, min_gap: Duration) {
     if min_gap.is_zero() {
       return;
@@ -1883,21 +1920,77 @@ enum SendAttempt {
   /// A bound socket the per-family wire gate held back for this round; no
   /// operation was submitted. See [`FamilyWireGate`].
   Gated,
-  /// The socket completed the send: the `send_to` result, plus the wall time and
-  /// the monotonic instant captured immediately before the operation was
-  /// submitted.
-  Answered(std::io::Result<usize>, SystemTime, StdInstant),
+  /// The socket completed the send, carrying the `send_to` result and THREE
+  /// separate clock reads.
+  ///
+  /// Three, not one, and not two: each stamp is allowed to be wrong in exactly
+  /// one direction, and the three directions do not agree. Folding any pair
+  /// together silently breaks whichever consumer needed the other direction —
+  /// see the field docs before "simplifying" them.
+  Answered {
+    /// What `send_to` reported.
+    result: std::io::Result<usize>,
+    /// Wall clock, read BEFORE submission. Keys self-send suppression.
+    ///
+    /// Suppression matches our own loopback echo against this stamp, so
+    /// `submitted_wall <= kernel_send_time <= echo_rx_time` must hold or the echo
+    /// falls outside the 1 ms `Ordered` match window and this host processes its
+    /// own probe / announcement as peer traffic. Reading it after the completion
+    /// can push it past the kernel's rx stamp; reading it before cannot.
+    submitted_wall: SystemTime,
+    /// Monotonic, read BEFORE submission. Anchors the CORE's refresh schedule.
+    ///
+    /// EARLY is the safe direction here: an anchor at or before the true
+    /// acceptance can only understate how fresh a family's peers are, so the
+    /// next refresh lands sooner than strictly needed. A late anchor would push
+    /// a refresh past the records' own TTL.
+    submitted_at: StdInstant,
+    /// Monotonic, read AFTER the completion. Anchors [`FamilyWireGate`].
+    ///
+    /// EARLY is the UNSAFE direction here — the opposite of `submitted_at`, and
+    /// the whole reason this is a third stamp rather than that one reused. The
+    /// gate measures the real spacing between bytes on ONE family's wire; a
+    /// pre-submit anchor credits that spacing with the time the datagram spent
+    /// merely pending, so a send pending `P` before it succeeds re-opens its own
+    /// family `P` early. At RFC 6762 §8.1's 250 ms inter-probe interval a
+    /// 200 ms-pending send would leave 50 ms of true spacing, and it would do so
+    /// on precisely the slow-socket path the spacing exists to protect.
+    completed_at: StdInstant,
+  },
 }
 
 impl SendAttempt {
-  /// The instant this family accepted the datagram, if it did.
+  /// The instant to confirm a delivered family at, if it delivered.
   ///
-  /// Read before submission, so it is at or before the true acceptance — the
-  /// only direction an anchor may be wrong in, since it may understate how fresh
-  /// a family's peers are but never overstate it.
-  fn accepted_at(&self) -> Option<StdInstant> {
+  /// The CORE's anchor, read before submission (`Answered::submitted_at`), so it
+  /// is at or before the true acceptance.
+  fn confirm_anchor(&self) -> Option<StdInstant> {
     match self {
-      Self::Answered(Ok(_), _, at) => Some(*at),
+      Self::Answered {
+        result: Ok(_),
+        submitted_at,
+        ..
+      } => Some(*submitted_at),
+      _ => None,
+    }
+  }
+
+  /// The instant this family's bytes were actually on its wire, if they were.
+  ///
+  /// The WIRE GATE's anchor, read after the completion
+  /// (`Answered::completed_at`).
+  ///
+  /// Never fold this into [`Self::confirm_anchor`]. The two answer different
+  /// questions — "when may the core assume peers heard us" versus "when did this
+  /// wire last carry bytes" — and they are wrong in opposite directions, so each
+  /// consumer can absorb only its own.
+  fn wire_time(&self) -> Option<StdInstant> {
+    match self {
+      Self::Answered {
+        result: Ok(_),
+        completed_at,
+        ..
+      } => Some(*completed_at),
       _ => None,
     }
   }
@@ -1914,14 +2007,13 @@ impl SendAttempt {
 /// report a fact this driver does not have. What such a wait costs in liveness is
 /// traced by [`awaiting_fanout`].
 ///
-/// Both clocks are read IMMEDIATELY BEFORE the `.await`. compio is
-/// completion-based — the buffer moves into the op on `.await`, so we cannot
-/// stamp "at the syscall" the way readiness I/O does inside `poll_send_to`.
-/// Stamping before the await guarantees `when <= kernel_send_time <=
-/// echo_rx_time`, keeping our own loopback inside the 1 ms Ordered match window
-/// even when task-resume latency is high; stamping after it could push the
-/// recorded time past the kernel's rx stamp and misclassify our own
-/// announce/probe as a peer packet.
+/// A completed attempt is stamped THREE times, twice before the `.await` and
+/// once after it — see [`SendAttempt::Answered`] for why the three cannot be
+/// collapsed. compio is completion-based: the buffer moves into the op on
+/// `.await`, so nothing here can stamp "at the syscall" the way readiness I/O
+/// does inside `poll_send_to`, and the two pre-submit reads are the closest
+/// under-estimates available while the post-completion read is the closest
+/// over-estimate.
 async fn attempt_send_to<S: SendDatagram>(
   sock: Option<&S>,
   may_send: bool,
@@ -1934,9 +2026,23 @@ async fn attempt_send_to<S: SendDatagram>(
   if !may_send {
     return SendAttempt::Gated;
   }
-  let when = SystemTime::now();
-  let at = StdInstant::now();
-  SendAttempt::Answered(sock.send_to(body, dst).await, when, at)
+  // Both PRE-submit reads stay pre-submit: the wall clock because a late one
+  // could outrun the kernel's rx stamp and cost us loopback suppression, the
+  // monotonic one because a late one could schedule a refresh past its records'
+  // TTL.
+  let submitted_wall = SystemTime::now();
+  let submitted_at = StdInstant::now();
+  let result = sock.send_to(body, dst).await;
+  // POST-completion, and only this one. The operation is complete, so this is
+  // the first instant at which the datagram is known to have reached the wire —
+  // the only honest input to a gate that spaces one wire's bytes.
+  let completed_at = StdInstant::now();
+  SendAttempt::Answered {
+    result,
+    submitted_wall,
+    submitted_at,
+    completed_at,
+  }
 }
 
 /// Record the trace line, the self-send credit, and the stats for one MULTICAST
@@ -1956,17 +2062,26 @@ fn note_multicast_attempt(
     // Neither put bytes on a wire, and neither is an error: no socket, or this
     // driver's own deliberate spacing.
     SendAttempt::Unbound | SendAttempt::Gated => {}
-    SendAttempt::Answered(Ok(_), when, _) => {
+    SendAttempt::Answered {
+      result: Ok(_),
+      submitted_wall,
+      ..
+    } => {
       trace!(kind = _kind, dst = %_dst, len = body.len(), "send_to");
       let mut state = inner.state.borrow_mut();
-      crate::selfsend::record_self_send(&mut state.recent_sends, body, *when);
+      // The PRE-submit wall clock, and it must stay that: suppression compares
+      // this against the loopback echo's rx stamp, and a stamp taken after the
+      // completion could land after the echo arrived.
+      crate::selfsend::record_self_send(&mut state.recent_sends, body, *submitted_wall);
       #[cfg(feature = "stats")]
       {
         state.stats.packets_tx(1);
         state.stats.bytes_tx(body.len() as u64);
       }
     }
-    SendAttempt::Answered(Err(_e), _, _) => {
+    SendAttempt::Answered {
+      result: Err(_e), ..
+    } => {
       debug!(kind = _kind, error = %_e, dst = %_dst, "send_to failed");
       #[cfg(feature = "stats")]
       inner.state.borrow().stats.send_errors(1);
@@ -1999,8 +2114,9 @@ fn note_multicast_attempt(
 /// minimum the core computed for this datagram's kind
 /// ([`Transmit::min_family_gap`]). A family whose gap is unpaid is not offered the
 /// datagram at all and is reported [`FamilySend::Gated`] — obligated, and it did
-/// not carry it. Every family that DID carry it records its own acceptance
-/// instant back into `gate`.
+/// not carry it. Every family that DID carry it records its own COMPLETION
+/// instant back into `gate`, which is NOT the instant this function returns as
+/// the confirm anchor (see [`SendAttempt::Answered`]).
 ///
 /// Every family that was offered the datagram is awaited to its true completion,
 /// so the returned [`Fanout`] carries observed facts only.
@@ -2038,17 +2154,23 @@ async fn send_via<S: SendDatagram>(
     .await;
     fanout.v4 = FamilySend::from_attempt(&a4);
     fanout.v6 = FamilySend::from_attempt(&a6);
-    // Each family's OWN acceptance instant re-opens ITS OWN gate one `min_gap`
-    // later. Using the fan-out anchor (the earliest across families) instead
-    // would put the late family's next send back inside the interval — the exact
-    // skew this gate exists to absorb.
-    if let Some(at) = a4.accepted_at() {
+    // Each family's OWN COMPLETION instant re-opens ITS OWN gate one `min_gap`
+    // later, and it is deliberately not the instant the confirm below anchors
+    // at. Two distinctions, both load-bearing:
+    //
+    // * per FAMILY, not the fan-out anchor (the earliest across families) —
+    //   the anchor would put the late family's next send back inside the
+    //   interval, the exact skew this gate exists to absorb;
+    // * per COMPLETION, not per submission — a pre-submit stamp would credit
+    //   the gap with however long the send sat pending, which is how a slow
+    //   socket talks its own way into an early next datagram.
+    if let Some(at) = a4.wire_time() {
       gate.record(FAMILY_V4, at, min_gap);
     }
-    if let Some(at) = a6.accepted_at() {
+    if let Some(at) = a6.wire_time() {
       gate.record(FAMILY_V6, at, min_gap);
     }
-    let accepted_at = [a4.accepted_at(), a6.accepted_at()]
+    let accepted_at = [a4.confirm_anchor(), a6.confirm_anchor()]
       .into_iter()
       .flatten()
       .min();
@@ -2081,16 +2203,19 @@ async fn send_via<S: SendDatagram>(
     SocketAddr::V4(_) => fanout.v4 = outcome,
     SocketAddr::V6(_) => fanout.v6 = outcome,
   }
-  if let Some(at) = attempt.accepted_at() {
+  // The COMPLETION instant, exactly as on the multicast branch — a unicast send
+  // is no less capable of sitting pending, and a gated kind reaching this branch
+  // must not have its wire gap shortened by that.
+  if let Some(at) = attempt.wire_time() {
     gate.record(idx, at, min_gap);
   }
-  let accepted_at = attempt.accepted_at();
+  let accepted_at = attempt.confirm_anchor();
   match &attempt {
     // In tree every unicast datagram is a §6.7 legacy reply, which is one-shot
     // and therefore ungated — `Gated` is unreachable here today and is listed
     // with `Unbound` because neither wrote to a wire nor failed.
     SendAttempt::Unbound | SendAttempt::Gated => {}
-    SendAttempt::Answered(Ok(_), _, _) => {
+    SendAttempt::Answered { result: Ok(_), .. } => {
       trace!(dst = %dst, len = n, "send_to");
       #[cfg(feature = "stats")]
       {
@@ -2099,7 +2224,9 @@ async fn send_via<S: SendDatagram>(
         state.stats.bytes_tx(n as u64);
       }
     }
-    SendAttempt::Answered(Err(_e), _, _) => {
+    SendAttempt::Answered {
+      result: Err(_e), ..
+    } => {
       debug!(error = %_e, dst = %dst, "send_to failed");
       #[cfg(feature = "stats")]
       inner.state.borrow().stats.send_errors(1);
@@ -2274,7 +2401,7 @@ async fn drain_withdrawals(
     .await;
     let outcome = |attempt: &SendAttempt| match attempt {
       SendAttempt::Unbound => WithdrawalSend::WriteOff,
-      SendAttempt::Answered(res, _, _) => present_socket_send_outcome(res),
+      SendAttempt::Answered { result, .. } => present_socket_send_outcome(result),
       // `Gated` is unreachable: this fan-out passes `may_send == true` for both
       // families.
       SendAttempt::Gated => WithdrawalSend::Retry,
