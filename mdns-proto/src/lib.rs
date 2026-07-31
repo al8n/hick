@@ -101,7 +101,7 @@ pub use event::{
   EndpointEvent, HostConflict, KnownAnswer, ProbeConflict, QueryEvent, QueryUpdate, RouteEvent,
   ServiceEvent, ServiceQuestion, ToQuery, ToService,
 };
-pub use transmit::{Transmit, TransmitObligation, TransmitOutcome};
+pub use transmit::{FamilyDelivery, Transmit, TransmitDelivery, TransmitObligation};
 
 cfg_heap! {
   pub use event::{ServiceRenamed, ServiceUpdate};

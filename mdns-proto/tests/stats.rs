@@ -11,7 +11,7 @@ use std::{net::Ipv4Addr, time::Instant as StdInstant};
 use std::time::Duration;
 
 use mdns_proto::{
-  CollectedAnswer, Name, Query, TransmitOutcome,
+  CollectedAnswer, FamilyDelivery, Name, Query, TransmitDelivery,
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec, ServiceSpec},
   endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
@@ -242,7 +242,7 @@ fn tick(
 }
 
 /// All-socket-failure: drive the service through probe, announce,
-/// and response, feeding `TransmitOutcome::NoneDelivered` to every
+/// and response, confirming that no family carried them to every
 /// `note_transmit_outcome`. After N ticks, NONE of the `*_tx` counters should
 /// have advanced.
 #[test]
@@ -256,7 +256,10 @@ fn tx_counters_stay_zero_on_all_socket_failure() {
     let (ok, next) = tick(&mut svc, now);
     now = next;
     if ok {
-      svc.note_transmit_outcome(now, TransmitOutcome::NoneDelivered); // all-socket-failure
+      svc.note_transmit_outcome(
+        now,
+        TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Missed),
+      ); // all-socket-failure
     }
   }
 
@@ -314,7 +317,10 @@ fn tx_counters_advance_on_confirmed_delivery() {
     svc.handle_timeout(now).unwrap();
     let mut buf = vec![0u8; 4096];
     if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
-      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+      svc.note_transmit_outcome(
+        now,
+        TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered),
+      );
     }
     if svc.state() == mdns_proto::ServiceState::Established {
       break;
@@ -378,7 +384,10 @@ fn excused_rounds_do_not_count_as_delivered_transmits() {
     svc.handle_timeout(now).unwrap();
     let mut buf = vec![0u8; 4096];
     if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
-      svc.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+      svc.note_transmit_outcome(
+        now,
+        TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Missed),
+      );
     }
     if svc.state() == mdns_proto::ServiceState::Established {
       break;

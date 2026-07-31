@@ -1,6 +1,6 @@
 use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use super::{Transmit, TransmitObligation, TransmitOutcome};
+use super::{FamilyDelivery, Transmit, TransmitDelivery, TransmitObligation};
 
 #[test]
 fn accessors_return_constructed_fields() {
@@ -19,36 +19,61 @@ fn accessors_return_constructed_fields() {
 }
 
 #[test]
-fn outcome_projects_the_two_independent_facts() {
-  // The whole point of the enum: `any_delivered` (goodbye ownership, RFC 6762
-  // §10.1) and `all_delivered` (lifecycle phase, §8.1/§8.3, and the §5.2 query
-  // budget) are DIFFERENT questions, and they differ exactly on the partial row.
-  // A one-bit confirm cannot express that row, which is why both shipped boolean
-  // policies were wrong in one direction or the other.
-  assert!(TransmitOutcome::AllDelivered.any_delivered());
-  assert!(TransmitOutcome::AllDelivered.all_delivered());
+fn delivery_projects_the_two_independent_facts() {
+  // `any_delivered` (goodbye ownership, RFC 6762 §10.1) and `all_delivered`
+  // (lifecycle phase, §8.1/§8.3, and the §5.2 query budget) are DIFFERENT
+  // questions, and they differ exactly on the partial row. A one-bit confirm
+  // cannot express that row, which is why both shipped boolean policies were
+  // wrong in one direction or the other.
+  assert!(TransmitDelivery::ALL.any_delivered());
+  assert!(TransmitDelivery::ALL.all_delivered());
 
-  assert!(TransmitOutcome::PartiallyDelivered.any_delivered());
-  assert!(!TransmitOutcome::PartiallyDelivered.all_delivered());
+  assert!(TransmitDelivery::V4_ONLY.any_delivered());
+  assert!(!TransmitDelivery::V4_ONLY.all_delivered());
+  assert!(TransmitDelivery::V6_ONLY.any_delivered());
+  assert!(!TransmitDelivery::V6_ONLY.all_delivered());
 
-  assert!(!TransmitOutcome::NoneDelivered.any_delivered());
-  assert!(!TransmitOutcome::NoneDelivered.all_delivered());
+  assert!(!TransmitDelivery::NONE.any_delivered());
+  assert!(!TransmitDelivery::NONE.all_delivered());
 }
 
 #[test]
-fn outcome_variants_are_the_total_partition_of_any_and_all() {
-  // Exhaustive by construction: `all && !any` is not representable, so the three
-  // variants are every reachable (any, all) combination. A fourth variant would
-  // have to duplicate one of these.
-  for outcome in [
-    TransmitOutcome::AllDelivered,
-    TransmitOutcome::PartiallyDelivered,
-    TransmitOutcome::NoneDelivered,
-  ] {
-    assert!(
-      !outcome.all_delivered() || outcome.any_delivered(),
-      "all_delivered must imply any_delivered for {outcome}"
-    );
+fn an_unobligated_family_is_neither_a_miss_nor_a_delivery() {
+  // The whole reason `Unobligated` cannot collapse into `Missed`. A v4-only host
+  // is FULLY delivered on v4 alone — it owes nothing on a family it has no socket
+  // for — so its lifecycle advances exactly as a dual-stack host's does.
+  let v4_only_host = TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Unobligated);
+  assert!(v4_only_host.any_delivered());
+  assert!(
+    v4_only_host.all_delivered(),
+    "an absent family was never obligated, so its absence is not a missed delivery"
+  );
+
+  // …and an EMPTY obligated set is never a vacuous "all": nothing was delivered,
+  // so nothing may latch or advance.
+  let no_sockets = TransmitDelivery::new(FamilyDelivery::Unobligated, FamilyDelivery::Unobligated);
+  assert!(!no_sockets.any_delivered());
+  assert!(!no_sockets.all_delivered());
+}
+
+#[test]
+fn all_delivered_implies_any_delivered_across_every_shape() {
+  // Exhaustive over the 3×2 shapes: `all && !any` must not be representable.
+  let families = [
+    FamilyDelivery::Unobligated,
+    FamilyDelivery::Delivered,
+    FamilyDelivery::Missed,
+  ];
+  for v4 in families {
+    for v6 in families {
+      let d = TransmitDelivery::new(v4, v6);
+      assert!(
+        !d.all_delivered() || d.any_delivered(),
+        "all_delivered must imply any_delivered for ({v4}, {v6})"
+      );
+      assert_eq!(d.v4(), v4, "the accessor must return what was constructed");
+      assert_eq!(d.v6(), v6, "the accessor must return what was constructed");
+    }
   }
 }
 
@@ -86,19 +111,16 @@ impl core::fmt::Write for StackWriter {
 }
 
 #[test]
-fn outcome_slugs_are_stable_and_distinct() {
-  assert_eq!(TransmitOutcome::AllDelivered.as_str(), "all_delivered");
-  assert_eq!(
-    TransmitOutcome::PartiallyDelivered.as_str(),
-    "partially_delivered"
-  );
-  assert_eq!(TransmitOutcome::NoneDelivered.as_str(), "none_delivered");
+fn family_slugs_are_stable_and_distinct() {
+  assert_eq!(FamilyDelivery::Unobligated.as_str(), "unobligated");
+  assert_eq!(FamilyDelivery::Delivered.as_str(), "delivered");
+  assert_eq!(FamilyDelivery::Missed.as_str(), "missed");
   // Display is defined as the slug (parity with `WithdrawalSend`).
-  for outcome in [
-    TransmitOutcome::AllDelivered,
-    TransmitOutcome::PartiallyDelivered,
-    TransmitOutcome::NoneDelivered,
+  for family in [
+    FamilyDelivery::Unobligated,
+    FamilyDelivery::Delivered,
+    FamilyDelivery::Missed,
   ] {
-    assert_eq!(StackWriter::render(outcome).as_str(), outcome.as_str());
+    assert_eq!(StackWriter::render(family).as_str(), family.as_str());
   }
 }

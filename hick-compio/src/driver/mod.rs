@@ -14,9 +14,9 @@ use core::{
 use hick_trace::*;
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
-  QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate, TransmitOutcome,
-  WithdrawalSend, WithdrawalToken, query::Query as ProtoQuery, service::Service as ProtoSvc,
-  transmit::Transmit,
+  FamilyDelivery, QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate,
+  TransmitDelivery, WithdrawalSend, WithdrawalToken, query::Query as ProtoQuery,
+  service::Service as ProtoSvc, transmit::Transmit,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -887,10 +887,10 @@ impl State {
     &mut self,
     h: ServiceHandle,
     now: StdInstant,
-    outcome: TransmitOutcome,
+    delivery: TransmitDelivery,
   ) {
     if let Some(ctx) = self.services.get_mut(&h) {
-      ctx.proto.note_transmit_outcome(now, outcome);
+      ctx.proto.note_transmit_outcome(now, delivery);
       // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
       // route so sibling host-address retention (during a same-host withdrawal)
       // honours what this service ACTUALLY announced, not its configured
@@ -898,7 +898,7 @@ impl State {
       // delivery — so a round that reached no wire has nothing to mirror.
       // Idempotent overwrite. `self.services` (via `ctx`) and `self.endpoint` are
       // disjoint fields, so this borrow split is sound.
-      if outcome.any_delivered() {
+      if delivery.any_delivered() {
         // The reclaim-cancel gate is the ALL-delivered announcement fact the CORE
         // computes, ferried verbatim. It is emphatically NOT
         // `advertises_instance()` — that latch fires on any delivery by any
@@ -928,9 +928,9 @@ impl State {
     &mut self,
     h: QueryHandle,
     now: StdInstant,
-    outcome: TransmitOutcome,
+    delivery: TransmitDelivery,
   ) {
-    self.endpoint.note_query_transmit_outcome(h, now, outcome);
+    self.endpoint.note_query_transmit_outcome(h, now, delivery);
   }
 
   /// Whether any service is flagged cancelled but not yet swept by
@@ -1278,15 +1278,15 @@ pub(crate) async fn run(
       // retry budget only once every obligated family carried it. Anchored to
       // post-send time so the next deadline is relative to the actual on-wire
       // send.
-      let outcome = fanout.transmit_outcome();
+      let delivery = fanout.delivery();
       match origin {
         TransmitOrigin::Service(h) => {
           let mut state = inner.state.borrow_mut();
-          state.note_service_transmit_outcome(h, StdInstant::now(), outcome);
+          state.note_service_transmit_outcome(h, StdInstant::now(), delivery);
         }
         TransmitOrigin::Query(h) => {
           let mut state = inner.state.borrow_mut();
-          state.note_query_transmit_outcome(h, StdInstant::now(), outcome);
+          state.note_query_transmit_outcome(h, StdInstant::now(), delivery);
         }
       }
     }
@@ -1549,6 +1549,16 @@ impl FamilySend {
       Err(_) => Self::Failed,
     }
   }
+
+  /// This family's I/O answer as the core's protocol vocabulary. The mapping is
+  /// one-to-one — no family is ever laundered into a different one.
+  const fn delivery(self) -> FamilyDelivery {
+    match self {
+      Self::Unbound => FamilyDelivery::Unobligated,
+      Self::Sent => FamilyDelivery::Delivered,
+      Self::Failed => FamilyDelivery::Missed,
+    }
+  }
 }
 
 /// The per-family shape of one logical transmit's fan-out: the I/O answer, which
@@ -1567,41 +1577,26 @@ impl Fanout {
     v6: FamilySend::Unbound,
   };
 
-  /// Project the fan-out onto the core's [`TransmitOutcome`] — the honest,
-  /// unexcused shape of what the sockets did.
+  /// Hand the fan-out to the core VERBATIM, one [`FamilyDelivery`] per family —
+  /// the honest, unexcused I/O facts.
   ///
   /// The obligated set is every family with a socket that this datagram was
   /// offered to; `Unbound` means there is none, so that family was never
-  /// obligated. Delivery is `Sent` and nothing else — a `Failed` family did not
-  /// carry the datagram, so the core must not advance its §8.1 / §8.3 phase as if
-  /// it had.
+  /// obligated and its absence must not read as a failure. Delivery is `Sent` and
+  /// nothing else — a `Failed` family did not carry the datagram, so the core must
+  /// not advance its §8.1 / §8.3 phase as if it had.
   ///
-  /// An empty obligated set yields [`TransmitOutcome::NoneDelivered`], never a
-  /// vacuous "all": nothing was delivered, so nothing may latch or advance.
+  /// Nothing is projected onto an aggregate here. WHICH family missed is what lets
+  /// the core schedule the next announcement per link rather than per round, and a
+  /// driver that folded it away would put the core back to refreshing alternating
+  /// families at twice the periodic interval.
   ///
   /// A family that keeps missing is never written off here, and this driver has
   /// no other place that could: the confirm is the honest I/O facts and nothing
   /// more. Bounding how long the lifecycle waits for it is the core's own
-  /// patience, applied inside [`TransmitOutcome`]'s confirm.
-  pub(crate) fn transmit_outcome(self) -> TransmitOutcome {
-    let mut obligated = 0usize;
-    let mut delivered = 0usize;
-    for family in [self.v4, self.v6] {
-      if matches!(family, FamilySend::Unbound) {
-        continue;
-      }
-      obligated += 1;
-      if matches!(family, FamilySend::Sent) {
-        delivered += 1;
-      }
-    }
-    if delivered == 0 {
-      TransmitOutcome::NoneDelivered
-    } else if delivered == obligated {
-      TransmitOutcome::AllDelivered
-    } else {
-      TransmitOutcome::PartiallyDelivered
-    }
+  /// patience, applied inside [`TransmitDelivery`]'s confirm.
+  pub(crate) fn delivery(self) -> TransmitDelivery {
+    TransmitDelivery::new(self.v4.delivery(), self.v6.delivery())
   }
 }
 

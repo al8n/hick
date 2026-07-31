@@ -27,7 +27,7 @@ pub enum SendError {
   /// a reason that may clear: a momentarily-full transmit queue, a socket not yet
   /// bound, or no route yet. The engine keeps the family in the obligated set —
   /// so a fan-out where the other family succeeded projects to
-  /// [`TransmitOutcome::PartiallyDelivered`](mdns_proto::TransmitOutcome::PartiallyDelivered),
+  /// a partial [`TransmitDelivery`](mdns_proto::TransmitDelivery),
   /// not `AllDelivered` — and retries on the next pump.
   Busy,
   /// No socket for this datagram's address family — it will never be queued on

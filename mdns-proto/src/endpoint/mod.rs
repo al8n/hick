@@ -40,7 +40,7 @@ use crate::{
   query::{CollectedAnswer, Query},
   service::{FullyAnnounced, Service},
   trace::*,
-  transmit::{Transmit, TransmitOutcome},
+  transmit::{Transmit, TransmitDelivery},
   wire::{MessageReader, NameRef, ResourceClass, ResourceType},
 };
 

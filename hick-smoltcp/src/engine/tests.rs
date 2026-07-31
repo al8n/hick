@@ -1032,6 +1032,94 @@ fn a_constrained_transport_does_not_starve_either_family() {
   );
 }
 
+/// The defect per-family delivery exists to remove, measured on the wire.
+///
+/// `family_order` deliberately hands the one free slot of a constrained transport
+/// to the longest-blocked family, so under capacity one the families ALTERNATE:
+/// every round carries a real datagram, every round is globally partial, and each
+/// family is refreshed only every OTHER round. An aggregate confirm cannot see
+/// that, so the core re-armed per ROUND and each family's own gap came out at
+/// twice the periodic interval — beyond the TTL that interval is 80 % of. Records
+/// expired cyclically on BOTH families while every per-round invariant still held.
+///
+/// This walks the announcement stream per family and asserts each family's OWN
+/// gap stays inside its periodic refresh interval. Both TTLs matter: 10 s is
+/// short enough that the ladder's cap binds and the whole schedule is the cap,
+/// while 120 s (the conventional A/SRV TTL) is where the uncapped ladder reached
+/// 64 s and the per-family gap reached 128 s — over the TTL.
+#[test]
+fn a_constrained_transport_refreshes_every_family_within_its_ttl() {
+  for ttl_secs in [10u32, 120] {
+    // The core's own periodic cadence: 80 % of the TTL, floored at RFC 6762
+    // §8.3's one second. A family may not go longer than this without an
+    // announcement, plus the one §8.3-floored round it takes to serve the other
+    // family (the `max(R, 2 × ANNOUNCE_INTERVAL)` bound).
+    let refresh_us = i64::from(ttl_secs).saturating_mul(800_000).max(1_000_000);
+    let bound_us = refresh_us.max(2_000_000);
+
+    let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(77));
+    let spec = {
+      let mut records = ServiceRecords::new(
+        Name::try_from_str("_ipp._tcp.local.").unwrap(),
+        Name::try_from_str("Constrained._ipp._tcp.local.").unwrap(),
+        Name::try_from_str("constrained.local.").unwrap(),
+        631,
+        ttl_secs,
+      );
+      records.add_a(Ipv4Addr::new(192, 168, 1, 10));
+      ServiceSpec::new(records)
+    };
+    engine.register_service(spec, at(0)).unwrap();
+    let mut io = MockUdp::default();
+    let mut scratch = [0u8; 1500];
+
+    // When each family last had a positive-TTL announcement put on its wire.
+    let mut last: [Option<i64>; 2] = [None, None];
+    let mut worst: [i64; 2] = [0, 0];
+    let mut announced: [usize; 2] = [0, 0];
+
+    let mut t = 0i64;
+    // Long enough for several refresh intervals at either TTL, sampled finely
+    // enough that a 1 s deadline is never overshot.
+    while t < 20 * refresh_us {
+      t += 250_000;
+      io.capacity = Some(1);
+      io.sent.clear();
+      engine.pump(at(t), &mut io, &mut scratch);
+      for (dst, data) in &io.sent {
+        // Positive-TTL answers only: probes carry none and a §10.1 goodbye is a
+        // withdrawal, not a refresh.
+        if datagram_kind(data) != Some(false) {
+          continue;
+        }
+        let idx = usize::from(*dst == MDNS_SOCKET_V6);
+        if let Some(prev) = last[idx] {
+          worst[idx] = worst[idx].max(t - prev);
+        }
+        last[idx] = Some(t);
+        announced[idx] += 1;
+      }
+    }
+
+    assert!(
+      announced[0] > 1 && announced[1] > 1,
+      "TTL {ttl_secs}: the fair fan-out must reach BOTH families repeatedly, or \
+       the gap measurement below means nothing; v4={} v6={}",
+      announced[0],
+      announced[1]
+    );
+    for (idx, family) in ["v4", "v6"].iter().enumerate() {
+      assert!(
+        worst[idx] <= bound_us,
+        "TTL {ttl_secs}: {family} went {} us between announcements, past its own \
+         {bound_us} us refresh bound — its records expire from every peer cache \
+         on that link while the other family is being served",
+        worst[idx]
+      );
+    }
+  }
+}
+
 /// A one-datagram-per-cycle (capacity-1) transport must still complete the
 /// endpoint-owned withdrawal: each goodbye round fans out, and even though only
 /// one family queues per pump the withdrawal is driven to completion across
@@ -1605,9 +1693,11 @@ fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
   assert!(
     matches!(
       outcome,
-      MulticastOutcome::Confirm(TransmitOutcome::PartiallyDelivered)
+      MulticastOutcome::Confirm(d) if d.v4() == FamilyDelivery::Delivered
+        && d.v6() == FamilyDelivery::Missed
     ),
-    "v4 queued + v6 obligated-but-busy is a partial fan-out"
+    "v4 queued + v6 obligated-but-busy is a partial fan-out, and WHICH family \
+     missed reaches the core"
   );
   assert_eq!(
     fanout.sent_count(),
@@ -1630,9 +1720,12 @@ fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
   assert!(
     matches!(
       outcome_single,
-      MulticastOutcome::Confirm(TransmitOutcome::AllDelivered)
+      MulticastOutcome::Confirm(d) if d.all_delivered()
+        && d.v6() == FamilyDelivery::Unobligated
     ),
-    "a family with no socket is not obligated, so a v4-only node is all-delivered"
+    "a family with no socket is not obligated, so a v4-only node is all-delivered \
+     — and it must reach the core as UNOBLIGATED, not as a miss, or the core \
+     would chase a family this node does not have"
   );
 
   // Both families busy: nothing reached a wire, so nothing may latch or advance —
@@ -1646,10 +1739,7 @@ fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
   let (outcome_busy, fanout_busy) =
     tx.send_multicast(&mut all_busy, b"a-multicast-datagram", at(0));
   assert!(
-    matches!(
-      outcome_busy,
-      MulticastOutcome::Confirm(TransmitOutcome::NoneDelivered)
-    ),
+    matches!(outcome_busy, MulticastOutcome::Confirm(d) if !d.any_delivered()),
     "both families busy: nothing on the wire, so none-delivered rather than retire"
   );
   assert_eq!(
@@ -1668,10 +1758,8 @@ fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
   };
   let (outcome_none, _) = tx.send_multicast(&mut no_transport, b"a-multicast-datagram", at(0));
   assert!(
-    matches!(
-      outcome_none,
-      MulticastOutcome::Confirm(TransmitOutcome::NoneDelivered)
-    ),
+    matches!(outcome_none, MulticastOutcome::Confirm(d)
+      if !d.any_delivered() && !d.all_delivered()),
     "an empty obligated set is none-delivered, never a vacuous all-delivered"
   );
 }
@@ -2270,7 +2358,8 @@ fn stats_multicast_sent_plus_failed_send_errors_exact() {
   assert!(
     matches!(
       outcome,
-      MulticastOutcome::Confirm(TransmitOutcome::PartiallyDelivered)
+      MulticastOutcome::Confirm(d) if d.v4() == FamilyDelivery::Delivered
+        && d.v6() == FamilyDelivery::Missed
     ),
     "v4 Sent + v6 TooLarge: v6 has a socket and rejected the datagram, so it is \
      obligated-and-undelivered — a partial fan-out, not a whole one"
@@ -2313,10 +2402,7 @@ fn stats_multicast_failed_plus_busy_send_errors_exact() {
   // v4 Failed + v6 Busy: nothing reached a wire, and the busy family may yet
   // recover — so this confirms as none-delivered rather than retiring anything.
   assert!(
-    matches!(
-      outcome,
-      MulticastOutcome::Confirm(TransmitOutcome::NoneDelivered)
-    ),
+    matches!(outcome, MulticastOutcome::Confirm(d) if !d.any_delivered()),
     "v4 Failed + v6 Busy must confirm none-delivered (v6 Busy keeps things alive)"
   );
   assert_eq!(

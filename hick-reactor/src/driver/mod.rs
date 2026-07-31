@@ -13,8 +13,8 @@ use agnostic_net::{Net, UdpSocket};
 use async_channel::Sender;
 use futures::{FutureExt, pin_mut, select_biased};
 use mdns_proto::{
-  QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate, TransmitOutcome,
-  endpoint::WithdrawalSend, event::RouteEvent,
+  FamilyDelivery, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate,
+  TransmitDelivery, endpoint::WithdrawalSend, event::RouteEvent,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -857,7 +857,7 @@ impl<N: Net> DriverState<N> {
         // `StdInstant::now()` anchors any scheduled deadline to post-send time
         // (a long `send_via` await would put a pre-send deadline in the past).
         if let Some(ctx) = services.get_mut(&h) {
-          confirm_service_transmit(endpoint, ctx, StdInstant::now(), fanout.transmit_outcome());
+          confirm_service_transmit(endpoint, ctx, StdInstant::now(), fanout.delivery());
         }
         credits_remaining = credits_remaining.saturating_sub(fanout.sent_count());
       }
@@ -978,7 +978,7 @@ impl<N: Net> DriverState<N> {
         // anchor the retry backoff to POST-send time — `send_via`
         // can await longer than the backoff interval, so the pre-send `now`
         // would schedule a deadline already in the past.
-        endpoint.note_query_transmit_outcome(h, StdInstant::now(), fanout.transmit_outcome());
+        endpoint.note_query_transmit_outcome(h, StdInstant::now(), fanout.delivery());
         credits_remaining = credits_remaining.saturating_sub(fanout.sent_count());
       }
     }
@@ -1493,6 +1493,16 @@ impl FamilySend {
       Err(_) => Self::Failed,
     }
   }
+
+  /// This family's I/O answer as the core's protocol vocabulary. The mapping is
+  /// one-to-one — no family is ever laundered into a different one.
+  const fn delivery(self) -> FamilyDelivery {
+    match self {
+      Self::Unbound => FamilyDelivery::Unobligated,
+      Self::Sent => FamilyDelivery::Delivered,
+      Self::Failed => FamilyDelivery::Missed,
+    }
+  }
 }
 
 /// The per-family shape of one logical transmit's fan-out: the I/O answer, which
@@ -1521,41 +1531,26 @@ impl Fanout {
       + usize::from(matches!(self.v6, FamilySend::Sent))
   }
 
-  /// Project the fan-out onto the core's [`TransmitOutcome`] — the honest,
-  /// unexcused shape of what the sockets did.
+  /// Hand the fan-out to the core VERBATIM, one [`FamilyDelivery`] per family —
+  /// the honest, unexcused I/O facts.
   ///
   /// The obligated set is every family with a socket that this datagram was
   /// offered to; `Unbound` means there is none, so that family was never
-  /// obligated. Delivery is `Sent` and nothing else — a `Failed` family did not
-  /// carry the datagram, so the core must not advance its §8.1 / §8.3 phase as if
-  /// it had.
+  /// obligated and its absence must not read as a failure. Delivery is `Sent` and
+  /// nothing else — a `Failed` family did not carry the datagram, so the core must
+  /// not advance its §8.1 / §8.3 phase as if it had.
   ///
-  /// An empty obligated set yields [`TransmitOutcome::NoneDelivered`], never a
-  /// vacuous "all": nothing was delivered, so nothing may latch or advance.
+  /// Nothing is projected onto an aggregate here. WHICH family missed is what lets
+  /// the core schedule the next announcement per link rather than per round, and a
+  /// driver that folded it away would put the core back to refreshing alternating
+  /// families at twice the periodic interval.
   ///
   /// A family that keeps missing is never written off here, and this driver has
   /// no other place that could: the confirm is the honest I/O facts and nothing
   /// more. Bounding how long the lifecycle waits for it is the core's own
-  /// patience, applied inside [`TransmitOutcome`]'s confirm.
-  fn transmit_outcome(self) -> TransmitOutcome {
-    let mut obligated = 0usize;
-    let mut delivered = 0usize;
-    for family in [self.v4, self.v6] {
-      if matches!(family, FamilySend::Unbound) {
-        continue;
-      }
-      obligated += 1;
-      if matches!(family, FamilySend::Sent) {
-        delivered += 1;
-      }
-    }
-    if delivered == 0 {
-      TransmitOutcome::NoneDelivered
-    } else if delivered == obligated {
-      TransmitOutcome::AllDelivered
-    } else {
-      TransmitOutcome::PartiallyDelivered
-    }
+  /// patience, applied inside [`TransmitDelivery`]'s confirm.
+  fn delivery(self) -> TransmitDelivery {
+    TransmitDelivery::new(self.v4.delivery(), self.v6.delivery())
   }
 }
 
@@ -1583,10 +1578,10 @@ fn confirm_service_transmit(
   endpoint: &mut ProtoEndpoint,
   ctx: &mut ServiceCtx,
   now: StdInstant,
-  outcome: TransmitOutcome,
+  delivery: TransmitDelivery,
 ) {
-  ctx.proto.note_transmit_outcome(now, outcome);
-  if outcome.any_delivered() {
+  ctx.proto.note_transmit_outcome(now, delivery);
+  if delivery.any_delivered() {
     endpoint.note_service_announced(
       ctx.proto.has_fully_announced(),
       ctx.proto.advertised_a_addrs(),
@@ -1600,7 +1595,7 @@ fn confirm_service_transmit(
 /// `send_to`.
 ///
 /// Returns the per-family [`Fanout`], which the caller projects onto a
-/// [`TransmitOutcome`] for the confirm and reads `sent_count()` from for the
+/// [`TransmitDelivery`] for the confirm and reads `sent_count()` from for the
 /// fairness budget — the two are independent facts and must not be conflated:
 /// one datagram that reached one of two families costs one credit but has NOT
 /// discharged the transmit's obligation.

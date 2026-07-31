@@ -1674,7 +1674,7 @@ fn generic_recv_error_does_not_increment_any_stats() {
   );
 }
 
-// ── The dual-stack delivery boundary (`TransmitOutcome`) ────────────────────
+// ── The dual-stack delivery boundary (`TransmitDelivery`) ───────────────────
 
 /// A driver state with NO bound family. The delivery-shape tests drive
 /// `confirm_service_transmit` directly — the exact seam `drain_transmits` uses —
@@ -1727,7 +1727,7 @@ fn confirm_service_round(
   let _ = ctx.proto.handle_timeout(t);
   let mut rounds = 0;
   while ctx.proto.poll_transmit(t, buf).is_ok_and(|tx| tx.is_some()) {
-    confirm_service_transmit(endpoint, ctx, t, fanout.transmit_outcome());
+    confirm_service_transmit(endpoint, ctx, t, fanout.delivery());
     rounds += 1;
   }
   rounds
@@ -1735,8 +1735,8 @@ fn confirm_service_round(
 
 /// A dual-stack fan-out in which v4 carried the datagram and a BOUND v6 socket
 /// rejected it (`ENETUNREACH` and friends). Driving the behaviour tests from the
-/// per-family facts rather than a hand-fed [`TransmitOutcome`] keeps the
-/// projection inside the tested path.
+/// per-family facts rather than a hand-fed [`TransmitDelivery`] keeps the
+/// mapping inside the tested path.
 #[cfg(feature = "tokio")]
 const PARTIAL_FANOUT: Fanout = Fanout {
   v4: FamilySend::Sent,
@@ -1757,31 +1757,43 @@ const FAILED_FANOUT: Fanout = Fanout {
   v6: FamilySend::Failed,
 };
 
-/// The projection is a pure function of the per-family facts, and the obligated
-/// set is "every family that HAS a socket". The three rows that matter: an absent
-/// family is not obligated (a single-stack host advances at full speed), a
-/// present-but-failing one is, and an empty obligated set is `NoneDelivered` —
+/// The confirm is a pure, per-family function of the I/O facts, and the obligated
+/// set is "every family that HAS a socket". The rows that matter: an absent family
+/// is not obligated (a single-stack host advances at full speed), a
+/// present-but-failing one is, and an empty obligated set delivers to nobody —
 /// never a vacuous "all", which would let a torn-down endpoint advance its
 /// lifecycle on nothing.
+///
+/// WHICH family missed survives to the core, so it can schedule the next
+/// announcement per link. The two partial rows differ here; under the aggregate
+/// confirm they were the same value.
 #[test]
-fn the_fan_out_projects_onto_the_delivery_shape() {
+fn the_fan_out_reaches_the_core_per_family() {
   use FamilySend::{Failed, Sent, Unbound};
+  use mdns_proto::FamilyDelivery::{Delivered, Missed, Unobligated};
   let cases = [
-    (Sent, Sent, TransmitOutcome::AllDelivered, 2),
-    (Sent, Unbound, TransmitOutcome::AllDelivered, 1),
-    (Unbound, Sent, TransmitOutcome::AllDelivered, 1),
-    (Sent, Failed, TransmitOutcome::PartiallyDelivered, 1),
-    (Failed, Sent, TransmitOutcome::PartiallyDelivered, 1),
-    (Failed, Failed, TransmitOutcome::NoneDelivered, 0),
-    (Failed, Unbound, TransmitOutcome::NoneDelivered, 0),
-    (Unbound, Unbound, TransmitOutcome::NoneDelivered, 0),
+    (Sent, Sent, Delivered, Delivered, 2),
+    (Sent, Unbound, Delivered, Unobligated, 1),
+    (Unbound, Sent, Unobligated, Delivered, 1),
+    (Sent, Failed, Delivered, Missed, 1),
+    (Failed, Sent, Missed, Delivered, 1),
+    (Failed, Failed, Missed, Missed, 0),
+    (Failed, Unbound, Missed, Unobligated, 0),
+    (Unbound, Unbound, Unobligated, Unobligated, 0),
   ];
-  for (v4, v6, want, credits) in cases {
+  for (v4, v6, want_v4, want_v6, credits) in cases {
     let fanout = Fanout { v4, v6 };
+    let delivery = fanout.delivery();
     assert_eq!(
-      fanout.transmit_outcome(),
-      want,
-      "({v4:?}, {v6:?}) must project onto {want:?}"
+      (delivery.v4(), delivery.v6()),
+      (want_v4, want_v6),
+      "({v4:?}, {v6:?}) must reach the core as ({want_v4}, {want_v6})"
+    );
+    assert_eq!(
+      delivery.all_delivered(),
+      want_v4 != Missed && want_v6 != Missed && (want_v4 == Delivered || want_v6 == Delivered),
+      "({v4:?}, {v6:?}): all_delivered is 'every obligated family carried it, and \
+       at least one was obligated'"
     );
     assert_eq!(
       fanout.sent_count(),
@@ -2136,10 +2148,13 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   .await;
 
   assert_eq!(
-    fanout.transmit_outcome(),
-    TransmitOutcome::AllDelivered,
-    "a §6.7 reply has exactly one obligated link, so it is all-or-none by \
-     construction"
+    fanout.delivery(),
+    mdns_proto::TransmitDelivery::new(
+      mdns_proto::FamilyDelivery::Delivered,
+      mdns_proto::FamilyDelivery::Unobligated,
+    ),
+    "a §6.7 reply obligates exactly the destination's family; the other one was \
+     never offered the datagram and must not read as a miss"
   );
   assert!(
     tracker.is_empty(),
@@ -2151,7 +2166,7 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
 // ── The obligation tag (`TransmitObligation`) at the driver seam ────────────
 
 /// A §6.7 legacy unicast reply reaches exactly ONE family, so its fan-out is
-/// `AllDelivered` by construction.
+/// all-delivered by construction — the other family is unobligated, not missing.
 #[cfg(feature = "tokio")]
 const UNICAST_FANOUT: Fanout = Fanout {
   v4: FamilySend::Sent,
@@ -2185,7 +2200,7 @@ fn confirm_service_round_mixed(
     } else {
       UNICAST_FANOUT
     };
-    confirm_service_transmit(endpoint, ctx, t, fanout.transmit_outcome());
+    confirm_service_transmit(endpoint, ctx, t, fanout.delivery());
     rounds += 1;
   }
   rounds

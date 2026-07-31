@@ -107,7 +107,7 @@ fn query_delegation_tolerates_unknown_handles() {
     e.poll_query_transmit(bogus, now, &mut buf),
     Ok(None)
   ));
-  e.note_query_transmit_outcome(bogus, now, TransmitOutcome::AllDelivered); // no-op on an unknown handle
+  e.note_query_transmit_outcome(bogus, now, TransmitDelivery::ALL); // no-op on an unknown handle
   assert!(e.handle_query_timeout(bogus, now).is_ok());
 }
 
@@ -1144,7 +1144,7 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
   // (next_deadline ≈ now+1s) with transmit_pending cleared.
   let mut buf = [0u8; 512];
   assert!(e.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
-  e.note_query_transmit_outcome(h, now, TransmitOutcome::AllDelivered);
+  e.note_query_transmit_outcome(h, now, TransmitDelivery::ALL);
   let t1 = e
     .poll_query_timeout(h)
     .expect("a retransmit must be scheduled");
@@ -3457,7 +3457,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 
   // (b) Confirm the send, advance time to arm next retry, then feed the peer
   // question again → note_duplicate_question returns true → counter advances.
-  e.note_query_transmit_outcome(h, now, TransmitOutcome::AllDelivered); // confirm
+  e.note_query_transmit_outcome(h, now, TransmitDelivery::ALL); // confirm
   now += Duration::from_secs(10); // past the first retry deadline (~1s)
   e.handle_query_timeout(h, now).unwrap(); // arms transmit_pending = true
 
@@ -7030,7 +7030,7 @@ fn additional_section_ttl0_withdrawal_skipped_then_later_record_delivered() {
   );
 }
 
-// ── TransmitOutcome at the endpoint boundary ─────────────────────────
+// ── TransmitDelivery at the endpoint boundary ─────────────────────────
 
 #[test]
 fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
@@ -7046,20 +7046,22 @@ fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
   let mut buf = std::vec![0u8; 512];
   assert!(ep.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
 
-  ep.note_query_transmit_outcome(h, now, TransmitOutcome::PartiallyDelivered);
+  ep.note_query_transmit_outcome(h, now, TransmitDelivery::V4_ONLY);
   let after_partial = ep.poll_query_timeout(h);
   assert!(
     after_partial.is_some(),
     "a partially-delivered question must still re-arm"
   );
 
-  // The budget is untouched, so the query survives far more partial rounds than
-  // MAX_RETRIES — the bound on this belongs to the driver's obligation policy.
+  // Only the excusing round spends a slot, so the query survives far more partial
+  // rounds than MAX_RETRIES. (`Query::note_transmit_outcome` owns the walk past
+  // that bound; this pins that the endpoint boundary ferries the per-family
+  // confirm rather than absorbing it.)
   for _ in 0..12 {
     let due = ep.poll_query_timeout(h).unwrap();
     ep.handle_query_timeout(h, due).unwrap();
     assert!(ep.poll_query_transmit(h, due, &mut buf).unwrap().is_some());
-    ep.note_query_transmit_outcome(h, due, TransmitOutcome::PartiallyDelivered);
+    ep.note_query_transmit_outcome(h, due, TransmitDelivery::V4_ONLY);
   }
   assert!(
     ep.poll_query(h).is_none(),
@@ -7119,7 +7121,7 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
     now = svc.poll_timeout().unwrap_or(now).max(now);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
       ep.note_service_announced(
         svc.has_fully_announced(),
         svc.advertised_a_addrs(),
@@ -7141,7 +7143,7 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
   now = svc.poll_timeout().unwrap_or(now).max(now);
   svc.handle_timeout(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_transmit_outcome(now, TransmitOutcome::PartiallyDelivered);
+  svc.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
   assert!(
     svc.advertises_instance(),
     "the v4 zone heard it, so ownership latched"
@@ -7161,7 +7163,7 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
   now = svc.poll_timeout().unwrap_or(now).max(now);
   svc.handle_timeout(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   ep.note_service_announced(
     svc.has_fully_announced(),
     svc.advertised_a_addrs(),
@@ -7364,7 +7366,7 @@ fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
     now = svc.poll_timeout().filter(|d| *d > now).unwrap_or(now);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
     if svc.state() == crate::ServiceState::Established {
       break;
@@ -7393,7 +7395,7 @@ fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
     let mut sent = 0usize;
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       sent += 1;
-      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
     assert_eq!(
       sent, 1,

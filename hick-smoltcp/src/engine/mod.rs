@@ -23,7 +23,7 @@ use mdns_proto::{
   query::Query,
   service::Service,
   slab::Slab,
-  transmit::{Transmit, TransmitObligation, TransmitOutcome},
+  transmit::{FamilyDelivery, Transmit, TransmitDelivery, TransmitObligation},
 };
 use rand_core::Rng;
 use smoltcp::wire::IpCidr;
@@ -190,6 +190,17 @@ impl FamilySend {
     matches!(self, FamilySend::Sent(_))
   }
 
+  /// This family's I/O answer as the core's protocol vocabulary. `Busy` is a
+  /// MISS, not an absence: the socket exists, so the family is obligated and
+  /// simply did not carry this datagram.
+  const fn delivery(self) -> FamilyDelivery {
+    match self {
+      FamilySend::Sent(_) => FamilyDelivery::Delivered,
+      FamilySend::Busy | FamilySend::Failed => FamilyDelivery::Missed,
+      FamilySend::Unsupported => FamilyDelivery::Unobligated,
+    }
+  }
+
   /// Map this family's send outcome to the per-family withdrawal debt result the
   /// endpoint consumes: a queued send spends one of the family's owed rounds
   /// (`Sent`); a transiently-full socket keeps its debt to retry (`Busy` →
@@ -257,8 +268,8 @@ impl Fanout {
     matches!(self.v4, FamilySend::Busy) || matches!(self.v6, FamilySend::Busy)
   }
 
-  /// Project the per-family fan-out onto the core's [`TransmitOutcome`] — the
-  /// honest, unexcused shape of what the sockets did.
+  /// Hand the per-family fan-out to the core VERBATIM, one [`FamilyDelivery`]
+  /// per family — the honest, unexcused I/O facts.
   ///
   /// The obligated set is every family this datagram was fanned onto that has a
   /// socket at all: `Unsupported` means there is none, so that family was never
@@ -266,32 +277,20 @@ impl Fanout {
   /// and nothing else — a `Busy` or `Failed` family did not carry the datagram,
   /// so the core must not advance its RFC 6762 §8.1 / §8.3 phase as if it had.
   ///
-  /// An empty obligated set yields [`TransmitOutcome::NoneDelivered`], never a
-  /// vacuous "all": nothing was delivered, so nothing may latch or advance.
+  /// Nothing is projected onto an aggregate here, and this driver is where that
+  /// matters most: [`family_order`] hands the one free slot of a constrained
+  /// transport to the longest-blocked family, so under capacity one the families
+  /// ALTERNATE and every round is partial. An aggregate confirm cannot tell that
+  /// apart from one chronically dead family, and the core would refresh each
+  /// family at twice the periodic interval — past the TTL — while every per-round
+  /// invariant still held.
   ///
   /// A family that keeps missing is never written off here, and this driver has
   /// no other place that could: the confirm is the honest I/O facts and nothing
   /// more. Bounding how long the lifecycle waits for it is the core's own
-  /// patience, applied inside [`TransmitOutcome`]'s confirm.
-  fn into_transmit_outcome(self) -> TransmitOutcome {
-    let mut obligated = 0u32;
-    let mut delivered = 0u32;
-    for family in [self.v4, self.v6] {
-      if matches!(family, FamilySend::Unsupported) {
-        continue;
-      }
-      obligated = obligated.saturating_add(1);
-      if family.is_sent() {
-        delivered = delivered.saturating_add(1);
-      }
-    }
-    if delivered == 0 {
-      TransmitOutcome::NoneDelivered
-    } else if delivered == obligated {
-      TransmitOutcome::AllDelivered
-    } else {
-      TransmitOutcome::PartiallyDelivered
-    }
+  /// patience, applied inside [`TransmitDelivery`]'s confirm.
+  fn into_delivery(self) -> TransmitDelivery {
+    TransmitDelivery::new(self.v4.delivery(), self.v6.delivery())
   }
 
   /// Decide how the pump resolves this fan-out: confirm the proto transmit with
@@ -307,7 +306,7 @@ impl Fanout {
     if !self.any_sent() && !self.any_busy() && self.failed_count() > 0 {
       MulticastOutcome::Undeliverable
     } else {
-      MulticastOutcome::Confirm(self.into_transmit_outcome())
+      MulticastOutcome::Confirm(self.into_delivery())
     }
   }
 }
@@ -328,6 +327,12 @@ enum Origin {
 /// `Established` with v6 having seen nothing. Handing the next free slot to the
 /// longest-blocked family makes both groups advance in turn. With ample capacity
 /// both sends succeed regardless of order, so this is a no-op in the common case.
+///
+/// This is the driver half of [`TransmitDelivery`]'s normative fair-service
+/// obligation: offer every obligated family on every round, and under a
+/// constrained slot prefer the longest-blocked one. The core says WHEN the
+/// stalest family is due; without the rotation it would say so about a family
+/// this driver never gets around to serving.
 fn family_order<I: Instant>(failing_since: &[Option<I>; 2]) -> [(usize, SocketAddr); 2] {
   let v4 = (0usize, MDNS_SOCKET_V4);
   let v6 = (1usize, MDNS_SOCKET_V6);
@@ -344,11 +349,11 @@ fn family_order<I: Instant>(failing_since: &[Option<I>; 2]) -> [(usize, SocketAd
 
 /// The result of a synchronous multicast fan-out, deciding how the pump confirms.
 enum MulticastOutcome {
-  /// Confirm the proto transmit with this delivery shape. A fan-out where
-  /// nothing was queued — every family busy, or every family absent — is a
-  /// [`TransmitOutcome::NoneDelivered`] confirm: the proto latches nothing,
-  /// advances nothing, and re-offers on its own schedule.
-  Confirm(TransmitOutcome),
+  /// Confirm the proto transmit with these per-family results. A fan-out where
+  /// nothing was queued — every family busy, or every family absent — delivers to
+  /// no family: the proto latches nothing, advances nothing, and re-offers on its
+  /// own schedule.
+  Confirm(TransmitDelivery),
   /// Nothing queued and a family reported the datagram permanently TooLarge, with
   /// no transient family left to wait for → it can never be sent, so the producing
   /// service/query is retired rather than re-offered forever.
@@ -420,7 +425,7 @@ impl<I: Instant> Multicaster<I> {
   /// the proto confirm-on-send contract and the per-family stats from it.
   ///
   /// **Confirm-on-send contract** (the proto's own): the pump reports the
-  /// [`TransmitOutcome`] this fan-out actually produced, and the CORE decides
+  /// [`TransmitDelivery`] this fan-out actually produced, and the CORE decides
   /// what it means. The two questions it asks have different answers under
   /// partial delivery, which is why the per-family shape must survive to the
   /// confirm rather than being folded to one bit here:
@@ -900,7 +905,7 @@ where
               // contract, so retiring under a live token would build the §10.1
               // goodbye from a service the core still considers mid-datagram.
               TransmitObligation::Sustained => {
-                self.note_transmit_outcome(origin, now, TransmitOutcome::NoneDelivered);
+                self.note_transmit_outcome(origin, now, fanout.into_delivery());
                 self.retire_origin(origin, now);
               }
               // One-shot: a §6 / §6.7 / RFC 6763 §9 reply is never re-armed, so an
@@ -911,7 +916,7 @@ where
               // by asking it a question whose answer does not fit, and it is also
               // what the adjacent unicast branch has always done.
               TransmitObligation::OneShot => {
-                self.note_transmit_outcome(origin, now, TransmitOutcome::NoneDelivered);
+                self.note_transmit_outcome(origin, now, fanout.into_delivery());
               }
             }
           }
@@ -934,10 +939,16 @@ where
         // and the querier simply re-asks. The multicast branch above reaches the
         // same conclusion for its own undeliverable one-shots.
         debug_assert_eq!(transmit.obligation(), TransmitObligation::OneShot);
-        let outcome = if result.is_ok() {
-          TransmitOutcome::AllDelivered
-        } else {
-          TransmitOutcome::NoneDelivered
+        let served = match &result {
+          Ok(()) => FamilyDelivery::Delivered,
+          // No socket for the destination's family: it was never obligated, so
+          // the obligated set is EMPTY rather than failed.
+          Err(SendError::Unsupported) => FamilyDelivery::Unobligated,
+          Err(_) => FamilyDelivery::Missed,
+        };
+        let delivery = match dst {
+          SocketAddr::V4(_) => TransmitDelivery::new(served, FamilyDelivery::Unobligated),
+          SocketAddr::V6(_) => TransmitDelivery::new(FamilyDelivery::Unobligated, served),
         };
         match result {
           Ok(()) => {
@@ -959,7 +970,7 @@ where
             // the querier will re-ask if it needs the answer.
           }
         }
-        self.note_transmit_outcome(origin, now, outcome);
+        self.note_transmit_outcome(origin, now, delivery);
       }
     }
 
@@ -1351,11 +1362,11 @@ where
   /// for whatever reached a wire (§10.1) and advances its §8.1 probe / §8.3
   /// announce / §5.2 query-backoff lifecycle only once every obligated family
   /// heard it.
-  fn note_transmit_outcome(&mut self, origin: Origin, now: I, outcome: TransmitOutcome) {
+  fn note_transmit_outcome(&mut self, origin: Origin, now: I, delivery: TransmitDelivery) {
     match origin {
       Origin::Service(handle) => {
         if let Some(slot) = self.services.get_mut(&handle) {
-          slot.proto.note_transmit_outcome(now, outcome);
+          slot.proto.note_transmit_outcome(now, delivery);
           // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
           // route so sibling host-address retention (during a same-host
           // withdrawal) honours what this service ACTUALLY announced, not its
@@ -1363,7 +1374,7 @@ where
           // i.e. on any delivery, so a round that reached no wire has nothing to
           // mirror and nothing to gate. Idempotent overwrite. `slot.proto` (read)
           // and `self.endpoint` (mut) are disjoint fields, so this borrow is fine.
-          if outcome.any_delivered() {
+          if delivery.any_delivered() {
             // The reclaim-cancel gate is the ALL-delivered announcement fact the
             // CORE computes, ferried verbatim. It is emphatically NOT
             // `advertises_instance()` — that latch fires on any delivery by any
@@ -1385,7 +1396,7 @@ where
       Origin::Query(handle) => {
         self
           .endpoint
-          .note_query_transmit_outcome(handle, now, outcome);
+          .note_query_transmit_outcome(handle, now, delivery);
       }
     }
   }

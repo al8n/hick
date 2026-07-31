@@ -26,7 +26,7 @@ use core::net::{IpAddr, SocketAddr};
 pub enum TransmitObligation {
   /// The core re-arms this datagram until every obligated link accepts it, so a
   /// link that keeps missing pins the producer's progress — until the core's own
-  /// patience bound excuses it (see [`TransmitOutcome`]).
+  /// patience bound excuses it (see [`TransmitDelivery`]).
   ///
   /// Carried by the RFC 6762 §8.1 probe, by every §8.3 announcement (including
   /// the periodic re-announce from `Established`), and by the §5.2 query
@@ -34,7 +34,7 @@ pub enum TransmitObligation {
   Sustained,
   /// Fire-and-forget: the core never re-arms this datagram, so missing it pins
   /// nothing and losing it costs nothing but one unanswered question. The core
-  /// still reads [`TransmitOutcome::any_delivered`] from its confirm to latch
+  /// still reads [`TransmitDelivery::any_delivered`] from its confirm to latch
   /// §10.1 goodbye ownership for the records the datagram carried.
   ///
   /// Carried by every response: the jittered multicast reply (§6), the legacy
@@ -101,112 +101,242 @@ impl Transmit {
   }
 }
 
-/// The delivery outcome of ONE logical datagram produced by a `poll_transmit`.
+/// What ONE address family did with ONE logical datagram: the presence
+/// trichotomy the core schedules on.
 ///
-/// A single logical mDNS multicast fans out to every link the driver serves —
-/// the IPv4 and IPv6 groups today, an arbitrary set under a future
-/// multi-interface driver — and those sends succeed or fail INDEPENDENTLY. The
-/// core asks two different questions of a send, and under partial delivery their
-/// answers differ, so the driver reports the aggregate shape and the core alone
-/// decides what each shape means:
+/// None of the three may be collapsed into another, and the interesting collapse
+/// is `Unobligated` into `Missed`. A single-stack host has no IPv6 socket at all,
+/// so folding the two makes it look permanently behind on a family it never had
+/// — and a scheduler that chases the stalest family then re-arms that host at the
+/// RFC 6762 §8.3 one-second floor forever, flooding the one link it does have.
+///
+/// Deliberately NOT `#[non_exhaustive]`: a future case must break every driver's
+/// match and force it to choose, rather than silently inheriting a wildcard arm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
+#[display("{}", self.as_str())]
+pub enum FamilyDelivery {
+  /// No socket for this family, or the datagram was not addressed to it. The
+  /// family was never OBLIGATED to carry this transmit, so its absence is not a
+  /// failure and it owes nothing.
+  Unobligated,
+  /// Obligated, and the datagram was accepted.
+  Delivered,
+  /// Obligated, and the datagram was not accepted.
+  Missed,
+}
+
+impl FamilyDelivery {
+  /// Canonical lowercase slug for this result.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Unobligated => "unobligated",
+      Self::Delivered => "delivered",
+      Self::Missed => "missed",
+    }
+  }
+}
+
+/// The PER-FAMILY delivery result of ONE logical datagram produced by a
+/// `poll_transmit`.
+///
+/// A single logical mDNS multicast fans out to every link the driver serves — the
+/// IPv4 and IPv6 groups — and those sends succeed or fail INDEPENDENTLY. The core
+/// asks three different questions of a send, and under partial delivery their
+/// answers differ:
 ///
 /// * [`any_delivered`](Self::any_delivered) drives the goodbye-ownership latch
-///   (RFC 6762 §10.1): peers reachable over a link that accepted the datagram may
-///   now hold the records it carried, so a later withdrawal must retract them.
+///   (RFC 6762 §10.1): peers reachable over a family that accepted the datagram
+///   may now hold the records it carried, so a later withdrawal must retract them.
 /// * [`all_delivered`](Self::all_delivered) drives lifecycle-phase advance (§8.1
-///   probing, §8.3 announcing) and the §5.2 query retry budget: a link that never
-///   saw the probe has not been asked, and one that never saw the announcement
-///   has not been told.
+///   probing, §8.3 announcing) and the §5.2 query retry budget: a family that
+///   never saw the probe has not been asked, and one that never saw the
+///   announcement has not been told.
+/// * [`v4`](Self::v4) / [`v6`](Self::v6) drive per-family SCHEDULING: WHICH family
+///   heard the announcement decides when the next one is due, because each family
+///   races its own copy of the record TTL in its own peers' caches.
+///
+/// # Why the aggregate shape is not enough
+///
+/// An aggregate "all / partial / none" carries no family identity, so it cannot
+/// distinguish "the same family keeps failing" (correctly excused) from "the
+/// families are taking turns" (each one served, but only every other round). A
+/// transport with room for one datagram per round produces exactly the second
+/// pattern once the driver's fair-service obligation below rotates the slot: every
+/// round is globally partial, the re-arm converges on the periodic refresh
+/// interval `R`, and each family is refreshed every 2·`R` — beyond the TTL that
+/// `R` is 80 % of. Records then expire cyclically on BOTH families while every
+/// per-round invariant still holds. Per-family delivery is what makes that
+/// observable at all.
 ///
 /// # The obligated set
 ///
-/// "Obligated" is DRIVER policy, not a core concept: the links this datagram is
-/// fanned onto that the driver has not permanently written off (no socket, a
-/// degraded family). The core never enumerates links, so this enum is
-/// family-count-agnostic and unchanged by a driver that grows past two.
+/// "Obligated" is DRIVER policy, not a core concept: a family is obligated for
+/// this datagram when the driver fanned it onto that family's socket and has not
+/// permanently written it off.
 ///
-/// * An RFC 6762 §6.7 legacy unicast reply has exactly ONE obligated link (the
-///   destination's family), so it reports `AllDelivered` or `NoneDelivered` by
-///   construction and can never be `PartiallyDelivered`.
-/// * An EMPTY obligated set (every link torn down mid-flight) reports
-///   [`NoneDelivered`](Self::NoneDelivered) — never a vacuous "all".
+/// * An RFC 6762 §6.7 legacy unicast reply obligates exactly ONE family (the
+///   destination's); the other is [`Unobligated`](FamilyDelivery::Unobligated).
+/// * An EMPTY obligated set (no socket at all) is
+///   [`any_delivered`](Self::any_delivered) `== false` and therefore
+///   [`all_delivered`](Self::all_delivered) `== false` — never a vacuous "all".
 ///
 /// # The split (normative)
 ///
-/// The DRIVER owns the obligated set and link death: which links a datagram is
+/// The DRIVER owns the obligated set and link death: which families a datagram is
 /// fanned onto, which have been permanently written off (no socket, a degraded
-/// family), and when a socket is torn down. It reports the honest aggregate shape
+/// family), and when a socket is torn down. It reports the honest per-family facts
 /// and nothing else — no confirm is ever laundered into a different one, and a
-/// `OneShot` outcome in particular reaches the core verbatim, since the core
-/// reads `any_delivered` from it to latch §10.1 goodbye ownership.
+/// `OneShot` result in particular reaches the core verbatim, since the core reads
+/// `any_delivered` from it to latch §10.1 goodbye ownership.
 ///
-/// The CORE owns its own patience. Repeated `PartiallyDelivered` re-arms
+/// A driver MUST offer every obligated family on every round, and under a
+/// constrained slot MUST prefer the longest-blocked family. This is what makes the
+/// core's scheduling sufficient: the core says WHEN the stalest family is due and
+/// the driver hands that family the next free slot, so neither side needs to know
+/// anything new about the other. A driver that always filled the same family first
+/// would starve the other one no matter what the core scheduled.
+///
+/// The CORE owns its own patience, per family. Repeated partial delivery re-arms
 /// indefinitely, so the core bounds how many consecutive re-arms one producer
-/// spends waiting for a link that never accepts; past that bound it advances the
-/// phase without that link (`MAX_PARTIAL_ROUNDS`). That is a decision about the
-/// core's own lifecycle, made of facts the core already holds — the confirm shape
-/// and its own re-arm count — with no socket or link-health knowledge involved,
-/// so it belongs where every other lifecycle rule lives. Its in-tree sibling is
-/// the withdrawal ceiling, which force-completes per-family goodbye debt the
-/// driver never paid.
+/// spends waiting for a family that never accepts; past that bound it advances the
+/// phase without that family (`MAX_PARTIAL_ROUNDS`). That is a decision about the
+/// core's own lifecycle, made of facts the core already holds — the confirm and its
+/// own re-arm count — with no socket or link-health knowledge involved, so it
+/// belongs where every other lifecycle rule lives. Its in-tree sibling is the
+/// withdrawal ceiling, which force-completes per-family goodbye debt the driver
+/// never paid.
 ///
-/// The core does NOT thereby decide a link is dead: the excused link is fanned
-/// onto on every later round and the first round it accepts is `AllDelivered` on
-/// its own merit, so there is no degraded state to get stuck in and no recovery
-/// edge to detect. Nor is the escape a delivery — it advances the phase and
-/// nothing else. It earns no announcement proof
+/// The core does NOT thereby decide a family is dead: the excused family is fanned
+/// onto on every later round and the first round it accepts is a delivery on its
+/// own merit, so there is no degraded state to get stuck in and no recovery edge to
+/// detect. Nor is the escape a delivery — it advances the phase and nothing else.
+/// It earns no announcement proof
 /// ([`Service::has_fully_announced`](crate::Service::has_fully_announced) stays
 /// shut), no ladder reset, and no delivered-datagram counter. §8.1's requirement
-/// that a name be probed before it is claimed is honoured by the bound being
-/// spent on genuine re-arms of that probe, and by the excusal never being
-/// reachable from an outcome that put nothing on a wire
-/// ([`NoneDelivered`](Self::NoneDelivered) leaves the count untouched, so an
-/// alternating partial/failed pattern cannot walk into it).
+/// that a name be probed before it is claimed is honoured by the bound being spent
+/// on genuine re-arms of that probe, and by the excusal never being reachable from
+/// a confirm that put nothing on a wire: an all-miss round leaves every per-family
+/// count untouched, so an alternating partial/failed pattern cannot walk into it.
 ///
 /// The core's other half of the contract: a re-arm is LOSSLESS (same probe index,
 /// same announcement count — nothing restarts) and recovery is IMMEDIATE — the
-/// first confirm after the lagging link starts accepting is `AllDelivered`, and
-/// the phase advances from exactly where it stood.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
-#[display("{}", self.as_str())]
-pub enum TransmitOutcome {
-  /// Every obligated link accepted the datagram.
-  AllDelivered,
-  /// At least one obligated link accepted the datagram and at least one did not.
-  PartiallyDelivered,
-  /// No link accepted the datagram, including the case of an empty obligated set.
-  NoneDelivered,
+/// first confirm after the lagging family starts accepting advances the phase from
+/// exactly where it stood.
+///
+/// # What the per-family schedule guarantees
+///
+/// With `R` the periodic refresh interval (~80 % of the record TTL, floored at
+/// §8.3's one second), every obligated family in good standing is re-announced
+/// within `max(R, 2 × ANNOUNCE_INTERVAL)` of its last delivery. The second term is
+/// arithmetic, not slack: at the minimum registrable TTL of 2 s
+/// ([`MIN_SERVICE_TTL_SECS`](crate::constants::MIN_SERVICE_TTL_SECS)) `R` is 1 s,
+/// so a capacity-one transport spends two §8.3-floored rounds to serve two
+/// families and the per-family gap is the TTL exactly.
+///
+/// A family that has reached its own patience bound stops driving that schedule
+/// until it delivers again — otherwise its frozen anchor would hold the deadline
+/// permanently in the past and the HEALTHY family would be re-announced at the
+/// one-second floor forever.
+///
+/// # Not modelled
+///
+/// * **Within-family aggregation.** Under a future multi-interface driver a
+///   family spans several links, and [`Delivered`](FamilyDelivery::Delivered)
+///   would have to mean "every obligated link of that family accepted"; the
+///   fair-service obligation above would then apply per link inside the driver.
+///   Today each family is one socket, so the two readings coincide.
+/// * **Per-family goodbye ownership.** The §10.1 latch stays aggregate: any
+///   delivery latches the records the datagram carried, for every family. That is
+///   the conservative direction — it can only make a withdrawal retract more than
+///   strictly necessary — and splitting it per family would risk the opposite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransmitDelivery {
+  /// Indexed [v4, v6]. Private so the shape stays an implementation detail while
+  /// the public surface names the families, matching
+  /// [`Endpoint::note_withdrawal_result`](crate::Endpoint::note_withdrawal_result).
+  families: [FamilyDelivery; 2],
 }
 
-impl TransmitOutcome {
-  /// At least one obligated link accepted the datagram, so peers reachable over
-  /// that link may now hold the records it carried.
+impl TransmitDelivery {
+  /// Report what each family did with this datagram.
+  #[inline(always)]
+  pub const fn new(v4: FamilyDelivery, v6: FamilyDelivery) -> Self {
+    Self { families: [v4, v6] }
+  }
+
+  /// What the IPv4 family did with this datagram.
+  #[inline(always)]
+  pub const fn v4(&self) -> FamilyDelivery {
+    self.families[0]
+  }
+
+  /// What the IPv6 family did with this datagram.
+  #[inline(always)]
+  pub const fn v6(&self) -> FamilyDelivery {
+    self.families[1]
+  }
+
+  /// At least one obligated family accepted the datagram, so peers reachable over
+  /// that family may now hold the records it carried.
   ///
   /// This is the goodbye-ownership fact (RFC 6762 §10.1): ownership latches iff
   /// this is `true`.
   #[inline(always)]
-  pub const fn any_delivered(self) -> bool {
-    matches!(self, Self::AllDelivered | Self::PartiallyDelivered)
+  pub const fn any_delivered(&self) -> bool {
+    matches!(self.families[0], FamilyDelivery::Delivered)
+      || matches!(self.families[1], FamilyDelivery::Delivered)
   }
 
-  /// Every obligated link accepted the datagram.
+  /// Every obligated family accepted the datagram — and at least one was
+  /// obligated, so an empty obligated set is never a vacuous "all".
   ///
   /// This is the lifecycle fact: the §8.1 probe sequence, the §8.3 announcement
-  /// phase, and the §5.2 query retry budget advance iff this is `true`.
+  /// phase, and the §5.2 query retry budget advance iff this is `true`, or iff
+  /// every family that missed has already spent the core's patience.
   #[inline(always)]
-  pub const fn all_delivered(self) -> bool {
-    matches!(self, Self::AllDelivered)
+  pub const fn all_delivered(&self) -> bool {
+    self.any_delivered() && !self.any_missed()
   }
 
-  /// Canonical lowercase slug for this outcome.
+  /// At least one obligated family did NOT accept the datagram.
   #[inline(always)]
-  pub const fn as_str(&self) -> &'static str {
-    match self {
-      Self::AllDelivered => "all_delivered",
-      Self::PartiallyDelivered => "partially_delivered",
-      Self::NoneDelivered => "none_delivered",
-    }
+  pub(crate) const fn any_missed(&self) -> bool {
+    matches!(self.families[0], FamilyDelivery::Missed)
+      || matches!(self.families[1], FamilyDelivery::Missed)
   }
+
+  /// The per-family results in index order, for the core's own per-family state.
+  #[inline(always)]
+  pub(crate) const fn families(&self) -> &[FamilyDelivery; 2] {
+    &self.families
+  }
+}
+
+/// Index of the IPv4 family in every per-family array, for the in-crate tests
+/// that assert on the core's own per-family state.
+#[cfg(test)]
+pub(crate) const V4: usize = 0;
+/// Index of the IPv6 family. `V4_ONLY` misses on this one, so it is the family
+/// the patience assertions are about.
+#[cfg(test)]
+pub(crate) const V6: usize = 1;
+
+/// Terse fixtures for the in-crate tests, which drive thousands of confirms and
+/// mostly care about the delivery SHAPE rather than which family carried what.
+#[cfg(test)]
+impl TransmitDelivery {
+  /// Both families obligated, both delivered.
+  pub(crate) const ALL: Self = Self::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered);
+  /// Both families obligated, neither delivered.
+  pub(crate) const NONE: Self = Self::new(FamilyDelivery::Missed, FamilyDelivery::Missed);
+  /// Both obligated; v4 carried the datagram and v6 missed it. The canonical
+  /// partial shape, so a REPEATED `V4_ONLY` is one chronically missing family —
+  /// which is what the patience bound is about.
+  pub(crate) const V4_ONLY: Self = Self::new(FamilyDelivery::Delivered, FamilyDelivery::Missed);
+  /// The mirror image. Alternating `V4_ONLY` / `V6_ONLY` is the capacity-one
+  /// transport, where every round is partial yet NEITHER family is failing.
+  pub(crate) const V6_ONLY: Self = Self::new(FamilyDelivery::Missed, FamilyDelivery::Delivered);
 }
 
 #[cfg(test)]

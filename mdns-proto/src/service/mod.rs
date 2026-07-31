@@ -155,8 +155,9 @@ cfg_heap! {
 }
 #[allow(unused_imports)]
 pub(crate) use schedule::{
-  MAX_PARTIAL_ROUNDS, PhaseAdvance, announce_deadline, classify_advance, partial_announce_deadline,
-  probe_deadline, re_announce_deadline,
+  FamilyPatience, MAX_PARTIAL_ROUNDS, PhaseAdvance, announce_deadline, classify_advance,
+  compose_announce_deadline, partial_announce_deadline, probe_deadline, re_announce_deadline,
+  stalest_refresh_due,
 };
 pub use state::ServiceState;
 
@@ -166,7 +167,7 @@ cfg_heap! {
   use crate::error::{HandleTimeoutError, TransmitError};
   use crate::event::{ServiceEvent, ServiceUpdate};
   use crate::records::ServiceRecords;
-  use crate::transmit::{Transmit, TransmitObligation, TransmitOutcome};
+  use crate::transmit::{FamilyDelivery, Transmit, TransmitDelivery, TransmitObligation};
   use crate::{Instant, Pool, ServiceHandle};
 
   type Rng = rand::rngs::StdRng;
@@ -324,18 +325,24 @@ cfg_heap! {
   /// Every cell marked "rewrite" is a BACKSTOP: unreachable for a compliant
   /// driver, and what happens if the contract is broken.
   ///
-  /// | entry point | live token | partial counters (`partial_rounds` / `partial_announce_streak`) | deadlines |
+  /// The counter column covers all three pieces of per-round state: the
+  /// per-family patience (`partial_rounds`, a [`FamilyPatience`] each), the §8.3
+  /// ladder exponent (`partial_announce_streak`), and the per-family refresh
+  /// anchors (`last_delivered`). "zeroed" means `FamilyPatience::default()` — the
+  /// count, the coverage bit, and the good-standing latch together.
+  ///
+  /// | entry point | live token | partial counters (`partial_rounds` / `partial_announce_streak` / `last_delivered`) | deadlines |
   /// |---|---|---|---|
   /// | `handle_event` §8.2 probe-conflict buffer | untouched — buffering a peer record is not a lifecycle move | untouched | untouched |
-  /// | `handle_event` §9 same-name revert (`Init`) | backstop: **rewrite** → `Stale`, name unchanged | `partial_rounds = 0` (fresh §8.1 sequence); streak untouched — same name, same §8.3 ladder | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
+  /// | `handle_event` §9 same-name revert (`Init`) | backstop: **rewrite** → `Stale`, name unchanged | `partial_rounds` zeroed (fresh §8.1 sequence); streak untouched — same name, same §8.3 ladder; `last_delivered` untouched, since peers still hold THESE records under THIS name and each family still races the same TTL | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
   /// | `handle_event` Question / KnownAnswer / HostConflict | untouched — none of them regress a phase | untouched | `response_deadline` / `meta_response_deadline` only |
-  /// | `handle_timeout` §8.2 tiebreak → rename (`Init`) | backstop: **rewrite** → `Stale`, old-name records captured | both zeroed by `reset_advertised_name_state` — a NEW name starts both sequences over | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
-  /// | `handle_timeout` §8.2 tiebreak → `Conflicting` (invalid new name) | backstop: **rewrite** → `Stale`, old-name records captured | streak zeroed; `partial_rounds` untouched — terminal, nothing left to excuse | all cleared |
+  /// | `handle_timeout` §8.2 tiebreak → rename (`Init`) | backstop: **rewrite** → `Stale`, old-name records captured | all three cleared by `reset_advertised_name_state` — a NEW name starts every sequence over, and no family is owed a refresh of a name it has never heard | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
+  /// | `handle_timeout` §8.2 tiebreak → `Conflicting` (invalid new name) | backstop: **rewrite** → `Stale`, old-name records captured | streak zeroed; `partial_rounds` / `last_delivered` untouched — terminal, nothing left to excuse and nothing left to schedule | all cleared |
   /// | `handle_timeout` `Init` → `Probing(0)` | untouched — a forward step, and it emits nothing | untouched | re-armed |
   /// | `handle_timeout` `Probing`/`Announcing`/`Established` fire | untouched; backstop: `push_lifecycle_pending` queues NOTHING while a token is live, so no lifecycle transmit outlives the confirm | untouched | re-armed |
   /// | `handle_timeout` `Conflicting` | untouched — no progression | untouched | untouched |
   /// | `poll_transmit` | refuses (`Ok(None)`) while one is live — the single slot is what matches one confirm to one datagram | untouched | untouched |
-  /// | `note_transmit_outcome` | consumed (`.take()`) | per the confirm arms | per the confirm arms |
+  /// | `note_transmit_outcome` | consumed (`.take()`) | per the confirm arms; only the Probe and Announcement arms touch patience, and only the Announcement arm touches `last_delivered` | per the confirm arms |
   /// | `withdrawal_snapshot` | untouched — a pure read of the latch, and it asserts rather than reporting a short goodbye | untouched | untouched |
   /// | `take_rename_goodbye_handoff` | untouched — pure `.take()` of the handoff field | untouched | untouched |
   ///
@@ -754,19 +761,46 @@ cfg_heap! {
   /// §8.3's "increases by at least a factor of two with every response sent";
   /// a fully-failed send reaches no wire and so neither uses nor advances this.
   partial_announce_streak: u8,
-  /// Consecutive `PartiallyDelivered` LIFECYCLE confirms (§8.1 probe or §8.3
-  /// announcement) since the last phase advance — the core's own patience,
-  /// bounded by `MAX_PARTIAL_ROUNDS`. Reaching the bound EXCUSES the link that
-  /// keeps missing for one confirm, so the phase advances from exactly where it
-  /// stood instead of pinning forever.
+  /// Per family ([0] = v4, [1] = v6): consecutive LIFECYCLE confirms (§8.1 probe
+  /// or §8.3 announcement) in which THAT family was obligated and missed a
+  /// datagram some other family carried — the core's own patience, bounded by
+  /// `MAX_PARTIAL_ROUNDS`. Reaching the bound EXCUSES that family, so the phase
+  /// advances from exactly where it stood instead of pinning forever, and takes it
+  /// out of good standing so it stops driving the refresh schedule below until it
+  /// delivers again.
+  ///
+  /// Per family rather than per round because those disagree exactly where it
+  /// matters: two families alternating under a capacity-one transport look
+  /// identical to one chronically dead family through a shared counter, and the
+  /// first must not be excused at all.
   ///
   /// It lives beside the per-kind confirm arms that maintain it, so a §6 response
   /// or a §9 meta reply — never re-armed, so evidence of nothing — structurally
-  /// cannot touch it. Reset by a fully-delivered confirm and by the excusal
-  /// itself; left ALONE by a wholly-failed one (see `classify_advance`); and
+  /// cannot touch it. Reset by that family's OWN delivery and by it ceasing to be
+  /// obligated; left ALONE by a wholly-failed round (see `classify_advance`); and
   /// zeroed wherever the lifecycle regresses to `Init`, which starts a fresh
   /// §8.1 sequence.
-  partial_rounds: u8,
+  partial_rounds: [FamilyPatience; 2],
+  /// Per family ([0] = v4, [1] = v6): when this family last had an ANNOUNCEMENT
+  /// delivered to it — the event that refreshes the record TTLs in that family's
+  /// peer caches. `None` means the family is not obligated (no socket for it).
+  ///
+  /// Each family races its OWN copy of the TTL, so the periodic re-announce is
+  /// scheduled off the stalest of these rather than off the last round: under a
+  /// capacity-one transport every round is partial while each family is served
+  /// only every other one, so a round-anchored schedule refreshes each family at
+  /// TWICE the periodic interval and its records expire from every peer cache
+  /// while every per-round invariant still holds.
+  ///
+  /// Only the announcement confirm arm writes it. A probe advertises nothing, and
+  /// a §6 response refreshes one querier's cache with whatever §7.1 left of it —
+  /// neither is a refresh this schedule may count on.
+  ///
+  /// A family that becomes obligated at runtime is anchored at THAT moment rather
+  /// than left `None`: unanchored reads as "not obligated" and would defer it
+  /// silently, while anchoring it in the past would read as infinitely stale and
+  /// re-arm every confirm at the §8.3 floor.
+  last_delivered: [Option<I>; 2],
   /// the commit token for the datagram `poll_transmit`
   /// most recently produced — `Some(kind)` while that send is awaiting a
   /// delivery result, `None` otherwise. This is the structural heart of the
@@ -882,7 +916,8 @@ where
       goodbye: GoodbyeOwnership::default(),
       fully_announced: false,
       partial_announce_streak: 0,
-      partial_rounds: 0,
+      partial_rounds: [FamilyPatience::default(); 2],
+      last_delivered: [None, None],
       awaiting_confirm: None,
       pending_legacy: std::vec::Vec::new(),
       last_conflict_reprobe: None,
@@ -983,7 +1018,7 @@ where
 
   /// Whether a COMPLETE §8.3 announcement of the CURRENT instance name has
   /// reached EVERY obligated link — i.e. at least one announcement resolved
-  /// [`TransmitOutcome::AllDelivered`].
+  /// [`TransmitDelivery::all_delivered`].
   ///
   /// This is the reclaim-cancel gate the driver ferries into
   /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced):
@@ -1044,12 +1079,13 @@ where
   /// commit token (`awaiting_confirm`); the driver then reports how the fan-out
   /// went. Two invariants key every arm below:
   ///
-  /// * **Goodbye ownership latches iff [`TransmitOutcome::any_delivered`]** —
+  /// * **Goodbye ownership latches iff [`TransmitDelivery::any_delivered`]** —
   ///   peers reachable over any link that accepted the datagram may hold the
   ///   records it carried (RFC 6762 §10.1), whether or not every link did.
-  /// * **Phase advances iff [`TransmitOutcome::all_delivered`]** — a link that
+  /// * **Phase advances iff [`TransmitDelivery::all_delivered`]** — a link that
   ///   never saw the probe has not been asked (§8.1) and one that never saw the
-  ///   announcement has not been told (§8.3).
+  ///   announcement has not been told (§8.3). The two ways a phase moves without
+  ///   that, and what they deliberately do NOT earn, are below.
   ///
   /// Behaviour per commit token:
   ///
@@ -1064,9 +1100,10 @@ where
   /// * **Announcement, all delivered** — latch goodbye ownership for the records
   ///   it emitted, mark [`Self::has_fully_announced`], and advance the §8.3
   ///   phase, reaching `Established` after the second.
-  /// * **Announcement, partially delivered** — latch ownership (the served link
-  ///   heard it) but do NOT advance; re-arm on the §8.3 doubling ladder, since
-  ///   every such retry puts another real datagram on that link's wire.
+  /// * **Announcement, partially delivered** — latch ownership (the served
+  ///   family heard it) but do NOT advance; re-arm on the composed rule in
+  ///   `arm_announcement`, since every such retry puts another real datagram on
+  ///   that family's wire and some family is now falling behind on its TTL.
   /// * **Announcement, none delivered** — nothing reached any wire: latch
   ///   nothing, advance nothing, retry flat at the §8.3 one-second interval.
   /// * **Response / meta-response** — exposure is an any-delivered fact and no
@@ -1090,26 +1127,41 @@ where
   /// driver that confirms each datagram before polling the next one, which is
   /// every driver that cannot park.
   ///
-  /// # The bounded-patience escape
+  /// # Advancing without a fully-delivered round
   ///
-  /// Repeated partial delivery would otherwise re-arm forever, so after
-  /// `MAX_PARTIAL_ROUNDS` consecutive partial LIFECYCLE confirms the next one
-  /// is EXCUSED: the phase advances from exactly where it stood, without the link
-  /// that keeps missing. An excused advance is **not** a delivery, and this is
-  /// the whole of the distinction:
+  /// A partially-delivered datagram is re-armed LOSSLESSLY — the same probe
+  /// index, the same announcement content — so the phase has two further ways to
+  /// move, and neither is a delivery:
   ///
-  /// * [`Self::has_fully_announced`] stays shut — no complete announcement
-  ///   reached every obligated link, so a renamed-away name's §10.1 goodbye must
-  ///   keep going;
+  /// * **Covered.** Every obligated family has carried this datagram at some
+  ///   point since the phase last advanced. Under a capacity-one transport the
+  ///   families take turns, so no single round ever reaches both while both are
+  ///   in fact being served; without this the producer would sit in `Probing(0)`
+  ///   forever, because a family's patience resets on its own delivery and
+  ///   neither could ever spend it.
+  /// * **Excused.** Every family still owed the datagram has spent
+  ///   `MAX_PARTIAL_ROUNDS` re-arms on it. The phase advances from exactly where
+  ///   it stood, without that family, and the family stops driving the per-family
+  ///   refresh schedule until it delivers again.
+  ///
+  /// Neither takes any of the credit a delivery earns, and that is the whole of
+  /// the distinction:
+  ///
+  /// * [`Self::has_fully_announced`] stays shut — no ONE announcement was
+  ///   confirmed by every obligated family, so a renamed-away name's §10.1
+  ///   goodbye must keep going;
   /// * the §8.3 doubling ladder is preserved, and the re-arm is never EARLIER
-  ///   than the rung the served link already earned;
+  ///   than the rung the served family already earned;
   /// * `probes_tx` / `announcements_tx` do not count it — those counters mean
-  ///   "confirmed delivered by every obligated link", so an excused round is
-  ///   visible as an advance the counters never recorded.
+  ///   "confirmed delivered by every obligated link", so such a round is visible
+  ///   as an advance the counters never recorded.
   ///
-  /// Goodbye ownership is unaffected either way: an excused round is still
-  /// `any_delivered`, so the records it put on a wire stay owned and retractable.
-  pub fn note_transmit_outcome(&mut self, now: I, outcome: TransmitOutcome) {
+  /// Goodbye ownership is unaffected either way: both are still `any_delivered`,
+  /// so the records they put on a wire stay owned and retractable.
+  ///
+  /// An all-miss round reaches none of this: it leaves every family's patience
+  /// untouched, which is what keeps a phase from ever advancing out of silence.
+  pub fn note_transmit_outcome(&mut self, now: I, delivery: TransmitDelivery) {
     let kind = match self.awaiting_confirm.take() {
       Some(k) => k,
       None => return,
@@ -1117,7 +1169,7 @@ where
     match kind {
       AwaitingConfirm::Probe => {
         if let ServiceState::Probing(n) = self.state {
-          let advance = classify_advance(&mut self.partial_rounds, outcome);
+          let advance = classify_advance(&mut self.partial_rounds, delivery);
           if matches!(advance, PhaseAdvance::Partial | PhaseAdvance::Failed) {
             // §8.1: the probe did not reach every obligated link — do NOT
             // advance the sequence. Re-arm the SAME probe from post-send time so
@@ -1162,7 +1214,7 @@ where
         }
       }
       AwaitingConfirm::Announcement(emitted) => {
-        let advance = classify_advance(&mut self.partial_rounds, outcome);
+        let advance = self.classify_announcement(now, delivery);
         if matches!(advance, PhaseAdvance::Failed) {
           // The announcement never reached ANY link — re-arm without advancing
           // and latch nothing. Retry at the §8.3 inter-announce interval,
@@ -1193,29 +1245,18 @@ where
         // even though it advances nothing.
         self.goodbye.record_emitted(&emitted);
         if matches!(advance, PhaseAdvance::Partial) {
-          // §8.3 phase does NOT advance — some obligated link has not been told.
-          // Re-arm on the doubling ladder: this retry will put another real
-          // datagram on the served link's wire, and §8.3 requires the interval
-          // between unsolicited responses to grow by ≥2× with every one sent.
-          // The re-arm is lossless — `announce_count` and the state are
-          // untouched, so the first all-delivered confirm resumes from here.
-          if matches!(
-            self.state,
-            ServiceState::Announcing(_) | ServiceState::Established
-          ) {
-            self.lifecycle_deadline = partial_announce_deadline(
-              now,
-              self.partial_announce_streak,
-              self.records.ttl_secs(),
-            );
-          }
+          // §8.3 phase does NOT advance — some obligated family has not been told.
+          // The re-arm is lossless: `announce_count` and the state are untouched,
+          // so the first all-delivered confirm resumes from here.
+          self.arm_announcement(now, advance);
           self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
           return;
         }
         // The phase advances. Only a genuine delivery earns the credit that goes
-        // with it: `announcements_tx` counts confirmed-delivered datagrams, and
-        // the reclaim-cancel gate asserts that EVERY obligated link heard a
-        // complete announcement — neither of which an excused round did.
+        // with it: `announcements_tx` counts datagrams confirmed by every
+        // obligated family, and the reclaim-cancel gate asserts that ONE complete
+        // announcement reached all of them — neither of which a covered or an
+        // excused round produced.
         if matches!(advance, PhaseAdvance::Delivered) {
           #[cfg(feature = "stats")]
           if let Some(s) = self.stat() {
@@ -1260,29 +1301,11 @@ where
             );
           }
         }
-        if matches!(advance, PhaseAdvance::Excused)
-          && matches!(
-            self.state,
-            ServiceState::Announcing(_) | ServiceState::Established
-          )
-        {
-          // §8.3: the excused round still put a real unsolicited response on the
-          // served link's wire, so the next one must be at least twice as far
-          // out. Re-arm on the rung already earned, then climb one — the ladder
-          // is CARRIED ACROSS the excuse point, never reset by it. Without it the
-          // advance would re-arm at the flat 1 s interval and the served link
-          // would observe 2 s → 1 s.
-          //
-          // `Established` needs no special case of its own, but it is where the
-          // rung has to REPLACE the pre-armed deadline rather than merely raise
-          // it. Nothing advanced above — it is the terminal phase — so what
-          // `handle_timeout` left armed is the periodic re-announce, always
-          // further out than the capped rung. Keeping the later of the two would
-          // hold the next attempt off for a whole refresh interval measured from
-          // an announcement that never reached every link, so the records the
-          // missing link is still owed expire from the caches that do hold them
-          // before the retry lands.
-          self.arm_on_partial_ladder(now);
+        self.arm_announcement(now, advance);
+        if advance.advances_without_delivery() {
+          // §8.3: the round still put a real unsolicited response on the served
+          // family's wire, so the ladder is CARRIED ACROSS the advance point
+          // rather than reset by it.
           self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
         }
       }
@@ -1311,7 +1334,7 @@ where
         // Exposure is an ANY-delivered fact and a response carries no lifecycle
         // phase, so a partial delivery is handled exactly like a full one: one
         // link's peers heard the records, and that is the whole question here.
-        if outcome.any_delivered() {
+        if delivery.any_delivered() {
           #[cfg(feature = "stats")]
           if let Some(s) = self.stat() {
             s.responses_tx(1);
@@ -1328,7 +1351,7 @@ where
         // NOT touched.  Any delivery bumps responses_tx so the *_tx counters
         // reflect every datagram that left the host; there is no phase here, so
         // partial and full delivery are the same event.
-        if outcome.any_delivered() {
+        if delivery.any_delivered() {
           #[cfg(feature = "stats")]
           if let Some(s) = self.stat() {
             s.responses_tx(1);
@@ -1353,9 +1376,9 @@ where
           match _fact {
             // `probes_tx` / `announcements_tx` mean "confirmed delivered by every
             // obligated link", so they hold to that bar here too.
-            StaleWireFact::Probe if outcome.all_delivered() => s.probes_tx(1),
-            StaleWireFact::Announcement if outcome.all_delivered() => s.announcements_tx(1),
-            StaleWireFact::Response(kas) if outcome.any_delivered() => {
+            StaleWireFact::Probe if delivery.all_delivered() => s.probes_tx(1),
+            StaleWireFact::Announcement if delivery.all_delivered() => s.announcements_tx(1),
+            StaleWireFact::Response(kas) if delivery.any_delivered() => {
               s.responses_tx(1);
               if kas > 0 {
                 s.answers_suppressed_kas(kas);
@@ -1364,7 +1387,7 @@ where
             _ => {}
           }
         }
-        if !outcome.any_delivered() {
+        if !delivery.any_delivered() {
           return;
         }
         match records {
@@ -1492,23 +1515,12 @@ where
   /// Re-arm `lifecycle_deadline` on the rung the RFC 6762 §8.3 partial ladder has
   /// already earned, DISCARDING whatever schedule the phase change pre-armed.
   ///
-  /// Only an EXCUSED advance needs this. The phase moves without the link that
-  /// kept missing, so the advance re-arms on the fresh phase's own schedule —
-  /// `announce_deadline`'s flat 1 s while announcing, the periodic re-announce
-  /// (~0.8·TTL) once `Established` — while the SERVED link has been climbing the
-  /// doubling ladder all along. Neither of those schedules is the right one for
-  /// it, and they are wrong in OPPOSITE directions: the flat 1 s comes sooner than
-  /// the rung the link already earned (§8.3: the interval "increases by at least a
-  /// factor of two with every response sent"), while the pre-armed periodic
-  /// deadline postpones the next attempt by up to a whole refresh interval,
-  /// stranding the missing link past the point where the records it never received
-  /// expire from every peer cache that did.
-  ///
-  /// The ladder's own rung is correct in both directions at once, which is why it
-  /// simply replaces them. It satisfies the invariant
-  /// [`partial_announce_deadline`] documents — non-decreasing across the excuse
-  /// because rungs are monotonic in the streak, and never beyond the periodic
-  /// refresh because the rung is capped AT that cadence.
+  /// Only an EXCUSED advance OUT OF PROBING needs this. The phase moves without
+  /// the family that kept missing and re-arms on the fresh phase's own schedule —
+  /// `announce_deadline`'s flat 1 s — while the served family has been climbing the
+  /// doubling ladder all along. §8.3 forbids the next unsolicited response from
+  /// coming sooner than the last one did, so the flat interval is the wrong one and
+  /// the earned rung replaces it.
   ///
   /// A streak of zero means the ladder is not engaged (the patience bound was
   /// spent on probes, which are questions and take no rung), so the advance's own
@@ -1519,6 +1531,87 @@ where
     }
     self.lifecycle_deadline =
       partial_announce_deadline(now, self.partial_announce_streak, self.records.ttl_secs());
+  }
+
+  /// Apply the core's per-family patience to one ANNOUNCEMENT confirm and record
+  /// what each family did with it.
+  ///
+  /// The anchors are maintained here, beside the counter they are read with, so
+  /// the two can never describe different rounds. Their rules are the presence
+  /// trichotomy, one clause each:
+  ///
+  /// * **Delivered** — this family's peers have a fresh copy of the records, so
+  ///   its TTL race restarts now.
+  /// * **Missed** — the anchor stands, and the growing gap is precisely what pulls
+  ///   the next announcement in. An UNANCHORED family is anchored here instead:
+  ///   that is the runtime `Unobligated` → obligated transition (a socket that
+  ///   just appeared), and it is owed its first refresh within one interval, not
+  ///   immediately and not never.
+  /// * **Unobligated** — no socket, so nothing is owed and nothing may be stale.
+  ///   Clearing it is also what makes the transition above detectable.
+  fn classify_announcement(&mut self, now: I, delivery: TransmitDelivery) -> PhaseAdvance {
+    let advance = classify_advance(&mut self.partial_rounds, delivery);
+    for (anchor, family) in self
+      .last_delivered
+      .iter_mut()
+      .zip(delivery.families().iter())
+    {
+      match family {
+        FamilyDelivery::Delivered => *anchor = Some(now),
+        FamilyDelivery::Missed => {
+          if anchor.is_none() {
+            *anchor = Some(now);
+          }
+        }
+        FamilyDelivery::Unobligated => *anchor = None,
+      }
+    }
+    advance
+  }
+
+  /// Install the deadline for the next §8.3 unsolicited response after a confirm
+  /// that reached at least one family.
+  ///
+  /// ONE composed rule covers every such confirm: **the phase's own schedule,
+  /// pulled in to whenever the stalest obligated family in good standing is next
+  /// owed a refresh, and never sooner than §8.3's one-second minimum.**
+  ///
+  /// The phase's own schedule is the §8.3 spacing — the doubling ladder while
+  /// announcing, the periodic refresh once `Established` — and the per-family
+  /// term is the TTL bound. Composing them subsumes two arms this used to need:
+  ///
+  /// * the honest-partial re-arm, which climbed the ladder to keep the served
+  ///   family's spacing legal but measured staleness per ROUND, so alternating
+  ///   families each fell a full interval behind;
+  /// * the excused re-arm, which REPLACED `Established`'s pre-armed periodic
+  ///   deadline with the earned rung so the missing family was not stranded a
+  ///   whole refresh interval away. A family in good standing now pulls the
+  ///   deadline in by itself, and one that has spent the core's patience is
+  ///   deliberately no longer chased — chasing it is what floods the healthy
+  ///   family at the one-second floor.
+  ///
+  /// `Established` is where the ladder retires: the announcement burst is over,
+  /// the periodic refresh is the rate limit, and the ladder's cap was that same
+  /// rate all along.
+  fn arm_announcement(&mut self, now: I, advance: PhaseAdvance) {
+    let ttl_secs = self.records.ttl_secs();
+    let base = match self.state {
+      ServiceState::Established => re_announce_deadline(now, ttl_secs),
+      ServiceState::Announcing(_) => match advance {
+        PhaseAdvance::Partial => {
+          partial_announce_deadline(now, self.partial_announce_streak, ttl_secs)
+        }
+        PhaseAdvance::Covered | PhaseAdvance::Excused if self.partial_announce_streak > 0 => {
+          partial_announce_deadline(now, self.partial_announce_streak, ttl_secs)
+        }
+        // A delivery, or an excusal off the bottom rung, keeps the schedule the
+        // phase change itself just armed.
+        _ => self.lifecycle_deadline,
+      },
+      _ => return,
+    };
+    let due = stalest_refresh_due(&self.last_delivered, &self.partial_rounds, ttl_secs);
+    self.lifecycle_deadline = compose_announce_deadline(now, base, due);
   }
 
   /// The [`TransmitObligation`] of the datagram whose commit token is currently
@@ -1536,13 +1629,21 @@ where
     }
   }
 
-  /// Convenience wrapper for a fully-delivered send — equivalent to
-  /// `note_transmit_outcome(now, TransmitOutcome::AllDelivered)`. Retained so
-  /// call sites (and tests) that always represent a successful send stay terse;
-  /// all advancement logic lives in [`Self::note_transmit_outcome`].
+  /// Convenience wrapper for a send BOTH families carried — equivalent to a
+  /// [`Self::note_transmit_outcome`] whose every family is
+  /// [`FamilyDelivery::Delivered`]. All advancement logic lives there.
+  ///
+  /// It asserts the strongest possible shape, so a caller that cannot honestly
+  /// say both families were obligated AND both accepted the datagram must build
+  /// the [`TransmitDelivery`] itself: this one anchors the per-family refresh
+  /// schedule on both families, which for a single-stack host would claim a
+  /// refresh on a family it does not have.
   #[inline]
   pub fn note_transmit_delivered(&mut self, now: I) {
-    self.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+    self.note_transmit_outcome(
+      now,
+      TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered),
+    );
   }
 
   /// Capture everything the endpoint needs to re-encode a TTL=0 goodbye for
@@ -1808,8 +1909,11 @@ where
     // A fresh name restarts the §8.3 announcement sequence at the bottom rung.
     self.partial_announce_streak = 0;
     // …and restarts the §8.1 sequence, so the patience already spent waiting for
-    // a lagging link under the OLD name may not excuse a probe of the new one.
-    self.partial_rounds = 0;
+    // a lagging family under the OLD name may not excuse a probe of the new one.
+    self.partial_rounds = [FamilyPatience::default(); 2];
+    // The NEW name has been announced to nobody, so no family is owed a refresh
+    // of it. Each is re-anchored by its first announcement round under this name.
+    self.last_delivered = [None, None];
     self.clear_response_cycle_state();
   }
 
@@ -2009,7 +2113,7 @@ where
         // cancelled when it first fully announced. A NEW same-name detached
         // goodbye cannot appear meanwhile — the endpoint's name guard rejects a
         // same-name registration while this service holds the route.
-        self.partial_rounds = 0;
+        self.partial_rounds = [FamilyPatience::default(); 2];
         self.clear_response_cycle_state();
         self.lifecycle_deadline = probe_deadline(now, 0, &mut self.rng);
       }
@@ -2595,7 +2699,7 @@ where
   ///
   /// A driver therefore does `poll_transmit` → send → `note_transmit_outcome` as
   /// one indivisible step. A send the transport cannot accept right now is
-  /// **dropped and confirmed** — `TransmitOutcome::NoneDelivered` — not parked:
+  /// **dropped and confirmed** — every family missed — not parked:
   /// every re-armed datagram is re-encoded from live state on the next poll, so
   /// dropping one costs nothing but the re-encode.
   ///

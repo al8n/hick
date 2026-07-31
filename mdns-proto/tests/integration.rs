@@ -6,7 +6,7 @@
 use std::{net::Ipv4Addr, time::Instant as StdInstant};
 
 use mdns_proto::{
-  CollectedAnswer, Name, Query, QueryHandle, Service, TransmitOutcome,
+  CollectedAnswer, FamilyDelivery, Name, Query, QueryHandle, Service, TransmitDelivery,
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec, ServiceSpec},
   endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
@@ -88,7 +88,10 @@ fn responder_advances_through_states_with_time() {
     now += Duration::from_millis(300);
     let _ = svc.handle_timeout(now);
     while svc.poll_transmit(now, &mut buf).unwrap().is_some() {
-      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+      svc.note_transmit_outcome(
+        now,
+        TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered),
+      );
     }
   }
   // After enough probe + announce ticks, we expect the service to have
@@ -194,7 +197,10 @@ fn service_emits_three_probes_before_announcement() {
       } else if hdr.flags().is_response() && hdr.answer_count() >= 1 {
         announcements_emitted = announcements_emitted.saturating_add(1);
       }
-      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+      svc.note_transmit_outcome(
+        now,
+        TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered),
+      );
     }
     if probes_emitted >= 3 {
       break;
@@ -220,7 +226,10 @@ fn service_emits_three_probes_before_announcement() {
       if hdr.flags().is_response() && hdr.answer_count() >= 1 {
         announcements_emitted = announcements_emitted.saturating_add(1);
       }
-      svc.note_transmit_outcome(now, TransmitOutcome::AllDelivered);
+      svc.note_transmit_outcome(
+        now,
+        TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered),
+      );
     }
     if announcements_emitted >= 1 {
       break;
@@ -247,7 +256,11 @@ fn query_polls_one_transmit_per_deadline() {
   assert!(tx1.is_some(), "expected first poll_transmit to return Some");
   // the retry is scheduled on a CONFIRMED delivery, not at encode
   // time. Confirm the send so the backoff deadline is armed.
-  e.note_query_transmit_outcome(h, now, TransmitOutcome::AllDelivered);
+  e.note_query_transmit_outcome(
+    h,
+    now,
+    TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered),
+  );
 
   // Second call immediately: transmit_pending is now false → None.
   let tx2 = e.poll_query_transmit(h, now, &mut buf).unwrap();

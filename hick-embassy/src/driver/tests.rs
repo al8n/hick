@@ -151,7 +151,7 @@ fn mdns_state_run_loop_pumps_over_a_v4_socket() {
 
 // ── Delivery-outcome behaviour over hick-embassy's own transport ────────────
 //
-// `hick-embassy` contributes exactly one input to the `TransmitOutcome` the
+// `hick-embassy` contributes exactly one input to the `TransmitDelivery` the
 // engine reports: which per-family `SendError` each socket produces. That single
 // mapping decides whether a family is in the obligated set at all — an absent
 // family (`Unsupported`) is not obligated, so a single-stack node is

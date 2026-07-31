@@ -1151,7 +1151,14 @@ fn multi_service_encode_failure_frees_route_even_with_sibling_transmit() {
         "any returned transmit must be from B, never from A (A's records won't encode)"
       );
       // Confirm B's delivery so B advances its probe/announce lifecycle.
-      s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered);
+      s.note_service_transmit_outcome(
+        h,
+        t,
+        mdns_proto::TransmitDelivery::new(
+          mdns_proto::FamilyDelivery::Delivered,
+          mdns_proto::FamilyDelivery::Delivered,
+        ),
+      );
     }
 
     // Check if A just escalated.
@@ -1315,7 +1322,14 @@ fn rename_collision_with_local_service_frees_proto_route() {
     loop {
       match s.poll_one_transmit(t, buf) {
         Some((_tx, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered);
+          s.note_service_transmit_outcome(
+            h,
+            t,
+            mdns_proto::TransmitDelivery::new(
+              mdns_proto::FamilyDelivery::Delivered,
+              mdns_proto::FamilyDelivery::Delivered,
+            ),
+          );
         }
         Some(_) => {}
         None => break,
@@ -1524,7 +1538,14 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
     loop {
       match s.poll_one_transmit(t, buf) {
         Some((_tx, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered);
+          s.note_service_transmit_outcome(
+            h,
+            t,
+            mdns_proto::TransmitDelivery::new(
+              mdns_proto::FamilyDelivery::Delivered,
+              mdns_proto::FamilyDelivery::Delivered,
+            ),
+          );
         }
         Some(_) => {}
         None => break,
@@ -1683,9 +1704,14 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_tx, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered)
-        }
+        Some((_tx, TransmitOrigin::Service(h))) => s.note_service_transmit_outcome(
+          h,
+          t,
+          mdns_proto::TransmitDelivery::new(
+            mdns_proto::FamilyDelivery::Delivered,
+            mdns_proto::FamilyDelivery::Delivered,
+          ),
+        ),
         Some(_) => {}
         None => break,
       }
@@ -1920,7 +1946,14 @@ fn a_query_dropped_mid_send_still_gets_its_confirm() {
     );
 
     // The send completes and the pump confirms.
-    s.note_query_transmit_outcome(h, now, TransmitOutcome::AllDelivered);
+    s.note_query_transmit_outcome(
+      h,
+      now,
+      mdns_proto::TransmitDelivery::new(
+        mdns_proto::FamilyDelivery::Delivered,
+        mdns_proto::FamilyDelivery::Delivered,
+      ),
+    );
     assert!(
       s.endpoint.poll_query_timeout(h).is_some(),
       "the confirm must resolve the live token and advance the §5.2 schedule — \
@@ -2372,7 +2405,14 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     loop {
       match s.poll_one_transmit(t, buf) {
         Some((_tx, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(h, t, TransmitOutcome::AllDelivered);
+          s.note_service_transmit_outcome(
+            h,
+            t,
+            mdns_proto::TransmitDelivery::new(
+              mdns_proto::FamilyDelivery::Delivered,
+              mdns_proto::FamilyDelivery::Delivered,
+            ),
+          );
         }
         Some(_) => {}
         None => break,
@@ -2472,7 +2512,7 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
   );
 }
 
-// ── The dual-stack delivery boundary (`TransmitOutcome`) ────────────────────
+// ── The dual-stack delivery boundary (`TransmitDelivery`) ───────────────────
 
 /// A minimal registerable service spec for the delivery-shape tests.
 fn delivery_test_spec(instance: &str) -> mdns_proto::ServiceSpec {
@@ -2488,8 +2528,9 @@ fn delivery_test_spec(instance: &str) -> mdns_proto::ServiceSpec {
   ServiceSpec::new(r)
 }
 
-/// Drain one service's due transmits at `t`, confirming each with `outcome`
-/// through the SAME seam the run loop uses. Returns how many were confirmed.
+/// Drain one service's due transmits at `t`, confirming each with `fanout`'s
+/// per-family result through the SAME seam the run loop uses. Returns how many
+/// were confirmed.
 fn confirm_service_round(
   s: &mut State,
   h: ServiceHandle,
@@ -2498,16 +2539,16 @@ fn confirm_service_round(
   fanout: Fanout,
 ) -> usize {
   s.fire_timeouts(t);
-  let outcome = fanout.transmit_outcome();
+  let delivery = fanout.delivery();
   let mut rounds = 0;
   while let Some((_tx, origin)) = s.poll_one_transmit(t, buf) {
     match origin {
       TransmitOrigin::Service(origin_h) if origin_h == h => {
-        s.note_service_transmit_outcome(h, t, outcome);
+        s.note_service_transmit_outcome(h, t, delivery);
         rounds += 1;
       }
-      TransmitOrigin::Service(other) => s.note_service_transmit_outcome(other, t, outcome),
-      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, outcome),
+      TransmitOrigin::Service(other) => s.note_service_transmit_outcome(other, t, delivery),
+      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, delivery),
     }
   }
   rounds
@@ -2515,8 +2556,8 @@ fn confirm_service_round(
 
 /// A dual-stack fan-out in which v4 carried the datagram and a BOUND v6 socket
 /// rejected it (`ENETUNREACH` and friends). Driving the behaviour tests from the
-/// per-family facts rather than a hand-fed [`TransmitOutcome`] keeps the
-/// projection inside the tested path.
+/// per-family facts rather than a hand-fed [`TransmitDelivery`] keeps the
+/// mapping inside the tested path.
 const PARTIAL_FANOUT: Fanout = Fanout {
   v4: FamilySend::Sent,
   v6: FamilySend::Failed,
@@ -2534,30 +2575,36 @@ const FAILED_FANOUT: Fanout = Fanout {
   v6: FamilySend::Failed,
 };
 
-/// The projection is a pure function of the per-family facts, and the obligated
-/// set is "every family that HAS a socket". The three rows that matter: an absent
-/// family is not obligated (a single-stack host advances at full speed), a
-/// present-but-failing one is, and an empty obligated set is `NoneDelivered` —
+/// The confirm is a pure, per-family function of the I/O facts, and the obligated
+/// set is "every family that HAS a socket". The rows that matter: an absent family
+/// is not obligated (a single-stack host advances at full speed), a
+/// present-but-failing one is, and an empty obligated set delivers to nobody —
 /// never a vacuous "all", which would let a torn-down endpoint advance its
 /// lifecycle on nothing.
+///
+/// WHICH family missed survives to the core, so it can schedule the next
+/// announcement per link. The two partial rows differ here; under the aggregate
+/// confirm they were the same value.
 #[test]
-fn the_fan_out_projects_onto_the_delivery_shape() {
+fn the_fan_out_reaches_the_core_per_family() {
   use FamilySend::{Failed, Sent, Unbound};
+  use mdns_proto::FamilyDelivery::{Delivered, Missed, Unobligated};
   let cases = [
-    (Sent, Sent, TransmitOutcome::AllDelivered),
-    (Sent, Unbound, TransmitOutcome::AllDelivered),
-    (Unbound, Sent, TransmitOutcome::AllDelivered),
-    (Sent, Failed, TransmitOutcome::PartiallyDelivered),
-    (Failed, Sent, TransmitOutcome::PartiallyDelivered),
-    (Failed, Failed, TransmitOutcome::NoneDelivered),
-    (Failed, Unbound, TransmitOutcome::NoneDelivered),
-    (Unbound, Unbound, TransmitOutcome::NoneDelivered),
+    (Sent, Sent, Delivered, Delivered),
+    (Sent, Unbound, Delivered, Unobligated),
+    (Unbound, Sent, Unobligated, Delivered),
+    (Sent, Failed, Delivered, Missed),
+    (Failed, Sent, Missed, Delivered),
+    (Failed, Failed, Missed, Missed),
+    (Failed, Unbound, Missed, Unobligated),
+    (Unbound, Unbound, Unobligated, Unobligated),
   ];
-  for (v4, v6, want) in cases {
+  for (v4, v6, want_v4, want_v6) in cases {
+    let delivery = Fanout { v4, v6 }.delivery();
     assert_eq!(
-      Fanout { v4, v6 }.transmit_outcome(),
-      want,
-      "({v4:?}, {v6:?}) must project onto {want:?}"
+      (delivery.v4(), delivery.v6()),
+      (want_v4, want_v6),
+      "({v4:?}, {v6:?}) must reach the core as ({want_v4}, {want_v6})"
     );
   }
 }
@@ -2884,10 +2931,13 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   .await;
 
   assert_eq!(
-    fanout.transmit_outcome(),
-    TransmitOutcome::AllDelivered,
-    "a §6.7 reply has exactly one obligated link, so it is all-or-none by \
-     construction"
+    fanout.delivery(),
+    mdns_proto::TransmitDelivery::new(
+      mdns_proto::FamilyDelivery::Delivered,
+      mdns_proto::FamilyDelivery::Unobligated,
+    ),
+    "a §6.7 reply obligates exactly the destination's family; the other one was \
+     never offered the datagram and must not read as a miss"
   );
   assert!(
     inner.state.borrow().recent_sends.is_empty(),
@@ -2924,15 +2974,15 @@ fn confirm_service_round_mixed(
     } else {
       UNICAST_FANOUT
     };
-    let outcome = fanout.transmit_outcome();
+    let delivery = fanout.delivery();
     match origin {
       TransmitOrigin::Service(origin_h) => {
-        s.note_service_transmit_outcome(origin_h, t, outcome);
+        s.note_service_transmit_outcome(origin_h, t, delivery);
         if origin_h == h {
           rounds += 1;
         }
       }
-      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, outcome),
+      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, delivery),
     }
   }
   rounds

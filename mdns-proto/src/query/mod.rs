@@ -7,8 +7,8 @@ use crate::{
   backend::RdataBuf,
   error::{HandleTimeoutError, TransmitError},
   event::{QueryEvent, QueryUpdate},
-  service::{PhaseAdvance, classify_advance},
-  transmit::{Transmit, TransmitObligation, TransmitOutcome},
+  service::{FamilyPatience, PhaseAdvance, classify_advance},
+  transmit::{Transmit, TransmitObligation, TransmitDelivery},
   wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
 };
 
@@ -165,15 +165,21 @@ pub struct Query<I, AN, EV> {
   /// at least a factor of two"; a fully-failed send reaches no wire and so
   /// neither uses nor advances this.
   partial_send_streak: u32,
-  /// Consecutive `PartiallyDelivered` sends since the last budget advance — the
-  /// core's own patience, bounded by `MAX_PARTIAL_ROUNDS`. A partial send
-  /// freezes the §5.2 budget, so without the bound a half-reachable link would
-  /// keep a question re-asking on the growing partial interval and the query
-  /// would never reach its terminal timeout. Reaching the bound EXCUSES that link
-  /// for one confirm and the budget advances. Reset by a fully-delivered send and
-  /// by the excusal itself; left ALONE by a wholly-failed one (see
+  /// Per family ([0] = v4, [1] = v6): consecutive sends in which THAT family was
+  /// obligated and missed a question some other family carried — the core's own
+  /// patience, bounded by `MAX_PARTIAL_ROUNDS`. A partial send freezes the §5.2
+  /// budget, so without the bound a half-reachable family would keep a question
+  /// re-asking on the growing partial interval and the query would never reach its
+  /// terminal timeout. Once EVERY missing family has spent the bound the send is
+  /// excused and the budget advances. Reset by that family's own delivery and by it
+  /// ceasing to be obligated; left ALONE by a wholly-failed round (see
   /// [`classify_advance`]).
-  partial_rounds: u8,
+  ///
+  /// A query takes per-family PATIENCE and nothing else from the per-family
+  /// confirm. It has no §5.2 requery scheduler and races no record TTL — the cache
+  /// refreshes on receive — so there is no per-family staleness for it to anchor
+  /// on, and its backoff stays measured from confirm time.
+  partial_rounds: [FamilyPatience; 2],
   /// When `true`, questions are emitted with the QU bit set (RFC 6762 §5.4):
   /// the sender prefers a unicast response rather than a multicast one.
   unicast_response: bool,
@@ -235,7 +241,7 @@ where
       transmit_pending: true,
       awaiting_send_confirm: false,
       partial_send_streak: 0,
-      partial_rounds: 0,
+      partial_rounds: [FamilyPatience::default(); 2],
       unicast_response,
       timeout_deadline,
       #[cfg(test)]
@@ -609,7 +615,7 @@ where
   /// A terminal transition is a state mutation like any other, so it is bound by
   /// the same confirm-before-anything contract (see [`Self::poll_transmit`]): the
   /// driver must resolve an outstanding datagram's commit token — a datagram it
-  /// cannot send is [`TransmitOutcome::NoneDelivered`](crate::transmit::TransmitOutcome::NoneDelivered)
+  /// cannot send is a confirm no family delivered
   /// — before retiring the query that produced it.
   pub(crate) fn retire(&mut self) {
     self.assert_no_live_send_confirm("Endpoint::retire_query");
@@ -634,7 +640,7 @@ where
   ///
   /// A driver therefore does `poll_transmit` → send → `note_transmit_outcome` as
   /// one indivisible step, and a send the transport cannot accept right now is
-  /// dropped and confirmed [`NoneDelivered`](TransmitOutcome::NoneDelivered)
+  /// dropped and confirmed as delivered by no family
   /// rather than parked — nothing is lost, because a re-armed question is
   /// re-encoded from live state on the next poll.
   ///
@@ -702,7 +708,7 @@ where
   /// Must be called before ANY other state-mutating entry point for this query —
   /// see [`Self::poll_transmit`] for the ordering contract.
   ///
-  /// The §5.2 retry BUDGET advances iff [`TransmitOutcome::all_delivered`] — a
+  /// The §5.2 retry BUDGET advances iff [`TransmitDelivery::all_delivered`] — a
   /// question that reached only some of the links the driver fans it onto has
   /// not been asked everywhere, so spending a retry slot for it would time the
   /// query out having never queried the missing link.
@@ -725,7 +731,7 @@ where
   /// EXCUSED and spends a slot — but takes none of the credit a delivery earns:
   /// the §5.2 ladder is carried across the excuse point rather than reset, so the
   /// served link never sees a shorter interval than the one before it.
-  pub fn note_transmit_outcome(&mut self, now: I, outcome: TransmitOutcome) {
+  pub fn note_transmit_outcome(&mut self, now: I, delivery: TransmitDelivery) {
     if !self.awaiting_send_confirm {
       return;
     }
@@ -738,13 +744,13 @@ where
     if self.done {
       return;
     }
-    match classify_advance(&mut self.partial_rounds, outcome) {
+    match classify_advance(&mut self.partial_rounds, delivery) {
       PhaseAdvance::Delivered => {
         self.retry_count = self.retry_count.saturating_add(1);
         self.partial_send_streak = 0;
         self.next_deadline = retry::next_deadline(now, self.retry_count);
       }
-      PhaseAdvance::Excused => {
+      PhaseAdvance::Covered | PhaseAdvance::Excused => {
         // The slot is spent so the query can progress to its terminal, but the
         // send was NOT delivered everywhere: the ladder keeps climbing from where
         // it stood rather than resetting to the bottom rung. Indexing the backoff
@@ -822,7 +828,7 @@ where
     // into a slot that met its own, so the next genuine partial could be EXCUSED
     // early — spending a retry slot for a link that was never asked.
     self.partial_send_streak = 0;
-    self.partial_rounds = 0;
+    self.partial_rounds = [FamilyPatience::default(); 2];
     if self.retry_count > MAX_RETRIES {
       // Budget spent (counting suppressed slots as our sends) — retire exactly
       // as `handle_timeout` would after the final retransmit. Route through

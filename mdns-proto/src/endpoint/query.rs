@@ -214,7 +214,7 @@ where
   /// [`Self::poll_query_transmit`] for `handle`.
   ///
   /// The query advances its RFC 6762 §5.2 retry budget only on
-  /// [`TransmitOutcome::all_delivered`]; a partially-delivered question climbs
+  /// [`TransmitDelivery::all_delivered`]; a partially-delivered question climbs
   /// the §5.2 doubling ladder without spending a slot. See
   /// [`Query::note_transmit_outcome`] for the full contract. No-op for an
   /// unknown handle.
@@ -222,13 +222,13 @@ where
     &mut self,
     handle: QueryHandle,
     now: I,
-    outcome: TransmitOutcome,
+    delivery: TransmitDelivery,
   ) {
     let Some(key) = self.query_key(handle) else {
       return;
     };
     if let Some(q) = self.queries.get_mut(key) {
-      q.note_transmit_outcome(now, outcome);
+      q.note_transmit_outcome(now, delivery);
     }
   }
 
