@@ -138,7 +138,7 @@ pub mod service;
 pub use service::ServiceState;
 
 cfg_heap! {
-  pub use service::{FullyAnnounced, LateWireFacts, Service};
+  pub use service::{FullyAnnounced, Service};
 
   /// Query state machine.
   pub mod query;

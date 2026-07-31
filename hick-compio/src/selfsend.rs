@@ -42,30 +42,13 @@ pub(crate) enum MatchMode {
 /// FNV-1a hash and the body length, so a hash collision alone can't consume a
 /// credit.
 pub(crate) fn record_self_send(tracker: &mut SelfSends, body: &[u8], sent: SystemTime) {
-  record_self_send_hashed(tracker, credit_of(body), sent);
-}
-
-/// The `(hash, length)` credit key for a datagram, computed up front so a send
-/// whose completion is observed later does not have to keep the body alive to
-/// record it. The tracker never stores the bytes themselves — only this key and
-/// the send time — so nothing is lost by hashing early.
-pub(crate) fn credit_of(body: &[u8]) -> (u64, u32) {
-  (fnv1a(body), body.len() as u32)
-}
-
-/// [`record_self_send`] for a credit key already computed by [`credit_of`].
-pub(crate) fn record_self_send_hashed(
-  tracker: &mut SelfSends,
-  credit: (u64, u32),
-  sent: SystemTime,
-) {
   tracker.retain(|(_, _, t)| {
     sent
       .duration_since(*t)
       .is_ok_and(|age| age <= SELF_SEND_TTL)
   });
   if tracker.len() < MAX_SELF_SEND_ENTRIES {
-    tracker.push((credit.0, credit.1, sent));
+    tracker.push((fnv1a(body), body.len() as u32, sent));
   }
 }
 

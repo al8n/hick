@@ -109,6 +109,35 @@ update to the [`metrics`] facade automatically.
 - Handles (`Query`, `Service`, `Lookup`) hold `Rc<EndpointInner>` and borrow
   shared state directly under short, non-`.await` borrows.
 
+## Send semantics, and their limitation
+
+`hick-compio` submits sends to a completion-based kernel interface and **awaits
+every operation to its true completion** — compio cannot reliably cancel a
+submitted operation, so bounding the wait would mean acting on datagrams whose
+fate is unknown.
+
+The contract that follows:
+
+- every submitted operation is awaited to completion before its round confirms;
+- driver latency equals kernel completion latency;
+- a completion the kernel never delivers stalls the driver visibly, without
+  corrupting peer caches.
+
+The consequence, stated plainly: if the kernel never completes a send — a
+pathological state for UDP, since it requires permanently backpressured local
+buffers — the driver task stalls entirely, including its shutdown goodbye flush,
+and is reclaimed only at runtime teardown. A fan-out pending far longer than any
+healthy send is traced, so such a stall is diagnosable rather than silent.
+Transient send stalls simply delay the loop by their own duration; RFC 6762's
+schedules tolerate this and the core recomputes on resume. At runtime teardown a
+still-pending operation is dropped with the task; a datagram that later reaches
+the wire is bounded by record TTLs, exactly as a host crash is.
+
+[`hick-reactor`] bounds each attempt instead. That is correct there and is not an
+inconsistency: it drives readiness I/O, where abandoning an attempt abandons a
+future whose last syscall returned `WouldBlock` — nothing was submitted, so its
+cancellation is definitive.
+
 ## The hick family
 
 [`hick`] (facade) · [`mdns-proto`] (Sans-I/O core) · [`hick-udp`] (UDP) ·

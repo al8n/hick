@@ -395,7 +395,7 @@ fn begin_service_withdrawal_holds_name_then_frees_on_completion() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok, _)) = s.poll_one_withdrawal(t, &mut scratch) {
+    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
       // No sockets bound in this State-level test: model BOTH families as
       // transiently undeliverable (Retry) so the per-family budget stays intact
       // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
@@ -764,7 +764,7 @@ fn same_name_replacement_is_rejected_until_withdrawal_completes() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok, _)) = s.poll_one_withdrawal(t, &mut scratch) {
+    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
       // No sockets bound in this State-level test: model BOTH families as
       // transiently undeliverable (Retry) so the per-family budget stays intact
       // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
@@ -1424,7 +1424,7 @@ fn rename_collision_with_local_service_frees_proto_route() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok, _)) = s.poll_one_withdrawal(t, &mut scratch) {
+    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
       // No sockets bound in this State-level test: model BOTH families as
       // transiently undeliverable (Retry) so the per-family budget stays intact
       // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
@@ -1646,7 +1646,7 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok, _)) = s.poll_one_withdrawal(t, &mut scratch) {
+    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
       // No sockets bound in this State-level test: model BOTH families as
       // transiently undeliverable (Retry) so the per-family budget stays intact
       // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
@@ -1805,7 +1805,7 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   let mut gced = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok, _)) = s.poll_one_withdrawal(t, &mut scratch) {
+    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
       s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
     }
     s.drain_completed_withdrawals(t);
@@ -2843,7 +2843,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
 
   // Goodbye round 1 reaches v4 only: IPv6's debt is still outstanding, which is
   // exactly what a premature cancel would throw away.
-  let (_, _, token, _) = s
+  let (_, _, token) = s
     .poll_one_withdrawal(t, &mut buf)
     .expect("the renamed-away old name must have a detached goodbye pending");
   s.note_withdrawal_result(token, t, WithdrawalSend::Sent, WithdrawalSend::Retry);
@@ -2927,7 +2927,6 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   let sock_v4 = Some(Rc::new(sender));
   let sock_v6: Option<Rc<Socket>> = None;
 
-  let mut detached = Vec::new();
   let (fanout, accepted_at) = send_via(
     &inner,
     &sock_v4,
@@ -2938,14 +2937,8 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
     &mut FamilyWireGate::default(),
     Duration::ZERO,
     StdInstant::now(),
-    MAX_DETACHED_SENDS,
-    &mut detached,
   )
   .await;
-  assert!(
-    detached.is_empty(),
-    "a loopback socket answers well inside the bound, so nothing is detached"
-  );
 
   assert!(
     accepted_at.is_some(),
@@ -2967,7 +2960,7 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   );
 }
 
-// ── The wedged family (per-family send bound) ───────────────────────────────
+// ── The per-family wire gate ────────────────────────────────────────────────
 
 /// What `Transmit::min_family_gap()` carries for an RFC 6762 §8.3 unsolicited
 /// announcement — the one-second floor §6 puts on re-multicasting a record on the
@@ -3027,212 +3020,6 @@ fn the_wire_gate_holds_each_kind_to_its_own_minimum() {
   assert!(
     ungated.open(FAMILY_V4, t0, ANNOUNCE_MIN_FAMILY_GAP),
     "a one-shot send does not start the clock on the next announcement"
-  );
-}
-
-/// How a [`TestSocket`] answers a send.
-#[derive(Clone, Copy)]
-enum SendBehaviour {
-  /// Accepts immediately without touching the kernel, so the fan-out's timing is
-  /// the test's rather than the host's routing table.
-  Accepts,
-  /// Never completes — the family whose transport is wedged. This is the case no
-  /// bound UDP socket can be coaxed into on a real host, and the only one that
-  /// distinguishes a bounded attempt from an unbounded one.
-  Wedged,
-}
-
-/// A socket whose write side is scripted.
-struct TestSocket(SendBehaviour);
-
-impl SendDatagram for TestSocket {
-  fn send_datagram(self: Rc<Self>, body: std::vec::Vec<u8>, _dst: SocketAddr) -> SendOp {
-    let behaviour = self.0;
-    let n = body.len();
-    Box::pin(async move {
-      match behaviour {
-        SendBehaviour::Accepts => Ok(n),
-        SendBehaviour::Wedged => core::future::pending::<std::io::Result<usize>>().await,
-      }
-    })
-  }
-}
-
-/// Fan one multicast datagram out to a healthy v4 and a wedged v6, returning the
-/// instant the fan-out STARTED (a lower bound on v4's true acceptance, taken
-/// independently of what the fan-out reports), the fan-out, the acceptance
-/// instant the confirm must use, and how long the whole fan-out took.
-async fn wedged_v6_round(
-  inner: &Rc<EndpointInner>,
-  body: &[u8],
-  admit: usize,
-  detached: &mut Vec<ParkedOp>,
-) -> (StdInstant, Fanout, Option<StdInstant>, Duration) {
-  let sock_v4 = Some(Rc::new(TestSocket(SendBehaviour::Accepts)));
-  let sock_v6 = Some(Rc::new(TestSocket(SendBehaviour::Wedged)));
-
-  let started = StdInstant::now();
-  let mut gate = FamilyWireGate::default();
-  let (fanout, accepted_at) = compio::time::timeout(
-    SEND_ATTEMPT_TIMEOUT * 20,
-    send_via(
-      inner,
-      &sock_v4,
-      &sock_v6,
-      MDNS_V4_DST,
-      body,
-      &mut gate,
-      ANNOUNCE_MIN_FAMILY_GAP,
-      started,
-      admit,
-      detached,
-    ),
-  )
-  .await
-  .expect(
-    "a family that never completes must not park the fan-out: the driver loop \
-     cannot service a timer, a dropped handle, or any other family's transmit \
-     while it is suspended here",
-  );
-  (started, fanout, accepted_at, started.elapsed())
-}
-
-/// A wedged family must be given up on within the per-family bound, and must not
-/// move the healthy family's acceptance instant.
-///
-/// Both halves are the same defect seen from two sides. Serially awaiting an
-/// unbounded send suspends the whole driver task, so nothing else the loop owns
-/// runs; and confirming at post-fan-out time records the family that accepted at
-/// `t0` as having been served when the wedged one finally gave up, which is a lie
-/// about how fresh that family's peers are.
-#[compio::test]
-async fn a_wedged_family_is_bounded_and_leaves_the_healthy_anchor_alone() {
-  let inner = Rc::new(EndpointInner::new(
-    mdns_proto::EndpointConfig::default(),
-    1500,
-    9000,
-  ));
-  let mut detached = Vec::new();
-  let (started, fanout, accepted_at, elapsed) =
-    wedged_v6_round(&inner, b"announcement", MAX_DETACHED_SENDS, &mut detached).await;
-
-  assert_eq!(
-    fanout.delivery(),
-    mdns_proto::TransmitDelivery::new(
-      mdns_proto::FamilyDelivery::Delivered,
-      mdns_proto::FamilyDelivery::Missed,
-    ),
-    "the wedged family put nothing on its wire that anything observed, so the \
-     core must be told it missed — never that it was unobligated or that it \
-     carried the datagram"
-  );
-  assert!(
-    elapsed < SEND_ATTEMPT_TIMEOUT * 4,
-    "the fan-out must return once the bound expires; it took {elapsed:?}"
-  );
-
-  let anchor = accepted_at.expect("the healthy family accepted the datagram");
-  assert!(
-    anchor.saturating_duration_since(started) < SEND_ATTEMPT_TIMEOUT,
-    "the anchor must be the healthy family's OWN acceptance instant, not a time \
-     read after the wedged family's bound expired"
-  );
-  assert_eq!(
-    inner.state.borrow().recent_sends.len(),
-    1,
-    "one credit for the one family that actually sent; a wedged family's op is \
-     cancelled, so a credit for it could only ever suppress a genuine peer packet"
-  );
-}
-
-/// The consequence the anchor exists for: a wedged family must not push the
-/// healthy family's next refresh beyond the TTL its records were published with.
-///
-/// Run at [`mdns_proto::constants::MIN_SERVICE_TTL_SECS`], where the slack
-/// between the periodic refresh interval (`max(0.8 · TTL, 1 s)` = 1 s) and the
-/// TTL itself is at its smallest, so the bound has the least room it will ever
-/// have.
-#[compio::test]
-async fn a_wedged_family_cannot_push_the_healthy_refresh_past_its_ttl() {
-  const TTL_SECS: u32 = mdns_proto::constants::MIN_SERVICE_TTL_SECS;
-  /// `max(0.8 · TTL, RFC 6762 §8.3's one second)` at that TTL.
-  const REFRESH: Duration = Duration::from_secs(1);
-
-  let inner = Rc::new(EndpointInner::new(
-    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
-    1500,
-    9000,
-  ));
-  // One periodic refresh in which v6 has wedged, taken first so the service's
-  // schedule can be laid out around the acceptance instant it reports.
-  let mut detached = Vec::new();
-  let (started, fanout, accepted_at, _) =
-    wedged_v6_round(&inner, b"refresh", MAX_DETACHED_SENDS, &mut detached).await;
-  let anchor = accepted_at.expect("v4 accepted the refresh");
-  let base = anchor
-    .checked_sub(Duration::from_secs(3))
-    .expect("the monotonic clock is at least a few seconds old");
-
-  let mut s = State::new(
-    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
-    1500,
-    9000,
-  );
-  let mut records = mdns_proto::ServiceRecords::new(
-    mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
-    mdns_proto::Name::try_from_str("wedged._ipp._tcp.local.").unwrap(),
-    mdns_proto::Name::try_from_str("wedged.local.").unwrap(),
-    631,
-    TTL_SECS,
-  );
-  records.add_a([192, 168, 1, 10].into());
-  let h = s
-    .test_register_service(mdns_proto::ServiceSpec::new(records), base)
-    .unwrap();
-  let mut buf = std::vec![0u8; 4096];
-
-  // Two whole announcements reach Established, so the periodic refresh is the
-  // schedule under test and it is already due at `anchor`.
-  confirm_service_round(&mut s, h, base, &mut buf, WHOLE_FANOUT);
-  confirm_service_round(
-    &mut s,
-    h,
-    base + Duration::from_secs(1),
-    &mut buf,
-    WHOLE_FANOUT,
-  );
-  assert_eq!(
-    s.services[&h].proto.state(),
-    mdns_proto::service::ServiceState::Established
-  );
-
-  // Confirm the wedged round with exactly what the fan-out reported, the way the
-  // run loop's transmit pump does.
-  s.fire_timeouts(anchor);
-  assert!(
-    s.poll_one_transmit(anchor, &mut buf).is_some(),
-    "the periodic re-announce must be due"
-  );
-  s.note_service_transmit_outcome(h, anchor, fanout.delivery());
-
-  let due = s.services[&h].proto.poll_timeout().expect("re-armed");
-  assert!(
-    due.saturating_duration_since(anchor) <= REFRESH,
-    "the core arms the next announcement one refresh interval after the confirm"
-  );
-  // Measured from a clock read the fan-out never touched, so a confirm instant
-  // that had absorbed the wedged family's bound cannot hide inside it.
-  let gap = due.saturating_duration_since(started);
-  assert!(
-    gap < REFRESH + SEND_ATTEMPT_TIMEOUT / 2,
-    "v4's gap is measured from ITS OWN acceptance, so a family that never \
-     accepted may add nothing to it; v4's next announcement was due {gap:?} after \
-     the fan-out began, against a refresh interval of {REFRESH:?}"
-  );
-  assert!(
-    gap < Duration::from_secs(u64::from(TTL_SECS)),
-    "…which is what keeps v4's peers from expiring these records: they hold them \
-     for {TTL_SECS} s from that same instant"
   );
 }
 
@@ -3353,485 +3140,5 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
   assert!(
     !s.services[&h].proto.has_fully_announced().get(),
     "an all-delivered UNICAST reply is still not a complete announcement"
-  );
-}
-
-// ── The wire that outlives the round (uncancellable completion-based sends) ──
-
-/// compio's `Proactor::cancel` documents that "the cancellation is not reliable —
-/// the underlying operation may continue", so a send this driver stopped waiting
-/// for may still reach a wire. Until it resolves, the name it advertises is not
-/// safe to snapshot a §10.1 goodbye for: `withdrawal_snapshot` reports only what a
-/// confirm has LATCHED, so a snapshot taken now is short by exactly the records
-/// that datagram is about to place in peer caches — and their TTLs would only
-/// START at that late transmission, so the exposure would outlive the goodbye
-/// that exists to bound it.
-#[test]
-fn an_unresolved_name_defers_its_teardown_snapshot_until_the_wire_resolves() {
-  let mut s = State::new(mdns_proto::EndpointConfig::new(), 1500, 9000);
-  let t0 = std::time::Instant::now();
-  let h = s
-    .test_register_service(delivery_test_spec("Pinned"), t0)
-    .unwrap();
-  let t = establish_service(&mut s, h, t0);
-  let name = s.services[&h].proto.name().clone();
-
-  // A datagram advertising this name is still on the wire.
-  s.unresolved_wire_names.push(name.clone());
-  assert!(s.wire_unresolved(&name));
-
-  s.flag_service_unregistered(h);
-  s.sweep_cancelled_services(t);
-  assert!(
-    s.services.get(&h).is_some_and(|c| c.errored),
-    "the service stops serving immediately — it is retiring either way"
-  );
-  assert!(
-    s.services.get(&h).is_some_and(|c| c.withdrawal_deferred),
-    "…but its goodbye snapshot waits for the wire"
-  );
-  let mut scratch = vec![0u8; 4096];
-  assert!(
-    s.poll_one_withdrawal(t, &mut scratch).is_none(),
-    "no goodbye may be encoded from a snapshot that would be short"
-  );
-
-  // The wire resolves.
-  s.unresolved_wire_names.clear();
-  assert!(
-    s.begin_deferred_withdrawals(t),
-    "the deferred teardown proceeds the instant the name is off the wire"
-  );
-  assert!(
-    !s.services.get(&h).is_some_and(|c| c.withdrawal_deferred),
-    "…and is no longer deferred"
-  );
-  assert!(
-    s.poll_one_withdrawal(t, &mut scratch).is_some(),
-    "the goodbye is now due, built from a complete snapshot"
-  );
-}
-
-/// The gate is a HOLD on the route as well as the item, and the 2 s
-/// `WITHDRAWAL_CEILING` does not override it: that ceiling bounds goodbye
-/// SCHEDULING — how long an unreachable family keeps a name pinned waiting for
-/// resends it will never make — and a datagram whose fate is unknown is not a
-/// scheduling question. Freeing the route here is what lets a same-name
-/// replacement register into the path of a late TTL=0 goodbye that then erases
-/// the REPLACEMENT's records.
-#[test]
-fn an_unresolved_name_holds_its_route_past_the_two_second_ceiling() {
-  let mut s = State::new(
-    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
-    1500,
-    9000,
-  );
-  let t0 = std::time::Instant::now();
-  let h = s
-    .test_register_service(delivery_test_spec("Held"), t0)
-    .unwrap();
-  let mut t = establish_service(&mut s, h, t0);
-  let name = s.services[&h].proto.name().clone();
-
-  // Teardown begins cleanly (nothing outstanding yet), then a goodbye datagram
-  // is submitted and does not resolve.
-  s.flag_service_unregistered(h);
-  s.sweep_cancelled_services(t);
-  let mut scratch = vec![0u8; 4096];
-  let (_, _, tok, item_name) = s
-    .poll_one_withdrawal(t, &mut scratch)
-    .expect("the first goodbye round is due immediately");
-  assert_eq!(
-    item_name.as_str(),
-    name.as_str(),
-    "the pump reports the name so the fan-out can pin it"
-  );
-  s.unresolved_wire_names.push(item_name);
-  s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
-
-  // Well past the ceiling, and past the final-attempt window.
-  for _ in 0..64 {
-    t += Duration::from_millis(250);
-    while let Some((_, _, tok, _)) = s.poll_one_withdrawal(t, &mut scratch) {
-      s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
-    }
-    s.drain_completed_withdrawals(t);
-  }
-  assert!(
-    s.services.contains_key(&h),
-    "the route must still be held while a goodbye for its name is unresolved"
-  );
-  assert!(
-    matches!(
-      s.test_register_service(delivery_test_spec("Held"), t),
-      Err(mdns_proto::error::RegisterServiceError::NameAlreadyRegistered(_))
-    ),
-    "…so no replacement can register into the path of that datagram"
-  );
-
-  // The wire resolves: the hold lifts on the very next drain.
-  s.unresolved_wire_names.clear();
-  s.drain_completed_withdrawals(t);
-  assert!(
-    !s.services.contains_key(&h),
-    "the gate is a hold, not a cancel — the route is freed once the wire answers"
-  );
-  s.test_register_service(delivery_test_spec("Held"), t)
-    .expect("the name is re-registerable once nothing unresolved carries it");
-}
-
-/// The restrictive edge. A gate on "any unresolved send" would wedge every
-/// service's teardown behind one wedged socket, which is a liveness bug traded for
-/// a correctness one. It keys on the instance NAME.
-#[test]
-fn a_pin_on_one_name_leaves_another_services_teardown_alone() {
-  let mut s = State::new(mdns_proto::EndpointConfig::new(), 1500, 9000);
-  let t0 = std::time::Instant::now();
-  let wedged = s
-    .test_register_service(delivery_test_spec("Wedged"), t0)
-    .unwrap();
-  let healthy = s
-    .test_register_service(delivery_test_spec("Healthy"), t0)
-    .unwrap();
-  let t = establish_service(&mut s, wedged, t0);
-  let t = establish_service(&mut s, healthy, t);
-
-  s.unresolved_wire_names
-    .push(s.services[&wedged].proto.name().clone());
-
-  s.flag_service_unregistered(wedged);
-  s.flag_service_unregistered(healthy);
-  s.sweep_cancelled_services(t);
-
-  assert!(
-    s.services
-      .get(&wedged)
-      .is_some_and(|c| c.withdrawal_deferred),
-    "the pinned service waits"
-  );
-  assert!(
-    !s.services
-      .get(&healthy)
-      .is_some_and(|c| c.withdrawal_deferred),
-    "a service whose own name is resolved tears down on schedule, whatever any \
-     other service's wire is doing"
-  );
-}
-
-/// The sharper of the two hazards, and the one that needs no name guard at all:
-/// one unresolved positive-TTL datagram plus a normal unregister. Without the
-/// gate the goodbye is built from a snapshot taken before the datagram landed, so
-/// peers end up holding a dead service's records for a full TTL with NO owner —
-/// nothing will ever retract them.
-///
-/// With the gate the snapshot waits, the late arrival latches ownership through
-/// the core's wire-fact intake, and the goodbye that is finally built covers the
-/// records that really are out there.
-#[test]
-fn a_late_positive_ttl_arrival_is_covered_by_the_goodbye_it_preceded() {
-  let mut s = State::new(mdns_proto::EndpointConfig::new(), 1500, 9000);
-  let t0 = std::time::Instant::now();
-  let h = s
-    .test_register_service(delivery_test_spec("Late"), t0)
-    .unwrap();
-  let mut t = establish_service(&mut s, h, t0);
-
-  // Drive the service back to a state where nothing is latched, so the late
-  // arrival is the ONLY thing that could put records in a peer cache.
-  let (facts, name) = {
-    let ctx = s.services.get_mut(&h).unwrap();
-    // A fresh announcement round whose every family missed.
-    t += Duration::from_secs(120);
-    let _ = ctx.proto.handle_timeout(t);
-    let mut buf = vec![0u8; 4096];
-    ctx
-      .proto
-      .poll_transmit(t, &mut buf)
-      .unwrap()
-      .expect("the periodic re-announce is due");
-    let facts = ctx
-      .proto
-      .late_wire_facts()
-      .expect("a live commit token always has wire facts");
-    let name = facts.instance().clone();
-    ctx.proto.note_transmit_outcome(
-      t,
-      mdns_proto::TransmitDelivery::new(
-        mdns_proto::FamilyDelivery::Missed,
-        mdns_proto::FamilyDelivery::Missed,
-      ),
-    );
-    (facts, name)
-  };
-
-  // The operation is still outstanding when the handle drops.
-  s.unresolved_wire_names.push(name.clone());
-  s.flag_service_unregistered(h);
-  s.sweep_cancelled_services(t);
-  assert!(
-    s.services.get(&h).is_some_and(|c| c.withdrawal_deferred),
-    "the teardown must wait for the wire"
-  );
-
-  // …and only now does the driver learn it reached a wire.
-  s.note_late_wire_delivery(t, facts);
-  s.unresolved_wire_names.clear();
-  assert!(
-    s.begin_deferred_withdrawals(t),
-    "the deferred teardown proceeds once the wire resolves"
-  );
-
-  let mut scratch = vec![0u8; 4096];
-  let (_, len, _, goodbye_name) = s
-    .poll_one_withdrawal(t, &mut scratch)
-    .expect("the late arrival's records must be withdrawn, not stranded");
-  assert_eq!(goodbye_name.as_str(), name.as_str());
-  assert!(
-    len > 0,
-    "the goodbye must carry the records the late datagram exposed"
-  );
-}
-
-/// A socket whose write side is scripted with a real delay, so a send can be
-/// observed to complete AFTER the round that produced it gave up on it.
-struct SlowSocket(Duration);
-
-impl SendDatagram for SlowSocket {
-  fn send_datagram(self: Rc<Self>, body: std::vec::Vec<u8>, _dst: SocketAddr) -> SendOp {
-    let delay = self.0;
-    let n = body.len();
-    Box::pin(async move {
-      compio::time::sleep(delay).await;
-      Ok(n)
-    })
-  }
-}
-
-/// The premise, asserted directly: an operation the round stopped waiting for is
-/// HANDED BACK rather than dropped. Dropping it would ask compio to cancel, which
-/// it explicitly does not promise to do — so the datagram's fate would become
-/// permanently unknown while the bytes went out anyway.
-#[compio::test]
-async fn an_unfinished_send_is_detached_rather_than_cancelled() {
-  let inner = Rc::new(EndpointInner::new(
-    mdns_proto::EndpointConfig::default(),
-    1500,
-    9000,
-  ));
-  let mut detached = Vec::new();
-  let (_, fanout, accepted_at, _) =
-    wedged_v6_round(&inner, b"announcement", MAX_DETACHED_SENDS, &mut detached).await;
-
-  assert_eq!(
-    fanout.delivery(),
-    mdns_proto::TransmitDelivery::new(
-      mdns_proto::FamilyDelivery::Delivered,
-      mdns_proto::FamilyDelivery::Missed,
-    ),
-    "the confirm is on time and conservative: nothing observed v6 carry it"
-  );
-  assert!(
-    accepted_at.is_some(),
-    "the healthy family's own acceptance still anchors the schedule"
-  );
-  assert_eq!(
-    detached.len(),
-    1,
-    "the wedged family's operation is handed back to be kept alive, not dropped"
-  );
-}
-
-/// A wedged family must not starve the healthy one. One producer serves BOTH, so
-/// a confirm that waited for v6 would hold back the very v4 refresh whose records
-/// expire without it — which is why an admission cap alone cannot replace the
-/// bounded wait.
-#[compio::test]
-async fn a_wedged_family_does_not_stop_the_healthy_one_being_served() {
-  let inner = Rc::new(EndpointInner::new(
-    mdns_proto::EndpointConfig::default(),
-    1500,
-    9000,
-  ));
-  let mut pool = SendPool::default();
-  for round in 0..3 {
-    let mut detached = Vec::new();
-    let (_, fanout, accepted_at, elapsed) =
-      wedged_v6_round(&inner, b"refresh", pool.admit(), &mut detached).await;
-    assert_eq!(
-      fanout.v4,
-      FamilySend::Sent,
-      "round {round}: the healthy family keeps carrying the datagram"
-    );
-    assert!(
-      accepted_at.is_some() && elapsed < SEND_ATTEMPT_TIMEOUT * 4,
-      "round {round}: and the round still returns on its own bound"
-    );
-    pool.park(detached, None, None);
-  }
-  assert_eq!(
-    pool.entries.len(),
-    3,
-    "each round's unresolved operation is kept — none is abandoned to an \
-     unreliable cancel"
-  );
-}
-
-/// The pool is BOUNDED, and the bound is enforced by refusing to submit rather
-/// than by dropping what was submitted. An operation the driver cannot keep alive
-/// is one whose delivery it will never learn about, which is the hole the pool
-/// exists to close; an unbounded pool is simply a different defect.
-#[compio::test]
-async fn a_full_pool_refuses_to_submit_instead_of_growing() {
-  let inner = Rc::new(EndpointInner::new(
-    mdns_proto::EndpointConfig::default(),
-    1500,
-    9000,
-  ));
-  let sock_v4 = Some(Rc::new(TestSocket(SendBehaviour::Wedged)));
-  let sock_v6 = Some(Rc::new(TestSocket(SendBehaviour::Wedged)));
-  let mut detached = Vec::new();
-  let mut gate = FamilyWireGate::default();
-  let started = StdInstant::now();
-  let (fanout, accepted_at) = send_via(
-    &inner,
-    &sock_v4,
-    &sock_v6,
-    MDNS_V4_DST,
-    b"announcement",
-    &mut gate,
-    ANNOUNCE_MIN_FAMILY_GAP,
-    started,
-    // A full pool.
-    0,
-    &mut detached,
-  )
-  .await;
-  assert!(
-    detached.is_empty(),
-    "nothing may be submitted that the driver has no room to keep"
-  );
-  assert!(accepted_at.is_none());
-  assert_eq!(
-    (fanout.v4, fanout.v6),
-    (FamilySend::Deferred, FamilySend::Deferred),
-    "a refused family is obligated and did not carry the datagram"
-  );
-  assert_eq!(
-    fanout.delivery(),
-    mdns_proto::TransmitDelivery::new(
-      mdns_proto::FamilyDelivery::Missed,
-      mdns_proto::FamilyDelivery::Missed,
-    ),
-    "…so the core hears `Missed`, never `Unobligated` — the family has a socket \
-     and was owed the datagram"
-  );
-  assert!(
-    started.elapsed() < SEND_ATTEMPT_TIMEOUT,
-    "a refusal costs no wall clock at all"
-  );
-}
-
-/// End to end: a send that lands after its round was confirmed pays what it owes
-/// — the self-send credit (or our own loopback is ingested as a peer's) and the
-/// byte counters — and pays it exactly once.
-#[compio::test]
-async fn a_late_completion_pays_the_self_send_credit_it_owes() {
-  let inner = Rc::new(EndpointInner::new(
-    mdns_proto::EndpointConfig::default(),
-    1500,
-    9000,
-  ));
-  let sock_v4: Option<Rc<SlowSocket>> = Some(Rc::new(SlowSocket(SEND_ATTEMPT_TIMEOUT * 2)));
-  let sock_v6: Option<Rc<SlowSocket>> = None;
-  let mut detached = Vec::new();
-  let mut gate = FamilyWireGate::default();
-  let (fanout, accepted_at) = send_via(
-    &inner,
-    &sock_v4,
-    &sock_v6,
-    MDNS_V4_DST,
-    b"a-slow-announcement",
-    &mut gate,
-    ANNOUNCE_MIN_FAMILY_GAP,
-    StdInstant::now(),
-    MAX_DETACHED_SENDS,
-    &mut detached,
-  )
-  .await;
-  assert_eq!(fanout.v4, FamilySend::Failed, "unobserved reads as missed");
-  assert!(accepted_at.is_none());
-  assert_eq!(detached.len(), 1);
-  assert!(
-    inner.state.borrow().recent_sends.is_empty(),
-    "an unobserved send records no credit — a stale entry would suppress a later \
-     byte-identical peer packet"
-  );
-
-  let mut pool = SendPool::default();
-  pool.park(detached, None, None);
-  // Nothing has completed yet, so the harvest is empty and the pool intact.
-  pool.poll_parked().await;
-  reconcile_harvests(&inner, &mut pool);
-  assert_eq!(pool.entries.len(), 1);
-
-  // Wait for the real completion, then harvest. Bounded, so a regression that
-  // dropped the operation fails the test instead of hanging it.
-  compio::time::timeout(SEND_ATTEMPT_TIMEOUT * 20, pool.wait_ready())
-    .await
-    .expect("a detached operation must still be alive to complete");
-  reconcile_harvests(&inner, &mut pool);
-  assert!(pool.is_empty(), "a completed operation leaves the pool");
-  assert_eq!(
-    inner.state.borrow().recent_sends.len(),
-    1,
-    "the credit is paid when the answer exists, against the wall time read \
-     before submission"
-  );
-}
-
-/// The pool's pins are what the teardown gates read, so parking and harvesting
-/// must keep them in step — a pin that outlived its operation would wedge the
-/// name, and one that vanished early would reopen the hazard.
-#[compio::test]
-async fn parking_and_harvesting_keep_the_pinned_names_in_step() {
-  let inner = Rc::new(EndpointInner::new(
-    mdns_proto::EndpointConfig::default(),
-    1500,
-    9000,
-  ));
-  let name = mdns_proto::Name::try_from_str("Pinned._ipp._tcp.local.").unwrap();
-  let sock_v4: Option<Rc<SlowSocket>> = Some(Rc::new(SlowSocket(SEND_ATTEMPT_TIMEOUT * 2)));
-  let sock_v6: Option<Rc<SlowSocket>> = None;
-  let mut detached = Vec::new();
-  let mut gate = FamilyWireGate::default();
-  let _ = send_via(
-    &inner,
-    &sock_v4,
-    &sock_v6,
-    MDNS_V4_DST,
-    b"pinned-announcement",
-    &mut gate,
-    ANNOUNCE_MIN_FAMILY_GAP,
-    StdInstant::now(),
-    MAX_DETACHED_SENDS,
-    &mut detached,
-  )
-  .await;
-
-  let mut pool = SendPool::default();
-  pool.park(detached, Some(name.clone()), None);
-  pool.sync_pins(&mut inner.state.borrow_mut());
-  assert!(
-    inner.state.borrow().wire_unresolved(&name),
-    "an unresolved datagram pins the name it advertises"
-  );
-
-  compio::time::timeout(SEND_ATTEMPT_TIMEOUT * 20, pool.wait_ready())
-    .await
-    .expect("a detached operation must still be alive to complete");
-  reconcile_harvests(&inner, &mut pool);
-  assert!(
-    !inner.state.borrow().wire_unresolved(&name),
-    "…and the pin lifts the moment the operation answers"
   );
 }
