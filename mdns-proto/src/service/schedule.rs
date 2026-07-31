@@ -27,8 +27,15 @@ pub(crate) mod rfc {
   pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(1);
 }
 
-/// Compute the next probe deadline given the current probe count (0..3).
-/// Probe 0 uses a random offset ∈ [0, 250 ms]; probes 1 and 2 use `PROBE_INTERVAL`.
+/// Compute the deadline for the FIRST transmission of probe `probe_count` in a
+/// §8.1 sequence. Probe 0 uses a random offset ∈ [0, 250 ms]; probes 1 and 2 use
+/// `PROBE_INTERVAL`.
+///
+/// The random offset is RFC 6762 §8.1's *initial* delay — "wait for a random
+/// amount of time selected with uniform random distribution in the range 0-250 ms
+/// before sending the first probe packet" — so it belongs to a sequence that has
+/// put NO probe on any wire yet. Re-arming a probe the wire has already carried
+/// is [`probe_retry_deadline`]'s job instead.
 #[allow(clippy::arithmetic_side_effects, dead_code)]
 pub(crate) fn probe_deadline<I: Instant, R: Rng>(
   now: I,
@@ -42,6 +49,25 @@ pub(crate) fn probe_deadline<I: Instant, R: Rng>(
     rfc::PROBE_INTERVAL
   };
   now.checked_add_duration(wait)
+}
+
+/// Compute the deadline for RE-SENDING a probe the wire has already carried,
+/// whatever its index.
+///
+/// RFC 6762 §8.1 spaces probes 250 ms apart, and that spacing is about
+/// TRANSMISSIONS, not about how far a sequence has progressed. A probe 0 that
+/// reached one family and not the other is re-armed losslessly — the same probe
+/// index goes out again — so the next copy is a second transmission of the same
+/// question and owes the same interval as any other. [`probe_deadline`]'s random
+/// offset would put it as little as 0 ms later, which is §8.1's *initial* delay
+/// applied to a sequence that is no longer initial.
+///
+/// A driver-side per-family wire gate would DEFER such a send rather than emit
+/// it, so the wire stays legal either way; the schedule is fixed here so the
+/// obligation is not one the driver has to absorb.
+#[allow(dead_code)]
+pub(crate) fn probe_retry_deadline<I: Instant>(now: I) -> Option<I> {
+  now.checked_add_duration(rfc::PROBE_INTERVAL)
 }
 
 /// Compute the next announce deadline.

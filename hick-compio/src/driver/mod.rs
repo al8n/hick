@@ -167,6 +167,19 @@ pub(crate) struct ServiceCtx {
   /// RFC 6762 §8.1 / §8.3 spacing is honoured per wire rather than per confirm.
   /// See [`FamilyWireGate`].
   pub(crate) wire_gate: FamilyWireGate,
+  /// This service is retiring but its §10.1 withdrawal has NOT been begun,
+  /// because a datagram carrying its instance name is still unresolved on the
+  /// wire (see [`State::wire_unresolved`]).
+  ///
+  /// [`Service::withdrawal_snapshot`](mdns_proto::service::Service::withdrawal_snapshot)
+  /// can only report what a confirm has latched, so a snapshot taken now would
+  /// omit the records that datagram is about to place in peer caches — and their
+  /// TTLs would only START at that late transmission, so the exposure the goodbye
+  /// exists to bound would outlive the goodbye entirely. The ctx is marked
+  /// `errored` immediately (it serves nothing further) and
+  /// [`State::begin_deferred_withdrawals`] retries the snapshot once the wire
+  /// resolves.
+  pub(crate) withdrawal_deferred: bool,
 }
 
 /// Driver-side per-query context: last-delivered sequence number and a
@@ -241,6 +254,14 @@ pub(crate) struct State {
   /// round-trip.
   #[cfg(feature = "stats")]
   pub(crate) stats: std::sync::Arc<stats::Stats>,
+  /// Instance names carried by a submitted send whose completion has not been
+  /// observed yet — the driver-owned mirror of [`SendPool`]'s pins, kept here so
+  /// the teardown gates can consult it without the pool's futures having to reach
+  /// into the state.
+  ///
+  /// A MULTISET: two unresolved operations on the same name pin it twice, and it
+  /// stays pinned until both resolve.
+  pub(crate) unresolved_wire_names: Vec<mdns_proto::Name>,
 }
 
 impl State {
@@ -269,7 +290,28 @@ impl State {
       max_recv,
       #[cfg(feature = "stats")]
       stats,
+      unresolved_wire_names: Vec::new(),
     }
+  }
+
+  /// Whether some datagram advertising `name` was submitted to a socket and has
+  /// not been observed to finish.
+  ///
+  /// compio cannot definitively cancel a submitted send, so an unresolved
+  /// operation is a datagram that MAY still reach a wire. Until it resolves, the
+  /// name it advertises is not safe to snapshot a goodbye for, to complete a
+  /// withdrawal of, or to release for re-registration — see
+  /// [`mdns_proto::Endpoint::drain_completed_withdrawals_gated`] for the two
+  /// hazards this closes.
+  ///
+  /// Keyed on the NAME and nothing coarser: gating on "any unresolved send" would
+  /// let one wedged service's operation wedge every other service's teardown.
+  /// DNS names compare case-insensitively (RFC 1035 §2.3.3).
+  pub(crate) fn wire_unresolved(&self, name: &mdns_proto::Name) -> bool {
+    self
+      .unresolved_wire_names
+      .iter()
+      .any(|n| n.as_str().eq_ignore_ascii_case(name.as_str()))
   }
 
   /// Register a service spec with the endpoint and create a driver-side context
@@ -295,6 +337,7 @@ impl State {
         encode_failures: 0,
         errored: false,
         wire_gate: FamilyWireGate::default(),
+        withdrawal_deferred: false,
       },
     );
     Ok(handle)
@@ -393,6 +436,26 @@ impl State {
   /// is GC'd. `begin_withdrawal` is idempotent, so calling this for an
   /// already-withdrawing service is a no-op. A no-op for an unknown driver handle.
   pub(crate) fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: StdInstant) {
+    // Take the snapshot FIRST (a pure read of the confirmed-emitted latch) so the
+    // name it would withdraw can be checked against the wire before anything is
+    // consumed. A name still carried by an unresolved datagram is not snapshotable
+    // — the snapshot would be short by exactly the records that datagram is about
+    // to expose, and nothing later could tell that it was. Mark the ctx `errored`
+    // regardless (a retiring service serves nothing further) and leave the retry
+    // to `begin_deferred_withdrawals`.
+    let snap = match self.services.get_mut(&handle) {
+      Some(ctx) => {
+        ctx.errored = true;
+        ctx.proto.withdrawal_snapshot()
+      }
+      None => return,
+    };
+    if self.wire_unresolved(snap.records.instance()) {
+      if let Some(ctx) = self.services.get_mut(&handle) {
+        ctx.withdrawal_deferred = true;
+      }
+      return;
+    }
     // Scope the `ctx` borrow so it ends before `self.endpoint` is touched (the
     // snapshot is owned, so no borrow of `self.services` outlives this block).
     // ALSO take any pending §9 rename handoff here: a retirement that races a
@@ -400,11 +463,10 @@ impl State {
     // reaches the update-drain site that normally enqueues it, which would strand
     // the old-name goodbye in a proto being GC'd. `.take()` makes the handoff
     // exactly-once vs the update-drain path.
-    let (snap, handoff) = match self.services.get_mut(&handle) {
+    let handoff = match self.services.get_mut(&handle) {
       Some(ctx) => {
-        ctx.errored = true;
-        let handoff = ctx.proto.take_rename_goodbye_handoff();
-        (ctx.proto.withdrawal_snapshot(), handoff)
+        ctx.withdrawal_deferred = false;
+        ctx.proto.take_rename_goodbye_handoff()
       }
       None => return,
     };
@@ -423,12 +485,110 @@ impl State {
   /// then confirms via [`Self::note_withdrawal_result`], round-tripping the opaque
   /// [`WithdrawalToken`]. The endpoint encodes the goodbye with fresh sibling
   /// host-address retention computed internally.
+  ///
+  /// The item's instance name rides along so the fan-out can PIN it: a TTL=0
+  /// goodbye is exactly as uncancellable as any other datagram, and one that lands
+  /// after its route was freed and a same-name replacement announced erases the
+  /// REPLACEMENT's records instead of the dead service's.
   pub(crate) fn poll_one_withdrawal(
     &mut self,
     now: StdInstant,
     scratch: &mut [u8],
-  ) -> Option<(SocketAddr, usize, WithdrawalToken)> {
-    self.endpoint.poll_withdrawal_transmit(now, scratch)
+  ) -> Option<(SocketAddr, usize, WithdrawalToken, mdns_proto::Name)> {
+    let (dst, len, token) = self.endpoint.poll_withdrawal_transmit(now, scratch)?;
+    let name = self.endpoint.withdrawal_instance(token)?.clone();
+    Some((dst, len, token, name))
+  }
+
+  /// Whether any service is retiring with its §10.1 snapshot deferred because its
+  /// name is still on the wire.
+  ///
+  /// Such a service has NO withdrawal item yet, so it contributes no withdrawal
+  /// deadline: a shutdown flush that looked only at `next_withdrawal_deadline`
+  /// would exit before its goodbye was ever built, which is the §10.1 leak the
+  /// flush exists to prevent.
+  pub(crate) fn has_deferred_withdrawal(&self) -> bool {
+    self.services.values().any(|c| c.withdrawal_deferred)
+  }
+
+  /// Begin the §10.1 withdrawal of every service whose snapshot
+  /// [`Self::begin_service_withdrawal`] deferred because its name was still on the
+  /// wire. Returns `true` if at least one was begun.
+  ///
+  /// Runs after the harvest, so a datagram that resolved this pass has already
+  /// latched whatever it exposed and the snapshot taken here is complete.
+  pub(crate) fn begin_deferred_withdrawals(&mut self, now: StdInstant) -> bool {
+    let deferred: Vec<ServiceHandle> = self
+      .services
+      .iter()
+      .filter(|(_, ctx)| ctx.withdrawal_deferred)
+      .map(|(h, _)| *h)
+      .collect();
+    let mut begun = false;
+    for h in deferred {
+      self.begin_service_withdrawal(h, now);
+      begun |= self.services.get(&h).is_none_or(|c| !c.withdrawal_deferred);
+    }
+    begun
+  }
+
+  /// Capture the WIRE facts of the datagram `origin` is currently awaiting a
+  /// confirm for, so an operation the round stopped waiting for can still latch
+  /// them if it is later observed to have reached a wire.
+  ///
+  /// MUST be called before the confirm consumes the commit token, and only for a
+  /// round with a detached operation. A QUERY has no per-datagram exposure to
+  /// latch — a question advertises nothing — so it mints nothing.
+  pub(crate) fn late_wire_facts(
+    &self,
+    origin: TransmitOrigin,
+  ) -> Option<mdns_proto::LateWireFacts> {
+    match origin {
+      TransmitOrigin::Service(h) => self.services.get(&h)?.proto.late_wire_facts(),
+      TransmitOrigin::Query(_) => None,
+    }
+  }
+
+  /// Latch the wire facts of a service datagram that reached a wire AFTER its
+  /// round was confirmed, and mirror what that exposed onto the endpoint.
+  ///
+  /// Wire facts ONLY: the core's `note_late_wire_delivery` moves no phase, no
+  /// deadline, no patience and no coverage, and the `has_fully_announced` proof
+  /// passed on to the endpoint is simply re-asserted — a late arrival cannot set
+  /// it, because setting it is a lifecycle fact of the round that was already
+  /// classified.
+  ///
+  /// The §9 rename handoff is drained here for the same reason
+  /// `note_transmit_outcome`'s contract requires it: if a rename happened while
+  /// the operation was unresolved, the records it exposed belong to a name this
+  /// service no longer holds, and this handoff is the only thing that will ever
+  /// withdraw them. It is enqueued as NAME-HOLDING because the exposure is a fact
+  /// about peer caches that no re-registration supersedes — the reclaim-cancel
+  /// gate exists for a replacement that announced, and nothing here is one.
+  pub(crate) fn note_late_wire_delivery(
+    &mut self,
+    now: StdInstant,
+    facts: mdns_proto::LateWireFacts,
+  ) {
+    let h = facts.handle();
+    // Split-borrow: `services` and `endpoint` are disjoint fields, so the ctx's
+    // proto can be driven while the endpoint is mirrored in the same scope.
+    let Self {
+      endpoint, services, ..
+    } = self;
+    let Some(ctx) = services.get_mut(&h) else {
+      return;
+    };
+    ctx.proto.note_late_wire_delivery(facts);
+    let handoff = ctx.proto.take_rename_goodbye_handoff();
+    endpoint.note_service_announced(
+      ctx.proto.has_fully_announced(),
+      ctx.proto.advertised_a_addrs(),
+      ctx.proto.advertised_aaaa_addrs(),
+    );
+    if let Some(handoff) = handoff {
+      endpoint.enqueue_rename_withdrawal(handoff, now, true);
+    }
   }
 
   /// Confirm a withdrawal goodbye round for `token`, reporting EACH family's
@@ -464,13 +624,29 @@ impl State {
   /// draining withdrawal transmits. Returns `true` if at least one ctx was GC'd
   /// (so the caller can wake any handle parked on an otherwise-idle endpoint to
   /// observe its end-of-stream).
+  ///
+  /// GATED on the wire: an item whose instance name is still carried by an
+  /// unresolved datagram is held back, route and all. compio cannot definitively
+  /// cancel a submitted send, so completing such an item would either strand a
+  /// late positive-TTL record in every peer cache for a full TTL with no owner, or
+  /// free the name for a replacement that a late TTL=0 goodbye then erases. See
+  /// [`Self::wire_unresolved`].
   pub(crate) fn drain_completed_withdrawals(&mut self, now: StdInstant) -> bool {
-    // `completed_withdrawals` and `endpoint` are disjoint fields; clear the
-    // reused scratch and let the endpoint push the completed handles into it.
+    // `completed_withdrawals`, `unresolved_wire_names` and `endpoint` are disjoint
+    // fields; clear the reused scratch and let the endpoint push the completed
+    // handles into it.
     self.completed_withdrawals.clear();
-    self
-      .endpoint
-      .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
+    let Self {
+      endpoint,
+      completed_withdrawals,
+      unresolved_wire_names,
+      ..
+    } = self;
+    endpoint.drain_completed_withdrawals_gated(now, completed_withdrawals, |name| {
+      unresolved_wire_names
+        .iter()
+        .any(|n| n.as_str().eq_ignore_ascii_case(name.as_str()))
+    });
     let mut gcd_any = false;
     while let Some(handle) = self.completed_withdrawals.pop() {
       // Unconditional GC: the handle-owned mailbox carries any pending terminal,
@@ -1275,8 +1451,27 @@ pub(crate) async fn run(
     let s = inner.state.borrow();
     (vec![0u8; s.max_payload], s.max_recv)
   };
+  // Every send this driver submitted and has not seen finish. compio cannot
+  // definitively cancel one, so none is ever dropped — see [`SendPool`].
+  let mut pool = SendPool::default();
+  // Reused per fan-out so a pass that detaches nothing allocates nothing.
+  let mut detached: std::vec::Vec<ParkedOp> = std::vec::Vec::new();
 
   loop {
+    // 0. Harvest every detached send that finished since the last pass, BEFORE
+    //    anything reads or moves lifecycle state. A datagram that reached a wire
+    //    must have latched its goodbye ownership before the sweep below snapshots
+    //    what this service still owes peers, and must have released its name pin
+    //    before a withdrawal of that name may complete.
+    pool.poll_parked().await;
+    reconcile_harvests(&inner, &mut pool);
+    // A service whose teardown was held back by the wire can proceed the instant
+    // the harvest above resolved its name.
+    {
+      let now = StdInstant::now();
+      inner.state.borrow_mut().begin_deferred_withdrawals(now);
+    }
+
     // 1. extract-then-await transmit pump.  Borrow only long enough to pull
     //    one datagram into `scratch`; drop the borrow before awaiting the
     //    socket send.  The self-send record runs inside a second short
@@ -1291,30 +1486,33 @@ pub(crate) async fn run(
     //    No replacement can announce ahead of the withdrawal, so this pump runs
     //    unconditionally.
     //
-    //    Bounded by [`MAX_TRANSMIT_CREDITS_PER_PASS`] (mirrors the reactor's
-    //    `MAX_SEND_CREDITS_PER_DRAIN`): a fan-out that reaches no bound socket
-    //    confirms as `NoneDelivered`, which re-arms the same transmit rather than
-    //    advancing lifecycle. Without a cap proto could keep re-yielding it; the
-    //    cap forces the loop to yield control to the select! so timers / recv can
-    //    make progress, and the deadline-driven re-entry will retry.
-    let mut credits = MAX_TRANSMIT_CREDITS_PER_PASS;
-    loop {
-      if credits == 0 {
-        break;
+    //    Bounded by [`DrainBudget`] — [`MAX_TRANSMIT_CREDITS_PER_PASS`] fan-outs
+    //    (mirroring the reactor's `MAX_SEND_CREDITS_PER_DRAIN`) AND
+    //    [`DRAIN_PASS_BUDGET`] of wall clock shared with the withdrawal pump: a
+    //    fan-out that reaches no bound socket confirms as `NoneDelivered`, which
+    //    re-arms the same transmit rather than advancing lifecycle, and one whose
+    //    families are wedged costs a full [`SEND_ATTEMPT_TIMEOUT`] whatever it
+    //    confirms. Either cap forces the loop to yield control to the select! so
+    //    timers / recv can make progress, and the deadline-driven re-entry retries.
+    let mut budget = DrainBudget::new(StdInstant::now());
+    let pump_budget_exhausted = loop {
+      if !budget.may_start_fanout() {
+        break true;
       }
-      credits -= 1;
       let now = StdInstant::now();
       let pumped = {
         let mut s = inner.state.borrow_mut();
         s.poll_one_transmit(now, &mut scratch)
       };
       let Some((tx, origin)) = pumped else {
-        break;
+        break false;
       };
+      budget.charge();
       // The producer's per-family wire gate travels with the fan-out: copied out
       // here, updated by whichever families accepted, written back with the
       // confirm. No borrow crosses the await.
       let mut gate = inner.state.borrow().wire_gate(origin);
+      detached.clear();
       let (fanout, accepted_at) = send_via(
         &inner,
         &sock_v4,
@@ -1324,6 +1522,8 @@ pub(crate) async fn run(
         &mut gate,
         tx.min_family_gap(),
         now,
+        pool.admit(),
+        &mut detached,
       )
       .await;
       // Confirm the pending transmit with the honest per-family shape of the
@@ -1342,12 +1542,26 @@ pub(crate) async fn run(
       {
         let mut state = inner.state.borrow_mut();
         state.set_wire_gate(origin, gate);
+        // Mint the late-wire ticket while the commit token is STILL LIVE — the
+        // confirm below consumes it. Only a round that actually left an operation
+        // unresolved needs one; every other round is fully resolved by the confirm.
+        let facts = if detached.is_empty() {
+          None
+        } else {
+          state.late_wire_facts(origin)
+        };
         match origin {
           TransmitOrigin::Service(h) => state.note_service_transmit_outcome(h, at, delivery),
           TransmitOrigin::Query(h) => state.note_query_transmit_outcome(h, at, delivery),
         }
+        // The confirm has settled the lifecycle on time. What is still open is
+        // only whether these bytes reach a wire — park the operations under the
+        // name they advertise so no teardown of it runs ahead of the answer.
+        let name = facts.as_ref().map(|f| f.instance().clone());
+        pool.park(detached.drain(..), name, facts);
+        pool.sync_pins(&mut state);
       }
-    }
+    };
     // Exhausted the per-pass send budget — more transmits may be ready, so the
     // driver must re-enter the pump rather than park until an unrelated event.
     //
@@ -1362,7 +1576,6 @@ pub(crate) async fn run(
     // This cannot busy-spin now that multicast transmits reach a bound socket:
     // each successful send drives `note_*_transmit_result(delivered = true)`, so
     // the proto advances (§8.1 probe / §8.3 announce) and the queue drains.
-    let pump_budget_exhausted = credits == 0;
 
     // 1a-pre. Sweep handles that were dropped. `Service::drop` / `Query::drop`
     //     only flag `cancelled`; the teardown that resolves a producer's state
@@ -1411,7 +1624,15 @@ pub(crate) async fn run(
     //     draining, frees each completed route + GCs its driver ctx. Running AFTER
     //     `push_service_updates` (1b) ensures a rename-collision withdrawal begun
     //     this iteration flushes its first goodbye on-wire the same iteration.
-    drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch).await;
+    let withdrawals_budget_stopped = drain_withdrawals(
+      &inner,
+      &sock_v4,
+      &sock_v6,
+      &mut scratch,
+      &mut budget,
+      &mut pool,
+    )
+    .await;
 
     // 1b'. fire one-shot wakes for queries that just transitioned to `errored`
     //      (un-encodable question, see `QueryCtx::errored`). Such a query has no
@@ -1448,7 +1669,25 @@ pub(crate) async fn run(
     if Rc::strong_count(&inner) == 1 {
       let shutdown_deadline = StdInstant::now() + Duration::from_secs(10);
       loop {
-        drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch).await;
+        // Resolve the wire first: a goodbye held back by an unresolved datagram,
+        // and a teardown whose snapshot was deferred, both need the harvest before
+        // they can finish.
+        pool.poll_parked().await;
+        reconcile_harvests(&inner, &mut pool);
+        {
+          let now = StdInstant::now();
+          inner.state.borrow_mut().begin_deferred_withdrawals(now);
+        }
+        let mut budget = DrainBudget::new(StdInstant::now());
+        drain_withdrawals(
+          &inner,
+          &sock_v4,
+          &sock_v6,
+          &mut scratch,
+          &mut budget,
+          &mut pool,
+        )
+        .await;
         // Sweep any service whose handle dropped since the last pass — INCLUDING
         // one that raced the awaited drain above — into a withdrawal BEFORE
         // deciding whether any remain. The 1a-pre sweep only ran for cancellations
@@ -1460,23 +1699,47 @@ pub(crate) async fn run(
           .borrow_mut()
           .sweep_cancelled_services(StdInstant::now());
         let now = StdInstant::now();
-        // Sleep on (and exit when there are no) WITHDRAWAL deadlines only — NOT
-        // the aggregate `poll_deadline`, which folds in cache expiry and query
-        // timers. Otherwise, once every goodbye is sent, a still-populated cache
-        // would keep this flush parked until that unrelated deadline (or the 10 s
+        // Sleep on (and exit when there are neither) WITHDRAWAL deadlines nor
+        // teardowns the wire is still holding back — NOT the aggregate
+        // `poll_deadline`, which folds in cache expiry and query timers.
+        // Otherwise, once every goodbye is sent, a still-populated cache would
+        // keep this flush parked until that unrelated deadline (or the 10 s
         // backstop) instead of exiting promptly.
-        let Some(next) = ({ inner.state.borrow().next_withdrawal_deadline() }) else {
-          break;
+        //
+        // A DEFERRED teardown has no withdrawal item yet, so it contributes no
+        // deadline at all: exiting on the deadline alone would drop its goodbye
+        // entirely, which is exactly the §10.1 leak this flush exists to prevent.
+        let (next, deferred) = {
+          let s = inner.state.borrow();
+          (s.next_withdrawal_deadline(), s.has_deferred_withdrawal())
         };
+        if next.is_none() && !deferred {
+          break;
+        }
         if now >= shutdown_deadline {
           debug!("shutdown withdrawal flush hit its wall-clock backstop; exiting");
           break;
         }
+        let backstop = shutdown_deadline.saturating_duration_since(now);
         let dur = next
-          .saturating_duration_since(now)
-          .min(shutdown_deadline.saturating_duration_since(now));
-        if dur > Duration::ZERO {
-          compio::time::sleep(dur).await;
+          .map_or(backstop, |n| n.saturating_duration_since(now))
+          .min(backstop);
+        // A goodbye — or a snapshot — the wire is holding back leaves nothing on
+        // the clock to wait for: its deadline is either absent or already in the
+        // past. A completion is the only thing that can move it, so wait on the
+        // pool alongside the clock; the backstop still bounds the whole flush.
+        let idle = if dur > Duration::ZERO {
+          dur
+        } else if pool.is_empty() {
+          Duration::ZERO
+        } else {
+          backstop
+        };
+        if idle > Duration::ZERO {
+          futures::select! {
+            _ = compio::time::sleep(idle).fuse() => {}
+            _ = pool.wait_ready().fuse() => {}
+          }
         }
       }
       break;
@@ -1500,10 +1763,12 @@ pub(crate) async fn run(
     //      newly-started timeout-less query, …): every work-creating handle op
     //      marks the endpoint dirty (see `EndpointInner::mark_dirty`), closing the
     //      "handle parks forever" lost-wake class by construction.
-    //    * `pump_budget_exhausted` — the transmit pump hit its per-pass credit
-    //      cap with work still queued; re-enter to drain the backlog.
+    //    * `pump_budget_exhausted` / `withdrawals_budget_stopped` — a pump hit the
+    //      pass's [`DrainBudget`] with work still queued; re-enter to drain the
+    //      backlog.
     let deadline = { inner.state.borrow().poll_deadline() };
-    let force_now = inner.dirty.replace(false) || pump_budget_exhausted;
+    let force_now =
+      inner.dirty.replace(false) || pump_budget_exhausted || withdrawals_budget_stopped;
 
     // 3. arm the timer future. `Either<sleep, pending>` keeps both arms with
     //    the same `Output = ()` so a single `pin_mut!` is enough for
@@ -1512,6 +1777,20 @@ pub(crate) async fn run(
       (true, _) => Either::Left(compio::time::sleep(Duration::ZERO)),
       (false, Some(at)) => {
         let dur = at.saturating_duration_since(StdInstant::now());
+        // A withdrawal the wire is holding back keeps a PAST-DUE deadline
+        // standing that no pass can serve: its item is past its ceiling, so
+        // `poll_withdrawal_transmit` will not re-offer it and
+        // `drain_completed_withdrawals` will not complete it until the datagram
+        // resolves. A bare `sleep(0)` there re-enters the loop to redo the pumps
+        // that just ran, for as long as the wire takes. The pool arm is what
+        // actually wakes the loop on resolution; this floor is the backstop, and
+        // it applies ONLY while something is unresolved — so it can delay nothing
+        // that a healthy endpoint ever schedules.
+        let dur = if dur.is_zero() && !pool.is_empty() {
+          WIRE_HOLD_TICK
+        } else {
+          dur
+        };
         Either::Left(compio::time::sleep(dur))
       }
       (false, None) => Either::Right(core::future::pending::<()>()),
@@ -1523,6 +1802,15 @@ pub(crate) async fn run(
     //    fuse it so `select!` accepts it.
     let notify_fut = inner.notify.listen().fuse();
     futures::pin_mut!(notify_fut);
+
+    // 4a. arm the completion pool. A detached send is polled with THIS task's
+    //     waker, so its completion wakes the driver; this arm is what turns that
+    //     wake into a harvest instead of a spurious re-park. It never completes
+    //     while the pool is empty, so it costs a parked endpoint nothing — and
+    //     without it a teardown gated on an unresolved name could wait on a
+    //     deadline that no longer exists.
+    let pool_fut = pool.wait_ready().fuse();
+    futures::pin_mut!(pool_fut);
 
     // 5. arm one recv future per bound family. The recv future borrows from
     //    its socket and owns its data + control buffers across the
@@ -1543,6 +1831,7 @@ pub(crate) async fn run(
           r = r4 => { handle_recv(&inner, r); woke_state = true; }
           r = r6 => { handle_recv(&inner, r); woke_state = true; }
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
+          _ = pool_fut => {}
           _ = notify_fut => {}
         }
       }
@@ -1552,6 +1841,7 @@ pub(crate) async fn run(
         futures::select! {
           r = r4 => { handle_recv(&inner, r); woke_state = true; }
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
+          _ = pool_fut => {}
           _ = notify_fut => {}
         }
       }
@@ -1561,6 +1851,7 @@ pub(crate) async fn run(
         futures::select! {
           r = r6 => { handle_recv(&inner, r); woke_state = true; }
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
+          _ = pool_fut => {}
           _ = notify_fut => {}
         }
       }
@@ -1569,6 +1860,7 @@ pub(crate) async fn run(
         // busy-spin.
         futures::select! {
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
+          _ = pool_fut => {}
           _ = notify_fut => {}
         }
       }
@@ -1592,6 +1884,14 @@ pub(crate) enum FamilySend {
   /// [`FamilySend::Failed`] — but a deliberate deferral, not an I/O error, so it
   /// bumps no error counter.
   Gated,
+  /// A bound socket was NOT offered the datagram because [`SendPool`] was full.
+  /// Obligated and did not carry it; like [`FamilySend::Gated`] it is the driver's
+  /// own back-pressure rather than an I/O error, so it bumps no error counter.
+  ///
+  /// Submitting anyway is the one thing that must not happen: an operation the
+  /// driver cannot keep alive is an operation whose delivery it will never learn
+  /// about, which is exactly the hole the pool exists to close.
+  Deferred,
   /// A bound socket accepted the datagram.
   Sent,
   /// A bound socket did not carry it. A completion-based `send_to` removes
@@ -1599,8 +1899,13 @@ pub(crate) enum FamilySend {
   /// route goes away, `ENOBUFS` under buffer pressure, `EPERM` from a local
   /// firewall, `EADDRNOTAVAIL` when an interface loses its address, `EMSGSIZE`.
   /// Each of those lands here on one family while the other returns `Ok` in the
-  /// very same fan-out — as does an op that had not completed inside
-  /// [`SEND_ATTEMPT_TIMEOUT`].
+  /// very same fan-out — as does an operation still unresolved when
+  /// [`SEND_ATTEMPT_TIMEOUT`] expires.
+  ///
+  /// For that last case `Failed` is a CONSERVATIVE reading, not a known fact: the
+  /// operation is detached rather than cancelled, and if it does reach a wire its
+  /// wire facts are reconciled by [`SendPool`]. Reporting it missed can only make
+  /// the lifecycle slower, never wrong.
   Failed,
 }
 
@@ -1615,30 +1920,32 @@ impl FamilySend {
     }
   }
 
-  /// Classify one bounded attempt. An attempt whose bound expired is reported as
-  /// a miss: the op is cancelled, so nothing observed it reach the wire, and the
-  /// core must not advance its §8.1 / §8.3 phase on an unobserved send.
+  /// Classify one bounded attempt. An attempt still unresolved when its bound
+  /// expired is reported as a miss: nothing has OBSERVED it reach the wire, and
+  /// the core must not advance its §8.1 / §8.3 phase on an unobserved send.
   fn from_attempt(attempt: &SendAttempt) -> Self {
     match attempt {
       SendAttempt::Unbound => Self::Unbound,
       SendAttempt::Gated => Self::Gated,
+      SendAttempt::Refused => Self::Deferred,
       SendAttempt::Answered(res, _, _) => Self::from_bound_result(res),
-      SendAttempt::TimedOut => Self::Failed,
+      SendAttempt::Detached(_, _) => Self::Failed,
     }
   }
 
   /// This family's I/O answer as the core's protocol vocabulary. The mapping is
   /// one-to-one — no family is ever laundered into a different one.
   ///
-  /// A GATED family is `Missed` and never `Unobligated`: its socket is there and
-  /// the datagram was fanned onto it, the driver simply owed the wire a gap it
-  /// had not yet paid. Reporting it absent would hide the deferral from the core
-  /// and let the phase advance without it.
+  /// A GATED or DEFERRED family is `Missed` and never `Unobligated`: its socket is
+  /// there and the datagram was fanned onto it, the driver simply owed the wire a
+  /// gap it had not yet paid, or had no room to track another unresolved
+  /// operation. Reporting it absent would hide the deferral from the core and let
+  /// the phase advance without it.
   const fn delivery(self) -> FamilyDelivery {
     match self {
       Self::Unbound => FamilyDelivery::Unobligated,
       Self::Sent => FamilyDelivery::Delivered,
-      Self::Gated | Self::Failed => FamilyDelivery::Missed,
+      Self::Gated | Self::Deferred | Self::Failed => FamilyDelivery::Missed,
     }
   }
 }
@@ -1682,13 +1989,27 @@ impl Fanout {
   }
 }
 
-/// How long ONE address family's `send_to` may stay unaccepted before the
-/// fan-out gives up on it for this round and reports that family `Missed`.
+/// How long the CONFIRM waits for one address family's `send_to` before giving
+/// up on it FOR THIS ROUND and reporting that family `Missed`.
+///
+/// It is a bounded WAIT, not a cancel. The operation is detached into
+/// [`SendPool`] and driven to its true completion; what the bound ends is the
+/// round's patience, not the datagram. compio cannot do better —
+/// `Proactor::cancel` documents that "the cancellation is not reliable, the
+/// underlying operation may continue" — so a driver that dropped the future here
+/// would be reporting a fact it does not have.
+///
+/// Bounding the WAIT is still necessary, and an admission cap alone would not
+/// substitute for it: one producer serves BOTH families, so a wedged v6 that held
+/// the confirm would starve the healthy v4 of the very refresh its records expire
+/// without (at [`mdns_proto`'s minimum service TTL] that is 2 s).
 ///
 /// Without a bound a family whose transport is wedged parks the whole driver
 /// task — every timer, every dropped-handle sweep, every other family's transmit
 /// — for as long as it stays that way. Running the families concurrently removes
 /// the serialisation but bounds neither attempt.
+///
+/// [`mdns_proto`'s minimum service TTL]: mdns_proto::constants::MIN_SERVICE_TTL_SECS
 ///
 /// It is a LIVENESS knob, not a wire-freshness budget. What the core guarantees
 /// is the SCHEDULE: a family in good standing is re-announced within
@@ -1710,26 +2031,36 @@ impl Fanout {
 /// completion-based one may not.
 const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// One submitted send, owning everything the operation touches.
+///
+/// Boxed and `'static` on purpose. compio is COMPLETION-based: the buffer moves
+/// into the operation and the kernel keeps it until the operation finishes, and
+/// [`compio_driver`'s own contract] is that cancellation "is not reliable — the
+/// underlying operation may continue, but just don't return from
+/// `Proactor::poll`". Dropping the future therefore stops the driver LEARNING
+/// what happened; it does not stop the datagram. Everything the fan-out needs to
+/// keep such an operation alive past the round that produced it lives inside this
+/// type, so it can be moved into [`SendPool`] instead of dropped.
+///
+/// [`compio_driver`'s own contract]: https://docs.rs/compio-driver/0.12.1/compio_driver/struct.Proactor.html#method.cancel
+type SendOp = core::pin::Pin<Box<dyn core::future::Future<Output = std::io::Result<usize>>>>;
+
 /// The one socket capability the transmit and withdrawal fan-outs use.
 ///
 /// Naming it keeps the fan-out's dependency on the socket to a single method, so
 /// the per-family bound can be exercised against a family that never accepts —
 /// a state no bound UDP socket can be coaxed into on a real host.
-trait SendDatagram {
-  fn send_to(
-    &self,
-    buf: &[u8],
-    dst: SocketAddr,
-  ) -> impl core::future::Future<Output = std::io::Result<usize>>;
+///
+/// The receiver is `Rc<Self>` and the body is an owned `Vec` so the returned
+/// operation borrows nothing: see [`SendOp`] for why a submitted send must be
+/// able to outlive the fan-out that started it.
+trait SendDatagram: 'static {
+  fn send_datagram(self: Rc<Self>, body: std::vec::Vec<u8>, dst: SocketAddr) -> SendOp;
 }
 
 impl SendDatagram for Socket {
-  fn send_to(
-    &self,
-    buf: &[u8],
-    dst: SocketAddr,
-  ) -> impl core::future::Future<Output = std::io::Result<usize>> {
-    Socket::send_to(self, buf, dst, None)
+  fn send_datagram(self: Rc<Self>, body: std::vec::Vec<u8>, dst: SocketAddr) -> SendOp {
+    Box::pin(async move { self.send_to_owned(body, dst).await })
   }
 }
 
@@ -1808,12 +2139,23 @@ enum SendAttempt {
   /// A bound socket the per-family wire gate held back for this round; no
   /// operation was submitted. See [`FamilyWireGate`].
   Gated,
+  /// A bound socket the driver declined to submit to because [`SendPool`] had no
+  /// room to keep another unresolved operation alive. No operation was submitted.
+  Refused,
   /// The socket answered within [`SEND_ATTEMPT_TIMEOUT`]: the `send_to` result,
   /// plus the wall time and the monotonic instant captured immediately before
   /// the op was submitted.
   Answered(std::io::Result<usize>, SystemTime, StdInstant),
-  /// The socket had still not accepted the datagram when the bound expired.
-  TimedOut,
+  /// The operation was submitted and had not completed when the bound expired.
+  ///
+  /// It is NOT cancelled — it is handed back so the caller can park it in
+  /// [`SendPool`] (see [`SendOp`]). The wall clock is the one read immediately
+  /// before submission, carried through so the late harvest records the self-send
+  /// credit against the same instant an on-time completion would have used. The
+  /// monotonic instant is deliberately NOT carried: it anchors the core's refresh
+  /// schedule, and the round this operation belonged to was already anchored
+  /// without it.
+  Detached(SendOp, SystemTime),
 }
 
 impl SendAttempt {
@@ -1822,6 +2164,11 @@ impl SendAttempt {
   /// Read before submission, so it is at or before the true acceptance — the
   /// only direction an anchor may be wrong in, since it may understate how fresh
   /// a family's peers are but never overstate it.
+  ///
+  /// A DETACHED attempt has none: nothing has observed it reach a wire yet, and
+  /// the confirm this anchors must not claim otherwise. If it later lands, the
+  /// wire facts are reconciled — the schedule is not retroactively re-anchored,
+  /// because the phase it would have anchored was already settled.
   fn accepted_at(&self) -> Option<StdInstant> {
     match self {
       Self::Answered(Ok(_), _, at) => Some(*at),
@@ -1830,10 +2177,12 @@ impl SendAttempt {
   }
 }
 
-/// Offer one family its copy of the datagram, bounded by
-/// [`SEND_ATTEMPT_TIMEOUT`]. An absent socket is [`SendAttempt::Unbound`] — that
-/// family was never obligated — and is answered without touching the clock, as is
-/// a family whose wire gate is shut (`may_send == false`).
+/// Offer one family its copy of the datagram, waiting at most
+/// [`SEND_ATTEMPT_TIMEOUT`] for an answer. An absent socket is
+/// [`SendAttempt::Unbound`] — that family was never obligated — and is answered
+/// without touching the clock, as is a family whose wire gate is shut
+/// (`may_send == false`) or whose operation the pool has no room for
+/// (`admit == false`).
 ///
 /// Both clocks are read IMMEDIATELY BEFORE the `.await`. compio is
 /// completion-based — the buffer moves into the op on `.await`, so we cannot
@@ -1843,10 +2192,18 @@ impl SendAttempt {
 /// even when task-resume latency is high; stamping after it could push the
 /// recorded time past the kernel's rx stamp and misclassify our own
 /// announce/probe as a peer packet.
+///
+/// The bound is applied to a `&mut` BORROW of the operation, so an expiry drops
+/// the borrow and hands the operation itself back as
+/// [`SendAttempt::Detached`]. That is the whole difference between this and a
+/// `timeout(.., op)` that consumes it: consuming and dropping would ask compio to
+/// cancel, which it explicitly does not promise to do, leaving the datagram's
+/// fate unknown forever.
 async fn attempt_send_to<S: SendDatagram>(
-  sock: Option<&S>,
+  sock: Option<&Rc<S>>,
   may_send: bool,
-  buf: &[u8],
+  admit: bool,
+  body: &[u8],
   dst: SocketAddr,
 ) -> SendAttempt {
   let Some(sock) = sock else {
@@ -1855,11 +2212,15 @@ async fn attempt_send_to<S: SendDatagram>(
   if !may_send {
     return SendAttempt::Gated;
   }
+  if !admit {
+    return SendAttempt::Refused;
+  }
   let when = SystemTime::now();
   let at = StdInstant::now();
-  match compio::time::timeout(SEND_ATTEMPT_TIMEOUT, sock.send_to(buf, dst)).await {
+  let mut op = Rc::clone(sock).send_datagram(body.to_vec(), dst);
+  match compio::time::timeout(SEND_ATTEMPT_TIMEOUT, &mut op).await {
     Ok(res) => SendAttempt::Answered(res, when, at),
-    Err(_) => SendAttempt::TimedOut,
+    Err(_) => SendAttempt::Detached(op, when),
   }
 }
 
@@ -1868,11 +2229,13 @@ async fn attempt_send_to<S: SendDatagram>(
 ///
 /// The credit is recorded only for an attempt that reported bytes on the wire. A
 /// failed send produces no loopback, and a stale entry would suppress a later
-/// byte-identical peer packet. A TIMED-OUT completion-based send is ambiguous —
-/// the kernel may still deliver it after the op is cancelled — and is treated as
-/// a failure in both directions: no credit, and `Missed` to the core. Both are
-/// the conservative reading; the cost of being wrong is one duplicate
-/// unsolicited response, which RFC 6762 §8.3 sends by design anyway.
+/// byte-identical peer packet.
+///
+/// A DETACHED attempt records nothing HERE and is not an error either: whether it
+/// reaches a wire is not yet known. Its credit and its counters are deferred to
+/// [`SendPool`]'s harvest, where the answer exists — which is also why an
+/// unresolved send no longer bumps `send_errors`: it has not failed, it has not
+/// been observed.
 fn note_multicast_attempt(
   inner: &Rc<EndpointInner>,
   attempt: &SendAttempt,
@@ -1881,9 +2244,9 @@ fn note_multicast_attempt(
   _kind: &'static str,
 ) {
   match attempt {
-    // Neither put bytes on a wire, and neither is an error: one has no socket,
-    // the other is this driver's own deliberate spacing.
-    SendAttempt::Unbound | SendAttempt::Gated => {}
+    // None of these put bytes on a wire, and none is an error: no socket, this
+    // driver's own deliberate spacing, or its own back-pressure.
+    SendAttempt::Unbound | SendAttempt::Gated | SendAttempt::Refused => {}
     SendAttempt::Answered(Ok(_), when, _) => {
       trace!(kind = _kind, dst = %_dst, len = body.len(), "send_to");
       let mut state = inner.state.borrow_mut();
@@ -1899,12 +2262,32 @@ fn note_multicast_attempt(
       #[cfg(feature = "stats")]
       inner.state.borrow().stats.send_errors(1);
     }
-    SendAttempt::TimedOut => {
-      debug!(kind = _kind, dst = %_dst, "send_to did not complete within the per-family bound");
-      #[cfg(feature = "stats")]
-      inner.state.borrow().stats.send_errors(1);
+    SendAttempt::Detached(_, _) => {
+      debug!(kind = _kind, dst = %_dst, "send_to did not complete within the round's bound; detached");
     }
   }
+}
+
+/// One submitted send the round stopped waiting for, with everything its harvest
+/// needs and nothing it does not.
+///
+/// The datagram's BYTES are deliberately absent: the self-send tracker stores only
+/// a `(hash, length)` credit key and a send time, so hashing at detach time keeps
+/// a second copy of every parked datagram out of the pool.
+struct ParkedOp {
+  op: SendOp,
+  /// The wall clock read immediately before submission — the same instant an
+  /// on-time completion would have credited, so a late loopback still matches
+  /// inside the tracker's window.
+  when: SystemTime,
+  /// FNV-1a content hash + length of the datagram, for the self-send credit.
+  /// `None` for a unicast send, which never loops back through a joined group and
+  /// must record no credit at all (see [`send_via`]).
+  credit: Option<(u64, u32)>,
+  /// Payload length, for `bytes_tx` on a successful harvest.
+  len: usize,
+  dst: SocketAddr,
+  kind: &'static str,
 }
 
 /// Send one logical transmit and report each family's result.
@@ -1934,6 +2317,12 @@ fn note_multicast_attempt(
 /// datagram at all and is reported [`FamilySend::Gated`] — obligated, and it did
 /// not carry it. Every family that DID carry it records its own acceptance
 /// instant back into `gate`.
+///
+/// `admit` is how many still-unresolved operations [`SendPool`] can accept, and
+/// every operation this fan-out submits but does not see finish is pushed into
+/// `detached` for the caller to park. A family beyond `admit` is not offered the
+/// datagram at all ([`FamilySend::Deferred`]): submitting an operation the driver
+/// cannot keep is what reopens the hole the pool closes.
 #[allow(clippy::too_many_arguments)]
 async fn send_via<S: SendDatagram>(
   inner: &Rc<EndpointInner>,
@@ -1944,6 +2333,8 @@ async fn send_via<S: SendDatagram>(
   gate: &mut FamilyWireGate,
   min_gap: Duration,
   now: StdInstant,
+  admit: usize,
+  detached: &mut std::vec::Vec<ParkedOp>,
 ) -> (Fanout, Option<StdInstant>) {
   let n = body.len();
   let mut fanout = Fanout::UNBOUND;
@@ -1952,16 +2343,23 @@ async fn send_via<S: SendDatagram>(
     // acceptance instant depend on how long the other one took, and made a
     // family that never accepts hold the whole fan-out — and with it the driver
     // loop — for as long as it stayed wedged.
+    //
+    // Both families could detach, so the second one is admitted only when the
+    // pool could hold both. Reserving up front is what keeps the bound a bound:
+    // by the time an attempt expires the operation is already submitted and
+    // refusing it is no longer possible.
     let (a4, a6) = futures::future::join(
       attempt_send_to(
-        sock_v4.as_deref(),
+        sock_v4.as_ref(),
         gate.open(FAMILY_V4, now, min_gap),
+        admit >= 1,
         body,
         MDNS_V4_DST,
       ),
       attempt_send_to(
-        sock_v6.as_deref(),
+        sock_v6.as_ref(),
         gate.open(FAMILY_V6, now, min_gap),
+        admit >= 2,
         body,
         MDNS_V6_DST,
       ),
@@ -1988,6 +2386,9 @@ async fn send_via<S: SendDatagram>(
     // recorded them — and under no borrow held across an await.
     note_multicast_attempt(inner, &a4, body, MDNS_V4_DST, "transmit");
     note_multicast_attempt(inner, &a6, body, MDNS_V6_DST, "transmit");
+    let credit = Some(crate::selfsend::credit_of(body));
+    park_detached(detached, a4, credit, n, MDNS_V4_DST, "transmit");
+    park_detached(detached, a6, credit, n, MDNS_V6_DST, "transmit");
     return (fanout, accepted_at);
   }
 
@@ -1995,8 +2396,8 @@ async fn send_via<S: SendDatagram>(
   // is obligated (an absent socket obligates none), so this branch can only be
   // all- or none-delivered.
   let (idx, sock) = match dst {
-    SocketAddr::V4(_) => (FAMILY_V4, sock_v4.as_deref()),
-    SocketAddr::V6(_) => (FAMILY_V6, sock_v6.as_deref()),
+    SocketAddr::V4(_) => (FAMILY_V4, sock_v4.as_ref()),
+    SocketAddr::V6(_) => (FAMILY_V6, sock_v6.as_ref()),
   };
   // NO self-send tracker entry here, unlike the multicast branch. A unicast
   // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
@@ -2006,7 +2407,7 @@ async fn send_via<S: SendDatagram>(
   // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
   // the NEW entry — so a legacy-query flood would starve the genuine multicast
   // credits that suppression actually depends on.
-  let attempt = attempt_send_to(sock, gate.open(idx, now, min_gap), body, dst).await;
+  let attempt = attempt_send_to(sock, gate.open(idx, now, min_gap), admit >= 1, body, dst).await;
   let outcome = FamilySend::from_attempt(&attempt);
   match dst {
     SocketAddr::V4(_) => fanout.v4 = outcome,
@@ -2015,11 +2416,13 @@ async fn send_via<S: SendDatagram>(
   if let Some(at) = attempt.accepted_at() {
     gate.record(idx, at, min_gap);
   }
+  let accepted_at = attempt.accepted_at();
   match &attempt {
     // In tree every unicast datagram is a §6.7 legacy reply, which is one-shot
     // and therefore ungated — `Gated` is unreachable here today and is listed
-    // with `Unbound` because neither wrote to a wire nor failed.
-    SendAttempt::Unbound | SendAttempt::Gated => {}
+    // with `Unbound` because neither wrote to a wire nor failed, as is a
+    // pool-refused send.
+    SendAttempt::Unbound | SendAttempt::Gated | SendAttempt::Refused => {}
     SendAttempt::Answered(Ok(_), _, _) => {
       trace!(dst = %dst, len = n, "send_to");
       #[cfg(feature = "stats")]
@@ -2034,13 +2437,353 @@ async fn send_via<S: SendDatagram>(
       #[cfg(feature = "stats")]
       inner.state.borrow().stats.send_errors(1);
     }
-    SendAttempt::TimedOut => {
-      debug!(dst = %dst, "send_to did not complete within the per-family bound");
-      #[cfg(feature = "stats")]
-      inner.state.borrow().stats.send_errors(1);
+    SendAttempt::Detached(_, _) => {
+      debug!(dst = %dst, "send_to did not complete within the round's bound; detached");
     }
   }
-  (fanout, attempt.accepted_at())
+  // No credit for a unicast send, for the same reason the on-time path records
+  // none: it never loops back through a joined group, so the entry could only
+  // occupy the tracker until it aged out.
+  park_detached(detached, attempt, None, n, dst, "transmit");
+  (fanout, accepted_at)
+}
+
+/// Move a [`SendAttempt::Detached`] operation into the caller's park list.
+/// Every other outcome is already resolved and contributes nothing.
+fn park_detached(
+  detached: &mut std::vec::Vec<ParkedOp>,
+  attempt: SendAttempt,
+  credit: Option<(u64, u32)>,
+  len: usize,
+  dst: SocketAddr,
+  kind: &'static str,
+) {
+  if let SendAttempt::Detached(op, when) = attempt {
+    detached.push(ParkedOp {
+      op,
+      when,
+      credit,
+      len,
+      dst,
+      kind,
+    });
+  }
+}
+
+/// How many submitted-but-unresolved sends the driver keeps alive at once.
+///
+/// The pool MUST be bounded: every entry holds a boxed operation whose kernel-side
+/// buffer is a copy of the datagram (at most
+/// [`crate::ServerOptions::max_payload_size`], 1500 bytes by default), so an
+/// unbounded one is a memory-growth defect of exactly the kind this change exists
+/// to remove. At 64 entries a default-configured endpoint holds at most ~96 KB of
+/// in-flight datagram plus the per-entry facts.
+///
+/// 64 is [`MAX_TRANSMIT_CREDITS_PER_PASS`], i.e. one slot per transmit a single
+/// pass can pump, so a pass whose every fan-out wedges still admits every
+/// datagram it produced. Reaching the cap at all means ≥ 64 operations the kernel
+/// has neither completed nor errored, which no healthy host produces; the
+/// back-pressure ([`FamilySend::Deferred`]) is a last resort, not a working
+/// régime.
+const MAX_DETACHED_SENDS: usize = MAX_TRANSMIT_CREDITS_PER_PASS;
+
+/// The shortest the driver will park while some send is still unresolved.
+///
+/// A backstop against a permanently-past deadline, not a polling cadence: a
+/// completion wakes the loop through [`SendPool`]'s own `select!` arm, so this
+/// only bounds the degenerate case where a wire-held withdrawal leaves a deadline
+/// standing that no pass can serve. 10 ms is far below every interval RFC 6762
+/// schedules (§8.1's 250 ms is the shortest), so it cannot pace anything, and far
+/// above a busy-spin.
+const WIRE_HOLD_TICK: Duration = Duration::from_millis(10);
+
+/// One parked operation and the facts its completion still owes.
+struct Detached {
+  parked: ParkedOp,
+  /// The instance name this datagram advertises, while it advertises one. A name
+  /// with an entry here is PINNED: no withdrawal of it may be snapshotted or
+  /// completed, and its route may not be freed. See [`State::wire_unresolved`].
+  name: Option<mdns_proto::Name>,
+  /// The core-side wire facts a successful completion latches. `None` for a
+  /// query's question and for a TTL=0 goodbye, neither of which the core tracks
+  /// per-datagram exposure for.
+  facts: Option<mdns_proto::LateWireFacts>,
+}
+
+/// One harvested completion: what the operation did, and what that means.
+struct Harvest {
+  res: std::io::Result<usize>,
+  parked_when: SystemTime,
+  credit: Option<(u64, u32)>,
+  len: usize,
+  dst: SocketAddr,
+  kind: &'static str,
+  facts: Option<mdns_proto::LateWireFacts>,
+}
+
+/// Every send this driver submitted and has not yet seen finish.
+///
+/// # Why a driver-owned pool and not a cancel
+///
+/// compio is completion-based, and `Proactor::cancel`'s own documentation is that
+/// "the cancellation is not reliable — the underlying operation may continue, but
+/// just don't return from `Proactor::poll`". Dropping an in-flight `Submit`
+/// therefore ends the driver's KNOWLEDGE of a datagram, not the datagram. Every
+/// downstream fact that depends on knowing — who owns a record peers may now hold,
+/// whether a name is safe to release, whether our own loopback should be
+/// suppressed — is silently wrong from that moment on.
+///
+/// So no submitted operation is ever dropped. The round confirms on time with a
+/// conservative `Missed`, and the operation moves here to be driven to its true
+/// completion.
+///
+/// # This is not the old parked-datagram design
+///
+/// An earlier driver in this workspace parked DATAGRAMS and deferred their
+/// CONFIRMS, so an in-flight send outlived the core state transitions its confirm
+/// was supposed to order. That is a defect generator and it was deleted. Nothing
+/// here defers a confirm: the lifecycle is settled on time, and only the WIRE
+/// facts — goodbye ownership, the advertised-address mirror, the self-send credit,
+/// the byte counters — are reconciled late, through
+/// [`mdns_proto::Service::note_late_wire_delivery`], which moves no lifecycle
+/// state at all.
+///
+/// # The readiness driver needs none of this
+///
+/// `hick-reactor` drives `poll_send_to` directly, so abandoning an attempt between
+/// polls abandons a future in which the last syscall returned `WouldBlock`:
+/// nothing was submitted and nothing can arrive later. Its per-attempt bound
+/// really is definitive, and that licence is documented there; it does not
+/// generalise here.
+#[derive(Default)]
+struct SendPool {
+  entries: std::vec::Vec<Detached>,
+  ready: std::vec::Vec<Harvest>,
+}
+
+impl SendPool {
+  /// How many more operations may be submitted without exceeding
+  /// [`MAX_DETACHED_SENDS`].
+  fn admit(&self) -> usize {
+    MAX_DETACHED_SENDS.saturating_sub(self.entries.len())
+  }
+
+  fn is_empty(&self) -> bool {
+    self.entries.is_empty()
+  }
+
+  /// Take ownership of one fan-out's detached operations, tagging them with the
+  /// name they pin and the core facts their completion owes.
+  ///
+  /// `facts` is cloned onto EVERY operation of the round, not handed to one of
+  /// them. A dual-stack fan-out detaches up to two operations for one datagram
+  /// and either may be the one that reaches a wire — attaching the facts to only
+  /// the first would lose the latch exactly when the first fails and the second
+  /// succeeds, which is the case the ownership latch exists for. Latching the
+  /// same records twice is idempotent
+  /// ([`mdns_proto::Service::note_late_wire_delivery`]), so the duplicate costs
+  /// nothing but the clone, and a round has at most two.
+  fn park<I: IntoIterator<Item = ParkedOp>>(
+    &mut self,
+    ops: I,
+    name: Option<mdns_proto::Name>,
+    facts: Option<mdns_proto::LateWireFacts>,
+  ) {
+    for parked in ops {
+      self.entries.push(Detached {
+        parked,
+        name: name.clone(),
+        facts: facts.clone(),
+      });
+    }
+  }
+
+  /// Poll every parked operation once with the CURRENT task's waker, moving any
+  /// that completed into `ready`. Returns how many completed.
+  ///
+  /// The waker matters: it is what makes a completion that lands while the driver
+  /// is parked in its `select!` wake the driver rather than sit unnoticed until
+  /// some unrelated timer fires.
+  fn poll_all(&mut self, cx: &mut core::task::Context<'_>) -> usize {
+    let mut i = 0usize;
+    let mut done = 0usize;
+    while i < self.entries.len() {
+      let Some(entry) = self.entries.get_mut(i) else {
+        break;
+      };
+      match core::future::Future::poll(entry.parked.op.as_mut(), cx) {
+        core::task::Poll::Ready(res) => {
+          let entry = self.entries.swap_remove(i);
+          self.ready.push(Harvest {
+            res,
+            parked_when: entry.parked.when,
+            credit: entry.parked.credit,
+            len: entry.parked.len,
+            dst: entry.parked.dst,
+            kind: entry.parked.kind,
+            facts: entry.facts,
+          });
+          done = done.saturating_add(1);
+        }
+        core::task::Poll::Pending => i = i.saturating_add(1),
+      }
+    }
+    done
+  }
+
+  /// Poll every parked operation once and return without waiting.
+  async fn poll_parked(&mut self) {
+    core::future::poll_fn(|cx| {
+      self.poll_all(cx);
+      core::task::Poll::Ready(())
+    })
+    .await;
+  }
+
+  /// Wait until at least one parked operation completes. NEVER completes while
+  /// the pool is empty, so it is safe as a permanent `select!` arm.
+  async fn wait_ready(&mut self) {
+    core::future::poll_fn(|cx| {
+      if self.poll_all(cx) > 0 {
+        core::task::Poll::Ready(())
+      } else {
+        core::task::Poll::Pending
+      }
+    })
+    .await;
+  }
+
+  /// Drain the completions harvested so far.
+  fn take_ready(&mut self) -> std::vec::Vec<Harvest> {
+    core::mem::take(&mut self.ready)
+  }
+
+  /// Republish the pinned-name set onto the driver state, which is where the
+  /// teardown gates read it. Cheap: the pool is capped at
+  /// [`MAX_DETACHED_SENDS`] and this runs only when it changes.
+  fn sync_pins(&self, state: &mut State) {
+    state.unresolved_wire_names.clear();
+    state
+      .unresolved_wire_names
+      .extend(self.entries.iter().filter_map(|e| e.name.clone()));
+  }
+}
+
+/// Apply every completion harvested since the last pass.
+///
+/// A SUCCESSFUL completion is the moment the driver learns the datagram really
+/// did reach a wire, so it owes exactly the facts that do not depend on the round
+/// it belonged to: the self-send credit (or our own loopback is ingested as a
+/// peer's), the byte counters, and — for a service datagram — the core's goodbye
+/// ownership plus the advertised-address mirror the endpoint filters sibling host
+/// records with. It owes NO lifecycle fact: the phase, the deadline, the patience
+/// and the coverage were all settled on time by the confirm, and re-opening them
+/// here is the parked-datagram design this deliberately is not.
+fn reconcile_harvests(inner: &Rc<EndpointInner>, pool: &mut SendPool) {
+  let harvested = pool.take_ready();
+  if harvested.is_empty() {
+    return;
+  }
+  for h in harvested {
+    match &h.res {
+      Ok(_) => {
+        trace!(kind = h.kind, dst = %h.dst, len = h.len, "send_to completed after its round");
+        let mut state = inner.state.borrow_mut();
+        if let Some(credit) = h.credit {
+          crate::selfsend::record_self_send_hashed(&mut state.recent_sends, credit, h.parked_when);
+        }
+        #[cfg(feature = "stats")]
+        {
+          state.stats.packets_tx(1);
+          state.stats.bytes_tx(h.len as u64);
+        }
+        if let Some(facts) = h.facts {
+          state.note_late_wire_delivery(StdInstant::now(), facts);
+        }
+      }
+      Err(_e) => {
+        debug!(kind = h.kind, error = %_e, dst = %h.dst, "detached send_to failed");
+        #[cfg(feature = "stats")]
+        inner.state.borrow().stats.send_errors(1);
+      }
+    }
+  }
+  pool.sync_pins(&mut inner.state.borrow_mut());
+}
+
+/// The wall clock ONE driver pass may spend inside bounded send attempts, across
+/// the transmit pump AND the withdrawal pump together.
+///
+/// The per-pass send credits cannot bound a pass on their own now that an
+/// unresolved family is WAITED for rather than cancelled: a fan-out both families
+/// wedge still costs a full [`SEND_ATTEMPT_TIMEOUT`], and the producers are served
+/// serially, so a pass of `n` due producers ran for `n × SEND_ATTEMPT_TIMEOUT`
+/// with nothing else in the loop running — no recv, no timer, no dropped-handle
+/// sweep.
+///
+/// A LIVENESS knob on the same terms as [`SEND_ATTEMPT_TIMEOUT`]: it buys nothing
+/// about wire freshness, it only bounds how long the loop can go without
+/// servicing everything else it owns. 500 ms is two attempt bounds, the smallest
+/// value that lets a pass with a wedged family still make forward progress —
+/// [`DrainBudget::may_start_fanout`] reserves a whole attempt's worth before
+/// admitting one, so a pass starts at least one fan-out and at most two entirely
+/// wedged ones. Mirrors `hick-reactor::driver::DRAIN_PASS_BUDGET`.
+const DRAIN_PASS_BUDGET: Duration = Duration::from_millis(500);
+
+/// The two bounds one driver pass spends: [`MAX_TRANSMIT_CREDITS_PER_PASS`] actual
+/// fan-outs, and [`DRAIN_PASS_BUDGET`] of wall clock shared by every fan-out the
+/// pass performs.
+///
+/// One value threaded through both pumps so the budget is genuinely per PASS.
+/// Withdrawals are drained after transmits, so a pass whose transmits spend the
+/// whole budget defers its goodbyes — but only to the next pass, which the
+/// `force_now` re-settle starts without parking, and the goodbye resend schedule
+/// the endpoint owns re-arms them regardless.
+struct DrainBudget {
+  credits: usize,
+  deadline: StdInstant,
+  /// Whether this pass has started a fan-out yet. See
+  /// [`Self::may_start_fanout`]'s forward-progress clause.
+  started: bool,
+}
+
+impl DrainBudget {
+  /// Open a fresh budget for a pass beginning at `pass_start`.
+  fn new(pass_start: StdInstant) -> Self {
+    Self {
+      credits: MAX_TRANSMIT_CREDITS_PER_PASS,
+      deadline: pass_start
+        .checked_add(DRAIN_PASS_BUDGET)
+        .unwrap_or(pass_start),
+      started: false,
+    }
+  }
+
+  /// Whether another fan-out may START.
+  ///
+  /// Requires a whole [`SEND_ATTEMPT_TIMEOUT`] of budget left, not merely a
+  /// non-zero remainder: a fan-out that begins inside the budget runs to its own
+  /// bound regardless, so admitting one with less than that left would let the
+  /// pass overrun. Reserving it up front makes [`DRAIN_PASS_BUDGET`] a ceiling on
+  /// the pass rather than on the point at which it stops taking work.
+  ///
+  /// The FIRST fan-out of a pass is admitted regardless of the clock, so a pass
+  /// whose preamble somehow outran the budget still takes work instead of
+  /// reporting more pending and re-entering to do the same again.
+  fn may_start_fanout(&self) -> bool {
+    self.credits > 0
+      && (!self.started
+        || self
+          .deadline
+          .checked_duration_since(StdInstant::now())
+          .is_some_and(|left| left >= SEND_ATTEMPT_TIMEOUT))
+  }
+
+  /// Charge one fan-out, and record that this pass has taken work.
+  fn charge(&mut self) {
+    self.credits = self.credits.saturating_sub(1);
+    self.started = true;
+  }
 }
 
 /// Map a PRESENT (bound) family's `send_to` result to its per-family withdrawal
@@ -2094,21 +2837,43 @@ fn present_socket_send_outcome<T>(res: &std::io::Result<T>) -> WithdrawalSend {
 ///     is the backstop for a genuinely-wedged bound socket;
 ///   * absent socket (family not bound) → [`WithdrawalSend::WriteOff`] (no reachable
 ///     peers on it), so its debt never pins the withdrawal past the other family.
+///
+/// Shares the pass's [`DrainBudget`] with the transmit pump — the wall clock is
+/// per PASS, and a goodbye deferred by an exhausted budget is re-armed by the
+/// endpoint's own resend schedule and pumped by the immediate re-settle. Returns
+/// `true` when it stopped on the budget with goodbyes still due.
+///
+/// Every operation it submits but does not see finish is parked in `pool` under
+/// the item's instance NAME, so that name cannot be released while a TTL=0
+/// goodbye for it is still unresolved.
 async fn drain_withdrawals(
   inner: &Rc<EndpointInner>,
   sock_v4: &Option<Rc<Socket>>,
   sock_v6: &Option<Rc<Socket>>,
   scratch: &mut [u8],
-) {
+  budget: &mut DrainBudget,
+  pool: &mut SendPool,
+) -> bool {
+  let mut budget_stopped = false;
   loop {
+    if !budget.may_start_fanout() {
+      // Only report a stop if something was actually still due.
+      budget_stopped = {
+        let s = inner.state.borrow();
+        s.next_withdrawal_deadline()
+          .is_some_and(|at| at <= StdInstant::now())
+      };
+      break;
+    }
     let due = {
       let mut s = inner.state.borrow_mut();
       let now = StdInstant::now();
       s.poll_one_withdrawal(now, scratch)
     };
-    let Some((_dst, len, token)) = due else {
+    let Some((_dst, len, token, name)) = due else {
       break;
     };
+    budget.charge();
     // Fan out to every bound family on the mDNS multicast group, concurrently
     // and with each attempt bounded, for the same reason the positive-TTL
     // fan-out is: this pump runs in the driver loop, so a family that never
@@ -2124,20 +2889,51 @@ async fn drain_withdrawals(
     // (`note_withdrawal_result`), which already spaces the resends, and holding
     // one back here would leave a family's peers pinned to positive-TTL records
     // it has already been promised the retraction of.
+    let admit = pool.admit();
     let (a4, a6) = futures::future::join(
-      attempt_send_to(sock_v4.as_deref(), true, &scratch[..len], MDNS_V4_DST),
-      attempt_send_to(sock_v6.as_deref(), true, &scratch[..len], MDNS_V6_DST),
+      attempt_send_to(
+        sock_v4.as_ref(),
+        true,
+        admit >= 1,
+        &scratch[..len],
+        MDNS_V4_DST,
+      ),
+      attempt_send_to(
+        sock_v6.as_ref(),
+        true,
+        admit >= 2,
+        &scratch[..len],
+        MDNS_V6_DST,
+      ),
     )
     .await;
     let outcome = |attempt: &SendAttempt| match attempt {
       SendAttempt::Unbound => WithdrawalSend::WriteOff,
       SendAttempt::Answered(res, _, _) => present_socket_send_outcome(res),
-      // Unreachable: this fan-out passes `may_send == true` for both families.
-      SendAttempt::Gated | SendAttempt::TimedOut => WithdrawalSend::Retry,
+      // A detached goodbye has not been observed to reach a wire, so the family
+      // keeps its debt exactly as a transient error would — and the name it
+      // advertises stays pinned until the operation resolves. `Gated` is
+      // unreachable: this fan-out passes `may_send == true` for both families.
+      SendAttempt::Gated | SendAttempt::Refused | SendAttempt::Detached(_, _) => {
+        WithdrawalSend::Retry
+      }
     };
     let (v4_out, v6_out) = (outcome(&a4), outcome(&a6));
     note_multicast_attempt(inner, &a4, &scratch[..len], MDNS_V4_DST, "withdrawal");
     note_multicast_attempt(inner, &a6, &scratch[..len], MDNS_V6_DST, "withdrawal");
+    {
+      let credit = Some(crate::selfsend::credit_of(&scratch[..len]));
+      let mut parked = std::vec::Vec::new();
+      park_detached(&mut parked, a4, credit, len, MDNS_V4_DST, "withdrawal");
+      park_detached(&mut parked, a6, credit, len, MDNS_V6_DST, "withdrawal");
+      if !parked.is_empty() {
+        // A goodbye carries no per-datagram exposure the core tracks — it
+        // WITHDRAWS records rather than advertising them — so it parks the name
+        // pin alone.
+        pool.park(parked, Some(name), None);
+        pool.sync_pins(&mut inner.state.borrow_mut());
+      }
+    }
     // Count the goodbye as a delivered round when at least one family Sent;
     // `send_to` already bumped packets_tx/bytes_tx/send_errors per family above.
     #[cfg(feature = "stats")]
@@ -2166,6 +2962,7 @@ async fn drain_withdrawals(
   if gcd_any {
     inner.notify.notify();
   }
+  budget_stopped
 }
 
 #[inline]

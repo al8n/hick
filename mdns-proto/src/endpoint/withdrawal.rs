@@ -741,12 +741,72 @@ where
     /// in `poll_withdrawal_transmit` too, so a route can never be pinned past the
     /// ceiling waiting for a final attempt that can't be made.
     pub fn drain_completed_withdrawals<E: Extend<ServiceHandle>>(&mut self, now: I, out: &mut E) {
+      self.drain_completed_withdrawals_gated(now, out, |_| false);
+    }
+
+    /// The instance name a withdrawal item's goodbye advertises, or `None` for an
+    /// unknown token.
+    ///
+    /// A driver whose transport cannot definitively cancel a submitted send needs
+    /// this to key the goodbye datagram it is about to fan out against
+    /// [`Self::drain_completed_withdrawals_gated`]: a TTL=0 goodbye that is still
+    /// unresolved when the item completes and the route is freed can land AFTER a
+    /// same-name replacement has registered and announced, erasing the
+    /// replacement's records from every peer cache that hears it.
+    pub fn withdrawal_instance(&self, token: WithdrawalToken) -> Option<&Name> {
+      self
+        .withdrawals
+        .iter()
+        .find(|(t, _)| *t == token)
+        .map(|(_, w)| w.records.instance())
+    }
+
+    /// [`Self::drain_completed_withdrawals`], holding back any item whose instance
+    /// name `pinned` reports still has an UNRESOLVED datagram on it.
+    ///
+    /// # Why a completion gate exists at all
+    ///
+    /// A completion-based transport cannot definitively cancel a submitted send:
+    /// abandoning the operation stops the driver observing it, not the kernel
+    /// delivering it. Two things then depend on the name outliving the datagram,
+    /// and both are silent when they break:
+    ///
+    /// * a still-unresolved POSITIVE-TTL datagram that lands after this item
+    ///   completed leaves its records in every peer cache that hears it for a full
+    ///   TTL with no owner — the service is gone, so nothing will ever retract
+    ///   them;
+    /// * a still-unresolved TTL=0 GOODBYE that lands after the route was freed and
+    ///   a same-name replacement registered and announced erases the
+    ///   REPLACEMENT's records instead of the dead service's.
+    ///
+    /// Holding the item — and with it the route, and with the route the
+    /// [`RegisterServiceError::NameAlreadyRegistered`]
+    /// guard — until the wire resolves closes both. This is the same requirement
+    /// [`Service::withdrawal_snapshot`](crate::service::Service::withdrawal_snapshot)'s
+    /// contract already states for the START of a withdrawal ("taken with no
+    /// datagram outstanding"), applied to its END.
+    ///
+    /// The 2 s `WITHDRAWAL_CEILING` deliberately does not override this. That
+    /// ceiling caps goodbye SCHEDULING — how long an unreachable family may keep a
+    /// name pinned waiting for resends it will never make — and a datagram whose
+    /// fate is unknown is not a scheduling question.
+    ///
+    /// `pinned` MUST be keyed on the instance NAME and nothing coarser. Gating on
+    /// "any unresolved datagram" would let one wedged service's operation wedge
+    /// every other service's teardown, which trades a silent correctness bug for a
+    /// loud liveness one.
+    pub fn drain_completed_withdrawals_gated<E, F>(&mut self, now: I, out: &mut E, mut pinned: F)
+    where
+      E: Extend<ServiceHandle>,
+      F: FnMut(&Name) -> bool,
+    {
       // Collect completed tokens first so the route/withdrawal removals below do
       // not fight the iteration borrow.
       let completed: std::vec::Vec<WithdrawalToken> = self
         .withdrawals
         .iter()
         .filter(|(_, w)| w.owed == [0, 0] || (now >= w.ceiling_at && w.final_attempt))
+        .filter(|(_, w)| !pinned(w.records.instance()))
         .map(|(t, _)| *t)
         .collect();
       for token in completed {

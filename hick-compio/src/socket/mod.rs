@@ -259,10 +259,24 @@ impl Socket {
         let compio_buf::BufResult(res, _) = self.inner.send_to(data, dst).await;
         res
       }
-      _ => {
-        let compio_buf::BufResult(res, _) = self.inner.send_to(data, dst).await;
-        res
-      }
+      _ => self.send_to_owned(data, dst).await,
     }
+  }
+
+  /// Send an ALREADY-OWNED datagram to `dst` with no cmsg payload.
+  ///
+  /// compio is completion-based: the operation takes ownership of its buffer for
+  /// as long as the kernel holds it. Taking the `Vec` rather than a slice means
+  /// the driver's transmit path copies the encoded datagram out of its scratch
+  /// buffer exactly once, and lets the resulting future be `'static` — which is
+  /// what allows a send the driver stopped waiting for to be kept alive to its
+  /// true completion instead of dropped (see `driver::SendPool`).
+  pub(crate) async fn send_to_owned(
+    &self,
+    data: std::vec::Vec<u8>,
+    dst: core::net::SocketAddr,
+  ) -> std::io::Result<usize> {
+    let compio_buf::BufResult(res, _) = self.inner.send_to(data, dst).await;
+    res
   }
 }

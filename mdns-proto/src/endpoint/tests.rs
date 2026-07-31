@@ -4265,6 +4265,143 @@ fn withdrawal_send_as_str_slug_for_every_variant() {
   );
 }
 
+/// Register `instance` and put a route-attached withdrawal owning real instance
+/// records behind it, so a test can drive the completion gate.
+fn withdrawing_service(
+  ep: &mut TestEndp,
+  instance: &str,
+  now: StdInstant,
+) -> (ServiceHandle, Name) {
+  let inst = Name::try_from_str(instance).unwrap();
+  let recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    inst.clone(),
+    Name::try_from_str("h.local.").unwrap(),
+    631,
+    120,
+  );
+  let (h, _svc) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs.clone()),
+      now,
+    )
+    .unwrap();
+  let snap = crate::service::WithdrawalSnapshot {
+    records: recs,
+    owned: crate::service::EmittedRecords::new(
+      true,
+      true,
+      true,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    ),
+    host_a: std::vec::Vec::new(),
+    host_aaaa: std::vec::Vec::new(),
+  };
+  ep.begin_withdrawal(h, snap, now);
+  (h, inst)
+}
+
+/// A completion-based driver cannot definitively cancel a submitted send, so a
+/// datagram it stopped waiting for may still reach a wire. Completing that name's
+/// withdrawal while one is outstanding is silently wrong in both directions: a
+/// late POSITIVE-TTL datagram strands records in peer caches for a full TTL with
+/// no owner, and a late TTL=0 goodbye lands after the freed name was re-taken and
+/// erases the REPLACEMENT's records.
+///
+/// The 2 s anti-pin ceiling does not override the gate. That ceiling bounds
+/// goodbye SCHEDULING — how long an unreachable family keeps a name pinned
+/// waiting for resends it will never make — and a datagram whose fate is unknown
+/// is not a scheduling question.
+#[test]
+fn a_pinned_name_holds_its_withdrawal_and_its_route_past_the_ceiling() {
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+  let (h, inst) = withdrawing_service(&mut ep, "Pinned._ipp._tcp.local.", now);
+  let token = ep.route_withdrawal_token(h).unwrap();
+
+  // Spend the whole budget: nothing but the gate is holding this item now.
+  for _ in 0..super::WITHDRAWAL_SENDS {
+    ep.note_withdrawal_result(
+      token,
+      now,
+      super::WithdrawalSend::Sent,
+      super::WithdrawalSend::Sent,
+    );
+  }
+  assert_eq!(ep.route_withdrawal_owed(h), Some([0, 0]));
+
+  // Well past the anti-pin ceiling, with the name still on the wire.
+  let past_ceiling = now + super::WITHDRAWAL_CEILING + core::time::Duration::from_secs(5);
+  let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+  ep.drain_completed_withdrawals_gated(past_ceiling, &mut done, |n| n.as_str() == inst.as_str());
+  assert!(
+    done.is_empty(),
+    "an item whose name still has an unresolved datagram must not complete, \
+     however long its ceiling has passed"
+  );
+  let dup = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    inst.clone(),
+    Name::try_from_str("h2.local.").unwrap(),
+    631,
+    120,
+  );
+  assert!(
+    matches!(
+      ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(dup),
+        past_ceiling,
+      ),
+      Err(RegisterServiceError::NameAlreadyRegistered(_))
+    ),
+    "the route is held with the item, so no replacement can register into the \
+     path of a datagram that predates it"
+  );
+
+  // The wire resolves; the item completes on the very next drain.
+  ep.drain_completed_withdrawals_gated(past_ceiling, &mut done, |_| false);
+  assert!(
+    done.contains(&h),
+    "the gate is a HOLD, not a cancel: once the datagram resolves the withdrawal \
+     completes and the name is released"
+  );
+}
+
+/// The gate keys on the instance NAME and nothing coarser. Gating on "any
+/// unresolved datagram" would let one wedged service's operation wedge every
+/// other service's teardown — a loud liveness bug traded for a silent
+/// correctness one, and no improvement.
+#[test]
+fn a_pin_on_one_name_does_not_hold_another_services_withdrawal() {
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+  let (a, wedged) = withdrawing_service(&mut ep, "Wedged._ipp._tcp.local.", now);
+  let (b, _healthy) = withdrawing_service(&mut ep, "Healthy._ipp._tcp.local.", now);
+
+  for h in [a, b] {
+    let token = ep.route_withdrawal_token(h).unwrap();
+    for _ in 0..super::WITHDRAWAL_SENDS {
+      ep.note_withdrawal_result(
+        token,
+        now,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Sent,
+      );
+    }
+  }
+
+  let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+  ep.drain_completed_withdrawals_gated(now, &mut done, |n| n.as_str() == wedged.as_str());
+  assert!(
+    done.contains(&b),
+    "a service whose own name is resolved must complete regardless of what any \
+     other service's wire is doing"
+  );
+  assert!(!done.contains(&a), "…and only the pinned one is held");
+}
+
 /// regression: a withdrawal is NOT freed until EVERY reachable
 /// family has sent the goodbye. Pump WITHDRAWAL_SENDS rounds with `v4 = Sent,
 /// v6 = Retry`: v4's debt drains to 0 but v6 still owes, so the withdrawal is

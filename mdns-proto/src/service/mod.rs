@@ -156,8 +156,8 @@ cfg_heap! {
 #[allow(unused_imports)]
 pub(crate) use schedule::{
   FamilyPatience, MAX_PARTIAL_ROUNDS, PhaseAdvance, announce_deadline, classify_advance,
-  compose_announce_deadline, partial_announce_deadline, probe_deadline, re_announce_deadline,
-  stalest_refresh_due,
+  compose_announce_deadline, partial_announce_deadline, probe_deadline, probe_retry_deadline,
+  re_announce_deadline, stalest_refresh_due,
 };
 pub use state::ServiceState;
 
@@ -714,6 +714,71 @@ cfg_heap! {
 }
 
 cfg_heap! {
+  /// What a datagram still owes the core if it reaches a wire AFTER the round it
+  /// belonged to was already confirmed.
+  ///
+  /// # Why this exists
+  ///
+  /// A completion-based transport cannot definitively cancel a submitted send:
+  /// abandoning the operation stops the driver observing it, not the kernel
+  /// delivering it. Such a driver has two consumers of one confirm with opposite
+  /// tolerances. The phase and the schedule need it ON TIME and tolerate a
+  /// conservative falsehood — reporting an unresolved family
+  /// [`FamilyDelivery::Missed`] can only make advancement slower, never wrong. Goodbye ownership and teardown need the
+  /// TRUTH and tolerate lateness — a record that reached a peer cache must be
+  /// retractable however long the driver took to find out.
+  ///
+  /// So the confirm happens on time with the conservative fact, and the WIRE fact
+  /// alone is reconciled later through this value. It is emphatically NOT a way to
+  /// defer a confirm: [`Service::note_late_wire_delivery`] moves ZERO lifecycle
+  /// state, so no datagram's lifecycle effect ever outlives its round.
+  ///
+  /// Minted by [`Service::late_wire_facts`] while the commit token is still live,
+  /// and applied by [`Service::note_late_wire_delivery`] if — and only if — the
+  /// operation is later observed to have reached a wire. It has no public
+  /// constructor and names the service it was minted from, so it can neither be
+  /// forged nor applied to a different service.
+  #[derive(Debug, Clone)]
+  #[must_use]
+  pub struct LateWireFacts {
+    /// The service this datagram belonged to.
+    handle: ServiceHandle,
+    /// The records — and therefore the instance NAME — the datagram advertised,
+    /// captured while the token was live. Captured rather than re-read at
+    /// application time for [`Service::stale_live_commit_token`]'s reason: by
+    /// then a RFC 6762 §9 rename may have moved the name out from under it.
+    records: ServiceRecords,
+    /// What the encoder reported this datagram put on the wire, or `None` when it
+    /// advertised nothing at all (a §8.1 probe is a QUESTION, and a RFC 6763 §9
+    /// meta-response carries only a shared PTR).
+    emitted: Option<respond::EmittedRecords>,
+  }
+
+  impl LateWireFacts {
+    /// The service these facts belong to. A driver routes the late intake on this
+    /// rather than on a handle it kept alongside, so the fact and its subject
+    /// cannot be separated.
+    #[inline]
+    pub const fn handle(&self) -> ServiceHandle {
+      self.handle
+    }
+
+    /// The instance name this datagram advertised.
+    ///
+    /// A driver that cannot cancel a submitted send must keep that name reserved
+    /// until the operation resolves: a RFC 6762 §10.1 goodbye taken while it is
+    /// outstanding withdraws less than the datagram is about to expose (see
+    /// [`Service::withdrawal_snapshot`]'s contract), and a route freed while it is
+    /// outstanding lets a same-name replacement register into the path of a
+    /// datagram that predates it.
+    #[inline]
+    pub fn instance(&self) -> &crate::name::Name {
+      self.records.instance()
+    }
+  }
+}
+
+cfg_heap! {
   /// Service state machine. One per registered service.
   ///
   /// Driving one means honouring two call-ordering contracts: drain
@@ -1203,7 +1268,14 @@ where
             // advance the sequence. Re-arm the SAME probe from post-send time so
             // it retries, rather than the service progressing toward Announcing
             // while a link that has never been asked might already hold the name.
-            self.lifecycle_deadline = probe_deadline(now, n, &mut self.rng);
+            //
+            // A RETRY, not an initial schedule: `probe_deadline(now, 0, ..)` would
+            // hand probe 0 §8.1's random 0–250 ms *initial* delay, so a
+            // partially-delivered probe 0 could go back on the wire less than
+            // 250 ms after the copy that was delivered. The spacing is about
+            // transmissions, so every re-arm owes `PROBE_INTERVAL` regardless of
+            // index — see `probe_retry_deadline`.
+            self.lifecycle_deadline = probe_retry_deadline(now);
           } else {
             // Only a genuine delivery counts: `probes_tx` means "reached every
             // obligated link", so an excused advance must not inflate it.
@@ -1538,6 +1610,131 @@ where
       (Some(emitted), Some(records)) => StaleRecords::OldName { records, emitted },
     };
     self.awaiting_confirm = Some(AwaitingConfirm::Stale { fact, records });
+  }
+
+  /// Capture the WIRE facts of the datagram currently awaiting confirmation, so a
+  /// driver that cannot definitively cancel a submitted send can reconcile them if
+  /// the send is later observed to have reached a wire.
+  ///
+  /// Returns `None` when no datagram is outstanding.
+  ///
+  /// # When to call it
+  ///
+  /// While the commit token is still live — i.e. AFTER the fan-out returns and
+  /// BEFORE [`Self::note_transmit_outcome`] consumes it — and only for a round the
+  /// driver is about to confirm with an unresolved family reported
+  /// [`FamilyDelivery::Missed`]. A driver whose transport resolves every send
+  /// definitively (readiness I/O, where an abandoned attempt was never submitted)
+  /// needs none of this and should not call it.
+  ///
+  /// # What it does NOT do
+  ///
+  /// Nothing. It is a pure read: the token stays live, the phase stays put, and
+  /// the confirm that follows behaves exactly as it would have. The captured facts
+  /// only ever reach the service through [`Self::note_late_wire_delivery`], and
+  /// only if the operation really did reach a wire.
+  pub fn late_wire_facts(&self) -> Option<LateWireFacts> {
+    let (records, emitted) = match self.awaiting_confirm.as_ref()? {
+      // A probe is a QUESTION (§8.1) and a §9 meta-response carries only a shared
+      // meta-PTR: neither advertises an instance-owned record, so neither has
+      // anything to latch. They still name the service's current instance, which
+      // is what a driver holding the name reserved keys on.
+      AwaitingConfirm::Probe | AwaitingConfirm::MetaResponse => (self.records.clone(), None),
+      AwaitingConfirm::Announcement(e) => (self.records.clone(), Some(e.clone())),
+      AwaitingConfirm::Response(e, _) => (self.records.clone(), Some(e.clone())),
+      // A regression already voided this datagram's LIFECYCLE meaning and recorded
+      // whose records it put on the wire; a late arrival owes exactly that same
+      // wire fact, so the capture is read straight off it rather than recomputed.
+      AwaitingConfirm::Stale { records, .. } => match records {
+        StaleRecords::None => (self.records.clone(), None),
+        StaleRecords::SameName(e) => (self.records.clone(), Some(e.clone())),
+        StaleRecords::OldName { records, emitted } => (records.clone(), Some(emitted.clone())),
+      },
+    };
+    Some(LateWireFacts {
+      handle: self.handle,
+      records,
+      emitted,
+    })
+  }
+
+  /// Apply the WIRE facts of a datagram that reached a wire AFTER the round it
+  /// belonged to was confirmed.
+  ///
+  /// **Moves ZERO lifecycle facts.** No phase, no deadline, no patience, no
+  /// coverage, no `fully_announced`, no counter of the round that has already been
+  /// classified. The lifecycle was settled on time, conservatively, by the confirm;
+  /// the only thing still outstanding is whether these records are in a peer cache
+  /// and therefore need retracting (RFC 6762 §10.1). That, and nothing else, is
+  /// what this latches — the same split the `Stale` confirm arm makes for a
+  /// datagram whose generation was replaced.
+  ///
+  /// A no-op for facts minted by a DIFFERENT service, and for a datagram that
+  /// advertised nothing.
+  ///
+  /// # Drain contract for the rename goodbye handoff
+  ///
+  /// As with [`Self::note_transmit_outcome`], a driver MUST call
+  /// [`Self::take_rename_goodbye_handoff`] after every call to this method. If a
+  /// RFC 6762 §9 rename happened while the operation was unresolved, the records
+  /// it exposed belong to a name this service no longer holds, and the handoff is
+  /// the only thing that will ever withdraw them.
+  pub fn note_late_wire_delivery(&mut self, facts: LateWireFacts) {
+    let LateWireFacts {
+      handle,
+      records,
+      emitted,
+    } = facts;
+    // The token names its own service, so a transplant is a no-op rather than a
+    // cross-service latch.
+    if handle != self.handle {
+      return;
+    }
+    let Some(emitted) = emitted else {
+      return;
+    };
+    if self
+      .records
+      .instance()
+      .as_str()
+      .eq_ignore_ascii_case(records.instance().as_str())
+    {
+      // The name is unchanged, so peers hold these records under the very name
+      // this service still owns: ownership latches exactly as an on-time confirm
+      // would have latched it. `record_emitted` is idempotent (`|=` on each kind,
+      // de-duplicated per address), so a second family's late arrival re-latching
+      // the same records changes nothing.
+      self.goodbye.record_emitted(&emitted);
+      return;
+    }
+    // A §9 rename happened while the operation was unresolved. The host name is
+    // invariant across an instance rename, so the addresses this datagram carried
+    // are cached under a name the service still holds and stay its to withdraw;
+    // the INSTANCE records belong to the renamed-away name and go to its detached
+    // §10.1 goodbye instead. Identical to the `StaleRecords::OldName` arm.
+    self.goodbye.record_host_emitted(&emitted);
+    let instance = respond::EmittedRecords::new(
+      emitted.ptr(),
+      emitted.srv(),
+      emitted.txt(),
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      emitted.subtypes(),
+    );
+    if instance.is_empty() {
+      // §7.1 trimmed every instance record: the old name put nothing in any peer
+      // cache, so it has nothing to withdraw.
+      return;
+    }
+    match &mut self.rename_goodbye_handoff {
+      Some(h) => h.owned.merge_instance(&instance),
+      None => {
+        self.rename_goodbye_handoff = Some(RenameGoodbyeHandoff {
+          records,
+          owned: instance,
+        });
+      }
+    }
   }
 
   /// Re-arm `lifecycle_deadline` on the rung the RFC 6762 §8.3 partial ladder has
