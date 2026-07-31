@@ -448,7 +448,20 @@ where
     ///
     /// The token names its own service, so the confirm takes no separate handle:
     ///
-    /// ```
+    // This doctest and its `compile_fail` twin below share a preamble that needs
+    // BOTH `std` (the `StdInstant` alias only implements `mdns_proto::Instant`
+    // under `std`, see `time.rs`) AND `slab` (`slab::Slab` only implements
+    // `mdns_proto::Pool` under `slab`, see `pool.rs`) to compile at all. Gate
+    // both fences on `all(std, slab)` — they are a deliberate pair: the twin
+    // below proves the handle mismatch fails to compile for the RIGHT reason,
+    // and this one proves the shared preamble compiles when both features are
+    // present. Gating or deleting only one lets the other pass vacuously
+    // elsewhere: a preamble that fails to *build* (missing `std` or `slab`,
+    // e.g. the `alloc`-only tier, or the `std`-without-`slab` tiers such as
+    // plain `std` or `metrics`) is not the same as the API *rejecting* the
+    // mismatch it documents. Keep them gated together.
+    #[cfg_attr(all(feature = "std", feature = "slab"), doc = "```")]
+    #[cfg_attr(not(all(feature = "std", feature = "slab")), doc = "```ignore")]
     /// # use core::net::{Ipv4Addr, Ipv6Addr};
     /// # use std::time::Instant as StdInstant;
     /// # use mdns_proto::{
@@ -478,7 +491,12 @@ where
     /// Pairing one service's proof with ANOTHER service's handle — the transplant
     /// this signature exists to rule out — does not compile:
     ///
-    /// ```compile_fail
+    // Paired with the positive doctest above over the same preamble that needs
+    // BOTH `std` and `slab` (see the comment there for why). Gated identically
+    // so this can't start passing vacuously — for the wrong reason — on a tier
+    // missing either feature.
+    #[cfg_attr(all(feature = "std", feature = "slab"), doc = "```compile_fail")]
+    #[cfg_attr(not(all(feature = "std", feature = "slab")), doc = "```ignore")]
     /// # use core::net::{Ipv4Addr, Ipv6Addr};
     /// # use std::time::Instant as StdInstant;
     /// # use mdns_proto::{
