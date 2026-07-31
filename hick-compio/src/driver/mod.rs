@@ -1780,11 +1780,15 @@ impl Fanout {
 /// kernel that never completes one stalls the loop — and this is what makes that
 /// stall visible in a log instead of leaving it to be inferred from silence.
 ///
-/// Two orders of magnitude above RFC 6762 §8.1's 250 ms inter-probe interval, the
-/// shortest cadence the protocol itself schedules, and far above any healthy
-/// datagram send. Ordinary scheduling jitter cannot reach it, so a line here
-/// means the send path itself is wedged.
-const FANOUT_STALL_TRACE: Duration = Duration::from_secs(5);
+/// Matches the smallest slack this driver can ever be given. [`run`]'s
+/// minimum-TTL note derives `TTL - max(floor(0.8 * TTL), 1 s)` as the margin a
+/// stall must stay under to keep a record fresh; that margin is exactly 1 s at
+/// [`mdns_proto::constants::MIN_SERVICE_TTL_SECS`], the lowest TTL a service can
+/// register at. A stall shorter than this cannot yet have cost a refresh at any
+/// registrable TTL; one that reaches it already could have, at that floor — so
+/// this is the latest the trace could fire without falling silent on exactly
+/// the hazard [`run`] documents.
+const FANOUT_STALL_TRACE: Duration = Duration::from_secs(1);
 
 /// Await one send fan-out, tracing ONCE if it has not completed within
 /// [`FANOUT_STALL_TRACE`].
