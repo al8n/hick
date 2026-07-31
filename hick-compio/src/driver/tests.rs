@@ -327,7 +327,13 @@ fn establish_service(
     let ctx = s.services.get_mut(&handle).unwrap();
     let _ = ctx.proto.handle_timeout(t);
     while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-      ctx.proto.note_transmit_delivered(t);
+      ctx.proto.note_transmit_outcome(
+        t,
+        mdns_proto::TransmitDelivery::new(
+          mdns_proto::FamilyDelivery::Delivered,
+          mdns_proto::FamilyDelivery::Delivered,
+        ),
+      );
     }
   }
   assert!(

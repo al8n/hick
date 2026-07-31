@@ -13,6 +13,18 @@ fn lock_mailbox_for_test(
     .drain_for_test()
 }
 
+/// Confirm a send BOTH families carried, for tests that drive a service with no
+/// bound sockets and must still see the announce/host-latch guards fire.
+fn deliver_both(proto: &mut ProtoService, now: StdInstant) {
+  proto.note_transmit_outcome(
+    now,
+    mdns_proto::TransmitDelivery::new(
+      mdns_proto::FamilyDelivery::Delivered,
+      mdns_proto::FamilyDelivery::Delivered,
+    ),
+  );
+}
+
 #[test]
 fn on_link_check_rejects_non_255_ttl() {
   // only TTL/Hop-Limit exactly 255 (or an absent value, where we
@@ -779,8 +791,8 @@ async fn same_name_replacement_is_rejected_until_withdrawal_completes() {
 
   // 1. Register A and drive its proto to an announced state so the withdrawal
   //    snapshot is NON-empty (records were confirmed-emitted). Delivery is
-  //    simulated via `note_transmit_delivered` so the announce/host guards
-  //    latch (no sockets are bound).
+  //    simulated via `deliver_both` so the announce/host guards latch (no
+  //    sockets are bound).
   let a = state.register_service(mk(), now).unwrap().handle;
   {
     let ctx = state.services.get_mut(&a).unwrap();
@@ -790,7 +802,7 @@ async fn same_name_replacement_is_rejected_until_withdrawal_completes() {
       t += Duration::from_millis(300);
       let _ = ctx.proto.handle_timeout(t);
       while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        ctx.proto.note_transmit_delivered(t);
+        deliver_both(&mut ctx.proto, t);
       }
     }
   }
@@ -897,7 +909,7 @@ async fn queued_conflict_survives_withdrawal_gc() {
       t += Duration::from_millis(300);
       let _ = ctx.proto.handle_timeout(t);
       while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        ctx.proto.note_transmit_delivered(t);
+        deliver_both(&mut ctx.proto, t);
       }
     }
   }
@@ -1007,7 +1019,7 @@ async fn dropped_reply_reclaiming_register_keeps_old_name_goodbye() {
       t += Duration::from_millis(300);
       let _ = ctx.proto.handle_timeout(t);
       while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        ctx.proto.note_transmit_delivered(t);
+        deliver_both(&mut ctx.proto, t);
       }
     }
     assert!(
@@ -1040,7 +1052,7 @@ async fn dropped_reply_reclaiming_register_keeps_old_name_goodbye() {
       let ctx = state.services.get_mut(&handle).unwrap();
       let _ = ctx.proto.handle_timeout(t);
       while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        ctx.proto.note_transmit_delivered(t);
+        deliver_both(&mut ctx.proto, t);
       }
     }
     {
@@ -1165,7 +1177,7 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
       t += Duration::from_millis(300);
       let _ = ctx.proto.handle_timeout(t);
       while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        ctx.proto.note_transmit_delivered(t);
+        deliver_both(&mut ctx.proto, t);
       }
     }
   }
@@ -1301,7 +1313,7 @@ async fn terminal_survives_full_mailbox_and_immediate_ctx_gc() {
       t += Duration::from_millis(300);
       let _ = ctx.proto.handle_timeout(t);
       while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        ctx.proto.note_transmit_delivered(t);
+        deliver_both(&mut ctx.proto, t);
       }
     }
   }

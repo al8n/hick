@@ -1082,10 +1082,10 @@ where
   /// * **Goodbye ownership latches iff [`TransmitDelivery::any_delivered`]** —
   ///   peers reachable over any link that accepted the datagram may hold the
   ///   records it carried (RFC 6762 §10.1), whether or not every link did.
-  /// * **Phase advances iff [`TransmitDelivery::all_delivered`]** — a link that
-  ///   never saw the probe has not been asked (§8.1) and one that never saw the
-  ///   announcement has not been told (§8.3). The two ways a phase moves without
-  ///   that, and what they deliberately do NOT earn, are below.
+  /// * **Phase takes full credit iff [`TransmitDelivery::all_delivered`]** — a
+  ///   link that never saw the probe has not been asked (§8.1) and one that
+  ///   never saw the announcement has not been told (§8.3). The phase can also
+  ///   advance WITHOUT that credit, via the two bounded escapes described below.
   ///
   /// Behaviour per commit token:
   ///
@@ -1627,23 +1627,6 @@ where
       Some(token) => token.obligation(),
       None => TransmitObligation::OneShot,
     }
-  }
-
-  /// Convenience wrapper for a send BOTH families carried — equivalent to a
-  /// [`Self::note_transmit_outcome`] whose every family is
-  /// [`FamilyDelivery::Delivered`]. All advancement logic lives there.
-  ///
-  /// It asserts the strongest possible shape, so a caller that cannot honestly
-  /// say both families were obligated AND both accepted the datagram must build
-  /// the [`TransmitDelivery`] itself: this one anchors the per-family refresh
-  /// schedule on both families, which for a single-stack host would claim a
-  /// refresh on a family it does not have.
-  #[inline]
-  pub fn note_transmit_delivered(&mut self, now: I) {
-    self.note_transmit_outcome(
-      now,
-      TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered),
-    );
   }
 
   /// Capture everything the endpoint needs to re-encode a TTL=0 goodbye for
@@ -2629,7 +2612,7 @@ where
             // an announce deadline fired — schedule the announcement
             // transmit but do NOT advance the phase here. The phase progression
             // and the Established update happen on CONFIRMED delivery
-            // (`note_transmit_delivered`); peers learn of us only once a send
+            // (`note_transmit_outcome`); peers learn of us only once a send
             // actually reaches the link. Re-arm at the announce interval so an
             // unconfirmed (all-socket-failed) send is retried rather than the
             // service silently progressing to Established with nothing on the

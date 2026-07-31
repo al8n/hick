@@ -88,7 +88,7 @@ fn non_probing_service_announces_without_probing() {
       ever_probed = true;
     }
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_delivered(now);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
     if svc.state() == ServiceState::Established {
       break;
@@ -469,7 +469,7 @@ fn drive_to_established(
     // Simulate the driver confirming a successful send so the
     // announce/host_advertised guards latch as they would in production.
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_delivered(now);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
     if svc.state() == ServiceState::Established {
       return now;
@@ -662,7 +662,7 @@ fn announce_guards_latch_only_on_confirmed_delivery() {
 
   // Confirm delivery → guards latch (a goodbye is now produced; the
   // datagram-level withdrawal is covered by the endpoint withdrawal tests).
-  svc.note_transmit_delivered(now);
+  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   assert!(
     svc.advertises_host(),
     "host ownership must latch on confirmed delivery"
@@ -734,7 +734,7 @@ fn announce_phase_does_not_advance_without_confirmed_send() {
   now = now.advance(1000);
   svc.handle_timeout(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_transmit_delivered(now);
+  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   assert!(
     matches!(svc.state(), ServiceState::Announcing(1)),
     "phase advances on the first confirmed announcement; got {:?}",
@@ -2450,7 +2450,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_delivered(now);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(_)) {
       break;
@@ -2464,14 +2464,14 @@ fn question_during_announcing_does_not_shortcut_sequence() {
   // Should be Announcing(0) just after the last probe fired.
   // Drain any pending transmit.
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_delivered(now);
+    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   }
 
   // ── 2. Fire the first announce (Announcing(0) → Announcing(1)) ────
   now = now.advance(500);
   svc.handle_timeout(now).unwrap();
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_delivered(now);
+    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   }
   // We may now be Announcing(1) or Established (if n was already ≥1).
   // Advance until we're in Announcing(1).
@@ -2482,7 +2482,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_delivered(now);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
   }
   assert!(
@@ -2531,7 +2531,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
     "question during Announcing must produce Response kind, not Announcement"
   );
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_delivered(now);
+    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   }
 
   // ── 6. State must still be Announcing(1) — counter not advanced ──
@@ -2550,7 +2550,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
     "second announce must produce Announcement kind"
   );
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_delivered(now);
+    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   }
   assert_eq!(
     svc.state(),
@@ -2710,7 +2710,7 @@ fn question_does_not_push_out_announce_deadline() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_delivered(now);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(1)) {
       break;
@@ -2722,7 +2722,7 @@ fn question_does_not_push_out_announce_deadline() {
     );
   }
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_delivered(now);
+    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   } // drain any pending
 
   // ── 2. Record the lifecycle_deadline BEFORE the question ─────────────
@@ -2778,7 +2778,7 @@ fn question_does_not_push_out_announce_deadline() {
     "firing response_deadline must produce Response kind, not Announcement"
   );
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_delivered(now);
+    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   }
 
   // ── 6. lifecycle_deadline must still equal announce_deadline_before ───
@@ -2808,7 +2808,7 @@ fn question_does_not_push_out_announce_deadline() {
     "announce must fire at the original lifecycle_deadline, not at a pushed-out time"
   );
   if let Ok(Some(_)) = svc.poll_transmit(original_announce, &mut buf4096) {
-    svc.note_transmit_delivered(original_announce);
+    svc.note_transmit_outcome(original_announce, TransmitDelivery::ALL);
   }
   assert_eq!(
     svc.state(),
@@ -2990,7 +2990,7 @@ fn same_tick_response_and_lifecycle_both_fire() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_delivered(now);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(0)) {
       break;
@@ -2998,7 +2998,7 @@ fn same_tick_response_and_lifecycle_both_fire() {
     assert!(now.0 < 10_000, "should reach Announcing(0) within 10 s");
   }
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_delivered(now);
+    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   } // drain any pending
 
   // Record the lifecycle_deadline (the next announce deadline).
@@ -3065,7 +3065,7 @@ fn same_tick_response_and_lifecycle_both_fire() {
   // drain + confirm the queued transmits and verify the phase progressed
   // (Announcing(0) -> Announcing(1)).
   while let Ok(Some(_)) = svc.poll_transmit(announce_dl, &mut buf4096) {
-    svc.note_transmit_delivered(announce_dl);
+    svc.note_transmit_outcome(announce_dl, TransmitDelivery::ALL);
   }
   assert!(
     !matches!(svc.state(), ServiceState::Announcing(0)),
@@ -3111,7 +3111,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_delivered(now);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(0)) {
       break;
@@ -3119,7 +3119,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
     assert!(now.0 < 10_000, "should reach Announcing(0) within 10 s");
   }
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_delivered(now);
+    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
   } // drain any pending
 
   // Record the first-announce lifecycle_deadline.
@@ -3410,7 +3410,7 @@ fn poll_transmit_does_not_lose_pending_on_buffer_too_small() {
     }
     // Drain to avoid blocking state machine, but check before draining.
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_delivered(now);
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
     }
   }
   assert!(

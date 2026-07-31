@@ -224,6 +224,17 @@ impl FamilyDelivery {
 /// first confirm after the lagging family starts accepting advances the phase from
 /// exactly where it stood.
 ///
+/// That same losslessness is what lets the phase advance through a second escape
+/// that needs no patience bound at all: if every obligated family has carried the
+/// CURRENT datagram at some point since the phase last advanced — each in its own
+/// round, no round `all_delivered` on its own — the phase advances `Covered`, on
+/// the same nothing-else terms as an excusal. A re-arm re-encodes the identical
+/// probe index / announcement content, so the family served two rounds ago was
+/// genuinely asked (§8.1) or told (§8.3) about the very datagram still
+/// outstanding today. This is the capacity-one transport's own way out: its
+/// families take turns by construction, so no single round is ever
+/// `all_delivered`, yet each one is served in full every other round.
+///
 /// # What the per-family schedule guarantees
 ///
 /// With `R` the periodic refresh interval (~80 % of the record TTL, floored at
