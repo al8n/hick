@@ -14,6 +14,22 @@ where
   EvQ: Pool<QueryUpdate>,
 {
   /// Register a new service. Returns the handle and a `Service` state-machine.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RegisterServiceError::NameAlreadyRegistered`] if the instance name
+  /// belongs to another registered service, or is still held by an unfinished
+  /// RFC 6762 §10.1 goodbye that must retract it before the name is reused.
+  ///
+  /// Returns [`RegisterServiceError::TtlTooSmall`] if the records' TTL is below
+  /// [`MIN_SERVICE_TTL_SECS`](crate::constants::MIN_SERVICE_TTL_SECS): a TTL of 0
+  /// is the §10.1 goodbye encoding rather than an advertisement, and a TTL of 1
+  /// refreshes inside §8.3's one-second floor. The TTL is rejected rather than
+  /// clamped — silently publishing a service at a lifetime the caller did not ask
+  /// for is the kind of surprise a registration API should not hand back.
+  ///
+  /// Returns [`RegisterServiceError::StorageFull`] if the routing pool is at
+  /// capacity.
   pub fn try_register_service<TQ, EvS>(
     &mut self,
     spec: ServiceSpec,
@@ -23,6 +39,14 @@ where
     TQ: Pool<Transmit>,
     EvS: Pool<crate::event::ServiceUpdate>,
   {
+    // A TTL the periodic refresh cannot legally sustain is rejected before the
+    // name is reserved: `periodic_refresh_secs` truncates a sub-2 s TTL to a
+    // zero-second re-announce interval, so an Established service would re-arm at
+    // `now` and repump every tick.
+    let ttl_secs = spec.records().ttl_secs();
+    if ttl_secs < crate::constants::MIN_SERVICE_TTL_SECS {
+      return Err(RegisterServiceError::TtlTooSmall(ttl_secs));
+    }
     // Reject duplicate names.
     for (_, route) in self.services.iter() {
       if route.name().as_str() == spec.records().instance().as_str() {
@@ -65,7 +89,7 @@ where
         subtypes: spec.records().subtype_names().to_vec(),
         // EMPTY at registration: a service has CONFIRMED-ADVERTISED nothing
         // until its first announce is delivered (then mirrored in here via
-        // `note_service_advertised`).
+        // `note_service_announced`).
         #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
         advertised_a: std::vec::Vec::new(),
         #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
@@ -77,7 +101,7 @@ where
     // NOTE: a reclaimable detached old-name goodbye for this instance name is NOT
     // cancelled here. Registration only RESERVES the name; the reclaiming service
     // probes (~750 ms, RFC 6762 §8.1) before it advertises. The reclaim-cancel now
-    // fires on the CERTAIN live event — `note_service_advertised`, when this service
+    // fires on the CERTAIN live event — `note_service_announced`, when this service
     // confirms it is announcing the name — not at register time, because the
     // reactor only async-commits a registration across its reply boundary and
     // cancelling here could lose the goodbye when the caller drops the registration
@@ -247,10 +271,10 @@ where
     // conflict/rename away again before announcing. Cancelling now would lose the old
     // records' retraction if it never announces (the same premature-cancel class as
     //). The cancel instead fires on the certain live event —
-    // `note_service_advertised` gated on `advertised_instance`, when the renamed
-    // service confirms advertising this name. The rename is still NOT rejected for a
-    // reclaimable name: a detached item holds no route, so the
-    // duplicate-name scan above does not see it, and reuse proceeds.
+    // `note_service_announced` gated on `Service::has_fully_announced`, when the
+    // renamed service has announced this name on every obligated link. The rename is
+    // still NOT rejected for a reclaimable name: a detached item holds no route, so
+    // the duplicate-name scan above does not see it, and reuse proceeds.
 
     // Apply the rename.
     if let Some(route) = self.services.get_mut(key) {

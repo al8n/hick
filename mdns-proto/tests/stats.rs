@@ -11,7 +11,7 @@ use std::{net::Ipv4Addr, time::Instant as StdInstant};
 use std::time::Duration;
 
 use mdns_proto::{
-  CollectedAnswer, Name, Query,
+  CollectedAnswer, FamilyDelivery, Name, Query, TransmitDelivery,
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec, ServiceSpec},
   endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
@@ -242,8 +242,9 @@ fn tick(
 }
 
 /// All-socket-failure: drive the service through probe, announce,
-/// and response, feeding `delivered=false` to every `note_transmit_result`.
-/// After N ticks, NONE of the `*_tx` counters should have advanced.
+/// and response, confirming that no family carried them to every
+/// `note_transmit_outcome`. After N ticks, NONE of the `*_tx` counters should
+/// have advanced.
 #[test]
 fn tx_counters_stay_zero_on_all_socket_failure() {
   let (e, mut svc) = make_no_probe_endpoint();
@@ -255,7 +256,10 @@ fn tx_counters_stay_zero_on_all_socket_failure() {
     let (ok, next) = tick(&mut svc, now);
     now = next;
     if ok {
-      svc.note_transmit_result(now, false); // all-socket-failure
+      svc.note_transmit_outcome(
+        now,
+        TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Missed),
+      ); // all-socket-failure
     }
   }
 
@@ -313,7 +317,10 @@ fn tx_counters_advance_on_confirmed_delivery() {
     svc.handle_timeout(now).unwrap();
     let mut buf = vec![0u8; 4096];
     if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
-      svc.note_transmit_result(now, true);
+      svc.note_transmit_outcome(
+        now,
+        TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered),
+      );
     }
     if svc.state() == mdns_proto::ServiceState::Established {
       break;
@@ -342,6 +349,71 @@ fn tx_counters_advance_on_confirmed_delivery() {
     snap.goodbyes_tx, 0,
     "goodbyes_tx must be 0 before any unregister; got {}",
     snap.goodbyes_tx
+  );
+}
+
+/// `probes_tx` / `announcements_tx` mean "confirmed delivered to every obligated
+/// link". The core's patience bound eventually EXCUSES a link that never accepts
+/// and advances the phase without it — that advance is not a delivery, so it must
+/// leave both counters alone. Otherwise a permanently half-broken host reports a
+/// full, healthy startup while one whole family heard nothing.
+#[test]
+fn excused_rounds_do_not_count_as_delivered_transmits() {
+  use rand::SeedableRng;
+
+  let rng = rand::rngs::StdRng::from_seed([9u8; 32]);
+  let mut e = Endp::try_new(EndpointConfig::new(), rng);
+  let stype = Name::try_from_str("_http._tcp.local.").unwrap();
+  let inst = Name::try_from_str("Excused._http._tcp.local.").unwrap();
+  let host = Name::try_from_str("excused-host.local.").unwrap();
+  let mut recs = ServiceRecords::new(stype, inst, host, 80, 120);
+  recs.add_a(Ipv4Addr::new(10, 0, 2, 3));
+  let start = StdInstant::now();
+  let (_h, mut svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      start,
+    )
+    .unwrap();
+
+  // Every round is partially delivered, so the lifecycle only ever moves on an
+  // excused advance.
+  let mut now = start;
+  for _ in 0..200 {
+    now += Duration::from_millis(1100);
+    svc.handle_timeout(now).unwrap();
+    let mut buf = vec![0u8; 4096];
+    if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
+      svc.note_transmit_outcome(
+        now,
+        TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Missed),
+      );
+    }
+    if svc.state() == mdns_proto::ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(
+    svc.state(),
+    mdns_proto::ServiceState::Established,
+    "the bound must carry a permanently half-delivered service to Established"
+  );
+
+  let snap = e.stats();
+  assert_eq!(
+    snap.probes_tx, 0,
+    "no probe reached every obligated link, so probes_tx must stay 0; got {}",
+    snap.probes_tx
+  );
+  assert_eq!(
+    snap.announcements_tx, 0,
+    "no announcement reached every obligated link, so announcements_tx must stay \
+     0; got {}",
+    snap.announcements_tx
+  );
+  assert!(
+    !svc.has_fully_announced().get(),
+    "and the reclaim-cancel gate stays shut for the same reason"
   );
 }
 

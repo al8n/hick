@@ -1,5 +1,225 @@
 # RELEASED
 
+## Dual-stack partial delivery (`TransmitDelivery`) (July 30th, 2026)
+
+Published crates: `mdns-proto` 0.4.0, `hick` 0.3.0, `hick-reactor` 0.3.0,
+`hick-compio` 0.3.0, `hick-smoltcp` 0.3.0, `hick-embassy` 0.3.0.
+
+`mdns-proto`'s confirm APIs took a single boolean doing two jobs — advancing
+the RFC 6762 lifecycle phase (§8.1 probing / §8.3 announcing, plus the §5.2
+query retry budget) and latching §10.1 TTL=0 goodbye ownership — which is
+unsound the moment a dual-stack multicast transmit succeeds on one address
+family and fails on the other: there is no truthful bool to pass. This release
+replaces the boolean with a lossless PER-FAMILY confirm and fixes the resulting
+conformance and stranding defects in every released async driver.
+
+BREAKING
+
+- `mdns-proto`: new `TransmitDelivery` struct, carrying one `FamilyDelivery`
+  (`Unobligated` / `Delivered` / `Missed`) per address family, reports what each
+  family did with a multicast fan-out instead of collapsing it to one bool.
+  `Service::note_transmit_outcome` / `Query::note_transmit_outcome` /
+  `Endpoint::note_query_transmit_outcome` are now the sole confirm entry points;
+  the boolean shims they were added alongside — `note_transmit_result` (on both
+  `Service` and `Query`) and `Endpoint::note_query_transmit_result` — are
+  removed. Lifecycle phase and the query retry budget advance only on
+  `TransmitDelivery::all_delivered()`; goodbye ownership latches on the weaker
+  `any_delivered()` — the two facts a single bool could never carry
+  independently, and exactly where the removed boolean API was unsound for a
+  dual-stack send.
+- `mdns-proto`: the periodic §8.3 re-announce is scheduled PER FAMILY, off the
+  stalest obligated family in good standing rather than off the last round. Each
+  family holds its own copy of the records in its own peers' caches and so races
+  its own TTL. A driver with room for one datagram per round serves the
+  longest-blocked family first (which is now normative on `TransmitDelivery`), so
+  the families alternate: every round is partial while each family is refreshed
+  only every OTHER round, at twice the periodic interval — past the TTL for every
+  TTL below 128 s, including the conventional 120 s. Records expired cyclically
+  on BOTH families while every per-round invariant still held. Every obligated
+  family in good standing is now re-announced within `max(0.8·TTL, 2 s)` of its
+  last delivery. A family with no socket is excluded rather than read as
+  infinitely stale (which would re-arm a single-stack host at the §8.3 one-second
+  floor forever), and a family that has spent the core's patience stops driving
+  the schedule until it delivers again (which would otherwise hold the deadline
+  permanently in the past and flood the healthy family at the same floor).
+- `mdns-proto`: the partial-delivery patience bound is counted PER FAMILY. A
+  shared counter cannot tell "one family has missed twice" from "two families
+  missed one round each while taking turns", and those need opposite answers.
+  A phase also advances when every obligated family has carried the CURRENT
+  datagram at some point since the last advance: a re-arm is lossless, so the
+  same probe index reaching one family in one round and the other in the next has
+  been asked on both. That is the only way a capacity-one transport ever
+  advances, since under it no single round reaches both families and no family
+  ever spends its patience. Neither shape takes the credit a delivery earns —
+  `Service::has_fully_announced` still requires ONE datagram confirmed by every
+  obligated family.
+- `mdns-proto`: new `FullyAnnounced` newtype (opaque; no public constructor)
+  replaces the raw `bool` parameter of the reclaim-cancel confirm, which is
+  renamed `Endpoint::note_service_announced` (from `note_service_advertised`,
+  removed). The old bool's meaning had drifted to "the all-delivered
+  announcement fact," but nothing stopped a driver from passing the
+  any-delivered exposure latch (`Service::advertises_instance()`) instead —
+  which every released driver did, until this release (see FIXES).
+  `FullyAnnounced` has no public constructor, so that substitution no longer
+  compiles. The token also carries the `ServiceHandle` it was minted from and
+  `note_service_announced` takes no separate handle, so one service's proof
+  cannot be applied to another (which would cancel that other name's goodbye
+  while an obligated family still needed it).
+- `mdns-proto`: new `TransmitObligation` enum (`Sustained` / `OneShot`), carried
+  on every `Transmit` and readable via `Transmit::obligation()`;
+  `Transmit::new` takes it as its fourth argument. It states whether the core will
+  re-arm that datagram until every obligated link accepts it, which is what a
+  driver needs to know to decide what a PERMANENT send failure costs: a
+  `Sustained` datagram that can never be sent would be re-offered forever and so
+  retires its producer, while an undeliverable `OneShot` reply costs one
+  unanswered question. The tag is a function of what was encoded, not of the
+  service's lifecycle phase: the periodic `Established` re-announce advances no
+  phase yet is still re-armed on the §8.3 ladder, and `Query::poll_transmit` has
+  no service phase at all.
+- `mdns-proto`: every `Transmit` also carries the minimum time that must separate
+  it from its producer's previous datagram ON ONE ADDRESS FAMILY'S WIRE, readable
+  via `Transmit::min_family_gap()` and taken by `Transmit::new` as its fifth
+  argument. Drivers enforce it as a per-family earliest-next-send gate, reporting
+  a deferred family `Missed`. The confirm anchors at the EARLIEST acceptance
+  across families — the proven-safe direction for the TTL guarantee — so under
+  inter-family skew `s` the core schedules the next datagram one interval after
+  the EARLY family's wire time and the LATE family's own gap is `interval − s`:
+  an announcement fell under RFC 6762 §6 / §8.3's one-second floor at every TTL
+  and a §8.1 probe gap could approach zero. The core cannot see `s`; the driver
+  measured it. The VALUE stays in the core because it is kind-dependent — §8.1
+  spaces probes 250 ms apart and exempts them from the one-second rule that
+  governs announcements and §5.2 query retransmissions — so a driver that picked
+  the number itself would have taken protocol policy across the sans-I/O
+  boundary. `TransmitObligation::OneShot` datagrams carry `Duration::ZERO` and
+  are ungated: the core never re-arms them, so a gate could only drop them.
+- The bound on repeated partial delivery lives in `mdns-proto`, not in drivers.
+  Repeated partial delivery re-arms indefinitely, so the core bounds how many
+  consecutive re-arms one producer spends waiting for a family that never accepts
+  and then advances the phase without it. A driver reports the honest per-family
+  facts and nothing else. The split is normative on `TransmitDelivery`'s rustdoc:
+  the driver owns the obligated set and link death — and MUST offer every
+  obligated family on every round, preferring the longest-blocked one under a
+  constrained slot — while the core owns its own patience and its own
+  schedule.
+- Confirm before anything else. Once `Service::poll_transmit` /
+  `Query::poll_transmit` returns a datagram, no other state-mutating entry point
+  for that service or query — `handle_event`, `handle_timeout`,
+  `withdrawal_snapshot` / teardown — may run until its `note_transmit_outcome`;
+  `poll_transmit` itself is excepted and refuses while one is outstanding. A
+  driver that cannot send right now DROPS the datagram and confirms
+  as carried by no family in the same call rather than parking it: "delivered" here
+  already means only that the kernel accepted the datagram synchronously, so a
+  deferred confirm buys no fidelity while leaving the pending token's lifecycle
+  meaning undecided. Normative on `Service::poll_transmit`'s rustdoc, asserted in
+  debug builds. All four drivers in this workspace already comply.
+- `mdns-proto`: `Endpoint::try_register_service` rejects a record TTL below
+  `constants::MIN_SERVICE_TTL_SECS` (2 s) with the new
+  `RegisterServiceError::TtlTooSmall`. A TTL-0 positive record is the RFC 6762
+  §10.1 goodbye encoding — it deletes the record from peer caches instead of
+  publishing it — and TTL 1 refreshes at 0.8 s, inside §8.3's one-second floor on
+  unsolicited responses. Both also truncate the ~80 %-of-TTL periodic refresh to
+  a zero-second interval, which re-armed an `Established` service at `now` and
+  repumped an announcement every tick. The TTL is rejected rather than clamped.
+
+FIXES (dependent-crate behaviour; visible without any source change on the
+caller's part)
+
+- All four drivers (`hick-reactor`, `hick-compio`, `hick-smoltcp`,
+  `hick-embassy`): a partially-delivered dual-stack transmit no longer advances
+  the §8.1 probe sequence or the §8.3 announce phase, and no longer burns a
+  §5.2 query retry. Previously any single successful socket send (e.g. IPv4
+  only) advanced the lifecycle even though the other family was never probed —
+  an RFC 6762 §8.1 conformance defect. A service on a host where one family is
+  unreachable now takes longer to establish instead of establishing a name it
+  never defended on that family.
+- All four drivers: the reclaim-cancel gate is now the all-delivered
+  announcement fact, not any single delivery. A replacement service reclaiming
+  a renamed-away name no longer cancels that name's still-draining TTL=0
+  goodbye until it has announced on every family the driver still obligates —
+  previously a single-family announcement, or even an RFC 6762 §6.7 legacy
+  unicast reply, could cancel it. Fixes stranded peers on the unserved family
+  holding withdrawn records until positive TTL.
+- `mdns-proto`: bounded patience — after two consecutive partially-delivered
+  lifecycle confirms for the same service or query, the third is EXCUSED and the
+  phase advances without the link that keeps missing. A permanently
+  half-reachable link now still reaches `Established` — after ~30 s, since the
+  served link's announcements stay on §8.3's doubling ladder throughout —
+  instead of pinning in probing forever. An excused advance is not a
+  delivery: it does not set `Service::has_fully_announced`, does not reset the
+  §8.3 / §5.2 doubling ladder (and never re-arms EARLIER than the rung the served
+  link already earned), and does not bump `probes_tx` / `announcements_tx` —
+  those counters mean "confirmed delivered by every obligated link", so a
+  permanently half-broken host no longer reports a healthy startup.
+  A round that reached no wire leaves every count untouched, so an alternating
+  partial/failed pattern cannot evade the bound — and no phase can ever advance
+  out of silence, which is what §8.1 requires of anything that claims a name. The count is reset wherever the lifecycle
+  regresses to `Init` — both the §9 conflict rename and the RFC 6763 §9 same-name
+  revert-to-probe, the latter of which emits no `ServiceUpdate` and so was
+  unreachable from a driver.
+- Because the count lives inside the per-kind confirm arms, a response (the §6
+  multicast reply, the §6.7 legacy unicast reply, the RFC 6763 §9 meta reply)
+  structurally cannot move it. Those datagrams are never re-armed, so counting
+  them corrupts the bound in both directions: a unicast reply has one obligated
+  family and is all-delivered by construction, so it would RESET the count — a
+  service answering legacy queriers between lifecycle rounds would hold it at
+  zero and the bound would never fire; and a partially-delivered multicast
+  response would PRELOAD it, so the next partial probe would be excused and §8.1
+  would advance although one family never heard the probe.
+- `hick-smoltcp` / `hick-embassy`: a multicast RESPONSE that is permanently
+  undeliverable (too large for every reachable socket) no longer retires the
+  service. It resolves as delivered by no family — nothing latched, nothing advanced,
+  the querier re-asks — matching the adjacent unicast branch. Previously any
+  on-link peer could tear down a healthy established service by asking it a
+  question whose answer did not fit the TX buffer: the service was marked
+  errored, surfaced `Conflict`, and began withdrawing. An undeliverable
+  `Sustained` datagram (probe, announcement, query) still retires its producer,
+  which is the case that reasoning was written for.
+- `hick-smoltcp` / `hick-embassy`: a PRESENT but unbound (or unaddressable) UDP
+  socket is now `SendError::Busy`, not `SendError::Unsupported`. `Unsupported`
+  removes a family from the obligated set, so a bound-IPv4 + present-but-unbound
+  -IPv6 fan-out read as all-delivered and advanced §8.1 probing as though the node
+  had no IPv6 at all. That family now reports `FamilyDelivery::Missed` and is
+  retried.
+- All four drivers: a family that carried a producer's previous datagram is no
+  longer offered the next one until `Transmit::min_family_gap()` has elapsed ON
+  ITS OWN WIRE, and is reported `FamilyDelivery::Missed` for the round it is
+  deferred. Under inter-family skew the confirm's earliest-acceptance anchor put
+  the late family's successive announcements inside RFC 6762 §6 / §8.3's
+  one-second floor at every TTL, and could drive a §8.1 probe gap toward zero.
+  The core re-arms losslessly, so a deferred family carries the same datagram on
+  the next round.
+- `hick-reactor`: one driver pass is bounded by an aggregate wall-clock budget
+  spanning both the transmit drain and the §10.1 goodbye pump, and resumes at a
+  rotating cursor. Producers are awaited serially and the 64-send credit budget
+  is charged only per family that actually SENT, so an all-miss fan-out cost zero
+  credits while still costing a whole per-attempt bound: a pass of `n`
+  simultaneously-due producers with one wedged family ran for `n × 250 ms` with
+  the 64-slot packet channel backing up behind it and inbound peer datagrams
+  being dropped. The goodbye pump had no budget of any kind. The cursor is what
+  keeps the new budget a delay rather than a starvation — without it every pass
+  would restart at the front of the handle set and the producers behind the first
+  cut would never be reached.
+- `mdns-proto`: an obligation gap now clears the returning family's COVERAGE bit
+  along with the rest of its state. A family that delivered, ceased to be
+  obligated during an all-miss round, and then returned kept a stale claim to
+  have carried the datagram still outstanding, so the next round could read
+  `all(covered)` and advance the phase on pre-gap evidence — the returned family
+  never had to receive the current datagram. Unreachable from the in-tree
+  drivers, which fix their obligated set at spawn; the core is a public library
+  and a driver whose obligated set varies at runtime is exactly what the
+  three-valued `FamilyDelivery` exists to support. A gap containing no confirmed
+  round remains invisible to the core by construction.
+- `hick-reactor` / `hick-compio` only: RFC 6762 §6.7 legacy unicast replies no
+  longer record a self-send credit. A unicast reply never loops back to its
+  sender, so the credit could never be consumed; under a legacy-query flood
+  the 65,536-entry tracker filled with dead entries and began refusing genuine
+  multicast credits, causing the responder to ingest its own loopback as peer
+  traffic.
+
+The dependent crates (`hick`, `hick-reactor`, `hick-compio`, `hick-smoltcp`,
+`hick-embassy`) bump to 0.3.0 to track the `mdns-proto` 0.4 public dependency;
+`hick-udp` and `hick-trace` are unaffected.
+
 ## Drop the `heapless` tier (June 8th, 2026)
 
 Published crates: `mdns-proto` 0.3.0, `hick` 0.2.0, `hick-reactor` 0.2.0,

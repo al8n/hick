@@ -55,6 +55,16 @@ where
     /// more than once (e.g. an encode-failure escalation on an already-cancelled
     /// service) and must not enqueue a duplicate. If `handle` has no registered
     /// route the call is likewise a silent no-op.
+    ///
+    /// # Contract
+    ///
+    /// `snapshot` must come from a
+    /// [`Service::withdrawal_snapshot`](crate::service::Service::withdrawal_snapshot)
+    /// taken with no datagram outstanding — i.e. after the service's last
+    /// `poll_transmit` was confirmed. A snapshot taken mid-flight omits the
+    /// records that datagram is about to place in peer caches, and this goodbye
+    /// can only withdraw what the snapshot names. See
+    /// [`Service::poll_transmit`](crate::service::Service::poll_transmit).
     pub fn begin_withdrawal(
       &mut self,
       handle: ServiceHandle,
@@ -410,17 +420,127 @@ where
     /// never-announced service has, despite having advertised nothing).
     ///
     /// Idempotent overwrite (the advertised set only grows as the service
-    /// announces), and a no-op for an unknown handle.
+    /// announces), and a no-op for a handle the endpoint does not route.
+    ///
+    /// # `announced`
+    ///
+    /// The RECLAIM-CANCEL gate, and the only place the target service is named.
+    /// A [`FullyAnnounced`] that reads `true` retires any reclaimable detached
+    /// goodbye still draining for that service's instance name (see below).
+    ///
+    /// The parameter is the opaque token rather than a `bool` because no
+    /// driver-side formula is admissible here: it must be
+    /// [`Service::has_fully_announced`] and nothing else. In particular it is NOT
+    /// [`Service::advertises_instance`] — that latch fires on ANY delivery, so a
+    /// v4-only announcement, or an RFC 6762 §6.7 legacy unicast reply (one
+    /// obligated link, hence fully delivered by construction), would cancel a
+    /// goodbye the unserved family still needs. Since [`FullyAnnounced`] has no
+    /// public constructor, that substitution does not compile.
+    ///
+    /// The route is looked up through the token's own
+    /// [`ServiceHandle`] rather than a separate argument, so a genuine token from
+    /// one service cannot be applied to another. A caller CAN still pass `a` /
+    /// `aaaa` slices read from a different service; that mis-records an advertised
+    /// address set (a sibling-retention input) and is a strictly smaller fault
+    /// than cancelling the wrong service's goodbye.
+    ///
+    /// # Examples
+    ///
+    /// The token names its own service, so the confirm takes no separate handle:
+    ///
+    // This doctest and its `compile_fail` twin below share a preamble that needs
+    // BOTH `std` (the `StdInstant` alias only implements `mdns_proto::Instant`
+    // under `std`, see `time.rs`) AND `slab` (`slab::Slab` only implements
+    // `mdns_proto::Pool` under `slab`, see `pool.rs`) to compile at all. Gate
+    // both fences on `all(std, slab)` — they are a deliberate pair: the twin
+    // below proves the handle mismatch fails to compile for the RIGHT reason,
+    // and this one proves the shared preamble compiles when both features are
+    // present. Gating or deleting only one lets the other pass vacuously
+    // elsewhere: a preamble that fails to *build* (missing `std` or `slab`,
+    // e.g. the `alloc`-only tier, or the `std`-without-`slab` tiers such as
+    // plain `std` or `metrics`) is not the same as the API *rejecting* the
+    // mismatch it documents. Keep them gated together.
+    #[cfg_attr(all(feature = "std", feature = "slab"), doc = "```")]
+    #[cfg_attr(not(all(feature = "std", feature = "slab")), doc = "```ignore")]
+    /// # use core::net::{Ipv4Addr, Ipv6Addr};
+    /// # use std::time::Instant as StdInstant;
+    /// # use mdns_proto::{
+    /// #   CollectedAnswer, FullyAnnounced,
+    /// #   cache::CacheEntry,
+    /// #   endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
+    /// #   event::QueryUpdate,
+    /// #   query::Query,
+    /// # };
+    /// # use slab::Slab;
+    /// # type Q = Query<StdInstant, Slab<CollectedAnswer>, Slab<QueryUpdate>>;
+    /// # type Ep = Endpoint<
+    /// #   StdInstant,
+    /// #   rand::rngs::StdRng,
+    /// #   Slab<CacheEntry<StdInstant>>,
+    /// #   Slab<ServiceRoute>,
+    /// #   Slab<Q>,
+    /// #   Slab<EndpointEventEntry>,
+    /// #   Slab<CollectedAnswer>,
+    /// #   Slab<QueryUpdate>,
+    /// # >;
+    /// fn confirm(ep: &mut Ep, announced: FullyAnnounced, a: &[Ipv4Addr], aaaa: &[Ipv6Addr]) {
+    ///   ep.note_service_announced(announced, a, aaaa);
+    /// }
+    /// ```
+    ///
+    /// Pairing one service's proof with ANOTHER service's handle — the transplant
+    /// this signature exists to rule out — does not compile:
+    ///
+    // Paired with the positive doctest above over the same preamble that needs
+    // BOTH `std` and `slab` (see the comment there for why). Gated identically
+    // so this can't start passing vacuously — for the wrong reason — on a tier
+    // missing either feature.
+    #[cfg_attr(all(feature = "std", feature = "slab"), doc = "```compile_fail")]
+    #[cfg_attr(not(all(feature = "std", feature = "slab")), doc = "```ignore")]
+    /// # use core::net::{Ipv4Addr, Ipv6Addr};
+    /// # use std::time::Instant as StdInstant;
+    /// # use mdns_proto::{
+    /// #   CollectedAnswer, FullyAnnounced, ServiceHandle,
+    /// #   cache::CacheEntry,
+    /// #   endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
+    /// #   event::QueryUpdate,
+    /// #   query::Query,
+    /// # };
+    /// # use slab::Slab;
+    /// # type Q = Query<StdInstant, Slab<CollectedAnswer>, Slab<QueryUpdate>>;
+    /// # type Ep = Endpoint<
+    /// #   StdInstant,
+    /// #   rand::rngs::StdRng,
+    /// #   Slab<CacheEntry<StdInstant>>,
+    /// #   Slab<ServiceRoute>,
+    /// #   Slab<Q>,
+    /// #   Slab<EndpointEventEntry>,
+    /// #   Slab<CollectedAnswer>,
+    /// #   Slab<QueryUpdate>,
+    /// # >;
+    /// fn transplant(
+    ///   ep: &mut Ep,
+    ///   other: ServiceHandle,
+    ///   announced_by_someone_else: FullyAnnounced,
+    ///   a: &[Ipv4Addr],
+    ///   aaaa: &[Ipv6Addr],
+    /// ) {
+    ///   ep.note_service_announced(other, a, aaaa, announced_by_someone_else);
+    /// }
+    /// ```
     ///
     /// [`Service::advertised_a_addrs`]: crate::service::Service::advertised_a_addrs
     /// [`Service::advertised_aaaa_addrs`]: crate::service::Service::advertised_aaaa_addrs
-    pub fn note_service_advertised(
+    /// [`Service::has_fully_announced`]: crate::service::Service::has_fully_announced
+    /// [`Service::advertises_instance`]: crate::service::Service::advertises_instance
+    pub fn note_service_announced(
       &mut self,
-      handle: ServiceHandle,
+      announced: FullyAnnounced,
       a: &[Ipv4Addr],
       aaaa: &[Ipv6Addr],
-      advertised_instance: bool,
     ) {
+      let handle = announced.handle();
+      let fully_announced = announced.get();
       let name = {
         let Some((_, route)) = self.services.iter_mut().find(|(_, r)| r.handle() == handle) else {
           return;
@@ -439,16 +559,26 @@ where
       // time could lose the goodbye if the caller dropped the registration before
       // owning the service — ).
       //
-      // The cancel is GATED on `advertised_instance`: this hook is called after EVERY
-      // delivered service transmit, INCLUDING probes, so cancelling on a probe would
-      // drop the goodbye before the reclaiming service ever announced — losing the
-      // retraction if it then drops, conflicts, or renames away. The
-      // address args cannot serve as the guard (an address-less service advertises no
-      // host addresses), so `Service::advertises_instance` is the precise signal. If
-      // the new service never announces, the goodbye is NEVER cancelled and completes
-      // normally. A name-HOLDING collision goodbye is left intact.
+      // The cancel is GATED on `fully_announced`: this hook is called after EVERY
+      // delivered service transmit, INCLUDING probes and responses, so cancelling on
+      // one of those would drop the goodbye before the reclaiming service ever
+      // announced — losing the retraction if it then drops, conflicts, or renames
+      // away. The address args cannot serve as the guard (an address-less service
+      // advertises no host addresses).
+      //
+      // The gate must be the ALL-delivered fact, not the any-delivered exposure
+      // latch: it may fire only once a complete announcement of this name has
+      // reached every link the driver still obligates, because only for such a link
+      // does §10.2's cache-flush announcement supersede the stale unique records the
+      // goodbye exists to retract. A partially-delivered announcement therefore
+      // leaves the old goodbye draining its per-family debt, which is exactly the
+      // case where the unserved family has heard neither the goodbye nor the
+      // replacement.
+      //
+      // If the new service never fully announces, the goodbye is NEVER cancelled and
+      // completes normally. A name-HOLDING collision goodbye is left intact.
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
-      if advertised_instance {
+      if fully_announced {
         self.withdrawals.retain(|(_, item)| {
           !(item.route.is_none()
             && !item.holds_name

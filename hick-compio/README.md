@@ -109,6 +109,60 @@ update to the [`metrics`] facade automatically.
 - Handles (`Query`, `Service`, `Lookup`) hold `Rc<EndpointInner>` and borrow
   shared state directly under short, non-`.await` borrows.
 
+## Send semantics, and their limitation
+
+`hick-compio` submits sends to a completion-based kernel interface and **awaits
+every operation to its true completion** — compio cannot reliably cancel a
+submitted operation, so bounding the wait would mean acting on datagrams whose
+fate is unknown.
+
+The contract that follows:
+
+- every submitted operation is awaited to completion before its round confirms;
+- driver latency equals kernel completion latency;
+- a completion the kernel never delivers stalls the driver visibly, without
+  corrupting peer caches.
+
+The consequence, stated plainly: if the kernel never completes a send — a
+pathological state for UDP, since it requires permanently backpressured local
+buffers — the driver task stalls entirely, including its shutdown goodbye flush,
+and is reclaimed only at runtime teardown. A fan-out pending far longer than any
+healthy send is traced, so such a stall is diagnosable rather than silent. At
+runtime teardown a still-pending operation is dropped with the task; a datagram
+that later reaches the wire is bounded by record TTLs, exactly as a host crash
+is.
+
+### The minimum TTL this driver can serve
+
+A transient stall is not free, and RFC 6762's schedules do not tolerate it
+unconditionally. This driver's worst-case loop stall equals its slowest in-flight
+send, and that stall is added to the periodic re-announce interval, so a record
+stays fresh in peer caches only while
+
+```text
+TTL - max(floor(0.8 * TTL), 1 s)   >   the worst plausible send stall
+```
+
+The left side is the slack between a record's TTL and the ~80 % refresh the core
+schedules for it, floored at §8.3's one-second interval. Integer truncation makes
+that slack 1 s flat for every TTL from 2 s to 5 s, and at least a fifth of the
+TTL above that.
+
+That is a **per-driver** minimum, above the protocol's. At `mdns-proto`'s
+`MIN_SERVICE_TTL_SECS` (2 s) the slack is exactly 1 s, which any multi-second
+stall overruns — and a multi-second stall is precisely the state this driver
+cannot bound. Register services driven by `hick-compio` at a TTL whose slack
+covers your worst plausible send, not at the 2 s floor.
+
+The floor itself is correct where it lives — it is shared protocol math from
+§8.3's one-second interval — and it is not a limitation other drivers inherit.
+
+[`hick-reactor`] bounds each attempt instead. That is correct there and is not an
+inconsistency: it drives readiness I/O, where abandoning an attempt abandons a
+future whose last syscall returned `WouldBlock` — nothing was submitted, so its
+cancellation is definitive. That bound is also what lets it serve the 2 s floor
+this driver cannot: no attempt can stall its loop for longer than the bound.
+
 ## The hick family
 
 [`hick`] (facade) · [`mdns-proto`] (Sans-I/O core) · [`hick-udp`] (UDP) ·

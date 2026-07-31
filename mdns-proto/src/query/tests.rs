@@ -6,6 +6,8 @@ use super::*;
 use crate::{
   Name, QueryHandle,
   event::QueryEvent,
+  service::MAX_PARTIAL_ROUNDS,
+  transmit::{FamilyDelivery, V4, V6},
   wire::{MessageReader, ResourceClass, ResourceType},
 };
 
@@ -637,11 +639,12 @@ fn poll_timeout_reflects_absolute_timeout() {
     "initial poll_timeout must be <= timeout_deadline"
   );
 
-  // The first transmit schedules the first retry at now + ~1s (well past the
-  // 100 ms timeout). handle_timeout(now) is then a no-op: the retry is not
-  // yet due.
+  // The first transmit's CONFIRM schedules the first retry at now + ~1s (well
+  // past the 100 ms timeout). handle_timeout(now) is then a no-op: the retry is
+  // not yet due.
   let mut buf = [0u8; 512];
   let _ = q.poll_transmit(now, &mut buf).unwrap();
+  q.note_transmit_outcome(now, TransmitDelivery::ALL);
   q.handle_timeout(now).unwrap();
   assert!(!q.done, "query must not be done immediately");
 
@@ -706,7 +709,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
   );
   // the retry is scheduled on a CONFIRMED delivery, not at encode
   // time. Confirm the send.
-  q.note_transmit_result(now, true);
+  q.note_transmit_outcome(now, TransmitDelivery::ALL);
 
   // The driver now sleeps until poll_timeout. It must be exactly now + 1s —
   // not now — so the loop does not immediately re-fire at now.
@@ -737,7 +740,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
     q.poll_transmit(one_sec, &mut buf).unwrap().is_some(),
     "first retry must be sent at now + 1s"
   );
-  q.note_transmit_result(one_sec, true);
+  q.note_transmit_outcome(one_sec, TransmitDelivery::ALL);
   let three_sec = now.checked_add(Duration::from_secs(3)).unwrap();
   assert_eq!(
     q.poll_timeout(),
@@ -775,7 +778,7 @@ fn failed_send_does_not_consume_retry_budget() {
   for _ in 0..50 {
     let sent = q.poll_transmit(t, &mut buf).unwrap().is_some();
     assert!(sent, "query must keep attempting to send while undelivered");
-    q.note_transmit_result(t, false); // all sockets failed
+    q.note_transmit_outcome(t, TransmitDelivery::NONE); // all sockets failed
     assert!(!q.is_done(), "an undelivered query must NOT time out");
     // Advance to the re-attempt deadline and fire it.
     let due = q.poll_timeout().expect("a re-attempt must be scheduled");
@@ -790,7 +793,7 @@ fn failed_send_does_not_consume_retry_budget() {
   // Now let a send succeed: the budget finally advances and normal backoff
   // resumes (first confirmed retry at +1s).
   assert!(q.poll_transmit(t, &mut buf).unwrap().is_some());
-  q.note_transmit_result(t, true);
+  q.note_transmit_outcome(t, TransmitDelivery::ALL);
   let plus_1s = t.checked_add(Duration::from_secs(1)).unwrap();
   assert_eq!(
     q.poll_timeout(),
@@ -800,7 +803,7 @@ fn failed_send_does_not_consume_retry_budget() {
 }
 
 /// the retry backoff is anchored to the time passed to
-/// `note_transmit_result` (post-send), not the `poll_transmit` time — a send
+/// `note_transmit_outcome` (post-send), not the `poll_transmit` time — a send
 /// that takes longer than the backoff interval must not yield a past deadline.
 #[test]
 fn query_retry_anchored_to_confirmation_time() {
@@ -823,7 +826,7 @@ fn query_retry_anchored_to_confirmation_time() {
 
   // The send completes 5 s later — longer than the 1 s first backoff.
   let send_done = t0.checked_add(Duration::from_secs(5)).unwrap();
-  q.note_transmit_result(send_done, true);
+  q.note_transmit_outcome(send_done, TransmitDelivery::ALL);
 
   // The next retry is 1 s AFTER the confirmed-send time, not after t0.
   assert_eq!(
@@ -971,10 +974,10 @@ fn retire_is_idempotent() {
 }
 
 #[test]
-fn note_transmit_result_without_a_pending_send_is_noop() {
+fn note_transmit_outcome_without_a_pending_send_is_noop() {
   let mut q = make_query(ResourceType::Any, ResourceClass::Any);
   // No poll_transmit happened → awaiting_send_confirm is false → no-op.
-  q.note_transmit_result(StdInstant::now(), true);
+  q.note_transmit_outcome(StdInstant::now(), TransmitDelivery::ALL);
   assert_eq!(
     q.retry_count, 0,
     "a result with no in-flight send must not advance the retry budget"
@@ -999,7 +1002,7 @@ fn retry_budget_exhaustion_retires_the_query() {
     now += std::time::Duration::from_secs(120); // past the 60s backoff cap
     q.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = q.poll_transmit(now, &mut buf) {
-      q.note_transmit_result(now, true); // confirmed send burns one retry slot
+      q.note_transmit_outcome(now, TransmitDelivery::ALL); // confirmed send burns one retry slot
     }
     if q.is_done() {
       retired = true;
@@ -1097,4 +1100,299 @@ fn duplicate_question_exhaustion_produces_timeout_and_correct_stats() {
       "queries_timeout must be 1 after duplicate-question termination"
     );
   }
+}
+
+// ── TransmitDelivery: the §5.2 retry budget and its ladder ─────────────
+
+/// Emit the query's pending datagram, leaving its confirm outstanding.
+fn emit_question(q: &mut TestQuery, now: StdInstant) {
+  let mut buf = std::vec![0u8; 512];
+  q.poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("a due query must produce a datagram");
+}
+
+#[test]
+fn partially_delivered_question_does_not_burn_the_retry_budget() {
+  // A question that reached only some of the links the driver fans it onto has
+  // not been asked everywhere. Burning a §5.2 retry slot for it would march the
+  // query to its retry-budget timeout having never queried the missing link —
+  // the same over-advance the §8.1/§8.3 phases suffer under `used > 0`.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let now = StdInstant::now();
+
+  emit_question(&mut q, now);
+  q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+  assert_eq!(
+    q.retry_count, 0,
+    "a partially-delivered question must NOT consume a retry slot"
+  );
+  assert!(
+    q.next_deadline.is_some(),
+    "it must still re-arm, so the query keeps trying"
+  );
+  assert!(!q.is_done(), "and it must not be retired");
+}
+
+#[test]
+fn fully_delivered_question_burns_the_retry_budget() {
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let now = StdInstant::now();
+
+  emit_question(&mut q, now);
+  q.note_transmit_outcome(now, TransmitDelivery::ALL);
+  assert_eq!(
+    q.retry_count, 1,
+    "a fully-delivered question advances the §5.2 budget"
+  );
+}
+
+#[test]
+fn undelivered_question_neither_burns_the_budget_nor_grows_the_interval() {
+  // Nothing reached any wire, so §5.2 counts no query to space out. This is the
+  // bit-for-bit parity row for the old `delivered = false`.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+
+  let mut previous = None;
+  for _ in 0..3 {
+    emit_question(&mut q, now);
+    q.note_transmit_outcome(now, TransmitDelivery::NONE);
+    assert_eq!(
+      q.retry_count, 0,
+      "an undelivered question must not consume a retry slot"
+    );
+    let gap = q.next_deadline.unwrap().duration_since(now);
+    if let Some(prev) = previous {
+      assert_eq!(
+        gap, prev,
+        "a fully-failed send does not climb the §5.2 ladder"
+      );
+    }
+    previous = Some(gap);
+    now = q.next_deadline.unwrap();
+    q.handle_timeout(now).unwrap();
+  }
+  assert_eq!(
+    previous,
+    Some(core::time::Duration::from_secs(1)),
+    "the undelivered retry stays at the initial §5.2 interval"
+  );
+}
+
+#[test]
+fn repeated_partial_questions_climb_the_rfc_5_2_doubling_ladder() {
+  // RFC 6762 §5.2: "the intervals between successive queries MUST increase by at
+  // least a factor of two". A partial send puts a real question on the served
+  // link's wire every round, so a flat-interval partial resend would violate that
+  // for the link that IS being served — while the budget stays frozen, because no
+  // slot was spent.
+  //
+  // The budget cannot stay frozen forever, or a half-reachable family would keep
+  // the query alive past every terminal. After `MAX_PARTIAL_ROUNDS` honest
+  // partials the next is EXCUSED and spends a slot — carrying the ladder across
+  // rather than resetting it, so the served family never sees a shorter interval.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+
+  let mut previous = 0u64;
+  let mut spent = 0u32;
+  let mut excused = 0u32;
+  for round in 0..8 {
+    emit_question(&mut q, now);
+    let before = q.retry_count;
+    q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+    let deadline = q.next_deadline.expect("a partial send always re-arms");
+    let gap = deadline.duration_since(now).as_secs();
+    if q.retry_count == before {
+      assert!(
+        round % 3 != 2,
+        "round {round} is the budget-exhausting one and must have been excused"
+      );
+    } else {
+      assert_eq!(
+        q.retry_count,
+        before + 1,
+        "an excused round spends exactly one slot"
+      );
+      spent += 1;
+      excused += 1;
+    }
+    // §5.2 holds the interval at 60 s, so the doubling requirement only binds
+    // below that cap.
+    if round > 0 && gap < 60 {
+      assert!(
+        gap >= previous.saturating_mul(2),
+        "§5.2 requires each interval to be at least double the previous one \
+         ({gap} s after {previous} s) — round {round}"
+      );
+    }
+    previous = gap;
+    now = deadline;
+    q.handle_timeout(now).unwrap();
+  }
+  assert_eq!(
+    (spent, excused),
+    (2, 2),
+    "two of eight partial rounds exhausted the bound and advanced the budget"
+  );
+
+  // Recovery is immediate: the first fully-delivered question spends its slot and
+  // the ladder resets to the bottom rung.
+  emit_question(&mut q, now);
+  let before = q.retry_count;
+  q.note_transmit_outcome(now, TransmitDelivery::ALL);
+  assert_eq!(q.retry_count, before + 1, "recovery spends exactly one slot");
+  assert_eq!(
+    q.partial_send_streak, 0,
+    "a genuine delivery resets the partial ladder — an excused one does not"
+  );
+  assert_eq!(
+    q.next_deadline,
+    retry::next_deadline(now, q.retry_count),
+    "and the schedule returns to the plain §5.2 walk indexed by the budget alone, \
+     with no partial streak added on top"
+  );
+}
+
+#[test]
+fn the_first_partial_rungs_are_the_plain_5_2_intervals() {
+  // The head of the ladder, exactly: 1 s, then 2 s while the budget is frozen,
+  // then the EXCUSED round at 4 s — never back at the flat 1 s the freshly-spent
+  // budget slot would otherwise index.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+  for want in [1u64, 2, 4] {
+    emit_question(&mut q, now);
+    q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+    let deadline = q.next_deadline.expect("a partial send always re-arms");
+    assert_eq!(
+      deadline.duration_since(now).as_secs(),
+      want,
+      "expected a {want} s rung"
+    );
+    now = deadline;
+    q.handle_timeout(now).unwrap();
+  }
+  assert_eq!(
+    q.retry_count, 1,
+    "only the excused third round may have spent a slot"
+  );
+}
+
+#[test]
+fn a_permanently_partial_question_still_reaches_its_terminal_timeout() {
+  // Without the bound the §5.2 budget never advances on a partial send, so a
+  // half-reachable link keeps a query re-asking on the growing partial interval
+  // forever and the caller's `QueryUpdate::Timeout` never arrives.
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+  for _ in 0..64 {
+    if q.is_done() {
+      break;
+    }
+    emit_question(&mut q, now);
+    q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+    now = q.next_deadline.expect("a partial send always re-arms");
+    q.handle_timeout(now).unwrap();
+  }
+  assert!(
+    q.is_done(),
+    "a permanently half-delivered question must still retire, not hang"
+  );
+}
+
+/// RFC 6762 §7.3 treats a peer's identical question as OUR send, so the slot it
+/// consumes must clear exactly what an all-delivered send clears — the core's
+/// patience counter included.
+///
+/// Leaving a family's `partial_rounds` charged carries the previous slot's unmet obligation
+/// into a slot that met its own, so the NEXT genuine partial is EXCUSED early:
+/// a §5.2 retry slot spent on behalf of a link that was never asked.
+#[test]
+fn duplicate_suppression_clears_the_partial_bound_like_a_delivered_send() {
+  let mut q = make_query(ResourceType::Any, ResourceClass::Any);
+  let mut now = StdInstant::now();
+
+  // Charge the bound to exactly one round short of the excusal.
+  for _ in 0..MAX_PARTIAL_ROUNDS {
+    emit_question(&mut q, now);
+    q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+    now = q.next_deadline.expect("a partial send always re-arms");
+    q.handle_timeout(now).unwrap();
+  }
+  assert_eq!(q.partial_rounds[V6].missed, MAX_PARTIAL_ROUNDS);
+
+  // A peer multicasts the same question just as ours becomes due.
+  assert!(
+    q.note_duplicate_question(now),
+    "a suppressed retransmit must actually consume the slot"
+  );
+  assert_eq!(
+    q.partial_rounds, [FamilyPatience::default(); 2],
+    "the peer's query was asked on every link, so nothing is left outstanding"
+  );
+  assert_eq!(
+    q.partial_send_streak, 0,
+    "…which is the same reason the §5.2 ladder resets here"
+  );
+
+  // The next honestly-partial round is therefore held, not excused.
+  now = q.next_deadline.expect("suppression arms the next slot");
+  q.handle_timeout(now).unwrap();
+  emit_question(&mut q, now);
+  let before = q.retry_count;
+  q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+  assert_eq!(
+    q.retry_count, before,
+    "the first partial after a full slot must not be excused — the bound was \
+     cleared, so this round is held honestly"
+  );
+  assert_eq!(q.partial_rounds[V6].missed, 1);
+}
+
+/// The absolute `timeout_deadline` can terminate a query while a question is
+/// still awaiting its confirm. `terminate` clears both deadlines, so a late
+/// confirm that re-armed `next_deadline` would hand the driver a wakeup for a
+/// query that will never transmit again — `poll_timeout` does not screen `done`.
+///
+/// Reaching that state requires `handle_timeout` to run while the datagram is
+/// unconfirmed, which the contract on `Query::poll_transmit` forbids, so the
+/// debug-build assertion is off: this pins the RELEASE-mode backstop.
+#[test]
+fn a_late_confirm_on_a_terminated_query_arms_no_wakeup() {
+  let handle = QueryHandle::from_raw(0);
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let start = StdInstant::now();
+  let deadline = start + core::time::Duration::from_millis(500);
+  let mut q: TestQuery = TestQuery::try_new(
+    handle,
+    qname,
+    ResourceType::Any,
+    ResourceClass::Any,
+    1,
+    false,
+    Some(deadline),
+  );
+  q.disable_contract_assertions();
+
+  emit_question(&mut q, start);
+  assert!(q.awaiting_send_confirm);
+
+  // The absolute deadline fires first: the query is terminal and quiescent.
+  let late = start + core::time::Duration::from_secs(1);
+  q.handle_timeout(late).unwrap();
+  assert!(q.is_done());
+  assert!(q.poll_timeout().is_none());
+
+  // The parked datagram's confirm finally lands.
+  q.note_transmit_outcome(late, TransmitDelivery::ALL);
+  assert!(
+    !q.awaiting_send_confirm,
+    "the token is still resolved — a terminal query must not stay awaiting"
+  );
+  assert!(
+    q.poll_timeout().is_none(),
+    "a finished query must not re-arm a deadline the driver would wake for"
+  );
 }

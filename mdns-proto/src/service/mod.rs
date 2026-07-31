@@ -5,7 +5,7 @@ cfg_heap! {
 
   mod respond;
 }
-mod schedule;
+pub(crate) mod schedule;
 mod state;
 
 cfg_heap! {
@@ -154,16 +154,22 @@ cfg_heap! {
   pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye};
 }
 #[allow(unused_imports)]
-pub(crate) use schedule::{announce_deadline, probe_deadline, re_announce_deadline};
+pub(crate) use schedule::{
+  FamilyPatience, MAX_PARTIAL_ROUNDS, PhaseAdvance, announce_deadline, classify_advance,
+  compose_announce_deadline, partial_announce_deadline, probe_deadline, probe_retry_deadline,
+  re_announce_deadline, stalest_refresh_due,
+};
 pub use state::ServiceState;
 
 cfg_heap! {
+  use core::time::Duration;
+
   use rand::SeedableRng;
 
   use crate::error::{HandleTimeoutError, TransmitError};
   use crate::event::{ServiceEvent, ServiceUpdate};
   use crate::records::ServiceRecords;
-  use crate::transmit::Transmit;
+  use crate::transmit::{FamilyDelivery, Transmit, TransmitDelivery, TransmitObligation};
   use crate::{Instant, Pool, ServiceHandle};
 
   type Rng = rand::rngs::StdRng;
@@ -304,11 +310,51 @@ cfg_heap! {
   }
 
   /// The commit token stamped by `poll_transmit` and resolved by
-  /// `note_transmit_result`. Unlike [`PendingTransmitKind`] (which is
+  /// `note_transmit_outcome`. Unlike [`PendingTransmitKind`] (which is
   /// queued at deadline-fire time), this carries what was ACTUALLY encoded, so a
   /// response that known-answer-suppression (§7.1) trimmed latches goodbye
   /// ownership only for the concrete records it really put on the wire
   /// (per record, not per group).
+  ///
+  /// # Token lifecycle across every state-mutating entry point
+  ///
+  /// The confirm-before-anything contract on [`Service::poll_transmit`] means no
+  /// state-mutating entry point may run while a token is live, so for a compliant
+  /// driver every row below except `poll_transmit` and `note_transmit_outcome` is
+  /// unreachable. The core cannot type-check the ordering, though, and a
+  /// violation must stay defined rather than silently corrupting state in
+  /// release — so each entry point still declares what it does to a live token.
+  /// Every cell marked "rewrite" is a BACKSTOP: unreachable for a compliant
+  /// driver, and what happens if the contract is broken.
+  ///
+  /// The counter column covers all three pieces of per-round state: the
+  /// per-family patience (`partial_rounds`, a [`FamilyPatience`] each), the §8.3
+  /// ladder exponent (`partial_announce_streak`), and the per-family refresh
+  /// anchors (`last_delivered`). "zeroed" means `FamilyPatience::default()` — the
+  /// count, the coverage bit, and the good-standing latch together.
+  ///
+  /// | entry point | live token | partial counters (`partial_rounds` / `partial_announce_streak` / `last_delivered`) | deadlines |
+  /// |---|---|---|---|
+  /// | `handle_event` §8.2 probe-conflict buffer | untouched — buffering a peer record is not a lifecycle move | untouched | untouched |
+  /// | `handle_event` §9 same-name revert (`Init`) | backstop: **rewrite** → `Stale`, name unchanged | `partial_rounds` zeroed (fresh §8.1 sequence); streak untouched — same name, same §8.3 ladder; `last_delivered` untouched, since peers still hold THESE records under THIS name and each family still races the same TTL | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
+  /// | `handle_event` Question / KnownAnswer / HostConflict | untouched — none of them regress a phase | untouched | `response_deadline` / `meta_response_deadline` only |
+  /// | `handle_timeout` §8.2 tiebreak → rename (`Init`) | backstop: **rewrite** → `Stale`, old-name records captured | all three cleared by `reset_advertised_name_state` — a NEW name starts every sequence over, and no family is owed a refresh of a name it has never heard | `response_deadline` cleared, `lifecycle_deadline` = fresh probe |
+  /// | `handle_timeout` §8.2 tiebreak → `Conflicting` (invalid new name) | backstop: **rewrite** → `Stale`, old-name records captured | streak zeroed; `partial_rounds` / `last_delivered` untouched — terminal, nothing left to excuse and nothing left to schedule | all cleared |
+  /// | `handle_timeout` `Init` → `Probing(0)` | untouched — a forward step, and it emits nothing | untouched | re-armed |
+  /// | `handle_timeout` `Probing`/`Announcing`/`Established` fire | untouched; backstop: `push_lifecycle_pending` queues NOTHING while a token is live, so no lifecycle transmit outlives the confirm | untouched | re-armed |
+  /// | `handle_timeout` `Conflicting` | untouched — no progression | untouched | untouched |
+  /// | `poll_transmit` | refuses (`Ok(None)`) while one is live — the single slot is what matches one confirm to one datagram | untouched | untouched |
+  /// | `note_transmit_outcome` | consumed (`.take()`) | per the confirm arms; only the Probe and Announcement arms touch patience, and only the Announcement arm touches `last_delivered` | per the confirm arms |
+  /// | `withdrawal_snapshot` | untouched — a pure read of the latch, and it asserts rather than reporting a short goodbye | untouched | untouched |
+  /// | `take_rename_goodbye_handoff` | untouched — pure `.take()` of the handoff field | untouched | untouched |
+  ///
+  /// Teardown is the row where the contract is doing the most work.
+  /// [`Service::withdrawal_snapshot`] can only report what a confirm has already
+  /// latched, so a datagram outstanding across a teardown would put records in
+  /// peer caches that the §10.1 goodbye then never withdraws — and those records'
+  /// TTLs would only START at that late transmission, so the exposure is not
+  /// bounded by the teardown at all. Confirming before tearing down is what makes
+  /// the snapshot complete.
   #[derive(Debug, Clone)]
   enum AwaitingConfirm {
     /// A probe is awaiting its delivery result (§8.1 sequence advance). A probe is
@@ -332,6 +378,123 @@ cfg_heap! {
     /// delivery bumps `responses_tx` WITHOUT touching goodbye ownership or any
     /// lifecycle state.
     MetaResponse,
+    /// A datagram whose LIFECYCLE meaning a regression to [`ServiceState::Init`]
+    /// has voided: it was encoded for a generation of the state machine that a
+    /// RFC 6763 §9 same-name revert-to-probe, or a RFC 6762 §8.2 conflict rename,
+    /// has since replaced.
+    ///
+    /// The datagram itself is real and may well be delivered, so the token keeps
+    /// exactly the two facts that outlive the generation — which counter the send
+    /// earned, and WHOSE records it put on the wire — and drops everything else.
+    /// See [`Service::stale_live_commit_token`] for why the second fact is
+    /// captured at the regression rather than reconstructed at confirm time.
+    Stale {
+      /// The wire fact the datagram still earns on delivery.
+      fact: StaleWireFact,
+      /// Where a delivered confirm must latch the records it carried.
+      records: StaleRecords,
+    },
+  }
+
+  /// Which counter a regression-voided datagram's confirm still owes.
+  ///
+  /// Only the counters: every LIFECYCLE effect of the original token is void. The
+  /// distinction is the code's own documented split between wire facts and
+  /// lifecycle facts — `responses_tx` reflects every datagram that left the host,
+  /// and `probes_tx` / `announcements_tx` mean "confirmed delivered by every
+  /// obligated link" — neither of which says anything about which generation the
+  /// datagram belonged to.
+  #[cfg_attr(not(feature = "stats"), allow(dead_code))]
+  #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+  enum StaleWireFact {
+    /// RFC 6762 §8.1 probe: `probes_tx` on a fully-delivered confirm.
+    Probe,
+    /// §8.3 unsolicited announcement: `announcements_tx` on a fully-delivered
+    /// confirm.
+    Announcement,
+    /// §6 multicast or §6.7 legacy-unicast response: `responses_tx` on ANY
+    /// delivery, plus the §7.1 partial-suppression count the response carried.
+    Response(u64),
+  }
+
+  /// Which name a regression-voided datagram advertised, and therefore where a
+  /// delivered confirm must latch its records so they can still be withdrawn.
+  #[derive(Debug, Clone)]
+  enum StaleRecords {
+    /// Nothing to latch. A probe is a QUESTION (§8.1) — it advertises no records
+    /// at all — and it is the only stale datagram that carries none.
+    None,
+    /// The service STILL holds the name these records were emitted under (the §9
+    /// same-name revert-to-probe): they latch into the live `goodbye` exactly as
+    /// they would have without the regression.
+    SameName(respond::EmittedRecords),
+    /// The service has RENAMED AWAY from the name these instance records were
+    /// emitted under. `records` is the OLD name, cloned at the regression site
+    /// before `ServiceRecords::set_instance` overwrote it, so the detached
+    /// old-name §10.1 goodbye can still withdraw them.
+    OldName {
+      /// The OLD instance name's records.
+      records: ServiceRecords,
+      /// What the datagram actually emitted under that name.
+      emitted: respond::EmittedRecords,
+    },
+  }
+
+  impl AwaitingConfirm {
+    /// The [`TransmitObligation`] this token implies, i.e. whether
+    /// [`Service::note_transmit_outcome`] will re-arm the datagram until every
+    /// obligated link accepts it.
+    ///
+    /// Derived from the token — what was actually ENCODED — and never from
+    /// `self.state`. Two things make the state wrong here. The periodic
+    /// `Established` re-announce advances no phase yet is still re-armed on the
+    /// RFC 6762 §8.3 doubling ladder while a link keeps missing it, so a
+    /// phase-derived tag would call it fire-and-forget. And the state can advance
+    /// between the deadline firing and the datagram being encoded — the drift
+    /// [`PendingTransmitKind`] already exists to absorb.
+    #[inline]
+    fn obligation(&self) -> TransmitObligation {
+      match self {
+        // Re-armed until every obligated link hears it: the §8.1 probe sequence
+        // and the §8.3 announcement (startup phase AND periodic re-announce).
+        Self::Probe | Self::Announcement(_) => TransmitObligation::Sustained,
+        // A response is emitted once for the question that provoked it and is
+        // never re-armed, so no link can pin anything by missing it. A
+        // regression-voided datagram belongs to a generation that no longer
+        // exists, so nothing will ever re-arm it either. (Unreachable in
+        // practice: `stamped_obligation` reads the token `poll_transmit` just
+        // stamped, and `poll_transmit` never stamps `Stale`.)
+        Self::Response(_, _) | Self::MetaResponse | Self::Stale { .. } => {
+          TransmitObligation::OneShot
+        }
+      }
+    }
+
+    /// The minimum wire gap this token's datagram owes each family it is fanned
+    /// onto ([`Transmit::min_family_gap`]).
+    ///
+    /// Kind-dependent, and read from the token for the same reason the
+    /// obligation is: it describes what was actually ENCODED, not what
+    /// `self.state` has since become.
+    ///
+    /// * A probe is RFC 6762 §8.1's, spaced [`schedule::rfc::PROBE_INTERVAL`]
+    ///   apart and explicitly exempt from the one-second rule §6 applies to
+    ///   records — §8.1's own sequence would be illegal under it.
+    /// * An unsolicited announcement — the §8.3 burst and the periodic
+    ///   `Established` re-announce alike — is not exempt: §6 forbids
+    ///   re-multicasting a record on an interface inside
+    ///   [`schedule::rfc::ANNOUNCE_INTERVAL`] of the last time it went out on
+    ///   that same interface, and §8.3's own floor says the same.
+    /// * Everything else is one-shot and ungated (see
+    ///   [`Transmit::min_family_gap`]).
+    #[inline]
+    fn min_family_gap(&self) -> Duration {
+      match self {
+        Self::Probe => schedule::rfc::PROBE_INTERVAL,
+        Self::Announcement(_) => schedule::rfc::ANNOUNCE_INTERVAL,
+        Self::Response(_, _) | Self::MetaResponse | Self::Stale { .. } => Duration::ZERO,
+      }
+    }
   }
 
   /// Goodbye ownership: which CONCRETE records peers may have cached FROM US, and
@@ -343,7 +506,7 @@ cfg_heap! {
   ///
   /// INVARIANT: a record becomes "advertised" ONLY through a CONFIRMED send that
   /// actually emitted THAT record ([`Self::record_emitted`], driven by the
-  /// encoder's per-record report via `note_transmit_result`). A send that never
+  /// encoder's per-record report via `note_transmit_outcome`). A send that never
   /// reaches the link — or whose record was known-answer-suppressed (§7.1) —
   /// advertises nothing, so a later goodbye never withdraws a record we did not
   /// put on the wire (which could otherwise flush a peer's matching shared
@@ -380,6 +543,16 @@ cfg_heap! {
       self.srv |= e.srv();
       self.txt |= e.txt();
       self.subtypes |= e.subtypes();
+      self.record_host_emitted(e);
+    }
+    /// Latch ONLY the host-owned addresses of a confirmed-delivered send.
+    ///
+    /// Used when the send's INSTANCE records belong to a name the service has
+    /// since renamed away from: the host name is invariant across an instance
+    /// rename, so those addresses really are cached under a name this service
+    /// still holds and stay its to withdraw, while the instance records go to the
+    /// detached old-name goodbye instead.
+    fn record_host_emitted(&mut self, e: &respond::EmittedRecords) {
       for ip in e.a_slice() {
         if !self.a.contains(ip) {
           self.a.push(*ip);
@@ -478,7 +651,76 @@ cfg_heap! {
 }
 
 cfg_heap! {
+  /// Unforgeable proof of [`Service::has_fully_announced`] — the reclaim-cancel
+  /// gate of
+  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced).
+  ///
+  /// There is NO public constructor and no `From<bool>`: the only way a driver can
+  /// obtain a value is to ask the `Service` that owns the fact. That is the whole
+  /// purpose of the type. The gate's predecessor took a plain `bool`, and every
+  /// shipped driver filled it with [`Service::advertises_instance`] — the
+  /// ANY-delivered exposure latch, which is a different fact and makes the cancel
+  /// unsound (a v4-only announcement, or an RFC 6762 §6.7 legacy unicast reply,
+  /// would retire a goodbye the unserved family still needs). A `bool` parameter
+  /// cannot reject that; this type can, at compile time.
+  ///
+  /// The distinction matters more here than at the other confirm boundaries
+  /// because this is the ONE migration leg with no compile-time forcing function:
+  /// deleting the boolean confirm METHODS makes every other call site fail to
+  /// compile, whereas a same-arity `bool` parameter whose MEANING changed would
+  /// silently survive both the driver migration and any external upgrade.
+  ///
+  /// The token also NAMES the service it was minted from, and
+  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced)
+  /// takes no separate handle. An unforgeable fact is still transplantable while
+  /// the subject is a second argument: a genuine `true` from service A, paired
+  /// with service B's handle, would cancel B's reclaimable goodbye while an
+  /// obligated family still needs it. Carrying the subject inside the proof makes
+  /// that pairing unrepresentable rather than merely validated.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  #[must_use]
+  pub struct FullyAnnounced {
+    handle: ServiceHandle,
+    fully_announced: bool,
+  }
+
+  impl FullyAnnounced {
+    /// Wrap the fact together with the service it is a fact ABOUT.
+    /// Crate-internal: [`Service::has_fully_announced`] is the sole caller, which
+    /// is what makes the type unforgeable outside this crate.
+    #[inline(always)]
+    pub(crate) const fn new(handle: ServiceHandle, fully_announced: bool) -> Self {
+      Self {
+        handle,
+        fully_announced,
+      }
+    }
+
+    /// The service this fact is about — the [`Service`] that minted it. The
+    /// endpoint routes on this instead of a caller-supplied handle, so the fact
+    /// and its subject cannot be separated.
+    #[inline(always)]
+    pub(crate) const fn handle(self) -> ServiceHandle {
+      self.handle
+    }
+
+    /// Whether a complete announcement of the service's current instance name has
+    /// reached every obligated link.
+    #[inline(always)]
+    pub const fn get(self) -> bool {
+      self.fully_announced
+    }
+  }
+}
+
+cfg_heap! {
   /// Service state machine. One per registered service.
+  ///
+  /// Driving one means honouring two call-ordering contracts: drain
+  /// [`Service::poll_transmit`] until it returns `Ok(None)`, and confirm each
+  /// datagram it hands out — via [`Service::note_transmit_outcome`] — before
+  /// invoking any other state-mutating entry point on this service.
+  /// [`Service::poll_transmit`] documents the second one in full.
   pub struct Service<I, TQ, EV> {
   handle: ServiceHandle,
   state: ServiceState,
@@ -532,12 +774,67 @@ cfg_heap! {
   /// [`GoodbyeOwnership`] for the invariants (confirmed-send-driven, instance
   /// resets on rename, host persists).
   goodbye: GoodbyeOwnership,
+  /// Whether a COMPLETE §8.3 announcement of the CURRENT instance name has
+  /// reached every obligated link. Set ONLY by an `AllDelivered` announcement
+  /// confirm; reset by a §9 conflict rename alongside
+  /// [`GoodbyeOwnership::reset_instance`], because the new name has announced
+  /// nothing. Distinct from `goodbye.any_instance()`, which is an ANY-delivered
+  /// exposure latch: see [`Service::has_fully_announced`] for why the endpoint's
+  /// reclaim-cancel needs the all-delivered fact and not the exposure one.
+  fully_announced: bool,
+  /// Consecutive `PartiallyDelivered` announcement confirms since the last phase
+  /// advance — the exponent of the RFC §8.3 doubling ladder
+  /// (`partial_announce_deadline`). A partial announcement puts a real datagram
+  /// on the served link's wire every re-arm, so its repetition must respect
+  /// §8.3's "increases by at least a factor of two with every response sent";
+  /// a fully-failed send reaches no wire and so neither uses nor advances this.
+  partial_announce_streak: u8,
+  /// Per family ([0] = v4, [1] = v6): consecutive LIFECYCLE confirms (§8.1 probe
+  /// or §8.3 announcement) in which THAT family was obligated and missed a
+  /// datagram some other family carried — the core's own patience, bounded by
+  /// `MAX_PARTIAL_ROUNDS`. Reaching the bound EXCUSES that family, so the phase
+  /// advances from exactly where it stood instead of pinning forever, and takes it
+  /// out of good standing so it stops driving the refresh schedule below until it
+  /// delivers again.
+  ///
+  /// Per family rather than per round because those disagree exactly where it
+  /// matters: two families alternating under a capacity-one transport look
+  /// identical to one chronically dead family through a shared counter, and the
+  /// first must not be excused at all.
+  ///
+  /// It lives beside the per-kind confirm arms that maintain it, so a §6 response
+  /// or a §9 meta reply — never re-armed, so evidence of nothing — structurally
+  /// cannot touch it. Reset by that family's OWN delivery and by it ceasing to be
+  /// obligated; left ALONE by a wholly-failed round (see `classify_advance`); and
+  /// zeroed wherever the lifecycle regresses to `Init`, which starts a fresh
+  /// §8.1 sequence.
+  partial_rounds: [FamilyPatience; 2],
+  /// Per family ([0] = v4, [1] = v6): when this family last had an ANNOUNCEMENT
+  /// delivered to it — the event that refreshes the record TTLs in that family's
+  /// peer caches. `None` means the family is not obligated (no socket for it).
+  ///
+  /// Each family races its OWN copy of the TTL, so the periodic re-announce is
+  /// scheduled off the stalest of these rather than off the last round: under a
+  /// capacity-one transport every round is partial while each family is served
+  /// only every other one, so a round-anchored schedule refreshes each family at
+  /// TWICE the periodic interval and its records expire from every peer cache
+  /// while every per-round invariant still holds.
+  ///
+  /// Only the announcement confirm arm writes it. A probe advertises nothing, and
+  /// a §6 response refreshes one querier's cache with whatever §7.1 left of it —
+  /// neither is a refresh this schedule may count on.
+  ///
+  /// A family that becomes obligated at runtime is anchored at THAT moment rather
+  /// than left `None`: unanchored reads as "not obligated" and would defer it
+  /// silently, while anchoring it in the past would read as infinitely stale and
+  /// re-arm every confirm at the §8.3 floor.
+  last_delivered: [Option<I>; 2],
   /// the commit token for the datagram `poll_transmit`
   /// most recently produced — `Some(kind)` while that send is awaiting a
   /// delivery result, `None` otherwise. This is the structural heart of the
   /// confirm-on-send invariant: `poll_transmit` ONLY stamps this token and
   /// advances no lifecycle state; ALL lifecycle progression happens in
-  /// [`Self::note_transmit_result`], keyed on the token. Because of that a send
+  /// [`Self::note_transmit_outcome`], keyed on the token. Because of that a send
   /// that never reaches the link (all sockets error) advances nothing — neither
   /// the goodbye-ownership latches (`announce_emitted` / `host_advertised`) for
   /// an announcement, nor the probe sequence (RFC 6762 §8.1) for a probe.
@@ -583,6 +880,14 @@ cfg_heap! {
   /// section already carries the meta-PTR for OUR service type — our pending
   /// meta reply is then suppressed. Reset each meta cycle.
   meta_known_answered: bool,
+  /// Test-only: silence [`Service::assert_no_live_commit_token`] so a test can
+  /// drive the entry points the way a NON-COMPLIANT driver would and pin what
+  /// the release-mode backstops actually do. Those backstops only exist for a
+  /// driver that breaks the contract, so the assertion that catches such a
+  /// driver in debug builds would otherwise make them untestable. `cfg(test)`:
+  /// it does not exist in a shipped build and no public API sets it.
+  #[cfg(test)]
+  contract_assertions_off: bool,
   }
 }
 
@@ -637,6 +942,10 @@ where
       peer_probes: std::vec::Vec::new(),
       tiebreak_pending: false,
       goodbye: GoodbyeOwnership::default(),
+      fully_announced: false,
+      partial_announce_streak: 0,
+      partial_rounds: [FamilyPatience::default(); 2],
+      last_delivered: [None, None],
       awaiting_confirm: None,
       pending_legacy: std::vec::Vec::new(),
       last_conflict_reprobe: None,
@@ -644,7 +953,20 @@ where
       meta_response_deadline: None,
       meta_questioner_srcs: std::vec::Vec::new(),
       meta_known_answered: false,
+      #[cfg(test)]
+      contract_assertions_off: false,
     }
+  }
+
+  /// Test-only: opt this service out of the debug-build contract assertions.
+  ///
+  /// The only callers are the backstop tests, which must reproduce a
+  /// non-compliant driver to observe what release builds do when the contract is
+  /// broken.
+  #[cfg(test)]
+  #[cfg(all(any(feature = "alloc", feature = "std"), feature = "slab"))]
+  pub(crate) fn disable_contract_assertions(&mut self) {
+    self.contract_assertions_off = true;
   }
 
   /// Attach the shared [`hick_trace::stats::Stats`] handle from the owning
@@ -710,12 +1032,48 @@ where
   /// Whether this service has CONFIRMED-EMITTED at least one INSTANCE record
   /// (PTR/SRV/TXT) on the wire — i.e. it has truly advertised its name, not merely
   /// probed for it. Unlike [`Self::advertises_host`] this is set even for an
-  /// address-less service. Drivers gate the endpoint's cancel-on-announce reclaim
-  /// on this so a probe alone cannot cancel a renamed-away old name's goodbye
-  /// before the reclaiming service has actually announced.
+  /// address-less service.
+  ///
+  /// This is the ANY-delivered EXPOSURE latch: it answers "may some peer hold
+  /// these records?", which is what a §10.1 goodbye must retract. It is
+  /// deliberately NOT the reclaim-cancel gate — that is
+  /// [`Self::has_fully_announced`], which requires EVERY obligated link to have
+  /// heard a complete announcement. See that method for why substituting this one
+  /// there is unsound, and why the fact is handed out wrapped so it cannot be.
   #[inline(always)]
   pub fn advertises_instance(&self) -> bool {
     self.goodbye.any_instance()
+  }
+
+  /// Whether a COMPLETE §8.3 announcement of the CURRENT instance name has
+  /// reached EVERY obligated link — i.e. at least one announcement resolved
+  /// [`TransmitDelivery::all_delivered`].
+  ///
+  /// This is the reclaim-cancel gate the driver ferries into
+  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced):
+  /// only once every link the driver still obligates has heard the reclaiming
+  /// name may that name's renamed-away predecessor stop sending its TTL=0
+  /// goodbye. For every such link §10.2's cache-flush announcement supersedes the
+  /// stale unique records, so the goodbye has nothing left to do.
+  ///
+  /// It is deliberately NOT [`Self::advertises_instance`], which latches on ANY
+  /// delivery and would make the gate unsound in two ways: a v4-only (partial)
+  /// announcement would cancel a goodbye the v6 zone still needs, and — because
+  /// an RFC 6762 §6.7 legacy UNICAST reply has a single obligated link and so
+  /// reports `AllDelivered` by construction — a mere unicast reply would satisfy
+  /// any "advertises_instance() && all_delivered()" formula without ever having
+  /// multicast the name. Only the Announcement confirm arm sets this, so no
+  /// response of any kind can.
+  ///
+  /// The result is wrapped in [`FullyAnnounced`] precisely so that the wrong fact
+  /// cannot be substituted at the call site; use [`FullyAnnounced::get`] to read
+  /// it. The token is stamped with THIS service's handle, so it also cannot be
+  /// applied to a different service.
+  ///
+  /// Reset by a §9 conflict rename: the new name has announced nothing.
+  #[inline(always)]
+  pub const fn has_fully_announced(&self) -> FullyAnnounced {
+    FullyAnnounced::new(self.handle, self.fully_announced)
   }
 
   /// The host IPv4 addresses this service has actually ADVERTISED (confirmed-
@@ -736,27 +1094,103 @@ where
     &self.goodbye.aaaa
   }
 
-  /// Report the delivery result of the datagram most recently produced by
+  /// Report the delivery outcome of the datagram most recently produced by
   /// [`Self::poll_transmit`] (the confirm-on-send chokepoint).
   ///
-  /// This is the SOLE place service lifecycle state advances. `poll_transmit`
-  /// only encodes bytes and stamps a commit token (`awaiting_confirm`); the
-  /// driver then calls this with `delivered = true` when at least one socket
-  /// send succeeded (`used > 0`). Behaviour is keyed on the token:
+  /// # Contract
   ///
-  /// * **Probe, delivered** — advance the §8.1 probe sequence (next probe, or
-  ///   enter `Announcing(0)` after the third). A name is therefore claimed only
-  ///   once a probe has actually reached the link.
-  /// * **Probe, NOT delivered** — re-arm the same probe WITHOUT advancing, so a
-  ///   service whose probes never leave the host never announces (the RFC 6762
-  ///   §8.1 guarantee; the fix).
-  /// * **Announcement, delivered** — latch the goodbye-ownership guards
-  ///   (`announce_emitted` / `host_advertised`) and advance the §8.3
-  ///   announce phase, reaching `Established` after the second.
-  /// * **Announcement, NOT delivered** — re-arm without advancing; the
-  ///   announcement is retried.
-  /// * **Response / nothing pending** — no lifecycle state to advance.
-  pub fn note_transmit_result(&mut self, now: I, delivered: bool) {
+  /// Must be called before ANY other state-mutating entry point for this service
+  /// — see [`Self::poll_transmit`], which documents the ordering and why a
+  /// datagram the transport refuses is dropped and confirmed rather than parked.
+  ///
+  /// This is the SOLE place service lifecycle state advances and the SOLE place
+  /// goodbye ownership latches. `poll_transmit` only encodes bytes and stamps a
+  /// commit token (`awaiting_confirm`); the driver then reports how the fan-out
+  /// went. Two invariants key every arm below:
+  ///
+  /// * **Goodbye ownership latches iff [`TransmitDelivery::any_delivered`]** —
+  ///   peers reachable over any link that accepted the datagram may hold the
+  ///   records it carried (RFC 6762 §10.1), whether or not every link did.
+  /// * **Phase takes full credit iff [`TransmitDelivery::all_delivered`]** — a
+  ///   link that never saw the probe has not been asked (§8.1) and one that
+  ///   never saw the announcement has not been told (§8.3). The phase can also
+  ///   advance WITHOUT that credit, via the two bounded escapes described below.
+  ///
+  /// Behaviour per commit token:
+  ///
+  /// * **Probe, all delivered** — advance the §8.1 probe sequence (next probe,
+  ///   or enter `Announcing(0)` after the third). A name is therefore claimed
+  ///   only once its probe reached every obligated link.
+  /// * **Probe, otherwise** — re-arm the SAME probe without advancing. A probe
+  ///   is a question: it advertises nothing, so a partial probe latches nothing
+  ///   either. Probes are exempt from the doubling ladders — §8.1's own 250 ms
+  ///   cadence governs them, and §6's one-second rule explicitly carves probing
+  ///   out.
+  /// * **Announcement, all delivered** — latch goodbye ownership for the records
+  ///   it emitted, mark [`Self::has_fully_announced`], and advance the §8.3
+  ///   phase, reaching `Established` after the second.
+  /// * **Announcement, partially delivered** — latch ownership (the served
+  ///   family heard it) but do NOT advance; re-arm on the composed rule in
+  ///   `arm_announcement`, since every such retry puts another real datagram on
+  ///   that family's wire and some family is now falling behind on its TTL.
+  /// * **Announcement, none delivered** — nothing reached any wire: latch
+  ///   nothing, advance nothing, retry flat at the §8.3 one-second interval.
+  /// * **Response / meta-response** — exposure is an any-delivered fact and no
+  ///   phase exists, so partial and full delivery behave identically.
+  /// * **Stale** — the datagram belongs to a generation a regression to
+  ///   [`ServiceState::Init`] replaced. It still counts its wire fact, and its
+  ///   records still latch somewhere they can be withdrawn from, but it advances
+  ///   no phase, moves no deadline, and touches no counter of the generation that
+  ///   replaced it.
+  /// * **Nothing pending** — no-op.
+  ///
+  /// # Drain contract for the rename goodbye handoff
+  ///
+  /// A driver MUST call [`Self::take_rename_goodbye_handoff`] after EVERY call to
+  /// this method, not only after observing
+  /// [`ServiceUpdate::Renamed`](crate::event::ServiceUpdate). A confirm that
+  /// resolves a datagram parked across a §9 conflict rename can INSTALL a handoff
+  /// — the old name's records really are in peer caches and something must
+  /// withdraw them — and by then the `Renamed` update is long since drained, so
+  /// nothing else will ever look. The call is free and returns `None` for a
+  /// driver that confirms each datagram before polling the next one, which is
+  /// every driver that cannot park.
+  ///
+  /// # Advancing without a fully-delivered round
+  ///
+  /// A partially-delivered datagram is re-armed LOSSLESSLY — the same probe
+  /// index, the same announcement content — so the phase has two further ways to
+  /// move, and neither is a delivery:
+  ///
+  /// * **Covered.** Every obligated family has carried this datagram at some
+  ///   point since the phase last advanced. Under a capacity-one transport the
+  ///   families take turns, so no single round ever reaches both while both are
+  ///   in fact being served; without this the producer would sit in `Probing(0)`
+  ///   forever, because a family's patience resets on its own delivery and
+  ///   neither could ever spend it.
+  /// * **Excused.** Every family still owed the datagram has spent
+  ///   `MAX_PARTIAL_ROUNDS` re-arms on it. The phase advances from exactly where
+  ///   it stood, without that family, and the family stops driving the per-family
+  ///   refresh schedule until it delivers again.
+  ///
+  /// Neither takes any of the credit a delivery earns, and that is the whole of
+  /// the distinction:
+  ///
+  /// * [`Self::has_fully_announced`] stays shut — no ONE announcement was
+  ///   confirmed by every obligated family, so a renamed-away name's §10.1
+  ///   goodbye must keep going;
+  /// * the §8.3 doubling ladder is preserved, and the re-arm is never EARLIER
+  ///   than the rung the served family already earned;
+  /// * `probes_tx` / `announcements_tx` do not count it — those counters mean
+  ///   "confirmed delivered by every obligated link", so such a round is visible
+  ///   as an advance the counters never recorded.
+  ///
+  /// Goodbye ownership is unaffected either way: both are still `any_delivered`,
+  /// so the records they put on a wire stay owned and retractable.
+  ///
+  /// An all-miss round reaches none of this: it leaves every family's patience
+  /// untouched, which is what keeps a phase from ever advancing out of silence.
+  pub fn note_transmit_outcome(&mut self, now: I, delivery: TransmitDelivery) {
     let kind = match self.awaiting_confirm.take() {
       Some(k) => k,
       None => return,
@@ -764,16 +1198,27 @@ where
     match kind {
       AwaitingConfirm::Probe => {
         if let ServiceState::Probing(n) = self.state {
-          if !delivered {
-            // §8.1: the probe never reached the link — do NOT advance the
-            // sequence. Re-arm the SAME probe from post-send time so it
-            // retries, rather than the service progressing toward Announcing
-            // with nothing on the wire.
-            self.lifecycle_deadline = probe_deadline(now, n, &mut self.rng);
+          let advance = classify_advance(&mut self.partial_rounds, delivery);
+          if matches!(advance, PhaseAdvance::Partial | PhaseAdvance::Failed) {
+            // §8.1: the probe did not reach every obligated link — do NOT
+            // advance the sequence. Re-arm the SAME probe from post-send time so
+            // it retries, rather than the service progressing toward Announcing
+            // while a link that has never been asked might already hold the name.
+            //
+            // A RETRY, not an initial schedule: `probe_deadline(now, 0, ..)` would
+            // hand probe 0 §8.1's random 0–250 ms *initial* delay, so a
+            // partially-delivered probe 0 could go back on the wire less than
+            // 250 ms after the copy that was delivered. The spacing is about
+            // transmissions, so every re-arm owes `PROBE_INTERVAL` regardless of
+            // index — see `probe_retry_deadline`.
+            self.lifecycle_deadline = probe_retry_deadline(now);
           } else {
-            // Probe reached the link — count it now (confirmed delivery).
+            // Only a genuine delivery counts: `probes_tx` means "reached every
+            // obligated link", so an excused advance must not inflate it.
             #[cfg(feature = "stats")]
-            if let Some(s) = self.stat() {
+            if matches!(advance, PhaseAdvance::Delivered)
+              && let Some(s) = self.stat()
+            {
               s.probes_tx(1);
             }
             if n >= 2 {
@@ -781,8 +1226,21 @@ where
               self.state = ServiceState::Announcing(0);
               self.probe_count = 3;
               self.lifecycle_deadline = announce_deadline(now, 0);
+              match advance {
+                // A fresh §8.3 announcement sequence starts from the bottom rung.
+                PhaseAdvance::Delivered => self.partial_announce_streak = 0,
+                // An excused advance earns no reset: the served link is still on
+                // whatever rung it climbed to, and §8.3 forbids the next
+                // unsolicited response from coming sooner than the last one did.
+                // The rung itself does not move — a probe is a question, not an
+                // unsolicited response, so it is not a step on that ladder.
+                _ => self.arm_on_partial_ladder(now),
+              }
             } else {
               // Probe confirmed → schedule the next one PROBE_INTERVAL later.
+              // Probes stay off the ladders whether or not this one was excused:
+              // §8.1's own 250 ms cadence governs them and §6's one-second rule
+              // explicitly carves probing out.
               let new_n = n.saturating_add(1);
               self.state = ServiceState::Probing(new_n);
               self.probe_count = new_n;
@@ -792,14 +1250,20 @@ where
         }
       }
       AwaitingConfirm::Announcement(emitted) => {
-        if !delivered {
-          // The announcement never reached the link — re-arm without advancing.
-          // Retry at the §8.3 inter-announce interval, anchored to
-          // post-send time. This MUST also cover the periodic
+        let advance = self.classify_announcement(now, delivery);
+        if matches!(advance, PhaseAdvance::Failed) {
+          // The announcement never reached ANY link — re-arm without advancing
+          // and latch nothing. Retry at the §8.3 inter-announce interval,
+          // anchored to post-send time. This MUST also cover the periodic
           // `Established` re-announce — otherwise a single transient send failure
           // leaves the next attempt a full re-announce interval (~80% of TTL)
           // away, during which peers expire the records and the service silently
           // disappears. A short 1 s retry keeps the records alive.
+          //
+          // The §8.3 doubling ladder deliberately does NOT apply here: nothing
+          // hit any wire, so §8.3 counts no unsolicited response to space out,
+          // and the streak is neither used nor advanced. The delay a failed round
+          // adds is pure extra spacing on top of whatever rung the ladder is on.
           if matches!(
             self.state,
             ServiceState::Announcing(_) | ServiceState::Established
@@ -808,16 +1272,39 @@ where
           }
           return;
         }
-        // Confirmed announcement → count it, then latch goodbye ownership for
-        // the records it carried (peers can only have cached our records once a
-        // send truly reached the link). Driven by the encoder's per-record
-        // report, same as a response: a full announcement emits all of
-        // PTR/SRV/TXT plus every host address.
-        #[cfg(feature = "stats")]
-        if let Some(s) = self.stat() {
-          s.announcements_tx(1);
-        }
+        // At least one obligated link accepted it → peers reachable over that
+        // link may now hold these records, so latch goodbye ownership for
+        // exactly what the encoder reported it emitted (a full announcement
+        // carries all of PTR/SRV/TXT plus every host address). This is the
+        // ANY-delivered half of the invariant pair and happens BEFORE the
+        // all-delivered phase check below: partial delivery owns what it exposed
+        // even though it advances nothing.
         self.goodbye.record_emitted(&emitted);
+        if matches!(advance, PhaseAdvance::Partial) {
+          // §8.3 phase does NOT advance — some obligated family has not been told.
+          // The re-arm is lossless: `announce_count` and the state are untouched,
+          // so the first all-delivered confirm resumes from here.
+          self.arm_announcement(now, advance);
+          self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
+          return;
+        }
+        // The phase advances. Only a genuine delivery earns the credit that goes
+        // with it: `announcements_tx` counts datagrams confirmed by every
+        // obligated family, and the reclaim-cancel gate asserts that ONE complete
+        // announcement reached all of them — neither of which a covered or an
+        // excused round produced.
+        if matches!(advance, PhaseAdvance::Delivered) {
+          #[cfg(feature = "stats")]
+          if let Some(s) = self.stat() {
+            s.announcements_tx(1);
+          }
+          // The ladder resets — the next partial streak starts from the bottom
+          // rung.
+          self.partial_announce_streak = 0;
+          // THE reclaim-cancel gate (see `has_fully_announced`): a complete
+          // announcement of the current name has now reached every obligated link.
+          self.fully_announced = true;
+        }
         if let ServiceState::Announcing(n) = self.state {
           if n >= 1 {
             // Second announcement confirmed → the §8.3 startup sequence is
@@ -850,6 +1337,13 @@ where
             );
           }
         }
+        self.arm_announcement(now, advance);
+        if advance.advances_without_delivery() {
+          // §8.3: the round still put a real unsolicited response on the served
+          // family's wire, so the ladder is CARRIED ACROSS the advance point
+          // rather than reset by it.
+          self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
+        }
       }
       AwaitingConfirm::Response(emitted, _kas_suppressed_count) => {
         #[cfg(feature = "stats")]
@@ -872,7 +1366,11 @@ where
         // a socket failure must not inflate the suppression counter — the
         // records were encoded but never left the host, so from the network's
         // perspective they were NOT suppressed.
-        if delivered {
+        //
+        // Exposure is an ANY-delivered fact and a response carries no lifecycle
+        // phase, so a partial delivery is handled exactly like a full one: one
+        // link's peers heard the records, and that is the whole question here.
+        if delivery.any_delivered() {
           #[cfg(feature = "stats")]
           if let Some(s) = self.stat() {
             s.responses_tx(1);
@@ -886,25 +1384,299 @@ where
       AwaitingConfirm::MetaResponse => {
         // A §9 meta-response (multicast or legacy) put a shared meta-PTR on the
         // wire.  No instance-owned records were emitted, so goodbye ownership is
-        // NOT touched.  On a confirmed delivery bump responses_tx so the
-        // *_tx counters reflect every datagram that left the host.
-        if delivered {
+        // NOT touched.  Any delivery bumps responses_tx so the *_tx counters
+        // reflect every datagram that left the host; there is no phase here, so
+        // partial and full delivery are the same event.
+        if delivery.any_delivered() {
           #[cfg(feature = "stats")]
           if let Some(s) = self.stat() {
             s.responses_tx(1);
           }
         }
       }
+      AwaitingConfirm::Stale {
+        fact: _fact,
+        records,
+      } => {
+        // A regression to `Init` voided this datagram's place in the lifecycle,
+        // not the fact that it left the host. So the WIRE facts still count —
+        // `responses_tx` reflects every datagram that left the host, and
+        // `answers_suppressed_kas` is deferred to delivery precisely so it counts
+        // encode-facts that reached the wire — while every LIFECYCLE fact is left
+        // alone: no phase moves, no deadline is re-armed, and neither
+        // `partial_rounds` nor `partial_announce_streak` is read or written,
+        // because both now describe the generation that replaced this one.
+        // `classify_advance` is deliberately not called here for that reason.
+        #[cfg(feature = "stats")]
+        if let Some(s) = self.stat() {
+          match _fact {
+            // `probes_tx` / `announcements_tx` mean "confirmed delivered by every
+            // obligated link", so they hold to that bar here too.
+            StaleWireFact::Probe if delivery.all_delivered() => s.probes_tx(1),
+            StaleWireFact::Announcement if delivery.all_delivered() => s.announcements_tx(1),
+            StaleWireFact::Response(kas) if delivery.any_delivered() => {
+              s.responses_tx(1);
+              if kas > 0 {
+                s.answers_suppressed_kas(kas);
+              }
+            }
+            _ => {}
+          }
+        }
+        if !delivery.any_delivered() {
+          return;
+        }
+        match records {
+          // A probe is a QUESTION (§8.1): it advertised nothing, so there is
+          // nothing to withdraw — and the sequence it was a step of no longer
+          // exists, so it must not advance the fresh one either. That advance is
+          // the §8.1 violation this arm removes: `Init → Probing(0)` costs no
+          // datagram, so a parked old-generation probe confirming into it would
+          // claim the name after TWO probes on the wire instead of three.
+          StaleRecords::None => {}
+          // The name did not change (§9 same-name revert-to-probe): peers hold
+          // these records under the very name this service still owns, so
+          // ownership latches exactly as it would have without the regression.
+          // Discarding it would trade a false withdrawal for a MISSING one at
+          // unregister, which is the worse of the two.
+          StaleRecords::SameName(emitted) => self.goodbye.record_emitted(&emitted),
+          StaleRecords::OldName { records, emitted } => {
+            // The host name is invariant across an instance rename, so the
+            // addresses this datagram carried are cached under a name the service
+            // still holds: they latch into the live goodbye as usual.
+            self.goodbye.record_host_emitted(&emitted);
+            // The instance records are not. `self.records` names the NEW
+            // instance, so `withdrawal_snapshot` would encode them under a name
+            // that never carried them — they belong to the OLD name's detached
+            // §10.1 goodbye instead.
+            let instance = respond::EmittedRecords::new(
+              emitted.ptr(),
+              emitted.srv(),
+              emitted.txt(),
+              std::vec::Vec::new(),
+              std::vec::Vec::new(),
+              emitted.subtypes(),
+            );
+            if instance.is_empty() {
+              // §7.1 trimmed every instance record: the old name put nothing in
+              // any peer cache, so it has nothing to withdraw.
+              return;
+            }
+            match &mut self.rename_goodbye_handoff {
+              Some(h) => h.owned.merge_instance(&instance),
+              // The driver takes the handoff the instant it observes `Renamed`,
+              // and a parked confirm lands after that by construction, so
+              // installing a fresh one is the ordinary case rather than the
+              // exception. Draining it is the drain contract documented above.
+              None => {
+                self.rename_goodbye_handoff = Some(RenameGoodbyeHandoff {
+                  records,
+                  owned: instance,
+                });
+              }
+            }
+          }
+        }
+      }
     }
   }
 
-  /// Convenience wrapper for a CONFIRMED delivery — equivalent to
-  /// `note_transmit_result(now, true)`. Retained so call sites (and tests) that
-  /// always represent a successful send stay terse; all advancement logic lives
-  /// in [`Self::note_transmit_result`].
+  /// Void the LIFECYCLE meaning of a live commit token at a regression to
+  /// [`ServiceState::Init`], capturing WHOSE records the parked datagram put on
+  /// the wire.
+  ///
+  /// The capture has to happen HERE, at the regression, because the fact does not
+  /// survive to confirm time: by then `records` names the new instance,
+  /// `goodbye` has been reset, and `rename_goodbye_handoff` has very likely
+  /// already been drained — drivers take it the instant they observe
+  /// `Renamed`, while a parked confirm lands later by construction. A token that
+  /// only knew it was stale could tell that it must not advance, but not whose
+  /// records it exposed, which is the one fact that decides between withdrawing
+  /// them and stranding them in every peer cache on the link.
+  ///
+  /// The token is REWRITTEN, never dropped. The single-token slot is what matches
+  /// one confirm to one datagram by ordering: clearing it would let
+  /// `poll_transmit` stamp a fresh token that the parked datagram's confirm then
+  /// resolves against the wrong send.
+  ///
+  /// `renamed_from` is the OLD instance name's records when the regression
+  /// RENAMES (cloned before `ServiceRecords::set_instance`), and `None` when the
+  /// name is unchanged.
+  ///
+  /// # Two regressions in a row
+  ///
+  /// Safe by construction: `poll_transmit` returns `Ok(None)` while a token is
+  /// live, so between two regressions no datagram is produced and no confirm can
+  /// arrive. The second regression therefore finds exactly the token the first
+  /// rewrote, over an unchanged `goodbye` — in particular a rename that follows a
+  /// rename finds `goodbye.any_instance()` still `false` from the first, installs
+  /// no competing handoff, and leaves the older name's capture intact. Only a
+  /// SAME-name capture needs updating when a rename follows it, since the name it
+  /// referred to has just been left behind.
+  fn stale_live_commit_token(&mut self, renamed_from: Option<ServiceRecords>) {
+    let (fact, emitted) = match self.awaiting_confirm.take() {
+      None => return,
+      Some(AwaitingConfirm::Probe) => (StaleWireFact::Probe, None),
+      Some(AwaitingConfirm::Announcement(e)) => (StaleWireFact::Announcement, Some(e)),
+      Some(AwaitingConfirm::Response(e, kas)) => (StaleWireFact::Response(kas), Some(e)),
+      // The §9 meta-PTR names the SERVICE TYPE, which no instance rename or
+      // same-name revert touches, and it latches no ownership at all. Nothing
+      // about it can go stale, so it is put back exactly as it was.
+      Some(token @ AwaitingConfirm::MetaResponse) => {
+        self.awaiting_confirm = Some(token);
+        return;
+      }
+      // Already voided by an earlier regression. Its wire fact is unchanged; only
+      // a rename moves its records, and only if they were attributed to the name
+      // being renamed away from.
+      Some(AwaitingConfirm::Stale { fact, records }) => {
+        let records = match (records, renamed_from) {
+          (StaleRecords::SameName(emitted), Some(records)) => {
+            StaleRecords::OldName { records, emitted }
+          }
+          (records, _) => records,
+        };
+        self.awaiting_confirm = Some(AwaitingConfirm::Stale { fact, records });
+        return;
+      }
+    };
+    let records = match (emitted, renamed_from) {
+      (None, _) => StaleRecords::None,
+      (Some(emitted), None) => StaleRecords::SameName(emitted),
+      (Some(emitted), Some(records)) => StaleRecords::OldName { records, emitted },
+    };
+    self.awaiting_confirm = Some(AwaitingConfirm::Stale { fact, records });
+  }
+
+  /// Re-arm `lifecycle_deadline` on the rung the RFC 6762 §8.3 partial ladder has
+  /// already earned, DISCARDING whatever schedule the phase change pre-armed.
+  ///
+  /// Only an EXCUSED advance OUT OF PROBING needs this. The phase moves without
+  /// the family that kept missing and re-arms on the fresh phase's own schedule —
+  /// `announce_deadline`'s flat 1 s — while the served family has been climbing the
+  /// doubling ladder all along. §8.3 forbids the next unsolicited response from
+  /// coming sooner than the last one did, so the flat interval is the wrong one and
+  /// the earned rung replaces it.
+  ///
+  /// A streak of zero means the ladder is not engaged (the patience bound was
+  /// spent on probes, which are questions and take no rung), so the advance's own
+  /// deadline stands unchanged.
+  fn arm_on_partial_ladder(&mut self, now: I) {
+    if self.partial_announce_streak == 0 {
+      return;
+    }
+    self.lifecycle_deadline =
+      partial_announce_deadline(now, self.partial_announce_streak, self.records.ttl_secs());
+  }
+
+  /// Apply the core's per-family patience to one ANNOUNCEMENT confirm and record
+  /// what each family did with it.
+  ///
+  /// The anchors are maintained here, beside the counter they are read with, so
+  /// the two can never describe different rounds. Their rules are the presence
+  /// trichotomy, one clause each:
+  ///
+  /// * **Delivered** — this family's peers have a fresh copy of the records, so
+  ///   its TTL race restarts now.
+  /// * **Missed** — the anchor stands, and the growing gap is precisely what pulls
+  ///   the next announcement in. An UNANCHORED family is anchored here instead:
+  ///   that is the runtime `Unobligated` → obligated transition (a socket that
+  ///   just appeared), and it is owed its first refresh within one interval, not
+  ///   immediately and not never.
+  /// * **Unobligated** — no socket, so nothing is owed and nothing may be stale.
+  ///   Clearing it is also what makes the transition above detectable.
+  fn classify_announcement(&mut self, now: I, delivery: TransmitDelivery) -> PhaseAdvance {
+    let advance = classify_advance(&mut self.partial_rounds, delivery);
+    for (anchor, family) in self
+      .last_delivered
+      .iter_mut()
+      .zip(delivery.families().iter())
+    {
+      match family {
+        FamilyDelivery::Delivered => *anchor = Some(now),
+        FamilyDelivery::Missed => {
+          if anchor.is_none() {
+            *anchor = Some(now);
+          }
+        }
+        FamilyDelivery::Unobligated => *anchor = None,
+      }
+    }
+    advance
+  }
+
+  /// Install the deadline for the next §8.3 unsolicited response after a confirm
+  /// that reached at least one family.
+  ///
+  /// ONE composed rule covers every such confirm: **the phase's own schedule,
+  /// pulled in to whenever the stalest obligated family in good standing is next
+  /// owed a refresh, and never sooner than §8.3's one-second minimum.**
+  ///
+  /// The phase's own schedule is the §8.3 spacing — the doubling ladder while
+  /// announcing, the periodic refresh once `Established` — and the per-family
+  /// term is the TTL bound. Composing them subsumes two arms this used to need:
+  ///
+  /// * the honest-partial re-arm, which climbed the ladder to keep the served
+  ///   family's spacing legal but measured staleness per ROUND, so alternating
+  ///   families each fell a full interval behind;
+  /// * the excused re-arm, which REPLACED `Established`'s pre-armed periodic
+  ///   deadline with the earned rung so the missing family was not stranded a
+  ///   whole refresh interval away. A family in good standing now pulls the
+  ///   deadline in by itself, and one that has spent the core's patience is
+  ///   deliberately no longer chased — chasing it is what floods the healthy
+  ///   family at the one-second floor.
+  ///
+  /// `Established` is where the ladder retires: the announcement burst is over,
+  /// the periodic refresh is the rate limit, and the ladder's cap was that same
+  /// rate all along.
+  fn arm_announcement(&mut self, now: I, advance: PhaseAdvance) {
+    let ttl_secs = self.records.ttl_secs();
+    let base = match self.state {
+      ServiceState::Established => re_announce_deadline(now, ttl_secs),
+      ServiceState::Announcing(_) => match advance {
+        PhaseAdvance::Partial => {
+          partial_announce_deadline(now, self.partial_announce_streak, ttl_secs)
+        }
+        PhaseAdvance::Covered | PhaseAdvance::Excused if self.partial_announce_streak > 0 => {
+          partial_announce_deadline(now, self.partial_announce_streak, ttl_secs)
+        }
+        // A delivery, or an excusal off the bottom rung, keeps the schedule the
+        // phase change itself just armed.
+        _ => self.lifecycle_deadline,
+      },
+      _ => return,
+    };
+    let due = stalest_refresh_due(&self.last_delivered, &self.partial_rounds, ttl_secs);
+    self.lifecycle_deadline = compose_announce_deadline(now, base, due);
+  }
+
+  /// The [`TransmitObligation`] of the datagram whose commit token is currently
+  /// stamped — the tag [`Self::poll_transmit`] hands the driver.
+  ///
+  /// A pure function of the token, so the tag always describes what
+  /// [`Self::note_transmit_outcome`] will actually do with the confirm. A
+  /// datagram that stamped NO token obligates nothing at all (the confirm is a
+  /// no-op), so it reports `OneShot`.
   #[inline]
-  pub fn note_transmit_delivered(&mut self, now: I) {
-    self.note_transmit_result(now, true);
+  fn stamped_obligation(&self) -> TransmitObligation {
+    match &self.awaiting_confirm {
+      Some(token) => token.obligation(),
+      None => TransmitObligation::OneShot,
+    }
+  }
+
+  /// The per-family minimum wire gap of the datagram whose commit token is
+  /// currently stamped — the value [`Self::poll_transmit`] hands the driver on
+  /// [`Transmit::min_family_gap`].
+  ///
+  /// A pure function of the token, for the same reason [`Self::stamped_obligation`]
+  /// is. A datagram that stamped NO token is fire-and-forget and ungated.
+  #[inline]
+  fn stamped_min_family_gap(&self) -> Duration {
+    match &self.awaiting_confirm {
+      Some(token) => token.min_family_gap(),
+      None => Duration::ZERO,
+    }
   }
 
   /// Capture everything the endpoint needs to re-encode a TTL=0 goodbye for
@@ -924,7 +1696,21 @@ where
   /// window is therefore simply two independent items — the detached old-name
   /// item already enqueued, plus the route-attached current-name item this
   /// snapshot produces — with no `snapshot.rename` inheritance.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`]. This snapshot reports only
+  /// what a confirm has already latched, so an outstanding datagram's records are
+  /// missing from it: peers would cache records the goodbye never withdraws, and
+  /// their TTLs would only start at that late transmission — an exposure the
+  /// teardown does not bound. See [`Self::poll_transmit`] for the full contract.
+  ///
+  /// Debug builds assert it HERE, at the teardown itself, because this is the one
+  /// place the violation is otherwise silent: the goodbye is simply built short,
+  /// and no later step can tell that it was.
   pub fn withdrawal_snapshot(&mut self) -> WithdrawalSnapshot {
+    self.assert_no_live_commit_token("Service::withdrawal_snapshot");
     // Snapshot the CURRENT goodbye-ownership latch (the live name's records).
     // After a rename the current name is the freshly re-announced one, and its
     // confirmed instance + host records still need withdrawing; the OLD name is
@@ -1010,6 +1796,54 @@ where
       self.pending_transmits[1] = Some(kind);
     }
     // Both slots full — drop.
+  }
+
+  /// Fail loudly, in debug builds, when a state-mutating entry point runs while
+  /// a datagram produced by [`Self::poll_transmit`] is still awaiting its
+  /// [`Self::note_transmit_outcome`].
+  ///
+  /// The confirm-before-anything contract documented on [`Self::poll_transmit`]
+  /// is not something the core can type-check, so this is where a driver that
+  /// breaks it discovers the fact — in its own test suite, at the offending call,
+  /// instead of through corrupted lifecycle state in release. It compiles out of
+  /// release builds, where the structural backstops (the single-slot refusal in
+  /// `poll_transmit`, [`Self::push_lifecycle_pending`], and the `Stale` token
+  /// rewrite) absorb the violation.
+  #[inline]
+  fn assert_no_live_commit_token(&self, entry_point: &str) {
+    #[cfg(test)]
+    if self.contract_assertions_off {
+      return;
+    }
+    debug_assert!(
+      self.awaiting_confirm.is_none(),
+      "{entry_point} was called while a datagram from Service::poll_transmit is \
+       still awaiting Service::note_transmit_outcome",
+    );
+  }
+
+  /// Queue a LIFECYCLE transmit (a §8.1 probe or a §8.3 announcement), unless a
+  /// datagram is still awaiting its delivery result.
+  ///
+  /// A live commit token means the previous datagram's lifecycle effect has not
+  /// been applied yet, and [`Self::note_transmit_outcome`] re-arms
+  /// `lifecycle_deadline` from post-confirm time for exactly the phase the
+  /// confirm lands the service in. Queuing another lifecycle transmit here would
+  /// outlive that confirm and then ignore the deadline it installed: the queue
+  /// is drained by position, not by deadline, so the entry fires as soon as the
+  /// token clears. A queued `Probe` also carries no sequence index, so several
+  /// accumulated entries would advance the §8.1 sequence at ~0 ms spacing rather
+  /// than at §8.1's 250 ms cadence.
+  ///
+  /// The confirm's own re-arm governs instead. This is unreachable for a driver
+  /// that honours the confirm-before-anything contract documented on
+  /// [`Self::poll_transmit`] — nothing may call `handle_timeout` while a token is
+  /// live — and is the structural backstop for one that does not.
+  fn push_lifecycle_pending(&mut self, kind: PendingTransmitKind) {
+    if self.awaiting_confirm.is_some() {
+      return;
+    }
+    self.push_pending(kind);
   }
 
   /// Pop the head of the FIFO queue, compacting the tail down.
@@ -1102,6 +1936,17 @@ where
   /// name must not carry over either.
   fn reset_advertised_name_state(&mut self) {
     self.goodbye.reset_instance();
+    // The NEW name has announced nothing, so it cannot yet supersede the old
+    // name's in-flight goodbye — the reclaim-cancel gate must re-earn its `true`.
+    self.fully_announced = false;
+    // A fresh name restarts the §8.3 announcement sequence at the bottom rung.
+    self.partial_announce_streak = 0;
+    // …and restarts the §8.1 sequence, so the patience already spent waiting for
+    // a lagging family under the OLD name may not excuse a probe of the new one.
+    self.partial_rounds = [FamilyPatience::default(); 2];
+    // The NEW name has been announced to nobody, so no family is owed a refresh
+    // of it. Each is re-anchored by its first announcement round under this name.
+    self.last_delivered = [None, None];
     self.clear_response_cycle_state();
   }
 
@@ -1136,9 +1981,18 @@ where
   /// `now` is the current time; it is cached so that `handle_event` can
   /// compute KAS-hint expiration times and schedule the jittered response
   /// deadline without needing `handle_timeout` to have fired first.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`] — an inbound RFC 6762 §9
+  /// conflict processed in that window regresses the exact state the pending
+  /// confirm is about to apply. See [`Self::poll_transmit`] for the full
+  /// contract; debug builds assert it.
   pub fn handle_event(&mut self, event: ServiceEvent<'_>, now: I) {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
+    self.assert_no_live_commit_token("Service::handle_event");
     // always refresh last_now so that subsequent calls (e.g.
     // Question→response_deadline, KnownAnswer→expiry) use a current reference
     // even when handle_timeout has not recently fired.
@@ -1278,6 +2132,21 @@ where
         self.announce_count = 0;
         self.pending_transmits = [None, None];
         self.response_deadline = None;
+        // A parked datagram belongs to the generation this revert just replaced,
+        // so its confirm must not advance the fresh §8.1 sequence. The NAME is
+        // unchanged, so whatever it emitted still latches into `goodbye` —
+        // see `stale_live_commit_token`.
+        self.stale_live_commit_token(None);
+        // A fresh §8.1 sequence: the patience already spent waiting for a lagging
+        // link must not excuse a probe of the name we are re-verifying. This is
+        // the SAME name, so unlike a rename the per-advertised-name state stays
+        // put — `fully_announced` in particular. Ferrying it into the re-probe is
+        // sound: the only thing it can do is cancel a renamed-away predecessor's
+        // §10.1 goodbye, and any goodbye this name could cancel was already
+        // cancelled when it first fully announced. A NEW same-name detached
+        // goodbye cannot appear meanwhile — the endpoint's name guard rejects a
+        // same-name registration while this service holds the route.
+        self.partial_rounds = [FamilyPatience::default(); 2];
         self.clear_response_cycle_state();
         self.lifecycle_deadline = probe_deadline(now, 0, &mut self.rng);
       }
@@ -1585,10 +2454,21 @@ where
   }
 
   /// Drive timer-based transitions. Returns Ok unless arithmetic overflowed.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`]: the confirm installs the
+  /// deadline for the phase it lands the service in, so a lifecycle deadline
+  /// fired before it would queue a transmit that then ignores that deadline. See
+  /// [`Self::poll_transmit`] for the full contract; debug builds assert it, and
+  /// the lifecycle queue refuses to accept an entry under a live token in
+  /// release.
   #[allow(clippy::arithmetic_side_effects)]
   pub fn handle_timeout(&mut self, now: I) -> Result<(), HandleTimeoutError> {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
+    self.assert_no_live_commit_token("Service::handle_timeout");
     // Cache latest `now` for use by poll_transmit's KAS filtering closure.
     // handle_event now receives `now` directly, so this is only needed
     // for the filtering closure in poll_transmit.
@@ -1659,8 +2539,13 @@ where
         self.rename_attempt = self.rename_attempt.saturating_add(1);
         let new_name_str =
           rename_with_suffix(self.records.instance().as_str(), self.rename_attempt);
+        // Capture the OLD name BEFORE `set_instance` overwrites it — a live
+        // commit token's records are cached under this name and nowhere else, and
+        // by confirm time nothing here still says so.
+        let renamed_from = self.records.clone();
         match crate::Name::try_from_str(&new_name_str) {
           Ok(new_name) => {
+            self.stale_live_commit_token(Some(renamed_from));
             self.records.set_instance(new_name.clone());
             let _ = self.pending_updates.insert(ServiceUpdate::Renamed(
               crate::event::ServiceRenamed::new(new_name),
@@ -1683,12 +2568,22 @@ where
             // name) — give up. Mirror the success-branch cleanup so no stale
             // transmit / response-cycle work can still be drained by
             // poll_transmit after we've declared Conflicting.
+            //
+            // The name is NOT mutated on this branch, but `goodbye.reset_instance`
+            // below moves its ownership into the handoff installed above, so a
+            // parked datagram's records must go to the same place: treating this
+            // as a rename-away is what keeps a late confirm from re-latching
+            // ownership the handoff now holds (a double withdrawal) and from
+            // opening the reclaim-cancel gate on a terminal service.
+            self.stale_live_commit_token(Some(renamed_from));
             self.state = ServiceState::Conflicting;
             let _ = self.pending_updates.insert(ServiceUpdate::Conflict);
             self.lifecycle_deadline = None;
             self.pending_transmits = [None, None];
             self.response_deadline = None;
             self.goodbye.reset_instance();
+            self.fully_announced = false;
+            self.partial_announce_streak = 0;
             self.clear_response_cycle_state();
           }
         }
@@ -1747,7 +2642,7 @@ where
             // a probe deadline fired — ENQUEUE the probe and re-arm a
             // fallback retry deadline, but do NOT advance the probe sequence
             // here. The §8.1 progression (next probe, or entering Announcing
-            // after the third) happens in `note_transmit_result` ONLY once the
+            // after the third) happens in `note_transmit_outcome` ONLY once the
             // driver confirms the probe actually reached the link — mirroring
             // the Announcing arm below. An unconfirmed probe is retried at the
             // probe interval instead of the service silently marching toward
@@ -1759,7 +2654,7 @@ where
               probe_n = n,
               "service: Probing — enqueueing probe"
             );
-            self.push_pending(PendingTransmitKind::Probe);
+            self.push_lifecycle_pending(PendingTransmitKind::Probe);
             self.lifecycle_deadline = probe_deadline(now, n, &mut self.rng);
             true
           }
@@ -1767,7 +2662,7 @@ where
             // an announce deadline fired — schedule the announcement
             // transmit but do NOT advance the phase here. The phase progression
             // and the Established update happen on CONFIRMED delivery
-            // (`note_transmit_delivered`); peers learn of us only once a send
+            // (`note_transmit_outcome`); peers learn of us only once a send
             // actually reaches the link. Re-arm at the announce interval so an
             // unconfirmed (all-socket-failed) send is retried rather than the
             // service silently progressing to Established with nothing on the
@@ -1778,7 +2673,7 @@ where
               announce_n = _n,
               "service: Announcing — enqueueing announcement"
             );
-            self.push_pending(PendingTransmitKind::Announcement);
+            self.push_lifecycle_pending(PendingTransmitKind::Announcement);
             self.lifecycle_deadline = announce_deadline(now, 1);
             true
           }
@@ -1789,7 +2684,7 @@ where
               handle = self.handle.raw(),
               "service: Established — enqueueing periodic re-announce"
             );
-            self.push_pending(PendingTransmitKind::Announcement);
+            self.push_lifecycle_pending(PendingTransmitKind::Announcement);
             self.lifecycle_deadline = re_announce_deadline(now, self.records.ttl_secs());
             true
           }
@@ -1825,6 +2720,46 @@ where
   /// loop on this method until it returns `Ok(None)` to drain all pending
   /// transmits (at most 2 can be queued when both a response deadline and a
   /// lifecycle deadline fired at the same `now`).
+  ///
+  /// # The confirm-before-anything contract
+  ///
+  /// > Once this method returns a datagram, NO other state-mutating entry point
+  /// > for this service — [`Self::handle_event`], [`Self::handle_timeout`],
+  /// > [`Self::withdrawal_snapshot`] or any other teardown step — may be invoked
+  /// > until that datagram's [`Self::note_transmit_outcome`]. `poll_transmit`
+  /// > itself is excepted: it refuses (`Ok(None)`) while a datagram is
+  /// > outstanding, which is what makes one confirm resolve exactly one datagram.
+  ///
+  /// A driver therefore does `poll_transmit` → send → `note_transmit_outcome` as
+  /// one indivisible step. A send the transport cannot accept right now is
+  /// **dropped and confirmed** — every family missed — not parked:
+  /// every re-armed datagram is re-encoded from live state on the next poll, so
+  /// dropping one costs nothing but the re-encode.
+  ///
+  /// The reason parking looks attractive is a fidelity that does not exist.
+  /// "Delivered" at this layer already means only *the kernel accepted the
+  /// datagram synchronously* — a successful `sendto` says nothing about whether
+  /// anything reached the wire, let alone a peer, and UDP offers no way to learn
+  /// otherwise. Deferring the confirm to report a truer answer therefore buys
+  /// nothing, while everything the interim breaks is real: `poll_transmit` stamps
+  /// a commit token before returning, and that token is the ONLY record of what
+  /// the encoded bytes mean. An entry point that runs while it is live regresses
+  /// or re-encodes the very state the pending confirm is about to apply — a §9
+  /// conflict processed between the poll and the confirm voids the datagram's
+  /// whole generation, and a teardown between them takes a
+  /// [`Self::withdrawal_snapshot`] that cannot know about records the unconfirmed
+  /// datagram is putting in peer caches, so the goodbye never withdraws them and
+  /// their TTL only starts counting once that late datagram lands.
+  ///
+  /// The core cannot type-check the ordering, so it is enforced by cheap
+  /// backstops rather than assumed: a `debug_assert!` at each entry point fails a
+  /// non-compliant driver loudly in its own test suite, and in release the single
+  /// slot above, the lifecycle queue's own token check, and the `Stale` token
+  /// rewrite keep the damage defined. All are unreachable for a compliant driver.
+  ///
+  /// Precedent for call-ordering contracts on this type: the drain-to-`Ok(None)`
+  /// rule above, and the rename-handoff drain contract on
+  /// [`Self::note_transmit_outcome`].
   pub fn poll_transmit(
     &mut self,
     now: I,
@@ -1833,13 +2768,13 @@ where
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
     // the commit token is a SINGLE slot. If a previously produced
-    // datagram has not yet been confirmed via `note_transmit_result`, do NOT
+    // datagram has not yet been confirmed via `note_transmit_outcome`, do NOT
     // hand out (and silently overwrite the token of) another one — that would
     // lose the first send's pending confirmation and mis-apply the next result
     // to the wrong datagram. Returning `Ok(None)` makes the documented
     // "poll until Ok(None)" drain contract enforce poll→confirm→poll ordering
     // for EVERY Sans-I/O caller, not just the tokio driver (which already
-    // confirms after each send). The token is cleared by `note_transmit_result`
+    // confirms after each send). The token is cleared by `note_transmit_outcome`
     // (`.take()`), so the next poll after a confirm proceeds normally; a probe/
     // announce/response branch below re-stamps it, while the early-return
     // datagram (legacy unicast) only stamps where it owns lifecycle/ownership
@@ -1848,10 +2783,13 @@ where
       return Ok(None);
     }
     // §9: emit a pending service-type enumeration reply (a single shared
-    // meta-PTR). Standalone like the rename goodbye — stamps NO awaiting_confirm
-    // (it advertises no instance records and is never withdrawn), so it gates no
-    // lifecycle/goodbye state. An un-encodable reply (near-MTU) is dropped, not
-    // surfaced as an error, so a remote meta-query can't poison the service.
+    // meta-PTR). It stamps a `MetaResponse` commit token — every datagram this
+    // method returns stamps exactly one token, which is what makes one outcome
+    // per datagram well defined — but that token gates no lifecycle or goodbye
+    // state: the meta-PTR is shared, advertises no instance records, and is never
+    // withdrawn, so its confirm only counts `responses_tx`. An un-encodable reply
+    // (near-MTU) is dropped, not surfaced as an error, so a remote meta-query
+    // can't poison the service.
     if self.meta_response_deadline.is_some_and(|due| now >= due) {
       // Consume the meta cycle up-front: clear the deadline, the questioner set,
       // and the suppression flag regardless of outcome.
@@ -1869,11 +2807,17 @@ where
         && let Ok(meta) = crate::Name::try_from_str(crate::endpoint::DNS_SD_META_QUERY_NAME)
         && let Ok(n) = respond::write_meta_response(&self.records, &meta, buf)
       {
-        // Stamp the MetaResponse token so note_transmit_result can count
+        // Stamp the MetaResponse token so note_transmit_outcome can count
         // responses_tx on a confirmed delivery.  No goodbye ownership is
         // latched (the meta-PTR is shared and never withdrawn).
         self.awaiting_confirm = Some(AwaitingConfirm::MetaResponse);
-        return Ok(Some(Transmit::new(respond::multicast_dst(), None, n)));
+        return Ok(Some(Transmit::new(
+          respond::multicast_dst(),
+          None,
+          n,
+          self.stamped_obligation(),
+          self.stamped_min_family_gap(),
+        )));
       }
       // Suppressed, or name build (impossible) / encode failed — drop the reply
       // (state already cleared above), do not poison; fall through to the queue.
@@ -1913,7 +2857,7 @@ where
           // the wire — the FULL record set, since legacy replies are not
           // KAS-filtered. Stamp the Response commit token with exactly what the
           // encoder reported it emitted; a confirmed delivery then latches
-          // goodbye ownership for those records via `note_transmit_result`. A
+          // goodbye ownership for those records via `note_transmit_outcome`. A
           // meta reply (`emitted` is None) uses MetaResponse — shared PTR, no
           // goodbye ownership — but still counts responses_tx on delivery.
           // Legacy replies are not KAS-filtered, so the partial-suppression
@@ -1922,7 +2866,13 @@ where
             Some(e) => Some(AwaitingConfirm::Response(e, 0)),
             None => Some(AwaitingConfirm::MetaResponse),
           };
-          return Ok(Some(Transmit::new(resp.dst, None, n)));
+          return Ok(Some(Transmit::new(
+            resp.dst,
+            None,
+            n,
+            self.stamped_obligation(),
+            self.stamped_min_family_gap(),
+          )));
         }
         // a legacy reply echoes the question, so it can exceed the
         // buffer for a near-MTU service whose normal announcement still fits.
@@ -1969,7 +2919,7 @@ where
           bytes = n,
           "service: poll_transmit emitting probe"
         );
-        // probes_tx is bumped in note_transmit_result on confirmed delivery.
+        // probes_tx is bumped in note_transmit_outcome on confirmed delivery.
         n
       }
       PendingTransmitKind::Announcement => {
@@ -1993,7 +2943,7 @@ where
           bytes = n,
           "service: poll_transmit emitting announcement"
         );
-        // announcements_tx is bumped in note_transmit_result on confirmed delivery.
+        // announcements_tx is bumped in note_transmit_outcome on confirmed delivery.
         n
       }
       PendingTransmitKind::Response => {
@@ -2073,7 +3023,7 @@ where
     self.pop_pending();
     // the datagram has been
     // ENCODED, but no lifecycle state advances here. Map the queued kind to the
-    // commit token the driver resolves via `note_transmit_result` — the SOLE
+    // commit token the driver resolves via `note_transmit_outcome` — the SOLE
     // place probe/announce progression AND goodbye-ownership latching happen,
     // and only on a confirmed send.
     self.awaiting_confirm = match kind {
@@ -2105,7 +3055,7 @@ where
         // delivery to wait for. Count answers_suppressed_kas immediately at
         // the point of suppression — this is a genuine suppression event, not
         // a send failure. Document: this is the ONLY counter bump in
-        // poll_transmit that is NOT deferred to note_transmit_result, because
+        // poll_transmit that is NOT deferred to note_transmit_outcome, because
         // Ok(None) means no datagram (and thus no AwaitingConfirm token) is
         // ever produced.
         if resp_emitted.is_empty() {
@@ -2119,7 +3069,7 @@ where
           return Ok(None);
         }
         // Partial suppression: carry the suppressed count in the AwaitingConfirm
-        // token and defer the answers_suppressed_kas bump to note_transmit_result
+        // token and defer the answers_suppressed_kas bump to note_transmit_outcome
         // so a socket failure does NOT inflate the counter.
         // responses_tx is also deferred there.
         #[cfg(feature = "stats")]
@@ -2134,7 +3084,13 @@ where
     let _ = self.pending_tx.iter().next(); // silence unused-field warning
     // Multicast response — serves QM and QU (§5.4) group members. Legacy unicast
     // queriers are handled separately via `pending_legacy`.
-    Ok(Some(Transmit::new(respond::multicast_dst(), None, n)))
+    Ok(Some(Transmit::new(
+      respond::multicast_dst(),
+      None,
+      n,
+      self.stamped_obligation(),
+      self.stamped_min_family_gap(),
+    )))
   }
 }
 }

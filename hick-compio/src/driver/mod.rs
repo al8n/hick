@@ -14,8 +14,9 @@ use core::{
 use hick_trace::*;
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
-  QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate, WithdrawalSend,
-  WithdrawalToken, query::Query as ProtoQuery, service::Service as ProtoSvc, transmit::Transmit,
+  FamilyDelivery, QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate,
+  TransmitDelivery, WithdrawalSend, WithdrawalToken, query::Query as ProtoQuery,
+  service::Service as ProtoSvc, transmit::Transmit,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -106,8 +107,8 @@ impl LocalNotify {
 }
 
 /// Origin tag for a pumped transmit. Carries the source handle so the driver
-/// can route the post-send `note_transmit_result` (and similar) back to the
-/// right per-handle context.
+/// can route the post-send `note_*_transmit_outcome` back to the right
+/// per-handle context.
 #[derive(Clone, Copy)]
 pub(crate) enum TransmitOrigin {
   Service(ServiceHandle),
@@ -162,6 +163,10 @@ pub(crate) struct ServiceCtx {
   /// losing the `Conflict`. Meanwhile `errored` makes every proto-polling pump
   /// skip this ctx so a finished proto can't be re-polled into a busy-spin.
   pub(crate) errored: bool,
+  /// When each family last carried one of THIS service's gated datagrams, so the
+  /// RFC 6762 §8.1 / §8.3 spacing is honoured per wire rather than per confirm.
+  /// See [`FamilyWireGate`].
+  pub(crate) wire_gate: FamilyWireGate,
 }
 
 /// Driver-side per-query context: last-delivered sequence number and a
@@ -189,6 +194,10 @@ pub(crate) struct QueryCtx {
   /// withdrawal it begins carries the wake — its deadline re-settles the driver
   /// and the completion GC notifies.)
   pub(crate) terminal_wake_pending: bool,
+  /// When each family last carried one of THIS question's transmissions, so
+  /// RFC 6762 §5.2's one-second floor is honoured per wire. See
+  /// [`FamilyWireGate`].
+  pub(crate) wire_gate: FamilyWireGate,
 }
 
 /// All state owned by the compio driver task. Held behind the `RefCell` in
@@ -285,6 +294,7 @@ impl State {
         cancelled: false,
         encode_failures: 0,
         errored: false,
+        wire_gate: FamilyWireGate::default(),
       },
     );
     Ok(handle)
@@ -322,13 +332,18 @@ impl State {
         cancelled: false,
         errored: false,
         terminal_wake_pending: false,
+        wire_gate: FamilyWireGate::default(),
       },
     );
     Ok(h)
   }
 
-  /// Flag a query as cancelled.  The driver loop sweeps cancelled
-  /// queries on the next poll cycle and calls `endpoint.cancel_query`.
+  /// Flag a query as cancelled (called from [`crate::Query::drop`]). The actual
+  /// removal is deferred to the driver loop's [`Self::sweep_cancelled_queries`],
+  /// which runs after the transmit pump so any in-flight send confirms first. The
+  /// `cancelled` flag is meanwhile honoured by [`Self::poll_one_transmit`] and
+  /// [`Self::fire_timeouts`] so a cancelled query asks nothing further before the
+  /// sweep.
   pub(crate) fn flag_query_cancelled(&mut self, h: QueryHandle) {
     if let Some(q) = self.queries.get_mut(&h) {
       q.cancelled = true;
@@ -377,6 +392,23 @@ impl State {
   /// already-queued `ServiceUpdate::Conflict` still reaches the host before the ctx
   /// is GC'd. `begin_withdrawal` is idempotent, so calling this for an
   /// already-withdrawing service is a no-op. A no-op for an unknown driver handle.
+  ///
+  /// # Why the snapshot is never short
+  ///
+  /// [`Service::withdrawal_snapshot`](mdns_proto::service::Service::withdrawal_snapshot)
+  /// reports only what a confirm has latched, so it must be taken with no datagram
+  /// of this service's outstanding — otherwise the goodbye omits exactly the
+  /// records a still-flying datagram is about to place in peer caches, and their
+  /// TTLs would only start at that late transmission.
+  ///
+  /// That holds STRUCTURALLY here, from loop ordering, and needs no wire
+  /// bookkeeping to enforce: [`run`] awaits every submitted send to its true
+  /// completion inside the fan-out, and every caller of this method runs in a loop
+  /// phase strictly after the fan-out returned — the dropped-handle sweep, the
+  /// update drain's rename-collision teardown, and the transmit pump's
+  /// encode-failure escalation alike. The only handle-side entry points that could
+  /// race are `register_service`, which the endpoint rejects while the withdrawing
+  /// route still holds the name, and `Query::drop`, which advertises nothing.
   pub(crate) fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: StdInstant) {
     // Scope the `ctx` borrow so it ends before `self.endpoint` is touched (the
     // snapshot is owned, so no borrow of `self.services` outlives this block).
@@ -388,8 +420,8 @@ impl State {
     let (snap, handoff) = match self.services.get_mut(&handle) {
       Some(ctx) => {
         ctx.errored = true;
-        let handoff = ctx.proto.take_rename_goodbye_handoff();
-        (ctx.proto.withdrawal_snapshot(), handoff)
+        let snap = ctx.proto.withdrawal_snapshot();
+        (snap, ctx.proto.take_rename_goodbye_handoff())
       }
       None => return,
     };
@@ -450,12 +482,15 @@ impl State {
   /// (so the caller can wake any handle parked on an otherwise-idle endpoint to
   /// observe its end-of-stream).
   pub(crate) fn drain_completed_withdrawals(&mut self, now: StdInstant) -> bool {
-    // `completed_withdrawals` and `endpoint` are disjoint fields; clear the
-    // reused scratch and let the endpoint push the completed handles into it.
+    // `completed_withdrawals` and `endpoint` are disjoint fields; clear the reused
+    // scratch and let the endpoint push the completed handles into it.
     self.completed_withdrawals.clear();
-    self
-      .endpoint
-      .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
+    let Self {
+      endpoint,
+      completed_withdrawals,
+      ..
+    } = self;
+    endpoint.drain_completed_withdrawals(now, completed_withdrawals);
     let mut gcd_any = false;
     while let Some(handle) = self.completed_withdrawals.pop() {
       // Unconditional GC: the handle-owned mailbox carries any pending terminal,
@@ -479,8 +514,11 @@ impl State {
       endpoint, queries, ..
     } = &mut *self;
     for (&h, ctx) in queries.iter() {
-      // Don't tick a structurally-dead query's proto (see `QueryCtx::errored`).
-      if ctx.errored {
+      // Don't tick a cancelled (handle dropped, awaiting sweep) or
+      // structurally-dead query's proto (see `QueryCtx::errored`) — a query that
+      // is on its way out must not retry its question or reach a terminal it will
+      // never surface.
+      if ctx.cancelled || ctx.errored {
         continue;
       }
       let _ = endpoint.handle_query_timeout(h, now);
@@ -523,6 +561,36 @@ impl State {
     let swept = !cancelled.is_empty();
     for h in cancelled {
       self.begin_service_withdrawal(h, now);
+    }
+    swept
+  }
+
+  /// Remove every query flagged `cancelled` by [`crate::Query::drop`], freeing its
+  /// driver ctx and its proto pool entry. Returns `true` if at least one was
+  /// swept.
+  ///
+  /// The driver calls this AFTER the transmit pump, never from `Query::drop`
+  /// directly, for the same reason [`Self::sweep_cancelled_services`] is deferred:
+  /// a question that was mid-`send_via().await` when the handle dropped still owes
+  /// the core its `note_query_transmit_outcome`. `Endpoint::cancel_query` DISCARDS
+  /// that commit token, so cancelling synchronously in `Drop` would leave the
+  /// confirm landing on a handle the endpoint no longer knows — a silent no-op,
+  /// with the datagram still going out — instead of resolving the token. Sweeping
+  /// after the pump means the confirm has always already happened.
+  ///
+  /// A query has no §10.1 obligation, so unlike a service there is nothing to
+  /// withdraw and the removal is immediate.
+  pub(crate) fn sweep_cancelled_queries(&mut self) -> bool {
+    let cancelled: Vec<QueryHandle> = self
+      .queries
+      .iter()
+      .filter(|(_, ctx)| ctx.cancelled)
+      .map(|(h, _)| *h)
+      .collect();
+    let swept = !cancelled.is_empty();
+    for h in cancelled {
+      self.queries.remove(&h);
+      let _ = self.endpoint.cancel_query(h);
     }
     swept
   }
@@ -587,9 +655,21 @@ impl State {
             .and_then(|c| c.proto.take_rename_goodbye_handoff());
           if let Some(handoff) = handoff {
             // A rename COLLISION (rename_result Err) tears the service down: its old
-            // name must HOLD until the goodbye completes so a quick re-register
-            // cannot cancel the only retraction. A SURVIVING rename
-            // stays reclaimable.
+            // name must HOLD until the goodbye completes, because the dead service
+            // will never re-announce and the goodbye is the only retraction the old
+            // name will ever get.
+            //
+            // A SURVIVING rename stays RECLAIMABLE. That is sound only because the
+            // sole thing that can cancel a reclaimable goodbye —
+            // `Endpoint::note_service_announced` — is gated on
+            // `Service::has_fully_announced`: a complete §8.3 announcement of the
+            // reclaiming name that reached EVERY family this driver still
+            // obligates. For each such family §10.2's cache-flush announcement
+            // supersedes the stale unique records the goodbye exists to retract, so
+            // cancelling loses nothing. A partially-delivered replacement
+            // announcement leaves the gate shut and the old goodbye keeps draining
+            // its per-family debt — which is exactly the case where the unserved
+            // family has heard neither the goodbye nor the replacement.
             self
               .endpoint
               .enqueue_rename_withdrawal(handoff, now, rename_result.is_err());
@@ -655,17 +735,18 @@ impl State {
   }
 
   /// Extract one outgoing datagram into `scratch`. Returns
-  /// `Some((dst, used, origin))` or `None`. Walks services first, then queries.
+  /// `Some((transmit, origin))` or `None`. Walks services first, then queries.
   /// The driver loop repeatedly calls this until `None`, sending each
   /// datagram via the matching socket. The `origin` carries the service handle
-  /// that produced the datagram so the driver can call `note_transmit_result`
-  /// after the send completes — the §8.1 probe sequence and §8.3 announce phase
-  /// only advance once each pending datagram is acknowledged.
+  /// that produced the datagram so the driver can confirm it via
+  /// [`State::note_service_transmit_outcome`] after the send completes — the §8.1
+  /// probe sequence and §8.3 announce phase only advance once every obligated
+  /// family carried the pending datagram.
   pub(crate) fn poll_one_transmit(
     &mut self,
     now: StdInstant,
     scratch: &mut [u8],
-  ) -> Option<(SocketAddr, usize, TransmitOrigin)> {
+  ) -> Option<(Transmit, TransmitOrigin)> {
     self.svc_handle_scratch.clear();
     self
       .svc_handle_scratch
@@ -703,7 +784,7 @@ impl State {
         match ctx.proto.poll_transmit(now, scratch) {
           Ok(Some(t)) => {
             ctx.encode_failures = 0;
-            return Some((t.dst(), t.size(), TransmitOrigin::Service(h)));
+            return Some((t, TransmitOrigin::Service(h)));
           }
           Ok(None) => {
             ctx.encode_failures = 0;
@@ -780,7 +861,7 @@ impl State {
       }
       match self.endpoint.poll_query_transmit(h, now, scratch) {
         // A datagram is ready — hand it to the driver to send.
-        Ok(Some(t)) => return Some((t.dst(), t.size(), TransmitOrigin::Query(h))),
+        Ok(Some(t)) => return Some((t, TransmitOrigin::Query(h))),
         // Nothing due right now — try the next query.
         Ok(None) => {}
         // The question can't be encoded into `scratch` (e.g. `max_payload`
@@ -823,46 +904,93 @@ impl State {
   }
 
   /// Confirm a previously polled service transmit. Called by the driver loop
-  /// after `send_to` returns, so the per-service state machine can advance the
-  /// §8.1 probe sequence and §8.3 announce phase (which require the post-send
-  /// `delivered` flag to clear `awaiting_confirm`). For query transmits the
-  /// proto layer holds no equivalent commit token, so this is a no-op there.
-  pub(crate) fn note_service_transmit_result(
+  /// after the fan-out returns, handing the core the honest per-family shape of
+  /// what the sockets did so the core — the only layer holding lifecycle state —
+  /// decides what it means: goodbye ownership (§10.1) latches for whatever
+  /// reached a wire, while the §8.1 probe sequence and §8.3 announce phase
+  /// advance only once EVERY obligated family heard it.
+  ///
+  /// A family that keeps missing eventually stops holding the phase: the core
+  /// bounds its OWN patience inside this confirm, so nothing here needs to
+  /// second-guess the fan-out's honest shape.
+  pub(crate) fn note_service_transmit_outcome(
     &mut self,
     h: ServiceHandle,
     now: StdInstant,
-    delivered: bool,
+    delivery: TransmitDelivery,
   ) {
     if let Some(ctx) = self.services.get_mut(&h) {
-      ctx.proto.note_transmit_result(now, delivered);
+      ctx.proto.note_transmit_outcome(now, delivery);
       // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
       // route so sibling host-address retention (during a same-host withdrawal)
       // honours what this service ACTUALLY announced, not its configured
-      // addresses. Idempotent overwrite; only meaningful after a delivered send.
-      // `self.services` (via `ctx`) and `self.endpoint` are disjoint fields, so
-      // this borrow split is sound.
-      if delivered {
-        self.endpoint.note_service_advertised(
-          h,
+      // addresses. That set grows exactly when ownership latches — on any
+      // delivery — so a round that reached no wire has nothing to mirror.
+      // Idempotent overwrite. `self.services` (via `ctx`) and `self.endpoint` are
+      // disjoint fields, so this borrow split is sound.
+      if delivery.any_delivered() {
+        // The reclaim-cancel gate is the ALL-delivered announcement fact the CORE
+        // computes, ferried verbatim. It is emphatically NOT
+        // `advertises_instance()` — that latch fires on any delivery by any
+        // transmit kind, so a v4-only announcement (or an RFC 6762 §6.7 legacy
+        // unicast reply, which has one obligated link and is therefore
+        // all-delivered by construction) would cancel a renamed-away name's
+        // goodbye that the unserved family still needs. `FullyAnnounced` has no
+        // public constructor precisely so that substitution cannot compile, and it
+        // names the service it was minted from, so it cannot be applied to a
+        // different one either.
+        self.endpoint.note_service_announced(
+          ctx.proto.has_fully_announced(),
           ctx.proto.advertised_a_addrs(),
           ctx.proto.advertised_aaaa_addrs(),
-          ctx.proto.advertises_instance(),
         );
       }
     }
   }
 
-  /// Confirm a previously polled query transmit so the proto layer advances
-  /// its §5.2 backoff and retry budget only on a confirmed-delivered send.
-  /// Mirrors [`Self::note_service_transmit_result`] for the query side; called
-  /// by the driver loop after `send_to` returns.
-  pub(crate) fn note_query_transmit_result(
+  /// Confirm a previously polled query transmit so the proto layer advances its
+  /// §5.2 backoff and retry budget only once EVERY obligated family carried the
+  /// question — a responder reachable on one family alone must not be able to
+  /// consume the whole retry schedule of a question the other family never asked.
+  /// Mirrors [`Self::note_service_transmit_outcome`] for the query side; called
+  /// by the driver loop after the fan-out returns.
+  pub(crate) fn note_query_transmit_outcome(
     &mut self,
     h: QueryHandle,
     now: StdInstant,
-    delivered: bool,
+    delivery: TransmitDelivery,
   ) {
-    self.endpoint.note_query_transmit_result(h, now, delivered);
+    self.endpoint.note_query_transmit_outcome(h, now, delivery);
+  }
+
+  /// This producer's per-family wire gate, copied out for a fan-out.
+  ///
+  /// Copied rather than borrowed because the fan-out awaits, and no `RefCell`
+  /// borrow may be held across that await. A producer GC'd mid-fan-out yields the
+  /// default gate, which is open — the same answer as a producer that has sent
+  /// nothing, and the write-back below is then simply dropped.
+  pub(crate) fn wire_gate(&self, origin: TransmitOrigin) -> FamilyWireGate {
+    match origin {
+      TransmitOrigin::Service(h) => self.services.get(&h).map(|c| c.wire_gate),
+      TransmitOrigin::Query(h) => self.queries.get(&h).map(|c| c.wire_gate),
+    }
+    .unwrap_or_default()
+  }
+
+  /// Write a fan-out's updated wire gate back onto its producer.
+  pub(crate) fn set_wire_gate(&mut self, origin: TransmitOrigin, gate: FamilyWireGate) {
+    match origin {
+      TransmitOrigin::Service(h) => {
+        if let Some(ctx) = self.services.get_mut(&h) {
+          ctx.wire_gate = gate;
+        }
+      }
+      TransmitOrigin::Query(h) => {
+        if let Some(ctx) = self.queries.get_mut(&h) {
+          ctx.wire_gate = gate;
+        }
+      }
+    }
   }
 
   /// Whether any service is flagged cancelled but not yet swept by
@@ -1145,6 +1273,73 @@ impl EndpointInner {
 /// `.await`. The only `.await` points are `send_to`, `Socket::recv`,
 /// `compio::time::sleep`, and `LocalNotify::listen` — none of which run inside
 /// an open borrow.
+///
+/// # The contract of a completion-based driver
+///
+/// Every operation this driver submits is awaited to its true completion before
+/// the round that produced it confirms. Driver latency is therefore kernel
+/// completion latency, and a completion the kernel never delivers stalls the
+/// driver VISIBLY — without corrupting peer caches.
+///
+/// That is not a preference; compio is completion-based and
+/// [`Proactor::cancel`'s own contract] is that "the cancellation is not reliable,
+/// the underlying operation may continue". Bounding the wait would therefore mean
+/// acting on datagrams whose fate is unknown: reporting a family missed while the
+/// kernel is still putting its bytes on a wire, snapshotting a RFC 6762 §10.1
+/// goodbye that is short by exactly those records, or freeing a name for a
+/// replacement that a late TTL=0 goodbye then erases.
+///
+/// The consequence is a real limitation, stated plainly: if the kernel never
+/// completes a send — a pathological state for UDP, requiring permanently
+/// backpressured local buffers — this task stalls entirely, including its
+/// shutdown goodbye flush, and is reclaimed only at runtime teardown. A stall
+/// that long is traced (see [`FANOUT_STALL_TRACE`]) so it is diagnosable rather
+/// than silent. At runtime teardown a still-pending operation is dropped with
+/// the task; a datagram that later reaches the wire is bounded by record TTLs,
+/// exactly as a host crash is.
+///
+/// # The minimum TTL THIS driver can serve
+///
+/// A transient stall is not free, and RFC 6762's schedules do not tolerate it
+/// unconditionally. This driver's worst-case loop stall equals its slowest
+/// in-flight send, and that stall is added to the periodic re-announce interval,
+/// so a record stays fresh in peer caches only while
+///
+/// ```text
+/// TTL - max(floor(0.8 * TTL), 1 s)   >   the worst plausible send stall
+/// ```
+///
+/// The left side is the slack between a record's TTL and the ~80 % refresh the
+/// core schedules for it, floored at §8.3's one-second interval. Integer
+/// truncation makes that slack 1 s flat for every TTL from 2 s to 5 s, and at
+/// least a fifth of the TTL above that.
+///
+/// That makes a PER-DRIVER minimum, above the protocol's: at
+/// [`mdns_proto::constants::MIN_SERVICE_TTL_SECS`] the slack is exactly 1 s,
+/// which any multi-second stall overruns — and a multi-second stall is precisely
+/// the state this driver cannot bound. Services driven by `hick-compio` must
+/// therefore be registered at a TTL whose slack covers the deployment's worst
+/// plausible send, not at the 2 s floor.
+///
+/// The floor itself is correct where it lives — it is shared protocol math from
+/// §8.3's one-second interval — and no driver that bounds its attempts inherits
+/// this limitation. What is limited is awaiting an unbounded completion, not the
+/// constant.
+///
+/// Awaiting the fan-out is also what makes the lifecycle ordering structural:
+/// every name-ownership transition — the dropped-handle sweep, a rename
+/// repoint, a withdrawal snapshot, a route free — runs in a loop phase strictly
+/// AFTER the fan-out returned, so no such transition can overlap a datagram of
+/// its own that is still in flight. See [`State::begin_service_withdrawal`].
+///
+/// `hick-reactor` bounds each attempt instead, and that is correct THERE and not
+/// an inconsistency to harmonise away: it drives `poll_send_to` directly, so
+/// abandoning the future between polls abandons one whose last syscall returned
+/// `WouldBlock` — nothing was submitted, so its cancellation is definitive. That
+/// bound is also what lets it serve the 2 s TTL floor this driver cannot: no
+/// attempt can stall its loop for longer than the bound.
+///
+/// [`Proactor::cancel`'s own contract]: https://docs.rs/compio-driver/0.12.1/compio_driver/struct.Proactor.html#method.cancel
 #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip_all))]
 pub(crate) async fn run(
   inner: Rc<EndpointInner>,
@@ -1167,7 +1362,6 @@ pub(crate) async fn run(
     let s = inner.state.borrow();
     (vec![0u8; s.max_payload], s.max_recv)
   };
-
   loop {
     // 1. extract-then-await transmit pump.  Borrow only long enough to pull
     //    one datagram into `scratch`; drop the borrow before awaiting the
@@ -1183,143 +1377,67 @@ pub(crate) async fn run(
     //    No replacement can announce ahead of the withdrawal, so this pump runs
     //    unconditionally.
     //
-    //    Bounded by [`MAX_TRANSMIT_CREDITS_PER_PASS`] (mirrors the reactor's
-    //    `MAX_SEND_CREDITS_PER_DRAIN`): when `poll_one_transmit` yields a
-    //    transmit for an address family WE never bound (e.g. v6 transmit
-    //    requested but only v4 socket present), `note_*_transmit_result`
-    //    is called with `delivered = false`, which re-arms the same transmit
-    //    rather than advancing lifecycle. Without a cap proto could keep
-    //    re-yielding it; the cap forces the loop to yield control to the
-    //    select! so timers / recv can make progress, and the deadline-driven
-    //    re-entry will retry.
-    let mut credits = MAX_TRANSMIT_CREDITS_PER_PASS;
-    loop {
-      if credits == 0 {
-        break;
+    //    Bounded by [`DrainBudget`] — [`MAX_TRANSMIT_CREDITS_PER_PASS`] fan-outs
+    //    (mirroring the reactor's `MAX_SEND_CREDITS_PER_DRAIN`) AND
+    //    [`DRAIN_PASS_BUDGET`] of wall clock shared with the withdrawal pump: a
+    //    fan-out that reaches no bound socket confirms as `NoneDelivered`, which
+    //    re-arms the same transmit rather than advancing lifecycle. Either cap
+    //    forces the loop to yield control to the select! so timers / recv can make
+    //    progress, and the deadline-driven re-entry retries.
+    let mut budget = DrainBudget::new(StdInstant::now());
+    let pump_budget_exhausted = loop {
+      if !budget.may_start_fanout() {
+        break true;
       }
-      credits -= 1;
+      let now = StdInstant::now();
       let pumped = {
         let mut s = inner.state.borrow_mut();
-        let now = StdInstant::now();
         s.poll_one_transmit(now, &mut scratch)
       };
-      let Some((dst, n, origin)) = pumped else {
-        break;
+      let Some((tx, origin)) = pumped else {
+        break false;
       };
-      // `mdns-proto` always hands back the IPv4 multicast group for BOTH the
-      // v4 and v6 service groups (multicast_dst()), so we cannot route
-      // multicast by the destination's address family. Detect an mDNS
-      // multicast destination and fan the SAME body out to every bound
-      // family's multicast group (RFC 6762 §6); a dual-stack endpoint then
-      // reaches both `224.0.0.251` and `ff02::fb`, and a v6-only endpoint
-      // actually transmits (instead of routing to an absent v4 socket and
-      // marking the send undelivered).
+      budget.charge();
+      // The producer's per-family wire gate travels with the fan-out: copied out
+      // here, updated by whichever families accepted, written back with the
+      // confirm. No borrow crosses the await.
+      let mut gate = inner.state.borrow().wire_gate(origin);
+      let (fanout, accepted_at) = awaiting_fanout(
+        send_via(
+          &inner,
+          &sock_v4,
+          &sock_v6,
+          tx.dst(),
+          &scratch[..tx.size()],
+          &mut gate,
+          tx.min_family_gap(),
+          now,
+        ),
+        "transmit",
+      )
+      .await;
+      // Confirm the pending transmit with the honest per-family shape of the
+      // fan-out. The core latches §10.1 goodbye ownership for whatever reached a
+      // wire and advances the §8.1 probe sequence / §8.3 announce phase / §5.2
+      // retry budget only once every obligated family carried it.
       //
-      // Self-send credit: record ONE tracker entry per ACTUAL successful
-      // send. Take-once self-suppression consumes a single entry per matching
-      // loopback, and dual-stack fan-out yields TWO loopback copies (one per
-      // joined socket), so a successful v4+v6 send records two entries.
-      //
-      // Timestamp: capture `when` IMMEDIATELY BEFORE each `.await`. compio is
-      // completion-based — the buffer moves into the op on `.await`, so we
-      // can't stamp "at the syscall" the way the readiness-I/O reactor does
-      // inside `poll_send_to`. Stamping before the await guarantees
-      // `when <= kernel_send_time <= echo_rx_time`, keeping our own loopback
-      // inside the 1 ms Ordered match window even when task-resume latency is
-      // high. (Stamping AFTER the await — the previous bug — could push the
-      // recorded time past the kernel's rx stamp and misclassify our own
-      // announce/probe as a peer packet.)
-      let delivered = if is_mdns_multicast_dst(dst) {
-        let mut sent_any = false;
-        if let Some(s4) = sock_v4.as_ref() {
-          let when = SystemTime::now();
-          let res = s4.send_to(&scratch[..n], MDNS_V4_DST, None).await;
-          if res.is_ok() {
-            trace!(dst = %MDNS_V4_DST, len = n, "send_to v4");
-            let mut state = inner.state.borrow_mut();
-            crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
-            #[cfg(feature = "stats")]
-            {
-              state.stats.packets_tx(1);
-              state.stats.bytes_tx(n as u64);
-            }
-            sent_any = true;
-          } else {
-            debug!(dst = %MDNS_V4_DST, "send_to v4 failed");
-            #[cfg(feature = "stats")]
-            inner.state.borrow().stats.send_errors(1);
-          }
-        }
-        if let Some(s6) = sock_v6.as_ref() {
-          let when = SystemTime::now();
-          let res = s6.send_to(&scratch[..n], MDNS_V6_DST, None).await;
-          if res.is_ok() {
-            trace!(dst = %MDNS_V6_DST, len = n, "send_to v6");
-            let mut state = inner.state.borrow_mut();
-            crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
-            #[cfg(feature = "stats")]
-            {
-              state.stats.packets_tx(1);
-              state.stats.bytes_tx(n as u64);
-            }
-            sent_any = true;
-          } else {
-            debug!(dst = %MDNS_V6_DST, "send_to v6 failed");
-            #[cfg(feature = "stats")]
-            inner.state.borrow().stats.send_errors(1);
-          }
-        }
-        // `delivered` ⇔ at least one family reached the wire.
-        sent_any
-      } else {
-        // Unicast: pick the socket matching the destination family, single
-        // send. No socket for this family → count as failed delivery so the
-        // proto re-arms the probe / announce without advancing lifecycle
-        // state (unchanged semantics).
-        let sock = match dst {
-          SocketAddr::V4(_) => sock_v4.as_ref(),
-          SocketAddr::V6(_) => sock_v6.as_ref(),
-        };
-        if let Some(s) = sock {
-          let when = SystemTime::now();
-          let res = s.send_to(&scratch[..n], dst, None).await;
-          // Record the self-send credit under a fresh short borrow so the next
-          // inbound copy of this datagram (from the loopback / multicast echo)
-          // is classified as our own.  Only record on a successful send.
-          if res.is_ok() {
-            trace!(dst = %dst, len = n, "send_to");
-            let mut state = inner.state.borrow_mut();
-            crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..n], when);
-            #[cfg(feature = "stats")]
-            {
-              state.stats.packets_tx(1);
-              state.stats.bytes_tx(n as u64);
-            }
-          } else {
-            debug!(dst = %dst, "send_to failed");
-            #[cfg(feature = "stats")]
-            inner.state.borrow().stats.send_errors(1);
-          }
-          res.is_ok()
-        } else {
-          false
-        }
-      };
-      // Confirm the pending transmit so the §8.1 probe sequence / §8.3 announce
-      // phase advance (services), or so the §5.2 backoff + retry budget
-      // advance only on a confirmed-delivered send (queries).  Anchored to
-      // post-send time so the next deadline is relative to actual on-wire send.
-      match origin {
-        TransmitOrigin::Service(h) => {
-          let mut state = inner.state.borrow_mut();
-          state.note_service_transmit_result(h, StdInstant::now(), delivered);
-        }
-        TransmitOrigin::Query(h) => {
-          let mut state = inner.state.borrow_mut();
-          state.note_query_transmit_result(h, StdInstant::now(), delivered);
+      // Anchored at the EARLIEST family acceptance, which is the instant the core
+      // measures each delivered family's freshness from. Post-fan-out time would
+      // backdate every family by however long the slowest one took, pushing the
+      // healthy family's next refresh past its records' TTL. A round that reached
+      // no wire has no acceptance to anchor, and its re-arm is spaced from the
+      // attempt instead.
+      let delivery = fanout.delivery();
+      let at = accepted_at.unwrap_or_else(StdInstant::now);
+      {
+        let mut state = inner.state.borrow_mut();
+        state.set_wire_gate(origin, gate);
+        match origin {
+          TransmitOrigin::Service(h) => state.note_service_transmit_outcome(h, at, delivery),
+          TransmitOrigin::Query(h) => state.note_query_transmit_outcome(h, at, delivery),
         }
       }
-    }
+    };
     // Exhausted the per-pass send budget — more transmits may be ready, so the
     // driver must re-enter the pump rather than park until an unrelated event.
     //
@@ -1334,20 +1452,24 @@ pub(crate) async fn run(
     // This cannot busy-spin now that multicast transmits reach a bound socket:
     // each successful send drives `note_*_transmit_result(delivered = true)`, so
     // the proto advances (§8.1 probe / §8.3 announce) and the queue drains.
-    let pump_budget_exhausted = credits == 0;
 
-    // 1a-pre. Sweep services whose handle was dropped. `Service::drop` only
-    //     flags `cancelled`; beginning the endpoint-owned §10.1 withdrawal happens
-    //     HERE, after the transmit pump, so a send that was in flight when the
-    //     handle dropped has already latched its records via
-    //     `note_service_transmit_result` and is therefore captured in the
-    //     withdrawal snapshot. The endpoint holds the route + drives the goodbye
-    //     schedule; the first round is due immediately and is pumped by
-    //     `drain_withdrawals` (1a) later in this same iteration, after 1b has also
-    //     had a chance to begin any rename-collision withdrawal.
+    // 1a-pre. Sweep handles that were dropped. `Service::drop` / `Query::drop`
+    //     only flag `cancelled`; the teardown that resolves a producer's state
+    //     happens HERE, after the transmit pump, so a send that was in flight when
+    //     the handle dropped has already been confirmed. For a service that means
+    //     `note_service_transmit_outcome` latched its records before the
+    //     withdrawal snapshot reads them; for a query it means
+    //     `note_query_transmit_outcome` resolved the commit token before
+    //     `cancel_query` discards it. The endpoint holds each withdrawing
+    //     service's route + drives the goodbye schedule; the first round is due
+    //     immediately and is pumped by `drain_withdrawals` (1a) later in this same
+    //     iteration, after 1b has also had a chance to begin any rename-collision
+    //     withdrawal.
     {
       let now = StdInstant::now();
-      inner.state.borrow_mut().sweep_cancelled_services(now);
+      let mut state = inner.state.borrow_mut();
+      state.sweep_cancelled_services(now);
+      state.sweep_cancelled_queries();
     }
 
     // 1b. drain pending `ServiceUpdate`s out of each per-service proto state
@@ -1378,7 +1500,8 @@ pub(crate) async fn run(
     //     draining, frees each completed route + GCs its driver ctx. Running AFTER
     //     `push_service_updates` (1b) ensures a rename-collision withdrawal begun
     //     this iteration flushes its first goodbye on-wire the same iteration.
-    drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch).await;
+    let withdrawals_budget_stopped =
+      drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch, &mut budget).await;
 
     // 1b'. fire one-shot wakes for queries that just transitioned to `errored`
     //      (un-encodable question, see `QueryCtx::errored`). Such a query has no
@@ -1415,7 +1538,8 @@ pub(crate) async fn run(
     if Rc::strong_count(&inner) == 1 {
       let shutdown_deadline = StdInstant::now() + Duration::from_secs(10);
       loop {
-        drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch).await;
+        let mut budget = DrainBudget::new(StdInstant::now());
+        drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch, &mut budget).await;
         // Sweep any service whose handle dropped since the last pass — INCLUDING
         // one that raced the awaited drain above — into a withdrawal BEFORE
         // deciding whether any remain. The 1a-pre sweep only ran for cancellations
@@ -1427,10 +1551,10 @@ pub(crate) async fn run(
           .borrow_mut()
           .sweep_cancelled_services(StdInstant::now());
         let now = StdInstant::now();
-        // Sleep on (and exit when there are no) WITHDRAWAL deadlines only — NOT
-        // the aggregate `poll_deadline`, which folds in cache expiry and query
-        // timers. Otherwise, once every goodbye is sent, a still-populated cache
-        // would keep this flush parked until that unrelated deadline (or the 10 s
+        // Sleep on (and exit when there is no) WITHDRAWAL deadline — NOT the
+        // aggregate `poll_deadline`, which folds in cache expiry and query timers.
+        // Otherwise, once every goodbye is sent, a still-populated cache would
+        // keep this flush parked until that unrelated deadline (or the 10 s
         // backstop) instead of exiting promptly.
         let Some(next) = ({ inner.state.borrow().next_withdrawal_deadline() }) else {
           break;
@@ -1439,11 +1563,10 @@ pub(crate) async fn run(
           debug!("shutdown withdrawal flush hit its wall-clock backstop; exiting");
           break;
         }
-        let dur = next
-          .saturating_duration_since(now)
-          .min(shutdown_deadline.saturating_duration_since(now));
-        if dur > Duration::ZERO {
-          compio::time::sleep(dur).await;
+        let backstop = shutdown_deadline.saturating_duration_since(now);
+        let idle = next.saturating_duration_since(now).min(backstop);
+        if idle > Duration::ZERO {
+          compio::time::sleep(idle).await;
         }
       }
       break;
@@ -1467,20 +1590,21 @@ pub(crate) async fn run(
     //      newly-started timeout-less query, …): every work-creating handle op
     //      marks the endpoint dirty (see `EndpointInner::mark_dirty`), closing the
     //      "handle parks forever" lost-wake class by construction.
-    //    * `pump_budget_exhausted` — the transmit pump hit its per-pass credit
-    //      cap with work still queued; re-enter to drain the backlog.
+    //    * `pump_budget_exhausted` / `withdrawals_budget_stopped` — a pump hit the
+    //      pass's [`DrainBudget`] with work still queued; re-enter to drain the
+    //      backlog.
     let deadline = { inner.state.borrow().poll_deadline() };
-    let force_now = inner.dirty.replace(false) || pump_budget_exhausted;
+    let force_now =
+      inner.dirty.replace(false) || pump_budget_exhausted || withdrawals_budget_stopped;
 
     // 3. arm the timer future. `Either<sleep, pending>` keeps both arms with
     //    the same `Output = ()` so a single `pin_mut!` is enough for
     //    `select!` to accept either branch via the fused wrapper.
     let timer_fut = match (force_now, deadline) {
       (true, _) => Either::Left(compio::time::sleep(Duration::ZERO)),
-      (false, Some(at)) => {
-        let dur = at.saturating_duration_since(StdInstant::now());
-        Either::Left(compio::time::sleep(dur))
-      }
+      (false, Some(at)) => Either::Left(compio::time::sleep(
+        at.saturating_duration_since(StdInstant::now()),
+      )),
       (false, None) => Either::Right(core::future::pending::<()>()),
     }
     .fuse();
@@ -1546,6 +1670,636 @@ pub(crate) async fn run(
   }
 }
 
+/// One address family's result for one logical transmit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FamilySend {
+  /// No socket bound for this family, or the datagram was not addressed to it.
+  /// It was therefore never OBLIGATED to carry this transmit, and its absence
+  /// must not read as a failure — a v4-only host is fully delivered on v4 alone.
+  Unbound,
+  /// A bound socket was NOT offered the datagram because the producer's previous
+  /// one is still inside [`Transmit::min_family_gap`] on THIS family's wire (see
+  /// [`FamilyWireGate`]). Obligated and did not carry it, exactly like
+  /// [`FamilySend::Failed`] — but a deliberate deferral, not an I/O error, so it
+  /// bumps no error counter.
+  Gated,
+  /// A bound socket accepted the datagram.
+  Sent,
+  /// A bound socket did not carry it, and the kernel said so. A completion-based
+  /// `send_to` removes `EWOULDBLOCK` and nothing else: `ENETUNREACH`/`EHOSTUNREACH`
+  /// when a family's route goes away, `ENOBUFS` under buffer pressure, `EPERM` from
+  /// a local firewall, `EADDRNOTAVAIL` when an interface loses its address,
+  /// `EMSGSIZE`. Each of those lands here on one family while the other returns
+  /// `Ok` in the very same fan-out.
+  ///
+  /// Every value of this enum is an OBSERVED fact. There is no "unknown" variant
+  /// because the fan-out never confirms without one: every submitted operation is
+  /// awaited to its true completion first.
+  Failed,
+}
+
+impl FamilySend {
+  /// Classify a PRESENT (bound) family's `send_to` result. Never yields
+  /// [`FamilySend::Unbound`] — that is the caller's default for a family it has
+  /// no socket for.
+  fn from_bound_result<T>(res: &std::io::Result<T>) -> Self {
+    match res {
+      Ok(_) => Self::Sent,
+      Err(_) => Self::Failed,
+    }
+  }
+
+  /// Classify one completed attempt.
+  fn from_attempt(attempt: &SendAttempt) -> Self {
+    match attempt {
+      SendAttempt::Unbound => Self::Unbound,
+      SendAttempt::Gated => Self::Gated,
+      SendAttempt::Answered { result, .. } => Self::from_bound_result(result),
+    }
+  }
+
+  /// This family's I/O answer as the core's protocol vocabulary. The mapping is
+  /// one-to-one — no family is ever laundered into a different one.
+  ///
+  /// A GATED family is `Missed` and never `Unobligated`: its socket is there and
+  /// the datagram was fanned onto it, the driver simply owed the wire a gap it had
+  /// not yet paid. Reporting it absent would hide the deferral from the core and
+  /// let the phase advance without it.
+  const fn delivery(self) -> FamilyDelivery {
+    match self {
+      Self::Unbound => FamilyDelivery::Unobligated,
+      Self::Sent => FamilyDelivery::Delivered,
+      Self::Gated | Self::Failed => FamilyDelivery::Missed,
+    }
+  }
+}
+
+/// The per-family shape of one logical transmit's fan-out: the I/O answer, which
+/// the core alone turns into a protocol answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Fanout {
+  pub(crate) v4: FamilySend,
+  pub(crate) v6: FamilySend,
+}
+
+impl Fanout {
+  /// Neither family attempted — the starting value, and the honest report for an
+  /// endpoint with no bound socket at all.
+  const UNBOUND: Self = Self {
+    v4: FamilySend::Unbound,
+    v6: FamilySend::Unbound,
+  };
+
+  /// Hand the fan-out to the core VERBATIM, one [`FamilyDelivery`] per family —
+  /// the honest, unexcused I/O facts.
+  ///
+  /// The obligated set is every family with a socket that this datagram was
+  /// offered to; `Unbound` means there is none, so that family was never
+  /// obligated and its absence must not read as a failure. Delivery is `Sent` and
+  /// nothing else — a `Failed` family did not carry the datagram, so the core must
+  /// not advance its §8.1 / §8.3 phase as if it had.
+  ///
+  /// Nothing is projected onto an aggregate here. WHICH family missed is what lets
+  /// the core schedule the next announcement per link rather than per round, and a
+  /// driver that folded it away would put the core back to refreshing alternating
+  /// families at twice the periodic interval.
+  ///
+  /// A family that keeps missing is never written off here, and this driver has
+  /// no other place that could: the confirm is the honest I/O facts and nothing
+  /// more. Bounding how long the lifecycle waits for it is the core's own
+  /// patience, applied inside [`TransmitDelivery`]'s confirm.
+  pub(crate) fn delivery(self) -> TransmitDelivery {
+    TransmitDelivery::new(self.v4.delivery(), self.v6.delivery())
+  }
+}
+
+/// How long a send fan-out may stay pending before the driver TRACES it.
+///
+/// Diagnostics only: nothing is cancelled, nothing is reported, no state moves.
+/// The driver awaits every submitted operation to its true completion, so a
+/// kernel that never completes one stalls the loop — and this is what makes that
+/// stall visible in a log instead of leaving it to be inferred from silence.
+///
+/// Matches the smallest slack this driver can ever be given. [`run`]'s
+/// minimum-TTL note derives `TTL - max(floor(0.8 * TTL), 1 s)` as the margin a
+/// stall must stay under to keep a record fresh; that margin is exactly 1 s at
+/// [`mdns_proto::constants::MIN_SERVICE_TTL_SECS`], the lowest TTL a service can
+/// register at. A stall shorter than this cannot yet have cost a refresh at any
+/// registrable TTL; one that reaches it already could have, at that floor — so
+/// this is the latest the trace could fire without falling silent on exactly
+/// the hazard [`run`] documents.
+const FANOUT_STALL_TRACE: Duration = Duration::from_secs(1);
+
+/// Await one send fan-out, tracing ONCE if it has not completed within
+/// [`FANOUT_STALL_TRACE`].
+///
+/// The fan-out is polled to completion either way — the timer only decides
+/// whether a line is emitted. It must never be turned into a `timeout` that
+/// abandons the future: compio's cancellation is documented as unreliable, so
+/// dropping a submitted operation ends the driver's knowledge of a datagram
+/// rather than the datagram (see [`run`]).
+async fn awaiting_fanout<F: core::future::Future>(fanout: F, _kind: &'static str) -> F::Output {
+  use futures::FutureExt;
+
+  let fanout = fanout.fuse();
+  let stall = compio::time::sleep(FANOUT_STALL_TRACE).fuse();
+  futures::pin_mut!(fanout, stall);
+  loop {
+    futures::select! {
+      out = fanout => return out,
+      _ = stall => warn!(
+        kind = _kind,
+        after = ?FANOUT_STALL_TRACE,
+        "send fan-out still pending; the driver awaits every submitted operation, \
+         so the loop is stalled until the kernel completes it"
+      ),
+    }
+  }
+}
+
+/// The one socket capability the transmit and withdrawal fan-outs use.
+///
+/// Naming it keeps the fan-out's dependency on the socket to a single method, so
+/// the fan-out can be exercised against a family that never accepts — a state no
+/// bound UDP socket can be coaxed into on a real host.
+trait SendDatagram {
+  fn send_to(
+    &self,
+    buf: &[u8],
+    dst: SocketAddr,
+  ) -> impl core::future::Future<Output = std::io::Result<usize>>;
+}
+
+impl SendDatagram for Socket {
+  fn send_to(
+    &self,
+    buf: &[u8],
+    dst: SocketAddr,
+  ) -> impl core::future::Future<Output = std::io::Result<usize>> {
+    Socket::send_to(self, buf, dst, None)
+  }
+}
+
+/// One PRODUCER's per-family earliest-next-send gate: when each address family
+/// ([0] = v4, [1] = v6) last carried a datagram from this service or query.
+///
+/// The rule it enforces is RFC 6762's, on the wire: §6 and §8.3 forbid
+/// re-multicasting a record on an interface inside one second of the last time it
+/// went out on that same interface, and §8.1 spaces probes 250 ms apart. The
+/// MINIMUM is protocol policy and arrives from the core on
+/// [`Transmit::min_family_gap`]; only the driver knows when each family last
+/// satisfied it, which is why the two halves live on opposite sides of the seam.
+///
+/// It cannot be folded into the core's schedule because the confirm anchors at
+/// the EARLIEST acceptance across families. That anchor is the right one for the
+/// TTL guarantee — it can only understate how fresh a family's peers are — but
+/// under inter-family skew `s` it schedules the next datagram one interval after
+/// the EARLY family's wire time, leaving the late family a gap of
+/// `interval - s`. The core cannot see `s`; the driver measured it.
+///
+/// Kept PER PRODUCER because the rules are per record set: two different services
+/// announcing inside the same second are two different records and pace each
+/// other not at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FamilyWireGate {
+  /// Indexed [v4, v6]. `None` until that family has carried a GATED datagram from
+  /// this producer — an ungated (one-shot) send never writes here, so a §6 reply
+  /// cannot defer the announcement that follows it.
+  last_sent: [Option<StdInstant>; 2],
+}
+
+impl FamilyWireGate {
+  /// Whether family `idx` may be offered a datagram at `now` under `min_gap`.
+  ///
+  /// A zero `min_gap` is ungated and always open. A family that has carried
+  /// nothing yet is open. A clock that reads BEFORE the recorded send closes the
+  /// gate: the elapsed gap is then unknown, and the conservative answer is the
+  /// one that cannot put a record back on the wire too soon.
+  fn open(&self, idx: usize, now: StdInstant, min_gap: Duration) -> bool {
+    if min_gap.is_zero() {
+      return true;
+    }
+    match self.last_sent.get(idx).copied().flatten() {
+      Some(last) => now
+        .checked_duration_since(last)
+        .is_some_and(|gap| gap >= min_gap),
+      None => true,
+    }
+  }
+
+  /// Record that family `idx` put a GATED datagram on its wire at `at`.
+  ///
+  /// `at` must be that family's OWN COMPLETION instant. Two ways to get it
+  /// wrong, and this gate tolerates neither:
+  ///
+  /// * the fan-out's confirm anchor (the EARLIEST family's) would re-introduce
+  ///   exactly the inter-family skew this gate exists to absorb;
+  /// * a PRE-submit instant would spend the gap on time the datagram was still
+  ///   pending. The next `open` would then pass while the true spacing was only
+  ///   `min_gap` minus that pending time — §8.1 / §8.3 measure the wire, and the
+  ///   wire only saw bytes when the operation completed.
+  ///
+  /// The core's own confirm anchor is a pre-submit instant and correctly so; the
+  /// two anchors are wrong in opposite directions and are not interchangeable.
+  fn record(&mut self, idx: usize, at: StdInstant, min_gap: Duration) {
+    if min_gap.is_zero() {
+      return;
+    }
+    if let Some(slot) = self.last_sent.get_mut(idx) {
+      *slot = Some(at);
+    }
+  }
+}
+
+/// Index of the IPv4 family in every per-family array, matching
+/// [`mdns_proto::TransmitDelivery`]'s own ordering.
+const FAMILY_V4: usize = 0;
+/// Index of the IPv6 family.
+const FAMILY_V6: usize = 1;
+
+/// One address family's answer to ONE bounded send attempt.
+enum SendAttempt {
+  /// No socket bound for this family, so it was never offered the datagram.
+  Unbound,
+  /// A bound socket the per-family wire gate held back for this round; no
+  /// operation was submitted. See [`FamilyWireGate`].
+  Gated,
+  /// The socket completed the send, carrying the `send_to` result and THREE
+  /// separate clock reads.
+  ///
+  /// Three, not one, and not two: each stamp is allowed to be wrong in exactly
+  /// one direction, and the three directions do not agree. Folding any pair
+  /// together silently breaks whichever consumer needed the other direction —
+  /// see the field docs before "simplifying" them.
+  Answered {
+    /// What `send_to` reported.
+    result: std::io::Result<usize>,
+    /// Wall clock, read BEFORE submission. Keys self-send suppression.
+    ///
+    /// Suppression matches our own loopback echo against this stamp, so
+    /// `submitted_wall <= kernel_send_time <= echo_rx_time` must hold or the echo
+    /// falls outside the 1 ms `Ordered` match window and this host processes its
+    /// own probe / announcement as peer traffic. Reading it after the completion
+    /// can push it past the kernel's rx stamp; reading it before cannot.
+    submitted_wall: SystemTime,
+    /// Monotonic, read BEFORE submission. Anchors the CORE's refresh schedule.
+    ///
+    /// EARLY is the safe direction here: an anchor at or before the true
+    /// acceptance can only understate how fresh a family's peers are, so the
+    /// next refresh lands sooner than strictly needed. A late anchor would push
+    /// a refresh past the records' own TTL.
+    submitted_at: StdInstant,
+    /// Monotonic, read AFTER the completion. Anchors [`FamilyWireGate`].
+    ///
+    /// EARLY is the UNSAFE direction here — the opposite of `submitted_at`, and
+    /// the whole reason this is a third stamp rather than that one reused. The
+    /// gate measures the real spacing between bytes on ONE family's wire; a
+    /// pre-submit anchor credits that spacing with the time the datagram spent
+    /// merely pending, so a send pending `P` before it succeeds re-opens its own
+    /// family `P` early. At RFC 6762 §8.1's 250 ms inter-probe interval a
+    /// 200 ms-pending send would leave 50 ms of true spacing, and it would do so
+    /// on precisely the slow-socket path the spacing exists to protect.
+    completed_at: StdInstant,
+  },
+}
+
+impl SendAttempt {
+  /// The instant to confirm a delivered family at, if it delivered.
+  ///
+  /// The CORE's anchor, read before submission (`Answered::submitted_at`), so it
+  /// is at or before the true acceptance.
+  fn confirm_anchor(&self) -> Option<StdInstant> {
+    match self {
+      Self::Answered {
+        result: Ok(_),
+        submitted_at,
+        ..
+      } => Some(*submitted_at),
+      _ => None,
+    }
+  }
+
+  /// The instant this family's bytes were actually on its wire, if they were.
+  ///
+  /// The WIRE GATE's anchor, read after the completion
+  /// (`Answered::completed_at`).
+  ///
+  /// Never fold this into [`Self::confirm_anchor`]. The two answer different
+  /// questions — "when may the core assume peers heard us" versus "when did this
+  /// wire last carry bytes" — and they are wrong in opposite directions, so each
+  /// consumer can absorb only its own.
+  fn wire_time(&self) -> Option<StdInstant> {
+    match self {
+      Self::Answered {
+        result: Ok(_),
+        completed_at,
+        ..
+      } => Some(*completed_at),
+      _ => None,
+    }
+  }
+}
+
+/// Offer one family its copy of the datagram and await the operation's true
+/// completion. An absent socket is [`SendAttempt::Unbound`] — that family was
+/// never obligated — and is answered without touching the clock, as is a family
+/// whose wire gate is shut (`may_send == false`).
+///
+/// There is deliberately no bound on the wait. compio is completion-based, so the
+/// operation is handed to the kernel before any wait begins and abandoning the
+/// wait does not abandon the datagram (see [`run`]); a bounded wait could only
+/// report a fact this driver does not have. What such a wait costs in liveness is
+/// traced by [`awaiting_fanout`].
+///
+/// A completed attempt is stamped THREE times, twice before the `.await` and
+/// once after it — see [`SendAttempt::Answered`] for why the three cannot be
+/// collapsed. compio is completion-based: the buffer moves into the op on
+/// `.await`, so nothing here can stamp "at the syscall" the way readiness I/O
+/// does inside `poll_send_to`, and the two pre-submit reads are the closest
+/// under-estimates available while the post-completion read is the closest
+/// over-estimate.
+async fn attempt_send_to<S: SendDatagram>(
+  sock: Option<&S>,
+  may_send: bool,
+  body: &[u8],
+  dst: SocketAddr,
+) -> SendAttempt {
+  let Some(sock) = sock else {
+    return SendAttempt::Unbound;
+  };
+  if !may_send {
+    return SendAttempt::Gated;
+  }
+  // Both PRE-submit reads stay pre-submit: the wall clock because a late one
+  // could outrun the kernel's rx stamp and cost us loopback suppression, the
+  // monotonic one because a late one could schedule a refresh past its records'
+  // TTL.
+  let submitted_wall = SystemTime::now();
+  let submitted_at = StdInstant::now();
+  let result = sock.send_to(body, dst).await;
+  // POST-completion, and only this one. The operation is complete, so this is
+  // the first instant at which the datagram is known to have reached the wire —
+  // the only honest input to a gate that spaces one wire's bytes.
+  let completed_at = StdInstant::now();
+  SendAttempt::Answered {
+    result,
+    submitted_wall,
+    submitted_at,
+    completed_at,
+  }
+}
+
+/// Record the trace line, the self-send credit, and the stats for one MULTICAST
+/// family's completed attempt.
+///
+/// The credit is recorded only for an attempt that reported bytes on the wire. A
+/// failed send produces no loopback, and a stale entry would suppress a later
+/// byte-identical peer packet.
+fn note_multicast_attempt(
+  inner: &Rc<EndpointInner>,
+  attempt: &SendAttempt,
+  body: &[u8],
+  _dst: SocketAddr,
+  _kind: &'static str,
+) {
+  match attempt {
+    // Neither put bytes on a wire, and neither is an error: no socket, or this
+    // driver's own deliberate spacing.
+    SendAttempt::Unbound | SendAttempt::Gated => {}
+    SendAttempt::Answered {
+      result: Ok(_),
+      submitted_wall,
+      ..
+    } => {
+      trace!(kind = _kind, dst = %_dst, len = body.len(), "send_to");
+      let mut state = inner.state.borrow_mut();
+      // The PRE-submit wall clock, and it must stay that: suppression compares
+      // this against the loopback echo's rx stamp, and a stamp taken after the
+      // completion could land after the echo arrived.
+      crate::selfsend::record_self_send(&mut state.recent_sends, body, *submitted_wall);
+      #[cfg(feature = "stats")]
+      {
+        state.stats.packets_tx(1);
+        state.stats.bytes_tx(body.len() as u64);
+      }
+    }
+    SendAttempt::Answered {
+      result: Err(_e), ..
+    } => {
+      debug!(kind = _kind, error = %_e, dst = %_dst, "send_to failed");
+      #[cfg(feature = "stats")]
+      inner.state.borrow().stats.send_errors(1);
+    }
+  }
+}
+
+/// Send one logical transmit and report each family's result.
+///
+/// `mdns-proto` always hands back the IPv4 multicast group for BOTH the v4 and v6
+/// service groups (`multicast_dst()`), so multicast cannot be routed by the
+/// destination's address family. An mDNS multicast destination is detected here
+/// and the SAME body fanned out to every bound family's group (RFC 6762 §6: a
+/// dual-stack host answers on each); a v6-only endpoint therefore actually
+/// transmits instead of routing to an absent v4 socket.
+///
+/// Self-send credits are recorded ONLY on the multicast branch, one per ACTUAL
+/// successful send: take-once suppression consumes a single entry per matching
+/// loopback, and a dual-stack fan-out yields two loopback copies (one per joined
+/// socket). The unicast branch deliberately records none — see below.
+///
+/// The second return value is the EARLIEST instant at which some family accepted
+/// the datagram, and it is what the caller must confirm with. The core anchors
+/// each delivered family's refresh schedule at the confirm instant, so a single
+/// post-fan-out `Instant::now()` would record a family that was served at `t0` as
+/// having been served when the SLOWEST family finished: its next refresh would
+/// then land a whole fan-out later than its records' TTL allows.
+///
+/// `gate` is the PRODUCER's per-family earliest-next-send state and `min_gap` the
+/// minimum the core computed for this datagram's kind
+/// ([`Transmit::min_family_gap`]). A family whose gap is unpaid is not offered the
+/// datagram at all and is reported [`FamilySend::Gated`] — obligated, and it did
+/// not carry it. Every family that DID carry it records its own COMPLETION
+/// instant back into `gate`, which is NOT the instant this function returns as
+/// the confirm anchor (see [`SendAttempt::Answered`]).
+///
+/// Every family that was offered the datagram is awaited to its true completion,
+/// so the returned [`Fanout`] carries observed facts only.
+#[allow(clippy::too_many_arguments)]
+async fn send_via<S: SendDatagram>(
+  inner: &Rc<EndpointInner>,
+  sock_v4: &Option<Rc<S>>,
+  sock_v6: &Option<Rc<S>>,
+  dst: SocketAddr,
+  body: &[u8],
+  gate: &mut FamilyWireGate,
+  min_gap: Duration,
+  now: StdInstant,
+) -> (Fanout, Option<StdInstant>) {
+  let n = body.len();
+  let mut fanout = Fanout::UNBOUND;
+  if is_mdns_multicast_dst(dst) {
+    // Offer both families CONCURRENTLY. Serialising them made each family's
+    // acceptance instant depend on how long the other one took, so a slow family
+    // backdated the healthy one's refresh schedule by its own latency.
+    let (a4, a6) = futures::future::join(
+      attempt_send_to(
+        sock_v4.as_deref(),
+        gate.open(FAMILY_V4, now, min_gap),
+        body,
+        MDNS_V4_DST,
+      ),
+      attempt_send_to(
+        sock_v6.as_deref(),
+        gate.open(FAMILY_V6, now, min_gap),
+        body,
+        MDNS_V6_DST,
+      ),
+    )
+    .await;
+    fanout.v4 = FamilySend::from_attempt(&a4);
+    fanout.v6 = FamilySend::from_attempt(&a6);
+    // Each family's OWN COMPLETION instant re-opens ITS OWN gate one `min_gap`
+    // later, and it is deliberately not the instant the confirm below anchors
+    // at. Two distinctions, both load-bearing:
+    //
+    // * per FAMILY, not the fan-out anchor (the earliest across families) —
+    //   the anchor would put the late family's next send back inside the
+    //   interval, the exact skew this gate exists to absorb;
+    // * per COMPLETION, not per submission — a pre-submit stamp would credit
+    //   the gap with however long the send sat pending, which is how a slow
+    //   socket talks its own way into an early next datagram.
+    if let Some(at) = a4.wire_time() {
+      gate.record(FAMILY_V4, at, min_gap);
+    }
+    if let Some(at) = a6.wire_time() {
+      gate.record(FAMILY_V6, at, min_gap);
+    }
+    let accepted_at = [a4.confirm_anchor(), a6.confirm_anchor()]
+      .into_iter()
+      .flatten()
+      .min();
+    // The tracker is written after the join, in family order, so the two entries
+    // a dual-stack fan-out needs are recorded exactly as the serial version
+    // recorded them — and under no borrow held across an await.
+    note_multicast_attempt(inner, &a4, body, MDNS_V4_DST, "transmit");
+    note_multicast_attempt(inner, &a6, body, MDNS_V6_DST, "transmit");
+    return (fanout, accepted_at);
+  }
+
+  // Unicast: pick the socket matching the destination family. Exactly one family
+  // is obligated (an absent socket obligates none), so this branch can only be
+  // all- or none-delivered.
+  let (idx, sock) = match dst {
+    SocketAddr::V4(_) => (FAMILY_V4, sock_v4.as_deref()),
+    SocketAddr::V6(_) => (FAMILY_V6, sock_v6.as_deref()),
+  };
+  // NO self-send tracker entry here, unlike the multicast branch. A unicast
+  // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
+  // for the querier's own address and port and never loops back through the
+  // multicast group we joined, so a credit recorded for it can never be
+  // consumed. It would simply occupy the linear-scanned tracker for
+  // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
+  // the NEW entry — so a legacy-query flood would starve the genuine multicast
+  // credits that suppression actually depends on.
+  let attempt = attempt_send_to(sock, gate.open(idx, now, min_gap), body, dst).await;
+  let outcome = FamilySend::from_attempt(&attempt);
+  match dst {
+    SocketAddr::V4(_) => fanout.v4 = outcome,
+    SocketAddr::V6(_) => fanout.v6 = outcome,
+  }
+  // The COMPLETION instant, exactly as on the multicast branch — a unicast send
+  // is no less capable of sitting pending, and a gated kind reaching this branch
+  // must not have its wire gap shortened by that.
+  if let Some(at) = attempt.wire_time() {
+    gate.record(idx, at, min_gap);
+  }
+  let accepted_at = attempt.confirm_anchor();
+  match &attempt {
+    // In tree every unicast datagram is a §6.7 legacy reply, which is one-shot
+    // and therefore ungated — `Gated` is unreachable here today and is listed
+    // with `Unbound` because neither wrote to a wire nor failed.
+    SendAttempt::Unbound | SendAttempt::Gated => {}
+    SendAttempt::Answered { result: Ok(_), .. } => {
+      trace!(dst = %dst, len = n, "send_to");
+      #[cfg(feature = "stats")]
+      {
+        let state = inner.state.borrow();
+        state.stats.packets_tx(1);
+        state.stats.bytes_tx(n as u64);
+      }
+    }
+    SendAttempt::Answered {
+      result: Err(_e), ..
+    } => {
+      debug!(error = %_e, dst = %dst, "send_to failed");
+      #[cfg(feature = "stats")]
+      inner.state.borrow().stats.send_errors(1);
+    }
+  }
+  (fanout, accepted_at)
+}
+
+/// The wall clock ONE driver pass may spend inside send fan-outs, across the
+/// transmit pump AND the withdrawal pump together.
+///
+/// The per-pass send credits cannot bound a pass on their own: producers are
+/// served serially, so 64 due producers each taking a few milliseconds is already
+/// a pass in which nothing else in the loop runs — no recv, no timer, no
+/// dropped-handle sweep.
+///
+/// A LIVENESS knob: it buys nothing about wire freshness, it only bounds how long
+/// the loop goes without servicing everything else it owns. It bounds when a pass
+/// STOPS TAKING new work, not the pass itself — a fan-out already started runs to
+/// its own completion (see [`run`]), which is the only honest thing a
+/// completion-based driver can do with a submitted operation. Mirrors
+/// `hick-reactor::driver::DRAIN_PASS_BUDGET`.
+const DRAIN_PASS_BUDGET: Duration = Duration::from_millis(500);
+
+/// The two bounds one driver pass spends: [`MAX_TRANSMIT_CREDITS_PER_PASS`] actual
+/// fan-outs, and [`DRAIN_PASS_BUDGET`] of wall clock shared by every fan-out the
+/// pass performs.
+///
+/// One value threaded through both pumps so the budget is genuinely per PASS.
+/// Withdrawals are drained after transmits, so a pass whose transmits spend the
+/// whole budget defers its goodbyes — but only to the next pass, which the
+/// `force_now` re-settle starts without parking, and the goodbye resend schedule
+/// the endpoint owns re-arms them regardless.
+struct DrainBudget {
+  credits: usize,
+  deadline: StdInstant,
+  /// Whether this pass has started a fan-out yet. See
+  /// [`Self::may_start_fanout`]'s forward-progress clause.
+  started: bool,
+}
+
+impl DrainBudget {
+  /// Open a fresh budget for a pass beginning at `pass_start`.
+  fn new(pass_start: StdInstant) -> Self {
+    Self {
+      credits: MAX_TRANSMIT_CREDITS_PER_PASS,
+      deadline: pass_start
+        .checked_add(DRAIN_PASS_BUDGET)
+        .unwrap_or(pass_start),
+      started: false,
+    }
+  }
+
+  /// Whether another fan-out may START.
+  ///
+  /// The FIRST fan-out of a pass is admitted regardless of the clock, so a pass
+  /// whose preamble somehow outran the budget still takes work instead of
+  /// reporting more pending and re-entering to do the same again.
+  fn may_start_fanout(&self) -> bool {
+    self.credits > 0 && (!self.started || StdInstant::now() < self.deadline)
+  }
+
+  /// Charge one fan-out, and record that this pass has taken work.
+  fn charge(&mut self) {
+    self.credits = self.credits.saturating_sub(1);
+    self.started = true;
+  }
+}
+
 /// Map a PRESENT (bound) family's `send_to` result to its per-family withdrawal
 /// outcome: `Ok` → [`WithdrawalSend::Sent`] (spend one owed round); ANY
 /// `Err` → [`WithdrawalSend::Retry`] (keep the debt, retry until success or the
@@ -1593,17 +2347,32 @@ fn present_socket_send_outcome<T>(res: &std::io::Result<T>) -> WithdrawalSend {
 ///     transiently (e.g. `ENOBUFS` buffer pressure, route/interface churn) with an
 ///     error kind other than `WouldBlock`/`Interrupted`; treating those as a
 ///     permanent write-off would free the route after the OTHER family drains and
-///     leave this family's peers pinned to stale positive-TTL records. The ceiling
-///     is the backstop for a genuinely-wedged bound socket;
+///     leave this family's peers pinned to stale positive-TTL records;
 ///   * absent socket (family not bound) → [`WithdrawalSend::WriteOff`] (no reachable
 ///     peers on it), so its debt never pins the withdrawal past the other family.
+///
+/// Shares the pass's [`DrainBudget`] with the transmit pump — the wall clock is
+/// per PASS, and a goodbye deferred by an exhausted budget is re-armed by the
+/// endpoint's own resend schedule and pumped by the immediate re-settle. Returns
+/// `true` when it stopped on the budget with goodbyes still due.
 async fn drain_withdrawals(
   inner: &Rc<EndpointInner>,
   sock_v4: &Option<Rc<Socket>>,
   sock_v6: &Option<Rc<Socket>>,
   scratch: &mut [u8],
-) {
+  budget: &mut DrainBudget,
+) -> bool {
+  let mut budget_stopped = false;
   loop {
+    if !budget.may_start_fanout() {
+      // Only report a stop if something was actually still due.
+      budget_stopped = {
+        let s = inner.state.borrow();
+        s.next_withdrawal_deadline()
+          .is_some_and(|at| at <= StdInstant::now())
+      };
+      break;
+    }
     let due = {
       let mut s = inner.state.borrow_mut();
       let now = StdInstant::now();
@@ -1612,65 +2381,38 @@ async fn drain_withdrawals(
     let Some((_dst, len, token)) = due else {
       break;
     };
-    // Fan out to every bound family on the mDNS multicast group.
-    // Capture `when` BEFORE each `.await` (completion-I/O equivalent of
-    // stamping at the syscall) so `when <= kernel_send_time <= echo_rx_time`
-    // and the kernel-looped goodbye stays inside the 1 ms Ordered self-send
-    // match window.
+    budget.charge();
+    // Fan out to every bound family on the mDNS multicast group, concurrently,
+    // for the same reason the positive-TTL fan-out is: serialising them would
+    // make each family's latency the other's.
+    //
     // Per-family outcome is load-bearing (not stats-only): the endpoint tracks
     // per-family debt, so a withdrawal frees only once EVERY reachable family
     // has withdrawn its records. A family with no bound socket is `WriteOff` (no
     // peers reachable on it to withdraw from) so its debt never pins the other.
-    let mut v4_out = WithdrawalSend::WriteOff;
-    let mut v6_out = WithdrawalSend::WriteOff;
-    if let Some(s4) = sock_v4.as_ref() {
-      let when = SystemTime::now();
-      let res = s4.send_to(&scratch[..len], MDNS_V4_DST, None).await;
-      // Present socket: Ok → Sent, ANY Err → Retry (never WriteOff). See
-      // `present_socket_send_outcome`.
-      v4_out = present_socket_send_outcome(&res);
-      match res {
-        Ok(_) => {
-          trace!(dst = %MDNS_V4_DST, len, "withdrawal send_to v4");
-          let mut state = inner.state.borrow_mut();
-          crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
-          #[cfg(feature = "stats")]
-          {
-            state.stats.packets_tx(1);
-            state.stats.bytes_tx(len as u64);
-          }
-        }
-        Err(_e) => {
-          debug!(error = %_e, dst = %MDNS_V4_DST, "withdrawal send_to v4 failed");
-          #[cfg(feature = "stats")]
-          inner.state.borrow().stats.send_errors(1);
-        }
-      }
-    }
-    if let Some(s6) = sock_v6.as_ref() {
-      let when = SystemTime::now();
-      let res = s6.send_to(&scratch[..len], MDNS_V6_DST, None).await;
-      // Present socket: Ok → Sent, ANY Err → Retry (never WriteOff). See
-      // `present_socket_send_outcome`.
-      v6_out = present_socket_send_outcome(&res);
-      match res {
-        Ok(_) => {
-          trace!(dst = %MDNS_V6_DST, len, "withdrawal send_to v6");
-          let mut state = inner.state.borrow_mut();
-          crate::selfsend::record_self_send(&mut state.recent_sends, &scratch[..len], when);
-          #[cfg(feature = "stats")]
-          {
-            state.stats.packets_tx(1);
-            state.stats.bytes_tx(len as u64);
-          }
-        }
-        Err(_e) => {
-          debug!(error = %_e, dst = %MDNS_V6_DST, "withdrawal send_to v6 failed");
-          #[cfg(feature = "stats")]
-          inner.state.borrow().stats.send_errors(1);
-        }
-      }
-    }
+    //
+    // Ungated: a TTL=0 goodbye's repeat schedule is the endpoint's
+    // (`note_withdrawal_result`), which already spaces the resends, and holding
+    // one back here would leave a family's peers pinned to positive-TTL records
+    // it has already been promised the retraction of.
+    let (a4, a6) = awaiting_fanout(
+      futures::future::join(
+        attempt_send_to(sock_v4.as_deref(), true, &scratch[..len], MDNS_V4_DST),
+        attempt_send_to(sock_v6.as_deref(), true, &scratch[..len], MDNS_V6_DST),
+      ),
+      "withdrawal",
+    )
+    .await;
+    let outcome = |attempt: &SendAttempt| match attempt {
+      SendAttempt::Unbound => WithdrawalSend::WriteOff,
+      SendAttempt::Answered { result, .. } => present_socket_send_outcome(result),
+      // `Gated` is unreachable: this fan-out passes `may_send == true` for both
+      // families.
+      SendAttempt::Gated => WithdrawalSend::Retry,
+    };
+    let (v4_out, v6_out) = (outcome(&a4), outcome(&a6));
+    note_multicast_attempt(inner, &a4, &scratch[..len], MDNS_V4_DST, "withdrawal");
+    note_multicast_attempt(inner, &a6, &scratch[..len], MDNS_V6_DST, "withdrawal");
     // Count the goodbye as a delivered round when at least one family Sent;
     // `send_to` already bumped packets_tx/bytes_tx/send_errors per family above.
     #[cfg(feature = "stats")]
@@ -1699,6 +2441,7 @@ async fn drain_withdrawals(
   if gcd_any {
     inner.notify.notify();
   }
+  budget_stopped
 }
 
 #[inline]

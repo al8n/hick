@@ -282,6 +282,15 @@ cfg_heap! {
     #[error("service `{0}` already registered")]
     NameAlreadyRegistered(crate::Name),
 
+    /// The record TTL is below [`MIN_SERVICE_TTL_SECS`](crate::constants::MIN_SERVICE_TTL_SECS).
+    ///
+    /// A TTL of 0 is the RFC 6762 §10.1 goodbye encoding — it deletes the record
+    /// from peer caches rather than publishing it — and a TTL of 1 refreshes at
+    /// 0.8 s, inside §8.3's one-second floor on unsolicited responses, so the
+    /// record cannot be kept alive at a legal rate. Carries the rejected TTL.
+    #[error("record TTL {0} s is below the {min} s minimum a service can be advertised at", min = crate::constants::MIN_SERVICE_TTL_SECS)]
+    TtlTooSmall(u32),
+
     /// The internal routing pool is full.
     #[error(transparent)]
     StorageFull(#[from] StorageFullError),

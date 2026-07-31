@@ -160,10 +160,17 @@ where
   /// instead of tracking handles individually with
   /// [`Self::cancel_query`].  Safe to call at any time — queries that
   /// have NOT yet emitted terminal are left untouched.
+  ///
+  /// Carries the same confirm-before-anything obligation as
+  /// [`Self::cancel_query`] for each query it removes. A query that has emitted
+  /// its terminal has stopped producing datagrams, so a compliant driver cannot
+  /// reach this with one outstanding; debug builds assert it per removed query
+  /// rather than assuming.
   pub fn sweep_terminated_queries(&mut self) -> usize {
     let mut to_remove: std::vec::Vec<usize> = std::vec::Vec::new();
     for (key, q) in self.queries.iter() {
       if q.terminal_emitted() {
+        q.assert_no_live_send_confirm("Endpoint::sweep_terminated_queries");
         to_remove.push(key);
       }
     }
@@ -203,16 +210,25 @@ where
     }
   }
 
-  /// Report the send result for the datagram most recently produced by
-  /// [`Self::poll_query_transmit`] for `handle`. `delivered` is
-  /// `true` when at least one socket send succeeded; the query advances its
-  /// retry budget only on a confirmed-delivered send.
-  pub fn note_query_transmit_result(&mut self, handle: QueryHandle, now: I, delivered: bool) {
+  /// Report the delivery outcome of the datagram most recently produced by
+  /// [`Self::poll_query_transmit`] for `handle`.
+  ///
+  /// The query advances its RFC 6762 §5.2 retry budget only on
+  /// [`TransmitDelivery::all_delivered`]; a partially-delivered question climbs
+  /// the §5.2 doubling ladder without spending a slot. See
+  /// [`Query::note_transmit_outcome`] for the full contract. No-op for an
+  /// unknown handle.
+  pub fn note_query_transmit_outcome(
+    &mut self,
+    handle: QueryHandle,
+    now: I,
+    delivery: TransmitDelivery,
+  ) {
     let Some(key) = self.query_key(handle) else {
       return;
     };
     if let Some(q) = self.queries.get_mut(key) {
-      q.note_transmit_result(now, delivered);
+      q.note_transmit_outcome(now, delivery);
     }
   }
 
@@ -264,10 +280,26 @@ where
   ///
   /// Returns [`CancelQueryError::QueryNotFound`] if `handle` does not
   /// correspond to a currently registered query.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_query_transmit`] is
+  /// still awaiting its [`Self::note_query_transmit_outcome`]. Removing the query
+  /// discards the commit token, so the confirm that follows lands on a handle the
+  /// endpoint no longer knows and silently does nothing — while the datagram it
+  /// described may still be on its way out. A driver that cancels from another
+  /// task must FLAG the cancellation and sweep it once the transmit pump has
+  /// confirmed. Debug builds assert this; see [`Query::poll_transmit`] for the
+  /// full contract.
+  ///
+  /// [`Query::poll_transmit`]: crate::query::Query::poll_transmit
   pub fn cancel_query(&mut self, handle: QueryHandle) -> Result<(), CancelQueryError> {
     let key = self
       .query_key(handle)
       .ok_or(CancelQueryError::QueryNotFound(handle))?;
+    if let Some(q) = self.queries.get(key) {
+      q.assert_no_live_send_confirm("Endpoint::cancel_query");
+    }
     // Apply terminal accounting for a live cancel.  If the query has NOT yet
     // reached a terminal state (done=false), this cancel IS the terminal
     // transition, so we must bump `queries_done` AND decrement `queries_active`

@@ -1,7 +1,7 @@
 use alloc::{collections::VecDeque, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use mdns_proto::{Name, ServiceRecords, ServiceSpec};
+use mdns_proto::{Name, ServiceRecords, ServiceSpec, ServiceState};
 use rand::{SeedableRng, rngs::StdRng};
 use smoltcp::time::Instant as RawInstant;
 
@@ -25,6 +25,10 @@ struct MockUdp {
   /// it before each pump to model a transport that fits only one datagram per
   /// cycle; the extra send in a fan-out then reports `Busy`.
   capacity: Option<usize>,
+  /// Every `try_send` call, whether or not it queued. `sent` only records the
+  /// ones that did, so a test that must observe a fan-out ROUND on a failing
+  /// family has to count attempts instead.
+  attempts: usize,
 }
 
 impl UdpIo for MockUdp {
@@ -37,6 +41,7 @@ impl UdpIo for MockUdp {
   }
 
   fn try_send(&mut self, buf: &[u8], dst: SocketAddr) -> Result<(), SendError> {
+    self.attempts += 1;
     if let Some(err) = if dst.is_ipv4() {
       self.v4_fail
     } else {
@@ -54,6 +59,12 @@ impl UdpIo for MockUdp {
     Ok(())
   }
 }
+
+/// The engine shape every test in this module builds: the smoltcp clock and a
+/// seeded RNG, over the crate's fixed slab-backed pools.
+type TestEngine = Engine<SmoltcpInstant, StdRng>;
+/// A log of `(destination, datagram)` pairs a [`MockUdp`] queued.
+type SentLog = Vec<(SocketAddr, Vec<u8>)>;
 
 fn at(micros: i64) -> SmoltcpInstant {
   SmoltcpInstant(RawInstant::from_micros(micros))
@@ -84,8 +95,7 @@ fn spec_for(service_type: &str, instance: &str, host: &str, addr: Ipv4Addr) -> S
 
 #[test]
 fn registering_a_service_emits_a_probe_to_the_mdns_group() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1));
   engine.register_service(sample_spec(), at(0)).unwrap();
 
   let mut io = MockUdp::default();
@@ -106,8 +116,7 @@ fn registering_a_service_emits_a_probe_to_the_mdns_group() {
 
 #[test]
 fn a_goodbye_with_no_socket_on_any_family_writes_off_without_error() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(101));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(101));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -154,11 +163,11 @@ fn build_ptr_query(qname: &Name) -> Vec<u8> {
   buf[..n].to_vec()
 }
 
-/// Announce `sample_spec`, then feed a query from `querier`, pump, and return
-/// the sent log so a caller can assert how the (legacy → unicast) reply fared.
-fn unicast_reply_scenario(seed: u64, v4_fail: Option<SendError>) -> Vec<(SocketAddr, Vec<u8>)> {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(seed));
+/// Announce `sample_spec`, then feed a query from `querier`, pump, and return the
+/// engine plus the sent log so a caller can assert how the (legacy → unicast)
+/// reply fared — on the wire and in the engine's own accounting.
+fn unicast_reply_scenario(seed: u64, v4_fail: Option<SendError>) -> (TestEngine, SentLog) {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(seed));
   engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -184,13 +193,13 @@ fn unicast_reply_scenario(seed: u64, v4_fail: Option<SendError>) -> Vec<(SocketA
   for micros in [5_000_000, 5_250_000, 5_500_000] {
     engine.pump(at(micros), &mut io, &mut scratch);
   }
-  io.sent
+  (engine, io.sent)
 }
 
 #[test]
 fn a_legacy_unicast_query_gets_a_unicast_reply() {
   let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 6000));
-  let sent = unicast_reply_scenario(201, None);
+  let (_, sent) = unicast_reply_scenario(201, None);
   assert!(
     sent.iter().any(|(dst, _)| *dst == querier),
     "expected a unicast reply to the legacy querier; sent = {:?}",
@@ -203,7 +212,7 @@ fn a_unicast_reply_too_large_is_handled_without_panicking() {
   // A permanent TooLarge failure on the one-shot reply: the engine writes it
   // off (real send error) and stays healthy. Nothing reaches the wire.
   let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 6000));
-  let sent = unicast_reply_scenario(202, Some(SendError::TooLarge));
+  let (_, sent) = unicast_reply_scenario(202, Some(SendError::TooLarge));
   assert!(sent.iter().all(|(dst, _)| *dst != querier));
 }
 
@@ -212,14 +221,101 @@ fn a_unicast_reply_busy_is_best_effort_not_fatal() {
   // Busy is transient/not-an-error: the one-shot reply is dropped (the querier
   // re-asks) and the engine stays healthy.
   let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 6000));
-  let sent = unicast_reply_scenario(203, Some(SendError::Busy));
+  let (_, sent) = unicast_reply_scenario(203, Some(SendError::Busy));
   assert!(sent.iter().all(|(dst, _)| *dst != querier));
+}
+
+/// RFC 6762 §6.7: a legacy unicast reply is fanned to exactly ONE link — the
+/// destination's family — so its obligated set has one member and the outcome is
+/// all-delivered or none-delivered by construction, never partial. The core
+/// counts a response iff it was delivered, which is what makes that mapping
+/// observable from outside: a queued reply counts, a rejected one does not.
+#[cfg(feature = "stats")]
+#[test]
+fn a_legacy_unicast_reply_is_confirmed_all_or_none_by_construction() {
+  let (delivered, _) = unicast_reply_scenario(211, None);
+  let (busy, _) = unicast_reply_scenario(212, Some(SendError::Busy));
+  let (too_large, _) = unicast_reply_scenario(213, Some(SendError::TooLarge));
+
+  assert!(
+    delivered.stats().responses_tx > busy.stats().responses_tx,
+    "a queued unicast reply is all-delivered, so it must be counted; \
+     delivered={} busy={}",
+    delivered.stats().responses_tx,
+    busy.stats().responses_tx
+  );
+  assert_eq!(
+    busy.stats().responses_tx,
+    too_large.stats().responses_tx,
+    "neither a busy nor a too-large unicast reply reached its one obligated \
+     link, so both are none-delivered and neither may be counted"
+  );
+}
+
+#[test]
+fn a_legacy_unicast_reply_never_opens_the_reclaim_cancel_gate() {
+  // RFC 6762 §6.7: a legacy unicast reply has exactly ONE obligated link, so it
+  // is all-delivered by construction. That makes it the trap the reclaim-cancel
+  // gate must not fall into — under the old `advertises_instance()` predicate a
+  // single unicast reply, after a v4-only announcement, satisfied the gate and
+  // cancelled a renamed-away name's goodbye that the v6 zone still needed.
+  // The gate is now the core's own all-delivered ANNOUNCEMENT fact, which no
+  // response of any kind can set.
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(205));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp {
+    v6_fail: Some(SendError::Busy),
+    ..Default::default()
+  };
+  let mut scratch = [0u8; 1500];
+
+  // Run to the first (partial) announcement: it exposes the instance records to
+  // v4 — so ownership latches — while v6 has still been told nothing.
+  let mut t = 0i64;
+  for _ in 0..200 {
+    t = pump_to_next_round(&mut engine, &mut io, &mut scratch, t);
+    if engine.services[&handle].proto.advertises_instance() {
+      break;
+    }
+  }
+  assert!(
+    engine.services[&handle].proto.advertises_instance(),
+    "the v4-only announcement must have latched instance ownership"
+  );
+  assert!(
+    !engine.services[&handle].proto.has_fully_announced().get(),
+    "a partially-delivered announcement must NOT open the reclaim-cancel gate"
+  );
+
+  // A legacy querier (source port != 5353) gets a §6.7 UNICAST reply, which is
+  // all-delivered by construction.
+  let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 6000));
+  io.inbound.push_back((
+    build_ptr_query(&Name::try_from_str("_ipp._tcp.local.").unwrap()),
+    RecvMeta {
+      src: querier,
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
+      len: 0,
+    },
+  ));
+  io.sent.clear();
+  engine.pump(at(t + 1_000), &mut io, &mut scratch);
+  assert!(
+    io.sent.iter().any(|(dst, _)| *dst == querier),
+    "the legacy querier must get its unicast reply; sent = {:?}",
+    io.sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
+  );
+  assert!(
+    !engine.services[&handle].proto.has_fully_announced().get(),
+    "an all-delivered UNICAST reply must not open the reclaim-cancel gate — only \
+     a complete announcement that reached every obligated family may"
+  );
 }
 
 #[test]
 fn unregistering_an_announced_service_emits_a_goodbye() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(2));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(2));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
 
   let mut io = MockUdp::default();
@@ -264,8 +360,7 @@ fn pump_schedule() -> [i64; 10] {
 
 #[test]
 fn v6_only_node_advertises_via_multicast_fan_out() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(4));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(4));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp {
     v4_fail: Some(SendError::Unsupported),
@@ -293,8 +388,7 @@ fn v6_only_node_advertises_via_multicast_fan_out() {
 
 #[test]
 fn no_reachable_group_does_not_falsely_advance() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(5));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(5));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   // No socket for either family: every send is unsupported, nothing is queued.
   let mut io = MockUdp {
@@ -329,8 +423,7 @@ fn no_reachable_group_does_not_falsely_advance() {
 /// loop. The proto-level test exercises the spend/re-arm bookkeeping directly.)
 #[test]
 fn goodbye_budget_is_not_consumed_while_transport_is_busy() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(6));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(6));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -404,7 +497,7 @@ fn datagram_kind(bytes: &[u8]) -> Option<bool> {
 #[test]
 fn same_name_replacement_is_rejected_until_withdrawal_completes() {
   let cfg = EndpointConfig::new().with_probe_unique_names(false);
-  let mut engine: Engine<SmoltcpInstant, StdRng> = Engine::new(cfg, StdRng::seed_from_u64(101));
+  let mut engine: TestEngine = Engine::new(cfg, StdRng::seed_from_u64(101));
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
 
@@ -483,8 +576,7 @@ fn same_name_replacement_is_rejected_until_withdrawal_completes() {
 /// otherwise grow `services` without bound under register/unregister churn.
 #[test]
 fn unregister_then_discard_with_unread_update_gc_s_the_slot() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(202));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(202));
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
 
@@ -518,8 +610,7 @@ fn unregister_then_discard_with_unread_update_gc_s_the_slot() {
 
 #[test]
 fn flooded_conflict_updates_are_coalesced_and_bounded() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(7));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(7));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let slot = engine.services.get_mut(&handle).unwrap();
   // A peer flooding HostConflict must coalesce to a single queued update.
@@ -543,58 +634,118 @@ fn flooded_conflict_updates_are_coalesced_and_bounded() {
   );
 }
 
+/// Drive `engine` at a fixed 250 ms cadence for `steps` pumps starting one step
+/// after `from_micros`, draining service updates like a real host loop. Returns
+/// `(established, next_micros)`.
+fn pump_for(
+  engine: &mut TestEngine,
+  io: &mut MockUdp,
+  scratch: &mut [u8],
+  handle: ServiceHandle,
+  from_micros: i64,
+  steps: usize,
+) -> (bool, i64) {
+  let mut t = from_micros;
+  let mut established = false;
+  for _ in 0..steps {
+    t += 250_000;
+    engine.pump(at(t), io, scratch);
+    while let Some(update) = engine.poll_service_update(handle) {
+      established |= matches!(update, ServiceUpdate::Established);
+    }
+  }
+  (established, t)
+}
+
+/// Pump at 250 ms from `from_micros` until ONE more fan-out round reaches the
+/// transport, and return the time it landed. The first §8.1 probe carries a
+/// randomised 0–250 ms delay, so a round is not reliably one pump away.
+fn pump_to_next_round(
+  engine: &mut TestEngine,
+  io: &mut MockUdp,
+  scratch: &mut [u8],
+  from_micros: i64,
+) -> i64 {
+  let attempts_before = io.attempts;
+  let mut t = from_micros;
+  for _ in 0..400 {
+    t += 250_000;
+    engine.pump(at(t), io, scratch);
+    if io.attempts > attempts_before {
+      return t;
+    }
+  }
+  panic!("no fan-out round happened within 100 s");
+}
+
+/// The current proto lifecycle state of a registered service, read through the
+/// driver slot — the phase observable the invariant pair keys on.
+fn service_state(engine: &TestEngine, handle: ServiceHandle) -> ServiceState {
+  engine.services[&handle].proto.state()
+}
+
 #[test]
-fn a_partial_fan_out_confirms_and_latches_goodbye_ownership() {
-  // The proto's confirm-on-send contract is "delivered = at
-  // least one socket send succeeded". A partial multicast fan-out (v4 queues,
-  // v6 BUSY) MUST confirm on v4: it advances the lifecycle AND latches goodbye
-  // ownership for the records v4 put on the wire. Reporting "not delivered" would
-  // instead let the proto consume a one-shot response (or spend a conflict-rename
-  // goodbye) WITHOUT latching, so a later unregister would omit the §10.1
-  // withdrawal and leave v4 peers caching records nothing ever retracts.
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(8));
+fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
+  // The invariant pair, at the driver seam. A partial multicast fan-out (v4
+  // queues, v6 BUSY) reports `PartiallyDelivered`, which means two DIFFERENT
+  // things to the core and must not be folded to one bit:
+  //
+  //   * goodbye ownership LATCHES — v4 peers may now cache the records v4 put on
+  //     the wire, so a later unregister owes them a §10.1 TTL=0 withdrawal;
+  //   * the §8.1/§8.3 phase does NOT advance — v6 has been neither asked nor
+  //     told, and claiming a name on a link that never heard the probe is what
+  //     §8.1 forbids.
+  //
+  // The old boolean confirm had no truthful value here: `true` advanced the
+  // phase on v6's behalf, `false` dropped the ownership of records v4 peers
+  // already hold.
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(8));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp {
     v6_fail: Some(SendError::Busy),
     ..Default::default()
   };
   let mut scratch = [0u8; 1500];
-  // v6 stays busy throughout, yet the service reaches Established carried by v4
-  // alone (a busy family never blocks the reachable one).
-  let mut established = false;
-  for micros in [
-    0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 2_500_000, 3_000_000, 4_000_000,
-  ] {
-    engine.pump(at(micros), &mut io, &mut scratch);
-    while let Some(update) = engine.poll_service_update(handle) {
-      established |= matches!(update, ServiceUpdate::Established);
-    }
-  }
-  assert!(
-    established,
-    "a partial fan-out must confirm on the reachable family, not stall on the \
-       transiently-busy one"
+
+  // Exactly one fan-out round: the first probe. v4 queues it, v6 is busy.
+  let t = pump_to_next_round(&mut engine, &mut io, &mut scratch, 0);
+  assert_eq!(io.sent.len(), 1, "one probe should have reached v4 only");
+  assert_eq!(io.sent[0].0, MDNS_SOCKET_V4, "v4 must carry the probe");
+  assert_eq!(
+    service_state(&engine, handle),
+    ServiceState::Probing(0),
+    "a partial probe must re-arm the SAME probe index — v6 was never asked"
   );
+
+  // Let it climb to the announcements. Every round stays partial, so the phase
+  // only moves when the bounded policy excuses v6 (covered on its own below);
+  // what matters here is that the FIRST partial announcement latches ownership
+  // while the service is still short of Established.
+  let (_, t) = pump_for(&mut engine, &mut io, &mut scratch, handle, t, 40);
   assert!(
     io.sent.iter().all(|(dst, _)| *dst == MDNS_SOCKET_V4),
     "only v4 should carry sends while v6 is busy; got {:?}",
     io.sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
   );
-  // The v4-only announcement latched goodbye ownership, so a graceful
-  // unregister MUST withdraw those records: pump once (v6 still busy) and a
-  // TTL=0 §10.1 goodbye must reach v4 (the records v4 peers cached). If v4 had
-  // never latched ownership, the withdrawal snapshot would be empty and nothing
-  // would go on the wire.
-  engine.unregister_service(handle, at(4_500_000));
+  assert!(
+    engine.services[&handle].proto.advertises_instance(),
+    "a v4-only announcement exposes the instance records to v4 peers, so \
+     goodbye ownership must latch on the PARTIAL round"
+  );
+
+  // Ownership latched ⇒ a graceful unregister actually retracts: a TTL=0 §10.1
+  // goodbye reaches v4 (the peers that cached them). Had the partial round
+  // dropped ownership, the withdrawal snapshot would be empty and the wire
+  // silent.
+  engine.unregister_service(handle, at(t));
   io.sent.clear();
-  engine.pump(at(4_500_001), &mut io, &mut scratch);
+  engine.pump(at(t + 1), &mut io, &mut scratch);
   assert!(
     io.sent
       .iter()
       .any(|(dst, d)| *dst == MDNS_SOCKET_V4 && datagram_kind(d) == Some(true)),
-    "a v4-only advertisement must still latch goodbye ownership, so the \
-       withdrawal emits a TTL=0 goodbye to v4; sent = {:?}",
+    "a partially-delivered advertisement must still latch goodbye ownership, so \
+     the withdrawal emits a TTL=0 goodbye to v4; sent = {:?}",
     io.sent
       .iter()
       .map(|(dst, d)| (*dst, datagram_kind(d)))
@@ -602,15 +753,199 @@ fn a_partial_fan_out_confirms_and_latches_goodbye_ownership() {
   );
   // v6 recovers BEFORE the withdrawal's resend budget is spent → a later
   // goodbye round reaches v6 too (the busy family catches up). Resends are
-  // 250 ms apart; recover v6 and pump the next due round.
+  // 250 ms apart; recover v6 and pump the next due rounds.
   io.v6_fail = None;
   io.sent.clear();
-  for micros in [4_750_001, 5_000_001] {
+  for micros in [t + 250_001, t + 500_001] {
     engine.pump(at(micros), &mut io, &mut scratch);
   }
   assert!(
     io.sent.iter().any(|(dst, _)| *dst == MDNS_SOCKET_V6),
     "the goodbye must reach v6 once it recovers"
+  );
+}
+
+#[test]
+fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
+  // The other half of the pair: when EVERY obligated family queues the datagram,
+  // the same confirm both latches ownership and advances the phase. This is the
+  // healthy dual-stack path, and it must not need the bounded policy to get
+  // there — no family ever misses, so no round is ever partial.
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(81));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+
+  // One round: the first probe reaches BOTH groups, so the probe index advances.
+  let t = pump_to_next_round(&mut engine, &mut io, &mut scratch, 0);
+  assert_eq!(
+    io.sent.len(),
+    2,
+    "a healthy dual-stack fan-out puts the probe on both groups; sent = {:?}",
+    io.sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
+  );
+  assert_eq!(
+    service_state(&engine, handle),
+    ServiceState::Probing(1),
+    "an all-delivered probe advances the §8.1 sequence"
+  );
+
+  // The full §8.1 + §8.3 startup completes with no round ever partial.
+  let (established, _) = pump_for(&mut engine, &mut io, &mut scratch, handle, t, 20);
+  assert!(
+    established,
+    "a fully-delivered dual-stack service must reach Established"
+  );
+  assert!(
+    engine.services[&handle].proto.advertises_instance(),
+    "a delivered announcement latches goodbye ownership"
+  );
+  assert!(
+    engine.services[&handle].proto.has_fully_announced().get(),
+    "an all-delivered announcement is what sets the reclaim-cancel gate"
+  );
+}
+
+#[test]
+fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
+  // Nothing reached any wire: no peer can hold these records and no link has
+  // been asked or told, so a fully-failed round must latch NOTHING and advance
+  // NOTHING — and must not be laundered into an all-delivered confirm by the
+  // bounded policy either (that policy writes off a family that MISSED while
+  // another delivered; here none did).
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(82));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp {
+    v4_fail: Some(SendError::Busy),
+    v6_fail: Some(SendError::Busy),
+    ..Default::default()
+  };
+  let mut scratch = [0u8; 1500];
+
+  // 20 s of all-busy rounds — far past the bounded policy's budget.
+  let (established, t) = pump_for(&mut engine, &mut io, &mut scratch, handle, 0, 80);
+  assert!(
+    io.sent.is_empty(),
+    "nothing may reach a wire while all-busy"
+  );
+  assert!(
+    !established,
+    "a service whose datagrams never leave the host must not reach Established"
+  );
+  assert_eq!(
+    service_state(&engine, handle),
+    ServiceState::Probing(0),
+    "a fully-failed probe re-arms the same index forever — it is not a partial \
+     round, so no obligation may be written off"
+  );
+  assert!(
+    !engine.services[&handle].proto.advertises_instance(),
+    "nothing was exposed, so goodbye ownership must not latch"
+  );
+  // The withdrawal therefore has nothing to retract: it completes with no
+  // datagram on the wire rather than TTL=0-ing records no peer ever saw.
+  engine.unregister_service(handle, at(t));
+  io.v4_fail = None;
+  io.v6_fail = None;
+  io.sent.clear();
+  engine.pump(at(t + 250_000), &mut io, &mut scratch);
+  assert!(
+    io.sent.iter().all(|(_, d)| datagram_kind(d) != Some(true)),
+    "an unexposed service owns nothing, so its withdrawal emits no goodbye; \
+     sent = {:?}",
+    io.sent
+      .iter()
+      .map(|(dst, d)| (*dst, datagram_kind(d)))
+      .collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn the_bounded_partial_policy_fires_instead_of_pinning_the_phase() {
+  // The core's patience bound, observed end to end through THIS transport. A
+  // partial transmit re-arms losslessly and advances nothing, so a family that
+  // never accepts a datagram would hold this service in probing forever if the
+  // core waited indefinitely. It does not: past its bound it advances without
+  // that family, and the service completes its lifecycle on the family it has.
+  // (Round-precision — how many partials are honest before one is excused, and
+  // what the excused round must NOT credit — is asserted in `mdns-proto`, where
+  // the bound lives.)
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(83));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp {
+    v6_fail: Some(SendError::Busy),
+    ..Default::default()
+  };
+  let mut scratch = [0u8; 1500];
+
+  // Within the budget the phase must NOT advance: the first partial probe re-arms
+  // the same probe index, because v6 has not been asked.
+  let t = pump_to_next_round(&mut engine, &mut io, &mut scratch, 0);
+  assert_eq!(
+    service_state(&engine, handle),
+    ServiceState::Probing(0),
+    "the first partial round is within the budget, so the phase must not advance"
+  );
+
+  // End to end: the service reaches Established on v4 alone, and v6 — still
+  // attempted on every round — never carries a byte.
+  // The horizon is ~50 s because every round is partial: the served family's
+  // announcements are spaced on the §8.3 doubling ladder (1, 2, 4, 8, 16 s), which
+  // the excused advances carry across rather than reset.
+  let (established, _) = pump_for(&mut engine, &mut io, &mut scratch, handle, t, 200);
+  assert!(
+    established,
+    "the bound must let the healthy family finish the lifecycle"
+  );
+  assert!(
+    !engine.services[&handle].proto.has_fully_announced().get(),
+    "no announcement ever reached v6, so the excused advances must NOT have \
+     opened the reclaim-cancel gate — an excused advance is not a delivery"
+  );
+  assert!(
+    io.sent.iter().all(|(dst, _)| *dst == MDNS_SOCKET_V4),
+    "the excused family must still send nothing; got {:?}",
+    io.sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn a_recovered_family_resumes_the_obligated_set_on_its_next_send() {
+  // Excusal is per-confirm and never sticky: a family is dropped from the
+  // obligated set only for the round it missed, and the first round it accepts
+  // is all-delivered on its own merit. This is the driver side of the core's
+  // reciprocal guarantee (lossless re-arm, immediate recovery).
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(84));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp {
+    v6_fail: Some(SendError::Busy),
+    ..Default::default()
+  };
+  let mut scratch = [0u8; 1500];
+
+  // Burn partial rounds while v6 is busy, then recover it.
+  let (_, t) = pump_for(&mut engine, &mut io, &mut scratch, handle, 0, 2);
+  assert_eq!(
+    service_state(&engine, handle),
+    ServiceState::Probing(0),
+    "a partial probe re-arms the same index — v6 has not been asked"
+  );
+  io.v6_fail = None;
+  io.sent.clear();
+  let (_, t) = pump_for(&mut engine, &mut io, &mut scratch, handle, t, 2);
+  assert!(
+    io.sent.iter().any(|(dst, _)| *dst == MDNS_SOCKET_V6),
+    "the recovered family must be attempted and must send"
+  );
+  let (established, _) = pump_for(&mut engine, &mut io, &mut scratch, handle, t, 20);
+  assert!(
+    established,
+    "the lifecycle resumes from where it stood once every family delivers"
+  );
+  assert!(
+    engine.services[&handle].proto.has_fully_announced().get(),
+    "the recovered family carries the announcements on their own merit, so the \
+     all-delivered credit an excused round never earns is earned here"
   );
 }
 
@@ -665,14 +1000,16 @@ fn a_constrained_transport_does_not_starve_either_family() {
   // probes/announcements. The fan-out instead prioritises the family that has
   // been waiting longest (family_order), so both groups make progress and the
   // alternating success keeps either family from degrading.
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(22));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(22));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
   let mut established = false;
   let mut t = 0i64;
-  for _ in 0..40 {
+  // ~50 s: one slot per cycle makes EVERY fan-out partial, so the served family's
+  // announcements walk the §8.3 doubling ladder (1, 2, 4, 8, 16 s) that the
+  // core's excused advances carry across rather than reset.
+  for _ in 0..200 {
     t += 250_000;
     // One datagram of TX room this cycle: the SECOND family in any fan-out is
     // busy, so only a fair order lets both groups eventually transmit.
@@ -695,6 +1032,94 @@ fn a_constrained_transport_does_not_starve_either_family() {
   );
 }
 
+/// The defect per-family delivery exists to remove, measured on the wire.
+///
+/// `family_order` deliberately hands the one free slot of a constrained transport
+/// to the longest-blocked family, so under capacity one the families ALTERNATE:
+/// every round carries a real datagram, every round is globally partial, and each
+/// family is refreshed only every OTHER round. An aggregate confirm cannot see
+/// that, so the core re-armed per ROUND and each family's own gap came out at
+/// twice the periodic interval — beyond the TTL that interval is 80 % of. Records
+/// expired cyclically on BOTH families while every per-round invariant still held.
+///
+/// This walks the announcement stream per family and asserts each family's OWN
+/// gap stays inside its periodic refresh interval. Both TTLs matter: 10 s is
+/// short enough that the ladder's cap binds and the whole schedule is the cap,
+/// while 120 s (the conventional A/SRV TTL) is where the uncapped ladder reached
+/// 64 s and the per-family gap reached 128 s — over the TTL.
+#[test]
+fn a_constrained_transport_refreshes_every_family_within_its_ttl() {
+  for ttl_secs in [10u32, 120] {
+    // The core's own periodic cadence: 80 % of the TTL, floored at RFC 6762
+    // §8.3's one second. A family may not go longer than this without an
+    // announcement, plus the one §8.3-floored round it takes to serve the other
+    // family (the `max(R, 2 × ANNOUNCE_INTERVAL)` bound).
+    let refresh_us = i64::from(ttl_secs).saturating_mul(800_000).max(1_000_000);
+    let bound_us = refresh_us.max(2_000_000);
+
+    let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(77));
+    let spec = {
+      let mut records = ServiceRecords::new(
+        Name::try_from_str("_ipp._tcp.local.").unwrap(),
+        Name::try_from_str("Constrained._ipp._tcp.local.").unwrap(),
+        Name::try_from_str("constrained.local.").unwrap(),
+        631,
+        ttl_secs,
+      );
+      records.add_a(Ipv4Addr::new(192, 168, 1, 10));
+      ServiceSpec::new(records)
+    };
+    engine.register_service(spec, at(0)).unwrap();
+    let mut io = MockUdp::default();
+    let mut scratch = [0u8; 1500];
+
+    // When each family last had a positive-TTL announcement put on its wire.
+    let mut last: [Option<i64>; 2] = [None, None];
+    let mut worst: [i64; 2] = [0, 0];
+    let mut announced: [usize; 2] = [0, 0];
+
+    let mut t = 0i64;
+    // Long enough for several refresh intervals at either TTL, sampled finely
+    // enough that a 1 s deadline is never overshot.
+    while t < 20 * refresh_us {
+      t += 250_000;
+      io.capacity = Some(1);
+      io.sent.clear();
+      engine.pump(at(t), &mut io, &mut scratch);
+      for (dst, data) in &io.sent {
+        // Positive-TTL answers only: probes carry none and a §10.1 goodbye is a
+        // withdrawal, not a refresh.
+        if datagram_kind(data) != Some(false) {
+          continue;
+        }
+        let idx = usize::from(*dst == MDNS_SOCKET_V6);
+        if let Some(prev) = last[idx] {
+          worst[idx] = worst[idx].max(t - prev);
+        }
+        last[idx] = Some(t);
+        announced[idx] += 1;
+      }
+    }
+
+    assert!(
+      announced[0] > 1 && announced[1] > 1,
+      "TTL {ttl_secs}: the fair fan-out must reach BOTH families repeatedly, or \
+       the gap measurement below means nothing; v4={} v6={}",
+      announced[0],
+      announced[1]
+    );
+    for (idx, family) in ["v4", "v6"].iter().enumerate() {
+      assert!(
+        worst[idx] <= bound_us,
+        "TTL {ttl_secs}: {family} went {} us between announcements, past its own \
+         {bound_us} us refresh bound — its records expire from every peer cache \
+         on that link while the other family is being served",
+        worst[idx]
+      );
+    }
+  }
+}
+
 /// A one-datagram-per-cycle (capacity-1) transport must still complete the
 /// endpoint-owned withdrawal: each goodbye round fans out, and even though only
 /// one family queues per pump the withdrawal is driven to completion across
@@ -711,8 +1136,7 @@ fn a_constrained_transport_does_not_starve_either_family() {
 /// gone. The endpoint holds exactly one in-flight withdrawal per route.)
 #[test]
 fn a_constrained_transport_drains_a_withdrawal_after_each_family_gets_a_round() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(23));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(23));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -765,8 +1189,7 @@ fn default_setup_processes_rx_without_hop_limit_or_subnets() {
   // conflict with the real supplied-transport metadata shape (hop_limit None) and NO
   // set_local_subnets; it must be PROCESSED (the service renames), not silently
   // dropped. The rename is the observable that the conflict reached the proto.
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(47));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(47));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -815,8 +1238,7 @@ fn default_setup_rejects_off_link_unicast() {
   // The SAME conflict that renames over multicast (above) must be ignored when its
   // destination is the device's own unicast address and no hop-limit/subnets vouch
   // for it.
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(59));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(59));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -863,8 +1285,7 @@ fn default_setup_rejects_off_link_unicast() {
 /// the terminal.
 #[test]
 fn proto_emitted_host_conflict_retires_and_gcs_the_smoltcp_service() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(83));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(83));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -950,8 +1371,7 @@ fn rx_drain_is_capped_per_pump_with_immediate_repump() {
   // before drain_service_updates coalesces/caps it. One pump processes at most the
   // cap and, because datagrams remain buffered, asks for an immediate re-pump
   // (deadline = now) so a genuine backlog still drains promptly.
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(53));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(53));
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
   let pkt = build_conflict_srv_authority("Whatever._ipp._tcp.local.");
@@ -1001,8 +1421,7 @@ fn an_oversized_service_is_not_advertised_so_it_is_never_unwithdrawable() {
   // pump scratch is larger — so the engine can never latch goodbye ownership for
   // records it could not later withdraw (which would leave peers caching them
   // until TTL).
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(30));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(30));
   let mut records = ServiceRecords::new(
     Name::try_from_str("_ipp._tcp.local.").unwrap(),
     Name::try_from_str("Huge._ipp._tcp.local.").unwrap(),
@@ -1054,8 +1473,7 @@ fn an_oversized_service_is_not_advertised_so_it_is_never_unwithdrawable() {
 
 #[test]
 fn permanently_failing_family_does_not_stall_the_healthy_one() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(15));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(15));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   // v6 is permanently busy (e.g. an unbound v6 socket mapped to Busy). It must
   // never block the healthy family: v4 confirms on its own (delivered = at least
@@ -1067,7 +1485,10 @@ fn permanently_failing_family_does_not_stall_the_healthy_one() {
   let mut scratch = [0u8; 1500];
   let mut established = false;
   let mut t = 0;
-  for _ in 0..80 {
+  // ~50 s: every round is partial, so the healthy family's announcements walk the
+  // §8.3 doubling ladder (1, 2, 4, 8, 16 s) that the core's excused advances carry
+  // across rather than reset.
+  for _ in 0..200 {
     t += 250_000;
     engine.pump(at(t), &mut io, &mut scratch);
     while let Some(update) = engine.poll_service_update(handle) {
@@ -1087,8 +1508,7 @@ fn permanently_failing_family_does_not_stall_the_healthy_one() {
 
 #[test]
 fn own_multicast_loopback_is_not_treated_as_conflict() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(9));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(9));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -1128,8 +1548,7 @@ fn own_multicast_loopback_is_not_treated_as_conflict() {
 
 #[test]
 fn actionable_updates_survive_conflict_flood() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(10));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(10));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let slot = engine.services.get_mut(&handle).unwrap();
   // An actionable transition queued first...
@@ -1160,8 +1579,7 @@ fn actionable_updates_survive_conflict_flood() {
 /// the ceiling/age bookkeeping now lives in the endpoint.)
 #[test]
 fn busy_goodbye_is_held_then_force_completed_at_the_ceiling() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(11));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(11));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -1199,8 +1617,7 @@ fn busy_goodbye_is_held_then_force_completed_at_the_ceiling() {
 
 #[test]
 fn loopback_detected_across_a_large_send_burst() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(14));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(14));
   // Register many services so one pump emits a burst of probes far larger than
   // any small fixed ring would hold.
   let mut handles = Vec::new();
@@ -1258,23 +1675,97 @@ fn loopback_detected_across_a_large_send_burst() {
   );
 }
 
+/// The per-family wire gate holds each datagram kind to ITS OWN minimum, and a
+/// deferred family is reported `Missed` — obligated, and it did not carry it.
+///
+/// The value is kind-dependent, which is exactly why the driver may not pick it:
+/// hardcoding RFC 6762 §6's one second would stretch the §8.1 probe sequence
+/// fourfold, and hardcoding 250 ms would breach §6 on every announcement. The
+/// minimum arrives on the `Transmit`; only the WHEN is the driver's.
 #[test]
-fn send_multicast_confirms_when_any_family_queues() {
-  // Pin the proto's confirm-on-send contract directly at the fan-out: confirm
-  // iff at least one socket send succeeded — NOT only when every family did. A
-  // partial fan-out that reported "not delivered" would let the proto consume a
-  // one-shot response (or spend a conflict-rename goodbye) without latching the
-  // records the reachable family already put on the wire.
+fn the_wire_gate_defers_a_family_inside_its_kinds_minimum() {
+  /// §6 / §8.3: one second between two multicasts of a record on one interface.
+  const ANNOUNCE_GAP: Duration = Duration::from_secs(1);
+  /// §8.1: probes are exempt from that rule and carry their own spacing.
+  const PROBE_GAP: Duration = Duration::from_millis(250);
+
   let mut tx = Multicaster::<SmoltcpInstant>::new();
-  // v4 queues, v6 busy: at least one socket succeeded, so Delivered.
+  let mut io = MockUdp::default();
+  let mut gate = FamilyWireGate::new();
+
+  let (_, first) = tx.send_multicast(&mut io, b"announcement", at(0), &mut gate, ANNOUNCE_GAP);
+  assert!(
+    first.v4.is_sent() && first.v6.is_sent(),
+    "a producer that has sent nothing owes no gap on either family"
+  );
+
+  // 850 ms later — inside §6's floor for the records this datagram carries.
+  let (outcome, early) = tx.send_multicast(
+    &mut io,
+    b"announcement",
+    at(850_000),
+    &mut gate,
+    ANNOUNCE_GAP,
+  );
+  assert!(
+    !early.any_sent(),
+    "neither family may re-multicast the same records inside one second of its      own last copy"
+  );
+  assert!(
+    matches!(
+      outcome,
+      MulticastOutcome::Confirm(d) if d.v4() == FamilyDelivery::Missed
+        && d.v6() == FamilyDelivery::Missed
+    ),
+    "a deferred family is a MISS, never `Unobligated` — its socket is there and      the datagram was fanned onto it, so hiding the deferral would let the phase      advance without it"
+  );
+
+  // A probe at the very same instant is fine: §8.1 exempts it.
+  let (_, probe) = tx.send_multicast(&mut io, b"probe", at(850_000), &mut gate, PROBE_GAP);
+  assert!(
+    probe.v4.is_sent() && probe.v6.is_sent(),
+    "§8.1 spaces probes 250 ms apart and exempts them from the one-second rule"
+  );
+
+  // A one-shot reply is ungated, and leaves the announcement clock alone.
+  let mut ungated = FamilyWireGate::new();
+  let (_, reply) = tx.send_multicast(&mut io, b"reply", at(900_000), &mut ungated, Duration::ZERO);
+  assert!(reply.any_sent(), "a one-shot reply is never gated");
+  assert!(
+    ungated.open(0, at(900_000), ANNOUNCE_GAP),
+    "…and does not start the clock on the announcement that follows it"
+  );
+}
+
+#[test]
+fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
+  // Pin the projection every confirm downstream depends on: the obligated set is
+  // the families that HAVE a socket, delivery is `Sent` and nothing else, and an
+  // empty obligated set is none-delivered rather than a vacuous "all".
+  let mut tx = Multicaster::<SmoltcpInstant>::new();
+
+  // v4 queues, v6 transiently busy → PARTIAL. v6 has a socket, so it is
+  // obligated and did not carry the datagram; folding this to "delivered" is
+  // exactly what over-advanced the §8.1/§8.3 phase on a family that heard nothing.
   let mut partial = MockUdp {
     v6_fail: Some(SendError::Busy),
     ..Default::default()
   };
-  let (outcome, fanout) = tx.send_multicast(&mut partial, b"a-multicast-datagram", at(0));
+  let (outcome, fanout) = tx.send_multicast(
+    &mut partial,
+    b"a-multicast-datagram",
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
   assert!(
-    matches!(outcome, MulticastOutcome::Delivered),
-    "v4 queued + v6 transiently busy must confirm (>= 1 socket succeeded)"
+    matches!(
+      outcome,
+      MulticastOutcome::Confirm(d) if d.v4() == FamilyDelivery::Delivered
+        && d.v6() == FamilyDelivery::Missed
+    ),
+    "v4 queued + v6 obligated-but-busy is a partial fan-out, and WHICH family \
+     missed reaches the core"
   );
   assert_eq!(
     fanout.sent_count(),
@@ -1286,24 +1777,75 @@ fn send_multicast_confirms_when_any_family_queues() {
     "v4 must have sent"
   );
   assert!(matches!(fanout.v6, FamilySend::Busy), "v6 must be Busy");
-  // Both families busy: nothing reached the link, so it must NOT confirm — the
-  // proto then re-offers a probe/announce and latches nothing for a response
-  // that never left the host. A transiently-busy family means Retry, not retire.
+
+  // v4 queues, v6 has NO socket → ALL delivered. An absent family was never
+  // obligated, so a single-stack node advances its lifecycle at full speed.
+  let mut single_stack = MockUdp {
+    v6_fail: Some(SendError::Unsupported),
+    ..Default::default()
+  };
+  let (outcome_single, _) = tx.send_multicast(
+    &mut single_stack,
+    b"a-multicast-datagram",
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
+  assert!(
+    matches!(
+      outcome_single,
+      MulticastOutcome::Confirm(d) if d.all_delivered()
+        && d.v6() == FamilyDelivery::Unobligated
+    ),
+    "a family with no socket is not obligated, so a v4-only node is all-delivered \
+     — and it must reach the core as UNOBLIGATED, not as a miss, or the core \
+     would chase a family this node does not have"
+  );
+
+  // Both families busy: nothing reached a wire, so nothing may latch or advance —
+  // the proto re-offers on its own schedule. A transiently-busy family is a
+  // none-delivered confirm, never a retirement.
   let mut all_busy = MockUdp {
     v4_fail: Some(SendError::Busy),
     v6_fail: Some(SendError::Busy),
     ..Default::default()
   };
-  let (outcome_busy, fanout_busy) =
-    tx.send_multicast(&mut all_busy, b"a-multicast-datagram", at(0));
+  let (outcome_busy, fanout_busy) = tx.send_multicast(
+    &mut all_busy,
+    b"a-multicast-datagram",
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
   assert!(
-    matches!(outcome_busy, MulticastOutcome::Retry),
-    "both families busy: nothing on the link, so retry rather than confirm or retire"
+    matches!(outcome_busy, MulticastOutcome::Confirm(d) if !d.any_delivered()),
+    "both families busy: nothing on the wire, so none-delivered rather than retire"
   );
   assert_eq!(
     fanout_busy.sent_count(),
     0,
     "both families busy: no datagrams on the wire"
+  );
+
+  // No socket on either family — an EMPTY obligated set. It must report
+  // none-delivered, never a vacuous "all" that would advance a phase no link
+  // ever heard.
+  let mut no_transport = MockUdp {
+    v4_fail: Some(SendError::Unsupported),
+    v6_fail: Some(SendError::Unsupported),
+    ..Default::default()
+  };
+  let (outcome_none, _) = tx.send_multicast(
+    &mut no_transport,
+    b"a-multicast-datagram",
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
+  assert!(
+    matches!(outcome_none, MulticastOutcome::Confirm(d)
+      if !d.any_delivered() && !d.all_delivered()),
+    "an empty obligated set is none-delivered, never a vacuous all-delivered"
   );
 }
 
@@ -1313,8 +1855,7 @@ fn a_permanently_too_large_send_retires_the_service() {
   // embassy PacketTooLarge — a TX buffer too small for a legal ≤§17 packet) must
   // NOT be retried forever. The service is retired with an actionable Conflict
   // update instead of probing/announcing indefinitely with nothing on the wire.
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(31));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(31));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp {
     v4_fail: Some(SendError::TooLarge),
@@ -1351,8 +1892,7 @@ fn a_too_large_family_does_not_retire_while_the_other_may_recover() {
   // family is recoverable. A permanently-TooLarge family alongside a transiently
   // Busy one must NOT retire it — the busy family may yet recover and carry the
   // datagram (embassy maps NoRoute / SocketNotBound to Busy, and those clear).
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(33));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(33));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp {
     v4_fail: Some(SendError::TooLarge), // permanent on v4
@@ -1383,9 +1923,12 @@ fn a_too_large_family_does_not_retire_while_the_other_may_recover() {
     "cannot advertise while v6 is busy and v4 is permanently too large"
   );
   // v6 recovers → the service advertises on it and reaches Established, proving
-  // it was never wrongly retired.
+  // it was never wrongly retired. Every round stays PARTIAL (v4 is permanently
+  // TooLarge, so it is obligated and never delivers), so each phase step waits
+  // out the core's patience bound plus its §8.3 partial ladder — hence the long
+  // tail here.
   io.v6_fail = None;
-  for ms in 41..=64i64 {
+  for ms in 41..=200i64 {
     engine.pump(at(ms * 250_000), &mut io, &mut scratch);
     while let Some(u) = engine.poll_service_update(handle) {
       established |= matches!(u, ServiceUpdate::Established);
@@ -1406,8 +1949,7 @@ fn established_is_observable_on_the_pump_that_confirms_it() {
   // of a TTL. Assert it is surfaced on the SAME pump that confirms it: poll right
   // after each pump and break as soon as the lifecycle settles into the distant
   // re-announce deadline — at which point Established must already be visible.
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(32));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(32));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -1505,8 +2047,7 @@ fn a_query_that_can_never_send_surfaces_a_terminal_update() {
   // a query whose question is permanently too large for every reachable
   // family is retired — and must surface a terminal QueryUpdate so the caller
   // learns it died, instead of waiting forever for a result it can never request.
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(42));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(42));
   let q = engine
     .start_query(
       QuerySpec::new(
@@ -1645,8 +2186,7 @@ fn a_retired_query_freezes_answers_and_emits_no_second_terminal() {
 #[cfg(feature = "stats")]
 #[test]
 fn stats_withdrawal_dual_stack_counts_rounds_and_per_family_datagrams() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1005));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1005));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -1714,8 +2254,7 @@ fn stats_withdrawal_dual_stack_counts_rounds_and_per_family_datagrams() {
 #[cfg(feature = "stats")]
 #[test]
 fn stats_withdrawal_v6_busy_until_recovery_not_freed_before_v6_sends() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(2006));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(2006));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
@@ -1784,8 +2323,7 @@ fn stats_withdrawal_v6_busy_until_recovery_not_freed_before_v6_sends() {
 #[cfg(feature = "stats")]
 #[test]
 fn stats_goodbye_both_families_failed_no_goodbyes_tx() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1004));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1004));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   // Both families healthy during announce so records are owned (the withdrawal
   // snapshot is non-empty, so a goodbye send is attempted).
@@ -1841,8 +2379,7 @@ fn stats_goodbye_both_families_failed_no_goodbyes_tx() {
 #[cfg(feature = "stats")]
 #[test]
 fn stats_multicast_tx_partial_failure_counted_per_family() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1006));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(1006));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   // v4 succeeds, v6 is permanently TooLarge (Failed in FamilySend terms).
   let mut io = MockUdp {
@@ -1901,11 +2438,22 @@ fn stats_multicast_sent_plus_failed_send_errors_exact() {
     ..Default::default()
   };
   let data = b"probe-datagram";
-  let (outcome, fanout) = tx.send_multicast(&mut io, data, at(0));
+  let (outcome, fanout) = tx.send_multicast(
+    &mut io,
+    data,
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
 
   assert!(
-    matches!(outcome, MulticastOutcome::Delivered),
-    "v4 Sent + v6 TooLarge must yield Delivered"
+    matches!(
+      outcome,
+      MulticastOutcome::Confirm(d) if d.v4() == FamilyDelivery::Delivered
+        && d.v6() == FamilyDelivery::Missed
+    ),
+    "v4 Sent + v6 TooLarge: v6 has a socket and rejected the datagram, so it is \
+     obligated-and-undelivered — a partial fan-out, not a whole one"
   );
   assert_eq!(
     fanout.failed_count(),
@@ -1940,12 +2488,19 @@ fn stats_multicast_failed_plus_busy_send_errors_exact() {
     ..Default::default()
   };
   let data = b"probe-datagram";
-  let (outcome, fanout) = tx.send_multicast(&mut io, data, at(0));
+  let (outcome, fanout) = tx.send_multicast(
+    &mut io,
+    data,
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
 
-  // v4 Failed + v6 Busy: nothing sent → not Delivered; v6 Busy → Retry
+  // v4 Failed + v6 Busy: nothing reached a wire, and the busy family may yet
+  // recover — so this confirms as none-delivered rather than retiring anything.
   assert!(
-    matches!(outcome, MulticastOutcome::Retry),
-    "v4 Failed + v6 Busy must yield Retry (v6 Busy keeps things alive)"
+    matches!(outcome, MulticastOutcome::Confirm(d) if !d.any_delivered()),
+    "v4 Failed + v6 Busy must confirm none-delivered (v6 Busy keeps things alive)"
   );
   assert_eq!(
     fanout.failed_count(),
@@ -1977,8 +2532,7 @@ fn stats_unicast_busy_does_not_increment_send_errors() {
   //
   // Build an engine, register a service so it can respond, then inject a
   // unicast-expecting query and have the send return Busy.
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(2001));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(2001));
   let _handle = engine.register_service(sample_spec(), at(0)).unwrap();
 
   // Use a MockUdp where every send returns Busy so ANY send path will fail.
@@ -2076,8 +2630,7 @@ fn stats_unicast_unsupported_does_not_increment_send_errors() {
 #[cfg(feature = "stats")]
 #[test]
 fn stats_off_link_datagram_counts_rx_bytes_and_dropped() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(9001));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(9001));
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
 
@@ -2129,8 +2682,7 @@ fn stats_off_link_datagram_counts_rx_bytes_and_dropped() {
 fn stats_oversized_zero_len_marker_counts_rx_and_dropped() {
   use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(42));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(42));
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
 
@@ -2179,8 +2731,7 @@ fn stats_oversized_zero_len_marker_counts_rx_and_dropped() {
 #[cfg(feature = "stats")]
 #[test]
 fn encode_failure_retirement_frees_proto_route_and_decrements_services_active() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(99));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(99));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
 
   // Verify services_active is 1 after registration.
@@ -2264,8 +2815,7 @@ fn encode_failure_retirement_frees_proto_route_and_decrements_services_active() 
 #[cfg(feature = "stats")]
 #[test]
 fn multi_service_encode_failure_frees_route_even_with_sibling_transmit() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(200));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(200));
 
   // Register two services that will both encode-fail once we switch to the
   // 1-byte scratch (simulates the ordering bypass: both in the map, one
@@ -2378,8 +2928,7 @@ fn multi_service_encode_failure_frees_route_even_with_sibling_transmit() {
 #[cfg(feature = "stats")]
 #[test]
 fn send_too_large_retirement_frees_proto_route_and_decrements_services_active() {
-  let mut engine: Engine<SmoltcpInstant, StdRng> =
-    Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(100));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(100));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
 
   assert_eq!(
@@ -2427,5 +2976,126 @@ fn send_too_large_retirement_frees_proto_route_and_decrements_services_active() 
     engine.stats().services_active,
     1,
     "services_active must be 1 again after re-registration"
+  );
+}
+
+// ── The obligation tag (`TransmitObligation`) at the driver seam ────────────
+
+/// Deliver `data` to the engine as an on-link datagram from `src` addressed to
+/// the IPv4 mDNS group.
+fn inbound_from(src: SocketAddr, data: Vec<u8>) -> (Vec<u8>, RecvMeta) {
+  (
+    data,
+    RecvMeta {
+      src,
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
+      len: 0,
+    },
+  )
+}
+
+/// A datagram no reachable socket can carry retires its producer, so that a
+/// service does not probe/announce forever with nothing on the wire. That
+/// reasoning holds ONLY for a datagram the core RE-OFFERS.
+///
+/// A response is `TransmitObligation::OneShot`: the core emits it once for the
+/// question that provoked it and never re-arms it, so an undeliverable one costs
+/// exactly one unanswered question — the querier re-asks. Retiring on it would
+/// hand any on-link peer a remote kill switch: ask an established service a
+/// question whose answer does not fit the TX buffer and the service is marked
+/// errored, surfaces `Conflict`, and begins withdrawing.
+#[test]
+fn an_undeliverable_one_shot_reply_must_not_retire_the_service() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(91));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+
+  // Healthy startup: the service reaches Established on both families.
+  let (established, mut t) = pump_for(&mut engine, &mut io, &mut scratch, handle, 0, 40);
+  assert!(
+    established,
+    "the service must be established before the attack"
+  );
+
+  // Now every socket rejects every datagram as permanently too large, and a peer
+  // asks a question. The only transmit due is the §6 multicast reply — the
+  // periodic re-announce is ~80 % of a 120 s TTL away.
+  io.v4_fail = Some(SendError::TooLarge);
+  io.v6_fail = Some(SendError::TooLarge);
+  let querier = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 5353));
+  let qname = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  t += 100_000;
+  io.inbound
+    .push_back(inbound_from(querier, build_ptr_query(&qname)));
+  engine.pump(at(t), &mut io, &mut scratch); // arms the §6 20–120 ms jitter
+  t += 200_000;
+  engine.pump(at(t), &mut io, &mut scratch); // fires the reply — undeliverable
+
+  let mut conflict = false;
+  while let Some(u) = engine.poll_service_update(handle) {
+    conflict |= matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict);
+  }
+  assert!(
+    !conflict,
+    "an unanswerable question must not tear down a healthy service"
+  );
+  assert!(
+    engine.services.contains_key(&handle),
+    "the service must still be registered"
+  );
+  assert!(
+    !engine.services[&handle].errored,
+    "the service must still be pumped — a one-shot reply is best-effort"
+  );
+  assert_eq!(
+    service_state(&engine, handle),
+    ServiceState::Established,
+    "the lifecycle is untouched: the undeliverable reply clears its commit token \
+     with nothing latched and nothing advanced"
+  );
+}
+
+/// The precision the previous test must not cost: an undeliverable SUSTAINED
+/// datagram still retires its producer. A query is always `Sustained`, so a
+/// question too large for every reachable socket must still terminate the query
+/// rather than re-offer it forever.
+#[test]
+fn an_undeliverable_sustained_datagram_still_retires_its_producer() {
+  use mdns_proto::{QuerySpec, wire::ResourceType};
+
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(92));
+  let mut io = MockUdp {
+    v4_fail: Some(SendError::TooLarge),
+    v6_fail: Some(SendError::TooLarge),
+    ..Default::default()
+  };
+  let mut scratch = [0u8; 1500];
+  let qname = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let q = engine
+    .start_query(QuerySpec::new(qname, ResourceType::Ptr), at(0))
+    .unwrap();
+
+  let mut terminal = false;
+  let mut t = 0i64;
+  for _ in 0..20 {
+    engine.pump(at(t), &mut io, &mut scratch);
+    while let Some(u) = engine.poll_query_update(q) {
+      terminal |= matches!(u, QueryUpdate::Timeout | QueryUpdate::Done);
+    }
+    if terminal {
+      break;
+    }
+    t += 250_000;
+  }
+  assert!(
+    terminal,
+    "a question that can never be sent must retire the query, not re-offer it \
+     forever"
+  );
+  assert!(
+    io.sent.is_empty(),
+    "nothing may reach a wire when every send is permanently too large"
   );
 }

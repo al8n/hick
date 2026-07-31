@@ -578,6 +578,20 @@ impl EmittedRecords {
     }
   }
 
+  /// OR another report's INSTANCE records (PTR/SRV/TXT/subtypes) into this one.
+  ///
+  /// Ownership is a union of what reached the wire, so merging two reports for
+  /// the SAME name is the same operation the goodbye latch performs. Host
+  /// addresses are deliberately not merged: the only caller is the RFC 6763 §9
+  /// rename handoff, which withdraws instance records exclusively (the host name
+  /// is invariant across an instance rename).
+  pub(crate) fn merge_instance(&mut self, other: &Self) {
+    self.ptr |= other.ptr;
+    self.srv |= other.srv;
+    self.txt |= other.txt;
+    self.subtypes |= other.subtypes;
+  }
+
   /// Whether the instance PTR was emitted.
   #[inline(always)]
   pub(crate) const fn ptr(&self) -> bool {

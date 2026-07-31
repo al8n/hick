@@ -63,6 +63,19 @@ fn recv_from(socket: &mut udp::Socket<'_>, buf: &mut [u8]) -> Option<RecvMeta> {
 /// payload larger than the TX buffer to [`SendError::TooLarge`] (permanent, so the
 /// engine retires the producer rather than retrying) versus a momentarily
 /// full queue to [`SendError::Busy`] (transient).
+///
+/// smoltcp's `Unaddressable` is ALSO [`SendError::Busy`], never
+/// [`SendError::Unsupported`]. `Unsupported` means the family has no socket at
+/// all and so was never obligated, which is why the engine excludes it from the
+/// obligated set; but this socket demonstrably exists — smoltcp raises
+/// `Unaddressable` when the socket's own local port is still zero (unbound) or
+/// when the destination endpoint is unspecified. Reporting it as an absent family
+/// would make a bound-v4 + present-but-unbound-v6 fan-out project to
+/// `AllDelivered`, advancing RFC 6762 §8.1 probing as though IPv6 did not exist.
+/// `Busy` keeps the family obligated and not-delivered, so the fan-out projects to
+/// `PartiallyDelivered` and the phase waits — and it is retried, which is right
+/// for a binding that may still complete. This matches `hick-embassy`, which maps
+/// embassy-net's `SocketNotBound` / `NoRoute` the same way.
 fn send_from(socket: &mut udp::Socket<'_>, buf: &[u8], dst: SocketAddr) -> Result<(), SendError> {
   if buf.len() > socket.payload_send_capacity() {
     return Err(SendError::TooLarge);
@@ -84,7 +97,7 @@ fn send_from(socket: &mut udp::Socket<'_>, buf: &[u8], dst: SocketAddr) -> Resul
   match socket.send_slice(buf, IpEndpoint::from(dst)) {
     Ok(()) => Ok(()),
     Err(udp::SendError::BufferFull) => Err(SendError::Busy),
-    Err(udp::SendError::Unaddressable) => Err(SendError::Unsupported),
+    Err(udp::SendError::Unaddressable) => Err(SendError::Busy),
   }
 }
 

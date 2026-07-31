@@ -94,14 +94,14 @@ pub mod wire;
 
 /// Event types between Endpoint, Service, and Query.
 pub mod event;
-/// Outgoing-datagram descriptor.
+/// Outgoing-datagram descriptor and its delivery outcome.
 pub mod transmit;
 
 pub use event::{
   EndpointEvent, HostConflict, KnownAnswer, ProbeConflict, QueryEvent, QueryUpdate, RouteEvent,
   ServiceEvent, ServiceQuestion, ToQuery, ToService,
 };
-pub use transmit::Transmit;
+pub use transmit::{FamilyDelivery, Transmit, TransmitDelivery, TransmitObligation};
 
 cfg_heap! {
   pub use event::{ServiceRenamed, ServiceUpdate};
@@ -138,7 +138,7 @@ pub mod service;
 pub use service::ServiceState;
 
 cfg_heap! {
-  pub use service::Service;
+  pub use service::{FullyAnnounced, Service};
 
   /// Query state machine.
   pub mod query;

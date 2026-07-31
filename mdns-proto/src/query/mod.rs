@@ -7,7 +7,8 @@ use crate::{
   backend::RdataBuf,
   error::{HandleTimeoutError, TransmitError},
   event::{QueryEvent, QueryUpdate},
-  transmit::Transmit,
+  service::{FamilyPatience, PhaseAdvance, classify_advance},
+  transmit::{Transmit, TransmitObligation, TransmitDelivery},
   wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
 };
 
@@ -110,6 +111,11 @@ impl CollectedAnswer {
 }
 
 /// Query state machine. One per outstanding query.
+///
+/// Driving one means confirming each datagram [`Query::poll_transmit`] hands out
+/// — via [`Query::note_transmit_outcome`] — before invoking any other
+/// state-mutating entry point on this query. [`Query::poll_transmit`] documents
+/// that contract in full.
 pub struct Query<I, AN, EV> {
   handle: QueryHandle,
   #[cfg(feature = "stats")]
@@ -146,18 +152,46 @@ pub struct Query<I, AN, EV> {
   /// sending the same query continuously instead of honoring the backoff.
   transmit_pending: bool,
   /// set by `poll_transmit` for the datagram it just produced, and
-  /// cleared by `note_transmit_result` once the driver reports the send result.
+  /// cleared by `note_transmit_outcome` once the driver reports the send result.
   /// The retry budget (`retry_count`) and the next-retry deadline are advanced
   /// ONLY on a confirmed-delivered send — a datagram that fails on every socket
   /// is re-attempted without consuming the budget, so a transient send failure
   /// can never time out a query that never actually put a question on the wire.
   awaiting_send_confirm: bool,
+  /// Consecutive `PartiallyDelivered` sends since the last budget advance — the
+  /// extra doubling steps applied to the §5.2 backoff while the budget is frozen.
+  /// A partial send puts a real question on the served link's wire every re-arm,
+  /// and §5.2 requires "the intervals between successive queries MUST increase by
+  /// at least a factor of two"; a fully-failed send reaches no wire and so
+  /// neither uses nor advances this.
+  partial_send_streak: u32,
+  /// Per family ([0] = v4, [1] = v6): consecutive sends in which THAT family was
+  /// obligated and missed a question some other family carried — the core's own
+  /// patience, bounded by `MAX_PARTIAL_ROUNDS`. A partial send freezes the §5.2
+  /// budget, so without the bound a half-reachable family would keep a question
+  /// re-asking on the growing partial interval and the query would never reach its
+  /// terminal timeout. Once EVERY missing family has spent the bound the send is
+  /// excused and the budget advances. Reset by that family's own delivery and by it
+  /// ceasing to be obligated; left ALONE by a wholly-failed round (see
+  /// [`classify_advance`]).
+  ///
+  /// A query takes per-family PATIENCE and nothing else from the per-family
+  /// confirm. It has no §5.2 requery scheduler and races no record TTL — the cache
+  /// refreshes on receive — so there is no per-family staleness for it to anchor
+  /// on, and its backoff stays measured from confirm time.
+  partial_rounds: [FamilyPatience; 2],
   /// When `true`, questions are emitted with the QU bit set (RFC 6762 §5.4):
   /// the sender prefers a unicast response rather than a multicast one.
   unicast_response: bool,
   /// Absolute instant at which this query should auto-cancel regardless of
   /// the retry budget (`None` means no hard deadline beyond the retry budget).
   timeout_deadline: Option<I>,
+  /// Test-only: silence [`Query::assert_no_live_send_confirm`] so a test can
+  /// drive the entry points the way a NON-COMPLIANT driver would and pin what a
+  /// release build actually does. `cfg(test)`: it does not exist in a shipped
+  /// build and no public API sets it.
+  #[cfg(test)]
+  contract_assertions_off: bool,
 }
 
 impl<I, AN, EV> Query<I, AN, EV>
@@ -206,9 +240,51 @@ where
       next_seq: 0,
       transmit_pending: true,
       awaiting_send_confirm: false,
+      partial_send_streak: 0,
+      partial_rounds: [FamilyPatience::default(); 2],
       unicast_response,
       timeout_deadline,
+      #[cfg(test)]
+      contract_assertions_off: false,
     }
+  }
+
+  /// Test-only: opt this query out of the debug-build contract assertions.
+  ///
+  /// The only callers are tests that must reproduce a non-compliant driver to
+  /// observe what release builds do when the contract is broken.
+  #[cfg(test)]
+  #[cfg(all(feature = "std", feature = "slab"))]
+  pub(crate) fn disable_contract_assertions(&mut self) {
+    self.contract_assertions_off = true;
+  }
+
+  /// Fail loudly, in debug builds, when a state-mutating entry point runs while
+  /// the datagram [`Self::poll_transmit`] produced is still awaiting its
+  /// [`Self::note_transmit_outcome`].
+  ///
+  /// See [`Self::poll_transmit`] for the contract this enforces. It compiles out
+  /// of release builds, where `awaiting_send_confirm` alone absorbs the
+  /// violation: it makes at most one confirm resolve one datagram, but it cannot
+  /// undo state a mid-flight `handle_event` / `handle_timeout` already moved.
+  ///
+  /// `pub(crate)` so the endpoint's teardown entry points ([`Endpoint::cancel_query`],
+  /// [`Endpoint::sweep_terminated_queries`]) can assert it for a query they are
+  /// about to drop, which is the case the query's own methods can no longer see.
+  ///
+  /// [`Endpoint::cancel_query`]: crate::Endpoint::cancel_query
+  /// [`Endpoint::sweep_terminated_queries`]: crate::Endpoint::sweep_terminated_queries
+  #[inline]
+  pub(crate) fn assert_no_live_send_confirm(&self, entry_point: &str) {
+    #[cfg(test)]
+    if self.contract_assertions_off {
+      return;
+    }
+    debug_assert!(
+      !self.awaiting_send_confirm,
+      "{entry_point} was called while a datagram from Query::poll_transmit is \
+       still awaiting Query::note_transmit_outcome",
+    );
   }
 
   /// Attach the shared [`hick_trace::stats::Stats`] handle from the owning
@@ -275,9 +351,15 @@ where
   }
 
   /// Process an event routed to this query by the Endpoint.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`]; see [`Self::poll_transmit`].
   pub fn handle_event(&mut self, event: QueryEvent<'_>) {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("query", handle = self.handle.raw()).entered();
+    self.assert_no_live_send_confirm("Query::handle_event");
     crate::trace::trace!(
       target: "mdns_proto::query",
       handle = self.handle.raw(),
@@ -461,9 +543,15 @@ where
   }
 
   /// Drive timer-based transitions.
+  ///
+  /// # Contract
+  ///
+  /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
+  /// awaiting its [`Self::note_transmit_outcome`]; see [`Self::poll_transmit`].
   pub fn handle_timeout(&mut self, now: I) -> Result<(), HandleTimeoutError> {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("query", handle = self.handle.raw()).entered();
+    self.assert_no_live_send_confirm("Query::handle_timeout");
     if self.done {
       return Ok(());
     }
@@ -524,7 +612,14 @@ where
   /// `done` (so [`Self::is_done`] is true and `Endpoint::handle` freezes any late
   /// answers) and queues a terminal [`QueryUpdate::Timeout`]. The collected answers
   /// stay readable until the caller cancels. No-op if already done.
+  ///
+  /// A terminal transition is a state mutation like any other, so it is bound by
+  /// the same confirm-before-anything contract (see [`Self::poll_transmit`]): the
+  /// driver must resolve an outstanding datagram's commit token — a datagram it
+  /// cannot send is a confirm no family delivered
+  /// — before retiring the query that produced it.
   pub(crate) fn retire(&mut self) {
+    self.assert_no_live_send_confirm("Endpoint::retire_query");
     self.terminate(QueryUpdate::Timeout);
   }
 
@@ -535,6 +630,29 @@ where
   /// deadline tick is guaranteed: the pending flag is cleared after the
   /// datagram is built, so a driver looping on this method will not
   /// re-send the query until the next `handle_timeout` fires.
+  ///
+  /// # The confirm-before-anything contract
+  ///
+  /// > Once this method returns a datagram, NO other state-mutating entry point
+  /// > for this query — [`Self::handle_event`], [`Self::handle_timeout`] — may be
+  /// > invoked until that datagram's [`Self::note_transmit_outcome`].
+  /// > `poll_transmit` itself is excepted: `transmit_pending` is already cleared,
+  /// > so it produces nothing further.
+  ///
+  /// A driver therefore does `poll_transmit` → send → `note_transmit_outcome` as
+  /// one indivisible step, and a send the transport cannot accept right now is
+  /// dropped and confirmed as delivered by no family
+  /// rather than parked — nothing is lost, because a re-armed question is
+  /// re-encoded from live state on the next poll.
+  ///
+  /// The reason is the same as for a service: "delivered" here already means only
+  /// *the kernel accepted the datagram synchronously*, so deferring the confirm
+  /// buys no extra fidelity, while the §5.2 retry budget and backoff — which
+  /// [`Self::note_transmit_outcome`] alone advances — sit in an undecided state
+  /// for the whole interim. An absolute [`Self::poll_timeout`] deadline firing in
+  /// that window terminates the query with a question outstanding, and RFC 6762
+  /// §7.3 duplicate-question suppression arriving in it re-times a retransmission
+  /// the pending confirm is about to reschedule. Debug builds assert the ordering.
   pub fn poll_transmit(
     &mut self,
     _now: I,
@@ -562,7 +680,7 @@ where
     self.transmit_pending = false;
     // do NOT advance the retry budget or schedule the next retry
     // here — the datagram has only been ENCODED. Await the driver's delivery
-    // result (`note_transmit_result`), which schedules the backoff on a
+    // result (`note_transmit_outcome`), which schedules the backoff on a
     // confirmed send and re-attempts (without burning the budget) on failure.
     self.awaiting_send_confirm = true;
     crate::trace::debug!(
@@ -573,36 +691,104 @@ where
       bytes = n,
       "query: poll_transmit emitting question"
     );
+    // Sustained: a question that did not reach every obligated link re-arms
+    // WITHOUT spending a §5.2 retry slot (see `note_transmit_outcome`), until the
+    // core's patience bound (`MAX_PARTIAL_ROUNDS`) excuses the link that keeps
+    // missing and the budget resumes.
+    //
+    // The per-family gate carries §5.2's own floor: the re-arm that follows a
+    // partial round is anchored at the EARLIEST family acceptance, so without it
+    // the family that accepted late would be re-asked the same question inside
+    // one second on its own interface.
     Ok(Some(Transmit::new(
       crate::service::multicast_dst(),
       None,
       n,
+      TransmitObligation::Sustained,
+      retry::MIN_QUERY_GAP,
     )))
   }
 
-  /// Report the result of sending the datagram most recently produced by
-  /// [`Self::poll_transmit`]. The driver calls this after a send,
-  /// with `delivered = true` when at least one socket send succeeded.
+  /// Report the delivery outcome of the datagram most recently produced by
+  /// [`Self::poll_transmit`].
   ///
-  /// On a delivered send this counts the transmission against the §5.2 retry
-  /// budget and schedules the next retransmit (backoff: +1s, doubling, capped
-  /// at 60s). On a failed send the budget is NOT consumed and the query is
-  /// re-armed to re-attempt at the same interval — so a transient or total send
-  /// failure retries with backoff (no tight spin) and a query can never reach
-  /// its retry-budget timeout having put nothing on the wire.
-  pub fn note_transmit_result(&mut self, now: I, delivered: bool) {
+  /// Must be called before ANY other state-mutating entry point for this query —
+  /// see [`Self::poll_transmit`] for the ordering contract.
+  ///
+  /// The §5.2 retry BUDGET advances iff [`TransmitDelivery::all_delivered`] — a
+  /// question that reached only some of the links the driver fans it onto has
+  /// not been asked everywhere, so spending a retry slot for it would time the
+  /// query out having never queried the missing link.
+  ///
+  /// * **All delivered** — count the transmission against the budget and
+  ///   schedule the next retransmit on the §5.2 backoff (+1 s, doubling, capped
+  ///   at 60 s).
+  /// * **Partially delivered** — the budget is NOT consumed, but the served
+  ///   link's wire did carry a real question, so the re-arm climbs the §5.2
+  ///   ladder: each consecutive partial doubles the interval, without ever
+  ///   burning a retry slot.
+  /// * **None delivered** — the budget is NOT consumed and the interval does not
+  ///   grow; the query re-attempts after the current backoff, so a transient or
+  ///   total send failure retries without a tight spin and can never reach the
+  ///   retry-budget timeout having put nothing on the wire.
+  ///
+  /// A frozen budget cannot stay frozen forever, or a chronically half-reachable
+  /// link would keep the query re-asking without ever reaching its terminal
+  /// timeout. After `MAX_PARTIAL_ROUNDS` consecutive partials the next one is
+  /// EXCUSED and spends a slot — but takes none of the credit a delivery earns:
+  /// the §5.2 ladder is carried across the excuse point rather than reset, so the
+  /// served link never sees a shorter interval than the one before it.
+  pub fn note_transmit_outcome(&mut self, now: I, delivery: TransmitDelivery) {
     if !self.awaiting_send_confirm {
       return;
     }
     self.awaiting_send_confirm = false;
-    if delivered {
-      self.retry_count = self.retry_count.saturating_add(1);
-      self.next_deadline = retry::next_deadline(now, self.retry_count);
-    } else {
-      // Re-attempt this (undelivered) send after its backoff interval without
-      // advancing `retry_count`. `transmit_pending` stays false until the
-      // deadline fires, so the driver's drain loop does not spin.
-      self.next_deadline = retry::next_deadline(now, self.retry_count.saturating_add(1));
+    // The absolute `timeout_deadline` can terminate the query while a send is
+    // still awaiting its confirm, and `terminate` clears both deadlines. Re-arming
+    // `next_deadline` on a finished query would hand the driver one wakeup for a
+    // query that will never transmit again — `poll_timeout` does not screen `done`
+    // — so a terminal query resolves the token and stops there.
+    if self.done {
+      return;
+    }
+    match classify_advance(&mut self.partial_rounds, delivery) {
+      PhaseAdvance::Delivered => {
+        self.retry_count = self.retry_count.saturating_add(1);
+        self.partial_send_streak = 0;
+        self.next_deadline = retry::next_deadline(now, self.retry_count);
+      }
+      PhaseAdvance::Covered | PhaseAdvance::Excused => {
+        // The slot is spent so the query can progress to its terminal, but the
+        // send was NOT delivered everywhere: the ladder keeps climbing from where
+        // it stood rather than resetting to the bottom rung. Indexing the backoff
+        // by budget + streak is the same walk the honest-partial arm below does,
+        // so the served link's intervals stay monotonically doubling across the
+        // excuse point.
+        self.retry_count = self.retry_count.saturating_add(1);
+        let index = self.retry_count.saturating_add(self.partial_send_streak);
+        self.next_deadline = retry::next_deadline(now, index);
+        self.partial_send_streak = self.partial_send_streak.saturating_add(1);
+      }
+      PhaseAdvance::Partial => {
+        // §5.2 ladder: the served link heard this question, so the NEXT one must
+        // be at least twice as far out. `retry::next_deadline` derives the
+        // interval from a send index, so adding the partial streak to the
+        // (unspent) budget index walks the same doubling schedule — 1 s, 2 s,
+        // 4 s … — while `retry_count` itself stays frozen.
+        let index = self
+          .retry_count
+          .saturating_add(1)
+          .saturating_add(self.partial_send_streak);
+        self.next_deadline = retry::next_deadline(now, index);
+        self.partial_send_streak = self.partial_send_streak.saturating_add(1);
+      }
+      PhaseAdvance::Failed => {
+        // Nothing reached any wire: §5.2 counts no query to space out. Re-attempt
+        // after the current backoff interval without advancing `retry_count` or
+        // the ladder. `transmit_pending` stays false until the deadline fires, so
+        // the driver's drain loop does not spin.
+        self.next_deadline = retry::next_deadline(now, self.retry_count.saturating_add(1));
+      }
     }
   }
 
@@ -642,6 +828,14 @@ where
     }
     self.transmit_pending = false;
     self.retry_count = self.retry_count.saturating_add(1);
+    // The peer's query counts as ours, so this IS a budget advance: the §5.2
+    // partial ladder resets exactly as it does on an all-delivered send — and so
+    // does the core's patience counter, for the same reason. Leaving
+    // `partial_rounds` charged would carry the previous slot's unmet obligations
+    // into a slot that met its own, so the next genuine partial could be EXCUSED
+    // early — spending a retry slot for a link that was never asked.
+    self.partial_send_streak = 0;
+    self.partial_rounds = [FamilyPatience::default(); 2];
     if self.retry_count > MAX_RETRIES {
       // Budget spent (counting suppressed slots as our sends) — retire exactly
       // as `handle_timeout` would after the final retransmit. Route through

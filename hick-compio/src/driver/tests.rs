@@ -327,7 +327,13 @@ fn establish_service(
     let ctx = s.services.get_mut(&handle).unwrap();
     let _ = ctx.proto.handle_timeout(t);
     while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-      ctx.proto.note_transmit_delivered(t);
+      ctx.proto.note_transmit_outcome(
+        t,
+        mdns_proto::TransmitDelivery::new(
+          mdns_proto::FamilyDelivery::Delivered,
+          mdns_proto::FamilyDelivery::Delivered,
+        ),
+      );
     }
   }
   assert!(
@@ -423,7 +429,7 @@ fn begin_service_withdrawal_holds_name_then_frees_on_completion() {
 /// `cancelled` (via `flag_service_unregistered`). The driver's post-pump
 /// `sweep_cancelled_services` is what begins the endpoint-owned §10.1
 /// withdrawal. This split is load-bearing: it lets a send that was in flight
-/// when the handle dropped latch its records (via `note_service_transmit_result`)
+/// when the handle dropped latch its records (via `note_service_transmit_outcome`)
 /// BEFORE the withdrawal snapshot is taken, so a service dropped mid-send still
 /// withdraws every record it actually put on the wire.
 #[compio::test]
@@ -1144,14 +1150,21 @@ fn multi_service_encode_failure_frees_route_even_with_sibling_transmit() {
 
     // Note any Ok(Some) result (should always be B's transmit, never A's
     // since A's records can't be encoded).
-    if let Some((_, _, TransmitOrigin::Service(h))) = result {
+    if let Some((_tx, TransmitOrigin::Service(h))) = result {
       // The returned transmit MUST belong to B (A's records are too large).
       assert_eq!(
         h, handle_b,
         "any returned transmit must be from B, never from A (A's records won't encode)"
       );
       // Confirm B's delivery so B advances its probe/announce lifecycle.
-      s.note_service_transmit_result(h, t, true);
+      s.note_service_transmit_outcome(
+        h,
+        t,
+        mdns_proto::TransmitDelivery::new(
+          mdns_proto::FamilyDelivery::Delivered,
+          mdns_proto::FamilyDelivery::Delivered,
+        ),
+      );
     }
 
     // Check if A just escalated.
@@ -1310,12 +1323,19 @@ fn rename_collision_with_local_service_frees_proto_route() {
   );
 
   // Helper: pump all pending transmits and confirm delivery (mimics the
-  // async driver loop's send + note_service_transmit_result round-trip).
+  // async driver loop's send + note_service_transmit_outcome round-trip).
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_, _, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_result(h, t, true);
+        Some((_tx, TransmitOrigin::Service(h))) => {
+          s.note_service_transmit_outcome(
+            h,
+            t,
+            mdns_proto::TransmitDelivery::new(
+              mdns_proto::FamilyDelivery::Delivered,
+              mdns_proto::FamilyDelivery::Delivered,
+            ),
+          );
         }
         Some(_) => {}
         None => break,
@@ -1523,8 +1543,15 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_, _, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_result(h, t, true);
+        Some((_tx, TransmitOrigin::Service(h))) => {
+          s.note_service_transmit_outcome(
+            h,
+            t,
+            mdns_proto::TransmitDelivery::new(
+              mdns_proto::FamilyDelivery::Delivered,
+              mdns_proto::FamilyDelivery::Delivered,
+            ),
+          );
         }
         Some(_) => {}
         None => break,
@@ -1683,7 +1710,14 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_, _, TransmitOrigin::Service(h))) => s.note_service_transmit_result(h, t, true),
+        Some((_tx, TransmitOrigin::Service(h))) => s.note_service_transmit_outcome(
+          h,
+          t,
+          mdns_proto::TransmitDelivery::new(
+            mdns_proto::FamilyDelivery::Delivered,
+            mdns_proto::FamilyDelivery::Delivered,
+          ),
+        ),
         Some(_) => {}
         None => break,
       }
@@ -1848,6 +1882,108 @@ fn unencodable_query_is_errored_not_spun_or_hung() {
     !s.take_query_terminal_wakes(),
     "no further wake is armed once the query is already errored"
   );
+}
+
+/// A `Query::drop` that lands while the pump is inside `send_via().await` must
+/// not cost the in-flight datagram its confirm.
+///
+/// The handle drops on the driver's own thread but from another task, so it can
+/// run at exactly this point — for THIS query's own question. Cancelling the
+/// proto query there DISCARDS the commit token, and the
+/// `note_query_transmit_outcome` that follows lands on a handle the endpoint no
+/// longer knows: a silent no-op, with the datagram still on its way out and the
+/// §5.2 schedule left in the undecided state the confirm was supposed to resolve.
+/// The drop therefore only FLAGS, and the removal waits for
+/// `sweep_cancelled_queries`, which the run loop calls after the pump.
+///
+/// This drives the State seam directly because the interleaving IS the test: the
+/// point between `poll_one_transmit` and `note_query_transmit_outcome` is exactly
+/// where a real `send_via` await parks and where `Drop` can interpose.
+#[test]
+fn a_query_dropped_mid_send_still_gets_its_confirm() {
+  use mdns_proto::{QuerySpec, wire::ResourceType};
+
+  let inner = EndpointInner::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+  let now = std::time::Instant::now();
+  let qname = mdns_proto::Name::try_from_str("printer.local.").unwrap();
+  let h = inner
+    .state
+    .borrow_mut()
+    .start_query(QuerySpec::new(qname, ResourceType::A), now)
+    .unwrap();
+  // The real app-facing handle, so this drives the real `Drop` impl.
+  let query = crate::Query {
+    inner: Rc::clone(&inner),
+    handle: h,
+    terminal_delivered: Cell::new(false),
+  };
+
+  let mut scratch = [0u8; 1500];
+  // The pump extracts the question and stamps the commit token; from here the
+  // driver is parked inside `send_via`, holding no borrow on the state.
+  {
+    let mut s = inner.state.borrow_mut();
+    let (_tx, origin) = s
+      .poll_one_transmit(now, &mut scratch)
+      .expect("a newly-started query has its first question due");
+    assert!(
+      matches!(origin, TransmitOrigin::Query(qh) if qh == h),
+      "the pending datagram must be attributed to the query that produced it"
+    );
+    assert!(
+      s.endpoint.poll_query_timeout(h).is_none(),
+      "the §5.2 retry is scheduled by the CONFIRM, not by the poll, so nothing \
+       is armed while the token is live — this is what the confirm resolves"
+    );
+  }
+
+  // `Query::drop` runs mid-send.
+  drop(query);
+  {
+    let mut s = inner.state.borrow_mut();
+    assert!(
+      s.queries.contains_key(&h),
+      "the drop must only FLAG — removing the query here would discard the \
+       commit token the pump still owes a confirm for"
+    );
+    assert!(
+      s.poll_one_transmit(now, &mut scratch).is_none(),
+      "a cancelled query asks nothing further, flag or no flag"
+    );
+
+    // The send completes and the pump confirms.
+    s.note_query_transmit_outcome(
+      h,
+      now,
+      mdns_proto::TransmitDelivery::new(
+        mdns_proto::FamilyDelivery::Delivered,
+        mdns_proto::FamilyDelivery::Delivered,
+      ),
+    );
+    assert!(
+      s.endpoint.poll_query_timeout(h).is_some(),
+      "the confirm must resolve the live token and advance the §5.2 schedule — \
+       it silently no-ops if the drop already removed the handle"
+    );
+
+    // Only now is the query freed, driver ctx and proto pool entry together.
+    assert!(
+      s.sweep_cancelled_queries(),
+      "the post-pump sweep is what removes a cancelled query"
+    );
+    assert!(
+      !s.queries.contains_key(&h),
+      "the driver ctx is gone after the sweep"
+    );
+    assert!(
+      s.endpoint.poll_query_timeout(h).is_none(),
+      "and so is the proto pool entry"
+    );
+    assert!(
+      !s.sweep_cancelled_queries(),
+      "a second sweep pass has nothing left to do"
+    );
+  }
 }
 
 /// Registering the same instance name twice (no intervening removal) must
@@ -2274,8 +2410,15 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_, _, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_result(h, t, true);
+        Some((_tx, TransmitOrigin::Service(h))) => {
+          s.note_service_transmit_outcome(
+            h,
+            t,
+            mdns_proto::TransmitDelivery::new(
+              mdns_proto::FamilyDelivery::Delivered,
+              mdns_proto::FamilyDelivery::Delivered,
+            ),
+          );
         }
         Some(_) => {}
         None => break,
@@ -2372,5 +2515,791 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     !before,
     "no withdrawal must be due BEFORE push_service_updates on the decisive \
        iteration (the collision withdrawal is begun by push, not by a prior sweep)"
+  );
+}
+
+// ── The dual-stack delivery boundary (`TransmitDelivery`) ───────────────────
+
+/// A minimal registerable service spec for the delivery-shape tests.
+fn delivery_test_spec(instance: &str) -> mdns_proto::ServiceSpec {
+  use mdns_proto::{Name, ServiceRecords, ServiceSpec};
+  let mut r = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str(&format!("{instance}._ipp._tcp.local.")).unwrap(),
+    Name::try_from_str(&format!("{instance}.local.")).unwrap(),
+    631,
+    120,
+  );
+  r.add_a([192, 168, 1, 10].into());
+  ServiceSpec::new(r)
+}
+
+/// Drain one service's due transmits at `t`, confirming each with `fanout`'s
+/// per-family result through the SAME seam the run loop uses. Returns how many
+/// were confirmed.
+fn confirm_service_round(
+  s: &mut State,
+  h: ServiceHandle,
+  t: StdInstant,
+  buf: &mut [u8],
+  fanout: Fanout,
+) -> usize {
+  s.fire_timeouts(t);
+  let delivery = fanout.delivery();
+  let mut rounds = 0;
+  while let Some((_tx, origin)) = s.poll_one_transmit(t, buf) {
+    match origin {
+      TransmitOrigin::Service(origin_h) if origin_h == h => {
+        s.note_service_transmit_outcome(h, t, delivery);
+        rounds += 1;
+      }
+      TransmitOrigin::Service(other) => s.note_service_transmit_outcome(other, t, delivery),
+      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, delivery),
+    }
+  }
+  rounds
+}
+
+/// A dual-stack fan-out in which v4 carried the datagram and a BOUND v6 socket
+/// rejected it (`ENETUNREACH` and friends). Driving the behaviour tests from the
+/// per-family facts rather than a hand-fed [`TransmitDelivery`] keeps the
+/// mapping inside the tested path.
+const PARTIAL_FANOUT: Fanout = Fanout {
+  v4: FamilySend::Sent,
+  v6: FamilySend::Failed,
+};
+
+/// Both bound families carried the datagram.
+const WHOLE_FANOUT: Fanout = Fanout {
+  v4: FamilySend::Sent,
+  v6: FamilySend::Sent,
+};
+
+/// Both bound families rejected it — nothing reached any wire.
+const FAILED_FANOUT: Fanout = Fanout {
+  v4: FamilySend::Failed,
+  v6: FamilySend::Failed,
+};
+
+/// The confirm is a pure, per-family function of the I/O facts, and the obligated
+/// set is "every family that HAS a socket". The rows that matter: an absent family
+/// is not obligated (a single-stack host advances at full speed), a
+/// present-but-failing one is, and an empty obligated set delivers to nobody —
+/// never a vacuous "all", which would let a torn-down endpoint advance its
+/// lifecycle on nothing.
+///
+/// WHICH family missed survives to the core, so it can schedule the next
+/// announcement per link. The two partial rows differ here; under the aggregate
+/// confirm they were the same value.
+#[test]
+fn the_fan_out_reaches_the_core_per_family() {
+  use FamilySend::{Failed, Sent, Unbound};
+  use mdns_proto::FamilyDelivery::{Delivered, Missed, Unobligated};
+  let cases = [
+    (Sent, Sent, Delivered, Delivered),
+    (Sent, Unbound, Delivered, Unobligated),
+    (Unbound, Sent, Unobligated, Delivered),
+    (Sent, Failed, Delivered, Missed),
+    (Failed, Sent, Missed, Delivered),
+    (Failed, Failed, Missed, Missed),
+    (Failed, Unbound, Missed, Unobligated),
+    (Unbound, Unbound, Unobligated, Unobligated),
+  ];
+  for (v4, v6, want_v4, want_v6) in cases {
+    let delivery = Fanout { v4, v6 }.delivery();
+    assert_eq!(
+      (delivery.v4(), delivery.v6()),
+      (want_v4, want_v6),
+      "({v4:?}, {v6:?}) must reach the core as ({want_v4}, {want_v6})"
+    );
+  }
+}
+
+/// The invariant pair at the driver seam. A partial fan-out means two DIFFERENT
+/// things to the core and must not be folded to one bit:
+///
+///   * goodbye ownership LATCHES — the served family's peers may now hold the
+///     records that reached the wire, so a later unregister owes them a §10.1
+///     TTL=0 withdrawal;
+///   * the §8.3 phase does NOT advance, and the reclaim-cancel gate stays shut —
+///     the unserved family was neither asked nor told.
+///
+/// The shipped `sent_any` boolean had no truthful value here: it advanced the
+/// phase on the unserved family's behalf.
+#[test]
+fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
+  use mdns_proto::service::ServiceState;
+
+  let mut s = State::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  let now = StdInstant::now();
+  let h = s
+    .test_register_service(delivery_test_spec("partial"), now)
+    .unwrap();
+  let mut buf = vec![0u8; 4096];
+
+  // Exactly ONE confirm, so the bounded policy provably cannot have fired.
+  assert_eq!(
+    confirm_service_round(&mut s, h, now, &mut buf, PARTIAL_FANOUT),
+    1,
+    "one announcement should have been offered"
+  );
+
+  assert_eq!(
+    s.services[&h].proto.state(),
+    ServiceState::Announcing(0),
+    "a partial announcement must re-arm the SAME announcement — the unserved \
+     family never heard it"
+  );
+  assert!(
+    s.services[&h].proto.advertises_instance(),
+    "the served family's peers may now cache these records, so §10.1 goodbye \
+     ownership must latch on the PARTIAL round"
+  );
+  assert!(
+    !s.services[&h].proto.has_fully_announced().get(),
+    "a partial announcement must NOT open the reclaim-cancel gate"
+  );
+
+  // The headline regression: ownership latched, so a graceful unregister really
+  // does retract. Had the partial round dropped ownership the snapshot would be
+  // empty and the wire silent.
+  s.begin_service_withdrawal(h, now);
+  assert!(
+    s.poll_one_withdrawal(now, &mut buf).is_some(),
+    "a partially-announced service must still emit a §10.1 TTL=0 goodbye for the \
+     records the served family put into peer caches"
+  );
+}
+
+/// The other half of the pair: when EVERY obligated family carried the datagram,
+/// the same confirm both latches ownership and advances the phase — and only then
+/// does the reclaim-cancel gate open.
+#[test]
+fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
+  use mdns_proto::service::ServiceState;
+
+  let mut s = State::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  let now = StdInstant::now();
+  let h = s
+    .test_register_service(delivery_test_spec("full"), now)
+    .unwrap();
+  let mut buf = vec![0u8; 4096];
+
+  assert_eq!(
+    confirm_service_round(&mut s, h, now, &mut buf, WHOLE_FANOUT),
+    1,
+    "one announcement should have been offered"
+  );
+
+  assert_eq!(
+    s.services[&h].proto.state(),
+    ServiceState::Announcing(1),
+    "an all-delivered announcement advances the §8.3 sequence"
+  );
+  assert!(
+    s.services[&h].proto.advertises_instance(),
+    "a delivered announcement latches goodbye ownership"
+  );
+  assert!(
+    s.services[&h].proto.has_fully_announced().get(),
+    "a complete announcement is the ONLY thing that opens the reclaim-cancel gate"
+  );
+}
+
+/// A fan-out that reached NO wire neither latches nor advances: nothing was
+/// exposed to any peer, so there is nothing to retract, and no family heard the
+/// announcement, so the phase must not move.
+#[test]
+fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
+  use mdns_proto::service::ServiceState;
+
+  let mut s = State::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  let now = StdInstant::now();
+  let h = s
+    .test_register_service(delivery_test_spec("failed"), now)
+    .unwrap();
+  let mut buf = vec![0u8; 4096];
+
+  assert_eq!(
+    confirm_service_round(&mut s, h, now, &mut buf, FAILED_FANOUT),
+    1,
+    "one announcement should have been offered"
+  );
+
+  assert_eq!(
+    s.services[&h].proto.state(),
+    ServiceState::Announcing(0),
+    "a wholly-failed announcement must re-arm without advancing"
+  );
+  assert!(
+    !s.services[&h].proto.advertises_instance(),
+    "nothing reached a wire, so no peer can hold these records and no goodbye \
+     ownership may latch"
+  );
+
+  s.begin_service_withdrawal(h, now);
+  assert!(
+    s.poll_one_withdrawal(now, &mut buf).is_none(),
+    "an unadvertised service has nothing to retract, so its withdrawal must put \
+     no datagram on the wire"
+  );
+}
+
+/// RFC 6762 §9 surviving rename: the renamed-away old name's detached goodbye is
+/// enqueued RECLAIMABLE, so a replacement that takes the vacated name can cancel
+/// it — but ONLY once that replacement has fully announced. A replacement that
+/// reached one family alone must not cancel a goodbye the OTHER family still
+/// needs; the shipped driver cancelled on the any-delivered exposure latch and
+/// left every peer on the unserved family holding the old registration's records
+/// until their positive TTL expired.
+///
+/// The old goodbye's per-family debt is what makes "both families" concrete: this
+/// drives a v4-only goodbye round first, so the item still owes IPv6 when the
+/// replacement announces.
+#[test]
+fn a_surviving_rename_retracts_its_old_name_on_both_families() {
+  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+  use crate::socket::RecvMeta;
+  use mdns_proto::{
+    Name,
+    service::ServiceState,
+    wire::{Header, MessageBuilder},
+  };
+
+  let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+  s.local_subnets = vec![(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)), 24)];
+  s.bound_interface = 1;
+  let now = StdInstant::now();
+  let old_inst = Name::try_from_str("Old._ipp._tcp.local.").unwrap();
+  let handle = s
+    .test_register_service(delivery_test_spec("Old"), now)
+    .unwrap();
+  let mut buf = vec![0u8; 4096];
+
+  // Drive "Old" to fully announced, so its rename hands off a NON-empty goodbye.
+  let mut t = now;
+  for _ in 0..40 {
+    t += Duration::from_millis(300);
+    confirm_service_round(&mut s, handle, t, &mut buf, WHOLE_FANOUT);
+  }
+  assert!(
+    s.services[&handle].proto.advertises_instance(),
+    "Old must announce before the rename (so the goodbye is non-empty)"
+  );
+
+  // A conflicting SRV authority for "Old" with rival rdata: we lose the §8.2
+  // tiebreak and rename away. No LOCAL service owns the new name, so this is a
+  // SURVIVING rename and its old-name goodbye is enqueued reclaimable.
+  let conflict = {
+    let target = Name::try_from_str("rival.local.").unwrap();
+    let mut cbuf = [0u8; 512];
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
+    b.push_srv_authority(&old_inst, 120, 0, 0, 9999, &target)
+      .unwrap();
+    let n = b.finish().unwrap();
+    cbuf[..n].to_vec()
+  };
+  let peer = RecvMeta::new(
+    SocketAddr::from(([192, 168, 1, 200], 5353)),
+    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)),
+    1,
+    Some(255),
+    None,
+    conflict.len(),
+  );
+  let mut renamed = false;
+  for _ in 0..80 {
+    t += Duration::from_millis(250);
+    s.handle_datagram(&peer, &conflict);
+    confirm_service_round(&mut s, handle, t, &mut buf, WHOLE_FANOUT);
+    s.push_service_updates(t);
+    if s
+      .services
+      .get(&handle)
+      .map(|c| c.proto.name().as_str() != old_inst.as_str())
+      .unwrap_or(true)
+    {
+      renamed = true;
+      break;
+    }
+  }
+  assert!(
+    renamed,
+    "Old must rename away under sustained conflict (seeding the detached goodbye)"
+  );
+
+  // Goodbye round 1 reaches v4 only: IPv6's debt is still outstanding, which is
+  // exactly what a premature cancel would throw away.
+  let (_, _, token) = s
+    .poll_one_withdrawal(t, &mut buf)
+    .expect("the renamed-away old name must have a detached goodbye pending");
+  s.note_withdrawal_result(token, t, WithdrawalSend::Sent, WithdrawalSend::Retry);
+
+  // The application reclaims the vacated name.
+  let rh = s
+    .test_register_service(delivery_test_spec("Old"), t)
+    .expect("the vacated name must be re-registerable while its goodbye drains");
+
+  // Drive the replacement's §8.1 probes to completion (a probe is a question and
+  // opens no gate) so the next round is its FIRST announcement.
+  for _ in 0..12 {
+    t += Duration::from_millis(300);
+    confirm_service_round(&mut s, rh, t, &mut buf, WHOLE_FANOUT);
+    if s.services[&rh].proto.state() == ServiceState::Announcing(0) {
+      break;
+    }
+  }
+  assert_eq!(
+    s.services[&rh].proto.state(),
+    ServiceState::Announcing(0),
+    "the replacement must reach its first announcement"
+  );
+
+  // Exactly ONE partially-delivered announcement — the bounded policy provably
+  // cannot have excused anything yet.
+  t += Duration::from_millis(300);
+  confirm_service_round(&mut s, rh, t, &mut buf, PARTIAL_FANOUT);
+  assert!(
+    !s.services[&rh].proto.has_fully_announced().get(),
+    "a partial announcement must leave the reclaim-cancel gate shut"
+  );
+  assert!(
+    s.poll_one_withdrawal(t, &mut buf).is_some(),
+    "a partially-announced replacement must NOT cancel the old name's goodbye — \
+     the unserved family has heard neither the goodbye nor the replacement, and \
+     its share of the per-family debt is still owed"
+  );
+
+  // Once the replacement reaches every obligated family, §10.2's cache-flush
+  // announcement supersedes the stale records and the goodbye may be cancelled.
+  t += Duration::from_secs(2);
+  confirm_service_round(&mut s, rh, t, &mut buf, WHOLE_FANOUT);
+  assert!(
+    s.services[&rh].proto.has_fully_announced().get(),
+    "the replacement must have fully announced by now"
+  );
+  assert!(
+    s.poll_one_withdrawal(t, &mut buf).is_none(),
+    "a fully-announced replacement supersedes the old records on every obligated \
+     family, so the reclaimable goodbye is cancelled"
+  );
+}
+
+/// RFC 6762 §6.7 legacy unicast reply: no self-send credit.
+///
+/// A unicast datagram leaves for the querier's own address and ephemeral port and
+/// never loops back through the multicast group we joined, so a credit recorded
+/// for it can never be consumed. It would occupy the linear-scanned tracker for
+/// `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines the
+/// NEW entry — so a legacy-query flood would starve the genuine multicast credits
+/// that loopback suppression depends on.
+#[compio::test]
+async fn a_legacy_unicast_reply_records_no_self_send_credit() {
+  use crate::socket::Socket;
+
+  let inner = Rc::new(EndpointInner::new(
+    mdns_proto::EndpointConfig::default(),
+    1500,
+    9000,
+  ));
+
+  // A real bound socket, so this exercises the actual send path rather than the
+  // absent-socket short circuit.
+  let sender = Socket::from_std(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+    .await
+    .expect("wrap a loopback sender");
+  let querier = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let querier_addr = querier.local_addr().unwrap();
+
+  let sock_v4 = Some(Rc::new(sender));
+  let sock_v6: Option<Rc<Socket>> = None;
+
+  let (fanout, accepted_at) = send_via(
+    &inner,
+    &sock_v4,
+    &sock_v6,
+    querier_addr,
+    b"legacy-unicast-reply",
+    // A §6.7 reply is one-shot and therefore ungated.
+    &mut FamilyWireGate::default(),
+    Duration::ZERO,
+    StdInstant::now(),
+  )
+  .await;
+
+  assert!(
+    accepted_at.is_some(),
+    "the one obligated family accepted the datagram, so the confirm has a real \
+     acceptance instant to anchor at"
+  );
+  assert_eq!(
+    fanout.delivery(),
+    mdns_proto::TransmitDelivery::new(
+      mdns_proto::FamilyDelivery::Delivered,
+      mdns_proto::FamilyDelivery::Unobligated,
+    ),
+    "a §6.7 reply obligates exactly the destination's family; the other one was \
+     never offered the datagram and must not read as a miss"
+  );
+  assert!(
+    inner.state.borrow().recent_sends.is_empty(),
+    "a unicast reply never loops back, so it must record NO self-send credit"
+  );
+}
+
+// ── The per-family wire gate ────────────────────────────────────────────────
+
+/// What `Transmit::min_family_gap()` carries for an RFC 6762 §8.3 unsolicited
+/// announcement — the one-second floor §6 puts on re-multicasting a record on the
+/// same interface. Restated here because the core's copy is crate-private.
+const ANNOUNCE_MIN_FAMILY_GAP: Duration = Duration::from_secs(1);
+
+/// What it carries for a §8.1 probe, which is explicitly EXEMPT from that
+/// one-second rule and spaced by its own inter-probe interval instead.
+const PROBE_MIN_FAMILY_GAP: Duration = Duration::from_millis(250);
+
+/// The gate is kind-dependent, which is precisely why the driver may not pick the
+/// number: a driver that hardcoded §6's one second would stretch the §8.1 probe
+/// sequence fourfold, and one that hardcoded 250 ms would breach §6 on every
+/// announcement. The value arrives on the `Transmit`; only the WHEN is the
+/// driver's.
+#[test]
+fn the_wire_gate_holds_each_kind_to_its_own_minimum() {
+  let mut gate = FamilyWireGate::default();
+  let t0 = StdInstant::now();
+
+  assert!(
+    gate.open(FAMILY_V6, t0, ANNOUNCE_MIN_FAMILY_GAP),
+    "a family that has carried nothing owes no gap"
+  );
+  gate.record(FAMILY_V6, t0, ANNOUNCE_MIN_FAMILY_GAP);
+
+  let skewed = t0 + Duration::from_millis(850);
+  assert!(
+    !gate.open(FAMILY_V6, skewed, ANNOUNCE_MIN_FAMILY_GAP),
+    "an announcement 850 ms after this family's own last one is inside §6 /      §8.3's floor for that interface, however the confirm anchored"
+  );
+  assert!(
+    gate.open(FAMILY_V6, skewed, PROBE_MIN_FAMILY_GAP),
+    "…yet a §8.1 probe at the same instant is fine: probes are exempt from the      one-second rule and carry their own 250 ms minimum"
+  );
+  assert!(
+    gate.open(FAMILY_V6, skewed, Duration::ZERO),
+    "…and a one-shot reply is ungated entirely — a gate could only drop it"
+  );
+  assert!(
+    gate.open(FAMILY_V4, skewed, ANNOUNCE_MIN_FAMILY_GAP),
+    "the gate is per family: v4's wire owes nothing because of what v6 carried"
+  );
+  assert!(
+    gate.open(
+      FAMILY_V6,
+      t0 + ANNOUNCE_MIN_FAMILY_GAP,
+      ANNOUNCE_MIN_FAMILY_GAP
+    ),
+    "exactly one interval later the floor is paid"
+  );
+
+  // An ungated send must leave no trace, or a §6 reply would defer the
+  // announcement that follows it.
+  let mut ungated = FamilyWireGate::default();
+  ungated.record(FAMILY_V4, t0, Duration::ZERO);
+  assert!(
+    ungated.open(FAMILY_V4, t0, ANNOUNCE_MIN_FAMILY_GAP),
+    "a one-shot send does not start the clock on the next announcement"
+  );
+}
+
+/// What a §5.2 question carries: "the interval between the first two queries
+/// MUST be at least one second", and the backoff only widens from there.
+/// Restated here for the same reason the other two are — the core's copy is
+/// crate-private.
+const QUERY_MIN_FAMILY_GAP: Duration = Duration::from_secs(1);
+
+/// A socket whose sends SUCCEED but only after sitting pending, recording the
+/// instant each one actually reached the wire.
+///
+/// The pending time is what no real host lets a test choose, and it is exactly
+/// the variable the wire gate must not be allowed to spend: a gate anchored
+/// before submission gives back every millisecond a send spent in flight.
+struct DelayedSender {
+  /// Per-call pending durations, consumed in order; exhausted calls complete
+  /// immediately.
+  pending: RefCell<std::collections::VecDeque<Duration>>,
+  /// When each successful send actually put bytes on the wire — read INSIDE the
+  /// socket, so it owes nothing to how the driver stamps anything.
+  wire_times: RefCell<Vec<StdInstant>>,
+}
+
+impl DelayedSender {
+  fn new(pending: &[Duration]) -> Self {
+    Self {
+      pending: RefCell::new(pending.iter().copied().collect()),
+      wire_times: RefCell::new(Vec::new()),
+    }
+  }
+}
+
+impl SendDatagram for DelayedSender {
+  async fn send_to(&self, buf: &[u8], _dst: SocketAddr) -> std::io::Result<usize> {
+    let pending = self
+      .pending
+      .borrow_mut()
+      .pop_front()
+      .unwrap_or(Duration::ZERO);
+    if !pending.is_zero() {
+      compio::time::sleep(pending).await;
+    }
+    self.wire_times.borrow_mut().push(StdInstant::now());
+    Ok(buf.len())
+  }
+}
+
+/// How often a gated round is retried, standing in for the run loop's own
+/// re-entry. Only granularity: a coarser value can delay a send but never let
+/// one out early.
+const GATED_RETRY_POLL: Duration = Duration::from_millis(5);
+
+/// Put `pending.len()` gated multicast datagrams from ONE producer onto ONE
+/// family through the real [`send_via`], retrying a gated round the way the run
+/// loop does, and return the instants the SOCKET recorded for them.
+///
+/// Only v4 is bound, so every wire time belongs to one family and the gaps
+/// between them are that family's own wire spacing.
+async fn same_family_wire_times(min_gap: Duration, pending: &[Duration]) -> Vec<StdInstant> {
+  let inner = Rc::new(EndpointInner::new(
+    mdns_proto::EndpointConfig::default(),
+    1500,
+    9000,
+  ));
+  let sender = Rc::new(DelayedSender::new(pending));
+  let sock_v4 = Some(sender.clone());
+  let sock_v6: Option<Rc<DelayedSender>> = None;
+  let mut gate = FamilyWireGate::default();
+
+  for i in 0..pending.len() {
+    // A distinct body per round, so nothing about self-send bookkeeping can
+    // make one round's datagram stand in for another's.
+    let body = [b'g', b'a', b'p', i as u8];
+    loop {
+      let (fanout, _) = send_via(
+        &inner,
+        &sock_v4,
+        &sock_v6,
+        MDNS_V4_DST,
+        &body,
+        &mut gate,
+        min_gap,
+        StdInstant::now(),
+      )
+      .await;
+      match fanout.v4 {
+        FamilySend::Sent => break,
+        FamilySend::Gated => compio::time::sleep(GATED_RETRY_POLL).await,
+        other => panic!("a delayed-but-successful send must be Sent or Gated, got {other:?}"),
+      }
+    }
+  }
+  sender.wire_times.take()
+}
+
+/// A send that stays PENDING must not buy back the wire gap it owes.
+///
+/// The gate exists to space one family's bytes on one wire, so its anchor has to
+/// be when the operation COMPLETED. Anchored before submission instead, a send
+/// pending `P` re-opens its own family `P` early: at §8.1's 250 ms inter-probe
+/// interval a 200 ms-pending probe leaves 50 ms of real spacing, and it does so
+/// on exactly the slow-socket path the spacing protects. Measured from inside
+/// the socket, so the assertion is the wire's own history and not the driver's
+/// account of it.
+async fn delayed_sends_keep_their_wire_gap(kind: &str, min_gap: Duration, pending: &[Duration]) {
+  let wire_times = same_family_wire_times(min_gap, pending).await;
+  assert_eq!(
+    wire_times.len(),
+    pending.len(),
+    "{kind}: every round must have reached the wire exactly once"
+  );
+  for (i, pair) in wire_times.windows(2).enumerate() {
+    let gap = pair[1].saturating_duration_since(pair[0]);
+    assert!(
+      gap >= min_gap,
+      "{kind}: consecutive datagrams were {gap:?} apart on one family's wire, \
+       inside the {min_gap:?} that kind owes it — the send pending {:?} before it \
+       succeeded was credited to the gap",
+      pending[i]
+    );
+  }
+}
+
+/// §8.1 probes: 250 ms apart on the wire, however long a probe sat pending. Two
+/// pending rounds in a row, so the anchor is exercised on a later send and not
+/// just the first.
+#[compio::test]
+async fn a_pending_probe_does_not_shorten_the_next_probes_wire_gap() {
+  delayed_sends_keep_their_wire_gap(
+    "probe",
+    PROBE_MIN_FAMILY_GAP,
+    &[
+      Duration::from_millis(200),
+      Duration::from_millis(200),
+      Duration::ZERO,
+    ],
+  )
+  .await;
+}
+
+/// §6 / §8.3 unsolicited announcements: one second apart on the wire.
+#[compio::test]
+async fn a_pending_announcement_does_not_shorten_the_next_ones_wire_gap() {
+  delayed_sends_keep_their_wire_gap(
+    "announcement",
+    ANNOUNCE_MIN_FAMILY_GAP,
+    &[Duration::from_millis(500), Duration::ZERO],
+  )
+  .await;
+}
+
+/// §5.2 questions: at least one second between the first two transmissions of
+/// the same question on one interface.
+#[compio::test]
+async fn a_pending_query_does_not_shorten_the_next_ones_wire_gap() {
+  delayed_sends_keep_their_wire_gap(
+    "query",
+    QUERY_MIN_FAMILY_GAP,
+    &[Duration::from_millis(500), Duration::ZERO],
+  )
+  .await;
+}
+
+// ── The obligation tag (`TransmitObligation`) at the driver seam ────────────
+
+/// A §6.7 legacy unicast reply reaches exactly ONE family, so its fan-out is
+/// `AllDelivered` by construction.
+const UNICAST_FANOUT: Fanout = Fanout {
+  v4: FamilySend::Sent,
+  v6: FamilySend::Unbound,
+};
+
+/// Drain one service's due transmits at `t` through the SAME seam the run loop
+/// uses, choosing each datagram's fan-out the way `send_via` would: an mDNS
+/// MULTICAST destination is fanned onto both families (and so can be partial),
+/// while a §6.7 legacy UNICAST reply reaches the single family its destination
+/// names. Returns how many datagrams were confirmed.
+fn confirm_service_round_mixed(
+  s: &mut State,
+  h: ServiceHandle,
+  t: StdInstant,
+  buf: &mut [u8],
+  multicast_fanout: Fanout,
+) -> usize {
+  s.fire_timeouts(t);
+  let mut rounds = 0;
+  while let Some((tx, origin)) = s.poll_one_transmit(t, buf) {
+    let fanout = if tx.dst().ip().is_multicast() {
+      multicast_fanout
+    } else {
+      UNICAST_FANOUT
+    };
+    let delivery = fanout.delivery();
+    match origin {
+      TransmitOrigin::Service(origin_h) => {
+        s.note_service_transmit_outcome(origin_h, t, delivery);
+        if origin_h == h {
+          rounds += 1;
+        }
+      }
+      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, delivery),
+    }
+  }
+  rounds
+}
+
+/// Feed a browse (PTR) query for the sample service type through the driver's
+/// own receive path. A `src` port of 5353 elicits a jittered §6 MULTICAST
+/// response; any other port elicits a §6.7 legacy UNICAST reply.
+fn inject_ptr_query(s: &mut State, src: core::net::SocketAddr, t: StdInstant) {
+  use core::net::{IpAddr, Ipv4Addr};
+
+  use mdns_proto::{
+    Name,
+    wire::{Header, MessageBuilder, ResourceClass, ResourceType},
+  };
+
+  use crate::socket::RecvMeta;
+
+  let qname = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let mut qbuf = [0u8; 512];
+  let n = {
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut qbuf, Header::new()).unwrap();
+    b.push_question(&qname, ResourceType::Ptr, ResourceClass::In, false)
+      .unwrap();
+    b.finish().unwrap()
+  };
+  let meta = RecvMeta::new(
+    src,
+    IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
+    1,
+    Some(255), // §11 on-link
+    None,
+    n,
+  );
+  let _ = t;
+  s.handle_datagram(&meta, &qbuf[..n]);
+}
+
+/// Bypassing the bound for a one-shot datagram must not bypass the CORE confirm:
+/// the outcome still reaches `Service::note_transmit_outcome` verbatim, so a
+/// delivered response latches §10.1 goodbye ownership for the records it put on
+/// the wire.
+#[test]
+fn a_one_shot_confirm_still_latches_goodbye_ownership() {
+  let mut s = State::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  let now = StdInstant::now();
+  let h = s
+    .test_register_service(delivery_test_spec("oneshot"), now)
+    .unwrap();
+  let mut buf = vec![0u8; 4096];
+
+  // The lifecycle reaches no wire at all, so nothing it sends can latch.
+  confirm_service_round(&mut s, h, now, &mut buf, FAILED_FANOUT);
+  assert!(
+    !s.services[&h].proto.advertises_instance(),
+    "a wholly-failed announcement exposes nothing"
+  );
+
+  // A §6.7 legacy querier is served over the one family its destination names.
+  let legacy = core::net::SocketAddr::from(([192, 168, 1, 50], 6000));
+  let t = now + Duration::from_millis(50);
+  inject_ptr_query(&mut s, legacy, t);
+  assert_eq!(
+    confirm_service_round_mixed(&mut s, h, t, &mut buf, FAILED_FANOUT),
+    1,
+    "only the legacy reply is due this early"
+  );
+  assert!(
+    s.services[&h].proto.advertises_instance(),
+    "the reply put positive-TTL records on a wire, so §10.1 ownership latches — \
+     the confirm reaches the core unchanged, it just skips the bound"
+  );
+  assert!(
+    !s.services[&h].proto.has_fully_announced().get(),
+    "an all-delivered UNICAST reply is still not a complete announcement"
   );
 }

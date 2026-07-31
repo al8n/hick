@@ -38,9 +38,9 @@ use crate::{
     ServiceEvent, ServiceQuestion, ToQuery, ToService,
   },
   query::{CollectedAnswer, Query},
-  service::Service,
+  service::{FullyAnnounced, Service},
   trace::*,
-  transmit::Transmit,
+  transmit::{Transmit, TransmitDelivery},
   wire::{MessageReader, NameRef, ResourceClass, ResourceType},
 };
 
@@ -201,10 +201,11 @@ cfg_heap! {
     /// name: the service is DEAD, so its stale records must be retracted BEFORE the
     /// name is reused; without the hold, the empty route-attached current-name
     /// withdrawal completes first and a quick re-register cancels the only real
-    /// goodbye, leaving peers with stale PTR/SRV/TXT until TTL. Auto-
-    /// rename reclaim via `handle_service_renamed` still CANCELS even a held name —
-    /// that path must not reject (it would kill the renaming service), and
-    /// the reclaiming service re-announces the name.
+    /// goodbye, leaving peers with stale PTR/SRV/TXT until TTL. A held name is
+    /// rejected by BOTH reuse paths — `try_register_service` and
+    /// `handle_service_renamed` — and is never cancelled by
+    /// [`Endpoint::note_service_announced`], so the dead service's goodbye always
+    /// drains before the name can be claimed again.
     #[allow(dead_code)]
     holds_name: bool,
   }
@@ -245,7 +246,7 @@ pub struct ServiceRoute {
   /// wire — the subset of `a_addrs` a peer truly holds in its cache.  EMPTY at
   /// registration (a never-announced service has advertised nothing); the
   /// driver mirrors the live `Service::advertised_a_addrs` set here via
-  /// [`Endpoint::note_service_advertised`] after each confirmed announce.  This
+  /// [`Endpoint::note_service_announced`] after each confirmed announce.  This
   /// (NOT the configured `a_addrs`) is what `sibling_retained_addrs` honours so
   /// a withdrawing service only retains addresses a LIVE same-host sibling
   /// genuinely owns in peer caches.
@@ -314,7 +315,7 @@ impl ServiceRoute {
     /// IPv4 host addresses this service has CONFIRMED-ADVERTISED on the wire.
     /// Distinct from [`Self::a_addrs`] (the configured set used for self-/
     /// loopback detection): this is the subset peers actually hold in cache, kept
-    /// current by [`Endpoint::note_service_advertised`] and consumed by
+    /// current by [`Endpoint::note_service_announced`] and consumed by
     /// sibling host-address retention during withdrawal.
     #[inline(always)]
     pub(crate) fn advertised_a(&self) -> &[Ipv4Addr] {

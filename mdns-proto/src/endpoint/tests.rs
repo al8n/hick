@@ -74,10 +74,10 @@ fn handle_rejects_a_malformed_packet_with_a_parse_error() {
 }
 
 #[test]
-fn note_service_advertised_is_a_noop_for_an_unknown_handle() {
+fn note_service_announced_is_a_noop_for_an_unknown_handle() {
   let mut e = build_endpoint();
   // No registered service → the route lookup misses and the call returns early.
-  e.note_service_advertised(ServiceHandle::from_raw(0xDEAD), &[], &[], false);
+  e.note_service_announced(FullyAnnounced::new(ServiceHandle::from_raw(0xDEAD), false), &[], &[]);
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn query_delegation_tolerates_unknown_handles() {
     e.poll_query_transmit(bogus, now, &mut buf),
     Ok(None)
   ));
-  e.note_query_transmit_result(bogus, now, true); // no-op on an unknown handle
+  e.note_query_transmit_outcome(bogus, now, TransmitDelivery::ALL); // no-op on an unknown handle
   assert!(e.handle_query_timeout(bogus, now).is_ok());
 }
 
@@ -1144,7 +1144,7 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
   // (next_deadline ≈ now+1s) with transmit_pending cleared.
   let mut buf = [0u8; 512];
   assert!(e.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
-  e.note_query_transmit_result(h, now, true);
+  e.note_query_transmit_outcome(h, now, TransmitDelivery::ALL);
   let t1 = e
     .poll_query_timeout(h)
     .expect("a retransmit must be scheduled");
@@ -3264,6 +3264,53 @@ fn cancel_query_removes_route() {
   );
 }
 
+/// Query teardown is bound by the same confirm-before-anything contract as a
+/// service's. Removing the query DISCARDS the commit token, so the confirm that
+/// follows finds no handle and silently does nothing while the datagram it
+/// described is still on its way out — a driver that cancels from another task
+/// must flag the cancellation and sweep it after its transmit pump confirms.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "still awaiting Query::note_transmit_outcome")]
+fn cancel_query_under_a_live_send_confirm_trips_the_contract_assertion() {
+  use crate::{config::QuerySpec, wire::ResourceType};
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = e
+    .try_start_query(QuerySpec::new(qname, ResourceType::A), now)
+    .unwrap();
+  let mut buf = std::vec![0u8; 512];
+  e.poll_query_transmit(h, now, &mut buf)
+    .unwrap()
+    .expect("a newly-started query has its first question due");
+  let _ = e.cancel_query(h);
+}
+
+/// The retirement half of the same contract: forcing the query to its TIMEOUT
+/// terminal is a state mutation, so a driver that cannot send the question must
+/// resolve the outstanding datagram as `NoneDelivered` before retiring the query
+/// that produced it.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "still awaiting Query::note_transmit_outcome")]
+fn retire_query_under_a_live_send_confirm_trips_the_contract_assertion() {
+  use crate::{config::QuerySpec, wire::ResourceType};
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = e
+    .try_start_query(QuerySpec::new(qname, ResourceType::A), now)
+    .unwrap();
+  let mut buf = std::vec![0u8; 512];
+  e.poll_query_transmit(h, now, &mut buf)
+    .unwrap()
+    .expect("a newly-started query has its first question due");
+  e.retire_query(h);
+}
+
 // ── Stats invariant: queries_started == queries_done + queries_active ──────
 
 /// The invariant `queries_started == queries_done + queries_active` must
@@ -3394,7 +3441,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
     tx.is_some(),
     "newly-started query must have an initial transmit pending"
   );
-  // Do NOT call note_query_transmit_result — leave the query awaiting confirm.
+  // Do NOT call note_query_transmit_outcome — leave the query awaiting confirm.
   // Now feed the peer question: note_duplicate_question → returns false → no bump.
   {
     let mut events = e
@@ -3410,7 +3457,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 
   // (b) Confirm the send, advance time to arm next retry, then feed the peer
   // question again → note_duplicate_question returns true → counter advances.
-  e.note_query_transmit_result(h, now, true); // confirm
+  e.note_query_transmit_outcome(h, now, TransmitDelivery::ALL); // confirm
   now += Duration::from_secs(10); // past the first retry deadline (~1s)
   e.handle_query_timeout(h, now).unwrap(); // arms transmit_pending = true
 
@@ -3782,7 +3829,7 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
   // B has CONFIRMED-ADVERTISED the shared address (its announce was delivered),
   // so the route's advertised set is non-empty — otherwise retention would
   // honour nothing and A would (wrongly) withdraw the shared address.
-  ep.note_service_advertised(b_handle, &[shared], &[], true);
+  ep.note_service_announced(FullyAnnounced::new(b_handle, true), &[shared], &[]);
 
   // A's withdrawal snapshot: owns PTR/SRV/TXT, the subtype PTR, and both host
   // A addresses.
@@ -3854,7 +3901,7 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
 /// (optionally) mirror an advertised set into its route, returning its handle.
 /// `advertised == None` models a registered-but-never-announced sibling (its
 /// route advertised set stays EMPTY); `Some(addrs)` mirrors a confirmed
-/// announce via `note_service_advertised`.
+/// announce via `note_service_announced`.
 fn register_host_service(
   ep: &mut TestEndp,
   instance: &str,
@@ -3879,7 +3926,7 @@ fn register_host_service(
     )
     .unwrap();
   if let Some(adv) = advertised {
-    ep.note_service_advertised(h, adv, &[], true);
+    ep.note_service_announced(FullyAnnounced::new(h, true), adv, &[]);
   }
   h
 }
@@ -5020,19 +5067,25 @@ fn surviving_rename_old_name_is_reclaimable_on_announce() {
   );
 
   // The reclaiming service CONFIRMS advertising its name → cancel-on-announce.
-  ep.note_service_advertised(handle, &[Ipv4Addr::new(192, 168, 1, 10)], &[], true);
+  ep.note_service_announced(
+    FullyAnnounced::new(handle, true),
+    &[Ipv4Addr::new(192, 168, 1, 10)],
+    &[],
+  );
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "the reclaimable goodbye is cancelled when the new service announces the name"
   );
 }
 
-/// cancel-on-announce must NOT fire on a PROBE. `note_service_advertised`
+/// cancel-on-announce must NOT fire on a PROBE. `note_service_announced`
 /// is called after EVERY delivered service transmit (including probes); the
-/// reclaim-cancel is gated on `advertised_instance` so a probe alone cannot cancel
-/// a renamed-away old name's goodbye before the reclaiming service has actually
-/// advertised. A service with NO host addresses still signals `advertised_instance`
-/// via its instance records, so the address args cannot serve as the guard.
+/// reclaim-cancel is gated on `Service::has_fully_announced`, which is set only
+/// by a fully-delivered §8.3 announcement — never a probe — so a probe alone
+/// cannot cancel a renamed-away old name's goodbye before the reclaiming service
+/// has actually announced. A service with NO host addresses still reaches this
+/// gate through its instance records, so the address args cannot serve as the
+/// guard.
 #[test]
 fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
   let mut ep = build_endpoint();
@@ -5064,19 +5117,19 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
     )
     .unwrap();
 
-  // A delivered PROBE reports advertised_instance=false (no instance records
+  // A delivered PROBE reports fully_announced=false (no instance records
   // emitted yet) — and ALSO an address-less shape (empty address slices). The
   // goodbye MUST survive: if the reclaiming service drops/conflicts after probing
   // but before announcing, the old records still need retracting.
-  ep.note_service_advertised(handle, &[], &[], false);
+  ep.note_service_announced(FullyAnnounced::new(handle, false), &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_some(),
-    "a probe (advertised_instance=false) must NOT cancel the reclaimed goodbye"
+    "a probe (fully_announced=false) must NOT cancel the reclaimed goodbye"
   );
 
-  // A CONFIRMED instance-advertise (advertised_instance=true, still address-less)
+  // A CONFIRMED instance-advertise (fully_announced=true, still address-less)
   // cancels it.
-  ep.note_service_advertised(handle, &[], &[], true);
+  ep.note_service_announced(FullyAnnounced::new(handle, true), &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "a confirmed instance-advertise cancels the reclaimed goodbye (even address-less)"
@@ -5783,7 +5836,7 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
 
   // The reclaiming service CONFIRMS advertising the name → cancel-on-announce
   // drops the goodbye, so no late TTL=0 goodbye can flush the new registration.
-  ep.note_service_advertised(dup_h, &[], &[], true);
+  ep.note_service_announced(FullyAnnounced::new(dup_h, true), &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "the detached old-name goodbye is cancelled when the reclaiming service announces"
@@ -5883,7 +5936,7 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
   );
   // When S CONFIRMS advertising its instance records under `target`,
   // cancel-on-announce drops the goodbye so no late TTL=0 send can flush S.
-  ep.note_service_advertised(s, &[], &[], true);
+  ep.note_service_announced(FullyAnnounced::new(s, true), &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&target).is_none(),
     "the detached goodbye is cancelled once S advertises the reclaimed name"
@@ -6975,4 +7028,378 @@ fn additional_section_ttl0_withdrawal_skipped_then_later_record_delivered() {
     to_query, 1,
     "a TTL=0 additional must be skipped while the following positive-TTL one is delivered"
   );
+}
+
+// ── TransmitDelivery at the endpoint boundary ─────────────────────────
+
+#[test]
+fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = ep
+    .try_start_query(
+      crate::config::QuerySpec::new(qname, ResourceType::Any),
+      now,
+    )
+    .unwrap();
+  let mut buf = std::vec![0u8; 512];
+  assert!(ep.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
+
+  ep.note_query_transmit_outcome(h, now, TransmitDelivery::V4_ONLY);
+  let after_partial = ep.poll_query_timeout(h);
+  assert!(
+    after_partial.is_some(),
+    "a partially-delivered question must still re-arm"
+  );
+
+  // Only the excusing round spends a slot, so the query survives far more partial
+  // rounds than MAX_RETRIES. (`Query::note_transmit_outcome` owns the walk past
+  // that bound; this pins that the endpoint boundary ferries the per-family
+  // confirm rather than absorbing it.)
+  for _ in 0..12 {
+    let due = ep.poll_query_timeout(h).unwrap();
+    ep.handle_query_timeout(h, due).unwrap();
+    assert!(ep.poll_query_transmit(h, due, &mut buf).unwrap().is_some());
+    ep.note_query_transmit_outcome(h, due, TransmitDelivery::V4_ONLY);
+  }
+  assert!(
+    ep.poll_query(h).is_none(),
+    "no partial send may retire the query"
+  );
+}
+
+/// Endpoint conformance for the driver-audit §2.3 reclaim sequence: a reclaiming
+/// service that has announced on only SOME obligated links must NOT cancel the
+/// renamed-away old name's in-flight goodbye. The gate is
+/// `Service::has_fully_announced`, ferried verbatim; the sequence dies at the
+/// step where a v4-only announce would previously have cancelled it, leaving the
+/// v6 zone with neither the goodbye nor the replacement announcement.
+#[test]
+fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
+  let mut ep = build_endpoint();
+  let mut now = StdInstant::now();
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let name = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("printer.local.").unwrap();
+
+  // A surviving rename left a RECLAIMABLE detached goodbye for the old name.
+  ep.enqueue_rename_withdrawal(
+    crate::service::RenameGoodbyeHandoff {
+      records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+    },
+    now,
+    false,
+  );
+
+  // A fresh service reclaims the vacated name. The reclaim-cancel gate names its
+  // own service through the `FullyAnnounced` token, so no handle is needed here.
+  let mut recs = ServiceRecords::new(stype, name.clone(), host, 631, 120);
+  recs.add_a(Ipv4Addr::new(192, 168, 1, 10));
+  let (_handle, mut svc) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  // Drive its §8.1 probes, every one fully delivered, and ferry the gate after
+  // each confirm exactly as a driver does.
+  let mut buf = std::vec![0u8; 4096];
+  for _ in 0..20 {
+    if matches!(svc.state(), crate::ServiceState::Announcing(0)) {
+      break;
+    }
+    now = svc.poll_timeout().unwrap_or(now).max(now);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      ep.note_service_announced(
+        svc.has_fully_announced(),
+        svc.advertised_a_addrs(),
+        svc.advertised_aaaa_addrs(),
+      );
+    }
+  }
+  assert!(
+    matches!(svc.state(), crate::ServiceState::Announcing(0)),
+    "expected the reclaiming service to finish probing; got {:?}",
+    svc.state()
+  );
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_some(),
+    "probing alone must never cancel the old name's goodbye"
+  );
+
+  // The first announcement reaches IPv4 only.
+  now = svc.poll_timeout().unwrap_or(now).max(now);
+  svc.handle_timeout(now).unwrap();
+  assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
+  svc.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+  assert!(
+    svc.advertises_instance(),
+    "the v4 zone heard it, so ownership latched"
+  );
+  ep.note_service_announced(
+    svc.has_fully_announced(),
+    svc.advertised_a_addrs(),
+    svc.advertised_aaaa_addrs(),
+  );
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_some(),
+    "the v6 zone has heard neither the goodbye nor the replacement — the old \
+     name's goodbye MUST keep draining"
+  );
+
+  // IPv6 recovers and the next announcement reaches every obligated link.
+  now = svc.poll_timeout().unwrap_or(now).max(now);
+  svc.handle_timeout(now).unwrap();
+  assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
+  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  ep.note_service_announced(
+    svc.has_fully_announced(),
+    svc.advertised_a_addrs(),
+    svc.advertised_aaaa_addrs(),
+  );
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_none(),
+    "once every obligated link has heard the replacement, §10.2's cache-flush \
+     announcement supersedes the stale records and the goodbye is cancelled"
+  );
+}
+
+/// The reclaim-cancel gate is reachable ONLY through a `FullyAnnounced`. This pins
+/// what a compile-time check cannot state from inside the crate: the fact round-
+/// trips whether it is ferried from `Service::has_fully_announced` or minted
+/// directly — `false` cancels nothing, `true` cancels, regardless of provenance.
+#[test]
+fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let name = Name::try_from_str("Ghost._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("ghost.local.").unwrap();
+
+  // A service that has announced nothing mints a `false` fact, which cancels
+  // nothing however it is delivered to the endpoint.
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+  ep.enqueue_rename_withdrawal(
+    crate::service::RenameGoodbyeHandoff {
+      records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+    },
+    now,
+    false,
+  );
+  let recs = ServiceRecords::new(stype, name.clone(), host, 631, 120);
+  let (handle, svc) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+  let fact = svc.has_fully_announced();
+  assert!(
+    !fact.get(),
+    "a freshly registered service has announced nothing"
+  );
+  ep.note_service_announced(fact, &[], &[]);
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_some(),
+    "a `false` fact cancels nothing"
+  );
+
+  // A directly-minted `true` fact is the same code path as one ferried from a
+  // `Service` that has actually fully announced — it cancels.
+  ep.note_service_announced(FullyAnnounced::new(handle, true), &[], &[]);
+  assert!(
+    ep.detached_withdrawal_owed_for(&name).is_none(),
+    "a `true` fact cancels the reclaimable goodbye"
+  );
+}
+
+/// The reclaim-cancel gate routes on the handle INSIDE the `FullyAnnounced`, so
+/// one service's proof can only ever retire its OWN name's reclaimable goodbye.
+///
+/// An unforgeable fact is still transplantable while its subject is a separate
+/// argument: a genuine `true` from a service that fully announced, paired with a
+/// different service's handle, would cancel that other name's goodbye while an
+/// obligated family still needed it.
+#[test]
+fn a_fully_announced_proof_cancels_only_its_own_services_goodbye() {
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("shared.local.").unwrap();
+  let name_a = Name::try_from_str("A._ipp._tcp.local.").unwrap();
+  let name_b = Name::try_from_str("B._ipp._tcp.local.").unwrap();
+
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+
+  // Both names have a RECLAIMABLE detached goodbye still draining.
+  for name in [&name_a, &name_b] {
+    ep.enqueue_rename_withdrawal(
+      crate::service::RenameGoodbyeHandoff {
+        records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+        owned: crate::service::EmittedRecords::new(
+          true,
+          true,
+          true,
+          std::vec::Vec::new(),
+          std::vec::Vec::new(),
+          false,
+        ),
+      },
+      now,
+      false,
+    );
+  }
+
+  // Both names are reclaimed by fresh services.
+  let (handle_a, _svc_a) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(ServiceRecords::new(
+        stype.clone(),
+        name_a.clone(),
+        host.clone(),
+        631,
+        120,
+      )),
+      now,
+    )
+    .unwrap();
+  let (_handle_b, _svc_b) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(ServiceRecords::new(stype, name_b.clone(), host, 631, 120)),
+      now,
+    )
+    .unwrap();
+
+  // Only A has fully announced. Its proof names A, and the endpoint has no other
+  // way to learn which service the fact is about.
+  ep.note_service_announced(FullyAnnounced::new(handle_a, true), &[], &[]);
+  assert!(
+    ep.detached_withdrawal_owed_for(&name_a).is_none(),
+    "A's own reclaimable goodbye is superseded by A's complete announcement"
+  );
+  assert!(
+    ep.detached_withdrawal_owed_for(&name_b).is_some(),
+    "B has announced nothing, so B's goodbye MUST keep draining"
+  );
+}
+
+// ── the minimum advertisable TTL ──────────────────────────────────────
+
+fn spec_with_ttl(instance: &str, ttl_secs: u32) -> ServiceSpec {
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let inst = Name::try_from_str(instance).unwrap();
+  let host = Name::try_from_str("h.local.").unwrap();
+  let mut recs = ServiceRecords::new(stype, inst, host, 631, ttl_secs);
+  recs.add_a(Ipv4Addr::new(10, 0, 0, 5));
+  ServiceSpec::new(recs)
+}
+
+/// A TTL-0 positive record is the RFC 6762 §10.1 goodbye encoding — it tells
+/// every peer to DELETE the record — so publishing a service at it advertises
+/// and retracts in the same datagram. TTL 1 refreshes at 0.8 s, inside §8.3's
+/// one-second floor on unsolicited responses, so the record cannot be kept alive
+/// at a legal rate; both also truncate the periodic refresh interval to zero,
+/// which re-arms an `Established` service at `now`.
+///
+/// `Service::try_new` is crate-private, so registration is the only way to build
+/// one and this guard is total.
+#[test]
+fn registration_rejects_a_ttl_below_the_advertisable_minimum() {
+  for ttl in [0u32, 1] {
+    let mut e = build_endpoint();
+    let err = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      spec_with_ttl("P._ipp._tcp.local.", ttl),
+      StdInstant::now(),
+    ) {
+      Ok(_) => panic!("a TTL of {ttl} s must be rejected, not clamped or accepted"),
+      Err(e) => e,
+    };
+    assert!(
+      matches!(err, RegisterServiceError::TtlTooSmall(t) if t == ttl),
+      "expected TtlTooSmall({ttl}), got {err:?}"
+    );
+    assert!(
+      e.services.iter().next().is_none(),
+      "a rejected registration must reserve no name"
+    );
+  }
+}
+
+/// The smallest TTL that IS advertisable, driven end-to-end: it registers, it
+/// reaches `Established`, and its periodic refresh re-arms a full RFC 6762 §8.3
+/// announce interval out rather than at `now`. A zero-length interval would make
+/// the service re-announce on every tick forever.
+#[test]
+fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
+  use core::time::Duration;
+
+  let mut e = build_endpoint();
+  let base = StdInstant::now();
+  let (_handle, mut svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      spec_with_ttl("P._ipp._tcp.local.", crate::constants::MIN_SERVICE_TTL_SECS),
+      base,
+    )
+    .expect("the minimum TTL is advertisable");
+
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = base;
+  for _ in 0..40 {
+    now = svc.poll_timeout().filter(|d| *d > now).unwrap_or(now);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    }
+    if svc.state() == crate::ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(
+    svc.state(),
+    crate::ServiceState::Established,
+    "a minimum-TTL service must still complete the §8.1/§8.3 sequence"
+  );
+
+  // Two consecutive refresh rounds, each fired at its own deadline: both the
+  // deadline the announce phase left and the one the refresh confirm installs
+  // must clear the one-second floor.
+  for round in 0..2 {
+    let due = svc
+      .poll_timeout()
+      .expect("an Established service re-announces periodically");
+    assert!(
+      due >= now + Duration::from_secs(1),
+      "round {round}: the periodic refresh re-armed inside the §8.3 one-second \
+       floor, so the service repumps"
+    );
+    now = due;
+    svc.handle_timeout(now).unwrap();
+    let mut sent = 0usize;
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      sent += 1;
+      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    }
+    assert_eq!(
+      sent, 1,
+      "round {round}: one fired refresh deadline is one unsolicited response"
+    );
+  }
 }
