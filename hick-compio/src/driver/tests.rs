@@ -2933,6 +2933,10 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
     &sock_v6,
     querier_addr,
     b"legacy-unicast-reply",
+    // A §6.7 reply is one-shot and therefore ungated.
+    &mut FamilyWireGate::default(),
+    Duration::ZERO,
+    StdInstant::now(),
   )
   .await;
 
@@ -2957,6 +2961,67 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
 }
 
 // ── The wedged family (per-family send bound) ───────────────────────────────
+
+/// What `Transmit::min_family_gap()` carries for an RFC 6762 §8.3 unsolicited
+/// announcement — the one-second floor §6 puts on re-multicasting a record on the
+/// same interface. Restated here because the core's copy is crate-private.
+const ANNOUNCE_MIN_FAMILY_GAP: Duration = Duration::from_secs(1);
+
+/// What it carries for a §8.1 probe, which is explicitly EXEMPT from that
+/// one-second rule and spaced by its own inter-probe interval instead.
+const PROBE_MIN_FAMILY_GAP: Duration = Duration::from_millis(250);
+
+/// The gate is kind-dependent, which is precisely why the driver may not pick the
+/// number: a driver that hardcoded §6's one second would stretch the §8.1 probe
+/// sequence fourfold, and one that hardcoded 250 ms would breach §6 on every
+/// announcement. The value arrives on the `Transmit`; only the WHEN is the
+/// driver's.
+#[test]
+fn the_wire_gate_holds_each_kind_to_its_own_minimum() {
+  let mut gate = FamilyWireGate::default();
+  let t0 = StdInstant::now();
+
+  assert!(
+    gate.open(FAMILY_V6, t0, ANNOUNCE_MIN_FAMILY_GAP),
+    "a family that has carried nothing owes no gap"
+  );
+  gate.record(FAMILY_V6, t0, ANNOUNCE_MIN_FAMILY_GAP);
+
+  let skewed = t0 + Duration::from_millis(850);
+  assert!(
+    !gate.open(FAMILY_V6, skewed, ANNOUNCE_MIN_FAMILY_GAP),
+    "an announcement 850 ms after this family's own last one is inside §6 /      §8.3's floor for that interface, however the confirm anchored"
+  );
+  assert!(
+    gate.open(FAMILY_V6, skewed, PROBE_MIN_FAMILY_GAP),
+    "…yet a §8.1 probe at the same instant is fine: probes are exempt from the      one-second rule and carry their own 250 ms minimum"
+  );
+  assert!(
+    gate.open(FAMILY_V6, skewed, Duration::ZERO),
+    "…and a one-shot reply is ungated entirely — a gate could only drop it"
+  );
+  assert!(
+    gate.open(FAMILY_V4, skewed, ANNOUNCE_MIN_FAMILY_GAP),
+    "the gate is per family: v4's wire owes nothing because of what v6 carried"
+  );
+  assert!(
+    gate.open(
+      FAMILY_V6,
+      t0 + ANNOUNCE_MIN_FAMILY_GAP,
+      ANNOUNCE_MIN_FAMILY_GAP
+    ),
+    "exactly one interval later the floor is paid"
+  );
+
+  // An ungated send must leave no trace, or a §6 reply would defer the
+  // announcement that follows it.
+  let mut ungated = FamilyWireGate::default();
+  ungated.record(FAMILY_V4, t0, Duration::ZERO);
+  assert!(
+    ungated.open(FAMILY_V4, t0, ANNOUNCE_MIN_FAMILY_GAP),
+    "a one-shot send does not start the clock on the next announcement"
+  );
+}
 
 /// How a [`TestSocket`] answers a send.
 #[derive(Clone, Copy)]
@@ -3002,9 +3067,19 @@ async fn wedged_v6_round(
   let sock_v6 = Some(Rc::new(TestSocket(SendBehaviour::Wedged)));
 
   let started = StdInstant::now();
+  let mut gate = FamilyWireGate::default();
   let (fanout, accepted_at) = compio::time::timeout(
     SEND_ATTEMPT_TIMEOUT * 20,
-    send_via(inner, &sock_v4, &sock_v6, MDNS_V4_DST, body),
+    send_via(
+      inner,
+      &sock_v4,
+      &sock_v6,
+      MDNS_V4_DST,
+      body,
+      &mut gate,
+      ANNOUNCE_MIN_FAMILY_GAP,
+      started,
+    ),
   )
   .await
   .expect(

@@ -1,4 +1,7 @@
-use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::{
+  net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+  time::Duration,
+};
 
 use super::{FamilyDelivery, Transmit, TransmitDelivery, TransmitObligation};
 
@@ -6,15 +9,28 @@ use super::{FamilyDelivery, Transmit, TransmitDelivery, TransmitObligation};
 fn accessors_return_constructed_fields() {
   let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), 5353));
   let src = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
-  let t = Transmit::new(dst, Some(src), 42, TransmitObligation::Sustained);
+  let gap = Duration::from_millis(250);
+  let t = Transmit::new(dst, Some(src), 42, TransmitObligation::Sustained, gap);
   assert_eq!(t.dst(), dst);
   assert_eq!(t.src_ip(), Some(src));
   assert_eq!(t.size(), 42);
   assert_eq!(t.obligation(), TransmitObligation::Sustained);
   assert_eq!(
-    Transmit::new(dst, None, 1, TransmitObligation::OneShot).obligation(),
+    t.min_family_gap(),
+    gap,
+    "the wire-spacing rule is carried per datagram, because it is kind-dependent \
+     and no driver may pick it"
+  );
+  let one_shot = Transmit::new(dst, None, 1, TransmitObligation::OneShot, Duration::ZERO);
+  assert_eq!(
+    one_shot.obligation(),
     TransmitObligation::OneShot,
     "the tag is carried per datagram, not derived from the destination"
+  );
+  assert_eq!(
+    one_shot.min_family_gap(),
+    Duration::ZERO,
+    "a datagram the core never re-arms is ungated: a gate could only drop it"
   );
 }
 

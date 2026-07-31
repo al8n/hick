@@ -96,6 +96,9 @@ struct ServiceSlot<I: Instant> {
   proto: ProtoService<I>,
   updates: VecDeque<ServiceUpdate>,
   errored: bool,
+  /// When each family last carried one of THIS service's gated datagrams, so the
+  /// RFC 6762 §8.1 / §8.3 spacing is honoured per wire. See [`FamilyWireGate`].
+  wire_gate: FamilyWireGate<I>,
   /// Set when the endpoint-owned withdrawal for this service has COMPLETED (its
   /// route is already freed) but the slot is RETAINED because it still holds
   /// un-polled app-facing updates — typically the `Conflict` queued at an internal
@@ -158,8 +161,77 @@ impl<I: Instant> ServiceSlot<I> {
 /// skips. A retired query is ALSO forced to its proto-level TIMEOUT terminal (see
 /// [`Engine::retire_query`]), so its terminal update and frozen answers come from
 /// the proto, not a synthetic driver-side signal.
-struct QuerySlot {
+struct QuerySlot<I> {
   errored: bool,
+  /// When each family last carried one of THIS question's transmissions, so
+  /// RFC 6762 §5.2's one-second floor is honoured per wire. See
+  /// [`FamilyWireGate`].
+  wire_gate: FamilyWireGate<I>,
+}
+
+/// One PRODUCER's per-family earliest-next-send gate: when each address family
+/// ([0] = v4, [1] = v6) last carried a datagram from this service or query.
+///
+/// The rule it enforces is RFC 6762's, on the wire: §6 and §8.3 forbid
+/// re-multicasting a record on an interface inside one second of the last time it
+/// went out on that same interface, and §8.1 spaces probes 250 ms apart. The
+/// MINIMUM is protocol policy and arrives from the core on
+/// [`Transmit::min_family_gap`]; only the driver knows when each family last
+/// satisfied it, which is why the two halves live on opposite sides of the seam.
+///
+/// This driver offers both families inside ONE synchronous pump, so its confirm
+/// anchor and both families' wire instants coincide and the gate does not fire in
+/// any in-tree schedule. It is enforced anyway, and identically to the
+/// readiness/completion drivers, because the rule is about the wire rather than
+/// about how a particular driver reaches it: a fan-out that ever defers one
+/// family — [`family_order`] already exists to hand a one-slot transport to the
+/// longest-blocked family — would otherwise take that family's spacing with it.
+///
+/// Kept PER PRODUCER because the rules are per record set: two different services
+/// announcing inside the same second are two different records and pace each
+/// other not at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FamilyWireGate<I> {
+  /// Indexed [v4, v6]. `None` until that family has carried a GATED datagram from
+  /// this producer — an ungated (one-shot) send never writes here, so a §6 reply
+  /// cannot defer the announcement that follows it.
+  last_sent: [Option<I>; 2],
+}
+
+impl<I: Instant> FamilyWireGate<I> {
+  fn new() -> Self {
+    Self {
+      last_sent: [None, None],
+    }
+  }
+
+  /// Whether family `idx` may be offered a datagram at `now` under `min_gap`.
+  ///
+  /// A zero `min_gap` is ungated and always open. A family that has carried
+  /// nothing yet is open. A clock that reads BEFORE the recorded send closes the
+  /// gate: the elapsed gap is then unknown, and the conservative answer is the
+  /// one that cannot put a record back on the wire too soon.
+  fn open(&self, idx: usize, now: I, min_gap: Duration) -> bool {
+    if min_gap.is_zero() {
+      return true;
+    }
+    match self.last_sent.get(idx).copied().flatten() {
+      Some(last) => now
+        .checked_duration_since(last)
+        .is_some_and(|gap| gap >= min_gap),
+      None => true,
+    }
+  }
+
+  /// Record that family `idx` put a GATED datagram on its wire at `at`.
+  fn record(&mut self, idx: usize, at: I, min_gap: Duration) {
+    if min_gap.is_zero() {
+      return;
+    }
+    if let Some(slot) = self.last_sent.get_mut(idx) {
+      *slot = Some(at);
+    }
+  }
 }
 
 /// The outcome of a single per-family send attempt in a multicast fan-out or
@@ -176,6 +248,12 @@ struct QuerySlot {
 enum FamilySend {
   /// Datagram placed on the wire; payload byte count is carried for `bytes_tx`.
   Sent(usize),
+  /// A present socket was NOT offered the datagram because the producer's
+  /// previous one is still inside [`Transmit::min_family_gap`] on THIS family's
+  /// wire (see [`FamilyWireGate`]). Obligated and did not carry it, like `Busy` —
+  /// but a deliberate deferral rather than a full transmit queue, so it is
+  /// neither an error nor a retry candidate.
+  Gated,
   /// Real I/O failure — the socket exists but permanently rejected the datagram.
   Failed,
   /// No socket for this family; not an error, not a retry candidate.
@@ -192,11 +270,13 @@ impl FamilySend {
 
   /// This family's I/O answer as the core's protocol vocabulary. `Busy` is a
   /// MISS, not an absence: the socket exists, so the family is obligated and
-  /// simply did not carry this datagram.
+  /// simply did not carry this datagram. So is `Gated`, for the same reason —
+  /// the socket is there and the datagram was fanned onto it, the driver simply
+  /// owed the wire a gap it had not yet paid.
   const fn delivery(self) -> FamilyDelivery {
     match self {
       FamilySend::Sent(_) => FamilyDelivery::Delivered,
-      FamilySend::Busy | FamilySend::Failed => FamilyDelivery::Missed,
+      FamilySend::Busy | FamilySend::Gated | FamilySend::Failed => FamilyDelivery::Missed,
       FamilySend::Unsupported => FamilyDelivery::Unobligated,
     }
   }
@@ -210,7 +290,9 @@ impl FamilySend {
   fn withdrawal_send(self) -> WithdrawalSend {
     match self {
       FamilySend::Sent(_) => WithdrawalSend::Sent,
-      FamilySend::Busy => WithdrawalSend::Retry,
+      // `Gated` is unreachable for a goodbye burst — it is ungated (see
+      // `Self::burst`) — and keeps the debt if it ever appears.
+      FamilySend::Busy | FamilySend::Gated => WithdrawalSend::Retry,
       FamilySend::Unsupported | FamilySend::Failed => WithdrawalSend::WriteOff,
     }
   }
@@ -263,9 +345,14 @@ impl Fanout {
       + u32::from(matches!(self.v6, FamilySend::Failed))
   }
 
-  /// `true` if at least one family is transiently `Busy` and should be retried.
-  fn any_busy(self) -> bool {
-    matches!(self.v4, FamilySend::Busy) || matches!(self.v6, FamilySend::Busy)
+  /// `true` if at least one family did not carry the datagram for a reason that
+  /// may clear: a transiently full transmit queue (`Busy`), or a wire gap this
+  /// driver deliberately deferred it for (`Gated`). Either family may carry the
+  /// SAME datagram on a later round, so neither may be read as permanent
+  /// undeliverability.
+  fn any_deferred(self) -> bool {
+    matches!(self.v4, FamilySend::Busy | FamilySend::Gated)
+      || matches!(self.v6, FamilySend::Busy | FamilySend::Gated)
   }
 
   /// Hand the per-family fan-out to the core VERBATIM, one [`FamilyDelivery`]
@@ -297,13 +384,13 @@ impl Fanout {
   /// the delivery shape above, or retire the producer because the datagram can
   /// never be sent.
   ///
-  /// Retirement needs all three of: nothing queued anywhere, no family still
-  /// transiently `Busy` (a busy family may recover and carry it), and some family
-  /// rejecting the datagram permanently (`Failed`, reached only from
-  /// [`SendError::TooLarge`]). Every other shape is a confirm — including "every
-  /// family absent", which re-offers without retiring.
+  /// Retirement needs all three of: nothing queued anywhere, no family merely
+  /// deferred (a `Busy` or `Gated` family carries the SAME datagram on a later
+  /// round), and some family rejecting the datagram permanently (`Failed`,
+  /// reached only from [`SendError::TooLarge`]). Every other shape is a confirm —
+  /// including "every family absent", which re-offers without retiring.
   fn into_multicast_outcome(self) -> MulticastOutcome {
-    if !self.any_sent() && !self.any_busy() && self.failed_count() > 0 {
+    if !self.any_sent() && !self.any_deferred() && self.failed_count() > 0 {
       MulticastOutcome::Undeliverable
     } else {
       MulticastOutcome::Confirm(self.into_delivery())
@@ -455,12 +542,21 @@ impl<I: Instant> Multicaster<I> {
     io: &mut T,
     data: &[u8],
     now: I,
+    gate: &mut FamilyWireGate<I>,
+    min_gap: Duration,
   ) -> (MulticastOutcome, Fanout) {
     let mut results = [FamilySend::Unsupported; 2];
     for (idx, group) in family_order(&self.failing_since) {
+      // The producer's own wire spacing, checked BEFORE the socket call so a
+      // deferred family makes no syscall and reports the deferral honestly.
+      if !gate.open(idx, now, min_gap) {
+        results[idx] = FamilySend::Gated;
+        continue;
+      }
       let outcome = match io.try_send(data, group) {
         Ok(()) => {
           self.failing_since[idx] = None;
+          gate.record(idx, now, min_gap);
           FamilySend::Sent(data.len())
         }
         // Busy is TRANSIENT — a momentarily-full TX queue, or an embassy
@@ -575,7 +671,7 @@ impl<I: Instant> Multicaster<I> {
 pub struct Engine<I: Instant, R> {
   endpoint: ProtoEndpoint<I, R>,
   services: BTreeMap<ServiceHandle, ServiceSlot<I>>,
-  queries: BTreeMap<QueryHandle, QuerySlot>,
+  queries: BTreeMap<QueryHandle, QuerySlot<I>>,
   subnets: Vec<IpCidr>,
   /// Reusable scratch for the handles of endpoint-owned withdrawals that
   /// completed in a pump (so [`Endpoint::drain_completed_withdrawals`] can push
@@ -677,6 +773,7 @@ where
         errored: false,
         route_freed: false,
         caller_gone: false,
+        wire_gate: FamilyWireGate::new(),
       },
     );
     Ok(handle)
@@ -726,7 +823,13 @@ where
   /// Start a query. Updates are read via [`Self::poll_query_update`].
   pub fn start_query(&mut self, spec: QuerySpec, now: I) -> Result<QueryHandle, StartQueryError> {
     let handle = self.endpoint.try_start_query(spec, now)?;
-    self.queries.insert(handle, QuerySlot { errored: false });
+    self.queries.insert(
+      handle,
+      QuerySlot {
+        errored: false,
+        wire_gate: FamilyWireGate::new(),
+      },
+    );
     Ok(handle)
   }
 
@@ -848,7 +951,18 @@ where
           not(any(feature = "stats", feature = "defmt")),
           allow(unused_variables)
         )]
-        let (outcome, fanout) = self.tx.send_multicast(io, &scratch[..len], now);
+        // The producing service's / query's own per-family wire spacing. Copied
+        // out and written back because `self.tx` and the slot maps are disjoint
+        // fields and the fan-out borrows the former mutably.
+        let mut gate = self.wire_gate(origin);
+        let (outcome, fanout) = self.tx.send_multicast(
+          io,
+          &scratch[..len],
+          now,
+          &mut gate,
+          transmit.min_family_gap(),
+        );
+        self.set_wire_gate(origin, gate);
         // ── Per-family accounting, INDEPENDENT of the coarse outcome ────────────
         // A partial fan-out (v4 Sent + v6 TooLarge) puts one datagram on the wire
         // AND raises one error; keying either counter off the outcome arm would
@@ -1267,6 +1381,36 @@ where
       self.endpoint.enqueue_rename_withdrawal(handoff, now, true);
     }
     self.endpoint.begin_withdrawal(handle, snap, now);
+  }
+
+  /// This producer's per-family wire gate, copied out for a fan-out.
+  ///
+  /// Copied rather than borrowed because the fan-out borrows `self.tx` mutably at
+  /// the same time. A producer retired mid-pump yields the default gate, which is
+  /// open — the same answer as a producer that has sent nothing — and the
+  /// write-back is then a no-op.
+  fn wire_gate(&self, origin: Origin) -> FamilyWireGate<I> {
+    match origin {
+      Origin::Service(h) => self.services.get(&h).map(|s| s.wire_gate),
+      Origin::Query(h) => self.queries.get(&h).map(|s| s.wire_gate),
+    }
+    .unwrap_or_else(FamilyWireGate::new)
+  }
+
+  /// Write a fan-out's updated wire gate back onto its producer.
+  fn set_wire_gate(&mut self, origin: Origin, gate: FamilyWireGate<I>) {
+    match origin {
+      Origin::Service(h) => {
+        if let Some(slot) = self.services.get_mut(&h) {
+          slot.wire_gate = gate;
+        }
+      }
+      Origin::Query(h) => {
+        if let Some(slot) = self.queries.get_mut(&h) {
+          slot.wire_gate = gate;
+        }
+      }
+    }
   }
 
   /// Extract one outgoing datagram into `scratch`: services first, then

@@ -6606,6 +6606,61 @@ fn an_obligation_gap_clears_the_stalled_latch() {
   );
 }
 
+/// The same transition, seen through the bit that completes a phase without any
+/// single round reaching every family: COVERAGE must not survive an obligation
+/// gap either.
+///
+/// Coverage claims that THIS family already carried the datagram still
+/// outstanding. A family that leaves the obligated set and returns is a new link
+/// which has carried nothing, so a stale bit lets the next round read
+/// `all(covered)` and advance the phase on PRE-GAP evidence — the returned family
+/// is never required to receive the current datagram at all, which is exactly
+/// what RFC 6762 §8.1 forbids for a name being claimed.
+#[test]
+fn an_obligation_gap_clears_the_coverage_bit() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_announcing_zero(&mut svc);
+
+  // v6 carries the announcement; v4 misses. v6 is now covered for this datagram.
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitDelivery::V6_ONLY);
+  assert!(
+    svc.partial_rounds[V6].covered,
+    "the family that carried the datagram is covered for it"
+  );
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(0)),
+    "v4 has not been told yet, so the phase holds; got {:?}",
+    svc.state()
+  );
+  now = svc.lifecycle_deadline.expect("re-armed");
+
+  // v6's socket goes away in a round that reached NO wire.
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(
+    at,
+    TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Unobligated),
+  );
+  assert_eq!(
+    svc.partial_rounds[V6],
+    FamilyPatience::default(),
+    "the departed family leaves NOTHING behind — its coverage describes a link \
+     that no longer exists"
+  );
+  now = svc.lifecycle_deadline.expect("a failed round retries flat");
+
+  // v6 comes back and misses while v4 delivers.
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(0)),
+    "the returned family has carried nothing since the gap, so this round is \
+     PARTIAL: the phase may not advance on coverage earned by the link that went \
+     away; got {:?}",
+    svc.state()
+  );
+}
+
 /// The capacity-one transport at the CORE's own seam: the families take turns, so
 /// no single round reaches both and NEITHER family is failing.
 ///

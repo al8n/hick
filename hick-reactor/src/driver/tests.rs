@@ -838,7 +838,9 @@ async fn same_name_replacement_is_rejected_until_withdrawal_completes() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    state.drain_withdrawals(t, &mut scratch).await;
+    let _ = state
+      .drain_withdrawals(t, &mut DrainBudget::new(t), &mut scratch)
+      .await;
     if !state.services.contains_key(&a) {
       completed = true;
       break;
@@ -939,7 +941,9 @@ async fn queued_conflict_survives_withdrawal_gc() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    state.drain_withdrawals(t, &mut scratch).await;
+    let _ = state
+      .drain_withdrawals(t, &mut DrainBudget::new(t), &mut scratch)
+      .await;
     if !state.services.contains_key(&handle) {
       completed = true;
       break;
@@ -1236,7 +1240,9 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   let mut gced = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    state.drain_withdrawals(t, &mut scratch).await;
+    let _ = state
+      .drain_withdrawals(t, &mut DrainBudget::new(t), &mut scratch)
+      .await;
     if !state.services.contains_key(&handle) {
       gced = true;
       break;
@@ -1348,7 +1354,9 @@ async fn terminal_survives_full_mailbox_and_immediate_ctx_gc() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    state.drain_withdrawals(t, &mut scratch).await;
+    let _ = state
+      .drain_withdrawals(t, &mut DrainBudget::new(t), &mut scratch)
+      .await;
     if !state.services.contains_key(&handle) {
       completed = true;
       break;
@@ -1471,7 +1479,9 @@ async fn unencodable_query_retire_records_terminal_stats() {
   // Drive drain_transmits with a 1-byte scratch → encode fails for the
   // pending question → retire_query must be called.
   let mut scratch = vec![0u8; 1];
-  state.drain_transmits(now, &mut scratch).await;
+  state
+    .drain_transmits(now, &mut DrainBudget::new(now), &mut scratch)
+    .await;
 
   // Stats invariant: queries_active == 0, queries_done == 1.
   let after = state.stats.snapshot();
@@ -1585,7 +1595,9 @@ async fn encode_retired_gc_runs_with_subsequent_queries_pending() {
   // encode_retired.  This is acceptable: the assertion below checks that the
   // encode-failing handle is gone, irrespective of how many others fail too.
   let mut scratch = vec![0u8; 1];
-  let more_pending = state.drain_transmits(now, &mut scratch).await;
+  let more_pending = state
+    .drain_transmits(now, &mut DrainBudget::new(now), &mut scratch)
+    .await;
 
   // `more_pending` is false because null sockets never exhaust credits.
   // The credit-exhaustion `break` path requires live multicast sockets and
@@ -1723,8 +1735,8 @@ fn delivery_test_spec(instance: &str) -> mdns_proto::ServiceSpec {
 /// Drain one service's due transmits at `t`, confirming each through the SAME
 /// seam `drain_transmits` uses. Returns how many datagrams were confirmed.
 #[cfg(feature = "tokio")]
-fn confirm_service_round(
-  state: &mut DriverState<agnostic_net::tokio::Net>,
+fn confirm_service_round<N: agnostic_net::Net>(
+  state: &mut DriverState<N>,
   h: ServiceHandle,
   t: StdInstant,
   buf: &mut [u8],
@@ -2154,6 +2166,10 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
     &v6,
     querier_addr,
     b"legacy-unicast-reply",
+    // A §6.7 reply is one-shot and therefore ungated.
+    &mut FamilyWireGate::default(),
+    Duration::ZERO,
+    StdInstant::now(),
     #[cfg(feature = "stats")]
     &stats,
   )
@@ -2182,6 +2198,14 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
 
 // ── The wedged family (per-family send bound) ───────────────────────────────
 
+/// What `Transmit::min_family_gap()` carries for an RFC 6762 §8.3 unsolicited
+/// announcement — the one-second floor §6 puts on re-multicasting a record on the
+/// same interface. Restated here because the core's copy is crate-private; the
+/// tests that assert on the gate check the two agree by driving a real
+/// announcement through `drain_transmits`.
+#[cfg(feature = "tokio")]
+const ANNOUNCE_MIN_FAMILY_GAP: Duration = Duration::from_secs(1);
+
 /// How a [`TestSocket`] answers `poll_send_to`.
 #[cfg(feature = "tokio")]
 #[derive(Clone, Copy)]
@@ -2193,6 +2217,11 @@ enum SendBehaviour {
   /// case no bound UDP socket can be coaxed into on a real host, and the only one
   /// that distinguishes a bounded attempt from an unbounded one.
   Wedged,
+  /// Accepts, but not before this instant — the family that is SLOW rather than
+  /// broken. This is what produces inter-family skew: both families carry the
+  /// datagram, one of them measurably later than the other, so the confirm's
+  /// earliest-acceptance anchor and this family's own wire time diverge.
+  Delayed(StdInstant),
 }
 
 /// A bound socket whose write side is scripted. It owns a real `std::net`
@@ -2204,6 +2233,10 @@ enum SendBehaviour {
 struct TestSocket {
   fd: std::net::UdpSocket,
   behaviour: SendBehaviour,
+  /// Every instant at which this socket ACCEPTED a datagram, in order. This is
+  /// the WIRE record the per-family spacing rules are actually about, captured
+  /// independently of anything the driver reports.
+  sends: Arc<Mutex<Vec<StdInstant>>>,
 }
 
 #[cfg(feature = "tokio")]
@@ -2212,7 +2245,26 @@ impl TestSocket {
     Self {
       fd: std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a loopback socket"),
       behaviour,
+      sends: Arc::new(Mutex::new(Vec::new())),
     }
+  }
+
+  /// A socket that accepts only once `skew` has elapsed from now.
+  fn delayed(skew: Duration) -> Self {
+    Self::new(SendBehaviour::Delayed(StdInstant::now() + skew))
+  }
+
+  /// A shared view of this socket's accepted-send instants.
+  fn wire_log(&self) -> Arc<Mutex<Vec<StdInstant>>> {
+    Arc::clone(&self.sends)
+  }
+
+  fn note_send(&self) {
+    self
+      .sends
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .push(StdInstant::now());
   }
 }
 
@@ -2224,6 +2276,7 @@ impl TryFrom<std::net::UdpSocket> for TestSocket {
     Ok(Self {
       fd,
       behaviour: SendBehaviour::Accepts,
+      sends: Arc::new(Mutex::new(Vec::new())),
     })
   }
 }
@@ -2267,10 +2320,29 @@ impl UdpSocket for TestSocket {
     _target: SocketAddr,
   ) -> core::task::Poll<std::io::Result<usize>> {
     match self.behaviour {
-      SendBehaviour::Accepts => core::task::Poll::Ready(Ok(buf.len())),
+      SendBehaviour::Accepts => {
+        self.note_send();
+        core::task::Poll::Ready(Ok(buf.len()))
+      }
       // No waker is registered: a wedged family never wakes the task by itself,
       // which is precisely why the attempt needs its own bound.
       SendBehaviour::Wedged => core::task::Poll::Pending,
+      SendBehaviour::Delayed(ready_at) => {
+        let now = StdInstant::now();
+        if now >= ready_at {
+          self.note_send();
+          return core::task::Poll::Ready(Ok(buf.len()));
+        }
+        // A slow family DOES wake the task, unlike a wedged one — that is the
+        // whole difference between the two.
+        let waker = _cx.waker().clone();
+        let wait = ready_at.saturating_duration_since(now);
+        tokio::spawn(async move {
+          tokio::time::sleep(wait).await;
+          waker.wake();
+        });
+        core::task::Poll::Pending
+      }
     }
   }
 
@@ -2418,6 +2490,7 @@ async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Option<StdInstant>
   let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
 
   let started = StdInstant::now();
+  let mut gate = FamilyWireGate::default();
   let out = tokio::time::timeout(
     SEND_ATTEMPT_TIMEOUT * 20,
     send_via(
@@ -2426,6 +2499,9 @@ async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Option<StdInstant>
       &v6,
       MDNS_V4_DST,
       body,
+      &mut gate,
+      ANNOUNCE_MIN_FAMILY_GAP,
+      started,
       #[cfg(feature = "stats")]
       &stats,
     ),
@@ -2689,4 +2765,294 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
     "an all-delivered UNICAST reply is still not a complete announcement"
   );
   drop(reg);
+}
+
+// ── The per-family wire gate and the drain pass budget ──────────────────────
+
+/// A [`Net`](agnostic_net::Net) whose UDP socket is the scripted [`TestSocket`],
+/// so `drain_transmits` can be driven end to end against a family that is slow,
+/// or one that never becomes writable. Everything else is tokio's.
+#[cfg(feature = "tokio")]
+struct TestNet;
+
+#[cfg(feature = "tokio")]
+impl agnostic_net::Net for TestNet {
+  type Runtime = <agnostic_net::tokio::Net as agnostic_net::Net>::Runtime;
+  type TcpListener = <agnostic_net::tokio::Net as agnostic_net::Net>::TcpListener;
+  type TcpStream = <agnostic_net::tokio::Net as agnostic_net::Net>::TcpStream;
+  type UdpSocket = TestSocket;
+}
+
+/// A driver state bound to two scripted sockets.
+#[cfg(feature = "tokio")]
+fn scripted_state(probe: bool, v4: TestSocket, v6: TestSocket) -> DriverState<TestNet> {
+  let opts = crate::options::ServerOptions::default()
+    .with_endpoint_config(mdns_proto::EndpointConfig::new().with_probe_unique_names(probe));
+  DriverState::new(
+    &opts,
+    BoundSockets::<TestNet> {
+      v4: Some(v4),
+      v6: Some(v6),
+      interface_index: 0,
+    },
+  )
+}
+
+/// Fire the due deadlines and run ONE whole driver pass — both drains under one
+/// shared budget, exactly as `driver_task` does. Returns `(more_pending, elapsed)`.
+#[cfg(feature = "tokio")]
+async fn drive_one_pass(state: &mut DriverState<TestNet>, scratch: &mut [u8]) -> (bool, Duration) {
+  let now = StdInstant::now();
+  state.fire_timeouts(now);
+  let mut budget = DrainBudget::new(now);
+  let more_tx = state.drain_transmits(now, &mut budget, scratch).await;
+  let more_wd = state.drain_withdrawals(now, &mut budget, scratch).await;
+  (more_tx || more_wd, now.elapsed())
+}
+
+/// The successive gaps between one socket's accepted sends.
+#[cfg(feature = "tokio")]
+fn wire_gaps(log: &Arc<Mutex<Vec<StdInstant>>>) -> Vec<Duration> {
+  let sends = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+  sends
+    .windows(2)
+    .map(|w| w[1].saturating_duration_since(w[0]))
+    .collect()
+}
+
+/// The headline defect the per-family gate exists for: with inter-family skew,
+/// the LATE family's own successive wire gap fell below RFC 6762 §6 / §8.3's
+/// one-second minimum on every announcement.
+///
+/// The confirm anchors at the EARLIEST acceptance across families, which is the
+/// right anchor for the TTL guarantee — it can only understate how fresh a
+/// family's peers are. But it also means the core schedules the next
+/// announcement one interval after the EARLY family's wire time, so a family
+/// that accepted `s` later gets its own copy `interval − s` after its last one.
+/// The core cannot see `s`; the driver measured it, so the driver holds the gate
+/// and the core supplies the minimum.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skewed_family_is_never_re_announced_inside_its_own_floor() {
+  /// Well under the per-family attempt bound, so v6 genuinely ACCEPTS the first
+  /// datagram (late) rather than timing out and missing it.
+  const SKEW: Duration = Duration::from_millis(150);
+
+  let v4 = TestSocket::new(SendBehaviour::Accepts);
+  let v6 = TestSocket::delayed(SKEW);
+  let (v4_log, v6_log) = (v4.wire_log(), v6.wire_log());
+  let mut state = scripted_state(false, v4, v6);
+  let mut scratch = std::vec![0u8; 4096];
+
+  let reg = state
+    .register_service(delivery_test_spec("skewed"), StdInstant::now())
+    .expect("register the service under test");
+  let h = reg.handle;
+
+  // Three announcement rounds: the first is the skewed one, the second is the
+  // round at which v6's floor is still unpaid, the third is when it is.
+  for _ in 0..3 {
+    drive_one_pass(&mut state, &mut scratch).await;
+    let Some(due) = state.next_deadline() else {
+      break;
+    };
+    let wait = due.saturating_duration_since(StdInstant::now());
+    // Once the burst is over the next deadline is the periodic refresh, ~80 % of
+    // the TTL away; the rounds under test are all §8.3-spaced, so anything longer
+    // means the sequence is done.
+    if wait > Duration::from_secs(3) {
+      break;
+    }
+    // A small overshoot so the deadline has genuinely passed when the next pass
+    // reads the clock; the schedule under test is measured in seconds.
+    tokio::time::sleep(wait + Duration::from_millis(20)).await;
+  }
+  assert!(
+    state.services.contains_key(&h),
+    "the service must survive the whole sequence"
+  );
+
+  for (family, log) in [("v4", &v4_log), ("v6", &v6_log)] {
+    for gap in wire_gaps(log) {
+      assert!(
+        gap >= ANNOUNCE_MIN_FAMILY_GAP,
+        "{family} received two copies of the same service's announcement {gap:?} \
+         apart, inside RFC 6762 §6 / §8.3's one-second floor for that interface. \
+         v4 gaps {:?}, v6 gaps {:?}",
+        wire_gaps(&v4_log),
+        wire_gaps(&v6_log),
+      );
+    }
+  }
+  assert!(
+    v6_log.lock().unwrap_or_else(|e| e.into_inner()).len() >= 2,
+    "the late family must still be SERVED — the gate defers a round, it does not \
+     write the family off"
+  );
+  drop(reg);
+}
+
+/// A pass with many simultaneously-due producers and one wedged family must stay
+/// inside its aggregate budget — and that budget spans the withdrawal pump too.
+///
+/// Producers are awaited serially and the send credits are charged only per
+/// family that actually SENT, so an all-miss fan-out costs zero credits while
+/// still costing a whole attempt bound. The pass was therefore bounded by nothing
+/// at all: `n` due producers with a wedged family ran for `n × 250 ms` with the
+/// packet channel backing up behind it. The goodbye pump had no budget of any
+/// kind.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_with_a_wedged_family_stays_inside_its_budget() {
+  /// Far more than the two entirely-wedged fan-outs a pass can afford, so the
+  /// budget is what stops it rather than the work running out.
+  const DUE_PRODUCERS: usize = 8;
+
+  let v4 = TestSocket::new(SendBehaviour::Accepts);
+  let v6 = TestSocket::new(SendBehaviour::Wedged);
+  let mut state = scripted_state(false, v4, v6);
+  let mut scratch = std::vec![0u8; 4096];
+  let t = StdInstant::now();
+
+  // A service that has announced and is then retired, so a real TTL=0 goodbye is
+  // due in the same pass. Confirmed through the direct seam so the setup itself
+  // costs no wall clock.
+  let dying = state
+    .register_service(delivery_test_spec("dying"), t)
+    .expect("register the withdrawing service");
+  confirm_service_round(&mut state, dying.handle, t, &mut scratch, WHOLE_FANOUT);
+  state.remove_service(dying.handle, t);
+  assert!(
+    state
+      .endpoint
+      .next_withdrawal_deadline()
+      .is_some_and(|due| due <= t),
+    "the retired service must owe a goodbye at the instant the pass starts"
+  );
+
+  let mut regs = Vec::new();
+  for i in 0..DUE_PRODUCERS {
+    regs.push(
+      state
+        .register_service(delivery_test_spec(&std::format!("due{i}")), t)
+        .expect("register a due service"),
+    );
+  }
+
+  let started = StdInstant::now();
+  state.fire_timeouts(started);
+  let mut budget = DrainBudget::new(started);
+  let more_tx = state
+    .drain_transmits(started, &mut budget, &mut scratch)
+    .await;
+  let after_transmits = started.elapsed();
+  let more_wd = state
+    .drain_withdrawals(started, &mut budget, &mut scratch)
+    .await;
+  let elapsed = started.elapsed();
+
+  assert!(
+    more_tx,
+    "the budget must have cut the transmit drain short with producers unserved"
+  );
+  assert!(
+    more_wd,
+    "…and the goodbye still due must be reported pending rather than silently \
+     skipped, so the loop re-enters instead of sleeping"
+  );
+  assert!(
+    elapsed <= DRAIN_PASS_BUDGET + Duration::from_millis(200),
+    "one pass ran for {elapsed:?} against a {DRAIN_PASS_BUDGET:?} budget \
+     ({after_transmits:?} of it in the transmit drain); {DUE_PRODUCERS} due \
+     producers with a wedged family used to cost {:?}",
+    SEND_ATTEMPT_TIMEOUT * (DUE_PRODUCERS as u32),
+  );
+  assert!(
+    elapsed >= after_transmits,
+    "the withdrawal pump shares the pass budget rather than opening its own"
+  );
+  drop(regs);
+  drop(dying);
+}
+
+/// Repeated budget cuts must eventually service EVERY producer.
+///
+/// A pass that always restarts at the front of the handle snapshot serves the
+/// same few producers forever: the ones behind the cut are due on every pass and
+/// reached on none of them. The resume cursor is what makes the budget a delay
+/// rather than a starvation.
+///
+/// Driven with probing services because RFC 6762 §8.1 re-arms a partially
+/// delivered probe within 250 ms, so every producer is genuinely due again at
+/// every pass — which is the condition under which a fixed start point starves.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_budget_cuts_reach_every_producer() {
+  const PRODUCERS: usize = 3;
+
+  let v4 = TestSocket::new(SendBehaviour::Accepts);
+  let v6 = TestSocket::new(SendBehaviour::Wedged);
+  let mut state = scripted_state(true, v4, v6);
+  let mut scratch = std::vec![0u8; 4096];
+  let t = StdInstant::now();
+
+  let mut regs = Vec::new();
+  for i in 0..PRODUCERS {
+    regs.push(
+      state
+        .register_service(delivery_test_spec(&std::format!("probe{i}")), t)
+        .expect("register a probing service"),
+    );
+  }
+  // Two warm-up ticks: the first moves each service Init → Probing(0) (which
+  // schedules the first probe rather than sending one), the second lands past
+  // §8.1's random initial wait of up to 250 ms, so every service is due when the
+  // measured passes begin.
+  for _ in 0..2 {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    state.fire_timeouts(StdInstant::now());
+  }
+  assert!(
+    state.services.values().all(|c| matches!(
+      c.proto.state(),
+      mdns_proto::service::ServiceState::Probing(0)
+    )),
+    "every service must be probing and due before the budget is applied"
+  );
+
+  for _ in 0..PRODUCERS {
+    let now = StdInstant::now();
+    state.fire_timeouts(now);
+    // A budget with room for exactly ONE wedged fan-out, so each pass is cut at a
+    // known point and the cursor is the only thing that can move the start.
+    let mut budget = DrainBudget {
+      credits: MAX_SEND_CREDITS_PER_DRAIN,
+      deadline: now + SEND_ATTEMPT_TIMEOUT + Duration::from_millis(50),
+      started: false,
+    };
+    let more = state.drain_transmits(now, &mut budget, &mut scratch).await;
+    assert!(
+      more,
+      "a one-fan-out budget must cut a {PRODUCERS}-producer pass"
+    );
+    // Past every served producer's §8.1 re-arm, so the whole set is due again and
+    // a fixed start point would spend the next budget on the same handle.
+    tokio::time::sleep(Duration::from_millis(280)).await;
+  }
+
+  let unserved: Vec<_> = state
+    .services
+    .iter()
+    .filter(|(_, ctx)| ctx.wire_gate.last_sent[FAMILY_V4].is_none())
+    .map(|(h, _)| *h)
+    .collect();
+  assert!(
+    unserved.is_empty(),
+    "{} of {PRODUCERS} producers never reached a wire across {PRODUCERS} cut \
+     passes: {unserved:?}. A budget cut must rotate where the next pass resumes, \
+     or the producers behind the first cut are starved for as long as the \
+     pressure lasts",
+    unserved.len(),
+  );
+  drop(regs);
 }

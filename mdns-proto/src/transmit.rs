@@ -1,6 +1,9 @@
 //! Outgoing-datagram descriptor and its delivery outcome.
 
-use core::net::{IpAddr, SocketAddr};
+use core::{
+  net::{IpAddr, SocketAddr},
+  time::Duration,
+};
 
 /// Whether the core will KEEP RE-ARMING a datagram until every obligated link
 /// accepts it — i.e. whether missing this datagram pins the producer's progress.
@@ -54,6 +57,7 @@ pub struct Transmit {
   src_ip: Option<IpAddr>,
   size: usize,
   obligation: TransmitObligation,
+  min_family_gap: Duration,
 }
 
 impl Transmit {
@@ -64,12 +68,14 @@ impl Transmit {
     src_ip: Option<IpAddr>,
     size: usize,
     obligation: TransmitObligation,
+    min_family_gap: Duration,
   ) -> Self {
     Self {
       dst,
       src_ip,
       size,
       obligation,
+      min_family_gap,
     }
   }
 
@@ -98,6 +104,50 @@ impl Transmit {
   #[inline(always)]
   pub const fn obligation(&self) -> TransmitObligation {
     self.obligation
+  }
+
+  /// The minimum time that must separate this datagram from the PRODUCER'S
+  /// PREVIOUS one **on one address family's wire** — the earliest-next-send gate
+  /// the driver owes each family it fans onto.
+  ///
+  /// # Why the core computes it and the driver enforces it
+  ///
+  /// The rule is about the WIRE, so only the driver knows when it was last
+  /// satisfied: [`TransmitDelivery`]'s confirm anchors at the EARLIEST acceptance
+  /// across families, which is the right anchor for the TTL guarantee but is not
+  /// the late family's own wire time. With inter-family skew `s` the core
+  /// schedules the next datagram one interval after the early family's
+  /// acceptance, so the LATE family's own gap is `interval − s`: an announcement
+  /// falls under RFC 6762 §6 / §8.3's one-second minimum at every TTL, and a
+  /// probe gap can approach zero. Only the driver holds the per-family
+  /// acceptance instants that make that visible.
+  ///
+  /// The VALUE, though, is protocol policy and is kind-dependent, which is why it
+  /// is carried here rather than hardcoded in each driver. §8.1 spaces probes
+  /// 250 ms apart and exempts them from the one-second rule; announcements and
+  /// §5.2 query retransmissions are not exempt. A driver that picked the number
+  /// itself would have taken protocol policy across the sans-I/O boundary, and
+  /// would get the probe sequence wrong by a factor of four.
+  ///
+  /// # Zero
+  ///
+  /// [`Duration::ZERO`] means this datagram is UNGATED, and every
+  /// [`TransmitObligation::OneShot`] datagram is. A one-shot is never re-armed,
+  /// so a gate could only DROP it — trading a §6 spacing nicety for an
+  /// unanswered question — and its spacing is already governed by the response
+  /// jitter and coalescing schedule the core applies before emitting it.
+  ///
+  /// # What a driver does when the gate is shut
+  ///
+  /// It reports that family [`FamilyDelivery::Missed`] for this round: the family
+  /// is obligated and did not carry the datagram, which is the honest fact. It
+  /// must NOT report [`FamilyDelivery::Unobligated`] (that would launder a
+  /// deferral into an absent link) and must not park the fan-out waiting for the
+  /// gate to open. The core re-arms losslessly, and the gate is open by the time
+  /// the re-armed datagram is due.
+  #[inline(always)]
+  pub const fn min_family_gap(&self) -> Duration {
+    self.min_family_gap
   }
 }
 

@@ -163,6 +163,10 @@ pub(crate) struct ServiceCtx {
   /// losing the `Conflict`. Meanwhile `errored` makes every proto-polling pump
   /// skip this ctx so a finished proto can't be re-polled into a busy-spin.
   pub(crate) errored: bool,
+  /// When each family last carried one of THIS service's gated datagrams, so the
+  /// RFC 6762 §8.1 / §8.3 spacing is honoured per wire rather than per confirm.
+  /// See [`FamilyWireGate`].
+  pub(crate) wire_gate: FamilyWireGate,
 }
 
 /// Driver-side per-query context: last-delivered sequence number and a
@@ -190,6 +194,10 @@ pub(crate) struct QueryCtx {
   /// withdrawal it begins carries the wake — its deadline re-settles the driver
   /// and the completion GC notifies.)
   pub(crate) terminal_wake_pending: bool,
+  /// When each family last carried one of THIS question's transmissions, so
+  /// RFC 6762 §5.2's one-second floor is honoured per wire. See
+  /// [`FamilyWireGate`].
+  pub(crate) wire_gate: FamilyWireGate,
 }
 
 /// All state owned by the compio driver task. Held behind the `RefCell` in
@@ -286,6 +294,7 @@ impl State {
         cancelled: false,
         encode_failures: 0,
         errored: false,
+        wire_gate: FamilyWireGate::default(),
       },
     );
     Ok(handle)
@@ -323,6 +332,7 @@ impl State {
         cancelled: false,
         errored: false,
         terminal_wake_pending: false,
+        wire_gate: FamilyWireGate::default(),
       },
     );
     Ok(h)
@@ -933,6 +943,36 @@ impl State {
     self.endpoint.note_query_transmit_outcome(h, now, delivery);
   }
 
+  /// This producer's per-family wire gate, copied out for a fan-out.
+  ///
+  /// Copied rather than borrowed because the fan-out awaits, and no `RefCell`
+  /// borrow may be held across that await. A producer GC'd mid-fan-out yields the
+  /// default gate, which is open — the same answer as a producer that has sent
+  /// nothing, and the write-back below is then simply dropped.
+  pub(crate) fn wire_gate(&self, origin: TransmitOrigin) -> FamilyWireGate {
+    match origin {
+      TransmitOrigin::Service(h) => self.services.get(&h).map(|c| c.wire_gate),
+      TransmitOrigin::Query(h) => self.queries.get(&h).map(|c| c.wire_gate),
+    }
+    .unwrap_or_default()
+  }
+
+  /// Write a fan-out's updated wire gate back onto its producer.
+  pub(crate) fn set_wire_gate(&mut self, origin: TransmitOrigin, gate: FamilyWireGate) {
+    match origin {
+      TransmitOrigin::Service(h) => {
+        if let Some(ctx) = self.services.get_mut(&h) {
+          ctx.wire_gate = gate;
+        }
+      }
+      TransmitOrigin::Query(h) => {
+        if let Some(ctx) = self.queries.get_mut(&h) {
+          ctx.wire_gate = gate;
+        }
+      }
+    }
+  }
+
   /// Whether any service is flagged cancelled but not yet swept by
   /// [`Self::sweep_cancelled_services`] (i.e. `cancelled` but the withdrawal has
   /// not yet been begun — `!errored`). The driver uses this to force an immediate
@@ -1263,16 +1303,29 @@ pub(crate) async fn run(
         break;
       }
       credits -= 1;
+      let now = StdInstant::now();
       let pumped = {
         let mut s = inner.state.borrow_mut();
-        let now = StdInstant::now();
         s.poll_one_transmit(now, &mut scratch)
       };
       let Some((tx, origin)) = pumped else {
         break;
       };
-      let (fanout, accepted_at) =
-        send_via(&inner, &sock_v4, &sock_v6, tx.dst(), &scratch[..tx.size()]).await;
+      // The producer's per-family wire gate travels with the fan-out: copied out
+      // here, updated by whichever families accepted, written back with the
+      // confirm. No borrow crosses the await.
+      let mut gate = inner.state.borrow().wire_gate(origin);
+      let (fanout, accepted_at) = send_via(
+        &inner,
+        &sock_v4,
+        &sock_v6,
+        tx.dst(),
+        &scratch[..tx.size()],
+        &mut gate,
+        tx.min_family_gap(),
+        now,
+      )
+      .await;
       // Confirm the pending transmit with the honest per-family shape of the
       // fan-out. The core latches §10.1 goodbye ownership for whatever reached a
       // wire and advances the §8.1 probe sequence / §8.3 announce phase / §5.2
@@ -1286,14 +1339,12 @@ pub(crate) async fn run(
       // attempt instead.
       let delivery = fanout.delivery();
       let at = accepted_at.unwrap_or_else(StdInstant::now);
-      match origin {
-        TransmitOrigin::Service(h) => {
-          let mut state = inner.state.borrow_mut();
-          state.note_service_transmit_outcome(h, at, delivery);
-        }
-        TransmitOrigin::Query(h) => {
-          let mut state = inner.state.borrow_mut();
-          state.note_query_transmit_outcome(h, at, delivery);
+      {
+        let mut state = inner.state.borrow_mut();
+        state.set_wire_gate(origin, gate);
+        match origin {
+          TransmitOrigin::Service(h) => state.note_service_transmit_outcome(h, at, delivery),
+          TransmitOrigin::Query(h) => state.note_query_transmit_outcome(h, at, delivery),
         }
       }
     }
@@ -1535,6 +1586,12 @@ pub(crate) enum FamilySend {
   /// It was therefore never OBLIGATED to carry this transmit, and its absence
   /// must not read as a failure — a v4-only host is fully delivered on v4 alone.
   Unbound,
+  /// A bound socket was NOT offered the datagram because the producer's previous
+  /// one is still inside [`Transmit::min_family_gap`] on THIS family's wire (see
+  /// [`FamilyWireGate`]). Obligated and did not carry it, exactly like
+  /// [`FamilySend::Failed`] — but a deliberate deferral, not an I/O error, so it
+  /// bumps no error counter.
+  Gated,
   /// A bound socket accepted the datagram.
   Sent,
   /// A bound socket did not carry it. A completion-based `send_to` removes
@@ -1564,6 +1621,7 @@ impl FamilySend {
   fn from_attempt(attempt: &SendAttempt) -> Self {
     match attempt {
       SendAttempt::Unbound => Self::Unbound,
+      SendAttempt::Gated => Self::Gated,
       SendAttempt::Answered(res, _, _) => Self::from_bound_result(res),
       SendAttempt::TimedOut => Self::Failed,
     }
@@ -1571,11 +1629,16 @@ impl FamilySend {
 
   /// This family's I/O answer as the core's protocol vocabulary. The mapping is
   /// one-to-one — no family is ever laundered into a different one.
+  ///
+  /// A GATED family is `Missed` and never `Unobligated`: its socket is there and
+  /// the datagram was fanned onto it, the driver simply owed the wire a gap it
+  /// had not yet paid. Reporting it absent would hide the deferral from the core
+  /// and let the phase advance without it.
   const fn delivery(self) -> FamilyDelivery {
     match self {
       Self::Unbound => FamilyDelivery::Unobligated,
       Self::Sent => FamilyDelivery::Delivered,
-      Self::Failed => FamilyDelivery::Missed,
+      Self::Gated | Self::Failed => FamilyDelivery::Missed,
     }
   }
 }
@@ -1627,17 +1690,24 @@ impl Fanout {
 /// — for as long as it stays that way. Running the families concurrently removes
 /// the serialisation but bounds neither attempt.
 ///
-/// The value is what the schedule can absorb. A family in good standing is due
-/// again `R = max(0.8 · TTL, 1 s)` after its own last delivery, and the only
-/// delay a wedged family can still add is the one fan-out in flight at that
-/// moment, so staying inside the record TTL needs `R + bound ≤ TTL`. The tightest
-/// case is the smallest registrable TTL
-/// ([`mdns_proto::constants::MIN_SERVICE_TTL_SECS`], 2 s), where the slack is
-/// 1 s; 250 ms keeps a four-fold margin against it. It is also RFC 6762 §8.1's
-/// inter-probe interval — the shortest cadence the protocol itself schedules —
-/// and far above any healthy datagram send, so it can neither pace the lifecycle
-/// nor manufacture the spurious misses that would spend the core's patience.
-/// Mirrors `hick-reactor::driver::SEND_ATTEMPT_TIMEOUT`.
+/// It is a LIVENESS knob, not a wire-freshness budget. What the core guarantees
+/// is the SCHEDULE: a family in good standing is re-announced within
+/// `max(R, 2 × ANNOUNCE_INTERVAL)` of ITS LAST DELIVERY, with `R` the periodic
+/// refresh interval. Whether the records are actually fresh on the wire is
+/// conditional on the driver delivering due transmits promptly, and no value here
+/// makes that unconditional — against arbitrarily slow I/O no budget causes a
+/// non-accepting socket's peers to refresh in time, and the protocol-correct
+/// response is the one the core already has: patience, stall, excusal, and the
+/// silence rule. The driver owes loop liveness and honest per-family facts, not a
+/// latency SLA.
+///
+/// The value is 250 ms because that is RFC 6762 §8.1's inter-probe interval, the
+/// shortest cadence the protocol itself schedules, and far above any healthy
+/// datagram send — so it can neither pace the lifecycle nor manufacture the
+/// spurious misses that would spend the core's patience. Mirrors
+/// `hick-reactor::driver::SEND_ATTEMPT_TIMEOUT`, whose doc block also records why
+/// a READINESS driver may treat an expired bound as a definitive `Missed` and a
+/// completion-based one may not.
 const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The one socket capability the transmit and withdrawal fan-outs use.
@@ -1663,10 +1733,81 @@ impl SendDatagram for Socket {
   }
 }
 
+/// One PRODUCER's per-family earliest-next-send gate: when each address family
+/// ([0] = v4, [1] = v6) last carried a datagram from this service or query.
+///
+/// The rule it enforces is RFC 6762's, on the wire: §6 and §8.3 forbid
+/// re-multicasting a record on an interface inside one second of the last time it
+/// went out on that same interface, and §8.1 spaces probes 250 ms apart. The
+/// MINIMUM is protocol policy and arrives from the core on
+/// [`Transmit::min_family_gap`]; only the driver knows when each family last
+/// satisfied it, which is why the two halves live on opposite sides of the seam.
+///
+/// It cannot be folded into the core's schedule because the confirm anchors at
+/// the EARLIEST acceptance across families. That anchor is the right one for the
+/// TTL guarantee — it can only understate how fresh a family's peers are — but
+/// under inter-family skew `s` it schedules the next datagram one interval after
+/// the EARLY family's wire time, leaving the late family a gap of
+/// `interval - s`. The core cannot see `s`; the driver measured it.
+///
+/// Kept PER PRODUCER because the rules are per record set: two different services
+/// announcing inside the same second are two different records and pace each
+/// other not at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FamilyWireGate {
+  /// Indexed [v4, v6]. `None` until that family has carried a GATED datagram from
+  /// this producer — an ungated (one-shot) send never writes here, so a §6 reply
+  /// cannot defer the announcement that follows it.
+  last_sent: [Option<StdInstant>; 2],
+}
+
+impl FamilyWireGate {
+  /// Whether family `idx` may be offered a datagram at `now` under `min_gap`.
+  ///
+  /// A zero `min_gap` is ungated and always open. A family that has carried
+  /// nothing yet is open. A clock that reads BEFORE the recorded send closes the
+  /// gate: the elapsed gap is then unknown, and the conservative answer is the
+  /// one that cannot put a record back on the wire too soon.
+  fn open(&self, idx: usize, now: StdInstant, min_gap: Duration) -> bool {
+    if min_gap.is_zero() {
+      return true;
+    }
+    match self.last_sent.get(idx).copied().flatten() {
+      Some(last) => now
+        .checked_duration_since(last)
+        .is_some_and(|gap| gap >= min_gap),
+      None => true,
+    }
+  }
+
+  /// Record that family `idx` put a GATED datagram on its wire at `at`.
+  ///
+  /// `at` is that family's OWN acceptance instant, not the fan-out's confirm
+  /// anchor — recording the anchor would re-introduce exactly the skew this gate
+  /// exists to absorb.
+  fn record(&mut self, idx: usize, at: StdInstant, min_gap: Duration) {
+    if min_gap.is_zero() {
+      return;
+    }
+    if let Some(slot) = self.last_sent.get_mut(idx) {
+      *slot = Some(at);
+    }
+  }
+}
+
+/// Index of the IPv4 family in every per-family array, matching
+/// [`mdns_proto::TransmitDelivery`]'s own ordering.
+const FAMILY_V4: usize = 0;
+/// Index of the IPv6 family.
+const FAMILY_V6: usize = 1;
+
 /// One address family's answer to ONE bounded send attempt.
 enum SendAttempt {
   /// No socket bound for this family, so it was never offered the datagram.
   Unbound,
+  /// A bound socket the per-family wire gate held back for this round; no
+  /// operation was submitted. See [`FamilyWireGate`].
+  Gated,
   /// The socket answered within [`SEND_ATTEMPT_TIMEOUT`]: the `send_to` result,
   /// plus the wall time and the monotonic instant captured immediately before
   /// the op was submitted.
@@ -1691,7 +1832,8 @@ impl SendAttempt {
 
 /// Offer one family its copy of the datagram, bounded by
 /// [`SEND_ATTEMPT_TIMEOUT`]. An absent socket is [`SendAttempt::Unbound`] — that
-/// family was never obligated — and is answered without touching the clock.
+/// family was never obligated — and is answered without touching the clock, as is
+/// a family whose wire gate is shut (`may_send == false`).
 ///
 /// Both clocks are read IMMEDIATELY BEFORE the `.await`. compio is
 /// completion-based — the buffer moves into the op on `.await`, so we cannot
@@ -1703,12 +1845,16 @@ impl SendAttempt {
 /// announce/probe as a peer packet.
 async fn attempt_send_to<S: SendDatagram>(
   sock: Option<&S>,
+  may_send: bool,
   buf: &[u8],
   dst: SocketAddr,
 ) -> SendAttempt {
   let Some(sock) = sock else {
     return SendAttempt::Unbound;
   };
+  if !may_send {
+    return SendAttempt::Gated;
+  }
   let when = SystemTime::now();
   let at = StdInstant::now();
   match compio::time::timeout(SEND_ATTEMPT_TIMEOUT, sock.send_to(buf, dst)).await {
@@ -1735,7 +1881,9 @@ fn note_multicast_attempt(
   _kind: &'static str,
 ) {
   match attempt {
-    SendAttempt::Unbound => {}
+    // Neither put bytes on a wire, and neither is an error: one has no socket,
+    // the other is this driver's own deliberate spacing.
+    SendAttempt::Unbound | SendAttempt::Gated => {}
     SendAttempt::Answered(Ok(_), when, _) => {
       trace!(kind = _kind, dst = %_dst, len = body.len(), "send_to");
       let mut state = inner.state.borrow_mut();
@@ -1779,12 +1927,23 @@ fn note_multicast_attempt(
 /// post-fan-out `Instant::now()` would record a family that was served at `t0` as
 /// having been served when the SLOWEST family finished: its next refresh would
 /// then land a whole fan-out later than its records' TTL allows.
+///
+/// `gate` is the PRODUCER's per-family earliest-next-send state and `min_gap` the
+/// minimum the core computed for this datagram's kind
+/// ([`Transmit::min_family_gap`]). A family whose gap is unpaid is not offered the
+/// datagram at all and is reported [`FamilySend::Gated`] — obligated, and it did
+/// not carry it. Every family that DID carry it records its own acceptance
+/// instant back into `gate`.
+#[allow(clippy::too_many_arguments)]
 async fn send_via<S: SendDatagram>(
   inner: &Rc<EndpointInner>,
   sock_v4: &Option<Rc<S>>,
   sock_v6: &Option<Rc<S>>,
   dst: SocketAddr,
   body: &[u8],
+  gate: &mut FamilyWireGate,
+  min_gap: Duration,
+  now: StdInstant,
 ) -> (Fanout, Option<StdInstant>) {
   let n = body.len();
   let mut fanout = Fanout::UNBOUND;
@@ -1794,12 +1953,32 @@ async fn send_via<S: SendDatagram>(
     // family that never accepts hold the whole fan-out — and with it the driver
     // loop — for as long as it stayed wedged.
     let (a4, a6) = futures::future::join(
-      attempt_send_to(sock_v4.as_deref(), body, MDNS_V4_DST),
-      attempt_send_to(sock_v6.as_deref(), body, MDNS_V6_DST),
+      attempt_send_to(
+        sock_v4.as_deref(),
+        gate.open(FAMILY_V4, now, min_gap),
+        body,
+        MDNS_V4_DST,
+      ),
+      attempt_send_to(
+        sock_v6.as_deref(),
+        gate.open(FAMILY_V6, now, min_gap),
+        body,
+        MDNS_V6_DST,
+      ),
     )
     .await;
     fanout.v4 = FamilySend::from_attempt(&a4);
     fanout.v6 = FamilySend::from_attempt(&a6);
+    // Each family's OWN acceptance instant re-opens ITS OWN gate one `min_gap`
+    // later. Using the fan-out anchor (the earliest across families) instead
+    // would put the late family's next send back inside the interval — the exact
+    // skew this gate exists to absorb.
+    if let Some(at) = a4.accepted_at() {
+      gate.record(FAMILY_V4, at, min_gap);
+    }
+    if let Some(at) = a6.accepted_at() {
+      gate.record(FAMILY_V6, at, min_gap);
+    }
     let accepted_at = [a4.accepted_at(), a6.accepted_at()]
       .into_iter()
       .flatten()
@@ -1815,9 +1994,9 @@ async fn send_via<S: SendDatagram>(
   // Unicast: pick the socket matching the destination family. Exactly one family
   // is obligated (an absent socket obligates none), so this branch can only be
   // all- or none-delivered.
-  let sock = match dst {
-    SocketAddr::V4(_) => sock_v4.as_deref(),
-    SocketAddr::V6(_) => sock_v6.as_deref(),
+  let (idx, sock) = match dst {
+    SocketAddr::V4(_) => (FAMILY_V4, sock_v4.as_deref()),
+    SocketAddr::V6(_) => (FAMILY_V6, sock_v6.as_deref()),
   };
   // NO self-send tracker entry here, unlike the multicast branch. A unicast
   // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
@@ -1827,14 +2006,20 @@ async fn send_via<S: SendDatagram>(
   // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
   // the NEW entry — so a legacy-query flood would starve the genuine multicast
   // credits that suppression actually depends on.
-  let attempt = attempt_send_to(sock, body, dst).await;
+  let attempt = attempt_send_to(sock, gate.open(idx, now, min_gap), body, dst).await;
   let outcome = FamilySend::from_attempt(&attempt);
   match dst {
     SocketAddr::V4(_) => fanout.v4 = outcome,
     SocketAddr::V6(_) => fanout.v6 = outcome,
   }
+  if let Some(at) = attempt.accepted_at() {
+    gate.record(idx, at, min_gap);
+  }
   match &attempt {
-    SendAttempt::Unbound => {}
+    // In tree every unicast datagram is a §6.7 legacy reply, which is one-shot
+    // and therefore ungated — `Gated` is unreachable here today and is listed
+    // with `Unbound` because neither wrote to a wire nor failed.
+    SendAttempt::Unbound | SendAttempt::Gated => {}
     SendAttempt::Answered(Ok(_), _, _) => {
       trace!(dst = %dst, len = n, "send_to");
       #[cfg(feature = "stats")]
@@ -1934,15 +2119,21 @@ async fn drain_withdrawals(
     // has withdrawn its records. A family with no bound socket is `WriteOff` (no
     // peers reachable on it to withdraw from) so its debt never pins the other;
     // an expired bound keeps the debt, exactly as a transient error does.
+    //
+    // Ungated: a TTL=0 goodbye's repeat schedule is the endpoint's
+    // (`note_withdrawal_result`), which already spaces the resends, and holding
+    // one back here would leave a family's peers pinned to positive-TTL records
+    // it has already been promised the retraction of.
     let (a4, a6) = futures::future::join(
-      attempt_send_to(sock_v4.as_deref(), &scratch[..len], MDNS_V4_DST),
-      attempt_send_to(sock_v6.as_deref(), &scratch[..len], MDNS_V6_DST),
+      attempt_send_to(sock_v4.as_deref(), true, &scratch[..len], MDNS_V4_DST),
+      attempt_send_to(sock_v6.as_deref(), true, &scratch[..len], MDNS_V6_DST),
     )
     .await;
     let outcome = |attempt: &SendAttempt| match attempt {
       SendAttempt::Unbound => WithdrawalSend::WriteOff,
       SendAttempt::Answered(res, _, _) => present_socket_send_outcome(res),
-      SendAttempt::TimedOut => WithdrawalSend::Retry,
+      // Unreachable: this fan-out passes `may_send == true` for both families.
+      SendAttempt::Gated | SendAttempt::TimedOut => WithdrawalSend::Retry,
     };
     let (v4_out, v6_out) = (outcome(&a4), outcome(&a6));
     note_multicast_attempt(inner, &a4, &scratch[..len], MDNS_V4_DST, "withdrawal");

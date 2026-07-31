@@ -1675,6 +1675,68 @@ fn loopback_detected_across_a_large_send_burst() {
   );
 }
 
+/// The per-family wire gate holds each datagram kind to ITS OWN minimum, and a
+/// deferred family is reported `Missed` — obligated, and it did not carry it.
+///
+/// The value is kind-dependent, which is exactly why the driver may not pick it:
+/// hardcoding RFC 6762 §6's one second would stretch the §8.1 probe sequence
+/// fourfold, and hardcoding 250 ms would breach §6 on every announcement. The
+/// minimum arrives on the `Transmit`; only the WHEN is the driver's.
+#[test]
+fn the_wire_gate_defers_a_family_inside_its_kinds_minimum() {
+  /// §6 / §8.3: one second between two multicasts of a record on one interface.
+  const ANNOUNCE_GAP: Duration = Duration::from_secs(1);
+  /// §8.1: probes are exempt from that rule and carry their own spacing.
+  const PROBE_GAP: Duration = Duration::from_millis(250);
+
+  let mut tx = Multicaster::<SmoltcpInstant>::new();
+  let mut io = MockUdp::default();
+  let mut gate = FamilyWireGate::new();
+
+  let (_, first) = tx.send_multicast(&mut io, b"announcement", at(0), &mut gate, ANNOUNCE_GAP);
+  assert!(
+    first.v4.is_sent() && first.v6.is_sent(),
+    "a producer that has sent nothing owes no gap on either family"
+  );
+
+  // 850 ms later — inside §6's floor for the records this datagram carries.
+  let (outcome, early) = tx.send_multicast(
+    &mut io,
+    b"announcement",
+    at(850_000),
+    &mut gate,
+    ANNOUNCE_GAP,
+  );
+  assert!(
+    !early.any_sent(),
+    "neither family may re-multicast the same records inside one second of its      own last copy"
+  );
+  assert!(
+    matches!(
+      outcome,
+      MulticastOutcome::Confirm(d) if d.v4() == FamilyDelivery::Missed
+        && d.v6() == FamilyDelivery::Missed
+    ),
+    "a deferred family is a MISS, never `Unobligated` — its socket is there and      the datagram was fanned onto it, so hiding the deferral would let the phase      advance without it"
+  );
+
+  // A probe at the very same instant is fine: §8.1 exempts it.
+  let (_, probe) = tx.send_multicast(&mut io, b"probe", at(850_000), &mut gate, PROBE_GAP);
+  assert!(
+    probe.v4.is_sent() && probe.v6.is_sent(),
+    "§8.1 spaces probes 250 ms apart and exempts them from the one-second rule"
+  );
+
+  // A one-shot reply is ungated, and leaves the announcement clock alone.
+  let mut ungated = FamilyWireGate::new();
+  let (_, reply) = tx.send_multicast(&mut io, b"reply", at(900_000), &mut ungated, Duration::ZERO);
+  assert!(reply.any_sent(), "a one-shot reply is never gated");
+  assert!(
+    ungated.open(0, at(900_000), ANNOUNCE_GAP),
+    "…and does not start the clock on the announcement that follows it"
+  );
+}
+
 #[test]
 fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
   // Pin the projection every confirm downstream depends on: the obligated set is
@@ -1689,7 +1751,13 @@ fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
     v6_fail: Some(SendError::Busy),
     ..Default::default()
   };
-  let (outcome, fanout) = tx.send_multicast(&mut partial, b"a-multicast-datagram", at(0));
+  let (outcome, fanout) = tx.send_multicast(
+    &mut partial,
+    b"a-multicast-datagram",
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
   assert!(
     matches!(
       outcome,
@@ -1716,7 +1784,13 @@ fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
     v6_fail: Some(SendError::Unsupported),
     ..Default::default()
   };
-  let (outcome_single, _) = tx.send_multicast(&mut single_stack, b"a-multicast-datagram", at(0));
+  let (outcome_single, _) = tx.send_multicast(
+    &mut single_stack,
+    b"a-multicast-datagram",
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
   assert!(
     matches!(
       outcome_single,
@@ -1736,8 +1810,13 @@ fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
     v6_fail: Some(SendError::Busy),
     ..Default::default()
   };
-  let (outcome_busy, fanout_busy) =
-    tx.send_multicast(&mut all_busy, b"a-multicast-datagram", at(0));
+  let (outcome_busy, fanout_busy) = tx.send_multicast(
+    &mut all_busy,
+    b"a-multicast-datagram",
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
   assert!(
     matches!(outcome_busy, MulticastOutcome::Confirm(d) if !d.any_delivered()),
     "both families busy: nothing on the wire, so none-delivered rather than retire"
@@ -1756,7 +1835,13 @@ fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
     v6_fail: Some(SendError::Unsupported),
     ..Default::default()
   };
-  let (outcome_none, _) = tx.send_multicast(&mut no_transport, b"a-multicast-datagram", at(0));
+  let (outcome_none, _) = tx.send_multicast(
+    &mut no_transport,
+    b"a-multicast-datagram",
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
   assert!(
     matches!(outcome_none, MulticastOutcome::Confirm(d)
       if !d.any_delivered() && !d.all_delivered()),
@@ -2353,7 +2438,13 @@ fn stats_multicast_sent_plus_failed_send_errors_exact() {
     ..Default::default()
   };
   let data = b"probe-datagram";
-  let (outcome, fanout) = tx.send_multicast(&mut io, data, at(0));
+  let (outcome, fanout) = tx.send_multicast(
+    &mut io,
+    data,
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
 
   assert!(
     matches!(
@@ -2397,7 +2488,13 @@ fn stats_multicast_failed_plus_busy_send_errors_exact() {
     ..Default::default()
   };
   let data = b"probe-datagram";
-  let (outcome, fanout) = tx.send_multicast(&mut io, data, at(0));
+  let (outcome, fanout) = tx.send_multicast(
+    &mut io,
+    data,
+    at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
 
   // v4 Failed + v6 Busy: nothing reached a wire, and the busy family may yet
   // recover — so this confirms as none-delivered rather than retiring anything.

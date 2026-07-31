@@ -186,6 +186,27 @@ pub(crate) struct FamilyPatience {
   /// advances: the families alternate, so no single round reaches both and no
   /// family ever spends its patience, and without this the producer would sit in
   /// `Probing(0)` forever while both links were being served perfectly well.
+  ///
+  /// The bit is scoped to ONE continuous stretch of obligation. A family that
+  /// ceases to be obligated and later returns is a NEW link that has carried
+  /// nothing, so [`classify_advance`] drops this bit across the gap along with
+  /// the rest of the family's state — otherwise pre-gap coverage would complete a
+  /// round the returned family never received, and the phase would advance on
+  /// evidence about a link that no longer exists.
+  ///
+  /// Unreachable in tree TODAY: every `Sustained` transmit is multicast, both
+  /// families' obligation is fixed by socket presence, and every in-tree driver
+  /// fixes its sockets at spawn, so no family ever leaves the obligated set
+  /// mid-producer. The core is a public library and a driver that varies its
+  /// obligated set at runtime is exactly what the trichotomy exists to support,
+  /// so the gap is handled rather than assumed away.
+  ///
+  /// The harder limit is not fixable here at all: a gap that contains NO
+  /// confirmed round is invisible to the core by construction. The core learns
+  /// about obligation only through confirms, so a family that leaves and returns
+  /// between two confirms is indistinguishable from one that never left, and its
+  /// pre-gap coverage stands. No housekeeping inside this function can see that,
+  /// and nothing short of the driver reporting the transition itself would.
   pub(crate) covered: bool,
   /// Whether this family was EXCUSED at the last advance and has not delivered
   /// since — i.e. the core has stopped waiting for it.
@@ -334,14 +355,18 @@ impl PhaseAdvance {
 /// alternating partial/failed pattern evade the bound forever.
 ///
 /// A family reported `Unobligated` is the one exception, and it is not about the
-/// round at all: ceasing to be obligated is a TRANSITION, and the charge it
-/// leaves behind describes a family that no longer exists. Carrying it across the
-/// gap would excuse the family the moment it comes back — it would have spent the
-/// bound while unreachable and be written off after a single offer, which is the
-/// §8.1 violation this bound exists to prevent. Its `covered` bit is deliberately
-/// NOT set here: `covered` records an ACTUAL earlier delivery, and letting a
-/// silent round set it would let coverage — and therefore a phase — be completed
-/// out of silence.
+/// round at all: ceasing to be obligated is a TRANSITION, and everything it
+/// leaves behind describes a family that no longer exists. Carrying the charge
+/// across the gap would excuse the family the moment it comes back — it would
+/// have spent the bound while unreachable and be written off after a single
+/// offer, which is the §8.1 violation this bound exists to prevent. Carrying its
+/// COVERAGE across the gap is the mirror image and just as wrong: coverage is a
+/// claim that THIS family already carried the datagram still outstanding, and the
+/// family that returns is a newly obligated link that has carried nothing. So the
+/// whole of [`FamilyPatience`] is dropped here, not part of it. Clearing can only
+/// make advancement harder, so it cannot reintroduce the silence hazard; a silent
+/// round still SETS nothing, which is what keeps coverage — and therefore a phase
+/// — unreachable from silence.
 #[allow(dead_code)]
 pub(crate) fn classify_advance(
   patience: &mut [FamilyPatience; 2],
@@ -350,8 +375,7 @@ pub(crate) fn classify_advance(
   if !delivery.any_delivered() {
     for (p, family) in patience.iter_mut().zip(delivery.families().iter()) {
       if matches!(family, FamilyDelivery::Unobligated) {
-        p.missed = 0;
-        p.stalled = false;
+        *p = FamilyPatience::default();
       }
     }
     return PhaseAdvance::Failed;

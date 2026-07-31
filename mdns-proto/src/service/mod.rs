@@ -5,7 +5,7 @@ cfg_heap! {
 
   mod respond;
 }
-mod schedule;
+pub(crate) mod schedule;
 mod state;
 
 cfg_heap! {
@@ -162,6 +162,8 @@ pub(crate) use schedule::{
 pub use state::ServiceState;
 
 cfg_heap! {
+  use core::time::Duration;
+
   use rand::SeedableRng;
 
   use crate::error::{HandleTimeoutError, TransmitError};
@@ -465,6 +467,32 @@ cfg_heap! {
         Self::Response(_, _) | Self::MetaResponse | Self::Stale { .. } => {
           TransmitObligation::OneShot
         }
+      }
+    }
+
+    /// The minimum wire gap this token's datagram owes each family it is fanned
+    /// onto ([`Transmit::min_family_gap`]).
+    ///
+    /// Kind-dependent, and read from the token for the same reason the
+    /// obligation is: it describes what was actually ENCODED, not what
+    /// `self.state` has since become.
+    ///
+    /// * A probe is RFC 6762 §8.1's, spaced [`schedule::rfc::PROBE_INTERVAL`]
+    ///   apart and explicitly exempt from the one-second rule §6 applies to
+    ///   records — §8.1's own sequence would be illegal under it.
+    /// * An unsolicited announcement — the §8.3 burst and the periodic
+    ///   `Established` re-announce alike — is not exempt: §6 forbids
+    ///   re-multicasting a record on an interface inside
+    ///   [`schedule::rfc::ANNOUNCE_INTERVAL`] of the last time it went out on
+    ///   that same interface, and §8.3's own floor says the same.
+    /// * Everything else is one-shot and ungated (see
+    ///   [`Transmit::min_family_gap`]).
+    #[inline]
+    fn min_family_gap(&self) -> Duration {
+      match self {
+        Self::Probe => schedule::rfc::PROBE_INTERVAL,
+        Self::Announcement(_) => schedule::rfc::ANNOUNCE_INTERVAL,
+        Self::Response(_, _) | Self::MetaResponse | Self::Stale { .. } => Duration::ZERO,
       }
     }
   }
@@ -1629,6 +1657,20 @@ where
     }
   }
 
+  /// The per-family minimum wire gap of the datagram whose commit token is
+  /// currently stamped — the value [`Self::poll_transmit`] hands the driver on
+  /// [`Transmit::min_family_gap`].
+  ///
+  /// A pure function of the token, for the same reason [`Self::stamped_obligation`]
+  /// is. A datagram that stamped NO token is fire-and-forget and ungated.
+  #[inline]
+  fn stamped_min_family_gap(&self) -> Duration {
+    match &self.awaiting_confirm {
+      Some(token) => token.min_family_gap(),
+      None => Duration::ZERO,
+    }
+  }
+
   /// Capture everything the endpoint needs to re-encode a TTL=0 goodbye for
   /// this service without holding the [`Service`] alive.
   ///
@@ -2766,6 +2808,7 @@ where
           None,
           n,
           self.stamped_obligation(),
+          self.stamped_min_family_gap(),
         )));
       }
       // Suppressed, or name build (impossible) / encode failed — drop the reply
@@ -2820,6 +2863,7 @@ where
             None,
             n,
             self.stamped_obligation(),
+            self.stamped_min_family_gap(),
           )));
         }
         // a legacy reply echoes the question, so it can exceed the
@@ -3037,6 +3081,7 @@ where
       None,
       n,
       self.stamped_obligation(),
+      self.stamped_min_family_gap(),
     )))
   }
 }

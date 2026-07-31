@@ -105,6 +105,10 @@ struct ServiceCtx {
   /// the handle-owned mailbox's reserved terminal slot, so it survives the ctx
   /// GC and reaches a live reader.
   withdrawing: bool,
+  /// When each family last carried one of THIS service's gated datagrams, so the
+  /// §8.1 / §8.3 spacing is honoured per wire rather than per confirm. See
+  /// [`FamilyWireGate`].
+  wire_gate: FamilyWireGate,
 }
 
 /// Driver-side state for a single active query.
@@ -116,6 +120,10 @@ struct QueryCtx {
   /// driver detects the consumer is gone and GCs the query.
   doorbell: Sender<()>,
   last_seq: u64,
+  /// When each family last carried one of THIS question's transmissions, so
+  /// RFC 6762 §5.2's one-second floor is honoured per wire. See
+  /// [`FamilyWireGate`].
+  wire_gate: FamilyWireGate,
 }
 
 /// All state owned by the driver task.
@@ -155,6 +163,17 @@ struct DriverState<N: Net> {
   /// allocating a fresh `Vec` per wakeup, matching the compio / smoltcp drivers.
   svc_handle_scratch: Vec<ServiceHandle>,
   query_handle_scratch: Vec<QueryHandle>,
+  /// Where the next transmit pass resumes in each handle snapshot, so a pass cut
+  /// short by [`DRAIN_PASS_BUDGET`] does not restart at the front and serve the
+  /// same few producers forever. Both loops iterate their snapshot rotated by
+  /// this offset and park it on the first handle they did NOT reach.
+  svc_resume: usize,
+  query_resume: usize,
+  /// Which producer CLASS the next transmit pass drains first, flipped after any
+  /// pass that was cut short. The cursors above rotate within a class; this
+  /// rotates between them, so a budget spent entirely on services cannot starve
+  /// every query (and vice versa).
+  queries_first: bool,
   /// this host's directly-attached subnets, the source-address
   /// fallback for the RFC 6762 §11 on-link check on platforms that can't
   /// supply a TTL/Hop-Limit. Empty if interface discovery failed (the
@@ -185,6 +204,9 @@ impl<N: Net> DriverState<N> {
       completed_withdrawals: Vec::new(),
       svc_handle_scratch: Vec::new(),
       query_handle_scratch: Vec::new(),
+      svc_resume: 0,
+      query_resume: 0,
+      queries_first: false,
       // scope the §11 source-subnet fallback to the BOUND
       // interface only — not every local NIC (per-packet interface index for
       // delivered PKTINFO is handled separately in recv_with_meta).
@@ -326,6 +348,7 @@ impl<N: Net> DriverState<N> {
         doorbell: doorbell_tx,
         encode_failures: 0,
         withdrawing: false,
+        wire_gate: FamilyWireGate::default(),
       },
     );
     Ok(ServiceRegistered {
@@ -353,6 +376,7 @@ impl<N: Net> DriverState<N> {
         mailbox: Arc::clone(&mailbox),
         doorbell: doorbell_tx,
         last_seq: 0,
+        wire_gate: FamilyWireGate::default(),
       },
     );
     Ok(QueryStarted {
@@ -745,8 +769,7 @@ impl<N: Net> DriverState<N> {
     }
   }
 
-  /// Drain outgoing transmits across services + queries, up to
-  /// [`MAX_TRANSMITS_PER_DRAIN`] per call.
+  /// Drain outgoing transmits across services + queries.
   ///
   /// Every ACTUAL successful MULTICAST send records its own self-send tracker
   /// entry via [`record_self_send`]. Take-once suppression means a single entry
@@ -755,39 +778,78 @@ impl<N: Net> DriverState<N> {
   /// suppress both copies — not one. The entry is therefore recorded inside
   /// [`send_via`] per real send, not here.
   ///
-  /// capped at [`MAX_SEND_CREDITS_PER_DRAIN`] sends per call so
-  /// the work per drain pass stays bounded. Returns `true` if more
-  /// transmits are pending so the driver loop knows to schedule another
-  /// drain pass on the next tick rather than sleeping.
+  /// Bounded by [`DrainBudget`] — the aggregate per-pass wall clock it shares with
+  /// [`Self::drain_withdrawals`], plus the [`MAX_SEND_CREDITS_PER_DRAIN`] send
+  /// cap. Returns `true` if either bound cut the pass short, so the driver loop
+  /// re-enters immediately instead of sleeping.
+  ///
+  /// Services and queries take turns going first ([`Self::queries_first`]) and
+  /// each class resumes where the previous cut pass stopped, so no producer can
+  /// be permanently on the wrong side of a budget that keeps running out.
   #[cfg_attr(
     feature = "tracing",
     tracing::instrument(level = "trace", skip_all, fields(credits = MAX_SEND_CREDITS_PER_DRAIN))
   )]
-  async fn drain_transmits(&mut self, now: StdInstant, scratch: &mut [u8]) -> bool {
+  async fn drain_transmits(
+    &mut self,
+    now: StdInstant,
+    budget: &mut DrainBudget,
+    scratch: &mut [u8],
+  ) -> bool {
+    let queries_first = self.queries_first;
+    let mut more_pending = false;
+    if queries_first {
+      more_pending |= self.drain_query_transmits(now, budget, scratch).await;
+      more_pending |= self.drain_service_transmits(now, budget, scratch).await;
+    } else {
+      more_pending |= self.drain_service_transmits(now, budget, scratch).await;
+      more_pending |= self.drain_query_transmits(now, budget, scratch).await;
+    }
+    // Only a CUT pass rotates the class order. A pass that drained everything
+    // leaves the order alone, so the steady state stays services-first and
+    // predictable.
+    if more_pending {
+      self.queries_first = !queries_first;
+    }
+    more_pending
+  }
+
+  /// The service half of [`Self::drain_transmits`]. Returns `true` if the budget
+  /// cut it short with services left unvisited.
+  async fn drain_service_transmits(
+    &mut self,
+    now: StdInstant,
+    budget: &mut DrainBudget,
+    scratch: &mut [u8],
+  ) -> bool {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
     let Self {
       endpoint,
       services,
-      queries,
       recent_sends,
       v4,
       v6,
       svc_handle_scratch,
-      query_handle_scratch,
+      svc_resume,
       ..
     } = self;
-    // Plain fairness cap: bound the work per drain pass so a very large
-    // handle set can't monopolise the loop before commands / packets are
-    // serviced. (Self-loopback safety no longer depends on this — it's the
-    // SystemTime-keyed `recent_sends` tracker + kernel rx timestamps.)
-    let mut credits_remaining = MAX_SEND_CREDITS_PER_DRAIN;
-    // Service transmits.
     svc_handle_scratch.clear();
     svc_handle_scratch.extend(services.keys().copied());
-    for &h in svc_handle_scratch.iter() {
-      if credits_remaining == 0 {
-        return true;
+    let total = svc_handle_scratch.len();
+    if total == 0 {
+      return false;
+    }
+    let start = *svc_resume % total;
+    let mut more_pending = false;
+    'service_loop: for step in 0..total {
+      let slot = (start + step) % total;
+      let h = svc_handle_scratch[slot];
+      if !budget.may_start_fanout() {
+        // Park on the handle this pass did NOT reach, so the next one opens here.
+        *svc_resume = slot;
+        more_pending = true;
+        break 'service_loop;
       }
       // re-check liveness AT this handle so a drop / cancel
       // command racing with the per-loop sweep does not still emit a
@@ -802,9 +864,21 @@ impl<N: Net> DriverState<N> {
         continue;
       }
       let mut hit_encode_error = false;
+      // Whether this handle got a fan-out in THIS pass, which decides where the
+      // cursor parks if the budget runs out mid-handle: a handle that was served
+      // must be stepped PAST, or a producer that is due on every pass parks the
+      // cursor on itself and starves everything behind it — the very starvation
+      // the cursor exists to prevent.
+      let mut served_here = false;
       loop {
-        if credits_remaining == 0 {
-          return true;
+        if !budget.may_start_fanout() {
+          *svc_resume = if served_here {
+            slot.saturating_add(1)
+          } else {
+            slot
+          };
+          more_pending = true;
+          break 'service_loop;
         }
         // distinguish "no more pending"
         // (Ok(None)) from a real encoding error (Err). Track
@@ -838,12 +912,19 @@ impl<N: Net> DriverState<N> {
           None => break,
         };
         let body_len = tx.size();
+        // The gate is copied out and written back rather than borrowed across the
+        // await, so `services` stays free for the confirm below. Nothing else in
+        // this single-task loop touches it in between.
+        let mut gate = services.get(&h).map(|c| c.wire_gate).unwrap_or_default();
         let (fanout, accepted_at) = send_via(
           recent_sends,
           v4,
           v6,
           tx.dst(),
           &scratch[..body_len],
+          &mut gate,
+          tx.min_family_gap(),
+          now,
           #[cfg(feature = "stats")]
           &stats,
         )
@@ -862,10 +943,12 @@ impl<N: Net> DriverState<N> {
         // that reached no wire has no acceptance to anchor, and its re-arm is
         // spaced from the attempt instead.
         if let Some(ctx) = services.get_mut(&h) {
+          ctx.wire_gate = gate;
           let at = accepted_at.unwrap_or_else(StdInstant::now);
           confirm_service_transmit(endpoint, ctx, at, fanout.delivery());
         }
-        credits_remaining = credits_remaining.saturating_sub(fanout.sent_count());
+        budget.charge(fanout.sent_count());
+        served_here = true;
       }
       // persistent encode failure → escalate to Conflict.
       if hit_encode_error {
@@ -908,9 +991,36 @@ impl<N: Net> DriverState<N> {
         }
       }
     }
-    // Query transmits.
+    more_pending
+  }
+
+  /// The query half of [`Self::drain_transmits`]. Returns `true` if the budget
+  /// cut it short with queries left unvisited.
+  async fn drain_query_transmits(
+    &mut self,
+    now: StdInstant,
+    budget: &mut DrainBudget,
+    scratch: &mut [u8],
+  ) -> bool {
+    #[cfg(feature = "stats")]
+    let stats = self.stats.clone();
+    let Self {
+      endpoint,
+      queries,
+      recent_sends,
+      v4,
+      v6,
+      query_handle_scratch,
+      query_resume,
+      ..
+    } = self;
     query_handle_scratch.clear();
     query_handle_scratch.extend(queries.keys().copied());
+    let total = query_handle_scratch.len();
+    if total == 0 {
+      return false;
+    }
+    let start = *query_resume % total;
     // Collect queries that were retired due to encode failures so they can be
     // GC'd after the loop (matching the terminated-handle cleanup in push_updates).
     let mut encode_retired: Vec<QueryHandle> = Vec::new();
@@ -920,8 +1030,11 @@ impl<N: Net> DriverState<N> {
     // would bypass the cleanup below and leave the retired handle resident in
     // both `queries` and proto storage until the user drops the stream.
     let mut more_pending = false;
-    'query_loop: for &h in query_handle_scratch.iter() {
-      if credits_remaining == 0 {
+    'query_loop: for step in 0..total {
+      let slot = (start + step) % total;
+      let h = query_handle_scratch[slot];
+      if !budget.may_start_fanout() {
+        *query_resume = slot;
         more_pending = true;
         break 'query_loop;
       }
@@ -932,7 +1045,19 @@ impl<N: Net> DriverState<N> {
       if !live {
         continue;
       }
-      while credits_remaining > 0 {
+      // See the service loop: a handle already served this pass parks the cursor
+      // one step PAST itself.
+      let mut served_here = false;
+      loop {
+        if !budget.may_start_fanout() {
+          *query_resume = if served_here {
+            slot.saturating_add(1)
+          } else {
+            slot
+          };
+          more_pending = true;
+          break 'query_loop;
+        }
         // surface encoding errors instead of treating them
         // as "no more transmits".
         let tx = match endpoint.poll_query_transmit(h, now, scratch) {
@@ -967,16 +1092,23 @@ impl<N: Net> DriverState<N> {
           }
         };
         let body_len = tx.size();
+        let mut gate = queries.get(&h).map(|c| c.wire_gate).unwrap_or_default();
         let (fanout, accepted_at) = send_via(
           recent_sends,
           v4,
           v6,
           tx.dst(),
           &scratch[..body_len],
+          &mut gate,
+          tx.min_family_gap(),
+          now,
           #[cfg(feature = "stats")]
           &stats,
         )
         .await;
+        if let Some(ctx) = queries.get_mut(&h) {
+          ctx.wire_gate = gate;
+        }
         // The §5.2 retry budget is spent only once EVERY obligated family carried
         // the question: a responder reachable on one family alone must not be able
         // to consume the whole retry schedule of a question the other family never
@@ -986,7 +1118,8 @@ impl<N: Net> DriverState<N> {
         // asked; a round that reached no wire is spaced from the attempt.
         let at = accepted_at.unwrap_or_else(StdInstant::now);
         endpoint.note_query_transmit_outcome(h, at, fanout.delivery());
-        credits_remaining = credits_remaining.saturating_sub(fanout.sent_count());
+        budget.charge(fanout.sent_count());
+        served_here = true;
       }
     }
     // GC queries retired by encode failure (mirrors the push_updates terminated
@@ -1117,7 +1250,18 @@ impl<N: Net> DriverState<N> {
   /// (and its doorbell receiver) are gone and the buffered terminal is simply
   /// collected with the mailbox. No flag, no park, no retry (mirrors the query
   /// path, whose terminal also lives in a handle-owned mailbox).
-  async fn drain_withdrawals(&mut self, now: StdInstant, scratch: &mut [u8]) {
+  ///
+  /// Shares the pass's [`DrainBudget`] with [`Self::drain_transmits`] and returns
+  /// `true` when the budget stopped it with goodbyes still due, so the driver loop
+  /// re-enters immediately. The pump was previously an unbounded `while let`: a
+  /// family that never accepts costs a whole [`SEND_ATTEMPT_TIMEOUT`] per queued
+  /// goodbye, and a mass unregister queues one per service.
+  async fn drain_withdrawals(
+    &mut self,
+    now: StdInstant,
+    budget: &mut DrainBudget,
+    scratch: &mut [u8],
+  ) -> bool {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
     // Split-borrow disjoint fields so `send_via` can borrow `recent_sends`/`v4`/
@@ -1129,7 +1273,11 @@ impl<N: Net> DriverState<N> {
       v6,
       ..
     } = self;
-    while let Some((dst, len, token)) = endpoint.poll_withdrawal_transmit(now, scratch) {
+    let mut more_pending = false;
+    while budget.may_start_fanout() {
+      let Some((dst, len, token)) = endpoint.poll_withdrawal_transmit(now, scratch) else {
+        break;
+      };
       // The endpoint always returns the multicast marker; the driver fans the
       // datagram to both groups regardless. Assert the contract in debug builds.
       debug_assert!(
@@ -1160,6 +1308,22 @@ impl<N: Net> DriverState<N> {
         stats.goodbyes_tx(1);
       }
       endpoint.note_withdrawal_result(token, now, v4_out, v6_out);
+      // The budget is charged per family that actually SENT, exactly as the
+      // transmit drain charges it, so a wholly-undeliverable goodbye round is
+      // bounded by the wall clock alone.
+      budget.charge(
+        usize::from(matches!(v4_out, WithdrawalSend::Sent))
+          + usize::from(matches!(v6_out, WithdrawalSend::Sent)),
+      );
+    }
+    // The pass ran out with a goodbye already due — including the case where the
+    // transmit drain spent the whole budget and this pump never started at all.
+    if !budget.may_start_fanout()
+      && endpoint
+        .next_withdrawal_deadline()
+        .is_some_and(|due| due <= now)
+    {
+      more_pending = true;
     }
     // Free completed withdrawals (budget spent or 2 s ceiling reached): the
     // endpoint releases each route (decrementing services_active) and reports the
@@ -1178,6 +1342,7 @@ impl<N: Net> DriverState<N> {
       // and the buffered terminal is collected with it. No park, no retry.
       self.services.remove(&handle);
     }
+    more_pending
   }
 }
 
@@ -1191,6 +1356,89 @@ impl<N: Net> DriverState<N> {
 /// `drain_transmits` returns `true` when more is pending, and the driver
 /// loop re-enters the packet pump immediately.
 const MAX_SEND_CREDITS_PER_DRAIN: usize = 64;
+
+/// The wall clock ONE driver pass may spend inside bounded send attempts, across
+/// `drain_transmits` AND `drain_withdrawals` together.
+///
+/// The send credits above cannot bound a pass on their own, because they are
+/// charged per family that actually SENT: a fan-out every family missed costs
+/// zero credits while still costing a full [`SEND_ATTEMPT_TIMEOUT`] per wedged
+/// family, and the producers are served serially. A pass of `n` due producers
+/// with one wedged family therefore ran for `n × SEND_ATTEMPT_TIMEOUT` with no
+/// cap at all, during which nothing else in the loop ran — the 64-slot packet
+/// channel backs up and inbound peer datagrams are simply dropped.
+///
+/// This is a LIVENESS knob, on the same terms as [`SEND_ATTEMPT_TIMEOUT`]: it
+/// buys nothing about wire freshness, it only bounds how long the loop can go
+/// without pumping packets and commands. 500 ms is two attempt bounds, which is
+/// the smallest value that lets a pass with a wedged family still make forward
+/// progress (`DrainBudget::may_start_fanout` requires a whole attempt's worth of
+/// budget left, so a pass starts at least one fan-out and at most two entirely
+/// wedged ones). A pass therefore never overruns this by the last fan-out it
+/// started — the only exception is the forward-progress clause on
+/// `DrainBudget::may_start_fanout`.
+const DRAIN_PASS_BUDGET: Duration = Duration::from_millis(500);
+
+/// The two bounds one driver pass spends: [`MAX_SEND_CREDITS_PER_DRAIN`] actual
+/// sends, and [`DRAIN_PASS_BUDGET`] of wall clock shared by every fan-out the
+/// pass performs.
+///
+/// One value threaded through both drains so the budget is genuinely per PASS.
+/// Withdrawals are drained after transmits, so a pass whose transmits spend the
+/// whole budget defers its goodbyes — but only to the next pass, which the
+/// `more_pending` return starts immediately without sleeping, and the goodbye
+/// resend schedule the endpoint owns re-arms them regardless.
+struct DrainBudget {
+  credits: usize,
+  deadline: StdInstant,
+  /// Whether this pass has started a fan-out yet. See
+  /// [`Self::may_start_fanout`]'s forward-progress clause.
+  started: bool,
+}
+
+impl DrainBudget {
+  /// Open a fresh budget for a pass beginning at `pass_start`.
+  fn new(pass_start: StdInstant) -> Self {
+    Self {
+      credits: MAX_SEND_CREDITS_PER_DRAIN,
+      deadline: pass_start
+        .checked_add(DRAIN_PASS_BUDGET)
+        .unwrap_or(pass_start),
+      started: false,
+    }
+  }
+
+  /// Whether another fan-out may START.
+  ///
+  /// Requires a whole [`SEND_ATTEMPT_TIMEOUT`] of budget left, not merely a
+  /// non-zero remainder: a fan-out that begins inside the budget runs to its own
+  /// bound regardless, so admitting one with less than that left would let the
+  /// pass overrun. Reserving it up front makes [`DRAIN_PASS_BUDGET`] a ceiling
+  /// on the pass rather than on the point at which it stops taking work.
+  ///
+  /// The FIRST fan-out of a pass is admitted regardless of the clock. The budget
+  /// starts at the top of the loop, so the sweep and the timer fire are charged
+  /// to it; if those ever outran it the pass would take no work, report more
+  /// pending, and re-enter to do the same again — a livelock in which transmits
+  /// never progress. Unreachable in practice (both are microseconds over a
+  /// slab-capped handle set), and this clause is what makes it structurally so.
+  /// It costs at most one attempt bound, and only in that degenerate case.
+  fn may_start_fanout(&self) -> bool {
+    self.credits > 0
+      && (!self.started
+        || self
+          .deadline
+          .checked_duration_since(StdInstant::now())
+          .is_some_and(|left| left >= SEND_ATTEMPT_TIMEOUT))
+  }
+
+  /// Charge one fan-out's actual sends against the credit cap, and record that
+  /// this pass has taken work.
+  fn charge(&mut self, sends: usize) {
+    self.credits = self.credits.saturating_sub(sends);
+    self.started = true;
+  }
+}
 
 /// Maximum consecutive `Service::poll_transmit` errors before the
 /// driver gives up on a registered service and surfaces
@@ -1479,6 +1727,12 @@ enum FamilySend {
   /// It was therefore never OBLIGATED to carry this transmit, and its absence
   /// must not read as a failure — a v4-only host is fully delivered on v4 alone.
   Unbound,
+  /// A bound socket was NOT offered the datagram because the producer's previous
+  /// one is still inside [`Transmit::min_family_gap`] on THIS family's wire (see
+  /// [`FamilyWireGate`]). Obligated and did not carry it, exactly like
+  /// [`FamilySend::Failed`] — but it is a deliberate deferral, not an I/O error,
+  /// so it bumps no error counter.
+  Gated,
   /// A bound socket accepted the datagram.
   Sent,
   /// A bound socket did not carry it. Awaiting writability removes `EWOULDBLOCK`
@@ -1510,6 +1764,7 @@ impl FamilySend {
   fn from_attempt(attempt: &SendAttempt) -> Self {
     match attempt {
       SendAttempt::Unbound => Self::Unbound,
+      SendAttempt::Gated => Self::Gated,
       SendAttempt::Answered(res, _, _) => Self::from_bound_result(res),
       SendAttempt::TimedOut => Self::Failed,
     }
@@ -1517,11 +1772,16 @@ impl FamilySend {
 
   /// This family's I/O answer as the core's protocol vocabulary. The mapping is
   /// one-to-one — no family is ever laundered into a different one.
+  ///
+  /// A GATED family is `Missed` and never `Unobligated`: its socket is there and
+  /// the datagram was fanned onto it, the driver simply owed the wire a gap it
+  /// had not yet paid. Reporting it absent would hide the deferral from the core
+  /// entirely and let the phase advance without it.
   const fn delivery(self) -> FamilyDelivery {
     match self {
       Self::Unbound => FamilyDelivery::Unobligated,
       Self::Sent => FamilyDelivery::Delivered,
-      Self::Failed => FamilyDelivery::Missed,
+      Self::Gated | Self::Failed => FamilyDelivery::Missed,
     }
   }
 }
@@ -1620,29 +1880,119 @@ fn confirm_service_transmit(
 /// serialisation but bounds neither attempt, so the bound is what actually
 /// returns control to the loop.
 ///
-/// The value is derived from the schedule it must not disturb. With `R` the
-/// periodic refresh interval (`max(0.8 · TTL, 1 s)`) a family in good standing is
-/// due again `R` after its own last delivery, and the only delay a wedged family
-/// can still add is the one fan-out in flight at that moment — at most this
-/// bound. Staying inside the record TTL therefore needs `R + bound ≤ TTL`, whose
-/// tightest case is the smallest registrable TTL
-/// ([`mdns_proto::constants::MIN_SERVICE_TTL_SECS`], 2 s): `R` is 1 s there, so
-/// the slack is 1 s, and it is 1 s or more at every larger TTL. 250 ms keeps a
-/// four-fold margin against that slack, which also absorbs several fan-outs'
-/// worth of it when a whole drain pass of producers is due at once.
+/// # What this bound is, and what it is not
 ///
-/// It is also RFC 6762 §8.1's inter-probe interval — the shortest cadence the
-/// protocol itself schedules — so a timed-out family is reported before the
-/// re-arm that report feeds falls due, and the bound never becomes the thing
-/// that paces the lifecycle. A healthy bound UDP socket answers in microseconds
-/// or with an errno, so this cannot manufacture the spurious misses that would
-/// spend the core's patience.
+/// It is a LIVENESS knob, not a wire-freshness budget. What the core guarantees
+/// is the SCHEDULE: a family in good standing is re-announced within
+/// `max(R, 2 × ANNOUNCE_INTERVAL)` of ITS LAST DELIVERY, with `R` the periodic
+/// refresh interval. Whether the records are actually fresh on the wire is
+/// conditional on the driver delivering due transmits promptly. No value here
+/// makes that unconditional: against arbitrarily slow I/O no budget causes a
+/// non-accepting socket's peers to refresh in time, and the protocol-correct
+/// response to a link that will not carry datagrams is the one the core already
+/// has — patience, stall, excusal, and the silence rule. The driver owes loop
+/// liveness and honest per-family facts, not a latency SLA.
+///
+/// The value is 250 ms because that is RFC 6762 §8.1's inter-probe interval, the
+/// shortest cadence the protocol itself schedules: a timed-out family is
+/// reported before the re-arm that report feeds falls due, so the bound never
+/// becomes the thing that paces the lifecycle. A healthy bound UDP socket answers
+/// in microseconds or with an errno, so this cannot manufacture the spurious
+/// misses that would spend the core's patience.
+///
+/// # Why a READINESS driver may bound an attempt at all
+///
+/// Abandoning this future is a DEFINITIVE cancellation, and that is a property of
+/// readiness I/O specifically. The attempt makes a `sendto` syscall only from
+/// inside a poll that found the socket writable; when the bound fires, the future
+/// is dropped between polls, after the last syscall returned `WouldBlock`.
+/// Nothing was ever handed to the kernel, so reporting the family `Missed` is a
+/// fact rather than a guess.
+///
+/// A COMPLETION-based driver has no such licence: its operation is submitted to
+/// the kernel before the wait begins, and cancelling the wait does not cancel the
+/// submission — compio documents its own cancellation as unreliable, with the
+/// underlying operation free to continue. Timing one out there and reporting
+/// `Missed` would tell the core a datagram never reached the wire while the
+/// kernel may still be putting it there. Do NOT copy this pattern into such a
+/// driver on the strength of it appearing here.
 const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// One PRODUCER's per-family earliest-next-send gate: when each address family
+/// ([0] = v4, [1] = v6) last carried a datagram from this service or query.
+///
+/// The rule it enforces is RFC 6762's, on the wire: §6 and §8.3 forbid
+/// re-multicasting a record on an interface inside one second of the last time it
+/// went out on that same interface, and §8.1 spaces probes 250 ms apart. The
+/// MINIMUM is protocol policy and arrives from the core on
+/// [`Transmit::min_family_gap`]; only the driver knows when each family last
+/// satisfied it, which is why the two halves live on opposite sides of the seam.
+///
+/// It cannot be folded into the core's schedule because the confirm anchors at
+/// the EARLIEST acceptance across families. That anchor is the right one for the
+/// TTL guarantee — it can only understate how fresh a family's peers are — but
+/// under inter-family skew `s` it schedules the next datagram one interval after
+/// the EARLY family's wire time, leaving the late family a gap of
+/// `interval − s`. The core cannot see `s`; the driver measured it.
+///
+/// Kept PER PRODUCER because the rules are per record set: two different services
+/// announcing inside the same second are two different records and pace each
+/// other not at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FamilyWireGate {
+  /// Indexed [v4, v6]. `None` until that family has carried a GATED datagram from
+  /// this producer — an ungated (one-shot) send never writes here, so a §6 reply
+  /// cannot defer the announcement that follows it.
+  last_sent: [Option<StdInstant>; 2],
+}
+
+impl FamilyWireGate {
+  /// Whether family `idx` may be offered a datagram at `now` under `min_gap`.
+  ///
+  /// A zero `min_gap` is ungated and always open. A family that has carried
+  /// nothing yet is open. A clock that reads BEFORE the recorded send closes the
+  /// gate: the elapsed gap is then unknown, and the conservative answer is the
+  /// one that cannot put a record back on the wire too soon.
+  fn open(&self, idx: usize, now: StdInstant, min_gap: Duration) -> bool {
+    if min_gap.is_zero() {
+      return true;
+    }
+    match self.last_sent.get(idx).copied().flatten() {
+      Some(last) => now
+        .checked_duration_since(last)
+        .is_some_and(|gap| gap >= min_gap),
+      None => true,
+    }
+  }
+
+  /// Record that family `idx` put a GATED datagram on its wire at `at`.
+  ///
+  /// `at` is that family's OWN acceptance instant, not the fan-out's confirm
+  /// anchor — recording the anchor would re-introduce exactly the skew this gate
+  /// exists to absorb.
+  fn record(&mut self, idx: usize, at: StdInstant, min_gap: Duration) {
+    if min_gap.is_zero() {
+      return;
+    }
+    if let Some(slot) = self.last_sent.get_mut(idx) {
+      *slot = Some(at);
+    }
+  }
+}
+
+/// Index of the IPv4 family in every per-family array, matching
+/// [`mdns_proto::TransmitDelivery`]'s own ordering.
+const FAMILY_V4: usize = 0;
+/// Index of the IPv6 family.
+const FAMILY_V6: usize = 1;
 
 /// One address family's answer to ONE bounded send attempt.
 enum SendAttempt {
   /// No socket bound for this family, so it was never offered the datagram.
   Unbound,
+  /// A bound socket the per-family wire gate held back for this round; no
+  /// syscall was made. See [`FamilyWireGate`].
+  Gated,
   /// The socket answered within [`SEND_ATTEMPT_TIMEOUT`]: the `send_to` result,
   /// plus the wall time and the monotonic instant captured in the poll iteration
   /// that performed the `sendto` (see [`send_to_at`]).
@@ -1666,15 +2016,20 @@ impl SendAttempt {
 
 /// Offer one family its copy of the datagram, bounded by
 /// [`SEND_ATTEMPT_TIMEOUT`]. An absent socket is [`SendAttempt::Unbound`] — that
-/// family was never obligated — and is answered without touching the clock.
+/// family was never obligated — and is answered without touching the clock, as is
+/// a family whose wire gate is shut (`may_send == false`).
 async fn attempt_send_to<S: UdpSocket>(
   sock: Option<&S>,
+  may_send: bool,
   buf: &[u8],
   dst: SocketAddr,
 ) -> SendAttempt {
   let Some(sock) = sock else {
     return SendAttempt::Unbound;
   };
+  if !may_send {
+    return SendAttempt::Gated;
+  }
   let send = send_to_at(sock, buf, dst).fuse();
   let bound = <S::Runtime as RuntimeLite>::sleep(SEND_ATTEMPT_TIMEOUT).fuse();
   pin_mut!(send, bound);
@@ -1702,7 +2057,9 @@ fn note_multicast_attempt(
   #[cfg(feature = "stats")] stats: &std::sync::Arc<hick_trace::stats::Stats>,
 ) {
   match attempt {
-    SendAttempt::Unbound => {}
+    // Neither put bytes on a wire, and neither is an error: one has no socket,
+    // the other is this driver's own deliberate spacing.
+    SendAttempt::Unbound | SendAttempt::Gated => {}
     SendAttempt::Answered(Ok(_), wall, _) => {
       hick_trace::trace!(kind = _kind, dst = %_dst, len = body.len(), "send_to");
       record_self_send(tracker, body, *wall);
@@ -1748,12 +2105,23 @@ fn note_multicast_attempt(
 /// earliest keeps every delivered family's anchor at or before its true
 /// acceptance, which is the safe direction — an anchor may only ever understate
 /// how fresh a family's peers are.
+///
+/// `gate` is the PRODUCER's per-family earliest-next-send state and `min_gap` the
+/// minimum the core computed for this datagram's kind
+/// ([`Transmit::min_family_gap`]). A family whose gap is unpaid is not offered the
+/// datagram at all and is reported [`FamilySend::Gated`] — obligated, and it did
+/// not carry it. Every family that DID carry it records its own acceptance
+/// instant back into `gate`.
+#[allow(clippy::too_many_arguments)]
 async fn send_via<S: UdpSocket>(
   tracker: &mut Vec<(u64, SystemTime)>,
   v4: &Option<Arc<S>>,
   v6: &Option<Arc<S>>,
   dst: SocketAddr,
   body: &[u8],
+  gate: &mut FamilyWireGate,
+  min_gap: Duration,
+  now: StdInstant,
   #[cfg(feature = "stats")] stats: &std::sync::Arc<hick_trace::stats::Stats>,
 ) -> (Fanout, Option<StdInstant>) {
   // proto-layer transmits use multicast_dst() which always
@@ -1786,12 +2154,32 @@ async fn send_via<S: UdpSocket>(
     // family that never accepts hold the whole fan-out — and with it the driver
     // loop — for as long as it stayed wedged.
     let (a4, a6) = futures::future::join(
-      attempt_send_to(v4.as_deref(), body, MDNS_V4_DST),
-      attempt_send_to(v6.as_deref(), body, MDNS_V6_DST),
+      attempt_send_to(
+        v4.as_deref(),
+        gate.open(FAMILY_V4, now, min_gap),
+        body,
+        MDNS_V4_DST,
+      ),
+      attempt_send_to(
+        v6.as_deref(),
+        gate.open(FAMILY_V6, now, min_gap),
+        body,
+        MDNS_V6_DST,
+      ),
     )
     .await;
     fanout.v4 = FamilySend::from_attempt(&a4);
     fanout.v6 = FamilySend::from_attempt(&a6);
+    // Each family's OWN acceptance instant re-opens ITS OWN gate one `min_gap`
+    // later. Using the fan-out anchor (the earliest across families) instead
+    // would put the late family's next send back inside the interval — the exact
+    // skew this gate exists to absorb.
+    if let Some(at) = a4.accepted_at() {
+      gate.record(FAMILY_V4, at, min_gap);
+    }
+    if let Some(at) = a6.accepted_at() {
+      gate.record(FAMILY_V6, at, min_gap);
+    }
     let accepted_at = [a4.accepted_at(), a6.accepted_at()]
       .into_iter()
       .flatten()
@@ -1823,9 +2211,9 @@ async fn send_via<S: UdpSocket>(
   // Unicast: pick the socket matching the destination family. Exactly one family
   // is obligated (an absent socket obligates none), so this branch can only be
   // all- or none-delivered.
-  let sock = match dst {
-    SocketAddr::V4(_) => v4.as_deref(),
-    SocketAddr::V6(_) => v6.as_deref(),
+  let (idx, sock) = match dst {
+    SocketAddr::V4(_) => (FAMILY_V4, v4.as_deref()),
+    SocketAddr::V6(_) => (FAMILY_V6, v6.as_deref()),
   };
   // NO self-send tracker entry here, unlike the multicast branch. A unicast
   // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
@@ -1835,14 +2223,20 @@ async fn send_via<S: UdpSocket>(
   // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
   // the NEW entry — so a legacy-query flood would starve the genuine multicast
   // credits that suppression actually depends on.
-  let attempt = attempt_send_to(sock, body, dst).await;
+  let attempt = attempt_send_to(sock, gate.open(idx, now, min_gap), body, dst).await;
   let outcome = FamilySend::from_attempt(&attempt);
   match dst {
     SocketAddr::V4(_) => fanout.v4 = outcome,
     SocketAddr::V6(_) => fanout.v6 = outcome,
   }
+  if let Some(at) = attempt.accepted_at() {
+    gate.record(idx, at, min_gap);
+  }
   match &attempt {
-    SendAttempt::Unbound => {}
+    // In tree every unicast datagram is a §6.7 legacy reply, which is one-shot
+    // and therefore ungated — `Gated` is unreachable here today and is listed
+    // with `Unbound` because neither wrote to a wire nor failed.
+    SendAttempt::Unbound | SendAttempt::Gated => {}
     SendAttempt::Answered(Ok(_), _, _) => {
       hick_trace::trace!(dst = %dst, len = body.len(), "send_to");
       #[cfg(feature = "stats")]
@@ -1895,8 +2289,12 @@ async fn send_withdrawal_via<S: UdpSocket>(
   #[cfg(feature = "stats")] stats: &std::sync::Arc<hick_trace::stats::Stats>,
 ) -> (WithdrawalSend, WithdrawalSend) {
   let (a4, a6) = futures::future::join(
-    attempt_send_to(v4.as_deref(), body, MDNS_V4_DST),
-    attempt_send_to(v6.as_deref(), body, MDNS_V6_DST),
+    // Ungated: a TTL=0 goodbye's repeat schedule is the endpoint's
+    // (`note_withdrawal_result`), which already spaces the resends, and holding
+    // one back here would leave a family's peers pinned to positive-TTL records
+    // it has already been promised the retraction of.
+    attempt_send_to(v4.as_deref(), true, body, MDNS_V4_DST),
+    attempt_send_to(v6.as_deref(), true, body, MDNS_V6_DST),
   )
   .await;
   let out = |attempt: &SendAttempt| match attempt {
@@ -1905,7 +2303,8 @@ async fn send_withdrawal_via<S: UdpSocket>(
     // See `present_socket_send_outcome`.
     SendAttempt::Unbound => WithdrawalSend::WriteOff,
     SendAttempt::Answered(res, _, _) => present_socket_send_outcome(res),
-    SendAttempt::TimedOut => WithdrawalSend::Retry,
+    // Unreachable: this fan-out passes `may_send == true` for both families.
+    SendAttempt::Gated | SendAttempt::TimedOut => WithdrawalSend::Retry,
   };
   let outcomes = (out(&a4), out(&a6));
   note_multicast_attempt(
@@ -2079,7 +2478,12 @@ async fn driver_task<N: Net>(
     // `register_service` is rejected (`NameAlreadyRegistered`) until the
     // withdrawal frees the name. No replacement can announce ahead of the
     // withdrawal, so this drain runs unconditionally.
-    let more_transmits_pending = state.drain_transmits(now, &mut scratch).await;
+    //
+    // ONE budget covers both drains, so the pass — not each drain in isolation —
+    // is what is bounded. Its clock starts at `now`, so the sweep and the timer
+    // fire above are charged to it too, which is the conservative direction.
+    let mut budget = DrainBudget::new(now);
+    let more_transmits_pending = state.drain_transmits(now, &mut budget, &mut scratch).await;
     // `push_updates` may retire services (orphan drop, encode escalation, or a
     // rename collision), each beginning an endpoint-owned withdrawal.
     state.push_updates(now).await;
@@ -2087,7 +2491,10 @@ async fn driver_task<N: Net>(
     // withdrawal (route freed → driver ctx removed). `Endpoint::poll_timeout`
     // folds the withdrawal deadlines into `next_deadline`, so a due resend wakes
     // the loop.
-    state.drain_withdrawals(now, &mut scratch).await;
+    let more_withdrawals_pending = state
+      .drain_withdrawals(now, &mut budget, &mut scratch)
+      .await;
+    let more_pending = more_transmits_pending || more_withdrawals_pending;
 
     // if drain_transmits stopped at its per-tick budget,
     // don't sleep — loop back immediately so the packet pump can
@@ -2100,7 +2507,7 @@ async fn driver_task<N: Net>(
     // flood that triggers responses faster than we can drain). The
     // command channel is unbounded; without this drain a stuck
     // attacker scenario can grow it without bound.
-    if more_transmits_pending {
+    if more_pending {
       const COMMAND_DRAIN_BUDGET: usize = 8;
       let mut cmd_closed = false;
       for _ in 0..COMMAND_DRAIN_BUDGET {
@@ -2181,7 +2588,13 @@ async fn driver_task<N: Net>(
   let shutdown_deadline = StdInstant::now() + Duration::from_secs(10);
   loop {
     let now = StdInstant::now();
-    state.drain_withdrawals(now, &mut scratch).await;
+    // A fresh budget per iteration: this flush loop re-enters immediately when a
+    // pass is cut (the next deadline is already past, so `dur` is zero), and its
+    // own wall-clock backstop below is what terminates it.
+    let mut budget = DrainBudget::new(now);
+    let _ = state
+      .drain_withdrawals(now, &mut budget, &mut scratch)
+      .await;
     // Sleep on (and exit when there are no) WITHDRAWAL deadlines only — NOT the
     // aggregate `next_deadline`, which folds in cache expiry and query/service
     // timers. Otherwise, once every goodbye is sent, a still-populated cache would

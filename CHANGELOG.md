@@ -67,7 +67,7 @@ BREAKING
   while an obligated family still needed it).
 - `mdns-proto`: new `TransmitObligation` enum (`Sustained` / `OneShot`), carried
   on every `Transmit` and readable via `Transmit::obligation()`;
-  `Transmit::new` takes it as a fourth argument. It states whether the core will
+  `Transmit::new` takes it as its fourth argument. It states whether the core will
   re-arm that datagram until every obligated link accepts it, which is what a
   driver needs to know to decide what a PERMANENT send failure costs: a
   `Sustained` datagram that can never be sent would be re-offered forever and so
@@ -76,6 +76,22 @@ BREAKING
   service's lifecycle phase: the periodic `Established` re-announce advances no
   phase yet is still re-armed on the §8.3 ladder, and `Query::poll_transmit` has
   no service phase at all.
+- `mdns-proto`: every `Transmit` also carries the minimum time that must separate
+  it from its producer's previous datagram ON ONE ADDRESS FAMILY'S WIRE, readable
+  via `Transmit::min_family_gap()` and taken by `Transmit::new` as its fifth
+  argument. Drivers enforce it as a per-family earliest-next-send gate, reporting
+  a deferred family `Missed`. The confirm anchors at the EARLIEST acceptance
+  across families — the proven-safe direction for the TTL guarantee — so under
+  inter-family skew `s` the core schedules the next datagram one interval after
+  the EARLY family's wire time and the LATE family's own gap is `interval − s`:
+  an announcement fell under RFC 6762 §6 / §8.3's one-second floor at every TTL
+  and a §8.1 probe gap could approach zero. The core cannot see `s`; the driver
+  measured it. The VALUE stays in the core because it is kind-dependent — §8.1
+  spaces probes 250 ms apart and exempts them from the one-second rule that
+  governs announcements and §5.2 query retransmissions — so a driver that picked
+  the number itself would have taken protocol policy across the sans-I/O
+  boundary. `TransmitObligation::OneShot` datagrams carry `Duration::ZERO` and
+  are ungated: the core never re-arms them, so a gate could only drop them.
 - The bound on repeated partial delivery lives in `mdns-proto`, not in drivers.
   Repeated partial delivery re-arms indefinitely, so the core bounds how many
   consecutive re-arms one producer spends waiting for a family that never accepts
@@ -164,6 +180,35 @@ caller's part)
   -IPv6 fan-out read as all-delivered and advanced §8.1 probing as though the node
   had no IPv6 at all. That family now reports `FamilyDelivery::Missed` and is
   retried.
+- All four drivers: a family that carried a producer's previous datagram is no
+  longer offered the next one until `Transmit::min_family_gap()` has elapsed ON
+  ITS OWN WIRE, and is reported `FamilyDelivery::Missed` for the round it is
+  deferred. Under inter-family skew the confirm's earliest-acceptance anchor put
+  the late family's successive announcements inside RFC 6762 §6 / §8.3's
+  one-second floor at every TTL, and could drive a §8.1 probe gap toward zero.
+  The core re-arms losslessly, so a deferred family carries the same datagram on
+  the next round.
+- `hick-reactor`: one driver pass is bounded by an aggregate wall-clock budget
+  spanning both the transmit drain and the §10.1 goodbye pump, and resumes at a
+  rotating cursor. Producers are awaited serially and the 64-send credit budget
+  is charged only per family that actually SENT, so an all-miss fan-out cost zero
+  credits while still costing a whole per-attempt bound: a pass of `n`
+  simultaneously-due producers with one wedged family ran for `n × 250 ms` with
+  the 64-slot packet channel backing up behind it and inbound peer datagrams
+  being dropped. The goodbye pump had no budget of any kind. The cursor is what
+  keeps the new budget a delay rather than a starvation — without it every pass
+  would restart at the front of the handle set and the producers behind the first
+  cut would never be reached.
+- `mdns-proto`: an obligation gap now clears the returning family's COVERAGE bit
+  along with the rest of its state. A family that delivered, ceased to be
+  obligated during an all-miss round, and then returned kept a stale claim to
+  have carried the datagram still outstanding, so the next round could read
+  `all(covered)` and advance the phase on pre-gap evidence — the returned family
+  never had to receive the current datagram. Unreachable from the in-tree
+  drivers, which fix their obligated set at spawn; the core is a public library
+  and a driver whose obligated set varies at runtime is exactly what the
+  three-valued `FamilyDelivery` exists to support. A gap containing no confirmed
+  round remains invisible to the core by construction.
 - `hick-reactor` / `hick-compio` only: RFC 6762 §6.7 legacy unicast replies no
   longer record a self-send credit. A unicast reply never loops back to its
   sender, so the credit could never be consumed; under a legacy-query flood

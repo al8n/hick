@@ -694,11 +694,17 @@ where
     // WITHOUT spending a §5.2 retry slot (see `note_transmit_outcome`), until the
     // core's patience bound (`MAX_PARTIAL_ROUNDS`) excuses the link that keeps
     // missing and the budget resumes.
+    //
+    // The per-family gate carries §5.2's own floor: the re-arm that follows a
+    // partial round is anchored at the EARLIEST family acceptance, so without it
+    // the family that accepted late would be re-asked the same question inside
+    // one second on its own interface.
     Ok(Some(Transmit::new(
       crate::service::multicast_dst(),
       None,
       n,
       TransmitObligation::Sustained,
+      retry::MIN_QUERY_GAP,
     )))
   }
 

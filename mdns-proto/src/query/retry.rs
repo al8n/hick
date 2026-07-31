@@ -6,6 +6,13 @@ use crate::Instant;
 
 /// Initial interval between query retransmits (RFC §5.2).
 const INITIAL_SECS: u64 = 1;
+
+/// The tightest spacing RFC 6762 §5.2 permits between two transmissions of the
+/// same question ON ONE INTERFACE: "the interval between the first two queries
+/// MUST be at least one second". The backoff below only ever widens from there,
+/// so this is the floor for the whole retry schedule and the value a question's
+/// [`Transmit::min_family_gap`](crate::Transmit::min_family_gap) carries.
+pub(crate) const MIN_QUERY_GAP: Duration = Duration::from_secs(INITIAL_SECS);
 /// Maximum interval (RFC §5.2: hold at 60s).
 const MAX_SECS: u64 = 60;
 
