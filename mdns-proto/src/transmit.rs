@@ -377,10 +377,12 @@ impl TransmitDelivery {
 /// Index of the IPv4 family in every per-family array, for the in-crate tests
 /// that assert on the core's own per-family state.
 #[cfg(test)]
+#[cfg(all(any(feature = "alloc", feature = "std"), feature = "slab"))]
 pub(crate) const V4: usize = 0;
 /// Index of the IPv6 family. `V4_ONLY` misses on this one, so it is the family
 /// the patience assertions are about.
 #[cfg(test)]
+#[cfg(all(any(feature = "alloc", feature = "std"), feature = "slab"))]
 pub(crate) const V6: usize = 1;
 
 /// Terse fixtures for the in-crate tests, which drive thousands of confirms and

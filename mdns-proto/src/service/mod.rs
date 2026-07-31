@@ -964,6 +964,7 @@ where
   /// non-compliant driver to observe what release builds do when the contract is
   /// broken.
   #[cfg(test)]
+  #[cfg(all(any(feature = "alloc", feature = "std"), feature = "slab"))]
   pub(crate) fn disable_contract_assertions(&mut self) {
     self.contract_assertions_off = true;
   }
