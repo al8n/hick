@@ -200,8 +200,11 @@ pub(super) fn send_withdrawal(
     loops_back: true,
   };
   for (family, outcome) in report.per_family() {
-    if let SendOutcome::Sent(at, _) = outcome {
-      selfsend.record(family, body, at);
+    // The same two-stamp pair `send_and_credit` records, for the same reasons:
+    // a pre-syscall wall stamp to order the echo, a post-syscall monotonic one
+    // to age the credit. See `SelfSendTracker::record`.
+    if let Some((sent, aged_from)) = outcome.credit_stamp().zip(outcome.credit_age_anchor()) {
+      selfsend.record(family, body, sent, aged_from);
     }
   }
   health.note_fanout(report);
@@ -233,7 +236,7 @@ pub(super) fn send_withdrawal(
 /// transient failure would free the route while it still owed its goodbye.
 const fn withdrawal_outcome(outcome: SendOutcome) -> WithdrawalSend {
   match outcome {
-    SendOutcome::Sent(_, _) => WithdrawalSend::Sent,
+    SendOutcome::Sent { .. } => WithdrawalSend::Sent,
     SendOutcome::Gated | SendOutcome::Failed => WithdrawalSend::Retry,
     SendOutcome::NoSocket => WithdrawalSend::WriteOff,
   }

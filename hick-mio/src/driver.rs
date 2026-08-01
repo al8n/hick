@@ -36,8 +36,8 @@ use crate::{endpoint::Mdns, error::TickError, event::Event, onlink, selfsend::Ma
 
 pub(crate) use sends::{FamilyWireGate, SendHealth, send_and_credit};
 
-/// Per-family delivery reporting, the per-family wire gate, and the family
-/// degradation policy — see the module's own docs.
+/// Per-family delivery reporting, the per-family wire gate, and the link-health
+/// signal — see the module's own docs.
 mod sends;
 /// The RFC 6762 §10.1 goodbye stage. A separate responsibility rather than
 /// another link in the tick chain — see the module's own docs.
@@ -182,10 +182,13 @@ impl Mdns {
   ///   already sitting in the socket buffer will never re-notify and blocking
   ///   would go deaf.
   /// * **work due now that no deadline announces** returns [`Duration::ZERO`]
-  ///   too: a query that has never transmitted, or a transmit drain that
-  ///   stopped at its credit cap or cut a sender off at its round-robin
-  ///   quantum. It cannot spin — the next tick either performs the work or
-  ///   hands every sender another fair share of a whole send budget.
+  ///   too: a query that has never transmitted, a transmit drain that stopped at
+  ///   its credit cap or cut a sender off at its round-robin quantum, or a
+  ///   service whose `poll_transmit` failed to encode — the core keeps that
+  ///   datagram armed and schedules no deadline for one it has already armed. It
+  ///   cannot spin — the next tick either performs the work, hands every sender
+  ///   another fair share of a whole send budget, or, after a bounded number of
+  ///   consecutive failures, retires the service that cannot encode.
   /// * **a socket no edge will announce** returns a bounded 50 ms backoff,
   ///   capped against the folded deadline. Two states reach it, and what they
   ///   share is that mio has no edge left to deliver:
@@ -338,8 +341,10 @@ impl Mdns {
 
   /// Stage 1: ingest up to [`RECV_BUDGET`] datagrams.
   ///
-  /// Each one passes the RFC 6762 §11 on-link gate and the untrusted-response
-  /// guard *before* it can consume a self-send credit or reach the proto layer.
+  /// Each one passes the ingress trust boundary — the interface it arrived on
+  /// and the RFC 6762 §11 on-link gate, both in
+  /// [`onlink::admits_ingress`] — and then the untrusted-response guard,
+  /// *before* it can consume a self-send credit or reach the proto layer.
   fn drain_recv(&mut self, now: StdInstant) {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
@@ -367,25 +372,27 @@ impl Mdns {
         continue;
       };
 
-      // RFC 6762 §11 trust boundary, applied BEFORE the proto layer can cache
-      // or act on attacker-injected records. A reported TTL/hop limit is
-      // decisive; without one, fall back to the source address on the bound
-      // interface's own links.
-      let on_link = if meta.hop_limit().is_some() {
-        onlink::is_on_link(meta.hop_limit())
-      } else {
-        onlink::src_on_local_link(
-          meta.peer().ip(),
-          local_subnets,
-          *bound_interface,
-          meta.interface_index(),
-        )
-      };
-      if !on_link {
+      // The ingress trust boundary, applied BEFORE the proto layer can cache or
+      // act on attacker-injected records and BEFORE the take-once credit is
+      // consulted: the link the datagram arrived on, then RFC 6762 §11. Both
+      // gates live in `onlink::admits_ingress` so neither can be applied to only
+      // one of the §11 branches — the interface check in particular, which the
+      // hop-limit branch used to skip entirely even though a conforming hop
+      // limit says nothing about *whose* link a wildcard-bound socket heard.
+      let pkt_iface = sockets.rx_interface(&meta);
+      if !onlink::admits_ingress(
+        meta.peer().ip(),
+        meta.hop_limit(),
+        local_subnets,
+        *bound_interface,
+        pkt_iface,
+      ) {
         hick_trace::debug!(
           src = %meta.peer(),
           hop_limit = ?meta.hop_limit(),
-          "dropping an off-link datagram (RFC 6762 §11 trust boundary)"
+          interface_index = pkt_iface,
+          bound_interface = *bound_interface,
+          "dropping an off-link datagram (ingress trust boundary)"
         );
         #[cfg(feature = "stats")]
         {
@@ -428,16 +435,24 @@ impl Mdns {
       // BEFORE our send from stealing the credit. Without one there is no
       // ordering to check, so matching degrades to content hash inside the TTL
       // window.
+      //
+      // `now` is the tick's own monotonic instant and ages the credit; the
+      // wall stamp only orders it. The two are separate clocks answering
+      // separate questions — see `SelfSendTracker::take`. Passing the tick's
+      // instant rather than a fresh read under-ages the credit by however long
+      // this drain has been running, which is the safe direction: a credit
+      // retained a moment too long costs nothing, and one expired a moment too
+      // early makes this endpoint raise a phantom conflict against itself.
       let caller_is_self = match meta.rx_time() {
-        Some(rx) => selfsend.take(family, data, rx, MatchMode::Ordered),
-        None => selfsend.take(family, data, SystemTime::now(), MatchMode::Degraded),
+        Some(rx) => selfsend.take(family, data, rx, now, MatchMode::Ordered),
+        None => selfsend.take(family, data, SystemTime::now(), now, MatchMode::Degraded),
       };
 
       let route_events = match endpoint.handle(
         now,
         meta.peer(),
         meta.local_ip(),
-        meta.interface_index(),
+        pkt_iface,
         data,
         caller_is_self,
       ) {
@@ -611,7 +626,7 @@ impl Mdns {
           }
           let mut spent = 0usize;
           let mut hit_encode_error = false;
-          let capped = loop {
+          let mut capped = loop {
             if spent >= quantum {
               break true;
             }
@@ -634,7 +649,16 @@ impl Mdns {
                     "Service::poll_transmit failed"
                   );
                   hit_encode_error = true;
-                  break false;
+                  // LEFTOVER WORK, not "nothing due". The core retries the same
+                  // datagram on the next `poll_transmit` and schedules no
+                  // deadline for one it has already armed, so nothing in
+                  // `next_timeout`'s fold speaks for it. Reporting `false` here
+                  // cleared `work_pending` and let the caller block in
+                  // `Poll::poll` on a datagram sitting in memory — and mio's
+                  // readiness is edge-triggered, so no event can ever wake it.
+                  // It would also stall the retirement below, which only counts
+                  // failures on ticks that reach this arm.
+                  break true;
                 }
               },
               None => break false,
@@ -685,6 +709,18 @@ impl Mdns {
             if let Some(ctx) = services.get_mut(&handle) {
               ctx.withdrawing = true;
             }
+            // Only a NON-TERMINAL encode failure is leftover work. This one was
+            // terminal: the service's proto is never polled again, so the
+            // undeliverable datagram is abandoned with it and there is nothing
+            // for a zero timeout to come back for. What the retirement did
+            // produce — the terminal event, and the RFC 6762 §10.1 goodbye that
+            // stage 7 begins from `withdrawing` — both run later in THIS tick,
+            // and the goodbye's schedule is the endpoint's, which
+            // `next_timeout` already folds. Unconditional because `capped` can
+            // only be the `true` this arm's own encode failure set: reaching it
+            // requires `hit_encode_error`, and the loop breaks on the quantum or
+            // on the failure, never both.
+            capped = false;
           }
           (spent, capped)
         }
@@ -964,8 +1000,9 @@ impl Mdns {
 /// round count — would put the core back to refreshing alternating families at
 /// twice the periodic interval. Bounding how long the lifecycle waits for a
 /// family that keeps missing is the core's own patience, applied inside the
-/// confirm; this driver's only write-off is the obligated set itself, and that
-/// is [`SendHealth`]'s.
+/// confirm. This driver writes no family off: the obligated set it reports turns
+/// on which sockets exist and which family the datagram was addressed to, and
+/// [`SendHealth`] — a caller-facing health signal — is no input to it.
 ///
 /// `note_service_announced` reads the goodbye-ownership latch that
 /// `note_transmit_outcome` has just updated, and it is that latch — not the

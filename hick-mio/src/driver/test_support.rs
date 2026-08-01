@@ -61,6 +61,19 @@ fn loopback_index() -> Option<u32> {
 /// asserted here depend on IPv6. The degradation is printed so a run that
 /// covers less than it looks like says so.
 pub(crate) fn loopback_mdns() -> Option<TestMdns> {
+  loopback_mdns_with(ServerOptions::default())
+}
+
+/// [`loopback_mdns`] over a caller-supplied options bundle, with the interface
+/// pinned to loopback on top of it.
+///
+/// The one knob a test cannot get any other way is
+/// [`ServerOptions::with_max_payload_size`]: it sizes the encode scratch every
+/// `poll_transmit` writes into, and a buffer too small for a service's records
+/// is the only thing that makes the proto layer fail to encode on demand. That
+/// failure drives the consecutive-encode-error retirement, which is otherwise
+/// unreachable from a test.
+pub(crate) fn loopback_mdns_with(opts: ServerOptions) -> Option<TestMdns> {
   // Ignore poisoning: a panic in one test must surface as that test's own
   // assertion failure, not as a poison error in every test that follows it.
   let guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -68,7 +81,7 @@ pub(crate) fn loopback_mdns() -> Option<TestMdns> {
     eprintln!("skipping: no UP loopback interface reported by getifs");
     return None;
   };
-  let opts = ServerOptions::default().with_interface_index(Some(idx));
+  let opts = opts.with_interface_index(Some(idx));
   let mdns = match Mdns::new(opts.clone()) {
     Ok(m) => m,
     Err(e) => {

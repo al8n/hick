@@ -299,14 +299,23 @@ impl Mdns {
     self.sockets.register(registry, v4, v6)
   }
 
-  /// Remove both sockets from the caller's [`Registry`].
+  /// Remove both sockets from the [`Registry`] they were registered into.
+  ///
+  /// It deliberately takes no `Registry`: the removal goes through a clone of
+  /// the one handed to [`register`](Self::register), so a caller driving more
+  /// than one `Poll` cannot deregister this endpoint from the wrong selector —
+  /// which kqueue would report as success while the original registration went
+  /// on delivering events under a token [`owns`](Self::owns) had stopped
+  /// claiming. Calling this before ever registering is a no-op.
   ///
   /// # Errors
   ///
   /// Any error the underlying `Registry::deregister` returns. Both families are
-  /// always attempted; the first failure is reported.
-  pub fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-    self.sockets.deregister(registry)
+  /// always attempted and the first failure is reported. A family the selector
+  /// did not confirm stays registered *and stays owned*, so calling this again
+  /// retries exactly the removal that is outstanding.
+  pub fn deregister(&mut self) -> io::Result<()> {
+    self.sockets.deregister()
   }
 
   /// Whether `token` is one of the two handed to [`register`](Self::register).
@@ -345,13 +354,15 @@ impl Mdns {
   ///
   /// Two independent conditions report here, one per direction:
   ///
-  /// * **It cannot deliver.** A family that fails to deliver several datagrams
-  ///   in a row stops holding the protocol back: it is still attempted on every
-  ///   transmit, and one successful send restores it, but until then a service
-  ///   may complete its RFC 6762 §8.1 probe sequence and a query may spend its
-  ///   §5.2 retry budget without it. That is deliberate — the alternative is a
-  ///   service stuck probing forever because one socket cannot send — but it is
-  ///   also a real reduction in coverage.
+  /// * **It cannot deliver.** A family has failed to deliver several datagrams
+  ///   in a row. It is still attempted on every transmit, every such attempt is
+  ///   still reported to the protocol layer as a miss, and one successful send
+  ///   clears the flag. Nothing about the flag changes what the protocol layer
+  ///   is told: a service whose probe or announcement keeps missing this family
+  ///   advances only under the protocol layer's own patience, which advances the
+  ///   phase without granting it the credit a real delivery earns. What the flag
+  ///   reports is a real reduction in coverage, and this is the only way to see
+  ///   it.
   /// * **It cannot receive.** A receive that fails structurally (the socket is
   ///   not readable at all, not merely busy) is not retried, because retrying it
   ///   is a busy-loop that never recovers. The family keeps sending, so it is

@@ -198,6 +198,30 @@ impl RecvRotor {
   }
 }
 
+/// The clock reads of ONE successful `send_to` attempt, on their way from
+/// [`BoundSocket::send_attempt`] into [`SendOutcome::Sent`].
+///
+/// It exists so the `EINTR` retry has something to return: the attempt that
+/// succeeded owns all three reads, and an interrupted attempt's are discarded
+/// with it. See [`SendOutcome::Sent`] for what each one is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendStamps {
+  submitted_wall: SystemTime,
+  submitted_at: StdInstant,
+  wire_at: StdInstant,
+}
+
+impl SendStamps {
+  /// The [`SendOutcome`] a family that carried the datagram reports.
+  const fn into_sent(self) -> SendOutcome {
+    SendOutcome::Sent {
+      submitted_wall: self.submitted_wall,
+      submitted_at: self.submitted_at,
+      wire_at: self.wire_at,
+    }
+  }
+}
+
 /// Outcome of one family's send.
 ///
 /// The four are the whole vocabulary, and none may be collapsed into another:
@@ -205,27 +229,63 @@ impl RecvRotor {
 /// §10.1 withdrawal pump maps them onto per-family goodbye debt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendOutcome {
-  /// The datagram reached the kernel, carrying the two stamps taken immediately
-  /// **before** the `send_to` — never after it.
+  /// The datagram reached the kernel, carrying **three** separate clock reads
+  /// serving **four** distinct uses.
   ///
-  /// The [`SystemTime`] is the self-send credit's stamp, and the direction is
-  /// what makes the credit usable: an entry stamped early can never postdate the
-  /// kernel's stamp on the multicast loopback copy, so the tracker's
-  /// `sent <= kernel rx` test still admits our own copy. One exception is worth
-  /// naming: [`send_with_eintr_retry`] retries once on `EINTR`, so on that path
-  /// the stamp precedes the attempt that actually succeeded by one interrupted
-  /// syscall. Early is the safe side, at the cost of one extra syscall's worth
-  /// of window in which a byte-identical peer datagram could take the credit —
-  /// sub-microsecond, and bounded above by `SELF_SEND_TTL` either way.
+  /// Three, not one, and not two: each stamp is allowed to be wrong in exactly
+  /// one direction, and the directions do not all agree. Folding any pair
+  /// together silently breaks whichever consumer needed the other direction, so
+  /// read the field docs before "simplifying" them. Two consumers do share one
+  /// stamp — the wire gate and the self-send credit's ageing both read
+  /// `wire_at` — and they may only do so because they want the *same* direction;
+  /// see [`SendOutcome::credit_age_anchor`]. `hick-compio`'s
+  /// `SendAttempt::Answered` carries the same three for the same reasons.
   ///
-  /// The [`StdInstant`] is **this family's own acceptance instant**, which the
-  /// driver needs for two things a single post-fan-out clock read would get
-  /// wrong: the per-family wire gate
-  /// ([`FamilyWireGate`](crate::driver::FamilyWireGate)) records the family that
-  /// actually carried the datagram, and the confirm anchors at the *earliest*
-  /// acceptance across families so no delivered family's refresh schedule is
-  /// backdated by however long the other family took.
-  Sent(SystemTime, StdInstant),
+  /// **All three come from the attempt that actually succeeded.** See
+  /// [`BoundSocket::send_attempt`]: the `EINTR` retry re-reads its own
+  /// pre-syscall clocks rather than carrying the interrupted attempt's forward.
+  Sent {
+    /// Wall clock, read **before** the syscall. Orders our own multicast
+    /// loopback echo against the send that produced it, and nothing else.
+    ///
+    /// EARLY is the safe direction, and pre-syscall is the only way to get it:
+    /// suppression compares this against the kernel's receive stamp on the echo,
+    /// so `submitted_wall <= kernel send time <= echo rx time` must hold or the
+    /// echo looks like a peer datagram that predated our send and this host
+    /// processes its own probe or announcement as peer traffic.
+    ///
+    /// It is **not** how the credit ages. `SELF_SEND_TTL` runs off
+    /// [`SendOutcome::credit_age_anchor`] precisely because the gap between this
+    /// read and the syscall is unbounded — a preemption, a page fault, or the
+    /// `EINTR` retry all widen it — and charging that gap to the credit's life
+    /// is what expires a credit before its echo can claim it.
+    submitted_wall: SystemTime,
+    /// Monotonic, read **before** the syscall. Anchors the **core's** refresh
+    /// schedule.
+    ///
+    /// EARLY is the safe direction here too: an anchor at or before the true
+    /// acceptance can only understate how fresh a family's peers are, so the
+    /// next refresh lands sooner than strictly needed. A late anchor would push
+    /// a refresh past the records' own TTL.
+    submitted_at: StdInstant,
+    /// Monotonic, read **after** the syscall returned success. Anchors
+    /// [`FamilyWireGate`](crate::driver::FamilyWireGate) and the self-send
+    /// credit's ageing — the two uses that want a POST-syscall instant, and
+    /// nothing else.
+    ///
+    /// EARLY is the UNSAFE direction here — the opposite of the two above, and
+    /// the whole reason this is a third stamp rather than `submitted_at` reused.
+    /// The gate measures the real spacing between bytes on ONE family's wire.
+    /// Nothing bounds the delay between a pre-syscall clock read and the syscall
+    /// that follows it: a preempted thread, a signal handler, or a page fault
+    /// puts the datagram on the wire long after the stamp. Anchored at
+    /// `submitted_at`, a send stalled by `P` re-opens its own family `P` early —
+    /// at RFC 6762 §8.1's 250 ms inter-probe interval a 200 ms stall would leave
+    /// 50 ms of true spacing, and it would do so on exactly the loaded host the
+    /// spacing exists to protect. The credit's ageing takes the same view of the
+    /// same stall from the other side: see [`SendOutcome::credit_age_anchor`].
+    wire_at: StdInstant,
+  },
   /// A bound socket was **not offered** the datagram, because the caller's
   /// per-producer wire gate had not yet paid this family the minimum gap the
   /// core asked for ([`Transmit::min_family_gap`](mdns_proto::Transmit)).
@@ -270,10 +330,60 @@ pub(crate) enum SendOutcome {
 }
 
 impl SendOutcome {
-  /// This family's own acceptance instant, if it accepted the datagram.
-  pub(crate) const fn accepted_at(self) -> Option<StdInstant> {
+  /// The wall stamp that ORDERS the self-send credit against its echo, if this
+  /// family carried the datagram. Read before the syscall — see
+  /// [`SendOutcome::Sent`].
+  pub(crate) const fn credit_stamp(self) -> Option<SystemTime> {
     match self {
-      Self::Sent(_, at) => Some(at),
+      Self::Sent { submitted_wall, .. } => Some(submitted_wall),
+      _ => None,
+    }
+  }
+
+  /// The instant the self-send credit starts AGEING from, if this family
+  /// carried the datagram.
+  ///
+  /// The same post-syscall monotonic read the wire gate anchors at, and shared
+  /// with it deliberately: both want the instant the kernel accepted the
+  /// datagram, and both are safe when it is LATE and unsafe when it is EARLY. A
+  /// gate anchored early re-opens a wire inside RFC 6762's minimum spacing; a
+  /// credit aged from an early instant expires before its own echo arrives, and
+  /// the endpoint then raises a phantom conflict against itself. One stamp, one
+  /// direction, two consumers.
+  ///
+  /// Never [`SendOutcome::credit_stamp`]. That one is pre-syscall by necessity —
+  /// it has to precede the kernel's own receive stamp on the echo — and the
+  /// unbounded gap it leaves is exactly what must not be charged to a two-second
+  /// TTL.
+  pub(crate) const fn credit_age_anchor(self) -> Option<StdInstant> {
+    match self {
+      Self::Sent { wire_at, .. } => Some(wire_at),
+      _ => None,
+    }
+  }
+
+  /// The instant to confirm this family at, if it carried the datagram.
+  ///
+  /// The **core's** anchor, read before the syscall, so it is at or before the
+  /// true acceptance.
+  pub(crate) const fn confirm_anchor(self) -> Option<StdInstant> {
+    match self {
+      Self::Sent { submitted_at, .. } => Some(submitted_at),
+      _ => None,
+    }
+  }
+
+  /// The instant this family's bytes were actually on its wire, if they were.
+  ///
+  /// The **wire gate's** anchor, read after the syscall succeeded.
+  ///
+  /// Never fold this into [`SendOutcome::confirm_anchor`]. The two answer
+  /// different questions — "when may the core assume peers heard us" versus
+  /// "when did this wire last carry bytes" — and they are wrong in opposite
+  /// directions, so each consumer can absorb only its own.
+  pub(crate) const fn wire_time(self) -> Option<StdInstant> {
+    match self {
+      Self::Sent { wire_at, .. } => Some(wire_at),
       _ => None,
     }
   }
@@ -407,6 +517,45 @@ struct BoundSocket {
   /// eventually writes the family off — is unreachable in a test without it.
   #[cfg(test)]
   forced_send_wouldblock: bool,
+  /// Fail this family's next `n` send **attempts** with `EINTR`, consumed one
+  /// per attempt.
+  ///
+  /// A signal landing between a `sendto` entering the kernel and returning is
+  /// not something a test can arrange against a healthy socket, and the retry it
+  /// drives is the one path on which a single send reads its pre-syscall clocks
+  /// twice. Which of the two readings survives into [`SendOutcome::Sent`] is the
+  /// whole question — an interrupted attempt's stamps can precede the successful
+  /// syscall by an unbounded stall — so the path must not go untested.
+  #[cfg(test)]
+  forced_send_eintr: u32,
+  /// Per-call stalls injected **between an attempt's pre-syscall stamps and its
+  /// syscall**, consumed one per attempt; once exhausted every send proceeds at
+  /// full speed.
+  ///
+  /// It stands in for the one thing no test can ask a real host for: the thread
+  /// losing the CPU after [`BoundSocket::send_attempt`] reads its pre-syscall
+  /// clocks and before `sendto` runs. That window is what a wire gate anchored
+  /// at a pre-syscall stamp gives back — a family re-armed inside the minimum
+  /// spacing RFC 6762 gives its wire — and equally what a self-send credit aged
+  /// from a pre-syscall stamp gives back: a credit that expires before its own
+  /// echo can claim it. Neither path is reachable in a test without this.
+  #[cfg(test)]
+  forced_send_delays: std::collections::VecDeque<std::time::Duration>,
+  /// When each successful send actually put bytes on this family's wire, read
+  /// **inside** the send path after any injected stall.
+  ///
+  /// This is the wire's own history and owes nothing to how `send_one` stamps
+  /// anything, which is what lets a test assert real spacing rather than the
+  /// driver's account of it.
+  #[cfg(test)]
+  wire_times: Vec<StdInstant>,
+  /// Make this family's next `Registry::deregister` fail.
+  ///
+  /// A partial deregistration failure is what leaves a ghost registration in the
+  /// caller's selector, and a healthy socket in a live `Poll` cannot be made to
+  /// produce one on demand.
+  #[cfg(test)]
+  forced_deregister_error: bool,
   /// Successful `reregister` calls, counted so a test can tell an interest
   /// toggle that was actually issued from one short-circuited as unchanged.
   /// That difference is the whole of the receive re-arm retry, and it is
@@ -434,6 +583,14 @@ impl BoundSocket {
       forced_permanent_recv_error: false,
       #[cfg(test)]
       forced_send_wouldblock: false,
+      #[cfg(test)]
+      forced_send_eintr: 0,
+      #[cfg(test)]
+      forced_send_delays: std::collections::VecDeque::new(),
+      #[cfg(test)]
+      wire_times: Vec::new(),
+      #[cfg(test)]
+      forced_deregister_error: false,
       #[cfg(test)]
       reregisters: 0,
     }
@@ -471,17 +628,91 @@ impl BoundSocket {
     raw_recv(&self.sock, buf, is_v4)
   }
 
-  /// One `send_to` on this family's socket, retrying once on `EINTR`.
+  /// One `send_to` on this family's socket, retrying once on `EINTR`, and the
+  /// clock reads of the attempt that actually **succeeded**.
   ///
-  /// Wraps the free [`send_with_eintr_retry`] purely so a test can inject the
-  /// `WouldBlock` no healthy loopback socket will produce. See
-  /// [`BoundSocket::forced_send_wouldblock`].
-  fn raw_send(&self, body: &[u8], dst: SocketAddr) -> io::Result<usize> {
+  /// `EINTR` means a signal landed mid-syscall; it is not backpressure, so the
+  /// socket is still writable and an immediate retry normally succeeds. Retrying
+  /// here is what keeps a signal from costing the datagram a whole re-arm cycle,
+  /// since a family this driver reports as missed is not tried again until the
+  /// core re-offers it. Exactly one retry: a signal storm must not spin inside a
+  /// syscall wrapper.
+  ///
+  /// # Why the stamps are read here and not by the caller
+  ///
+  /// A retry makes "the pre-syscall instant" ambiguous, and the wrong answer is
+  /// silently wrong. Carrying the interrupted attempt's stamps forward puts an
+  /// entire failed syscall — plus whatever preempted the thread between the two
+  /// — inside the self-send credit's `SELF_SEND_TTL`, and a stall past that TTL
+  /// makes this endpoint ingest its own multicast echo as peer traffic. Reading
+  /// them per attempt in [`BoundSocket::send_attempt`] and returning the
+  /// survivor's is the only formulation with no such window, and it keeps every
+  /// stamp's documented direction true of the syscall it actually describes.
+  ///
+  /// Also the seam for what no healthy loopback socket will produce: the
+  /// `WouldBlock` of [`BoundSocket::forced_send_wouldblock`].
+  fn raw_send(&mut self, body: &[u8], dst: SocketAddr) -> io::Result<SendStamps> {
     #[cfg(test)]
     if self.forced_send_wouldblock {
       return Err(io::Error::from(io::ErrorKind::WouldBlock));
     }
-    send_with_eintr_retry(self, body, dst)
+    match self.send_attempt(body, dst) {
+      Err(e) if e.kind() == io::ErrorKind::Interrupted => self.send_attempt(body, dst),
+      other => other,
+    }
+  }
+
+  /// One `send_to` attempt: its own pre-syscall clock reads, the syscall, and —
+  /// only if the kernel accepted the datagram — the post-syscall read.
+  ///
+  /// The two pre-syscall stamps are captured as late as possible, with the
+  /// syscall as the next statement; the post-syscall one as early as possible,
+  /// before any telemetry, which is not free and would otherwise be charged to
+  /// the next datagram's wire gap. See [`SendOutcome::Sent`] for what each is
+  /// for and the one direction each may be wrong in.
+  ///
+  /// Also the seam for the two things no healthy loopback socket will produce:
+  /// the pre-syscall stall of [`BoundSocket::forced_send_delays`] and the
+  /// interruption of [`BoundSocket::forced_send_eintr`]. Both are consumed
+  /// **per attempt**, exactly as the real conditions occur.
+  fn send_attempt(&mut self, body: &[u8], dst: SocketAddr) -> io::Result<SendStamps> {
+    let submitted_wall = SystemTime::now();
+    let submitted_at = StdInstant::now();
+    // Deliberately AFTER this attempt's pre-syscall stamps and BEFORE its
+    // syscall: that is the window a preempted thread opens for real.
+    #[cfg(test)]
+    if let Some(stall) = self.forced_send_delays.pop_front()
+      && !stall.is_zero()
+    {
+      std::thread::sleep(stall);
+    }
+    #[cfg(test)]
+    if self.forced_send_eintr > 0 {
+      self.forced_send_eintr -= 1;
+      return Err(io::Error::from(io::ErrorKind::Interrupted));
+    }
+    self.sock.send_to(body, dst)?;
+    let wire_at = StdInstant::now();
+    #[cfg(test)]
+    self.wire_times.push(wire_at);
+    Ok(SendStamps {
+      submitted_wall,
+      submitted_at,
+      wire_at,
+    })
+  }
+
+  /// Remove this socket from `registry`.
+  ///
+  /// Wraps `Registry::deregister` purely so a test can inject the partial
+  /// failure that leaves a ghost registration behind. See
+  /// [`BoundSocket::forced_deregister_error`].
+  fn raw_deregister(&mut self, registry: &Registry) -> io::Result<()> {
+    #[cfg(test)]
+    if self.forced_deregister_error {
+      return Err(io::Error::other("forced deregister failure"));
+    }
+    registry.deregister(&mut self.sock)
   }
 
   /// Re-arm this socket's readiness after we stopped reading it. No-op when the
@@ -537,6 +768,20 @@ pub(crate) struct Sockets {
   /// platform's `Selector::try_clone` deliberately preserves the selector id,
   /// so a `reregister` through this clone reaches the same selector state the
   /// caller's `Poll` owns and mio's association debug-assertion still holds.
+  ///
+  /// **It is also the only registry anything here deregisters through.** A
+  /// caller driving more than one `Poll` could otherwise hand
+  /// [`Sockets::deregister`] a foreign one, and the platforms disagree about
+  /// what that means: kqueue ignores the absent filter and reports success,
+  /// epoll returns `ENOENT`. Either way the registration the *original*
+  /// selector holds survives, so honouring a caller-supplied registry could only
+  /// ever forget a registration that still exists.
+  ///
+  /// INVARIANT: `Some` whenever either family holds a token. A family is only
+  /// given a token by a `register` that succeeded through this registry, and
+  /// only stripped of one by a `deregister` through it that the selector
+  /// confirmed — including the rollback of a partial `register`, which restores
+  /// this field when its own cleanup fails.
   registry: Option<Registry>,
   /// The two tokens the caller reserved for us, recorded even for a family that
   /// is not bound: [`Sockets::owns`] must claim both, or the caller would route
@@ -546,6 +791,24 @@ pub(crate) struct Sockets {
   /// call, because the starvation it prevents is across ticks: a per-call or
   /// per-tick preference resets to the same family every time.
   recv_rotor: RecvRotor,
+  /// Make the IPv6 half of the next [`Sockets::register`] fail, so the partial
+  /// registration and its rollback can be exercised.
+  ///
+  /// It lives here rather than on a [`BoundSocket`] because the rollback has to
+  /// be testable on a host with no IPv6 socket to fail — which is most CI
+  /// runners, and macOS in particular.
+  #[cfg(test)]
+  forced_v6_register_error: bool,
+  /// Report this index as the interface every received datagram arrived on,
+  /// overriding the cmsg metadata. See [`Sockets::rx_interface`].
+  ///
+  /// The ingress trust boundary drops a datagram whose interface index is not
+  /// the one this endpoint bound, and no unit test can make a datagram arrive on
+  /// a NIC — real or otherwise — that the host does not route to this socket.
+  /// The gate is the difference between a responder that answers only its own
+  /// link and one an adjacent network can drive, so it must not go untested.
+  #[cfg(test)]
+  forced_rx_interface: Option<u32>,
   /// Shared counters. The **same** `Arc` [`crate::endpoint::Mdns::stats`] holds
   /// and `mdns-proto`'s `Endpoint::handle()` bumps `packets_rx`/`bytes_rx` on
   /// (both clone the handle `ProtoEndpoint::stats_handle()` mints) — never a
@@ -646,9 +909,27 @@ impl Sockets {
       registry: None,
       tokens: None,
       recv_rotor: RecvRotor::new(),
+      #[cfg(test)]
+      forced_v6_register_error: false,
+      #[cfg(test)]
+      forced_rx_interface: None,
       #[cfg(feature = "stats")]
       stats,
     })
+  }
+
+  /// The interface a received datagram arrived on, as the ingress trust
+  /// boundary must read it.
+  ///
+  /// Production reads it straight off the cmsg metadata; the `#[cfg(test)]`
+  /// override is the only way to present a datagram from an interface this host
+  /// does not deliver on. See [`Sockets::forced_rx_interface`].
+  pub(crate) fn rx_interface(&self, meta: &RecvMeta) -> u32 {
+    #[cfg(test)]
+    if let Some(idx) = self.forced_rx_interface {
+      return idx;
+    }
+    meta.interface_index()
   }
 
   /// The interface both sockets are scoped to. The RFC 6762 §11 fallback needs
@@ -691,10 +972,25 @@ impl Sockets {
     // the caller's selector with no way for us to re-arm or toggle them.
     let cloned = registry.try_clone()?;
     register_family(self.v4.as_mut(), registry, v4)?;
-    if let Err(e) = register_family(self.v6.as_mut(), registry, v6) {
+    if let Err(e) = self.register_v6(registry, v6) {
       // Never sit half-registered: the caller would receive readiness for one
       // family while `owns`/`deregister` disagree about what we hold.
-      let _ = deregister_family(self.v4.as_mut(), registry);
+      if let Err(_rollback) = deregister_family(self.v4.as_mut(), registry) {
+        // The rollback ITSELF failed, so IPv4 is still in the caller's selector
+        // under `v4`. Adopt the registration state we were about to discard:
+        // `owns` must keep claiming a token the selector still routes to us, and
+        // `deregister` must have the clone it needs to retry the removal. The
+        // caller sees `register` fail and — because this leaves us registered —
+        // is told by the `AlreadyExists` above to deregister before retrying,
+        // which is precisely the cleanup that is outstanding.
+        hick_trace::debug!(
+          error = %_rollback,
+          "rolling back a partial registration failed; keeping the registration \
+           state so the leftover family can still be deregistered"
+        );
+        self.registry = Some(cloned);
+        self.tokens = Some((v4, v6));
+      }
       return Err(e);
     }
     self.registry = Some(cloned);
@@ -702,13 +998,49 @@ impl Sockets {
     Ok(())
   }
 
-  /// Remove both sockets from the caller's `Registry` and drop our clone of it.
-  pub(crate) fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-    let v4 = deregister_family(self.v4.as_mut(), registry);
-    let v6 = deregister_family(self.v6.as_mut(), registry);
-    self.registry = None;
-    self.tokens = None;
-    v4.and(v6)
+  /// Register the IPv6 family, or the injected failure standing in for it.
+  fn register_v6(&mut self, registry: &Registry, token: Token) -> io::Result<()> {
+    #[cfg(test)]
+    if self.forced_v6_register_error {
+      return Err(io::Error::other("forced v6 registration failure"));
+    }
+    register_family(self.v6.as_mut(), registry, token)
+  }
+
+  /// Remove both sockets from the selector they were registered into, and drop
+  /// our clone of it.
+  ///
+  /// It takes no `Registry`, and that absence is the guarantee: the removal goes
+  /// through the clone taken at [`Sockets::register`], so a caller driving two
+  /// `Poll`s cannot deregister us from the wrong one. See [`Sockets::registry`].
+  ///
+  /// Both families are always attempted and the first failure is reported. A
+  /// family the selector did not confirm keeps its token, its readiness and its
+  /// interest, and the clone and the token pair are kept alongside — so `owns`
+  /// still claims a token the selector still routes to us, and calling this
+  /// again retries exactly the removal that is outstanding. Forgetting the pair
+  /// on a failure would strand that registration: no token to recognise its
+  /// events by, and no registry to remove it with.
+  pub(crate) fn deregister(&mut self) -> io::Result<()> {
+    let Self {
+      v4,
+      v6,
+      registry,
+      tokens,
+      ..
+    } = self;
+    // Nothing was ever registered through us, so there is nothing to remove and
+    // no clone to drop. By the invariant on `registry`, neither family can be
+    // holding a token here.
+    let Some(reg) = registry.as_ref() else {
+      return Ok(());
+    };
+    let r4 = deregister_family(v4.as_mut(), reg);
+    let r6 = deregister_family(v6.as_mut(), reg);
+    r4.and(r6)?;
+    *registry = None;
+    *tokens = None;
+    Ok(())
   }
 
   /// Whether `token` is one of the two the caller handed us in
@@ -1082,21 +1414,19 @@ impl Sockets {
     let Some(fam) = self.family_mut(family) else {
       return SendOutcome::NoSocket;
     };
-    // Captured as late as possible — the next statement is the syscall — so the
-    // credit's stamp cannot postdate the kernel's stamp on the loopback copy,
-    // and the monotonic instant is this family's own acceptance time rather than
-    // a later point in the fan-out.
-    let at = SystemTime::now();
-    let accepted = StdInstant::now();
+    // Every clock read belongs to the attempt that succeeded, and is taken
+    // inside `send_attempt` for that reason — the `EINTR` retry is a second
+    // syscall, and a stamp read out here would describe the first one. See
+    // [`SendOutcome::Sent`].
     match fam.raw_send(body, dst) {
-      Ok(_) => {
+      Ok(stamps) => {
         hick_trace::trace!(dst = %dst, len = body.len(), via_v4 = family.is_v4(), "send_to");
         #[cfg(feature = "stats")]
         {
           stats.packets_tx(1);
           stats.bytes_tx(body.len() as u64);
         }
-        SendOutcome::Sent(at, accepted)
+        stamps.into_sent()
       }
       // The send buffer is full. NOTHING reached the kernel, so this family
       // definitively did not carry the datagram — there is no in-flight
@@ -1206,6 +1536,64 @@ impl Sockets {
     }
   }
 
+  /// Stall this family's next send attempts between their pre-syscall stamps
+  /// and the syscall, one entry per **attempt**. See
+  /// [`BoundSocket::forced_send_delays`].
+  #[cfg(test)]
+  pub(crate) fn force_send_delays_for_test(
+    &mut self,
+    family: Family,
+    stalls: &[std::time::Duration],
+  ) {
+    if let Some(fam) = self.family_mut(family) {
+      fam.forced_send_delays = stalls.iter().copied().collect();
+    }
+  }
+
+  /// Interrupt this family's next `n` send attempts with `EINTR`. See
+  /// [`BoundSocket::forced_send_eintr`].
+  #[cfg(test)]
+  pub(crate) fn force_send_eintr_for_test(&mut self, family: Family, n: u32) {
+    if let Some(fam) = self.family_mut(family) {
+      fam.forced_send_eintr = n;
+    }
+  }
+
+  /// Report `idx` as the interface every subsequent receive arrived on. See
+  /// [`Sockets::forced_rx_interface`].
+  #[cfg(test)]
+  pub(crate) const fn force_rx_interface_for_test(&mut self, idx: Option<u32>) {
+    self.forced_rx_interface = idx;
+  }
+
+  /// When this family's sends actually reached its wire, in order. Recorded
+  /// inside the send path, so it is the wire's own history rather than the
+  /// driver's account of it. See [`BoundSocket::wire_times`].
+  #[cfg(test)]
+  pub(crate) fn wire_times_for_test(&self, family: Family) -> Vec<StdInstant> {
+    match family {
+      Family::V4 => self.v4.as_ref(),
+      Family::V6 => self.v6.as_ref(),
+    }
+    .map_or_else(Vec::new, |fam| fam.wire_times.clone())
+  }
+
+  /// Make this family's next `Registry::deregister` fail. See
+  /// [`BoundSocket::forced_deregister_error`].
+  #[cfg(test)]
+  pub(crate) fn force_deregister_error_for_test(&mut self, family: Family, fail: bool) {
+    if let Some(fam) = self.family_mut(family) {
+      fam.forced_deregister_error = fail;
+    }
+  }
+
+  /// Make the IPv6 half of the next [`Sockets::register`] fail. See
+  /// [`Sockets::forced_v6_register_error`].
+  #[cfg(test)]
+  pub(crate) const fn force_v6_register_error_for_test(&mut self, fail: bool) {
+    self.forced_v6_register_error = fail;
+  }
+
   /// This family's transient-receive-error count for the current round, so a
   /// test can tell a retained-readiness backoff from a cleared flag.
   #[cfg(test)]
@@ -1313,21 +1701,6 @@ impl Sockets {
   }
 }
 
-/// One `send_to`, retrying once on `EINTR`.
-///
-/// `EINTR` means a signal landed mid-syscall; it is not backpressure, so the
-/// socket is still writable and an immediate retry normally succeeds. Retrying
-/// here is what keeps a signal from costing the datagram a whole re-arm cycle,
-/// since a family this driver reports as missed is not tried again until the
-/// core re-offers it. Exactly one retry: a signal storm must not spin inside a
-/// syscall wrapper.
-fn send_with_eintr_retry(fam: &BoundSocket, body: &[u8], dst: SocketAddr) -> io::Result<usize> {
-  match fam.sock.send_to(body, dst) {
-    Err(e) if e.kind() == io::ErrorKind::Interrupted => fam.sock.send_to(body, dst),
-    other => other,
-  }
-}
-
 /// Register one family, recording the token and interest it now holds.
 fn register_family(
   fam: Option<&mut BoundSocket>,
@@ -1346,18 +1719,24 @@ fn register_family(
 
 /// Deregister one family and reset it to its freshly-bound state, so a later
 /// [`Sockets::register`] starts from the same assumptions `bind` did.
+///
+/// **The reset happens only once the selector has confirmed the removal.** A
+/// family whose `deregister` failed is still registered, and clearing its token
+/// would leave that registration with nothing left to recognise its events by
+/// and nothing to retry the removal with — a ghost in the caller's selector,
+/// under a token `Sockets::owns` has stopped claiming.
 fn deregister_family(fam: Option<&mut BoundSocket>, registry: &Registry) -> io::Result<()> {
   let Some(fam) = fam else { return Ok(()) };
   if fam.token.is_none() {
     return Ok(());
   }
-  let res = registry.deregister(&mut fam.sock);
+  fam.raw_deregister(registry)?;
   fam.token = None;
   fam.interest = Interest::READABLE;
   // Nothing is registered any more, so there is no outstanding re-arm to retry.
   fam.interest_stale = false;
   fam.readable = false;
-  res
+  Ok(())
 }
 
 /// Whether `dst` is an mDNS multicast group, which must fan out to both
