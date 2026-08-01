@@ -197,6 +197,25 @@ jobs:
       # itself) — a default-feature run would silently skip them, not fail.
       - run: cargo test -p hick-mio --features stats
       - run: cargo build -p hick-mio --features metrics
+      # The maximal leg for both socket-layer crates. Every feature either owns
+      # has is an observability one (`tracing` / `metrics` / `stats`), so
+      # `--all-features` here IS this job's subject rather than an extra scope:
+      # for hick-mio it is a strict superset of the `stats` run above (`metrics`
+      # implies `stats`) that additionally compiles the `tracing` instrumentation
+      # into every test, and hick-udp has no other axis at all. Running them here
+      # rather than in a job of their own keeps one warm dependency graph and one
+      # cargo cache, and keeps every hick-mio test invocation beside the
+      # `skipping:` gate below that protects them.
+      #
+      # `--test-threads=1` is deliberately NOT passed. Both of hick-mio's socket-
+      # binding suites serialise themselves: the unit tests hold `socket.rs`'s
+      # crate-wide `BIND_LOCK` for the whole lifetime of each fixture, and
+      # `tests/loopback.rs` funnels every endpoint through its own `bind_lock`.
+      # Nothing beyond an ordinary unprivileged runner is needed either — binding
+      # UDP 5353 on `lo` and joining 224.0.0.251 takes no capability the
+      # `--test loopback` step above does not already rely on.
+      - run: cargo test -p hick-mio --all-features
+      - run: cargo test -p hick-udp --all-features
       # Anti-flake gate for hick-mio's loopback integration tests
       # (hick-mio/tests/loopback.rs). They are deliberately designed to
       # self-skip — print a `skipping:` line and return early — on a host that

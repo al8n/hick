@@ -917,22 +917,7 @@ fn an_announced_service_owes_more_than_one_goodbye_round() {
     .expect("register_service");
   // Probing is real wall-clock work (RFC 6762 §8.1: three probes 250 ms apart),
   // so drive the loop until the service has confirmed-emitted its records.
-  let deadline = Instant::now() + Duration::from_secs(5);
-  let mut advertised = false;
-  while Instant::now() < deadline {
-    mdns.tick().expect("tick");
-    if mdns
-      .services
-      .get(&handle)
-      .is_some_and(|ctx| ctx.proto.advertises_instance())
-    {
-      advertised = true;
-      break;
-    }
-    std::thread::sleep(Duration::from_millis(20));
-  }
-  if !advertised {
-    eprintln!("skipping: the service never reached its announce within the budget");
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
     return;
   }
 
@@ -972,22 +957,7 @@ fn a_delivered_withdrawal_round_bumps_goodbyes_tx() {
       8080,
     ))
     .expect("register_service");
-  let deadline = Instant::now() + Duration::from_secs(5);
-  let mut advertised = false;
-  while Instant::now() < deadline {
-    mdns.tick().expect("tick");
-    if mdns
-      .services
-      .get(&handle)
-      .is_some_and(|ctx| ctx.proto.advertises_instance())
-    {
-      advertised = true;
-      break;
-    }
-    std::thread::sleep(Duration::from_millis(20));
-  }
-  if !advertised {
-    eprintln!("skipping: the service never reached its announce within the budget");
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
     return;
   }
 
@@ -1219,6 +1189,17 @@ fn packet_is_response_reads_qr_bit() {
 // advertised for its whole positive TTL, and the next rename overwrites the
 // parked handoff so the first name's retraction is lost outright.
 
+/// Why a rename that does not happen is never excused as an unsuitable host.
+///
+/// The conflicting probe is handed straight to `Endpoint::handle` by
+/// [`test_support::ingest`], so the §8.2 tiebreak that renames the service is
+/// reached without a peer, without a link, and without a single byte leaving a
+/// socket. The budget below is two orders of magnitude past the in-memory work
+/// it bounds. Nothing about it is environmental, so a timeout is a defect in §9
+/// conflict handling or in the `Renamed` update reaching the caller.
+const RENAME_IS_NOT_ENVIRONMENTAL: &str = "an ingested §8.2 tiebreak loss must rename the service: the probe reaches the \
+   core without touching a socket, so nothing here depends on this host";
+
 /// Drive `mdns`, feeding `probe` on every iteration, until it reports a §9
 /// rename. Returns the new instance name.
 ///
@@ -1280,10 +1261,7 @@ fn a_surviving_rename_holds_the_old_name_until_its_retraction_is_paid() {
   }
 
   let probe = test_support::conflict_probe(&old);
-  let Some(new_name) = drive_to_rename(&mut mdns, &probe) else {
-    eprintln!("skipping: the service never renamed within the budget");
-    return;
-  };
+  let new_name = drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
   assert_ne!(new_name, old, "a rename must change the instance name");
   assert!(
     !mdns
@@ -1360,10 +1338,7 @@ fn an_unpaid_ipv6_retraction_holds_the_old_name_against_immediate_reuse() {
   }
 
   let probe = test_support::conflict_probe(&old);
-  if drive_to_rename(&mut mdns, &probe).is_none() {
-    eprintln!("skipping: the service never renamed within the budget");
-    return;
-  }
+  drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
 
   // IPv4 pays, IPv6 fails, round after round: v4's debt runs out and v6's never
   // does, which is exactly the state a same-name reuse must not be able to
@@ -1424,10 +1399,7 @@ fn consecutive_renames_each_retract_their_own_old_name() {
   }
 
   let probe = test_support::conflict_probe(&first);
-  let Some(second) = drive_to_rename(&mut mdns, &probe) else {
-    eprintln!("skipping: the service never renamed within the budget");
-    return;
-  };
+  let second = drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
   let round_one = goodbyes_now(&mut mdns);
   assert!(
     round_one.iter().any(|d| test_support::retracts(d, &first)),
@@ -1441,10 +1413,7 @@ fn consecutive_renames_each_retract_their_own_old_name() {
     return;
   }
   let probe = test_support::conflict_probe(&second);
-  let Some(third) = drive_to_rename(&mut mdns, &probe) else {
-    eprintln!("skipping: the service never renamed a second time within the budget");
-    return;
-  };
+  let third = drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
   assert_ne!(
     third, second,
     "the second rename must change the name again"
@@ -1497,10 +1466,12 @@ fn a_colliding_rename_holds_the_old_name_until_it_is_retracted() {
     }
     std::thread::sleep(Duration::from_millis(20));
   }
-  if !conflicted {
-    eprintln!("skipping: the rename never collided within the budget");
-    return;
-  }
+  assert!(
+    conflicted,
+    "the rival registration already owns the label this rename reaches for, and \
+     the conflicting probe is ingested without touching a socket, so the local \
+     collision is in-memory work that must happen"
+  );
 
   assert!(
     matches!(
@@ -1594,18 +1565,19 @@ fn two_withdrawal_items_take_two_creation_instants() {
   if !test_support::drive_to_advertised(&mut mdns, handle) {
     return;
   }
-  if !rename_leaving_the_handoff_parked(&mut mdns, handle, &old) {
-    eprintln!("skipping: the service never renamed within the budget");
-    return;
-  }
+  assert!(
+    rename_leaving_the_handoff_parked(&mut mdns, handle, &old),
+    "{RENAME_IS_NOT_ENVIRONMENTAL}"
+  );
 
   // Both items are created inside this one call: the rename handoff's, then the
   // service's own.
   mdns.unregister_service(handle);
-  let Some(first) = mdns.endpoint.next_withdrawal_deadline() else {
-    eprintln!("skipping: the unregister enqueued no withdrawal at all");
-    return;
-  };
+  let first = mdns.endpoint.next_withdrawal_deadline().expect(
+    "unregistering an announced service that is still holding a parked rename \
+     handoff must enqueue both withdrawals, so one of them is due at an instant \
+     the endpoint can name",
+  );
   let due = test_support::collect_goodbyes_as(
     &mut mdns,
     first,
@@ -2043,27 +2015,39 @@ fn drain_transmits_gives_every_sender_a_turn_and_sends_it_to_the_tail() {
 // RFC 6762 §8.1 probe sequence, or a family that never carries anything pinning
 // it forever.
 
-/// Tick until the only bound family is reported degraded, or report why the test
-/// is skipping.
+/// How long to wait for a refusal streak the socket has been forced to produce.
+///
+/// §8.1 spaces each retry 250 ms apart on top of the initial 0-250 ms jitter, so
+/// `MAX_CONSECUTIVE_SEND_FAILURES` of them is about a second. Five times that is
+/// slack for a loaded runner rather than a timing assertion.
+const DEGRADATION_BUDGET: Duration = Duration::from_secs(5);
+
+/// Tick until the only bound family is reported degraded.
 ///
 /// Degradation takes `MAX_CONSECUTIVE_SEND_FAILURES` refused sends, so reaching
 /// it is proof that the core really did re-arm and re-offer the probe that many
 /// times. It is a health signal and changes nothing the core is told — which is
-/// exactly what makes it a usable progress marker here. §8.1 spaces each retry
-/// 250 ms apart on top of the initial 0–250 ms jitter, so the whole sequence is
-/// about a second; a slow host that has not got there inside the budget is
-/// skipped rather than asserted against.
-fn tick_until_the_family_is_reported_degraded(mdns: &mut Mdns) -> bool {
-  let deadline = Instant::now() + Duration::from_secs(3);
+/// exactly what makes it a usable progress marker here.
+///
+/// Panics rather than skips. Every caller has already forced the family's sends
+/// to fail through a test seam, so the refusals owe nothing to this host's
+/// kernel, its link, or its multicast support: a streak that never forms means
+/// the core stopped re-arming the probe or the driver stopped offering it.
+fn tick_until_the_family_is_reported_degraded(mdns: &mut Mdns) {
+  let deadline = Instant::now() + DEGRADATION_BUDGET;
   while Instant::now() < deadline {
     mdns.tick().expect("tick");
     if mdns.degraded_families().0 {
-      return true;
+      return;
     }
     std::thread::sleep(Duration::from_millis(10));
   }
-  eprintln!("skipping: the service produced no refused transmit within the budget");
-  false
+  let want = super::sends::MAX_CONSECUTIVE_SEND_FAILURES;
+  panic!(
+    "the socket was forced to refuse every send, so {want} consecutive failures \
+     must accumulate within {DEGRADATION_BUDGET:?}: the core stopped re-arming \
+     the probe, or the driver stopped offering it"
+  );
 }
 
 /// End to end: a probe the socket refused advances nothing, and the core
@@ -2082,9 +2066,7 @@ fn a_refused_probe_does_not_advance_the_probe_sequence() {
   mdns
     .sockets
     .force_send_wouldblock_for_test(Family::V4, true);
-  if !tick_until_the_family_is_reported_degraded(&mut mdns) {
-    return;
-  }
+  tick_until_the_family_is_reported_degraded(&mut mdns);
 
   let state = |mdns: &Mdns| {
     mdns
@@ -2148,9 +2130,7 @@ fn a_permanently_refusing_family_is_reported_degraded_and_nothing_more() {
     .sockets
     .force_send_wouldblock_for_test(Family::V4, true);
 
-  if !tick_until_the_family_is_reported_degraded(&mut mdns) {
-    return;
-  }
+  tick_until_the_family_is_reported_degraded(&mut mdns);
   assert_eq!(
     mdns.degraded_families(),
     (true, false),
@@ -2217,10 +2197,7 @@ fn a_rename_leaves_no_transmit_still_awaiting_a_confirm() {
   }
 
   let probe = test_support::conflict_probe(&old);
-  let Some(new_name) = drive_to_rename(&mut mdns, &probe) else {
-    eprintln!("skipping: the service never renamed within the budget");
-    return;
-  };
+  let new_name = drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
   assert_ne!(new_name, old, "the rename must have chosen a fresh label");
 
   // A full §8.1 sequence is three probes 250 ms apart plus the first §8.3
@@ -2306,27 +2283,35 @@ fn the_receive_error_backoff_escalates_and_is_capped() {
 /// 12-byte header and nothing that follows it.
 const UNENCODABLE_PAYLOAD_SIZE: usize = 24;
 
-/// Tick until `handle`'s consecutive encode-failure count reaches `want`, or
-/// report why the test is skipping.
+/// Tick until `handle`'s consecutive encode-failure count reaches `want`.
 ///
 /// The first probe is scheduled a random 0-250 ms out (RFC 6762 §8.1), so the
-/// first few ticks legitimately poll nothing at all.
-fn tick_to_encode_failures(mdns: &mut Mdns, handle: mdns_proto::ServiceHandle, want: u8) -> bool {
+/// first few ticks legitimately poll nothing at all. Everything after that is
+/// in-memory: the encode scratch is sized [`UNENCODABLE_PAYLOAD_SIZE`] by the
+/// fixture's own options, so `poll_transmit` fails before any socket is
+/// consulted and the failures accumulate as fast as the caller ticks. No arm of
+/// this owes anything to the host, so both exits panic.
+fn tick_to_encode_failures(mdns: &mut Mdns, handle: mdns_proto::ServiceHandle, want: u8) {
   let deadline = Instant::now() + Duration::from_secs(3);
   while Instant::now() < deadline {
     mdns.tick().expect("tick");
     match mdns.services.get(&handle) {
-      Some(ctx) if ctx.encode_failures >= want => return true,
+      Some(ctx) if ctx.encode_failures >= want => return,
       Some(_) => {}
-      None => {
-        eprintln!("skipping: the service was retired before reaching {want} encode failures");
-        return false;
-      }
+      None => panic!(
+        "the service was retired before reaching {want} consecutive encode \
+         failures, which is inside MAX_CONSECUTIVE_ENCODE_ERRORS ({max}): \
+         retirement fired early",
+        max = crate::driver::MAX_CONSECUTIVE_ENCODE_ERRORS
+      ),
     }
     std::thread::sleep(Duration::from_millis(10));
   }
-  eprintln!("skipping: the service never reached {want} encode failures within the budget");
-  false
+  panic!(
+    "every `poll_transmit` on a {UNENCODABLE_PAYLOAD_SIZE}-byte scratch must fail, \
+     so {want} consecutive failures must be counted within the budget: the failing \
+     poll is not being reached, or its failure is not being counted"
+  );
 }
 
 #[test]
@@ -2343,9 +2328,7 @@ fn a_non_terminal_encode_failure_reports_leftover_work() {
     .expect("register_service");
 
   for want in 1..crate::driver::MAX_CONSECUTIVE_ENCODE_ERRORS {
-    if !tick_to_encode_failures(&mut mdns, handle, want) {
-      return;
-    }
+    tick_to_encode_failures(&mut mdns, handle, want);
     // Nothing is readable — this fixture never received a datagram — so a zero
     // timeout can only come from `work_pending`.
     assert!(
@@ -2388,10 +2371,12 @@ fn consecutive_encode_failures_retire_the_service_with_a_conflict() {
     }
     std::thread::sleep(Duration::from_millis(10));
   }
-  let Some(update) = conflict else {
-    eprintln!("skipping: the service never reported a terminal within the budget");
-    return;
-  };
+  let update = conflict.expect(
+    "the encode scratch is too small for any DNS message, so every poll fails \
+     before a socket is consulted and MAX_CONSECUTIVE_ENCODE_ERRORS of them must \
+     retire the service within the budget: no terminal at all means the counter \
+     never reaches its own ceiling and the caller waits forever",
+  );
   assert!(
     update.is_conflict(),
     "a payload that cannot be encoded retires the service rather than leaving \
@@ -2449,23 +2434,31 @@ fn too_large_refusals(mdns: &mut Mdns) -> u32 {
     + mdns.sockets.forced_send_refusals_for_test(Family::V6)
 }
 
-/// Tick until some datagram has been refused as permanently too large, or report
-/// why the test is skipping.
+/// Tick until some datagram has been refused as permanently too large.
 ///
 /// `budget` is the caller's, because what a wait may safely span differs: a
 /// service still probing has nothing else due, while one already announcing has
 /// its next RFC 6762 §8.3 round a second out and must be asserted well inside it.
-fn tick_until_a_send_is_refused_as_too_large(mdns: &mut Mdns, budget: Duration) -> bool {
+///
+/// Panics rather than skips. The refusal is counted by
+/// [`refuse_every_send_as_too_large`]'s forced payload ceiling, which is weighed
+/// before the syscall, so it needs no link, no peer and no multicast support
+/// whatever: reaching the budget means the producer was never offered a
+/// datagram at all, and every assertion the caller goes on to make about how
+/// that refusal was handled would be about a refusal that never happened.
+fn tick_until_a_send_is_refused_as_too_large(mdns: &mut Mdns, budget: Duration) {
   let deadline = Instant::now() + budget;
   while Instant::now() < deadline {
     mdns.tick().expect("tick");
     if too_large_refusals(mdns) > 0 {
-      return true;
+      return;
     }
     std::thread::sleep(Duration::from_millis(5));
   }
-  eprintln!("skipping: no datagram was offered to the socket within the budget");
-  false
+  panic!(
+    "no datagram reached the socket within {budget:?}, so the size refusal this \
+     fixture forces was never even offered one: the producer stopped emitting"
+  );
 }
 
 /// Drain every service terminal the queue holds for `handle`.
@@ -2508,9 +2501,7 @@ fn an_undeliverable_sustained_transmit_retires_the_service() {
 
   // §8.1 puts the first probe a random 0-250 ms out, so the first ticks
   // legitimately offer nothing at all.
-  if !tick_until_a_send_is_refused_as_too_large(&mut mdns, Duration::from_secs(3)) {
-    return;
-  }
+  tick_until_a_send_is_refused_as_too_large(&mut mdns, Duration::from_secs(3));
   assert!(
     mdns.services.get(&handle).is_none_or(|ctx| ctx.withdrawing),
     "the probe reached no wire and no retry ever can, so the service must be \
@@ -2572,7 +2563,7 @@ fn a_transient_all_family_failure_retries_and_never_retires() {
   // reach the threshold at all — and a check that ran only after the loop would
   // see the timeout, print a skip and pass. Asserted every tick, the retirement
   // is caught on the tick it happens.
-  let deadline = Instant::now() + Duration::from_secs(3);
+  let deadline = Instant::now() + DEGRADATION_BUDGET;
   let mut degraded = false;
   while Instant::now() < deadline && !degraded {
     mdns.tick().expect("tick");
@@ -2587,10 +2578,13 @@ fn a_transient_all_family_failure_retries_and_never_retires() {
     degraded = mdns.degraded_families().0;
     std::thread::sleep(Duration::from_millis(10));
   }
-  if !degraded {
-    eprintln!("skipping: the service produced no refused transmit within the budget");
-    return;
-  }
+  assert!(
+    degraded,
+    "the socket was forced to refuse every send, so the streak owes nothing to \
+     this host: no degradation inside {DEGRADATION_BUDGET:?} means the probe \
+     stopped being re-armed or stopped being offered, and the survival assertion \
+     above never ran against a real retry"
+  );
   let terminals = service_terminals(&mut mdns, handle);
   assert!(
     terminals.is_empty(),
@@ -2660,10 +2654,12 @@ fn an_emsgsize_below_the_hard_limit_never_retires_a_sustained_producer() {
     refused = too_large_refusals(&mut mdns) > 0;
     std::thread::sleep(Duration::from_millis(5));
   }
-  if !refused {
-    eprintln!("skipping: no datagram was offered to the socket within the budget");
-    return;
-  }
+  assert!(
+    refused,
+    "the forced `EMSGSIZE` is raised inside the send path, so it needs no link \
+     and no peer: no refusal inside the budget means the probe was never offered \
+     to the socket and the survival assertion above never ran against one"
+  );
   let terminals = service_terminals(&mut mdns, handle);
   assert!(
     terminals.is_empty(),
@@ -2743,8 +2739,11 @@ fn a_service_the_other_family_can_serve_is_never_retired() {
 /// The refusal is waited for well inside the next RFC 6762 §8.3 round: a §6
 /// multicast reply is jittered 20-120 ms, and the announcement that follows the
 /// one `drive_to_advertised` just watched land is a full second out. The budget
-/// below sits between the two, so the datagram whose refusal is observed is the
-/// reply.
+/// is bracketed on both sides and it is a panic on both, so it is aimed at the
+/// middle of that window rather than at either edge: short of the jitter ceiling
+/// the reply has not been offered yet and the wait fails for nothing, and past
+/// the next announcement the refusal observed belongs to a `Sustained` datagram
+/// that this driver is *supposed* to retire the service over.
 #[test]
 fn an_undeliverable_one_shot_reply_costs_the_reply_and_not_the_service() {
   let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
@@ -2762,9 +2761,7 @@ fn an_undeliverable_one_shot_reply_costs_the_reply_and_not_the_service() {
 
   test_support::ingest(&mut mdns, &ptr_question(ty), Instant::now());
   refuse_every_send_as_too_large(&mut mdns, true);
-  if !tick_until_a_send_is_refused_as_too_large(&mut mdns, Duration::from_millis(400)) {
-    return;
-  }
+  tick_until_a_send_is_refused_as_too_large(&mut mdns, Duration::from_millis(600));
 
   assert!(
     mdns
@@ -2818,9 +2815,7 @@ fn an_undeliverable_question_retires_the_query() {
     .start_query(test_support::query_spec("_hick-mio-bigq._tcp.local."))
     .expect("start_query");
   refuse_every_send_as_too_large(&mut mdns, true);
-  if !tick_until_a_send_is_refused_as_too_large(&mut mdns, Duration::from_secs(3)) {
-    return;
-  }
+  tick_until_a_send_is_refused_as_too_large(&mut mdns, Duration::from_secs(3));
   assert!(
     !mdns.queries.contains_key(&handle),
     "the question reached no wire and no retry ever can, so the query is \
@@ -2867,28 +2862,9 @@ fn an_own_echo_survives_a_foreign_interface_index() {
     .expect("register");
 
   let body = [0x3Cu8; 28];
-  {
-    let mut gate = FamilyWireGate::default();
-    let Mdns {
-      sockets,
-      selfsend,
-      send_health,
-      ..
-    } = &mut *mdns;
-    let summary = super::send_and_credit(
-      sockets,
-      selfsend,
-      send_health,
-      &mut gate,
-      &body,
-      MDNS_V4_DST,
-      Duration::ZERO,
-    );
-    if summary.sent == 0 {
-      eprintln!("skipping: the datagram never reached a wire on this host");
-      mdns.deregister().expect("deregister");
-      return;
-    }
+  if credit_a_multicast_send(&mut mdns, &body).is_none() {
+    mdns.deregister().expect("deregister");
+    return;
   }
   // Every subsequent receive now reports an interface this endpoint did not
   // bind — the disagreement a loopback copy can genuinely show.
@@ -2910,7 +2886,7 @@ fn an_own_echo_survives_a_foreign_interface_index() {
     mdns.tick().expect("tick");
   }
   let matched = mdns.selfsend.len() == 0;
-  // The skip must gate on an observed counter, or a regression in the gate
+  // The excuse must gate on an observed counter, or a regression in the gate
   // itself would present as "the echo never arrived" and take this test green.
   // `packets_rx` counts every datagram that left the kernel queue, including one
   // the trust boundary then dropped, so it separates a host whose loopback
@@ -2924,7 +2900,13 @@ fn an_own_echo_survives_a_foreign_interface_index() {
      what keeps a foreign interface index from swallowing it"
   );
   if !matched {
-    eprintln!("skipping: this endpoint's own multicast never looped back within the budget");
+    // Nothing was skipped: the assertion above ran, and `arrived` being false is
+    // the only way it can pass here. Said as a note rather than a `skipping:`
+    // line so the word keeps meaning "an assertion did not run".
+    eprintln!(
+      "note: this endpoint's own multicast never looped back, so the assertion \
+       above held vacuously"
+    );
   }
 }
 
@@ -2958,28 +2940,9 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
     .expect("register");
 
   let body = [0x5Au8; 32];
-  {
-    let mut gate = FamilyWireGate::default();
-    let Mdns {
-      sockets,
-      selfsend,
-      send_health,
-      ..
-    } = &mut *mdns;
-    let summary = super::send_and_credit(
-      sockets,
-      selfsend,
-      send_health,
-      &mut gate,
-      &body,
-      MDNS_V4_DST,
-      Duration::ZERO,
-    );
-    if summary.sent == 0 {
-      eprintln!("skipping: the datagram never reached a wire on this host");
-      mdns.deregister().expect("deregister");
-      return;
-    }
+  if credit_a_multicast_send(&mut mdns, &body).is_none() {
+    mdns.deregister().expect("deregister");
+    return;
   }
   assert!(
     mdns.selfsend.len() > 0,
@@ -3017,6 +2980,7 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
   }
   let unclaimed = mdns.selfsend.len() > 0;
   let dropped = dropped_at_the_gate(&mdns) > before;
+  let arrived = saw_own_loopback(&mdns);
   mdns.deregister().expect("deregister");
   assert!(
     unclaimed,
@@ -3024,12 +2988,32 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
      the ingress gate must reject it before the take-once credit is consulted, \
      and before `endpoint.handle` can cache anything it carries"
   );
+  // The assertion above is vacuous on a host that delivered nothing, so the
+  // other half is asserted rather than assumed wherever a counter can tell.
+  // `force_rx_peer_for_test` rewrites the peer of EVERY arrival, so a datagram
+  // that reached the queue and did not raise the drop counter is one the gate
+  // let through — and the credit above would then be gone, not unclaimed.
+  // Without `stats` neither counter exists, so there is nothing to weigh and
+  // nothing worth reporting.
   #[cfg(feature = "stats")]
-  if !dropped {
-    eprintln!("skipping: this endpoint's own multicast never looped back within the budget");
+  {
+    assert!(
+      dropped || !arrived,
+      "this endpoint read a datagram off its own queue, left its credit \
+       unclaimed, and never counted a drop: something between the queue and the \
+       self-send match swallowed it without the ingress gate rejecting it"
+    );
+    if !arrived {
+      // Nothing was skipped here either: what is reported is that the run was
+      // vacuous, not that an assertion was withheld.
+      eprintln!(
+        "note: this endpoint's own multicast never looped back, so the assertions \
+         above held vacuously"
+      );
+    }
   }
   #[cfg(not(feature = "stats"))]
-  let _ = dropped;
+  let _ = (dropped, arrived);
 }
 
 /// How many datagrams this endpoint has read and then thrown away, or `0` where
@@ -3086,32 +3070,53 @@ fn saw_own_loopback(mdns: &Mdns) -> bool {
 const STALL_PAST_TTL: Duration = SELF_SEND_TTL.saturating_add(Duration::from_millis(50));
 
 /// Put `body` on the wire through stage 4's own credit path, or `None` when this
-/// host's multicast egress went nowhere and the test has nothing to assert.
+/// host's kernel refused the datagram and there is nothing for the caller to
+/// assert against.
 ///
 /// `min_gap` is zero, so the gate is open for both families and every test below
 /// is about the credit rather than about the spacing.
+///
+/// The `None` is a HOST verdict and is checked to be one. It is the setup this
+/// endpoint needs before any behaviour under test runs, and the socket layer's
+/// own wire history is what decides it: a fan-out that reported carrying nothing
+/// while the socket recorded these bytes reaching a wire is the fan-out
+/// miscounting its own send, which is a defect and panics here rather than
+/// taking every caller below green.
 fn credit_a_multicast_send(mdns: &mut Mdns, body: &[u8]) -> Option<()> {
-  let mut gate = FamilyWireGate::default();
-  let Mdns {
-    sockets,
-    selfsend,
-    send_health,
-    ..
-  } = &mut *mdns;
-  let summary = super::send_and_credit(
-    sockets,
-    selfsend,
-    send_health,
-    &mut gate,
-    body,
-    MDNS_V4_DST,
-    Duration::ZERO,
-  );
-  if summary.sent == 0 {
-    eprintln!("skipping: the datagram never reached a wire on this host");
-    return None;
+  let before = [Family::V4, Family::V6].map(|f| mdns.sockets.wire_times_for_test(f).len());
+  let summary = {
+    let mut gate = FamilyWireGate::default();
+    let Mdns {
+      sockets,
+      selfsend,
+      send_health,
+      ..
+    } = &mut *mdns;
+    super::send_and_credit(
+      sockets,
+      selfsend,
+      send_health,
+      &mut gate,
+      body,
+      MDNS_V4_DST,
+      Duration::ZERO,
+    )
+  };
+  if summary.sent > 0 {
+    return Some(());
   }
-  Some(())
+  let after = [Family::V4, Family::V6].map(|f| mdns.sockets.wire_times_for_test(f).len());
+  assert_eq!(
+    before, after,
+    "the fan-out reported carrying nothing while the socket layer recorded these \
+     bytes reaching a wire: a `sent` of zero is then the fan-out's own accounting, \
+     not a host that cannot egress multicast"
+  );
+  eprintln!(
+    "skipping: this host's kernel accepted no multicast datagram on the loopback \
+     interface, so there is no send for an echo to be weighed against"
+  );
+  None
 }
 
 /// Open the next tick's claim window and present the echo there, exactly where
@@ -3727,11 +3732,16 @@ fn credits_after_an_ephemeral_arrival(
 /// [`credit_a_multicast_send`], so the credit taken afterwards is the only one
 /// and the arrival really does predate it.
 fn credits_after_our_own_echo(mdns: &mut Mdns, poll: &mut Poll, body: &[u8]) -> Option<usize> {
+  // The socket layer's own verdict on one ungated send, so the refusal it reports
+  // is the kernel's and nothing in this crate stands between the two.
   let sent = mdns
     .sockets
     .send_one(Family::V4, body, MDNS_V4_DST, &crate::socket::Ungated);
   if !matches!(sent, crate::socket::SendOutcome::Sent { .. }) {
-    eprintln!("skipping: the datagram never reached a wire on this host");
+    eprintln!(
+      "skipping: this host's kernel refused a multicast datagram on the loopback \
+       interface ({sent:?}), so there is no echo to arrive from port 5353"
+    );
     return None;
   }
   await_queued_datagram(mdns, poll, "this endpoint's own multicast")?;
@@ -3835,10 +3845,24 @@ fn the_wire_gate_is_weighed_at_the_send_not_at_the_tick() {
   // The service's first datagram is its first probe, and it is the one that
   // stalls. Nothing else can reach this wire: no query is running and no peer is
   // on loopback.
-  let give_up = Instant::now() + Duration::from_secs(5);
+  // A probe that reaches no wire has two causes and they are not interchangeable:
+  // a kernel that refuses multicast egress — which shows up as a send-failure
+  // streak, since the driver goes on offering the probe and the socket goes on
+  // refusing it — and a driver that stopped offering one, which leaves the family
+  // healthy and this wire empty. Only the first is this host's doing.
+  let give_up = Instant::now() + Duration::from_secs(8);
   while mdns.sockets.wire_times_for_test(Family::V4).is_empty() {
     if Instant::now() >= give_up {
-      eprintln!("skipping: no probe reached this host's wire within the budget");
+      assert!(
+        mdns.degraded_families().0,
+        "nothing reached IPv4's wire and the family is not degraded either, so \
+         the socket was never asked to carry a probe: the gate is withholding a \
+         datagram the core had due"
+      );
+      eprintln!(
+        "skipping: this host's kernel refused every multicast send, so no probe \
+         could reach a wire for the gate to be weighed against"
+      );
       return;
     }
     mdns.tick().expect("tick");
