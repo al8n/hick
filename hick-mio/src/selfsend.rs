@@ -242,14 +242,52 @@ pub(crate) enum MatchMode {
   /// It is enough to suppress our own loopback in the ordinary single-host case,
   /// but by construction it cannot defend the credit-theft race that `Ordered`
   /// guards against. **That is the cheap direction, and it is chosen
-  /// deliberately.** A datagram that reaches a credit at all is byte-identical
-  /// to one we sent, so every record it carries has rdata identical to ours, and
-  /// RFC 6762 §9 defines a conflict as the same name, rrtype and rrclass with
-  /// *different* rdata — so swallowing it cannot swallow a conflict. It costs at
-  /// most one redundant peer datagram inside a two-second window. Rejecting our
-  /// own echo instead makes this responder raise a phantom conflict against
-  /// itself and rename under §9, and under a clock that keeps stepping it does
-  /// so repeatedly.
+  /// deliberately.**
+  ///
+  /// # What is given up is narrower than "ordering"
+  ///
+  /// Ordering only ever *rejects*, and it only ever rejects a datagram the
+  /// kernel stamped BEFORE our `sendto`. Anything the kernel saw at or after it
+  /// already claims the credit under `Ordered` too — see [`reference_ordered`] —
+  /// so the whole of the marginal exposure here is a datagram that was already
+  /// queued when the send it claims was made. It still has to arrive on the same
+  /// family, from source port 5353 (`Mdns::drain_recv` offers a credit to no
+  /// other port, since that is the only port this endpoint sends from), carrying
+  /// the same content fingerprint, inside [`SELF_SEND_TTL`].
+  ///
+  /// # What one costs, and the bound on the fingerprint
+  ///
+  /// One datagram, once. The case that can arise without an author arranging it
+  /// is a co-resident responder's byte-identical copy: every record in it
+  /// asserts exactly what we assert, and RFC 6762 §9 defines a conflict as the
+  /// same name, rrtype and rrclass with *different* rdata, so suppressing it
+  /// cannot suppress a conflict. A query costs the answer to a question we had
+  /// just asked ourselves.
+  ///
+  /// The match is [`fnv1a`] over the body rather than the body, so
+  /// "byte-identical" is where the near-certainty is and it is stated rather
+  /// than assumed: FNV is not collision-resistant, and a *different* payload
+  /// that collides is a payload §9 could read as a conflict. An accidental
+  /// collision is ~2⁻⁶⁴ against a tracker holding a handful of credits; a
+  /// deliberate one is constructible, but only by the author of the colliding
+  /// datagram, who thereby suppresses nothing but their own records. Storing the
+  /// body instead would make the claim exact, at up to
+  /// [`MAX_SELF_SEND_ENTRIES`] × the configured max payload — 98 MB at the
+  /// 1500-byte default and 4.3 GB at the ceiling — which is not a price this
+  /// buys anything at.
+  ///
+  /// # The direction neither mode bounds
+  ///
+  /// Whatever claims a credit takes it FROM our echo, which then reaches the
+  /// protocol layer as peer traffic. `Ordered` narrows that to datagrams the
+  /// kernel saw after our send and no further, so an exact replay of our own
+  /// bytes defeats both modes equally; it is the standing price of matching on
+  /// content at all, bounded by family, port, fingerprint and the TTL.
+  ///
+  /// Rejecting our own echo is the expensive direction, and it is what settles
+  /// the trade: it makes this responder raise a phantom conflict against itself
+  /// and rename under §9, and under a clock that keeps stepping it does so
+  /// repeatedly.
   Degraded,
 }
 
@@ -709,6 +747,18 @@ impl SelfSendTracker {
   /// that recorded before a receive would over-retain (cheap) instead of
   /// expiring a credit that never had an opportunity (a phantom self-conflict).
   ///
+  /// # What may be offered a credit is the caller's half of the match
+  ///
+  /// This weighs content, family and time, and it never sees where the datagram
+  /// came from. Both of this endpoint's sockets are bound to port 5353, so every
+  /// datagram it sends leaves from that port and every loopback copy arrives
+  /// from it — which makes a different source port proof that the datagram is
+  /// not our echo, and something this call cannot discover for itself.
+  /// `Mdns::drain_recv` holds that line, beside the RFC 6762 §11 source-port
+  /// rule it belongs with: an untrusted RESPONSE is dropped outright there,
+  /// while a §6.7 legacy unicast QUERY is kept — it is owed a reply — and simply
+  /// never offered here.
+  ///
   /// # Why the family is part of the key
   ///
   /// One multicast transmit is **two** syscalls with **identical bytes** and
@@ -852,13 +902,10 @@ fn still_live(now: StdInstant, aged_from: Option<StdInstant>) -> bool {
 /// itself and the RFC 6762 §9 rename that follows — repeatedly, for as long as
 /// the clock keeps stepping, since each step refuses the next echo the same way.
 ///
-/// Reading it as *our echo* lets a byte-identical peer datagram take the credit
-/// instead. That cannot swallow a §9 conflict: §9 defines one as the same name,
-/// rrtype and rrclass carrying *different* rdata, and a datagram that matches a
-/// credit at all is byte-identical to one we sent, so every record in it asserts
-/// exactly what we assert. What it can cost is one redundant peer datagram
-/// inside a two-second window — a duplicate announcement, or a query identical
-/// to one we just asked ourselves.
+/// Reading it as *our echo* lets a stranger carrying the same fingerprint take
+/// the credit instead, at a cost of one datagram inside a two-second window. See
+/// [`MatchMode::Degraded`] for what that datagram can and cannot be, and for the
+/// two things the RFC 6762 §9 rdata test does and does not settle about it.
 ///
 /// So the fall-back is [`MatchMode::Degraded`], which is not a new state: it is
 /// what every claim on a platform with no receive-timestamp cmsg already runs
