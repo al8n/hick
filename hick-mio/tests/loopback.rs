@@ -12,9 +12,11 @@
 //! Two environment facts are load-bearing and neither is universal, so nothing
 //! here is allowed to assume this host's behaviour:
 //!
-//! * **A family may not bind.** `hick_udp::try_bind_v6` is rejected outright on
-//!   some hosts; on others it binds but link-local multicast egress over
-//!   loopback fails. [`common::endpoint`] degrades to IPv4-only and prints why,
+//! * **A family may not be usable.** `hick_udp::try_bind_v6` is rejected
+//!   outright on some hosts; on others it binds, joins, and then refuses every
+//!   send, because the loopback interface carries no IPv6 multicast route.
+//!   [`common::endpoint`] establishes both up front — the second by sending one
+//!   datagram before any endpoint exists — degrades to IPv4-only and prints why,
 //!   and no assertion below mentions a family, a socket count, or a send count.
 //! * **A host may bind and join fine yet carry nothing.** Every environment-
 //!   dependent early return gates on an observed counter and prints a
