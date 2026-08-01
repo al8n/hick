@@ -1164,6 +1164,10 @@ impl Sockets {
   /// requested family, that family is skipped rather than failing the whole
   /// endpoint, so `with_ipv4(true).with_ipv6(true)` still works on a host with
   /// no global IPv6.
+  ///
+  /// **The degradation is keyed to `Ok(empty)` and to nothing else.** A family
+  /// whose address enumeration *failed* is not a family this interface has no
+  /// address in — see [`interface_families`].
   pub(crate) fn bind(
     opts: &ServerOptions,
     #[cfg(feature = "stats")] stats: std::sync::Arc<hick_trace::stats::Stats>,
@@ -1174,12 +1178,14 @@ impl Sockets {
 
     let interface_index = match opts.interface_index() {
       Some(i) => i,
-      None => pick_default_interface_index(opts.ipv4(), opts.ipv6()).ok_or_else(|| {
-        ServerError::Io(io::Error::new(
-          io::ErrorKind::NotFound,
-          "no multicast-capable interface found",
-        ))
-      })?,
+      None => pick_default_interface_index(opts.ipv4(), opts.ipv6())
+        .map_err(ServerError::Io)?
+        .ok_or_else(|| {
+          ServerError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no multicast-capable interface found",
+          ))
+        })?,
     };
 
     // The three outcomes are kept apart on purpose. An index that names no
@@ -1188,10 +1194,7 @@ impl Sockets {
     // reports the address error below, which sends a caller who passed a stale
     // index looking for missing addresses on an interface that does not exist.
     let (iface_has_v4, iface_has_v6) = match getifs::interface_by_index(interface_index) {
-      Ok(Some(i)) => (
-        matches!(i.ipv4_addrs(), Ok(ref a) if !a.is_empty()),
-        matches!(i.ipv6_addrs(), Ok(ref a) if !a.is_empty()),
-      ),
+      Ok(Some(i)) => interface_families(&i).map_err(ServerError::Io)?,
       Ok(None) => {
         return Err(ServerError::Io(io::Error::new(
           io::ErrorKind::NotFound,
@@ -2429,6 +2432,103 @@ fn map_join_to_bind_v6(e: hick_udp::JoinError) -> ServerError {
   }
 }
 
+/// Which address families `iface` actually has addresses in, as `(ipv4, ipv6)`.
+///
+/// # A failure is not an absence
+///
+/// Both accessors are fallible syscalls, and answering `false` for an `Err` is
+/// the defect this exists to prevent: it makes a family whose enumeration FAILED
+/// indistinguishable from one that genuinely has no address. Downstream that is
+/// a family silently dropped from a dual-stack bind that then *succeeds*, and —
+/// when both fail — an `AddrNotAvailable` that names the wrong cause and sends
+/// the caller auditing addresses on an interface nobody managed to read. The
+/// same confusion of *failing* with *absent* has cost this crate twice before,
+/// so `false` is reserved for `Ok` with nothing in it and everything else
+/// propagates.
+///
+/// The error carries the interface index and the family it could not read, on
+/// top of the kind the platform reported, because "permission denied" alone
+/// names neither.
+fn interface_families(iface: &getifs::Interface) -> io::Result<(bool, bool)> {
+  Ok((
+    has_addr_in(iface, Family::V4)?,
+    has_addr_in(iface, Family::V6)?,
+  ))
+}
+
+/// Whether `iface` has any address in `family`, or why the platform could not
+/// say. Split out of [`interface_families`] so both families are asked the same
+/// question the same way, and so the `#[cfg(test)]` failure lands on exactly one
+/// of them.
+fn has_addr_in(iface: &getifs::Interface, family: Family) -> io::Result<bool> {
+  let index = iface.index();
+  let (label, addrs) = match family {
+    Family::V4 => ("IPv4", iface.ipv4_addrs().map(|a| !a.is_empty())),
+    Family::V6 => ("IPv6", iface.ipv6_addrs().map(|a| !a.is_empty())),
+  };
+  // Injected after the accessor rather than in place of it, so a forced failure
+  // travels the very path a real one does — the kind carried over, the context
+  // below added — instead of a shortcut that would pass while that path rotted.
+  #[cfg(test)]
+  let addrs = match forced_enumeration_error() {
+    Some(forced) if forced == family => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+    _ => addrs,
+  };
+  addrs.map_err(|e| {
+    io::Error::new(
+      e.kind(),
+      format!("reading the {label} addresses of interface {index}: {e}"),
+    )
+  })
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Force one family's address enumeration to fail inside [`has_addr_in`], for
+  /// the current thread.
+  ///
+  /// A thread-local rather than a `#[cfg(test)]` field, because neither consumer
+  /// has a receiver to hang one on: [`Sockets::bind`] is a constructor and
+  /// [`pick_default_interface_index`] is a free function, and the failure has to
+  /// be visible from inside both. Thread-local rather than global so tests
+  /// running in parallel cannot see each other's injection — libtest gives every
+  /// `#[test]` its own thread.
+  ///
+  /// The condition is otherwise unreachable: `getifs` reads addresses straight
+  /// from the kernel and no healthy host refuses. It is also exactly the
+  /// condition whose mishandling this file has had to fix repeatedly, so it must
+  /// not go untested.
+  static FORCED_ENUMERATION_ERROR: core::cell::Cell<Option<Family>> =
+    const { core::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn forced_enumeration_error() -> Option<Family> {
+  FORCED_ENUMERATION_ERROR.with(core::cell::Cell::get)
+}
+
+/// Make `family`'s address enumeration fail on this thread until the returned
+/// guard is dropped. See [`FORCED_ENUMERATION_ERROR`].
+///
+/// A guard rather than a pair of calls, so a failing assertion cannot leave the
+/// injection armed for whatever else runs on this thread.
+#[cfg(test)]
+pub(crate) fn force_enumeration_error_for_test(family: Family) -> ForcedEnumerationError {
+  FORCED_ENUMERATION_ERROR.with(|c| c.set(Some(family)));
+  ForcedEnumerationError
+}
+
+/// Disarms [`FORCED_ENUMERATION_ERROR`] on drop.
+#[cfg(test)]
+pub(crate) struct ForcedEnumerationError;
+
+#[cfg(test)]
+impl Drop for ForcedEnumerationError {
+  fn drop(&mut self) {
+    FORCED_ENUMERATION_ERROR.with(|c| c.set(None));
+  }
+}
+
 /// Pick the interface to bind when the caller pinned none.
 ///
 /// Prefers an up, multicast-capable, non-loopback interface that satisfies
@@ -2437,10 +2537,23 @@ fn map_join_to_bind_v6(e: hick_udp::JoinError) -> ServerError {
 /// IPv4-only NIC on a host with no global IPv6 would be rejected even though it
 /// serves `with_ipv4(true).with_ipv6(true)` over v4 perfectly well. Reimplements
 /// `hick-reactor/src/endpoint.rs:254-289`, which is private to that crate.
-fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> Option<u32> {
-  let ifs = getifs::interfaces().ok()?;
-  let has_v4 = |i: &getifs::Interface| matches!(i.ipv4_addrs(), Ok(ref v) if !v.is_empty());
-  let has_v6 = |i: &getifs::Interface| matches!(i.ipv6_addrs(), Ok(ref v) if !v.is_empty());
+///
+/// # `Ok(None)` is "nothing qualified"; an error is an error
+///
+/// The three answers are distinct and the return type keeps them so. Enumerating
+/// the interfaces can fail, and so can reading one candidate's addresses, and
+/// neither is evidence that no interface qualifies — folding either into `None`
+/// produced a `NotFound` naming the wrong cause, or, worse, ranked a candidate
+/// as having no address in a family nobody managed to read and picked a
+/// different NIC. A responder bound to the wrong link looks exactly like a
+/// working one until nothing is ever discovered, so the failure is raised where
+/// a caller can see it and pin an interface instead.
+///
+/// The probe runs only for interfaces whose flags already qualify them, so an
+/// unrelated down or non-multicast interface cannot fail the pick.
+fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<Option<u32>> {
+  let ifs = getifs::interfaces()
+    .map_err(|e| io::Error::new(e.kind(), format!("enumerating network interfaces: {e}")))?;
   let multicast_up_non_loopback = |i: &getifs::Interface| -> bool {
     let f = i.flags();
     f.contains(getifs::Flags::UP)
@@ -2451,22 +2564,34 @@ fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> Option<u32> {
   let loopback_up = |i: &getifs::Interface| -> bool {
     i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP)
   };
-  let strict =
-    |i: &&getifs::Interface| -> bool { (!want_v4 || has_v4(i)) && (!want_v6 || has_v6(i)) };
-  let loose = |i: &&getifs::Interface| -> bool { (want_v4 && has_v4(i)) || (want_v6 && has_v6(i)) };
-  let strict_non_loopback = ifs
-    .iter()
-    .find(|i| multicast_up_non_loopback(i) && strict(i));
-  let loose_non_loopback = ifs
-    .iter()
-    .find(|i| multicast_up_non_loopback(i) && loose(i));
-  let strict_loopback = ifs.iter().find(|i| loopback_up(i) && strict(i));
-  let loose_loopback = ifs.iter().find(|i| loopback_up(i) && loose(i));
-  strict_non_loopback
-    .or(loose_non_loopback)
-    .or(strict_loopback)
-    .or(loose_loopback)
-    .map(|i| i.index())
+  // One pass over four preference tiers, lowest wins, first-seen wins within a
+  // tier — the order the four separate `find` passes used to produce. Ranked in
+  // one walk because each interface's families now cost a fallible syscall pair
+  // that must be asked once and propagated, not re-asked per tier.
+  let mut best: Option<(u8, u32)> = None;
+  for iface in ifs.iter() {
+    let tier_base = if multicast_up_non_loopback(iface) {
+      0
+    } else if loopback_up(iface) {
+      2
+    } else {
+      continue;
+    };
+    let (has_v4, has_v6) = interface_families(iface)?;
+    let strict = (!want_v4 || has_v4) && (!want_v6 || has_v6);
+    let loose = (want_v4 && has_v4) || (want_v6 && has_v6);
+    let tier = if strict {
+      tier_base
+    } else if loose {
+      tier_base + 1
+    } else {
+      continue;
+    };
+    if best.is_none_or(|(seen, _)| tier < seen) {
+      best = Some((tier, iface.index()));
+    }
+  }
+  Ok(best.map(|(_, index)| index))
 }
 
 #[cfg(test)]

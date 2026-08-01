@@ -446,6 +446,119 @@ fn an_unknown_interface_index_is_not_reported_as_a_missing_address() {
   );
 }
 
+// ── a failing family is not an absent one ───────────────────────────────────
+//
+// `Interface::ipv4_addrs` / `ipv6_addrs` are fallible syscalls, and reading an
+// `Err` as "this interface has no address in that family" is a confusion this
+// crate has had to unpick more than once. Both consumers are pinned here: the
+// pinned-interface path, where it silently dropped a requested family from a
+// dual-stack bind that then succeeded, and the default picker, where it silently
+// misranked or skipped a candidate and bound the wrong link.
+
+#[test]
+fn a_failed_address_enumeration_on_a_pinned_interface_is_not_a_missing_address() {
+  // A real interface index, so the lookup gets past `Ok(Some(_))` and reaches
+  // the family probe that is being made to fail. No socket is created on this
+  // path — the bind returns before any is opened — so no bind lock is needed.
+  let Some(idx) = loopback_index() else {
+    eprintln!("skipping: no UP loopback interface reported by getifs");
+    return;
+  };
+  let opts = ServerOptions::default().with_interface_index(Some(idx));
+  let _forced = super::force_enumeration_error_for_test(Family::V4);
+  let bound = Sockets::bind(
+    &opts,
+    #[cfg(feature = "stats")]
+    std::sync::Arc::new(hick_trace::stats::Stats::default()),
+  );
+  let Err(err) = bound else {
+    panic!(
+      "a family whose address enumeration failed must not be reported as a \
+       family this interface has no address in, and must not be silently \
+       dropped from a bind that then succeeds"
+    );
+  };
+  let crate::error::ServerError::Io(io) = err else {
+    panic!("a failed enumeration must surface as an I/O error, got {err:?}");
+  };
+  assert_ne!(
+    io.kind(),
+    std::io::ErrorKind::AddrNotAvailable,
+    "AddrNotAvailable is the has-no-address error; a failed read must not borrow it"
+  );
+  assert_eq!(
+    io.kind(),
+    std::io::ErrorKind::PermissionDenied,
+    "the platform's own kind must be carried over, not flattened, got {io:?}"
+  );
+  let msg = io.to_string();
+  assert!(
+    msg.contains("IPv4") && msg.contains(&idx.to_string()),
+    "the message must name the family that could not be read and the interface \
+     it was read on, got {msg}"
+  );
+}
+
+#[test]
+fn the_default_interface_picker_reports_a_failed_address_enumeration() {
+  // Host precondition, checked before the behaviour runs: the picker only probes
+  // interfaces whose flags already qualify them, so a host with no UP
+  // multicast-or-loopback interface has nothing to fail on.
+  let Ok(ifs) = getifs::interfaces() else {
+    eprintln!("skipping: this host will not enumerate its interfaces at all");
+    return;
+  };
+  let qualifies = |i: &getifs::Interface| {
+    let f = i.flags();
+    f.contains(getifs::Flags::UP)
+      && (f.contains(getifs::Flags::LOOPBACK) || f.contains(getifs::Flags::MULTICAST))
+  };
+  if !ifs.iter().any(qualifies) {
+    eprintln!("skipping: no UP interface for the picker to consider");
+    return;
+  }
+  let _forced = super::force_enumeration_error_for_test(Family::V6);
+  let err = super::pick_default_interface_index(true, true).expect_err(
+    "a candidate whose addresses could not be read must not be ranked as if it had none",
+  );
+  assert_ne!(
+    err.kind(),
+    std::io::ErrorKind::NotFound,
+    "NotFound is the nothing-qualified answer; a failed read must not borrow it"
+  );
+  assert!(
+    err.to_string().contains("IPv6"),
+    "the message must name the family that could not be read, got {err}"
+  );
+}
+
+/// The injection is scoped to the family asked for, so the two probes stay
+/// distinguishable — a hook that failed both would pass the tests above while
+/// proving nothing about which accessor the error came from.
+#[test]
+fn the_forced_enumeration_error_is_scoped_to_one_family_and_disarms_on_drop() {
+  let Some(idx) = loopback_index() else {
+    eprintln!("skipping: no UP loopback interface reported by getifs");
+    return;
+  };
+  let iface = getifs::interface_by_index(idx)
+    .expect("looking up the loopback interface")
+    .expect("the loopback index just read back must name an interface");
+  {
+    let _forced = super::force_enumeration_error_for_test(Family::V6);
+    assert!(
+      super::has_addr_in(&iface, Family::V4).is_ok(),
+      "forcing IPv6 to fail must leave the IPv4 probe alone"
+    );
+    assert!(super::has_addr_in(&iface, Family::V6).is_err());
+  }
+  assert!(
+    super::interface_families(&iface).is_ok(),
+    "the guard must disarm the injection, or it leaks into whatever runs next \
+     on this thread"
+  );
+}
+
 // ── self-send credit accounting ─────────────────────────────────────────────
 //
 // One logical multicast transmit is one syscall PER BOUND FAMILY, and each
