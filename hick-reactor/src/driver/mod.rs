@@ -924,7 +924,6 @@ impl<N: Net> DriverState<N> {
           &scratch[..body_len],
           &mut gate,
           tx.min_family_gap(),
-          now,
           #[cfg(feature = "stats")]
           &stats,
         )
@@ -1101,7 +1100,6 @@ impl<N: Net> DriverState<N> {
           &scratch[..body_len],
           &mut gate,
           tx.min_family_gap(),
-          now,
           #[cfg(feature = "stats")]
           &stats,
         )
@@ -2016,20 +2014,20 @@ impl SendAttempt {
 
 /// Offer one family its copy of the datagram, bounded by
 /// [`SEND_ATTEMPT_TIMEOUT`]. An absent socket is [`SendAttempt::Unbound`] — that
-/// family was never obligated — and is answered without touching the clock, as is
-/// a family whose wire gate is shut (`may_send == false`).
+/// family was never obligated — and is answered without touching the clock.
+///
+/// This offer is UNCONDITIONAL, and the only caller entitled to one is the RFC
+/// 6762 §10.1 goodbye fan-out ([`send_withdrawal_via`]), which is ungated by
+/// design. A positive-TTL transmit goes through [`attempt_gated_send_to`], which
+/// is where its wire gate is consulted.
 async fn attempt_send_to<S: UdpSocket>(
   sock: Option<&S>,
-  may_send: bool,
   buf: &[u8],
   dst: SocketAddr,
 ) -> SendAttempt {
   let Some(sock) = sock else {
     return SendAttempt::Unbound;
   };
-  if !may_send {
-    return SendAttempt::Gated;
-  }
   let send = send_to_at(sock, buf, dst).fuse();
   let bound = <S::Runtime as RuntimeLite>::sleep(SEND_ATTEMPT_TIMEOUT).fuse();
   pin_mut!(send, bound);
@@ -2040,6 +2038,44 @@ async fn attempt_send_to<S: UdpSocket>(
     },
     _ = bound => SendAttempt::TimedOut,
   }
+}
+
+/// [`attempt_send_to`], gated by this family's own share of the producer's
+/// [`FamilyWireGate`].
+///
+/// The clock is read HERE — after the boundness check, with this family's
+/// `sendto` as the next thing that happens — rather than once for the whole
+/// driver pass. A pass may legitimately spend [`DRAIN_PASS_BUDGET`] plus the last
+/// fan-out's own [`SEND_ATTEMPT_TIMEOUT`] serving the producers ahead of this one,
+/// and a reading that old UNDERSTATES how long this wire has actually been idle.
+/// The gate would then withhold a datagram whose §6 / §8.1 floor was genuinely
+/// paid — and [`SendAttempt::Gated`] does not reach the core as "nothing
+/// happened", it reaches it as [`FamilyDelivery::Missed`], spending the core's
+/// partial-round patience and holding the §8.1 probe sequence / §8.3 announce
+/// phase for a wire that was ready.
+///
+/// Reading later than the pass would have is provably one-directional: with
+/// `last_sent` fixed [`FamilyWireGate::open`] is monotone in `now`, and nothing
+/// can record into the gate while a fan-out is in flight —
+/// [`FamilyWireGate::record`] runs once, after every family has answered, and the
+/// SHARED borrow taken here is what makes that structural rather than a
+/// convention. So this can only ever flip a family from gated to offered; it can
+/// never withhold one a pass-wide reading would have offered.
+async fn attempt_gated_send_to<S: UdpSocket>(
+  sock: Option<&S>,
+  gate: &FamilyWireGate,
+  idx: usize,
+  min_gap: Duration,
+  buf: &[u8],
+  dst: SocketAddr,
+) -> SendAttempt {
+  if sock.is_none() {
+    return SendAttempt::Unbound;
+  }
+  if !gate.open(idx, StdInstant::now(), min_gap) {
+    return SendAttempt::Gated;
+  }
+  attempt_send_to(sock, buf, dst).await
 }
 
 /// Record the trace line, the self-send credit, and the stats for one MULTICAST
@@ -2112,6 +2148,10 @@ fn note_multicast_attempt(
 /// datagram at all and is reported [`FamilySend::Gated`] — obligated, and it did
 /// not carry it. Every family that DID carry it records its own acceptance
 /// instant back into `gate`.
+///
+/// This deliberately takes no `now`, unlike every sibling on the drain path: each
+/// family's gap is weighed at ITS OWN send point ([`attempt_gated_send_to`]), not
+/// against the reading the pass took before it began serving producers.
 #[allow(clippy::too_many_arguments)]
 async fn send_via<S: UdpSocket>(
   tracker: &mut Vec<(u64, SystemTime)>,
@@ -2121,7 +2161,6 @@ async fn send_via<S: UdpSocket>(
   body: &[u8],
   gate: &mut FamilyWireGate,
   min_gap: Duration,
-  now: StdInstant,
   #[cfg(feature = "stats")] stats: &std::sync::Arc<hick_trace::stats::Stats>,
 ) -> (Fanout, Option<StdInstant>) {
   // proto-layer transmits use multicast_dst() which always
@@ -2154,18 +2193,8 @@ async fn send_via<S: UdpSocket>(
     // family that never accepts hold the whole fan-out — and with it the driver
     // loop — for as long as it stayed wedged.
     let (a4, a6) = futures::future::join(
-      attempt_send_to(
-        v4.as_deref(),
-        gate.open(FAMILY_V4, now, min_gap),
-        body,
-        MDNS_V4_DST,
-      ),
-      attempt_send_to(
-        v6.as_deref(),
-        gate.open(FAMILY_V6, now, min_gap),
-        body,
-        MDNS_V6_DST,
-      ),
+      attempt_gated_send_to(v4.as_deref(), gate, FAMILY_V4, min_gap, body, MDNS_V4_DST),
+      attempt_gated_send_to(v6.as_deref(), gate, FAMILY_V6, min_gap, body, MDNS_V6_DST),
     )
     .await;
     fanout.v4 = FamilySend::from_attempt(&a4);
@@ -2223,7 +2252,7 @@ async fn send_via<S: UdpSocket>(
   // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
   // the NEW entry — so a legacy-query flood would starve the genuine multicast
   // credits that suppression actually depends on.
-  let attempt = attempt_send_to(sock, gate.open(idx, now, min_gap), body, dst).await;
+  let attempt = attempt_gated_send_to(sock, gate, idx, min_gap, body, dst).await;
   let outcome = FamilySend::from_attempt(&attempt);
   match dst {
     SocketAddr::V4(_) => fanout.v4 = outcome,
@@ -2293,8 +2322,8 @@ async fn send_withdrawal_via<S: UdpSocket>(
     // (`note_withdrawal_result`), which already spaces the resends, and holding
     // one back here would leave a family's peers pinned to positive-TTL records
     // it has already been promised the retraction of.
-    attempt_send_to(v4.as_deref(), true, body, MDNS_V4_DST),
-    attempt_send_to(v6.as_deref(), true, body, MDNS_V6_DST),
+    attempt_send_to(v4.as_deref(), body, MDNS_V4_DST),
+    attempt_send_to(v6.as_deref(), body, MDNS_V6_DST),
   )
   .await;
   let out = |attempt: &SendAttempt| match attempt {
@@ -2303,7 +2332,7 @@ async fn send_withdrawal_via<S: UdpSocket>(
     // See `present_socket_send_outcome`.
     SendAttempt::Unbound => WithdrawalSend::WriteOff,
     SendAttempt::Answered(res, _, _) => present_socket_send_outcome(res),
-    // Unreachable: this fan-out passes `may_send == true` for both families.
+    // Unreachable: this fan-out goes through the UNGATED `attempt_send_to`.
     SendAttempt::Gated | SendAttempt::TimedOut => WithdrawalSend::Retry,
   };
   let outcomes = (out(&a4), out(&a6));
