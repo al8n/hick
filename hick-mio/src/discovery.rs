@@ -176,6 +176,45 @@ impl QueryParam {
   /// gets the **remaining** time, never a fresh full window, so the whole lookup
   /// stays inside this deadline.
   ///
+  /// # What the boundary is
+  ///
+  /// A hard boundary on what the lookup may *produce*, not a hint:
+  ///
+  /// * **every [`Event::Lookup`] names an instance that was complete while the
+  ///   window was still open.** Nothing surfaces on or after the deadline, and
+  ///   nothing completed on or after it ever surfaces at all;
+  /// * **no sub-query is started on or after it.** A resolve the aggregation
+  ///   asks for once the window has shut is not opened, and the lookup is
+  ///   retired instead.
+  ///
+  /// Both are weighed at the moment of the decision they govern, not once at the
+  /// top of the tick that reaches them, so a tick that crosses the deadline while
+  /// running observes the crossing rather than finishing on the reading it
+  /// started with. Since [`Mdns::tick`](crate::Mdns::tick) is driven by the
+  /// caller, the alternative would leave "how far past the deadline a lookup may
+  /// still work" defined by how late the caller happens to tick.
+  ///
+  /// # What no caller-driven loop can promise
+  ///
+  /// **When you are told the lookup ended.** [`Event::LookupDone`] is reported by
+  /// the first tick to run at or after the deadline, so how long after the
+  /// deadline it is *observed* is set by the caller's own tick cadence — a caller
+  /// who ticks once a minute cannot be handed millisecond precision by any
+  /// implementation, because the implementation does not own the clock that wakes
+  /// it. [`Mdns::next_timeout`](crate::Mdns::next_timeout) folds every live
+  /// lookup's deadline in, so a caller that honours it is woken at the boundary.
+  ///
+  /// **Retransmits of legs already armed.** A sub-query still open when the
+  /// deadline passes may put one more copy of its question on the wire, trailing
+  /// the deadline by up to one tick, before the tick that observes the deadline
+  /// cancels it. The leg's absolute deadline is weighed in the proto layer
+  /// against the instant the tick hands in — the same instant that drives the
+  /// RFC 6762 §5.2 retry ladder, which is the core's own schedule rather than
+  /// this bound — so a question armed just before the boundary can still reach
+  /// the send path just after it. Such an answer cannot reach you: the lookup is
+  /// retired before it would be consumed, and the two guarantees above are
+  /// unaffected. The packet is real all the same.
+  ///
   /// A timeout so large that `Instant::now() + timeout` overflows means *no*
   /// effective deadline, here and on every sub-query. Such a lookup ends only
   /// when its sub-queries do, or when the caller calls
@@ -408,7 +447,16 @@ pub(crate) struct LookupCtx {
 }
 
 impl LookupCtx {
-  fn new(param: QueryParam, now: StdInstant) -> Self {
+  /// Open a lookup whose window starts **now**.
+  ///
+  /// Takes no instant, and that is the fix rather than an omission: the reading
+  /// *is* the lookup's start, so it is taken here, at the thing it defines. All
+  /// three constructors used to read one at their top and hand it in, and each
+  /// then spent that same reading a second time on the lookup's first
+  /// sub-query — see [`Self::start_subquery_in_window`] for why a sub-query's
+  /// anchor is now unreachable from out here.
+  fn new(param: QueryParam) -> Self {
+    let now = StdInstant::now();
     Self {
       generation: 0,
       // `checked_add` so a pathological timeout (e.g. `Duration::MAX`) cannot
@@ -433,12 +481,72 @@ impl LookupCtx {
     self.deadline
   }
 
-  /// The budget for a sub-query started now: what is left of the lookup's own
-  /// deadline, never a fresh full window.
-  fn remaining(&self, now: StdInstant) -> Duration {
-    self
-      .deadline
-      .map_or(self.timeout, |d| d.saturating_duration_since(now))
+  /// Start one sub-query inside this lookup's window, or report that the window
+  /// has already closed.
+  ///
+  /// The budget is what is left of the lookup's own deadline, never a fresh full
+  /// window, which is what keeps the whole browse → resolve chain inside
+  /// [`QueryParam::with_timeout`]. A lookup with no deadline (a timeout that
+  /// overflows [`StdInstant`]) passes its requested timeout straight through,
+  /// and it overflows in the proto layer too — so the leg is unbounded exactly
+  /// as its lookup is.
+  ///
+  /// # `Ok(None)`: the window is shut, so nothing is opened
+  ///
+  /// A remainder is taken with `checked_duration_since` and a zero one counts as
+  /// shut, because the alternative is not "a leg with no time left" — it is a
+  /// leg *outside* the window it exists to be bounded by. A saturating remainder
+  /// hands the proto layer a budget of `0`, whose absolute deadline is
+  /// `at + 0 == at`, and `at` is strictly **later** than the lookup's own
+  /// deadline exactly when the deadline has passed. Such a leg survives until
+  /// some later tick expires it, which is the thing
+  /// [`QueryParam::with_timeout`] promises cannot happen.
+  ///
+  /// Distinct from a refused start rather than folded into it: nothing failed
+  /// and nothing is left to retry, so an error would misreport a closed window
+  /// as pool exhaustion — including in the trace stage 6 emits.
+  ///
+  /// # One reading, whose two uses are inverses
+  ///
+  /// The anchor is read here and **never leaves this function**, which is the
+  /// same shape as
+  /// [`begin_service_withdrawal`](crate::endpoint::begin_service_withdrawal) —
+  /// but for the opposite reason, and the difference is the whole point.
+  ///
+  /// A withdrawal item's schedule is *created* from its instant, so two items
+  /// sharing one reading charge the first item's work to the second's ceiling.
+  /// Nothing is created from `at` here. The proto layer's only use of the
+  /// instant it is started with is `at + timeout`, and the timeout handed to it
+  /// is `deadline - at`, so the two uses cancel and the leg's absolute deadline
+  /// lands on the lookup's **exactly**, for any `at` inside the window. `at` is
+  /// an origin, not a measurement, and both uses are in the same coordinate
+  /// system. Outside the window the identity has nothing to say — `deadline -
+  /// at` is not a duration there — which is why that case starts no leg at all
+  /// rather than clamping the subtraction.
+  ///
+  /// So the mistake this shape rules out is not a stale reading — a stale `at`
+  /// cancels out unharmed — but a *split* one: a budget measured from one read
+  /// and an anchor taken at another leaves the leg outliving its lookup by the
+  /// gap between them. A caller holding an instant can express that pair. There
+  /// is deliberately no way to hand one in.
+  fn start_subquery_in_window(
+    &self,
+    endpoint: &mut ProtoEndpoint,
+    spec: QuerySpec,
+  ) -> Result<Option<QueryHandle>, StartQueryError> {
+    let at = StdInstant::now();
+    let budget = match self.deadline {
+      Some(deadline) => match deadline.checked_duration_since(at) {
+        Some(remaining) if !remaining.is_zero() => remaining,
+        // `>=` the deadline, which is the same boundary `is_finished` draws.
+        _ => return Ok(None),
+      },
+      None => self.timeout,
+    };
+    // `From`, never `map_err(|_| StorageFull)`: see `Mdns::start_query`.
+    Ok(Some(
+      endpoint.try_start_query(spec.with_timeout(budget), at)?,
+    ))
   }
 
   /// Seed a bare host resolve: one partial whose SRV is synthetic (the queried
@@ -625,6 +733,17 @@ impl LookupCtx {
     self.ready.pop_front()
   }
 
+  /// Whether the lookup's deadline has come due.
+  ///
+  /// Split out of [`Self::is_finished`] because it is the one termination reason
+  /// that can hold *before* a tick does any work for this lookup rather than
+  /// because of it — see [`Mdns::advance_lookups`], which tests it first for
+  /// exactly that reason. The one copy of the comparison, so the precondition
+  /// and the verdict can never draw the boundary differently.
+  fn is_expired(&self, now: StdInstant) -> bool {
+    self.deadline.is_some_and(|d| now >= d)
+  }
+
   /// Whether the lookup is over: the entry cap reached, the deadline due, or
   /// every sub-query it ever started has terminated with none left to start.
   ///
@@ -634,7 +753,7 @@ impl LookupCtx {
     if self.emitted >= self.max_entries {
       return true;
     }
-    if self.deadline.is_some_and(|d| now >= d) {
+    if self.is_expired(now) {
       return true;
     }
     self.launched > 0 && self.subqueries.is_empty() && self.pending.is_empty()
@@ -741,15 +860,20 @@ impl Mdns {
   /// [`StartQueryError::Other`] for a proto failure this crate does not map
   /// explicitly yet — propagated from the sub-query start, like `StorageFull`.
   pub fn browse(&mut self, param: QueryParam) -> Result<LookupHandle, StartQueryError> {
-    let now = StdInstant::now();
     // Size the PTR answer pool to the requested instance cap so a `max_entries`
     // above the query's default answer cap is actually reachable, and the
     // aggregation — not the query's answer pool — is what bounds instances.
-    let spec = QuerySpec::new(param.service.clone(), ResourceType::Ptr)
-      .with_timeout(param.timeout)
-      .with_max_answers(param.max_entries);
-    let handle = self.lookups.insert(LookupCtx::new(param, now));
-    match self.start_subquery(handle, spec, Step::Ptr, now) {
+    //
+    // No timeout on the spec and no clock read in this function: the browse's
+    // PTR leg is a sub-query like every other, so its window is measured against
+    // the lookup by `start_subquery_in_window`. It used to be given the FULL
+    // timeout and the lookup's own reading, which landed it on the lookup's
+    // deadline only because the two shared that reading; now it lands there by
+    // construction.
+    let spec =
+      QuerySpec::new(param.service.clone(), ResourceType::Ptr).with_max_answers(param.max_entries);
+    let handle = self.lookups.insert(LookupCtx::new(param));
+    match self.start_subquery(handle, spec, Step::Ptr) {
       Ok(()) => Ok(handle),
       Err(e) => {
         self.cancel_lookup(handle);
@@ -799,13 +923,12 @@ impl Mdns {
     host: Name,
     timeout: Duration,
   ) -> Result<LookupHandle, StartQueryError> {
-    let now = StdInstant::now();
     let param = QueryParam::new(host.clone())
       .with_timeout(timeout)
       .with_max_entries(1);
-    let mut ctx = LookupCtx::new(param, now);
+    let mut ctx = LookupCtx::new(param);
     ctx.seed_host(host);
-    self.start_seeded(ctx, now)
+    self.start_seeded(ctx)
   }
 
   /// Resolve a *known* DNS-SD service instance directly into a [`ServiceEntry`],
@@ -833,13 +956,12 @@ impl Mdns {
     instance: Name,
     timeout: Duration,
   ) -> Result<LookupHandle, StartQueryError> {
-    let now = StdInstant::now();
     let param = QueryParam::new(instance.clone())
       .with_timeout(timeout)
       .with_max_entries(1);
-    let mut ctx = LookupCtx::new(param, now);
+    let mut ctx = LookupCtx::new(param);
     ctx.on_ptr(instance);
-    self.start_seeded(ctx, now)
+    self.start_seeded(ctx)
   }
 
   /// Stop a lookup and cancel every sub-query it owns.
@@ -873,13 +995,9 @@ impl Mdns {
   /// Starting them here rather than leaving them to the next `tick` is what lets
   /// a pool-full failure surface synchronously to the caller instead of turning
   /// into a lookup that silently resolves nothing.
-  fn start_seeded(
-    &mut self,
-    ctx: LookupCtx,
-    now: StdInstant,
-  ) -> Result<LookupHandle, StartQueryError> {
+  fn start_seeded(&mut self, ctx: LookupCtx) -> Result<LookupHandle, StartQueryError> {
     let handle = self.lookups.insert(ctx);
-    match self.launch_pending(handle, now) {
+    match self.launch_pending(handle) {
       Ok(()) => Ok(handle),
       Err(e) => {
         self.cancel_lookup(handle);
@@ -893,20 +1011,20 @@ impl Mdns {
   /// Best effort: a refused start is skipped and the rest are still attempted,
   /// so one pool-full does not silently abandon the other legs. The first error
   /// is reported for the constructors, which unwind on it.
-  fn launch_pending(
-    &mut self,
-    owner: LookupHandle,
-    now: StdInstant,
-  ) -> Result<(), StartQueryError> {
+  ///
+  /// Nothing is hoisted out of the loop. One budget computed here and applied to
+  /// every start is one decision spent N times — the shape that survived the
+  /// pair-by-pair audits — so each leg is anchored by its own reading inside
+  /// [`LookupCtx::start_subquery_in_window`] instead.
+  fn launch_pending(&mut self, owner: LookupHandle) -> Result<(), StartQueryError> {
     let Some(ctx) = self.lookups.get_mut(owner) else {
       return Ok(());
     };
-    let remaining = ctx.remaining(now);
     let starts = core::mem::take(&mut ctx.pending);
     let mut first_err = None;
     for Start { name, step } in starts {
-      let spec = QuerySpec::new(name, step.qtype()).with_timeout(remaining);
-      if let Err(e) = self.start_subquery(owner, spec, step, now)
+      let spec = QuerySpec::new(name, step.qtype());
+      if let Err(e) = self.start_subquery(owner, spec, step)
         && first_err.is_none()
       {
         first_err = Some(e);
@@ -920,22 +1038,26 @@ impl Mdns {
 
   /// Start one lookup-owned sub-query.
   ///
+  /// The spec arrives **without** a timeout: the lookup is what a leg's window
+  /// is measured against, so only [`LookupCtx::start_subquery_in_window`] can
+  /// set one.
+  ///
+  /// `Ok(())` does not promise a leg: a lookup whose deadline has already passed
+  /// starts none, which is not a failure — the lookup is simply over, and the
+  /// next tick reports its [`Event::LookupDone`]. This is the path a
+  /// zero-timeout lookup takes.
+  ///
   /// # Errors
   ///
   /// [`StartQueryError::StorageFull`] when the proto query pool refuses it, and
-  /// when the owning lookup is already gone — in which case the query just
-  /// started is cancelled again rather than left running unowned.
-  /// [`StartQueryError::Other`] for a proto failure this crate does not map
-  /// explicitly yet.
+  /// when the owning lookup is already gone. [`StartQueryError::Other`] for a
+  /// proto failure this crate does not map explicitly yet.
   fn start_subquery(
     &mut self,
     owner: LookupHandle,
     spec: QuerySpec,
     step: Step,
-    now: StdInstant,
   ) -> Result<(), StartQueryError> {
-    // `From`, never `map_err(|_| StorageFull)`: see `Mdns::start_query`.
-    let sub = self.endpoint.try_start_query(spec, now)?;
     let Self {
       endpoint,
       queries,
@@ -944,11 +1066,16 @@ impl Mdns {
       work_pending,
       ..
     } = self;
+    // Resolved BEFORE the start rather than after it, which the lookup-owned
+    // window is what forces: there is no window to measure against without the
+    // context, so an unowned sub-query can no longer be started and then
+    // cancelled — it is never started. Unreachable in practice either way; both
+    // callers hold the lookup across this call.
     let Some(ctx) = get_checked(&mut lookups.slab, owner) else {
-      // Nothing owns it, so nothing would ever consume its answers or stop it
-      // retransmitting. Unreachable in practice; free it rather than leak it.
-      let _ = endpoint.cancel_query(sub);
       return Err(StartQueryError::StorageFull);
+    };
+    let Some(sub) = ctx.start_subquery_in_window(endpoint, spec)? else {
+      return Ok(());
     };
     register_subquery(queries, ctx, owner, sub, step, tx_queue.join());
     // A freshly started query has a question pending immediately and no proto
@@ -963,6 +1090,61 @@ impl Mdns {
   /// this is the only stage that consumes their answers and terminals, so a
   /// sub-query answer has no path to the caller's event queue.
   ///
+  /// # It takes no instant
+  ///
+  /// A lookup's deadline is [`QueryParam::with_timeout`] made absolute, so it is
+  /// the **caller's** bound and not a schedule the core owns: it is a real-time
+  /// question wearing a deadline's clothing, and the `>=` that weighs it is
+  /// identical to the one a protocol deadline uses. That resemblance is the
+  /// whole trap. This stage runs last, so the tick's instant — read before
+  /// `drain_recv`, `sweep`, `fire_timeouts`, `drain_transmits` and
+  /// `push_updates` — is at its stalest here, and every microsecond of those
+  /// five stages would be spent inside a window the caller was told was shut.
+  /// So the reading is taken here, at each decision, and there is no parameter
+  /// left for one to arrive through. See the `driver` module's clock rule.
+  ///
+  /// [`LookupCtx::is_expired`] and [`LookupCtx::is_finished`] still take one,
+  /// because they are *predicates* — "was the boundary crossed at this instant"
+  /// — rather than decision sites. The decisions are here, and each supplies a
+  /// reading it took itself and spends on that one question.
+  ///
+  /// # The deadline is tested before the work, not after it
+  ///
+  /// A lookup past its deadline is finished *instead of* being advanced: it
+  /// consumes no answer, launches no follow-up and emits no entry. The
+  /// alternative would let a lookup do a whole tick's worth of work — including
+  /// surfacing instances discovered entirely after its window — outside the
+  /// bound [`QueryParam::with_timeout`] documents.
+  ///
+  /// The boundary is weighed at each of the four points it governs — before the
+  /// answer walk, at each leg's launch, before the emit, and at the retirement —
+  /// because one test up front is a single decision applied four times, and the
+  /// last three applications would weigh a window that may have shut since. The
+  /// launch needs no test written here: [`LookupCtx::start_subquery_in_window`]
+  /// reads its own anchor and reports a shut window as `Ok(None)`, which is
+  /// fresher evidence than anything this loop holds, so it is acted on as the
+  /// verdict it is rather than logged and walked past.
+  ///
+  /// The other two [`LookupCtx::is_finished`] terms stay *below* the walk, and
+  /// deliberately: the entry cap and the last-leg-ended condition become true
+  /// only as a **result** of the walk, so testing them up here would leave a
+  /// lookup that is already over sitting in the slab for another whole tick —
+  /// and nothing but its own deadline would be left to wake the loop for it.
+  ///
+  /// # What this cannot close
+  ///
+  /// A sub-query's own absolute deadline lands on its lookup's exactly, but it
+  /// lives in the proto layer and is weighed against the instant stage 3 hands
+  /// in — the tick's, because that same instant also drives the §5.2 retry
+  /// ladder, which *is* the core's own schedule. One parameter, two categories:
+  /// a question armed just before the boundary can therefore still reach stage
+  /// 4's send path a few microseconds after it. Splitting that would be an
+  /// `mdns-proto` change (either `Query::poll_transmit` honouring
+  /// `timeout_deadline` against the instant it is given, or `handle_timeout`
+  /// taking the absolute bound separately from the retry one), so what is closed
+  /// here is everything caller-visible: no answer consumed, no leg opened, no
+  /// entry surfaced, and the leg cancelled by the retirement below.
+  ///
   /// # Termination
   ///
   /// No budget of its own, like `push_updates`: every loop is bounded by state
@@ -971,7 +1153,7 @@ impl Mdns {
   /// `pending` list, which only grows for a *new* instance (capped at
   /// `max_entries`) or a *new* host (capped the same way) and is drained here in
   /// full; and the emit loop by the entries the aggregation just produced.
-  pub(crate) fn advance_lookups(&mut self, now: StdInstant) {
+  pub(crate) fn advance_lookups(&mut self) {
     let Self {
       endpoint,
       queries,
@@ -979,6 +1161,8 @@ impl Mdns {
       events,
       tx_queue,
       work_pending,
+      #[cfg(test)]
+      forced_launch_delays,
       ..
     } = &mut *self;
     let Lookups {
@@ -998,6 +1182,18 @@ impl Mdns {
         key,
         generation: ctx.generation,
       };
+      // Read here and spent here, on the one question of whether this lookup may
+      // still consume the answers below. The reconcile between the two touches
+      // only `queries`: it consumes nothing and creates nothing, so it cannot
+      // put work inside a window this reading has just called open.
+      //
+      // Before anything this lookup could do with the tick. Its legs go with it
+      // in the teardown below, which reads `ctx.subqueries` directly — so the
+      // reconcile the walk would have done first is not needed to retire them.
+      if ctx.is_expired(StdInstant::now()) {
+        finished.push(handle);
+        continue;
+      }
       // A sub-query the pipeline retired (an encode failure) or swept is gone
       // from `queries`; this is where the lookup learns of it. Without the
       // reconcile the lookup would wait on a leg that can never answer.
@@ -1041,31 +1237,90 @@ impl Mdns {
         }
       }
 
+      // Stands in for the one thing no test can ask a real host for: the walk
+      // losing the CPU between the expiry test above and the launches below,
+      // long enough for the lookup's window to shut in between. That is the
+      // window `Ok(None)` exists to answer, and nothing else can place a
+      // deadline inside it. See `Mdns::forced_launch_delays`.
+      #[cfg(test)]
+      Self::stall_before_launch(forced_launch_delays);
+
       // Start the follow-ups the answers above asked for, in the SAME tick.
       // `mem::take` first: the launch mutates `ctx.subqueries`, so nothing may
       // still borrow `ctx.pending`. A refused start is skipped rather than
       // fatal — the lookup reports what it can resolve and ends when its
       // remaining sub-queries do.
-      let remaining = ctx.remaining(now);
+      //
+      // No instant is in reach of this loop, deliberately: each start anchors
+      // itself, one reading per leg, in `start_subquery_in_window`.
+      let mut window_shut = false;
       for Start { name, step } in core::mem::take(&mut ctx.pending) {
-        let spec = QuerySpec::new(name, step.qtype()).with_timeout(remaining);
-        match endpoint.try_start_query(spec, now) {
-          Ok(sub) => {
+        let spec = QuerySpec::new(name, step.qtype());
+        match ctx.start_subquery_in_window(endpoint, spec) {
+          Ok(Some(sub)) => {
             register_subquery(queries, ctx, handle, sub, step, tx_queue.join());
             *work_pending = true;
+          }
+          // Reachable despite the expiry test above: that one weighs a reading
+          // taken before the answer walk, and a leg reads its own anchor here,
+          // so a deadline falling between the two lands in this arm. It is the
+          // freshest evidence about this lookup's window anything in the tick
+          // holds — a proof the window is shut, not a refusal — so it ends the
+          // lookup here rather than being logged and walked past. Falling
+          // through would let the collection below surface an entry the caller
+          // was told could not arrive, on the strength of an older reading.
+          //
+          // Traced apart from the refusal below because it is a different fact —
+          // the window shut, the pool did not fill — and a trace that conflated
+          // them would send a reader hunting a capacity problem that is not
+          // there.
+          Ok(None) => {
+            hick_trace::debug!("a lookup's own deadline passed mid-walk; retiring it unstarted");
+            window_shut = true;
+            break;
           }
           Err(_e) => {
             hick_trace::debug!("a lookup could not start a resolve sub-query: query pool is full");
           }
         }
       }
+      if window_shut {
+        finished.push(handle);
+        continue;
+      }
 
+      // The launches above are real work, so the emit weighs its own reading:
+      // an entry surfaced here is caller-visible, and `QueryParam::with_timeout`
+      // promises none of them was completed on or after the deadline.
+      //
+      // This reading is taken AFTER the completions it governs, and that order is
+      // what makes the drain below need no test of its own. Every completion the
+      // drain could surface was produced by the `feed` above — its only call
+      // site — in this iteration, on this thread; `ready` is filled only by the
+      // `collect_ready` below and emptied in full by the loop after it, and every
+      // path that skips that pair retires the lookup instead of leaving it in the
+      // slab. So no completion from an earlier iteration or an earlier tick can
+      // still be waiting here: each one precedes this reading, and on a monotonic
+      // clock that settles both cases. If any of them landed on or after the
+      // deadline, this reading is later still, so the lookup retires and nothing
+      // is surfaced at all; and if this reading is inside the window, so was
+      // every completion before it.
+      //
+      // What the boundary does NOT govern is whether a completion may be
+      // *produced* late: a deadline falling between the expiry test above and the
+      // answer walk lets exactly that happen. It governs whether a late one may
+      // be surfaced, and losing the CPU anywhere above only moves this reading
+      // later — towards discarding more, never less.
+      if ctx.is_expired(StdInstant::now()) {
+        finished.push(handle);
+        continue;
+      }
       ctx.collect_ready();
       while let Some(entry) = ctx.take_ready() {
         events.push_terminal(Event::Lookup { handle, entry });
       }
 
-      if ctx.is_finished(now) {
+      if ctx.is_finished(StdInstant::now()) {
         finished.push(handle);
       }
     }
@@ -1078,6 +1333,25 @@ impl Mdns {
       }
       events.push_terminal(Event::LookupDone { handle });
     }
+  }
+
+  /// Lose the CPU where the lookup walk really can: after the expiry test that
+  /// admitted this lookup's answers, and before its follow-up legs are opened.
+  /// See [`Mdns::forced_launch_delays`].
+  #[cfg(test)]
+  fn stall_before_launch(stalls: &mut std::collections::VecDeque<Duration>) {
+    if let Some(stall) = stalls.pop_front()
+      && !stall.is_zero()
+    {
+      std::thread::sleep(stall);
+    }
+  }
+
+  /// Stall the next lookups walked between their expiry test and their launch
+  /// loop, one entry per lookup. See [`Mdns::forced_launch_delays`].
+  #[cfg(test)]
+  pub(crate) fn force_launch_delays_for_test(&mut self, stalls: &[Duration]) {
+    self.forced_launch_delays = stalls.iter().copied().collect();
   }
 }
 

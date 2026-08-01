@@ -58,24 +58,55 @@
 //! kind is small.
 //!
 //! **A protocol instant may be passed in.** [`Mdns::tick`] reads one at its top
-//! and every *deadline* inside that tick is weighed against it — the endpoint's,
-//! each service's, each query's, each lookup's. One stable value per tick is the
-//! point: two stages that disagree about "now" can fire a deadline twice or skip
-//! it. Nothing real-time may be measured from it.
+//! and every *protocol* deadline inside that tick is weighed against it — the
+//! endpoint's, each service's lifecycle, each query's RFC 6762 §5.2 retry. Those
+//! are schedules the core owns and nobody outside it can observe, so one stable
+//! value per tick is the point: two stages that disagree about "now" can fire a
+//! deadline twice or skip it, while the quantization itself never leaves the
+//! core. Nothing real-time may be measured from it.
 //!
 //! **A real-time instant may not.** Anything answering "how long has actually
-//! elapsed" — a self-send credit's age, a wire's spacing gap, when a withdrawal
-//! schedule begins, when its next round is due — is read at the decision by the
-//! code that makes it. The strongest form is to take no instant at all, which is
-//! what [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take),
-//! [`send_and_credit`], [`Mdns::push_updates`] and [`Mdns::drain_withdrawals`]
-//! all do: a parameter is a channel through which a caller hands in a reading
-//! taken somewhere else, and moving the read nearer never removes the channel.
-//! Deleting it does.
+//! elapsed", and anything a **caller** was promised in wall-clock terms — a
+//! self-send credit's age, a wire's spacing gap, when a withdrawal schedule
+//! begins, when its next round is due, whether a lookup's
+//! [`QueryParam::with_timeout`](crate::QueryParam::with_timeout) window is still
+//! open — is read at the decision by the code that makes it. The strongest form
+//! is to take no instant at all, which is what
+//! [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take),
+//! [`send_and_credit`], [`Mdns::push_updates`], [`Mdns::advance_lookups`] and
+//! [`Mdns::drain_withdrawals`] all do: a parameter is a channel through which a
+//! caller hands in a reading taken somewhere else, and moving the read nearer
+//! never removes the channel. Deleting it does.
+//!
+//! **A deadline comparison is not automatically a protocol deadline.** Which
+//! kind an instant is depends on *who was promised it*, never on the `>=` that
+//! weighs it — and the two comparisons are written identically, which is what
+//! makes the misfiling easy. A lookup's deadline is
+//! [`QueryParam::with_timeout`](crate::QueryParam::with_timeout) made absolute:
+//! the caller is told that on and after it the lookup consumes no answer, starts
+//! no sub-query and surfaces no entry. Weighing that against the tick's instant
+//! spends the whole of stages 1 through 5 inside a window the caller was told
+//! was shut, and stage 6 is where the tick's reading is at its stalest. So the
+//! lookup's own boundary is real-time even though a sub-query's §5.2 ladder,
+//! sitting one layer below it, is not.
 //!
 //! What is left is the instructions between the read and the comparison, and it
 //! is irreducible — something must read a clock before something can compare
 //! against it.
+//!
+//! **And one reading may have two uses when they are inverses.** A DNS-SD
+//! sub-query is started with an absolute anchor and a relative budget, and the
+//! budget is `lookup deadline - anchor` while the proto layer's only use of the
+//! anchor is to add the budget back — so the leg lands on its lookup's deadline
+//! exactly, however stale the anchor is. Nothing is measured; the reading is an
+//! *origin*, and both uses are in the same coordinate system. Deleting that
+//! pairing would not close a defect, it would open one: a budget from one read
+//! and an anchor from another leave the leg outliving its lookup by the gap. So
+//! the reading is taken where both uses are, inside
+//! [`LookupCtx::start_subquery_in_window`](crate::discovery::LookupCtx), and no
+//! parameter offers a caller the chance to split it. Round eleven audited this
+//! site expecting the ninth instance and found the arithmetic instead; what it
+//! closed was the four parameter channels around it, not the pairing.
 //!
 //! # How to look, and how not to
 //!
@@ -395,6 +426,11 @@ impl Mdns {
   /// has silently gone deaf.
   pub fn tick(&mut self) -> Result<(), TickError> {
     let now = StdInstant::now();
+    // Recorded, not consulted: no stage reads it back. See the field.
+    #[cfg(test)]
+    {
+      self.last_tick_instant = Some(now);
+    }
     // Hand every family back its transient-receive-error budget. Once per tick
     // is what makes the retry bounded rather than merely repeated.
     self.sockets.begin_recv_round();
@@ -412,13 +448,22 @@ impl Mdns {
     self.sweep();
     self.fire_timeouts(now);
     self.drain_transmits(now);
-    // Neither of these takes `now`, and that is the fix rather than an
+    // None of the three below takes `now`, and that is the fix rather than an
     // omission: each contains a decision that is a REAL-TIME question rather
-    // than a deadline comparison — when a withdrawal schedule begins, and when
-    // its rounds are due — and each reads the clock at that decision. See this
-    // module's clock rule.
+    // than a protocol deadline, and each reads the clock at that decision. See
+    // this module's clock rule.
+    //
+    // For `push_updates` and `drain_withdrawals` the question is when a
+    // withdrawal schedule begins and when its rounds are due. For
+    // `advance_lookups` it is whether a lookup's `QueryParam::with_timeout`
+    // window is still open — a bound the CALLER holds, not a schedule the core
+    // owns, so the tick's quantization would be visible in exactly the place it
+    // must not be. Being a deadline comparison does not make it the tick's
+    // protocol instant; being the core's own schedule is what does, and this
+    // one is not. The sub-queries this stage starts anchor themselves too — see
+    // `LookupCtx::start_subquery_in_window`.
     self.push_updates();
-    self.advance_lookups(now);
+    self.advance_lookups();
     self.compact_events();
     self.drain_withdrawals();
     self.sockets.end_tick().map_err(TickError::from)
