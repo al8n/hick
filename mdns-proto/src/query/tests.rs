@@ -1192,13 +1192,17 @@ fn repeated_partial_questions_climb_the_rfc_5_2_doubling_ladder() {
   // the query alive past every terminal. After `MAX_PARTIAL_ROUNDS` honest
   // partials the next is EXCUSED and spends a slot — carrying the ladder across
   // rather than resetting it, so the served family never sees a shorter interval.
+  //
+  // The freeze is paid for ONCE. The family is written off at the excusal and
+  // every later partial spends its slot, so the query walks §5.2's own retry count
+  // on the served link instead of three times it.
   let mut q = make_query(ResourceType::Any, ResourceClass::Any);
   let mut now = StdInstant::now();
 
   let mut previous = 0u64;
   let mut spent = 0u32;
   let mut excused = 0u32;
-  for round in 0..8 {
+  for round in 0usize..8 {
     emit_question(&mut q, now);
     let before = q.retry_count;
     q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
@@ -1206,8 +1210,9 @@ fn repeated_partial_questions_climb_the_rfc_5_2_doubling_ladder() {
     let gap = deadline.duration_since(now).as_secs();
     if q.retry_count == before {
       assert!(
-        round % 3 != 2,
-        "round {round} is the budget-exhausting one and must have been excused"
+        round < usize::from(MAX_PARTIAL_ROUNDS),
+        "round {round} is at or past the bound, so the frozen budget must have \
+         been released"
       );
     } else {
       assert_eq!(
@@ -1233,8 +1238,10 @@ fn repeated_partial_questions_climb_the_rfc_5_2_doubling_ladder() {
   }
   assert_eq!(
     (spent, excused),
-    (2, 2),
-    "two of eight partial rounds exhausted the bound and advanced the budget"
+    (6, 6),
+    "the bound is spent on the first two rounds alone; every round after the \
+     write-off advances the budget, so the query retires on §5.2's own retry count \
+     rather than on three times it"
   );
 
   // Recovery is immediate: the first fully-delivered question spends its slot and

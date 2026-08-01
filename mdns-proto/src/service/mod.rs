@@ -802,6 +802,12 @@ cfg_heap! {
   /// identical to one chronically dead family through a shared counter, and the
   /// first must not be excused at all.
   ///
+  /// The bound is charged once per stretch of failure, not once per phase: the
+  /// excusal sets `FamilyPatience::stalled` and a family carrying that latch is
+  /// excusable on sight, so a link that is chronically dead costs one round per
+  /// phase rather than `MAX_PARTIAL_ROUNDS + 1` — and the healthy link is not made
+  /// to pay for it in §8.3 ladder rungs.
+  ///
   /// It lives beside the per-kind confirm arms that maintain it, so a §6 response
   /// or a §9 meta reply — never re-armed, so evidence of nothing — structurally
   /// cannot touch it. Reset by that family's OWN delivery and by it ceasing to be
@@ -1169,9 +1175,11 @@ where
   ///   forever, because a family's patience resets on its own delivery and
   ///   neither could ever spend it.
   /// * **Excused.** Every family still owed the datagram has spent
-  ///   `MAX_PARTIAL_ROUNDS` re-arms on it. The phase advances from exactly where
-  ///   it stood, without that family, and the family stops driving the per-family
-  ///   refresh schedule until it delivers again.
+  ///   `MAX_PARTIAL_ROUNDS` re-arms on it, or spent them on an earlier phase and
+  ///   not delivered since. The phase advances from exactly where it stood,
+  ///   without that family, and the family stops driving the per-family refresh
+  ///   schedule until it delivers again — at which point it is owed the whole
+  ///   bound afresh.
   ///
   /// Neither takes any of the credit a delivery earns, and that is the whole of
   /// the distinction:

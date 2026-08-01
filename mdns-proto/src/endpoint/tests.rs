@@ -7032,6 +7032,43 @@ fn additional_section_ttl0_withdrawal_skipped_then_later_record_delivered() {
 
 // ── TransmitDelivery at the endpoint boundary ─────────────────────────
 
+/// Drive one query at the ENDPOINT boundary, confirming every send with
+/// `delivery`, until it stops transmitting. Returns how many questions it put on a
+/// wire.
+fn questions_before_the_query_retires(delivery: TransmitDelivery) -> usize {
+  let mut ep = build_endpoint();
+  let mut now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = ep
+    .try_start_query(
+      crate::config::QuerySpec::new(qname, ResourceType::Any),
+      now,
+    )
+    .unwrap();
+  let mut buf = std::vec![0u8; 512];
+  let mut sent = 0usize;
+  while ep
+    .poll_query_transmit(h, now, &mut buf)
+    .unwrap()
+    .is_some()
+  {
+    sent = sent.saturating_add(1);
+    assert!(sent < 64, "the query never reached its §5.2 terminal");
+    ep.note_query_transmit_outcome(h, now, delivery);
+    let Some(due) = ep.poll_query_timeout(h) else {
+      break;
+    };
+    assert!(
+      due > now,
+      "a {delivery:?} send must re-arm strictly later than §5.2's floor allows, \
+       not at the instant it was confirmed"
+    );
+    now = due;
+    ep.handle_query_timeout(h, due).unwrap();
+  }
+  sent
+}
+
 #[test]
 fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
   let mut ep = build_endpoint();
@@ -7053,11 +7090,10 @@ fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
     "a partially-delivered question must still re-arm"
   );
 
-  // Only the excusing round spends a slot, so the query survives far more partial
-  // rounds than MAX_RETRIES. (`Query::note_transmit_outcome` owns the walk past
-  // that bound; this pins that the endpoint boundary ferries the per-family
-  // confirm rather than absorbing it.)
-  for _ in 0..12 {
+  // A round inside the core's patience spends NO §5.2 slot: the question has not
+  // been asked everywhere, so counting it would time the query out having never
+  // queried the missing link.
+  for _ in 1..crate::service::MAX_PARTIAL_ROUNDS {
     let due = ep.poll_query_timeout(h).unwrap();
     ep.handle_query_timeout(h, due).unwrap();
     assert!(ep.poll_query_transmit(h, due, &mut buf).unwrap().is_some());
@@ -7065,7 +7101,26 @@ fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
   }
   assert!(
     ep.poll_query(h).is_none(),
-    "no partial send may retire the query"
+    "no round inside the bound may retire the query"
+  );
+
+  // …and the freeze is charged ONCE. Past the bound the missing family is written
+  // off, so every later round spends its slot again and the half-reachable host
+  // reaches the SAME §5.2 terminal exactly `MAX_PARTIAL_ROUNDS` questions later
+  // than a fully-reachable one. Re-charging the freeze per slot instead put three
+  // times as many questions on the served link's wire before the same terminal.
+  //
+  // (`Query::note_transmit_outcome` owns that walk; this pins that the endpoint
+  // boundary ferries the per-family confirm rather than absorbing it into a
+  // one-bit all-or-nothing answer, which would show up here as the two counts
+  // being equal.)
+  let healthy = questions_before_the_query_retires(TransmitDelivery::ALL);
+  let half_reachable = questions_before_the_query_retires(TransmitDelivery::V4_ONLY);
+  assert_eq!(
+    half_reachable,
+    healthy.saturating_add(usize::from(crate::service::MAX_PARTIAL_ROUNDS)),
+    "a half-reachable host must pay the core's patience once — {healthy} healthy \
+     questions, {half_reachable} half-reachable"
   );
 }
 

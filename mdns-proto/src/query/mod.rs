@@ -175,6 +175,11 @@ pub struct Query<I, AN, EV> {
   /// ceasing to be obligated; left ALONE by a wholly-failed round (see
   /// [`classify_advance`]).
   ///
+  /// The bound is charged once per stretch of failure rather than once per slot,
+  /// so a chronically dead family freezes the budget once instead of tripling the
+  /// number of questions §5.2 puts on the SERVED link's wire before the query
+  /// retires.
+  ///
   /// A query takes per-family PATIENCE and nothing else from the per-family
   /// confirm. It has no §5.2 requery scheduler and races no record TTL — the cache
   /// refreshes on receive — so there is no per-family staleness for it to anchor
@@ -738,6 +743,12 @@ where
   /// EXCUSED and spends a slot — but takes none of the credit a delivery earns:
   /// the §5.2 ladder is carried across the excuse point rather than reset, so the
   /// served link never sees a shorter interval than the one before it.
+  ///
+  /// The freeze is paid for once. A family that has already been excused and has
+  /// not delivered since no longer holds the budget at all, so every later partial
+  /// spends its slot and the query walks the §5.2 schedule the served link would
+  /// have seen anyway. Re-freezing per slot instead put three times as many
+  /// questions on that link before the same terminal.
   pub fn note_transmit_outcome(&mut self, now: I, delivery: TransmitDelivery) {
     if !self.awaiting_send_confirm {
       return;
