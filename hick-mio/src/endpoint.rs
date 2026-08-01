@@ -240,6 +240,36 @@ pub struct Mdns {
   /// read and so lands before this window opens; the two are not substitutes.
   #[cfg(test)]
   pub(crate) forced_claim_delays: std::collections::VecDeque<std::time::Duration>,
+  /// Per-lookup stalls injected **between the expiry test that admits a lookup's
+  /// answers and the launch loop that opens its follow-up legs**, consumed one
+  /// per lookup walked; once exhausted every walk proceeds at full speed.
+  ///
+  /// It stands in for the other thing no test can ask a real host for: the walk
+  /// losing the CPU inside that window, so the lookup's own
+  /// `QueryParam::with_timeout` boundary is crossed with the launches still
+  /// ahead of it. That is the only place a leg's own anchor can be later than
+  /// the reading the walk was admitted on, which is what makes
+  /// `LookupCtx::start_subquery_in_window`'s `Ok(None)` reachable — and the gap
+  /// is nanoseconds wide on a healthy host, so no timeout a test can choose
+  /// lands inside it.
+  ///
+  /// Distinct from [`Self::forced_claim_delays`], which stalls in stage 1 and so
+  /// lands before the tick has reached lookups at all; the two are not
+  /// substitutes.
+  #[cfg(test)]
+  pub(crate) forced_launch_delays: std::collections::VecDeque<std::time::Duration>,
+  /// The instant [`Self::tick`] read at its top, on the last tick that ran.
+  ///
+  /// The lookup tests that let a real clock cross a real window rest on a
+  /// premise: the tick *began* inside the lookup's window, so whatever ended the
+  /// lookup can only be a reading taken later in the same tick. A tick that began
+  /// outside it would instead exercise the already-past-the-deadline path, and
+  /// would pass whatever the lookup stage does — a vacuous pass, not a failure.
+  ///
+  /// A reading taken beside the call states that premise about a *different*
+  /// instant than the one the tick used. This is the one the tick used.
+  #[cfg(test)]
+  pub(crate) last_tick_instant: Option<std::time::Instant>,
 }
 
 impl Mdns {
@@ -323,6 +353,10 @@ impl Mdns {
       stats,
       #[cfg(test)]
       forced_claim_delays: std::collections::VecDeque::new(),
+      #[cfg(test)]
+      forced_launch_delays: std::collections::VecDeque::new(),
+      #[cfg(test)]
+      last_tick_instant: None,
     })
   }
 
