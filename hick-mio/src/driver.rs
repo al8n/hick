@@ -401,7 +401,7 @@ impl Mdns {
       // limit says nothing about *whose* link a wildcard-bound socket heard.
       let pkt_iface = sockets.rx_interface(&meta);
       if !onlink::admits_ingress(
-        meta.peer().ip(),
+        sockets.rx_peer(&meta),
         meta.hop_limit(),
         local_subnets,
         *bound_interface,
