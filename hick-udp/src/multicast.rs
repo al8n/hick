@@ -159,15 +159,22 @@ pub struct RecvMeta {
   len: usize,
   peer: SocketAddr,
   local_ip: IpAddr,
+  destination: Option<IpAddr>,
   interface_index: u32,
   rx_time: Option<SystemTime>,
   hop_limit: Option<u8>,
+  multicast_flag: Option<bool>,
 }
 impl RecvMeta {
+  /// `destination` is `Option<IpAddr>` rather than a second `IpAddr` so no call
+  /// site can pass it positionally in place of `local_ip`: the two carry
+  /// different addresses on Unix IPv4 and the compiler, not review, is what
+  /// keeps them apart. See [`RecvMeta::destination`].
   pub(crate) const fn new(
     len: usize,
     peer: SocketAddr,
     local_ip: IpAddr,
+    destination: Option<IpAddr>,
     iface: u32,
     rx_time: Option<SystemTime>,
   ) -> Self {
@@ -175,9 +182,11 @@ impl RecvMeta {
       len,
       peer,
       local_ip,
+      destination,
       interface_index: iface,
       rx_time,
       hop_limit: None,
+      multicast_flag: None,
     }
   }
   /// Datagram length in bytes.
@@ -196,9 +205,37 @@ impl RecvMeta {
     self.peer
   }
   /// Local IP the datagram was received on.
+  ///
+  /// On Unix IPv4 this is `in_pktinfo.ipi_spec_dst`, the receiving interface's
+  /// own unicast address — deliberately, because self-send detection on a
+  /// multi-homed host needs to know which of this host's addresses the datagram
+  /// landed on. It is therefore NOT the address the sender wrote in the IP
+  /// header; for that, and only for that, use [`RecvMeta::destination`].
   #[inline(always)]
   pub const fn local_ip(&self) -> IpAddr {
     self.local_ip
+  }
+
+  /// The IP header **destination** of the datagram, where this target recovers
+  /// one.
+  ///
+  /// Distinct from [`RecvMeta::local_ip`] on exactly one square: Unix IPv4,
+  /// where PKTINFO carries both `ipi_spec_dst` (the interface address, returned
+  /// by `local_ip`) and `ipi_addr` (the header destination, returned here). For
+  /// IPv6, and on Windows, PKTINFO carries only the header destination and the
+  /// two accessors return the same address.
+  ///
+  /// `None` is "this receive recovered no destination", never "the destination
+  /// was unicast": it is what Unix IPv4 without `IP_PKTINFO`
+  /// (FreeBSD/DragonFly/OpenBSD/NetBSD) reports on every datagram, and what any
+  /// receive whose PKTINFO cmsg was absent or truncated reports. RFC 6762 §11
+  /// selects between its two local-link tests by destination, so a caller
+  /// holding `None` has to decide on something else — see
+  /// [`RecvMeta::multicast_flag`], which is that something on the netbsdlike
+  /// half of the gap.
+  #[inline(always)]
+  pub const fn destination(&self) -> Option<IpAddr> {
+    self.destination
   }
   /// Interface index.
   #[inline(always)]
@@ -242,6 +279,34 @@ impl RecvMeta {
   #[inline(always)]
   pub(crate) fn set_hop_limit(&mut self, hop_limit: Option<u8>) {
     self.hop_limit = hop_limit;
+  }
+
+  /// Whether the kernel flagged this datagram as delivered to a multicast
+  /// group rather than to this host alone (`MSG_MCAST` in the `msg_flags`
+  /// `recvmsg` returns), on targets that have that flag.
+  ///
+  /// `None` means the flag does not exist here — **not** that the datagram was
+  /// unicast. Of the targets this crate supports, only OpenBSD and NetBSD bind
+  /// `MSG_MCAST` in `libc`.
+  ///
+  /// `Some(true)` is coarse on purpose: it says the datagram was delivered as a
+  /// multicast, not which group it was addressed to, and the flag follows the
+  /// link-layer delivery. It exists because on OpenBSD/NetBSD IPv4 it is the
+  /// only destination evidence available at all — [`RecvMeta::destination`] is
+  /// `None` on every datagram there — and RFC 6762 §11 needs to tell a group
+  /// destination from a unicast one to pick the right local-link test.
+  #[inline(always)]
+  pub const fn multicast_flag(&self) -> Option<bool> {
+    self.multicast_flag
+  }
+
+  /// Overwrite the multicast-delivery flag, threaded in by `recv_with_meta`
+  /// from `msghdr::msg_flags`. Unlike the cmsg-derived fields this one survives
+  /// `MSG_CTRUNC`: it rides on the header, not on the control buffer.
+  #[cfg(unix)]
+  #[inline(always)]
+  pub(crate) fn set_multicast_flag(&mut self, multicast_flag: Option<bool>) {
+    self.multicast_flag = multicast_flag;
   }
 }
 
@@ -498,10 +563,10 @@ pub fn parse_pktinfo_v4(
       })?;
       // ipi_ifindex is platform-endian; use from_ne_bytes for portability.
       let iface = u32::from_ne_bytes(*idx_bytes);
-      // read ipi_spec_dst (bytes 4..8) — the local interface address
-      // the packet was received on — NOT ipi_addr (bytes 8..12), which for
-      // multicast carries the group destination (224.0.0.251) and is useless
-      // for self-packet detection on multi-homed hosts.
+      // `local_ip` is ipi_spec_dst (bytes 4..8) — the local interface address
+      // the packet was received on, which is what self-packet detection on a
+      // multi-homed host needs and which for a multicast receive is NOT the
+      // address the sender addressed.
       let addr_bytes: &[u8; 4] = cmsg
         .data
         .get(4..8)
@@ -510,9 +575,29 @@ pub fn parse_pktinfo_v4(
           ParseRecvMetaError::BufferTooShort(BufferTooShortDetail::new(4, cmsg.data.len()))
         })?;
       let local_ip = IpAddr::V4(Ipv4Addr::from(*addr_bytes));
+      // `destination` is ipi_addr (bytes 8..12) — the IP header destination,
+      // the group (224.0.0.251) for a multicast receive. Both are kept: RFC 6762
+      // §11 selects its local-link test by the header destination, and reading
+      // ipi_spec_dst for that made every multicast arrival look unicast. The
+      // 12-byte length check above already covers this slice.
+      let dst_bytes: &[u8; 4] = cmsg
+        .data
+        .get(8..12)
+        .and_then(|s| s.first_chunk::<4>())
+        .ok_or_else(|| {
+          ParseRecvMetaError::BufferTooShort(BufferTooShortDetail::new(4, cmsg.data.len()))
+        })?;
+      let destination = IpAddr::V4(Ipv4Addr::from(*dst_bytes));
       // No timestamp available here; recv_with_meta overwrites rx_time after
       // parsing the SCM_TIMESTAMP* cmsg from the same control buffer.
-      return Ok(RecvMeta::new(len, peer, local_ip, iface, None));
+      return Ok(RecvMeta::new(
+        len,
+        peer,
+        local_ip,
+        Some(destination),
+        iface,
+        None,
+      ));
     }
   }
   Err(ParseRecvMetaError::MissingPktinfo)
@@ -553,9 +638,19 @@ pub fn parse_pktinfo_v6(
         })?;
       let local_ip = IpAddr::V6(Ipv6Addr::from(*addr_bytes));
       let iface = u32::from_ne_bytes(*idx_bytes);
+      // in6_pktinfo has no `ipi_spec_dst` twin: ipi6_addr IS the IP header
+      // destination, so `local_ip` and `destination` are the same address here
+      // and the v4 asymmetry does not reach IPv6.
       // No timestamp available here; recv_with_meta overwrites rx_time after
       // parsing the SCM_TIMESTAMP* cmsg from the same control buffer.
-      return Ok(RecvMeta::new(len, peer, local_ip, iface, None));
+      return Ok(RecvMeta::new(
+        len,
+        peer,
+        local_ip,
+        Some(local_ip),
+        iface,
+        None,
+      ));
     }
   }
   Err(ParseRecvMetaError::MissingPktinfo)
@@ -695,26 +790,37 @@ pub fn recv_with_meta(
     )
   })?;
 
+  // The kernel's own multicast-delivery flag, read from the header rather than
+  // from a cmsg — so it survives MSG_CTRUNC, and it is available on the targets
+  // that parse no IPv4 PKTINFO at all. `None` where libc binds no MSG_MCAST.
+  let multicast_flag = msg_multicast_flag(msg.msg_flags);
+
   // Helper: a RecvMeta carrying the real peer + length but an UNSPECIFIED
-  // local address, used when PKTINFO is absent. The datagram itself was
-  // already consumed by `recvmsg`, so we MUST NOT drop it just because the
-  // ancillary metadata is missing — the caller falls back to its own
+  // local address and NO destination, used when PKTINFO is absent. The datagram
+  // itself was already consumed by `recvmsg`, so we MUST NOT drop it just
+  // because the ancillary metadata is missing — the caller falls back to its own
   // self-loopback detection (content-hash ring) when local_ip is
   // unspecified. This keeps a missing/failed PKTINFO sockopt from silently
   // black-holing all inbound traffic.
+  //
+  // `destination` is `None` rather than the UNSPECIFIED address: a caller must
+  // be able to tell "no destination was recovered" from "the destination was
+  // 0.0.0.0", because the two lead to opposite RFC 6762 §11 decisions.
   let unspecified_meta = || {
     let local_ip = if is_v4 {
       std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
     } else {
       std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
     };
-    RecvMeta::new(n, peer, local_ip, 0, None)
+    RecvMeta::new(n, peer, local_ip, None, 0, None)
   };
 
   // MSG_CTRUNC means our control buffer was too small to hold all ancillary
   // data; treat that as "no pktinfo" and fall back (data is preserved).
   if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-    return Ok(unspecified_meta());
+    let mut meta = unspecified_meta();
+    meta.set_multicast_flag(multicast_flag);
+    return Ok(meta);
   }
 
   // Parse the PKTINFO cmsg out of the (possibly shortened) control buffer.
@@ -756,7 +862,27 @@ pub fn recv_with_meta(
   // the RFC 6762 §11 on-link check (==255). Absent/short cmsg leaves it None
   // (degraded: the driver cannot enforce and passes the packet through).
   meta.set_hop_limit(parse_hop_limit(control_slice, is_v4));
+  meta.set_multicast_flag(multicast_flag);
   Ok(meta)
+}
+
+/// Read `MSG_MCAST` out of the `msg_flags` `recvmsg` returned: whether the
+/// datagram was delivered as a multicast rather than addressed to this host
+/// alone.
+///
+/// `None` where `libc` binds no `MSG_MCAST` — every supported target but
+/// OpenBSD and NetBSD. See [`RecvMeta::multicast_flag`] for why a coarse
+/// "some group" answer is worth carrying at all.
+#[cfg(all(unix, has_msg_mcast))]
+fn msg_multicast_flag(msg_flags: libc::c_int) -> Option<bool> {
+  Some(msg_flags & libc::MSG_MCAST != 0)
+}
+
+/// Fallback for targets where `libc` binds no `MSG_MCAST`: always `None`,
+/// meaning "this target has no such flag", never "the datagram was unicast".
+#[cfg(all(unix, not(has_msg_mcast)))]
+fn msg_multicast_flag(_msg_flags: libc::c_int) -> Option<bool> {
+  None
 }
 
 /// Walk an ancillary buffer for the inbound IPv4 TTL (`IP_TTL`) or IPv6 Hop

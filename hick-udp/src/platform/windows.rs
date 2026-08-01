@@ -266,13 +266,20 @@ pub fn recv_with_meta(socket: RawSocket, buf: &mut [u8], is_v4: bool) -> std::io
   // data; treat as "no pktinfo" and fall back (the datagram is already
   // consumed). On Windows this flag is 0x200 — use the platform constant.
   if msg.dwFlags & MSG_CTRUNC != 0 {
-    return Ok(RecvMeta::new(n, peer, unspecified, 0, None));
+    return Ok(RecvMeta::new(n, peer, unspecified, None, 0, None));
   }
 
   let ctrl_len = core::cmp::min(msg.Control.len as usize, control.len());
   let ctrl = control.get(..ctrl_len).unwrap_or(&control);
-  let (local_ip, iface) = parse_pktinfo(ctrl, is_v4).unwrap_or((unspecified, 0));
-  Ok(RecvMeta::new(n, peer, local_ip, iface, None))
+  let parsed = parse_pktinfo(ctrl, is_v4);
+  let (local_ip, iface) = parsed.unwrap_or((unspecified, 0));
+  // Windows' IN_PKTINFO carries `ipi_addr`, the IP header destination — there
+  // is no `ipi_spec_dst` twin as on Unix IPv4 — so `local_ip` already IS the
+  // destination and the two accessors agree here. It is `Some` only when the
+  // cmsg actually parsed: the UNSPECIFIED degradation above is absence of
+  // evidence, not a destination of `0.0.0.0`.
+  let destination = parsed.map(|(dst, _)| dst);
+  Ok(RecvMeta::new(n, peer, local_ip, destination, iface, None))
 }
 
 /// Walk a `WSARecvMsg` control buffer for the IP_PKTINFO (v4) / IPV6_PKTINFO

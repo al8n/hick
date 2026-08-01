@@ -181,7 +181,11 @@ impl SendHealth {
     for (family, outcome) in report.per_family() {
       match outcome {
         SendOutcome::Sent { .. } => self.note_delivered(family),
-        SendOutcome::Failed => self.note_failed(family),
+        // A refusal is a refusal: an oversized datagram this socket will never
+        // carry is as much a non-delivery on this link as a full send buffer.
+        // What separates them is what the PRODUCER does about it, which is no
+        // part of a health streak.
+        SendOutcome::Failed | SendOutcome::TooLarge => self.note_failed(family),
         // Neither is evidence about the link: one has no socket, the other is
         // this driver's own deliberate spacing.
         SendOutcome::Gated | SendOutcome::NoSocket => {}
@@ -240,6 +244,19 @@ pub(crate) struct SendSummary {
   /// allows. Taking the earliest can only ever understate how fresh a family's
   /// peers are, which is the safe direction.
   pub(crate) accepted_at: Option<StdInstant>,
+  /// Every reachable family rejected this datagram as permanently too large, so
+  /// re-offering these exact bytes can never put them on a wire. See
+  /// [`SendReport::undeliverable`], which decides it, and
+  /// [`Mdns::drain_transmits`](crate::Mdns::tick) — the one consumer — for the
+  /// obligation it is weighed against.
+  ///
+  /// **Not a delivery verdict, and not an input to one.** `delivery` above is
+  /// the same honest per-family shape either way: an undeliverable round is
+  /// `Missed` on every family that has a socket, exactly as a refused one is.
+  /// This rides alongside so the caller can ask a question the core's vocabulary
+  /// has no room for — *is there any point re-arming this datagram* — without
+  /// any of it reaching the confirm.
+  pub(crate) undeliverable: bool,
 }
 
 /// One PRODUCER's per-family earliest-next-send gate: when each address family
@@ -487,13 +504,23 @@ pub(crate) fn send_and_credit(
 /// * `Sent` is [`FamilyDelivery::Delivered`], **including for a degraded
 ///   family**: a family that has quietly recovered really did put the records on
 ///   a wire, and peers reachable over it now hold them.
-/// * `Gated` and `Failed` are [`FamilyDelivery::Missed`], however long the
-///   family has been failing. Its socket is there and the datagram was meant for
-///   it — the driver either owed the wire a gap it had not paid, or the kernel
-///   refused it. Reporting either absent would hide it from the core and let the
-///   phase advance without the family. How long the core waits for such a family
-///   is the core's `MAX_PARTIAL_ROUNDS`, spent on an `Excused` advance that takes
-///   none of the credit a delivery earns.
+/// * `Gated`, `Failed` and `TooLarge` are [`FamilyDelivery::Missed`], however
+///   long the family has been failing. Its socket is there and the datagram was
+///   meant for it — the driver either owed the wire a gap it had not paid, or
+///   the kernel refused it. Reporting any of them absent would hide it from the
+///   core and let the phase advance without the family. How long the core waits
+///   for such a family is the core's `MAX_PARTIAL_ROUNDS`, spent on an `Excused`
+///   advance that takes none of the credit a delivery earns.
+///
+/// # `undeliverable` is carried, not projected
+///
+/// [`SendSummary::undeliverable`] leaves this mapping untouched: a datagram no
+/// reachable socket can carry is still `Missed` on every family that has one.
+/// The core's vocabulary has no way to say "and there is no point re-arming
+/// it" — which is precisely why it must not be said in `delivery`, where the
+/// only unused shape is `Unobligated` and that means an ABSENT socket. It rides
+/// beside the confirm instead, and only [`Mdns::drain_transmits`](crate::Mdns::tick)
+/// reads it, after the confirm has been spent.
 fn summarize(report: SendReport) -> SendSummary {
   let mut sent = 0usize;
   let mut families = [FamilyDelivery::Unobligated; 2];
@@ -512,7 +539,7 @@ fn summarize(report: SendReport) -> SendSummary {
         }
         FamilyDelivery::Delivered
       }
-      SendOutcome::Gated | SendOutcome::Failed => FamilyDelivery::Missed,
+      SendOutcome::Gated | SendOutcome::Failed | SendOutcome::TooLarge => FamilyDelivery::Missed,
       SendOutcome::NoSocket => FamilyDelivery::Unobligated,
     };
     if let Some(slot) = families.get_mut(family.index()) {
@@ -523,6 +550,7 @@ fn summarize(report: SendReport) -> SendSummary {
     sent,
     delivery: TransmitDelivery::new(families[FAMILY_V4], families[FAMILY_V6]),
     accepted_at,
+    undeliverable: report.undeliverable(),
   }
 }
 

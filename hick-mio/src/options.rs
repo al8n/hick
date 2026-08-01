@@ -31,6 +31,33 @@ impl Default for ServerOptions {
 }
 
 impl ServerOptions {
+  /// The smallest [`Self::max_payload_size`] or [`Self::max_recv_packet_size`]
+  /// an [`Mdns`](crate::Mdns) will accept: one DNS header.
+  ///
+  /// A buffer that cannot hold the fixed 12-byte header cannot hold a message
+  /// either — nothing could ever be encoded into it or parsed out of it — so it
+  /// is refused at construction rather than turned into an endpoint that can
+  /// only fail.
+  pub const MIN_BUFFER_SIZE: usize = mdns_proto::wire::HEADER_SIZE;
+
+  /// The largest [`Self::max_payload_size`] or [`Self::max_recv_packet_size`] an
+  /// [`Mdns`](crate::Mdns) will accept: the biggest UDP payload either address
+  /// family can carry.
+  ///
+  /// A 16-bit IPv6 payload-length field less the 8-byte UDP header, which is 20
+  /// bytes above the IPv4 ceiling and therefore the larger of the two. Above it
+  /// a datagram cannot exist on any UDP socket, so the extra capacity could
+  /// never be filled by a receive nor emptied by a send — while below it the
+  /// setting stays useful, including the narrow band an IPv4 socket cannot carry
+  /// (see `SendOutcome::TooLarge`).
+  ///
+  /// It is also what keeps the two buffers a bounded allocation. Both were sized
+  /// by an unvalidated `usize` and allocated infallibly, so a configuration
+  /// carrying `usize::MAX` — or any size the allocator could not satisfy — ended
+  /// the process instead of returning
+  /// [`ServerError`](crate::ServerError::BufferSizeUnsupported).
+  pub const MAX_BUFFER_SIZE: usize = crate::socket::Family::V6.max_udp_payload();
+
   /// Build a new options bundle with defaults.
   ///
   /// The single source of truth for those defaults; [`Default`] delegates here.
@@ -102,6 +129,12 @@ impl ServerOptions {
   }
 
   /// Override the maximum outgoing packet size.
+  ///
+  /// Must be within [`Self::MIN_BUFFER_SIZE`]`..=`[`Self::MAX_BUFFER_SIZE`].
+  /// This setter accepts anything, so that it stays `const`; the bound is
+  /// checked by [`Mdns::new`](crate::Mdns::new), which reports
+  /// [`ServerError::BufferSizeUnsupported`](crate::ServerError::BufferSizeUnsupported)
+  /// before it binds a socket.
   #[inline]
   #[must_use]
   pub const fn with_max_payload_size(mut self, size: usize) -> Self {
@@ -118,7 +151,8 @@ impl ServerOptions {
     self.max_recv_packet_size
   }
 
-  /// Override the recv buffer size.
+  /// Override the recv buffer size. Bounded exactly as
+  /// [`Self::with_max_payload_size`] is.
   #[inline]
   #[must_use]
   pub const fn with_max_recv_packet_size(mut self, size: usize) -> Self {

@@ -519,6 +519,7 @@ pub(super) fn send_withdrawal(
 /// |---|---|---|
 /// | `Sent` | `Sent` | on the wire; spend one owed round |
 /// | `Failed` | `Retry` | a bound socket did not carry it; the 2 s ceiling is the backstop |
+/// | `TooLarge` | `Retry` | same: a bound socket did not carry it, and the same ceiling bounds it |
 /// | `Gated` | `Retry` | the debt mask withheld it (see [`GoodbyeLedger`]); a deferral is not a write-off |
 /// | `NoSocket` | `WriteOff` | nothing bound, so no peers on this family to retract from |
 ///
@@ -530,15 +531,25 @@ pub(super) fn send_withdrawal(
 /// this family's peers pinned to stale positive-TTL records for the rest of the
 /// record's TTL. Keeping the debt costs at most the 2 s ceiling.
 ///
-/// And [`SendOutcome::NoSocket`] exists as its own variant precisely so this row
-/// can differ from `Failed`. Conflating them in either direction breaks
+/// [`SendOutcome::TooLarge`] joins that row rather than the write-off one, and
+/// the asymmetry with stage 4 is deliberate. There, an undeliverable datagram
+/// retires a producer that would otherwise re-arm it forever, because the
+/// producer is what is unbounded. Here nothing is: the item's own 2 s anti-pin
+/// ceiling force-completes it whatever the family answers, so the ONLY thing a
+/// write-off could buy is finishing marginally sooner — at the price of the
+/// exact defect this table exists to prevent, a route freed while a bound family
+/// still owes its goodbye. The direction stays one-sided: **only an absent
+/// socket writes a debt off.**
+///
+/// And [`SendOutcome::NoSocket`] exists as its own variant precisely so that row
+/// can differ from the failing ones. Conflating them in either direction breaks
 /// something: as `Retry`, an unbound family's debt would pin every withdrawal to
 /// its full ceiling on a single-stack host; as `WriteOff`, a bound family's
 /// transient failure would free the route while it still owed its goodbye.
 const fn withdrawal_outcome(outcome: SendOutcome) -> WithdrawalSend {
   match outcome {
     SendOutcome::Sent { .. } => WithdrawalSend::Sent,
-    SendOutcome::Gated | SendOutcome::Failed => WithdrawalSend::Retry,
+    SendOutcome::Gated | SendOutcome::Failed | SendOutcome::TooLarge => WithdrawalSend::Retry,
     SendOutcome::NoSocket => WithdrawalSend::WriteOff,
   }
 }

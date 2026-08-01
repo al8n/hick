@@ -96,7 +96,10 @@
 
 use std::time::{Duration, Instant as StdInstant, SystemTime};
 
-use mdns_proto::{QueryHandle, ServiceHandle, ServiceUpdate, TransmitDelivery, event::RouteEvent};
+use mdns_proto::{
+  QueryHandle, ServiceHandle, ServiceUpdate, TransmitDelivery, TransmitObligation,
+  event::RouteEvent,
+};
 
 use crate::{endpoint::Mdns, error::TickError, event::Event, onlink, selfsend::MatchMode};
 
@@ -395,14 +398,16 @@ impl Mdns {
     // Hand every family back its transient-receive-error budget. Once per tick
     // is what makes the retry bounded rather than merely repeated.
     self.sockets.begin_recv_round();
-    // Open the self-send claim window before the stage that claims from it, on
-    // the instant this tick already took. `now` is the first moment a credit the
-    // previous tick recorded can be claimed, and `SELF_SEND_TTL` may be measured
-    // from nothing earlier — the outbound stages below all run after stage 1, so
-    // the tick that records a credit can never claim it. Top of the tick rather
-    // than end of the outbound stages so that this stays true however stages 4
-    // through 7 are later reordered or added to.
-    self.selfsend.seal(now);
+    // Open the self-send claim window before the stage that claims from it. It
+    // takes no instant and is deliberately not given `now`: the anchor it stamps
+    // this batch with is the first moment a credit the previous tick recorded can
+    // be claimed, and `SELF_SEND_TTL` may be measured from nothing earlier or
+    // later — so it is read inside the seal, after the sweep that precedes it,
+    // rather than handed in from here. The outbound stages below all run after
+    // stage 1, so the tick that records a credit can never claim it; top of the
+    // tick rather than end of the outbound stages so that stays true however
+    // stages 4 through 7 are later reordered or added to.
+    self.selfsend.seal();
     self.drain_recv(now);
     self.sweep();
     self.fire_timeouts(now);
@@ -472,14 +477,18 @@ impl Mdns {
       // hop-limit branch used to skip entirely even though a conforming hop
       // limit says nothing about *whose* link a wildcard-bound socket heard.
       //
-      // `local_ip` is the datagram's destination, which is what selects between
-      // §11's two arms where no hop limit was reported. See `admits_ingress` for
-      // what that accessor carries on which platform, and why a square where it
-      // is NOT the destination can only fail closed.
+      // `destination` is the datagram's IP header destination, which is what
+      // selects between §11's two arms where no hop limit was reported, and
+      // `multicast_flag` is the kernel's coarser stand-in where no destination
+      // was recovered. NOT `local_ip`, which on Unix IPv4 is the receiving
+      // interface's own address and can never equal a group — see
+      // `admits_ingress` for why reading it here rejected the very traffic §11
+      // exists to admit.
       let pkt_iface = sockets.rx_interface(&meta);
       if !onlink::admits_ingress(
         sockets.rx_peer(&meta),
-        meta.local_ip(),
+        meta.destination(),
+        meta.multicast_flag(),
         meta.hop_limit(),
         local_subnets,
         *bound_interface,
@@ -487,7 +496,8 @@ impl Mdns {
       ) {
         hick_trace::debug!(
           src = %meta.peer(),
-          dst = %meta.local_ip(),
+          dst = ?meta.destination(),
+          multicast_flag = ?meta.multicast_flag(),
           hop_limit = ?meta.hop_limit(),
           interface_index = pkt_iface,
           bound_interface = *bound_interface,
@@ -782,6 +792,11 @@ impl Mdns {
               None => break false,
             };
             let len = tx.size().min(send_buf.len());
+            // Read from the transmit BEFORE the send, because the send is what
+            // consumes it: `tx` borrows nothing, but the confirm below spends
+            // the commit token it belongs to, and after that this datagram is
+            // no longer a thing the core is offering.
+            let obligation = tx.obligation();
             // The gate is copied out and written back rather than borrowed
             // across the send, so `services` stays free for the confirm below.
             let mut gate = services
@@ -809,6 +824,48 @@ impl Mdns {
             }
             confirm_service(endpoint, services, handle, at, summary.delivery);
             spent = spent.saturating_add(datagram_cost(summary.sent));
+            // Every reachable socket refused these bytes as too large, so the
+            // datagram is not late — it is impossible. What that costs depends
+            // entirely on whether the core will offer it again.
+            if summary.undeliverable {
+              match obligation {
+                // Sustained: a probe or an §8.3 announcement, re-armed until
+                // every obligated link accepts it. Nothing ever will, so the
+                // service would probe or announce forever with nothing on any
+                // wire and never reach `Established` — and no patience bound
+                // helps, because the core's own excuses a MISSING family, not a
+                // round that can never succeed on any of them. Retire it so the
+                // caller sees an actionable terminal instead of a silent stall.
+                //
+                // AFTER the confirm above, never instead of it: the core holds a
+                // commit token from this `poll_transmit`, the honest all-missed
+                // confirm is what spends it and latches nothing, and stage 7
+                // builds the §10.1 goodbye from what a confirm has latched. A
+                // retirement under a live token would build it from a service
+                // the core still considers mid-datagram.
+                TransmitObligation::Sustained => {
+                  hick_trace::warn!(
+                    handle = ?handle,
+                    len,
+                    "no bound family can carry this service's datagram; retiring it with a Conflict"
+                  );
+                  retire_service(services, events, handle);
+                  // Nothing left for this slot: every later stage skips a
+                  // withdrawing service, so the datagram is abandoned with the
+                  // producer and no zero timeout could come back for it. Same
+                  // exit the terminal encode failure below takes, for the same
+                  // reason.
+                  break false;
+                }
+                // One-shot: a §6 / §6.7 / RFC 6763 §9 reply, never re-armed. It
+                // costs exactly one unanswered question — the querier re-asks —
+                // and the confirm above has already resolved it as the miss it
+                // was. Retiring here would let any peer tear down a healthy
+                // established service by asking it a question whose answer does
+                // not fit.
+                TransmitObligation::OneShot => {}
+              }
+            }
           };
           if hit_encode_error
             && services
@@ -819,13 +876,7 @@ impl Mdns {
               handle = ?handle,
               "service exceeded MAX_CONSECUTIVE_ENCODE_ERRORS; retiring it with a Conflict"
             );
-            events.push_terminal(Event::Service {
-              handle,
-              update: ServiceUpdate::Conflict,
-            });
-            if let Some(ctx) = services.get_mut(&handle) {
-              ctx.withdrawing = true;
-            }
+            retire_service(services, events, handle);
             // Only a NON-TERMINAL encode failure is leftover work. This one was
             // terminal: the service's proto is never polled again, so the
             // undeliverable datagram is abandoned with it and there is nothing
@@ -880,6 +931,12 @@ impl Mdns {
               }
             };
             let len = tx.size().min(send_buf.len());
+            // Read before the send that consumes it, exactly as the service arm
+            // above does. A query's question is always `Sustained` — §5.2 has no
+            // one-shot form — so the `debug_assert` states a core contract this
+            // arm depends on rather than a local invariant.
+            let obligation = tx.obligation();
+            debug_assert_eq!(obligation, TransmitObligation::Sustained);
             let mut gate = queries
               .get(&handle)
               .map(|ctx| ctx.wire_gate)
@@ -907,6 +964,27 @@ impl Mdns {
             let at = summary.accepted_at.unwrap_or_else(StdInstant::now);
             endpoint.note_query_transmit_outcome(handle, at, summary.delivery);
             spent = spent.saturating_add(datagram_cost(summary.sent));
+            // No bound family can carry the question, and the §5.2 budget is
+            // spent only on an all-delivered send — so this query would re-ask
+            // forever without ever reaching its own retry ceiling. Retire it, on
+            // the same terms the un-encodable question above uses, and after the
+            // confirm for the same reason the service arm gives.
+            if summary.undeliverable && obligation == TransmitObligation::Sustained {
+              hick_trace::warn!(
+                handle = ?handle,
+                len,
+                "no bound family can carry this query's question; retiring it"
+              );
+              let owned_by_lookup = queries.get(&handle).is_some_and(|c| c.owner.is_some());
+              endpoint.retire_query(handle);
+              if let Some(update) = endpoint.poll_query(handle)
+                && !owned_by_lookup
+              {
+                events.push_terminal(Event::QueryTerminal { handle, update });
+              }
+              retired_scratch.push(handle);
+              break false;
+            }
           };
           (spent, capped)
         }
@@ -1116,6 +1194,36 @@ impl Mdns {
     if self.events.physical_len() > EVENT_QUEUE_COMPACT_THRESHOLD {
       self.events.compact();
     }
+  }
+}
+
+/// Retire a service the driver cannot transmit for: queue its terminal and mark
+/// the context withdrawing.
+///
+/// The **only** shape a driver-side retirement takes, so the two sites that need
+/// one — a payload that can never be encoded, and one no bound family can ever
+/// carry — cannot drift into saying different things to the caller.
+///
+/// Two halves, and each is load-bearing. The [`ServiceUpdate::Conflict`] is what
+/// the caller sees instead of waiting for an `Established` that can never
+/// arrive; it is pushed as a TERMINAL, so it is not subject to the answer
+/// queue's cap. And `withdrawing` is what every later stage reads to stop
+/// driving this service's state machine — including stage 7, which is where the
+/// route is actually released once the RFC 6762 §10.1 goodbye it begins from
+/// this flag has been paid. **The context is deliberately not removed here**:
+/// dropping it would strand the queued terminal's route and free the name while
+/// the retraction is still owed.
+fn retire_service(
+  services: &mut std::collections::HashMap<ServiceHandle, crate::endpoint::ServiceCtx>,
+  events: &mut crate::event::EventQueue,
+  handle: ServiceHandle,
+) {
+  events.push_terminal(Event::Service {
+    handle,
+    update: ServiceUpdate::Conflict,
+  });
+  if let Some(ctx) = services.get_mut(&handle) {
+    ctx.withdrawing = true;
   }
 }
 

@@ -21,6 +21,47 @@ pub enum ServerError {
   #[error("bind v6: {0}")]
   BindV6(hick_udp::BindError),
 
+  /// A [`ServerOptions`](crate::ServerOptions) buffer size outside
+  /// [`MIN_BUFFER_SIZE`](crate::ServerOptions::MIN_BUFFER_SIZE)`..=`[`MAX_BUFFER_SIZE`](crate::ServerOptions::MAX_BUFFER_SIZE).
+  ///
+  /// Reported **before any socket is bound**, so a configuration this endpoint
+  /// cannot serve costs nothing and leaves nothing behind. `setting` names the
+  /// [`ServerOptions`](crate::ServerOptions) setter to correct.
+  ///
+  /// Both sizes reach an allocation, and both setters take a bare `usize`: an
+  /// externally-sourced configuration carrying `usize::MAX` used to abort the
+  /// process on a capacity overflow rather than return anything at all.
+  #[error("{setting} of {requested} bytes is outside the supported range {min}..={max}")]
+  BufferSizeUnsupported {
+    /// The [`ServerOptions`](crate::ServerOptions) setter whose value was
+    /// refused.
+    setting: &'static str,
+    /// The size that setter was given.
+    requested: usize,
+    /// [`ServerOptions::MIN_BUFFER_SIZE`](crate::ServerOptions::MIN_BUFFER_SIZE).
+    min: usize,
+    /// [`ServerOptions::MAX_BUFFER_SIZE`](crate::ServerOptions::MAX_BUFFER_SIZE).
+    max: usize,
+  },
+
+  /// The allocator refused one of the endpoint's two scratch buffers.
+  ///
+  /// Distinct from [`Self::BufferSizeUnsupported`] because the cause is: the
+  /// size asked for is one this endpoint would serve, and the machine could not
+  /// supply the memory. Reserved fallibly for exactly that reason — the bound
+  /// above makes each buffer at most 64 KiB, which is not the same as saying an
+  /// allocation of it cannot fail.
+  #[error("allocating the {setting} of {requested} bytes failed: {source}")]
+  BufferAllocation {
+    /// The [`ServerOptions`](crate::ServerOptions) setter that sized the buffer.
+    setting: &'static str,
+    /// The size that setter was given.
+    requested: usize,
+    /// What the allocator reported.
+    #[source]
+    source: std::collections::TryReserveError,
+  },
+
   /// I/O error during endpoint setup (e.g. setting non-blocking mode).
   #[error(transparent)]
   Io(#[from] std::io::Error),

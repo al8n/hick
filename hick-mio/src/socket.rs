@@ -147,6 +147,38 @@ impl Family {
       Self::V6 => Self::V4,
     }
   }
+
+  /// The largest UDP payload this family can **ever** carry, and therefore the
+  /// only sound proof that a refused datagram can never be sent. See
+  /// [`SendOutcome::TooLarge`] for why an errno is not one.
+  ///
+  /// Both numbers fall out of the wire formats and neither is a tunable:
+  ///
+  /// * IPv4 — a 16-bit total-length field caps the whole datagram at 65 535
+  ///   bytes, of which a minimal IPv4 header takes 20 and the UDP header 8:
+  ///   **65 507**. Options make the real ceiling lower, never higher.
+  /// * IPv6 — the 16-bit payload-length field caps everything after the fixed
+  ///   header at 65 535, of which the UDP header takes 8: **65 527**. Extension
+  ///   headers count against that payload length, so the real ceiling is again
+  ///   only ever lower.
+  ///
+  /// Both are therefore upper bounds that a host may not reach and can never
+  /// exceed, which is the direction that matters: a datagram *below* the bound
+  /// may still be refused for a reason that clears — a path MTU with DF set, on
+  /// Linux, reports the very same `EMSGSIZE` — and is classified transient, while
+  /// one above it is impossible on any route, at any MTU, forever.
+  ///
+  /// RFC 2675 IPv6 jumbograms are deliberately not modelled. They need a
+  /// hop-by-hop option and a jumbo-capable path end to end, an mDNS message is
+  /// six orders of magnitude smaller than the threshold, and reading the bound
+  /// too low is the expensive direction — it would retire a producer whose
+  /// datagram the kernel would have accepted.
+  pub(crate) const fn max_udp_payload(self) -> usize {
+    match self {
+      Self::V4 => 65_507,
+      Self::V6 => 65_527,
+    }
+  }
 }
 
 /// Round-robin cursor over the two receive sockets.
@@ -224,7 +256,7 @@ impl SendStamps {
 
 /// Outcome of one family's send.
 ///
-/// The four are the whole vocabulary, and none may be collapsed into another:
+/// The five are the whole vocabulary, and none may be collapsed into another:
 /// the driver maps them one-to-one onto [`mdns_proto::FamilyDelivery`], and the
 /// §10.1 withdrawal pump maps them onto per-family goodbye debt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,16 +348,77 @@ pub(crate) enum SendOutcome {
   ///   not counted as `send_errors`: backpressure is not an error.
   /// * a `send_to` the kernel rejected for some other reason — `ENETUNREACH`
   ///   when a family's route goes away, `ENOBUFS`, `EPERM` from a local
-  ///   firewall, `EMSGSIZE`. `send_errors` is bumped.
+  ///   firewall. `send_errors` is bumped.
   /// * [`Sockets::send_one`] called with a `dst` whose family is not the one
   ///   selected. **Nothing was attempted at all** — that guard fires before
   ///   boundness is even checked, so the family may or may not be bound — and it
   ///   is deliberately NOT counted as `send_errors`, because a caller-error
   ///   guard is not a network failure. No call site in this crate produces it.
   ///
+  /// Every one of them is a **may-clear** failure, and that is what separates
+  /// this from [`SendOutcome::TooLarge`]: a route comes back, a buffer drains, a
+  /// firewall rule is withdrawn. Nothing may read this variant as evidence that
+  /// a datagram can never be sent — see [`SendReport::undeliverable`].
+  ///
   /// The §10.1 withdrawal pump maps this to a retry, never a write-off: see
   /// [`SendOutcome::NoSocket`], which exists precisely so the two can differ.
   Failed,
+  /// A bound socket refused the datagram, and its body is past
+  /// [`Family::max_udp_payload`] — the hard limit UDP on this family can ever
+  /// carry.
+  ///
+  /// A non-delivery like [`SendOutcome::Failed`] in every respect the wire cares
+  /// about: the family is obligated, reported [`FamilyDelivery::Missed`], and
+  /// charged a send failure and a `send_errors` bump. It differs in exactly one
+  /// thing, and that thing is the reason it is a separate variant — **a retry
+  /// cannot help**. The datagram's size is a property of the datagram, so the
+  /// identical bytes re-offered to the identical socket are refused identically,
+  /// forever.
+  ///
+  /// # Permanence is proved by the SIZE, and never by the errno
+  ///
+  /// This variant used to be decided by an OS-keyed `EMSGSIZE` table, and that is
+  /// unsound in both directions.
+  ///
+  /// **An errno cannot prove permanence.** Linux UDP answers `EMSGSIZE` both for
+  /// a payload past the hard maximum — permanent — and for a write past the
+  /// *currently known* path MTU with `DF` set, which the next attempt may get
+  /// past after an MTU probe or a route change (udp(7), ip(7) `IP_MTU_DISCOVER`).
+  /// One errno, two meanings, and the table read the transient one as permanent:
+  /// enough to retire a perfectly healthy service over a link whose MTU had just
+  /// dropped.
+  ///
+  /// **And a table cannot prove impossibility either.** A target it does not
+  /// list, or lists wrongly, answers "not permanent" for a datagram that is
+  /// genuinely impossible, and the sustained producer re-arms it until the
+  /// process ends — the defect this variant was introduced to close, quietly
+  /// restored on every platform the table missed.
+  ///
+  /// So the question asked is `body.len() > family.max_udp_payload()`: exact,
+  /// platform-independent, and a property of the datagram rather than of the
+  /// moment. The kernel's refusal is still required — it is what proves these
+  /// bytes did not go out, and a host that somehow accepted them has manifestly
+  /// contradicted the classification — but *which* refusal it was decides
+  /// nothing. Every refusal of a datagram within the limit is
+  /// [`SendOutcome::Failed`], `EMSGSIZE` included, which is the cheap direction:
+  /// a retry costs one datagram per round, a wrong retirement costs the service.
+  ///
+  /// This crate can produce such a datagram: [`ServerOptions::with_max_payload_size`]
+  /// admits any size up to the IPv6 hard limit, which is 20 bytes above IPv4's, so
+  /// a v4 family can be handed an encoded message it can never carry.
+  /// `an_oversized_datagram_the_kernel_can_never_carry_is_reported_too_large`
+  /// pins the kernel's deterministic refusal of exactly that, and
+  /// `an_emsgsize_below_the_hard_limit_is_transient_and_retried` pins the
+  /// direction that must not be taken wrongly.
+  ///
+  /// What it costs the PRODUCER depends on whether the core will re-offer the
+  /// datagram, which is [`Transmit::obligation`](mdns_proto::Transmit::obligation)'s
+  /// question and not this layer's. See [`SendReport::undeliverable`] for the
+  /// aggregate, and `Mdns::drain_transmits` for the asymmetry it feeds.
+  ///
+  /// [`FamilyDelivery::Missed`]: mdns_proto::FamilyDelivery::Missed
+  /// [`ServerOptions::with_max_payload_size`]: crate::ServerOptions::with_max_payload_size
+  TooLarge,
   /// Nothing was attempted on this family: it is **not bound**, or it is **not
   /// applicable to this destination** (the family a unicast destination did not
   /// select, which on a dual-stack host is reported even though that socket is
@@ -414,6 +507,50 @@ impl SendReport {
   /// result) never has to re-derive which socket an outcome came from.
   pub(crate) fn per_family(&self) -> [(Family, SendOutcome); 2] {
     [(Family::V4, self.v4), (Family::V6, self.v6)]
+  }
+
+  /// Whether **every reachable family** rejected this datagram as permanently
+  /// too large, so no later attempt at these exact bytes can ever reach a wire.
+  ///
+  /// Reachable means [`SendOutcome::NoSocket`] is excluded and nothing else is:
+  /// a family with no socket was never offered the datagram, so it is no
+  /// evidence either way — a single-stack host that refuses an oversized
+  /// datagram on its one family has still refused it on every family it has.
+  /// The predicate is therefore "at least one [`SendOutcome::TooLarge`], and
+  /// every other family absent".
+  ///
+  /// # The two ways to get this wrong, and which side each errs on
+  ///
+  /// **Too eager** would read a transient refusal as permanent and destroy a
+  /// healthy advertisement over a full send buffer. So every may-clear
+  /// outcome — [`SendOutcome::Failed`] (backpressure, a route that went away, a
+  /// firewall) and [`SendOutcome::Gated`] (this driver's own §8.3 spacing, whose
+  /// next round carries the SAME datagram) — vetoes the answer outright.
+  /// [`SendOutcome::Sent`] does too, trivially: something reached a wire.
+  ///
+  /// **Too lax** would leave a sustained producer re-arming a datagram no socket
+  /// can ever carry, retrying it until the process ends. That is the defect this
+  /// exists to close, and it is why "some family failed for some reason" is not
+  /// enough to *avoid* the answer either: a family that answered `TooLarge`
+  /// alongside a family that answered `Failed` is a mixed round, so this reports
+  /// `false` and the transient family is waited for.
+  ///
+  /// It says nothing about what to DO. A one-shot response that cannot be sent
+  /// is a lost response; a sustained one is a producer that can never make
+  /// progress. Only [`Transmit::obligation`](mdns_proto::Transmit::obligation)
+  /// tells the two apart, and only `Mdns::drain_transmits` consults it.
+  pub(crate) fn undeliverable(&self) -> bool {
+    let mut any_too_large = false;
+    for (_, outcome) in self.per_family() {
+      match outcome {
+        SendOutcome::TooLarge => any_too_large = true,
+        // Never offered this family: no evidence, and no veto either.
+        SendOutcome::NoSocket => {}
+        // Reached a wire, or may yet on a later round.
+        SendOutcome::Sent { .. } | SendOutcome::Gated | SendOutcome::Failed => return false,
+      }
+    }
+    any_too_large
   }
 }
 
@@ -581,6 +718,38 @@ struct BoundSocket {
   /// eventually writes the family off — is unreachable in a test without it.
   #[cfg(test)]
   forced_send_wouldblock: bool,
+  /// Stand in for this family's [`Family::max_udp_payload`], so an ordinary
+  /// datagram a live producer emits is genuinely oversize for it.
+  ///
+  /// The real condition IS reproducible — a 70 000-byte payload, which
+  /// `an_oversized_datagram_the_kernel_can_never_carry_is_reported_too_large`
+  /// uses — but only against one socket at a time and only for bytes the driver
+  /// would never encode by itself. Reaching the driver's own decision needs the
+  /// datagram a live producer emits to be refused, on every bound family, at a
+  /// moment the test chooses, which is what this gives.
+  ///
+  /// It lowers the ceiling rather than returning the outcome, so the refusal is
+  /// classified by the very comparison a real oversized send goes through. A
+  /// hook that answered [`SendOutcome::TooLarge`] directly would still pass if
+  /// that comparison, or the constants behind it, were wrong.
+  #[cfg(test)]
+  forced_payload_ceiling: Option<usize>,
+  /// Fail every send on this family with the platform's own oversized-datagram
+  /// errno, **whatever the body's size**.
+  ///
+  /// The one condition no test can otherwise provoke: Linux reports `EMSGSIZE`
+  /// for a write past the current path MTU with `DF` set, on a datagram far
+  /// below the hard limit and on a link whose next probe may carry it. It must
+  /// be [`SendOutcome::Failed`], and this is what puts it in front of the
+  /// classification.
+  #[cfg(test)]
+  forced_send_emsgsize: bool,
+  /// How many sends the two hooks above have actually refused.
+  ///
+  /// A test asserting that a producer SURVIVED an undeliverable datagram is
+  /// vacuous unless the datagram was really offered; this is what proves it was.
+  #[cfg(test)]
+  forced_send_refusals: u32,
   /// Fail this family's next `n` send **attempts** with `EINTR`, consumed one
   /// per attempt.
   ///
@@ -649,6 +818,12 @@ impl BoundSocket {
       forced_recv_delays: std::collections::VecDeque::new(),
       #[cfg(test)]
       forced_send_wouldblock: false,
+      #[cfg(test)]
+      forced_payload_ceiling: None,
+      #[cfg(test)]
+      forced_send_emsgsize: false,
+      #[cfg(test)]
+      forced_send_refusals: 0,
       #[cfg(test)]
       forced_send_eintr: 0,
       #[cfg(test)]
@@ -729,16 +904,39 @@ impl BoundSocket {
   /// stamp's documented direction true of the syscall it actually describes.
   ///
   /// Also the seam for what no healthy loopback socket will produce: the
-  /// `WouldBlock` of [`BoundSocket::forced_send_wouldblock`].
+  /// `WouldBlock` of [`BoundSocket::forced_send_wouldblock`], and the refusals of
+  /// [`BoundSocket::forced_payload_ceiling`] and
+  /// [`BoundSocket::forced_send_emsgsize`].
   fn raw_send(&mut self, body: &[u8], dst: SocketAddr) -> io::Result<SendStamps> {
     #[cfg(test)]
     if self.forced_send_wouldblock {
       return Err(io::Error::from(io::ErrorKind::WouldBlock));
     }
+    // Raised as an error from the syscall rather than as a `SendOutcome`, so the
+    // injected refusal is classified by the very comparison a real kernel
+    // refusal goes through. Both hooks raise the SAME error, which is the point:
+    // what separates them is the body's size against the ceiling, and nothing
+    // about the errno.
+    #[cfg(test)]
+    if self.forced_send_emsgsize || self.forced_payload_ceiling.is_some_and(|c| body.len() > c) {
+      self.forced_send_refusals = self.forced_send_refusals.saturating_add(1);
+      return Err(emsgsize_for_test());
+    }
     match self.send_attempt(body, dst) {
       Err(e) if e.kind() == io::ErrorKind::Interrupted => self.send_attempt(body, dst),
       other => other,
     }
+  }
+
+  /// The largest body this family will accept, which is
+  /// [`Family::max_udp_payload`] unless a test has lowered it. See
+  /// [`BoundSocket::forced_payload_ceiling`].
+  fn payload_ceiling(&self, family: Family) -> usize {
+    #[cfg(test)]
+    if let Some(ceiling) = self.forced_payload_ceiling {
+      return ceiling;
+    }
+    family.max_udp_payload()
   }
 
   /// One `send_to` attempt: its own pre-syscall clock reads, the syscall, and —
@@ -1559,6 +1757,12 @@ impl Sockets {
     let Some(fam) = self.family_mut(family) else {
       return SendOutcome::NoSocket;
     };
+    // The hard ceiling this family's wire format imposes, read BEFORE the
+    // admission so that nothing at all stands between that decision and the
+    // syscall it governs. Placement is all this costs: it is a constant of the
+    // address family rather than a reading of anything that can change, so no
+    // amount of time passing over it could make it stale.
+    let ceiling = fam.payload_ceiling(family);
     // Asked HERE, with this family's syscall as the next statement. Nothing runs
     // between the two — least of all the OTHER family's `sendto`, which is what
     // a fan-out-wide mask put there. See `FamilyAdmission`.
@@ -1593,11 +1797,22 @@ impl Sockets {
         hick_trace::debug!(dst = %dst, via_v4 = family.is_v4(), "send_to kept being interrupted; reporting the family missed");
         SendOutcome::Failed
       }
-      Err(_e) => {
-        hick_trace::debug!(error = %_e, dst = %dst, "send_to failed");
+      Err(e) => {
+        hick_trace::debug!(error = %e, dst = %dst, "send_to failed");
         #[cfg(feature = "stats")]
         stats.send_errors(1);
-        SendOutcome::Failed
+        // Both are a non-delivery on an obligated family and both are counted
+        // above; they are told apart for one question only — can these bytes
+        // EVER leave on this socket. The refusal proves they did not leave now;
+        // the SIZE is the only thing that proves they never can. `e` is
+        // deliberately not consulted: an `EMSGSIZE` is equally what Linux
+        // reports for a write past the current path MTU, which the next attempt
+        // may get past. See `SendOutcome::TooLarge`.
+        if body.len() > ceiling {
+          SendOutcome::TooLarge
+        } else {
+          SendOutcome::Failed
+        }
       }
     }
   }
@@ -1698,6 +1913,35 @@ impl Sockets {
     if let Some(fam) = self.family_mut(family) {
       fam.forced_send_wouldblock = fail;
     }
+  }
+
+  /// Lower this family's hard UDP payload ceiling, so an ordinary datagram is
+  /// genuinely too large for it. `None` restores the family's real limit. See
+  /// [`BoundSocket::forced_payload_ceiling`].
+  #[cfg(test)]
+  pub(crate) fn force_payload_ceiling_for_test(&mut self, family: Family, ceiling: Option<usize>) {
+    if let Some(fam) = self.family_mut(family) {
+      fam.forced_payload_ceiling = ceiling;
+    }
+  }
+
+  /// Fail every send on this family with the platform's own oversized-datagram
+  /// errno, whatever the body's size. See
+  /// [`BoundSocket::forced_send_emsgsize`].
+  #[cfg(test)]
+  pub(crate) fn force_send_emsgsize_for_test(&mut self, family: Family, fail: bool) {
+    if let Some(fam) = self.family_mut(family) {
+      fam.forced_send_emsgsize = fail;
+    }
+  }
+
+  /// How many sends the two hooks above have refused on this family. An unbound
+  /// family has refused nothing. See [`BoundSocket::forced_send_refusals`].
+  #[cfg(test)]
+  pub(crate) fn forced_send_refusals_for_test(&mut self, family: Family) -> u32 {
+    self
+      .family_mut(family)
+      .map_or(0, |fam| fam.forced_send_refusals)
   }
 
   /// Stall this family's next send attempts between their pre-syscall stamps
@@ -1928,6 +2172,64 @@ fn is_mdns_multicast(dst: SocketAddr) -> bool {
   match dst {
     SocketAddr::V4(a) => a.ip().is_multicast() && a.port() == MDNS_PORT,
     SocketAddr::V6(a) => a.ip().is_multicast() && a.port() == MDNS_PORT,
+  }
+}
+
+/// The platform's own oversized-datagram refusal, synthesised for the send hooks
+/// on [`BoundSocket`].
+///
+/// `#[cfg(test)]`, and that is the whole change of status: the classification no
+/// longer reads an errno, so this table decides nothing in any shipping build.
+/// It exists so an injected refusal *looks* like the real one — the same code a
+/// kernel raises for a datagram past the hard limit and, on Linux, for one merely
+/// past the current path MTU — which is what lets
+/// `an_emsgsize_below_the_hard_limit_is_transient_and_retried` state its subject
+/// exactly.
+///
+/// A target this does not name is not a gap any more: the refusal falls back to a
+/// plain error, the size comparison is unchanged by it, and no test is skipped.
+/// Stable ABI numbers, not header lookups: this crate takes no `libc` dependency.
+#[cfg(test)]
+fn emsgsize_for_test() -> io::Error {
+  // EMSGSIZE: 90 on Linux/Android, 40 on the BSDs, 97 on Solaris/illumos, and
+  // Winsock's WSAEMSGSIZE, which does not share the C errno space.
+  #[cfg(any(target_os = "linux", target_os = "android"))]
+  const CODE: Option<i32> = Some(90);
+  #[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+  ))]
+  const CODE: Option<i32> = Some(40);
+  #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+  const CODE: Option<i32> = Some(97);
+  #[cfg(windows)]
+  const CODE: Option<i32> = Some(10040);
+  #[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "solaris",
+    target_os = "illumos",
+    windows,
+  )))]
+  const CODE: Option<i32> = None;
+
+  match CODE {
+    Some(code) => io::Error::from_raw_os_error(code),
+    None => io::Error::other("forced oversized-datagram refusal"),
   }
 }
 

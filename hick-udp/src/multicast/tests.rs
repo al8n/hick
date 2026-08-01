@@ -60,6 +60,35 @@ fn parses_ipv4_pktinfo() {
 
 #[cfg(has_ip_pktinfo)]
 #[test]
+fn destination_is_ipi_addr_while_local_ip_stays_ipi_spec_dst() {
+  // Both readings, pinned on ONE buffer. The same in_pktinfo carries the
+  // receiving interface's address in ipi_spec_dst and the address the sender
+  // actually addressed in ipi_addr; `local_ip` and `destination` must keep
+  // returning one each and never collapse onto either. Reading ipi_spec_dst as
+  // the destination is what made a multicast arrival look unicast to the
+  // RFC 6762 §11 fallback — ipi_spec_dst is a local unicast address, so it can
+  // never equal a group.
+  let cmsgs = synth_cmsg_v4(Ipv4Addr::new(192, 168, 1, 100), 42);
+  let peer: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5353).into();
+  let meta = parse_pktinfo_v4(&cmsgs, 200, peer).unwrap();
+  assert_eq!(
+    meta.destination(),
+    Some(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
+    "destination must be ipi_addr, the group the sender addressed"
+  );
+  assert_eq!(
+    meta.local_ip(),
+    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
+    "local_ip must stay ipi_spec_dst on the very same buffer"
+  );
+  assert_ne!(Some(meta.local_ip()), meta.destination());
+  // Nothing sets the flag on this path: the PKTINFO parsers never see
+  // `msg_flags`, and `None` is "no such flag here", not "unicast".
+  assert_eq!(meta.multicast_flag(), None);
+}
+
+#[cfg(has_ip_pktinfo)]
+#[test]
 fn empty_cmsgs_returns_missing() {
   let peer: SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5353).into();
   let err = parse_pktinfo_v4(&[], 0, peer).unwrap_err();

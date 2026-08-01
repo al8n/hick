@@ -11,9 +11,17 @@
 //!   * has_ip_pktinfo IP_PKTINFO / IP_RECVPKTINFO (+ in_pktinfo parse)
 //!   * has_ipv6_pktinfo IPV6_PKTINFO + IPV6_RECVPKTINFO
 //!   * has_recv_hoplimit IP_RECVTTL + IPV6_HOPLIMIT + IPV6_RECVHOPLIMIT (§11)
+//!   * has_msg_mcast MSG_MCAST, the `recvmsg` result flag saying the datagram
+//!     was delivered as a multicast rather than to this host alone
 //!   * has_recv_timestamp SO_TIMESTAMP[NS] + SCM_TIMESTAMP[NS]
 //!   * recv_timestamp_ns the timestamp cmsg is nanosecond SO_TIMESTAMPNS
 //!     (Linux/Android); otherwise it is microsecond SO_TIMESTAMP.
+//!
+//! Every cfg here answers "does `libc` BIND this constant for the target",
+//! which is not the same question as "can the target report this". Where the
+//! two diverge the comment at the emit site says so, because a fail-open
+//! exemption justified on "the platform provably cannot answer" is unearned
+//! when the real gap is a binding this crate has not reached for.
 
 fn main() {
   println!("cargo:rerun-if-changed=build.rs");
@@ -24,6 +32,7 @@ fn main() {
     "has_ip_pktinfo",
     "has_ipv6_pktinfo",
     "has_recv_hoplimit",
+    "has_msg_mcast",
     "has_recv_timestamp",
     "recv_timestamp_ns",
   ] {
@@ -47,6 +56,15 @@ fn main() {
   // ipi_ifindex) the shared parser would misread as too-short. All of
   // them degrade to an unspecified local address + interface index 0, exactly
   // as the IPv4 path already does elsewhere.
+  //
+  // That degradation is this crate's, not the platforms'. `libc` binds
+  // IP_RECVDSTADDR, IP_RECVIF and IP_RECVTTL for freebsdlike
+  // (src/unix/bsd/freebsdlike/mod.rs:921-926) and IP_PKTINFO/IP_RECVPKTINFO for
+  // NetBSD (src/unix/bsd/netbsdlike/netbsd/mod.rs:957-958); the receive paths
+  // for them are simply unimplemented here. Until they exist, an IPv4 datagram
+  // on these targets has no recovered destination, `RecvMeta::destination`
+  // returns `None`, and RFC 6762 §11's group arm has to be selected by the
+  // coarser `has_msg_mcast` flag below.
   if linux_like || apple {
     println!("cargo::rustc-cfg=has_ip_pktinfo");
   }
@@ -55,10 +73,26 @@ fn main() {
   if linux_like || apple || freebsdlike || netbsdlike {
     println!("cargo::rustc-cfg=has_ipv6_pktinfo");
   }
-  // RFC 6762 §11 TTL/Hop-Limit receive cmsg. Absent on netbsdlike
-  // (OpenBSD/NetBSD don't define IP_RECVTTL/IPV6_HOPLIMIT/IPV6_RECVHOPLIMIT).
+  // RFC 6762 §11 TTL/Hop-Limit receive cmsg. Off on netbsdlike because `libc`
+  // BINDS none of IP_RECVTTL/IPV6_HOPLIMIT/IPV6_RECVHOPLIMIT for OpenBSD or
+  // NetBSD — a binding gap, NOT a platform incapability. Both are KAME-derived
+  // stacks that report the hop limit exactly as RFC 3542 specifies, so a
+  // receiver there is degraded by what this crate can reach through `libc`, not
+  // by what the kernel knows. Stated precisely because the §11 fail-open rule
+  // ("no hop limit ⇒ we can prove neither on-link nor off-link") is a real
+  // exemption on Windows, where the sockopt genuinely does not exist, and only
+  // an accident of bindings here.
   if linux_like || apple || freebsdlike {
     println!("cargo::rustc-cfg=has_recv_hoplimit");
+  }
+  // MSG_MCAST: the `recvmsg` result flag saying the datagram arrived as a
+  // multicast rather than addressed to this host. Bound only for netbsdlike
+  // (src/unix/bsd/netbsdlike/mod.rs:577, value 0x200) among the targets this
+  // crate supports. It is coarse — it names no group — but on OpenBSD/NetBSD
+  // IPv4 it is the ONLY destination evidence there is, and RFC 6762 §11 selects
+  // its two local-link tests by destination.
+  if netbsdlike {
+    println!("cargo::rustc-cfg=has_msg_mcast");
   }
   // Kernel receive-timestamp cmsg (all supported Unix).
   if linux_like || apple || freebsdlike || netbsdlike {

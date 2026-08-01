@@ -132,6 +132,42 @@ fn is_mdns_group(dst: IpAddr) -> bool {
   }
 }
 
+/// Whether RFC 6762 §11's **group** arm applies to a datagram: was it addressed
+/// to a multicast group rather than to this host?
+///
+/// `destination` is [`hick_udp::RecvMeta::destination`] — the IP header
+/// destination where the platform recovers one, `None` where it recovers none.
+/// When it is `Some` it decides alone, exactly the two groups and nothing else;
+/// a known unicast destination is not overruled by any coarser signal.
+///
+/// # The `None` arm is a deliberate over-approximation
+///
+/// `multicast_flag` is [`hick_udp::RecvMeta::multicast_flag`]: the kernel's own
+/// `MSG_MCAST`, which says the datagram was delivered as a multicast but not
+/// **which** group it was addressed to. Accepting it here therefore means "some
+/// multicast group, port 5353" rather than "224.0.0.251 or FF02::FB", and that
+/// is wider than the `Some` arm on purpose.
+///
+/// It widens nothing that matters. The source-prefix test this replaces exists
+/// to keep **off-link unicast injection** out — a datagram a router carried to
+/// this host from a prefix we do not share — and a datagram delivered as a
+/// multicast is not that datagram. It is also still behind everything else:
+/// [`arrived_on_bound_interface`] has already required it to have arrived on
+/// this endpoint's own link, a reported hop limit below 255 has already
+/// rejected it, and it still had to be sent to port 5353 to be read at all. On
+/// OpenBSD/NetBSD, the only targets that reach this arm, it restores exactly
+/// the traffic §11 mandates be admitted and that this crate was dropping.
+///
+/// Stage 2 removes the approximation by reading the real destination there
+/// (`IP_RECVDSTADDR` / NetBSD's `IP_RECVPKTINFO`), at which point `destination`
+/// is `Some` and this arm stops being reached.
+fn addressed_to_group(destination: Option<IpAddr>, multicast_flag: Option<bool>) -> bool {
+  match destination {
+    Some(dst) => is_mdns_group(dst),
+    None => multicast_flag == Some(true),
+  }
+}
+
 /// The whole ingress trust boundary for one datagram: the link it arrived on,
 /// then RFC 6762 §11.
 ///
@@ -160,7 +196,8 @@ fn is_mdns_group(dst: IpAddr) -> bool {
 /// says it must not be. That is not a hypothetical square: Windows reports no
 /// TTL/hop limit at all — `hick-udp`'s `set_recv_ttl_v4` and
 /// `set_recv_hoplimit_v6` are no-ops there — so every Windows datagram takes
-/// this branch, which made the loss silent rather than rare.
+/// this branch, which made the loss silent rather than rare. Nor is Windows the
+/// only such square; see the section below for the Unix IPv4 ones.
 ///
 /// The group arm sits INSIDE the no-hop-limit branch rather than ahead of it.
 /// It replaces the source-prefix *guess*, the only thing §11 ever offered it as
@@ -170,22 +207,36 @@ fn is_mdns_group(dst: IpAddr) -> bool {
 /// link-local to SOME link, never that it was ours, and a wildcard-bound socket
 /// on a multi-homed host is handed every NIC's copy.
 ///
-/// # What `dst` actually carries
+/// # Where the destination comes from, and why not `local_ip`
 ///
-/// The caller passes `RecvMeta::local_ip`, whose meaning is per-platform: the
-/// IP header destination on Windows (`IN_PKTINFO.ipi_addr` /
-/// `IN6_PKTINFO.ipi6_addr`) and on every Unix IPv6 receive
-/// (`in6_pktinfo.ipi6_addr`), but the receiving interface's own address on Unix
-/// IPv4, where `hick-udp` reads `ipi_spec_dst` deliberately and asserts it.
-/// That asymmetry cannot admit anything it should not: `ipi_spec_dst` is a
-/// local unicast address and so never equals a group, and the targets that read
-/// it (Linux/Android/Apple) all report a hop limit and never reach this branch.
-/// A `dst` that is not the destination — including the UNSPECIFIED a target
-/// with no PKTINFO parser degrades to — therefore reads as "unicast" and falls
-/// through to the source-prefix rule, which is what was there before.
+/// `destination` is [`hick_udp::RecvMeta::destination`], which reports the IP
+/// header destination or nothing at all. It is NOT `RecvMeta::local_ip`, which
+/// this function used to be handed: on Unix IPv4 that accessor deliberately
+/// returns `in_pktinfo.ipi_spec_dst`, the receiving interface's own unicast
+/// address, because self-send detection on a multi-homed host needs it — and a
+/// local unicast address never equals a group, so every multicast arrival read
+/// as "unicast" and went to the source-prefix test §11 says must not decide it.
+///
+/// The claim that used to excuse that — "the targets that read `ipi_spec_dst`
+/// all report a hop limit and never reach this branch" — is false, and this
+/// crate is what refutes it: `hick-udp` enables `IP_RECVTTL` best-effort at bind
+/// (`let _ = platform::set_recv_ttl_v4(..)`) while `IP_PKTINFO` is mandatory, so
+/// a Linux or Apple host whose TTL enable failed reaches this branch on every
+/// datagram with PKTINFO intact. On OpenBSD/NetBSD there is no IPv4 PKTINFO
+/// parse at all, the destination degraded to UNSPECIFIED, and the false
+/// rejection was unconditional — against precisely the overlaid-subnet
+/// multicast §11 calls it "essential" to admit.
+///
+/// So the fallback reads three ways, not two, and [`addressed_to_group`] holds
+/// the first two: a recovered destination decides by itself, a missing one
+/// defers to the kernel's coarser multicast flag where the platform has one, and
+/// only a datagram that is neither falls through to the source prefix. That last
+/// case — no destination and no flag either — is the pre-existing behavior,
+/// unchanged.
 pub(crate) fn admits_ingress(
   src: SocketAddr,
-  dst: IpAddr,
+  destination: Option<IpAddr>,
+  multicast_flag: Option<bool>,
   hop_limit: Option<u8>,
   subnets: &[(IpAddr, u8)],
   bound_iface: u32,
@@ -200,7 +251,7 @@ pub(crate) fn admits_ingress(
   // falls back to the source address on the bound interface's own links.
   if hop_limit.is_some() {
     is_on_link(hop_limit)
-  } else if is_mdns_group(dst) {
+  } else if addressed_to_group(destination, multicast_flag) {
     true
   } else {
     src_on_local_link(src, subnets, bound_iface, pkt_iface, iface_reported)
@@ -264,9 +315,10 @@ pub(crate) fn collect_local_subnets(iface_index: u32) -> Vec<(IpAddr, u8)> {
 /// configured on the bound interface.
 ///
 /// Reached only through [`admits_ingress`], which has already required the
-/// datagram to have arrived on the bound interface AND to have been addressed
-/// to this host rather than to an mDNS group: §11 scopes this source check to
-/// unicast destinations, because a group destination settles the question by
+/// datagram to have arrived on the bound interface AND to have failed
+/// [`addressed_to_group`] — so as far as this platform can report, it was
+/// addressed to this host rather than to a group. §11 scopes this source check
+/// to unicast destinations, because a group destination settles the question by
 /// itself and a source prefix could only overrule it wrongly.
 ///
 /// The link-local arm below keeps its own copy of the interface check anyway:
