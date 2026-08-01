@@ -17,7 +17,11 @@ use mdns_proto::{
   wire::{Header, MessageBuilder, MessageReader, NameRef, ResourceType},
 };
 
-use crate::{endpoint::Mdns, options::ServerOptions, socket::BIND_LOCK};
+use crate::{
+  endpoint::Mdns,
+  options::ServerOptions,
+  socket::{BIND_LOCK, Family},
+};
 
 /// An [`Mdns`] bound to loopback, holding the crate-wide bind lock.
 ///
@@ -192,14 +196,29 @@ pub(crate) fn query_spec(ty: &str) -> QuerySpec {
   )
 }
 
-/// Tick until `handle` has confirmed-emitted its records, or report why the
-/// test is skipping.
+/// Long enough for a full RFC 6762 §8 lifecycle — the 0-250 ms jitter before the
+/// first probe, three probes 250 ms apart, and the §8.3 announcement that follows
+/// — several times over, so a slow runner is slack rather than a verdict.
+/// `tests/loopback.rs` gives its own advertise wait the same budget.
+const ADVERTISE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Tick until `handle` has confirmed-emitted its records.
 ///
 /// RFC 6762 §8.1 probing is real wall-clock work — three probes 250 ms apart —
 /// and only an **announced** service has an old name for a later rename to
 /// retract, so every rename test has to get through this first.
+///
+/// # The failure path is not a skip
+///
+/// Ten callers return early on `false`, so an unconditional skip here would take
+/// all ten green on a regression in probing, announcing, or the per-family
+/// confirm. There is exactly one environmental cause — a host whose kernel
+/// accepts no multicast datagram on the loopback interface, so no probe ever
+/// leaves — and it is read from the socket layer's own record of what it handed
+/// the kernel, never inferred from the announce failing. Datagrams on a wire and
+/// no announce is this crate's fault and panics.
 pub(crate) fn drive_to_advertised(mdns: &mut Mdns, handle: ServiceHandle) -> bool {
-  let deadline = StdInstant::now() + Duration::from_secs(5);
+  let deadline = StdInstant::now() + ADVERTISE_BUDGET;
   while StdInstant::now() < deadline {
     mdns.tick().expect("tick");
     if mdns
@@ -211,7 +230,21 @@ pub(crate) fn drive_to_advertised(mdns: &mut Mdns, handle: ServiceHandle) -> boo
     }
     std::thread::sleep(Duration::from_millis(20));
   }
-  eprintln!("skipping: the service never reached its announce within the budget");
+  let on_wire: usize = [Family::V4, Family::V6]
+    .into_iter()
+    .map(|family| mdns.sockets.wire_times_for_test(family).len())
+    .sum();
+  assert_eq!(
+    on_wire, 0,
+    "the service never advertised within {ADVERTISE_BUDGET:?}, yet the socket \
+     layer had already handed the kernel datagrams on this endpoint's own wires: \
+     the probes did go out, so probing, announcing or the per-family confirm has \
+     regressed"
+  );
+  eprintln!(
+    "skipping: this host's kernel accepted no multicast datagram on the loopback \
+     interface, so no probe could leave and no service can announce"
+  );
   false
 }
 
