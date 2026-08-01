@@ -1167,7 +1167,13 @@ impl Sockets {
   ///
   /// **The degradation is keyed to `Ok(empty)` and to nothing else.** A family
   /// whose address enumeration *failed* is not a family this interface has no
-  /// address in — see [`interface_families`].
+  /// address in — see [`has_addr_in`] — and it fails the bind rather than
+  /// quietly dropping the family.
+  ///
+  /// **Only a requested family is probed at all**, which is what keeps that
+  /// strictness from costing availability elsewhere: an IPv6 enumeration error
+  /// says nothing about an IPv4-only bind, so failing one on it would be a
+  /// refusal bought with no decision.
   pub(crate) fn bind(
     opts: &ServerOptions,
     #[cfg(feature = "stats")] stats: std::sync::Arc<hick_trace::stats::Stats>,
@@ -1193,8 +1199,15 @@ impl Sockets {
     // address in a requested family" — collapsing all three into `(false, false)`
     // reports the address error below, which sends a caller who passed a stale
     // index looking for missing addresses on an interface that does not exist.
-    let (iface_has_v4, iface_has_v6) = match getifs::interface_by_index(interface_index) {
-      Ok(Some(i)) => interface_families(&i).map_err(ServerError::Io)?,
+    //
+    // `&&` short-circuits, so a family the caller switched off is never probed
+    // and therefore cannot fail: the availability property is the operator's,
+    // not a promise some later reader has to keep.
+    let (bind_v4, bind_v6) = match getifs::interface_by_index(interface_index) {
+      Ok(Some(i)) => (
+        opts.ipv4() && has_addr_in(&i, Family::V4).map_err(ServerError::Io)?,
+        opts.ipv6() && has_addr_in(&i, Family::V6).map_err(ServerError::Io)?,
+      ),
       Ok(None) => {
         return Err(ServerError::Io(io::Error::new(
           io::ErrorKind::NotFound,
@@ -1211,8 +1224,6 @@ impl Sockets {
         )));
       }
     };
-    let bind_v4 = opts.ipv4() && iface_has_v4;
-    let bind_v6 = opts.ipv6() && iface_has_v6;
     if !bind_v4 && !bind_v6 {
       return Err(ServerError::Io(io::Error::new(
         io::ErrorKind::AddrNotAvailable,
@@ -2432,12 +2443,13 @@ fn map_join_to_bind_v6(e: hick_udp::JoinError) -> ServerError {
   }
 }
 
-/// Which address families `iface` actually has addresses in, as `(ipv4, ipv6)`.
+/// Whether `iface` has any address in `family`, or why the platform could not
+/// say.
 ///
 /// # A failure is not an absence
 ///
-/// Both accessors are fallible syscalls, and answering `false` for an `Err` is
-/// the defect this exists to prevent: it makes a family whose enumeration FAILED
+/// The accessor is a fallible syscall, and answering `false` for an `Err` is the
+/// defect this exists to prevent: it makes a family whose enumeration FAILED
 /// indistinguishable from one that genuinely has no address. Downstream that is
 /// a family silently dropped from a dual-stack bind that then *succeeds*, and —
 /// when both fail — an `AddrNotAvailable` that names the wrong cause and sends
@@ -2446,20 +2458,19 @@ fn map_join_to_bind_v6(e: hick_udp::JoinError) -> ServerError {
 /// so `false` is reserved for `Ok` with nothing in it and everything else
 /// propagates.
 ///
+/// # Which is why it is asked one family at a time
+///
+/// An error only means something to a decision the answer feeds. Asking both
+/// families together made every caller carry an error it could not use: an IPv6
+/// read that failed aborted an IPv4-only bind, and it aborted a pick whose
+/// winner the candidate could no longer outrank. Both callers therefore ask per
+/// family, behind the condition that makes the answer matter — see
+/// [`Sockets::bind`] and [`rank_candidates`] — so an error propagates exactly
+/// when the decision needed the answer.
+///
 /// The error carries the interface index and the family it could not read, on
 /// top of the kind the platform reported, because "permission denied" alone
 /// names neither.
-fn interface_families(iface: &getifs::Interface) -> io::Result<(bool, bool)> {
-  Ok((
-    has_addr_in(iface, Family::V4)?,
-    has_addr_in(iface, Family::V6)?,
-  ))
-}
-
-/// Whether `iface` has any address in `family`, or why the platform could not
-/// say. Split out of [`interface_families`] so both families are asked the same
-/// question the same way, and so the `#[cfg(test)]` failure lands on exactly one
-/// of them.
 fn has_addr_in(iface: &getifs::Interface, family: Family) -> io::Result<bool> {
   let index = iface.index();
   let (label, addrs) = match family {
@@ -2549,46 +2560,118 @@ impl Drop for ForcedEnumerationError {
 /// working one until nothing is ever discovered, so the failure is raised where
 /// a caller can see it and pin an interface instead.
 ///
-/// The probe runs only for interfaces whose flags already qualify them, so an
-/// unrelated down or non-multicast interface cannot fail the pick.
+/// # An error is retained only while it could still change the answer
+///
+/// Propagating one that cannot is not strictness, it is availability spent for
+/// nothing. Two conditions decide whether an address read matters at all, and
+/// both are applied before every read rather than after it: the family must have
+/// been requested, and the best tier the candidate can still reach must still
+/// outrank the interface already chosen — see [`rank_candidates`]. That reach
+/// narrows as the candidate's own families come back absent, so the second
+/// condition is worth re-testing between one candidate's probes and not only
+/// between candidates. The flag filter is the same rule one step earlier, and it
+/// was already here: a down or non-multicast interface is never probed, so it
+/// can never fail the pick.
 fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<Option<u32>> {
   let ifs = getifs::interfaces()
     .map_err(|e| io::Error::new(e.kind(), format!("enumerating network interfaces: {e}")))?;
-  let multicast_up_non_loopback = |i: &getifs::Interface| -> bool {
-    let f = i.flags();
-    f.contains(getifs::Flags::UP)
-      && f.contains(getifs::Flags::MULTICAST)
-      && !f.contains(getifs::Flags::LOOPBACK)
-      && i.index() != 0
-  };
-  let loopback_up = |i: &getifs::Interface| -> bool {
-    i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP)
-  };
-  // One pass over four preference tiers, lowest wins, first-seen wins within a
-  // tier — the order the four separate `find` passes used to produce. Ranked in
-  // one walk because each interface's families now cost a fallible syscall pair
-  // that must be asked once and propagated, not re-asked per tier.
+  rank_candidates(
+    ifs
+      .iter()
+      .filter_map(|i| Some((tier_base(i)?, i.index(), i))),
+    want_v4,
+    want_v6,
+    |iface, family| has_addr_in(iface, family),
+  )
+}
+
+/// The best tier `iface`'s FLAGS alone can qualify it for, or `None` when they
+/// disqualify it outright.
+///
+/// Tier 0 is an up, multicast-capable, non-loopback interface and tier 2 is an
+/// up loopback one; each tier's odd neighbour above it is the same interface
+/// serving only some of the requested families. Reading no address here is what
+/// keeps an interface the picker would never choose from costing a syscall — or
+/// failing one.
+fn tier_base(iface: &getifs::Interface) -> Option<u8> {
+  let f = iface.flags();
+  if f.contains(getifs::Flags::UP)
+    && f.contains(getifs::Flags::MULTICAST)
+    && !f.contains(getifs::Flags::LOOPBACK)
+    && iface.index() != 0
+  {
+    Some(0)
+  } else if f.contains(getifs::Flags::LOOPBACK) && f.contains(getifs::Flags::UP) {
+    Some(2)
+  } else {
+    None
+  }
+}
+
+/// Rank already-classified candidates and return the winner's interface index.
+///
+/// `candidates` yields `(tier_base, index, subject)`, where `subject` is
+/// whatever `has_addr` needs to read that candidate's addresses. Split out of
+/// [`pick_default_interface_index`] because a `getifs::Interface` cannot be
+/// constructed by a test, while everything below — which candidates are probed,
+/// which failures propagate, and which one wins — is a property of this walk and
+/// not of the host it runs on.
+///
+/// One pass over four preference tiers, lowest wins, first-seen wins within a
+/// tier — the order four separate `find` passes used to produce. Ranked in one
+/// walk because each candidate's families cost fallible syscalls that must be
+/// asked once and propagated, not re-asked per tier.
+fn rank_candidates<S>(
+  candidates: impl IntoIterator<Item = (u8, u32, S)>,
+  want_v4: bool,
+  want_v6: bool,
+  mut has_addr: impl FnMut(&S, Family) -> io::Result<bool>,
+) -> io::Result<Option<u32>> {
   let mut best: Option<(u8, u32)> = None;
-  for iface in ifs.iter() {
-    let tier_base = if multicast_up_non_loopback(iface) {
-      0
-    } else if loopback_up(iface) {
-      2
-    } else {
+  'candidates: for (tier_base, index, subject) in candidates {
+    // The best tier this candidate can still reach, narrowed as its families are
+    // read. It starts at the strict tier its flags allow; a requested family it
+    // has no address in puts that tier out of reach for good, leaving the loose
+    // tier immediately above.
+    let mut reachable = tier_base;
+    let mut serves_any = false;
+    for (family, wanted) in [(Family::V4, want_v4), (Family::V6, want_v6)] {
+      // A family is probed only while its answer could still change the winner.
+      // Displacing the incumbent takes a strictly lower tier, first-seen-wins
+      // within a tier being what makes `>=` the test rather than `>`, so a
+      // candidate already out of reach of that cannot alter the pick whatever
+      // its remaining addresses turn out to be — and a failure to read them is
+      // exactly as uninformative. Re-tested per family rather than once per
+      // candidate because the reach narrows mid-candidate: a tier-0 incumbent is
+      // unbeatable before the first probe, while a candidate whose first family
+      // came back absent has just lost the only tier that beat a tier-1 one.
+      //
+      // A candidate that COULD still outrank the incumbent is probed, and its
+      // failure still propagates. That is the half a fix in this direction gets
+      // backwards: reading it as "no address in that family" ranks a candidate
+      // on an answer nobody obtained and can bind the wrong link, which looks
+      // exactly like a working responder until nothing is ever discovered.
+      if best.is_some_and(|(seen, _)| reachable >= seen) {
+        continue 'candidates;
+      }
+      // "Requested AND present": the short circuit is what keeps a family nobody
+      // asked for from being read at all, so a `false` there is for want of a
+      // question rather than for want of an address, and cannot cost the strict
+      // tier below.
+      let serves = wanted && has_addr(&subject, family)?;
+      serves_any |= serves;
+      if wanted && !serves {
+        reachable = tier_base + 1;
+      }
+    }
+    // Every requested family has been read, so the tier still within reach is
+    // the tier earned — except by a candidate serving none of them, which is no
+    // candidate at all rather than one ranked last.
+    if !serves_any && reachable > tier_base {
       continue;
-    };
-    let (has_v4, has_v6) = interface_families(iface)?;
-    let strict = (!want_v4 || has_v4) && (!want_v6 || has_v6);
-    let loose = (want_v4 && has_v4) || (want_v6 && has_v6);
-    let tier = if strict {
-      tier_base
-    } else if loose {
-      tier_base + 1
-    } else {
-      continue;
-    };
-    if best.is_none_or(|(seen, _)| tier < seen) {
-      best = Some((tier, iface.index()));
+    }
+    if best.is_none_or(|(seen, _)| reachable < seen) {
+      best = Some((reachable, index));
     }
   }
   Ok(best.map(|(_, index)| index))

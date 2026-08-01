@@ -553,10 +553,266 @@ fn the_forced_enumeration_error_is_scoped_to_one_family_and_disarms_on_drop() {
     assert!(super::has_addr_in(&iface, Family::V6).is_err());
   }
   assert!(
-    super::interface_families(&iface).is_ok(),
+    super::has_addr_in(&iface, Family::V6).is_ok(),
     "the guard must disarm the injection, or it leaks into whatever runs next \
      on this thread"
   );
+}
+
+// ── an error is retained only while it could still change the answer ─────────
+//
+// The rule above is about which failures are real; this one is about which
+// failures are relevant. An enumeration error only means something to a decision
+// that needed the answer, and two conditions settle that before the syscall is
+// made: the family has to have been requested, and the tier the candidate can
+// still reach has to outrank the interface already chosen. Propagating one that
+// meets neither is a bind refused on information it could not have used. The
+// reach narrows as a candidate's own families come back absent, so the second
+// condition is asked between its probes as well as before the first.
+//
+// The over-correction is the same defect one direction over, so the tests that
+// expect an error are the ones that must keep failing loudly: a candidate that
+// COULD have outranked the winner surfaces its error rather than being ranked as
+// a family with no address, whether it is the first probe that could have
+// decided the pick or the second.
+//
+// The walk is driven over synthetic `(tier_base, index, name)` candidates
+// because `getifs::Interface` has no constructor a test can reach, and because
+// which candidates get probed must not depend on what NICs the host happens to
+// have. The name is what a failing probe is aimed at.
+
+/// A probe that fails for `failing` and reports both families present for every
+/// other candidate, recording each call so a test can assert what was never
+/// asked.
+fn probe_failing<'a>(
+  failing: &'static str,
+  asked: &'a mut Vec<(&'static str, Family)>,
+) -> impl FnMut(&&'static str, Family) -> std::io::Result<bool> + 'a {
+  move |name, family| {
+    asked.push((name, family));
+    if *name == failing {
+      return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    Ok(true)
+  }
+}
+
+#[test]
+fn a_failure_in_a_family_nobody_requested_does_not_fail_the_pick() {
+  let mut asked = Vec::new();
+  let picked = super::rank_candidates([(0, 7, "eth0")], true, false, |name, family| {
+    asked.push((*name, family));
+    match family {
+      Family::V6 => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+      Family::V4 => Ok(true),
+    }
+  });
+  assert_eq!(
+    picked.expect("an IPv6 read the caller never asked for cannot fail an IPv4-only pick"),
+    Some(7)
+  );
+  assert_eq!(
+    asked,
+    vec![("eth0", Family::V4)],
+    "a family that was not requested must not be probed at all: the short \
+     circuit is what makes the failure unreachable rather than merely ignored"
+  );
+}
+
+#[test]
+fn a_failure_after_an_unbeatable_candidate_does_not_fail_the_pick() {
+  let mut asked = Vec::new();
+  let picked = super::rank_candidates(
+    [(0, 7, "eth0"), (0, 8, "eth1")],
+    true,
+    true,
+    probe_failing("eth1", &mut asked),
+  );
+  assert_eq!(
+    picked.expect("nothing can outrank a tier-0 winner, so nothing after it may fail the pick"),
+    Some(7),
+    "first-seen-wins within a tier: the incumbent keeps the pick"
+  );
+  assert_eq!(
+    asked,
+    vec![("eth0", Family::V4), ("eth0", Family::V6)],
+    "a candidate that cannot beat the incumbent must not be probed, or a failure \
+     with no bearing on the answer is back to aborting the bind"
+  );
+}
+
+#[test]
+fn a_failure_on_a_candidate_that_could_outrank_the_winner_still_surfaces() {
+  let mut asked = Vec::new();
+  // Loopback first, so the incumbent sits at tier 2 and the tier-0 candidate
+  // behind it genuinely could take the pick away from it.
+  let err = super::rank_candidates(
+    [(2, 1, "lo"), (0, 8, "eth0")],
+    true,
+    true,
+    probe_failing("eth0", &mut asked),
+  )
+  .expect_err(
+    "a candidate that could outrank the winner must not be ranked on an answer \
+     nobody obtained: that binds the wrong link and looks like a working \
+     responder until nothing is ever discovered",
+  );
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::PermissionDenied,
+    "the platform's own kind must be carried over, not flattened, got {err:?}"
+  );
+  assert!(
+    asked.contains(&("eth0", Family::V4)),
+    "the higher-ranked candidate must actually have been probed"
+  );
+}
+
+#[test]
+fn a_failure_after_the_first_probe_cost_the_strict_tier_does_not_fail_the_pick() {
+  let mut asked = Vec::new();
+  let picked = super::rank_candidates(
+    [(0, 7, "eth0"), (0, 8, "eth1")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        // The incumbent serves IPv4 only, so it takes the loose tier 1.
+        ("eth0", Family::V4) => Ok(true),
+        ("eth0", Family::V6) => Ok(false),
+        // The challenger has no IPv4 address either, which puts the strict
+        // tier 0 out of its reach; tier 1 only ties the incumbent, and a tie
+        // does not displace it. Its IPv6 read can no longer change the answer.
+        ("eth1", Family::V4) => Ok(false),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+      }
+    },
+  );
+  assert_eq!(
+    picked.expect(
+      "a probe whose answer can no longer beat the incumbent must not be made, let alone \
+       abort the pick"
+    ),
+    Some(7),
+    "first-seen-wins within a tier: the incumbent keeps the pick"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("eth0", Family::V4),
+      ("eth0", Family::V6),
+      ("eth1", Family::V4)
+    ],
+    "the tier a candidate can still reach is re-weighed between its own probes, not just \
+     before the first"
+  );
+}
+
+/// The reachable tier is the candidate's own base plus one, not a constant: the
+/// same walk over loopback candidates has to stop the second probe at tier 3
+/// exactly as it does at tier 1.
+#[test]
+fn the_tier_a_probe_is_weighed_against_is_the_candidates_own() {
+  let mut asked = Vec::new();
+  let picked = super::rank_candidates(
+    [(2, 1, "lo0"), (2, 9, "lo1")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("lo0", Family::V4) => Ok(true),
+        ("lo0", Family::V6) => Ok(false),
+        ("lo1", Family::V4) => Ok(false),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+      }
+    },
+  );
+  assert_eq!(
+    picked.expect(
+      "a tier-3 incumbent is no more beatable by a second tier-3 candidate than a tier-1 \
+       one is"
+    ),
+    Some(1)
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("lo0", Family::V4),
+      ("lo0", Family::V6),
+      ("lo1", Family::V4)
+    ],
+    "the loose tier a failed family leaves within reach is relative to the candidate's own \
+     base, so the second probe must be skipped here too"
+  );
+}
+
+#[test]
+fn a_failure_after_a_first_probe_that_left_the_pick_in_reach_still_surfaces() {
+  let mut asked = Vec::new();
+  // The incumbent is a loopback interface serving IPv4 only — tier 3, the worst
+  // tier there is — so the challenger's missing IPv4 still leaves it tier 1 and
+  // able to take the pick. Its IPv6 answer is the one thing left that decides
+  // the winner, and nobody obtained it.
+  let err = super::rank_candidates(
+    [(2, 1, "lo"), (0, 8, "eth0")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("lo", Family::V4) => Ok(true),
+        ("lo", Family::V6) => Ok(false),
+        ("eth0", Family::V4) => Ok(false),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+      }
+    },
+  )
+  .expect_err(
+    "skipping a probe is sound only while its answer cannot matter; here it decides the \
+     pick, and ranking the candidate as having no IPv6 address binds a link nobody read",
+  );
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::PermissionDenied,
+    "the platform's own kind must be carried over, not flattened, got {err:?}"
+  );
+  assert!(
+    asked.contains(&("eth0", Family::V6)),
+    "the probe that could still change the winner must actually have been made"
+  );
+}
+
+#[test]
+fn a_failure_in_a_disabled_family_does_not_fail_a_single_stack_bind() {
+  // Host precondition, checked before the behaviour runs. This one really opens
+  // a socket, so it takes the crate-wide bind lock; `refusal` consumes the
+  // result, closing whatever bound before the guard is released.
+  let _guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+  let Some(idx) = loopback_index() else {
+    eprintln!("skipping: no UP loopback interface reported by getifs");
+    return;
+  };
+  let opts = ServerOptions::default()
+    .with_interface_index(Some(idx))
+    .with_ipv6(false);
+  let _forced = super::force_enumeration_error_for_test(Family::V6);
+  let refusal = Sockets::bind(
+    &opts,
+    #[cfg(feature = "stats")]
+    std::sync::Arc::new(hick_trace::stats::Stats::default()),
+  )
+  .err()
+  .map(|e| format!("{e:?}"));
+  assert!(
+    !refusal.as_deref().is_some_and(|m| m.contains("IPv6")),
+    "an IPv6 enumeration error has nothing to say about an IPv4-only bind and \
+     must not refuse one, got {refusal:?}"
+  );
+  if let Some(reason) = refusal {
+    eprintln!("note: the IPv4-only loopback bind failed for an unrelated reason ({reason})");
+  }
 }
 
 // ── self-send credit accounting ─────────────────────────────────────────────
