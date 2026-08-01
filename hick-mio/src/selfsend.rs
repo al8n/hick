@@ -126,24 +126,130 @@ pub(crate) const SELF_SEND_TTL: Duration = Duration::from_secs(2);
 /// reclaim's own length is not an answer to the cap question.
 pub(crate) const MAX_SELF_SEND_ENTRIES: usize = 65536;
 
-/// How an inbound datagram's timestamp is weighed against a recorded send.
+/// How far the wall clock may disagree with the monotonic clock across a
+/// credit's window before that credit's ordering evidence is treated as
+/// unusable.
+///
+/// # What it is measuring
+///
+/// [`Credit::sent`] is the only thing that orders an echo against its send, and
+/// its wall half is not monotonic. An NTP step, a `settimeofday`, a manual clock
+/// change, or a VM suspend/resume moves it under a credit that is already
+/// waiting, and the stamp then describes a timeline the echo's kernel receive
+/// stamp was never taken on. A monotonic stamp cannot replace it — the kernel's
+/// receive stamp is itself a realtime value, so there is nothing monotonic to
+/// compare it against — so the fix is a second stamp rather than a different
+/// one: every credit carries the monotonic partner of its wall stamp, every
+/// claim reads both clocks the same way, and the difference of the two elapsed
+/// times is what the wall clock did on its own. See [`ClockPair`].
+///
+/// # Why this size
+///
+/// It must sit **above** every legitimate disagreement. A disciplined wall clock
+/// is slewed rather than stepped, at up to 500 ppm — 1 ms across
+/// [`SELF_SEND_TTL`], and 5 ms even across a ten-second caller stall — on top of
+/// each clock's own resolution and the few nanoseconds between the paired reads.
+///
+/// It must sit **below** every real step. `ntpd` slews rather than steps until
+/// the offset passes 128 ms; `settimeofday`, a manual clock change and a VM
+/// resume are larger still, usually by orders of magnitude.
+///
+/// # Accepted residual
+///
+/// A backward step smaller than this is invisible here and can still reject one
+/// echo. [`reference_ordered`]'s [`hick_udp::RX_TIMESTAMP_GRAIN`] arm absorbs
+/// the truncation-scale end of that range already, and what is left is bounded
+/// to a single credit and a single datagram. Tightening it further would buy
+/// that back at the price of degrading every claim on a merely slewed host,
+/// which is by far the more common condition.
+pub(crate) const WALL_STEP_TOLERANCE: Duration = Duration::from_millis(50);
+
+/// One reading of BOTH clocks, taken back to back.
+///
+/// The pair is the unit, and the halves are never taken apart. A wall stamp is
+/// only comparable with another wall stamp taken on the same timeline, and the
+/// monotonic partner is the only thing that can say whether that timeline held;
+/// a lone wall stamp cannot distinguish two seconds of elapsed time from a
+/// two-second step.
+///
+/// **Both ends read `wall` first and `mono` second**, which is load-bearing
+/// twice over. The nanoseconds between the two reads then have the same sign at
+/// each end and cancel in the subtraction rather than accumulating into
+/// [`WALL_STEP_TOLERANCE`]; and the monotonic read — the one [`SELF_SEND_TTL`]
+/// is measured on — stays the last thing that happens before the comparison it
+/// feeds, which is the floor [`SelfSendTracker::take`] documents.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ClockPair {
+  /// Wall clock. Ordering only — never an age, on either end of the comparison.
+  pub(crate) wall: SystemTime,
+  /// The monotonic reading taken immediately after [`ClockPair::wall`].
+  pub(crate) mono: StdInstant,
+}
+
+impl ClockPair {
+  /// Read both clocks here, wall first. The only way production reaches a
+  /// pair that was not taken from one syscall's own stamps.
+  pub(crate) fn now() -> Self {
+    Self {
+      wall: SystemTime::now(),
+      mono: StdInstant::now(),
+    }
+  }
+
+  /// Adopt two readings a caller already holds.
+  ///
+  /// The one production caller is
+  /// [`SendOutcome::credit_stamp`](crate::socket::SendOutcome::credit_stamp),
+  /// whose two stamps are read on consecutive statements immediately before the
+  /// `sendto` — which is exactly the adjacency this type needs.
+  pub(crate) const fn new(wall: SystemTime, mono: StdInstant) -> Self {
+    Self { wall, mono }
+  }
+}
+
+/// How much ordering evidence a claim actually has.
+///
+/// It is **derived, never declared**: [`SelfSendTracker::take`] settles it from
+/// whether the platform delivered a kernel receive timestamp, and
+/// [`evidence_mode`] then weakens it per credit when that credit's own wall
+/// stamp did not survive a clock step. No caller can hand in a mode, so no
+/// caller can claim ordering evidence that the inputs do not carry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MatchMode {
-  /// `reference` is a kernel receive timestamp. A datagram is ours only if it
-  /// was stamped at-or-after the recorded send — within
+  /// The reference is a kernel receive timestamp, and the credit's wall stamp
+  /// is on the same timeline it was taken on. A datagram is ours only if it was
+  /// stamped at-or-after the recorded send — within
   /// [`hick_udp::RX_TIMESTAMP_GRAIN`]. That ordering requirement is what stops
   /// a byte-identical peer datagram the kernel saw *before* our `sendto` from
   /// stealing the take-once credit. The [`SELF_SEND_TTL`] bound is applied
   /// separately, on the monotonic clock.
   Ordered,
-  /// No kernel receive timestamp was available — Windows, or a Unix kernel
-  /// that didn't deliver the timestamp cmsg — so `reference` is a userspace
-  /// read time carrying no ordering information: matching falls back to
-  /// content hash alone, still bounded by [`SELF_SEND_TTL`]. That is enough to
-  /// suppress our own loopback in the ordinary single-host case, but by
-  /// construction it cannot defend the credit-theft race that `Ordered`'s
-  /// pre-send tolerance guards against — the documented degradation on these
-  /// platforms.
+  /// There is no ordering evidence to weigh, so matching is content hash plus
+  /// family, bounded by [`SELF_SEND_TTL`], and nothing else. **The reference is
+  /// not consulted at all** — see [`reference_ordered`] for why weighing one
+  /// here could only ever reject our own echo.
+  ///
+  /// Two routes reach it, and they degrade to the same thing:
+  ///
+  /// * no kernel receive timestamp was available — Windows, or a Unix kernel
+  ///   that delivered no timestamp cmsg — so the only wall value the claim could
+  ///   offer is a userspace read time, which says nothing about when the kernel
+  ///   saw the datagram;
+  /// * the wall clock stepped between the send and the claim, so the credit's
+  ///   own wall stamp is not on the timeline the receive stamp was taken on. See
+  ///   [`WALL_STEP_TOLERANCE`].
+  ///
+  /// It is enough to suppress our own loopback in the ordinary single-host case,
+  /// but by construction it cannot defend the credit-theft race that `Ordered`
+  /// guards against. **That is the cheap direction, and it is chosen
+  /// deliberately.** A datagram that reaches a credit at all is byte-identical
+  /// to one we sent, so every record it carries has rdata identical to ours, and
+  /// RFC 6762 §9 defines a conflict as the same name, rrtype and rrclass with
+  /// *different* rdata — so swallowing it cannot swallow a conflict. It costs at
+  /// most one redundant peer datagram inside a two-second window. Rejecting our
+  /// own echo instead makes this responder raise a phantom conflict against
+  /// itself and rename under §9, and under a clock that keeps stepping it does
+  /// so repeatedly.
   Degraded,
 }
 
@@ -160,17 +266,23 @@ struct Credit {
   family: Family,
   /// FNV-1a of the datagram body.
   hash: u64,
-  /// Wall clock, read **before** the `sendto`. Used for **ordering only**: an
-  /// echo the kernel stamped at-or-after this cannot be a peer datagram that
-  /// predated our send.
+  /// Both clocks, read **before** the `sendto`. Used for **ordering only**: an
+  /// echo the kernel stamped at-or-after [`ClockPair::wall`] cannot be a peer
+  /// datagram that predated our send.
   ///
   /// EARLY is the safe direction, and pre-syscall is the only way to get it.
   /// The comparison is against the kernel's own receive stamp on the echo, so
-  /// `sent <= kernel send time <= echo rx time` must hold; a stamp read *after*
-  /// the syscall could outrun the kernel's receive stamp on a copy already
-  /// looped back, and the endpoint would ingest its own datagram as a peer's.
-  /// It is emphatically **not** an age: see [`Credit::aged_from`].
-  sent: SystemTime,
+  /// `sent.wall <= kernel send time <= echo rx time` must hold; a stamp read
+  /// *after* the syscall could outrun the kernel's receive stamp on a copy
+  /// already looped back, and the endpoint would ingest its own datagram as a
+  /// peer's. It is emphatically **not** an age: see [`Credit::aged_from`].
+  ///
+  /// [`ClockPair::mono`] is here for exactly one job and no other: it is the
+  /// wall stamp's partner, and the difference between the two elapsed times at
+  /// claim time is the only way to tell real elapsed time from a wall clock that
+  /// moved on its own. It anchors nothing — see [`WALL_STEP_TOLERANCE`] and,
+  /// again, [`Credit::aged_from`].
+  sent: ClockPair,
   /// Monotonic, and the only input to the [`SELF_SEND_TTL`] bound.
   ///
   /// `None` means "recorded since the last [`SelfSendTracker::seal`], ageing
@@ -252,7 +364,8 @@ impl SelfSendTracker {
     }
   }
 
-  /// Record that we just sent `body` on `family`, submitted at wall time `sent`.
+  /// Record that we just sent `body` on `family`, submitted at `sent` — the
+  /// send's own pre-syscall reading of both clocks.
   ///
   /// The credit starts life un-aged ([`Credit::aged_from`] is `None`): its echo
   /// cannot be claimed until the next tick's receive stage, so its clock does
@@ -301,7 +414,7 @@ impl SelfSendTracker {
   /// behind is a decision made against a stale reading — the same defect class
   /// that cost this crate seven rounds elsewhere. So the length test is not the
   /// decision: [`Self::admit`] is, and it reads the clock at itself.
-  pub(crate) fn record(&mut self, family: Family, body: &[u8], sent: SystemTime) {
+  pub(crate) fn record(&mut self, family: Family, body: &[u8], sent: ClockPair) {
     self.record_by(family, body, sent, StdInstant::now);
   }
 
@@ -318,7 +431,7 @@ impl SelfSendTracker {
     &mut self,
     family: Family,
     body: &[u8],
-    sent: SystemTime,
+    sent: ClockPair,
     sweep_now: StdInstant,
   ) {
     self.record_by(family, body, sent, move || sweep_now);
@@ -329,7 +442,7 @@ impl SelfSendTracker {
     &mut self,
     family: Family,
     body: &[u8],
-    sent: SystemTime,
+    sent: ClockPair,
     sweep_clock: impl Fn() -> StdInstant,
   ) {
     let hash = fnv1a(body);
@@ -519,10 +632,17 @@ impl SelfSendTracker {
   }
 
   /// Consume the tracker entry (if any) recorded for `family` whose content
-  /// hash matches `body`, whose recorded send is ordered before `reference` per
-  /// `mode`, and whose claim window is **still open at the instant this call
-  /// weighs it**. Returns `true` when a credit was consumed, i.e. `body` is this
-  /// endpoint's own loopback rather than a peer's datagram.
+  /// hash matches `body`, whose recorded send is ordered before `rx`, and whose
+  /// claim window is **still open at the instant this call weighs it**. Returns
+  /// `true` when a credit was consumed, i.e. `body` is this endpoint's own
+  /// loopback rather than a peer's datagram.
+  ///
+  /// `rx` is the **kernel's** receive timestamp for `body`, or `None` when the
+  /// platform delivered no timestamp cmsg. It is the whole of the ordering
+  /// evidence, and no caller supplies anything else: [`MatchMode`] is derived
+  /// from it here rather than declared, so there is no way to ask for `Ordered`
+  /// matching against a stamp that carries no order — a userspace read time
+  /// taken at the claim says nothing about when the kernel saw the datagram.
   ///
   /// # It takes no instant, and no caller can supply one
   ///
@@ -552,13 +672,23 @@ impl SelfSendTracker {
   /// left inside it to move out, so it is the floor rather than a seventh window
   /// — a later pass hunting for one here should stop at this paragraph.
   ///
-  /// # Two clocks, two questions
+  /// # Two clocks, two questions, and a third that keeps the first honest
   ///
-  /// `reference` answers *ordering* — could the kernel have seen this datagram
-  /// before we sent ours? — and is a wall stamp because that is the only clock a
-  /// kernel receive timestamp is expressed in. The age is the other question,
-  /// answered on the monotonic clock, because an age must not be a wall-clock
+  /// `rx` answers *ordering* — could the kernel have seen this datagram before
+  /// we sent ours? — and is a wall stamp because that is the only clock a kernel
+  /// receive timestamp is expressed in. The age is the other question, answered
+  /// on the monotonic clock, because an age must not be a wall-clock
   /// subtraction.
+  ///
+  /// The third question is whether the ordering answer is worth anything, and it
+  /// exists because the wall clock is not monotonic. A step between the send and
+  /// this claim leaves [`Credit::sent`]'s wall half describing a timeline `rx`
+  /// was never taken on, and the credit's own echo then looks like a peer
+  /// datagram that predated it. So every claim reads both clocks — see
+  /// [`ClockPair`] — and a credit whose two elapsed times disagree past
+  /// [`WALL_STEP_TOLERANCE`] is weighed under [`MatchMode::Degraded`] instead of
+  /// being refused. See [`evidence_mode`] for the direction that trade takes and
+  /// why.
   ///
   /// The tick's own instant is not a substitute for the live read, which is why
   /// [`Mdns::tick`](crate::Mdns::tick) keeps it for the protocol path and hands
@@ -597,59 +727,59 @@ impl SelfSendTracker {
   /// preferred over consuming the newest eligible credit: newest-first only
   /// reorders the same interchangeable set, and a third credit for the same
   /// bytes (a queued copy completing out of order) defeats it again.
-  pub(crate) fn take(
-    &mut self,
-    family: Family,
-    body: &[u8],
-    reference: SystemTime,
-    mode: MatchMode,
-  ) -> bool {
-    self.take_by(family, body, reference, mode, StdInstant::now)
+  pub(crate) fn take(&mut self, family: Family, body: &[u8], rx: Option<SystemTime>) -> bool {
+    self.take_by(family, body, rx, ClockPair::now)
   }
 
-  /// [`Self::take`] against a caller-chosen `now`, so a test can place a claim
-  /// anywhere in a credit's window without sleeping through it.
+  /// [`Self::take`] against a caller-chosen reading of both clocks, so a test can
+  /// place a claim anywhere in a credit's window without sleeping through it,
+  /// and can put the wall clock somewhere the monotonic one says it cannot be.
   ///
   /// `#[cfg(test)]`, permanently, and that gate is the entire point: production
-  /// reaches the liveness decision only through [`Self::take`], which reads the
-  /// clock itself, so there is no build in which a stale instant can be handed
+  /// reaches the liveness decision only through [`Self::take`], which reads both
+  /// clocks itself, so there is no build in which a stale reading can be handed
   /// in. Same seam as `BoundSocket::forced_recv_delays` and
   /// `Sockets::forced_no_rx_time` — a test-only door onto a decision production
   /// makes for itself.
+  ///
+  /// It is also the only deterministic way to present a wall-clock step: no test
+  /// can ask a host to run `settimeofday` under it, and the whole subject of
+  /// [`WALL_STEP_TOLERANCE`] is what a claim does when the wall clock moved
+  /// between the send and here.
   #[cfg(test)]
   pub(crate) fn take_at(
     &mut self,
     family: Family,
     body: &[u8],
-    reference: SystemTime,
-    now: StdInstant,
-    mode: MatchMode,
+    rx: Option<SystemTime>,
+    now: ClockPair,
   ) -> bool {
-    self.take_by(family, body, reference, mode, move || now)
+    self.take_by(family, body, rx, move || now)
   }
 
   /// The one body behind [`Self::take`] and [`Self::take_at`].
   ///
   /// `clock` is invoked **in the predicate**, at the [`still_live`] test of each
   /// candidate that already matched on family and content — so the production
-  /// path's read lands at the decision itself, with nothing between the two but
-  /// the comparison. Private, and taking a clock rather than an instant, so the
-  /// only way to reach it with a value fixed in advance is the `#[cfg(test)]`
-  /// door above.
+  /// path's read lands at the decision itself, with nothing between the
+  /// monotonic half and the comparison it feeds. Private, and taking a clock
+  /// rather than a reading, so the only way to reach it with a value fixed in
+  /// advance is the `#[cfg(test)]` door above.
   fn take_by(
     &mut self,
     family: Family,
     body: &[u8],
-    reference: SystemTime,
-    mode: MatchMode,
-    clock: impl Fn() -> StdInstant,
+    rx: Option<SystemTime>,
+    clock: impl Fn() -> ClockPair,
   ) -> bool {
     let needle = fnv1a(body);
     match self.entries.iter().position(|c| {
-      c.family == family
-        && c.hash == needle
-        && still_live(clock(), c.aged_from)
-        && reference_ordered(reference, c.sent, mode)
+      if c.family != family || c.hash != needle {
+        return false;
+      }
+      let now = clock();
+      still_live(now.mono, c.aged_from)
+        && reference_ordered(rx, c.sent, evidence_mode(rx, c.sent, now))
     }) {
       Some(pos) => {
         self.entries.remove(pos);
@@ -704,28 +834,100 @@ fn still_live(now: StdInstant, aged_from: Option<StdInstant>) -> bool {
   }
 }
 
-/// Whether `reference` is **ordered after** a send submitted at `sent`, per
-/// `mode`.
+/// How much ordering evidence this claim really has about **this** credit.
+///
+/// Never stronger than the platform supplied, and weaker whenever the credit's
+/// own wall stamp did not survive the window: the two elapsed times between
+/// `sent` and `now` are the same interval measured on two clocks, so their
+/// disagreement is what the wall clock did on its own, and past
+/// [`WALL_STEP_TOLERANCE`] the stamp is simply not on the timeline the kernel's
+/// receive stamp was taken on.
+///
+/// # Which way to fail, and what it costs
+///
+/// Unusable evidence has two possible readings and both cost something.
+///
+/// Reading it as *not our echo* refuses the credit, and this endpoint then
+/// ingests its own announcement as peer traffic: a phantom conflict against
+/// itself and the RFC 6762 §9 rename that follows — repeatedly, for as long as
+/// the clock keeps stepping, since each step refuses the next echo the same way.
+///
+/// Reading it as *our echo* lets a byte-identical peer datagram take the credit
+/// instead. That cannot swallow a §9 conflict: §9 defines one as the same name,
+/// rrtype and rrclass carrying *different* rdata, and a datagram that matches a
+/// credit at all is byte-identical to one we sent, so every record in it asserts
+/// exactly what we assert. What it can cost is one redundant peer datagram
+/// inside a two-second window — a duplicate announcement, or a query identical
+/// to one we just asked ourselves.
+///
+/// So the fall-back is [`MatchMode::Degraded`], which is not a new state: it is
+/// what every claim on a platform with no receive-timestamp cmsg already runs
+/// under, with the same bound and the same accepted weakness.
+fn evidence_mode(rx: Option<SystemTime>, sent: ClockPair, now: ClockPair) -> MatchMode {
+  match rx {
+    // No kernel receive timestamp: nothing to order against in the first place.
+    None => MatchMode::Degraded,
+    // The wall clock moved on its own inside this credit's window, so its
+    // pre-syscall stamp cannot be compared with a receive stamp any more.
+    Some(_) if wall_stepped(sent, now) => MatchMode::Degraded,
+    Some(_) => MatchMode::Ordered,
+  }
+}
+
+/// Whether the wall clock moved on its own — in **either** direction — between
+/// the send at `sent` and the claim at `now`.
+///
+/// Both readings pair a wall stamp with a monotonic one taken immediately after
+/// it, so the two elapsed times measure the same interval. Real elapsed time is
+/// the monotonic one; everything the wall one does beyond it is the step. A
+/// merely slewed clock stays well inside [`WALL_STEP_TOLERANCE`] — see there.
+fn wall_stepped(sent: ClockPair, now: ClockPair) -> bool {
+  // `saturating_duration_since` reads a `now` before the send as zero elapsed.
+  // That can only make the disagreement look larger, and a larger disagreement
+  // degrades — which is the cheap direction. See `evidence_mode`.
+  let elapsed = now.mono.saturating_duration_since(sent.mono);
+  match now.wall.duration_since(sent.wall) {
+    // The wall clock is still ahead of the send. Whatever it did beyond real
+    // elapsed time, in either direction, is the step.
+    Ok(advanced) => advanced.abs_diff(elapsed) > WALL_STEP_TOLERANCE,
+    // The wall clock now reads BEFORE the send it stamped, which no amount of
+    // elapsed time can produce. The step is that gap plus every bit of real time
+    // that passed while the clock was travelling the other way.
+    Err(behind) => behind.duration().saturating_add(elapsed) > WALL_STEP_TOLERANCE,
+  }
+}
+
+/// Whether a kernel receive stamp of `rx` is **ordered after** a send submitted
+/// at `sent`, given the evidence `mode` says this claim actually has.
 ///
 /// Ordering only. It deliberately does not bound how far after — that is
 /// [`still_live`]'s job, on the monotonic clock, and unifying the two is the
-/// defect this split exists to prevent: `sent` is read before the syscall, so
-/// any stall between the read and the kernel accepting the datagram would be
+/// defect this split exists to prevent: `sent.wall` is read before the syscall,
+/// so any stall between the read and the kernel accepting the datagram would be
 /// charged to a TTL measured from it, and a stall past [`SELF_SEND_TTL`] would
 /// make the endpoint ingest its own echo as peer traffic.
 ///
-/// `Degraded` does not blanket-accept a reference before `sent` — a read-time
-/// reference is always at-or-after the send in practice, so that arm is only
-/// a clock-went-backwards guard.
-fn reference_ordered(reference: SystemTime, sent: SystemTime, mode: MatchMode) -> bool {
-  match reference.duration_since(sent) {
-    // Reference at-or-after the send: correctly ordered to be our own echo.
+/// [`MatchMode::Degraded`] weighs nothing here, and the missing test is the
+/// point rather than an omission. The only wall value a degraded claim could
+/// offer is a userspace read time, which is at-or-after the send in every case
+/// except one — a wall clock that stepped backwards — so an ordering test
+/// against it can only ever fire on the step, and firing means refusing our own
+/// echo. That is the expensive direction; see [`evidence_mode`].
+fn reference_ordered(rx: Option<SystemTime>, sent: ClockPair, mode: MatchMode) -> bool {
+  // `Ordered` is only ever derived from a `Some`, so the absent-stamp arm here
+  // is unreachable; it answers `true` rather than panicking, which is the
+  // direction [`evidence_mode`] takes for missing evidence anyway.
+  let (MatchMode::Ordered, Some(rx)) = (mode, rx) else {
+    return true;
+  };
+  match rx.duration_since(sent.wall) {
+    // Receive stamp at-or-after the send: correctly ordered to be our echo.
     Ok(_) => true,
-    // Reference BEFORE the send. Only ordered mode tolerates it, and only
-    // within this target's receive-timestamp truncation grain — that ordering
-    // is exactly what stops a byte-identical peer datagram the kernel saw
-    // before our sendto from stealing the take-once credit.
-    Err(behind) => mode == MatchMode::Ordered && behind.duration() <= hick_udp::RX_TIMESTAMP_GRAIN,
+    // Receive stamp BEFORE the send, tolerated only within this target's
+    // receive-timestamp truncation grain — that ordering is exactly what stops a
+    // byte-identical peer datagram the kernel saw before our sendto from
+    // stealing the take-once credit.
+    Err(behind) => behind.duration() <= hick_udp::RX_TIMESTAMP_GRAIN,
   }
 }
 

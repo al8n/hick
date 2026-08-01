@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant as StdInstant, SystemTime};
 
-use super::{Credit, MAX_SELF_SEND_ENTRIES, MatchMode, SELF_SEND_TTL, SelfSendTracker, fnv1a};
+use super::{
+  ClockPair, Credit, MAX_SELF_SEND_ENTRIES, SELF_SEND_TTL, SelfSendTracker, WALL_STEP_TOLERANCE,
+  fnv1a,
+};
 use crate::socket::Family;
 
 /// A fixed wall instant to build ordering fixtures from. Ordering is all this
@@ -19,19 +22,31 @@ fn mono() -> StdInstant {
   StdInstant::now()
 }
 
-/// Record `body` and open its claim window at `at`, which is what one turn of
-/// the driver's loop does: the send stage records, and the **next** tick's top
-/// seals. Every test whose subject is not the seal itself goes through this, so
-/// none of them depends on the unsealed state by accident.
-fn recorded_and_sealed(
-  t: &mut SelfSendTracker,
-  family: Family,
-  body: &[u8],
-  sent: SystemTime,
-  at: StdInstant,
-) {
+/// One send's own pre-syscall reading of both clocks, exactly as
+/// `BoundSocket::send_attempt` takes it: the wall stamp, and the monotonic
+/// partner read immediately after.
+fn send_stamps() -> ClockPair {
+  ClockPair::new(wall(), mono())
+}
+
+/// A claim landing `after` the send, on **both** clocks at once — a run in which
+/// the wall clock did nothing but keep up with the monotonic one.
+///
+/// Every test that is not about a clock step goes through this, so none of them
+/// falls back to content-only matching by accident and quietly stops exercising
+/// the ordering rule it was written for.
+fn claim(sent: ClockPair, after: Duration) -> ClockPair {
+  ClockPair::new(sent.wall + after, sent.mono + after)
+}
+
+/// Record `body` with the send stamps `sent` and open its claim window at
+/// `sent.mono`, which is what one turn of the driver's loop does: the send stage
+/// records, and the **next** tick's top seals. Every test whose subject is not
+/// the seal itself goes through this, so none of them depends on the unsealed
+/// state by accident.
+fn recorded_and_sealed(t: &mut SelfSendTracker, family: Family, body: &[u8], sent: ClockPair) {
   t.record(family, body, sent);
-  t.seal_at(at);
+  t.seal_at(sent.mono);
 }
 
 #[test]
@@ -43,98 +58,88 @@ fn hash_is_content_addressed() {
 #[test]
 fn take_once_consumes_the_credit() {
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
-  let rx = sent + Duration::from_millis(1);
-  assert!(t.take_at(Family::V4, b"payload", rx, at, MatchMode::Ordered));
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
+  let rx = Some(sent.wall + Duration::from_millis(1));
+  let now = claim(sent, Duration::from_millis(1));
+  assert!(t.take_at(Family::V4, b"payload", rx, now));
   // Second identical datagram is a genuine peer packet: no credit left.
-  assert!(!t.take_at(Family::V4, b"payload", rx, at, MatchMode::Ordered));
+  assert!(!t.take_at(Family::V4, b"payload", rx, now));
 }
 
 #[test]
 fn ordered_mode_rejects_a_packet_stamped_before_our_send() {
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
   // Kernel stamped this BEFORE we sent -> cannot be our loopback.
-  let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(9);
-  assert!(!t.take_at(Family::V4, b"payload", earlier, at, MatchMode::Ordered));
+  let earlier = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(9));
+  assert!(!t.take_at(Family::V4, b"payload", earlier, sent));
   // The credit must survive for the real loopback copy.
   assert!(t.take_at(
     Family::V4,
     b"payload",
-    sent + Duration::from_millis(1),
-    at,
-    MatchMode::Ordered
+    Some(sent.wall + Duration::from_millis(1)),
+    sent
   ));
 }
 
+/// Degraded matching is content plus family plus the TTL, and **nothing else**.
+///
+/// It used to additionally require the reference to be at-or-after the send,
+/// described as a clock-went-backwards guard, and that description is the whole
+/// problem: the only wall value a degraded claim ever has is a userspace read
+/// time, which is at-or-after the send in every case *except* a wall clock that
+/// stepped backwards. So the guard could fire on nothing but the step, and
+/// firing meant refusing our own echo — a phantom conflict against ourselves and
+/// the RFC 6762 §9 rename that follows. There is no reference to weigh here now,
+/// which is why the mode takes none.
 #[test]
-fn degraded_mode_still_rejects_a_reference_before_the_send() {
-  // Degraded does NOT blanket-accept. A read-time reference is always
-  // at-or-after the send in practice, so a reference that predates it means the
-  // clock moved backwards -- reject, matching hick-compio/hick-reactor.
+fn degraded_matching_weighs_no_reference_at_all() {
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
-  let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(9);
-  assert!(!t.take_at(Family::V4, b"payload", earlier, at, MatchMode::Degraded));
-  // The credit must survive for the genuine loopback copy.
-  assert!(t.take_at(Family::V4, b"payload", sent, at, MatchMode::Degraded));
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
+  // The wall clock stepped ten seconds backwards between the send and here.
+  // Nothing about that changes whether these bytes are the copy we just sent.
+  let stepped_back = ClockPair::new(sent.wall - Duration::from_secs(10), sent.mono);
+  assert!(t.take_at(Family::V4, b"payload", None, stepped_back));
+  assert_eq!(t.len(), 0, "and it stays take-once, as in every other mode");
 }
 
 #[test]
 fn ordered_mode_tolerates_only_the_timestamp_grain() {
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
   // One nanosecond past the grain is outside the truncation tolerance. This is
   // meaningful on both target classes without a `cfg`: on a nanosecond-grain
-  // target (grain == ZERO) it is 1ns before `sent`, landing in the branch
-  // Ordered shares with Degraded; on a microsecond-grain target it is 1ns
-  // past the 1us tolerance. Either way it must not match, so this exercises
-  // the grain comparison itself rather than only ever hitting the trivial
+  // target (grain == ZERO) it is 1ns before the send, landing in the branch that
+  // only the grain comparison can save; on a microsecond-grain target it is 1ns
+  // past the 1us tolerance. Either way it must not match, so this exercises the
+  // grain comparison itself rather than only ever hitting the trivial
   // at-or-after-send case.
-  let just_outside_grain = sent - super::RX_GRAIN_FOR_TEST - Duration::from_nanos(1);
-  assert!(!t.take_at(
-    Family::V4,
-    b"payload",
-    just_outside_grain,
-    at,
-    MatchMode::Ordered
-  ));
+  let just_outside_grain = sent.wall - super::RX_GRAIN_FOR_TEST - Duration::from_nanos(1);
+  assert!(!t.take_at(Family::V4, b"payload", Some(just_outside_grain), sent));
   // Exactly one grain early is inside the truncation tolerance.
-  let within = sent - super::RX_GRAIN_FOR_TEST;
-  assert!(t.take_at(Family::V4, b"payload", within, at, MatchMode::Ordered));
+  let within = sent.wall - super::RX_GRAIN_FOR_TEST;
+  assert!(t.take_at(Family::V4, b"payload", Some(within), sent));
   // A full second early is a peer packet the kernel saw before our sendto.
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
-  let way_early = SystemTime::UNIX_EPOCH + Duration::from_secs(9);
-  assert!(!t.take_at(Family::V4, b"payload", way_early, at, MatchMode::Ordered));
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
+  let way_early = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(9));
+  assert!(!t.take_at(Family::V4, b"payload", way_early, sent));
 }
 
 #[test]
 fn a_credit_older_than_the_ttl_is_a_peer_not_our_echo() {
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
   // Byte-identical and correctly ordered, but the credit has been waiting
   // longer than SELF_SEND_TTL -> a co-resident peer, not our echo.
-  let late = at + SELF_SEND_TTL + Duration::from_millis(1);
-  assert!(!t.take_at(
-    Family::V4,
-    b"payload",
-    sent + Duration::from_secs(3),
-    late,
-    MatchMode::Degraded
-  ));
+  let late = claim(sent, SELF_SEND_TTL + Duration::from_millis(1));
+  assert!(!t.take_at(Family::V4, b"payload", None, late));
   // Exactly at the TTL it still matches.
-  assert!(t.take_at(
-    Family::V4,
-    b"payload",
-    sent + Duration::from_secs(2),
-    at + SELF_SEND_TTL,
-    MatchMode::Degraded
-  ));
+  assert!(t.take_at(Family::V4, b"payload", None, claim(sent, SELF_SEND_TTL)));
 }
 
 #[test]
@@ -145,24 +150,167 @@ fn the_ttl_upper_bound_applies_to_ordered_mode_too() {
   // all of them while swallowing a co-resident peer's byte-identical datagram,
   // hours later, as our own echo.
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
-  let expired = at + SELF_SEND_TTL + Duration::from_millis(1);
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
+  let expired = claim(sent, SELF_SEND_TTL + Duration::from_millis(1));
   assert!(!t.take_at(
     Family::V4,
     b"payload",
-    sent + Duration::from_secs(3),
-    expired,
-    MatchMode::Ordered
+    Some(sent.wall + Duration::from_secs(3)),
+    expired
   ));
   // Inside the window it still matches.
   assert!(t.take_at(
     Family::V4,
     b"payload",
-    sent + Duration::from_secs(2),
-    at + SELF_SEND_TTL,
-    MatchMode::Ordered
+    Some(sent.wall + Duration::from_secs(2)),
+    claim(sent, SELF_SEND_TTL)
   ));
+}
+
+// ── the wall clock is not monotonic, and ordering runs on it ────────────────
+//
+// `Credit::sent`'s wall half is the only thing that orders an echo against its
+// send, and an NTP step, a `settimeofday`, or a VM suspend/resume moves it under
+// a credit that is already waiting. These four pin what each of the two clocks
+// can and cannot see about that, and which way the claim falls when the wall
+// stamp is no longer on the timeline the kernel's receive stamp was taken on.
+
+/// The expensive direction, and the one this pair of stamps exists for.
+///
+/// The wall clock steps backwards right after the send, so the kernel stamps our
+/// own echo *before* the credit that produced it. Weighed on the wall clock
+/// alone the echo is a peer datagram that predated our send, and this endpoint
+/// ingests its own announcement as peer traffic — a phantom conflict against
+/// itself and the RFC 6762 §9 rename that follows. The monotonic partner is what
+/// says the interval was 300 microseconds and not minus five seconds.
+#[test]
+fn a_backwards_wall_step_after_the_send_must_not_reject_our_own_echo() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"announcement", sent);
+  const STEP: Duration = Duration::from_secs(5);
+  // The kernel stamps the loopback copy 200us of REAL time after the send, on a
+  // wall clock that has since moved five seconds backwards.
+  let rx = Some(sent.wall - STEP + Duration::from_micros(200));
+  // The claim reads both clocks 300us of real time after the send.
+  let now = ClockPair::new(
+    sent.wall - STEP + Duration::from_micros(300),
+    sent.mono + Duration::from_micros(300),
+  );
+  assert!(
+    t.take_at(Family::V4, b"announcement", rx, now),
+    "the two elapsed times disagree by five seconds, so the wall stamp is not on \
+     the timeline the receive stamp was taken on and cannot order anything — \
+     refusing the credit here is a phantom conflict against ourselves"
+  );
+}
+
+/// The same machinery, the other direction, so a one-sided implementation fails.
+///
+/// A forward step makes a datagram the kernel saw *before* our send look ordered
+/// after it, and the credit is given up the same way. That direction is the
+/// cheap one: a datagram that reaches a credit at all is byte-identical to one
+/// we sent, so every record in it carries rdata identical to ours, and RFC 6762
+/// §9 defines a conflict as the same name, rrtype and rrclass with *different*
+/// rdata. What it can cost is one redundant peer datagram inside the TTL window.
+#[test]
+fn a_forward_wall_step_after_the_send_also_gives_up_the_ordering_evidence() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"announcement", sent);
+  // A datagram the kernel stamped a full second before our send.
+  let rx = Some(sent.wall - Duration::from_secs(1));
+  // The wall clock jumped five seconds forward while one millisecond of real
+  // time passed.
+  let now = ClockPair::new(
+    sent.wall + Duration::from_secs(5),
+    sent.mono + Duration::from_millis(1),
+  );
+  assert!(
+    t.take_at(Family::V4, b"announcement", rx, now),
+    "a five-second forward jump in one millisecond of real time is a step, and a \
+     stepped wall stamp orders nothing in either direction"
+  );
+}
+
+/// A disagreement inside the tolerance is a slewed clock, not a stepped one, and
+/// the ordering rule must survive it intact.
+///
+/// Without this, "treat unusable evidence as our echo" degenerates into treating
+/// *every* claim as our echo, and the credit-theft guard `Ordered` exists for is
+/// gone on every host whose clock is disciplined at all.
+#[test]
+fn a_disagreement_inside_the_tolerance_keeps_the_ordering_evidence() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"announcement", sent);
+  // The wall clock ran a little ahead of real elapsed time, by less than the
+  // tolerance: a slew, which is what a disciplined clock does.
+  let now = ClockPair::new(
+    sent.wall + WALL_STEP_TOLERANCE - Duration::from_millis(1),
+    sent.mono + Duration::from_millis(1),
+  );
+  assert!(
+    !t.take_at(
+      Family::V4,
+      b"announcement",
+      Some(sent.wall - Duration::from_secs(1)),
+      now
+    ),
+    "the evidence is still good, so a datagram the kernel saw before our send \
+     must not take the credit"
+  );
+  assert!(
+    t.take_at(
+      Family::V4,
+      b"announcement",
+      Some(sent.wall + Duration::from_micros(200)),
+      now
+    ),
+    "and our own echo still claims it"
+  );
+}
+
+/// What a credit's own two stamps can and cannot see, stated as a test.
+///
+/// They bracket exactly one interval — the send to the claim — so a step that
+/// landed *before* the send leaves no trace in them at all, and the credit is
+/// weighed with full ordering evidence. That is right for the echo (both the
+/// credit and the receive stamp are on the post-step timeline), and it leaves
+/// one direction open: a byte-identical peer datagram the kernel queued before
+/// the step now looks ordered after our send and can take the credit. That is
+/// the cheap direction — byte-identical means identical rdata, which RFC 6762 §9
+/// does not call a conflict — and closing it needs evidence this type does not
+/// have: a paired reading taken *before* the send, held across the tick, for the
+/// record to bracket the send against.
+#[test]
+fn a_step_before_the_send_leaves_the_credits_own_window_clean() {
+  let mut t = SelfSendTracker::new();
+  // The clock stepped, and only then did we send: both stamps are already on the
+  // post-step timeline, and so is everything after.
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"announcement", sent);
+  let now = claim(sent, Duration::from_millis(1));
+  assert!(
+    !t.take_at(
+      Family::V4,
+      b"announcement",
+      Some(sent.wall - Duration::from_secs(1)),
+      now
+    ),
+    "nothing stepped inside this credit's window, so the ordering rule is intact \
+     and a datagram stamped before our send is a peer's"
+  );
+  assert!(
+    t.take_at(
+      Family::V4,
+      b"announcement",
+      Some(sent.wall + Duration::from_micros(200)),
+      now
+    ),
+    "and our own echo, stamped on the same post-step timeline, still claims it"
+  );
 }
 
 // ── where the window starts, and where it does not ──────────────────────────
@@ -179,16 +327,16 @@ fn the_ttl_upper_bound_applies_to_ordered_mode_too() {
 /// A credit is recorded and *nothing* about the driver's own tick can expire
 /// it — not a syscall that stalled past the TTL before returning, not a later
 /// send in the same tick, not the time the outbound stages took. The tracker is
-/// handed no send instant at all, so there is no anchor available for that
+/// handed no ageing anchor at all, so there is no anchor available for that
 /// stretch to be charged to. The window opens when the seal opens it.
 #[test]
 fn an_unsealed_credit_cannot_expire_however_long_the_recording_tick_ran() {
   let mut t = SelfSendTracker::new();
-  let sent = wall();
+  let sent = send_stamps();
   t.record(Family::V4, b"announcement", sent);
   // Whatever this tick then did — a stalled syscall, a fan-out to the other
   // family, a stage-7 goodbye — it ran well past the TTL.
-  let much_later = mono() + SELF_SEND_TTL + Duration::from_secs(5);
+  let much_later = claim(sent, SELF_SEND_TTL + Duration::from_secs(5));
   assert_eq!(
     t.len(),
     1,
@@ -199,31 +347,24 @@ fn an_unsealed_credit_cannot_expire_however_long_the_recording_tick_ran() {
   // stage today, so nothing unsealed is visible to a `take`. It must be live
   // anyway — a credit with no claim opportunity yet has nothing to have
   // outlived.
-  assert!(t.take_at(
-    Family::V4,
-    b"announcement",
-    sent + Duration::from_secs(7),
-    much_later,
-    MatchMode::Degraded
-  ));
+  assert!(t.take_at(Family::V4, b"announcement", None, much_later));
 }
 
 #[test]
 fn the_seal_starts_an_unsealed_credit_at_age_zero() {
   let mut t = SelfSendTracker::new();
-  let sent = wall();
+  let sent = send_stamps();
   t.record(Family::V4, b"announcement", sent);
   // The recording tick ran long. The seal that follows is the credit's first
   // claim opportunity, so its age there is zero and the full TTL is ahead of it.
-  let top = mono() + SELF_SEND_TTL + Duration::from_secs(5);
-  t.seal_at(top);
+  let opened = SELF_SEND_TTL + Duration::from_secs(5);
+  t.seal_at(sent.mono + opened);
   assert!(
     t.take_at(
       Family::V4,
       b"announcement",
-      sent + Duration::from_secs(9),
-      top + SELF_SEND_TTL,
-      MatchMode::Degraded
+      None,
+      claim(sent, opened + SELF_SEND_TTL)
     ),
     "a sealed credit gets the whole TTL measured from the seal, not a remainder \
      of it measured from the send"
@@ -247,17 +388,11 @@ fn the_seal_starts_an_unsealed_credit_at_age_zero() {
 #[test]
 fn a_stall_inside_the_seal_cannot_expire_the_batch_that_seal_opens() {
   let mut t = SelfSendTracker::new();
-  let sent = wall();
-  t.record(Family::V4, b"announcement", sent);
+  t.record(Family::V4, b"announcement", send_stamps());
   t.pause_next_seal_for_test(STALL_PAST_TTL);
   t.seal();
   assert!(
-    t.take(
-      Family::V4,
-      b"announcement",
-      sent + Duration::from_secs(3),
-      MatchMode::Degraded
-    ),
+    t.take(Family::V4, b"announcement", None),
     "the whole of the seal's pre-claim work happens before the anchor is read, \
      so a credit recorded by the previous tick is claimable however long that \
      work took — anchoring it at the reading the sweep already spent hands a \
@@ -272,12 +407,12 @@ fn recording_sweeps_nothing() {
   // a second fan-out or a stage-7 goodbye later in the same tick could evict a
   // credit whose echo had not yet had one opportunity to claim it.
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"earlier", sent, at);
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"earlier", sent);
   t.record(Family::V4, b"later", sent);
   assert_eq!(t.len(), 2, "a record must never evict anything");
   assert!(
-    t.take_at(Family::V4, b"earlier", sent, at, MatchMode::Degraded),
+    t.take_at(Family::V4, b"earlier", None, sent),
     "the earlier credit is untouched by the later record"
   );
 }
@@ -287,16 +422,16 @@ fn sealing_sweeps_entries_older_than_the_ttl() {
   // Eviction is by TTL relative to the tick that is opening a claim window, not
   // by ring position and not by the arrival of another send.
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"stale", sent, at);
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"stale", sent);
   assert_eq!(t.len(), 1);
   t.record(Family::V4, b"fresh", sent);
-  let much_later = at + SELF_SEND_TTL + Duration::from_secs(1);
-  t.seal_at(much_later);
+  let much_later = claim(sent, SELF_SEND_TTL + Duration::from_secs(1));
+  t.seal_at(much_later.mono);
   // The stale entry was swept by the seal, not merely outvoted.
   assert_eq!(t.len(), 1);
-  assert!(!t.take_at(Family::V4, b"stale", sent, much_later, MatchMode::Degraded));
-  assert!(t.take_at(Family::V4, b"fresh", sent, much_later, MatchMode::Degraded));
+  assert!(!t.take_at(Family::V4, b"stale", None, much_later));
+  assert!(t.take_at(Family::V4, b"fresh", None, much_later));
 }
 
 /// The upper end of the invariant, and the reason the seal uses
@@ -316,23 +451,17 @@ fn sealing_sweeps_entries_older_than_the_ttl() {
 #[test]
 fn a_caller_gap_after_the_seal_still_expires_the_credit() {
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
   // The caller went away for longer than the TTL and came back. The credit's
-  // window opened at `at` and has now run out.
-  let after_the_gap = at + SELF_SEND_TTL + Duration::from_millis(1);
+  // window opened at the send's own instant and has now run out.
+  let after_the_gap = claim(sent, SELF_SEND_TTL + Duration::from_millis(1));
   assert!(
-    !t.take_at(
-      Family::V4,
-      b"payload",
-      sent + Duration::from_secs(3),
-      after_the_gap,
-      MatchMode::Degraded
-    ),
+    !t.take_at(Family::V4, b"payload", None, after_the_gap),
     "elapsed time after the first claim opportunity is charged in full, or the \
      false-suppression bound is not a bound at all"
   );
-  t.seal_at(after_the_gap);
+  t.seal_at(after_the_gap.mono);
   assert_eq!(
     t.len(),
     0,
@@ -344,9 +473,9 @@ fn a_caller_gap_after_the_seal_still_expires_the_credit() {
 #[test]
 fn non_matching_body_is_never_taken() {
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
-  assert!(!t.take_at(Family::V4, b"other", sent, at, MatchMode::Degraded));
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
+  assert!(!t.take_at(Family::V4, b"other", None, sent));
 }
 
 /// The dual-stack echo race, deterministically.
@@ -360,27 +489,27 @@ fn non_matching_body_is_never_taken() {
 #[test]
 fn an_ipv6_echo_read_first_cannot_steal_the_ipv4_credit() {
   let mut t = SelfSendTracker::new();
-  let v4_sent = wall();
-  // Ordered, distinct WALL stamps: the fan-out is two syscalls, IPv4 first, and
+  let v4_sent = send_stamps();
+  // Ordered, distinct stamps: the fan-out is two syscalls, IPv4 first, and
   // ordering is the only thing that still distinguishes them. Both credits are
   // recorded in one tick and share the next tick's seal, so neither ages ahead
   // of the other.
-  let v6_sent = v4_sent + Duration::from_millis(5);
+  let v6_sent = claim(v4_sent, Duration::from_millis(5));
   t.record(Family::V4, b"announcement", v4_sent);
   t.record(Family::V6, b"announcement", v6_sent);
-  let top = mono();
-  t.seal_at(top);
+  let top = claim(v4_sent, Duration::from_millis(10));
+  t.seal_at(top.mono);
 
   // The rotor reads IPv6 first. Its kernel stamp is at-or-after the IPv6 send
   // but AFTER the IPv4 send too, so both credits look eligible on content.
-  let v6_rx = v6_sent + Duration::from_micros(50);
-  assert!(t.take_at(Family::V6, b"announcement", v6_rx, top, MatchMode::Ordered));
+  let v6_rx = Some(v6_sent.wall + Duration::from_micros(50));
+  assert!(t.take_at(Family::V6, b"announcement", v6_rx, top));
 
   // The IPv4 echo now arrives, stamped between the two sends — before the IPv6
   // credit. It matches only because its own credit is still there.
-  let v4_rx = v4_sent + Duration::from_micros(50);
+  let v4_rx = Some(v4_sent.wall + Duration::from_micros(50));
   assert!(
-    t.take_at(Family::V4, b"announcement", v4_rx, top, MatchMode::Ordered),
+    t.take_at(Family::V4, b"announcement", v4_rx, top),
     "the IPv4 echo must find its own credit, not one already spent by IPv6"
   );
   assert_eq!(t.len(), 0, "both credits are spent exactly once");
@@ -392,11 +521,11 @@ fn an_ipv6_echo_read_first_cannot_steal_the_ipv4_credit() {
 #[test]
 fn a_credit_is_not_visible_to_the_other_family() {
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V4, b"payload", sent, at);
-  let rx = sent + Duration::from_millis(1);
-  assert!(!t.take_at(Family::V6, b"payload", rx, at, MatchMode::Ordered));
-  assert!(t.take_at(Family::V4, b"payload", rx, at, MatchMode::Ordered));
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
+  let rx = Some(sent.wall + Duration::from_millis(1));
+  assert!(!t.take_at(Family::V6, b"payload", rx, sent));
+  assert!(t.take_at(Family::V4, b"payload", rx, sent));
 }
 
 #[test]
@@ -409,27 +538,21 @@ fn a_backwards_wall_clock_step_cannot_evict_or_expire_a_credit() {
   // than over-retaining one: it makes the responder treat its own loopback as a
   // peer and raise a phantom conflict against itself.
   let mut t = SelfSendTracker::new();
-  let later = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
-  let first_at = mono();
-  recorded_and_sealed(&mut t, Family::V4, b"already-recorded", later, first_at);
+  let first = ClockPair::new(SystemTime::UNIX_EPOCH + Duration::from_secs(20), mono());
+  recorded_and_sealed(&mut t, Family::V4, b"already-recorded", first);
   // The clock stepped backwards: this send's WALL stamp predates the entry
   // above by ten seconds, while the seal that follows it is a millisecond after.
-  let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-  let second_at = first_at + Duration::from_millis(1);
-  recorded_and_sealed(
-    &mut t,
-    Family::V4,
-    b"clock-stepped-back",
-    earlier,
-    second_at,
+  let second = ClockPair::new(
+    SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+    first.mono + Duration::from_millis(1),
   );
+  recorded_and_sealed(&mut t, Family::V4, b"clock-stepped-back", second);
   assert_eq!(t.len(), 2, "a wall-clock step must not sweep a live credit");
   assert!(t.take_at(
     Family::V4,
     b"already-recorded",
-    later,
-    second_at,
-    MatchMode::Degraded
+    None,
+    ClockPair::new(first.wall, second.mono)
   ));
 }
 
@@ -438,10 +561,10 @@ fn a_backwards_wall_clock_step_cannot_evict_or_expire_a_credit() {
 #[test]
 fn a_credit_matches_only_the_body_it_fingerprints() {
   let mut t = SelfSendTracker::new();
-  let (sent, at) = (wall(), mono());
-  recorded_and_sealed(&mut t, Family::V6, b"announcement", sent, at);
-  assert!(!t.take_at(Family::V6, b"other", sent, at, MatchMode::Degraded));
-  assert!(t.take_at(Family::V6, b"announcement", sent, at, MatchMode::Degraded));
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V6, b"announcement", sent);
+  assert!(!t.take_at(Family::V6, b"other", None, sent));
+  assert!(t.take_at(Family::V6, b"announcement", None, sent));
 }
 
 /// A stall longer than [`SELF_SEND_TTL`], slept for real.
@@ -461,7 +584,7 @@ const STALL_PAST_TTL: Duration = SELF_SEND_TTL.saturating_add(Duration::from_mil
 /// `MAX_SELF_SEND_ENTRIES` times, so each fixture states the shape it wants
 /// rather than arriving at it, and only the single `record()` call under test
 /// exercises the cap logic.
-fn full_tracker(sent: SystemTime, aged_from: Option<StdInstant>) -> SelfSendTracker {
+fn full_tracker(sent: ClockPair, aged_from: Option<StdInstant>) -> SelfSendTracker {
   SelfSendTracker {
     entries: (0..MAX_SELF_SEND_ENTRIES)
       .map(|i| Credit {
@@ -486,11 +609,12 @@ fn full_tracker(sent: SystemTime, aged_from: Option<StdInstant>) -> SelfSendTrac
 /// a phantom conflict against itself.
 #[test]
 fn the_cap_reclaims_dead_credits_rather_than_refusing_a_new_one() {
-  let sent = wall();
-  let mut t = full_tracker(sent, Some(mono()));
+  let sent = send_stamps();
+  let mut t = full_tracker(sent, Some(sent.mono));
   // The tick ran on past the TTL after the seal that anchored every one of them.
   std::thread::sleep(STALL_PAST_TTL);
-  t.record(Family::V4, b"later-in-the-same-tick", sent);
+  let later = ClockPair::now();
+  t.record(Family::V4, b"later-in-the-same-tick", later);
   assert_eq!(
     t.len(),
     1,
@@ -504,9 +628,8 @@ fn the_cap_reclaims_dead_credits_rather_than_refusing_a_new_one() {
     t.take_at(
       Family::V4,
       b"later-in-the-same-tick",
-      sent,
-      top,
-      MatchMode::Degraded
+      None,
+      ClockPair::new(later.wall, top)
     ),
     "a tracker full of dead credits must not crowd out a live send's echo \
      suppression"
@@ -522,27 +645,21 @@ fn the_cap_reclaims_dead_credits_rather_than_refusing_a_new_one() {
 /// `MAX_SELF_SEND_ENTRIES` of them.
 #[test]
 fn the_cap_never_reclaims_an_unsealed_credit() {
-  let sent = wall();
+  let sent = send_stamps();
   let mut t = full_tracker(sent, None);
   // Long enough that ageing these against the live clock would evict every one.
   std::thread::sleep(STALL_PAST_TTL);
-  t.record(Family::V4, b"one-too-many", sent);
+  t.record(Family::V4, b"one-too-many", ClockPair::now());
   assert_eq!(
     t.len(),
     MAX_SELF_SEND_ENTRIES,
     "an unsealed credit has no window open and no age; elapsed time cannot \
      reclaim it, so the cap is still full and the NEW entry is what goes"
   );
-  let now = StdInstant::now();
-  assert!(!t.take_at(Family::V4, b"one-too-many", sent, now, MatchMode::Degraded));
+  let now = ClockPair::now();
+  assert!(!t.take_at(Family::V4, b"one-too-many", None, now));
   assert!(
-    t.take_at(
-      Family::V4,
-      &0u64.to_be_bytes(),
-      sent,
-      now,
-      MatchMode::Degraded
-    ),
+    t.take_at(Family::V4, &0u64.to_be_bytes(), None, now),
     "and the first-seeded credit is still there: the cap never evicts to make \
      room"
   );
@@ -550,10 +667,10 @@ fn the_cap_never_reclaims_an_unsealed_credit() {
 
 #[test]
 fn the_entry_cap_drops_the_new_entry_not_the_oldest() {
-  let (sent, at) = (wall(), mono());
+  let sent = send_stamps();
   // Full of credits that are sealed and still well inside their TTL: the
   // reclaim finds nothing to take, so this is the cap rule on its own.
-  let mut t = full_tracker(sent, Some(at));
+  let mut t = full_tracker(sent, Some(sent.mono));
   assert_eq!(t.len(), MAX_SELF_SEND_ENTRIES);
   t.record(Family::V4, b"one-too-many", sent);
   // One more record() leaves len() at the cap: the new entry was dropped.
@@ -562,15 +679,9 @@ fn the_entry_cap_drops_the_new_entry_not_the_oldest() {
     MAX_SELF_SEND_ENTRIES,
     "the cap drops the NEW entry"
   );
-  assert!(!t.take_at(Family::V4, b"one-too-many", sent, at, MatchMode::Degraded));
+  assert!(!t.take_at(Family::V4, b"one-too-many", None, sent));
   // The first-seeded entry is still present — the oldest is NOT evicted.
-  assert!(t.take_at(
-    Family::V4,
-    &0u64.to_be_bytes(),
-    sent,
-    at,
-    MatchMode::Degraded
-  ));
+  assert!(t.take_at(Family::V4, &0u64.to_be_bytes(), None, sent));
 }
 
 // ── the cap's admission decision ────────────────────────────────────────────
@@ -588,8 +699,9 @@ fn the_entry_cap_drops_the_new_entry_not_the_oldest() {
 /// open every credit's window at `at`.
 fn full_tracker_sealed_at(at: StdInstant) -> SelfSendTracker {
   let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
   for i in 0..MAX_SELF_SEND_ENTRIES {
-    t.record(Family::V4, &(i as u64).to_le_bytes(), wall());
+    t.record(Family::V4, &(i as u64).to_le_bytes(), sent);
   }
   t.seal_at(at);
   assert_eq!(
@@ -613,15 +725,9 @@ fn the_cap_admits_against_the_clock_at_the_decision_not_the_sweeps() {
   let mut t = full_tracker_sealed_at(base);
   // Real time runs past every credit's TTL while the sweep's reading does not.
   std::thread::sleep(SELF_SEND_TTL + Duration::from_millis(50));
-  t.record_with_stale_sweep(Family::V4, b"fresh", wall(), base);
+  t.record_with_stale_sweep(Family::V4, b"fresh", send_stamps(), base);
   assert!(
-    t.take_at(
-      Family::V4,
-      b"fresh",
-      wall(),
-      StdInstant::now(),
-      MatchMode::Degraded
-    ),
+    t.take_at(Family::V4, b"fresh", None, ClockPair::now()),
     "every resident credit was already dead when the cap was decided, so the \
      new send must have been given one — refusing it makes this endpoint ingest \
      its own loopback as a peer's datagram"
@@ -635,20 +741,14 @@ fn the_cap_admits_against_the_clock_at_the_decision_not_the_sweeps() {
 fn the_cap_still_refuses_when_every_resident_credit_is_live() {
   let base = mono();
   let mut t = full_tracker_sealed_at(base);
-  t.record(Family::V4, b"fresh", wall());
+  t.record(Family::V4, b"fresh", send_stamps());
   assert_eq!(
     t.len(),
     MAX_SELF_SEND_ENTRIES,
     "a live credit must never be displaced to make room"
   );
   assert!(
-    !t.take_at(
-      Family::V4,
-      b"fresh",
-      wall(),
-      StdInstant::now(),
-      MatchMode::Degraded
-    ),
+    !t.take_at(Family::V4, b"fresh", None, ClockPair::now()),
     "the NEW entry is the one dropped at the cap, never a live one"
   );
 }
@@ -663,11 +763,11 @@ fn the_cap_still_refuses_when_every_resident_credit_is_live() {
 fn insertion_order_is_expiry_order() {
   let mut t = SelfSendTracker::new();
   let t0 = mono();
-  t.record(Family::V4, b"first", wall());
+  t.record(Family::V4, b"first", send_stamps());
   t.seal_at(t0);
-  t.record(Family::V4, b"second", wall());
+  t.record(Family::V4, b"second", send_stamps());
   t.seal_at(t0 + Duration::from_millis(10));
-  t.record(Family::V4, b"third", wall());
+  t.record(Family::V4, b"third", send_stamps());
   let anchors = t.anchors_for_test();
   let mut previous: Option<StdInstant> = None;
   let mut unsealed_seen = false;
