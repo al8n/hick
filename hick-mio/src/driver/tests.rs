@@ -1,5 +1,5 @@
 use std::{
-  net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+  net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
   time::{Duration, Instant},
 };
 
@@ -2381,6 +2381,131 @@ fn an_own_echo_survives_a_foreign_interface_index() {
   );
   if !matched {
     eprintln!("skipping: this endpoint's own multicast never looped back within the budget");
+  }
+}
+
+/// The reported bypass, through the real receive path: a conforming hop limit
+/// and a source address whose zone names another link.
+///
+/// The gate runs before the self-send credit and before `endpoint.handle`, so a
+/// rejected datagram must reach neither. This drives the difference the wrong
+/// way round from the test above: there the forced disagreement is one the
+/// exception forgives, here it is one nothing forgives, and the observable is
+/// that the take-once credit is still unclaimed afterwards. A claimed credit
+/// would mean the datagram passed the gate and reached the self-send match —
+/// which sits between the gate and `endpoint.handle`, so it is the earlier of
+/// the two things the drop has to happen before.
+///
+/// Both witnesses are forced, in opposition: the receive path reports the
+/// interface this endpoint bound (the loopback fixture's own), and the peer
+/// reports a link-local address zoned to a different one. That is the case a
+/// "some witness agrees" rule would admit, and it is exactly what a wildcard
+/// socket on a multi-homed host is handed. Neither can be produced by a host
+/// this test runs on: a loopback fixture only ever sees `127.0.0.1`/`::1`,
+/// which the boundary admits by construction.
+#[test]
+fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let poll = Poll::new().expect("poll");
+  mdns
+    .register(poll.registry(), Token(42), Token(43))
+    .expect("register");
+
+  let body = [0x5Au8; 32];
+  {
+    let now = Instant::now();
+    let mut gate = FamilyWireGate::default();
+    let Mdns {
+      sockets,
+      selfsend,
+      send_health,
+      ..
+    } = &mut *mdns;
+    let summary = super::send_and_credit(
+      sockets,
+      selfsend,
+      send_health,
+      &mut gate,
+      &body,
+      MDNS_V4_DST,
+      Duration::ZERO,
+      now,
+    );
+    if summary.sent == 0 {
+      eprintln!("skipping: the datagram never reached a wire on this host");
+      mdns.deregister().expect("deregister");
+      return;
+    }
+  }
+  assert!(
+    mdns.selfsend.len() > 0,
+    "the send must have left a credit for the echo to claim, or this test \
+     cannot tell a dropped echo from an unclaimable one"
+  );
+  // Port 5353 so the §11 source-port rule for responses cannot be what drops
+  // this instead of the gate; the zone is the only thing wrong with it.
+  let foreign = mdns.bound_interface.wrapping_add(1_000);
+  mdns
+    .sockets
+    .force_rx_peer_for_test(Some(SocketAddr::V6(SocketAddrV6::new(
+      Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+      5353,
+      0,
+      foreign,
+    ))));
+
+  let before = dropped_at_the_gate(&mdns);
+  let mut events = mio::Events::with_capacity(8);
+  // Well inside `SELF_SEND_TTL` (2 s), so an unclaimed credit below is one the
+  // gate protected and never one the clock retired.
+  let deadline = Instant::now() + Duration::from_millis(750);
+  let mut poll = poll;
+  while Instant::now() < deadline && dropped_at_the_gate(&mdns) == before {
+    poll
+      .poll(&mut events, Some(Duration::from_millis(50)))
+      .expect("poll");
+    for ev in events.iter() {
+      if mdns.owns(ev.token()) {
+        mdns.handle_io(ev);
+      }
+    }
+    mdns.tick().expect("tick");
+  }
+  let unclaimed = mdns.selfsend.len() > 0;
+  let dropped = dropped_at_the_gate(&mdns) > before;
+  mdns.deregister().expect("deregister");
+  assert!(
+    unclaimed,
+    "an echo whose source zone names another link reached the self-send match: \
+     the ingress gate must reject it before the take-once credit is consulted, \
+     and before `endpoint.handle` can cache anything it carries"
+  );
+  #[cfg(feature = "stats")]
+  if !dropped {
+    eprintln!("skipping: this endpoint's own multicast never looped back within the budget");
+  }
+  #[cfg(not(feature = "stats"))]
+  let _ = dropped;
+}
+
+/// How many datagrams this endpoint has read and then thrown away, or `0` where
+/// there is no counter to ask.
+///
+/// The ingress gate is the only stage before the self-send match that both
+/// reads a datagram off the queue and drops it, so a rise here across the poll
+/// loop above is the gate firing. Without the `stats` feature this is constant,
+/// and the caller's loop simply runs out its budget.
+fn dropped_at_the_gate(mdns: &Mdns) -> u64 {
+  #[cfg(feature = "stats")]
+  {
+    mdns.stats().packets_dropped
+  }
+  #[cfg(not(feature = "stats"))]
+  {
+    let _ = mdns;
+    0
   }
 }
 

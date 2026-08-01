@@ -824,6 +824,18 @@ pub(crate) struct Sockets {
   /// link and one an adjacent network can drive, so it must not go untested.
   #[cfg(test)]
   forced_rx_interface: Option<u32>,
+  /// Report this address as the peer every received datagram came from,
+  /// overriding the cmsg metadata. See [`Sockets::rx_peer`].
+  ///
+  /// The other half of [`Sockets::forced_rx_interface`], and there for the same
+  /// reason: an IPv6 source address carries a scope id naming the link it came
+  /// from, the trust boundary weighs it exactly as it weighs the receive
+  /// interface, and no unit test can make a host deliver a datagram from a link
+  /// it is not on. A loopback fixture only ever sees `127.0.0.1` / `::1`, which
+  /// the boundary admits by construction, so without this the scope witness is
+  /// unreachable through the real receive path on every platform.
+  #[cfg(test)]
+  forced_rx_peer: Option<SocketAddr>,
   /// Report every received datagram as carrying no kernel receive timestamp,
   /// overriding the cmsg metadata. See [`Sockets::rx_time`].
   ///
@@ -939,6 +951,8 @@ impl Sockets {
       #[cfg(test)]
       forced_rx_interface: None,
       #[cfg(test)]
+      forced_rx_peer: None,
+      #[cfg(test)]
       forced_no_rx_time: false,
       #[cfg(feature = "stats")]
       stats,
@@ -957,6 +971,25 @@ impl Sockets {
       return idx;
     }
     meta.interface_index()
+  }
+
+  /// The peer a datagram came from, as the ingress trust boundary must read it:
+  /// the WHOLE address, scope id included.
+  ///
+  /// `RecvMeta::peer` already carries the scope id on every platform this crate
+  /// supports — it is the boundary that used to discard it by taking `.ip()`,
+  /// and with it the only proof an IPv6 link-local source offers of which link
+  /// it is actually on.
+  ///
+  /// Production reads it straight off the cmsg metadata; the `#[cfg(test)]`
+  /// override is the only way to present a peer from a link this host is not on.
+  /// See [`Sockets::forced_rx_peer`].
+  pub(crate) fn rx_peer(&self, meta: &RecvMeta) -> SocketAddr {
+    #[cfg(test)]
+    if let Some(peer) = self.forced_rx_peer {
+      return peer;
+    }
+    meta.peer()
   }
 
   /// The kernel receive timestamp a datagram carried, as the self-send match
@@ -1621,6 +1654,13 @@ impl Sockets {
   #[cfg(test)]
   pub(crate) const fn force_rx_interface_for_test(&mut self, idx: Option<u32>) {
     self.forced_rx_interface = idx;
+  }
+
+  /// Report `peer` as the source of every subsequent receive, scope id and all.
+  /// See [`Sockets::forced_rx_peer`].
+  #[cfg(test)]
+  pub(crate) const fn force_rx_peer_for_test(&mut self, peer: Option<SocketAddr>) {
+    self.forced_rx_peer = peer;
   }
 
   /// Present every subsequent receive as carrying no kernel timestamp, which is

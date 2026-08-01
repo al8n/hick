@@ -1,6 +1,6 @@
 //! RFC 6762 §11 on-link trust boundary.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// §11: a conforming mDNS datagram arrives with IPv4 TTL / IPv6 hop limit 255.
 /// Anything lower crossed a router. `None` means the platform did not report it,
@@ -10,8 +10,14 @@ pub(crate) fn is_on_link(hop_limit: Option<u8>) -> bool {
   hop_limit.is_none_or(|t| t == 255)
 }
 
-/// Whether a datagram that arrived on interface `pkt_iface` belongs to the link
-/// this endpoint bound.
+/// Whether a datagram from `src`, delivered on interface `pkt_iface`, belongs to
+/// the link this endpoint bound.
+///
+/// `iface_reported` says whether this platform reports a receive interface for
+/// `src`'s address family at all — [`hick_udp::reports_rx_interface_v4`] /
+/// [`hick_udp::reports_rx_interface_v6`]. It is a parameter rather than a
+/// direct call so the decision is testable on every host, not only on one whose
+/// capabilities happen to match the case under test.
 ///
 /// # Why this is a separate gate from §11
 ///
@@ -29,33 +35,84 @@ pub(crate) fn is_on_link(hop_limit: Option<u8>) -> bool {
 /// says. Applied to BOTH §11 branches, and before the self-send match, because a
 /// foreign-link datagram must not even be offered a take-once credit.
 ///
-/// # The two exceptions, both deliberate
+/// # Two witnesses, not one
 ///
-/// **An unknown index is not a mismatch.** `pkt_iface == 0` is what a platform
-/// that delivers no `PKTINFO`/`RECVIF` cmsg reports — the same platforms that
-/// deliver no TTL cmsg — and `bound_iface == 0` would mean this endpoint does
-/// not know its own link either. Treating "unknown" as "different" would drop
-/// every datagram on those hosts and take the responder off the air entirely, so
-/// it degrades exactly as the §11 hop-limit rule does: absent evidence fails
-/// open, present evidence is decisive.
+/// The receive interface is not the only thing that names the link a datagram
+/// came from: an IPv6 source address carries a **scope id**, and the platforms
+/// this crate supports all preserve it into the peer address (`hick-udp`'s
+/// `sockaddr_storage_to_socketaddr` and its Windows twin). So both are consulted,
+/// and **every nonzero witness must equal `bound_iface`** — including when they
+/// disagree with each other. A datagram whose PKTINFO says our own interface and
+/// whose scope id says another has already contradicted itself; a trust boundary
+/// resolves that against the sender, not for it.
 ///
-/// **A loopback source is admitted whatever interface it arrived on.** It is
-/// stated here rather than left to fall out of the index comparison because this
-/// crate's own loopback suppression depends on receiving its own multicast back:
-/// the tests in this crate, and any caller pinned to the loopback interface, run
-/// entirely on traffic whose source is `127.0.0.1`/`::1`. A datagram from a
-/// loopback address crossed no link at all, so there is no link for it to be off
-/// — and a remote attacker cannot manufacture one, because a kernel does not
-/// deliver a martian loopback source arriving on a real NIC. The same
-/// short-circuit, for the same reason, opens [`src_on_local_link`].
-pub(crate) fn arrived_on_bound_interface(src: IpAddr, bound_iface: u32, pkt_iface: u32) -> bool {
-  if src.is_loopback() {
+/// # The three exceptions, all deliberate
+///
+/// **A loopback source is admitted whatever interface it arrived on**, and
+/// whatever scope it carries. It is stated here rather than left to fall out of
+/// the index comparison because this crate's own loopback suppression depends on
+/// receiving its own multicast back: the tests in this crate, and any caller
+/// pinned to the loopback interface, run entirely on traffic whose source is
+/// `127.0.0.1`/`::1`. A datagram from a loopback address crossed no link at all,
+/// so there is no link for it to be off — and a remote attacker cannot
+/// manufacture one, because a kernel does not deliver a martian loopback source
+/// arriving on a real NIC. The same short-circuit, for the same reason, opens
+/// [`src_on_local_link`].
+///
+/// **`bound_iface == 0` is permissive**, meaning this endpoint does not know its
+/// own link and so can prove nothing about anyone else's. Production never
+/// reaches it: [`Sockets::bind`](crate::socket::Sockets::bind) either takes the
+/// caller's index or picks a default, then fails the bind outright if that index
+/// names no interface, so a live endpoint always has a real one.
+///
+/// **No witness at all is admitted only where the platform never had one to
+/// give.** With `iface_reported == false` a zero index is the platform's silence
+/// — IPv4 on FreeBSD/DragonFly/OpenBSD/NetBSD, which define no usable
+/// `IP_PKTINFO` — and rejecting silence would take IPv4 off the air there
+/// entirely, so it degrades as the §11 hop-limit rule does. With
+/// `iface_reported == true` the platform does answer this question, so a zero
+/// index is a datagram the kernel declined to place: no longer absent evidence
+/// but a failed proof, and this fails closed on it. That asymmetry is the
+/// residual attack surface, and it is exactly one square of the matrix: IPv4 on
+/// the four BSDs, known at compile time and documented in `hick-udp`'s README.
+pub(crate) fn arrived_on_bound_interface(
+  src: SocketAddr,
+  bound_iface: u32,
+  pkt_iface: u32,
+  iface_reported: bool,
+) -> bool {
+  if src.ip().is_loopback() {
     return true;
   }
-  if pkt_iface == 0 || bound_iface == 0 {
+  if bound_iface == 0 {
     return true;
   }
-  pkt_iface == bound_iface
+  // An IPv4 peer carries no scope, so its only witness is the cmsg index.
+  let scope = match src {
+    SocketAddr::V6(a) => a.scope_id(),
+    SocketAddr::V4(_) => 0,
+  };
+  let mut witnessed = false;
+  for witness in [pkt_iface, scope] {
+    if witness == 0 {
+      continue;
+    }
+    witnessed = true;
+    if witness != bound_iface {
+      return false;
+    }
+  }
+  witnessed || !iface_reported
+}
+
+/// Whether this platform reports the interface a datagram from `src`'s address
+/// family arrived on. The family is the peer's because the sockets are
+/// `IPV6_V6ONLY`, so a peer's family is always the receiving socket's.
+const fn reports_rx_interface(src: SocketAddr) -> bool {
+  match src {
+    SocketAddr::V4(_) => hick_udp::reports_rx_interface_v4(),
+    SocketAddr::V6(_) => hick_udp::reports_rx_interface_v6(),
+  }
 }
 
 /// The whole ingress trust boundary for one datagram: the link it arrived on,
@@ -65,14 +122,19 @@ pub(crate) fn arrived_on_bound_interface(src: IpAddr, bound_iface: u32, pkt_ifac
 /// of the §11 branches. The interface check runs **first** and applies to both:
 /// a reported hop limit answers "did this cross a router", never "whose link is
 /// this", and only the fallback branch ever looked at an interface index at all.
+///
+/// `src` is the whole peer [`SocketAddr`], not its [`IpAddr`]: for an IPv6 peer
+/// the scope id is half of what names the link it came from, and taking the
+/// address alone silently discarded it.
 pub(crate) fn admits_ingress(
-  src: IpAddr,
+  src: SocketAddr,
   hop_limit: Option<u8>,
   subnets: &[(IpAddr, u8)],
   bound_iface: u32,
   pkt_iface: u32,
 ) -> bool {
-  if !arrived_on_bound_interface(src, bound_iface, pkt_iface) {
+  let iface_reported = reports_rx_interface(src);
+  if !arrived_on_bound_interface(src, bound_iface, pkt_iface, iface_reported) {
     return false;
   }
   // A reported TTL/hop limit is decisive; without one, fall back to the source
@@ -80,7 +142,7 @@ pub(crate) fn admits_ingress(
   if hop_limit.is_some() {
     is_on_link(hop_limit)
   } else {
-    src_on_local_link(src, subnets, bound_iface, pkt_iface)
+    src_on_local_link(src, subnets, bound_iface, pkt_iface, iface_reported)
   }
 }
 
@@ -144,14 +206,19 @@ pub(crate) fn collect_local_subnets(iface_index: u32) -> Vec<(IpAddr, u8)> {
 /// datagram to have arrived on the bound interface. The link-local arm below
 /// keeps its own copy of that check anyway: this is the trust boundary, it costs
 /// one integer comparison, and a caller that reaches this function by some other
-/// route must not silently lose it.
+/// route must not silently lose it. It delegates to
+/// [`arrived_on_bound_interface`] rather than restating the rule, so the copy
+/// cannot become a weaker copy — it was previously a bare `pkt_iface` test that
+/// admitted a link-local source with a foreign scope id.
 pub(crate) fn src_on_local_link(
-  src: IpAddr,
+  src: SocketAddr,
   subnets: &[(IpAddr, u8)],
   bound_iface: u32,
   pkt_iface: u32,
+  iface_reported: bool,
 ) -> bool {
-  let (is_loopback, is_link_local) = match src {
+  let ip = src.ip();
+  let (is_loopback, is_link_local) = match ip {
     IpAddr::V4(a) => (a.is_loopback(), a.is_link_local()),
     // `Ipv6Addr::is_unicast_link_local` is still UNSTABLE in std, so test the
     // fe80::/10 prefix directly — same expression as hick-reactor
@@ -166,16 +233,16 @@ pub(crate) fn src_on_local_link(
   }
   if is_link_local {
     // A link-local source is only meaningful within its own link: require the
-    // datagram to have arrived on the interface we bound. `0` means the platform
-    // did not report an interface, which fails open (degraded, not dropped).
-    return pkt_iface == 0 || pkt_iface == bound_iface;
+    // datagram to have arrived on the interface we bound, by whichever witnesses
+    // this platform and this address family can supply.
+    return arrived_on_bound_interface(src, bound_iface, pkt_iface, iface_reported);
   }
   // Global (routable) source: admit only on positive on-link evidence. An empty
   // `subnets` makes this `false`, so a global source is dropped as off-link —
   // fail-CLOSED per §11, unlike the missing-TTL case which fails open.
   subnets
     .iter()
-    .any(|&(net, pfx)| addr_in_subnet(net, pfx, src))
+    .any(|&(net, pfx)| addr_in_subnet(net, pfx, ip))
 }
 
 #[cfg(test)]

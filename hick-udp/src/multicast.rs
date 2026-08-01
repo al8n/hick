@@ -118,6 +118,41 @@ impl MulticastOptionsV6 {
   }
 }
 
+/// Whether this target can report the interface an **IPv4** datagram arrived
+/// on, i.e. whether [`RecvMeta::interface_index`] carries evidence rather than
+/// a placeholder.
+///
+/// `false` means every IPv4 [`RecvMeta`] reports index `0` whichever NIC
+/// actually delivered the datagram. A caller that scopes a wildcard-bound
+/// socket to one link — as RFC 6762 §11 requires — needs this to tell "this
+/// arrived somewhere else" apart from "this platform never says": treating the
+/// second as the first takes IPv4 off the air, and the reverse admits an
+/// adjacent network. The capability is fixed at compile time, so the choice can
+/// be made once per target rather than per datagram.
+///
+/// True on Linux/Android, Apple and Windows. **False on FreeBSD, DragonFly,
+/// OpenBSD and NetBSD**: the first three define no `IP_PKTINFO` at all (they
+/// use `IP_RECVDSTADDR`/`IP_RECVIF`), and NetBSD's `in_pktinfo` is a different,
+/// 8-byte layout this crate's parser does not decode. See `build.rs` for the
+/// capability matrix these track.
+#[inline(always)]
+pub const fn reports_rx_interface_v4() -> bool {
+  cfg!(any(has_ip_pktinfo, windows))
+}
+
+/// Whether this target can report the interface an **IPv6** datagram arrived
+/// on. The IPv6 twin of [`reports_rx_interface_v4`], and `true` on every
+/// supported target.
+///
+/// Every supported Unix defines `IPV6_RECVPKTINFO`/`IPV6_PKTINFO`, and
+/// `try_bind_v6` fails the bind rather than continuing if enabling it fails.
+/// Windows sets `IPV6_PKTINFO` the same way, and its receive path reports an
+/// error rather than degrading when the `WSARecvMsg` extension is unavailable.
+#[inline(always)]
+pub const fn reports_rx_interface_v6() -> bool {
+  cfg!(any(has_ipv6_pktinfo, windows))
+}
+
 /// Metadata about a received datagram.
 #[derive(Debug, Clone, Copy)]
 pub struct RecvMeta {
@@ -251,10 +286,14 @@ fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
   )?;
   platform::set_multicast_loop_v4(&std_sock, opts.multicast_loop())?;
   platform::set_multicast_ttl_v4(&std_sock, opts.ttl())?;
-  // Best-effort: enabling IP_PKTINFO must not fail the bind on platforms that
-  // lack it. A missing PKTINFO just means the driver falls back to its
-  // degraded self-loopback matching.
-  let _ = platform::set_recv_pktinfo_v4(&std_sock);
+  // NOT best-effort where the option exists. On a target `reports_rx_interface_v4`
+  // calls capable, a receiver is entitled to read a zero interface index as "this
+  // datagram was not delivered on my link" and drop it; if the enable silently
+  // failed, every index would be zero and that receiver would be totally deaf
+  // rather than degraded. On an incapable target the setter is a no-op returning
+  // `Ok(())`, so this changes nothing there — the index stays zero and the
+  // receiver knows from the constant that it means "unknown".
+  platform::set_recv_pktinfo_v4(&std_sock)?;
   // Best-effort: enabling kernel receive timestamps must not fail the bind on
   // platforms that lack the sockopt. A missing timestamp just leaves
   // RecvMeta::rx_time as None.
@@ -289,12 +328,12 @@ pub fn try_bind_v6(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
 /// option in this crate that has already failed silently in production (the
 /// rustix wrong-protocol-level defect landed on Linux's unrelated
 /// `IP_PASSSEC` boolean, reporting success while the real hop limit stayed at
-/// its default of 1, violating the 255 RFC 6762 §11 requires). Every other
-/// option these two functions set either has no comparable history, or is
-/// already explicitly best-effort (the receive-cmsg enablers below, which
-/// degrade gracefully when unavailable and so are never checked for success
-/// at all, let alone read back) — re-reading those would add a syscall
-/// without adding safety.
+/// its default of 1, violating the 255 RFC 6762 §11 requires). No other option
+/// these two functions set has a comparable history: the PKTINFO enablers do
+/// fail the bind now (see their call sites), but on a plain error return, which
+/// no known defect turns into a false success; the timestamp and TTL enablers
+/// degrade legitimately and stay best-effort. Re-reading any of them would add
+/// a syscall without adding safety.
 ///
 /// Unix-only: the read-back chokepoint (`get_int_sockopt`) only exists on
 /// this platform. Windows sets this option through `socket2`, which passes
@@ -368,10 +407,12 @@ fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   // despite `setsockopt` reporting success.
   #[cfg(unix)]
   verify_multicast_hops_v6(&std_sock, opts.hops())?;
-  // Best-effort: enabling IPV6_PKTINFO must not fail the bind on platforms that
-  // lack it. A missing PKTINFO just means the driver falls back to its
-  // hash-ring self-detection.
-  let _ = platform::set_recv_pktinfo_v6(&std_sock);
+  // NOT best-effort: `reports_rx_interface_v6` promises every supported target
+  // reports the receiving interface, and a receiver that scopes itself to one
+  // link is entitled to drop what arrived elsewhere. See the IPv4 twin in
+  // `try_bind_v4_inner` for why a silent failure here would be deafness rather
+  // than degradation.
+  platform::set_recv_pktinfo_v6(&std_sock)?;
   // Best-effort: enabling kernel receive timestamps must not fail the bind on
   // platforms that lack the sockopt. A missing timestamp just leaves
   // RecvMeta::rx_time as None.

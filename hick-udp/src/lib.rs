@@ -34,8 +34,8 @@ pub mod sync;
 #[cfg(unix)]
 pub use multicast::recv_with_meta;
 pub use multicast::{
-  MulticastOptionsV4, MulticastOptionsV6, RX_TIMESTAMP_GRAIN, RecvMeta, try_bind_v4, try_bind_v6,
-  try_join_v4, try_join_v6,
+  MulticastOptionsV4, MulticastOptionsV6, RX_TIMESTAMP_GRAIN, RecvMeta, reports_rx_interface_v4,
+  reports_rx_interface_v6, try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
 // `parse_pktinfo_v6` exists only where libc defines `IPV6_PKTINFO`
 // (`has_ipv6_pktinfo`, see build.rs); gate the re-export identically.

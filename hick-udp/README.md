@@ -39,6 +39,42 @@ It provides:
 Cross-platform across Linux, macOS, the BSDs, and Windows; a `build.rs`
 capability matrix gates the platform-specific `cmsg` paths.
 
+## Platform capabilities
+
+mDNS sockets are wildcard bound — they must be, to receive traffic addressed to
+a multicast group rather than to an address — so on a multi-homed host every
+NIC's port-5353 traffic is delivered to them. Answering only for the interface
+you chose therefore depends on the kernel reporting **which** interface each
+datagram arrived on, and not every platform can.
+
+`reports_rx_interface_v4()` and `reports_rx_interface_v6()` state that per
+family, at compile time:
+
+| Target | IPv4 receive interface | IPv6 receive interface |
+|---|---|---|
+| Linux, Android | yes (`IP_PKTINFO`) | yes (`IPV6_PKTINFO`) |
+| macOS, iOS, tvOS, watchOS, visionOS | yes (`IP_PKTINFO`) | yes (`IPV6_PKTINFO`) |
+| Windows | yes (`IP_PKTINFO` via `WSARecvMsg`) | yes (`IPV6_PKTINFO`) |
+| **FreeBSD, DragonFly, OpenBSD, NetBSD** | **no** | yes (`IPV6_PKTINFO`) |
+
+**The residual limitation.** On FreeBSD, DragonFly, OpenBSD and NetBSD there is
+no usable IPv4 `IP_PKTINFO`: the first three do not define it, and NetBSD's
+`in_pktinfo` is a different 8-byte layout this crate does not decode. Every
+IPv4 `RecvMeta` on those targets reports interface index `0`, so an IPv4
+datagram **cannot be proved to have arrived on the interface you bound**. A
+receiver has to choose between dropping all IPv4 traffic and admitting some
+that came from another link; the drivers in this family choose to admit it,
+because the alternative takes IPv4 mDNS off the air entirely there. Where the
+whole trust boundary matters — a host with more than one network, where an
+adjacent network must not be able to reach your responder's cache — prefer
+IPv6, which is provable on every supported target, or a platform in the first
+three rows.
+
+IPv6 has no such gap, and `try_bind_v4`/`try_bind_v6` now **fail the bind**
+rather than continue if enabling `PKTINFO` fails on a target that claims the
+capability: a silently disabled option would make every index `0` and turn a
+link-scoped receiver deaf instead of merely degraded.
+
 ## Installation
 
 ```toml

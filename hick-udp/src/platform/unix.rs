@@ -157,27 +157,25 @@ pub(crate) fn set_multicast_loop_v6(sock: &UdpSocket, on: bool) -> std::io::Resu
 /// `recvmsg` reports the local receive address + interface index (the cmsg type
 /// [`crate::parse_pktinfo_v4`] looks for is always `IP_PKTINFO`).
 ///
-/// Gated on the `has_ip_pktinfo` capability cfg (see `build.rs`): Linux/Android,
-/// Apple, and NetBSD. FreeBSD/OpenBSD/DragonFly use `IP_RECVDSTADDR`/`IP_RECVIF`
-/// and are NOT supported by this parser, so this is a no-op there;
-/// `recv_with_meta` then degrades to an UNSPECIFIED local address and the driver
-/// falls back to its content-hash self-loopback matching.
+/// Gated on the `has_ip_pktinfo` capability cfg (see `build.rs`), which is
+/// Linux/Android and Apple ONLY — every BSD is excluded. FreeBSD, DragonFly and
+/// OpenBSD define no `IP_PKTINFO` at all (they use `IP_RECVDSTADDR`/`IP_RECVIF`),
+/// and NetBSD's `in_pktinfo` is a different, 8-byte layout that
+/// [`crate::parse_pktinfo_v4`] would misread as truncated — so NetBSD is
+/// excluded too, despite spelling the enable `IP_RECVPKTINFO`. On all four this
+/// is a no-op, `recv_with_meta` degrades to an UNSPECIFIED local address and
+/// interface index `0`, and [`crate::reports_rx_interface_v4`] reports `false`
+/// so a caller can tell that zero from a real answer.
 ///
 /// rustix has no setter for this option (see the module docs), so it routes
-/// through the single `libc::setsockopt` chokepoint. The *enable* optname
-/// differs by platform: NetBSD spells it `IP_RECVPKTINFO`; the others use
-/// `IP_PKTINFO`.
+/// through the single `libc::setsockopt` chokepoint.
 #[cfg(has_ip_pktinfo)]
 pub(crate) fn set_recv_pktinfo_v4(sock: &UdpSocket) -> std::io::Result<()> {
-  #[cfg(target_os = "netbsd")]
-  let optname = libc::IP_RECVPKTINFO;
-  #[cfg(not(target_os = "netbsd"))]
-  let optname = libc::IP_PKTINFO;
-  set_bool_sockopt(sock, libc::IPPROTO_IP, optname)
+  set_bool_sockopt(sock, libc::IPPROTO_IP, libc::IP_PKTINFO)
 }
 
-/// Fallback where IPv4 `IP_PKTINFO` isn't available (FreeBSD/OpenBSD/DragonFly):
-/// no-op. See the supported-target variant above.
+/// Fallback where IPv4 `IP_PKTINFO` isn't available (FreeBSD, DragonFly,
+/// OpenBSD, NetBSD): no-op. See the supported-target variant above.
 #[cfg(not(has_ip_pktinfo))]
 pub(crate) fn set_recv_pktinfo_v4(_sock: &UdpSocket) -> std::io::Result<()> {
   Ok(())
