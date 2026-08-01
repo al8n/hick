@@ -475,6 +475,11 @@ impl Mdns {
   /// and the RFC 6762 §11 on-link gate, both in
   /// [`onlink::admits_ingress`] — and then the untrusted-response guard,
   /// *before* it can consume a self-send credit or reach the proto layer.
+  ///
+  /// The source port decides twice over: it drops an untrusted response, and it
+  /// is the precondition on being offered a credit at all. Only a datagram from
+  /// port 5353 can be this endpoint's own loopback copy, because that is the
+  /// port both of its sockets send from.
   fn drain_recv(&mut self, now: StdInstant) {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
@@ -557,13 +562,19 @@ impl Mdns {
         continue;
       }
 
+      // Both sockets are bound to port 5353, so every datagram this endpoint
+      // sends leaves from it and every loopback copy arrives from it. A source
+      // port of anything else is therefore proof that the datagram is not our
+      // own echo, and that is what both gates below are built on.
+      let from_mdns_port = meta.peer().port() == hick_udp::constants::MDNS_PORT;
+
       // §11 source-port rule for RESPONSES, enforced before the take-once
       // credit is consulted. An on-link attacker echoing a byte-identical copy
       // of our own datagram from an ephemeral port would otherwise burn the
       // credit, leaving our genuine port-5353 loopback to be ingested as a
       // trusted peer. Queries (QR=0) are exempt: legacy unicast queriers do use
       // ephemeral ports.
-      if packet_is_response(data) && meta.peer().port() != hick_udp::constants::MDNS_PORT {
+      if packet_is_response(data) && !from_mdns_port {
         hick_trace::debug!(
           src = %meta.peer(),
           "dropping an untrusted response (source port != 5353) before the self-send match"
@@ -598,9 +609,22 @@ impl Mdns {
       // between the read above and this line — both admission gates, and
       // whatever the scheduler does among them — is elapsed time the credit must
       // be charged.
+      //
+      // A datagram from any other source port is not offered a credit at all,
+      // and this is the only place that can hold the line: the §11 rule above
+      // drops an untrusted RESPONSE, but a QUERY from an ephemeral port is
+      // deliberately kept — RFC 6762 §6.7 legacy unicast queriers use ephemeral
+      // ports and are owed a reply. Kept is not the same as ours. Under
+      // `MatchMode::Degraded` nothing orders a claim against the send, so a
+      // legacy query carrying the same bytes as one we just multicast would
+      // otherwise take that credit and be reported here as our own echo: the
+      // reply that querier is owed would never be sent, and the genuine echo
+      // behind it would find no credit and reach the protocol layer as peer
+      // traffic. The short circuit is load-bearing — a datagram that cannot be
+      // ours must not consume the credit it failed to match either.
       #[cfg(test)]
       Self::stall_before_claim(forced_claim_delays);
-      let caller_is_self = selfsend.take(family, data, sockets.rx_time(&meta));
+      let caller_is_self = from_mdns_port && selfsend.take(family, data, sockets.rx_time(&meta));
 
       let route_events = match endpoint.handle(
         now,

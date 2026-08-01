@@ -3382,6 +3382,16 @@ fn registered_v4_only() -> Option<(test_support::TestMdns, Poll)> {
 /// kernel's own word that a datagram is queued for the drain below to weigh.
 fn queue_own_echo(mdns: &mut Mdns, poll: &mut Poll, body: &[u8]) -> Option<()> {
   credit_a_multicast_send(mdns, body)?;
+  await_queued_datagram(mdns, poll, "this endpoint's own multicast")
+}
+
+/// Poll until the IPv4 socket holds a datagram for the drain to weigh, or
+/// `None` with a printed reason naming `what` never arrived.
+///
+/// Readiness is what makes that skip stats-free: it is the kernel's own word
+/// that something is queued, so a test that goes on to assert is never asserting
+/// over an empty receive stage.
+fn await_queued_datagram(mdns: &mut Mdns, poll: &mut Poll, what: &str) -> Option<()> {
   let mut events = mio::Events::with_capacity(8);
   let deadline = Instant::now() + Duration::from_secs(2);
   while Instant::now() < deadline {
@@ -3397,7 +3407,7 @@ fn queue_own_echo(mdns: &mut Mdns, poll: &mut Poll, body: &[u8]) -> Option<()> {
       return Some(());
     }
   }
-  eprintln!("skipping: this endpoint's own multicast never looped back within the budget");
+  eprintln!("skipping: {what} never reached this endpoint's socket within the budget");
   None
 }
 
@@ -3600,6 +3610,181 @@ fn a_degraded_claim_stalled_after_admission_is_rejected() {
     "with no arrival stamp the TTL is the entire bound on false suppression, so \
      a claim stalled past it between admission and the credit check must be \
      rejected on the degraded path too"
+  );
+}
+
+// ── only port 5353 may be offered a self-send credit ────────────────────────
+//
+// Both of this endpoint's sockets are bound to 5353, so that is the source port
+// every datagram it sends leaves from and the only one a loopback copy can
+// arrive from. RFC 6762 §11 already drops a RESPONSE from any other port, but a
+// §6.7 legacy unicast QUERY is deliberately kept — such a querier uses an
+// ephemeral port and is owed a unicast reply. Kept is not ours: under
+// `MatchMode::Degraded` nothing orders a claim against the send, so a legacy
+// query carrying the same bytes as one we just multicast would take that credit
+// and be reported as our own echo. The reply the querier is owed would never be
+// sent, and the genuine echo behind it would find no credit and reach the
+// protocol layer as peer traffic.
+//
+// The two tests below are the same datagram, the same ordering and the same
+// match mode, differing only in the source port it arrives from.
+
+/// A UDP socket that can reach an endpoint joined on the loopback link, from an
+/// EPHEMERAL source port.
+///
+/// Three options are load-bearing and `std::net::UdpSocket` exposes only two of
+/// them, which is what `socket2` is a dev-dependency for:
+///
+/// * `IP_MULTICAST_IF` = 127.0.0.1, or the datagram egresses on the host's
+///   default multicast interface and an endpoint joined only on loopback never
+///   sees it;
+/// * `IP_MULTICAST_TTL` = 255, or the §11 on-link gate drops it long before any
+///   credit is weighed and the test asserts over an empty receive stage;
+/// * `IP_MULTICAST_LOOP`, on by default but set explicitly, because same-host
+///   delivery is the whole point.
+///
+/// Never bound to 5353: being a source port that is not ours is this socket's
+/// entire job, and joining the endpoint's `SO_REUSEPORT` group would also let it
+/// absorb deliveries meant for the endpoint under test.
+fn ephemeral_loopback_sender() -> Option<socket2::Socket> {
+  use socket2::{Domain, Protocol, Socket, Type};
+
+  let build = || -> std::io::Result<Socket> {
+    let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())?;
+    s.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)?;
+    s.set_multicast_ttl_v4(255)?;
+    s.set_multicast_loop_v4(true)?;
+    Ok(s)
+  };
+  match build() {
+    Ok(s) => Some(s),
+    Err(e) => {
+      eprintln!("skipping: the ephemeral-port sender could not be set up ({e:?})");
+      None
+    }
+  }
+}
+
+/// One PTR question, QR=0 — the shape of an RFC 6762 §6.7 legacy query.
+///
+/// A query rather than a response deliberately: a response from an ephemeral
+/// port is dropped by the §11 source-port rule before the credit is weighed at
+/// all, so it could never reach the gate these tests are about.
+fn legacy_query_datagram(service_type: &str) -> Vec<u8> {
+  use mdns_proto::wire::{Header, MessageBuilder};
+
+  let mut buf = vec![0u8; 512];
+  let mut builder: MessageBuilder<'_> =
+    MessageBuilder::try_new(&mut buf, Header::new()).expect("message builder");
+  builder
+    .push_question(
+      &mdns_proto::Name::try_from_str(service_type).expect("service type"),
+      ResourceType::Ptr,
+      ResourceClass::In,
+      false,
+    )
+    .expect("push_question");
+  let n = builder.finish().expect("finish");
+  buf.truncate(n);
+  buf
+}
+
+/// Record a credit for `body` — with the datagram that will be weighed against
+/// it ALREADY queued — open its window, and report the credits that survived.
+///
+/// The credit is taken after the arrival on purpose: the kernel stamped the
+/// datagram before the send it now faces, which is the ordering `Ordered`
+/// matching exists to reject and `Degraded` matching cannot see. So the source
+/// port is the only thing left that can tell the two callers apart.
+fn credits_after_a_pre_send_arrival(mdns: &mut Mdns, body: &[u8]) -> usize {
+  mdns
+    .selfsend
+    .record(Family::V4, body, crate::selfsend::ClockPair::now());
+  mdns.tick().expect("tick");
+  mdns.selfsend.len()
+}
+
+/// [`credits_after_a_pre_send_arrival`] over a datagram delivered from an
+/// ephemeral source port.
+fn credits_after_an_ephemeral_arrival(
+  mdns: &mut Mdns,
+  poll: &mut Poll,
+  body: &[u8],
+) -> Option<usize> {
+  let sender = ephemeral_loopback_sender()?;
+  if sender.send_to(body, &MDNS_V4_DST.into()).is_err() {
+    eprintln!("skipping: this host's multicast egress refused the ephemeral-port query");
+    return None;
+  }
+  await_queued_datagram(mdns, poll, "the ephemeral-port query")?;
+  Some(credits_after_a_pre_send_arrival(mdns, body))
+}
+
+/// [`credits_after_a_pre_send_arrival`] over this endpoint's own loopback copy.
+///
+/// Put on the wire through the socket layer alone rather than through
+/// [`credit_a_multicast_send`], so the credit taken afterwards is the only one
+/// and the arrival really does predate it.
+fn credits_after_our_own_echo(mdns: &mut Mdns, poll: &mut Poll, body: &[u8]) -> Option<usize> {
+  let sent = mdns
+    .sockets
+    .send_one(Family::V4, body, MDNS_V4_DST, &crate::socket::Ungated);
+  if !matches!(sent, crate::socket::SendOutcome::Sent { .. }) {
+    eprintln!("skipping: the datagram never reached a wire on this host");
+    return None;
+  }
+  await_queued_datagram(mdns, poll, "this endpoint's own multicast")?;
+  Some(credits_after_a_pre_send_arrival(mdns, body))
+}
+
+#[test]
+fn a_degraded_claim_refuses_a_credit_to_an_ephemeral_port_query() {
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  // The mode with no ordering evidence at all — the whole of the match on
+  // Windows and on any kernel that delivers no timestamp cmsg. Forcing it is
+  // what makes the arm reachable from a host whose kernel does supply a stamp.
+  mdns.sockets.force_no_rx_time_for_test();
+  let body = legacy_query_datagram("_hick-mio-legacy._tcp.local.");
+  assert!(
+    !packet_is_response(&body),
+    "a response from an ephemeral port never reaches the credit check, so only a \
+     query can exercise this gate"
+  );
+
+  let survived = credits_after_an_ephemeral_arrival(&mut mdns, &mut poll, &body);
+  mdns.deregister().expect("deregister");
+  let Some(survived) = survived else {
+    return;
+  };
+  assert_eq!(
+    survived, 1,
+    "a query from an ephemeral port cannot be our own loopback — we send only \
+     from 5353 — so it must not be offered the credit: swallowing it drops the \
+     unicast reply RFC 6762 §6.7 owes that querier and leaves our own echo \
+     facing no credit at all"
+  );
+}
+
+#[test]
+fn a_degraded_claim_still_admits_our_own_echo_that_predates_its_credit() {
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  mdns.sockets.force_no_rx_time_for_test();
+  let body = legacy_query_datagram("_hick-mio-legacy-echo._tcp.local.");
+  let survived = credits_after_our_own_echo(&mut mdns, &mut poll, &body);
+  mdns.deregister().expect("deregister");
+  let Some(survived) = survived else {
+    return;
+  };
+  assert_eq!(
+    survived, 0,
+    "the port gate must not become a second ordering check: our own echo arrives \
+     from 5353 and still claims its credit, however the kernel happened to stamp \
+     it against the send"
   );
 }
 
