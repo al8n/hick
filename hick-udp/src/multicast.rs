@@ -603,6 +603,272 @@ pub fn parse_pktinfo_v4(
   Err(ParseRecvMetaError::MissingPktinfo)
 }
 
+// ============================================================================
+// BSD IPv4 receive metadata — PARSED BUT NOT YET TRUSTED.
+//
+// The two shapes below recover for FreeBSD/DragonFly/OpenBSD/NetBSD what
+// `parse_pktinfo_v4` recovers for Linux/Apple. Neither is reachable from
+// `recv_with_meta`, neither has a matching `setsockopt` enabler, and neither
+// changes `reports_rx_interface_v4()`, which still answers `false` on all four
+// targets. They are landed inert on purpose: promoting them flips a receiver's
+// ingress rule for a witness-less datagram from "admit" to "drop", so a parse
+// that is quietly wrong would produce IPv4 deafness rather than a visible
+// failure. `build.rs` lists, at the emit site for the two `ipv4_rx_*` cfgs,
+// exactly what a real host of each target has to show before that flip.
+//
+// What is verifiable here, and is: the byte layouts, against `libc`'s own
+// structs (the `const _` assertions below, checked by any cross-compile) and
+// against synthesized cmsg buffers (the unit tests, which run on every host).
+// What is not verifiable here: that a kernel delivers these cmsgs at all.
+// ============================================================================
+
+/// `offsetof(struct sockaddr_dl, sdl_index)`. Pinned against `libc` by the
+/// assertion beside `parse_dstaddr_recvif_v4`.
+#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+const SDL_INDEX_OFFSET: usize = 2;
+
+/// `offsetof(struct sockaddr_dl, sdl_data[0])` — the fixed prefix every
+/// `sockaddr_dl` carries, and the shortest `IP_RECVIF` payload the BSD kernels
+/// emit (their "no receive interface" dummy is exactly this long).
+#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+const SOCKADDR_DL_FIXED_LEN: usize = 8;
+
+/// Decode an `IP_RECVDSTADDR` payload: a bare `struct in_addr`, which the
+/// FreeBSD, DragonFly, OpenBSD and NetBSD kernels all fill with `ip->ip_dst` —
+/// the IP header destination, i.e. the group for a multicast arrival. There is
+/// no `ipi_spec_dst` twin in this cmsg, so it cannot report the receiving
+/// interface's own address.
+///
+/// `s_addr` is in network byte order and `Ipv4Addr::from([u8; 4])` reads
+/// big-endian octets, so the four bytes transfer verbatim. `None` for a payload
+/// shorter than an `in_addr`.
+#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+fn decode_recvdstaddr(data: &[u8]) -> Option<Ipv4Addr> {
+  data.first_chunk::<4>().map(|b| Ipv4Addr::from(*b))
+}
+
+/// Decode the receiving interface index out of an `IP_RECVIF` payload: a
+/// `struct sockaddr_dl`, of which only `sdl_index` — a HOST-order `u_short` at
+/// `SDL_INDEX_OFFSET` — is read.
+///
+/// The payload is variable-length. The kernels send `sdl_len` bytes, which is
+/// the interface's own link-layer `sockaddr_dl` copied verbatim (FreeBSD's
+/// `ip_savecontrol` does `bcopy(sdp, sdl2, sdp->sdl_len)`), so it runs from
+/// `SOCKADDR_DL_FIXED_LEN` up to the full struct depending on how long that
+/// interface's name and hardware address are. Requiring the full
+/// `size_of::<sockaddr_dl>()` would therefore reject legitimate payloads, and
+/// the three targets do not even agree on that size; only the fixed prefix may
+/// be relied on. Anything shorter than the prefix is not a `sockaddr_dl` at
+/// all: `None`.
+///
+/// `Some(0)` is a real answer, not an error — it is the kernels' own dummy for
+/// "this datagram has no receive interface" (`sdl_index = 0` on the `makedummy`
+/// path) and carries the same meaning as the zero index a target without this
+/// cmsg reports. `sdl_family` is not checked: the cmsg level and type already
+/// identify the producer as the kernel's `IP_RECVIF` writer, and `AF_LINK` is
+/// the only family it ever sets.
+#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+fn decode_recvif_index(data: &[u8]) -> Option<u32> {
+  if data.len() < SOCKADDR_DL_FIXED_LEN {
+    return None;
+  }
+  let index_bytes = data
+    .get(SDL_INDEX_OFFSET..)
+    .and_then(|rest| rest.first_chunk::<2>())?;
+  Some(u32::from(u16::from_ne_bytes(*index_bytes)))
+}
+
+/// Walk an ancillary buffer for the `IPPROTO_IP` destination-address and
+/// receive-interface cmsgs, returning whichever of the two it recovers.
+///
+/// The two cmsg types are parameters rather than direct `libc::IP_RECVDSTADDR`
+/// / `libc::IP_RECVIF` reads so that this walk — including the requirement to
+/// skip unrelated cmsgs and to keep looking after one of the pair — is covered
+/// by unit tests on every host, not only on a BSD nobody can run here. The one
+/// thing the parameters hide is which numbers the target uses, and that is the
+/// part `libc` answers: `IP_RECVIF` is 20 on FreeBSD/DragonFly/NetBSD but 30 on
+/// OpenBSD.
+///
+/// A malformed cmsg header ends the walk with whatever was recovered before it,
+/// mirroring the other parsers: the datagram has already been consumed, so a
+/// bad control buffer must not cost the caller its data.
+#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+fn scan_dstaddr_recvif(
+  cmsgs: &[u8],
+  dstaddr_ty: libc::c_int,
+  recvif_ty: libc::c_int,
+) -> (Option<Ipv4Addr>, Option<u32>) {
+  let mut destination = None;
+  let mut iface = None;
+  for cmsg in CmsgIter::new(cmsgs) {
+    let Ok(cmsg) = cmsg else { break };
+    if cmsg.level != libc::IPPROTO_IP {
+      continue;
+    }
+    if cmsg.ty == dstaddr_ty && destination.is_none() {
+      destination = decode_recvdstaddr(cmsg.data);
+    } else if cmsg.ty == recvif_ty && iface.is_none() {
+      iface = decode_recvif_index(cmsg.data);
+    }
+  }
+  (destination, iface)
+}
+
+/// Parse the FreeBSD/DragonFly/OpenBSD IPv4 receive metadata — the
+/// `IP_RECVDSTADDR` + `IP_RECVIF` cmsg pair — into a [`RecvMeta`].
+///
+/// The IPv4 counterpart of `parse_pktinfo_v4` on the targets that define no
+/// `IP_PKTINFO`. **Not wired into [`recv_with_meta`]**, which still degrades on
+/// these targets, and does not affect [`reports_rx_interface_v4`]; see the
+/// comment block above this function and `build.rs` for the evidence a
+/// promotion requires.
+///
+/// [`RecvMeta::local_ip`] is UNSPECIFIED, and that is the honest answer rather
+/// than a placeholder: neither cmsg carries an `ipi_spec_dst` equivalent, so the
+/// receiving interface's own unicast address is simply absent from the ancillary
+/// data on these platforms. Callers already read an unspecified local address as
+/// "fall back to content-hash self-detection".
+///
+/// Returns [`ParseRecvMetaError::MissingPktinfo`] only when NEITHER cmsg was
+/// present. Recovering one without the other is reported, not discarded: the
+/// destination and the interface answer different RFC 6762 §11 questions, and a
+/// caller that got one of them is better off than a caller that got neither.
+#[cfg(ipv4_rx_dstaddr_recvif)]
+pub fn parse_dstaddr_recvif_v4(
+  cmsgs: &[u8],
+  len: usize,
+  peer: SocketAddr,
+) -> Result<RecvMeta, ParseRecvMetaError> {
+  let (destination, iface) = scan_dstaddr_recvif(cmsgs, libc::IP_RECVDSTADDR, libc::IP_RECVIF);
+  if destination.is_none() && iface.is_none() {
+    return Err(ParseRecvMetaError::MissingPktinfo);
+  }
+  // No timestamp available here; `recv_with_meta` overwrites rx_time after
+  // parsing the SCM_TIMESTAMP* cmsg from the same control buffer.
+  Ok(RecvMeta::new(
+    len,
+    peer,
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    destination.map(IpAddr::V4),
+    iface.unwrap_or(0),
+    None,
+  ))
+}
+
+// The `sockaddr_dl` prefix `decode_recvif_index` reads, pinned against `libc`'s
+// own struct for whichever BSD is being compiled. The three targets disagree on
+// `size_of::<sockaddr_dl>()` — FreeBSD's trailing `sdl_data` is 46 bytes,
+// OpenBSD's 24, and DragonFly follows a 12-byte `sdl_data` with `sdl_rcf` and
+// `sdl_route` — so the OFFSET of the index, not the size of the struct, is what
+// this parse may rely on. A cross-compile for any of the three checks it.
+#[cfg(ipv4_rx_dstaddr_recvif)]
+const _: () = assert!(core::mem::offset_of!(libc::sockaddr_dl, sdl_index) == SDL_INDEX_OFFSET);
+#[cfg(ipv4_rx_dstaddr_recvif)]
+const _: () = assert!(core::mem::offset_of!(libc::sockaddr_dl, sdl_data) == SOCKADDR_DL_FIXED_LEN);
+#[cfg(ipv4_rx_dstaddr_recvif)]
+const _: () = assert!(core::mem::size_of::<libc::in_addr>() == 4);
+
+/// `sizeof(struct in_pktinfo)` on NetBSD, whose layout is `ipi_addr` (4) then
+/// `ipi_ifindex` (4) — eight bytes, against the twelve of the Linux/Apple
+/// struct. Pinned against `libc` by the assertion beside
+/// `parse_netbsd_pktinfo_v4`.
+#[cfg(all(unix, any(ipv4_rx_netbsd_pktinfo, test)))]
+const NETBSD_IN_PKTINFO_LEN: usize = 8;
+
+/// `offsetof(struct in_pktinfo, ipi_ifindex)` on NetBSD.
+#[cfg(all(unix, any(ipv4_rx_netbsd_pktinfo, test)))]
+const NETBSD_IPI_IFINDEX_OFFSET: usize = 4;
+
+/// Decode NetBSD's `struct in_pktinfo`: `ipi_addr` (a network-order
+/// `struct in_addr`, which `ip_savecontrol` fills with `ip->ip_dst` — the IP
+/// header destination) followed by a host-order `unsigned int ipi_ifindex`.
+///
+/// The length test is EXACT, not a minimum, and that is the whole point of this
+/// function existing separately from `parse_pktinfo_v4`. The Linux/Apple
+/// `in_pktinfo` is twelve bytes in a different order (`ipi_ifindex`,
+/// `ipi_spec_dst`, `ipi_addr`); accepting `>= 8` would decode ITS interface
+/// index as this layout's destination address and its `ipi_spec_dst` as this
+/// layout's index, silently, with no length or value out of range to give it
+/// away. A cmsg payload is exactly `sizeof(struct in_pktinfo)` long — the
+/// kernel passes that size to `sbcreatecontrol` and `CmsgIter` hands back
+/// `cmsg_len` minus the aligned header — so nothing legitimate is rejected.
+#[cfg(all(unix, any(ipv4_rx_netbsd_pktinfo, test)))]
+fn decode_netbsd_pktinfo(data: &[u8]) -> Option<(Ipv4Addr, u32)> {
+  if data.len() != NETBSD_IN_PKTINFO_LEN {
+    return None;
+  }
+  let addr_bytes = data.first_chunk::<4>()?;
+  let index_bytes = data
+    .get(NETBSD_IPI_IFINDEX_OFFSET..)
+    .and_then(|rest| rest.first_chunk::<4>())?;
+  Some((
+    Ipv4Addr::from(*addr_bytes),
+    u32::from_ne_bytes(*index_bytes),
+  ))
+}
+
+/// Walk an ancillary buffer for NetBSD's `IP_PKTINFO` cmsg.
+///
+/// The cmsg type is a parameter for the same reason as in
+/// `scan_dstaddr_recvif`: it keeps the walk testable on every host. Note that
+/// the type delivered is `IP_PKTINFO` (25) while the sockopt that ENABLES it is
+/// `IP_RECVPKTINFO` (26) — two different numbers on NetBSD, unlike the single
+/// `IP_PKTINFO` Linux uses for both.
+#[cfg(all(unix, any(ipv4_rx_netbsd_pktinfo, test)))]
+fn scan_netbsd_pktinfo(cmsgs: &[u8], pktinfo_ty: libc::c_int) -> Option<(Ipv4Addr, u32)> {
+  for cmsg in CmsgIter::new(cmsgs) {
+    let Ok(cmsg) = cmsg else { break };
+    if cmsg.level == libc::IPPROTO_IP && cmsg.ty == pktinfo_ty {
+      return decode_netbsd_pktinfo(cmsg.data);
+    }
+  }
+  None
+}
+
+/// Parse NetBSD's IPv4 `IP_PKTINFO` cmsg into a [`RecvMeta`].
+///
+/// NetBSD is the one BSD here that does define `IP_PKTINFO`, but its
+/// `in_pktinfo` is an 8-byte `ipi_addr`/`ipi_ifindex` pair rather than the
+/// 12-byte Linux/Apple struct, so `parse_pktinfo_v4` cannot serve it — it
+/// would reject the payload as truncated. **Not wired into [`recv_with_meta`]**
+/// and does not affect [`reports_rx_interface_v4`]; see the comment block above
+/// `parse_dstaddr_recvif_v4` and `build.rs`.
+///
+/// [`RecvMeta::local_ip`] is UNSPECIFIED for the same reason as in the
+/// `IP_RECVDSTADDR` parser: NetBSD's `in_pktinfo` has no `ipi_spec_dst` field,
+/// so the receiving interface's own address is not in the ancillary data.
+#[cfg(ipv4_rx_netbsd_pktinfo)]
+pub fn parse_netbsd_pktinfo_v4(
+  cmsgs: &[u8],
+  len: usize,
+  peer: SocketAddr,
+) -> Result<RecvMeta, ParseRecvMetaError> {
+  let (destination, iface) =
+    scan_netbsd_pktinfo(cmsgs, libc::IP_PKTINFO).ok_or(ParseRecvMetaError::MissingPktinfo)?;
+  // No timestamp available here; `recv_with_meta` overwrites rx_time after
+  // parsing the SCM_TIMESTAMP* cmsg from the same control buffer.
+  Ok(RecvMeta::new(
+    len,
+    peer,
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    Some(IpAddr::V4(destination)),
+    iface,
+    None,
+  ))
+}
+
+// NetBSD's `in_pktinfo`, pinned against `libc`. If NetBSD ever grew the struct
+// to match Linux's, the exact-length test in `decode_netbsd_pktinfo` would
+// start rejecting every payload — these assertions turn that into a compile
+// failure on the next cross-compile instead.
+#[cfg(ipv4_rx_netbsd_pktinfo)]
+const _: () = assert!(core::mem::size_of::<libc::in_pktinfo>() == NETBSD_IN_PKTINFO_LEN);
+#[cfg(ipv4_rx_netbsd_pktinfo)]
+const _: () = assert!(core::mem::offset_of!(libc::in_pktinfo, ipi_addr) == 0);
+#[cfg(ipv4_rx_netbsd_pktinfo)]
+const _: () =
+  assert!(core::mem::offset_of!(libc::in_pktinfo, ipi_ifindex) == NETBSD_IPI_IFINDEX_OFFSET);
+
 /// Parse IPV6_PKTINFO cmsg ancillary data (Unix) to recover the local IP +
 /// interface index for an incoming IPv6 datagram.
 ///

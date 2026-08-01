@@ -59,16 +59,28 @@ family, at compile time:
 
 **The residual limitation.** On FreeBSD, DragonFly, OpenBSD and NetBSD there is
 no usable IPv4 `IP_PKTINFO`: the first three do not define it, and NetBSD's
-`in_pktinfo` is a different 8-byte layout this crate does not decode. Every
-IPv4 `RecvMeta` on those targets reports interface index `0`, so an IPv4
-datagram **cannot be proved to have arrived on the interface you bound**. A
-receiver has to choose between dropping all IPv4 traffic and admitting some
-that came from another link; the drivers in this family choose to admit it,
-because the alternative takes IPv4 mDNS off the air entirely there. Where the
-whole trust boundary matters — a host with more than one network, where an
-adjacent network must not be able to reach your responder's cache — prefer
-IPv6, which is provable on every supported target, or a platform in the first
-three rows.
+`in_pktinfo` is a different 8-byte layout that the shared parser reads as
+truncated. Every IPv4 `RecvMeta` on those targets reports interface index `0`,
+so an IPv4 datagram **cannot be proved to have arrived on the interface you
+bound**. A receiver has to choose between dropping all IPv4 traffic and
+admitting some that came from another link; the drivers in this family choose
+to admit it, because the alternative takes IPv4 mDNS off the air entirely
+there. Where the whole trust boundary matters — a host with more than one
+network, where an adjacent network must not be able to reach your responder's
+cache — prefer IPv6, which is provable on every supported target, or a platform
+in the first three rows.
+
+The gap is this crate's, not the kernels'. All four BSDs do report an IPv4
+destination and receive interface, through `IP_RECVDSTADDR` + `IP_RECVIF`
+(FreeBSD, DragonFly, OpenBSD) or NetBSD's own `IP_RECVPKTINFO`, and
+`multicast::parse_dstaddr_recvif_v4` / `multicast::parse_netbsd_pktinfo_v4`
+decode both shapes. Those parsers are **not wired into `recv_with_meta`** and do
+not change the table above. Promoting them inverts the ingress rule for a
+datagram with no interface witness — from "admit" to "drop" — so a parse that
+was quietly wrong would make a responder deaf on IPv4 while still looking
+healthy, and no amount of cross-compiling can rule that out. `build.rs` records,
+at the emit site for the `ipv4_rx_*` cfgs, exactly what a real host of each
+target has to demonstrate first.
 
 IPv6 has no such gap, and `try_bind_v4`/`try_bind_v6` now **fail the bind**
 rather than continue if enabling `PKTINFO` fails on a target that claims the

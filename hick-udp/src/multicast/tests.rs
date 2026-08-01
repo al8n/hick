@@ -96,10 +96,7 @@ fn empty_cmsgs_returns_missing() {
 }
 
 /// Build a single cmsg with the given level/type carrying `data`, padded to
-/// the cmsghdr alignment, mirroring `synth_cmsg_v4`. Compiled wherever a
-/// receive-timestamp or hop-limit parse test uses it (`has_recv_timestamp`
-/// ⊇ `has_recv_hoplimit`).
-#[cfg(has_recv_timestamp)]
+/// the cmsghdr alignment, mirroring `synth_cmsg_v4`.
 fn synth_cmsg(level: libc::c_int, ty: libc::c_int, data: &[u8]) -> Vec<u8> {
   let hdr_size = core::mem::size_of::<libc::cmsghdr>();
   let cmsg_len = hdr_size + data.len();
@@ -459,4 +456,333 @@ fn try_bind_v6_rejects_a_mismatch_forced_through_production_wiring() {
   );
   assert_eq!(detail.requested(), requested);
   assert_eq!(detail.observed(), i32::from(forced));
+}
+
+// ============================================================================
+// BSD IPv4 receive metadata.
+//
+// These tests prove the PARSE and nothing else. They feed synthesized cmsg
+// buffers to the decoders and walkers, so they run on any host — which is the
+// only reason coverage exists for these targets at all, since CI cross-COMPILES
+// FreeBSD/DragonFly/OpenBSD/NetBSD and runs nothing there. What they do NOT
+// prove is the PLUMBING: that the enabling sockopt is accepted, that the kernel
+// actually attaches these cmsgs to a real mDNS datagram, that the interface
+// index it reports matches `if_nametoindex`, or that the 256-byte control
+// buffer still escapes `MSG_CTRUNC` with them present. That evidence can only
+// come from a real host of each target, and until it does the parsers stay
+// unwired — see `build.rs` for the full list.
+//
+// The cmsg type numbers are passed in rather than read from `libc` (see
+// `scan_dstaddr_recvif`), so these are the real per-target values: 7 for
+// `IP_RECVDSTADDR` everywhere, 20 for `IP_RECVIF` on FreeBSD/DragonFly/NetBSD
+// against 30 on OpenBSD, and 25 for the `IP_PKTINFO` cmsg NetBSD delivers (the
+// sockopt that enables it, `IP_RECVPKTINFO`, is a different number: 26).
+// ============================================================================
+
+const IP_RECVDSTADDR_TY: libc::c_int = 7;
+const IP_RECVIF_TY: libc::c_int = 20;
+const IP_RECVIF_TY_OPENBSD: libc::c_int = 30;
+const IP_PKTINFO_TY_NETBSD: libc::c_int = 25;
+
+/// Concatenate several cmsgs into one ancillary buffer. Each `synth_cmsg` is
+/// already padded to the cmsghdr alignment, which is the same stride
+/// `CmsgIter` derives from libc's `CMSG_SPACE` — the multi-cmsg tests below
+/// assert the resulting item count, so a disagreement would surface as a
+/// failure rather than as a silently skipped cmsg.
+fn synth_cmsgs(parts: &[(libc::c_int, libc::c_int, &[u8])]) -> Vec<u8> {
+  let mut buf = Vec::new();
+  for (level, ty, data) in parts {
+    buf.extend_from_slice(&synth_cmsg(*level, *ty, data));
+  }
+  buf
+}
+
+/// A `struct sockaddr_dl` payload as the BSD kernels emit it for `IP_RECVIF`:
+/// the 8-byte fixed prefix followed by `trailing` bytes of name/hardware
+/// address, with `sdl_len` covering the whole thing. `trailing` empty is the
+/// kernels' `makedummy` form.
+fn synth_sockaddr_dl(index: u16, trailing: &[u8]) -> Vec<u8> {
+  let mut v = Vec::with_capacity(8 + trailing.len());
+  v.push((8 + trailing.len()) as u8); // sdl_len
+  v.push(18); // sdl_family = AF_LINK on every BSD
+  v.extend_from_slice(&index.to_ne_bytes()); // sdl_index, host order
+  v.push(6); // sdl_type
+  v.push(trailing.len() as u8); // sdl_nlen
+  v.push(0); // sdl_alen
+  v.push(0); // sdl_slen
+  v.extend_from_slice(trailing);
+  v
+}
+
+/// NetBSD's 8-byte `struct in_pktinfo`: `ipi_addr` then `ipi_ifindex`.
+fn synth_netbsd_in_pktinfo(addr: Ipv4Addr, index: u32) -> Vec<u8> {
+  let mut v = Vec::with_capacity(8);
+  v.extend_from_slice(&addr.octets());
+  v.extend_from_slice(&index.to_ne_bytes());
+  v
+}
+
+/// The Linux/Apple 12-byte `struct in_pktinfo`: `ipi_ifindex`, `ipi_spec_dst`,
+/// `ipi_addr`. Used to feed each parser the OTHER platform's layout.
+fn synth_linux_in_pktinfo(index: u32, spec_dst: Ipv4Addr, addr: Ipv4Addr) -> Vec<u8> {
+  let mut v = Vec::with_capacity(12);
+  v.extend_from_slice(&index.to_ne_bytes());
+  v.extend_from_slice(&spec_dst.octets());
+  v.extend_from_slice(&addr.octets());
+  v
+}
+
+#[test]
+fn decode_recvdstaddr_reads_a_network_order_in_addr() {
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+  assert_eq!(decode_recvdstaddr(&group.octets()), Some(group));
+  // A unicast destination must survive the same path: RFC 6762 §11 picks
+  // between its two local-link tests by exactly this value, so the parser must
+  // not be able to turn a unicast arrival into a group one or the reverse.
+  let unicast = Ipv4Addr::new(192, 168, 1, 100);
+  assert_eq!(decode_recvdstaddr(&unicast.octets()), Some(unicast));
+}
+
+#[test]
+fn decode_recvdstaddr_rejects_a_truncated_in_addr() {
+  assert_eq!(decode_recvdstaddr(&[224, 0, 0]), None);
+  assert_eq!(decode_recvdstaddr(&[]), None);
+}
+
+#[test]
+fn decode_recvif_index_reads_sdl_index_out_of_the_fixed_prefix() {
+  // The kernels' shortest form: `sdl_len` == offsetof(sdl_data), no trailing
+  // name or hardware address.
+  assert_eq!(decode_recvif_index(&synth_sockaddr_dl(42, &[])), Some(42));
+
+  // And the long form. `sockaddr_dl` is variable-length — the kernel copies
+  // the interface's own link-layer address, whose length depends on the
+  // interface name and hardware address — so the index must be read from the
+  // fixed prefix and the tail ignored, never located relative to the end.
+  let long = synth_sockaddr_dl(42, b"em0\x00\x11\x22\x33\x44\x55\x66");
+  assert!(long.len() > 8, "the long form must actually be longer");
+  assert_eq!(decode_recvif_index(&long), Some(42));
+
+  // A wide index still round-trips: `sdl_index` is a `u_short`, so the top of
+  // the 16-bit range has to survive the widening to u32 unchanged.
+  assert_eq!(
+    decode_recvif_index(&synth_sockaddr_dl(u16::MAX, &[])),
+    Some(u32::from(u16::MAX))
+  );
+}
+
+#[test]
+fn decode_recvif_index_rejects_a_payload_shorter_than_the_fixed_prefix() {
+  let full = synth_sockaddr_dl(42, &[]);
+  for short in 0..full.len() {
+    assert_eq!(
+      decode_recvif_index(&full[..short]),
+      None,
+      "{short} bytes is not a sockaddr_dl and must not be decoded as one"
+    );
+  }
+}
+
+#[test]
+fn decode_recvif_index_passes_through_the_kernel_dummy_zero() {
+  // `sdl_index = 0` is what the BSD kernels' `makedummy` path emits when a
+  // datagram has no receive interface. It is a decoded value, not a decode
+  // failure, and it means exactly what the zero index a target without this
+  // cmsg reports means: the platform is not naming an interface.
+  assert_eq!(decode_recvif_index(&synth_sockaddr_dl(0, &[])), Some(0));
+}
+
+#[test]
+fn scan_dstaddr_recvif_skips_unrelated_cmsgs_and_recovers_both() {
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+  let sdl = synth_sockaddr_dl(7, b"em0");
+  let ttl: libc::c_int = 255;
+  let parts: &[(libc::c_int, libc::c_int, &[u8])] = &[
+    // A different level entirely.
+    (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4]),
+    (libc::IPPROTO_IP, IP_RECVDSTADDR_TY, &group.octets()),
+    // Same level, unrelated type — including the number OpenBSD uses for
+    // IP_RECVIF, which must NOT match while scanning with 20.
+    (libc::IPPROTO_IP, libc::IP_TTL, &ttl.to_ne_bytes()),
+    (libc::IPPROTO_IP, IP_RECVIF_TY_OPENBSD, &sdl),
+    (libc::IPPROTO_IP, IP_RECVIF_TY, &sdl),
+  ];
+  let buf = synth_cmsgs(parts);
+  assert_eq!(
+    CmsgIter::new(&buf).count(),
+    parts.len(),
+    "the synthesized stride must match the one CmsgIter derives from CMSG_SPACE"
+  );
+
+  let (destination, iface) = scan_dstaddr_recvif(&buf, IP_RECVDSTADDR_TY, IP_RECVIF_TY);
+  assert_eq!(destination, Some(group));
+  assert_eq!(iface, Some(7));
+}
+
+#[test]
+fn scan_dstaddr_recvif_honours_the_type_numbers_it_is_given() {
+  // OpenBSD spells IP_RECVIF 30 where FreeBSD/DragonFly/NetBSD spell it 20.
+  // The same buffer must therefore yield the interface under one number and
+  // not under the other — proving the walk reads its parameters rather than a
+  // hardcoded constant, which is what makes `libc`'s per-target numbers the
+  // only thing this parse takes on trust.
+  let sdl = synth_sockaddr_dl(9, &[]);
+  let buf = synth_cmsgs(&[(libc::IPPROTO_IP, IP_RECVIF_TY_OPENBSD, &sdl)]);
+
+  let (_, openbsd) = scan_dstaddr_recvif(&buf, IP_RECVDSTADDR_TY, IP_RECVIF_TY_OPENBSD);
+  assert_eq!(openbsd, Some(9));
+
+  let (_, freebsd) = scan_dstaddr_recvif(&buf, IP_RECVDSTADDR_TY, IP_RECVIF_TY);
+  assert_eq!(freebsd, None);
+}
+
+#[test]
+fn scan_dstaddr_recvif_reports_each_half_of_the_pair_independently() {
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+
+  // Destination only: the two cmsgs are separately enabled and separately
+  // delivered, so one arriving without the other is a real case.
+  let dst_only = synth_cmsgs(&[(libc::IPPROTO_IP, IP_RECVDSTADDR_TY, &group.octets())]);
+  assert_eq!(
+    scan_dstaddr_recvif(&dst_only, IP_RECVDSTADDR_TY, IP_RECVIF_TY),
+    (Some(group), None)
+  );
+
+  // Interface only.
+  let sdl = synth_sockaddr_dl(3, &[]);
+  let if_only = synth_cmsgs(&[(libc::IPPROTO_IP, IP_RECVIF_TY, &sdl)]);
+  assert_eq!(
+    scan_dstaddr_recvif(&if_only, IP_RECVDSTADDR_TY, IP_RECVIF_TY),
+    (None, Some(3))
+  );
+
+  // Neither: an empty buffer, and a buffer holding only unrelated cmsgs.
+  assert_eq!(
+    scan_dstaddr_recvif(&[], IP_RECVDSTADDR_TY, IP_RECVIF_TY),
+    (None, None)
+  );
+  let unrelated = synth_cmsgs(&[(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4])]);
+  assert_eq!(
+    scan_dstaddr_recvif(&unrelated, IP_RECVDSTADDR_TY, IP_RECVIF_TY),
+    (None, None)
+  );
+
+  // A truncated destination payload does not become a bogus address, and does
+  // not cost us the interface sitting next to it.
+  let truncated = synth_cmsgs(&[
+    (libc::IPPROTO_IP, IP_RECVDSTADDR_TY, &[224, 0, 0]),
+    (libc::IPPROTO_IP, IP_RECVIF_TY, &sdl),
+  ]);
+  assert_eq!(
+    scan_dstaddr_recvif(&truncated, IP_RECVDSTADDR_TY, IP_RECVIF_TY),
+    (None, Some(3))
+  );
+}
+
+#[test]
+fn decode_netbsd_pktinfo_reads_the_eight_byte_layout() {
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+  assert_eq!(
+    decode_netbsd_pktinfo(&synth_netbsd_in_pktinfo(group, 42)),
+    Some((group, 42))
+  );
+  // ipi_ifindex is an `unsigned int`, not the `u_short` of sockaddr_dl.
+  assert_eq!(
+    decode_netbsd_pktinfo(&synth_netbsd_in_pktinfo(group, u32::from(u16::MAX) + 1)),
+    Some((group, 65536))
+  );
+}
+
+#[test]
+fn decode_netbsd_pktinfo_rejects_a_truncated_payload() {
+  let full = synth_netbsd_in_pktinfo(Ipv4Addr::new(224, 0, 0, 251), 42);
+  for short in 0..full.len() {
+    assert_eq!(
+      decode_netbsd_pktinfo(&full[..short]),
+      None,
+      "{short} bytes is not a NetBSD in_pktinfo"
+    );
+  }
+}
+
+#[test]
+fn decode_netbsd_pktinfo_rejects_the_twelve_byte_linux_layout() {
+  // THE misread this parser exists to prevent. The Linux/Apple `in_pktinfo`
+  // is 12 bytes ordered ipi_ifindex / ipi_spec_dst / ipi_addr; NetBSD's is 8
+  // ordered ipi_addr / ipi_ifindex. Decoded as NetBSD's, the Linux struct
+  // would hand back its interface index as the destination address and its
+  // ipi_spec_dst as the index — both plausible-looking, neither out of range,
+  // nothing to notice at runtime. The exact-length test is what stops it.
+  let linux = synth_linux_in_pktinfo(
+    42,
+    Ipv4Addr::new(192, 168, 1, 100),
+    Ipv4Addr::new(224, 0, 0, 251),
+  );
+  assert_eq!(linux.len(), 12);
+  assert_eq!(decode_netbsd_pktinfo(&linux), None);
+
+  // And through the walk, so a promotion that swapped the decoder for a
+  // permissive one could not slip past on the cmsg type alone.
+  let buf = synth_cmsgs(&[(libc::IPPROTO_IP, IP_PKTINFO_TY_NETBSD, &linux)]);
+  assert_eq!(scan_netbsd_pktinfo(&buf, IP_PKTINFO_TY_NETBSD), None);
+}
+
+/// The other direction of the same confusion: the 12-byte parser must keep
+/// refusing NetBSD's 8-byte struct rather than reading four bytes past its end
+/// or accepting a short one. This is the behaviour `build.rs` cites as the
+/// reason NetBSD is excluded from `has_ip_pktinfo`, pinned so it stays true.
+#[cfg(has_ip_pktinfo)]
+#[test]
+fn parse_pktinfo_v4_rejects_the_netbsd_eight_byte_layout() {
+  let netbsd = synth_netbsd_in_pktinfo(Ipv4Addr::new(224, 0, 0, 251), 42);
+  assert_eq!(netbsd.len(), 8);
+  let buf = synth_cmsg(libc::IPPROTO_IP, libc::IP_PKTINFO, &netbsd);
+  let peer: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5353).into();
+  let err = parse_pktinfo_v4(&buf, 200, peer).unwrap_err();
+  let detail = err
+    .try_unwrap_buffer_too_short()
+    .expect("expected BufferTooShort, not a decoded meta");
+  assert_eq!(detail.needed(), 12);
+  assert_eq!(detail.have(), 8);
+}
+
+#[test]
+fn scan_netbsd_pktinfo_skips_unrelated_cmsgs() {
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+  let ttl: libc::c_int = 255;
+  let sdl = synth_sockaddr_dl(9, &[]);
+  let parts: &[(libc::c_int, libc::c_int, &[u8])] = &[
+    (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4]),
+    (libc::IPPROTO_IP, libc::IP_TTL, &ttl.to_ne_bytes()),
+    // NetBSD binds IP_RECVDSTADDR/IP_RECVIF too, so both can legitimately
+    // share the buffer with IP_PKTINFO; neither may be mistaken for it.
+    (libc::IPPROTO_IP, IP_RECVDSTADDR_TY, &group.octets()),
+    (libc::IPPROTO_IP, IP_RECVIF_TY, &sdl),
+    (
+      libc::IPPROTO_IP,
+      IP_PKTINFO_TY_NETBSD,
+      &synth_netbsd_in_pktinfo(group, 42),
+    ),
+  ];
+  let buf = synth_cmsgs(parts);
+  assert_eq!(
+    CmsgIter::new(&buf).count(),
+    parts.len(),
+    "the synthesized stride must match the one CmsgIter derives from CMSG_SPACE"
+  );
+  assert_eq!(
+    scan_netbsd_pktinfo(&buf, IP_PKTINFO_TY_NETBSD),
+    Some((group, 42))
+  );
+}
+
+#[test]
+fn scan_netbsd_pktinfo_is_none_without_its_own_cmsg() {
+  assert_eq!(scan_netbsd_pktinfo(&[], IP_PKTINFO_TY_NETBSD), None);
+  let ttl: libc::c_int = 255;
+  let unrelated = synth_cmsgs(&[
+    (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4]),
+    (libc::IPPROTO_IP, libc::IP_TTL, &ttl.to_ne_bytes()),
+  ]);
+  assert_eq!(scan_netbsd_pktinfo(&unrelated, IP_PKTINFO_TY_NETBSD), None);
 }
