@@ -389,10 +389,10 @@ fn a_chronically_failing_family_never_opens_the_fully_announced_gate() {
 fn a_zero_gap_is_ungated_and_records_nothing() {
   let base = StdInstant::now();
   let mut gate = FamilyWireGate::default();
-  assert_eq!(gate.allow(base, Duration::ZERO), [true, true]);
+  assert_eq!(gate.allow_at(base, Duration::ZERO), [true, true]);
   gate.note(report(sent(base, 0), sent(base, 0)), Duration::ZERO);
   assert_eq!(
-    gate.allow(base, Duration::ZERO),
+    gate.allow_at(base, Duration::ZERO),
     [true, true],
     "a one-shot §6 reply must not defer the announcement that follows it"
   );
@@ -402,7 +402,7 @@ fn a_zero_gap_is_ungated_and_records_nothing() {
 fn a_family_that_has_carried_nothing_is_open() {
   let base = StdInstant::now();
   let gate = FamilyWireGate::default();
-  assert_eq!(gate.allow(base, Duration::from_secs(1)), [true, true]);
+  assert_eq!(gate.allow_at(base, Duration::from_secs(1)), [true, true]);
 }
 
 #[test]
@@ -413,11 +413,14 @@ fn each_family_reopens_on_its_own_acceptance_instant() {
   // v4 accepted at +0, v6 at +3: the inter-family skew the core cannot see.
   gate.note(report(sent(base, 0), sent(base, 3)), gap);
   assert_eq!(
-    gate.allow(base + Duration::from_millis(3500), gap),
+    gate.allow_at(base + Duration::from_millis(3500), gap),
     [true, false],
     "v4 has paid its second; v6's own second is not up until +4"
   );
-  assert_eq!(gate.allow(base + Duration::from_secs(4), gap), [true, true]);
+  assert_eq!(
+    gate.allow_at(base + Duration::from_secs(4), gap),
+    [true, true]
+  );
 }
 
 #[test]
@@ -427,7 +430,7 @@ fn a_family_that_missed_does_not_move_its_gate() {
   let mut gate = FamilyWireGate::default();
   gate.note(report(sent(base, 0), SendOutcome::Failed), gap);
   assert_eq!(
-    gate.allow(base, gap),
+    gate.allow_at(base, gap),
     [false, true],
     "v6 carried nothing, so it owes no gap and must be offered the re-arm"
   );
@@ -441,10 +444,10 @@ fn a_gated_family_does_not_move_its_own_gate() {
   gate.note(report(sent(base, 0), sent(base, 0)), gap);
   // Half a second later both are shut; the shut round must not push them out.
   let mid = base + Duration::from_millis(500);
-  assert_eq!(gate.allow(mid, gap), [false, false]);
+  assert_eq!(gate.allow_at(mid, gap), [false, false]);
   gate.note(report(SendOutcome::Gated, SendOutcome::Gated), gap);
   assert_eq!(
-    gate.allow(base + Duration::from_secs(1), gap),
+    gate.allow_at(base + Duration::from_secs(1), gap),
     [true, true],
     "the gate reopens one gap after the last ACCEPTANCE, not after the last attempt"
   );
@@ -457,7 +460,7 @@ fn a_clock_that_reads_before_the_recorded_send_keeps_the_gate_shut() {
   let mut gate = FamilyWireGate::default();
   gate.note(report(sent(base, 0), sent(base, 0)), gap);
   assert_eq!(
-    gate.allow(base - Duration::from_secs(5), gap),
+    gate.allow_at(base - Duration::from_secs(5), gap),
     [false, false],
     "the elapsed gap is unknown, and the conservative answer is the one that \
      cannot put a record back on the wire too soon"
@@ -491,13 +494,13 @@ fn the_confirm_anchors_before_the_syscall_and_the_gate_after_it() {
   let mut gate = FamilyWireGate::default();
   gate.note(rep, gap);
   assert_eq!(
-    gate.allow(base + gap, gap),
+    gate.allow_at(base + gap, gap),
     [false, true],
     "the bytes reached the wire `stall` after the confirm anchor, so one gap \
      measured from that anchor has NOT paid this wire its second"
   );
   assert_eq!(
-    gate.allow(base + gap + stall, gap),
+    gate.allow_at(base + gap + stall, gap),
     [true, true],
     "one gap after the bytes actually landed, and not before"
   );
@@ -511,7 +514,7 @@ fn the_gate_indices_match_the_cores_family_order() {
   let gap = Duration::from_secs(1);
   let mut gate = FamilyWireGate::default();
   gate.note(report(sent(base, 0), SendOutcome::Failed), gap);
-  let allow = gate.allow(base, gap);
+  let allow = gate.allow_at(base, gap);
   assert!(
     !allow[FAMILY_V4] && allow[FAMILY_V6],
     "an index mismatch would gate the wrong wire"

@@ -116,12 +116,14 @@ pub(crate) const SELF_SEND_TTL: Duration = Duration::from_secs(2);
 ///
 /// **It counts credits that are still alive.** At the cap,
 /// [`SelfSendTracker::record`] first reclaims every entry that is already dead —
-/// sealed and past the TTL — and declines to add the new entry only if that
-/// still leaves no room. It never evicts a live one: a flood of sends must not
+/// sealed and past the TTL — and then decides, against a clock read **at the
+/// decision** ([`SelfSendTracker::admit`]), whether the new entry still has
+/// nowhere to go. It never evicts a live one: a flood of sends must not
 /// displace a credit that is still waiting to match its own loopback copy, and
 /// equally a heap of corpses must not displace a credit that has not been
 /// recorded yet. See [`SelfSendTracker::reclaim_expired_sealed`] for why only
-/// the dead half is reclaimable.
+/// the dead half is reclaimable, and [`SelfSendTracker::admit`] for why the
+/// reclaim's own length is not an answer to the cap question.
 pub(crate) const MAX_SELF_SEND_ENTRIES: usize = 65536;
 
 /// How an inbound datagram's timestamp is weighed against a recorded send.
@@ -198,6 +200,30 @@ pub(crate) struct SelfSendTracker {
   /// One [`Credit`] per recorded send, insertion ordered and scanned linearly.
   /// [`SELF_SEND_TTL`] and [`MAX_SELF_SEND_ENTRIES`] keep this small enough
   /// that a `Vec` needs no fancier index.
+  ///
+  /// # Insertion order **is** expiry order, and [`Self::admit`] depends on it
+  ///
+  /// For any `i < j`, entry `i` expires no later than entry `j` — reading an
+  /// unsealed [`Credit::aged_from`] (`None`) as "expires never". So the entry
+  /// closest to expiry is always the **front**, and "is any entry dead at this
+  /// instant?" is an `O(1)` question rather than a scan that could itself go
+  /// stale. That is what makes the cap's admission decision decision-local; see
+  /// [`Self::admit`].
+  ///
+  /// It holds by construction, under every operation this type has:
+  ///
+  /// * [`Self::record`] appends, and a fresh credit is unsealed — the largest
+  ///   expiry there is — so it can only ever go at the back;
+  /// * [`Self::seal`] stamps every unsealed credit with one instant. The
+  ///   unsealed credits are exactly the suffix appended since the previous seal,
+  ///   and the driver seals with the tick's monotonic `now`, which is
+  ///   non-decreasing across ticks — so the suffix takes an anchor at or after
+  ///   every anchor already assigned;
+  /// * [`Self::take`] and [`Self::reclaim_expired_sealed`] only ever remove, and
+  ///   removal preserves relative order.
+  ///
+  /// The seal's non-decreasing instant is the one half a caller could break, and
+  /// it is [`Self::seal`]'s stated contract.
   entries: Vec<Credit>,
 }
 
@@ -248,18 +274,100 @@ impl SelfSendTracker {
   /// The reclaim is gated on the cap rather than run every time: below it there
   /// is nothing to make room for, so the clock read and the scan are both
   /// skipped and the routine sweep stays exactly where the anchor is.
+  ///
+  /// # The sweep is a sweep; [`Self::admit`] is the decision
+  ///
+  /// The bulk reclaim above is bounded only by [`MAX_SELF_SEND_ENTRIES`], so it
+  /// weighs up to 65 536 credits against **one** instant read before it started.
+  /// A credit that was live when the sweep looked at it can be dead by the time
+  /// the sweep finishes, and deciding the cap on the length that sweep left
+  /// behind is a decision made against a stale reading — the same defect class
+  /// that cost this crate seven rounds elsewhere. So the length test is not the
+  /// decision: [`Self::admit`] is, and it reads the clock at itself.
   pub(crate) fn record(&mut self, family: Family, body: &[u8], sent: SystemTime) {
+    self.record_by(family, body, sent, StdInstant::now);
+  }
+
+  /// [`Self::record`] with the **bulk sweep's** clock chosen by the caller, so a
+  /// test can hold that reading still while real time runs past it — which is
+  /// exactly what a sweep of 65 536 entries does to it.
+  ///
+  /// `#[cfg(test)]`, permanently. It fakes only the sweep; the admission
+  /// decision below reads the live clock in every build, so there is no build in
+  /// which the cap is decided against an instant a caller handed in. Same seam
+  /// as [`Self::take_at`].
+  #[cfg(test)]
+  pub(crate) fn record_with_stale_sweep(
+    &mut self,
+    family: Family,
+    body: &[u8],
+    sent: SystemTime,
+    sweep_now: StdInstant,
+  ) {
+    self.record_by(family, body, sent, move || sweep_now);
+  }
+
+  /// The one body behind [`Self::record`] and [`Self::record_with_stale_sweep`].
+  fn record_by(
+    &mut self,
+    family: Family,
+    body: &[u8],
+    sent: SystemTime,
+    sweep_clock: impl Fn() -> StdInstant,
+  ) {
     let hash = fnv1a(body);
     if self.entries.len() >= MAX_SELF_SEND_ENTRIES {
-      self.reclaim_expired_sealed(StdInstant::now());
+      self.reclaim_expired_sealed(sweep_clock());
     }
-    if self.entries.len() < MAX_SELF_SEND_ENTRIES {
+    if self.admit() {
       self.entries.push(Credit {
         family,
         hash,
         sent,
         aged_from: None,
       });
+    }
+  }
+
+  /// Whether a new credit fits **at the instant this decides**, freeing the one
+  /// slot it needs when the only thing in the way is a corpse.
+  ///
+  /// # It takes no instant, and the check it makes is `O(1)`
+  ///
+  /// Below the cap there is nothing to weigh. At the cap the only room is a dead
+  /// credit, and because [`Self::entries`] is expiry-ordered (see that field)
+  /// the earliest expiry there is is the **front** — so "is anything dead now?"
+  /// is one comparison, and the clock read sits immediately before it with
+  /// nothing but that comparison in between. That is the same floor
+  /// [`Self::take`] reaches: something must read a clock before something can
+  /// compare against it, and there is no work left inside the gap to move out.
+  ///
+  /// A scan would not do. Weighing every entry against one reading is what the
+  /// bulk sweep in [`Self::record`] already does, and it is precisely why the
+  /// admission cannot be decided on the length that sweep produced: entries it
+  /// found live can expire before it returns, and a second scan would inherit
+  /// the same window. The ordering invariant is what replaces the scan with an
+  /// exact answer.
+  ///
+  /// Refusing here is not a lost byte. It is this endpoint ingesting its own
+  /// loopback as peer traffic — a phantom conflict against itself and the RFC
+  /// 6762 §9 rename that follows — so the direction that must never be taken
+  /// wrongly is the refusal.
+  fn admit(&mut self) -> bool {
+    if self.entries.len() < MAX_SELF_SEND_ENTRIES {
+      return true;
+    }
+    match self.entries.first() {
+      // Dead at the instant this decides: reclaim exactly the one slot needed.
+      // The removal happens AFTER the decision, so nothing about it can go
+      // stale.
+      Some(front) if !still_live(StdInstant::now(), front.aged_from) => {
+        self.entries.remove(0);
+        true
+      }
+      // The earliest expiry there is has not arrived, so every credit here is
+      // live and the NEW one is the one that must give way.
+      _ => false,
     }
   }
 
@@ -309,6 +417,15 @@ impl SelfSendTracker {
   /// reclaim below is shared with [`Self::record`]'s cap path and is the *only*
   /// thing they share: this is where the window opens, and it is the only place
   /// that can open one.
+  ///
+  /// # Contract: `now` must be non-decreasing across calls
+  ///
+  /// The driver satisfies it by construction — `now` is the tick's own
+  /// monotonic read — and [`SelfSendTracker::entries`]'s expiry order depends on
+  /// it: this is the one operation that can assign an anchor, so sealing with an
+  /// instant *earlier* than a previous seal's is the only way to put a
+  /// later-inserted credit ahead of an earlier one in expiry order, which is
+  /// what [`Self::admit`]'s `O(1)` front check reads.
   pub(crate) fn seal(&mut self, now: StdInstant) {
     self.reclaim_expired_sealed(now);
     for credit in &mut self.entries {
@@ -466,6 +583,17 @@ impl SelfSendTracker {
   #[cfg(test)]
   pub(crate) fn len(&self) -> usize {
     self.entries.len()
+  }
+
+  /// Every entry's ageing anchor, in storage order, so a test can assert the
+  /// expiry order [`Self::admit`] depends on.
+  ///
+  /// Test-only, permanently, and for the same reason as [`Self::len`]: the
+  /// driver drives this type through `record`, `seal` and `take` and never reads
+  /// its layout.
+  #[cfg(test)]
+  pub(crate) fn anchors_for_test(&self) -> Vec<Option<StdInstant>> {
+    self.entries.iter().map(|c| c.aged_from).collect()
   }
 }
 

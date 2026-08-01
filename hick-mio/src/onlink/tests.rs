@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use super::{
-  addr_in_subnet, admits_ingress, arrived_on_bound_interface, is_on_link, reports_rx_interface,
-  src_on_local_link,
+  addr_in_subnet, admits_ingress, arrived_on_bound_interface, is_mdns_group, is_on_link,
+  reports_rx_interface, src_on_local_link,
 };
 
 /// The interface this fixture's endpoint is pinned to.
@@ -14,6 +14,23 @@ const OTHER: u32 = 9;
 const ON_SUBNET_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7));
 /// The bound interface's configured subnets.
 const SUBNETS: [(IpAddr, u8); 1] = [(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)), 24u8)];
+
+/// A **unicast** destination, per family: the arm of §11 that does consult the
+/// source prefix. Every pre-existing case below passes one of these, because a
+/// unicast destination is the condition they were all implicitly written under.
+const UNICAST_V4_DST: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2));
+const UNICAST_V6_DST: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2));
+
+/// The two mDNS groups, the destinations §11 says establish local-link origin
+/// on their own.
+const V4_GROUP: IpAddr = IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP);
+const V6_GROUP: IpAddr = IpAddr::V6(hick_udp::constants::MDNS_IPV6_GROUP);
+
+/// Routable sources on prefixes the bound interface does NOT have configured:
+/// the overlaid-subnet host §11 names, which the source-prefix arm cannot admit
+/// and must not be asked to.
+const OFF_SUBNET_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 4, 4, 4));
+const OFF_SUBNET_V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xbeef, 0, 0, 0, 0, 1));
 
 /// [`ON_SUBNET_IP`] as the peer the receive path actually hands the boundary.
 fn on_subnet() -> SocketAddr {
@@ -287,6 +304,7 @@ fn a_conforming_hop_limit_does_not_excuse_a_foreign_interface() {
   // the RFC 6762 §8.2 conflict handling.
   assert!(!admits_ingress(
     on_subnet(),
+    UNICAST_V4_DST,
     Some(255),
     &SUBNETS,
     BOUND,
@@ -295,6 +313,7 @@ fn a_conforming_hop_limit_does_not_excuse_a_foreign_interface() {
   // And the same datagram on the interface we bound is still admitted.
   assert!(admits_ingress(
     on_subnet(),
+    UNICAST_V4_DST,
     Some(255),
     &SUBNETS,
     BOUND,
@@ -312,9 +331,17 @@ fn a_conforming_hop_limit_does_not_excuse_a_conflicting_scope() {
   // router", nothing answered "whose link is this", and the datagram was
   // admitted.
   let foreign_zone = scoped(LINK_LOCAL, OTHER);
-  assert!(!admits_ingress(foreign_zone, Some(255), &SUBNETS, BOUND, 0));
   assert!(!admits_ingress(
     foreign_zone,
+    UNICAST_V6_DST,
+    Some(255),
+    &SUBNETS,
+    BOUND,
+    0
+  ));
+  assert!(!admits_ingress(
+    foreign_zone,
+    UNICAST_V6_DST,
     Some(255),
     &SUBNETS,
     BOUND,
@@ -324,6 +351,7 @@ fn a_conforming_hop_limit_does_not_excuse_a_conflicting_scope() {
   // scope and not the address family.
   assert!(admits_ingress(
     scoped(LINK_LOCAL, BOUND),
+    UNICAST_V6_DST,
     Some(255),
     &SUBNETS,
     BOUND,
@@ -336,11 +364,26 @@ fn a_foreign_interface_is_rejected_with_no_hop_metadata_either() {
   // The fallback branch, on a platform that delivers no TTL cmsg. Its own
   // interface check only ever covered a LINK-LOCAL source; a routable source
   // inside the bound interface's subnet passed it on any interface at all.
-  assert!(!admits_ingress(on_subnet(), None, &SUBNETS, BOUND, OTHER));
-  assert!(admits_ingress(on_subnet(), None, &SUBNETS, BOUND, BOUND));
+  assert!(!admits_ingress(
+    on_subnet(),
+    UNICAST_V4_DST,
+    None,
+    &SUBNETS,
+    BOUND,
+    OTHER
+  ));
+  assert!(admits_ingress(
+    on_subnet(),
+    UNICAST_V4_DST,
+    None,
+    &SUBNETS,
+    BOUND,
+    BOUND
+  ));
   // And the scope witness reaches the fallback branch too.
   assert!(!admits_ingress(
     scoped(LINK_LOCAL, OTHER),
+    UNICAST_V6_DST,
     None,
     &SUBNETS,
     BOUND,
@@ -413,7 +456,7 @@ fn admits_ingress_reads_the_capability_of_the_peers_own_family() {
   // Pinned against the same constants rather than a hardcoded expectation: the
   // point is that the two track each other, on every platform this runs on.
   assert_eq!(
-    admits_ingress(on_subnet(), Some(255), &SUBNETS, BOUND, 0),
+    admits_ingress(on_subnet(), UNICAST_V4_DST, Some(255), &SUBNETS, BOUND, 0),
     !hick_udp::reports_rx_interface_v4(),
     "an IPv4 zero index must be admitted exactly where the platform reports no interface"
   );
@@ -429,7 +472,14 @@ fn admits_ingress_reads_the_capability_of_the_peers_own_family() {
   // IPv6 is provable on every supported target, so a zero index there is always
   // a failed proof and never silence.
   assert!(hick_udp::reports_rx_interface_v6());
-  assert!(!admits_ingress(global_v6, Some(255), &SUBNETS, BOUND, 0));
+  assert!(!admits_ingress(
+    global_v6,
+    UNICAST_V6_DST,
+    Some(255),
+    &SUBNETS,
+    BOUND,
+    0
+  ));
 }
 
 #[test]
@@ -446,7 +496,14 @@ fn a_bound_interface_of_zero_proves_nothing_and_so_forbids_nothing() {
     OTHER,
     true
   ));
-  assert!(admits_ingress(on_subnet(), Some(255), &SUBNETS, 0, OTHER));
+  assert!(admits_ingress(
+    on_subnet(),
+    UNICAST_V4_DST,
+    Some(255),
+    &SUBNETS,
+    0,
+    OTHER
+  ));
 }
 
 #[test]
@@ -481,6 +538,7 @@ fn a_loopback_source_is_admitted_from_any_interface() {
   ));
   assert!(admits_ingress(
     scoped(Ipv6Addr::LOCALHOST, OTHER),
+    UNICAST_V6_DST,
     Some(255),
     &[],
     BOUND,
@@ -488,13 +546,17 @@ fn a_loopback_source_is_admitted_from_any_interface() {
   ));
   assert!(admits_ingress(
     peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    UNICAST_V4_DST,
     Some(255),
     &[],
     BOUND,
     OTHER
   ));
+  // The loopback exception is the SOURCE's, not the destination's: it still
+  // holds on the unicast arm, with no group destination to carry it.
   assert!(admits_ingress(
     peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    UNICAST_V4_DST,
     None,
     &[],
     BOUND,
@@ -508,6 +570,7 @@ fn the_interface_gate_does_not_replace_the_hop_limit_rule() {
   // additional condition, never a substitute.
   assert!(!admits_ingress(
     on_subnet(),
+    UNICAST_V4_DST,
     Some(254),
     &SUBNETS,
     BOUND,
@@ -515,18 +578,178 @@ fn the_interface_gate_does_not_replace_the_hop_limit_rule() {
   ));
   assert!(!admits_ingress(
     on_subnet(),
+    UNICAST_V4_DST,
     Some(1),
     &SUBNETS,
     BOUND,
     BOUND
   ));
   // Right interface, no hop metadata, and a global source with no matching
-  // subnet: the fallback still fails closed.
+  // subnet: the unicast fallback still fails closed.
   assert!(!admits_ingress(
     peer(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+    UNICAST_V4_DST,
     None,
     &SUBNETS,
     BOUND,
     BOUND
   ));
+}
+
+// ── §11's two arms, selected by DESTINATION ─────────────────────────────────
+//
+// §11 gives the local-link test two forms and the IP header's destination picks
+// between them: a datagram addressed to 224.0.0.251 or FF02::FB is "necessarily
+// deemed to have originated on the local link, regardless of source IP address",
+// and only a UNICAST destination puts the source address to the subnet check.
+// This crate had the unicast form alone and applied it to both.
+
+#[test]
+fn a_group_destination_establishes_local_link_origin_with_no_hop_limit() {
+  // The defect, in the shape Windows actually produces: `set_recv_ttl_v4` and
+  // `set_recv_hoplimit_v6` are no-ops there, so every datagram reaches the
+  // fallback with no hop limit at all — and a host on an overlaid subnet, or one
+  // simply misconfigured onto an unrelated prefix, sources from outside
+  // `SUBNETS`. §11 calls admitting it "essential ... in unusual configurations,
+  // such as multiple logical IP subnets overlayed on a single link". It was
+  // silently dropped.
+  assert!(admits_ingress(
+    peer(OFF_SUBNET_V4),
+    V4_GROUP,
+    None,
+    &SUBNETS,
+    BOUND,
+    BOUND
+  ));
+  assert!(admits_ingress(
+    peer(OFF_SUBNET_V6),
+    V6_GROUP,
+    None,
+    &SUBNETS,
+    BOUND,
+    BOUND
+  ));
+  // An empty subnet list is the same case with the evidence gone entirely: the
+  // group destination is the whole proof, so it must not depend on `subnets`.
+  assert!(admits_ingress(
+    peer(OFF_SUBNET_V4),
+    V4_GROUP,
+    None,
+    &[],
+    BOUND,
+    BOUND
+  ));
+}
+
+#[test]
+fn a_unicast_destination_still_answers_to_the_source_prefix_rule() {
+  // §11's other arm, reserved rather than deleted. Same source, same missing hop
+  // limit, same interface as the case above — only the destination differs, and
+  // with a unicast one the source address is the only evidence there is.
+  assert!(!admits_ingress(
+    peer(OFF_SUBNET_V4),
+    UNICAST_V4_DST,
+    None,
+    &SUBNETS,
+    BOUND,
+    BOUND
+  ));
+  assert!(!admits_ingress(
+    peer(OFF_SUBNET_V6),
+    UNICAST_V6_DST,
+    None,
+    &SUBNETS,
+    BOUND,
+    BOUND
+  ));
+  // And it still ADMITS on a matching prefix, so the arm is intact in both
+  // directions rather than merely unreachable.
+  assert!(admits_ingress(
+    on_subnet(),
+    UNICAST_V4_DST,
+    None,
+    &SUBNETS,
+    BOUND,
+    BOUND
+  ));
+}
+
+#[test]
+fn a_group_destination_does_not_excuse_a_foreign_interface_or_scope() {
+  // The interface check runs FIRST and gates both arms. A group destination
+  // proves a datagram was link-local to SOME link, never that it was ours, and a
+  // wildcard-bound socket on a multi-homed host is handed every NIC's copy.
+  assert!(!admits_ingress(
+    peer(OFF_SUBNET_V4),
+    V4_GROUP,
+    None,
+    &SUBNETS,
+    BOUND,
+    OTHER
+  ));
+  assert!(!admits_ingress(
+    peer(OFF_SUBNET_V6),
+    V6_GROUP,
+    None,
+    &SUBNETS,
+    BOUND,
+    OTHER
+  ));
+  // The scope witness too: an index naming our own interface does not rescue a
+  // source whose zone names another link, group destination or not.
+  assert!(!admits_ingress(
+    scoped(LINK_LOCAL, OTHER),
+    V6_GROUP,
+    None,
+    &SUBNETS,
+    BOUND,
+    BOUND
+  ));
+}
+
+#[test]
+fn a_group_destination_does_not_excuse_a_routed_hop_limit() {
+  // The group arm sits INSIDE the no-hop-limit branch: it replaces the
+  // source-prefix guess, which is the only thing §11 ever offered it as an
+  // alternative to. A hop limit below 255 crossed a router and stays decisive
+  // whatever the destination says.
+  assert!(!admits_ingress(
+    peer(OFF_SUBNET_V4),
+    V4_GROUP,
+    Some(254),
+    &SUBNETS,
+    BOUND,
+    BOUND
+  ));
+  assert!(!admits_ingress(
+    peer(OFF_SUBNET_V6),
+    V6_GROUP,
+    Some(1),
+    &SUBNETS,
+    BOUND,
+    BOUND
+  ));
+}
+
+#[test]
+fn only_the_two_mdns_groups_establish_local_link_origin() {
+  assert!(is_mdns_group(V4_GROUP));
+  assert!(is_mdns_group(V6_GROUP));
+  // The nearest neighbours in the same link-local blocks are LLMNR's groups,
+  // not ours; this is a trust boundary, not a link-local scope test.
+  assert!(!is_mdns_group(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 252))));
+  assert!(!is_mdns_group(IpAddr::V6(Ipv6Addr::new(
+    0xff02, 0, 0, 0, 0, 0, 1, 3
+  ))));
+  assert!(!is_mdns_group(UNICAST_V4_DST));
+  assert!(!is_mdns_group(UNICAST_V6_DST));
+  // What a target with no PKTINFO parser degrades to. It must read as unicast,
+  // so the source-prefix rule keeps deciding exactly as it did before.
+  assert!(!is_mdns_group(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+  assert!(!is_mdns_group(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+  // The families do not cross: a group compared against the other family's
+  // address is not a match by accident of octets.
+  assert!(!is_mdns_group(IpAddr::V6(Ipv6Addr::new(
+    0, 0, 0, 0, 0, 0xffff, 0xe000, 0x00fb
+  ))));
 }

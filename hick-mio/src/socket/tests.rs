@@ -7,8 +7,8 @@ use std::{
 use mio::{Interest, Poll, Token};
 
 use super::{
-  ALLOW_BOTH, BIND_LOCK, Family, MAX_DISCARDED_PER_RECV, MAX_RECV_ERRORS_PER_ROUND, RecvRotor,
-  SendOutcome, SendReport, Sockets,
+  BIND_LOCK, Family, MAX_DISCARDED_PER_RECV, MAX_RECV_ERRORS_PER_ROUND, Mask, RecvRotor,
+  SendOutcome, SendReport, Sockets, Ungated,
 };
 use crate::options::ServerOptions;
 
@@ -161,7 +161,7 @@ fn deregistration_reaches_the_selector_that_holds_the_registration() {
   socks
     .register(other.registry(), Token(10), Token(11))
     .expect("the second Poll must be able to take the registration");
-  let report = socks.send_to(b"two-polls", MDNS_V4, ALLOW_BOTH);
+  let report = socks.send_to(b"two-polls", MDNS_V4, &Ungated);
   assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
 
   let mut events = mio::Events::with_capacity(8);
@@ -319,7 +319,7 @@ fn readiness_is_recorded_then_cleared_by_draining_to_wouldblock() {
   // EVERY socket joined on that interface, so we get our own copy back —
   // unlike a unicast to our own port, which macOS `SO_REUSEPORT` hands to just
   // one of the sockets bound to 5353 (usually the system responder).
-  let report = socks.send_to(b"ping", MDNS_V4, ALLOW_BOTH);
+  let report = socks.send_to(b"ping", MDNS_V4, &Ungated);
   assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
 
   let mut events = mio::Events::with_capacity(8);
@@ -408,7 +408,7 @@ fn a_registration_is_readable_only_for_the_life_of_the_socket() {
     socks.interest_for_test(Family::V4),
     Some(Interest::READABLE)
   );
-  let report = socks.send_to(b"body", MDNS_V4, ALLOW_BOTH);
+  let report = socks.send_to(b"body", MDNS_V4, &Ungated);
   assert!(matches!(report.v4, SendOutcome::Sent { .. }));
   assert_eq!(
     socks.interest_for_test(Family::V4),
@@ -527,7 +527,7 @@ fn a_multicast_send_reports_one_outcome_per_bound_family() {
     return;
   };
   let before = SystemTime::now();
-  let report = socks.send_to(b"body", MDNS_V4, ALLOW_BOTH);
+  let report = socks.send_to(b"body", MDNS_V4, &Ungated);
   let after = SystemTime::now();
 
   if socks.is_bound_for_test(Family::V6) {
@@ -596,7 +596,7 @@ fn a_unicast_send_reports_one_sent_and_one_no_socket() {
     return;
   };
   let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5354));
-  let report = socks.send_to(b"body", dst, ALLOW_BOTH);
+  let report = socks.send_to(b"body", dst, &Ungated);
   assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
   assert_eq!(report.v6, SendOutcome::NoSocket);
   assert_eq!(
@@ -615,7 +615,7 @@ fn an_unbound_family_reports_no_socket_rather_than_failed() {
     return;
   };
   let dst = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5354, 0, 0));
-  let report = socks.send_to(b"body", dst, ALLOW_BOTH);
+  let report = socks.send_to(b"body", dst, &Ungated);
   assert_eq!(report.v6, SendOutcome::NoSocket);
   assert_eq!(report.v4, SendOutcome::NoSocket);
   assert_eq!(stamps(&report).len(), 0);
@@ -630,7 +630,7 @@ fn send_one_rejects_a_destination_from_another_family() {
   // Failed, not NoSocket: the v4 family IS bound, the caller just passed a
   // destination it cannot carry.
   assert_eq!(
-    socks.send_one(Family::V4, b"body", v6_dst, ALLOW_BOTH),
+    socks.send_one(Family::V4, b"body", v6_dst, &Ungated),
     SendOutcome::Failed
   );
 }
@@ -643,7 +643,7 @@ fn a_shut_gate_withholds_the_datagram_without_a_syscall() {
   let Some(mut socks) = loopback_sockets(ServerOptions::default().with_ipv6(false)) else {
     return;
   };
-  let report = socks.send_to(b"body", MDNS_V4, [false, false]);
+  let report = socks.send_to(b"body", MDNS_V4, &Mask([false, false]));
   assert_eq!(report.v4, SendOutcome::Gated);
   assert_eq!(
     report.v6,
@@ -696,7 +696,7 @@ fn a_successful_send_bumps_packets_tx_and_bytes_tx() {
   };
   let before = socks.stats.snapshot();
   let body = b"ping";
-  let report = socks.send_to(body, MDNS_V4, ALLOW_BOTH);
+  let report = socks.send_to(body, MDNS_V4, &Ungated);
   assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
 
   let after = socks.stats.snapshot();
@@ -727,7 +727,7 @@ fn a_send_the_kernel_rejects_bumps_send_errors() {
   // is the one deterministic way to force a real `send_to` failure.
   let oversized = vec![0u8; 70_000];
   let before = socks.stats.snapshot();
-  let outcome = socks.send_one(Family::V4, &oversized, MDNS_V4, ALLOW_BOTH);
+  let outcome = socks.send_one(Family::V4, &oversized, MDNS_V4, &Ungated);
   assert_eq!(outcome, SendOutcome::Failed, "{outcome:?}");
 
   let after = socks.stats.snapshot();
@@ -756,7 +756,7 @@ fn a_family_mismatch_is_not_counted_as_a_send_error() {
   let v6_dst = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5354, 0, 0));
   let before = socks.stats.snapshot();
   assert_eq!(
-    socks.send_one(Family::V4, b"body", v6_dst, ALLOW_BOTH),
+    socks.send_one(Family::V4, b"body", v6_dst, &Ungated),
     SendOutcome::Failed
   );
   let after = socks.stats.snapshot();
@@ -793,7 +793,7 @@ fn a_truncated_datagram_bumps_packets_rx_bytes_rx_and_packets_dropped() {
   // (`readiness_is_recorded_then_cleared_by_draining_to_wouldblock`) as
   // reliable on every supported platform, so this needs no additional skip.
   let big = vec![0xABu8; 4096];
-  let report = socks.send_to(&big, MDNS_V4, ALLOW_BOTH);
+  let report = socks.send_to(&big, MDNS_V4, &Ungated);
   assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
 
   let mut events = mio::Events::with_capacity(8);
@@ -1020,7 +1020,7 @@ fn stop_reading_clears_readiness_and_records_a_failed_rearm_together() {
 /// makes that wait exist at all: the loopback copy is not necessarily in the
 /// receive queue by the time `sendto` returns.
 fn seed_one_datagram(socks: &mut Sockets, poll: &mut Poll, body: &[u8]) -> bool {
-  let report = socks.send_to(body, MDNS_V4, ALLOW_BOTH);
+  let report = socks.send_to(body, MDNS_V4, &Ungated);
   if !matches!(report.v4, SendOutcome::Sent { .. }) {
     eprintln!("skipping: the IPv4 multicast send did not reach the kernel ({report:?})");
     return false;
@@ -1254,7 +1254,7 @@ fn an_eintr_retry_reports_the_successful_attempts_stamps() {
 
   let before_wall = SystemTime::now();
   let before = StdInstant::now();
-  let report = socks.send_to(b"eintr-retry", MDNS_V4, ALLOW_BOTH);
+  let report = socks.send_to(b"eintr-retry", MDNS_V4, &Ungated);
   let SendOutcome::Sent {
     submitted_wall,
     submitted_at,

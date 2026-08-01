@@ -535,3 +535,126 @@ fn the_entry_cap_drops_the_new_entry_not_the_oldest() {
     MatchMode::Degraded
   ));
 }
+
+// ── the cap's admission decision ────────────────────────────────────────────
+//
+// The cap is enforced in two steps and only the second is a decision. The bulk
+// reclaim weighs up to `MAX_SELF_SEND_ENTRIES` credits against ONE instant read
+// before it started, so a credit that was live when it looked at it can be dead
+// by the time it returns; deciding the cap on the length that sweep left behind
+// refuses a live send's credit in order to keep corpses resident. A refused
+// credit is not a lost byte — it is this endpoint ingesting its own loopback as
+// peer traffic, a phantom conflict against itself and the RFC 6762 §9 rename
+// that follows.
+
+/// Fill a tracker to exactly [`MAX_SELF_SEND_ENTRIES`] with distinct bodies, and
+/// open every credit's window at `at`.
+fn full_tracker_sealed_at(at: StdInstant) -> SelfSendTracker {
+  let mut t = SelfSendTracker::new();
+  for i in 0..MAX_SELF_SEND_ENTRIES {
+    t.record(Family::V4, &(i as u64).to_le_bytes(), wall());
+  }
+  t.seal(at);
+  assert_eq!(
+    t.len(),
+    MAX_SELF_SEND_ENTRIES,
+    "the tracker must start full"
+  );
+  t
+}
+
+/// A sweep that finished before its own findings did. Every credit is dead at
+/// the admission decision, and every one of them was live at the instant the
+/// sweep weighed it — which is exactly what a 65 536-entry scan does to the
+/// reading it started from.
+///
+/// The sweep's clock is the only thing held still: the admission below reads the
+/// live clock here as it does in every build.
+#[test]
+fn the_cap_admits_against_the_clock_at_the_decision_not_the_sweeps() {
+  let base = mono();
+  let mut t = full_tracker_sealed_at(base);
+  // Real time runs past every credit's TTL while the sweep's reading does not.
+  std::thread::sleep(SELF_SEND_TTL + Duration::from_millis(50));
+  t.record_with_stale_sweep(Family::V4, b"fresh", wall(), base);
+  assert!(
+    t.take_at(
+      Family::V4,
+      b"fresh",
+      wall(),
+      StdInstant::now(),
+      MatchMode::Degraded
+    ),
+    "every resident credit was already dead when the cap was decided, so the \
+     new send must have been given one — refusing it makes this endpoint ingest \
+     its own loopback as a peer's datagram"
+  );
+}
+
+/// The other direction, and the one the cap exists for: a tracker whose credits
+/// are all genuinely live still refuses the new one rather than evicting any of
+/// them.
+#[test]
+fn the_cap_still_refuses_when_every_resident_credit_is_live() {
+  let base = mono();
+  let mut t = full_tracker_sealed_at(base);
+  t.record(Family::V4, b"fresh", wall());
+  assert_eq!(
+    t.len(),
+    MAX_SELF_SEND_ENTRIES,
+    "a live credit must never be displaced to make room"
+  );
+  assert!(
+    !t.take_at(
+      Family::V4,
+      b"fresh",
+      wall(),
+      StdInstant::now(),
+      MatchMode::Degraded
+    ),
+    "the NEW entry is the one dropped at the cap, never a live one"
+  );
+}
+
+/// Insertion order **is** expiry order, which is what makes the admission above
+/// an `O(1)` question instead of a scan that would go stale in turn.
+///
+/// Asserted over the interleaving that actually occurs: record, seal, record,
+/// seal, record — so the anchors run `[t0, t1, unsealed]`, non-decreasing with
+/// the unsealed suffix last.
+#[test]
+fn insertion_order_is_expiry_order() {
+  let mut t = SelfSendTracker::new();
+  let t0 = mono();
+  t.record(Family::V4, b"first", wall());
+  t.seal(t0);
+  t.record(Family::V4, b"second", wall());
+  t.seal(t0 + Duration::from_millis(10));
+  t.record(Family::V4, b"third", wall());
+  let anchors = t.anchors_for_test();
+  let mut previous: Option<StdInstant> = None;
+  let mut unsealed_seen = false;
+  for anchor in anchors {
+    match anchor {
+      Some(at) => {
+        assert!(
+          !unsealed_seen,
+          "an unsealed credit expires never, so nothing sealed may follow one"
+        );
+        if let Some(prev) = previous {
+          assert!(
+            at >= prev,
+            "anchors must be non-decreasing in storage order"
+          );
+        }
+        previous = Some(at);
+      }
+      None => unsealed_seen = true,
+    }
+  }
+  assert!(
+    unsealed_seen,
+    "the last record has not been sealed, so this must have exercised the \
+     unsealed suffix"
+  );
+}

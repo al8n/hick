@@ -20,7 +20,7 @@ use slab::Slab;
 
 use crate::{
   discovery::{LookupHandle, Lookups},
-  driver::{FamilyWireGate, SendHealth, TxQueue, TxSlot},
+  driver::{FamilyWireGate, GoodbyeLedger, SendHealth, TxQueue, TxSlot},
   error::{RegisterError, ServerError, StartQueryError},
   event::{Event, EventQueue},
   onlink::collect_local_subnets,
@@ -194,6 +194,11 @@ pub struct Mdns {
   /// [`mdns_proto::Endpoint::drain_completed_withdrawals`] and drained into the
   /// context GC.
   pub(crate) completed_scratch: Vec<ServiceHandle>,
+  /// Which families each in-flight RFC 6762 §10.1 goodbye still owes a round,
+  /// so a family that has paid is not offered the next one. See
+  /// [`GoodbyeLedger`] — it is a projection of the endpoint's own per-family
+  /// debt, and emphatically not a pending-send table.
+  pub(crate) goodbye_ledger: GoodbyeLedger,
   /// Work the driver knows is due **now** and that no deadline announces, so
   /// [`Mdns::next_timeout`] must not let the caller sleep on it.
   ///
@@ -290,6 +295,7 @@ impl Mdns {
       tx_queue: TxQueue::new(),
       retired_scratch: Vec::new(),
       completed_scratch: Vec::new(),
+      goodbye_ledger: GoodbyeLedger::new(),
       work_pending: false,
       shutting_down: false,
       #[cfg(feature = "stats")]
@@ -502,11 +508,10 @@ impl Mdns {
   ///
   /// Unknown and already-unregistered handles are accepted and ignored.
   pub fn unregister_service(&mut self, handle: ServiceHandle) {
-    let now = StdInstant::now();
     let Self {
       endpoint, services, ..
     } = self;
-    begin_service_withdrawal(endpoint, services, handle, now);
+    begin_service_withdrawal(endpoint, services, handle);
   }
 
   /// Begin the RFC 6762 §10.1 goodbye for every live service and refuse further
@@ -547,9 +552,16 @@ impl Mdns {
   /// deliberately left alone — they advertise nothing, so they owe no
   /// retraction, and they do not keep [`is_idle`](Self::is_idle) from becoming
   /// `true`.
+  ///
+  /// # Each withdrawal is scheduled from its own creation
+  ///
+  /// There is no `now` read here, deliberately. Every item this begins takes its
+  /// `next_at` and its 2 s anti-pin ceiling from the instant it is actually
+  /// created, inside `begin_service_withdrawal` — so the scan below, and the
+  /// `n − 1` withdrawals begun before this one, are not charged to its ceiling.
+  /// See the clock rule in `crate::driver`'s own docs.
   pub fn shutdown(&mut self) {
     self.shutting_down = true;
-    let now = StdInstant::now();
     let Self {
       endpoint,
       services,
@@ -564,7 +576,7 @@ impl Mdns {
         .map(|(&handle, _)| handle),
     );
     for &handle in svc_scratch.iter() {
-      begin_service_withdrawal(endpoint, services, handle, now);
+      begin_service_withdrawal(endpoint, services, handle);
     }
   }
 
@@ -664,7 +676,7 @@ impl Mdns {
       return;
     }
     self.shutdown();
-    self.drain_withdrawals(StdInstant::now());
+    self.drain_withdrawals();
   }
 }
 
@@ -705,11 +717,34 @@ impl Mdns {
 /// Idempotent at both levels: the `goodbye_begun` flag skips a service already
 /// handed over, and `begin_withdrawal` itself no-ops for a handle that already
 /// has a route-attached item. A no-op for an unknown handle.
+///
+/// # It takes no instant, and no caller may supply one
+///
+/// A withdrawal item's whole schedule is defined relative to the instant it is
+/// **created**: `next_at` *is* that instant, and the 2 s anti-pin ceiling is
+/// measured from it. So the instant is not a convenient earlier reading a caller
+/// can pass down — it is the thing being defined, and it is read here, once per
+/// item, at that item's own enqueue.
+///
+/// Every caller had one to hand and every one of them was wrong in the same
+/// direction. `Mdns::shutdown` read once and then scanned its whole service map,
+/// charging the scan and each earlier withdrawal to every later one's ceiling.
+/// `Mdns::drain_withdrawals` passed the tick's instant, read before stages 1
+/// through 6 — so a receive drain, the timers, the transmit fan-out and the
+/// update drain were all deducted from the ceiling of a withdrawal that did not
+/// exist while they ran. Past ~1.75 s of that, `note_withdrawal_result`'s clamp
+/// puts the next round inside the 250 ms §10.1 interval; past 2 s the very next
+/// pass makes the one final ceiling attempt and frees the route after two of the
+/// three intended rounds, leaving peers holding records nothing retracted.
+///
+/// Deleting the parameter is the fix rather than moving the read: a parameter is
+/// the channel, and every caller that has one will eventually pass the one it
+/// happens to be holding. Same shape as
+/// [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take).
 pub(crate) fn begin_service_withdrawal(
   endpoint: &mut ProtoEndpoint,
   services: &mut HashMap<ServiceHandle, ServiceCtx>,
   handle: ServiceHandle,
-  now: StdInstant,
 ) {
   // Scoped so the borrow of `services` ends before `endpoint` is touched; the
   // snapshot and the handoff are both owned.
@@ -724,13 +759,21 @@ pub(crate) fn begin_service_withdrawal(
     }
     _ => return,
   };
+  // TWO items, two creation instants, each read where its own schedule is
+  // defined. A reading is spent by its first consumer: the rename item's
+  // schedule spends the first read, and the whole of `enqueue_rename_withdrawal`
+  // — opening the item, holding the name's route, arming its 250 ms interval and
+  // its 2 s ceiling — then runs before the service item exists at all. One
+  // reading shared between them charged every microsecond of that to the second
+  // item's ceiling, which is the same error every deleted caller parameter made,
+  // one call frame further in.
   if let Some(handoff) = handoff {
     // The service is dead, so its old name must be held until that goodbye
     // completes: a re-registration must not be able to cancel the only TTL=0
     // retraction the renamed-away name will ever get.
-    endpoint.enqueue_rename_withdrawal(handoff, now, true);
+    endpoint.enqueue_rename_withdrawal(handoff, StdInstant::now(), true);
   }
-  endpoint.begin_withdrawal(handle, snapshot, now);
+  endpoint.begin_withdrawal(handle, snapshot, StdInstant::now());
 }
 
 /// The degraded fallback for a caller that never ran the

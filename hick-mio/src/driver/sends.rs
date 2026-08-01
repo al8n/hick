@@ -56,7 +56,7 @@ use mdns_proto::{FamilyDelivery, TransmitDelivery};
 
 use crate::{
   selfsend::SelfSendTracker,
-  socket::{Family, FamilyAllow, SendOutcome, SendReport, Sockets},
+  socket::{Family, FamilyAdmission, SendOutcome, SendReport, Sockets},
 };
 
 /// Consecutive non-deliveries on one family before this driver calls that family
@@ -293,9 +293,15 @@ impl FamilyWireGate {
     }
   }
 
-  /// Which families this gate permits at `now`, in the shape
-  /// [`Sockets::send_to`] takes.
-  fn allow(&self, now: StdInstant, min_gap: Duration) -> FamilyAllow {
+  /// [`FamilyWireGate::open`] for both families at one instant, for the gate
+  /// tests that are about the arithmetic rather than about when it is asked.
+  ///
+  /// `#[cfg(test)]` permanently, and this is the only composition of the two
+  /// families that exists anywhere. Production asks each family at its own offer
+  /// through [`WireGate`]; a value holding both answers is exactly what
+  /// [`FamilyAdmission`] exists to keep out of a send path.
+  #[cfg(test)]
+  fn allow_at(&self, now: StdInstant, min_gap: Duration) -> [bool; 2] {
     [
       self.open(FAMILY_V4, now, min_gap),
       self.open(FAMILY_V6, now, min_gap),
@@ -336,6 +342,39 @@ impl FamilyWireGate {
   }
 }
 
+/// One producer's [`FamilyWireGate`] as a per-family admission: the **only**
+/// clock-reading [`FamilyAdmission`] in this crate.
+///
+/// The clock is read inside [`FamilyAdmission::admits`], so the gap each family
+/// is weighed against is the one that wire has actually had at the moment the
+/// datagram is offered to *it*. That is the whole difference from the `[bool;
+/// 2]` this replaces, and it is one-directional: with `last_sent` fixed,
+/// [`FamilyWireGate::open`] is monotone in `now`, and nothing records into the
+/// gate during a fan-out — [`FamilyWireGate::note`] runs once, after both
+/// families. So a per-family read taken later than a fan-out-wide one can only
+/// ever flip Gated → open. It can never withhold a family the frozen mask would
+/// have offered.
+pub(crate) struct WireGate<'a> {
+  gate: &'a FamilyWireGate,
+  min_gap: Duration,
+}
+
+impl<'a> WireGate<'a> {
+  /// `min_gap` is the core's own per-family minimum for this datagram's kind. A
+  /// zero one is ungated; see [`FamilyWireGate::open`].
+  pub(crate) const fn new(gate: &'a FamilyWireGate, min_gap: Duration) -> Self {
+    Self { gate, min_gap }
+  }
+}
+
+impl FamilyAdmission for WireGate<'_> {
+  fn admits(&self, family: Family) -> bool {
+    self
+      .gate
+      .open(family.index(), StdInstant::now(), self.min_gap)
+  }
+}
+
 /// Send `body` to `dst` through `gate`, take the self-send credit of every
 /// family that reached a wire, and report the per-family result.
 ///
@@ -358,7 +397,50 @@ impl FamilyWireGate {
 /// `min_gap` is the core's own per-family minimum for this datagram's kind; a
 /// family whose gap is unpaid is not offered the datagram and is reported
 /// `Missed`. See [`FamilyWireGate`].
-#[allow(clippy::too_many_arguments)]
+///
+/// # It takes no instant, and the tick's is not a substitute for one
+///
+/// The gate is a **real-time** question — has this family's wire had its gap? —
+/// so it is answered on a clock read at the offer, and the caller cannot supply
+/// one. [`Mdns::tick`](crate::Mdns::tick)'s `now` is the tick's PROTOCOL instant
+/// and is read before stages 1 through 3 and before every earlier datagram in
+/// stage 4's own walk; handing it to the gate charges none of that elapsed time,
+/// so a gap the wire has genuinely paid reads as unpaid and the family is
+/// withheld. That is not a harmless conservatism: the family is reported
+/// [`FamilyDelivery::Missed`], which spends the core's own partial-round
+/// patience and delays the §8 phase for a wire that was ready.
+///
+/// # One read per family, and the older rule this overturns
+///
+/// This function used to read the clock **once** for the fan-out and hand
+/// `send_to` a `[bool; 2]`, defended here in these terms: *"`allow` is one
+/// decision about one datagram, and the two families must be weighed against the
+/// same instant or the second would be offered a wider gap than the first for no
+/// reason but syscall ordering."* That is withdrawn. It was the defect written
+/// down, and it survived a round of review because it reads as a fairness
+/// argument. Three things are wrong with it:
+///
+/// 1. **The gate was already per-family on its write side.**
+///    [`FamilyWireGate::record`] insists `at` be that family's OWN instant and
+///    refuses the fan-out's confirm anchor, because taking the anchor would
+///    reintroduce the very skew this gate absorbs. A gate whose record side
+///    refuses a fan-out-wide instant and whose decide side required one was
+///    internally inconsistent, and the skew argument is the same argument on
+///    both sides.
+/// 2. **"A wider gap for no reason but syscall ordering" misnames the
+///    quantity.** The second family's gap genuinely *is* wider when it is
+///    offered, because time passed — the IPv4 syscall's time, plus any
+///    preemption around it. Declining to charge elapsed time to a real-time
+///    bound is this defect class stated in its own words.
+/// 3. **The error was one-directional and landed on the expensive side.** A
+///    frozen mask can only report a *ready* family gated, never a gated family
+///    ready. `Gated` maps to [`FamilyDelivery::Missed`], which is no free
+///    deferral: it spends the core's `MAX_PARTIAL_ROUNDS`, holds the §8 phase,
+///    and on an announce round withholds the reclaim-cancel gate.
+///
+/// Each family is now asked at its own offer, inside [`Sockets::send_one`] and
+/// immediately before that family's syscall — see [`WireGate`] and
+/// [`FamilyAdmission`]. Nothing carries a decision from one family to the other.
 pub(crate) fn send_and_credit(
   sockets: &mut Sockets,
   selfsend: &mut SelfSendTracker,
@@ -367,9 +449,8 @@ pub(crate) fn send_and_credit(
   body: &[u8],
   dst: SocketAddr,
   min_gap: Duration,
-  now: StdInstant,
 ) -> SendSummary {
-  let report = sockets.send_to(body, dst, gate.allow(now, min_gap));
+  let report = sockets.send_to(body, dst, &WireGate::new(gate, min_gap));
   if report.loops_back {
     for (family, outcome) in report.per_family() {
       // The wall stamp ORDERS the credit against its echo, and is pre-syscall so
