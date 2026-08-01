@@ -1791,9 +1791,18 @@ const FAILED_FANOUT: Fanout = Fanout {
 /// WHICH family missed survives to the core, so it can schedule the next
 /// announcement per link. The two partial rows differ here; under the aggregate
 /// confirm they were the same value.
+///
+/// A GATED family is `Missed`, exactly as a failing one is. Its socket is there
+/// and the datagram was fanned onto it; the driver simply owed that wire a §6 /
+/// §8.3 gap it had not yet paid, so the round did not reach it. Reporting it
+/// `Unobligated` — the one plausible alternative — would let the §8.1 probe
+/// sequence and §8.3 announce phase advance on a wire that never heard the
+/// datagram, and would hide the deferral from the core entirely. This mapping is
+/// what makes a WRONGLY gated family protocol-visible, so it is asserted here
+/// rather than left to the two call sites that read it.
 #[test]
 fn the_fan_out_reaches_the_core_per_family() {
-  use FamilySend::{Failed, Sent, Unbound};
+  use FamilySend::{Failed, Gated, Sent, Unbound};
   use mdns_proto::FamilyDelivery::{Delivered, Missed, Unobligated};
   let cases = [
     (Sent, Sent, Delivered, Delivered, 2),
@@ -1804,6 +1813,11 @@ fn the_fan_out_reaches_the_core_per_family() {
     (Failed, Failed, Missed, Missed, 0),
     (Failed, Unbound, Missed, Unobligated, 0),
     (Unbound, Unbound, Unobligated, Unobligated, 0),
+    (Sent, Gated, Delivered, Missed, 1),
+    (Gated, Sent, Missed, Delivered, 1),
+    (Gated, Gated, Missed, Missed, 0),
+    (Gated, Failed, Missed, Missed, 0),
+    (Gated, Unbound, Missed, Unobligated, 0),
   ];
   for (v4, v6, want_v4, want_v6, credits) in cases {
     let fanout = Fanout { v4, v6 };
@@ -2169,7 +2183,6 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
     // A §6.7 reply is one-shot and therefore ungated.
     &mut FamilyWireGate::default(),
     Duration::ZERO,
-    StdInstant::now(),
     #[cfg(feature = "stats")]
     &stats,
   )
@@ -2501,7 +2514,6 @@ async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Option<StdInstant>
       body,
       &mut gate,
       ANNOUNCE_MIN_FAMILY_GAP,
-      started,
       #[cfg(feature = "stats")]
       &stats,
     ),
@@ -2889,6 +2901,108 @@ async fn a_skewed_family_is_never_re_announced_inside_its_own_floor() {
     "the late family must still be SERVED — the gate defers a round, it does not \
      write the family off"
   );
+  drop(reg);
+}
+
+/// The other side of the gate: a family whose wire had genuinely paid its floor
+/// by the time the datagram was offered to IT must not be held back.
+///
+/// The gap has to be weighed at that family's own send point. A driver pass reads
+/// its clock once, at the top, and may then legitimately spend
+/// [`DRAIN_PASS_BUDGET`] plus the last fan-out's own [`SEND_ATTEMPT_TIMEOUT`]
+/// serving the producers ahead of this one. Weighing the gate against that reading
+/// UNDERSTATES how long the wire has been idle, so the gate withholds a round the
+/// wire had in fact paid for — and `Gated` is not "nothing happened": it reaches
+/// the core as `FamilyDelivery::Missed`, spending its partial-round patience and
+/// holding the §8.3 announce phase for a family that was ready.
+///
+/// Inter-family skew is what makes the two anchors disagree at all: the confirm
+/// anchors at the EARLIEST acceptance, so the core re-arms one interval after the
+/// EARLY family's wire time while the late family's own floor still has the skew
+/// left to run. That is the window in which a stale reading is wrong.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_family_that_paid_its_floor_before_its_own_send_is_not_gated() {
+  /// Well under the per-family attempt bound, so v6 genuinely ACCEPTS the first
+  /// datagram late rather than timing out and missing it.
+  const SKEW: Duration = Duration::from_millis(150);
+  /// How far into the pass this producer's fan-out lands — past v6's floor, and
+  /// far short of what one pass may legitimately spend before reaching a producer.
+  const PASS_LAG: Duration = Duration::from_millis(400);
+
+  let v4 = TestSocket::new(SendBehaviour::Accepts);
+  let v6 = TestSocket::delayed(SKEW);
+  let (v4_log, v6_log) = (v4.wire_log(), v6.wire_log());
+  let mut state = scripted_state(false, v4, v6);
+  let mut scratch = std::vec![0u8; 4096];
+
+  let reg = state
+    .register_service(delivery_test_spec("skewed"), StdInstant::now())
+    .expect("register the service under test");
+  let h = reg.handle;
+
+  // Round 1, at a clock the pass reads for itself: both families carry it, v6 its
+  // SKEW later.
+  drive_one_pass(&mut state, &mut scratch).await;
+  let v6_first = *v6_log
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+    .first()
+    .expect("v6 must have carried the first announcement");
+
+  // The pass carrying round 2 wakes when the core's re-arm falls due and reads its
+  // clock ONCE, there — with a small overshoot so the deadline has genuinely
+  // passed.
+  let due = state.services[&h]
+    .proto
+    .poll_timeout()
+    .expect("the next announcement must be armed");
+  let pass_clock = due + Duration::from_millis(20);
+  assert!(
+    pass_clock.saturating_duration_since(v6_first) < ANNOUNCE_MIN_FAMILY_GAP,
+    "the pass wakes while v6's own floor still has the skew left to run — that is \
+     the window under test"
+  );
+
+  // …but it does not reach THIS producer until PASS_LAG later, by which point v6's
+  // floor has been paid several times over. The pass-level reading cannot show it.
+  let wait = (pass_clock + PASS_LAG).saturating_duration_since(StdInstant::now());
+  tokio::time::sleep(wait).await;
+  state.fire_timeouts(pass_clock);
+  // A budget opened at the CURRENT clock, so the pass cannot be cut short before
+  // this producer's fan-out: what is under test is the gate, not the budget.
+  let mut budget = DrainBudget::new(StdInstant::now());
+  let offered_at = StdInstant::now();
+  state
+    .drain_transmits(pass_clock, &mut budget, &mut scratch)
+    .await;
+
+  let v6_sends = v6_log.lock().unwrap_or_else(|e| e.into_inner()).len();
+  assert_eq!(
+    v6_sends,
+    2,
+    "v6's wire had been idle {:?} — well past RFC 6762 §6 / §8.3's \
+     {ANNOUNCE_MIN_FAMILY_GAP:?} floor — by the time the datagram was offered to \
+     IT, yet the gate was weighed against the reading the pass took {PASS_LAG:?} \
+     earlier and reported it Gated, which reaches the core as \
+     FamilyDelivery::Missed",
+    offered_at.saturating_duration_since(v6_first),
+  );
+
+  // The gate must still be a gate: a round is deferred until the floor is paid,
+  // never merely waved through.
+  for (family, log) in [("v4", &v4_log), ("v6", &v6_log)] {
+    for gap in wire_gaps(log) {
+      assert!(
+        gap >= ANNOUNCE_MIN_FAMILY_GAP,
+        "{family} received two copies of the same service's announcement {gap:?} \
+         apart, inside RFC 6762 §6 / §8.3's one-second floor for that interface. \
+         v4 gaps {:?}, v6 gaps {:?}",
+        wire_gaps(&v4_log),
+        wire_gaps(&v6_log),
+      );
+    }
+  }
   drop(reg);
 }
 
