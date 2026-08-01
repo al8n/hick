@@ -284,13 +284,35 @@ fn pump_for(
   (established, t)
 }
 
-/// Rounds that comfortably cover a §8.1 + §8.3 startup in which EVERY round is
-/// fully delivered — the yardstick the partial cases are measured against. At
-/// this 250 ms cadence a fully-delivered service establishes on round 9 and a
-/// permanently-partial one on round 39 (each phase step waits out the driver's
-/// partial budget plus the core's §8.3 doubling ladder), so 24 separates them
-/// with room on both sides.
+/// Rounds that comfortably cover a §8.1 + §8.3 startup at this 250 ms cadence —
+/// the budget every lifecycle case here is given.
+///
+/// A permanently-partial startup fits too: the core's patience is spent ONCE on a
+/// family that never comes back, so such a run establishes a handful of rounds
+/// after a fully-delivered one rather than an order of magnitude later. The two
+/// are separated by comparing them ([`rounds_to_established`]) rather than by
+/// tuning this budget to fall between them.
 const HEALTHY_ROUNDS: usize = 24;
+
+/// Pump one round at a time until the service reports `Established`. Returns the
+/// round it arrived on — `None` if `limit` rounds pass without it — and the
+/// instant the run ended at.
+fn rounds_to_established(
+  engine: &mut Engine<EmbassyInstant, StdRng>,
+  io: &mut Recording<'_, '_>,
+  handle: mdns_proto::ServiceHandle,
+  limit: usize,
+) -> (Option<usize>, u64) {
+  let mut t = 0u64;
+  for round in 1..=limit {
+    let (established, next) = pump_for(engine, io, handle, t, 1);
+    t = next;
+    if established {
+      return (Some(round), t);
+    }
+  }
+  (None, t)
+}
 
 #[test]
 fn dual_udp_separates_an_absent_family_from_a_failing_one() {
@@ -362,8 +384,29 @@ fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
 #[test]
 fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
   // v4 queues, v6 exists but cannot send. Ownership must latch for what v4 put
-  // on the wire, while the §8.1/§8.3 phase must NOT advance — measured against
-  // the healthy run above, which establishes well within `HEALTHY_ROUNDS`.
+  // on the wire, while the §8.1/§8.3 phase must NOT advance on the rounds the
+  // core is still waiting for v6.
+  //
+  // The yardstick is the SAME schedule with nothing held back, run here under the
+  // same seed, and the discriminator is the difference between the two rather than
+  // a window tuned to fall between them. A driver that laundered the busy socket
+  // into an all-delivered round would establish on the healthy round exactly;
+  // holding the phase honestly costs the core's patience and nothing more, because
+  // that patience is charged once for a family that never comes back. Re-charging
+  // it at every phase would be paid in §8.3 ladder rungs on the link that works,
+  // and stretched this run by an order of magnitude.
+  let healthy = {
+    dual_stack_sockets!(h4, h6, 26, 0x3333_4444);
+    h4.bind(5353).unwrap();
+    h6.bind(5353).unwrap();
+    let mut engine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(42));
+    let handle = engine.register_service(http_service(), at(0)).unwrap();
+    let mut io = Recording::new(Some(&h4), Some(&h6));
+    rounds_to_established(&mut engine, &mut io, handle, HEALTHY_ROUNDS)
+      .0
+      .expect("a whole fan-out establishes inside the budget")
+  };
+
   dual_stack_sockets!(v4, v6, 23, 0x3333_4444);
   v4.bind(5353).unwrap();
 
@@ -371,11 +414,16 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
   let handle = engine.register_service(http_service(), at(0)).unwrap();
   let mut io = Recording::new(Some(&v4), Some(&v6));
 
-  let (established, t) = pump_for(&mut engine, &mut io, handle, 0, HEALTHY_ROUNDS);
+  let (partial, t) = rounds_to_established(&mut engine, &mut io, handle, HEALTHY_ROUNDS);
+  let partial = partial.expect(
+    "the core's patience is spent once, so a permanently-partial fan-out must \
+     still establish inside the budget a healthy one is given",
+  );
   assert!(
-    !established,
-    "a partial fan-out must not advance the phase: the same schedule that \
-     establishes a fully-delivered service must still be short of it here"
+    partial > healthy,
+    "a partial fan-out must hold the phase while the core is still waiting for \
+     the missing family; establishing on the healthy round {healthy} exactly \
+     would mean the busy socket had been laundered into an all-delivered round"
   );
   assert!(
     io.hit(MDNS_SOCKET_V4) > 0,

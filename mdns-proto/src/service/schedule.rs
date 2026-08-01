@@ -184,6 +184,10 @@ pub(crate) fn partial_announce_deadline<I: Instant>(
 /// so a family that missed round 1 because the transport had room for one datagram
 /// gets that exact datagram again in round 2. It also caps the §8.3 doubling
 /// ladder at its second rung, delaying an announcement step by at most 1 s + 2 s.
+///
+/// That cap holds for the whole of one failure because the bound is spent ONCE per
+/// stretch, not once per phase: [`FamilyPatience::stalled`] records that it has
+/// been spent, and only the family's own delivery hands it back.
 #[allow(dead_code)]
 pub(crate) const MAX_PARTIAL_ROUNDS: u8 = 2;
 
@@ -238,12 +242,33 @@ pub(crate) struct FamilyPatience {
   /// since — i.e. the core has stopped waiting for it.
   ///
   /// It is still fanned onto every round; what it loses is the right to drive the
-  /// per-family refresh schedule. This latch has to outlive the advance that set
-  /// it: `missed` restarts there, so without it a chronically dead family would be
-  /// back in good standing every third round, hold the next deadline permanently
-  /// in the past, and have the HEALTHY family re-announced at the §8.3 one-second
-  /// floor forever — one defect traded for another, and a per-link §8.3 violation
-  /// on the link that works.
+  /// per-family refresh schedule, and the right to hold a phase. This latch has to
+  /// outlive the advance that set it: `missed` restarts there, so without it a
+  /// chronically dead family would be back in good standing every third round,
+  /// hold the next deadline permanently in the past, and have the HEALTHY family
+  /// re-announced at the §8.3 one-second floor forever — one defect traded for
+  /// another, and a per-link §8.3 violation on the link that works.
+  ///
+  /// It is also what stops the bound from being re-spent. `missed` restarting at
+  /// the advance would otherwise buy the same written-off family
+  /// [`MAX_PARTIAL_ROUNDS`] fresh re-arms in EVERY later phase, and each of those
+  /// re-arms is a real datagram on the HEALTHY family's wire that climbs the §8.3
+  /// / §5.2 ladder, and the ladder is where the cost lands. On a dual-stack host
+  /// whose v6 binds but cannot carry multicast — an unrouted IPv6, a common
+  /// configuration — re-spending took the §8.1/§8.3 startup to 15 rounds over
+  /// 33 s and a query's §5.2 budget to 27 sends over 23 min, against a healthy
+  /// 5 rounds / 1.9 s and 9 sends / 4 min. Charged once instead, they are 7 rounds
+  /// over 2.4 s and 11 sends over 7 min: the healthy link sees §8.3's two
+  /// announcements and §5.2's own retry count rather than three times each, and
+  /// the whole write-off is paid in §8.1 probe rounds at that section's flat
+  /// 250 ms interval.
+  ///
+  /// Skipping the bound is not giving up on the family, because the bound was
+  /// never what gave it its chances: the datagram is fanned onto it every round
+  /// either way, and its own delivery clears this latch along with the rest of
+  /// [`FamilyPatience`]. What that delivery restores is a FULL budget — a family
+  /// that came back and failed again is charged the whole bound afresh, exactly
+  /// like one that had never stalled.
   pub(crate) stalled: bool,
 }
 
@@ -373,6 +398,12 @@ impl PhaseAdvance {
 /// advancing — the same three events that clear the aggregate counter this
 /// replaced, so the excusal cadence is unchanged.
 ///
+/// The bound is charged ONCE per stretch of failure, not once per phase: a family
+/// that has already latched [`FamilyPatience::stalled`] is excusable on sight,
+/// because the reset above would otherwise hand it a fresh budget at every advance
+/// and make the healthy family pay for it in ladder rungs. See that field for the
+/// measured cost and for why this does not write the family off any harder.
+///
 /// A round in which NOTHING was delivered leaves every MISSED family's counter
 /// untouched rather than resetting it: nothing reached a wire, so no obligation
 /// was met and none may be written off. It must not ADVANCE it either — that is
@@ -422,7 +453,13 @@ pub(crate) fn classify_advance(
       }
       FamilyDelivery::Missed => {
         if !p.covered {
-          if p.missed < MAX_PARTIAL_ROUNDS {
+          // A family already latched `stalled` has spent the bound and been
+          // written off; re-spending it proves nothing new and is what stretched
+          // a dead family's cost from one round per phase to
+          // `MAX_PARTIAL_ROUNDS + 1`. The write-off is undone by the family's own
+          // delivery, not by the phase turning over, so the fresh budget is there
+          // for a family that has actually come back.
+          if p.missed < MAX_PARTIAL_ROUNDS && !p.stalled {
             excusable = false;
           }
           p.missed = p.missed.saturating_add(1);

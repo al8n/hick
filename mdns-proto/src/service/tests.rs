@@ -4850,8 +4850,8 @@ fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
   // send, which puts nothing anywhere), so a flat 1 s partial retry would flood
   // that link.
   //
-  // The ladder must survive the core's patience escape. Every third round here is
-  // EXCUSED — the phase advances without the family that keeps missing — and the
+  // The ladder must survive the core's patience escape. The round after the bound
+  // is EXCUSED — the phase advances without the family that keeps missing — and the
   // served family must NOT then observe a shorter interval than the one before it:
   // the excused round re-arms on the rung it earned (4 s), not on the fresh
   // phase's flat `announce_deadline` (1 s).
@@ -4861,7 +4861,7 @@ fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
   let mut svc = make_service(120);
   let mut now = drive_to_announcing_zero(&mut svc);
 
-  let expected_ms = [1_000u64, 2_000, 4_000, 8_000, 16_000];
+  let expected_ms = [1_000u64, 2_000, 4_000];
   let mut previous_gap = 0u64;
   for (round, want_ms) in expected_ms.iter().enumerate() {
     let at = emit_announcement(&mut svc, now);
@@ -4884,11 +4884,11 @@ fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
     previous_gap = gap;
     now = next;
   }
-  // Rounds 0-1 held the phase; round 2 was excused into Announcing(1); rounds 3-4
-  // held it again.
+  // Rounds 0-1 held the phase; round 2 spent the bound and was excused into
+  // Announcing(1).
   assert!(
     matches!(svc.state(), ServiceState::Announcing(1)),
-    "exactly one excused advance may have happened across five partial rounds; \
+    "exactly one excused advance may have happened across three partial rounds; \
      got {:?}",
     svc.state()
   );
@@ -6785,6 +6785,212 @@ fn alternating_families_advance_the_phase_without_spending_patience() {
     ServiceState::Established,
     "a capacity-one transport that serves both families in turn must still \
      establish the service"
+  );
+}
+
+// ── the write-off is charged once ─────────────────────────────────────
+
+/// Drive a fresh service from `Init` to `Established` with every confirm
+/// reporting `delivery`. Returns the instant it arrived, how many datagrams the
+/// startup took, and how many of those were §8.3 announcements.
+///
+/// Time only ever moves to a deadline the core itself armed, so the instant is the
+/// schedule's own latency rather than an artefact of the tick size.
+fn establish_under(delivery: TransmitDelivery) -> (FakeInstant, usize, usize) {
+  let mut svc = make_service(120);
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+  let mut rounds = 0usize;
+  let mut announcements = 0usize;
+  for _ in 0..64 {
+    if let Some(due) = svc.poll_timeout()
+      && due > now
+    {
+      now = due;
+    }
+    svc.handle_timeout(now).unwrap();
+    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      rounds = rounds.saturating_add(1);
+      if matches!(svc.awaiting_confirm, Some(AwaitingConfirm::Announcement(_))) {
+        announcements = announcements.saturating_add(1);
+      }
+      svc.note_transmit_outcome(now, delivery);
+    }
+    if svc.state() == ServiceState::Established {
+      return (now, rounds, announcements);
+    }
+  }
+  panic!(
+    "service did not reach Established within 64 rounds; state={:?}",
+    svc.state()
+  );
+}
+
+/// A family that is obligated but permanently unable to carry anything — the
+/// dual-stack host whose IPv6 binds but has no multicast route, so every
+/// `send_to(ff02::fb)` fails — must be written off ONCE, not re-proven per phase.
+///
+/// `missed` restarts at every advance, so a bound read from it alone hands the same
+/// dead family `MAX_PARTIAL_ROUNDS` fresh re-arms in every §8.1 probe step and
+/// every §8.3 announcement step. The rounds themselves are cheap; the ladder is
+/// not. Each re-arm is a real unsolicited response on the HEALTHY link, and §8.3
+/// requires the next interval to at least double, so the extra announcing rounds
+/// are paid for in rungs — 1 + 2 + 4 + 8 + 16 s of them before the second
+/// announcement is even reached.
+///
+/// So the §8.3 spacing is not what this bounds, and must not be: what it bounds is
+/// the NUMBER of unsolicited responses the dead family costs. §8.3 asks for at
+/// least two, and the healthy link gets exactly the two it would get if the dead
+/// family were simply absent — the whole write-off is instead paid once, in §8.1
+/// probe rounds at that section's own 250 ms cadence.
+#[test]
+fn a_written_off_family_is_not_re_proven_in_every_phase() {
+  let (healthy_at, healthy_rounds, healthy_announcements) = establish_under(TransmitDelivery::ALL);
+  let (dead_at, dead_rounds, dead_announcements) = establish_under(TransmitDelivery::V4_ONLY);
+
+  assert_eq!(
+    dead_announcements, healthy_announcements,
+    "the dead family may not buy itself extra §8.3 unsolicited responses on the \
+     healthy link: {dead_announcements} announcements against {healthy_announcements}"
+  );
+  assert_eq!(
+    dead_rounds,
+    healthy_rounds.saturating_add(usize::from(MAX_PARTIAL_ROUNDS)),
+    "the whole write-off is `MAX_PARTIAL_ROUNDS` re-arms, spent once — {dead_rounds} \
+     rounds against a healthy {healthy_rounds}"
+  );
+  assert_eq!(
+    dead_at.0.saturating_sub(healthy_at.0),
+    u64::from(MAX_PARTIAL_ROUNDS) * schedule::rfc::PROBE_INTERVAL.as_millis() as u64,
+    "…and those re-arms land in `Probing(0)`, where §8.1's flat 250 ms interval \
+     governs, so none of them climbs the §8.3 ladder: Established at {} ms against \
+     a healthy {} ms",
+    dead_at.0,
+    healthy_at.0
+  );
+}
+
+/// The write-off is undone by the family's OWN delivery, and what that hands back
+/// is the WHOLE bound.
+///
+/// Skipping the bound for a family currently latched `stalled` must not decay into
+/// skipping it for one that has since recovered. Reading "has ever stalled" rather
+/// than "is stalled" would excuse a returned link after a SINGLE offer — it would
+/// have spent the bound while unreachable — which is exactly the RFC 6762 §8.1
+/// guarantee (the name is probed on the link before it is claimed) that the bound
+/// exists to protect. That is a correctness regression, not an optimisation, and it
+/// is the failure this test is here for.
+#[test]
+fn a_recovered_family_is_owed_the_whole_bound_again() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_probing_zero(&mut svc);
+
+  // v6 spends the bound and is written off on the round after it.
+  for _ in 0..=MAX_PARTIAL_ROUNDS {
+    let at = emit_probe(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    now = at;
+  }
+  assert!(
+    svc.partial_rounds[V6].stalled,
+    "the excusal must take v6 out of good standing"
+  );
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(1)),
+    "…having advanced §8.1 by exactly one step; got {:?}",
+    svc.state()
+  );
+
+  // While it stays down the write-off stands: the next partial advances the
+  // sequence straight away rather than re-spending a bound already spent.
+  let at = emit_probe(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(2)),
+    "a family the core has already stopped waiting for must not hold the phase \
+     again; got {:?}",
+    svc.state()
+  );
+  now = at;
+
+  // Silence still advances nothing, latch or no latch — an excusal reachable from
+  // a round that touched no wire would let the name be claimed unprobed.
+  let at = emit_probe(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitDelivery::NONE);
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(2)),
+    "no phase may advance out of silence; got {:?}",
+    svc.state()
+  );
+  assert!(
+    svc.partial_rounds[V6].stalled,
+    "…and a silent round neither spends nor refunds the write-off"
+  );
+  now = at;
+
+  // v6 comes back and carries the probe. The latch clears with the rest of its
+  // patience, and §8.1 completes.
+  let at = emit_probe(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  assert_eq!(
+    svc.partial_rounds,
+    [FamilyPatience::default(); 2],
+    "a delivery clears the whole of the family's patience, latch included"
+  );
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(0)),
+    "the third probe was confirmed by every obligated family; got {:?}",
+    svc.state()
+  );
+  now = at;
+
+  // …and now it fails again. This is a NEW failure and is owed the whole bound: the
+  // §8.3 phase must hold for `MAX_PARTIAL_ROUNDS` rounds before the next excusal,
+  // exactly as it would for a family that had never stalled.
+  for round in 0..MAX_PARTIAL_ROUNDS {
+    let at = emit_announcement(&mut svc, now);
+    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    assert!(
+      matches!(svc.state(), ServiceState::Announcing(0)),
+      "round {round}: the returned family has been told at most {round} times, so \
+       the phase may not advance past it; got {:?}",
+      svc.state()
+    );
+    assert_eq!(
+      svc.partial_rounds[V6].missed,
+      round + 1,
+      "round {round}: the recovered family's budget is spent from the top"
+    );
+    now = svc
+      .lifecycle_deadline
+      .expect("a partial announcement always re-arms");
+  }
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(1)),
+    "the excusal lands on the round after the fresh bound is spent; got {:?}",
+    svc.state()
+  );
+  now = svc.lifecycle_deadline.expect("an excused advance re-arms");
+
+  // And the recovery path stays open: when v6 carries an announcement the phase
+  // takes the full credit a delivery earns, which no excusal ever did.
+  let at = emit_announcement(&mut svc, now);
+  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "the recovered family is still served the §8.3 sequence to its end"
+  );
+  assert!(
+    svc.has_fully_announced().get(),
+    "…and one complete announcement reached every obligated link, which opens the \
+     reclaim-cancel gate an excused advance leaves shut"
+  );
+  assert!(
+    svc.partial_rounds[V6].in_good_standing(),
+    "…and puts v6 back in charge of its own refresh schedule"
   );
 }
 
