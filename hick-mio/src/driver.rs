@@ -27,6 +27,72 @@
 //!
 //! The stages also run in a fixed order in which no early return can skip a
 //! later one.
+//!
+//! # The clock rule
+//!
+//! **Read the clock at the decision, never before it. An instant may be passed
+//! in only when that instant *is* the thing being defined, not merely a
+//! convenient earlier reading.**
+//!
+//! **A reading is spent by its first consumer; a decision is spent by its first
+//! application.** That sentence is the whole rule's second half and it was
+//! missing for eight rounds. It is what makes the two enqueues in
+//! [`begin_service_withdrawal`](crate::endpoint::begin_service_withdrawal) two
+//! clock reads, and what makes a per-family send admission a question asked
+//! inside [`Sockets::send_one`](crate::socket::Sockets::send_one) rather than a
+//! `[bool; 2]` computed for the fan-out — see
+//! [`FamilyAdmission`](crate::socket::FamilyAdmission).
+//!
+//! Nine instances across eight adversarial rounds, each in a different place,
+//! all one defect: a decision weighed against an instant captured before the
+//! work that decision was meant to measure. A credit aged from a pre-syscall
+//! stamp. A credit aged before the receive resumed. A credit swept across tick
+//! stages by a later record, then frozen at tick entry, then frozen immediately
+//! after the read. A goodbye's resend anchor backdated to the top of the tick. A
+//! cap admission decided on a length a 65 536-entry sweep had left behind. A
+//! withdrawal schedule created from an instant older than the withdrawal. One
+//! reading serving two schedule-creating enqueues. One per-family admission mask
+//! carried across a syscall to its second application.
+//!
+//! The rule sorts every instant in this crate into two kinds, and the second
+//! kind is small.
+//!
+//! **A protocol instant may be passed in.** [`Mdns::tick`] reads one at its top
+//! and every *deadline* inside that tick is weighed against it — the endpoint's,
+//! each service's, each query's, each lookup's. One stable value per tick is the
+//! point: two stages that disagree about "now" can fire a deadline twice or skip
+//! it. Nothing real-time may be measured from it.
+//!
+//! **A real-time instant may not.** Anything answering "how long has actually
+//! elapsed" — a self-send credit's age, a wire's spacing gap, when a withdrawal
+//! schedule begins, when its next round is due — is read at the decision by the
+//! code that makes it. The strongest form is to take no instant at all, which is
+//! what [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take),
+//! [`send_and_credit`], [`Mdns::push_updates`] and [`Mdns::drain_withdrawals`]
+//! all do: a parameter is a channel through which a caller hands in a reading
+//! taken somewhere else, and moving the read nearer never removes the channel.
+//! Deleting it does.
+//!
+//! What is left is the instructions between the read and the comparison, and it
+//! is irreducible — something must read a clock before something can compare
+//! against it.
+//!
+//! # How to look, and how not to
+//!
+//! **Enumerating capture→consumer pairs is not the method.** Round eight
+//! classified all 28 of them, closed seven entry points by deleting the
+//! parameter, and wrote that the hunt could stop. Its own diff then contained
+//! two more instances, each under a fresh doc comment defending it. The model is
+//! what failed, not the diligence: a pair scores each edge separately, so a
+//! single reading with *two* consumers is two individually innocent edges, and a
+//! decision applied twice is invisible to it entirely. Both survivors were
+//! exactly those shapes.
+//!
+//! So do not audit the pairs. Take each *reading* and each *decision* and ask
+//! who spends it — if the answer is more than one place, or one place reached
+//! after other work, that is the defect whatever the edges look like. Prefer the
+//! form where the question cannot be asked: no parameter, or a capability asked
+//! at the point of use, so that a stale answer has no type to live in.
 
 use std::time::{Duration, Instant as StdInstant, SystemTime};
 
@@ -35,6 +101,7 @@ use mdns_proto::{QueryHandle, ServiceHandle, ServiceUpdate, TransmitDelivery, ev
 use crate::{endpoint::Mdns, error::TickError, event::Event, onlink, selfsend::MatchMode};
 
 pub(crate) use sends::{FamilyWireGate, SendHealth, send_and_credit};
+pub(crate) use withdrawal::GoodbyeLedger;
 
 /// Per-family delivery reporting, the per-family wire gate, and the link-health
 /// signal — see the module's own docs.
@@ -340,10 +407,15 @@ impl Mdns {
     self.sweep();
     self.fire_timeouts(now);
     self.drain_transmits(now);
-    self.push_updates(now);
+    // Neither of these takes `now`, and that is the fix rather than an
+    // omission: each contains a decision that is a REAL-TIME question rather
+    // than a deadline comparison — when a withdrawal schedule begins, and when
+    // its rounds are due — and each reads the clock at that decision. See this
+    // module's clock rule.
+    self.push_updates();
     self.advance_lookups(now);
     self.compact_events();
-    self.drain_withdrawals(now);
+    self.drain_withdrawals();
     self.sockets.end_tick().map_err(TickError::from)
   }
 
@@ -399,9 +471,15 @@ impl Mdns {
       // one of the §11 branches — the interface check in particular, which the
       // hop-limit branch used to skip entirely even though a conforming hop
       // limit says nothing about *whose* link a wildcard-bound socket heard.
+      //
+      // `local_ip` is the datagram's destination, which is what selects between
+      // §11's two arms where no hop limit was reported. See `admits_ingress` for
+      // what that accessor carries on which platform, and why a square where it
+      // is NOT the destination can only fail closed.
       let pkt_iface = sockets.rx_interface(&meta);
       if !onlink::admits_ingress(
         sockets.rx_peer(&meta),
+        meta.local_ip(),
         meta.hop_limit(),
         local_subnets,
         *bound_interface,
@@ -409,6 +487,7 @@ impl Mdns {
       ) {
         hick_trace::debug!(
           src = %meta.peer(),
+          dst = %meta.local_ip(),
           hop_limit = ?meta.hop_limit(),
           interface_index = pkt_iface,
           bound_interface = *bound_interface,
@@ -717,7 +796,6 @@ impl Mdns {
               &send_buf[..len],
               tx.dst(),
               tx.min_family_gap(),
-              now,
             );
             // Confirmed here, before anything else can touch this service:
             // the core holds a commit token from the `poll_transmit` above and
@@ -814,7 +892,6 @@ impl Mdns {
               &send_buf[..len],
               tx.dst(),
               tx.min_family_gap(),
-              now,
             );
             if let Some(ctx) = queries.get_mut(&handle) {
               ctx.wire_gate = gate;
@@ -860,10 +937,16 @@ impl Mdns {
   /// collects can surface as an [`Event::QueryAnswer`] or
   /// [`Event::QueryTerminal`] for a handle the caller never asked for.
   ///
-  /// Takes `now` because an observed [`ServiceUpdate::Renamed`] enqueues the old
-  /// instance name's RFC 6762 §9 goodbye here, and a withdrawal item is
-  /// scheduled from the instant it is created.
-  fn push_updates(&mut self, now: StdInstant) {
+  /// # It takes no instant
+  ///
+  /// An observed [`ServiceUpdate::Renamed`] enqueues the old instance name's RFC
+  /// 6762 §9 goodbye here, and a withdrawal item's schedule — its first send and
+  /// its 2 s anti-pin ceiling — is defined by the instant it is **created**. The
+  /// tick's `now` is not that instant: it is read before stages 1 through 4, so
+  /// handing it over charges every microsecond of them to a schedule that did
+  /// not exist yet. See this module's clock rule, and the live read at the
+  /// enqueue below.
+  fn push_updates(&mut self) {
     let Self {
       endpoint,
       services,
@@ -931,7 +1014,17 @@ impl Mdns {
               // bounded by the endpoint's 2 s anti-pin ceiling: a re-registration
               // of a just-vacated name is refused for at most that long, and
               // typically only for the ~750 ms the resend schedule takes.
-              endpoint.enqueue_rename_withdrawal(handoff, now, true);
+              //
+              // A LIVE read, at the enqueue. This item's whole schedule is
+              // defined relative to the instant it is created — `next_at` IS
+              // that instant and the anti-pin ceiling is 2 s past it — so the
+              // instant handed over has to be the one at which it is actually
+              // created. Stages 1 through 4 all ran between the tick's own read
+              // and this line; charging them to the ceiling shortens the old
+              // name's retraction by exactly that much, and past ~1.75 s of it
+              // the next re-arm clamps below the 250 ms §10.1 interval and the
+              // item is force-completed with debt still owed.
+              endpoint.enqueue_rename_withdrawal(handoff, StdInstant::now(), true);
             }
             match routed {
               Ok(()) => update,

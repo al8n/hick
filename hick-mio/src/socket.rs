@@ -417,15 +417,79 @@ impl SendReport {
   }
 }
 
-/// Which bound families a send may be offered, indexed by [`Family::index`].
+/// Whether one family may be offered this datagram, **asked at the moment it
+/// would be offered**: inside [`Sockets::send_one`], with that family's `sendto`
+/// as the next statement.
 ///
-/// The caller's per-producer wire gate is the only thing that closes an entry;
-/// see [`SendOutcome::Gated`]. `[true, true]` is the ungated case and the only
-/// value the RFC 6762 §10.1 withdrawal pump ever uses.
-pub(crate) type FamilyAllow = [bool; 2];
+/// # Why this is a trait and not a `[bool; 2]`
+///
+/// It replaces a mask the caller computed once for the whole fan-out, and the
+/// reason is that the fan-out is SEQUENTIAL. The IPv4 syscall — and any
+/// preemption around it — ran between the mask's IPv6 entry being decided and
+/// that entry being applied. A gap IPv6 had genuinely paid by then still read as
+/// unpaid, so the family came back [`SendOutcome::Gated`], which the driver's
+/// projection reports to the core as `Missed`: it spends the core's
+/// partial-round patience and holds the RFC 6762 §8 phase for a wire that was
+/// ready.
+///
+/// **A reading is spent by its first consumer; a decision is spent by its first
+/// application.** A per-family decision has exactly one application — that
+/// family's own syscall — and as a trait it cannot reach any other. As a
+/// `[bool; 2]` it had two applications, and the second one travelled across a
+/// syscall to reach its own.
+///
+/// # Where it is asked, and why there
+///
+/// [`Sockets::send_one`] asks **after** boundness and immediately **before** the
+/// syscall.
+///
+/// * After boundness, so an unbound family reports [`SendOutcome::NoSocket`]
+///   whatever this answers. No admission can invent an obligation for a link
+///   that does not exist, and `NoSocket` is what the RFC 6762 §10.1 per-family
+///   goodbye debt writes off.
+/// * Immediately before the syscall, so nothing — least of all the other
+///   family's `sendto` — runs between the answer and the send it governs.
+pub(crate) trait FamilyAdmission {
+  /// Called once per family, immediately before that family's `sendto`, and
+  /// nowhere else. An implementation that reads a clock reads it here.
+  fn admits(&self, family: Family) -> bool;
+}
 
-/// Both families open — a one-shot datagram, or a goodbye.
-pub(crate) const ALLOW_BOTH: FamilyAllow = [true, true];
+/// Every family open.
+///
+/// `#[cfg(test)]`, because **no production send is unconditional**. The two that
+/// exist each carry a real answer: a transmit is admitted by its producer's wire
+/// gate (whose zero-`min_gap` case is what makes a one-shot §6 reply ungated,
+/// rather than a separate admission), and an RFC 6762 §10.1 goodbye is admitted
+/// by its outstanding per-family debt. Nothing in the crate wants "yes" as a
+/// constant, and the old `ALLOW_BOTH` that did was the withdrawal pump's
+/// unknown-token fallback, which is now a `true` inside the debt lookup itself.
+#[cfg(test)]
+pub(crate) struct Ungated;
+
+#[cfg(test)]
+impl FamilyAdmission for Ungated {
+  fn admits(&self, _family: Family) -> bool {
+    true
+  }
+}
+
+/// A fixed per-family answer, for the tests that are about what
+/// [`Sockets::send_one`] does with a closed family rather than about what closed
+/// it.
+///
+/// `#[cfg(test)]` permanently. A frozen per-family decision is precisely the
+/// shape [`FamilyAdmission`] exists to keep out of production, so the one place
+/// it survives is behind a door no production build has.
+#[cfg(test)]
+pub(crate) struct Mask(pub(crate) [bool; 2]);
+
+#[cfg(test)]
+impl FamilyAdmission for Mask {
+  fn admits(&self, family: Family) -> bool {
+    self.0.get(family.index()).copied().unwrap_or(true)
+  }
+}
 
 /// One bound family: the socket plus the readiness bookkeeping the caller's
 /// `Poll` does not keep for us.
@@ -1379,15 +1443,21 @@ impl Sockets {
   /// credit per [`SendOutcome::Sent`], and each family carries its own share of
   /// the transmit's delivery obligation.
   ///
-  /// `allow` is the caller's per-producer wire gate, indexed by
-  /// [`Family::index`]: a bound family whose entry is `false` is not offered the
-  /// datagram at all and comes back [`SendOutcome::Gated`]. The gate's *value*
-  /// is protocol policy the core computes; enforcing it per family is the
-  /// driver's job, and reporting it is this method's.
-  pub(crate) fn send_to(&mut self, body: &[u8], dst: SocketAddr, allow: FamilyAllow) -> SendReport {
+  /// `admission` is the caller's per-family gate. It is **not** consulted here:
+  /// each family is asked inside its own [`Sockets::send_one`], immediately
+  /// before that family's syscall, so this fan-out carries no decision from one
+  /// family across to the other. A family that answers `false` is not offered
+  /// the datagram and comes back [`SendOutcome::Gated`]. See
+  /// [`FamilyAdmission`].
+  pub(crate) fn send_to(
+    &mut self,
+    body: &[u8],
+    dst: SocketAddr,
+    admission: &impl FamilyAdmission,
+  ) -> SendReport {
     if is_mdns_multicast(dst) {
-      let v4 = self.send_one(Family::V4, body, MDNS_V4_DST, allow);
-      let v6 = self.send_one(Family::V6, body, MDNS_V6_DST, allow);
+      let v4 = self.send_one(Family::V4, body, MDNS_V4_DST, admission);
+      let v6 = self.send_one(Family::V6, body, MDNS_V6_DST, admission);
       return SendReport {
         v4,
         v6,
@@ -1396,13 +1466,13 @@ impl Sockets {
     }
     match Family::of(dst) {
       Family::V4 => SendReport {
-        v4: self.send_one(Family::V4, body, dst, allow),
+        v4: self.send_one(Family::V4, body, dst, admission),
         v6: SendOutcome::NoSocket,
         loops_back: false,
       },
       Family::V6 => SendReport {
         v4: SendOutcome::NoSocket,
-        v6: self.send_one(Family::V6, body, dst, allow),
+        v6: self.send_one(Family::V6, body, dst, admission),
         loops_back: false,
       },
     }
@@ -1447,11 +1517,12 @@ impl Sockets {
   /// or withdrawn, transmitting it after the retraction that was supposed to
   /// supersede it.
   ///
-  /// `allow` is the caller's wire gate: a bound family whose entry is `false` is
-  /// not offered the datagram and reports [`SendOutcome::Gated`]. It is checked
-  /// after the destination-family guard and before boundness, so an unbound
-  /// family still reports [`SendOutcome::NoSocket`] — a gate cannot invent an
-  /// obligation for a link that does not exist.
+  /// `admission` is the caller's per-family gate: a bound family it declines is
+  /// not offered the datagram and reports [`SendOutcome::Gated`]. It is asked
+  /// **after** boundness — so an unbound family still reports
+  /// [`SendOutcome::NoSocket`], and no gate can invent an obligation for a link
+  /// that does not exist — and immediately **before** the syscall, so nothing
+  /// runs between the answer and the send it governs. See [`FamilyAdmission`].
   ///
   /// `dst` must belong to `family`; a mismatch is reported as
   /// [`SendOutcome::Failed`] rather than sent. That early mismatch is **not**
@@ -1465,7 +1536,7 @@ impl Sockets {
     family: Family,
     body: &[u8],
     dst: SocketAddr,
-    allow: FamilyAllow,
+    admission: &impl FamilyAdmission,
   ) -> SendOutcome {
     if Family::of(dst) != family {
       hick_trace::debug!(dst = %dst, "dropping a datagram: destination family does not match the selected socket");
@@ -1475,9 +1546,6 @@ impl Sockets {
     // gate must not be able to report it as one that merely missed a round.
     if self.family_mut(family).is_none() {
       return SendOutcome::NoSocket;
-    }
-    if !allow.get(family.index()).copied().unwrap_or(true) {
-      return SendOutcome::Gated;
     }
 
     // Cloned (a refcount bump, not a snapshot) before the family borrow below:
@@ -1491,6 +1559,12 @@ impl Sockets {
     let Some(fam) = self.family_mut(family) else {
       return SendOutcome::NoSocket;
     };
+    // Asked HERE, with this family's syscall as the next statement. Nothing runs
+    // between the two — least of all the OTHER family's `sendto`, which is what
+    // a fan-out-wide mask put there. See `FamilyAdmission`.
+    if !admission.admits(family) {
+      return SendOutcome::Gated;
+    }
     // Every clock read belongs to the attempt that succeeded, and is taken
     // inside `send_attempt` for that reason — the `EINTR` retry is a second
     // syscall, and a stamp read out here would describe the first one. See

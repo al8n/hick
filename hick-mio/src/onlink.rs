@@ -2,6 +2,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use hick_udp::constants::{MDNS_IPV4_GROUP, MDNS_IPV6_GROUP};
+
 /// §11: a conforming mDNS datagram arrives with IPv4 TTL / IPv6 hop limit 255.
 /// Anything lower crossed a router. `None` means the platform did not report it,
 /// which fails open — we can prove neither on-link nor off-link.
@@ -115,6 +117,21 @@ const fn reports_rx_interface(src: SocketAddr) -> bool {
   }
 }
 
+/// Whether `dst` is one of the two mDNS link-local multicast groups, the
+/// destination RFC 6762 §11 says establishes local-link origin on its own.
+///
+/// Exactly these two and nothing else. The nearest neighbours in the same
+/// link-local blocks — `224.0.0.252` and `ff02::1:3` — are LLMNR's groups, not
+/// ours, and this is a trust boundary rather than a link-local scope test: §11
+/// names these two addresses, so widening it to "any link-local multicast"
+/// would hand the exemption to every other protocol sharing the link.
+fn is_mdns_group(dst: IpAddr) -> bool {
+  match dst {
+    IpAddr::V4(a) => a == MDNS_IPV4_GROUP,
+    IpAddr::V6(a) => a == MDNS_IPV6_GROUP,
+  }
+}
+
 /// The whole ingress trust boundary for one datagram: the link it arrived on,
 /// then RFC 6762 §11.
 ///
@@ -126,8 +143,49 @@ const fn reports_rx_interface(src: SocketAddr) -> bool {
 /// `src` is the whole peer [`SocketAddr`], not its [`IpAddr`]: for an IPv6 peer
 /// the scope id is half of what names the link it came from, and taking the
 /// address alone silently discarded it.
+///
+/// # §11 selects the fallback's arm by DESTINATION, not by source
+///
+/// §11 states the local-link test two ways, and the IP header's destination
+/// picks between them. A datagram addressed to `224.0.0.251` or `FF02::FB` is
+/// *"necessarily deemed to have originated on the local link, regardless of
+/// source IP address"* — which the RFC calls *"essential to allow devices to
+/// work correctly and reliably in unusual configurations, such as multiple
+/// logical IP subnets overlayed on a single link, or in cases of severe
+/// misconfiguration"*. Only a **unicast** destination sends the source address
+/// to the subnet check.
+///
+/// This crate had the unicast arm alone and applied it to both, so an on-link
+/// host sourcing from a prefix we do not share was dropped exactly where §11
+/// says it must not be. That is not a hypothetical square: Windows reports no
+/// TTL/hop limit at all — `hick-udp`'s `set_recv_ttl_v4` and
+/// `set_recv_hoplimit_v6` are no-ops there — so every Windows datagram takes
+/// this branch, which made the loss silent rather than rare.
+///
+/// The group arm sits INSIDE the no-hop-limit branch rather than ahead of it.
+/// It replaces the source-prefix *guess*, the only thing §11 ever offered it as
+/// an alternative to; a reported hop limit below 255 crossed a router and stays
+/// decisive whatever the destination says. And the interface check still runs
+/// first and still gates both arms: a group destination proves a datagram was
+/// link-local to SOME link, never that it was ours, and a wildcard-bound socket
+/// on a multi-homed host is handed every NIC's copy.
+///
+/// # What `dst` actually carries
+///
+/// The caller passes `RecvMeta::local_ip`, whose meaning is per-platform: the
+/// IP header destination on Windows (`IN_PKTINFO.ipi_addr` /
+/// `IN6_PKTINFO.ipi6_addr`) and on every Unix IPv6 receive
+/// (`in6_pktinfo.ipi6_addr`), but the receiving interface's own address on Unix
+/// IPv4, where `hick-udp` reads `ipi_spec_dst` deliberately and asserts it.
+/// That asymmetry cannot admit anything it should not: `ipi_spec_dst` is a
+/// local unicast address and so never equals a group, and the targets that read
+/// it (Linux/Android/Apple) all report a hop limit and never reach this branch.
+/// A `dst` that is not the destination — including the UNSPECIFIED a target
+/// with no PKTINFO parser degrades to — therefore reads as "unicast" and falls
+/// through to the source-prefix rule, which is what was there before.
 pub(crate) fn admits_ingress(
   src: SocketAddr,
+  dst: IpAddr,
   hop_limit: Option<u8>,
   subnets: &[(IpAddr, u8)],
   bound_iface: u32,
@@ -137,10 +195,13 @@ pub(crate) fn admits_ingress(
   if !arrived_on_bound_interface(src, bound_iface, pkt_iface, iface_reported) {
     return false;
   }
-  // A reported TTL/hop limit is decisive; without one, fall back to the source
-  // address on the bound interface's own links.
+  // A reported TTL/hop limit is decisive. Without one, §11's own two arms: a
+  // group destination is local-link origin by itself, and only a unicast one
+  // falls back to the source address on the bound interface's own links.
   if hop_limit.is_some() {
     is_on_link(hop_limit)
+  } else if is_mdns_group(dst) {
+    true
   } else {
     src_on_local_link(src, subnets, bound_iface, pkt_iface, iface_reported)
   }
@@ -198,13 +259,18 @@ pub(crate) fn collect_local_subnets(iface_index: u32) -> Vec<(IpAddr, u8)> {
   out
 }
 
-/// §11 fallback used when no TTL cmsg is available: trust a source that is
-/// link-local on the receiving interface, or that falls inside a subnet
+/// §11's **unicast** arm, used when no TTL cmsg is available: trust a source
+/// that is link-local on the receiving interface, or that falls inside a subnet
 /// configured on the bound interface.
 ///
 /// Reached only through [`admits_ingress`], which has already required the
-/// datagram to have arrived on the bound interface. The link-local arm below
-/// keeps its own copy of that check anyway: this is the trust boundary, it costs
+/// datagram to have arrived on the bound interface AND to have been addressed
+/// to this host rather than to an mDNS group: §11 scopes this source check to
+/// unicast destinations, because a group destination settles the question by
+/// itself and a source prefix could only overrule it wrongly.
+///
+/// The link-local arm below keeps its own copy of the interface check anyway:
+/// this is the trust boundary, it costs
 /// one integer comparison, and a caller that reaches this function by some other
 /// route must not silently lose it. It delegates to
 /// [`arrived_on_bound_interface`] rather than restating the rule, so the copy

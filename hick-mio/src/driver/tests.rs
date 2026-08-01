@@ -4,7 +4,7 @@ use std::{
 };
 
 use mdns_proto::{
-  CollectedAnswer, ServiceState,
+  CollectedAnswer, FamilyDelivery, ServiceState,
   endpoint::WithdrawalSend,
   wire::{ResourceClass, ResourceType},
 };
@@ -76,7 +76,9 @@ fn a_refused_send_leaves_no_send_side_term_in_the_timeout() {
   mdns
     .sockets
     .force_send_wouldblock_for_test(Family::V4, true);
-  let report = mdns.sockets.send_to(&[0u8; 12], MDNS_V4_DST, [true, true]);
+  let report = mdns
+    .sockets
+    .send_to(&[0u8; 12], MDNS_V4_DST, &crate::socket::Ungated);
   assert_eq!(
     report.v4,
     crate::socket::SendOutcome::Failed,
@@ -361,7 +363,6 @@ fn a_multicast_send_takes_one_credit_per_family_that_reached_the_wire() {
   let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
     return;
   };
-  let now = Instant::now();
   let body = [0x5Au8; 20];
   let mut gate = FamilyWireGate::default();
   let Mdns {
@@ -379,7 +380,6 @@ fn a_multicast_send_takes_one_credit_per_family_that_reached_the_wire() {
     &body,
     MDNS_V4_DST,
     Duration::ZERO,
-    now,
   );
   assert_eq!(summary.sent, 1, "one bound family, one syscall");
   assert_eq!(
@@ -412,7 +412,6 @@ fn a_refused_send_takes_no_credit_and_reports_the_family_missed() {
   mdns
     .sockets
     .force_send_wouldblock_for_test(Family::V4, true);
-  let now = Instant::now();
   let mut gate = FamilyWireGate::default();
   let Mdns {
     sockets,
@@ -428,7 +427,6 @@ fn a_refused_send_takes_no_credit_and_reports_the_family_missed() {
     &[0x5Au8; 20],
     MDNS_V4_DST,
     Duration::ZERO,
-    now,
   );
   assert_eq!(summary.sent, 0);
   assert_eq!(summary.accepted_at, None);
@@ -453,7 +451,6 @@ fn a_families_wire_gate_withholds_a_second_datagram_inside_the_minimum_gap() {
   let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
     return;
   };
-  let now = Instant::now();
   let gap = Duration::from_secs(1);
   let mut gate = FamilyWireGate::default();
   let Mdns {
@@ -470,7 +467,6 @@ fn a_families_wire_gate_withholds_a_second_datagram_inside_the_minimum_gap() {
     &[0x5Au8; 20],
     MDNS_V4_DST,
     gap,
-    now,
   );
   assert_eq!(first.sent, 1, "the first datagram owes no gap");
 
@@ -483,7 +479,6 @@ fn a_families_wire_gate_withholds_a_second_datagram_inside_the_minimum_gap() {
     &[0x5Au8; 20],
     MDNS_V4_DST,
     gap,
-    now,
   );
   assert_eq!(second.sent, 0, "no syscall was made for the gated family");
   assert_eq!(
@@ -566,7 +561,6 @@ fn same_family_wire_times(mdns: &mut Mdns, min_gap: Duration, stalls: &[Duration
         &body,
         MDNS_V4_DST,
         min_gap,
-        Instant::now(),
       );
       if summary.sent == 1 {
         break;
@@ -673,7 +667,6 @@ fn a_unicast_reply_takes_no_self_send_credit() {
     return;
   };
   let unicast = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5353));
-  let now = Instant::now();
   let mut gate = FamilyWireGate::default();
   let Mdns {
     sockets,
@@ -689,7 +682,6 @@ fn a_unicast_reply_takes_no_self_send_credit() {
     &[0x5Au8; 20],
     unicast,
     Duration::ZERO,
-    now,
   );
   assert_eq!(summary.sent, 1, "the unicast reply really did go out");
   assert_eq!(selfsend.len(), 0, "and it will never come back");
@@ -788,7 +780,13 @@ fn an_absent_family_is_written_off_and_a_present_one_never_is() {
     send_health,
     ..
   } = &mut *mdns;
-  let (v4, v6) = super::withdrawal::send_withdrawal(sockets, selfsend, send_health, &[0x5Au8; 20]);
+  let (v4, v6, _at) = super::withdrawal::send_withdrawal(
+    sockets,
+    selfsend,
+    send_health,
+    &[0x5Au8; 20],
+    &crate::socket::Ungated,
+  );
   assert_eq!(
     v6,
     WithdrawalSend::WriteOff,
@@ -818,7 +816,13 @@ fn a_refused_family_keeps_its_goodbye_debt() {
     send_health,
     ..
   } = &mut *mdns;
-  let (v4, _v6) = super::withdrawal::send_withdrawal(sockets, selfsend, send_health, &[0x5Au8; 20]);
+  let (v4, _v6, _at) = super::withdrawal::send_withdrawal(
+    sockets,
+    selfsend,
+    send_health,
+    &[0x5Au8; 20],
+    &crate::socket::Ungated,
+  );
   assert_eq!(
     v4,
     WithdrawalSend::Retry,
@@ -854,7 +858,13 @@ fn a_withdrawal_datagram_takes_one_self_send_credit_per_syscall() {
     ..
   } = &mut *mdns;
   let before_credits = selfsend.len();
-  let (v4, v6) = super::withdrawal::send_withdrawal(sockets, selfsend, send_health, &[0x5Au8; 20]);
+  let (v4, v6, _at) = super::withdrawal::send_withdrawal(
+    sockets,
+    selfsend,
+    send_health,
+    &[0x5Au8; 20],
+    &crate::socket::Ungated,
+  );
 
   let credits = selfsend.len() - before_credits;
   let sent = [v4, v6]
@@ -1093,7 +1103,7 @@ fn goodbye_wire_times(mdns: &mut Mdns, already_on_wire: usize) -> Vec<Instant> {
   // with a round missing from the end.
   let deadline = Instant::now() + GOODBYE_CEILING + Duration::from_secs(1);
   while mdns.endpoint.has_pending_withdrawals() && Instant::now() < deadline {
-    mdns.drain_withdrawals(Instant::now());
+    mdns.drain_withdrawals();
     std::thread::sleep(GOODBYE_DRAIN_POLL);
   }
   assert!(
@@ -1508,6 +1518,111 @@ fn a_colliding_rename_holds_the_old_name_until_it_is_retracted() {
   assert!(
     goodbyes.iter().any(|d| test_support::retracts(d, &old)),
     "the torn-down service's old name must still be retracted"
+  );
+}
+
+/// Rename `handle` **without letting stage 5 see it**, so the one-shot §9
+/// handoff is still parked on the service when the caller unregisters it.
+///
+/// `push_updates` takes the handoff on every rename it observes, which is
+/// correct and is what production normally does. The window this reaches is the
+/// other one: a caller that unregisters a service in the same breath as the
+/// rename, so `begin_service_withdrawal` is the site holding both a handoff and
+/// a snapshot to enqueue. Running the §8.1 probe machinery through stages 3 and
+/// 4 alone — never `tick`, which would run stage 5 — is what holds that window
+/// open for the length of a test rather than a scheduler quantum.
+fn rename_leaving_the_handoff_parked(
+  mdns: &mut Mdns,
+  handle: mdns_proto::ServiceHandle,
+  old: &str,
+) -> bool {
+  /// Drain this service's own updates, reporting whether a rename was among
+  /// them. Draining is the point: an update stage 5 never sees is a handoff
+  /// stage 5 never takes.
+  fn took_the_rename(mdns: &mut Mdns, handle: mdns_proto::ServiceHandle) -> bool {
+    let mut renamed = false;
+    if let Some(ctx) = mdns.services.get_mut(&handle) {
+      while let Some(update) = ctx.proto.poll() {
+        renamed |= matches!(update, mdns_proto::ServiceUpdate::Renamed(_));
+      }
+    }
+    renamed
+  }
+
+  let probe = test_support::conflict_probe(old);
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while Instant::now() < deadline {
+    test_support::ingest(mdns, &probe, Instant::now());
+    if took_the_rename(mdns, handle) {
+      return true;
+    }
+    let now = Instant::now();
+    mdns.fire_timeouts(now);
+    mdns.drain_transmits(now);
+    if took_the_rename(mdns, handle) {
+      return true;
+    }
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  false
+}
+
+/// The rename item and the service item are **two** schedules, so they take two
+/// creation instants.
+///
+/// A withdrawal item's `next_at` *is* the instant it was created, so an item is
+/// due at exactly that instant and not before. Polling at the earlier of the two
+/// therefore offers exactly one item — unless the two were created from one
+/// reading, in which case both are due at it and both go out. That is the whole
+/// observable difference, and this test is the whole of what is checkable from
+/// outside.
+///
+/// **Weak, and worth saying so.** It pins the *direction* — the service item's
+/// schedule begins after the rename item's, so the entire
+/// `enqueue_rename_withdrawal` is not charged to the service item's 2 s
+/// anti-pin ceiling — and nothing about the magnitude, which is one enqueue
+/// wide. Nothing here would catch a future site that shared a reading between
+/// two consumers a few instructions apart. The property that does is structural:
+/// each enqueue reads its own clock, adjacent to its own use, and there is no
+/// value in scope for a second consumer to reach for. This is the residual, and
+/// it is accepted rather than argued away.
+#[test]
+fn two_withdrawal_items_take_two_creation_instants() {
+  let Some(mut mdns) = test_support::loopback_mdns() else {
+    return;
+  };
+  let ty = "_hick-mio-two-anchors._tcp.local.";
+  let old = format!("anchors.{ty}");
+  let handle = mdns
+    .register_service(test_support::named_service_spec("anchors", ty, 8080))
+    .expect("register_service");
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
+    return;
+  }
+  if !rename_leaving_the_handoff_parked(&mut mdns, handle, &old) {
+    eprintln!("skipping: the service never renamed within the budget");
+    return;
+  }
+
+  // Both items are created inside this one call: the rename handoff's, then the
+  // service's own.
+  mdns.unregister_service(handle);
+  let Some(first) = mdns.endpoint.next_withdrawal_deadline() else {
+    eprintln!("skipping: the unregister enqueued no withdrawal at all");
+    return;
+  };
+  let due = test_support::collect_goodbyes_as(
+    &mut mdns,
+    first,
+    WithdrawalSend::Retry,
+    WithdrawalSend::Retry,
+  );
+  assert_eq!(
+    due.len(),
+    1,
+    "at the EARLIER item's own creation instant only that item is due; a second \
+     datagram here means both schedules were anchored at one reading, which \
+     charges the whole of the first enqueue to the second item's 2 s ceiling"
   );
 }
 
@@ -2322,7 +2437,6 @@ fn an_own_echo_survives_a_foreign_interface_index() {
 
   let body = [0x3Cu8; 28];
   {
-    let now = Instant::now();
     let mut gate = FamilyWireGate::default();
     let Mdns {
       sockets,
@@ -2338,7 +2452,6 @@ fn an_own_echo_survives_a_foreign_interface_index() {
       &body,
       MDNS_V4_DST,
       Duration::ZERO,
-      now,
     );
     if summary.sent == 0 {
       eprintln!("skipping: the datagram never reached a wire on this host");
@@ -2415,7 +2528,6 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
 
   let body = [0x5Au8; 32];
   {
-    let now = Instant::now();
     let mut gate = FamilyWireGate::default();
     let Mdns {
       sockets,
@@ -2431,7 +2543,6 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
       &body,
       MDNS_V4_DST,
       Duration::ZERO,
-      now,
     );
     if summary.sent == 0 {
       eprintln!("skipping: the datagram never reached a wire on this host");
@@ -2549,7 +2660,6 @@ const STALL_PAST_TTL: Duration = SELF_SEND_TTL.saturating_add(Duration::from_mil
 /// `min_gap` is zero, so the gate is open for both families and every test below
 /// is about the credit rather than about the spacing.
 fn credit_a_multicast_send(mdns: &mut Mdns, body: &[u8]) -> Option<()> {
-  let now = Instant::now();
   let mut gate = FamilyWireGate::default();
   let Mdns {
     sockets,
@@ -2565,7 +2675,6 @@ fn credit_a_multicast_send(mdns: &mut Mdns, body: &[u8]) -> Option<()> {
     body,
     MDNS_V4_DST,
     Duration::ZERO,
-    now,
   );
   if summary.sent == 0 {
     eprintln!("skipping: the datagram never reached a wire on this host");
@@ -2757,7 +2866,13 @@ fn a_stage_seven_goodbye_does_not_evict_an_unclaimed_stage_four_credit() {
       send_health,
       ..
     } = &mut *mdns;
-    super::withdrawal::send_withdrawal(sockets, selfsend, send_health, &goodbye);
+    super::withdrawal::send_withdrawal(
+      sockets,
+      selfsend,
+      send_health,
+      &goodbye,
+      &crate::socket::Ungated,
+    );
   }
   assert!(
     echo_matched_at_next_tick_top(&mut mdns, Family::V4, &announcement),
@@ -3056,5 +3171,398 @@ fn a_degraded_claim_stalled_after_admission_is_rejected() {
     "with no arrival stamp the TTL is the entire bound on false suppression, so \
      a claim stalled past it between admission and the credit check must be \
      rejected on the degraded path too"
+  );
+}
+
+// ── the wire gate is weighed at the SEND, not at the top of the tick ─────────
+//
+// The gate is a real-time question about one family's wire — has it had its gap?
+// — so the instant it is weighed against must be the one at which the datagram
+// is offered. `tick`'s own instant is read before stages 1 through 3 and before
+// every earlier datagram in stage 4's own walk, so on it a gap the wire has
+// genuinely paid still reads as unpaid, the family is withheld, and it is
+// reported `Missed` — which spends the core's partial-round patience for a wire
+// that was ready.
+//
+// The window in which the tick's instant and the wire's disagree is normally one
+// syscall wide. It is widened here the only way a test can: by stalling the send,
+// which pushes the gate's own anchor (the WIRE instant) far past the core's
+// confirm anchor (the PRE-syscall one) and opens a stretch in which a probe is
+// genuinely due and the wire genuinely has its gap.
+
+/// How long the first §8.1 probe is held inside its `send_to`. It sets the width
+/// of that stretch: `GATE_ANCHOR_STALL - PROBE_MIN_FAMILY_GAP`.
+const GATE_ANCHOR_STALL: Duration = Duration::from_millis(600);
+
+/// Where in that stretch the stale tick instant is aimed, measured back from the
+/// wire instant: past the core's own next-probe deadline (so a probe really is
+/// due) and before the wire instant itself (so the gate, weighed there, cannot
+/// even subtract a gap).
+const GATE_STALE_TICK_OFFSET: Duration = Duration::from_millis(300);
+
+#[test]
+fn the_wire_gate_is_weighed_at_the_send_not_at_the_tick() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  if !mdns.sockets.is_bound_for_test(Family::V4) {
+    eprintln!("skipping: IPv4 is not bound on this host");
+    return;
+  }
+  mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-gate-anchor._tcp.local.",
+      8080,
+    ))
+    .expect("register_service");
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V4, &[GATE_ANCHOR_STALL]);
+  // The service's first datagram is its first probe, and it is the one that
+  // stalls. Nothing else can reach this wire: no query is running and no peer is
+  // on loopback.
+  let give_up = Instant::now() + Duration::from_secs(5);
+  while mdns.sockets.wire_times_for_test(Family::V4).is_empty() {
+    if Instant::now() >= give_up {
+      eprintln!("skipping: no probe reached this host's wire within the budget");
+      return;
+    }
+    mdns.tick().expect("tick");
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  let wire_times = mdns.sockets.wire_times_for_test(Family::V4);
+  assert_eq!(
+    wire_times.len(),
+    1,
+    "only the stalled first probe may have gone out, or the offsets below aim \
+     at the wrong round"
+  );
+  let Some(&wire) = wire_times.first() else {
+    return;
+  };
+  let Some(stale) = wire.checked_sub(GATE_STALE_TICK_OFFSET) else {
+    eprintln!("skipping: this host's monotonic clock is too young to subtract from");
+    return;
+  };
+  // Wait until the wire's own gap is genuinely paid, so the only thing that can
+  // still withhold this family is an instant read before the wait.
+  let open = wire + PROBE_MIN_FAMILY_GAP + Duration::from_millis(50);
+  while Instant::now() < open {
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  // A tick instant from inside the stretch: the core says the next probe is due
+  // at it, and the gate weighed at it reads a wire instant in its own future.
+  // Stage 3 then stage 4, both on that instant, exactly as a tick runs them:
+  // the timer is what arms the next probe, and the drain is what offers it.
+  mdns.fire_timeouts(stale);
+  mdns.drain_transmits(stale);
+  assert!(
+    mdns.sockets.wire_times_for_test(Family::V4).len() > 1,
+    "the wire had paid its {PROBE_MIN_FAMILY_GAP:?} and the core had a probe \
+     due, but the family was withheld — the gate was weighed against the tick's \
+     instant instead of the instant the datagram was offered"
+  );
+}
+
+// ── the SECOND family is admitted at its own offer ───────────────────────────
+//
+// A fan-out is SEQUENTIAL, so v4's `sendto` — and any preemption around it —
+// runs between v6's admission being decided and v6 being offered anything. A
+// mask computed once for the fan-out therefore answers v6's question at v4's
+// instant, and is wrong in exactly one direction: a wire that has since paid its
+// gap still reports `Gated`, which the projection maps to `Missed`, which spends
+// the core's partial-round patience for a family that was ready.
+//
+// The window is normally one syscall wide. `forced_send_delays` widens it from
+// inside v4's own send path, which is the seam that already exists — nothing new
+// is needed to reach the cross-family case, only two bound families.
+
+/// How long v4 is held inside its `sendto`. Must exceed
+/// [`CROSS_FAMILY_MARGIN`], or v6's deadline does not fall inside the fan-out at
+/// all and the test asserts nothing.
+const CROSS_FAMILY_STALL: Duration = Duration::from_millis(300);
+
+/// How far short of its own deadline v6 starts: small enough that the stall
+/// crosses it with room, wide enough that a mask frozen at the top of the
+/// fan-out cannot drift past it.
+const CROSS_FAMILY_MARGIN: Duration = Duration::from_millis(100);
+
+#[test]
+fn the_second_family_is_admitted_at_its_own_offer_not_at_the_fan_outs() {
+  let Some(mut mdns) = test_support::loopback_mdns() else {
+    return;
+  };
+  if !mdns.sockets.is_bound_for_test(Family::V6) {
+    eprintln!("skipping: the cross-family window needs two bound families and this host bound one");
+    return;
+  }
+  let gap = PROBE_MIN_FAMILY_GAP;
+  let mut gate = FamilyWireGate::default();
+
+  // Round one seeds v6's gate and leaves v4's untouched: the socket refuses v4,
+  // so it puts nothing on a wire and the gate records nothing for it. That
+  // asymmetry is what makes v4 open and v6 nearly-shut in round two — one
+  // producer, one `min_gap`, two families at different points in it.
+  mdns
+    .sockets
+    .force_send_wouldblock_for_test(Family::V4, true);
+  {
+    let Mdns {
+      sockets,
+      selfsend,
+      send_health,
+      ..
+    } = &mut *mdns;
+    super::send_and_credit(
+      sockets,
+      selfsend,
+      send_health,
+      &mut gate,
+      b"seed",
+      MDNS_V4_DST,
+      gap,
+    );
+  }
+  mdns
+    .sockets
+    .force_send_wouldblock_for_test(Family::V4, false);
+  let Some(&v6_wire) = mdns.sockets.wire_times_for_test(Family::V6).first() else {
+    eprintln!(
+      "skipping: IPv6 is bound but its multicast egress failed, so its gate never moved and \
+       there is no deadline for the fan-out to cross"
+    );
+    return;
+  };
+
+  // Wait until v6 is exactly `CROSS_FAMILY_MARGIN` short of its own deadline. A
+  // decision taken now says v6 is gated; the truth at v6's own offer, after v4's
+  // stall, is that it is not.
+  let offer = v6_wire + gap - CROSS_FAMILY_MARGIN;
+  while Instant::now() < offer {
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  if Instant::now() >= v6_wire + gap {
+    eprintln!("skipping: this host overslept v6's own deadline, so the window never existed");
+    return;
+  }
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V4, &[CROSS_FAMILY_STALL]);
+  let summary = {
+    let Mdns {
+      sockets,
+      selfsend,
+      send_health,
+      ..
+    } = &mut *mdns;
+    super::send_and_credit(
+      sockets,
+      selfsend,
+      send_health,
+      &mut gate,
+      b"offer",
+      MDNS_V4_DST,
+      gap,
+    )
+  };
+  assert_eq!(
+    summary.delivery.v6(),
+    FamilyDelivery::Delivered,
+    "v6's {gap:?} came due {CROSS_FAMILY_MARGIN:?} into v4's {CROSS_FAMILY_STALL:?} stall, \
+     before v6 had been offered anything at all — reporting it missed weighs v6's admission \
+     at v4's instant and spends the core's partial-round patience on a ready wire"
+  );
+}
+
+// ── stage 7 reads its own clock ─────────────────────────────────────────────
+//
+// A withdrawal item's whole schedule is defined relative to the instant it is
+// CREATED: `next_at` is that instant, and the 2 s anti-pin ceiling is measured
+// from it. Stage 7 is where the pipeline creates one — for a service an earlier
+// stage retired without beginning its goodbye — and on the tick's instant every
+// microsecond of stages 1 through 6 is deducted from that ceiling for a schedule
+// that did not exist while they ran. Past ~1.75 s of it the endpoint's own clamp
+// puts the next round inside the 250 ms §10.1 interval, and the pass after that
+// makes the one final ceiling attempt and frees the route with debt still owed.
+
+/// A tick whose receive stage alone runs longer than the §10.1 interval the
+/// schedule it is about to create owes. Past the 1.75 s at which the endpoint's
+/// re-arm clamp starts cutting that interval short.
+const SLOW_STAGE_ONE: Duration = Duration::from_millis(1_800);
+
+/// Stands in for the run loop's re-entry while a goodbye drains.
+const WITHDRAWAL_DRIVE_POLL: Duration = Duration::from_millis(5);
+
+/// Tick until nothing is withdrawing, and return the instants IPv4's wire
+/// recorded after `already_on_wire` — every one of which is a goodbye, since a
+/// withdrawing service transmits in no other stage.
+fn drive_withdrawal_to_settled(mdns: &mut Mdns, already_on_wire: usize) -> Vec<Instant> {
+  let deadline = Instant::now() + GOODBYE_CEILING + Duration::from_secs(2);
+  while mdns.endpoint.has_pending_withdrawals() && Instant::now() < deadline {
+    mdns.tick().expect("tick");
+    std::thread::sleep(WITHDRAWAL_DRIVE_POLL);
+  }
+  assert!(
+    !mdns.endpoint.has_pending_withdrawals(),
+    "the withdrawal outlived its own anti-pin ceiling"
+  );
+  let mut all = mdns.sockets.wire_times_for_test(Family::V4);
+  all.split_off(already_on_wire)
+}
+
+/// An IPv4-only endpoint whose one service has announced, plus how many
+/// datagrams that took, so everything after them is a goodbye.
+fn advertised_service(
+  ty: &str,
+) -> Option<(test_support::TestMdns, mdns_proto::ServiceHandle, usize)> {
+  let mut mdns = test_support::loopback_mdns_v4_only()?;
+  if !mdns.sockets.is_bound_for_test(Family::V4) {
+    eprintln!("skipping: IPv4 is not bound on this host");
+    return None;
+  }
+  let handle = mdns
+    .register_service(test_support::service_spec(ty, 8080))
+    .expect("register_service");
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
+    return None;
+  }
+  let already_on_wire = mdns.sockets.wire_times_for_test(Family::V4).len();
+  Some((mdns, handle, already_on_wire))
+}
+
+/// A goodbye begun by stage 7 is scheduled from stage 7, not from the top of the
+/// tick that reached it.
+///
+/// The service is retired the way an internal retirement does it — `withdrawing`
+/// set, the goodbye NOT begun — which is exactly the gap stage 7 scans for and
+/// the only path that creates a withdrawal from inside a tick.
+#[test]
+fn a_goodbye_begun_in_stage_seven_is_scheduled_from_stage_seven() {
+  let Some((mut mdns, handle, already_on_wire)) =
+    advertised_service("_hick-mio-slow-tick._tcp.local.")
+  else {
+    return;
+  };
+  mdns
+    .services
+    .get_mut(&handle)
+    .expect("the service context")
+    .withdrawing = true;
+  mdns.sockets.set_readable_for_test(Family::V4, true);
+  mdns
+    .sockets
+    .force_recv_delays_for_test(Family::V4, &[SLOW_STAGE_ONE]);
+  // The item is created after that stall, so its ceiling is at least this far
+  // out. A LOWER bound is what the spacing assertion wants: understating it can
+  // only weaken the floor it computes, never move it somewhere the fix does not
+  // reach.
+  let ceiling_floor = Instant::now() + SLOW_STAGE_ONE + GOODBYE_CEILING;
+  mdns.tick().expect("tick");
+  assert!(
+    mdns.endpoint.has_pending_withdrawals(),
+    "stage 7 must begin the goodbye of a service retired without one"
+  );
+  let wire_times = drive_withdrawal_to_settled(&mut mdns, already_on_wire);
+  assert_eq!(
+    wire_times.len(),
+    usize::from(super::withdrawal::GOODBYE_ROUNDS_PER_FAMILY),
+    "IPv4 owed a full §10.1 budget; a schedule anchored at the top of the slow \
+     tick loses the last round to the anti-pin ceiling and frees the route with \
+     the debt still owed"
+  );
+  assert_goodbye_wire_spacing("a goodbye begun by a slow tick", &wire_times, ceiling_floor);
+}
+
+// ── a paid family owes no further goodbye ───────────────────────────────────
+//
+// §10.1 debt is per family and the resend schedule is per item. Once one family
+// has paid every round and the other is still failing, a `Sent` on the paid one
+// is (correctly) not progress, so the endpoint re-arms the item on its 20 ms
+// retry backoff for the sake of the family that still owes. A driver that fans
+// every round to both families then puts a redundant TTL=0 goodbye on the paid
+// family's wire every 20 ms until the ceiling — dozens of multicast datagrams
+// per service, at a per-family spacing of 20 ms where §10.1 asks for 250 ms.
+
+/// A family that has paid its whole §10.1 budget is not offered the rounds the
+/// other family's retries keep producing.
+#[test]
+fn a_paid_family_carries_no_goodbye_while_the_blocked_one_retries() {
+  let Some(mut mdns) = test_support::loopback_mdns() else {
+    return;
+  };
+  if mdns.bound_families() != (true, true) {
+    eprintln!(
+      "skipping: this host did not bind both families, so no family can be paid \
+       while another still owes"
+    );
+    return;
+  }
+  let handle = mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-goodbye-debt._tcp.local.",
+      8080,
+    ))
+    .expect("register_service");
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
+    return;
+  }
+  let already_on_wire = mdns.sockets.wire_times_for_test(Family::V4).len();
+  // IPv6 refuses every datagram from here on, so it keeps its goodbye debt and
+  // the item re-arms on the endpoint's short retry backoff for its sake.
+  mdns
+    .sockets
+    .force_send_wouldblock_for_test(Family::V6, true);
+  mdns.unregister_service(handle);
+  let wire_times = drive_withdrawal_to_settled(&mut mdns, already_on_wire);
+  assert_eq!(
+    wire_times.len(),
+    usize::from(super::withdrawal::GOODBYE_ROUNDS_PER_FAMILY),
+    "IPv4 owed exactly its §10.1 budget and paid it; every datagram after that \
+     is a retraction of records nothing still advertises, emitted only because \
+     IPv6 is retrying"
+  );
+  for pair in wire_times.windows(2) {
+    let gap = pair[1].saturating_duration_since(pair[0]);
+    assert!(
+      gap >= GOODBYE_MIN_FAMILY_GAP,
+      "two goodbyes for one name reached IPv4's wire {gap:?} apart, inside the \
+       {GOODBYE_MIN_FAMILY_GAP:?} §10.1 gives one family's wire — the blocked \
+       family's retry cadence was applied to the paid family's transmissions"
+    );
+  }
+}
+
+/// The endpoint's own per-family goodbye budget is what the driver projects.
+///
+/// Pinned against the ENDPOINT rather than against the driver: this pumps
+/// `poll_withdrawal_transmit` directly, so it counts the rounds the endpoint
+/// itself owes rather than the rounds the driver was willing to offer. A change
+/// to `mdns-proto`'s budget therefore fails here, instead of leaving the driver
+/// silently withholding a goodbye a family still owes.
+#[test]
+fn the_endpoints_goodbye_budget_is_what_the_driver_projects() {
+  let Some((mut mdns, handle, _)) = advertised_service("_hick-mio-goodbye-budget._tcp.local.")
+  else {
+    return;
+  };
+  mdns.unregister_service(handle);
+  let mut at = Instant::now();
+  let mut rounds = 0usize;
+  // One more turn than the projection expects, so an endpoint that owes MORE is
+  // counted rather than truncated.
+  for _ in 0..usize::from(super::withdrawal::GOODBYE_ROUNDS_PER_FAMILY).saturating_add(2) {
+    let emitted = test_support::collect_goodbyes(&mut mdns, at);
+    if emitted.is_empty() {
+      break;
+    }
+    rounds = rounds.saturating_add(emitted.len());
+    at += GOODBYE_MIN_FAMILY_GAP + Duration::from_millis(10);
+  }
+  assert_eq!(
+    rounds,
+    usize::from(super::withdrawal::GOODBYE_ROUNDS_PER_FAMILY),
+    "`GOODBYE_ROUNDS_PER_FAMILY` restates a crate-private `mdns-proto` constant; \
+     they have drifted, and the driver is now projecting a debt the endpoint \
+     does not have"
   );
 }
