@@ -372,15 +372,14 @@ pub(crate) fn send_and_credit(
   let report = sockets.send_to(body, dst, gate.allow(now, min_gap));
   if report.loops_back {
     for (family, outcome) in report.per_family() {
-      // Two stamps from the same send, and they must not be swapped. The wall
-      // one ORDERS the credit against the echo and is pre-syscall so it cannot
-      // outrun the kernel's receive stamp; the monotonic one AGES it and is
-      // post-syscall so an unbounded pre-syscall stall is not charged to a
-      // two-second TTL. `zip` rather than two lookups: both are `Some` exactly
-      // when this family carried the datagram, so a credit is never recorded
-      // with half a pair.
-      if let Some((sent, aged_from)) = outcome.credit_stamp().zip(outcome.credit_age_anchor()) {
-        selfsend.record(family, body, sent, aged_from);
+      // The wall stamp ORDERS the credit against its echo, and is pre-syscall so
+      // it cannot outrun the kernel's receive stamp on a copy already looped
+      // back. It is emphatically not an age: the credit takes no ageing anchor
+      // here at all, because no anchor available inside this tick is a legal one
+      // — stage 1 has already run, so nothing recorded now can be claimed before
+      // the next tick opens the window. See `SelfSendTracker::seal`.
+      if let Some(sent) = outcome.credit_stamp() {
+        selfsend.record(family, body, sent);
       }
     }
   }
