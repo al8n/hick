@@ -599,14 +599,15 @@ fn query_without_timeout_deadline_does_not_cancel_early() {
   );
 }
 
-/// A send armed INSIDE the caller's window but drained after it must not go out,
-/// and the query must still END — visibly, through the deadline's own owner.
+/// A send armed INSIDE the caller's window but drained after it must not be
+/// admitted, and the query must still END — visibly, through the deadline's own
+/// owner.
 ///
 /// `handle_timeout` arms the retry at one instant; `poll_transmit` drains it at a
 /// later one, and no entry point in between weighs that later instant. A
-/// `poll_transmit` that ignores its own `now` therefore puts a question on the
-/// wire after the deadline `QuerySpec::with_timeout` promised would end the
-/// query.
+/// `poll_transmit` that ignores its own `now` therefore admits a question after
+/// the deadline `QuerySpec::with_timeout` promised would end the query — and
+/// admission is the boundary that promise names, so this is where it is kept.
 ///
 /// THREE things are asserted, and the middle one is why this is not simply a
 /// terminal taken here. "No transmit" alone would hold for a query that silently
@@ -658,7 +659,7 @@ fn a_send_drained_past_the_absolute_deadline_is_never_emitted() {
   let drained_at = t0.checked_add(Duration::from_secs(3)).unwrap();
   assert!(
     q.poll_transmit(|| drained_at, &mut buf).unwrap().is_none(),
-    "no question may go out after the caller's absolute deadline"
+    "no question may be admitted at or after the caller's absolute deadline"
   );
   assert!(
     !q.done,

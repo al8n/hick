@@ -665,11 +665,21 @@ where
   ///
   /// # The caller's deadline is weighed against a reading this call takes itself
   ///
-  /// `QuerySpec::with_timeout` is a promise to whoever set it: no question is
-  /// asked after that instant. [`Self::handle_timeout`] weighs the same
-  /// deadline, but a transmit it arms is drained LATER, and nothing in between
-  /// weighs that. So a send that is due once the clock has reached the deadline
-  /// is WITHHELD, on the same `now >= deadline` boundary `handle_timeout` uses.
+  /// `QuerySpec::with_timeout` is a promise to whoever set it, and THIS CALL is
+  /// the boundary it names: no question is ADMITTED — handed back from here as a
+  /// datagram to send — on or after the instant it makes absolute.
+  /// [`Self::handle_timeout`] weighs the same deadline, but a transmit it arms
+  /// is drained LATER, and nothing in between weighs that. So a send that is due
+  /// once the clock has reached the deadline is WITHHELD, on the same
+  /// `now >= deadline` boundary `handle_timeout` uses.
+  ///
+  /// Admission is the whole of what is promised, and deliberately so. What the
+  /// driver does with the returned datagram takes further time — a spacing
+  /// check, a syscall, on an async driver an await — and no comparison written
+  /// here can make its arrival on the wire atomic with the boundary. A caller
+  /// sizing a window against that overshoot needs the driver's send path, which
+  /// `QuerySpec::with_timeout` describes; what this method owes is that the
+  /// datagram was drawn while the window was open.
   ///
   /// `clock` is that reading, and it is a closure rather than an instant on
   /// purpose. An instant is sampled in the caller, and whatever runs between the

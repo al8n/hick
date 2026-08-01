@@ -185,7 +185,8 @@ cfg_heap! {
       self.unicast_response
     }
 
-    /// The absolute timeout for the query, if set.
+    /// The absolute timeout for the query, if set. See [`Self::with_timeout`]
+    /// for the boundary it guarantees.
     #[inline(always)]
     pub const fn timeout(&self) -> Option<Duration> {
       self.timeout
@@ -213,7 +214,76 @@ cfg_heap! {
       self
     }
 
-    /// Set an absolute timeout for the query.
+    /// Set an absolute timeout for the query, measured from the instant the
+    /// query is started.
+    ///
+    /// # The boundary is ADMISSION
+    ///
+    /// A question is **admitted** when [`Query::poll_transmit`] hands a driver
+    /// an encoded datagram to send. No question is admitted on or after
+    /// `start + timeout`: the core reads the clock at that comparison and
+    /// withholds the datagram, and it re-weighs the deadline at *every*
+    /// admission — so a question armed inside the window but drawn outside it
+    /// never becomes a datagram at all. The query itself ends on the same
+    /// boundary, in [`Query::handle_timeout`], on a wakeup
+    /// [`Query::poll_timeout`] publishes — and a query that has ended draws no
+    /// question at all.
+    ///
+    /// # It is NOT the instant the datagram leaves
+    ///
+    /// A question admitted just inside the window may reach the wire just after
+    /// it, and this promise deliberately does not claim otherwise. Admission
+    /// leaves the driver still holding the datagram, and no userspace precheck
+    /// can make the handover atomic: a check placed immediately before `sendto`
+    /// still leaves the interval between the check and the syscall, and between
+    /// the syscall and the wire. Every move of the check shortens that interval
+    /// and none of them removes it, so the guarantee is stated where it can be
+    /// kept. An enforceable departure boundary would have to come from the
+    /// operating system, not from a comparison in this crate.
+    ///
+    /// What a caller may conclude, then, is not that no question bearing this
+    /// `qname` was on the wire after the deadline. It is that the query stopped
+    /// *producing* questions there, and that whatever was still in flight had
+    /// already been admitted while the window was open.
+    ///
+    /// # What bounds the overshoot
+    ///
+    /// The driver's own path from admission to its `sendto` — which is the
+    /// quantity to size a window against, and it depends on the shape of that
+    /// path rather than on this crate:
+    ///
+    /// * A **synchronous** send path — per-family spacing check, syscall, no
+    ///   suspension point — overshoots by that stretch plus whatever the host's
+    ///   preemption adds. `hick-mio` has this shape.
+    /// * An **awaited** send path additionally carries the socket's own latency
+    ///   and the executor's scheduling latency, and can be meaningfully longer.
+    ///   How much longer is the driver's to state: `hick-reactor` bounds each
+    ///   family's attempt at RFC 6762 §8.1's 250 ms inter-probe interval and
+    ///   abandons it there — sound only because readiness I/O makes no syscall
+    ///   until the socket is writable — while `hick-compio` has no such licence,
+    ///   since cancelling a submitted completion-based operation is unreliable,
+    ///   and so awaits every fan-out to completion for as long as the kernel
+    ///   takes.
+    /// * A driver whose entry point receives an *instant* rather than a clock
+    ///   (`hick-smoltcp` and `hick-embassy`, through `Engine::pump`) weighs
+    ///   admission against its caller's reading, so admission there is only as
+    ///   fresh as that reading.
+    ///
+    /// A driver that parked an admitted datagram and sent it on a later pass
+    /// would widen this without bound. None of the drivers here do: a pass cut
+    /// short by its send budget parks its *cursor*, and a query it did not reach
+    /// is polled — and so re-weighed — afresh by the pass that resumes.
+    ///
+    /// # No effective deadline
+    ///
+    /// A `timeout` so large that `start + timeout` overflows the caller's
+    /// `Instant` leaves the query with no deadline rather than a clamped one:
+    /// such a query ends only when its RFC 6762 §5.2 retry budget or the caller
+    /// ends it.
+    ///
+    /// [`Query::poll_transmit`]: crate::Query::poll_transmit
+    /// [`Query::handle_timeout`]: crate::Query::handle_timeout
+    /// [`Query::poll_timeout`]: crate::Query::poll_timeout
     #[must_use]
     pub const fn with_timeout(mut self, v: Duration) -> Self {
       self.timeout = Some(v);

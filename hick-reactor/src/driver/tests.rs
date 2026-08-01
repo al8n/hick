@@ -3173,15 +3173,15 @@ async fn repeated_budget_cuts_reach_every_producer() {
 
 // ── the query drain weighs the caller's window on its own clock ─────────────
 //
-// `QuerySpec::with_timeout` is a promise to whoever set it: no question is asked
-// at or after the instant it makes absolute. The core keeps that promise inside
-// `Query::poll_transmit`, weighed against the instant the driver hands in — so
-// the promise is worth exactly what that reading is worth. The pass's reading is
-// taken before `sweep_closed_handles`, `fire_timeouts` and (in the default class
-// order) the whole service drain, whose fan-outs are AWAITED and bounded only by
-// `SEND_ATTEMPT_TIMEOUT` — so a window that shuts while an earlier producer's
-// datagram is in flight is invisible to it, and the question goes out after the
-// caller was told none would.
+// `QuerySpec::with_timeout` is a promise to whoever set it: no question is
+// ADMITTED at or after the instant it makes absolute. The core keeps that
+// promise inside `Query::poll_transmit`, weighed against the instant the driver
+// hands in — so the promise is worth exactly what that reading is worth. The
+// pass's reading is taken before `sweep_closed_handles`, `fire_timeouts` and (in
+// the default class order) the whole service drain, whose fan-outs are AWAITED
+// and bounded only by `SEND_ATTEMPT_TIMEOUT` — so a window that shuts while an
+// earlier producer's datagram is in flight is invisible to it, and the question
+// is admitted after the caller was told none would be.
 //
 // The RFC 6762 §5.2 ladder underneath the same query is the opposite case and
 // stays on the pass's instant: it is the core's own schedule, and every stage of

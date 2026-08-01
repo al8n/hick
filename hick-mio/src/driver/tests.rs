@@ -4300,14 +4300,14 @@ fn the_endpoints_goodbye_budget_is_what_the_driver_projects() {
 
 // ── stage 4 weighs the caller's query window on its own clock ───────────────
 //
-// `QuerySpec::with_timeout` is a promise to whoever set it: no question is asked
-// at or after the instant it makes absolute. The core keeps that promise inside
-// `Query::poll_transmit`, weighed against the instant the driver hands in — so
-// the promise is worth exactly what that reading is worth. The tick's reading is
-// taken before stages 1 through 3, and stage 1 is bounded by a peer rather than
-// by this host: a window that shuts while the receive is still running is
-// invisible to it, and the question goes out after the caller was told none
-// would.
+// `QuerySpec::with_timeout` is a promise to whoever set it: no question is
+// ADMITTED at or after the instant it makes absolute. The core keeps that
+// promise inside `Query::poll_transmit`, weighed against the instant the driver
+// hands in — so the promise is worth exactly what that reading is worth. The
+// tick's reading is taken before stages 1 through 3, and stage 1 is bounded by a
+// peer rather than by this host: a window that shuts while the receive is still
+// running is invisible to it, and the question is admitted after the caller was
+// told none would be.
 //
 // The §5.2 ladder underneath the same query is the opposite case and stays on
 // the tick's instant — see this module's clock rule.

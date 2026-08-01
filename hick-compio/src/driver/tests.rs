@@ -3608,14 +3608,15 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
 
 // ── the pump weighs the caller's query window on its own clock ──────────────
 //
-// `QuerySpec::with_timeout` is a promise to whoever set it: no question is asked
-// at or after the instant it makes absolute. The core keeps that promise inside
-// `Query::poll_transmit`, weighed against the instant the driver hands in — so
-// the promise is worth exactly what that reading is worth. The run loop re-reads
-// once per pump iteration, but it hands that reading to `poll_one_transmit`,
-// which snapshots and walks every service — and every preceding query — before
-// a query poll can use it. Both maps are uncapped and nothing in that stretch
-// awaits, so a re-read outside the call cannot stand in for one inside it.
+// `QuerySpec::with_timeout` is a promise to whoever set it: no question is
+// ADMITTED at or after the instant it makes absolute. The core keeps that
+// promise inside `Query::poll_transmit`, weighed against the instant the driver
+// hands in — so the promise is worth exactly what that reading is worth. The run
+// loop re-reads once per pump iteration, but it hands that reading to
+// `poll_one_transmit`, which snapshots and walks every service — and every
+// preceding query — before a query poll can use it. Both maps are uncapped and
+// nothing in that stretch awaits, so a re-read outside the call cannot stand in
+// for one inside it.
 //
 // The §5.2 ladder underneath the same query is the opposite case and keeps the
 // instant the call was given — see `poll_one_transmit`.

@@ -72,8 +72,8 @@
 //! [`QueryParam::with_timeout`](crate::QueryParam::with_timeout) window is still
 //! open, whether a query's
 //! [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window still
-//! admits the question stage 4 is about to put on the wire — is read at the
-//! decision by the code that makes it. The strongest form
+//! admits the question stage 4 is about to draw — is read at the decision by the
+//! code that makes it. The strongest form
 //! is to take no instant at all, which is what
 //! [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take),
 //! [`send_and_credit`], [`Mdns::push_updates`], [`Mdns::advance_lookups`] and
@@ -104,6 +104,19 @@
 //! What is left is the instructions between the read and the comparison, and it
 //! is irreducible — something must read a clock before something can compare
 //! against it.
+//!
+//! **What is left AFTER the comparison is irreducible too**, and that is why the
+//! caller's promise names admission rather than departure. A question the core
+//! admits still has to reach the kernel, and a check moved down to sit
+//! immediately before `sendto` would leave the interval between itself and the
+//! syscall, and between the syscall and the wire. So
+//! [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) bounds when a
+//! question may be admitted, and each driver bounds its own overshoot. This
+//! driver's is synchronous: stage 4 goes straight from the poll into
+//! [`send_and_credit`] — a per-family spacing check and a `sendto`, with no
+//! suspension point — so the overshoot is that stretch plus whatever preemption
+//! the host adds. That is a bound to reason with, not a second enforcement
+//! point, and adding one here would only relocate the same gap.
 //!
 //! **And one reading may have two uses when they are inverses.** A DNS-SD
 //! sub-query is started with an absolute anchor and a relative budget, and the
@@ -994,12 +1007,16 @@ impl Mdns {
             }
             // The CLOCK, not a reading of it. The core weighs a query's
             // `QuerySpec::with_timeout` deadline — a bound the CALLER holds, no
-            // question asked at or after it — against the instant the question
-            // would leave on, and it takes that instant itself, at the
-            // comparison. This driver hands over the source and keeps no reading
-            // of its own: the tick's instant predates stages 1 through 3, and any
-            // reading taken here would still predate the handle lookup the core
-            // does before it compares, so neither can stand in.
+            // question ADMITTED at or after it — against the instant it admits
+            // on, and it takes that instant itself, at the comparison. This
+            // driver hands over the source and keeps no reading of its own: the
+            // tick's instant predates stages 1 through 3, and any reading taken
+            // here would still predate the handle lookup the core does before it
+            // compares, so neither can stand in.
+            //
+            // Departure is not what is promised and cannot be: the send below is
+            // this driver's overshoot, and a check placed inside it would still
+            // sit before a syscall. See this module's clock rule.
             //
             // The RFC 6762 §5.2 retry ladder is not this deadline and does not
             // move here: `handle_query_timeout` fires it in stage 3 against the

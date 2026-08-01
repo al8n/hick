@@ -204,16 +204,19 @@ impl QueryParam {
   /// it. [`Mdns::next_timeout`](crate::Mdns::next_timeout) folds every live
   /// lookup's deadline in, so a caller that honours it is woken at the boundary.
   ///
-  /// **Retransmits of legs already armed.** A sub-query still open when the
-  /// deadline passes may put one more copy of its question on the wire, trailing
-  /// the deadline by up to one tick, before the tick that observes the deadline
-  /// cancels it. The leg's absolute deadline is weighed in the proto layer
-  /// against the instant the tick hands in — the same instant that drives the
-  /// RFC 6762 §5.2 retry ladder, which is the core's own schedule rather than
-  /// this bound — so a question armed just before the boundary can still reach
-  /// the send path just after it. Such an answer cannot reach you: the lookup is
-  /// retired before it would be consumed, and the two guarantees above are
-  /// unaffected. The packet is real all the same.
+  /// **Departure of a question already admitted.** A sub-query's absolute
+  /// deadline lands on this one exactly, and the core withholds any question it
+  /// draws on or after it — but what
+  /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) bounds is
+  /// ADMISSION, not departure, because no userspace check can make departure
+  /// atomic with the boundary: one placed immediately before `sendto` still
+  /// precedes the syscall, and the syscall still precedes the wire. So a
+  /// question admitted a moment before the boundary can leave a moment after it.
+  /// This driver's overshoot is synchronous — stage 4 goes straight from the poll
+  /// into the send, with no suspension point — so the trailing edge is that
+  /// stretch plus the host's preemption rather than a whole tick. Such an answer
+  /// cannot reach you: the lookup is retired before it would be consumed, and the
+  /// two guarantees above are unaffected. The packet is real all the same.
   ///
   /// A timeout so large that `Instant::now() + timeout` overflows means *no*
   /// effective deadline, here and on every sub-query. Such a lookup ends only
@@ -1133,17 +1136,16 @@ impl Mdns {
   ///
   /// # What this cannot close
   ///
-  /// A sub-query's own absolute deadline lands on its lookup's exactly, but it
-  /// lives in the proto layer and is weighed against the instant stage 3 hands
-  /// in — the tick's, because that same instant also drives the §5.2 retry
-  /// ladder, which *is* the core's own schedule. One parameter, two categories:
-  /// a question armed just before the boundary can therefore still reach stage
-  /// 4's send path a few microseconds after it. Splitting that would be an
-  /// `mdns-proto` change (either `Query::poll_transmit` honouring
-  /// `timeout_deadline` against the instant it is given, or `handle_timeout`
-  /// taking the absolute bound separately from the retry one), so what is closed
-  /// here is everything caller-visible: no answer consumed, no leg opened, no
-  /// entry surfaced, and the leg cancelled by the retirement below.
+  /// A sub-query's own absolute deadline lands on its lookup's exactly, and the
+  /// core weighs it at the poll that would draw the question, against a clock it
+  /// reads at that comparison — so a question drawn on or after the boundary is
+  /// withheld, and only one ADMITTED inside it can still reach the wire outside
+  /// it. That residue is not closable here, or in `mdns-proto`, or anywhere in
+  /// userspace: a check moved down to sit immediately before `sendto` still
+  /// precedes the syscall. It is stated instead, on
+  /// [`QueryParam::with_timeout`](crate::QueryParam::with_timeout). What IS
+  /// closed here is everything caller-visible: no answer consumed, no leg
+  /// opened, no entry surfaced, and the leg cancelled by the retirement below.
   ///
   /// # Termination
   ///

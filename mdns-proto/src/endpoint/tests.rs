@@ -1573,7 +1573,7 @@ fn a_query_whose_timeout_overflows_the_instant_still_transmits() {
 /// before the call — is therefore already history by the time the core weighs
 /// it, so a question whose `QuerySpec::with_timeout` window shut during that
 /// stretch would be admitted on the strength of a reading taken while the window
-/// was still open, and the caller would be told a question was asked inside a
+/// was still open, and the caller would be told a question was admitted inside a
 /// window that had closed.
 ///
 /// The clock is passed instead of a reading of it, so there is no parameter for

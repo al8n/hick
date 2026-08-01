@@ -51,6 +51,14 @@ pub enum TransmitObligation {
 /// this struct describes where the bytes go, how many were written, and whether
 /// the core will re-arm it until every obligated link accepts it
 /// ([`TransmitObligation`]).
+///
+/// It deliberately carries NO caller deadline. A query's `QuerySpec::with_timeout`
+/// bound is weighed once, at the poll that admits the datagram, and admission is
+/// the boundary that bound names. Carrying it here would only invite a recheck
+/// before each per-family syscall — the same comparison relocated, still ahead of
+/// the syscall and the syscall still ahead of the wire — so it would narrow the
+/// interval without ever closing it, while giving every driver a second place to
+/// disagree about when the window shut.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Transmit {
   dst: SocketAddr,

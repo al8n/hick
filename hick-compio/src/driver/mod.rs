@@ -887,16 +887,28 @@ impl State {
       Self::stall_before_query_poll(&mut self.forced_query_poll_delays);
       // The CLOCK, not a reading of it. The core weighs a query's
       // `QuerySpec::with_timeout` deadline — a bound the CALLER holds, no
-      // question asked at or after it — against the instant the question would
-      // leave on, and it takes that instant itself, at the comparison. This
-      // driver hands over the source and keeps no reading of its own: the `now`
-      // this call was handed is the run loop's per-iteration reading, taken
-      // before the service snapshot, the whole service walk and every preceding
-      // query of this same call, and a reading taken right here would still
-      // predate the handle lookup the core does before it compares. Both maps are
-      // uncapped, and no `await` divides any of it — elapsed time needs no
-      // suspension point to accrue, which is why no reading OUTSIDE the
-      // comparison can stand in for one at it.
+      // question ADMITTED at or after it — against the instant it admits on, and
+      // it takes that instant itself, at the comparison. This driver hands over
+      // the source and keeps no reading of its own: the `now` this call was
+      // handed is the run loop's per-iteration reading, taken before the service
+      // snapshot, the whole service walk and every preceding query of this same
+      // call, and a reading taken right here would still predate the handle
+      // lookup the core does before it compares. Both maps are uncapped, and no
+      // `await` divides any of it — elapsed time needs no suspension point to
+      // accrue, which is why no reading OUTSIDE the comparison can stand in for
+      // one at it.
+      //
+      // Admission is the boundary, and this driver's overshoot past it is the one
+      // it cannot cap: `run` hands the datagram to an AWAITED fan-out that is
+      // never abandoned, because cancelling a submitted completion-based
+      // operation is unreliable (see `awaiting_fanout`), so a question admitted
+      // just inside the window reaches a wire whenever the kernel completes it —
+      // traced, not bounded, at `FANOUT_STALL_TRACE`. Neither shape of recheck
+      // recovers departure: one placed before the submission is just this
+      // comparison again, a few instructions lower and still ahead of a syscall,
+      // and one placed after it would have to abandon an operation the kernel may
+      // already be completing — reporting a datagram as never sent while it goes
+      // out. The bound is what this driver can honestly offer.
       //
       // The RFC 6762 §5.2 retry ladder is not this deadline and does not move
       // here. That ladder, the endpoint's own timers and each service's

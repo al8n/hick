@@ -1054,14 +1054,26 @@ impl<N: Net> DriverState<N> {
         }
         // The CLOCK, not a reading of it. The core weighs a query's
         // `QuerySpec::with_timeout` deadline — a bound the CALLER holds, no
-        // question asked at or after it — against the instant the question would
-        // leave on, and it takes that instant itself, at the comparison. This
-        // driver hands over the source and keeps no reading of its own: the
-        // pass's `now` is read before `sweep_closed_handles`, `fire_timeouts` and
-        // (in the default order) the whole service drain, whose fan-outs are
-        // AWAITED, and any reading taken right here would still predate the
-        // handle lookup the core does before it compares — so neither can stand
-        // in.
+        // question ADMITTED at or after it — against the instant it admits on,
+        // and it takes that instant itself, at the comparison. This driver hands
+        // over the source and keeps no reading of its own: the pass's `now` is
+        // read before `sweep_closed_handles`, `fire_timeouts` and (in the default
+        // order) the whole service drain, whose fan-outs are AWAITED, and any
+        // reading taken right here would still predate the handle lookup the core
+        // does before it compares — so neither can stand in.
+        //
+        // Admission is the boundary, and this driver's overshoot past it is the
+        // AWAITED fan-out below: a question admitted just inside the window
+        // reaches a wire up to one `SEND_ATTEMPT_TIMEOUT` — plus the executor's
+        // scheduling latency — later. That is a bound to reason with, not a
+        // second enforcement point; a recheck placed inside the fan-out would
+        // still sit before a syscall, and before the wire.
+        //
+        // Nothing admitted is carried across a pass, either: `may_start_fanout`
+        // is consulted ABOVE this poll, both times, so a pass cut short by its
+        // budget parks its CURSOR and never a datagram. The query it did not
+        // reach still has its send pending, and the pass that resumes re-draws
+        // the question and re-weighs the window.
         //
         // Nothing else downstream wants an instant from this point: the fan-out
         // below takes no `now` of any kind — each family's wire gate is weighed at

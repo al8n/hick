@@ -1489,9 +1489,10 @@ where
       // `pump` is handed its instant by whoever calls it, and this engine has no
       // clock of its own to read — an `I` here can only be that same reading, so
       // the closure yields it unchanged. A query's `QuerySpec::with_timeout`
-      // deadline is therefore weighed against an instant the CALLER sampled,
-      // which on this tier is as close to the send as the API allows: closing
-      // that gap needs `pump` to take a clock, not this call site.
+      // deadline bounds ADMISSION, and on this tier admission is therefore
+      // weighed against an instant the CALLER sampled — as fresh as the API
+      // allows, and no fresher: narrowing it needs `pump` to take a clock, not a
+      // re-read at this call site.
       match self.endpoint.poll_query_transmit(handle, || now, scratch) {
         Ok(Some(transmit)) => {
           return Some((transmit, Origin::Query(handle)));
