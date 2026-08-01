@@ -631,9 +631,11 @@ where
   /// Produce the next outgoing datagram, if any. Writes into `buf`.
   ///
   /// Returns `Ok(None)` when the query is done, when no send is currently
-  /// due (i.e. `transmit_pending` is false), or when a due send would go out
-  /// past the caller's absolute deadline — in which case the query TERMINATES
-  /// instead (see below). A single call per scheduled
+  /// due (i.e. `transmit_pending` is false), or when a due send would go out at
+  /// or after the caller's absolute deadline (see below). Every one of those is
+  /// the same signal with the same meaning — *no datagram from this call, and
+  /// nothing about the query has changed* — so a driver that reads `Ok(None)`
+  /// as "no work here" is never wrong. A single call per scheduled
   /// deadline tick is guaranteed: the pending flag is cleared after the
   /// datagram is built, so a driver looping on this method will not
   /// re-send the query until the next `handle_timeout` fires.
@@ -667,13 +669,21 @@ where
   /// asked after that instant. [`Self::handle_timeout`] weighs the same
   /// deadline, but a transmit it arms is drained against a LATER instant — the
   /// one passed here — and nothing in between weighs that one. So a send that is
-  /// due when `now` has reached the deadline emits nothing and terminates the
-  /// query with [`QueryUpdate::Timeout`]: the same terminal, through the same
-  /// accounting, as the deadline firing from `handle_timeout`, and on the same
-  /// `now >= deadline` boundary.
+  /// due once `now` has reached the deadline is WITHHELD, on the same
+  /// `now >= deadline` boundary `handle_timeout` uses.
+  ///
+  /// Withheld, and nothing more. Ending the query here would be a terminal
+  /// transition reported as `Ok(None)` — byte-identical to an idle poll, so no
+  /// driver could tell the two apart, and one parked on this query's updates
+  /// would have nothing left to wake it. The deadline is not lost by
+  /// withholding: [`Self::poll_timeout`] still reports it (it is folded in with
+  /// `min`), so it is a wakeup every driver has already scheduled, and
+  /// [`Self::handle_timeout`] — its one owner — ends the query there, on a tick
+  /// the driver observes. Withholding is what the promise needs; the terminal
+  /// belongs to the entry point that can be seen making it.
   ///
   /// This is the caller's bound only. The RFC 6762 §5.2 retry ladder is a
-  /// separate deadline with a separate owner, and it is still fired exclusively
+  /// separate deadline with a separate owner, and it too is fired exclusively
   /// by [`Self::handle_timeout`].
   pub fn poll_transmit(
     &mut self,
@@ -685,28 +695,24 @@ where
     if self.done || !self.transmit_pending {
       return Ok(None);
     }
-    // Deliberately AFTER the pending check, so a terminal here can only ever
-    // stand in for a datagram this very call would have produced. `poll_transmit`
-    // is the one entry point excepted from the confirm-before-anything contract
-    // above, and it stays excepted: an unconfirmed datagram means
-    // `transmit_pending` is false, so this cannot move the query to a terminal
-    // state while a commit token is live. It also leaves an idle query — one
-    // waiting on a response, with no send due — untouched by a method that
-    // produces nothing for it.
+    // Deliberately AFTER the pending check, so this can only ever withhold a
+    // datagram THIS call would otherwise have produced. An idle query — one
+    // waiting on a response, with no send due — is left alone by a method that
+    // produces nothing for it, and a datagram still awaiting its
+    // `note_transmit_outcome` means `transmit_pending` is false, so the
+    // confirm-before-anything contract above is untouched.
     //
-    // Terminating rather than merely withholding the datagram: a withheld
-    // question would leave the query armed, with both deadlines still set and
-    // every later tick reaching this same point, so the query would stall rather
-    // than end.
+    // Nothing moves here. Withholding is the whole of what the caller's promise
+    // needs, and it keeps `Ok(None)` one signal with one meaning; the terminal
+    // stays with `handle_timeout`, whose wakeup `poll_timeout` still publishes.
     if let Some(deadline) = self.timeout_deadline
       && now >= deadline
     {
       crate::trace::trace!(
         target: "mdns_proto::query",
         handle = self.handle.raw(),
-        "query: absolute timeout deadline reached with a send due — terminating instead of emitting"
+        "query: absolute timeout deadline reached with a send due — withholding the question"
       );
-      self.terminate(QueryUpdate::Timeout);
       return Ok(None);
     }
     let buf_len = buf.len();

@@ -600,7 +600,7 @@ fn query_without_timeout_deadline_does_not_cancel_early() {
 }
 
 /// A send armed INSIDE the caller's window but drained after it must not go out,
-/// and the query must end.
+/// and the query must still END — visibly, through the deadline's own owner.
 ///
 /// `handle_timeout` arms the retry at one instant; `poll_transmit` drains it at a
 /// later one, and no entry point in between weighs that later instant. A
@@ -608,9 +608,15 @@ fn query_without_timeout_deadline_does_not_cancel_early() {
 /// wire after the deadline `QuerySpec::with_timeout` promised would end the
 /// query.
 ///
-/// BOTH halves are asserted. "No transmit" alone would also hold for a query
-/// that silently stalls — pending send still armed, deadline never fired, no
-/// terminal for the caller to observe.
+/// THREE things are asserted, and the middle one is why this is not simply a
+/// terminal taken here. "No transmit" alone would hold for a query that silently
+/// stalls, so the withheld send must leave the deadline still visible in
+/// `poll_timeout` — the wakeup every driver already folds into its park — and
+/// `handle_timeout` must then produce the terminal. A terminal taken by
+/// `poll_transmit` instead would be a state change reported as the same
+/// `Ok(None)` an idle poll returns: unobservable, with the query's last standing
+/// wakeup cleared by it, so a driver parked on that query would never be woken
+/// for the terminal it just took.
 #[test]
 fn a_send_drained_past_the_absolute_deadline_is_never_emitted() {
   use core::time::Duration;
@@ -655,12 +661,30 @@ fn a_send_drained_past_the_absolute_deadline_is_never_emitted() {
     "no question may go out after the caller's absolute deadline"
   );
   assert!(
+    !q.done,
+    "withholding is the whole of it — a terminal taken here would be reported \
+     as the same Ok(None) an idle poll returns, so no caller could see it"
+  );
+  assert!(
+    q.poll().is_none(),
+    "and no terminal update may be queued behind that indistinguishable Ok(None)"
+  );
+
+  // The query still ends, on the wakeup the driver has already scheduled.
+  assert_eq!(
+    q.poll_timeout(),
+    Some(deadline),
+    "the withheld send must leave the deadline standing in poll_timeout — that \
+     is the wakeup that ends the query, and clearing it is what would strand one"
+  );
+  q.handle_timeout(drained_at).unwrap();
+  assert!(
     q.done,
     "a query past its deadline must END, not stall with a send still armed"
   );
   assert!(
     matches!(q.poll(), Some(QueryUpdate::Timeout)),
-    "the terminal must be the same QueryUpdate::Timeout handle_timeout produces"
+    "the terminal is the QueryUpdate::Timeout its one owner produces"
   );
   assert!(
     q.poll_timeout().is_none(),
@@ -709,12 +733,12 @@ fn a_send_drained_inside_the_absolute_deadline_still_goes_out() {
   );
 }
 
-/// The deadline `poll_transmit` weighs stands in for a datagram THIS call would
-/// have produced, and for nothing else. Re-polling while the previous datagram
-/// is still awaiting its `note_transmit_outcome` is explicitly legal — the send
-/// itself may outlast the window — and it must stay the no-op it has always
-/// been: a terminal there would move the query with a commit token live, so the
-/// confirm would land on a query already retired.
+/// The deadline `poll_transmit` weighs governs a datagram THIS call would have
+/// produced, and nothing else. Re-polling while the previous datagram is still
+/// awaiting its `note_transmit_outcome` is explicitly legal — the send itself may
+/// outlast the window — and it must stay the pure no-op it has always been:
+/// there is no datagram to withhold, and any decision taken there would land on
+/// a query whose commit token is still live.
 ///
 /// The deadline is not lost by waiting, only left to its owner: once the token
 /// is resolved, `handle_timeout` fires it.
