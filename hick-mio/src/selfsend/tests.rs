@@ -111,14 +111,29 @@ fn ordered_mode_tolerates_only_the_timestamp_grain() {
   let mut t = SelfSendTracker::new();
   let sent = send_stamps();
   recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
-  // One nanosecond past the grain is outside the truncation tolerance. This is
-  // meaningful on both target classes without a `cfg`: on a nanosecond-grain
-  // target (grain == ZERO) it is 1ns before the send, landing in the branch that
-  // only the grain comparison can save; on a microsecond-grain target it is 1ns
-  // past the 1us tolerance. Either way it must not match, so this exercises the
-  // grain comparison itself rather than only ever hitting the trivial
-  // at-or-after-send case.
-  let just_outside_grain = sent.wall - super::RX_GRAIN_FOR_TEST - Duration::from_nanos(1);
+  // One hundred nanoseconds past the grain is outside the truncation tolerance.
+  // The epsilon has to clear two independent resolutions at once:
+  //
+  //   * the grain, which is `Duration::ZERO` on nanosecond-timestamp targets and
+  //     one microsecond on `timeval` ones. Any epsilon above zero is strictly
+  //     outside both — 100ns before the send on the first, 1.1us before it on
+  //     the second — so the claim lands in the branch that only the grain
+  //     comparison can save, and this exercises that comparison rather than only
+  //     ever hitting the trivial at-or-after-send case.
+  //   * the tick of `SystemTime` itself, which is one nanosecond on the
+  //     `timespec` targets but one hundred on Windows, where a `SystemTime` is a
+  //     FILETIME and converting a `Duration` into one integer-divides the
+  //     subsecond nanoseconds by 100. An epsilon below that tick is absorbed
+  //     rather than applied: the subtraction moves nothing, `just_outside_grain`
+  //     lands exactly ON the grain, `reference_ordered` rightly tolerates it,
+  //     and the assertion below reads its own arithmetic back as a failure.
+  //
+  // 100ns is the smallest value clearing both — one whole tick of the coarsest
+  // `SystemTime` any supported target has — so one epsilon still serves every
+  // target without a `cfg`, and it stays an order of magnitude inside the
+  // one-microsecond grain, leaving this assertion and the one below it
+  // bracketing the boundary tightly.
+  let just_outside_grain = sent.wall - super::RX_GRAIN_FOR_TEST - Duration::from_nanos(100);
   assert!(!t.take_at(Family::V4, b"payload", Some(just_outside_grain), sent));
   // Exactly one grain early is inside the truncation tolerance.
   let within = sent.wall - super::RX_GRAIN_FOR_TEST;

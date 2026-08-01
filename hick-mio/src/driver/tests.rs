@@ -2107,6 +2107,99 @@ fn a_refused_probe_does_not_advance_the_probe_sequence() {
   );
 }
 
+/// The other half of the contract above: when ONE of two bound families keeps
+/// refusing and the other carries the probe, RFC 6762 §8.1 advances anyway.
+///
+/// The two tests are the whole rule between them. A round that reached no wire
+/// advances nothing, however long it repeats — that is what keeps a name from
+/// being claimed out of silence. A round that reached one of two obligated
+/// families is a different fact: the core spends its partial-round patience
+/// re-arming the SAME probe, and then advances past the family that has not
+/// answered, as `Excused`. A family that is bound but permanently unable to send
+/// therefore costs the sequence a bounded delay and never pins it.
+///
+/// The driver's own part in that is to keep telling the truth: a
+/// present-but-refusing socket is reported missed on its thousandth consecutive
+/// failure exactly as on its first, and never `Unobligated`. It is the core, not
+/// the health table, that decides when to stop waiting — so this asserts both
+/// that the sequence moved and that the family is still being reported as
+/// degraded while it moved.
+///
+/// # The host condition this pins
+///
+/// A dual-stack endpoint whose IPv6 family can never deliver is not a contrived
+/// shape. A Linux host carrying `::1` on `lo` binds the socket, joins `ff02::fb`
+/// on the loopback index, and then refuses every send with `ENETUNREACH`,
+/// because `lo` has no IPv6 multicast route; every GitHub `ubuntu-latest` runner
+/// is such a host. `force_send_wouldblock_for_test` reproduces that shape on any
+/// host that binds the family at all, which is what makes the property testable
+/// somewhere other than a runner.
+///
+/// Skipped where IPv6 does not bind, since there is then no second family to
+/// hold anything back. The skip is decided from `bound_families`, a
+/// construction-time fact settled before the behaviour under test runs, rather
+/// than inferred from the sequence failing to advance.
+#[test]
+fn a_probe_one_of_two_families_carried_advances_the_sequence() {
+  let Some(mut mdns) = test_support::loopback_mdns() else {
+    return;
+  };
+  if !mdns.bound_families().1 {
+    eprintln!(
+      "skipping: this host binds no IPv6 socket, so there is no second family to \
+       hold back"
+    );
+    return;
+  }
+  let handle = mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-partial._tcp.local.",
+      8080,
+    ))
+    .expect("register_service");
+  mdns
+    .sockets
+    .force_send_wouldblock_for_test(Family::V6, true);
+
+  let state = |mdns: &Mdns| {
+    mdns
+      .services
+      .get(&handle)
+      .map(|ctx| ctx.proto.state())
+      .expect("the service is still registered")
+  };
+  // `Init` is where a freshly registered service sits out §8.1's initial
+  // 0-250 ms delay, and `Probing(0)` is where it lands once the first probe has
+  // been sent and confirmed missed. Only leaving BOTH is the advance under test;
+  // waiting merely to leave `Probing(0)` would be satisfied before the first
+  // probe was ever armed.
+  let waiting = |mdns: &Mdns| matches!(state(mdns), ServiceState::Init | ServiceState::Probing(0));
+  // §8.1 spaces each re-arm 250 ms apart on top of the initial 0-250 ms jitter,
+  // and the excusal lands on the round after the patience bound is spent, so the
+  // advance is about a second away. This is slack for a loaded runner rather
+  // than a timing assertion.
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while Instant::now() < deadline && waiting(&mdns) {
+    mdns.tick().expect("tick");
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  assert!(
+    !waiting(&mdns),
+    "IPv4 carried every probe, so the core must spend its partial-round patience \
+     on IPv6 and then advance without it: a bound family that can never deliver \
+     may delay the §8.1 sequence and must not pin it, but the service is still \
+     at {}",
+    state(&mdns)
+  );
+  assert_eq!(
+    mdns.degraded_families(),
+    (false, true),
+    "the sequence advanced because the CORE stopped waiting, not because the \
+     driver wrote the family off: it is still bound, still offered every \
+     datagram, and still reported failing"
+  );
+}
+
 /// End to end: a socket that never accepts a byte is reported degraded, and that
 /// is the whole of what the driver does about it.
 ///

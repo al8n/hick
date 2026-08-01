@@ -27,7 +27,7 @@
 
 use std::{
   marker::PhantomData,
-  net::Ipv4Addr,
+  net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
   sync::{Mutex, MutexGuard},
   time::{Duration, Instant},
 };
@@ -195,24 +195,102 @@ impl Endpoint<'_> {
   }
 }
 
+/// Whether interface `idx` can actually put an IPv6 multicast datagram on a
+/// wire, decided by trying one **before** any endpoint is built.
+///
+/// # A successful bind is not the question
+///
+/// [`Mdns::new`] already degrades to IPv4-only when `hick_udp::try_bind_v6` is
+/// *rejected*, and that covers the hosts which refuse the family outright. It
+/// cannot cover the host that accepts it and then carries nothing: one with
+/// `::1` on `lo` binds the socket, accepts `IPV6_MULTICAST_IF` for the loopback
+/// index, joins `ff02::fb` there, and then refuses **every** `sendto` with
+/// `ENETUNREACH`, because `lo` has no IPv6 multicast route. Every GitHub
+/// `ubuntu-latest` runner is that host; a macOS box and a container that leaves
+/// IPv6 disabled are not, which is why this was invisible outside CI. Nothing
+/// short of the send distinguishes the two, so the send is the probe.
+///
+/// # Why such a family must be kept out rather than waited on
+///
+/// A bound family is an OBLIGATED family. `hick-mio` reports a
+/// present-but-refusing socket as missed and never as unobligated — that rule is
+/// load-bearing, since reporting it unobligated would tell the core the link
+/// owes nothing and let an RFC 6762 §8.3 announcement count as delivered to a
+/// link that heard none of it. The core then advances each §8 phase past the
+/// dead family, but only after spending its partial-round patience on it, and
+/// every one of those re-arms is a real unsolicited response on the IPv4 wire
+/// that §8.3 requires the *next* one to be spaced at least twice as far behind.
+/// The service does still reach `Established` — measured at ~34 s on such a
+/// host, against ~2.5 s single-stack — which is the protocol behaving correctly
+/// and is far outside any budget a test should sit through. So the family is
+/// excluded here, from a fact about the host established up front, rather than
+/// inferred afterwards from a lifecycle that failed to finish in time.
+///
+/// `hick-reactor`'s loopback fixture arrives at the same endpoint by
+/// construction: its endpoints are `with_ipv6(false)` unconditionally, which is
+/// why its suite is green on the runner this one failed on.
+///
+/// # The probe socket
+///
+/// Bound to an ephemeral port and never 5353: joining the endpoint's
+/// `SO_REUSEPORT` group would let this socket absorb deliveries meant for the
+/// endpoint under test. It joins no group either — only egress is in question,
+/// and a joined socket would receive the group's traffic for no reason. The
+/// destination is `hick-mio`'s own, scope id and all, so a route this probe
+/// finds is the route the endpoint will use. The payload is empty: the datagram
+/// exists to be routed, not to be read.
+fn carries_ipv6_multicast(idx: u32) -> bool {
+  use socket2::{Domain, Protocol, Socket, Type};
+
+  let dst = SocketAddr::V6(SocketAddrV6::new(
+    hick_udp::constants::MDNS_IPV6_GROUP,
+    hick_udp::constants::MDNS_PORT,
+    0,
+    0,
+  ));
+  let probe = || -> std::io::Result<()> {
+    let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    s.set_only_v6(true)?;
+    s.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    s.set_multicast_if_v6(idx)?;
+    s.send_to(&[], &dst.into())?;
+    Ok(())
+  };
+  match probe() {
+    Ok(()) => true,
+    Err(e) => {
+      eprintln!("note: interface {idx} carries no IPv6 multicast egress ({e:?})");
+      false
+    }
+  }
+}
+
 /// Build an endpoint pinned to the loopback interface, or print why the test is
 /// skipping.
 ///
-/// A dual-stack bind is attempted first and degrades to IPv4-only, because
-/// `hick_udp::try_bind_v6` is rejected outright on some hosts — macOS returns
-/// `EINVAL` on every interface — while it succeeds on others. Which families end
-/// up bound is therefore a property of the host, never of a test: nothing in
-/// this suite asserts a family count, a credit count, or a `sent` literal. The
-/// degradation is printed so a run that covers less than it looks like says so.
+/// Which families end up bound is a property of the host, never of a test:
+/// nothing in this suite asserts a family count, a credit count, or a `sent`
+/// literal. Two host facts can each take IPv6 away, and they are established in
+/// the order that a bind cannot answer the second of them:
+///
+/// * the loopback interface carries no IPv6 multicast egress — see
+///   [`carries_ipv6_multicast`], which decides this by sending one datagram
+///   before the endpoint exists;
+/// * the dual-stack bind is rejected outright.
+///
+/// Both are printed, so a run that covers less than it looks like says so.
 pub fn endpoint<'lock>(_lock: &'lock BindGuard, label: &'static str) -> Option<Endpoint<'lock>> {
   let Some(idx) = loopback_index() else {
     eprintln!("skipping: no UP loopback interface reported by getifs");
     return None;
   };
-  let opts = ServerOptions::default().with_interface_index(Some(idx));
+  let want_v6 = carries_ipv6_multicast(idx);
+  let opts = ServerOptions::default()
+    .with_interface_index(Some(idx))
+    .with_ipv6(want_v6);
   let mdns = match Mdns::new(opts.clone()) {
     Ok(m) => m,
-    Err(e) => {
+    Err(e) if want_v6 => {
       eprintln!("note: {label}: dual-stack loopback bind failed ({e:?}); retrying IPv4-only");
       match Mdns::new(opts.with_ipv6(false)) {
         Ok(m) => m,
@@ -222,7 +300,21 @@ pub fn endpoint<'lock>(_lock: &'lock BindGuard, label: &'static str) -> Option<E
         }
       }
     }
+    Err(e) => {
+      eprintln!("skipping: {label}: loopback bind failed even IPv4-only ({e:?})");
+      return None;
+    }
   };
+  // The probe's answer must reach the endpoint, not merely be printed: an
+  // endpoint that bound IPv6 anyway would be obligated on a family that can
+  // never deliver, which is the whole condition this fixture exists to keep out.
+  // Asserted rather than skipped — it is a statement about this crate honouring
+  // `with_ipv6(false)`, and nothing about the host can make it false.
+  assert!(
+    !mdns.bound_families().1 || want_v6,
+    "{label}: IPv6 egress is unavailable on interface {idx}, so the endpoint was built with \
+     with_ipv6(false), yet it bound an IPv6 socket anyway"
+  );
   let poll = match Poll::new() {
     Ok(p) => p,
     Err(e) => {
