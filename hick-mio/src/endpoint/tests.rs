@@ -55,7 +55,7 @@ fn deregister_releases_the_tokens_and_allows_re_registration() {
   mdns
     .register(poll.registry(), Token(1), Token(2))
     .expect("register");
-  mdns.deregister(poll.registry()).expect("deregister");
+  mdns.deregister().expect("deregister");
   assert!(!mdns.owns(Token(1)));
   assert!(!mdns.owns(Token(2)));
   mdns

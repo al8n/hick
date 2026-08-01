@@ -1,7 +1,7 @@
 use std::{
   net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
   sync::MutexGuard,
-  time::SystemTime,
+  time::{Duration, Instant as StdInstant, SystemTime},
 };
 
 use mio::{Interest, Poll, Token};
@@ -121,7 +121,161 @@ fn bind_register_and_deregister_on_loopback() {
   assert!(socks.owns(Token(10)));
   assert!(socks.owns(Token(11)));
   assert!(!socks.owns(Token(12)));
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
+}
+
+// ── registration state ──────────────────────────────────────────────────────
+//
+// A registration lives in exactly one selector, and the state that names it —
+// the cloned registry, the token pair, each family's own token — is the only
+// handle this crate has on it. Forgetting any of that while the selector still
+// holds the registration leaves a ghost: events still delivered under a token
+// `owns` has stopped claiming, and no registry left to remove it with.
+
+/// Deregistration goes to the selector that actually holds the registration.
+///
+/// A caller driving two `Poll`s could otherwise hand us the wrong one, and the
+/// platforms do not even agree about what that means — kqueue ignores the absent
+/// filter and reports success, epoll returns `ENOENT` — so honouring a
+/// caller-supplied registry could only ever forget a registration that still
+/// exists. There is deliberately no argument left to get wrong; what this pins is
+/// that the removal really reached the first `Poll`.
+#[test]
+fn deregistration_reaches_the_selector_that_holds_the_registration() {
+  let Some(mut socks) = loopback_sockets(ServerOptions::default().with_ipv6(false)) else {
+    return;
+  };
+  // `holder` takes the registration; `other` is a second selector the same
+  // caller drives.
+  let mut holder = Poll::new().expect("poll");
+  let mut other = Poll::new().expect("poll");
+  socks
+    .register(holder.registry(), Token(10), Token(11))
+    .expect("register");
+  socks.deregister().expect("deregister");
+  assert!(!socks.owns(Token(10)));
+
+  // The registration really left `holder`, so `other` can take it — and then
+  // `other` alone hears about a datagram. A ghost left behind would deliver the
+  // same edge twice, the second time under a token nothing claims.
+  socks
+    .register(other.registry(), Token(10), Token(11))
+    .expect("the second Poll must be able to take the registration");
+  let report = socks.send_to(b"two-polls", MDNS_V4, ALLOW_BOTH);
+  assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
+
+  let mut events = mio::Events::with_capacity(8);
+  other
+    .poll(&mut events, Some(std::time::Duration::from_millis(500)))
+    .expect("poll");
+  if !events.iter().any(|ev| socks.owns(ev.token())) {
+    eprintln!("skipping the ghost assertion: no readiness arrived on the second Poll within 500ms");
+    socks.deregister().expect("deregister");
+    return;
+  }
+  let mut ghosts = mio::Events::with_capacity(8);
+  holder
+    .poll(&mut ghosts, Some(std::time::Duration::from_millis(100)))
+    .expect("poll");
+  assert!(
+    !ghosts.iter().any(|ev| socks.owns(ev.token())),
+    "the first Poll is still delivering readiness for a socket it was told to \
+     release"
+  );
+  socks.deregister().expect("deregister");
+}
+
+/// A family the selector did not release keeps everything needed to retry.
+///
+/// Clearing the token, the readiness and the shared registration state on a
+/// failure loses the ghost twice over: `owns` stops claiming a token the
+/// selector still routes to us, and no registry is left to remove it with.
+#[test]
+fn a_family_the_selector_did_not_release_keeps_its_registration_state() {
+  let Some(mut socks) = loopback_sockets(ServerOptions::default()) else {
+    return;
+  };
+  let poll = Poll::new().expect("poll");
+  socks
+    .register(poll.registry(), Token(10), Token(11))
+    .expect("register");
+  socks.force_deregister_error_for_test(Family::V4, true);
+  socks
+    .deregister()
+    .expect_err("a family the selector refused to release must be reported");
+
+  assert!(
+    socks.owns(Token(10)) && socks.owns(Token(11)),
+    "IPv4 is still registered, so the pair the caller reserved is still ours to \
+     route"
+  );
+  assert_eq!(
+    socks.interest_for_test(Family::V4),
+    Some(Interest::READABLE),
+    "the family that was not released still holds the registration it was given"
+  );
+  assert_eq!(
+    socks
+      .register(poll.registry(), Token(12), Token(13))
+      .expect_err("still registered")
+      .kind(),
+    std::io::ErrorKind::AlreadyExists,
+    "the outstanding cleanup is exactly what the caller is told to do first"
+  );
+
+  // Retryable: the same call, once the selector cooperates, finishes it.
+  socks.force_deregister_error_for_test(Family::V4, false);
+  socks
+    .deregister()
+    .expect("the outstanding removal must still be retryable");
+  assert!(!socks.owns(Token(10)));
+  assert_eq!(socks.interest_for_test(Family::V4), None);
+  socks
+    .register(poll.registry(), Token(12), Token(13))
+    .expect("re-register");
+  socks.deregister().expect("deregister");
+}
+
+/// A partial registration whose rollback also failed stays owned and removable.
+///
+/// The rollback is the same hazard read backwards: IPv6 refuses the
+/// registration, rolling IPv4 back out fails too, and IPv4 is left in the
+/// caller's selector. Dropping the state that names it there would strand it for
+/// the life of the process.
+#[test]
+fn a_registration_whose_rollback_failed_stays_owned_and_retryable() {
+  let Some(mut socks) = loopback_sockets(ServerOptions::default().with_ipv6(false)) else {
+    return;
+  };
+  let poll = Poll::new().expect("poll");
+  socks.force_v6_register_error_for_test(true);
+  socks.force_deregister_error_for_test(Family::V4, true);
+  socks
+    .register(poll.registry(), Token(10), Token(11))
+    .expect_err("the IPv6 half of the registration failed");
+
+  assert!(
+    socks.owns(Token(10)),
+    "IPv4 is still in the caller's selector; `owns` must keep claiming the token \
+     it will route on"
+  );
+  assert_eq!(
+    socks.interest_for_test(Family::V4),
+    Some(Interest::READABLE),
+    "and the family still holds the registration the rollback could not remove"
+  );
+
+  socks.force_deregister_error_for_test(Family::V4, false);
+  socks
+    .deregister()
+    .expect("the leftover registration must still be removable");
+  assert!(!socks.owns(Token(10)));
+
+  socks.force_v6_register_error_for_test(false);
+  socks
+    .register(poll.registry(), Token(10), Token(11))
+    .expect("a fully cleaned-up endpoint registers again");
+  socks.deregister().expect("deregister");
 }
 
 #[test]
@@ -136,7 +290,7 @@ fn recv_with_nothing_pending_returns_none() {
   let mut buf = vec![0u8; 2048];
   // No readiness recorded -> nothing to drain.
   assert!(socks.recv(&mut buf).is_none());
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 // ── readiness bookkeeping ───────────────────────────────────────────────────
@@ -166,7 +320,7 @@ fn readiness_is_recorded_then_cleared_by_draining_to_wouldblock() {
   // unlike a unicast to our own port, which macOS `SO_REUSEPORT` hands to just
   // one of the sockets bound to 5353 (usually the system responder).
   let report = socks.send_to(b"ping", MDNS_V4, ALLOW_BOTH);
-  assert!(matches!(report.v4, SendOutcome::Sent(_, _)), "{report:?}");
+  assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
 
   let mut events = mio::Events::with_capacity(8);
   poll
@@ -214,7 +368,7 @@ fn readiness_is_recorded_then_cleared_by_draining_to_wouldblock() {
     !socks.has_readable(),
     "draining to WouldBlock must clear the flag and re-arm, or the caller spins"
   );
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 // ── liveness for pending output ─────────────────────────────────────────────
@@ -235,7 +389,7 @@ fn a_healthy_socket_pair_needs_no_timer() {
     !socks.needs_interest_retry(),
     "nothing is parked and no re-arm failed, so mio's own edges suffice"
   );
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 #[test]
@@ -255,13 +409,13 @@ fn a_registration_is_readable_only_for_the_life_of_the_socket() {
     Some(Interest::READABLE)
   );
   let report = socks.send_to(b"body", MDNS_V4, ALLOW_BOTH);
-  assert!(matches!(report.v4, SendOutcome::Sent(_, _)));
+  assert!(matches!(report.v4, SendOutcome::Sent { .. }));
   assert_eq!(
     socks.interest_for_test(Family::V4),
     Some(Interest::READABLE),
     "a send must never change what the selector is watching for"
   );
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 #[test]
@@ -301,6 +455,18 @@ fn an_unknown_interface_index_is_not_reported_as_a_missing_address() {
 // loopback uncredited, and the take-once tracker would then ingest it as a peer
 // datagram and see a phantom conflict against itself.
 
+/// A synthetic acceptance whose three stamps all describe one syscall: the wall
+/// clock `wall`, and both monotonic reads at `mono`. Only the wall stamp matters
+/// to the credit accounting below, and collapsing the other two keeps the
+/// fixture from implying a stall it is not testing.
+const fn sent_at(wall: SystemTime, mono: std::time::Instant) -> SendOutcome {
+  SendOutcome::Sent {
+    submitted_wall: wall,
+    submitted_at: mono,
+    wire_at: mono,
+  }
+}
+
 /// The wall stamp of every family that actually transmitted, in family order.
 /// The shape the driver reads out of [`SendReport::per_family`] to credit its
 /// own loopback copies.
@@ -308,10 +474,7 @@ fn stamps(report: &SendReport) -> Vec<SystemTime> {
   report
     .per_family()
     .into_iter()
-    .filter_map(|(_, outcome)| match outcome {
-      SendOutcome::Sent(at, _) => Some(at),
-      _ => None,
-    })
+    .filter_map(|(_, outcome)| outcome.credit_stamp())
     .collect()
 }
 
@@ -325,8 +488,8 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
 
   let mono = std::time::Instant::now();
   let both = SendReport {
-    v4: SendOutcome::Sent(t1, mono),
-    v6: SendOutcome::Sent(t2, mono),
+    v4: sent_at(t1, mono),
+    v6: sent_at(t2, mono),
     loops_back: true,
   };
   assert_eq!(
@@ -336,7 +499,7 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
   );
 
   let v4_only = SendReport {
-    v4: SendOutcome::Sent(t1, mono),
+    v4: sent_at(t1, mono),
     v6: SendOutcome::NoSocket,
     loops_back: true,
   };
@@ -388,7 +551,7 @@ fn a_multicast_send_reports_one_outcome_per_bound_family() {
       !matches!(report.v6, SendOutcome::NoSocket),
       "a bound family must be attempted, never reported absent: {report:?}"
     );
-    if !matches!(report.v6, SendOutcome::Sent(_, _)) {
+    if !matches!(report.v6, SendOutcome::Sent { .. }) {
       eprintln!(
         "note: IPv6 is bound but its multicast egress failed ({:?}); the two-credit fan-out is unexercised on this host",
         report.v6
@@ -405,7 +568,7 @@ fn a_multicast_send_reports_one_outcome_per_bound_family() {
   // IPv4 multicast on loopback works on every supported platform, so this stays
   // strict.
   assert!(
-    matches!(report.v4, SendOutcome::Sent(_, _)),
+    matches!(report.v4, SendOutcome::Sent { .. }),
     "v4: {report:?}"
   );
   // One credit per family that actually reached the kernel — whichever families
@@ -414,7 +577,7 @@ fn a_multicast_send_reports_one_outcome_per_bound_family() {
     stamps(&report).len(),
     [report.v4, report.v6]
       .iter()
-      .filter(|o| matches!(o, SendOutcome::Sent(_, _)))
+      .filter(|o| matches!(o, SendOutcome::Sent { .. }))
       .count(),
     "credits must match the families that reached the kernel: {report:?}"
   );
@@ -434,7 +597,7 @@ fn a_unicast_send_reports_one_sent_and_one_no_socket() {
   };
   let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5354));
   let report = socks.send_to(b"body", dst, ALLOW_BOTH);
-  assert!(matches!(report.v4, SendOutcome::Sent(_, _)), "{report:?}");
+  assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
   assert_eq!(report.v6, SendOutcome::NoSocket);
   assert_eq!(
     stamps(&report).len(),
@@ -534,7 +697,7 @@ fn a_successful_send_bumps_packets_tx_and_bytes_tx() {
   let before = socks.stats.snapshot();
   let body = b"ping";
   let report = socks.send_to(body, MDNS_V4, ALLOW_BOTH);
-  assert!(matches!(report.v4, SendOutcome::Sent(_, _)), "{report:?}");
+  assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
 
   let after = socks.stats.snapshot();
   assert_eq!(
@@ -631,7 +794,7 @@ fn a_truncated_datagram_bumps_packets_rx_bytes_rx_and_packets_dropped() {
   // reliable on every supported platform, so this needs no additional skip.
   let big = vec![0xABu8; 4096];
   let report = socks.send_to(&big, MDNS_V4, ALLOW_BOTH);
-  assert!(matches!(report.v4, SendOutcome::Sent(_, _)), "{report:?}");
+  assert!(matches!(report.v4, SendOutcome::Sent { .. }), "{report:?}");
 
   let mut events = mio::Events::with_capacity(8);
   poll
@@ -646,7 +809,7 @@ fn a_truncated_datagram_bumps_packets_rx_bytes_rx_and_packets_dropped() {
   }
   if !saw_ours {
     eprintln!("skipping: no readiness event arrived within 500ms");
-    socks.deregister(poll.registry()).expect("deregister");
+    socks.deregister().expect("deregister");
     return;
   }
 
@@ -674,7 +837,7 @@ fn a_truncated_datagram_bumps_packets_rx_bytes_rx_and_packets_dropped() {
     after.packets_dropped > before.packets_dropped,
     "a truncated datagram must be counted as a drop"
   );
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 // ── receive rotation ────────────────────────────────────────────────────────
@@ -756,7 +919,7 @@ fn recv_consults_and_advances_the_family_rotor() {
     Family::V6,
     "selecting a family must hand the next turn to the other one"
   );
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 // ── receive re-arm liveness ─────────────────────────────────────────────────
@@ -811,7 +974,7 @@ fn a_failed_receive_rearm_brings_the_caller_back_with_nothing_queued() {
     !socks.needs_interest_retry(),
     "a re-arm that landed must stop asking to be retried"
   );
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 /// `WouldBlock` is the **only** thing that clears readiness, and when it does
@@ -837,7 +1000,7 @@ fn stop_reading_clears_readiness_and_records_a_failed_rearm_together() {
   socks.stop_reading_for_test(Family::V4);
   assert!(!socks.has_readable());
   assert!(socks.needs_interest_retry());
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 // ── transient receive errors ────────────────────────────────────────────────
@@ -858,7 +1021,7 @@ fn stop_reading_clears_readiness_and_records_a_failed_rearm_together() {
 /// receive queue by the time `sendto` returns.
 fn seed_one_datagram(socks: &mut Sockets, poll: &mut Poll, body: &[u8]) -> bool {
   let report = socks.send_to(body, MDNS_V4, ALLOW_BOTH);
-  if !matches!(report.v4, SendOutcome::Sent(_, _)) {
+  if !matches!(report.v4, SendOutcome::Sent { .. }) {
     eprintln!("skipping: the IPv4 multicast send did not reach the kernel ({report:?})");
     return false;
   }
@@ -913,7 +1076,7 @@ fn a_transient_receive_error_still_reads_the_datagram_behind_it() {
   }
   if !drain_for(&mut socks, b"control") {
     eprintln!("skipping: this host did not loop our own multicast back");
-    socks.deregister(poll.registry()).expect("deregister");
+    socks.deregister().expect("deregister");
     return;
   }
 
@@ -928,7 +1091,7 @@ fn a_transient_receive_error_still_reads_the_datagram_behind_it() {
     "clearing readiness on an error that consumed nothing strands whatever is \
      queued behind it: edge-triggered readiness generates no second edge"
   );
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 /// A socket erroring on every read must neither spin nor go silent: readiness
@@ -994,7 +1157,7 @@ fn repeated_receive_errors_retain_readiness_and_escalate_the_backoff() {
     "WouldBlock is what clears readiness"
   );
   assert_eq!(socks.recv_error_backoff_level(), 0);
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 /// A receive error the socket will keep returning is not retried: the family is
@@ -1043,7 +1206,7 @@ fn a_permanent_receive_error_gives_up_on_the_family() {
   assert!(socks.recv(&mut buf).is_none());
   assert_eq!(socks.deaf_families(), (true, false));
   assert_eq!(socks.recv_error_backoff_level(), 0);
-  socks.deregister(poll.registry()).expect("deregister");
+  socks.deregister().expect("deregister");
 }
 
 /// A transient error must **not** reach the give-up path, or one `ENOBUFS`
@@ -1059,4 +1222,68 @@ fn a_transient_receive_error_never_marks_the_family_deaf() {
   socks.begin_recv_round();
   assert!(socks.recv(&mut buf).is_none());
   assert_eq!(socks.deaf_families(), (false, false));
+}
+
+// ── the EINTR retry's stamps ────────────────────────────────────────────────
+//
+// `send_to` retries once on `EINTR`, which makes one logical send read its
+// pre-syscall clocks twice. Which reading survives into `SendOutcome::Sent`
+// decides how long a self-send credit appears to have been waiting: the
+// interrupted attempt's stamps precede the successful syscall by a whole failed
+// syscall plus whatever preempted the thread around it, and a gap past
+// `SELF_SEND_TTL` makes this endpoint ingest its own multicast echo as peer
+// traffic.
+
+/// Long enough that no scheduling noise could account for it, short enough to
+/// keep the test fast. Nothing here depends on it exceeding `SELF_SEND_TTL` —
+/// the stamps are read directly.
+const EINTR_STALL: Duration = Duration::from_millis(200);
+
+#[test]
+fn an_eintr_retry_reports_the_successful_attempts_stamps() {
+  let Some(mut socks) = loopback_sockets(ServerOptions::default().with_ipv6(false)) else {
+    return;
+  };
+  if !socks.is_bound_for_test(Family::V4) {
+    eprintln!("skipping: IPv4 is not bound on this host");
+    return;
+  }
+  // Attempt one stalls, then reports `EINTR`; attempt two runs clean.
+  socks.force_send_eintr_for_test(Family::V4, 1);
+  socks.force_send_delays_for_test(Family::V4, &[EINTR_STALL, Duration::ZERO]);
+
+  let before_wall = SystemTime::now();
+  let before = StdInstant::now();
+  let report = socks.send_to(b"eintr-retry", MDNS_V4, ALLOW_BOTH);
+  let SendOutcome::Sent {
+    submitted_wall,
+    submitted_at,
+    wire_at,
+  } = report.v4
+  else {
+    panic!("the retry must carry the datagram: {report:?}");
+  };
+
+  assert!(
+    submitted_at.saturating_duration_since(before) >= EINTR_STALL,
+    "the monotonic pre-syscall stamp must belong to the attempt that succeeded, \
+     which begins only after the interrupted one has stalled"
+  );
+  assert!(
+    submitted_wall
+      .duration_since(before_wall)
+      .is_ok_and(|d| d >= EINTR_STALL),
+    "the wall pre-syscall stamp keys self-send ordering; carrying the \
+     interrupted attempt's forward would put the whole stall inside the \
+     credit's TTL"
+  );
+  assert!(
+    wire_at >= submitted_at,
+    "the post-syscall stamp still follows its own attempt's pre-syscall one"
+  );
+  assert_eq!(
+    socks.wire_times_for_test(Family::V4).len(),
+    1,
+    "only the attempt the kernel accepted put bytes on the wire"
+  );
 }

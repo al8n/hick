@@ -18,6 +18,7 @@ use crate::{
   endpoint::Mdns,
   error::RegisterError,
   event::{Event, EventQueue},
+  selfsend::SELF_SEND_TTL,
   socket::{Family, MDNS_V4_DST},
 };
 
@@ -90,7 +91,7 @@ fn a_refused_send_leaves_no_send_side_term_in_the_timeout() {
     !mdns.sockets.needs_interest_retry(),
     "the send path must not ask for a registration retry"
   );
-  mdns.deregister(poll.registry()).expect("deregister");
+  mdns.deregister().expect("deregister");
 }
 
 /// The one thing that still needs a bounded backoff: a receive re-arm that
@@ -116,7 +117,7 @@ fn a_stale_registration_yields_a_bounded_timeout() {
     t > Duration::ZERO && t <= RETRY_INTEREST_BACKOFF,
     "expected a bounded backoff in (0, {RETRY_INTEREST_BACKOFF:?}], got {t:?}"
   );
-  mdns.deregister(poll.registry()).expect("deregister");
+  mdns.deregister().expect("deregister");
 }
 
 #[test]
@@ -155,7 +156,7 @@ fn tick_retries_a_stale_registration_and_reports_a_failure() {
     "the tick must issue a real reregister, which is the re-arm itself"
   );
   assert!(!mdns.sockets.needs_interest_retry());
-  mdns.deregister(poll.registry()).expect("deregister");
+  mdns.deregister().expect("deregister");
 }
 
 #[test]
@@ -394,6 +395,7 @@ fn a_multicast_send_takes_one_credit_per_family_that_reached_the_wire() {
     Family::V4,
     &body,
     std::time::SystemTime::now(),
+    Instant::now(),
     crate::selfsend::MatchMode::Degraded
   ));
 }
@@ -499,6 +501,162 @@ fn a_families_wire_gate_withholds_a_second_datagram_inside_the_minimum_gap() {
     send_health.degraded_families(),
     (false, false),
     "a deliberate deferral is no evidence at all about the link"
+  );
+}
+
+// ── the wire gate's anchor ────────────────────────────────────────────
+//
+// The gate spaces one family's bytes on one wire, so what it must measure from
+// is when the bytes GOT there — never when the driver was about to ask. Nothing
+// bounds the window between a pre-syscall clock read and the syscall that
+// follows it: a preemption, a signal handler or a page fault stretches it
+// arbitrarily, and a gate anchored on the near side hands that whole stall back
+// to the next datagram's spacing.
+//
+// The stall is what no test can ask a real host for, so it is injected — and the
+// spacing is then measured from inside the send path, after the stall, so the
+// assertion is the wire's own history rather than the driver's account of it.
+
+/// What RFC 6762 gives each kind of datagram as its per-family minimum. Restated
+/// here because the core's own copies are crate-private, and pinned by name so a
+/// kind whose minimum changed would not silently reuse another's: §8.1 spaces
+/// probes 250 ms apart.
+const PROBE_MIN_FAMILY_GAP: Duration = Duration::from_millis(250);
+/// §6 and §8.3: a record may not be re-multicast on an interface inside one
+/// second of the last time it went out on that interface.
+const ANNOUNCE_MIN_FAMILY_GAP: Duration = Duration::from_secs(1);
+/// §5.2: "the interval between the first two queries MUST be at least one
+/// second", and the backoff only widens from there.
+const QUERY_MIN_FAMILY_GAP: Duration = Duration::from_secs(1);
+
+/// How often a gated round is retried, standing in for the run loop's own
+/// re-entry. Only granularity: a coarser value can delay a send but never let
+/// one out early.
+const GATED_RETRY_POLL: Duration = Duration::from_millis(5);
+
+/// Put `stalls.len()` gated multicast datagrams from ONE producer onto ONE
+/// family through the real [`send_and_credit`](super::send_and_credit), retrying
+/// a gated round the way the run loop does, and return the instants the SOCKET
+/// recorded for them.
+///
+/// The fixture is IPv4-only, so every wire time belongs to one family and the
+/// gaps between them are that family's own wire spacing.
+fn same_family_wire_times(mdns: &mut Mdns, min_gap: Duration, stalls: &[Duration]) -> Vec<Instant> {
+  mdns.sockets.force_send_delays_for_test(Family::V4, stalls);
+  let mut gate = FamilyWireGate::default();
+  let Mdns {
+    sockets,
+    selfsend,
+    send_health,
+    ..
+  } = &mut *mdns;
+  for i in 0..stalls.len() {
+    // A distinct body per round, so nothing about self-send bookkeeping can make
+    // one round's datagram stand in for another's.
+    let body = [b'g', b'a', b'p', i as u8];
+    // A gated round is retried, but a REFUSED one never becomes a delivered one,
+    // and looping on it forever would report a broken egress path as a hang.
+    let deadline = Instant::now() + min_gap * 2 + Duration::from_secs(2);
+    loop {
+      let summary = super::send_and_credit(
+        sockets,
+        selfsend,
+        send_health,
+        &mut gate,
+        &body,
+        MDNS_V4_DST,
+        min_gap,
+        Instant::now(),
+      );
+      if summary.sent == 1 {
+        break;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "round {i} never reached the wire; a send the socket refused cannot be \
+         retried into a wire gap, so this is an egress failure and not a gate"
+      );
+      std::thread::sleep(GATED_RETRY_POLL);
+    }
+  }
+  sockets.wire_times_for_test(Family::V4)
+}
+
+/// A send that had not reached the kernel when its pre-syscall stamps were read
+/// must not buy back the wire gap it owes.
+///
+/// Anchored at the pre-syscall stamp instead, a send stalled by `P` re-opens its
+/// own family `P` early. The stalls end at zero on purpose: with a CONSTANT
+/// stall every wire time shifts by the same amount and the bug is invisible, so
+/// it is the round that does NOT stall, following ones that did, that puts the
+/// too-early datagram on the wire.
+fn stalled_sends_keep_their_wire_gap(kind: &str, min_gap: Duration, stalls: &[Duration]) {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  if !mdns.sockets.is_bound_for_test(Family::V4) {
+    eprintln!("skipping: IPv4 is not bound on this host");
+    return;
+  }
+  let wire_times = same_family_wire_times(&mut mdns, min_gap, stalls);
+  assert_eq!(
+    wire_times.len(),
+    stalls.len(),
+    "{kind}: every round must have reached the wire exactly once"
+  );
+  for (i, pair) in wire_times.windows(2).enumerate() {
+    let gap = pair[1].saturating_duration_since(pair[0]);
+    assert!(
+      gap >= min_gap,
+      "{kind}: consecutive datagrams were {gap:?} apart on one family's wire, \
+       inside the {min_gap:?} that kind owes it — the {:?} the send before it \
+       spent between its pre-syscall stamp and the syscall was credited to the gap",
+      stalls[i]
+    );
+  }
+}
+
+/// §8.1 probes: 250 ms apart on the wire, however long a probe was stalled. Two
+/// stalled rounds in a row, so the anchor is exercised on a later send and not
+/// just the first.
+#[test]
+fn a_stalled_probe_does_not_shorten_the_next_probes_wire_gap() {
+  stalled_sends_keep_their_wire_gap(
+    "probe",
+    PROBE_MIN_FAMILY_GAP,
+    &[
+      Duration::from_millis(200),
+      Duration::from_millis(200),
+      Duration::ZERO,
+    ],
+  );
+}
+
+/// §6 / §8.3 unsolicited announcements: one second apart on the wire.
+#[test]
+fn a_stalled_announcement_does_not_shorten_the_next_ones_wire_gap() {
+  stalled_sends_keep_their_wire_gap(
+    "announcement",
+    ANNOUNCE_MIN_FAMILY_GAP,
+    &[
+      Duration::from_millis(200),
+      Duration::from_millis(200),
+      Duration::ZERO,
+    ],
+  );
+}
+
+/// §5.2 queries: the same second, and the backoff only widens it.
+#[test]
+fn a_stalled_query_does_not_shorten_the_next_ones_wire_gap() {
+  stalled_sends_keep_their_wire_gap(
+    "query",
+    QUERY_MIN_FAMILY_GAP,
+    &[
+      Duration::from_millis(200),
+      Duration::from_millis(200),
+      Duration::ZERO,
+    ],
   );
 }
 
@@ -1587,15 +1745,17 @@ fn drain_transmits_gives_every_sender_a_turn_and_sends_it_to_the_tail() {
 // RFC 6762 §8.1 probe sequence, or a family that never carries anything pinning
 // it forever.
 
-/// Tick until the only bound family has been written off, or report why the
-/// test is skipping.
+/// Tick until the only bound family is reported degraded, or report why the test
+/// is skipping.
 ///
 /// Degradation takes `MAX_CONSECUTIVE_SEND_FAILURES` refused sends, so reaching
 /// it is proof that the core really did re-arm and re-offer the probe that many
-/// times. §8.1 spaces each retry 250 ms apart on top of the initial 0–250 ms
-/// jitter, so the whole sequence is about a second; a slow host that has not got
-/// there inside the budget is skipped rather than asserted against.
-fn tick_until_the_family_is_written_off(mdns: &mut Mdns) -> bool {
+/// times. It is a health signal and changes nothing the core is told — which is
+/// exactly what makes it a usable progress marker here. §8.1 spaces each retry
+/// 250 ms apart on top of the initial 0–250 ms jitter, so the whole sequence is
+/// about a second; a slow host that has not got there inside the budget is
+/// skipped rather than asserted against.
+fn tick_until_the_family_is_reported_degraded(mdns: &mut Mdns) -> bool {
   let deadline = Instant::now() + Duration::from_secs(3);
   while Instant::now() < deadline {
     mdns.tick().expect("tick");
@@ -1624,7 +1784,7 @@ fn a_refused_probe_does_not_advance_the_probe_sequence() {
   mdns
     .sockets
     .force_send_wouldblock_for_test(Family::V4, true);
-  if !tick_until_the_family_is_written_off(&mut mdns) {
+  if !tick_until_the_family_is_reported_degraded(&mut mdns) {
     return;
   }
 
@@ -1640,10 +1800,10 @@ fn a_refused_probe_does_not_advance_the_probe_sequence() {
     ServiceState::Probing(0),
     "the probe reached no link, so §8.1 has not progressed"
   );
-  // Nor does the write-off itself advance it. A family the driver has stopped
-  // obligating reports `Unobligated`, and a round in which NO family delivered
-  // is never a vacuous all-delivered — so the sequence stays put even once the
-  // escape valve is open.
+  // Nor does the degradation itself advance it. A failing family stays `Missed`
+  // however long it fails, the absent family is the only `Unobligated` one, and
+  // a round in which NO family delivered is never a vacuous all-delivered — so
+  // the sequence stays put no matter what the health table now says.
   for _ in 0..5 {
     mdns.tick().expect("tick");
     std::thread::sleep(Duration::from_millis(60));
@@ -1667,15 +1827,16 @@ fn a_refused_probe_does_not_advance_the_probe_sequence() {
   );
 }
 
-/// End to end: a socket that never accepts a byte does not pin RFC 6762 §8.1
-/// probing.
+/// End to end: a socket that never accepts a byte is reported degraded, and that
+/// is the whole of what the driver does about it.
 ///
-/// The core re-arms the same probe on its own schedule, so the driver keeps
-/// offering it; the family's failure streak is what eventually writes the family
-/// off and lets the lifecycle continue with the links that do work. Nothing here
-/// depends on a queue draining, which is the point.
+/// The core re-arms the same probe on its own schedule and the driver keeps
+/// offering it — every round reported honestly as a miss. The failure streak
+/// surfaces on [`Mdns::degraded_families`] and nowhere else; deciding when a
+/// family stops holding the lifecycle back is the core's own patience. Nothing
+/// here depends on a queue draining, which is the point.
 #[test]
-fn a_permanently_refusing_family_degrades_instead_of_pinning_the_lifecycle() {
+fn a_permanently_refusing_family_is_reported_degraded_and_nothing_more() {
   let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
     return;
   };
@@ -1689,14 +1850,14 @@ fn a_permanently_refusing_family_degrades_instead_of_pinning_the_lifecycle() {
     .sockets
     .force_send_wouldblock_for_test(Family::V4, true);
 
-  if !tick_until_the_family_is_written_off(&mut mdns) {
+  if !tick_until_the_family_is_reported_degraded(&mut mdns) {
     return;
   }
   assert_eq!(
     mdns.degraded_families(),
     (true, false),
     "the core re-armed the probe, the driver kept offering it, and the family's \
-     failure streak is what finally writes it off"
+     failure streak is what the caller gets to see"
   );
 }
 
@@ -1828,5 +1989,323 @@ fn the_receive_error_backoff_escalates_and_is_capped() {
     super::recv_error_backoff(u32::MAX),
     capped,
     "a socket that never recovers costs a bounded trickle of wakeups"
+  );
+}
+
+// ── an encode failure is leftover work ──────────────────────────────────────
+//
+// `Service::poll_transmit` failing leaves the datagram armed inside the proto
+// layer: the core retries the same one on the next call and schedules no
+// deadline for something it has already armed. Nothing in `next_timeout`'s
+// deadline fold speaks for it, and mio's readiness is edge-triggered, so no
+// event can announce in-memory work either. If the drain reports the exit as
+// "nothing left", the caller blocks in `Poll::poll` with a datagram sitting in
+// memory — and the failure counter that retires a structurally unusable
+// service only advances on ticks that reach the failing poll.
+
+/// A payload buffer far too small for any DNS message, which is what makes
+/// `poll_transmit` fail on demand. Twenty-four bytes leaves room for the
+/// 12-byte header and nothing that follows it.
+const UNENCODABLE_PAYLOAD_SIZE: usize = 24;
+
+/// Tick until `handle`'s consecutive encode-failure count reaches `want`, or
+/// report why the test is skipping.
+///
+/// The first probe is scheduled a random 0-250 ms out (RFC 6762 §8.1), so the
+/// first few ticks legitimately poll nothing at all.
+fn tick_to_encode_failures(mdns: &mut Mdns, handle: mdns_proto::ServiceHandle, want: u8) -> bool {
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while Instant::now() < deadline {
+    mdns.tick().expect("tick");
+    match mdns.services.get(&handle) {
+      Some(ctx) if ctx.encode_failures >= want => return true,
+      Some(_) => {}
+      None => {
+        eprintln!("skipping: the service was retired before reaching {want} encode failures");
+        return false;
+      }
+    }
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  eprintln!("skipping: the service never reached {want} encode failures within the budget");
+  false
+}
+
+#[test]
+fn a_non_terminal_encode_failure_reports_leftover_work() {
+  let Some(mut mdns) = test_support::loopback_mdns_with(
+    crate::options::ServerOptions::default()
+      .with_ipv6(false)
+      .with_max_payload_size(UNENCODABLE_PAYLOAD_SIZE),
+  ) else {
+    return;
+  };
+  let handle = mdns
+    .register_service(test_support::service_spec("_encfail._tcp.local.", 4444))
+    .expect("register_service");
+
+  for want in 1..crate::driver::MAX_CONSECUTIVE_ENCODE_ERRORS {
+    if !tick_to_encode_failures(&mut mdns, handle, want) {
+      return;
+    }
+    // Nothing is readable — this fixture never received a datagram — so a zero
+    // timeout can only come from `work_pending`.
+    assert!(
+      !mdns.sockets.has_readable(),
+      "the zero timeout must be about the stranded datagram, not leftover \
+       readable data"
+    );
+    assert_eq!(
+      mdns.next_timeout(),
+      Some(Duration::ZERO),
+      "encode failure {want} left a datagram armed in the proto layer; the \
+       caller must come straight back rather than sleep on a lifecycle deadline"
+    );
+  }
+}
+
+#[test]
+fn consecutive_encode_failures_retire_the_service_with_a_conflict() {
+  let Some(mut mdns) = test_support::loopback_mdns_with(
+    crate::options::ServerOptions::default()
+      .with_ipv6(false)
+      .with_max_payload_size(UNENCODABLE_PAYLOAD_SIZE),
+  ) else {
+    return;
+  };
+  let handle = mdns
+    .register_service(test_support::service_spec("_encfail._tcp.local.", 4445))
+    .expect("register_service");
+
+  let deadline = Instant::now() + Duration::from_secs(5);
+  let mut conflict = None;
+  while Instant::now() < deadline && conflict.is_none() {
+    mdns.tick().expect("tick");
+    while let Some(ev) = mdns.next_event() {
+      if let Event::Service { handle: h, update } = ev
+        && h == handle
+      {
+        conflict = Some(update);
+      }
+    }
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  let Some(update) = conflict else {
+    eprintln!("skipping: the service never reported a terminal within the budget");
+    return;
+  };
+  assert!(
+    update.is_conflict(),
+    "a payload that cannot be encoded retires the service rather than leaving \
+     the caller waiting for an Established that can never arrive: {update:?}"
+  );
+  // Retired means retired: nothing keeps driving its proto state machine.
+  assert!(
+    mdns.services.get(&handle).is_none_or(|ctx| ctx.withdrawing),
+    "the retirement must stop every stage from driving this service"
+  );
+}
+
+// ── the ingress interface gate, wired ───────────────────────────────────────
+
+/// The explicit loopback exception, through the real receive path.
+///
+/// The gate drops a datagram whose reported interface index is not the one this
+/// endpoint bound. Our own multicast echo is the traffic loopback suppression
+/// depends on, and a platform is free to report it as having arrived on the
+/// loopback pseudo-interface rather than on the socket's egress interface — so
+/// the exception is stated in `onlink::arrived_on_bound_interface` rather than
+/// left to fall out of the index comparison. This forces exactly that
+/// disagreement and pins that the echo still reaches the self-send match.
+///
+/// It cannot be inverted into a rejection test on this fixture: an endpoint
+/// pinned to the loopback interface only ever receives loopback-sourced
+/// datagrams, which is the very case the exception admits. The rejection matrix
+/// lives in `onlink::tests`, against the same function this path calls.
+#[test]
+fn an_own_echo_survives_a_foreign_interface_index() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let poll = Poll::new().expect("poll");
+  mdns
+    .register(poll.registry(), Token(40), Token(41))
+    .expect("register");
+
+  let body = [0x3Cu8; 28];
+  {
+    let now = Instant::now();
+    let mut gate = FamilyWireGate::default();
+    let Mdns {
+      sockets,
+      selfsend,
+      send_health,
+      ..
+    } = &mut *mdns;
+    let summary = super::send_and_credit(
+      sockets,
+      selfsend,
+      send_health,
+      &mut gate,
+      &body,
+      MDNS_V4_DST,
+      Duration::ZERO,
+      now,
+    );
+    if summary.sent == 0 {
+      eprintln!("skipping: the datagram never reached a wire on this host");
+      mdns.deregister().expect("deregister");
+      return;
+    }
+  }
+  // Every subsequent receive now reports an interface this endpoint did not
+  // bind — the disagreement a loopback copy can genuinely show.
+  let foreign = mdns.bound_interface.wrapping_add(1_000);
+  mdns.sockets.force_rx_interface_for_test(Some(foreign));
+
+  let mut events = mio::Events::with_capacity(8);
+  let deadline = Instant::now() + Duration::from_secs(2);
+  let mut poll = poll;
+  while Instant::now() < deadline && mdns.selfsend.len() > 0 {
+    poll
+      .poll(&mut events, Some(Duration::from_millis(100)))
+      .expect("poll");
+    for ev in events.iter() {
+      if mdns.owns(ev.token()) {
+        mdns.handle_io(ev);
+      }
+    }
+    mdns.tick().expect("tick");
+  }
+  let matched = mdns.selfsend.len() == 0;
+  // The skip must gate on an observed counter, or a regression in the gate
+  // itself would present as "the echo never arrived" and take this test green.
+  // `packets_rx` counts every datagram that left the kernel queue, including one
+  // the trust boundary then dropped, so it separates a host whose loopback
+  // egress went nowhere from a gate that swallowed the echo.
+  let arrived = saw_own_loopback(&mdns);
+  mdns.deregister().expect("deregister");
+  assert!(
+    matched || !arrived,
+    "our own multicast echo reached this endpoint and did not reach the \
+     self-send match: the loopback exception in the ingress interface gate is \
+     what keeps a foreign interface index from swallowing it"
+  );
+  if !matched {
+    eprintln!("skipping: this endpoint's own multicast never looped back within the budget");
+  }
+}
+
+/// Whether this endpoint has read any datagram off its own sockets, dropped or
+/// not.
+///
+/// The egress probe [`crate::Mdns::stats`] gives, under the same fallback the
+/// loopback integration tests use: with no `stats` feature there is no counter
+/// to consult, so it reports `true` and the caller asserts unconditionally.
+fn saw_own_loopback(mdns: &Mdns) -> bool {
+  #[cfg(feature = "stats")]
+  {
+    mdns.stats().packets_rx > 0
+  }
+  #[cfg(not(feature = "stats"))]
+  {
+    let _ = mdns;
+    true
+  }
+}
+
+// ── a self-send credit outlives a stalled syscall ───────────────────────────
+//
+// Nothing bounds the gap between a send's pre-syscall clock reads and the
+// syscall itself: a preempted thread, a signal handler, a page fault, or the
+// `EINTR` retry can all stretch it. While that pre-syscall wall stamp was also
+// the credit's age, a gap past `SELF_SEND_TTL` made this endpoint ingest its own
+// announcement as peer traffic — a phantom conflict against itself and the RFC
+// 6762 §9 rename that follows.
+
+/// Just past the TTL, so the stall these two tests inject is unambiguously
+/// fatal to a credit aged from a pre-syscall stamp.
+const STALL_PAST_TTL: Duration = SELF_SEND_TTL.saturating_add(Duration::from_millis(50));
+
+/// Send `body` through the driver's own credit path and report whether the echo
+/// that follows is recognised as ours.
+///
+/// The echo is presented rather than awaited: what is under test is which
+/// instants the credit carries, and a real loopback copy would arrive with
+/// exactly these — a kernel receive stamp taken after the syscall, read back on
+/// the next tick.
+fn echo_is_matched(mdns: &mut Mdns, body: &[u8]) -> Option<bool> {
+  let now = Instant::now();
+  let mut gate = FamilyWireGate::default();
+  let Mdns {
+    sockets,
+    selfsend,
+    send_health,
+    ..
+  } = &mut *mdns;
+  let summary = super::send_and_credit(
+    sockets,
+    selfsend,
+    send_health,
+    &mut gate,
+    body,
+    MDNS_V4_DST,
+    Duration::ZERO,
+    now,
+  );
+  if summary.sent == 0 {
+    eprintln!("skipping: the datagram never reached a wire on this host");
+    return None;
+  }
+  Some(selfsend.take(
+    Family::V4,
+    body,
+    std::time::SystemTime::now(),
+    Instant::now(),
+    crate::selfsend::MatchMode::Ordered,
+  ))
+}
+
+#[test]
+fn a_send_stalled_past_the_self_send_ttl_still_suppresses_its_own_echo() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V4, &[STALL_PAST_TTL]);
+  let body = [0x7Eu8; 32];
+  let Some(matched) = echo_is_matched(&mut mdns, &body) else {
+    return;
+  };
+  assert!(
+    matched,
+    "the credit must age from the syscall that succeeded: a stall longer than \
+     SELF_SEND_TTL between the pre-syscall stamp and the kernel accepting the \
+     datagram must not expire it before its own echo can claim it"
+  );
+}
+
+#[test]
+fn an_eintr_retry_past_the_self_send_ttl_still_suppresses_its_own_echo() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  // The first attempt stalls past the TTL and is then interrupted; the second
+  // runs at full speed and carries the datagram. Only the second attempt's
+  // stamps describe the syscall that actually happened.
+  mdns.sockets.force_send_eintr_for_test(Family::V4, 1);
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V4, &[STALL_PAST_TTL, Duration::ZERO]);
+  let body = [0x1Du8; 32];
+  let Some(matched) = echo_is_matched(&mut mdns, &body) else {
+    return;
+  };
+  assert!(
+    matched,
+    "an EINTR retry must report the SUCCESSFUL attempt's stamps: carrying the \
+     interrupted attempt's forward puts a whole failed syscall, and whatever \
+     preempted the thread around it, inside the credit's TTL"
   );
 }

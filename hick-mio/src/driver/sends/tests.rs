@@ -15,14 +15,35 @@ use super::{
 };
 use crate::socket::{Family, SendOutcome, SendReport};
 
-/// A stamped acceptance, `secs` after a fixed origin. Both clocks move together
-/// so a test that reads the wall stamp and the monotonic one is talking about
-/// the same syscall.
+/// A stamped acceptance, `secs` after a fixed origin. All three clocks move
+/// together so a test that reads any of them is talking about the same syscall.
+///
+/// The two monotonic stamps coincide here on purpose: an instantaneous syscall
+/// is the case where the confirm anchor and the wire time agree, so a fixture
+/// built on it cannot smuggle the difference between them into a property that
+/// is not about it. [`stalled_send`] is the fixture that pulls them apart.
 fn sent(base: StdInstant, secs: u64) -> SendOutcome {
-  SendOutcome::Sent(
-    SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-    base + Duration::from_secs(secs),
-  )
+  let at = base + Duration::from_secs(secs);
+  SendOutcome::Sent {
+    submitted_wall: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+    submitted_at: at,
+    wire_at: at,
+  }
+}
+
+/// An acceptance whose syscall did not run when its pre-syscall stamps were
+/// read: submitted at `secs`, on the wire `stall` later.
+///
+/// Nothing bounds that window on a real host — a preemption, a signal handler or
+/// a page fault between the clock read and `sendto` opens it — and it is the one
+/// input that tells the core's anchor and the wire gate's apart.
+fn stalled_send(base: StdInstant, secs: u64, stall: Duration) -> SendOutcome {
+  let submitted_at = base + Duration::from_secs(secs);
+  SendOutcome::Sent {
+    submitted_wall: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+    submitted_at,
+    wire_at: submitted_at + stall,
+  }
 }
 
 /// A **multicast** report: the case that fans out to both families.
@@ -35,9 +56,13 @@ fn report(v4: SendOutcome, v6: SendOutcome) -> SendReport {
 }
 
 /// Fold `rep` into `health` exactly as a real fan-out does, then project it.
+///
+/// The projection takes no `health`: that severance is the property most of the
+/// tests below are about, so the fixture keeps both halves the way production
+/// runs them rather than skipping the one that cannot matter.
 fn settle(health: &mut SendHealth, rep: SendReport) -> super::SendSummary {
   health.note_fanout(rep);
-  summarize(rep, health)
+  summarize(rep)
 }
 
 // ── the per-family projection ─────────────────────────────────────────
@@ -135,32 +160,44 @@ fn a_send_no_family_could_be_offered_delivers_nothing() {
   );
 }
 
-// ── family health, and the obligated set it decides ───────────────────
+// ── family health is observability, and nothing the core is told ──────
 
+/// The laundering this driver must never do: a present family that keeps failing
+/// is `Missed` forever, and never the `Unobligated` an ABSENT socket reports.
+///
+/// `Unobligated` tells the core the family owes nothing, so `classify_advance`
+/// clears its missed count and marks it covered — and the round then satisfies
+/// `all_delivered` on the strength of the one family that did deliver. Bounding
+/// how long the lifecycle waits for a family that keeps missing is the core's
+/// own patience, which advances the phase as `Excused` and takes none of the
+/// credit a delivery earns.
 #[test]
-fn a_family_stops_holding_lifecycle_back_after_repeated_failures() {
+fn a_chronically_failing_family_is_missed_forever_never_unobligated() {
   let base = StdInstant::now();
   let mut health = SendHealth::new();
-  for round in 0..MAX_CONSECUTIVE_SEND_FAILURES {
+  // Well past the degradation threshold: whatever the driver's health table
+  // thinks of this link, the projection says the same thing every round.
+  for round in 0..MAX_CONSECUTIVE_SEND_FAILURES * 4 {
     let summary = settle(&mut health, report(sent(base, 1), SendOutcome::Failed));
     assert_eq!(
       summary.delivery.v6(),
-      if round + 1 < MAX_CONSECUTIVE_SEND_FAILURES {
-        FamilyDelivery::Missed
-      } else {
-        // Health is folded in BEFORE the projection, so the send that trips the
-        // degradation is excused by it rather than being one more the core has
-        // to wait on.
-        FamilyDelivery::Unobligated
-      },
-      "round {round}"
+      FamilyDelivery::Missed,
+      "round {round}: the socket is there and the datagram was fanned onto it"
+    );
+    assert!(
+      !summary.delivery.all_delivered(),
+      "round {round}: a family that heard nothing must keep the phase shut"
+    );
+    assert!(
+      summary.delivery.any_delivered(),
+      "round {round}: IPv4 peers hold these records, so §10.1 ownership latches"
     );
   }
-  assert_eq!(health.degraded_families(), (false, true));
-  let summary = settle(&mut health, report(sent(base, 1), SendOutcome::Failed));
-  assert!(
-    summary.delivery.all_delivered(),
-    "a written-off family is one the core must stop waiting for"
+  assert_eq!(
+    health.degraded_families(),
+    (false, true),
+    "the observability signal is preserved: a caller debugging \"my peers do \
+     not see me over IPv6\" must still be able to see this"
   );
 }
 
@@ -211,7 +248,7 @@ fn one_delivery_restores_a_degraded_family() {
 }
 
 #[test]
-fn a_delivery_by_a_written_off_family_still_latches_ownership() {
+fn a_delivery_by_a_degraded_family_still_latches_ownership() {
   let base = StdInstant::now();
   let mut health = SendHealth::new();
   // Degrade v4 while v6 stays healthy.
@@ -245,6 +282,104 @@ fn a_families_failure_streak_is_its_own() {
     (false, false),
     "a capacity-one transport is two working links taking turns, not a dead \
      one; bounding that is the core's patience, not this table's"
+  );
+}
+
+// ── the reclaim-cancel gate belongs to the core alone ─────────────────
+
+/// The hazard the severance exists to prevent, against a REAL `mdns-proto`
+/// service rather than against the projection in isolation.
+///
+/// One family takes every datagram; the other is bound and refuses every one,
+/// for far longer than [`MAX_CONSECUTIVE_SEND_FAILURES`]. `has_fully_announced`
+/// is the reclaim-cancel gate, and its whole content is the assertion that EVERY
+/// obligated link heard a complete announcement — so nothing the DRIVER does may
+/// open it here. Only the core's own `Delivered` advance may, and a family that
+/// heard nothing cannot produce one.
+///
+/// The service must still reach `Established`, and does so on the core's own
+/// `Excused` patience: that advance moves the phase and takes none of the credit
+/// a delivery earns, which is exactly the asymmetry a driver-side write-off
+/// destroys.
+///
+/// Socket-free and on a virtual clock, so it asserts the same thing on every
+/// host and in every CI configuration.
+#[test]
+fn a_chronically_failing_family_never_opens_the_fully_announced_gate() {
+  use mdns_proto::ServiceState;
+  use rand::{SeedableRng, rngs::StdRng};
+  use slab::Slab;
+
+  use crate::{driver::test_support, options::ServerOptions, proto::ProtoEndpoint};
+
+  let opts = ServerOptions::default();
+  let mut endpoint = ProtoEndpoint::try_new(*opts.endpoint_config(), StdRng::seed_from_u64(0x6a7c));
+  let mut now = StdInstant::now();
+  let (_handle, mut svc) = endpoint
+    .try_register_service::<Slab<_>, Slab<_>>(
+      test_support::service_spec("_hick-mio-gate._tcp.local.", 8080),
+      now,
+    )
+    .expect("try_register_service");
+
+  let mut health = SendHealth::new();
+  let mut buf = vec![0u8; 1500];
+  let mut confirms = 0usize;
+  for _ in 0..400 {
+    // Jump the virtual clock to whatever the service is next waiting for. The
+    // extra millisecond is what makes a deadline of `now` due rather than
+    // pending.
+    match svc.poll_timeout() {
+      Some(due) => now = due.max(now) + Duration::from_millis(1),
+      None => now += Duration::from_secs(1),
+    }
+    svc.handle_timeout(now).expect("handle_timeout");
+    if svc
+      .poll_transmit(now, &mut buf)
+      .expect("poll_transmit")
+      .is_some()
+    {
+      let summary = settle(
+        &mut health,
+        report(
+          SendOutcome::Sent {
+            submitted_wall: SystemTime::UNIX_EPOCH,
+            submitted_at: now,
+            wire_at: now,
+          },
+          SendOutcome::Failed,
+        ),
+      );
+      svc.note_transmit_outcome(summary.accepted_at.unwrap_or(now), summary.delivery);
+      let _ = svc.take_rename_goodbye_handoff();
+      confirms = confirms.saturating_add(1);
+    }
+    assert!(
+      !svc.has_fully_announced().get(),
+      "the driver reported one family failing and nothing else; only a \
+       complete announcement heard by EVERY obligated link may open the \
+       reclaim-cancel gate, and IPv6 heard none of them"
+    );
+    if svc.state() == ServiceState::Established {
+      break;
+    }
+  }
+
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "the core's own patience must still carry the lifecycle past a family that \
+     never delivers; a test that never got here would assert nothing"
+  );
+  assert!(
+    confirms > MAX_CONSECUTIVE_SEND_FAILURES as usize,
+    "the run has to spend more rounds than the degradation threshold for the \
+     property to mean anything: {confirms}"
+  );
+  assert_eq!(
+    health.degraded_families(),
+    (false, true),
+    "and the caller can still see which family it was"
   );
 }
 
@@ -326,6 +461,45 @@ fn a_clock_that_reads_before_the_recorded_send_keeps_the_gate_shut() {
     [false, false],
     "the elapsed gap is unknown, and the conservative answer is the one that \
      cannot put a record back on the wire too soon"
+  );
+}
+
+/// The two monotonic stamps answer different questions, and a send that had not
+/// reached the kernel when its pre-syscall stamps were read is what tells them
+/// apart.
+///
+/// Collapsing them is the tempting simplification, and it is wrong in one
+/// direction whichever one survives: the core's anchor must be at or before the
+/// true acceptance, and the gate's must be at or after it.
+#[test]
+fn the_confirm_anchors_before_the_syscall_and_the_gate_after_it() {
+  let base = StdInstant::now();
+  let stall = Duration::from_millis(200);
+  let gap = Duration::from_secs(1);
+  let outcome = stalled_send(base, 0, stall);
+  let rep = report(outcome, SendOutcome::NoSocket);
+
+  let mut health = SendHealth::new();
+  assert_eq!(
+    settle(&mut health, rep).accepted_at,
+    Some(base),
+    "the core confirms at the PRE-syscall instant: early can only understate how \
+     fresh this family's peers are, while a late one would schedule the refresh \
+     past its records' TTL"
+  );
+
+  let mut gate = FamilyWireGate::default();
+  gate.note(rep, gap);
+  assert_eq!(
+    gate.allow(base + gap, gap),
+    [false, true],
+    "the bytes reached the wire `stall` after the confirm anchor, so one gap \
+     measured from that anchor has NOT paid this wire its second"
+  );
+  assert_eq!(
+    gate.allow(base + gap + stall, gap),
+    [true, true],
+    "one gap after the bytes actually landed, and not before"
   );
 }
 

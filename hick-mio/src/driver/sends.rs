@@ -1,6 +1,7 @@
 //! Per-family delivery reporting for every datagram this driver produces: the
 //! self-send credit each fan-out earns, the per-family wire gate it must honour,
-//! and the family-health policy that decides which families are still obligated.
+//! and the link-health signal the caller reads through
+//! [`Mdns::degraded_families`](crate::Mdns::degraded_families).
 //!
 //! # Nothing is parked, so nothing is guessed
 //!
@@ -39,12 +40,12 @@
 //! would leave the core applying its patience to a fact that had already been
 //! excused once.
 //!
-//! What the driver *does* own is the **obligated set** — which families a
-//! datagram was fanned onto, and which have been written off — and the core's
-//! own documentation names a degraded family as one such write-off. That is
-//! [`MAX_CONSECUTIVE_SEND_FAILURES`], reported through
-//! [`Mdns::degraded_families`](crate::Mdns::degraded_families) because a caller
-//! debugging "my peers do not see me over IPv6" must be able to see it.
+//! The **obligated set** the driver owns is a fact about SOCKETS, not about link
+//! quality: a family is unobligated when there is no socket for it, or when this
+//! datagram was not addressed to it. Nothing else may shrink it, and in
+//! particular no amount of failing may — see
+//! [`MAX_CONSECUTIVE_SEND_FAILURES`], which is a health signal for the caller
+//! and no part of what the core is told.
 
 use std::{
   net::SocketAddr,
@@ -58,22 +59,54 @@ use crate::{
   socket::{Family, FamilyAllow, SendOutcome, SendReport, Sockets},
 };
 
-/// Consecutive non-deliveries on one family before it stops holding lifecycle
-/// state back.
+/// Consecutive non-deliveries on one family before this driver calls that family
+/// **degraded**.
 ///
-/// This is the driver's half of the [`TransmitDelivery`] contract — the
-/// obligated set — and not a second patience bound: a family past this
-/// threshold is reported [`FamilyDelivery::Unobligated`], the same thing an
-/// absent socket reports, so the core is never told a family missed a round it
-/// has stopped waiting for. The core's own `MAX_PARTIAL_ROUNDS` still governs
-/// how long it waits for a family that *is* obligated.
+/// Purely a health and observability signal. It reaches
+/// [`Mdns::degraded_families`](crate::Mdns::degraded_families) and a warn line,
+/// and it reaches **nothing the core is told**.
 ///
-/// Low on purpose. The cost of a threshold that is too high is a service stuck
-/// in RFC 6762 §8.1 probing for as long as one family is broken; the cost of one
-/// that is too low is a transmit confirmed while a briefly-blipping family
-/// missed it. Three consecutive failures is past any single blip — a probe
-/// sequence is 250 ms apart, so this is most of a second of a family failing
-/// every time.
+/// # The division, and why it is not negotiable
+///
+/// The driver reports honest per-family facts and owns LINK HEALTH. The core
+/// owns PATIENCE and decides when a family stops holding a phase back. This
+/// constant is the seam, and the seam is structural: [`summarize`] does not take
+/// a [`SendHealth`], so no degradation can turn one [`FamilyDelivery`] into
+/// another. A present-but-failing family is [`FamilyDelivery::Missed`] on its
+/// thousandth consecutive failure exactly as on its first.
+/// [`FamilyDelivery::Unobligated`] means what the core says it means — no socket
+/// for this family, or a datagram not addressed to it — and a wire that keeps
+/// refusing is neither.
+///
+/// **Do not reconnect them.** Reporting a failing family `Unobligated` reads to
+/// the core as "this family owes nothing", which is what an ABSENT socket
+/// reports. The core's `classify_advance` then clears that family's missed
+/// count, marks it covered, and the round satisfies
+/// [`TransmitDelivery::all_delivered`] on the strength of the one family that
+/// did deliver. That is the `Delivered` advance, which sets
+/// [`Service::has_fully_announced`](mdns_proto::Service::has_fully_announced),
+/// counts a delivered datagram, and resets the RFC 6762 §8.3 ladder.
+/// `has_fully_announced` is the reclaim-cancel gate and its entire content is
+/// the assertion that EVERY obligated link heard a complete announcement — so a
+/// driver able to shrink the obligated set on its own opens that gate for a
+/// family that heard nothing. The opaque proof type exists to make precisely
+/// that unrepresentable.
+///
+/// # The write-off would be redundant even if it were sound
+///
+/// A chronically-missing family does not pin the lifecycle. The core's own
+/// `MAX_PARTIAL_ROUNDS` patience advances the phase past it as `Excused`, and
+/// that escape is deliberately asymmetric with the one above: it advances the
+/// phase and NOTHING else — no announcement proof, no delivered-datagram count,
+/// no ladder reset. The core already solves this, and correctly. There is
+/// nothing here for a driver-side bound to add.
+///
+/// # Choosing the threshold
+///
+/// Low on purpose, because the only cost of tripping it early is a caller told
+/// sooner about a link that was briefly blipping. Three consecutive failures is
+/// past any single blip — a probe sequence is 250 ms apart, so this is most of a
+/// second of a family failing every time.
 ///
 /// Only a resolution that reached no link counts, and only one that is evidence
 /// about the link: a hard send error or a refused `send_to`. A family the wire
@@ -91,16 +124,20 @@ pub(crate) const FAMILY_V4: usize = 0;
 /// Index of the IPv6 family.
 pub(crate) const FAMILY_V6: usize = 1;
 
-/// One family's recent delivery record and whether it is currently excused from
-/// holding lifecycle state back.
+/// One family's recent delivery record, and whether that record is currently bad
+/// enough to report.
 #[derive(Debug, Clone, Copy, Default)]
 struct FamilyStanding {
   failures: u32,
   degraded: bool,
 }
 
-/// Each family's send-side standing: how badly it is currently failing, and
-/// whether it is still obligated to carry this driver's datagrams.
+/// Each family's send-side standing: how badly it is currently failing.
+///
+/// **Observability only.** It feeds
+/// [`Mdns::degraded_families`](crate::Mdns::degraded_families) and the warn
+/// lines below, and it is deliberately not an input to [`summarize`] — see
+/// [`MAX_CONSECUTIVE_SEND_FAILURES`] for why the two halves stay severed.
 ///
 /// All that survives of the old send ledger. The pending table, the completion
 /// tokens and the parked-send deadline went with the parking they existed to
@@ -117,16 +154,10 @@ impl SendHealth {
     Self::default()
   }
 
-  /// Which families are currently excused from holding lifecycle state back.
+  /// Which families have failed to deliver often enough in a row to report to
+  /// the caller. It holds no family back from anything.
   pub(crate) const fn degraded_families(&self) -> (bool, bool) {
     (self.v4.degraded, self.v6.degraded)
-  }
-
-  const fn standing(&self, family: Family) -> &FamilyStanding {
-    match family {
-      Family::V4 => &self.v4,
-      Family::V6 => &self.v6,
-    }
   }
 
   const fn standing_mut(&mut self, family: Family) -> &mut FamilyStanding {
@@ -138,10 +169,9 @@ impl SendHealth {
 
   /// Fold one fan-out into every family's standing.
   ///
-  /// Health first, projection second — see [`summarize`], which reads the
-  /// standing this leaves behind. A send that trips a family's degradation
-  /// therefore excuses that same send, rather than being the one attempt that
-  /// still has to be waited on before the escape valve opens.
+  /// Its order against [`summarize`] is immaterial, and that is the point:
+  /// `summarize` cannot read what this leaves behind, so the same fan-out
+  /// projects identically whether or not it tripped a degradation.
   ///
   /// `pub(crate)` because the RFC 6762 §10.1 withdrawal pump sends through
   /// [`Sockets::send_one`] directly (it always fans to both groups regardless of
@@ -150,7 +180,7 @@ impl SendHealth {
   pub(crate) fn note_fanout(&mut self, report: SendReport) {
     for (family, outcome) in report.per_family() {
       match outcome {
-        SendOutcome::Sent(_, _) => self.note_delivered(family),
+        SendOutcome::Sent { .. } => self.note_delivered(family),
         SendOutcome::Failed => self.note_failed(family),
         // Neither is evidence about the link: one has no socket, the other is
         // this driver's own deliberate spacing.
@@ -167,7 +197,7 @@ impl SendHealth {
     if recovered {
       hick_trace::warn!(
         via_v4 = family.is_v4(),
-        "a degraded family delivered again; it holds lifecycle state once more"
+        "a degraded family delivered again; it is no longer reported degraded"
       );
     }
   }
@@ -182,8 +212,9 @@ impl SendHealth {
     hick_trace::warn!(
       via_v4 = family.is_v4(),
       failures = standing.failures,
-      "a family failed to deliver too many times; it no longer holds probing, \
-       announcement ownership, or query retries back"
+      "a family has failed to deliver too many times in a row; it is still \
+       offered every datagram and still reported missed, and `degraded_families` \
+       now says so"
     );
   }
 }
@@ -273,9 +304,19 @@ impl FamilyWireGate {
 
   /// Record that family `idx` put a GATED datagram on its wire at `at`.
   ///
-  /// `at` is that family's OWN acceptance instant, not the fan-out's confirm
-  /// anchor — recording the anchor would re-introduce exactly the skew this gate
-  /// exists to absorb.
+  /// Two things `at` must be, and both are load-bearing:
+  ///
+  /// * that family's OWN instant, not the fan-out's confirm anchor — recording
+  ///   the anchor would re-introduce exactly the skew this gate exists to
+  ///   absorb;
+  /// * its POST-syscall instant ([`SendOutcome::wire_time`]), not the
+  ///   pre-syscall one the core confirms at. Nothing bounds the gap between a
+  ///   pre-syscall clock read and the syscall itself, and a stamp taken on the
+  ///   near side of a preemption hands that whole stall back to the next
+  ///   datagram's spacing.
+  ///
+  /// The core's own confirm anchor is a pre-syscall instant and correctly so;
+  /// the two are wrong in opposite directions and are not interchangeable.
   fn record(&mut self, idx: usize, at: StdInstant, min_gap: Duration) {
     if min_gap.is_zero() {
       return;
@@ -285,10 +326,10 @@ impl FamilyWireGate {
     }
   }
 
-  /// Fold one fan-out's accepted instants back into the gate.
+  /// Fold one fan-out's WIRE instants back into the gate.
   fn note(&mut self, report: SendReport, min_gap: Duration) {
     for (family, outcome) in report.per_family() {
-      if let Some(at) = outcome.accepted_at() {
+      if let Some(at) = outcome.wire_time() {
         self.record(family.index(), at, min_gap);
       }
     }
@@ -331,57 +372,67 @@ pub(crate) fn send_and_credit(
   let report = sockets.send_to(body, dst, gate.allow(now, min_gap));
   if report.loops_back {
     for (family, outcome) in report.per_family() {
-      if let SendOutcome::Sent(at, _) = outcome {
-        selfsend.record(family, body, at);
+      // Two stamps from the same send, and they must not be swapped. The wall
+      // one ORDERS the credit against the echo and is pre-syscall so it cannot
+      // outrun the kernel's receive stamp; the monotonic one AGES it and is
+      // post-syscall so an unbounded pre-syscall stall is not charged to a
+      // two-second TTL. `zip` rather than two lookups: both are `Some` exactly
+      // when this family carried the datagram, so a credit is never recorded
+      // with half a pair.
+      if let Some((sent, aged_from)) = outcome.credit_stamp().zip(outcome.credit_age_anchor()) {
+        selfsend.record(family, body, sent, aged_from);
       }
     }
   }
   gate.note(report, min_gap);
+  // Health is a side channel to the caller, taken from the same report; it is
+  // deliberately not an argument to `summarize`.
   health.note_fanout(report);
-  summarize(report, health)
+  summarize(report)
 }
 
-/// Project one fan-out onto the core's vocabulary, under the obligated set this
-/// driver currently keeps.
+/// Project one fan-out onto the core's vocabulary.
 ///
-/// The mapping is one-to-one and nothing is laundered:
+/// It takes the [`SendReport`] and nothing else. No health table, no history,
+/// nothing that could turn a link's CONDITION into a different protocol answer —
+/// the signature is the guarantee, and [`MAX_CONSECUTIVE_SEND_FAILURES`] says
+/// why it must stay that way. The mapping is one-to-one and nothing is
+/// laundered:
 ///
-/// * `NoSocket` is [`FamilyDelivery::Unobligated`] — the family was never
-///   offered the datagram, so its absence is not a failure. A single-stack host
-///   is fully delivered on the one family it has.
+/// * `NoSocket` is [`FamilyDelivery::Unobligated`], and is the ONLY thing that
+///   is. It covers both of the core's cases — this driver has no socket for the
+///   family, and the datagram was addressed to the other one — so the family was
+///   never offered it and its absence is not a failure. A single-stack host is
+///   fully delivered on the one family it has.
 /// * `Sent` is [`FamilyDelivery::Delivered`], **including for a degraded
 ///   family**: a family that has quietly recovered really did put the records on
 ///   a wire, and peers reachable over it now hold them.
-/// * `Gated` and `Failed` are [`FamilyDelivery::Missed`] for a family still
-///   obligated. A gated family is emphatically not `Unobligated` — its socket is
-///   there and the datagram was meant for it; the driver simply owed the wire a
-///   gap it had not paid. Reporting it absent would hide the deferral from the
-///   core and let the phase advance without it.
-/// * `Gated` and `Failed` are [`FamilyDelivery::Unobligated`] for a **degraded**
-///   family, and that is the one place the driver writes a family off. The
-///   core's contract names it: "obligated" is driver policy, and a family the
-///   driver has written off is one the core must stop waiting for. It is
-///   transient — a single delivery restores it — and it is reported through
-///   [`Mdns::degraded_families`](crate::Mdns::degraded_families) rather than
-///   applied silently.
-fn summarize(report: SendReport, health: &SendHealth) -> SendSummary {
+/// * `Gated` and `Failed` are [`FamilyDelivery::Missed`], however long the
+///   family has been failing. Its socket is there and the datagram was meant for
+///   it — the driver either owed the wire a gap it had not paid, or the kernel
+///   refused it. Reporting either absent would hide it from the core and let the
+///   phase advance without the family. How long the core waits for such a family
+///   is the core's `MAX_PARTIAL_ROUNDS`, spent on an `Excused` advance that takes
+///   none of the credit a delivery earns.
+fn summarize(report: SendReport) -> SendSummary {
   let mut sent = 0usize;
   let mut families = [FamilyDelivery::Unobligated; 2];
   let mut accepted_at: Option<StdInstant> = None;
   for (family, outcome) in report.per_family() {
     let delivery = match outcome {
-      SendOutcome::Sent(_, at) => {
+      SendOutcome::Sent { .. } => {
         sent = sent.saturating_add(1);
-        accepted_at = Some(accepted_at.map_or(at, |best: StdInstant| best.min(at)));
+        // `confirm_anchor`, never `wire_time`: the core's anchor is the
+        // PRE-syscall instant, where early can only understate how fresh this
+        // family's peers are, while a late one would schedule a refresh past its
+        // records' TTL. The gate's anchor is the other one and reads the other
+        // way round.
+        if let Some(at) = outcome.confirm_anchor() {
+          accepted_at = Some(accepted_at.map_or(at, |best: StdInstant| best.min(at)));
+        }
         FamilyDelivery::Delivered
       }
-      SendOutcome::Gated | SendOutcome::Failed => {
-        if health.standing(family).degraded {
-          FamilyDelivery::Unobligated
-        } else {
-          FamilyDelivery::Missed
-        }
-      }
+      SendOutcome::Gated | SendOutcome::Failed => FamilyDelivery::Missed,
       SendOutcome::NoSocket => FamilyDelivery::Unobligated,
     };
     if let Some(slot) = families.get_mut(family.index()) {
