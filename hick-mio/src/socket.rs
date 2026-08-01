@@ -280,6 +280,15 @@ pub(crate) enum SendOutcome {
   /// the same monotonic clock and in the same late-safe direction, by
   /// [`SelfSendTracker::seal`](crate::selfsend::SelfSendTracker::seal).
   ///
+  /// **`submitted_wall` and `submitted_at` are read on consecutive statements,
+  /// and that adjacency is load-bearing.** Together they are one reading of both
+  /// clocks at one instant, which is what lets the self-send credit tell real
+  /// elapsed time from a wall clock that stepped under it — see
+  /// [`ClockPair`](crate::selfsend::ClockPair) and
+  /// [`WALL_STEP_TOLERANCE`](crate::selfsend::WALL_STEP_TOLERANCE). A stall
+  /// inserted between the two reads is charged to the credit as skew, so nothing
+  /// may come between them.
+  ///
   /// **All three come from the attempt that actually succeeded.** See
   /// [`BoundSocket::send_attempt`]: the `EINTR` retry re-reads its own
   /// pre-syscall clocks rather than carrying the interrupted attempt's forward.
@@ -300,13 +309,19 @@ pub(crate) enum SendOutcome {
     /// all widen it — and charging that gap to the credit's life is what expires
     /// a credit before its echo can claim it.
     submitted_wall: SystemTime,
-    /// Monotonic, read **before** the syscall. Anchors the **core's** refresh
-    /// schedule.
+    /// Monotonic, read **before** the syscall and immediately after
+    /// `submitted_wall`. Anchors the **core's** refresh schedule, and is the
+    /// wall stamp's partner in the self-send credit's step check.
     ///
     /// EARLY is the safe direction here too: an anchor at or before the true
     /// acceptance can only understate how fresh a family's peers are, so the
     /// next refresh lands sooner than strictly needed. A late anchor would push
     /// a refresh past the records' own TTL.
+    ///
+    /// The second consumer needs no direction at all, only the adjacency: it
+    /// subtracts this from a later monotonic reading to get real elapsed time,
+    /// and compares that against what the wall clock claims elapsed. Moving this
+    /// read away from `submitted_wall` breaks it — see the type-level note.
     submitted_at: StdInstant,
     /// Monotonic, read **after** the syscall returned success. Anchors
     /// [`FamilyWireGate`](crate::driver::FamilyWireGate), and nothing else.
@@ -434,12 +449,24 @@ pub(crate) enum SendOutcome {
 }
 
 impl SendOutcome {
-  /// The wall stamp that ORDERS the self-send credit against its echo, if this
-  /// family carried the datagram. Read before the syscall — see
+  /// The stamps that ORDER the self-send credit against its echo, if this family
+  /// carried the datagram: the pre-syscall wall reading and the monotonic
+  /// partner read next to it.
+  ///
+  /// Both, never just the wall one. The wall stamp alone cannot say whether it
+  /// is still on the timeline the echo's kernel receive stamp will be taken on —
+  /// see [`ClockPair`](crate::selfsend::ClockPair) — and neither is an age. See
   /// [`SendOutcome::Sent`].
-  pub(crate) const fn credit_stamp(self) -> Option<SystemTime> {
+  pub(crate) const fn credit_stamp(self) -> Option<crate::selfsend::ClockPair> {
     match self {
-      Self::Sent { submitted_wall, .. } => Some(submitted_wall),
+      Self::Sent {
+        submitted_wall,
+        submitted_at,
+        ..
+      } => Some(crate::selfsend::ClockPair::new(
+        submitted_wall,
+        submitted_at,
+      )),
       _ => None,
     }
   }

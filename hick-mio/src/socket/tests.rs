@@ -456,9 +456,9 @@ fn an_unknown_interface_index_is_not_reported_as_a_missing_address() {
 // datagram and see a phantom conflict against itself.
 
 /// A synthetic acceptance whose three stamps all describe one syscall: the wall
-/// clock `wall`, and both monotonic reads at `mono`. Only the wall stamp matters
-/// to the credit accounting below, and collapsing the other two keeps the
-/// fixture from implying a stall it is not testing.
+/// clock `wall`, and both monotonic reads at `mono`. The credit accounting below
+/// reads the pre-syscall pair, and collapsing the post-syscall read onto it
+/// keeps the fixture from implying a stall it is not testing.
 const fn sent_at(wall: SystemTime, mono: std::time::Instant) -> SendOutcome {
   SendOutcome::Sent {
     submitted_wall: wall,
@@ -467,10 +467,12 @@ const fn sent_at(wall: SystemTime, mono: std::time::Instant) -> SendOutcome {
   }
 }
 
-/// The wall stamp of every family that actually transmitted, in family order.
-/// The shape the driver reads out of [`SendReport::per_family`] to credit its
-/// own loopback copies.
-fn stamps(report: &SendReport) -> Vec<SystemTime> {
+/// The send stamps of every family that actually transmitted, in family order —
+/// both clocks, because ordering an echo against its send needs the wall stamp
+/// and telling real elapsed time from a wall-clock step needs its monotonic
+/// partner. The shape the driver reads out of [`SendReport::per_family`] to
+/// credit its own loopback copies.
+fn stamps(report: &SendReport) -> Vec<crate::selfsend::ClockPair> {
   report
     .per_family()
     .into_iter()
@@ -494,7 +496,10 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
   };
   assert_eq!(
     stamps(&both),
-    vec![t1, t2],
+    vec![
+      crate::selfsend::ClockPair::new(t1, mono),
+      crate::selfsend::ClockPair::new(t2, mono)
+    ],
     "a dual-stack fan-out produces two loopback copies and must yield two credits"
   );
 
@@ -503,7 +508,10 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
     v6: SendOutcome::NoSocket,
     loops_back: true,
   };
-  assert_eq!(stamps(&v4_only), vec![t1]);
+  assert_eq!(
+    stamps(&v4_only),
+    vec![crate::selfsend::ClockPair::new(t1, mono)]
+  );
 
   // None of these produced a loopback copy: one was never offered the datagram,
   // two were refused, and one was held back by the wire gate.
@@ -671,8 +679,8 @@ fn a_multicast_send_reports_one_outcome_per_bound_family() {
   for at in stamps(&report) {
     // Each stamp must bracket its syscall, so the tracker entry it feeds can
     // never postdate the kernel's stamp on the loopback copy.
-    assert!(at >= before, "send stamp predates the call");
-    assert!(at <= after, "send stamp postdates the call");
+    assert!(at.wall >= before, "send stamp predates the call");
+    assert!(at.wall <= after, "send stamp postdates the call");
   }
 }
 

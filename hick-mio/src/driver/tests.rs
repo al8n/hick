@@ -390,14 +390,9 @@ fn a_multicast_send_takes_one_credit_per_family_that_reached_the_wire() {
   assert!(summary.accepted_at.is_some());
   assert!(summary.delivery.all_delivered());
   // Take it back with the body: the credit is keyed to the family that carried
-  // it and to the fingerprint of what went out.
-  assert!(selfsend.take_at(
-    Family::V4,
-    &body,
-    std::time::SystemTime::now(),
-    Instant::now(),
-    crate::selfsend::MatchMode::Degraded
-  ));
+  // it and to the fingerprint of what went out. No receive stamp is offered, so
+  // the claim runs on content and family alone.
+  assert!(selfsend.take_at(Family::V4, &body, None, crate::selfsend::ClockPair::now()));
 }
 
 /// A refused send takes no credit and reports the family `Missed`, inside the
@@ -3127,15 +3122,13 @@ fn credit_a_multicast_send(mdns: &mut Mdns, body: &[u8]) -> Option<()> {
 /// these — a kernel receive stamp taken after the syscall, read back against the
 /// instant the following tick opened with.
 fn echo_matched_at_next_tick_top(mdns: &mut Mdns, family: Family, body: &[u8]) -> bool {
-  let top = Instant::now();
-  mdns.selfsend.seal_at(top);
-  mdns.selfsend.take_at(
-    family,
-    body,
-    std::time::SystemTime::now(),
-    top,
-    crate::selfsend::MatchMode::Ordered,
-  )
+  let top = crate::selfsend::ClockPair::now();
+  mdns.selfsend.seal_at(top.mono);
+  // Both readings are live, so the wall clock and the monotonic one agree about
+  // how much time has passed since the send and the claim keeps full ordering
+  // evidence — which is what makes this an `Ordered` claim rather than a
+  // degraded one.
+  mdns.selfsend.take_at(family, body, Some(top.wall), top)
 }
 
 /// Send once through stage 4 and claim the echo at the next tick's top.
@@ -3333,21 +3326,21 @@ fn a_caller_gap_after_the_claim_window_opened_still_expires_the_credit() {
   // during a caller stall exactly as it can during a tick. Ageing by tick count,
   // or re-anchoring on every seal, would make the suppression window a function
   // of the caller's loop rate instead of a bound.
-  let top = Instant::now();
-  mdns.selfsend.seal_at(top);
-  let after_the_gap = top + STALL_PAST_TTL;
+  let top = crate::selfsend::ClockPair::now();
+  mdns.selfsend.seal_at(top.mono);
+  // The gap is charged to BOTH clocks, so the claim below is refused by the TTL
+  // and by nothing else: a gap that only the monotonic clock knew about would
+  // read as a wall-clock step and give up the ordering evidence instead.
+  let after_the_gap =
+    crate::selfsend::ClockPair::new(top.wall + STALL_PAST_TTL, top.mono + STALL_PAST_TTL);
   assert!(
-    !mdns.selfsend.take_at(
-      Family::V4,
-      &body,
-      std::time::SystemTime::now(),
-      after_the_gap,
-      crate::selfsend::MatchMode::Ordered,
-    ),
+    !mdns
+      .selfsend
+      .take_at(Family::V4, &body, Some(after_the_gap.wall), after_the_gap,),
     "post-opportunity time is charged in full, caller stalls included, or the \
      false-suppression bound is not a bound"
   );
-  mdns.selfsend.seal_at(after_the_gap);
+  mdns.selfsend.seal_at(after_the_gap.mono);
   assert_eq!(
     mdns.selfsend.len(),
     0,

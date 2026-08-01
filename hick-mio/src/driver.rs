@@ -125,14 +125,14 @@
 //! form where the question cannot be asked: no parameter, or a capability asked
 //! at the point of use, so that a stale answer has no type to live in.
 
-use std::time::{Duration, Instant as StdInstant, SystemTime};
+use std::time::{Duration, Instant as StdInstant};
 
 use mdns_proto::{
   QueryHandle, ServiceHandle, ServiceUpdate, TransmitDelivery, TransmitObligation,
   event::RouteEvent,
 };
 
-use crate::{endpoint::Mdns, error::TickError, event::Event, onlink, selfsend::MatchMode};
+use crate::{endpoint::Mdns, error::TickError, event::Event, onlink};
 
 pub(crate) use sends::{FamilyWireGate, SendHealth, send_and_credit};
 pub(crate) use withdrawal::GoodbyeLedger;
@@ -588,19 +588,19 @@ impl Mdns {
       // which is what stops a byte-identical peer datagram the kernel saw
       // BEFORE our send from stealing the credit. Without one there is no
       // ordering to check, so matching degrades to content hash inside the TTL
-      // window.
+      // window — and the absence is handed over as an absence rather than
+      // papered over with a userspace stamp, because a read time taken here
+      // says nothing about when the kernel saw the datagram.
       //
-      // The wall stamp only ORDERS the echo against the send. Two clocks answer
-      // two questions and this call supplies exactly one of them: the credit's
-      // AGE is read inside `take`, at the decision, because everything between
-      // the read above and this line — both admission gates, and whatever the
-      // scheduler does among them — is elapsed time the credit must be charged.
+      // The kernel stamp only ORDERS the echo against the send. Two clocks
+      // answer two questions and this call supplies exactly one of them: the
+      // credit's AGE is read inside `take`, at the decision, because everything
+      // between the read above and this line — both admission gates, and
+      // whatever the scheduler does among them — is elapsed time the credit must
+      // be charged.
       #[cfg(test)]
       Self::stall_before_claim(forced_claim_delays);
-      let caller_is_self = match sockets.rx_time(&meta) {
-        Some(rx) => selfsend.take(family, data, rx, MatchMode::Ordered),
-        None => selfsend.take(family, data, SystemTime::now(), MatchMode::Degraded),
-      };
+      let caller_is_self = selfsend.take(family, data, sockets.rx_time(&meta));
 
       let route_events = match endpoint.handle(
         now,
