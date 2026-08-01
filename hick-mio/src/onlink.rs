@@ -296,6 +296,23 @@ fn prefix_match(net: &[u8], addr: &[u8], prefix: u8, max: u8) -> bool {
 /// Addresses + prefix lengths configured on the bound interface. Scoped to the
 /// BOUND interface only — not every local NIC — so the §11 fallback cannot be
 /// widened by an unrelated interface's subnet.
+///
+/// # A failed enumeration is deliberately read as "no evidence"
+///
+/// Every fallible read below collapses to *nothing collected*, which is the
+/// opposite direction from `Sockets::bind`, where the same collapse is a defect:
+/// there a failed family read masqueraded as a family with no address and
+/// silently bound the wrong thing, so it propagates. Here the caller is the
+/// §11 trust boundary and the answer it needs is a yes or a no. This list is
+/// consulted only by [`src_on_local_link`]'s global-source arm, which admits a
+/// source **only** on positive on-link evidence — so an empty list is a refusal,
+/// and a refusal is what an interface nobody could read must produce. Returning
+/// a `Result` here would only move the same decision one frame up.
+///
+/// The cost is the fail-closed one and it is bounded: while the read fails, a
+/// global-address on-link peer is treated as off-link and dropped. Group
+/// destinations, link-local sources and loopback all short-circuit before this
+/// list is reached.
 pub(crate) fn collect_local_subnets(iface_index: u32) -> Vec<(IpAddr, u8)> {
   let mut out = Vec::new();
   let Ok(Some(iface)) = getifs::interface_by_index(iface_index) else {
