@@ -22,6 +22,11 @@ smol = ["std", "hick-reactor/smol"]
 
 compio = ["std", "hick-compio"]
 
+# Synchronous driver: the caller drives its own `mio::Poll` loop. Still a
+# `std` driver like `tokio`/`smol`/`compio` above, but no async runtime and no
+# extra thread.
+mio = ["std", "hick-mio"]
+
 # Enables the `std` build of the proto core. Pulled by the std runtimes above; NOT
 # by the bare-metal features, so `default-features = false` + a bare-metal feature
 # stays `no_std`.
@@ -53,6 +58,7 @@ tracing = [
   "mdns-proto/tracing",
   "hick-reactor?/tracing",
   "hick-compio?/tracing",
+  "hick-mio?/tracing",
   "hick-smoltcp?/tracing",
   "hick-embassy?/tracing",
 ]
@@ -68,6 +74,7 @@ metrics = [
   "mdns-proto/metrics",
   "hick-reactor?/metrics",
   "hick-compio?/metrics",
+  "hick-mio?/metrics",
   # hick-smoltcp and hick-embassy are `no_std` crates; their `metrics` feature
   # was removed because the `metrics` facade requires `std`. Their atomic-only
   # stats are still available via the `stats` feature.
@@ -82,6 +89,7 @@ stats = [
   "mdns-proto/stats",
   "hick-reactor?/stats",
   "hick-compio?/stats",
+  "hick-mio?/stats",
   "hick-smoltcp?/stats",
   "hick-embassy?/stats",
 ]
@@ -100,6 +108,7 @@ defmt = ["hick-smoltcp?/defmt", "hick-embassy?/defmt"]
 mdns-proto = { workspace = true, features = ["slab"] }
 hick-reactor = { optional = true, workspace = true }
 hick-compio = { optional = true, workspace = true }
+hick-mio = { optional = true, workspace = true }
 # `default-features = false`: the driver's default `atomic` tier is selected
 # explicitly by the facade's `smoltcp` / `embassy` features, leaving the
 # `*-no-atomic` features free to select the `no-atomic` tier instead.

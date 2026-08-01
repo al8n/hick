@@ -1,0 +1,415 @@
+//! Fixtures shared by the loopback integration tests.
+//!
+//! `hick-reactor/tests/common/mod.rs` is a `tracing` subscriber installer and
+//! not a spec-helper module; the spec constructors it uses live inline in
+//! `hick-reactor/tests/loopback_endpoint.rs:30-41`. Those are mirrored here.
+//!
+//! # Why everything here funnels through [`bind_lock`]
+//!
+//! [`Mdns::new`] always lands on the fixed mDNS port and joins the same group,
+//! so every live endpoint in this process shares one `SO_REUSEPORT` group.
+//! macOS then delivers a group datagram to only **one** member, which is what
+//! made a socket unit test fail about half the time under `cargo test`'s default
+//! parallelism before `socket.rs` grew its crate-wide `BIND_LOCK`. That lock is
+//! `#[cfg(test)] pub(crate)`, so it does not reach this binary — integration
+//! tests are a separate crate — and this module carries its own.
+//!
+//! The guard is held for the endpoints' whole **lifetime**, not just across the
+//! bind: two live endpoints in different tests is exactly the contention being
+//! excluded. Because a test may need *two* endpoints at once, the guard is taken
+//! once by the test and passed to [`endpoint`] by reference, rather than being
+//! taken inside it — a second acquisition of a non-reentrant `Mutex` on the same
+//! thread would deadlock.
+
+// Each test binary uses a subset of these helpers, and an unused one here is not
+// dead code in any meaningful sense.
+#![allow(dead_code)]
+
+use std::{
+  marker::PhantomData,
+  net::Ipv4Addr,
+  sync::{Mutex, MutexGuard},
+  time::{Duration, Instant},
+};
+
+use hick_mio::{
+  Event, Mdns, Name, QueryParam, ServerOptions, ServiceRecords, ServiceSpec,
+  wire::{Header, MessageBuilder, ResourceClass, ResourceType},
+};
+use mio::{Events, Poll, Token};
+
+/// The token each endpoint's IPv4 socket is registered under.
+pub const V4: Token = Token(0);
+/// The token each endpoint's IPv6 socket is registered under.
+pub const V6: Token = Token(1);
+
+/// How long one [`Endpoint::step`] may block in `Poll::poll`.
+///
+/// Every wait in this file is bounded by a slice like this **and** by a
+/// caller-supplied budget, so no helper here can hang: the worst case is that a
+/// predicate never becomes true and the pump returns `false` at its deadline.
+const SLICE: Duration = Duration::from_millis(20);
+
+/// Serialises every test in this binary that binds a real mDNS socket.
+static BIND_LOCK: Mutex<()> = Mutex::new(());
+
+/// Proof that the caller holds the process-wide bind lock.
+///
+/// Every [`Endpoint`] borrows one of these for its whole life, so the compiler —
+/// not a comment — is what stops a test releasing the lock while its sockets are
+/// still in the multicast group.
+pub struct BindGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+/// Take the process-wide bind lock.
+///
+/// Poisoning is ignored on purpose: a panic in one test must surface as that
+/// test's own assertion failure, not as a poison error in every test after it.
+pub fn bind_lock() -> BindGuard {
+  BindGuard(BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The index of an interface that is both `LOOPBACK` and `UP`, if any.
+fn loopback_index() -> Option<u32> {
+  getifs::interfaces()
+    .ok()?
+    .into_iter()
+    .find(|i| i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP))
+    .map(|i| i.index())
+}
+
+/// An [`Mdns`] plus the `mio` loop the test drives it from, and every event it
+/// has produced so far.
+///
+/// The lifetime is the [`BindGuard`] it was built under: an endpoint cannot
+/// outlive the lock that keeps its sockets the only ones in the group.
+pub struct Endpoint<'lock> {
+  /// The endpoint under test.
+  pub mdns: Mdns,
+  /// Every event [`Self::step`] has drained, in arrival order.
+  pub seen: Vec<Event>,
+  /// A human-readable name, used only in skip and diagnostic lines.
+  pub label: &'static str,
+  poll: Poll,
+  events: Events,
+  _lock: PhantomData<&'lock BindGuard>,
+}
+
+impl Endpoint<'_> {
+  /// One event-loop iteration: block for at most `SLICE`, feed readiness, tick,
+  /// and drain the event queue into [`Self::seen`].
+  ///
+  /// Mirrors the loop `Mdns::shutdown`'s rustdoc prescribes, except that the
+  /// `Poll::poll` timeout is additionally capped at `SLICE` so a test that pumps
+  /// two endpoints alternately never parks in one of them.
+  ///
+  /// That cap makes this **unusable for testing `next_timeout` itself**: a
+  /// `next_timeout` that wrongly reported a distant deadline would still be
+  /// re-entered `SLICE` later and would still make progress, so the defect would
+  /// not show. Use [`Self::step_trusting_next_timeout`] for that.
+  pub fn step(&mut self) {
+    let timeout = self.mdns.next_timeout().map_or(SLICE, |t| t.min(SLICE));
+    self.drive(timeout);
+  }
+
+  /// One event-loop iteration that takes `next_timeout()` at its word.
+  ///
+  /// `safety` is a backstop and nothing else: it bounds `None` (which means
+  /// "block indefinitely") and any absurdly distant deadline, so a wrong answer
+  /// **stalls** the loop instead of hanging it. Pick a `safety` far larger than
+  /// the caller's own deadline, so that stalling once is already enough to fail
+  /// the caller's assertion.
+  pub fn step_trusting_next_timeout(&mut self, safety: Duration) {
+    let timeout = self.mdns.next_timeout().map_or(safety, |t| t.min(safety));
+    self.drive(timeout);
+  }
+
+  fn drive(&mut self, timeout: Duration) {
+    self
+      .poll
+      .poll(&mut self.events, Some(timeout))
+      .expect("poll");
+    for ev in self.events.iter() {
+      if self.mdns.owns(ev.token()) {
+        self.mdns.handle_io(ev);
+      }
+    }
+    self.mdns.tick().expect("tick");
+    while let Some(e) = self.mdns.next_event() {
+      self.seen.push(e);
+    }
+  }
+
+  /// Whether this endpoint has parsed any answer record out of an inbound
+  /// datagram.
+  ///
+  /// The delivery probe every environment-gated skip in this suite keys on: an
+  /// endpoint that advertises nothing sends no answers of its own, so a non-zero
+  /// count means a **peer's** response actually crossed the loopback group.
+  /// `packets_rx` cannot serve here — it counts our own multicast loopback
+  /// copies too, so it is non-zero the moment we send anything at all.
+  ///
+  /// Without the `stats` feature there is no counter to consult, so this reports
+  /// `true` and the caller asserts unconditionally — the same contract
+  /// `hick-reactor`'s loopback tests use, where a non-delivering environment is
+  /// a failure rather than a skip. Build with `--features stats` to get the
+  /// skip instead.
+  pub fn saw_peer_answers(&self) -> bool {
+    #[cfg(feature = "stats")]
+    {
+      self.mdns.stats().answers_rx > 0
+    }
+    #[cfg(not(feature = "stats"))]
+    {
+      true
+    }
+  }
+
+  /// Whether this endpoint has ingested any datagram at all, its **own**
+  /// multicast loopback copies included.
+  ///
+  /// The egress probe, and the counterpart to [`Self::saw_peer_answers`]: the
+  /// kernel loops one copy of every multicast transmit back to each joined
+  /// socket, so a responder that has put a probe on the wire receives that probe
+  /// itself (the self-send tracker is what stops it being mistaken for a peer).
+  /// A responder that has transmitted and still reads `packets_rx == 0`
+  /// therefore had its egress swallowed by the environment; one that reads
+  /// non-zero got its datagrams out and back, so anything it then fails to do is
+  /// a defect in this crate rather than in the host.
+  ///
+  /// Exactly the counter [`Self::saw_peer_answers`] rejects, and for the
+  /// opposite reason: counting our own loopback copies makes it useless as a
+  /// *peer-delivery* probe and precisely right as an *egress* probe.
+  ///
+  /// Without the `stats` feature there is no counter to consult, so this reports
+  /// `true` and the caller asserts unconditionally — the same fallback
+  /// [`Self::saw_peer_answers`] uses.
+  pub fn saw_own_loopback(&self) -> bool {
+    #[cfg(feature = "stats")]
+    {
+      self.mdns.stats().packets_rx > 0
+    }
+    #[cfg(not(feature = "stats"))]
+    {
+      true
+    }
+  }
+}
+
+/// Build an endpoint pinned to the loopback interface, or print why the test is
+/// skipping.
+///
+/// A dual-stack bind is attempted first and degrades to IPv4-only, because
+/// `hick_udp::try_bind_v6` is rejected outright on some hosts — macOS returns
+/// `EINVAL` on every interface — while it succeeds on others. Which families end
+/// up bound is therefore a property of the host, never of a test: nothing in
+/// this suite asserts a family count, a credit count, or a `sent` literal. The
+/// degradation is printed so a run that covers less than it looks like says so.
+pub fn endpoint<'lock>(_lock: &'lock BindGuard, label: &'static str) -> Option<Endpoint<'lock>> {
+  let Some(idx) = loopback_index() else {
+    eprintln!("skipping: no UP loopback interface reported by getifs");
+    return None;
+  };
+  let opts = ServerOptions::default().with_interface_index(Some(idx));
+  let mdns = match Mdns::new(opts.clone()) {
+    Ok(m) => m,
+    Err(e) => {
+      eprintln!("note: {label}: dual-stack loopback bind failed ({e:?}); retrying IPv4-only");
+      match Mdns::new(opts.with_ipv6(false)) {
+        Ok(m) => m,
+        Err(e) => {
+          eprintln!("skipping: {label}: loopback bind failed even IPv4-only ({e:?})");
+          return None;
+        }
+      }
+    }
+  };
+  let poll = match Poll::new() {
+    Ok(p) => p,
+    Err(e) => {
+      eprintln!("skipping: {label}: mio::Poll::new failed ({e:?})");
+      return None;
+    }
+  };
+  let mut ep = Endpoint {
+    mdns,
+    seen: Vec::new(),
+    label,
+    poll,
+    events: Events::with_capacity(64),
+    _lock: PhantomData,
+  };
+  if let Err(e) = ep.mdns.register(ep.poll.registry(), V4, V6) {
+    eprintln!("skipping: {label}: registering the sockets with mio failed ({e:?})");
+    return None;
+  }
+  Some(ep)
+}
+
+/// Drive `ep` until `done` reports true or `budget` elapses. Returns whether it
+/// hit.
+///
+/// `done` is evaluated once before the first `poll` too, so a condition already
+/// satisfied costs no wall time.
+pub fn pump<F>(ep: &mut Endpoint<'_>, budget: Duration, mut done: F) -> bool
+where
+  F: FnMut(&mut Endpoint<'_>) -> bool,
+{
+  let deadline = Instant::now() + budget;
+  loop {
+    if done(ep) {
+      return true;
+    }
+    if Instant::now() >= deadline {
+      return false;
+    }
+    ep.step();
+  }
+}
+
+/// Drive `a` and `b` in lockstep until `done` reports true or `budget` elapses.
+///
+/// Both are stepped every iteration. Pumping one and then the other in separate
+/// `pump` calls would let the idle endpoint's socket buffer absorb a burst it is
+/// not draining, which on a small default `SO_RCVBUF` silently loses the very
+/// packets the test is waiting for.
+pub fn pump_pair<F>(
+  a: &mut Endpoint<'_>,
+  b: &mut Endpoint<'_>,
+  budget: Duration,
+  mut done: F,
+) -> bool
+where
+  F: FnMut(&mut Endpoint<'_>, &mut Endpoint<'_>) -> bool,
+{
+  let deadline = Instant::now() + budget;
+  loop {
+    if done(a, b) {
+      return true;
+    }
+    if Instant::now() >= deadline {
+      return false;
+    }
+    a.step();
+    b.step();
+  }
+}
+
+/// A service advertised on 127.0.0.1, mirroring `hick-reactor`'s `http_service`.
+///
+/// `instance` and `host` are caller-chosen so each test owns names no other test
+/// in this binary publishes: a shared instance name would be renamed by RFC 6762
+/// §9 conflict resolution the moment two tests overlapped.
+pub fn service_spec(service_type: &str, instance: &str, host: &str, port: u16) -> ServiceSpec {
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str(service_type).expect("service type"),
+    Name::try_from_str(instance).expect("instance name"),
+    Name::try_from_str(host).expect("host name"),
+    port,
+    120,
+  );
+  recs.add_a(Ipv4Addr::LOCALHOST);
+  ServiceSpec::new(recs)
+}
+
+/// A browse for `service_type` with an explicit timeout.
+pub fn query_param(service_type: &str, timeout: Duration) -> QueryParam {
+  QueryParam::new(Name::try_from_str(service_type).expect("service type")).with_timeout(timeout)
+}
+
+/// A UDP socket that can flood the mDNS IPv4 group *on the loopback link*, or
+/// `None` with a printed reason.
+///
+/// Three socket options are all load-bearing, and `std::net::UdpSocket` exposes
+/// only two of them — hence `socket2`:
+///
+/// * `IP_MULTICAST_IF` = 127.0.0.1. Without it the datagrams egress on the
+///   host's **default** multicast interface, and an endpoint joined only on
+///   loopback never sees them. Observed on macOS: 400 datagrams sent, zero
+///   delivered.
+/// * `IP_MULTICAST_TTL` = 255. RFC 6762 §11's on-link gate drops anything whose
+///   TTL is not 255, and the default multicast TTL is 1 — without this the burst
+///   never reaches the proto layer and `packets_rx` stays at zero for entirely
+///   the wrong reason.
+/// * `IP_MULTICAST_LOOP`. On by default, but set explicitly: the whole point is
+///   that a same-host socket receives these.
+///
+/// Bound to an ephemeral port, never 5353: joining the endpoint's
+/// `SO_REUSEPORT` group would let this socket absorb deliveries meant for the
+/// endpoint under test.
+pub fn loopback_flooder() -> Option<socket2::Socket> {
+  use socket2::{Domain, Protocol, Socket, Type};
+
+  let build = || -> std::io::Result<Socket> {
+    let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    s.bind(&std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())?;
+    s.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)?;
+    s.set_multicast_ttl_v4(255)?;
+    s.set_multicast_loop_v4(true)?;
+    Ok(s)
+  };
+  match build() {
+    Ok(s) => Some(s),
+    Err(e) => {
+      eprintln!("skipping: the flooding socket could not be set up ({e:?})");
+      None
+    }
+  }
+}
+
+/// A wire-format PTR question for `service_type`, used to generate inbound load.
+///
+/// A **query** (QR=0), deliberately: RFC 6762 §11 makes this crate drop any
+/// response whose source port is not 5353, and the flooding socket that sends
+/// this is on an ephemeral port. A response body would be discarded before it
+/// ever reached the drain under test.
+pub fn minimal_query_datagram(service_type: &str) -> Vec<u8> {
+  let mut buf = vec![0u8; 512];
+  let mut b: MessageBuilder<'_> =
+    MessageBuilder::try_new(&mut buf, Header::new()).expect("message builder");
+  b.push_question(
+    &Name::try_from_str(service_type).expect("service type"),
+    ResourceType::Ptr,
+    ResourceClass::In,
+    false,
+  )
+  .expect("push_question");
+  let n = b.finish().expect("finish");
+  buf.truncate(n);
+  buf
+}
+
+/// The first resolved entry in `seen` that is an instance of `service_type`
+/// **and** satisfies `accept`.
+///
+/// Matched on the case-folded service-type **suffix**, never the exact instance
+/// label: a responder lowercases names on the wire, and §9 conflict resolution
+/// renames a clashing instance, so the label is not stable while the suffix is.
+///
+/// `accept` is part of the selection rather than a filter the caller applies
+/// afterwards, and that is the point. A caller that waits on
+/// `resolved_entry(..).is_some_and(accept)` and then re-fetches with
+/// `resolved_entry(..)` alone is running two different searches: with more than
+/// one instance of `service_type` on the link — a foreign responder advertising
+/// the same custom type — the wait can be satisfied by the second entry while
+/// the re-fetch returns the first. Folding `accept` in makes the two calls
+/// select the same entry by construction.
+pub fn resolved_entry<'a>(
+  seen: &'a [Event],
+  service_type: &str,
+  mut accept: impl FnMut(&hick_mio::ServiceEntry) -> bool,
+) -> Option<&'a hick_mio::ServiceEntry> {
+  let suffix = service_type.to_ascii_lowercase();
+  seen.iter().find_map(|e| match e {
+    Event::Lookup { entry, .. }
+      if entry
+        .instance_name()
+        .as_str()
+        .to_ascii_lowercase()
+        .ends_with(&suffix)
+        && accept(entry) =>
+    {
+      Some(entry)
+    }
+    _ => None,
+  })
+}

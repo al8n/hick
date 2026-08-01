@@ -14,15 +14,16 @@
   feature = "tokio",
   feature = "smol",
   feature = "compio",
+  feature = "mio",
   feature = "smoltcp",
   feature = "smoltcp-no-atomic",
   feature = "embassy",
   feature = "embassy-no-atomic"
 )))]
 compile_error!(
-  "hick: enable a runtime (`tokio`, `smol`, or `compio`) or a bare-metal driver \
-   (`smoltcp` / `embassy`, or their `-no-atomic` variants for cores without \
-   native atomic CAS)"
+  "hick: enable a runtime (`tokio`, `smol`, or `compio`), the synchronous `mio` \
+   driver, or a bare-metal driver (`smoltcp` / `embassy`, or their `-no-atomic` \
+   variants for cores without native atomic CAS)"
 );
 
 /// The Sans-I/O mDNS protocol core ([`mdns_proto`]).
@@ -41,13 +42,19 @@ pub use mdns_proto::wire;
 /// ergonomics. Service / query specs, records, names, and update events are
 /// identical for every driver, so they live at the crate root; the runtime-specific
 /// entry points (the endpoint constructor and its handle types) live in the
-/// per-runtime driver modules ([`tokio`], [`smol`]) or driver crates ([`compio`],
-/// [`smoltcp`], [`embassy`]). These require a proto storage tier, which every
-/// runtime / driver feature enables, so the re-export is gated on having one.
+/// per-runtime driver modules (`tokio`, `smol`) or driver crates (`compio`,
+/// `mio`, `smoltcp`, `embassy`). These require a proto storage tier, which
+/// every runtime / driver feature enables, so the re-export is gated on having one.
+///
+/// Named as plain code rather than intra-doc links: each is only compiled in
+/// under its own feature, so a doc build enabling just one (rather than
+/// `--all-features`, which is what docs.rs and this workspace's CI use) would
+/// otherwise report the others as broken links.
 #[cfg(any(
   feature = "tokio",
   feature = "smol",
   feature = "compio",
+  feature = "mio",
   feature = "smoltcp",
   feature = "smoltcp-no-atomic",
   feature = "embassy",
@@ -83,6 +90,12 @@ pub mod smol {
 #[cfg(feature = "compio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "compio")))]
 pub use hick_compio as compio;
+
+/// The `mio` mDNS driver ([`hick_mio`]) — a synchronous endpoint driven from the
+/// caller's own `mio::Poll` loop. No async runtime and no extra thread.
+#[cfg(feature = "mio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mio")))]
+pub use hick_mio as mio;
 
 /// The runtime-agnostic bare-metal mDNS engine ([`hick_smoltcp`]) over smoltcp
 /// UDP (`no_std` + `alloc`). Enable `smoltcp` (atomic tier) or `smoltcp-no-atomic`
