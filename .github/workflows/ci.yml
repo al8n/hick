@@ -74,9 +74,11 @@ jobs:
   # These are the capability families behind `hick-udp/build.rs`.
   #
   # NetBSD is scoped to the sans-io crates (mdns-proto + hick-udp): the
-  # hick-reactor tokio driver depends on mio, which does not build on NetBSD.
-  # The NetBSD portability target is the sans-io mechanism + socket layer, not
-  # the tokio policy layer. FreeBSD/Android check the whole workspace.
+  # hick-reactor tokio driver depends on mio, which does not build on NetBSD —
+  # and so does hick-mio, which depends on mio directly rather than through
+  # tokio. The NetBSD portability target is the sans-io mechanism + socket
+  # layer, not a mio-based policy layer. FreeBSD/Android check the whole
+  # workspace.
   cross-check:
     runs-on: ubuntu-latest
     strategy:
@@ -189,6 +191,43 @@ jobs:
       - run: cargo build -p hick-reactor --features metrics
       # Verify the hick-trace no-op tests run clean (default = no tracing).
       - run: cargo test -p hick-trace
+      # hick-mio: `stats` is the only public window into queries_active /
+      # packets_rx, and 3 of its 5 loopback integration tests are compiled only
+      # under that feature (`#[cfg(feature = "stats")]` on the `#[test]`
+      # itself) — a default-feature run would silently skip them, not fail.
+      - run: cargo test -p hick-mio --features stats
+      - run: cargo build -p hick-mio --features metrics
+      # Anti-flake gate for hick-mio's loopback integration tests
+      # (hick-mio/tests/loopback.rs). They are deliberately designed to
+      # self-skip — print a `skipping:` line and return early — on a host that
+      # cannot deliver multicast across its own loopback interface, so a run
+      # here is never wrong to *pass* on a skip. But ubuntu-latest reliably
+      # delivers loopback multicast, so on THIS runner a `skipping:` line means
+      # either a real regression or an intermittent SO_REUSEPORT group
+      # misdelivery — both are indistinguishable from "this environment does
+      # not deliver" without this check, and both must fail loudly instead of
+      # passing green with an assertion that never ran. `--nocapture` is
+      # required: the test harness captures stderr (where `skipping:`/`note:`
+      # are printed) for a passing test unless asked not to. `note:` lines (the
+      # IPv4-only degradation a host with no bindable IPv6 falls back to) are
+      # deliberately NOT matched — they weaken no assertion.
+      - name: hick-mio loopback tests must not silently self-skip on Linux
+        run: |
+          # MANDATORY. GitHub's implicit shell is `bash -e {0}`, NOT
+          # `bash -eo pipefail` — pipefail is added only when `shell: bash` is
+          # set explicitly, and this workflow sets neither `shell:` nor
+          # `defaults:`. Without this line the pipeline's exit status is
+          # `tee`'s, so a FAILING loopback run exits 0 and only the `skipping:`
+          # grep below could fail the job — discarding exactly the flaky
+          # SO_REUSEPORT misdelivery this gate exists to catch. Verify with
+          # `bash -e -c 'false | tee /dev/null'; echo $?` → 0.
+          set -o pipefail
+          cargo test -p hick-mio --features stats --test loopback -- --nocapture 2>&1 | tee loopback.log
+          if grep -q 'skipping:' loopback.log; then
+            echo "::error::hick-mio loopback tests printed 'skipping:' on ubuntu-latest, which reliably delivers loopback multicast. Treat as a regression or an intermittent SO_REUSEPORT misdelivery — never re-run and ignore."
+            grep -n 'skipping:' loopback.log
+            exit 1
+          fi
 
   miri:
     runs-on: ubuntu-latest

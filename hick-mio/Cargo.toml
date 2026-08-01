@@ -1,0 +1,49 @@
+[package]
+name = "hick-mio"
+version = "0.1.0"
+edition = "2024"
+publish = true
+repository = "https://github.com/al8n/hick"
+homepage = "https://github.com/al8n/hick"
+documentation = "https://docs.rs/hick-mio"
+description = "Synchronous mDNS driver for `mio` event loops, layered on `mdns-proto` + `hick-udp`. No async runtime, no extra thread."
+license = "MIT OR Apache-2.0"
+rust-version = "1.91.0"
+categories = ["network-programming"]
+keywords = ["mdns", "dns-sd", "zeroconf", "mio", "event-loop"]
+readme = "README.md"
+
+[features]
+default = []
+tracing = ["dep:tracing", "mdns-proto/tracing", "hick-trace/tracing"]
+metrics = ["stats", "mdns-proto/metrics", "hick-trace/metrics"]
+stats = ["mdns-proto/stats", "hick-trace/stats"]
+
+[dependencies]
+bytes = { workspace = true, features = ["default"] }
+mdns-proto = { workspace = true, features = ["std", "slab"] }
+hick-udp.workspace = true
+hick-trace.workspace = true
+mio = { workspace = true, features = ["os-poll", "net"] }
+tracing = { workspace = true, optional = true, features = ["attributes", "std"] }
+getifs.workspace = true
+rand = { workspace = true, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
+slab = { workspace = true, features = ["std"] }
+smol_str = { workspace = true, features = ["std"] }
+thiserror = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+getifs.workspace = true
+# Test-only. The loopback integration tests need a flooding socket pinned to the
+# loopback interface via `IP_MULTICAST_IF`; `std::net::UdpSocket` exposes
+# multicast TTL and loop but not the egress interface, so a `0.0.0.0`-bound
+# sender egresses on the host's default multicast interface and never reaches an
+# endpoint joined on loopback.
+socket2 = { version = "0.6" }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

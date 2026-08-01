@@ -61,6 +61,7 @@ The crates split protocol logic from I/O, mirroring the `quinn` layering:
 | [`hick-udp`] | multicast UDP socket setup |
 | [`hick-reactor`] | runtime-agnostic async driver (`tokio` & `smol`) |
 | [`hick-compio`] | `compio` (thread-per-core) async driver |
+| [`hick-mio`] | synchronous driver for `mio` event loops (no async runtime) |
 | [`hick-smoltcp`] | bare-metal mDNS engine over smoltcp (`no_std` + `alloc`) |
 | [`hick-embassy`] | embassy async driver, built on `hick-smoltcp` (`no_std` + `alloc`) |
 
@@ -157,6 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `tokio` *(default)* — drive the `tokio` runtime via [`hick-reactor`].
 - `smol` — drive the `smol` runtime.
 - `compio` — drive the `compio` (thread-per-core) runtime via [`hick-compio`].
+- `mio` — synchronous driver for a caller-owned `mio::Poll` event loop via [`hick-mio`]; no async runtime, no extra thread.
 - `smoltcp` — expose the bare-metal [`hick-smoltcp`] engine (`no_std` + `alloc`).
 - `embassy` — expose the [`hick-embassy`] async driver (`no_std` + `alloc`).
 - `smoltcp-no-atomic` / `embassy-no-atomic` — the same engine / driver on the `no-atomic` tier, for cores **without** native atomic CAS (Cortex-M0+ / thumbv6m / RP2040). Refcounted Name / rdata use `portable-atomic` (clone via a `critical-section` impl your binary provides). Pick exactly one tier per engine.
@@ -220,8 +222,8 @@ instead of (or alongside) `stats`. Log events are forwarded through the
 `defmt` framework. On std drivers this feature is a no-op.
 
 Per-crate observability details: [`hick-trace`] (shim) · [`mdns-proto`] ·
-[`hick-reactor`] · [`hick-compio`] · [`hick-smoltcp`] · [`hick-embassy`] ·
-[`hick-udp`].
+[`hick-reactor`] · [`hick-compio`] · [`hick-mio`] · [`hick-smoltcp`] ·
+[`hick-embassy`] · [`hick-udp`].
 
 ## License
 
@@ -238,6 +240,7 @@ Copyright (c) 2025 Al Liu.
 [`hick-udp`]: https://crates.io/crates/hick-udp
 [`hick-reactor`]: https://crates.io/crates/hick-reactor
 [`hick-compio`]: https://crates.io/crates/hick-compio
+[`hick-mio`]: https://crates.io/crates/hick-mio
 [`hick-smoltcp`]: https://crates.io/crates/hick-smoltcp
 [`hick-embassy`]: https://crates.io/crates/hick-embassy
 [`metrics`]: https://crates.io/crates/metrics
