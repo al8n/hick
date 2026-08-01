@@ -4,7 +4,7 @@ use std::{
 };
 
 use mdns_proto::{
-  CollectedAnswer, FamilyDelivery, ServiceState,
+  CollectedAnswer, FamilyDelivery, ServiceState, ServiceUpdate,
   endpoint::WithdrawalSend,
   wire::{ResourceClass, ResourceType},
 };
@@ -2409,6 +2409,442 @@ fn consecutive_encode_failures_retire_the_service_with_a_conflict() {
   );
 }
 
+// ── a datagram no reachable socket can ever carry ───────────────────────────
+//
+// A `Sustained` transmit is re-armed until every obligated link accepts it, and
+// the core's own partial-round patience excuses a family that keeps MISSING —
+// not a round that can never succeed on any family. So a datagram every
+// reachable socket refuses on its SIZE is the one shape neither side bounds: the
+// core re-arms it forever and the driver re-offers it forever, and the service
+// stays pending and unestablished for the life of the process with nothing on
+// any wire. It is reachable, not theoretical: `ServerOptions` admits any encode
+// scratch up to `MAX_BUFFER_SIZE`, which is the IPv6 ceiling and 20 bytes above
+// IPv4's, so a v4 family can be handed a message it can never carry.
+//
+// The fix is one asymmetry, and both halves are tested here. A `Sustained`
+// producer is retired, because it can never make progress. A `OneShot` response
+// is NOT, because it is never re-armed — losing it costs one unanswered
+// question, and retiring on it would let any peer tear down a healthy service by
+// asking it a question whose answer does not fit.
+//
+// Every "does not retire" test below is a guard against the OTHER failure mode:
+// permanence is a property of the SIZE and of nothing else, so a transient
+// failure — `WouldBlock`, or the `EMSGSIZE` Linux also raises for a write past
+// the current path MTU — and a family with no socket are each no evidence at all.
+
+/// Make every send on both families oversize, by lowering each family's hard UDP
+/// payload ceiling to zero — or restore the real ceilings.
+///
+/// The ceiling, never a hook that answers `TooLarge` directly: an ordinary
+/// datagram a live producer emits then reaches the driver's decision through the
+/// same size comparison a 70 000-byte one does.
+fn refuse_every_send_as_too_large(mdns: &mut Mdns, refuse: bool) {
+  let ceiling = refuse.then_some(0);
+  for family in [Family::V4, Family::V6] {
+    mdns.sockets.force_payload_ceiling_for_test(family, ceiling);
+  }
+}
+
+/// How many sends the hook above has actually refused, across both families.
+///
+/// A "the producer survived" assertion is vacuous unless the producer really was
+/// offered a datagram nothing could carry; this is what proves it was.
+fn too_large_refusals(mdns: &mut Mdns) -> u32 {
+  mdns.sockets.forced_send_refusals_for_test(Family::V4)
+    + mdns.sockets.forced_send_refusals_for_test(Family::V6)
+}
+
+/// Tick until some datagram has been refused as permanently too large, or report
+/// why the test is skipping.
+///
+/// `budget` is the caller's, because what a wait may safely span differs: a
+/// service still probing has nothing else due, while one already announcing has
+/// its next RFC 6762 §8.3 round a second out and must be asserted well inside it.
+fn tick_until_a_send_is_refused_as_too_large(mdns: &mut Mdns, budget: Duration) -> bool {
+  let deadline = Instant::now() + budget;
+  while Instant::now() < deadline {
+    mdns.tick().expect("tick");
+    if too_large_refusals(mdns) > 0 {
+      return true;
+    }
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  eprintln!("skipping: no datagram was offered to the socket within the budget");
+  false
+}
+
+/// Drain every service terminal the queue holds for `handle`.
+fn service_terminals(mdns: &mut Mdns, handle: mdns_proto::ServiceHandle) -> Vec<ServiceUpdate> {
+  let mut out = Vec::new();
+  while let Some(ev) = mdns.next_event() {
+    if let Event::Service { handle: h, update } = ev
+      && h == handle
+    {
+      out.push(update);
+    }
+  }
+  out
+}
+
+/// The defect itself: a `Sustained` probe no reachable socket can carry must
+/// retire its producer rather than be re-armed forever.
+///
+/// The fixture is IPv4-only **by configuration**, so "every reachable family
+/// refused it" is a property of the test rather than of the host: the absent
+/// family reports `NoSocket`, which is no evidence either way, and the one family
+/// this endpoint has refuses the size.
+///
+/// Retirement is asserted on the FIRST refusal, not merely "eventually". A
+/// version that waited for a failure streak would look like this one on a green
+/// run while still leaving the datagram re-armed for as long as the streak takes,
+/// and a version that never retired would sit here until the budget expired.
+#[test]
+fn an_undeliverable_sustained_transmit_retires_the_service() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let handle = mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-toobig._tcp.local.",
+      8080,
+    ))
+    .expect("register_service");
+  refuse_every_send_as_too_large(&mut mdns, true);
+
+  // §8.1 puts the first probe a random 0-250 ms out, so the first ticks
+  // legitimately offer nothing at all.
+  if !tick_until_a_send_is_refused_as_too_large(&mut mdns, Duration::from_secs(3)) {
+    return;
+  }
+  assert!(
+    mdns.services.get(&handle).is_none_or(|ctx| ctx.withdrawing),
+    "the probe reached no wire and no retry ever can, so the service must be \
+     retired on that very round — not re-armed and re-offered forever"
+  );
+  let terminals = service_terminals(&mut mdns, handle);
+  assert!(
+    terminals.iter().any(ServiceUpdate::is_conflict),
+    "the caller must be told, instead of waiting for an Established that can \
+     never arrive: {terminals:?}"
+  );
+
+  // And retired means retired: no further tick revives the lifecycle.
+  for _ in 0..5 {
+    mdns.tick().expect("tick");
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  assert!(
+    mdns.services.get(&handle).is_none_or(|ctx| ctx.withdrawing),
+    "nothing may drive a retired service's §8 lifecycle again"
+  );
+  assert!(
+    mdns
+      .services
+      .get(&handle)
+      .is_none_or(|ctx| ctx.proto.state() == ServiceState::Probing(0)),
+    "the §8.1 sequence never advanced: nothing reached a link"
+  );
+}
+
+/// The over-eager direction, guarded end to end: a family that refuses every send
+/// for a reason that MAY clear is never evidence that a datagram is impossible.
+///
+/// It ends by letting the socket accept again and watching the same service
+/// complete its probe sequence — which is a much stronger statement than "no
+/// terminal was queued". A retirement marks the context `withdrawing`, and every
+/// stage skips such a context forever, so a service that goes on to reach
+/// `Probing(1)` was demonstrably never retired.
+#[test]
+fn a_transient_all_family_failure_retries_and_never_retires() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let handle = mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-transient._tcp.local.",
+      8081,
+    ))
+    .expect("register_service");
+  mdns
+    .sockets
+    .force_send_wouldblock_for_test(Family::V4, true);
+  // Reaching the degradation threshold is proof the core really did re-arm and
+  // the driver really did re-offer the probe, several times over.
+  //
+  // The survival assertion is inside the loop, not after it, and that placement
+  // is what keeps this test from going vacuous. A retirement stops the transmits
+  // the degradation counter is made of, so an over-eager driver would never
+  // reach the threshold at all — and a check that ran only after the loop would
+  // see the timeout, print a skip and pass. Asserted every tick, the retirement
+  // is caught on the tick it happens.
+  let deadline = Instant::now() + Duration::from_secs(3);
+  let mut degraded = false;
+  while Instant::now() < deadline && !degraded {
+    mdns.tick().expect("tick");
+    assert!(
+      mdns
+        .services
+        .get(&handle)
+        .is_some_and(|ctx| !ctx.withdrawing),
+      "a full send buffer is a datagram that has not gone out YET; retiring a \
+       healthy advertisement over it is the expensive way to be wrong"
+    );
+    degraded = mdns.degraded_families().0;
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  if !degraded {
+    eprintln!("skipping: the service produced no refused transmit within the budget");
+    return;
+  }
+  let terminals = service_terminals(&mut mdns, handle);
+  assert!(
+    terminals.is_empty(),
+    "nothing terminal has happened to this service: {terminals:?}"
+  );
+
+  mdns
+    .sockets
+    .force_send_wouldblock_for_test(Family::V4, false);
+  let deadline = Instant::now() + Duration::from_secs(2);
+  let state = |mdns: &Mdns| mdns.services.get(&handle).map(|ctx| ctx.proto.state());
+  while Instant::now() < deadline && state(&mdns) == Some(ServiceState::Probing(0)) {
+    mdns.tick().expect("tick");
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  assert_eq!(
+    state(&mdns),
+    Some(ServiceState::Probing(1)),
+    "the service was never retired: the same registration picked its sequence \
+     back up the moment the socket accepted a byte"
+  );
+}
+
+/// The same over-eager direction, on the error that used to *define* permanence.
+///
+/// Linux reports `EMSGSIZE` for a write past the currently-known path MTU with
+/// `DF` set as well as for one past the hard maximum (udp(7)), and an mDNS
+/// datagram is three orders of magnitude inside that maximum when it happens. A
+/// classification keyed on the errno therefore retires a healthy service over a
+/// link whose next MTU probe would have carried it — which is why permanence is
+/// proved by `Family::max_udp_payload` and by nothing else.
+///
+/// Ends the way its `WouldBlock` sibling does, by letting the socket accept
+/// again and watching the same registration resume its §8.1 sequence: a retired
+/// context is skipped by every stage forever, so reaching `Probing(1)` is proof
+/// it was never retired.
+#[test]
+fn an_emsgsize_below_the_hard_limit_never_retires_a_sustained_producer() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let handle = mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-pathmtu._tcp.local.",
+      8085,
+    ))
+    .expect("register_service");
+  for family in [Family::V4, Family::V6] {
+    mdns.sockets.force_send_emsgsize_for_test(family, true);
+  }
+  // Asserted every tick rather than once at the end, for the reason the
+  // `WouldBlock` sibling gives: a retirement stops the transmits, so a check
+  // that ran only afterwards could not tell a retirement from a slow start.
+  let deadline = Instant::now() + Duration::from_secs(3);
+  let mut refused = false;
+  while Instant::now() < deadline && !refused {
+    mdns.tick().expect("tick");
+    assert!(
+      mdns
+        .services
+        .get(&handle)
+        .is_some_and(|ctx| !ctx.withdrawing),
+      "the datagram is far inside every family's hard UDP limit, so this refusal \
+       may clear on the very next attempt; retiring on it destroys a healthy \
+       service over a transient path MTU"
+    );
+    refused = too_large_refusals(&mut mdns) > 0;
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  if !refused {
+    eprintln!("skipping: no datagram was offered to the socket within the budget");
+    return;
+  }
+  let terminals = service_terminals(&mut mdns, handle);
+  assert!(
+    terminals.is_empty(),
+    "nothing terminal has happened to this service: {terminals:?}"
+  );
+
+  for family in [Family::V4, Family::V6] {
+    mdns.sockets.force_send_emsgsize_for_test(family, false);
+  }
+  let deadline = Instant::now() + Duration::from_secs(2);
+  let state = |mdns: &Mdns| mdns.services.get(&handle).map(|ctx| ctx.proto.state());
+  while Instant::now() < deadline && state(&mdns) == Some(ServiceState::Probing(0)) {
+    mdns.tick().expect("tick");
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  assert_eq!(
+    state(&mdns),
+    Some(ServiceState::Probing(1)),
+    "the registration picked its §8.1 sequence back up once the refusal cleared, \
+     which a retired one could never do"
+  );
+}
+
+/// One family refusing the size while the other carries the datagram is a
+/// PARTIAL round, and a partial round retires nothing.
+///
+/// Needs a real second family, so it skips loudly where IPv6 cannot be bound —
+/// the aggregate itself is pinned on every host by
+/// `undeliverable_is_every_reachable_family_refusing_the_size_and_nothing_less`.
+#[test]
+fn a_service_the_other_family_can_serve_is_never_retired() {
+  let Some(mut mdns) = dual_stack_mdns() else {
+    return;
+  };
+  let handle = mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-halfbig._tcp.local.",
+      8082,
+    ))
+    .expect("register_service");
+  // Only IPv6 refuses. IPv4 multicast on loopback works everywhere this suite
+  // runs, so every round is `{v4: Sent, v6: TooLarge}` — a datagram that
+  // manifestly CAN be carried.
+  mdns
+    .sockets
+    .force_payload_ceiling_for_test(Family::V6, Some(0));
+
+  let advertised = test_support::drive_to_advertised(&mut mdns, handle);
+  assert!(
+    mdns.sockets.forced_send_refusals_for_test(Family::V6) > 0,
+    "IPv6 must actually have been offered — and have refused — a datagram"
+  );
+  assert!(
+    mdns
+      .services
+      .get(&handle)
+      .is_some_and(|ctx| !ctx.withdrawing),
+    "one family put the records on a wire, so the datagram is deliverable and \
+     nothing about the other family's refusal may retire the service"
+  );
+  let terminals = service_terminals(&mut mdns, handle);
+  assert!(terminals.is_empty(), "{terminals:?}");
+  assert!(
+    advertised,
+    "the service went on to announce over the family that works"
+  );
+}
+
+/// The other half of the asymmetry: a `OneShot` reply that cannot be sent is a
+/// lost reply, never a dead service.
+///
+/// The core never re-arms a §6 response, so nothing is stuck and nothing needs
+/// bounding — while retiring on one would hand any peer on the link a way to
+/// tear down an established service by asking it a question whose answer does
+/// not fit.
+///
+/// The refusal is waited for well inside the next RFC 6762 §8.3 round: a §6
+/// multicast reply is jittered 20-120 ms, and the announcement that follows the
+/// one `drive_to_advertised` just watched land is a full second out. The budget
+/// below sits between the two, so the datagram whose refusal is observed is the
+/// reply.
+#[test]
+fn an_undeliverable_one_shot_reply_costs_the_reply_and_not_the_service() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let ty = "_hick-mio-bigreply._tcp.local.";
+  let handle = mdns
+    .register_service(test_support::service_spec(ty, 8083))
+    .expect("register_service");
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
+    return;
+  }
+  // Drop the lifecycle's own events; what this test reads is what comes AFTER.
+  let _ = service_terminals(&mut mdns, handle);
+
+  test_support::ingest(&mut mdns, &ptr_question(ty), Instant::now());
+  refuse_every_send_as_too_large(&mut mdns, true);
+  if !tick_until_a_send_is_refused_as_too_large(&mut mdns, Duration::from_millis(400)) {
+    return;
+  }
+
+  assert!(
+    mdns
+      .services
+      .get(&handle)
+      .is_some_and(|ctx| !ctx.withdrawing),
+    "a response the core will never re-arm costs exactly one unanswered \
+     question; the querier re-asks, and the service is untouched"
+  );
+  let terminals = service_terminals(&mut mdns, handle);
+  assert!(
+    terminals.is_empty(),
+    "no peer may retire a healthy service by asking it a question whose answer \
+     does not fit: {terminals:?}"
+  );
+  assert!(
+    mdns
+      .services
+      .get(&handle)
+      .is_some_and(|ctx| ctx.proto.advertises_instance()),
+    "the service still owns and advertises its instance name"
+  );
+}
+
+/// A PTR browse for `ty`, from a peer that wants the multicast (§6) reply.
+fn ptr_question(ty: &str) -> Vec<u8> {
+  use mdns_proto::wire::{Header, MessageBuilder};
+
+  let qname = mdns_proto::Name::try_from_str(ty).expect("query name");
+  let mut buf = vec![0u8; 512];
+  let mut b: MessageBuilder<'_> =
+    MessageBuilder::try_new(&mut buf, Header::new()).expect("message builder");
+  b.push_question(&qname, ResourceType::Ptr, ResourceClass::In, false)
+    .expect("push_question");
+  let n = b.finish().expect("finish");
+  buf.truncate(n);
+  buf
+}
+
+/// A query is always `Sustained` — RFC 6762 §5.2 has no one-shot form — so a
+/// question no reachable socket can carry retires it for the same reason a probe
+/// does, and for a sharper one: the §5.2 retry budget is spent only on an
+/// all-delivered send, so this query would re-ask forever without ever reaching
+/// its own ceiling.
+#[test]
+fn an_undeliverable_question_retires_the_query() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let handle = mdns
+    .start_query(test_support::query_spec("_hick-mio-bigq._tcp.local."))
+    .expect("start_query");
+  refuse_every_send_as_too_large(&mut mdns, true);
+  if !tick_until_a_send_is_refused_as_too_large(&mut mdns, Duration::from_secs(3)) {
+    return;
+  }
+  assert!(
+    !mdns.queries.contains_key(&handle),
+    "the question reached no wire and no retry ever can, so the query is \
+     retired rather than left re-asking for the life of the process"
+  );
+  let mut terminal = None;
+  while let Some(ev) = mdns.next_event() {
+    if let Event::QueryTerminal { handle: h, update } = ev
+      && h == handle
+    {
+      terminal = Some(update);
+    }
+  }
+  assert!(
+    terminal.is_some(),
+    "the caller must be told, instead of waiting on a browse that can never ask"
+  );
+}
+
 // ── the ingress interface gate, wired ───────────────────────────────────────
 
 /// The explicit loopback exception, through the real receive path.
@@ -2692,7 +3128,7 @@ fn credit_a_multicast_send(mdns: &mut Mdns, body: &[u8]) -> Option<()> {
 /// instant the following tick opened with.
 fn echo_matched_at_next_tick_top(mdns: &mut Mdns, family: Family, body: &[u8]) -> bool {
   let top = Instant::now();
-  mdns.selfsend.seal(top);
+  mdns.selfsend.seal_at(top);
   mdns.selfsend.take_at(
     family,
     body,
@@ -2898,7 +3334,7 @@ fn a_caller_gap_after_the_claim_window_opened_still_expires_the_credit() {
   // or re-anchoring on every seal, would make the suppression window a function
   // of the caller's loop rate instead of a bound.
   let top = Instant::now();
-  mdns.selfsend.seal(top);
+  mdns.selfsend.seal_at(top);
   let after_the_gap = top + STALL_PAST_TTL;
   assert!(
     !mdns.selfsend.take_at(
@@ -2911,7 +3347,7 @@ fn a_caller_gap_after_the_claim_window_opened_still_expires_the_credit() {
     "post-opportunity time is charged in full, caller stalls included, or the \
      false-suppression bound is not a bound"
   );
-  mdns.selfsend.seal(after_the_gap);
+  mdns.selfsend.seal_at(after_the_gap);
   assert_eq!(
     mdns.selfsend.len(),
     0,

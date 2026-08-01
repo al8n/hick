@@ -31,7 +31,7 @@ fn recorded_and_sealed(
   at: StdInstant,
 ) {
   t.record(family, body, sent);
-  t.seal(at);
+  t.seal_at(at);
 }
 
 #[test]
@@ -167,12 +167,12 @@ fn the_ttl_upper_bound_applies_to_ordered_mode_too() {
 
 // ── where the window starts, and where it does not ──────────────────────────
 //
-// The invariant these four hold: a credit's ageing must not begin until the
+// The invariant these five hold: a credit's ageing must not begin until the
 // first instant its echo is claimable — the top of the tick after the recording
 // tick — and from then on charges real monotonic elapsed time, including caller
-// latency. The first three defend the lower end (nothing inside the recording
-// tick may be charged), the fourth defends the upper end (everything after the
-// seal must be).
+// latency. The first four defend the lower end (nothing before the window opens
+// may be charged, including the seal's own sweep), the fifth defends the upper
+// end (everything after the seal must be).
 
 /// The defect class this anchor exists for, in its purest form.
 ///
@@ -216,7 +216,7 @@ fn the_seal_starts_an_unsealed_credit_at_age_zero() {
   // The recording tick ran long. The seal that follows is the credit's first
   // claim opportunity, so its age there is zero and the full TTL is ahead of it.
   let top = mono() + SELF_SEND_TTL + Duration::from_secs(5);
-  t.seal(top);
+  t.seal_at(top);
   assert!(
     t.take_at(
       Family::V4,
@@ -227,6 +227,41 @@ fn the_seal_starts_an_unsealed_credit_at_age_zero() {
     ),
     "a sealed credit gets the whole TTL measured from the seal, not a remainder \
      of it measured from the send"
+  );
+}
+
+/// The seal's own two phases, and the reading each one spends.
+///
+/// The sweep runs first and is a bulk one — up to `MAX_SELF_SEND_ENTRIES`
+/// credits weighed against the reading it started from — so by the time it
+/// returns that reading can be arbitrarily stale. Anchoring the batch it is
+/// about to open at that same reading is the defect: the window opens already
+/// expired, the very first claim against it is refused, and this endpoint
+/// ingests its own loopback as peer traffic — a phantom conflict against itself
+/// and the RFC 6762 §9 rename that follows.
+///
+/// Slept for real, past the TTL, because that is the condition: `seal` reads the
+/// monotonic clock itself and `StdInstant` offers no constructor to fake it
+/// with. The pause is injected into `seal` rather than into a copy of its body,
+/// so a seal that went back to one reading fails here.
+#[test]
+fn a_stall_inside_the_seal_cannot_expire_the_batch_that_seal_opens() {
+  let mut t = SelfSendTracker::new();
+  let sent = wall();
+  t.record(Family::V4, b"announcement", sent);
+  t.pause_next_seal_for_test(STALL_PAST_TTL);
+  t.seal();
+  assert!(
+    t.take(
+      Family::V4,
+      b"announcement",
+      sent + Duration::from_secs(3),
+      MatchMode::Degraded
+    ),
+    "the whole of the seal's pre-claim work happens before the anchor is read, \
+     so a credit recorded by the previous tick is claimable however long that \
+     work took — anchoring it at the reading the sweep already spent hands a \
+     newly-opened window an anchor from before it"
   );
 }
 
@@ -257,7 +292,7 @@ fn sealing_sweeps_entries_older_than_the_ttl() {
   assert_eq!(t.len(), 1);
   t.record(Family::V4, b"fresh", sent);
   let much_later = at + SELF_SEND_TTL + Duration::from_secs(1);
-  t.seal(much_later);
+  t.seal_at(much_later);
   // The stale entry was swept by the seal, not merely outvoted.
   assert_eq!(t.len(), 1);
   assert!(!t.take_at(Family::V4, b"stale", sent, much_later, MatchMode::Degraded));
@@ -297,7 +332,7 @@ fn a_caller_gap_after_the_seal_still_expires_the_credit() {
     "elapsed time after the first claim opportunity is charged in full, or the \
      false-suppression bound is not a bound at all"
   );
-  t.seal(after_the_gap);
+  t.seal_at(after_the_gap);
   assert_eq!(
     t.len(),
     0,
@@ -334,7 +369,7 @@ fn an_ipv6_echo_read_first_cannot_steal_the_ipv4_credit() {
   t.record(Family::V4, b"announcement", v4_sent);
   t.record(Family::V6, b"announcement", v6_sent);
   let top = mono();
-  t.seal(top);
+  t.seal_at(top);
 
   // The rotor reads IPv6 first. Its kernel stamp is at-or-after the IPv6 send
   // but AFTER the IPv4 send too, so both credits look eligible on content.
@@ -411,11 +446,12 @@ fn a_credit_matches_only_the_body_it_fingerprints() {
 
 /// A stall longer than [`SELF_SEND_TTL`], slept for real.
 ///
-/// `record` reads the monotonic clock itself — that is the whole point of the
-/// reclaim being live rather than anchored on anything the send carries — so the
-/// two cap tests below cannot fake the elapsed time, and `StdInstant` offers no
-/// constructor to fake it with. Same value and same reason as
-/// `driver/tests.rs`'s `STALL_PAST_TTL`.
+/// `record` and `seal` read the monotonic clock themselves — that is the whole
+/// point of both the reclaim and the anchor being live rather than taken from
+/// anything a caller hands in — so neither the two cap tests below nor
+/// `a_stall_inside_the_seal_cannot_expire_the_batch_that_seal_opens` can fake the
+/// elapsed time, and `StdInstant` offers no constructor to fake it with. Same
+/// value and same reason as `driver/tests.rs`'s `STALL_PAST_TTL`.
 const STALL_PAST_TTL: Duration = SELF_SEND_TTL.saturating_add(Duration::from_millis(50));
 
 /// Seed a FULL tracker directly, every entry anchored at `aged_from`.
@@ -435,6 +471,7 @@ fn full_tracker(sent: SystemTime, aged_from: Option<StdInstant>) -> SelfSendTrac
         aged_from,
       })
       .collect(),
+    ..SelfSendTracker::new()
   }
 }
 
@@ -462,7 +499,7 @@ fn the_cap_reclaims_dead_credits_rather_than_refusing_a_new_one() {
   // And the new credit behaves like any other: sealed at the next tick's top,
   // then claimed by its own echo.
   let top = StdInstant::now();
-  t.seal(top);
+  t.seal_at(top);
   assert!(
     t.take_at(
       Family::V4,
@@ -554,7 +591,7 @@ fn full_tracker_sealed_at(at: StdInstant) -> SelfSendTracker {
   for i in 0..MAX_SELF_SEND_ENTRIES {
     t.record(Family::V4, &(i as u64).to_le_bytes(), wall());
   }
-  t.seal(at);
+  t.seal_at(at);
   assert_eq!(
     t.len(),
     MAX_SELF_SEND_ENTRIES,
@@ -627,9 +664,9 @@ fn insertion_order_is_expiry_order() {
   let mut t = SelfSendTracker::new();
   let t0 = mono();
   t.record(Family::V4, b"first", wall());
-  t.seal(t0);
+  t.seal_at(t0);
   t.record(Family::V4, b"second", wall());
-  t.seal(t0 + Duration::from_millis(10));
+  t.seal_at(t0 + Duration::from_millis(10));
   t.record(Family::V4, b"third", wall());
   let anchors = t.anchors_for_test();
   let mut previous: Option<StdInstant> = None;

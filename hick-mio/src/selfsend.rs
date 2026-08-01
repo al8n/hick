@@ -216,15 +216,30 @@ pub(crate) struct SelfSendTracker {
   ///   expiry there is — so it can only ever go at the back;
   /// * [`Self::seal`] stamps every unsealed credit with one instant. The
   ///   unsealed credits are exactly the suffix appended since the previous seal,
-  ///   and the driver seals with the tick's monotonic `now`, which is
-  ///   non-decreasing across ticks — so the suffix takes an anchor at or after
-  ///   every anchor already assigned;
+  ///   and the anchor is a monotonic reading taken inside that call — so the
+  ///   suffix takes an anchor at or after every anchor already assigned;
   /// * [`Self::take`] and [`Self::reclaim_expired_sealed`] only ever remove, and
   ///   removal preserves relative order.
   ///
-  /// The seal's non-decreasing instant is the one half a caller could break, and
-  /// it is [`Self::seal`]'s stated contract.
+  /// The non-decreasing anchor was the one half a caller could break while
+  /// [`Self::seal`] still took one, and deleting that parameter is what turned
+  /// its contract into a property of the monotonic clock.
   entries: Vec<Credit>,
+  /// A stall injected **between the expiry sweep and the read that anchors the
+  /// batch the seal is about to open**, consumed by the seal that observes it.
+  ///
+  /// It stands in for the one thing no test can ask a real host for: a sweep of
+  /// [`MAX_SELF_SEND_ENTRIES`] credits, or a preemption anywhere inside it,
+  /// running longer than [`SELF_SEND_TTL`]. That stretch is pre-claim time — the
+  /// batch's window has not opened yet — so charging it to the batch hands a
+  /// newly-opened window an already-expired anchor, and the credit's own echo is
+  /// then ingested as peer traffic.
+  ///
+  /// Injected into [`Self::seal`] itself rather than into a test-only copy of
+  /// its body, so a seal that went back to anchoring on the sweep's reading
+  /// fails the test instead of passing beside it.
+  #[cfg(test)]
+  forced_seal_pause: Option<Duration>,
 }
 
 impl SelfSendTracker {
@@ -232,6 +247,8 @@ impl SelfSendTracker {
   pub(crate) fn new() -> Self {
     Self {
       entries: Vec::new(),
+      #[cfg(test)]
+      forced_seal_pause: None,
     }
   }
 
@@ -384,29 +401,29 @@ impl SelfSendTracker {
   /// must not quietly re-acquire the power to break it — conflating the two is
   /// what made the old record-time sweep a defect rather than a cleanup.
   ///
-  /// [`Self::seal`] runs it once per tick as ordinary garbage collection, on the
-  /// instant it is about to anchor the survivors at. [`Self::record`] runs it
-  /// only at [`MAX_SELF_SEND_ENTRIES`], where the alternative is refusing a live
-  /// send's credit to keep corpses resident.
+  /// [`Self::seal`] runs it once per tick as ordinary garbage collection, on a
+  /// reading of its own — spent here and not reused to anchor the survivors, who
+  /// are anchored at a later reading taken once this has returned.
+  /// [`Self::record`] runs it only at [`MAX_SELF_SEND_ENTRIES`], where the
+  /// alternative is refusing a live send's credit to keep corpses resident.
   fn reclaim_expired_sealed(&mut self, now: StdInstant) {
     self.entries.retain(|c| still_live(now, c.aged_from));
   }
 
-  /// Open a claim window at monotonic instant `now`: expire every credit whose
-  /// window has run out, and start the clock on every credit that does not have
-  /// one yet.
+  /// Open a claim window: expire every credit whose window has run out, and
+  /// **then** start the clock on every credit that does not have one yet.
   ///
   /// Called once per tick, at the **top**, immediately before the receive stage
-  /// — so `now` is precisely the first instant at which a credit recorded by the
-  /// previous tick can be claimed, which is the only instant [`SELF_SEND_TTL`]
-  /// may be measured from. See that constant for why not earlier (the recording
+  /// — so the batch it opens is exactly the credits the previous tick recorded,
+  /// and the anchor it stamps them with is the first instant at which any of
+  /// their echoes can be claimed. That is the only instant [`SELF_SEND_TTL`] may
+  /// be measured from: see that constant for why not earlier (the recording
   /// tick's outbound stretch is structurally claim-free) and why not later
   /// (post-opportunity time bounds false suppression and must be charged).
   ///
   /// Top-of-tick rather than end-of-outbound on purpose. An end-of-tick seal
-  /// would need its own clock read and would carry a placement obligation that
-  /// a future stage placed after it would silently break, reopening exactly this
-  /// hole; a top-of-tick seal reuses the instant the tick already took and stays
+  /// would carry a placement obligation that a future stage placed after it
+  /// would silently break, reopening exactly this hole; a top-of-tick seal stays
   /// correct however the outbound stages are reordered. It also gives a credit
   /// age zero at its first claim opportunity, instead of arriving there having
   /// already spent one inter-tick caller gap.
@@ -418,18 +435,86 @@ impl SelfSendTracker {
   /// thing they share: this is where the window opens, and it is the only place
   /// that can open one.
   ///
-  /// # Contract: `now` must be non-decreasing across calls
+  /// # It takes no instant, and the two phases do not share a reading
   ///
-  /// The driver satisfies it by construction — `now` is the tick's own
-  /// monotonic read — and [`SelfSendTracker::entries`]'s expiry order depends on
-  /// it: this is the one operation that can assign an anchor, so sealing with an
-  /// instant *earlier* than a previous seal's is the only way to put a
-  /// later-inserted credit ahead of an earlier one in expiry order, which is
-  /// what [`Self::admit`]'s `O(1)` front check reads.
-  pub(crate) fn seal(&mut self, now: StdInstant) {
-    self.reclaim_expired_sealed(now);
+  /// **A reading is spent by its first consumer**, and this call has two
+  /// consumers in a fixed order. The sweep is first, and it is a bulk one:
+  /// bounded only by [`MAX_SELF_SEND_ENTRIES`], it weighs up to 65 536 credits
+  /// against the reading it started from. Handing that same, already-spent
+  /// reading to the anchor is what made a caller-supplied `now` unsound — a long
+  /// sweep, or a preemption anywhere inside it, gave a window that had only just
+  /// opened an anchor from before it, and the first claim against that credit
+  /// then found it expired. A credit lost that way is not a lost byte: it is this
+  /// endpoint ingesting its own loopback as peer traffic, a phantom conflict
+  /// against itself and the RFC 6762 §9 rename that follows.
+  ///
+  /// So sealing is batch-oriented. Every piece of pre-claim work — the sweep, and
+  /// anything a later pass adds before the anchor — completes first, and the
+  /// anchor is read after all of it, because that instant is not a convenient
+  /// earlier reading but the thing being defined. The caller's parameter is
+  /// deleted rather than moved for the same reason it was deleted from
+  /// [`Self::take`]: a parameter is the channel through which a reading taken
+  /// somewhere else arrives, and moving the read nearer never removes the
+  /// channel.
+  ///
+  /// The sweep spending a stale reading is harmless in the only direction it can
+  /// be wrong: a credit that died while the sweep ran is merely retained until
+  /// the next seal, and [`Self::take`] refuses it meanwhile.
+  ///
+  /// It also settles the non-decreasing-anchor contract this used to state and
+  /// rely on a caller for. The anchor is now a monotonic reading taken here, so
+  /// each seal's anchor is at or after every anchor already assigned and
+  /// [`SelfSendTracker::entries`]'s expiry order — which [`Self::admit`]'s `O(1)`
+  /// front check reads — holds by construction.
+  pub(crate) fn seal(&mut self) {
+    // The sweep completes FIRST, on a reading of its own.
+    self.reclaim_expired_sealed(StdInstant::now());
+    // Deliberately between the sweep and the anchor: that is the stretch a
+    // 65 536-entry sweep, or a preemption inside it, occupies for real.
+    #[cfg(test)]
+    if let Some(pause) = self.forced_seal_pause.take()
+      && !pause.is_zero()
+    {
+      std::thread::sleep(pause);
+    }
+    // Read after every piece of pre-claim work above, and nowhere else.
+    self.open_window_at(StdInstant::now());
+  }
+
+  /// [`Self::seal`] with both phases pinned to `at`, so a test can place a tick
+  /// top anywhere without sleeping to it.
+  ///
+  /// `#[cfg(test)]`, permanently, and the gate is the point: production reaches
+  /// a seal only through [`Self::seal`], which reads the clock for each phase
+  /// itself, so there is no build in which a caller's instant can anchor a
+  /// window. Collapsing the two readings is exactly what makes this usable for
+  /// the tests whose subject is *not* the gap between them — `StdInstant` has no
+  /// constructor, so a chosen tick top cannot be expressed any other way. The
+  /// gap itself is tested through [`Self::pause_next_seal_for_test`], against
+  /// the real [`Self::seal`]. Same seam as [`Self::take_at`].
+  #[cfg(test)]
+  pub(crate) fn seal_at(&mut self, at: StdInstant) {
+    self.reclaim_expired_sealed(at);
+    self.open_window_at(at);
+  }
+
+  /// Stall the next [`Self::seal`] between its sweep and its anchor. See
+  /// [`SelfSendTracker::forced_seal_pause`].
+  #[cfg(test)]
+  pub(crate) fn pause_next_seal_for_test(&mut self, pause: Duration) {
+    self.forced_seal_pause = Some(pause);
+  }
+
+  /// Start the clock on every credit that does not have one yet, at
+  /// `opened_at`.
+  ///
+  /// `get_or_insert`, never an unconditional assignment: a credit already sealed
+  /// keeps its original anchor, or a caller ticking faster than
+  /// [`SELF_SEND_TTL`] would push every credit's expiry forward forever and the
+  /// false-suppression bound would not be a bound at all.
+  fn open_window_at(&mut self, opened_at: StdInstant) {
     for credit in &mut self.entries {
-      credit.aged_from.get_or_insert(now);
+      credit.aged_from.get_or_insert(opened_at);
     }
   }
 
@@ -607,10 +692,10 @@ impl SelfSendTracker {
 /// live unconditionally: its window has not opened, so there is no age to
 /// compare and nothing it could have outlived. `saturating_duration_since`
 /// likewise reads a `now` before `aged_from` as an age of zero rather than as an
-/// expiry: a monotonic clock cannot really run backwards, and
-/// [`SelfSendTracker::seal`]'s own sweep legitimately weighs a credit against
-/// the very instant it is about to anchor it at. Zero is the safe answer either
-/// way — it retains the credit.
+/// expiry: a monotonic clock cannot really run backwards, so an age computed
+/// from a reading that predates the anchor is a reading taken out of order
+/// rather than an expired credit. Zero is the safe answer either way — it
+/// retains the credit.
 fn still_live(now: StdInstant, aged_from: Option<StdInstant>) -> bool {
   match aged_from {
     // Unsealed: recorded this tick, and no claim was possible yet.

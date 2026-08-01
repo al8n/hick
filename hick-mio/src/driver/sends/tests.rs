@@ -160,6 +160,72 @@ fn a_send_no_family_could_be_offered_delivers_nothing() {
   );
 }
 
+#[test]
+fn a_too_large_family_is_missed_exactly_like_a_refused_one() {
+  let base = StdInstant::now();
+  let mut health = SendHealth::new();
+  let summary = settle(&mut health, report(sent(base, 1), SendOutcome::TooLarge));
+  assert_eq!(
+    summary.delivery.v6(),
+    FamilyDelivery::Missed,
+    "the socket is there and the datagram was meant for it, so it MISSED — \
+     `Unobligated` would tell the core this family owes nothing and let the \
+     phase advance on IPv4's strength alone"
+  );
+  assert!(summary.delivery.any_delivered() && !summary.delivery.all_delivered());
+  assert!(
+    !summary.undeliverable,
+    "IPv4 put it on a wire, so it is manifestly deliverable"
+  );
+}
+
+/// The projection is unchanged by permanence: `delivery` is the same all-missed
+/// shape a transient round produces, and the difference rides beside it.
+///
+/// It must be that way round. The core's per-family vocabulary has no term for
+/// "and there is no point re-arming it" — its only unused shape is
+/// `Unobligated`, which means an ABSENT socket — so saying it inside the confirm
+/// could only be said by lying about the obligated set.
+#[test]
+fn an_undeliverable_round_confirms_exactly_as_a_refused_one_does() {
+  let mut health = SendHealth::new();
+  let refused = settle(
+    &mut health,
+    report(SendOutcome::Failed, SendOutcome::Failed),
+  );
+  let mut health = SendHealth::new();
+  let oversized = settle(
+    &mut health,
+    report(SendOutcome::TooLarge, SendOutcome::TooLarge),
+  );
+  assert_eq!(oversized.delivery, refused.delivery);
+  assert_eq!(oversized.sent, refused.sent);
+  assert_eq!(oversized.accepted_at, refused.accepted_at);
+  assert!(
+    !refused.undeliverable,
+    "a may-clear refusal is never evidence that a retry is pointless"
+  );
+  assert!(
+    oversized.undeliverable,
+    "every reachable family refused the SIZE, so no retry can help"
+  );
+}
+
+#[test]
+fn a_single_stack_host_refusing_the_size_has_refused_it_everywhere() {
+  let mut health = SendHealth::new();
+  let summary = settle(
+    &mut health,
+    report(SendOutcome::TooLarge, SendOutcome::NoSocket),
+  );
+  assert!(
+    summary.undeliverable,
+    "the absent family was never offered the datagram, so it is no reason to \
+     keep retrying on the one family this host has"
+  );
+  assert_eq!(summary.delivery.v6(), FamilyDelivery::Unobligated);
+}
+
 // ── family health is observability, and nothing the core is told ──────
 
 /// The laundering this driver must never do: a present family that keeps failing
@@ -213,6 +279,22 @@ fn a_gated_family_is_never_charged_to_health() {
     (false, false),
     "no syscall was made and the deferral is this driver's own, so it is no \
      evidence at all about the link"
+  );
+}
+
+#[test]
+fn a_family_refusing_the_size_is_charged_to_health_like_any_other_refusal() {
+  let base = StdInstant::now();
+  let mut health = SendHealth::new();
+  for _ in 0..MAX_CONSECUTIVE_SEND_FAILURES {
+    settle(&mut health, report(sent(base, 1), SendOutcome::TooLarge));
+  }
+  assert_eq!(
+    health.degraded_families(),
+    (false, true),
+    "a socket that refuses everything offered to it is a link a caller \
+     debugging \"my peers do not see me over IPv6\" must be told about, \
+     whatever the reason for the refusal"
   );
 }
 

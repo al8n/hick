@@ -256,9 +256,30 @@ impl Mdns {
   /// # Errors
   ///
   /// Returns [`ServerError::NoFamilyEnabled`] when the options disable both
-  /// families, and the corresponding bind error when the interface has an
+  /// families, [`ServerError::BufferSizeUnsupported`] when either configured
+  /// buffer size is outside
+  /// [`ServerOptions::MIN_BUFFER_SIZE`]`..=`[`ServerOptions::MAX_BUFFER_SIZE`],
+  /// [`ServerError::BufferAllocation`] when the allocator refuses a buffer whose
+  /// size is in range, and the corresponding bind error when the interface has an
   /// address in a requested family but the socket could not be bound or joined.
+  ///
+  /// # Both buffers are settled before anything is bound
+  ///
+  /// Both sizes come from public setters that take a bare `usize`, and both used
+  /// to reach an infallible `vec![0; n]`: `usize::MAX` aborted the process on a
+  /// deterministic capacity overflow, and a large-but-representable size could
+  /// reach the allocator's own abort path. A malformed or externally-sourced
+  /// configuration must be an error, not a dead process.
+  ///
+  /// So the range check runs first, then both reservations, and only then is a
+  /// socket bound. Binding first would leave a joined multicast group and two
+  /// descriptors to unwind for a configuration that was never going to work, and
+  /// would put the process-ending allocation *after* the point where this
+  /// endpoint has side effects on the link.
   pub fn new(opts: ServerOptions) -> Result<Self, ServerError> {
+    // Before the bind, and before any allocation sized by them.
+    let send_buf = alloc_buf(opts.max_payload_size(), "with_max_payload_size")?;
+    let recv_buf = alloc_buf(opts.max_recv_packet_size(), "with_max_recv_packet_size")?;
     // rand 0.10 removed `from_entropy`; seed StdRng from the OS-seeded thread RNG.
     let rng = StdRng::from_rng(&mut rand::rng());
     // `try_new` returns `Self`, not a `Result`, despite the name.
@@ -287,8 +308,8 @@ impl Mdns {
       events: EventQueue::new(),
       local_subnets: collect_local_subnets(bound_interface),
       bound_interface,
-      send_buf: vec![0u8; opts.max_payload_size()],
-      recv_buf: vec![0u8; opts.max_recv_packet_size()],
+      send_buf,
+      recv_buf,
       svc_scratch: Vec::new(),
       query_scratch: Vec::new(),
       tx_scratch: Vec::new(),
@@ -678,6 +699,43 @@ impl Mdns {
     self.shutdown();
     self.drain_withdrawals();
   }
+}
+
+/// One zeroed scratch buffer of `size` bytes, or the reason there is none.
+///
+/// `setting` names the [`ServerOptions`] setter that chose `size`, so the error
+/// says which one to correct.
+///
+/// # Neither step may be skipped for the other
+///
+/// The range check is a **protocol** bound — below one DNS header nothing can be
+/// encoded or parsed, above the largest UDP payload either family carries nothing
+/// can be sent or received — and it is what makes an absurd configuration a
+/// reported error rather than a memory decision. `try_reserve_exact` is the
+/// **implementation** bound, and it stays even though the range check already
+/// caps the request at 64 KiB: an allocation that small is unlikely to fail, not
+/// impossible to, and `vec![0; n]` answers a failure by ending the process. The
+/// resize below cannot grow the vector past what was just reserved, so it cannot
+/// reach that path.
+fn alloc_buf(size: usize, setting: &'static str) -> Result<Vec<u8>, ServerError> {
+  if !(ServerOptions::MIN_BUFFER_SIZE..=ServerOptions::MAX_BUFFER_SIZE).contains(&size) {
+    return Err(ServerError::BufferSizeUnsupported {
+      setting,
+      requested: size,
+      min: ServerOptions::MIN_BUFFER_SIZE,
+      max: ServerOptions::MAX_BUFFER_SIZE,
+    });
+  }
+  let mut buf = Vec::new();
+  buf
+    .try_reserve_exact(size)
+    .map_err(|source| ServerError::BufferAllocation {
+      setting,
+      requested: size,
+      source,
+    })?;
+  buf.resize(size, 0u8);
+  Ok(buf)
 }
 
 /// Retire `handle` and hand its RFC 6762 §10.1 goodbye to the endpoint.

@@ -1,6 +1,80 @@
 use mio::{Poll, Token};
 
-use crate::driver::test_support;
+use crate::{Mdns, ServerError, ServerOptions, driver::test_support};
+
+/// A configured buffer size must be an ERROR, never a dead process.
+///
+/// Both setters take a bare `usize` and both sizes reached an infallible
+/// `vec![0; n]`: `usize::MAX` aborts on a deterministic capacity overflow and a
+/// large-but-representable size can reach the allocator's abort path, so a
+/// malformed or externally-sourced configuration ended the process instead of
+/// being reported. The boundaries are pinned on both sides of both ends, because
+/// a bound that is off by one silently refuses a legal size or admits an
+/// impossible one.
+#[test]
+fn an_absurd_configured_buffer_size_is_reported_and_never_allocated() {
+  let too_big = [
+    usize::MAX,
+    ServerOptions::MAX_BUFFER_SIZE + 1,
+    // A size that is representable, and that no machine this runs on can supply.
+    1 << 46,
+  ];
+  let too_small = [0, ServerOptions::MIN_BUFFER_SIZE - 1];
+
+  for size in too_big.into_iter().chain(too_small) {
+    for (setting, opts) in [
+      (
+        "with_max_payload_size",
+        ServerOptions::new().with_max_payload_size(size),
+      ),
+      (
+        "with_max_recv_packet_size",
+        ServerOptions::new().with_max_recv_packet_size(size),
+      ),
+    ] {
+      // Both families disabled, so `Sockets::bind` — whose FIRST act is to
+      // reject that — would answer `NoFamilyEnabled`. Getting the size error
+      // instead is what proves nothing was bound before the check ran.
+      let err = Mdns::new(opts.with_ipv4(false).with_ipv6(false))
+        .err()
+        .expect("an unusable buffer size must be reported, not allocated");
+      match err {
+        ServerError::BufferSizeUnsupported {
+          setting: named,
+          requested,
+          min,
+          max,
+        } => {
+          assert_eq!(named, setting, "the error must name the setter to correct");
+          assert_eq!(requested, size);
+          assert_eq!(min, ServerOptions::MIN_BUFFER_SIZE);
+          assert_eq!(max, ServerOptions::MAX_BUFFER_SIZE);
+        }
+        other => panic!("{setting} of {size}: expected a buffer-size error, got {other:?}"),
+      }
+    }
+  }
+
+  // And the ends themselves are legal, so the bound refuses nothing usable. The
+  // bind is what fails here, and that it is reached at all is the assertion.
+  for size in [
+    ServerOptions::MIN_BUFFER_SIZE,
+    ServerOptions::MAX_BUFFER_SIZE,
+  ] {
+    for opts in [
+      ServerOptions::new().with_max_payload_size(size),
+      ServerOptions::new().with_max_recv_packet_size(size),
+    ] {
+      let err = Mdns::new(opts.with_ipv4(false).with_ipv6(false))
+        .err()
+        .expect("no family is enabled, so this cannot succeed");
+      assert!(
+        matches!(err, ServerError::NoFamilyEnabled),
+        "a size at the bound must pass the check and reach the bind: {err:?}"
+      );
+    }
+  }
+}
 
 #[test]
 fn owns_claims_both_reserved_tokens_and_nothing_else() {

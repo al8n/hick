@@ -506,10 +506,11 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
   assert_eq!(stamps(&v4_only), vec![t1]);
 
   // None of these produced a loopback copy: one was never offered the datagram,
-  // one was held back by the wire gate, and one was refused outright.
+  // two were refused, and one was held back by the wire gate.
   for absent in [
     SendOutcome::Gated,
     SendOutcome::Failed,
+    SendOutcome::TooLarge,
     SendOutcome::NoSocket,
   ] {
     let r = SendReport {
@@ -519,6 +520,91 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
     };
     assert_eq!(stamps(&r).len(), 0, "{absent:?} must not yield a credit");
   }
+}
+
+/// The permanent-undeliverability aggregate, over every per-family shape a
+/// fan-out can have.
+///
+/// Pure arithmetic over [`SendReport`], so it is pinned identically on a host
+/// with no IPv6 socket and on one with two working families. The two directions
+/// it can be wrong in cost very different things — a `true` here retires a live
+/// registration, a `false` leaves it retrying a datagram forever — so the whole
+/// 5x5 matrix is enumerated rather than sampled.
+#[test]
+fn undeliverable_is_every_reachable_family_refusing_the_size_and_nothing_less() {
+  let mono = std::time::Instant::now();
+  let sent = sent_at(SystemTime::UNIX_EPOCH, mono);
+  let all = [
+    sent,
+    SendOutcome::Gated,
+    SendOutcome::Failed,
+    SendOutcome::TooLarge,
+    SendOutcome::NoSocket,
+  ];
+  for v4 in all {
+    for v6 in all {
+      let report = SendReport {
+        v4,
+        v6,
+        loops_back: true,
+      };
+      // Stated independently of the implementation: SOME family called the
+      // datagram too large, and every family that was not absent said the same.
+      let reachable = [v4, v6]
+        .into_iter()
+        .filter(|o| !matches!(o, SendOutcome::NoSocket));
+      let want = reachable
+        .clone()
+        .any(|o| matches!(o, SendOutcome::TooLarge))
+        && reachable.count()
+          == [v4, v6]
+            .into_iter()
+            .filter(|o| matches!(o, SendOutcome::TooLarge))
+            .count();
+      assert_eq!(
+        report.undeliverable(),
+        want,
+        "v4={v4:?} v6={v6:?}: a datagram is permanently undeliverable only when \
+         every family with a socket refused its SIZE"
+      );
+    }
+  }
+
+  // The four rows worth naming, so a future edit that flips one fails against a
+  // sentence rather than against a loop.
+  let case = |v4, v6| {
+    SendReport {
+      v4,
+      v6,
+      loops_back: true,
+    }
+    .undeliverable()
+  };
+  assert!(
+    case(SendOutcome::TooLarge, SendOutcome::TooLarge),
+    "both families refused the size: nothing can ever carry it"
+  );
+  assert!(
+    case(SendOutcome::TooLarge, SendOutcome::NoSocket),
+    "a family with no socket is not evidence to the contrary — the one family \
+     this host HAS refused it"
+  );
+  assert!(
+    !case(SendOutcome::TooLarge, SendOutcome::Failed),
+    "the other family may clear, so the round is mixed and must be waited for"
+  );
+  assert!(
+    !case(SendOutcome::TooLarge, SendOutcome::Gated),
+    "a gated family carries the SAME datagram on its next round"
+  );
+  assert!(
+    !case(SendOutcome::TooLarge, sent),
+    "one family put it on a wire, so it is manifestly deliverable"
+  );
+  assert!(
+    !case(SendOutcome::NoSocket, SendOutcome::NoSocket),
+    "no socket anywhere is an empty obligated set, not a refusal"
+  );
 }
 
 #[test]
@@ -712,23 +798,137 @@ fn a_successful_send_bumps_packets_tx_and_bytes_tx() {
   );
 }
 
+/// A payload past the hard ceiling a UDP/IPv4 datagram can ever carry
+/// (65535-byte max IP total length, minus a 20-byte IPv4 header and an 8-byte
+/// UDP header = 65507). No platform can send it — a protocol limit the kernel
+/// enforces before it even looks at routing, unlike the multicast egress
+/// `a_multicast_send_reports_one_outcome_per_bound_family` deliberately does NOT
+/// assert on because it genuinely varies by host. It is the one deterministic
+/// way to force a real `send_to` failure, and the only way to get the REAL
+/// oversized errno out of a healthy socket.
+///
+/// Well past what any configuration can produce — `Mdns::new` caps the encode
+/// scratch at
+/// [`ServerOptions::MAX_BUFFER_SIZE`](crate::ServerOptions::MAX_BUFFER_SIZE) —
+/// and deliberately so: the subject here is the kernel's own ceiling, not the
+/// crate's, and asking well past it leaves no doubt which one answered.
+const OVERSIZED_FOR_ANY_UDP_DATAGRAM: usize = 70_000;
+
+/// The classification that decides whether a producer is retired, checked
+/// against a REAL kernel.
+///
+/// `Family::max_udp_payload` is a hard-coded number. If it were above the
+/// kernel's own ceiling, a datagram the kernel refuses forever would fall back
+/// to `SendOutcome::Failed` and the driver would keep retrying it until the
+/// process ends — the exact defect the distinction exists to close, restored
+/// quietly and passing every test that injects a refusal rather than provoking
+/// one. This is the one test that cannot be fooled that way: nothing here is
+/// injected, and no hook is set.
+#[test]
+fn an_oversized_datagram_the_kernel_can_never_carry_is_reported_too_large() {
+  let Some(mut socks) = loopback_sockets(ServerOptions::default().with_ipv6(false)) else {
+    return;
+  };
+  let oversized = vec![0u8; OVERSIZED_FOR_ANY_UDP_DATAGRAM];
+  let outcome = socks.send_one(Family::V4, &oversized, MDNS_V4, &Ungated);
+  assert_eq!(
+    outcome,
+    SendOutcome::TooLarge,
+    "this body is past `Family::max_udp_payload` and the kernel refused it, so \
+     reporting anything but a permanent refusal leaves it retried forever: \
+     {outcome:?}"
+  );
+  // Retrying is exactly what cannot help: the same bytes on the same socket are
+  // refused identically, which is the whole content of the variant.
+  assert_eq!(
+    socks.send_one(Family::V4, &oversized, MDNS_V4, &Ungated),
+    SendOutcome::TooLarge
+  );
+  // And the ONLY thing that is permanent about it is the datagram. The same
+  // socket carries a legal one immediately afterwards.
+  assert!(
+    matches!(
+      socks.send_one(Family::V4, b"legal", MDNS_V4, &Ungated),
+      SendOutcome::Sent { .. }
+    ),
+    "the refusal is a property of the datagram, never of the socket"
+  );
+  // The hard limit is where the answer changes, and the byte on each side of it
+  // is what pins that. `65 507 + 1` is the smallest body IPv4 can never carry.
+  assert_eq!(Family::V4.max_udp_payload(), 65_507);
+  assert_eq!(Family::V6.max_udp_payload(), 65_527);
+  let one_past = vec![0u8; Family::V4.max_udp_payload() + 1];
+  assert_eq!(
+    socks.send_one(Family::V4, &one_past, MDNS_V4, &Ungated),
+    SendOutcome::TooLarge,
+    "one byte past the family's hard limit is already impossible"
+  );
+}
+
+/// The direction that must not be taken wrongly, and the reason the errno was
+/// dropped from the classification.
+///
+/// Linux answers `EMSGSIZE` for a write past the *currently known* path MTU with
+/// `DF` set as well as for one past the hard maximum (udp(7)). The first clears —
+/// an MTU probe, a route change — and the datagram is far inside the limit while
+/// it happens. Retiring on it destroys a healthy service over a link that was
+/// about to come back, so a refused datagram within
+/// [`Family::max_udp_payload`](crate::socket::Family::max_udp_payload) is
+/// [`SendOutcome::Failed`] whatever the kernel called it.
+#[test]
+fn an_emsgsize_below_the_hard_limit_is_transient_and_retried() {
+  let Some(mut socks) = loopback_sockets(ServerOptions::default().with_ipv6(false)) else {
+    return;
+  };
+  // An ordinary mDNS-sized body: three orders of magnitude inside the limit, and
+  // the size a path-MTU refusal actually happens at.
+  let body = vec![0u8; 1200];
+  assert!(body.len() <= Family::V4.max_udp_payload());
+  socks.force_send_emsgsize_for_test(Family::V4, true);
+  let outcome = socks.send_one(Family::V4, &body, MDNS_V4, &Ungated);
+  assert_eq!(
+    outcome,
+    SendOutcome::Failed,
+    "an oversized-datagram errno on a datagram that is not oversized proves \
+     nothing about the datagram, and reading it as permanent retires a service \
+     whose next attempt would have succeeded: {outcome:?}"
+  );
+  assert!(
+    !SendReport {
+      v4: outcome,
+      v6: SendOutcome::NoSocket,
+      loops_back: true,
+    }
+    .undeliverable(),
+    "and the aggregate the driver retires on must not see it either"
+  );
+  // Which is what "transient" means: the same bytes on the same socket once the
+  // condition clears.
+  socks.force_send_emsgsize_for_test(Family::V4, false);
+  assert!(
+    matches!(
+      socks.send_one(Family::V4, &body, MDNS_V4, &Ungated),
+      SendOutcome::Sent { .. }
+    ),
+    "the retry the transient classification buys must actually be able to succeed"
+  );
+}
+
 #[test]
 #[cfg(feature = "stats")]
 fn a_send_the_kernel_rejects_bumps_send_errors() {
   let Some(mut socks) = loopback_sockets(ServerOptions::default().with_ipv6(false)) else {
     return;
   };
-  // A payload past the hard ceiling a UDP/IPv4 datagram can ever carry
-  // (65535-byte max IP total length, minus a 20-byte IPv4 header and an
-  // 8-byte UDP header = 65507) cannot be sent on ANY platform — a protocol
-  // limit the kernel enforces before it even looks at routing, unlike the
-  // multicast egress `a_multicast_send_reports_one_outcome_per_bound_family`
-  // deliberately does NOT assert on because it genuinely varies by host. This
-  // is the one deterministic way to force a real `send_to` failure.
-  let oversized = vec![0u8; 70_000];
+  let oversized = vec![0u8; OVERSIZED_FOR_ANY_UDP_DATAGRAM];
   let before = socks.stats.snapshot();
   let outcome = socks.send_one(Family::V4, &oversized, MDNS_V4, &Ungated);
-  assert_eq!(outcome, SendOutcome::Failed, "{outcome:?}");
+  assert_eq!(
+    outcome,
+    SendOutcome::TooLarge,
+    "an oversized send is still a send_errors-bumping refusal, whatever the \
+     producer does about it: {outcome:?}"
+  );
 
   let after = socks.stats.snapshot();
   assert_eq!(
