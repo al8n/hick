@@ -1528,6 +1528,44 @@ fn poll_query_terminal_then_cancel_no_leak() {
   }
 }
 
+/// `QuerySpec::with_timeout` becomes an absolute deadline through
+/// `Instant::checked_add_duration`, and a duration that overflows the instant
+/// leaves the query with no effective deadline at all. Every deadline
+/// comparison must read that absence as "unbounded", never as "already
+/// expired" — the query that asked for the widest possible window must not be
+/// the one that ends first.
+#[test]
+fn a_query_whose_timeout_overflows_the_instant_still_transmits() {
+  use crate::{config::QuerySpec, wire::ResourceType};
+  use core::time::Duration;
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  // `Duration::MAX` overflows `StdInstant`, so no absolute deadline is stored.
+  let spec = QuerySpec::new(qname, ResourceType::A).with_timeout(Duration::MAX);
+  let h = e.try_start_query(spec, now).unwrap();
+  assert!(
+    e.poll_query_timeout(h).is_none(),
+    "an overflowing timeout must leave the query with no deadline at all"
+  );
+
+  // Poll far past any plausible window: with no deadline there is nothing to be
+  // past, so the query's question must still go out.
+  let much_later = now.checked_add(Duration::from_secs(86_400)).unwrap();
+  let mut buf = [0u8; 512];
+  assert!(
+    e.poll_query_transmit(h, much_later, &mut buf)
+      .unwrap()
+      .is_some(),
+    "a query with no effective deadline must still transmit"
+  );
+  assert!(
+    e.poll_query(h).is_none(),
+    "a query with no effective deadline must not have reached a terminal"
+  );
+}
+
 // ── collected_answers readable after terminal poll_query ─────
 
 /// After `poll_query` returns `Some(Done | Timeout)`, the natural

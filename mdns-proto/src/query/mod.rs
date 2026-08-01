@@ -630,8 +630,10 @@ where
 
   /// Produce the next outgoing datagram, if any. Writes into `buf`.
   ///
-  /// Returns `Ok(None)` when the query is done or when no send is currently
-  /// due (i.e. `transmit_pending` is false). A single call per scheduled
+  /// Returns `Ok(None)` when the query is done, when no send is currently
+  /// due (i.e. `transmit_pending` is false), or when a due send would go out
+  /// past the caller's absolute deadline — in which case the query TERMINATES
+  /// instead (see below). A single call per scheduled
   /// deadline tick is guaranteed: the pending flag is cleared after the
   /// datagram is built, so a driver looping on this method will not
   /// re-send the query until the next `handle_timeout` fires.
@@ -658,14 +660,53 @@ where
   /// that window terminates the query with a question outstanding, and RFC 6762
   /// §7.3 duplicate-question suppression arriving in it re-times a retransmission
   /// the pending confirm is about to reschedule. Debug builds assert the ordering.
+  ///
+  /// # The caller's deadline is weighed against THIS call's instant
+  ///
+  /// `QuerySpec::with_timeout` is a promise to whoever set it: no question is
+  /// asked after that instant. [`Self::handle_timeout`] weighs the same
+  /// deadline, but a transmit it arms is drained against a LATER instant — the
+  /// one passed here — and nothing in between weighs that one. So a send that is
+  /// due when `now` has reached the deadline emits nothing and terminates the
+  /// query with [`QueryUpdate::Timeout`]: the same terminal, through the same
+  /// accounting, as the deadline firing from `handle_timeout`, and on the same
+  /// `now >= deadline` boundary.
+  ///
+  /// This is the caller's bound only. The RFC 6762 §5.2 retry ladder is a
+  /// separate deadline with a separate owner, and it is still fired exclusively
+  /// by [`Self::handle_timeout`].
   pub fn poll_transmit(
     &mut self,
-    _now: I,
+    now: I,
     buf: &mut [u8],
   ) -> Result<Option<Transmit>, TransmitError> {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("query", handle = self.handle.raw()).entered();
     if self.done || !self.transmit_pending {
+      return Ok(None);
+    }
+    // Deliberately AFTER the pending check, so a terminal here can only ever
+    // stand in for a datagram this very call would have produced. `poll_transmit`
+    // is the one entry point excepted from the confirm-before-anything contract
+    // above, and it stays excepted: an unconfirmed datagram means
+    // `transmit_pending` is false, so this cannot move the query to a terminal
+    // state while a commit token is live. It also leaves an idle query — one
+    // waiting on a response, with no send due — untouched by a method that
+    // produces nothing for it.
+    //
+    // Terminating rather than merely withholding the datagram: a withheld
+    // question would leave the query armed, with both deadlines still set and
+    // every later tick reaching this same point, so the query would stall rather
+    // than end.
+    if let Some(deadline) = self.timeout_deadline
+      && now >= deadline
+    {
+      crate::trace::trace!(
+        target: "mdns_proto::query",
+        handle = self.handle.raw(),
+        "query: absolute timeout deadline reached with a send due — terminating instead of emitting"
+      );
+      self.terminate(QueryUpdate::Timeout);
       return Ok(None);
     }
     let buf_len = buf.len();

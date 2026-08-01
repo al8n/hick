@@ -599,6 +599,176 @@ fn query_without_timeout_deadline_does_not_cancel_early() {
   );
 }
 
+/// A send armed INSIDE the caller's window but drained after it must not go out,
+/// and the query must end.
+///
+/// `handle_timeout` arms the retry at one instant; `poll_transmit` drains it at a
+/// later one, and no entry point in between weighs that later instant. A
+/// `poll_transmit` that ignores its own `now` therefore puts a question on the
+/// wire after the deadline `QuerySpec::with_timeout` promised would end the
+/// query.
+///
+/// BOTH halves are asserted. "No transmit" alone would also hold for a query
+/// that silently stalls — pending send still armed, deadline never fired, no
+/// terminal for the caller to observe.
+#[test]
+fn a_send_drained_past_the_absolute_deadline_is_never_emitted() {
+  use core::time::Duration;
+
+  let handle = QueryHandle::from_raw(0);
+  let qname = Name::try_from_str("host.local.").unwrap();
+  let t0 = StdInstant::now();
+  // Wide enough that the first send AND the first §5.2 retry (+1 s) are both
+  // armed inside the window: the drain below is the only step outside it.
+  let deadline = t0.checked_add(Duration::from_millis(2500)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    handle,
+    qname,
+    ResourceType::A,
+    ResourceClass::In,
+    50,
+    false,
+    Some(deadline),
+  );
+
+  let mut buf = [0u8; 512];
+  assert!(
+    q.poll_transmit(t0, &mut buf).unwrap().is_some(),
+    "the first send is inside the window and must go out"
+  );
+  q.note_transmit_outcome(t0, TransmitDelivery::ALL);
+
+  // The retry falls due inside the window and arms a transmit.
+  let armed_at = t0.checked_add(Duration::from_secs(1)).unwrap();
+  q.handle_timeout(armed_at).unwrap();
+  assert!(q.transmit_pending, "the §5.2 retry must be armed");
+  assert!(
+    !q.done,
+    "arming a retry inside the window must not end the query"
+  );
+
+  // The driver drains it only after the caller's deadline has passed.
+  let drained_at = t0.checked_add(Duration::from_secs(3)).unwrap();
+  assert!(
+    q.poll_transmit(drained_at, &mut buf).unwrap().is_none(),
+    "no question may go out after the caller's absolute deadline"
+  );
+  assert!(
+    q.done,
+    "a query past its deadline must END, not stall with a send still armed"
+  );
+  assert!(
+    matches!(q.poll(), Some(QueryUpdate::Timeout)),
+    "the terminal must be the same QueryUpdate::Timeout handle_timeout produces"
+  );
+  assert!(
+    q.poll_timeout().is_none(),
+    "a terminated query must arm no further wakeup"
+  );
+}
+
+/// A send drained INSIDE the window is untouched. The deadline gates on the
+/// instant, never on the mere presence of a deadline, and it closes the window on
+/// the same `now >= deadline` boundary `handle_timeout` uses — not one tick early.
+#[test]
+fn a_send_drained_inside_the_absolute_deadline_still_goes_out() {
+  use core::time::Duration;
+
+  let handle = QueryHandle::from_raw(0);
+  let qname = Name::try_from_str("host.local.").unwrap();
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_secs(5)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    handle,
+    qname,
+    ResourceType::A,
+    ResourceClass::In,
+    51,
+    false,
+    Some(deadline),
+  );
+
+  let mut buf = [0u8; 512];
+  assert!(
+    q.poll_transmit(t0, &mut buf).unwrap().is_some(),
+    "the first send is inside the window and must go out"
+  );
+  q.note_transmit_outcome(t0, TransmitDelivery::ALL);
+
+  let armed_at = t0.checked_add(Duration::from_secs(1)).unwrap();
+  q.handle_timeout(armed_at).unwrap();
+  assert!(
+    q.poll_transmit(armed_at, &mut buf).unwrap().is_some(),
+    "a retry drained well inside the window must still be sent"
+  );
+  assert!(
+    !q.done,
+    "a query inside its window must not be terminated by a transmit poll"
+  );
+}
+
+/// The deadline `poll_transmit` weighs stands in for a datagram THIS call would
+/// have produced, and for nothing else. Re-polling while the previous datagram
+/// is still awaiting its `note_transmit_outcome` is explicitly legal — the send
+/// itself may outlast the window — and it must stay the no-op it has always
+/// been: a terminal there would move the query with a commit token live, so the
+/// confirm would land on a query already retired.
+///
+/// The deadline is not lost by waiting, only left to its owner: once the token
+/// is resolved, `handle_timeout` fires it.
+#[test]
+fn a_transmit_poll_past_the_deadline_does_not_retire_an_unconfirmed_send() {
+  use core::time::Duration;
+
+  let handle = QueryHandle::from_raw(0);
+  let qname = Name::try_from_str("host.local.").unwrap();
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_millis(100)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    handle,
+    qname,
+    ResourceType::A,
+    ResourceClass::In,
+    52,
+    false,
+    Some(deadline),
+  );
+
+  let mut buf = [0u8; 512];
+  assert!(
+    q.poll_transmit(t0, &mut buf).unwrap().is_some(),
+    "the first send is inside the window and must go out"
+  );
+  assert!(q.awaiting_send_confirm, "the commit token must be live");
+
+  // The send outlives the window and the driver re-polls before confirming.
+  let past = t0.checked_add(Duration::from_millis(200)).unwrap();
+  assert!(
+    q.poll_transmit(past, &mut buf).unwrap().is_none(),
+    "a re-poll during the confirm window produces no second datagram"
+  );
+  assert!(
+    !q.done,
+    "the query must not be retired while its datagram's commit token is live"
+  );
+
+  // The confirm resolves against a live query, as the driver was promised.
+  q.note_transmit_outcome(past, TransmitDelivery::ALL);
+  assert!(!q.awaiting_send_confirm, "the commit token must be resolved");
+  assert!(!q.done, "confirming a delivered send does not retire the query");
+
+  // The deadline was deferred, not dropped: its own entry point still fires it.
+  q.handle_timeout(past).unwrap();
+  assert!(q.done, "handle_timeout must still fire the passed deadline");
+  assert!(
+    matches!(q.poll(), Some(QueryUpdate::Timeout)),
+    "the deferred deadline produces the same terminal"
+  );
+}
+
 // ── poll_timeout includes timeout_deadline ───────────────────
 
 /// `poll_timeout` must return the EARLIER of `next_deadline` (retry backoff)
