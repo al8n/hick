@@ -391,7 +391,7 @@ fn a_multicast_send_takes_one_credit_per_family_that_reached_the_wire() {
   assert!(summary.delivery.all_delivered());
   // Take it back with the body: the credit is keyed to the family that carried
   // it and to the fingerprint of what went out.
-  assert!(selfsend.take(
+  assert!(selfsend.take_at(
     Family::V4,
     &body,
     std::time::SystemTime::now(),
@@ -997,6 +997,194 @@ fn a_delivered_withdrawal_round_bumps_goodbyes_tx() {
   assert!(
     mdns.stats().goodbyes_tx > before,
     "an announced service's withdrawal must deliver at least one round and bump goodbyes_tx"
+  );
+}
+
+// ── the §10.1 resend schedule's anchor ──────────────────────────────────────
+//
+// Stage 7 is ungated by design — the per-family wire gate paces a producer's own
+// record set, and a goodbye answers to the endpoint's schedule instead — so that
+// schedule is the ONLY thing pacing two consecutive goodbyes for one name on one
+// family's wire. Re-arming it from the tick's `now`, read before the fan-out,
+// hands the next round every microsecond this one spent inside the syscall: a
+// stall past the 250 ms interval leaves the next round already due the moment the
+// send returns, and the two goodbyes land back to back.
+//
+// Measured, like the wire gate's own anchor tests above, from
+// `wire_times_for_test` — the socket's record of when the bytes reached the wire.
+// Reading the endpoint's schedule instead would only ask the bug what it believed
+// it had promised.
+
+/// RFC 6762 §10.1's goodbye resend interval, restated because `mdns-proto`'s own
+/// copy is crate-private.
+const GOODBYE_MIN_FAMILY_GAP: Duration = Duration::from_millis(250);
+
+/// §10.1's anti-pin ceiling: a withdrawal is force-completed this long after it
+/// begins, whatever debt is left. The one thing allowed to shorten the interval
+/// above, so it belongs to the property rather than being an exception carved out
+/// of it.
+const GOODBYE_CEILING: Duration = Duration::from_secs(2);
+
+/// A first goodbye held inside its syscall for longer than the resend interval —
+/// the whole of what the anchor has to survive. Short enough that the round it
+/// delays is nowhere near the ceiling, so the full interval is what the next
+/// round owes.
+const GOODBYE_STALL_PAST_INTERVAL: Duration = Duration::from_millis(400);
+
+/// A first goodbye held long enough that its send lands inside the LAST interval
+/// before the ceiling: the re-arm then clamps to the ceiling and the goodbye after
+/// it is the past-ceiling final attempt.
+///
+/// The value is bracketed on both sides and neither edge has slack to spare.
+/// Below `GOODBYE_CEILING - GOODBYE_MIN_FAMILY_GAP` the re-arm does not clamp and
+/// this is just the test above again; at or beyond `GOODBYE_CEILING` the stalled
+/// send itself lands past the ceiling, where the final attempt fires on `now >=
+/// ceiling_at` alone and no schedule — right or wrong — has any say.
+const GOODBYE_STALL_INTO_CEILING: Duration = Duration::from_millis(1_850);
+
+/// Stands in for the run loop's re-entry between two stage-7 drains. Only
+/// granularity: a coarser poll can delay a round but never let one out early.
+const GOODBYE_DRAIN_POLL: Duration = Duration::from_millis(5);
+
+/// An IPv4-only [`Mdns`] whose one service has announced and is now withdrawing,
+/// plus the two things the caller needs to read its goodbyes off the wire: a lower
+/// bound on the withdrawal item's anti-pin ceiling, and how many datagrams the
+/// probe and announce already put on IPv4's wire.
+///
+/// The service must have ANNOUNCED: a never-announced one owes `[0, 0]`, settles
+/// on its first pass with nothing on the wire, and would make every gap assertion
+/// below vacuous.
+fn advertised_then_withdrawn(ty: &str) -> Option<(test_support::TestMdns, Instant, usize)> {
+  let mut mdns = test_support::loopback_mdns_v4_only()?;
+  if !mdns.sockets.is_bound_for_test(Family::V4) {
+    eprintln!("skipping: IPv4 is not bound on this host");
+    return None;
+  }
+  let handle = mdns
+    .register_service(test_support::service_spec(ty, 8080))
+    .expect("register_service");
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
+    return None;
+  }
+  let already_on_wire = mdns.sockets.wire_times_for_test(Family::V4).len();
+  // `unregister_service` begins the withdrawal at its own `Instant::now()`, so the
+  // item's ceiling is 2 s past an instant no EARLIER than this one. A lower bound
+  // is exactly what the assertion wants: understating the ceiling can only weaken
+  // the floor it computes, never move it somewhere the fix does not reach.
+  let ceiling_floor = Instant::now() + GOODBYE_CEILING;
+  mdns.unregister_service(handle);
+  assert!(
+    mdns.endpoint.has_pending_withdrawals(),
+    "an announced service must owe a §10.1 goodbye once unregistered"
+  );
+  Some((mdns, ceiling_floor, already_on_wire))
+}
+
+/// Drive stage 7 the way the run loop does — one [`Mdns::drain_withdrawals`] per
+/// re-entry, each at the live clock — until the withdrawal settles, and return the
+/// instants IPv4's socket recorded for the goodbyes alone.
+///
+/// `drain_withdrawals` rather than `tick`, so that every datagram after
+/// `already_on_wire` is a goodbye: no other stage gets to put bytes on this wire
+/// or to eat the forced stall meant for the first round.
+fn goodbye_wire_times(mdns: &mut Mdns, already_on_wire: usize) -> Vec<Instant> {
+  // The ceiling force-completes every item, so a run that outlives it by a whole
+  // second is a hang and must be reported as one rather than as a wire history
+  // with a round missing from the end.
+  let deadline = Instant::now() + GOODBYE_CEILING + Duration::from_secs(1);
+  while mdns.endpoint.has_pending_withdrawals() && Instant::now() < deadline {
+    mdns.drain_withdrawals(Instant::now());
+    std::thread::sleep(GOODBYE_DRAIN_POLL);
+  }
+  assert!(
+    !mdns.endpoint.has_pending_withdrawals(),
+    "the withdrawal outlived its own anti-pin ceiling"
+  );
+  mdns
+    .sockets
+    .wire_times_for_test(Family::V4)
+    .split_off(already_on_wire)
+}
+
+/// Two consecutive goodbyes for one name on one family's wire are `min(the §10.1
+/// interval, whatever is left before the anti-pin ceiling)` apart — the endpoint's
+/// own guarantee, restated against the wire instead of against its schedule.
+///
+/// The ceiling term is not a softened assertion: `note_withdrawal_result` clamps
+/// every re-arm to `ceiling_at`, so a round taken inside the last interval before
+/// the ceiling is followed by the final attempt, which is due AT the ceiling. What
+/// the bug does is take that goodbye earlier still, from a schedule armed off an
+/// instant that predates the stalled send.
+fn assert_goodbye_wire_spacing(kind: &str, wire_times: &[Instant], ceiling_floor: Instant) {
+  assert!(
+    wire_times.len() >= 2,
+    "{kind}: {} goodbyes reached IPv4's wire, so there is no consecutive pair to \
+     weigh and this test asserts nothing",
+    wire_times.len()
+  );
+  for pair in wire_times.windows(2) {
+    let earliest = (pair[0] + GOODBYE_MIN_FAMILY_GAP).min(ceiling_floor);
+    assert!(
+      pair[1] >= earliest,
+      "{kind}: a goodbye reached IPv4's wire {:?} after the one before it and \
+       {:?} before its withdrawal's anti-pin ceiling, so it was {:?} early — the \
+       §10.1 schedule was re-armed from an instant read BEFORE the fan-out, which \
+       credits the stalled round's own time in the syscall to the next round's \
+       spacing",
+      pair[1].saturating_duration_since(pair[0]),
+      ceiling_floor.saturating_duration_since(pair[1]),
+      earliest.saturating_duration_since(pair[1]),
+    );
+  }
+}
+
+/// **The progress path.** A round that paid down real debt re-arms at the full
+/// 250 ms interval, and that interval belongs to the wire: a first goodbye held
+/// 400 ms inside its `send_to` must not have those 400 ms handed to the round
+/// after it.
+#[test]
+fn a_stalled_goodbye_keeps_the_next_rounds_wire_gap() {
+  let Some((mut mdns, ceiling_floor, already_on_wire)) =
+    advertised_then_withdrawn("_hick-mio-goodbye-gap._tcp.local.")
+  else {
+    return;
+  };
+  // Only the FIRST round stalls. A constant stall shifts every wire time by the
+  // same amount and hides the defect completely; it is the unstalled round
+  // following a stalled one that goes out early.
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V4, &[GOODBYE_STALL_PAST_INTERVAL]);
+  let wire_times = goodbye_wire_times(&mut mdns, already_on_wire);
+  assert_goodbye_wire_spacing("a stalled progress round", &wire_times, ceiling_floor);
+}
+
+/// **The final-attempt path.** The same anchor, where the re-arm it produces is
+/// clamped to the anti-pin ceiling and the goodbye that follows is the one final
+/// attempt `poll_withdrawal_transmit` makes past it.
+///
+/// Anchored at the fan-out, the stalled round re-arms at the ceiling and the final
+/// attempt is what pays the next goodbye. Anchored at the tick's `now` — read
+/// 1.85 s earlier, before the stall — the schedule re-arms 250 ms after an instant
+/// long past, so an ORDINARY round is already due when the stalled send returns
+/// and goes out roughly 150 ms ahead of the ceiling. The ceiling is §10.1's only
+/// licence to cut the interval short, and this takes the licence without the
+/// ceiling.
+#[test]
+fn a_goodbye_stalled_into_its_ceiling_still_waits_for_the_final_attempt() {
+  let Some((mut mdns, ceiling_floor, already_on_wire)) =
+    advertised_then_withdrawn("_hick-mio-goodbye-ceiling._tcp.local.")
+  else {
+    return;
+  };
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V4, &[GOODBYE_STALL_INTO_CEILING]);
+  let wire_times = goodbye_wire_times(&mut mdns, already_on_wire);
+  assert_goodbye_wire_spacing(
+    "a round stalled into its ceiling",
+    &wire_times,
+    ceiling_floor,
   );
 }
 
@@ -2214,27 +2402,28 @@ fn saw_own_loopback(mdns: &Mdns) -> bool {
   }
 }
 
-// ── a self-send credit outlives a stalled syscall ───────────────────────────
+// ── a self-send credit outlives its own recording tick ──────────────────────
 //
-// Nothing bounds the gap between a send's pre-syscall clock reads and the
-// syscall itself: a preempted thread, a signal handler, a page fault, or the
-// `EINTR` retry can all stretch it. While that pre-syscall wall stamp was also
-// the credit's age, a gap past `SELF_SEND_TTL` made this endpoint ingest its own
-// announcement as peer traffic — a phantom conflict against itself and the RFC
-// 6762 §9 rename that follows.
+// A credit recorded during a tick cannot be claimed during that tick: stage 1
+// receives, and every stage that sends runs after it. So no instant inside the
+// recording tick may start the credit's `SELF_SEND_TTL`, and each of these tests
+// is one way the driver used to spend that unclaimable stretch — a stalled
+// syscall, a stalled sibling family, a later send in the same tick, a stage-7
+// goodbye after a stage-4 announcement — and thereby ingest its own datagram as
+// peer traffic, raising a phantom conflict against itself and renaming under RFC
+// 6762 §9. The last test is the other side: once the window HAS opened, elapsed
+// time is charged in full.
 
-/// Just past the TTL, so the stall these two tests inject is unambiguously
-/// fatal to a credit aged from a pre-syscall stamp.
+/// Just past the TTL, so every stall injected below is unambiguously fatal to a
+/// credit anchored anywhere inside its recording tick.
 const STALL_PAST_TTL: Duration = SELF_SEND_TTL.saturating_add(Duration::from_millis(50));
 
-/// Send `body` through the driver's own credit path and report whether the echo
-/// that follows is recognised as ours.
+/// Put `body` on the wire through stage 4's own credit path, or `None` when this
+/// host's multicast egress went nowhere and the test has nothing to assert.
 ///
-/// The echo is presented rather than awaited: what is under test is which
-/// instants the credit carries, and a real loopback copy would arrive with
-/// exactly these — a kernel receive stamp taken after the syscall, read back on
-/// the next tick.
-fn echo_is_matched(mdns: &mut Mdns, body: &[u8]) -> Option<bool> {
+/// `min_gap` is zero, so the gate is open for both families and every test below
+/// is about the credit rather than about the spacing.
+fn credit_a_multicast_send(mdns: &mut Mdns, body: &[u8]) -> Option<()> {
   let now = Instant::now();
   let mut gate = FamilyWireGate::default();
   let Mdns {
@@ -2257,13 +2446,32 @@ fn echo_is_matched(mdns: &mut Mdns, body: &[u8]) -> Option<bool> {
     eprintln!("skipping: the datagram never reached a wire on this host");
     return None;
   }
-  Some(selfsend.take(
-    Family::V4,
+  Some(())
+}
+
+/// Open the next tick's claim window and present the echo there, exactly where
+/// [`Mdns::tick`] would.
+///
+/// The echo is presented rather than awaited: what is under test is *when* the
+/// credit's window opens, and a real loopback copy would arrive with exactly
+/// these — a kernel receive stamp taken after the syscall, read back against the
+/// instant the following tick opened with.
+fn echo_matched_at_next_tick_top(mdns: &mut Mdns, family: Family, body: &[u8]) -> bool {
+  let top = Instant::now();
+  mdns.selfsend.seal(top);
+  mdns.selfsend.take_at(
+    family,
     body,
     std::time::SystemTime::now(),
-    Instant::now(),
+    top,
     crate::selfsend::MatchMode::Ordered,
-  ))
+  )
+}
+
+/// Send once through stage 4 and claim the echo at the next tick's top.
+fn echo_is_matched(mdns: &mut Mdns, body: &[u8]) -> Option<bool> {
+  credit_a_multicast_send(mdns, body)?;
+  Some(echo_matched_at_next_tick_top(mdns, Family::V4, body))
 }
 
 #[test]
@@ -2280,9 +2488,9 @@ fn a_send_stalled_past_the_self_send_ttl_still_suppresses_its_own_echo() {
   };
   assert!(
     matched,
-    "the credit must age from the syscall that succeeded: a stall longer than \
-     SELF_SEND_TTL between the pre-syscall stamp and the kernel accepting the \
-     datagram must not expire it before its own echo can claim it"
+    "a stall longer than SELF_SEND_TTL between the pre-syscall stamp and the \
+     kernel accepting the datagram must not expire the credit before its own \
+     echo can claim it"
   );
 }
 
@@ -2304,8 +2512,424 @@ fn an_eintr_retry_past_the_self_send_ttl_still_suppresses_its_own_echo() {
   };
   assert!(
     matched,
-    "an EINTR retry must report the SUCCESSFUL attempt's stamps: carrying the \
-     interrupted attempt's forward puts a whole failed syscall, and whatever \
-     preempted the thread around it, inside the credit's TTL"
+    "an EINTR retry must not put a whole failed syscall, and whatever preempted \
+     the thread around it, inside the credit's life"
+  );
+}
+
+/// A dual-stack fixture with IPv6 actually bound, or `None` with a printed
+/// reason.
+///
+/// `loopback_mdns` degrades to IPv4-only where `try_bind_v6` is refused (macOS
+/// returns `EINVAL` on every interface), and these two tests are *about* the
+/// second family, so an IPv4-only fixture would take them green while asserting
+/// nothing.
+fn dual_stack_mdns() -> Option<test_support::TestMdns> {
+  let mdns = test_support::loopback_mdns()?;
+  if !mdns.sockets.is_bound_for_test(Family::V6) {
+    eprintln!("skipping: IPv6 is not bound on this host, so there is no second leg to stall");
+    return None;
+  }
+  Some(mdns)
+}
+
+#[test]
+fn an_ipv6_leg_stalling_past_the_ttl_does_not_expire_the_ipv4_credit() {
+  let Some(mut mdns) = dual_stack_mdns() else {
+    return;
+  };
+  // One multicast transmit is two syscalls. IPv4 goes first and takes its
+  // credit; IPv6 then stalls past the whole TTL before its own syscall lands.
+  // Nothing has drained a datagram in between — stage 1 is behind us — so the
+  // IPv4 echo has not had one opportunity to claim its credit.
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V6, &[STALL_PAST_TTL]);
+  let body = [0x4Au8; 32];
+  if credit_a_multicast_send(&mut mdns, &body).is_none() {
+    return;
+  }
+  assert!(
+    echo_matched_at_next_tick_top(&mut mdns, Family::V4, &body),
+    "the sibling family's stall is time in which no echo could be claimed; \
+     charging it to the IPv4 credit expires it before its first opportunity"
+  );
+}
+
+#[test]
+fn an_ipv6_leg_that_stalls_and_then_fails_does_not_expire_the_ipv4_credit() {
+  let Some(mut mdns) = dual_stack_mdns() else {
+    return;
+  };
+  // Same stall, but IPv6 never reaches the kernel: interrupted on both attempts,
+  // so it records no credit at all. This is the half a record-time sweep cannot
+  // explain — with no second `record` there is no sweep, and the credit is lost
+  // at claim time instead. Both TTL sites have to move, not just the sweep.
+  mdns.sockets.force_send_eintr_for_test(Family::V6, 2);
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V6, &[STALL_PAST_TTL, Duration::ZERO]);
+  let body = [0x4Bu8; 32];
+  if credit_a_multicast_send(&mut mdns, &body).is_none() {
+    return;
+  }
+  assert!(
+    echo_matched_at_next_tick_top(&mut mdns, Family::V4, &body),
+    "a sibling family that stalls and then fails records nothing, so only the \
+     claim-time TTL can expire the IPv4 credit — and it must not"
+  );
+}
+
+#[test]
+fn a_later_same_tick_send_stalling_past_the_ttl_does_not_expire_an_earlier_credit() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  // Stage 4 drains a whole queue of transmits before stage 1 runs again. The
+  // first send is clean; the second stalls past the TTL. The first datagram's
+  // echo is sitting in the socket queue the entire time and cannot be read until
+  // the next tick.
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V4, &[Duration::ZERO, STALL_PAST_TTL]);
+  let first = [0x5Au8; 32];
+  let second = [0x5Bu8; 32];
+  if credit_a_multicast_send(&mut mdns, &first).is_none() {
+    return;
+  }
+  if credit_a_multicast_send(&mut mdns, &second).is_none() {
+    return;
+  }
+  assert!(
+    echo_matched_at_next_tick_top(&mut mdns, Family::V4, &first),
+    "a later datagram in the same tick must not age out an earlier one's \
+     credit: receive does not resume until the tick ends, so the earlier echo \
+     has had no opportunity at all"
+  );
+}
+
+#[test]
+fn a_stage_seven_goodbye_does_not_evict_an_unclaimed_stage_four_credit() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  // Stage 4 announces, then stage 7 pumps an RFC 6762 §10.1 goodbye in the SAME
+  // tick — with stages 5 and 6 between them, and no receive anywhere. The
+  // goodbye's own send stalls past the TTL, so a sweep anchored on the goodbye's
+  // syscall would evict the announcement's credit.
+  mdns
+    .sockets
+    .force_send_delays_for_test(Family::V4, &[Duration::ZERO, STALL_PAST_TTL]);
+  let announcement = [0x6Au8; 32];
+  let goodbye = [0x6Bu8; 32];
+  if credit_a_multicast_send(&mut mdns, &announcement).is_none() {
+    return;
+  }
+  {
+    let Mdns {
+      sockets,
+      selfsend,
+      send_health,
+      ..
+    } = &mut *mdns;
+    super::withdrawal::send_withdrawal(sockets, selfsend, send_health, &goodbye);
+  }
+  assert!(
+    echo_matched_at_next_tick_top(&mut mdns, Family::V4, &announcement),
+    "a stage-7 goodbye recorded a TTL after a stage-4 announcement must not \
+     evict that announcement's credit: stage 1 has not run between them, so the \
+     announcement's echo is still unclaimed"
+  );
+}
+
+#[test]
+fn a_caller_gap_after_the_claim_window_opened_still_expires_the_credit() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let body = [0x7Au8; 32];
+  if credit_a_multicast_send(&mut mdns, &body).is_none() {
+    return;
+  }
+  // The window opens, and then the caller goes away for longer than the TTL.
+  // This half must NOT be forgiven: the TTL's other job is bounding false
+  // suppression, and a co-resident peer's byte-identical datagram can arrive
+  // during a caller stall exactly as it can during a tick. Ageing by tick count,
+  // or re-anchoring on every seal, would make the suppression window a function
+  // of the caller's loop rate instead of a bound.
+  let top = Instant::now();
+  mdns.selfsend.seal(top);
+  let after_the_gap = top + STALL_PAST_TTL;
+  assert!(
+    !mdns.selfsend.take_at(
+      Family::V4,
+      &body,
+      std::time::SystemTime::now(),
+      after_the_gap,
+      crate::selfsend::MatchMode::Ordered,
+    ),
+    "post-opportunity time is charged in full, caller stalls included, or the \
+     false-suppression bound is not a bound"
+  );
+  mdns.selfsend.seal(after_the_gap);
+  assert_eq!(
+    mdns.selfsend.len(),
+    0,
+    "and the seal that observes the gap sweeps the credit rather than granting \
+     it another whole TTL"
+  );
+}
+
+// ── the receive stage's own runtime is charged to the credit ────────────────
+//
+// The upper half of the same invariant, through the real drain. Once a credit's
+// window has opened, `SELF_SEND_TTL` charges elapsed time in full — and the
+// receive stage's own runtime is elapsed time like any other. So stage 1 carries
+// two monotonic clocks on purpose: the tick's instant, which stays the protocol
+// `now` every deadline comparison below needs to be stable, and a live read per
+// datagram, which is the only thing the credit is aged against. Weighing a claim
+// against the tick's instant charges nothing for a drain that ran long or lost
+// the CPU, and the bound on FALSE suppression stops being a bound — a
+// co-resident peer's byte-identical datagram, read an unbounded time after the
+// seal, still finds a live credit and is swallowed as our own echo.
+
+/// A loopback IPv4-only fixture registered into its own `Poll`, so a send's
+/// loopback copy can be waited for.
+fn registered_v4_only() -> Option<(test_support::TestMdns, Poll)> {
+  let mut mdns = test_support::loopback_mdns_v4_only()?;
+  let poll = Poll::new().expect("poll");
+  mdns
+    .register(poll.registry(), Token(60), Token(61))
+    .expect("register");
+  Some((mdns, poll))
+}
+
+/// Put `body` on the multicast wire and wait until its loopback copy has made
+/// the IPv4 socket readable, leaving the credit recorded and unclaimed.
+///
+/// `None`, with a printed reason, when this host's multicast egress or its
+/// loopback delivered nothing — a silent skip is a test that passes while
+/// asserting nothing. Readiness is what makes that skip stats-free: it is the
+/// kernel's own word that a datagram is queued for the drain below to weigh.
+fn queue_own_echo(mdns: &mut Mdns, poll: &mut Poll, body: &[u8]) -> Option<()> {
+  credit_a_multicast_send(mdns, body)?;
+  let mut events = mio::Events::with_capacity(8);
+  let deadline = Instant::now() + Duration::from_secs(2);
+  while Instant::now() < deadline {
+    poll
+      .poll(&mut events, Some(Duration::from_millis(50)))
+      .expect("poll");
+    for ev in events.iter() {
+      if mdns.owns(ev.token()) {
+        mdns.handle_io(ev);
+      }
+    }
+    if mdns.sockets.is_readable_for_test(Family::V4) {
+      return Some(());
+    }
+  }
+  eprintln!("skipping: this endpoint's own multicast never looped back within the budget");
+  None
+}
+
+/// Run one tick over a queued echo whose read stalls past the TTL, and report
+/// how many credits survived it.
+fn credits_after_a_stalled_drain(mdns: &mut Mdns, poll: &mut Poll, body: &[u8]) -> Option<usize> {
+  queue_own_echo(mdns, poll, body)?;
+  // The tick seals at its top and then loses the CPU inside stage 1, before the
+  // read whose claim is weighed against that seal.
+  mdns
+    .sockets
+    .force_recv_delays_for_test(Family::V4, &[STALL_PAST_TTL]);
+  mdns.tick().expect("tick");
+  Some(mdns.selfsend.len())
+}
+
+/// The defect the second clock exists for, on the ordered path.
+///
+/// The queued datagram is byte-identical to the one we sent, and bytes are all
+/// the tracker has: our own echo and a co-resident peer's copy of it are the
+/// same datagram here, which is the whole premise of the take-once design. So
+/// the only question left is whether the credit's window is still open, and a
+/// claim weighed a full `SELF_SEND_TTL` after the seal must be answered "peer".
+/// Weighing it against the tick's own instant answers "ours" however long the
+/// drain ran.
+#[test]
+fn an_ordered_claim_past_the_ttl_inside_one_receive_stage_is_rejected() {
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  let body = [0x8Au8; 32];
+  let survived = credits_after_a_stalled_drain(&mut mdns, &mut poll, &body);
+  mdns.deregister().expect("deregister");
+  let Some(survived) = survived else {
+    return;
+  };
+  assert_eq!(
+    survived, 1,
+    "a claim evaluated a whole SELF_SEND_TTL after the seal must find the credit \
+     expired: ageing it against the tick's own instant instead leaves the \
+     false-suppression window a function of how long the drain happened to run"
+  );
+}
+
+/// The same, on the path that has no arrival stamp at all.
+///
+/// `Degraded` is the whole self-send match on Windows and on any kernel that
+/// delivers no timestamp cmsg, and it is content-hash matching bounded by
+/// nothing but this TTL — so the TTL going unbounded there is not one guard of
+/// two failing, it is the only guard failing. The forced absence of the stamp is
+/// what makes that arm reachable from a host whose kernel does supply one.
+#[test]
+fn a_degraded_claim_past_the_ttl_inside_one_receive_stage_is_rejected() {
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  mdns.sockets.force_no_rx_time_for_test();
+  let body = [0x8Bu8; 32];
+  let survived = credits_after_a_stalled_drain(&mut mdns, &mut poll, &body);
+  mdns.deregister().expect("deregister");
+  let Some(survived) = survived else {
+    return;
+  };
+  assert_eq!(
+    survived, 1,
+    "with no arrival stamp the TTL is the entire bound on false suppression, so \
+     a claim past it must be rejected on the degraded path too"
+  );
+}
+
+/// The over-correction guard, and this section's positive control.
+///
+/// A live clock read must not turn into rejecting genuine loopback: a claim made
+/// promptly inside the same receive stage still suppresses our own echo. It is
+/// also the one test here that fails outright if this host's multicast never
+/// loops back, so the two above cannot quietly pass by weighing a datagram that
+/// was never delivered.
+#[test]
+fn a_prompt_claim_inside_the_receive_stage_still_suppresses_our_own_echo() {
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  let body = [0x8Cu8; 32];
+  let queued = queue_own_echo(&mut mdns, &mut poll, &body).is_some();
+  if queued {
+    mdns.tick().expect("tick");
+  }
+  let credits = mdns.selfsend.len();
+  mdns.deregister().expect("deregister");
+  if !queued {
+    return;
+  }
+  assert_eq!(
+    credits, 0,
+    "our own loopback copy, read promptly after the seal, must still consume its \
+     credit: the live clock bounds the window, it does not close it"
+  );
+}
+
+// ── the claim's clock is read AT the claim, by the claim ────────────────────
+//
+// The defect class, closed at the signature rather than at another call site. A
+// self-send credit's liveness was mis-evaluated six times, each in a different
+// window between a caller's clock read and the comparison, and the read walked
+// inward every round: the pre-syscall wall stamp, the recording tick, the tick's
+// top, and finally the instant taken immediately after `recv`. That last one
+// still left both admission gates — the ingress trust boundary and the §11
+// source-port rule — plus whatever the scheduler does among them running on a
+// frozen clock. A credit that expires in there is weighed as live, a
+// byte-identical PEER datagram spends it, and the genuine loopback copy behind
+// it reaches the protocol layer as peer traffic: a phantom conflict against
+// ourselves and the RFC 6762 §9 rename that follows.
+//
+// So `SelfSendTracker::take` now takes no instant from anyone and reads the
+// monotonic clock at its own liveness decision. No caller can supply a stale one
+// because no caller can supply one at all.
+//
+// The two tests below stall exactly there — after the read, after both gates,
+// with only the credit check left — in each match mode. The stalled-drain tests
+// in the section above stall INSIDE `recv`, before that instant was even
+// captured, so neither of them can reach this window.
+
+/// Run one tick over a queued echo that is read and admitted at full speed and
+/// then loses the CPU past the TTL with only the credit check ahead of it.
+///
+/// Reports the credits that survived, and whether the injected stall was
+/// actually consumed — which is what makes the survivor count mean something. A
+/// datagram dropped at either admission gate never reaches the claim, and would
+/// leave the credit untouched for a reason that has nothing to do with the
+/// clock.
+fn credits_after_a_stalled_claim(
+  mdns: &mut Mdns,
+  poll: &mut Poll,
+  body: &[u8],
+) -> Option<(usize, bool)> {
+  queue_own_echo(mdns, poll, body)?;
+  mdns.force_claim_delays_for_test(&[STALL_PAST_TTL]);
+  mdns.tick().expect("tick");
+  Some((mdns.selfsend.len(), mdns.forced_claim_delays.is_empty()))
+}
+
+/// The seventh window, on the ordered path.
+///
+/// The queued datagram is byte-identical to the one we sent and its kernel stamp
+/// is correctly ordered after the send, so ordering says nothing here — exactly
+/// as it says nothing about a co-resident peer's copy of our own announcement.
+/// The whole answer is whether the credit's window is still open when the claim
+/// is made, and a claim made a full `SELF_SEND_TTL` after the seal must be
+/// answered "peer" however early the driver happened to read a clock.
+#[test]
+fn an_ordered_claim_stalled_after_admission_is_rejected() {
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  let body = [0x9Au8; 32];
+  let outcome = credits_after_a_stalled_claim(&mut mdns, &mut poll, &body);
+  mdns.deregister().expect("deregister");
+  let Some((survived, stalled)) = outcome else {
+    return;
+  };
+  assert!(
+    stalled,
+    "the stall is consumed at the claim itself, so an unconsumed one means the \
+     echo never got past the admission gates and this test asserted nothing"
+  );
+  assert_eq!(
+    survived, 1,
+    "a claim evaluated a whole SELF_SEND_TTL after the seal must find the credit \
+     expired even when every instant before the admission gates was fresh: the \
+     age belongs to the claim, not to whatever the drain read on its way there"
+  );
+}
+
+/// The same window on the path that has no arrival stamp at all.
+///
+/// `Degraded` is the whole self-send match on Windows and on any kernel that
+/// delivers no timestamp cmsg: content hash bounded by this TTL and nothing
+/// else. So a claim aged from before the gates is not one guard of two failing
+/// there, it is the only guard failing. Forcing the stamp away is what makes the
+/// arm reachable from a host whose kernel does supply one.
+#[test]
+fn a_degraded_claim_stalled_after_admission_is_rejected() {
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  mdns.sockets.force_no_rx_time_for_test();
+  let body = [0x9Bu8; 32];
+  let outcome = credits_after_a_stalled_claim(&mut mdns, &mut poll, &body);
+  mdns.deregister().expect("deregister");
+  let Some((survived, stalled)) = outcome else {
+    return;
+  };
+  assert!(
+    stalled,
+    "the stall is consumed at the claim itself, so an unconsumed one means the \
+     echo never got past the admission gates and this test asserted nothing"
+  );
+  assert_eq!(
+    survived, 1,
+    "with no arrival stamp the TTL is the entire bound on false suppression, so \
+     a claim stalled past it between admission and the credit check must be \
+     rejected on the degraded path too"
   );
 }

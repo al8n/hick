@@ -1228,15 +1228,15 @@ fn a_transient_receive_error_never_marks_the_family_deaf() {
 //
 // `send_to` retries once on `EINTR`, which makes one logical send read its
 // pre-syscall clocks twice. Which reading survives into `SendOutcome::Sent`
-// decides how long a self-send credit appears to have been waiting: the
+// decides what every downstream consumer believes about the send: the
 // interrupted attempt's stamps precede the successful syscall by a whole failed
-// syscall plus whatever preempted the thread around it, and a gap past
-// `SELF_SEND_TTL` makes this endpoint ingest its own multicast echo as peer
-// traffic.
+// syscall plus whatever preempted the thread around it, so carrying them forward
+// orders the self-send credit against an instant before the datagram existed and
+// tells the core its peers were refreshed before they were.
 
 /// Long enough that no scheduling noise could account for it, short enough to
-/// keep the test fast. Nothing here depends on it exceeding `SELF_SEND_TTL` —
-/// the stamps are read directly.
+/// keep the test fast. The stamps are read directly, so nothing here needs it to
+/// exceed any TTL.
 const EINTR_STALL: Duration = Duration::from_millis(200);
 
 #[test]
@@ -1274,8 +1274,8 @@ fn an_eintr_retry_reports_the_successful_attempts_stamps() {
       .duration_since(before_wall)
       .is_ok_and(|d| d >= EINTR_STALL),
     "the wall pre-syscall stamp keys self-send ordering; carrying the \
-     interrupted attempt's forward would put the whole stall inside the \
-     credit's TTL"
+     interrupted attempt's forward would order the credit against an instant a \
+     whole stall before the datagram existed"
   );
   assert!(
     wire_at >= submitted_at,

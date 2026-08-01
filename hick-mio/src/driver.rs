@@ -328,6 +328,14 @@ impl Mdns {
     // Hand every family back its transient-receive-error budget. Once per tick
     // is what makes the retry bounded rather than merely repeated.
     self.sockets.begin_recv_round();
+    // Open the self-send claim window before the stage that claims from it, on
+    // the instant this tick already took. `now` is the first moment a credit the
+    // previous tick recorded can be claimed, and `SELF_SEND_TTL` may be measured
+    // from nothing earlier — the outbound stages below all run after stage 1, so
+    // the tick that records a credit can never claim it. Top of the tick rather
+    // than end of the outbound stages so that this stays true however stages 4
+    // through 7 are later reordered or added to.
+    self.selfsend.seal(now);
     self.drain_recv(now);
     self.sweep();
     self.fire_timeouts(now);
@@ -360,12 +368,24 @@ impl Mdns {
         recv_buf,
         local_subnets,
         bound_interface,
+        #[cfg(test)]
+        forced_claim_delays,
         ..
       } = &mut *self;
 
       let Some((meta, family)) = sockets.recv(recv_buf.as_mut_slice()) else {
         return;
       };
+      // No second clock read here, and none anywhere else in this loop — do not
+      // add one. `now` is the tick's PROTOCOL instant: the core weighs every
+      // deadline within a tick against one stable value, so it is what
+      // `endpoint.handle` and every stage below receive, unchanged. It is not,
+      // and must not become, the age of a self-send credit. `SELF_SEND_TTL` is
+      // no deadline but a real-time bound on FALSE suppression, so that age
+      // belongs to `SelfSendTracker::take`, which reads it at its own liveness
+      // decision and accepts an instant from nobody. An instant captured at this
+      // line would already be stale by the two admission gates below — see that
+      // method's docs for why the parameter was the defect rather than the fix.
       let Some(data) = recv_buf.get(..meta.len()) else {
         // `recv` never reports more bytes than the buffer holds; a datagram
         // that would not fit was already rejected as truncated.
@@ -436,16 +456,16 @@ impl Mdns {
       // ordering to check, so matching degrades to content hash inside the TTL
       // window.
       //
-      // `now` is the tick's own monotonic instant and ages the credit; the
-      // wall stamp only orders it. The two are separate clocks answering
-      // separate questions — see `SelfSendTracker::take`. Passing the tick's
-      // instant rather than a fresh read under-ages the credit by however long
-      // this drain has been running, which is the safe direction: a credit
-      // retained a moment too long costs nothing, and one expired a moment too
-      // early makes this endpoint raise a phantom conflict against itself.
-      let caller_is_self = match meta.rx_time() {
-        Some(rx) => selfsend.take(family, data, rx, now, MatchMode::Ordered),
-        None => selfsend.take(family, data, SystemTime::now(), now, MatchMode::Degraded),
+      // The wall stamp only ORDERS the echo against the send. Two clocks answer
+      // two questions and this call supplies exactly one of them: the credit's
+      // AGE is read inside `take`, at the decision, because everything between
+      // the read above and this line — both admission gates, and whatever the
+      // scheduler does among them — is elapsed time the credit must be charged.
+      #[cfg(test)]
+      Self::stall_before_claim(forced_claim_delays);
+      let caller_is_self = match sockets.rx_time(&meta) {
+        Some(rx) => selfsend.take(family, data, rx, MatchMode::Ordered),
+        None => selfsend.take(family, data, SystemTime::now(), MatchMode::Degraded),
       };
 
       let route_events = match endpoint.handle(
@@ -484,6 +504,25 @@ impl Mdns {
         }
       }
     }
+  }
+
+  /// Lose the CPU where the drain really can: after a datagram has been read and
+  /// admitted, and before the credit check weighs it. See
+  /// [`Mdns::forced_claim_delays`].
+  #[cfg(test)]
+  fn stall_before_claim(stalls: &mut std::collections::VecDeque<Duration>) {
+    if let Some(stall) = stalls.pop_front()
+      && !stall.is_zero()
+    {
+      std::thread::sleep(stall);
+    }
+  }
+
+  /// Stall the next admitted datagrams between admission and the self-send
+  /// claim, one entry per datagram. See [`Mdns::forced_claim_delays`].
+  #[cfg(test)]
+  pub(crate) fn force_claim_delays_for_test(&mut self, stalls: &[Duration]) {
+    self.forced_claim_delays = stalls.iter().copied().collect();
   }
 
   /// Stage 2: drop contexts whose proto-side state is already gone.

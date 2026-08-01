@@ -219,6 +219,22 @@ pub struct Mdns {
   /// Shared counters, so proto-layer and driver-layer stats land in one place.
   #[cfg(feature = "stats")]
   pub(crate) stats: std::sync::Arc<hick_trace::stats::Stats>,
+  /// Per-datagram stalls injected **between a datagram's admission and the
+  /// self-send credit check weighed on it**, consumed one per admitted datagram;
+  /// once exhausted every claim proceeds at full speed.
+  ///
+  /// It stands in for the one thing no test can ask a real host for: the drain
+  /// thread losing the CPU inside stage 1 *after* the read and the two admission
+  /// gates, with the claim still ahead of it. That stretch is post-opportunity
+  /// time, which [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) requires be
+  /// charged in full, and it is the last window in which a caller-supplied
+  /// instant could still be stale — so it is exactly where a claim that trusts
+  /// one swallows a co-resident peer's byte-identical datagram as our own echo.
+  ///
+  /// Distinct from `BoundSocket::forced_recv_delays`, which stalls *inside* the
+  /// read and so lands before this window opens; the two are not substitutes.
+  #[cfg(test)]
+  pub(crate) forced_claim_delays: std::collections::VecDeque<std::time::Duration>,
 }
 
 impl Mdns {
@@ -278,6 +294,8 @@ impl Mdns {
       shutting_down: false,
       #[cfg(feature = "stats")]
       stats,
+      #[cfg(test)]
+      forced_claim_delays: std::collections::VecDeque::new(),
     })
   }
 

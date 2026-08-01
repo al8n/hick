@@ -56,9 +56,10 @@ impl Mdns {
   /// The pump loop has no budget of its own, like `push_updates`: the bound is
   /// the proto layer's, borrowed. Each iteration takes one due item and reports
   /// its result, and `note_withdrawal_result` re-arms that item strictly past
-  /// `now` (the full 250 ms interval on progress, a 20 ms backoff otherwise) or
-  /// zeroes its debt, so no item can be selected twice at this `now`. A
-  /// past-ceiling item gets exactly one final attempt, guarded by the proto
+  /// the instant it is handed (the full 250 ms interval on progress, a 20 ms
+  /// backoff otherwise) or zeroes its debt. That instant is never *before* `now`
+  /// — see the live read below — so no item can be selected twice at this `now`.
+  /// A past-ceiling item gets exactly one final attempt, guarded by the proto
   /// layer's own `final_attempt` flag. The number of iterations is therefore
   /// bounded by the number of live withdrawal items, which is bounded by the
   /// registrations the caller itself made — no peer can grow it.
@@ -121,6 +122,11 @@ impl Mdns {
       // `continue` without a result would leave the item due at this same `now`
       // and spin this loop forever. `Retry` re-arms it on the short backoff,
       // with the endpoint's 2 s anti-pin ceiling as the backstop.
+      //
+      // The tick's `now`, deliberately, unlike the delivered round below: this
+      // arm reaches no socket and puts nothing on any family's wire, so there is
+      // no transmission for a later one to be spaced against. The 20 ms it
+      // re-arms on is an encode-retry cadence, not the §10.1 wire interval.
       if len > send_buf.len() {
         hick_trace::warn!(
           len,
@@ -131,6 +137,28 @@ impl Mdns {
         continue;
       }
       let (v4, v6) = send_withdrawal(sockets, selfsend, send_health, &send_buf[..len]);
+      // A LIVE monotonic read, and the second clock this stage carries **on
+      // purpose** — the same split `drain_recv` makes for a self-send claim, for
+      // the same reason.
+      //
+      // `now` is the tick's PROTOCOL instant: every deadline inside a tick is
+      // weighed against one stable value, so it is what `poll_withdrawal_transmit`
+      // above and `drain_completed_withdrawals` below still receive, unchanged.
+      // The §10.1 resend schedule this call re-arms is not a deadline comparison
+      // but a real-time SPACING bound on one family's wire, and this stage is
+      // ungated by design — see `send_withdrawal` — so that schedule is the only
+      // thing pacing consecutive goodbyes. Re-arming it from `now` hands the
+      // next round every microsecond this one spent: a stall in an earlier
+      // stage, in either family's syscall, between the two, or from the
+      // scheduler. A total past the 250 ms interval leaves the next round
+      // already due, and two goodbyes for one family reach the wire nearly
+      // back-to-back — exactly the spacing §10.1 asks for and the anti-pin
+      // ceiling is separately allowed to cut short.
+      //
+      // Read before the stats bump, which is not free and would otherwise be
+      // charged to the next round's spacing. Do not fold the two clocks
+      // together.
+      let fanned_out_at = StdInstant::now();
       // `send_withdrawal` already bumped packets_tx/bytes_tx per SENT family and
       // send_errors per failed one, inside `Sockets::send_one` itself — see that
       // method's doc. What is missing there is the ROUND-level goodbyes_tx: a
@@ -141,7 +169,7 @@ impl Mdns {
       if matches!(v4, WithdrawalSend::Sent) || matches!(v6, WithdrawalSend::Sent) {
         stats.goodbyes_tx(1);
       }
-      endpoint.note_withdrawal_result(token, now, v4, v6);
+      endpoint.note_withdrawal_result(token, fanned_out_at, v4, v6);
     }
 
     // Every family's debt cleared, or the anti-pin ceiling reached: the endpoint
@@ -167,9 +195,9 @@ impl Mdns {
 /// stated here.
 ///
 /// A goodbye loops back off the joined sockets like any other multicast
-/// transmit, so its self-send credits are taken here — one per family, at the
-/// instant that family's syscall succeeded. Skipping them would let the
-/// responder ingest its own goodbye as a peer datagram.
+/// transmit, so its self-send credits are taken here — one per family that
+/// carried it. Skipping them would let the responder ingest its own goodbye as a
+/// peer datagram.
 ///
 /// **Ungated**, hence [`ALLOW_BOTH`]. The per-family wire gate paces a
 /// producer's own record set; the §10.1 resend schedule is the endpoint's, has
@@ -200,11 +228,14 @@ pub(super) fn send_withdrawal(
     loops_back: true,
   };
   for (family, outcome) in report.per_family() {
-    // The same two-stamp pair `send_and_credit` records, for the same reasons:
-    // a pre-syscall wall stamp to order the echo, a post-syscall monotonic one
-    // to age the credit. See `SelfSendTracker::record`.
-    if let Some((sent, aged_from)) = outcome.credit_stamp().zip(outcome.credit_age_anchor()) {
-      selfsend.record(family, body, sent, aged_from);
+    // The same pre-syscall wall stamp `send_and_credit` records, for the same
+    // reason: it orders the echo against the send and never ages it. This stage
+    // is the sharpest case for keeping the ageing anchor out of `record` — a
+    // goodbye pumped here can land an arbitrarily long time after stage 4's
+    // announcement in the SAME tick, and a record-time sweep would let it evict
+    // that announcement's still-unclaimed credit. See `SelfSendTracker::seal`.
+    if let Some(sent) = outcome.credit_stamp() {
+      selfsend.record(family, body, sent);
     }
   }
   health.note_fanout(report);

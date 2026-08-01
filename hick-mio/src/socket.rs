@@ -229,17 +229,24 @@ impl SendStamps {
 /// §10.1 withdrawal pump maps them onto per-family goodbye debt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendOutcome {
-  /// The datagram reached the kernel, carrying **three** separate clock reads
-  /// serving **four** distinct uses.
+  /// The datagram reached the kernel, carrying **three** separate clock reads,
+  /// one per consumer that needs a stamp from the send itself.
   ///
   /// Three, not one, and not two: each stamp is allowed to be wrong in exactly
   /// one direction, and the directions do not all agree. Folding any pair
   /// together silently breaks whichever consumer needed the other direction, so
-  /// read the field docs before "simplifying" them. Two consumers do share one
-  /// stamp — the wire gate and the self-send credit's ageing both read
-  /// `wire_at` — and they may only do so because they want the *same* direction;
-  /// see [`SendOutcome::credit_age_anchor`]. `hick-compio`'s
+  /// read the field docs before "simplifying" them. `hick-compio`'s
   /// `SendAttempt::Answered` carries the same three for the same reasons.
+  ///
+  /// There is a **fourth** use of a monotonic instant in the credit's lifetime —
+  /// the [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) ageing — and it is
+  /// deliberately not a fourth read here, nor a second consumer of `wire_at`. No
+  /// instant belonging to the send can anchor it: the driver's receive stage has
+  /// already run by the time any of these are taken, so the credit is unclaimable
+  /// for the rest of its own tick and every such instant charges claim-free time
+  /// to the window. It is anchored instead at the top of the following tick, on
+  /// the same monotonic clock and in the same late-safe direction, by
+  /// [`SelfSendTracker::seal`](crate::selfsend::SelfSendTracker::seal).
   ///
   /// **All three come from the attempt that actually succeeded.** See
   /// [`BoundSocket::send_attempt`]: the `EINTR` retry re-reads its own
@@ -254,11 +261,12 @@ pub(crate) enum SendOutcome {
     /// echo looks like a peer datagram that predated our send and this host
     /// processes its own probe or announcement as peer traffic.
     ///
-    /// It is **not** how the credit ages. `SELF_SEND_TTL` runs off
-    /// [`SendOutcome::credit_age_anchor`] precisely because the gap between this
-    /// read and the syscall is unbounded — a preemption, a page fault, or the
-    /// `EINTR` retry all widen it — and charging that gap to the credit's life
-    /// is what expires a credit before its echo can claim it.
+    /// It is **not** how the credit ages.
+    /// [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) runs off the tick-top
+    /// instant instead, precisely because the gap between this read and the
+    /// syscall is unbounded — a preemption, a page fault, or the `EINTR` retry
+    /// all widen it — and charging that gap to the credit's life is what expires
+    /// a credit before its echo can claim it.
     submitted_wall: SystemTime,
     /// Monotonic, read **before** the syscall. Anchors the **core's** refresh
     /// schedule.
@@ -269,9 +277,7 @@ pub(crate) enum SendOutcome {
     /// a refresh past the records' own TTL.
     submitted_at: StdInstant,
     /// Monotonic, read **after** the syscall returned success. Anchors
-    /// [`FamilyWireGate`](crate::driver::FamilyWireGate) and the self-send
-    /// credit's ageing — the two uses that want a POST-syscall instant, and
-    /// nothing else.
+    /// [`FamilyWireGate`](crate::driver::FamilyWireGate), and nothing else.
     ///
     /// EARLY is the UNSAFE direction here — the opposite of the two above, and
     /// the whole reason this is a third stamp rather than `submitted_at` reused.
@@ -282,8 +288,13 @@ pub(crate) enum SendOutcome {
     /// `submitted_at`, a send stalled by `P` re-opens its own family `P` early —
     /// at RFC 6762 §8.1's 250 ms inter-probe interval a 200 ms stall would leave
     /// 50 ms of true spacing, and it would do so on exactly the loaded host the
-    /// spacing exists to protect. The credit's ageing takes the same view of the
-    /// same stall from the other side: see [`SendOutcome::credit_age_anchor`].
+    /// spacing exists to protect.
+    ///
+    /// The self-send credit's ageing used to share this stamp. It no longer may:
+    /// the gate is asking "when did these bytes leave", which is a property of
+    /// this send, while the credit is asking "how long has the echo had to come
+    /// back", which cannot start before the next tick lets it. Same direction,
+    /// different question — see the type-level note above.
     wire_at: StdInstant,
   },
   /// A bound socket was **not offered** the datagram, because the caller's
@@ -336,28 +347,6 @@ impl SendOutcome {
   pub(crate) const fn credit_stamp(self) -> Option<SystemTime> {
     match self {
       Self::Sent { submitted_wall, .. } => Some(submitted_wall),
-      _ => None,
-    }
-  }
-
-  /// The instant the self-send credit starts AGEING from, if this family
-  /// carried the datagram.
-  ///
-  /// The same post-syscall monotonic read the wire gate anchors at, and shared
-  /// with it deliberately: both want the instant the kernel accepted the
-  /// datagram, and both are safe when it is LATE and unsafe when it is EARLY. A
-  /// gate anchored early re-opens a wire inside RFC 6762's minimum spacing; a
-  /// credit aged from an early instant expires before its own echo arrives, and
-  /// the endpoint then raises a phantom conflict against itself. One stamp, one
-  /// direction, two consumers.
-  ///
-  /// Never [`SendOutcome::credit_stamp`]. That one is pre-syscall by necessity —
-  /// it has to precede the kernel's own receive stamp on the echo — and the
-  /// unbounded gap it leaves is exactly what must not be charged to a two-second
-  /// TTL.
-  pub(crate) const fn credit_age_anchor(self) -> Option<StdInstant> {
-    match self {
-      Self::Sent { wire_at, .. } => Some(wire_at),
       _ => None,
     }
   }
@@ -507,6 +496,17 @@ struct BoundSocket {
   /// merely transient.
   #[cfg(test)]
   forced_permanent_recv_error: bool,
+  /// Per-call stalls injected **inside** this family's raw receive, consumed one
+  /// per read; once exhausted every receive proceeds at full speed.
+  ///
+  /// It stands in for the one thing no test can ask a real host for: the drain
+  /// thread losing the CPU between the tick's `SelfSendTracker::seal` and the
+  /// read whose claim is weighed against it. That stretch is post-opportunity
+  /// time, which [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) requires be
+  /// charged in full — and a claim that ignores it is exactly what pushes the
+  /// false-suppression window past its bound.
+  #[cfg(test)]
+  forced_recv_delays: std::collections::VecDeque<std::time::Duration>,
   /// Make every send on this family answer `WouldBlock`.
   ///
   /// A real full send buffer is not reproducible against a healthy loopback
@@ -582,6 +582,8 @@ impl BoundSocket {
       #[cfg(test)]
       forced_permanent_recv_error: false,
       #[cfg(test)]
+      forced_recv_delays: std::collections::VecDeque::new(),
+      #[cfg(test)]
       forced_send_wouldblock: false,
       #[cfg(test)]
       forced_send_eintr: 0,
@@ -613,9 +615,20 @@ impl BoundSocket {
 
   /// One `recvmsg`/`WSARecvMsg` with cmsg metadata on this family's socket.
   ///
-  /// Wraps the free [`raw_recv`] purely so a test can inject the transient,
-  /// non-consuming receive error that no healthy loopback socket will produce.
+  /// Wraps the free [`raw_recv`] purely so a test can inject what no healthy
+  /// loopback socket will produce: the transient, non-consuming receive error of
+  /// [`BoundSocket::forced_recv_errors`], and the mid-drain stall of
+  /// [`BoundSocket::forced_recv_delays`].
   fn raw_recv(&mut self, buf: &mut [u8], is_v4: bool) -> io::Result<RecvMeta> {
+    // Deliberately BEFORE the read, and before the injected errors: that is
+    // where a preempted drain thread really loses the CPU, and the stall has to
+    // be charged whether or not this particular read yields a datagram.
+    #[cfg(test)]
+    if let Some(stall) = self.forced_recv_delays.pop_front()
+      && !stall.is_zero()
+    {
+      std::thread::sleep(stall);
+    }
     #[cfg(test)]
     if self.forced_permanent_recv_error {
       return Err(io::Error::from(io::ErrorKind::NotConnected));
@@ -641,12 +654,14 @@ impl BoundSocket {
   /// # Why the stamps are read here and not by the caller
   ///
   /// A retry makes "the pre-syscall instant" ambiguous, and the wrong answer is
-  /// silently wrong. Carrying the interrupted attempt's stamps forward puts an
-  /// entire failed syscall — plus whatever preempted the thread between the two
-  /// — inside the self-send credit's `SELF_SEND_TTL`, and a stall past that TTL
-  /// makes this endpoint ingest its own multicast echo as peer traffic. Reading
-  /// them per attempt in [`BoundSocket::send_attempt`] and returning the
-  /// survivor's is the only formulation with no such window, and it keeps every
+  /// silently wrong. Carrying the interrupted attempt's stamps forward backdates
+  /// every consumer by an entire failed syscall plus whatever preempted the
+  /// thread between the two: `submitted_wall` would order the self-send credit
+  /// against an instant a whole stall before the datagram existed, widening the
+  /// window in which a co-resident peer's byte-identical datagram can steal that
+  /// credit, and `submitted_at` would tell the core its peers were refreshed
+  /// before they were. Reading them per attempt in
+  /// [`BoundSocket::send_attempt`] and returning the survivor's keeps every
   /// stamp's documented direction true of the syscall it actually describes.
   ///
   /// Also the seam for what no healthy loopback socket will produce: the
@@ -809,6 +824,16 @@ pub(crate) struct Sockets {
   /// link and one an adjacent network can drive, so it must not go untested.
   #[cfg(test)]
   forced_rx_interface: Option<u32>,
+  /// Report every received datagram as carrying no kernel receive timestamp,
+  /// overriding the cmsg metadata. See [`Sockets::rx_time`].
+  ///
+  /// [`MatchMode::Degraded`](crate::selfsend::MatchMode::Degraded) is the whole
+  /// of the self-send match on Windows and on any Unix kernel that delivers no
+  /// timestamp cmsg — and every Unix host a test runs on does deliver one, so
+  /// without this the degraded arm of the drain's claim is unreachable from a
+  /// test on every platform that can run one.
+  #[cfg(test)]
+  forced_no_rx_time: bool,
   /// Shared counters. The **same** `Arc` [`crate::endpoint::Mdns::stats`] holds
   /// and `mdns-proto`'s `Endpoint::handle()` bumps `packets_rx`/`bytes_rx` on
   /// (both clone the handle `ProtoEndpoint::stats_handle()` mints) — never a
@@ -913,6 +938,8 @@ impl Sockets {
       forced_v6_register_error: false,
       #[cfg(test)]
       forced_rx_interface: None,
+      #[cfg(test)]
+      forced_no_rx_time: false,
       #[cfg(feature = "stats")]
       stats,
     })
@@ -930,6 +957,23 @@ impl Sockets {
       return idx;
     }
     meta.interface_index()
+  }
+
+  /// The kernel receive timestamp a datagram carried, as the self-send match
+  /// must read it — `None` when the platform delivered no timestamp cmsg, which
+  /// is what degrades that match to
+  /// [`MatchMode::Degraded`](crate::selfsend::MatchMode::Degraded).
+  ///
+  /// Production reads it straight off the cmsg metadata; the `#[cfg(test)]`
+  /// override is the only way to present the timestamp-less datagram a Windows
+  /// host hands the drain on every single receive. See
+  /// [`Sockets::forced_no_rx_time`].
+  pub(crate) fn rx_time(&self, meta: &RecvMeta) -> Option<SystemTime> {
+    #[cfg(test)]
+    if self.forced_no_rx_time {
+      return None;
+    }
+    meta.rx_time()
   }
 
   /// The interface both sockets are scoped to. The RFC 6762 §11 fallback needs
@@ -1526,6 +1570,19 @@ impl Sockets {
     }
   }
 
+  /// Stall this family's next raw receives, one entry per **read**. See
+  /// [`BoundSocket::forced_recv_delays`].
+  #[cfg(test)]
+  pub(crate) fn force_recv_delays_for_test(
+    &mut self,
+    family: Family,
+    stalls: &[std::time::Duration],
+  ) {
+    if let Some(fam) = self.family_mut(family) {
+      fam.forced_recv_delays = stalls.iter().copied().collect();
+    }
+  }
+
   /// Make every send on this family answer `WouldBlock`. See
   /// [`BoundSocket::forced_send_wouldblock`] for why no real socket can be made
   /// to do it on demand, and why the path must not go untested.
@@ -1564,6 +1621,14 @@ impl Sockets {
   #[cfg(test)]
   pub(crate) const fn force_rx_interface_for_test(&mut self, idx: Option<u32>) {
     self.forced_rx_interface = idx;
+  }
+
+  /// Present every subsequent receive as carrying no kernel timestamp, which is
+  /// what drives the drain's degraded self-send claim. See
+  /// [`Sockets::forced_no_rx_time`].
+  #[cfg(test)]
+  pub(crate) const fn force_no_rx_time_for_test(&mut self) {
+    self.forced_no_rx_time = true;
   }
 
   /// When this family's sends actually reached its wire, in order. Recorded
