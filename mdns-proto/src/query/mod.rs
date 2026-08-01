@@ -631,8 +631,8 @@ where
   /// Produce the next outgoing datagram, if any. Writes into `buf`.
   ///
   /// Returns `Ok(None)` when the query is done, when no send is currently
-  /// due (i.e. `transmit_pending` is false), or when a due send would go out at
-  /// or after the caller's absolute deadline (see below). Every one of those is
+  /// due (i.e. `transmit_pending` is false), or when `clock` reads at or after
+  /// the caller's absolute deadline (see below). Every one of those is
   /// the same signal with the same meaning — *no datagram from this call, and
   /// nothing about the query has changed* — so a driver that reads `Ok(None)`
   /// as "no work here" is never wrong. A single call per scheduled
@@ -663,14 +663,24 @@ where
   /// §7.3 duplicate-question suppression arriving in it re-times a retransmission
   /// the pending confirm is about to reschedule. Debug builds assert the ordering.
   ///
-  /// # The caller's deadline is weighed against THIS call's instant
+  /// # The caller's deadline is weighed against a reading this call takes itself
   ///
   /// `QuerySpec::with_timeout` is a promise to whoever set it: no question is
   /// asked after that instant. [`Self::handle_timeout`] weighs the same
-  /// deadline, but a transmit it arms is drained against a LATER instant — the
-  /// one passed here — and nothing in between weighs that one. So a send that is
-  /// due once `now` has reached the deadline is WITHHELD, on the same
-  /// `now >= deadline` boundary `handle_timeout` uses.
+  /// deadline, but a transmit it arms is drained LATER, and nothing in between
+  /// weighs that. So a send that is due once the clock has reached the deadline
+  /// is WITHHELD, on the same `now >= deadline` boundary `handle_timeout` uses.
+  ///
+  /// `clock` is that reading, and it is a closure rather than an instant on
+  /// purpose. An instant is sampled in the caller, and whatever runs between the
+  /// sample and this comparison — a handle lookup over an uncapped pool, a walk
+  /// across other producers, a scheduler preempting either — is time the value
+  /// does not know about, so it can be stale by the time it is weighed. Moving
+  /// the sample closer only shortens that stretch; deleting the parameter
+  /// removes it, because there is no longer anything to hand a stale reading in
+  /// through. `clock` is invoked HERE, adjacent to its only consumer: at most
+  /// once, and not at all unless a datagram is otherwise due and a deadline
+  /// exists to weigh it against.
   ///
   /// Withheld, and nothing more. Ending the query here would be a terminal
   /// transition reported as `Ok(None)` — byte-identical to an idle poll, so no
@@ -687,7 +697,7 @@ where
   /// by [`Self::handle_timeout`].
   pub fn poll_transmit(
     &mut self,
-    now: I,
+    clock: impl FnOnce() -> I,
     buf: &mut [u8],
   ) -> Result<Option<Transmit>, TransmitError> {
     #[cfg(feature = "tracing")]
@@ -705,8 +715,12 @@ where
     // Nothing moves here. Withholding is the whole of what the caller's promise
     // needs, and it keeps `Ok(None)` one signal with one meaning; the terminal
     // stays with `handle_timeout`, whose wakeup `poll_timeout` still publishes.
+    //
+    // `clock()` sits inside the comparison, with nothing between the reading and
+    // the use that is its only reason to exist — not even the tracing span or
+    // the pending check above, both of which precede it.
     if let Some(deadline) = self.timeout_deadline
-      && now >= deadline
+      && clock() >= deadline
     {
       crate::trace::trace!(
         target: "mdns_proto::query",

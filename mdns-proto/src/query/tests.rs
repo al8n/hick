@@ -472,7 +472,7 @@ fn query_emits_unicast_response_bit_when_spec_set() {
   );
 
   let mut buf = [0u8; 512];
-  let result = q.poll_transmit(now, &mut buf).unwrap();
+  let result = q.poll_transmit(|| now, &mut buf).unwrap();
   let n = result.expect("expected a transmit to be produced").size();
 
   // Parse the datagram and inspect the question's QU bit.
@@ -507,7 +507,7 @@ fn query_omits_unicast_response_bit_by_default() {
   );
 
   let mut buf = [0u8; 512];
-  let result = q.poll_transmit(now, &mut buf).unwrap();
+  let result = q.poll_transmit(|| now, &mut buf).unwrap();
   let n = result.expect("expected a transmit to be produced").size();
 
   let reader = MessageReader::try_parse(&buf[..n]).expect("datagram must parse");
@@ -640,7 +640,7 @@ fn a_send_drained_past_the_absolute_deadline_is_never_emitted() {
 
   let mut buf = [0u8; 512];
   assert!(
-    q.poll_transmit(t0, &mut buf).unwrap().is_some(),
+    q.poll_transmit(|| t0, &mut buf).unwrap().is_some(),
     "the first send is inside the window and must go out"
   );
   q.note_transmit_outcome(t0, TransmitDelivery::ALL);
@@ -657,7 +657,7 @@ fn a_send_drained_past_the_absolute_deadline_is_never_emitted() {
   // The driver drains it only after the caller's deadline has passed.
   let drained_at = t0.checked_add(Duration::from_secs(3)).unwrap();
   assert!(
-    q.poll_transmit(drained_at, &mut buf).unwrap().is_none(),
+    q.poll_transmit(|| drained_at, &mut buf).unwrap().is_none(),
     "no question may go out after the caller's absolute deadline"
   );
   assert!(
@@ -716,7 +716,7 @@ fn a_send_drained_inside_the_absolute_deadline_still_goes_out() {
 
   let mut buf = [0u8; 512];
   assert!(
-    q.poll_transmit(t0, &mut buf).unwrap().is_some(),
+    q.poll_transmit(|| t0, &mut buf).unwrap().is_some(),
     "the first send is inside the window and must go out"
   );
   q.note_transmit_outcome(t0, TransmitDelivery::ALL);
@@ -724,7 +724,7 @@ fn a_send_drained_inside_the_absolute_deadline_still_goes_out() {
   let armed_at = t0.checked_add(Duration::from_secs(1)).unwrap();
   q.handle_timeout(armed_at).unwrap();
   assert!(
-    q.poll_transmit(armed_at, &mut buf).unwrap().is_some(),
+    q.poll_transmit(|| armed_at, &mut buf).unwrap().is_some(),
     "a retry drained well inside the window must still be sent"
   );
   assert!(
@@ -763,7 +763,7 @@ fn a_transmit_poll_past_the_deadline_does_not_retire_an_unconfirmed_send() {
 
   let mut buf = [0u8; 512];
   assert!(
-    q.poll_transmit(t0, &mut buf).unwrap().is_some(),
+    q.poll_transmit(|| t0, &mut buf).unwrap().is_some(),
     "the first send is inside the window and must go out"
   );
   assert!(q.awaiting_send_confirm, "the commit token must be live");
@@ -771,7 +771,7 @@ fn a_transmit_poll_past_the_deadline_does_not_retire_an_unconfirmed_send() {
   // The send outlives the window and the driver re-polls before confirming.
   let past = t0.checked_add(Duration::from_millis(200)).unwrap();
   assert!(
-    q.poll_transmit(past, &mut buf).unwrap().is_none(),
+    q.poll_transmit(|| past, &mut buf).unwrap().is_none(),
     "a re-poll during the confirm window produces no second datagram"
   );
   assert!(
@@ -837,7 +837,7 @@ fn poll_timeout_reflects_absolute_timeout() {
   // past the 100 ms timeout). handle_timeout(now) is then a no-op: the retry is
   // not yet due.
   let mut buf = [0u8; 512];
-  let _ = q.poll_transmit(now, &mut buf).unwrap();
+  let _ = q.poll_transmit(|| now, &mut buf).unwrap();
   q.note_transmit_outcome(now, TransmitDelivery::ALL);
   q.handle_timeout(now).unwrap();
   assert!(!q.done, "query must not be done immediately");
@@ -898,7 +898,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
 
   // First send (the initial query) is immediately due.
   assert!(
-    q.poll_transmit(now, &mut buf).unwrap().is_some(),
+    q.poll_transmit(|| now, &mut buf).unwrap().is_some(),
     "initial query must be sent at now"
   );
   // the retry is scheduled on a CONFIRMED delivery, not at encode
@@ -918,7 +918,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
   // second datagram (no duplicate at now).
   q.handle_timeout(now).unwrap();
   assert!(
-    q.poll_transmit(now, &mut buf).unwrap().is_none(),
+    q.poll_transmit(|| now, &mut buf).unwrap().is_none(),
     "no duplicate query may be emitted at now"
   );
   assert_eq!(
@@ -931,7 +931,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
   // following retry is scheduled 2s later (now + 3s), honouring the ≥2x backoff.
   q.handle_timeout(one_sec).unwrap();
   assert!(
-    q.poll_transmit(one_sec, &mut buf).unwrap().is_some(),
+    q.poll_transmit(|| one_sec, &mut buf).unwrap().is_some(),
     "first retry must be sent at now + 1s"
   );
   q.note_transmit_outcome(one_sec, TransmitDelivery::ALL);
@@ -970,7 +970,7 @@ fn failed_send_does_not_consume_retry_budget() {
   // out, and must keep re-attempting (transmit due again after the backoff).
   let mut t = now;
   for _ in 0..50 {
-    let sent = q.poll_transmit(t, &mut buf).unwrap().is_some();
+    let sent = q.poll_transmit(|| t, &mut buf).unwrap().is_some();
     assert!(sent, "query must keep attempting to send while undelivered");
     q.note_transmit_outcome(t, TransmitDelivery::NONE); // all sockets failed
     assert!(!q.is_done(), "an undelivered query must NOT time out");
@@ -986,7 +986,7 @@ fn failed_send_does_not_consume_retry_budget() {
 
   // Now let a send succeed: the budget finally advances and normal backoff
   // resumes (first confirmed retry at +1s).
-  assert!(q.poll_transmit(t, &mut buf).unwrap().is_some());
+  assert!(q.poll_transmit(|| t, &mut buf).unwrap().is_some());
   q.note_transmit_outcome(t, TransmitDelivery::ALL);
   let plus_1s = t.checked_add(Duration::from_secs(1)).unwrap();
   assert_eq!(
@@ -1016,7 +1016,7 @@ fn query_retry_anchored_to_confirmation_time() {
     None,
   );
   let mut buf = [0u8; 512];
-  assert!(q.poll_transmit(t0, &mut buf).unwrap().is_some());
+  assert!(q.poll_transmit(|| t0, &mut buf).unwrap().is_some());
 
   // The send completes 5 s later — longer than the 1 s first backoff.
   let send_done = t0.checked_add(Duration::from_secs(5)).unwrap();
@@ -1195,7 +1195,7 @@ fn retry_budget_exhaustion_retires_the_query() {
   for _ in 0..(MAX_RETRIES as usize + 5) {
     now += std::time::Duration::from_secs(120); // past the 60s backoff cap
     q.handle_timeout(now).unwrap();
-    if let Ok(Some(_)) = q.poll_transmit(now, &mut buf) {
+    if let Ok(Some(_)) = q.poll_transmit(|| now, &mut buf) {
       q.note_transmit_outcome(now, TransmitDelivery::ALL); // confirmed send burns one retry slot
     }
     if q.is_done() {
@@ -1301,7 +1301,7 @@ fn duplicate_question_exhaustion_produces_timeout_and_correct_stats() {
 /// Emit the query's pending datagram, leaving its confirm outstanding.
 fn emit_question(q: &mut TestQuery, now: StdInstant) {
   let mut buf = std::vec![0u8; 512];
-  q.poll_transmit(now, &mut buf)
+  q.poll_transmit(|| now, &mut buf)
     .unwrap()
     .expect("a due query must produce a datagram");
 }

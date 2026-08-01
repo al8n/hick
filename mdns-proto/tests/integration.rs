@@ -68,7 +68,7 @@ fn querier_emits_question_on_first_poll() {
   let (mut e, h) = build_querier();
   let mut buf = [0u8; 1500];
   let now = StdInstant::now();
-  let tx = e.poll_query_transmit(h, now, &mut buf).unwrap();
+  let tx = e.poll_query_transmit(h, || now, &mut buf).unwrap();
   assert!(tx.is_some());
   let t = tx.unwrap();
   assert_eq!(t.dst().port(), 5353);
@@ -252,7 +252,7 @@ fn query_polls_one_transmit_per_deadline() {
   let now = StdInstant::now();
 
   // First call: transmit_pending starts true → yields a datagram.
-  let tx1 = e.poll_query_transmit(h, now, &mut buf).unwrap();
+  let tx1 = e.poll_query_transmit(h, || now, &mut buf).unwrap();
   assert!(tx1.is_some(), "expected first poll_transmit to return Some");
   // the retry is scheduled on a CONFIRMED delivery, not at encode
   // time. Confirm the send so the backoff deadline is armed.
@@ -263,7 +263,7 @@ fn query_polls_one_transmit_per_deadline() {
   );
 
   // Second call immediately: transmit_pending is now false → None.
-  let tx2 = e.poll_query_transmit(h, now, &mut buf).unwrap();
+  let tx2 = e.poll_query_transmit(h, || now, &mut buf).unwrap();
   assert!(
     tx2.is_none(),
     "expected second poll_transmit (same tick) to return None"
@@ -274,14 +274,14 @@ fn query_polls_one_transmit_per_deadline() {
   e.handle_query_timeout(h, later).unwrap();
 
   // After handle_query_timeout fires, transmit_pending is set again.
-  let tx3 = e.poll_query_transmit(h, later, &mut buf).unwrap();
+  let tx3 = e.poll_query_transmit(h, || later, &mut buf).unwrap();
   assert!(
     tx3.is_some(),
     "expected poll_transmit after handle_query_timeout to return Some"
   );
 
   // And again it is consumed: a second call still returns None.
-  let tx4 = e.poll_query_transmit(h, later, &mut buf).unwrap();
+  let tx4 = e.poll_query_transmit(h, || later, &mut buf).unwrap();
   assert!(
     tx4.is_none(),
     "expected poll_transmit to be None after consuming the retry send"

@@ -2081,9 +2081,16 @@ fn a_query_ended_past_its_deadline_wakes_the_next_parked_on_it() {
   // shuts, less the slack that must still be open at the first draw. Neither
   // half is assumed: the slack is asserted before that draw and the crossing is
   // asserted after the fan-out.
-  let t0 = StdInstant::now()
-    .checked_sub(ESTABLISH_LADDER + window - WINDOW_STILL_OPEN)
-    .expect("the monotonic clock must reach back over the schedule this replays");
+  //
+  // How far back the monotonic clock reaches is a property of the HOST, decided
+  // before any of the behaviour below runs: a machine booted moments ago has no
+  // instant this far in its past to anchor at. That is a setup this host cannot
+  // provide, not an outcome, so it skips rather than fails.
+  let Some(t0) = StdInstant::now().checked_sub(ESTABLISH_LADDER + window - WINDOW_STILL_OPEN)
+  else {
+    eprintln!("skipping: this host's monotonic clock is too young to subtract from");
+    return;
+  };
   let mut buf = vec![0u8; 4096];
 
   // The earlier producer: an established service, drained of its lifecycle

@@ -104,7 +104,7 @@ fn query_delegation_tolerates_unknown_handles() {
   let now = StdInstant::now();
   let mut buf = std::vec![0u8; 512];
   assert!(matches!(
-    e.poll_query_transmit(bogus, now, &mut buf),
+    e.poll_query_transmit(bogus, || now, &mut buf),
     Ok(None)
   ));
   e.note_query_transmit_outcome(bogus, now, TransmitDelivery::ALL); // no-op on an unknown handle
@@ -955,7 +955,7 @@ fn duplicate_qm_question_suppresses_planned_query() {
       .unwrap();
     let mut buf = [0u8; 512];
     assert!(
-      e.poll_query_transmit(h, now, &mut buf).unwrap().is_some(),
+      e.poll_query_transmit(h, || now, &mut buf).unwrap().is_some(),
       "control: a started query transmits when no duplicate is seen"
     );
   }
@@ -979,7 +979,7 @@ fn duplicate_qm_question_suppresses_planned_query() {
 
   let mut buf = [0u8; 512];
   assert!(
-    e.poll_query_transmit(h, now, &mut buf).unwrap().is_none(),
+    e.poll_query_transmit(h, || now, &mut buf).unwrap().is_none(),
     "§7.3: observing a duplicate QM question must suppress our planned query"
   );
   assert!(
@@ -1019,7 +1019,7 @@ fn qu_duplicate_question_does_not_suppress_query() {
 
   let mut buf = [0u8; 512];
   assert!(
-    e.poll_query_transmit(h, now, &mut buf).unwrap().is_some(),
+    e.poll_query_transmit(h, || now, &mut buf).unwrap().is_some(),
     "§7.3: a QU duplicate must NOT suppress our query (it elicits no multicast answer)"
   );
 }
@@ -1057,7 +1057,7 @@ fn legacy_source_duplicate_does_not_suppress_query() {
 
   let mut buf = [0u8; 512];
   assert!(
-    e.poll_query_transmit(h, now, &mut buf).unwrap().is_some(),
+    e.poll_query_transmit(h, || now, &mut buf).unwrap().is_some(),
     "§7.3: a legacy-source (non-5353) duplicate must NOT suppress our query"
   );
 }
@@ -1098,7 +1098,7 @@ fn repeated_duplicate_questions_do_not_stall_query_forever() {
   for _ in 0..32 {
     let _ = e.handle(now, src, local_ip, 0, &qbuf[..n], false).unwrap();
     assert!(
-      e.poll_query_transmit(h, now, &mut buf).unwrap().is_none(),
+      e.poll_query_transmit(h, || now, &mut buf).unwrap().is_none(),
       "each duplicate suppresses the planned transmit"
     );
     match e.poll_query_timeout(h) {
@@ -1143,7 +1143,7 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
   // Send the first query and confirm delivery → a retransmit is scheduled
   // (next_deadline ≈ now+1s) with transmit_pending cleared.
   let mut buf = [0u8; 512];
-  assert!(e.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
+  assert!(e.poll_query_transmit(h, || now, &mut buf).unwrap().is_some());
   e.note_query_transmit_outcome(h, now, TransmitDelivery::ALL);
   let t1 = e
     .poll_query_timeout(h)
@@ -1171,7 +1171,7 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
   // Arming the now-stale deadline must not transmit (slot already consumed).
   e.handle_query_timeout(h, t1).unwrap();
   assert!(
-    e.poll_query_transmit(h, t1, &mut buf).unwrap().is_none(),
+    e.poll_query_transmit(h, || t1, &mut buf).unwrap().is_none(),
     "§7.3: no redundant transmit after the due slot was suppressed"
   );
 }
@@ -1555,7 +1555,7 @@ fn a_query_whose_timeout_overflows_the_instant_still_transmits() {
   let much_later = now.checked_add(Duration::from_secs(86_400)).unwrap();
   let mut buf = [0u8; 512];
   assert!(
-    e.poll_query_transmit(h, much_later, &mut buf)
+    e.poll_query_transmit(h, || much_later, &mut buf)
       .unwrap()
       .is_some(),
     "a query with no effective deadline must still transmit"
@@ -1563,6 +1563,123 @@ fn a_query_whose_timeout_overflows_the_instant_still_transmits() {
   assert!(
     e.poll_query(h).is_none(),
     "a query with no effective deadline must not have reached a terminal"
+  );
+}
+
+/// The stretch between resolving a query handle and drawing its question is not
+/// free: `poll_query_transmit` finds the handle by scanning a pool with no
+/// capacity bound, and a preempted scan can take arbitrarily long whatever its
+/// length. An instant the CALLER sampled — even one sampled on the statement
+/// before the call — is therefore already history by the time the core weighs
+/// it, so a question whose `QuerySpec::with_timeout` window shut during that
+/// stretch would be admitted on the strength of a reading taken while the window
+/// was still open, and the caller would be told a question was asked inside a
+/// window that had closed.
+///
+/// The clock is passed instead of a reading of it, so there is no parameter for
+/// a stale reading to arrive through: the core samples at the comparison, after
+/// the scan. This test burns real time in exactly that gap and then asks for the
+/// question, with the window already shut.
+///
+/// The two halves differ only in how long resolution took, so what withholds the
+/// question is the elapsed time and nothing else. And the withheld half stops at
+/// withholding: the terminal stays with `handle_query_timeout`, whose wakeup
+/// `poll_query_timeout` must still publish.
+#[test]
+fn a_window_that_shuts_during_handle_resolution_withholds_the_question() {
+  use crate::{config::QuerySpec, wire::ResourceType};
+  use core::time::Duration;
+
+  /// The caller's window, wide enough that reaching the poll inside it is not a
+  /// race and narrow enough that a scan can outlive it.
+  const WINDOW: Duration = Duration::from_millis(300);
+  /// What resolution costs when the window survives it — a small fraction of
+  /// `WINDOW`, so the control half is not a race either.
+  const SCAN_INSIDE: Duration = Duration::from_millis(20);
+  /// What resolution costs when it outlives the window.
+  const SCAN_PAST: Duration = Duration::from_millis(450);
+
+  let mut e = build_endpoint();
+  let mut buf = std::vec![0u8; 512];
+
+  // Entries for the scan to walk, so the handle under test is genuinely found by
+  // a linear pass over the pool rather than by a lookup that could not cost
+  // anything.
+  for i in 0..8u16 {
+    let decoy = Name::try_from_str(&std::format!("decoy{i}.local.")).unwrap();
+    e.try_start_query(
+      QuerySpec::new(decoy, ResourceType::A),
+      StdInstant::now(),
+    )
+    .unwrap();
+  }
+
+  // Control: resolution finishes well inside the window, and the question goes
+  // out. Without this the assertion below would also pass on an endpoint that
+  // never transmits for a query carrying a timeout at all.
+  let inside = e
+    .try_start_query(
+      QuerySpec::new(Name::try_from_str("inside.local.").unwrap(), ResourceType::A)
+        .with_timeout(WINDOW),
+      StdInstant::now(),
+    )
+    .unwrap();
+  let inside_deadline = e
+    .poll_query_timeout(inside)
+    .expect("a query given a timeout must carry its absolute deadline");
+  e.query_resolve_stall = Some(SCAN_INSIDE);
+  assert!(
+    StdInstant::now() < inside_deadline,
+    "premise: the control's window must still be open when the poll begins"
+  );
+  assert!(
+    e.poll_query_transmit(inside, StdInstant::now, &mut buf)
+      .unwrap()
+      .is_some(),
+    "a question drawn while the caller's window is open must go out"
+  );
+
+  // The fault: resolution outlives the window.
+  let past = e
+    .try_start_query(
+      QuerySpec::new(Name::try_from_str("past.local.").unwrap(), ResourceType::A)
+        .with_timeout(WINDOW),
+      StdInstant::now(),
+    )
+    .unwrap();
+  let past_deadline = e
+    .poll_query_timeout(past)
+    .expect("a query given a timeout must carry its absolute deadline");
+  e.query_resolve_stall = Some(SCAN_PAST);
+  assert!(
+    StdInstant::now() < past_deadline,
+    "premise: the window must still be open when the poll begins, so the only \
+     thing that can shut it is the resolution the endpoint is about to spend"
+  );
+  let drawn = e.poll_query_transmit(past, StdInstant::now, &mut buf).unwrap();
+  assert!(
+    StdInstant::now() >= past_deadline,
+    "premise: resolution must have outlived the window, or nothing was asked \
+     past a deadline and the assertion below is vacuous"
+  );
+  assert!(
+    drawn.is_none(),
+    "the caller's window shut while the endpoint was still resolving the \
+     handle, but the question was admitted anyway — the deadline was weighed \
+     against an instant read before the scan instead of at the comparison"
+  );
+
+  // Withheld, not ended: the terminal belongs to `handle_query_timeout`, and the
+  // wakeup that reaches it must still be published.
+  assert!(
+    e.poll_query(past).is_none(),
+    "withholding a late question must not terminate the query"
+  );
+  assert_eq!(
+    e.poll_query_timeout(past),
+    Some(past_deadline),
+    "the deadline the withheld question was weighed against must still be \
+     scheduled, or no driver would ever wake to end the query"
   );
 }
 
@@ -3320,7 +3437,7 @@ fn cancel_query_under_a_live_send_confirm_trips_the_contract_assertion() {
     .try_start_query(QuerySpec::new(qname, ResourceType::A), now)
     .unwrap();
   let mut buf = std::vec![0u8; 512];
-  e.poll_query_transmit(h, now, &mut buf)
+  e.poll_query_transmit(h, || now, &mut buf)
     .unwrap()
     .expect("a newly-started query has its first question due");
   let _ = e.cancel_query(h);
@@ -3343,7 +3460,7 @@ fn retire_query_under_a_live_send_confirm_trips_the_contract_assertion() {
     .try_start_query(QuerySpec::new(qname, ResourceType::A), now)
     .unwrap();
   let mut buf = std::vec![0u8; 512];
-  e.poll_query_transmit(h, now, &mut buf)
+  e.poll_query_transmit(h, || now, &mut buf)
     .unwrap()
     .expect("a newly-started query has its first question due");
   e.retire_query(h);
@@ -3474,7 +3591,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 
   // (a) Drain the initial transmit without confirming → awaiting_send_confirm=true.
   let mut tx_buf = std::vec![0u8; 512];
-  let tx = e.poll_query_transmit(h, now, &mut tx_buf).unwrap();
+  let tx = e.poll_query_transmit(h, || now, &mut tx_buf).unwrap();
   assert!(
     tx.is_some(),
     "newly-started query must have an initial transmit pending"
@@ -7086,7 +7203,7 @@ fn questions_before_the_query_retires(delivery: TransmitDelivery) -> usize {
   let mut buf = std::vec![0u8; 512];
   let mut sent = 0usize;
   while ep
-    .poll_query_transmit(h, now, &mut buf)
+    .poll_query_transmit(h, || now, &mut buf)
     .unwrap()
     .is_some()
   {
@@ -7119,7 +7236,7 @@ fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
     )
     .unwrap();
   let mut buf = std::vec![0u8; 512];
-  assert!(ep.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
+  assert!(ep.poll_query_transmit(h, || now, &mut buf).unwrap().is_some());
 
   ep.note_query_transmit_outcome(h, now, TransmitDelivery::V4_ONLY);
   let after_partial = ep.poll_query_timeout(h);
@@ -7134,7 +7251,7 @@ fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
   for _ in 1..crate::service::MAX_PARTIAL_ROUNDS {
     let due = ep.poll_query_timeout(h).unwrap();
     ep.handle_query_timeout(h, due).unwrap();
-    assert!(ep.poll_query_transmit(h, due, &mut buf).unwrap().is_some());
+    assert!(ep.poll_query_transmit(h, || due, &mut buf).unwrap().is_some());
     ep.note_query_transmit_outcome(h, due, TransmitDelivery::V4_ONLY);
   }
   assert!(

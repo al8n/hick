@@ -885,17 +885,18 @@ impl State {
       }
       #[cfg(test)]
       Self::stall_before_query_poll(&mut self.forced_query_poll_delays);
-      // The instant this question would leave on, read HERE and nowhere earlier.
-      // It is the only thing the core weighs against a query's
-      // `QuerySpec::with_timeout` deadline, and that deadline is a bound the
-      // CALLER holds — no question asked at or after it — so it is real-time.
-      // The `now` this call was handed is the run loop's per-iteration reading,
-      // taken before the service snapshot, the whole service walk, and every
-      // preceding query of this same call; both maps are uncapped, so the
-      // caller's window can shut inside it. No `await` divides that stretch,
-      // which is exactly why no re-read outside the call can stand in for one
-      // inside it: elapsed time needs no suspension point to accrue. Per query
-      // rather than per call, because each poll is its own decision.
+      // The CLOCK, not a reading of it. The core weighs a query's
+      // `QuerySpec::with_timeout` deadline — a bound the CALLER holds, no
+      // question asked at or after it — against the instant the question would
+      // leave on, and it takes that instant itself, at the comparison. This
+      // driver hands over the source and keeps no reading of its own: the `now`
+      // this call was handed is the run loop's per-iteration reading, taken
+      // before the service snapshot, the whole service walk and every preceding
+      // query of this same call, and a reading taken right here would still
+      // predate the handle lookup the core does before it compares. Both maps are
+      // uncapped, and no `await` divides any of it — elapsed time needs no
+      // suspension point to accrue, which is why no reading OUTSIDE the
+      // comparison can stand in for one at it.
       //
       // The RFC 6762 §5.2 retry ladder is not this deadline and does not move
       // here. That ladder, the endpoint's own timers and each service's
@@ -904,8 +905,10 @@ impl State {
       // disagreeing about "now" can fire a deadline twice or skip it, while the
       // quantization never leaves the core. Which kind an instant is depends on
       // who was promised it, never on the comparison that weighs it.
-      let at_poll = StdInstant::now();
-      match self.endpoint.poll_query_transmit(h, at_poll, scratch) {
+      match self
+        .endpoint
+        .poll_query_transmit(h, StdInstant::now, scratch)
+      {
         // A datagram is ready — hand it to the driver to send.
         Ok(Some(t)) => return Some((t, TransmitOrigin::Query(h))),
         // Nothing due right now — try the next query.

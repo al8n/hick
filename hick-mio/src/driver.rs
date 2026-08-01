@@ -992,23 +992,24 @@ impl Mdns {
             if spent >= quantum {
               break true;
             }
-            // The instant this question would leave on, read HERE and nowhere
-            // earlier. It is the only thing the core weighs against a query's
-            // `QuerySpec::with_timeout` deadline, and that deadline is a bound
-            // the CALLER holds — no question asked at or after it — so it is
-            // real-time. The tick's reading predates stages 1 through 3, so a
-            // retry armed just inside the window and drained after a slow
-            // receive would be admitted by an instant taken while the window was
-            // still open, and the question would reach the wire past a deadline
-            // the caller was promised. Per datagram rather than per slot,
-            // because this loop sends between its iterations.
+            // The CLOCK, not a reading of it. The core weighs a query's
+            // `QuerySpec::with_timeout` deadline — a bound the CALLER holds, no
+            // question asked at or after it — against the instant the question
+            // would leave on, and it takes that instant itself, at the
+            // comparison. This driver hands over the source and keeps no reading
+            // of its own: the tick's instant predates stages 1 through 3, and any
+            // reading taken here would still predate the handle lookup the core
+            // does before it compares, so neither can stand in.
             //
             // The RFC 6762 §5.2 retry ladder is not this deadline and does not
             // move here: `handle_query_timeout` fires it in stage 3 against the
             // tick's protocol instant, and both it and the terminal stay there.
             // See this module's clock rule.
-            let at_poll = StdInstant::now();
-            let tx = match endpoint.poll_query_transmit(handle, at_poll, send_buf.as_mut_slice()) {
+            let tx = match endpoint.poll_query_transmit(
+              handle,
+              StdInstant::now,
+              send_buf.as_mut_slice(),
+            ) {
               Ok(Some(tx)) => tx,
               Ok(None) => break false,
               Err(_e) => {
