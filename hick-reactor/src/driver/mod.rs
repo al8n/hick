@@ -799,11 +799,11 @@ impl<N: Net> DriverState<N> {
     let queries_first = self.queries_first;
     let mut more_pending = false;
     if queries_first {
-      more_pending |= self.drain_query_transmits(now, budget, scratch).await;
+      more_pending |= self.drain_query_transmits(budget, scratch).await;
       more_pending |= self.drain_service_transmits(now, budget, scratch).await;
     } else {
       more_pending |= self.drain_service_transmits(now, budget, scratch).await;
-      more_pending |= self.drain_query_transmits(now, budget, scratch).await;
+      more_pending |= self.drain_query_transmits(budget, scratch).await;
     }
     // Only a CUT pass rotates the class order. A pass that drained everything
     // leaves the order alone, so the steady state stays services-first and
@@ -995,12 +995,7 @@ impl<N: Net> DriverState<N> {
 
   /// The query half of [`Self::drain_transmits`]. Returns `true` if the budget
   /// cut it short with queries left unvisited.
-  async fn drain_query_transmits(
-    &mut self,
-    now: StdInstant,
-    budget: &mut DrainBudget,
-    scratch: &mut [u8],
-  ) -> bool {
+  async fn drain_query_transmits(&mut self, budget: &mut DrainBudget, scratch: &mut [u8]) -> bool {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
     let Self {
@@ -1057,9 +1052,28 @@ impl<N: Net> DriverState<N> {
           more_pending = true;
           break 'query_loop;
         }
+        // The instant this question would leave on, read HERE and nowhere
+        // earlier. It is the only thing the core weighs against a query's
+        // `QuerySpec::with_timeout` deadline, and that deadline is a bound the
+        // CALLER holds — no question asked at or after it. The pass's `now` is
+        // read before `sweep_closed_handles`, `fire_timeouts`, and (in the
+        // default order) the whole service drain, whose fan-outs are AWAITED —
+        // so a retry armed just inside the window and drained after them would
+        // be admitted by an instant taken while the window was still open, and
+        // the question would reach the wire past a deadline the caller was
+        // promised. Per datagram rather than per query, because this loop awaits
+        // a fan-out between its iterations.
+        //
+        // Its own reading, spent on this one decision: the fan-out below takes no
+        // `now` of any kind — each family's wire gate is weighed at ITS OWN send
+        // point (`attempt_gated_send_to`), against a reading taken there, which is
+        // a different question about a different subject. The RFC 6762 §5.2 retry
+        // ladder is not this deadline either — `fire_timeouts` fires it against
+        // the pass's instant, and both it and the terminal stay there.
+        let at_poll = StdInstant::now();
         // surface encoding errors instead of treating them
         // as "no more transmits".
-        let tx = match endpoint.poll_query_transmit(h, now, scratch) {
+        let tx = match endpoint.poll_query_transmit(h, at_poll, scratch) {
           Ok(Some(t)) => t,
           Ok(None) => break,
           Err(_e) => {
@@ -2568,7 +2582,14 @@ async fn driver_task<N: Net>(
     // control flow can't be confused with the select macro's internals.
     let mut closed = false;
     if let Some(at) = deadline {
-      let dur = at.saturating_duration_since(now);
+      // How long to sleep is measured from the moment the sleep starts, not from
+      // the top of a pass that has since awaited every fan-out in it. The pass's
+      // `now` is stale by exactly the wall clock those sends took, so a duration
+      // derived from it overshoots the absolute deadline by the same amount —
+      // and a §5.2 retry, a §8.3 announcement or a caller's query window would
+      // be woken that late. `sleep` takes a duration, so the subtraction is
+      // unavoidable; taking it here is what keeps the result a real interval.
+      let dur = at.saturating_duration_since(StdInstant::now());
       let sleep = <N::Runtime as RuntimeLite>::sleep(dur).fuse();
       pin_mut!(sleep);
       select_biased! {

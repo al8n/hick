@@ -70,7 +70,10 @@
 //! self-send credit's age, a wire's spacing gap, when a withdrawal schedule
 //! begins, when its next round is due, whether a lookup's
 //! [`QueryParam::with_timeout`](crate::QueryParam::with_timeout) window is still
-//! open — is read at the decision by the code that makes it. The strongest form
+//! open, whether a query's
+//! [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window still
+//! admits the question stage 4 is about to put on the wire — is read at the
+//! decision by the code that makes it. The strongest form
 //! is to take no instant at all, which is what
 //! [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take),
 //! [`send_and_credit`], [`Mdns::push_updates`], [`Mdns::advance_lookups`] and
@@ -89,6 +92,14 @@
 //! was shut, and stage 6 is where the tick's reading is at its stalest. So the
 //! lookup's own boundary is real-time even though a sub-query's §5.2 ladder,
 //! sitting one layer below it, is not.
+//!
+//! A **query** carries the same pair, one layer down and in one stage: stage 4
+//! polls it for a datagram and the core admits that datagram only while the
+//! caller's [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout)
+//! window is open, while stage 3 fires the §5.2 ladder that armed it. The ladder
+//! is the core's own schedule and keeps the tick's instant; the window is the
+//! caller's and is read where the question is drawn. Two decisions, one query,
+//! and the answer to *who was promised it* differs between them.
 //!
 //! What is left is the instructions between the read and the comparison, and it
 //! is irreducible — something must read a clock before something can compare
@@ -759,6 +770,15 @@ impl Mdns {
   /// the confirm to a later stage is what a parked-send table would require, and
   /// it would leave a commit token live across `handle_event`, `handle_timeout`,
   /// a rename, and a teardown.
+  ///
+  /// # `now` is this stage's protocol instant, and one decision is not on it
+  ///
+  /// A service's probe index and announcement phase are the core's own schedule
+  /// and are weighed against the tick's instant here. A query's
+  /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window is
+  /// not: it is a real-time bound the caller holds, so the query arm reads its
+  /// own instant at the poll that would draw the question. See this module's
+  /// clock rule, and do not fold the two back together.
   fn drain_transmits(&mut self, now: StdInstant) {
     let Self {
       endpoint,
@@ -972,7 +992,23 @@ impl Mdns {
             if spent >= quantum {
               break true;
             }
-            let tx = match endpoint.poll_query_transmit(handle, now, send_buf.as_mut_slice()) {
+            // The instant this question would leave on, read HERE and nowhere
+            // earlier. It is the only thing the core weighs against a query's
+            // `QuerySpec::with_timeout` deadline, and that deadline is a bound
+            // the CALLER holds — no question asked at or after it — so it is
+            // real-time. The tick's reading predates stages 1 through 3, so a
+            // retry armed just inside the window and drained after a slow
+            // receive would be admitted by an instant taken while the window was
+            // still open, and the question would reach the wire past a deadline
+            // the caller was promised. Per datagram rather than per slot,
+            // because this loop sends between its iterations.
+            //
+            // The RFC 6762 §5.2 retry ladder is not this deadline and does not
+            // move here: `handle_query_timeout` fires it in stage 3 against the
+            // tick's protocol instant, and both it and the terminal stay there.
+            // See this module's clock rule.
+            let at_poll = StdInstant::now();
+            let tx = match endpoint.poll_query_transmit(handle, at_poll, send_buf.as_mut_slice()) {
               Ok(Some(tx)) => tx,
               Ok(None) => break false,
               Err(_e) => {

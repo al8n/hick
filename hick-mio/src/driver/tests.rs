@@ -4297,3 +4297,133 @@ fn the_endpoints_goodbye_budget_is_what_the_driver_projects() {
      does not have"
   );
 }
+
+// ── stage 4 weighs the caller's query window on its own clock ───────────────
+//
+// `QuerySpec::with_timeout` is a promise to whoever set it: no question is asked
+// at or after the instant it makes absolute. The core keeps that promise inside
+// `Query::poll_transmit`, weighed against the instant the driver hands in — so
+// the promise is worth exactly what that reading is worth. The tick's reading is
+// taken before stages 1 through 3, and stage 1 is bounded by a peer rather than
+// by this host: a window that shuts while the receive is still running is
+// invisible to it, and the question goes out after the caller was told none
+// would.
+//
+// The §5.2 ladder underneath the same query is the opposite case and stays on
+// the tick's instant — see this module's clock rule.
+
+/// A receive stage that alone outlives the caller's whole window, so the
+/// crossing is this stall's rather than a slow runner's.
+const RECV_OUTLIVES_QUERY_WINDOW: Duration = Duration::from_millis(600);
+
+/// The window the caller asks for. Short enough that the stall above clears it
+/// several times over, long enough that reaching stage 4 inside it is not a race.
+const CALLER_QUERY_WINDOW: Duration = Duration::from_millis(150);
+
+/// A question drawn after the caller's window shut must not reach the wire — and
+/// the query must still end where its deadline's owner ends it.
+///
+/// The window is a real 150 ms measured from `start_query`, and stage 1 is made
+/// to lose the CPU for 600 ms of it. That stall lands *before* the read, so it is
+/// charged whether or not a datagram is waiting, and it puts the deadline inside
+/// the tick with stage 4 still to run — which no arrangement of the query's own
+/// fields can do, since those fields are what the core reads.
+///
+/// What it catches: stage 4 handing the core the instant `tick` read at its top.
+/// That reading is *before* the deadline here — asserted rather than assumed, so
+/// a slow host fails the premise loudly instead of passing on the
+/// already-expired path — so a stage 4 that trusts it draws a question the
+/// caller's window has in fact already closed on, and multicasts it.
+///
+/// The wire count is the discriminator, and it is IPv4's own record rather than
+/// the driver's account of it. The closing half asserts the withheld send left
+/// the deadline standing: withholding defers the terminal to `handle_timeout`,
+/// so a caller that would have been told `Timeout` must still be told it, on the
+/// wakeup `next_timeout` already publishes.
+#[test]
+fn a_question_drawn_past_the_callers_window_never_reaches_the_wire() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  if !mdns.sockets.is_bound_for_test(Family::V4) {
+    eprintln!("skipping: IPv4 is not bound on this host");
+    return;
+  }
+  let handle = mdns
+    .start_query(
+      test_support::query_spec("_hick-mio-late-question._tcp.local.")
+        .with_timeout(CALLER_QUERY_WINDOW),
+    )
+    .expect("start_query");
+  let deadline = mdns
+    .endpoint
+    .poll_query_timeout(handle)
+    .expect("a query given a window publishes its absolute deadline");
+  let already_on_wire = mdns.sockets.wire_times_for_test(Family::V4).len();
+
+  // Readable-but-empty: the stall is charged on the read attempt, and the real
+  // `recv` behind it reports `WouldBlock` and ends stage 1 without needing a
+  // peer to supply a datagram.
+  mdns.sockets.set_readable_for_test(Family::V4, true);
+  mdns
+    .sockets
+    .force_recv_delays_for_test(Family::V4, &[RECV_OUTLIVES_QUERY_WINDOW]);
+
+  mdns.tick().expect("tick");
+
+  // The premise, stated about the reading the tick itself took rather than one
+  // taken beside the call: the tick began inside the window, so whatever
+  // withheld this question can only be a reading taken later in the same tick.
+  assert!(
+    mdns
+      .last_tick_instant
+      .expect("the tick records the instant it read")
+      < deadline,
+    "the tick must begin inside the caller's window, or this asserts nothing"
+  );
+  assert!(
+    Instant::now() >= deadline,
+    "and the stall must have carried it out of the window"
+  );
+
+  assert_eq!(
+    mdns.sockets.wire_times_for_test(Family::V4).len(),
+    already_on_wire,
+    "a question drawn after the caller's window shut reached IPv4's wire; stage \
+     4 weighed a promise made to the caller against an instant read before \
+     stage 1, which the peer — not this host — decides the length of"
+  );
+
+  // Withheld, not ended: the terminal belongs to the deadline's owner, and the
+  // wakeup that reaches it must survive the withholding.
+  assert_eq!(
+    mdns.endpoint.poll_query_timeout(handle),
+    Some(deadline),
+    "the withheld question must leave the deadline standing — it is the wakeup \
+     `next_timeout` folds, and the only thing left that can end this query"
+  );
+  assert_eq!(
+    mdns.next_timeout(),
+    Some(Duration::ZERO),
+    "and that deadline is already past, so the caller is sent straight back"
+  );
+
+  mdns.tick().expect("tick");
+  let mut terminal = None;
+  while let Some(ev) = mdns.next_event() {
+    if let Event::QueryTerminal { handle: h, update } = ev
+      && h == handle
+    {
+      terminal = Some(update);
+    }
+  }
+  assert!(
+    matches!(terminal, Some(mdns_proto::QueryUpdate::Timeout)),
+    "the query must still end, and with the terminal its deadline's owner \
+     produces; got {terminal:?}"
+  );
+  assert!(
+    !mdns.queries.contains_key(&handle),
+    "and the ended query must not be left resident"
+  );
+}
