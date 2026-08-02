@@ -250,44 +250,52 @@ pub enum RouteEvent<'a> {
   /// Informational: `Endpoint::handle` has already offered this record to the
   /// query named here, so delivering the event applies nothing.
   ///
-  /// # What the fan-out screened
+  /// # What an event means
   ///
-  /// Screening happens at two levels, and the DATAGRAM and RECORD levels come
-  /// first: a record turned away there never reaches the query pool, so no query
-  /// is screened for it and none of the per-query screens below says anything
-  /// about it. Both levels are stated because absence is only readable against
-  /// the whole chain — a query can satisfy every per-query screen and still see
-  /// no event, simply because no record got that far.
-  ///
-  /// The datagram must have been admitted by `Endpoint::handle`: it parsed, with
-  /// a QUERY opcode and a no-error rcode; it was not classified as this
-  /// endpoint's own loopback, by the caller's self flag or by the opt-in
-  /// advertised-source check; and — since only a response can carry an answer to
-  /// a query — it set QR=1 and arrived from UDP source port 5353, the only source
-  /// RFC 6762 lets a response be trusted from.
-  ///
-  /// The record must then sit in that datagram's answer or additional section
-  /// (question and authority records route to services alone); it must parse, and
-  /// so must every record ahead of it in its section, since a parse error is
-  /// reported and abandons the rest of that section; and its TTL must be
-  /// non-zero, because a TTL=0 goodbye is a withdrawal that updates the cache and
-  /// is never announced as an answer.
-  ///
-  /// Only a record past all of that is offered to the query pool, where it is
-  /// screened against each query on four more, weighed as of the `now` that
-  /// `Endpoint::handle` processed the datagram at: the query had not ended; its
-  /// terminal `QueryUpdate` had not already been taken by `Endpoint::poll_query`;
-  /// the caller's `QuerySpec::with_timeout` window was still open; and the record
-  /// matched the query's name, type and class.
+  /// The record reached the query fan-out and passed the four screens taken
+  /// there, all weighed as of the `now` that `Endpoint::handle` processed the
+  /// datagram at: the query had not ended; its terminal `QueryUpdate` had not
+  /// already been taken by `Endpoint::poll_query`; the caller's
+  /// `QuerySpec::with_timeout` window was still open; and the record matched the
+  /// query's name, type and class. Those four are the whole of what the fan-out
+  /// decides, so they are the whole of what an event asserts.
   ///
   /// The window screen is the same comparison, against the same reading, that
   /// `Query::handle_event` weighed this record on — so a record refused for
   /// standing past that window is never announced here.
   ///
-  /// # What it does NOT imply
+  /// # What absence means
   ///
-  /// Those screens decide that the query was OFFERED the record. Whether it KEPT
-  /// one is `Query::handle_event`'s separate decision, and that decision
+  /// Nothing a consumer may reason from. The fan-out is the last stage of a long
+  /// inbound path, and a record turned away anywhere earlier never reaches it, so
+  /// none of the four screens ever weighed that record and none of them says
+  /// anything about its silence. `Endpoint::handle` can reject a datagram
+  /// outright or suppress every side effect it would have had; a message that is
+  /// not a response carries no answers to route; a record that fails to parse
+  /// abandons the rest of its section, and one that fails in an earlier section
+  /// strands every later section with it, because a section is located only by
+  /// walking the ones ahead of it; a TTL=0 record is a withdrawal, never
+  /// announced as an answer. Those are illustrations, not an enumeration: no
+  /// event distinguishes them, the set has grown as the receive path has, and a
+  /// missing event is evidence for none of them in particular. Do not infer WHY
+  /// nothing arrived.
+  ///
+  /// One bound does hold, and it is the useful one: only answer-section and
+  /// additional-section records are ever routed to a query. Question and
+  /// authority records go to services alone, so no query is ever told about one.
+  ///
+  /// The TTL=0 case is worth stating on its own, because its cache effect is
+  /// conditional and easy to over-read. The withdrawal reaches the cache only
+  /// when population is enabled (`EndpointConfig::with_populate_cache`) and the
+  /// record's name and rdata canonicalize; and even then `Cache::try_insert`
+  /// mutates nothing unless a matching entry already exists whose expiry is
+  /// later than the one-second rescue window it clamps to. A suppressed event is
+  /// therefore not evidence that any withdrawal was recorded.
+  ///
+  /// # What an event does NOT imply
+  ///
+  /// The four screens decide that the query was OFFERED the record. Whether it
+  /// KEPT one is `Query::handle_event`'s separate decision, and that decision
   /// declines for reasons no screen above looks at: a
   /// `QuerySpec::with_max_answers` cap of zero, rdata carrying a domain name
   /// that will not decode, a (type, class, rdata) triple the query already

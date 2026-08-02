@@ -371,17 +371,21 @@ where
           };
 
           // route-level TTL=0 guard.  Records with TTL=0 are
-          // mDNS "goodbye" / deletion signals (RFC 6762 §10.1) — the
-          // cache layer already processes them as removals during the
-          // eager loop in `Endpoint::handle`, and `Query::handle_event`
-          // rejects them at the eager-mutation step.  The
-          // remaining hazard is the iterator: emitting service events
+          // mDNS "goodbye" / deletion signals (RFC 6762 §10.1) — the eager loop
+          // in `Endpoint::handle` has already offered them to the cache, and
+          // `Query::handle_event` rejects them at the eager-mutation step.  What
+          // the cache made of it is conditional (population enabled, name and
+          // rdata canonicalizable, a matching entry whose expiry is later than
+          // the one-second rescue window), so nothing here may be read as proof
+          // that a withdrawal was recorded.  The remaining hazard is the
+          // iterator: emitting service events
           // (ProbeConflict / HostConflict / KnownAnswer) for a goodbye
           // would let a peer withdrawing a record trigger our auto-
           // rename or HostConflict surfacing, and emitting ToQuery
           // for a goodbye would let callers receive ghost "answers"
           // from records being withdrawn.  Skip the whole fan-out for
-          // TTL=0 — cache removal is the only correct side effect.
+          // TTL=0 — whatever the cache did with it is the only correct
+          // side effect.
           if r.ttl() == 0 {
             self.answer_idx = self.answer_idx.saturating_add(1);
             self.answer_service_cursor = None;
@@ -622,8 +626,9 @@ where
               continue;
             }
           };
-          // TTL=0 additionals are withdrawals — cache removal already handled
-          // eagerly; do not surface a ghost conflict/answer.
+          // TTL=0 additionals are withdrawals — already offered to the cache
+          // eagerly, on the conditional terms noted in the Answer arm; do not
+          // surface a ghost conflict/answer.
           if r.ttl() == 0 {
             self.additional_idx = self.additional_idx.saturating_add(1);
             self.additional_service_cursor = None;

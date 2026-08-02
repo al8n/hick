@@ -2007,16 +2007,20 @@ fn a_refused_answer_is_not_routed_to_its_query() {
   );
 }
 
-/// `ToQuery` reports that a query was OFFERED a record, not that it kept one,
-/// and the fan-out's four screens are exactly that offer.
+/// `ToQuery` reports that a query was OFFERED a record, not that it kept one:
+/// the fan-out's four per-query screens are exactly that offer, and nothing
+/// about what the query then did with the record.
 ///
 /// A `QuerySpec::with_max_answers` cap of zero is the cheapest witness: the
 /// query has not ended, has taken no terminal, sits well inside its caller's
-/// window, and the record matches its name, type and class — every screen the
-/// fan-out has — while `Query::handle_event` collects nothing. The other grounds
-/// on which collection declines (undecodable rdata, a duplicate, a full pool)
-/// differ only in which of `handle_event`'s filters fires; each would re-exercise
-/// the same divergence this one already pins.
+/// window, and the record matches its name, type and class — all four screens
+/// the fan-out applies per query — while `Query::handle_event` collects nothing.
+/// This says nothing about the earlier stages a record must clear to reach the
+/// fan-out at all; those are not screens on a query, and no absent event can be
+/// read back to them. The other grounds on which collection declines
+/// (undecodable rdata, a duplicate, a full pool) differ only in which of
+/// `handle_event`'s filters fires; each would re-exercise the same divergence
+/// this one already pins.
 ///
 /// BOTH halves are asserted, because a change that stopped the fan-out routing
 /// altogether would satisfy the empty answer set on its own.
