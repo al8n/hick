@@ -88,9 +88,16 @@ jobs:
   # glibc) exercises a distinct libc-struct path. Scoped to mdns-proto +
   # hick-udp. The musl test binary is statically linked and runs natively on the
   # runner, so no emulator is needed — only the musl linker and the rustup
-  # target. (FreeBSD coverage was dropped: its synth-cmsg parse tests assume the
-  # Linux/Apple cmsg ABI and don't round-trip on the BSD layout; FreeBSD remains
-  # compile-verified by the `cross-check` job in ci.yml.)
+  # target.
+  #
+  # (FreeBSD still has no leg here, but no longer for an ABI reason: the
+  # synth-cmsg builder now frames every buffer from libc's own CMSG_LEN /
+  # CMSG_SPACE, so those tests do round-trip on the BSD layout. It is instead
+  # that instrumenting them inside a FreeBSD VM would need rustup for
+  # llvm-tools-preview plus a from-source cargo-llvm-cov in the guest. So
+  # FreeBSD contributes execution rather than coverage: ci.yml's `freebsd` job
+  # runs the hick-udp tests natively in a VM, and its `cross-check` job keeps
+  # compile-verifying the whole workspace for the target.)
   coverage-linux-musl:
     name: Coverage (linux-musl)
     runs-on: ubuntu-latest

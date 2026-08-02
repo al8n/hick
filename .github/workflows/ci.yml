@@ -99,6 +99,292 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check ${{ matrix.scope }} --target ${{ matrix.target }}
 
+  # The first NATIVE execution of this workspace's tests on a BSD. `cross-check`
+  # above only COMPILES FreeBSD, so hick-udp's cmsg tests — the whole evidence
+  # base behind the BSD IPv4 receive parsers — have until now executed on Linux
+  # and macOS only, against those hosts' cmsg ABI. The BSDs are the divergent
+  # case: `struct cmsghdr` is 12 bytes there but `CMSG_LEN(0)` rounds it to 16,
+  # so an offset or stride taken from the struct instead of from libc's macros
+  # is wrong on exactly the targets those parsers exist for. Running here puts
+  # the assertions on the layout they were written for.
+  #
+  # This is FreeBSD's evidence and no other target's: `IP_RECVIF` is 20 here and
+  # 30 on OpenBSD, and NetBSD carries a different `in_pktinfo` entirely. It is
+  # also still only the PARSE — see the four numbered items at the emit site in
+  # `hick-udp/build.rs` for what a capability flip additionally requires from a
+  # real host.
+  #
+  # GitHub has no FreeBSD runner. `vmactions/freebsd-vm` boots one under QEMU on
+  # the ubuntu runner and pipes the script below to `sh` over ssh, failing the
+  # step on a non-zero exit. So this job must never be given `continue-on-error`
+  # (nor the action's `debug-on-error`, which swallows the throw): a VM that
+  # cannot run the tests has to be red, not green.
+  #
+  # Plain `cargo test`, NOT cargo-llvm-cov. Instrumenting inside the guest needs
+  # rustup for `llvm-tools-preview` (FreeBSD's `rust` package does not carry the
+  # component) plus a from-source `cargo install cargo-llvm-cov`, since
+  # taiki-e/install-action neither runs in the VM nor has a FreeBSD binary to
+  # fetch — a long, fragile build for a coverage percentage. What is missing on
+  # this platform is execution, not a number, and that is what this buys.
+  freebsd:
+    name: Test (FreeBSD)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Least privilege for the one job that runs a runtime-downloaded provisioner
+    # on this runner (see the supply-chain note below). Nothing here writes to
+    # the repository.
+    permissions:
+      contents: read
+    env:
+      # One list, read twice: once inside the guest and once on the runner after
+      # copyback. Keeping a single copy is what stops the two checks drifting
+      # into disagreeing about what counts as evidence.
+      REQUIRED_TESTS: >-
+        synth_cmsg_agrees_with_libc_on_payload_offset_and_stride
+        cmsg_iter_is_sound_on_crafted_and_unaligned_input
+        cmsg_iter_fuses_after_malformed_header
+        parses_ipv4_ttl_cmsg
+        parses_ipv6_hoplimit_cmsg
+        parses_scm_timestamp
+        decode_recvdstaddr_reads_a_network_order_in_addr
+        decode_recvif_index_reads_sdl_index_out_of_the_fixed_prefix
+        scan_dstaddr_recvif_skips_unrelated_cmsgs_and_recovers_both
+      # HARNESS_LOG and RUN_NONCE are deliberately NOT set here. They are minted
+      # per run by the step below and published through $GITHUB_ENV, because a
+      # value written in this file is a value a branch can predict.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The whole tree is rsynced into the VM, and the push side of that
+          # rsync excludes `_actions` and `_PipelineMapping` but NOT `.git` — so
+          # a token left in `.git/config` would be handed straight to the guest.
+          persist-credentials: false
+
+      # The evidence log has to be something THIS run produced. Without that,
+      # the host-side check below verifies a file rather than a test run: the
+      # log lives at a repository-relative path, so a branch could simply commit
+      # one containing the nine passing lines, and a VM step that returned
+      # success without executing anything would leave that file in place to be
+      # accepted.
+      - name: Mint this run's evidence nonce and refuse a pre-seeded log
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A committed file at this path is not something to clean up silently
+          # — nothing legitimately produces one before the VM runs, so its
+          # presence is the signal, and it fails the job.
+          shopt -s nullglob
+          seeded=(freebsd-harness*.log)
+          if [ ${#seeded[@]} -gt 0 ]; then
+            echo "::error::the checkout contains ${seeded[*]}. That path is reserved for the log the FreeBSD VM writes during this run and must never be committed."
+            exit 1
+          fi
+
+          # Unpredictable at commit time, which is the entire point: a file
+          # written into the tree cannot carry a value minted here. This is not
+          # a secret and needs no masking — it only has to be unknown to whoever
+          # wrote the branch. It goes in the FILENAME as well as the contents so
+          # that even the path cannot be guessed and pre-created.
+          nonce="$(openssl rand -hex 32)"
+          log="freebsd-harness-$nonce.log"
+          test ! -e "$log"
+          {
+            echo "RUN_NONCE=$nonce"
+            echo "HARNESS_LOG=$log"
+          } >> "$GITHUB_ENV"
+
+      - name: cargo test -p hick-udp natively on FreeBSD
+        # Pinned to an immutable commit rather than the moving `v1`. This action
+        # boots the VM, ships the tree into it, and decides whether the guest's
+        # exit status ever reaches the runner — so the guest's own `set -eu`
+        # cannot defend against the action changing underneath us, and a full
+        # SHA is the only reference GitHub does not let anyone move. Audited at
+        # this SHA: `runSSHOnce` spawns `ssh <host> sh` with the script on stdin
+        # and resolves the child's exit code (a signal-killed ssh becomes 1, not
+        # 0); `execSSH` returns only on 0 and throws otherwise; the `run` call
+        # site asks for no retries and no timeout and rethrows unless
+        # `debug-on-error` is set, which this job must never set. That throw
+        # ends at `core.setFailed`, so a failing guest script fails the step.
+        #
+        # SUPPLY CHAIN, stated plainly rather than implied: that SHA is not the
+        # whole chain. At it, the action fetches `anyvm.py` at runtime from
+        # `anyvm-org/anyvm` at the tag `v0.5.1` named in its own bundled conf,
+        # and a git tag is movable — it is not a SHA. That script runs ON THIS
+        # RUNNER and performs the workspace synchronisation, so a compromised or
+        # changed AnyVM CAN FORGE THE EVIDENCE LOG outright: it can write the
+        # nine passing lines, the summary, and this run's nonce — which it sees,
+        # since the action hands that nonce to the guest — without ever booting
+        # FreeBSD. Nothing in this job detects that, and no host-side check can,
+        # because the untrusted code runs on the host too.
+        #
+        # WHAT THIS MECHANISM ESTABLISHES, scoped precisely so the next reader
+        # does not take it for more than it is. The nonce, the host-side check
+        # and the refusal of a pre-seeded log detect ACCIDENTAL non-execution:
+        # a VM that never booted, a guest that skipped the harness, a copyback
+        # that returned nothing, a stale log committed to the tree, an
+        # infrastructure failure that would otherwise report green. Those are
+        # the failures this job exists to catch, and it catches them.
+        #
+        # It is NOT resistant to a hostile branch, and nothing at this layer
+        # could make it so. The branch under test owns `build.rs`, the
+        # dependency graph, the Cargo configuration, the test sources — and this
+        # workflow file. It can print whatever it likes into the output the
+        # shell later stamps with the nonce, or leave the nine test names in
+        # place while hollowing them out until they assert nothing and still
+        # print `... ok`. The log would then be a truthful record of tests
+        # deliberately made vacuous. Keeping the nonce and the log path out of
+        # Cargo's environment below removes the laziest version of that — a
+        # build script appending a correct nonce line — but it does not change
+        # the conclusion. Reading the diff is what covers a hostile branch. CI
+        # is not, and this guard should never be cited as though it were.
+        #
+        # Nor does any of it defeat a HOSTILE AnyVM, per the paragraph above.
+        # What bounds both is blast radius: `permissions: contents: read` and no
+        # persisted credentials, so the worst case is a false green rather than
+        # a write to the repository.
+        uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
+        with:
+          # Must name a conf file bundled in the action: resolution is a literal
+          # `conf/<release>.conf` lookup with no branch-to-latest step, so a
+          # bare "14" aborts the step. Pinning the action pins that set too, so
+          # a SHA bump means re-checking this value.
+          release: "14.4"
+          usesh: true
+          # The workspace is rsynced back so the runner can verify the log, and
+          # copyback is whole-tree with no path filter — hence CARGO_TARGET_DIR
+          # below, which keeps the build tree out of what gets copied.
+          copyback: true
+          # The VM is a separate machine, so this job's `env:` block does not
+          # reach it; these get there through this hand-off and nowhere else.
+          envs: "RUSTFLAGS RUST_BACKTRACE REQUIRED_TESTS HARNESS_LOG RUN_NONCE"
+          prepare: |
+            pkg install -y rust
+          run: |
+            set -eu
+            if [ -z "${RUSTFLAGS-}" ]; then
+              echo "::error::RUSTFLAGS did not reach the VM; this build would allow warnings"
+              exit 1
+            fi
+            # Take copies and drop the originals from the environment before
+            # the FIRST cargo invocation of any kind, so nothing in the build —
+            # build scripts, proc macros, dependencies, the tests themselves —
+            # is ever handed the nonce or the evidence path. `set -u` makes a
+            # later reference to either name an error rather than an empty
+            # string.
+            nonce="$RUN_NONCE"
+            final_log="$HARNESS_LOG"
+            required="$REQUIRED_TESTS"
+            unset RUN_NONCE HARNESS_LOG REQUIRED_TESTS
+
+            freebsd-version
+            rustc --version
+            cargo --version
+
+            # Both halves of the colour setting matter, and only because the
+            # checks compare whole lines: CARGO_TERM_COLOR governs cargo,
+            # `--color never` governs the test harness that actually prints
+            # them, and either left on would wrap `ok` in ANSI escapes that no
+            # exact match can see past.
+            export CARGO_TERM_COLOR=never
+            # Out of the synced tree, or copyback drags gigabytes of build
+            # artifacts back to the runner. /var/tmp, not /tmp, because it is
+            # disk-backed on FreeBSD.
+            export CARGO_TARGET_DIR=/var/tmp/hick-udp-target
+
+            # Cargo's output goes somewhere cargo is never told about, outside
+            # the synced tree, so a build script cannot find the file by
+            # globbing the workspace. The evidence log does not exist yet.
+            raw_log=/var/tmp/hick-udp-harness.raw
+
+            # Build first so compile output streams, then capture the harness
+            # output. Piping into `tee` instead would report `tee`'s status and
+            # hide a failing run.
+            cargo test -p hick-udp --all-features --no-run
+            if ! cargo test -p hick-udp --all-features --no-fail-fast -- --color never >"$raw_log" 2>&1; then
+              cat "$raw_log"
+              exit 1
+            fi
+
+            # Cargo has exited. The shell — not the build — writes the nonce
+            # line and assembles the log into the workspace for copyback.
+            {
+              printf 'freebsd-run-nonce: %s\n' "$nonce"
+              cat "$raw_log"
+            } > "$final_log"
+            cat "$final_log"
+
+            # Defence in depth only — the authoritative copy of this check runs
+            # on the runner, for the reason given above. Failing here just
+            # surfaces the problem next to the output that caused it.
+            for t in $required; do
+              if ! grep -Fqx "test multicast::tests::$t ... ok" "$final_log"; then
+                echo "::error::hick-udp test $t did not run and pass on FreeBSD"
+                exit 1
+              fi
+            done
+
+      # The authoritative evidence check, deliberately OUTSIDE the VM. An action
+      # that reports success without executing anything leaves this log absent,
+      # empty, or without this run's nonce, and each of those has to be as red
+      # as a failing assertion — so they are checked separately and none is
+      # allowed to pass.
+      #
+      # Whole-line exact matches, because a bare name proves nothing: `#[ignore]`
+      # prints `test <name> ... ignored, <reason>` and still exits 0 — this crate
+      # has such a test — and a rename to `<name>_v2` leaves the old name a
+      # substring of the new one.
+      - name: Verify on the runner that FreeBSD really executed the cmsg tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -e "$HARNESS_LOG" ]; then
+            echo "::error::$HARNESS_LOG did not come back from the VM. Either the guest never wrote it or the VM step reported success without running the tests."
+            exit 1
+          fi
+          if [ ! -s "$HARNESS_LOG" ]; then
+            echo "::error::$HARNESS_LOG came back empty, so nothing was executed in the VM."
+            exit 1
+          fi
+          # Proves the file was produced during this run rather than shipped in
+          # the tree: the value did not exist when the branch was written.
+          if ! grep -Fqx "freebsd-run-nonce: $RUN_NONCE" "$HARNESS_LOG"; then
+            echo "::error::$HARNESS_LOG does not carry this run's nonce, so it is not the log this run's VM wrote."
+            exit 1
+          fi
+          # An empty list would make the loop below iterate zero times and pass
+          # vacuously, which is the same green-with-no-evidence outcome.
+          if [ -z "${REQUIRED_TESTS// /}" ]; then
+            echo "::error::REQUIRED_TESTS is empty; there is no evidence list to check."
+            exit 1
+          fi
+
+          if grep -q '^test result: FAILED' "$HARNESS_LOG"; then
+            echo "::error::a FreeBSD test binary reported failures."
+            grep -n '^test result: FAILED' "$HARNESS_LOG"
+            exit 1
+          fi
+          if ! grep -q '^test result: ok\.' "$HARNESS_LOG"; then
+            echo "::error::no 'test result: ok.' summary in $HARNESS_LOG; no test binary ran to completion."
+            exit 1
+          fi
+
+          missing=0
+          # Word splitting is the point: REQUIRED_TESTS is a space-separated list.
+          # shellcheck disable=SC2086
+          for t in $REQUIRED_TESTS; do
+            if ! grep -Fqx "test multicast::tests::$t ... ok" "$HARNESS_LOG"; then
+              echo "::error::hick-udp test $t did not run and pass on FreeBSD"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "FreeBSD executed every required cmsg test:"
+          for t in $REQUIRED_TESTS; do echo "  ok  $t"; done
+
   # Bare-metal proof: the `no_std` + `alloc` engine (`hick-smoltcp`) and its
   # embassy driver (`hick-embassy`) must build for a real embedded target. A
   # `no_std` lib also compiles on a `std` host, so the `--workspace` jobs above
@@ -280,6 +566,7 @@ jobs:
           fi
 
   # Multi-platform coverage lives in its own workflow (`coverage.yml`): it runs
-  # cargo-llvm-cov on a Linux/macOS/Windows + FreeBSD matrix and merges the
-  # per-platform reports into one codecov upload, with the Linux leg as the
-  # >= 90% hard gate.
+  # cargo-llvm-cov on a Linux/macOS/Windows matrix plus a linux-musl leg and
+  # merges the per-platform reports into one codecov upload, with the Linux leg
+  # as the >= 90% hard gate. FreeBSD is absent from it on purpose — the
+  # `freebsd` job above executes those tests instead of instrumenting them.
