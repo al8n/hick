@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant as StdInstant, SystemTime};
 
-use mdns_proto::FamilyDelivery;
+use mdns_proto::FamilyAttempt;
 
 use super::{
   FAMILY_V4, FAMILY_V6, FamilyWireGate, MAX_CONSECUTIVE_SEND_FAILURES, SendHealth, summarize,
@@ -72,20 +72,15 @@ fn a_dual_stack_send_both_families_took_is_all_delivered() {
   let base = StdInstant::now();
   let mut health = SendHealth::new();
   let summary = settle(&mut health, report(sent(base, 1), sent(base, 2)));
-  assert_eq!(summary.delivery.v4(), FamilyDelivery::Delivered);
-  assert_eq!(summary.delivery.v6(), FamilyDelivery::Delivered);
-  assert!(summary.delivery.all_delivered());
+  assert!(matches!(
+    summary.attempts[FAMILY_V4],
+    FamilyAttempt::Accepted { .. }
+  ));
+  assert!(matches!(
+    summary.attempts[FAMILY_V6],
+    FamilyAttempt::Accepted { .. }
+  ));
   assert_eq!(summary.sent, 2, "two syscalls put bytes on a wire");
-}
-
-#[test]
-fn the_confirm_anchors_at_the_earliest_family_acceptance() {
-  let base = StdInstant::now();
-  let mut health = SendHealth::new();
-  // v6 accepted first. Anchoring at the later one would backdate v6's refresh
-  // schedule by the whole inter-family skew.
-  let summary = settle(&mut health, report(sent(base, 9), sent(base, 3)));
-  assert_eq!(summary.accepted_at, Some(base + Duration::from_secs(3)));
 }
 
 #[test]
@@ -95,9 +90,15 @@ fn a_round_that_reached_no_wire_has_no_anchor() {
     &mut health,
     report(SendOutcome::Failed, SendOutcome::Failed),
   );
-  assert_eq!(summary.accepted_at, None);
+  assert_eq!(
+    summary.attempts,
+    [
+      FamilyAttempt::Refused { permanent: false },
+      FamilyAttempt::Refused { permanent: false }
+    ],
+    "neither family accepted, so there is no acceptance to anchor a refresh on"
+  );
   assert_eq!(summary.sent, 0);
-  assert!(!summary.delivery.any_delivered());
 }
 
 #[test]
@@ -105,15 +106,13 @@ fn a_send_one_family_missed_latches_ownership_but_not_the_phase() {
   let base = StdInstant::now();
   let mut health = SendHealth::new();
   let summary = settle(&mut health, report(sent(base, 1), SendOutcome::Failed));
-  assert_eq!(summary.delivery.v4(), FamilyDelivery::Delivered);
-  assert_eq!(summary.delivery.v6(), FamilyDelivery::Missed);
-  assert!(
-    summary.delivery.any_delivered(),
-    "IPv4 peers may hold these records, so §10.1 ownership latches"
-  );
-  assert!(
-    !summary.delivery.all_delivered(),
-    "IPv6 never saw it, so the §8.1/§8.3 phase must not advance"
+  assert!(matches!(
+    summary.attempts[FAMILY_V4],
+    FamilyAttempt::Accepted { .. }
+  ));
+  assert_eq!(
+    summary.attempts[FAMILY_V6],
+    FamilyAttempt::Refused { permanent: false }
   );
   assert_eq!(summary.sent, 1);
 }
@@ -123,11 +122,7 @@ fn an_unbound_family_owes_nothing() {
   let base = StdInstant::now();
   let mut health = SendHealth::new();
   let summary = settle(&mut health, report(sent(base, 1), SendOutcome::NoSocket));
-  assert_eq!(summary.delivery.v6(), FamilyDelivery::Unobligated);
-  assert!(
-    summary.delivery.all_delivered(),
-    "a single-stack host is fully delivered on the one family it has"
-  );
+  assert_eq!(summary.attempts[FAMILY_V6], FamilyAttempt::NoSocket);
 }
 
 #[test]
@@ -136,27 +131,11 @@ fn a_gated_family_is_missed_and_never_unobligated() {
   let mut health = SendHealth::new();
   let summary = settle(&mut health, report(sent(base, 1), SendOutcome::Gated));
   assert_eq!(
-    summary.delivery.v6(),
-    FamilyDelivery::Missed,
+    summary.attempts[FAMILY_V6],
+    FamilyAttempt::GateShut,
     "the socket is there and the datagram was meant for it; the driver owed \
-     the wire a gap it had not paid"
-  );
-  assert!(
-    !summary.delivery.all_delivered(),
-    "reporting the deferral absent would let the phase advance without it"
-  );
-}
-
-#[test]
-fn a_send_no_family_could_be_offered_delivers_nothing() {
-  let mut health = SendHealth::new();
-  let summary = settle(
-    &mut health,
-    report(SendOutcome::NoSocket, SendOutcome::NoSocket),
-  );
-  assert!(
-    !summary.delivery.any_delivered() && !summary.delivery.all_delivered(),
-    "an empty obligated set is never a vacuous all-delivered"
+     the wire a gap it had not paid, and that is never the same report as an \
+     absent socket"
   );
 }
 
@@ -166,48 +145,11 @@ fn a_too_large_family_is_missed_exactly_like_a_refused_one() {
   let mut health = SendHealth::new();
   let summary = settle(&mut health, report(sent(base, 1), SendOutcome::TooLarge));
   assert_eq!(
-    summary.delivery.v6(),
-    FamilyDelivery::Missed,
-    "the socket is there and the datagram was meant for it, so it MISSED — \
-     `Unobligated` would tell the core this family owes nothing and let the \
-     phase advance on IPv4's strength alone"
-  );
-  assert!(summary.delivery.any_delivered() && !summary.delivery.all_delivered());
-  assert!(
-    !summary.undeliverable,
-    "IPv4 put it on a wire, so it is manifestly deliverable"
-  );
-}
-
-/// The projection is unchanged by permanence: `delivery` is the same all-missed
-/// shape a transient round produces, and the difference rides beside it.
-///
-/// It must be that way round. The core's per-family vocabulary has no term for
-/// "and there is no point re-arming it" — its only unused shape is
-/// `Unobligated`, which means an ABSENT socket — so saying it inside the confirm
-/// could only be said by lying about the obligated set.
-#[test]
-fn an_undeliverable_round_confirms_exactly_as_a_refused_one_does() {
-  let mut health = SendHealth::new();
-  let refused = settle(
-    &mut health,
-    report(SendOutcome::Failed, SendOutcome::Failed),
-  );
-  let mut health = SendHealth::new();
-  let oversized = settle(
-    &mut health,
-    report(SendOutcome::TooLarge, SendOutcome::TooLarge),
-  );
-  assert_eq!(oversized.delivery, refused.delivery);
-  assert_eq!(oversized.sent, refused.sent);
-  assert_eq!(oversized.accepted_at, refused.accepted_at);
-  assert!(
-    !refused.undeliverable,
-    "a may-clear refusal is never evidence that a retry is pointless"
-  );
-  assert!(
-    oversized.undeliverable,
-    "every reachable family refused the SIZE, so no retry can help"
+    summary.attempts[FAMILY_V6],
+    FamilyAttempt::Refused { permanent: true },
+    "the socket is there and the datagram was meant for it, so it is a \
+     refusal — never `NoSocket`, which would tell the core this family owes \
+     nothing"
   );
 }
 
@@ -218,12 +160,15 @@ fn a_single_stack_host_refusing_the_size_has_refused_it_everywhere() {
     &mut health,
     report(SendOutcome::TooLarge, SendOutcome::NoSocket),
   );
-  assert!(
-    summary.undeliverable,
-    "the absent family was never offered the datagram, so it is no reason to \
-     keep retrying on the one family this host has"
+  assert_eq!(
+    summary.attempts,
+    [
+      FamilyAttempt::Refused { permanent: true },
+      FamilyAttempt::NoSocket
+    ],
+    "the absent family was never offered the datagram, so only the bound one's \
+     refusal is on record"
   );
-  assert_eq!(summary.delivery.v6(), FamilyDelivery::Unobligated);
 }
 
 // ── family health is observability, and nothing the core is told ──────
@@ -246,17 +191,10 @@ fn a_chronically_failing_family_is_missed_forever_never_unobligated() {
   for round in 0..MAX_CONSECUTIVE_SEND_FAILURES * 4 {
     let summary = settle(&mut health, report(sent(base, 1), SendOutcome::Failed));
     assert_eq!(
-      summary.delivery.v6(),
-      FamilyDelivery::Missed,
-      "round {round}: the socket is there and the datagram was fanned onto it"
-    );
-    assert!(
-      !summary.delivery.all_delivered(),
-      "round {round}: a family that heard nothing must keep the phase shut"
-    );
-    assert!(
-      summary.delivery.any_delivered(),
-      "round {round}: IPv4 peers hold these records, so §10.1 ownership latches"
+      summary.attempts[FAMILY_V6],
+      FamilyAttempt::Refused { permanent: false },
+      "round {round}: the socket is there and the datagram was fanned onto it, \
+       never `NoSocket`"
     );
   }
   assert_eq!(
@@ -317,9 +255,8 @@ fn one_delivery_restores_a_degraded_family() {
   }
   assert_eq!(health.degraded_families(), (false, true));
   let summary = settle(&mut health, report(sent(base, 1), sent(base, 1)));
-  assert_eq!(
-    summary.delivery.v6(),
-    FamilyDelivery::Delivered,
+  assert!(
+    matches!(summary.attempts[FAMILY_V6], FamilyAttempt::Accepted { .. }),
     "a degraded family that put the records on a wire really did deliver them"
   );
   assert_eq!(
@@ -340,11 +277,12 @@ fn a_delivery_by_a_degraded_family_still_latches_ownership() {
   assert_eq!(health.degraded_families(), (true, false));
   let summary = settle(&mut health, report(sent(base, 2), SendOutcome::Failed));
   assert!(
-    summary.delivery.any_delivered(),
+    matches!(summary.attempts[FAMILY_V4], FamilyAttempt::Accepted { .. }),
     "peers reachable over the recovered family now hold these records"
   );
-  assert!(
-    !summary.delivery.all_delivered(),
+  assert_eq!(
+    summary.attempts[FAMILY_V6],
+    FamilyAttempt::Refused { permanent: false },
     "v6 is obligated and missed"
   );
 }
@@ -432,7 +370,11 @@ fn a_chronically_failing_family_never_opens_the_fully_announced_gate() {
           SendOutcome::Failed,
         ),
       );
-      svc.note_transmit_outcome(summary.accepted_at.unwrap_or(now), summary.delivery);
+      let _ = svc.note_transmit_outcome(
+        now,
+        summary.attempts[FAMILY_V4],
+        summary.attempts[FAMILY_V6],
+      );
       let _ = svc.take_rename_goodbye_handoff();
       confirms = confirms.saturating_add(1);
     }
@@ -566,8 +508,8 @@ fn the_confirm_anchors_before_the_syscall_and_the_gate_after_it() {
 
   let mut health = SendHealth::new();
   assert_eq!(
-    settle(&mut health, rep).accepted_at,
-    Some(base),
+    settle(&mut health, rep).attempts[FAMILY_V4],
+    FamilyAttempt::Accepted { at: base },
     "the core confirms at the PRE-syscall instant: early can only understate how \
      fresh this family's peers are, while a late one would schedule the refresh \
      past its records' TTL"

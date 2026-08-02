@@ -55,12 +55,24 @@ let mut records = ServiceRecords::new(
     120,
 );
 records.add_a(my_ipv4);
-engine.register_service(ServiceSpec::new(records), now)?;
+// `now()` is YOUR monotonic clock, wrapped as a `SmoltcpInstant`.
+engine.register_service(ServiceSpec::new(records), now())?;
 
 // Pump from your own loop, handing it a `DualStack` view of your sockets and a
 // scratch buffer. The engine fans each multicast to BOTH groups, so `DualStack`
 // routes by family (leave a family `None` for a single-stack node). `pump` returns
 // the next instant the engine wants to be polled.
+//
+// `pump` takes the CLOCK, not a reading of it: it samples once for the pass and
+// again after each RFC 6762 §10.1 goodbye fan-out, so however long a pass spends
+// draining RX and TX before it reaches the goodbyes is not charged to the next
+// goodbye's spacing.
+//
+// That spacing — and every other per-family RFC 6762 floor the engine keeps — is
+// measured from the moment `UdpIo::try_send` ACCEPTS a datagram. smoltcp queues it
+// on the socket and `iface.poll` puts it on the device afterwards, so poll the
+// interface promptly: a poll loop stalled for longer than a floor can drain two of
+// the engine's datagrams onto the device back-to-back.
 loop {
     let mut io = DualStack::new(&mut sockets, Some(v4_handle), Some(v6_handle));
     let next = engine.pump(now, &mut io, &mut scratch);

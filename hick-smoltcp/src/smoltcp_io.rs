@@ -116,7 +116,9 @@ fn send_from(socket: &mut udp::Socket<'_>, buf: &[u8], dst: SocketAddr) -> Resul
 ///
 /// `pump` borrows the [`SocketSet`] for the duration of one step; build a fresh
 /// `DualStack` each step (it is a thin view) with [`DualStack::new`], e.g.
-/// `engine.pump(now, &mut DualStack::new(sockets, Some(h4), Some(h6)), buf)`.
+/// `engine.pump(now, &mut DualStack::new(sockets, Some(h4), Some(h6)), buf)`,
+/// where `now` is your clock ITSELF (a `FnMut() -> SmoltcpInstant`) rather than a
+/// reading of it.
 pub struct DualStack<'set, 'sockets> {
   sockets: &'set mut SocketSet<'sockets>,
   v4: Option<SocketHandle>,

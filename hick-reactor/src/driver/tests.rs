@@ -16,13 +16,20 @@ fn lock_mailbox_for_test(
 /// Confirm a send BOTH families carried, for tests that drive a service with no
 /// bound sockets and must still see the announce/host-latch guards fire.
 fn deliver_both(proto: &mut ProtoService, now: StdInstant) {
-  proto.note_transmit_outcome(
+  let _ = proto.note_transmit_outcome(
     now,
-    mdns_proto::TransmitDelivery::new(
-      mdns_proto::FamilyDelivery::Delivered,
-      mdns_proto::FamilyDelivery::Delivered,
-    ),
+    FamilyAttempt::Accepted { at: now },
+    FamilyAttempt::Accepted { at: now },
   );
+}
+
+/// This family's acceptance instant, if it accepted. The accessor lives inside
+/// the core; a test names the fact by hand-matching the (public) variant.
+fn accepted_at(attempt: FamilyAttempt<StdInstant>) -> Option<StdInstant> {
+  match attempt {
+    FamilyAttempt::Accepted { at } => Some(at),
+    _ => None,
+  }
 }
 
 #[test]
@@ -36,23 +43,39 @@ fn on_link_check_rejects_non_255_ttl() {
   assert!(!is_on_link(Some(0)));
 }
 
-/// regression: a PRESENT (bound) family's `send_to` failure
-/// must map to `Retry` (keep the debt, retry until the 2 s ceiling), NOT
-/// `WriteOff`. A bound UDP socket can return transient errors whose kind is
-/// NOT `WouldBlock`/`Interrupted` (e.g. `ENOBUFS`, route/interface churn);
-/// writing that family off would free the route once the OTHER family drained
-/// and strand this family's peers on stale positive-TTL records. `WriteOff` is
-/// reserved for an ABSENT socket (the caller's `let mut … = WriteOff` default),
-/// never produced by this present-socket classifier.
+/// regression: a PRESENT (bound) family's `send_to` failure must be reported
+/// [`FamilyAttempt::Refused`], NEVER [`FamilyAttempt::NoSocket`] — the fact an
+/// ABSENT family reports, and the only one that lets the core's withdrawal
+/// table write a debt off. A bound UDP socket can return transient errors whose
+/// kind is NOT `WouldBlock`/`Interrupted` (e.g. `ENOBUFS`, route/interface
+/// churn); laundering those into `NoSocket` would free the route once the OTHER
+/// family drained and strand this family's peers on stale positive-TTL records.
+/// `permanent` is decided by the datagram's size against this family's UDP
+/// ceiling and never by the error kind — see `attempt_of`.
 #[test]
-fn present_socket_send_error_is_retry_not_writeoff() {
-  // Ok → Sent.
+fn present_socket_send_error_is_refused_not_no_socket() {
+  let body = *b"present-socket-probe";
+
+  // Ok → Accepted, anchored at the PRE-syscall stamp. The post-syscall one is
+  // deliberately a different instant here: the confirm anchor may only ever
+  // understate how fresh a family's peers are, so reaching for the wire gate's
+  // stamp instead would be visible as a failure right here.
+  let at = StdInstant::now();
   assert_eq!(
-    present_socket_send_outcome::<usize>(&Ok(42)),
-    WithdrawalSend::Sent,
+    attempt_of(
+      Family::V4,
+      &body,
+      &SendAttempt::Answered {
+        result: Ok(body.len()),
+        submitted_wall: SystemTime::now(),
+        submitted_at: at,
+        wire_at: at + Duration::from_millis(1),
+      },
+    ),
+    FamilyAttempt::Accepted { at },
   );
   // Every non-WouldBlock/Interrupted error kind a bound socket might surface
-  // must still be Retry (NEVER WriteOff).
+  // must still be `Refused { permanent: false }` (NEVER `NoSocket`).
   for kind in [
     std::io::ErrorKind::WouldBlock,
     std::io::ErrorKind::Interrupted,
@@ -63,9 +86,18 @@ fn present_socket_send_error_is_retry_not_writeoff() {
   ] {
     let res: std::io::Result<usize> = Err(std::io::Error::from(kind));
     assert_eq!(
-      present_socket_send_outcome(&res),
-      WithdrawalSend::Retry,
-      "a present (bound) socket error ({kind:?}) must be Retry, not WriteOff"
+      attempt_of(
+        Family::V4,
+        &body,
+        &SendAttempt::Answered {
+          result: res,
+          submitted_wall: SystemTime::now(),
+          submitted_at: StdInstant::now(),
+          wire_at: StdInstant::now(),
+        },
+      ),
+      FamilyAttempt::Refused { permanent: false },
+      "a present (bound) socket error ({kind:?}) must be Refused, not NoSocket"
     );
   }
 }
@@ -1698,7 +1730,7 @@ fn generic_recv_error_does_not_increment_any_stats() {
   );
 }
 
-// ── The dual-stack delivery boundary (`TransmitDelivery`) ───────────────────
+// ── The dual-stack delivery boundary (`FamilyAttempt`) ──────────────────────
 
 /// A driver state with NO bound family. The delivery-shape tests drive
 /// `confirm_service_transmit` directly — the exact seam `drain_transmits` uses —
@@ -1751,90 +1783,75 @@ fn confirm_service_round<N: agnostic_net::Net>(
   let _ = ctx.proto.handle_timeout(t);
   let mut rounds = 0;
   while ctx.proto.poll_transmit(t, buf).is_ok_and(|tx| tx.is_some()) {
-    confirm_service_transmit(endpoint, ctx, t, fanout.delivery());
+    let _ = confirm_service_transmit(endpoint, ctx, t, fanout.v4, fanout.v6);
     rounds += 1;
   }
   rounds
 }
 
-/// A dual-stack fan-out in which v4 carried the datagram and a BOUND v6 socket
-/// rejected it (`ENETUNREACH` and friends). Driving the behaviour tests from the
-/// per-family facts rather than a hand-fed [`TransmitDelivery`] keeps the
+/// A dual-stack fan-out in which v4 carried the datagram at `at` and a BOUND v6
+/// socket rejected it (`ENETUNREACH` and friends). Driving the behaviour tests
+/// from the per-family facts rather than a hand-fed delivery shape keeps the
 /// mapping inside the tested path.
 #[cfg(feature = "tokio")]
-const PARTIAL_FANOUT: Fanout = Fanout {
-  v4: FamilySend::Sent,
-  v6: FamilySend::Failed,
-};
+fn partial_fanout(at: StdInstant) -> Fanout {
+  Fanout {
+    v4: FamilyAttempt::Accepted { at },
+    v6: FamilyAttempt::Refused { permanent: false },
+  }
+}
 
-/// Both bound families carried the datagram.
+/// Both bound families carried the datagram, at `at`.
 #[cfg(feature = "tokio")]
-const WHOLE_FANOUT: Fanout = Fanout {
-  v4: FamilySend::Sent,
-  v6: FamilySend::Sent,
-};
+fn whole_fanout(at: StdInstant) -> Fanout {
+  Fanout {
+    v4: FamilyAttempt::Accepted { at },
+    v6: FamilyAttempt::Accepted { at },
+  }
+}
 
 /// Both bound families rejected it — nothing reached any wire.
 #[cfg(feature = "tokio")]
-const FAILED_FANOUT: Fanout = Fanout {
-  v4: FamilySend::Failed,
-  v6: FamilySend::Failed,
-};
+fn failed_fanout() -> Fanout {
+  Fanout {
+    v4: FamilyAttempt::Refused { permanent: false },
+    v6: FamilyAttempt::Refused { permanent: false },
+  }
+}
 
-/// The confirm is a pure, per-family function of the I/O facts, and the obligated
-/// set is "every family that HAS a socket". The rows that matter: an absent family
-/// is not obligated (a single-stack host advances at full speed), a
-/// present-but-failing one is, and an empty obligated set delivers to nobody —
-/// never a vacuous "all", which would let a torn-down endpoint advance its
-/// lifecycle on nothing.
-///
-/// WHICH family missed survives to the core, so it can schedule the next
-/// announcement per link. The two partial rows differ here; under the aggregate
-/// confirm they were the same value.
-///
-/// A GATED family is `Missed`, exactly as a failing one is. Its socket is there
-/// and the datagram was fanned onto it; the driver simply owed that wire a §6 /
-/// §8.3 gap it had not yet paid, so the round did not reach it. Reporting it
-/// `Unobligated` — the one plausible alternative — would let the §8.1 probe
-/// sequence and §8.3 announce phase advance on a wire that never heard the
-/// datagram, and would hide the deferral from the core entirely. This mapping is
-/// what makes a WRONGLY gated family protocol-visible, so it is asserted here
-/// rather than left to the two call sites that read it.
+/// `Fanout::sent_count()` is the one piece of the old per-family table that is
+/// still this driver's own: which [`FamilyAttempt`] a family reports now
+/// projects onto the core's delivery shape, and that projection — the table of
+/// which value is `Delivered`/`Missed`/`Unobligated`, and that a GATED family is
+/// `Missed` rather than `Unobligated` — is internal to `mdns_proto` and asserted
+/// once, in its own suite. What stays here is the fairness credit: how many
+/// families the fan-out actually put bytes on, which this driver spends and the
+/// core never sees.
 #[test]
-fn the_fan_out_reaches_the_core_per_family() {
-  use FamilySend::{Failed, Gated, Sent, Unbound};
-  use mdns_proto::FamilyDelivery::{Delivered, Missed, Unobligated};
+fn the_fan_out_charges_one_credit_per_family_actually_sent() {
+  let at = StdInstant::now();
+  let accepted = FamilyAttempt::Accepted { at };
+  let refused = FamilyAttempt::Refused { permanent: false };
+  let gate_shut = FamilyAttempt::GateShut;
+  let no_socket = FamilyAttempt::NoSocket;
   let cases = [
-    (Sent, Sent, Delivered, Delivered, 2),
-    (Sent, Unbound, Delivered, Unobligated, 1),
-    (Unbound, Sent, Unobligated, Delivered, 1),
-    (Sent, Failed, Delivered, Missed, 1),
-    (Failed, Sent, Missed, Delivered, 1),
-    (Failed, Failed, Missed, Missed, 0),
-    (Failed, Unbound, Missed, Unobligated, 0),
-    (Unbound, Unbound, Unobligated, Unobligated, 0),
-    (Sent, Gated, Delivered, Missed, 1),
-    (Gated, Sent, Missed, Delivered, 1),
-    (Gated, Gated, Missed, Missed, 0),
-    (Gated, Failed, Missed, Missed, 0),
-    (Gated, Unbound, Missed, Unobligated, 0),
+    (accepted, accepted, 2),
+    (accepted, no_socket, 1),
+    (no_socket, accepted, 1),
+    (accepted, refused, 1),
+    (refused, accepted, 1),
+    (refused, refused, 0),
+    (refused, no_socket, 0),
+    (no_socket, no_socket, 0),
+    (accepted, gate_shut, 1),
+    (gate_shut, accepted, 1),
+    (gate_shut, gate_shut, 0),
+    (gate_shut, refused, 0),
+    (gate_shut, no_socket, 0),
   ];
-  for (v4, v6, want_v4, want_v6, credits) in cases {
-    let fanout = Fanout { v4, v6 };
-    let delivery = fanout.delivery();
+  for (v4, v6, credits) in cases {
     assert_eq!(
-      (delivery.v4(), delivery.v6()),
-      (want_v4, want_v6),
-      "({v4:?}, {v6:?}) must reach the core as ({want_v4}, {want_v6})"
-    );
-    assert_eq!(
-      delivery.all_delivered(),
-      want_v4 != Missed && want_v6 != Missed && (want_v4 == Delivered || want_v6 == Delivered),
-      "({v4:?}, {v6:?}): all_delivered is 'every obligated family carried it, and \
-       at least one was obligated'"
-    );
-    assert_eq!(
-      fanout.sent_count(),
+      Fanout { v4, v6 }.sent_count(),
       credits,
       "({v4:?}, {v6:?}) must charge {credits} fairness credit(s)"
     );
@@ -1866,7 +1883,7 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
   let mut buf = std::vec![0u8; 4096];
 
   // Exactly ONE confirm, so the bounded policy provably cannot have fired.
-  let rounds = confirm_service_round(&mut state, h, now, &mut buf, PARTIAL_FANOUT);
+  let rounds = confirm_service_round(&mut state, h, now, &mut buf, partial_fanout(now));
   assert_eq!(rounds, 1, "one announcement should have been offered");
 
   let ctx = state.services.get(&h).unwrap();
@@ -1918,7 +1935,7 @@ fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
   let h = reg.handle;
   let mut buf = std::vec![0u8; 4096];
 
-  let rounds = confirm_service_round(&mut state, h, now, &mut buf, WHOLE_FANOUT);
+  let rounds = confirm_service_round(&mut state, h, now, &mut buf, whole_fanout(now));
   assert_eq!(rounds, 1, "one announcement should have been offered");
 
   let ctx = state.services.get(&h).unwrap();
@@ -1955,7 +1972,7 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
   let h = reg.handle;
   let mut buf = std::vec![0u8; 4096];
 
-  let rounds = confirm_service_round(&mut state, h, now, &mut buf, FAILED_FANOUT);
+  let rounds = confirm_service_round(&mut state, h, now, &mut buf, failed_fanout());
   assert_eq!(rounds, 1, "one announcement should have been offered");
 
   let ctx = state.services.get(&h).unwrap();
@@ -2018,7 +2035,7 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   let mut t = now;
   for _ in 0..40 {
     t += Duration::from_millis(300);
-    confirm_service_round(&mut state, handle, t, &mut buf, WHOLE_FANOUT);
+    confirm_service_round(&mut state, handle, t, &mut buf, whole_fanout(t));
   }
   assert!(
     state.services[&handle].proto.advertises_instance(),
@@ -2042,7 +2059,7 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   let mut renamed = false;
   for _ in 0..80 {
     t += Duration::from_millis(250);
-    confirm_service_round(&mut state, handle, t, &mut buf, WHOLE_FANOUT);
+    confirm_service_round(&mut state, handle, t, &mut buf, whole_fanout(t));
     {
       let DriverState {
         endpoint, services, ..
@@ -2080,9 +2097,12 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     .poll_withdrawal_transmit(t, &mut buf)
     .expect("the renamed-away old name must have a detached goodbye pending")
     .token();
-  state
-    .endpoint
-    .note_withdrawal_result(token, t, WithdrawalSend::Sent, WithdrawalSend::Retry);
+  state.endpoint.note_withdrawal_result(
+    token,
+    t,
+    FamilyAttempt::Accepted { at: t },
+    FamilyAttempt::Refused { permanent: false },
+  );
 
   // The application reclaims the vacated name.
   let replacement = state
@@ -2094,7 +2114,7 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   // opens no gate) so the next round is its FIRST announcement.
   for _ in 0..12 {
     t += Duration::from_millis(300);
-    confirm_service_round(&mut state, rh, t, &mut buf, WHOLE_FANOUT);
+    confirm_service_round(&mut state, rh, t, &mut buf, whole_fanout(t));
     if state.services[&rh].proto.state() == mdns_proto::service::ServiceState::Announcing(0) {
       break;
     }
@@ -2108,7 +2128,7 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   // Exactly ONE partially-delivered announcement — the core's patience bound
   // provably cannot have excused anything yet.
   t += Duration::from_millis(300);
-  confirm_service_round(&mut state, rh, t, &mut buf, PARTIAL_FANOUT);
+  confirm_service_round(&mut state, rh, t, &mut buf, partial_fanout(t));
   assert!(
     !state.services[&rh].proto.has_fully_announced().get(),
     "a partial announcement must leave the reclaim-cancel gate shut"
@@ -2126,7 +2146,7 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   // Once the replacement reaches every obligated family, §10.2's cache-flush
   // announcement supersedes the stale records and the goodbye may be cancelled.
   t += Duration::from_secs(2);
-  confirm_service_round(&mut state, rh, t, &mut buf, WHOLE_FANOUT);
+  confirm_service_round(&mut state, rh, t, &mut buf, whole_fanout(t));
   assert!(
     state.services[&rh].proto.has_fully_announced().get(),
     "the replacement must have fully announced by now"
@@ -2175,7 +2195,7 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   #[cfg(feature = "stats")]
   let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
 
-  let (fanout, accepted_at) = send_via(
+  let fanout = send_via(
     &mut tracker,
     &v4,
     &v6,
@@ -2190,16 +2210,14 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   .await;
 
   assert!(
-    accepted_at.is_some(),
+    matches!(fanout.v4, FamilyAttempt::Accepted { .. }),
     "the one obligated family accepted the datagram, so the confirm has a real \
-     acceptance instant to anchor at"
+     acceptance instant to anchor at; got {:?}",
+    fanout.v4
   );
   assert_eq!(
-    fanout.delivery(),
-    mdns_proto::TransmitDelivery::new(
-      mdns_proto::FamilyDelivery::Delivered,
-      mdns_proto::FamilyDelivery::Unobligated,
-    ),
+    fanout.v6,
+    FamilyAttempt::NotAddressed,
     "a §6.7 reply obligates exactly the destination's family; the other one was \
      never offered the datagram and must not read as a miss"
   );
@@ -2242,6 +2260,49 @@ enum SendBehaviour {
   /// bound — which is what makes a multi-round schedule testable in bounded
   /// time.
   Refuses,
+  /// Accepts every datagram, but holds the FIRST one this long — measured from
+  /// when that attempt began — before doing so. Every later attempt is prompt.
+  /// The family whose transport stalls transiently: a full send buffer that
+  /// drains, not a route that is gone.
+  ///
+  /// [`SendBehaviour::Delayed`] cannot stand in for it. That one names an
+  /// absolute instant, so a round-by-round schedule sees the delay once and by a
+  /// diminishing amount; and a delay applied UNIFORMLY to every round is
+  /// invisible to a spacing rule, because it shifts each transmission by the same
+  /// offset. What separates an anchor read before a fan-out from one read after
+  /// it is a round that costs real time followed by one that does not.
+  StallsOnce(Duration),
+  /// Accepts every datagram, but the FIRST poll to take one does not return
+  /// until this long has elapsed INSIDE `poll_send_to`. Every later attempt is
+  /// prompt.
+  ///
+  /// This is the window between the driver's pre-syscall clock read and the
+  /// bytes actually reaching the wire, which a preempted thread, a signal
+  /// handler, or a page fault opens for real — on precisely the loaded host RFC
+  /// 6762 §6 / §8.1 / §8.3's spacing exists to protect.
+  ///
+  /// [`SendBehaviour::StallsOnce`] cannot stand in for it. That one answers
+  /// `Pending` and is re-polled, so `send_to_at` re-reads its pre-syscall clocks
+  /// on the poll that finally accepts and the two stamps still agree. Only a hold
+  /// taken WITHOUT yielding, between those reads and the acceptance, makes them
+  /// disagree.
+  StallsInSyscall(Duration),
+}
+
+/// How far a one-shot stalling behaviour's first attempt has got. Shared by
+/// [`SendBehaviour::StallsOnce`] and [`SendBehaviour::StallsInSyscall`]; every
+/// other behaviour leaves it alone.
+#[cfg(feature = "tokio")]
+#[derive(Clone, Copy)]
+enum Stall {
+  /// No attempt has been made yet.
+  Idle,
+  /// An attempt is in flight and will be accepted at this instant. Only
+  /// [`SendBehaviour::StallsOnce`] parks here — a hold taken inside the syscall
+  /// never yields, so it has no in-flight state to park in.
+  Holding(StdInstant),
+  /// The stalling attempt was accepted; every later one is immediate.
+  Spent,
 }
 
 /// A bound socket whose write side is scripted. It owns a real `std::net`
@@ -2257,6 +2318,9 @@ struct TestSocket {
   /// the WIRE record the per-family spacing rules are actually about, captured
   /// independently of anything the driver reports.
   sends: Arc<Mutex<Vec<StdInstant>>>,
+  /// [`SendBehaviour::StallsOnce`]'s progress. Untouched by every other
+  /// behaviour.
+  stall: Mutex<Stall>,
 }
 
 #[cfg(feature = "tokio")]
@@ -2266,6 +2330,7 @@ impl TestSocket {
       fd: std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a loopback socket"),
       behaviour,
       sends: Arc::new(Mutex::new(Vec::new())),
+      stall: Mutex::new(Stall::Idle),
     }
   }
 
@@ -2297,6 +2362,7 @@ impl TryFrom<std::net::UdpSocket> for TestSocket {
       fd,
       behaviour: SendBehaviour::Accepts,
       sends: Arc::new(Mutex::new(Vec::new())),
+      stall: Mutex::new(Stall::Idle),
     })
   }
 }
@@ -2367,6 +2433,51 @@ impl UdpSocket for TestSocket {
           waker.wake();
         });
         core::task::Poll::Pending
+      }
+      SendBehaviour::StallsOnce(hold) => {
+        let now = StdInstant::now();
+        let mut stall = self.stall.lock().unwrap_or_else(|e| e.into_inner());
+        // The hold runs from the attempt itself, not from this socket's
+        // construction, so what it costs does not depend on how long the setup
+        // ahead of it took.
+        if matches!(*stall, Stall::Idle) {
+          *stall = Stall::Holding(now + hold);
+        }
+        if let Stall::Holding(ready_at) = *stall {
+          if now < ready_at {
+            // Wakes the task like a slow family and unlike a wedged one: this is a
+            // round that COSTS time, not one that never answers.
+            let waker = _cx.waker().clone();
+            let wait = ready_at.saturating_duration_since(now);
+            tokio::spawn(async move {
+              tokio::time::sleep(wait).await;
+              waker.wake();
+            });
+            return core::task::Poll::Pending;
+          }
+          *stall = Stall::Spent;
+        }
+        drop(stall);
+        self.note_send();
+        core::task::Poll::Ready(Ok(buf.len()))
+      }
+      SendBehaviour::StallsInSyscall(hold) => {
+        let first = {
+          let mut stall = self.stall.lock().unwrap_or_else(|e| e.into_inner());
+          let first = matches!(*stall, Stall::Idle);
+          *stall = Stall::Spent;
+          first
+        };
+        // Deliberately BLOCKING, and taken after the driver's pre-syscall clock
+        // reads and before this socket accepts anything: yielding here would let
+        // `send_to_at` re-read those clocks, which is the one thing that would
+        // close the window under test. `note_send` follows, so this socket's own
+        // wire log records the far side of the hold.
+        if first && !hold.is_zero() {
+          std::thread::sleep(hold);
+        }
+        self.note_send();
+        core::task::Poll::Ready(Ok(buf.len()))
       }
     }
   }
@@ -2504,10 +2615,11 @@ impl UdpSocket for TestSocket {
 
 /// Fan one multicast datagram out to a healthy v4 and a wedged v6, returning the
 /// instant the fan-out STARTED (a lower bound on v4's true acceptance, taken
-/// independently of what the fan-out reports), the fan-out, the acceptance
-/// instant the confirm must use, and how long the whole fan-out took.
+/// independently of what the fan-out reports), the fan-out itself — which
+/// carries each family's own acceptance instant — and how long the whole
+/// fan-out took.
 #[cfg(feature = "tokio")]
-async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Option<StdInstant>, Duration) {
+async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Duration) {
   let v4 = Some(Arc::new(TestSocket::new(SendBehaviour::Accepts)));
   let v6 = Some(Arc::new(TestSocket::new(SendBehaviour::Wedged)));
   let mut tracker: Vec<(u64, SystemTime)> = Vec::new();
@@ -2516,7 +2628,7 @@ async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Option<StdInstant>
 
   let started = StdInstant::now();
   let mut gate = FamilyWireGate::default();
-  let out = tokio::time::timeout(
+  let fanout = tokio::time::timeout(
     SEND_ATTEMPT_TIMEOUT * 20,
     send_via(
       &mut tracker,
@@ -2536,8 +2648,7 @@ async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Option<StdInstant>
      loop cannot service a timer, a command, or any other family's transmit \
      while it is suspended here",
   );
-  let (fanout, accepted_at) = out;
-  (started, fanout, accepted_at, started.elapsed())
+  (started, fanout, started.elapsed())
 }
 
 /// A wedged family must be given up on within the per-family bound, and must not
@@ -2551,14 +2662,16 @@ async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Option<StdInstant>
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn a_wedged_family_is_bounded_and_leaves_the_healthy_anchor_alone() {
-  let (started, fanout, accepted_at, elapsed) = wedged_v6_round(b"announcement").await;
+  let (started, fanout, elapsed) = wedged_v6_round(b"announcement").await;
 
+  assert!(
+    matches!(fanout.v4, FamilyAttempt::Accepted { .. }),
+    "the healthy family must be reported delivered; got {:?}",
+    fanout.v4
+  );
   assert_eq!(
-    fanout.delivery(),
-    mdns_proto::TransmitDelivery::new(
-      mdns_proto::FamilyDelivery::Delivered,
-      mdns_proto::FamilyDelivery::Missed,
-    ),
+    fanout.v6,
+    FamilyAttempt::WouldBlock,
     "the wedged family put nothing on its wire, so the core must be told it \
      missed — never that it was unobligated or that it carried the datagram"
   );
@@ -2567,7 +2680,7 @@ async fn a_wedged_family_is_bounded_and_leaves_the_healthy_anchor_alone() {
     "the fan-out must return once the bound expires; it took {elapsed:?}"
   );
 
-  let anchor = accepted_at.expect("the healthy family accepted the datagram");
+  let anchor = accepted_at(fanout.v4).expect("the healthy family accepted the datagram");
   assert!(
     anchor.saturating_duration_since(started) < SEND_ATTEMPT_TIMEOUT,
     "the anchor must be the healthy family's OWN acceptance instant, not a time \
@@ -2591,8 +2704,8 @@ async fn a_wedged_family_cannot_push_the_healthy_refresh_past_its_ttl() {
 
   // One periodic refresh in which v6 has wedged, taken first so the service's
   // schedule can be laid out around the acceptance instant it reports.
-  let (started, fanout, accepted_at, _) = wedged_v6_round(b"refresh").await;
-  let anchor = accepted_at.expect("v4 accepted the refresh");
+  let (started, fanout, _) = wedged_v6_round(b"refresh").await;
+  let anchor = accepted_at(fanout.v4).expect("v4 accepted the refresh");
   let base = anchor
     .checked_sub(Duration::from_secs(3))
     .expect("the monotonic clock is at least a few seconds old");
@@ -2614,13 +2727,13 @@ async fn a_wedged_family_cannot_push_the_healthy_refresh_past_its_ttl() {
 
   // Two whole announcements reach Established, so the periodic refresh is the
   // schedule under test and it is already due at `anchor`.
-  confirm_service_round(&mut state, h, base, &mut buf, WHOLE_FANOUT);
+  confirm_service_round(&mut state, h, base, &mut buf, whole_fanout(base));
   confirm_service_round(
     &mut state,
     h,
     base + Duration::from_secs(1),
     &mut buf,
-    WHOLE_FANOUT,
+    whole_fanout(base + Duration::from_secs(1)),
   );
   assert_eq!(
     state.services[&h].proto.state(),
@@ -2641,7 +2754,7 @@ async fn a_wedged_family_cannot_push_the_healthy_refresh_past_its_ttl() {
       .is_ok_and(|t| t.is_some()),
     "the periodic re-announce must be due"
   );
-  confirm_service_transmit(endpoint, ctx, anchor, fanout.delivery());
+  let _ = confirm_service_transmit(endpoint, ctx, anchor, fanout.v4, fanout.v6);
 
   let due = ctx.proto.poll_timeout().expect("re-armed");
   assert!(
@@ -2667,12 +2780,14 @@ async fn a_wedged_family_cannot_push_the_healthy_refresh_past_its_ttl() {
 // ── The obligation tag (`TransmitObligation`) at the driver seam ────────────
 
 /// A §6.7 legacy unicast reply reaches exactly ONE family, so its fan-out is
-/// all-delivered by construction — the other family is unobligated, not missing.
+/// all-delivered by construction — the other family was not addressed, not missing.
 #[cfg(feature = "tokio")]
-const UNICAST_FANOUT: Fanout = Fanout {
-  v4: FamilySend::Sent,
-  v6: FamilySend::Unbound,
-};
+fn unicast_fanout(at: StdInstant) -> Fanout {
+  Fanout {
+    v4: FamilyAttempt::Accepted { at },
+    v6: FamilyAttempt::NotAddressed,
+  }
+}
 
 /// Drain one service's due transmits at `t` through the SAME seam
 /// `drain_transmits` uses, choosing each datagram's fan-out the way `send_via`
@@ -2699,9 +2814,9 @@ fn confirm_service_round_mixed(
     let fanout = if tx.dst().ip().is_multicast() {
       multicast_fanout
     } else {
-      UNICAST_FANOUT
+      unicast_fanout(t)
     };
-    confirm_service_transmit(endpoint, ctx, t, fanout.delivery());
+    let _ = confirm_service_transmit(endpoint, ctx, t, fanout.v4, fanout.v6);
     rounds += 1;
   }
   rounds
@@ -2764,7 +2879,7 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
   let mut buf = std::vec![0u8; 4096];
 
   // The lifecycle reaches no wire at all, so nothing it sends can latch.
-  confirm_service_round(&mut state, h, now, &mut buf, FAILED_FANOUT);
+  confirm_service_round(&mut state, h, now, &mut buf, failed_fanout());
   assert!(
     !state.services[&h].proto.advertises_instance(),
     "a wholly-failed announcement exposes nothing"
@@ -2775,7 +2890,7 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
   let t = now + Duration::from_millis(50);
   inject_ptr_query(&mut state, legacy, t);
   assert_eq!(
-    confirm_service_round_mixed(&mut state, h, t, &mut buf, FAILED_FANOUT),
+    confirm_service_round_mixed(&mut state, h, t, &mut buf, failed_fanout()),
     1,
     "only the legacy reply is due this early"
   );
@@ -3018,6 +3133,107 @@ async fn a_family_that_paid_its_floor_before_its_own_send_is_not_gated() {
   drop(reg);
 }
 
+/// The RECORD side of the same gate: a send whose syscall completes long after
+/// the driver offered it must re-open its family from the instant the bytes
+/// reached the wire, never from the pre-syscall reading taken before it.
+///
+/// The two stamps are wrong in opposite directions, so neither can stand in for
+/// the other. The core's confirm anchor is pre-syscall and correctly so — it may
+/// only ever UNDERSTATE how fresh a family's peers are. The gate measures the
+/// real spacing between bytes on ONE wire, so a pre-syscall anchor spends part of
+/// the interval on time the datagram had not yet reached that wire, and the next
+/// datagram goes out INSIDE RFC 6762 §6 / §8.1 / §8.3's floor. That direction is
+/// permissive rather than conservative: reading a clock early withholds a send,
+/// recording one early releases one.
+///
+/// Nothing bounds the delay between the clock read and the `sendto` — a preempted
+/// thread, a signal handler, or a page fault — and that is what
+/// [`SendBehaviour::StallsInSyscall`] stands in for. At §8.1's 250 ms inter-probe
+/// interval a 200 ms stall would leave 50 ms of true spacing, on precisely the
+/// loaded host the interval exists to protect.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_send_re_opens_its_family_from_the_wire_not_the_offer() {
+  /// The floor the gate is asked to keep for this datagram's kind.
+  const GAP: Duration = Duration::from_millis(400);
+  /// How long the first send is held between the driver's clock reads and the
+  /// socket accepting it. Comfortably PAST `GAP`, so a gate anchored at the
+  /// pre-syscall reading has already re-opened by the time the syscall returns.
+  const STALL: Duration = Duration::from_millis(900);
+
+  let sock = TestSocket::new(SendBehaviour::StallsInSyscall(STALL));
+  let wire_log = sock.wire_log();
+  let v4 = Some(Arc::new(sock));
+  let v6: Option<Arc<TestSocket>> = None;
+  let mut tracker: Vec<(u64, SystemTime)> = Vec::new();
+  #[cfg(feature = "stats")]
+  let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
+  let mut gate = FamilyWireGate::default();
+
+  let first = send_via(
+    &mut tracker,
+    &v4,
+    &v6,
+    MDNS_V4_DST,
+    b"announcement",
+    &mut gate,
+    GAP,
+    #[cfg(feature = "stats")]
+    &stats,
+  )
+  .await;
+  assert!(
+    matches!(first.v4, FamilyAttempt::Accepted { .. }),
+    "the stalled send still SUCCEEDS — this is a slow syscall, not a failure, and \
+     a round that missed would never reach the spacing under test; got {:?}",
+    first.v4
+  );
+
+  // The socket's own record of when it took the datagram, captured on the far
+  // side of the hold and independently of anything the driver reports.
+  let wire_at = *wire_log
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+    .first()
+    .expect("the socket accepted the datagram");
+  let recorded =
+    gate.last_sent[FAMILY_V4].expect("a carried datagram re-arms its own family's gate");
+  assert!(
+    recorded >= wire_at,
+    "the gate must be anchored at or after the instant the bytes reached the wire; \
+     it was anchored {:?} BEFORE it, which is the whole {STALL:?} the syscall spent \
+     handing the datagram over",
+    wire_at.saturating_duration_since(recorded),
+  );
+
+  // The consequence, in the gate's own vocabulary: the very next datagram of the
+  // same kind is offered immediately, and its family has not paid the floor.
+  let second = send_via(
+    &mut tracker,
+    &v4,
+    &v6,
+    MDNS_V4_DST,
+    b"announcement",
+    &mut gate,
+    GAP,
+    #[cfg(feature = "stats")]
+    &stats,
+  )
+  .await;
+  assert_eq!(
+    second.v4,
+    FamilyAttempt::GateShut,
+    "this wire carried the previous copy moments ago, so the {GAP:?} floor is \
+     unpaid and the datagram must be withheld"
+  );
+  assert_eq!(
+    wire_log.lock().unwrap_or_else(|e| e.into_inner()).len(),
+    1,
+    "a withheld family makes no syscall at all, so exactly one copy may have \
+     reached this wire"
+  );
+}
+
 /// A pass with many simultaneously-due producers and one wedged family must stay
 /// inside its aggregate budget — and that budget spans the withdrawal pump too.
 ///
@@ -3046,7 +3262,7 @@ async fn a_pass_with_a_wedged_family_stays_inside_its_budget() {
   let dying = state
     .register_service(delivery_test_spec("dying"), t)
     .expect("register the withdrawing service");
-  confirm_service_round(&mut state, dying.handle, t, &mut scratch, WHOLE_FANOUT);
+  confirm_service_round(&mut state, dying.handle, t, &mut scratch, whole_fanout(t));
   state.remove_service(dying.handle, t);
   assert!(
     state
@@ -3144,8 +3360,6 @@ async fn a_paid_family_is_not_offered_the_blocked_familys_retry_rounds() {
   let v4_log = v4.wire_log();
   let mut state = scripted_state(false, v4, v6);
   let mut scratch = std::vec![0u8; 4096];
-  let v4_wire_len =
-    |log: &Arc<Mutex<Vec<StdInstant>>>| log.lock().unwrap_or_else(|e| e.into_inner()).len();
 
   // A service driven to an announced state through the direct seam (so the setup
   // costs no wall clock) and then retired: its goodbye is non-empty and both
@@ -3155,27 +3369,26 @@ async fn a_paid_family_is_not_offered_the_blocked_familys_retry_rounds() {
     .register_service(delivery_test_spec("paid"), base)
     .expect("register the withdrawing service");
   let handle = reg.handle;
-  confirm_service_round(&mut state, handle, base, &mut scratch, WHOLE_FANOUT);
+  confirm_service_round(&mut state, handle, base, &mut scratch, whole_fanout(base));
   state.remove_service(handle, base);
 
-  // Every round is pumped at the endpoint's OWN next deadline, so the clock this
-  // walks follows the §10.1 schedule exactly rather than the host's timing. The
+  // Every round is pumped when the endpoint's own next deadline falls due, ON THE
+  // WALL CLOCK, exactly as `driver_task` sleeps to it. A synthetic instant walked
+  // along `next_withdrawal_deadline` cannot stand in: the §10.1 resend schedule is
+  // re-armed from the instant the round FANNED OUT, which this drain reads for
+  // itself, so a hand-rolled clock running ahead of the host's would leave every
+  // item due against a schedule anchored where the host actually is. The
   // sequence terminates at the anti-pin ceiling; the iteration cap is a hang
   // guard, not a bound the assertions rely on.
-  let mut rounds_on_v4: Vec<Duration> = Vec::new();
-  let mut t = base;
   for _ in 0..512 {
-    let before = v4_wire_len(&v4_log);
+    let t = StdInstant::now();
     state
       .drain_withdrawals(t, &mut DrainBudget::new(t), &mut scratch)
       .await;
-    if v4_wire_len(&v4_log) > before {
-      rounds_on_v4.push(t.saturating_duration_since(base));
-    }
     let Some(due) = state.endpoint.next_withdrawal_deadline() else {
       break;
     };
-    t = due.max(t);
+    tokio::time::sleep(due.saturating_duration_since(StdInstant::now())).await;
   }
 
   assert!(
@@ -3184,26 +3397,118 @@ async fn a_paid_family_is_not_offered_the_blocked_familys_retry_rounds() {
      guard and the counts below mean nothing"
   );
   assert!(
-    t.saturating_duration_since(base) >= GOODBYE_CEILING,
+    base.elapsed() >= GOODBYE_CEILING,
     "v6 never carried its goodbye, so the item must have run to its \
      {GOODBYE_CEILING:?} anti-pin ceiling — a shorter run means the rounds v4 \
      was NOT offered were never produced in the first place"
   );
+  let v4_gaps = wire_gaps(&v4_log);
   assert_eq!(
-    rounds_on_v4.len(),
+    v4_log.lock().unwrap_or_else(|e| e.into_inner()).len(),
     GOODBYE_ROUNDS_PER_FAMILY,
     "v4 owed exactly its §10.1 budget and paid it; every datagram after that \
      retracts records no v4 peer still holds, and exists only because v6 is \
-     retrying. Rounds reached v4's wire at: {rounds_on_v4:?}"
+     retrying. Gaps between the rounds that reached v4's wire: {v4_gaps:?}"
   );
-  for pair in rounds_on_v4.windows(2) {
-    let gap = pair[1].saturating_sub(pair[0]);
+  for gap in v4_gaps {
     assert!(
       gap >= GOODBYE_MIN_FAMILY_GAP,
       "two goodbyes for one name reached v4's wire {gap:?} apart, inside the \
        {GOODBYE_MIN_FAMILY_GAP:?} §10.1 gives one family's wire — the blocked \
        family's retry cadence was applied to the paid family's transmissions"
     );
+  }
+  drop(reg);
+}
+
+/// The §10.1 resend schedule is re-armed from the round's OWN fan-out, so a slow
+/// goodbye does not pull the next one onto its heels.
+///
+/// `note_withdrawal_result` re-arms `next_at` at the instant it is handed plus
+/// the §10.1 interval, and that schedule is the only thing pacing consecutive
+/// goodbyes — this fan-out is deliberately ungated, so nothing else stands
+/// between two rounds. Hand it the instant the PASS began and every microsecond
+/// the round spent is charged to the next one: the drain ahead of it, the fan-out
+/// itself under its own [`SEND_ATTEMPT_TIMEOUT`], the scheduler. A family that
+/// accepts near that bound leaves the next round already due at the moment this
+/// one lands, and §10.1's three loss-resilience sends collapse into near-adjacent
+/// transmissions on the very wire the spacing is for.
+///
+/// The fan-out is slow ONCE and prompt afterwards, which is what makes the two
+/// anchors disagree: a uniform delay shifts every transmission equally and is
+/// invisible to a spacing rule. Both families carry every round, so nothing here
+/// rides on the failure paths — what is measured is the schedule alone.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_goodbye_fan_out_does_not_pull_the_next_round_onto_it() {
+  /// How long the first round's fan-out holds before both families accept it.
+  /// Inside [`SEND_ATTEMPT_TIMEOUT`], so the datagram is genuinely CARRIED rather
+  /// than missed — a missed round takes the short retry backoff and never reaches
+  /// the interval under test.
+  const STALL: Duration = Duration::from_millis(200);
+
+  let v4 = TestSocket::new(SendBehaviour::StallsOnce(STALL));
+  let v6 = TestSocket::new(SendBehaviour::StallsOnce(STALL));
+  let (v4_log, v6_log) = (v4.wire_log(), v6.wire_log());
+  let mut state = scripted_state(false, v4, v6);
+  let mut scratch = std::vec![0u8; 4096];
+
+  // Announced through the direct seam (so the setup costs no wall clock) and then
+  // retired: the goodbye is non-empty and both families owe it.
+  let base = StdInstant::now();
+  let reg = state
+    .register_service(delivery_test_spec("slowbye"), base)
+    .expect("register the withdrawing service");
+  let handle = reg.handle;
+  confirm_service_round(&mut state, handle, base, &mut scratch, whole_fanout(base));
+  state.remove_service(handle, base);
+
+  // Passes exactly as `driver_task` runs them: ONE instant read at the top and
+  // handed to the drain, then a sleep to the endpoint's own next deadline. That
+  // is the whole of the setup — the stale anchor is the pass's own `now`, not
+  // anything contrived here. The iteration cap is a hang guard, not a bound the
+  // assertions rely on.
+  for _ in 0..16 {
+    let now = StdInstant::now();
+    let mut budget = DrainBudget::new(now);
+    state
+      .drain_withdrawals(now, &mut budget, &mut scratch)
+      .await;
+    let Some(due) = state.endpoint.next_withdrawal_deadline() else {
+      break;
+    };
+    tokio::time::sleep(due.saturating_duration_since(StdInstant::now())).await;
+  }
+
+  assert!(
+    !state.services.contains_key(&handle),
+    "the withdrawal must have settled; otherwise the loop stopped on its hang \
+     guard and the gaps below mean nothing"
+  );
+  assert!(
+    base.elapsed() < GOODBYE_CEILING,
+    "the sequence must have run on its own schedule rather than been cut off by \
+     the {GOODBYE_CEILING:?} anti-pin ceiling"
+  );
+  for (family, log) in [("v4", &v4_log), ("v6", &v6_log)] {
+    assert_eq!(
+      log.lock().unwrap_or_else(|e| e.into_inner()).len(),
+      GOODBYE_ROUNDS_PER_FAMILY,
+      "{family} accepted every round it was offered, so it must have carried its \
+       whole §10.1 budget — otherwise there is no spacing left to measure"
+    );
+    for gap in wire_gaps(log) {
+      assert!(
+        gap >= GOODBYE_MIN_FAMILY_GAP,
+        "two goodbyes for one name reached {family}'s wire {gap:?} apart, inside \
+         the {GOODBYE_MIN_FAMILY_GAP:?} §10.1 gives one family's wire. The round \
+         took {STALL:?} to fan out and its schedule was re-armed from the instant \
+         the PASS began, so the next round was already due when this one landed. \
+         v4 gaps {:?}, v6 gaps {:?}",
+        wire_gaps(&v4_log),
+        wire_gaps(&v6_log),
+      );
+    }
   }
   drop(reg);
 }
@@ -3435,4 +3740,165 @@ async fn a_question_drawn_past_the_callers_window_never_reaches_the_wire() {
      produces; got {event:?}"
   );
   drop(reg);
+}
+
+/// A datagram past this family's HARD UDP ceiling is reported permanently
+/// refused; one within it never is, whatever errno the kernel chose.
+///
+/// This driver had no permanence arm at all: every `Err` was one undifferentiated
+/// failure, so a §8.1 probe or a §8.3 announcement no socket could ever carry was
+/// re-armed by the core forever, with nothing on any wire and `Established` never
+/// reached. The core's patience does not rescue that — it excuses a MISSING
+/// family, not a round that can succeed on none of them.
+///
+/// The SIZE is the only sound proof and the errno is deliberately not consulted:
+/// Linux answers `EMSGSIZE` both for a payload past the hard maximum, which is
+/// permanent, and for a write past the currently-known path MTU with `DF` set,
+/// which the next attempt may get past after an MTU probe or a route change
+/// (udp(7), ip(7) `IP_MTU_DISCOVER`). Reading that errno as permanent retires a
+/// healthy service over a link whose MTU just dropped.
+#[test]
+fn permanence_is_proved_by_the_size_and_never_by_the_errno() {
+  let err = || SendAttempt::Answered {
+    result: Err(std::io::Error::from(std::io::ErrorKind::Other)),
+    submitted_wall: SystemTime::now(),
+    submitted_at: StdInstant::now(),
+    wire_at: StdInstant::now(),
+  };
+  // An ordinary mDNS-sized body: three orders of magnitude inside the limit, and
+  // the size at which a path-MTU refusal actually happens.
+  let ordinary = std::vec![0u8; 1200];
+  assert_eq!(
+    attempt_of(Family::V4, &ordinary, &err()),
+    FamilyAttempt::Refused { permanent: false },
+    "a refusal of a datagram within the ceiling proves only that these bytes did \
+     not go out now"
+  );
+
+  let past_v4 = std::vec![0u8; mdns_proto::constants::MAX_UDP_PAYLOAD_V4 + 1];
+  assert_eq!(
+    attempt_of(Family::V4, &past_v4, &err()),
+    FamilyAttempt::Refused { permanent: true },
+    "past IPv4's 16-bit total-length ceiling, no route and no MTU can ever carry \
+     it, so the core must stop re-arming it"
+  );
+  // The two ceilings differ by the 20-byte IPv4 header, so the very body that is
+  // impossible on v4 is merely refused on v6.
+  assert_eq!(
+    attempt_of(Family::V6, &past_v4, &err()),
+    FamilyAttempt::Refused { permanent: false },
+    "each family's ceiling is its own"
+  );
+  assert_eq!(
+    attempt_of(
+      Family::V6,
+      &std::vec![0u8; mdns_proto::constants::MAX_UDP_PAYLOAD_V6 + 1],
+      &err()
+    ),
+    FamilyAttempt::Refused { permanent: true },
+  );
+}
+
+/// A sustained datagram every offered family refuses by SIZE retires its
+/// producer, and the core is the one that says so.
+///
+/// The end of the liveness defect: this driver reported such a round as an
+/// ordinary miss, the core re-armed it, and the producer probed or announced
+/// forever with nothing on any wire.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn a_permanently_oversized_sustained_datagram_retires_its_producer() {
+  let mut buf = std::vec![0u8; 4096];
+
+  // End to end through this driver's own classification: a body no IPv4 socket
+  // can carry, refused by the kernel, on a single-stack host.
+  let oversized = std::vec![0u8; mdns_proto::constants::MAX_UDP_PAYLOAD_V4 + 1];
+  let refused = SendAttempt::Answered {
+    result: Err(std::io::Error::from(std::io::ErrorKind::Other)),
+    submitted_wall: SystemTime::now(),
+    submitted_at: StdInstant::now(),
+    wire_at: StdInstant::now(),
+  };
+  let (mut state, h) = probing_service();
+  let ctx = state.services.get_mut(&h).unwrap();
+  let now = draw_first_probe(&mut ctx.proto, &mut buf);
+  assert!(
+    ctx
+      .proto
+      .note_transmit_outcome(
+        now,
+        attempt_of(Family::V4, &oversized, &refused),
+        FamilyAttempt::NoSocket,
+      )
+      .retire_producer(),
+    "the one family this host has refused the probe's SIZE, so re-offering these \
+     exact bytes can never put them on a wire"
+  );
+
+  // The contrast: a family that may still clear is waited for, however badly the
+  // other one failed. Retiring here would destroy a healthy advertisement over a
+  // full send buffer.
+  let (mut state, h) = probing_service();
+  let ctx = state.services.get_mut(&h).unwrap();
+  let now = draw_first_probe(&mut ctx.proto, &mut buf);
+  assert!(
+    !ctx
+      .proto
+      .note_transmit_outcome(
+        now,
+        attempt_of(Family::V4, &oversized, &refused),
+        FamilyAttempt::WouldBlock,
+      )
+      .retire_producer(),
+    "an unwritable socket submitted nothing and may accept the same bytes next \
+     round"
+  );
+}
+
+/// A `DriverState` with no bound socket, and one registered service in `Probing`.
+///
+/// No sockets: this test is about what the CORE concludes from a reported round,
+/// and the report is handed over by hand.
+#[cfg(feature = "tokio")]
+fn probing_service() -> (
+  DriverState<agnostic_net::tokio::Net>,
+  mdns_proto::ServiceHandle,
+) {
+  let opts = crate::options::ServerOptions::default();
+  let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+    v4: None,
+    v6: None,
+    interface_index: 0,
+  };
+  let mut state = DriverState::new(&opts, sockets);
+  let mut records = mdns_proto::ServiceRecords::new(
+    mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    mdns_proto::Name::try_from_str("printer._ipp._tcp.local.").unwrap(),
+    mdns_proto::Name::try_from_str("host.local.").unwrap(),
+    631,
+    120,
+  );
+  records.add_a(std::net::Ipv4Addr::new(192, 168, 1, 10));
+  let handle = state
+    .register_service(mdns_proto::ServiceSpec::new(records), StdInstant::now())
+    .unwrap()
+    .handle;
+  (state, handle)
+}
+
+/// Arm and draw the first §8.1 probe, returning the instant it was drawn at. A
+/// fresh service waits out §8.1's random 0-250 ms initial delay first.
+#[cfg(feature = "tokio")]
+fn draw_first_probe(proto: &mut ProtoService, buf: &mut [u8]) -> StdInstant {
+  let start = StdInstant::now();
+  for step in 1..=8u32 {
+    let now = start
+      .checked_add(std::time::Duration::from_millis(u64::from(step) * 100))
+      .unwrap();
+    proto.handle_timeout(now).unwrap();
+    if proto.poll_transmit(now, buf).unwrap().is_some() {
+      return now;
+    }
+  }
+  panic!("no probe was drawn within the §8.1 initial delay");
 }

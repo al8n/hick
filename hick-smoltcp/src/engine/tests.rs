@@ -1,5 +1,8 @@
-use alloc::{collections::VecDeque, vec::Vec};
-use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use alloc::{collections::VecDeque, rc::Rc, vec::Vec};
+use core::{
+  cell::Cell,
+  net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use mdns_proto::{Name, ServiceRecords, ServiceSpec, ServiceState};
 use rand::{SeedableRng, rngs::StdRng};
@@ -29,6 +32,26 @@ struct MockUdp {
   /// ones that did, so a test that must observe a fan-out ROUND on a failing
   /// family has to count attempts instead.
   attempts: usize,
+  /// The monotonic clock this transport SHARES with the engine: `pump` reads it
+  /// as its clock parameter, and every datagram queued here is stamped with it
+  /// into [`Self::queued`]. That is what lets a test observe WHEN a datagram
+  /// reached the transport rather than only that it did — the pass instant a test
+  /// hands the pump is not the same thing once the pump spends time getting to a
+  /// send. `None` (the default) leaves `queued` empty and changes nothing.
+  clock: Option<Rc<Cell<i64>>>,
+  /// Micros of pump work to charge to [`Self::clock`] on the next `try_send`,
+  /// before the transport answers. Models a pump that spends time BEFORE it
+  /// reaches a send — an RX drain, the normal transmit loop, an earlier
+  /// withdrawal round — at the one point provably between the pass instant and
+  /// anything the pump reads after the send. Taken by the send it delays, so a
+  /// test can be slow ONCE: a uniform delay shifts every transmission equally and
+  /// is invisible to a spacing rule.
+  stall_before_next_send: Option<i64>,
+  /// `(destination, datagram, clock micros)` for every datagram this transport
+  /// ACCEPTED while a [`Self::clock`] is set. Acceptance is where the real
+  /// transport queues too, so what these stamps measure — and what the spacing
+  /// assertions below therefore pin — is the spacing between ENQUEUES.
+  queued: Vec<(SocketAddr, Vec<u8>, i64)>,
 }
 
 impl UdpIo for MockUdp {
@@ -42,6 +65,13 @@ impl UdpIo for MockUdp {
 
   fn try_send(&mut self, buf: &[u8], dst: SocketAddr) -> Result<(), SendError> {
     self.attempts += 1;
+    // Charged before the transport answers: the pump spent this time whatever the
+    // socket goes on to say about the datagram.
+    if let Some(clock) = self.clock.as_ref()
+      && let Some(stall) = self.stall_before_next_send.take()
+    {
+      clock.set(clock.get().saturating_add(stall));
+    }
     if let Some(err) = if dst.is_ipv4() {
       self.v4_fail
     } else {
@@ -54,6 +84,9 @@ impl UdpIo for MockUdp {
         return Err(SendError::Busy);
       }
       *slots -= 1;
+    }
+    if let Some(clock) = self.clock.as_ref() {
+      self.queued.push((dst, buf.to_vec(), clock.get()));
     }
     self.sent.push((dst, buf.to_vec()));
     Ok(())
@@ -102,7 +135,7 @@ fn registering_a_service_emits_a_probe_to_the_mdns_group() {
   let mut scratch = [0u8; 1500];
   // Advance time past the §8.1 probe delay (0–250 ms) so the probe fires.
   for micros in [0, 250_000, 500_000, 1_000_000, 2_000_000] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
 
   assert!(
@@ -124,7 +157,7 @@ fn a_goodbye_with_no_socket_on_any_family_writes_off_without_error() {
   for micros in [
     0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
   ] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   // Every family now reports "no socket": the goodbye burst must write each
   // family off as Unsupported — no error, no datagram, no infinite retry.
@@ -133,7 +166,7 @@ fn a_goodbye_with_no_socket_on_any_family_writes_off_without_error() {
   io.sent.clear();
   engine.unregister_service(handle, at(5_000_000));
   for micros in [5_000_000, 5_250_001, 5_500_001, 5_750_001, 6_000_001] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   assert!(
     io.sent.is_empty(),
@@ -165,7 +198,7 @@ fn build_ptr_query(qname: &Name) -> Vec<u8> {
 
 /// Announce `sample_spec`, then feed a query from `querier`, pump, and return the
 /// engine plus the sent log so a caller can assert how the (legacy → unicast)
-/// reply fared — on the wire and in the engine's own accounting.
+/// reply fared — on the transport and in the engine's own accounting.
 fn unicast_reply_scenario(seed: u64, v4_fail: Option<SendError>) -> (TestEngine, SentLog) {
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(seed));
   engine.register_service(sample_spec(), at(0)).unwrap();
@@ -174,7 +207,7 @@ fn unicast_reply_scenario(seed: u64, v4_fail: Option<SendError>) -> (TestEngine,
   for micros in [
     0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
   ] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   io.sent.clear();
   io.v4_fail = v4_fail;
@@ -191,7 +224,7 @@ fn unicast_reply_scenario(seed: u64, v4_fail: Option<SendError>) -> (TestEngine,
     },
   ));
   for micros in [5_000_000, 5_250_000, 5_500_000] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   (engine, io.sent)
 }
@@ -300,7 +333,7 @@ fn a_legacy_unicast_reply_never_opens_the_reclaim_cancel_gate() {
     },
   ));
   io.sent.clear();
-  engine.pump(at(t + 1_000), &mut io, &mut scratch);
+  engine.pump(|| at(t + 1_000), &mut io, &mut scratch);
   assert!(
     io.sent.iter().any(|(dst, _)| *dst == querier),
     "the legacy querier must get its unicast reply; sent = {:?}",
@@ -324,16 +357,16 @@ fn unregistering_an_announced_service_emits_a_goodbye() {
   for micros in [
     0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
   ] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   io.sent.clear();
 
   // Unregister → begins the endpoint-owned §10.1 TTL=0 goodbye sequence. The
   // first round is due immediately; resends are WITHDRAWAL_INTERVAL (250 ms)
-  // apart. Pump across the sequence so at least one goodbye reaches the wire.
+  // apart. Pump across the sequence so at least one goodbye is queued.
   engine.unregister_service(handle, at(5_000_000));
   for micros in [5_000_000, 5_000_001, 5_250_001, 5_500_001, 5_750_001] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
 
   assert!(
@@ -369,7 +402,7 @@ fn v6_only_node_advertises_via_multicast_fan_out() {
   let mut scratch = [0u8; 1500];
   let mut established = false;
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while let Some(update) = engine.poll_service_update(handle) {
       established |= matches!(update, ServiceUpdate::Established);
     }
@@ -399,7 +432,7 @@ fn no_reachable_group_does_not_falsely_advance() {
   let mut scratch = [0u8; 1500];
   let mut established = false;
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while let Some(update) = engine.poll_service_update(handle) {
       established |= matches!(update, ServiceUpdate::Established);
     }
@@ -417,7 +450,7 @@ fn no_reachable_group_does_not_falsely_advance() {
 /// A busy transport must not consume the endpoint-owned withdrawal's resend
 /// budget: an all-`Busy` goodbye round is reported as not-delivered, so the
 /// endpoint re-arms it (short backoff) WITHOUT spending — and once the transport
-/// recovers the goodbye still reaches the wire. (The per-family `owed` budget is
+/// recovers the goodbye is still queued. (The per-family `owed` budget is
 /// now endpoint-owned; this is the black-box observation of that property
 /// through the driver's `poll_withdrawal_transmit` → `note_withdrawal_result`
 /// loop. The proto-level test exercises the spend/re-arm bookkeeping directly.)
@@ -430,7 +463,7 @@ fn goodbye_budget_is_not_consumed_while_transport_is_busy() {
   for micros in [
     0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
   ] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   engine.unregister_service(handle, at(5_000_000));
 
@@ -442,7 +475,7 @@ fn goodbye_budget_is_not_consumed_while_transport_is_busy() {
   io.v6_fail = Some(SendError::Busy);
   io.sent.clear();
   for micros in [5_000_000, 5_250_001, 5_500_001, 5_750_001, 6_000_001] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   assert!(
     io.sent.is_empty(),
@@ -457,7 +490,7 @@ fn goodbye_budget_is_not_consumed_while_transport_is_busy() {
   // Transport recovers → the goodbye finally goes out (budget was preserved).
   io.v4_fail = None;
   io.v6_fail = None;
-  engine.pump(at(6_250_001), &mut io, &mut scratch);
+  engine.pump(|| at(6_250_001), &mut io, &mut scratch);
   assert!(
     io.sent.iter().any(|(_, d)| datagram_kind(d) == Some(true)),
     "the TTL=0 goodbye must go out once the transport frees"
@@ -470,8 +503,12 @@ fn goodbye_budget_is_not_consumed_while_transport_is_busy() {
 const GOODBYE_ROUNDS_PER_FAMILY: usize = 3;
 
 /// The §10.1 spacing between two successive goodbyes for one name on ONE
-/// family's wire, restated for the same reason.
+/// interface, restated for the same reason.
 const GOODBYE_INTERVAL_MICROS: i64 = 250_000;
+
+/// The endpoint's anti-pin ceiling: how long one withdrawal item may hold its
+/// route before it is force-completed. Restated for the same reason.
+const GOODBYE_CEILING_MICROS: i64 = 2_000_000;
 
 /// TTL=0 goodbyes this log records for the IPv4 group.
 fn v4_goodbye_count(sent: &SentLog) -> usize {
@@ -488,7 +525,7 @@ fn v4_goodbye_count(sent: &SentLog) -> usize {
 /// paid every round and v6 is still failing, a `Sent` on v4 is (correctly) not
 /// progress and the endpoint re-arms the item on its short retry backoff for
 /// v6's sake. A driver that fans every round to both families then puts a TTL=0
-/// goodbye on v4's wire at THAT cadence until the 2 s ceiling — retracting
+/// goodbye for v4 at THAT cadence until the 2 s ceiling — retracting
 /// records no v4 peer still holds, dozens of times, where §10.1 spaces one
 /// family's goodbyes 250 ms apart. This driver used to, because `burst` was fed
 /// a throwaway `[1, 1]` in place of the real debt.
@@ -502,14 +539,14 @@ fn a_paid_family_is_not_offered_the_blocked_familys_retry_rounds() {
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   // Drain announce-phase updates so the slot's only remaining lifecycle is the
   // withdrawal.
   while engine.poll_service_update(handle).is_some() {}
   engine.unregister_service(handle, at(5_000_000)); // ceiling at 7_000_000
-  // Only count withdrawal-phase datagrams (the announce phase already put
-  // positive-TTL records on both wires).
+  // Only count withdrawal-phase datagrams (the announce phase already queued
+  // positive-TTL records for both families).
   io.sent.clear();
   // v6 refuses everything from here on, so it keeps its whole debt and the item
   // re-arms on the endpoint's short retry backoff for its sake.
@@ -523,7 +560,7 @@ fn a_paid_family_is_not_offered_the_blocked_familys_retry_rounds() {
   let mut micros = 5_010_000i64;
   while micros < 6_990_000 {
     let before = v4_goodbye_count(&io.sent);
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     if v4_goodbye_count(&io.sent) > before {
       v4_goodbyes.push(micros);
     }
@@ -542,16 +579,139 @@ fn a_paid_family_is_not_offered_the_blocked_familys_retry_rounds() {
     GOODBYE_ROUNDS_PER_FAMILY,
     "v4 owed exactly its §10.1 budget and paid it; every datagram after that \
      retracts records no v4 peer still holds, and exists only because v6 is \
-     retrying. Rounds reached v4's wire at (us): {v4_goodbyes:?}"
+     retrying. Rounds queued for v4 at (us): {v4_goodbyes:?}"
   );
   for pair in v4_goodbyes.windows(2) {
     let gap = pair[1] - pair[0];
     assert!(
       gap >= GOODBYE_INTERVAL_MICROS,
-      "two goodbyes for one name reached v4's wire {gap} us apart, inside the \
-       {GOODBYE_INTERVAL_MICROS} us §10.1 gives one family's wire — the blocked \
+      "two goodbyes for one name were queued for v4 {gap} us apart, inside the \
+       {GOODBYE_INTERVAL_MICROS} us §10.1 gives one interface — the blocked \
        family's retry cadence was applied to the paid family's transmissions"
     );
+  }
+}
+
+/// A pump that spends time BEFORE it reaches the withdrawals must not pull the
+/// next §10.1 goodbye onto the heels of the one it just sent.
+///
+/// `note_withdrawal_result` re-arms the item at the instant it is handed plus the
+/// §10.1 interval, and that schedule is the only thing pacing consecutive
+/// goodbyes — this fan-out is deliberately ungated, so nothing else stands
+/// between two rounds. Hand it the instant the PASS began and every microsecond
+/// the pump spent first is charged to the next round: up to `MAX_RX_PER_PUMP`
+/// inbound datagrams, the whole normal transmit loop, every earlier withdrawal
+/// round. Non-blocking `try_send` bounds how long one send can PARK and nothing
+/// else — not the CPU a pass spends, not how many producers it serves, not
+/// preemption — so the gap between the pass instant and the send is unbounded by
+/// anything the transport promises.
+///
+/// The pump is slow ONCE and prompt afterwards, which is what makes the two
+/// anchors disagree: a uniform delay shifts every transmission equally and is
+/// invisible to a spacing rule. Both families carry every round, so nothing here
+/// rides on the failure paths — what is measured is the schedule alone.
+///
+/// Exact rather than approximate: the engine's whole notion of time is the clock
+/// it is handed, so the delay is a number this test chooses and the gaps it
+/// produces need no slack.
+#[test]
+fn a_slow_pump_does_not_pull_the_next_goodbye_round_onto_it() {
+  /// Micros the pump spends between reading its pass instant and queuing the
+  /// first goodbye. Under the §10.1 interval, so a pass-instant anchor pulls the
+  /// next round CLOSE rather than leaving it already due — the weaker of the two
+  /// failures, and the one any delay at all produces.
+  const SLOW_PUMP_MICROS: i64 = 200_000;
+  /// When the service is retired. Leaves the whole three-round sequence inside
+  /// the item's anti-pin ceiling even with the slow round, so every gap measured
+  /// belongs to the §10.1 schedule rather than to a forced finish.
+  const RETIRE_AT: i64 = 5_000_000;
+
+  // The one clock: the engine READS it through `pump`, and the transport STAMPS
+  // every queued datagram with it. A pass instant and an enqueue instant are then
+  // the same kind of thing and can be compared.
+  let clock = Rc::new(Cell::new(0i64));
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(3141));
+  let handle = engine
+    .register_service(sample_spec(), at(clock.get()))
+    .unwrap();
+  let mut io = MockUdp {
+    clock: Some(Rc::clone(&clock)),
+    ..Default::default()
+  };
+  let mut scratch = [0u8; 1500];
+  for micros in pump_schedule() {
+    clock.set(micros);
+    engine.pump(|| at(clock.get()), &mut io, &mut scratch);
+  }
+  // Drain announce-phase updates so the slot's only remaining lifecycle is the
+  // withdrawal.
+  while engine.poll_service_update(handle).is_some() {}
+
+  clock.set(RETIRE_AT);
+  engine.unregister_service(handle, at(RETIRE_AT));
+  // Only the withdrawal phase is measured; the announce phase already queued
+  // positive-TTL records for both families.
+  io.queued.clear();
+  io.stall_before_next_send = Some(SLOW_PUMP_MICROS);
+
+  // Driven exactly as a real loop runs it — `hick-embassy`'s included: pump, then
+  // sleep to the deadline the pump reported. Nothing reaches past that seam; the
+  // only thing this test adds is time the pump spends, charged where a real one
+  // spends it. The iteration cap is a hang guard, not a bound the assertions rely
+  // on.
+  for _ in 0..64 {
+    engine.pump(|| at(clock.get()), &mut io, &mut scratch);
+    if !engine.services.contains_key(&handle) {
+      break;
+    }
+    let Some(deadline) = engine.poll_deadline() else {
+      break;
+    };
+    clock.set(clock.get().max(deadline.0.total_micros()));
+  }
+
+  assert!(
+    !engine.services.contains_key(&handle),
+    "the withdrawal must have settled; otherwise the loop stopped on its hang \
+     guard and the gaps below mean nothing"
+  );
+  let last_queued = io
+    .queued
+    .iter()
+    .map(|(_, _, stamp)| *stamp)
+    .max()
+    .unwrap_or(RETIRE_AT);
+  assert!(
+    last_queued < RETIRE_AT + GOODBYE_CEILING_MICROS,
+    "the sequence must have run on its own schedule rather than been cut off by \
+     the {GOODBYE_CEILING_MICROS} us anti-pin ceiling; last goodbye queued at \
+     {last_queued} us"
+  );
+  for (family, group) in [("v4", MDNS_SOCKET_V4), ("v6", MDNS_SOCKET_V6)] {
+    let stamps: Vec<i64> = io
+      .queued
+      .iter()
+      .filter(|(dst, data, _)| *dst == group && datagram_kind(data) == Some(true))
+      .map(|(_, _, stamp)| *stamp)
+      .collect();
+    assert_eq!(
+      stamps.len(),
+      GOODBYE_ROUNDS_PER_FAMILY,
+      "{family} accepted every round it was offered, so it must have taken its \
+       whole §10.1 budget — otherwise there is no spacing left to measure. \
+       Queued for {family} at (us): {stamps:?}"
+    );
+    for pair in stamps.windows(2) {
+      let gap = pair[1] - pair[0];
+      assert!(
+        gap >= GOODBYE_INTERVAL_MICROS,
+        "two goodbyes for one name were queued for {family} {gap} us apart, inside \
+         the {GOODBYE_INTERVAL_MICROS} us §10.1 gives one interface. The pump spent \
+         {SLOW_PUMP_MICROS} us before queuing the first round, so re-arming the \
+         resend schedule from the instant the PASS began charged that to the next \
+         round. Queued for {family} at (us): {stamps:?}"
+      );
+    }
   }
 }
 
@@ -576,6 +736,195 @@ fn datagram_kind(bytes: &[u8]) -> Option<bool> {
   Some(saw_zero_ttl)
 }
 
+/// A datagram carrying no answer records at all — an RFC 6762 §8.1 probe or a
+/// §5.2 query. Unambiguous in a scenario whose only producer is one or the
+/// other, which is how each test below is built.
+fn asks_a_question(bytes: &[u8]) -> bool {
+  datagram_kind(bytes).is_none()
+}
+
+/// A positive-TTL unsolicited response — an RFC 6762 §8.3 announcement.
+fn announces(bytes: &[u8]) -> bool {
+  datagram_kind(bytes) == Some(false)
+}
+
+/// Micros the pump spends between reading its pass instant and reaching the
+/// send it is about to make. Under every interval measured below, so a
+/// pass-instant anchor leaves the next round CLOSE rather than already overdue —
+/// the weaker of the two failures, and the one any delay at all produces.
+const SLOW_TRANSMIT_PUMP_MICROS: i64 = 200_000;
+
+/// RFC 6762 §8.1: 250 ms between two transmissions of a probe on one interface.
+const PROBE_INTERVAL_MICROS: i64 = 250_000;
+/// RFC 6762 §6 / §8.3: one second between two multicasts of a record on one
+/// interface.
+const ANNOUNCE_INTERVAL_MICROS: i64 = 1_000_000;
+/// RFC 6762 §5.2: "the interval between the first two queries MUST be at least
+/// one second". The backoff only widens from there, so this is the floor for the
+/// whole retry schedule.
+const QUERY_INTERVAL_MICROS: i64 = 1_000_000;
+
+/// Run one producer under a pump that is slow ONCE, and hand back the transport
+/// it sent through — [`MockUdp::queued`] then holds every datagram with the clock
+/// value at which the transport accepted it.
+///
+/// The stall is charged inside the FIRST `try_send` of the run, the one point
+/// provably between the pass instant and everything the pump reads after the
+/// send. Being slow ONCE is what makes a stale anchor visible: a uniform delay
+/// shifts every transmission equally and no spacing rule can see it.
+///
+/// Driven exactly as a real loop runs it — `hick-embassy`'s included: pump, then
+/// sleep to the deadline the pump reported. Nothing reaches past that seam. The
+/// pass cap is a hang guard, not a bound the assertions rely on.
+fn queued_under_a_slow_pump(
+  config: EndpointConfig,
+  seed: u64,
+  start: impl FnOnce(&mut TestEngine, SmoltcpInstant),
+  passes: usize,
+) -> MockUdp {
+  // The one clock: the engine READS it through `pump`, and the transport STAMPS
+  // every queued datagram with it. A pass instant and an enqueue instant are then
+  // the same kind of thing and can be compared.
+  let clock = Rc::new(Cell::new(0i64));
+  let mut engine: TestEngine = Engine::new(config, StdRng::seed_from_u64(seed));
+  start(&mut engine, at(clock.get()));
+  let mut io = MockUdp {
+    clock: Some(Rc::clone(&clock)),
+    stall_before_next_send: Some(SLOW_TRANSMIT_PUMP_MICROS),
+    ..Default::default()
+  };
+  let mut scratch = [0u8; 1500];
+  for _ in 0..passes {
+    engine.pump(|| at(clock.get()), &mut io, &mut scratch);
+    let Some(deadline) = engine.poll_deadline() else {
+      break;
+    };
+    clock.set(clock.get().max(deadline.0.total_micros()));
+  }
+  io
+}
+
+/// Assert that for EACH family, consecutive datagrams `kind` selects were queued
+/// at least `min_gap` micros apart — the rule being about one interface, so the
+/// two families are measured separately and neither may borrow the other's
+/// spacing.
+///
+/// The enqueue is what this driver can measure and therefore what it pins; see
+/// `FamilyWireGate` for the distance between that and the device.
+fn assert_enqueue_spacing(
+  io: &MockUdp,
+  kind: fn(&[u8]) -> bool,
+  min_gap: i64,
+  least: usize,
+  what: &str,
+) {
+  for (family, group) in [("v4", MDNS_SOCKET_V4), ("v6", MDNS_SOCKET_V6)] {
+    let stamps: Vec<i64> = io
+      .queued
+      .iter()
+      .filter(|(dst, data, _)| *dst == group && kind(data))
+      .map(|(_, _, stamp)| *stamp)
+      .collect();
+    assert!(
+      stamps.len() >= least,
+      "{family} must have taken at least {least} {what} datagrams — otherwise \
+       there is no spacing left to measure. Queued for {family} at (us): \
+       {stamps:?}"
+    );
+    for pair in stamps.windows(2) {
+      let gap = pair[1] - pair[0];
+      assert!(
+        gap >= min_gap,
+        "two {what} datagrams were queued for {family} {gap} us apart, inside the \
+         {min_gap} us the RFC gives one interface. The pump spent \
+         {SLOW_TRANSMIT_PUMP_MICROS} us before reaching the first send, so both \
+         the gate and the core's re-arm anchor were taken from the instant the \
+         PASS began instead of from the send itself. Queued for {family} at (us): \
+         {stamps:?}"
+      );
+    }
+  }
+}
+
+/// A pump that spends time before it reaches a NORMAL multicast must not pull
+/// the producer's next datagram onto the heels of the one it just sent.
+///
+/// Two independent anchors are taken per fan-out and both are egress
+/// measurements: the per-family gate records when that family last accepted this
+/// producer's datagram, and the core re-arms the round from the confirm anchor.
+/// Take either
+/// from the instant the pass began and everything the pump spent first — up to
+/// `MAX_RX_PER_PUMP` inbound datagrams, every earlier producer in the same
+/// transmit loop — is counted as interval that has already elapsed. Take BOTH
+/// from it and the same spent time is discounted twice: the next datagram is due
+/// one interval after the pass began AND the gate agrees the interval is paid, so
+/// the gap is the interval minus the pump's own delay. A pass exceeding the
+/// interval collapses it entirely.
+///
+/// `try_send` being non-blocking bounds how long a send can PARK and nothing else
+/// — not the CPU a pass spends, not how many producers it serves, not preemption.
+///
+/// §8.1 probes: 250 ms between transmissions on one interface.
+#[test]
+fn a_slow_pump_does_not_pull_the_next_probe_onto_it() {
+  let io = queued_under_a_slow_pump(
+    EndpointConfig::new(),
+    9_001,
+    |engine, now| {
+      engine.register_service(sample_spec(), now).unwrap();
+    },
+    8,
+  );
+  assert_enqueue_spacing(&io, asks_a_question, PROBE_INTERVAL_MICROS, 3, "probe");
+}
+
+/// The §8.3 half of the same rule: one second between two multicasts of a record
+/// on one interface.
+///
+/// Not redundant with the probe case. The interval is four times as long and
+/// carries the §6 record rule rather than §8.1's probe exemption, and the core
+/// re-arms it down a different ladder — so the two exercise the same driver-side
+/// sampling against schedules that fail differently. `with_probe_unique_names`
+/// is off so the startup announcement is the run's first send and the stall lands
+/// on it; a probe sequence ahead of it would take the stall instead.
+#[test]
+fn a_slow_pump_does_not_pull_the_next_announcement_onto_it() {
+  let io = queued_under_a_slow_pump(
+    EndpointConfig::new().with_probe_unique_names(false),
+    9_002,
+    |engine, now| {
+      engine.register_service(sample_spec(), now).unwrap();
+    },
+    4,
+  );
+  assert_enqueue_spacing(&io, announces, ANNOUNCE_INTERVAL_MICROS, 2, "announcement");
+}
+
+/// A query is the third producer kind and reaches the confirm by its own route —
+/// `note_query_transmit_outcome` on the endpoint rather than the service state
+/// machine — so its §5.2 one-second floor is a separate path to the same
+/// anchors, and its gate lives on the query slot rather than the service slot.
+#[test]
+fn a_slow_pump_does_not_pull_the_next_query_onto_it() {
+  let io = queued_under_a_slow_pump(
+    EndpointConfig::new(),
+    9_003,
+    |engine, now| {
+      engine
+        .start_query(
+          QuerySpec::new(
+            Name::try_from_str("_ipp._tcp.local.").unwrap(),
+            mdns_proto::wire::ResourceType::Ptr,
+          ),
+          now,
+        )
+        .unwrap();
+    },
+    6,
+  );
+  assert_enqueue_spacing(&io, asks_a_question, QUERY_INTERVAL_MICROS, 3, "query");
+}
+
 /// Endpoint-owned-withdrawal replacement survival (supersedes the old free-name
 /// goodbye BARRIER test). Under `with_probe_unique_names(false)` a same-name
 /// replacement announces a positive TTL directly (no §8.1 probe) — exactly the
@@ -598,7 +947,7 @@ fn same_name_replacement_is_rejected_until_withdrawal_completes() {
   let mut established = false;
   let mut t = 0i64;
   for _ in 0..16 {
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     while let Some(u) = engine.poll_service_update(a) {
       established |= matches!(u, ServiceUpdate::Established);
     }
@@ -632,7 +981,7 @@ fn same_name_replacement_is_rejected_until_withdrawal_completes() {
   let mut completed = false;
   for _ in 0..32 {
     t += 250_000;
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     if !engine.services.contains_key(&a) {
       completed = true;
       break;
@@ -643,7 +992,7 @@ fn same_name_replacement_is_rejected_until_withdrawal_completes() {
     "the withdrawal must complete (route freed + driver slot GC'd) on a working \
        transport"
   );
-  // The withdrawal put at least one TTL=0 goodbye on the wire.
+  // The withdrawal queued at least one TTL=0 goodbye.
   assert!(
     io.sent.iter().any(|(_, d)| datagram_kind(d) == Some(true)),
     "the withdrawal must emit a TTL=0 §10.1 goodbye; sent kinds = {:?}",
@@ -686,7 +1035,7 @@ fn unregister_then_discard_with_unread_update_gc_s_the_slot() {
   let mut gcd = false;
   for _ in 0..4 {
     t += 250_000;
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     if !engine.services.contains_key(&a) {
       gcd = true;
       break;
@@ -740,7 +1089,7 @@ fn pump_for(
   let mut established = false;
   for _ in 0..steps {
     t += 250_000;
-    engine.pump(at(t), io, scratch);
+    engine.pump(|| at(t), io, scratch);
     while let Some(update) = engine.poll_service_update(handle) {
       established |= matches!(update, ServiceUpdate::Established);
     }
@@ -761,7 +1110,7 @@ fn pump_to_next_round(
   let mut t = from_micros;
   for _ in 0..400 {
     t += 250_000;
-    engine.pump(at(t), io, scratch);
+    engine.pump(|| at(t), io, scratch);
     if io.attempts > attempts_before {
       return t;
     }
@@ -781,8 +1130,8 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
   // queues, v6 BUSY) reports `PartiallyDelivered`, which means two DIFFERENT
   // things to the core and must not be folded to one bit:
   //
-  //   * goodbye ownership LATCHES — v4 peers may now cache the records v4 put on
-  //     the wire, so a later unregister owes them a §10.1 TTL=0 withdrawal;
+  //   * goodbye ownership LATCHES — v4 peers may now cache the records v4 sent,
+  //     so a later unregister owes them a §10.1 TTL=0 withdrawal;
   //   * the §8.1/§8.3 phase does NOT advance — v6 has been neither asked nor
   //     told, and claiming a name on a link that never heard the probe is what
   //     §8.1 forbids.
@@ -830,7 +1179,7 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
   // silent.
   engine.unregister_service(handle, at(t));
   io.sent.clear();
-  engine.pump(at(t + 1), &mut io, &mut scratch);
+  engine.pump(|| at(t + 1), &mut io, &mut scratch);
   assert!(
     io.sent
       .iter()
@@ -848,7 +1197,7 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
   io.v6_fail = None;
   io.sent.clear();
   for micros in [t + 250_001, t + 500_001] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   assert!(
     io.sent.iter().any(|(dst, _)| *dst == MDNS_SOCKET_V6),
@@ -939,7 +1288,7 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
   io.v4_fail = None;
   io.v6_fail = None;
   io.sent.clear();
-  engine.pump(at(t + 250_000), &mut io, &mut scratch);
+  engine.pump(|| at(t + 250_000), &mut io, &mut scratch);
   assert!(
     io.sent.iter().all(|(_, d)| datagram_kind(d) != Some(true)),
     "an unexposed service owns nothing, so its withdrawal emits no goodbye; \
@@ -1105,7 +1454,7 @@ fn a_constrained_transport_does_not_starve_either_family() {
     // One datagram of TX room this cycle: the SECOND family in any fan-out is
     // busy, so only a fair order lets both groups eventually transmit.
     io.capacity = Some(1);
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     while let Some(update) = engine.poll_service_update(handle) {
       established |= matches!(update, ServiceUpdate::Established);
     }
@@ -1123,7 +1472,8 @@ fn a_constrained_transport_does_not_starve_either_family() {
   );
 }
 
-/// The defect per-family delivery exists to remove, measured on the wire.
+/// The defect per-family delivery exists to remove, measured per family at the
+/// enqueue.
 ///
 /// `family_order` deliberately hands the one free slot of a constrained transport
 /// to the longest-blocked family, so under capacity one the families ALTERNATE:
@@ -1164,7 +1514,7 @@ fn a_constrained_transport_refreshes_every_family_within_its_ttl() {
     let mut io = MockUdp::default();
     let mut scratch = [0u8; 1500];
 
-    // When each family last had a positive-TTL announcement put on its wire.
+    // When each family last accepted a positive-TTL announcement.
     let mut last: [Option<i64>; 2] = [None, None];
     let mut worst: [i64; 2] = [0, 0];
     let mut announced: [usize; 2] = [0, 0];
@@ -1176,7 +1526,7 @@ fn a_constrained_transport_refreshes_every_family_within_its_ttl() {
       t += 250_000;
       io.capacity = Some(1);
       io.sent.clear();
-      engine.pump(at(t), &mut io, &mut scratch);
+      engine.pump(|| at(t), &mut io, &mut scratch);
       for (dst, data) in &io.sent {
         // Positive-TTL answers only: probes carry none and a §10.1 goodbye is a
         // withdrawal, not a refresh.
@@ -1235,7 +1585,7 @@ fn a_constrained_transport_drains_a_withdrawal_after_each_family_gets_a_round() 
   for micros in [
     0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
   ] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   engine.unregister_service(handle, at(5_000_000));
   io.sent.clear();
@@ -1246,7 +1596,7 @@ fn a_constrained_transport_drains_a_withdrawal_after_each_family_gets_a_round() 
   for _ in 0..16 {
     t += 250_000;
     io.capacity = Some(1);
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     // Drain updates like a real host loop, so the slot is GC'd once its
     // withdrawal completes (a completed slot is reclaimed only after its
     // app-facing updates are read — see ServiceSlot::route_freed).
@@ -1285,7 +1635,7 @@ fn default_setup_processes_rx_without_hop_limit_or_subnets() {
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while engine.poll_service_update(handle).is_some() {}
   }
 
@@ -1305,7 +1655,7 @@ fn default_setup_processes_rx_without_hop_limit_or_subnets() {
         len: 0,
       },
     ));
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     t += 250_000;
     while let Some(u) = engine.poll_service_update(handle) {
       reacted |= matches!(u, ServiceUpdate::Renamed(_) | ServiceUpdate::Conflict);
@@ -1334,7 +1684,7 @@ fn default_setup_rejects_off_link_unicast() {
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while engine.poll_service_update(handle).is_some() {}
   }
 
@@ -1352,7 +1702,7 @@ fn default_setup_rejects_off_link_unicast() {
         len: 0,
       },
     ));
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     t += 250_000;
     while let Some(u) = engine.poll_service_update(handle) {
       reacted |= matches!(u, ServiceUpdate::Renamed(_) | ServiceUpdate::Conflict);
@@ -1385,7 +1735,7 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_smoltcp_service() {
   // conflict hits a SERVING service with a non-empty withdrawal snapshot.
   let mut established = false;
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while let Some(u) = engine.poll_service_update(handle) {
       established |= matches!(u, ServiceUpdate::Established);
     }
@@ -1411,7 +1761,7 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_smoltcp_service() {
         len: 0,
       },
     ));
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     t += 250_000;
     if engine
       .services
@@ -1443,7 +1793,7 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_smoltcp_service() {
   let mut gced = false;
   for _ in 0..64 {
     t += 250_000;
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     if !engine.services.contains_key(&handle) {
       gced = true;
       break;
@@ -1481,7 +1831,7 @@ fn rx_drain_is_capped_per_pump_with_immediate_repump() {
     ));
   }
   let now = at(1_000_000);
-  let deadline = engine.pump(now, &mut io, &mut scratch);
+  let deadline = engine.pump(|| now, &mut io, &mut scratch);
   assert_eq!(
     io.inbound.len(),
     flood - MAX_RX_PER_PUMP,
@@ -1493,7 +1843,7 @@ fn rx_drain_is_capped_per_pump_with_immediate_repump() {
     "a capped RX drain must request an immediate re-pump (deadline = now)"
   );
   // The remainder (< cap) drains in the next pump, which is no longer capped.
-  engine.pump(at(1_000_001), &mut io, &mut scratch);
+  engine.pump(|| at(1_000_001), &mut io, &mut scratch);
   assert!(
     io.inbound.is_empty(),
     "the follow-up pump drains the remaining buffered datagrams"
@@ -1533,7 +1883,7 @@ fn an_oversized_service_is_not_advertised_so_it_is_never_unwithdrawable() {
   let mut scratch = [0u8; 12_000];
   let mut established = false;
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while let Some(u) = engine.poll_service_update(handle) {
       established |= matches!(u, ServiceUpdate::Established);
     }
@@ -1549,7 +1899,7 @@ fn an_oversized_service_is_not_advertised_so_it_is_never_unwithdrawable() {
   io.sent.clear();
   engine.unregister_service(handle, at(6_000_000));
   for micros in [6_000_001, 6_250_001, 6_500_001] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   assert!(
     io.sent.iter().all(|(_, d)| datagram_kind(d) != Some(true)),
@@ -1581,7 +1931,7 @@ fn permanently_failing_family_does_not_stall_the_healthy_one() {
   // across rather than reset.
   for _ in 0..200 {
     t += 250_000;
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     while let Some(update) = engine.poll_service_update(handle) {
       established |= matches!(update, ServiceUpdate::Established);
     }
@@ -1606,7 +1956,7 @@ fn own_multicast_loopback_is_not_treated_as_conflict() {
   // Drive to advertised so an announcement (authoritative records) has gone out
   // and been fingerprinted.
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   // Loop our most recent multicast datagram back in, from a DIFFERENT source so
   // the proto's advertised-source fallback cannot catch it — only the self-send
@@ -1622,7 +1972,7 @@ fn own_multicast_loopback_is_not_treated_as_conflict() {
     },
   ));
   // Process the loopback promptly — within RECENT_SEND_TTL of the announcement.
-  engine.pump(at(5_000_001), &mut io, &mut scratch);
+  engine.pump(|| at(5_000_001), &mut io, &mut scratch);
 
   let mut conflict = false;
   while let Some(update) = engine.poll_service_update(handle) {
@@ -1677,7 +2027,7 @@ fn busy_goodbye_is_held_then_force_completed_at_the_ceiling() {
   for micros in [
     0, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000,
   ] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   // Drain the announce-phase updates so the slot's only lifecycle left is the
   // withdrawal (a completed slot is GC'd only after its updates are read).
@@ -1689,7 +2039,7 @@ fn busy_goodbye_is_held_then_force_completed_at_the_ceiling() {
   io.v4_fail = Some(SendError::Busy);
   io.v6_fail = Some(SendError::Busy);
   for micros in [5_250_001, 5_500_001, 6_000_001, 6_500_001] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while engine.poll_service_update(handle).is_some() {}
   }
   assert!(
@@ -1699,7 +2049,7 @@ fn busy_goodbye_is_held_then_force_completed_at_the_ceiling() {
   );
   // PAST the ceiling (7 s) `drain_completed_withdrawals` force-completes it — the
   // route is freed and the driver slot GC'd even though nothing ever sent.
-  engine.pump(at(7_500_001), &mut io, &mut scratch);
+  engine.pump(|| at(7_500_001), &mut io, &mut scratch);
   assert!(
     !engine.services.contains_key(&handle),
     "an undeliverable withdrawal must be force-completed at its anti-pin ceiling"
@@ -1733,7 +2083,7 @@ fn loopback_detected_across_a_large_send_burst() {
   let mut scratch = [0u8; 1500];
   // Pump until the probe burst has fired for every service.
   for micros in [0, 250_000, 500_000] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   assert!(
     io.sent.len() > 4,
@@ -1752,7 +2102,7 @@ fn loopback_detected_across_a_large_send_burst() {
       len: 0,
     },
   ));
-  engine.pump(at(750_000), &mut io, &mut scratch);
+  engine.pump(|| at(750_000), &mut io, &mut scratch);
 
   let mut conflict = false;
   for h in &handles {
@@ -1766,8 +2116,9 @@ fn loopback_detected_across_a_large_send_burst() {
   );
 }
 
-/// The per-family wire gate holds each datagram kind to ITS OWN minimum, and a
-/// deferred family is reported `Missed` — obligated, and it did not carry it.
+/// The per-family gate holds each datagram kind to ITS OWN minimum, measured
+/// between enqueues, and a deferred family is reported `Missed` — obligated, and
+/// it did not carry it.
 ///
 /// The value is kind-dependent, which is exactly why the driver may not pick it:
 /// hardcoding RFC 6762 §6's one second would stretch the §8.1 probe sequence
@@ -1784,35 +2135,40 @@ fn the_wire_gate_defers_a_family_inside_its_kinds_minimum() {
   let mut io = MockUdp::default();
   let mut gate = FamilyWireGate::new();
 
-  let (_, first) = tx.send_multicast(&mut io, b"announcement", at(0), &mut gate, ANNOUNCE_GAP);
+  let first = tx.send_multicast(
+    &mut io,
+    b"announcement",
+    &mut || at(0),
+    &mut gate,
+    ANNOUNCE_GAP,
+  );
   assert!(
     first.v4.is_sent() && first.v6.is_sent(),
     "a producer that has sent nothing owes no gap on either family"
   );
 
   // 850 ms later — inside §6's floor for the records this datagram carries.
-  let (outcome, early) = tx.send_multicast(
+  let early = tx.send_multicast(
     &mut io,
     b"announcement",
-    at(850_000),
+    &mut || at(850_000),
     &mut gate,
     ANNOUNCE_GAP,
   );
   assert!(
     !early.any_sent(),
-    "neither family may re-multicast the same records inside one second of its      own last copy"
+    "neither family may be offered the same records again inside one second of \
+     its own last enqueue"
   );
   assert!(
-    matches!(
-      outcome,
-      MulticastOutcome::Confirm(d) if d.v4() == FamilyDelivery::Missed
-        && d.v6() == FamilyDelivery::Missed
-    ),
-    "a deferred family is a MISS, never `Unobligated` — its socket is there and      the datagram was fanned onto it, so hiding the deferral would let the phase      advance without it"
+    matches!(early.v4, FamilySend::Gated) && matches!(early.v6, FamilySend::Gated),
+    "a deferred family reports Gated, which the core reads as a MISS and never as \
+     `Unobligated` — its socket is there and the datagram was fanned onto it, so \
+     hiding the deferral would let the phase advance without it"
   );
 
   // A probe at the very same instant is fine: §8.1 exempts it.
-  let (_, probe) = tx.send_multicast(&mut io, b"probe", at(850_000), &mut gate, PROBE_GAP);
+  let probe = tx.send_multicast(&mut io, b"probe", &mut || at(850_000), &mut gate, PROBE_GAP);
   assert!(
     probe.v4.is_sent() && probe.v6.is_sent(),
     "§8.1 spaces probes 250 ms apart and exempts them from the one-second rule"
@@ -1820,123 +2176,17 @@ fn the_wire_gate_defers_a_family_inside_its_kinds_minimum() {
 
   // A one-shot reply is ungated, and leaves the announcement clock alone.
   let mut ungated = FamilyWireGate::new();
-  let (_, reply) = tx.send_multicast(&mut io, b"reply", at(900_000), &mut ungated, Duration::ZERO);
+  let reply = tx.send_multicast(
+    &mut io,
+    b"reply",
+    &mut || at(900_000),
+    &mut ungated,
+    Duration::ZERO,
+  );
   assert!(reply.any_sent(), "a one-shot reply is never gated");
   assert!(
     ungated.open(0, at(900_000), ANNOUNCE_GAP),
     "…and does not start the clock on the announcement that follows it"
-  );
-}
-
-#[test]
-fn send_multicast_projects_the_fan_out_onto_the_delivery_shape() {
-  // Pin the projection every confirm downstream depends on: the obligated set is
-  // the families that HAVE a socket, delivery is `Sent` and nothing else, and an
-  // empty obligated set is none-delivered rather than a vacuous "all".
-  let mut tx = Multicaster::<SmoltcpInstant>::new();
-
-  // v4 queues, v6 transiently busy → PARTIAL. v6 has a socket, so it is
-  // obligated and did not carry the datagram; folding this to "delivered" is
-  // exactly what over-advanced the §8.1/§8.3 phase on a family that heard nothing.
-  let mut partial = MockUdp {
-    v6_fail: Some(SendError::Busy),
-    ..Default::default()
-  };
-  let (outcome, fanout) = tx.send_multicast(
-    &mut partial,
-    b"a-multicast-datagram",
-    at(0),
-    &mut FamilyWireGate::new(),
-    Duration::ZERO,
-  );
-  assert!(
-    matches!(
-      outcome,
-      MulticastOutcome::Confirm(d) if d.v4() == FamilyDelivery::Delivered
-        && d.v6() == FamilyDelivery::Missed
-    ),
-    "v4 queued + v6 obligated-but-busy is a partial fan-out, and WHICH family \
-     missed reaches the core"
-  );
-  assert_eq!(
-    fanout.sent_count(),
-    1,
-    "v4 queued, v6 busy: exactly 1 datagram on the wire"
-  );
-  assert!(
-    matches!(fanout.v4, FamilySend::Sent(_)),
-    "v4 must have sent"
-  );
-  assert!(matches!(fanout.v6, FamilySend::Busy), "v6 must be Busy");
-
-  // v4 queues, v6 has NO socket → ALL delivered. An absent family was never
-  // obligated, so a single-stack node advances its lifecycle at full speed.
-  let mut single_stack = MockUdp {
-    v6_fail: Some(SendError::Unsupported),
-    ..Default::default()
-  };
-  let (outcome_single, _) = tx.send_multicast(
-    &mut single_stack,
-    b"a-multicast-datagram",
-    at(0),
-    &mut FamilyWireGate::new(),
-    Duration::ZERO,
-  );
-  assert!(
-    matches!(
-      outcome_single,
-      MulticastOutcome::Confirm(d) if d.all_delivered()
-        && d.v6() == FamilyDelivery::Unobligated
-    ),
-    "a family with no socket is not obligated, so a v4-only node is all-delivered \
-     — and it must reach the core as UNOBLIGATED, not as a miss, or the core \
-     would chase a family this node does not have"
-  );
-
-  // Both families busy: nothing reached a wire, so nothing may latch or advance —
-  // the proto re-offers on its own schedule. A transiently-busy family is a
-  // none-delivered confirm, never a retirement.
-  let mut all_busy = MockUdp {
-    v4_fail: Some(SendError::Busy),
-    v6_fail: Some(SendError::Busy),
-    ..Default::default()
-  };
-  let (outcome_busy, fanout_busy) = tx.send_multicast(
-    &mut all_busy,
-    b"a-multicast-datagram",
-    at(0),
-    &mut FamilyWireGate::new(),
-    Duration::ZERO,
-  );
-  assert!(
-    matches!(outcome_busy, MulticastOutcome::Confirm(d) if !d.any_delivered()),
-    "both families busy: nothing on the wire, so none-delivered rather than retire"
-  );
-  assert_eq!(
-    fanout_busy.sent_count(),
-    0,
-    "both families busy: no datagrams on the wire"
-  );
-
-  // No socket on either family — an EMPTY obligated set. It must report
-  // none-delivered, never a vacuous "all" that would advance a phase no link
-  // ever heard.
-  let mut no_transport = MockUdp {
-    v4_fail: Some(SendError::Unsupported),
-    v6_fail: Some(SendError::Unsupported),
-    ..Default::default()
-  };
-  let (outcome_none, _) = tx.send_multicast(
-    &mut no_transport,
-    b"a-multicast-datagram",
-    at(0),
-    &mut FamilyWireGate::new(),
-    Duration::ZERO,
-  );
-  assert!(
-    matches!(outcome_none, MulticastOutcome::Confirm(d)
-      if !d.any_delivered() && !d.all_delivered()),
-    "an empty obligated set is none-delivered, never a vacuous all-delivered"
   );
 }
 
@@ -1957,7 +2207,7 @@ fn a_permanently_too_large_send_retires_the_service() {
   let mut conflict = false;
   let mut established = false;
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while let Some(u) = engine.poll_service_update(handle) {
       conflict |= matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict);
       established |= matches!(u, ServiceUpdate::Established);
@@ -1998,7 +2248,7 @@ fn a_too_large_family_does_not_retire_while_the_other_may_recover() {
   // busy. The service must keep retrying, NOT be retired.
   for _ in 0..40 {
     t += 250_000;
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     while let Some(u) = engine.poll_service_update(handle) {
       conflict |= matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict);
       established |= matches!(u, ServiceUpdate::Established);
@@ -2020,7 +2270,7 @@ fn a_too_large_family_does_not_retire_while_the_other_may_recover() {
   // tail here.
   io.v6_fail = None;
   for ms in 41..=200i64 {
-    engine.pump(at(ms * 250_000), &mut io, &mut scratch);
+    engine.pump(|| at(ms * 250_000), &mut io, &mut scratch);
     while let Some(u) = engine.poll_service_update(handle) {
       established |= matches!(u, ServiceUpdate::Established);
     }
@@ -2049,7 +2299,7 @@ fn established_is_observable_on_the_pump_that_confirms_it() {
   let mut t = 0i64;
   for _ in 0..40 {
     t += 250_000;
-    let deadline = engine.pump(at(t), &mut io, &mut scratch);
+    let deadline = engine.pump(|| at(t), &mut io, &mut scratch);
     while let Some(u) = engine.poll_service_update(handle) {
       established |= matches!(u, ServiceUpdate::Established);
     }
@@ -2085,7 +2335,7 @@ fn a_query_exposes_collected_answers_via_the_public_api() {
   let mut rio = MockUdp::default();
   let mut scratch = [0u8; 1500];
   for micros in pump_schedule() {
-    responder.pump(at(micros), &mut rio, &mut scratch);
+    responder.pump(|| at(micros), &mut rio, &mut scratch);
   }
   let (_, announcement) = rio
     .sent
@@ -2118,7 +2368,7 @@ fn a_query_exposes_collected_answers_via_the_public_api() {
     },
   ));
   for micros in pump_schedule() {
-    querier.pump(at(micros), &mut qio, &mut scratch);
+    querier.pump(|| at(micros), &mut qio, &mut scratch);
   }
 
   // The collected answer must be readable through the public API.
@@ -2156,7 +2406,7 @@ fn a_query_that_can_never_send_surfaces_a_terminal_update() {
   let mut scratch = [0u8; 1500];
   let mut terminal = false;
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while let Some(u) = engine.poll_query_update(q) {
       terminal |= matches!(u, QueryUpdate::Timeout | QueryUpdate::Done);
     }
@@ -2180,7 +2430,7 @@ fn a_retired_query_freezes_answers_and_emits_no_second_terminal() {
   let mut rio = MockUdp::default();
   let mut scratch = [0u8; 1500];
   for micros in pump_schedule() {
-    responder.pump(at(micros), &mut rio, &mut scratch);
+    responder.pump(|| at(micros), &mut rio, &mut scratch);
   }
   let (_, announcement) = rio
     .sent
@@ -2209,7 +2459,7 @@ fn a_retired_query_freezes_answers_and_emits_no_second_terminal() {
   };
   let mut terminals = 0;
   for micros in pump_schedule() {
-    querier.pump(at(micros), &mut qio, &mut scratch);
+    querier.pump(|| at(micros), &mut qio, &mut scratch);
     while let Some(u) = querier.poll_query_update(q) {
       if matches!(u, QueryUpdate::Timeout | QueryUpdate::Done) {
         terminals += 1;
@@ -2240,7 +2490,7 @@ fn a_retired_query_freezes_answers_and_emits_no_second_terminal() {
   let mut t = 100_000_000i64;
   for _ in 0..10 {
     t += 250_000;
-    querier.pump(at(t), &mut qio, &mut scratch);
+    querier.pump(|| at(t), &mut qio, &mut scratch);
     while let Some(u) = querier.poll_query_update(q) {
       if matches!(u, QueryUpdate::Timeout | QueryUpdate::Done) {
         terminals += 1;
@@ -2265,7 +2515,7 @@ fn a_retired_query_freezes_answers_and_emits_no_second_terminal() {
 // endpoint-owned-withdrawal migration: they asserted the deleted drain_goodbyes
 // per-family GOODBYE_SENDS bookkeeping (engine.goodbyes + owed). The endpoint now
 // owns the resend schedule; the driver bumps goodbyes_tx once per DELIVERED round
-// (>= 1 family on the wire), packets_tx/bytes_tx per Sent family, and send_errors
+// (>= 1 family carried it), packets_tx/bytes_tx per Sent family, and send_errors
 // per Failed family in the withdrawal send. The dual-stack happy path below pins
 // that driver-side accounting; both-families-failed pins the no-send case.
 
@@ -2282,7 +2532,7 @@ fn stats_withdrawal_dual_stack_counts_rounds_and_per_family_datagrams() {
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   engine.unregister_service(handle, at(5_000_000));
   let snap_before = engine.stats();
@@ -2295,7 +2545,7 @@ fn stats_withdrawal_dual_stack_counts_rounds_and_per_family_datagrams() {
   let mut completed = false;
   for _ in 0..16 {
     t += 250_000;
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     if engine.stats().services_active == 0 {
       completed = true;
       break;
@@ -2350,14 +2600,14 @@ fn stats_withdrawal_v6_busy_until_recovery_not_freed_before_v6_sends() {
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   // Drain announce-phase updates so the slot's only remaining lifecycle is the
   // withdrawal (a completed slot is GC'd only after its updates are read).
   while engine.poll_service_update(handle).is_some() {}
   engine.unregister_service(handle, at(5_000_000)); // ceiling at 7_000_000
-  // Only count withdrawal-phase datagrams (the announce phase already put v4+v6
-  // POSITIVE-TTL records on the wire).
+  // Only count withdrawal-phase datagrams (the announce phase already queued
+  // v4+v6 POSITIVE-TTL records).
   io.sent.clear();
 
   // v6 transiently busy, v4 healthy. Pump rounds 250 ms apart (WITHDRAWAL_INTERVAL,
@@ -2365,7 +2615,7 @@ fn stats_withdrawal_v6_busy_until_recovery_not_freed_before_v6_sends() {
   // whole debt; v6's debt is untouched, so the withdrawal stays HELD.
   io.v6_fail = Some(SendError::Busy);
   for micros in [5_250_001, 5_500_001, 5_750_001, 6_000_001] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while engine.poll_service_update(handle).is_some() {}
   }
   assert!(
@@ -2390,7 +2640,7 @@ fn stats_withdrawal_v6_busy_until_recovery_not_freed_before_v6_sends() {
   io.v6_fail = None;
   let mut completed = false;
   for micros in [6_250_001, 6_500_001, 6_750_001, 6_900_001] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while engine.poll_service_update(handle).is_some() {}
     if !engine.services.contains_key(&handle) {
       completed = true;
@@ -2409,8 +2659,8 @@ fn stats_withdrawal_v6_busy_until_recovery_not_freed_before_v6_sends() {
   );
 }
 
-/// Both families fail (TooLarge write-off): `send_errors` bumped per family,
-/// `goodbyes_tx == 0` since nothing ever went on the wire.
+/// Both families fail (TooLarge, so neither ever reaches a wire): `send_errors`
+/// bumped per family, `goodbyes_tx == 0` since nothing ever went on the wire.
 #[cfg(feature = "stats")]
 #[test]
 fn stats_goodbye_both_families_failed_no_goodbyes_tx() {
@@ -2421,7 +2671,7 @@ fn stats_goodbye_both_families_failed_no_goodbyes_tx() {
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   engine.unregister_service(handle, at(5_500_000));
   // NOW make both fail with TooLarge (the endpoint-owned withdrawal send path).
@@ -2430,9 +2680,9 @@ fn stats_goodbye_both_families_failed_no_goodbyes_tx() {
   let snap_before = engine.stats();
   io.sent.clear();
 
-  // One pump (within the 2 s ceiling): both families are written off — nothing
+  // One pump (within the 2 s ceiling): both refusals keep their debt — nothing
   // reaches the wire, so the round is not delivered (re-armed, not spent).
-  engine.pump(at(6_500_000), &mut io, &mut scratch);
+  engine.pump(|| at(6_500_000), &mut io, &mut scratch);
 
   let snap_after = engine.stats();
   assert_eq!(
@@ -2461,10 +2711,10 @@ fn stats_goodbye_both_families_failed_no_goodbyes_tx() {
 /// Normal multicast TX path (probes/announcements): per-family `packets_tx`
 /// and `send_errors` correctness when one family fails permanently (TooLarge).
 ///
-/// v4 sends (Sent), v6 returns TooLarge (Failed): the fan-out yields
-/// MulticastOutcome::Delivered (because v4 sent), but `fanout.failed_count()` is
-/// still 1. The fix counts send_errors unconditionally from `fanout.failed_count()`,
-/// so the v6 failure is not dropped even though the coarse outcome is Delivered.
+/// v4 sends (Sent), v6 returns TooLarge (Failed): the fan-out counts as delivered
+/// (because v4 sent), but `fanout.failed_count()` is still 1. The fix counts
+/// send_errors unconditionally from `fanout.failed_count()`, so the v6 failure is
+/// not dropped even though the round overall delivers.
 /// Each pump that fires a datagram increments send_errors by exactly 1 (the v6
 /// failure). packets_tx reflects only v4 sends.
 #[cfg(feature = "stats")]
@@ -2482,7 +2732,7 @@ fn stats_multicast_tx_partial_failure_counted_per_family() {
 
   // Drive a few pumps so probes fire.
   for micros in [0, 250_000, 500_000, 750_000, 1_000_000] {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   let _ = handle;
 
@@ -2529,20 +2779,16 @@ fn stats_multicast_sent_plus_failed_send_errors_exact() {
     ..Default::default()
   };
   let data = b"probe-datagram";
-  let (outcome, fanout) = tx.send_multicast(
+  let fanout = tx.send_multicast(
     &mut io,
     data,
-    at(0),
+    &mut || at(0),
     &mut FamilyWireGate::new(),
     Duration::ZERO,
   );
 
   assert!(
-    matches!(
-      outcome,
-      MulticastOutcome::Confirm(d) if d.v4() == FamilyDelivery::Delivered
-        && d.v6() == FamilyDelivery::Missed
-    ),
+    matches!(fanout.v4, FamilySend::Sent { .. }) && matches!(fanout.v6, FamilySend::Failed),
     "v4 Sent + v6 TooLarge: v6 has a socket and rejected the datagram, so it is \
      obligated-and-undelivered — a partial fan-out, not a whole one"
   );
@@ -2579,10 +2825,10 @@ fn stats_multicast_failed_plus_busy_send_errors_exact() {
     ..Default::default()
   };
   let data = b"probe-datagram";
-  let (outcome, fanout) = tx.send_multicast(
+  let fanout = tx.send_multicast(
     &mut io,
     data,
-    at(0),
+    &mut || at(0),
     &mut FamilyWireGate::new(),
     Duration::ZERO,
   );
@@ -2590,8 +2836,8 @@ fn stats_multicast_failed_plus_busy_send_errors_exact() {
   // v4 Failed + v6 Busy: nothing reached a wire, and the busy family may yet
   // recover — so this confirms as none-delivered rather than retiring anything.
   assert!(
-    matches!(outcome, MulticastOutcome::Confirm(d) if !d.any_delivered()),
-    "v4 Failed + v6 Busy must confirm none-delivered (v6 Busy keeps things alive)"
+    matches!(fanout.v4, FamilySend::Failed) && matches!(fanout.v6, FamilySend::Busy),
+    "v4 Failed + v6 Busy: neither carried the datagram, and v6 may yet recover"
   );
   assert_eq!(
     fanout.failed_count(),
@@ -2639,7 +2885,7 @@ fn stats_unicast_busy_does_not_increment_send_errors() {
   // happened yet).
   let snap_before = engine.stats();
   // Pump once at t=0. With capacity=0, any send returns Busy.
-  engine.pump(at(0), &mut io, &mut scratch);
+  engine.pump(|| at(0), &mut io, &mut scratch);
   let snap_after = engine.stats();
 
   // send_errors must be 0: Busy is not an error on any path.
@@ -2742,7 +2988,7 @@ fn stats_off_link_datagram_counts_rx_bytes_and_dropped() {
   ));
 
   let snap_before = engine.stats();
-  engine.pump(at(0), &mut io, &mut scratch);
+  engine.pump(|| at(0), &mut io, &mut scratch);
   let snap_after = engine.stats();
 
   assert_eq!(
@@ -2790,7 +3036,7 @@ fn stats_oversized_zero_len_marker_counts_rx_and_dropped() {
   ));
 
   let snap_before = engine.stats();
-  engine.pump(at(0), &mut io, &mut scratch);
+  engine.pump(|| at(0), &mut io, &mut scratch);
   let snap_after = engine.stats();
 
   assert_eq!(
@@ -2844,7 +3090,7 @@ fn encode_failure_retirement_frees_proto_route_and_decrements_services_active() 
   // retires immediately on the first failed encode (unlike compio which counts
   // to MAX_CONSECUTIVE_ENCODE_ERRORS — smoltcp retires on the first failure).
   for micros in [0i64, 100_000, 200_000, 300_000, 400_000] {
-    engine.pump(at(micros), &mut io, &mut scratch_tiny);
+    engine.pump(|| at(micros), &mut io, &mut scratch_tiny);
     while let Some(u) = engine.poll_service_update(handle) {
       got_conflict |= matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict);
     }
@@ -2944,7 +3190,7 @@ fn multi_service_encode_failure_frees_route_even_with_sibling_transmit() {
 
   for i in 0..30i64 {
     let t = at(i * 100_000);
-    engine.pump(t, &mut io, &mut tiny);
+    engine.pump(|| t, &mut io, &mut tiny);
     // Draining the Conflict GCs the (route-already-freed) slot, so observe the
     // Conflict here rather than via a `slot.errored` peek (the slot may be gone).
     while let Some(u) = engine.poll_service_update(handle_a) {
@@ -3038,7 +3284,7 @@ fn send_too_large_retirement_frees_proto_route_and_decrements_services_active() 
   let mut got_conflict = false;
 
   for micros in pump_schedule() {
-    engine.pump(at(micros), &mut io, &mut scratch);
+    engine.pump(|| at(micros), &mut io, &mut scratch);
     while let Some(u) = engine.poll_service_update(handle) {
       got_conflict |= matches!(u, ServiceUpdate::Conflict | ServiceUpdate::HostConflict);
     }
@@ -3120,9 +3366,9 @@ fn an_undeliverable_one_shot_reply_must_not_retire_the_service() {
   t += 100_000;
   io.inbound
     .push_back(inbound_from(querier, build_ptr_query(&qname)));
-  engine.pump(at(t), &mut io, &mut scratch); // arms the §6 20–120 ms jitter
+  engine.pump(|| at(t), &mut io, &mut scratch); // arms the §6 20–120 ms jitter
   t += 200_000;
-  engine.pump(at(t), &mut io, &mut scratch); // fires the reply — undeliverable
+  engine.pump(|| at(t), &mut io, &mut scratch); // fires the reply — undeliverable
 
   let mut conflict = false;
   while let Some(u) = engine.poll_service_update(handle) {
@@ -3171,7 +3417,7 @@ fn an_undeliverable_sustained_datagram_still_retires_its_producer() {
   let mut terminal = false;
   let mut t = 0i64;
   for _ in 0..20 {
-    engine.pump(at(t), &mut io, &mut scratch);
+    engine.pump(|| at(t), &mut io, &mut scratch);
     while let Some(u) = engine.poll_query_update(q) {
       terminal |= matches!(u, QueryUpdate::Timeout | QueryUpdate::Done);
     }
@@ -3189,4 +3435,206 @@ fn an_undeliverable_sustained_datagram_still_retires_its_producer() {
     io.sent.is_empty(),
     "nothing may reach a wire when every send is permanently too large"
   );
+}
+
+/// Pin the ONE restatement this driver makes: every `try_send` outcome, and the
+/// core's own debt mask, expressed as the [`FamilyAttempt`] the confirm carries.
+///
+/// The projection onto delivered / missed / unobligated is the core's, but WHICH
+/// I/O fact each family reports is still this driver's, and getting one row wrong
+/// is the whole class of defect the vocabulary exists to close — a `Busy` family
+/// reported absent would let the §8.1 / §8.3 phase advance on a link that heard
+/// nothing, and a `TooLarge` goodbye reported as an absent socket would write off
+/// a debt a bound family still owes.
+#[test]
+fn each_family_send_restates_as_exactly_one_attempt() {
+  let now = at(0);
+  assert!(matches!(
+    FamilySend::Sent { bytes: 7, at: now }.attempt(),
+    FamilyAttempt::Accepted { at } if at == now
+  ));
+  assert_eq!(
+    FamilySend::<SmoltcpInstant>::Busy.attempt(),
+    FamilyAttempt::Refused { permanent: false },
+    "a transiently full transmit queue is a present socket that did not carry \
+     the datagram, and the SAME bytes may go out on the next round"
+  );
+  assert_eq!(
+    FamilySend::<SmoltcpInstant>::Failed.attempt(),
+    FamilyAttempt::Refused { permanent: true },
+    "`SendError::TooLarge` is this transport's own hard ceiling — its socket \
+     buffer — so re-offering these exact bytes can never queue them"
+  );
+  assert_eq!(
+    FamilySend::<SmoltcpInstant>::Gated.attempt(),
+    FamilyAttempt::GateShut,
+    "the enqueue gap is this driver's own deferral, never an absent link"
+  );
+  assert_eq!(
+    FamilySend::<SmoltcpInstant>::NotOwed.attempt(),
+    FamilyAttempt::GateShut,
+    "a family the core's own debt withheld made no syscall, so it has no I/O \
+     fact to report; the core discards a zero-debt family's round either way"
+  );
+  assert_eq!(
+    FamilySend::<SmoltcpInstant>::Unsupported.attempt(),
+    FamilyAttempt::NoSocket,
+    "and only an absent socket may report the one fact that writes a §10.1 debt \
+     off"
+  );
+}
+
+/// A fan-out reaches the core per FAMILY, with each family's own outcome intact.
+///
+/// Folding it to an aggregate is what this driver can least afford:
+/// [`family_order`] hands the one free slot of a constrained transport to the
+/// longest-blocked family, so under capacity one the families ALTERNATE and every
+/// round is partial. An aggregate cannot tell that apart from one chronically
+/// dead family, and the core would then refresh each family at twice the periodic
+/// interval — past the TTL — while every per-round invariant still held.
+#[test]
+fn a_fan_out_reaches_the_core_per_family() {
+  let mut tx = Multicaster::<SmoltcpInstant>::new();
+
+  // v4 queues, v6 transiently busy: v6 has a socket, so it is obligated and did
+  // not carry the datagram.
+  let mut partial = MockUdp {
+    v6_fail: Some(SendError::Busy),
+    ..Default::default()
+  };
+  let fanout = tx.send_multicast(
+    &mut partial,
+    b"a-multicast-datagram",
+    &mut || at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
+  assert_eq!(fanout.sent_count(), 1, "v4 queued, v6 busy");
+  let (v4, v6) = fanout.into_attempts();
+  assert!(matches!(v4, FamilyAttempt::Accepted { .. }));
+  assert_eq!(v6, FamilyAttempt::Refused { permanent: false });
+
+  // v4 queues, v6 has NO socket: an absent family was never obligated, so a
+  // single-stack node advances its lifecycle at full speed rather than chasing a
+  // family it does not have.
+  let mut single_stack = MockUdp {
+    v6_fail: Some(SendError::Unsupported),
+    ..Default::default()
+  };
+  let (v4, v6) = tx
+    .send_multicast(
+      &mut single_stack,
+      b"a-multicast-datagram",
+      &mut || at(0),
+      &mut FamilyWireGate::new(),
+      Duration::ZERO,
+    )
+    .into_attempts();
+  assert!(matches!(v4, FamilyAttempt::Accepted { .. }));
+  assert_eq!(v6, FamilyAttempt::NoSocket);
+
+  // Both busy: nothing reached a wire, so nothing may latch or advance — and a
+  // transient family is never read as a producer that can make no progress.
+  let mut all_busy = MockUdp {
+    v4_fail: Some(SendError::Busy),
+    v6_fail: Some(SendError::Busy),
+    ..Default::default()
+  };
+  let busy = tx.send_multicast(
+    &mut all_busy,
+    b"a-multicast-datagram",
+    &mut || at(0),
+    &mut FamilyWireGate::new(),
+    Duration::ZERO,
+  );
+  assert_eq!(busy.sent_count(), 0);
+  assert_eq!(
+    busy.into_attempts(),
+    (
+      FamilyAttempt::Refused { permanent: false },
+      FamilyAttempt::Refused { permanent: false }
+    )
+  );
+
+  // No socket anywhere: an EMPTY obligated set, which the core must not read as a
+  // vacuous "all delivered" that advances a phase no link ever heard.
+  let mut no_transport = MockUdp {
+    v4_fail: Some(SendError::Unsupported),
+    v6_fail: Some(SendError::Unsupported),
+    ..Default::default()
+  };
+  assert_eq!(
+    tx.send_multicast(
+      &mut no_transport,
+      b"a-multicast-datagram",
+      &mut || at(0),
+      &mut FamilyWireGate::new(),
+      Duration::ZERO,
+    )
+    .into_attempts(),
+    (FamilyAttempt::NoSocket, FamilyAttempt::NoSocket)
+  );
+}
+
+/// A §10.1 goodbye every family reports permanently too large KEEPS its debt, so
+/// the withdrawal is held for its full anti-pin ceiling instead of completing at
+/// once.
+///
+/// This driver used to write that debt off, freeing the route as soon as the
+/// refusal came back — and with it the NAME, while every bound family's peers
+/// stayed pinned to stale positive-TTL records for the rest of their TTL. Only an
+/// absent socket writes a debt off; the ceiling is what bounds a bound family
+/// that will not carry the retraction.
+#[test]
+fn a_permanently_too_large_goodbye_holds_the_name_to_the_ceiling() {
+  let cfg = EndpointConfig::new().with_probe_unique_names(false);
+  let mut engine: TestEngine = Engine::new(cfg, StdRng::seed_from_u64(7));
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+
+  let a = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut established = false;
+  let mut t = 0i64;
+  for _ in 0..16 {
+    engine.pump(|| at(t), &mut io, &mut scratch);
+    while let Some(u) = engine.poll_service_update(a) {
+      established |= matches!(u, ServiceUpdate::Established);
+    }
+    t += 250_000;
+  }
+  assert!(
+    established,
+    "the service must be advertising before it withdraws"
+  );
+
+  // Every goodbye is now refused as permanently too large on both families.
+  engine.unregister_service(a, at(t));
+  io.v4_fail = Some(SendError::TooLarge);
+  io.v6_fail = Some(SendError::TooLarge);
+
+  // Half a second of rounds — twice the §10.1 resend interval and well inside the
+  // 2 s ceiling. The name must still be held.
+  for _ in 0..2 {
+    t += 250_000;
+    engine.pump(|| at(t), &mut io, &mut scratch);
+  }
+  let rejected = engine.register_service(sample_spec(), at(t));
+  assert!(
+    matches!(
+      rejected,
+      Err(RegisterServiceError::NameAlreadyRegistered(_))
+    ),
+    "a refused goodbye leaves the debt outstanding, so the withdrawal still \
+     holds the name; got {rejected:?}"
+  );
+
+  // Past the anti-pin ceiling the item force-completes anyway — a family that
+  // cannot carry the retraction must not pin the name forever.
+  for _ in 0..12 {
+    t += 250_000;
+    engine.pump(|| at(t), &mut io, &mut scratch);
+  }
+  engine
+    .register_service(sample_spec(), at(t))
+    .expect("the ceiling force-completes the withdrawal and releases the name");
 }

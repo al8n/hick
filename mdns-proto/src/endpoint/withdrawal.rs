@@ -266,8 +266,8 @@ where
     /// short backoff they arrive at that backoff's cadence rather than the §10.1
     /// interval, for as long as the item lives.
     ///
-    /// A family the driver withheld on that basis is reported
-    /// [`WithdrawalSend::Retry`] — see [`Self::note_withdrawal_result`].
+    /// Whatever a driver reports for a family this names as owing nothing is
+    /// discarded — see [`Self::note_withdrawal_result`].
     ///
     /// Returns the [`WithdrawalTransmit`] describing the first due item that
     /// actually has records to emit, or `None` when no due item has anything to
@@ -658,35 +658,34 @@ where
     }
 
     /// Confirm the datagram most recently produced by
-    /// [`Self::poll_withdrawal_transmit`] for `token`, reporting the outcome for
-    /// EACH address family ([`WithdrawalSend`] for `v4` and `v6`) so withdrawal
-    /// debt is tracked PER FAMILY. The token names exactly one
-    /// `WithdrawalItem`, so no in-flight-part disambiguation is needed.
+    /// [`Self::poll_withdrawal_transmit`] for `token`, reporting what EACH address
+    /// family's transport did with it ([`FamilyAttempt`]) so withdrawal debt is
+    /// tracked PER FAMILY. The token names exactly one `WithdrawalItem`, so no
+    /// in-flight-part disambiguation is needed.
     ///
-    /// Per family `f`:
-    ///   * [`WithdrawalSend::Sent`] — the goodbye reached that family's wire, so
-    ///     spend one of its owed rounds (`owed[f] = owed[f].saturating_sub(1)`).
-    ///   * [`WithdrawalSend::Retry`] — transiently undeliverable (socket busy):
-    ///     keep that family's debt for a later retry.
-    ///   * [`WithdrawalSend::WriteOff`] — that family is permanently unavailable
-    ///     (no socket / permanent send error): zero its debt (`owed[f] = 0`), since
-    ///     it has no reachable peers to withdraw from.
+    /// The driver reports I/O-world facts; the core owns the spend / keep /
+    /// write-off table they project onto — see `WithdrawalSend::project`, and note
+    /// in particular that a PERMANENTLY-refused goodbye KEEPS its debt. Only an
+    /// absent socket writes one off.
     ///
-    /// # A family withheld because it had already paid
+    /// `now` is the driver's own instant for this round, and unlike a positive-TTL
+    /// confirm it is not folded from the attempts: what it re-arms is a §10.1
+    /// resend SCHEDULE, a real-time spacing bound on one family's egress path, so
+    /// it must be at or
+    /// AFTER the round's last syscall rather than at the earliest acceptance. The
+    /// two anchors are wrong in opposite directions and are not interchangeable.
+    ///
+    /// # A family that owed nothing is MASKED
     ///
     /// A driver offers the round only to the families
-    /// [`WithdrawalTransmit::debt`] named, and reports the ones it withheld as
-    /// [`WithdrawalSend::Retry`]. That is the only variant whose meaning survives
-    /// the mask being wrong in either direction. When the mask is right the family
-    /// is at zero already, and `Retry` is the one variant that neither touches the
-    /// debt nor counts as progress, so it is exactly a no-op. Were the mask ever
-    /// to withhold a family that DID still owe, `Retry` costs it a round it will be
-    /// offered again on the next schedule. Its alternatives have no such margin:
-    /// `Sent` claims a wire event that did not happen and would spend the very
-    /// debt the withholding assumed was gone, and `WriteOff` would zero it
-    /// outright — freeing the route while that family's peers stay pinned to stale
-    /// positive-TTL records. The one-sidedness is the point: a mask erring towards
-    /// caution can cost a round, never a debt.
+    /// [`WithdrawalTransmit::debt`] named, so it must invent SOME report for a
+    /// family it withheld — no honest I/O fact describes "you told me it owed
+    /// nothing". Whatever it invents is discarded here: a family whose debt was
+    /// already zero when the round was handed out has its outcome ignored
+    /// outright, so no laundering can cost a debt, spend a round, or count as
+    /// progress. The mask is one-sided by construction — a driver that withholds a
+    /// family which DID still owe loses that family one round, which the next
+    /// schedule offers again.
     ///
     /// `next_at` re-arms at the full `WITHDRAWAL_INTERVAL` when a family made REAL
     /// progress this round — a `Sent` for a family that still OWED a goodbye
@@ -711,8 +710,8 @@ where
       &mut self,
       token: WithdrawalToken,
       now: I,
-      v4: WithdrawalSend,
-      v6: WithdrawalSend,
+      v4: FamilyAttempt<I>,
+      v6: FamilyAttempt<I>,
     ) {
       let Some((_, w)) = self.withdrawals.iter_mut().find(|(t, _)| *t == token) else {
         return;
@@ -721,25 +720,26 @@ where
       // Zip each family's debt counter (by mutable reference) with its outcome to
       // avoid dynamic indexing (clippy::indexing_slicing) into `owed`.
       //
-      // A `Sent` counts as progress ONLY when that family still OWED a goodbye
-      // before this round (`*debt > 0`). A driver that consults
-      // `WithdrawalTransmit::debt` never offers a paid family the round at all, so
-      // this arm is its backstop rather than its normal path: were a redundant
-      // `Sent` to count as progress it would re-arm at the FULL interval and starve
-      // a still-busy family of its short-backoff retry, risking a missed
-      // last-interval recovery before the ceiling. So a `Sent` on an already-paid
-      // family changes nothing — neither the debt nor the schedule.
+      // The ZERO-DEBT MASK is the `*debt == 0` guard, and it is the whole of it: a
+      // family that owed nothing when the round was handed out cannot have its
+      // outcome change anything, whatever the driver reported. `Sent` on such a
+      // family is a redundant fan-out rather than progress — were it counted, a
+      // paid family echoing `Sent` every round would keep re-arming at the FULL
+      // interval and starve a still-failing family of its short-backoff retry,
+      // risking a missed last-interval recovery before the ceiling — and a
+      // `WriteOff` cannot zero a debt that is already zero.
       let owed = &mut w.owed;
-      for (debt, outcome) in owed.iter_mut().zip([v4, v6]) {
-        match outcome {
-          WithdrawalSend::Sent if *debt > 0 => {
+      for (debt, attempt) in owed.iter_mut().zip([v4, v6]) {
+        if *debt == 0 {
+          continue;
+        }
+        match WithdrawalSend::project(attempt) {
+          WithdrawalSend::Sent => {
             // `*debt > 0` here, so this is `-= 1`; `saturating_sub` keeps it free of
             // `clippy::arithmetic_side_effects` (denied workspace-wide).
             *debt = debt.saturating_sub(1);
             progressed = true;
           }
-          // Redundant send on an already-paid family (`*debt == 0`): no progress.
-          WithdrawalSend::Sent => {}
           WithdrawalSend::Retry => {}
           WithdrawalSend::WriteOff => *debt = 0,
         }
@@ -850,6 +850,21 @@ where
       .map(|(t, _)| *t)
   }
 
+  /// Test-only: confirm a round by the DEBT EFFECT it should have, rather than by
+  /// the I/O outcome that projects onto it. The debt tests are about spend / keep
+  /// / write-off; the projection has its own tests, which build attempts
+  /// explicitly.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
+  pub(crate) fn note_withdrawal_sends(
+    &mut self,
+    token: WithdrawalToken,
+    now: I,
+    v4: WithdrawalSend,
+    v6: WithdrawalSend,
+  ) {
+    self.note_withdrawal_result(token, now, v4.as_attempt(now), v6.as_attempt(now));
+  }
+
   /// Test-only: confirm a send for the ROUTE-attached item of `handle` by looking
   /// up its token internally (a no-op if the item is gone). Lets handle-oriented
   /// tests spend a route withdrawal's debt without threading the token through.
@@ -862,7 +877,7 @@ where
     v6: WithdrawalSend,
   ) {
     if let Some(tok) = self.route_withdrawal_token(handle) {
-      self.note_withdrawal_result(tok, now, v4, v6);
+      self.note_withdrawal_sends(tok, now, v4, v6);
     }
   }
 

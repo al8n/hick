@@ -175,8 +175,8 @@ impl Family {
   /// datagram the kernel would have accepted.
   pub(crate) const fn max_udp_payload(self) -> usize {
     match self {
-      Self::V4 => 65_507,
-      Self::V6 => 65_527,
+      Self::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
+      Self::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
     }
   }
 }
@@ -471,17 +471,6 @@ impl SendOutcome {
     }
   }
 
-  /// The instant to confirm this family at, if it carried the datagram.
-  ///
-  /// The **core's** anchor, read before the syscall, so it is at or before the
-  /// true acceptance.
-  pub(crate) const fn confirm_anchor(self) -> Option<StdInstant> {
-    match self {
-      Self::Sent { submitted_at, .. } => Some(submitted_at),
-      _ => None,
-    }
-  }
-
   /// The instant this family's bytes were actually on its wire, if they were.
   ///
   /// The **wire gate's** anchor, read after the syscall succeeded.
@@ -534,50 +523,6 @@ impl SendReport {
   /// result) never has to re-derive which socket an outcome came from.
   pub(crate) fn per_family(&self) -> [(Family, SendOutcome); 2] {
     [(Family::V4, self.v4), (Family::V6, self.v6)]
-  }
-
-  /// Whether **every reachable family** rejected this datagram as permanently
-  /// too large, so no later attempt at these exact bytes can ever reach a wire.
-  ///
-  /// Reachable means [`SendOutcome::NoSocket`] is excluded and nothing else is:
-  /// a family with no socket was never offered the datagram, so it is no
-  /// evidence either way — a single-stack host that refuses an oversized
-  /// datagram on its one family has still refused it on every family it has.
-  /// The predicate is therefore "at least one [`SendOutcome::TooLarge`], and
-  /// every other family absent".
-  ///
-  /// # The two ways to get this wrong, and which side each errs on
-  ///
-  /// **Too eager** would read a transient refusal as permanent and destroy a
-  /// healthy advertisement over a full send buffer. So every may-clear
-  /// outcome — [`SendOutcome::Failed`] (backpressure, a route that went away, a
-  /// firewall) and [`SendOutcome::Gated`] (this driver's own §8.3 spacing, whose
-  /// next round carries the SAME datagram) — vetoes the answer outright.
-  /// [`SendOutcome::Sent`] does too, trivially: something reached a wire.
-  ///
-  /// **Too lax** would leave a sustained producer re-arming a datagram no socket
-  /// can ever carry, retrying it until the process ends. That is the defect this
-  /// exists to close, and it is why "some family failed for some reason" is not
-  /// enough to *avoid* the answer either: a family that answered `TooLarge`
-  /// alongside a family that answered `Failed` is a mixed round, so this reports
-  /// `false` and the transient family is waited for.
-  ///
-  /// It says nothing about what to DO. A one-shot response that cannot be sent
-  /// is a lost response; a sustained one is a producer that can never make
-  /// progress. Only [`Transmit::obligation`](mdns_proto::Transmit::obligation)
-  /// tells the two apart, and only `Mdns::drain_transmits` consults it.
-  pub(crate) fn undeliverable(&self) -> bool {
-    let mut any_too_large = false;
-    for (_, outcome) in self.per_family() {
-      match outcome {
-        SendOutcome::TooLarge => any_too_large = true,
-        // Never offered this family: no evidence, and no veto either.
-        SendOutcome::NoSocket => {}
-        // Reached a wire, or may yet on a later round.
-        SendOutcome::Sent { .. } | SendOutcome::Gated | SendOutcome::Failed => return false,
-      }
-    }
-    any_too_large
   }
 }
 

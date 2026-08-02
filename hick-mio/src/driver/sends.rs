@@ -52,7 +52,7 @@ use std::{
   time::{Duration, Instant as StdInstant},
 };
 
-use mdns_proto::{FamilyDelivery, TransmitDelivery};
+use mdns_proto::FamilyAttempt;
 
 use crate::{
   selfsend::SelfSendTracker,
@@ -118,10 +118,15 @@ use crate::{
 /// streak and the degradation with it.
 pub(crate) const MAX_CONSECUTIVE_SEND_FAILURES: u32 = 3;
 
-/// Index of the IPv4 family in every per-family array, matching
-/// [`TransmitDelivery`]'s own ordering.
+/// Index of the IPv4 family in every per-family array, matching the core's own
+/// `[v4, v6]` ordering.
+///
+/// `#[cfg(test)]`: production reads [`Family::index`] at the one place it fans
+/// out, so the only remaining use is the tests that pin the two agree.
+#[cfg(test)]
 pub(crate) const FAMILY_V4: usize = 0;
 /// Index of the IPv6 family.
+#[cfg(test)]
 pub(crate) const FAMILY_V6: usize = 1;
 
 /// One family's recent delivery record, and whether that record is currently bad
@@ -223,8 +228,7 @@ impl SendHealth {
   }
 }
 
-/// What one fan-out settled: the per-family confirm, the fairness charge, and
-/// the instant to anchor the confirm at.
+/// What one fan-out settled: the per-family I/O facts and the fairness charge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SendSummary {
   /// Families that actually put bytes on a wire. Feeds
@@ -232,31 +236,15 @@ pub(crate) struct SendSummary {
   /// **not** the delivery verdict: one datagram that reached one of two
   /// obligated families costs one credit yet has discharged no obligation.
   pub(crate) sent: usize,
-  /// The honest per-family result, to be handed to the core verbatim.
-  pub(crate) delivery: TransmitDelivery,
-  /// The **earliest** instant at which some family accepted the datagram, or
-  /// `None` when none did.
+  /// What each family's socket did, indexed `[v4, v6]` — the whole of what this
+  /// driver tells the core about a send.
   ///
-  /// The core anchors each delivered family's refresh schedule at the confirm
-  /// instant, so a clock read taken after the fan-out would record a family
-  /// served at `t0` as having been served when the slower family finished, and
-  /// its next refresh would land a whole fan-out later than its records' TTL
-  /// allows. Taking the earliest can only ever understate how fresh a family's
-  /// peers are, which is the safe direction.
-  pub(crate) accepted_at: Option<StdInstant>,
-  /// Every reachable family rejected this datagram as permanently too large, so
-  /// re-offering these exact bytes can never put them on a wire. See
-  /// [`SendReport::undeliverable`], which decides it, and
-  /// [`Mdns::drain_transmits`](crate::Mdns::tick) — the one consumer — for the
-  /// obligation it is weighed against.
-  ///
-  /// **Not a delivery verdict, and not an input to one.** `delivery` above is
-  /// the same honest per-family shape either way: an undeliverable round is
-  /// `Missed` on every family that has a socket, exactly as a refused one is.
-  /// This rides alongside so the caller can ask a question the core's vocabulary
-  /// has no room for — *is there any point re-arming this datagram* — without
-  /// any of it reaching the confirm.
-  pub(crate) undeliverable: bool,
+  /// Each acceptance carries its OWN pre-syscall instant, so the core folds the
+  /// earliest across families itself. The fold used to be done here and handed
+  /// over as a single instant, which left the anchor rule — an interpretation, and
+  /// the one at the centre of the per-family schedule — on this side of the
+  /// boundary.
+  pub(crate) attempts: [FamilyAttempt<StdInstant>; 2],
 }
 
 /// One PRODUCER's per-family earliest-next-send gate: when each address family
@@ -272,6 +260,13 @@ pub(crate) struct SendSummary {
 /// live on opposite sides of the sans-I/O seam. **Nothing here may hardcode the
 /// value** — doing so would take protocol policy into the driver and get the
 /// probe sequence wrong by a factor of four.
+///
+/// "Wire" throughout this driver names the KERNEL HANDOFF, the furthest point a
+/// socket transport can observe: this gate anchors at the instant `sendto`
+/// RETURNED, and `Ok` there means the kernel owns the datagram rather than that
+/// the NIC has put it on the link. See
+/// [`Transmit::min_family_gap`](mdns_proto::Transmit::min_family_gap) for where
+/// each driver's boundary sits.
 ///
 /// It cannot be folded into the core's schedule because the confirm anchors at
 /// the EARLIEST acceptance across families. That anchor is the right one for the
@@ -488,70 +483,55 @@ pub(crate) fn send_and_credit(
   summarize(report)
 }
 
-/// Project one fan-out onto the core's vocabulary.
+/// Restate one fan-out in the core's I/O-world vocabulary.
 ///
 /// It takes the [`SendReport`] and nothing else. No health table, no history,
-/// nothing that could turn a link's CONDITION into a different protocol answer —
-/// the signature is the guarantee, and [`MAX_CONSECUTIVE_SEND_FAILURES`] says
-/// why it must stay that way. The mapping is one-to-one and nothing is
-/// laundered:
+/// nothing that could turn a link's CONDITION into a different answer — the
+/// signature is the guarantee, and [`MAX_CONSECUTIVE_SEND_FAILURES`] says why it
+/// must stay that way. The mapping is one-to-one and nothing is laundered:
 ///
-/// * `NoSocket` is [`FamilyDelivery::Unobligated`], and is the ONLY thing that
-///   is. It covers both of the core's cases — this driver has no socket for the
-///   family, and the datagram was addressed to the other one — so the family was
-///   never offered it and its absence is not a failure. A single-stack host is
-///   fully delivered on the one family it has.
-/// * `Sent` is [`FamilyDelivery::Delivered`], **including for a degraded
-///   family**: a family that has quietly recovered really did put the records on
-///   a wire, and peers reachable over it now hold them.
-/// * `Gated`, `Failed` and `TooLarge` are [`FamilyDelivery::Missed`], however
-///   long the family has been failing. Its socket is there and the datagram was
-///   meant for it — the driver either owed the wire a gap it had not paid, or
-///   the kernel refused it. Reporting any of them absent would hide it from the
-///   core and let the phase advance without the family. How long the core waits
-///   for such a family is the core's `MAX_PARTIAL_ROUNDS`, spent on an `Excused`
-///   advance that takes none of the credit a delivery earns.
+/// * `Sent` is [`FamilyAttempt::Accepted`], **including for a degraded family**:
+///   a family that has quietly recovered really did put the records on a wire.
+///   It carries `confirm_anchor` and never `wire_time` — the core's anchor is the
+///   PRE-syscall instant, where early can only understate how fresh this family's
+///   peers are, while a late one would schedule a refresh past its records' TTL.
+///   The gate's anchor is the other one and reads the other way round.
+/// * `Gated` is [`FamilyAttempt::GateShut`] — the deferral is this driver's own,
+///   made against a minimum the core computed.
+/// * `Failed` is [`FamilyAttempt::Refused`] with `permanent: false`, and
+///   `TooLarge` the same with `permanent: true`. The refusal proves the bytes did
+///   not go out; only the SIZE proves they never could, which is exactly the split
+///   [`SendOutcome::TooLarge`] documents.
+/// * `NoSocket` is [`FamilyAttempt::NoSocket`]. This driver's own variant also
+///   covers "the datagram was addressed to the other family", which the core
+///   vocabulary names separately — the two project identically on this path (the
+///   family was never offered the datagram either way), and the withdrawal path,
+///   where they differ, always sends each family its own group's datagram and so
+///   can only produce the genuine absence.
 ///
-/// # `undeliverable` is carried, not projected
-///
-/// [`SendSummary::undeliverable`] leaves this mapping untouched: a datagram no
-/// reachable socket can carry is still `Missed` on every family that has one.
-/// The core's vocabulary has no way to say "and there is no point re-arming
-/// it" — which is precisely why it must not be said in `delivery`, where the
-/// only unused shape is `Unobligated` and that means an ABSENT socket. It rides
-/// beside the confirm instead, and only [`Mdns::drain_transmits`](crate::Mdns::tick)
-/// reads it, after the confirm has been spent.
+/// **What each outcome MEANS is no longer decided here.** Missed versus absent,
+/// the earliest-acceptance anchor, and whether a permanently-refused datagram is
+/// worth re-arming are all read off these facts by the core, once, instead of
+/// once per driver.
 fn summarize(report: SendReport) -> SendSummary {
   let mut sent = 0usize;
-  let mut families = [FamilyDelivery::Unobligated; 2];
-  let mut accepted_at: Option<StdInstant> = None;
+  let mut attempts = [FamilyAttempt::NoSocket; 2];
   for (family, outcome) in report.per_family() {
-    let delivery = match outcome {
-      SendOutcome::Sent { .. } => {
+    let attempt = match outcome {
+      SendOutcome::Sent { submitted_at, .. } => {
         sent = sent.saturating_add(1);
-        // `confirm_anchor`, never `wire_time`: the core's anchor is the
-        // PRE-syscall instant, where early can only understate how fresh this
-        // family's peers are, while a late one would schedule a refresh past its
-        // records' TTL. The gate's anchor is the other one and reads the other
-        // way round.
-        if let Some(at) = outcome.confirm_anchor() {
-          accepted_at = Some(accepted_at.map_or(at, |best: StdInstant| best.min(at)));
-        }
-        FamilyDelivery::Delivered
+        FamilyAttempt::Accepted { at: submitted_at }
       }
-      SendOutcome::Gated | SendOutcome::Failed | SendOutcome::TooLarge => FamilyDelivery::Missed,
-      SendOutcome::NoSocket => FamilyDelivery::Unobligated,
+      SendOutcome::Gated => FamilyAttempt::GateShut,
+      SendOutcome::Failed => FamilyAttempt::Refused { permanent: false },
+      SendOutcome::TooLarge => FamilyAttempt::Refused { permanent: true },
+      SendOutcome::NoSocket => FamilyAttempt::NoSocket,
     };
-    if let Some(slot) = families.get_mut(family.index()) {
-      *slot = delivery;
+    if let Some(slot) = attempts.get_mut(family.index()) {
+      *slot = attempt;
     }
   }
-  SendSummary {
-    sent,
-    delivery: TransmitDelivery::new(families[FAMILY_V4], families[FAMILY_V6]),
-    accepted_at,
-    undeliverable: report.undeliverable(),
-  }
+  SendSummary { sent, attempts }
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use crate::{
   error::{HandleTimeoutError, TransmitError},
   event::{QueryEvent, QueryUpdate},
   service::{FamilyPatience, PhaseAdvance, classify_advance},
-  transmit::{Transmit, TransmitObligation, TransmitDelivery},
+  transmit::{FamilyAttempt, Transmit, TransmitConfirm, TransmitObligation},
   wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
 };
 
@@ -894,15 +894,22 @@ where
     )))
   }
 
-  /// Report the delivery outcome of the datagram most recently produced by
-  /// [`Self::poll_transmit`].
+  /// Report what each address family's transport did with the datagram most
+  /// recently produced by [`Self::poll_transmit`], and take back the core's
+  /// conclusions.
   ///
   /// Must be called before ANY other state-mutating entry point for this query —
   /// see [`Self::poll_transmit`] for the ordering contract.
   ///
-  /// The §5.2 retry BUDGET advances iff [`TransmitDelivery::all_delivered`] — a
-  /// question that reached only some of the links the driver fans it onto has
-  /// not been asked everywhere, so spending a retry slot for it would time the
+  /// The driver reports I/O-world facts only ([`FamilyAttempt`]); every protocol
+  /// meaning is read into them here. `now` serves only as the FALLBACK anchor for
+  /// a round no family accepted: when some family did, the §5.2 backoff is
+  /// anchored at the EARLIEST acceptance across families, so the response window
+  /// a peer is given runs from when it was asked.
+  ///
+  /// The §5.2 retry BUDGET advances iff EVERY obligated family accepted the
+  /// question — one that reached only some of the links the driver fans it onto
+  /// has not been asked everywhere, so spending a retry slot for it would time the
   /// query out having never queried the missing link.
   ///
   /// * **All delivered** — count the transmission against the budget and
@@ -929,19 +936,41 @@ where
   /// spends its slot and the query walks the §5.2 schedule the served link would
   /// have seen anyway. Re-freezing per slot instead put three times as many
   /// questions on that link before the same terminal.
-  pub fn note_transmit_outcome(&mut self, now: I, delivery: TransmitDelivery) {
+  ///
+  /// # Retirement
+  ///
+  /// [`TransmitConfirm::retire_producer`] is `true` when no transport can ever
+  /// carry the question. A §5.2 question is always
+  /// [`TransmitObligation::Sustained`] — there is no one-shot form — so such a
+  /// query would re-ask forever without ever reaching its own retry ceiling,
+  /// since the budget is spent only on a fully-delivered send. A query that has
+  /// already terminated retires nothing: there is no producer left to stop.
+  pub fn note_transmit_outcome(
+    &mut self,
+    now: I,
+    v4: FamilyAttempt<I>,
+    v6: FamilyAttempt<I>,
+  ) -> TransmitConfirm {
     if !self.awaiting_send_confirm {
-      return;
+      return TransmitConfirm::NOTHING;
     }
     self.awaiting_send_confirm = false;
+    let delivery = FamilyAttempt::project(v4, v6);
+    let confirm = TransmitConfirm::new(
+      delivery.any_delivered(),
+      !self.done && FamilyAttempt::undeliverable(v4, v6),
+    );
     // The absolute `timeout_deadline` can terminate the query while a send is
     // still awaiting its confirm, and `terminate` clears both deadlines. Re-arming
     // `next_deadline` on a finished query would hand the driver one wakeup for a
     // query that will never transmit again — `poll_timeout` does not screen `done`
     // — so a terminal query resolves the token and stops there.
     if self.done {
-      return;
+      return confirm;
     }
+    // THE anchor: earliest acceptance across families, falling back to the
+    // driver's own instant for a round that reached no wire.
+    let now = FamilyAttempt::anchor(v4, v6, now);
     match classify_advance(&mut self.partial_rounds, delivery) {
       PhaseAdvance::Delivered => {
         self.retry_count = self.retry_count.saturating_add(1);
@@ -981,6 +1010,16 @@ where
         self.next_deadline = retry::next_deadline(now, self.retry_count.saturating_add(1));
       }
     }
+    confirm
+  }
+
+  /// Test-only: confirm from a projected delivery SHAPE. See
+  /// [`Service::note_delivery`](crate::Service::note_delivery).
+  #[cfg(test)]
+  #[allow(dead_code)]
+  pub(crate) fn note_delivery(&mut self, now: I, delivery: crate::transmit::TransmitDelivery) {
+    let (v4, v6) = delivery.as_attempts(now);
+    let _ = self.note_transmit_outcome(now, v4, v6);
   }
 
   /// RFC 6762 §7.3 duplicate-question suppression. Another host has multicast

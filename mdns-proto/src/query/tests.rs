@@ -7,7 +7,7 @@ use crate::{
   Name, QueryHandle,
   event::QueryEvent,
   service::MAX_PARTIAL_ROUNDS,
-  transmit::{FamilyDelivery, V4, V6},
+  transmit::{FamilyAttempt, FamilyDelivery, TransmitDelivery, V4, V6},
   wire::{MessageReader, ResourceClass, ResourceType},
 };
 
@@ -648,7 +648,7 @@ fn a_send_drained_past_the_absolute_deadline_is_never_emitted() {
     q.poll_transmit(|| t0, &mut buf).unwrap().is_some(),
     "the first send is inside the window and must go out"
   );
-  q.note_transmit_outcome(t0, TransmitDelivery::ALL);
+  q.note_delivery(t0, TransmitDelivery::ALL);
 
   // The retry falls due inside the window and arms a transmit.
   let armed_at = t0.checked_add(Duration::from_secs(1)).unwrap();
@@ -724,7 +724,7 @@ fn a_send_drained_inside_the_absolute_deadline_still_goes_out() {
     q.poll_transmit(|| t0, &mut buf).unwrap().is_some(),
     "the first send is inside the window and must go out"
   );
-  q.note_transmit_outcome(t0, TransmitDelivery::ALL);
+  q.note_delivery(t0, TransmitDelivery::ALL);
 
   let armed_at = t0.checked_add(Duration::from_secs(1)).unwrap();
   q.handle_timeout(armed_at).unwrap();
@@ -798,7 +798,7 @@ fn a_question_admitted_inside_the_window_is_produced_though_the_call_returns_aft
   );
 
   // The boundary that WAS crossed still ends the query, through its one owner.
-  q.note_transmit_outcome(returned_at, TransmitDelivery::ALL);
+  q.note_delivery(returned_at, TransmitDelivery::ALL);
   assert!(
     !q.done,
     "admitting a question must not terminate the query, however long the call \
@@ -968,7 +968,7 @@ fn a_transmit_poll_past_the_deadline_does_not_retire_an_unconfirmed_send() {
   );
 
   // The confirm resolves against a live query, as the driver was promised.
-  q.note_transmit_outcome(past, TransmitDelivery::ALL);
+  q.note_delivery(past, TransmitDelivery::ALL);
   assert!(!q.awaiting_send_confirm, "the commit token must be resolved");
   assert!(!q.done, "confirming a delivered send does not retire the query");
 
@@ -1026,7 +1026,7 @@ fn poll_timeout_reflects_absolute_timeout() {
   // not yet due.
   let mut buf = [0u8; 512];
   let _ = q.poll_transmit(|| now, &mut buf).unwrap();
-  q.note_transmit_outcome(now, TransmitDelivery::ALL);
+  q.note_delivery(now, TransmitDelivery::ALL);
   q.handle_timeout(now).unwrap();
   assert!(!q.done, "query must not be done immediately");
 
@@ -1091,7 +1091,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
   );
   // the retry is scheduled on a CONFIRMED delivery, not at encode
   // time. Confirm the send.
-  q.note_transmit_outcome(now, TransmitDelivery::ALL);
+  q.note_delivery(now, TransmitDelivery::ALL);
 
   // The driver now sleeps until poll_timeout. It must be exactly now + 1s —
   // not now — so the loop does not immediately re-fire at now.
@@ -1122,7 +1122,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
     q.poll_transmit(|| one_sec, &mut buf).unwrap().is_some(),
     "first retry must be sent at now + 1s"
   );
-  q.note_transmit_outcome(one_sec, TransmitDelivery::ALL);
+  q.note_delivery(one_sec, TransmitDelivery::ALL);
   let three_sec = now.checked_add(Duration::from_secs(3)).unwrap();
   assert_eq!(
     q.poll_timeout(),
@@ -1160,7 +1160,7 @@ fn failed_send_does_not_consume_retry_budget() {
   for _ in 0..50 {
     let sent = q.poll_transmit(|| t, &mut buf).unwrap().is_some();
     assert!(sent, "query must keep attempting to send while undelivered");
-    q.note_transmit_outcome(t, TransmitDelivery::NONE); // all sockets failed
+    q.note_delivery(t, TransmitDelivery::NONE); // all sockets failed
     assert!(!q.is_done(), "an undelivered query must NOT time out");
     // Advance to the re-attempt deadline and fire it.
     let due = q.poll_timeout().expect("a re-attempt must be scheduled");
@@ -1175,7 +1175,7 @@ fn failed_send_does_not_consume_retry_budget() {
   // Now let a send succeed: the budget finally advances and normal backoff
   // resumes (first confirmed retry at +1s).
   assert!(q.poll_transmit(|| t, &mut buf).unwrap().is_some());
-  q.note_transmit_outcome(t, TransmitDelivery::ALL);
+  q.note_delivery(t, TransmitDelivery::ALL);
   let plus_1s = t.checked_add(Duration::from_secs(1)).unwrap();
   assert_eq!(
     q.poll_timeout(),
@@ -1208,7 +1208,7 @@ fn query_retry_anchored_to_confirmation_time() {
 
   // The send completes 5 s later — longer than the 1 s first backoff.
   let send_done = t0.checked_add(Duration::from_secs(5)).unwrap();
-  q.note_transmit_outcome(send_done, TransmitDelivery::ALL);
+  q.note_delivery(send_done, TransmitDelivery::ALL);
 
   // The next retry is 1 s AFTER the confirmed-send time, not after t0.
   assert_eq!(
@@ -1359,7 +1359,7 @@ fn retire_is_idempotent() {
 fn note_transmit_outcome_without_a_pending_send_is_noop() {
   let mut q = make_query(ResourceType::Any, ResourceClass::Any);
   // No poll_transmit happened → awaiting_send_confirm is false → no-op.
-  q.note_transmit_outcome(StdInstant::now(), TransmitDelivery::ALL);
+  q.note_delivery(StdInstant::now(), TransmitDelivery::ALL);
   assert_eq!(
     q.retry_count, 0,
     "a result with no in-flight send must not advance the retry budget"
@@ -1442,7 +1442,7 @@ fn retry_budget_exhaustion_retires_the_query() {
     now += std::time::Duration::from_secs(120); // past the 60s backoff cap
     q.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = q.poll_transmit(|| now, &mut buf) {
-      q.note_transmit_outcome(now, TransmitDelivery::ALL); // confirmed send burns one retry slot
+      q.note_delivery(now, TransmitDelivery::ALL); // confirmed send burns one retry slot
     }
     if q.is_done() {
       retired = true;
@@ -1562,7 +1562,7 @@ fn partially_delivered_question_does_not_burn_the_retry_budget() {
   let now = StdInstant::now();
 
   emit_question(&mut q, now);
-  q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+  q.note_delivery(now, TransmitDelivery::V4_ONLY);
   assert_eq!(
     q.retry_count, 0,
     "a partially-delivered question must NOT consume a retry slot"
@@ -1580,7 +1580,7 @@ fn fully_delivered_question_burns_the_retry_budget() {
   let now = StdInstant::now();
 
   emit_question(&mut q, now);
-  q.note_transmit_outcome(now, TransmitDelivery::ALL);
+  q.note_delivery(now, TransmitDelivery::ALL);
   assert_eq!(
     q.retry_count, 1,
     "a fully-delivered question advances the §5.2 budget"
@@ -1597,7 +1597,7 @@ fn undelivered_question_neither_burns_the_budget_nor_grows_the_interval() {
   let mut previous = None;
   for _ in 0..3 {
     emit_question(&mut q, now);
-    q.note_transmit_outcome(now, TransmitDelivery::NONE);
+    q.note_delivery(now, TransmitDelivery::NONE);
     assert_eq!(
       q.retry_count, 0,
       "an undelivered question must not consume a retry slot"
@@ -1645,7 +1645,7 @@ fn repeated_partial_questions_climb_the_rfc_5_2_doubling_ladder() {
   for round in 0usize..8 {
     emit_question(&mut q, now);
     let before = q.retry_count;
-    q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+    q.note_delivery(now, TransmitDelivery::V4_ONLY);
     let deadline = q.next_deadline.expect("a partial send always re-arms");
     let gap = deadline.duration_since(now).as_secs();
     if q.retry_count == before {
@@ -1688,7 +1688,7 @@ fn repeated_partial_questions_climb_the_rfc_5_2_doubling_ladder() {
   // the ladder resets to the bottom rung.
   emit_question(&mut q, now);
   let before = q.retry_count;
-  q.note_transmit_outcome(now, TransmitDelivery::ALL);
+  q.note_delivery(now, TransmitDelivery::ALL);
   assert_eq!(q.retry_count, before + 1, "recovery spends exactly one slot");
   assert_eq!(
     q.partial_send_streak, 0,
@@ -1711,7 +1711,7 @@ fn the_first_partial_rungs_are_the_plain_5_2_intervals() {
   let mut now = StdInstant::now();
   for want in [1u64, 2, 4] {
     emit_question(&mut q, now);
-    q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+    q.note_delivery(now, TransmitDelivery::V4_ONLY);
     let deadline = q.next_deadline.expect("a partial send always re-arms");
     assert_eq!(
       deadline.duration_since(now).as_secs(),
@@ -1739,7 +1739,7 @@ fn a_permanently_partial_question_still_reaches_its_terminal_timeout() {
       break;
     }
     emit_question(&mut q, now);
-    q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+    q.note_delivery(now, TransmitDelivery::V4_ONLY);
     now = q.next_deadline.expect("a partial send always re-arms");
     q.handle_timeout(now).unwrap();
   }
@@ -1764,7 +1764,7 @@ fn duplicate_suppression_clears_the_partial_bound_like_a_delivered_send() {
   // Charge the bound to exactly one round short of the excusal.
   for _ in 0..MAX_PARTIAL_ROUNDS {
     emit_question(&mut q, now);
-    q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+    q.note_delivery(now, TransmitDelivery::V4_ONLY);
     now = q.next_deadline.expect("a partial send always re-arms");
     q.handle_timeout(now).unwrap();
   }
@@ -1789,7 +1789,7 @@ fn duplicate_suppression_clears_the_partial_bound_like_a_delivered_send() {
   q.handle_timeout(now).unwrap();
   emit_question(&mut q, now);
   let before = q.retry_count;
-  q.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+  q.note_delivery(now, TransmitDelivery::V4_ONLY);
   assert_eq!(
     q.retry_count, before,
     "the first partial after a full slot must not be excused — the bound was \
@@ -1833,7 +1833,7 @@ fn a_late_confirm_on_a_terminated_query_arms_no_wakeup() {
   assert!(q.poll_timeout().is_none());
 
   // The parked datagram's confirm finally lands.
-  q.note_transmit_outcome(late, TransmitDelivery::ALL);
+  q.note_delivery(late, TransmitDelivery::ALL);
   assert!(
     !q.awaiting_send_confirm,
     "the token is still resolved — a terminal query must not stay awaiting"
@@ -1842,4 +1842,113 @@ fn a_late_confirm_on_a_terminated_query_arms_no_wakeup() {
     q.poll_timeout().is_none(),
     "a finished query must not re-arm a deadline the driver would wake for"
   );
+}
+
+/// The §5.2 backoff is anchored at the EARLIEST family acceptance, so the
+/// response window a peer is given runs from when it was actually asked.
+///
+/// The min-fold moved from each driver into the core and the semantics are
+/// unchanged: earliest can only ever understate how long ago the question went
+/// out, which retransmits sooner than strictly needed, while the latest — or a
+/// clock read after the fan-out — would let a slow family talk the schedule into
+/// asking again later than §5.2 allows.
+#[test]
+fn the_retry_backoff_anchors_at_the_earliest_family_acceptance() {
+  use core::time::Duration;
+
+  for swapped in [false, true] {
+    let mut q = make_query(ResourceType::A, ResourceClass::In);
+    let mut buf = [0u8; 512];
+    let t0 = StdInstant::now();
+    assert!(q.poll_transmit(|| t0, &mut buf).unwrap().is_some());
+
+    let early = t0.checked_add(Duration::from_millis(10)).unwrap();
+    let late = t0.checked_add(Duration::from_millis(400)).unwrap();
+    // The driver's own post-fan-out reading: the FALLBACK, and unreachable while
+    // some family accepted.
+    let fallback = t0.checked_add(Duration::from_secs(5)).unwrap();
+    let (v4, v6) = if swapped {
+      (
+        FamilyAttempt::Accepted { at: late },
+        FamilyAttempt::Accepted { at: early },
+      )
+    } else {
+      (
+        FamilyAttempt::Accepted { at: early },
+        FamilyAttempt::Accepted { at: late },
+      )
+    };
+    let _ = q.note_transmit_outcome(fallback, v4, v6);
+
+    assert_eq!(
+      q.poll_timeout(),
+      Some(early.checked_add(Duration::from_secs(1)).unwrap()),
+      "the first §5.2 retry is one second after the question was ASKED"
+    );
+  }
+}
+
+/// A question no transport can ever carry retires its query.
+///
+/// A §5.2 question is always sustained — there is no one-shot form — and the
+/// retry budget is spent only on a fully-delivered send, so such a query would
+/// re-ask forever without ever reaching its own terminal. The core's patience
+/// does not rescue it: that excuses a MISSING family, not a round that can
+/// succeed on none of them.
+#[test]
+fn a_permanently_oversized_question_retires_its_query() {
+  let mut q = make_query(ResourceType::A, ResourceClass::In);
+  let mut buf = [0u8; 512];
+  let t0 = StdInstant::now();
+  assert!(q.poll_transmit(|| t0, &mut buf).unwrap().is_some());
+
+  let confirm = q.note_transmit_outcome(
+    t0,
+    FamilyAttempt::Refused { permanent: true },
+    FamilyAttempt::NoSocket,
+  );
+  assert!(
+    confirm.retire_producer(),
+    "the one family this host has refused the question's SIZE, so re-asking it \
+     can never put it on a wire"
+  );
+  assert!(!confirm.any_delivered());
+  assert_eq!(
+    q.retry_count, 0,
+    "the confirm still spends the commit token without burning a §5.2 slot"
+  );
+}
+
+/// A round that merely failed retires nothing, and neither does a question a
+/// still-transient family may yet carry.
+#[test]
+fn a_transient_failure_never_retires_a_query() {
+  for (v4, v6) in [
+    (
+      FamilyAttempt::Refused { permanent: true },
+      FamilyAttempt::Refused { permanent: false },
+    ),
+    (
+      FamilyAttempt::Refused { permanent: true },
+      FamilyAttempt::WouldBlock,
+    ),
+    (
+      FamilyAttempt::Refused { permanent: true },
+      FamilyAttempt::GateShut,
+    ),
+    (FamilyAttempt::NoSocket, FamilyAttempt::NoSocket),
+  ] {
+    let mut q = make_query(ResourceType::A, ResourceClass::In);
+    let mut buf = [0u8; 512];
+    let t0 = StdInstant::now();
+    assert!(q.poll_transmit(|| t0, &mut buf).unwrap().is_some());
+    let confirm = q.note_transmit_outcome(t0, v4, v6);
+    assert!(
+      !confirm.retire_producer(),
+      "{} / {}: a family that may carry the same question later is waited for, \
+       and a host with no socket at all has refused nothing",
+      v4.as_str(),
+      v6.as_str()
+    );
+  }
 }

@@ -2,13 +2,13 @@
 
 use embassy_futures::select::select;
 use embassy_net::udp::UdpSocket;
-use embassy_time::{Instant, Timer};
+use embassy_time::Timer;
 use hick_smoltcp::Engine;
 use rand_core::Rng;
 
 use crate::{
   io::{DualUdp, wait_either_recv},
-  time::EmbassyInstant,
+  time::{EmbassyInstant, now},
 };
 
 /// Run the mDNS driver loop over a bound IPv4 and/or IPv6 embassy-net
@@ -53,9 +53,11 @@ pub async fn run<R: Rng>(
     defmt::debug!("hick-embassy: v6 hop-limit set to 255 (RFC 6762 §11)");
   }
   loop {
-    let now = EmbassyInstant(Instant::now());
     let deadline = {
       let mut io = DualUdp::new(v4.as_deref(), v6.as_deref());
+      // The CLOCK, not a reading of it: the pump anchors the pass to its own first
+      // read and re-reads after each §10.1 goodbye fan-out, so a long pass cannot
+      // pull the next goodbye onto the heels of the one it just queued.
       engine.pump(now, &mut io, scratch)
     };
     match deadline {

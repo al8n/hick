@@ -14,9 +14,9 @@ use core::{
 use hick_trace::*;
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
-  FamilyDelivery, QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate,
-  TransmitDelivery, WithdrawalSend, WithdrawalToken, WithdrawalTransmit,
-  query::Query as ProtoQuery, service::Service as ProtoSvc, transmit::Transmit,
+  FamilyAttempt, QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate,
+  TransmitConfirm, WithdrawalToken, WithdrawalTransmit, query::Query as ProtoQuery,
+  service::Service as ProtoSvc, transmit::Transmit,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -477,8 +477,8 @@ impl State {
     &mut self,
     token: WithdrawalToken,
     now: StdInstant,
-    v4: WithdrawalSend,
-    v6: WithdrawalSend,
+    v4: FamilyAttempt<StdInstant>,
+    v6: FamilyAttempt<StdInstant>,
   ) {
     self.endpoint.note_withdrawal_result(token, now, v4, v6);
   }
@@ -1003,11 +1003,15 @@ impl State {
   pub(crate) fn note_service_transmit_outcome(
     &mut self,
     h: ServiceHandle,
-    now: StdInstant,
-    delivery: TransmitDelivery,
-  ) {
-    if let Some(ctx) = self.services.get_mut(&h) {
-      ctx.proto.note_transmit_outcome(now, delivery);
+    fallback_at: StdInstant,
+    v4: FamilyAttempt<StdInstant>,
+    v6: FamilyAttempt<StdInstant>,
+  ) -> TransmitConfirm {
+    let Some(ctx) = self.services.get_mut(&h) else {
+      return TransmitConfirm::default();
+    };
+    let confirm = ctx.proto.note_transmit_outcome(fallback_at, v4, v6);
+    {
       // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
       // route so sibling host-address retention (during a same-host withdrawal)
       // honours what this service ACTUALLY announced, not its configured
@@ -1015,7 +1019,7 @@ impl State {
       // delivery — so a round that reached no wire has nothing to mirror.
       // Idempotent overwrite. `self.services` (via `ctx`) and `self.endpoint` are
       // disjoint fields, so this borrow split is sound.
-      if delivery.any_delivered() {
+      if confirm.any_delivered() {
         // The reclaim-cancel gate is the ALL-delivered announcement fact the CORE
         // computes, ferried verbatim. It is emphatically NOT
         // `advertises_instance()` — that latch fires on any delivery by any
@@ -1033,6 +1037,7 @@ impl State {
         );
       }
     }
+    confirm
   }
 
   /// Confirm a previously polled query transmit so the proto layer advances its
@@ -1044,10 +1049,13 @@ impl State {
   pub(crate) fn note_query_transmit_outcome(
     &mut self,
     h: QueryHandle,
-    now: StdInstant,
-    delivery: TransmitDelivery,
-  ) {
-    self.endpoint.note_query_transmit_outcome(h, now, delivery);
+    fallback_at: StdInstant,
+    v4: FamilyAttempt<StdInstant>,
+    v6: FamilyAttempt<StdInstant>,
+  ) -> TransmitConfirm {
+    self
+      .endpoint
+      .note_query_transmit_outcome(h, fallback_at, v4, v6)
   }
 
   /// This producer's per-family wire gate, copied out for a fan-out.
@@ -1498,7 +1506,7 @@ pub(crate) async fn run(
       // here, updated by whichever families accepted, written back with the
       // confirm. No borrow crosses the await.
       let mut gate = inner.state.borrow().wire_gate(origin);
-      let (fanout, accepted_at) = awaiting_fanout(
+      let fanout = awaiting_fanout(
         send_via(
           &inner,
           &sock_v4,
@@ -1512,26 +1520,64 @@ pub(crate) async fn run(
         "transmit",
       )
       .await;
-      // Confirm the pending transmit with the honest per-family shape of the
-      // fan-out. The core latches §10.1 goodbye ownership for whatever reached a
-      // wire and advances the §8.1 probe sequence / §8.3 announce phase / §5.2
-      // retry budget only once every obligated family carried it.
+      // Confirm the pending transmit with the honest per-family I/O facts. The
+      // core latches §10.1 goodbye ownership for whatever reached a wire and
+      // advances the §8.1 probe sequence / §8.3 announce phase / §5.2 retry budget
+      // only once every obligated family carried it.
       //
-      // Anchored at the EARLIEST family acceptance, which is the instant the core
-      // measures each delivered family's freshness from. Post-fan-out time would
-      // backdate every family by however long the slowest one took, pushing the
-      // healthy family's next refresh past its records' TTL. A round that reached
-      // no wire has no acceptance to anchor, and its re-arm is spaced from the
-      // attempt instead.
-      let delivery = fanout.delivery();
-      let at = accepted_at.unwrap_or_else(StdInstant::now);
-      {
+      // The instant handed over is only the FALLBACK for a round that reached no
+      // wire; the core anchors at the earliest family acceptance whenever one
+      // happened, so a healthy family's freshness is never backdated by however
+      // long the slowest one took.
+      let confirm = {
         let mut state = inner.state.borrow_mut();
         state.set_wire_gate(origin, gate);
+        let at = StdInstant::now();
         match origin {
-          TransmitOrigin::Service(h) => state.note_service_transmit_outcome(h, at, delivery),
-          TransmitOrigin::Query(h) => state.note_query_transmit_outcome(h, at, delivery),
+          TransmitOrigin::Service(h) => {
+            state.note_service_transmit_outcome(h, at, fanout.v4, fanout.v6)
+          }
+          TransmitOrigin::Query(h) => {
+            state.note_query_transmit_outcome(h, at, fanout.v4, fanout.v6)
+          }
         }
+      };
+      // The core weighed the refusals against this datagram's obligation and says
+      // the producer cannot make progress: no bound family can ever carry these
+      // bytes and the core will keep re-arming them, so the producer would
+      // probe/announce (or re-question) forever with nothing on any wire. Retire
+      // it on exactly the terms a persistent encode failure takes, and AFTER the
+      // confirm above — which has already spent the commit token and latched
+      // nothing, so the §10.1 goodbye is built from a settled service.
+      if confirm.retire_producer() {
+        let now = StdInstant::now();
+        let mut state = inner.state.borrow_mut();
+        match origin {
+          TransmitOrigin::Service(h) => {
+            warn!(
+              handle = ?h,
+              "no bound family can carry this service's datagram; retiring it with a Conflict"
+            );
+            if let Some(ctx) = state.services.get(&h) {
+              ctx
+                .mailbox
+                .borrow_mut()
+                .set_terminal(ServiceUpdate::Conflict);
+            }
+            state.begin_service_withdrawal(h, now);
+          }
+          TransmitOrigin::Query(h) => {
+            warn!(
+              handle = ?h,
+              "no bound family can carry this query's question; retiring it"
+            );
+            if let Some(ctx) = state.queries.get_mut(&h) {
+              ctx.errored = true;
+            }
+            state.endpoint.retire_query(h);
+          }
+        }
+        inner.notify.notify();
       }
     };
     // Exhausted the per-pass send budget — more transmits may be ready, so the
@@ -1767,106 +1813,90 @@ pub(crate) async fn run(
 }
 
 /// One address family's result for one logical transmit.
+/// Which address family a socket serves, and therefore which hard UDP payload
+/// ceiling applies to a datagram offered to it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FamilySend {
-  /// No socket bound for this family, or the datagram was not addressed to it.
-  /// It was therefore never OBLIGATED to carry this transmit, and its absence
-  /// must not read as a failure — a v4-only host is fully delivered on v4 alone.
-  Unbound,
-  /// A bound socket was NOT offered the datagram because the producer's previous
-  /// one is still inside [`Transmit::min_family_gap`] on THIS family's wire (see
-  /// [`FamilyWireGate`]). Obligated and did not carry it, exactly like
-  /// [`FamilySend::Failed`] — but a deliberate deferral, not an I/O error, so it
-  /// bumps no error counter.
-  Gated,
-  /// A bound socket accepted the datagram.
-  Sent,
-  /// A bound socket did not carry it, and the kernel said so. A completion-based
-  /// `send_to` removes `EWOULDBLOCK` and nothing else: `ENETUNREACH`/`EHOSTUNREACH`
-  /// when a family's route goes away, `ENOBUFS` under buffer pressure, `EPERM` from
-  /// a local firewall, `EADDRNOTAVAIL` when an interface loses its address,
-  /// `EMSGSIZE`. Each of those lands here on one family while the other returns
-  /// `Ok` in the very same fan-out.
-  ///
-  /// Every value of this enum is an OBSERVED fact. There is no "unknown" variant
-  /// because the fan-out never confirms without one: every submitted operation is
-  /// awaited to its true completion first.
-  Failed,
+pub(crate) enum Family {
+  V4,
+  V6,
 }
 
-impl FamilySend {
-  /// Classify a PRESENT (bound) family's `send_to` result. Never yields
-  /// [`FamilySend::Unbound`] — that is the caller's default for a family it has
-  /// no socket for.
-  fn from_bound_result<T>(res: &std::io::Result<T>) -> Self {
-    match res {
-      Ok(_) => Self::Sent,
-      Err(_) => Self::Failed,
+impl Family {
+  /// The family a destination selects.
+  const fn of(dst: SocketAddr) -> Self {
+    match dst {
+      SocketAddr::V4(_) => Self::V4,
+      SocketAddr::V6(_) => Self::V6,
     }
   }
 
-  /// Classify one completed attempt.
-  fn from_attempt(attempt: &SendAttempt) -> Self {
-    match attempt {
-      SendAttempt::Unbound => Self::Unbound,
-      SendAttempt::Gated => Self::Gated,
-      SendAttempt::Answered { result, .. } => Self::from_bound_result(result),
-    }
-  }
-
-  /// This family's I/O answer as the core's protocol vocabulary. The mapping is
-  /// one-to-one — no family is ever laundered into a different one.
-  ///
-  /// A GATED family is `Missed` and never `Unobligated`: its socket is there and
-  /// the datagram was fanned onto it, the driver simply owed the wire a gap it had
-  /// not yet paid. Reporting it absent would hide the deferral from the core and
-  /// let the phase advance without it.
-  const fn delivery(self) -> FamilyDelivery {
+  /// The largest UDP payload this family can EVER carry — the only sound proof
+  /// that a refused datagram can never be sent. See
+  /// [`mdns_proto::constants::MAX_UDP_PAYLOAD_V6`].
+  const fn max_udp_payload(self) -> usize {
     match self {
-      Self::Unbound => FamilyDelivery::Unobligated,
-      Self::Sent => FamilyDelivery::Delivered,
-      Self::Gated | Self::Failed => FamilyDelivery::Missed,
+      Self::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
+      Self::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
     }
   }
 }
 
-/// The per-family shape of one logical transmit's fan-out: the I/O answer, which
+/// Restate one family's completed attempt in the core's I/O-world vocabulary.
+///
+/// Every value produced here is an OBSERVED fact, and there is no "unknown"
+/// because the fan-out never confirms without one: every submitted operation is
+/// awaited to its true completion first. That is the completion-driver half of
+/// the readiness/completion asymmetry — [`FamilyAttempt::WouldBlock`] is simply
+/// VACUOUS here rather than forbidden, since compio's cancellation is documented
+/// as unreliable and abandoning a submitted send would end this driver's
+/// knowledge of a datagram rather than the datagram.
+///
+/// `body` is what decides `permanent`: a refusal proves the bytes did not go out,
+/// and only the SIZE against this family's hard UDP ceiling proves they never
+/// could. The errno is deliberately not consulted — `EMSGSIZE` is equally what a
+/// path-MTU refusal reports, and the next attempt may get past that. See
+/// [`FamilyAttempt::Refused`].
+fn attempt_of(family: Family, body: &[u8], attempt: &SendAttempt) -> FamilyAttempt<StdInstant> {
+  match attempt {
+    SendAttempt::Unbound => FamilyAttempt::NoSocket,
+    SendAttempt::Gated => FamilyAttempt::GateShut,
+    SendAttempt::Answered { result: Ok(_), .. } => match attempt.confirm_anchor() {
+      Some(at) => FamilyAttempt::Accepted { at },
+      // `confirm_anchor` is `Some` for every answered-Ok attempt; a `None` here
+      // would mean the stamp went missing, and claiming an acceptance without one
+      // would hand the core an anchor it never measured.
+      None => FamilyAttempt::Refused { permanent: false },
+    },
+    SendAttempt::Answered { result: Err(_), .. } => FamilyAttempt::Refused {
+      permanent: body.len() > family.max_udp_payload(),
+    },
+  }
+}
+
+/// The per-family shape of one logical transmit's fan-out: the I/O facts, which
 /// the core alone turns into a protocol answer.
+///
+/// Nothing is projected onto an aggregate here, and nothing is written off. WHICH
+/// family missed is what lets the core schedule the next announcement per link
+/// rather than per round, and a driver that folded it away would put the core back
+/// to refreshing alternating families at twice the periodic interval. Bounding how
+/// long the lifecycle waits for a family that keeps missing is the core's own
+/// patience, applied inside the confirm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Fanout {
-  pub(crate) v4: FamilySend,
-  pub(crate) v6: FamilySend,
+  pub(crate) v4: FamilyAttempt<StdInstant>,
+  pub(crate) v6: FamilyAttempt<StdInstant>,
 }
 
 impl Fanout {
-  /// Neither family attempted — the starting value, and the honest report for an
-  /// endpoint with no bound socket at all.
-  const UNBOUND: Self = Self {
-    v4: FamilySend::Unbound,
-    v6: FamilySend::Unbound,
+  /// Neither family was addressed — the starting value, overwritten per family
+  /// the datagram is actually offered to. A unicast destination leaves the other
+  /// family here, which is the honest fact about it: its socket may well be bound
+  /// and healthy, this datagram was simply not for it.
+  const NOT_ADDRESSED: Self = Self {
+    v4: FamilyAttempt::NotAddressed,
+    v6: FamilyAttempt::NotAddressed,
   };
-
-  /// Hand the fan-out to the core VERBATIM, one [`FamilyDelivery`] per family —
-  /// the honest, unexcused I/O facts.
-  ///
-  /// The obligated set is every family with a socket that this datagram was
-  /// offered to; `Unbound` means there is none, so that family was never
-  /// obligated and its absence must not read as a failure. Delivery is `Sent` and
-  /// nothing else — a `Failed` family did not carry the datagram, so the core must
-  /// not advance its §8.1 / §8.3 phase as if it had.
-  ///
-  /// Nothing is projected onto an aggregate here. WHICH family missed is what lets
-  /// the core schedule the next announcement per link rather than per round, and a
-  /// driver that folded it away would put the core back to refreshing alternating
-  /// families at twice the periodic interval.
-  ///
-  /// A family that keeps missing is never written off here, and this driver has
-  /// no other place that could: the confirm is the honest I/O facts and nothing
-  /// more. Bounding how long the lifecycle waits for it is the core's own
-  /// patience, applied inside [`TransmitDelivery`]'s confirm.
-  pub(crate) fn delivery(self) -> TransmitDelivery {
-    TransmitDelivery::new(self.v4.delivery(), self.v6.delivery())
-  }
 }
 
 /// How long a send fan-out may stay pending before the driver TRACES it.
@@ -1945,6 +1975,12 @@ impl SendDatagram for Socket {
 /// MINIMUM is protocol policy and arrives from the core on
 /// [`Transmit::min_family_gap`]; only the driver knows when each family last
 /// satisfied it, which is why the two halves live on opposite sides of the seam.
+///
+/// "Wire" throughout this driver names the KERNEL HANDOFF, the furthest point a
+/// socket transport can observe: this gate anchors at the instant the send
+/// COMPLETION returned, and success there means the kernel owns the datagram
+/// rather than that the NIC has put it on the link. See
+/// [`Transmit::min_family_gap`] for where each driver's boundary sits.
 ///
 /// It cannot be folded into the core's schedule because the confirm anchors at
 /// the EARLIEST acceptance across families. That anchor is the right one for the
@@ -2237,9 +2273,9 @@ async fn send_via<S: SendDatagram>(
   gate: &mut FamilyWireGate,
   min_gap: Duration,
   now: StdInstant,
-) -> (Fanout, Option<StdInstant>) {
+) -> Fanout {
   let n = body.len();
-  let mut fanout = Fanout::UNBOUND;
+  let mut fanout = Fanout::NOT_ADDRESSED;
   if is_mdns_multicast_dst(dst) {
     // Offer both families CONCURRENTLY. Serialising them made each family's
     // acceptance instant depend on how long the other one took, so a slow family
@@ -2259,8 +2295,8 @@ async fn send_via<S: SendDatagram>(
       ),
     )
     .await;
-    fanout.v4 = FamilySend::from_attempt(&a4);
-    fanout.v6 = FamilySend::from_attempt(&a6);
+    fanout.v4 = attempt_of(Family::V4, body, &a4);
+    fanout.v6 = attempt_of(Family::V6, body, &a6);
     // Each family's OWN COMPLETION instant re-opens ITS OWN gate one `min_gap`
     // later, and it is deliberately not the instant the confirm below anchors
     // at. Two distinctions, both load-bearing:
@@ -2277,16 +2313,12 @@ async fn send_via<S: SendDatagram>(
     if let Some(at) = a6.wire_time() {
       gate.record(FAMILY_V6, at, min_gap);
     }
-    let accepted_at = [a4.confirm_anchor(), a6.confirm_anchor()]
-      .into_iter()
-      .flatten()
-      .min();
     // The tracker is written after the join, in family order, so the two entries
     // a dual-stack fan-out needs are recorded exactly as the serial version
     // recorded them — and under no borrow held across an await.
     note_multicast_attempt(inner, &a4, body, MDNS_V4_DST, "transmit");
     note_multicast_attempt(inner, &a6, body, MDNS_V6_DST, "transmit");
-    return (fanout, accepted_at);
+    return fanout;
   }
 
   // Unicast: pick the socket matching the destination family. Exactly one family
@@ -2305,7 +2337,7 @@ async fn send_via<S: SendDatagram>(
   // the NEW entry — so a legacy-query flood would starve the genuine multicast
   // credits that suppression actually depends on.
   let attempt = attempt_send_to(sock, gate.open(idx, now, min_gap), body, dst).await;
-  let outcome = FamilySend::from_attempt(&attempt);
+  let outcome = attempt_of(Family::of(dst), body, &attempt);
   match dst {
     SocketAddr::V4(_) => fanout.v4 = outcome,
     SocketAddr::V6(_) => fanout.v6 = outcome,
@@ -2316,7 +2348,6 @@ async fn send_via<S: SendDatagram>(
   if let Some(at) = attempt.wire_time() {
     gate.record(idx, at, min_gap);
   }
-  let accepted_at = attempt.confirm_anchor();
   match &attempt {
     // In tree every unicast datagram is a §6.7 legacy reply, which is one-shot
     // and therefore ungated — `Gated` is unreachable here today and is listed
@@ -2339,7 +2370,7 @@ async fn send_via<S: SendDatagram>(
       inner.state.borrow().stats.send_errors(1);
     }
   }
-  (fanout, accepted_at)
+  fanout
 }
 
 /// The wall clock ONE driver pass may spend inside send fan-outs, across the
@@ -2400,26 +2431,6 @@ impl DrainBudget {
   fn charge(&mut self) {
     self.credits = self.credits.saturating_sub(1);
     self.started = true;
-  }
-}
-
-/// Map a PRESENT (bound) family's `send_to` result to its per-family withdrawal
-/// outcome: `Ok` → [`WithdrawalSend::Sent`] (spend one owed round); ANY
-/// `Err` → [`WithdrawalSend::Retry`] (keep the debt, retry until success or the
-/// 2 s ceiling).
-///
-/// The classification is deliberately NOT by `io::ErrorKind`: a BOUND UDP socket
-/// can fail transiently with a kind other than `WouldBlock`/`Interrupted` (e.g.
-/// `ENOBUFS` buffer pressure, transient route/interface churn). Writing such a
-/// family off would zero its goodbye debt and free the route as soon as the OTHER
-/// family drained, leaving this family's peers pinned to stale positive-TTL
-/// records. [`WithdrawalSend::WriteOff`] is reserved for an ABSENT socket (handled
-/// by the caller, which only invokes this for a present one); the ceiling is the
-/// backstop for a genuinely-wedged bound socket.
-fn present_socket_send_outcome<T>(res: &std::io::Result<T>) -> WithdrawalSend {
-  match res {
-    Ok(_) => WithdrawalSend::Sent,
-    Err(_) => WithdrawalSend::Retry,
   }
 }
 
@@ -2528,26 +2539,37 @@ async fn drain_withdrawals(
       "withdrawal",
     )
     .await;
-    let outcome = |attempt: &SendAttempt| match attempt {
-      SendAttempt::Unbound => WithdrawalSend::WriteOff,
-      SendAttempt::Answered { result, .. } => present_socket_send_outcome(result),
-      // Withheld because this family has already paid every round it owed. No
-      // syscall was made and nothing was observed, so keep its (already-zero)
-      // debt rather than claiming a send or writing it off.
-      SendAttempt::Gated => WithdrawalSend::Retry,
-    };
-    let (v4_out, v6_out) = (outcome(&a4), outcome(&a6));
+    // The SAME restatement a positive-TTL fan-out makes: what a socket did means
+    // the same thing whatever the datagram was for. What each fact then does to
+    // this family's §10.1 debt is the endpoint's table and no part of this crate —
+    // only an absent socket writes a debt off. A family withheld because it has
+    // already paid every round it owed reports `Gated`, and the endpoint discards
+    // any report for a family whose debt was already zero.
+    let (v4_out, v6_out) = (
+      attempt_of(Family::V4, &scratch[..len], &a4),
+      attempt_of(Family::V6, &scratch[..len], &a6),
+    );
     note_multicast_attempt(inner, &a4, &scratch[..len], MDNS_V4_DST, "withdrawal");
     note_multicast_attempt(inner, &a6, &scratch[..len], MDNS_V6_DST, "withdrawal");
     // Count the goodbye as a delivered round when at least one family Sent;
     // `send_to` already bumped packets_tx/bytes_tx/send_errors per family above.
     #[cfg(feature = "stats")]
-    if matches!(v4_out, WithdrawalSend::Sent) || matches!(v6_out, WithdrawalSend::Sent) {
+    if matches!(v4_out, FamilyAttempt::Accepted { .. })
+      || matches!(v6_out, FamilyAttempt::Accepted { .. })
+    {
       inner.state.borrow().stats.goodbyes_tx(1);
     }
     // The endpoint spends a resend per Sent family + re-arms at WITHDRAWAL_INTERVAL
     // on a round with progress; a no-send round re-arms at the short backoff with
     // the family's budget intact (busy → Retry) or written off (permanent error).
+    //
+    // The instant is read HERE, after the awaited fan-out, and is never the one
+    // this iteration polled with. What it re-arms is the §10.1 resend SCHEDULE — a
+    // spacing bound on a wire, and the only thing pacing consecutive goodbyes,
+    // since this fan-out is deliberately ungated. An anchor read before the
+    // fan-out charges the next round everything this one spent waiting on the
+    // kernel, and a round that lands near the interval leaves the next one already
+    // due as it lands, collapsing §10.1's three sends into near-adjacent ones.
     {
       let now = StdInstant::now();
       inner

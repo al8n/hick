@@ -25,10 +25,11 @@ pub struct RecvMeta {
 pub enum SendError {
   /// A socket for this family EXISTS but did not take the datagram this time, for
   /// a reason that may clear: a momentarily-full transmit queue, a socket not yet
-  /// bound, or no route yet. The engine keeps the family in the obligated set —
-  /// so a fan-out where the other family succeeded projects to
-  /// a partial [`TransmitDelivery`](mdns_proto::TransmitDelivery),
-  /// not `AllDelivered` — and retries on the next pump.
+  /// bound, or no route yet. The engine reports it
+  /// [`FamilyAttempt::Refused`](mdns_proto::FamilyAttempt::Refused) with
+  /// `permanent: false`, so the core keeps the family obligated — a fan-out where
+  /// the other family succeeded is PARTIAL, not fully delivered — and retries it
+  /// on the next pump.
   Busy,
   /// No socket for this datagram's address family — it will never be queued on
   /// this transport (e.g. an IPv6 group on a v4-only stack). The engine treats
@@ -59,5 +60,22 @@ pub trait UdpIo {
   /// Enqueue one datagram for `dst`. Non-blocking; returns [`SendError::Busy`]
   /// when a socket for the family exists but did not take the datagram, or
   /// [`SendError::Unsupported`] when there is no socket for that family at all.
+  ///
+  /// # `Ok` means QUEUED, and the engine's spacing is measured from here
+  ///
+  /// Both transports behind this trait queue: smoltcp's `udp::Socket::send_slice`
+  /// hands the datagram to a socket buffer that the caller's `Interface::poll`
+  /// drains onto the device afterwards, and embassy-net's network task does the
+  /// same. So the RFC 6762 spacing the engine enforces per family — §8.1 probes,
+  /// §6 / §8.3 announcements, §5.2 query retransmissions, §10.1 goodbyes — is
+  /// measured from THIS call and not from the device.
+  ///
+  /// Poll the interface promptly and the two coincide. Let it stall for longer
+  /// than one of those floors and the engine, seeing only acceptances, can queue
+  /// the next datagram while the previous one is still waiting; a single poll then
+  /// puts both on the device back-to-back, inside the interval the RFC gives one
+  /// interface. Bounding the device rather than the queue would take a per-family
+  /// egress acknowledgement, which this seam deliberately does not have — an
+  /// implementor owes only the honest `Ok`.
   fn try_send(&mut self, buf: &[u8], dst: SocketAddr) -> Result<(), SendError>;
 }

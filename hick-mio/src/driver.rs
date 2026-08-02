@@ -165,7 +165,7 @@
 use std::time::{Duration, Instant as StdInstant};
 
 use mdns_proto::{
-  QueryHandle, ServiceHandle, ServiceUpdate, TransmitDelivery, TransmitObligation,
+  FamilyAttempt, QueryHandle, ServiceHandle, ServiceUpdate, TransmitConfirm, TransmitObligation,
   event::RouteEvent,
 };
 
@@ -930,11 +930,6 @@ impl Mdns {
               None => break false,
             };
             let len = tx.size().min(send_buf.len());
-            // Read from the transmit BEFORE the send, because the send is what
-            // consumes it: `tx` borrows nothing, but the confirm below spends
-            // the commit token it belongs to, and after that this datagram is
-            // no longer a thing the core is offering.
-            let obligation = tx.obligation();
             // The gate is copied out and written back rather than borrowed
             // across the send, so `services` stays free for the confirm below.
             let mut gate = services
@@ -952,57 +947,40 @@ impl Mdns {
             );
             // Confirmed here, before anything else can touch this service:
             // the core holds a commit token from the `poll_transmit` above and
-            // every other entry point is forbidden until it is spent. Anchored
-            // at the EARLIEST family acceptance, which is the instant the core
-            // anchors each delivered family's refresh at; a round that reached
-            // no wire has no acceptance and is spaced from the attempt instead.
-            let at = summary.accepted_at.unwrap_or_else(StdInstant::now);
+            // every other entry point is forbidden until it is spent. The
+            // fallback instant is only reached when NO family accepted; the core
+            // anchors at the earliest acceptance whenever one did.
+            let [v4, v6] = summary.attempts;
             if let Some(ctx) = services.get_mut(&handle) {
               ctx.wire_gate = gate;
             }
-            confirm_service(endpoint, services, handle, at, summary.delivery);
+            let confirm = confirm_service(endpoint, services, handle, StdInstant::now(), v4, v6);
             spent = spent.saturating_add(datagram_cost(summary.sent));
-            // Every reachable socket refused these bytes as too large, so the
-            // datagram is not late — it is impossible. What that costs depends
-            // entirely on whether the core will offer it again.
-            if summary.undeliverable {
-              match obligation {
-                // Sustained: a probe or an §8.3 announcement, re-armed until
-                // every obligated link accepts it. Nothing ever will, so the
-                // service would probe or announce forever with nothing on any
-                // wire and never reach `Established` — and no patience bound
-                // helps, because the core's own excuses a MISSING family, not a
-                // round that can never succeed on any of them. Retire it so the
-                // caller sees an actionable terminal instead of a silent stall.
-                //
-                // AFTER the confirm above, never instead of it: the core holds a
-                // commit token from this `poll_transmit`, the honest all-missed
-                // confirm is what spends it and latches nothing, and stage 7
-                // builds the §10.1 goodbye from what a confirm has latched. A
-                // retirement under a live token would build it from a service
-                // the core still considers mid-datagram.
-                TransmitObligation::Sustained => {
-                  hick_trace::warn!(
-                    handle = ?handle,
-                    len,
-                    "no bound family can carry this service's datagram; retiring it with a Conflict"
-                  );
-                  retire_service(services, events, handle);
-                  // Nothing left for this slot: every later stage skips a
-                  // withdrawing service, so the datagram is abandoned with the
-                  // producer and no zero timeout could come back for it. Same
-                  // exit the terminal encode failure below takes, for the same
-                  // reason.
-                  break false;
-                }
-                // One-shot: a §6 / §6.7 / RFC 6763 §9 reply, never re-armed. It
-                // costs exactly one unanswered question — the querier re-asks —
-                // and the confirm above has already resolved it as the miss it
-                // was. Retiring here would let any peer tear down a healthy
-                // established service by asking it a question whose answer does
-                // not fit.
-                TransmitObligation::OneShot => {}
-              }
+            // The core weighed the refusals against this datagram's obligation
+            // and says the producer cannot make progress: a probe or an §8.3
+            // announcement no bound family can ever carry would otherwise be
+            // re-armed forever, with nothing on any wire and `Established` never
+            // reached. Retire it so the caller sees an actionable terminal
+            // instead of a silent stall.
+            //
+            // AFTER the confirm above, never instead of it: the core holds a
+            // commit token from this `poll_transmit`, the honest all-missed
+            // confirm is what spends it and latches nothing, and stage 7 builds
+            // the §10.1 goodbye from what a confirm has latched. A retirement
+            // under a live token would build it from a service the core still
+            // considers mid-datagram.
+            if confirm.retire_producer() {
+              hick_trace::warn!(
+                handle = ?handle,
+                len,
+                "no bound family can carry this service's datagram; retiring it with a Conflict"
+              );
+              retire_service(services, events, handle);
+              // Nothing left for this slot: every later stage skips a
+              // withdrawing service, so the datagram is abandoned with the
+              // producer and no zero timeout could come back for it. Same exit
+              // the terminal encode failure below takes, for the same reason.
+              break false;
             }
           };
           if hit_encode_error
@@ -1120,15 +1098,15 @@ impl Mdns {
             // handle, which is what the core's contract requires. The retry
             // backoff is anchored at the question's own acceptance so the
             // response window a peer is given runs from when it was asked.
-            let at = summary.accepted_at.unwrap_or_else(StdInstant::now);
-            endpoint.note_query_transmit_outcome(handle, at, summary.delivery);
+            let [v4, v6] = summary.attempts;
+            let confirm = endpoint.note_query_transmit_outcome(handle, StdInstant::now(), v4, v6);
             spent = spent.saturating_add(datagram_cost(summary.sent));
             // No bound family can carry the question, and the §5.2 budget is
             // spent only on an all-delivered send — so this query would re-ask
             // forever without ever reaching its own retry ceiling. Retire it, on
             // the same terms the un-encodable question above uses, and after the
             // confirm for the same reason the service arm gives.
-            if summary.undeliverable && obligation == TransmitObligation::Sustained {
+            if confirm.retire_producer() {
               hick_trace::warn!(
                 handle = ?handle,
                 len,
@@ -1424,20 +1402,22 @@ fn confirm_service(
   endpoint: &mut crate::proto::ProtoEndpoint,
   services: &mut std::collections::HashMap<ServiceHandle, crate::endpoint::ServiceCtx>,
   handle: ServiceHandle,
-  at: StdInstant,
-  delivery: TransmitDelivery,
-) {
+  fallback_at: StdInstant,
+  v4: FamilyAttempt<StdInstant>,
+  v6: FamilyAttempt<StdInstant>,
+) -> TransmitConfirm {
   let Some(ctx) = services.get_mut(&handle) else {
-    return;
+    return TransmitConfirm::default();
   };
-  ctx.proto.note_transmit_outcome(at, delivery);
-  if delivery.any_delivered() {
+  let confirm = ctx.proto.note_transmit_outcome(fallback_at, v4, v6);
+  if confirm.any_delivered() {
     endpoint.note_service_announced(
       ctx.proto.has_fully_announced(),
       ctx.proto.advertised_a_addrs(),
       ctx.proto.advertised_aaaa_addrs(),
     );
   }
+  confirm
 }
 
 /// One participant in [`Mdns::drain_transmits`]'s round-robin: a registered

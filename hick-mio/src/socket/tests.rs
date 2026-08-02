@@ -899,91 +899,6 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
   }
 }
 
-/// The permanent-undeliverability aggregate, over every per-family shape a
-/// fan-out can have.
-///
-/// Pure arithmetic over [`SendReport`], so it is pinned identically on a host
-/// with no IPv6 socket and on one with two working families. The two directions
-/// it can be wrong in cost very different things — a `true` here retires a live
-/// registration, a `false` leaves it retrying a datagram forever — so the whole
-/// 5x5 matrix is enumerated rather than sampled.
-#[test]
-fn undeliverable_is_every_reachable_family_refusing_the_size_and_nothing_less() {
-  let mono = std::time::Instant::now();
-  let sent = sent_at(SystemTime::UNIX_EPOCH, mono);
-  let all = [
-    sent,
-    SendOutcome::Gated,
-    SendOutcome::Failed,
-    SendOutcome::TooLarge,
-    SendOutcome::NoSocket,
-  ];
-  for v4 in all {
-    for v6 in all {
-      let report = SendReport {
-        v4,
-        v6,
-        loops_back: true,
-      };
-      // Stated independently of the implementation: SOME family called the
-      // datagram too large, and every family that was not absent said the same.
-      let reachable = [v4, v6]
-        .into_iter()
-        .filter(|o| !matches!(o, SendOutcome::NoSocket));
-      let want = reachable
-        .clone()
-        .any(|o| matches!(o, SendOutcome::TooLarge))
-        && reachable.count()
-          == [v4, v6]
-            .into_iter()
-            .filter(|o| matches!(o, SendOutcome::TooLarge))
-            .count();
-      assert_eq!(
-        report.undeliverable(),
-        want,
-        "v4={v4:?} v6={v6:?}: a datagram is permanently undeliverable only when \
-         every family with a socket refused its SIZE"
-      );
-    }
-  }
-
-  // The four rows worth naming, so a future edit that flips one fails against a
-  // sentence rather than against a loop.
-  let case = |v4, v6| {
-    SendReport {
-      v4,
-      v6,
-      loops_back: true,
-    }
-    .undeliverable()
-  };
-  assert!(
-    case(SendOutcome::TooLarge, SendOutcome::TooLarge),
-    "both families refused the size: nothing can ever carry it"
-  );
-  assert!(
-    case(SendOutcome::TooLarge, SendOutcome::NoSocket),
-    "a family with no socket is not evidence to the contrary — the one family \
-     this host HAS refused it"
-  );
-  assert!(
-    !case(SendOutcome::TooLarge, SendOutcome::Failed),
-    "the other family may clear, so the round is mixed and must be waited for"
-  );
-  assert!(
-    !case(SendOutcome::TooLarge, SendOutcome::Gated),
-    "a gated family carries the SAME datagram on its next round"
-  );
-  assert!(
-    !case(SendOutcome::TooLarge, sent),
-    "one family put it on a wire, so it is manifestly deliverable"
-  );
-  assert!(
-    !case(SendOutcome::NoSocket, SendOutcome::NoSocket),
-    "no socket anywhere is an empty obligated set, not a refusal"
-  );
-}
-
 #[test]
 fn a_multicast_send_reports_one_outcome_per_bound_family() {
   let Some(mut socks) = loopback_sockets(ServerOptions::default()) else {
@@ -1269,15 +1184,6 @@ fn an_emsgsize_below_the_hard_limit_is_transient_and_retried() {
     "an oversized-datagram errno on a datagram that is not oversized proves \
      nothing about the datagram, and reading it as permanent retires a service \
      whose next attempt would have succeeded: {outcome:?}"
-  );
-  assert!(
-    !SendReport {
-      v4: outcome,
-      v6: SendOutcome::NoSocket,
-      loops_back: true,
-    }
-    .undeliverable(),
-    "and the aggregate the driver retires on must not see it either"
   );
   // Which is what "transient" means: the same bytes on the same socket once the
   // condition clears.

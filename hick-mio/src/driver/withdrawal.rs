@@ -13,11 +13,10 @@
 //! **Per-family goodbye debt.** A withdrawal is not "sent" until *every bound*
 //! family has retracted its records, so the fan-out reports each family's
 //! outcome separately and the endpoint tracks a debt per family. The endpoint
-//! also says which families a given round is FOR — see [`Debt`] — and the
-//! mapping from a socket result back to that debt is by socket **presence**,
-//! never by error kind — see [`withdrawal_outcome`], which is where a defect
-//! would cost a route freed while a bound family's peers still hold stale
-//! positive-TTL records.
+//! also says which families a given round is FOR — see [`Debt`] — and it owns the
+//! mapping from a socket result back to that debt, which is where a defect would
+//! cost a route freed while a bound family's peers still hold stale positive-TTL
+//! records. This stage reports the I/O facts and reads nothing into them.
 //!
 //! **The context GC.** Every other stage skips a retired service; this is the
 //! one that finally drops it, and only once the endpoint reports its withdrawal
@@ -34,7 +33,7 @@
 
 use std::{net::SocketAddr, time::Instant as StdInstant};
 
-use mdns_proto::endpoint::{FamilyDebt, WithdrawalSend};
+use mdns_proto::{FamilyAttempt, endpoint::FamilyDebt};
 
 use crate::{
   driver::sends::SendHealth,
@@ -222,7 +221,15 @@ impl Mdns {
           scratch = send_buf.len(),
           "a withdrawal encoded more bytes than the scratch holds; dropping the round"
         );
-        endpoint.note_withdrawal_result(token, now, WithdrawalSend::Retry, WithdrawalSend::Retry);
+        // No socket was reached, so neither family refused anything: the honest
+        // report is that this driver's own gate withheld both. The endpoint keeps
+        // both debts and re-arms on the short backoff.
+        endpoint.note_withdrawal_result(
+          token,
+          now,
+          FamilyAttempt::GateShut,
+          FamilyAttempt::GateShut,
+        );
         continue;
       }
       // The anchor comes back from the fan-out that measured it — the second
@@ -243,7 +250,9 @@ impl Mdns {
       // `hick-reactor/src/driver/mod.rs:1140-1157`, whose comment is explicit
       // that only this counter is added at the round level.
       #[cfg(feature = "stats")]
-      if matches!(v4, WithdrawalSend::Sent) || matches!(v6, WithdrawalSend::Sent) {
+      if matches!(v4, FamilyAttempt::Accepted { .. })
+        || matches!(v6, FamilyAttempt::Accepted { .. })
+      {
         stats.goodbyes_tx(1);
       }
       endpoint.note_withdrawal_result(token, fanned_out_at, v4, v6);
@@ -291,8 +300,8 @@ impl Mdns {
 /// is re-arming on its 20 ms backoff, it is dozens of them.
 ///
 /// The mask is one-sided by construction. A family it withholds reports
-/// [`SendOutcome::Gated`] and so [`WithdrawalSend::Retry`], which leaves its debt
-/// untouched and its next round scheduled — it can lose a round, never a debt —
+/// [`SendOutcome::Gated`], and the core discards any report for a family whose
+/// debt was already zero — so a withheld family can lose a round, never a debt —
 /// while a family it admits costs at most one extra datagram.
 ///
 /// The family health table is updated exactly as it is for a transmit: a bound
@@ -338,7 +347,11 @@ pub(super) fn send_withdrawal(
   health: &mut SendHealth,
   body: &[u8],
   admission: &impl FamilyAdmission,
-) -> (WithdrawalSend, WithdrawalSend, StdInstant) {
+) -> (
+  FamilyAttempt<StdInstant>,
+  FamilyAttempt<StdInstant>,
+  StdInstant,
+) {
   let v4 = sockets.send_one(Family::V4, body, MDNS_V4_DST, admission);
   let v6 = sockets.send_one(Family::V6, body, MDNS_V6_DST, admission);
   // The round's own anchor, returned rather than re-read by the caller, and read
@@ -367,51 +380,29 @@ pub(super) fn send_withdrawal(
     }
   }
   health.note_fanout(report);
-  (
-    withdrawal_outcome(v4),
-    withdrawal_outcome(v6),
-    fanned_out_at,
-  )
+  (attempt(v4), attempt(v6), fanned_out_at)
 }
 
-/// Map one family's send to its goodbye debt, **by socket presence, not by
-/// error kind**.
+/// Restate one family's goodbye send in the core's I/O-world vocabulary — the
+/// same mapping [`summarize`](super::sends) makes for a positive-TTL transmit,
+/// and deliberately the same one: a socket outcome means the same thing whatever
+/// the datagram was for.
 ///
-/// | [`SendOutcome`] | [`WithdrawalSend`] | why |
-/// |---|---|---|
-/// | `Sent` | `Sent` | on the wire; spend one owed round |
-/// | `Failed` | `Retry` | a bound socket did not carry it; the 2 s ceiling is the backstop |
-/// | `TooLarge` | `Retry` | same: a bound socket did not carry it, and the same ceiling bounds it |
-/// | `Gated` | `Retry` | the core's debt withheld it (see [`Debt`]); a deferral is not a write-off |
-/// | `NoSocket` | `WriteOff` | nothing bound, so no peers on this family to retract from |
+/// What each fact then does to that family's §10.1 debt is the endpoint's table,
+/// not this crate's. This stage used to hold a copy of it, and the copy is what
+/// let two drivers disagree about whether a permanently-oversized goodbye writes
+/// its debt off. It does not: only an absent socket does, and the endpoint is now
+/// the only place that says so.
 ///
-/// The `Failed` row is the one worth defending, and it now covers backpressure
-/// as well as a hard error: a `WouldBlock` send put nothing on this family's
-/// wire, so the debt is unchanged and the next scheduled round is what pays it.
-/// Writing the family off instead would zero its debt, so the withdrawal would
-/// complete and free the route as soon as the *other* family drained, leaving
-/// this family's peers pinned to stale positive-TTL records for the rest of the
-/// record's TTL. Keeping the debt costs at most the 2 s ceiling.
-///
-/// [`SendOutcome::TooLarge`] joins that row rather than the write-off one, and
-/// the asymmetry with stage 4 is deliberate. There, an undeliverable datagram
-/// retires a producer that would otherwise re-arm it forever, because the
-/// producer is what is unbounded. Here nothing is: the item's own 2 s anti-pin
-/// ceiling force-completes it whatever the family answers, so the ONLY thing a
-/// write-off could buy is finishing marginally sooner — at the price of the
-/// exact defect this table exists to prevent, a route freed while a bound family
-/// still owes its goodbye. The direction stays one-sided: **only an absent
-/// socket writes a debt off.**
-///
-/// And [`SendOutcome::NoSocket`] exists as its own variant precisely so that row
-/// can differ from the failing ones. Conflating them in either direction breaks
-/// something: as `Retry`, an unbound family's debt would pin every withdrawal to
-/// its full ceiling on a single-stack host; as `WriteOff`, a bound family's
-/// transient failure would free the route while it still owed its goodbye.
-const fn withdrawal_outcome(outcome: SendOutcome) -> WithdrawalSend {
+/// A family the core's [`Debt`] mask withheld reports [`SendOutcome::Gated`]; the
+/// endpoint discards any report for a family whose debt was already zero, so
+/// what this maps it to cannot cost a debt either way.
+const fn attempt(outcome: SendOutcome) -> FamilyAttempt<StdInstant> {
   match outcome {
-    SendOutcome::Sent { .. } => WithdrawalSend::Sent,
-    SendOutcome::Gated | SendOutcome::Failed | SendOutcome::TooLarge => WithdrawalSend::Retry,
-    SendOutcome::NoSocket => WithdrawalSend::WriteOff,
+    SendOutcome::Sent { submitted_at, .. } => FamilyAttempt::Accepted { at: submitted_at },
+    SendOutcome::Gated => FamilyAttempt::GateShut,
+    SendOutcome::Failed => FamilyAttempt::Refused { permanent: false },
+    SendOutcome::TooLarge => FamilyAttempt::Refused { permanent: true },
+    SendOutcome::NoSocket => FamilyAttempt::NoSocket,
   }
 }

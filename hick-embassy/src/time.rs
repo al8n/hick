@@ -28,6 +28,23 @@ impl From<EmbassyInstant> for RawInstant {
   }
 }
 
+/// Read the `embassy-time` clock as an [`mdns_proto::Instant`].
+///
+/// This is the function both entry points hand to `Engine::pump` AS the clock —
+/// not a value sampled ahead of the call. The pump reads it once for the pass and
+/// again after each RFC 6762 §10.1 goodbye fan-out, so the goodbye resend spacing
+/// is measured from when the socket ACCEPTED the datagram rather than from when
+/// the loop iteration started; a pre-sampled instant would charge the pass's own
+/// work to the next goodbye.
+///
+/// Acceptance is where the measurement stops: embassy-net queues the datagram and
+/// its network task puts it on the device afterwards, so the spacing this buys is
+/// between enqueues (`hick_smoltcp::UdpIo::try_send` says what that does and does
+/// not bound).
+pub(crate) fn now() -> EmbassyInstant {
+  EmbassyInstant(RawInstant::now())
+}
+
 impl ProtoInstant for EmbassyInstant {
   #[inline]
   fn checked_add_duration(self, dur: Duration) -> Option<Self> {

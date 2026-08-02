@@ -21,23 +21,36 @@ async fn local_notify_wakes_a_listener() {
   assert!(woken.get(), "listener woken by notify()");
 }
 
-/// regression: a PRESENT (bound) family's `send_to` failure
-/// must map to `Retry` (keep the debt, retry until the 2 s ceiling), NOT
-/// `WriteOff`. A bound UDP socket can return transient errors whose kind is
-/// NOT `WouldBlock`/`Interrupted` (e.g. `ENOBUFS`, route/interface churn);
-/// writing that family off would free the route once the OTHER family drained
-/// and strand this family's peers on stale positive-TTL records. `WriteOff` is
-/// reserved for an ABSENT socket (the caller's `let mut … = WriteOff` default),
-/// never produced by this present-socket classifier.
+/// regression: a PRESENT (bound) family's `send_to` failure must be reported
+/// [`FamilyAttempt::Refused`], NEVER [`FamilyAttempt::NoSocket`] — the fact an
+/// ABSENT family reports, and the only one that lets the core's withdrawal
+/// table write a debt off. A bound UDP socket can return transient errors whose
+/// kind is NOT `WouldBlock`/`Interrupted` (e.g. `ENOBUFS`, route/interface
+/// churn); laundering those into `NoSocket` would free the route once the OTHER
+/// family drained and strand this family's peers on stale positive-TTL records.
+/// `permanent` is decided by the datagram's size against this family's UDP
+/// ceiling and never by the error kind — see `attempt_of`.
 #[test]
-fn present_socket_send_error_is_retry_not_writeoff() {
-  // Ok → Sent.
+fn present_socket_send_error_is_refused_not_no_socket() {
+  let body = *b"present-socket-probe";
+  let now = StdInstant::now();
+
+  // Ok → Accepted.
   assert_eq!(
-    present_socket_send_outcome::<usize>(&Ok(42)),
-    WithdrawalSend::Sent,
+    attempt_of(
+      Family::V4,
+      &body,
+      &SendAttempt::Answered {
+        result: Ok(body.len()),
+        submitted_wall: SystemTime::now(),
+        submitted_at: now,
+        completed_at: now,
+      },
+    ),
+    FamilyAttempt::Accepted { at: now },
   );
   // Every non-WouldBlock/Interrupted error kind a bound socket might surface
-  // must still be Retry (NEVER WriteOff).
+  // must still be `Refused { permanent: false }` (NEVER `NoSocket`).
   for kind in [
     std::io::ErrorKind::WouldBlock,
     std::io::ErrorKind::Interrupted,
@@ -48,9 +61,18 @@ fn present_socket_send_error_is_retry_not_writeoff() {
   ] {
     let res: std::io::Result<usize> = Err(std::io::Error::from(kind));
     assert_eq!(
-      present_socket_send_outcome(&res),
-      WithdrawalSend::Retry,
-      "a present (bound) socket error ({kind:?}) must be Retry, not WriteOff"
+      attempt_of(
+        Family::V4,
+        &body,
+        &SendAttempt::Answered {
+          result: res,
+          submitted_wall: SystemTime::now(),
+          submitted_at: StdInstant::now(),
+          completed_at: StdInstant::now(),
+        },
+      ),
+      FamilyAttempt::Refused { permanent: false },
+      "a present (bound) socket error ({kind:?}) must be Refused, not NoSocket"
     );
   }
 }
@@ -327,12 +349,10 @@ fn establish_service(
     let ctx = s.services.get_mut(&handle).unwrap();
     let _ = ctx.proto.handle_timeout(t);
     while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-      ctx.proto.note_transmit_outcome(
+      let _ = ctx.proto.note_transmit_outcome(
         t,
-        mdns_proto::TransmitDelivery::new(
-          mdns_proto::FamilyDelivery::Delivered,
-          mdns_proto::FamilyDelivery::Delivered,
-        ),
+        FamilyAttempt::Accepted { at: t },
+        FamilyAttempt::Accepted { at: t },
       );
     }
   }
@@ -404,8 +424,8 @@ fn begin_service_withdrawal_holds_name_then_frees_on_completion() {
       s.note_withdrawal_result(
         round.token(),
         t,
-        WithdrawalSend::Retry,
-        WithdrawalSend::Retry,
+        FamilyAttempt::Refused { permanent: false },
+        FamilyAttempt::Refused { permanent: false },
       );
     }
     s.drain_completed_withdrawals(t);
@@ -778,8 +798,8 @@ fn same_name_replacement_is_rejected_until_withdrawal_completes() {
       s.note_withdrawal_result(
         round.token(),
         t,
-        WithdrawalSend::Retry,
-        WithdrawalSend::Retry,
+        FamilyAttempt::Refused { permanent: false },
+        FamilyAttempt::Refused { permanent: false },
       );
     }
     s.drain_completed_withdrawals(t);
@@ -1167,13 +1187,11 @@ fn multi_service_encode_failure_frees_route_even_with_sibling_transmit() {
         "any returned transmit must be from B, never from A (A's records won't encode)"
       );
       // Confirm B's delivery so B advances its probe/announce lifecycle.
-      s.note_service_transmit_outcome(
+      let _ = s.note_service_transmit_outcome(
         h,
         t,
-        mdns_proto::TransmitDelivery::new(
-          mdns_proto::FamilyDelivery::Delivered,
-          mdns_proto::FamilyDelivery::Delivered,
-        ),
+        FamilyAttempt::Accepted { at: t },
+        FamilyAttempt::Accepted { at: t },
       );
     }
 
@@ -1338,13 +1356,11 @@ fn rename_collision_with_local_service_frees_proto_route() {
     loop {
       match s.poll_one_transmit(t, buf) {
         Some((_tx, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(
+          let _ = s.note_service_transmit_outcome(
             h,
             t,
-            mdns_proto::TransmitDelivery::new(
-              mdns_proto::FamilyDelivery::Delivered,
-              mdns_proto::FamilyDelivery::Delivered,
-            ),
+            FamilyAttempt::Accepted { at: t },
+            FamilyAttempt::Accepted { at: t },
           );
         }
         Some(_) => {}
@@ -1443,8 +1459,8 @@ fn rename_collision_with_local_service_frees_proto_route() {
       s.note_withdrawal_result(
         round.token(),
         t,
-        WithdrawalSend::Retry,
-        WithdrawalSend::Retry,
+        FamilyAttempt::Refused { permanent: false },
+        FamilyAttempt::Refused { permanent: false },
       );
     }
     s.drain_completed_withdrawals(t);
@@ -1559,13 +1575,11 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
     loop {
       match s.poll_one_transmit(t, buf) {
         Some((_tx, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(
+          let _ = s.note_service_transmit_outcome(
             h,
             t,
-            mdns_proto::TransmitDelivery::new(
-              mdns_proto::FamilyDelivery::Delivered,
-              mdns_proto::FamilyDelivery::Delivered,
-            ),
+            FamilyAttempt::Accepted { at: t },
+            FamilyAttempt::Accepted { at: t },
           );
         }
         Some(_) => {}
@@ -1670,8 +1684,8 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
       s.note_withdrawal_result(
         round.token(),
         t,
-        WithdrawalSend::Retry,
-        WithdrawalSend::Retry,
+        FamilyAttempt::Refused { permanent: false },
+        FamilyAttempt::Refused { permanent: false },
       );
     }
     s.drain_completed_withdrawals(t);
@@ -1706,7 +1720,7 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
   use mdns_proto::{
-    Name, ServiceRecords, ServiceSpec, WithdrawalSend,
+    Name, ServiceRecords, ServiceSpec,
     wire::{Header, MessageBuilder},
   };
 
@@ -1730,14 +1744,14 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
     loop {
       match s.poll_one_transmit(t, buf) {
-        Some((_tx, TransmitOrigin::Service(h))) => s.note_service_transmit_outcome(
-          h,
-          t,
-          mdns_proto::TransmitDelivery::new(
-            mdns_proto::FamilyDelivery::Delivered,
-            mdns_proto::FamilyDelivery::Delivered,
-          ),
-        ),
+        Some((_tx, TransmitOrigin::Service(h))) => {
+          let _ = s.note_service_transmit_outcome(
+            h,
+            t,
+            FamilyAttempt::Accepted { at: t },
+            FamilyAttempt::Accepted { at: t },
+          );
+        }
         Some(_) => {}
         None => break,
       }
@@ -1829,8 +1843,8 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
       s.note_withdrawal_result(
         round.token(),
         t,
-        WithdrawalSend::Retry,
-        WithdrawalSend::Retry,
+        FamilyAttempt::Refused { permanent: false },
+        FamilyAttempt::Refused { permanent: false },
       );
     }
     s.drain_completed_withdrawals(t);
@@ -1977,13 +1991,11 @@ fn a_query_dropped_mid_send_still_gets_its_confirm() {
     );
 
     // The send completes and the pump confirms.
-    s.note_query_transmit_outcome(
+    let _ = s.note_query_transmit_outcome(
       h,
       now,
-      mdns_proto::TransmitDelivery::new(
-        mdns_proto::FamilyDelivery::Delivered,
-        mdns_proto::FamilyDelivery::Delivered,
-      ),
+      FamilyAttempt::Accepted { at: now },
+      FamilyAttempt::Accepted { at: now },
     );
     assert!(
       s.endpoint.poll_query_timeout(h).is_some(),
@@ -2171,7 +2183,8 @@ fn a_query_ended_past_its_deadline_wakes_the_next_parked_on_it() {
     );
     // Delivered everywhere, so the §5.2 ladder advances and the retry is armed
     // one second out — comfortably inside the caller's window.
-    s.note_query_transmit_outcome(h, t_est, WHOLE_FANOUT.delivery());
+    let fanout = whole_fanout(t_est);
+    let _ = s.note_query_transmit_outcome(h, t_est, fanout.v4, fanout.v6);
     h
   };
   let query = crate::Query {
@@ -2239,7 +2252,8 @@ fn a_query_ended_past_its_deadline_wakes_the_next_parked_on_it() {
     // closes while it is there — in real time as much as in protocol time, since
     // the query walk below weighs that window on the clock it reads itself.
     std::thread::sleep(AWAITED_FANOUT);
-    s.note_service_transmit_outcome(svc, t_past, UNICAST_FANOUT.delivery());
+    let fanout = unicast_fanout(t_past);
+    let _ = s.note_service_transmit_outcome(svc, t_past, fanout.v4, fanout.v6);
     assert!(
       StdInstant::now() >= deadline,
       "the awaited fan-out must have carried the real clock out of the caller's \
@@ -2738,13 +2752,11 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     loop {
       match s.poll_one_transmit(t, buf) {
         Some((_tx, TransmitOrigin::Service(h))) => {
-          s.note_service_transmit_outcome(
+          let _ = s.note_service_transmit_outcome(
             h,
             t,
-            mdns_proto::TransmitDelivery::new(
-              mdns_proto::FamilyDelivery::Delivered,
-              mdns_proto::FamilyDelivery::Delivered,
-            ),
+            FamilyAttempt::Accepted { at: t },
+            FamilyAttempt::Accepted { at: t },
           );
         }
         Some(_) => {}
@@ -2845,7 +2857,7 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
   );
 }
 
-// ── The dual-stack delivery boundary (`TransmitDelivery`) ───────────────────
+// ── The dual-stack delivery boundary (`FamilyAttempt`) ──────────────────────
 
 /// A minimal registerable service spec for the delivery-shape tests.
 fn delivery_test_spec(instance: &str) -> mdns_proto::ServiceSpec {
@@ -2872,72 +2884,99 @@ fn confirm_service_round(
   fanout: Fanout,
 ) -> usize {
   s.fire_timeouts(t);
-  let delivery = fanout.delivery();
   let mut rounds = 0;
   while let Some((_tx, origin)) = s.poll_one_transmit(t, buf) {
     match origin {
       TransmitOrigin::Service(origin_h) if origin_h == h => {
-        s.note_service_transmit_outcome(h, t, delivery);
+        let _ = s.note_service_transmit_outcome(h, t, fanout.v4, fanout.v6);
         rounds += 1;
       }
-      TransmitOrigin::Service(other) => s.note_service_transmit_outcome(other, t, delivery),
-      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, delivery),
+      TransmitOrigin::Service(other) => {
+        let _ = s.note_service_transmit_outcome(other, t, fanout.v4, fanout.v6);
+      }
+      TransmitOrigin::Query(q) => {
+        let _ = s.note_query_transmit_outcome(q, t, fanout.v4, fanout.v6);
+      }
     }
   }
   rounds
 }
 
-/// A dual-stack fan-out in which v4 carried the datagram and a BOUND v6 socket
-/// rejected it (`ENETUNREACH` and friends). Driving the behaviour tests from the
-/// per-family facts rather than a hand-fed [`TransmitDelivery`] keeps the
+/// A dual-stack fan-out in which v4 carried the datagram at `at` and a BOUND v6
+/// socket rejected it (`ENETUNREACH` and friends). Driving the behaviour tests
+/// from the per-family facts rather than a hand-fed delivery shape keeps the
 /// mapping inside the tested path.
-const PARTIAL_FANOUT: Fanout = Fanout {
-  v4: FamilySend::Sent,
-  v6: FamilySend::Failed,
-};
+fn partial_fanout(at: StdInstant) -> Fanout {
+  Fanout {
+    v4: FamilyAttempt::Accepted { at },
+    v6: FamilyAttempt::Refused { permanent: false },
+  }
+}
 
-/// Both bound families carried the datagram.
-const WHOLE_FANOUT: Fanout = Fanout {
-  v4: FamilySend::Sent,
-  v6: FamilySend::Sent,
-};
+/// Both bound families carried the datagram, at `at`.
+fn whole_fanout(at: StdInstant) -> Fanout {
+  Fanout {
+    v4: FamilyAttempt::Accepted { at },
+    v6: FamilyAttempt::Accepted { at },
+  }
+}
 
 /// Both bound families rejected it — nothing reached any wire.
-const FAILED_FANOUT: Fanout = Fanout {
-  v4: FamilySend::Failed,
-  v6: FamilySend::Failed,
-};
+fn failed_fanout() -> Fanout {
+  Fanout {
+    v4: FamilyAttempt::Refused { permanent: false },
+    v6: FamilyAttempt::Refused { permanent: false },
+  }
+}
 
-/// The confirm is a pure, per-family function of the I/O facts, and the obligated
-/// set is "every family that HAS a socket". The rows that matter: an absent family
-/// is not obligated (a single-stack host advances at full speed), a
-/// present-but-failing one is, and an empty obligated set delivers to nobody —
-/// never a vacuous "all", which would let a torn-down endpoint advance its
-/// lifecycle on nothing.
-///
-/// WHICH family missed survives to the core, so it can schedule the next
-/// announcement per link. The two partial rows differ here; under the aggregate
-/// confirm they were the same value.
+/// The classification each completed attempt gets — raw [`SendAttempt`] to
+/// [`FamilyAttempt`] — is the only piece of the old per-family table still this
+/// driver's own: what a family's answer becomes IS the whole of what this
+/// driver tells the core now that [`Fanout`] carries the two families'
+/// [`FamilyAttempt`]s with no projection of its own. The core's projection of
+/// that onto `Delivered`/`Missed`/`Unobligated`, and how a pair of them combine,
+/// is internal to `mdns_proto` and asserted once, in its own suite.
 #[test]
-fn the_fan_out_reaches_the_core_per_family() {
-  use FamilySend::{Failed, Sent, Unbound};
-  use mdns_proto::FamilyDelivery::{Delivered, Missed, Unobligated};
-  let cases = [
-    (Sent, Sent, Delivered, Delivered),
-    (Sent, Unbound, Delivered, Unobligated),
-    (Unbound, Sent, Unobligated, Delivered),
-    (Sent, Failed, Delivered, Missed),
-    (Failed, Sent, Missed, Delivered),
-    (Failed, Failed, Missed, Missed),
-    (Failed, Unbound, Missed, Unobligated),
-    (Unbound, Unbound, Unobligated, Unobligated),
+fn a_completed_attempt_classifies_into_exactly_one_family_attempt() {
+  let body = *b"classification-probe";
+  let at = StdInstant::now();
+  let cases: [(&str, SendAttempt, FamilyAttempt<StdInstant>); 4] = [
+    (
+      "no socket bound",
+      SendAttempt::Unbound,
+      FamilyAttempt::NoSocket,
+    ),
+    (
+      "withheld by the wire gate",
+      SendAttempt::Gated,
+      FamilyAttempt::GateShut,
+    ),
+    (
+      "the socket accepted it",
+      SendAttempt::Answered {
+        result: Ok(body.len()),
+        submitted_wall: SystemTime::now(),
+        submitted_at: at,
+        completed_at: at,
+      },
+      FamilyAttempt::Accepted { at },
+    ),
+    (
+      "the socket refused it",
+      SendAttempt::Answered {
+        result: Err(std::io::Error::from(std::io::ErrorKind::Other)),
+        submitted_wall: SystemTime::now(),
+        submitted_at: at,
+        completed_at: at,
+      },
+      FamilyAttempt::Refused { permanent: false },
+    ),
   ];
-  for (v4, v6, want_v4, want_v6) in cases {
-    let delivery = Fanout { v4, v6 }.delivery();
+  for (label, attempt, want) in cases {
     assert_eq!(
-      (delivery.v4(), delivery.v6()),
-      (want_v4, want_v6),
-      "({v4:?}, {v6:?}) must reach the core as ({want_v4}, {want_v6})"
+      attempt_of(Family::V4, &body, &attempt),
+      want,
+      "{label} must classify as {want:?}"
     );
   }
 }
@@ -2970,7 +3009,7 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
 
   // Exactly ONE confirm, so the bounded policy provably cannot have fired.
   assert_eq!(
-    confirm_service_round(&mut s, h, now, &mut buf, PARTIAL_FANOUT),
+    confirm_service_round(&mut s, h, now, &mut buf, partial_fanout(now)),
     1,
     "one announcement should have been offered"
   );
@@ -3021,7 +3060,7 @@ fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
   let mut buf = vec![0u8; 4096];
 
   assert_eq!(
-    confirm_service_round(&mut s, h, now, &mut buf, WHOLE_FANOUT),
+    confirm_service_round(&mut s, h, now, &mut buf, whole_fanout(now)),
     1,
     "one announcement should have been offered"
   );
@@ -3060,7 +3099,7 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
   let mut buf = vec![0u8; 4096];
 
   assert_eq!(
-    confirm_service_round(&mut s, h, now, &mut buf, FAILED_FANOUT),
+    confirm_service_round(&mut s, h, now, &mut buf, failed_fanout()),
     1,
     "one announcement should have been offered"
   );
@@ -3120,7 +3159,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   let mut t = now;
   for _ in 0..40 {
     t += Duration::from_millis(300);
-    confirm_service_round(&mut s, handle, t, &mut buf, WHOLE_FANOUT);
+    confirm_service_round(&mut s, handle, t, &mut buf, whole_fanout(t));
   }
   assert!(
     s.services[&handle].proto.advertises_instance(),
@@ -3151,7 +3190,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   for _ in 0..80 {
     t += Duration::from_millis(250);
     s.handle_datagram(&peer, &conflict);
-    confirm_service_round(&mut s, handle, t, &mut buf, WHOLE_FANOUT);
+    confirm_service_round(&mut s, handle, t, &mut buf, whole_fanout(t));
     s.push_service_updates(t);
     if s
       .services
@@ -3174,7 +3213,12 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     .poll_one_withdrawal(t, &mut buf)
     .expect("the renamed-away old name must have a detached goodbye pending")
     .token();
-  s.note_withdrawal_result(token, t, WithdrawalSend::Sent, WithdrawalSend::Retry);
+  s.note_withdrawal_result(
+    token,
+    t,
+    FamilyAttempt::Accepted { at: t },
+    FamilyAttempt::Refused { permanent: false },
+  );
 
   // The application reclaims the vacated name.
   let rh = s
@@ -3185,7 +3229,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   // opens no gate) so the next round is its FIRST announcement.
   for _ in 0..12 {
     t += Duration::from_millis(300);
-    confirm_service_round(&mut s, rh, t, &mut buf, WHOLE_FANOUT);
+    confirm_service_round(&mut s, rh, t, &mut buf, whole_fanout(t));
     if s.services[&rh].proto.state() == ServiceState::Announcing(0) {
       break;
     }
@@ -3199,7 +3243,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   // Exactly ONE partially-delivered announcement — the bounded policy provably
   // cannot have excused anything yet.
   t += Duration::from_millis(300);
-  confirm_service_round(&mut s, rh, t, &mut buf, PARTIAL_FANOUT);
+  confirm_service_round(&mut s, rh, t, &mut buf, partial_fanout(t));
   assert!(
     !s.services[&rh].proto.has_fully_announced().get(),
     "a partial announcement must leave the reclaim-cancel gate shut"
@@ -3214,7 +3258,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   // Once the replacement reaches every obligated family, §10.2's cache-flush
   // announcement supersedes the stale records and the goodbye may be cancelled.
   t += Duration::from_secs(2);
-  confirm_service_round(&mut s, rh, t, &mut buf, WHOLE_FANOUT);
+  confirm_service_round(&mut s, rh, t, &mut buf, whole_fanout(t));
   assert!(
     s.services[&rh].proto.has_fully_announced().get(),
     "the replacement must have fully announced by now"
@@ -3255,7 +3299,7 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   let sock_v4 = Some(Rc::new(sender));
   let sock_v6: Option<Rc<Socket>> = None;
 
-  let (fanout, accepted_at) = send_via(
+  let fanout = send_via(
     &inner,
     &sock_v4,
     &sock_v6,
@@ -3269,16 +3313,14 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   .await;
 
   assert!(
-    accepted_at.is_some(),
+    matches!(fanout.v4, FamilyAttempt::Accepted { .. }),
     "the one obligated family accepted the datagram, so the confirm has a real \
-     acceptance instant to anchor at"
+     acceptance instant to anchor at; got {:?}",
+    fanout.v4
   );
   assert_eq!(
-    fanout.delivery(),
-    mdns_proto::TransmitDelivery::new(
-      mdns_proto::FamilyDelivery::Delivered,
-      mdns_proto::FamilyDelivery::Unobligated,
-    ),
+    fanout.v6,
+    FamilyAttempt::NotAddressed,
     "a §6.7 reply obligates exactly the destination's family; the other one was \
      never offered the datagram and must not read as a miss"
   );
@@ -3423,7 +3465,7 @@ async fn same_family_wire_times(min_gap: Duration, pending: &[Duration]) -> Vec<
     // make one round's datagram stand in for another's.
     let body = [b'g', b'a', b'p', i as u8];
     loop {
-      let (fanout, _) = send_via(
+      let fanout = send_via(
         &inner,
         &sock_v4,
         &sock_v6,
@@ -3435,9 +3477,11 @@ async fn same_family_wire_times(min_gap: Duration, pending: &[Duration]) -> Vec<
       )
       .await;
       match fanout.v4 {
-        FamilySend::Sent => break,
-        FamilySend::Gated => compio::time::sleep(GATED_RETRY_POLL).await,
-        other => panic!("a delayed-but-successful send must be Sent or Gated, got {other:?}"),
+        FamilyAttempt::Accepted { .. } => break,
+        FamilyAttempt::GateShut => compio::time::sleep(GATED_RETRY_POLL).await,
+        other => {
+          panic!("a delayed-but-successful send must be Accepted or GateShut, got {other:?}")
+        }
       }
     }
   }
@@ -3515,11 +3559,13 @@ async fn a_pending_query_does_not_shorten_the_next_ones_wire_gap() {
 // ── The obligation tag (`TransmitObligation`) at the driver seam ────────────
 
 /// A §6.7 legacy unicast reply reaches exactly ONE family, so its fan-out is
-/// `AllDelivered` by construction.
-const UNICAST_FANOUT: Fanout = Fanout {
-  v4: FamilySend::Sent,
-  v6: FamilySend::Unbound,
-};
+/// all-delivered by construction — the other family was not addressed, not missing.
+fn unicast_fanout(at: StdInstant) -> Fanout {
+  Fanout {
+    v4: FamilyAttempt::Accepted { at },
+    v6: FamilyAttempt::NotAddressed,
+  }
+}
 
 /// Drain one service's due transmits at `t` through the SAME seam the run loop
 /// uses, choosing each datagram's fan-out the way `send_via` would: an mDNS
@@ -3539,17 +3585,18 @@ fn confirm_service_round_mixed(
     let fanout = if tx.dst().ip().is_multicast() {
       multicast_fanout
     } else {
-      UNICAST_FANOUT
+      unicast_fanout(t)
     };
-    let delivery = fanout.delivery();
     match origin {
       TransmitOrigin::Service(origin_h) => {
-        s.note_service_transmit_outcome(origin_h, t, delivery);
+        let _ = s.note_service_transmit_outcome(origin_h, t, fanout.v4, fanout.v6);
         if origin_h == h {
           rounds += 1;
         }
       }
-      TransmitOrigin::Query(q) => s.note_query_transmit_outcome(q, t, delivery),
+      TransmitOrigin::Query(q) => {
+        let _ = s.note_query_transmit_outcome(q, t, fanout.v4, fanout.v6);
+      }
     }
   }
   rounds
@@ -3606,7 +3653,7 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
   let mut buf = vec![0u8; 4096];
 
   // The lifecycle reaches no wire at all, so nothing it sends can latch.
-  confirm_service_round(&mut s, h, now, &mut buf, FAILED_FANOUT);
+  confirm_service_round(&mut s, h, now, &mut buf, failed_fanout());
   assert!(
     !s.services[&h].proto.advertises_instance(),
     "a wholly-failed announcement exposes nothing"
@@ -3617,7 +3664,7 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
   let t = now + Duration::from_millis(50);
   inject_ptr_query(&mut s, legacy, t);
   assert_eq!(
-    confirm_service_round_mixed(&mut s, h, t, &mut buf, FAILED_FANOUT),
+    confirm_service_round_mixed(&mut s, h, t, &mut buf, failed_fanout()),
     1,
     "only the legacy reply is due this early"
   );
@@ -3704,7 +3751,11 @@ fn a_question_drawn_past_the_callers_window_is_withheld_inside_the_pump() {
     }
     let _ = ctx.proto.handle_timeout(t0);
     while let Ok(Some(_)) = ctx.proto.poll_transmit(t0, &mut buf) {
-      ctx.proto.note_transmit_outcome(t0, WHOLE_FANOUT.delivery());
+      let _ = ctx.proto.note_transmit_outcome(
+        t0,
+        FamilyAttempt::Accepted { at: t0 },
+        FamilyAttempt::Accepted { at: t0 },
+      );
     }
   }
 
@@ -3775,5 +3826,123 @@ fn a_question_drawn_past_the_callers_window_is_withheld_inside_the_pump() {
     matches!(terminal, Some(QueryUpdate::Timeout)),
     "the query must still end, and with the terminal its deadline's owner \
      produces; got {terminal:?}"
+  );
+}
+
+/// A datagram past this family's HARD UDP ceiling is reported permanently
+/// refused; one within it never is, whatever errno the kernel chose.
+///
+/// This driver had no permanence arm at all: every `Err` was one undifferentiated
+/// failure, so a §8.1 probe or a §8.3 announcement no socket could ever carry was
+/// re-armed by the core forever, with nothing on any wire and `Established` never
+/// reached. The core's patience does not rescue that — it excuses a MISSING
+/// family, not a round that can succeed on none of them.
+///
+/// The SIZE is the only sound proof and the errno is deliberately not consulted:
+/// `EMSGSIZE` is equally what a write past the currently-known path MTU with `DF`
+/// set reports, and the next attempt may get past that after an MTU probe or a
+/// route change.
+#[test]
+fn permanence_is_proved_by_the_size_and_never_by_the_errno() {
+  let at = StdInstant::now();
+  let err = || SendAttempt::Answered {
+    result: Err(std::io::Error::from(std::io::ErrorKind::Other)),
+    submitted_wall: SystemTime::now(),
+    submitted_at: at,
+    completed_at: at,
+  };
+  // An ordinary mDNS-sized body: three orders of magnitude inside the limit, and
+  // the size at which a path-MTU refusal actually happens.
+  let ordinary = vec![0u8; 1200];
+  assert_eq!(
+    attempt_of(Family::V4, &ordinary, &err()),
+    FamilyAttempt::Refused { permanent: false },
+    "a refusal of a datagram within the ceiling proves only that these bytes did \
+     not go out now"
+  );
+
+  let past_v4 = vec![0u8; mdns_proto::constants::MAX_UDP_PAYLOAD_V4 + 1];
+  assert_eq!(
+    attempt_of(Family::V4, &past_v4, &err()),
+    FamilyAttempt::Refused { permanent: true },
+    "past IPv4's 16-bit total-length ceiling, no route and no MTU can ever carry \
+     it, so the core must stop re-arming it"
+  );
+  // The two ceilings differ by the 20-byte IPv4 header, so the very body that is
+  // impossible on v4 is merely refused on v6.
+  assert_eq!(
+    attempt_of(Family::V6, &past_v4, &err()),
+    FamilyAttempt::Refused { permanent: false },
+    "each family's ceiling is its own"
+  );
+  assert_eq!(
+    attempt_of(
+      Family::V6,
+      &vec![0u8; mdns_proto::constants::MAX_UDP_PAYLOAD_V6 + 1],
+      &err()
+    ),
+    FamilyAttempt::Refused { permanent: true },
+  );
+}
+
+/// A sustained datagram every offered family refuses by SIZE retires its
+/// producer, and the core is the one that says so.
+///
+/// The end of the liveness defect: this driver reported such a round as an
+/// ordinary miss, the core re-armed it, and the producer probed or announced
+/// forever with nothing on any wire.
+#[test]
+fn a_permanently_oversized_sustained_datagram_retires_its_producer() {
+  use mdns_proto::{Name, ServiceSpec, records::ServiceRecords};
+
+  let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+  let t0 = std::time::Instant::now();
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("printer._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("host.local.").unwrap(),
+    631,
+    120,
+  );
+  recs.add_a([127, 0, 0, 1].into());
+  let h = s.test_register_service(ServiceSpec::new(recs), t0).unwrap();
+
+  // Draw the first §8.1 probe: a fresh service waits out §8.1's random 0-250 ms
+  // initial delay first.
+  let mut buf = vec![0u8; 4096];
+  let mut now = t0;
+  let mut drawn = false;
+  for step in 1..=8u32 {
+    now = t0
+      .checked_add(Duration::from_millis(u64::from(step) * 100))
+      .unwrap();
+    let ctx = s.services.get_mut(&h).unwrap();
+    ctx.proto.handle_timeout(now).unwrap();
+    if ctx.proto.poll_transmit(now, &mut buf).unwrap().is_some() {
+      drawn = true;
+      break;
+    }
+  }
+  assert!(drawn, "no probe was drawn within the §8.1 initial delay");
+
+  // End to end through this driver's own classification: a body no IPv4 socket
+  // can carry, refused by the kernel, on a single-stack host.
+  let oversized = vec![0u8; mdns_proto::constants::MAX_UDP_PAYLOAD_V4 + 1];
+  let refused = SendAttempt::Answered {
+    result: Err(std::io::Error::from(std::io::ErrorKind::Other)),
+    submitted_wall: SystemTime::now(),
+    submitted_at: now,
+    completed_at: now,
+  };
+  assert!(
+    s.note_service_transmit_outcome(
+      h,
+      now,
+      attempt_of(Family::V4, &oversized, &refused),
+      FamilyAttempt::NoSocket,
+    )
+    .retire_producer(),
+    "the one family this host has refused the probe's SIZE, so re-offering these \
+     exact bytes can never put them on a wire"
   );
 }
