@@ -51,4 +51,15 @@ pub use platform::recv_with_meta;
 // dangle on FreeBSD/OpenBSD/DragonFly (which use IP_RECVDSTADDR/IP_RECVIF).
 #[cfg(has_ip_pktinfo)]
 pub use multicast::parse_pktinfo_v4;
+// The BSD IPv4 ancillary parsers, each compiled only where its cmsg shape
+// exists. They are NOT part of the receive path — `recv_with_meta` still
+// degrades on those targets and `reports_rx_interface_v4` still answers
+// `false` there — so they are exported for the same reason they exist: a
+// caller on a real FreeBSD/DragonFly/OpenBSD/NetBSD host can drive them
+// against live ancillary data and produce the evidence `build.rs` names as
+// the precondition for wiring them in.
+#[cfg(ipv4_rx_dstaddr_recvif)]
+pub use multicast::parse_dstaddr_recvif_v4;
+#[cfg(ipv4_rx_netbsd_pktinfo)]
+pub use multicast::parse_netbsd_pktinfo_v4;
 pub use sync::{MulticastSocketV4, MulticastSocketV6};
