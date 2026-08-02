@@ -1,5 +1,11 @@
 use super::*;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::Ipv4Addr;
+// Only the `parse_pktinfo_v4` tests build a peer address or compare a
+// `RecvMeta` address, and every one of them is `has_ip_pktinfo`-gated. Left
+// unconditional, these three warn on each target without that cfg — all four
+// BSDs — and so fail any job that compiles this file under `-D warnings`.
+#[cfg(has_ip_pktinfo)]
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 
 /// The Linux/Apple 12-byte `struct in_pktinfo`: `ipi_ifindex`, `ipi_spec_dst`,
 /// `ipi_addr`. Also fed to the NetBSD parser, whose own `in_pktinfo` is a
