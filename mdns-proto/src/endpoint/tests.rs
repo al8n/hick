@@ -1845,6 +1845,163 @@ fn an_answer_processed_past_the_query_deadline_is_not_collected() {
   );
 }
 
+/// The routing fan-out must withhold the answer the same datagram's collection
+/// refused — on the Answer section and on the Additional section alike.
+///
+/// The two sites observe one fact about one record. `handle` applies the answer
+/// eagerly and refuses it, while the query deliberately stays LIVE until its own
+/// timer fires — so `is_done` and `terminal_emitted`, the only screens the
+/// fan-out applies on its own, are both false at exactly the moment the
+/// collection was refused. A `ToQuery` emitted there reports an accepted answer
+/// that no caller can find in `collected_answers`, and carries nothing to tell
+/// it apart from one that was accepted.
+///
+/// Exactly ON the boundary, which is where `now >= deadline` differs from
+/// `now > deadline`, and each section is weighed twice: once inside the window,
+/// where the event MUST still be emitted, and once at the boundary. Without the
+/// first half a fan-out that emitted nothing at all would pass.
+#[test]
+fn a_refused_answer_is_not_routed_to_its_query() {
+  use crate::{
+    config::QuerySpec,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
+  };
+  use core::{net::SocketAddr, time::Duration};
+
+  const WINDOW: Duration = Duration::from_millis(100);
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let deadline = now.checked_add(WINDOW).unwrap();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = e
+    .try_start_query(
+      QuerySpec::new(qname.clone(), ResourceType::A).with_timeout(WINDOW),
+      now,
+    )
+    .unwrap();
+  // A service publishing the SAME name as its host, so every datagram below also
+  // has service-side work to do: the refusal must be scoped to the query that
+  // asked for the window, not to the datagram.
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("P._ipp._tcp.local.").unwrap(),
+    qname.clone(),
+    631,
+    120,
+  );
+  recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
+  let _ = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+
+  // The A record in the ANSWER section.
+  let mut buf = [0u8; 512];
+  let answer_section = |addr: Ipv4Addr, buf: &mut [u8]| -> usize {
+    let mut hdr = Header::new();
+    hdr.flags_mut().set_response();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(buf, hdr).unwrap();
+    b.push_a_answer(&qname, 120, addr, false).unwrap();
+    b.finish().unwrap()
+  };
+  // The same record in the ADDITIONAL section (qd=0, an=0, ns=0, ar=1), where a
+  // DNS-SD responder puts the SRV/TXT/A/AAAA accompanying a PTR. The builder has
+  // no push_*_additional, so the bytes are laid out by hand.
+  let additional_section = |addr: Ipv4Addr| -> std::vec::Vec<u8> {
+    let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
+    msg.extend_from_slice(&[0, 0, 0x84, 0x00, 0, 0, 0, 0, 0, 0, 0, 1]);
+    msg.extend_from_slice(&[
+      7, b'p', b'r', b'i', b'n', b't', b'e', b'r', 5, b'l', b'o', b'c', b'a', b'l', 0,
+    ]);
+    msg.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+    msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+    msg.extend_from_slice(&120u32.to_be_bytes()); // TTL
+    msg.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+    msg.extend_from_slice(&addr.octets());
+    msg
+  };
+  /// Routing decisions for one datagram, split by which side they address.
+  fn routed(e: &mut TestEndp, at: StdInstant, src: SocketAddr, pkt: &[u8]) -> (usize, usize) {
+    let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+    let mut to_query = 0usize;
+    let mut to_service = 0usize;
+    for ev in e.handle(at, src, local_ip, 0, pkt, false).unwrap() {
+      match ev {
+        Ok(ev) if ev.is_to_query() => to_query = to_query.saturating_add(1),
+        Ok(ev) if ev.is_to_service() => to_service = to_service.saturating_add(1),
+        _ => {}
+      }
+    }
+    (to_query, to_service)
+  }
+
+  // Inside the window: both sections route the answer they collected.
+  let n = answer_section(Ipv4Addr::new(10, 0, 0, 7), &mut buf);
+  let answer_pkt = buf[..n].to_vec();
+  assert_eq!(
+    routed(&mut e, now, src, &answer_pkt).0,
+    1,
+    "an answer collected inside the window must still be routed to its query"
+  );
+  let additional_pkt = additional_section(Ipv4Addr::new(10, 0, 0, 8));
+  assert_eq!(
+    routed(&mut e, now, src, &additional_pkt).0,
+    1,
+    "an additional-section answer collected inside the window must still be routed"
+  );
+  assert_eq!(
+    e.collected_answers(h).count(),
+    2,
+    "both in-window records must have been collected, or the boundary below is \
+     not what the difference is"
+  );
+
+  // On the boundary: the collection is refused, so the routing must be too.
+  let n = answer_section(Ipv4Addr::new(10, 0, 0, 9), &mut buf);
+  let late_answer = buf[..n].to_vec();
+  let (to_query, to_service) = routed(&mut e, deadline, src, &late_answer);
+  assert_eq!(
+    to_query, 0,
+    "an answer the query refused on the deadline must not be routed to it: the \
+     event is indistinguishable from one for an answer that was collected"
+  );
+  assert!(
+    to_service >= 1,
+    "and only the query fan-out is refused: a peer claiming our host name is \
+     still a HostConflict, whatever any query's window is doing"
+  );
+  let late_additional = additional_section(Ipv4Addr::new(10, 0, 0, 10));
+  assert_eq!(
+    routed(&mut e, deadline, src, &late_additional).0,
+    0,
+    "and the Additional section is the same record on the same terms — DNS-SD \
+     carries SRV/TXT/A/AAAA there"
+  );
+
+  assert_eq!(
+    e.collected_answers(h).count(),
+    2,
+    "neither refused record may be collected"
+  );
+  // The datagram is still processed: only the query fan-out is refused.
+  assert!(
+    e.cache.contains(&qname, ResourceType::A, ResourceClass::In),
+    "a datagram whose query fan-out is refused must still populate the cache — \
+     the cache is not bounded by any query's window"
+  );
+  assert!(
+    e.poll_query(h).is_none(),
+    "withholding the routing must not produce a terminal either: the terminal \
+     belongs to handle_query_timeout"
+  );
+}
+
 // ── query state applied eagerly during handle ────────────────
 
 /// Dropping the `RouteEvents` iterator BEFORE iterating it must NOT

@@ -1237,6 +1237,15 @@ impl State {
 
     // Use a process-monotonic `now` for proto scheduling; the SystemTime
     // reference above is what classified the self-send credit.
+    //
+    // Read per datagram, here, and it must stay here: `endpoint.handle` anchors
+    // this datagram's every effect to it, and one of them is a bound the CALLER
+    // holds — a query whose `QuerySpec::with_timeout` window has shut collects
+    // nothing from this datagram and suppresses no RFC 6762 §7.3 slot for it.
+    // Hoisting the read to the run loop, which drains a batch of datagrams and
+    // awaits between them, would weigh the last of them on a reading taken before
+    // the first, and that is not laxity in the caller's favour: under
+    // `max_answers` a late answer EVICTS one collected inside the window.
     let now = StdInstant::now();
 
     // Split-borrow: endpoint and services are disjoint fields, but

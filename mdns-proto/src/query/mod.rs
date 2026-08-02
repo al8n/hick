@@ -378,6 +378,21 @@ where
     self.txid
   }
 
+  /// Has the caller's absolute `QuerySpec::with_timeout` window shut as of `now`?
+  ///
+  /// One comparison behind every refusal that bound produces, so the sites that
+  /// observe the same fact cannot drift apart: [`Self::handle_event`] refuses the
+  /// answer, [`Self::note_duplicate_question`] refuses the RFC 6762 §7.3 slot,
+  /// and the endpoint's routing iterator withholds the informational fan-out for
+  /// the answer `handle_event` has just refused. [`Self::handle_timeout`] takes
+  /// the terminal on the same `now >= deadline` boundary and `terminate` then
+  /// CLEARS the deadline, which is why callers check `done` beside this rather
+  /// than expecting it to answer for a query that has already ended.
+  #[inline]
+  pub(crate) fn caller_window_shut(&self, now: I) -> bool {
+    self.timeout_deadline.is_some_and(|deadline| now >= deadline)
+  }
+
   /// Process an event routed to this query by the Endpoint.
   ///
   /// `now` is when the event is being APPLIED, which is what the caller's window
@@ -432,9 +447,7 @@ where
     if self.done {
       return;
     }
-    if let Some(deadline) = self.timeout_deadline
-      && now >= deadline
-    {
+    if self.caller_window_shut(now) {
       crate::trace::trace!(
         target: "mdns_proto::query",
         handle = self.handle.raw(),
@@ -1005,7 +1018,7 @@ where
     if self.done || self.awaiting_send_confirm {
       return false;
     }
-    if self.timeout_deadline.is_some_and(|d| now >= d) {
+    if self.caller_window_shut(now) {
       return false;
     }
     let imminent = self.transmit_pending || self.next_deadline.is_some_and(|d| now >= d);

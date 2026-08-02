@@ -1193,6 +1193,17 @@ where
 
   /// Feed one received datagram to the endpoint and route its `ToService`
   /// events to the owning service state machine.
+  ///
+  /// `now` carries a caller-facing bound as well as the core's schedules:
+  /// `Endpoint::handle` weighs a query's `QuerySpec::with_timeout` window against
+  /// it, so an answer is collected — and an RFC 6762 §7.3 slot spent — only while
+  /// that window is open. This engine has no clock of its own, so on this tier
+  /// that window is weighed against the instant the CALLER sampled for `pump`,
+  /// and every datagram of one drain shares it. The overshoot is therefore the
+  /// caller's gap plus this drain, bounded by `MAX_RX_PER_PUMP` datagrams and
+  /// whatever the caller's `UdpIo` spends handing them over; narrowing it needs
+  /// `pump` to take a clock, not a re-read at this call site — the same position
+  /// the admission side records in `poll_one_transmit`.
   fn handle_one(&mut self, now: I, src: SocketAddr, local: Option<core::net::IpAddr>, data: &[u8]) {
     // `local_ip` is only used by the proto for tracing / the opt-in
     // advertised-source check; any valid address is acceptable.

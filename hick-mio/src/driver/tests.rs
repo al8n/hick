@@ -3451,14 +3451,15 @@ fn a_caller_gap_after_the_claim_window_opened_still_expires_the_credit() {
 //
 // The upper half of the same invariant, through the real drain. Once a credit's
 // window has opened, `SELF_SEND_TTL` charges elapsed time in full — and the
-// receive stage's own runtime is elapsed time like any other. So stage 1 carries
-// two monotonic clocks on purpose: the tick's instant, which stays the protocol
-// `now` every deadline comparison below needs to be stable, and a live read per
-// datagram, which is the only thing the credit is aged against. Weighing a claim
-// against the tick's instant charges nothing for a drain that ran long or lost
-// the CPU, and the bound on FALSE suppression stops being a bound — a
-// co-resident peer's byte-identical datagram, read an unbounded time after the
-// seal, still finds a live credit and is swallowed as our own echo.
+// receive stage's own runtime is elapsed time like any other. So the credit is
+// aged against a live read inside `SelfSendTracker::take` and against nothing
+// else: the tick's instant stays the protocol `now` for the schedules the core
+// owns, and the datagram's own processing instant — read per datagram for the
+// caller-facing bounds `Endpoint::handle` weighs — is not an age either.
+// Weighing a claim against the tick's instant charges nothing for a drain that
+// ran long or lost the CPU, and the bound on FALSE suppression stops being a
+// bound — a co-resident peer's byte-identical datagram, read an unbounded time
+// after the seal, still finds a live credit and is swallowed as our own echo.
 
 /// A loopback IPv4-only fixture registered into its own `Poll`, so a send's
 /// loopback copy can be waited for.
@@ -3888,6 +3889,213 @@ fn a_degraded_claim_still_admits_our_own_echo_that_predates_its_credit() {
     "the port gate must not become a second ordering check: our own echo arrives \
      from 5353 and still claims its credit, however the kernel happened to stamp \
      it against the send"
+  );
+}
+
+// ── what a query may TAKE is weighed at the datagram, not at the tick ────────
+//
+// `QuerySpec::with_timeout` is a promise to whoever set it, and it bounds the
+// receive side as well as the send: on and after the boundary the query collects
+// no answer and spends no RFC 6762 §7.3 retry slot. The core weighs that promise
+// against the instant `Endpoint::handle` is handed, so it is stage 1 that decides
+// how much of the drain is charged to it. One reading for a whole drain charges
+// none of it — the last of up to `RECV_BUDGET` datagrams, and the `recvmsg` calls
+// before it, are weighed on a clock read at the top of the tick.
+//
+// Nor is the error in the caller's favour: under `max_answers` an answer admitted
+// past the window EVICTS one collected inside it, and a duplicate question
+// admitted past it spends a §5.2 slot on behalf of a query the window has already
+// closed.
+//
+// Both tests below stall exactly there — after the tick has read its own instant,
+// with the datagram already admitted and only `Endpoint::handle` ahead of it.
+
+/// Long enough that the setup below finishes inside it on a loaded runner. The
+/// stall that crosses it is sized from what is LEFT at the moment the tick is
+/// about to run, so the crossing does not depend on how long the socket took.
+const QUERY_WINDOW: Duration = Duration::from_millis(500);
+
+/// Carries the stall past the boundary rather than onto it, so nothing turns on
+/// the difference between `>=` and `>` here.
+const PAST_THE_WINDOW: Duration = Duration::from_millis(50);
+
+/// A QR=1 response carrying one A record for `qname`.
+fn a_response(qname: &str, addr: Ipv4Addr) -> Vec<u8> {
+  use mdns_proto::wire::{Header, MessageBuilder};
+
+  let mut buf = vec![0u8; 512];
+  let mut header = Header::new();
+  header.flags_mut().set_response();
+  let mut builder: MessageBuilder<'_> =
+    MessageBuilder::try_new(&mut buf, header).expect("message builder");
+  builder
+    .push_a_answer(
+      &mdns_proto::Name::try_from_str(qname).expect("query name"),
+      120,
+      addr,
+      false,
+    )
+    .expect("push_a_answer");
+  let n = builder.finish().expect("finish");
+  buf.truncate(n);
+  buf
+}
+
+/// Put `body` on the multicast wire through the socket layer alone — no credit
+/// recorded, so the drain weighs the loopback copy as peer traffic — and wait
+/// until it has made the IPv4 socket readable.
+fn queue_peer_datagram(mdns: &mut Mdns, poll: &mut Poll, body: &[u8], what: &str) -> Option<()> {
+  let sent = mdns
+    .sockets
+    .send_one(Family::V4, body, MDNS_V4_DST, &crate::socket::Ungated);
+  if !matches!(sent, crate::socket::SendOutcome::Sent { .. }) {
+    eprintln!(
+      "skipping: this host's kernel refused a multicast datagram on the loopback \
+       interface ({sent:?}), so {what} can never reach the drain"
+    );
+    return None;
+  }
+  await_queued_datagram(mdns, poll, what)
+}
+
+/// Run one tick whose stage 1 loses the CPU until the query's window has shut,
+/// with the datagram already admitted and only `Endpoint::handle` left.
+///
+/// `started` is from just before the query was created, so the stall is what
+/// remains of the window plus a margin: the tick's own instant is still inside
+/// the window — which is what a stale reading would admit the datagram on — while
+/// the datagram is processed outside it.
+fn tick_across_the_window(mdns: &mut Mdns, started: Instant) {
+  let left = QUERY_WINDOW.saturating_sub(started.elapsed());
+  assert!(
+    !left.is_zero(),
+    "the window shut during setup, so the tick's own instant is past it too and \
+     this test would assert nothing about which instant was weighed"
+  );
+  mdns.force_claim_delays_for_test(&[left.saturating_add(PAST_THE_WINDOW)]);
+  mdns.tick().expect("tick");
+  assert!(
+    mdns.forced_claim_delays.is_empty(),
+    "the stall is consumed at the claim, so an unconsumed one means the datagram \
+     never got past the admission gates and this test asserted nothing"
+  );
+}
+
+/// A response processed after the drain has crossed the window must not be
+/// collected — and must not evict the answer that was collected inside it.
+///
+/// The cap is 1 because the late answer's real cost is not that it appears: it is
+/// that FIFO eviction makes it take one away. That is what makes weighing the
+/// refusal against a stale instant a loss rather than a laxity.
+#[test]
+fn a_response_processed_after_the_drain_crossed_the_window_is_not_collected() {
+  const QNAME: &str = "hick-mio-late-answer.local.";
+
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  let started = Instant::now();
+  let handle = mdns
+    .start_query(
+      mdns_proto::QuerySpec::new(
+        mdns_proto::Name::try_from_str(QNAME).expect("query name"),
+        ResourceType::A,
+      )
+      .with_timeout(QUERY_WINDOW)
+      .with_max_answers(1),
+    )
+    .expect("start_query");
+
+  // The answer the caller is owed, taken while the window is open.
+  test_support::ingest(
+    &mut mdns,
+    &a_response(QNAME, Ipv4Addr::new(10, 0, 0, 7)),
+    Instant::now(),
+  );
+  assert_eq!(
+    mdns.endpoint.collected_answers(handle).count(),
+    1,
+    "the in-window answer must be collected, or there is nothing for the late one \
+     to evict"
+  );
+
+  let late = a_response(QNAME, Ipv4Addr::new(10, 0, 0, 8));
+  let queued = queue_peer_datagram(&mut mdns, &mut poll, &late, "the late response");
+  if queued.is_none() {
+    mdns.deregister().expect("deregister");
+    return;
+  }
+  tick_across_the_window(&mut mdns, started);
+  let answers: Vec<_> = mdns.endpoint.collected_answers(handle).cloned().collect();
+  mdns.deregister().expect("deregister");
+
+  assert_eq!(
+    answers.len(),
+    1,
+    "a response processed after the drain crossed the window must not be \
+     collected; got {answers:?}"
+  );
+  assert_eq!(
+    answers[0].rdata_slice(),
+    &[10, 0, 0, 7],
+    "and it must not have evicted the answer collected inside the window: the \
+     tick's instant is what makes a late datagram look in-window, and under the \
+     cap that costs the caller a result it was promised"
+  );
+}
+
+/// A duplicate question processed after the drain has crossed the window must
+/// spend no RFC 6762 §7.3 retry slot.
+///
+/// The query is deliberately never polled first, so its first transmit is still
+/// pending — which is what makes a suppression reachable at all. Counted through
+/// `duplicate_questions_suppressed`, which is bumped only where the endpoint
+/// accepts the suppression.
+#[test]
+#[cfg(feature = "stats")]
+fn a_duplicate_question_after_the_drain_crossed_the_window_spends_no_slot() {
+  const QNAME: &str = "_hick-mio-late-dup._tcp.local.";
+
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  let started = Instant::now();
+  let handle = mdns
+    .start_query(
+      mdns_proto::QuerySpec::new(
+        mdns_proto::Name::try_from_str(QNAME).expect("query name"),
+        ResourceType::Ptr,
+      )
+      .with_timeout(QUERY_WINDOW),
+    )
+    .expect("start_query");
+
+  let peer_question = legacy_query_datagram(QNAME);
+  let queued = queue_peer_datagram(
+    &mut mdns,
+    &mut poll,
+    &peer_question,
+    "the peer's duplicate question",
+  );
+  if queued.is_none() {
+    mdns.deregister().expect("deregister");
+    return;
+  }
+  tick_across_the_window(&mut mdns, started);
+  let suppressed = mdns.stats().duplicate_questions_suppressed;
+  let still_live = mdns.endpoint.query_accepted_count(handle).is_some();
+  mdns.deregister().expect("deregister");
+
+  assert!(
+    still_live,
+    "the query must still exist for the count below to mean the suppression was \
+     refused rather than that there was nothing left to suppress"
+  );
+  assert_eq!(
+    suppressed, 0,
+    "a duplicate question processed after the drain crossed the window must not \
+     consume a §5.2 slot: the peer's query elicits answers this query's caller \
+     was told it would no longer collect"
   );
 }
 

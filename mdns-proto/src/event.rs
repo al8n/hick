@@ -246,6 +246,12 @@ pub enum RouteEvent<'a> {
   /// Route the event to the matched service.
   ToService(ToService<'a>),
   /// Route the event to the matched query.
+  ///
+  /// Informational: `Endpoint::handle` has already applied the answer to the
+  /// query it names. One is yielded only for an answer that query actually
+  /// took — a record refused because the caller's `QuerySpec::with_timeout`
+  /// window had shut is not announced here, so a consumer never sees a routing
+  /// decision it cannot find the result of.
   ToQuery(ToQuery<'a>),
   /// The endpoint cache observed new or refreshed records as a side effect
   /// of this datagram. Callers can use this as a hint to re-poll queries.

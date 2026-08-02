@@ -72,9 +72,9 @@
 //! [`QueryParam::with_timeout`](crate::QueryParam::with_timeout) window is still
 //! open, whether a query's
 //! [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window still
-//! admits the question stage 4 is about to draw — is read at the decision by the
-//! code that makes it. The strongest form
-//! is to take no instant at all, which is what
+//! admits the question stage 4 is about to draw or the answer stage 1 is about
+//! to apply — is read at the decision by the code that makes it. The strongest
+//! form is to take no instant at all, which is what
 //! [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take),
 //! [`send_and_credit`], [`Mdns::push_updates`], [`Mdns::advance_lookups`] and
 //! [`Mdns::drain_withdrawals`] all do: a parameter is a channel through which a
@@ -100,6 +100,17 @@
 //! is the core's own schedule and keeps the tick's instant; the window is the
 //! caller's and is read where the question is drawn. Two decisions, one query,
 //! and the answer to *who was promised it* differs between them.
+//!
+//! **The same window bounds what a query may TAKE, so stage 1 reads for it too.**
+//! `Endpoint::handle` weighs an inbound answer against the instant it is handed,
+//! and a drain that reused the tick's would weigh its 64th datagram — and the 63
+//! `recvmsg` calls before it — on a reading from the top of the tick. Leniency in
+//! that direction is not free: under `max_answers` a late answer EVICTS one taken
+//! inside the window, and a duplicate question can spend a §5.2 slot for a query
+//! the window has already closed. So the datagram's processing instant is read
+//! per datagram, adjacent to the call that anchors the datagram to it, while the
+//! service events that same stage routes keep the tick's — their schedule is the
+//! core's.
 //!
 //! What is left is the instructions between the read and the comparison, and it
 //! is irreducible — something must read a clock before something can compare
@@ -506,6 +517,16 @@ impl Mdns {
   /// is the precondition on being offered a credit at all. Only a datagram from
   /// port 5353 can be this endpoint's own loopback copy, because that is the
   /// port both of its sockets send from.
+  ///
+  /// # `now` is this stage's protocol instant, and the datagram's is not
+  ///
+  /// `now` is what the service events this stage routes are applied at — the
+  /// core's own response schedule, stable across the tick. Each datagram's
+  /// processing instant is read separately, immediately before the
+  /// `Endpoint::handle` that anchors the datagram's effects to it, because one of
+  /// those effects is a query's caller-facing
+  /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window. See
+  /// this module's clock rule and the read itself.
   fn drain_recv(&mut self, now: StdInstant) {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
@@ -529,16 +550,13 @@ impl Mdns {
       let Some((meta, family)) = sockets.recv(recv_buf.as_mut_slice()) else {
         return;
       };
-      // No second clock read here, and none anywhere else in this loop — do not
-      // add one. `now` is the tick's PROTOCOL instant: the core weighs every
-      // deadline within a tick against one stable value, so it is what
-      // `endpoint.handle` and every stage below receive, unchanged. It is not,
-      // and must not become, the age of a self-send credit. `SELF_SEND_TTL` is
-      // no deadline but a real-time bound on FALSE suppression, so that age
-      // belongs to `SelfSendTracker::take`, which reads it at its own liveness
-      // decision and accepts an instant from nobody. An instant captured at this
-      // line would already be stale by the two admission gates below — see that
-      // method's docs for why the parameter was the defect rather than the fix.
+      // No clock read at this line, and the one below is not for the credit.
+      // `SELF_SEND_TTL` is no deadline but a real-time bound on FALSE
+      // suppression, so a credit's age belongs to `SelfSendTracker::take`, which
+      // reads it at its own liveness decision and accepts an instant from
+      // nobody. An instant captured here would already be stale by the two
+      // admission gates below — see that method's docs for why the parameter was
+      // the defect rather than the fix.
       let Some(data) = recv_buf.get(..meta.len()) else {
         // `recv` never reports more bytes than the buffer holds; a datagram
         // that would not fit was already rejected as truncated.
@@ -652,8 +670,25 @@ impl Mdns {
       Self::stall_before_claim(forced_claim_delays);
       let caller_is_self = from_mdns_port && selfsend.take(family, data, sockets.rx_time(&meta));
 
+      // This datagram's own processing instant, read here rather than taken from
+      // the tick, because `Endpoint::handle` weighs a bound the CALLER holds
+      // against it: a query whose `QuerySpec::with_timeout` window has shut
+      // collects nothing from this datagram and suppresses no RFC 6762 §7.3 slot
+      // for it. The tick's reading is up to `RECV_BUDGET` datagrams and a
+      // `recvmsg` apiece old by the time the last of them reaches this line, and
+      // a stale one here does not merely err on the side of keeping an answer:
+      // under a query's `max_answers` cap, collecting a late answer EVICTS one
+      // collected inside the window.
+      //
+      // The tick's `now` still governs everything whose schedule the core owns —
+      // stage 3's timers, and the service dispatch below, which must not
+      // schedule a response from an instant that stage's `handle_timeout` has
+      // not reached. One stable protocol instant per tick, one live read per
+      // caller-facing decision. See this module's clock rule.
+      let processed_at = StdInstant::now();
+
       let route_events = match endpoint.handle(
-        now,
+        processed_at,
         meta.peer(),
         meta.local_ip(),
         pkt_iface,
