@@ -1,9 +1,15 @@
 use super::*;
+// Every caller of this import and the three helpers below is a `#[cfg(feature
+// = "tokio")]` test (they drive the driver via `agnostic_net::tokio::Net`), so
+// all four are gated the same way rather than compiled — and reported dead —
+// on a test build with no runtime feature enabled.
+#[cfg(feature = "tokio")]
 use crate::service::{SERVICE_UPDATE_CAPACITY, ServiceMailbox};
 
 /// Drain one [`ServiceUpdate`] from a shared mailbox (the handle side), used by
 /// the service-update tests to assert delivery without awaiting the async
 /// [`crate::Service::next`].
+#[cfg(feature = "tokio")]
 fn lock_mailbox_for_test(
   mailbox: &std::sync::Arc<std::sync::Mutex<ServiceMailbox>>,
 ) -> Option<ServiceUpdate> {
@@ -15,6 +21,7 @@ fn lock_mailbox_for_test(
 
 /// Confirm a send BOTH families carried, for tests that drive a service with no
 /// bound sockets and must still see the announce/host-latch guards fire.
+#[cfg(feature = "tokio")]
 fn deliver_both(proto: &mut ProtoService, now: StdInstant) {
   let _ = proto.note_transmit_outcome(
     now,
@@ -25,6 +32,7 @@ fn deliver_both(proto: &mut ProtoService, now: StdInstant) {
 
 /// This family's acceptance instant, if it accepted. The accessor lives inside
 /// the core; a test names the fact by hand-matching the (public) variant.
+#[cfg(feature = "tokio")]
 fn accepted_at(attempt: FamilyAttempt<StdInstant>) -> Option<StdInstant> {
   match attempt {
     FamilyAttempt::Accepted { at } => Some(at),

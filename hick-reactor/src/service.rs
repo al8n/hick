@@ -132,7 +132,11 @@ impl ServiceMailbox {
 
   /// Number of buffered NON-terminal updates (excludes the reserved terminal
   /// slot). Test-only window into the bound + coalesce behaviour.
-  #[cfg(test)]
+  ///
+  /// Gated on `feature = "tokio"` as well as `test`: every caller is a
+  /// `driver::tests` case that drives the driver with the tokio runtime, so
+  /// this is dead code on a test build with no runtime feature enabled.
+  #[cfg(all(test, feature = "tokio"))]
   pub(crate) fn non_terminal_len(&self) -> usize {
     self.updates.len()
   }
@@ -141,7 +145,9 @@ impl ServiceMailbox {
   /// report it to the caller, or `None` at end-of-stream / when empty. Test-only
   /// synchronous peek used by the driver-level tests to assert what was
   /// delivered without awaiting the async [`Service::next`].
-  #[cfg(test)]
+  ///
+  /// Gated on `feature = "tokio"` as well as `test`: see `non_terminal_len`.
+  #[cfg(all(test, feature = "tokio"))]
   pub(crate) fn drain_for_test(&mut self) -> Option<ServiceUpdate> {
     match self.drain() {
       Drained::Update(upd) => Some(upd),
@@ -153,7 +159,9 @@ impl ServiceMailbox {
   /// non-coalescing entries (bypassing `push_update`'s by-kind coalescing).
   /// Test-only: lets a driver test exercise a FULL non-terminal ring while the
   /// reserved terminal slot stays independently deliverable.
-  #[cfg(test)]
+  ///
+  /// Gated on `feature = "tokio"` as well as `test`: see `non_terminal_len`.
+  #[cfg(all(test, feature = "tokio"))]
   pub(crate) fn fill_non_terminal_to_cap_for_test(&mut self) {
     use mdns_proto::event::ServiceRenamed;
     self.updates.clear();
