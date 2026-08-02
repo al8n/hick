@@ -1,4 +1,8 @@
 use super::*;
+// The tracker's public bounds. Its clock seams (`take_at`, `seal_at`, `len`)
+// come with the `test-support` feature this crate carries in `dev-dependencies`
+// only, so a claim or a loop top can be placed without sleeping to it.
+use hick_udp::selfsend::{MAX_SELF_SEND_ENTRIES, SELF_SEND_TTL, WALL_STEP_TOLERANCE};
 // Every caller of this import and the three helpers below is a `#[cfg(feature
 // = "tokio")]` test (they drive the driver via `agnostic_net::tokio::Net`), so
 // all four are gated the same way rather than compiled — and reported dead —
@@ -142,23 +146,27 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
 
   // A QR=1 response body (header byte 2 = 0x84) we "recently sent".
   let body = vec![0u8, 0, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-  record_self_send(&mut state.recent_sends, &body, SystemTime::now());
-  assert_eq!(state.recent_sends.len(), 1);
+  let sent = ClockPair::now();
+  state.selfsend.record(Family::V4, &body, sent);
+  state.selfsend.seal_at(sent.mono);
+  #[cfg(debug_assertions)]
+  state.note_park_entry();
+  assert_eq!(state.selfsend.len(), 1);
 
   // Same bytes arriving from an EPHEMERAL port (on-link TTL 255): untrusted
-  // response — must be dropped before `take_self_send`.
+  // response — must be dropped before it can be offered the credit.
   let untrusted = Packet {
     src: "192.0.2.9:40000".parse().unwrap(),
     data: body.clone(),
+    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    kernel_rx_time: Some(SystemTime::now()),
-    read_time: SystemTime::now(),
+    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
     hop_limit: Some(255),
   };
   state.handle_packet(untrusted);
   assert_eq!(
-    state.recent_sends.len(),
+    state.selfsend.len(),
     1,
     "untrusted response must not consume the self-send credit"
   );
@@ -167,15 +175,15 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
   let loopback = Packet {
     src: "192.0.2.9:5353".parse().unwrap(),
     data: body,
+    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    kernel_rx_time: Some(SystemTime::now()),
-    read_time: SystemTime::now(),
+    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
     hop_limit: Some(255),
   };
   state.handle_packet(loopback);
   assert_eq!(
-    state.recent_sends.len(),
+    state.selfsend.len(),
     0,
     "the trusted port-5353 loopback consumes the credit"
   );
@@ -213,10 +221,10 @@ fn pre_drop_short_qr1_counts_rx_and_dropped_exactly_once() {
   let pkt = Packet {
     src: "192.0.2.7:40000".parse().unwrap(),
     data: body,
+    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    kernel_rx_time: Some(SystemTime::now()),
-    read_time: SystemTime::now(),
+    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
     hop_limit: Some(255),
   };
   state.handle_packet(pkt);
@@ -265,27 +273,26 @@ fn pre_drop_untrusted_qr1_response_counts_rx_and_dropped_exactly_once() {
   ];
   let len = body.len() as u64;
 
-  // No prior self-send credit recorded — if the drop were to incorrectly call
-  // take_self_send the tracker would stay at zero (no match), but the correct
-  // behaviour is that it is never called at all.
-  assert_eq!(state.recent_sends.len(), 0);
+  // No prior self-send credit recorded — if the drop were to incorrectly offer
+  // this datagram a credit the tracker would stay at zero (no match), but the
+  // correct behaviour is that it is never offered one at all.
+  assert!(state.selfsend.is_empty());
 
   let pkt = Packet {
     src: "192.0.2.8:54321".parse().unwrap(), // non-5353 → untrusted
     data: body,
+    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    kernel_rx_time: Some(SystemTime::now()),
-    read_time: SystemTime::now(),
+    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
     hop_limit: Some(255), // on-link
   };
   state.handle_packet(pkt);
 
   // Self-send tracker unchanged (never reached).
-  assert_eq!(
-    state.recent_sends.len(),
-    0,
-    "self-send credit ring must be untouched"
+  assert!(
+    state.selfsend.is_empty(),
+    "the self-send tracker must be untouched"
   );
 
   let snap = state.stats.snapshot();
@@ -322,10 +329,10 @@ fn pre_drop_off_link_datagram_counts_rx_and_dropped_exactly_once() {
   let pkt = Packet {
     src: "203.0.113.5:5353".parse().unwrap(),
     data: body,
+    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    kernel_rx_time: Some(SystemTime::now()),
-    read_time: SystemTime::now(),
+    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
     hop_limit: Some(64), // off-link: TTL != 255
   };
   state.handle_packet(pkt);
@@ -543,236 +550,340 @@ fn collect_local_subnets_rejects_zero_index() {
   assert!(collect_local_subnets(0).is_empty());
 }
 
+// ── The self-send tracker (`hick_udp::selfsend`) as this driver drives it ────
+//
+// The tracker itself is exhaustively tested in `hick-udp`. What these cover is
+// the contract THIS driver depends on: a credit per real multicast send, keyed
+// to the family that carried it, claimed take-once by the echo read off that
+// family's socket, aged on the monotonic clock from the window the run loop's
+// seal opens.
+
+/// One send's own pre-syscall reading of both clocks, in the shape `send_to_at`
+/// takes it: the wall stamp, and the monotonic partner read immediately after.
+fn send_stamps() -> ClockPair {
+  ClockPair::now()
+}
+
+/// A claim landing `after` the send on BOTH clocks at once — a run in which the
+/// wall clock did nothing but keep up with the monotonic one.
+///
+/// Every test whose subject is not a clock step goes through this, so none of
+/// them degrades to content-only matching by accident and quietly stops
+/// exercising the ordering rule it was written for.
+fn claim(sent: ClockPair, after: Duration) -> ClockPair {
+  ClockPair::new(sent.wall + after, sent.mono + after)
+}
+
+/// Record `body` on `family` and open its claim window at `sent.mono` — one turn
+/// of the driver loop, where the send stage records and the NEXT iteration's top
+/// seals. Every test whose subject is not the seal itself goes through this, so
+/// none of them leans on the unsealed state by accident.
+fn recorded_and_sealed(t: &mut SelfSendTracker, family: Family, body: &[u8], sent: ClockPair) {
+  t.record(family, body, sent);
+  t.seal_at(sent.mono);
+}
+
 #[test]
 fn self_send_consume_once() {
-  // one recorded send suppresses exactly one loopback.
-  let t = SystemTime::now();
-  let mut tracker = Vec::new();
-  record_self_send(&mut tracker, b"hello", t);
-  // The loopback arrives at-or-after our send -> matched and consumed.
-  assert!(take_self_send(
-    &mut tracker,
-    b"hello",
-    t,
-    MatchMode::Ordered
-  ));
-  // A second byte-identical packet finds no entry -> treated as a peer.
-  assert!(!take_self_send(
-    &mut tracker,
-    b"hello",
-    t,
-    MatchMode::Ordered
-  ));
+  // One recorded send suppresses exactly one loopback.
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"hello", sent);
+  let now = claim(sent, Duration::from_millis(1));
+  let rx = RxEvidence::from_caller_parsed_cmsg(now.wall);
+  // The loopback the kernel stamped at-or-after our send is matched and consumed.
+  assert!(tracker.take_at(Family::V4, b"hello", rx, now));
+  // A second byte-identical datagram finds no credit -> treated as a peer's.
+  assert!(!tracker.take_at(Family::V4, b"hello", rx, now));
   assert!(tracker.is_empty());
 }
 
 #[test]
 fn self_send_distinct_payloads_do_not_match() {
-  let t = SystemTime::now();
-  let mut tracker = Vec::new();
-  record_self_send(&mut tracker, b"alpha", t);
-  assert!(!take_self_send(
-    &mut tracker,
-    b"beta",
-    t,
-    MatchMode::Ordered
-  ));
-  // The unrelated entry is left intact for its own loopback.
-  assert!(take_self_send(
-    &mut tracker,
-    b"alpha",
-    t,
-    MatchMode::Ordered
-  ));
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"alpha", sent);
+  let now = claim(sent, Duration::from_millis(1));
+  let rx = RxEvidence::from_caller_parsed_cmsg(now.wall);
+  assert!(!tracker.take_at(Family::V4, b"beta", rx, now));
+  // The unrelated credit is left intact for its own loopback.
+  assert!(tracker.take_at(Family::V4, b"alpha", rx, now));
 }
 
 #[test]
 fn self_send_expires_after_ttl() {
-  // a packet arriving more than SELF_SEND_TTL after the send
-  // is no longer our loopback, and the stale entry is swept on the next
-  // record so the tracker can't grow without bound.
-  let t = SystemTime::now();
-  let mut tracker = Vec::new();
-  record_self_send(&mut tracker, b"hello", t);
-  let too_late = t + SELF_SEND_TTL + Duration::from_millis(1);
-  assert!(!take_self_send(
-    &mut tracker,
+  // A datagram arriving more than SELF_SEND_TTL after the window opened is no
+  // longer our loopback, and the dead credit is reclaimed by the next seal so
+  // the tracker cannot grow without bound.
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"hello", sent);
+  // Past the TTL on the MONOTONIC half, which is the only clock the age is
+  // measured on; the wall half moves with it so nothing here is a step.
+  let too_late = claim(sent, SELF_SEND_TTL + Duration::from_millis(1));
+  assert!(!tracker.take_at(
+    Family::V4,
     b"hello",
-    too_late,
-    MatchMode::Ordered
+    RxEvidence::from_caller_parsed_cmsg(too_late.wall),
+    too_late
   ));
-  record_self_send(&mut tracker, b"other", too_late);
+  tracker.seal_at(too_late.mono);
+  assert!(
+    tracker.is_empty(),
+    "the dead credit is swept, so a tracker under a sustained send rate stays bounded"
+  );
+  // A credit recorded afterwards is unaffected by the expiry above.
+  recorded_and_sealed(&mut tracker, Family::V4, b"other", too_late);
   assert_eq!(tracker.len(), 1);
-  assert!(take_self_send(
-    &mut tracker,
+  let now = claim(too_late, Duration::from_millis(1));
+  assert!(tracker.take_at(
+    Family::V4,
     b"other",
-    too_late,
-    MatchMode::Ordered
+    RxEvidence::from_caller_parsed_cmsg(now.wall),
+    now
   ));
 }
 
 #[test]
 fn self_send_peer_before_our_send_cannot_steal_credit() {
-  // a byte-identical peer datagram the kernel stamped BEFORE
-  // our send must not consume the credit even though its content hash
-  // matches; otherwise the genuine loopback is later misclassified as a
-  // peer (self-rename / dropped answers).
-  let sent = SystemTime::now();
-  let mut tracker = Vec::new();
-  record_self_send(&mut tracker, b"probe", sent);
-  let peer_rx = sent - Duration::from_millis(500);
-  assert!(!take_self_send(
-    &mut tracker,
-    b"probe",
-    peer_rx,
-    MatchMode::Ordered
-  ));
+  // A byte-identical peer datagram the kernel stamped BEFORE our send must not
+  // consume the credit even though its content hash matches; otherwise the
+  // genuine loopback behind it is misclassified as a peer's and this endpoint
+  // raises an RFC 6762 §9 conflict against itself.
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"probe", sent);
+  let peer_rx = RxEvidence::from_caller_parsed_cmsg(sent.wall - Duration::from_millis(500));
+  assert!(!tracker.take_at(Family::V4, b"probe", peer_rx, sent));
   // Our genuine loopback arrives at-or-after the send and is matched.
-  let loop_rx = sent + Duration::from_millis(1);
-  assert!(take_self_send(
-    &mut tracker,
+  let now = claim(sent, Duration::from_millis(1));
+  assert!(tracker.take_at(
+    Family::V4,
     b"probe",
-    loop_rx,
-    MatchMode::Ordered
+    RxEvidence::from_caller_parsed_cmsg(now.wall),
+    now
   ));
 }
 
-// on microsecond `timeval` sources (Apple/BSD)
-// RX_TIMESTAMP_GRAIN is 1µs, so a loopback whose kernel timestamp was
-// truncated to a slightly-earlier microsecond than our nanosecond send
-// time still counts as ours — but anything earlier than the grain is a
-// genuine pre-send (peer) datagram and must not match.
+// On microsecond `timeval` sources (Apple/BSD) RX_TIMESTAMP_GRAIN is 1µs, so a
+// loopback whose kernel timestamp was truncated to a slightly-earlier microsecond
+// than our nanosecond send time still counts as ours — but anything earlier than
+// the grain is a genuine pre-send (peer) datagram and must not match.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 #[test]
 fn self_send_ordered_tolerates_microsecond_truncation() {
   assert_eq!(hick_udp::RX_TIMESTAMP_GRAIN, Duration::from_micros(1));
-  let sent = SystemTime::now();
-  let mut tracker = Vec::new();
-  record_self_send(&mut tracker, b"trunc", sent);
-  let truncated_rx = sent - (hick_udp::RX_TIMESTAMP_GRAIN - Duration::from_nanos(1));
-  assert!(take_self_send(
-    &mut tracker,
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"trunc", sent);
+  let truncated_rx = sent.wall - (hick_udp::RX_TIMESTAMP_GRAIN - Duration::from_nanos(1));
+  assert!(tracker.take_at(
+    Family::V4,
     b"trunc",
-    truncated_rx,
-    MatchMode::Ordered
+    RxEvidence::from_caller_parsed_cmsg(truncated_rx),
+    sent
   ));
 
-  record_self_send(&mut tracker, b"trunc", sent);
-  let too_early = sent - (hick_udp::RX_TIMESTAMP_GRAIN + Duration::from_micros(4));
-  assert!(!take_self_send(
-    &mut tracker,
+  recorded_and_sealed(&mut tracker, Family::V4, b"trunc", sent);
+  let too_early = sent.wall - (hick_udp::RX_TIMESTAMP_GRAIN + Duration::from_micros(4));
+  assert!(!tracker.take_at(
+    Family::V4,
     b"trunc",
-    too_early,
-    MatchMode::Ordered
+    RxEvidence::from_caller_parsed_cmsg(too_early),
+    sent
   ));
 }
 
-// on nanosecond `SO_TIMESTAMPNS` (Linux/Android) the kernel
-// timestamp is exact, so RX_TIMESTAMP_GRAIN is zero and there is NO
-// pre-send tolerance: a byte-identical peer datagram stamped even 500ns
-// before our send must not steal the take-once credit.
+// On nanosecond `SO_TIMESTAMPNS` (Linux/Android) the kernel timestamp is exact,
+// so RX_TIMESTAMP_GRAIN is zero and there is NO pre-send tolerance: a
+// byte-identical peer datagram stamped even 500ns before our send must not steal
+// the take-once credit.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn self_send_ordered_nanosecond_rejects_pre_send() {
   assert_eq!(hick_udp::RX_TIMESTAMP_GRAIN, Duration::ZERO);
-  let sent = SystemTime::now();
-  let mut tracker = Vec::new();
-  record_self_send(&mut tracker, b"probe", sent);
-  let pre_send = sent - Duration::from_nanos(500);
-  assert!(!take_self_send(
-    &mut tracker,
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"probe", sent);
+  let pre_send = sent.wall - Duration::from_nanos(500);
+  assert!(!tracker.take_at(
+    Family::V4,
     b"probe",
-    pre_send,
-    MatchMode::Ordered
+    RxEvidence::from_caller_parsed_cmsg(pre_send),
+    sent
   ));
-  // The entry survives the non-match; our genuine loopback (at-or-after
-  // the send) is still matched.
-  assert!(take_self_send(
-    &mut tracker,
+  // The credit survives the non-match; our genuine loopback (at-or-after the
+  // send) is still matched.
+  assert!(tracker.take_at(
+    Family::V4,
     b"probe",
-    sent,
-    MatchMode::Ordered
+    RxEvidence::from_caller_parsed_cmsg(sent.wall),
+    sent
   ));
 }
 
+/// Degraded matching is reached by presenting NO kernel receive stamp, and it
+/// weighs content, family and the TTL — nothing else.
+///
+/// The old version of this test handed the claim a userspace read time and
+/// asserted it was weighed as a reference. That behaviour is gone, and its
+/// removal is the point: the only wall value a degraded claim can offer is a
+/// read time, which is at-or-after the send in every case except a wall clock
+/// that stepped backwards — so an ordering test against it could only ever fire
+/// on the step, and firing means refusing our own echo.
 #[test]
 fn self_send_degraded_matches_take_once_within_ttl() {
-  // with no kernel timestamp the reference is a userspace
-  // READ time (always at-or-after the send). Degraded mode matches on
-  // content hash alone within TTL, take-once. This is what keeps normal
-  // single-host operation correct on Windows / timestamp-less kernels.
-  let sent = SystemTime::now();
-  let mut tracker = Vec::new();
-  record_self_send(&mut tracker, b"win", sent);
-  let read = sent + Duration::from_millis(10);
-  assert!(take_self_send(
-    &mut tracker,
-    b"win",
-    read,
-    MatchMode::Degraded
-  ));
-  // Take-once: the credit is gone. (A byte-identical PEER datagram read
-  // next would now be treated as a peer — and, conversely, a pre-buffered
-  // peer datagram read first could consume this credit. That credit-theft
-  // exposure is the documented degradation when no kernel rx timestamp is
-  // available; ordered mode is what closes it.)
-  assert!(!take_self_send(
-    &mut tracker,
-    b"win",
-    read,
-    MatchMode::Degraded
-  ));
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"win", sent);
+  let now = claim(sent, Duration::from_millis(10));
+  assert!(tracker.take_at(Family::V4, b"win", RxEvidence::none(), now));
+  // Take-once: the credit is gone. A byte-identical PEER datagram read next
+  // would now be treated as a peer's — and, conversely, a pre-buffered peer
+  // datagram read first could consume this credit. That credit-theft exposure is
+  // the documented degradation when no kernel rx timestamp is available.
+  assert!(!tracker.take_at(Family::V4, b"win", RxEvidence::none(), now));
 }
 
 #[test]
 fn self_send_degraded_expires_after_ttl() {
-  let sent = SystemTime::now();
-  let mut tracker = Vec::new();
-  record_self_send(&mut tracker, b"win", sent);
-  let too_late = sent + SELF_SEND_TTL + Duration::from_millis(1);
-  assert!(!take_self_send(
-    &mut tracker,
-    b"win",
-    too_late,
-    MatchMode::Degraded
-  ));
+  // Nothing but the TTL bounds a degraded claim, and the TTL is monotonic.
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"win", sent);
+  let too_late = claim(sent, SELF_SEND_TTL + Duration::from_millis(1));
+  assert!(!tracker.take_at(Family::V4, b"win", RxEvidence::none(), too_late));
 }
 
 #[test]
 fn self_send_dual_stack_records_two_entries() {
-  // dual-stack fan-out records one entry per real send, so
-  // BOTH loopback copies are suppressed.
-  let t = SystemTime::now();
-  let mut tracker = Vec::new();
-  record_self_send(&mut tracker, b"resp", t);
-  record_self_send(&mut tracker, b"resp", t);
-  assert!(take_self_send(&mut tracker, b"resp", t, MatchMode::Ordered));
-  assert!(take_self_send(&mut tracker, b"resp", t, MatchMode::Ordered));
-  assert!(!take_self_send(
-    &mut tracker,
-    b"resp",
-    t,
-    MatchMode::Ordered
-  ));
+  // One logical transmit is TWO syscalls with identical bytes, so the fan-out
+  // records one credit per family and each echo claims only its own.
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"resp", sent);
+  recorded_and_sealed(&mut tracker, Family::V6, b"resp", sent);
+  assert_eq!(tracker.len(), 2);
+  let now = claim(sent, Duration::from_millis(1));
+  let rx = RxEvidence::from_caller_parsed_cmsg(now.wall);
+  assert!(tracker.take_at(Family::V4, b"resp", rx, now));
+  assert!(tracker.take_at(Family::V6, b"resp", rx, now));
+  // Both credits are spent; a third copy on either family is a peer's.
+  assert!(!tracker.take_at(Family::V4, b"resp", rx, now));
+  assert!(!tracker.take_at(Family::V6, b"resp", rx, now));
 }
 
 #[test]
 fn self_send_cap_declines_without_evicting_live_entries() {
-  // at capacity, record_self_send declines a new entry rather
-  // than evicting a still-live one (which would unmask a real loopback).
-  let t = SystemTime::now();
-  let mut tracker = vec![(fnv1a(b"live"), t); MAX_SELF_SEND_ENTRIES];
-  record_self_send(&mut tracker, b"overflow", t);
+  // At the cap the NEW credit is the one refused. Evicting a live one would
+  // unmask a real loopback as peer traffic, which is the expensive direction.
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  for _ in 0..MAX_SELF_SEND_ENTRIES {
+    tracker.record(Family::V4, b"live", sent);
+  }
+  // Sealed, so every resident credit's window is genuinely open and its TTL is
+  // genuinely running — an unsealed credit is retained by a different rule.
+  tracker.seal_at(sent.mono);
   assert_eq!(tracker.len(), MAX_SELF_SEND_ENTRIES);
-  // The would-be new entry was never added.
-  assert!(!take_self_send(
-    &mut tracker,
-    b"overflow",
-    t,
-    MatchMode::Ordered
-  ));
-  // A pre-existing live entry is still matchable.
-  assert!(take_self_send(&mut tracker, b"live", t, MatchMode::Ordered));
+
+  tracker.record(Family::V4, b"overflow", sent);
+  assert_eq!(tracker.len(), MAX_SELF_SEND_ENTRIES);
+
+  let now = claim(sent, Duration::from_millis(1));
+  let rx = RxEvidence::from_caller_parsed_cmsg(now.wall);
+  assert!(
+    !tracker.take_at(Family::V4, b"overflow", rx, now),
+    "the would-be new credit was refused, never admitted"
+  );
+  assert!(
+    tracker.take_at(Family::V4, b"live", rx, now),
+    "and a resident LIVE credit is still claimable by its own loopback"
+  );
+}
+
+/// A wall-clock step between the send and the echo used to make this endpoint
+/// ingest its own announcement as a peer's.
+///
+/// `Credit::sent`'s wall half is the only thing ordering an echo against its
+/// send, and it is not monotonic. When an NTP step, a `settimeofday`, or a VM
+/// resume moves it under a credit that is already waiting, that stamp describes a
+/// timeline the kernel's receive stamp was never taken on — and comparing the two
+/// refused our own echo, which reached the protocol layer as peer traffic and
+/// raised a phantom RFC 6762 §9 conflict against ourselves, once per step, for as
+/// long as the clock kept stepping.
+///
+/// Every claim now reads both clocks, and a credit whose two elapsed times
+/// disagree past `WALL_STEP_TOLERANCE` has its ordering evidence discarded rather
+/// than used against it.
+#[test]
+fn self_send_wall_step_no_longer_makes_us_ingest_our_own_echo_as_a_peer() {
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"announce", sent);
+
+  // A backwards step is the expensive direction, so that is the one presented:
+  // one millisecond of real time passed on the monotonic clock while the wall
+  // clock travelled ten seconds the other way.
+  const STEP: Duration = Duration::from_secs(10);
+  assert!(
+    STEP > WALL_STEP_TOLERANCE,
+    "the fixture must present a step large enough for the claim to detect"
+  );
+  let stepped = ClockPair::new(sent.wall - STEP, sent.mono + Duration::from_millis(1));
+  // The kernel stamped our own echo on the far side of the step, so it reads as
+  // predating the send it is the echo OF.
+  let rx = RxEvidence::from_caller_parsed_cmsg(stepped.wall + Duration::from_millis(1));
+
+  assert!(
+    tracker.take_at(Family::V4, b"announce", rx, stepped),
+    "the credit's wall stamp is not on the timeline this receive stamp was taken \
+     on, so the ordering evidence must be discarded rather than weighed — \
+     weighing it refuses our own echo and renames this service under §9"
+  );
+  assert!(tracker.is_empty(), "and the claim is still take-once");
+}
+
+/// The TTL is real elapsed time, so it is measured on the monotonic clock and a
+/// wall-clock step can neither expire a live credit nor resurrect a dead one.
+///
+/// Both directions are asserted, because a wall-measured age gets each one wrong
+/// in the opposite way: a forward step expires a credit whose echo is still in
+/// flight (our own datagram then reaches the protocol layer as a peer's), and a
+/// backward step keeps a credit alive past the window that bounds how long a
+/// co-resident peer's byte-identical datagram can be swallowed as our echo.
+///
+/// Both claims pass no receive stamp, so the subject is the age alone and not the
+/// ordering evidence a step also weakens.
+#[test]
+fn self_send_ttl_is_monotonic_so_a_wall_step_neither_expires_nor_resurrects() {
+  const HOURS: Duration = Duration::from_secs(3 * 3600);
+
+  // Hours forward on the wall clock, one millisecond of real time: still live.
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"probe", sent);
+  let wall_far_ahead = ClockPair::new(sent.wall + HOURS, sent.mono + Duration::from_millis(1));
+  assert!(
+    tracker.take_at(Family::V4, b"probe", RxEvidence::none(), wall_far_ahead),
+    "a wall clock that stepped hours forward is not hours of elapsed time; \
+     ageing on it would expire a credit whose echo is still in flight"
+  );
+
+  // Past the TTL of real time, hours BACKWARD on the wall clock — which a
+  // wall-measured age reads as no age at all: dead anyway.
+  let mut tracker = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut tracker, Family::V4, b"probe", sent);
+  let mono_expired = ClockPair::new(
+    sent.wall - HOURS,
+    sent.mono + SELF_SEND_TTL + Duration::from_millis(1),
+  );
+  assert!(
+    !tracker.take_at(Family::V4, b"probe", RxEvidence::none(), mono_expired),
+    "real elapsed time is past the TTL, so these bytes are a co-resident peer's \
+     and not our echo; no wall-clock reading may resurrect the credit"
+  );
 }
 
 // NOTE: the deleted driver-goodbye-queue seam tests
@@ -2177,8 +2288,8 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
 /// A unicast datagram leaves for the querier's own address and ephemeral port and
 /// never loops back through the multicast group we joined, so a credit recorded
 /// for it can never be consumed. It would occupy the linear-scanned tracker for
-/// `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines the
-/// NEW entry — so a legacy-query flood would starve the genuine multicast credits
+/// [`SELF_SEND_TTL`], and at [`MAX_SELF_SEND_ENTRIES`] the NEW credit is the one
+/// refused — so a legacy-query flood would starve the genuine multicast credits
 /// that loopback suppression depends on.
 #[cfg(feature = "tokio")]
 #[tokio::test]
@@ -2199,7 +2310,7 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
 
   let v4 = Some(Arc::new(sender));
   let v6: Option<Arc<<Net as agnostic_net::Net>::UdpSocket>> = None;
-  let mut tracker: Vec<(u64, SystemTime)> = Vec::new();
+  let mut tracker = SelfSendTracker::new();
   #[cfg(feature = "stats")]
   let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
 
@@ -2232,7 +2343,8 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
   assert!(
     tracker.is_empty(),
     "a unicast reply never loops back, so it must record NO self-send credit; \
-     tracker = {tracker:?}"
+     the tracker holds {}",
+    tracker.len()
   );
 }
 
@@ -2630,7 +2742,7 @@ impl UdpSocket for TestSocket {
 async fn wedged_v6_round(body: &[u8]) -> (StdInstant, Fanout, Duration) {
   let v4 = Some(Arc::new(TestSocket::new(SendBehaviour::Accepts)));
   let v6 = Some(Arc::new(TestSocket::new(SendBehaviour::Wedged)));
-  let mut tracker: Vec<(u64, SystemTime)> = Vec::new();
+  let mut tracker = SelfSendTracker::new();
   #[cfg(feature = "stats")]
   let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
 
@@ -3173,7 +3285,7 @@ async fn a_stalled_send_re_opens_its_family_from_the_wire_not_the_offer() {
   let wire_log = sock.wire_log();
   let v4 = Some(Arc::new(sock));
   let v6: Option<Arc<TestSocket>> = None;
-  let mut tracker: Vec<(u64, SystemTime)> = Vec::new();
+  let mut tracker = SelfSendTracker::new();
   #[cfg(feature = "stats")]
   let stats = std::sync::Arc::new(hick_trace::stats::Stats::default());
   let mut gate = FamilyWireGate::default();
@@ -3909,4 +4021,239 @@ fn draw_first_probe(proto: &mut ProtoService, buf: &mut [u8]) -> StdInstant {
     }
   }
   panic!("no probe was drawn within the §8.1 initial delay");
+}
+
+/// A monotonic instant `age` in the past, waiting for the clock if this process
+/// has not been up that long yet.
+///
+/// `StdInstant` has no constructor and no epoch, so the only way to name an
+/// instant a whole `SELF_SEND_TTL` ago is to subtract from a live reading — which
+/// a process younger than the TTL cannot do. Waiting is a bounded precondition,
+/// not a skip: the assertions below always run.
+#[cfg(feature = "tokio")]
+fn monotonic_instant_ago(age: Duration) -> StdInstant {
+  loop {
+    if let Some(t) = StdInstant::now().checked_sub(age) {
+      return t;
+    }
+    std::thread::sleep(Duration::from_millis(25));
+  }
+}
+
+/// The claim window must be open BEFORE the driver can receive, or the TTL bounds
+/// nothing on the path it exists to bound.
+///
+/// `driver_task` records this iteration's sends in `drain_transmits` /
+/// `drain_withdrawals` and then parks in `select_biased!`, which handles a
+/// received packet in that SAME iteration. A credit that is still unsealed when
+/// the park returns is live UNCONDITIONALLY — `still_live` reads `aged_from:
+/// None` as "no window has opened, so nothing can have been missed" — so a
+/// byte-identical peer datagram arriving arbitrarily long after the send would be
+/// swallowed as our own echo. The park is bounded only by the next protocol
+/// deadline, which can be seconds away or absent.
+///
+/// So the seal is placed after the drains and before the park, and this test
+/// stands on that placement: it seals the credit exactly as the loop does, ages
+/// it past `SELF_SEND_TTL`, and drives the production receive path. Remove the
+/// seal from `driver_task` — the state this test builds is then precisely what
+/// the loop hands `handle_packet` — and the credit is consumed instead of
+/// refused.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn a_credit_sealed_before_the_park_expires_across_it_and_cannot_suppress_a_peer() {
+  use std::net::{IpAddr, Ipv4Addr};
+
+  let opts = crate::options::ServerOptions::default();
+  let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+    v4: None,
+    v6: None,
+    interface_index: 0,
+  };
+  let mut state = DriverState::new(&opts, sockets);
+
+  // A QR=0 query body, so the §11 untrusted-response gate cannot be what refuses
+  // it and the datagram genuinely reaches the self-send match.
+  let body = vec![0u8; 12];
+  state.selfsend.record(Family::V4, &body, ClockPair::now());
+  assert_eq!(state.selfsend.len(), 1, "the send recorded its credit");
+
+  // The seal the loop performs after its drains, with the window opened longer
+  // ago than the TTL — which is what a park longer than the TTL amounts to.
+  let opened = monotonic_instant_ago(SELF_SEND_TTL + Duration::from_millis(250));
+  state.selfsend.seal_at(opened);
+  #[cfg(debug_assertions)]
+  state.note_park_entry();
+
+  // The park ends with a byte-identical datagram from a co-resident peer, on
+  // port 5353 and on-link, offered to the production receive path.
+  state.handle_packet(Packet {
+    src: "192.0.2.9:5353".parse().unwrap(),
+    data: body.clone(),
+    family: Family::V4,
+    local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+    interface_index: 0,
+    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    hop_limit: Some(255),
+  });
+
+  assert_eq!(
+    state.selfsend.len(),
+    1,
+    "the credit's window opened more than SELF_SEND_TTL before this datagram \
+     arrived, so these bytes are a peer's and the credit must NOT be consumed; \
+     an unsealed credit would have been spent here however long the park lasted"
+  );
+}
+
+/// The seal must PRECEDE the park, and this pins the ordering rather than the
+/// state left behind.
+///
+/// "Nothing is unsealed" is true at the receive whichever side of the park the
+/// seal happened on, so a driver that sealed in its receive arm — after an
+/// arbitrarily long park, with every credit anchored that late — satisfies a
+/// state check placed there. What separates the two is *when* the window opened,
+/// and `SelfSendTracker::seal_generation` is what makes that observable: the
+/// boundary records which seal it is relying on, and the receive requires that
+/// no window has opened since.
+///
+/// The three phases below are the loop's, in the loop's order.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn the_seal_predates_the_park_and_the_generation_proves_it() {
+  use std::net::{IpAddr, Ipv4Addr};
+
+  let opts = crate::options::ServerOptions::default();
+  let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+    v4: None,
+    v6: None,
+    interface_index: 0,
+  };
+  let mut state = DriverState::new(&opts, sockets);
+  let body = vec![0u8; 12];
+
+  // Phase 1 — the pumps record. Until the seal these credits are ageless, which
+  // is exactly the state a receive must never be reached in.
+  state.selfsend.record(Family::V4, &body, ClockPair::now());
+  assert!(
+    state.selfsend.has_unsealed(),
+    "a freshly recorded credit has no window yet; this is the state a seal \
+     placed after the park would leave standing across it"
+  );
+  let before_seal = state.selfsend.seal_generation();
+
+  // Phase 2 — the park entry. Both halves of the contract become true
+  // here and nowhere later.
+  state.selfsend.seal();
+  assert!(
+    !state.selfsend.has_unsealed(),
+    "the boundary seal must close every credit the pumps recorded"
+  );
+  let at_boundary = state.selfsend.seal_generation();
+  // The park entry, exactly as `driver_task` reaches it.
+  #[cfg(debug_assertions)]
+  state.note_park_entry();
+  assert_eq!(
+    at_boundary,
+    before_seal + 1,
+    "the boundary seal opened exactly one window"
+  );
+
+  // Phase 3 — the park, then a receive. The park itself performs no tracker
+  // operation, which is the whole claim: the generation observed at the receive
+  // must be the one the boundary recorded.
+  state.handle_packet(Packet {
+    src: "192.0.2.9:5353".parse().unwrap(),
+    data: body.clone(),
+    family: Family::V4,
+    local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+    interface_index: 0,
+    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    hop_limit: Some(255),
+  });
+  assert_eq!(
+    state.selfsend.seal_generation(),
+    at_boundary,
+    "no claim window may open between the park entry and the receive; a \
+     seal that ran in the receive arm would show up here as a later generation"
+  );
+
+  // And the credit really was claimable, so the ordering above was exercised
+  // against a live match rather than a vacuous one.
+  assert!(
+    state.selfsend.is_empty(),
+    "the datagram matched its own credit, so this test weighed a real claim"
+  );
+}
+
+/// The reactor has a receive path that never parks, and the seal-ordering check
+/// must not fire on it.
+///
+/// When a drain reports work still pending, `driver_task` does NOT park: it
+/// drains a bounded batch of commands and `continue`s straight back to the packet
+/// pump, so the next datagram it handles arrives with no park behind it. The seal
+/// that ran on the way there legitimately advanced the generation, and there is
+/// no park entry between it and that receive — so a generation comparison made
+/// unconditionally would compare against a park one or more iterations old and
+/// panic on correct sealing, killing the driver task on an ordinary backlog.
+///
+/// This walks the production sequence with the production drains — pump, drains,
+/// `seal`, no park entry, pump again — rather than announcing the boundary by
+/// hand, which is exactly why it catches what a hand-called park entry cannot.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receive_reached_without_parking_is_not_weighed_against_a_stale_park() {
+  use std::net::{IpAddr, Ipv4Addr};
+
+  let mut state = scripted_state(
+    false,
+    TestSocket::new(SendBehaviour::Accepts),
+    TestSocket::new(SendBehaviour::Accepts),
+  );
+  let now = StdInstant::now();
+  let mut r = mdns_proto::ServiceRecords::new(
+    mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    mdns_proto::Name::try_from_str("svc._ipp._tcp.local.").unwrap(),
+    mdns_proto::Name::try_from_str("host.local.").unwrap(),
+    631,
+    120,
+  );
+  r.add_a(Ipv4Addr::new(192, 168, 1, 10));
+  let _reg = state
+    .register_service(mdns_proto::ServiceSpec::new(r), now)
+    .unwrap();
+
+  let mut scratch = vec![0u8; 1500];
+
+  // One whole pass of the real drains, which is what records this iteration's
+  // credits.
+  let _ = drive_one_pass(&mut state, &mut scratch).await;
+  // The loop's own seal, after every record stage.
+  state.selfsend.seal();
+  // And then the `more_pending` branch: a bounded command drain and `continue`.
+  // NO park entry runs on this path, which is the whole point — the capture is
+  // cleared by the seal above and nothing re-establishes it.
+  #[cfg(debug_assertions)]
+  {
+    state.sealed_generation_at_park = None;
+  }
+
+  // Next iteration's packet pump. A datagram arriving here has no park behind it.
+  // Before this fix the generation comparison ran anyway, against a park that
+  // never happened, and panicked inside the driver task.
+  state.handle_packet(Packet {
+    src: "192.0.2.9:5353".parse().unwrap(),
+    data: vec![0u8; 12],
+    family: Family::V4,
+    local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+    interface_index: 0,
+    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    hop_limit: Some(255),
+  });
+
+  // The unconditional half still holds on this path: a receive reached without
+  // parking must still find every credit sealed.
+  assert!(
+    !state.selfsend.has_unsealed(),
+    "the seal before the `continue` must leave nothing unsealed, park or no park"
+  );
 }
