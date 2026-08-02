@@ -195,17 +195,46 @@ where
   /// Returns `Ok(None)` when no send is currently due, or when the
   /// handle does not correspond to an active query (use
   /// [`Self::poll_query`] to observe terminal updates separately).
+  ///
+  /// # Why a clock, not an instant
+  ///
+  /// `clock` is the caller's monotonic source, and it is read INSIDE this call —
+  /// after the handle is resolved, immediately before [`Query::poll_transmit`]
+  /// weighs it against the `QuerySpec::with_timeout` deadline. That deadline
+  /// bounds ADMISSION, and admission is that comparison rather than this call's
+  /// return: the reading has to be taken where the decision is, because
+  /// everything before it — the handle resolution here most of all — is time a
+  /// reading taken earlier would not know about. What the datagram then costs on
+  /// the way to a wire is the driver's, and is what `QuerySpec::with_timeout`
+  /// bounds instead of pretending to eliminate.
+  ///
+  /// An instant parameter could not be: resolving `handle` walks the query pool,
+  /// whose length is the caller's choice and which this crate puts no ceiling on,
+  /// so a value sampled before this call can be stale before the comparison it
+  /// was sampled for — and on a preemptible host so can one sampled a single
+  /// statement earlier. Taking the clock instead of
+  /// its reading leaves no parameter through which a stale reading can arrive.
+  /// It is invoked at most once, and only when a datagram is otherwise due.
   pub fn poll_query_transmit(
     &mut self,
     handle: QueryHandle,
-    now: I,
+    clock: impl FnOnce() -> I,
     buf: &mut [u8],
   ) -> Result<Option<Transmit>, TransmitError> {
     let Some(key) = self.query_key(handle) else {
       return Ok(None);
     };
+    #[cfg(all(test, feature = "std"))]
+    {
+      // The scan above, made observable: see `query_resolve_stall`.
+      if let Some(stall) = self.query_resolve_stall.take()
+        && !stall.is_zero()
+      {
+        std::thread::sleep(stall);
+      }
+    }
     match self.queries.get_mut(key) {
-      Some(q) => q.poll_transmit(now, buf),
+      Some(q) => q.poll_transmit(clock, buf),
       None => Ok(None),
     }
   }

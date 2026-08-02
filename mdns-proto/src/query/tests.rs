@@ -50,9 +50,13 @@ fn make_query(qtype: ResourceType, qclass: ResourceClass) -> TestQuery {
 }
 
 fn inject_a_record(q: &mut TestQuery, msg: &[u8]) {
+  inject_a_record_at(q, msg, StdInstant::now());
+}
+
+fn inject_a_record_at(q: &mut TestQuery, msg: &[u8], now: StdInstant) {
   let reader = MessageReader::try_parse(msg).unwrap();
   let record = reader.answers().next().unwrap().unwrap();
-  q.handle_event(QueryEvent::Answer(record));
+  q.handle_event(QueryEvent::Answer(record), now);
 }
 
 // ── dedupe ───────────────────────────────────────────────────────────
@@ -415,7 +419,7 @@ fn fixed_capacity_pool_below_max_answers_evicts_and_advances_seq() {
     let msg = make_a_response(b"printer", [10, 0, 0, i]);
     let reader = MessageReader::try_parse(&msg).unwrap();
     let record = reader.answers().next().unwrap().unwrap();
-    q.handle_event(QueryEvent::Answer(record));
+    q.handle_event(QueryEvent::Answer(record), StdInstant::now());
   }
 
   // The pool stays at its own hard capacity (2), NOT max_answers (10).
@@ -472,7 +476,7 @@ fn query_emits_unicast_response_bit_when_spec_set() {
   );
 
   let mut buf = [0u8; 512];
-  let result = q.poll_transmit(now, &mut buf).unwrap();
+  let result = q.poll_transmit(|| now, &mut buf).unwrap();
   let n = result.expect("expected a transmit to be produced").size();
 
   // Parse the datagram and inspect the question's QU bit.
@@ -507,7 +511,7 @@ fn query_omits_unicast_response_bit_by_default() {
   );
 
   let mut buf = [0u8; 512];
-  let result = q.poll_transmit(now, &mut buf).unwrap();
+  let result = q.poll_transmit(|| now, &mut buf).unwrap();
   let n = result.expect("expected a transmit to be produced").size();
 
   let reader = MessageReader::try_parse(&buf[..n]).expect("datagram must parse");
@@ -599,6 +603,384 @@ fn query_without_timeout_deadline_does_not_cancel_early() {
   );
 }
 
+/// A send armed INSIDE the caller's window but drained after it must not be
+/// admitted, and the query must still END — visibly, through the deadline's own
+/// owner.
+///
+/// `handle_timeout` arms the retry at one instant; `poll_transmit` drains it at a
+/// later one, and no entry point in between weighs that later instant. A
+/// `poll_transmit` that ignores its own `now` therefore admits a question after
+/// the deadline `QuerySpec::with_timeout` promised would end the query — and
+/// admission is the boundary that promise names, so this is where it is kept.
+///
+/// THREE things are asserted, and the middle one is why this is not simply a
+/// terminal taken here. "No transmit" alone would hold for a query that silently
+/// stalls, so the withheld send must leave the deadline still visible in
+/// `poll_timeout` — the wakeup every driver already folds into its park — and
+/// `handle_timeout` must then produce the terminal. A terminal taken by
+/// `poll_transmit` instead would be a state change reported as the same
+/// `Ok(None)` an idle poll returns: unobservable, with the query's last standing
+/// wakeup cleared by it, so a driver parked on that query would never be woken
+/// for the terminal it just took.
+#[test]
+fn a_send_drained_past_the_absolute_deadline_is_never_emitted() {
+  use core::time::Duration;
+
+  let handle = QueryHandle::from_raw(0);
+  let qname = Name::try_from_str("host.local.").unwrap();
+  let t0 = StdInstant::now();
+  // Wide enough that the first send AND the first §5.2 retry (+1 s) are both
+  // armed inside the window: the drain below is the only step outside it.
+  let deadline = t0.checked_add(Duration::from_millis(2500)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    handle,
+    qname,
+    ResourceType::A,
+    ResourceClass::In,
+    50,
+    false,
+    Some(deadline),
+  );
+
+  let mut buf = [0u8; 512];
+  assert!(
+    q.poll_transmit(|| t0, &mut buf).unwrap().is_some(),
+    "the first send is inside the window and must go out"
+  );
+  q.note_transmit_outcome(t0, TransmitDelivery::ALL);
+
+  // The retry falls due inside the window and arms a transmit.
+  let armed_at = t0.checked_add(Duration::from_secs(1)).unwrap();
+  q.handle_timeout(armed_at).unwrap();
+  assert!(q.transmit_pending, "the §5.2 retry must be armed");
+  assert!(
+    !q.done,
+    "arming a retry inside the window must not end the query"
+  );
+
+  // The driver drains it only after the caller's deadline has passed.
+  let drained_at = t0.checked_add(Duration::from_secs(3)).unwrap();
+  assert!(
+    q.poll_transmit(|| drained_at, &mut buf).unwrap().is_none(),
+    "no question may be admitted at or after the caller's absolute deadline"
+  );
+  assert!(
+    !q.done,
+    "withholding is the whole of it — a terminal taken here would be reported \
+     as the same Ok(None) an idle poll returns, so no caller could see it"
+  );
+  assert!(
+    q.poll().is_none(),
+    "and no terminal update may be queued behind that indistinguishable Ok(None)"
+  );
+
+  // The query still ends, on the wakeup the driver has already scheduled.
+  assert_eq!(
+    q.poll_timeout(),
+    Some(deadline),
+    "the withheld send must leave the deadline standing in poll_timeout — that \
+     is the wakeup that ends the query, and clearing it is what would strand one"
+  );
+  q.handle_timeout(drained_at).unwrap();
+  assert!(
+    q.done,
+    "a query past its deadline must END, not stall with a send still armed"
+  );
+  assert!(
+    matches!(q.poll(), Some(QueryUpdate::Timeout)),
+    "the terminal is the QueryUpdate::Timeout its one owner produces"
+  );
+  assert!(
+    q.poll_timeout().is_none(),
+    "a terminated query must arm no further wakeup"
+  );
+}
+
+/// A send drained INSIDE the window is untouched. The deadline gates on the
+/// instant, never on the mere presence of a deadline, and it closes the window on
+/// the same `now >= deadline` boundary `handle_timeout` uses — not one tick early.
+#[test]
+fn a_send_drained_inside_the_absolute_deadline_still_goes_out() {
+  use core::time::Duration;
+
+  let handle = QueryHandle::from_raw(0);
+  let qname = Name::try_from_str("host.local.").unwrap();
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_secs(5)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    handle,
+    qname,
+    ResourceType::A,
+    ResourceClass::In,
+    51,
+    false,
+    Some(deadline),
+  );
+
+  let mut buf = [0u8; 512];
+  assert!(
+    q.poll_transmit(|| t0, &mut buf).unwrap().is_some(),
+    "the first send is inside the window and must go out"
+  );
+  q.note_transmit_outcome(t0, TransmitDelivery::ALL);
+
+  let armed_at = t0.checked_add(Duration::from_secs(1)).unwrap();
+  q.handle_timeout(armed_at).unwrap();
+  assert!(
+    q.poll_transmit(|| armed_at, &mut buf).unwrap().is_some(),
+    "a retry drained well inside the window must still be sent"
+  );
+  assert!(
+    !q.done,
+    "a query inside its window must not be terminated by a transmit poll"
+  );
+}
+
+/// Admission is the COMPARISON, and the only way to see that it is not the
+/// RETURN is to make time pass between them.
+///
+/// `poll_transmit` weighs the caller's window and then — still inside the same
+/// call — encodes the question and hands back the datagram. That stretch is real
+/// work on a preemptible host, so it can outlive the window; and a comparison
+/// placed after it could no more be atomic with the return than this one is with
+/// the encode. The promise is therefore made at the last point where the outcome
+/// is still open, and the stretch below it is stated as overshoot on
+/// `QuerySpec::with_timeout` rather than chased.
+///
+/// The stall is what no test can ask a real host for, so it is injected exactly
+/// there. The window is open at the comparison and shut by the time the call
+/// returns: were the boundary the return, this poll would have to withhold, and
+/// the assertion below would fail.
+#[test]
+fn a_question_admitted_inside_the_window_is_produced_though_the_call_returns_after_it() {
+  use core::time::Duration;
+
+  /// The caller's window, wide enough that reaching the comparison inside it is
+  /// not a race.
+  const WINDOW: Duration = Duration::from_millis(300);
+  /// What the stretch after the comparison costs when it outlives the window.
+  const ENCODE_PAST: Duration = Duration::from_millis(450);
+
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(WINDOW).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    QueryHandle::from_raw(0),
+    Name::try_from_str("host.local.").unwrap(),
+    ResourceType::A,
+    ResourceClass::In,
+    53,
+    false,
+    Some(deadline),
+  );
+
+  let mut buf = [0u8; 512];
+  q.stall_after_admission_for_test(ENCODE_PAST);
+  assert!(
+    StdInstant::now() < deadline,
+    "premise: the window must still be open when the poll begins, so the only \
+     thing that can shut it is the stretch after the comparison"
+  );
+  let drawn = q.poll_transmit(StdInstant::now, &mut buf).unwrap();
+  let returned_at = StdInstant::now();
+  assert!(
+    returned_at >= deadline,
+    "premise: the call must have outlived the window, or nothing was returned \
+     past a deadline and the assertion below is vacuous"
+  );
+  assert!(
+    drawn.is_some(),
+    "a question committed to while the window was open must still be produced: \
+     admission is the comparison, and the encode and the return that follow it \
+     are the overshoot QuerySpec::with_timeout states, not a second boundary"
+  );
+
+  // The boundary that WAS crossed still ends the query, through its one owner.
+  q.note_transmit_outcome(returned_at, TransmitDelivery::ALL);
+  assert!(
+    !q.done,
+    "admitting a question must not terminate the query, however long the call \
+     that produced it took"
+  );
+  assert_eq!(
+    q.poll_timeout(),
+    Some(deadline),
+    "the deadline the question was admitted against must still be the standing \
+     wakeup — it is what ends the query"
+  );
+  q.handle_timeout(returned_at).unwrap();
+  assert!(
+    q.done,
+    "the query must end on its deadline, on the tick its owner observes"
+  );
+}
+
+/// An answer applied on or after the caller's absolute deadline is refused —
+/// and refused before it can EVICT one collected while the window was open.
+///
+/// The endpoint applies matching answers eagerly on receive, and a driver whose
+/// receive side runs ahead of its timer pump reaches a query no timer has ended
+/// yet — `hick-mio` ingests datagrams before it fires deadlines, `hick-reactor`
+/// drains queued packets first and prefers a ready packet to a
+/// simultaneously-ready timer.
+/// Left to land it would not merely add a late result: answers are capped and
+/// the cap evicts FIFO, so the late one can displace a result the caller had
+/// already earned inside its window. The cap is 1 here so that displacement is
+/// what is asserted, rather than something the default 256 hides.
+#[test]
+fn an_answer_applied_past_the_absolute_deadline_is_refused_and_evicts_nothing() {
+  use core::time::Duration;
+
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_millis(200)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    QueryHandle::from_raw(0),
+    Name::try_from_str("printer.local.").unwrap(),
+    ResourceType::A,
+    ResourceClass::In,
+    54,
+    false,
+    Some(deadline),
+  );
+  q.set_max_answers(1);
+
+  let early = make_a_response(b"printer", [192, 168, 1, 10]);
+  inject_a_record_at(&mut q, &early, t0);
+  assert_eq!(
+    q.answers.len(),
+    1,
+    "an answer applied while the window was open must be collected"
+  );
+
+  let after = t0.checked_add(Duration::from_millis(400)).unwrap();
+  let late = make_a_response(b"printer", [192, 168, 1, 11]);
+  inject_a_record_at(&mut q, &late, after);
+
+  assert_eq!(
+    q.collected_answers().count(),
+    1,
+    "the late answer must not be collected"
+  );
+  assert_eq!(
+    q.collected_answers().next().unwrap().rdata_slice(),
+    &[192, 168, 1, 10],
+    "the in-window answer must still be the one held: a late answer admitted \
+     into a full set evicts FIFO, so accepting it would take away a result the \
+     caller obtained inside the window it was promised"
+  );
+  assert_eq!(
+    q.accepted_count(),
+    1,
+    "a refused answer must not be accounted as collected either"
+  );
+
+  // Refused, and nothing more — the terminal stays with `handle_timeout`.
+  assert!(
+    !q.done,
+    "refusing a late answer must not terminate the query"
+  );
+  assert!(
+    q.poll().is_none(),
+    "and it must queue no terminal update of its own"
+  );
+  assert_eq!(
+    q.poll_timeout(),
+    Some(deadline),
+    "the deadline must still stand as the wakeup that ends the query"
+  );
+}
+
+/// The refusal gates on the instant, never on the mere presence of a deadline:
+/// an answer applied one tick INSIDE the window is collected as it always was.
+#[test]
+fn an_answer_applied_inside_the_absolute_deadline_is_still_collected() {
+  use core::time::Duration;
+
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_secs(5)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    QueryHandle::from_raw(0),
+    Name::try_from_str("printer.local.").unwrap(),
+    ResourceType::A,
+    ResourceClass::In,
+    55,
+    false,
+    Some(deadline),
+  );
+
+  let msg = make_a_response(b"printer", [192, 168, 1, 10]);
+  inject_a_record_at(&mut q, &msg, t0.checked_add(Duration::from_secs(4)).unwrap());
+  assert_eq!(
+    q.answers.len(),
+    1,
+    "an answer applied inside the caller's window must be collected"
+  );
+}
+
+/// The deadline `poll_transmit` weighs governs a datagram THIS call would have
+/// produced, and nothing else. Re-polling while the previous datagram is still
+/// awaiting its `note_transmit_outcome` is explicitly legal — the send itself may
+/// outlast the window — and it must stay the pure no-op it has always been:
+/// there is no datagram to withhold, and any decision taken there would land on
+/// a query whose commit token is still live.
+///
+/// The deadline is not lost by waiting, only left to its owner: once the token
+/// is resolved, `handle_timeout` fires it.
+#[test]
+fn a_transmit_poll_past_the_deadline_does_not_retire_an_unconfirmed_send() {
+  use core::time::Duration;
+
+  let handle = QueryHandle::from_raw(0);
+  let qname = Name::try_from_str("host.local.").unwrap();
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_millis(100)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    handle,
+    qname,
+    ResourceType::A,
+    ResourceClass::In,
+    52,
+    false,
+    Some(deadline),
+  );
+
+  let mut buf = [0u8; 512];
+  assert!(
+    q.poll_transmit(|| t0, &mut buf).unwrap().is_some(),
+    "the first send is inside the window and must go out"
+  );
+  assert!(q.awaiting_send_confirm, "the commit token must be live");
+
+  // The send outlives the window and the driver re-polls before confirming.
+  let past = t0.checked_add(Duration::from_millis(200)).unwrap();
+  assert!(
+    q.poll_transmit(|| past, &mut buf).unwrap().is_none(),
+    "a re-poll during the confirm window produces no second datagram"
+  );
+  assert!(
+    !q.done,
+    "the query must not be retired while its datagram's commit token is live"
+  );
+
+  // The confirm resolves against a live query, as the driver was promised.
+  q.note_transmit_outcome(past, TransmitDelivery::ALL);
+  assert!(!q.awaiting_send_confirm, "the commit token must be resolved");
+  assert!(!q.done, "confirming a delivered send does not retire the query");
+
+  // The deadline was deferred, not dropped: its own entry point still fires it.
+  q.handle_timeout(past).unwrap();
+  assert!(q.done, "handle_timeout must still fire the passed deadline");
+  assert!(
+    matches!(q.poll(), Some(QueryUpdate::Timeout)),
+    "the deferred deadline produces the same terminal"
+  );
+}
+
 // ── poll_timeout includes timeout_deadline ───────────────────
 
 /// `poll_timeout` must return the EARLIER of `next_deadline` (retry backoff)
@@ -643,7 +1025,7 @@ fn poll_timeout_reflects_absolute_timeout() {
   // past the 100 ms timeout). handle_timeout(now) is then a no-op: the retry is
   // not yet due.
   let mut buf = [0u8; 512];
-  let _ = q.poll_transmit(now, &mut buf).unwrap();
+  let _ = q.poll_transmit(|| now, &mut buf).unwrap();
   q.note_transmit_outcome(now, TransmitDelivery::ALL);
   q.handle_timeout(now).unwrap();
   assert!(!q.done, "query must not be done immediately");
@@ -704,7 +1086,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
 
   // First send (the initial query) is immediately due.
   assert!(
-    q.poll_transmit(now, &mut buf).unwrap().is_some(),
+    q.poll_transmit(|| now, &mut buf).unwrap().is_some(),
     "initial query must be sent at now"
   );
   // the retry is scheduled on a CONFIRMED delivery, not at encode
@@ -724,7 +1106,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
   // second datagram (no duplicate at now).
   q.handle_timeout(now).unwrap();
   assert!(
-    q.poll_transmit(now, &mut buf).unwrap().is_none(),
+    q.poll_transmit(|| now, &mut buf).unwrap().is_none(),
     "no duplicate query may be emitted at now"
   );
   assert_eq!(
@@ -737,7 +1119,7 @@ fn first_retry_is_one_second_and_no_same_tick_duplicate() {
   // following retry is scheduled 2s later (now + 3s), honouring the ≥2x backoff.
   q.handle_timeout(one_sec).unwrap();
   assert!(
-    q.poll_transmit(one_sec, &mut buf).unwrap().is_some(),
+    q.poll_transmit(|| one_sec, &mut buf).unwrap().is_some(),
     "first retry must be sent at now + 1s"
   );
   q.note_transmit_outcome(one_sec, TransmitDelivery::ALL);
@@ -776,7 +1158,7 @@ fn failed_send_does_not_consume_retry_budget() {
   // out, and must keep re-attempting (transmit due again after the backoff).
   let mut t = now;
   for _ in 0..50 {
-    let sent = q.poll_transmit(t, &mut buf).unwrap().is_some();
+    let sent = q.poll_transmit(|| t, &mut buf).unwrap().is_some();
     assert!(sent, "query must keep attempting to send while undelivered");
     q.note_transmit_outcome(t, TransmitDelivery::NONE); // all sockets failed
     assert!(!q.is_done(), "an undelivered query must NOT time out");
@@ -792,7 +1174,7 @@ fn failed_send_does_not_consume_retry_budget() {
 
   // Now let a send succeed: the budget finally advances and normal backoff
   // resumes (first confirmed retry at +1s).
-  assert!(q.poll_transmit(t, &mut buf).unwrap().is_some());
+  assert!(q.poll_transmit(|| t, &mut buf).unwrap().is_some());
   q.note_transmit_outcome(t, TransmitDelivery::ALL);
   let plus_1s = t.checked_add(Duration::from_secs(1)).unwrap();
   assert_eq!(
@@ -822,7 +1204,7 @@ fn query_retry_anchored_to_confirmation_time() {
     None,
   );
   let mut buf = [0u8; 512];
-  assert!(q.poll_transmit(t0, &mut buf).unwrap().is_some());
+  assert!(q.poll_transmit(|| t0, &mut buf).unwrap().is_some());
 
   // The send completes 5 s later — longer than the 1 s first backoff.
   let send_done = t0.checked_add(Duration::from_secs(5)).unwrap();
@@ -909,7 +1291,7 @@ fn txid_accessor_returns_transaction_id() {
 #[test]
 fn truncated_event_collects_nothing() {
   let mut q = make_query(ResourceType::Any, ResourceClass::Any);
-  q.handle_event(QueryEvent::Truncated);
+  q.handle_event(QueryEvent::Truncated, StdInstant::now());
   assert_eq!(q.answers.len(), 0, "a Truncated event collects no answer");
 }
 
@@ -992,6 +1374,64 @@ fn note_duplicate_question_is_noop_when_done() {
   assert!(q.is_done());
 }
 
+/// §7.3 suppression stops at the caller's absolute deadline, on the same
+/// comparison an answer is refused on.
+///
+/// This path is reached past the boundary only because drivers pump received
+/// packets before they fire timers, so the query is still live when a peer's
+/// duplicate lands. Consuming it would spend a §5.2 slot — and, at the end of
+/// the budget, take that budget's terminal — for a query the caller's window has
+/// already closed, while there is no retransmission left to suppress: every
+/// question from the boundary on is withheld anyway.
+#[test]
+fn a_duplicate_question_past_the_absolute_deadline_suppresses_nothing() {
+  use core::time::Duration;
+
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_millis(200)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    QueryHandle::from_raw(0),
+    Name::try_from_str("host.local.").unwrap(),
+    ResourceType::A,
+    ResourceClass::In,
+    56,
+    false,
+    Some(deadline),
+  );
+  assert!(
+    q.transmit_pending,
+    "premise: a send is armed, so without the deadline this would suppress"
+  );
+
+  let after = t0.checked_add(Duration::from_millis(400)).unwrap();
+  assert!(
+    !q.note_duplicate_question(after),
+    "a peer's duplicate seen past the caller's deadline must consume no slot"
+  );
+  assert_eq!(q.retry_count, 0, "and must not advance the §5.2 budget");
+  assert!(
+    q.transmit_pending,
+    "nor clear the arming it would otherwise have consumed"
+  );
+  assert!(
+    !q.done,
+    "nor take a terminal — that stays with handle_timeout"
+  );
+  assert_eq!(
+    q.poll_timeout(),
+    Some(deadline),
+    "the deadline must still stand as the wakeup that ends the query"
+  );
+
+  // Control: the same duplicate INSIDE the window suppresses as it always has,
+  // so what refused it above is the instant and not the deadline's presence.
+  assert!(
+    q.note_duplicate_question(t0),
+    "a duplicate inside the window must still consume the slot"
+  );
+}
+
 #[test]
 fn retry_budget_exhaustion_retires_the_query() {
   let mut q = make_query(ResourceType::Any, ResourceClass::Any);
@@ -1001,7 +1441,7 @@ fn retry_budget_exhaustion_retires_the_query() {
   for _ in 0..(MAX_RETRIES as usize + 5) {
     now += std::time::Duration::from_secs(120); // past the 60s backoff cap
     q.handle_timeout(now).unwrap();
-    if let Ok(Some(_)) = q.poll_transmit(now, &mut buf) {
+    if let Ok(Some(_)) = q.poll_transmit(|| now, &mut buf) {
       q.note_transmit_outcome(now, TransmitDelivery::ALL); // confirmed send burns one retry slot
     }
     if q.is_done() {
@@ -1107,7 +1547,7 @@ fn duplicate_question_exhaustion_produces_timeout_and_correct_stats() {
 /// Emit the query's pending datagram, leaving its confirm outstanding.
 fn emit_question(q: &mut TestQuery, now: StdInstant) {
   let mut buf = std::vec![0u8; 512];
-  q.poll_transmit(now, &mut buf)
+  q.poll_transmit(|| now, &mut buf)
     .unwrap()
     .expect("a due query must produce a datagram");
 }

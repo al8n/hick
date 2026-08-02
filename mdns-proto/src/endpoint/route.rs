@@ -23,6 +23,36 @@ where
   pub(crate) src: SocketAddr,
   pub(crate) endpoint: &'e mut Endpoint<I, R, C, SR, QS, EV, AN, EvQ>,
   pub(crate) reader: MessageReader<'a>,
+  /// The instant [`Endpoint::handle`] processed this datagram at, carried in so
+  /// the query fan-out weighs the caller's `QuerySpec::with_timeout` window
+  /// against the SAME reading that decided whether the answer was collected.
+  ///
+  /// Without it the two sites disagree about one datagram: `handle` applies and
+  /// refuses a late answer eagerly, while the query intentionally stays live
+  /// until its own timer fires — so the fan-out below, which screens only
+  /// `is_done` / `terminal_emitted`, would announce a record refused for
+  /// standing past a boundary the CALLER set. These events are informational, so
+  /// that is a report of an answer no caller can find in `collected_answers`
+  /// rather than a state change; the remedy is the same either way, because a
+  /// consumer cannot tell such a report apart from an accepted one.
+  ///
+  /// This aligns the two sites on the caller's window and on nothing else.
+  /// `Query::handle_event` also declines records on its own terms — a zero
+  /// `max_answers` cap, a duplicate, undecodable rdata, a full answer pool — and
+  /// the fan-out screens none of those, which is why [`RouteEvent::ToQuery`]
+  /// states an offer rather than a receipt. Those refusals stay deliberately
+  /// unreported, and a consumer cannot in general reconstruct them: a duplicate
+  /// the query already held and an equal record it has just kept leave
+  /// `collected_answers` looking the same, and a pool refusal turns on occupancy
+  /// no event carries. The window is mirrored because it is the one refusal that
+  /// is otherwise INVISIBLE — it turns on a reading taken inside `handle`, so
+  /// leaving it unmirrored would let a driver's tick order decide what the
+  /// consumer is told.
+  ///
+  /// It is not re-read per record. The datagram is one event with one processing
+  /// instant, which is what keeps its cache writes, its collections and this
+  /// fan-out in one epoch instead of splitting a single message across two.
+  pub(crate) now: I,
   /// `true` when the QR bit is set (this is a response, not a query).
   /// Used to gate KnownAnswer-suppression routing: KAS hints must only be
   /// extracted from QUERY packets (QR=0); response packets must not poison
@@ -341,17 +371,21 @@ where
           };
 
           // route-level TTL=0 guard.  Records with TTL=0 are
-          // mDNS "goodbye" / deletion signals (RFC 6762 §10.1) — the
-          // cache layer already processes them as removals during the
-          // eager loop in `Endpoint::handle`, and `Query::handle_event`
-          // rejects them at the eager-mutation step.  The
-          // remaining hazard is the iterator: emitting service events
+          // mDNS "goodbye" / deletion signals (RFC 6762 §10.1) — the eager loop
+          // in `Endpoint::handle` has already offered them to the cache, and
+          // `Query::handle_event` rejects them at the eager-mutation step.  What
+          // the cache made of it is conditional (population enabled, name and
+          // rdata canonicalizable, a matching entry whose expiry is later than
+          // the one-second rescue window), so nothing here may be read as proof
+          // that a withdrawal was recorded.  The remaining hazard is the
+          // iterator: emitting service events
           // (ProbeConflict / HostConflict / KnownAnswer) for a goodbye
           // would let a peer withdrawing a record trigger our auto-
           // rename or HostConflict surfacing, and emitting ToQuery
           // for a goodbye would let callers receive ghost "answers"
           // from records being withdrawn.  Skip the whole fan-out for
-          // TTL=0 — cache removal is the only correct side effect.
+          // TTL=0 — whatever the cache did with it is the only correct
+          // side effect.
           if r.ttl() == 0 {
             self.answer_idx = self.answer_idx.saturating_add(1);
             self.answer_service_cursor = None;
@@ -443,14 +477,20 @@ where
           // `answer_query_cursor`.  This already applied the answer
           // to the Query state eagerly in `Endpoint::handle`; the
           // events emitted here are informational only.
+          //
+          // Informational is exactly why the caller's window is weighed here
+          // too: a query past it collected nothing from this record, so
+          // announcing it would describe a result the caller cannot find. See
+          // the `now` field.
           if self.is_response {
+            let now = self.now;
             let start = self.answer_query_cursor.unwrap_or(0);
             let mut found: Option<(usize, RouteEvent<'a>)> = None;
             for (key, q) in self.endpoint.queries.iter() {
               if key < start {
                 continue;
               }
-              if q.is_done() || q.terminal_emitted() {
+              if q.is_done() || q.terminal_emitted() || q.caller_window_shut(now) {
                 continue;
               }
               if names_match_record(q.qname(), &r) && qry_query_accepts(q, &r) {
@@ -586,8 +626,9 @@ where
               continue;
             }
           };
-          // TTL=0 additionals are withdrawals — cache removal already handled
-          // eagerly; do not surface a ghost conflict/answer.
+          // TTL=0 additionals are withdrawals — already offered to the cache
+          // eagerly, on the conditional terms noted in the Answer arm; do not
+          // surface a ghost conflict/answer.
           if r.ttl() == 0 {
             self.additional_idx = self.additional_idx.saturating_add(1);
             self.additional_service_cursor = None;
@@ -611,14 +652,18 @@ where
             // query event can't re-enter and replay the conflict events.
             self.additional_service_done = true;
           }
-          // Then query fan-out (informational; eager state update already done).
+          // Then query fan-out (informational; eager state update already done),
+          // on the same terms as the Answer section: DNS-SD carries SRV/TXT/A/AAAA
+          // here, so a query past the caller's window would otherwise be told
+          // about additionals it refused to collect.
+          let now = self.now;
           let start = self.additional_query_cursor.unwrap_or(0);
           let mut found: Option<(usize, RouteEvent<'a>)> = None;
           for (key, q) in self.endpoint.queries.iter() {
             if key < start {
               continue;
             }
-            if q.is_done() || q.terminal_emitted() {
+            if q.is_done() || q.terminal_emitted() || q.caller_window_shut(now) {
               continue;
             }
             if names_match_record(q.qname(), &r) && qry_query_accepts(q, &r) {

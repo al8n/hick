@@ -480,6 +480,15 @@ impl<N: Net> DriverState<N> {
     // proto `now` is monotonic; process time is fine for cache TTL /
     // scheduling (the self-loopback ordering used the SystemTime rx stamp
     // above, not this value).
+    //
+    // Read per datagram, here, and it must stay here: `endpoint.handle` anchors
+    // this datagram's every effect to it, and one of them is a bound the CALLER
+    // holds — a query whose `QuerySpec::with_timeout` window has shut collects
+    // nothing from this datagram and suppresses no RFC 6762 §7.3 slot for it.
+    // Hoisting the read to a caller that drains a queue of packets would weigh
+    // the last of them on a reading taken before the first, and that is not
+    // laxity in the caller's favour: under `max_answers` a late answer EVICTS one
+    // collected inside the window.
     let now = StdInstant::now();
 
     // Split-borrow: endpoint and services are disjoint fields.
@@ -799,11 +808,11 @@ impl<N: Net> DriverState<N> {
     let queries_first = self.queries_first;
     let mut more_pending = false;
     if queries_first {
-      more_pending |= self.drain_query_transmits(now, budget, scratch).await;
+      more_pending |= self.drain_query_transmits(budget, scratch).await;
       more_pending |= self.drain_service_transmits(now, budget, scratch).await;
     } else {
       more_pending |= self.drain_service_transmits(now, budget, scratch).await;
-      more_pending |= self.drain_query_transmits(now, budget, scratch).await;
+      more_pending |= self.drain_query_transmits(budget, scratch).await;
     }
     // Only a CUT pass rotates the class order. A pass that drained everything
     // leaves the order alone, so the steady state stays services-first and
@@ -995,12 +1004,7 @@ impl<N: Net> DriverState<N> {
 
   /// The query half of [`Self::drain_transmits`]. Returns `true` if the budget
   /// cut it short with queries left unvisited.
-  async fn drain_query_transmits(
-    &mut self,
-    now: StdInstant,
-    budget: &mut DrainBudget,
-    scratch: &mut [u8],
-  ) -> bool {
+  async fn drain_query_transmits(&mut self, budget: &mut DrainBudget, scratch: &mut [u8]) -> bool {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
     let Self {
@@ -1057,9 +1061,41 @@ impl<N: Net> DriverState<N> {
           more_pending = true;
           break 'query_loop;
         }
+        // The CLOCK, not a reading of it. The core weighs a query's
+        // `QuerySpec::with_timeout` deadline — a bound the CALLER holds, no
+        // question ADMITTED at or after it — against the instant it admits on,
+        // and it takes that instant itself, at the comparison. This driver hands
+        // over the source and keeps no reading of its own: the pass's `now` is
+        // read before `sweep_closed_handles`, `fire_timeouts` and (in the default
+        // order) the whole service drain, whose fan-outs are AWAITED, and any
+        // reading taken right here would still predate the handle lookup the core
+        // does before it compares — so neither can stand in.
+        //
+        // Admission is the core's COMPARISON, so the overshoot past it starts
+        // with the encode and return that finish the poll, and is then dominated
+        // by the AWAITED fan-out below: a question admitted just inside the
+        // window reaches a wire up to one `SEND_ATTEMPT_TIMEOUT` — plus the
+        // executor's scheduling latency — later. That is a bound to reason with,
+        // not a second enforcement point; a recheck placed inside the fan-out
+        // would still sit before a syscall, and before the wire.
+        //
+        // Nothing admitted is carried across a pass, either: `may_start_fanout`
+        // is consulted ABOVE this poll, both times, so a pass cut short by its
+        // budget parks its CURSOR and never a datagram. The query it did not
+        // reach still has its send pending, and the pass that resumes re-draws
+        // the question and re-weighs the window.
+        //
+        // Nothing else downstream wants an instant from this point: the fan-out
+        // below takes no `now` of any kind — each family's wire gate is weighed at
+        // ITS OWN send point (`attempt_gated_send_to`), against a reading taken
+        // there, which is a different question about a different subject. The RFC
+        // 6762 §5.2 retry ladder is not this deadline either — `fire_timeouts`
+        // fires it against the pass's instant, and both it and the terminal stay
+        // there.
+
         // surface encoding errors instead of treating them
         // as "no more transmits".
-        let tx = match endpoint.poll_query_transmit(h, now, scratch) {
+        let tx = match endpoint.poll_query_transmit(h, StdInstant::now, scratch) {
           Ok(Some(t)) => t,
           Ok(None) => break,
           Err(_e) => {
@@ -2568,7 +2604,14 @@ async fn driver_task<N: Net>(
     // control flow can't be confused with the select macro's internals.
     let mut closed = false;
     if let Some(at) = deadline {
-      let dur = at.saturating_duration_since(now);
+      // How long to sleep is measured from the moment the sleep starts, not from
+      // the top of a pass that has since awaited every fan-out in it. The pass's
+      // `now` is stale by exactly the wall clock those sends took, so a duration
+      // derived from it overshoots the absolute deadline by the same amount —
+      // and a §5.2 retry, a §8.3 announcement or a caller's query window would
+      // be woken that late. `sleep` takes a duration, so the subtraction is
+      // unavoidable; taking it here is what keeps the result a real interval.
+      let dur = at.saturating_duration_since(StdInstant::now());
       let sleep = <N::Runtime as RuntimeLite>::sleep(dur).fuse();
       pin_mut!(sleep);
       select_biased! {

@@ -3170,3 +3170,150 @@ async fn repeated_budget_cuts_reach_every_producer() {
   );
   drop(regs);
 }
+
+// ── the query drain weighs the caller's window on its own clock ─────────────
+//
+// `QuerySpec::with_timeout` is a promise to whoever set it: no question is
+// ADMITTED at or after the instant it makes absolute. The core keeps that
+// promise inside `Query::poll_transmit`, weighed against the instant the driver
+// hands in — so the promise is worth exactly what that reading is worth. The
+// pass's reading is taken before `sweep_closed_handles`, `fire_timeouts` and (in
+// the default class order) the whole service drain, whose fan-outs are AWAITED
+// and bounded only by `SEND_ATTEMPT_TIMEOUT` — so a window that shuts while an
+// earlier producer's datagram is in flight is invisible to it, and the question
+// is admitted after the caller was told none would be.
+//
+// The RFC 6762 §5.2 ladder underneath the same query is the opposite case and
+// stays on the pass's instant: it is the core's own schedule, and every stage of
+// a pass must agree about it.
+
+/// How long the earlier producer's fan-out takes to be accepted. Inside
+/// [`SEND_ATTEMPT_TIMEOUT`], so both families genuinely ACCEPT the datagram and
+/// the pass is delayed by a real send rather than by a bound expiring.
+#[cfg(feature = "tokio")]
+const EARLIER_SEND_ACCEPTS_AFTER: Duration = Duration::from_millis(200);
+
+/// The window the caller asks for. Comfortably shorter than the send above, so
+/// the crossing belongs to the send rather than to a slow runner.
+#[cfg(feature = "tokio")]
+const CALLER_QUERY_WINDOW: Duration = Duration::from_millis(60);
+
+/// A question drawn after the caller's window shut must not reach either wire —
+/// and the query must still end where its deadline's owner ends it.
+///
+/// The two drains are called separately, in the order `drain_transmits` calls
+/// them by default, so the wire record can be read at the seam between them.
+/// That is what makes the count a discriminator: the earlier producer's
+/// announcement is on both wires before the query is polled at all, and anything
+/// the query adds is the question under test.
+///
+/// Both premises are asserted about the instants that were actually used, not
+/// about readings taken beside the call: the pass began inside the window (its
+/// own `now`, the one handed to both drains), and the awaited fan-out carried it
+/// out of the window before the query drain was entered. A pass that began
+/// outside the window would exercise the already-expired path instead and pass
+/// whatever the query drain does.
+///
+/// The closing half is why "no datagram" is not the whole property. Withholding
+/// defers the terminal to `handle_timeout`, so the deadline must still stand in
+/// `poll_query_timeout` — it is the wakeup `next_deadline` folds — and a caller
+/// parked on `Query::next` must still be told `Timeout`.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_drawn_past_the_callers_window_never_reaches_the_wire() {
+  let v4 = TestSocket::delayed(EARLIER_SEND_ACCEPTS_AFTER);
+  let v6 = TestSocket::delayed(EARLIER_SEND_ACCEPTS_AFTER);
+  let (v4_log, v6_log) = (v4.wire_log(), v6.wire_log());
+  let mut state = scripted_state(false, v4, v6);
+  let mut scratch = std::vec![0u8; 4096];
+
+  let t0 = StdInstant::now();
+  let reg = state
+    .register_service(delivery_test_spec("earlier"), t0)
+    .expect("register the earlier producer");
+  let started = state
+    .start_query(
+      mdns_proto::QuerySpec::new(
+        mdns_proto::Name::try_from_str("printer.local.").unwrap(),
+        mdns_proto::wire::ResourceType::A,
+      )
+      .with_timeout(CALLER_QUERY_WINDOW),
+      t0,
+    )
+    .expect("start the query under test");
+  let qh = started.handle;
+  let deadline = state
+    .endpoint
+    .poll_query_timeout(qh)
+    .expect("a query given a window publishes its absolute deadline");
+
+  // One pass, exactly as `driver_task` runs it: one instant read at the top,
+  // handed to the timer fire and to both drains.
+  let pass_now = StdInstant::now();
+  assert!(
+    pass_now < deadline,
+    "the pass must begin inside the caller's window, or this asserts nothing"
+  );
+  state.fire_timeouts(pass_now);
+  let mut budget = DrainBudget::new(pass_now);
+  state
+    .drain_service_transmits(pass_now, &mut budget, &mut scratch)
+    .await;
+
+  let served =
+    |log: &Arc<Mutex<Vec<StdInstant>>>| log.lock().unwrap_or_else(|e| e.into_inner()).len();
+  let (v4_after_services, v6_after_services) = (served(&v4_log), served(&v6_log));
+  assert!(
+    v4_after_services > 0 && v6_after_services > 0,
+    "premise: the earlier producer must have been SERVED on both wires, or the \
+     pass never spent the wall clock this test is about"
+  );
+  assert!(
+    StdInstant::now() >= deadline,
+    "premise: awaiting that fan-out must have carried the pass out of the \
+     caller's window"
+  );
+
+  state.drain_query_transmits(&mut budget, &mut scratch).await;
+  assert_eq!(
+    (served(&v4_log), served(&v6_log)),
+    (v4_after_services, v6_after_services),
+    "a question drawn after the caller's window shut reached the wire; the query \
+     drain weighed a promise made to the caller against an instant read before \
+     an awaited fan-out it does not bound"
+  );
+
+  // Withheld, not ended: the terminal belongs to the deadline's owner, and the
+  // wakeup that reaches it must survive the withholding.
+  assert_eq!(
+    state.endpoint.poll_query_timeout(qh),
+    Some(deadline),
+    "the withheld question must leave the deadline standing — it is the wakeup \
+     `next_deadline` folds, and the only thing left that can end this query"
+  );
+  assert!(
+    state
+      .next_deadline()
+      .is_some_and(|at| at <= StdInstant::now()),
+    "and it is already due, so the loop is sent straight back rather than parked"
+  );
+
+  let settle = StdInstant::now();
+  state.fire_timeouts(settle);
+  state.push_updates(settle).await;
+  let (cmd_tx, _cmd_rx) = async_channel::unbounded::<crate::command::Command>();
+  let mut q = crate::query::Query::new(qh, started.mailbox, started.doorbell, cmd_tx);
+  let event = tokio::time::timeout(Duration::from_millis(200), q.next())
+    .await
+    .expect("the terminal is already in the mailbox, so `next` must complete")
+    .expect("a query past its window ends, rather than closing its stream");
+  assert!(
+    matches!(
+      event,
+      crate::query::QueryEvent::Terminal(mdns_proto::QueryUpdate::Timeout)
+    ),
+    "the query must still end, and with the terminal its deadline's owner \
+     produces; got {event:?}"
+  );
+  drop(reg);
+}

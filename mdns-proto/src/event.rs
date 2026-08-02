@@ -246,6 +246,65 @@ pub enum RouteEvent<'a> {
   /// Route the event to the matched service.
   ToService(ToService<'a>),
   /// Route the event to the matched query.
+  ///
+  /// Informational: `Endpoint::handle` has already offered this record to the
+  /// query named here, so delivering the event applies nothing.
+  ///
+  /// # What an event means
+  ///
+  /// The record reached the query fan-out and passed the four screens taken
+  /// there, all weighed as of the `now` that `Endpoint::handle` processed the
+  /// datagram at: the query had not ended; its terminal `QueryUpdate` had not
+  /// already been taken by `Endpoint::poll_query`; the caller's
+  /// `QuerySpec::with_timeout` window was still open; and the record matched the
+  /// query's name, type and class. Those four are the whole of what the fan-out
+  /// decides, so they are the whole of what an event asserts.
+  ///
+  /// The window screen is the same comparison, against the same reading, that
+  /// `Query::handle_event` weighed this record on — so a record refused for
+  /// standing past that window is never announced here.
+  ///
+  /// # What absence means
+  ///
+  /// Nothing a consumer may reason from. The fan-out is the last stage of a long
+  /// inbound path, and a record turned away anywhere earlier never reaches it, so
+  /// none of the four screens ever weighed that record and none of them says
+  /// anything about its silence. `Endpoint::handle` can reject a datagram
+  /// outright or suppress every side effect it would have had; a message that is
+  /// not a response carries no answers to route; a record that fails to parse
+  /// abandons the rest of its section, and one that fails in an earlier section
+  /// strands every later section with it, because a section is located only by
+  /// walking the ones ahead of it; a TTL=0 record is a withdrawal, never
+  /// announced as an answer. Those are illustrations, not an enumeration: no
+  /// event distinguishes them, the set has grown as the receive path has, and a
+  /// missing event is evidence for none of them in particular. Do not infer WHY
+  /// nothing arrived.
+  ///
+  /// One bound does hold, and it is the useful one: only answer-section and
+  /// additional-section records are ever routed to a query. Question and
+  /// authority records go to services alone, so no query is ever told about one.
+  ///
+  /// The TTL=0 case is worth stating on its own, because its cache effect is
+  /// conditional and easy to over-read. The withdrawal reaches the cache only
+  /// when population is enabled (`EndpointConfig::with_populate_cache`) and the
+  /// record's name and rdata canonicalize; and even then `Cache::try_insert`
+  /// mutates nothing unless a matching entry already exists whose expiry is
+  /// later than the one-second rescue window it clamps to. A suppressed event is
+  /// therefore not evidence that any withdrawal was recorded.
+  ///
+  /// # What an event does NOT imply
+  ///
+  /// The four screens decide that the query was OFFERED the record. Whether it
+  /// KEPT one is `Query::handle_event`'s separate decision, and that decision
+  /// declines for reasons no screen above looks at: a
+  /// `QuerySpec::with_max_answers` cap of zero, rdata carrying a domain name
+  /// that will not decode, a (type, class, rdata) triple the query already
+  /// holds, and an answer pool with no room even after evicting its oldest
+  /// entry. At the cap, a record that IS kept also evicts one that was, which no
+  /// event reports either.
+  ///
+  /// So this is a routing decision and not a receipt. A consumer that needs to
+  /// know what a query holds must read `Endpoint::collected_answers`.
   ToQuery(ToQuery<'a>),
   /// The endpoint cache observed new or refreshed records as a side effect
   /// of this datagram. Callers can use this as a hint to re-poll queries.

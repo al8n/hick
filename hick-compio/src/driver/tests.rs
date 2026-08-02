@@ -1986,6 +1986,308 @@ fn a_query_dropped_mid_send_still_gets_its_confirm() {
   }
 }
 
+/// A query that ends while the driver is looking away strands the caller that
+/// asked for it: the terminal is delivered by a WAKE, and the driver can only
+/// arm a wake for a transition it can see.
+///
+/// Every step below is a seam the run loop really runs, in the order it runs
+/// them:
+///
+/// 1. a §5.2 retry falls due INSIDE the query's absolute window, so the timer arm
+///    arms its transmit and bumps `notify` (`woke_state`);
+/// 2. the `Query::next` parked on that `notify` consumes the wake, finds the
+///    query merely armed with nothing to report, and re-parks — the wake is
+///    spent;
+/// 3. the transmit pump reaches an EARLIER producer first (services are pumped
+///    before queries) and the driver sits in that send's `.await` while the
+///    absolute deadline passes. The query walk reads its own instant at the poll
+///    that would draw the question, so the query is finally polled past its own
+///    deadline;
+/// 4. nothing else the driver holds is due — asserted, not assumed.
+///
+/// A `Query::poll_transmit` that took the query's terminal there and reported it
+/// as the `Ok(None)` an idle poll returns would leave this driver nothing to act
+/// on: the one-shot terminal wake belongs to the encode-error path and is not
+/// armed here, and the terminal itself clears the query's deadline, so
+/// `poll_deadline` has nothing left to fold for it. The driver parks, and the
+/// waiter from step 2 is never woken by anything it was owed — its terminal sits
+/// undelivered and the query's storage stays pinned for as long as the handle
+/// lives.
+///
+/// The future is driven by hand with a counting waker instead of being spawned
+/// because the fault IS the missing wake: polled by hand its absence is an
+/// assertion, spawned it would only be a test that hangs.
+#[test]
+fn a_query_ended_past_its_deadline_wakes_the_next_parked_on_it() {
+  use core::{
+    future::Future,
+    task::{Context, Poll, Waker},
+  };
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+
+  use mdns_proto::{Name, QuerySpec, QueryUpdate, wire::ResourceType};
+
+  /// Counts wakes instead of resuming a task, so "was the parked waiter woken?"
+  /// is answerable without a runtime, a timer, or a spawn.
+  #[derive(Default)]
+  struct WakeCount(AtomicUsize);
+
+  impl WakeCount {
+    fn count(&self) -> usize {
+      self.0.load(Ordering::Relaxed)
+    }
+
+    fn reset(&self) {
+      self.0.store(0, Ordering::Relaxed);
+    }
+  }
+
+  impl std::task::Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+      self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      self.0.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+
+  let inner = EndpointInner::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  // `establish_service`'s ladder: 40 rounds 300 ms apart.
+  const ESTABLISH_LADDER: Duration = Duration::from_secs(12);
+  // How much of the caller's window is still open, in REAL time, when the pump
+  // first draws the question. Wide enough that reaching that draw inside it is
+  // not a race.
+  const WINDOW_STILL_OPEN: Duration = Duration::from_millis(500);
+  // What the fan-out the driver awaits actually costs — past the slack above, so
+  // the window shuts while the driver is inside it.
+  const AWAITED_FANOUT: Duration = Duration::from_millis(700);
+
+  // The window the caller asks for, wide enough to hold the §5.2 retry armed
+  // inside it.
+  let window = Duration::from_millis(2500);
+
+  // Protocol time and real time have to agree about the caller's window here,
+  // because the query walk weighs it on an instant it reads itself while every
+  // other instant below is one this test chooses. The schedule is therefore
+  // anchored in the real past by the protocol time it spends before that window
+  // shuts, less the slack that must still be open at the first draw. Neither
+  // half is assumed: the slack is asserted before that draw and the crossing is
+  // asserted after the fan-out.
+  //
+  // How far back the monotonic clock reaches is a property of the HOST, decided
+  // before any of the behaviour below runs: a machine booted moments ago has no
+  // instant this far in its past to anchor at. That is a setup this host cannot
+  // provide, not an outcome, so it skips rather than fails.
+  let Some(t0) = StdInstant::now().checked_sub(ESTABLISH_LADDER + window - WINDOW_STILL_OPEN)
+  else {
+    eprintln!("skipping: this host's monotonic clock is too young to subtract from");
+    return;
+  };
+  let mut buf = vec![0u8; 4096];
+
+  // The earlier producer: an established service, drained of its lifecycle
+  // updates. Draining is load-bearing — an undrained `Established` would make
+  // the post-pump `push_service_updates` bump `notify` and supply the very wake
+  // this schedule must not have.
+  let svc = {
+    let mut s = inner.state.borrow_mut();
+    s.test_register_service(delivery_test_spec("earlier"), t0)
+      .unwrap()
+  };
+  let t_est = {
+    let mut s = inner.state.borrow_mut();
+    let t = establish_service(&mut s, svc, t0);
+    let _ = s.push_service_updates(t);
+    assert!(
+      !s.push_service_updates(t),
+      "premise: the established service must have nothing left to report"
+    );
+    assert!(
+      s.endpoint.poll_timeout().is_none(),
+      "premise: the endpoint itself must have nothing scheduled, so every \
+       deadline in play below belongs to a producer this test controls"
+    );
+    t
+  };
+
+  // The query, and the caller parked on it.
+  let deadline = t_est + window;
+  let qh = {
+    let mut s = inner.state.borrow_mut();
+    let h = s
+      .start_query(
+        QuerySpec::new(
+          Name::try_from_str("printer.local.").unwrap(),
+          ResourceType::A,
+        )
+        .with_timeout(window),
+        t_est,
+      )
+      .unwrap();
+    assert!(
+      StdInstant::now() < deadline,
+      "premise: the caller's window must still be open on the clock the query \
+       walk reads, or the first question would be withheld here instead of drawn"
+    );
+    let (_tx, origin) = s
+      .poll_one_transmit(t_est, &mut buf)
+      .expect("a newly-started query has its first question due");
+    assert!(
+      matches!(origin, TransmitOrigin::Query(h2) if h2 == h),
+      "the idle service has nothing due, so the first datagram is the query's"
+    );
+    // Delivered everywhere, so the §5.2 ladder advances and the retry is armed
+    // one second out — comfortably inside the caller's window.
+    s.note_query_transmit_outcome(h, t_est, WHOLE_FANOUT.delivery());
+    h
+  };
+  let query = crate::Query {
+    inner: Rc::clone(&inner),
+    handle: qh,
+    terminal_delivered: Cell::new(false),
+  };
+
+  let wakes = Arc::new(WakeCount::default());
+  let waker = Waker::from(Arc::clone(&wakes));
+  let mut cx = Context::from_waker(&waker);
+  let next = query.next();
+  futures::pin_mut!(next);
+  assert!(
+    next.as_mut().poll(&mut cx).is_pending(),
+    "the caller parks: no answer has arrived and the query is still running"
+  );
+
+  // ── The iteration that arms the retry ────────────────────────────────────
+  let t1 = t_est + Duration::from_secs(1);
+  let legacy_querier = core::net::SocketAddr::from(([192, 168, 1, 50], 6000));
+  {
+    let mut s = inner.state.borrow_mut();
+    // A §6.7 legacy querier: exactly one unicast reply, due immediately, and
+    // once it is confirmed the service is back to nothing due in this window.
+    inject_ptr_query(&mut s, legacy_querier, t1);
+    s.fire_timeouts(t1);
+    assert_eq!(
+      s.endpoint.poll_query_timeout(qh),
+      Some(deadline),
+      "the retry is ARMED, not scheduled, so the absolute deadline is now the \
+       query's whole schedule"
+    );
+  }
+  inner.notify.notify(); // the run loop's post-timer `woke_state` bump
+  assert!(
+    wakes.count() > 0,
+    "the timer wake must reach the parked waiter"
+  );
+  assert!(
+    next.as_mut().poll(&mut cx).is_pending(),
+    "the query is merely armed — nothing to report, so the waiter re-parks and \
+     that wake is spent"
+  );
+  wakes.reset();
+
+  // ── The iteration whose pump crosses the deadline ────────────────────────
+  let t_past = deadline + Duration::from_millis(10);
+  {
+    let mut s = inner.state.borrow_mut();
+    // Pump pass 1: services before queries, so the earlier producer's datagram
+    // is the one this iteration awaits.
+    let (tx, origin) = s
+      .poll_one_transmit(t1, &mut buf)
+      .expect("the legacy reply is due");
+    assert!(
+      matches!(origin, TransmitOrigin::Service(h) if h == svc),
+      "the earlier producer must be the one the pump serves first"
+    );
+    assert!(
+      !tx.dst().ip().is_multicast(),
+      "a §6.7 legacy reply is unicast back to its querier"
+    );
+    // The driver is inside `send_via().await` for it, and the caller's window
+    // closes while it is there — in real time as much as in protocol time, since
+    // the query walk below weighs that window on the clock it reads itself.
+    std::thread::sleep(AWAITED_FANOUT);
+    s.note_service_transmit_outcome(svc, t_past, UNICAST_FANOUT.delivery());
+    assert!(
+      StdInstant::now() >= deadline,
+      "the awaited fan-out must have carried the real clock out of the caller's \
+       window too, or the withholding below would be this test's own clock alone"
+    );
+
+    // Pump pass 2: the query walk reads its own instant, and the question is
+    // drawn past the caller's deadline.
+    assert!(
+      s.poll_one_transmit(t_past, &mut buf).is_none(),
+      "no question may go out at or after the caller's absolute deadline"
+    );
+    assert_eq!(
+      s.endpoint.poll_query_timeout(qh),
+      Some(deadline),
+      "and the query must still publish the deadline that ENDS it: this is the \
+       wake the driver folds into its park, and a terminal taken inside that \
+       `Ok(None)` would have cleared it — the driver would then be parking on a \
+       query it has no reason left to come back to"
+    );
+  }
+
+  // ── The post-pump settle, in the run loop's order ────────────────────────
+  //
+  // No I/O, no clock advance, no invented timer: whatever wakes the caller now
+  // has to be work this driver can see.
+  let fired_due_deadline = {
+    let mut s = inner.state.borrow_mut();
+    s.sweep_cancelled_services(t_past);
+    s.sweep_cancelled_queries();
+    if s.push_service_updates(t_past) {
+      inner.notify.notify();
+    }
+    if s.take_query_terminal_wakes() {
+      inner.notify.notify();
+    }
+    assert!(
+      s.services[&svc]
+        .proto
+        .poll_timeout()
+        .is_some_and(|at| at > t_past),
+      "premise: the earlier producer's own next tick is its §8.3 re-announcement, \
+       far beyond this window — it cannot stand in for the wake the query owes"
+    );
+    match s.poll_deadline() {
+      // Already due: the run loop's zero-duration timer arm, which fires the
+      // timeouts in this same iteration and bumps `notify` (`woke_state`).
+      Some(at) if at <= t_past => {
+        s.fire_timeouts(t_past);
+        true
+      }
+      // Anything else is a timer the driver parks on. This schedule has none,
+      // and the test will not invent one to rescue the waiter.
+      _ => false,
+    }
+  };
+  if fired_due_deadline {
+    inner.notify.notify();
+  }
+
+  assert!(
+    wakes.count() > 0,
+    "the driver settled with nothing it could act on, so the `Query::next` \
+     parked on this query is never woken again — its terminal was taken behind \
+     an `Ok(None)` indistinguishable from an idle poll, and taking it cleared \
+     the very deadline that would have woken the caller"
+  );
+  match next.as_mut().poll(&mut cx) {
+    Poll::Ready(Some(crate::QueryEvent::Terminal(QueryUpdate::Timeout))) => {}
+    other => panic!("the woken caller must observe the timeout terminal, got {other:?}"),
+  }
+}
+
 /// Registering the same instance name twice (no intervening removal) must
 /// be rejected by the driver `State` with the proto
 /// `RegisterServiceError::NameAlreadyRegistered` — the duplicate-detection
@@ -3301,5 +3603,151 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
   assert!(
     !s.services[&h].proto.has_fully_announced().get(),
     "an all-delivered UNICAST reply is still not a complete announcement"
+  );
+}
+
+// ── the pump weighs the caller's query window on its own clock ──────────────
+//
+// `QuerySpec::with_timeout` is a promise to whoever set it: no question is
+// ADMITTED at or after the instant it makes absolute. The core keeps that
+// promise inside `Query::poll_transmit`, weighed against the instant the driver
+// hands in — so the promise is worth exactly what that reading is worth. The run
+// loop re-reads once per pump iteration, but it hands that reading to
+// `poll_one_transmit`, which snapshots and walks every service — and every
+// preceding query — before a query poll can use it. Both maps are uncapped and
+// nothing in that stretch awaits, so a re-read outside the call cannot stand in
+// for one inside it.
+//
+// The §5.2 ladder underneath the same query is the opposite case and keeps the
+// instant the call was given — see `poll_one_transmit`.
+
+/// A walk that alone outlives the caller's whole window, so the crossing is this
+/// stall's rather than a slow runner's.
+const WALK_OUTLIVES_QUERY_WINDOW: Duration = Duration::from_millis(600);
+
+/// The window the caller asks for. Short enough that the stall above clears it
+/// several times over, long enough that entering the pump inside it is not a
+/// race.
+const CALLER_QUERY_WINDOW: Duration = Duration::from_millis(150);
+
+/// A question drawn after the caller's window shut must not be handed back for
+/// the run loop to send — and the query must still end where its deadline's
+/// owner ends it.
+///
+/// The window is a real 150 ms measured from `start_query`, and the pump is made
+/// to lose the CPU for 600 ms of it *inside* `poll_one_transmit`: after the run
+/// loop's own per-iteration reading was taken, after the service walk, and with
+/// the query poll still ahead. No `await` divides that stretch, so no
+/// arrangement of the run loop outside the call can re-read across it — which is
+/// what separates this from the awaited-send schedule
+/// `a_query_ended_past_its_deadline_wakes_the_next_parked_on_it` covers.
+///
+/// What it catches: the query poll trusting the `now` the pump was handed. That
+/// reading is *before* the deadline here — asserted rather than assumed, so a
+/// slow host fails the premise loudly instead of passing on the already-expired
+/// path — so a poll that trusts it draws a question the caller's window has in
+/// fact already closed on, and returns it to be sent.
+///
+/// The closing half asserts the withheld question left the deadline standing:
+/// withholding defers the terminal to `handle_timeout`, so a caller that would
+/// have been told `Timeout` must still be told it, on the wakeup `poll_deadline`
+/// already publishes.
+#[test]
+fn a_question_drawn_past_the_callers_window_is_withheld_inside_the_pump() {
+  use mdns_proto::{Name, QuerySpec, QueryUpdate, wire::ResourceType};
+
+  let mut s = State::new(
+    mdns_proto::EndpointConfig::new().with_probe_unique_names(false),
+    1500,
+    9000,
+  );
+  let mut buf = vec![0u8; 4096];
+  let t0 = StdInstant::now();
+
+  // An earlier producer, so the walk this stall stands in for is one the pump
+  // really performs. Driven to its own steady state at `t0` — fire what is due,
+  // confirm what that yields, repeat — so its §8.3 successor is a full second
+  // out and the pump reaches the query walk instead of returning ITS datagram.
+  let svc = s
+    .test_register_service(delivery_test_spec("earlier"), t0)
+    .unwrap();
+  for _ in 0..8 {
+    let ctx = s.services.get_mut(&svc).unwrap();
+    if ctx.proto.poll_timeout().is_none_or(|at| at > t0) {
+      break;
+    }
+    let _ = ctx.proto.handle_timeout(t0);
+    while let Ok(Some(_)) = ctx.proto.poll_transmit(t0, &mut buf) {
+      ctx.proto.note_transmit_outcome(t0, WHOLE_FANOUT.delivery());
+    }
+  }
+
+  let qh = s
+    .start_query(
+      QuerySpec::new(
+        Name::try_from_str("printer.local.").unwrap(),
+        ResourceType::A,
+      )
+      .with_timeout(CALLER_QUERY_WINDOW),
+      t0,
+    )
+    .unwrap();
+  let deadline = s
+    .endpoint
+    .poll_query_timeout(qh)
+    .expect("a query given a window publishes its absolute deadline");
+  assert!(
+    s.services[&svc]
+      .proto
+      .poll_timeout()
+      .is_some_and(|at| at > deadline),
+    "premise: the earlier producer must have nothing due inside the caller's \
+     window, or the pump would return ITS datagram and never reach the query"
+  );
+
+  s.force_query_poll_delays_for_test(&[WALK_OUTLIVES_QUERY_WINDOW]);
+
+  // Exactly what the run loop hands in: read immediately before the call, so
+  // nothing outside `poll_one_transmit` can be blamed for its staleness.
+  let now = StdInstant::now();
+  assert!(
+    now < deadline,
+    "the pump must be entered inside the caller's window, or this asserts nothing"
+  );
+  let pumped = s.poll_one_transmit(now, &mut buf);
+  assert!(
+    StdInstant::now() >= deadline,
+    "and the walk must have carried it out of the window"
+  );
+
+  assert!(
+    pumped.is_none(),
+    "a question drawn after the caller's window shut was handed back to be sent; \
+     the query poll weighed a promise made to the caller against a reading taken \
+     before a walk over two uncapped maps in this same call"
+  );
+
+  // Withheld, not ended: the terminal belongs to the deadline's owner, and the
+  // wakeup that reaches it must survive the withholding.
+  assert_eq!(
+    s.endpoint.poll_query_timeout(qh),
+    Some(deadline),
+    "the withheld question must leave the deadline standing — it is the wakeup \
+     `poll_deadline` folds, and the only thing left that can end this query"
+  );
+  assert!(
+    s.poll_deadline().is_some_and(|at| at <= StdInstant::now()),
+    "and that deadline is already past, so the driver is sent straight back"
+  );
+
+  s.fire_timeouts(deadline + Duration::from_millis(1));
+  let mut terminal = None;
+  while let Some(update) = s.endpoint.poll_query(qh) {
+    terminal = Some(update);
+  }
+  assert!(
+    matches!(terminal, Some(QueryUpdate::Timeout)),
+    "the query must still end, and with the terminal its deadline's owner \
+     produces; got {terminal:?}"
   );
 }

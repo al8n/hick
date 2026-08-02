@@ -70,8 +70,11 @@
 //! self-send credit's age, a wire's spacing gap, when a withdrawal schedule
 //! begins, when its next round is due, whether a lookup's
 //! [`QueryParam::with_timeout`](crate::QueryParam::with_timeout) window is still
-//! open — is read at the decision by the code that makes it. The strongest form
-//! is to take no instant at all, which is what
+//! open, whether a query's
+//! [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window still
+//! admits the question stage 4 is about to draw or the answer stage 1 is about
+//! to apply — is read at the decision by the code that makes it. The strongest
+//! form is to take no instant at all, which is what
 //! [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take),
 //! [`send_and_credit`], [`Mdns::push_updates`], [`Mdns::advance_lookups`] and
 //! [`Mdns::drain_withdrawals`] all do: a parameter is a channel through which a
@@ -90,9 +93,43 @@
 //! lookup's own boundary is real-time even though a sub-query's §5.2 ladder,
 //! sitting one layer below it, is not.
 //!
+//! A **query** carries the same pair, one layer down and in one stage: stage 4
+//! polls it for a datagram and the core admits that datagram only while the
+//! caller's [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout)
+//! window is open, while stage 3 fires the §5.2 ladder that armed it. The ladder
+//! is the core's own schedule and keeps the tick's instant; the window is the
+//! caller's and is read where the question is drawn. Two decisions, one query,
+//! and the answer to *who was promised it* differs between them.
+//!
+//! **The same window bounds what a query may TAKE, so stage 1 reads for it too.**
+//! `Endpoint::handle` weighs an inbound answer against the instant it is handed,
+//! and a drain that reused the tick's would weigh its 64th datagram — and the 63
+//! `recvmsg` calls before it — on a reading from the top of the tick. Leniency in
+//! that direction is not free: under `max_answers` a late answer EVICTS one taken
+//! inside the window, and a duplicate question can spend a §5.2 slot for a query
+//! the window has already closed. So the datagram's processing instant is read
+//! per datagram, adjacent to the call that anchors the datagram to it, while the
+//! service events that same stage routes keep the tick's — their schedule is the
+//! core's.
+//!
 //! What is left is the instructions between the read and the comparison, and it
 //! is irreducible — something must read a clock before something can compare
 //! against it.
+//!
+//! **What is left AFTER the comparison is irreducible too**, and that is why the
+//! caller's promise names admission rather than departure. A question the core
+//! admits still has to reach the kernel, and a check moved down to sit
+//! immediately before `sendto` would leave the interval between itself and the
+//! syscall, and between the syscall and the wire. So
+//! [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) bounds when a
+//! question may be admitted, and each driver bounds its own overshoot. Admission
+//! is the core's COMPARISON, so the overshoot starts inside the poll — the
+//! encode and the return that follow it are already past the boundary. This
+//! driver's is synchronous from there: stage 4 goes straight from the poll into
+//! [`send_and_credit`] — a per-family spacing check and a `sendto`, with no
+//! suspension point — so the overshoot is those two stretches plus whatever
+//! preemption the host adds. That is a bound to reason with, not a second
+//! enforcement point, and adding one here would only relocate the same gap.
 //!
 //! **And one reading may have two uses when they are inverses.** A DNS-SD
 //! sub-query is started with an absolute anchor and a relative budget, and the
@@ -480,6 +517,16 @@ impl Mdns {
   /// is the precondition on being offered a credit at all. Only a datagram from
   /// port 5353 can be this endpoint's own loopback copy, because that is the
   /// port both of its sockets send from.
+  ///
+  /// # `now` is this stage's protocol instant, and the datagram's is not
+  ///
+  /// `now` is what the service events this stage routes are applied at — the
+  /// core's own response schedule, stable across the tick. Each datagram's
+  /// processing instant is read separately, immediately before the
+  /// `Endpoint::handle` that anchors the datagram's effects to it, because one of
+  /// those effects is a query's caller-facing
+  /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window. See
+  /// this module's clock rule and the read itself.
   fn drain_recv(&mut self, now: StdInstant) {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
@@ -503,16 +550,13 @@ impl Mdns {
       let Some((meta, family)) = sockets.recv(recv_buf.as_mut_slice()) else {
         return;
       };
-      // No second clock read here, and none anywhere else in this loop — do not
-      // add one. `now` is the tick's PROTOCOL instant: the core weighs every
-      // deadline within a tick against one stable value, so it is what
-      // `endpoint.handle` and every stage below receive, unchanged. It is not,
-      // and must not become, the age of a self-send credit. `SELF_SEND_TTL` is
-      // no deadline but a real-time bound on FALSE suppression, so that age
-      // belongs to `SelfSendTracker::take`, which reads it at its own liveness
-      // decision and accepts an instant from nobody. An instant captured at this
-      // line would already be stale by the two admission gates below — see that
-      // method's docs for why the parameter was the defect rather than the fix.
+      // No clock read at this line, and the one below is not for the credit.
+      // `SELF_SEND_TTL` is no deadline but a real-time bound on FALSE
+      // suppression, so a credit's age belongs to `SelfSendTracker::take`, which
+      // reads it at its own liveness decision and accepts an instant from
+      // nobody. An instant captured here would already be stale by the two
+      // admission gates below — see that method's docs for why the parameter was
+      // the defect rather than the fix.
       let Some(data) = recv_buf.get(..meta.len()) else {
         // `recv` never reports more bytes than the buffer holds; a datagram
         // that would not fit was already rejected as truncated.
@@ -626,8 +670,25 @@ impl Mdns {
       Self::stall_before_claim(forced_claim_delays);
       let caller_is_self = from_mdns_port && selfsend.take(family, data, sockets.rx_time(&meta));
 
+      // This datagram's own processing instant, read here rather than taken from
+      // the tick, because `Endpoint::handle` weighs a bound the CALLER holds
+      // against it: a query whose `QuerySpec::with_timeout` window has shut
+      // collects nothing from this datagram and suppresses no RFC 6762 §7.3 slot
+      // for it. The tick's reading is up to `RECV_BUDGET` datagrams and a
+      // `recvmsg` apiece old by the time the last of them reaches this line, and
+      // a stale one here does not merely err on the side of keeping an answer:
+      // under a query's `max_answers` cap, collecting a late answer EVICTS one
+      // collected inside the window.
+      //
+      // The tick's `now` still governs everything whose schedule the core owns —
+      // stage 3's timers, and the service dispatch below, which must not
+      // schedule a response from an instant that stage's `handle_timeout` has
+      // not reached. One stable protocol instant per tick, one live read per
+      // caller-facing decision. See this module's clock rule.
+      let processed_at = StdInstant::now();
+
       let route_events = match endpoint.handle(
-        now,
+        processed_at,
         meta.peer(),
         meta.local_ip(),
         pkt_iface,
@@ -759,6 +820,15 @@ impl Mdns {
   /// the confirm to a later stage is what a parked-send table would require, and
   /// it would leave a commit token live across `handle_event`, `handle_timeout`,
   /// a rename, and a teardown.
+  ///
+  /// # `now` is this stage's protocol instant, and one decision is not on it
+  ///
+  /// A service's probe index and announcement phase are the core's own schedule
+  /// and are weighed against the tick's instant here. A query's
+  /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window is
+  /// not: it is a real-time bound the caller holds, so the query arm reads its
+  /// own instant at the poll that would draw the question. See this module's
+  /// clock rule, and do not fold the two back together.
   fn drain_transmits(&mut self, now: StdInstant) {
     let Self {
       endpoint,
@@ -972,7 +1042,28 @@ impl Mdns {
             if spent >= quantum {
               break true;
             }
-            let tx = match endpoint.poll_query_transmit(handle, now, send_buf.as_mut_slice()) {
+            // The CLOCK, not a reading of it. The core weighs a query's
+            // `QuerySpec::with_timeout` deadline — a bound the CALLER holds, no
+            // question ADMITTED at or after it — against the instant it admits
+            // on, and it takes that instant itself, at the comparison. This
+            // driver hands over the source and keeps no reading of its own: the
+            // tick's instant predates stages 1 through 3, and any reading taken
+            // here would still predate the handle lookup the core does before it
+            // compares, so neither can stand in.
+            //
+            // Departure is not what is promised and cannot be: the send below is
+            // this driver's overshoot, and a check placed inside it would still
+            // sit before a syscall. See this module's clock rule.
+            //
+            // The RFC 6762 §5.2 retry ladder is not this deadline and does not
+            // move here: `handle_query_timeout` fires it in stage 3 against the
+            // tick's protocol instant, and both it and the terminal stay there.
+            // See this module's clock rule.
+            let tx = match endpoint.poll_query_transmit(
+              handle,
+              StdInstant::now,
+              send_buf.as_mut_slice(),
+            ) {
               Ok(Some(tx)) => tx,
               Ok(None) => break false,
               Err(_e) => {

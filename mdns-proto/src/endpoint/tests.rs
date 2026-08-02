@@ -104,7 +104,7 @@ fn query_delegation_tolerates_unknown_handles() {
   let now = StdInstant::now();
   let mut buf = std::vec![0u8; 512];
   assert!(matches!(
-    e.poll_query_transmit(bogus, now, &mut buf),
+    e.poll_query_transmit(bogus, || now, &mut buf),
     Ok(None)
   ));
   e.note_query_transmit_outcome(bogus, now, TransmitDelivery::ALL); // no-op on an unknown handle
@@ -955,7 +955,7 @@ fn duplicate_qm_question_suppresses_planned_query() {
       .unwrap();
     let mut buf = [0u8; 512];
     assert!(
-      e.poll_query_transmit(h, now, &mut buf).unwrap().is_some(),
+      e.poll_query_transmit(h, || now, &mut buf).unwrap().is_some(),
       "control: a started query transmits when no duplicate is seen"
     );
   }
@@ -979,7 +979,7 @@ fn duplicate_qm_question_suppresses_planned_query() {
 
   let mut buf = [0u8; 512];
   assert!(
-    e.poll_query_transmit(h, now, &mut buf).unwrap().is_none(),
+    e.poll_query_transmit(h, || now, &mut buf).unwrap().is_none(),
     "§7.3: observing a duplicate QM question must suppress our planned query"
   );
   assert!(
@@ -1019,7 +1019,7 @@ fn qu_duplicate_question_does_not_suppress_query() {
 
   let mut buf = [0u8; 512];
   assert!(
-    e.poll_query_transmit(h, now, &mut buf).unwrap().is_some(),
+    e.poll_query_transmit(h, || now, &mut buf).unwrap().is_some(),
     "§7.3: a QU duplicate must NOT suppress our query (it elicits no multicast answer)"
   );
 }
@@ -1057,7 +1057,7 @@ fn legacy_source_duplicate_does_not_suppress_query() {
 
   let mut buf = [0u8; 512];
   assert!(
-    e.poll_query_transmit(h, now, &mut buf).unwrap().is_some(),
+    e.poll_query_transmit(h, || now, &mut buf).unwrap().is_some(),
     "§7.3: a legacy-source (non-5353) duplicate must NOT suppress our query"
   );
 }
@@ -1098,7 +1098,7 @@ fn repeated_duplicate_questions_do_not_stall_query_forever() {
   for _ in 0..32 {
     let _ = e.handle(now, src, local_ip, 0, &qbuf[..n], false).unwrap();
     assert!(
-      e.poll_query_transmit(h, now, &mut buf).unwrap().is_none(),
+      e.poll_query_transmit(h, || now, &mut buf).unwrap().is_none(),
       "each duplicate suppresses the planned transmit"
     );
     match e.poll_query_timeout(h) {
@@ -1143,7 +1143,7 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
   // Send the first query and confirm delivery → a retransmit is scheduled
   // (next_deadline ≈ now+1s) with transmit_pending cleared.
   let mut buf = [0u8; 512];
-  assert!(e.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
+  assert!(e.poll_query_transmit(h, || now, &mut buf).unwrap().is_some());
   e.note_query_transmit_outcome(h, now, TransmitDelivery::ALL);
   let t1 = e
     .poll_query_timeout(h)
@@ -1171,7 +1171,7 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
   // Arming the now-stale deadline must not transmit (slot already consumed).
   e.handle_query_timeout(h, t1).unwrap();
   assert!(
-    e.poll_query_transmit(h, t1, &mut buf).unwrap().is_none(),
+    e.poll_query_transmit(h, || t1, &mut buf).unwrap().is_none(),
     "§7.3: no redundant transmit after the due slot was suppressed"
   );
 }
@@ -1528,6 +1528,161 @@ fn poll_query_terminal_then_cancel_no_leak() {
   }
 }
 
+/// `QuerySpec::with_timeout` becomes an absolute deadline through
+/// `Instant::checked_add_duration`, and a duration that overflows the instant
+/// leaves the query with no effective deadline at all. Every deadline
+/// comparison must read that absence as "unbounded", never as "already
+/// expired" — the query that asked for the widest possible window must not be
+/// the one that ends first.
+#[test]
+fn a_query_whose_timeout_overflows_the_instant_still_transmits() {
+  use crate::{config::QuerySpec, wire::ResourceType};
+  use core::time::Duration;
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  // `Duration::MAX` overflows `StdInstant`, so no absolute deadline is stored.
+  let spec = QuerySpec::new(qname, ResourceType::A).with_timeout(Duration::MAX);
+  let h = e.try_start_query(spec, now).unwrap();
+  assert!(
+    e.poll_query_timeout(h).is_none(),
+    "an overflowing timeout must leave the query with no deadline at all"
+  );
+
+  // Poll far past any plausible window: with no deadline there is nothing to be
+  // past, so the query's question must still go out.
+  let much_later = now.checked_add(Duration::from_secs(86_400)).unwrap();
+  let mut buf = [0u8; 512];
+  assert!(
+    e.poll_query_transmit(h, || much_later, &mut buf)
+      .unwrap()
+      .is_some(),
+    "a query with no effective deadline must still transmit"
+  );
+  assert!(
+    e.poll_query(h).is_none(),
+    "a query with no effective deadline must not have reached a terminal"
+  );
+}
+
+/// The stretch between resolving a query handle and drawing its question is not
+/// free: `poll_query_transmit` finds the handle by scanning a pool with no
+/// capacity bound, and a preempted scan can take arbitrarily long whatever its
+/// length. An instant the CALLER sampled — even one sampled on the statement
+/// before the call — is therefore already history by the time the core weighs
+/// it, so a question whose `QuerySpec::with_timeout` window shut during that
+/// stretch would be admitted on the strength of a reading taken while the window
+/// was still open, and the caller would be told a question was admitted inside a
+/// window that had closed.
+///
+/// The clock is passed instead of a reading of it, so there is no parameter for
+/// a stale reading to arrive through: the core samples at the comparison, after
+/// the scan. This test burns real time in exactly that gap and then asks for the
+/// question, with the window already shut.
+///
+/// The two halves differ only in how long resolution took, so what withholds the
+/// question is the elapsed time and nothing else. And the withheld half stops at
+/// withholding: the terminal stays with `handle_query_timeout`, whose wakeup
+/// `poll_query_timeout` must still publish.
+#[test]
+fn a_window_that_shuts_during_handle_resolution_withholds_the_question() {
+  use crate::{config::QuerySpec, wire::ResourceType};
+  use core::time::Duration;
+
+  /// The caller's window, wide enough that reaching the poll inside it is not a
+  /// race and narrow enough that a scan can outlive it.
+  const WINDOW: Duration = Duration::from_millis(300);
+  /// What resolution costs when the window survives it — a small fraction of
+  /// `WINDOW`, so the control half is not a race either.
+  const SCAN_INSIDE: Duration = Duration::from_millis(20);
+  /// What resolution costs when it outlives the window.
+  const SCAN_PAST: Duration = Duration::from_millis(450);
+
+  let mut e = build_endpoint();
+  let mut buf = std::vec![0u8; 512];
+
+  // Entries for the scan to walk, so the handle under test is genuinely found by
+  // a linear pass over the pool rather than by a lookup that could not cost
+  // anything.
+  for i in 0..8u16 {
+    let decoy = Name::try_from_str(&std::format!("decoy{i}.local.")).unwrap();
+    e.try_start_query(
+      QuerySpec::new(decoy, ResourceType::A),
+      StdInstant::now(),
+    )
+    .unwrap();
+  }
+
+  // Control: resolution finishes well inside the window, and the question goes
+  // out. Without this the assertion below would also pass on an endpoint that
+  // never transmits for a query carrying a timeout at all.
+  let inside = e
+    .try_start_query(
+      QuerySpec::new(Name::try_from_str("inside.local.").unwrap(), ResourceType::A)
+        .with_timeout(WINDOW),
+      StdInstant::now(),
+    )
+    .unwrap();
+  let inside_deadline = e
+    .poll_query_timeout(inside)
+    .expect("a query given a timeout must carry its absolute deadline");
+  e.query_resolve_stall = Some(SCAN_INSIDE);
+  assert!(
+    StdInstant::now() < inside_deadline,
+    "premise: the control's window must still be open when the poll begins"
+  );
+  assert!(
+    e.poll_query_transmit(inside, StdInstant::now, &mut buf)
+      .unwrap()
+      .is_some(),
+    "a question drawn while the caller's window is open must go out"
+  );
+
+  // The fault: resolution outlives the window.
+  let past = e
+    .try_start_query(
+      QuerySpec::new(Name::try_from_str("past.local.").unwrap(), ResourceType::A)
+        .with_timeout(WINDOW),
+      StdInstant::now(),
+    )
+    .unwrap();
+  let past_deadline = e
+    .poll_query_timeout(past)
+    .expect("a query given a timeout must carry its absolute deadline");
+  e.query_resolve_stall = Some(SCAN_PAST);
+  assert!(
+    StdInstant::now() < past_deadline,
+    "premise: the window must still be open when the poll begins, so the only \
+     thing that can shut it is the resolution the endpoint is about to spend"
+  );
+  let drawn = e.poll_query_transmit(past, StdInstant::now, &mut buf).unwrap();
+  assert!(
+    StdInstant::now() >= past_deadline,
+    "premise: resolution must have outlived the window, or nothing was asked \
+     past a deadline and the assertion below is vacuous"
+  );
+  assert!(
+    drawn.is_none(),
+    "the caller's window shut while the endpoint was still resolving the \
+     handle, but the question was admitted anyway — the deadline was weighed \
+     against an instant read before the scan instead of at the comparison"
+  );
+
+  // Withheld, not ended: the terminal belongs to `handle_query_timeout`, and the
+  // wakeup that reaches it must still be published.
+  assert!(
+    e.poll_query(past).is_none(),
+    "withholding a late question must not terminate the query"
+  );
+  assert_eq!(
+    e.poll_query_timeout(past),
+    Some(past_deadline),
+    "the deadline the withheld question was weighed against must still be \
+     scheduled, or no driver would ever wake to end the query"
+  );
+}
+
 // ── collected_answers readable after terminal poll_query ─────
 
 /// After `poll_query` returns `Some(Done | Timeout)`, the natural
@@ -1606,6 +1761,325 @@ fn collected_answers_survive_terminal_until_cancel() {
   // Explicit cleanup leaves the pool empty.
   e.cancel_query(h).unwrap();
   assert!(e.collected_answers(h).next().is_none());
+}
+
+/// A response processed after the query's absolute deadline is not collected,
+/// even though nothing has ended the query yet.
+///
+/// `handle` applies matching answers eagerly, and a driver whose receive side
+/// runs ahead of its timer pump reaches it while the query is still live:
+/// `hick-mio` drains receives before it fires timeouts, and `hick-reactor`
+/// drains queued packets first and prefers a packet to a simultaneously-ready
+/// timer. So `done` is still false at the moment a datagram from past the
+/// boundary is handed to the query. That is the ordering this screens, and
+/// screening it is what keeps the answer set from depending on which stage of a
+/// loop happens to run first.
+///
+/// The cap is 1, because the late answer's real cost is not that it appears: it
+/// is that the FIFO cap makes it EVICT the answer collected while the window was
+/// open, turning a laxity into a lost result.
+#[test]
+fn an_answer_processed_past_the_query_deadline_is_not_collected() {
+  use crate::{
+    config::QuerySpec,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceType},
+  };
+  use core::{net::SocketAddr, time::Duration};
+
+  /// Long enough that the first datagram is unambiguously inside the window.
+  const WINDOW: Duration = Duration::from_millis(100);
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let spec = QuerySpec::new(qname.clone(), ResourceType::A)
+    .with_timeout(WINDOW)
+    .with_max_answers(1);
+  let h = e.try_start_query(spec, now).unwrap();
+
+  let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let response = |addr: Ipv4Addr, buf: &mut [u8]| -> usize {
+    let mut hdr = Header::new();
+    hdr.flags_mut().set_response();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(buf, hdr).unwrap();
+    b.push_a_answer(&qname, 120, addr, false).unwrap();
+    b.finish().unwrap()
+  };
+
+  let mut buf = [0u8; 512];
+  let n = response(Ipv4Addr::new(10, 0, 0, 7), &mut buf);
+  let _ = e.handle(now, src, local_ip, 0, &buf[..n], false).unwrap().count();
+  assert_eq!(
+    e.collected_answers(h).count(),
+    1,
+    "an answer processed inside the window must be collected"
+  );
+
+  // Past the deadline, with no timer pump in between — the reachable ordering.
+  let after = now.checked_add(Duration::from_millis(300)).unwrap();
+  let n = response(Ipv4Addr::new(10, 0, 0, 8), &mut buf);
+  let _ = e
+    .handle(after, src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .count();
+
+  let answers: std::vec::Vec<_> = e.collected_answers(h).cloned().collect();
+  assert_eq!(
+    answers.len(),
+    1,
+    "a response processed past the deadline must not be collected; got {answers:?}"
+  );
+  assert_eq!(
+    answers[0].rdata_slice(),
+    &[10, 0, 0, 7],
+    "and it must not have evicted the answer the caller collected inside its \
+     window — that is the whole reason the boundary is enforced here rather \
+     than left to whichever driver stage runs first"
+  );
+  assert!(
+    e.poll_query(h).is_none(),
+    "refusing the late answer must not produce a terminal: the terminal belongs \
+     to handle_query_timeout"
+  );
+}
+
+/// The routing fan-out must withhold a record refused for standing past the
+/// CALLER's window — on the Answer section and on the Additional section alike.
+///
+/// The two sites observe one fact about one record. `handle` applies the answer
+/// eagerly and refuses it, while the query deliberately stays LIVE until its own
+/// timer fires — so `is_done` and `terminal_emitted`, the only other screens the
+/// fan-out applies, are both false at exactly the moment the collection was
+/// refused. A `ToQuery` emitted there points at nothing a caller can find in
+/// `collected_answers`, and carries nothing to tell it apart from a record the
+/// query kept.
+///
+/// This is the window and only the window: the fan-out screens none of
+/// `handle_event`'s own grounds for declining, which
+/// `an_uncollected_answer_is_still_routed_to_its_query` pins from the other
+/// side.
+///
+/// Exactly ON the boundary, which is where `now >= deadline` differs from
+/// `now > deadline`, and each section is weighed twice: once inside the window,
+/// where the event MUST still be emitted, and once at the boundary. Without the
+/// first half a fan-out that emitted nothing at all would pass.
+#[test]
+fn a_refused_answer_is_not_routed_to_its_query() {
+  use crate::{
+    config::QuerySpec,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
+  };
+  use core::{net::SocketAddr, time::Duration};
+
+  const WINDOW: Duration = Duration::from_millis(100);
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let deadline = now.checked_add(WINDOW).unwrap();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = e
+    .try_start_query(
+      QuerySpec::new(qname.clone(), ResourceType::A).with_timeout(WINDOW),
+      now,
+    )
+    .unwrap();
+  // A service publishing the SAME name as its host, so every datagram below also
+  // has service-side work to do: the refusal must be scoped to the query that
+  // asked for the window, not to the datagram.
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("P._ipp._tcp.local.").unwrap(),
+    qname.clone(),
+    631,
+    120,
+  );
+  recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
+  let _ = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+
+  // The A record in the ANSWER section.
+  let mut buf = [0u8; 512];
+  let answer_section = |addr: Ipv4Addr, buf: &mut [u8]| -> usize {
+    let mut hdr = Header::new();
+    hdr.flags_mut().set_response();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(buf, hdr).unwrap();
+    b.push_a_answer(&qname, 120, addr, false).unwrap();
+    b.finish().unwrap()
+  };
+  // The same record in the ADDITIONAL section (qd=0, an=0, ns=0, ar=1), where a
+  // DNS-SD responder puts the SRV/TXT/A/AAAA accompanying a PTR. The builder has
+  // no push_*_additional, so the bytes are laid out by hand.
+  let additional_section = |addr: Ipv4Addr| -> std::vec::Vec<u8> {
+    let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
+    msg.extend_from_slice(&[0, 0, 0x84, 0x00, 0, 0, 0, 0, 0, 0, 0, 1]);
+    msg.extend_from_slice(&[
+      7, b'p', b'r', b'i', b'n', b't', b'e', b'r', 5, b'l', b'o', b'c', b'a', b'l', 0,
+    ]);
+    msg.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+    msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+    msg.extend_from_slice(&120u32.to_be_bytes()); // TTL
+    msg.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+    msg.extend_from_slice(&addr.octets());
+    msg
+  };
+  /// Routing decisions for one datagram, split by which side they address.
+  fn routed(e: &mut TestEndp, at: StdInstant, src: SocketAddr, pkt: &[u8]) -> (usize, usize) {
+    let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+    let mut to_query = 0usize;
+    let mut to_service = 0usize;
+    for ev in e.handle(at, src, local_ip, 0, pkt, false).unwrap() {
+      match ev {
+        Ok(ev) if ev.is_to_query() => to_query = to_query.saturating_add(1),
+        Ok(ev) if ev.is_to_service() => to_service = to_service.saturating_add(1),
+        _ => {}
+      }
+    }
+    (to_query, to_service)
+  }
+
+  // Inside the window: both sections route the answer they collected.
+  let n = answer_section(Ipv4Addr::new(10, 0, 0, 7), &mut buf);
+  let answer_pkt = buf[..n].to_vec();
+  assert_eq!(
+    routed(&mut e, now, src, &answer_pkt).0,
+    1,
+    "an answer collected inside the window must still be routed to its query"
+  );
+  let additional_pkt = additional_section(Ipv4Addr::new(10, 0, 0, 8));
+  assert_eq!(
+    routed(&mut e, now, src, &additional_pkt).0,
+    1,
+    "an additional-section answer collected inside the window must still be routed"
+  );
+  assert_eq!(
+    e.collected_answers(h).count(),
+    2,
+    "both in-window records must have been collected, or the boundary below is \
+     not what the difference is"
+  );
+
+  // On the boundary: the collection is refused, so the routing must be too.
+  let n = answer_section(Ipv4Addr::new(10, 0, 0, 9), &mut buf);
+  let late_answer = buf[..n].to_vec();
+  let (to_query, to_service) = routed(&mut e, deadline, src, &late_answer);
+  assert_eq!(
+    to_query, 0,
+    "an answer the query refused on the deadline must not be routed to it: the \
+     event is indistinguishable from one for an answer that was collected"
+  );
+  assert!(
+    to_service >= 1,
+    "and only the query fan-out is refused: a peer claiming our host name is \
+     still a HostConflict, whatever any query's window is doing"
+  );
+  let late_additional = additional_section(Ipv4Addr::new(10, 0, 0, 10));
+  assert_eq!(
+    routed(&mut e, deadline, src, &late_additional).0,
+    0,
+    "and the Additional section is the same record on the same terms — DNS-SD \
+     carries SRV/TXT/A/AAAA there"
+  );
+
+  assert_eq!(
+    e.collected_answers(h).count(),
+    2,
+    "neither refused record may be collected"
+  );
+  // The datagram is still processed: only the query fan-out is refused.
+  assert!(
+    e.cache.contains(&qname, ResourceType::A, ResourceClass::In),
+    "a datagram whose query fan-out is refused must still populate the cache — \
+     the cache is not bounded by any query's window"
+  );
+  assert!(
+    e.poll_query(h).is_none(),
+    "withholding the routing must not produce a terminal either: the terminal \
+     belongs to handle_query_timeout"
+  );
+}
+
+/// `ToQuery` reports that a query was OFFERED a record, not that it kept one:
+/// the fan-out's four per-query screens are exactly that offer, and nothing
+/// about what the query then did with the record.
+///
+/// A `QuerySpec::with_max_answers` cap of zero is the cheapest witness: the
+/// query has not ended, has taken no terminal, sits well inside its caller's
+/// window, and the record matches its name, type and class — all four screens
+/// the fan-out applies per query — while `Query::handle_event` collects nothing.
+/// This says nothing about the earlier stages a record must clear to reach the
+/// fan-out at all; those are not screens on a query, and no absent event can be
+/// read back to them. The other grounds on which collection declines
+/// (undecodable rdata, a duplicate, a full pool) differ only in which of
+/// `handle_event`'s filters fires; each would re-exercise the same divergence
+/// this one already pins.
+///
+/// BOTH halves are asserted, because a change that stopped the fan-out routing
+/// altogether would satisfy the empty answer set on its own.
+#[test]
+fn an_uncollected_answer_is_still_routed_to_its_query() {
+  use crate::{
+    config::QuerySpec,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceType},
+  };
+  use core::{net::SocketAddr, time::Duration};
+
+  /// Long enough that the datagram lands unambiguously inside the window, so the
+  /// caller-window screen is not what this test turns on.
+  const WINDOW: Duration = Duration::from_millis(100);
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = e
+    .try_start_query(
+      QuerySpec::new(qname.clone(), ResourceType::A)
+        .with_timeout(WINDOW)
+        .with_max_answers(0),
+      now,
+    )
+    .unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  b.push_a_answer(&qname, 120, Ipv4Addr::new(10, 0, 0, 7), false)
+    .unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let to_query: std::vec::Vec<_> = e
+    .handle(now, src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .map(Result::unwrap)
+    .filter_map(|ev| match ev {
+      RouteEvent::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_)) => Some(tq.handle()),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    to_query,
+    [h],
+    "an in-window matching answer must still be routed to the query it matches, \
+     whatever that query then does with it"
+  );
+  assert_eq!(
+    e.collected_answers(h).count(),
+    0,
+    "and a zero max_answers cap keeps none of it: the routed event is an offer, \
+     not a receipt"
+  );
 }
 
 // ── query state applied eagerly during handle ────────────────
@@ -3282,7 +3756,7 @@ fn cancel_query_under_a_live_send_confirm_trips_the_contract_assertion() {
     .try_start_query(QuerySpec::new(qname, ResourceType::A), now)
     .unwrap();
   let mut buf = std::vec![0u8; 512];
-  e.poll_query_transmit(h, now, &mut buf)
+  e.poll_query_transmit(h, || now, &mut buf)
     .unwrap()
     .expect("a newly-started query has its first question due");
   let _ = e.cancel_query(h);
@@ -3305,7 +3779,7 @@ fn retire_query_under_a_live_send_confirm_trips_the_contract_assertion() {
     .try_start_query(QuerySpec::new(qname, ResourceType::A), now)
     .unwrap();
   let mut buf = std::vec![0u8; 512];
-  e.poll_query_transmit(h, now, &mut buf)
+  e.poll_query_transmit(h, || now, &mut buf)
     .unwrap()
     .expect("a newly-started query has its first question due");
   e.retire_query(h);
@@ -3436,7 +3910,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 
   // (a) Drain the initial transmit without confirming → awaiting_send_confirm=true.
   let mut tx_buf = std::vec![0u8; 512];
-  let tx = e.poll_query_transmit(h, now, &mut tx_buf).unwrap();
+  let tx = e.poll_query_transmit(h, || now, &mut tx_buf).unwrap();
   assert!(
     tx.is_some(),
     "newly-started query must have an initial transmit pending"
@@ -7048,7 +7522,7 @@ fn questions_before_the_query_retires(delivery: TransmitDelivery) -> usize {
   let mut buf = std::vec![0u8; 512];
   let mut sent = 0usize;
   while ep
-    .poll_query_transmit(h, now, &mut buf)
+    .poll_query_transmit(h, || now, &mut buf)
     .unwrap()
     .is_some()
   {
@@ -7081,7 +7555,7 @@ fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
     )
     .unwrap();
   let mut buf = std::vec![0u8; 512];
-  assert!(ep.poll_query_transmit(h, now, &mut buf).unwrap().is_some());
+  assert!(ep.poll_query_transmit(h, || now, &mut buf).unwrap().is_some());
 
   ep.note_query_transmit_outcome(h, now, TransmitDelivery::V4_ONLY);
   let after_partial = ep.poll_query_timeout(h);
@@ -7096,7 +7570,7 @@ fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
   for _ in 1..crate::service::MAX_PARTIAL_ROUNDS {
     let due = ep.poll_query_timeout(h).unwrap();
     ep.handle_query_timeout(h, due).unwrap();
-    assert!(ep.poll_query_transmit(h, due, &mut buf).unwrap().is_some());
+    assert!(ep.poll_query_transmit(h, || due, &mut buf).unwrap().is_some());
     ep.note_query_transmit_outcome(h, due, TransmitDelivery::V4_ONLY);
   }
   assert!(

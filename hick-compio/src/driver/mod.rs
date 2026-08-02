@@ -241,6 +241,22 @@ pub(crate) struct State {
   /// round-trip.
   #[cfg(feature = "stats")]
   pub(crate) stats: std::sync::Arc<stats::Stats>,
+  /// Per-query stalls injected **between [`Self::poll_one_transmit`]'s entry and
+  /// the instant each question is weighed against**, consumed one per query the
+  /// pump actually polls — a cancelled or errored query is skipped before the
+  /// stall. Once exhausted every poll proceeds at full speed.
+  ///
+  /// It stands in for the one thing no test can ask a real host for: this
+  /// synchronous call losing the CPU with a query poll still ahead of it. The
+  /// stretch it models is a snapshot of, and a walk over, two uncapped
+  /// `HashMap`s — every service first, then every preceding query — so on a
+  /// loaded endpoint it is real elapsed time. Nothing in it awaits, which is
+  /// precisely why the run loop's per-iteration re-read cannot cover it, and it
+  /// is the last window in which a caller's
+  /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window can
+  /// shut while the reading that would admit the question is already stale.
+  #[cfg(test)]
+  pub(crate) forced_query_poll_delays: std::collections::VecDeque<Duration>,
 }
 
 impl State {
@@ -269,6 +285,8 @@ impl State {
       max_recv,
       #[cfg(feature = "stats")]
       stats,
+      #[cfg(test)]
+      forced_query_poll_delays: std::collections::VecDeque::new(),
     }
   }
 
@@ -742,6 +760,15 @@ impl State {
   /// [`State::note_service_transmit_outcome`] after the send completes — the §8.1
   /// probe sequence and §8.3 announce phase only advance once every obligated
   /// family carried the pending datagram.
+  ///
+  /// `now` is the reading the transmit pump took for this iteration, and what it
+  /// is spent on HERE is the core's own service schedules alone — each service's
+  /// lifecycle timers, and the withdrawal one of them may begin. A query's
+  /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window is
+  /// not one of those: it is real time promised to a caller, so the query walk
+  /// reads its own instant at the poll that would draw the question. The RFC 6762
+  /// §5.2 retry ladder is not one of them either — [`Self::fire_timeouts`] fires
+  /// it, from the timer branch, against a reading taken there.
   pub(crate) fn poll_one_transmit(
     &mut self,
     now: StdInstant,
@@ -859,7 +886,46 @@ impl State {
       if ctx.cancelled || ctx.errored {
         continue;
       }
-      match self.endpoint.poll_query_transmit(h, now, scratch) {
+      #[cfg(test)]
+      Self::stall_before_query_poll(&mut self.forced_query_poll_delays);
+      // The CLOCK, not a reading of it. The core weighs a query's
+      // `QuerySpec::with_timeout` deadline — a bound the CALLER holds, no
+      // question ADMITTED at or after it — against the instant it admits on, and
+      // it takes that instant itself, at the comparison. This driver hands over
+      // the source and keeps no reading of its own: the `now` this call was
+      // handed is the run loop's per-iteration reading, taken before the service
+      // snapshot, the whole service walk and every preceding query of this same
+      // call, and a reading taken right here would still predate the handle
+      // lookup the core does before it compares. Both maps are uncapped, and no
+      // `await` divides any of it — elapsed time needs no suspension point to
+      // accrue, which is why no reading OUTSIDE the comparison can stand in for
+      // one at it.
+      //
+      // Admission is the core's COMPARISON — the encode and return that finish
+      // the poll are already past it — and this driver's overshoot past that is
+      // the one it cannot cap: `run` hands the datagram to an AWAITED fan-out that is
+      // never abandoned, because cancelling a submitted completion-based
+      // operation is unreliable (see `awaiting_fanout`), so a question admitted
+      // just inside the window reaches a wire whenever the kernel completes it —
+      // traced, not bounded, at `FANOUT_STALL_TRACE`. Neither shape of recheck
+      // recovers departure: one placed before the submission is just this
+      // comparison again, a few instructions lower and still ahead of a syscall,
+      // and one placed after it would have to abandon an operation the kernel may
+      // already be completing — reporting a datagram as never sent while it goes
+      // out. The bound is what this driver can honestly offer.
+      //
+      // The RFC 6762 §5.2 retry ladder is not this deadline and does not move
+      // here: `fire_timeouts` fires it, and the endpoint's own timers with it,
+      // against a reading taken there. What keeps the `now` this call was given
+      // is the service walk above — lifecycle schedules the core owns and nobody
+      // outside it observes, where two stages disagreeing about "now" can fire a
+      // deadline twice or skip it, and where the quantization never leaves the
+      // core. Which kind an instant is depends on who was promised it, never on
+      // the comparison that weighs it.
+      match self
+        .endpoint
+        .poll_query_transmit(h, StdInstant::now, scratch)
+      {
         // A datagram is ready — hand it to the driver to send.
         Ok(Some(t)) => return Some((t, TransmitOrigin::Query(h))),
         // Nothing due right now — try the next query.
@@ -901,6 +967,26 @@ impl State {
       }
     }
     None
+  }
+
+  /// Lose the CPU where the transmit pump really can: inside one
+  /// `poll_one_transmit`, with the instant that admits the next question still
+  /// unread. See [`State::forced_query_poll_delays`].
+  #[cfg(test)]
+  fn stall_before_query_poll(stalls: &mut std::collections::VecDeque<Duration>) {
+    if let Some(stall) = stalls.pop_front()
+      && !stall.is_zero()
+    {
+      std::thread::sleep(stall);
+    }
+  }
+
+  /// Stall the next query polls between the pump's entry and each poll's own
+  /// clock read, one entry per query walked. See
+  /// [`State::forced_query_poll_delays`].
+  #[cfg(test)]
+  pub(crate) fn force_query_poll_delays_for_test(&mut self, stalls: &[Duration]) {
+    self.forced_query_poll_delays = stalls.iter().copied().collect();
   }
 
   /// Confirm a previously polled service transmit. Called by the driver loop
@@ -1155,6 +1241,15 @@ impl State {
 
     // Use a process-monotonic `now` for proto scheduling; the SystemTime
     // reference above is what classified the self-send credit.
+    //
+    // Read per datagram, here, and it must stay here: `endpoint.handle` anchors
+    // this datagram's every effect to it, and one of them is a bound the CALLER
+    // holds — a query whose `QuerySpec::with_timeout` window has shut collects
+    // nothing from this datagram and suppresses no RFC 6762 §7.3 slot for it.
+    // Hoisting the read to the run loop, which drains a batch of datagrams and
+    // awaits between them, would weigh the last of them on a reading taken before
+    // the first, and that is not laxity in the caller's favour: under
+    // `max_answers` a late answer EVICTS one collected inside the window.
     let now = StdInstant::now();
 
     // Split-borrow: endpoint and services are disjoint fields, but
