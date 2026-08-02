@@ -110,74 +110,48 @@ pub(crate) const MAX_RECV_ERRORS_PER_ROUND: u32 = 4;
 pub(crate) static BIND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Which of the two sockets an operation applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Family {
-  V4,
-  V6,
-}
+///
+/// `hick-udp`'s type rather than one of this crate's own, because the self-send
+/// tracker it keys credits on lives there too — one definition, so a credit
+/// recorded on this crate's IPv4 and one claimed on the tracker's cannot drift
+/// apart. [`Family::index`] fixes the per-family array order, and it matches
+/// [`mdns_proto::TransmitDelivery`]'s own so a driver-side array and a confirm
+/// can never be indexed differently.
+pub(crate) use hick_udp::Family;
 
-impl Family {
-  /// The family a destination address belongs to.
-  const fn of(dst: SocketAddr) -> Self {
-    match dst {
-      SocketAddr::V4(_) => Self::V4,
-      SocketAddr::V6(_) => Self::V6,
-    }
-  }
-
-  /// `via_v4` in the shape `recv` and the trace fields want.
-  pub(crate) const fn is_v4(self) -> bool {
-    matches!(self, Self::V4)
-  }
-
-  /// This family's index in every per-family array, matching
-  /// [`mdns_proto::TransmitDelivery`]'s own ordering so a driver-side array and
-  /// a confirm can never be indexed differently.
-  pub(crate) const fn index(self) -> usize {
-    match self {
-      Self::V4 => 0,
-      Self::V6 => 1,
-    }
-  }
-
-  /// The family this one is not.
-  const fn other(self) -> Self {
-    match self {
-      Self::V4 => Self::V6,
-      Self::V6 => Self::V4,
-    }
-  }
-
-  /// The largest UDP payload this family can **ever** carry, and therefore the
-  /// only sound proof that a refused datagram can never be sent. See
-  /// [`SendOutcome::TooLarge`] for why an errno is not one.
-  ///
-  /// Both numbers fall out of the wire formats and neither is a tunable:
-  ///
-  /// * IPv4 — a 16-bit total-length field caps the whole datagram at 65 535
-  ///   bytes, of which a minimal IPv4 header takes 20 and the UDP header 8:
-  ///   **65 507**. Options make the real ceiling lower, never higher.
-  /// * IPv6 — the 16-bit payload-length field caps everything after the fixed
-  ///   header at 65 535, of which the UDP header takes 8: **65 527**. Extension
-  ///   headers count against that payload length, so the real ceiling is again
-  ///   only ever lower.
-  ///
-  /// Both are therefore upper bounds that a host may not reach and can never
-  /// exceed, which is the direction that matters: a datagram *below* the bound
-  /// may still be refused for a reason that clears — a path MTU with DF set, on
-  /// Linux, reports the very same `EMSGSIZE` — and is classified transient, while
-  /// one above it is impossible on any route, at any MTU, forever.
-  ///
-  /// RFC 2675 IPv6 jumbograms are deliberately not modelled. They need a
-  /// hop-by-hop option and a jumbo-capable path end to end, an mDNS message is
-  /// six orders of magnitude smaller than the threshold, and reading the bound
-  /// too low is the expensive direction — it would retire a producer whose
-  /// datagram the kernel would have accepted.
-  pub(crate) const fn max_udp_payload(self) -> usize {
-    match self {
-      Self::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
-      Self::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
-    }
+/// The largest UDP payload `family` can **ever** carry, and therefore the only
+/// sound proof that a refused datagram can never be sent. See
+/// [`SendOutcome::TooLarge`] for why an errno is not one.
+///
+/// Both numbers fall out of the wire formats and neither is a tunable:
+///
+/// * IPv4 — a 16-bit total-length field caps the whole datagram at 65 535
+///   bytes, of which a minimal IPv4 header takes 20 and the UDP header 8:
+///   **65 507**. Options make the real ceiling lower, never higher.
+/// * IPv6 — the 16-bit payload-length field caps everything after the fixed
+///   header at 65 535, of which the UDP header takes 8: **65 527**. Extension
+///   headers count against that payload length, so the real ceiling is again
+///   only ever lower.
+///
+/// Both are therefore upper bounds that a host may not reach and can never
+/// exceed, which is the direction that matters: a datagram *below* the bound
+/// may still be refused for a reason that clears — a path MTU with DF set, on
+/// Linux, reports the very same `EMSGSIZE` — and is classified transient, while
+/// one above it is impossible on any route, at any MTU, forever.
+///
+/// RFC 2675 IPv6 jumbograms are deliberately not modelled. They need a
+/// hop-by-hop option and a jumbo-capable path end to end, an mDNS message is
+/// six orders of magnitude smaller than the threshold, and reading the bound
+/// too low is the expensive direction — it would retire a producer whose
+/// datagram the kernel would have accepted.
+///
+/// A free function rather than a method: [`Family`] is `hick-udp`'s type, and
+/// this ceiling is `mdns-proto`'s constant, which that crate deliberately does
+/// not depend on.
+pub(crate) const fn max_udp_payload(family: Family) -> usize {
+  match family {
+    Family::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
+    Family::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
   }
 }
 
@@ -379,7 +353,7 @@ pub(crate) enum SendOutcome {
   /// [`SendOutcome::NoSocket`], which exists precisely so the two can differ.
   Failed,
   /// A bound socket refused the datagram, and its body is past
-  /// [`Family::max_udp_payload`] — the hard limit UDP on this family can ever
+  /// [`max_udp_payload`] — the hard limit UDP on this family can ever
   /// carry.
   ///
   /// A non-delivery like [`SendOutcome::Failed`] in every respect the wire cares
@@ -409,7 +383,7 @@ pub(crate) enum SendOutcome {
   /// process ends — the defect this variant was introduced to close, quietly
   /// restored on every platform the table missed.
   ///
-  /// So the question asked is `body.len() > family.max_udp_payload()`: exact,
+  /// So the question asked is `body.len() > max_udp_payload(family)`: exact,
   /// platform-independent, and a property of the datagram rather than of the
   /// moment. The kernel's refusal is still required — it is what proves these
   /// bytes did not go out, and a host that somehow accepted them has manifestly
@@ -690,7 +664,7 @@ struct BoundSocket {
   /// eventually writes the family off — is unreachable in a test without it.
   #[cfg(test)]
   forced_send_wouldblock: bool,
-  /// Stand in for this family's [`Family::max_udp_payload`], so an ordinary
+  /// Stand in for this family's [`max_udp_payload`], so an ordinary
   /// datagram a live producer emits is genuinely oversize for it.
   ///
   /// The real condition IS reproducible — a 70 000-byte payload, which
@@ -901,14 +875,14 @@ impl BoundSocket {
   }
 
   /// The largest body this family will accept, which is
-  /// [`Family::max_udp_payload`] unless a test has lowered it. See
+  /// [`max_udp_payload`] unless a test has lowered it. See
   /// [`BoundSocket::forced_payload_ceiling`].
   fn payload_ceiling(&self, family: Family) -> usize {
     #[cfg(test)]
     if let Some(ceiling) = self.forced_payload_ceiling {
       return ceiling;
     }
-    family.max_udp_payload()
+    max_udp_payload(family)
   }
 
   /// One `send_to` attempt: its own pre-syscall clock reads, the syscall, and —

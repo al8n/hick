@@ -2714,7 +2714,7 @@ fn a_transient_all_family_failure_retries_and_never_retires() {
 /// datagram is three orders of magnitude inside that maximum when it happens. A
 /// classification keyed on the errno therefore retires a healthy service over a
 /// link whose next MTU probe would have carried it — which is why permanence is
-/// proved by `Family::max_udp_payload` and by nothing else.
+/// proved by `socket::max_udp_payload` and by nothing else.
 ///
 /// Ends the way its `WouldBlock` sibling does, by letting the socket accept
 /// again and watching the same registration resume its §8.1 sequence: a retired

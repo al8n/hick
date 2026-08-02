@@ -56,7 +56,7 @@ impl ServerOptions {
   /// carrying `usize::MAX` — or any size the allocator could not satisfy — ended
   /// the process instead of returning
   /// [`ServerError`](crate::ServerError::BufferSizeUnsupported).
-  pub const MAX_BUFFER_SIZE: usize = crate::socket::Family::V6.max_udp_payload();
+  pub const MAX_BUFFER_SIZE: usize = crate::socket::max_udp_payload(crate::socket::Family::V6);
 
   /// Build a new options bundle with defaults.
   ///
