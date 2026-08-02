@@ -13,7 +13,6 @@ mod event;
 mod onlink;
 mod options;
 mod proto;
-mod selfsend;
 mod socket;
 
 pub use discovery::{DEFAULT_MAX_ENTRIES, LookupHandle, QueryParam, ServiceEntry};

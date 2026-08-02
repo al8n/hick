@@ -75,7 +75,7 @@
 //! admits the question stage 4 is about to draw or the answer stage 1 is about
 //! to apply — is read at the decision by the code that makes it. The strongest
 //! form is to take no instant at all, which is what
-//! [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take),
+//! [`SelfSendTracker::take`](hick_udp::selfsend::SelfSendTracker::take),
 //! [`send_and_credit`], [`Mdns::push_updates`], [`Mdns::advance_lookups`] and
 //! [`Mdns::drain_withdrawals`] all do: a parameter is a channel through which a
 //! caller hands in a reading taken somewhere else, and moving the read nearer
@@ -470,15 +470,23 @@ impl Mdns {
     // Hand every family back its transient-receive-error budget. Once per tick
     // is what makes the retry bounded rather than merely repeated.
     self.sockets.begin_recv_round();
-    // Open the self-send claim window before the stage that claims from it. It
-    // takes no instant and is deliberately not given `now`: the anchor it stamps
-    // this batch with is the first moment a credit the previous tick recorded can
-    // be claimed, and `SELF_SEND_TTL` may be measured from nothing earlier or
-    // later — so it is read inside the seal, after the sweep that precedes it,
-    // rather than handed in from here. The outbound stages below all run after
-    // stage 1, so the tick that records a credit can never claim it; top of the
-    // tick rather than end of the outbound stages so that stays true however
-    // stages 4 through 7 are later reordered or added to.
+    // Open the self-send claim window, closing every credit the PREVIOUS tick's
+    // outbound stages recorded, immediately before `drain_recv` — the one stage
+    // that can claim one.
+    //
+    // Recording and window-opening straddle the receive, which is the actual
+    // rule: this tick's own records all happen in stages below `drain_recv`, so
+    // no credit can reach a claim unsealed. (An unsealed credit is live
+    // UNCONDITIONALLY, so one that did would ignore `SELF_SEND_TTL` entirely.)
+    // Top-of-tick is the right placement HERE only because the receive stage
+    // comes first and every send follows it; a loop that sent before it received
+    // would need its seal after those sends instead. Adding a send above this
+    // line, or a receive below it, breaks the property silently.
+    //
+    // It takes no instant and is deliberately not given `now`: the anchor is the
+    // first moment a credit can be claimed, and `SELF_SEND_TTL` may be measured
+    // from nothing earlier or later — so it is read inside the seal, after the
+    // sweep that precedes it, rather than handed in from here.
     self.selfsend.seal();
     self.drain_recv(now);
     self.sweep();
@@ -667,7 +675,8 @@ impl Mdns {
       // ours must not consume the credit it failed to match either.
       #[cfg(test)]
       Self::stall_before_claim(forced_claim_delays);
-      let caller_is_self = from_mdns_port && selfsend.take(family, data, sockets.rx_time(&meta));
+      let caller_is_self =
+        from_mdns_port && selfsend.take(family, data, sockets.rx_evidence(&meta));
 
       // This datagram's own processing instant, read here rather than taken from
       // the tick, because `Endpoint::handle` weighs a bound the CALLER holds

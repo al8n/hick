@@ -841,7 +841,7 @@ const fn sent_at(wall: SystemTime, mono: std::time::Instant) -> SendOutcome {
 /// and telling real elapsed time from a wall-clock step needs its monotonic
 /// partner. The shape the driver reads out of [`SendReport::per_family`] to
 /// credit its own loopback copies.
-fn stamps(report: &SendReport) -> Vec<crate::selfsend::ClockPair> {
+fn stamps(report: &SendReport) -> Vec<hick_udp::selfsend::ClockPair> {
   report
     .per_family()
     .into_iter()
@@ -866,8 +866,8 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
   assert_eq!(
     stamps(&both),
     vec![
-      crate::selfsend::ClockPair::new(t1, mono),
-      crate::selfsend::ClockPair::new(t2, mono)
+      hick_udp::selfsend::ClockPair::new(t1, mono),
+      hick_udp::selfsend::ClockPair::new(t2, mono)
     ],
     "a dual-stack fan-out produces two loopback copies and must yield two credits"
   );
@@ -879,7 +879,7 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
   };
   assert_eq!(
     stamps(&v4_only),
-    vec![crate::selfsend::ClockPair::new(t1, mono)]
+    vec![hick_udp::selfsend::ClockPair::new(t1, mono)]
   );
 
   // None of these produced a loopback copy: one was never offered the datagram,

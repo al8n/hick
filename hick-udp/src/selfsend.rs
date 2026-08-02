@@ -9,15 +9,36 @@
 //! datagram from a co-resident peer received afterwards is still seen as a
 //! peer, not swallowed as our own echo.
 //!
-//! `hick-compio/src/selfsend.rs` and `hick-reactor/src/driver/mod.rs` apply
-//! the same take-once semantics for their own drivers; this module matches
-//! them, and additionally keys every credit to the **address family it was
-//! sent on** — see [`SelfSendTracker::take`] for the dual-stack echo race that
-//! makes content-and-time matching alone insufficient here.
+//! Every credit is keyed to the **address family it was sent on** — see
+//! [`SelfSendTracker::take`] for the dual-stack echo race that makes
+//! content-and-time matching alone insufficient.
+//!
+//! # One implementation, because three drifted
+//!
+//! This lives here, one layer below the socket drivers, because it was written
+//! out three times and the three copies disagreed on seven points — four of them
+//! defects: the [`SELF_SEND_TTL`] measured on the wall clock, no wall-step
+//! detection, a hard-coded pre-send slack in place of
+//! [`crate::RX_TIMESTAMP_GRAIN`], and a sweep that dropped every future-stamped
+//! credit. Two of the three carried a comment claiming they matched the others,
+//! which is why a cross-reference is not the mechanism that keeps them together
+//! and a shared type is.
+//!
+//! A driver that needs *different* semantics needs its own type rather than a
+//! fourth copy of this one. The `no_std` stacks are exactly that case: they own
+//! their IP stack, match on exact bytes, and cannot have a [`SystemTime`] at
+//! all.
+
+// The invariants this module turns on live in its private half — the two-stamp
+// `Credit`, the expiry-ordered `entries`, the derivation in `evidence_mode`.
+// Public docs that state a rule and then name the code enforcing it are worth
+// more than public docs that state the rule and stop, and publishing that half
+// to satisfy the link checker would put internal seams into this crate's API.
+#![allow(rustdoc::private_intra_doc_links)]
 
 use std::time::{Duration, Instant as StdInstant, SystemTime};
 
-use crate::socket::Family;
+use crate::{Family, RX_TIMESTAMP_GRAIN, RecvMeta};
 
 /// How long a recorded send stays eligible to match an inbound loopback,
 /// measured from the **first instant its echo could be claimed** rather than
@@ -30,30 +51,28 @@ use crate::socket::Family;
 /// # The clock starts at the first claim opportunity
 ///
 /// **A credit's ageing must not begin until the first instant its echo is
-/// claimable — the top of the tick after the recording tick — and from then on
-/// charges real monotonic elapsed time, including caller latency.** Both halves
-/// are load-bearing.
+/// claimable — the [`SelfSendTracker::seal`] that follows the send and precedes
+/// the driver's next receive — and from then on charges real monotonic elapsed
+/// time, including caller latency.** Both halves are load-bearing.
 ///
-/// Intra-tick outbound time is *structurally* claim-free.
-/// [`Mdns::tick`](crate::Mdns::tick) runs its receive stage **before** every
-/// stage that sends, so nothing recorded during a tick can be claimed during
-/// that same tick; the stretch between a record and the end of its own tick is
-/// the driver's own scheduling, and charging it to a window that exists to
-/// bound the echo's *flight* is a defect. It expired credits three separate
-/// ways before this anchor moved: a stall between a send's pre-syscall stamp
-/// and its syscall, a later send in the same tick stalling after an earlier
-/// credit was already recorded, and a stage-7 goodbye recorded a full TTL after
-/// the stage-4 announcement whose credit was still unclaimed. All three are the
-/// one bug, and [`SelfSendTracker::seal`] closes all three at once — by
-/// construction, wherever the outbound stages later move to.
+/// The recording iteration's outbound time is *structurally* claim-free: the
+/// stretch between a record and the end of the iteration it was recorded in is
+/// the driver's own scheduling, and charging it to a window that exists to bound
+/// the echo's *flight* is a defect. It expired credits three separate ways
+/// before this anchor moved: a stall between a send's pre-syscall stamp and its
+/// syscall, a later send in the same iteration stalling after an earlier credit
+/// was already recorded, and a goodbye recorded a full TTL after the
+/// announcement whose credit was still unclaimed. All three are the one bug, and
+/// [`SelfSendTracker::seal`] closes all three at once — by construction,
+/// wherever the outbound stages later move to.
 ///
 /// Post-opportunity time, in contrast, **must** be charged, caller stalls
 /// included. This TTL's other job is bounding FALSE suppression, and a
 /// co-resident peer's byte-identical datagram can arrive during a caller stall
-/// just as easily as during a tick. Excluding non-ticking time — ageing by tick
-/// count, say — would couple the suppression window to the caller's tick rate,
-/// which is wrong in both directions: a fast caller would expire live credits
-/// and a slow one would suppress peer traffic indefinitely.
+/// just as easily as during an iteration. Excluding non-running time — ageing by
+/// iteration count, say — would couple the suppression window to the driver's
+/// loop rate, which is wrong in both directions: a fast loop would expire live
+/// credits and a slow one would suppress peer traffic indefinitely.
 ///
 /// # Not the echo's arrival time
 ///
@@ -86,29 +105,28 @@ use crate::socket::Family;
 ///
 /// Not this constant alone. A byte-identical co-resident peer datagram can be
 /// swallowed as our echo for up to **this TTL, plus the outbound residue of the
-/// recording tick, plus one caller gap** — the residue because the credit does
-/// not start ageing until the next tick's top, and the caller gap because that
-/// top is whenever the caller comes back. On a caller that ticks at any sane
-/// rate the extra is negligible against 2s, and it buys the elimination of the
-/// under-retention direction, which is the expensive one: over-retaining costs
-/// one mistaken peer datagram, while under-retaining makes this responder raise
-/// a phantom conflict against **itself** and rename under RFC 6762 §9.
+/// recording iteration, plus one caller gap** — the residue because the credit
+/// does not start ageing until the seal that follows the send, and the caller gap
+/// because a driver reaches that seal when it reaches it. On a loop running at any
+/// sane rate the extra is negligible against 2s, and it buys the elimination of
+/// the under-retention direction, which is the expensive one: over-retaining
+/// costs one mistaken peer datagram, while under-retaining makes this responder
+/// raise a phantom conflict against **itself** and rename under RFC 6762 §9.
 ///
 /// # Accepted residual
 ///
-/// A caller that stalls for `SELF_SEND_TTL` or longer **after the seal**, with
-/// an echo already pending, still expires that credit — between two ticks, or
-/// inside the receive stage itself, since both are time the window was open and
-/// the claim did not happen. The seal happened, the clock ran, and no claim got
-/// to it. A stall that size already violates the once-per-loop-iteration
-/// contract on [`Mdns::tick`](crate::Mdns::tick), and degrades RFC 6762 probe
-/// timing and §8.3 announcement spacing regardless, so the endpoint is mis-timed
-/// either way. It is unfixable without ageing from the echo's arrival time,
+/// A driver that stalls for `SELF_SEND_TTL` or longer **after the seal**, with
+/// an echo already pending, still expires that credit — between two iterations,
+/// or inside the receive stage itself, since both are time the window was open
+/// and the claim did not happen. The seal happened, the clock ran, and no claim
+/// got to it. A stall that size degrades RFC 6762 probe timing and §8.3
+/// announcement spacing regardless, so the endpoint is mis-timed either way. It
+/// is unfixable without ageing from the echo's arrival time,
 /// which the section above rules out and which [`MatchMode::Degraded`] cannot
 /// supply at all — and forgiving it is not an option, because the forgiveness
 /// would have no bound: the same stall is indistinguishable from the one during
 /// which a co-resident peer's byte-identical datagram arrived.
-pub(crate) const SELF_SEND_TTL: Duration = Duration::from_secs(2);
+pub const SELF_SEND_TTL: Duration = Duration::from_secs(2);
 
 /// Memory backstop on live [`SelfSendTracker`] entries. The real bound is
 /// [`SELF_SEND_TTL`]; under normal operation the tracker holds only a
@@ -124,7 +142,7 @@ pub(crate) const SELF_SEND_TTL: Duration = Duration::from_secs(2);
 /// recorded yet. See [`SelfSendTracker::reclaim_expired_sealed`] for why only
 /// the dead half is reclaimable, and [`SelfSendTracker::admit`] for why the
 /// reclaim's own length is not an answer to the cap question.
-pub(crate) const MAX_SELF_SEND_ENTRIES: usize = 65536;
+pub const MAX_SELF_SEND_ENTRIES: usize = 65536;
 
 /// How far the wall clock may disagree with the monotonic clock across a
 /// credit's window before that credit's ordering evidence is treated as
@@ -157,12 +175,99 @@ pub(crate) const MAX_SELF_SEND_ENTRIES: usize = 65536;
 /// # Accepted residual
 ///
 /// A backward step smaller than this is invisible here and can still reject one
-/// echo. [`reference_ordered`]'s [`hick_udp::RX_TIMESTAMP_GRAIN`] arm absorbs
+/// echo. [`reference_ordered`]'s [`RX_TIMESTAMP_GRAIN`] arm absorbs
 /// the truncation-scale end of that range already, and what is left is bounded
 /// to a single credit and a single datagram. Tightening it further would buy
 /// that back at the price of degrading every claim on a merely slewed host,
 /// which is by far the more common condition.
-pub(crate) const WALL_STEP_TOLERANCE: Duration = Duration::from_millis(50);
+pub const WALL_STEP_TOLERANCE: Duration = Duration::from_millis(50);
+
+/// What a claim knows about **when the kernel saw** the datagram being weighed.
+///
+/// [`SelfSendTracker::take`] takes one of these rather than a bare
+/// [`SystemTime`] because the two things a `SystemTime` could be are not
+/// interchangeable and the tracker cannot tell them apart by looking. A kernel
+/// receive timestamp orders the datagram against our `sendto`. A userspace read
+/// time — taken when the driver got round to the buffer — orders nothing: it is
+/// at-or-after our send whatever the datagram is, so weighing it as ordering
+/// evidence grants [`MatchMode::Ordered`] strength to a value that carries no
+/// order, which is the credit-theft race `Ordered` exists to close.
+///
+/// # How much each constructor actually proves
+///
+/// * [`Self::from_meta`] — **structural**. [`RecvMeta`] has no public
+///   constructor, so outside this crate the only way to obtain one is this
+///   crate's own `recvmsg` and cmsg parse. A caller cannot fabricate it, and
+///   cannot mistake a read time for one.
+/// * [`Self::none`] — **structural**. The platform delivered no timestamp cmsg;
+///   there is nothing to be wrong about.
+/// * [`Self::from_caller_parsed_cmsg`] — **a contract this crate cannot
+///   enforce**, for a driver that owns its own `recvmsg` and therefore its own
+///   cmsg walk. See that constructor.
+///
+/// The type does not make the third case verifiable. What it does is stop the
+/// unverifiable case from being the *silent* one: a caller with only a read time
+/// has to name what it is claiming before it can claim it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RxEvidence(Option<SystemTime>);
+
+impl RxEvidence {
+  /// The kernel receive timestamp this crate parsed for `meta`, if the platform
+  /// delivered one.
+  ///
+  /// The strongest form, and the one to prefer: [`RecvMeta`] is minted only by
+  /// this crate's receive path, so the provenance is a property of the type
+  /// rather than a promise made at the call site.
+  #[must_use]
+  pub const fn from_meta(meta: &RecvMeta) -> Self {
+    Self(meta.rx_time())
+  }
+
+  /// No kernel receive timestamp — Windows, or a Unix kernel that delivered no
+  /// timestamp cmsg.
+  ///
+  /// The claim is weighed under [`MatchMode::Degraded`]: content, family and
+  /// [`SELF_SEND_TTL`], and no ordering test at all. Passing this is never
+  /// unsound, only weaker.
+  #[must_use]
+  pub const fn none() -> Self {
+    Self(None)
+  }
+
+  /// A kernel receive timestamp the **caller** parsed out of its own `recvmsg`.
+  ///
+  /// For a driver whose I/O model this crate's blocking receive path does not
+  /// fit — a completion-based one that submits its own `recvmsg` and walks the
+  /// control buffer itself — so there is no [`RecvMeta`] to read it from.
+  ///
+  /// # This crate cannot verify it, and does not pretend to
+  ///
+  /// `rx` must be a value the **kernel** stamped on this datagram, taken from a
+  /// receive-timestamp cmsg. Nothing here can check that: a userspace
+  /// [`SystemTime::now`] has the same type and is accepted identically. The
+  /// obligation is the caller's, it is not enforceable from this side, and the
+  /// name of this constructor is the whole of the mechanism.
+  ///
+  /// Getting it wrong is not a lost byte. A read time is at-or-after our send in
+  /// every case, so [`reference_ordered`]'s test can never reject on it, and the
+  /// claim silently runs at `Ordered` strength while carrying `Degraded`
+  /// evidence — which re-opens the credit-theft window: a byte-identical
+  /// datagram the kernel saw *before* our `sendto` takes the take-once credit,
+  /// and our own echo then reaches the protocol layer as peer traffic. That is a
+  /// phantom RFC 6762 §9 conflict against ourselves and the rename that follows.
+  ///
+  /// If you have no kernel stamp, [`Self::none`] is the correct answer and costs
+  /// only the ordering arm.
+  #[must_use]
+  pub const fn from_caller_parsed_cmsg(rx: SystemTime) -> Self {
+    Self(Some(rx))
+  }
+
+  /// The stamp, for this module's own weighing.
+  const fn stamp(self) -> Option<SystemTime> {
+    self.0
+  }
+}
 
 /// One reading of BOTH clocks, taken back to back.
 ///
@@ -179,17 +284,17 @@ pub(crate) const WALL_STEP_TOLERANCE: Duration = Duration::from_millis(50);
 /// is measured on — stays the last thing that happens before the comparison it
 /// feeds, which is the floor [`SelfSendTracker::take`] documents.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct ClockPair {
+pub struct ClockPair {
   /// Wall clock. Ordering only — never an age, on either end of the comparison.
-  pub(crate) wall: SystemTime,
+  pub wall: SystemTime,
   /// The monotonic reading taken immediately after [`ClockPair::wall`].
-  pub(crate) mono: StdInstant,
+  pub mono: StdInstant,
 }
 
 impl ClockPair {
   /// Read both clocks here, wall first. The only way production reaches a
   /// pair that was not taken from one syscall's own stamps.
-  pub(crate) fn now() -> Self {
+  pub fn now() -> Self {
     Self {
       wall: SystemTime::now(),
       mono: StdInstant::now(),
@@ -198,11 +303,12 @@ impl ClockPair {
 
   /// Adopt two readings a caller already holds.
   ///
-  /// The one production caller is
-  /// [`SendOutcome::credit_stamp`](crate::socket::SendOutcome::credit_stamp),
-  /// whose two stamps are read on consecutive statements immediately before the
-  /// `sendto` — which is exactly the adjacency this type needs.
-  pub(crate) const fn new(wall: SystemTime, mono: StdInstant) -> Self {
+  /// **The caller owes the adjacency this type is built on**: the two stamps
+  /// must be read on consecutive statements, wall first, with nothing between
+  /// them. A driver reaches this with the pair its send path took immediately
+  /// before the `sendto`; a pair assembled from two readings taken at different
+  /// moments is not a [`ClockPair`] and will read as a clock step.
+  pub const fn new(wall: SystemTime, mono: StdInstant) -> Self {
     Self { wall, mono }
   }
 }
@@ -215,11 +321,11 @@ impl ClockPair {
 /// stamp did not survive a clock step. No caller can hand in a mode, so no
 /// caller can claim ordering evidence that the inputs do not carry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum MatchMode {
+pub enum MatchMode {
   /// The reference is a kernel receive timestamp, and the credit's wall stamp
   /// is on the same timeline it was taken on. A datagram is ours only if it was
   /// stamped at-or-after the recorded send — within
-  /// [`hick_udp::RX_TIMESTAMP_GRAIN`]. That ordering requirement is what stops
+  /// [`RX_TIMESTAMP_GRAIN`]. That ordering requirement is what stops
   /// a byte-identical peer datagram the kernel saw *before* our `sendto` from
   /// stealing the take-once credit. The [`SELF_SEND_TTL`] bound is applied
   /// separately, on the monotonic clock.
@@ -251,9 +357,10 @@ pub(crate) enum MatchMode {
   /// already claims the credit under `Ordered` too — see [`reference_ordered`] —
   /// so the whole of the marginal exposure here is a datagram that was already
   /// queued when the send it claims was made. It still has to arrive on the same
-  /// family, from source port 5353 (`Mdns::drain_recv` offers a credit to no
-  /// other port, since that is the only port this endpoint sends from), carrying
-  /// the same content fingerprint, inside [`SELF_SEND_TTL`].
+  /// family, from source port 5353 (a driver offers a credit to no other port,
+  /// since that is the only port an mDNS endpoint sends from — see
+  /// [`SelfSendTracker::take`]), carrying the same content fingerprint, inside
+  /// [`SELF_SEND_TTL`].
   ///
   /// # What one costs, and the bound on the fingerprint
   ///
@@ -323,10 +430,13 @@ struct Credit {
   sent: ClockPair,
   /// Monotonic, and the only input to the [`SELF_SEND_TTL`] bound.
   ///
-  /// `None` means "recorded since the last [`SelfSendTracker::seal`], ageing
-  /// has not started" — a credit taken this tick, whose echo cannot be claimed
-  /// until the next one. [`SelfSendTracker::seal`] fills it in at the top of
-  /// that next tick, which is the first instant a claim is possible; see
+  /// `None` means "recorded since the last [`SelfSendTracker::seal`], ageing has
+  /// not started" — and such a credit is live UNCONDITIONALLY, whatever the clock
+  /// reads, because a window that never opened cannot have been missed. That is
+  /// why the seal must precede the driver's next receive: an unsealed credit
+  /// reaching a claim is not merely young, it is ageless.
+  /// [`SelfSendTracker::seal`] fills it in at the first instant a claim is
+  /// possible; see
   /// [`SELF_SEND_TTL`] for why the window may not start any earlier.
   ///
   /// LATE is the safe direction here — the opposite of [`Credit::sent`], and
@@ -334,7 +444,7 @@ struct Credit {
   /// most one byte-identical co-resident peer datagram mistaken for our echo
   /// inside a two-second window; under-retaining one makes this responder raise
   /// a phantom conflict against **itself**. Anchoring the age anywhere inside
-  /// the recording tick — at the pre-syscall wall stamp, or even at the
+  /// the recording iteration — at the pre-syscall wall stamp, or even at the
   /// post-syscall monotonic one — gets the unsafe direction: it charges a
   /// stretch in which no claim was structurally possible to a window that was
   /// never meant to cover it.
@@ -346,7 +456,7 @@ struct Credit {
 /// as a peer's traffic. Take-once: [`SelfSendTracker::take`] removes the
 /// entry it matches, so a later, genuinely distinct datagram with the same
 /// bytes (a co-resident peer) is still seen.
-pub(crate) struct SelfSendTracker {
+pub struct SelfSendTracker {
   /// One [`Credit`] per recorded send, insertion ordered and scanned linearly.
   /// [`SELF_SEND_TTL`] and [`MAX_SELF_SEND_ENTRIES`] keep this small enough
   /// that a `Vec` needs no fancier index.
@@ -375,6 +485,14 @@ pub(crate) struct SelfSendTracker {
   /// [`Self::seal`] still took one, and deleting that parameter is what turned
   /// its contract into a property of the monotonic clock.
   entries: Vec<Credit>,
+  /// How many claim windows this tracker has opened, ever.
+  ///
+  /// Bumped by [`Self::open_window_at`] — the one place a window opens — and by
+  /// nothing else, so it counts seals and is untouched by [`Self::record`] or
+  /// [`Self::take`]. See [`Self::seal_generation`] for what a driver does with
+  /// it. `u64` at one increment per loop iteration cannot wrap in any runtime
+  /// this endpoint will see.
+  seal_generation: u64,
   /// A stall injected **between the expiry sweep and the read that anchors the
   /// batch the seal is about to open**, consumed by the seal that observes it.
   ///
@@ -388,16 +506,24 @@ pub(crate) struct SelfSendTracker {
   /// Injected into [`Self::seal`] itself rather than into a test-only copy of
   /// its body, so a seal that went back to anchoring on the sweep's reading
   /// fails the test instead of passing beside it.
-  #[cfg(test)]
+  #[cfg(any(test, feature = "test-support"))]
   forced_seal_pause: Option<Duration>,
+}
+
+impl Default for SelfSendTracker {
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 impl SelfSendTracker {
   /// Create an empty tracker.
-  pub(crate) fn new() -> Self {
+  #[must_use]
+  pub fn new() -> Self {
     Self {
       entries: Vec::new(),
-      #[cfg(test)]
+      seal_generation: 0,
+      #[cfg(any(test, feature = "test-support"))]
       forced_seal_pause: None,
     }
   }
@@ -405,9 +531,38 @@ impl SelfSendTracker {
   /// Record that we just sent `body` on `family`, submitted at `sent` — the
   /// send's own pre-syscall reading of both clocks.
   ///
-  /// The credit starts life un-aged ([`Credit::aged_from`] is `None`): its echo
-  /// cannot be claimed until the next tick's receive stage, so its clock does
-  /// not start until [`Self::seal`] starts it there.
+  /// # `sent` is a contract this type CANNOT enforce
+  ///
+  /// Stated plainly because the receive side is different: [`Self::take`] takes
+  /// an [`RxEvidence`], whose strong constructor reads a stamp out of a
+  /// [`RecvMeta`] only this crate can mint. There is no equivalent here, and no
+  /// honest way to build one — **this crate does not own the send**. It has no
+  /// `sendto` to stamp, so whatever it accepted would be a value the caller read,
+  /// and wrapping that in a newtype would move the promise without checking it.
+  ///
+  /// What the caller owes, then, in full:
+  ///
+  /// * both halves of `sent` are read on **consecutive statements, wall first**,
+  ///   with nothing between them — see [`ClockPair`], whose step detection
+  ///   measures the two elapsed times against each other and reads any gap
+  ///   between the reads as clock movement;
+  /// * both are read **before** the `sendto`, never after. Early is the safe
+  ///   direction: the comparison is against the kernel's receive stamp on the
+  ///   echo, so `sent.wall <= kernel send time <= echo rx time` must hold, and a
+  ///   post-syscall stamp can outrun the kernel's stamp on a copy already looped
+  ///   back — at which point the endpoint ingests its own datagram as a peer's;
+  /// * `family` is the family whose socket carried **this** syscall, not the one
+  ///   the destination suggests. A multicast fan-out is two syscalls with
+  ///   identical bytes, and each echo can only arrive on the socket its copy left
+  ///   from.
+  ///
+  /// Breaking any of the three degrades or loses suppression rather than
+  /// corrupting the tracker; the failure is a phantom RFC 6762 §9 conflict
+  /// against ourselves. Nothing below detects it.
+  ///
+  /// The credit starts life un-aged ([`Credit::aged_from`] is `None`) and is
+  /// therefore live unconditionally until sealed: its clock does not start until
+  /// the [`Self::seal`] that precedes the driver's next receive starts it.
   ///
   /// Pushes only if the tracker is still under [`MAX_SELF_SEND_ENTRIES`] — at
   /// the cap the NEW entry is dropped, never a live one, so a burst of sends
@@ -419,8 +574,8 @@ impl SelfSendTracker {
   ///
   /// **Reclaiming.** A sealed credit past [`SELF_SEND_TTL`] is garbage:
   /// [`Self::take`] already refuses it, and nothing but the next [`Self::seal`]
-  /// removes it. So a full tracker whose tick then stalls past the TTL is
-  /// [`MAX_SELF_SEND_ENTRIES`] corpses, and a later send in that same tick would
+  /// removes it. So a full tracker whose loop then stalls past the TTL is
+  /// [`MAX_SELF_SEND_ENTRIES`] corpses, and a later send in that same iteration would
   /// be refused a credit by entries that are every one of them dead. A refused
   /// credit is not a lost byte — it is this endpoint ingesting its own loopback
   /// as peer traffic, a phantom conflict against itself and the RFC 6762 §9
@@ -430,10 +585,10 @@ impl SelfSendTracker {
   /// uses.
   ///
   /// **Ageing.** Not here, and not from anything this send carries. The
-  /// record-time sweep this crate once had aged every existing credit against
-  /// whatever instant *this* send happened to reach the kernel at, so a later
-  /// send in the same tick — a second fan-out, or a stage-7 goodbye after a
-  /// stage-4 announcement — evicted credits whose echoes had not had a single
+  /// record-time sweep this once had aged every existing credit against whatever
+  /// instant *this* send happened to reach the kernel at, so a later send in the
+  /// same iteration — a second fan-out, or a goodbye after an announcement —
+  /// evicted credits whose echoes had not had a single
   /// opportunity to claim them. That half is not coming back: an unsealed credit
   /// has no window open, so [`Self::reclaim_expired_sealed`] retains it
   /// unconditionally however late the clock reads, and [`Self::seal`] remains
@@ -449,10 +604,9 @@ impl SelfSendTracker {
   /// weighs up to 65 536 credits against **one** instant read before it started.
   /// A credit that was live when the sweep looked at it can be dead by the time
   /// the sweep finishes, and deciding the cap on the length that sweep left
-  /// behind is a decision made against a stale reading — the same defect class
-  /// that cost this crate seven rounds elsewhere. So the length test is not the
-  /// decision: [`Self::admit`] is, and it reads the clock at itself.
-  pub(crate) fn record(&mut self, family: Family, body: &[u8], sent: ClockPair) {
+  /// behind is a decision made against a stale reading. So the length test is not
+  /// the decision: [`Self::admit`] is, and it reads the clock at itself.
+  pub fn record(&mut self, family: Family, body: &[u8], sent: ClockPair) {
     self.record_by(family, body, sent, StdInstant::now);
   }
 
@@ -460,12 +614,12 @@ impl SelfSendTracker {
   /// test can hold that reading still while real time runs past it — which is
   /// exactly what a sweep of 65 536 entries does to it.
   ///
-  /// `#[cfg(test)]`, permanently. It fakes only the sweep; the admission
+  /// Behind `test-support`, permanently. It fakes only the sweep; the admission
   /// decision below reads the live clock in every build, so there is no build in
   /// which the cap is decided against an instant a caller handed in. Same seam
   /// as [`Self::take_at`].
-  #[cfg(test)]
-  pub(crate) fn record_with_stale_sweep(
+  #[cfg(any(test, feature = "test-support"))]
+  pub fn record_with_stale_sweep(
     &mut self,
     family: Family,
     body: &[u8],
@@ -552,7 +706,7 @@ impl SelfSendTracker {
   /// must not quietly re-acquire the power to break it — conflating the two is
   /// what made the old record-time sweep a defect rather than a cleanup.
   ///
-  /// [`Self::seal`] runs it once per tick as ordinary garbage collection, on a
+  /// [`Self::seal`] runs it once per iteration as ordinary garbage collection, on a
   /// reading of its own — spent here and not reused to anchor the survivors, who
   /// are anchored at a later reading taken once this has returned.
   /// [`Self::record`] runs it only at [`MAX_SELF_SEND_ENTRIES`], where the
@@ -564,27 +718,54 @@ impl SelfSendTracker {
   /// Open a claim window: expire every credit whose window has run out, and
   /// **then** start the clock on every credit that does not have one yet.
   ///
-  /// Called once per tick, at the **top**, immediately before the receive stage
-  /// — so the batch it opens is exactly the credits the previous tick recorded,
-  /// and the anchor it stamps them with is the first instant at which any of
+  /// # Where a driver must call this
+  ///
+  /// **Recording and window-opening must straddle the receive.** A seal must sit
+  /// on every path between a [`Self::record`] and the next thing that can claim
+  /// what it recorded, with no record in between. Equivalently: whenever a driver
+  /// reaches a receive, every credit it holds is already sealed.
+  ///
+  /// "Once per iteration, at the top" is NOT the contract, and stating it that
+  /// way is a trap. It is right only for a loop whose receive is the first thing
+  /// after the seal and whose sends all come after that receive — a tick-shaped
+  /// driver. In a loop that pumps its sends and *then* parks on a `select!` whose
+  /// arms can receive, a top-of-iteration seal sits on the same side of the
+  /// receive as the records it is meant to open: this iteration's credits are
+  /// still unsealed when the park returns a datagram. An unsealed credit is live
+  /// UNCONDITIONALLY (see [`Credit::aged_from`]), so a byte-identical peer
+  /// datagram arriving arbitrarily long afterwards is swallowed as our own echo,
+  /// and [`SELF_SEND_TTL`] bounds nothing on exactly the path it exists to bound.
+  /// Such a driver seals after its pumps and immediately before it arms the
+  /// receive.
+  ///
+  /// The anchor it stamps the batch with is the first instant at which any of
   /// their echoes can be claimed. That is the only instant [`SELF_SEND_TTL`] may
   /// be measured from: see that constant for why not earlier (the recording
-  /// tick's outbound stretch is structurally claim-free) and why not later
-  /// (post-opportunity time bounds false suppression and must be charged).
+  /// stretch is structurally claim-free) and why not later (post-opportunity time
+  /// bounds false suppression and must be charged).
   ///
-  /// Top-of-tick rather than end-of-outbound on purpose. An end-of-tick seal
-  /// would carry a placement obligation that a future stage placed after it
-  /// would silently break, reopening exactly this hole; a top-of-tick seal stays
-  /// correct however the outbound stages are reordered. It also gives a credit
-  /// age zero at its first claim opportunity, instead of arriving there having
-  /// already spent one inter-tick caller gap.
+  /// **Never at record time.** That collapses the two moments this split exists
+  /// to keep apart, and charges the window a stretch in which no claim was
+  /// possible — which is exactly the credit loss the split prevents.
+  ///
+  /// The placement is an obligation on whoever adds a stage: a send added AFTER
+  /// the seal, or a receive added BEFORE it, reopens this hole silently. There is
+  /// no placement that survives arbitrary reordering — the rule is relational, not
+  /// positional — so a driver's seal call site should name which records it closes
+  /// and which receive it precedes.
+  ///
+  /// Over-retention is bounded by one iteration's duration, and over-retention is
+  /// the **cheap** direction: a stale credit can at worst suppress one
+  /// byte-identical peer datagram, and take-once bounds it to that. Under-
+  /// retention is the expensive one — our own echo ingested as a peer, an RFC
+  /// 6762 §9 conflict against ourselves and the rename that follows.
   ///
   /// Ageing here rather than on `record` also means the anchor is taken once per
-  /// tick instead of once per send, and always against the monotonic clock — so
-  /// a wall-clock step in either direction still cannot evict a live credit. The
-  /// reclaim below is shared with [`Self::record`]'s cap path and is the *only*
-  /// thing they share: this is where the window opens, and it is the only place
-  /// that can open one.
+  /// iteration instead of once per send, and always against the monotonic clock
+  /// — so a wall-clock step in either direction still cannot evict a live credit.
+  /// The reclaim below is shared with [`Self::record`]'s cap path and is the
+  /// *only* thing they share: this is where the window opens, and it is the only
+  /// place that can open one.
   ///
   /// # It takes no instant, and the two phases do not share a reading
   ///
@@ -617,12 +798,12 @@ impl SelfSendTracker {
   /// each seal's anchor is at or after every anchor already assigned and
   /// [`SelfSendTracker::entries`]'s expiry order — which [`Self::admit`]'s `O(1)`
   /// front check reads — holds by construction.
-  pub(crate) fn seal(&mut self) {
+  pub fn seal(&mut self) {
     // The sweep completes FIRST, on a reading of its own.
     self.reclaim_expired_sealed(StdInstant::now());
     // Deliberately between the sweep and the anchor: that is the stretch a
     // 65 536-entry sweep, or a preemption inside it, occupies for real.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(pause) = self.forced_seal_pause.take()
       && !pause.is_zero()
     {
@@ -632,27 +813,27 @@ impl SelfSendTracker {
     self.open_window_at(StdInstant::now());
   }
 
-  /// [`Self::seal`] with both phases pinned to `at`, so a test can place a tick
+  /// [`Self::seal`] with both phases pinned to `at`, so a test can place a loop
   /// top anywhere without sleeping to it.
   ///
-  /// `#[cfg(test)]`, permanently, and the gate is the point: production reaches
-  /// a seal only through [`Self::seal`], which reads the clock for each phase
-  /// itself, so there is no build in which a caller's instant can anchor a
-  /// window. Collapsing the two readings is exactly what makes this usable for
+  /// Behind `test-support`, permanently, and the gate is the point: no default
+  /// build has this at all, and production reaches a seal only through
+  /// [`Self::seal`], which reads the clock for each phase itself — so there is no
+  /// build a driver ships in which a caller's instant can anchor a window. Collapsing the two readings is exactly what makes this usable for
   /// the tests whose subject is *not* the gap between them — `StdInstant` has no
-  /// constructor, so a chosen tick top cannot be expressed any other way. The
+  /// constructor, so a chosen loop top cannot be expressed any other way. The
   /// gap itself is tested through [`Self::pause_next_seal_for_test`], against
   /// the real [`Self::seal`]. Same seam as [`Self::take_at`].
-  #[cfg(test)]
-  pub(crate) fn seal_at(&mut self, at: StdInstant) {
+  #[cfg(any(test, feature = "test-support"))]
+  pub fn seal_at(&mut self, at: StdInstant) {
     self.reclaim_expired_sealed(at);
     self.open_window_at(at);
   }
 
   /// Stall the next [`Self::seal`] between its sweep and its anchor. See
   /// [`SelfSendTracker::forced_seal_pause`].
-  #[cfg(test)]
-  pub(crate) fn pause_next_seal_for_test(&mut self, pause: Duration) {
+  #[cfg(any(test, feature = "test-support"))]
+  pub fn pause_next_seal_for_test(&mut self, pause: Duration) {
     self.forced_seal_pause = Some(pause);
   }
 
@@ -660,13 +841,14 @@ impl SelfSendTracker {
   /// `opened_at`.
   ///
   /// `get_or_insert`, never an unconditional assignment: a credit already sealed
-  /// keeps its original anchor, or a caller ticking faster than
+  /// keeps its original anchor, or a driver looping faster than
   /// [`SELF_SEND_TTL`] would push every credit's expiry forward forever and the
   /// false-suppression bound would not be a bound at all.
   fn open_window_at(&mut self, opened_at: StdInstant) {
     for credit in &mut self.entries {
       credit.aged_from.get_or_insert(opened_at);
     }
+    self.seal_generation = self.seal_generation.wrapping_add(1);
   }
 
   /// Consume the tracker entry (if any) recorded for `family` whose content
@@ -675,12 +857,17 @@ impl SelfSendTracker {
   /// `true` when a credit was consumed, i.e. `body` is this endpoint's own
   /// loopback rather than a peer's datagram.
   ///
-  /// `rx` is the **kernel's** receive timestamp for `body`, or `None` when the
-  /// platform delivered no timestamp cmsg. It is the whole of the ordering
-  /// evidence, and no caller supplies anything else: [`MatchMode`] is derived
-  /// from it here rather than declared, so there is no way to ask for `Ordered`
-  /// matching against a stamp that carries no order — a userspace read time
-  /// taken at the claim says nothing about when the kernel saw the datagram.
+  /// `rx` is the **kernel's** receive timestamp for `body`, or the absence of
+  /// one. It is the whole of the ordering evidence, and no caller supplies
+  /// anything else: [`MatchMode`] is derived from it here rather than declared,
+  /// so there is no way to ask for `Ordered` matching against a stamp that
+  /// carries no order — a userspace read time taken at the claim says nothing
+  /// about when the kernel saw the datagram.
+  ///
+  /// It is an [`RxEvidence`] and not a bare [`SystemTime`] because that last
+  /// sentence is the whole game and a `SystemTime` cannot carry it. Prefer
+  /// [`RxEvidence::from_meta`], which is unforgeable outside this crate; see that
+  /// type for what each constructor does and does not prove.
   ///
   /// # It takes no instant, and no caller can supply one
   ///
@@ -692,17 +879,14 @@ impl SelfSendTracker {
   ///
   /// A credit's liveness was mis-evaluated six times, each in a different window
   /// between some caller's clock read and this comparison: aged from a
-  /// pre-syscall wall stamp, aged before the receive resumed, swept across tick
-  /// stages by a later record, frozen at tick entry, counted as occupancy at the
+  /// pre-syscall wall stamp, aged before the receive resumed, swept across loop
+  /// stages by a later record, frozen at loop entry, counted as occupancy at the
   /// cap while dead, and frozen immediately after `recv` with both admission
   /// gates still to run. Each round closed its window by moving the read nearer,
   /// and each round left the next one. The parameter *is* the defect class: it is
   /// a channel through which a caller hands in an age measured somewhere else,
-  /// and moving the read closer never removes the channel. Deleting it does —
-  /// the same shape as [`Mdns::deregister`](crate::Mdns::deregister) dropping its
-  /// `Registry` so a foreign selector became unrepresentable, and `summarize` in
-  /// `driver::sends` taking no `SendHealth` so a link's condition could not reach
-  /// the delivery projection.
+  /// and moving the read closer never removes the channel. Deleting it is what
+  /// removed the channel.
   ///
   /// **What is left is the instructions between that read and the comparison,
   /// and it is irreducible.** Every possible implementation has it: something
@@ -728,24 +912,26 @@ impl SelfSendTracker {
   /// being refused. See [`evidence_mode`] for the direction that trade takes and
   /// why.
   ///
-  /// The tick's own instant is not a substitute for the live read, which is why
-  /// [`Mdns::tick`](crate::Mdns::tick) keeps it for the protocol path and hands
-  /// it to nothing here. It is taken before the receive stage, so reusing it
-  /// charges nothing for the drain's own runtime, for the admission gates each
-  /// datagram passes, or for a preemption anywhere among them; a caller stalling
-  /// mid-drain would find a credit still live an unbounded time after its window
-  /// opened. [`SELF_SEND_TTL`] bounds FALSE suppression and that bound is real
+  /// The driver's own loop instant is not a substitute for the live read, which
+  /// is why this takes none: a driver keeps that reading for its protocol path
+  /// and hands it to nothing here. It is taken before the receive stage, so
+  /// reusing it charges nothing for the drain's own runtime, for the admission
+  /// gates each datagram passes, or for a preemption anywhere among them; a
+  /// driver stalling mid-drain would find a credit still live an unbounded time
+  /// after its window opened. [`SELF_SEND_TTL`] bounds FALSE suppression and that bound is real
   /// time, so post-opportunity time is charged in full — see that constant.
   /// Erring EARLY is still the safe direction within a live read, since
   /// over-retention is cheap and losing a credit raises a phantom conflict
   /// against ourselves.
   ///
   /// A credit [`Self::seal`] has not reached yet is live whatever the clock
-  /// reads. Today that is unreachable — the driver seals at the top of the tick
-  /// and no send stage precedes its receive stage, so nothing this call can see
-  /// is unsealed — but the rule is stated rather than assumed, so a future stage
-  /// that recorded before a receive would over-retain (cheap) instead of
-  /// expiring a credit that never had an opportunity (a phantom self-conflict).
+  /// reads, and a driver honouring that seal's contract never presents one here:
+  /// the seal sits between its records and this claim. The rule is stated rather
+  /// than assumed because the failure is silent — an unsealed credit that did
+  /// arrive would be retained (cheap) rather than expiring one that never had a
+  /// claim opportunity (a phantom self-conflict) — and because "cheap" is not
+  /// "free": retention with no bound is the stale-credit suppression
+  /// [`Self::has_unsealed`] exists to let a driver assert against.
   ///
   /// # What may be offered a credit is the caller's half of the match
   ///
@@ -753,11 +939,11 @@ impl SelfSendTracker {
   /// came from. Both of this endpoint's sockets are bound to port 5353, so every
   /// datagram it sends leaves from that port and every loopback copy arrives
   /// from it — which makes a different source port proof that the datagram is
-  /// not our echo, and something this call cannot discover for itself.
-  /// `Mdns::drain_recv` holds that line, beside the RFC 6762 §11 source-port
-  /// rule it belongs with: an untrusted RESPONSE is dropped outright there,
-  /// while a §6.7 legacy unicast QUERY is kept — it is owed a reply — and simply
-  /// never offered here.
+  /// not our echo, and something this call cannot discover for itself. **The
+  /// driver holds that line**, beside the RFC 6762 §11 source-port rule it
+  /// belongs with: an untrusted RESPONSE is dropped outright there, while a §6.7
+  /// legacy unicast QUERY is kept — it is owed a reply — and simply never offered
+  /// here.
   ///
   /// # Why the family is part of the key
   ///
@@ -777,7 +963,7 @@ impl SelfSendTracker {
   /// preferred over consuming the newest eligible credit: newest-first only
   /// reorders the same interchangeable set, and a third credit for the same
   /// bytes (a queued copy completing out of order) defeats it again.
-  pub(crate) fn take(&mut self, family: Family, body: &[u8], rx: Option<SystemTime>) -> bool {
+  pub fn take(&mut self, family: Family, body: &[u8], rx: RxEvidence) -> bool {
     self.take_by(family, body, rx, ClockPair::now)
   }
 
@@ -785,25 +971,17 @@ impl SelfSendTracker {
   /// place a claim anywhere in a credit's window without sleeping through it,
   /// and can put the wall clock somewhere the monotonic one says it cannot be.
   ///
-  /// `#[cfg(test)]`, permanently, and that gate is the entire point: production
-  /// reaches the liveness decision only through [`Self::take`], which reads both
-  /// clocks itself, so there is no build in which a stale reading can be handed
-  /// in. Same seam as `BoundSocket::forced_recv_delays` and
-  /// `Sockets::forced_no_rx_time` — a test-only door onto a decision production
-  /// makes for itself.
+  /// Behind `test-support`, permanently, and that gate is the entire point: no
+  /// default build has this at all, and production reaches the liveness decision
+  /// only through [`Self::take`], which reads both clocks itself — so there is no
+  /// build a driver ships in which a stale reading can be handed in.
   ///
   /// It is also the only deterministic way to present a wall-clock step: no test
   /// can ask a host to run `settimeofday` under it, and the whole subject of
   /// [`WALL_STEP_TOLERANCE`] is what a claim does when the wall clock moved
   /// between the send and here.
-  #[cfg(test)]
-  pub(crate) fn take_at(
-    &mut self,
-    family: Family,
-    body: &[u8],
-    rx: Option<SystemTime>,
-    now: ClockPair,
-  ) -> bool {
+  #[cfg(any(test, feature = "test-support"))]
+  pub fn take_at(&mut self, family: Family, body: &[u8], rx: RxEvidence, now: ClockPair) -> bool {
     self.take_by(family, body, rx, move || now)
   }
 
@@ -819,9 +997,10 @@ impl SelfSendTracker {
     &mut self,
     family: Family,
     body: &[u8],
-    rx: Option<SystemTime>,
+    rx: RxEvidence,
     clock: impl Fn() -> ClockPair,
   ) -> bool {
+    let rx = rx.stamp();
     let needle = fnv1a(body);
     match self.entries.iter().position(|c| {
       if c.family != family || c.hash != needle {
@@ -841,23 +1020,83 @@ impl SelfSendTracker {
 
   /// Number of live entries.
   ///
-  /// Test-only, permanently: the driver drives the tracker entirely through
-  /// [`Self::record`] and [`Self::take`] and never reads its depth, so this
-  /// stays `#[cfg(test)]` rather than carrying a dead-code allow that a later
-  /// cleanup could mistake for stale — same rule as [`RX_GRAIN_FOR_TEST`].
-  #[cfg(test)]
-  pub(crate) fn len(&self) -> usize {
+  /// Behind `test-support`, permanently: a driver drives this type entirely
+  /// through [`Self::record`], [`Self::seal`] and [`Self::take`] and never reads
+  /// its depth, so this stays gated rather than becoming ordinary public surface
+  /// that a caller could start depending on.
+  #[cfg(any(test, feature = "test-support"))]
+  #[must_use]
+  pub fn len(&self) -> usize {
     self.entries.len()
+  }
+
+  /// How many times a claim window has been opened here.
+  ///
+  /// Advances on every [`Self::seal`], and on nothing else — [`Self::record`] and
+  /// [`Self::take`] leave it alone.
+  ///
+  /// # What it is for: proving WHEN a driver sealed, not merely that it did
+  ///
+  /// [`Self::has_unsealed`] answers a question about *state*, and state is not
+  /// enough. A driver that seals in its receive arm — after the park, just before
+  /// it weighs the datagram — has no unsealed credit by the time anything looks,
+  /// yet every credit it holds was anchored an entire park too late, which is the
+  /// stale-credit bug [`Self::seal`] describes. The two placements are
+  /// indistinguishable from the claim site.
+  ///
+  /// So a driver reads this at its pre-park boundary and again where it receives,
+  /// and requires the two to be **equal**: no window opened in between, therefore
+  /// the seal it is relying on happened before the park rather than inside it.
+  /// Together with [`Self::has_unsealed`] being false at that same boundary —
+  /// everything recorded this iteration is already sealed — that pins both halves
+  /// of the contract: sealed, and sealed early enough.
+  #[must_use]
+  pub const fn seal_generation(&self) -> u64 {
+    self.seal_generation
+  }
+
+  /// Whether any credit is still **unsealed** — recorded, but with no claim
+  /// window opened yet.
+  ///
+  /// Not behind `test-support`, because this is not a clock seam: it exposes no
+  /// instant, accepts none, and cannot change what any claim decides. It is here
+  /// so a driver can **check** the one contract [`Self::seal`] states and this
+  /// type cannot enforce — that recording and window-opening straddle the
+  /// receive — instead of only promising it.
+  ///
+  /// A driver whose sends all precede its receive (a tick-shaped one) has no
+  /// unsealed credit at any receive, and neither does a `select!`-shaped one that
+  /// seals after its pumps. Either can assert that:
+  ///
+  /// ```ignore
+  /// debug_assert!(!tracker.has_unsealed(), "seal must precede this receive");
+  /// ```
+  ///
+  /// The assertion is worth making because the failure is silent otherwise: an
+  /// unsealed credit is live UNCONDITIONALLY, so a misplaced seal does not fail
+  /// fast, it quietly stops [`SELF_SEND_TTL`] from bounding anything.
+  #[must_use]
+  pub fn has_unsealed(&self) -> bool {
+    self.entries.iter().any(|c| c.aged_from.is_none())
+  }
+
+  /// Whether no credit is outstanding — "every echo we sent has been claimed".
+  ///
+  /// Behind `test-support` for the same reason as [`Self::len`].
+  #[cfg(any(test, feature = "test-support"))]
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.entries.is_empty()
   }
 
   /// Every entry's ageing anchor, in storage order, so a test can assert the
   /// expiry order [`Self::admit`] depends on.
   ///
-  /// Test-only, permanently, and for the same reason as [`Self::len`]: the
-  /// driver drives this type through `record`, `seal` and `take` and never reads
-  /// its layout.
-  #[cfg(test)]
-  pub(crate) fn anchors_for_test(&self) -> Vec<Option<StdInstant>> {
+  /// Behind `test-support`, permanently, and for the same reason as
+  /// [`Self::len`]: a driver drives this type through `record`, `seal` and `take`
+  /// and never reads its layout.
+  #[cfg(any(test, feature = "test-support"))]
+  pub fn anchors_for_test(&self) -> Vec<Option<StdInstant>> {
     self.entries.iter().map(|c| c.aged_from).collect()
   }
 }
@@ -878,7 +1117,7 @@ impl SelfSendTracker {
 /// retains the credit.
 fn still_live(now: StdInstant, aged_from: Option<StdInstant>) -> bool {
   match aged_from {
-    // Unsealed: recorded this tick, and no claim was possible yet.
+    // Unsealed: recorded this iteration, and no claim was possible yet.
     None => true,
     Some(from) => now.saturating_duration_since(from) <= SELF_SEND_TTL,
   }
@@ -974,14 +1213,14 @@ fn reference_ordered(rx: Option<SystemTime>, sent: ClockPair, mode: MatchMode) -
     // receive-timestamp truncation grain — that ordering is exactly what stops a
     // byte-identical peer datagram the kernel saw before our sendto from
     // stealing the take-once credit.
-    Err(behind) => behind.duration() <= hick_udp::RX_TIMESTAMP_GRAIN,
+    Err(behind) => behind.duration() <= RX_TIMESTAMP_GRAIN,
   }
 }
 
 /// Standard 64-bit FNV-1a hash. Used only to fingerprint our own sends for
 /// loopback matching, never as a security primitive, so a fast
 /// non-cryptographic hash is appropriate.
-pub(crate) fn fnv1a(data: &[u8]) -> u64 {
+fn fnv1a(data: &[u8]) -> u64 {
   const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
   const PRIME: u64 = 0x0000_0100_0000_01b3;
   let mut h = OFFSET;
@@ -992,14 +1231,6 @@ pub(crate) fn fnv1a(data: &[u8]) -> u64 {
   h
 }
 
-/// [`hick_udp::RX_TIMESTAMP_GRAIN`] under a short name for `selfsend/tests.rs`
-/// to assert against. `Duration::ZERO` on nanosecond `SO_TIMESTAMPNS` targets,
-/// one microsecond on `timeval` targets — see that constant for the full
-/// rationale. Test-only, permanently: unlike the rest of this module it is
-/// never consumed by the driver, so it stays `#[cfg(test)]` rather than
-/// carrying a dead-code allow that a later cleanup could mistake for stale.
 #[cfg(test)]
-pub(crate) const RX_GRAIN_FOR_TEST: Duration = hick_udp::RX_TIMESTAMP_GRAIN;
-
-#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
 mod tests;

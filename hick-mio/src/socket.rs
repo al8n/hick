@@ -39,6 +39,7 @@ use std::{
 use hick_udp::{
   MulticastOptionsV4, MulticastOptionsV6, RecvMeta,
   constants::{MDNS_IPV4_GROUP, MDNS_IPV6_GROUP, MDNS_PORT},
+  selfsend::RxEvidence,
   try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
 use mio::{Interest, Registry, Token, net::UdpSocket};
@@ -245,21 +246,21 @@ pub(crate) enum SendOutcome {
   /// `SendAttempt::Answered` carries the same three for the same reasons.
   ///
   /// There is a **fourth** use of a monotonic instant in the credit's lifetime —
-  /// the [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) ageing — and it is
+  /// the [`SELF_SEND_TTL`](hick_udp::selfsend::SELF_SEND_TTL) ageing — and it is
   /// deliberately not a fourth read here, nor a second consumer of `wire_at`. No
   /// instant belonging to the send can anchor it: the driver's receive stage has
   /// already run by the time any of these are taken, so the credit is unclaimable
   /// for the rest of its own tick and every such instant charges claim-free time
   /// to the window. It is anchored instead at the top of the following tick, on
   /// the same monotonic clock and in the same late-safe direction, by
-  /// [`SelfSendTracker::seal`](crate::selfsend::SelfSendTracker::seal).
+  /// [`SelfSendTracker::seal`](hick_udp::selfsend::SelfSendTracker::seal).
   ///
   /// **`submitted_wall` and `submitted_at` are read on consecutive statements,
   /// and that adjacency is load-bearing.** Together they are one reading of both
   /// clocks at one instant, which is what lets the self-send credit tell real
   /// elapsed time from a wall clock that stepped under it — see
-  /// [`ClockPair`](crate::selfsend::ClockPair) and
-  /// [`WALL_STEP_TOLERANCE`](crate::selfsend::WALL_STEP_TOLERANCE). A stall
+  /// [`ClockPair`](hick_udp::selfsend::ClockPair) and
+  /// [`WALL_STEP_TOLERANCE`](hick_udp::selfsend::WALL_STEP_TOLERANCE). A stall
   /// inserted between the two reads is charged to the credit as skew, so nothing
   /// may come between them.
   ///
@@ -277,7 +278,7 @@ pub(crate) enum SendOutcome {
     /// processes its own probe or announcement as peer traffic.
     ///
     /// It is **not** how the credit ages.
-    /// [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) runs off the tick-top
+    /// [`SELF_SEND_TTL`](hick_udp::selfsend::SELF_SEND_TTL) runs off the tick-top
     /// instant instead, precisely because the gap between this read and the
     /// syscall is unbounded — a preemption, a page fault, or the `EINTR` retry
     /// all widen it — and charging that gap to the credit's life is what expires
@@ -429,15 +430,15 @@ impl SendOutcome {
   ///
   /// Both, never just the wall one. The wall stamp alone cannot say whether it
   /// is still on the timeline the echo's kernel receive stamp will be taken on —
-  /// see [`ClockPair`](crate::selfsend::ClockPair) — and neither is an age. See
+  /// see [`ClockPair`](hick_udp::selfsend::ClockPair) — and neither is an age. See
   /// [`SendOutcome::Sent`].
-  pub(crate) const fn credit_stamp(self) -> Option<crate::selfsend::ClockPair> {
+  pub(crate) const fn credit_stamp(self) -> Option<hick_udp::selfsend::ClockPair> {
     match self {
       Self::Sent {
         submitted_wall,
         submitted_at,
         ..
-      } => Some(crate::selfsend::ClockPair::new(
+      } => Some(hick_udp::selfsend::ClockPair::new(
         submitted_wall,
         submitted_at,
       )),
@@ -649,7 +650,7 @@ struct BoundSocket {
   /// It stands in for the one thing no test can ask a real host for: the drain
   /// thread losing the CPU between the tick's `SelfSendTracker::seal` and the
   /// read whose claim is weighed against it. That stretch is post-opportunity
-  /// time, which [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) requires be
+  /// time, which [`SELF_SEND_TTL`](hick_udp::selfsend::SELF_SEND_TTL) requires be
   /// charged in full — and a claim that ignores it is exactly what pushes the
   /// false-suppression window past its bound.
   #[cfg(test)]
@@ -1047,7 +1048,7 @@ pub(crate) struct Sockets {
   /// Report every received datagram as carrying no kernel receive timestamp,
   /// overriding the cmsg metadata. See [`Sockets::rx_time`].
   ///
-  /// [`MatchMode::Degraded`](crate::selfsend::MatchMode::Degraded) is the whole
+  /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded) is the whole
   /// of the self-send match on Windows and on any Unix kernel that delivers no
   /// timestamp cmsg — and every Unix host a test runs on does deliver one, so
   /// without this the degraded arm of the drain's claim is unreachable from a
@@ -1214,21 +1215,24 @@ impl Sockets {
     meta.peer()
   }
 
-  /// The kernel receive timestamp a datagram carried, as the self-send match
-  /// must read it — `None` when the platform delivered no timestamp cmsg, which
-  /// is what degrades that match to
-  /// [`MatchMode::Degraded`](crate::selfsend::MatchMode::Degraded).
+  /// The ordering evidence a datagram carried, as the self-send match must read
+  /// it — no timestamp cmsg means
+  /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded).
   ///
-  /// Production reads it straight off the cmsg metadata; the `#[cfg(test)]`
-  /// override is the only way to present the timestamp-less datagram a Windows
-  /// host hands the drain on every single receive. See
+  /// Taken from the [`RecvMeta`] rather than from a `SystemTime` this crate
+  /// passes along, so the provenance is structural: `RecvMeta` is minted only by
+  /// `hick-udp`'s own receive path, and this crate has no way to present a
+  /// userspace read time as a kernel stamp even by mistake.
+  ///
+  /// The `#[cfg(test)]` override is the only way to present the timestamp-less
+  /// datagram a Windows host hands the drain on every single receive. See
   /// [`Sockets::forced_no_rx_time`].
-  pub(crate) fn rx_time(&self, meta: &RecvMeta) -> Option<SystemTime> {
+  pub(crate) fn rx_evidence(&self, meta: &RecvMeta) -> RxEvidence {
     #[cfg(test)]
     if self.forced_no_rx_time {
-      return None;
+      return RxEvidence::none();
     }
-    meta.rx_time()
+    RxEvidence::from_meta(meta)
   }
 
   /// The interface both sockets are scoped to. The RFC 6762 §11 fallback needs

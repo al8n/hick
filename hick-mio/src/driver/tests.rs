@@ -13,11 +13,12 @@ use super::{
   EVENT_QUEUE_COMPACT_THRESHOLD, FamilyWireGate, MAX_SEND_CREDITS_PER_DRAIN,
   RETRY_INTEREST_BACKOFF, TxQueue, datagram_cost, packet_is_response, test_support,
 };
+use hick_udp::selfsend::{RxEvidence, SELF_SEND_TTL};
+
 use crate::{
   endpoint::Mdns,
   error::RegisterError,
   event::{Event, EventQueue},
-  selfsend::SELF_SEND_TTL,
   socket::{Family, MDNS_V4_DST},
 };
 
@@ -393,7 +394,12 @@ fn a_multicast_send_takes_one_credit_per_family_that_reached_the_wire() {
   // Take it back with the body: the credit is keyed to the family that carried
   // it and to the fingerprint of what went out. No receive stamp is offered, so
   // the claim runs on content and family alone.
-  assert!(selfsend.take_at(Family::V4, &body, None, crate::selfsend::ClockPair::now()));
+  assert!(selfsend.take_at(
+    Family::V4,
+    &body,
+    RxEvidence::none(),
+    hick_udp::selfsend::ClockPair::now()
+  ));
 }
 
 /// A refused send takes no credit and reports the family `Missed`, inside the
@@ -2973,7 +2979,7 @@ fn an_own_echo_survives_a_foreign_interface_index() {
   let mut events = mio::Events::with_capacity(8);
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut poll = poll;
-  while Instant::now() < deadline && mdns.selfsend.len() > 0 {
+  while Instant::now() < deadline && !mdns.selfsend.is_empty() {
     poll
       .poll(&mut events, Some(Duration::from_millis(100)))
       .expect("poll");
@@ -2984,7 +2990,7 @@ fn an_own_echo_survives_a_foreign_interface_index() {
     }
     mdns.tick().expect("tick");
   }
-  let matched = mdns.selfsend.len() == 0;
+  let matched = mdns.selfsend.is_empty();
   // The excuse must gate on an observed counter, or a regression in the gate
   // itself would present as "the echo never arrived" and take this test green.
   // `packets_rx` counts every datagram that left the kernel queue, including one
@@ -3044,7 +3050,7 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
     return;
   }
   assert!(
-    mdns.selfsend.len() > 0,
+    !mdns.selfsend.is_empty(),
     "the send must have left a credit for the echo to claim, or this test \
      cannot tell a dropped echo from an unclaimable one"
   );
@@ -3077,7 +3083,7 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
     }
     mdns.tick().expect("tick");
   }
-  let unclaimed = mdns.selfsend.len() > 0;
+  let unclaimed = !mdns.selfsend.is_empty();
   let dropped = dropped_at_the_gate(&mdns) > before;
   let arrived = saw_own_loopback(&mdns);
   mdns.deregister().expect("deregister");
@@ -3226,13 +3232,18 @@ fn credit_a_multicast_send(mdns: &mut Mdns, body: &[u8]) -> Option<()> {
 /// these — a kernel receive stamp taken after the syscall, read back against the
 /// instant the following tick opened with.
 fn echo_matched_at_next_tick_top(mdns: &mut Mdns, family: Family, body: &[u8]) -> bool {
-  let top = crate::selfsend::ClockPair::now();
+  let top = hick_udp::selfsend::ClockPair::now();
   mdns.selfsend.seal_at(top.mono);
   // Both readings are live, so the wall clock and the monotonic one agree about
   // how much time has passed since the send and the claim keeps full ordering
   // evidence — which is what makes this an `Ordered` claim rather than a
   // degraded one.
-  mdns.selfsend.take_at(family, body, Some(top.wall), top)
+  mdns.selfsend.take_at(
+    family,
+    body,
+    RxEvidence::from_caller_parsed_cmsg(top.wall),
+    top,
+  )
 }
 
 /// Send once through stage 4 and claim the echo at the next tick's top.
@@ -3430,17 +3441,20 @@ fn a_caller_gap_after_the_claim_window_opened_still_expires_the_credit() {
   // during a caller stall exactly as it can during a tick. Ageing by tick count,
   // or re-anchoring on every seal, would make the suppression window a function
   // of the caller's loop rate instead of a bound.
-  let top = crate::selfsend::ClockPair::now();
+  let top = hick_udp::selfsend::ClockPair::now();
   mdns.selfsend.seal_at(top.mono);
   // The gap is charged to BOTH clocks, so the claim below is refused by the TTL
   // and by nothing else: a gap that only the monotonic clock knew about would
   // read as a wall-clock step and give up the ordering evidence instead.
   let after_the_gap =
-    crate::selfsend::ClockPair::new(top.wall + STALL_PAST_TTL, top.mono + STALL_PAST_TTL);
+    hick_udp::selfsend::ClockPair::new(top.wall + STALL_PAST_TTL, top.mono + STALL_PAST_TTL);
   assert!(
-    !mdns
-      .selfsend
-      .take_at(Family::V4, &body, Some(after_the_gap.wall), after_the_gap,),
+    !mdns.selfsend.take_at(
+      Family::V4,
+      &body,
+      RxEvidence::from_caller_parsed_cmsg(after_the_gap.wall),
+      after_the_gap,
+    ),
     "post-opportunity time is charged in full, caller stalls included, or the \
      false-suppression bound is not a bound"
   );
@@ -3805,7 +3819,7 @@ fn legacy_query_datagram(service_type: &str) -> Vec<u8> {
 fn credits_after_a_pre_send_arrival(mdns: &mut Mdns, body: &[u8]) -> usize {
   mdns
     .selfsend
-    .record(Family::V4, body, crate::selfsend::ClockPair::now());
+    .record(Family::V4, body, hick_udp::selfsend::ClockPair::now());
   mdns.tick().expect("tick");
   mdns.selfsend.len()
 }

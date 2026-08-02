@@ -18,6 +18,8 @@ use mio::{Registry, Token};
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
 
+use hick_udp::selfsend::SelfSendTracker;
+
 use crate::{
   discovery::{LookupHandle, Lookups},
   driver::{FamilyWireGate, SendHealth, TxQueue, TxSlot},
@@ -26,7 +28,6 @@ use crate::{
   onlink::collect_local_subnets,
   options::ServerOptions,
   proto::{ProtoEndpoint, ProtoService},
-  selfsend::SelfSendTracker,
   socket::Sockets,
 };
 
@@ -226,7 +227,7 @@ pub struct Mdns {
   /// It stands in for the one thing no test can ask a real host for: the drain
   /// thread losing the CPU inside stage 1 *after* the read and the two admission
   /// gates, with the claim still ahead of it. That stretch is post-opportunity
-  /// time, which [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) requires be
+  /// time, which [`SELF_SEND_TTL`](hick_udp::selfsend::SELF_SEND_TTL) requires be
   /// charged in full, and it is the last window in which a caller-supplied
   /// instant could still be stale — so it is exactly where a claim that trusts
   /// one swallows a co-resident peer's byte-identical datagram as our own echo.
@@ -826,7 +827,7 @@ fn alloc_buf(size: usize, setting: &'static str) -> Result<Vec<u8>, ServerError>
 /// Deleting the parameter is the fix rather than moving the read: a parameter is
 /// the channel, and every caller that has one will eventually pass the one it
 /// happens to be holding. Same shape as
-/// [`SelfSendTracker::take`](crate::selfsend::SelfSendTracker::take).
+/// [`SelfSendTracker::take`](hick_udp::selfsend::SelfSendTracker::take).
 pub(crate) fn begin_service_withdrawal(
   endpoint: &mut ProtoEndpoint,
   services: &mut HashMap<ServiceHandle, ServiceCtx>,

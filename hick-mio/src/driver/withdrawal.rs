@@ -33,12 +33,12 @@
 
 use std::{net::SocketAddr, time::Instant as StdInstant};
 
+use hick_udp::selfsend::SelfSendTracker;
 use mdns_proto::{FamilyAttempt, endpoint::FamilyDebt};
 
 use crate::{
   driver::sends::SendHealth,
   endpoint::Mdns,
-  selfsend::SelfSendTracker,
   socket::{Family, FamilyAdmission, MDNS_V4_DST, MDNS_V6_DST, SendOutcome, SendReport, Sockets},
 };
 
