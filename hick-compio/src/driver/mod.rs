@@ -1493,6 +1493,11 @@ pub(crate) async fn run(
       if !budget.may_start_fanout() {
         break true;
       }
+      // The PROTOCOL instant: ONE stable reading for the core to weigh every
+      // deadline in this walk against. It stops at the core — the fan-out below
+      // weighs each family's wire gap at that family's own send point instead,
+      // because by then this reading has a `RefCell` borrow, a whole
+      // `poll_one_transmit` walk and a budget charge behind it.
       let now = StdInstant::now();
       let pumped = {
         let mut s = inner.state.borrow_mut();
@@ -1515,7 +1520,6 @@ pub(crate) async fn run(
           &scratch[..tx.size()],
           &mut gate,
           tx.min_family_gap(),
-          now,
         ),
         "transmit",
       )
@@ -2141,8 +2145,14 @@ impl SendAttempt {
 /// Offer one family its copy of the datagram and await the operation's true
 /// completion. An absent socket is [`SendAttempt::Unbound`] — that family was
 /// never obligated — and is answered without touching the clock, as is a family
-/// the caller withheld it from (`may_send == false`): a shut wire gate on the
-/// transmit path, an already-paid goodbye debt on the withdrawal path.
+/// the caller withheld it from (`may_send == false`).
+///
+/// `may_send` is for a decision the CALLER already holds and cannot get wrong by
+/// holding it: the withdrawal pump's per-family §10.1 debt, which only the core
+/// changes and only between rounds. A wire gap is not such a decision — it is
+/// weighed against a clock — so the transmit path goes through
+/// [`attempt_gated_send_to`], which reads that clock here rather than passing a
+/// verdict down.
 ///
 /// There is deliberately no bound on the wait. compio is completion-based, so the
 /// operation is handed to the kernel before any wait begins and abandoning the
@@ -2186,6 +2196,60 @@ async fn attempt_send_to<S: SendDatagram>(
     submitted_at,
     completed_at,
   }
+}
+
+/// The clock `family`'s admission check reads, at that family's own send point.
+///
+/// In a release build this is `StdInstant::now()` inlined at the call site with
+/// nothing between it and the `send_to` it admits, and `family` is not looked at.
+/// Under `cfg(test)` it is a seam that both scripts the reading and records which
+/// family took it, so a test can assert WHERE the reading happened — that a
+/// family's reading is immediately followed by that family's own send — instead
+/// of inferring it from the shape of the code.
+#[cfg(not(test))]
+#[inline]
+fn admission_now(_family: usize) -> StdInstant {
+  StdInstant::now()
+}
+
+#[cfg(test)]
+fn admission_now(family: usize) -> StdInstant {
+  tests::scripted_admission_now(family)
+}
+
+/// [`attempt_send_to`], admitted by this family's own share of the producer's
+/// [`FamilyWireGate`].
+///
+/// The clock is read HERE — after the boundness check, with this family's
+/// `send_to` as the next thing that happens — rather than once for the whole
+/// driver pass. The pass reads its instant before `poll_one_transmit` walks every
+/// producer, and may then spend up to [`DRAIN_PASS_BUDGET`] serving the ones
+/// ahead of this one, so a reading that old UNDERSTATES how long this wire has
+/// actually been idle. The gate would then withhold a datagram whose §6 / §8.1 /
+/// §8.3 floor was genuinely paid — and [`SendAttempt::Gated`] does not reach the
+/// core as "nothing happened", it reaches it as [`FamilyAttempt::GateShut`],
+/// spending the core's partial-round patience and holding the §8.1 probe sequence
+/// / §8.3 announce phase for a wire that was ready.
+///
+/// Reading later than the pass would have is provably one-directional: with
+/// `last_sent` fixed [`FamilyWireGate::open`] is monotone in `now`, and nothing
+/// can record into the gate while a fan-out is in flight —
+/// [`FamilyWireGate::record`] runs once, after every family has answered, and the
+/// SHARED borrow taken here is what makes that structural rather than a
+/// convention. So this can only ever flip a family from gated to offered; it can
+/// never withhold one a pass-wide reading would have offered.
+async fn attempt_gated_send_to<S: SendDatagram>(
+  sock: Option<&S>,
+  gate: &FamilyWireGate,
+  idx: usize,
+  min_gap: Duration,
+  body: &[u8],
+  dst: SocketAddr,
+) -> SendAttempt {
+  if sock.is_none() {
+    return SendAttempt::Unbound;
+  }
+  attempt_send_to(sock, gate.open(idx, admission_now(idx), min_gap), body, dst).await
 }
 
 /// Record the trace line, the self-send credit, and the stats for one MULTICAST
@@ -2256,14 +2320,17 @@ fn note_multicast_attempt(
 /// `gate` is the PRODUCER's per-family earliest-next-send state and `min_gap` the
 /// minimum the core computed for this datagram's kind
 /// ([`Transmit::min_family_gap`]). A family whose gap is unpaid is not offered the
-/// datagram at all and is reported [`FamilySend::Gated`] — obligated, and it did
-/// not carry it. Every family that DID carry it records its own COMPLETION
+/// datagram at all and is reported [`FamilyAttempt::GateShut`] — obligated, and it
+/// did not carry it. Every family that DID carry it records its own COMPLETION
 /// instant back into `gate`, which is NOT the instant this function returns as
 /// the confirm anchor (see [`SendAttempt::Answered`]).
 ///
+/// This deliberately takes no `now`, unlike its caller in the pump: each family's
+/// gap is weighed at ITS OWN send point ([`attempt_gated_send_to`]), not against
+/// the reading the pass took before it began walking producers.
+///
 /// Every family that was offered the datagram is awaited to its true completion,
 /// so the returned [`Fanout`] carries observed facts only.
-#[allow(clippy::too_many_arguments)]
 async fn send_via<S: SendDatagram>(
   inner: &Rc<EndpointInner>,
   sock_v4: &Option<Rc<S>>,
@@ -2272,7 +2339,6 @@ async fn send_via<S: SendDatagram>(
   body: &[u8],
   gate: &mut FamilyWireGate,
   min_gap: Duration,
-  now: StdInstant,
 ) -> Fanout {
   let n = body.len();
   let mut fanout = Fanout::NOT_ADDRESSED;
@@ -2280,21 +2346,34 @@ async fn send_via<S: SendDatagram>(
     // Offer both families CONCURRENTLY. Serialising them made each family's
     // acceptance instant depend on how long the other one took, so a slow family
     // backdated the healthy one's refresh schedule by its own latency.
-    let (a4, a6) = futures::future::join(
-      attempt_send_to(
-        sock_v4.as_deref(),
-        gate.open(FAMILY_V4, now, min_gap),
-        body,
-        MDNS_V4_DST,
-      ),
-      attempt_send_to(
-        sock_v6.as_deref(),
-        gate.open(FAMILY_V6, now, min_gap),
-        body,
-        MDNS_V6_DST,
-      ),
-    )
-    .await;
+    //
+    // One SHARED reborrow of the producer's gate serves both attempts: each reads
+    // it at its own send point, and neither can write to it while the other is in
+    // flight. The reborrow ends with the `join`, so the `record` calls below
+    // retake the mutable borrow once every family has answered — which is the
+    // ordering the anchor rule below depends on.
+    let (a4, a6) = {
+      let admission: &FamilyWireGate = gate;
+      futures::future::join(
+        attempt_gated_send_to(
+          sock_v4.as_deref(),
+          admission,
+          FAMILY_V4,
+          min_gap,
+          body,
+          MDNS_V4_DST,
+        ),
+        attempt_gated_send_to(
+          sock_v6.as_deref(),
+          admission,
+          FAMILY_V6,
+          min_gap,
+          body,
+          MDNS_V6_DST,
+        ),
+      )
+      .await
+    };
     fanout.v4 = attempt_of(Family::V4, body, &a4);
     fanout.v6 = attempt_of(Family::V6, body, &a6);
     // Each family's OWN COMPLETION instant re-opens ITS OWN gate one `min_gap`
@@ -2336,7 +2415,7 @@ async fn send_via<S: SendDatagram>(
   // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
   // the NEW entry — so a legacy-query flood would starve the genuine multicast
   // credits that suppression actually depends on.
-  let attempt = attempt_send_to(sock, gate.open(idx, now, min_gap), body, dst).await;
+  let attempt = attempt_gated_send_to(sock, &*gate, idx, min_gap, body, dst).await;
   let outcome = attempt_of(Family::of(dst), body, &attempt);
   match dst {
     SocketAddr::V4(_) => fanout.v4 = outcome,
