@@ -1062,12 +1062,13 @@ impl<N: Net> DriverState<N> {
         // reading taken right here would still predate the handle lookup the core
         // does before it compares — so neither can stand in.
         //
-        // Admission is the boundary, and this driver's overshoot past it is the
-        // AWAITED fan-out below: a question admitted just inside the window
-        // reaches a wire up to one `SEND_ATTEMPT_TIMEOUT` — plus the executor's
-        // scheduling latency — later. That is a bound to reason with, not a
-        // second enforcement point; a recheck placed inside the fan-out would
-        // still sit before a syscall, and before the wire.
+        // Admission is the core's COMPARISON, so the overshoot past it starts
+        // with the encode and return that finish the poll, and is then dominated
+        // by the AWAITED fan-out below: a question admitted just inside the
+        // window reaches a wire up to one `SEND_ATTEMPT_TIMEOUT` — plus the
+        // executor's scheduling latency — later. That is a bound to reason with,
+        // not a second enforcement point; a recheck placed inside the fan-out
+        // would still sit before a syscall, and before the wire.
         //
         // Nothing admitted is carried across a pass, either: `may_start_fanout`
         // is consulted ABOVE this poll, both times, so a pass cut short by its

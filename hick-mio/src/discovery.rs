@@ -208,15 +208,18 @@ impl QueryParam {
   /// deadline lands on this one exactly, and the core withholds any question it
   /// draws on or after it — but what
   /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) bounds is
-  /// ADMISSION, not departure, because no userspace check can make departure
-  /// atomic with the boundary: one placed immediately before `sendto` still
-  /// precedes the syscall, and the syscall still precedes the wire. So a
-  /// question admitted a moment before the boundary can leave a moment after it.
-  /// This driver's overshoot is synchronous — stage 4 goes straight from the poll
-  /// into the send, with no suspension point — so the trailing edge is that
-  /// stretch plus the host's preemption rather than a whole tick. Such an answer
-  /// cannot reach you: the lookup is retired before it would be consumed, and the
-  /// two guarantees above are unaffected. The packet is real all the same.
+  /// ADMISSION — the core's own deadline COMPARISON — and not departure, because
+  /// no userspace check can make departure atomic with the boundary: one placed
+  /// immediately before `sendto` still precedes the syscall, and the syscall
+  /// still precedes the wire. So a question admitted a moment before the
+  /// boundary can leave a moment after it. This driver's overshoot is
+  /// synchronous — the encode that finishes the poll, then stage 4 straight into
+  /// the send, with no suspension point — so the trailing edge is those
+  /// stretches plus the host's preemption rather than a whole tick. Such an
+  /// answer cannot reach you: the lookup is retired before it would be consumed,
+  /// and the sub-query itself refuses any answer weighed on or after the same
+  /// boundary, so the two guarantees above are unaffected. The packet is real
+  /// all the same.
   ///
   /// A timeout so large that `Instant::now() + timeout` overflows means *no*
   /// effective deadline, here and on every sub-query. Such a lookup ends only

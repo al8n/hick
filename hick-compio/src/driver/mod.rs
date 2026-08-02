@@ -898,8 +898,9 @@ impl State {
       // accrue, which is why no reading OUTSIDE the comparison can stand in for
       // one at it.
       //
-      // Admission is the boundary, and this driver's overshoot past it is the one
-      // it cannot cap: `run` hands the datagram to an AWAITED fan-out that is
+      // Admission is the core's COMPARISON — the encode and return that finish
+      // the poll are already past it — and this driver's overshoot past that is
+      // the one it cannot cap: `run` hands the datagram to an AWAITED fan-out that is
       // never abandoned, because cancelling a submitted completion-based
       // operation is unreliable (see `awaiting_fanout`), so a question admitted
       // just inside the window reaches a wire whenever the kernel completes it —

@@ -217,57 +217,93 @@ cfg_heap! {
     /// Set an absolute timeout for the query, measured from the instant the
     /// query is started.
     ///
-    /// # The boundary is ADMISSION
+    /// # The boundary is ADMISSION, and admission is the COMPARISON
     ///
-    /// A question is **admitted** when [`Query::poll_transmit`] hands a driver
-    /// an encoded datagram to send. No question is admitted on or after
-    /// `start + timeout`: the core reads the clock at that comparison and
-    /// withholds the datagram, and it re-weighs the deadline at *every*
+    /// A question is **admitted** at the instant [`Query::poll_transmit`] reads
+    /// the clock, weighs it against `start + timeout`, and finds the window
+    /// open. No question is admitted on or after `start + timeout`: the core
+    /// withholds the datagram instead, and it re-weighs the deadline at *every*
     /// admission — so a question armed inside the window but drawn outside it
-    /// never becomes a datagram at all. The query itself ends on the same
+    /// is never committed to at all. The query itself ends on the same
     /// boundary, in [`Query::handle_timeout`], on a wakeup
     /// [`Query::poll_timeout`] publishes — and a query that has ended draws no
     /// question at all.
     ///
+    /// The boundary is that comparison and not the moment `poll_transmit`
+    /// returns, because the comparison is the last point at which the outcome is
+    /// still open. Encoding the question and returning the datagram both happen
+    /// after it, both take time, and a second comparison placed before the
+    /// return would leave the interval between itself and the return just as
+    /// this one leaves the interval before the encode. So the promise is made
+    /// where it can be kept, and everything downstream of it is stated below as
+    /// overshoot.
+    ///
+    /// # The same boundary cuts off the ANSWERS
+    ///
+    /// An answer applied to this query on or after `start + timeout` is refused,
+    /// on the same comparison, by [`Query::handle_event`]. The RFC 6762 §7.3
+    /// duplicate-question suppression a peer's query would trigger is refused
+    /// there too, so past the boundary the query spends no retry slot either.
+    ///
+    /// Without that, what a caller collected would depend on the internal
+    /// ordering of its driver's loop: a receive path that runs ahead of the
+    /// timer pump reaches a query no timer has ended yet, so one and the same
+    /// response — same arrival, same instant, same deadline already passed —
+    /// would land on that driver and be dropped by one whose timers fired first.
+    /// And because a collected answer competes for the `max_answers` cap,
+    /// letting the late one in can EVICT an answer collected while the window
+    /// was open.
+    ///
+    /// The price is the answer that arrived inside the window and was only
+    /// *processed* after it: it is dropped. That answer was never reliably
+    /// yours — the tick order that happened to reach the query first is what
+    /// would have saved it — so what is given up is a result that survived by
+    /// accident, and what is bought is a deadline that means the same thing
+    /// whichever driver runs it.
+    ///
     /// # It is NOT the instant the datagram leaves
     ///
-    /// A question admitted just inside the window may reach the wire just after
-    /// it, and this promise deliberately does not claim otherwise. Admission
-    /// leaves the driver still holding the datagram, and no userspace precheck
-    /// can make the handover atomic: a check placed immediately before `sendto`
-    /// still leaves the interval between the check and the syscall, and between
-    /// the syscall and the wire. Every move of the check shortens that interval
-    /// and none of them removes it, so the guarantee is stated where it can be
-    /// kept. An enforceable departure boundary would have to come from the
-    /// operating system, not from a comparison in this crate.
+    /// A question admitted just inside the window may reach the wire well after
+    /// it, and this promise deliberately does not claim otherwise. No userspace
+    /// precheck can make the handover atomic: a check placed immediately before
+    /// `sendto` still leaves the interval between the check and the syscall, and
+    /// between the syscall and the wire. Every move of the check shortens that
+    /// interval and none of them removes it, so the guarantee is stated where it
+    /// can be kept. An enforceable departure boundary would have to come from
+    /// the operating system, not from a comparison in this crate.
     ///
     /// What a caller may conclude, then, is not that no question bearing this
     /// `qname` was on the wire after the deadline. It is that the query stopped
-    /// *producing* questions there, and that whatever was still in flight had
-    /// already been admitted while the window was open.
+    /// *committing* to questions there, and that whatever was still in flight
+    /// had already been admitted while the window was open.
     ///
     /// # What bounds the overshoot
     ///
-    /// The driver's own path from admission to its `sendto` — which is the
-    /// quantity to size a window against, and it depends on the shape of that
-    /// path rather than on this crate:
+    /// Everything between the comparison and the wire, which is the quantity to
+    /// size a window against:
     ///
-    /// * A **synchronous** send path — per-family spacing check, syscall, no
-    ///   suspension point — overshoots by that stretch plus whatever the host's
-    ///   preemption adds. `hick-mio` has this shape.
-    /// * An **awaited** send path additionally carries the socket's own latency
-    ///   and the executor's scheduling latency, and can be meaningfully longer.
-    ///   How much longer is the driver's to state: `hick-reactor` bounds each
-    ///   family's attempt at RFC 6762 §8.1's 250 ms inter-probe interval and
-    ///   abandons it there — sound only because readiness I/O makes no syscall
-    ///   until the socket is writable — while `hick-compio` has no such licence,
-    ///   since cancelling a submitted completion-based operation is unreliable,
-    ///   and so awaits every fan-out to completion for as long as the kernel
-    ///   takes.
-    /// * A driver whose entry point receives an *instant* rather than a clock
-    ///   (`hick-smoltcp` and `hick-embassy`, through `Engine::pump`) weighs
-    ///   admission against its caller's reading, so admission there is only as
-    ///   fresh as that reading.
+    /// * **The rest of `poll_transmit`** — building the question into the
+    ///   caller's buffer and returning the [`Transmit`] that describes it. A
+    ///   fixed, small amount of work on memory the caller already owns, plus
+    ///   whatever the host's preemption adds to it.
+    /// * **The driver's own path from that return to its `sendto`**, which
+    ///   depends on the shape of the path rather than on this crate:
+    ///   * A **synchronous** send path — per-family spacing check, syscall, no
+    ///     suspension point — overshoots by that stretch plus whatever the
+    ///     host's preemption adds. `hick-mio` has this shape.
+    ///   * An **awaited** send path additionally carries the socket's own
+    ///     latency and the executor's scheduling latency, and can be
+    ///     meaningfully longer. How much longer is the driver's to state:
+    ///     `hick-reactor` bounds each family's attempt at RFC 6762 §8.1's 250 ms
+    ///     inter-probe interval and abandons it there — sound only because
+    ///     readiness I/O makes no syscall until the socket is writable — while
+    ///     `hick-compio` has no such licence, since cancelling a submitted
+    ///     completion-based operation is unreliable, and so awaits every fan-out
+    ///     to completion for as long as the kernel takes.
+    ///   * A driver whose entry point receives an *instant* rather than a clock
+    ///     (`hick-smoltcp` and `hick-embassy`, through `Engine::pump`) weighs
+    ///     admission against its caller's reading, so admission there is only as
+    ///     fresh as that reading.
     ///
     /// A driver that parked an admitted datagram and sent it on a later pass
     /// would widen this without bound. None of the drivers here do: a pass cut
@@ -282,8 +318,10 @@ cfg_heap! {
     /// ends it.
     ///
     /// [`Query::poll_transmit`]: crate::Query::poll_transmit
+    /// [`Query::handle_event`]: crate::Query::handle_event
     /// [`Query::handle_timeout`]: crate::Query::handle_timeout
     /// [`Query::poll_timeout`]: crate::Query::poll_timeout
+    /// [`Transmit`]: crate::Transmit
     #[must_use]
     pub const fn with_timeout(mut self, v: Duration) -> Self {
       self.timeout = Some(v);

@@ -72,6 +72,13 @@ where
   /// as one step satisfies this by construction. See
   /// [`Service::poll_transmit`](crate::service::Service::poll_transmit).
   ///
+  /// `now` is the instant this datagram is PROCESSED at, and every effect it has
+  /// is anchored to that one reading: cached records expire from it, and an
+  /// active query whose `QuerySpec::with_timeout` window has already shut as of
+  /// `now` collects nothing from this datagram. A caller that defers `handle`
+  /// therefore defers the whole datagram, rather than having part of it land in
+  /// one epoch and part in another.
+  ///
   /// `local_ip` is the address of the interface that received the datagram
   /// (as reported by IP_PKTINFO / IPV6_PKTINFO on Unix).  When the packet's
   /// source IP equals `local_ip` the datagram is treated as a self-originated
@@ -368,7 +375,14 @@ where
               continue;
             }
             if names_match_record(q.qname(), &r) && qry_query_accepts(q, &r) {
-              q.handle_event(QueryEvent::Answer(r));
+              // `now` is this datagram's processing instant, and every effect it
+              // has is anchored to it — the cache entry inserted below expires
+              // from the same reading. A query whose `QuerySpec::with_timeout`
+              // window has shut as of `now` refuses the answer (see
+              // `Query::handle_event`), which is what keeps the result set from
+              // depending on whether this drain runs before or after the
+              // caller's timer pump.
+              q.handle_event(QueryEvent::Answer(r), now);
             }
           }
         }

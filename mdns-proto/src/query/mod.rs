@@ -197,6 +197,13 @@ pub struct Query<I, AN, EV> {
   /// build and no public API sets it.
   #[cfg(test)]
   contract_assertions_off: bool,
+  /// Test-only: a stall injected between the caller-deadline comparison that
+  /// admits a question and the encode that follows it — the interval
+  /// [`Query::poll_transmit`] names as unclosable, made observable. A real host
+  /// opens it by preemption alone, on no schedule a test can ask for.
+  /// `cfg(test)`: it does not exist in a shipped build and no public API sets it.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
+  admission_stall: Option<core::time::Duration>,
 }
 
 impl<I, AN, EV> Query<I, AN, EV>
@@ -251,7 +258,23 @@ where
       timeout_deadline,
       #[cfg(test)]
       contract_assertions_off: false,
+      #[cfg(all(test, feature = "std", feature = "slab"))]
+      admission_stall: None,
     }
+  }
+
+  /// Test-only: stall the next admitted question between the deadline
+  /// comparison that admits it and the encode that follows.
+  ///
+  /// [`Self::poll_transmit`] names that comparison as admission, so a question
+  /// admitted while the window was open must still be produced when the stall
+  /// carries the RETURN past the deadline. That is the residual overshoot
+  /// `QuerySpec::with_timeout` states, not a gap a further comparison could
+  /// close: one placed before the return would leave the interval between itself
+  /// and the return, exactly as this one leaves the interval before the encode.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
+  pub(crate) fn stall_after_admission_for_test(&mut self, stall: core::time::Duration) {
+    self.admission_stall = Some(stall);
   }
 
   /// Test-only: opt this query out of the debug-build contract assertions.
@@ -357,11 +380,43 @@ where
 
   /// Process an event routed to this query by the Endpoint.
   ///
+  /// `now` is when the event is being APPLIED, which is what the caller's window
+  /// is weighed against — see below. It is not the instant the datagram arrived,
+  /// and this call does not need one: what a query may still collect is decided
+  /// by where the boundary stands when the collection happens.
+  ///
+  /// # A query past the caller's window consumes nothing
+  ///
+  /// `QuerySpec::with_timeout` ends the query on an absolute boundary, and the
+  /// result set is cut off at that same boundary: an event weighed on or after
+  /// it is dropped, on the same `now >= deadline` comparison
+  /// [`Self::handle_timeout`] takes the terminal on.
+  ///
+  /// Without that, the answers a caller receives would depend on the order of a
+  /// driver's loop rather than on the clock. A receive path that runs ahead of
+  /// the timer pump — `hick-mio` ingests datagrams before it fires deadlines,
+  /// `hick-reactor` drains queued packets first and prefers a ready packet to a
+  /// simultaneously-ready timer — reaches a query no timer has ended yet. So one
+  /// and the same response, at the same instant with the same deadline already
+  /// passed, would be collected there and dropped by a loop whose timers fired
+  /// first. Worse, the late answer competes for the `max_answers` cap: admitting
+  /// it can EVICT an answer collected while the window was open, so the ordering
+  /// accident does not merely add a result, it can take one away.
+  ///
+  /// The cost is the answer that arrived inside the window and was only
+  /// *processed* after it. That answer was never reliably delivered — the tick
+  /// order that reached it first is what saved it — so what is given up is a
+  /// result that survived by accident, and what is bought is a window that means
+  /// the same thing on every driver.
+  ///
+  /// This drops the event and nothing more: the terminal stays with
+  /// [`Self::handle_timeout`], whose wakeup [`Self::poll_timeout`] publishes.
+  ///
   /// # Contract
   ///
   /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
   /// awaiting its [`Self::note_transmit_outcome`]; see [`Self::poll_transmit`].
-  pub fn handle_event(&mut self, event: QueryEvent<'_>) {
+  pub fn handle_event(&mut self, event: QueryEvent<'_>, now: I) {
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("query", handle = self.handle.raw()).entered();
     self.assert_no_live_send_confirm("Query::handle_event");
@@ -371,6 +426,22 @@ where
       event = ?core::mem::discriminant(&event),
       "query: handle_event"
     );
+    // A terminated query is frozen for the same reason, and the two arms are not
+    // redundant: `terminate` CLEARS `timeout_deadline`, so once the terminal has
+    // been taken the deadline is no longer there to weigh against.
+    if self.done {
+      return;
+    }
+    if let Some(deadline) = self.timeout_deadline
+      && now >= deadline
+    {
+      crate::trace::trace!(
+        target: "mdns_proto::query",
+        handle = self.handle.raw(),
+        "query: absolute timeout deadline reached — refusing the event"
+      );
+      return;
+    }
     match event {
       QueryEvent::Answer(record) => {
         // TTL=0 records are mDNS "goodbye" / deletion records
@@ -665,21 +736,29 @@ where
   ///
   /// # The caller's deadline is weighed against a reading this call takes itself
   ///
-  /// `QuerySpec::with_timeout` is a promise to whoever set it, and THIS CALL is
-  /// the boundary it names: no question is ADMITTED — handed back from here as a
-  /// datagram to send — on or after the instant it makes absolute.
+  /// `QuerySpec::with_timeout` is a promise to whoever set it, and the
+  /// comparison BELOW is the boundary it names: a question is ADMITTED at the
+  /// instant this call reads the clock and finds the window still open, and none
+  /// is admitted on or after the instant the deadline makes absolute.
   /// [`Self::handle_timeout`] weighs the same deadline, but a transmit it arms
   /// is drained LATER, and nothing in between weighs that. So a send that is due
   /// once the clock has reached the deadline is WITHHELD, on the same
   /// `now >= deadline` boundary `handle_timeout` uses.
   ///
-  /// Admission is the whole of what is promised, and deliberately so. What the
-  /// driver does with the returned datagram takes further time — a spacing
-  /// check, a syscall, on an async driver an await — and no comparison written
-  /// here can make its arrival on the wire atomic with the boundary. A caller
-  /// sizing a window against that overshoot needs the driver's send path, which
-  /// `QuerySpec::with_timeout` describes; what this method owes is that the
-  /// datagram was drawn while the window was open.
+  /// The COMPARISON is admission, not this call's return, and the distinction is
+  /// deliberate rather than a convenience. The comparison is the last point at
+  /// which the outcome is still open — past it the question is encoded and the
+  /// datagram handed back, and nothing between reverses that — so it is the only
+  /// point at which the promise can actually be kept. A second comparison placed
+  /// just before the return would leave the interval between ITSELF and the
+  /// return, exactly as this one leaves the interval before the encode; the
+  /// encode, the return, and everything the driver then does are stated as
+  /// overshoot on `QuerySpec::with_timeout` instead of chased with a check that
+  /// cannot catch them.
+  ///
+  /// What this method owes, then, is that the question was committed to while
+  /// the window was open. A caller sizing a window against the overshoot needs
+  /// the driver's send path, which `QuerySpec::with_timeout` describes.
   ///
   /// `clock` is that reading, and it is a closure rather than an instant on
   /// purpose. An instant is sampled in the caller, and whatever runs between the
@@ -729,6 +808,11 @@ where
     // `clock()` sits inside the comparison, with nothing between the reading and
     // the use that is its only reason to exist — not even the tracing span or
     // the pending check above, both of which precede it.
+    //
+    // This comparison IS the admission the caller was promised. What follows it
+    // — the encode, the return, the driver's path to `sendto` — is the overshoot
+    // `QuerySpec::with_timeout` states, and no further comparison is placed below
+    // it: one would only move the unclosable interval down a few statements.
     if let Some(deadline) = self.timeout_deadline
       && clock() >= deadline
     {
@@ -738,6 +822,14 @@ where
         "query: absolute timeout deadline reached with a send due — withholding the question"
       );
       return Ok(None);
+    }
+    // The interval the comparison above cannot close, made observable: see
+    // `stall_after_admission_for_test`.
+    #[cfg(all(test, feature = "std", feature = "slab"))]
+    if let Some(stall) = self.admission_stall.take()
+      && !stall.is_zero()
+    {
+      std::thread::sleep(stall);
     }
     let buf_len = buf.len();
     let header = Header::new().with_id(self.txid);
@@ -895,13 +987,25 @@ where
   /// still progresses to its terminal timeout instead of being
   /// deferred forever. An in-flight (awaiting-confirm) send is left alone.
   ///
+  /// A query past its caller's absolute deadline suppresses nothing, on the same
+  /// comparison [`Self::handle_event`] refuses an answer on and for the same
+  /// reason: the path is reached past that boundary only where a driver's
+  /// receive side runs ahead of its timer pump, and taking it would spend a §5.2
+  /// slot — possibly the last one, and with it the budget's terminal — on behalf
+  /// of a query the caller's window has already closed. There is no
+  /// retransmission left to suppress either: [`Self::poll_transmit`] withholds
+  /// every question from that boundary on.
+  ///
   /// Returns `true` if a transmit slot was actually consumed (i.e. real
   /// suppression happened) and `false` if the call was a no-op (query is
-  /// done, awaiting send confirmation, or no send was imminent). Callers use
-  /// the return value to decide whether to bump the
+  /// done, past its caller's deadline, awaiting send confirmation, or no send
+  /// was imminent). Callers use the return value to decide whether to bump the
   /// `duplicate_questions_suppressed` counter.
   pub fn note_duplicate_question(&mut self, now: I) -> bool {
     if self.done || self.awaiting_send_confirm {
+      return false;
+    }
+    if self.timeout_deadline.is_some_and(|d| now >= d) {
       return false;
     }
     let imminent = self.transmit_pending || self.next_deadline.is_some_and(|d| now >= d);

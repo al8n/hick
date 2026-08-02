@@ -50,9 +50,13 @@ fn make_query(qtype: ResourceType, qclass: ResourceClass) -> TestQuery {
 }
 
 fn inject_a_record(q: &mut TestQuery, msg: &[u8]) {
+  inject_a_record_at(q, msg, StdInstant::now());
+}
+
+fn inject_a_record_at(q: &mut TestQuery, msg: &[u8], now: StdInstant) {
   let reader = MessageReader::try_parse(msg).unwrap();
   let record = reader.answers().next().unwrap().unwrap();
-  q.handle_event(QueryEvent::Answer(record));
+  q.handle_event(QueryEvent::Answer(record), now);
 }
 
 // ── dedupe ───────────────────────────────────────────────────────────
@@ -415,7 +419,7 @@ fn fixed_capacity_pool_below_max_answers_evicts_and_advances_seq() {
     let msg = make_a_response(b"printer", [10, 0, 0, i]);
     let reader = MessageReader::try_parse(&msg).unwrap();
     let record = reader.answers().next().unwrap().unwrap();
-    q.handle_event(QueryEvent::Answer(record));
+    q.handle_event(QueryEvent::Answer(record), StdInstant::now());
   }
 
   // The pool stays at its own hard capacity (2), NOT max_answers (10).
@@ -731,6 +735,189 @@ fn a_send_drained_inside_the_absolute_deadline_still_goes_out() {
   assert!(
     !q.done,
     "a query inside its window must not be terminated by a transmit poll"
+  );
+}
+
+/// Admission is the COMPARISON, and the only way to see that it is not the
+/// RETURN is to make time pass between them.
+///
+/// `poll_transmit` weighs the caller's window and then — still inside the same
+/// call — encodes the question and hands back the datagram. That stretch is real
+/// work on a preemptible host, so it can outlive the window; and a comparison
+/// placed after it could no more be atomic with the return than this one is with
+/// the encode. The promise is therefore made at the last point where the outcome
+/// is still open, and the stretch below it is stated as overshoot on
+/// `QuerySpec::with_timeout` rather than chased.
+///
+/// The stall is what no test can ask a real host for, so it is injected exactly
+/// there. The window is open at the comparison and shut by the time the call
+/// returns: were the boundary the return, this poll would have to withhold, and
+/// the assertion below would fail.
+#[test]
+fn a_question_admitted_inside_the_window_is_produced_though_the_call_returns_after_it() {
+  use core::time::Duration;
+
+  /// The caller's window, wide enough that reaching the comparison inside it is
+  /// not a race.
+  const WINDOW: Duration = Duration::from_millis(300);
+  /// What the stretch after the comparison costs when it outlives the window.
+  const ENCODE_PAST: Duration = Duration::from_millis(450);
+
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(WINDOW).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    QueryHandle::from_raw(0),
+    Name::try_from_str("host.local.").unwrap(),
+    ResourceType::A,
+    ResourceClass::In,
+    53,
+    false,
+    Some(deadline),
+  );
+
+  let mut buf = [0u8; 512];
+  q.stall_after_admission_for_test(ENCODE_PAST);
+  assert!(
+    StdInstant::now() < deadline,
+    "premise: the window must still be open when the poll begins, so the only \
+     thing that can shut it is the stretch after the comparison"
+  );
+  let drawn = q.poll_transmit(StdInstant::now, &mut buf).unwrap();
+  let returned_at = StdInstant::now();
+  assert!(
+    returned_at >= deadline,
+    "premise: the call must have outlived the window, or nothing was returned \
+     past a deadline and the assertion below is vacuous"
+  );
+  assert!(
+    drawn.is_some(),
+    "a question committed to while the window was open must still be produced: \
+     admission is the comparison, and the encode and the return that follow it \
+     are the overshoot QuerySpec::with_timeout states, not a second boundary"
+  );
+
+  // The boundary that WAS crossed still ends the query, through its one owner.
+  q.note_transmit_outcome(returned_at, TransmitDelivery::ALL);
+  assert!(
+    !q.done,
+    "admitting a question must not terminate the query, however long the call \
+     that produced it took"
+  );
+  assert_eq!(
+    q.poll_timeout(),
+    Some(deadline),
+    "the deadline the question was admitted against must still be the standing \
+     wakeup — it is what ends the query"
+  );
+  q.handle_timeout(returned_at).unwrap();
+  assert!(
+    q.done,
+    "the query must end on its deadline, on the tick its owner observes"
+  );
+}
+
+/// An answer applied on or after the caller's absolute deadline is refused —
+/// and refused before it can EVICT one collected while the window was open.
+///
+/// The endpoint applies matching answers eagerly on receive, and a driver whose
+/// receive side runs ahead of its timer pump reaches a query no timer has ended
+/// yet — `hick-mio` ingests datagrams before it fires deadlines, `hick-reactor`
+/// drains queued packets first and prefers a ready packet to a
+/// simultaneously-ready timer.
+/// Left to land it would not merely add a late result: answers are capped and
+/// the cap evicts FIFO, so the late one can displace a result the caller had
+/// already earned inside its window. The cap is 1 here so that displacement is
+/// what is asserted, rather than something the default 256 hides.
+#[test]
+fn an_answer_applied_past_the_absolute_deadline_is_refused_and_evicts_nothing() {
+  use core::time::Duration;
+
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_millis(200)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    QueryHandle::from_raw(0),
+    Name::try_from_str("printer.local.").unwrap(),
+    ResourceType::A,
+    ResourceClass::In,
+    54,
+    false,
+    Some(deadline),
+  );
+  q.set_max_answers(1);
+
+  let early = make_a_response(b"printer", [192, 168, 1, 10]);
+  inject_a_record_at(&mut q, &early, t0);
+  assert_eq!(
+    q.answers.len(),
+    1,
+    "an answer applied while the window was open must be collected"
+  );
+
+  let after = t0.checked_add(Duration::from_millis(400)).unwrap();
+  let late = make_a_response(b"printer", [192, 168, 1, 11]);
+  inject_a_record_at(&mut q, &late, after);
+
+  assert_eq!(
+    q.collected_answers().count(),
+    1,
+    "the late answer must not be collected"
+  );
+  assert_eq!(
+    q.collected_answers().next().unwrap().rdata_slice(),
+    &[192, 168, 1, 10],
+    "the in-window answer must still be the one held: a late answer admitted \
+     into a full set evicts FIFO, so accepting it would take away a result the \
+     caller obtained inside the window it was promised"
+  );
+  assert_eq!(
+    q.accepted_count(),
+    1,
+    "a refused answer must not be accounted as collected either"
+  );
+
+  // Refused, and nothing more — the terminal stays with `handle_timeout`.
+  assert!(
+    !q.done,
+    "refusing a late answer must not terminate the query"
+  );
+  assert!(
+    q.poll().is_none(),
+    "and it must queue no terminal update of its own"
+  );
+  assert_eq!(
+    q.poll_timeout(),
+    Some(deadline),
+    "the deadline must still stand as the wakeup that ends the query"
+  );
+}
+
+/// The refusal gates on the instant, never on the mere presence of a deadline:
+/// an answer applied one tick INSIDE the window is collected as it always was.
+#[test]
+fn an_answer_applied_inside_the_absolute_deadline_is_still_collected() {
+  use core::time::Duration;
+
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_secs(5)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    QueryHandle::from_raw(0),
+    Name::try_from_str("printer.local.").unwrap(),
+    ResourceType::A,
+    ResourceClass::In,
+    55,
+    false,
+    Some(deadline),
+  );
+
+  let msg = make_a_response(b"printer", [192, 168, 1, 10]);
+  inject_a_record_at(&mut q, &msg, t0.checked_add(Duration::from_secs(4)).unwrap());
+  assert_eq!(
+    q.answers.len(),
+    1,
+    "an answer applied inside the caller's window must be collected"
   );
 }
 
@@ -1104,7 +1291,7 @@ fn txid_accessor_returns_transaction_id() {
 #[test]
 fn truncated_event_collects_nothing() {
   let mut q = make_query(ResourceType::Any, ResourceClass::Any);
-  q.handle_event(QueryEvent::Truncated);
+  q.handle_event(QueryEvent::Truncated, StdInstant::now());
   assert_eq!(q.answers.len(), 0, "a Truncated event collects no answer");
 }
 
@@ -1185,6 +1372,64 @@ fn note_duplicate_question_is_noop_when_done() {
   q.retire();
   q.note_duplicate_question(StdInstant::now());
   assert!(q.is_done());
+}
+
+/// §7.3 suppression stops at the caller's absolute deadline, on the same
+/// comparison an answer is refused on.
+///
+/// This path is reached past the boundary only because drivers pump received
+/// packets before they fire timers, so the query is still live when a peer's
+/// duplicate lands. Consuming it would spend a §5.2 slot — and, at the end of
+/// the budget, take that budget's terminal — for a query the caller's window has
+/// already closed, while there is no retransmission left to suppress: every
+/// question from the boundary on is withheld anyway.
+#[test]
+fn a_duplicate_question_past_the_absolute_deadline_suppresses_nothing() {
+  use core::time::Duration;
+
+  let t0 = StdInstant::now();
+  let deadline = t0.checked_add(Duration::from_millis(200)).unwrap();
+
+  let mut q: TestQuery = TestQuery::try_new(
+    QueryHandle::from_raw(0),
+    Name::try_from_str("host.local.").unwrap(),
+    ResourceType::A,
+    ResourceClass::In,
+    56,
+    false,
+    Some(deadline),
+  );
+  assert!(
+    q.transmit_pending,
+    "premise: a send is armed, so without the deadline this would suppress"
+  );
+
+  let after = t0.checked_add(Duration::from_millis(400)).unwrap();
+  assert!(
+    !q.note_duplicate_question(after),
+    "a peer's duplicate seen past the caller's deadline must consume no slot"
+  );
+  assert_eq!(q.retry_count, 0, "and must not advance the §5.2 budget");
+  assert!(
+    q.transmit_pending,
+    "nor clear the arming it would otherwise have consumed"
+  );
+  assert!(
+    !q.done,
+    "nor take a terminal — that stays with handle_timeout"
+  );
+  assert_eq!(
+    q.poll_timeout(),
+    Some(deadline),
+    "the deadline must still stand as the wakeup that ends the query"
+  );
+
+  // Control: the same duplicate INSIDE the window suppresses as it always has,
+  // so what refused it above is the instant and not the deadline's presence.
+  assert!(
+    q.note_duplicate_question(t0),
+    "a duplicate inside the window must still consume the slot"
+  );
 }
 
 #[test]

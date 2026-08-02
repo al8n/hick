@@ -111,12 +111,14 @@
 //! immediately before `sendto` would leave the interval between itself and the
 //! syscall, and between the syscall and the wire. So
 //! [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) bounds when a
-//! question may be admitted, and each driver bounds its own overshoot. This
-//! driver's is synchronous: stage 4 goes straight from the poll into
+//! question may be admitted, and each driver bounds its own overshoot. Admission
+//! is the core's COMPARISON, so the overshoot starts inside the poll — the
+//! encode and the return that follow it are already past the boundary. This
+//! driver's is synchronous from there: stage 4 goes straight from the poll into
 //! [`send_and_credit`] — a per-family spacing check and a `sendto`, with no
-//! suspension point — so the overshoot is that stretch plus whatever preemption
-//! the host adds. That is a bound to reason with, not a second enforcement
-//! point, and adding one here would only relocate the same gap.
+//! suspension point — so the overshoot is those two stretches plus whatever
+//! preemption the host adds. That is a bound to reason with, not a second
+//! enforcement point, and adding one here would only relocate the same gap.
 //!
 //! **And one reading may have two uses when they are inverses.** A DNS-SD
 //! sub-query is started with an absolute anchor and a relative budget, and the

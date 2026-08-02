@@ -1763,6 +1763,88 @@ fn collected_answers_survive_terminal_until_cancel() {
   assert!(e.collected_answers(h).next().is_none());
 }
 
+/// A response processed after the query's absolute deadline is not collected,
+/// even though nothing has ended the query yet.
+///
+/// `handle` applies matching answers eagerly, and a driver whose receive side
+/// runs ahead of its timer pump reaches it while the query is still live:
+/// `hick-mio` drains receives before it fires timeouts, and `hick-reactor`
+/// drains queued packets first and prefers a packet to a simultaneously-ready
+/// timer. So `done` is still false at the moment a datagram from past the
+/// boundary is handed to the query. That is the ordering this screens, and
+/// screening it is what keeps the answer set from depending on which stage of a
+/// loop happens to run first.
+///
+/// The cap is 1, because the late answer's real cost is not that it appears: it
+/// is that the FIFO cap makes it EVICT the answer collected while the window was
+/// open, turning a laxity into a lost result.
+#[test]
+fn an_answer_processed_past_the_query_deadline_is_not_collected() {
+  use crate::{
+    config::QuerySpec,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceType},
+  };
+  use core::{net::SocketAddr, time::Duration};
+
+  /// Long enough that the first datagram is unambiguously inside the window.
+  const WINDOW: Duration = Duration::from_millis(100);
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let spec = QuerySpec::new(qname.clone(), ResourceType::A)
+    .with_timeout(WINDOW)
+    .with_max_answers(1);
+  let h = e.try_start_query(spec, now).unwrap();
+
+  let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let response = |addr: Ipv4Addr, buf: &mut [u8]| -> usize {
+    let mut hdr = Header::new();
+    hdr.flags_mut().set_response();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(buf, hdr).unwrap();
+    b.push_a_answer(&qname, 120, addr, false).unwrap();
+    b.finish().unwrap()
+  };
+
+  let mut buf = [0u8; 512];
+  let n = response(Ipv4Addr::new(10, 0, 0, 7), &mut buf);
+  let _ = e.handle(now, src, local_ip, 0, &buf[..n], false).unwrap().count();
+  assert_eq!(
+    e.collected_answers(h).count(),
+    1,
+    "an answer processed inside the window must be collected"
+  );
+
+  // Past the deadline, with no timer pump in between — the reachable ordering.
+  let after = now.checked_add(Duration::from_millis(300)).unwrap();
+  let n = response(Ipv4Addr::new(10, 0, 0, 8), &mut buf);
+  let _ = e
+    .handle(after, src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .count();
+
+  let answers: std::vec::Vec<_> = e.collected_answers(h).cloned().collect();
+  assert_eq!(
+    answers.len(),
+    1,
+    "a response processed past the deadline must not be collected; got {answers:?}"
+  );
+  assert_eq!(
+    answers[0].rdata_slice(),
+    &[10, 0, 0, 7],
+    "and it must not have evicted the answer the caller collected inside its \
+     window — that is the whole reason the boundary is enforced here rather \
+     than left to whichever driver stage runs first"
+  );
+  assert!(
+    e.poll_query(h).is_none(),
+    "refusing the late answer must not produce a terminal: the terminal belongs \
+     to handle_query_timeout"
+  );
+}
+
 // ── query state applied eagerly during handle ────────────────
 
 /// Dropping the `RouteEvents` iterator BEFORE iterating it must NOT

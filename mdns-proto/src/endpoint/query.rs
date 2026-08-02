@@ -201,10 +201,12 @@ where
   /// `clock` is the caller's monotonic source, and it is read INSIDE this call —
   /// after the handle is resolved, immediately before [`Query::poll_transmit`]
   /// weighs it against the `QuerySpec::with_timeout` deadline. That deadline
-  /// bounds ADMISSION: a question is admitted when this call returns it, so the
-  /// instant it is weighed against has to be the one this call returns on. What
-  /// the datagram then costs on the way to a wire is the driver's, and is what
-  /// `QuerySpec::with_timeout` bounds instead of pretending to eliminate.
+  /// bounds ADMISSION, and admission is that comparison rather than this call's
+  /// return: the reading has to be taken where the decision is, because
+  /// everything before it — the handle resolution here most of all — is time a
+  /// reading taken earlier would not know about. What the datagram then costs on
+  /// the way to a wire is the driver's, and is what `QuerySpec::with_timeout`
+  /// bounds instead of pretending to eliminate.
   ///
   /// An instant parameter could not be: resolving `handle` walks the query pool,
   /// which has no capacity bound, so a value sampled before this call can be
