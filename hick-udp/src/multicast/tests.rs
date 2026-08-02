@@ -462,6 +462,161 @@ fn cmsg_iter_is_sound_on_crafted_and_unaligned_input() {
   assert!(items[0].is_ok());
 }
 
+/// Regression test: a malformed header must fuse the iterator, not just
+/// return an `Err` from the call that found it.
+///
+/// Every in-crate caller of `CmsgIter` bails on the first `Err` (via `?`,
+/// `.ok()?`, or `let Ok(..) else { break }`), so this drives it through
+/// `.collect()` instead — a consumer that does NOT stop at the first `Err`
+/// and would have looped forever before `next()` cleared `rest` on both
+/// error paths, since `cmsg_len` was the only way to find the next header
+/// and the same unusable header was re-read on every call.
+///
+/// Covers the two length checks; the third non-progress path — a stride
+/// computation that cannot advance past the header it was meant to skip —
+/// is covered directly against `cmsg_advance` instead
+/// (`cmsg_advance_rejects_a_u32_wrapped_stride` and
+/// `cmsg_advance_holds_across_the_reachable_domain_below_64_bit`): reaching
+/// it through `CmsgIter` itself needs a real multi-gigabyte buffer, which
+/// `cmsg_advance` exists precisely to make unnecessary.
+#[cfg(unix)]
+#[test]
+#[allow(unsafe_code)]
+fn cmsg_iter_fuses_after_malformed_header() {
+  let hdr_size = core::mem::size_of::<libc::cmsghdr>();
+  let bytes_of = |h: &libc::cmsghdr| -> std::vec::Vec<u8> {
+    // SAFETY: read exactly `size_of::<cmsghdr>()` bytes of a live cmsghdr.
+    unsafe {
+      core::slice::from_raw_parts((h as *const libc::cmsghdr).cast::<u8>(), hdr_size).to_vec()
+    }
+  };
+
+  // Path 1: cmsg_len < hdr_size.
+  let zeroed: libc::cmsghdr = unsafe { core::mem::zeroed() };
+  let short = bytes_of(&zeroed);
+  let items: std::vec::Vec<_> = CmsgIter::new(&short).collect();
+  assert_eq!(
+    items.len(),
+    1,
+    "a too-short cmsg_len must yield exactly one item, not hang"
+  );
+  assert!(items[0].is_err());
+
+  // Path 2: cmsg_len > rest.len().
+  let mut big: libc::cmsghdr = unsafe { core::mem::zeroed() };
+  big.cmsg_len = (hdr_size + 4096) as _;
+  let long = bytes_of(&big);
+  let items: std::vec::Vec<_> = CmsgIter::new(&long).collect();
+  assert_eq!(
+    items.len(),
+    1,
+    "an oversized cmsg_len must yield exactly one item, not hang"
+  );
+  assert!(items[0].is_err());
+}
+
+/// `cmsg_advance` must advance by exactly `CMSG_SPACE(datalen)` for an
+/// ordinary, small payload — same value the crate's own builder/parser
+/// agreement above relies on. Portable: unlike the u32-boundary cases below,
+/// nothing here depends on the target's pointer width.
+#[cfg(unix)]
+#[test]
+fn cmsg_advance_matches_the_normal_stride() {
+  let data_start = cmsg_data_offset();
+  let normal_datalen = 4usize;
+  assert_eq!(
+    cmsg_advance(data_start + normal_datalen, data_start),
+    Some(cmsg_stride(normal_datalen)),
+    "a normal payload length must produce the libc-computed stride"
+  );
+}
+
+/// Direct tests of `cmsg_advance`'s `u32`-overflow boundary — the arithmetic
+/// `CmsgIter::next` relies on to know it may trust a computed stride,
+/// checked here without allocating anything.
+///
+/// `libc::CMSG_SPACE` takes and returns a `c_uint` (32 bits) but aligns in
+/// `usize` — 64 bits here — before truncating the sum back on return, so a
+/// `datalen` near `u32::MAX` overflows only at that final truncation,
+/// wrapping the returned stride to something smaller than the header it was
+/// meant to skip, including exactly zero.
+///
+/// 64-bit only: reaching any of these `cmsg_len` values needs a real slice
+/// at least that long (`cmsg_len <= rest.len()` is enforced by the caller),
+/// and on a narrower target no slice can be long enough — see
+/// `cmsg_advance_holds_across_the_reachable_domain_below_64_bit`. The
+/// `usize` arithmetic these cases construct their inputs with (e.g.
+/// `u32::MAX as usize + 1`) also overflows `usize` itself on a target where
+/// `usize` is only 32 bits, which is the other reason this is 64-bit-only.
+#[cfg(unix)]
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn cmsg_advance_rejects_a_u32_wrapped_stride() {
+  let data_start = cmsg_data_offset();
+
+  // datalen == u32::MAX: ALIGN(u32::MAX) rounds up to exactly 2**32 under
+  // any power-of-two alignment (0xFFFF_FFFF is one less than any such
+  // alignment), so CMSG_SPACE(u32::MAX) truncates to precisely `data_start`
+  // — always < cmsg_len, so it must be rejected rather than read as a
+  // `data_start`-sized advance.
+  let at_u32_max = u32::MAX as usize;
+  assert_eq!(
+    cmsg_advance(data_start + at_u32_max, data_start),
+    None,
+    "datalen == u32::MAX must be rejected, not treated as a valid stride"
+  );
+
+  // datalen one past u32::MAX: does not fit the `c_uint` CMSG_SPACE takes at
+  // all, so it must be rejected before any libc call.
+  let past_u32_max = u32::MAX as usize + 1;
+  assert_eq!(
+    cmsg_advance(data_start + past_u32_max, data_start),
+    None,
+    "a datalen that overflows c_uint must be rejected"
+  );
+
+  // A datalen chosen so CMSG_SPACE's truncation lands on exactly zero:
+  // ALIGN(datalen) == 2**32 - data_start (itself already ALIGN'd, since
+  // data_start is), so + data_start truncates to 0 exactly. `advance == 0`
+  // must be rejected, not read as "advance by nothing and try again" — the
+  // caller has no other way to make progress.
+  let wraps_to_zero = (u32::MAX - data_start as u32 + 1) as usize;
+  assert_eq!(
+    cmsg_advance(data_start + wraps_to_zero, data_start),
+    None,
+    "a datalen that wraps CMSG_SPACE to zero must be rejected"
+  );
+}
+
+/// The `cmsg_advance` invariant (`advance >= cmsg_len`) holds across the
+/// entire domain a target with a narrower-than-64-bit `usize` can actually
+/// reach, checked at that domain's own upper edge.
+///
+/// No safe Rust slice can be longer than `isize::MAX` bytes — a
+/// language-wide invariant, not specific to this crate — so `rest.len()`,
+/// and therefore any `cmsg_len` a real `CmsgIter` could ever see, is bounded
+/// by `isize::MAX`. On a 32-bit target that is roughly 2 GiB: far short of
+/// the ~4 GiB `datalen` needs to reach the `u32` boundary in
+/// `cmsg_advance_rejects_a_u32_wrapped_stride`, so `CMSG_SPACE` never
+/// overflows for any `cmsg_len` reachable here. This is what makes the
+/// production path safe on such a target without any extra guard: the
+/// bound comes from what a slice can be, not from the arithmetic itself.
+#[cfg(unix)]
+#[cfg(not(target_pointer_width = "64"))]
+#[test]
+fn cmsg_advance_holds_across_the_reachable_domain_below_64_bit() {
+  let data_start = cmsg_data_offset();
+  let largest_reachable_cmsg_len = isize::MAX as usize;
+  let advance = cmsg_advance(largest_reachable_cmsg_len, data_start).expect(
+    "the largest cmsg_len any real slice could carry on this target must still be a valid stride",
+  );
+  assert!(
+    advance >= largest_reachable_cmsg_len,
+    "advance ({advance}) must reach at least as far as the largest reachable cmsg_len \
+     ({largest_reachable_cmsg_len})"
+  );
+}
+
 /// Regression test for the library-side `IPV6_MULTICAST_HOPS` read-back
 /// verification's COMPARISON logic (`verify_multicast_hops_v6`, wired into
 /// `try_bind_v6_inner` right after `platform::set_multicast_hops_v6`).
