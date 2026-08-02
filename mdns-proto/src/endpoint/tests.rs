@@ -1845,16 +1845,21 @@ fn an_answer_processed_past_the_query_deadline_is_not_collected() {
   );
 }
 
-/// The routing fan-out must withhold the answer the same datagram's collection
-/// refused — on the Answer section and on the Additional section alike.
+/// The routing fan-out must withhold a record refused for standing past the
+/// CALLER's window — on the Answer section and on the Additional section alike.
 ///
 /// The two sites observe one fact about one record. `handle` applies the answer
 /// eagerly and refuses it, while the query deliberately stays LIVE until its own
-/// timer fires — so `is_done` and `terminal_emitted`, the only screens the
-/// fan-out applies on its own, are both false at exactly the moment the
-/// collection was refused. A `ToQuery` emitted there reports an accepted answer
-/// that no caller can find in `collected_answers`, and carries nothing to tell
-/// it apart from one that was accepted.
+/// timer fires — so `is_done` and `terminal_emitted`, the only other screens the
+/// fan-out applies, are both false at exactly the moment the collection was
+/// refused. A `ToQuery` emitted there points at nothing a caller can find in
+/// `collected_answers`, and carries nothing to tell it apart from a record the
+/// query kept.
+///
+/// This is the window and only the window: the fan-out screens none of
+/// `handle_event`'s own grounds for declining, which
+/// `an_uncollected_answer_is_still_routed_to_its_query` pins from the other
+/// side.
 ///
 /// Exactly ON the boundary, which is where `now >= deadline` differs from
 /// `now > deadline`, and each section is weighed twice: once inside the window,
@@ -1999,6 +2004,77 @@ fn a_refused_answer_is_not_routed_to_its_query() {
     e.poll_query(h).is_none(),
     "withholding the routing must not produce a terminal either: the terminal \
      belongs to handle_query_timeout"
+  );
+}
+
+/// `ToQuery` reports that a query was OFFERED a record, not that it kept one,
+/// and the fan-out's four screens are exactly that offer.
+///
+/// A `QuerySpec::with_max_answers` cap of zero is the cheapest witness: the
+/// query has not ended, has taken no terminal, sits well inside its caller's
+/// window, and the record matches its name, type and class — every screen the
+/// fan-out has — while `Query::handle_event` collects nothing. The other grounds
+/// on which collection declines (undecodable rdata, a duplicate, a full pool)
+/// differ only in which of `handle_event`'s filters fires; each would re-exercise
+/// the same divergence this one already pins.
+///
+/// BOTH halves are asserted, because a change that stopped the fan-out routing
+/// altogether would satisfy the empty answer set on its own.
+#[test]
+fn an_uncollected_answer_is_still_routed_to_its_query() {
+  use crate::{
+    config::QuerySpec,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceType},
+  };
+  use core::{net::SocketAddr, time::Duration};
+
+  /// Long enough that the datagram lands unambiguously inside the window, so the
+  /// caller-window screen is not what this test turns on.
+  const WINDOW: Duration = Duration::from_millis(100);
+
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let qname = Name::try_from_str("printer.local.").unwrap();
+  let h = e
+    .try_start_query(
+      QuerySpec::new(qname.clone(), ResourceType::A)
+        .with_timeout(WINDOW)
+        .with_max_answers(0),
+      now,
+    )
+    .unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  b.push_a_answer(&qname, 120, Ipv4Addr::new(10, 0, 0, 7), false)
+    .unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let to_query: std::vec::Vec<_> = e
+    .handle(now, src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .map(Result::unwrap)
+    .filter_map(|ev| match ev {
+      RouteEvent::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_)) => Some(tq.handle()),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    to_query,
+    [h],
+    "an in-window matching answer must still be routed to the query it matches, \
+     whatever that query then does with it"
+  );
+  assert_eq!(
+    e.collected_answers(h).count(),
+    0,
+    "and a zero max_answers cap keeps none of it: the routed event is an offer, \
+     not a receipt"
   );
 }
 

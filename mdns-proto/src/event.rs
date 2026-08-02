@@ -247,11 +247,35 @@ pub enum RouteEvent<'a> {
   ToService(ToService<'a>),
   /// Route the event to the matched query.
   ///
-  /// Informational: `Endpoint::handle` has already applied the answer to the
-  /// query it names. One is yielded only for an answer that query actually
-  /// took — a record refused because the caller's `QuerySpec::with_timeout`
-  /// window had shut is not announced here, so a consumer never sees a routing
-  /// decision it cannot find the result of.
+  /// Informational: `Endpoint::handle` has already offered this record to the
+  /// query named here, so delivering the event applies nothing.
+  ///
+  /// # What the fan-out screened
+  ///
+  /// One is yielded only for a query that passed all four of the fan-out's
+  /// screens, weighed as of the `now` that `Endpoint::handle` processed the
+  /// datagram at: the query had not ended; its terminal `QueryUpdate` had not
+  /// already been taken by `Endpoint::poll_query`; the caller's
+  /// `QuerySpec::with_timeout` window was still open; and the record matched the
+  /// query's name, type and class.
+  ///
+  /// The window screen is the same comparison, against the same reading, that
+  /// `Query::handle_event` weighed this record on — so a record refused for
+  /// standing past that window is never announced here.
+  ///
+  /// # What it does NOT imply
+  ///
+  /// Those four decide that the query was OFFERED the record. Whether it KEPT
+  /// one is `Query::handle_event`'s separate decision, and that decision
+  /// declines for reasons no screen above looks at: a
+  /// `QuerySpec::with_max_answers` cap of zero, rdata carrying a domain name
+  /// that will not decode, a (type, class, rdata) triple the query already
+  /// holds, and an answer pool with no room even after evicting its oldest
+  /// entry. At the cap, a record that IS kept also evicts one that was, which no
+  /// event reports either.
+  ///
+  /// So this is a routing decision and not a receipt. A consumer that needs to
+  /// know what a query holds must read `Endpoint::collected_answers`.
   ToQuery(ToQuery<'a>),
   /// The endpoint cache observed new or refreshed records as a side effect
   /// of this datagram. Callers can use this as a hint to re-poll queries.

@@ -383,11 +383,14 @@ where
   /// One comparison behind every refusal that bound produces, so the sites that
   /// observe the same fact cannot drift apart: [`Self::handle_event`] refuses the
   /// answer, [`Self::note_duplicate_question`] refuses the RFC 6762 §7.3 slot,
-  /// and the endpoint's routing iterator withholds the informational fan-out for
-  /// the answer `handle_event` has just refused. [`Self::handle_timeout`] takes
-  /// the terminal on the same `now >= deadline` boundary and `terminate` then
-  /// CLEARS the deadline, which is why callers check `done` beside this rather
-  /// than expecting it to answer for a query that has already ended.
+  /// and the endpoint's routing iterator withholds the informational fan-out from
+  /// a query standing past the boundary. That last site mirrors THIS refusal and
+  /// no other — it still announces records `handle_event` declined on its own
+  /// terms, which is why [`crate::RouteEvent::ToQuery`] documents itself as a
+  /// routing decision rather than a receipt. [`Self::handle_timeout`] takes the
+  /// terminal on the same `now >= deadline` boundary and `terminate` then CLEARS
+  /// the deadline, which is why callers check `done` beside this rather than
+  /// expecting it to answer for a query that has already ended.
   #[inline]
   pub(crate) fn caller_window_shut(&self, now: I) -> bool {
     self.timeout_deadline.is_some_and(|deadline| now >= deadline)

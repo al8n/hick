@@ -30,11 +30,21 @@ where
   /// Without it the two sites disagree about one datagram: `handle` applies and
   /// refuses a late answer eagerly, while the query intentionally stays live
   /// until its own timer fires — so the fan-out below, which screens only
-  /// `is_done` / `terminal_emitted`, would announce a record the query did not
-  /// take. These events are informational, so that is a report of an answer no
-  /// caller can find in `collected_answers` rather than a state change; the
-  /// remedy is the same either way, because a consumer cannot tell such a report
-  /// apart from an accepted one.
+  /// `is_done` / `terminal_emitted`, would announce a record refused for
+  /// standing past a boundary the CALLER set. These events are informational, so
+  /// that is a report of an answer no caller can find in `collected_answers`
+  /// rather than a state change; the remedy is the same either way, because a
+  /// consumer cannot tell such a report apart from an accepted one.
+  ///
+  /// This aligns the two sites on the caller's window and on nothing else.
+  /// `Query::handle_event` also declines records on its own terms — a zero
+  /// `max_answers` cap, a duplicate, undecodable rdata, a full answer pool — and
+  /// the fan-out screens none of those, which is why [`RouteEvent::ToQuery`]
+  /// states an offer rather than a receipt. The window is the one worth
+  /// mirroring: a consumer can re-derive the others from the event's own record
+  /// and the cap it configured, while this one turns on a reading taken inside
+  /// `handle` — invisible from outside, so leaving it unmirrored would let a
+  /// driver's tick order decide what the consumer is told.
   ///
   /// It is not re-read per record. The datagram is one event with one processing
   /// instant, which is what keeps its cache writes, its collections and this
