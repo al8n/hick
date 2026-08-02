@@ -106,6 +106,139 @@ cfg_heap! {
   #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
   pub struct WithdrawalToken(u64);
 
+  /// Which address families a withdrawal round is actually FOR — the per-family
+  /// RFC 6762 §10.1 goodbye debt still outstanding on the item
+  /// [`Endpoint::poll_withdrawal_transmit`] just encoded.
+  ///
+  /// A driver fans one goodbye datagram onto every family it has bound, but the
+  /// debt is per family while the resend schedule is per ITEM: once one family has
+  /// paid every round it owed and the other is still failing, the item keeps being
+  /// selected for the sake of the family that still owes. Offering the paid family
+  /// those rounds retracts records nothing still advertises. That is wire noise
+  /// rather than a §10.1 violation — the standard permits the repeats — but it is
+  /// noise the core can rule out for free, since the core is the thing that knows.
+  ///
+  /// # Why an opaque token works here
+  ///
+  /// Same shape as [`FullyAnnounced`]: `Copy`, no
+  /// public constructor, accessors only. A driver reads one; a driver cannot mint
+  /// one. That is sound HERE — and not for a send outcome — because outstanding
+  /// debt is a fact the **core** owns and spends. A driver has nothing to
+  /// contribute to it and no reason to synthesise one, so making the type
+  /// unforgeable takes nothing away. A send outcome is the mirror case: the driver
+  /// is the only witness, so an unforgeable one would be unconstructible by the
+  /// only party that knows the answer.
+  ///
+  /// # Booleans, not counts
+  ///
+  /// Each family answers "does it still owe a goodbye", not "how many". One round
+  /// puts at most one datagram on one family's wire, so the count above zero is
+  /// never actionable at a fan-out — and publishing it would export the §10.1
+  /// budget itself, inviting a driver to re-derive "has this family finished?"
+  /// from its own copy of a constant the core owns. That reconstruction is exactly
+  /// the driver-side shadow this type exists to make unnecessary.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  #[must_use]
+  pub struct FamilyDebt {
+    v4: bool,
+    v6: bool,
+  }
+
+  impl FamilyDebt {
+    /// Project an item's raw per-family budget onto the owed/paid question.
+    /// Crate-internal: [`Endpoint::poll_withdrawal_transmit`] is the sole caller,
+    /// which is what makes the type unforgeable outside this crate.
+    #[inline(always)]
+    pub(crate) const fn new(owed: [u8; 2]) -> Self {
+      let [v4, v6] = owed;
+      Self {
+        v4: v4 > 0,
+        v6: v6 > 0,
+      }
+    }
+
+    /// Whether IPv4 still owes a goodbye for this item.
+    #[inline(always)]
+    pub const fn v4_owed(self) -> bool {
+      self.v4
+    }
+
+    /// Whether IPv6 still owes a goodbye for this item.
+    #[inline(always)]
+    pub const fn v6_owed(self) -> bool {
+      self.v6
+    }
+  }
+
+  /// One due RFC 6762 §10.1 goodbye datagram, as returned by
+  /// [`Endpoint::poll_withdrawal_transmit`].
+  ///
+  /// A named struct rather than a tuple because the fourth member is the one a
+  /// driver most easily ignores: [`Self::debt`] says which families the round is
+  /// actually for, and a positional `.3` is a poorer prompt to consult it than a
+  /// name is. Carrying it ON the transmit — rather than offering it beside one —
+  /// is what makes consulting it non-optional: there is no call a driver can
+  /// forget to make.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  #[must_use]
+  pub struct WithdrawalTransmit {
+    dst: SocketAddr,
+    len: usize,
+    token: WithdrawalToken,
+    debt: FamilyDebt,
+  }
+
+  // No `is_empty` beside `len`: a returned round always carries a goodbye — the
+  // pump completes an item with nothing to retract in place rather than handing
+  // it out — so the method could only ever answer `false`. Stating the invariant
+  // here is worth more than a public question with one possible answer.
+  #[allow(clippy::len_without_is_empty)]
+  impl WithdrawalTransmit {
+    /// Crate-internal: only the withdrawal pump may describe a round, since both
+    /// [`WithdrawalToken`] and [`FamilyDebt`] are core-owned facts.
+    #[inline(always)]
+    pub(crate) const fn new(
+      dst: SocketAddr,
+      len: usize,
+      token: WithdrawalToken,
+      debt: FamilyDebt,
+    ) -> Self {
+      Self {
+        dst,
+        len,
+        token,
+        debt,
+      }
+    }
+
+    /// The multicast destination marker. The core always names the IPv4 group and
+    /// leaves the fan-out to the driver, which retracts on every group it joined.
+    #[inline(always)]
+    pub const fn dst(&self) -> SocketAddr {
+      self.dst
+    }
+
+    /// Bytes written into the caller-supplied scratch buffer. Never zero.
+    #[inline(always)]
+    pub const fn len(&self) -> usize {
+      self.len
+    }
+
+    /// The item this round belongs to, to be round-tripped to
+    /// [`Endpoint::note_withdrawal_result`].
+    #[inline(always)]
+    pub const fn token(&self) -> WithdrawalToken {
+      self.token
+    }
+
+    /// Which families still owe a goodbye for this item — the families this round
+    /// is for. See [`FamilyDebt`].
+    #[inline(always)]
+    pub const fn debt(&self) -> FamilyDebt {
+      self.debt
+    }
+  }
+
   /// In-progress withdrawal state for ONE name (one TTL=0 goodbye lifecycle).
   /// Stored in [`Endpoint::withdrawals`] keyed by an opaque [`WithdrawalToken`].
   /// The `I` type parameter is the [`Instant`] type of the enclosing endpoint.

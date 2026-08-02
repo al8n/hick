@@ -20,7 +20,7 @@ use slab::Slab;
 
 use crate::{
   discovery::{LookupHandle, Lookups},
-  driver::{FamilyWireGate, GoodbyeLedger, SendHealth, TxQueue, TxSlot},
+  driver::{FamilyWireGate, SendHealth, TxQueue, TxSlot},
   error::{RegisterError, ServerError, StartQueryError},
   event::{Event, EventQueue},
   onlink::collect_local_subnets,
@@ -194,11 +194,6 @@ pub struct Mdns {
   /// [`mdns_proto::Endpoint::drain_completed_withdrawals`] and drained into the
   /// context GC.
   pub(crate) completed_scratch: Vec<ServiceHandle>,
-  /// Which families each in-flight RFC 6762 §10.1 goodbye still owes a round,
-  /// so a family that has paid is not offered the next one. See
-  /// [`GoodbyeLedger`] — it is a projection of the endpoint's own per-family
-  /// debt, and emphatically not a pending-send table.
-  pub(crate) goodbye_ledger: GoodbyeLedger,
   /// Work the driver knows is due **now** and that no deadline announces, so
   /// [`Mdns::next_timeout`] must not let the caller sleep on it.
   ///
@@ -346,7 +341,6 @@ impl Mdns {
       tx_queue: TxQueue::new(),
       retired_scratch: Vec::new(),
       completed_scratch: Vec::new(),
-      goodbye_ledger: GoodbyeLedger::new(),
       work_pending: false,
       shutting_down: false,
       #[cfg(feature = "stats")]

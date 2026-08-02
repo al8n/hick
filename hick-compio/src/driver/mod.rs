@@ -15,8 +15,8 @@ use hick_trace::*;
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
   FamilyDelivery, QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate,
-  TransmitDelivery, WithdrawalSend, WithdrawalToken, query::Query as ProtoQuery,
-  service::Service as ProtoSvc, transmit::Transmit,
+  TransmitDelivery, WithdrawalSend, WithdrawalToken, WithdrawalTransmit,
+  query::Query as ProtoQuery, service::Service as ProtoSvc, transmit::Transmit,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -452,17 +452,18 @@ impl State {
   }
 
   /// Pump every due endpoint-owned withdrawal datagram into `scratch`, returning
-  /// `Some((dst, len, token))` for ONE due TTL=0 goodbye or `None` when none is
-  /// due. Mirrors [`Self::poll_one_transmit`]: the run loop sends `scratch[..len]`
-  /// (fanned to BOTH families — `dst` is always the IPv4 multicast marker) and
-  /// then confirms via [`Self::note_withdrawal_result`], round-tripping the opaque
-  /// [`WithdrawalToken`]. The endpoint encodes the goodbye with fresh sibling
-  /// host-address retention computed internally.
+  /// the [`WithdrawalTransmit`] describing ONE due TTL=0 goodbye or `None` when
+  /// none is due. Mirrors [`Self::poll_one_transmit`]: the run loop sends
+  /// `scratch[..len]` — fanned to every family
+  /// [`WithdrawalTransmit::debt`] still names, `dst` always being the IPv4
+  /// multicast marker — and then confirms via [`Self::note_withdrawal_result`],
+  /// round-tripping the opaque [`WithdrawalToken`]. The endpoint encodes the
+  /// goodbye with fresh sibling host-address retention computed internally.
   pub(crate) fn poll_one_withdrawal(
     &mut self,
     now: StdInstant,
     scratch: &mut [u8],
-  ) -> Option<(SocketAddr, usize, WithdrawalToken)> {
+  ) -> Option<WithdrawalTransmit> {
     self.endpoint.poll_withdrawal_transmit(now, scratch)
   }
 
@@ -2016,8 +2017,14 @@ const FAMILY_V6: usize = 1;
 enum SendAttempt {
   /// No socket bound for this family, so it was never offered the datagram.
   Unbound,
-  /// A bound socket the per-family wire gate held back for this round; no
-  /// operation was submitted. See [`FamilyWireGate`].
+  /// A bound socket this driver deliberately did not offer the datagram to; no
+  /// operation was submitted, so nothing about the transport was observed.
+  ///
+  /// Two callers withhold, for two reasons. A transmit is held back by the
+  /// per-family wire gate ([`FamilyWireGate`]) until this family's wire has been
+  /// left alone long enough. An RFC 6762 §10.1 goodbye is held back when the
+  /// core's [`mdns_proto::endpoint::FamilyDebt`] says this family has already
+  /// retracted everything the item withdraws.
   Gated,
   /// The socket completed the send, carrying the `send_to` result and THREE
   /// separate clock reads.
@@ -2098,7 +2105,8 @@ impl SendAttempt {
 /// Offer one family its copy of the datagram and await the operation's true
 /// completion. An absent socket is [`SendAttempt::Unbound`] — that family was
 /// never obligated — and is answered without touching the clock, as is a family
-/// whose wire gate is shut (`may_send == false`).
+/// the caller withheld it from (`may_send == false`): a shut wire gate on the
+/// transmit path, an already-paid goodbye debt on the withdrawal path.
 ///
 /// There is deliberately no bound on the wait. compio is completion-based, so the
 /// operation is handed to the kernel before any wait begins and abandoning the
@@ -2158,8 +2166,8 @@ fn note_multicast_attempt(
   _kind: &'static str,
 ) {
   match attempt {
-    // Neither put bytes on a wire, and neither is an error: no socket, or this
-    // driver's own deliberate spacing.
+    // Neither put bytes on a wire, and neither is an error: no socket, or a
+    // family this driver deliberately withheld the datagram from.
     SendAttempt::Unbound | SendAttempt::Gated => {}
     SendAttempt::Answered {
       result: Ok(_),
@@ -2416,15 +2424,15 @@ fn present_socket_send_outcome<T>(res: &std::io::Result<T>) -> WithdrawalSend {
 }
 
 /// Pump every DUE endpoint-owned RFC 6762 §10.1 withdrawal goodbye once, fanning
-/// each out to both bound multicast families, then free + GC every completed
-/// withdrawal.
+/// each out to every bound multicast family that still owes it, then free + GC
+/// every completed withdrawal.
 ///
 /// Borrow discipline (mirrors the run loop's transmit pump): pull ONE due
-/// `(dst, len, handle)` under a brief `borrow_mut` (`poll_one_withdrawal` encodes
-/// the goodbye into `scratch`), send `scratch[..len]` to BOTH families under NO
-/// borrow, then under another brief borrow report the result via
-/// `note_withdrawal_result` and bump per-round stats. `dst` is always the IPv4
-/// multicast marker; the driver fans to every bound family regardless. The
+/// [`WithdrawalTransmit`] under a brief `borrow_mut` (`poll_one_withdrawal`
+/// encodes the goodbye into `scratch`), send `scratch[..len]` to the families its
+/// debt names under NO borrow, then under another brief borrow report the result
+/// via `note_withdrawal_result` and bump per-round stats. `dst` is always the
+/// IPv4 multicast marker, so the fan-out reads the debt rather than it. The
 /// endpoint owns the resend schedule — a delivered round spends one resend; a
 /// fully-failed round is re-armed (short backoff) WITHOUT spending — so this
 /// drains at most one round per withdrawal per call and cannot busy-spin.
@@ -2444,7 +2452,16 @@ fn present_socket_send_outcome<T>(res: &std::io::Result<T>) -> WithdrawalSend {
 ///     permanent write-off would free the route after the OTHER family drains and
 ///     leave this family's peers pinned to stale positive-TTL records;
 ///   * absent socket (family not bound) → [`WithdrawalSend::WriteOff`] (no reachable
-///     peers on it), so its debt never pins the withdrawal past the other family.
+///     peers on it), so its debt never pins the withdrawal past the other family;
+///   * withheld because [`WithdrawalTransmit::debt`] says this family has already
+///     retracted everything the item withdraws → [`WithdrawalSend::Retry`], which
+///     leaves both its (already-zero) debt and the item's schedule untouched.
+///
+/// That last row is what keeps a paid family off the wire. An item stays
+/// selectable while EITHER family owes, so a paid one would otherwise be handed
+/// every round the other family's retries produce — a retraction of records no
+/// peer on that family still holds, arriving at whatever cadence the other
+/// family's failures set rather than at the §10.1 interval.
 ///
 /// Shares the pass's [`DrainBudget`] with the transmit pump — the wall clock is
 /// per PASS, and a goodbye deferred by an exhausted budget is re-armed by the
@@ -2473,11 +2490,12 @@ async fn drain_withdrawals(
       let now = StdInstant::now();
       s.poll_one_withdrawal(now, scratch)
     };
-    let Some((_dst, len, token)) = due else {
+    let Some(round) = due else {
       break;
     };
+    let (len, token, debt) = (round.len(), round.token(), round.debt());
     budget.charge();
-    // Fan out to every bound family on the mDNS multicast group, concurrently,
+    // Fan out to every bound family the round's debt still names, concurrently,
     // for the same reason the positive-TTL fan-out is: serialising them would
     // make each family's latency the other's.
     //
@@ -2486,14 +2504,26 @@ async fn drain_withdrawals(
     // has withdrawn its records. A family with no bound socket is `WriteOff` (no
     // peers reachable on it to withdraw from) so its debt never pins the other.
     //
-    // Ungated: a TTL=0 goodbye's repeat schedule is the endpoint's
+    // No WIRE gate: a TTL=0 goodbye's repeat schedule is the endpoint's
     // (`note_withdrawal_result`), which already spaces the resends, and holding
-    // one back here would leave a family's peers pinned to positive-TTL records
-    // it has already been promised the retraction of.
+    // one back for spacing would leave a family's peers pinned to positive-TTL
+    // records it has already been promised the retraction of. What `may_send`
+    // carries here is the core's own per-family DEBT instead — a family it
+    // withholds owes nothing, so there is no retraction being delayed.
     let (a4, a6) = awaiting_fanout(
       futures::future::join(
-        attempt_send_to(sock_v4.as_deref(), true, &scratch[..len], MDNS_V4_DST),
-        attempt_send_to(sock_v6.as_deref(), true, &scratch[..len], MDNS_V6_DST),
+        attempt_send_to(
+          sock_v4.as_deref(),
+          debt.v4_owed(),
+          &scratch[..len],
+          MDNS_V4_DST,
+        ),
+        attempt_send_to(
+          sock_v6.as_deref(),
+          debt.v6_owed(),
+          &scratch[..len],
+          MDNS_V6_DST,
+        ),
       ),
       "withdrawal",
     )
@@ -2501,8 +2531,9 @@ async fn drain_withdrawals(
     let outcome = |attempt: &SendAttempt| match attempt {
       SendAttempt::Unbound => WithdrawalSend::WriteOff,
       SendAttempt::Answered { result, .. } => present_socket_send_outcome(result),
-      // `Gated` is unreachable: this fan-out passes `may_send == true` for both
-      // families.
+      // Withheld because this family has already paid every round it owed. No
+      // syscall was made and nothing was observed, so keep its (already-zero)
+      // debt rather than claiming a send or writing it off.
       SendAttempt::Gated => WithdrawalSend::Retry,
     };
     let (v4_out, v6_out) = (outcome(&a4), outcome(&a6));

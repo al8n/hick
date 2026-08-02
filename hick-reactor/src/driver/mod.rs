@@ -14,7 +14,9 @@ use async_channel::Sender;
 use futures::{FutureExt, pin_mut, select_biased};
 use mdns_proto::{
   FamilyDelivery, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate,
-  TransmitDelivery, endpoint::WithdrawalSend, event::RouteEvent,
+  TransmitDelivery,
+  endpoint::{FamilyDebt, WithdrawalSend},
+  event::RouteEvent,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -1309,26 +1311,29 @@ impl<N: Net> DriverState<N> {
     } = self;
     let mut more_pending = false;
     while budget.may_start_fanout() {
-      let Some((dst, len, token)) = endpoint.poll_withdrawal_transmit(now, scratch) else {
+      let Some(round) = endpoint.poll_withdrawal_transmit(now, scratch) else {
         break;
       };
+      let (len, token) = (round.len(), round.token());
       // The endpoint always returns the multicast marker; the driver fans the
-      // datagram to both groups regardless. Assert the contract in debug builds.
+      // datagram to every group the round's debt still names. Assert the contract
+      // in debug builds.
       debug_assert!(
-        matches!(dst, SocketAddr::V4(v4a) if v4a.ip().is_multicast() && v4a.port() == 5353),
+        matches!(round.dst(), SocketAddr::V4(v4a) if v4a.ip().is_multicast() && v4a.port() == 5353),
         "withdrawal dst must be the IPv4 multicast marker"
       );
-      let _ = dst;
-      // Fan to both families and capture EACH family's outcome so the endpoint
-      // tracks per-family debt: a withdrawal frees only once every reachable
-      // family has withdrawn its records. `send_withdrawal_via` already bumps
-      // packets_tx/bytes_tx per Sent family and send_errors per failed family, so
-      // here we add only the per-round goodbyes_tx (one per DELIVERED round).
+      // Fan to the families the round is FOR and capture EACH one's outcome so the
+      // endpoint tracks per-family debt: a withdrawal frees only once every
+      // reachable family has withdrawn its records. `send_withdrawal_via` already
+      // bumps packets_tx/bytes_tx per Sent family and send_errors per failed
+      // family, so here we add only the per-round goodbyes_tx (one per DELIVERED
+      // round).
       let (v4_out, v6_out) = send_withdrawal_via(
         recent_sends,
         v4,
         v6,
         &scratch[..len],
+        round.debt(),
         #[cfg(feature = "stats")]
         &stats,
       )
@@ -2324,9 +2329,10 @@ async fn send_via<S: UdpSocket>(
   (fanout, attempt.accepted_at())
 }
 
-/// Fan ONE endpoint-owned withdrawal (TTL=0 goodbye) datagram out to BOTH bound
-/// multicast families and report EACH family's [`WithdrawalSend`] outcome so the
-/// endpoint tracks per-family debt. Mirrors [`send_via`]'s multicast branch
+/// Fan ONE endpoint-owned withdrawal (TTL=0 goodbye) datagram out to every bound
+/// multicast family `debt` still names, and report EACH family's
+/// [`WithdrawalSend`] outcome so the endpoint tracks per-family debt.
+/// Mirrors [`send_via`]'s multicast branch
 /// (same self-send tracking and `packets_tx`/`bytes_tx`/`send_errors` accounting)
 /// distinguishing a PRESENT family's send result from an ABSENT socket. The
 /// mapping is by socket presence, not error kind:
@@ -2341,16 +2347,33 @@ async fn send_via<S: UdpSocket>(
 ///   * absent socket (family not bound) → [`WithdrawalSend::WriteOff`] (no reachable
 ///     peers on it), so its debt never pins the withdrawal past the other family.
 ///
-/// Both families are offered the goodbye concurrently and each attempt is bounded
-/// by [`SEND_ATTEMPT_TIMEOUT`], for the same reason the positive-TTL fan-out is:
-/// this pump runs in the driver loop, so a family that never accepts would park
-/// every timer and every command behind it indefinitely. A bound that expires
-/// keeps the debt ([`WithdrawalSend::Retry`]) exactly as a transient error does.
+/// Every family the goodbye is offered to is offered it concurrently, and each
+/// attempt is bounded by [`SEND_ATTEMPT_TIMEOUT`], for the same reason the
+/// positive-TTL fan-out is: this pump runs in the driver loop, so a family that
+/// never accepts would park every timer and every command behind it indefinitely.
+/// A bound that expires keeps the debt ([`WithdrawalSend::Retry`]) exactly as a
+/// transient error does.
+///
+/// # `debt` decides which families are offered it at all
+///
+/// NOT a wire gate — there is deliberately none here (see the ungating note
+/// below). It is the core's own per-family goodbye debt, carried on the round
+/// itself, and a family it does not name has already retracted everything this
+/// item withdraws. An item stays selectable while EITHER family owes, so without
+/// this a paid family is handed every round the other one's retries produce: a
+/// retraction of records no peer on that family still holds, arriving at whatever
+/// cadence the other family's failures set rather than at the RFC 6762 §10.1
+/// interval.
+///
+/// A withheld family reports [`WithdrawalSend::Retry`] — the answer that leaves
+/// both its debt and the item's schedule untouched, so erring towards caution
+/// costs a round and never a debt.
 async fn send_withdrawal_via<S: UdpSocket>(
   tracker: &mut Vec<(u64, SystemTime)>,
   v4: &Option<Arc<S>>,
   v6: &Option<Arc<S>>,
   body: &[u8],
+  debt: FamilyDebt,
   #[cfg(feature = "stats")] stats: &std::sync::Arc<hick_trace::stats::Stats>,
 ) -> (WithdrawalSend, WithdrawalSend) {
   let (a4, a6) = futures::future::join(
@@ -2358,39 +2381,66 @@ async fn send_withdrawal_via<S: UdpSocket>(
     // (`note_withdrawal_result`), which already spaces the resends, and holding
     // one back here would leave a family's peers pinned to positive-TTL records
     // it has already been promised the retraction of.
-    attempt_send_to(v4.as_deref(), body, MDNS_V4_DST),
-    attempt_send_to(v6.as_deref(), body, MDNS_V6_DST),
+    attempt_owed_send_to(debt.v4_owed(), v4.as_deref(), body, MDNS_V4_DST),
+    attempt_owed_send_to(debt.v6_owed(), v6.as_deref(), body, MDNS_V6_DST),
   )
   .await;
-  let out = |attempt: &SendAttempt| match attempt {
+  let out = |attempt: &Option<SendAttempt>| match attempt {
+    // Withheld because the core's debt says this family has already paid: no
+    // syscall was made and nothing was observed, so keep its (already-zero) debt.
+    None => WithdrawalSend::Retry,
     // No socket for a family → WriteOff (no peers reachable on it to withdraw
     // from). Present socket: Ok → Sent, anything else → Retry (never WriteOff).
     // See `present_socket_send_outcome`.
-    SendAttempt::Unbound => WithdrawalSend::WriteOff,
-    SendAttempt::Answered(res, _, _) => present_socket_send_outcome(res),
+    Some(SendAttempt::Unbound) => WithdrawalSend::WriteOff,
+    Some(SendAttempt::Answered(res, _, _)) => present_socket_send_outcome(res),
     // Unreachable: this fan-out goes through the UNGATED `attempt_send_to`.
-    SendAttempt::Gated | SendAttempt::TimedOut => WithdrawalSend::Retry,
+    Some(SendAttempt::Gated | SendAttempt::TimedOut) => WithdrawalSend::Retry,
   };
   let outcomes = (out(&a4), out(&a6));
-  note_multicast_attempt(
-    tracker,
-    &a4,
-    body,
-    MDNS_V4_DST,
-    "withdrawal",
-    #[cfg(feature = "stats")]
-    stats,
-  );
-  note_multicast_attempt(
-    tracker,
-    &a6,
-    body,
-    MDNS_V6_DST,
-    "withdrawal",
-    #[cfg(feature = "stats")]
-    stats,
-  );
+  // Only a family that was actually offered the datagram has anything to record:
+  // a withheld one made no syscall, so it produces no loopback to credit and no
+  // stats to bump.
+  if let Some(a4) = a4 {
+    note_multicast_attempt(
+      tracker,
+      &a4,
+      body,
+      MDNS_V4_DST,
+      "withdrawal",
+      #[cfg(feature = "stats")]
+      stats,
+    );
+  }
+  if let Some(a6) = a6 {
+    note_multicast_attempt(
+      tracker,
+      &a6,
+      body,
+      MDNS_V6_DST,
+      "withdrawal",
+      #[cfg(feature = "stats")]
+      stats,
+    );
+  }
   outcomes
+}
+
+/// [`attempt_send_to`] for one family of a withdrawal fan-out, or `None` when the
+/// core's [`FamilyDebt`] says that family owes this item nothing.
+///
+/// The decision is taken before the future is created, so a withheld family makes
+/// no syscall, takes no [`SEND_ATTEMPT_TIMEOUT`] and has no attempt to record.
+async fn attempt_owed_send_to<S: UdpSocket>(
+  owed: bool,
+  sock: Option<&S>,
+  body: &[u8],
+  dst: SocketAddr,
+) -> Option<SendAttempt> {
+  if !owed {
+    return None;
+  }
+  Some(attempt_send_to(sock, body, dst).await)
 }
 
 /// Map a PRESENT (bound) family's `send_to` result to its per-family withdrawal

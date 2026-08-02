@@ -12,10 +12,12 @@
 //!
 //! **Per-family goodbye debt.** A withdrawal is not "sent" until *every bound*
 //! family has retracted its records, so the fan-out reports each family's
-//! outcome separately and the endpoint tracks a debt per family. The mapping
-//! from a socket result to that debt is by socket **presence**, never by error
-//! kind — see [`withdrawal_outcome`], which is where a defect would cost a route
-//! freed while a bound family's peers still hold stale positive-TTL records.
+//! outcome separately and the endpoint tracks a debt per family. The endpoint
+//! also says which families a given round is FOR — see [`Debt`] — and the
+//! mapping from a socket result back to that debt is by socket **presence**,
+//! never by error kind — see [`withdrawal_outcome`], which is where a defect
+//! would cost a route freed while a bound family's peers still hold stale
+//! positive-TTL records.
 //!
 //! **The context GC.** Every other stage skips a retired service; this is the
 //! one that finally drops it, and only once the endpoint reports its withdrawal
@@ -30,12 +32,9 @@
 //! docs; the reads are at [`Mdns::drain_withdrawals`] and
 //! [`begin_service_withdrawal`](crate::endpoint::begin_service_withdrawal).
 
-use std::{
-  net::SocketAddr,
-  time::{Duration, Instant as StdInstant},
-};
+use std::{net::SocketAddr, time::Instant as StdInstant};
 
-use mdns_proto::endpoint::{WithdrawalSend, WithdrawalToken};
+use mdns_proto::endpoint::{FamilyDebt, WithdrawalSend};
 
 use crate::{
   driver::sends::SendHealth,
@@ -47,174 +46,53 @@ use crate::{
 /// Goodbye rounds ONE family owes for one withdrawal item.
 ///
 /// Restated here because `mdns-proto`'s own `WITHDRAWAL_SENDS` is crate-private,
-/// exactly as the tests restate the §10.1 interval and ceiling. It is the
-/// driver's projection of the endpoint's per-family debt and nothing else — the
-/// debt itself lives on the endpoint, which is the only thing that spends it.
+/// exactly as the tests restate the §10.1 interval and ceiling. Test-only: the
+/// budget lives on the endpoint, which is the only thing that spends it and the
+/// only thing that says which families a round is for — this driver reads that
+/// answer, it does not reconstruct it.
 ///
-/// **Drift is caught, not hoped away.** `a_withdrawal_costs_exactly_the_rounds_
-/// the_driver_projects` drives a withdrawal to completion and asserts the
-/// endpoint took exactly this many rounds, so a change to the endpoint's budget
-/// fails a test here rather than silently withholding a goodbye a family still
-/// owes.
+/// **Drift is caught, not hoped away.** `the_endpoints_goodbye_budget_is_what_
+/// the_tests_restate` drives a withdrawal to completion and asserts the endpoint
+/// took exactly this many rounds, so a change to the endpoint's budget fails
+/// there rather than leaving every other assertion in this module quietly
+/// counting against the wrong number.
+#[cfg(test)]
 pub(crate) const GOODBYE_ROUNDS_PER_FAMILY: u8 = 3;
 
-/// How long a [`GoodbyeLedger`] row outlives its last round before it is aged
-/// out.
+/// The core's own per-family goodbye debt for ONE round, as a
+/// [`FamilyAdmission`]: **time-free** by construction, and the only admission in
+/// this crate that is.
 ///
-/// The §10.1 anti-pin ceiling, restated: an item is force-completed 2 s after it
-/// is created, and a row is touched every time its item is pumped — so a row
-/// untouched for this long cannot belong to a live item (the item's ceiling is
-/// at most 2 s past its creation, which is at or before that last touch).
+/// [`FamilyDebt`] arrives on the round itself
+/// ([`mdns_proto::endpoint::WithdrawalTransmit`]) and is `Copy`, so asking it per
+/// family inside the fan-out reads the same two bits for both — there is nothing
+/// for a syscall between them to change.
 ///
-/// Ageing a row out early costs one redundant goodbye and never a withheld one,
-/// because a forgotten row reads as "this item has paid nothing" and opens both
-/// families. That is the direction this bound is allowed to be wrong in.
-const GOODBYE_LEDGER_TTL: Duration = Duration::from_secs(2);
-
-/// The driver's projection of each in-flight withdrawal item's **outstanding
-/// per-family debt**, so a family that has paid is not offered the next round.
-///
-/// # Why the driver needs a projection at all
+/// # Why the endpoint has to be the one to say
 ///
 /// The endpoint owns the debt and spends it, but its resend schedule is one
 /// schedule for the ITEM while the debt is PER FAMILY. Once one family has paid
 /// every round and the other is still failing, a `Sent` on the paid family is
-/// (correctly) not progress, so the endpoint re-arms the item on its 20 ms
-/// retry backoff for the sake of the family that still owes — and a driver that
-/// fans every round to both families then puts a redundant TTL=0 goodbye on the
-/// paid family's wire every 20 ms until the ceiling. Dozens of multicast
-/// datagrams per service, and a per-family spacing of 20 ms where §10.1 asks for
-/// 250 ms.
-///
-/// # It is not a pending-send table
-///
-/// It holds no datagram, no unresolved send and no commit token; every send
-/// still resolves inside the call that makes it. A row is per-item spacing
-/// state, exactly like [`FamilyWireGate`](crate::driver::FamilyWireGate) is
-/// per-producer spacing state — and, like it, it is written from what the send
-/// actually did rather than from what was attempted.
-///
-/// # Bounded
-///
-/// One row per item pumped within [`GOODBYE_LEDGER_TTL`], which is bounded by
-/// the registrations the caller itself made; no peer can grow it. Rows age out
-/// on that bound, and the whole table is dropped the moment the endpoint reports
-/// no withdrawal pending.
-#[derive(Debug)]
-pub(crate) struct GoodbyeLedger {
-  /// One row per item this stage has pumped recently. Linear — see the bound
-  /// above.
-  rows: Vec<GoodbyeRow>,
-}
-
-/// One item's projection.
-#[derive(Debug, Clone, Copy)]
-struct GoodbyeRow {
-  /// The endpoint's own key for the item. Never reused, so a row can only ever
-  /// name the item it was opened for.
-  token: WithdrawalToken,
-  /// Rounds each family has actually PUT ON ITS WIRE for this item, `[v4, v6]`.
-  /// Only a [`WithdrawalSend::Sent`] counts: a refused or withheld round paid
-  /// nothing.
-  carried: [u8; 2],
-  /// When this row's item was last pumped. The only input to the ageing above.
-  touched: StdInstant,
-}
-
-impl GoodbyeLedger {
-  /// An empty ledger, which is what an endpoint with nothing withdrawing has.
-  pub(crate) const fn new() -> Self {
-    Self { rows: Vec::new() }
-  }
-
-  /// Whether `family` still owes `token` a goodbye.
-  ///
-  /// An item this stage has not pumped yet owes everything, so an unknown token
-  /// owes on both families — the safe direction, and the one a pruned row falls
-  /// back to. So does an index this row does not have.
-  ///
-  /// A withheld family reports [`SendOutcome::Gated`] and therefore
-  /// [`WithdrawalSend::Retry`], which leaves its debt exactly as it was. That is
-  /// what makes an over-cautious projection cost a redundant datagram while an
-  /// over-eager one could never zero a debt it had not paid.
-  fn owes(&self, token: WithdrawalToken, family: Family) -> bool {
-    match self.rows.iter().find(|row| row.token == token) {
-      Some(row) => {
-        row.carried.get(family.index()).copied().unwrap_or(0) < GOODBYE_ROUNDS_PER_FAMILY
-      }
-      None => true,
-    }
-  }
-
-  /// Fold one round's per-family outcome into `token`'s row, opening it if this
-  /// is the item's first round.
-  fn note(
-    &mut self,
-    token: WithdrawalToken,
-    at: StdInstant,
-    v4: WithdrawalSend,
-    v6: WithdrawalSend,
-  ) {
-    let row = match self.rows.iter_mut().find(|row| row.token == token) {
-      Some(row) => row,
-      None => {
-        self.rows.push(GoodbyeRow {
-          token,
-          carried: [0, 0],
-          touched: at,
-        });
-        let Some(row) = self.rows.last_mut() else {
-          return;
-        };
-        row
-      }
-    };
-    row.touched = at;
-    for (carried, outcome) in row.carried.iter_mut().zip([v4, v6]) {
-      if matches!(outcome, WithdrawalSend::Sent) {
-        *carried = carried.saturating_add(1);
-      }
-    }
-  }
-
-  /// Drop every row whose item cannot still be live. See
-  /// [`GOODBYE_LEDGER_TTL`].
-  fn prune(&mut self, now: StdInstant) {
-    self
-      .rows
-      .retain(|row| now.saturating_duration_since(row.touched) < GOODBYE_LEDGER_TTL);
-  }
-
-  /// Drop every row, for when the endpoint reports nothing left withdrawing.
-  fn clear(&mut self) {
-    self.rows.clear();
-  }
-}
-
-/// One item's outstanding per-family debt as a [`FamilyAdmission`]: **time-free**
-/// by construction, and the only admission in this crate that is.
-///
-/// It reads a ledger nothing mutates while the fan-out runs — [`GoodbyeLedger`]
-/// is folded once, after both families, by
-/// [`GoodbyeLedger::note`](GoodbyeLedger::note) — so asking per family answers
-/// bitwise-identically to the `[bool; 2]` this replaces. The §10.1 behaviour is
-/// unchanged in every direction: an unknown token still owes on both families, a
-/// withheld family still reports [`SendOutcome::Gated`] and so
-/// [`WithdrawalSend::Retry`], and a `Retry` still leaves the debt exactly as it
-/// was.
+/// (correctly) not progress, so the endpoint re-arms the item on its 20 ms retry
+/// backoff for the sake of the family that still owes — and a driver that fans
+/// every round to both families then puts a redundant TTL=0 goodbye on the paid
+/// family's wire every 20 ms until the ceiling. Dozens of multicast datagrams per
+/// service, and a per-family spacing of 20 ms where §10.1 asks for 250 ms. This
+/// driver used to answer that from a ledger of its own, shadowing a fact the core
+/// already had; carrying the debt on the round retires the shadow.
 ///
 /// It speaks the same trait as [`WireGate`](super::sends::WireGate) only so that
 /// no send path anywhere has a second shape for "which families may be offered
 /// this". A wire gate is spacing and this is debt; see [`send_withdrawal`] for
 /// why this stage has one and not the other.
-struct Debt<'a> {
-  ledger: &'a GoodbyeLedger,
-  token: WithdrawalToken,
-}
+struct Debt(FamilyDebt);
 
-impl FamilyAdmission for Debt<'_> {
+impl FamilyAdmission for Debt {
   fn admits(&self, family: Family) -> bool {
-    self.ledger.owes(self.token, family)
+    match family {
+      Family::V4 => self.0.v4_owed(),
+      Family::V6 => self.0.v6_owed(),
+    }
   }
 }
 
@@ -267,7 +145,6 @@ impl Mdns {
       send_buf,
       svc_scratch,
       completed_scratch,
-      goodbye_ledger,
       ..
     } = &mut *self;
 
@@ -297,11 +174,9 @@ impl Mdns {
     // whole receive drain, every timer, the transmit fan-out and the update
     // drain.
     let now = StdInstant::now();
-    goodbye_ledger.prune(now);
 
-    while let Some((dst, len, token)) =
-      endpoint.poll_withdrawal_transmit(now, send_buf.as_mut_slice())
-    {
+    while let Some(round) = endpoint.poll_withdrawal_transmit(now, send_buf.as_mut_slice()) {
+      let (len, token, debt) = (round.len(), round.token(), round.debt());
       // Neither of the two checks below is a `debug_assert!`, and that is
       // deliberate. Both encode an `mdns-proto` contract rather than a local
       // invariant, and this loop is reachable from `Drop` — via
@@ -312,15 +187,16 @@ impl Mdns {
 
       // The endpoint always hands back the IPv4 multicast marker and leaves the
       // fan-out to us. Same contract `hick-reactor` asserts. Informational
-      // only: the fan-out below is unconditional (§10.1 retracts on every
-      // joined group), so a different destination costs nothing but a
+      // only: the fan-out below is driven by the round's own per-family debt
+      // rather than by this address (§10.1 retracts on every joined group that
+      // still owes), so a different destination costs nothing but a
       // stale-contract warning.
-      if !matches!(dst, SocketAddr::V4(a) if a.ip().is_multicast()
+      if !matches!(round.dst(), SocketAddr::V4(a) if a.ip().is_multicast()
         && a.port() == hick_udp::constants::MDNS_PORT)
       {
         hick_trace::warn!(
-          dst = %dst,
-          "a withdrawal destination is not the IPv4 multicast marker; fanning out to both groups anyway"
+          dst = %round.dst(),
+          "a withdrawal destination is not the IPv4 multicast marker; fanning out to the owed groups anyway"
         );
       }
       // `len` counts bytes the endpoint wrote into the very buffer just passed
@@ -358,10 +234,7 @@ impl Mdns {
         selfsend,
         send_health,
         &send_buf[..len],
-        &Debt {
-          ledger: goodbye_ledger,
-          token,
-        },
+        &Debt(debt),
       );
       // `send_withdrawal` already bumped packets_tx/bytes_tx per SENT family and
       // send_errors per failed one, inside `Sockets::send_one` itself — see that
@@ -373,10 +246,6 @@ impl Mdns {
       if matches!(v4, WithdrawalSend::Sent) || matches!(v6, WithdrawalSend::Sent) {
         stats.goodbyes_tx(1);
       }
-      // Both take the SAME instant, and neither may take the other's. The
-      // endpoint spends the debt; the ledger only records what reached a wire,
-      // so the two can never disagree about which family paid.
-      goodbye_ledger.note(token, fanned_out_at, v4, v6);
       endpoint.note_withdrawal_result(token, fanned_out_at, v4, v6);
     }
 
@@ -389,24 +258,18 @@ impl Mdns {
     while let Some(handle) = completed_scratch.pop() {
       services.remove(&handle);
     }
-    // Nothing is withdrawing, so no row can name a live item. The age-out in
-    // `prune` is the general bound; this is the exact one, and it keeps the
-    // steady state empty.
-    if !endpoint.has_pending_withdrawals() {
-      goodbye_ledger.clear();
-    }
   }
 }
 
-/// Fan one RFC 6762 §10.1 goodbye out to **both** multicast groups, take its
-/// self-send credits, and report each family's outcome so the endpoint can track
-/// per-family goodbye debt.
+/// Fan one RFC 6762 §10.1 goodbye out to every multicast group `admission` still
+/// admits, take its self-send credits, and report each family's outcome so the
+/// endpoint can track per-family goodbye debt.
 ///
 /// Sends through [`Sockets::send_one`] per family rather than
 /// [`Sockets::send_to`]: `send_to` derives its fan-out from the destination, and
-/// the endpoint hands back only the IPv4 marker, so the withdrawal's "always
-/// both groups" rule would be riding on that classification instead of being
-/// stated here.
+/// the endpoint hands back only the IPv4 marker, so the withdrawal's "every
+/// group that still owes" rule would be riding on that classification instead of
+/// being stated here.
 ///
 /// A goodbye loops back off the joined sockets like any other multicast
 /// transmit, so its self-send credits are taken here — one per family that
@@ -414,10 +277,9 @@ impl Mdns {
 /// peer datagram.
 ///
 /// **No wire GATE**, but not unconditional either: `admission` is the
-/// outstanding per-family DEBT, projected by [`GoodbyeLedger`] and asked per
-/// family inside [`Sockets::send_one`] — see [`Debt`]. The two are different
-/// things and the distinction is the whole of why this stage has one and not the
-/// other.
+/// outstanding per-family DEBT the core carried on this round, asked per family
+/// inside [`Sockets::send_one`] — see [`Debt`]. The two are different things and
+/// the distinction is the whole of why this stage has one and not the other.
 ///
 /// A wire gate is a *spacing* rule — it withholds a datagram a family still owes
 /// until its interval has elapsed — and putting one here could only delay a
@@ -428,27 +290,25 @@ impl Mdns {
 /// a redundant multicast datagram. Once the other family is failing and the item
 /// is re-arming on its 20 ms backoff, it is dozens of them.
 ///
-/// Erring in the projection's own direction is cheap and one-sided. A family it
-/// wrongly withholds reports [`SendOutcome::Gated`] and so
-/// [`WithdrawalSend::Retry`], which leaves its debt untouched and its next round
-/// scheduled — it can lose a round, never a debt — while a family it wrongly
-/// offers costs one extra datagram.
+/// The mask is one-sided by construction. A family it withholds reports
+/// [`SendOutcome::Gated`] and so [`WithdrawalSend::Retry`], which leaves its debt
+/// untouched and its next round scheduled — it can lose a round, never a debt —
+/// while a family it admits costs at most one extra datagram.
 ///
 /// The family health table is updated exactly as it is for a transmit: a bound
 /// socket that keeps refusing goodbyes is failing for the same reason it fails
 /// everything else, and [`Mdns::degraded_families`](crate::Mdns::degraded_families)
-/// must say so. A family the projection withheld is charged nothing, exactly
-/// like a gated transmit: no syscall was made and the deferral is this driver's
-/// own.
+/// must say so. A family the debt withheld is charged nothing, exactly like a
+/// gated transmit: no syscall was made and the deferral is this driver's own.
 /// What a goodbye does *not* do is advance any lifecycle: its per-family debt
 /// lives on the endpoint, and [`withdrawal_outcome`] settles it at send time.
 ///
 /// # It returns the round's anchor, and the caller may not read its own
 ///
 /// The third return value is the instant this round finished fanning out, read
-/// **inside**, after the second `send_one` and before anything else. Both
-/// consumers take it: the ledger's row and the endpoint's §10.1 resend schedule,
-/// which can then never disagree about which family paid when.
+/// **inside**, after the second `send_one` and before anything else. The
+/// endpoint's §10.1 resend schedule takes it, so what re-arms that schedule is
+/// the round's own fan-out rather than anything the caller does afterwards.
 ///
 /// It is returned rather than read by the caller because **the anchor belongs to
 /// whatever measured it**. It used to be a `StdInstant::now()` at the call site
@@ -458,8 +318,8 @@ impl Mdns {
 /// function: nothing the caller does afterwards can be charged to the next
 /// round's spacing, because nothing the caller does afterwards can be reached
 /// before the read. That also excludes strictly more than the old comment asked
-/// for — the round-level stats bump, the ledger fold and the endpoint call are
-/// all now after it — which is the same intent carried further.
+/// for — the round-level stats bump and the endpoint call are both now after
+/// it — which is the same intent carried further.
 ///
 /// What it is **not** is the stage's own instant.
 /// [`Mdns::drain_withdrawals`]'s `now` is a due-list reference: one stable value
@@ -486,8 +346,10 @@ pub(super) fn send_withdrawal(
   // function or its caller does. See the section above.
   let fanned_out_at = StdInstant::now();
   // `loops_back` is unconditional here, unlike a `send_to` that classifies its
-  // destination: this function always sends to the two multicast groups this
-  // endpoint joined, so a goodbye always comes back and always owes its credit.
+  // destination: every datagram this function puts on a wire goes to one of the
+  // two multicast groups this endpoint joined, so a goodbye always comes back and
+  // always owes its credit. A family the admission withheld sent nothing, and
+  // `credit_stamp` returns `None` for it, so it takes no credit either.
   let report = SendReport {
     v4,
     v6,
@@ -520,7 +382,7 @@ pub(super) fn send_withdrawal(
 /// | `Sent` | `Sent` | on the wire; spend one owed round |
 /// | `Failed` | `Retry` | a bound socket did not carry it; the 2 s ceiling is the backstop |
 /// | `TooLarge` | `Retry` | same: a bound socket did not carry it, and the same ceiling bounds it |
-/// | `Gated` | `Retry` | the debt mask withheld it (see [`GoodbyeLedger`]); a deferral is not a write-off |
+/// | `Gated` | `Retry` | the core's debt withheld it (see [`Debt`]); a deferral is not a write-off |
 /// | `NoSocket` | `WriteOff` | nothing bound, so no peers on this family to retract from |
 ///
 /// The `Failed` row is the one worth defending, and it now covers backpressure

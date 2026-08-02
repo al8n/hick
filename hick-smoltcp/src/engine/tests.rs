@@ -464,6 +464,97 @@ fn goodbye_budget_is_not_consumed_while_transport_is_busy() {
   );
 }
 
+/// Goodbye rounds ONE family owes for one withdrawal item (RFC 6762 §10.1),
+/// restated because `mdns-proto`'s own constant is crate-private — exactly as
+/// the tests here restate the resend interval and the anti-pin ceiling.
+const GOODBYE_ROUNDS_PER_FAMILY: usize = 3;
+
+/// The §10.1 spacing between two successive goodbyes for one name on ONE
+/// family's wire, restated for the same reason.
+const GOODBYE_INTERVAL_MICROS: i64 = 250_000;
+
+/// TTL=0 goodbyes this log records for the IPv4 group.
+fn v4_goodbye_count(sent: &SentLog) -> usize {
+  sent
+    .iter()
+    .filter(|(dst, data)| *dst == MDNS_SOCKET_V4 && datagram_kind(data) == Some(true))
+    .count()
+}
+
+/// A family that has paid its whole §10.1 budget is not offered the rounds the
+/// blocked family's retries keep producing.
+///
+/// §10.1 debt is per family while the resend schedule is per item, so once v4 has
+/// paid every round and v6 is still failing, a `Sent` on v4 is (correctly) not
+/// progress and the endpoint re-arms the item on its short retry backoff for
+/// v6's sake. A driver that fans every round to both families then puts a TTL=0
+/// goodbye on v4's wire at THAT cadence until the 2 s ceiling — retracting
+/// records no v4 peer still holds, dozens of times, where §10.1 spaces one
+/// family's goodbyes 250 ms apart. This driver used to, because `burst` was fed
+/// a throwaway `[1, 1]` in place of the real debt.
+///
+/// Both halves are asserted: the count (v4 emits exactly the budget it owed) and
+/// the spacing (no two v4 goodbyes land inside the §10.1 interval).
+#[test]
+fn a_paid_family_is_not_offered_the_blocked_familys_retry_rounds() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(2109));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+  for micros in pump_schedule() {
+    engine.pump(at(micros), &mut io, &mut scratch);
+  }
+  // Drain announce-phase updates so the slot's only remaining lifecycle is the
+  // withdrawal.
+  while engine.poll_service_update(handle).is_some() {}
+  engine.unregister_service(handle, at(5_000_000)); // ceiling at 7_000_000
+  // Only count withdrawal-phase datagrams (the announce phase already put
+  // positive-TTL records on both wires).
+  io.sent.clear();
+  // v6 refuses everything from here on, so it keeps its whole debt and the item
+  // re-arms on the endpoint's short retry backoff for its sake.
+  io.v6_fail = Some(SendError::Busy);
+
+  // A grid fine enough to catch a round at either cadence — the §10.1 interval
+  // and the short retry backoff are both whole multiples of it — and stopping
+  // short of the 2 s anti-pin ceiling, so every round counted below belongs to an
+  // item that is provably still live.
+  let mut v4_goodbyes: Vec<i64> = Vec::new();
+  let mut micros = 5_010_000i64;
+  while micros < 6_990_000 {
+    let before = v4_goodbye_count(&io.sent);
+    engine.pump(at(micros), &mut io, &mut scratch);
+    if v4_goodbye_count(&io.sent) > before {
+      v4_goodbyes.push(micros);
+    }
+    while engine.poll_service_update(handle).is_some() {}
+    micros += 10_000;
+  }
+
+  assert!(
+    engine.services.contains_key(&handle),
+    "v6 never carried its goodbye, so the withdrawal must still be held — \
+     otherwise the rounds counted below stopped for some reason other than v4's \
+     debt running out"
+  );
+  assert_eq!(
+    v4_goodbyes.len(),
+    GOODBYE_ROUNDS_PER_FAMILY,
+    "v4 owed exactly its §10.1 budget and paid it; every datagram after that \
+     retracts records no v4 peer still holds, and exists only because v6 is \
+     retrying. Rounds reached v4's wire at (us): {v4_goodbyes:?}"
+  );
+  for pair in v4_goodbyes.windows(2) {
+    let gap = pair[1] - pair[0];
+    assert!(
+      gap >= GOODBYE_INTERVAL_MICROS,
+      "two goodbyes for one name reached v4's wire {gap} us apart, inside the \
+       {GOODBYE_INTERVAL_MICROS} us §10.1 gives one family's wire — the blocked \
+       family's retry cadence was applied to the paid family's transmissions"
+    );
+  }
+}
+
 /// Classify a sent datagram by its answer-record TTLs:
 /// `Some(true)`  — it carries at least one TTL=0 answer (a §10.1 goodbye),
 /// `Some(false)` — it carries answers, all with TTL>0 (a positive announce),
@@ -2247,10 +2338,10 @@ fn stats_withdrawal_dual_stack_counts_rounds_and_per_family_datagrams() {
 
 /// regression: per-family withdrawal debt at the driver level.
 /// With v4 healthy but v6 transiently BUSY, the withdrawal must NOT free before
-/// v6 sends — v6 peers still hold the records. v4 drains its debt (and keeps
-/// re-withdrawing harmlessly), yet the route stays held WITHIN the 2 s ceiling
-/// until v6 recovers and emits its own TTL=0 goodbyes, at which point it
-/// completes (well before the ceiling).
+/// v6 sends — v6 peers still hold the records. v4 drains its debt and is then
+/// offered nothing further, yet the route stays held WITHIN the 2 s ceiling until
+/// v6 recovers and emits its own TTL=0 goodbyes, at which point it completes
+/// (well before the ceiling).
 #[cfg(feature = "stats")]
 #[test]
 fn stats_withdrawal_v6_busy_until_recovery_not_freed_before_v6_sends() {
