@@ -395,13 +395,18 @@ fn begin_service_withdrawal_holds_name_then_frees_on_completion() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
+    while let Some(round) = s.poll_one_withdrawal(t, &mut scratch) {
       // No sockets bound in this State-level test: model BOTH families as
       // transiently undeliverable (Retry) so the per-family budget stays intact
       // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
       // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
       // instead, defeating the ceiling assertion.)
-      s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+      s.note_withdrawal_result(
+        round.token(),
+        t,
+        WithdrawalSend::Retry,
+        WithdrawalSend::Retry,
+      );
     }
     s.drain_completed_withdrawals(t);
     if !s.services.contains_key(&handle) {
@@ -764,13 +769,18 @@ fn same_name_replacement_is_rejected_until_withdrawal_completes() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
+    while let Some(round) = s.poll_one_withdrawal(t, &mut scratch) {
       // No sockets bound in this State-level test: model BOTH families as
       // transiently undeliverable (Retry) so the per-family budget stays intact
       // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
       // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
       // instead, defeating the ceiling assertion.)
-      s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+      s.note_withdrawal_result(
+        round.token(),
+        t,
+        WithdrawalSend::Retry,
+        WithdrawalSend::Retry,
+      );
     }
     s.drain_completed_withdrawals(t);
     if !s.services.contains_key(&a) {
@@ -1424,13 +1434,18 @@ fn rename_collision_with_local_service_frees_proto_route() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
+    while let Some(round) = s.poll_one_withdrawal(t, &mut scratch) {
       // No sockets bound in this State-level test: model BOTH families as
       // transiently undeliverable (Retry) so the per-family budget stays intact
       // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
       // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
       // instead, defeating the ceiling assertion.)
-      s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+      s.note_withdrawal_result(
+        round.token(),
+        t,
+        WithdrawalSend::Retry,
+        WithdrawalSend::Retry,
+      );
     }
     s.drain_completed_withdrawals(t);
     if !s.services.contains_key(&handle_a) {
@@ -1646,13 +1661,18 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
   let mut completed = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
+    while let Some(round) = s.poll_one_withdrawal(t, &mut scratch) {
       // No sockets bound in this State-level test: model BOTH families as
       // transiently undeliverable (Retry) so the per-family budget stays intact
       // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
       // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
       // instead, defeating the ceiling assertion.)
-      s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+      s.note_withdrawal_result(
+        round.token(),
+        t,
+        WithdrawalSend::Retry,
+        WithdrawalSend::Retry,
+      );
     }
     s.drain_completed_withdrawals(t);
     if !s.services.contains_key(&handle_a) {
@@ -1805,8 +1825,13 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   let mut gced = false;
   for _ in 0..64 {
     t += Duration::from_millis(250);
-    while let Some((_, _, tok)) = s.poll_one_withdrawal(t, &mut scratch) {
-      s.note_withdrawal_result(tok, t, WithdrawalSend::Retry, WithdrawalSend::Retry);
+    while let Some(round) = s.poll_one_withdrawal(t, &mut scratch) {
+      s.note_withdrawal_result(
+        round.token(),
+        t,
+        WithdrawalSend::Retry,
+        WithdrawalSend::Retry,
+      );
     }
     s.drain_completed_withdrawals(t);
     if !s.services.contains_key(&handle) {
@@ -3145,9 +3170,10 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
 
   // Goodbye round 1 reaches v4 only: IPv6's debt is still outstanding, which is
   // exactly what a premature cancel would throw away.
-  let (_, _, token) = s
+  let token = s
     .poll_one_withdrawal(t, &mut buf)
-    .expect("the renamed-away old name must have a detached goodbye pending");
+    .expect("the renamed-away old name must have a detached goodbye pending")
+    .token();
   s.note_withdrawal_result(token, t, WithdrawalSend::Sent, WithdrawalSend::Retry);
 
   // The application reclaims the vacated name.

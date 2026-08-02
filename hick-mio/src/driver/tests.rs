@@ -4471,15 +4471,16 @@ fn a_paid_family_carries_no_goodbye_while_the_blocked_one_retries() {
   }
 }
 
-/// The endpoint's own per-family goodbye budget is what the driver projects.
+/// The endpoint's own per-family goodbye budget is what this module's tests
+/// restate.
 ///
-/// Pinned against the ENDPOINT rather than against the driver: this pumps
-/// `poll_withdrawal_transmit` directly, so it counts the rounds the endpoint
-/// itself owes rather than the rounds the driver was willing to offer. A change
-/// to `mdns-proto`'s budget therefore fails here, instead of leaving the driver
-/// silently withholding a goodbye a family still owes.
+/// Pinned against the ENDPOINT: this pumps `poll_withdrawal_transmit` directly,
+/// so it counts the rounds the endpoint itself owes rather than the rounds any
+/// fan-out was willing to offer. A change to `mdns-proto`'s budget therefore
+/// fails here, instead of leaving the counts the other withdrawal tests assert
+/// on quietly measuring against the wrong number.
 #[test]
-fn the_endpoints_goodbye_budget_is_what_the_driver_projects() {
+fn the_endpoints_goodbye_budget_is_what_the_tests_restate() {
   let Some((mut mdns, handle, _)) = advertised_service("_hick-mio-goodbye-budget._tcp.local.")
   else {
     return;
@@ -4501,8 +4502,8 @@ fn the_endpoints_goodbye_budget_is_what_the_driver_projects() {
     rounds,
     usize::from(super::withdrawal::GOODBYE_ROUNDS_PER_FAMILY),
     "`GOODBYE_ROUNDS_PER_FAMILY` restates a crate-private `mdns-proto` constant; \
-     they have drifted, and the driver is now projecting a debt the endpoint \
-     does not have"
+     they have drifted, so every test here that counts goodbye rounds is now \
+     measuring against a budget the endpoint does not have"
   );
 }
 

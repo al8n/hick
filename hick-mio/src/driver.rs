@@ -172,7 +172,6 @@ use mdns_proto::{
 use crate::{endpoint::Mdns, error::TickError, event::Event, onlink};
 
 pub(crate) use sends::{FamilyWireGate, SendHealth, send_and_credit};
-pub(crate) use withdrawal::GoodbyeLedger;
 
 /// Per-family delivery reporting, the per-family wire gate, and the link-health
 /// signal — see the module's own docs.

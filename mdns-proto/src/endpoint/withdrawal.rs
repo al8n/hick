@@ -255,15 +255,29 @@ where
     /// iteration either returns a datagram, completes an item, or pushes one
     /// past `now`.
     ///
-    /// Returns `(multicast dst, datagram length, the item's [`WithdrawalToken`])`
-    /// for the first due item that actually has records to emit, or `None` when no
-    /// due item has anything to send (the empty/retained-only ones having been
-    /// marked complete; the encode-failing ones having been pushed past `now`).
+    /// # The round names the families it is FOR
+    ///
+    /// An item stays selectable while EITHER family still owes, so a round chosen
+    /// for one family's sake is not a round the other one needs.
+    /// [`WithdrawalTransmit::debt`] is what says which is which, and a driver must
+    /// offer the datagram only to the families it names: a paid family's peers
+    /// have already dropped the records, so another copy retracts nothing. §10.1
+    /// permits the repeats, but with one family paid and the other retrying on the
+    /// short backoff they arrive at that backoff's cadence rather than the §10.1
+    /// interval, for as long as the item lives.
+    ///
+    /// A family the driver withheld on that basis is reported
+    /// [`WithdrawalSend::Retry`] — see [`Self::note_withdrawal_result`].
+    ///
+    /// Returns the [`WithdrawalTransmit`] describing the first due item that
+    /// actually has records to emit, or `None` when no due item has anything to
+    /// send (the empty/retained-only ones having been marked complete; the
+    /// encode-failing ones having been pushed past `now`).
     pub fn poll_withdrawal_transmit(
       &mut self,
       now: I,
       scratch: &mut [u8],
-    ) -> Option<(SocketAddr, usize, WithdrawalToken)> {
+    ) -> Option<WithdrawalTransmit> {
       loop {
         // An item is selectable when it still owes a round (`owed != [0, 0]`) AND
         // either:
@@ -309,6 +323,10 @@ where
         // (`.get(idx)` cannot be `None` — `idx` came from the scan above — but it
         // sidesteps the `indexing_slicing` lint with no panic path.)
         let (_, w) = self.withdrawals.get(idx)?;
+        // The families this round is FOR, captured with the same scoped borrow
+        // that reads the records it encodes, so the debt handed out can only ever
+        // be the debt the emitted datagram was chosen for.
+        let debt = FamilyDebt::new(w.owed);
         let owned = &w.owned;
         let has_something = owned.ptr()
           || owned.srv()
@@ -361,7 +379,12 @@ where
             if is_final && let Some((_, w)) = self.withdrawals.get_mut(idx) {
               w.final_attempt = true;
             }
-            return Some((crate::service::multicast_dst(), len, token));
+            return Some(WithdrawalTransmit::new(
+              crate::service::multicast_dst(),
+              len,
+              token,
+              debt,
+            ));
           }
           Err(_) => {
             self.advance_after_encode_failure(idx, now, is_final);
@@ -649,6 +672,22 @@ where
     ///     (no socket / permanent send error): zero its debt (`owed[f] = 0`), since
     ///     it has no reachable peers to withdraw from.
     ///
+    /// # A family withheld because it had already paid
+    ///
+    /// A driver offers the round only to the families
+    /// [`WithdrawalTransmit::debt`] named, and reports the ones it withheld as
+    /// [`WithdrawalSend::Retry`]. That is the only variant whose meaning survives
+    /// the mask being wrong in either direction. When the mask is right the family
+    /// is at zero already, and `Retry` is the one variant that neither touches the
+    /// debt nor counts as progress, so it is exactly a no-op. Were the mask ever
+    /// to withhold a family that DID still owe, `Retry` costs it a round it will be
+    /// offered again on the next schedule. Its alternatives have no such margin:
+    /// `Sent` claims a wire event that did not happen and would spend the very
+    /// debt the withholding assumed was gone, and `WriteOff` would zero it
+    /// outright — freeing the route while that family's peers stay pinned to stale
+    /// positive-TTL records. The one-sidedness is the point: a mask erring towards
+    /// caution can cost a round, never a debt.
+    ///
     /// `next_at` re-arms at the full `WITHDRAWAL_INTERVAL` when a family made REAL
     /// progress this round — a `Sent` for a family that still OWED a goodbye
     /// (`owed[f] > 0` before this round). A `Sent` for an already-paid family
@@ -683,10 +722,11 @@ where
       // avoid dynamic indexing (clippy::indexing_slicing) into `owed`.
       //
       // A `Sent` counts as progress ONLY when that family still OWED a goodbye
-      // before this round (`*debt > 0`). Drivers fan every round's datagram to BOTH
-      // families, so a family whose debt is already 0 keeps reporting `Sent`; if that
-      // redundant send counted as progress it would re-arm at the FULL interval and
-      // starve a still-busy family of its short-backoff retry, risking a missed
+      // before this round (`*debt > 0`). A driver that consults
+      // `WithdrawalTransmit::debt` never offers a paid family the round at all, so
+      // this arm is its backstop rather than its normal path: were a redundant
+      // `Sent` to count as progress it would re-arm at the FULL interval and starve
+      // a still-busy family of its short-backoff retry, risking a missed
       // last-interval recovery before the ceiling. So a `Sent` on an already-paid
       // family changes nothing — neither the debt nor the schedule.
       let owed = &mut w.owed;

@@ -326,11 +326,13 @@ pub(crate) fn collect_goodbyes_as(
 ) -> Vec<Vec<u8>> {
   let mut out = Vec::new();
   let mut scratch = vec![0u8; 1500];
-  while let Some((_, len, token)) = mdns.endpoint.poll_withdrawal_transmit(now, &mut scratch) {
-    if let Some(body) = scratch.get(..len) {
+  while let Some(round) = mdns.endpoint.poll_withdrawal_transmit(now, &mut scratch) {
+    if let Some(body) = scratch.get(..round.len()) {
       out.push(body.to_vec());
     }
-    mdns.endpoint.note_withdrawal_result(token, now, v4, v6);
+    mdns
+      .endpoint
+      .note_withdrawal_result(round.token(), now, v4, v6);
   }
   out
 }

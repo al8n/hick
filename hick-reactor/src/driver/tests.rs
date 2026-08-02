@@ -2075,10 +2075,11 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
 
   // Goodbye round 1 reaches v4 only: IPv6's debt is still outstanding, which is
   // exactly what a premature cancel would throw away.
-  let (_, _, token) = state
+  let token = state
     .endpoint
     .poll_withdrawal_transmit(t, &mut buf)
-    .expect("the renamed-away old name must have a detached goodbye pending");
+    .expect("the renamed-away old name must have a detached goodbye pending")
+    .token();
   state
     .endpoint
     .note_withdrawal_result(token, t, WithdrawalSend::Sent, WithdrawalSend::Retry);
@@ -2235,6 +2236,12 @@ enum SendBehaviour {
   /// datagram, one of them measurably later than the other, so the confirm's
   /// earliest-acceptance anchor and this family's own wire time diverge.
   Delayed(StdInstant),
+  /// Every send completes with an error, the way a bound socket does under
+  /// buffer pressure or route churn. Unlike [`SendBehaviour::Wedged`] it
+  /// ANSWERS, so the fan-out finishes at once instead of running to its own
+  /// bound — which is what makes a multi-round schedule testable in bounded
+  /// time.
+  Refuses,
 }
 
 /// A bound socket whose write side is scripted. It owns a real `std::net`
@@ -2340,6 +2347,11 @@ impl UdpSocket for TestSocket {
       // No waker is registered: a wedged family never wakes the task by itself,
       // which is precisely why the attempt needs its own bound.
       SendBehaviour::Wedged => core::task::Poll::Pending,
+      // Nothing is logged: the wire log is what the socket ACCEPTED, and a
+      // refused send put no bytes on any wire.
+      SendBehaviour::Refuses => {
+        core::task::Poll::Ready(Err(std::io::Error::other("scripted send refusal")))
+      }
       SendBehaviour::Delayed(ready_at) => {
         let now = StdInstant::now();
         if now >= ready_at {
@@ -3087,6 +3099,113 @@ async fn a_pass_with_a_wedged_family_stays_inside_its_budget() {
   );
   drop(regs);
   drop(dying);
+}
+
+// ── a paid family owes no further goodbye ───────────────────────────────────
+//
+// RFC 6762 §10.1 debt is per family while the resend schedule is per item. Once
+// one family has paid every round and the other is still failing, a `Sent` on
+// the paid one is (correctly) not progress, so the endpoint re-arms the item on
+// its short retry backoff for the sake of the family that still owes. A driver
+// that fans every round to both families then puts a TTL=0 goodbye on the paid
+// family's wire at THAT cadence until the anti-pin ceiling — retracting records
+// no peer on that family still holds, dozens of times, where §10.1 spaces one
+// family's goodbyes 250 ms apart. `WithdrawalTransmit::debt` is what lets the
+// driver tell; before it there was nothing to consult.
+
+/// The §10.1 spacing between two successive goodbyes for one name on ONE
+/// family's wire. Restated because the core's copy is crate-private, exactly as
+/// [`ANNOUNCE_MIN_FAMILY_GAP`] restates the announce floor.
+#[cfg(feature = "tokio")]
+const GOODBYE_MIN_FAMILY_GAP: Duration = Duration::from_millis(250);
+
+/// Goodbye rounds ONE family owes for one withdrawal item, restated for the same
+/// reason.
+#[cfg(feature = "tokio")]
+const GOODBYE_ROUNDS_PER_FAMILY: usize = 3;
+
+/// The anti-pin ceiling at which an unfinished withdrawal is force-completed,
+/// restated for the same reason.
+#[cfg(feature = "tokio")]
+const GOODBYE_CEILING: Duration = Duration::from_secs(2);
+
+/// A family that has paid its whole §10.1 budget is not offered the rounds the
+/// blocked family's retries keep producing.
+///
+/// Both halves are asserted: the count (v4 emits exactly the budget it owed) and
+/// the spacing (no two v4 goodbyes land inside the §10.1 interval). The run
+/// reaching the ceiling is asserted too, so a schedule that merely stopped
+/// producing rounds cannot pass this vacuously.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn a_paid_family_is_not_offered_the_blocked_familys_retry_rounds() {
+  let v4 = TestSocket::new(SendBehaviour::Accepts);
+  let v6 = TestSocket::new(SendBehaviour::Refuses);
+  let v4_log = v4.wire_log();
+  let mut state = scripted_state(false, v4, v6);
+  let mut scratch = std::vec![0u8; 4096];
+  let v4_wire_len =
+    |log: &Arc<Mutex<Vec<StdInstant>>>| log.lock().unwrap_or_else(|e| e.into_inner()).len();
+
+  // A service driven to an announced state through the direct seam (so the setup
+  // costs no wall clock) and then retired: its goodbye is non-empty and both
+  // families owe it.
+  let base = StdInstant::now();
+  let reg = state
+    .register_service(delivery_test_spec("paid"), base)
+    .expect("register the withdrawing service");
+  let handle = reg.handle;
+  confirm_service_round(&mut state, handle, base, &mut scratch, WHOLE_FANOUT);
+  state.remove_service(handle, base);
+
+  // Every round is pumped at the endpoint's OWN next deadline, so the clock this
+  // walks follows the §10.1 schedule exactly rather than the host's timing. The
+  // sequence terminates at the anti-pin ceiling; the iteration cap is a hang
+  // guard, not a bound the assertions rely on.
+  let mut rounds_on_v4: Vec<Duration> = Vec::new();
+  let mut t = base;
+  for _ in 0..512 {
+    let before = v4_wire_len(&v4_log);
+    state
+      .drain_withdrawals(t, &mut DrainBudget::new(t), &mut scratch)
+      .await;
+    if v4_wire_len(&v4_log) > before {
+      rounds_on_v4.push(t.saturating_duration_since(base));
+    }
+    let Some(due) = state.endpoint.next_withdrawal_deadline() else {
+      break;
+    };
+    t = due.max(t);
+  }
+
+  assert!(
+    !state.services.contains_key(&handle),
+    "the withdrawal must have settled; otherwise the loop stopped on its hang \
+     guard and the counts below mean nothing"
+  );
+  assert!(
+    t.saturating_duration_since(base) >= GOODBYE_CEILING,
+    "v6 never carried its goodbye, so the item must have run to its \
+     {GOODBYE_CEILING:?} anti-pin ceiling — a shorter run means the rounds v4 \
+     was NOT offered were never produced in the first place"
+  );
+  assert_eq!(
+    rounds_on_v4.len(),
+    GOODBYE_ROUNDS_PER_FAMILY,
+    "v4 owed exactly its §10.1 budget and paid it; every datagram after that \
+     retracts records no v4 peer still holds, and exists only because v6 is \
+     retrying. Rounds reached v4's wire at: {rounds_on_v4:?}"
+  );
+  for pair in rounds_on_v4.windows(2) {
+    let gap = pair[1].saturating_sub(pair[0]);
+    assert!(
+      gap >= GOODBYE_MIN_FAMILY_GAP,
+      "two goodbyes for one name reached v4's wire {gap:?} apart, inside the \
+       {GOODBYE_MIN_FAMILY_GAP:?} §10.1 gives one family's wire — the blocked \
+       family's retry cadence was applied to the paid family's transmissions"
+    );
+  }
+  drop(reg);
 }
 
 /// Repeated budget cuts must eventually service EVERY producer.

@@ -17,7 +17,7 @@ use core::{net::SocketAddr, time::Duration};
 use mdns_proto::{
   CollectedAnswer, EndpointConfig, Instant, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec,
   cache::CacheEntry,
-  endpoint::{Endpoint, EndpointEventEntry, ServiceRoute, WithdrawalSend},
+  endpoint::{Endpoint, EndpointEventEntry, FamilyDebt, ServiceRoute, WithdrawalSend},
   error::{RegisterServiceError, StartQueryError},
   event::{EndpointEvent, QueryUpdate, RouteEvent, ServiceUpdate},
   query::Query,
@@ -260,6 +260,16 @@ enum FamilySend {
   Unsupported,
   /// Socket transiently full; will be retried.
   Busy,
+  /// A present socket was NOT offered an RFC 6762 §10.1 goodbye because the
+  /// core's [`FamilyDebt`] says this family has already paid every round it owed.
+  /// Withdrawal-only ([`Tx::burst`]): the positive-TTL path has no per-family
+  /// debt, so nothing there can produce it.
+  ///
+  /// Distinct from every other variant because each of the others is a claim
+  /// about the transport. This one is a claim about the item: the socket is
+  /// healthy and would have carried the datagram, there was simply nothing left
+  /// for it to retract.
+  NotOwed,
 }
 
 impl FamilySend {
@@ -276,7 +286,11 @@ impl FamilySend {
   const fn delivery(self) -> FamilyDelivery {
     match self {
       FamilySend::Sent(_) => FamilyDelivery::Delivered,
-      FamilySend::Busy | FamilySend::Gated | FamilySend::Failed => FamilyDelivery::Missed,
+      // `NotOwed` cannot arise on the positive-TTL path (only `burst` produces
+      // it), and `Missed` is the arm that excuses nothing if it ever did.
+      FamilySend::Busy | FamilySend::Gated | FamilySend::Failed | FamilySend::NotOwed => {
+        FamilyDelivery::Missed
+      }
       FamilySend::Unsupported => FamilyDelivery::Unobligated,
     }
   }
@@ -287,12 +301,18 @@ impl FamilySend {
   /// `Retry`); an absent socket or a real I/O failure writes the debt off
   /// (`Unsupported`/`Failed` → `WriteOff`), since that family has no reachable
   /// peers to withdraw from.
+  ///
+  /// A family withheld because the core's debt says it has already paid
+  /// (`NotOwed`) reports `Retry`, the one answer that touches neither the debt
+  /// nor the schedule. `WriteOff` — which is what this driver used to launder a
+  /// not-owed family as, by leaving its slot at `Unsupported` — would zero a
+  /// debt the withholding merely assumed was already zero.
   fn withdrawal_send(self) -> WithdrawalSend {
     match self {
       FamilySend::Sent(_) => WithdrawalSend::Sent,
       // `Gated` is unreachable for a goodbye burst — it is ungated (see
       // `Self::burst`) — and keeps the debt if it ever appears.
-      FamilySend::Busy | FamilySend::Gated => WithdrawalSend::Retry,
+      FamilySend::Busy | FamilySend::Gated | FamilySend::NotOwed => WithdrawalSend::Retry,
       FamilySend::Unsupported | FamilySend::Failed => WithdrawalSend::WriteOff,
     }
   }
@@ -586,51 +606,52 @@ impl<I: Instant> Multicaster<I> {
   }
 
   /// Fan ONE endpoint-owned withdrawal (TTL=0 goodbye) datagram out to every
-  /// family that still owes a send this round, in priority order ([`family_order`],
-  /// so a one-slot transport stays fair). `owed` is a per-family one-shot gate for
-  /// THIS round (the driver passes `[1, 1]` and discards the result) — the
-  /// multi-round resend schedule is owned by [`Endpoint::note_withdrawal_result`],
-  /// NOT by this method. A family that queues decrements its gate (to 0); a family
-  /// with NO socket (`Unsupported`) or a permanently-too-large datagram (`TooLarge`)
-  /// is written off; a busy family keeps its gate but, since the driver discards
-  /// `owed`, simply reports `Busy` for this round (the endpoint re-arms it).
-  /// Maintains `failing_since` so the prioritisation favours whichever family is
-  /// behind. Not fingerprinted (a goodbye loopback is harmless — it withdraws
-  /// records already being withdrawn).
+  /// family `debt` says still owes a goodbye for this item, in priority order
+  /// ([`family_order`], so a one-slot transport stays fair).
+  ///
+  /// `debt` comes from the core on the round itself
+  /// ([`mdns_proto::endpoint::WithdrawalTransmit::debt`]) and is the whole of the
+  /// admission decision. It is not a schedule: the multi-round resend schedule is
+  /// owned by [`Endpoint::note_withdrawal_result`], and this method holds no state
+  /// about it. An item stays selectable while EITHER family owes, so a family that
+  /// has paid every round it owed would otherwise be handed each round the other
+  /// family's retries produce — a retraction of records no peer on that family
+  /// still holds, at whatever cadence the other family's failures set.
+  ///
+  /// A family with NO socket (`Unsupported`) or a permanently-too-large datagram
+  /// (`TooLarge`) is written off by the core; a busy family keeps its debt and is
+  /// re-armed. Maintains `failing_since` so the prioritisation favours whichever
+  /// family is behind. Not fingerprinted (a goodbye loopback is harmless — it
+  /// withdraws records already being withdrawn).
   ///
   /// Returns a [`Fanout`] with the per-family outcome so the caller can derive
   /// EXACT stats: `packets_tx`/`bytes_tx` for `Sent`, `send_errors` for `Failed`,
-  /// nothing for `Unsupported`/`Busy`, and `any_sent` for the
+  /// nothing for `Unsupported`/`Busy`/`NotOwed`, and `any_sent` for the
   /// [`Endpoint::note_withdrawal_result`] delivery confirmation.
-  fn burst<T: UdpIo>(&mut self, io: &mut T, data: &[u8], owed: &mut [u8; 2], now: I) -> Fanout {
-    let mut results = [FamilySend::Unsupported; 2];
+  fn burst<T: UdpIo>(&mut self, io: &mut T, data: &[u8], debt: FamilyDebt, now: I) -> Fanout {
+    let owed = [debt.v4_owed(), debt.v6_owed()];
+    let mut results = [FamilySend::NotOwed; 2];
     for (idx, group) in family_order(&self.failing_since) {
-      if owed[idx] == 0 {
-        // Already finished for this family — leave result as Unsupported
-        // (finished-not-owed, not an error, no packet, no send_errors).
+      if !owed.get(idx).copied().unwrap_or(false) {
+        // This family has already retracted everything the item withdraws — no
+        // syscall, no packet, no send_errors, and reported as a deferral so the
+        // core's (already-zero) debt is left exactly as it is.
         continue;
       }
       let outcome = match io.try_send(data, group) {
         Ok(()) => {
           self.failing_since[idx] = None;
-          owed[idx] = owed[idx].saturating_sub(1);
           FamilySend::Sent(data.len())
         }
         // No socket for this family: write it off (no withdrawal possible, no
         // error — there's simply no socket to fail). Do NOT count as send_errors.
-        Err(SendError::Unsupported) => {
-          owed[idx] = 0;
-          FamilySend::Unsupported
-        }
+        Err(SendError::Unsupported) => FamilySend::Unsupported,
         // Permanently too large for this socket's buffer: write it off and
         // count as a real send error (the socket exists but rejects the datagram).
         // (A queued goodbye is a subset of records already announced within the
         // §17 ceiling, so TooLarge here is defensive, but still a real failure.)
-        Err(SendError::TooLarge) => {
-          owed[idx] = 0;
-          FamilySend::Failed
-        }
-        // Busy (transiently or persistently): keep the count and retry next call.
+        Err(SendError::TooLarge) => FamilySend::Failed,
+        // Busy (transiently or persistently): keep the debt and retry next round.
         Err(SendError::Busy) => {
           self.failing_since[idx].get_or_insert(now);
           FamilySend::Busy
@@ -1098,24 +1119,23 @@ where
     // ── Endpoint-owned withdrawals (RFC 6762 §10.1 goodbyes) ─────────────────
     // Pump every due TTL=0 goodbye datagram. The endpoint encodes each (with
     // fresh sibling host-address retention computed internally), hands back the
-    // multicast datagram + the item's opaque withdrawal token; the driver fans it
-    // out to BOTH groups (`tx.burst`, the SAME per-family send path the old goodbye
-    // burst used) and reports back whether at least one family sent so the endpoint
-    // can spend / re-arm the resend round.
-    while let Some((dst, len, token)) = self.endpoint.poll_withdrawal_transmit(now, scratch) {
+    // multicast datagram + the item's opaque withdrawal token and per-family debt;
+    // the driver fans it out to the groups that debt names (`tx.burst`, the SAME
+    // per-family send path the old goodbye burst used) and reports back each
+    // family's outcome so the endpoint can spend / re-arm the resend round.
+    while let Some(round) = self.endpoint.poll_withdrawal_transmit(now, scratch) {
+      let (len, token, debt) = (round.len(), round.token(), round.debt());
       // The endpoint always returns the multicast marker; the driver fans the
-      // datagram to both groups regardless. Assert the contract in debug builds.
+      // datagram to every group the debt still names. Assert the contract in debug
+      // builds.
       debug_assert_eq!(
-        dst, MDNS_SOCKET_V4,
+        round.dst(),
+        MDNS_SOCKET_V4,
         "withdrawal dst must be the multicast marker"
       );
-      let _ = dst;
-      // `owed = [1, 1]` is a throwaway one-shot-per-family gate for THIS round —
-      // the endpoint owns the multi-round schedule, so the mutation is discarded.
-      let mut owed = [1u8; 2];
       // Split borrow: `tx` and `endpoint` are disjoint fields. Re-borrow `scratch`
       // immutably here (the `poll_withdrawal_transmit` borrow ended on return).
-      let fanout = self.tx.burst(io, &scratch[..len], &mut owed, now);
+      let fanout = self.tx.burst(io, &scratch[..len], debt, now);
       #[cfg(feature = "stats")]
       {
         // packets_tx / bytes_tx: one per family that returned Sent.

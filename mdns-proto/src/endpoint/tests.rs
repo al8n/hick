@@ -4323,9 +4323,10 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
   ep.begin_withdrawal(a_handle, snap, now);
 
   let mut buf = std::vec![0u8; 4096];
-  let (_dst, len, got) = ep
+  let round = ep
     .poll_withdrawal_transmit(now, &mut buf)
     .expect("a due withdrawal must produce a datagram");
+  let (len, got) = (round.len(), round.token());
   assert_eq!(
     Some(got),
     ep.route_withdrawal_token(a_handle),
@@ -4412,9 +4413,10 @@ fn poll_withdrawn_v4(
   now: StdInstant,
 ) -> (std::vec::Vec<Ipv4Addr>, WithdrawalToken) {
   let mut buf = std::vec![0u8; 4096];
-  let (_dst, len, token) = ep
+  let round = ep
     .poll_withdrawal_transmit(now, &mut buf)
     .expect("a due withdrawal must produce a datagram");
+  let (len, token) = (round.len(), round.token());
   let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
   let mut withdrawn = std::vec::Vec::new();
   for rec in reader.answers() {
@@ -4861,6 +4863,143 @@ fn withdrawal_not_freed_until_every_family_sent() {
   );
 }
 
+/// The round a driver is handed NAMES the families it is for.
+///
+/// An item stays selectable while EITHER family owes, so once v4 has paid its
+/// whole §10.1 budget and v6 is still failing, every further round exists for v6
+/// alone. `WithdrawalTransmit::debt` is the only thing that says so; without it a
+/// driver can do nothing but fan to both, retracting on v4 records no v4 peer
+/// still holds — at the 20 ms retry cadence, since a redundant `Sent` is
+/// correctly not progress.
+///
+/// Also pins what a driver reports for the family it withheld on that basis:
+/// `Retry` alone leaves both the debt and the schedule exactly as a family that
+/// was never offered the round should leave them.
+#[test]
+fn a_withdrawal_round_names_the_families_that_still_owe() {
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    inst,
+    Name::try_from_str("h.local.").unwrap(),
+    631,
+    120,
+  );
+  let (h, _svc) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs.clone()),
+      now,
+    )
+    .unwrap();
+  let snap = crate::service::WithdrawalSnapshot {
+    records: recs,
+    owned: crate::service::EmittedRecords::new(
+      true,
+      true,
+      true,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    ),
+    host_a: std::vec::Vec::new(),
+    host_aaaa: std::vec::Vec::new(),
+  };
+  ep.begin_withdrawal(h, snap, now);
+
+  let mut buf = std::vec![0u8; 4096];
+  let mut t = now;
+  let first = ep
+    .poll_withdrawal_transmit(t, &mut buf)
+    .expect("a freshly begun withdrawal is due at once");
+  assert!(
+    first.debt().v4_owed() && first.debt().v6_owed(),
+    "a withdrawal that has paid nothing owes on both families"
+  );
+
+  // v4 pays its whole budget while v6 stays busy. Each round makes real progress
+  // (v4 still owed), so the schedule re-arms at the §10.1 interval.
+  for _ in 0..super::WITHDRAWAL_SENDS {
+    let round = ep
+      .poll_withdrawal_transmit(t, &mut buf)
+      .expect("v4 still owes, so a round is due");
+    ep.note_withdrawal_result(
+      round.token(),
+      t,
+      super::WithdrawalSend::Sent,
+      super::WithdrawalSend::Retry,
+    );
+    t = t.checked_add_duration(super::WITHDRAWAL_INTERVAL).unwrap();
+  }
+  assert_eq!(
+    ep.route_withdrawal_owed(h),
+    Some([0, super::WITHDRAWAL_SENDS]),
+    "v4 has paid its whole budget; v6 has paid nothing"
+  );
+
+  let round = ep
+    .poll_withdrawal_transmit(t, &mut buf)
+    .expect("v6 still owes, so the item is still selectable");
+  assert!(
+    !round.debt().v4_owed(),
+    "v4 has paid every round it owed, so this datagram is not for it — another \
+     copy on v4's wire retracts records no v4 peer still holds"
+  );
+  assert!(
+    round.debt().v6_owed(),
+    "v6 is the family this round exists for"
+  );
+
+  // v6 finally carries it; v4 is reported as the family the driver withheld.
+  ep.note_withdrawal_result(
+    round.token(),
+    t,
+    super::WithdrawalSend::Retry,
+    super::WithdrawalSend::Sent,
+  );
+  assert_eq!(
+    ep.route_withdrawal_owed(h),
+    Some([0, super::WITHDRAWAL_SENDS - 1]),
+    "a withheld family's `Retry` moves no debt, and v6's `Sent` spends exactly \
+     one of its own rounds"
+  );
+  assert_eq!(
+    ep.route_withdrawal_next_at(h).unwrap(),
+    t.checked_add_duration(super::WITHDRAWAL_INTERVAL).unwrap(),
+    "v6 made real progress, so the item re-arms at the §10.1 interval"
+  );
+
+  // The round that produced the storm: v6 fails too, so nothing is spent and the
+  // item re-arms on the short backoff — which is exactly the cadence a redundant
+  // v4 datagram would then have been emitted at.
+  t = t.checked_add_duration(super::WITHDRAWAL_INTERVAL).unwrap();
+  let round = ep
+    .poll_withdrawal_transmit(t, &mut buf)
+    .expect("v6 still owes");
+  assert!(
+    !round.debt().v4_owed() && round.debt().v6_owed(),
+    "the debt still names v6 alone"
+  );
+  ep.note_withdrawal_result(
+    round.token(),
+    t,
+    super::WithdrawalSend::Retry,
+    super::WithdrawalSend::Retry,
+  );
+  assert_eq!(
+    ep.route_withdrawal_owed(h),
+    Some([0, super::WITHDRAWAL_SENDS - 1]),
+    "a round no family carried spends nothing"
+  );
+  assert_eq!(
+    ep.route_withdrawal_next_at(h).unwrap(),
+    t.checked_add_duration(super::WITHDRAWAL_RETRY_BACKOFF)
+      .unwrap(),
+    "no progress, so the item re-arms on the short backoff for v6's sake"
+  );
+}
+
 /// a family reported `WriteOff` (no socket / permanent error) has its debt
 /// zeroed, so the withdrawal can complete via the OTHER family alone — a down
 /// family has no reachable peers to withdraw from, so it must not pin the name.
@@ -5183,8 +5322,9 @@ fn encode_failing_withdrawal_does_not_block_a_sibling() {
   // return B's datagram.
   let mut scratch = std::vec![0u8; 128];
   let got = ep.poll_withdrawal_transmit(now, &mut scratch);
-  let (_dst, _len, got_handle) =
-    got.expect("the pump must scan past the encode-failing A and return B's goodbye");
+  let got_handle = got
+    .expect("the pump must scan past the encode-failing A and return B's goodbye")
+    .token();
   assert_eq!(
     Some(got_handle),
     ep.route_withdrawal_token(b),
@@ -5355,9 +5495,10 @@ fn teardown_during_rename_goodbye_withdraws_old_and_new_name() {
   let mut saw_new_datagram = false;
   let mut saw_old_datagram = false;
   for _ in 0..2 {
-    let (_dst, len, token) = ep
+    let round = ep
       .poll_withdrawal_transmit(now, &mut buf)
       .expect("each rename-window item is due at now and emits its own datagram");
+    let (len, token) = (round.len(), round.token());
     let (saw_old, saw_new, withdrawn_v4, withdrawn_v6) = parse(buf.get(..len).unwrap());
     if saw_new {
       assert_eq!(token, token_b, "B's datagram round-trips B's route token");
@@ -5460,9 +5601,9 @@ fn collision_old_name_holds_against_reregister_until_goodbye_completes() {
   let mut out: std::vec::Vec<crate::ServiceHandle> = std::vec::Vec::new();
   let mut t = now;
   for _ in 0..20 {
-    while let Some((_, _, tok)) = ep.poll_withdrawal_transmit(t, &mut buf) {
+    while let Some(round) = ep.poll_withdrawal_transmit(t, &mut buf) {
       ep.note_withdrawal_result(
-        tok,
+        round.token(),
         t,
         super::WithdrawalSend::Sent,
         super::WithdrawalSend::Sent,
@@ -5671,9 +5812,10 @@ fn rename_enqueues_a_detached_withdrawal_for_the_old_name() {
   // It emits a TTL=0 instance goodbye for the OLD name (PTR/SRV/TXT), no host
   // addresses; the returned token is NOT a route token (it holds no route).
   let mut buf = std::vec![0u8; 4096];
-  let (_dst, len, token) = ep
+  let round = ep
     .poll_withdrawal_transmit(now, &mut buf)
     .expect("the detached old-name item is due and emits its goodbye");
+  let (len, token) = (round.len(), round.token());
   let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
   let mut saw_old_srv = false;
   let mut saw_host_addr = false;
@@ -5853,9 +5995,10 @@ fn rename_only_withdrawal_emits_old_name_goodbye() {
   // completes in place), so the only datagram is the detached old-name goodbye.
   let mut buf = std::vec![0u8; 4096];
   let detached_token = {
-    let (_dst, len, token) = ep
+    let round = ep
       .poll_withdrawal_transmit(now, &mut buf)
       .expect("the detached old-name item must still produce the old-name goodbye");
+    let (len, token) = (round.len(), round.token());
     let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
     let mut saw_old = false;
     for rec in reader.answers() {
@@ -5985,9 +6128,10 @@ fn dual_name_each_fits_but_combined_would_not() {
   let mut len_new = 0usize;
   let mut len_old = 0usize;
   for _ in 0..2 {
-    let (_d, len, token) = ep
+    let round = ep
       .poll_withdrawal_transmit(now, &mut buf)
       .expect("each single-name goodbye fits its own datagram");
+    let (len, token) = (round.len(), round.token());
     let reader = crate::wire::MessageReader::try_parse(buf.get(..len).unwrap()).unwrap();
     let mut saw_new = false;
     let mut saw_old = false;
@@ -6107,9 +6251,10 @@ fn independent_items_unencodable_current_does_not_starve_rename() {
 
   // A scratch too small for the current goodbye but big enough for the old one.
   let mut small = std::vec![0u8; 300];
-  let (_d, len, tok) = ep
+  let round = ep
     .poll_withdrawal_transmit(now, &mut small)
     .expect("the small old-name goodbye is emitted even though the current is unencodable");
+  let (len, tok) = (round.len(), round.token());
   let reader = crate::wire::MessageReader::try_parse(small.get(..len).unwrap()).unwrap();
   let saw_old = reader.answers().any(|r| {
     let r = r.unwrap();
@@ -6568,8 +6713,9 @@ fn owed_family_gets_a_final_attempt_at_ceiling() {
   // matches, but the owed family still gets ONE final attempt.
   let mut buf = std::vec![0u8; 4096];
   let first = ep.poll_withdrawal_transmit(ceiling, &mut buf);
-  let (_dst, _len, got) =
-    first.expect("the owed family must get a FINAL goodbye attempt at the ceiling");
+  let got = first
+    .expect("the owed family must get a FINAL goodbye attempt at the ceiling")
+    .token();
   assert_eq!(
     Some(got),
     ep.route_withdrawal_token(h),
@@ -6871,9 +7017,10 @@ fn retained_only_withdrawal_completes_and_does_not_block_a_sibling() {
   // A single pump must scan PAST the retained-only A and RETURN B's datagram —
   // NOT `None`. (Pre-fix it returned `None` on A, starving B.)
   let mut buf = std::vec![0u8; 4096];
-  let (_dst, len, got) = ep
+  let round = ep
     .poll_withdrawal_transmit(now, &mut buf)
     .expect("the pump must scan past the retained-only A and return B's goodbye");
+  let (len, got) = (round.len(), round.token());
   assert_eq!(
     Some(got),
     ep.route_withdrawal_token(b),
