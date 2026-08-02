@@ -58,6 +58,11 @@ ctor.workspace = true
 tokio = { version = "1", features = ["full"] }
 smol = "2"
 getifs.workspace = true
+# The Bonjour parity test proves, before trusting any premise, that an mDNS
+# round trip actually crosses the interface it is about to bind. That control
+# socket must not share hick's own socket layer, or a defect there would make
+# the control and the code under test fail together and read as a host problem.
+libc.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
