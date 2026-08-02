@@ -320,6 +320,13 @@ impl ClockPair {
 /// [`evidence_mode`] then weakens it per credit when that credit's own wall
 /// stamp did not survive a clock step. No caller can hand in a mode, so no
 /// caller can claim ordering evidence that the inputs do not carry.
+///
+/// That is structural, not a convention: the only function that consumes a mode
+/// is [`reference_ordered`], which is module-private, and **this type appears in
+/// no public signature at all**. It is public so that a driver's own
+/// documentation can name the two states its suppression runs in. A later change
+/// that adds a mode parameter to a public function undoes the guarantee, whatever
+/// this paragraph says.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatchMode {
   /// The reference is a kernel receive timestamp, and the credit's wall stamp
