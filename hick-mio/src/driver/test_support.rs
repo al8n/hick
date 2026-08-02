@@ -11,8 +11,7 @@ use std::{
 };
 
 use mdns_proto::{
-  Name, QuerySpec, ServiceHandle, ServiceRecords, ServiceSpec,
-  endpoint::WithdrawalSend,
+  FamilyAttempt, Name, QuerySpec, ServiceHandle, ServiceRecords, ServiceSpec,
   event::RouteEvent,
   wire::{Header, MessageBuilder, MessageReader, NameRef, ResourceType},
 };
@@ -308,12 +307,13 @@ pub(crate) fn ingest(mdns: &mut Mdns, data: &[u8], now: StdInstant) {
 /// Confirming is what advances the schedule, so repeated calls walk the whole
 /// resend sequence instead of re-encoding the first round forever.
 pub(crate) fn collect_goodbyes(mdns: &mut Mdns, now: StdInstant) -> Vec<Vec<u8>> {
-  collect_goodbyes_as(mdns, now, WithdrawalSend::Sent, WithdrawalSend::Sent)
+  let accepted = FamilyAttempt::Accepted { at: now };
+  collect_goodbyes_as(mdns, now, accepted, accepted)
 }
 
 /// [`collect_goodbyes`] with the per-family outcome chosen by the caller.
 ///
-/// A family reported as [`WithdrawalSend::Retry`] keeps its debt, which is how a
+/// A family reported [`FamilyAttempt::Refused`] keeps its debt, which is how a
 /// test reproduces "this family's send failed" without a socket that can be made
 /// to fail. Per-family debt is the whole of what the §10.1 schedule and the §9
 /// name hold turn on, so a test that can only report both families succeeding
@@ -321,8 +321,8 @@ pub(crate) fn collect_goodbyes(mdns: &mut Mdns, now: StdInstant) -> Vec<Vec<u8>>
 pub(crate) fn collect_goodbyes_as(
   mdns: &mut Mdns,
   now: StdInstant,
-  v4: WithdrawalSend,
-  v6: WithdrawalSend,
+  v4: FamilyAttempt<StdInstant>,
+  v6: FamilyAttempt<StdInstant>,
 ) -> Vec<Vec<u8>> {
   let mut out = Vec::new();
   let mut scratch = vec![0u8; 1500];

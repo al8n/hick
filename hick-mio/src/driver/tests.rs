@@ -4,8 +4,7 @@ use std::{
 };
 
 use mdns_proto::{
-  CollectedAnswer, FamilyDelivery, ServiceState, ServiceUpdate,
-  endpoint::WithdrawalSend,
+  CollectedAnswer, FamilyAttempt, ServiceState, ServiceUpdate,
   wire::{ResourceClass, ResourceType},
 };
 use mio::{Poll, Token};
@@ -387,8 +386,10 @@ fn a_multicast_send_takes_one_credit_per_family_that_reached_the_wire() {
     1,
     "the credit is taken at the syscall that produced the loopback copy"
   );
-  assert!(summary.accepted_at.is_some());
-  assert!(summary.delivery.all_delivered());
+  assert!(matches!(
+    summary.attempts[Family::V4.index()],
+    FamilyAttempt::Accepted { .. }
+  ));
   // Take it back with the body: the credit is keyed to the family that carried
   // it and to the fingerprint of what went out. No receive stamp is offered, so
   // the claim runs on content and family alone.
@@ -424,10 +425,9 @@ fn a_refused_send_takes_no_credit_and_reports_the_family_missed() {
     Duration::ZERO,
   );
   assert_eq!(summary.sent, 0);
-  assert_eq!(summary.accepted_at, None);
   assert_eq!(
-    summary.delivery.v4(),
-    mdns_proto::FamilyDelivery::Missed,
+    summary.attempts[Family::V4.index()],
+    FamilyAttempt::Refused { permanent: false },
     "the family was obligated and did not carry it"
   );
   assert_eq!(
@@ -477,8 +477,8 @@ fn a_families_wire_gate_withholds_a_second_datagram_inside_the_minimum_gap() {
   );
   assert_eq!(second.sent, 0, "no syscall was made for the gated family");
   assert_eq!(
-    second.delivery.v4(),
-    mdns_proto::FamilyDelivery::Missed,
+    second.attempts[Family::V4.index()],
+    FamilyAttempt::GateShut,
     "the socket is there and the datagram was meant for it; reporting it \
      absent would let the phase advance without the wire"
   );
@@ -681,7 +681,10 @@ fn a_unicast_reply_takes_no_self_send_credit() {
   assert_eq!(summary.sent, 1, "the unicast reply really did go out");
   assert_eq!(selfsend.len(), 0, "and it will never come back");
   assert!(
-    summary.delivery.all_delivered(),
+    matches!(
+      summary.attempts[Family::V4.index()],
+      FamilyAttempt::Accepted { .. }
+    ),
     "exactly one family is obligated by a unicast destination"
   );
 }
@@ -784,12 +787,12 @@ fn an_absent_family_is_written_off_and_a_present_one_never_is() {
   );
   assert_eq!(
     v6,
-    WithdrawalSend::WriteOff,
+    FamilyAttempt::NoSocket,
     "an unbound family has no peers to withdraw from; its debt must not pin the route"
   );
   assert_ne!(
     v4,
-    WithdrawalSend::WriteOff,
+    FamilyAttempt::NoSocket,
     "a bound family must keep its debt until it sends or the ceiling frees it"
   );
 }
@@ -820,7 +823,7 @@ fn a_refused_family_keeps_its_goodbye_debt() {
   );
   assert_eq!(
     v4,
-    WithdrawalSend::Retry,
+    FamilyAttempt::Refused { permanent: false },
     "nothing reached this family's wire, so its debt must survive to the next \
      scheduled round"
   );
@@ -864,7 +867,7 @@ fn a_withdrawal_datagram_takes_one_self_send_credit_per_syscall() {
   let credits = selfsend.len() - before_credits;
   let sent = [v4, v6]
     .into_iter()
-    .filter(|o| *o == WithdrawalSend::Sent)
+    .filter(|o| matches!(o, FamilyAttempt::Accepted { .. }))
     .count();
   assert_eq!(
     credits, sent,
@@ -1349,9 +1352,12 @@ fn an_unpaid_ipv6_retraction_holds_the_old_name_against_immediate_reuse() {
   for round in 1..=4u32 {
     let at = base + Duration::from_millis(260 * u64::from(round));
     last_round = at;
-    for datagram in
-      test_support::collect_goodbyes_as(&mut mdns, at, WithdrawalSend::Sent, WithdrawalSend::Retry)
-    {
+    for datagram in test_support::collect_goodbyes_as(
+      &mut mdns,
+      at,
+      FamilyAttempt::Accepted { at },
+      FamilyAttempt::Refused { permanent: false },
+    ) {
       retracted_subtype |= test_support::retracts(&datagram, &subtype_browse);
     }
   }
@@ -1581,8 +1587,8 @@ fn two_withdrawal_items_take_two_creation_instants() {
   let due = test_support::collect_goodbyes_as(
     &mut mdns,
     first,
-    WithdrawalSend::Retry,
-    WithdrawalSend::Retry,
+    FamilyAttempt::Refused { permanent: false },
+    FamilyAttempt::Refused { permanent: false },
   );
   assert_eq!(
     due.len(),
@@ -4304,9 +4310,11 @@ fn the_second_family_is_admitted_at_its_own_offer_not_at_the_fan_outs() {
       gap,
     )
   };
-  assert_eq!(
-    summary.delivery.v6(),
-    FamilyDelivery::Delivered,
+  assert!(
+    matches!(
+      summary.attempts[Family::V6.index()],
+      FamilyAttempt::Accepted { .. }
+    ),
     "v6's {gap:?} came due {CROSS_FAMILY_MARGIN:?} into v4's {CROSS_FAMILY_STALL:?} stall, \
      before v6 had been offered anything at all — reporting it missed weighs v6's admission \
      at v4's instant and spends the core's partial-round patience on a ready wire"

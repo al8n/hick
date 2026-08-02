@@ -40,7 +40,7 @@ use crate::{
   query::{CollectedAnswer, Query},
   service::{FullyAnnounced, Service},
   trace::*,
-  transmit::{Transmit, TransmitDelivery},
+  transmit::{FamilyAttempt, Transmit, TransmitConfirm},
   wire::{MessageReader, NameRef, ResourceClass, ResourceType},
 };
 
@@ -66,25 +66,85 @@ cfg_heap! {
 }
 
 cfg_heap! {
-  /// Per-family result of sending one withdrawal (RFC 6762 §10.1 goodbye)
-  /// datagram, reported to [`Endpoint::note_withdrawal_result`] for EACH address
-  /// family so a withdrawal only completes once every reachable family has
-  /// withdrawn its records.
+  /// What ONE family's RFC 6762 §10.1 goodbye attempt does to that family's
+  /// outstanding debt — the CORE's projection of a [`FamilyAttempt`], reached
+  /// only through [`WithdrawalSend::project`].
+  ///
+  /// Internal for the same reason [`FamilyDelivery`](crate::transmit::FamilyDelivery)
+  /// is: a driver able to name a write-off is a driver able to zero a debt that a
+  /// bound family still owes, freeing the route while that family's peers stay
+  /// pinned to stale positive-TTL records. Two drivers disagreed about exactly
+  /// that table before this projection existed.
   #[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
   #[display("{}", self.as_str())]
-  pub enum WithdrawalSend {
+  pub(crate) enum WithdrawalSend {
     /// The datagram reached the wire on this family — spend one of its owed rounds.
     Sent,
-    /// Transiently undeliverable (socket busy) — keep this family's debt, retry.
+    /// This family did not carry it, and may yet: keep its debt for a later round.
     Retry,
-    /// This family is permanently unavailable (no socket / permanent send error) —
-    /// write its debt off (it has no reachable peers to withdraw from).
+    /// This family has no socket at all, so it has no reachable peers to withdraw
+    /// from — write its debt off rather than let it pin the item.
     WriteOff,
   }
 
   impl WithdrawalSend {
+    /// THE withdrawal table: what one family's attempt does to its goodbye debt,
+    /// decided by socket PRESENCE and never by error kind.
+    ///
+    /// | [`FamilyAttempt`] | outcome | why |
+    /// |---|---|---|
+    /// | `Accepted` | `Sent` | on the wire; spend one owed round |
+    /// | `Refused { permanent: false }` | `Retry` | a present socket did not carry it; the §10.1 ceiling is the backstop |
+    /// | `Refused { permanent: true }` | `Retry` | same — see below |
+    /// | `WouldBlock` | `Retry` | nothing was submitted; the next round pays it |
+    /// | `GateShut` | `Retry` | a deferral is not a write-off |
+    /// | `NotAddressed` | `Retry` | a goodbye fans onto every joined group, so this is not producible here; keeping the debt is the safe answer if it ever is |
+    /// | `NoSocket` | `WriteOff` | nothing bound, so no peers on this family to retract from |
+    ///
+    /// **A permanent refusal KEEPS the debt**, and the asymmetry with a
+    /// positive-TTL transmit is deliberate. There, an undeliverable datagram
+    /// retires a producer that would otherwise re-arm it forever, because the
+    /// producer is what is unbounded. Here nothing is: the item's own anti-pin
+    /// ceiling force-completes it whatever the family answers, so the ONLY thing a
+    /// write-off could buy is finishing marginally sooner — at the price of the
+    /// exact defect this table exists to prevent. The direction stays one-sided:
+    /// **only an absent socket writes a debt off.**
+    ///
+    /// [`FamilyAttempt::NoSocket`] and [`FamilyAttempt::NotAddressed`] are
+    /// separate variants precisely so this row can differ from the failing ones.
+    /// Conflating a `NoSocket` family with a failing one breaks something in
+    /// either direction: as `Retry`, an unbound family's debt pins every
+    /// withdrawal to its full ceiling on a single-stack host; as `WriteOff`, a
+    /// bound family's transient failure frees the route while it still owed its
+    /// goodbye.
+    fn project<I: Instant>(attempt: FamilyAttempt<I>) -> Self {
+      match attempt {
+        FamilyAttempt::Accepted { .. } => Self::Sent,
+        FamilyAttempt::Refused { .. }
+        | FamilyAttempt::WouldBlock
+        | FamilyAttempt::GateShut
+        | FamilyAttempt::NotAddressed => Self::Retry,
+        FamilyAttempt::NoSocket => Self::WriteOff,
+      }
+    }
+
+    /// Test-only: one [`FamilyAttempt`] that projects onto this outcome, so a
+    /// withdrawal test can name the debt effect it is about rather than an I/O
+    /// outcome it is not. The chosen preimage is the dullest one — see
+    /// `TransmitDelivery::as_attempts`, which does the same for a transmit.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) const fn as_attempt<I: Instant>(self, at: I) -> FamilyAttempt<I> {
+      match self {
+        Self::Sent => FamilyAttempt::Accepted { at },
+        Self::Retry => FamilyAttempt::Refused { permanent: false },
+        Self::WriteOff => FamilyAttempt::NoSocket,
+      }
+    }
+
     /// Canonical lowercase slug for this per-family send outcome.
-    pub const fn as_str(&self) -> &'static str {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn as_str(&self) -> &'static str {
       match self {
         Self::Sent => "sent",
         Self::Retry => "retry",

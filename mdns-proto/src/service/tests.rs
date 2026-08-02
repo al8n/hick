@@ -88,7 +88,7 @@ fn non_probing_service_announces_without_probing() {
       ever_probed = true;
     }
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if svc.state() == ServiceState::Established {
       break;
@@ -469,7 +469,7 @@ fn drive_to_established(
     // Simulate the driver confirming a successful send so the
     // announce/host_advertised guards latch as they would in production.
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if svc.state() == ServiceState::Established {
       return now;
@@ -504,7 +504,7 @@ fn empty_txt_encodes_as_single_zero_length_string() {
           break 'drive;
         }
       }
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
   }
   assert_eq!(
@@ -646,7 +646,7 @@ fn announce_guards_latch_only_on_confirmed_delivery() {
         break 'drive;
       }
       // Confirm each probe so the lifecycle progresses to Announcing.
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
   }
   assert!(
@@ -662,7 +662,7 @@ fn announce_guards_latch_only_on_confirmed_delivery() {
 
   // Confirm delivery → guards latch (a goodbye is now produced; the
   // datagram-level withdrawal is covered by the endpoint withdrawal tests).
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
     svc.advertises_host(),
     "host ownership must latch on confirmed delivery"
@@ -686,7 +686,7 @@ fn announce_phase_does_not_advance_without_confirmed_send() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(0)) {
       break;
@@ -711,7 +711,7 @@ fn announce_phase_does_not_advance_without_confirmed_send() {
       svc.poll_transmit(now, &mut buf).unwrap().is_some(),
       "an announcement must be (re)emitted each cycle while unconfirmed"
     );
-    svc.note_transmit_outcome(now, TransmitDelivery::NONE); // send failed — re-arm, do NOT advance
+    svc.note_delivery(now, TransmitDelivery::NONE); // send failed — re-arm, do NOT advance
     assert!(
       matches!(svc.state(), ServiceState::Announcing(0)),
       "phase must NOT advance without a confirmed send; got {:?}",
@@ -734,7 +734,7 @@ fn announce_phase_does_not_advance_without_confirmed_send() {
   now = now.advance(1000);
   svc.handle_timeout(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
     matches!(svc.state(), ServiceState::Announcing(1)),
     "phase advances on the first confirmed announcement; got {:?}",
@@ -765,7 +765,7 @@ fn probe_sequence_does_not_advance_without_confirmed_send() {
       if matches!(svc.awaiting_confirm, Some(AwaitingConfirm::Probe)) {
         probes_emitted += 1;
       }
-      svc.note_transmit_outcome(now, TransmitDelivery::NONE);
+      svc.note_delivery(now, TransmitDelivery::NONE);
     }
     assert!(
       matches!(svc.state(), ServiceState::Init | ServiceState::Probing(_)),
@@ -792,7 +792,7 @@ fn probe_sequence_does_not_advance_without_confirmed_send() {
   now = now.advance(500);
   svc.handle_timeout(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
     matches!(svc.state(), ServiceState::Probing(1)),
     "a confirmed probe advances the sequence; got {:?}",
@@ -823,7 +823,7 @@ fn no_goodbye_after_final_probe_before_first_announcement() {
     // Drain + CONFIRM probes on the way to Announcing; probes
     // don't make a service cache-visible, so they must not enable a goodbye.
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
   }
   assert!(
@@ -865,7 +865,7 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
       if matches!(svc.state(), ServiceState::Announcing(0)) {
         break 'drive;
       }
@@ -920,7 +920,7 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
 
   // Confirm delivery → goodbye ownership latches for every emitted record, even
   // though no announcement has been confirmed and the phase is unchanged.
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   // a legacy reply emits the full set, so BOTH the instance records and
   // the host address latch (earlier the emitted host A was wrongly left
   // unlatched, leaving it unwithdrawn on a later goodbye).
@@ -954,7 +954,7 @@ fn legacy_a_query_reply_latches_full_set() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
       if matches!(svc.state(), ServiceState::Announcing(0)) {
         break 'drive;
       }
@@ -990,7 +990,7 @@ fn legacy_a_query_reply_latches_full_set() {
     ),
     other => panic!("expected a Response commit token, got {other:?}"),
   }
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
     svc.goodbye.any_host(),
     "a host A reply latches host ownership"
@@ -1474,7 +1474,7 @@ fn coalesced_legacy_queriers_each_get_a_response() {
   let mut dsts: std::vec::Vec<core::net::SocketAddr> = std::vec::Vec::new();
   while let Some(t) = svc.poll_transmit(now, &mut buf).unwrap() {
     dsts.push(t.dst());
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL); // confirm before the next poll
+    svc.note_delivery(now, TransmitDelivery::ALL); // confirm before the next poll
   }
   assert!(
     dsts.contains(&a) && dsts.contains(&b),
@@ -1516,7 +1516,7 @@ fn same_source_distinct_legacy_transactions_each_reply() {
     assert_eq!(t.dst(), src);
     let msg = buf.get(..t.size()).unwrap();
     ids.push(MessageReader::try_parse(msg).unwrap().header().id());
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL); // confirm before the next poll
+    svc.note_delivery(now, TransmitDelivery::ALL); // confirm before the next poll
   }
   assert!(
     ids.contains(&11) && ids.contains(&22),
@@ -2450,7 +2450,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(_)) {
       break;
@@ -2464,14 +2464,14 @@ fn question_during_announcing_does_not_shortcut_sequence() {
   // Should be Announcing(0) just after the last probe fired.
   // Drain any pending transmit.
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    svc.note_delivery(now, TransmitDelivery::ALL);
   }
 
   // ── 2. Fire the first announce (Announcing(0) → Announcing(1)) ────
   now = now.advance(500);
   svc.handle_timeout(now).unwrap();
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    svc.note_delivery(now, TransmitDelivery::ALL);
   }
   // We may now be Announcing(1) or Established (if n was already ≥1).
   // Advance until we're in Announcing(1).
@@ -2482,7 +2482,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
   }
   assert!(
@@ -2531,7 +2531,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
     "question during Announcing must produce Response kind, not Announcement"
   );
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    svc.note_delivery(now, TransmitDelivery::ALL);
   }
 
   // ── 6. State must still be Announcing(1) — counter not advanced ──
@@ -2550,7 +2550,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
     "second announce must produce Announcement kind"
   );
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    svc.note_delivery(now, TransmitDelivery::ALL);
   }
   assert_eq!(
     svc.state(),
@@ -2710,7 +2710,7 @@ fn question_does_not_push_out_announce_deadline() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(1)) {
       break;
@@ -2722,7 +2722,7 @@ fn question_does_not_push_out_announce_deadline() {
     );
   }
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    svc.note_delivery(now, TransmitDelivery::ALL);
   } // drain any pending
 
   // ── 2. Record the lifecycle_deadline BEFORE the question ─────────────
@@ -2778,7 +2778,7 @@ fn question_does_not_push_out_announce_deadline() {
     "firing response_deadline must produce Response kind, not Announcement"
   );
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    svc.note_delivery(now, TransmitDelivery::ALL);
   }
 
   // ── 6. lifecycle_deadline must still equal announce_deadline_before ───
@@ -2808,7 +2808,7 @@ fn question_does_not_push_out_announce_deadline() {
     "announce must fire at the original lifecycle_deadline, not at a pushed-out time"
   );
   if let Ok(Some(_)) = svc.poll_transmit(original_announce, &mut buf4096) {
-    svc.note_transmit_outcome(original_announce, TransmitDelivery::ALL);
+    svc.note_delivery(original_announce, TransmitDelivery::ALL);
   }
   assert_eq!(
     svc.state(),
@@ -2990,7 +2990,7 @@ fn same_tick_response_and_lifecycle_both_fire() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(0)) {
       break;
@@ -2998,7 +2998,7 @@ fn same_tick_response_and_lifecycle_both_fire() {
     assert!(now.0 < 10_000, "should reach Announcing(0) within 10 s");
   }
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    svc.note_delivery(now, TransmitDelivery::ALL);
   } // drain any pending
 
   // Record the lifecycle_deadline (the next announce deadline).
@@ -3065,7 +3065,7 @@ fn same_tick_response_and_lifecycle_both_fire() {
   // drain + confirm the queued transmits and verify the phase progressed
   // (Announcing(0) -> Announcing(1)).
   while let Ok(Some(_)) = svc.poll_transmit(announce_dl, &mut buf4096) {
-    svc.note_transmit_outcome(announce_dl, TransmitDelivery::ALL);
+    svc.note_delivery(announce_dl, TransmitDelivery::ALL);
   }
   assert!(
     !matches!(svc.state(), ServiceState::Announcing(0)),
@@ -3111,7 +3111,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(0)) {
       break;
@@ -3119,7 +3119,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
     assert!(now.0 < 10_000, "should reach Announcing(0) within 10 s");
   }
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-    svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+    svc.note_delivery(now, TransmitDelivery::ALL);
   } // drain any pending
 
   // Record the first-announce lifecycle_deadline.
@@ -3170,7 +3170,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
   // the single commit token requires a note_transmit_outcome between
   // polls — the driver confirms after each send, so it still drains both queued
   // transmits across the confirm boundary.
-  svc.note_transmit_outcome(announce_dl, TransmitDelivery::ALL);
+  svc.note_delivery(announce_dl, TransmitDelivery::ALL);
 
   // After draining slot 0 the tail compacts down (FIFO).  The
   // Response that was in slot 1 is now in slot 0, slot 1 is empty.  Either
@@ -3189,7 +3189,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
     t2.is_some(),
     "second poll_transmit must return Some (Response)"
   );
-  svc.note_transmit_outcome(announce_dl, TransmitDelivery::ALL);
+  svc.note_delivery(announce_dl, TransmitDelivery::ALL);
 
   // Queue is now empty.
   let t3 = svc.poll_transmit(announce_dl, &mut buf4096).unwrap();
@@ -3410,7 +3410,7 @@ fn poll_transmit_does_not_lose_pending_on_buffer_too_small() {
     }
     // Drain to avoid blocking state machine, but check before draining.
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
   }
   assert!(
@@ -3552,7 +3552,7 @@ fn poll_transmit_blocks_until_confirmation() {
     "no datagram may be handed out while a prior send is unconfirmed"
   );
   // Confirming frees the single token slot.
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
     svc.awaiting_confirm.is_none(),
     "confirming must clear the commit token"
@@ -3584,7 +3584,7 @@ fn failed_established_reannounce_retries_within_one_second() {
       .is_some(),
     "the periodic re-announce must be emitted"
   );
-  svc.note_transmit_outcome(due, TransmitDelivery::NONE);
+  svc.note_delivery(due, TransmitDelivery::NONE);
   assert!(
     matches!(svc.state(), ServiceState::Established),
     "a failed re-announce must not leave Established"
@@ -3648,7 +3648,7 @@ fn subtype_ptr_advertised_in_response() {
     saw_subtype,
     "a response must include the subtype PTR at positive TTL"
   );
-  svc.note_transmit_outcome(now2, TransmitDelivery::ALL);
+  svc.note_delivery(now2, TransmitDelivery::ALL);
 }
 
 #[test]
@@ -4069,7 +4069,7 @@ fn poll_transmit_announcement_surfaces_buffer_too_small() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
       if matches!(svc.state(), ServiceState::Announcing(0)) {
         break 'drive;
       }
@@ -4327,7 +4327,7 @@ fn partial_kas_suppression_counter_is_delivery_gated() {
 
   let before = stats.snapshot().answers_suppressed_kas;
   // Delivery FAILS — counter must NOT increase.
-  svc.note_transmit_outcome(now2, TransmitDelivery::NONE);
+  svc.note_delivery(now2, TransmitDelivery::NONE);
   let after_fail = stats.snapshot().answers_suppressed_kas;
   assert_eq!(
     after_fail, before,
@@ -4347,7 +4347,7 @@ fn partial_kas_suppression_counter_is_delivery_gated() {
   );
 
   // Delivery SUCCEEDS — counter must increase by the suppressed count (≥ 1, the SRV).
-  svc.note_transmit_outcome(now3, TransmitDelivery::ALL);
+  svc.note_delivery(now3, TransmitDelivery::ALL);
   let after_ok = stats.snapshot().answers_suppressed_kas;
   assert!(
     after_ok > after_fail,
@@ -4535,7 +4535,7 @@ fn multicast_meta_response_counts_responses_tx() {
 
   // delivery=false → responses_tx must remain 0.
   let before = stats.snapshot().responses_tx;
-  svc.note_transmit_outcome(now2, TransmitDelivery::NONE);
+  svc.note_delivery(now2, TransmitDelivery::NONE);
   let after_fail = stats.snapshot().responses_tx;
   assert_eq!(
     after_fail, before,
@@ -4558,7 +4558,7 @@ fn multicast_meta_response_counts_responses_tx() {
   );
 
   // delivery=true → responses_tx must bump by 1.
-  svc.note_transmit_outcome(now3, TransmitDelivery::ALL);
+  svc.note_delivery(now3, TransmitDelivery::ALL);
   let after_ok = stats.snapshot().responses_tx;
   assert_eq!(
     after_ok,
@@ -4605,7 +4605,7 @@ fn legacy_meta_response_counts_responses_tx() {
 
   // delivery=false → responses_tx must remain 0.
   let before = stats.snapshot().responses_tx;
-  svc.note_transmit_outcome(now, TransmitDelivery::NONE);
+  svc.note_delivery(now, TransmitDelivery::NONE);
   let after_fail = stats.snapshot().responses_tx;
   assert_eq!(
     after_fail, before,
@@ -4628,7 +4628,7 @@ fn legacy_meta_response_counts_responses_tx() {
   );
 
   // delivery=true → responses_tx must bump by 1.
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   let after_ok = stats.snapshot().responses_tx;
   assert_eq!(
     after_ok,
@@ -4712,7 +4712,7 @@ fn drive_to_announcing_zero(
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(0)) {
       return now;
@@ -4762,7 +4762,7 @@ fn partial_announcement_latches_ownership_without_advancing_the_phase() {
   let now = drive_to_announcing_zero(&mut svc);
   let at = emit_announcement(&mut svc, now);
 
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
 
   assert!(
     matches!(svc.state(), ServiceState::Announcing(0)),
@@ -4800,7 +4800,7 @@ fn fully_delivered_announcement_latches_ownership_and_advances_the_phase() {
   let now = drive_to_announcing_zero(&mut svc);
   let at = emit_announcement(&mut svc, now);
 
-  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  svc.note_delivery(at, TransmitDelivery::ALL);
 
   assert!(
     matches!(svc.state(), ServiceState::Announcing(1)),
@@ -4819,7 +4819,7 @@ fn undelivered_announcement_neither_latches_nor_advances() {
   let now = drive_to_announcing_zero(&mut svc);
   let at = emit_announcement(&mut svc, now);
 
-  svc.note_transmit_outcome(at, TransmitDelivery::NONE);
+  svc.note_delivery(at, TransmitDelivery::NONE);
 
   assert!(
     matches!(svc.state(), ServiceState::Announcing(0)),
@@ -4865,7 +4865,7 @@ fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
   let mut previous_gap = 0u64;
   for (round, want_ms) in expected_ms.iter().enumerate() {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     let next = svc
       .lifecycle_deadline
       .expect("a partial announcement always re-arms");
@@ -4904,7 +4904,7 @@ fn repeated_partial_announcements_climb_the_rfc_8_3_doubling_ladder() {
 
   // Recovery is immediate and resumes from exactly where the sequence stood.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  svc.note_delivery(at, TransmitDelivery::ALL);
   assert!(
     matches!(svc.state(), ServiceState::Established),
     "recovery resumes the §8.3 sequence at the next step, not from the start; got {:?}",
@@ -4989,7 +4989,7 @@ fn undelivered_announcement_keeps_the_flat_one_second_retry() {
   let now = drive_to_announcing_zero(&mut svc);
   let at = emit_announcement(&mut svc, now);
 
-  svc.note_transmit_outcome(at, TransmitDelivery::NONE);
+  svc.note_delivery(at, TransmitDelivery::NONE);
 
   let next = svc
     .lifecycle_deadline
@@ -5021,7 +5021,7 @@ fn partial_probe_re_arms_the_same_probe_and_latches_nothing() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
       if matches!(svc.state(), ServiceState::Probing(1)) {
         break 'reach;
       }
@@ -5039,7 +5039,7 @@ fn partial_probe_re_arms_the_same_probe_and_latches_nothing() {
     now = now.advance(500);
     svc.handle_timeout(now).unwrap();
     assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-    svc.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(now, TransmitDelivery::V4_ONLY);
     assert!(
       matches!(svc.state(), ServiceState::Probing(1)),
       "a partially-delivered probe must NOT advance the §8.1 sequence; got {:?}",
@@ -5059,7 +5059,7 @@ fn partial_probe_re_arms_the_same_probe_and_latches_nothing() {
   now = now.advance(500);
   svc.handle_timeout(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
     matches!(svc.state(), ServiceState::Probing(2)),
     "recovery resumes the probe sequence where it stood; got {:?}",
@@ -5079,7 +5079,7 @@ fn has_fully_announced_requires_a_fully_delivered_announcement() {
   );
 
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     svc.advertises_instance(),
     "the partial announce DID expose the instance records (the any-fact)"
@@ -5091,7 +5091,7 @@ fn has_fully_announced_requires_a_fully_delivered_announcement() {
   );
 
   let at = emit_announcement(&mut svc, at);
-  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  svc.note_delivery(at, TransmitDelivery::ALL);
   assert!(
     svc.has_fully_announced().get(),
     "the first fully-delivered announcement opens the gate"
@@ -5112,7 +5112,7 @@ fn a_legacy_unicast_reply_never_opens_the_reclaim_cancel_gate() {
 
   // A v4-only announce exposes the instance records without opening the gate.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(svc.advertises_instance() && !svc.has_fully_announced().get());
 
   // A legacy querier (source port != 5353) asks; its unicast reply is fully
@@ -5137,7 +5137,7 @@ fn a_legacy_unicast_reply_never_opens_the_reclaim_cancel_gate() {
     .unwrap()
     .expect("a legacy querier must get a unicast reply");
   assert_eq!(tx.dst(), legacy_src, "the reply is unicast to the resolver");
-  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  svc.note_delivery(at, TransmitDelivery::ALL);
 
   assert!(
     !svc.has_fully_announced().get(),
@@ -5254,7 +5254,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
         }
         other => panic!("unexpected commit token during the lifecycle: {other:?}"),
       }
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if svc.state() == ServiceState::Established {
       break;
@@ -5285,7 +5285,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
     "the periodic re-announce advances no phase, but a partial confirm still \
      re-arms it on the §8.3 ladder — a phase-derived tag would get this wrong"
   );
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
 
   // ── The jittered §6 multicast response ──────────────────────────────────
   inject_question_to_set_response_deadline(&mut svc, now);
@@ -5306,7 +5306,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
     TransmitObligation::OneShot,
     "a response answers one question once and is never re-armed"
   );
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
 
   // ── The §6.7 legacy unicast reply ───────────────────────────────────────
   let legacy_src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
@@ -5331,7 +5331,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
     "§6.7: a legacy reply has one obligated link and is never re-armed, so \
      missing it pins nothing and costs one unanswered question"
   );
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
 
   // ── The RFC 6763 §9 meta-response, unicast then multicast ───────────────
   let meta_q = question_bytes("_services._dns-sd._udp.local.", 12);
@@ -5349,7 +5349,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
     Some(AwaitingConfirm::MetaResponse)
   ));
   assert_eq!(legacy_meta.obligation(), TransmitObligation::OneShot);
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
 
   let meta_src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
   let (qref, _) = QuestionRef::try_parse(&meta_q, 0).unwrap();
@@ -5432,7 +5432,7 @@ fn a_partially_delivered_probe_zero_re_arms_a_full_probe_interval_later() {
   let now = drive_to_probing_zero(&mut svc);
 
   let at = emit_probe(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Probing(0)),
     "a partial probe holds the sequence at probe 0; got {:?}",
@@ -5498,7 +5498,7 @@ fn the_partial_bound_excuses_the_probe_instead_of_pinning_the_sequence() {
 
   for round in 0..MAX_PARTIAL_ROUNDS {
     let at = emit_probe(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     assert!(
       matches!(svc.state(), ServiceState::Probing(0)),
       "round {round} is within the bound, so the §8.1 sequence must not advance; \
@@ -5521,7 +5521,7 @@ fn the_partial_bound_excuses_the_probe_instead_of_pinning_the_sequence() {
   }
 
   let at = emit_probe(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Probing(1)),
     "the bound must excuse the link that keeps missing rather than pin the \
@@ -5566,7 +5566,7 @@ fn an_excused_announcement_advance_is_not_a_delivery() {
 
   for _ in 0..MAX_PARTIAL_ROUNDS {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     assert!(
       matches!(svc.state(), ServiceState::Announcing(0)),
       "within the bound the §8.3 phase must not advance; got {:?}",
@@ -5579,7 +5579,7 @@ fn an_excused_announcement_advance_is_not_a_delivery() {
   let streak_before = svc.partial_announce_streak;
 
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
 
   // It advances …
   assert!(
@@ -5628,11 +5628,11 @@ fn a_wholly_failed_round_does_not_reset_the_partial_bound() {
 
   for round in 0..MAX_PARTIAL_ROUNDS {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     now = svc.lifecycle_deadline.expect("re-armed");
 
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::NONE);
+    svc.note_delivery(at, TransmitDelivery::NONE);
     assert_eq!(
       svc.partial_rounds[V6].missed,
       round + 1,
@@ -5648,7 +5648,7 @@ fn a_wholly_failed_round_does_not_reset_the_partial_bound() {
   }
 
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Announcing(1)),
     "the bound must still fire through an alternating partial/failed pattern; \
@@ -5678,7 +5678,7 @@ fn a_response_confirm_cannot_move_the_partial_bound() {
 
   // One honest partial announcement, so the budget is part-spent.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert_eq!(svc.partial_rounds[V6].missed, 1);
   now = at;
 
@@ -5695,7 +5695,7 @@ fn a_response_confirm_cannot_move_the_partial_bound() {
     .poll_transmit(now, &mut buf)
     .unwrap()
     .expect("a legacy unicast reply is queued");
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   assert_eq!(
     svc.partial_rounds[V6].missed, 1,
     "an all-delivered one-shot reply must not RESET the budget"
@@ -5715,7 +5715,7 @@ fn a_response_confirm_cannot_move_the_partial_bound() {
     svc.awaiting_confirm,
     Some(AwaitingConfirm::Response(_, _))
   ));
-  svc.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(now, TransmitDelivery::V4_ONLY);
   assert_eq!(
     svc.partial_rounds[V6].missed, 1,
     "a partial one-shot response must not PRELOAD the budget"
@@ -5724,7 +5724,7 @@ fn a_response_confirm_cannot_move_the_partial_bound() {
   // The lifecycle therefore still gets its full remaining patience.
   now = svc.lifecycle_deadline.expect("still re-armed");
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Announcing(0)),
     "with the responses counted this round would have been the excusing one; \
@@ -5743,7 +5743,7 @@ fn a_conflict_rename_clears_the_partial_bound() {
   let mut now = drive_to_probing_zero(&mut svc);
 
   let at = emit_probe(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert_eq!(
     svc.partial_rounds[V6].missed, 1,
     "one partial probe must be counted against the family that missed it"
@@ -5795,7 +5795,7 @@ fn the_section9_revert_to_probe_clears_the_partial_bound() {
 
   // Spend a partial round on the periodic re-announce.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert_eq!(svc.partial_rounds[V6].missed, 1);
 
   // A genuine §9 conflict (different SRV rdata) reverts to re-probing.
@@ -5931,7 +5931,7 @@ fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
   svc.handle_timeout(now).unwrap();
   assert!(matches!(svc.state(), ServiceState::Probing(0)));
 
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
     matches!(svc.state(), ServiceState::Probing(0)),
     "a probe of the name we renamed AWAY from is not a step of the new name's \
@@ -5948,7 +5948,7 @@ fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       wire_probes += 1;
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if matches!(svc.state(), ServiceState::Announcing(_)) {
       break;
@@ -5975,7 +5975,7 @@ fn a_stale_announcement_confirm_withdraws_under_the_old_name() {
   assert!(svc.rename_goodbye_handoff.is_none());
 
   let now = regress_and_rename_with_a_parked_datagram(&mut svc, at);
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
 
   assert!(
     !svc.advertises_instance(),
@@ -6015,7 +6015,7 @@ fn a_stale_announcement_confirm_neither_establishes_nor_opens_the_reclaim_gate()
   let at = emit_announcement(&mut svc, now);
   let now = regress_and_rename_with_a_parked_datagram(&mut svc, at);
 
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
 
   assert!(
     !svc.has_fully_announced().get(),
@@ -6053,7 +6053,7 @@ fn a_stale_announcement_confirm_latches_ownership_without_recharging_the_sequenc
     "the revert starts a fresh §8.1 sequence"
   );
 
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
 
   assert!(
     svc.advertises_instance(),
@@ -6164,14 +6164,14 @@ fn the_partial_ladder_neither_contracts_nor_outruns_the_refresh_interval() {
   for cycle in 0..2 {
     for _ in 0..MAX_PARTIAL_ROUNDS {
       let at = emit_announcement(&mut svc, now);
-      svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+      svc.note_delivery(at, TransmitDelivery::V4_ONLY);
       let re_armed = svc.lifecycle_deadline.expect("a partial round re-arms");
       gaps.push(re_armed.0 - at.0);
       now = re_armed;
     }
     let at = emit_announcement(&mut svc, now);
     let streak_before = svc.partial_announce_streak;
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     assert_eq!(
       svc.state(),
       ServiceState::Established,
@@ -6249,7 +6249,7 @@ fn an_established_excusal_re_arms_on_the_stalest_family_in_good_standing() {
     let pre_armed = svc
       .lifecycle_deadline
       .expect("the fired periodic deadline re-arms the next one");
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     let re_armed = svc.lifecycle_deadline.expect("a partial round re-arms");
     assert_eq!(
       re_armed.0 - at.0,
@@ -6270,7 +6270,7 @@ fn an_established_excusal_re_arms_on_the_stalest_family_in_good_standing() {
     // within its bound.
     for round in 1..MAX_PARTIAL_ROUNDS {
       let at = emit_announcement(&mut svc, now);
-      svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+      svc.note_delivery(at, TransmitDelivery::V4_ONLY);
       let re_armed = svc.lifecycle_deadline.expect("a partial round re-arms");
       assert_eq!(
         re_armed.0 - at.0,
@@ -6286,7 +6286,7 @@ fn an_established_excusal_re_arms_on_the_stalest_family_in_good_standing() {
     // the plain periodic cadence rather than being flooded at the floor.
     let at = emit_announcement(&mut svc, now);
     let streak_before = svc.partial_announce_streak;
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
 
     assert_eq!(
       svc.state(),
@@ -6315,7 +6315,7 @@ fn an_established_excusal_re_arms_on_the_stalest_family_in_good_standing() {
     now = re_armed;
     for round in 0..3 {
       let at = emit_announcement(&mut svc, now);
-      svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+      svc.note_delivery(at, TransmitDelivery::V4_ONLY);
       let next = svc.lifecycle_deadline.expect("re-armed");
       assert_eq!(
         next.0 - at.0,
@@ -6340,7 +6340,7 @@ fn a_recovered_family_returns_to_driving_the_refresh_schedule() {
   // Spend v6's patience.
   for _ in 0..=MAX_PARTIAL_ROUNDS {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     now = svc.lifecycle_deadline.expect("re-armed");
   }
   assert!(
@@ -6351,7 +6351,7 @@ fn a_recovered_family_returns_to_driving_the_refresh_schedule() {
   // v6 carries the next one. Its counter clears and its anchor moves to now, so
   // both families are fresh and the schedule is the plain periodic one.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  svc.note_delivery(at, TransmitDelivery::ALL);
   assert_eq!(
     svc.partial_rounds,
     [FamilyPatience::default(); 2],
@@ -6388,7 +6388,7 @@ fn drive_to_established_with(
     };
     svc.handle_timeout(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, delivery);
+      svc.note_delivery(now, delivery);
     }
     if svc.state() == ServiceState::Established {
       return now;
@@ -6427,7 +6427,7 @@ fn a_single_stack_host_keeps_the_plain_periodic_cadence() {
 
   for round in 0..6 {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, v4_only);
+    svc.note_delivery(at, v4_only);
     let next = svc
       .lifecycle_deadline
       .expect("Established re-arms periodically");
@@ -6460,7 +6460,7 @@ fn a_chronically_dead_family_stops_driving_the_schedule() {
   let mut gaps: std::vec::Vec<u64> = std::vec::Vec::new();
   for _ in 0..12 {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     now = svc.lifecycle_deadline.expect("re-armed");
     gaps.push(now.0 - at.0);
   }
@@ -6497,7 +6497,7 @@ fn an_all_miss_round_advances_no_per_family_counter() {
 
   for round in 0..8 {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::NONE);
+    svc.note_delivery(at, TransmitDelivery::NONE);
     assert_eq!(
       svc.partial_rounds,
       [FamilyPatience::default(); 2],
@@ -6523,10 +6523,10 @@ fn an_all_miss_round_advances_no_per_family_counter() {
   let mut now = drive_to_announcing_zero(&mut svc);
   for _ in 0..MAX_PARTIAL_ROUNDS {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     now = svc.lifecycle_deadline.expect("re-armed");
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::NONE);
+    svc.note_delivery(at, TransmitDelivery::NONE);
     now = svc.lifecycle_deadline.expect("re-armed");
   }
   assert_eq!(
@@ -6552,7 +6552,7 @@ fn an_obligation_gap_in_an_all_miss_round_refunds_the_returning_family() {
   // Charge v6 to the bound with honest partials.
   for _ in 0..MAX_PARTIAL_ROUNDS {
     let at = emit_probe(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     now = at;
   }
   assert_eq!(svc.partial_rounds[V6].missed, MAX_PARTIAL_ROUNDS);
@@ -6560,7 +6560,7 @@ fn an_obligation_gap_in_an_all_miss_round_refunds_the_returning_family() {
 
   // v6's socket goes away in a round that reached NO wire.
   let at = emit_probe(&mut svc, now);
-  svc.note_transmit_outcome(
+  svc.note_delivery(
     at,
     TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Unobligated),
   );
@@ -6582,7 +6582,7 @@ fn an_obligation_gap_in_an_all_miss_round_refunds_the_returning_family() {
   // sequence, and the excusal lands only on the round after the bound is spent.
   for round in 0..MAX_PARTIAL_ROUNDS {
     let at = emit_probe(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     assert!(
       matches!(svc.state(), ServiceState::Probing(0)),
       "round {round}: the returned family has been asked at most {} times, so \
@@ -6593,7 +6593,7 @@ fn an_obligation_gap_in_an_all_miss_round_refunds_the_returning_family() {
     now = at;
   }
   let at = emit_probe(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Probing(1)),
     "the bound is spent on genuine re-arms, so the excusal lands on the round \
@@ -6614,13 +6614,13 @@ fn an_obligation_gap_refunds_only_the_family_that_left() {
   // the one carrying a charge.
   for _ in 0..MAX_PARTIAL_ROUNDS {
     let at = emit_probe(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V6_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V6_ONLY);
     now = at;
   }
   assert_eq!(svc.partial_rounds[V4].missed, MAX_PARTIAL_ROUNDS);
 
   let at = emit_probe(&mut svc, now);
-  svc.note_transmit_outcome(
+  svc.note_delivery(
     at,
     TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Unobligated),
   );
@@ -6653,7 +6653,7 @@ fn an_obligation_gap_clears_the_stalled_latch() {
   // of good standing.
   for _ in 0..=MAX_PARTIAL_ROUNDS {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     now = svc.lifecycle_deadline.expect("re-armed");
   }
   assert!(
@@ -6662,7 +6662,7 @@ fn an_obligation_gap_clears_the_stalled_latch() {
   );
 
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(
+  svc.note_delivery(
     at,
     TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Unobligated),
   );
@@ -6690,7 +6690,7 @@ fn an_obligation_gap_clears_the_coverage_bit() {
 
   // v6 carries the announcement; v4 misses. v6 is now covered for this datagram.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V6_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V6_ONLY);
   assert!(
     svc.partial_rounds[V6].covered,
     "the family that carried the datagram is covered for it"
@@ -6704,7 +6704,7 @@ fn an_obligation_gap_clears_the_coverage_bit() {
 
   // v6's socket goes away in a round that reached NO wire.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(
+  svc.note_delivery(
     at,
     TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Unobligated),
   );
@@ -6718,7 +6718,7 @@ fn an_obligation_gap_clears_the_coverage_bit() {
 
   // v6 comes back and misses while v4 delivers.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Announcing(0)),
     "the returned family has carried nothing since the gap, so this round is \
@@ -6744,7 +6744,7 @@ fn alternating_families_advance_the_phase_without_spending_patience() {
 
   // Round 1: v4 carries it. The phase holds — v6 has not been told yet.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Announcing(0)),
     "one family is not every family; got {:?}",
@@ -6755,7 +6755,7 @@ fn alternating_families_advance_the_phase_without_spending_patience() {
   // Round 2: the driver hands the slot to the family that missed, and the SAME
   // announcement reaches it. Both families have now heard it.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V6_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V6_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Announcing(1)),
     "both families have carried this announcement, so the §8.3 phase advances; \
@@ -6778,7 +6778,7 @@ fn alternating_families_advance_the_phase_without_spending_patience() {
   for delivery in [TransmitDelivery::V4_ONLY, TransmitDelivery::V6_ONLY] {
     now = svc.lifecycle_deadline.expect("re-armed");
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, delivery);
+    svc.note_delivery(at, delivery);
   }
   assert_eq!(
     svc.state(),
@@ -6814,7 +6814,7 @@ fn establish_under(delivery: TransmitDelivery) -> (FakeInstant, usize, usize) {
       if matches!(svc.awaiting_confirm, Some(AwaitingConfirm::Announcement(_))) {
         announcements = announcements.saturating_add(1);
       }
-      svc.note_transmit_outcome(now, delivery);
+      svc.note_delivery(now, delivery);
     }
     if svc.state() == ServiceState::Established {
       return (now, rounds, announcements);
@@ -6888,7 +6888,7 @@ fn a_recovered_family_is_owed_the_whole_bound_again() {
   // v6 spends the bound and is written off on the round after it.
   for _ in 0..=MAX_PARTIAL_ROUNDS {
     let at = emit_probe(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     now = at;
   }
   assert!(
@@ -6904,7 +6904,7 @@ fn a_recovered_family_is_owed_the_whole_bound_again() {
   // While it stays down the write-off stands: the next partial advances the
   // sequence straight away rather than re-spending a bound already spent.
   let at = emit_probe(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Probing(2)),
     "a family the core has already stopped waiting for must not hold the phase \
@@ -6916,7 +6916,7 @@ fn a_recovered_family_is_owed_the_whole_bound_again() {
   // Silence still advances nothing, latch or no latch — an excusal reachable from
   // a round that touched no wire would let the name be claimed unprobed.
   let at = emit_probe(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::NONE);
+  svc.note_delivery(at, TransmitDelivery::NONE);
   assert!(
     matches!(svc.state(), ServiceState::Probing(2)),
     "no phase may advance out of silence; got {:?}",
@@ -6931,7 +6931,7 @@ fn a_recovered_family_is_owed_the_whole_bound_again() {
   // v6 comes back and carries the probe. The latch clears with the rest of its
   // patience, and §8.1 completes.
   let at = emit_probe(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  svc.note_delivery(at, TransmitDelivery::ALL);
   assert_eq!(
     svc.partial_rounds,
     [FamilyPatience::default(); 2],
@@ -6949,7 +6949,7 @@ fn a_recovered_family_is_owed_the_whole_bound_again() {
   // exactly as it would for a family that had never stalled.
   for round in 0..MAX_PARTIAL_ROUNDS {
     let at = emit_announcement(&mut svc, now);
-    svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+    svc.note_delivery(at, TransmitDelivery::V4_ONLY);
     assert!(
       matches!(svc.state(), ServiceState::Announcing(0)),
       "round {round}: the returned family has been told at most {round} times, so \
@@ -6966,7 +6966,7 @@ fn a_recovered_family_is_owed_the_whole_bound_again() {
       .expect("a partial announcement always re-arms");
   }
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(at, TransmitDelivery::V4_ONLY);
   assert!(
     matches!(svc.state(), ServiceState::Announcing(1)),
     "the excusal lands on the round after the fresh bound is spent; got {:?}",
@@ -6977,7 +6977,7 @@ fn a_recovered_family_is_owed_the_whole_bound_again() {
   // And the recovery path stays open: when v6 carries an announcement the phase
   // takes the full credit a delivery earns, which no excusal ever did.
   let at = emit_announcement(&mut svc, now);
-  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  svc.note_delivery(at, TransmitDelivery::ALL);
   assert_eq!(
     svc.state(),
     ServiceState::Established,
@@ -7022,7 +7022,7 @@ fn a_lifecycle_timeout_queues_nothing_while_a_datagram_is_unconfirmed() {
   );
 
   // The confirm advances §8.1 and installs the deadline that governs from here.
-  svc.note_transmit_outcome(due, TransmitDelivery::ALL);
+  svc.note_delivery(due, TransmitDelivery::ALL);
   assert!(
     matches!(svc.state(), ServiceState::Probing(1)),
     "the delivered probe advances one §8.1 step; got {:?}",
@@ -7055,7 +7055,7 @@ fn accumulated_lifecycle_deadlines_cannot_burst_after_the_confirm() {
     at = svc.poll_timeout().expect("the probe deadline stays armed");
     svc.handle_timeout(at).unwrap();
   }
-  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  svc.note_delivery(at, TransmitDelivery::ALL);
   assert_eq!(
     svc.probe_count, 1,
     "exactly one probe reached the wire, so §8.1 advanced exactly one step"
@@ -7065,7 +7065,7 @@ fn accumulated_lifecycle_deadlines_cannot_burst_after_the_confirm() {
   let mut burst = 0usize;
   while let Ok(Some(_)) = svc.poll_transmit(at, &mut buf) {
     burst += 1;
-    svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+    svc.note_delivery(at, TransmitDelivery::ALL);
   }
   assert_eq!(
     burst, 0,
@@ -7101,7 +7101,7 @@ fn an_established_refresh_queues_nothing_while_a_datagram_is_unconfirmed() {
     svc.pending_transmits
   );
 
-  svc.note_transmit_outcome(at, TransmitDelivery::ALL);
+  svc.note_delivery(at, TransmitDelivery::ALL);
   let mut buf = std::vec![0u8; 4096];
   assert!(
     svc.poll_transmit(at, &mut buf).unwrap().is_none(),
@@ -7165,4 +7165,235 @@ fn the_periodic_refresh_interval_never_re_arms_at_now() {
       due.0
     );
   }
+}
+
+/// The confirm anchors at the EARLIEST family acceptance, and the fold now lives
+/// in the core rather than in each driver.
+///
+/// An anchor may only ever UNDERSTATE how fresh a family's peers are: taking the
+/// earliest schedules the next transmission sooner than strictly needed, while
+/// taking the latest — or a clock read after the fan-out — would backdate every
+/// family's freshness by however long the slowest one took and push a healthy
+/// family's next send past its records' TTL. Driving the same round in both
+/// family orders pins that the fold is a `min` and not "whichever came second".
+#[test]
+fn the_confirm_anchors_at_the_earliest_family_acceptance() {
+  for swapped in [false, true] {
+    let mut svc = make_service(120);
+    let mut buf = std::vec![0u8; 4096];
+    draw_first_probe(&mut svc, &mut buf);
+
+    let early = FakeInstant(1_000);
+    let late = FakeInstant(4_000);
+    // A driver's own post-fan-out reading, far later than either acceptance. It
+    // is the FALLBACK and must not be reached while some family accepted.
+    let fallback = FakeInstant(9_000);
+    let (v4, v6) = if swapped {
+      (
+        FamilyAttempt::Accepted { at: late },
+        FamilyAttempt::Accepted { at: early },
+      )
+    } else {
+      (
+        FamilyAttempt::Accepted { at: early },
+        FamilyAttempt::Accepted { at: late },
+      )
+    };
+    let _ = svc.note_transmit_outcome(fallback, v4, v6);
+
+    let due = svc
+      .poll_timeout()
+      .expect("a confirmed probe re-arms the next one");
+    let from_early = probe_deadline_probe_1(early);
+    assert_eq!(
+      due, from_early,
+      "the next probe must be scheduled from the EARLIEST acceptance, not from \
+       the late family's and not from the driver's post-fan-out reading"
+    );
+  }
+}
+
+/// The instant the second §8.1 probe is due, given the first one's anchor. The
+/// interval is spent from the anchor with no jitter at index 1, so the deadline
+/// is exact.
+fn probe_deadline_probe_1(anchor: FakeInstant) -> FakeInstant {
+  anchor
+    .checked_add_duration(crate::service::schedule::rfc::PROBE_INTERVAL)
+    .unwrap()
+}
+
+/// A round no family accepted has no acceptance to anchor, so the re-arm is
+/// spaced from the driver's own instant — the core reads no clock and cannot
+/// supply one itself.
+#[test]
+fn a_round_that_reached_no_wire_anchors_at_the_drivers_own_instant() {
+  let mut svc = make_service(120);
+  let mut buf = std::vec![0u8; 4096];
+  draw_first_probe(&mut svc, &mut buf);
+
+  let attempted = FakeInstant(3_000);
+  let _ = svc.note_transmit_outcome(
+    attempted,
+    FamilyAttempt::Refused { permanent: false },
+    FamilyAttempt::GateShut,
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Probing(0),
+    "an all-miss round advances no phase"
+  );
+  assert_eq!(
+    svc.poll_timeout(),
+    Some(probe_deadline_probe_1(attempted)),
+    "the retry is spaced from the attempt, not from the encode"
+  );
+}
+
+/// A §8.1 probe or a §8.3 announcement that NO transport can ever carry retires
+/// its service.
+///
+/// It is a liveness defect and not wire noise: the core re-arms a sustained
+/// datagram until every obligated family accepts it, so a service whose bytes are
+/// impossible would probe or announce forever with nothing on any wire and never
+/// reach `Established`. No patience bound rescues it either — the core's patience
+/// excuses a MISSING family, not a round that can succeed on none of them.
+#[test]
+fn a_permanently_oversized_sustained_datagram_retires_its_service() {
+  let mut svc = make_service(120);
+  let mut buf = std::vec![0u8; 4096];
+  let now = draw_first_probe(&mut svc, &mut buf);
+
+  let confirm = svc.note_transmit_outcome(
+    now,
+    FamilyAttempt::Refused { permanent: true },
+    FamilyAttempt::NoSocket,
+  );
+  assert!(
+    confirm.retire_producer(),
+    "the one family this host has refused the datagram's SIZE, so re-offering \
+     these exact bytes can never put them on a wire"
+  );
+  assert!(
+    !confirm.any_delivered(),
+    "and nothing reached a wire, so the confirm latches no goodbye ownership"
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Probing(0),
+    "the confirm still spends the commit token and advances nothing, so the \
+     driver's retirement runs on a settled service"
+  );
+}
+
+/// A round that is merely FAILING retires nothing, however badly.
+///
+/// Reading a transient refusal as permanent would destroy a healthy
+/// advertisement over a full send buffer, so every may-clear outcome vetoes the
+/// verdict — including a shut wire gate, whose very next round carries the SAME
+/// datagram.
+#[test]
+fn a_transient_failure_never_retires_a_service() {
+  for (v4, v6) in [
+    (
+      FamilyAttempt::Refused { permanent: true },
+      FamilyAttempt::Refused { permanent: false },
+    ),
+    (
+      FamilyAttempt::Refused { permanent: true },
+      FamilyAttempt::GateShut,
+    ),
+    (
+      FamilyAttempt::Refused { permanent: true },
+      FamilyAttempt::WouldBlock,
+    ),
+    (
+      FamilyAttempt::Refused { permanent: false },
+      FamilyAttempt::Refused { permanent: false },
+    ),
+  ] {
+    let mut svc = make_service(120);
+    let mut buf = std::vec![0u8; 4096];
+    let now = draw_first_probe(&mut svc, &mut buf);
+    let confirm = svc.note_transmit_outcome(now, v4, v6);
+    assert!(
+      !confirm.retire_producer(),
+      "{} / {}: a family that may carry the same datagram on a later round is \
+       waited for",
+      v4.as_str(),
+      v6.as_str()
+    );
+  }
+}
+
+/// A ONE-SHOT reply that cannot be sent retires nothing.
+///
+/// It costs exactly one unanswered question — the querier re-asks — and retiring
+/// on one would let any remote peer tear down a healthy established service by
+/// asking it something whose answer does not fit.
+#[test]
+fn a_permanently_oversized_one_shot_reply_never_retires_a_service() {
+  let mut svc = make_service(120);
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+  // Drive to Established so the next due datagram is not a lifecycle one.
+  for _ in 0..40 {
+    now = now.advance(300);
+    svc.handle_timeout(now).unwrap();
+    if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
+      svc.note_delivery(now, TransmitDelivery::ALL);
+    }
+    if svc.state() == ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(svc.state(), ServiceState::Established);
+
+  // A §6 multicast reply to an on-link question.
+  inject_question_to_set_response_deadline(&mut svc, now);
+  now = now.advance(1_000);
+  svc.handle_timeout(now).unwrap();
+  let tx = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("an answered question emits a reply");
+  assert_eq!(
+    tx.obligation(),
+    TransmitObligation::OneShot,
+    "a reply is fire-and-forget; the core never re-arms it"
+  );
+
+  let confirm = svc.note_transmit_outcome(
+    now,
+    FamilyAttempt::Refused { permanent: true },
+    FamilyAttempt::Refused { permanent: true },
+  );
+  assert!(
+    !confirm.retire_producer(),
+    "an undeliverable reply is one lost answer, not a dead producer"
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "and the service survives it"
+  );
+}
+
+/// Arm and draw the FIRST §8.1 probe, returning the instant it was drawn at.
+///
+/// A freshly built service sits in `Init` until its §8.1 random 0-250 ms initial
+/// delay elapses, so the probe has to be waited for rather than polled straight
+/// out.
+fn draw_first_probe(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  buf: &mut std::vec::Vec<u8>,
+) -> FakeInstant {
+  let mut now = FakeInstant::zero();
+  for _ in 0..8 {
+    now = now.advance(100);
+    svc.handle_timeout(now).unwrap();
+    if svc.poll_transmit(now, buf).unwrap().is_some() {
+      return now;
+    }
+  }
+  panic!("no probe was drawn within the §8.1 initial delay");
 }

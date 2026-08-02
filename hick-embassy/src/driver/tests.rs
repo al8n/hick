@@ -211,7 +211,7 @@ macro_rules! dual_stack_sockets {
 /// A [`UdpIo`] that delegates every call to the real [`DualUdp`] and logs the
 /// datagrams that were actually queued. The delivery facts still come from
 /// hick-embassy's own family routing and embassy-net's own error mapping; this
-/// only makes what reached a wire visible to a test.
+/// only makes what the socket accepted visible to a test.
 struct Recording<'sock, 'b> {
   inner: DualUdp<'sock, 'b>,
   sent: Vec<(SocketAddr, Vec<u8>)>,
@@ -276,7 +276,7 @@ fn pump_for(
   let mut established = false;
   for _ in 0..steps {
     t += 250_000;
-    engine.pump(at(t), io, &mut scratch);
+    engine.pump(|| at(t), io, &mut scratch);
     while let Some(update) = engine.poll_service_update(handle) {
       established |= matches!(update, ServiceUpdate::Established);
     }
@@ -383,8 +383,8 @@ fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
 
 #[test]
 fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
-  // v4 queues, v6 exists but cannot send. Ownership must latch for what v4 put
-  // on the wire, while the §8.1/§8.3 phase must NOT advance on the rounds the
+  // v4 queues, v6 exists but cannot send. Ownership must latch for what v4 sent,
+  // while the §8.1/§8.3 phase must NOT advance on the rounds the
   // core is still waiting for v6.
   //
   // The yardstick is the SAME schedule with nothing held back, run here under the
@@ -435,7 +435,7 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
     "the unusable family must never queue anything"
   );
 
-  // …and yet the records v4 put on the wire ARE owned: v4 peers may hold them,
+  // …and yet the records v4 queued ARE owned: v4 peers may hold them,
   // so the withdrawal must retract them.
   engine.unregister_service(handle, at(t));
   io.sent.clear();

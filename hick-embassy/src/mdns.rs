@@ -6,7 +6,7 @@ use core::cell::RefCell;
 use embassy_futures::select::{select, select3};
 use embassy_net::{IpCidr, udp::UdpSocket};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
-use embassy_time::{Instant, Timer};
+use embassy_time::Timer;
 use hick_smoltcp::Engine;
 use mdns_proto::{
   CollectedAnswer, EndpointConfig, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec,
@@ -17,7 +17,7 @@ use rand_core::Rng;
 
 use crate::{
   io::{DualUdp, wait_either_recv},
-  time::EmbassyInstant,
+  time::{EmbassyInstant, now},
 };
 
 /// Shared mDNS state: the engine behind a `RefCell`, plus a wake signal.
@@ -152,7 +152,10 @@ impl<R: Rng> MdnsState<R> {
       let deadline = {
         let mut engine = self.engine.borrow_mut();
         let mut io = DualUdp::new(v4.as_deref(), v6.as_deref());
-        engine.pump(now(), &mut io, scratch)
+        // The CLOCK, not a reading of it: the pump anchors the pass to its own
+        // first read and re-reads after each §10.1 goodbye fan-out, so a long pass
+        // cannot pull the next goodbye onto the heels of the one it just queued.
+        engine.pump(now, &mut io, scratch)
       };
       // Wake when: a datagram arrives on either socket, the next protocol
       // deadline elapses, or a handle signals new work.
@@ -179,11 +182,6 @@ impl<R: Rng> MdnsState<R> {
       }
     }
   }
-}
-
-/// The current monotonic instant, wrapped for the proto.
-fn now() -> EmbassyInstant {
-  EmbassyInstant(Instant::now())
 }
 
 #[cfg(test)]

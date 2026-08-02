@@ -239,26 +239,43 @@ where
     }
   }
 
-  /// Report the delivery outcome of the datagram most recently produced by
-  /// [`Self::poll_query_transmit`] for `handle`.
+  /// Report what each address family's transport did with the datagram most
+  /// recently produced by [`Self::poll_query_transmit`] for `handle`.
   ///
-  /// The query advances its RFC 6762 §5.2 retry budget only on
-  /// [`TransmitDelivery::all_delivered`]; a partially-delivered question climbs
-  /// the §5.2 doubling ladder without spending a slot. See
-  /// [`Query::note_transmit_outcome`] for the full contract. No-op for an
+  /// The query advances its RFC 6762 §5.2 retry budget only once EVERY obligated
+  /// family accepted the question; a partially-delivered one climbs the §5.2
+  /// doubling ladder without spending a slot. See
+  /// [`Query::note_transmit_outcome`] for the full contract, including what
+  /// [`TransmitConfirm::retire_producer`] obliges the caller to do. No-op for an
   /// unknown handle.
   pub fn note_query_transmit_outcome(
     &mut self,
     handle: QueryHandle,
     now: I,
-    delivery: TransmitDelivery,
-  ) {
+    v4: FamilyAttempt<I>,
+    v6: FamilyAttempt<I>,
+  ) -> TransmitConfirm {
     let Some(key) = self.query_key(handle) else {
-      return;
+      return TransmitConfirm::NOTHING;
     };
-    if let Some(q) = self.queries.get_mut(key) {
-      q.note_transmit_outcome(now, delivery);
+    match self.queries.get_mut(key) {
+      Some(q) => q.note_transmit_outcome(now, v4, v6),
+      None => TransmitConfirm::NOTHING,
     }
+  }
+
+  /// Test-only: confirm from a projected delivery SHAPE. See
+  /// [`Service::note_delivery`](crate::Service::note_delivery).
+  #[cfg(test)]
+  #[allow(dead_code)]
+  pub(crate) fn note_query_delivery(
+    &mut self,
+    handle: QueryHandle,
+    now: I,
+    delivery: crate::transmit::TransmitDelivery,
+  ) {
+    let (v4, v6) = delivery.as_attempts(now);
+    let _ = self.note_query_transmit_outcome(handle, now, v4, v6);
   }
 
   /// Drive timer-based transitions on a registered query.

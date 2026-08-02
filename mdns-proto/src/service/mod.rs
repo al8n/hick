@@ -169,7 +169,9 @@ cfg_heap! {
   use crate::error::{HandleTimeoutError, TransmitError};
   use crate::event::{ServiceEvent, ServiceUpdate};
   use crate::records::ServiceRecords;
-  use crate::transmit::{FamilyDelivery, Transmit, TransmitDelivery, TransmitObligation};
+  use crate::transmit::{
+    FamilyAttempt, FamilyDelivery, Transmit, TransmitConfirm, TransmitDelivery, TransmitObligation,
+  };
   use crate::{Instant, Pool, ServiceHandle};
 
   type Rng = rand::rngs::StdRng;
@@ -470,7 +472,7 @@ cfg_heap! {
       }
     }
 
-    /// The minimum wire gap this token's datagram owes each family it is fanned
+    /// The minimum gap this token's datagram owes each family it is fanned
     /// onto ([`Transmit::min_family_gap`]).
     ///
     /// Kind-dependent, and read from the token for the same reason the
@@ -1052,8 +1054,8 @@ where
   }
 
   /// Whether a COMPLETE §8.3 announcement of the CURRENT instance name has
-  /// reached EVERY obligated link — i.e. at least one announcement resolved
-  /// [`TransmitDelivery::all_delivered`].
+  /// reached EVERY obligated link — i.e. at least one announcement was accepted
+  /// by every family that was obligated to carry it.
   ///
   /// This is the reclaim-cancel gate the driver ferries into
   /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced):
@@ -1100,8 +1102,24 @@ where
     &self.goodbye.aaaa
   }
 
-  /// Report the delivery outcome of the datagram most recently produced by
-  /// [`Self::poll_transmit`] (the confirm-on-send chokepoint).
+  /// Report what each address family's transport did with the datagram most
+  /// recently produced by [`Self::poll_transmit`] (the confirm-on-send
+  /// chokepoint), and take back the two conclusions the core draws from it.
+  ///
+  /// The driver reports I/O-world facts only — see [`FamilyAttempt`], which also
+  /// states plainly that this is a TRUST boundary rather than a proof. Every
+  /// protocol meaning below is read into them HERE: the presence trichotomy, the
+  /// confirm anchor, and whether the producer can ever carry these bytes.
+  ///
+  /// # The anchor
+  ///
+  /// `now` is used only as the FALLBACK for a round no family accepted. When some
+  /// family did, the confirm is anchored at the EARLIEST acceptance across
+  /// families. Earliest is the only safe fold: it can only understate how fresh a
+  /// family's peers are, so the next transmission lands sooner than strictly
+  /// needed, whereas the latest — or the driver's own post-fan-out reading —
+  /// would backdate every family by however long the slowest one took and push a
+  /// healthy family's next send past its records' TTL.
   ///
   /// # Contract
   ///
@@ -1114,10 +1132,11 @@ where
   /// commit token (`awaiting_confirm`); the driver then reports how the fan-out
   /// went. Two invariants key every arm below:
   ///
-  /// * **Goodbye ownership latches iff [`TransmitDelivery::any_delivered`]** —
+  /// * **Goodbye ownership latches iff SOME obligated family accepted it** —
   ///   peers reachable over any link that accepted the datagram may hold the
-  ///   records it carried (RFC 6762 §10.1), whether or not every link did.
-  /// * **Phase takes full credit iff [`TransmitDelivery::all_delivered`]** — a
+  ///   records it carried (RFC 6762 §10.1), whether or not every link did. This
+  ///   is the fact handed back as [`TransmitConfirm::any_delivered`].
+  /// * **Phase takes full credit iff EVERY obligated family accepted it** — a
   ///   link that never saw the probe has not been asked (§8.1) and one that
   ///   never saw the announcement has not been told (§8.3). The phase can also
   ///   advance WITHOUT that credit, via the two bounded escapes described below.
@@ -1198,11 +1217,73 @@ where
   ///
   /// An all-miss round reaches none of this: it leaves every family's patience
   /// untouched, which is what keeps a phase from ever advancing out of silence.
-  pub fn note_transmit_outcome(&mut self, now: I, delivery: TransmitDelivery) {
+  ///
+  /// # Retirement
+  ///
+  /// [`TransmitConfirm::retire_producer`] is `true` when no transport can ever
+  /// carry these bytes AND the datagram is one the core keeps re-arming — a §8.1
+  /// probe or a §8.3 announcement. Such a service would otherwise probe or
+  /// announce forever with nothing on any wire and never reach `Established`, and
+  /// no patience bound rescues it: the core's patience excuses a MISSING family,
+  /// not a round that can succeed on none of them. A §6 / §6.7 / RFC 6763 §9
+  /// reply never retires anything.
+  pub fn note_transmit_outcome(
+    &mut self,
+    now: I,
+    v4: FamilyAttempt<I>,
+    v6: FamilyAttempt<I>,
+  ) -> TransmitConfirm {
     let kind = match self.awaiting_confirm.take() {
       Some(k) => k,
-      None => return,
+      None => return TransmitConfirm::NOTHING,
     };
+    let delivery = FamilyAttempt::project(v4, v6);
+    // THE anchor, folded here rather than by the driver: earliest acceptance
+    // across families, falling back to the driver's own instant for a round that
+    // reached no wire. See [`FamilyAttempt::anchor`].
+    let now = FamilyAttempt::anchor(v4, v6, now);
+    // A datagram no transport can ever carry retires the producer only if the
+    // core will offer it again. Probes and announcements are `Sustained`;
+    // responses are `OneShot` and cost exactly one unanswered question. A stale
+    // datagram is judged by the same obligation its own generation carried: the
+    // replacement generation re-encodes the same records, so the bytes that were
+    // impossible stay impossible.
+    let sustained = matches!(
+      kind,
+      AwaitingConfirm::Probe
+        | AwaitingConfirm::Announcement(_)
+        | AwaitingConfirm::Stale {
+          fact: StaleWireFact::Probe | StaleWireFact::Announcement,
+          ..
+        }
+    );
+    let confirm = TransmitConfirm::new(
+      delivery.any_delivered(),
+      sustained && FamilyAttempt::undeliverable(v4, v6),
+    );
+    self.settle_confirm(now, kind, delivery);
+    confirm
+  }
+
+  /// Test-only: confirm from a projected delivery SHAPE, discarding the verdict.
+  ///
+  /// The lifecycle tests are about what the core does with an all / partial /
+  /// none round, not about how an I/O outcome projects onto one, and naming the
+  /// shape is what keeps them readable. The projection, the anchor fold and the
+  /// retirement decision have their own tests, which build attempts explicitly
+  /// and read the [`TransmitConfirm`] this one drops.
+  #[cfg(test)]
+  #[allow(dead_code)]
+  pub(crate) fn note_delivery(&mut self, now: I, delivery: TransmitDelivery) {
+    let (v4, v6) = delivery.as_attempts(now);
+    let _ = self.note_transmit_outcome(now, v4, v6);
+  }
+
+  /// The body of [`Self::note_transmit_outcome`], once the commit token is spent
+  /// and the attempts are projected. Split out so the projection, the anchor fold
+  /// and the retirement decision read as one block above the lifecycle arms they
+  /// feed.
+  fn settle_confirm(&mut self, now: I, kind: AwaitingConfirm, delivery: TransmitDelivery) {
     match kind {
       AwaitingConfirm::Probe => {
         if let ServiceState::Probing(n) = self.state {
@@ -1673,7 +1754,7 @@ where
     }
   }
 
-  /// The per-family minimum wire gap of the datagram whose commit token is
+  /// The per-family minimum gap of the datagram whose commit token is
   /// currently stamped — the value [`Self::poll_transmit`] hands the driver on
   /// [`Transmit::min_family_gap`].
   ///

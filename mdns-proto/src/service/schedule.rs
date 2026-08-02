@@ -63,8 +63,9 @@ pub(crate) fn probe_deadline<I: Instant, R: Rng>(
 /// applied to a sequence that is no longer initial.
 ///
 /// A driver-side per-family wire gate would DEFER such a send rather than emit
-/// it, so the wire stays legal either way; the schedule is fixed here so the
-/// obligation is not one the driver has to absorb.
+/// it, so the spacing stays legal at whatever egress boundary that driver can
+/// observe ([`Transmit::min_family_gap`](crate::Transmit::min_family_gap)); the
+/// schedule is fixed here so the obligation is not one the driver has to absorb.
 #[allow(dead_code)]
 pub(crate) fn probe_retry_deadline<I: Instant>(now: I) -> Option<I> {
   now.checked_add_duration(rfc::PROBE_INTERVAL)

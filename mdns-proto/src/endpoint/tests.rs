@@ -5,7 +5,7 @@ use crate::{
   event::{QueryUpdate, ServiceUpdate},
   query::Query,
   records::ServiceRecords,
-  transmit::Transmit,
+  transmit::{Transmit, TransmitDelivery},
 };
 use std::{net::Ipv4Addr, time::Instant as StdInstant};
 
@@ -107,7 +107,7 @@ fn query_delegation_tolerates_unknown_handles() {
     e.poll_query_transmit(bogus, || now, &mut buf),
     Ok(None)
   ));
-  e.note_query_transmit_outcome(bogus, now, TransmitDelivery::ALL); // no-op on an unknown handle
+  e.note_query_delivery(bogus, now, TransmitDelivery::ALL); // no-op on an unknown handle
   assert!(e.handle_query_timeout(bogus, now).is_ok());
 }
 
@@ -1144,7 +1144,7 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
   // (next_deadline ≈ now+1s) with transmit_pending cleared.
   let mut buf = [0u8; 512];
   assert!(e.poll_query_transmit(h, || now, &mut buf).unwrap().is_some());
-  e.note_query_transmit_outcome(h, now, TransmitDelivery::ALL);
+  e.note_query_delivery(h, now, TransmitDelivery::ALL);
   let t1 = e
     .poll_query_timeout(h)
     .expect("a retransmit must be scheduled");
@@ -3931,7 +3931,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 
   // (b) Confirm the send, advance time to arm next retry, then feed the peer
   // question again → note_duplicate_question returns true → counter advances.
-  e.note_query_transmit_outcome(h, now, TransmitDelivery::ALL); // confirm
+  e.note_query_delivery(h, now, TransmitDelivery::ALL); // confirm
   now += Duration::from_secs(10); // past the first retry deadline (~1s)
   e.handle_query_timeout(h, now).unwrap(); // arms transmit_pending = true
 
@@ -4602,7 +4602,7 @@ fn simultaneous_same_host_withdrawals_each_withdraw_shared_addr() {
     withdrawn_1.contains(&shared),
     "first withdrawer ({tok1:?}) must withdraw the shared addr (sibling is also leaving)"
   );
-  ep.note_withdrawal_result(
+  ep.note_withdrawal_sends(
     tok1,
     now,
     super::WithdrawalSend::Sent,
@@ -4660,7 +4660,7 @@ fn note_withdrawal_delivered_spends_failed_rearms() {
 
   // A round where NEITHER family sent (both Retry) spends nothing and re-arms at
   // the short backoff.
-  ep.note_withdrawal_result(
+  ep.note_withdrawal_sends(
     token,
     now,
     super::WithdrawalSend::Retry,
@@ -4688,7 +4688,7 @@ fn note_withdrawal_delivered_spends_failed_rearms() {
 
   // A dual-stack delivered round spends exactly one PER family and re-arms at
   // the full interval (progress made).
-  ep.note_withdrawal_result(
+  ep.note_withdrawal_sends(
     token,
     now,
     super::WithdrawalSend::Sent,
@@ -4785,7 +4785,7 @@ fn withdrawal_not_freed_until_every_family_sent() {
   // v4 sends every round, v6 is transiently busy (Retry) every round: v4's debt
   // drains, v6's is untouched.
   for _ in 0..super::WITHDRAWAL_SENDS {
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       token,
       now,
       super::WithdrawalSend::Sent,
@@ -4828,7 +4828,7 @@ fn withdrawal_not_freed_until_every_family_sent() {
   // Now v6 recovers and sends its whole budget (v4 already at 0 → reported Sent
   // is a no-op there). owed reaches [0, 0] → it completes and frees the name.
   for _ in 0..super::WITHDRAWAL_SENDS {
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       token,
       now,
       super::WithdrawalSend::Sent,
@@ -4924,7 +4924,7 @@ fn a_withdrawal_round_names_the_families_that_still_owe() {
     let round = ep
       .poll_withdrawal_transmit(t, &mut buf)
       .expect("v4 still owes, so a round is due");
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       round.token(),
       t,
       super::WithdrawalSend::Sent,
@@ -4952,7 +4952,7 @@ fn a_withdrawal_round_names_the_families_that_still_owe() {
   );
 
   // v6 finally carries it; v4 is reported as the family the driver withheld.
-  ep.note_withdrawal_result(
+  ep.note_withdrawal_sends(
     round.token(),
     t,
     super::WithdrawalSend::Retry,
@@ -4981,7 +4981,7 @@ fn a_withdrawal_round_names_the_families_that_still_owe() {
     !round.debt().v4_owed() && round.debt().v6_owed(),
     "the debt still names v6 alone"
   );
-  ep.note_withdrawal_result(
+  ep.note_withdrawal_sends(
     round.token(),
     t,
     super::WithdrawalSend::Retry,
@@ -5039,7 +5039,7 @@ fn withdrawal_writeoff_family_completes() {
 
   // v6 has no socket (WriteOff zeroes its debt immediately); v4 still owes its
   // full budget after one Sent.
-  ep.note_withdrawal_result(
+  ep.note_withdrawal_sends(
     token,
     now,
     super::WithdrawalSend::Sent,
@@ -5053,7 +5053,7 @@ fn withdrawal_writeoff_family_completes() {
 
   // v4 sends out its remaining budget; v6 stays written off.
   for _ in 0..(super::WITHDRAWAL_SENDS - 1) {
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       token,
       now,
       super::WithdrawalSend::Sent,
@@ -5119,7 +5119,7 @@ fn withdrawal_retries_owed_family_at_backoff_when_other_is_paid() {
   // keeps its full debt. Each of these rounds DID make real progress on v4
   // (its owed was > 0), so they legitimately re-arm at the full interval.
   for _ in 0..super::WITHDRAWAL_SENDS {
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       token,
       now,
       super::WithdrawalSend::Sent,
@@ -5137,7 +5137,7 @@ fn withdrawal_retries_owed_family_at_backoff_when_other_is_paid() {
   // real progress this round — the paid v4 `Sent` is redundant — so the schedule
   // must re-arm at the SHORT backoff to retry the still-owed v6 soon, NOT wait a
   // full interval (which could miss a late v6 recovery before the 2 s ceiling).
-  ep.note_withdrawal_result(
+  ep.note_withdrawal_sends(
     token,
     now,
     super::WithdrawalSend::Sent,
@@ -5167,7 +5167,7 @@ fn withdrawal_retries_owed_family_at_backoff_when_other_is_paid() {
   // v6 now recovers: its `Sent` IS real progress (its owed was > 0), so it
   // decrements and — v4 already 0 — owed reaches [0, 0] once v6 drains.
   for _ in 0..super::WITHDRAWAL_SENDS {
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       token,
       now,
       super::WithdrawalSend::Sent,
@@ -5521,7 +5521,7 @@ fn teardown_during_rename_goodbye_withdraws_old_and_new_name() {
       saw_old_datagram = true;
     }
     // Confirm this round so the same item is not re-selected before the other.
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       token,
       now,
       super::WithdrawalSend::Sent,
@@ -5602,7 +5602,7 @@ fn collision_old_name_holds_against_reregister_until_goodbye_completes() {
   let mut t = now;
   for _ in 0..20 {
     while let Some(round) = ep.poll_withdrawal_transmit(t, &mut buf) {
-      ep.note_withdrawal_result(
+      ep.note_withdrawal_sends(
         round.token(),
         t,
         super::WithdrawalSend::Sent,
@@ -5855,7 +5855,7 @@ fn rename_enqueues_a_detached_withdrawal_for_the_old_name() {
 
   // Spend its budget by its own token; it completes and is removed silently.
   for _ in 0..super::WITHDRAWAL_SENDS {
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       token,
       now,
       super::WithdrawalSend::Sent,
@@ -6033,7 +6033,7 @@ fn rename_only_withdrawal_emits_old_name_goodbye() {
   // Spend the detached item's budget by its own token; it then completes and is
   // removed silently (reported to nobody — it owns no route).
   for _ in 0..super::WITHDRAWAL_SENDS {
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       detached_token,
       now,
       super::WithdrawalSend::Sent,
@@ -6152,7 +6152,7 @@ fn dual_name_each_fits_but_combined_would_not() {
       assert!(saw_old, "the other datagram carries the old name");
       len_old = len;
     }
-    ep.note_withdrawal_result(
+    ep.note_withdrawal_sends(
       token,
       now,
       super::WithdrawalSend::Sent,
@@ -7675,7 +7675,7 @@ fn questions_before_the_query_retires(delivery: TransmitDelivery) -> usize {
   {
     sent = sent.saturating_add(1);
     assert!(sent < 64, "the query never reached its §5.2 terminal");
-    ep.note_query_transmit_outcome(h, now, delivery);
+    ep.note_query_delivery(h, now, delivery);
     let Some(due) = ep.poll_query_timeout(h) else {
       break;
     };
@@ -7704,7 +7704,7 @@ fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
   let mut buf = std::vec![0u8; 512];
   assert!(ep.poll_query_transmit(h, || now, &mut buf).unwrap().is_some());
 
-  ep.note_query_transmit_outcome(h, now, TransmitDelivery::V4_ONLY);
+  ep.note_query_delivery(h, now, TransmitDelivery::V4_ONLY);
   let after_partial = ep.poll_query_timeout(h);
   assert!(
     after_partial.is_some(),
@@ -7718,7 +7718,7 @@ fn note_query_transmit_outcome_freezes_the_budget_on_a_partial_send() {
     let due = ep.poll_query_timeout(h).unwrap();
     ep.handle_query_timeout(h, due).unwrap();
     assert!(ep.poll_query_transmit(h, || due, &mut buf).unwrap().is_some());
-    ep.note_query_transmit_outcome(h, due, TransmitDelivery::V4_ONLY);
+    ep.note_query_delivery(h, due, TransmitDelivery::V4_ONLY);
   }
   assert!(
     ep.poll_query(h).is_none(),
@@ -7797,7 +7797,7 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
     now = svc.poll_timeout().unwrap_or(now).max(now);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
       ep.note_service_announced(
         svc.has_fully_announced(),
         svc.advertised_a_addrs(),
@@ -7819,7 +7819,7 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
   now = svc.poll_timeout().unwrap_or(now).max(now);
   svc.handle_timeout(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_transmit_outcome(now, TransmitDelivery::V4_ONLY);
+  svc.note_delivery(now, TransmitDelivery::V4_ONLY);
   assert!(
     svc.advertises_instance(),
     "the v4 zone heard it, so ownership latched"
@@ -7839,7 +7839,7 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
   now = svc.poll_timeout().unwrap_or(now).max(now);
   svc.handle_timeout(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+  svc.note_delivery(now, TransmitDelivery::ALL);
   ep.note_service_announced(
     svc.has_fully_announced(),
     svc.advertised_a_addrs(),
@@ -8042,7 +8042,7 @@ fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
     now = svc.poll_timeout().filter(|d| *d > now).unwrap_or(now);
     svc.handle_timeout(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     if svc.state() == crate::ServiceState::Established {
       break;
@@ -8071,11 +8071,184 @@ fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
     let mut sent = 0usize;
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       sent += 1;
-      svc.note_transmit_outcome(now, TransmitDelivery::ALL);
+      svc.note_delivery(now, TransmitDelivery::ALL);
     }
     assert_eq!(
       sent, 1,
       "round {round}: one fired refresh deadline is one unsolicited response"
+    );
+  }
+}
+
+/// A withdrawal item whose goodbye owns PTR/SRV/TXT, so its per-family resend
+/// budget is non-zero and the spend / keep / write-off table is actually
+/// exercised. Returns the handle and the item's token.
+fn withdrawing_route(ep: &mut TestEndp, now: StdInstant) -> (ServiceHandle, super::WithdrawalToken) {
+  let recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("A._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("h.local.").unwrap(),
+    631,
+    120,
+  );
+  let (h, _svc) = ep
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs.clone()),
+      now,
+    )
+    .unwrap();
+  let snap = crate::service::WithdrawalSnapshot {
+    records: recs,
+    owned: crate::service::EmittedRecords::new(
+      true,
+      true,
+      true,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+    ),
+    host_a: std::vec::Vec::new(),
+    host_aaaa: std::vec::Vec::new(),
+  };
+  ep.begin_withdrawal(h, snap, now);
+  let token = ep.route_withdrawal_token(h).unwrap();
+  (h, token)
+}
+
+/// A goodbye that is permanently too large for a family's transport KEEPS that
+/// family's debt.
+///
+/// The one-sidedness is the whole point. The item's own anti-pin ceiling
+/// force-completes it whatever the family answers, so a write-off could only buy
+/// finishing marginally sooner — at the price of freeing the route while a BOUND
+/// family's peers stay pinned to stale positive-TTL records for the rest of the
+/// records' TTL. Only an absent socket writes a debt off.
+#[test]
+fn a_permanently_oversized_goodbye_keeps_its_family_debt() {
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+  let (h, token) = withdrawing_route(&mut ep, now);
+
+  ep.note_withdrawal_result(
+    token,
+    now,
+    crate::transmit::FamilyAttempt::Refused { permanent: true },
+    crate::transmit::FamilyAttempt::Refused { permanent: true },
+  );
+  assert_eq!(
+    ep.route_withdrawal_owed(h),
+    Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
+    "a permanent refusal is a bound socket that did not carry the goodbye, so its \
+     debt survives for the retry the ceiling still allows"
+  );
+
+  // The contrast that makes the rule sharp: the SAME round with no socket at all
+  // on v6 writes only v6 off, because there are no peers on it to retract from.
+  ep.note_withdrawal_result(
+    token,
+    now,
+    crate::transmit::FamilyAttempt::Refused { permanent: true },
+    crate::transmit::FamilyAttempt::NoSocket,
+  );
+  assert_eq!(
+    ep.route_withdrawal_owed(h),
+    Some([super::WITHDRAWAL_SENDS, 0]),
+    "only an ABSENT socket writes a debt off"
+  );
+}
+
+/// Every non-acceptance keeps a bound family's goodbye debt, whatever the reason.
+///
+/// Stated as a matrix because the rows used to live in each driver, and two of
+/// them disagreed about the permanent-refusal row.
+#[test]
+fn only_an_absent_socket_writes_a_goodbye_debt_off() {
+  use crate::transmit::FamilyAttempt;
+  for keep in [
+    FamilyAttempt::Refused { permanent: false },
+    FamilyAttempt::Refused { permanent: true },
+    FamilyAttempt::GateShut,
+    FamilyAttempt::WouldBlock,
+    FamilyAttempt::NotAddressed,
+  ] {
+    let mut ep = build_endpoint();
+    let now = StdInstant::now();
+    let (h, token) = withdrawing_route(&mut ep, now);
+    ep.note_withdrawal_result(token, now, keep, keep);
+    assert_eq!(
+      ep.route_withdrawal_owed(h),
+      Some([super::WITHDRAWAL_SENDS, super::WITHDRAWAL_SENDS]),
+      "{}: the family did not carry the goodbye, but it may yet",
+      keep.as_str()
+    );
+  }
+}
+
+/// A family whose returned [`FamilyDebt`] was ZERO has its whole report
+/// discarded.
+///
+/// A driver offers a round only to the families the debt names, so it has to
+/// invent SOME outcome for one it withheld — no honest I/O fact describes "you
+/// told me it owed nothing". Masking is what makes that invention unable to cost
+/// anything: not the debt, not a spent round, not the item's schedule.
+#[test]
+fn a_zero_debt_family_report_is_masked() {
+  use crate::transmit::FamilyAttempt;
+  let now = StdInstant::now();
+
+  // Drain v4's debt with the rounds it owes, leaving v6 untouched.
+  let mut ep = build_endpoint();
+  let (h, token) = withdrawing_route(&mut ep, now);
+  for _ in 0..super::WITHDRAWAL_SENDS {
+    ep.note_withdrawal_result(
+      token,
+      now,
+      FamilyAttempt::Accepted { at: now },
+      FamilyAttempt::Refused { permanent: false },
+    );
+  }
+  assert_eq!(
+    ep.route_withdrawal_owed(h),
+    Some([0, super::WITHDRAWAL_SENDS]),
+    "v4 paid every round it owed; v6 kept its debt"
+  );
+  // The short backoff is the no-progress re-arm, and it is what every masked round
+  // below must produce: a still-failing v6 has to be retried soon rather than a
+  // full interval away, or it can miss its last chance before the anti-pin ceiling.
+  let no_progress_at = now
+    .checked_add_duration(super::WITHDRAWAL_RETRY_BACKOFF)
+    .unwrap();
+
+  // Every shape a driver could invent for the withheld v4 leaves the item exactly
+  // as it stands — including the write-off that would otherwise be the dangerous
+  // one, and the acceptance that would otherwise re-arm at the FULL interval and
+  // starve the still-failing v6 of its short-backoff retry.
+  for invented in [
+    FamilyAttempt::Accepted { at: now },
+    FamilyAttempt::Refused { permanent: true },
+    FamilyAttempt::GateShut,
+    FamilyAttempt::NoSocket,
+    FamilyAttempt::NotAddressed,
+    FamilyAttempt::WouldBlock,
+  ] {
+    ep.note_withdrawal_result(
+      token,
+      now,
+      invented,
+      FamilyAttempt::Refused { permanent: false },
+    );
+    assert_eq!(
+      ep.route_withdrawal_owed(h),
+      Some([0, super::WITHDRAWAL_SENDS]),
+      "{}: a report for a family that owed nothing must change nothing",
+      invented.as_str()
+    );
+    assert_eq!(
+      ep.route_withdrawal_next_at(h),
+      Some(no_progress_at),
+      "{}: nor may it count as progress and re-arm at the full interval, which \
+       would starve the family that still owes",
+      invented.as_str()
     );
   }
 }

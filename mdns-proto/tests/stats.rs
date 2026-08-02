@@ -11,7 +11,7 @@ use std::{net::Ipv4Addr, time::Instant as StdInstant};
 use std::time::Duration;
 
 use mdns_proto::{
-  CollectedAnswer, FamilyDelivery, Name, Query, TransmitDelivery,
+  CollectedAnswer, FamilyAttempt, Name, Query,
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec, ServiceSpec},
   endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
@@ -256,9 +256,10 @@ fn tx_counters_stay_zero_on_all_socket_failure() {
     let (ok, next) = tick(&mut svc, now);
     now = next;
     if ok {
-      svc.note_transmit_outcome(
+      let _ = svc.note_transmit_outcome(
         now,
-        TransmitDelivery::new(FamilyDelivery::Missed, FamilyDelivery::Missed),
+        FamilyAttempt::Refused { permanent: false },
+        FamilyAttempt::Refused { permanent: false },
       ); // all-socket-failure
     }
   }
@@ -317,9 +318,10 @@ fn tx_counters_advance_on_confirmed_delivery() {
     svc.handle_timeout(now).unwrap();
     let mut buf = vec![0u8; 4096];
     if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
-      svc.note_transmit_outcome(
+      let _ = svc.note_transmit_outcome(
         now,
-        TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Delivered),
+        FamilyAttempt::Accepted { at: now },
+        FamilyAttempt::Accepted { at: now },
       );
     }
     if svc.state() == mdns_proto::ServiceState::Established {
@@ -384,9 +386,10 @@ fn excused_rounds_do_not_count_as_delivered_transmits() {
     svc.handle_timeout(now).unwrap();
     let mut buf = vec![0u8; 4096];
     if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
-      svc.note_transmit_outcome(
+      let _ = svc.note_transmit_outcome(
         now,
-        TransmitDelivery::new(FamilyDelivery::Delivered, FamilyDelivery::Missed),
+        FamilyAttempt::Accepted { at: now },
+        FamilyAttempt::Refused { permanent: false },
       );
     }
     if svc.state() == mdns_proto::ServiceState::Established {
