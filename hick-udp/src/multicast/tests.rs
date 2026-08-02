@@ -1,40 +1,30 @@
 use super::*;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
-/// Synthesize a Linux IP_PKTINFO cmsg buffer for testing.
+/// The Linux/Apple 12-byte `struct in_pktinfo`: `ipi_ifindex`, `ipi_spec_dst`,
+/// `ipi_addr`. Also fed to the NetBSD parser, whose own `in_pktinfo` is a
+/// different 8-byte layout, to pin that it refuses this one.
+fn synth_linux_in_pktinfo(index: u32, spec_dst: Ipv4Addr, addr: Ipv4Addr) -> Vec<u8> {
+  let mut v = Vec::with_capacity(12);
+  v.extend_from_slice(&index.to_ne_bytes());
+  v.extend_from_slice(&spec_dst.octets());
+  v.extend_from_slice(&addr.octets());
+  v
+}
+
+/// Synthesize a Linux/Apple `IP_PKTINFO` cmsg buffer for testing.
 #[cfg(has_ip_pktinfo)]
 fn synth_cmsg_v4(local_ip: Ipv4Addr, iface: u32) -> Vec<u8> {
-  let hdr_size = core::mem::size_of::<libc::cmsghdr>();
-  let data_size = 12; // in_pktinfo
-  let cmsg_len = hdr_size + data_size;
-  let align = core::mem::align_of::<libc::cmsghdr>();
-  let padded = (cmsg_len + align - 1) & !(align - 1);
-
-  let mut buf = vec![0u8; padded];
-
-  // Write cmsghdr at offset 0. Build via `zeroed` + field assignment so any
-  // platform-specific padding (e.g. musl's `cmsghdr::__pad1`) is initialized.
-  #[allow(unsafe_code)]
-  let mut hdr: libc::cmsghdr = unsafe { core::mem::zeroed() };
-  hdr.cmsg_len = cmsg_len as _;
-  hdr.cmsg_level = libc::IPPROTO_IP;
-  hdr.cmsg_type = libc::IP_PKTINFO;
-  #[allow(unsafe_code)]
-  unsafe {
-    core::ptr::write_unaligned(buf.as_mut_ptr() as *mut libc::cmsghdr, hdr);
-  }
-  // Write in_pktinfo data: ifindex (i32 native), spec_dst (4 bytes), addr (4 bytes).
-  let idx_bytes = iface.to_ne_bytes();
-  buf[hdr_size..hdr_size + 4].copy_from_slice(&idx_bytes);
-  // ipi_spec_dst = the local interface address the packet was received on
-  // (this is what we want for self-packet detection); ipi_addr = the IP
-  // header destination address.  For multicast the two differ: ipi_addr is
-  // the group (224.0.0.251), ipi_spec_dst is the local interface IP.
-  let spec_dst_bytes = local_ip.octets();
-  let dst_bytes = Ipv4Addr::new(224, 0, 0, 251).octets();
-  buf[hdr_size + 4..hdr_size + 8].copy_from_slice(&spec_dst_bytes);
-  buf[hdr_size + 8..hdr_size + 12].copy_from_slice(&dst_bytes);
-  buf
+  // ipi_spec_dst is the local interface address the datagram arrived on (what
+  // self-packet detection wants); ipi_addr is the IP header destination. For a
+  // multicast arrival the two differ — ipi_addr is the group, ipi_spec_dst the
+  // interface's own IP — and the tests below pin that they never collapse onto
+  // each other.
+  synth_cmsg(
+    libc::IPPROTO_IP,
+    libc::IP_PKTINFO,
+    &synth_linux_in_pktinfo(iface, local_ip, Ipv4Addr::new(224, 0, 0, 251)),
+  )
 }
 
 #[cfg(has_ip_pktinfo)]
@@ -95,15 +85,65 @@ fn empty_cmsgs_returns_missing() {
   assert!(err.is_missing_pktinfo());
 }
 
-/// Build a single cmsg with the given level/type carrying `data`, padded to
-/// the cmsghdr alignment, mirroring `synth_cmsg_v4`.
-fn synth_cmsg(level: libc::c_int, ty: libc::c_int, data: &[u8]) -> Vec<u8> {
-  let hdr_size = core::mem::size_of::<libc::cmsghdr>();
-  let cmsg_len = hdr_size + data.len();
-  let align = core::mem::align_of::<libc::cmsghdr>();
-  let padded = (cmsg_len + align - 1) & !(align - 1);
+/// Where a kernel writes a cmsg's payload, and where `CmsgIter` reads it from:
+/// `CMSG_LEN(0)` — the header size rounded up to the target's cmsg alignment.
+///
+/// NOT `size_of::<libc::cmsghdr>()`. The two coincide on Linux (16 == 16) and
+/// Apple (12 == 12) and diverge on the BSDs, where `struct cmsghdr` is 12 bytes
+/// (`socklen_t` plus two `int`s) but `_ALIGN` rounds to `_ALIGNBYTES` — 7 on
+/// x86_64 FreeBSD, DragonFly, OpenBSD and NetBSD — making `CMSG_LEN(0)` 16.
+/// A builder keyed to the struct size therefore writes every payload four bytes
+/// early on exactly the targets these tests exist to cover, and the parser,
+/// reading from `CMSG_LEN(0)`, sees a 4-byte `IP_RECVDSTADDR` as empty and an
+/// 8-byte NetBSD `in_pktinfo` as four bytes. The alignment is not constant even
+/// within one platform (NetBSD rounds to 4 on x86 and 16 on sparc64), which is
+/// why this asks `libc` instead of deriving a constant.
+fn cmsg_data_offset() -> usize {
+  // SAFETY: `CMSG_LEN` is pure length arithmetic on an integer and dereferences
+  // nothing; `libc` marks it `unsafe` by convention only. `CmsgIter` calls it
+  // the same way, for the same reason, and that shared source is what makes
+  // builder and parser agree on every target rather than only on this host.
+  #[allow(unsafe_code)]
+  unsafe {
+    libc::CMSG_LEN(0) as usize
+  }
+}
 
-  let mut buf = vec![0u8; padded];
+/// How many bytes one cmsg occupies in an ancillary buffer, and so the offset
+/// of the next header: `CMSG_SPACE(data_len)`, which pads the payload as well
+/// as the header. This is the stride `CmsgIter` advances by, and therefore
+/// exactly what a synthesized cmsg must be allocated — padding to
+/// `align_of::<cmsghdr>()` is not the same quantity and is short on the BSDs,
+/// where a 4-byte-aligned struct is walked with 8-byte alignment.
+fn cmsg_stride(data_len: usize) -> usize {
+  let data_len = u32::try_from(data_len).expect("test cmsg payloads are a few bytes");
+  // SAFETY: as in `cmsg_data_offset` — `CMSG_SPACE` is integer arithmetic.
+  #[allow(unsafe_code)]
+  unsafe {
+    libc::CMSG_SPACE(data_len) as usize
+  }
+}
+
+/// Build one cmsg the way a kernel lays it out: header at offset 0, payload at
+/// `CMSG_LEN(0)`, `cmsg_len` covering header-plus-payload, and the whole thing
+/// occupying `CMSG_SPACE(data.len())` so the next header lands where the walker
+/// looks for it.
+///
+/// The buffer is read back through `CmsgIter` before being returned. These
+/// synthesized buffers are the only evidence the BSD parsers have — CI
+/// cross-compiles those targets and executes nothing on them — so the builder
+/// checks its own product instead of trusting its arithmetic: a target whose
+/// header padding or stride differed from what was assumed here fails at the
+/// build, in every test at once, rather than quietly handing the parsers
+/// payloads they read short or headers they walk past. The round trip pins
+/// builder against parser; what makes the parser itself right about a real
+/// kernel is that both sides take their offsets from `libc`'s macros, which
+/// are the ABI.
+fn synth_cmsg(level: libc::c_int, ty: libc::c_int, data: &[u8]) -> Vec<u8> {
+  let data_offset = cmsg_data_offset();
+  let cmsg_len = data_offset + data.len();
+  let mut buf = vec![0u8; cmsg_stride(data.len())];
+
   // `zeroed` + field assignment initializes any platform-specific padding
   // (e.g. musl's `cmsghdr::__pad1`) that a struct literal would omit.
   #[allow(unsafe_code)]
@@ -115,8 +155,100 @@ fn synth_cmsg(level: libc::c_int, ty: libc::c_int, data: &[u8]) -> Vec<u8> {
   unsafe {
     core::ptr::write_unaligned(buf.as_mut_ptr() as *mut libc::cmsghdr, hdr);
   }
-  buf[hdr_size..hdr_size + data.len()].copy_from_slice(data);
+  buf[data_offset..cmsg_len].copy_from_slice(data);
+
+  let mut walk = CmsgIter::new(&buf);
+  let parsed = walk
+    .next()
+    .expect("a synthesized cmsg must be visible to CmsgIter")
+    .expect("a synthesized cmsg must parse");
+  assert_eq!(
+    parsed.level, level,
+    "cmsg_level must survive the round trip"
+  );
+  assert_eq!(parsed.ty, ty, "cmsg_type must survive the round trip");
+  assert_eq!(
+    parsed.data, data,
+    "the payload written at CMSG_LEN(0) must be the payload CmsgIter reads back"
+  );
+  assert!(
+    walk.next().is_none(),
+    "one cmsg must occupy exactly CMSG_SPACE(data.len()) bytes, no more and no less"
+  );
+
   buf
+}
+
+/// The builder is evidence-bearing infrastructure — every parse test here reads
+/// a buffer it produced — so its two derived quantities are pinned against
+/// `libc`'s macros computed a different way, on whatever target is compiled.
+///
+/// The mismatch this guards was live in this file: deriving the payload offset
+/// from `size_of::<cmsghdr>()` and the stride from `align_of::<cmsghdr>()` is
+/// right on Linux and Apple and wrong on all four BSDs, so the tests below
+/// proved the BSD parsers against a layout no BSD kernel emits.
+#[test]
+fn synth_cmsg_agrees_with_libc_on_payload_offset_and_stride() {
+  let hdr_size = core::mem::size_of::<libc::cmsghdr>();
+  let data_offset = cmsg_data_offset();
+  assert!(
+    data_offset >= hdr_size,
+    "a payload at {data_offset} would overlap a {hdr_size}-byte cmsghdr"
+  );
+
+  for data_len in 0..=24usize {
+    // `synth_cmsg` derives `cmsg_len` as CMSG_LEN(0) + data_len; `libc` derives
+    // it as _ALIGN(sizeof cmsghdr) + data_len. Same ABI rule, different call.
+    #[allow(unsafe_code)]
+    let libc_len = unsafe { libc::CMSG_LEN(data_len as u32) } as usize;
+    assert_eq!(
+      data_offset + data_len,
+      libc_len,
+      "the builder's cmsg_len for a {data_len}-byte payload must be CMSG_LEN({data_len})"
+    );
+
+    let stride = cmsg_stride(data_len);
+    assert!(
+      stride >= libc_len,
+      "CMSG_SPACE({data_len}) = {stride} must cover CMSG_LEN({data_len}) = {libc_len}"
+    );
+
+    // Every byte distinct, so a payload written at the wrong offset comes back
+    // shifted rather than merely short: `synth_cmsg`'s own round trip compares
+    // the bytes, not just the length.
+    let data: Vec<u8> = (0..data_len).map(|i| 0xA5 ^ (i as u8)).collect();
+    let one = synth_cmsg(libc::IPPROTO_IP, libc::IP_TTL, &data);
+    assert_eq!(one.len(), stride, "one cmsg must be CMSG_SPACE bytes long");
+
+    // Concatenated, the walker must still see both — true only if the stride
+    // the builder allocates is the stride the walker advances by. The two
+    // differ in level as well as type, so a second header found at the wrong
+    // offset cannot pass by resembling the first. Both level/type pairs come
+    // from constants every Unix target binds — this test is ungated, and
+    // `IPV6_HOPLIMIT`, for one, does not exist on NetBSD.
+    let pair = synth_cmsgs(&[
+      (libc::IPPROTO_IP, libc::IP_TTL, &data),
+      (libc::SOL_SOCKET, libc::SCM_RIGHTS, &data),
+    ]);
+    assert_eq!(pair.len(), 2 * stride);
+    let items: Vec<_> = CmsgIter::new(&pair)
+      .map(|c| c.expect("a synthesized pair must parse"))
+      .collect();
+    assert_eq!(
+      items.len(),
+      2,
+      "a second cmsg placed at CMSG_SPACE({data_len}) must be walked to"
+    );
+    assert_eq!(
+      (items[0].level, items[0].ty),
+      (libc::IPPROTO_IP, libc::IP_TTL)
+    );
+    assert_eq!(
+      (items[1].level, items[1].ty),
+      (libc::SOL_SOCKET, libc::SCM_RIGHTS)
+    );
+    assert!(items.iter().all(|c| c.data == data.as_slice()));
+  }
 }
 
 // parse an IPv4 TTL cmsg (host-order int, as Linux delivers it).
@@ -472,6 +604,16 @@ fn try_bind_v6_rejects_a_mismatch_forced_through_production_wiring() {
 // come from a real host of each target, and until it does the parsers stay
 // unwired — see `build.rs` for the full list.
 //
+// Nor do they prove the parse ON a BSD. `synth_cmsg` now frames every buffer
+// from the compiled target's own `CMSG_LEN`/`CMSG_SPACE`, so cross-compiling
+// this test binary for a BSD type-checks the layout against that target's real
+// ABI constants; but these assertions run on the host that runs `cargo test`,
+// so what they execute is the host's cmsg ABI, with the per-target cmsg NUMBERS
+// supplied as parameters. Read them as "the decoders and the walk are correct
+// given the layout", not as "the layout is confirmed on FreeBSD". Only a run on
+// each target turns this into activation evidence, which is the same bar
+// `build.rs` sets for the flip.
+//
 // The cmsg type numbers are passed in rather than read from `libc` (see
 // `scan_dstaddr_recvif`), so these are the real per-target values: 7 for
 // `IP_RECVDSTADDR` everywhere, 20 for `IP_RECVIF` on FreeBSD/DragonFly/NetBSD
@@ -485,10 +627,10 @@ const IP_RECVIF_TY_OPENBSD: libc::c_int = 30;
 const IP_PKTINFO_TY_NETBSD: libc::c_int = 25;
 
 /// Concatenate several cmsgs into one ancillary buffer. Each `synth_cmsg` is
-/// already padded to the cmsghdr alignment, which is the same stride
-/// `CmsgIter` derives from libc's `CMSG_SPACE` — the multi-cmsg tests below
-/// assert the resulting item count, so a disagreement would surface as a
-/// failure rather than as a silently skipped cmsg.
+/// already exactly `CMSG_SPACE(data.len())` long — the stride `CmsgIter`
+/// advances by — so appending them places every header where the walker looks
+/// for it. The multi-cmsg tests below assert the resulting item count, so a
+/// disagreement surfaces as a failure rather than as a silently skipped cmsg.
 fn synth_cmsgs(parts: &[(libc::c_int, libc::c_int, &[u8])]) -> Vec<u8> {
   let mut buf = Vec::new();
   for (level, ty, data) in parts {
@@ -519,16 +661,6 @@ fn synth_netbsd_in_pktinfo(addr: Ipv4Addr, index: u32) -> Vec<u8> {
   let mut v = Vec::with_capacity(8);
   v.extend_from_slice(&addr.octets());
   v.extend_from_slice(&index.to_ne_bytes());
-  v
-}
-
-/// The Linux/Apple 12-byte `struct in_pktinfo`: `ipi_ifindex`, `ipi_spec_dst`,
-/// `ipi_addr`. Used to feed each parser the OTHER platform's layout.
-fn synth_linux_in_pktinfo(index: u32, spec_dst: Ipv4Addr, addr: Ipv4Addr) -> Vec<u8> {
-  let mut v = Vec::with_capacity(12);
-  v.extend_from_slice(&index.to_ne_bytes());
-  v.extend_from_slice(&spec_dst.octets());
-  v.extend_from_slice(&addr.octets());
   v
 }
 
