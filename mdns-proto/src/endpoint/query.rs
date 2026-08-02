@@ -209,9 +209,10 @@ where
   /// bounds instead of pretending to eliminate.
   ///
   /// An instant parameter could not be: resolving `handle` walks the query pool,
-  /// which has no capacity bound, so a value sampled before this call can be
-  /// stale before the comparison it was sampled for — and on a preemptible host
-  /// so can one sampled a single statement earlier. Taking the clock instead of
+  /// whose length is the caller's choice and which this crate puts no ceiling on,
+  /// so a value sampled before this call can be stale before the comparison it
+  /// was sampled for — and on a preemptible host so can one sampled a single
+  /// statement earlier. Taking the clock instead of
   /// its reading leaves no parameter through which a stale reading can arrive.
   /// It is invoked at most once, and only when a datagram is otherwise due.
   pub fn poll_query_transmit(

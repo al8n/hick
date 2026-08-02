@@ -40,11 +40,14 @@ where
   /// `Query::handle_event` also declines records on its own terms — a zero
   /// `max_answers` cap, a duplicate, undecodable rdata, a full answer pool — and
   /// the fan-out screens none of those, which is why [`RouteEvent::ToQuery`]
-  /// states an offer rather than a receipt. The window is the one worth
-  /// mirroring: a consumer can re-derive the others from the event's own record
-  /// and the cap it configured, while this one turns on a reading taken inside
-  /// `handle` — invisible from outside, so leaving it unmirrored would let a
-  /// driver's tick order decide what the consumer is told.
+  /// states an offer rather than a receipt. Those refusals stay deliberately
+  /// unreported, and a consumer cannot in general reconstruct them: a duplicate
+  /// the query already held and an equal record it has just kept leave
+  /// `collected_answers` looking the same, and a pool refusal turns on occupancy
+  /// no event carries. The window is mirrored because it is the one refusal that
+  /// is otherwise INVISIBLE — it turns on a reading taken inside `handle`, so
+  /// leaving it unmirrored would let a driver's tick order decide what the
+  /// consumer is told.
   ///
   /// It is not re-read per record. The datagram is one event with one processing
   /// instant, which is what keeps its cache writes, its collections and this

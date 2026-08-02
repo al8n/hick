@@ -252,12 +252,33 @@ pub enum RouteEvent<'a> {
   ///
   /// # What the fan-out screened
   ///
-  /// One is yielded only for a query that passed all four of the fan-out's
-  /// screens, weighed as of the `now` that `Endpoint::handle` processed the
-  /// datagram at: the query had not ended; its terminal `QueryUpdate` had not
-  /// already been taken by `Endpoint::poll_query`; the caller's
-  /// `QuerySpec::with_timeout` window was still open; and the record matched the
-  /// query's name, type and class.
+  /// Screening happens at two levels, and the DATAGRAM and RECORD levels come
+  /// first: a record turned away there never reaches the query pool, so no query
+  /// is screened for it and none of the per-query screens below says anything
+  /// about it. Both levels are stated because absence is only readable against
+  /// the whole chain — a query can satisfy every per-query screen and still see
+  /// no event, simply because no record got that far.
+  ///
+  /// The datagram must have been admitted by `Endpoint::handle`: it parsed, with
+  /// a QUERY opcode and a no-error rcode; it was not classified as this
+  /// endpoint's own loopback, by the caller's self flag or by the opt-in
+  /// advertised-source check; and — since only a response can carry an answer to
+  /// a query — it set QR=1 and arrived from UDP source port 5353, the only source
+  /// RFC 6762 lets a response be trusted from.
+  ///
+  /// The record must then sit in that datagram's answer or additional section
+  /// (question and authority records route to services alone); it must parse, and
+  /// so must every record ahead of it in its section, since a parse error is
+  /// reported and abandons the rest of that section; and its TTL must be
+  /// non-zero, because a TTL=0 goodbye is a withdrawal that updates the cache and
+  /// is never announced as an answer.
+  ///
+  /// Only a record past all of that is offered to the query pool, where it is
+  /// screened against each query on four more, weighed as of the `now` that
+  /// `Endpoint::handle` processed the datagram at: the query had not ended; its
+  /// terminal `QueryUpdate` had not already been taken by `Endpoint::poll_query`;
+  /// the caller's `QuerySpec::with_timeout` window was still open; and the record
+  /// matched the query's name, type and class.
   ///
   /// The window screen is the same comparison, against the same reading, that
   /// `Query::handle_event` weighed this record on — so a record refused for
@@ -265,7 +286,7 @@ pub enum RouteEvent<'a> {
   ///
   /// # What it does NOT imply
   ///
-  /// Those four decide that the query was OFFERED the record. Whether it KEPT
+  /// Those screens decide that the query was OFFERED the record. Whether it KEPT
   /// one is `Query::handle_event`'s separate decision, and that decision
   /// declines for reasons no screen above looks at: a
   /// `QuerySpec::with_max_answers` cap of zero, rdata carrying a domain name

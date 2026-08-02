@@ -778,8 +778,9 @@ where
   ///
   /// `clock` is that reading, and it is a closure rather than an instant on
   /// purpose. An instant is sampled in the caller, and whatever runs between the
-  /// sample and this comparison — a handle lookup over an uncapped pool, a walk
-  /// across other producers, a scheduler preempting either — is time the value
+  /// sample and this comparison — a handle lookup over a pool this crate puts no
+  /// ceiling on, a walk across other producers, a scheduler preempting either —
+  /// is time the value
   /// does not know about, so it can be stale by the time it is weighed. Moving
   /// the sample closer only shortens that stretch; deleting the parameter
   /// removes it, because there is no longer anything to hand a stale reading in

@@ -398,9 +398,10 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   stats: std::sync::Arc<hick_trace::stats::Stats>,
   /// Real time to burn inside the next [`Self::poll_query_transmit`], between
   /// the pool scan that resolves the handle and the poll that reads the clock.
-  /// That stretch is unbounded in principle — the query pool has no capacity
-  /// limit — but nothing a test can do from OUTSIDE the call makes it long
-  /// enough to observe, so a test hands the endpoint the delay directly.
+  /// That stretch grows with the pool, whose size is the caller's choice and
+  /// which this crate puts no ceiling on — but nothing a test can do from
+  /// OUTSIDE the call makes it long enough to observe, so a test hands the
+  /// endpoint the delay directly.
   /// `cfg(test)`: it does not exist in a shipped build.
   #[cfg(all(test, feature = "std"))]
   pub(crate) query_resolve_stall: Option<core::time::Duration>,

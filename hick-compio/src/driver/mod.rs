@@ -242,8 +242,9 @@ pub(crate) struct State {
   #[cfg(feature = "stats")]
   pub(crate) stats: std::sync::Arc<stats::Stats>,
   /// Per-query stalls injected **between [`Self::poll_one_transmit`]'s entry and
-  /// the instant each question is weighed against**, consumed one per query
-  /// walked; once exhausted every poll proceeds at full speed.
+  /// the instant each question is weighed against**, consumed one per query the
+  /// pump actually polls — a cancelled or errored query is skipped before the
+  /// stall. Once exhausted every poll proceeds at full speed.
   ///
   /// It stands in for the one thing no test can ask a real host for: this
   /// synchronous call losing the CPU with a query poll still ahead of it. The
@@ -760,12 +761,14 @@ impl State {
   /// probe sequence and §8.3 announce phase only advance once every obligated
   /// family carried the pending datagram.
   ///
-  /// `now` is the run loop's stable reading for this pass and is spent on the
-  /// core's OWN schedules — the service walk's lifecycle timers and the §5.2
-  /// retry ladder — which every stage must agree about. A query's
+  /// `now` is the reading the transmit pump took for this iteration, and what it
+  /// is spent on HERE is the core's own service schedules alone — each service's
+  /// lifecycle timers, and the withdrawal one of them may begin. A query's
   /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window is
   /// not one of those: it is real time promised to a caller, so the query walk
-  /// reads its own instant at the poll that would draw the question.
+  /// reads its own instant at the poll that would draw the question. The RFC 6762
+  /// §5.2 retry ladder is not one of them either — [`Self::fire_timeouts`] fires
+  /// it, from the timer branch, against a reading taken there.
   pub(crate) fn poll_one_transmit(
     &mut self,
     now: StdInstant,
@@ -912,12 +915,13 @@ impl State {
       // out. The bound is what this driver can honestly offer.
       //
       // The RFC 6762 §5.2 retry ladder is not this deadline and does not move
-      // here. That ladder, the endpoint's own timers and each service's
-      // lifecycle are schedules the core owns and nobody outside it observes, so
-      // they keep the one stable `now` this call was given — two of them
-      // disagreeing about "now" can fire a deadline twice or skip it, while the
-      // quantization never leaves the core. Which kind an instant is depends on
-      // who was promised it, never on the comparison that weighs it.
+      // here: `fire_timeouts` fires it, and the endpoint's own timers with it,
+      // against a reading taken there. What keeps the `now` this call was given
+      // is the service walk above — lifecycle schedules the core owns and nobody
+      // outside it observes, where two stages disagreeing about "now" can fire a
+      // deadline twice or skip it, and where the quantization never leaves the
+      // core. Which kind an instant is depends on who was promised it, never on
+      // the comparison that weighs it.
       match self
         .endpoint
         .poll_query_transmit(h, StdInstant::now, scratch)
