@@ -3308,7 +3308,6 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
     // A §6.7 reply is one-shot and therefore ungated.
     &mut FamilyWireGate::default(),
     Duration::ZERO,
-    StdInstant::now(),
   )
   .await;
 
@@ -3406,6 +3405,9 @@ const QUERY_MIN_FAMILY_GAP: Duration = Duration::from_secs(1);
 /// the variable the wire gate must not be allowed to spend: a gate anchored
 /// before submission gives back every millisecond a send spent in flight.
 struct DelayedSender {
+  /// Which family's socket this stands in for. Every event it logs carries it, so
+  /// the fan-out's event order can be read per family.
+  family: usize,
   /// Per-call pending durations, consumed in order; exhausted calls complete
   /// immediately.
   pending: RefCell<std::collections::VecDeque<Duration>>,
@@ -3415,8 +3417,9 @@ struct DelayedSender {
 }
 
 impl DelayedSender {
-  fn new(pending: &[Duration]) -> Self {
+  fn new(family: usize, pending: &[Duration]) -> Self {
     Self {
+      family,
       pending: RefCell::new(pending.iter().copied().collect()),
       wire_times: RefCell::new(Vec::new()),
     }
@@ -3425,6 +3428,11 @@ impl DelayedSender {
 
 impl SendDatagram for DelayedSender {
   async fn send_to(&self, buf: &[u8], _dst: SocketAddr) -> std::io::Result<usize> {
+    // Logged on ENTRY, ahead of any pending time: the event marks the point this
+    // family's socket was handed the datagram, which is what its admission
+    // reading is supposed to sit immediately before. Logging it at completion
+    // instead would make the order depend on how long each socket took.
+    note_fanout_event(FanoutEvent::Send(self.family));
     let pending = self
       .pending
       .borrow_mut()
@@ -3455,7 +3463,7 @@ async fn same_family_wire_times(min_gap: Duration, pending: &[Duration]) -> Vec<
     1500,
     9000,
   ));
-  let sender = Rc::new(DelayedSender::new(pending));
+  let sender = Rc::new(DelayedSender::new(FAMILY_V4, pending));
   let sock_v4 = Some(sender.clone());
   let sock_v6: Option<Rc<DelayedSender>> = None;
   let mut gate = FamilyWireGate::default();
@@ -3473,7 +3481,6 @@ async fn same_family_wire_times(min_gap: Duration, pending: &[Duration]) -> Vec<
         &body,
         &mut gate,
         min_gap,
-        StdInstant::now(),
       )
       .await;
       match fanout.v4 {
@@ -3554,6 +3561,262 @@ async fn a_pending_query_does_not_shorten_the_next_ones_wire_gap() {
     &[Duration::from_millis(500), Duration::ZERO],
   )
   .await;
+}
+
+/// One thing a fan-out did, as it did it.
+///
+/// The two kinds share one timeline, which is what makes the reading's PLACEMENT
+/// observable. Counting readings cannot: two taken back to back before either
+/// send are still two, and are still one stale verdict for whichever family goes
+/// second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FanoutEvent {
+  /// Admission read the clock for this family.
+  Admit(usize),
+  /// This family's socket was handed the datagram.
+  Send(usize),
+}
+
+thread_local! {
+  /// What the fan-out did, oldest first. Written by the admission seam and by
+  /// [`DelayedSender`], which is what puts both kinds of event on one timeline.
+  static FANOUT_LOG: RefCell<Vec<FanoutEvent>> = const { RefCell::new(Vec::new()) };
+
+  /// The instants admission will read, in call order, once armed.
+  ///
+  /// `None` — the state every other test in this file runs in — is the real
+  /// clock. Per thread, and `#[compio::test]` polls the whole fan-out on the
+  /// test's own.
+  static SCRIPTED_ADMISSION: RefCell<Option<std::collections::VecDeque<StdInstant>>> =
+    const { RefCell::new(None) };
+}
+
+fn note_fanout_event(event: FanoutEvent) {
+  FANOUT_LOG.with(|log| log.borrow_mut().push(event));
+}
+
+/// The seam `admission_now` reads under `cfg(test)`.
+///
+/// Every read is logged, armed or not, so the log records what the code did
+/// rather than what a script expected of it. An ARMED script that runs out is a
+/// failure and not a fallback: quietly returning the real clock would hand the
+/// decision to the host's timing in a test that exists to be decided by
+/// arithmetic.
+pub(super) fn scripted_admission_now(family: usize) -> StdInstant {
+  note_fanout_event(FanoutEvent::Admit(family));
+  SCRIPTED_ADMISSION.with(|script| match script.borrow_mut().as_mut() {
+    None => StdInstant::now(),
+    Some(readings) => readings.pop_front().unwrap_or_else(|| {
+      panic!(
+        "admission asked for more readings than were scripted for it (family \
+         {family} found the script exhausted)"
+      )
+    }),
+  })
+}
+
+/// Arms the admission script and clears the event log, and on drop requires that
+/// admission took every reading it was given.
+///
+/// On drop, so a test that ends before its own assertions still reports a fan-out
+/// that weighed fewer gaps than it had families rather than passing quietly.
+struct ScriptedAdmission;
+
+impl ScriptedAdmission {
+  fn arm(readings: &[StdInstant]) -> Self {
+    FANOUT_LOG.with(|log| log.borrow_mut().clear());
+    SCRIPTED_ADMISSION.with(|script| {
+      *script.borrow_mut() = Some(readings.iter().copied().collect());
+    });
+    Self
+  }
+
+  /// What the fan-out did since it was armed, oldest first.
+  fn events(&self) -> Vec<FanoutEvent> {
+    FANOUT_LOG.with(|log| log.borrow().clone())
+  }
+}
+
+impl Drop for ScriptedAdmission {
+  fn drop(&mut self) {
+    let unread =
+      SCRIPTED_ADMISSION.with(|script| script.borrow_mut().take().map_or(0, |r| r.len()));
+    FANOUT_LOG.with(|log| log.borrow_mut().clear());
+    // A test already unwinding carries its own report, and a second panic here
+    // would abort the process and take that report with it.
+    assert!(
+      unread == 0 || std::thread::panicking(),
+      "admission left {unread} of its scripted readings unread: it weighed fewer \
+       gaps than the fan-out had families, which is one verdict shared across them"
+    );
+  }
+}
+
+/// Each family reads the clock at ITS OWN send point, with that family's
+/// `send_to` as the next thing that happens.
+///
+/// That placement is the invariant, and it is not a count. Two readings taken
+/// back to back before either send are still two readings, and are still one
+/// stale verdict for whichever family goes second: everything between them and
+/// that family's send — a scheduler pause, the first family's submission work —
+/// is time the second family's gap was credited with but had not paid. So the
+/// admission seam and the sockets write onto one timeline, and the SHAPE of it is
+/// what is asserted.
+///
+/// Both families are given a reading that pays their floor, so both are admitted
+/// and both send: the log then shows the interleaving rather than a verdict.
+/// Neither socket has anything pending, so each completes inside the poll that
+/// handed it the datagram and the fan-out's whole history is these four events.
+/// Which family goes first is the fan-out's business and the assertion does not
+/// care; that a family's reading is followed by ITS OWN send, with nothing in
+/// between, is not.
+#[compio::test]
+async fn each_family_reads_the_clock_at_its_own_send_point() {
+  /// The floor both families owe, and what the reading each is given pays.
+  const GAP: Duration = ANNOUNCE_MIN_FAMILY_GAP;
+
+  let inner = Rc::new(EndpointInner::new(
+    mdns_proto::EndpointConfig::default(),
+    1500,
+    9000,
+  ));
+  let v4 = Rc::new(DelayedSender::new(FAMILY_V4, &[]));
+  let v6 = Rc::new(DelayedSender::new(FAMILY_V6, &[]));
+  let sock_v4 = Some(v4.clone());
+  let sock_v6 = Some(v6.clone());
+
+  // An origin, not a measurement.
+  let t0 = StdInstant::now();
+  let mut gate = FamilyWireGate::default();
+  gate.record(FAMILY_V4, t0, GAP);
+  gate.record(FAMILY_V6, t0, GAP);
+
+  let script = ScriptedAdmission::arm(&[t0 + GAP, t0 + GAP]);
+  let fanout = send_via(
+    &inner,
+    &sock_v4,
+    &sock_v6,
+    MDNS_V4_DST,
+    b"announce",
+    &mut gate,
+    GAP,
+  )
+  .await;
+  let events = script.events();
+
+  assert!(
+    matches!(fanout.v4, FamilyAttempt::Accepted { .. })
+      && matches!(fanout.v6, FamilyAttempt::Accepted { .. }),
+    "both families were given a reading that pays their floor, so both must carry \
+     the datagram — a withheld family sends nothing and would leave nothing to \
+     order. Got v4 {:?}, v6 {:?}",
+    fanout.v4,
+    fanout.v6
+  );
+
+  match events.as_slice() {
+    [
+      FanoutEvent::Admit(first),
+      FanoutEvent::Send(first_sent),
+      FanoutEvent::Admit(second),
+      FanoutEvent::Send(second_sent),
+    ] if first == first_sent && second == second_sent && first != second => {}
+    other => panic!(
+      "each family must read the clock at its own send point, so the fan-out's \
+       history is one family's reading, that family's send, then the other \
+       family's pair. A reading that sits before ANOTHER family's send is a \
+       reading taken before this family's — the pass-wide reading under a shorter \
+       name — however many of them there are. Got {other:?}"
+    ),
+  }
+}
+
+/// Every family weighs its gap against ITS OWN reading: the fan-out does not take
+/// one reading and hand the same verdict to both.
+///
+/// The companion to the ordering above, in the gate's own vocabulary. The pump
+/// reads its instant before `poll_one_transmit` walks every producer, and may
+/// then spend up to [`DRAIN_PASS_BUDGET`] serving the ones ahead of this fan-out,
+/// so a reading taken before a family's own send point can understate how long
+/// that family's wire has been idle and withhold a round it had already paid for.
+/// A withheld family is not "nothing happened": it reaches the core as
+/// [`FamilyAttempt::GateShut`], spending its partial-round patience and holding
+/// the §8.1 probe sequence / §8.3 announce phase for a wire that was ready.
+///
+/// Both families start owing the same floor, and admission is scripted two
+/// readings, only the later of which pays it. Weighed at their own send points
+/// that is one family admitted and one withheld, whichever order the fan-out
+/// polls them in. Weighed against a SINGLE reading — taken at the top of the
+/// fan-out, or by the caller before the walk — both families get the stale
+/// verdict and no family carries the datagram at all. Every instant here is
+/// arithmetic on one origin, so nothing depends on what the host managed to
+/// execute inside a given second.
+#[compio::test]
+async fn admission_is_weighed_per_family_not_once_per_fan_out() {
+  /// The floor both families owe, and the distance between the two readings.
+  const GAP: Duration = ANNOUNCE_MIN_FAMILY_GAP;
+  /// How far into that floor the earlier reading falls. Anything short of `GAP`
+  /// does; this is nowhere near it.
+  const STALE: Duration = Duration::from_millis(10);
+
+  let inner = Rc::new(EndpointInner::new(
+    mdns_proto::EndpointConfig::default(),
+    1500,
+    9000,
+  ));
+  // Nothing pending on either socket: what is under test is when the gap is
+  // WEIGHED, not what a completed send anchors it at.
+  let v4 = Rc::new(DelayedSender::new(FAMILY_V4, &[]));
+  let v6 = Rc::new(DelayedSender::new(FAMILY_V6, &[]));
+  let sock_v4 = Some(v4.clone());
+  let sock_v6 = Some(v6.clone());
+
+  // An origin, not a measurement.
+  let t0 = StdInstant::now();
+  let mut gate = FamilyWireGate::default();
+  gate.record(FAMILY_V4, t0, GAP);
+  gate.record(FAMILY_V6, t0, GAP);
+
+  // Two readings for two families, and the guard requires both be taken: a
+  // fan-out that read once leaves one behind and fails on the way out.
+  let _script = ScriptedAdmission::arm(&[t0 + STALE, t0 + GAP]);
+  let fanout = send_via(
+    &inner,
+    &sock_v4,
+    &sock_v6,
+    MDNS_V4_DST,
+    b"announce",
+    &mut gate,
+    GAP,
+  )
+  .await;
+
+  let outcomes = [fanout.v4, fanout.v6];
+  let admitted = outcomes
+    .iter()
+    .filter(|o| matches!(o, FamilyAttempt::Accepted { .. }))
+    .count();
+  let withheld = outcomes
+    .iter()
+    .filter(|o| matches!(o, FamilyAttempt::GateShut))
+    .count();
+  assert_eq!(
+    (admitted, withheld),
+    (1, 1),
+    "the two readings sit either side of the floor, so exactly one family had paid \
+     it when the datagram was offered to IT and exactly one had not. One reading \
+     shared across the fan-out is the stale one: it gives both families the same \
+     verdict and withholds the round entirely. Got v4 {:?}, v6 {:?}",
+    fanout.v4,
+    fanout.v6
+  );
+
+  assert_eq!(
+    v4.wire_times.borrow().len() + v6.wire_times.borrow().len(),
+    1,
+    "a withheld family submits no send at all, so exactly one copy may have \
+     reached a wire"
+  );
 }
 
 // ── The obligation tag (`TransmitObligation`) at the driver seam ────────────
