@@ -289,18 +289,7 @@ fn parse_hop_limit_empty_is_none() {
 #[test]
 fn parses_scm_timestampns() {
   use std::time::{Duration, SystemTime};
-  let ts = libc::timespec {
-    tv_sec: 1_700_000_000,
-    tv_nsec: 123_456_789,
-  };
-  #[allow(unsafe_code)]
-  let bytes = unsafe {
-    core::slice::from_raw_parts(
-      core::ptr::addr_of!(ts).cast::<u8>(),
-      core::mem::size_of::<libc::timespec>(),
-    )
-  };
-  let buf = synth_cmsg(libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS, bytes);
+  let buf = synth_rx_timestamp_cmsg(1_700_000_000, 123_456_789);
   let got = parse_rx_time(&buf).expect("expected a parsed timestamp");
   let want = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
   assert_eq!(got, want);
@@ -310,18 +299,7 @@ fn parses_scm_timestampns() {
 #[test]
 fn parses_scm_timestamp() {
   use std::time::{Duration, SystemTime};
-  let tv = libc::timeval {
-    tv_sec: 1_700_000_000,
-    tv_usec: 654_321,
-  };
-  #[allow(unsafe_code)]
-  let bytes = unsafe {
-    core::slice::from_raw_parts(
-      core::ptr::addr_of!(tv).cast::<u8>(),
-      core::mem::size_of::<libc::timeval>(),
-    )
-  };
-  let buf = synth_cmsg(libc::SOL_SOCKET, libc::SCM_TIMESTAMP, bytes);
+  let buf = synth_rx_timestamp_cmsg(1_700_000_000, 654_321);
   let got = parse_rx_time(&buf).expect("expected a parsed timestamp");
   let want = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 654_321 * 1000);
   assert_eq!(got, want);
@@ -331,6 +309,235 @@ fn parses_scm_timestamp() {
 #[test]
 fn no_timestamp_cmsg_yields_none() {
   assert_eq!(parse_rx_time(&[]), None);
+}
+
+/// `size` zeroed bytes with each `(offset, native-endian field bytes)` written
+/// in — the byte image of a C struct, assembled field by field.
+///
+/// The point is that **every byte is initialized**, padding included. Building
+/// the struct and then reading it as `&[u8]` (`slice::from_raw_parts` over
+/// `addr_of!`) does not have that property: a struct literal leaves padding
+/// uninitialized, and a `&[u8]` covering an uninitialized byte is undefined
+/// behaviour whatever the struct is made of — "plain old data" is not the
+/// question, padding is. Nor is it hypothetical here: `libc::timeval` is
+/// `{ time_t, suseconds_t }`, which on Apple/aarch64 is 8 + 4 bytes inside a
+/// 16-byte, 8-aligned struct, so bytes 12..16 are tail padding. `libc::timespec`
+/// happens to have none on that target, which is luck rather than a rule — a
+/// 32-bit target with a 64-bit `time_t` pads it too.
+///
+/// A kernel writes those padding bytes as whatever its stack held, and no parse
+/// in this crate reads them, so zeroing is a faithful stand-in as well as a
+/// sound one.
+#[cfg(has_recv_timestamp)]
+fn c_struct_bytes(size: usize, fields: &[(usize, &[u8])]) -> Vec<u8> {
+  let mut buf = vec![0u8; size];
+  for (offset, value) in fields {
+    buf[*offset..*offset + value.len()].copy_from_slice(value);
+  }
+  buf
+}
+
+/// A synthesized kernel receive-timestamp cmsg: the `SCM_TIMESTAMPNS` /
+/// `timespec` pair on Linux/Android, the `SCM_TIMESTAMP` / `timeval` pair on
+/// every other target that delivers one. `secs` and `sub` are written into the
+/// two fields verbatim, so a caller can put a value in either that no kernel
+/// would produce.
+///
+/// Assembled through [`c_struct_bytes`] rather than transmuted from a struct
+/// literal — see there for why that is a soundness requirement and not a style
+/// choice. No `unsafe` is involved on either layout.
+///
+/// Each field is written at `offset_of!` in the width of the alias libc itself
+/// declares that field with (`time_t`, `c_long`, `suseconds_t`). A target where
+/// that stopped holding would not fail silently: `parses_scm_timestampns` /
+/// `parses_scm_timestamp` round-trip a known value back through the real
+/// `parse_rx_time`, which reads the genuine struct.
+#[cfg(has_recv_timestamp)]
+fn synth_rx_timestamp_cmsg(secs: i64, sub: i64) -> Vec<u8> {
+  #[cfg(recv_timestamp_ns)]
+  let (ty, payload) = (
+    libc::SCM_TIMESTAMPNS,
+    c_struct_bytes(
+      core::mem::size_of::<libc::timespec>(),
+      &[
+        (
+          core::mem::offset_of!(libc::timespec, tv_sec),
+          &(secs as libc::time_t).to_ne_bytes()[..],
+        ),
+        (
+          core::mem::offset_of!(libc::timespec, tv_nsec),
+          &(sub as libc::c_long).to_ne_bytes()[..],
+        ),
+      ],
+    ),
+  );
+  #[cfg(not(recv_timestamp_ns))]
+  let (ty, payload) = (
+    libc::SCM_TIMESTAMP,
+    c_struct_bytes(
+      core::mem::size_of::<libc::timeval>(),
+      &[
+        (
+          core::mem::offset_of!(libc::timeval, tv_sec),
+          &(secs as libc::time_t).to_ne_bytes()[..],
+        ),
+        (
+          core::mem::offset_of!(libc::timeval, tv_usec),
+          &(sub as libc::suseconds_t).to_ne_bytes()[..],
+        ),
+      ],
+    ),
+  );
+  synth_cmsg(libc::SOL_SOCKET, ty, &payload)
+}
+
+/// The two doors onto a receive stamp must return the same evidence for the
+/// same bytes.
+///
+/// [`RxEvidence::from_meta`] serves a driver that receives through this crate;
+/// [`RxEvidence::from_cmsgs`] serves one that owns its own `recvmsg` and holds
+/// only the control buffer. They exist so no driver has to decode
+/// `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS` for itself — which is worth nothing if the
+/// second door drops the stamp or reads it differently, and neither failure is
+/// visible from outside: `RxEvidence` is opaque, and a lost stamp only weakens a
+/// claim to `Degraded` rather than breaking anything a test would notice.
+///
+/// Note what this test does to run at all: it **synthesizes** the buffer. That
+/// is the plain demonstration that `from_cmsgs` cannot tell a kernel's control
+/// buffer from an encoded one, and why its documentation states the origin of
+/// the bytes as an obligation on the caller rather than as something checked
+/// here.
+#[cfg(has_recv_timestamp)]
+#[test]
+fn rx_evidence_from_cmsgs_carries_the_same_stamp_as_from_meta() {
+  use crate::selfsend::RxEvidence;
+
+  let buf = synth_rx_timestamp_cmsg(1_700_000_000, 123_456);
+  let stamp = parse_rx_time(&buf).expect("a well-formed timestamp cmsg must parse");
+  let meta = RecvMeta::new(
+    0,
+    std::net::SocketAddr::from(([127, 0, 0, 1], 5353)),
+    std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    None,
+    0,
+    Some(stamp),
+  );
+  assert_eq!(
+    RxEvidence::from_cmsgs(&buf),
+    RxEvidence::from_meta(&meta),
+    "the control-buffer door must carry the stamp the RecvMeta door carries"
+  );
+  assert_ne!(
+    RxEvidence::from_cmsgs(&buf),
+    RxEvidence::none(),
+    "a buffer that does carry a timestamp must not degrade to no evidence"
+  );
+}
+
+/// A buffer with nothing in it — or nothing this crate can read — degrades
+/// rather than inventing a stamp. `none()` is the safe answer: it costs only the
+/// ordering arm of the match.
+#[test]
+fn rx_evidence_from_cmsgs_degrades_on_a_buffer_with_no_timestamp() {
+  use crate::selfsend::RxEvidence;
+
+  assert_eq!(RxEvidence::from_cmsgs(&[]), RxEvidence::none());
+  assert_eq!(
+    RxEvidence::from_cmsgs(&synth_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4])),
+    RxEvidence::none(),
+    "a cmsg that is not a receive timestamp must not be read as one"
+  );
+}
+
+/// An absurd, malformed timestamp cmsg must not panic the parse. Two panic
+/// vectors, and both are exercised: a sub-second field far past its modulus,
+/// which `Duration::new`'s carry could overflow-panic on, and `tv_sec =
+/// i64::MAX`, which a `UNIX_EPOCH + Duration` `Add` would overflow-panic on.
+/// Reaching the assertion is the proof.
+///
+/// They need two buffers now, not one. The modulus gate declines an
+/// out-of-range sub-second field before anything arithmetic runs, so the
+/// all-`i64::MAX` buffer never reaches the seconds arithmetic at all; a
+/// well-formed sub-second field beside the absurd `tv_sec` is what still puts
+/// it there.
+///
+/// Neither result is required to be `None`, only well-defined — declined, or a
+/// real [`SystemTime`]. `tv_sec`/`tv_nsec` are `time_t` / `c_long`, and on Linux
+/// `UNIX_EPOCH.checked_add(Duration::new(i64::MAX as u64, _))` stays in range
+/// and answers `Some`. The guarantee is "no panic", not a forced decline.
+#[cfg(has_recv_timestamp)]
+#[test]
+fn absurd_timestamp_cmsg_does_not_panic() {
+  use crate::selfsend::RxEvidence;
+
+  for buf in [
+    // Absurd in both fields; the sub-second gate is what declines it.
+    synth_rx_timestamp_cmsg(i64::MAX, i64::MAX),
+    // Absurd seconds, valid sub-second field — this one reaches
+    // `Duration::new` and `checked_add`.
+    synth_rx_timestamp_cmsg(i64::MAX, 0),
+  ] {
+    // Reaching the line after this call is the assertion.
+    let stamp = parse_rx_time(&buf);
+    if let Some(t) = stamp {
+      // If a stamp came back it must be a real `SystemTime` — no panic in
+      // `duration_since` either. The value is unspecified for garbage input;
+      // only well-definedness is required.
+      let _ = t.duration_since(std::time::UNIX_EPOCH);
+    }
+    // And the constructor a driver actually reaches must absorb it identically,
+    // since that is the path a completion-based driver's buffer takes.
+    let _ = RxEvidence::from_cmsgs(&buf);
+  }
+}
+
+/// The sub-second field's modulus is a boundary, and the boundary value itself
+/// is on the reject side.
+///
+/// `tv_nsec == 1_000_000_000` is not a nanosecond count; it is one second. The
+/// gate used to be a sign test, so such a field passed and `Duration::new`
+/// silently carried it — `parse_rx_time` returned `Some` for a malformed stamp,
+/// one whole second later than the field reads, and the self-send match then ran
+/// at [`crate::selfsend::MatchMode::Ordered`] strength on it. Two asserts, one
+/// apart: `999_999_999` must still be admitted, or the fix would have cost the
+/// last representable nanosecond.
+#[cfg(recv_timestamp_ns)]
+#[test]
+fn nanoseconds_admit_below_the_modulus_and_reject_at_it() {
+  use std::time::{Duration, SystemTime};
+
+  assert_eq!(
+    parse_rx_time(&synth_rx_timestamp_cmsg(1_700_000_000, 999_999_999)),
+    Some(SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999)),
+    "the largest legal tv_nsec must still parse, and must not be rounded"
+  );
+  assert_eq!(
+    parse_rx_time(&synth_rx_timestamp_cmsg(1_700_000_000, 1_000_000_000)),
+    None,
+    "tv_nsec at its modulus is malformed and must decline, not carry into the \
+     next second"
+  );
+}
+
+/// The `timeval` twin of the boundary above: `tv_usec == 1_000_000` is one
+/// second, not a microsecond count, and multiplying it by 1000 hands
+/// `Duration::new` a full 1e9 nanoseconds to carry. Same two asserts, one apart.
+#[cfg(all(has_recv_timestamp, not(recv_timestamp_ns)))]
+#[test]
+fn microseconds_admit_below_the_modulus_and_reject_at_it() {
+  use std::time::{Duration, SystemTime};
+
+  assert_eq!(
+    parse_rx_time(&synth_rx_timestamp_cmsg(1_700_000_000, 999_999)),
+    Some(SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_000)),
+    "the largest legal tv_usec must still parse, and must not be rounded"
+  );
+  assert_eq!(
+    parse_rx_time(&synth_rx_timestamp_cmsg(1_700_000_000, 1_000_000)),
+    None,
+    "tv_usec at its modulus is malformed and must decline, not carry into the \
+     next second"
+  );
 }
 
 /// a datagram larger than the receive buffer (MSG_TRUNC) must be
