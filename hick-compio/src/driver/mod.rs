@@ -1323,11 +1323,23 @@ impl State {
     // The credit's AGE is a separate question, read inside `take` at the decision
     // and on the monotonic clock only. See `SelfSendTracker::take`.
     //
-    // A response from any other source port never reaches this line — the §11
-    // gate above drops it — while a §6.7 legacy unicast QUERY from an ephemeral
-    // port is deliberately kept, since it is owed a reply. Both sockets bind
-    // 5353, so every loopback copy of ours arrives from 5353.
-    let caller_is_self = self.selfsend.take(family, data, meta.rx_evidence());
+    // **Only port 5353 may be offered a credit**, and that is this driver's half
+    // of `SelfSendTracker::take`'s contract rather than a local nicety. Both of
+    // this endpoint's sockets bind 5353, so every datagram it sends leaves from
+    // that port and every loopback copy arrives from it — a different source port
+    // is proof the datagram is not our echo, and it is proof the tracker cannot
+    // reach for itself, since it never sees where a datagram came from.
+    //
+    // The §11 gate above drops a RESPONSE from any other port, but a §6.7 legacy
+    // unicast QUERY is deliberately kept — such a querier uses an ephemeral port
+    // and is owed a reply. Kept is not ours: in degraded mode nothing orders a
+    // claim against the send, so a byte-identical legacy query would take the
+    // credit of a query we had just multicast and be reported as our own echo.
+    // The reply that querier is owed would never be sent, and the genuine echo
+    // behind it would find no credit and reach the protocol layer as peer
+    // traffic. The `&&` short-circuits, so such a datagram is never offered one.
+    let caller_is_self = meta.peer().port() == hick_udp::constants::MDNS_PORT
+      && self.selfsend.take(family, data, meta.rx_evidence());
 
     // Use a process-monotonic `now` for proto scheduling; the kernel receive
     // stamp above is ordering evidence for the self-send credit and nothing else.
