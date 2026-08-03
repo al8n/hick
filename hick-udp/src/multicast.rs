@@ -1309,6 +1309,16 @@ struct ParsedCmsg<'a> {
 /// slice — UB on a crafted/short buffer) nor a hand-rolled alignment
 /// constant (the `apple?4:size_of::<usize>()` was wrong on BSD arches whose
 /// `_ALIGNBYTES` differs from the pointer width, e.g. NetBSD/aarch64).
+///
+/// Terminates on malformed input: `cmsg_len` is the only way to locate the
+/// next header, so once one is unusable — too short to cover even the header,
+/// claiming more than the buffer holds, or (see `cmsg_advance`) producing a
+/// computed stride that would not actually advance past it — the walk cannot
+/// recover a position past it. Every error arm consumes the remainder before
+/// returning, so a malformed header yields exactly one `Err` and every
+/// following `next()` returns `None` — a caller that keeps polling past the
+/// first `Err` (e.g. `.collect()`, `.count()`, an unconditional `for` loop)
+/// still terminates instead of re-reading the same header forever.
 #[cfg(unix)]
 struct CmsgIter<'a> {
   rest: &'a [u8],
@@ -1343,15 +1353,23 @@ impl<'a> Iterator for CmsgIter<'a> {
       unsafe { core::ptr::read_unaligned(self.rest.as_ptr().cast::<libc::cmsghdr>()) };
     let cmsg_len = hdr.cmsg_len as usize;
     if cmsg_len < hdr_size {
-      // cmsg_len must at least cover the header.
+      // cmsg_len must at least cover the header. cmsg_len is the only way to
+      // locate the next header, so once it is unusable nothing past it is
+      // parseable: fuse by dropping the rest of the buffer before returning,
+      // rather than re-reading this same header forever.
+      self.rest = &[];
       return Some(Err(ParseRecvMetaError::BufferTooShort(
         BufferTooShortDetail::new(hdr_size, cmsg_len),
       )));
     }
     if cmsg_len > self.rest.len() {
-      return Some(Err(ParseRecvMetaError::BufferTooShort(
-        BufferTooShortDetail::new(cmsg_len, self.rest.len()),
-      )));
+      // Same reasoning as above: an unusable cmsg_len ends the walk for good.
+      // Build the error (which reports the pre-fuse remaining length) before
+      // clearing `rest`.
+      let err =
+        ParseRecvMetaError::BufferTooShort(BufferTooShortDetail::new(cmsg_len, self.rest.len()));
+      self.rest = &[];
+      return Some(Err(err));
     }
     // `CMSG_LEN(0)` is the platform-exact CMSG_ALIGN'd header size = the payload
     // offset; payload runs from there to `cmsg_len`. Pure length arithmetic (no
@@ -1363,23 +1381,63 @@ impl<'a> Iterator for CmsgIter<'a> {
     #[allow(unsafe_code)]
     let data_start = unsafe { libc::CMSG_LEN(0) } as usize;
     let data: &'a [u8] = self.rest.get(data_start..cmsg_len).unwrap_or(&[]);
-    // The next header is `CMSG_SPACE(datalen)` bytes on — again libc's own
-    // arithmetic. It is >= data_start >= hdr_size > 0, so iteration always
-    // progresses; clamp to what remains.
-    let datalen = cmsg_len.saturating_sub(data_start);
-    #[allow(unsafe_code)]
-    let advance = match u32::try_from(datalen) {
-      Ok(dl) => (unsafe { libc::CMSG_SPACE(dl) } as usize).min(self.rest.len()),
-      Err(_) => self.rest.len(),
-    };
-    self.rest = self.rest.get(advance..).unwrap_or(&[]);
-
-    Some(Ok(ParsedCmsg {
-      level: hdr.cmsg_level,
-      ty: hdr.cmsg_type,
-      data,
-    }))
+    // The next header is `cmsg_advance(cmsg_len, data_start)` bytes on. That
+    // helper is the only thing standing between this cmsg and the next, so an
+    // `Err` from it gets the same fuse-then-yield-one-Err treatment as the two
+    // length checks above rather than a silent zero-length advance.
+    match cmsg_advance(cmsg_len, data_start) {
+      Some(advance) => {
+        // Clamp to what remains: `advance` is validated to be >= cmsg_len,
+        // not to be <= self.rest.len().
+        self.rest = self.rest.get(advance.min(self.rest.len())..).unwrap_or(&[]);
+        Some(Ok(ParsedCmsg {
+          level: hdr.cmsg_level,
+          ty: hdr.cmsg_type,
+          data,
+        }))
+      }
+      None => {
+        // No advance value can be trusted: fuse rather than loop on a stride
+        // that cannot move past the header just read.
+        let err = ParseRecvMetaError::BufferTooShort(BufferTooShortDetail::new(cmsg_len, 0));
+        self.rest = &[];
+        Some(Err(err))
+      }
+    }
   }
+}
+
+/// How far `CmsgIter::next` should advance past one cmsg entry (header at
+/// offset 0, `cmsg_len` bytes long, payload starting at `data_start`), or
+/// `None` if the platform's own stride arithmetic cannot be trusted to move
+/// forward at all.
+///
+/// The one invariant `next()` needs from this: the result must be `>=
+/// cmsg_len`, so the entry just read is fully behind the new `rest` and the
+/// next call cannot read the same header again. `libc::CMSG_SPACE` takes and
+/// returns `c_uint` (32 bits), but its `CMSG_ALIGN(len) +
+/// CMSG_ALIGN(sizeof(cmsghdr))` body computes in `usize` — 64 bits on a
+/// 64-bit host — and only truncates that sum back to `c_uint` on return. A
+/// `datalen` near `u32::MAX` therefore overflows at the final truncation, not
+/// the alignment itself: the returned stride wraps to something smaller than
+/// the header it was meant to skip, including zero. A `cmsg_len` that large
+/// needs a buffer of the same order (`cmsg_len <= rest.len()` is already
+/// enforced by the caller), so on a 64-bit host this is reachable only
+/// against a multi-gigabyte ancillary buffer; on a narrower host no real
+/// slice can carry a `cmsg_len` that large in the first place (see the
+/// pointer-width-specific tests). Either way, `parse_pktinfo_v4`/
+/// `parse_pktinfo_v6` are public and documented as sound on arbitrary input,
+/// so this is checked rather than assumed unreachable.
+#[cfg(unix)]
+fn cmsg_advance(cmsg_len: usize, data_start: usize) -> Option<usize> {
+  let datalen = cmsg_len.saturating_sub(data_start);
+  let dl = u32::try_from(datalen).ok()?;
+  // SAFETY: CMSG_SPACE is pure length arithmetic — it takes an integer and
+  // dereferences no memory, so calling it is sound (libc marks it `unsafe`
+  // only by convention).
+  #[allow(unsafe_code)]
+  let advance = unsafe { libc::CMSG_SPACE(dl) } as usize;
+  (advance >= cmsg_len).then_some(advance)
 }
 
 // ============================================================================
