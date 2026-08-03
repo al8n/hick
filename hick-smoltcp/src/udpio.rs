@@ -12,9 +12,13 @@ pub struct RecvMeta {
   pub local: Option<IpAddr>,
   /// The received IP TTL / IPv6 hop-limit, if the transport surfaces it.
   ///
-  /// `Some(255)` is what RFC 6762 §11 requires of an on-link mDNS packet;
-  /// `None` means the transport could not provide it and the §11 gate must
-  /// fall back to a source-subnet heuristic.
+  /// `Some(255)` is what RFC 6762 §11 requires of an on-link mDNS packet, and is
+  /// decisive on its own. `None` means the transport could not provide it, and
+  /// the §11 gate falls through in order: a datagram addressed to the mDNS
+  /// group is admitted outright (arrival at the group is its own §11 admission
+  /// ground; a peer outside your configured subnets is still on your link if
+  /// its multicast reached you); otherwise, for a non-group destination,
+  /// subnet membership decides; otherwise reject.
   pub hop_limit: Option<u8>,
   /// Number of payload bytes written into the receive buffer.
   pub len: usize,

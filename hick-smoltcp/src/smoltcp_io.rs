@@ -35,9 +35,13 @@ fn recv_from(socket: &mut udp::Socket<'_>, buf: &mut [u8]) -> Option<RecvMeta> {
         local: meta.local_address.map(Into::into),
         // smoltcp's `udp::Socket` UDP metadata (`UdpMetadata`) exposes no received
         // hop-limit — verified against 0.13.1 (only `endpoint` / `local_address` /
-        // `meta`) — so this is `None` and the engine's §11 RECEIVE gate falls back to
-        // the source-subnet heuristic (`onlink::on_link`). The §11 TRANSMIT invariant
-        // (TTL 255 out) is enforced separately in `send_from`, not here.
+        // `meta`) — so this is `None` and the engine's §11 RECEIVE gate
+        // (`onlink::on_link`) falls through in order: the mDNS group is admitted
+        // outright (arrival at the group is its own §11 admission ground; a peer
+        // outside your configured subnets is still on your link if its multicast
+        // reached you); otherwise, for a non-group destination, subnet membership
+        // decides; otherwise reject. The §11 TRANSMIT invariant (TTL 255 out) is
+        // enforced separately in `send_from`, not here.
         hop_limit: None,
         len,
       })
