@@ -8,7 +8,7 @@ use mio::{Interest, Poll, Token};
 
 use super::{
   BIND_LOCK, Family, MAX_DISCARDED_PER_RECV, MAX_RECV_ERRORS_PER_ROUND, Mask, RecvRotor,
-  SendOutcome, SendReport, Sockets, Ungated,
+  SendOutcome, SendReport, Sockets, Ungated, max_udp_payload,
 };
 use crate::options::ServerOptions;
 
@@ -841,7 +841,7 @@ const fn sent_at(wall: SystemTime, mono: std::time::Instant) -> SendOutcome {
 /// and telling real elapsed time from a wall-clock step needs its monotonic
 /// partner. The shape the driver reads out of [`SendReport::per_family`] to
 /// credit its own loopback copies.
-fn stamps(report: &SendReport) -> Vec<crate::selfsend::ClockPair> {
+fn stamps(report: &SendReport) -> Vec<hick_udp::selfsend::ClockPair> {
   report
     .per_family()
     .into_iter()
@@ -866,8 +866,8 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
   assert_eq!(
     stamps(&both),
     vec![
-      crate::selfsend::ClockPair::new(t1, mono),
-      crate::selfsend::ClockPair::new(t2, mono)
+      hick_udp::selfsend::ClockPair::new(t1, mono),
+      hick_udp::selfsend::ClockPair::new(t2, mono)
     ],
     "a dual-stack fan-out produces two loopback copies and must yield two credits"
   );
@@ -879,7 +879,7 @@ fn stamps_yields_exactly_one_credit_per_successful_syscall() {
   };
   assert_eq!(
     stamps(&v4_only),
-    vec![crate::selfsend::ClockPair::new(t1, mono)]
+    vec![hick_udp::selfsend::ClockPair::new(t1, mono)]
   );
 
   // None of these produced a loopback copy: one was never offered the datagram,
@@ -1109,7 +1109,7 @@ const OVERSIZED_FOR_ANY_UDP_DATAGRAM: usize = 70_000;
 /// The classification that decides whether a producer is retired, checked
 /// against a REAL kernel.
 ///
-/// `Family::max_udp_payload` is a hard-coded number. If it were above the
+/// `max_udp_payload` is a hard-coded number. If it were above the
 /// kernel's own ceiling, a datagram the kernel refuses forever would fall back
 /// to `SendOutcome::Failed` and the driver would keep retrying it until the
 /// process ends — the exact defect the distinction exists to close, restored
@@ -1126,7 +1126,7 @@ fn an_oversized_datagram_the_kernel_can_never_carry_is_reported_too_large() {
   assert_eq!(
     outcome,
     SendOutcome::TooLarge,
-    "this body is past `Family::max_udp_payload` and the kernel refused it, so \
+    "this body is past `max_udp_payload` and the kernel refused it, so \
      reporting anything but a permanent refusal leaves it retried forever: \
      {outcome:?}"
   );
@@ -1147,9 +1147,9 @@ fn an_oversized_datagram_the_kernel_can_never_carry_is_reported_too_large() {
   );
   // The hard limit is where the answer changes, and the byte on each side of it
   // is what pins that. `65 507 + 1` is the smallest body IPv4 can never carry.
-  assert_eq!(Family::V4.max_udp_payload(), 65_507);
-  assert_eq!(Family::V6.max_udp_payload(), 65_527);
-  let one_past = vec![0u8; Family::V4.max_udp_payload() + 1];
+  assert_eq!(max_udp_payload(Family::V4), 65_507);
+  assert_eq!(max_udp_payload(Family::V6), 65_527);
+  let one_past = vec![0u8; max_udp_payload(Family::V4) + 1];
   assert_eq!(
     socks.send_one(Family::V4, &one_past, MDNS_V4, &Ungated),
     SendOutcome::TooLarge,
@@ -1165,7 +1165,7 @@ fn an_oversized_datagram_the_kernel_can_never_carry_is_reported_too_large() {
 /// an MTU probe, a route change — and the datagram is far inside the limit while
 /// it happens. Retiring on it destroys a healthy service over a link that was
 /// about to come back, so a refused datagram within
-/// [`Family::max_udp_payload`](crate::socket::Family::max_udp_payload) is
+/// [`max_udp_payload`](crate::socket::max_udp_payload) is
 /// [`SendOutcome::Failed`] whatever the kernel called it.
 #[test]
 fn an_emsgsize_below_the_hard_limit_is_transient_and_retried() {
@@ -1175,7 +1175,7 @@ fn an_emsgsize_below_the_hard_limit_is_transient_and_retried() {
   // An ordinary mDNS-sized body: three orders of magnitude inside the limit, and
   // the size a path-MTU refusal actually happens at.
   let body = vec![0u8; 1200];
-  assert!(body.len() <= Family::V4.max_udp_payload());
+  assert!(body.len() <= max_udp_payload(Family::V4));
   socks.force_send_emsgsize_for_test(Family::V4, true);
   let outcome = socks.send_one(Family::V4, &body, MDNS_V4, &Ungated);
   assert_eq!(

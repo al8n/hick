@@ -42,6 +42,11 @@ thiserror = { workspace = true, features = ["std"] }
 libc.workspace = true
 
 [dev-dependencies]
+# The self-send tracker's clock seams (`take_at`, `seal_at`, `len`) are behind
+# `test-support`, so a test can place a claim or a loop top without sleeping to
+# it. Dev-only on purpose: no shipped build of this crate can hand the tracker a
+# reading taken anywhere but inside its own decision.
+hick-udp = { workspace = true, features = ["test-support"] }
 compio = { version = "0.19", features = ["macros", "time"] }
 getifs.workspace = true
 tracing-core.workspace = true

@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant as StdInstant, SystemTime};
 
 use super::{
-  ClockPair, Credit, MAX_SELF_SEND_ENTRIES, SELF_SEND_TTL, SelfSendTracker, WALL_STEP_TOLERANCE,
-  fnv1a,
+  ClockPair, Credit, MAX_SELF_SEND_ENTRIES, RxEvidence, SELF_SEND_TTL, SelfSendTracker,
+  WALL_STEP_TOLERANCE, fnv1a,
 };
-use crate::socket::Family;
+use crate::Family;
 
 /// A fixed wall instant to build ordering fixtures from. Ordering is all this
 /// clock decides now, so every test that is not *about* ordering can leave it
@@ -60,7 +60,7 @@ fn take_once_consumes_the_credit() {
   let mut t = SelfSendTracker::new();
   let sent = send_stamps();
   recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
-  let rx = Some(sent.wall + Duration::from_millis(1));
+  let rx = RxEvidence::from_caller_parsed_cmsg(sent.wall + Duration::from_millis(1));
   let now = claim(sent, Duration::from_millis(1));
   assert!(t.take_at(Family::V4, b"payload", rx, now));
   // Second identical datagram is a genuine peer packet: no credit left.
@@ -73,13 +73,14 @@ fn ordered_mode_rejects_a_packet_stamped_before_our_send() {
   let sent = send_stamps();
   recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
   // Kernel stamped this BEFORE we sent -> cannot be our loopback.
-  let earlier = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(9));
+  let earlier =
+    RxEvidence::from_caller_parsed_cmsg(SystemTime::UNIX_EPOCH + Duration::from_secs(9));
   assert!(!t.take_at(Family::V4, b"payload", earlier, sent));
   // The credit must survive for the real loopback copy.
   assert!(t.take_at(
     Family::V4,
     b"payload",
-    Some(sent.wall + Duration::from_millis(1)),
+    RxEvidence::from_caller_parsed_cmsg(sent.wall + Duration::from_millis(1)),
     sent
   ));
 }
@@ -102,7 +103,7 @@ fn degraded_matching_weighs_no_reference_at_all() {
   // The wall clock stepped ten seconds backwards between the send and here.
   // Nothing about that changes whether these bytes are the copy we just sent.
   let stepped_back = ClockPair::new(sent.wall - Duration::from_secs(10), sent.mono);
-  assert!(t.take_at(Family::V4, b"payload", None, stepped_back));
+  assert!(t.take_at(Family::V4, b"payload", RxEvidence::none(), stepped_back));
   assert_eq!(t.len(), 0, "and it stays take-once, as in every other mode");
 }
 
@@ -133,14 +134,25 @@ fn ordered_mode_tolerates_only_the_timestamp_grain() {
   // target without a `cfg`, and it stays an order of magnitude inside the
   // one-microsecond grain, leaving this assertion and the one below it
   // bracketing the boundary tightly.
-  let just_outside_grain = sent.wall - super::RX_GRAIN_FOR_TEST - Duration::from_nanos(100);
-  assert!(!t.take_at(Family::V4, b"payload", Some(just_outside_grain), sent));
+  let just_outside_grain = sent.wall - crate::RX_TIMESTAMP_GRAIN - Duration::from_nanos(100);
+  assert!(!t.take_at(
+    Family::V4,
+    b"payload",
+    RxEvidence::from_caller_parsed_cmsg(just_outside_grain),
+    sent
+  ));
   // Exactly one grain early is inside the truncation tolerance.
-  let within = sent.wall - super::RX_GRAIN_FOR_TEST;
-  assert!(t.take_at(Family::V4, b"payload", Some(within), sent));
+  let within = sent.wall - crate::RX_TIMESTAMP_GRAIN;
+  assert!(t.take_at(
+    Family::V4,
+    b"payload",
+    RxEvidence::from_caller_parsed_cmsg(within),
+    sent
+  ));
   // A full second early is a peer packet the kernel saw before our sendto.
   recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
-  let way_early = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(9));
+  let way_early =
+    RxEvidence::from_caller_parsed_cmsg(SystemTime::UNIX_EPOCH + Duration::from_secs(9));
   assert!(!t.take_at(Family::V4, b"payload", way_early, sent));
 }
 
@@ -152,9 +164,14 @@ fn a_credit_older_than_the_ttl_is_a_peer_not_our_echo() {
   // Byte-identical and correctly ordered, but the credit has been waiting
   // longer than SELF_SEND_TTL -> a co-resident peer, not our echo.
   let late = claim(sent, SELF_SEND_TTL + Duration::from_millis(1));
-  assert!(!t.take_at(Family::V4, b"payload", None, late));
+  assert!(!t.take_at(Family::V4, b"payload", RxEvidence::none(), late));
   // Exactly at the TTL it still matches.
-  assert!(t.take_at(Family::V4, b"payload", None, claim(sent, SELF_SEND_TTL)));
+  assert!(t.take_at(
+    Family::V4,
+    b"payload",
+    RxEvidence::none(),
+    claim(sent, SELF_SEND_TTL)
+  ));
 }
 
 #[test]
@@ -171,14 +188,14 @@ fn the_ttl_upper_bound_applies_to_ordered_mode_too() {
   assert!(!t.take_at(
     Family::V4,
     b"payload",
-    Some(sent.wall + Duration::from_secs(3)),
+    RxEvidence::from_caller_parsed_cmsg(sent.wall + Duration::from_secs(3)),
     expired
   ));
   // Inside the window it still matches.
   assert!(t.take_at(
     Family::V4,
     b"payload",
-    Some(sent.wall + Duration::from_secs(2)),
+    RxEvidence::from_caller_parsed_cmsg(sent.wall + Duration::from_secs(2)),
     claim(sent, SELF_SEND_TTL)
   ));
 }
@@ -207,7 +224,7 @@ fn a_backwards_wall_step_after_the_send_must_not_reject_our_own_echo() {
   const STEP: Duration = Duration::from_secs(5);
   // The kernel stamps the loopback copy 200us of REAL time after the send, on a
   // wall clock that has since moved five seconds backwards.
-  let rx = Some(sent.wall - STEP + Duration::from_micros(200));
+  let rx = RxEvidence::from_caller_parsed_cmsg(sent.wall - STEP + Duration::from_micros(200));
   // The claim reads both clocks 300us of real time after the send.
   let now = ClockPair::new(
     sent.wall - STEP + Duration::from_micros(300),
@@ -235,7 +252,7 @@ fn a_forward_wall_step_after_the_send_also_gives_up_the_ordering_evidence() {
   let sent = send_stamps();
   recorded_and_sealed(&mut t, Family::V4, b"announcement", sent);
   // A datagram the kernel stamped a full second before our send.
-  let rx = Some(sent.wall - Duration::from_secs(1));
+  let rx = RxEvidence::from_caller_parsed_cmsg(sent.wall - Duration::from_secs(1));
   // The wall clock jumped five seconds forward while one millisecond of real
   // time passed.
   let now = ClockPair::new(
@@ -270,7 +287,7 @@ fn a_disagreement_inside_the_tolerance_keeps_the_ordering_evidence() {
     !t.take_at(
       Family::V4,
       b"announcement",
-      Some(sent.wall - Duration::from_secs(1)),
+      RxEvidence::from_caller_parsed_cmsg(sent.wall - Duration::from_secs(1)),
       now
     ),
     "the evidence is still good, so a datagram the kernel saw before our send \
@@ -280,7 +297,7 @@ fn a_disagreement_inside_the_tolerance_keeps_the_ordering_evidence() {
     t.take_at(
       Family::V4,
       b"announcement",
-      Some(sent.wall + Duration::from_micros(200)),
+      RxEvidence::from_caller_parsed_cmsg(sent.wall + Duration::from_micros(200)),
       now
     ),
     "and our own echo still claims it"
@@ -311,7 +328,7 @@ fn a_step_before_the_send_leaves_the_credits_own_window_clean() {
     !t.take_at(
       Family::V4,
       b"announcement",
-      Some(sent.wall - Duration::from_secs(1)),
+      RxEvidence::from_caller_parsed_cmsg(sent.wall - Duration::from_secs(1)),
       now
     ),
     "nothing stepped inside this credit's window, so the ordering rule is intact \
@@ -321,7 +338,7 @@ fn a_step_before_the_send_leaves_the_credits_own_window_clean() {
     t.take_at(
       Family::V4,
       b"announcement",
-      Some(sent.wall + Duration::from_micros(200)),
+      RxEvidence::from_caller_parsed_cmsg(sent.wall + Duration::from_micros(200)),
       now
     ),
     "and our own echo, stamped on the same post-step timeline, still claims it"
@@ -362,7 +379,7 @@ fn an_unsealed_credit_cannot_expire_however_long_the_recording_tick_ran() {
   // stage today, so nothing unsealed is visible to a `take`. It must be live
   // anyway — a credit with no claim opportunity yet has nothing to have
   // outlived.
-  assert!(t.take_at(Family::V4, b"announcement", None, much_later));
+  assert!(t.take_at(Family::V4, b"announcement", RxEvidence::none(), much_later));
 }
 
 #[test]
@@ -378,7 +395,7 @@ fn the_seal_starts_an_unsealed_credit_at_age_zero() {
     t.take_at(
       Family::V4,
       b"announcement",
-      None,
+      RxEvidence::none(),
       claim(sent, opened + SELF_SEND_TTL)
     ),
     "a sealed credit gets the whole TTL measured from the seal, not a remainder \
@@ -407,7 +424,7 @@ fn a_stall_inside_the_seal_cannot_expire_the_batch_that_seal_opens() {
   t.pause_next_seal_for_test(STALL_PAST_TTL);
   t.seal();
   assert!(
-    t.take(Family::V4, b"announcement", None),
+    t.take(Family::V4, b"announcement", RxEvidence::none()),
     "the whole of the seal's pre-claim work happens before the anchor is read, \
      so a credit recorded by the previous tick is claimable however long that \
      work took — anchoring it at the reading the sweep already spent hands a \
@@ -427,7 +444,7 @@ fn recording_sweeps_nothing() {
   t.record(Family::V4, b"later", sent);
   assert_eq!(t.len(), 2, "a record must never evict anything");
   assert!(
-    t.take_at(Family::V4, b"earlier", None, sent),
+    t.take_at(Family::V4, b"earlier", RxEvidence::none(), sent),
     "the earlier credit is untouched by the later record"
   );
 }
@@ -445,8 +462,8 @@ fn sealing_sweeps_entries_older_than_the_ttl() {
   t.seal_at(much_later.mono);
   // The stale entry was swept by the seal, not merely outvoted.
   assert_eq!(t.len(), 1);
-  assert!(!t.take_at(Family::V4, b"stale", None, much_later));
-  assert!(t.take_at(Family::V4, b"fresh", None, much_later));
+  assert!(!t.take_at(Family::V4, b"stale", RxEvidence::none(), much_later));
+  assert!(t.take_at(Family::V4, b"fresh", RxEvidence::none(), much_later));
 }
 
 /// The upper end of the invariant, and the reason the seal uses
@@ -472,7 +489,7 @@ fn a_caller_gap_after_the_seal_still_expires_the_credit() {
   // window opened at the send's own instant and has now run out.
   let after_the_gap = claim(sent, SELF_SEND_TTL + Duration::from_millis(1));
   assert!(
-    !t.take_at(Family::V4, b"payload", None, after_the_gap),
+    !t.take_at(Family::V4, b"payload", RxEvidence::none(), after_the_gap),
     "elapsed time after the first claim opportunity is charged in full, or the \
      false-suppression bound is not a bound at all"
   );
@@ -490,7 +507,7 @@ fn non_matching_body_is_never_taken() {
   let mut t = SelfSendTracker::new();
   let sent = send_stamps();
   recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
-  assert!(!t.take_at(Family::V4, b"other", None, sent));
+  assert!(!t.take_at(Family::V4, b"other", RxEvidence::none(), sent));
 }
 
 /// The dual-stack echo race, deterministically.
@@ -517,17 +534,65 @@ fn an_ipv6_echo_read_first_cannot_steal_the_ipv4_credit() {
 
   // The rotor reads IPv6 first. Its kernel stamp is at-or-after the IPv6 send
   // but AFTER the IPv4 send too, so both credits look eligible on content.
-  let v6_rx = Some(v6_sent.wall + Duration::from_micros(50));
+  let v6_rx = RxEvidence::from_caller_parsed_cmsg(v6_sent.wall + Duration::from_micros(50));
   assert!(t.take_at(Family::V6, b"announcement", v6_rx, top));
 
   // The IPv4 echo now arrives, stamped between the two sends — before the IPv6
   // credit. It matches only because its own credit is still there.
-  let v4_rx = Some(v4_sent.wall + Duration::from_micros(50));
+  let v4_rx = RxEvidence::from_caller_parsed_cmsg(v4_sent.wall + Duration::from_micros(50));
   assert!(
     t.take_at(Family::V4, b"announcement", v4_rx, top),
     "the IPv4 echo must find its own credit, not one already spent by IPv6"
   );
   assert_eq!(t.len(), 0, "both credits are spent exactly once");
+}
+
+/// The same race, with every margin expressed against
+/// [`crate::RX_TIMESTAMP_GRAIN`] so the test means the same thing on a
+/// **zero-grain** target as on a microsecond one.
+///
+/// The grain is the only slack `Ordered` has, and on Linux it is exactly zero.
+/// So the interesting question is not whether the stolen-credit case is refused
+/// by *some* margin, but whether the margin survives a platform that grants
+/// none: with the credits interchangeable, the IPv4 echo would be weighed
+/// against the IPv6 send, which is a whole inter-syscall gap later than the
+/// kernel stamp it carries — outside the grain on every target, and outside
+/// **any** grain on the target where the grain is zero. That is a phantom
+/// self-conflict and the spurious RFC 6762 §9 rename that follows, with no clock
+/// step involved at all.
+#[test]
+fn the_dual_stack_stamp_race_is_closed_at_every_timestamp_grain() {
+  // One inter-syscall gap, and it must be wider than the slack `Ordered` gives,
+  // or the grain would absorb the race rather than the family key closing it.
+  let gap = crate::RX_TIMESTAMP_GRAIN + Duration::from_micros(1);
+  assert!(gap > crate::RX_TIMESTAMP_GRAIN);
+
+  let mut t = SelfSendTracker::new();
+  let v4_sent = send_stamps();
+  let v6_sent = claim(v4_sent, gap);
+  t.record(Family::V4, b"probe", v4_sent);
+  t.record(Family::V6, b"probe", v6_sent);
+  let top = claim(v6_sent, Duration::from_millis(1));
+  t.seal_at(top.mono);
+
+  // The kernel stamps each echo at its own send: `join` polls IPv4 first, so the
+  // IPv4 echo's stamp structurally predates the IPv6 credit.
+  let v4_rx = RxEvidence::from_caller_parsed_cmsg(v4_sent.wall);
+  let v6_rx = RxEvidence::from_caller_parsed_cmsg(v6_sent.wall);
+  assert!(
+    v6_sent.wall.duration_since(v4_sent.wall).expect("ordered") > crate::RX_TIMESTAMP_GRAIN,
+    "the IPv4 echo must sit further before the IPv6 credit than the grain can \
+     forgive, or this test would pass without the family key"
+  );
+
+  // Drained in the opposite order to the sends.
+  assert!(t.take_at(Family::V6, b"probe", v6_rx, top));
+  assert!(
+    t.take_at(Family::V4, b"probe", v4_rx, top),
+    "each echo claims the credit recorded on its own family; unkeyed, the IPv6 \
+     echo takes the IPv4 credit and this claim is refused as a peer's"
+  );
+  assert_eq!(t.len(), 0);
 }
 
 /// The family key is a filter, not a tiebreak: a credit recorded for one family
@@ -538,7 +603,7 @@ fn a_credit_is_not_visible_to_the_other_family() {
   let mut t = SelfSendTracker::new();
   let sent = send_stamps();
   recorded_and_sealed(&mut t, Family::V4, b"payload", sent);
-  let rx = Some(sent.wall + Duration::from_millis(1));
+  let rx = RxEvidence::from_caller_parsed_cmsg(sent.wall + Duration::from_millis(1));
   assert!(!t.take_at(Family::V6, b"payload", rx, sent));
   assert!(t.take_at(Family::V4, b"payload", rx, sent));
 }
@@ -566,7 +631,7 @@ fn a_backwards_wall_clock_step_cannot_evict_or_expire_a_credit() {
   assert!(t.take_at(
     Family::V4,
     b"already-recorded",
-    None,
+    RxEvidence::none(),
     ClockPair::new(first.wall, second.mono)
   ));
 }
@@ -578,8 +643,8 @@ fn a_credit_matches_only_the_body_it_fingerprints() {
   let mut t = SelfSendTracker::new();
   let sent = send_stamps();
   recorded_and_sealed(&mut t, Family::V6, b"announcement", sent);
-  assert!(!t.take_at(Family::V6, b"other", None, sent));
-  assert!(t.take_at(Family::V6, b"announcement", None, sent));
+  assert!(!t.take_at(Family::V6, b"other", RxEvidence::none(), sent));
+  assert!(t.take_at(Family::V6, b"announcement", RxEvidence::none(), sent));
 }
 
 /// A stall longer than [`SELF_SEND_TTL`], slept for real.
@@ -643,7 +708,7 @@ fn the_cap_reclaims_dead_credits_rather_than_refusing_a_new_one() {
     t.take_at(
       Family::V4,
       b"later-in-the-same-tick",
-      None,
+      RxEvidence::none(),
       ClockPair::new(later.wall, top)
     ),
     "a tracker full of dead credits must not crowd out a live send's echo \
@@ -672,9 +737,9 @@ fn the_cap_never_reclaims_an_unsealed_credit() {
      reclaim it, so the cap is still full and the NEW entry is what goes"
   );
   let now = ClockPair::now();
-  assert!(!t.take_at(Family::V4, b"one-too-many", None, now));
+  assert!(!t.take_at(Family::V4, b"one-too-many", RxEvidence::none(), now));
   assert!(
-    t.take_at(Family::V4, &0u64.to_be_bytes(), None, now),
+    t.take_at(Family::V4, &0u64.to_be_bytes(), RxEvidence::none(), now),
     "and the first-seeded credit is still there: the cap never evicts to make \
      room"
   );
@@ -694,9 +759,9 @@ fn the_entry_cap_drops_the_new_entry_not_the_oldest() {
     MAX_SELF_SEND_ENTRIES,
     "the cap drops the NEW entry"
   );
-  assert!(!t.take_at(Family::V4, b"one-too-many", None, sent));
+  assert!(!t.take_at(Family::V4, b"one-too-many", RxEvidence::none(), sent));
   // The first-seeded entry is still present — the oldest is NOT evicted.
-  assert!(t.take_at(Family::V4, &0u64.to_be_bytes(), None, sent));
+  assert!(t.take_at(Family::V4, &0u64.to_be_bytes(), RxEvidence::none(), sent));
 }
 
 // ── the cap's admission decision ────────────────────────────────────────────
@@ -742,7 +807,7 @@ fn the_cap_admits_against_the_clock_at_the_decision_not_the_sweeps() {
   std::thread::sleep(SELF_SEND_TTL + Duration::from_millis(50));
   t.record_with_stale_sweep(Family::V4, b"fresh", send_stamps(), base);
   assert!(
-    t.take_at(Family::V4, b"fresh", None, ClockPair::now()),
+    t.take_at(Family::V4, b"fresh", RxEvidence::none(), ClockPair::now()),
     "every resident credit was already dead when the cap was decided, so the \
      new send must have been given one — refusing it makes this endpoint ingest \
      its own loopback as a peer's datagram"
@@ -763,7 +828,7 @@ fn the_cap_still_refuses_when_every_resident_credit_is_live() {
     "a live credit must never be displaced to make room"
   );
   assert!(
-    !t.take_at(Family::V4, b"fresh", None, ClockPair::now()),
+    !t.take_at(Family::V4, b"fresh", RxEvidence::none(), ClockPair::now()),
     "the NEW entry is the one dropped at the cap, never a live one"
   );
 }

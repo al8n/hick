@@ -12,6 +12,7 @@ use core::{
   net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
 use hick_trace::*;
+use hick_udp::selfsend::{ClockPair, SelfSendTracker};
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
   FamilyAttempt, QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate,
@@ -207,9 +208,28 @@ pub(crate) struct State {
   pub(crate) endpoint: ProtoEndpoint,
   pub(crate) services: HashMap<ServiceHandle, ServiceCtx>,
   pub(crate) queries: HashMap<QueryHandle, QueryCtx>,
-  /// Self-send tracker — `(content_hash, body_len, send_wall_time)` for every
-  /// datagram we recently transmitted, used by the loopback-self detection.
-  pub(crate) recent_sends: crate::selfsend::SelfSends,
+  /// One take-once credit per multicast datagram this endpoint recently
+  /// transmitted, so the kernel's loopback copy is recognized as our own instead
+  /// of being ingested as a peer's. Credits are recorded by
+  /// [`note_multicast_attempt`], have their claim window opened by the
+  /// [`SelfSendTracker::seal`] at the top of [`run`]'s loop, and are consumed by
+  /// [`Self::handle_datagram`].
+  /// The seal generation observed at the last park entry, so the receive path can
+  /// prove the seal it relies on happened BEFORE the park rather than inside it.
+  /// See [`SelfSendTracker::seal_generation`] and the check in [`run`].
+  ///
+  /// Unconditional here, unlike the readiness driver's, and the difference is a
+  /// property of this loop rather than a choice: [`run`] has no `continue`, its
+  /// only receives are the four `select!` arms, and [`Self::note_park_entry`]
+  /// precedes all of them with nothing in between — so **every** datagram this
+  /// driver handles came back out of a park and the ordering question is always
+  /// meaningful. A loop that could reach a receive without parking would have to
+  /// scope the comparison to the receives that did.
+  ///
+  /// Debug builds only: it feeds assertions and no decision.
+  #[cfg(debug_assertions)]
+  pub(crate) sealed_generation_at_park: u64,
+  pub(crate) selfsend: SelfSendTracker,
   /// Reusable scratch for the handles of endpoint-owned withdrawals that
   /// completed in a loop iteration, so [`ProtoEndpoint::drain_completed_withdrawals`]
   /// can push into it and the loop can GC each one's driver ctx. Kept on the
@@ -275,7 +295,9 @@ impl State {
       endpoint,
       services: HashMap::new(),
       queries: HashMap::new(),
-      recent_sends: Vec::new(),
+      #[cfg(debug_assertions)]
+      sealed_generation_at_park: 0,
+      selfsend: SelfSendTracker::new(),
       completed_withdrawals: Vec::new(),
       svc_handle_scratch: Vec::new(),
       query_handle_scratch: Vec::new(),
@@ -1170,12 +1192,58 @@ impl State {
     best
   }
 
-  /// Apply §11 + self-send + `proto.handle` for one received datagram.
+  /// Apply §11 + self-send + `proto.handle` for one datagram received on
+  /// `family`.
   ///
-  /// The §11 on-link gate lives in [`crate::onlink`] and the FNV-1a self-send
-  /// tracker (take-once classification with [`crate::selfsend::MatchMode`])
-  /// lives in [`crate::selfsend`].
-  pub(crate) fn handle_datagram(&mut self, meta: &crate::socket::RecvMeta, data: &[u8]) {
+  /// The §11 on-link gate lives in [`crate::onlink`]; the take-once self-send
+  /// classification lives in [`hick_udp::selfsend`]. `family` is the socket this
+  /// datagram was read off, threaded down from the `select!` arm that read it
+  /// rather than derived from the peer address: it is half the credit key, and
+  /// only the receive site knows it for certain.
+  /// The park entry: check that the seal this iteration relies on has already
+  /// happened, and record WHICH seal it was so [`Self::handle_datagram`] can
+  /// prove it predated the park.
+  ///
+  /// Debug builds only — it makes no decision and compiles out of release. See
+  /// the call site in [`run`] for why the check belongs there and not beside
+  /// `seal`.
+  #[cfg(debug_assertions)]
+  pub(crate) fn note_park_entry(&mut self) {
+    debug_assert!(
+      !self.selfsend.has_unsealed(),
+      "a credit recorded this iteration is still unsealed at the park entry: \
+       `seal` must run after every pump and before this park"
+    );
+    self.sealed_generation_at_park = self.selfsend.seal_generation();
+  }
+
+  pub(crate) fn handle_datagram(
+    &mut self,
+    family: Family,
+    meta: &crate::socket::RecvMeta,
+    data: &[u8],
+  ) {
+    // Defence in depth, and deliberately NOT the proof of placement: by the time
+    // this runs the park is over, so "nothing is unsealed" is equally true of a
+    // driver that sealed before parking and one that sealed in its receive arm
+    // after an arbitrarily long park. The placement itself is pinned at the
+    // park entry in `run`; what this adds is that no path reaches a claim
+    // with an unsealed credit, whatever route it took here.
+    debug_assert!(
+      !self.selfsend.has_unsealed(),
+      "a credit reached the receive path unsealed: `seal` must sit between this \
+       iteration's sends and this receive"
+    );
+    // The ordering half. The boundary recorded which seal it was relying on; if a
+    // window has opened since, the seal happened inside or after the park and
+    // every credit it anchored is a whole park too late.
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+      self.selfsend.seal_generation(),
+      self.sealed_generation_at_park,
+      "a claim window opened between the park entry and this receive: `seal` \
+       must PRECEDE the park, not run inside the receive arm"
+    );
     // §11 on-link gate.  When the kernel delivered a TTL / hop-limit we trust
     // it (must be 255); otherwise we fall back to a source-address heuristic
     // anchored by the cached local-subnet snapshot.
@@ -1232,24 +1300,37 @@ impl State {
       return;
     }
 
-    // Self-send classification (FNV-1a content-hash, take-once).
-    let caller_is_self = match meta.kernel_rx_time() {
-      Some(rx) => crate::selfsend::take_self_send(
-        &mut self.recent_sends,
-        data,
-        rx,
-        crate::selfsend::MatchMode::Ordered,
-      ),
-      None => crate::selfsend::take_self_send(
-        &mut self.recent_sends,
-        data,
-        SystemTime::now(),
-        crate::selfsend::MatchMode::Degraded,
-      ),
-    };
+    // Self-send classification: content fingerprint plus the family this
+    // datagram arrived on, take-once.
+    //
+    // The family is half the key. A multicast transmit fans out to both sockets
+    // with IDENTICAL bytes and two separately-stamped credits, and the `select!`
+    // below does not fix which socket is read first — so without it the second
+    // echo read can consume the first echo's credit and leave its own owner
+    // facing a credit stamped after the kernel saw it.
+    //
+    // How much ordering evidence the claim has is DERIVED inside `take`, never
+    // declared here. A kernel receive timestamp orders the echo against the send,
+    // which is what stops a byte-identical peer datagram the kernel saw BEFORE
+    // our `sendto` from stealing the credit; its absence is handed over as an
+    // absence rather than papered over with a userspace `SystemTime::now()`,
+    // which says nothing about when the kernel saw the datagram. `take` then
+    // weakens the mode per credit when that credit's own wall stamp did not
+    // survive a clock step between the send and here — the stamp is no longer on
+    // the timeline the receive stamp was taken on, and refusing the credit on it
+    // would make this endpoint ingest its own announcement as peer traffic.
+    //
+    // The credit's AGE is a separate question, read inside `take` at the decision
+    // and on the monotonic clock only. See `SelfSendTracker::take`.
+    //
+    // A response from any other source port never reaches this line — the §11
+    // gate above drops it — while a §6.7 legacy unicast QUERY from an ephemeral
+    // port is deliberately kept, since it is owed a reply. Both sockets bind
+    // 5353, so every loopback copy of ours arrives from 5353.
+    let caller_is_self = self.selfsend.take(family, data, meta.rx_evidence());
 
-    // Use a process-monotonic `now` for proto scheduling; the SystemTime
-    // reference above is what classified the self-send credit.
+    // Use a process-monotonic `now` for proto scheduling; the kernel receive
+    // stamp above is ordering evidence for the self-send credit and nothing else.
     //
     // Read per datagram, here, and it must stay here: `endpoint.handle` anchors
     // this datagram's every effect to it, and one of them is a bound the CALLER
@@ -1649,6 +1730,19 @@ pub(crate) async fn run(
     let withdrawals_budget_stopped =
       drain_withdrawals(&inner, &sock_v4, &sock_v6, &mut scratch, &mut budget).await;
 
+    // Open the claim window on everything the pumps above recorded: the last
+    // record stage of this iteration is behind us, and the recv arms are not yet
+    // armed. `SELF_SEND_TTL` runs from here, which is the first instant an echo
+    // of those sends could be seen. Sealing later — in a receive arm, after the
+    // park — would anchor every credit a whole park late and let a stale one
+    // suppress a peer datagram arbitrarily long after the send; sealing earlier,
+    // at the loop top, would leave these credits unsealed across the park, and an
+    // unsealed credit is live UNCONDITIONALLY. The park entry below checks it.
+    //
+    // It takes no instant: the anchor is read inside the call, after the expiry
+    // sweep it performs first.
+    inner.state.borrow_mut().selfsend.seal();
+
     // 1b'. fire one-shot wakes for queries that just transitioned to `errored`
     //      (un-encodable question, see `QueryCtx::errored`). Such a query has no
     //      standing deadline, so this is the only wake that gets a parked
@@ -1718,7 +1812,7 @@ pub(crate) async fn run(
       break;
     }
 
-    // 2. compute the next deadline, and decide whether to re-settle IMMEDIATELY
+    // 3. compute the next deadline, and decide whether to re-settle IMMEDIATELY
     //    (zero-duration timer) instead of parking. `force_now` is the
     //    driver-liveness guard, and both its sources are lost-wake-proof because
     //    they go through the TIMER, not `LocalNotify`:
@@ -1743,7 +1837,7 @@ pub(crate) async fn run(
     let force_now =
       inner.dirty.replace(false) || pump_budget_exhausted || withdrawals_budget_stopped;
 
-    // 3. arm the timer future. `Either<sleep, pending>` keeps both arms with
+    // 4. arm the timer future. `Either<sleep, pending>` keeps both arms with
     //    the same `Output = ()` so a single `pin_mut!` is enough for
     //    `select!` to accept either branch via the fused wrapper.
     let timer_fut = match (force_now, deadline) {
@@ -1756,12 +1850,65 @@ pub(crate) async fn run(
     .fuse();
     futures::pin_mut!(timer_fut);
 
-    // 4. arm the notify future. `LocalNotify::listen` is awaitable directly;
+    // 5. arm the notify future. `LocalNotify::listen` is awaitable directly;
     //    fuse it so `select!` accepts it.
     let notify_fut = inner.notify.listen().fuse();
     futures::pin_mut!(notify_fut);
 
-    // 5. arm one recv future per bound family. The recv future borrows from
+    // 6. open the self-send claim window on everything the pumps above recorded,
+    //    and nowhere else in this driver.
+    //
+    //    **Recording and window-opening must straddle the receive**, so this sits
+    //    between the last statement that can record a credit (the withdrawal pump
+    //    at 1a, and the transmit pump before it) and the only thing that can claim
+    //    one — the recv arms of the `select!` immediately below. Nothing between
+    //    here and the park records.
+    //
+    //    A loop-top seal instead of this one sits on the same side of the receive
+    //    as the records it is meant to open: this iteration's credits would still
+    //    be unsealed when the park below returns a datagram, and an unsealed
+    //    credit is live UNCONDITIONALLY. With no timer deadline the park is
+    //    unbounded, so a byte-identical peer datagram arriving arbitrarily long
+    //    after the send would still be swallowed as our own echo, and
+    //    `SELF_SEND_TTL` would bound nothing on exactly the path it exists to
+    //    bound.
+    //
+    //    Not at record time either: the recording iteration's own outbound time is
+    //    structurally claim-free — the recv arms have not been armed yet — so
+    //    charging it re-expires credits that never had a claim opportunity (a send
+    //    that stalls in the kernel, a second fan-out later in the same iteration,
+    //    a §10.1 goodbye a whole TTL after the announcement whose credit is still
+    //    unclaimed). What this placement costs is over-retention bounded by one
+    //    park, and over-retention is the CHEAP direction: a stale credit can at
+    //    worst suppress one byte-identical peer datagram, and take-once bounds it
+    //    to one. Under-retention is the expensive one — our own announcement
+    //    ingested as peer traffic, a phantom RFC 6762 §9 conflict against
+    //    ourselves and the rename that follows.
+    //
+    //    `seal` takes no instant and is deliberately given none: it reads the
+    //    monotonic clock itself, after the expiry sweep it performs first, so the
+    //    anchor cannot be a reading that sweep already spent. The borrow is scoped
+    //    to this statement so it cannot collide with any borrow below.
+    // THE PARK ENTRY, and the one place the seal's placement is actually checked.
+    //
+    // Deliberately NOT adjacent to the `seal` above: a check written straight
+    // after `seal` is vacuous, since sealing is exactly what makes nothing
+    // unsealed. Asked HERE it is a real question — "did the seal this iteration
+    // relies on already happen, with every pump behind it?" — and the ways to get
+    // the placement wrong all answer it "no": a seal at the loop top has the
+    // pumps recording after it, and a seal that only runs in a receive arm (or
+    // not at all) leaves this iteration's credits unsealed right here.
+    //
+    // The generation captured alongside is what `handle_datagram` compares
+    // against, which pins the remaining case — a seal that ran BOTH here and
+    // again inside the receive arm leaves nothing unsealed, so only a changed
+    // generation shows that the credits were re-anchored a whole park late.
+    //
+    // It compiles out of release builds and influences no decision.
+    #[cfg(debug_assertions)]
+    inner.state.borrow_mut().note_park_entry();
+
+    // 7. arm one recv future per bound family. The recv future borrows from
     //    its socket and owns its data + control buffers across the
     //    completion; if `select!` picks another arm the recv future is
     //    dropped, taking the in-flight buffers with it.
@@ -1777,8 +1924,8 @@ pub(crate) async fn run(
         let r6 = s6.recv(max_recv).fuse();
         futures::pin_mut!(r4, r6);
         futures::select! {
-          r = r4 => { handle_recv(&inner, r); woke_state = true; }
-          r = r6 => { handle_recv(&inner, r); woke_state = true; }
+          r = r4 => { handle_recv(&inner, Family::V4, r); woke_state = true; }
+          r = r6 => { handle_recv(&inner, Family::V6, r); woke_state = true; }
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
           _ = notify_fut => {}
         }
@@ -1787,7 +1934,7 @@ pub(crate) async fn run(
         let r4 = s4.recv(max_recv).fuse();
         futures::pin_mut!(r4);
         futures::select! {
-          r = r4 => { handle_recv(&inner, r); woke_state = true; }
+          r = r4 => { handle_recv(&inner, Family::V4, r); woke_state = true; }
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
           _ = notify_fut => {}
         }
@@ -1796,7 +1943,7 @@ pub(crate) async fn run(
         let r6 = s6.recv(max_recv).fuse();
         futures::pin_mut!(r6);
         futures::select! {
-          r = r6 => { handle_recv(&inner, r); woke_state = true; }
+          r = r6 => { handle_recv(&inner, Family::V6, r); woke_state = true; }
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
           _ = notify_fut => {}
         }
@@ -1816,32 +1963,26 @@ pub(crate) async fn run(
   }
 }
 
-/// One address family's result for one logical transmit.
-/// Which address family a socket serves, and therefore which hard UDP payload
-/// ceiling applies to a datagram offered to it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Family {
-  V4,
-  V6,
-}
+/// Which address family a socket serves, a datagram arrived on, or one leg of a
+/// fan-out was addressed to.
+///
+/// `hick-udp`'s type rather than one of this crate's own, because the self-send
+/// tracker this driver keys credits on lives there too — one definition, so a
+/// credit recorded on this crate's IPv4 and one claimed on the tracker's cannot
+/// drift apart.
+pub(crate) use hick_udp::Family;
 
-impl Family {
-  /// The family a destination selects.
-  const fn of(dst: SocketAddr) -> Self {
-    match dst {
-      SocketAddr::V4(_) => Self::V4,
-      SocketAddr::V6(_) => Self::V6,
-    }
-  }
-
-  /// The largest UDP payload this family can EVER carry — the only sound proof
-  /// that a refused datagram can never be sent. See
-  /// [`mdns_proto::constants::MAX_UDP_PAYLOAD_V6`].
-  const fn max_udp_payload(self) -> usize {
-    match self {
-      Self::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
-      Self::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
-    }
+/// The largest UDP payload `family` can EVER carry — the only sound proof that a
+/// refused datagram can never be sent. See
+/// [`mdns_proto::constants::MAX_UDP_PAYLOAD_V6`].
+///
+/// A free function rather than a method: [`Family`] is `hick-udp`'s type, and
+/// this ceiling is `mdns-proto`'s constant, which that crate deliberately does
+/// not depend on.
+const fn max_udp_payload(family: Family) -> usize {
+  match family {
+    Family::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
+    Family::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
   }
 }
 
@@ -1872,7 +2013,7 @@ fn attempt_of(family: Family, body: &[u8], attempt: &SendAttempt) -> FamilyAttem
       None => FamilyAttempt::Refused { permanent: false },
     },
     SendAttempt::Answered { result: Err(_), .. } => FamilyAttempt::Refused {
-      permanent: body.len() > family.max_udp_payload(),
+      permanent: body.len() > max_udp_payload(family),
     },
   }
 }
@@ -2076,20 +2217,33 @@ enum SendAttempt {
   Answered {
     /// What `send_to` reported.
     result: std::io::Result<usize>,
-    /// Wall clock, read BEFORE submission. Keys self-send suppression.
+    /// Wall clock, read BEFORE submission. ORDERS this send against its own
+    /// loopback echo, and is never an age.
     ///
-    /// Suppression matches our own loopback echo against this stamp, so
+    /// Suppression weighs our echo's kernel receive stamp against this one, so
     /// `submitted_wall <= kernel_send_time <= echo_rx_time` must hold or the echo
-    /// falls outside the 1 ms `Ordered` match window and this host processes its
-    /// own probe / announcement as peer traffic. Reading it after the completion
-    /// can push it past the kernel's rx stamp; reading it before cannot.
+    /// reads as a peer datagram the kernel saw before our `sendto` — the credit
+    /// is refused, this host processes its own probe / announcement as peer
+    /// traffic, and it raises a phantom RFC 6762 §9 conflict against itself.
+    /// Reading it after the completion can push it past the kernel's rx stamp;
+    /// reading it before cannot.
     submitted_wall: SystemTime,
-    /// Monotonic, read BEFORE submission. Anchors the CORE's refresh schedule.
+    /// Monotonic, read BEFORE submission on the statement immediately after
+    /// `submitted_wall`. Anchors the CORE's refresh schedule, and is
+    /// `submitted_wall`'s partner in the [`ClockPair`] the self-send credit
+    /// carries.
     ///
-    /// EARLY is the safe direction here: an anchor at or before the true
-    /// acceptance can only understate how fresh a family's peers are, so the
-    /// next refresh lands sooner than strictly needed. A late anchor would push
-    /// a refresh past the records' own TTL.
+    /// EARLY is the safe direction for the refresh schedule: an anchor at or
+    /// before the true acceptance can only understate how fresh a family's peers
+    /// are, so the next refresh lands sooner than strictly needed. A late anchor
+    /// would push a refresh past the records' own TTL.
+    ///
+    /// The ADJACENCY to `submitted_wall` is what the credit needs, and it is a
+    /// contract rather than a coincidence: the nanoseconds between the two reads
+    /// cancel against the pair the claim takes, so only a genuine wall-clock step
+    /// can put the two elapsed times further apart than
+    /// `hick_udp::selfsend::WALL_STEP_TOLERANCE`. It is not the credit's age
+    /// either — that runs from the seal at the top of the next loop iteration.
     submitted_at: StdInstant,
     /// Monotonic, read AFTER the completion. Anchors [`FamilyWireGate`].
     ///
@@ -2183,6 +2337,12 @@ async fn attempt_send_to<S: SendDatagram>(
   // could outrun the kernel's rx stamp and cost us loopback suppression, the
   // monotonic one because a late one could schedule a refresh past its records'
   // TTL.
+  //
+  // And they stay ADJACENT, wall first, with nothing between them: the self-send
+  // credit pairs them into a `ClockPair`, whose whole job is telling real elapsed
+  // time from a wall clock that moved on its own. Anything inserted here is
+  // charged to that difference, and enough of it reads as a clock step that never
+  // happened — which discards this credit's ordering evidence.
   let submitted_wall = SystemTime::now();
   let submitted_at = StdInstant::now();
   let result = sock.send_to(body, dst).await;
@@ -2258,8 +2418,14 @@ async fn attempt_gated_send_to<S: SendDatagram>(
 /// The credit is recorded only for an attempt that reported bytes on the wire. A
 /// failed send produces no loopback, and a stale entry would suppress a later
 /// byte-identical peer packet.
+///
+/// `family` is passed rather than read off `_dst` because it is what the credit
+/// is KEYED on, and the caller is the fan-out that chose which socket to offer
+/// the datagram to — so the credit is keyed by the same thing that decided the
+/// send, not by re-deriving it from an address afterwards.
 fn note_multicast_attempt(
   inner: &Rc<EndpointInner>,
+  family: Family,
   attempt: &SendAttempt,
   body: &[u8],
   _dst: SocketAddr,
@@ -2272,14 +2438,23 @@ fn note_multicast_attempt(
     SendAttempt::Answered {
       result: Ok(_),
       submitted_wall,
+      submitted_at,
       ..
     } => {
       trace!(kind = _kind, dst = %_dst, len = body.len(), "send_to");
       let mut state = inner.state.borrow_mut();
-      // The PRE-submit wall clock, and it must stay that: suppression compares
-      // this against the loopback echo's rx stamp, and a stamp taken after the
-      // completion could land after the echo arrived.
-      crate::selfsend::record_self_send(&mut state.recent_sends, body, *submitted_wall);
+      // BOTH pre-submit stamps, taken on consecutive statements in
+      // `attempt_send_to` — which is the adjacency `ClockPair` is built on, and
+      // the reason this pairs the two the send already holds instead of reading
+      // a clock here. The wall half orders the echo against the send and must
+      // stay pre-submit, since a stamp taken after the completion could land
+      // after the echo's own kernel receive stamp; the monotonic half is what
+      // says, at claim time, whether that wall stamp is still on the timeline the
+      // receive stamp was taken on. Neither is an age — `SELF_SEND_TTL` runs from
+      // the seal at the top of the NEXT loop iteration.
+      state
+        .selfsend
+        .record(family, body, ClockPair::new(*submitted_wall, *submitted_at));
       #[cfg(feature = "stats")]
       {
         state.stats.packets_tx(1);
@@ -2395,8 +2570,8 @@ async fn send_via<S: SendDatagram>(
     // The tracker is written after the join, in family order, so the two entries
     // a dual-stack fan-out needs are recorded exactly as the serial version
     // recorded them — and under no borrow held across an await.
-    note_multicast_attempt(inner, &a4, body, MDNS_V4_DST, "transmit");
-    note_multicast_attempt(inner, &a6, body, MDNS_V6_DST, "transmit");
+    note_multicast_attempt(inner, Family::V4, &a4, body, MDNS_V4_DST, "transmit");
+    note_multicast_attempt(inner, Family::V6, &a6, body, MDNS_V6_DST, "transmit");
     return fanout;
   }
 
@@ -2407,14 +2582,14 @@ async fn send_via<S: SendDatagram>(
     SocketAddr::V4(_) => (FAMILY_V4, sock_v4.as_deref()),
     SocketAddr::V6(_) => (FAMILY_V6, sock_v6.as_deref()),
   };
-  // NO self-send tracker entry here, unlike the multicast branch. A unicast
-  // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
-  // for the querier's own address and port and never loops back through the
-  // multicast group we joined, so a credit recorded for it can never be
-  // consumed. It would simply occupy the linear-scanned tracker for
-  // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
-  // the NEW entry — so a legacy-query flood would starve the genuine multicast
-  // credits that suppression actually depends on.
+  // NO self-send credit here, unlike the multicast branch. A unicast datagram —
+  // an RFC 6762 §6.7 legacy reply, or a directed response — leaves for the
+  // querier's own address and port and never loops back through the multicast
+  // group we joined, so a credit recorded for it can never be consumed. It would
+  // simply occupy the linear-scanned tracker for `SELF_SEND_TTL`, and at
+  // `MAX_SELF_SEND_ENTRIES` a record declines the NEW entry — so a legacy-query
+  // flood would starve the genuine multicast credits that suppression actually
+  // depends on.
   let attempt = attempt_gated_send_to(sock, &*gate, idx, min_gap, body, dst).await;
   let outcome = attempt_of(Family::of(dst), body, &attempt);
   match dst {
@@ -2628,8 +2803,22 @@ async fn drain_withdrawals(
       attempt_of(Family::V4, &scratch[..len], &a4),
       attempt_of(Family::V6, &scratch[..len], &a6),
     );
-    note_multicast_attempt(inner, &a4, &scratch[..len], MDNS_V4_DST, "withdrawal");
-    note_multicast_attempt(inner, &a6, &scratch[..len], MDNS_V6_DST, "withdrawal");
+    note_multicast_attempt(
+      inner,
+      Family::V4,
+      &a4,
+      &scratch[..len],
+      MDNS_V4_DST,
+      "withdrawal",
+    );
+    note_multicast_attempt(
+      inner,
+      Family::V6,
+      &a6,
+      &scratch[..len],
+      MDNS_V6_DST,
+      "withdrawal",
+    );
     // Count the goodbye as a delivered round when at least one family Sent;
     // `send_to` already bumped packets_tx/bytes_tx/send_errors per family above.
     #[cfg(feature = "stats")]
@@ -2671,8 +2860,14 @@ async fn drain_withdrawals(
   budget_stopped
 }
 
+/// Route one completed receive from the socket bound to `family`.
+///
+/// `family` travels down from the `select!` arm that produced `r` rather than
+/// being recovered from the peer address: it is half the self-send credit key
+/// (see [`State::handle_datagram`]), and the arm is the only place that knows
+/// which socket was read.
 #[inline]
-fn handle_recv(inner: &Rc<EndpointInner>, r: std::io::Result<(Vec<u8>, RecvMeta)>) {
+fn handle_recv(inner: &Rc<EndpointInner>, family: Family, r: std::io::Result<(Vec<u8>, RecvMeta)>) {
   match r {
     Ok((data, meta)) => {
       trace!(src = %meta.peer(), len = data.len(), truncated = meta.truncated(), "recv datagram");
@@ -2703,7 +2898,7 @@ fn handle_recv(inner: &Rc<EndpointInner>, r: std::io::Result<(Vec<u8>, RecvMeta)
       // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
       // on the shared Arc — do NOT bump them here too (double-count).
       let mut s = inner.state.borrow_mut();
-      s.handle_datagram(&meta, &data);
+      s.handle_datagram(family, &meta, &data);
     }
     Err(_e) => {
       // A generic recv error is a socket/driver failure — NOT a consumed-and-

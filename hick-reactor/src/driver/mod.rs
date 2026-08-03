@@ -12,6 +12,10 @@ use agnostic_lite::RuntimeLite;
 use agnostic_net::{Net, UdpSocket};
 use async_channel::Sender;
 use futures::{FutureExt, pin_mut, select_biased};
+use hick_udp::{
+  Family,
+  selfsend::{ClockPair, RxEvidence, SelfSendTracker},
+};
 use mdns_proto::{
   FamilyAttempt, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate,
   TransmitConfirm, endpoint::FamilyDebt, event::RouteEvent,
@@ -42,10 +46,18 @@ pub(crate) struct BoundSockets<N: Net> {
 struct Packet {
   src: SocketAddr,
   data: Vec<u8>,
-  /// local receive address from PKTINFO (ipi_spec_dst /
-  /// ipi6_addr). `UNSPECIFIED` when PKTINFO is unavailable (Windows,
-  /// or a kernel that didn't deliver it) — the proto layer then relies
-  /// on its content-hash tracker for self-loopback detection.
+  /// The socket this datagram was read from, and therefore the ONLY family whose
+  /// self-send credit it can claim: a multicast loopback copy arrives on the
+  /// socket its original was sent from and on no other. Carried from the recv
+  /// task that owns the socket rather than derived from [`Packet::src`] — a
+  /// source address describes the sender, and an IPv4-mapped or otherwise
+  /// unexpected address on either socket would silently key the claim to the
+  /// wrong family. See [`SelfSendTracker::take`].
+  family: Family,
+  /// local receive address from PKTINFO (ipi_spec_dst / ipi6_addr).
+  /// `UNSPECIFIED` when PKTINFO is unavailable (Windows, or a kernel that didn't
+  /// deliver it). It is not part of the self-loopback decision at all — that is
+  /// [`DriverState::selfsend`]'s, taken before the proto layer sees the datagram.
   local_ip: IpAddr,
   /// Receiving interface index from PKTINFO (`0` when unknown).
   interface_index: u32,
@@ -55,16 +67,20 @@ struct Packet {
   /// self-send tracker: a datagram the kernel stamped BEFORE our send
   /// cannot be our own loopback, so it can't steal that send's credit
   /// even when read later (behind a bounded packet-pump backlog).
-  /// Provenance is kept explicit (rather than collapsed to a read-time
-  /// `SystemTime`) so the degraded path is never mistaken for ordered:
-  /// see `handle_packet`.
-  kernel_rx_time: Option<SystemTime>,
-  /// Userspace read time, always present. Used (a) for TTL expiry in
-  /// every path and (b) as the only available time signal on platforms
-  /// that don't deliver a kernel rx timestamp (Windows, or a Unix kernel
-  /// that didn't attach the cmsg), where self-detection degrades to a
-  /// content-hash take-once match with NO ordering guarantee.
-  read_time: SystemTime,
+  ///
+  /// The absence is carried as an absence, never papered over with a userspace
+  /// read time: a stamp taken when this task got around to the datagram says
+  /// nothing about when the kernel saw it, and handing one over as ordering
+  /// evidence is what
+  /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded) exists to
+  /// refuse.
+  ///
+  /// It is an [`RxEvidence`] the whole way from the receive task to the claim,
+  /// built by [`RxEvidence::from_meta`] off the [`hick_udp::RecvMeta`] the
+  /// `recvmsg` produced. That keeps the provenance structural rather than
+  /// conventional: this driver never holds the stamp as a bare `SystemTime`, so
+  /// no later edit can substitute a read time for it without changing the type.
+  rx: RxEvidence,
   /// IPv4 TTL / IPv6 Hop Limit of the datagram (from `IP_RECVTTL` /
   /// `IPV6_RECVHOPLIMIT`), or `None` when the platform didn't supply it. The
   /// RFC 6762 §11 on-link check ([`is_on_link`]) drops the packet before the
@@ -139,17 +155,35 @@ struct DriverState<N: Net> {
   /// the feature is disabled so zero overhead in the no-stats build.
   #[cfg(feature = "stats")]
   stats: std::sync::Arc<hick_trace::stats::Stats>,
-  /// self-send tracker — `(content_hash, send_wall_time)` for every
-  /// datagram we recently transmitted. The driver (std layer) owns this
-  /// because deciding "is this inbound packet our own loopback?" needs the
-  /// kernel receive timestamp + a wall clock, facilities that don't belong
-  /// in the `no_std` proto core. An inbound packet is classified self when
-  /// its content hash matches a live entry AND its kernel rx timestamp is
-  /// at-or-after that entry's send wall-time (consume-once). Both stamps
-  /// are `SystemTime` so they're directly comparable; see `Packet::rx_time`.
-  /// Keyed on OUR sends only, so its size tracks our (coalescing-bounded)
-  /// send rate, not peer traffic.
-  recent_sends: Vec<(u64, SystemTime)>,
+  /// The seal generation observed at the last park entry, so a receive that
+  /// returned FROM that park can prove the seal it relies on happened before it
+  /// rather than inside it. See [`SelfSendTracker::seal_generation`].
+  ///
+  /// `None` means "the next receive is not a park return", and that state is
+  /// reachable on a perfectly correct path: when a drain reports more work
+  /// pending this loop `continue`s straight back to the packet pump WITHOUT
+  /// parking, so the pump drains a backlog that no park mediated. There is no
+  /// park for such a receive to be early relative to, so the ordering question is
+  /// not merely unproven but meaningless, and asking it would fail on correct
+  /// sealing. Every `seal` clears this; only a park entry sets it.
+  ///
+  /// Debug builds only: it feeds assertions and no decision.
+  #[cfg(debug_assertions)]
+  sealed_generation_at_park: Option<u64>,
+  /// Credits for the multicast datagrams this endpoint recently sent, so their
+  /// kernel loopback copies are recognized instead of being ingested as a peer's
+  /// traffic.
+  ///
+  /// The driver (std layer) owns it because the decision needs a kernel receive
+  /// timestamp and two clocks, facilities that do not belong in the `no_std`
+  /// proto core — which keeps no tracker of its own and takes the answer as an
+  /// explicit flag. Keyed on OUR sends only, so its size tracks our
+  /// (coalescing-bounded) send rate and never peer traffic.
+  ///
+  /// The window each credit ages in is opened once per run-loop iteration by
+  /// [`SelfSendTracker::seal`]; see the call site in [`driver_task`] for why it
+  /// sits at the top of the loop and nowhere else.
+  selfsend: SelfSendTracker,
   /// Reusable scratch for the handles of endpoint-owned withdrawals that
   /// completed in a loop iteration, so [`Endpoint::drain_completed_withdrawals`]
   /// can push into it and the loop can GC each one's driver ctx. Kept on the
@@ -200,7 +234,9 @@ impl<N: Net> DriverState<N> {
       endpoint,
       services: HashMap::new(),
       queries: HashMap::new(),
-      recent_sends: Vec::new(),
+      #[cfg(debug_assertions)]
+      sealed_generation_at_park: None,
+      selfsend: SelfSendTracker::new(),
       completed_withdrawals: Vec::new(),
       svc_handle_scratch: Vec::new(),
       query_handle_scratch: Vec::new(),
@@ -386,7 +422,56 @@ impl<N: Net> DriverState<N> {
     })
   }
 
+  /// The park entry: check that the seal this iteration relies on has already
+  /// happened, and record WHICH seal it was so [`Self::handle_packet`] can prove
+  /// it predated the park.
+  ///
+  /// Debug builds only — it makes no decision and compiles out of release. See
+  /// the call site in [`driver_task`] for why the check belongs here and not
+  /// beside `seal`.
+  #[cfg(debug_assertions)]
+  fn note_park_entry(&mut self) {
+    debug_assert!(
+      !self.selfsend.has_unsealed(),
+      "a credit recorded this iteration is still unsealed at the park entry: \
+       `seal` must run after every record stage and before this park"
+    );
+    self.sealed_generation_at_park = Some(self.selfsend.seal_generation());
+  }
+
   fn handle_packet(&mut self, pkt: Packet) {
+    // Defence in depth, and deliberately NOT the proof of placement: by the time
+    // this runs the park is over, so "nothing is unsealed" is equally true of a
+    // driver that sealed before parking and one that sealed in its receive arm
+    // after an arbitrarily long park. The placement itself is pinned at the
+    // park entry in `driver_task`; what this adds is that no path reaches
+    // a claim with an unsealed credit, whatever route it took here.
+    debug_assert!(
+      !self.selfsend.has_unsealed(),
+      "a credit reached the receive path unsealed: `seal` must sit between this \
+       iteration's sends and this receive"
+    );
+    // The ordering half, and it applies to exactly one kind of receive: one that
+    // came back OUT of a park. The park entry recorded which seal it was relying
+    // on, so a window opened since means the seal ran inside or after the park and
+    // every credit it anchored is a whole park late.
+    //
+    // A receive with no park behind it — the backlog the pump drains when a drain
+    // reported more work and the loop `continue`d — has nothing to be early
+    // relative to, and the seal that ran on the way there legitimately advanced
+    // the generation. Asking the question there fails on correct sealing, so the
+    // capture is absent and the question is not asked. The unsealed-state check
+    // above still applies to every receive, park or not; it is the half that
+    // holds unconditionally.
+    #[cfg(debug_assertions)]
+    if let Some(at_park) = self.sealed_generation_at_park {
+      debug_assert_eq!(
+        self.selfsend.seal_generation(),
+        at_park,
+        "a claim window opened between the park entry and this receive: `seal` \
+         must PRECEDE the park, not run inside the receive arm"
+      );
+    }
     // RFC 6762 §11 on-link trust boundary: a datagram that did NOT originate
     // on the local link must be dropped before the proto layer can act on
     // (cache, conflict, withdraw) attacker-injected records.
@@ -425,11 +510,11 @@ impl<N: Net> DriverState<N> {
     // enforce the §11 source-port rule for RESPONSES *before*
     // consuming a self-send credit. Proto re-checks this for
     // direct callers, but if we let an untrusted response reach
-    // `take_self_send` first, an on-link attacker's byte-identical copy from
+    // the tracker first, an on-link attacker's byte-identical copy from
     // an ephemeral port could burn the take-once credit — then proto
     // suppresses the attacker's copy, and our genuine port-5353 loopback
     // arrives with no credit and is mis-processed as a trusted peer. Drop
-    // untrusted responses here so they never touch `recent_sends`. (Queries,
+    // untrusted responses here so they are never offered a credit. (Queries,
     // QR=0, are exempt — legacy unicast queriers use ephemeral ports.)
     if packet_is_response(&pkt.data) && pkt.src.port() != hick_udp::constants::MDNS_PORT {
       hick_trace::debug!(
@@ -453,29 +538,35 @@ impl<N: Net> DriverState<N> {
     let local_ip = pkt.local_ip;
     let interface_index = pkt.interface_index;
 
-    // the AUTHORITATIVE self-loopback decision happens
-    // HERE, in the std driver, against our recorded send wall-times. We
-    // hand the result to the proto layer as an explicit flag; proto keeps
-    // no self-send tracker of its own.
+    // The AUTHORITATIVE self-loopback decision happens HERE, in the std driver.
+    // The result reaches the proto layer as an explicit flag; proto keeps no
+    // self-send tracker of its own.
     //
-    // When the kernel gave us a receive timestamp we match in ORDERED
-    // mode: the datagram is ours only if its kernel stamp is at-or-after
-    // (within a sub-microsecond grain) the recorded send time,
-    // which is what excludes a byte-identical peer datagram the kernel
-    // saw before we sent. When no kernel timestamp is available we fall
-    // back to a DEGRADED content-hash take-once match keyed on read time
-    // — correct for normal single-host operation but, by construction,
-    // unable to defend the credit-theft race (documented on
-    // `take_self_send`).
-    let caller_is_self = match pkt.kernel_rx_time {
-      Some(rx) => take_self_send(&mut self.recent_sends, &pkt.data, rx, MatchMode::Ordered),
-      None => take_self_send(
-        &mut self.recent_sends,
-        &pkt.data,
-        pkt.read_time,
-        MatchMode::Degraded,
-      ),
-    };
+    // The credit is looked up under the family this datagram ARRIVED on. One
+    // multicast transmit is two syscalls with identical bytes and two
+    // separately-stamped credits, and nothing fixes which socket's echo is read
+    // first — so without the family key the second echo read can consume the
+    // first echo's credit and leave its own owner facing a credit stamped after
+    // the kernel saw it.
+    //
+    // How much ordering evidence this claim has is DERIVED inside `take`, never
+    // declared here: it comes from whether the kernel delivered a receive
+    // timestamp, and is weakened per credit when that credit's own wall stamp did
+    // not survive a clock step between the send and now. Both fall back to
+    // matching on content, family and the TTL alone, which is enough to suppress
+    // our own loopback in the ordinary single-host case but cannot defend the
+    // credit-theft race — the cheap direction, since refusing our own echo raises
+    // a phantom RFC 6762 §9 conflict against ourselves.
+    //
+    // The absence of a kernel stamp is handed over as an absence. A userspace
+    // read time taken at this line would order every claim trivially and carry no
+    // information about when the kernel saw the datagram.
+    //
+    // Only ordering is asked here. The credit's AGE is read inside `take`, at the
+    // decision, because everything between this datagram's arrival and this line
+    // — both admission gates above, the packet-pump backlog, and whatever the
+    // scheduler does among them — is elapsed time the credit must be charged.
+    let caller_is_self = self.selfsend.take(pkt.family, &pkt.data, pkt.rx);
 
     // proto `now` is monotonic; process time is fine for cache TTL /
     // scheduling (the self-loopback ordering used the SystemTime rx stamp
@@ -780,12 +871,12 @@ impl<N: Net> DriverState<N> {
 
   /// Drain outgoing transmits across services + queries.
   ///
-  /// Every ACTUAL successful MULTICAST send records its own self-send tracker
-  /// entry via [`record_self_send`]. Take-once suppression means a single entry
-  /// can match only one inbound loopback, and a dual-stack fan-out sends the same
-  /// payload to BOTH multicast sockets, so the tracker needs two entries to
-  /// suppress both copies — not one. The entry is therefore recorded inside
-  /// [`send_via`] per real send, not here.
+  /// Every ACTUAL successful MULTICAST send records its own credit in
+  /// [`DriverState::selfsend`]. Take-once suppression means one credit can match
+  /// only one inbound loopback, and a dual-stack fan-out sends the same payload
+  /// to BOTH multicast sockets, so the tracker needs a credit per family — not
+  /// one for the pair. The credit is therefore recorded inside [`send_via`] per
+  /// real send, keyed to the family that carried it, and not here.
   ///
   /// Bounded by [`DrainBudget`] — the aggregate per-pass wall clock it shares with
   /// [`Self::drain_withdrawals`], plus the [`MAX_SEND_CREDITS_PER_DRAIN`] send
@@ -836,7 +927,7 @@ impl<N: Net> DriverState<N> {
     let Self {
       endpoint,
       services,
-      recent_sends,
+      selfsend,
       v4,
       v6,
       svc_handle_scratch,
@@ -926,7 +1017,7 @@ impl<N: Net> DriverState<N> {
         // this single-task loop touches it in between.
         let mut gate = services.get(&h).map(|c| c.wire_gate).unwrap_or_default();
         let fanout = send_via(
-          recent_sends,
+          selfsend,
           v4,
           v6,
           tx.dst(),
@@ -1034,7 +1125,7 @@ impl<N: Net> DriverState<N> {
     let Self {
       endpoint,
       queries,
-      recent_sends,
+      selfsend,
       v4,
       v6,
       query_handle_scratch,
@@ -1153,7 +1244,7 @@ impl<N: Net> DriverState<N> {
         let body_len = tx.size();
         let mut gate = queries.get(&h).map(|c| c.wire_gate).unwrap_or_default();
         let fanout = send_via(
-          recent_sends,
+          selfsend,
           v4,
           v6,
           tx.dst(),
@@ -1348,11 +1439,11 @@ impl<N: Net> DriverState<N> {
   ) -> bool {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
-    // Split-borrow disjoint fields so `send_via` can borrow `recent_sends`/`v4`/
+    // Split-borrow disjoint fields so `send_via` can borrow `selfsend`/`v4`/
     // `v6` while `endpoint` is borrowed for the withdrawal pump.
     let Self {
       endpoint,
-      recent_sends,
+      selfsend,
       v4,
       v6,
       ..
@@ -1377,7 +1468,7 @@ impl<N: Net> DriverState<N> {
       // family, so here we add only the per-round goodbyes_tx (one per DELIVERED
       // round).
       let (v4_out, v6_out) = send_withdrawal_via(
-        recent_sends,
+        selfsend,
         v4,
         v6,
         &scratch[..len],
@@ -1607,118 +1698,6 @@ const MDNS_V6_DST: SocketAddr = SocketAddr::V6(std::net::SocketAddrV6::new(
   0,
 ));
 
-/// How long a recorded self-send stays eligible to match an inbound
-/// loopback before it is swept. Multicast loopback is delivered on the
-/// same host within microseconds; 2s is generously larger than any real
-/// loopback latency yet short enough that a byte-identical packet from a
-/// co-resident peer arriving well after our send is correctly treated as
-/// a peer, not as our own echo.
-const SELF_SEND_TTL: Duration = Duration::from_secs(2);
-
-/// Hard cap on live self-send tracker entries. Our send rate is bounded
-/// by RFC 6762 §6 response coalescing (queries inside a jitter window
-/// collapse into ONE response), so under normal operation the tracker
-/// holds only a handful of entries. The cap is a backstop: if we ever
-/// burst past it (e.g. many services announcing at once) `record_self_send`
-/// declines to add more rather than evicting a still-live entry, which
-/// would let a real loopback be misclassified as a peer.
-const MAX_SELF_SEND_ENTRIES: usize = 65536;
-
-/// FNV-1a 64-bit hash of a datagram body. Used only to fingerprint our
-/// own sends for loopback matching — not a security primitive, so a fast
-/// non-cryptographic hash is appropriate.
-fn fnv1a(data: &[u8]) -> u64 {
-  const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-  const PRIME: u64 = 0x0000_0100_0000_01b3;
-  let mut h = OFFSET;
-  for &b in data {
-    h ^= b as u64;
-    h = h.wrapping_mul(PRIME);
-  }
-  h
-}
-
-/// Record that we just sent `body` at wall time `sent`. Sweeps entries
-/// older than [`SELF_SEND_TTL`] first (an entry whose age is `Err` is in
-/// the future relative to `sent` — a clock step — so it is kept), then
-/// appends `(hash, sent)` unless the tracker is already at
-/// [`MAX_SELF_SEND_ENTRIES`] (decline rather than evict a live
-/// entry).
-fn record_self_send(tracker: &mut Vec<(u64, SystemTime)>, body: &[u8], sent: SystemTime) {
-  tracker.retain(|(_, t)| match sent.duration_since(*t) {
-    Ok(age) => age <= SELF_SEND_TTL,
-    Err(_) => true,
-  });
-  if tracker.len() < MAX_SELF_SEND_ENTRIES {
-    tracker.push((fnv1a(body), sent));
-  }
-}
-
-/// How an inbound datagram's timestamp is matched against recorded sends.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MatchMode {
-  /// The reference time is a KERNEL receive timestamp. A datagram is ours
-  /// only if it was stamped at-or-after the recorded send (within
-  /// [`hick_udp::RX_TIMESTAMP_GRAIN`]) and within [`SELF_SEND_TTL`] — this
-  /// ordering is what excludes a byte-identical peer datagram the kernel
-  /// saw before we sent (credit-theft guard).
-  Ordered,
-  /// No kernel timestamp was available (Windows, or a Unix kernel that
-  /// didn't deliver the cmsg). The reference is a userspace READ time, so
-  /// ordering carries no information: we match on content hash alone
-  /// within [`SELF_SEND_TTL`] (take-once). This correctly suppresses our
-  /// own loopback for normal single-host operation but, by construction,
-  /// cannot defend the credit-theft race; that is the documented
-  /// degradation on these platforms.
-  Degraded,
-}
-
-/// Decide whether an inbound datagram (`body`, observed at `reference`) is
-/// our own multicast loopback, consuming the matching tracker entry if so
-/// (take-once, so one recorded send suppresses exactly one
-/// loopback). See [`MatchMode`] for how `reference` is interpreted.
-fn take_self_send(
-  tracker: &mut Vec<(u64, SystemTime)>,
-  body: &[u8],
-  reference: SystemTime,
-  mode: MatchMode,
-) -> bool {
-  let needle = fnv1a(body);
-  match tracker
-    .iter()
-    .position(|(h, sent)| *h == needle && reference_matches(reference, *sent, mode))
-  {
-    Some(pos) => {
-      tracker.remove(pos);
-      true
-    }
-    None => false,
-  }
-}
-
-/// Whether `reference` falls inside the acceptance window of a send made at
-/// `sent`, per [`MatchMode`].
-///
-/// - `Ordered`: `reference ∈ [sent - RX_TIMESTAMP_GRAIN, sent + SELF_SEND_TTL]`.
-///   The grain is the receive timestamp's worst-case truncation
-///   ([`hick_udp::RX_TIMESTAMP_GRAIN`]: zero for nanosecond `SO_TIMESTAMPNS`,
-///   one microsecond for `timeval` `SO_TIMESTAMP`), so a truncated loopback
-///   still matches without widening the pre-send
-///   credit-theft window beyond that intrinsic grain. The upper bound is TTL
-///   expiry.
-/// - `Degraded`: only the upper TTL bound applies (a read time is always
-///   at-or-after the send, so the lower bound never bites). Equivalent to
-///   content-hash take-once within TTL.
-fn reference_matches(reference: SystemTime, sent: SystemTime, mode: MatchMode) -> bool {
-  match reference.duration_since(sent) {
-    // reference at-or-after sent: accept while within the TTL window.
-    Ok(ahead) => ahead <= SELF_SEND_TTL,
-    // reference before sent: only ordered mode tolerates it, and only
-    // within this target's receive-timestamp truncation grain.
-    Err(behind) => mode == MatchMode::Ordered && behind.duration() <= hick_udp::RX_TIMESTAMP_GRAIN,
-  }
-}
-
 /// RFC 6762 §11 on-link check by TTL: a datagram is on-link only if its IPv4
 /// TTL / IPv6 Hop Limit is exactly 255 (anything less crossed a router).
 fn is_on_link(hop_limit: Option<u8>) -> bool {
@@ -1860,37 +1839,23 @@ fn attempt_of(family: Family, body: &[u8], attempt: &SendAttempt) -> FamilyAttem
       None => FamilyAttempt::Refused { permanent: false },
     },
     SendAttempt::Answered { result: Err(_), .. } => FamilyAttempt::Refused {
-      permanent: body.len() > family.max_udp_payload(),
+      permanent: body.len() > max_udp_payload(family),
     },
     SendAttempt::TimedOut => FamilyAttempt::WouldBlock,
   }
 }
 
-/// Which address family a socket, and therefore which hard UDP payload ceiling
-/// applies to a datagram offered to it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Family {
-  V4,
-  V6,
-}
-
-impl Family {
-  /// The family a destination selects.
-  const fn of(dst: SocketAddr) -> Self {
-    match dst {
-      SocketAddr::V4(_) => Self::V4,
-      SocketAddr::V6(_) => Self::V6,
-    }
-  }
-
-  /// The largest UDP payload this family can EVER carry — the only sound proof
-  /// that a refused datagram can never be sent. See
-  /// [`mdns_proto::constants::MAX_UDP_PAYLOAD_V6`].
-  const fn max_udp_payload(self) -> usize {
-    match self {
-      Self::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
-      Self::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
-    }
+/// The largest UDP payload `family` can EVER carry — the only sound proof
+/// that a refused datagram can never be sent. See
+/// [`mdns_proto::constants::MAX_UDP_PAYLOAD_V6`].
+///
+/// A free function rather than a method: [`Family`] is `hick-udp`'s type, and
+/// this ceiling is `mdns-proto`'s constant, which that crate deliberately does
+/// not depend on.
+const fn max_udp_payload(family: Family) -> usize {
+  match family {
+    Family::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
+    Family::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
   }
 }
 
@@ -2257,10 +2222,15 @@ async fn attempt_gated_send_to<S: UdpSocket>(
 /// family's completed attempt.
 ///
 /// The credit is recorded only for an attempt that actually put bytes on the
-/// wire. A failed or timed-out send produces no loopback, and a stale entry would
-/// suppress a later byte-identical peer packet.
+/// wire. A failed or timed-out send produces no loopback, and a stale credit
+/// would suppress a later byte-identical peer packet.
+///
+/// `family` is the family whose socket carried this attempt, passed in rather
+/// than read off `_dst`: the credit is keyed to the socket its loopback copy can
+/// arrive on, and only the caller that chose the socket knows that for certain.
 fn note_multicast_attempt(
-  tracker: &mut Vec<(u64, SystemTime)>,
+  tracker: &mut SelfSendTracker,
+  family: Family,
   attempt: &SendAttempt,
   body: &[u8],
   _dst: SocketAddr,
@@ -2274,10 +2244,20 @@ fn note_multicast_attempt(
     SendAttempt::Answered {
       result: Ok(_),
       submitted_wall,
+      submitted_at,
       ..
     } => {
       hick_trace::trace!(kind = _kind, dst = %_dst, len = body.len(), "send_to");
-      record_self_send(tracker, body, *submitted_wall);
+      // The pre-syscall pair, wall first and monotonic immediately after, exactly
+      // as `send_to_at` reads them on consecutive statements — which is the
+      // adjacency `ClockPair` is built on. The wall half ORDERS this credit
+      // against its echo and cannot outrun the kernel's stamp on a copy already
+      // looped back; the monotonic half is its partner, the only thing that can
+      // later say whether the wall clock stayed on one timeline. Neither is an
+      // age: the credit takes no ageing anchor here, because no instant inside
+      // this iteration is a legal one — nothing recorded now can be claimed
+      // before the next iteration's seal opens the window.
+      tracker.record(family, body, ClockPair::new(*submitted_wall, *submitted_at));
       #[cfg(feature = "stats")]
       {
         stats.packets_tx(1);
@@ -2304,8 +2284,8 @@ fn note_multicast_attempt(
 }
 
 /// Send a datagram on the appropriate socket(s), reporting each family's result
-/// and recording one self-send tracker entry per ACTUAL successful MULTICAST
-/// `send_to`.
+/// and recording one self-send credit per ACTUAL successful MULTICAST
+/// `send_to`, keyed to the family that carried it.
 ///
 /// Returns the per-family [`Fanout`]: the honest I/O facts for the confirm, and
 /// `sent_count()` for the fairness budget — two independent facts that must not
@@ -2331,7 +2311,7 @@ fn note_multicast_attempt(
 /// against the reading the pass took before it began serving producers.
 #[allow(clippy::too_many_arguments)]
 async fn send_via<S: UdpSocket>(
-  tracker: &mut Vec<(u64, SystemTime)>,
+  tracker: &mut SelfSendTracker,
   v4: &Option<Arc<S>>,
   v6: &Option<Arc<S>>,
   dst: SocketAddr,
@@ -2347,22 +2327,21 @@ async fn send_via<S: UdpSocket>(
   // each). Non-multicast (unicast) sends fall back to the per-family
   // socket selection.
   //
-  // record one tracker entry per ACTUAL send_to. Take-once
-  // self suppression consumes a single entry per matching
-  // loopback; dual-stack fan-out generates TWO loopback copies (one per
-  // joined socket) so we need two entries.
+  // Record one credit per ACTUAL send_to. Take-once suppression consumes a single
+  // credit per matching loopback; a dual-stack fan-out generates TWO loopback
+  // copies (one per joined socket), so it needs one credit per family and each is
+  // claimable only by an echo read off that family's own socket.
   let is_mdns_multicast = matches!(dst, SocketAddr::V4(v4a) if v4a.ip().is_multicast() && v4a.port() == 5353)
     || matches!(dst, SocketAddr::V6(v6a) if v6a.ip().is_multicast() && v6a.port() == 5353);
 
-  // stamp each tracker entry with the wall time captured INSIDE
-  // the poll that actually performs the `sendto` (see `send_to_at`), not
-  // before awaiting an async `send_to`. The kernel stamps the looped-back
-  // copy during that syscall, so the captured time is immediately before
-  // the kernel's receive stamp — guaranteeing `sent <= rx` for our own
-  // loopback (modulo the truncation grain) while leaving no awaitable gap
-  // in which a peer datagram could be stamped after our recorded time yet
-  // before our packet is actually sent (which would let it steal the
-  // take-once credit).
+  // Each credit is stamped with the clock pair read INSIDE the poll that actually
+  // performs the `sendto` (see `send_to_at`), not before awaiting an async
+  // `send_to`. The kernel stamps the looped-back copy during that syscall, so the
+  // captured wall time is immediately before the kernel's receive stamp —
+  // guaranteeing `sent <= rx` for our own loopback (modulo the truncation grain)
+  // while leaving no awaitable gap in which a peer datagram could be stamped after
+  // our recorded time yet before our packet is actually sent (which would let it
+  // steal the take-once credit).
   let mut fanout = Fanout::NOT_ADDRESSED;
   if is_mdns_multicast {
     // Offer both families CONCURRENTLY. Serialising them made each family's
@@ -2387,11 +2366,12 @@ async fn send_via<S: UdpSocket>(
     if let Some(at) = a6.wire_time() {
       gate.record(FAMILY_V6, at, min_gap);
     }
-    // The tracker is written after the join, in family order, so the two entries
+    // The tracker is written after the join, in family order, so the two credits
     // a dual-stack fan-out needs are recorded exactly as the serial version
     // recorded them.
     note_multicast_attempt(
       tracker,
+      Family::V4,
       &a4,
       body,
       MDNS_V4_DST,
@@ -2401,6 +2381,7 @@ async fn send_via<S: UdpSocket>(
     );
     note_multicast_attempt(
       tracker,
+      Family::V6,
       &a6,
       body,
       MDNS_V6_DST,
@@ -2418,14 +2399,14 @@ async fn send_via<S: UdpSocket>(
     SocketAddr::V4(_) => (FAMILY_V4, v4.as_deref()),
     SocketAddr::V6(_) => (FAMILY_V6, v6.as_deref()),
   };
-  // NO self-send tracker entry here, unlike the multicast branch. A unicast
-  // datagram — an RFC 6762 §6.7 legacy reply, or a directed response — leaves
-  // for the querier's own address and port and never loops back through the
-  // multicast group we joined, so a credit recorded for it can never be
-  // consumed. It would simply occupy the linear-scanned tracker for
-  // `SELF_SEND_TTL`, and at `MAX_SELF_SEND_ENTRIES` `record_self_send` declines
-  // the NEW entry — so a legacy-query flood would starve the genuine multicast
-  // credits that suppression actually depends on.
+  // NO self-send credit here, unlike the multicast branch. A unicast datagram —
+  // an RFC 6762 §6.7 legacy reply, or a directed response — leaves for the
+  // querier's own address and port and never loops back through the multicast
+  // group we joined, so a credit recorded for it can never be consumed. It would
+  // simply occupy the linear-scanned tracker for `SELF_SEND_TTL`, and at
+  // `MAX_SELF_SEND_ENTRIES` a record is refused rather than evicting a live
+  // credit — so a legacy-query flood would starve the genuine multicast credits
+  // that suppression actually depends on.
   let attempt = attempt_gated_send_to(sock, gate, idx, min_gap, body, dst).await;
   let outcome = attempt_of(Family::of(dst), body, &attempt);
   match dst {
@@ -2499,7 +2480,7 @@ async fn send_via<S: UdpSocket>(
 /// family whose debt was already zero — so erring towards caution costs a round
 /// and never a debt.
 async fn send_withdrawal_via<S: UdpSocket>(
-  tracker: &mut Vec<(u64, SystemTime)>,
+  tracker: &mut SelfSendTracker,
   v4: &Option<Arc<S>>,
   v6: &Option<Arc<S>>,
   body: &[u8],
@@ -2530,6 +2511,7 @@ async fn send_withdrawal_via<S: UdpSocket>(
   if let Some(a4) = a4 {
     note_multicast_attempt(
       tracker,
+      Family::V4,
       &a4,
       body,
       MDNS_V4_DST,
@@ -2541,6 +2523,7 @@ async fn send_withdrawal_via<S: UdpSocket>(
   if let Some(a6) = a6 {
     note_multicast_attempt(
       tracker,
+      Family::V6,
       &a6,
       body,
       MDNS_V6_DST,
@@ -2678,8 +2661,8 @@ async fn driver_task<N: Net>(
   loop {
     // drain any already-arrived packets BEFORE firing timers
     // and draining new transmits, so the multicast-loopback copies of
-    // the PRIOR tick's transmits are matched against the self-send hash
-    // ring before this tick records new sends.
+    // the PRIOR iteration's transmits are matched against the credits
+    // sealed at the end of that iteration, before this one records new sends.
     //
     // bound the drain to PACKET_PUMP_BUDGET iterations per
     // tick so a multicast flood (recv tasks can keep refilling the
@@ -2726,6 +2709,44 @@ async fn driver_task<N: Net>(
       .await;
     let more_pending = more_transmits_pending || more_withdrawals_pending;
 
+    // Open the claim window on everything the drains above just recorded, and
+    // nowhere else in this task.
+    //
+    // **Recording and window-opening must straddle the receive.** This is the
+    // last statement in the iteration that can record a credit — `handle_command`
+    // only answers channels — and every path from here to the next thing that can
+    // receive passes through it: the `select_biased!` below handles a packet in
+    // THIS iteration, and the `continue` above re-enters the packet pump at the
+    // top of the next one. A seal at the loop top instead of here sits on the
+    // same side of the receive as the records it is meant to open, which leaves
+    // this iteration's credits unsealed across the park below — and an unsealed
+    // credit is live unconditionally, so a matching datagram arriving minutes
+    // later would still be swallowed as our own echo. `SELF_SEND_TTL` would bound
+    // nothing on exactly the path it exists to bound.
+    //
+    // Sealing here rather than at each send keeps the two moments the credit's
+    // two stamps exist to keep apart: the outbound stretch of the iteration that
+    // recorded a credit is structurally claim-free, so charging it would
+    // re-expire credits that never had a claim opportunity. What it costs is
+    // over-retention bounded by the park below, and over-retention is the CHEAP
+    // direction: a stale credit can at worst suppress one byte-identical peer
+    // datagram, and take-once bounds it to one. Under-retention loses our own
+    // echo to the protocol layer as peer traffic — a phantom RFC 6762 §9 conflict
+    // against ourselves, and the rename that follows.
+    //
+    // It deliberately takes no instant: the anchor is read inside the call, after
+    // the expiry sweep that precedes it, so a long sweep cannot hand a
+    // just-opened window an anchor from before it.
+    state.selfsend.seal();
+    // Any park capture now refers to a park that happened BEFORE this seal, so it
+    // can no longer describe the next receive. Dropping it here is what keeps the
+    // `more_pending` path — seal, then `continue` straight back to the packet
+    // pump without parking — from being weighed against a park it never entered.
+    #[cfg(debug_assertions)]
+    {
+      state.sealed_generation_at_park = None;
+    }
+
     // if drain_transmits stopped at its per-tick budget,
     // don't sleep — loop back immediately so the packet pump can
     // consume the loopbacks from the sends we just made, before we
@@ -2763,6 +2784,28 @@ async fn driver_task<N: Net>(
     let cmd_fut = cmd_rx.recv().fuse();
     let pkt_fut = packet_rx.recv().fuse();
     pin_mut!(cmd_fut, pkt_fut);
+
+    // THE PARK ENTRY, and the one place the seal's placement is actually checked.
+    //
+    // Deliberately NOT adjacent to `seal` above: a check written straight after
+    // `seal` is vacuous, since sealing is exactly what makes nothing unsealed.
+    // Asked HERE it is a real question — "did the seal this iteration relies on
+    // already happen, with every record stage behind it?" — and the three ways to
+    // get the placement wrong all answer it "no":
+    //
+    // * seal at the loop top: the drains above recorded after it, so their
+    //   credits are unsealed right here;
+    // * no seal at all, or one only in a receive arm: likewise unsealed here;
+    // * seal after the park: same.
+    //
+    // The generation captured alongside is what the receive path compares against,
+    // which pins the remaining case — a seal that ran BOTH here and again inside
+    // the receive arm leaves nothing unsealed, so only a changed generation shows
+    // that the credits were re-anchored a whole park late.
+    //
+    // It compiles out of release builds and influences no decision.
+    #[cfg(debug_assertions)]
+    state.note_park_entry();
 
     // A closed command or packet channel means the endpoint (and its recv
     // loops) are gone. Record it via a flag and break AFTER the select so the
@@ -2881,6 +2924,13 @@ async fn recv_loop<N: Net>(
   max_recv: usize,
   #[cfg(feature = "stats")] stats: std::sync::Arc<hick_trace::stats::Stats>,
 ) {
+  // This task owns exactly one socket, so every datagram it reads arrived on one
+  // family and the parameter that selected the socket is the authority on which.
+  // Stamped onto each `Packet` rather than recovered downstream from the source
+  // address, because that address describes the SENDER: the family a self-send
+  // credit is keyed to is the socket its loopback copy can arrive on, and nothing
+  // in a peer's address can be allowed to name it.
+  let family = if via_v4 { Family::V4 } else { Family::V6 };
   // RFC 6762 §17: outgoing mDNS messages should fit in the path MTU
   // (~1500 bytes for Ethernet), but receivers MUST be prepared to accept
   // messages up to 9000 bytes. `max_recv` defaults to 9000 (configurable
@@ -2928,14 +2978,14 @@ async fn recv_loop<N: Net>(
           let pkt = Packet {
             src: meta.peer(),
             data,
+            family,
             local_ip: meta.local_ip(),
             interface_index: meta.interface_index(),
-            // carry the kernel receive timestamp as-is (None
-            // when this kernel didn't deliver the cmsg) so handle_packet
-            // can pick ORDERED vs DEGRADED self-matching by provenance,
-            // never silently treating a read time as an ordering signal.
-            kernel_rx_time: meta.rx_time(),
-            read_time: SystemTime::now(),
+            // The evidence is built from the `RecvMeta` this crate's own
+            // `recvmsg` produced, so its provenance is carried by the type: an
+            // absent cmsg stays absent, and there is no step at which a
+            // userspace stamp could be substituted for a kernel one.
+            rx: RxEvidence::from_meta(&meta),
             // IPv4 TTL / IPv6 Hop Limit for the §11 on-link check.
             hop_limit: meta.hop_limit(),
           };
@@ -2974,8 +3024,9 @@ async fn recv_loop<N: Net>(
     // That index lets handle_packet scope the §11 link-local on-link check to
     // the bound interface (no longer fail-open). No TTL cmsg is wired here, so
     // hop_limit stays None and the §11 check uses the (now interface-scoped)
-    // source-address fallback. No kernel rx timestamp either: degraded
-    // (read-time) self-match.
+    // source-address fallback. No kernel rx timestamp either, so the self-send
+    // match runs degraded: content, family and the TTL, weighing no reference at
+    // all rather than substituting a read time for one.
     #[cfg(windows)]
     {
       use std::os::windows::io::AsRawSocket;
@@ -3018,10 +3069,10 @@ async fn recv_loop<N: Net>(
           let pkt = Packet {
             src: meta.peer(),
             data,
+            family,
             local_ip: meta.local_ip(),
             interface_index: meta.interface_index(),
-            kernel_rx_time: meta.rx_time(),
-            read_time: SystemTime::now(),
+            rx: RxEvidence::from_meta(&meta),
             hop_limit: meta.hop_limit(),
           };
           if tx.send(pkt).await.is_err() {
@@ -3076,10 +3127,10 @@ async fn recv_loop<N: Net>(
           let pkt = Packet {
             src,
             data,
+            family,
             local_ip,
             interface_index: 0,
-            kernel_rx_time: None,
-            read_time: SystemTime::now(),
+            rx: RxEvidence::none(),
             hop_limit: None,
           };
           if tx.send(pkt).await.is_err() {

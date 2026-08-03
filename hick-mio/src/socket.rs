@@ -39,6 +39,7 @@ use std::{
 use hick_udp::{
   MulticastOptionsV4, MulticastOptionsV6, RecvMeta,
   constants::{MDNS_IPV4_GROUP, MDNS_IPV6_GROUP, MDNS_PORT},
+  selfsend::RxEvidence,
   try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
 use mio::{Interest, Registry, Token, net::UdpSocket};
@@ -110,74 +111,48 @@ pub(crate) const MAX_RECV_ERRORS_PER_ROUND: u32 = 4;
 pub(crate) static BIND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Which of the two sockets an operation applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Family {
-  V4,
-  V6,
-}
+///
+/// `hick-udp`'s type rather than one of this crate's own, because the self-send
+/// tracker it keys credits on lives there too — one definition, so a credit
+/// recorded on this crate's IPv4 and one claimed on the tracker's cannot drift
+/// apart. [`Family::index`] fixes the per-family array order, and it matches
+/// [`mdns_proto::TransmitDelivery`]'s own so a driver-side array and a confirm
+/// can never be indexed differently.
+pub(crate) use hick_udp::Family;
 
-impl Family {
-  /// The family a destination address belongs to.
-  const fn of(dst: SocketAddr) -> Self {
-    match dst {
-      SocketAddr::V4(_) => Self::V4,
-      SocketAddr::V6(_) => Self::V6,
-    }
-  }
-
-  /// `via_v4` in the shape `recv` and the trace fields want.
-  pub(crate) const fn is_v4(self) -> bool {
-    matches!(self, Self::V4)
-  }
-
-  /// This family's index in every per-family array, matching
-  /// [`mdns_proto::TransmitDelivery`]'s own ordering so a driver-side array and
-  /// a confirm can never be indexed differently.
-  pub(crate) const fn index(self) -> usize {
-    match self {
-      Self::V4 => 0,
-      Self::V6 => 1,
-    }
-  }
-
-  /// The family this one is not.
-  const fn other(self) -> Self {
-    match self {
-      Self::V4 => Self::V6,
-      Self::V6 => Self::V4,
-    }
-  }
-
-  /// The largest UDP payload this family can **ever** carry, and therefore the
-  /// only sound proof that a refused datagram can never be sent. See
-  /// [`SendOutcome::TooLarge`] for why an errno is not one.
-  ///
-  /// Both numbers fall out of the wire formats and neither is a tunable:
-  ///
-  /// * IPv4 — a 16-bit total-length field caps the whole datagram at 65 535
-  ///   bytes, of which a minimal IPv4 header takes 20 and the UDP header 8:
-  ///   **65 507**. Options make the real ceiling lower, never higher.
-  /// * IPv6 — the 16-bit payload-length field caps everything after the fixed
-  ///   header at 65 535, of which the UDP header takes 8: **65 527**. Extension
-  ///   headers count against that payload length, so the real ceiling is again
-  ///   only ever lower.
-  ///
-  /// Both are therefore upper bounds that a host may not reach and can never
-  /// exceed, which is the direction that matters: a datagram *below* the bound
-  /// may still be refused for a reason that clears — a path MTU with DF set, on
-  /// Linux, reports the very same `EMSGSIZE` — and is classified transient, while
-  /// one above it is impossible on any route, at any MTU, forever.
-  ///
-  /// RFC 2675 IPv6 jumbograms are deliberately not modelled. They need a
-  /// hop-by-hop option and a jumbo-capable path end to end, an mDNS message is
-  /// six orders of magnitude smaller than the threshold, and reading the bound
-  /// too low is the expensive direction — it would retire a producer whose
-  /// datagram the kernel would have accepted.
-  pub(crate) const fn max_udp_payload(self) -> usize {
-    match self {
-      Self::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
-      Self::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
-    }
+/// The largest UDP payload `family` can **ever** carry, and therefore the only
+/// sound proof that a refused datagram can never be sent. See
+/// [`SendOutcome::TooLarge`] for why an errno is not one.
+///
+/// Both numbers fall out of the wire formats and neither is a tunable:
+///
+/// * IPv4 — a 16-bit total-length field caps the whole datagram at 65 535
+///   bytes, of which a minimal IPv4 header takes 20 and the UDP header 8:
+///   **65 507**. Options make the real ceiling lower, never higher.
+/// * IPv6 — the 16-bit payload-length field caps everything after the fixed
+///   header at 65 535, of which the UDP header takes 8: **65 527**. Extension
+///   headers count against that payload length, so the real ceiling is again
+///   only ever lower.
+///
+/// Both are therefore upper bounds that a host may not reach and can never
+/// exceed, which is the direction that matters: a datagram *below* the bound
+/// may still be refused for a reason that clears — a path MTU with DF set, on
+/// Linux, reports the very same `EMSGSIZE` — and is classified transient, while
+/// one above it is impossible on any route, at any MTU, forever.
+///
+/// RFC 2675 IPv6 jumbograms are deliberately not modelled. They need a
+/// hop-by-hop option and a jumbo-capable path end to end, an mDNS message is
+/// six orders of magnitude smaller than the threshold, and reading the bound
+/// too low is the expensive direction — it would retire a producer whose
+/// datagram the kernel would have accepted.
+///
+/// A free function rather than a method: [`Family`] is `hick-udp`'s type, and
+/// this ceiling is `mdns-proto`'s constant, which that crate deliberately does
+/// not depend on.
+pub(crate) const fn max_udp_payload(family: Family) -> usize {
+  match family {
+    Family::V4 => mdns_proto::constants::MAX_UDP_PAYLOAD_V4,
+    Family::V6 => mdns_proto::constants::MAX_UDP_PAYLOAD_V6,
   }
 }
 
@@ -271,21 +246,21 @@ pub(crate) enum SendOutcome {
   /// `SendAttempt::Answered` carries the same three for the same reasons.
   ///
   /// There is a **fourth** use of a monotonic instant in the credit's lifetime —
-  /// the [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) ageing — and it is
+  /// the [`SELF_SEND_TTL`](hick_udp::selfsend::SELF_SEND_TTL) ageing — and it is
   /// deliberately not a fourth read here, nor a second consumer of `wire_at`. No
   /// instant belonging to the send can anchor it: the driver's receive stage has
   /// already run by the time any of these are taken, so the credit is unclaimable
   /// for the rest of its own tick and every such instant charges claim-free time
   /// to the window. It is anchored instead at the top of the following tick, on
   /// the same monotonic clock and in the same late-safe direction, by
-  /// [`SelfSendTracker::seal`](crate::selfsend::SelfSendTracker::seal).
+  /// [`SelfSendTracker::seal`](hick_udp::selfsend::SelfSendTracker::seal).
   ///
   /// **`submitted_wall` and `submitted_at` are read on consecutive statements,
   /// and that adjacency is load-bearing.** Together they are one reading of both
   /// clocks at one instant, which is what lets the self-send credit tell real
   /// elapsed time from a wall clock that stepped under it — see
-  /// [`ClockPair`](crate::selfsend::ClockPair) and
-  /// [`WALL_STEP_TOLERANCE`](crate::selfsend::WALL_STEP_TOLERANCE). A stall
+  /// [`ClockPair`](hick_udp::selfsend::ClockPair) and
+  /// [`WALL_STEP_TOLERANCE`](hick_udp::selfsend::WALL_STEP_TOLERANCE). A stall
   /// inserted between the two reads is charged to the credit as skew, so nothing
   /// may come between them.
   ///
@@ -303,7 +278,7 @@ pub(crate) enum SendOutcome {
     /// processes its own probe or announcement as peer traffic.
     ///
     /// It is **not** how the credit ages.
-    /// [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) runs off the tick-top
+    /// [`SELF_SEND_TTL`](hick_udp::selfsend::SELF_SEND_TTL) runs off the tick-top
     /// instant instead, precisely because the gap between this read and the
     /// syscall is unbounded — a preemption, a page fault, or the `EINTR` retry
     /// all widen it — and charging that gap to the credit's life is what expires
@@ -379,7 +354,7 @@ pub(crate) enum SendOutcome {
   /// [`SendOutcome::NoSocket`], which exists precisely so the two can differ.
   Failed,
   /// A bound socket refused the datagram, and its body is past
-  /// [`Family::max_udp_payload`] — the hard limit UDP on this family can ever
+  /// [`max_udp_payload`] — the hard limit UDP on this family can ever
   /// carry.
   ///
   /// A non-delivery like [`SendOutcome::Failed`] in every respect the wire cares
@@ -409,7 +384,7 @@ pub(crate) enum SendOutcome {
   /// process ends — the defect this variant was introduced to close, quietly
   /// restored on every platform the table missed.
   ///
-  /// So the question asked is `body.len() > family.max_udp_payload()`: exact,
+  /// So the question asked is `body.len() > max_udp_payload(family)`: exact,
   /// platform-independent, and a property of the datagram rather than of the
   /// moment. The kernel's refusal is still required — it is what proves these
   /// bytes did not go out, and a host that somehow accepted them has manifestly
@@ -455,15 +430,15 @@ impl SendOutcome {
   ///
   /// Both, never just the wall one. The wall stamp alone cannot say whether it
   /// is still on the timeline the echo's kernel receive stamp will be taken on —
-  /// see [`ClockPair`](crate::selfsend::ClockPair) — and neither is an age. See
+  /// see [`ClockPair`](hick_udp::selfsend::ClockPair) — and neither is an age. See
   /// [`SendOutcome::Sent`].
-  pub(crate) const fn credit_stamp(self) -> Option<crate::selfsend::ClockPair> {
+  pub(crate) const fn credit_stamp(self) -> Option<hick_udp::selfsend::ClockPair> {
     match self {
       Self::Sent {
         submitted_wall,
         submitted_at,
         ..
-      } => Some(crate::selfsend::ClockPair::new(
+      } => Some(hick_udp::selfsend::ClockPair::new(
         submitted_wall,
         submitted_at,
       )),
@@ -675,7 +650,7 @@ struct BoundSocket {
   /// It stands in for the one thing no test can ask a real host for: the drain
   /// thread losing the CPU between the tick's `SelfSendTracker::seal` and the
   /// read whose claim is weighed against it. That stretch is post-opportunity
-  /// time, which [`SELF_SEND_TTL`](crate::selfsend::SELF_SEND_TTL) requires be
+  /// time, which [`SELF_SEND_TTL`](hick_udp::selfsend::SELF_SEND_TTL) requires be
   /// charged in full — and a claim that ignores it is exactly what pushes the
   /// false-suppression window past its bound.
   #[cfg(test)]
@@ -690,7 +665,7 @@ struct BoundSocket {
   /// eventually writes the family off — is unreachable in a test without it.
   #[cfg(test)]
   forced_send_wouldblock: bool,
-  /// Stand in for this family's [`Family::max_udp_payload`], so an ordinary
+  /// Stand in for this family's [`max_udp_payload`], so an ordinary
   /// datagram a live producer emits is genuinely oversize for it.
   ///
   /// The real condition IS reproducible — a 70 000-byte payload, which
@@ -901,14 +876,14 @@ impl BoundSocket {
   }
 
   /// The largest body this family will accept, which is
-  /// [`Family::max_udp_payload`] unless a test has lowered it. See
+  /// [`max_udp_payload`] unless a test has lowered it. See
   /// [`BoundSocket::forced_payload_ceiling`].
   fn payload_ceiling(&self, family: Family) -> usize {
     #[cfg(test)]
     if let Some(ceiling) = self.forced_payload_ceiling {
       return ceiling;
     }
-    family.max_udp_payload()
+    max_udp_payload(family)
   }
 
   /// One `send_to` attempt: its own pre-syscall clock reads, the syscall, and —
@@ -1073,7 +1048,7 @@ pub(crate) struct Sockets {
   /// Report every received datagram as carrying no kernel receive timestamp,
   /// overriding the cmsg metadata. See [`Sockets::rx_time`].
   ///
-  /// [`MatchMode::Degraded`](crate::selfsend::MatchMode::Degraded) is the whole
+  /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded) is the whole
   /// of the self-send match on Windows and on any Unix kernel that delivers no
   /// timestamp cmsg — and every Unix host a test runs on does deliver one, so
   /// without this the degraded arm of the drain's claim is unreachable from a
@@ -1240,21 +1215,24 @@ impl Sockets {
     meta.peer()
   }
 
-  /// The kernel receive timestamp a datagram carried, as the self-send match
-  /// must read it — `None` when the platform delivered no timestamp cmsg, which
-  /// is what degrades that match to
-  /// [`MatchMode::Degraded`](crate::selfsend::MatchMode::Degraded).
+  /// The ordering evidence a datagram carried, as the self-send match must read
+  /// it — no timestamp cmsg means
+  /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded).
   ///
-  /// Production reads it straight off the cmsg metadata; the `#[cfg(test)]`
-  /// override is the only way to present the timestamp-less datagram a Windows
-  /// host hands the drain on every single receive. See
+  /// Taken from the [`RecvMeta`] rather than from a `SystemTime` this crate
+  /// passes along, so the provenance is structural: `RecvMeta` is minted only by
+  /// `hick-udp`'s own receive path, and this crate has no way to present a
+  /// userspace read time as a kernel stamp even by mistake.
+  ///
+  /// The `#[cfg(test)]` override is the only way to present the timestamp-less
+  /// datagram a Windows host hands the drain on every single receive. See
   /// [`Sockets::forced_no_rx_time`].
-  pub(crate) fn rx_time(&self, meta: &RecvMeta) -> Option<SystemTime> {
+  pub(crate) fn rx_evidence(&self, meta: &RecvMeta) -> RxEvidence {
     #[cfg(test)]
     if self.forced_no_rx_time {
-      return None;
+      return RxEvidence::none();
     }
-    meta.rx_time()
+    RxEvidence::from_meta(meta)
   }
 
   /// The interface both sockets are scoped to. The RFC 6762 §11 fallback needs

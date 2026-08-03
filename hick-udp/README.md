@@ -101,6 +101,7 @@ hick-udp = "0.5"
 | `tracing` | Emit `tracing` warn events on socket bind or multicast-join failures. |
 | `stats` | Enable `hick-trace` stats counters (forwarded from the driver layer; `no_std`-safe). |
 | `metrics` | Bridge stats counters to the [`metrics`] facade. Implies `stats`. |
+| `test-support` | Expose the self-send tracker's clock seams so a *dependent* crate's tests can place a claim or a loop top without sleeping to it. Belongs in `dev-dependencies`; a shipped build must not enable it, or a caller could hand the tracker a clock reading taken somewhere other than the decision it feeds. |
 
 ## Observability
 

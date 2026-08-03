@@ -8,6 +8,8 @@
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::SystemTime;
 
+use hick_udp::selfsend::RxEvidence;
+
 #[cfg(test)]
 mod tests;
 
@@ -89,6 +91,36 @@ impl RecvMeta {
   #[inline(always)]
   pub(crate) const fn kernel_rx_time(&self) -> Option<SystemTime> {
     self.kernel_rx_time
+  }
+
+  /// This datagram's ordering evidence for the self-send match.
+  ///
+  /// # Why this driver asserts rather than proves it
+  ///
+  /// The strong form is [`RxEvidence::from_meta`], which reads the stamp out of a
+  /// `hick_udp::RecvMeta` — a type `hick-udp` alone can mint, off its own
+  /// `recvmsg`. This driver is completion-based: it submits its own `recv_msg`
+  /// and walks the returned control buffer itself (see the cmsg decoder in
+  /// `socket::unix`), so there is no `hick_udp::RecvMeta` anywhere on its receive
+  /// path and nothing for that constructor to read.
+  ///
+  /// So the obligation is discharged HERE, at the single point where this crate's
+  /// own cmsg decoding meets the tracker, and it is an obligation `hick-udp`
+  /// cannot check: [`Self::kernel_rx_time`] must only ever hold a value the
+  /// KERNEL wrote into `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS`. It is populated in
+  /// exactly one place, by that decoder, and is never defaulted to a userspace
+  /// reading — a datagram whose cmsg carried no timestamp keeps `None` and
+  /// degrades the match, which is the correct and safe answer.
+  ///
+  /// Substituting a read time here would not lose a byte: a read time is
+  /// at-or-after our send in every case, so the ordering test could never reject
+  /// on it and the claim would run at `Ordered` strength on `Degraded` evidence,
+  /// re-opening the credit-theft window that ordering exists to close.
+  pub(crate) const fn rx_evidence(&self) -> RxEvidence {
+    match self.kernel_rx_time {
+      Some(rx) => RxEvidence::from_caller_parsed_cmsg(rx),
+      None => RxEvidence::none(),
+    }
   }
 
   /// True when the datagram exceeded the socket's configured

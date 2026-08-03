@@ -5,7 +5,6 @@
 
 pub(crate) mod driver;
 pub(crate) mod onlink;
-pub(crate) mod selfsend;
 pub(crate) mod socket;
 
 pub mod discovery;

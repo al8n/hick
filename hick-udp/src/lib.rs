@@ -20,14 +20,18 @@ pub mod constants;
 /// Error types.
 pub mod error;
 
+mod family;
+
 pub use error::{
   AddressInUseDetail, BindError, BufferTooShortDetail, InterfaceNotFoundDetail, JoinError,
   MulticastHopsNotAppliedDetail, ParseRecvMetaError,
 };
+pub use family::Family;
 
 /// Multicast socket configuration + cmsg parsing.
 pub mod multicast;
 mod platform;
+pub mod selfsend;
 /// Sync convenience wrappers.
 pub mod sync;
 

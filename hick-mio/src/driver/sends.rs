@@ -52,12 +52,10 @@ use std::{
   time::{Duration, Instant as StdInstant},
 };
 
+use hick_udp::selfsend::SelfSendTracker;
 use mdns_proto::FamilyAttempt;
 
-use crate::{
-  selfsend::SelfSendTracker,
-  socket::{Family, FamilyAdmission, SendOutcome, SendReport, Sockets},
-};
+use crate::socket::{Family, FamilyAdmission, SendOutcome, SendReport, Sockets};
 
 /// Consecutive non-deliveries on one family before this driver calls that family
 /// **degraded**.
