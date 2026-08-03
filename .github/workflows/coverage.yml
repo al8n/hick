@@ -67,7 +67,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (Cobertura)
@@ -110,7 +110,7 @@ jobs:
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (Cobertura)
