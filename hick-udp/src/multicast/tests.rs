@@ -1,5 +1,11 @@
 use super::*;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::Ipv4Addr;
+// Only the `parse_pktinfo_v4` tests build a peer address or compare a
+// `RecvMeta` address, and every one of them is `has_ip_pktinfo`-gated. Left
+// unconditional, these three warn on each target without that cfg — all four
+// BSDs — and so fail any job that compiles this file under `-D warnings`.
+#[cfg(has_ip_pktinfo)]
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 
 /// The Linux/Apple 12-byte `struct in_pktinfo`: `ipi_ifindex`, `ipi_spec_dst`,
 /// `ipi_addr`. Also fed to the NetBSD parser, whose own `in_pktinfo` is a
@@ -130,8 +136,8 @@ fn cmsg_stride(data_len: usize) -> usize {
 /// looks for it.
 ///
 /// The buffer is read back through `CmsgIter` before being returned. These
-/// synthesized buffers are the only evidence the BSD parsers have — CI
-/// cross-compiles those targets and executes nothing on them — so the builder
+/// synthesized buffers are the only layout evidence the BSD parsers have on
+/// every target but FreeBSD, which CI now runs natively — so the builder
 /// checks its own product instead of trusting its arithmetic: a target whose
 /// header padding or stride differed from what was assumed here fails at the
 /// build, in every test at once, rather than quietly handing the parsers
@@ -749,25 +755,27 @@ fn try_bind_v6_rejects_a_mismatch_forced_through_production_wiring() {
 // BSD IPv4 receive metadata.
 //
 // These tests prove the PARSE and nothing else. They feed synthesized cmsg
-// buffers to the decoders and walkers, so they run on any host — which is the
-// only reason coverage exists for these targets at all, since CI cross-COMPILES
-// FreeBSD/DragonFly/OpenBSD/NetBSD and runs nothing there. What they do NOT
-// prove is the PLUMBING: that the enabling sockopt is accepted, that the kernel
-// actually attaches these cmsgs to a real mDNS datagram, that the interface
-// index it reports matches `if_nametoindex`, or that the 256-byte control
-// buffer still escapes `MSG_CTRUNC` with them present. That evidence can only
-// come from a real host of each target, and until it does the parsers stay
-// unwired — see `build.rs` for the full list.
+// buffers to the decoders and walkers, so they run on any host — which is what
+// gives DragonFly, OpenBSD and NetBSD any coverage at all, since CI only
+// cross-COMPILES those three and runs nothing on them. What they do NOT prove,
+// on any host, is the PLUMBING: that the enabling sockopt is accepted, that the
+// kernel actually attaches these cmsgs to a real mDNS datagram, that the
+// interface index it reports matches `if_nametoindex`, or that the 256-byte
+// control buffer still escapes `MSG_CTRUNC` with them present. That evidence
+// can only come from a real host of each target, and until it does the parsers
+// stay unwired — see `build.rs` for the full list.
 //
-// Nor do they prove the parse ON a BSD. `synth_cmsg` now frames every buffer
-// from the compiled target's own `CMSG_LEN`/`CMSG_SPACE`, so cross-compiling
-// this test binary for a BSD type-checks the layout against that target's real
-// ABI constants; but these assertions run on the host that runs `cargo test`,
-// so what they execute is the host's cmsg ABI, with the per-target cmsg NUMBERS
-// supplied as parameters. Read them as "the decoders and the walk are correct
-// given the layout", not as "the layout is confirmed on FreeBSD". Only a run on
-// each target turns this into activation evidence, which is the same bar
-// `build.rs` sets for the flip.
+// Where they run decides what the parse itself is worth. `synth_cmsg` frames
+// every buffer from the compiled target's own `CMSG_LEN`/`CMSG_SPACE`, so
+// cross-compiling this test binary for a BSD type-checks the layout against
+// that target's real ABI constants — but the assertions execute on whatever
+// host runs `cargo test`, with the per-target cmsg NUMBERS supplied as
+// parameters. On FreeBSD they now execute on FreeBSD (ci.yml's `freebsd` job
+// boots a VM), so there the layout is confirmed rather than assumed. On the
+// other three, read them as "the decoders and the walk are correct given the
+// layout", not as "the layout is confirmed on NetBSD". Neither reading is
+// activation evidence: that bar is the four items at `build.rs`'s emit site,
+// and it is about the kernel, not the bytes.
 //
 // The cmsg type numbers are passed in rather than read from `libc` (see
 // `scan_dstaddr_recvif`), so these are the real per-target values: 7 for

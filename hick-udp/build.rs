@@ -103,10 +103,12 @@ fn main() {
   // `hick-mio`'s `arrived_on_bound_interface`). A parse that is silently wrong
   // would then not degrade — it would make the responder deaf on IPv4 while
   // still looking healthy. Unit tests over synthesized cmsg buffers prove the
-  // BYTE LAYOUT; they cannot prove the kernel delivers these cmsgs at all, and
-  // CI only cross-COMPILES these targets. So the parsers ship inert and the
-  // flip is a separate change, per target, once a real host of that target
-  // shows:
+  // BYTE LAYOUT and nothing else; they cannot prove the kernel delivers these
+  // cmsgs at all. CI now runs them on a real FreeBSD (ci.yml's `freebsd` job),
+  // which settles the layout on that one target and leaves every item below
+  // untouched; DragonFly, OpenBSD and NetBSD are still only cross-COMPILED. So
+  // the parsers ship inert and the flip is a separate change, per target, once
+  // a real host of that target shows:
   //   1. the enabling setsockopt (`IP_RECVDSTADDR` + `IP_RECVIF`, or
   //      `IP_RECVPKTINFO`) returns 0 on a wildcard-bound 0.0.0.0:5353 socket
   //      joined to 224.0.0.251;
