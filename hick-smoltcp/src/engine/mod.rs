@@ -1057,13 +1057,12 @@ where
       // on the shared Arc — do NOT bump them here too (double-count).
       #[cfg(feature = "defmt")]
       defmt::trace!("rx {} bytes", len);
-      if onlink::on_link(meta.hop_limit, meta.src.ip(), meta.local, &self.subnets) {
+      if onlink::on_link(meta.src.ip(), meta.local, &self.subnets) {
         self.handle_one(now, meta.src, meta.local, &scratch[..len]);
       } else {
-        // RFC 6762 §11: off-link datagram — a present hop limit other than
-        // 255, or an absent one with neither an mDNS-group destination nor an
-        // on-subnet source. Discard without calling into the proto layer. The
-        // datagram WAS received off the socket, so count packets_rx/bytes_rx
+        // RFC 6762 §11: off-link datagram — neither an mDNS-group destination
+        // nor an on-subnet source. Discard without calling into the proto layer.
+        // The datagram WAS received off the socket, so count packets_rx/bytes_rx
         // here (handle() never runs for it) plus the packets_dropped reject —
         // matching the reactor/compio pre-handle drop accounting so receive
         // volume and the drop stay driver-consistent rather than hidden here.
