@@ -4572,3 +4572,66 @@ fn the_seal_predates_the_park_and_the_generation_proves_it() {
     );
   }
 }
+
+/// Only port 5353 may be offered a self-send credit, and a §6.7 legacy query is
+/// the case that tests it.
+///
+/// Both of this endpoint's sockets bind 5353, so that is the source port every
+/// datagram it sends leaves from and the only one a loopback copy can arrive
+/// from. The §11 gate already drops a RESPONSE from any other port, but a legacy
+/// unicast QUERY is deliberately kept — that querier uses an ephemeral port and
+/// is owed a reply. Kept is not ours: in degraded mode nothing orders the claim
+/// against the send, so without the source-port gate this byte-identical query
+/// takes the credit and is reported as our own echo. The querier's reply is then
+/// never sent, and the genuine echo behind it finds no credit and reaches the
+/// protocol layer as peer traffic — the credit spent on the wrong datagram, and
+/// both datagrams misclassified.
+#[test]
+fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
+  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+  use crate::socket::RecvMeta;
+
+  let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+  s.local_subnets = vec![(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8)];
+  s.bound_interface = 1;
+
+  // QR=0, so the §11 untrusted-response gate does not fire and the datagram
+  // genuinely reaches the self-send match.
+  let body = vec![0u8; 12];
+  let sent = ClockPair::now();
+  s.selfsend.record(Family::V4, &body, sent);
+  s.selfsend.seal_at(sent.mono);
+  #[cfg(debug_assertions)]
+  s.note_park_entry();
+  assert_eq!(s.selfsend.len(), 1, "one credit is outstanding");
+
+  // Degraded: no kernel receive stamp, so nothing orders this claim against the
+  // send and content plus family plus the TTL is the whole of the match.
+  let from = |port: u16| {
+    RecvMeta::new(
+      SocketAddr::from(([127, 0, 0, 1], port)),
+      IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+      1,
+      Some(255),
+      None,
+      body.len(),
+    )
+  };
+  s.handle_datagram(Family::V4, &from(40000), &body);
+  assert_eq!(
+    s.selfsend.len(),
+    1,
+    "a datagram from a port this endpoint never sends from cannot be its own \
+     echo, so it must not be offered the credit at all"
+  );
+
+  // And the credit is still there for the datagram it belongs to: the same bytes
+  // arriving from 5353 are our echo and claim it.
+  s.handle_datagram(Family::V4, &from(5353), &body);
+  assert!(
+    s.selfsend.is_empty(),
+    "the genuine echo, from 5353, still finds the credit the legacy query was \
+     refused"
+  );
+}

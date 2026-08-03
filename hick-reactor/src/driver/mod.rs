@@ -422,6 +422,25 @@ impl<N: Net> DriverState<N> {
     })
   }
 
+  /// Close this iteration's records: open their claim window, and drop any park
+  /// capture.
+  ///
+  /// The two belong together and this is why they are one call rather than two
+  /// statements a test could reproduce differently from the loop. Any capture
+  /// still held describes a park that happened BEFORE this seal, so it can no
+  /// longer describe the next receive — and the next receive may well not be a
+  /// park return at all: when a drain reports more work pending, `driver_task`
+  /// `continue`s straight back to the packet pump without parking. Keeping the
+  /// stale capture there would weigh that backlog receive against a park it never
+  /// entered and fail on correct sealing.
+  fn seal_after_records(&mut self) {
+    self.selfsend.seal();
+    #[cfg(debug_assertions)]
+    {
+      self.sealed_generation_at_park = None;
+    }
+  }
+
   /// The park entry: check that the seal this iteration relies on has already
   /// happened, and record WHICH seal it was so [`Self::handle_packet`] can prove
   /// it predated the park.
@@ -566,7 +585,23 @@ impl<N: Net> DriverState<N> {
     // decision, because everything between this datagram's arrival and this line
     // — both admission gates above, the packet-pump backlog, and whatever the
     // scheduler does among them — is elapsed time the credit must be charged.
-    let caller_is_self = self.selfsend.take(pkt.family, &pkt.data, pkt.rx);
+    // **Only port 5353 may be offered a credit**, and that is this driver's half
+    // of `SelfSendTracker::take`'s contract rather than a local nicety. Both of
+    // this endpoint's sockets bind 5353, so every datagram it sends leaves from
+    // that port and every loopback copy arrives from it — a different source port
+    // is proof the datagram is not our echo, and it is proof the tracker cannot
+    // reach for itself, since it never sees where a datagram came from.
+    //
+    // The §11 gate above drops a RESPONSE from any other port, but a §6.7 legacy
+    // unicast QUERY is deliberately kept — such a querier uses an ephemeral port
+    // and is owed a reply. Kept is not ours: in degraded mode nothing orders a
+    // claim against the send, so a byte-identical legacy query would take the
+    // credit of a query we had just multicast and be reported as our own echo.
+    // The reply that querier is owed would never be sent, and the genuine echo
+    // behind it would find no credit and reach the protocol layer as peer
+    // traffic. The `&&` short-circuits, so such a datagram is never offered one.
+    let caller_is_self = pkt.src.port() == hick_udp::constants::MDNS_PORT
+      && self.selfsend.take(pkt.family, &pkt.data, pkt.rx);
 
     // proto `now` is monotonic; process time is fine for cache TTL /
     // scheduling (the self-loopback ordering used the SystemTime rx stamp
@@ -2737,15 +2772,7 @@ async fn driver_task<N: Net>(
     // It deliberately takes no instant: the anchor is read inside the call, after
     // the expiry sweep that precedes it, so a long sweep cannot hand a
     // just-opened window an anchor from before it.
-    state.selfsend.seal();
-    // Any park capture now refers to a park that happened BEFORE this seal, so it
-    // can no longer describe the next receive. Dropping it here is what keeps the
-    // `more_pending` path — seal, then `continue` straight back to the packet
-    // pump without parking — from being weighed against a park it never entered.
-    #[cfg(debug_assertions)]
-    {
-      state.sealed_generation_at_park = None;
-    }
+    state.seal_after_records();
 
     // if drain_transmits stopped at its per-tick budget,
     // don't sleep — loop back immediately so the packet pump can

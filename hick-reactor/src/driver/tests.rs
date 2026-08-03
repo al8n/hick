@@ -4191,14 +4191,15 @@ async fn the_seal_predates_the_park_and_the_generation_proves_it() {
 /// When a drain reports work still pending, `driver_task` does NOT park: it
 /// drains a bounded batch of commands and `continue`s straight back to the packet
 /// pump, so the next datagram it handles arrives with no park behind it. The seal
-/// that ran on the way there legitimately advanced the generation, and there is
-/// no park entry between it and that receive — so a generation comparison made
-/// unconditionally would compare against a park one or more iterations old and
-/// panic on correct sealing, killing the driver task on an ordinary backlog.
+/// on the way there legitimately advanced the generation, and the capture still
+/// held describes a park one or more iterations old — so comparing against it
+/// panics on correct sealing and kills the driver task on an ordinary backlog.
 ///
-/// This walks the production sequence with the production drains — pump, drains,
-/// `seal`, no park entry, pump again — rather than announcing the boundary by
-/// hand, which is exactly why it catches what a hand-called park entry cannot.
+/// Everything the loop does at that boundary is `DriverState::seal_after_records`,
+/// and this test calls that same method rather than restating what it should do.
+/// Delete the clear inside it and this test fails, because production and the
+/// test execute one body: the earlier version of this test assigned the capture
+/// by hand and survived exactly that deletion.
 #[cfg(feature = "tokio")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_receive_reached_without_parking_is_not_weighed_against_a_stale_park() {
@@ -4209,37 +4210,45 @@ async fn a_receive_reached_without_parking_is_not_weighed_against_a_stale_park()
     TestSocket::new(SendBehaviour::Accepts),
     TestSocket::new(SendBehaviour::Accepts),
   );
-  let now = StdInstant::now();
-  let mut r = mdns_proto::ServiceRecords::new(
-    mdns_proto::Name::try_from_str("_ipp._tcp.local.").unwrap(),
-    mdns_proto::Name::try_from_str("svc._ipp._tcp.local.").unwrap(),
-    mdns_proto::Name::try_from_str("host.local.").unwrap(),
-    631,
-    120,
-  );
-  r.add_a(Ipv4Addr::new(192, 168, 1, 10));
-  let _reg = state
-    .register_service(mdns_proto::ServiceSpec::new(r), now)
-    .unwrap();
+  let mut scratch = vec![0u8; 4096];
 
-  let mut scratch = vec![0u8; 1500];
+  // Enough services that one pass cannot serve them all: `more_pending` is what
+  // sends the loop down the no-park path, so the test has to earn it rather than
+  // assume it. Each fan-out charges two credits against
+  // `MAX_SEND_CREDITS_PER_DRAIN`.
+  //
+  // The registrations are KEPT: dropping one closes its doorbell and the drain
+  // skips it as orphaned, so a discarded handle means nothing is ever sent and
+  // the pass below would be vacuous.
+  let _regs: Vec<_> = (0..64u16)
+    .map(|i| {
+      state
+        .register_service(delivery_test_spec(&format!("svc{i}")), StdInstant::now())
+        .expect("register the service under test")
+    })
+    .collect();
 
-  // One whole pass of the real drains, which is what records this iteration's
-  // credits.
-  let _ = drive_one_pass(&mut state, &mut scratch).await;
-  // The loop's own seal, after every record stage.
-  state.selfsend.seal();
-  // And then the `more_pending` branch: a bounded command drain and `continue`.
-  // NO park entry runs on this path, which is the whole point — the capture is
-  // cleared by the seal above and nothing re-establishes it.
+  // A park from an EARLIER iteration, whose capture is the stale value the
+  // backlog receive must not be weighed against.
   #[cfg(debug_assertions)]
-  {
-    state.sealed_generation_at_park = None;
-  }
+  state.note_park_entry();
 
-  // Next iteration's packet pump. A datagram arriving here has no park behind it.
-  // Before this fix the generation comparison ran anyway, against a park that
-  // never happened, and panicked inside the driver task.
+  let (more_pending, _) = drive_one_pass(&mut state, &mut scratch).await;
+  assert!(
+    more_pending,
+    "this test is about the path taken when a drain reports more work; without \
+     that the loop parks and the stale capture is replaced rather than carried"
+  );
+  assert!(
+    state.selfsend.has_unsealed(),
+    "the pass above recorded credits, so there is something for the seal to close"
+  );
+
+  // The loop's own boundary, executed rather than described.
+  state.seal_after_records();
+
+  // `more_pending` is true, so `driver_task` drains commands and `continue`s —
+  // no park entry runs — and the next iteration's packet pump receives this.
   state.handle_packet(Packet {
     src: "192.0.2.9:5353".parse().unwrap(),
     data: vec![0u8; 12],
@@ -4255,5 +4264,78 @@ async fn a_receive_reached_without_parking_is_not_weighed_against_a_stale_park()
   assert!(
     !state.selfsend.has_unsealed(),
     "the seal before the `continue` must leave nothing unsealed, park or no park"
+  );
+}
+
+/// Only port 5353 may be offered a self-send credit, and a §6.7 legacy query is
+/// the case that tests it.
+///
+/// Both of this endpoint's sockets bind 5353, so that is the source port every
+/// datagram it sends leaves from and the only one a loopback copy can arrive
+/// from. The §11 gate already drops a RESPONSE from any other port, but a legacy
+/// unicast QUERY is deliberately kept — that querier uses an ephemeral port and
+/// is owed a reply. Kept is not ours: in degraded mode nothing orders the claim
+/// against the send, so without the source-port gate this byte-identical query
+/// takes the credit and is reported as our own echo. The querier's reply is then
+/// never sent, and the genuine echo behind it finds no credit and reaches the
+/// protocol layer as peer traffic — the credit spent on the wrong datagram, and
+/// both datagrams misclassified.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
+  use std::net::{IpAddr, Ipv4Addr};
+
+  let opts = crate::options::ServerOptions::default();
+  let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+    v4: None,
+    v6: None,
+    interface_index: 0,
+  };
+  let mut state = DriverState::new(&opts, sockets);
+
+  // QR=0, so the §11 untrusted-response gate does not fire and the datagram
+  // genuinely reaches the self-send match.
+  let body = vec![0u8; 12];
+  let sent = ClockPair::now();
+  state.selfsend.record(Family::V4, &body, sent);
+  state.selfsend.seal_at(sent.mono);
+  #[cfg(debug_assertions)]
+  state.note_park_entry();
+  assert_eq!(state.selfsend.len(), 1, "one credit is outstanding");
+
+  // Degraded: no kernel receive stamp, so nothing orders this claim against the
+  // send and content plus family plus the TTL is the whole of the match.
+  let ephemeral = Packet {
+    src: "192.0.2.9:40000".parse().unwrap(),
+    data: body.clone(),
+    family: Family::V4,
+    local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+    interface_index: 0,
+    rx: RxEvidence::none(),
+    hop_limit: Some(255),
+  };
+  state.handle_packet(ephemeral);
+  assert_eq!(
+    state.selfsend.len(),
+    1,
+    "a datagram from a port this endpoint never sends from cannot be its own \
+     echo, so it must not be offered the credit at all"
+  );
+
+  // And the credit is still there for the datagram it belongs to: the same bytes
+  // arriving from 5353 are our echo and claim it.
+  state.handle_packet(Packet {
+    src: "192.0.2.9:5353".parse().unwrap(),
+    data: body,
+    family: Family::V4,
+    local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+    interface_index: 0,
+    rx: RxEvidence::none(),
+    hop_limit: Some(255),
+  });
+  assert!(
+    state.selfsend.is_empty(),
+    "the genuine echo, from 5353, still finds the credit the legacy query was \
+     refused"
   );
 }
