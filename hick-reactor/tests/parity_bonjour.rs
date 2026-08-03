@@ -13,35 +13,57 @@
 //!
 //! ## The premise these tests rest on
 //!
-//! hick binds **one** interface, and a datagram reaches it only if the daemon's
-//! traffic actually crosses that link. Nothing about hick decides whether it
-//! does, so direction 2 settles it up front, before any hick code runs.
+//! hick binds **one** interface, and each direction happens only if that link
+//! carries the traffic *that direction* needs. Nothing about hick decides
+//! whether it does, so each test settles it with a socket of its own — bound
+//! beside the daemon on `:5353` and joined to the mDNS group on one link at a
+//! time — before any hick code runs.
 //!
 //! Asking `dns-sd` is not enough. That `dns-sd -B` can see a `dns-sd -R`
 //! registration says only that both are clients of the same `mDNSResponder`,
 //! talking to it over a local socket; no datagram need ever leave the host. It
 //! establishes which interfaces the daemon *claims*, which is a weaker fact than
-//! the one the test needs — a virtual NIC can carry the claim and not the
+//! the one the tests need — a virtual NIC can carry the claim and not the
 //! traffic.
 //!
-//! So the claim only narrows the candidates. A socket of our own then settles
-//! each in turn: bound beside the daemon on `:5353`, joined to the mDNS group on
-//! that one link, it asks the group for the registered service and waits for the
-//! answer to come back. Whichever link answers is the one hick is pinned to.
-//! Once that round trip is proven, a missed announcement is hick's and the test
-//! fails.
+//! **Direction 2** needs the daemon's announcement to reach hick, so its control
+//! asks the group for the registered service and waits for the answer to come
+//! back. Whichever link answers is the one hick is pinned to.
+//!
+//! **Direction 1 needs the opposite half, and cannot borrow that round trip.**
+//! A round trip that succeeds does prove direction 1's half — it is a superset —
+//! but one that fails does not deny it: the answer may simply not have come back
+//! *to us*, while hick's announcement travels the other way and `dns-sd -B`
+//! learns of it from the daemon over local IPC, with no multicast in the path at
+//! all. Where the daemon puts its own registration is likewise a fact about what
+//! it advertises, not what it accepts. So direction 1's control stops asking and
+//! starts answering: it announces an instance of its own on the candidate link
+//! and requires `dns-sd -B` to report it. That is hick's chain end to end,
+//! walked by something that is not hick, and it is the only evidence that may
+//! end direction 1 green without an assertion.
 //!
 //! ## Ending green without asserting
 //!
 //! A `return` from a test function is a pass, so every early exit is a claim
-//! that nothing was wrong. Direction 2 therefore has exactly **one** place that
-//! can end successfully without running its assertion, and it takes a
-//! [`HostCondition`] — a closed set of facts about the host, each established
-//! before the behaviour runs, each one a reason no datagram could have arrived.
-//! A harness that could not do its job is never one of them: a missing or
-//! failing `dns-sd`, an unreadable pipe, a registration the daemon never
-//! confirmed, or an endpoint hick could not build all fail the test, because
-//! none of them is evidence about this host's topology.
+//! that nothing was wrong. This file therefore has exactly **one** place where a
+//! live test can end successfully without running its assertion —
+//! [`end_on_host_condition`], which both directions funnel through — and the
+//! only thing that reaches it is a [`HostCondition`]: a closed set of facts
+//! about the host, each established before the behaviour runs, each one a reason
+//! no datagram could have crossed. A harness that could not do its job is never
+//! one of them: a missing or failing `dns-sd`, an unreadable pipe, a
+//! registration the daemon never confirmed, or an endpoint hick could not build
+//! all fail the test, because none of them is evidence about this host's
+//! topology.
+//!
+//! ## Not blocking the runtime
+//!
+//! `dns-sd` is driven with blocking child I/O over a window timed by a real
+//! sleep, and hick's driver is a task on the same runtime as the test. A browse
+//! that parks the test's thread parks the driver with it, so hick would neither
+//! finish announcing nor answer the daemon's questions, and the window would
+//! measure a responder that was switched off for all of it. Every such step that
+//! runs while hick is live therefore goes through [`off_thread`].
 
 #![cfg(all(target_os = "macos", feature = "tokio"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -68,12 +90,39 @@ fn parity_enabled() -> bool {
   std::env::var("HICK_PARITY").is_ok()
 }
 
-/// A fact about this host that makes the exchange impossible here, and the only
-/// reason direction 2 may end without running its assertion.
+/// Run one blocking step of the harness without stalling the runtime.
 ///
-/// Every variant is settled before hick browses and describes the host, not the
-/// outcome. The set is closed on purpose: a free-form reason would let the next
-/// unexplained green be written as easily as these four.
+/// A `#[tokio::test]` is a current-thread runtime, so a blocking call in a test
+/// body owns the only thread there is, and hick's driver — a task on that same
+/// runtime — stops being polled for the duration. Handing the step to the
+/// blocking pool lets the caller suspend instead. This is deliberately the fix
+/// rather than a multi-threaded runtime: nothing then depends on there being a
+/// spare worker to steal the driver, and the step is safe from any flavour.
+///
+/// A step that panicked is re-raised where it was awaited, so a broken harness
+/// still fails the test with the message it wrote.
+async fn off_thread<T, F>(step: F) -> T
+where
+  F: FnOnce() -> T + Send + 'static,
+  T: Send + 'static,
+{
+  match tokio::task::spawn_blocking(step).await {
+    Ok(value) => value,
+    Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+    Err(e) => panic!("a blocking step of the parity harness was cancelled: {e}"),
+  }
+}
+
+/// A fact about this host that makes an exchange impossible here, and the only
+/// reason a live direction may end without running its assertion.
+///
+/// Every variant is settled before hick runs at all and describes the host, not
+/// the outcome. They are **not** interchangeable between the two directions. The
+/// tests run the exchange opposite ways, and most of what stops one leaves the
+/// other perfectly viable, so each variant has to be read against the direction
+/// invoking it; [`disproves_hick_to_bonjour`] is where that is decided for
+/// direction 1. The set is closed on purpose: a free-form reason would let the
+/// next unexplained green be written as easily as these six.
 enum HostCondition {
   /// No UP, multicast-capable interface carries an IPv4 address.
   NoBindableIpv4Interface,
@@ -89,6 +138,9 @@ enum HostCondition {
   /// Every shared link was tried with a socket of our own, and none of them
   /// carried an mDNS round trip.
   NoLinkCarriesMdns { tried: Vec<u32> },
+  /// A control of our own announced an instance on every link hick could bind,
+  /// and mDNSResponder reported none of them.
+  NoLinkReachesTheDaemon { tried: Vec<u32> },
 }
 
 impl fmt::Display for HostCondition {
@@ -121,6 +173,13 @@ impl fmt::Display for HostCondition {
         "no mDNS round trip crosses any link Bonjour and hick share ({}): a socket of our own, \
          bound beside the daemon and joined to the group on each in turn, asked the group for the \
          service and heard no answer come back",
+        describe_interfaces(tried)
+      ),
+      Self::NoLinkReachesTheDaemon { tried } => write!(
+        f,
+        "no announcement reaches mDNSResponder over any link hick could bind ({}): a socket of \
+         our own, announcing an instance of its own on each in turn the way a responder does, was \
+         never reported by `dns-sd -B` — so nothing hick announced could be reported either",
         describe_interfaces(tried)
       ),
     }
@@ -378,7 +437,18 @@ fn read_capture(mut reader: impl BufRead) -> Result<Vec<String>, String> {
 /// host. `Err` — the tool missing, quitting on its own at any status, outrunning
 /// the capture budget, or leaving an unreadable pipe — is a fact about the
 /// harness, and the two must never be collapsed.
-fn dns_sd_browse(service_type: &str, secs: u64) -> Result<Vec<String>, String> {
+///
+/// The window is a real sleep and the child I/O is blocking, so the whole run
+/// goes to the blocking pool. Being `async` is what makes that unskippable: a
+/// caller has to await it, and awaiting it yields the runtime to whatever else —
+/// hick's driver above all — has to keep running across the window.
+async fn dns_sd_browse(service_type: &str, secs: u64) -> Result<Vec<String>, String> {
+  let service_type = service_type.to_string();
+  off_thread(move || browse_for(&service_type, secs)).await
+}
+
+/// Drive one `dns-sd -B` run to the end of its window, blocking throughout.
+fn browse_for(service_type: &str, secs: u64) -> Result<Vec<String>, String> {
   let mut child = Command::new("dns-sd")
     .args(["-B", service_type, "local."])
     .stdout(Stdio::piped())
@@ -424,8 +494,8 @@ enum Probe {
 }
 
 /// Ask the daemon which links it currently holds `instance` on.
-fn probe_registration(service_type: &str, instance: &str, secs: u64) -> Probe {
-  classify_probe(dns_sd_browse(service_type, secs), instance)
+async fn probe_registration(service_type: &str, instance: &str, secs: u64) -> Probe {
+  classify_probe(dns_sd_browse(service_type, secs).await, instance)
 }
 
 /// Decide what one `dns-sd -B` run established, keeping a failed run apart from
@@ -461,7 +531,7 @@ fn is_registration_under_test(discovered: &str, expected: &str) -> bool {
 ///
 /// Mirrors the rule `ServerOptions` documents for its default picker: the first
 /// UP, multicast-capable, non-loopback interface carrying an IPv4 address, else
-/// the loopback interface. Direction 2 pins the result, so the interface its
+/// the loopback interface. Both directions pin the result, so the interface the
 /// premise names is the one hick provably bound rather than one inferred after
 /// the fact.
 ///
@@ -809,6 +879,18 @@ impl ControlSocket {
   /// Multicast one mDNS question for `service_type` to the group.
   fn ask(&self, link: Link, service_type: &str) -> Result<(), ControlFailure> {
     let query = mdns_ptr_query(&format!("{service_type}.local."));
+    self.send_to_group(link, &query, "could not send its query")
+  }
+
+  /// Multicast one shared-PTR announcement naming `instance` to the group, the
+  /// way a responder announces its own service. A `ttl` of zero is the goodbye.
+  fn announce(&self, link: Link, instance: &str, ttl: u32) -> Result<(), ControlFailure> {
+    let response = mdns_ptr_announcement(&format!("{PARITY_TYPE}.local."), instance, ttl);
+    self.send_to_group(link, &response, "could not announce on the link")
+  }
+
+  /// Multicast `payload` to the mDNS group out of `link`.
+  fn send_to_group(&self, link: Link, payload: &[u8], what: &str) -> Result<(), ControlFailure> {
     let addr = libc::sockaddr_in {
       sin_len: size_of::<libc::sockaddr_in>() as u8,
       sin_family: libc::AF_INET as libc::sa_family_t,
@@ -840,12 +922,12 @@ impl ControlSocket {
       MDNS_GROUP,
       "the control's destination must be the mDNS group"
     );
-    // SAFETY: `query` and `addr` are live for the call and their lengths match.
+    // SAFETY: `payload` and `addr` are live for the call and their lengths match.
     let sent = unsafe {
       libc::sendto(
         self.fd,
-        query.as_ptr().cast(),
-        query.len(),
+        payload.as_ptr().cast(),
+        payload.len(),
         0,
         std::ptr::from_ref(&addr).cast(),
         size_of::<libc::sockaddr_in>() as libc::socklen_t,
@@ -854,7 +936,7 @@ impl ControlSocket {
     if sent < 0 {
       // The send names the link, so the kernel refusing a route through it is
       // the host condition rather than a fault of ours.
-      return Err(link_failure("could not send its query".to_string(), link));
+      return Err(link_failure(what.to_string(), link));
     }
     Ok(())
   }
@@ -987,6 +1069,124 @@ fn witness_round_trip(
   ControlSocket::open(link)?.hears_answer_for(link, PARITY_TYPE, label, budget)
 }
 
+/// How long `dns-sd -B` watches for the control's own announcement.
+const INGRESS_WINDOW_SECS: u64 = 4;
+
+/// Ask, on `link` alone, whether an announcement a third party puts on it
+/// reaches mDNSResponder and is reported to a browse client.
+///
+/// This is direction 1's premise, and nothing weaker will do. The round trip
+/// [`witness_round_trip`] proves is a superset: its *success* would establish
+/// this too, but its *failure* does not deny it. A question of ours that went
+/// out and drew no answer back says this process heard nothing on the way in;
+/// hick's announcement travels the other way, and `dns-sd -B` learns of it from
+/// the daemon over local IPC, where no multicast is involved at all.
+///
+/// So the control stops asking and starts answering. It announces an instance of
+/// its own on this link — a spec-correct unsolicited response, from `:5353` as a
+/// responder must, with the link chosen by `IP_MULTICAST_IF` — and requires
+/// `dns-sd -B` to report it. That is hick's chain end to end, walked by
+/// something that is not hick.
+///
+/// `anchor` is a registration mDNSResponder holds for this process. It makes the
+/// window falsifiable: the daemon reports its own client's registration over IPC
+/// whatever the network does, so a browse that does not even carry the anchor
+/// observed nothing, and reading a dead link out of it would be this harness
+/// mistaking its own blindness for the host's.
+async fn witness_ingress(
+  link: Link,
+  instance: &str,
+  anchor: &str,
+) -> Result<Witness, ControlFailure> {
+  let sock = ControlSocket::open(link)?;
+  let fqdn = format!("{instance}.{PARITY_TYPE}.local.");
+
+  // Two announcements a second apart, as a responder makes (RFC 6762 §8.3),
+  // before the window; more inside it. Either route will do — the daemon can
+  // report the record from its cache when the browse starts, or the moment a
+  // later announcement lands — and taking both leaves no single lost datagram
+  // deciding the witness.
+  sock.announce(link, &fqdn, ANNOUNCE_TTL)?;
+  tokio::time::sleep(Duration::from_secs(1)).await;
+  sock.announce(link, &fqdn, ANNOUNCE_TTL)?;
+
+  let browsing = dns_sd_browse(PARITY_TYPE, INGRESS_WINDOW_SECS);
+  let announcing = async {
+    for _ in 0..2 {
+      tokio::time::sleep(Duration::from_secs(1)).await;
+      sock.announce(link, &fqdn, ANNOUNCE_TTL)?;
+    }
+    Ok::<(), ControlFailure>(())
+  };
+  let (browsed, announced) = tokio::join!(browsing, announcing);
+  announced?;
+  let lines = browsed.map_err(ControlFailure::Harness)?;
+  for l in &lines {
+    eprintln!("dns-sd -B (ingress witness) | {l}");
+  }
+
+  // Withdraw what we announced, so the daemon's cache does not carry a control
+  // instance into the window hick is measured across — nor into the next run of
+  // this binary, which a record left to age out would outlive by two minutes.
+  // Repeated because a goodbye is one unacknowledged datagram, and nothing is
+  // concluded from whether any of them lands: the browse is already read.
+  for _ in 0..3 {
+    let _ = sock.announce(link, &fqdn, 0);
+  }
+
+  if advertised_interfaces(&lines, anchor).is_empty() {
+    return Err(ControlFailure::Harness(format!(
+      "`dns-sd -B` reported no live `Add` for {anchor:?}, a registration mDNSResponder is holding \
+       for this very process: the window observed nothing at all, so it cannot say whether \
+       interface {} carries",
+      describe_interface(link.index)
+    )));
+  }
+  Ok(if advertised_interfaces(&lines, instance).is_empty() {
+    Witness::Unproven
+  } else {
+    Witness::Proved
+  })
+}
+
+/// Whether `condition`, on its own, disproves direction 1's exchange.
+///
+/// Direction 1 asks one thing of this host: that an announcement a process here
+/// puts on a link is received by mDNSResponder, which then reports it to
+/// `dns-sd -B` over local IPC. Two facts bear on that — there being no link to
+/// bind at all, and a control announcement on every candidate going unreported.
+///
+/// The rest belong to direction 2, and every one of them leaves direction 1
+/// viable. A round trip that failed only on the way back says this process heard
+/// nothing, not that the daemon did, and inbound multicast being lost to us does
+/// not stop hick announcing outward. Where the daemon puts its *own*
+/// registration is a statement about what it advertises, not about what it
+/// accepts. One browse the daemon had nothing to say to is neither. Ending
+/// direction 1 green on any of them would hide exactly the regression it exists
+/// to catch.
+fn disproves_hick_to_bonjour(condition: &HostCondition) -> bool {
+  match condition {
+    HostCondition::NoBindableIpv4Interface | HostCondition::NoLinkReachesTheDaemon { .. } => true,
+    HostCondition::DaemonAnsweredNothing
+    | HostCondition::RegistrationLocalOnly { .. }
+    | HostCondition::NoSharedLink { .. }
+    | HostCondition::NoLinkCarriesMdns { .. } => false,
+  }
+}
+
+/// Let through only a condition that disproves direction 1's own exchange.
+///
+/// Direction 1 constructs no other kind, so this is a standing guard rather than
+/// a branch: should one ever reach here, the test has begun reading direction
+/// 2's evidence backwards again, and it must fail rather than end green.
+fn demand_one_way(condition: HostCondition) -> HostCondition {
+  assert!(
+    disproves_hick_to_bonjour(&condition),
+    "direction 1 may not end green on a condition that leaves its exchange viable: {condition}"
+  );
+  condition
+}
+
 fn to_in_addr(addr: Ipv4Addr) -> libc::in_addr {
   libc::in_addr {
     s_addr: u32::from_ne_bytes(addr.octets()),
@@ -1008,6 +1208,16 @@ fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
+/// Write `name` as the wire form of a DNS name: each label length-prefixed,
+/// terminated by the root label.
+fn encode_name(out: &mut Vec<u8>, name: &str) {
+  for label in name.split('.').filter(|l| !l.is_empty()) {
+    out.push(u8::try_from(label.len()).unwrap_or(u8::MAX));
+    out.extend_from_slice(label.as_bytes());
+  }
+  out.push(0); // root label
+}
+
 /// A minimal mDNS query: one PTR question for `name`, asked of the group.
 fn mdns_ptr_query(name: &str) -> Vec<u8> {
   let mut out = vec![
@@ -1016,13 +1226,48 @@ fn mdns_ptr_query(name: &str) -> Vec<u8> {
     0, 1, // one question
     0, 0, 0, 0, 0, 0, // no answer, authority or additional records
   ];
-  for label in name.split('.').filter(|l| !l.is_empty()) {
-    out.push(u8::try_from(label.len()).unwrap_or(u8::MAX));
-    out.extend_from_slice(label.as_bytes());
-  }
-  out.push(0); // root label
+  encode_name(&mut out, name);
   out.extend_from_slice(&[0, 12]); // PTR
   out.extend_from_slice(&[0, 1]); // IN, answer to the group
+  out
+}
+
+/// The TTL a responder gives a shared PTR record (RFC 6762 §10).
+const ANNOUNCE_TTL: u32 = 120;
+
+/// A minimal mDNS announcement: one shared PTR answer pointing `service_type`
+/// at `instance`, sent unsolicited the way a responder announces (RFC 6762 §8.3).
+///
+/// One record is the whole of it, deliberately. `dns-sd -B` reports instances
+/// from PTR records alone, so nothing else is needed, and every further record
+/// is another chance to mis-encode something mDNSResponder would drop the whole
+/// datagram over — a control the daemon threw away would read as a link that
+/// does not carry, which is the one mistake this witness must not make.
+///
+/// A `ttl` of zero is the goodbye that withdraws it (RFC 6762 §10.1).
+fn mdns_ptr_announcement(service_type: &str, instance: &str, ttl: u32) -> Vec<u8> {
+  let mut out = vec![
+    0, 0, // no transaction id, as mDNS asks
+    0x84, 0, // a response, and authoritative: QR=1, AA=1
+    0, 0, // no questions
+    0, 1, // one answer
+    0, 0, 0, 0, // no authority or additional records
+  ];
+  encode_name(&mut out, service_type);
+  out.extend_from_slice(&[0, 12]); // PTR
+  // Class IN with the cache-flush bit clear: a PTR is a shared record, and
+  // claiming it exclusively would ask mDNSResponder to drop every other instance
+  // of this type — including the one hick is about to announce.
+  out.extend_from_slice(&[0, 1]);
+  out.extend_from_slice(&ttl.to_be_bytes());
+  let mut target = Vec::new();
+  encode_name(&mut target, instance);
+  out.extend_from_slice(
+    &u16::try_from(target.len())
+      .unwrap_or(u16::MAX)
+      .to_be_bytes(),
+  );
+  out.extend_from_slice(&target);
   out
 }
 
@@ -1082,6 +1327,17 @@ fn advertised_interfaces(lines: &[String], instance: &str) -> Vec<i32> {
   active
 }
 
+/// The one and only path on which a live test ends green without asserting.
+///
+/// Both directions end here so this stays a single place rather than one per
+/// direction, and so the only thing that can reach it is a [`HostCondition`]:
+/// a fact about this host, settled before hick ran.
+fn end_on_host_condition(outcome: Result<(), HostCondition>) {
+  if let Err(condition) = outcome {
+    eprintln!("skipping: this host cannot carry the exchange — {condition}");
+  }
+}
+
 /// Direction 1: hick advertises a service; Bonjour's `dns-sd -B` must discover
 /// it — i.e. mDNSResponder accepts and parses hick's announcement off the wire.
 #[tokio::test]
@@ -1090,18 +1346,112 @@ async fn hick_advertisement_seen_by_bonjour() {
     eprintln!("HICK_PARITY not set; skipping Bonjour parity test");
     return;
   }
+  end_on_host_condition(hick_to_bonjour_parity().await.map_err(demand_one_way));
+}
+
+/// The live direction-1 exchange.
+///
+/// `Err` is reserved for the host conditions that make *this* exchange
+/// impossible here; everything else panics, so a harness that could not
+/// establish the premise fails the test instead of ending it green.
+async fn hick_to_bonjour_parity() -> Result<(), HostCondition> {
+  // A registration mDNSResponder holds for this very process, live from before
+  // the first browse until after the last. Its job is to make every window
+  // falsifiable: the daemon reports its own client's registration over local IPC
+  // whatever the network does, so a window that does not carry the anchor
+  // observed nothing at all, and neither its silence nor its speech about hick
+  // means a thing.
+  let requested = format!("HickAnchor-{}", std::process::id());
+  let mut anchor = register_via_dns_sd(&requested, 10)
+    .unwrap_or_else(|e| panic!("the parity harness could not register through `dns-sd`: {e}"));
+  if anchor.label != requested {
+    eprintln!(
+      "dns-sd renamed {requested:?} to {:?}; using the registered name",
+      anchor.label
+    );
+  }
+
+  // Settle the premise before hick runs, so it can never be read back out of the
+  // outcome. The question is direction 1's alone — which links carry a datagram
+  // *into* mDNSResponder — so the candidates are every link hick could bind,
+  // narrowed by nothing the daemon says about where it advertises: that is a
+  // statement about egress, and this test does not depend on it.
+  let bindable = hick_ipv4_interfaces()
+    .unwrap_or_else(|e| panic!("the parity harness could not read this host's interfaces: {e}"));
+  if bindable.is_empty() {
+    return Err(HostCondition::NoBindableIpv4Interface);
+  }
+  let mut attempts = Vec::new();
+  for &(index, addr) in &bindable {
+    let link = Link { index, addr };
+    let named = describe_interface(index);
+    // A label per link, so an announcement arriving late from an earlier
+    // candidate can never be read as this one having carried it.
+    let control = format!("HickCtl-{}-{index}", std::process::id());
+    demand_still_holding(&mut anchor);
+    match witness_ingress(link, &control, &anchor.label).await {
+      Ok(Witness::Proved) => {
+        eprintln!("control socket on interface {named} had its announcement reported");
+        attempts.push(Attempt::Proved(index));
+        break;
+      }
+      Ok(Witness::Unproven) => {
+        eprintln!("control socket on interface {named} announced and went unreported");
+        attempts.push(Attempt::Unproven);
+      }
+      // The kernel refused to carry, and the interface is still there to have
+      // refused. Leave the link unproven and give the next candidate its turn.
+      Err(ControlFailure::LinkUnusable {
+        why,
+        policy_ambiguous,
+      }) => {
+        eprintln!("control socket on interface {named} was refused the link: {why}");
+        attempts.push(Attempt::Refused { policy_ambiguous });
+      }
+      Err(ControlFailure::InterfaceChanged(why)) => panic!(
+        "the parity harness cannot conclude anything about interface {named}: the interface \
+         table changed under the candidate list — {why}"
+      ),
+      Err(ControlFailure::Harness(why)) => {
+        panic!("the parity harness could not witness interface {named}: {why}")
+      }
+    }
+  }
+  let tried: Vec<u32> = bindable.iter().map(|(i, _)| *i).collect();
+  let bound = match reduce(&attempts) {
+    Reduction::Bind(index) => index,
+    Reduction::Undecidable => {
+      demand_still_holding(&mut anchor);
+      panic!(
+        "no announcement of ours was reported from any of {}, and at least one link was refused \
+         with an errno macOS also returns when policy denies the selected egress interface: this \
+         run cannot tell a link that will not carry from one this process is not allowed to use",
+        describe_interfaces(&tried)
+      )
+    }
+    Reduction::NoLinkCarries => {
+      demand_still_holding(&mut anchor);
+      return Err(HostCondition::NoLinkReachesTheDaemon { tried });
+    }
+  };
+
   // Distinct label per direction so the two tests never cross-talk via the
   // shared service type, even if mDNSResponder's cache lingers between them.
   let instance = format!("HickAdv-{}", std::process::id());
 
-  let opts = ServerOptions::new().with_ipv6(false);
-  let responder = match tokio_drv::server(opts).await {
-    Ok(ep) => ep,
-    Err(e) => {
-      eprintln!("skipping: endpoint construction failed: {e:?}");
-      return;
-    }
-  };
+  // The premise holds from here on: a socket that is not hick's has just had its
+  // own announcement carried over this link and reported by the daemon, so
+  // nothing below may end this test green quietly.
+  let opts = ServerOptions::new()
+    .with_ipv6(false)
+    .with_interface_index(Some(bound));
+  let responder = tokio_drv::server(opts).await.unwrap_or_else(|e| {
+    panic!(
+      "hick must bind interface {}, the one the control's announcement reached the daemon over: \
+       {e:?}",
+      describe_interface(bound)
+    )
+  });
   let stype = Name::try_from_str(&format!("{PARITY_TYPE}.local.")).unwrap();
   let inst = Name::try_from_str(&format!("{instance}.{PARITY_TYPE}.local.")).unwrap();
   let host = Name::try_from_str(&format!("{instance}.local.")).unwrap();
@@ -1113,31 +1463,42 @@ async fn hick_advertisement_seen_by_bonjour() {
     .await
     .expect("register_service");
 
-  // Let hick probe + announce before Bonjour browses.
+  // Let hick probe and announce before Bonjour browses. Both this wait and the
+  // browse window below must yield: hick's driver runs on this very runtime, and
+  // a blocking wait would keep it from ever getting its announcement out.
   tokio::time::sleep(Duration::from_millis(1500)).await;
 
-  let lines = dns_sd_browse(PARITY_TYPE, 6).unwrap_or_default();
+  let lines = dns_sd_browse(PARITY_TYPE, 6)
+    .await
+    .unwrap_or_else(|e| panic!("the parity harness could not browse with `dns-sd`: {e}"));
   for l in &lines {
     eprintln!("dns-sd -B | {l}");
   }
-  if lines.is_empty() {
-    eprintln!(
-      "dns-sd -B produced no output — no functional mDNS (CI runner blocks \
-       multicast?); skipping live Bonjour parity"
-    );
-    return;
-  }
-  // mDNS names are case-insensitive (RFC 6762 §16) and responders lowercase
-  // them on the wire, so match case-insensitively.
-  let needle = instance.to_ascii_lowercase();
+
+  // The anchor is still live, so mDNSResponder has something of this process's
+  // to report across the window whatever hick did. A window that does not carry
+  // it is therefore not news about this host — it is the browse failing to
+  // observe a registration the daemon holds for one of its own clients — and
+  // nothing about hick may be read out of it either way.
+  demand_still_holding(&mut anchor);
   assert!(
-    lines
-      .iter()
-      .any(|l| l.to_ascii_lowercase().contains(&needle)),
-    "Bonjour (dns-sd -B) is live but did not discover hick's advertised \
-     instance {instance:?} ({} output lines)",
+    !advertised_interfaces(&lines, &anchor.label).is_empty(),
+    "`dns-sd -B` reported no live `Add` for {:?}, a registration mDNSResponder is holding for \
+     this very process; the browse did not observe this host's own advertisements, so nothing it \
+     says — or fails to say — about hick can be read ({} output lines)",
+    anchor.label,
     lines.len()
   );
+  assert!(
+    !advertised_interfaces(&lines, &instance).is_empty(),
+    "mDNSResponder did not report hick's advertised instance {instance:?}, though it reported \
+     {:?} across the same window, and reported a control announcement of ours over interface {} \
+     — the link hick bound — seconds earlier ({} output lines)",
+    anchor.label,
+    describe_interface(bound),
+    lines.len()
+  );
+  Ok(())
 }
 
 /// Direction 2: Bonjour's `dns-sd -R` advertises a service; hick's `browse` must
@@ -1148,10 +1509,7 @@ async fn bonjour_advertisement_seen_by_hick() {
     eprintln!("HICK_PARITY not set; skipping Bonjour parity test");
     return;
   }
-  // The one and only path on which this test ends green without asserting.
-  if let Err(condition) = bonjour_to_hick_parity().await {
-    eprintln!("skipping: this host cannot carry the exchange — {condition}");
-  }
+  end_on_host_condition(bonjour_to_hick_parity().await);
 }
 
 /// The live direction-2 exchange.
@@ -1178,13 +1536,13 @@ async fn bonjour_to_hick_parity() -> Result<(), HostCondition> {
   // work out which link hick will bind. Both are host properties — the daemon's
   // interface table and the picker's input — and both are known while hick is
   // still nothing but a set of options.
-  let probe = match probe_registration(PARITY_TYPE, &instance, 3) {
+  let probe = match probe_registration(PARITY_TYPE, &instance, 3).await {
     // The daemon is answering, yet reports nothing for a registration it
     // accepted seconds ago. Before spending a longer window on it, establish
     // that there is still a registration to find.
     Probe::Seen { ref ours } if ours.is_empty() => {
       demand_still_holding(&mut registration);
-      probe_registration(PARITY_TYPE, &instance, 6)
+      probe_registration(PARITY_TYPE, &instance, 6).await
     }
     settled => settled,
   };
@@ -1669,6 +2027,116 @@ fn a_send_on_one_interface_cannot_vouch_for_a_refusal_on_another() {
     ]),
     Reduction::Bind(7)
   );
+}
+
+#[test]
+fn a_query_of_ours_that_drew_no_answer_cannot_skip_direction_one() {
+  // The shape that used to end direction 1 green: the control's question went
+  // out — the send succeeded, so the link took it — and only the answer failed
+  // to come back. That is silence on the way *in* to this process. Direction 1
+  // never depends on it: hick announces outward, and `dns-sd -B` hears of that
+  // from the daemon over local IPC.
+  assert_eq!(reduce(&[Attempt::Unproven]), Reduction::NoLinkCarries);
+  assert!(!disproves_hick_to_bonjour(
+    &HostCondition::NoLinkCarriesMdns { tried: vec![14] }
+  ));
+}
+
+#[test]
+fn where_the_daemon_advertises_cannot_skip_direction_one() {
+  // These two say where mDNSResponder puts a registration of its own. Direction
+  // 1 asks the opposite question — where it *accepts* — and neither answers it.
+  assert!(!disproves_hick_to_bonjour(
+    &HostCondition::RegistrationLocalOnly {
+      advertised: vec![-1],
+      bound: 14
+    }
+  ));
+  assert!(!disproves_hick_to_bonjour(&HostCondition::NoSharedLink {
+    advertised: vec![14],
+    bindable: vec![1]
+  }));
+  // And one browse the daemon had nothing to say to is a fact about that browse.
+  assert!(!disproves_hick_to_bonjour(
+    &HostCondition::DaemonAnsweredNothing
+  ));
+}
+
+#[test]
+fn only_a_missing_link_or_an_unwitnessed_ingress_skips_direction_one() {
+  assert!(disproves_hick_to_bonjour(
+    &HostCondition::NoBindableIpv4Interface
+  ));
+  assert!(disproves_hick_to_bonjour(
+    &HostCondition::NoLinkReachesTheDaemon { tried: vec![1, 14] }
+  ));
+}
+
+#[test]
+#[should_panic(expected = "may not end green on a condition that leaves its exchange viable")]
+fn direction_one_refuses_a_condition_that_leaves_its_exchange_viable() {
+  demand_one_way(HostCondition::NoLinkCarriesMdns { tried: vec![14] });
+}
+
+/// Where the one answer record starts in an announcement for `service_type`.
+fn answer_offset(service_type: &str) -> usize {
+  let mut name = Vec::new();
+  encode_name(&mut name, service_type);
+  12 + name.len()
+}
+
+#[test]
+fn the_control_announces_as_an_authoritative_response() {
+  let wire = mdns_ptr_announcement(
+    "_hick-parity._tcp.local.",
+    "HickCtl-42._hick-parity._tcp.local.",
+    ANNOUNCE_TTL,
+  );
+  // QR=1 and AA=1, no question, one answer: an unsolicited announcement, which
+  // is the only shape mDNSResponder will take a record from.
+  assert_eq!(&wire[..12], &[0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+}
+
+#[test]
+fn the_control_announces_a_shared_ptr_that_claims_nothing() {
+  let wire = mdns_ptr_announcement(
+    "_hick-parity._tcp.local.",
+    "HickCtl-42._hick-parity._tcp.local.",
+    ANNOUNCE_TTL,
+  );
+  let rr = &wire[answer_offset("_hick-parity._tcp.local.")..];
+  assert_eq!(&rr[..2], &[0, 12], "a PTR record");
+  // Class IN with the top bit of the class clear. A PTR is shared; setting
+  // cache-flush would tell mDNSResponder to drop every other instance of the
+  // type, hick's included, and the witness would be sabotaging its own test.
+  assert_eq!(&rr[2..4], &[0, 1], "class IN, cache-flush bit clear");
+  assert_eq!(
+    u32::from_be_bytes(rr[4..8].try_into().unwrap()),
+    ANNOUNCE_TTL
+  );
+  let mut target = Vec::new();
+  encode_name(&mut target, "HickCtl-42._hick-parity._tcp.local.");
+  let rdlen = usize::from(u16::from_be_bytes(rr[8..10].try_into().unwrap()));
+  assert_eq!(rdlen, target.len());
+  assert_eq!(&rr[10..10 + rdlen], target.as_slice());
+}
+
+#[test]
+fn the_control_withdraws_what_it_announced_with_a_zero_ttl() {
+  let wire = mdns_ptr_announcement(
+    "_hick-parity._tcp.local.",
+    "HickCtl-42._hick-parity._tcp.local.",
+    0,
+  );
+  let rr = &wire[answer_offset("_hick-parity._tcp.local.")..];
+  assert_eq!(u32::from_be_bytes(rr[4..8].try_into().unwrap()), 0);
+}
+
+#[test]
+fn a_name_is_encoded_as_length_prefixed_labels_ending_in_the_root() {
+  let mut out = Vec::new();
+  encode_name(&mut out, "_hick-parity._tcp.local.");
+  assert_eq!(out, b"\x0c_hick-parity\x04_tcp\x05local\x00");
 }
 
 #[test]
