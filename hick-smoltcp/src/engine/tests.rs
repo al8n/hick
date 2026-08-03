@@ -6,7 +6,7 @@ use core::{
 
 use mdns_proto::{Name, ServiceRecords, ServiceSpec, ServiceState};
 use rand::{SeedableRng, rngs::StdRng};
-use smoltcp::time::Instant as RawInstant;
+use smoltcp::{time::Instant as RawInstant, wire::IpAddress};
 
 use super::*;
 use crate::{
@@ -1712,6 +1712,56 @@ fn default_setup_rejects_off_link_unicast() {
     !reacted,
     "off-link unicast must NOT drive a conflict rename when no hop-limit or subnet \
        vouches for it — only link-scoped multicast is trusted by default"
+  );
+}
+
+#[test]
+fn subnets_configured_still_admits_group_destined_off_subnet_source() {
+  // RFC 6762 §11 deems a datagram addressed to the mDNS group on-link
+  // "regardless of source IP address" — that admission ground does not go away
+  // once local subnets ARE configured. The SAME conflict that the default (no
+  // subnets) test above admits must still be admitted here, from a source
+  // outside the one configured subnet.
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(61));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+  for micros in pump_schedule() {
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+    while engine.poll_service_update(handle).is_some() {}
+  }
+
+  // A subnet that does NOT cover the conflicting peer fed below.
+  engine.set_local_subnets(vec![IpCidr::new(IpAddress::v4(10, 0, 0, 0), 24)]);
+
+  let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
+  let mut t = 6_000_000i64;
+  let mut reacted = false;
+  for _ in 0..16 {
+    io.inbound.push_back((
+      conflict.clone(),
+      RecvMeta {
+        // Off-subnet (outside 10.0.0.0/24) but addressed to the mDNS group.
+        src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
+        local: Some(MDNS_SOCKET_V4.ip()),
+        hop_limit: None,
+        len: 0,
+      },
+    ));
+    engine.pump(|| at(t), &mut io, &mut scratch);
+    t += 250_000;
+    while let Some(u) = engine.poll_service_update(handle) {
+      reacted |= matches!(u, ServiceUpdate::Renamed(_) | ServiceUpdate::Conflict);
+    }
+    if reacted {
+      break;
+    }
+  }
+  assert!(
+    reacted,
+    "a group-destined datagram must be admitted on its destination alone once \
+       subnets are configured — the source-subnet check is an ALTERNATIVE §11 \
+       offers only when the destination is NOT the group, not a veto over it"
   );
 }
 

@@ -126,8 +126,12 @@ instead for observability on embedded.
   `try_send`). The family-aware `DualStack` implements it over smoltcp UDP sockets
   (routing each multicast to the socket of its own family); bring your own and the
   engine is transport-agnostic.
-- **RFC 6762 §11 on-link gate** — uses the received hop-limit (`== 255`) when the
-  transport surfaces it, else falls back to a source-subnet membership check.
+- **RFC 6762 §11 on-link gate** — a present hop-limit (`== 255`) is decisive;
+  otherwise a datagram addressed to the mDNS group is admitted outright
+  (arrival at the group is its own §11 admission ground; a peer outside your
+  configured subnets is still on your link if its multicast reached you);
+  otherwise, for a non-group destination, subnet membership decides; otherwise
+  reject.
 - **RFC 6762 §10.1 goodbye** — unregistering an announced service emits a TTL=0
   goodbye, bursted a few times by the pump.
 

@@ -847,15 +847,23 @@ where
     self.stats.snapshot()
   }
 
-  /// Set the device's local subnets — the RFC 6762 §11 on-link heuristic used when
-  /// the transport cannot surface the received hop-limit (neither supplied transport
-  /// can; smoltcp's `UdpMetadata` carries no RX TTL).
+  /// Set the device's local subnets — consulted by the RFC 6762 §11 on-link gate
+  /// when the transport cannot surface the received hop-limit (neither supplied
+  /// transport can; smoltcp's `UdpMetadata` carries no RX TTL). The gate falls
+  /// through in order: a present hop-limit is decisive; otherwise a datagram
+  /// addressed to the mDNS group is admitted outright (arrival at the group is
+  /// its own §11 admission ground; a peer outside your configured subnets is
+  /// still on your link if its multicast reached you); otherwise, for a
+  /// non-group destination, subnet membership decides; otherwise reject.
   ///
-  /// OPTIONAL. With no subnets configured the §11 gate accepts every inbound mDNS
-  /// datagram (the groups are link-scoped multicast routers do not forward, so it is
-  /// on-link by IP design) rather than dropping all of it and going deaf. Configure
-  /// the device's own subnets to additionally REJECT sources outside them — a
-  /// best-effort defence against a same-link host spoofing on-link traffic.
+  /// OPTIONAL. With no subnets AND no received hop limit — true of both
+  /// supplied transports, whose underlying `UdpMetadata` never carries an RX
+  /// TTL — the group and reject steps above still apply: a default node admits
+  /// group-destined mDNS and is not deaf, but not unicast. A caller supplying
+  /// its own [`UdpIo`] whose transport DOES report a hop limit can have a
+  /// conforming (255) unicast datagram admitted regardless of subnets, since
+  /// the hop-limit step above is decisive first. Configure local subnets to
+  /// admit on-subnet unicast when the hop limit is not reported.
   pub fn set_local_subnets(&mut self, subnets: Vec<IpCidr>) {
     self.subnets = subnets;
   }
@@ -1052,8 +1060,9 @@ where
       if onlink::on_link(meta.hop_limit, meta.src.ip(), meta.local, &self.subnets) {
         self.handle_one(now, meta.src, meta.local, &scratch[..len]);
       } else {
-        // RFC 6762 §11: off-link datagram (hop-limit ≠ 255 or src not on a
-        // known subnet). Discard without calling into the proto layer. The
+        // RFC 6762 §11: off-link datagram — a present hop limit other than
+        // 255, or an absent one with neither an mDNS-group destination nor an
+        // on-subnet source. Discard without calling into the proto layer. The
         // datagram WAS received off the socket, so count packets_rx/bytes_rx
         // here (handle() never runs for it) plus the packets_dropped reject —
         // matching the reactor/compio pre-handle drop accounting so receive

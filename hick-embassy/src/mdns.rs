@@ -42,14 +42,22 @@ impl<R: Rng> MdnsState<R> {
     }
   }
 
-  /// Set the device's local subnets — the RFC 6762 §11 on-link heuristic used when
-  /// the transport can't surface the received hop-limit (embassy-net re-exports
-  /// smoltcp's `UdpMetadata`, which carries no RX TTL).
+  /// Set the device's local subnets — consulted by the RFC 6762 §11 on-link gate
+  /// when the transport can't surface the received hop-limit (embassy-net
+  /// re-exports smoltcp's `UdpMetadata`, which carries no RX TTL). The gate
+  /// falls through in order: a present hop-limit is decisive; otherwise a
+  /// datagram addressed to the mDNS group is admitted outright (arrival at the
+  /// group is its own §11 admission ground; a peer outside your configured
+  /// subnets is still on your link if its multicast reached you); otherwise,
+  /// for a non-group destination, subnet membership decides; otherwise reject.
   ///
-  /// OPTIONAL. With no subnets configured the §11 gate accepts every inbound mDNS
-  /// datagram (the groups are link-scoped multicast routers do not forward) rather
-  /// than dropping all of it and going deaf. Configure the device's own subnets to
-  /// additionally REJECT sources outside them.
+  /// OPTIONAL. With no subnets configured, the group and reject steps above
+  /// still apply: a default node admits group-destined mDNS and is not deaf,
+  /// but not unicast — because this driver's `DualUdp` transport always
+  /// constructs `RecvMeta` with `hop_limit: None` (embassy-net's `UdpMetadata`
+  /// does not currently surface a received hop limit), so the hop-limit step
+  /// above never short-circuits ahead of it. Configure the device's own
+  /// subnets to admit on-subnet unicast too.
   pub fn set_local_subnets(&self, subnets: Vec<IpCidr>) {
     self.engine.borrow_mut().set_local_subnets(subnets);
   }
