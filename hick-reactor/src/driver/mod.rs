@@ -14,6 +14,7 @@ use async_channel::Sender;
 use futures::{FutureExt, pin_mut, select_biased};
 use hick_udp::{
   Family,
+  onlink::{BoundLink, admits_ingress, collect_local_subnets, is_loopback_interface},
   selfsend::{ClockPair, RxEvidence, SelfSendTracker},
 };
 use mdns_proto::{
@@ -81,11 +82,52 @@ struct Packet {
   /// conventional: this driver never holds the stamp as a bare `SystemTime`, so
   /// no later edit can substitute a read time for it without changing the type.
   rx: RxEvidence,
+  /// The datagram's IP header **destination**, where this receive path
+  /// recovered one ([`hick_udp::RecvMeta::destination`]), and `None` where it
+  /// recovered none. NOT [`Packet::local_ip`]: on Unix IPv4 that is the
+  /// receiving interface's own address, which never equals a group, so reading
+  /// it here would make every multicast arrival look unicast.
+  ///
+  /// RFC 6762 §11 states the local-link test two ways and the header
+  /// destination picks between them — arrival at `224.0.0.251` / `FF02::FB` is
+  /// local-link origin on its own, "regardless of source IP address". Carrying
+  /// it is what admits an on-link peer sourcing from a prefix this interface
+  /// does not have configured, which is precisely the overlaid-subnet case §11
+  /// calls it "essential" to accept. Windows recovers a destination and reports
+  /// no hop limit at all, so on that target this is the ONLY thing that can
+  /// select the group arm.
+  destination: Option<IpAddr>,
+  /// The kernel's own `MSG_MCAST` where this receive path reports it
+  /// ([`hick_udp::RecvMeta::delivery`]), else `None`. Coarser than
+  /// [`Packet::destination`] — "some multicast group" rather than which one —
+  /// and consulted only when no destination was recovered. That is the
+  /// OpenBSD/NetBSD IPv4 square, which has no PKTINFO parse wired in and would
+  /// otherwise lose the same §11 group arm.
+  ///
+  /// **A `None` destination is a different admission regime, not a coarser
+  /// one.** `hick_udp::onlink::admits_ingress` refuses a recovered destination
+  /// this endpoint does not hold; with none recovered it cannot. This driver
+  /// reads through `hick_udp::recv_with_meta`, so its `None` squares are IPv4 on
+  /// FreeBSD, DragonFly, OpenBSD and NetBSD, and what is left there is exactly
+  /// this field:
+  ///
+  /// * `Broadcast` (OpenBSD/NetBSD only — `libc` binds `MSG_BCAST` nowhere else)
+  ///   REFUSES, which closes the IPv4 broadcast class on those two;
+  /// * `Multicast` admits and names no group, so any foreign group is admitted
+  ///   there from any source;
+  /// * `None` — FreeBSD/DragonFly — leaves the source arm deciding, so an IPv4
+  ///   broadcast is still admitted there for an in-prefix source.
+  ///
+  /// Stated here so a reader of this struct is not left with the `Some`
+  /// regime's guarantee; the `None` arms of `admits_ingress` carry the full
+  /// statement and what closes the rest.
+  delivery: Option<hick_udp::LinkDelivery>,
   /// IPv4 TTL / IPv6 Hop Limit of the datagram (from `IP_RECVTTL` /
   /// `IPV6_RECVHOPLIMIT`), or `None` when the platform didn't supply it. The
-  /// RFC 6762 §11 on-link check ([`is_on_link`]) drops the packet before the
-  /// proto layer when this is present and not 255; `None` degrades to
-  /// pass-through (we cannot prove on-link, but neither can we prove off-link).
+  /// Carried as a DIAGNOSTIC and never tested:
+  /// [`hick_udp::onlink::admits_ingress`] takes no hop limit, because RFC 6762
+  /// §11's receive test is stated exhaustively and both ways are about the
+  /// destination address. It appears in the drop trace and nowhere else.
   hop_limit: Option<u8>,
 }
 
@@ -208,18 +250,38 @@ struct DriverState<N: Net> {
   /// rotates between them, so a budget spent entirely on services cannot starve
   /// every query (and vice versa).
   queries_first: bool,
-  /// this host's directly-attached subnets, the source-address
-  /// fallback for the RFC 6762 §11 on-link check on platforms that can't
-  /// supply a TTL/Hop-Limit. Empty if interface discovery failed (the
-  /// fallback then accepts). Snapshotted once at startup. Scoped to
-  /// the bound interface only.
+  /// The BOUND interface's directly-attached subnets — what RFC 6762 §11's
+  /// unicast arm compares a source against. Re-read on a bounded interval (see
+  /// `subnets_refreshed_at`), and scoped to the
+  /// bound interface only so no other NIC's prefix can widen the gate. Empty if
+  /// interface discovery failed, which the fallback reads as no on-link evidence
+  /// and so REFUSES a global source — see
+  /// [`hick_udp::onlink::collect_local_subnets`].
   local_subnets: Vec<(IpAddr, u8)>,
-  /// the interface index this endpoint is bound to. Used by the
-  /// §11 source-address fallback to scope LINK-LOCAL sources: a link-local
-  /// address is meaningful only within its own link, so a link-local packet
-  /// is on-link only when it arrived on this interface. Always ≥ 1 (the
-  /// endpoint always resolves a concrete interface index at bind time).
+  /// The interface index this endpoint is bound to, and the link every inbound
+  /// datagram is measured against: both mDNS sockets are wildcard bound, so on a
+  /// multi-homed host every NIC's port-5353 traffic reaches them and only this
+  /// index (plus an IPv6 source's scope id) says which link a datagram came
+  /// from. Gates BOTH of §11's arms, because §11 answers "did this originate on
+  /// a local link" and never "on which one". Always ≥ 1
+  /// (the endpoint always resolves a concrete interface index at bind time).
   bound_interface: u32,
+  /// Whether [`Self::bound_interface`] is the loopback interface, resolved once
+  /// at construction rather than per datagram. It is the only thing that opens
+  /// the §11 loopback exception: a loopback SOURCE address is forgeable onto a
+  /// real NIC wherever an operator has stopped treating `127/8` as martian, so
+  /// an endpoint serving a physical link grants it nothing.
+  bound_is_loopback: bool,
+  /// When `local_subnets` was last read from the interface.
+  ///
+  /// §11's unicast arm compares a source against the receiving interface's
+  /// configuration as it IS. An address can change under a live endpoint — a
+  /// DHCP lease lost into APIPA, a renumbered subnet — and a snapshot taken once
+  /// at construction is then wrong in both directions: current-prefix traffic
+  /// refused, obsolete prefix still admitted. `getifs` offers no change
+  /// notification on any supported platform, so this is polled on a bounded
+  /// interval. See [`hick_udp::onlink::refresh_subnets_if_stale`].
+  subnets_refreshed_at: StdInstant,
 }
 
 impl<N: Net> DriverState<N> {
@@ -248,6 +310,8 @@ impl<N: Net> DriverState<N> {
       // delivered PKTINFO is handled separately in recv_with_meta).
       local_subnets: collect_local_subnets(bound_interface),
       bound_interface,
+      bound_is_loopback: is_loopback_interface(bound_interface),
+      subnets_refreshed_at: StdInstant::now(),
       v4: sockets.v4.map(Arc::new),
       v6: sockets.v6.map(Arc::new),
       #[cfg(feature = "stats")]
@@ -491,26 +555,59 @@ impl<N: Net> DriverState<N> {
          must PRECEDE the park, not run inside the receive arm"
       );
     }
-    // RFC 6762 §11 on-link trust boundary: a datagram that did NOT originate
-    // on the local link must be dropped before the proto layer can act on
-    // (cache, conflict, withdraw) attacker-injected records.
-    //   - when the kernel reported the IPv4 TTL / IPv6 Hop Limit,
-    //     require exactly 255 (any lower value crossed a router).
-    //   - when it didn't (Windows / illumos / solaris / fuchsia /
-    //     no cmsg), fall back to a source-address-on-local-subnet check.
-    let on_link = match pkt.hop_limit {
-      Some(_) => is_on_link(pkt.hop_limit),
-      None => src_on_local_link(
-        &self.local_subnets,
+    // The ingress trust boundary, applied BEFORE the proto layer can cache or
+    // act on (conflict, withdraw) attacker-injected records and BEFORE the
+    // take-once credit is consulted: the link the datagram arrived on, then RFC
+    // 6762 §11. Both gates live in `hick_udp::onlink::admits_ingress` so neither
+    // can be applied to only one of the §11 branches — the interface check in
+    // particular, which the hop-limit branch used to skip entirely even though a
+    // conforming hop limit says nothing about *whose* link a wildcard-bound
+    // socket heard.
+    //
+    // `src` is the whole peer address rather than `pkt.src.ip()`: an IPv6
+    // source's scope id is half of what names the link it came from, and taking
+    // the address alone discarded it.
+    //
+    // `destination` and `delivery` come off the receive path rather than
+    // being hardcoded away: §11 selects its arms by the header destination, and
+    // dropping them routed a correctly-witnessed multicast from an
+    // overlaid-subnet peer to the source-prefix arm, which refuses it.
+    //
+    // NOT the hop limit: RFC 6762 §11's receive test is stated exhaustively
+    // and is about the destination address. Inbound TTL appears in the RFC
+    // once, explaining why responses SHOULD be SENT at 255 for the benefit of
+    // 2004-draft queriers — it is not a test a reader is told to apply, and
+    // applying it refused conforming traffic (§5.5 unicast queries at the
+    // stack's default TTL, group queries at the socket-default multicast TTL
+    // of 1) while admitting witnessed out-of-prefix unicast. Outbound 255 is
+    // unaffected and still honoured.
+    // §11 compares against the interface's configuration as it is, so the
+    // snapshot is re-read once it ages past the shared interval. One clock read
+    // per datagram; one enumeration per interval at most.
+    hick_udp::onlink::refresh_subnets_if_stale(
+      self.bound_interface,
+      &mut self.local_subnets,
+      &mut self.subnets_refreshed_at,
+    );
+    if !admits_ingress(
+      pkt.src,
+      pkt.destination,
+      pkt.delivery,
+      BoundLink::new(
         self.bound_interface,
-        pkt.interface_index,
-        pkt.src.ip(),
+        self.bound_is_loopback,
+        &self.local_subnets,
       ),
-    };
-    if !on_link {
+      pkt.interface_index,
+      rx_interface_reported(pkt.src),
+    ) {
       hick_trace::debug!(
         src = %pkt.src,
+        dst = ?pkt.destination,
+        delivery = ?pkt.delivery,
         hop_limit = ?pkt.hop_limit,
+        interface_index = pkt.interface_index,
+        bound_interface = self.bound_interface,
         "dropping off-link packet (RFC 6762 §11 trust boundary)"
       );
       // The datagram WAS received off the socket — count it toward receive
@@ -1733,10 +1830,19 @@ const MDNS_V6_DST: SocketAddr = SocketAddr::V6(std::net::SocketAddrV6::new(
   0,
 ));
 
-/// RFC 6762 §11 on-link check by TTL: a datagram is on-link only if its IPv4
-/// TTL / IPv6 Hop Limit is exactly 255 (anything less crossed a router).
-fn is_on_link(hop_limit: Option<u8>) -> bool {
-  hop_limit.is_none_or(|hl| hl == 255)
+/// Whether THIS driver's receive path reports the interface a datagram from
+/// `src`'s address family arrived on, as the ingress trust boundary must be told
+/// it.
+///
+/// Capability belongs to the receive path and not to the platform, so
+/// [`admits_ingress`] takes it as a parameter rather than reading a constant. On
+/// Unix and Windows every datagram is read through
+/// [`hick_udp::recv_with_meta`], and what that reports is the whole answer;
+/// every other target takes the plain `recv_from` arm of `recv_task`, which
+/// recovers no ancillary data at all and must say so — a rule told otherwise
+/// would fail every one of those datagrams closed and leave the endpoint deaf.
+const fn rx_interface_reported(src: SocketAddr) -> bool {
+  cfg!(any(unix, windows)) && hick_udp::onlink::reports_rx_interface(src)
 }
 
 /// Cheap peek at the DNS header's QR bit (RFC 1035 §4.1.1): byte 2, MSB.
@@ -1746,102 +1852,6 @@ fn is_on_link(hop_limit: Option<u8>) -> bool {
 /// response (proto rejects it on parse).
 fn packet_is_response(data: &[u8]) -> bool {
   data.get(2).is_some_and(|b| b & 0x80 != 0)
-}
-
-/// source-address fallback for the §11 on-link check, used when the
-/// platform couldn't supply a TTL/Hop-Limit (Windows, illumos/solaris/fuchsia,
-/// or a kernel without the cmsg). A datagram is treated as on-link when its
-/// source address is loopback, an interface-matched link-local, or inside one
-/// of the bound interface's directly-attached subnets — an off-link unicast
-/// sender's global address matches none of these.
-///
-/// `bound_iface` is the interface this endpoint is bound to; `recv_iface` is
-/// the interface the datagram arrived on (from PKTINFO, `0` when the platform
-/// didn't report it).
-///
-/// link-local addresses (169.254/16, fe80::/10) are scoped to a
-/// single link, so a link-local source counts as on-link ONLY when it arrived
-/// on the bound interface. When `recv_iface` is `0` (provenance unavailable)
-/// we cannot scope it and accept it (degraded) rather than drop legitimate
-/// link-local discovery. Loopback is always on-link. A global (routable)
-/// source is accepted only when it matches a cached local subnet; with no
-/// match — including when no subnets were enumerated — it is dropped as
-/// off-link (fail-closed per §11), so a global sender is never admitted
-/// without positive on-link evidence.
-fn src_on_local_link(
-  local_subnets: &[(IpAddr, u8)],
-  bound_iface: u32,
-  recv_iface: u32,
-  src: IpAddr,
-) -> bool {
-  let (is_loopback, is_link_local) = match src {
-    IpAddr::V4(v4) => (v4.is_loopback(), v4.is_link_local()),
-    IpAddr::V6(v6) => (v6.is_loopback(), (v6.segments()[0] & 0xffc0) == 0xfe80),
-  };
-  if is_loopback {
-    return true;
-  }
-  if is_link_local {
-    // On-link only if it arrived on the interface we're bound to. recv_iface
-    // == 0 means the platform didn't report the receive interface — accept
-    // (degraded) rather than drop.
-    return recv_iface == 0 || recv_iface == bound_iface;
-  }
-  // Global (routable) source: admit only with positive on-link evidence. An
-  // empty `local_subnets` makes `any` return `false`, so a global source is
-  // dropped as off-link (fail-closed per §11) when nothing was enumerated.
-  local_subnets
-    .iter()
-    .any(|&(net, prefix)| addr_in_subnet(net, prefix, src))
-}
-
-/// Whether `addr` falls within the subnet `net`/`prefix` (families must match).
-fn addr_in_subnet(net: IpAddr, prefix: u8, addr: IpAddr) -> bool {
-  match (net, addr) {
-    (IpAddr::V4(n), IpAddr::V4(a)) => {
-      let p = prefix.min(32);
-      if p == 0 {
-        return true;
-      }
-      let mask: u32 = u32::MAX.checked_shl(32 - u32::from(p)).unwrap_or(0);
-      (u32::from(n) & mask) == (u32::from(a) & mask)
-    }
-    (IpAddr::V6(n), IpAddr::V6(a)) => {
-      let p = prefix.min(128);
-      if p == 0 {
-        return true;
-      }
-      let mask: u128 = u128::MAX.checked_shl(128 - u32::from(p)).unwrap_or(0);
-      (u128::from(n) & mask) == (u128::from(a) & mask)
-    }
-    _ => false,
-  }
-}
-
-/// Best-effort snapshot of the BOUND interface's directly-attached subnets,
-/// used by [`src_on_local_link`]. Scoped to `iface_index` — the
-/// interface this endpoint is bound to — NOT every local interface, so a
-/// packet from another NIC's subnet is not treated as on-link. An interface
-/// index of 0 or a failed lookup yields an empty list (degraded: the fallback
-/// then accepts, since we can't determine the link).
-fn collect_local_subnets(iface_index: u32) -> Vec<(IpAddr, u8)> {
-  let mut out: Vec<(IpAddr, u8)> = Vec::new();
-  if iface_index == 0 {
-    return out;
-  }
-  if let Ok(Some(i)) = getifs::interface_by_index(iface_index) {
-    if let Ok(v4s) = i.ipv4_addrs() {
-      for n in v4s.iter() {
-        out.push((IpAddr::V4(n.addr()), n.prefix_len()));
-      }
-    }
-    if let Ok(v6s) = i.ipv6_addrs() {
-      for n in v6s.iter() {
-        out.push((IpAddr::V6(n.addr()), n.prefix_len()));
-      }
-    }
-  }
-  out
 }
 
 /// Restate one family's bounded attempt in the core's I/O-world vocabulary.
@@ -3013,7 +3023,11 @@ async fn recv_loop<N: Net>(
             // absent cmsg stays absent, and there is no step at which a
             // userspace stamp could be substituted for a kernel one.
             rx: RxEvidence::from_meta(&meta),
-            // IPv4 TTL / IPv6 Hop Limit for the §11 on-link check.
+            // The two facts §11 selects its fallback arm by, carried rather
+            // than discarded — see `Packet::destination`.
+            destination: meta.destination(),
+            delivery: meta.delivery(),
+            // Carried as a diagnostic; §11's receive test never reads it.
             hop_limit: meta.hop_limit(),
           };
           if tx.send(pkt).await.is_err() {
@@ -3048,12 +3062,12 @@ async fn recv_loop<N: Net>(
     }
     // on Windows, peek for readiness then consume with WSARecvMsg so
     // we recover the receiving interface index (IP_PKTINFO / IPV6_PKTINFO).
-    // That index lets handle_packet scope the §11 link-local on-link check to
-    // the bound interface (no longer fail-open). No TTL cmsg is wired here, so
-    // hop_limit stays None and the §11 check uses the (now interface-scoped)
-    // source-address fallback. No kernel rx timestamp either, so the self-send
-    // match runs degraded: content, family and the TTL, weighing no reference at
-    // all rather than substituting a read time for one.
+    // That index lets handle_packet scope §11's arms to the bound interface (no
+    // longer fail-open), and WSARecvMsg also recovers the IP header destination
+    // that §11 selects its arms by. No TTL cmsg is wired here; nothing depends
+    // on one, since §11's receive test never reads it. No kernel rx timestamp
+    // either, so the self-send match runs degraded: content and family,
+    // weighing no reference at all rather than substituting a read time for one.
     #[cfg(windows)]
     {
       use std::os::windows::io::AsRawSocket;
@@ -3100,6 +3114,8 @@ async fn recv_loop<N: Net>(
             local_ip: meta.local_ip(),
             interface_index: meta.interface_index(),
             rx: RxEvidence::from_meta(&meta),
+            destination: meta.destination(),
+            delivery: meta.delivery(),
             hop_limit: meta.hop_limit(),
           };
           if tx.send(pkt).await.is_err() {
@@ -3158,6 +3174,11 @@ async fn recv_loop<N: Net>(
             local_ip,
             interface_index: 0,
             rx: RxEvidence::none(),
+            // A plain `recv_from` recovers no ancillary data at all, so this
+            // path has neither to report — the same silence `rx` and
+            // `hop_limit` carry here.
+            destination: None,
+            delivery: None,
             hop_limit: None,
           };
           if tx.send(pkt).await.is_err() {
