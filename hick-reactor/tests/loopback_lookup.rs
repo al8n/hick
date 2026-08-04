@@ -36,9 +36,6 @@ use hick_reactor::{
   ServiceSpec, tokio as tokio_drv, wire::ResourceType,
 };
 
-const UNIQUE_SERVICE: &str = "_agnostic-mdns-test-v06._tcp.local.";
-const UNIQUE_INSTANCE: &str = "Test._agnostic-mdns-test-v06._tcp.local.";
-const UNIQUE_HOST: &str = "test-host.local.";
 const SERVICE_PORT: u16 = 12345;
 const ADVERTISED_V4: [u8; 4] = [127, 0, 0, 1];
 const ADVERTISED_V6: Ipv6Addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
@@ -87,17 +84,32 @@ struct LoopbackPair {
 }
 
 /// Build a [responder, querier] pair on the loopback interface, with the
-/// responder publishing the canonical test service. The responder is given
-/// `setup_wait` to finish probing + announcing before the function returns.
-async fn build_pair(setup_wait: Duration) -> Option<LoopbackPair> {
-  build_pair_named(setup_wait, UNIQUE_SERVICE, UNIQUE_INSTANCE, UNIQUE_HOST).await
-}
-
-/// Like [`build_pair`] but with a caller-chosen service type, instance, and host
-/// name. Tests that resolve a *specific* name (rather than browsing the shared
-/// type) pass unique values so they neither conflict-rename a shared record nor
-/// leak their instance into another test's browse results.
-async fn build_pair_named(
+/// responder publishing a service under the caller-chosen `service` type,
+/// `instance`, and `host` names. The responder is given `setup_wait` to finish
+/// probing + announcing before the function returns.
+///
+/// `service`/`instance`/`host` are mandatory, not defaulted, because cargo runs
+/// every test in this file concurrently on the same loopback link. Two failure
+/// modes follow from a shared name, and the quiet one is why this signature has
+/// no defaulting overload to reach for:
+///
+/// * Two responders probing the same name is a genuine RFC 6762 §8.2 conflict,
+///   which triggers a §9 rename and leaves the loser's own querier looking up a
+///   name it no longer holds. That one at least fails loudly.
+/// * Worse, and silently: a responder's §8.3 unsolicited announcements are
+///   multicast to the whole group, so a *sibling test's* announcements for the
+///   same name land in this test's querier and satisfy its assertion without
+///   this test's own query ever going out. A driver regression that stops query
+///   transmission outright then still leaves the whole file green — the
+///   assertions are met by traffic no longer under test. Disabling
+///   `drain_query_transmits` and running the file is the check: with per-test
+///   names `loopback_browse_resolves_service_entry` fails, as it must; with a
+///   shared name every test passes.
+///
+/// Every call site must therefore pick a triple that is unique across this
+/// file, so no two responders ever contend for the same probe and no test's
+/// records can stand in for another's.
+async fn build_pair(
   setup_wait: Duration,
   service: &str,
   instance: &str,
@@ -492,15 +504,15 @@ fn multicast_loopback_carries() -> bool {
 
 #[tokio::test]
 async fn loopback_ptr_query_returns_instance() {
-  let pair = match build_pair(Duration::from_millis(1300)).await {
+  const SVC: &str = "_agnostic-mdns-test-ptr-v06._tcp.local.";
+  const INST: &str = "TestPtr._agnostic-mdns-test-ptr-v06._tcp.local.";
+  const HOST: &str = "test-ptr-host.local.";
+  let pair = match build_pair(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
-  let spec = QuerySpec::new(
-    Name::try_from_str(UNIQUE_SERVICE).unwrap(),
-    ResourceType::Ptr,
-  )
-  .with_timeout(Duration::from_secs(2));
+  let spec = QuerySpec::new(Name::try_from_str(SVC).unwrap(), ResourceType::Ptr)
+    .with_timeout(Duration::from_secs(2));
   let answers = run_query(&pair.querier, spec, Duration::from_secs(4)).await;
   let saw_ptr = answers.iter().any(|a| a.rtype() == ResourceType::Ptr);
   eprintln!(
@@ -520,15 +532,15 @@ async fn loopback_ptr_query_returns_instance() {
 
 #[tokio::test]
 async fn loopback_srv_query_returns_target() {
-  let pair = match build_pair(Duration::from_millis(1300)).await {
+  const SVC: &str = "_agnostic-mdns-test-srv-v06._tcp.local.";
+  const INST: &str = "TestSrv._agnostic-mdns-test-srv-v06._tcp.local.";
+  const HOST: &str = "test-srv-host.local.";
+  let pair = match build_pair(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
-  let spec = QuerySpec::new(
-    Name::try_from_str(UNIQUE_INSTANCE).unwrap(),
-    ResourceType::Srv,
-  )
-  .with_timeout(Duration::from_secs(2));
+  let spec = QuerySpec::new(Name::try_from_str(INST).unwrap(), ResourceType::Srv)
+    .with_timeout(Duration::from_secs(2));
   let answers = run_query(&pair.querier, spec, Duration::from_secs(4)).await;
   eprintln!(
     "SRV query: {} answers, types {:?}",
@@ -548,11 +560,14 @@ async fn loopback_srv_query_returns_target() {
 
 #[tokio::test]
 async fn loopback_a_query_returns_address() {
-  let pair = match build_pair(Duration::from_millis(1300)).await {
+  const SVC: &str = "_agnostic-mdns-test-a-v06._tcp.local.";
+  const INST: &str = "TestA._agnostic-mdns-test-a-v06._tcp.local.";
+  const HOST: &str = "test-a-host.local.";
+  let pair = match build_pair(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
-  let spec = QuerySpec::new(Name::try_from_str(UNIQUE_HOST).unwrap(), ResourceType::A)
+  let spec = QuerySpec::new(Name::try_from_str(HOST).unwrap(), ResourceType::A)
     .with_timeout(Duration::from_secs(2));
   let answers = run_query(&pair.querier, spec, Duration::from_secs(4)).await;
   eprintln!(
@@ -579,11 +594,14 @@ async fn loopback_a_query_returns_address() {
 
 #[tokio::test]
 async fn loopback_aaaa_query_returns_address() {
-  let pair = match build_pair(Duration::from_millis(1300)).await {
+  const SVC: &str = "_agnostic-mdns-test-aaaa-v06._tcp.local.";
+  const INST: &str = "TestAaaa._agnostic-mdns-test-aaaa-v06._tcp.local.";
+  const HOST: &str = "test-aaaa-host.local.";
+  let pair = match build_pair(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
-  let spec = QuerySpec::new(Name::try_from_str(UNIQUE_HOST).unwrap(), ResourceType::AAAA)
+  let spec = QuerySpec::new(Name::try_from_str(HOST).unwrap(), ResourceType::AAAA)
     .with_timeout(Duration::from_secs(2));
   let answers = run_query(&pair.querier, spec, Duration::from_secs(4)).await;
   eprintln!(
@@ -607,15 +625,15 @@ async fn loopback_aaaa_query_returns_address() {
 
 #[tokio::test]
 async fn loopback_txt_query_returns_payload() {
-  let pair = match build_pair(Duration::from_millis(1300)).await {
+  const SVC: &str = "_agnostic-mdns-test-txt-v06._tcp.local.";
+  const INST: &str = "TestTxt._agnostic-mdns-test-txt-v06._tcp.local.";
+  const HOST: &str = "test-txt-host.local.";
+  let pair = match build_pair(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
-  let spec = QuerySpec::new(
-    Name::try_from_str(UNIQUE_INSTANCE).unwrap(),
-    ResourceType::Txt,
-  )
-  .with_timeout(Duration::from_secs(2));
+  let spec = QuerySpec::new(Name::try_from_str(INST).unwrap(), ResourceType::Txt)
+    .with_timeout(Duration::from_secs(2));
   let answers = run_query(&pair.querier, spec, Duration::from_secs(4)).await;
   eprintln!(
     "TXT query: {} answers, types {:?}",
@@ -635,7 +653,10 @@ async fn loopback_txt_query_returns_payload() {
 
 #[tokio::test]
 async fn loopback_any_query_returns_full_record_set() {
-  let pair = match build_pair(Duration::from_millis(1300)).await {
+  const SVC: &str = "_agnostic-mdns-test-any-v06._tcp.local.";
+  const INST: &str = "TestAny._agnostic-mdns-test-any-v06._tcp.local.";
+  const HOST: &str = "test-any-host.local.";
+  let pair = match build_pair(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
@@ -643,11 +664,8 @@ async fn loopback_any_query_returns_full_record_set() {
   // OWNER name equals the qname (PTR). SRV/A/AAAA/TXT have different owners
   // (instance / host). To collect everything in one query, ANY-on-instance
   // gives SRV + TXT (both owned by the instance name).
-  let spec = QuerySpec::new(
-    Name::try_from_str(UNIQUE_INSTANCE).unwrap(),
-    ResourceType::Any,
-  )
-  .with_timeout(Duration::from_secs(2));
+  let spec = QuerySpec::new(Name::try_from_str(INST).unwrap(), ResourceType::Any)
+    .with_timeout(Duration::from_secs(2));
   let answers = run_query(&pair.querier, spec, Duration::from_secs(4)).await;
   eprintln!(
     "ANY-instance query: {} answers, types {:?}",
@@ -671,12 +689,15 @@ async fn loopback_any_query_returns_full_record_set() {
 /// A/AAAA chained by the `Lookup`).
 #[tokio::test]
 async fn loopback_browse_resolves_service_entry() {
-  let pair = match build_pair(Duration::from_millis(1300)).await {
+  const SVC: &str = "_agnostic-mdns-test-browse-v06._tcp.local.";
+  const INST: &str = "TestBrowse._agnostic-mdns-test-browse-v06._tcp.local.";
+  const HOST: &str = "test-browse-host.local.";
+  let pair = match build_pair(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
-  let param = QueryParam::new(Name::try_from_str(UNIQUE_SERVICE).unwrap())
-    .with_timeout(Duration::from_secs(2));
+  let param =
+    QueryParam::new(Name::try_from_str(SVC).unwrap()).with_timeout(Duration::from_secs(2));
   let mut lookup = match pair.querier.browse(param).await {
     Ok(l) => l,
     Err(e) => {
@@ -685,14 +706,14 @@ async fn loopback_browse_resolves_service_entry() {
     }
   };
 
-  // Resolve until an instance of our service type appears (or a hard cap).
-  // Breaking on the first match keeps the test fast — the entry resolves long
-  // before the per-query timeouts elapse. We match on the service-type suffix,
-  // not the exact instance label: parallel tests publish the same instance name
-  // on loopback, so §9 conflict resolution renames clones (`Test` → `test-2`),
-  // and responders lowercase names on the wire. The host/port/addr/TXT are
-  // identical across the renamed clones, so any resolved entry validates them.
-  let suffix = UNIQUE_SERVICE.to_ascii_lowercase();
+  // Resolve until our instance appears (or a hard cap). Breaking on the first
+  // match keeps the test fast — the entry resolves long before the per-query
+  // timeouts elapse. Every test in this file publishes under its own private
+  // service/instance/host triple (see `build_pair`), so no concurrent test can
+  // rename this responder or leak an entry into this browse; we still match on
+  // the lowercased type suffix rather than full instance equality because
+  // responders lowercase names on the wire.
+  let suffix = SVC.to_ascii_lowercase();
   let entry = tokio::time::timeout(Duration::from_secs(5), async {
     while let Some(e) = lookup.next().await {
       eprintln!(
@@ -732,12 +753,12 @@ async fn loopback_browse_resolves_service_entry() {
         );
         return;
       }
-      panic!("browse did not resolve any instance of {UNIQUE_SERVICE}");
+      panic!("browse did not resolve any instance of {SVC}");
     }
   };
   assert_eq!(entry.port(), SERVICE_PORT, "wrong port");
   assert!(
-    entry.host().as_str().eq_ignore_ascii_case(UNIQUE_HOST),
+    entry.host().as_str().eq_ignore_ascii_case(HOST),
     "wrong host: {}",
     entry.host()
   );
@@ -753,21 +774,19 @@ async fn loopback_browse_resolves_service_entry() {
   );
 }
 
-/// `resolve_host`: plain mDNS hostname resolution (A/AAAA), no DNS-SD chain. The
-/// host name carries identical A rdata across any concurrent responders, so this
-/// is robust under parallel tests (no §9 conflict on shared, identical records).
+/// `resolve_host`: plain mDNS hostname resolution (A/AAAA), no DNS-SD chain.
 #[tokio::test]
 async fn loopback_resolve_host_returns_addresses() {
-  let pair = match build_pair(Duration::from_millis(1300)).await {
+  const SVC: &str = "_agnostic-mdns-test-resolvehost-v06._tcp.local.";
+  const INST: &str = "TestResolveHost._agnostic-mdns-test-resolvehost-v06._tcp.local.";
+  const HOST: &str = "test-resolvehost-host.local.";
+  let pair = match build_pair(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
   let addrs = match pair
     .querier
-    .resolve_host(
-      Name::try_from_str(UNIQUE_HOST).unwrap(),
-      Duration::from_secs(2),
-    )
+    .resolve_host(Name::try_from_str(HOST).unwrap(), Duration::from_secs(2))
     .await
   {
     Ok(a) => a,
@@ -791,17 +810,13 @@ async fn loopback_resolve_host_returns_addresses() {
 }
 
 /// `resolve_instance`: resolve a *known* instance directly (SRV/TXT + A/AAAA),
-/// skipping the PTR browse. Uses unique instance/host names so a concurrent test
-/// can't conflict-rename them — this responder reliably owns the queried name.
+/// skipping the PTR browse.
 #[tokio::test]
 async fn loopback_resolve_instance_returns_entry() {
-  // A dedicated service type (not UNIQUE_SERVICE) so this responder's PTR never
-  // appears in `loopback_browse_resolves_service_entry`, which would otherwise
-  // be able to pick this instance and then fail its UNIQUE_HOST assertion.
   const SVC: &str = "_agnostic-mdns-resolve-v06._tcp.local.";
   const INST: &str = "ResolveOne._agnostic-mdns-resolve-v06._tcp.local.";
   const HOST: &str = "resolve-one-host.local.";
-  let pair = match build_pair_named(Duration::from_millis(1300), SVC, INST, HOST).await {
+  let pair = match build_pair(Duration::from_millis(1300), SVC, INST, HOST).await {
     Some(p) => p,
     None => return,
   };
