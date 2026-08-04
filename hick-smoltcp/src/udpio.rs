@@ -3,6 +3,9 @@
 use core::net::{IpAddr, SocketAddr};
 
 /// Normalized metadata for one received datagram.
+///
+/// Carries no interface identity — see [`UdpIo`]'s one-interface-per-implementation
+/// contract, which is what makes the §11 on-link gate's use of [`Self::src`] sound.
 #[derive(Debug, Clone, Copy)]
 pub struct RecvMeta {
   /// Source endpoint (the sender).
@@ -12,13 +15,16 @@ pub struct RecvMeta {
   pub local: Option<IpAddr>,
   /// The received IP TTL / IPv6 hop-limit, if the transport surfaces it.
   ///
-  /// `Some(255)` is what RFC 6762 §11 requires of an on-link mDNS packet, and is
-  /// decisive on its own. `None` means the transport could not provide it, and
-  /// the §11 gate falls through in order: a datagram addressed to the mDNS
-  /// group is admitted outright (arrival at the group is its own §11 admission
-  /// ground; a peer outside your configured subnets is still on your link if
-  /// its multicast reached you); otherwise, for a non-group destination,
-  /// subnet membership decides; otherwise reject.
+  /// Diagnostic only — NOT a §11 input. RFC 6762 §11's receive-side test is
+  /// exhaustive ("the test for whether a response originated on the local link
+  /// is done in two ways"): mDNS-group destination, or source-subnet
+  /// membership. The received hop-limit is neither; the RFC's only TTL
+  /// provision is the outbound `SHOULD` (send at 255, a compatibility
+  /// concession to 2004-draft queriers), not a receive check. The §11 on-link
+  /// gate (`onlink::on_link`) does not take this field at all — it is carried
+  /// here only so a caller/transport that has a hop-limit available can record
+  /// or otherwise use it for its own purposes (logging, metrics, a stricter
+  /// caller-side policy).
   pub hop_limit: Option<u8>,
   /// Number of payload bytes written into the receive buffer.
   pub len: usize,
@@ -56,6 +62,26 @@ pub enum SendError {
 ///
 /// Implemented over a raw `smoltcp::socket::udp::Socket` in this crate, and
 /// over embassy-net's `UdpSocket` in `hick-embassy`.
+///
+/// # Contract: exactly one interface per implementation
+///
+/// RFC 6762 §11's unicast on-link test is defined over "the interface
+/// receiving the packet" (singular), but neither [`RecvMeta`] nor
+/// [`Engine::set_local_subnets`](crate::Engine::set_local_subnets) carries or
+/// is keyed by interface identity: an `Engine` holds one flat subnet list,
+/// checked against every `RecvMeta::src` its `UdpIo` hands it, with no way to
+/// tell which physical interface a datagram arrived on. An implementation
+/// MUST therefore represent exactly one link: a `DualStack` / `DualUdp` over
+/// one interface's v4 AND v6 sockets is fine (one link, two address
+/// families); one that ALSO relays a second interface's socket(s) through the
+/// same `UdpIo` is not — use two `Engine`s (each with its own `UdpIo` and
+/// subnet list) instead, one per interface.
+///
+/// This is not runtime-checked, because there is nothing here to check it
+/// against. Violating it is silent: a datagram received on interface A is
+/// admitted because its source happens to fall inside interface B's
+/// configured prefix, defeating the subnet check exactly where §11 relies on
+/// it. See `onlink::on_link`'s cross-interface test for a pinned example.
 pub trait UdpIo {
   /// Pull one queued datagram into `buf`, returning its metadata, or `None`
   /// when the receive queue is empty. Non-blocking.

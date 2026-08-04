@@ -35,13 +35,14 @@ fn recv_from(socket: &mut udp::Socket<'_>, buf: &mut [u8]) -> Option<RecvMeta> {
         local: meta.local_address.map(Into::into),
         // smoltcp's `udp::Socket` UDP metadata (`UdpMetadata`) exposes no received
         // hop-limit — verified against 0.13.1 (only `endpoint` / `local_address` /
-        // `meta`) — so this is `None` and the engine's §11 RECEIVE gate
-        // (`onlink::on_link`) falls through in order: the mDNS group is admitted
+        // `meta`) — so this is diagnostic-only `None`; the engine's §11 RECEIVE
+        // gate (`onlink::on_link`) does not take a hop-limit input at all. It
+        // decides on destination and source alone: the mDNS group is admitted
         // outright (arrival at the group is its own §11 admission ground; a peer
         // outside your configured subnets is still on your link if its multicast
         // reached you); otherwise, for a non-group destination, subnet membership
-        // decides; otherwise reject. The §11 TRANSMIT invariant (TTL 255 out) is
-        // enforced separately in `send_from`, not here.
+        // decides; otherwise reject. The §11 TRANSMIT `SHOULD` (TTL 255 out) is
+        // honoured separately in `send_from`, not here.
         hop_limit: None,
         len,
       })
@@ -86,15 +87,18 @@ fn send_from(socket: &mut udp::Socket<'_>, buf: &[u8], dst: SocketAddr) -> Resul
   }
   #[cfg(feature = "defmt")]
   defmt::trace!("smoltcp send_from: {} bytes", buf.len());
-  // RFC 6762 §11: EVERY outgoing mDNS packet MUST leave with IP TTL / hop-limit 255,
-  // and a conformant receiver rejects anything else (it is the multicast on-link
-  // guard — the same gate `onlink::on_link` applies on RX). smoltcp dispatches a UDP
-  // datagram with the socket's configured hop-limit and DEFAULTS it to 64 when unset,
-  // so a probe/announcement/goodbye would otherwise egress at 64 and compliant peers
-  // would silently drop it — the API would appear to transmit while no peer listens.
+  // RFC 6762 §11: responses SHOULD leave with IP TTL / hop-limit 255 — a
+  // recommendation for backwards-compatibility with OLDER queriers implementing
+  // the February-2004 draft, which discard everything but 255 on reception. A
+  // modern §11-conformant receiver's on-link test (the same gate
+  // `onlink::on_link` applies on RX) never consults the received hop-limit at
+  // all. smoltcp dispatches a UDP datagram with the socket's configured
+  // hop-limit and DEFAULTS it to 64 when unset, so a probe/announcement/goodbye
+  // would otherwise egress at 64 and those older queriers would silently drop
+  // it — the API would appear to transmit while some listeners never see it.
   // Force 255 here at the single send choke point (idempotent — a plain field set on
   // the value smoltcp reads at egress) rather than trusting every caller to have
-  // configured both sockets; `hick-embassy`'s driver enforces the equivalent
+  // configured both sockets; `hick-embassy`'s driver honours the same `SHOULD` via
   // `set_hop_limit(Some(255))` once at startup (it holds the sockets by `&mut` there),
   // and the smoltcp sockets are reached only through this transport, so enforce per-send.
   socket.set_hop_limit(Some(255));

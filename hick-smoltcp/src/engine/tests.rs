@@ -1677,8 +1677,8 @@ fn default_setup_rejects_off_link_unicast() {
   // could send unicast (or an ephemeral-port probe) to the device's :5353 and inject
   // conflict/answer data — link-scoped multicast does not protect a unicast path.
   // The SAME conflict that renames over multicast (above) must be ignored when its
-  // destination is the device's own unicast address and no hop-limit/subnets vouch
-  // for it.
+  // destination is the device's own unicast address and no subnet vouches for
+  // it (the received hop-limit, if any, is never consulted).
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(59));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
@@ -1710,8 +1710,8 @@ fn default_setup_rejects_off_link_unicast() {
   }
   assert!(
     !reacted,
-    "off-link unicast must NOT drive a conflict rename when no hop-limit or subnet \
-       vouches for it — only link-scoped multicast is trusted by default"
+    "off-link unicast must NOT drive a conflict rename when no subnet vouches \
+       for it — only link-scoped multicast is trusted by default"
   );
 }
 
@@ -1762,6 +1762,101 @@ fn subnets_configured_still_admits_group_destined_off_subnet_source() {
     "a group-destined datagram must be admitted on its destination alone once \
        subnets are configured — the source-subnet check is an ALTERNATIVE §11 \
        offers only when the destination is NOT the group, not a veto over it"
+  );
+}
+
+/// The two supplied transports can never report a hop limit (both hardcode
+/// `RecvMeta::hop_limit: None`), so this drives a custom [`MockUdp`] transport
+/// that reports one — the only way to exercise the removed hop-limit arms'
+/// former reach. Before the fix, a present-but-non-255 hop limit refused a
+/// datagram outright, even addressed to the mDNS group — the exact case RFC
+/// 6762 §11 deems on-link "regardless of source IP address". The arms are gone;
+/// a reported 254 must not matter, since the on-link gate no longer takes a
+/// hop-limit input at all.
+#[test]
+fn reported_hop_limit_is_not_consulted_group_destined_admitted_at_254() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(101));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+  for micros in pump_schedule() {
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+    while engine.poll_service_update(handle).is_some() {}
+  }
+
+  let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
+  let mut t = 6_000_000i64;
+  let mut reacted = false;
+  for _ in 0..16 {
+    io.inbound.push_back((
+      conflict.clone(),
+      RecvMeta {
+        src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
+        local: Some(MDNS_SOCKET_V4.ip()),
+        hop_limit: Some(254),
+        len: 0,
+      },
+    ));
+    engine.pump(|| at(t), &mut io, &mut scratch);
+    t += 250_000;
+    while let Some(u) = engine.poll_service_update(handle) {
+      reacted |= matches!(u, ServiceUpdate::Renamed(_) | ServiceUpdate::Conflict);
+    }
+    if reacted {
+      break;
+    }
+  }
+  assert!(
+    reacted,
+    "a group-destined datagram must be admitted regardless of a reported hop \
+       limit other than 255 — §11's group admission does not depend on TTL"
+  );
+}
+
+/// The mirror defect: before the fix, a reported hop limit of exactly 255 was
+/// decisive and admitted this datagram outright even though it is unicast (not
+/// the mDNS group) from a source outside the one configured subnet — a case
+/// §11 never admits. The arms are gone; a reported 255 must not matter either,
+/// since destination and subnet membership are the only inputs left.
+#[test]
+fn reported_hop_limit_255_does_not_admit_off_prefix_unicast() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(103));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+  for micros in pump_schedule() {
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+    while engine.poll_service_update(handle).is_some() {}
+  }
+
+  // A subnet that does NOT cover the source fed below.
+  engine.set_local_subnets(vec![IpCidr::new(IpAddress::v4(10, 0, 0, 0), 24)]);
+
+  let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
+  let mut t = 6_000_000i64;
+  let mut reacted = false;
+  for _ in 0..16 {
+    io.inbound.push_back((
+      conflict.clone(),
+      RecvMeta {
+        // Off-prefix (outside 10.0.0.0/24) and unicast (the device's own
+        // address), not the mDNS group.
+        src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
+        local: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
+        hop_limit: Some(255),
+        len: 0,
+      },
+    ));
+    engine.pump(|| at(t), &mut io, &mut scratch);
+    t += 250_000;
+    while let Some(u) = engine.poll_service_update(handle) {
+      reacted |= matches!(u, ServiceUpdate::Renamed(_) | ServiceUpdate::Conflict);
+    }
+  }
+  assert!(
+    !reacted,
+    "a reported hop limit of 255 must NOT admit an off-prefix unicast datagram — \
+       destination and subnet membership decide admission, not TTL"
   );
 }
 
@@ -2010,14 +2105,15 @@ fn own_multicast_loopback_is_not_treated_as_conflict() {
   }
   // Loop our most recent multicast datagram back in, from a DIFFERENT source so
   // the proto's advertised-source fallback cannot catch it — only the self-send
-  // fingerprint can. hop_limit 255 passes the §11 gate.
+  // fingerprint can. Addressed to the mDNS group, so the §11 gate admits it on
+  // destination alone.
   let (_, datagram) = io.sent.last().cloned().expect("a datagram was sent");
   io.inbound.push_back((
     datagram,
     RecvMeta {
       src: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 99), 5353)),
-      local: None,
-      hop_limit: Some(255),
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
       len: 0,
     },
   ));
@@ -2141,14 +2237,15 @@ fn loopback_detected_across_a_large_send_burst() {
     io.sent.len()
   );
   // Loop the FIRST (oldest) probe back — it must still be recognised as self
-  // despite the larger, more-recent burst that followed it.
+  // despite the larger, more-recent burst that followed it. Addressed to the
+  // mDNS group, so the §11 gate admits it on destination alone.
   let first = io.sent.first().cloned().expect("a probe was sent");
   io.inbound.push_back((
     first.1,
     RecvMeta {
       src: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 99), 5353)),
-      local: None,
-      hop_limit: Some(255),
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
       len: 0,
     },
   ));
@@ -2408,12 +2505,13 @@ fn a_query_exposes_collected_answers_via_the_public_api() {
     )
     .unwrap();
   let mut qio = MockUdp::default();
+  // Addressed to the mDNS group, so the §11 gate admits it on destination alone.
   qio.inbound.push_back((
     announcement,
     RecvMeta {
       src: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 5), 5353)),
-      local: None,
-      hop_limit: Some(255),
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
       len: 0,
     },
   ));
@@ -2527,13 +2625,15 @@ fn a_retired_query_freezes_answers_and_emits_no_second_terminal() {
   );
 
   // A late MATCHING response after the terminal must be FROZEN (not collected)
-  // and must NOT produce a second terminal.
+  // and must NOT produce a second terminal. Addressed to the mDNS group, so the
+  // §11 gate admits it on destination alone — the freeze must come from the
+  // proto's terminal state, not from this datagram being dropped on arrival.
   qio.inbound.push_back((
     announcement,
     RecvMeta {
       src: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 7), 5353)),
-      local: None,
-      hop_limit: Some(255),
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
       len: 0,
     },
   ));
@@ -3010,10 +3110,11 @@ fn stats_unicast_unsupported_does_not_increment_send_errors() {
   );
 }
 
-/// RFC 6762 §11 off-link datagrams (hop-limit ≠ 255) are dropped before the
-/// proto layer, but the datagram WAS received off the socket — so it must
-/// increment `packets_rx`/`bytes_rx` AND `packets_dropped` exactly once each,
-/// matching the reactor/compio pre-handle drop accounting (driver-consistent).
+/// RFC 6762 §11 off-link datagrams (unicast destination, off-subnet source) are
+/// dropped before the proto layer, but the datagram WAS received off the
+/// socket — so it must increment `packets_rx`/`bytes_rx` AND `packets_dropped`
+/// exactly once each, matching the reactor/compio pre-handle drop accounting
+/// (driver-consistent).
 #[cfg(feature = "stats")]
 #[test]
 fn stats_off_link_datagram_counts_rx_bytes_and_dropped() {
@@ -3021,18 +3122,20 @@ fn stats_off_link_datagram_counts_rx_bytes_and_dropped() {
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
 
-  // Well-formed mDNS packet so the only reject reason is the hop-limit.
+  // Well-formed mDNS packet so the only reject reason is the on-link gate.
   let pkt = build_conflict_srv_authority("Test._ipp._tcp.local.");
   let pkt_len = pkt.len();
 
-  // Off-link: hop_limit = 1 (crossed a router → §11 reject). len > 0 so the
-  // on-link gate is actually exercised, not the len==0 marker path.
+  // Off-link: unicast destination (not the mDNS group), no subnets configured,
+  // so no source can vouch for it — REGARDLESS of the reported hop limit. A
+  // reported 255 used to be decisive here on its own; it no longer is. len > 0
+  // so the on-link gate is actually exercised, not the len==0 marker path.
   io.inbound.push_back((
     pkt,
     RecvMeta {
       src: SocketAddr::from((Ipv4Addr::new(192, 168, 2, 1), 5353)),
-      local: Some(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
-      hop_limit: Some(1),
+      local: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 10))),
+      hop_limit: Some(255),
       len: pkt_len,
     },
   ));

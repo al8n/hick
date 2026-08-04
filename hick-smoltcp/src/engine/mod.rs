@@ -847,23 +847,23 @@ where
     self.stats.snapshot()
   }
 
-  /// Set the device's local subnets — consulted by the RFC 6762 §11 on-link gate
-  /// when the transport cannot surface the received hop-limit (neither supplied
-  /// transport can; smoltcp's `UdpMetadata` carries no RX TTL). The gate falls
-  /// through in order: a present hop-limit is decisive; otherwise a datagram
-  /// addressed to the mDNS group is admitted outright (arrival at the group is
-  /// its own §11 admission ground; a peer outside your configured subnets is
-  /// still on your link if its multicast reached you); otherwise, for a
-  /// non-group destination, subnet membership decides; otherwise reject.
+  /// Set the device's local subnets — consulted by the RFC 6762 §11 on-link
+  /// gate for a non-group-destined datagram. The gate falls through in order: a
+  /// datagram addressed to the mDNS group is admitted outright (arrival at the
+  /// group is its own §11 admission ground; a peer outside your configured
+  /// subnets is still on your link if its multicast reached you); otherwise,
+  /// for a non-group destination, subnet membership decides; otherwise reject.
+  /// The received hop-limit / TTL, if a transport reports one, is not
+  /// consulted — §11's receive-side test is exhaustively the two checks above.
   ///
-  /// OPTIONAL. With no subnets AND no received hop limit — true of both
-  /// supplied transports, whose underlying `UdpMetadata` never carries an RX
-  /// TTL — the group and reject steps above still apply: a default node admits
-  /// group-destined mDNS and is not deaf, but not unicast. A caller supplying
-  /// its own [`UdpIo`] whose transport DOES report a hop limit can have a
-  /// conforming (255) unicast datagram admitted regardless of subnets, since
-  /// the hop-limit step above is decisive first. Configure local subnets to
-  /// admit on-subnet unicast when the hop limit is not reported.
+  /// OPTIONAL. With no subnets configured, the group and reject steps above
+  /// still apply: a default node admits group-destined mDNS and is not deaf,
+  /// but not unicast. Configure local subnets to admit on-subnet unicast too.
+  ///
+  /// `subnets` must be THIS `Engine`'s own single interface's prefixes — see
+  /// [`UdpIo`]'s one-interface-per-implementation contract. Pumping this
+  /// `Engine` with a `UdpIo` that aggregates more than one physical interface
+  /// admits cross-interface unicast here, silently.
   pub fn set_local_subnets(&mut self, subnets: Vec<IpCidr>) {
     self.subnets = subnets;
   }
@@ -1057,13 +1057,12 @@ where
       // on the shared Arc — do NOT bump them here too (double-count).
       #[cfg(feature = "defmt")]
       defmt::trace!("rx {} bytes", len);
-      if onlink::on_link(meta.hop_limit, meta.src.ip(), meta.local, &self.subnets) {
+      if onlink::on_link(meta.src.ip(), meta.local, &self.subnets) {
         self.handle_one(now, meta.src, meta.local, &scratch[..len]);
       } else {
-        // RFC 6762 §11: off-link datagram — a present hop limit other than
-        // 255, or an absent one with neither an mDNS-group destination nor an
-        // on-subnet source. Discard without calling into the proto layer. The
-        // datagram WAS received off the socket, so count packets_rx/bytes_rx
+        // RFC 6762 §11: off-link datagram — neither an mDNS-group destination
+        // nor an on-subnet source. Discard without calling into the proto layer.
+        // The datagram WAS received off the socket, so count packets_rx/bytes_rx
         // here (handle() never runs for it) plus the packets_dropped reject —
         // matching the reactor/compio pre-handle drop accounting so receive
         // volume and the drop stay driver-consistent rather than hidden here.

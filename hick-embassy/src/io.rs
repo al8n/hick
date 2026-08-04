@@ -30,11 +30,12 @@ fn recv_from(socket: &UdpSocket<'_>, buf: &mut [u8]) -> Option<RecvMeta> {
       src: meta.endpoint.into(),
       local: meta.local_address.map(Into::into),
       // embassy-net (like smoltcp) doesn't surface the received hop-limit yet, so
-      // the engine's §11 gate falls through in order: the mDNS group is admitted
-      // outright (arrival at the group is its own §11 admission ground; a peer
-      // outside your configured subnets is still on your link if its multicast
-      // reached you); otherwise, for a non-group destination, subnet membership
-      // decides; otherwise reject.
+      // this is diagnostic-only `None`; the engine's §11 gate does not take a
+      // hop-limit input at all. It decides on destination and source alone: the
+      // mDNS group is admitted outright (arrival at the group is its own §11
+      // admission ground; a peer outside your configured subnets is still on
+      // your link if its multicast reached you); otherwise, for a non-group
+      // destination, subnet membership decides; otherwise reject.
       hop_limit: None,
       len,
     }),

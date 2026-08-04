@@ -19,12 +19,17 @@ use crate::{
 /// single-stack node. Do NOT share one socket for both families — that re-creates
 /// the wrong-family-enqueue hazard.
 ///
-/// Takes the sockets by `&mut` so it can ENFORCE the RFC 6762 §11 transmit invariant
-/// (hop-limit 255 on every outgoing mDNS packet) once at startup: embassy-net creates
-/// UDP sockets with hop-limit `None`, which smoltcp egresses as 64, and a conformant
-/// peer rejects anything but 255 — so a node would otherwise look established while
-/// being invisible. The `DualUdp` send path holds only shared `&UdpSocket`, so this is
-/// the point that still has the `&mut` needed to call `set_hop_limit`.
+/// Takes the sockets by `&mut` so it can honour the RFC 6762 §11 transmit
+/// `SHOULD` (hop-limit 255 on every outgoing mDNS packet) once at startup:
+/// embassy-net creates UDP sockets with hop-limit `None`, which smoltcp
+/// egresses as 64. §11 recommends 255 only for backwards-compatibility with
+/// OLDER queriers implementing the February-2004 draft, which discard
+/// everything but 255 on reception — a modern §11-conformant receiver's
+/// on-link test never consults the received hop-limit at all. Setting it
+/// costs nothing on the send path, so this crate does it unconditionally
+/// rather than risk looking established while being invisible to those older
+/// queriers. The `DualUdp` send path holds only shared `&UdpSocket`, so this
+/// is the point that still has the `&mut` needed to call `set_hop_limit`.
 ///
 /// The caller must, before spawning this, for each socket present:
 /// - `socket.bind(5353)`,
