@@ -30,6 +30,7 @@ pub use family::Family;
 
 /// Multicast socket configuration + cmsg parsing.
 pub mod multicast;
+pub mod onlink;
 mod platform;
 pub mod selfsend;
 /// Sync convenience wrappers.
@@ -38,9 +39,14 @@ pub mod sync;
 #[cfg(unix)]
 pub use multicast::recv_with_meta;
 pub use multicast::{
-  MulticastOptionsV4, MulticastOptionsV6, RX_TIMESTAMP_GRAIN, RecvMeta, reports_rx_interface_v4,
-  reports_rx_interface_v6, try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
+  LinkDelivery, MulticastOptionsV4, MulticastOptionsV6, RX_TIMESTAMP_GRAIN, RecvMeta,
+  reports_rx_interface_v4, reports_rx_interface_v6, try_bind_v4, try_bind_v6, try_join_v4,
+  try_join_v6,
 };
+// A driver with its own `recvmsg` still has to read the kernel's `msg_flags`,
+// and what its bits mean is this crate's business rather than each driver's.
+#[cfg(unix)]
+pub use multicast::link_delivery_from_msg_flags;
 // `parse_pktinfo_v6` exists only where libc defines `IPV6_PKTINFO`
 // (`has_ipv6_pktinfo`, see build.rs); gate the re-export identically.
 #[cfg(has_ipv6_pktinfo)]

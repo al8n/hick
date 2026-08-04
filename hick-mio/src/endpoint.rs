@@ -18,14 +18,18 @@ use mio::{Registry, Token};
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
 
-use hick_udp::selfsend::SelfSendTracker;
+use hick_udp::{
+  onlink::{collect_local_subnets, is_loopback_interface},
+  selfsend::SelfSendTracker,
+};
 
+#[cfg(test)]
+use crate::driver::IngressRecord;
 use crate::{
   discovery::{LookupHandle, Lookups},
   driver::{FamilyWireGate, SendHealth, TxQueue, TxSlot},
   error::{RegisterError, ServerError, StartQueryError},
   event::{Event, EventQueue},
-  onlink::collect_local_subnets,
   options::ServerOptions,
   proto::{ProtoEndpoint, ProtoService},
   socket::Sockets,
@@ -157,13 +161,41 @@ pub struct Mdns {
   /// The ONE queue every caller-visible signal is delivered through.
   pub(crate) events: EventQueue,
   /// Addresses configured on the bound interface, snapshotted at construction.
-  /// The RFC 6762 §11 fallback for platforms that deliver no TTL cmsg. Scoped
+  /// The addresses §11's unicast arm compares a source against, re-read on a
+  /// bounded interval (see [`Self::subnets_refreshed_at`]). Scoped
   /// to the bound interface only, so an unrelated NIC's subnet cannot widen the
   /// trust boundary.
   pub(crate) local_subnets: Vec<(IpAddr, u8)>,
-  /// The interface both sockets are scoped to. The §11 fallback needs it to
-  /// scope a link-local source to the link we actually joined.
+  /// The interface both sockets are scoped to, and the link every inbound
+  /// datagram is measured against.
   pub(crate) bound_interface: u32,
+  /// Whether [`Self::bound_interface`] is the loopback interface, resolved once
+  /// here rather than per datagram. It is the only thing that opens the §11
+  /// loopback exception: a loopback SOURCE address is forgeable onto a real NIC
+  /// wherever an operator has stopped treating `127/8` as martian, so an
+  /// endpoint serving a physical link grants it nothing.
+  pub(crate) bound_is_loopback: bool,
+  /// When [`Self::local_subnets`] was last read from the interface.
+  ///
+  /// §11's unicast arm compares a source against the receiving interface's
+  /// configuration as it IS. An address can change under a live endpoint — a
+  /// DHCP lease lost into APIPA, a renumbered subnet — and a snapshot taken once
+  /// at construction is then wrong in both directions: current-prefix traffic
+  /// refused, obsolete prefix still admitted. `getifs` offers no change
+  /// notification on any supported platform, so this is polled on a bounded
+  /// interval. See [`hick_udp::onlink::refresh_subnets_if_stale`].
+  pub(crate) subnets_refreshed_at: std::time::Instant,
+  /// What the ingress boundary did with each datagram, recorded per-datagram so
+  /// a test can name the ONE it sent rather than read a shared counter.
+  ///
+  /// `packets_dropped` and `packets_rx` are all-cause and cumulative: proto
+  /// suppression and a deliberately invalid DNS header bump the same
+  /// `packets_dropped` the §11 gate does, so "the counter moved" stays true on
+  /// the very path a regression would take. Each entry here carries the family
+  /// and a fingerprint of the body, so a test asserts about its own datagram
+  /// and about the stage that decided it. Never read by production.
+  #[cfg(test)]
+  pub(crate) ingress_log: Vec<IngressRecord>,
   /// Encode scratch for `poll_transmit`, sized by
   /// [`ServerOptions::max_payload_size`].
   pub(crate) send_buf: Vec<u8>,
@@ -334,6 +366,10 @@ impl Mdns {
       events: EventQueue::new(),
       local_subnets: collect_local_subnets(bound_interface),
       bound_interface,
+      bound_is_loopback: is_loopback_interface(bound_interface),
+      subnets_refreshed_at: std::time::Instant::now(),
+      #[cfg(test)]
+      ingress_log: Vec::new(),
       send_buf,
       recv_buf,
       svc_scratch: Vec::new(),

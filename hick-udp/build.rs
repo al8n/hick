@@ -10,9 +10,13 @@
 //! Capability → enabling libc constants (verified against libc 0.2):
 //!   * has_ip_pktinfo IP_PKTINFO / IP_RECVPKTINFO (+ in_pktinfo parse)
 //!   * has_ipv6_pktinfo IPV6_PKTINFO + IPV6_RECVPKTINFO
-//!   * has_recv_hoplimit IP_RECVTTL + IPV6_HOPLIMIT + IPV6_RECVHOPLIMIT (§11)
+//!   * has_recv_hoplimit IP_RECVTTL + IPV6_HOPLIMIT + IPV6_RECVHOPLIMIT, for
+//!     the `RecvMeta::hop_limit` diagnostic; no §11 decision reads it
 //!   * has_msg_mcast MSG_MCAST, the `recvmsg` result flag saying the datagram
 //!     was delivered as a multicast rather than to this host alone
+//!   * has_msg_bcast MSG_BCAST, its sibling saying the datagram was delivered
+//!     as a link-layer broadcast — negative evidence RFC 6762 §11 gives no arm
+//!     to, and the only exact destination fact the netbsdlike IPv4 square has
 //!   * has_recv_timestamp SO_TIMESTAMP[NS] + SCM_TIMESTAMP[NS]
 //!   * recv_timestamp_ns the timestamp cmsg is nanosecond SO_TIMESTAMPNS
 //!     (Linux/Android); otherwise it is microsecond SO_TIMESTAMP.
@@ -39,6 +43,7 @@ fn main() {
     "has_ipv6_pktinfo",
     "has_recv_hoplimit",
     "has_msg_mcast",
+    "has_msg_bcast",
     "has_recv_timestamp",
     "recv_timestamp_ns",
     "ipv4_rx_dstaddr_recvif",
@@ -135,15 +140,14 @@ fn main() {
   if linux_like || apple || freebsdlike || netbsdlike {
     println!("cargo::rustc-cfg=has_ipv6_pktinfo");
   }
-  // RFC 6762 §11 TTL/Hop-Limit receive cmsg. Off on netbsdlike because `libc`
-  // BINDS none of IP_RECVTTL/IPV6_HOPLIMIT/IPV6_RECVHOPLIMIT for OpenBSD or
-  // NetBSD — a binding gap, NOT a platform incapability. Both are KAME-derived
-  // stacks that report the hop limit exactly as RFC 3542 specifies, so a
-  // receiver there is degraded by what this crate can reach through `libc`, not
-  // by what the kernel knows. Stated precisely because the §11 fail-open rule
-  // ("no hop limit ⇒ we can prove neither on-link nor off-link") is a real
-  // exemption on Windows, where the sockopt genuinely does not exist, and only
-  // an accident of bindings here.
+  // Inbound TTL/Hop-Limit receive cmsg, surfaced as a DIAGNOSTIC on
+  // `RecvMeta::hop_limit`. RFC 6762 §11's receive test is stated exhaustively
+  // and both ways are about the destination address, so nothing admits or
+  // refuses on this value and a target without the cmsg loses no admission
+  // capability. Off on netbsdlike because `libc` BINDS none of
+  // IP_RECVTTL/IPV6_HOPLIMIT/IPV6_RECVHOPLIMIT for OpenBSD or NetBSD — a
+  // binding gap rather than a platform incapability, both being KAME-derived
+  // stacks that report the hop limit exactly as RFC 3542 specifies.
   if linux_like || apple || freebsdlike {
     println!("cargo::rustc-cfg=has_recv_hoplimit");
   }
@@ -155,6 +159,26 @@ fn main() {
   // its two local-link tests by destination.
   if netbsdlike {
     println!("cargo::rustc-cfg=has_msg_mcast");
+  }
+  // MSG_BCAST: the sibling result flag saying the datagram arrived as a
+  // link-layer BROADCAST. Bound for netbsdlike and nobody else
+  // (src/unix/bsd/netbsdlike/mod.rs:576, value 0x100, one line above the
+  // MSG_MCAST above), and read from the same `msg_flags` word in the same
+  // decode.
+  //
+  // NOT one of the flips the block above sets an evidence bar for, and the
+  // distinction is worth stating. That bar exists because promoting
+  // `has_ip_pktinfo` INVERTS what an absent interface witness means, so a
+  // silently wrong parse turns into silent deafness. This cfg sets no sockopt,
+  // parses no cmsg and touches no witness rule: it reads one more bit of a word
+  // `recvmsg` already returns and this crate already reads, and it can only make
+  // `admits_ingress` refuse a datagram the kernel called a broadcast — which
+  // §11 gives no arm to whatever else is true of it. The one way it could cost
+  // availability is a kernel that sets MSG_BCAST on group traffic, and
+  // `msg_link_delivery` resolves that contradiction toward MSG_MCAST for
+  // exactly that reason.
+  if netbsdlike {
+    println!("cargo::rustc-cfg=has_msg_bcast");
   }
   // Kernel receive-timestamp cmsg (all supported Unix).
   if linux_like || apple || freebsdlike || netbsdlike {

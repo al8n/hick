@@ -99,9 +99,10 @@ pub(crate) fn set_recv_timestamp(_sock: &UdpSocket) -> std::io::Result<()> {
 }
 
 /// No-op on Windows: inbound TTL receipt is out of scope here, so
-/// `RecvMeta::hop_limit` is always `None`. The §11 on-link check then relies on
-/// the source-address fallback, now correctly scoped to the bound interface via
-/// the PKTINFO interface index that `recv_with_meta` recovers.
+/// `RecvMeta::hop_limit` is always `None`. Nothing depends on it — RFC 6762
+/// §11's receive test is about the destination address — and this path still
+/// recovers the destination and the PKTINFO interface index, which are what the
+/// boundary actually reads.
 pub(crate) fn set_recv_ttl_v4(_sock: &UdpSocket) -> std::io::Result<()> {
   Ok(())
 }

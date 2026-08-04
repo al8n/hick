@@ -2942,22 +2942,28 @@ fn an_undeliverable_question_retires_the_query() {
 
 // ── the ingress interface gate, wired ───────────────────────────────────────
 
-/// The explicit loopback exception, through the real receive path.
+/// A REPORTED foreign interface refuses our own echo, through the real receive
+/// path — and the loopback exception does not rescue it.
 ///
-/// The gate drops a datagram whose reported interface index is not the one this
-/// endpoint bound. Our own multicast echo is the traffic loopback suppression
-/// depends on, and a platform is free to report it as having arrived on the
-/// loopback pseudo-interface rather than on the socket's egress interface — so
-/// the exception is stated in `onlink::arrived_on_bound_interface` rather than
-/// left to fall out of the index comparison. This forces exactly that
-/// disagreement and pins that the echo still reaches the self-send match.
+/// This inverts what this test used to assert. The old policy let a loopback
+/// SOURCE override the interface the kernel reported, justified by "a platform
+/// is free to report the echo as having arrived on the loopback
+/// pseudo-interface rather than the socket's egress interface". That
+/// justification was never checked against a live host —
+/// `an_own_echo_is_reported_on_the_interface_this_endpoint_bound` now checks it
+/// — and it is the wrong shape regardless: these sockets are wildcard bound, so
+/// wherever an operator has stopped treating `127/8` as martian a
+/// physical-interface unicast can carry a loopback source straight to port
+/// 5353. A source address is a claim the sender wrote; a nonzero interface
+/// index is evidence the kernel attached, and the evidence wins.
 ///
-/// It cannot be inverted into a rejection test on this fixture: an endpoint
-/// pinned to the loopback interface only ever receives loopback-sourced
-/// datagrams, which is the very case the exception admits. The rejection matrix
-/// lives in `onlink::tests`, against the same function this path calls.
+/// The observable is [`IngressRecord`] for THIS datagram, not a counter.
+/// `packets_dropped` is all-cause and cumulative: on the forbidden path the
+/// datagram reaches proto, proto rejects the deliberately invalid header, and
+/// the same counter moves — so a counter-based assertion passes exactly when it
+/// should fail.
 #[test]
-fn an_own_echo_survives_a_foreign_interface_index() {
+fn a_foreign_interface_index_refuses_our_own_echo() {
   let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
     return;
   };
@@ -2967,19 +2973,25 @@ fn an_own_echo_survives_a_foreign_interface_index() {
     .expect("register");
 
   let body = [0x3Cu8; 28];
+  let want = crate::driver::body_fingerprint(&body);
   if credit_a_multicast_send(&mut mdns, &body).is_none() {
     mdns.deregister().expect("deregister");
+    eprintln!(
+      "note: no multicast send reached the wire on this host, so this case \
+       contributes no evidence"
+    );
     return;
   }
   // Every subsequent receive now reports an interface this endpoint did not
-  // bind — the disagreement a loopback copy can genuinely show.
+  // bind. Baseline first: only records added after this line are ours.
+  mdns.ingress_log.clear();
   let foreign = mdns.bound_interface.wrapping_add(1_000);
   mdns.sockets.force_rx_interface_for_test(Some(foreign));
 
   let mut events = mio::Events::with_capacity(8);
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut poll = poll;
-  while Instant::now() < deadline && !mdns.selfsend.is_empty() {
+  while Instant::now() < deadline && !mdns.ingress_log.iter().any(|r| r.body == want) {
     poll
       .poll(&mut events, Some(Duration::from_millis(100)))
       .expect("poll");
@@ -2990,27 +3002,103 @@ fn an_own_echo_survives_a_foreign_interface_index() {
     }
     mdns.tick().expect("tick");
   }
-  let matched = mdns.selfsend.is_empty();
-  // The excuse must gate on an observed counter, or a regression in the gate
-  // itself would present as "the echo never arrived" and take this test green.
-  // `packets_rx` counts every datagram that left the kernel queue, including one
-  // the trust boundary then dropped, so it separates a host whose loopback
-  // egress went nowhere from a gate that swallowed the echo.
-  let arrived = saw_own_loopback(&mdns);
+  let ours: Vec<_> = mdns
+    .ingress_log
+    .iter()
+    .filter(|r| r.body == want && r.family == Family::V4)
+    .copied()
+    .collect();
   mdns.deregister().expect("deregister");
-  assert!(
-    matched || !arrived,
-    "our own multicast echo reached this endpoint and did not reach the \
-     self-send match: the loopback exception in the ingress interface gate is \
-     what keeps a foreign interface index from swallowing it"
-  );
-  if !matched {
-    // Nothing was skipped: the assertion above ran, and `arrived` being false is
-    // the only way it can pass here. Said as a note rather than a `skipping:`
-    // line so the word keeps meaning "an assertion did not run".
+
+  if ours.is_empty() {
     eprintln!(
-      "note: this endpoint's own multicast never looped back, so the assertion \
-       above held vacuously"
+      "note: this endpoint's own multicast never looped back, so no datagram \
+       reached the gate and this host contributes no evidence"
+    );
+    return;
+  }
+  for rec in ours {
+    assert!(
+      !rec.admitted,
+      "our own echo, forced to report interface {foreign}, was ADMITTED: a \
+       loopback source must not override the interface the kernel attached"
+    );
+  }
+}
+
+/// Which interface does a REAL self-echo actually arrive on?
+///
+/// This is the premise the old loopback exception rested on, checked instead of
+/// assumed. If a supported platform genuinely reported our own multicast echo on
+/// some interface other than the socket's egress interface, the policy above
+/// would break self-send suppression there and a different exception design
+/// would be needed.
+///
+/// It matches on the fingerprint of the exact body it transmitted, so unrelated
+/// mDNS traffic on the host — of which there is usually plenty on port 5353 —
+/// cannot stand in for an echo that never looped back. Where no such datagram
+/// arrives it says so and asserts nothing, because a host that does not loop its
+/// own multicast back contributes no evidence either way.
+#[test]
+fn an_own_echo_is_reported_on_the_interface_this_endpoint_bound() {
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let poll = Poll::new().expect("poll");
+  mdns
+    .register(poll.registry(), Token(42), Token(43))
+    .expect("register");
+
+  let body = [0x5Au8; 28];
+  let want = crate::driver::body_fingerprint(&body);
+  if credit_a_multicast_send(&mut mdns, &body).is_none() {
+    mdns.deregister().expect("deregister");
+    eprintln!(
+      "note: no multicast send reached the wire on this host, so this case \
+       contributes no evidence"
+    );
+    return;
+  }
+  mdns.ingress_log.clear();
+
+  let mut events = mio::Events::with_capacity(8);
+  let deadline = Instant::now() + Duration::from_secs(2);
+  let mut poll = poll;
+  while Instant::now() < deadline && !mdns.ingress_log.iter().any(|r| r.body == want) {
+    poll
+      .poll(&mut events, Some(Duration::from_millis(100)))
+      .expect("poll");
+    for ev in events.iter() {
+      if mdns.owns(ev.token()) {
+        mdns.handle_io(ev);
+      }
+    }
+    mdns.tick().expect("tick");
+  }
+  let bound = mdns.bound_interface;
+  let ours: Vec<_> = mdns
+    .ingress_log
+    .iter()
+    .filter(|r| r.body == want && r.family == Family::V4)
+    .copied()
+    .collect();
+  mdns.deregister().expect("deregister");
+
+  if ours.is_empty() {
+    eprintln!(
+      "note: this endpoint's own multicast never looped back on this host, so \
+       it contributes no evidence about the reported echo interface"
+    );
+    return;
+  }
+  for rec in ours {
+    assert_eq!(
+      rec.reported_interface, bound,
+      "this host reported our own loopback echo on interface {}, not the bound \
+       interface {bound}: the ingress gate refuses a foreign index, so \
+       self-send suppression would break here and the exception needs a design \
+       that does not rest on the source address",
+      rec.reported_interface
     );
   }
 }
@@ -3066,13 +3154,15 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
       foreign,
     ))));
 
-  let before = dropped_at_the_gate(&mdns);
+  // Baseline: only records added after this line belong to this case.
+  mdns.ingress_log.clear();
+  let want = crate::driver::body_fingerprint(&body);
   let mut events = mio::Events::with_capacity(8);
   // Well inside `SELF_SEND_TTL` (2 s), so an unclaimed credit below is one the
   // gate protected and never one the clock retired.
   let deadline = Instant::now() + Duration::from_millis(750);
   let mut poll = poll;
-  while Instant::now() < deadline && dropped_at_the_gate(&mdns) == before {
+  while Instant::now() < deadline && !mdns.ingress_log.iter().any(|r| r.body == want) {
     poll
       .poll(&mut events, Some(Duration::from_millis(50)))
       .expect("poll");
@@ -3084,8 +3174,12 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
     mdns.tick().expect("tick");
   }
   let unclaimed = !mdns.selfsend.is_empty();
-  let dropped = dropped_at_the_gate(&mdns) > before;
-  let arrived = saw_own_loopback(&mdns);
+  let ours: Vec<_> = mdns
+    .ingress_log
+    .iter()
+    .filter(|r| r.body == want)
+    .copied()
+    .collect();
   mdns.deregister().expect("deregister");
   assert!(
     unclaimed,
@@ -3093,68 +3187,23 @@ fn a_conflicting_peer_scope_is_dropped_before_the_self_send_credit() {
      the ingress gate must reject it before the take-once credit is consulted, \
      and before `endpoint.handle` can cache anything it carries"
   );
-  // The assertion above is vacuous on a host that delivered nothing, so the
-  // other half is asserted rather than assumed wherever a counter can tell.
-  // `force_rx_peer_for_test` rewrites the peer of EVERY arrival, so a datagram
-  // that reached the queue and did not raise the drop counter is one the gate
-  // let through — and the credit above would then be gone, not unclaimed.
-  // Without `stats` neither counter exists, so there is nothing to weigh and
-  // nothing worth reporting.
-  #[cfg(feature = "stats")]
-  {
-    assert!(
-      dropped || !arrived,
-      "this endpoint read a datagram off its own queue, left its credit \
-       unclaimed, and never counted a drop: something between the queue and the \
-       self-send match swallowed it without the ingress gate rejecting it"
+  // The assertion above is vacuous on a host that delivered nothing, and an
+  // unclaimed credit alone cannot say WHICH stage refused the datagram. The
+  // per-datagram record can: it names this body and the gate's own verdict on
+  // it, where a shared `packets_dropped` would also move if proto rejected the
+  // same datagram after the gate let it through.
+  if ours.is_empty() {
+    eprintln!(
+      "note: this endpoint's own multicast never looped back, so no datagram \
+       reached the gate and the assertion above held vacuously"
     );
-    if !arrived {
-      // Nothing was skipped here either: what is reported is that the run was
-      // vacuous, not that an assertion was withheld.
-      eprintln!(
-        "note: this endpoint's own multicast never looped back, so the assertions \
-         above held vacuously"
-      );
-    }
   }
-  #[cfg(not(feature = "stats"))]
-  let _ = (dropped, arrived);
-}
-
-/// How many datagrams this endpoint has read and then thrown away, or `0` where
-/// there is no counter to ask.
-///
-/// The ingress gate is the only stage before the self-send match that both
-/// reads a datagram off the queue and drops it, so a rise here across the poll
-/// loop above is the gate firing. Without the `stats` feature this is constant,
-/// and the caller's loop simply runs out its budget.
-fn dropped_at_the_gate(mdns: &Mdns) -> u64 {
-  #[cfg(feature = "stats")]
-  {
-    mdns.stats().packets_dropped
-  }
-  #[cfg(not(feature = "stats"))]
-  {
-    let _ = mdns;
-    0
-  }
-}
-
-/// Whether this endpoint has read any datagram off its own sockets, dropped or
-/// not.
-///
-/// The egress probe [`crate::Mdns::stats`] gives, under the same fallback the
-/// loopback integration tests use: with no `stats` feature there is no counter
-/// to consult, so it reports `true` and the caller asserts unconditionally.
-fn saw_own_loopback(mdns: &Mdns) -> bool {
-  #[cfg(feature = "stats")]
-  {
-    mdns.stats().packets_rx > 0
-  }
-  #[cfg(not(feature = "stats"))]
-  {
-    let _ = mdns;
-    true
+  for rec in ours {
+    assert!(
+      !rec.admitted,
+      "the ingress gate ADMITTED an echo whose source zone names another link: \
+       an unclaimed credit afterwards would then be an expiry, not a refusal"
+    );
   }
 }
 
@@ -3757,8 +3806,13 @@ fn a_degraded_claim_stalled_after_admission_is_rejected() {
 /// * `IP_MULTICAST_IF` = 127.0.0.1, or the datagram egresses on the host's
 ///   default multicast interface and an endpoint joined only on loopback never
 ///   sees it;
-/// * `IP_MULTICAST_TTL` = 255, or the §11 on-link gate drops it long before any
-///   credit is weighed and the test asserts over an empty receive stage;
+/// * `IP_MULTICAST_TTL` = 255 — fixture normalisation, and load-bearing for
+///   nothing. It is NOT needed for the ingress boundary, which reads no hop
+///   limit; nor for delivery, since RFC 1112 requires the local loopback copy
+///   regardless of TTL; nor by §11, whose 255 recommendation is about RESPONSES
+///   and this fixture sends queries. An earlier version of this note claimed all
+///   three, which was false evidence about the setup. It is set so the fixture
+///   emits what a conforming responder would;
 /// * `IP_MULTICAST_LOOP`, on by default but set explicitly, because same-host
 ///   delivery is the whole point.
 ///
@@ -4657,4 +4711,140 @@ fn a_question_drawn_past_the_callers_window_never_reaches_the_wire() {
     !mdns.queries.contains_key(&handle),
     "and the ended query must not be left resident"
   );
+}
+
+/// A renumbering under a LIVE endpoint is picked up, through `drain_recv`, in
+/// BOTH directions and on the interface actually asked for.
+///
+/// §11 compares a source against the receiving interface's configuration as it
+/// IS. A snapshot taken once at bind is wrong in both directions the moment an
+/// address changes, and it became load-bearing when the TTL arm was removed.
+///
+/// Three things this has to establish, and an earlier version established only
+/// the first: that the obsolete prefix stops being admitted; that the CURRENT
+/// one starts; and that the refresh asked about the interface this endpoint
+/// bound. Without the last, production could refresh interface 0 or a foreign
+/// one — or merely clear the snapshot — and the first two would still hold.
+///
+/// It drives the real receive stage: the datagram arrives on a real socket,
+/// `drain_recv` refreshes and gates it, and the observable is the
+/// [`IngressRecord`] that stage writes. The peer, receive interface and
+/// destination are forced, because a loopback fixture only ever sees its own
+/// multicast to the group — and the group arm admits regardless of source, which
+/// would leave the prefix unobservable.
+#[test]
+fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
+  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+  let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+    return;
+  };
+  let poll = Poll::new().expect("poll");
+  mdns
+    .register(poll.registry(), Token(50), Token(51))
+    .expect("register");
+
+  // Each snapshot holds the interface's ASSIGNED address and that address's
+  // mask, the way `collect_local_subnets` reports it. The address renumbers with
+  // the interface, and the forced destination renumbers with it — a datagram
+  // unicast to this host after a renumbering is addressed to the address it now
+  // holds, and a destination the interface does not hold reaches no §11 arm at
+  // all, which would make the prefix unobservable in the other direction.
+  const OLD_OWN_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2));
+  const NEW_OWN_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 0, 2));
+
+  mdns.bound_is_loopback = false;
+  mdns.local_subnets = vec![(OLD_OWN_ADDR, 24u8)];
+  let bound = mdns.bound_interface;
+  mdns.sockets.force_rx_interface_for_test(Some(bound));
+  // A UNICAST destination — one this interface holds — so §11's source-prefix
+  // arm is what decides.
+  mdns
+    .sockets
+    .force_rx_destination_for_test(Some(Some(OLD_OWN_ADDR)));
+
+  let old_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)), 5353);
+  let new_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 3, 9)), 5353);
+
+  let mut poll = poll;
+  let verdict =
+    |mdns: &mut Mdns, poll: &mut Poll, peer: SocketAddr, body: &[u8; 28]| -> Option<bool> {
+      mdns.sockets.force_rx_peer_for_test(Some(peer));
+      credit_a_multicast_send(mdns, body)?;
+      let want = crate::driver::body_fingerprint(body);
+      mdns.ingress_log.clear();
+      let mut events = mio::Events::with_capacity(8);
+      let deadline = Instant::now() + Duration::from_secs(2);
+      while Instant::now() < deadline && !mdns.ingress_log.iter().any(|r| r.body == want) {
+        poll
+          .poll(&mut events, Some(Duration::from_millis(100)))
+          .expect("poll");
+        for ev in events.iter() {
+          if mdns.owns(ev.token()) {
+            mdns.handle_io(ev);
+          }
+        }
+        mdns.tick().expect("tick");
+      }
+      mdns
+        .ingress_log
+        .iter()
+        .find(|r| r.body == want)
+        .map(|r| r.admitted)
+    };
+
+  let old_before = verdict(&mut mdns, &mut poll, old_peer, &[0x11u8; 28]);
+  let new_before = verdict(&mut mdns, &mut poll, new_peer, &[0x22u8; 28]);
+
+  // The interface renumbers 192.168.1.2/24 -> 169.254.0.2/16 under the live
+  // endpoint. The forced answer is keyed to THIS interface: a refresh aimed at
+  // any other index gets an empty list, so wrong-field wiring cannot pass.
+  hick_udp::onlink::force_enumeration_for_test(Some((bound, vec![(NEW_OWN_ADDR, 16u8)])));
+  // The address this host answers to renumbers with it, so both phases below
+  // reach §11's second arm and the SOURCE prefix is the only thing that differs.
+  mdns
+    .sockets
+    .force_rx_destination_for_test(Some(Some(NEW_OWN_ADDR)));
+  mdns.subnets_refreshed_at = Instant::now()
+    .checked_sub(hick_udp::onlink::SUBNET_REFRESH_INTERVAL + Duration::from_millis(50))
+    .expect("a monotonic instant that far back exists on this host");
+
+  let old_after = verdict(&mut mdns, &mut poll, old_peer, &[0x33u8; 28]);
+  let new_after = verdict(&mut mdns, &mut poll, new_peer, &[0x44u8; 28]);
+  let asked = hick_udp::onlink::last_enumerated_interface_for_test();
+  hick_udp::onlink::force_enumeration_for_test(None);
+  mdns.deregister().expect("deregister");
+
+  match (old_before, new_before, old_after, new_after) {
+    (Some(ob), Some(nb), Some(oa), Some(na)) => {
+      assert!(
+        ob,
+        "the configured prefix must admit before the renumbering"
+      );
+      assert!(
+        !nb,
+        "the future prefix must not admit before the renumbering"
+      );
+      assert!(
+        !oa,
+        "the obsolete prefix must stop being admissible once the interface \
+         changed, and `drain_recv` is what has to notice"
+      );
+      assert!(
+        na,
+        "the current prefix must start being admitted without a restart"
+      );
+      assert_eq!(
+        asked,
+        Some(bound),
+        "the refresh must enumerate the interface this endpoint BOUND; \
+         refreshing index 0 or a foreign one would leave the four assertions \
+         above green while isolating nothing"
+      );
+    }
+    _ => eprintln!(
+      "note: this endpoint's own multicast never looped back, so no datagram \
+       reached the receive stage and this host contributes no evidence"
+    ),
+  }
 }

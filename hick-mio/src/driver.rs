@@ -169,9 +169,41 @@ use mdns_proto::{
   event::RouteEvent,
 };
 
-use crate::{endpoint::Mdns, error::TickError, event::Event, onlink};
+use hick_udp::onlink;
+
+use crate::{endpoint::Mdns, error::TickError, event::Event};
 
 pub(crate) use sends::{FamilyWireGate, SendHealth, send_and_credit};
+/// One datagram's passage through the ingress trust boundary, as a test needs to
+/// read it: which family carried it, which body it was, what the kernel said the
+/// interface was, and whether the §11 gate admitted it.
+///
+/// A fingerprint rather than the bytes so the record stays small, and the family
+/// alongside it because a dual-stack transmit puts identical bytes on two
+/// sockets. The point of recording at all is that the shared `packets_dropped` /
+/// `packets_rx` counters are all-cause: a test that reads them cannot tell the
+/// §11 gate from proto's own rejection of the same datagram, so it keeps passing
+/// on the path a regression takes.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IngressRecord {
+  pub(crate) family: hick_udp::Family,
+  pub(crate) body: u64,
+  pub(crate) reported_interface: u32,
+  pub(crate) admitted: bool,
+}
+
+/// FNV-1a over a datagram body. Test-only, and only ever compared against
+/// itself — it names a specific datagram within one test run and nothing more.
+#[cfg(test)]
+pub(crate) fn body_fingerprint(body: &[u8]) -> u64 {
+  let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+  for b in body {
+    h ^= u64::from(*b);
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+  }
+  h
+}
 
 /// Per-family delivery reporting, the per-family wire gate, and the link-health
 /// signal — see the module's own docs.
@@ -549,6 +581,10 @@ impl Mdns {
         recv_buf,
         local_subnets,
         bound_interface,
+        bound_is_loopback,
+        subnets_refreshed_at,
+        #[cfg(test)]
+        ingress_log,
         #[cfg(test)]
         forced_claim_delays,
         ..
@@ -579,26 +615,57 @@ impl Mdns {
       // limit says nothing about *whose* link a wildcard-bound socket heard.
       //
       // `destination` is the datagram's IP header destination, which is what
-      // selects between §11's two arms where no hop limit was reported, and
-      // `multicast_flag` is the kernel's coarser stand-in where no destination
+      // selects between §11's two arms, and
+      // `delivery` is the kernel's coarser stand-in where no destination
       // was recovered. NOT `local_ip`, which on Unix IPv4 is the receiving
       // interface's own address and can never equal a group — see
       // `admits_ingress` for why reading it here rejected the very traffic §11
       // exists to admit.
+      //
+      // Where `destination` is `None` — `recv_with_meta`'s IPv4 receives on
+      // FreeBSD, DragonFly, OpenBSD and NetBSD — `admits_ingress` is in its
+      // SECOND regime and its guarantee that a destination this endpoint does
+      // not hold is refused does not apply. What is left there is `delivery`:
+      // `Broadcast` refuses on OpenBSD/NetBSD, which closes the IPv4 broadcast
+      // class on those two; `Multicast` admits any group from any source; and
+      // FreeBSD/DragonFly have neither flag, so a broadcast is still admitted
+      // there for an in-prefix source. Wiring the BSD IPv4 ancillary parsers is
+      // what moves those squares into the first regime; see
+      // `hick-udp/build.rs`.
       let pkt_iface = sockets.rx_interface(&meta);
-      if !onlink::admits_ingress(
-        sockets.rx_peer(&meta),
-        meta.destination(),
-        meta.multicast_flag(),
-        meta.hop_limit(),
-        local_subnets,
-        *bound_interface,
+      let peer = sockets.rx_peer(&meta);
+      // §11 compares against the interface's configuration as it is, so the
+      // snapshot is re-read once it ages past the shared interval. One clock
+      // read per datagram; one enumeration per interval at most.
+      onlink::refresh_subnets_if_stale(*bound_interface, local_subnets, subnets_refreshed_at);
+      // NOT the hop limit: RFC 6762 §11's receive test is stated exhaustively
+      // and is about the destination address. Inbound TTL appears in the RFC
+      // once, explaining why responses SHOULD be SENT at 255 for the benefit of
+      // 2004-draft queriers — it is not a test a reader is told to apply, and
+      // applying it refused conforming traffic (§5.5 unicast queries at the
+      // stack's default TTL, group queries at the socket-default multicast TTL
+      // of 1) while admitting witnessed out-of-prefix unicast. Outbound 255 is
+      // unaffected and still honoured.
+      let admitted = onlink::admits_ingress(
+        peer,
+        sockets.rx_destination(&meta),
+        meta.delivery(),
+        onlink::BoundLink::new(*bound_interface, *bound_is_loopback, local_subnets),
         pkt_iface,
-      ) {
+        sockets.rx_interface_reported(peer),
+      );
+      #[cfg(test)]
+      ingress_log.push(IngressRecord {
+        family,
+        body: body_fingerprint(data),
+        reported_interface: meta.interface_index(),
+        admitted,
+      });
+      if !admitted {
         hick_trace::debug!(
           src = %meta.peer(),
-          dst = ?meta.destination(),
-          multicast_flag = ?meta.multicast_flag(),
+          dst = ?sockets.rx_destination(&meta),
+          delivery = ?meta.delivery(),
           hop_limit = ?meta.hop_limit(),
           interface_index = pkt_iface,
           bound_interface = *bound_interface,
