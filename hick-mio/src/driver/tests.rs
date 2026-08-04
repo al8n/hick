@@ -13,7 +13,10 @@ use super::{
   EVENT_QUEUE_COMPACT_THRESHOLD, FamilyWireGate, MAX_SEND_CREDITS_PER_DRAIN,
   RETRY_INTEREST_BACKOFF, TxQueue, datagram_cost, packet_is_response, test_support,
 };
-use hick_udp::selfsend::{RxEvidence, SELF_SEND_TTL};
+use hick_udp::{
+  onlink::{DestinationWitness, IfaceWitness},
+  selfsend::{RxEvidence, SELF_SEND_TTL},
+};
 
 use crate::{
   endpoint::Mdns,
@@ -21,6 +24,19 @@ use crate::{
   event::{Event, EventQueue},
   socket::{Family, MDNS_V4_DST},
 };
+
+/// `idx` as the interface witness a receive path that DID name the link would
+/// mint.
+///
+/// Spelled with a `match` rather than `unwrap`, and defaulting to
+/// [`IfaceWitness::Lost`], because a zero would be a fixture bug and `Lost` is
+/// the value that cannot silently widen the §11 gate if one ever appeared.
+fn iface_witness(idx: u32) -> IfaceWitness {
+  match core::num::NonZeroU32::new(idx) {
+    Some(idx) => IfaceWitness::Witnessed(idx),
+    None => IfaceWitness::Lost,
+  }
+}
 
 /// A distinct synthetic answer keyed by `tag`, encoded into the rdata so
 /// different tags do not coalesce. Same shape as `event/tests.rs`.
@@ -3199,7 +3215,9 @@ fn a_foreign_interface_index_refuses_our_own_echo() {
   // bind. Baseline first: only records added after this line are ours.
   mdns.ingress_log.clear();
   let foreign = mdns.bound_interface.wrapping_add(1_000);
-  mdns.sockets.force_rx_interface_for_test(Some(foreign));
+  mdns
+    .sockets
+    .force_rx_iface_for_test(Some(iface_witness(foreign)));
 
   let mut events = mio::Events::with_capacity(8);
   let deadline = Instant::now() + Duration::from_secs(2);
@@ -3236,6 +3254,100 @@ fn a_foreign_interface_index_refuses_our_own_echo() {
       "our own echo, forced to report interface {foreign}, was ADMITTED: a \
        loopback source must not override the interface the kernel attached"
     );
+  }
+}
+
+/// A destination witness the KERNEL declined to emit is admitted where a LOST
+/// one is refused — through the real receive path, on the same datagram.
+///
+/// The split matters because `Lost` and `Declined` are the same missing cmsg
+/// told apart by one flag, and only one of them is the sender's doing. Every BSD
+/// builds its ancillary mbufs with `M_NOWAIT` and, when `sbcreatecontrol`
+/// returns `NULL`, skips the cmsg with no error, no counter and no `MSG_CTRUNC`
+/// while still delivering the datagram (FreeBSD `kern/uipc_sockbuf.c`, NetBSD
+/// `kern/uipc_socket2.c`; XNU checks the allocation and returns `ENOBUFS`
+/// instead). Mbuf exhaustion is normally CAUSED by a flood, so refusing on it
+/// makes the responder go silently deaf exactly while it is under attack.
+/// `MSG_CTRUNC` is the opposite: our own control buffer was too small, which
+/// this side controls and sizes against a worst case, so refusing on it is safe.
+///
+/// The observable is [`IngressRecord`] for THIS datagram — `packets_dropped` is
+/// all-cause and cumulative, so a counter-based assertion passes exactly when it
+/// should fail.
+#[test]
+fn a_declined_destination_witness_is_admitted_where_a_lost_one_is_refused() {
+  for (witness, want_admitted, what) in [
+    (
+      DestinationWitness::Lost,
+      false,
+      "MSG_CTRUNC — our own control buffer",
+    ),
+    (
+      DestinationWitness::Declined,
+      true,
+      "no cmsg, no MSG_CTRUNC — the kernel declined",
+    ),
+  ] {
+    let Some(mut mdns) = test_support::loopback_mdns_v4_only() else {
+      return;
+    };
+    let poll = Poll::new().expect("poll");
+    mdns
+      .register(poll.registry(), Token(60), Token(61))
+      .expect("register");
+
+    let body = [0x7Eu8; 28];
+    let want = crate::driver::body_fingerprint(&body);
+    if credit_a_multicast_send(&mut mdns, &body).is_none() {
+      mdns.deregister().expect("deregister");
+      eprintln!(
+        "note: no multicast send reached the wire on this host, so this case \
+         contributes no evidence"
+      );
+      return;
+    }
+    mdns.ingress_log.clear();
+    mdns.sockets.force_rx_destination_for_test(Some(witness));
+
+    let mut events = mio::Events::with_capacity(8);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut poll = poll;
+    while Instant::now() < deadline && !mdns.ingress_log.iter().any(|r| r.body == want) {
+      poll
+        .poll(&mut events, Some(Duration::from_millis(100)))
+        .expect("poll");
+      for ev in events.iter() {
+        if mdns.owns(ev.token()) {
+          mdns.handle_io(ev);
+        }
+      }
+      mdns.tick().expect("tick");
+    }
+    let ours: Vec<_> = mdns
+      .ingress_log
+      .iter()
+      .filter(|r| r.body == want && r.family == Family::V4)
+      .copied()
+      .collect();
+    mdns.deregister().expect("deregister");
+
+    if ours.is_empty() {
+      eprintln!(
+        "note: this endpoint's own multicast never looped back, so no datagram \
+         reached the gate and this host contributes no evidence"
+      );
+      continue;
+    }
+    for rec in ours {
+      assert_eq!(
+        rec.admitted,
+        want_admitted,
+        "a datagram whose destination witness was {witness:?} ({what}) must be \
+         {}: refusing an mbuf shortage is deafness on demand, and admitting our \
+         own truncation hides a bug on this side",
+        if want_admitted { "admitted" } else { "refused" }
+      );
+    }
   }
 }
 
@@ -4991,12 +5103,14 @@ fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
   mdns.bound_is_loopback = false;
   mdns.local_subnets = vec![(OLD_OWN_ADDR, 24u8)];
   let bound = mdns.bound_interface;
-  mdns.sockets.force_rx_interface_for_test(Some(bound));
+  mdns
+    .sockets
+    .force_rx_iface_for_test(Some(iface_witness(bound)));
   // A UNICAST destination — one this interface holds — so §11's source-prefix
   // arm is what decides.
   mdns
     .sockets
-    .force_rx_destination_for_test(Some(Some(OLD_OWN_ADDR)));
+    .force_rx_destination_for_test(Some(DestinationWitness::Witnessed(OLD_OWN_ADDR)));
 
   let old_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)), 5353);
   let new_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 3, 9)), 5353);
@@ -5039,7 +5153,7 @@ fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
   // reach §11's second arm and the SOURCE prefix is the only thing that differs.
   mdns
     .sockets
-    .force_rx_destination_for_test(Some(Some(NEW_OWN_ADDR)));
+    .force_rx_destination_for_test(Some(DestinationWitness::Witnessed(NEW_OWN_ADDR)));
   mdns.subnets_refreshed_at = Instant::now()
     .checked_sub(hick_udp::onlink::SUBNET_REFRESH_INTERVAL + Duration::from_millis(50))
     .expect("a monotonic instant that far back exists on this host");
