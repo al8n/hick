@@ -46,7 +46,7 @@ pub use multicast::{
 // A driver with its own `recvmsg` still has to read the kernel's `msg_flags`,
 // and what its bits mean is this crate's business rather than each driver's.
 #[cfg(unix)]
-pub use multicast::link_delivery_from_msg_flags;
+pub use multicast::{control_truncated_from_msg_flags, link_delivery_from_msg_flags};
 // `parse_pktinfo_v6` exists only where libc defines `IPV6_PKTINFO`
 // (`has_ipv6_pktinfo`, see build.rs); gate the re-export identically.
 #[cfg(has_ipv6_pktinfo)]

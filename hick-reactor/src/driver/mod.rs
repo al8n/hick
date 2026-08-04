@@ -14,7 +14,10 @@ use async_channel::Sender;
 use futures::{FutureExt, pin_mut, select_biased};
 use hick_udp::{
   Family,
-  onlink::{BoundLink, admits_ingress, collect_local_subnets, is_loopback_interface},
+  onlink::{
+    BoundLink, DestinationWitness, IfaceWitness, admits_ingress, collect_local_subnets,
+    is_loopback_interface,
+  },
   selfsend::{ClockPair, RxEvidence, SelfSendTracker},
 };
 use mdns_proto::{
@@ -60,8 +63,16 @@ struct Packet {
   /// deliver it). It is not part of the self-loopback decision at all — that is
   /// [`DriverState::selfsend`]'s, taken before the proto layer sees the datagram.
   local_ip: IpAddr,
-  /// Receiving interface index from PKTINFO (`0` when unknown).
-  interface_index: u32,
+  /// What this receive path WITNESSED about the interface the datagram arrived
+  /// on ([`hick_udp::RecvMeta::iface_witness`]).
+  ///
+  /// An [`IfaceWitness`] and not a `u32`, because an absent index is three
+  /// different facts and RFC 6762 §11 decides them differently: our own control
+  /// buffer was too small (`Lost`, refuses), the kernel skipped the cmsg for this
+  /// datagram (`Declined`, degrades), or this path never reports one (`Blind`).
+  /// The plain `recv_from` arm of `recv_task` — every target that is neither Unix
+  /// nor Windows — declares `Blind` once, and cannot mint the other two.
+  iface: IfaceWitness,
   /// the *kernel* receive timestamp (from `SO_TIMESTAMP(NS)`
   /// via `RecvMeta::rx_time`) when the OS delivered one, else `None`.
   /// When present it is the authoritative ordering signal for the
@@ -97,11 +108,11 @@ struct Packet {
   /// point at which one receive's stamp could meet another's payload. See
   /// [`RxEvidence`] on origin versus association.
   rx: RxEvidence,
-  /// The datagram's IP header **destination**, where this receive path
-  /// recovered one ([`hick_udp::RecvMeta::destination`]), and `None` where it
-  /// recovered none. NOT [`Packet::local_ip`]: on Unix IPv4 that is the
-  /// receiving interface's own address, which never equals a group, so reading
-  /// it here would make every multicast arrival look unicast.
+  /// What this receive path WITNESSED about the datagram's IP header
+  /// **destination** ([`hick_udp::RecvMeta::destination_witness`]). NOT
+  /// [`Packet::local_ip`]: on Unix IPv4 that is the receiving interface's own
+  /// address, which never equals a group, so reading it here would make every
+  /// multicast arrival look unicast.
   ///
   /// RFC 6762 §11 states the local-link test two ways and the header
   /// destination picks between them — arrival at `224.0.0.251` / `FF02::FB` is
@@ -111,20 +122,20 @@ struct Packet {
   /// calls it "essential" to accept. Windows recovers a destination and reports
   /// no hop limit at all, so on that target this is the ONLY thing that can
   /// select the group arm.
-  destination: Option<IpAddr>,
+  destination: DestinationWitness,
   /// The kernel's own `MSG_MCAST` where this receive path reports it
   /// ([`hick_udp::RecvMeta::delivery`]), else `None`. Coarser than
   /// [`Packet::destination`] — "some multicast group" rather than which one —
-  /// and consulted only when no destination was recovered. That is the
+  /// and consulted only where no destination was WITNESSED. That is the
   /// OpenBSD/NetBSD IPv4 square, which has no PKTINFO parse wired in and would
   /// otherwise lose the same §11 group arm.
   ///
-  /// **A `None` destination is a different admission regime, not a coarser
-  /// one.** `hick_udp::onlink::admits_ingress` refuses a recovered destination
-  /// this endpoint does not hold; with none recovered it cannot. This driver
-  /// reads through `hick_udp::recv_with_meta`, so its `None` squares are IPv4 on
-  /// FreeBSD, DragonFly, OpenBSD and NetBSD, and what is left there is exactly
-  /// this field:
+  /// **An unwitnessed destination is a different admission regime, not a
+  /// coarser one.** `hick_udp::onlink::admits_ingress` refuses a WITNESSED
+  /// destination this endpoint does not hold; with none witnessed it cannot.
+  /// This driver reads through `hick_udp::recv_with_meta`, so its `Blind`
+  /// squares are IPv4 on FreeBSD, DragonFly, OpenBSD and NetBSD, and what is
+  /// left there is exactly this field:
   ///
   /// * `Broadcast` (OpenBSD/NetBSD only — `libc` binds `MSG_BCAST` nowhere else)
   ///   REFUSES, which closes the IPv4 broadcast class on those two;
@@ -133,9 +144,12 @@ struct Packet {
   /// * `None` — FreeBSD/DragonFly — leaves the source arm deciding, so an IPv4
   ///   broadcast is still admitted there for an in-prefix source.
   ///
-  /// Stated here so a reader of this struct is not left with the `Some`
-  /// regime's guarantee; the `None` arms of `admits_ingress` carry the full
-  /// statement and what closes the rest.
+  /// A `Declined` destination lands in that same residual for one datagram,
+  /// wherever a kernel skipped the cmsg under mbuf pressure.
+  ///
+  /// Stated here so a reader of this struct is not left with the witnessed
+  /// regime's guarantee; `admits_ingress` carries the full statement and what
+  /// closes the rest.
   delivery: Option<hick_udp::LinkDelivery>,
   /// IPv4 TTL / IPv6 Hop Limit of the datagram (from `IP_RECVTTL` /
   /// `IPV6_RECVHOPLIMIT`), or `None` when the platform didn't supply it. The
@@ -604,7 +618,7 @@ impl<N: Net> DriverState<N> {
       &mut self.local_subnets,
       &mut self.subnets_refreshed_at,
     );
-    if !admits_ingress(
+    let verdict = admits_ingress(
       pkt.src,
       pkt.destination,
       pkt.delivery,
@@ -613,16 +627,34 @@ impl<N: Net> DriverState<N> {
         self.bound_is_loopback,
         &self.local_subnets,
       ),
-      pkt.interface_index,
-      rx_interface_reported(pkt.src),
-    ) {
+      pkt.iface,
+    );
+    // The three §11 facts a drop count cannot carry, each read off the rule's
+    // own predicates so this driver re-derives none of them. A DECLINED witness
+    // is counted whatever the verdict was: a kernel skipping a cmsg it normally
+    // emits is an event in its own right, and the only warning a host gets that
+    // its §11 evidence is degrading.
+    #[cfg(feature = "stats")]
+    {
+      if pkt.destination.is_declined() || pkt.iface.is_declined() {
+        self.stats.ingress_witness_declined(1);
+      }
+      if verdict.is_degraded_admit() {
+        self.stats.ingress_degraded_admits(1);
+      }
+      if verdict.is_residual_refusal() {
+        self.stats.ingress_residual_refusals(1);
+      }
+    }
+    if !verdict.is_admit() {
       hick_trace::debug!(
         src = %pkt.src,
         dst = ?pkt.destination,
         delivery = ?pkt.delivery,
         hop_limit = ?pkt.hop_limit,
-        interface_index = pkt.interface_index,
+        iface_witness = ?pkt.iface,
         bound_interface = self.bound_interface,
+        verdict = ?verdict,
         "dropping off-link packet (RFC 6762 §11 trust boundary)"
       );
       // The datagram WAS received off the socket — count it toward receive
@@ -665,9 +697,11 @@ impl<N: Net> DriverState<N> {
     }
 
     // local_ip + interface_index come from PKTINFO (via
-    // hick_udp::recv_with_meta); UNSPECIFIED/0 when PKTINFO is unavailable.
+    // hick_udp::recv_with_meta); UNSPECIFIED/0 when PKTINFO is unavailable. The
+    // protocol core takes the index as a ROUTING hint and admits nothing on it —
+    // the trust decision was made above, against the witness itself.
     let local_ip = pkt.local_ip;
-    let interface_index = pkt.interface_index;
+    let interface_index = pkt.iface.index_or_zero();
 
     // The AUTHORITATIVE self-loopback decision happens HERE, in the std driver.
     // The result reaches the proto layer as an explicit flag; proto keeps no
@@ -1846,16 +1880,21 @@ const MDNS_V6_DST: SocketAddr = SocketAddr::V6(std::net::SocketAddrV6::new(
 ));
 
 /// Whether THIS driver's receive path reports the interface a datagram from
-/// `src`'s address family arrived on, as the ingress trust boundary must be told
-/// it.
+/// `src`'s address family arrived on.
 ///
-/// Capability belongs to the receive path and not to the platform, so
-/// [`admits_ingress`] takes it as a parameter rather than reading a constant. On
-/// Unix and Windows every datagram is read through
-/// [`hick_udp::recv_with_meta`], and what that reports is the whole answer;
-/// every other target takes the plain `recv_from` arm of `recv_task`, which
-/// recovers no ancillary data at all and must say so — a rule told otherwise
-/// would fail every one of those datagrams closed and leave the endpoint deaf.
+/// Capability belongs to the receive path and not to the platform. On Unix and
+/// Windows every datagram is read through [`hick_udp::recv_with_meta`], which
+/// mints [`Packet::iface`] from this answer plus `MSG_CTRUNC` and hands the
+/// trust boundary a witness rather than an index; every other target takes the
+/// plain `recv_from` arm of `recv_task`, which recovers no ancillary data at all
+/// and declares [`IfaceWitness::Blind`] once — a rule told otherwise would fail
+/// every one of those datagrams closed and leave the endpoint deaf.
+///
+/// Test-only now: production states the same fact structurally, by which arm of
+/// `recv_task` builds the packet, so there is no second copy to drift. The
+/// fixtures still need it, because what they must assert about a zero index
+/// depends on whether this driver's path could have supplied one.
+#[cfg(test)]
 const fn rx_interface_reported(src: SocketAddr) -> bool {
   cfg!(any(unix, windows)) && hick_udp::onlink::reports_rx_interface(src)
 }
@@ -3032,7 +3071,7 @@ async fn recv_loop<N: Net>(
             data,
             family,
             local_ip: meta.local_ip(),
-            interface_index: meta.interface_index(),
+            iface: meta.iface_witness(),
             // The evidence is built from the `RecvMeta` this crate's own
             // `recvmsg` produced, so its ORIGIN is carried by the type: an
             // absent cmsg stays absent, and there is no step at which a
@@ -3043,7 +3082,7 @@ async fn recv_loop<N: Net>(
             rx: RxEvidence::from_meta(&meta),
             // The two facts §11 selects its fallback arm by, carried rather
             // than discarded — see `Packet::destination`.
-            destination: meta.destination(),
+            destination: meta.destination_witness(),
             delivery: meta.delivery(),
             // Carried as a diagnostic; §11's receive test never reads it.
             hop_limit: meta.hop_limit(),
@@ -3130,9 +3169,9 @@ async fn recv_loop<N: Net>(
             data,
             family,
             local_ip: meta.local_ip(),
-            interface_index: meta.interface_index(),
+            iface: meta.iface_witness(),
             rx: RxEvidence::from_meta(&meta),
-            destination: meta.destination(),
+            destination: meta.destination_witness(),
             delivery: meta.delivery(),
             hop_limit: meta.hop_limit(),
           };
@@ -3190,12 +3229,14 @@ async fn recv_loop<N: Net>(
             data,
             family,
             local_ip,
-            interface_index: 0,
-            rx: RxEvidence::none(),
             // A plain `recv_from` recovers no ancillary data at all, so this
-            // path has neither to report — the same silence `rx` and
-            // `hop_limit` carry here.
-            destination: None,
+            // path declares itself BLIND for both witnesses — once, here, from
+            // its own construction. It can never mint `Lost` or `Declined`:
+            // there is no cmsg for a kernel to skip and no control buffer of
+            // ours to truncate. Same silence `rx` and `hop_limit` carry here.
+            iface: IfaceWitness::blind(),
+            rx: RxEvidence::none(),
+            destination: DestinationWitness::blind(),
             delivery: None,
             hop_limit: None,
           };

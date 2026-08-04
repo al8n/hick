@@ -27,7 +27,7 @@ use slab::Slab;
 
 use crate::{
   service::ServiceMailbox,
-  socket::{RecvMeta, Socket, rx_interface_reported},
+  socket::{RecvMeta, Socket},
 };
 
 #[cfg(test)]
@@ -1329,25 +1329,49 @@ impl State {
       &mut self.local_subnets,
       &mut self.subnets_refreshed_at,
     );
-    if !admits_ingress(
+    // Both facts §11 selects its arms by are WITNESSES minted by THIS crate's
+    // receive path — see `RecvMeta::destination_witness`, which is where its own
+    // capability, the decoder's output and the kernel's `MSG_CTRUNC` meet. The
+    // driver assembles nothing.
+    let destination = meta.destination_witness();
+    let iface = meta.iface_witness();
+    let verdict = admits_ingress(
       meta.peer(),
-      meta.destination(),
+      destination,
       meta.delivery(),
       BoundLink::new(
         self.bound_interface,
         self.bound_is_loopback,
         &self.local_subnets,
       ),
-      meta.interface_index(),
-      rx_interface_reported(meta.peer()),
-    ) {
+      iface,
+    );
+    // The three §11 facts a drop count cannot carry, each read off the rule's
+    // own predicates so this driver re-derives none of them. A DECLINED witness
+    // is counted whatever the verdict was: a kernel skipping a cmsg it normally
+    // emits is an event in its own right, and the only warning a host gets that
+    // its §11 evidence is degrading.
+    #[cfg(feature = "stats")]
+    {
+      if destination.is_declined() || iface.is_declined() {
+        self.stats.ingress_witness_declined(1);
+      }
+      if verdict.is_degraded_admit() {
+        self.stats.ingress_degraded_admits(1);
+      }
+      if verdict.is_residual_refusal() {
+        self.stats.ingress_residual_refusals(1);
+      }
+    }
+    if !verdict.is_admit() {
       debug!(
         src = %meta.peer(),
-        dst = ?meta.destination(),
+        dst = ?destination,
         delivery = ?meta.delivery(),
         hop_limit = ?meta.hop_limit(),
-        interface_index = meta.interface_index(),
+        iface_witness = ?iface,
         bound_interface = self.bound_interface,
+        verdict = ?verdict,
         "dropping off-link packet (RFC 6762 §11 trust boundary)"
       );
       // The datagram WAS received off the socket — count it toward receive

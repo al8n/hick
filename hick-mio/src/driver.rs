@@ -614,25 +614,27 @@ impl Mdns {
       // hop-limit branch used to skip entirely even though a conforming hop
       // limit says nothing about *whose* link a wildcard-bound socket heard.
       //
-      // `destination` is the datagram's IP header destination, which is what
-      // selects between §11's two arms, and
-      // `delivery` is the kernel's coarser stand-in where no destination
-      // was recovered. NOT `local_ip`, which on Unix IPv4 is the receiving
-      // interface's own address and can never equal a group — see
-      // `admits_ingress` for why reading it here rejected the very traffic §11
-      // exists to admit.
+      // Both facts §11 selects its arms by are WITNESSES minted by the receive
+      // path, not options this driver assembles: `hick_udp::recv_with_meta`
+      // knows both what this target can report and what the kernel actually
+      // reported for this datagram, and it is the only thing that does. NOT
+      // `local_ip`, which on Unix IPv4 is the receiving interface's own address
+      // and can never equal a group — see `admits_ingress` for why reading it
+      // here rejected the very traffic §11 exists to admit.
       //
-      // Where `destination` is `None` — `recv_with_meta`'s IPv4 receives on
-      // FreeBSD, DragonFly, OpenBSD and NetBSD — `admits_ingress` is in its
-      // SECOND regime and its guarantee that a destination this endpoint does
-      // not hold is refused does not apply. What is left there is `delivery`:
-      // `Broadcast` refuses on OpenBSD/NetBSD, which closes the IPv4 broadcast
-      // class on those two; `Multicast` admits any group from any source; and
-      // FreeBSD/DragonFly have neither flag, so a broadcast is still admitted
-      // there for an in-prefix source. Wiring the BSD IPv4 ancillary parsers is
-      // what moves those squares into the first regime; see
+      // Where the destination witness is `Blind` — `recv_with_meta`'s IPv4
+      // receives on FreeBSD, DragonFly, OpenBSD and NetBSD — or `Declined`,
+      // where a kernel skipped the cmsg for this one datagram, `admits_ingress`
+      // is in its SECOND regime and its guarantee that a destination this
+      // endpoint does not hold is refused does not apply. What is left there is
+      // `delivery`: `Broadcast` refuses on OpenBSD/NetBSD, which closes the IPv4
+      // broadcast class on those two; `Multicast` admits any group from any
+      // source; and FreeBSD/DragonFly have neither flag, so a broadcast is still
+      // admitted there for an in-prefix source. Wiring the BSD IPv4 ancillary
+      // parsers is what moves those squares into the first regime; see
       // `hick-udp/build.rs`.
-      let pkt_iface = sockets.rx_interface(&meta);
+      let iface_witness = sockets.rx_iface_witness(&meta);
+      let destination = sockets.rx_destination_witness(&meta);
       let peer = sockets.rx_peer(&meta);
       // §11 compares against the interface's configuration as it is, so the
       // snapshot is re-read once it ages past the shared interval. One clock
@@ -646,14 +648,31 @@ impl Mdns {
       // stack's default TTL, group queries at the socket-default multicast TTL
       // of 1) while admitting witnessed out-of-prefix unicast. Outbound 255 is
       // unaffected and still honoured.
-      let admitted = onlink::admits_ingress(
+      let verdict = onlink::admits_ingress(
         peer,
-        sockets.rx_destination(&meta),
+        destination,
         meta.delivery(),
         onlink::BoundLink::new(*bound_interface, *bound_is_loopback, local_subnets),
-        pkt_iface,
-        sockets.rx_interface_reported(peer),
+        iface_witness,
       );
+      let admitted = verdict.is_admit();
+      // The three §11 facts a drop count cannot carry, each bumped from the
+      // rule's own predicates so this driver re-derives none of them. A DECLINED
+      // witness is counted whatever the verdict was: the kernel skipping a cmsg
+      // is an event in its own right, and the only warning a host gets that its
+      // §11 evidence is degrading.
+      #[cfg(feature = "stats")]
+      {
+        if destination.is_declined() || iface_witness.is_declined() {
+          stats.ingress_witness_declined(1);
+        }
+        if verdict.is_degraded_admit() {
+          stats.ingress_degraded_admits(1);
+        }
+        if verdict.is_residual_refusal() {
+          stats.ingress_residual_refusals(1);
+        }
+      }
       #[cfg(test)]
       ingress_log.push(IngressRecord {
         family,
@@ -664,11 +683,12 @@ impl Mdns {
       if !admitted {
         hick_trace::debug!(
           src = %meta.peer(),
-          dst = ?sockets.rx_destination(&meta),
+          dst = ?destination,
           delivery = ?meta.delivery(),
           hop_limit = ?meta.hop_limit(),
-          interface_index = pkt_iface,
+          iface_witness = ?iface_witness,
           bound_interface = *bound_interface,
+          verdict = ?verdict,
           "dropping an off-link datagram (ingress trust boundary)"
         );
         #[cfg(feature = "stats")]
@@ -766,7 +786,9 @@ impl Mdns {
         processed_at,
         meta.peer(),
         meta.local_ip(),
-        pkt_iface,
+        // The protocol core takes the index as a ROUTING hint and admits nothing
+        // on it — the trust decision was made above, against the witness itself.
+        iface_witness.index_or_zero(),
         data,
         caller_is_self,
       ) {

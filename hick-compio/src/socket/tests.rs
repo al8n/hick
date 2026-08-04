@@ -4,7 +4,7 @@ use super::*;
 fn recv_meta_default_is_safe_and_unspecified() {
   let m = RecvMeta::empty(([127, 0, 0, 1], 5353).into());
   assert!(m.local_ip.is_unspecified());
-  assert_eq!(m.interface_index, 0);
+  assert_eq!(m.interface_index(), 0);
   assert!(m.hop_limit.is_none());
   assert_eq!(m.rx, RxEvidence::none());
 }

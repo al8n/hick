@@ -39,6 +39,7 @@ use std::{
 use hick_udp::{
   MulticastOptionsV4, MulticastOptionsV6, RecvMeta,
   constants::{MDNS_IPV4_GROUP, MDNS_IPV6_GROUP, MDNS_PORT},
+  onlink::{DestinationWitness, IfaceWitness},
   selfsend::RxEvidence,
   try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
@@ -1023,31 +1024,36 @@ pub(crate) struct Sockets {
   /// runners, and macOS in particular.
   #[cfg(test)]
   forced_v6_register_error: bool,
-  /// Report this index as the interface every received datagram arrived on,
-  /// overriding the cmsg metadata. See [`Sockets::rx_interface`].
+  /// Report this witness as the interface every received datagram arrived on,
+  /// overriding the cmsg metadata. See [`Sockets::rx_iface_witness`].
   ///
   /// The ingress trust boundary drops a datagram whose interface index is not
   /// the one this endpoint bound, and no unit test can make a datagram arrive on
   /// a NIC — real or otherwise — that the host does not route to this socket.
   /// The gate is the difference between a responder that answers only its own
   /// link and one an adjacent network can drive, so it must not go untested.
-  #[cfg(test)]
-  forced_rx_interface: Option<u32>,
-  /// Report this IP header destination for every received datagram, overriding
-  /// the cmsg metadata. See [`Sockets::rx_destination`].
   ///
-  /// The third of the same family as [`Sockets::forced_rx_interface`] and
+  /// An [`IfaceWitness`] rather than a `u32`, because the three ways an index
+  /// can be missing lead to different verdicts and a test has to be able to
+  /// present each: our truncated control buffer refuses, a kernel that declined
+  /// to emit degrades, and a path that reports none never had one.
+  #[cfg(test)]
+  forced_rx_iface: Option<IfaceWitness>,
+  /// Report this destination witness for every received datagram, overriding
+  /// the cmsg metadata. See [`Sockets::rx_destination_witness`].
+  ///
+  /// The third of the same family as [`Sockets::forced_rx_iface`] and
   /// [`Sockets::forced_rx_peer`], and there for the same reason. RFC 6762 §11
   /// selects its arms by the destination, and a loopback fixture only ever
   /// receives its own multicast — so without this the UNICAST arm, and with it
   /// everything the source-prefix comparison decides, is unreachable through
   /// the real receive path on every platform.
   #[cfg(test)]
-  forced_rx_destination: Option<Option<core::net::IpAddr>>,
+  forced_rx_destination: Option<DestinationWitness>,
   /// Report this address as the peer every received datagram came from,
   /// overriding the cmsg metadata. See [`Sockets::rx_peer`].
   ///
-  /// The other half of [`Sockets::forced_rx_interface`], and there for the same
+  /// The other half of [`Sockets::forced_rx_iface`], and there for the same
   /// reason: an IPv6 source address carries a scope id naming the link it came
   /// from, the trust boundary weighs it exactly as it weighs the receive
   /// interface, and no unit test can make a host deliver a datagram from a link
@@ -1183,7 +1189,7 @@ impl Sockets {
       #[cfg(test)]
       forced_v6_register_error: false,
       #[cfg(test)]
-      forced_rx_interface: None,
+      forced_rx_iface: None,
       #[cfg(test)]
       forced_rx_destination: None,
       #[cfg(test)]
@@ -1195,18 +1201,21 @@ impl Sockets {
     })
   }
 
-  /// The interface a received datagram arrived on, as the ingress trust
-  /// boundary must read it.
+  /// What the receive path witnessed about the interface a datagram arrived on,
+  /// as the ingress trust boundary must read it.
   ///
-  /// Production reads it straight off the cmsg metadata; the `#[cfg(test)]`
-  /// override is the only way to present a datagram from an interface this host
-  /// does not deliver on. See [`Sockets::forced_rx_interface`].
-  pub(crate) fn rx_interface(&self, meta: &RecvMeta) -> u32 {
+  /// Production reads it straight off the cmsg metadata, where
+  /// `hick_udp::recv_with_meta` minted it from this target's compile-time
+  /// capability plus `MSG_CTRUNC` — so this crate declares no capability of its
+  /// own and cannot get one wrong. The `#[cfg(test)]` override is the only way
+  /// to present a datagram from an interface this host does not deliver on. See
+  /// [`Sockets::forced_rx_iface`].
+  pub(crate) fn rx_iface_witness(&self, meta: &RecvMeta) -> IfaceWitness {
     #[cfg(test)]
-    if let Some(idx) = self.forced_rx_interface {
-      return idx;
+    if let Some(witness) = self.forced_rx_iface {
+      return witness;
     }
-    meta.interface_index()
+    meta.iface_witness()
   }
 
   /// The peer a datagram came from, as the ingress trust boundary must read it:
@@ -1226,12 +1235,12 @@ impl Sockets {
   /// override is the only way to present a UNICAST arrival to a loopback
   /// fixture, which otherwise only ever sees its own multicast. See
   /// [`Sockets::forced_rx_destination`].
-  pub(crate) fn rx_destination(&self, meta: &RecvMeta) -> Option<core::net::IpAddr> {
+  pub(crate) fn rx_destination_witness(&self, meta: &RecvMeta) -> DestinationWitness {
     #[cfg(test)]
     if let Some(dst) = self.forced_rx_destination {
       return dst;
     }
-    meta.destination()
+    meta.destination_witness()
   }
 
   pub(crate) fn rx_peer(&self, meta: &RecvMeta) -> SocketAddr {
@@ -1240,22 +1249,6 @@ impl Sockets {
       return peer;
     }
     meta.peer()
-  }
-
-  /// Whether THIS driver's receive path reports the interface a datagram from
-  /// `peer`'s address family arrived on, as the ingress trust boundary must be
-  /// told it.
-  ///
-  /// Capability belongs to the receive path and not to the platform: a driver
-  /// reading its datagrams with `recvfrom` recovers no interface on a target
-  /// whose `recvmsg` would have supplied one, so [`onlink::admits_ingress`]
-  /// takes this as a parameter rather than reading a constant. This crate reads
-  /// EVERY datagram through [`hick_udp::recv_with_meta`] on both of its targets
-  /// — see [`raw_recv`] — so what that call reports is the whole answer.
-  ///
-  /// [`onlink::admits_ingress`]: hick_udp::onlink::admits_ingress
-  pub(crate) const fn rx_interface_reported(&self, peer: SocketAddr) -> bool {
-    hick_udp::onlink::reports_rx_interface(peer)
   }
 
   /// The ordering evidence a datagram carried, as the self-send match must read
@@ -1990,16 +1983,16 @@ impl Sockets {
     }
   }
 
-  /// Report `idx` as the interface every subsequent receive arrived on. See
-  /// [`Sockets::forced_rx_interface`].
+  /// Report `witness` as the interface every subsequent receive arrived on. See
+  /// [`Sockets::forced_rx_iface`].
   #[cfg(test)]
-  pub(crate) const fn force_rx_interface_for_test(&mut self, idx: Option<u32>) {
-    self.forced_rx_interface = idx;
+  pub(crate) const fn force_rx_iface_for_test(&mut self, witness: Option<IfaceWitness>) {
+    self.forced_rx_iface = witness;
   }
-  /// Present this IP header destination on every subsequent receive. See
+  /// Present this destination witness on every subsequent receive. See
   /// [`Sockets::forced_rx_destination`].
   #[cfg(test)]
-  pub(crate) fn force_rx_destination_for_test(&mut self, dst: Option<Option<core::net::IpAddr>>) {
+  pub(crate) const fn force_rx_destination_for_test(&mut self, dst: Option<DestinationWitness>) {
     self.forced_rx_destination = dst;
   }
 

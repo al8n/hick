@@ -1,59 +1,193 @@
-//! ## The second regime's residual is much larger, and is not the above
+//! RFC 6762 §11 on-link trust boundary.
 //!
-//! Everything in this section so far is about a receive path that RECOVERS a
-//! destination. Where none is recovered, what remains depends on whether the
-//! target reports a delivery class at all:
+//! The whole rule, once, for every driver that reads datagrams off a real
+//! socket. It is a pure function of what the receive path WITNESSED — peer
+//! address, IP header destination, link-layer delivery class, receive interface
+//! — plus the configuration the caller holds, which arrives as a [`BoundLink`].
+//! Nothing here reads a socket, a clock or a driver's state, and nothing here is
+//! tunable: §11 is a fixed standard, so a driver supplies the CONFIGURATION and
+//! this module owns the RULE.
 //!
-//! | square | IPv4 broadcast | foreign multicast group |
-//! |---|---|---|
-//! | `hick-udp` IPv4, **OpenBSD/NetBSD** | refused (`MSG_BCAST`) | **admitted, any source** |
-//! | `hick-compio` unix IPv4, **OpenBSD/NetBSD** | refused (`MSG_BCAST`) | **admitted, any source** |
-//! | `hick-udp` IPv4, **FreeBSD/DragonFly** | **admitted, in-prefix source** | takes the source arm |
-//! | `hick-compio` unix IPv4, **FreeBSD/DragonFly** | **admitted, in-prefix source** | takes the source arm |
-//! | `hick-compio` **Windows** (`recv_from`) | **admitted, in-prefix source** | takes the source arm |
+//! It lives here because this is the shared socket layer for every driver with a
+//! [`RecvMeta`](crate::RecvMeta) to hand it, and because four hand-written
+//! copies of an admission boundary is how they came to disagree.
 //!
-//! The bold cells are live: R10 on the first two rows, R11/R12 on the last
-//! three. No wording elsewhere in this module should be read as covering them.
-//! The `None` arms of [`admits_ingress`] state them in full.
+//! # The inputs are WITNESSES, and absence has three different meanings
 //!
-//! What moves a square out of this regime is its own destination recovery, and
-//! there are three separate pieces of work because there are three decoders:
+//! [`admits_ingress`] used to take an `Option<IpAddr>` destination and a
+//! `(pkt_iface: u32, iface_reported: bool)` pair. Both spelled ABSENCE as the
+//! quiet value — `None`, `0` — and absence selected the widest arm. That is the
+//! wrong shape for a trust boundary, because a missing fact is three distinct
+//! facts and only one of them is a statement about the platform:
+//!
+//! * **[`DestinationWitness::Witnessed`] / [`IfaceWitness::Witnessed`]** — the path
+//!   recovered it for this datagram. `Witnessed(0)` is unrepresentable for an
+//!   interface index ([`NonZeroU32`]), so no driver can pass "I do not know"
+//!   positionally into the permissive arm;
+//! * **`Lost`** — the path witnesses this fact, and OUR OWN control buffer was
+//!   too small (`MSG_CTRUNC`). A bug on this side of the boundary, and the one
+//!   absence that REFUSES;
+//! * **`Declined`** — the path witnesses this fact, the kernel emitted nothing
+//!   and flagged no truncation. Not our bug and not the sender's: every BSD
+//!   allocates its ancillary mbufs with `M_NOWAIT` and silently skips the cmsg
+//!   when the allocation fails, still delivering the datagram. Refusing here
+//!   would make the responder go deaf under exactly the mbuf exhaustion a flood
+//!   causes, so this DEGRADES to the source-prefix arm and is counted;
+//! * **`Blind`** — this path cannot witness the fact by construction. Declared
+//!   ONCE per receive path, never inferred per datagram.
+//!
+//! [`DestinationWitness::Lost`] and [`DestinationWitness::Declined`] are the same missing cmsg read
+//! two ways, and the flag that tells them apart is `MSG_CTRUNC` — see
+//! `recv_with_meta`, which is the only thing in this crate that may mint either.
+//!
+//! # Capability is the RECEIVE PATH's, not the platform's
+//!
+//! [`DestinationWitness::Blind`] and [`IfaceWitness::Blind`] are the receive path's own
+//! declaration, never a constant read inside the rule. Whether a destination or
+//! a receive interface comes back is a property of **the path a driver actually
+//! runs**, not of the operating system: a driver calling `recvfrom` recovers no
+//! provenance on a platform whose `recvmsg` would have supplied it, and a rule
+//! that assumed otherwise would fail every datagram closed and leave that driver
+//! silently deaf. [`reports_rx_interface`] answers the capability question for
+//! THIS crate's own `recv_with_meta`; a driver with its own receive path must
+//! answer it for that path, and mint its own witnesses from the answer.
+//!
+//! # One capability table, and it is the only one in this module
+//!
+//! Which witnesses a square can mint at all. Everything else this module says
+//! about platforms is a consequence of this table and must not restate it:
+//!
+//! | receive path | family | targets | destination | interface | `MSG_MCAST`/`MSG_BCAST` |
+//! |---|---|---|---|---|---|
+//! | `hick-udp` `recv_with_meta` | IPv6 | all supported unix | witnessed | witnessed | OpenBSD/NetBSD only |
+//! | `hick-udp` `recv_with_meta` | IPv4 | Linux/Android, Apple | witnessed | witnessed | no |
+//! | `hick-udp` `recv_with_meta` | IPv4 | FreeBSD, DragonFly | **blind** | **blind** | no |
+//! | `hick-udp` `recv_with_meta` | IPv4 | OpenBSD, NetBSD | **blind** | **blind** | **yes** |
+//! | `hick-udp` `recv_with_meta` | both | Windows | witnessed | witnessed | no |
+//! | `hick-compio` unix decoder | IPv6 | all supported unix | witnessed | witnessed | OpenBSD/NetBSD only |
+//! | `hick-compio` unix decoder | IPv4 | Linux/Android, Apple | witnessed | witnessed | no |
+//! | `hick-compio` unix decoder | IPv4 | the four BSDs | **blind** | **blind** | OpenBSD/NetBSD only |
+//! | `hick-compio` Windows (`recv_from`) | both | Windows | **blind** | **blind** | **no** |
+//!
+//! An IPv6 peer's **scope id** is a second interface witness and it is carried on
+//! `src` rather than in this table: every supported platform — Windows included —
+//! fills `sin6_scope_id` from the receiving interface for a link-local source, so
+//! a link-local IPv6 peer is witnessed even where the row above says blind. A
+//! scopeless IPv6 peer and every IPv4 peer are not.
+//!
+//! `hick-compio` decodes its own ancillary data (`hick-compio/src/socket/unix.rs`,
+//! gated by `hick-compio/build.rs`) rather than calling this crate's
+//! `recv_with_meta`, so it is a SECOND decoder with the same gap and not a share
+//! of this crate's. Three separate pieces of work move the blind rows into the
+//! witnessed ones, and all three are tracked separately:
 //!
 //! * `hick-udp`'s `multicast::parse_dstaddr_recvif_v4` and
 //!   `multicast::parse_netbsd_pktinfo_v4` — written and unit-tested, no callers,
 //!   sockopts never set; see `hick-udp/build.rs` for the per-target evidence a
 //!   flip needs. This covers `hick-mio` and `hick-reactor`;
 //! * the same work again in `hick-compio/src/socket/unix.rs` behind that crate's
-//!   own `has_ip_pktinfo` in `hick-compio/build.rs`. `hick-compio` does not call
-//!   `recv_with_meta`, so `hick-udp`'s flip does nothing for it;
+//!   own `has_ip_pktinfo`. `hick-compio` does not call `recv_with_meta`, so
+//!   `hick-udp`'s flip does nothing for it;
 //! * a `WSARecvMsg` receive path for `hick-compio` on Windows.
 //!
-//! All three are tracked separately.
+//! # What a blind square costs, stated once
 //!
-//! RFC 6762 §11 on-link trust boundary.
+//! On a row whose destination is blind, none of the destination partition's
+//! guarantees hold — it needs a destination to be positive about. What is left is
+//! the kernel's coarse [`LinkDelivery`], and the residual is exactly:
 //!
-//! The whole rule, once, for every driver that reads datagrams off a real
-//! socket. It is a pure function of facts the kernel reported — peer address,
-//! IP header destination, multicast delivery flag, hop limit, receive interface
-//! — plus the configuration the caller holds, which arrives as a [`BoundLink`]
-//! and an `iface_reported` flag. Nothing here reads a socket, a clock or a
-//! driver's state, and nothing here is tunable: §11 is a fixed standard, so a
-//! driver supplies the CONFIGURATION and this module owns the RULE.
+//! * where `MSG_BCAST` is bound (OpenBSD/NetBSD), an IPv4 broadcast is REFUSED;
+//! * where `MSG_MCAST` is bound, **any** foreign multicast group is admitted from
+//!   **any** source, because the flag names no group;
+//! * where neither is bound (FreeBSD/DragonFly, and `hick-compio` on Windows), an
+//!   IPv4 broadcast is indistinguishable from a unicast and is admitted for an
+//!   in-prefix source.
 //!
-//! # Capability is the DRIVER's, not the platform's
+//! A datagram whose witness was `Declined` lands in that same residual for one
+//! datagram, and [`Admit::BlindSourceOnLink`] is what makes it countable.
 //!
-//! `iface_reported` is a parameter and never a constant read inside the rule.
-//! Whether a receive interface comes back is a property of **the receive path a
-//! driver actually runs**, not of the operating system: a driver that calls
-//! `recvfrom` recovers no provenance on a platform whose `recvmsg` would have
-//! supplied it, and a rule that assumed otherwise would fail every datagram
-//! closed and leave that driver silently deaf. [`reports_rx_interface`] answers
-//! the question for THIS crate's own `recv_with_meta`; a driver with its own
-//! receive path must answer it for that path.
+//! # Where `Declined` can actually occur, read out of each kernel
 //!
-//! It lives here because this is the shared socket layer for every driver with a
-//! [`RecvMeta`](crate::RecvMeta) to hand it, and because four hand-written
-//! copies of an admission boundary is how they came to disagree.
+//! `Declined` DEGRADES where the old rule refused, so which squares can reach it
+//! is a security question and not a curiosity. The mbuf argument that justifies
+//! the arm is a BSD argument and it does not transfer, so each square is
+//! answered from its own source — and the two ways to reach it are kept apart,
+//! because only one of them is "the cmsg went missing":
+//!
+//! | square | cmsg ABSENT, `MSG_CTRUNC` clear | cmsg PRESENT, index `0` |
+//! |---|---|---|
+//! | Linux/Android IPv4 | **unreachable** | **reachable** |
+//! | Linux/Android IPv6 | guard exists, trigger unproven | not via that guard |
+//! | Apple IPv4 | **unreachable** — datagram dropped instead | not applicable |
+//! | Apple IPv6 | **unreachable** — datagram dropped instead | **reachable** |
+//! | FreeBSD/DragonFly/OpenBSD/NetBSD IPv6 | **reachable, and wired today** | reachable |
+//! | Windows (`WSARecvMsg`) | no documented case | undocumented |
+//!
+//! **Linux cannot lose a cmsg silently.** `put_cmsg` (`net/core/scm.c`) writes
+//! straight into the CALLER's control buffer — there is no allocation to fail —
+//! and every path that cannot fit the message sets `MSG_CTRUNC` and returns.
+//! `ip_cmsg_recv_offset` (`net/ipv4/ip_sockglue.c`) calls
+//! `ip_cmsg_recv_pktinfo` unconditionally once `IP_CMSG_PKTINFO` is set, so an
+//! enabled sockopt always emits. An absent IPv4 PKTINFO with the flag clear is
+//! not a state Linux produces.
+//!
+//! **Linux CAN emit the cmsg and decline to name an interface.**
+//! `ipv4_pktinfo_prepare` sets `pktinfo->ipi_ifindex = 0` and
+//! `ipi_spec_dst = 0` in its `else` branch — taken when `skb_rtable(skb)` is
+//! `NULL` — while `ip_cmsg_recv_pktinfo` overwrites `info.ipi_addr` from
+//! `ip_hdr(skb)->daddr` regardless. The datagram therefore arrives with its
+//! DESTINATION witnessed and its INTERFACE zero, which is
+//! [`IfaceWitness::Declined`]: the kernel answered, and its answer was "I do not
+//! know which". **That is the reachable widening on Linux**, and it is far
+//! narrower than a blind square — the whole destination partition still runs, so
+//! a foreign group and a destination this endpoint does not hold are both still
+//! refused, and only the link SCOPING is lost.
+//!
+//! **Apple drops rather than under-reports.** `ip_savecontrol`
+//! (`bsd/netinet/ip_input.c`) and `ip6_savecontrol_v4`
+//! (`bsd/netinet6/ip6_input.c`) check every `sbcreatecontrol` result for `NULL`
+//! and, on failure, `goto no_mbufs` / return `ENOBUFS` after bumping
+//! `ipstat.ips_pktdropcntrl` / `ip6stat.ip6s_pktdropcntrl`. The datagram is
+//! discarded, so a caller never sees one with the cmsg missing. Apple's IPv6
+//! path does have the zero-index form —
+//! `pi6.ipi6_ifindex = (m && m->m_pkthdr.rcvif) ? m->m_pkthdr.rcvif->if_index : 0`
+//! — so it reaches `Declined` the same way Linux IPv4 does.
+//!
+//! **The BSDs are the case the arm exists for, and it is LIVE TODAY.**
+//! `ip6_savecontrol` (`sys/netinet6/ip6_input.c`) calls
+//! `sbcreatecontrol(&pi6, sizeof(struct in6_pktinfo), …, M_NOWAIT)` and guards
+//! the result with a bare `if (*mp) mp = &(*mp)->m_next;` — no `else`, no error,
+//! no counter — while `sbcreatecontrol` (`sys/kern/uipc_sockbuf.c`) returns
+//! `NULL` whenever `m_get`/`m_getcl` fails. The datagram is still delivered.
+//! IPv6 PKTINFO is enabled on every supported unix and `try_bind_v6` fails the
+//! bind rather than continuing without it, so this is a WIRED square: under the
+//! mbuf exhaustion a flood causes, a BSD host silently loses BOTH witnesses on
+//! arbitrary datagrams. Refusing there is deafness on demand, which is the whole
+//! reason `Declined` is not `Lost`.
+//!
+//! **Linux IPv6 has a suppression guard whose trigger this module has not
+//! proven.** `ip6_datagram_recv_common_ctl` (`net/ipv6/datagram.c`) wraps its
+//! `put_cmsg` in `if (src_info.ipi6_ifindex >= 0)`, so a negative index would
+//! omit the whole cmsg with no `MSG_CTRUNC`. Reading the source did not
+//! establish a reachable negative value on an `IPV6_V6ONLY` socket, so it is
+//! recorded as possible-but-unproven rather than claimed either way.
+//!
+//! **Windows documents truncation and nothing else.** `WSARecvMsg` defines
+//! `MSG_CTRUNC` as *"the control (ancillary) data was truncated"*, and states
+//! that with `IP_PKTINFO`/`IPV6_PKTINFO` enabled a control object *will* carry
+//! the `in_pktinfo`/`in6_pktinfo`. Its one documented omission — a DUAL-STACK
+//! socket with only `IPV6_PKTINFO` set, where IPv4 arrivals "may not" get one —
+//! cannot arise here: `IPV6_V6ONLY` is set at bind and the IPv4 socket enables
+//! `IP_PKTINFO` itself.
+//!
+//! **So the arm is not dead where it cannot fire.** On the squares where an
+//! ABSENT cmsg is unreachable, `recv_with_meta` still constructs `Declined` for
+//! a parse that recovered nothing — a malformed or short cmsg is not something a
+//! trust boundary may assume away, and the same code serves the BSD square where
+//! it IS live. What those squares must not do is REFUSE on it: the only way to
+//! reach it there is a kernel or a decoder behaving unexpectedly, and that is
+//! not evidence about the sender. The zero-index form, meanwhile, is reachable
+//! on the primary platforms and is where their widening actually lands.
 //!
 //! # What this boundary does and does not guarantee
 //!
@@ -92,42 +226,27 @@
 //! * a bound interface of `0` means this endpoint knows no link of its own, so
 //!   it can forbid nothing — pass;
 //! * otherwise every NONZERO witness must equal the bound interface. One
-//!   disagreement refuses outright, and no later stage overturns it;
+//!   disagreement refuses outright ([`Refuse::ForeignLink`]), and no later stage
+//!   overturns it;
 //! * if at least one witness was present and agreed — pass;
-//! * with NO witness at all, three sub-cases, and this is where "absent
-//!   provenance" stops being one condition:
+//! * with NO witness at all, the [`IfaceWitness`] itself decides, and this is
+//!   where "absent provenance" stops being one condition:
 //!   * a loopback-BOUND endpoint with a loopback source — pass;
-//!   * `iface_reported == true` — REFUSE. The path could have named the link and
-//!     did not: a failed proof rather than silence. A missing or truncated
-//!     `PKTINFO` lands here;
-//!   * `iface_reported == false` — pass. The path never had one to give.
+//!   * [`IfaceWitness::Lost`] — REFUSE ([`Refuse::LinkWitnessLost`]). Our control
+//!     buffer was too small, which is this side's bug, not the sender's;
+//!   * [`IfaceWitness::Declined`] — pass. The kernel skipped the cmsg on this
+//!     datagram, and refusing an mbuf shortage is how a responder goes deaf under
+//!     a flood;
+//!   * [`IfaceWitness::Blind`] — pass. The path never had one to give.
 //!
 //! **2. The destination partition — TWO REGIMES, and everything below is about
-//! the first.** §11 picks its arm by the IP header destination, so a receive
-//! path that recovers one and a receive path that does not are governed by
-//! different rules. Which square a driver is on decides which:
+//! the first.** §11 picks its arm by the IP header destination, so a
+//! [`DestinationWitness::Witnessed`] datagram and one that is `Blind`, `Declined` or
+//! `Lost` are governed by different rules. Which square a driver is on decides
+//! which — see the one capability table above.
 //!
-//! `hick-compio` decodes its own ancillary data (`hick-compio/src/socket/unix.rs`,
-//! gated by `hick-compio/build.rs`) rather than calling this crate's
-//! `recv_with_meta`, and its `has_ip_pktinfo` covers Linux/Android/Apple only —
-//! the same targets, by the same reasoning, as this crate's. So it is a SECOND
-//! decoder with the SAME gap, and both are listed per family and per target:
-//!
-//! | receive path | family | targets | destination |
-//! |---|---|---|---|
-//! | `hick-udp` `recv_with_meta` | IPv6 | all supported unix | recovered |
-//! | `hick-udp` `recv_with_meta` | IPv4 | Linux/Android, Apple, Windows | recovered |
-//! | `hick-udp` `recv_with_meta` | IPv4 | **FreeBSD, DragonFly, OpenBSD, NetBSD** | **none** |
-//! | `hick-compio` unix decoder | IPv6 | all supported unix | recovered |
-//! | `hick-compio` unix decoder | IPv4 | Linux/Android, Apple | recovered |
-//! | `hick-compio` unix decoder | IPv4 | **FreeBSD, DragonFly, OpenBSD, NetBSD** | **none** |
-//! | `hick-compio` Windows | both | Windows (`recv_from`) | **none** |
-//!
-//! Any receive whose PKTINFO cmsg was absent or truncated is in the second
-//! regime too, on any square.
-//!
-//! **With a destination recovered**, §11 names exactly two kinds and a
-//! recovered one is sorted by what it **is**, never by what it is not:
+//! **With a destination witnessed**, §11 names exactly two kinds and a witnessed
+//! one is sorted by what it **is**, never by what it is not:
 //!
 //! * either mDNS group admits, regardless of source address;
 //! * an address **this endpoint holds** is what §11 means by a response
@@ -147,6 +266,13 @@
 //! Four consecutive reviews found one more class that a residual defined as
 //! "none of the above" had absorbed. There is no residual of that shape left.
 //!
+//! [`Refuse`] then NAMES which class it was, so a refusal is countable rather
+//! than merely negative. Naming happens strictly after the verdict and cannot
+//! change it: `classify_unheld` is reached only on the arm that had already
+//! refused. [`Refuse::DestinationNotHeld`] is what is left once every named
+//! class is taken, and its count is the size of the conformance gap this
+//! partition still carries.
+//!
 //! [`BoundLink::local_addrs`] is what answers the question, and it already carries
 //! the answer: [`collect_local_subnets`] stores each interface address `getifs`
 //! reports, paired with its prefix length — the ASSIGNED address, not a masked
@@ -154,24 +280,33 @@
 //! computation. An **empty** snapshot is the one exception and it is documented
 //! at the decision site in [`admits_ingress`].
 //!
-//! **With no destination recovered** none of that runs, and saying otherwise is
-//! how a review round found this module claiming more than it delivers. What is
-//! left is the kernel's own delivery class ([`LinkDelivery`]), which OpenBSD and
-//! NetBSD alone report:
+//! **With no destination witnessed** none of that runs, and saying otherwise is
+//! how a review round found this module claiming more than it delivers.
+//! [`DestinationWitness::Lost`] refuses outright — see below. `Blind` and `Declined` take
+//! the same arm, and what is left there is the kernel's own delivery class
+//! ([`LinkDelivery`]), which OpenBSD and NetBSD alone report:
 //!
 //! * [`LinkDelivery::Broadcast`] is REFUSED. It is exact negative evidence —
 //!   §11 gives a broadcast no arm — so those two targets lose the IPv4
 //!   broadcast class here as well as in the first regime;
 //! * [`LinkDelivery::Multicast`] admits, and it names no group, so **any**
-//!   foreign group is admitted there from any source. That is the R10 class and
-//!   no flag can close it;
+//!   foreign group is admitted there from any source, and no flag can close it;
 //! * everything else takes the source arm, so on every square with no delivery
 //!   class either — `hick-udp` and `hick-compio` IPv4 on **FreeBSD/DragonFly**,
 //!   and `hick-compio` on **Windows** — an IPv4 **broadcast** is still admitted
-//!   for an in-prefix source. That is the R11/R12 class, live on those three.
+//!   for an in-prefix source.
 //!
-//! The `None` arms of [`admits_ingress`] carry the full statement and what
-//! closes the rest.
+//! **[`DestinationWitness::Lost`] is the one absence that refuses**, and it is deliberately
+//! not the one an attacker can provoke. `MSG_CTRUNC` says the kernel had the fact
+//! and OUR buffer could not hold it; `recv_with_meta` sizes that buffer at 512
+//! bytes against a worst case of about 152, so the flag is a defect report rather
+//! than a live class. The absence a flood DOES provoke is `Declined` — every BSD
+//! builds its ancillary mbufs with `M_NOWAIT` and skips the cmsg without an
+//! error, a counter, or a truncation flag, when the allocation fails
+//! (FreeBSD `kern/uipc_sockbuf.c`'s `sbcreatecontrol` returns `NULL`; NetBSD's
+//! `kern/uipc_socket2.c` likewise; XNU is the counter-example and returns
+//! `ENOBUFS`). Refusing THAT would take the responder off the air precisely
+//! during the traffic that caused it, so it degrades and is counted instead.
 //!
 //! **3. §11's source arm, for a destination this interface HOLDS.** A loopback
 //! source is on-link only for a loopback-bound endpoint. EVERY other source —
@@ -184,28 +319,6 @@
 //! the destination against its addresses, the source against its addresses and
 //! masks. An endpoint that cannot say which addresses it holds therefore fails
 //! both, and that is the empty-snapshot case above.
-//!
-//! ## What each receive path supplies, and therefore which stages it reaches
-//!
-//! | receive path | interface index | IPv6 scope | destination | `MSG_MCAST` |
-//! |---|---|---|---|---|
-//! | this crate's `recv_with_meta`, IPv6, all targets | yes | yes | yes | OpenBSD/NetBSD only |
-//! | this crate's `recv_with_meta`, IPv4 Linux/Apple/Windows | yes | n/a | yes | no |
-//! | this crate's `recv_with_meta`, IPv4 FreeBSD/DragonFly | **no** | n/a | **no** | no |
-//! | this crate's `recv_with_meta`, IPv4 OpenBSD/NetBSD | **no** | n/a | **no** | **yes** |
-//! | `hick-compio` unix | as above | yes | yes | as above |
-//! | `hick-compio` Windows | **no** | **yes** | **no** | **no** |
-//!
-//! `MSG_MCAST` is a property of the target rather than of the family: OpenBSD
-//! and NetBSD bind it and every other supported target does not, so IPv6 gets it
-//! there too.
-//!
-//! `hick-compio` on Windows is the one that is easy to get wrong, and a
-//! "provenance-less" label gets it wrong: its `recvfrom` recovers no interface
-//! index, but it does recover the peer `sockaddr_in6`, and every supported
-//! platform — Windows included — fills `sin6_scope_id` from the receiving
-//! interface for a link-local source. So a link-local IPv6 peer IS witnessed and
-//! fully isolated there; a scopeless IPv6 peer and every IPv4 peer are not.
 //!
 //! ## What removing the TTL test costs, stated plainly
 //!
@@ -284,35 +397,374 @@
 //! it as "not the one address enumerated", which is a reading RFC 1122 settles
 //! against. See `is_bound_address`.
 //!
-//! ## The second regime's residual is much larger, and is not the above
-//!
-//! Everything in this section so far is about a receive path that RECOVERS a
-//! destination. On the three squares that do not — `recv_with_meta` IPv4 on
-//! FreeBSD/DragonFly, the same on OpenBSD/NetBSD, and `hick-compio` on Windows
-//! — an IPv4 broadcast is indistinguishable from a unicast and is admitted for
-//! an in-prefix source, and on the OpenBSD/NetBSD square a foreign multicast
-//! group is admitted for ANY source. Those are live, they are the R10 and
-//! R11/R12 classes, and no wording in this module should be read as covering
-//! them. The `None` arms of [`admits_ingress`] state them in full and record why
-//! `MSG_BCAST` is not the answer.
-//!
-//! Wiring the BSD IPv4 ancillary parsers (`multicast::parse_dstaddr_recvif_v4`,
-//! `multicast::parse_netbsd_pktinfo_v4` — written and unit-tested, no callers,
-//! sockopts never set; see `hick-udp/build.rs` for the per-target evidence a
-//! flip needs) and a `WSARecvMsg` receive path for `hick-compio` is what moves
-//! those squares into the first regime. Both are tracked separately.
-//!
-//! It lives here because this is the shared socket layer for every driver with a
-//! [`RecvMeta`](crate::RecvMeta) to hand it, and because four hand-written
-//! copies of an admission boundary is how they came to disagree.
+//! The blind squares' residual is stated once, under the capability table at the
+//! top of this module, and is not restated here — that duplication is how two
+//! copies of it came to disagree inside one file.
 
-use core::net::{IpAddr, SocketAddr};
+use core::{
+  net::{IpAddr, Ipv4Addr, SocketAddr},
+  num::NonZeroU32,
+};
 use std::time::{Duration, Instant};
+
+use derive_more::IsVariant;
 
 use crate::{
   constants::{MDNS_IPV4_GROUP, MDNS_IPV6_GROUP},
   multicast::LinkDelivery,
 };
+
+/// What the receive path witnessed about the IP-header DESTINATION of one
+/// datagram.
+///
+/// RFC 6762 §11 selects its local-link test by the destination, so this is the
+/// fact the whole partition turns on. It replaces an `Option<IpAddr>`, where
+/// `None` had to stand for three unrelated things at once — and did, silently,
+/// selecting the widest arm for all three.
+///
+/// **A driver does not compute this.** It is minted by a receive path, which is
+/// the only place that knows both what the platform can report and what the
+/// kernel actually reported for this datagram. See [`Self::from_reporting_path`]
+/// and [`Self::blind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IsVariant)]
+pub enum DestinationWitness {
+  /// The path recovered the IP header destination for this datagram.
+  ///
+  /// This is the ONLY value the destination partition can be positive about, and
+  /// everything [`admits_ingress`] guarantees about refusing a destination this
+  /// endpoint does not hold is a guarantee about this variant.
+  Witnessed(IpAddr),
+  /// This path witnesses destinations, and OUR OWN control buffer was too small
+  /// to hold the ancillary data (`MSG_CTRUNC`).
+  ///
+  /// A failed proof, not a capability statement — and the failure is on this
+  /// side of the boundary. It REFUSES ([`Refuse::DestinationWitnessLost`]),
+  /// which is safe precisely because it is not attacker-reachable: the flag
+  /// means the kernel HAD the fact and our buffer could not take it, and
+  /// `recv_with_meta` sizes that buffer at 512 bytes against a worst case of
+  /// about 152. Reaching this variant in production is a bug report.
+  Lost,
+  /// This path witnesses destinations, the kernel emitted none for this
+  /// datagram, and it flagged no truncation.
+  ///
+  /// The kernel DECLINED. Every BSD builds its ancillary mbufs with `M_NOWAIT`
+  /// and, when the allocation fails, skips the cmsg with no error, no counter
+  /// and no `MSG_CTRUNC` — the datagram is still delivered. Mbuf exhaustion is
+  /// usually caused by a flood, so refusing here would make a responder go
+  /// silently deaf exactly while it is under attack. This DEGRADES to the same
+  /// source-prefix arm [`Self::Blind`] takes, and [`Admit::BlindSourceOnLink`]
+  /// plus [`Self::is_declined`] are what make that countable.
+  Declined,
+  /// This path cannot witness destinations by construction.
+  ///
+  /// Declared ONCE per receive path from a compile-time capability, never
+  /// inferred per datagram — that inference is what made every truncated cmsg
+  /// look like a platform that never reports one. See the capability table at
+  /// the top of this module for which squares declare it.
+  Blind,
+}
+
+impl DestinationWitness {
+  /// The witness a path that DOES recover destinations mints for ONE datagram:
+  /// what it parsed, and whether the kernel set `MSG_CTRUNC`.
+  ///
+  /// A recovered destination is a recovered destination whatever the flag says —
+  /// truncation only matters when it cost us the fact. With nothing recovered the
+  /// flag is the whole difference between our bug ([`Self::Lost`]) and the
+  /// kernel's shortage ([`Self::Declined`]), and the two lead to opposite
+  /// verdicts, so the rule is written here once rather than at each receive path.
+  #[inline]
+  #[must_use]
+  pub const fn from_reporting_path(destination: Option<IpAddr>, control_truncated: bool) -> Self {
+    match destination {
+      Some(dst) => Self::Witnessed(dst),
+      None if control_truncated => Self::Lost,
+      None => Self::Declined,
+    }
+  }
+
+  /// The declaration a path that recovers NO destination makes — once, from its
+  /// own compile-time capability, for every datagram it will ever produce.
+  ///
+  /// Spelled as a constructor rather than as a bare variant so the one-per-path
+  /// contract has a name a review can grep for.
+  #[inline]
+  #[must_use]
+  pub const fn blind() -> Self {
+    Self::Blind
+  }
+
+  /// The witnessed destination, or `None` for every kind of absence.
+  ///
+  /// For LOGGING and for callers that need the address itself. It is deliberately
+  /// not what [`admits_ingress`] reads: collapsing the three absences back into
+  /// one `Option` is the shape this type exists to remove.
+  #[inline]
+  #[must_use]
+  pub const fn witnessed_destination(self) -> Option<IpAddr> {
+    match self {
+      Self::Witnessed(dst) => Some(dst),
+      Self::Lost | Self::Declined | Self::Blind => None,
+    }
+  }
+}
+
+/// What the receive path witnessed about the interface a datagram ARRIVED on.
+///
+/// Replaces the `(pkt_iface: u32, iface_reported: bool)` pair, whose four
+/// combinations spelled three states and let a driver pass "I do not know"
+/// positionally into the permissive arm. The mapping is
+/// `(n, _) => Witnessed(n)`, `(0, true) => Lost` or [`Self::Declined`] depending
+/// on `MSG_CTRUNC`, `(0, false) => Blind`.
+///
+/// [`NonZeroU32`] is the point of the type: index `0` names no interface on any
+/// supported platform, so `Witnessed(0)` must be unrepresentable rather than
+/// merely discouraged.
+///
+/// An IPv6 peer's scope id is a SECOND witness to the same question and is not
+/// carried here — it rides on the peer address, which the rule already takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IsVariant)]
+pub enum IfaceWitness {
+  /// The kernel named the receiving interface for this datagram.
+  Witnessed(NonZeroU32),
+  /// This path reports interfaces, and OUR OWN control buffer was too small
+  /// (`MSG_CTRUNC`). REFUSES — see [`DestinationWitness::Lost`], which is the same flag
+  /// read for the other half of the same cmsg.
+  Lost,
+  /// This path reports interfaces, the kernel named none for this datagram, and
+  /// flagged no truncation. DEGRADES exactly as
+  /// [`DestinationWitness::Declined`] does, and for the same kernel-source
+  /// reason: on every wired path the two ride on ONE `PKTINFO` cmsg, so refusing
+  /// on this one and degrading on that one would leave the degradation
+  /// unreachable.
+  ///
+  /// Two different kernel events reach it, and the reachability table in this
+  /// module's header says which squares produce each: the cmsg missing entirely
+  /// (live on the BSD IPv6 square, where `sbcreatecontrol` is called `M_NOWAIT`
+  /// and its `NULL` return skipped without a flag), and the cmsg present with a
+  /// zero index (live on Linux IPv4 and Apple IPv6 — see
+  /// [`Self::from_reporting_path`]). The second keeps its destination witness,
+  /// so it loses only the link scoping.
+  Declined,
+  /// This path cannot report interfaces by construction. Declared once per
+  /// receive path.
+  Blind,
+}
+
+impl IfaceWitness {
+  /// The witness a path that DOES report interfaces mints for ONE datagram: the
+  /// index as the kernel gave it, and whether the kernel set `MSG_CTRUNC`.
+  ///
+  /// A `0` index from a reporting path is an ABSENCE and never an interface, so
+  /// it can only become [`Self::Lost`] or [`Self::Declined`] — never
+  /// `Witnessed(0)`.
+  ///
+  /// # A zero index INSIDE a present cmsg is `Declined`, deliberately
+  ///
+  /// This is not a corner case and it is not the same event as a missing cmsg.
+  /// Linux's `ipv4_pktinfo_prepare` (`net/ipv4/ip_sockglue.c`) sets
+  /// `pktinfo->ipi_ifindex = 0` in its `else` branch, taken when
+  /// `skb_rtable(skb)` is `NULL`, and `ip_cmsg_recv_pktinfo` emits the cmsg
+  /// anyway with `ipi_addr` filled from `ip_hdr(skb)->daddr`. Apple's
+  /// `ip6_savecontrol_v4` has the same shape:
+  /// `pi6.ipi6_ifindex = (m && m->m_pkthdr.rcvif) ? m->m_pkthdr.rcvif->if_index : 0`.
+  ///
+  /// The kernel ANSWERED, and its answer was "no interface". That is a decline
+  /// and not a failed proof: nothing was lost on our side, and there is nothing
+  /// a larger control buffer would fix — so [`Self::Lost`] would be a false
+  /// accusation against this side's own sizing. It is also the only form of
+  /// `Declined` reachable on the primary platforms (see the reachability table
+  /// in this module's header), and the datagram still carries the DESTINATION
+  /// the same cmsg witnessed, so §11's destination partition decides it in full
+  /// and only the link scoping is lost.
+  #[inline]
+  #[must_use]
+  pub const fn from_reporting_path(index: u32, control_truncated: bool) -> Self {
+    match NonZeroU32::new(index) {
+      Some(idx) => Self::Witnessed(idx),
+      None if control_truncated => Self::Lost,
+      None => Self::Declined,
+    }
+  }
+
+  /// The declaration a path that reports NO interface makes — once, from its own
+  /// compile-time capability, for every datagram it will ever produce.
+  #[inline]
+  #[must_use]
+  pub const fn blind() -> Self {
+    Self::Blind
+  }
+
+  /// The witnessed index, or `None` for every kind of absence. For logging, and
+  /// for the witness loop in `arrived_on_bound_interface`.
+  #[inline]
+  #[must_use]
+  pub const fn witnessed_index(self) -> Option<NonZeroU32> {
+    match self {
+      Self::Witnessed(idx) => Some(idx),
+      Self::Lost | Self::Declined | Self::Blind => None,
+    }
+  }
+
+  /// The witnessed index, or `0` where nothing was witnessed.
+  ///
+  /// **Never for an admission decision.** It flattens the three absences this
+  /// type exists to keep apart, and [`admits_ingress`] does not accept a `u32`
+  /// at all, so it cannot be reached from here. It is for the layers below the
+  /// trust boundary that take an interface index as a ROUTING hint — the
+  /// protocol core's `handle` among them — where `0` already means "unknown" and
+  /// nothing is admitted or refused on it.
+  #[inline]
+  #[must_use]
+  pub const fn index_or_zero(self) -> u32 {
+    match self.witnessed_index() {
+      Some(idx) => idx.get(),
+      None => 0,
+    }
+  }
+}
+
+/// What [`admits_ingress`] decided, and on WHICH arm.
+///
+/// A boolean said only that a datagram was dropped. Every arm below is a
+/// separate claim about §11, several of them are known residuals, and two of
+/// them ([`Admit::BlindSourceOnLink`], [`Refuse::DestinationNotHeld`]) are the
+/// conformance gaps this workspace is trying to measure — so the arm has to
+/// survive out of the function rather than being collapsed at the return.
+///
+/// Not `#[non_exhaustive]`, for the same reason [`LinkDelivery`] is not: every
+/// value is a decision in a trust boundary, so a new one must break every
+/// `match` that counts or asserts on it rather than fall into a wildcard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IsVariant)]
+pub enum Verdict {
+  /// The datagram passed the boundary, on the named arm.
+  Admit(Admit),
+  /// The datagram was refused, for the named reason.
+  Refuse(Refuse),
+}
+
+impl Verdict {
+  /// Whether this admission rested on **no destination witness at all** — the
+  /// blind/degraded source-prefix arm, where the destination partition's
+  /// guarantees do not hold.
+  ///
+  /// The counter a driver should keep for the conformance gap on its blind
+  /// squares, and the one that makes a `Declined` cmsg visible instead of silent.
+  #[inline]
+  #[must_use]
+  pub const fn is_degraded_admit(self) -> bool {
+    matches!(
+      self,
+      Self::Admit(Admit::BlindSourceOnLink | Admit::BlindMulticastDelivery)
+    )
+  }
+
+  /// Whether this refusal is the RESIDUAL one: a witnessed destination that no
+  /// named class describes and that this endpoint does not hold.
+  ///
+  /// Counting it is what makes the residual measurable rather than merely
+  /// argued about — see [`Refuse::DestinationNotHeld`].
+  #[inline]
+  #[must_use]
+  pub const fn is_residual_refusal(self) -> bool {
+    matches!(self, Self::Refuse(Refuse::DestinationNotHeld))
+  }
+}
+
+/// Which §11 arm admitted a datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IsVariant)]
+pub enum Admit {
+  /// §11 arm one, verbatim: a destination of `224.0.0.251` or `FF02::FB` is
+  /// *"necessarily deemed to have originated on the local link, regardless of
+  /// source IP address"*.
+  MdnsGroup,
+  /// §11 arm two: the witnessed destination is an address this endpoint HOLDS —
+  /// a response *"received via unicast"* — and the source passed the on-link
+  /// comparison.
+  HeldDestination,
+  /// The interface snapshot was EMPTY, so "not one of our addresses" was never a
+  /// fact this endpoint established; the destination test deferred to the source
+  /// arm and the source arm admitted. Bounded to a loopback-bound endpoint's own
+  /// traffic — see the arm that takes it in [`admits_ingress`].
+  UnenumeratedDestination,
+  /// No destination was witnessed and the kernel's coarse [`LinkDelivery`] said
+  /// multicast. It names no GROUP, so this admits any foreign group from any
+  /// source: a residual that no flag can close.
+  BlindMulticastDelivery,
+  /// No destination was witnessed, no delivery class settled it, and §11's
+  /// source arm alone admitted.
+  ///
+  /// **The degraded admission.** It is the standing behaviour on a structurally
+  /// blind square, and the one-datagram fallback wherever a kernel declined to
+  /// emit a cmsg — [`DestinationWitness::Declined`] tells those two apart at the call site,
+  /// and this variant is what makes the admission itself countable.
+  BlindSourceOnLink,
+}
+
+/// Why a datagram was refused. Each variant is one class, so a refusal can be
+/// counted and asserted rather than only observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IsVariant)]
+pub enum Refuse {
+  /// A nonzero witness — the receive interface index, or an IPv6 source's scope
+  /// id — named a link other than the one this endpoint bound. Stage 1, and no
+  /// later stage overturns it.
+  ForeignLink,
+  /// Nothing witnessed the link, and the interface witness was
+  /// [`IfaceWitness::Lost`]: our own control buffer was too small.
+  LinkWitnessLost,
+  /// The destination witness was [`DestinationWitness::Lost`]: our own control buffer was
+  /// too small. Distinct from [`Self::LinkWitnessLost`] because the two halves
+  /// can come from different cmsgs on the BSD `IP_RECVDSTADDR` + `IP_RECVIF`
+  /// pair, and a driver that sees only one of them should be able to say which.
+  DestinationWitnessLost,
+  /// The witnessed destination is a multicast group that is not one of the two
+  /// mDNS groups — LLMNR's `224.0.0.252` / `ff02::1:3`, or any other. §11 names
+  /// exactly two addresses and this is a trust boundary, not a link-local scope
+  /// test.
+  ForeignGroup,
+  /// The witnessed destination is a broadcast by its own definition: the IPv4
+  /// limited broadcast `255.255.255.255` (RFC 919). A subnet-directed broadcast
+  /// is NOT named here — identifying one needs arithmetic over a prefix that is
+  /// wrong in three separate ways (see `is_bound_address`) — so it lands in
+  /// [`Self::DestinationNotHeld`] and is refused there.
+  BroadcastAddressed,
+  /// No destination was witnessed and the kernel's coarse [`LinkDelivery`] said
+  /// broadcast. Exact NEGATIVE evidence that needs no address: §11 gives a
+  /// broadcast no arm at all.
+  BroadcastDelivery,
+  /// The witnessed destination is the unspecified address (`0.0.0.0` / `::`),
+  /// which §11 gives no arm and which is not an address any endpoint holds.
+  UnspecifiedDestination,
+  /// The witnessed destination is in RFC 1122 §3.2.1.3's `127.0.0.0/8` (or is
+  /// `::1`) and this endpoint is NOT bound to the loopback interface, so the
+  /// block is not its own and the destination is a martian.
+  ///
+  /// Scoped to the BINDING rather than to the address: Linux's `route_localnet`
+  /// lets an operator stop treating `127/8` as martian on a real NIC, at which
+  /// point an address-only exemption would hand an adjacent spoofer the whole
+  /// boundary.
+  LoopbackDestinationOffLoopbackBinding,
+  /// The witnessed destination is an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`).
+  ///
+  /// Classified rather than left to fall through: `::ffff:224.0.0.251` is **not**
+  /// [`core::net::Ipv6Addr::is_multicast`], so a residual defined as "everything
+  /// else" would absorb an mDNS group in disguise without ever naming it. It is
+  /// unreachable on this workspace's sockets — `IPV6_V6ONLY` is set at bind on
+  /// both Unix and Windows — which is a reason to name it, not a reason to let it
+  /// land in a terminal bucket by accident.
+  Ipv4MappedDestination,
+  /// The witnessed destination is none of the classes above and is not an address
+  /// this endpoint holds: a neighbour's address on our own subnet, a
+  /// subnet-directed or operator-configured broadcast, a martian, an anycast
+  /// address `getifs` does not surface.
+  ///
+  /// **The residual.** §11 offers it no arm, so it is refused; counting it is
+  /// what makes the size of the gap an observation rather than an argument.
+  DestinationNotHeld,
+  /// §11's source arm refused: the source is neither this loopback-bound
+  /// endpoint's own traffic nor inside any prefix the bound interface carries.
+  SourceOffLink,
+}
 
 /// The link an endpoint bound, as the §11 boundary needs to know it.
 ///
@@ -448,15 +900,13 @@ const fn scope_of(src: SocketAddr) -> u32 {
   }
 }
 
-/// Whether a datagram from `src`, delivered on interface `pkt_iface`, belongs to
-/// the link this endpoint bound.
+/// Whether a datagram from `src`, arriving under `iface`, belongs to the link
+/// this endpoint bound. `None` passes; `Some(reason)` refuses and names it.
 ///
-/// `iface_reported` says whether the CALLER's receive path reports a receive
-/// interface for `src`'s address family at all. It is a parameter rather than a
-/// constant read here because the answer belongs to that path and not to the
-/// platform — see this module's header — and because the decision must be
-/// testable on every host, not only on one whose capabilities happen to match
-/// the case under test.
+/// [`IfaceWitness`] carries both the index and what its absence MEANS, because
+/// the meaning belongs to the receive path and not to the platform — see this
+/// module's header — and because the decision must be testable on every host,
+/// not only on one whose capabilities happen to match the case under test.
 ///
 /// # Why this gate exists on top of §11
 ///
@@ -485,7 +935,7 @@ const fn scope_of(src: SocketAddr) -> u32 {
 /// our own interface and whose scope id says another has already contradicted
 /// itself; a trust boundary resolves that against the sender, not for it.
 ///
-/// # The three exceptions, all deliberate
+/// # The exceptions, all deliberate
 ///
 /// **A loopback source is admitted from any interface only when the ENDPOINT is
 /// bound to the loopback interface**, and never on the strength of the source
@@ -509,52 +959,115 @@ const fn scope_of(src: SocketAddr) -> u32 {
 /// default, then fails the bind outright if that index names no interface, so a
 /// live endpoint always has a real one.
 ///
-/// **No witness at all is admitted only where the caller's receive path never
-/// had one to give.** With `iface_reported == false` a zero index is that path's
-/// silence — IPv4 on FreeBSD/DragonFly/OpenBSD/NetBSD, which define no usable
-/// `IP_PKTINFO`, and any driver reading datagrams with `recvfrom` — and
-/// rejecting silence would take mDNS off the air there entirely. With
-/// `iface_reported == true` the path does
-/// answer this question, so a zero index is a datagram the kernel declined to
-/// place: no longer absent evidence but a failed proof, and this fails closed on
-/// it.
+/// **With NO witness at all, the kind of absence decides, and only one of the
+/// three refuses.** [`IfaceWitness::Blind`] is the path's silence — IPv4 on
+/// FreeBSD/DragonFly/OpenBSD/NetBSD, which define no usable `IP_PKTINFO`, and
+/// any driver reading datagrams with `recvfrom` — and rejecting silence would
+/// take mDNS off the air there entirely. [`IfaceWitness::Declined`] is the
+/// kernel skipping a cmsg it could not allocate, which is an availability event
+/// and not evidence about the sender, so it degrades the same way.
+/// [`IfaceWitness::Lost`] is the one that fails closed: our own control buffer
+/// was too small, the kernel HAD the fact, and that is a defect on this side.
 ///
-/// Admitting silence is NOT the end of the matter, and this function is not the
-/// place that settles it: a datagram that passes here must still satisfy one of
-/// §11's own two arms.
+/// The split matters because the previous rule refused both of the last two.
+/// Every BSD allocates its ancillary mbufs with `M_NOWAIT` and silently skips
+/// the cmsg — no error, no counter, no truncation flag — while still delivering
+/// the datagram, and mbuf exhaustion is normally CAUSED by a flood. A blanket
+/// refusal therefore made the responder go completely deaf, silently, exactly
+/// when it was under attack. Availability is chosen there, and the fallback is
+/// not a new one: it is the standing behaviour of every structurally blind
+/// square.
+///
+/// # THE TRADE, written down rather than left to be rediscovered
+///
+/// Degrading on [`IfaceWitness::Declined`] costs something real, and it is not
+/// the same cost as degrading on the destination witness. **This gate is the
+/// only thing that scopes §11's GROUP arm to the link this endpoint bound.** A
+/// group destination proves a datagram was link-local to SOME link, never to
+/// ours, so once this gate passes for want of evidence a foreign NIC's
+/// `224.0.0.251` traffic is admitted on the group arm with no source test at
+/// all.
+///
+/// **The attack.** An adjacent sender who can exhaust the receiving host's mbuf
+/// pool — flooding is the ordinary way — makes a BSD kernel skip `PKTINFO` on
+/// arbitrary datagrams, including their own. Their cross-NIC traffic then
+/// arrives here with no witness, this gate passes it, and either the group arm
+/// takes it outright or the source-prefix arm takes it on an in-prefix source
+/// they simply choose. Under the previous rule that traffic was refused. This is
+/// a genuine widening and it is attacker-INFLUENCED, even though the loss of any
+/// individual cmsg is not attacker-chosen.
+///
+/// **Why availability wins anyway.** The alternative is not "refuse the
+/// attacker": it is refuse EVERYTHING, because the shortage is host-wide and
+/// hits every datagram equally. So the choice is between an endpoint that admits
+/// some off-link traffic during a flood and an endpoint that answers nothing
+/// during a flood — including the queries it exists to answer, and including its
+/// own loopback echo, which its RFC 6762 §8.2 conflict handling and its
+/// self-send suppression both depend on. §21 is explicit that this mechanism
+/// does not defend against an on-link antagonist at all, and the degraded arm is
+/// exactly the rule four supported targets run permanently. An availability
+/// failure an adjacent host can trigger at will is the worse of the two.
+///
+/// **What an operator watches.** `ingress_degraded_admits` counts every
+/// admission taken with no destination witness, and `ingress_witness_declined`
+/// counts every datagram whose cmsg the kernel skipped or could not name an
+/// interface for. On a Linux, Apple or Windows square the first should sit at
+/// zero and the second should be rare — see the reachability table in this
+/// module's header — so sustained movement in either is this attack, or a kernel
+/// doing something that table does not describe. Neither is a rate a healthy
+/// host produces, and that is what makes them worth alerting on.
+///
+/// **What would close it.** Not refusing here — that is the failure above.
+/// Binding one socket per interface instead of wildcard-binding would make the
+/// link a property of the SOCKET rather than of a cmsg, and no ancillary-data
+/// shortage could take it away. That is a different endpoint design, and it is
+/// not tracked as part of this boundary.
+///
+/// Admitting an absence is NOT the end of the matter, and this function is not
+/// the place that settles it: a datagram that passes here must still satisfy one
+/// of §11's own two arms.
 fn arrived_on_bound_interface(
   src: SocketAddr,
   link: BoundLink<'_>,
-  pkt_iface: u32,
-  iface_reported: bool,
-) -> bool {
+  iface: IfaceWitness,
+) -> Option<Refuse> {
   if link.iface() == 0 {
-    return true;
+    return None;
   }
-  // The witnesses are read FIRST and nothing overrules them. A present, nonzero
-  // witness is evidence the kernel attached to this datagram; a source ADDRESS
-  // is a claim the sender wrote. No exception below may let the second answer
-  // over the first.
+  // The witnesses are read FIRST and nothing overrules them. A present witness is
+  // evidence the kernel attached to this datagram; a source ADDRESS is a claim
+  // the sender wrote. No exception below may let the second answer over the
+  // first.
   let mut witnessed = false;
-  for witness in [pkt_iface, scope_of(src)] {
-    if witness == 0 {
+  for witness in [iface.witnessed_index(), NonZeroU32::new(scope_of(src))] {
+    let Some(witness) = witness else {
       continue;
-    }
+    };
     witnessed = true;
-    if witness != link.iface() {
-      return false;
+    if witness.get() != link.iface() {
+      return Some(Refuse::ForeignLink);
     }
   }
   if witnessed {
-    return true;
+    return None;
   }
   // Nothing named the link. Only now may a loopback-BOUND endpoint take its own
   // loopback traffic on the source address, and only because the loopback
   // interface IS its link.
   if link.is_loopback() && src.ip().is_loopback() {
-    return true;
+    return None;
   }
-  !iface_reported
+  match iface {
+    IfaceWitness::Lost => Some(Refuse::LinkWitnessLost),
+    // The kernel declined, or this path never reports one: absent evidence in
+    // both cases, and §11's own arms still have to be satisfied below.
+    IfaceWitness::Declined | IfaceWitness::Blind => None,
+    // Unreachable: a `Witnessed` index is nonzero, so it set `witnessed` above
+    // and returned. Spelled as a pass rather than a panic because this crate
+    // denies `clippy::unreachable` on a trust boundary, and because refusing
+    // here would refuse a datagram whose witness AGREED with the binding.
+    IfaceWitness::Witnessed(_) => None,
+  }
 }
 
 /// Whether **this crate's own** [`recv_with_meta`](crate::recv_with_meta)
@@ -625,58 +1138,61 @@ fn is_mdns_group(dst: IpAddr) -> bool {
 ///
 /// # Where the destination comes from, and why not `local_ip`
 ///
-/// `destination` is [`RecvMeta::destination`](crate::RecvMeta::destination),
-/// which reports the IP header destination or nothing at all. It is NOT
-/// [`RecvMeta::local_ip`](crate::RecvMeta::local_ip): on Unix IPv4 that accessor
-/// deliberately returns `in_pktinfo.ipi_spec_dst`, the receiving interface's own
-/// unicast address, because self-send detection on a multi-homed host needs it —
-/// and a local unicast address never equals a group, so every multicast arrival
-/// would read as "unicast" and go to the source-prefix test §11 says must not
-/// decide it.
+/// `destination` is
+/// [`RecvMeta::destination_witness`](crate::RecvMeta::destination_witness),
+/// which reports what the receive path witnessed about the IP header
+/// destination. It is NOT [`RecvMeta::local_ip`](crate::RecvMeta::local_ip): on
+/// Unix IPv4 that accessor deliberately returns `in_pktinfo.ipi_spec_dst`, the
+/// receiving interface's own unicast address, because self-send detection on a
+/// multi-homed host needs it — and a local unicast address never equals a group,
+/// so every multicast arrival would read as "unicast" and go to the
+/// source-prefix test §11 says must not decide it.
 ///
 /// There is no branch that skips this reading, so getting it wrong is not a
 /// corner case: every arrival on every target would take the source-prefix arm.
-/// On OpenBSD/NetBSD there is no IPv4 PKTINFO parse at all, the destination
-/// degrades to `None`, and the kernel's multicast flag is the only thing left to
+/// On OpenBSD/NetBSD there is no IPv4 PKTINFO parse at all, the destination is
+/// [`DestinationWitness::Blind`], and the kernel's multicast flag is the only thing left to
 /// reach the group arm with — against precisely the overlaid-subnet multicast
 /// §11 calls "essential" to admit.
 ///
 /// # Two regimes, and the contract differs between them
 ///
-/// **`destination` is `Some`.** A recovered destination is matched against the
-/// two mDNS groups and then against the addresses this endpoint holds. Anything
-/// else takes no §11 arm and is REFUSED — a foreign multicast group, an IPv4
+/// **[`DestinationWitness::Witnessed`].** The destination is matched against the two mDNS
+/// groups and then against the addresses this endpoint holds. Anything else
+/// takes no §11 arm and is REFUSED — a foreign multicast group, an IPv4
 /// broadcast in any form, a martian, the unspecified address, a neighbour's
-/// address on our own subnet. That guarantee is this function's, in full, for
-/// every driver on a square that recovers a destination.
+/// address on our own subnet — and [`Refuse`] names which. That guarantee is
+/// this function's, in full, for every driver on a square that witnesses a
+/// destination.
 ///
-/// **`destination` is `None`.** None of the above holds, and this is a promise
-/// this function does not make on those squares — `recv_with_meta` for IPv4 on
-/// FreeBSD, DragonFly, OpenBSD and NetBSD; `hick-compio` on Windows, which
-/// reads with `recv_from`; and any receive whose PKTINFO cmsg was absent or
-/// truncated. `MSG_MCAST` stands in on the OpenBSD/NetBSD square and answers
-/// "some group" rather than which, so a foreign group is admitted there with no
-/// source test at all; everywhere else on those squares an IPv4 broadcast is
-/// indistinguishable from a unicast and is admitted for an in-prefix source.
+/// **[`DestinationWitness::Blind`] and [`DestinationWitness::Declined`].** None of the above holds,
+/// and this is a promise this function does not make there. `MSG_MCAST` stands
+/// in on the OpenBSD/NetBSD square and answers "some group" rather than which, so
+/// a foreign group is admitted with no source test at all; everywhere else an
+/// IPv4 broadcast is indistinguishable from a unicast and is admitted for an
+/// in-prefix source. [`Admit::BlindSourceOnLink`] is what makes an admission
+/// there countable.
+///
+/// **[`DestinationWitness::Lost`].** Refused outright: our own control buffer was too
+/// small, which is a defect on this side rather than a fact about the sender.
 ///
 /// A caller that needs the first regime's guarantee must be on a square that
-/// supplies a destination. The `None` arms below say what closes the gap, and
-/// why the available `MSG_BCAST` bit is not it.
+/// witnesses a destination; see the capability table in this module's header for
+/// which those are, and what closes the rest.
 pub fn admits_ingress(
   src: SocketAddr,
-  destination: Option<IpAddr>,
+  destination: DestinationWitness,
   delivery: Option<LinkDelivery>,
   link: BoundLink<'_>,
-  pkt_iface: u32,
-  iface_reported: bool,
-) -> bool {
+  iface: IfaceWitness,
+) -> Verdict {
   // Ours: scope "the local link" to the link this endpoint bound. §11 does not
   // prescribe it, but its unicast arm is defined over "the interface receiving
   // the packet", so the RFC's test is already interface-scoped — this is what
   // makes that model enforceable for a wildcard-bound socket on a multi-homed
   // host.
-  if !arrived_on_bound_interface(src, link, pkt_iface, iface_reported) {
-    return false;
+  if let Some(refusal) = arrived_on_bound_interface(src, link, iface) {
+    return Verdict::Refuse(refusal);
   }
   // §11 partitions by DESTINATION and names exactly two kinds. Each arm below
   // says what a destination IS. Nothing here is spelled as "everything that is
@@ -687,14 +1203,14 @@ pub fn admits_ingress(
   match destination {
     // Arm one, verbatim: "necessarily deemed to have originated on the local
     // link, regardless of source IP address".
-    Some(dst) if is_mdns_group(dst) => true,
+    DestinationWitness::Witnessed(dst) if is_mdns_group(dst) => Verdict::Admit(Admit::MdnsGroup),
     // Arm two: §11 scopes its source comparison to a response "received via
     // unicast", and a datagram received via unicast BY US is one addressed to
     // an address of ours. So the destination is matched against the receiving
     // interface's own configuration, which is the same configuration the
     // source is about to be matched against.
-    Some(dst) if is_bound_address(dst, link) => {
-      src_on_local_link(src, link, pkt_iface, iface_reported)
+    DestinationWitness::Witnessed(dst) if is_bound_address(dst, link) => {
+      source_arm(src, link, iface, Admit::HeldDestination)
     }
     // An EMPTY snapshot is the one place the arm above must not be believed,
     // and this is the deliberate choice at this site.
@@ -721,29 +1237,33 @@ pub fn admits_ingress(
     // means the enumeration succeeded, so a destination missing from it is a
     // real "not ours" until the next refresh. That fails closed for at most
     // `SUBNET_REFRESH_INTERVAL` and heals itself; see this module's header.
-    Some(_) if link.local_addrs().is_empty() => {
-      src_on_local_link(src, link, pkt_iface, iface_reported)
+    DestinationWitness::Witnessed(_) if link.local_addrs().is_empty() => {
+      source_arm(src, link, iface, Admit::UnenumeratedDestination)
     }
     // §11 offers no arm for any other destination, and this is a trust
     // boundary, so it is refused rather than handed to the arm next door.
-    Some(_) => false,
+    // `classify_unheld` runs strictly AFTER that decision and only names which
+    // class it was; it cannot change the verdict, and the refusal above does not
+    // depend on the naming being exhaustive.
+    DestinationWitness::Witnessed(dst) => Verdict::Refuse(classify_unheld(dst, link)),
+    // Our own control buffer was too small. The kernel HAD the destination and
+    // this side could not take it: a defect report rather than evidence about
+    // the sender, and the one absence that fails closed. `recv_with_meta` sizes
+    // its buffer so this cannot be provoked from the wire — see `DestinationWitness::Lost`.
+    DestinationWitness::Lost => Verdict::Refuse(Refuse::DestinationWitnessLost),
     // ── A DIFFERENT REGIME STARTS HERE ────────────────────────────────────
     //
-    // No destination recovered, on one of five named receive squares:
-    // **`hick-udp`'s `recv_with_meta` for IPv4 on FreeBSD/DragonFly** and **on
-    // OpenBSD/NetBSD**; **`hick-compio`'s own unix decoder for IPv4 on those
-    // same four targets** — its `build.rs` enables `has_ip_pktinfo` for
-    // Linux/Android/Apple only, exactly as `hick-udp`'s does, so it is a
-    // separate decoder with the same gap and not a share of this crate's — and
-    // **`hick-compio` on Windows**, which reads with `recv_from` and gets no
-    // ancillary data at all. Any receive whose PKTINFO cmsg was absent or
-    // truncated lands here too.
+    // No destination witnessed. Either this path never witnesses one — see the
+    // capability table in this module's header for which squares those are — or
+    // the kernel declined to emit the cmsg for THIS datagram, which every BSD
+    // does silently under mbuf pressure. The two are the same rule from here on
+    // and differ only in what they are counted as.
     //
-    // NOTHING IN THE `Some` ARMS APPLIES HERE. The positive partition needs a
-    // destination to be positive about; below there is none, so these arms are
+    // NOTHING IN THE `Witnessed` ARMS APPLIES HERE. The positive partition needs
+    // a destination to be positive about; below there is none, so these arms are
     // a coarser rule with a residual of their own, and every claim this module
     // makes about refusing a destination it does not hold is a claim about the
-    // `Some` arms only.
+    // `Witnessed` arms only.
     //
     // A link-layer BROADCAST is refused. `MSG_BCAST` is definitive NEGATIVE
     // evidence and it is exact rather than approximate: the delivery was
@@ -767,28 +1287,97 @@ pub fn admits_ingress(
     // # What it does and does not close
     //
     // It closes the IPv4 broadcast class on the OpenBSD/NetBSD squares — the
-    // only two of the five where `libc` binds the flag. It closes nothing on
+    // only two where `libc` binds the flag. It closes nothing on
     // FreeBSD/DragonFly (no binding) or on `hick-compio`'s Windows square
-    // (`recv_from` returns no `msg_flags` to read), and those three keep it.
+    // (`recv_from` returns no `msg_flags` to read), and those keep it.
     //
-    // It also leaves, on the very squares it does close, the R10 class beside
-    // it: the multicast arm below admits ANY group from ANY source with no
-    // prefix test, because "which group" is not a bit and no flag can carry it.
-    // That is a reason those squares are not fully closed, not a reason to
+    // It also leaves, on the very squares it does close, the foreign-group class
+    // beside it: the multicast arm below admits ANY group from ANY source with
+    // no prefix test, because "which group" is not a bit and no flag can carry
+    // it. That is a reason those squares are not fully closed, not a reason to
     // leave a closable part of them open.
     //
-    // The full closure is the destination itself: `hick-udp`'s
-    // `multicast::parse_dstaddr_recvif_v4` and `parse_netbsd_pktinfo_v4` (both
-    // written and unit-tested, no callers, sockopts never set — see
-    // `hick-udp/build.rs` for the per-target evidence a flip needs), the SAME
-    // work again in `hick-compio/src/socket/unix.rs` behind that crate's own
-    // `has_ip_pktinfo`, and a `WSARecvMsg` receive path for `hick-compio` on
-    // Windows. Each moves its square into the first regime entirely — broadcast,
-    // foreign group, martian and neighbour address at once. All are tracked
-    // separately; none is done here.
-    None if delivery == Some(LinkDelivery::Broadcast) => false,
-    None if delivery == Some(LinkDelivery::Multicast) => true,
-    None => src_on_local_link(src, link, pkt_iface, iface_reported),
+    // The full closure is the destination itself; the three pieces of work that
+    // reach it are named once, in this module's header.
+    DestinationWitness::Declined | DestinationWitness::Blind => match delivery {
+      Some(LinkDelivery::Broadcast) => Verdict::Refuse(Refuse::BroadcastDelivery),
+      Some(LinkDelivery::Multicast) => Verdict::Admit(Admit::BlindMulticastDelivery),
+      // `Unicast` says only "neither of those", so the source arm still decides;
+      // `None` is a target that binds no flag at all and says nothing.
+      Some(LinkDelivery::Unicast) | None => source_arm(src, link, iface, Admit::BlindSourceOnLink),
+    },
+  }
+}
+
+/// §11's source arm as a [`Verdict`]: `admit` when the source is on-link,
+/// [`Refuse::SourceOffLink`] when it is not.
+///
+/// Three arms of [`admits_ingress`] end here and each supplies its OWN [`Admit`]
+/// — a destination this endpoint holds, a snapshot that enumerated nothing, and
+/// a datagram with no destination witness — because they are three different
+/// claims that happen to share one test. Sharing the refusal is safe; sharing
+/// the admission would erase the distinction the counters exist for.
+fn source_arm(src: SocketAddr, link: BoundLink<'_>, iface: IfaceWitness, admit: Admit) -> Verdict {
+  if src_on_local_link(src, link, iface) {
+    Verdict::Admit(admit)
+  } else {
+    Verdict::Refuse(Refuse::SourceOffLink)
+  }
+}
+
+/// NAME the class of a witnessed destination this endpoint does not hold.
+///
+/// Reached only from the arm that has ALREADY refused, so nothing here can admit
+/// and nothing here has to be exhaustive to be safe: an unnamed class lands in
+/// [`Refuse::DestinationNotHeld`], which is a refusal exactly like the named
+/// ones. That is the whole reason it is safe to classify at all — four review
+/// rounds found a class that a residual defined as "none of the above" had
+/// absorbed, and the fix was to make the residual REFUSE rather than to keep
+/// enumerating. This function does not reintroduce that shape; it only labels
+/// what the refusal was about.
+///
+/// The loopback label is scoped to the BINDING, not to the address, exactly as
+/// `is_bound_address` decides it: a `127/8` destination on a real NIC is a
+/// martian, and Linux's `route_localnet` makes it deliverable by an adjacent
+/// spoofer, so the binding is what the label — like the decision — turns on.
+fn classify_unheld(dst: IpAddr, link: BoundLink<'_>) -> Refuse {
+  match dst {
+    IpAddr::V4(a) => {
+      if a.is_loopback() && !link.is_loopback() {
+        Refuse::LoopbackDestinationOffLoopbackBinding
+      } else if a.is_unspecified() {
+        Refuse::UnspecifiedDestination
+      } else if a == Ipv4Addr::BROADCAST {
+        // RFC 919's limited broadcast, and the only broadcast an address names
+        // by itself. A subnet-directed one needs arithmetic over a prefix, which
+        // `is_bound_address` documents as wrong in three separate directions, so
+        // it is deliberately left to the residual.
+        Refuse::BroadcastAddressed
+      } else if a.is_multicast() {
+        Refuse::ForeignGroup
+      } else {
+        Refuse::DestinationNotHeld
+      }
+    }
+    IpAddr::V6(a) => {
+      if a.is_loopback() && !link.is_loopback() {
+        Refuse::LoopbackDestinationOffLoopbackBinding
+      } else if a.is_unspecified() {
+        Refuse::UnspecifiedDestination
+      } else if a.to_ipv4_mapped().is_some() {
+        // BEFORE the multicast test, and that ordering is the point:
+        // `::ffff:224.0.0.251` is not `Ipv6Addr::is_multicast`, so an
+        // unclassified v4-mapped address would be an mDNS group wearing a shape
+        // no test here recognises. `IPV6_V6ONLY` keeps it off this workspace's
+        // sockets, which is a reason to name it rather than a reason to let it
+        // fall into a terminal bucket by accident.
+        Refuse::Ipv4MappedDestination
+      } else if a.is_multicast() {
+        Refuse::ForeignGroup
+      } else {
+        Refuse::DestinationNotHeld
+      }
+    }
   }
 }
 
@@ -1095,11 +1684,10 @@ pub fn is_loopback_interface(iface_index: u32) -> bool {
 ///
 /// It is one stage of a sequence and is correct only when reached through
 /// `admits_ingress`, which has already settled which link the datagram arrived
-/// on. Called directly it ignores `pkt_iface` and `iface_reported` for every
-/// source but loopback, so a foreign-scoped `fe80::` peer with a matching
-/// `fe80::/64` prefix would come back `true`. The hoist made it public by
-/// accident; a helper that only behaves when someone else went first has no
-/// business on a crate's surface.
+/// on. Called directly it ignores `iface` for every source but loopback, so a
+/// foreign-scoped `fe80::` peer with a matching `fe80::/64` prefix would come
+/// back `true`. The hoist made it public by accident; a helper that only behaves
+/// when someone else went first has no business on a crate's surface.
 ///
 /// Trust a source that is link-local on the receiving
 /// interface, or that falls inside a subnet configured on the bound interface.
@@ -1130,12 +1718,7 @@ pub fn is_loopback_interface(iface_index: u32) -> bool {
 /// forgeable onto a real NIC wherever an operator has stopped treating `127/8`
 /// as martian, so only a loopback-BOUND endpoint is exempt from proving where
 /// its traffic came from.
-fn src_on_local_link(
-  src: SocketAddr,
-  link: BoundLink<'_>,
-  pkt_iface: u32,
-  iface_reported: bool,
-) -> bool {
+fn src_on_local_link(src: SocketAddr, link: BoundLink<'_>, iface: IfaceWitness) -> bool {
   let ip = src.ip();
   // Link-local is deliberately NOT classified here any more. It used to select a
   // branch of its own, which was a third arm §11 does not have; every
@@ -1148,7 +1731,7 @@ fn src_on_local_link(
     // NIC wherever an operator has stopped treating `127/8` as martian.
     // Whether a witness contradicts it is `arrived_on_bound_interface`'s
     // question, asked there rather than restated here.
-    return link.is_loopback() && arrived_on_bound_interface(src, link, pkt_iface, iface_reported);
+    return link.is_loopback() && arrived_on_bound_interface(src, link, iface).is_none();
   }
   // EVERY other source — routable or link-local, witnessed or not — answers to
   // §11's unicast test as the RFC states it: the source address against the

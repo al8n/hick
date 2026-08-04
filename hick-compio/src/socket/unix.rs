@@ -10,6 +10,9 @@ use core::net::Ipv4Addr;
 #[cfg(has_ipv6_pktinfo)]
 use core::net::Ipv6Addr;
 
+#[cfg(any(has_ip_pktinfo, has_ipv6_pktinfo))]
+use hick_udp::onlink::{DestinationWitness, IfaceWitness};
+
 use super::RecvMeta;
 
 /// One ancillary control message inside a filled control buffer.
@@ -421,7 +424,7 @@ fn set_int(
   }
 }
 
-pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta) {
+pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta, control_truncated: bool) {
   // `ctrl` originates from `AlignedCtrlBuf::filled`, whose storage is the
   // start of a `#[repr(align(8))]` array — so the slice's first byte is
   // aligned for `cmsghdr`. Defensive bail for the rare future caller that
@@ -453,8 +456,13 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta) {
         // former; reading the latter made every multicast arrival look unicast
         // and sent it to the source-prefix arm, which refuses an on-link peer
         // sourcing from a prefix this interface does not carry.
-        meta.destination = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(pi.ipi_addr.s_addr))));
-        meta.interface_index = pi.ipi_ifindex as u32;
+        meta.destination = DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+          pi.ipi_addr.s_addr,
+        ))));
+        // A zero `ipi_ifindex` INSIDE a present cmsg is a kernel that named no
+        // interface, not a path that cannot name one — `from_reporting_path`
+        // makes that `Declined`, or `Lost` where our own buffer truncated.
+        meta.iface = IfaceWitness::from_reporting_path(pi.ipi_ifindex as u32, control_truncated);
       }
       // IPv6 PKTINFO — only where libc defines IPV6_PKTINFO (`has_ipv6_pktinfo`).
       #[cfg(has_ipv6_pktinfo)]
@@ -469,8 +477,9 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta) {
         // IPv6 PKTINFO carries only the header destination — there is no
         // `ipi_spec_dst` twin — so the one address serves as both.
         meta.local_ip = IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr));
-        meta.destination = Some(IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr)));
-        meta.interface_index = pi.ipi6_ifindex as u32;
+        meta.destination =
+          DestinationWitness::Witnessed(IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr)));
+        meta.iface = IfaceWitness::from_reporting_path(pi.ipi6_ifindex, control_truncated);
       }
       // IPv4 TTL — only where libc defines the hop-limit cmsg constants
       // (`has_recv_hoplimit`; absent on OpenBSD/NetBSD).
@@ -824,15 +833,16 @@ fn truncated_pktinfo_cmsg_is_skipped_not_read() {
     (*hdr).cmsg_type = IP_PKTINFO;
   }
   let mut meta = RecvMeta::empty(([0u8, 0, 0, 0], 0).into());
-  decode_unix_cmsgs(buf, &mut meta);
+  decode_unix_cmsgs(buf, &mut meta, false);
   // Left at defaults: the truncated cmsg was skipped, never read as garbage.
   assert!(
     meta.local_ip.is_unspecified(),
     "truncated PKTINFO populated local_ip from a short cmsg"
   );
   assert_eq!(
-    meta.interface_index, 0,
-    "truncated PKTINFO populated interface_index from a short cmsg"
+    meta.iface.index_or_zero(),
+    0,
+    "truncated PKTINFO populated the interface witness from a short cmsg"
   );
 }
 
@@ -904,7 +914,7 @@ fn timestamp_cmsg_is_decoded_by_hick_udp_and_not_by_this_crate() {
   assert!(acc > 0, "the encoded cmsg must not be all-zero");
 
   let mut meta = RecvMeta::empty(([0u8, 0, 0, 0], 0).into());
-  decode_unix_cmsgs(&buf[..written], &mut meta);
+  decode_unix_cmsgs(&buf[..written], &mut meta, false);
   assert_eq!(
     meta.rx,
     RxEvidence::none(),

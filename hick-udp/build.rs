@@ -79,9 +79,9 @@ fn main() {
   // for those shapes now exist (`multicast::parse_dstaddr_recvif_v4` and
   // `multicast::parse_netbsd_pktinfo_v4`, selected by the two cfgs below), but
   // NOTHING CALLS THEM: `recv_with_meta` still takes the degraded path, so an
-  // IPv4 datagram on these targets has no recovered destination,
-  // `RecvMeta::destination` returns `None`, and RFC 6762 §11's group arm is
-  // still selected by the coarser `has_msg_mcast` flag below.
+  // IPv4 datagram on these targets witnesses no destination,
+  // `RecvMeta::destination_witness` returns `DestinationWitness::Blind`, and RFC 6762
+  // §11's group arm is still selected by the coarser `has_msg_mcast` flag below.
   if linux_like || apple {
     println!("cargo::rustc-cfg=has_ip_pktinfo");
   }

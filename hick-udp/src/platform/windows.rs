@@ -20,7 +20,10 @@ use windows_sys::Win32::Networking::WinSock::{
   WSAID_WSARECVMSG, WSAIoctl, WSAMSG, setsockopt,
 };
 
-use crate::multicast::RecvMeta;
+use crate::{
+  multicast::RecvMeta,
+  onlink::{DestinationWitness, IfaceWitness},
+};
 
 fn as_socket(s: &UdpSocket) -> std::io::Result<Socket> {
   Ok(Socket::from(s.try_clone()?))
@@ -214,8 +217,10 @@ pub fn recv_with_meta(socket: RawSocket, buf: &mut [u8], is_v4: bool) -> std::io
     len: u32::try_from(buf.len()).unwrap_or(u32::MAX),
     buf: buf.as_mut_ptr(),
   };
-  // Control buffer for one PKTINFO cmsg (256 bytes is plenty).
-  let mut control = [0u8; 256];
+  // Control buffer for one PKTINFO cmsg. Sized like the Unix twin's `CmsgBuf`
+  // and for the same reason: `MSG_CTRUNC` now REFUSES the datagram, so our own
+  // sizing must not be able to provoke it.
+  let mut control = [0u8; 512];
   let mut msg = WSAMSG {
     name: core::ptr::addr_of_mut!(name).cast::<SOCKADDR>(),
     namelen: core::mem::size_of::<SOCKADDR_STORAGE>() as i32,
@@ -264,10 +269,24 @@ pub fn recv_with_meta(socket: RawSocket, buf: &mut [u8], is_v4: bool) -> std::io
   };
 
   // MSG_CTRUNC means our control buffer was too small to hold all ancillary
-  // data; treat as "no pktinfo" and fall back (the datagram is already
-  // consumed). On Windows this flag is 0x200 — use the platform constant.
+  // data. The datagram is preserved — WSARecvMsg already consumed it — but the
+  // witnesses are reported as LOST rather than absent, and the trust boundary
+  // refuses on them: the kernel HAD the facts and this side could not take
+  // them. On Windows this flag is 0x200 — use the platform constant.
+  //
+  // `WSARecvMsg` is enabled unconditionally on this path (`wsarecvmsg_fn`
+  // returns an error rather than degrading), so Windows always WITNESSES both
+  // facts and never declares itself blind — which is exactly what
+  // `reports_rx_interface_v4`/`_v6` already report for this target.
   if msg.dwFlags & MSG_CTRUNC != 0 {
-    return Ok(RecvMeta::new(n, peer, unspecified, None, 0, None));
+    return Ok(RecvMeta::new(
+      n,
+      peer,
+      unspecified,
+      DestinationWitness::from_reporting_path(None, true),
+      IfaceWitness::from_reporting_path(0, true),
+      None,
+    ));
   }
 
   let ctrl_len = core::cmp::min(msg.Control.len as usize, control.len());
@@ -276,11 +295,20 @@ pub fn recv_with_meta(socket: RawSocket, buf: &mut [u8], is_v4: bool) -> std::io
   let (local_ip, iface) = parsed.unwrap_or((unspecified, 0));
   // Windows' IN_PKTINFO carries `ipi_addr`, the IP header destination — there
   // is no `ipi_spec_dst` twin as on Unix IPv4 — so `local_ip` already IS the
-  // destination and the two accessors agree here. It is `Some` only when the
-  // cmsg actually parsed: the UNSPECIFIED degradation above is absence of
+  // destination and the two accessors agree here. It is `Witnessed` only when
+  // the cmsg actually parsed: the UNSPECIFIED degradation is an absence of
   // evidence, not a destination of `0.0.0.0`.
-  let destination = parsed.map(|(dst, _)| dst);
-  Ok(RecvMeta::new(n, peer, local_ip, destination, iface, None))
+  //
+  // With `MSG_CTRUNC` clear an absent cmsg is the kernel emitting none of its
+  // own accord, which DEGRADES rather than refusing — see `DestinationWitness::Declined`.
+  Ok(RecvMeta::new(
+    n,
+    peer,
+    local_ip,
+    DestinationWitness::from_reporting_path(parsed.map(|(dst, _)| dst), false),
+    IfaceWitness::from_reporting_path(iface, false),
+    None,
+  ))
 }
 
 /// Walk a `WSARecvMsg` control buffer for the IP_PKTINFO (v4) / IPV6_PKTINFO
