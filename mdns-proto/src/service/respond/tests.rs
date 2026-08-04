@@ -1,11 +1,11 @@
-use super::canonical_rdata_for_hash;
+use super::rdata_for_identity;
 use crate::wire::{A, AAAA, Ptr, Rdata, Srv, Txt};
 
 #[test]
 fn canonical_a_is_4_bytes() {
   let a = A::try_from_rdata(&[192, 168, 1, 10]).unwrap();
   let mut scratch = std::vec::Vec::new();
-  let out = canonical_rdata_for_hash(&Rdata::A(a), &mut scratch).unwrap();
+  let out = rdata_for_identity(&Rdata::A(a), &mut scratch).unwrap();
   assert_eq!(out, [192u8, 168, 1, 10].as_slice());
 }
 
@@ -70,7 +70,7 @@ fn canonical_aaaa_is_16_bytes() {
   let rdata = addr.octets();
   let rec = AAAA::try_from_rdata(&rdata).unwrap();
   let mut scratch = std::vec::Vec::new();
-  let out = canonical_rdata_for_hash(&Rdata::AAAA(rec), &mut scratch).unwrap();
+  let out = rdata_for_identity(&Rdata::AAAA(rec), &mut scratch).unwrap();
   assert_eq!(out.len(), 16);
   assert_eq!(out, &addr.octets());
 }
@@ -81,7 +81,7 @@ fn canonical_txt_roundtrips_wire_form() {
   let raw: &[u8] = &[7, b'k', b'e', b'y', b'=', b'v', b'a', b'l', 1, b'x'];
   let txt = Txt::from_rdata(raw);
   let mut scratch = std::vec::Vec::new();
-  let out = canonical_rdata_for_hash(&Rdata::Txt(txt), &mut scratch).unwrap();
+  let out = rdata_for_identity(&Rdata::Txt(txt), &mut scratch).unwrap();
   assert_eq!(out, raw, "canonical TXT must match wire bytes verbatim");
 }
 
@@ -92,7 +92,7 @@ fn canonical_txt_malformed_segment_returns_err() {
   let txt = Txt::from_rdata(raw);
   let mut scratch = std::vec::Vec::new();
   assert!(
-    canonical_rdata_for_hash(&Rdata::Txt(txt), &mut scratch).is_err(),
+    rdata_for_identity(&Rdata::Txt(txt), &mut scratch).is_err(),
     "malformed TXT segment must produce an Err"
   );
 }
@@ -110,7 +110,7 @@ fn canonical_ptr_is_lowercase_dotted_labels() {
   let rdata_len = msg.len();
   let ptr = Ptr::try_from_message(&msg, 0, rdata_len).unwrap();
   let mut scratch = std::vec::Vec::new();
-  let out = canonical_rdata_for_hash(&Rdata::Ptr(ptr), &mut scratch).unwrap();
+  let out = rdata_for_identity(&Rdata::Ptr(ptr), &mut scratch).unwrap();
   // Expected: "myprinter._ipp._tcp.local" (lowercase, dot-separated, no trailing dot)
   assert_eq!(out, b"myprinter._ipp._tcp.local".as_slice());
 }
@@ -130,7 +130,7 @@ fn canonical_ptr_forward_pointer_returns_err() {
   let ptr = Ptr::try_from_message(&msg, 0, msg.len()).unwrap();
   let mut scratch = std::vec::Vec::new();
   assert!(
-    canonical_rdata_for_hash(&Rdata::Ptr(ptr), &mut scratch).is_err(),
+    rdata_for_identity(&Rdata::Ptr(ptr), &mut scratch).is_err(),
     "forward compression pointer in PTR target must produce an Err"
   );
 }
@@ -150,7 +150,7 @@ fn canonical_srv_starts_with_priority_weight_port() {
   let rdata_len = msg.len();
   let srv = Srv::try_from_message(&msg, 0, rdata_len).unwrap();
   let mut scratch = std::vec::Vec::new();
-  let out = canonical_rdata_for_hash(&Rdata::Srv(srv), &mut scratch).unwrap();
+  let out = rdata_for_identity(&Rdata::Srv(srv), &mut scratch).unwrap();
   // First 6 bytes: priority(0,0) weight(0,0) port(2,119 = 631 big-endian)
   assert_eq!(&out[..2], &0u16.to_be_bytes()); // priority
   assert_eq!(&out[2..4], &0u16.to_be_bytes()); // weight
@@ -415,7 +415,7 @@ fn nsec_omitted_when_it_does_not_fit_but_answers_still_send() {
 }
 
 /// CNAME rdata is one domain name (RFC 1035 §3.3.1), structurally identical to
-/// PTR — `canonical_rdata_for_hash` must case-fold it to dot-joined lowercase
+/// PTR — `rdata_for_identity` must case-fold it to dot-joined lowercase
 /// labels with no length prefixes and no trailing dot, exactly like PTR. mDNS-SD
 /// never emits CNAME, so the only way to obtain one is to parse it off the wire;
 /// build a single CNAME resource record by hand and take its `rdata_view`.
@@ -451,13 +451,13 @@ fn canonical_cname_is_lowercase_dotted_labels() {
   };
   let view = rec.rdata_view().unwrap();
   let mut scratch = std::vec::Vec::new();
-  let out = canonical_rdata_for_hash(&view, &mut scratch).unwrap();
+  let out = rdata_for_identity(&view, &mut scratch).unwrap();
   // PTR-style canonical form: lowercase, dot-separated, no trailing dot.
   assert_eq!(out, b"target.local".as_slice());
 }
 
 /// A CNAME whose rdata target is a forward compression pointer must surface the
-/// label-iteration error from `canonical_rdata_for_hash` (the CNAME arm hashes
+/// label-iteration error from `rdata_for_identity` (the CNAME arm hashes
 /// the target via `write_canonical_name`, which propagates `ParseError`), never
 /// a silent empty hash.
 #[test]
@@ -493,7 +493,7 @@ fn canonical_cname_forward_pointer_returns_err() {
   let view = rec.rdata_view().unwrap();
   let mut scratch = std::vec::Vec::new();
   assert!(
-    canonical_rdata_for_hash(&view, &mut scratch).is_err(),
+    rdata_for_identity(&view, &mut scratch).is_err(),
     "forward compression pointer in CNAME target must produce an Err"
   );
 }

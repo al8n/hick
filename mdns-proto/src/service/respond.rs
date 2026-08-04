@@ -9,18 +9,34 @@ use crate::{
   wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, Rdata, ResourceClass, ResourceType},
 };
 
-/// Build a canonical byte representation of a record's rdata for use in
-/// hashing (KAS-suppression). The canonical form is the same regardless of
-/// whether the rdata was read from a compressed wire message or assembled
-/// locally, so that storage (from an incoming `KnownAnswer`) and filtering
-/// (of outgoing records) always hash identically.
+/// A record's rdata reduced to its IDENTITY — the bytes that answer "are these
+/// two records the same record", for §7.1 known-answer suppression and the §9
+/// identical-rdata screen.
+///
+/// The canonical form is the same regardless of whether the rdata was read from
+/// a compressed wire message or assembled locally, so that storage (from an
+/// incoming `KnownAnswer`) and filtering (of outgoing records) always hash
+/// identically. Getting there NORMALISES: SRV targets are lowercased, an empty
+/// TXT is rewritten to a single zero-length string.
+///
+/// # The other one
+///
+/// [`rdata_for_tiebreak`] has the same signature and answers a different
+/// question — which of two proposals sorts later (RFC 6762 §8.2), over the bytes
+/// a side actually put on the wire. It decompresses and normalises nothing.
+///
+/// Picking the wrong one of the pair FAILS SILENTLY on ordinary inputs: the two
+/// agree on every all-lowercase name and every non-empty TXT, which covers most
+/// fixtures and most real records, and they diverge exactly where a tiebreak has
+/// to be right. Choose by the question being asked, never by which one is
+/// already imported.
 ///
 /// The result is appended into `scratch`; the returned slice references `scratch`.
 ///
 /// Returns `Err` on any label-iteration error (pointer cycle, forward pointer,
 /// truncated name, etc.). Callers should drop the hint/record on error rather
 /// than storing a potentially incorrect partial hash.
-pub(crate) fn canonical_rdata_for_hash<'s>(
+pub(crate) fn rdata_for_identity<'s>(
   view: &Rdata<'_>,
   scratch: &'s mut std::vec::Vec<u8>,
 ) -> Result<&'s [u8], crate::error::ParseError> {
@@ -91,7 +107,7 @@ pub(crate) fn canonical_rdata_for_hash<'s>(
 /// canonical used for §8.2 tiebreak, §9 conflict comparison, and KAS-hint
 /// matching stays byte-symmetric with what a peer actually receives (a peer's
 /// compliant empty TXT — a single 0x00 — canonicalizes to the same bytes via
-/// `canonical_rdata_for_hash`).
+/// `rdata_for_identity`).
 // `'a` reads as single-use, but it cannot be elided at our 1.91 MSRV:
 // anonymous lifetimes in `impl Trait` are unstable before they stabilized
 // (rustc E0658), so the lifetime must stay named.
@@ -119,7 +135,7 @@ pub(crate) fn write_canonical_txt<'a>(
 /// Propagates any [`crate::error::ParseError`] from the label iterator
 /// (pointer cycle, forward pointer, truncation, etc.).
 ///
-/// This is used for SRV target encoding in `canonical_rdata_for_hash` so that
+/// This is used for SRV target encoding in `rdata_for_identity` so that
 /// the peer-side canonical bytes are byte-identical to what
 /// `write_canonical_wire_name` in `mod.rs` produces for our own SRV records.
 fn write_canonical_wire_name(
@@ -141,6 +157,110 @@ fn write_canonical_wire_name(
   }
   out.push(0); // root terminator
   Ok(())
+}
+
+/// Write `name` into `out` in uncompressed wire form, PRESERVING CASE.
+///
+/// The RFC 6762 §8.2 tiebreak's counterpart to [`write_canonical_wire_name`],
+/// which lowercases. See [`rdata_for_tiebreak`] for why the two must differ.
+fn write_wire_name_preserving_case(
+  name: &crate::wire::NameRef<'_>,
+  out: &mut std::vec::Vec<u8>,
+) -> Result<(), crate::error::ParseError> {
+  for label in name.labels() {
+    let label = label?;
+    if label.is_empty() {
+      break;
+    }
+    let len = label.len().min(63);
+    #[allow(clippy::cast_possible_truncation)]
+    out.push(len as u8);
+    // `.iter().take(len)` rather than `&label[..len]`: the crate denies
+    // `clippy::indexing_slicing`, and this is the same truncation-by-iterator
+    // `write_canonical_wire_name` uses — the two must stay byte-for-byte
+    // parallel apart from the case fold.
+    out.extend(label.iter().take(len));
+  }
+  out.push(0); // root terminator
+  Ok(())
+}
+
+/// A PEER record's rdata as RFC 6762 §8.2 compares it: the bytes that peer put
+/// on the wire, with embedded names decompressed and nothing else changed.
+///
+/// # Why this is not [`rdata_for_identity`]
+///
+/// §8.2 compares "raw comparison of the binary content of the rdata without
+/// regard for meaning or structure", and the ONLY transformation it mandates is
+/// decompression: "In the case of resource records containing rdata that is
+/// subject to name compression, the names MUST be uncompressed before
+/// comparison."
+///
+/// The identity canonicalizer answers a different question — "are these two
+/// records the same record" — and so lowercases SRV targets and rewrites an
+/// empty TXT to a single zero-length string. Both are right for identity and
+/// wrong for the tiebreak, because the tiebreak only resolves a name if BOTH
+/// hosts compute the same function over the same two lists. Normalising the
+/// peer's bytes while a byte-comparing peer does not normalise ours makes the
+/// two sides disagree:
+///
+/// | our target `m.local`, peer's `Z.local` | compares | verdict |
+/// |---|---|---|
+/// | peer, raw | `Z`(0x5A) vs `m`(0x6D), theirs earlier | peer loses |
+/// | us, normalising | `m`(0x6D) vs `z`(0x7A), ours earlier | we lose |
+///
+/// Both abdicate; the mirror case gives two owners.
+///
+/// The two have the SAME SIGNATURE and agree on every all-lowercase name and
+/// every non-empty TXT, so calling the wrong one compiles, passes, and stays
+/// wrong until a mixed-case target or an empty TXT turns up. Two fixtures had
+/// already done exactly that.
+///
+/// # The rule is per SIDE, not "raw everywhere"
+///
+/// EACH SIDE COMPARES THE BYTES THAT SIDE PUT ON THE WIRE. This function is the
+/// peer's side. OUR side keeps lowercasing — see `Service::our_proposal` — and
+/// that is not an inconsistency: [`crate::wire::MessageBuilder`]'s `write_name`
+/// lowercases on transmit, so lowercased bytes ARE what we send, and a peer
+/// comparing against us compares those. Making our side "raw" too would make our
+/// comparison bytes differ from our own wire bytes and open a second asymmetry
+/// while looking like a fix.
+///
+/// LOAD-BEARING COUPLING: this correctness argument depends on
+/// `MessageBuilder::write_name` lowercasing. If transmission ever stops
+/// lowercasing, `Service::our_proposal` must stop lowercasing with it, or the
+/// two sides diverge again.
+pub(crate) fn rdata_for_tiebreak<'s>(
+  view: &Rdata<'_>,
+  scratch: &'s mut std::vec::Vec<u8>,
+) -> Result<&'s [u8], crate::error::ParseError> {
+  scratch.clear();
+  match view {
+    Rdata::A(a) => scratch.extend_from_slice(&a.addr().octets()),
+    Rdata::AAAA(a) => scratch.extend_from_slice(&a.addr().octets()),
+    // Names subject to compression: decompressed, case untouched.
+    Rdata::Ptr(p) => write_wire_name_preserving_case(p.target(), scratch)?,
+    Rdata::Cname(c) => write_wire_name_preserving_case(c.target(), scratch)?,
+    Rdata::Srv(s) => {
+      scratch.extend_from_slice(&s.priority().to_be_bytes());
+      scratch.extend_from_slice(&s.weight().to_be_bytes());
+      scratch.extend_from_slice(&s.port().to_be_bytes());
+      write_wire_name_preserving_case(s.target(), scratch)?;
+    }
+    Rdata::Txt(t) => {
+      // Exactly as sent. No empty-TXT rewriting: a peer that sent zero-length
+      // rdata proposed zero-length rdata, and that is what it will compare.
+      for seg in t.segments() {
+        let seg = seg?;
+        #[allow(clippy::cast_possible_truncation)]
+        scratch.push(seg.len() as u8);
+        scratch.extend_from_slice(seg);
+      }
+    }
+    Rdata::Nsec(n) => scratch.extend_from_slice(n.type_bitmap_slice()),
+    Rdata::Other(bytes) => scratch.extend_from_slice(bytes),
+  }
+  Ok(scratch.as_slice())
 }
 
 /// Write the labels of `name` into `out` as lowercased bytes joined by `'.'`.
@@ -690,9 +810,9 @@ where
 
   // SRV — canonical: priority (2 BE) + weight (2 BE) + port (2 BE) +
   // wire-form target name (length-octet + label bytes, root 0x00 terminator).
-  // MUST use the same wire-form encoding as canonical_rdata_for_hash
+  // MUST use the same wire-form encoding as rdata_for_identity
   // (which parses incoming SRV records via write_canonical_wire_name). Using
-  // dot-joined plain bytes here while canonical_rdata_for_hash uses wire-form
+  // dot-joined plain bytes here while rdata_for_identity uses wire-form
   // means SRV KAS hints never match — the hashes diverge.
   {
     scratch.clear();

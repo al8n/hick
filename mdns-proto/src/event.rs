@@ -10,7 +10,7 @@ cfg_heap! {
 }
 use crate::{
   QueryHandle, ServiceHandle,
-  wire::{QuestionRef, Ref},
+  wire::{MessageReader, QuestionRef, Records, Ref},
 };
 
 /// A question routed to a registered service.
@@ -67,20 +67,96 @@ impl<'a> ServiceQuestion<'a> {
   }
 }
 
-/// A response record observed during another peer's probe — indicates this
-/// service's name is in use, triggering conflict resolution.
+/// Where a [`ProbeConflict`]'s record was carried, which is what decides WHICH
+/// RFC 6762 rule governs it.
+///
+/// The two are not interchangeable and the RFC never treats them as such. §8.2
+/// takes a peer's tentative proposal — "When a host that is probing for a
+/// record sees another host issue a **query** for the same record, it consults
+/// the Authority Section of that query" — and resolves it by lexicographic
+/// tiebreak. §8.1 and §9 take an authoritative **response**: §8.1's
+/// silently-ignore rule before the first probe is written about "Multicast DNS
+/// **responses**", and §9 opens "A conflict occurs when … it receives a
+/// Multicast DNS **response** message containing a record with the same name,
+/// rrtype and rrclass, but inconsistent rdata".
+///
+/// Collapsing the two applies each rule to the other's input: it lets §8.1's
+/// pre-probe fence swallow a simultaneous prober's proposal that §8.2 requires
+/// comparing, and it lets a peer merely PROBING a name this responder already
+/// owns push it back into probing, which §9 reserves for a response.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, IsVariant)]
+#[non_exhaustive]
+pub enum ConflictOrigin {
+  /// The Authority Section of a peer's QUERY (QR=0): the rdata a simultaneous
+  /// prober "would be proposing to use, should its probing be successful"
+  /// (RFC 6762 §8.2). This, and only this, is the §8.2 tiebreak's input.
+  TentativeProbe,
+  /// An authoritative RESPONSE (QR=1) — a peer announcing or defending a name
+  /// it owns. §8.1 governs one received while this responder is probing; §9
+  /// governs one received after it is established.
+  AuthoritativeResponse,
+}
+
+/// Identifies the datagram a [`ProbeConflict`] arrived in.
+///
+/// RFC 6762 §8.2's tiebreak input is one query's proposal — "the Authority
+/// Section of THAT query", and §8.2 requires that section to "contain *all* the
+/// records and proposed rdata being probed for uniqueness". So a proposal is a
+/// per-DATAGRAM list, and records from two datagrams are two proposals even when
+/// they share a source address.
+///
+/// Merging them by source address alone is unsound in both directions. The same
+/// probe delivered twice before one timeout — plain UDP duplication, a delayed
+/// timer, or a peer's own §8.1 retransmissions — doubles every member, and a
+/// duplicated shorter record then sorts ahead of a longer local one and flips
+/// the verdict: `{TXT, SRV}` seen twice compares as `[TXT, TXT, SRV, SRV]`,
+/// whose second TXT is below the local SRV, so a losing responder concludes it
+/// won. Two co-resident responders sharing one `IP:5353` merge into a union
+/// list that is neither host's proposal.
+///
+/// Opaque and only ever compared for equality: it identifies which datagram, and
+/// nothing about ordering or count is meaningful.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct DatagramId(u64);
+
+impl DatagramId {
+  #[allow(dead_code)]
+  #[inline(always)]
+  pub(crate) const fn new(raw: u64) -> Self {
+    Self(raw)
+  }
+}
+
+/// An AUTHORITATIVE record observed from a peer that claims this service's
+/// **instance** name, triggering conflict resolution.
+///
+/// Always a response — RFC 6762 §8.1's in-probe deferral and §9's conflict are
+/// both defined over one. A peer's tentative §8.2 proposal is a whole Authority
+/// Section rather than a record and arrives as [`ProbeProposal`]: the two rules
+/// take different units of input, so they take different types.
 #[derive(Debug, Copy, Clone)]
 pub struct ProbeConflict<'a> {
   src: SocketAddr,
   record: Ref<'a>,
+  datagram: DatagramId,
 }
 impl<'a> ProbeConflict<'a> {
   #[allow(dead_code)]
   #[inline(always)]
-  pub(crate) const fn new(src: SocketAddr, record: Ref<'a>) -> Self {
-    Self { src, record }
+  pub(crate) const fn new(src: SocketAddr, record: Ref<'a>, datagram: DatagramId) -> Self {
+    Self {
+      src,
+      record,
+      datagram,
+    }
   }
-  /// Returns the source address of the peer that sent the conflicting probe.
+  /// Returns which datagram carried this record. See [`DatagramId`]: one
+  /// datagram is one §8.2 proposal, and proposals are never merged across them.
+  #[inline(always)]
+  pub const fn datagram(&self) -> DatagramId {
+    self.datagram
+  }
+  /// Returns the source address of the peer that sent the conflicting record.
   #[inline(always)]
   pub const fn src(&self) -> SocketAddr {
     self.src
@@ -92,26 +168,98 @@ impl<'a> ProbeConflict<'a> {
   }
 }
 
-/// A response record observed during another peer's probe — indicates this
-/// service's **host** name (A/AAAA owner) is already claimed by a peer.
+/// One peer's COMPLETE RFC 6762 §8.2 proposal: the whole Authority Section of a
+/// single QR=0 query.
+///
+/// §8.2 defines its input as a whole — "it consults the Authority Section of
+/// that query" — and requires a prober to put its entire proposed set there:
+/// "for tiebreaking to work correctly in all cases, the Authority Section must
+/// contain *all* the records and proposed rdata being probed for uniqueness".
+/// §8.2.1 then sorts and compares the two LISTS.
+///
+/// So the unit the §8.2 rule is true of is a datagram's section, not a record,
+/// and this event carries exactly that. Delivering the section record-by-record
+/// made a PARTIAL list representable, and a partial list adjudicates wrong in
+/// the direction that costs a name: `write_probe` emits SRV before TXT, so after
+/// one record a peer proposing byte-identical records looks like `[SRV]` against
+/// a local `[TXT, SRV]`, loses at element 0, and renames a responder that should
+/// have tied. Carrying the section whole makes that state unrepresentable rather
+/// than guarded against.
+///
+/// Borrowed and lazy: nothing is copied, and [`Self::authority`] mints a fresh
+/// iterator per call.
+#[derive(Debug, Copy, Clone)]
+pub struct ProbeProposal<'a> {
+  src: SocketAddr,
+  reader: MessageReader<'a>,
+  datagram: DatagramId,
+}
+impl<'a> ProbeProposal<'a> {
+  #[allow(dead_code)]
+  #[inline(always)]
+  pub(crate) const fn new(
+    src: SocketAddr,
+    reader: MessageReader<'a>,
+    datagram: DatagramId,
+  ) -> Self {
+    Self {
+      src,
+      reader,
+      datagram,
+    }
+  }
+  /// Source address of the peer whose probe this is.
+  #[inline(always)]
+  pub const fn src(&self) -> SocketAddr {
+    self.src
+  }
+  /// Which datagram carried it. See [`DatagramId`].
+  #[inline(always)]
+  pub const fn datagram(&self) -> DatagramId {
+    self.datagram
+  }
+  /// The proposal's records: a fresh iterator over the query's Authority
+  /// Section. Callers filter it to the names and rtypes they own.
+  #[inline(always)]
+  pub fn authority(&self) -> Records<'a> {
+    self.reader.authority()
+  }
+}
+
+/// A record observed from a peer that claims this service's **host** name
+/// (the A/AAAA owner).
 ///
 /// Unlike [`ProbeConflict`], this does NOT trigger an automatic instance
 /// rename. The caller must resolve the host-name conflict out-of-band (e.g.
 /// by choosing a new host name and re-registering the service).
+///
+/// [`Self::origin`] carries the same distinction [`ProbeConflict`] does, and
+/// for the same reason: §9 defines a conflict over a response, so only an
+/// [`ConflictOrigin::AuthoritativeResponse`] may drive the terminal
+/// [`ServiceUpdate::HostConflict`] that callers act on. Dropping it here would
+/// have let any peer's ordinary probe for a shared host name retire every
+/// service using it.
 #[derive(Debug, Copy, Clone)]
 pub struct HostConflict<'a> {
   record: Ref<'a>,
+  origin: ConflictOrigin,
 }
 impl<'a> HostConflict<'a> {
   #[allow(dead_code)]
   #[inline(always)]
-  pub(crate) const fn new(record: Ref<'a>) -> Self {
-    Self { record }
+  pub(crate) const fn new(record: Ref<'a>, origin: ConflictOrigin) -> Self {
+    Self { record, origin }
   }
   /// Returns the conflicting DNS record observed from a peer.
   #[inline(always)]
   pub const fn record(&self) -> &Ref<'a> {
     &self.record
+  }
+  /// Returns where the record was carried, which decides which RFC 6762 rule
+  /// governs it. See [`ConflictOrigin`].
+  #[inline(always)]
+  pub const fn origin(&self) -> ConflictOrigin {
+    self.origin
   }
 }
 
@@ -154,9 +302,12 @@ impl<'a> KnownAnswer<'a> {
 pub enum ServiceEvent<'a> {
   /// A question targeting this service arrived.
   Question(ServiceQuestion<'a>),
-  /// While probing, another peer responded authoritatively for our **instance** name.
-  /// The service will auto-rename.
+  /// Another peer responded AUTHORITATIVELY for our **instance** name — RFC
+  /// 6762 §8.1 while probing, §9 once advertised.
   ProbeConflict(ProbeConflict<'a>),
+  /// Another peer is PROBING for our **instance** name, and this carries its
+  /// complete §8.2 proposal (that query's whole Authority Section).
+  ProbeProposal(ProbeProposal<'a>),
   /// While probing, another peer responded authoritatively for our **host** name
   /// (A/AAAA owner). The service will NOT auto-rename — the caller must
   /// intervene. See [`ServiceUpdate::HostConflict`].

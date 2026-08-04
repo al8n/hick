@@ -387,9 +387,11 @@ fn host_question_routes_to_service() {
 // ── authority-section HostConflict vs ProbeConflict routing ────
 
 /// A probe authority record matching the instance name must route as
-/// ProbeConflict (triggers auto-rename in Service).
+/// ProbeProposal — the peer is PROBING, so RFC 6762 §8.2's tiebreak is what
+/// governs it, and its input is that query's whole Authority Section.
+/// `ProbeConflict` is now responses only.
 #[test]
-fn authority_instance_name_routes_as_probe_conflict() {
+fn authority_instance_name_routes_as_probe_proposal() {
   use crate::event::RouteEvent;
   use core::net::SocketAddr;
 
@@ -413,13 +415,13 @@ fn authority_instance_name_routes_as_probe_conflict() {
     RouteEvent::ToService(ts) => {
       assert_eq!(ts.handle(), expected_handle);
       assert!(
-        ts.event().is_probe_conflict(),
-        "expected ProbeConflict for an instance-name authority record, got {:?}",
+        ts.event().is_probe_proposal(),
+        "expected ProbeProposal for an instance-name authority record, got {:?}",
         ts.event()
       );
     }
     other => panic!(
-      "expected RouteEvent::ToService(ProbeConflict), got {:?}",
+      "expected RouteEvent::ToService(ProbeProposal), got {:?}",
       other
     ),
   }
@@ -427,7 +429,7 @@ fn authority_instance_name_routes_as_probe_conflict() {
 
 /// the SAME probe-shaped authority record that triggers a
 /// ProbeConflict from port 5353 (see
-/// `authority_instance_name_routes_as_probe_conflict`) must NOT route as any
+/// `authority_instance_name_routes_as_probe_proposal`) must NOT route as any
 /// conflict when it arrives from an EPHEMERAL source port. Authority records
 /// are tentative-probe claims trusted only from a real mDNS peer (port 5353);
 /// an off-path / forged ephemeral-port packet must not force our rename.
@@ -748,7 +750,7 @@ fn non_in_class_record_does_not_route_conflict() {
 /// suppression), NEVER ProbeConflict.  Treating a QR=0 answer as a
 /// conflict signal would let a hostile querier trigger our auto-rename
 /// trivially.  Real probe-time conflicts arrive in the AUTHORITY
-/// section (peer probes); see `authority_instance_name_routes_as_probe_conflict`.
+/// section (peer probes); see `authority_instance_name_routes_as_probe_proposal`.
 #[test]
 fn query_answer_for_instance_name_emits_known_answer_only() {
   use crate::wire::{
@@ -1225,12 +1227,12 @@ fn self_packet_does_not_route_as_probe_conflict() {
     .expect("control: routing event must be Ok");
   match ev {
     RouteEvent::ToService(ts) => assert!(
-      ts.event().is_probe_conflict(),
-      "control: foreign-source probe must still emit ProbeConflict; got {:?}",
+      ts.event().is_probe_proposal(),
+      "control: foreign-source probe must still emit ProbeProposal; got {:?}",
       ts.event()
     ),
     other => panic!(
-      "control: expected RouteEvent::ToService(ProbeConflict), got {:?}",
+      "control: expected RouteEvent::ToService(ProbeProposal), got {:?}",
       other
     ),
   }
@@ -1437,12 +1439,12 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
     .expect("control: routing event must be Ok");
   match ev {
     RouteEvent::ToService(ts) => assert!(
-      ts.event().is_probe_conflict(),
-      "control: foreign IPv6 probe must still emit ProbeConflict; got {:?}",
+      ts.event().is_probe_proposal(),
+      "control: foreign IPv6 probe must still emit ProbeProposal; got {:?}",
       ts.event()
     ),
     other => panic!(
-      "control: expected RouteEvent::ToService(ProbeConflict), got {:?}",
+      "control: expected RouteEvent::ToService(ProbeProposal), got {:?}",
       other
     ),
   }
@@ -3426,6 +3428,121 @@ fn answer_questions_false_suppresses_question_events() {
   );
 }
 
+/// `answer_questions=false` suppresses DISCOVERY, not the RFC 6762 §8.1 defence
+/// of a name this endpoint has already claimed.
+///
+/// §8.1 puts the defence on the responder as a duty: "it is important that when
+/// a device receives a probe query for a name that it is currently using, it
+/// SHOULD generate its response to defend that name immediately and send it as
+/// quickly as possible." Suppressing it leaves the prober unanswered, and §8.1's
+/// own next step is that an unanswered prober claims the name — so a passive
+/// endpoint would keep advertising a name a conforming peer has just taken, with
+/// nothing left to resolve it.
+///
+/// The exemption is drawn as narrowly as the duty. Each negative below is a way
+/// the exemption could be over-wide, and is asserted separately.
+#[test]
+fn answer_questions_false_still_defends_a_probed_unique_name() {
+  use core::net::SocketAddr;
+
+  use rand::SeedableRng;
+
+  use crate::{
+    config::ServiceSpec,
+    records::ServiceRecords,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceType},
+  };
+
+  const INSTANCE: &str = "WebServer._http._tcp.local.";
+  const SERVICE_TYPE: &str = "_http._tcp.local.";
+  const HOST: &str = "web.local.";
+
+  /// A peer's §8.1 probe: QR=0, a question for `qname`, and the proposed record
+  /// in the Authority Section (§8.2 requires it there). `with_authority` off
+  /// makes it an ordinary query instead, which is the discovery case.
+  fn probe_for(qname: &str, with_authority: bool, buf: &mut [u8; 512]) -> usize {
+    let name = Name::try_from_str(qname).unwrap();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(buf, Header::new()).unwrap();
+    b.push_question(
+      &name,
+      ResourceType::Any,
+      crate::wire::ResourceClass::In,
+      false,
+    )
+    .unwrap();
+    if with_authority {
+      let target = Name::try_from_str("rival-host.local.").unwrap();
+      b.push_srv_authority(&name, 120, 0, 0, 9999, &target).unwrap();
+    }
+    b.finish().unwrap()
+  }
+
+  let mut e = {
+    let rng = rand::rngs::StdRng::from_seed([9u8; 32]);
+    let cfg = EndpointConfig::new().with_answer_questions(false);
+    TestEndp::try_new(cfg, rng)
+  };
+  let now = StdInstant::now();
+  let recs = ServiceRecords::new(
+    Name::try_from_str(SERVICE_TYPE).unwrap(),
+    Name::try_from_str(INSTANCE).unwrap(),
+    Name::try_from_str(HOST).unwrap(),
+    80,
+    120,
+  );
+  let (_h, _svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let mdns_peer: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let mut questions_for = |qname: &str, with_authority: bool, src: SocketAddr| -> usize {
+    let mut buf = [0u8; 512];
+    let n = probe_for(qname, with_authority, &mut buf);
+    e.handle(now, src, local_ip, 0, &buf[..n], false)
+      .unwrap()
+      .map(Result::unwrap)
+      .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_question()))
+      .count()
+  };
+
+  assert_eq!(
+    questions_for(INSTANCE, true, mdns_peer),
+    1,
+    "a probe for our INSTANCE name must reach the service even with \
+     answer_questions=false: §8.1 requires defending a name we are using, and an \
+     unanswered prober claims it"
+  );
+  assert_eq!(
+    questions_for(HOST, true, mdns_peer),
+    1,
+    "and a probe for our HOST name likewise — it is the other unique name this \
+     service owns"
+  );
+  assert_eq!(
+    questions_for(SERVICE_TYPE, true, mdns_peer),
+    0,
+    "but NOT the shared service type: many responders own it, so a query naming \
+     it is discovery and not a uniqueness probe, however it is shaped"
+  );
+  assert_eq!(
+    questions_for(INSTANCE, false, mdns_peer),
+    0,
+    "and not an ordinary query for the same name: no Authority Section means the \
+     peer is asking about the name, not proposing to take it"
+  );
+  assert_eq!(
+    questions_for(INSTANCE, true, "192.168.1.77:40404".parse().unwrap()),
+    0,
+    "and not one from an ephemeral port: a real prober multicasts from 5353, and \
+     admitting an off-path sender would make passive endpoints answer on demand"
+  );
+}
+
 // ── authority-section host fan-out ───────────────────────────
 
 /// Multiple services can legitimately share a host name.  An authority
@@ -4033,13 +4150,13 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
     .expect("event must be Ok");
   match ev {
     RouteEvent::ToService(ts) => assert!(
-      ts.event().is_probe_conflict(),
-      "link-local from ifindex=3 must emit ProbeConflict (not be misclassified \
+      ts.event().is_probe_proposal(),
+      "link-local from ifindex=3 must emit ProbeProposal (not be misclassified \
          as self because of bare-address match); got {:?}",
       ts.event()
     ),
     other => panic!(
-      "expected RouteEvent::ToService(ProbeConflict), got {:?}",
+      "expected RouteEvent::ToService(ProbeProposal), got {:?}",
       other
     ),
   }

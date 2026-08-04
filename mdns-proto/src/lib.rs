@@ -98,8 +98,9 @@ pub mod event;
 pub mod transmit;
 
 pub use event::{
-  EndpointEvent, HostConflict, KnownAnswer, ProbeConflict, QueryEvent, QueryUpdate, RouteEvent,
-  ServiceEvent, ServiceQuestion, ToQuery, ToService,
+  ConflictOrigin, DatagramId, EndpointEvent, HostConflict, KnownAnswer, ProbeConflict,
+  ProbeProposal, QueryEvent, QueryUpdate, RouteEvent, ServiceEvent, ServiceQuestion, ToQuery,
+  ToService,
 };
 pub use transmit::{FamilyAttempt, Transmit, TransmitConfirm, TransmitObligation};
 

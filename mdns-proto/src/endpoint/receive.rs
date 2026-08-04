@@ -540,11 +540,17 @@ where
       }
     }
 
+    // One datagram, one §8.2 proposal. Bumped per accepted datagram so a
+    // service can tell a peer's retransmission from a second proposal by the
+    // same peer; see `DatagramId`.
+    self.datagram_seq = self.datagram_seq.wrapping_add(1);
     Ok(RouteEvents {
       src,
       reader,
       now,
       is_response,
+      datagram: crate::event::DatagramId::new(self.datagram_seq),
+      proposal_service_cursor: None,
       question_idx: 0,
       service_cursor: 0,
       answer_idx: 0,
