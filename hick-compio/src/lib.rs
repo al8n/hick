@@ -4,7 +4,6 @@
 #![cfg_attr(docsrs, allow(unused_attributes))]
 
 pub(crate) mod driver;
-pub(crate) mod onlink;
 pub(crate) mod socket;
 
 pub mod discovery;

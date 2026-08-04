@@ -19,6 +19,36 @@ pub(crate) use unix::*;
 #[cfg(unix)]
 mod unix;
 
+/// Whether THIS driver's receive path reports the interface a datagram from
+/// `peer`'s address family arrived on, as the ingress trust boundary must be
+/// told it.
+///
+/// Capability belongs to the receive path and not to the platform, which is why
+/// [`hick_udp::onlink::admits_ingress`] takes it as a parameter rather than
+/// reading a constant. This crate does NOT read its datagrams through
+/// `hick-udp`: [`Socket::recv`] runs compio's own `recv_msg` plus
+/// [`decode_unix_cmsgs`] on Unix — gated on the same `has_ip_pktinfo` /
+/// `has_ipv6_pktinfo` cfgs `hick-udp` uses, so the answer there is identical —
+/// and plain `recv_from` everywhere else, which recovers no ancillary data at
+/// all.
+///
+/// # Windows recovers nothing, and says so
+///
+/// `hick-udp` reports IPv4 and IPv6 PKTINFO support on Windows because ITS
+/// receive path calls `WSARecvMsg`. This crate's does not: the Windows arm of
+/// [`Socket::recv`] is a plain `recv_from`, so every datagram arrives with
+/// interface index `0` and no hop limit. Handing the rule `hick-udp`'s answer
+/// there would make every zero index a failed proof and drop every non-loopback
+/// datagram — a silently deaf responder on a physical Windows network. Saying
+/// `false` instead leaves §11 deciding by the source-address rule exactly as it
+/// did before the interface gate existed, which on Windows is the only rule
+/// there has ever been anything to run: no hop limit is recovered there either.
+/// The gate is not weakened so much as absent, because this path supplies
+/// nothing for it to weigh. A `WSARecvMsg` port is what turns it on.
+pub(crate) const fn rx_interface_reported(peer: core::net::SocketAddr) -> bool {
+  cfg!(unix) && hick_udp::onlink::reports_rx_interface(peer)
+}
+
 /// Decoded recv metadata pulled from cmsgs.
 ///
 /// Reachable from `hick_compio::__test` for integration tests; the public
@@ -29,6 +59,13 @@ pub struct RecvMeta {
   peer: SocketAddr,
   /// The destination address recorded by the kernel (from PKTINFO).
   local_ip: IpAddr,
+  /// The IP header DESTINATION, where the cmsg carried one. Distinct from
+  /// `local_ip`: on Unix IPv4 that field is `in_pktinfo.ipi_spec_dst`, the
+  /// receiving interface's own unicast address, which never equals a multicast
+  /// group — so reading it as a destination makes every multicast arrival look
+  /// unicast. `ipi_addr` (IPv4) and `ipi6_addr` (IPv6) are the header
+  /// destination and are what this carries.
+  destination: Option<IpAddr>,
   /// Receiving interface index, taken from PKTINFO.
   interface_index: u32,
   /// IP TTL / IPv6 hop limit if the kernel exposed it.
@@ -37,6 +74,11 @@ pub struct RecvMeta {
   kernel_rx_time: Option<SystemTime>,
   /// Bytes of payload received.
   len: usize,
+  /// The kernel's `MSG_MCAST`, where this target binds one: whether the
+  /// datagram was delivered as a multicast rather than addressed to this host
+  /// alone. `None` means "this target has no such flag", never "it was
+  /// unicast" — RFC 6762 §11's group arm treats those completely differently.
+  delivery: Option<hick_udp::LinkDelivery>,
   /// True when the datagram exceeded `max_recv_packet_size`, indicating it was
   /// truncated by the kernel (compio's `recv_msg` does not expose `msg_flags`,
   /// so a `data_len > max_recv_packet_size` overflow into the one-byte sentinel
@@ -55,9 +97,11 @@ impl RecvMeta {
     Self {
       peer,
       local_ip,
+      destination: None,
       interface_index: 0,
       hop_limit: None,
       kernel_rx_time: None,
+      delivery: None,
       len: 0,
       truncated: false,
     }
@@ -73,6 +117,24 @@ impl RecvMeta {
   #[inline(always)]
   pub(crate) const fn local_ip(&self) -> IpAddr {
     self.local_ip
+  }
+
+  /// The datagram's IP header destination, where this receive path recovered
+  /// one. RFC 6762 §11 states its local-link test two ways and selects between
+  /// them by this — arrival at `224.0.0.251` / `FF02::FB` is local-link origin
+  /// on its own, regardless of source address — so it is emphatically NOT
+  /// [`RecvMeta::local_ip`]. `None` means "this receive recovered none", never
+  /// "the destination was unspecified".
+  pub(crate) const fn destination(&self) -> Option<IpAddr> {
+    self.destination
+  }
+
+  /// Whether the kernel delivered this datagram as a multicast, where this
+  /// target reports it. Coarser than [`RecvMeta::destination`] — "some group"
+  /// rather than which one — and consulted by §11's group arm only when no
+  /// destination was recovered. `None` is "this target has no such flag".
+  pub(crate) const fn delivery(&self) -> Option<hick_udp::LinkDelivery> {
+    self.delivery
   }
 
   /// The receiving interface index (PKTINFO).
@@ -137,9 +199,14 @@ impl RecvMeta {
   /// Full constructor. Test-only: production code builds a `RecvMeta` via
   /// [`Self::empty`] plus in-module cmsg decoding.
   #[cfg(test)]
+  /// `destination` is `Option<IpAddr>` rather than a second `IpAddr` so no
+  /// call site can pass it positionally in place of `local_ip`: the two carry
+  /// different addresses on Unix IPv4, and the compiler rather than review is
+  /// what keeps them apart.
   pub(crate) const fn new(
     peer: SocketAddr,
     local_ip: IpAddr,
+    destination: Option<IpAddr>,
     interface_index: u32,
     hop_limit: Option<u8>,
     kernel_rx_time: Option<SystemTime>,
@@ -148,12 +215,22 @@ impl RecvMeta {
     Self {
       peer,
       local_ip,
+      destination,
       interface_index,
       hop_limit,
       kernel_rx_time,
+      delivery: None,
       len,
       truncated: false,
     }
+  }
+
+  /// Set the kernel's multicast-delivery flag. Test-only; production sets it
+  /// inside `Socket::recv` from the `recvmsg` return flags.
+  #[cfg(test)]
+  pub(crate) const fn with_delivery(mut self, delivery: Option<hick_udp::LinkDelivery>) -> Self {
+    self.delivery = delivery;
+    self
   }
 
   /// Mark the datagram as truncated. Test-only: production code sets this flag
@@ -167,11 +244,12 @@ impl RecvMeta {
 
 /// `compio` UDP socket wrapper + cmsg-aware recv/send.
 ///
-/// The constructor enables the kernel ancillary-data options needed by the
-/// driver (PKTINFO for the receiving interface, RECVTTL/HOPLIMIT for RFC 6762
-/// §11 on-link checks, and `SO_TIMESTAMP`/`SO_TIMESTAMPNS` for ordered
-/// self-send classification) and then wraps the file descriptor as a
-/// `compio` socket.
+/// The constructor enables the kernel ancillary-data options the driver needs:
+/// PKTINFO for the receiving interface and the IP header destination, which are
+/// what RFC 6762 §11's arms actually read; RECVTTL/HOPLIMIT for the hop-limit
+/// diagnostic, which no admission decision reads; and
+/// `SO_TIMESTAMP`/`SO_TIMESTAMPNS` for ordered self-send classification. It then
+/// wraps the file descriptor as a `compio` socket.
 ///
 /// Reachable from `hick_compio::__test` for integration tests; the public
 /// surface of the driver is wired up separately.
@@ -220,7 +298,7 @@ impl Socket {
       // the sentinel is a true *inclusive* ceiling (a legal exactly-`max`-byte
       // datagram is preserved), whereas `MSG_TRUNC` would flag it. Bind the flags
       // to `_` to preserve the existing truncation semantics byte-for-byte.
-      let (data_len, ctrl_len, peer, _recv_flags) = res?;
+      let (data_len, ctrl_len, peer, recv_flags) = res?;
       let mut data = buf;
       // `compio-buf`'s `advance_vec_to` already set `data.len() = data_len`
       // through the `[Vec<u8>; 1]` SetLen impl, but truncate defensively.
@@ -236,6 +314,18 @@ impl Socket {
       // legal datagram of exactly `max` bytes lands as `data_len == max` and is
       // NOT flagged. The driver treats a flagged datagram as consumed-but-unusable.
       meta.truncated = data_len > max;
+      // `recvmsg`'s own `msg_flags`, which compio hands back as `ReturnFlags`
+      // and this code used to bind to `_` and throw away. rustix builds that
+      // value with `from_bits_retain` and declares a catch-all bit, so a flag it
+      // does not name — `MSG_MCAST` on OpenBSD/NetBSD — survives verbatim in
+      // `bits()`. What those bits mean is `hick-udp`'s business, so the decode
+      // lives there rather than being hand-rolled a second time here.
+      //
+      // Without it a valid mDNS-group datagram on those targets reached §11's
+      // fallback with no destination AND no flag, fell to the source-prefix arm
+      // and was refused whenever the sender's prefix was not one of ours —
+      // traffic §11 requires be accepted.
+      meta.delivery = hick_udp::link_delivery_from_msg_flags(recv_flags.bits() as i32);
       let ctrl_bytes = ctrl.filled(ctrl_len);
       decode_unix_cmsgs(ctrl_bytes, &mut meta);
       Ok((data, meta))

@@ -309,7 +309,8 @@ pub(super) fn enable_recv_cmsgs(sock: &std::net::UdpSocket) -> std::io::Result<(
     // libc defines IPV6_PKTINFO (`has_ipv6_pktinfo`).
     #[cfg(has_ipv6_pktinfo)]
     set_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, on)?;
-    // IPV6_RECVHOPLIMIT — hop limit for the §11 on-link check. Only where libc
+    // IPV6_RECVHOPLIMIT — hop limit, carried as a diagnostic and read by no
+    // admission decision. Only where libc
     // defines the hop-limit cmsg (`has_recv_hoplimit`; absent on OpenBSD/NetBSD).
     #[cfg(has_recv_hoplimit)]
     set_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVHOPLIMIT, on)?;
@@ -318,7 +319,8 @@ pub(super) fn enable_recv_cmsgs(sock: &std::net::UdpSocket) -> std::io::Result<(
     // defines the shared in_pktinfo layout (`has_ip_pktinfo`; BSDs excluded).
     #[cfg(has_ip_pktinfo)]
     set_int(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, on)?;
-    // IP_RECVTTL — TTL for the §11 on-link check. Only where libc defines the
+    // IP_RECVTTL — TTL, carried as a diagnostic and read by no admission
+    // decision. Only where libc defines the
     // hop-limit cmsg (`has_recv_hoplimit`; absent on OpenBSD/NetBSD).
     #[cfg(has_recv_hoplimit)]
     set_int(fd, libc::IPPROTO_IP, libc::IP_RECVTTL, on)?;
@@ -385,6 +387,13 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta) {
         // is only `cmsghdr`-aligned, so use `read_unaligned`.
         let pi = unsafe { core::ptr::read_unaligned(c.data::<libc::in_pktinfo>()) };
         meta.local_ip = IpAddr::V4(Ipv4Addr::from(u32::from_be(pi.ipi_spec_dst.s_addr)));
+        // `ipi_addr` is the IP header DESTINATION — the group, for a multicast
+        // arrival — while `ipi_spec_dst` above is the receiving interface's own
+        // unicast address. RFC 6762 §11 selects its local-link test by the
+        // former; reading the latter made every multicast arrival look unicast
+        // and sent it to the source-prefix arm, which refuses an on-link peer
+        // sourcing from a prefix this interface does not carry.
+        meta.destination = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(pi.ipi_addr.s_addr))));
         meta.interface_index = pi.ipi_ifindex as u32;
       }
       // IPv6 PKTINFO — only where libc defines IPV6_PKTINFO (`has_ipv6_pktinfo`).
@@ -397,7 +406,10 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta) {
         // the length guard above ensures the payload is at least
         // `size_of::<in6_pktinfo>()` bytes before this read.
         let pi = unsafe { core::ptr::read_unaligned(c.data::<libc::in6_pktinfo>()) };
+        // IPv6 PKTINFO carries only the header destination — there is no
+        // `ipi_spec_dst` twin — so the one address serves as both.
         meta.local_ip = IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr));
+        meta.destination = Some(IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr)));
         meta.interface_index = pi.ipi6_ifindex as u32;
       }
       // IPv4 TTL — only where libc defines the hop-limit cmsg constants

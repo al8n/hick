@@ -14,7 +14,8 @@
 //! Capability → enabling libc constants (verified against libc 0.2):
 //!   * has_ip_pktinfo IP_PKTINFO / IP_RECVPKTINFO (+ in_pktinfo parse)
 //!   * has_ipv6_pktinfo IPV6_PKTINFO + IPV6_RECVPKTINFO
-//!   * has_recv_hoplimit IP_RECVTTL + IPV6_HOPLIMIT + IPV6_RECVHOPLIMIT (§11)
+//!   * has_recv_hoplimit IP_RECVTTL + IPV6_HOPLIMIT + IPV6_RECVHOPLIMIT, for
+//!     the hop-limit diagnostic; no §11 decision reads it
 //!   * has_recv_timestamp SO_TIMESTAMP[NS] + SCM_TIMESTAMP[NS]
 //!   * recv_timestamp_ns the timestamp cmsg is nanosecond SO_TIMESTAMPNS
 //!     (Linux/Android); otherwise it is microsecond SO_TIMESTAMP.
@@ -59,7 +60,9 @@ fn main() {
   if linux_like || apple || freebsdlike || netbsdlike {
     println!("cargo::rustc-cfg=has_ipv6_pktinfo");
   }
-  // RFC 6762 §11 TTL/Hop-Limit receive cmsg. Absent on netbsdlike
+  // Inbound TTL/Hop-Limit receive cmsg, surfaced as a DIAGNOSTIC only: RFC 6762
+  // §11's receive test is about the destination address and reads no TTL, so a
+  // target without this cmsg loses no admission capability. Absent on netbsdlike
   // (OpenBSD/NetBSD don't define IP_RECVTTL/IPV6_HOPLIMIT/IPV6_RECVHOPLIMIT).
   if linux_like || apple || freebsdlike {
     println!("cargo::rustc-cfg=has_recv_hoplimit");
