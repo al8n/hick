@@ -170,7 +170,10 @@
 //! `put_cmsg` in `if (src_info.ipi6_ifindex >= 0)`, so a negative index would
 //! omit the whole cmsg with no `MSG_CTRUNC`. Reading the source did not
 //! establish a reachable negative value on an `IPV6_V6ONLY` socket, so it is
-//! recorded as possible-but-unproven rather than claimed either way.
+//! recorded as possible-but-unproven rather than claimed either way. A negative
+//! that reached a decoder ANYWAY — past that guard, or from a kernel that has
+//! no such guard — is an absence and not an interface, which is
+//! [`IfaceWitness::from_reporting_path_signed`]'s whole subject.
 //!
 //! **Windows documents truncation and nothing else.** `WSARecvMsg` defines
 //! `MSG_CTRUNC` as *"the control (ancillary) data was truncated"*, and states
@@ -585,6 +588,61 @@ impl IfaceWitness {
       None if control_truncated => Self::Lost,
       None => Self::Declined,
     }
+  }
+
+  /// [`Self::from_reporting_path`] for a path whose kernel field for the index
+  /// is SIGNED, where a NEGATIVE index is an absence on exactly the same terms
+  /// as `0`.
+  ///
+  /// # The field is signed more widely than one target
+  ///
+  /// Linux's uapi declares `int ipi_ifindex` in `struct in_pktinfo` and
+  /// `int ipi6_ifindex` in `struct in6_pktinfo`. `libc` binds the v4 field as
+  /// `c_int` on Linux AND Android, and the v6 field as `c_uint` everywhere
+  /// except Android — where `c_int` is the binding that matches the header the
+  /// others widen away. So the signedness is the C ABI's and not one target's
+  /// quirk, and a decoder reading the field as `u32` misreads a negative on any
+  /// of them.
+  ///
+  /// # Why a negative is `Declined` and not `Witnessed` or [`Self::Lost`]
+  ///
+  /// `Witnessed` is out by construction. A negative reinterpreted as `u32` is a
+  /// FABRICATED index — `-1` becomes `4294967295`, which names no interface any
+  /// host has, and `arrived_on_bound_interface` would take it as the kernel's
+  /// positive statement of arrival, disagree with the bound index and REFUSE
+  /// ([`Refuse::ForeignLink`]) on a fact no kernel ever stated. [`NonZeroU32`]
+  /// is here to make "not an interface" unrepresentable, and `4294967295` is no
+  /// more an interface than `0` is.
+  ///
+  /// [`Self::Lost`] is out for the reason `0` is not `Lost`: it accuses THIS
+  /// side's control buffer, and no buffer size changes the sign of a field the
+  /// kernel already delivered — the same false accusation
+  /// [`Self::from_reporting_path`] refuses to make for a zero index. A negative
+  /// therefore joins `0` in the one absence, which the truncation flag then
+  /// partitions exactly as it does there, and the datagram keeps the
+  /// DESTINATION the same cmsg witnessed, so only the link scoping is lost.
+  ///
+  /// Neither kernel is known to hand one over: Linux's
+  /// `ip6_datagram_recv_common_ctl` wraps its `put_cmsg` in
+  /// `if (src_info.ipi6_ifindex >= 0)`, so a negative would omit the cmsg
+  /// rather than deliver it (see this module's header), and every BSD signals
+  /// "no receive interface" with `0`. This is what the boundary does if one
+  /// arrives regardless.
+  ///
+  /// # Callers whose field is genuinely unsigned
+  ///
+  /// They reinterpret it (`as i32`), which is exact for every index a supported
+  /// kernel assigns: Linux's `ifindex` is a positive `int`, and the BSDs count
+  /// `if_index` up from `1`. No kernel here reaches `2^31`, and an index that
+  /// did would DEGRADE to `Declined` rather than fabricate a witness — the
+  /// direction this boundary is required to err in.
+  #[inline]
+  #[must_use]
+  pub const fn from_reporting_path_signed(index: i32, control_truncated: bool) -> Self {
+    // A negative collapses onto `0` so the truncation partition is written
+    // once, in `from_reporting_path`, and cannot come to disagree with itself.
+    let index = if index < 0 { 0 } else { index as u32 };
+    Self::from_reporting_path(index, control_truncated)
   }
 
   /// The declaration a path that reports NO interface makes — once, from its own

@@ -3669,6 +3669,69 @@ fn a_reporting_path_can_never_mint_a_zero_witness_or_declare_itself_blind() {
   );
 }
 
+/// A NEGATIVE interface index is an ABSENCE on the same terms as `0`, never a
+/// witness near `u32::MAX`.
+///
+/// The C field is `int`: the Linux uapi declares `int ipi_ifindex` and
+/// `int ipi6_ifindex`, and `libc` binds the v4 one as `c_int` on Linux and
+/// Android and the v6 one as `c_int` on Android. Read as `u32`, `-1` becomes
+/// `4294967295` and mints `Witnessed` for an interface no host has —
+/// `arrived_on_bound_interface` would then take that fabrication as the
+/// kernel's positive statement, disagree with the bound index and refuse. The
+/// sign test therefore lives in the constructor, so every decoder that reads
+/// the field gets the same answer.
+#[test]
+fn a_negative_interface_index_is_an_absence_and_never_a_witness() {
+  assert_eq!(
+    IfaceWitness::from_reporting_path_signed(-1, false),
+    IfaceWitness::Declined,
+    "a negative is the kernel naming no usable interface, exactly as `0` is"
+  );
+  assert_eq!(
+    IfaceWitness::from_reporting_path_signed(i32::MIN, false),
+    IfaceWitness::Declined,
+    "and no negative is special: the sign is the whole test"
+  );
+  assert_eq!(
+    IfaceWitness::from_reporting_path_signed(-1, true),
+    IfaceWitness::Lost,
+    "the truncation flag partitions this absence exactly as it partitions `0`"
+  );
+  assert_eq!(
+    IfaceWitness::from_reporting_path_signed(-1, false).witnessed_index(),
+    None,
+    "so nothing downstream can read an index out of it"
+  );
+
+  // Reinterpreting the sign away is what this constructor exists to prevent:
+  // the SAME bits through the unsigned door mint a witness for interface
+  // 4294967295, which is the outcome the sign test removes.
+  assert!(
+    IfaceWitness::from_reporting_path((-1i32) as u32, false).is_witnessed(),
+    "pins the misreading being avoided, so a revert cannot pass silently"
+  );
+
+  // Non-negative indices are untouched: the signed door and the unsigned door
+  // agree on every value a kernel actually assigns.
+  assert_eq!(
+    IfaceWitness::from_reporting_path_signed(0, false),
+    IfaceWitness::Declined
+  );
+  assert_eq!(
+    IfaceWitness::from_reporting_path_signed(0, true),
+    IfaceWitness::Lost
+  );
+  assert_eq!(
+    IfaceWitness::from_reporting_path_signed(BOUND as i32, false),
+    witnessed(BOUND)
+  );
+  assert_eq!(
+    IfaceWitness::from_reporting_path_signed(i32::MAX, false),
+    IfaceWitness::from_reporting_path(i32::MAX as u32, false),
+    "and the two doors agree across the whole non-negative range"
+  );
+}
+
 /// An IPv4-MAPPED IPv6 destination is CLASSIFIED, not absorbed.
 ///
 /// `::ffff:224.0.0.251` is the IPv4 mDNS group written as an IPv6 address, and

@@ -632,8 +632,14 @@ pub fn parse_pktinfo_v4(
       let idx_bytes: &[u8; 4] = cmsg.data.first_chunk::<4>().ok_or_else(|| {
         ParseRecvMetaError::BufferTooShort(BufferTooShortDetail::new(4, cmsg.data.len()))
       })?;
-      // ipi_ifindex is platform-endian; use from_ne_bytes for portability.
-      let iface = u32::from_ne_bytes(*idx_bytes);
+      // ipi_ifindex is platform-endian; use from_ne_bytes for portability. It
+      // is read SIGNED because that is what the C field is — `int` in the Linux
+      // uapi header and `c_int` in `libc` on Linux and Android — so a negative
+      // lands in `IfaceWitness`'s absence instead of becoming an index near
+      // `u32::MAX` that no host has. Apple, the third target this parser
+      // serves, types it `c_uint`; reading it signed is exact for every index
+      // that kernel assigns.
+      let iface = i32::from_ne_bytes(*idx_bytes);
       // `local_ip` is ipi_spec_dst (bytes 4..8) — the local interface address
       // the packet was received on, which is what self-packet detection on a
       // multi-homed host needs and which for a multicast receive is NOT the
@@ -674,7 +680,7 @@ pub fn parse_pktinfo_v4(
         peer,
         local_ip,
         DestinationWitness::Witnessed(destination),
-        IfaceWitness::from_reporting_path(iface, false),
+        IfaceWitness::from_reporting_path_signed(iface, false),
         None,
       ));
     }
@@ -986,7 +992,11 @@ pub fn parse_pktinfo_v6(
           ParseRecvMetaError::BufferTooShort(BufferTooShortDetail::new(4, cmsg.data.len()))
         })?;
       let local_ip = IpAddr::V6(Ipv6Addr::from(*addr_bytes));
-      let iface = u32::from_ne_bytes(*idx_bytes);
+      // Read SIGNED, as the length comment above already names the field: the
+      // Linux uapi declares `int ipi6_ifindex`, and `libc` types it `c_int` on
+      // Android. A negative is an absence in `IfaceWitness`, not an index near
+      // `u32::MAX`.
+      let iface = i32::from_ne_bytes(*idx_bytes);
       // in6_pktinfo has no `ipi_spec_dst` twin: ipi6_addr IS the IP header
       // destination, so `local_ip` and `destination` are the same address here
       // and the v4 asymmetry does not reach IPv6.
@@ -997,7 +1007,7 @@ pub fn parse_pktinfo_v6(
         peer,
         local_ip,
         DestinationWitness::Witnessed(local_ip),
-        IfaceWitness::from_reporting_path(iface, false),
+        IfaceWitness::from_reporting_path_signed(iface, false),
         None,
       ));
     }

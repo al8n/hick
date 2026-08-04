@@ -461,8 +461,12 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta, control_trunca
         ))));
         // A zero `ipi_ifindex` INSIDE a present cmsg is a kernel that named no
         // interface, not a path that cannot name one — `from_reporting_path`
-        // makes that `Declined`, or `Lost` where our own buffer truncated.
-        meta.iface = IfaceWitness::from_reporting_path(pi.ipi_ifindex as u32, control_truncated);
+        // makes that `Declined`, or `Lost` where our own buffer truncated. The
+        // C field is `int` (`c_int` in `libc` on Linux and Android, `c_uint` on
+        // Apple), so it goes through the SIGNED constructor, where a negative
+        // is that same absence and never an index near `u32::MAX`.
+        meta.iface =
+          IfaceWitness::from_reporting_path_signed(pi.ipi_ifindex as i32, control_truncated);
       }
       // IPv6 PKTINFO — only where libc defines IPV6_PKTINFO (`has_ipv6_pktinfo`).
       #[cfg(has_ipv6_pktinfo)]
@@ -479,7 +483,13 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta, control_trunca
         meta.local_ip = IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr));
         meta.destination =
           DestinationWitness::Witnessed(IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr)));
-        meta.iface = IfaceWitness::from_reporting_path(pi.ipi6_ifindex, control_truncated);
+        // `libc` types `ipi6_ifindex` as `c_int` on Android and `c_uint` on
+        // every other supported unix, though the Linux uapi header declares it
+        // `int` there too. The `as i32` normalises both onto the signed
+        // constructor, where a negative is an absence rather than an index near
+        // `u32::MAX`.
+        meta.iface =
+          IfaceWitness::from_reporting_path_signed(pi.ipi6_ifindex as i32, control_truncated);
       }
       // IPv4 TTL — only where libc defines the hop-limit cmsg constants
       // (`has_recv_hoplimit`; absent on OpenBSD/NetBSD).
