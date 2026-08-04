@@ -3500,12 +3500,9 @@ fn echo_matched_at_next_tick_top(mdns: &mut Mdns, family: Family, body: &[u8]) -
   // how much time has passed since the send and the claim keeps full ordering
   // evidence — which is what makes this an `Ordered` claim rather than a
   // degraded one.
-  mdns.selfsend.take_at(
-    family,
-    body,
-    RxEvidence::from_caller_parsed_cmsg(top.wall),
-    top,
-  )
+  mdns
+    .selfsend
+    .take_at(family, body, RxEvidence::from_stamp_for_test(top.wall), top)
 }
 
 /// Send once through stage 4 and claim the echo at the next tick's top.
@@ -3714,7 +3711,7 @@ fn a_caller_gap_after_the_claim_window_opened_still_expires_the_credit() {
     !mdns.selfsend.take_at(
       Family::V4,
       &body,
-      RxEvidence::from_caller_parsed_cmsg(after_the_gap.wall),
+      RxEvidence::from_stamp_for_test(after_the_gap.wall),
       after_the_gap,
     ),
     "post-opportunity time is charged in full, caller stalls included, or the \

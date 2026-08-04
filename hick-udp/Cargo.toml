@@ -14,11 +14,14 @@ categories = ["network-programming"]
 default = []
 # Exposes the self-send tracker's clock seams (`take_at`, `seal_at`,
 # `record_with_stale_sweep`, `pause_next_seal_for_test`, `len`,
-# `anchors_for_test`) so a DEPENDENT crate's test binary can place a claim or a
-# loop top without sleeping to it. Off by default, so no build a driver ships
-# can hand the tracker a clock reading taken somewhere else — production reaches
-# every liveness decision through `take`/`seal`, which read the clocks
-# themselves. Belongs in `dev-dependencies` only.
+# `anchors_for_test`) plus `RxEvidence::from_stamp_for_test`, so a DEPENDENT
+# crate's test binary can place a claim or a loop top without sleeping to it.
+# Off by default, so no build a driver ships can hand the tracker a clock
+# reading taken somewhere else — production reaches every liveness decision
+# through `take`/`seal`, which read the clocks themselves. Belongs in
+# `dev-dependencies` only. For the receive stamp this is a speed bump and not a
+# boundary: a default build can still assert one through the safe, public
+# `RxEvidence::from_cmsgs`, which is a documented caller contract. See its docs.
 test-support = []
 tracing = ["hick-trace/tracing"]
 metrics = ["hick-trace/metrics"]

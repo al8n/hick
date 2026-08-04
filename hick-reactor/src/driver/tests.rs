@@ -150,7 +150,7 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -171,7 +171,7 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -221,7 +221,7 @@ fn pre_drop_short_qr1_counts_rx_and_dropped_exactly_once() {
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -285,7 +285,7 @@ fn pre_drop_untrusted_qr1_response_counts_rx_and_dropped_exactly_once() {
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -343,7 +343,7 @@ fn pre_drop_off_link_datagram_counts_rx_and_dropped_exactly_once() {
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     destination: None,
     delivery: None,
     hop_limit: Some(64), // carried, never read — see the doc above
@@ -549,7 +549,7 @@ fn ingress_admits(a: Arrival, subnets: &[(IpAddr, u8)], bound_is_loopback: bool)
     family: a.family,
     local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     interface_index: a.pkt_iface,
-    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     destination: a.destination,
     delivery: a.delivery,
     hop_limit: a.hop_limit,
@@ -903,7 +903,7 @@ fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
       family: Family::V4,
       local_ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
       interface_index: INGRESS_BOUND,
-      rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+      rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
       destination: None,
       delivery: None,
       hop_limit: None,
@@ -1398,7 +1398,7 @@ fn self_send_consume_once() {
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"hello", sent);
   let now = claim(sent, Duration::from_millis(1));
-  let rx = RxEvidence::from_caller_parsed_cmsg(now.wall);
+  let rx = RxEvidence::from_stamp_for_test(now.wall);
   // The loopback the kernel stamped at-or-after our send is matched and consumed.
   assert!(tracker.take_at(Family::V4, b"hello", rx, now));
   // A second byte-identical datagram finds no credit -> treated as a peer's.
@@ -1412,7 +1412,7 @@ fn self_send_distinct_payloads_do_not_match() {
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"alpha", sent);
   let now = claim(sent, Duration::from_millis(1));
-  let rx = RxEvidence::from_caller_parsed_cmsg(now.wall);
+  let rx = RxEvidence::from_stamp_for_test(now.wall);
   assert!(!tracker.take_at(Family::V4, b"beta", rx, now));
   // The unrelated credit is left intact for its own loopback.
   assert!(tracker.take_at(Family::V4, b"alpha", rx, now));
@@ -1432,7 +1432,7 @@ fn self_send_expires_after_ttl() {
   assert!(!tracker.take_at(
     Family::V4,
     b"hello",
-    RxEvidence::from_caller_parsed_cmsg(too_late.wall),
+    RxEvidence::from_stamp_for_test(too_late.wall),
     too_late
   ));
   tracker.seal_at(too_late.mono);
@@ -1447,7 +1447,7 @@ fn self_send_expires_after_ttl() {
   assert!(tracker.take_at(
     Family::V4,
     b"other",
-    RxEvidence::from_caller_parsed_cmsg(now.wall),
+    RxEvidence::from_stamp_for_test(now.wall),
     now
   ));
 }
@@ -1461,14 +1461,14 @@ fn self_send_peer_before_our_send_cannot_steal_credit() {
   let mut tracker = SelfSendTracker::new();
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"probe", sent);
-  let peer_rx = RxEvidence::from_caller_parsed_cmsg(sent.wall - Duration::from_millis(500));
+  let peer_rx = RxEvidence::from_stamp_for_test(sent.wall - Duration::from_millis(500));
   assert!(!tracker.take_at(Family::V4, b"probe", peer_rx, sent));
   // Our genuine loopback arrives at-or-after the send and is matched.
   let now = claim(sent, Duration::from_millis(1));
   assert!(tracker.take_at(
     Family::V4,
     b"probe",
-    RxEvidence::from_caller_parsed_cmsg(now.wall),
+    RxEvidence::from_stamp_for_test(now.wall),
     now
   ));
 }
@@ -1488,7 +1488,7 @@ fn self_send_ordered_tolerates_microsecond_truncation() {
   assert!(tracker.take_at(
     Family::V4,
     b"trunc",
-    RxEvidence::from_caller_parsed_cmsg(truncated_rx),
+    RxEvidence::from_stamp_for_test(truncated_rx),
     sent
   ));
 
@@ -1497,7 +1497,7 @@ fn self_send_ordered_tolerates_microsecond_truncation() {
   assert!(!tracker.take_at(
     Family::V4,
     b"trunc",
-    RxEvidence::from_caller_parsed_cmsg(too_early),
+    RxEvidence::from_stamp_for_test(too_early),
     sent
   ));
 }
@@ -1517,7 +1517,7 @@ fn self_send_ordered_nanosecond_rejects_pre_send() {
   assert!(!tracker.take_at(
     Family::V4,
     b"probe",
-    RxEvidence::from_caller_parsed_cmsg(pre_send),
+    RxEvidence::from_stamp_for_test(pre_send),
     sent
   ));
   // The credit survives the non-match; our genuine loopback (at-or-after the
@@ -1525,7 +1525,7 @@ fn self_send_ordered_nanosecond_rejects_pre_send() {
   assert!(tracker.take_at(
     Family::V4,
     b"probe",
-    RxEvidence::from_caller_parsed_cmsg(sent.wall),
+    RxEvidence::from_stamp_for_test(sent.wall),
     sent
   ));
 }
@@ -1573,7 +1573,7 @@ fn self_send_dual_stack_records_two_entries() {
   recorded_and_sealed(&mut tracker, Family::V6, b"resp", sent);
   assert_eq!(tracker.len(), 2);
   let now = claim(sent, Duration::from_millis(1));
-  let rx = RxEvidence::from_caller_parsed_cmsg(now.wall);
+  let rx = RxEvidence::from_stamp_for_test(now.wall);
   assert!(tracker.take_at(Family::V4, b"resp", rx, now));
   assert!(tracker.take_at(Family::V6, b"resp", rx, now));
   // Both credits are spent; a third copy on either family is a peer's.
@@ -1599,7 +1599,7 @@ fn self_send_cap_declines_without_evicting_live_entries() {
   assert_eq!(tracker.len(), MAX_SELF_SEND_ENTRIES);
 
   let now = claim(sent, Duration::from_millis(1));
-  let rx = RxEvidence::from_caller_parsed_cmsg(now.wall);
+  let rx = RxEvidence::from_stamp_for_test(now.wall);
   assert!(
     !tracker.take_at(Family::V4, b"overflow", rx, now),
     "the would-be new credit was refused, never admitted"
@@ -1641,7 +1641,7 @@ fn self_send_wall_step_no_longer_makes_us_ingest_our_own_echo_as_a_peer() {
   let stepped = ClockPair::new(sent.wall - STEP, sent.mono + Duration::from_millis(1));
   // The kernel stamped our own echo on the far side of the step, so it reads as
   // predating the send it is the echo OF.
-  let rx = RxEvidence::from_caller_parsed_cmsg(stepped.wall + Duration::from_millis(1));
+  let rx = RxEvidence::from_stamp_for_test(stepped.wall + Duration::from_millis(1));
 
   assert!(
     tracker.take_at(Family::V4, b"announce", rx, stepped),
@@ -4900,7 +4900,7 @@ async fn a_credit_sealed_before_the_park_expires_across_it_and_cannot_suppress_a
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -4979,7 +4979,7 @@ async fn the_seal_predates_the_park_and_the_generation_proves_it() {
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -5071,7 +5071,7 @@ async fn a_receive_reached_without_parking_is_not_weighed_against_a_stale_park()
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
-    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),

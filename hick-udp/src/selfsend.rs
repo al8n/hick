@@ -225,8 +225,8 @@ pub const WALL_STEP_TOLERANCE: Duration = Duration::from_millis(50);
 ///   and a caller who encodes one gets ordering evidence for whatever value is
 ///   in it. See that constructor. Unix only, hence backticks rather than a
 ///   link.
-/// * [`Self::from_caller_parsed_cmsg`] — **the same contract, stated as a time
-///   instead of a buffer**, for a driver that has already walked its own cmsgs.
+/// * `from_stamp_for_test` — **the same contract, stated in one line instead of
+///   a buffer**, behind `test-support` and out of every default build.
 ///
 /// So the type does not make ordering evidence unforgeable, and no version of it
 /// short of this crate owning the receive syscall could: whatever a driver hands
@@ -361,19 +361,24 @@ impl RxEvidence {
     Self(crate::multicast::parse_rx_time(cmsgs))
   }
 
-  /// A kernel receive timestamp the **caller** parsed out of its own `recvmsg`.
+  /// A stamp a **test** chose, standing in for one a kernel wrote.
   ///
-  /// For a driver whose I/O model this crate's blocking receive path does not
-  /// fit — a completion-based one that submits its own `recvmsg` and walks the
-  /// control buffer itself — so there is no [`RecvMeta`] to read it from.
+  /// The same unverifiable contract `from_cmsgs` carries, in the shape a test
+  /// can actually use: `rx` is meant to be a value a kernel stamped on a
+  /// datagram, and nothing here can check that. It is not a weaker gate than
+  /// `from_cmsgs` so much as an honest one — a test wanting a stamp one
+  /// millisecond after a credit's send would otherwise hand-encode a native
+  /// timestamp cmsg to say so, which is `unsafe`, per-target, and proves
+  /// nothing the one-liner does not.
   ///
-  /// # This crate cannot verify it, and does not pretend to
-  ///
-  /// `rx` must be a value the **kernel** stamped on this datagram, taken from a
-  /// receive-timestamp cmsg. Nothing here can check that: a userspace
-  /// [`SystemTime::now`] has the same type and is accepted identically. The
-  /// obligation is the caller's, it is not enforceable from this side, and the
-  /// name of this constructor is the whole of the mechanism.
+  /// Behind `test-support` because that is where the tracker's other clock
+  /// seams are ([`SelfSendTracker::take_at`], [`SelfSendTracker::seal_at`]) and
+  /// for the same reason: a default build reaches every liveness decision
+  /// through
+  /// [`SelfSendTracker::take`], and a driver has no business placing a claim at
+  /// a time of its choosing. The gate is a speed bump on the trivial door, not
+  /// a proof that no door exists — `from_cmsgs` is safe, public, and reachable
+  /// from any dependent.
   ///
   /// Getting it wrong is not a lost byte. A read time is at-or-after our send in
   /// every case, so [`reference_ordered`]'s test can never reject on it, and the
@@ -383,13 +388,12 @@ impl RxEvidence {
   /// and our own echo then reaches the protocol layer as peer traffic. That is a
   /// phantom RFC 6762 §9 conflict against ourselves and the rename that follows.
   ///
-  /// If you have no kernel stamp, [`Self::none`] is the correct answer and costs
-  /// only the ordering arm. If you have the control buffer the stamp would be
-  /// in, `from_cmsgs` is the better answer — not because it checks anything it
-  /// cannot, but because this crate then does the decoding, so your driver is
-  /// not a second reading of the same cmsg.
+  /// It is also the only deterministic way to put a stamp at a chosen offset
+  /// from a credit's send, which is the whole subject of
+  /// [`crate::RX_TIMESTAMP_GRAIN`] and [`WALL_STEP_TOLERANCE`].
+  #[cfg(any(test, feature = "test-support"))]
   #[must_use]
-  pub const fn from_caller_parsed_cmsg(rx: SystemTime) -> Self {
+  pub const fn from_stamp_for_test(rx: SystemTime) -> Self {
     Self(Some(rx))
   }
 
@@ -680,10 +684,12 @@ impl SelfSendTracker {
   ///
   /// # `sent` is a contract this type CANNOT enforce
   ///
-  /// Stated plainly because the receive side is different: [`Self::take`] takes
-  /// an [`RxEvidence`], whose strong constructor reads a stamp out of a
-  /// [`RecvMeta`] only this crate can mint. There is no equivalent here, and no
-  /// honest way to build one — **this crate does not own the send**. It has no
+  /// Stated plainly because the receive side has one form this crate can check
+  /// and this side has none: [`Self::take`] takes an [`RxEvidence`], and
+  /// [`RxEvidence::from_meta`] reads its stamp off a [`RecvMeta`] only this
+  /// crate can mint, because this crate performed that `recvmsg`. There is no
+  /// equivalent here, and no honest way to build one — **this crate does not
+  /// own the send**. It has no
   /// `sendto` to stamp, so whatever it accepted would be a value the caller read,
   /// and wrapping that in a newtype would move the promise without checking it.
   ///
