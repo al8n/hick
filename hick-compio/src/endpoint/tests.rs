@@ -1,10 +1,6 @@
-use super::{collect_local_subnets, pick_default_interface_index};
+use hick_udp::onlink::collect_local_subnets;
 
-#[test]
-fn collect_local_subnets_is_empty_for_unspecified_index() {
-  // Index 0 means "unspecified" — no subnets are collected.
-  assert!(collect_local_subnets(0).is_empty());
-}
+use super::pick_default_interface_index;
 
 #[test]
 fn pick_default_interface_index_runs_for_every_family_combo() {

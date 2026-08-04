@@ -226,11 +226,14 @@ pub(crate) fn set_recv_timestamp(_sock: &UdpSocket) -> std::io::Result<()> {
 }
 
 /// Enable delivery of the inbound IPv4 TTL (`IP_RECVTTL`) so `recvmsg` reports
-/// it as an `IP_TTL` cmsg — needed for the RFC 6762 §11 on-link check.
+/// it as an `IP_TTL` cmsg, for [`crate::RecvMeta::hop_limit`] to carry as a
+/// diagnostic. RFC 6762 §11's receive test is about the destination address and
+/// never this value, so nothing is refused or admitted on it.
+///
 /// Gated on the `has_recv_hoplimit` capability cfg (see `build.rs`):
 /// Linux/Android, Apple, FreeBSD, DragonFly. `libc` does NOT define `IP_RECVTTL`
 /// on the netbsdlike targets (OpenBSD/NetBSD), so they fall through to the no-op
-/// below — `hop_limit` stays `None` and the §11 check degrades to pass-through.
+/// below and `hop_limit` stays `None` there. No admission decision changes.
 #[cfg(has_recv_hoplimit)]
 pub(crate) fn set_recv_ttl_v4(sock: &UdpSocket) -> std::io::Result<()> {
   set_bool_sockopt(sock, libc::IPPROTO_IP, libc::IP_RECVTTL)

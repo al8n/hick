@@ -13,7 +13,9 @@ use std::{
 use futures::future::select_all;
 use hick_trace::*;
 use hick_udp::{
-  MulticastOptionsV4, MulticastOptionsV6, try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
+  MulticastOptionsV4, MulticastOptionsV6,
+  onlink::{collect_local_subnets, is_loopback_interface},
+  try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
 use mdns_proto::{
   Name, QuerySpec, ServiceSpec,
@@ -154,6 +156,7 @@ impl Endpoint {
     {
       let mut st = inner.state.borrow_mut();
       st.bound_interface = interface_index;
+      st.bound_is_loopback = is_loopback_interface(interface_index);
       st.local_subnets = collect_local_subnets(interface_index);
     }
 
@@ -395,29 +398,6 @@ impl Drop for Endpoint {
   fn drop(&mut self) {
     self.inner.notify.notify();
   }
-}
-
-/// Snapshot the local IPv4 / IPv6 subnets owned by `iface_index`. Used by
-/// the §11 on-link source-address fallback when the kernel did not deliver
-/// an IPv4 TTL / IPv6 hop-limit cmsg.
-fn collect_local_subnets(iface_index: u32) -> Vec<(IpAddr, u8)> {
-  let mut out: Vec<(IpAddr, u8)> = Vec::new();
-  if iface_index == 0 {
-    return out;
-  }
-  if let Ok(Some(i)) = getifs::interface_by_index(iface_index) {
-    if let Ok(v4s) = i.ipv4_addrs() {
-      for n in v4s.iter() {
-        out.push((IpAddr::V4(n.addr()), n.prefix_len()));
-      }
-    }
-    if let Ok(v6s) = i.ipv6_addrs() {
-      for n in v6s.iter() {
-        out.push((IpAddr::V6(n.addr()), n.prefix_len()));
-      }
-    }
-  }
-  out
 }
 
 /// Pick a default interface index when the caller didn't pin one. Mirrors

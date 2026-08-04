@@ -80,7 +80,7 @@ fn destination_is_ipi_addr_while_local_ip_stays_ipi_spec_dst() {
   assert_ne!(Some(meta.local_ip()), meta.destination());
   // Nothing sets the flag on this path: the PKTINFO parsers never see
   // `msg_flags`, and `None` is "no such flag here", not "unicast".
-  assert_eq!(meta.multicast_flag(), None);
+  assert_eq!(meta.delivery(), None);
 }
 
 #[cfg(has_ip_pktinfo)]

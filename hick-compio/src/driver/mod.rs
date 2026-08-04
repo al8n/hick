@@ -12,7 +12,10 @@ use core::{
   net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
 use hick_trace::*;
-use hick_udp::selfsend::{ClockPair, SelfSendTracker};
+use hick_udp::{
+  onlink::{BoundLink, admits_ingress},
+  selfsend::{ClockPair, SelfSendTracker},
+};
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
   FamilyAttempt, QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate,
@@ -24,7 +27,7 @@ use slab::Slab;
 
 use crate::{
   service::ServiceMailbox,
-  socket::{RecvMeta, Socket},
+  socket::{RecvMeta, Socket, rx_interface_reported},
 };
 
 #[cfg(test)]
@@ -243,10 +246,34 @@ pub(crate) struct State {
   /// allocating a fresh `Vec` per pump call. `clear()`ed at the start of each use.
   pub(crate) svc_handle_scratch: Vec<ServiceHandle>,
   pub(crate) query_handle_scratch: Vec<QueryHandle>,
-  /// Bound interface index (1-based) used for §11 link-local scoping.
+  /// Bound interface index (1-based), and the link every inbound datagram is
+  /// measured against: both mDNS sockets are wildcard bound, so on a multi-homed
+  /// host every NIC's port-5353 traffic reaches them and only this index (plus
+  /// an IPv6 source's scope id) says which link a datagram came from. Gates BOTH
+  /// of §11's arms, because §11 answers "did this originate on a local link" and
+  /// never "on which one".
   pub(crate) bound_interface: u32,
-  /// Cached local subnets used for the §11 source-address fallback when the
-  /// kernel didn't deliver an IPv4 TTL / IPv6 hop-limit cmsg.
+  /// Whether [`Self::bound_interface`] is the loopback interface, resolved once
+  /// at bind rather than per datagram. It is the only thing that opens the §11
+  /// loopback exception: a loopback SOURCE address is forgeable onto a real NIC
+  /// wherever an operator has stopped treating `127/8` as martian, so an
+  /// endpoint serving a physical link grants it nothing.
+  pub(crate) bound_is_loopback: bool,
+  /// When `local_subnets` was last read from the interface.
+  ///
+  /// §11's unicast arm compares a source against the receiving interface's
+  /// configuration as it IS. An address can change under a live endpoint — a
+  /// DHCP lease lost into APIPA, a renumbered subnet — and a snapshot taken once
+  /// at construction is then wrong in both directions: current-prefix traffic
+  /// refused, obsolete prefix still admitted. `getifs` offers no change
+  /// notification on any supported platform, so this is polled on a bounded
+  /// interval. See [`hick_udp::onlink::refresh_subnets_if_stale`].
+  pub(crate) subnets_refreshed_at: StdInstant,
+  /// The BOUND interface's subnets — what RFC 6762 §11's unicast arm compares a
+  /// source against. Re-read on a bounded interval (see
+  /// [`Self::subnets_refreshed_at`]) and scoped to that interface only, so no
+  /// other NIC's prefix can widen the gate; empty when enumeration failed, which
+  /// the arm reads as no on-link evidence and so REFUSES a global source.
   pub(crate) local_subnets: Vec<(IpAddr, u8)>,
   /// Max datagram size; used to size the scratch buffer for the encode/send
   /// path. Sourced from [`crate::ServerOptions::max_payload_size`].
@@ -302,6 +329,8 @@ impl State {
       svc_handle_scratch: Vec::new(),
       query_handle_scratch: Vec::new(),
       bound_interface: 0,
+      bound_is_loopback: false,
+      subnets_refreshed_at: StdInstant::now(),
       local_subnets: Vec::new(),
       max_payload,
       max_recv,
@@ -1195,7 +1224,7 @@ impl State {
   /// Apply §11 + self-send + `proto.handle` for one datagram received on
   /// `family`.
   ///
-  /// The §11 on-link gate lives in [`crate::onlink`]; the take-once self-send
+  /// The §11 on-link gate lives in [`hick_udp::onlink`]; the take-once self-send
   /// classification lives in [`hick_udp::selfsend`]. `family` is the socket this
   /// datagram was read off, threaded down from the `select!` arm that read it
   /// rather than derived from the peer address: it is half the credit key, and
@@ -1244,23 +1273,81 @@ impl State {
       "a claim window opened between the park entry and this receive: `seal` \
        must PRECEDE the park, not run inside the receive arm"
     );
-    // §11 on-link gate.  When the kernel delivered a TTL / hop-limit we trust
-    // it (must be 255); otherwise we fall back to a source-address heuristic
-    // anchored by the cached local-subnet snapshot.
-    let on_link = if meta.hop_limit().is_some() {
-      crate::onlink::is_on_link(meta.hop_limit())
-    } else {
-      crate::onlink::src_on_local_link(
-        &self.local_subnets,
+    // The ingress trust boundary, applied BEFORE the proto layer can cache or
+    // act on (conflict, withdraw) attacker-injected records and BEFORE the
+    // take-once credit is consulted: the link the datagram arrived on, then RFC
+    // 6762 §11. Both gates live in `hick_udp::onlink::admits_ingress` so neither
+    // can be applied to only one of the §11 branches — the interface check in
+    // particular, which the hop-limit branch used to skip entirely even though a
+    // conforming hop limit says nothing about *whose* link a wildcard-bound
+    // socket heard.
+    //
+    // `src` is the whole peer address rather than `meta.peer().ip()`: an IPv6
+    // source's scope id is half of what names the link it came from, and taking
+    // the address alone discarded it.
+    //
+    // Both facts §11 selects its arms by come off the receive path: the IP
+    // header destination, and the kernel's coarser multicast flag where the
+    // target binds one. Hardcoding either away routed a valid group datagram to
+    // the source-prefix arm, which refuses a sender whose prefix is not one of
+    // ours — traffic §11 requires be accepted.
+    //
+    // THIS DRIVER HAS ITS OWN DECODER, AND ITS OWN GAPS. It does not call
+    // `hick_udp::recv_with_meta`; `crate::socket` decodes the ancillary data,
+    // gated by THIS crate's `build.rs`, whose `has_ip_pktinfo` covers
+    // Linux/Android/Apple only. So `destination` is `None`, and
+    // `admits_ingress` is in its second regime, on:
+    //
+    //   * unix IPv4 on FreeBSD, DragonFly, OpenBSD and NetBSD — the same four
+    //     targets `hick-udp` degrades on, but through a SEPARATE decoder, so
+    //     wiring `hick-udp`'s BSD IPv4 parsers does nothing for this crate;
+    //   * Windows, where the receive path is `recv_from` and returns no
+    //     ancillary data and no `msg_flags` at all.
+    //
+    // The first regime's guarantee — a recovered destination this endpoint does
+    // not hold is refused — DOES NOT HOLD on those squares. `delivery` recovers
+    // part of it on OpenBSD/NetBSD, where `MSG_BCAST` refuses the IPv4
+    // broadcast class; on FreeBSD/DragonFly and on Windows there is no such
+    // flag, so a broadcast is indistinguishable from a unicast and is admitted
+    // for an in-prefix source. Closing those needs work HERE — this crate's own
+    // `has_ip_pktinfo` and IPv4 decoder, and a `WSARecvMsg` path for Windows —
+    // not in `hick-udp`. Both are tracked separately and neither is done here.
+    //
+    // NOT the hop limit: RFC 6762 §11's receive test is stated exhaustively
+    // and is about the destination address. Inbound TTL appears in the RFC
+    // once, explaining why responses SHOULD be SENT at 255 for the benefit of
+    // 2004-draft queriers — it is not a test a reader is told to apply, and
+    // applying it refused conforming traffic (§5.5 unicast queries at the
+    // stack's default TTL, group queries at the socket-default multicast TTL
+    // of 1) while admitting witnessed out-of-prefix unicast. Outbound 255 is
+    // unaffected and still honoured.
+    // §11 compares against the interface's configuration as it is, so the
+    // snapshot is re-read once it ages past the shared interval. One clock read
+    // per datagram; one enumeration per interval at most.
+    hick_udp::onlink::refresh_subnets_if_stale(
+      self.bound_interface,
+      &mut self.local_subnets,
+      &mut self.subnets_refreshed_at,
+    );
+    if !admits_ingress(
+      meta.peer(),
+      meta.destination(),
+      meta.delivery(),
+      BoundLink::new(
         self.bound_interface,
-        meta.interface_index(),
-        meta.peer().ip(),
-      )
-    };
-    if !on_link {
+        self.bound_is_loopback,
+        &self.local_subnets,
+      ),
+      meta.interface_index(),
+      rx_interface_reported(meta.peer()),
+    ) {
       debug!(
         src = %meta.peer(),
+        dst = ?meta.destination(),
+        delivery = ?meta.delivery(),
         hop_limit = ?meta.hop_limit(),
+        interface_index = meta.interface_index(),
+        bound_interface = self.bound_interface,
         "dropping off-link packet (RFC 6762 §11 trust boundary)"
       );
       // The datagram WAS received off the socket — count it toward receive

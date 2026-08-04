@@ -10,7 +10,6 @@ mod driver;
 mod endpoint;
 mod error;
 mod event;
-mod onlink;
 mod options;
 mod proto;
 mod socket;

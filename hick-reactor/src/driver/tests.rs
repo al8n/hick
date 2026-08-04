@@ -44,17 +44,6 @@ fn accepted_at(attempt: FamilyAttempt<StdInstant>) -> Option<StdInstant> {
   }
 }
 
-#[test]
-fn on_link_check_rejects_non_255_ttl() {
-  // only TTL/Hop-Limit exactly 255 (or an absent value, where we
-  // can't enforce) is treated as on-link.
-  assert!(is_on_link(Some(255)));
-  assert!(is_on_link(None)); // degraded: platform didn't report it
-  assert!(!is_on_link(Some(254)));
-  assert!(!is_on_link(Some(1)));
-  assert!(!is_on_link(Some(0)));
-}
-
 /// regression: a PRESENT (bound) family's `send_to` failure must be reported
 /// [`FamilyAttempt::Refused`], NEVER [`FamilyAttempt::NoSocket`] — the fact an
 /// ABSENT family reports, and the only one that lets the core's withdrawal
@@ -153,7 +142,7 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
   state.note_park_entry();
   assert_eq!(state.selfsend.len(), 1);
 
-  // Same bytes arriving from an EPHEMERAL port (on-link TTL 255): untrusted
+  // Same bytes arriving from an EPHEMERAL port, admitted by §11: untrusted
   // response — must be dropped before it can be offered the credit.
   let untrusted = Packet {
     src: "192.0.2.9:40000".parse().unwrap(),
@@ -162,6 +151,10 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    // A multicast echo carries the group destination, which is what §11 admits
+    // it on now that the inbound TTL is not a test.
+    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    delivery: None,
     hop_limit: Some(255),
   };
   state.handle_packet(untrusted);
@@ -179,6 +172,10 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    // A multicast echo carries the group destination, which is what §11 admits
+    // it on now that the inbound TTL is not a test.
+    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    delivery: None,
     hop_limit: Some(255),
   };
   state.handle_packet(loopback);
@@ -217,7 +214,7 @@ fn pre_drop_short_qr1_counts_rx_and_dropped_exactly_once() {
   let body: Vec<u8> = vec![0x00, 0x00, 0x80];
   let len = body.len() as u64;
 
-  // Source port ≠ 5353 → untrusted-response pre-drop path; on-link (TTL=255).
+  // Source port ≠ 5353 → untrusted-response pre-drop path; §11 admits it.
   let pkt = Packet {
     src: "192.0.2.7:40000".parse().unwrap(),
     data: body,
@@ -225,6 +222,10 @@ fn pre_drop_short_qr1_counts_rx_and_dropped_exactly_once() {
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    // A multicast echo carries the group destination, which is what §11 admits
+    // it on now that the inbound TTL is not a test.
+    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    delivery: None,
     hop_limit: Some(255),
   };
   state.handle_packet(pkt);
@@ -285,7 +286,11 @@ fn pre_drop_untrusted_qr1_response_counts_rx_and_dropped_exactly_once() {
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
-    hop_limit: Some(255), // on-link
+    // A multicast echo carries the group destination, which is what §11 admits
+    // it on now that the inbound TTL is not a test.
+    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    delivery: None,
+    hop_limit: Some(255), // carried, never read
   };
   state.handle_packet(pkt);
 
@@ -301,8 +306,13 @@ fn pre_drop_untrusted_qr1_response_counts_rx_and_dropped_exactly_once() {
   assert_eq!(snap.packets_dropped, 1, "exactly one reject counter");
 }
 
-/// Off-link datagrams (TTL ≠ 255) must also count packets_rx + bytes_rx once
-/// (received from the wire) and packets_dropped once (rejected).
+/// A datagram the §11 boundary refuses must still count packets_rx + bytes_rx
+/// once (it was read off the wire) and packets_dropped once.
+///
+/// The refusal here is §11's unicast arm: the source matches no prefix
+/// configured on the bound interface. It is NOT the TTL — the boundary takes no
+/// hop limit at all — and this doc used to say otherwise while passing for the
+/// prefix reason anyway.
 #[cfg(all(feature = "stats", feature = "tokio"))]
 #[test]
 fn pre_drop_off_link_datagram_counts_rx_and_dropped_exactly_once() {
@@ -319,8 +329,9 @@ fn pre_drop_off_link_datagram_counts_rx_and_dropped_exactly_once() {
   };
   let mut state = DriverState::new(&opts, sockets);
 
-  // A datagram with TTL < 255 → off-link gate fires before the untrusted-
-  // response check. Use a query (QR=0) so only the §11 path is exercised.
+  // A source on no configured prefix → §11's unicast arm refuses it, before the
+  // untrusted-response check. Use a query (QR=0) so only the §11 path is
+  // exercised. The hop limit below is carried and never read.
   let body: Vec<u8> = vec![
     0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   ];
@@ -333,7 +344,9 @@ fn pre_drop_off_link_datagram_counts_rx_and_dropped_exactly_once() {
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
-    hop_limit: Some(64), // off-link: TTL != 255
+    destination: None,
+    delivery: None,
+    hop_limit: Some(64), // carried, never read — see the doc above
   };
   state.handle_packet(pkt);
 
@@ -428,126 +441,921 @@ async fn service_update_delivery_is_bounded_for_non_draining_caller() {
   drop(reg);
 }
 
-#[test]
-fn addr_in_subnet_masks_correctly() {
-  use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-  let net = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
-  assert!(addr_in_subnet(
-    net,
-    24,
-    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200))
-  ));
-  assert!(!addr_in_subnet(
-    net,
-    24,
-    IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1))
-  ));
-  // prefix 0 matches everything; family mismatch never matches.
-  assert!(addr_in_subnet(
-    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+// ── the ingress trust boundary, through the production receive path ─────────
+//
+// Both mDNS sockets are wildcard bound, so on a multi-homed host every NIC's
+// port-5353 traffic is delivered to them. A hop limit of 255 proves only that a
+// datagram crossed no router; it says nothing about WHICH link it did not cross,
+// and this endpoint serves exactly one interface. Two things can name that link
+// — the PKTINFO interface index and an IPv6 source's scope id — and every one of
+// them that is present has to agree.
+//
+// The rule itself is `hick_udp::onlink::admits_ingress` and is exhaustively
+// tested there. What these pin is THIS driver's wiring of it — the facts it
+// passes, and the capability it claims for its own receive path — driven through
+// `handle_packet`, the same entry the packet pump calls, rather than through a
+// reconstruction of it. Every rejecting case below is a row where
+// `hick-reactor` used to admit what the gate now refuses.
+
+/// The interface this fixture's endpoint is pinned to.
+#[cfg(feature = "tokio")]
+const INGRESS_BOUND: u32 = 5;
+/// Some other NIC on the same host.
+#[cfg(feature = "tokio")]
+const INGRESS_OTHER: u32 = 9;
+
+/// One datagram, in the shape a receive path hands it to the driver. A struct
+/// rather than a widening parameter list so the two facts §11 selects its
+/// fallback arm by are stated where they matter and default to "this path
+/// recovered none" everywhere else.
+#[cfg(feature = "tokio")]
+struct Arrival {
+  src: SocketAddr,
+  family: Family,
+  hop_limit: Option<u8>,
+  pkt_iface: u32,
+  destination: Option<IpAddr>,
+  delivery: Option<hick_udp::LinkDelivery>,
+}
+
+#[cfg(feature = "tokio")]
+impl Arrival {
+  /// A datagram whose receive path recovered neither a destination nor a
+  /// multicast flag.
+  fn new(src: SocketAddr, family: Family, hop_limit: Option<u8>, pkt_iface: u32) -> Self {
+    Self {
+      src,
+      family,
+      hop_limit,
+      pkt_iface,
+      destination: None,
+      delivery: None,
+    }
+  }
+
+  /// The IP header destination this receive path recovered.
+  fn addressed_to(mut self, dst: IpAddr) -> Self {
+    self.destination = Some(dst);
+    self
+  }
+
+  /// The kernel's `MSG_MCAST`, where the target reports one and no destination
+  /// was recovered.
+  fn delivered_as_multicast(mut self) -> Self {
+    self.delivery = Some(hick_udp::LinkDelivery::Multicast);
+    self
+  }
+}
+
+/// Whether the ingress trust boundary admitted one datagram, answered by the
+/// PRODUCTION receive entry.
+///
+/// The observable is the take-once self-send credit. `handle_packet` consults
+/// the tracker only AFTER the gate, and with a byte-identical credit already
+/// recorded a datagram that reaches the tracker always spends it — so a credit
+/// still unspent is a datagram the gate refused, and an empty tracker is one it
+/// admitted. Nothing here restates the gate's own conditions: the answer comes
+/// out of the function the packet pump calls.
+///
+/// The body is a QR=0 query, so the untrusted-response gate cannot be what
+/// refuses it, and the source port is 5353 for the same reason.
+#[cfg(feature = "tokio")]
+fn ingress_admits(a: Arrival, subnets: &[(IpAddr, u8)], bound_is_loopback: bool) -> bool {
+  use std::net::Ipv4Addr;
+
+  let opts = crate::options::ServerOptions::default();
+  let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+    v4: None,
+    v6: None,
+    interface_index: INGRESS_BOUND,
+  };
+  let mut state = DriverState::new(&opts, sockets);
+  // Pinned rather than enumerated: `INGRESS_BOUND` names whatever NIC happens to
+  // hold index 5 on the host running this, so neither its subnets nor its
+  // loopback flag may be allowed to decide these cases.
+  state.local_subnets = subnets.to_vec();
+  state.bound_is_loopback = bound_is_loopback;
+
+  let body = vec![0u8; 12];
+  state.selfsend.record(a.family, &body, ClockPair::now());
+  state.selfsend.seal();
+  #[cfg(debug_assertions)]
+  state.note_park_entry();
+  assert_eq!(state.selfsend.len(), 1, "the send recorded its credit");
+
+  state.handle_packet(Packet {
+    src: a.src,
+    data: body,
+    family: a.family,
+    local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    interface_index: a.pkt_iface,
+    rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    destination: a.destination,
+    delivery: a.delivery,
+    hop_limit: a.hop_limit,
+  });
+  state.selfsend.is_empty()
+}
+
+/// A routable source inside [`ingress_subnets`], so nothing below turns on the
+/// §11 fallback's own subnet rule.
+#[cfg(feature = "tokio")]
+fn ingress_on_subnet_peer() -> SocketAddr {
+  "192.168.1.7:5353".parse().expect("peer")
+}
+
+/// The bound interface's configuration: the address it HOLDS and that address's
+/// mask, which is what `collect_local_subnets` reports (`getifs`' `addr()`, not
+/// a masked network). Both of RFC 6762 §11's arms read it — the source arm as
+/// address and mask, the destination test as the address alone — so
+/// [`INGRESS_OUR_ADDR`] is also the unicast destination every case below reaches
+/// the source arm through.
+#[cfg(feature = "tokio")]
+fn ingress_subnets() -> Vec<(IpAddr, u8)> {
+  vec![(INGRESS_OUR_ADDR, 24u8)]
+}
+
+/// The address [`ingress_subnets`] holds, and therefore the destination §11
+/// treats as a response *"received via unicast"* on this link. A destination the
+/// interface does NOT hold reaches no §11 arm at all.
+#[cfg(feature = "tokio")]
+const INGRESS_OUR_ADDR: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 2));
+
+/// The link-local prefixes an interface holding a link-local address reports.
+/// §11's second arm is the only thing that admits a link-local source, so a
+/// fixture meaning "this link-local peer is on our link" has to say so the way a
+/// real interface does — a witness settles which link, never the prefix.
+#[cfg(feature = "tokio")]
+fn ingress_ll_prefixes() -> Vec<(IpAddr, u8)> {
+  vec![
+    (
+      IpAddr::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)),
+      64u8,
+    ),
+    (IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 0, 0)), 16u8),
+  ]
+}
+
+/// A link-local IPv6 peer inside `scope`'s zone — the second witness of the link
+/// a datagram came from, which taking `src.ip()` alone discarded.
+#[cfg(feature = "tokio")]
+fn ingress_link_local_peer(scope: u32) -> SocketAddr {
+  SocketAddr::V6(std::net::SocketAddrV6::new(
+    std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+    5353,
     0,
-    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))
+    scope,
+  ))
+}
+
+/// A routable source on a prefix the bound interface does NOT carry: the
+/// overlaid-subnet peer §11 names.
+#[cfg(feature = "tokio")]
+fn ingress_off_subnet_peer() -> SocketAddr {
+  SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 4, 4, 4)), 5353)
+}
+
+/// The IPv6 twin of [`ingress_off_subnet_peer`], with no scope id — a global
+/// source carries none.
+#[cfg(feature = "tokio")]
+fn ingress_off_subnet_peer_v6() -> SocketAddr {
+  SocketAddr::new(
+    IpAddr::V6(std::net::Ipv6Addr::new(
+      0x2001, 0xdb8, 0xbeef, 0, 0, 0, 0, 1,
+    )),
+    5353,
+  )
+}
+
+/// §11's GROUP arm, through the production receive path: arrival at the mDNS
+/// group is local-link origin on its own, "regardless of source IP address".
+///
+/// The RFC calls admitting this "essential ... in unusual configurations, such
+/// as multiple logical IP subnets overlayed on a single link". Hardcoding the
+/// destination away routed a correctly-witnessed multicast from such a peer to
+/// the source-prefix arm, which refuses it — and Windows recovers a destination
+/// while reporting no hop limit at all, so there this is the ONLY thing that can
+/// select the arm. That made the loss silent rather than rare.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_group_destination_admits_a_peer_from_an_unshared_prefix() {
+  let subnets = ingress_subnets();
+  // The Windows shape: a recovered destination, no hop limit, a source on a
+  // prefix this interface does not carry.
+  for group in [
+    IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP),
+    IpAddr::V6(hick_udp::constants::MDNS_IPV6_GROUP),
+  ] {
+    let family = if group.is_ipv4() {
+      Family::V4
+    } else {
+      Family::V6
+    };
+    let src = if group.is_ipv4() {
+      ingress_off_subnet_peer()
+    } else {
+      ingress_off_subnet_peer_v6()
+    };
+    assert!(
+      ingress_admits(
+        Arrival::new(src, family, None, INGRESS_BOUND).addressed_to(group),
+        &subnets,
+        false
+      ),
+      "{group}: §11 admits a group destination whatever the source prefix"
+    );
+  }
+
+  // The OpenBSD/NetBSD IPv4 square: no PKTINFO parse wired in, so no
+  // destination — but the kernel's own `MSG_MCAST` says it was delivered as a
+  // multicast, and §11's group arm is what that stands in for.
+  assert!(
+    ingress_admits(
+      Arrival::new(ingress_off_subnet_peer(), Family::V4, None, INGRESS_BOUND)
+        .delivered_as_multicast(),
+      &subnets,
+      false
+    ),
+    "a multicast delivery is local-link origin by itself; discarding the flag \
+     sent it to the source-prefix arm, which refuses an overlaid-subnet peer"
+  );
+
+  // The other arm is intact rather than merely unreachable: the same datagram
+  // addressed to this host is still answered by the source-prefix rule, and
+  // refused.
+  assert!(!ingress_admits(
+    Arrival::new(ingress_off_subnet_peer(), Family::V4, None, INGRESS_BOUND)
+      .addressed_to(INGRESS_OUR_ADDR),
+    &subnets,
+    false
   ));
-  assert!(!addr_in_subnet(net, 24, IpAddr::V6(Ipv6Addr::LOCALHOST)));
-  // IPv6 /64.
-  let n6 = IpAddr::V6("2001:db8:0:1::".parse().unwrap());
-  assert!(addr_in_subnet(
-    n6,
-    64,
-    IpAddr::V6("2001:db8:0:1::ff".parse().unwrap())
+  // A group destination does not excuse a foreign link — the interface check
+  // runs first. It DOES survive any TTL, which is the point of the change.
+  assert!(!ingress_admits(
+    Arrival::new(ingress_off_subnet_peer(), Family::V4, None, INGRESS_OTHER)
+      .addressed_to(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    &subnets,
+    false
   ));
-  assert!(!addr_in_subnet(
-    n6,
-    64,
-    IpAddr::V6("2001:db8:0:2::ff".parse().unwrap())
+  assert!(ingress_admits(
+    Arrival::new(
+      ingress_off_subnet_peer(),
+      Family::V4,
+      Some(254),
+      INGRESS_BOUND
+    )
+    .addressed_to(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    &subnets,
+    false
   ));
 }
 
+/// A link-local source with NO provenance is refused, through the production
+/// receive path.
+///
+/// `169.254/16` names some link and never ours. Where the receive path reports
+/// no interface — IPv4 on the four BSDs, and any driver reading datagrams with
+/// `recvfrom` — nothing else names one either, so admitting it let a peer on a
+/// neighbouring NIC unicast straight into the cache and §8.2 conflict handling
+/// with no shared prefix and no forged address.
+#[cfg(feature = "tokio")]
 #[test]
-fn src_on_local_link_fallback() {
-  use std::net::{IpAddr, Ipv4Addr};
-  let subnets = vec![(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 24u8)];
-  const BOUND: u32 = 3;
-  // In-subnet peer is on-link; an off-subnet global address is not
-  // (interface index is irrelevant for non-link-local sources).
-  assert!(src_on_local_link(
-    &subnets,
-    BOUND,
-    BOUND,
-    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 55))
-  ));
-  assert!(!src_on_local_link(
-    &subnets,
-    BOUND,
-    BOUND,
-    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))
-  ));
-  // Loopback is always on-link.
-  assert!(src_on_local_link(
-    &subnets,
-    BOUND,
-    BOUND,
-    IpAddr::V4(Ipv4Addr::LOCALHOST)
-  ));
-  // §11 fail-closed: a global source with no enumerated subnets has no
-  // on-link evidence and is dropped (was previously fail-open).
-  assert!(!src_on_local_link(
-    &[],
-    BOUND,
-    BOUND,
-    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))
-  ));
-  assert!(!src_on_local_link(
-    &[],
-    BOUND,
-    BOUND,
-    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
-  ));
-  // A global source inside a cached /8 is on-link; outside it is dropped.
-  let wide = vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8u8)];
-  assert!(src_on_local_link(
-    &wide,
-    BOUND,
-    BOUND,
-    IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))
-  ));
-  assert!(!src_on_local_link(
-    &wide,
-    BOUND,
-    BOUND,
-    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
+fn an_unwitnessed_link_local_source_is_refused() {
+  use std::net::Ipv4Addr;
+
+  let subnets = ingress_subnets();
+  let v4_ll = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 7, 7)), 5353);
+  for hop in [Some(255), None] {
+    assert!(
+      !ingress_admits(Arrival::new(v4_ll, Family::V4, hop, 0), &subnets, false),
+      "absent provenance is not membership of the bound link"
+    );
+  }
+  // An index naming our own interface is the witness stage 1 was missing — and
+  // §11's second arm still has to admit it, which needs the prefix.
+  assert!(ingress_admits(
+    Arrival::new(v4_ll, Family::V4, Some(255), INGRESS_BOUND),
+    &ingress_ll_prefixes(),
+    false
   ));
 }
 
+/// IPv4 APIPA on an infrastructure-less link, through the production receive
+/// path: a `169.254/16` peer is admitted when the bound interface carries the
+/// same prefix and nothing named the link.
+///
+/// §11's unicast test is the source against the configured address and mask and
+/// names no exception for link-local. Diverting every `169.254/16` source into a
+/// branch that demanded a witness made IPv4 mDNS deaf exactly where it is most
+/// load-bearing — a link with no DHCP, where our own address and every peer's is
+/// a link-local one.
+///
+/// The square that exercises is provenance-ABSENT, which this driver's own
+/// capability decides and no test can force through the production entry, so
+/// the expectation is derived from it: where the path does report an interface,
+/// a zero index is a failed proof and refusal is correct. The rule under both
+/// values of that axis is covered exhaustively in `hick_udp::onlink`'s tests,
+/// where it is a parameter.
+#[cfg(feature = "tokio")]
 #[test]
-fn src_on_local_link_scopes_link_local_to_bound_interface() {
-  // a link-local source is on-link ONLY when it arrived on the
-  // interface we're bound to — a link-local address from a different NIC is
-  // not our link and must not pass the §11 fallback.
-  use std::net::{IpAddr, Ipv4Addr};
-  let subnets = vec![(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 24u8)];
-  const BOUND: u32 = 3;
-  const OTHER: u32 = 7;
-  let v4_ll = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1));
-  let v6_ll = IpAddr::V6("fe80::1".parse().unwrap());
-  // Arrived on the bound interface → on-link.
-  assert!(src_on_local_link(&subnets, BOUND, BOUND, v4_ll));
-  assert!(src_on_local_link(&subnets, BOUND, BOUND, v6_ll));
-  // Arrived on a DIFFERENT interface → NOT on-link.
-  assert!(!src_on_local_link(&subnets, BOUND, OTHER, v4_ll));
-  assert!(!src_on_local_link(&subnets, BOUND, OTHER, v6_ll));
-  // Receive interface unknown (0) → degraded accept (can't scope).
-  assert!(src_on_local_link(&subnets, BOUND, 0, v4_ll));
-  assert!(src_on_local_link(&subnets, BOUND, 0, v6_ll));
+fn an_unwitnessed_apipa_peer_is_admitted_on_a_matching_prefix() {
+  let apipa: Vec<(IpAddr, u8)> = vec![(IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 0, 0)), 16u8)];
+  let peer_ll = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 3, 9)), 5353);
+  let reported = rx_interface_reported(peer_ll);
+  for hop in [Some(255), None] {
+    assert_eq!(
+      ingress_admits(Arrival::new(peer_ll, Family::V4, hop, 0), &apipa, false),
+      !reported,
+      "a link-local peer on a link-local-configured interface is on-link per \
+       §11 wherever nothing named the link, and a failed proof where something \
+       should have"
+    );
+  }
+  // Not a blanket exemption, on any target: with no matching prefix it is
+  // refused whatever the capability says.
+  assert!(!ingress_admits(
+    Arrival::new(peer_ll, Family::V4, Some(255), 0),
+    &ingress_subnets(),
+    false
+  ));
+  // And a witness still decides alone and outranks the prefix.
+  assert!(!ingress_admits(
+    Arrival::new(peer_ll, Family::V4, Some(255), INGRESS_OTHER),
+    &apipa,
+    false
+  ));
+  assert!(ingress_admits(
+    Arrival::new(peer_ll, Family::V4, Some(255), INGRESS_BOUND),
+    &apipa,
+    false
+  ));
 }
 
+/// The inbound TTL is carried and NOT tested, through the production receive
+/// path.
+///
+/// RFC 6762 §11 states its receive test exhaustively and both ways are about the
+/// destination address. The single receive-side TTL sentence in the RFC explains
+/// why responses SHOULD be SENT at 255 — backwards compatibility with
+/// 2004-draft queriers — and describes those obsolete implementations in the
+/// past tense. Testing it on receive refused conforming traffic: §5.5 direct
+/// unicast queries arrive at the sender stack's default unicast TTL, and group
+/// queries from a stack left at the socket-default multicast TTL arrive at 1.
+///
+/// These are the three cases that pin it. Outbound 255 is untouched.
+#[cfg(feature = "tokio")]
 #[test]
-fn collect_local_subnets_rejects_zero_index() {
-  // the fallback is scoped to the BOUND interface. Index 0 is
-  // "no interface" — it must NOT enumerate every NIC, so the result is
-  // empty (which makes src_on_local_link fail closed for a global source
-  // rather than treat another NIC's subnet as on-link).
-  assert!(collect_local_subnets(0).is_empty());
+fn the_inbound_ttl_is_carried_and_never_tested() {
+  let subnets = ingress_subnets();
+  let off = ingress_off_subnet_peer();
+  let group = IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP);
+
+  // 1. A group destination at a TTL that is not 255 — the case the old rule
+  //    refused ahead of the group arm, and which §11 calls *necessarily* local
+  //    regardless of source and *essential* for overlaid subnets.
+  for hop in [Some(1), Some(64), Some(254), None] {
+    assert!(
+      ingress_admits(
+        Arrival::new(off, Family::V4, hop, INGRESS_BOUND).addressed_to(group),
+        &subnets,
+        false
+      ),
+      "a group destination is local-link origin regardless of source, and the \
+       TTL is not part of that test (hop {hop:?})"
+    );
+  }
+
+  // 2. In-prefix unicast at TTL 64 — a §5.5 direct unicast query arriving at a
+  //    stack's default, which the old rule refused outright.
+  assert!(ingress_admits(
+    Arrival::new(
+      ingress_on_subnet_peer(),
+      Family::V4,
+      Some(64),
+      INGRESS_BOUND
+    )
+    .addressed_to(INGRESS_OUR_ADDR),
+    &subnets,
+    false
+  ));
+
+  // 3. Witnessed out-of-prefix unicast at TTL 255 — admitted by the old
+  //    shortcut before either arm was read, and refused now, which is what §11
+  //    expects a receiver to do with it.
+  assert!(!ingress_admits(
+    Arrival::new(off, Family::V4, Some(255), INGRESS_BOUND).addressed_to(INGRESS_OUR_ADDR),
+    &subnets,
+    false
+  ));
+
+  // The interface gate is unaffected by any of it: a foreign index still
+  // refuses, at every TTL and with a group destination.
+  for hop in [Some(255), Some(64), None] {
+    assert!(!ingress_admits(
+      Arrival::new(off, Family::V4, hop, INGRESS_OTHER).addressed_to(group),
+      &subnets,
+      false
+    ));
+  }
+}
+
+/// A renumbering under a LIVE endpoint is picked up: the old prefix stops being
+/// admissible and the new one starts, with no restart.
+///
+/// §11 compares a source against the receiving interface's configuration as it
+/// IS. A snapshot taken once at bind is wrong in both directions the moment an
+/// address changes — a DHCP lease lost into APIPA is the ordinary case — and it
+/// became load-bearing when the TTL arm was removed, because every non-loopback
+/// source now depends on it.
+///
+/// The transition is driven through the production refresh, not by assigning the
+/// field: the enumeration is forced to report the new prefix, the snapshot is
+/// aged past the shared interval, and the next datagram is what triggers the
+/// re-read.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
+  let opts = crate::options::ServerOptions::default();
+  let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+    v4: None,
+    v6: None,
+    interface_index: INGRESS_BOUND,
+  };
+  let mut state = DriverState::new(&opts, sockets);
+  state.bound_is_loopback = false;
+  state.local_subnets = ingress_subnets();
+  let old_peer = ingress_on_subnet_peer();
+  let apipa = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 3, 9)), 5353);
+
+  let feed = |state: &mut DriverState<agnostic_net::tokio::Net>, src: SocketAddr| -> bool {
+    let body = vec![0u8; 12];
+    state.selfsend.record(Family::V4, &body, ClockPair::now());
+    state.selfsend.seal();
+    #[cfg(debug_assertions)]
+    state.note_park_entry();
+    // The DELTA, not `is_empty`: a refused datagram leaves its credit behind, so
+    // after the first refusal the tracker is never empty again and `is_empty`
+    // would report every later datagram as refused too.
+    let before = state.selfsend.len();
+    state.handle_packet(Packet {
+      src,
+      data: body,
+      family: Family::V4,
+      local_ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+      interface_index: INGRESS_BOUND,
+      rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+      destination: None,
+      delivery: None,
+      hop_limit: None,
+    });
+    state.selfsend.len() < before
+  };
+
+  // Before: the configured prefix admits, APIPA does not.
+  assert!(feed(&mut state, old_peer));
+  assert!(!feed(&mut state, apipa));
+
+  // The interface renumbers 192.168.1.0/24 -> 169.254/16 under the live
+  // endpoint, and the snapshot ages past its interval.
+  hick_udp::onlink::force_enumeration_for_test(Some((
+    INGRESS_BOUND,
+    vec![(IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 0, 0)), 16u8)],
+  )));
+  state.subnets_refreshed_at =
+    monotonic_instant_ago(hick_udp::onlink::SUBNET_REFRESH_INTERVAL + Duration::from_millis(50));
+
+  // After: the obsolete prefix is refused and the current one is admitted.
+  assert!(
+    !feed(&mut state, old_peer),
+    "the obsolete prefix must stop being admissible once the interface changed"
+  );
+  assert!(
+    feed(&mut state, apipa),
+    "the current prefix must be admitted without restarting the endpoint"
+  );
+  // ... and the refresh asked about the interface this endpoint BOUND. Without
+  // this, production could refresh index 0 or a foreign one — or merely clear
+  // the snapshot — and both assertions above would still hold.
+  assert_eq!(
+    hick_udp::onlink::last_enumerated_interface_for_test(),
+    Some(INGRESS_BOUND)
+  );
+  hick_udp::onlink::force_enumeration_for_test(None);
+}
+
+/// The hop limit changes NOTHING, asserted directly rather than left implied.
+///
+/// Four tests in this workspace once said a TTL other than 255 made a datagram
+/// off-link. They passed — but for the source prefix, not the TTL — and the
+/// wrong rationale outlived the rule by two prose sweeps, because nobody
+/// re-reads a passing test. This is the assertion that would have caught them:
+/// otherwise-identical datagrams at every hop limit, admitted and refused
+/// together.
+#[cfg(feature = "tokio")]
+#[test]
+fn the_outcome_is_invariant_under_the_hop_limit() {
+  let subnets = ingress_subnets();
+  let group = IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP);
+  let unicast = INGRESS_OUR_ADDR;
+
+  for hop in [Some(255), Some(64), None] {
+    // Admitted, whatever the hop limit: in-prefix source at §11's unicast arm.
+    assert!(
+      ingress_admits(
+        Arrival::new(ingress_on_subnet_peer(), Family::V4, hop, INGRESS_BOUND)
+          .addressed_to(unicast),
+        &subnets,
+        false
+      ),
+      "in-prefix unicast must be admitted at hop {hop:?}"
+    );
+    // Admitted, whatever the hop limit: group destination, off-prefix source.
+    assert!(
+      ingress_admits(
+        Arrival::new(ingress_off_subnet_peer(), Family::V4, hop, INGRESS_BOUND).addressed_to(group),
+        &subnets,
+        false
+      ),
+      "a group destination must be admitted at hop {hop:?}"
+    );
+    // Refused, whatever the hop limit: out-of-prefix unicast.
+    assert!(
+      !ingress_admits(
+        Arrival::new(ingress_off_subnet_peer(), Family::V4, hop, INGRESS_BOUND)
+          .addressed_to(unicast),
+        &subnets,
+        false
+      ),
+      "out-of-prefix unicast must be refused at hop {hop:?}"
+    );
+    // Refused, whatever the hop limit: foreign interface.
+    assert!(
+      !ingress_admits(
+        Arrival::new(ingress_on_subnet_peer(), Family::V4, hop, INGRESS_OTHER)
+          .addressed_to(unicast),
+        &subnets,
+        false
+      ),
+      "a foreign interface must be refused at hop {hop:?}"
+    );
+  }
+}
+
+/// Row 1, and the live one: a conforming hop limit does not excuse a foreign
+/// interface.
+///
+/// This driver's gate was an exclusive match — a reported hop limit was decisive
+/// on its own and the interface was consulted only on the fallback branch. An
+/// attacker on a neighbouring NIC then reached the cache and RFC 6762 §8.2
+/// conflict handling with nothing but a well-formed unicast datagram at TTL 255,
+/// which needs no group membership to be delivered.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_conforming_hop_limit_does_not_excuse_a_foreign_interface() {
+  let subnets = ingress_subnets();
+  assert!(
+    !ingress_admits(
+      Arrival::new(
+        ingress_on_subnet_peer(),
+        Family::V4,
+        Some(255),
+        INGRESS_OTHER
+      ),
+      &subnets,
+      false
+    ),
+    "a datagram delivered on a NIC this endpoint did not bind is off its link \
+     whatever its hop limit says"
+  );
+  // The same datagram on the interface we bound is still admitted, so the
+  // rejection above is the interface and not the datagram.
+  assert!(ingress_admits(
+    Arrival::new(
+      ingress_on_subnet_peer(),
+      Family::V4,
+      Some(255),
+      INGRESS_BOUND
+    ),
+    &subnets,
+    false
+  ));
+}
+
+/// Row 2: a zero interface index is never the bound link, whatever this
+/// driver's receive path can report.
+///
+/// The old fallback read a zero as "the platform cannot tell us" and admitted a
+/// link-local source on it. Both halves of that are now refused, for two
+/// different reasons that reach the same answer — which is why this asserts
+/// outright rather than deriving the expectation from
+/// [`rx_interface_reported`]:
+///
+/// * where the path DOES report an interface, a zero is a datagram the kernel
+///   declined to place — a failed proof, not silence, and `try_bind_v6` fails
+///   the bind rather than leaving PKTINFO quietly disabled;
+/// * where it reports none, nothing named the link at all, and a link-local
+///   address may not name it for itself. Absent provenance is not membership.
+///
+/// The degraded mode that survives is the one resting on positive evidence — a
+/// source inside the bound interface's own subnets — which is what
+/// `a_receive_path_that_recovers_nothing_still_admits_an_in_subnet_peer`
+/// covers. It is deliberately not this one.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_zero_interface_is_never_the_bound_link() {
+  let subnets = ingress_subnets();
+  // A scope-LESS link-local peer: nothing names the link, on any target.
+  assert!(
+    !ingress_admits(
+      Arrival::new(ingress_link_local_peer(0), Family::V6, None, 0),
+      &subnets,
+      false
+    ),
+    "no witness at all is not the bound link, whichever reason applies"
+  );
+  // The shape a kernel actually produces: it fills `sin6_scope_id` for a
+  // link-local source from the receiving interface, and that scope is a witness
+  // in its own right — which is why IPv6 link-local discovery is unaffected by
+  // the rule above even on a path that reports no interface index.
+  assert!(ingress_admits(
+    Arrival::new(ingress_link_local_peer(INGRESS_BOUND), Family::V6, None, 0),
+    &ingress_ll_prefixes(),
+    false
+  ));
+  // And a scope naming another link is refused on the same evidence.
+  assert!(!ingress_admits(
+    Arrival::new(ingress_link_local_peer(INGRESS_OTHER), Family::V6, None, 0),
+    &subnets,
+    false
+  ));
+}
+
+/// Row 3: the fallback branch's own interface check only ever covered a
+/// LINK-LOCAL source.
+///
+/// A routable source inside the bound interface's subnet passed it on any
+/// interface at all — which is the whole neighbouring-NIC case again, on every
+/// platform that reports no TTL cmsg (Windows reports none at all).
+#[cfg(feature = "tokio")]
+#[test]
+fn a_foreign_interface_is_rejected_with_no_hop_metadata_either() {
+  let subnets = ingress_subnets();
+  assert!(
+    !ingress_admits(
+      Arrival::new(ingress_on_subnet_peer(), Family::V4, None, INGRESS_OTHER),
+      &subnets,
+      false
+    ),
+    "a global source inside our own prefix is still off our link when it \
+     arrived on someone else's NIC"
+  );
+  assert!(ingress_admits(
+    Arrival::new(ingress_on_subnet_peer(), Family::V4, None, INGRESS_BOUND),
+    &subnets,
+    false
+  ));
+}
+
+/// Row 4: an IPv6 source's scope id is decisive even when the index agrees with
+/// us.
+///
+/// This driver passed `pkt.src.ip()` to the gate and threw the zone away, so a
+/// source whose own address says it came from another link was admitted on an
+/// index that said ours. A datagram that contradicts itself has already failed
+/// to prove it is ours, and a trust boundary resolves that against the sender.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_conflicting_scope_rejects_whatever_the_index_says() {
+  let subnets = ingress_subnets();
+  assert!(
+    !ingress_admits(
+      Arrival::new(
+        ingress_link_local_peer(INGRESS_OTHER),
+        Family::V6,
+        None,
+        INGRESS_BOUND
+      ),
+      &subnets,
+      false
+    ),
+    "the scope id names another link; an index naming ours does not overrule it"
+  );
+  assert!(ingress_admits(
+    Arrival::new(
+      ingress_link_local_peer(INGRESS_BOUND),
+      Family::V6,
+      None,
+      INGRESS_BOUND
+    ),
+    &ingress_ll_prefixes(),
+    false
+  ));
+}
+
+/// The must-REJECT half of the loopback exception, at the same entry.
+///
+/// A reported foreign interface outranks the source address even for the
+/// endpoint the exception exists for. These sockets are wildcard bound, so where
+/// the OS permits a loopback source onto a physical NIC — Linux's
+/// `route_localnet` — the datagram reaches port 5353, and the exception must not
+/// carry it.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_loopback_bound_endpoint_still_refuses_a_reported_foreign_interface() {
+  use std::net::{Ipv4Addr, Ipv6Addr};
+
+  let subnets = ingress_subnets();
+  for ip in [
+    IpAddr::V4(Ipv4Addr::LOCALHOST),
+    IpAddr::V6(Ipv6Addr::LOCALHOST),
+  ] {
+    let family = if ip.is_ipv4() { Family::V4 } else { Family::V6 };
+    assert!(
+      !ingress_admits(
+        Arrival::new(SocketAddr::new(ip, 5353), family, Some(255), INGRESS_OTHER),
+        &subnets,
+        true
+      ),
+      "a source address is a claim the sender wrote; a nonzero interface index \
+       is evidence the kernel attached, and it wins"
+    );
+  }
+}
+
+/// A receive path that recovers no ancillary data at all must not be made deaf
+/// by the interface gate — `recv_task`'s plain `recv_from` arm, checked through
+/// the production receive entry.
+///
+/// Unix and Windows both read through `hick_udp::recv_with_meta`; every other
+/// target takes an arm that builds its `Packet` with `interface_index: 0` and
+/// `hop_limit: None`. Capability therefore belongs to the receive path and not
+/// to the platform, and telling the rule otherwise would make every zero index a
+/// failed proof and drop every non-loopback datagram there.
+///
+/// The expectation is derived from this driver's own capability rather than
+/// hardcoded, so the case runs on every target: where the path DOES report an
+/// interface a zero is a failed proof and the datagram is refused; where it
+/// reports none the source-address rule decides and an in-subnet peer is
+/// admitted.
+///
+/// This is the ONLY degraded admission left, and it survives because it rests
+/// on positive evidence: the source sits inside a prefix configured on the
+/// interface this endpoint bound. The link-local case does not degrade the same
+/// way and no longer admits anything on absent provenance — see
+/// `a_zero_interface_is_never_the_bound_link`.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_receive_path_that_recovers_nothing_still_admits_an_in_subnet_peer() {
+  use std::net::Ipv4Addr;
+
+  let src = ingress_on_subnet_peer();
+  let opts = crate::options::ServerOptions::default();
+  let sockets = BoundSockets::<agnostic_net::tokio::Net> {
+    v4: None,
+    v6: None,
+    interface_index: INGRESS_BOUND,
+  };
+  let mut state = DriverState::new(&opts, sockets);
+  state.local_subnets = ingress_subnets();
+  state.bound_is_loopback = false;
+
+  let body = vec![0u8; 12];
+  state.selfsend.record(Family::V4, &body, ClockPair::now());
+  state.selfsend.seal();
+  #[cfg(debug_assertions)]
+  state.note_park_entry();
+
+  // What the no-ancillary-data arm of `recv_task` builds.
+  state.handle_packet(Packet {
+    src,
+    data: body,
+    family: Family::V4,
+    local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    interface_index: 0,
+    rx: RxEvidence::none(),
+    destination: None,
+    delivery: None,
+    hop_limit: None,
+  });
+
+  assert_eq!(
+    state.selfsend.is_empty(),
+    !rx_interface_reported(src),
+    "a path with no interface to give must fall to §11's source rule, not be \
+     read as a kernel that declined to place the datagram"
+  );
+}
+
+/// Row 5: the loopback exception belongs to the ENDPOINT's link, not to the
+/// source address.
+///
+/// "A kernel does not deliver a martian loopback source arriving on a real NIC"
+/// is not an invariant — Linux's `route_localnet` exists to stop treating
+/// `127/8` as martian — so an adjacent sender can put `127.0.0.1:5353` at hop
+/// limit 255 onto a NIC this endpoint did not bind. An address-only exemption
+/// short-circuits the whole boundary before either witness is read.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_loopback_source_from_a_foreign_interface_is_rejected() {
+  use std::net::{Ipv4Addr, Ipv6Addr};
+
+  let subnets = ingress_subnets();
+  for (src, family) in [
+    (
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5353),
+      Family::V4,
+    ),
+    (
+      SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5353),
+      Family::V6,
+    ),
+  ] {
+    assert!(
+      !ingress_admits(
+        Arrival::new(src, family, Some(255), INGRESS_OTHER),
+        &subnets,
+        false
+      ),
+      "a NIC-bound endpoint has no loopback traffic to protect, so a loopback \
+       source from another link is just a spoofed source"
+    );
+    // And a loopback-BOUND endpoint refuses it too: the exception covers absent
+    // provenance, not contradicted provenance. What it does still take is its
+    // own echo where the platform placed it on no interface at all.
+    assert!(!ingress_admits(
+      Arrival::new(src, family, Some(255), INGRESS_OTHER),
+      &subnets,
+      true
+    ));
+    assert!(ingress_admits(
+      Arrival::new(src, family, Some(255), 0),
+      &subnets,
+      true
+    ));
+  }
+}
+
+/// The must-ADMIT direction, in every shape a loopback fixture's own traffic
+/// actually arrives in.
+///
+/// The rejecting rows above can only ever get stricter, and a gate that is
+/// stricter than §11 is a responder that goes quiet rather than one that leaks —
+/// so the boundary needs its other half pinned at the same entry. Every loopback
+/// integration test in this workspace, and any caller pinned to the loopback
+/// interface, runs entirely on the datagrams below; if the gate ever refuses one
+/// of them, discovery stops working there and no rejecting test would notice.
+///
+/// `iface_reported` is production's own value, not a fixture constant: it is
+/// `true` for both families on every target this driver builds for except the
+/// BSD IPv4 square, which is exactly the condition under which the interface
+/// check is live. A shape that survives it here survives it on the platforms
+/// that enforce it.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_loopback_bound_endpoint_admits_its_own_traffic_in_every_shape() {
+  use std::net::{Ipv4Addr, Ipv6Addr};
+
+  let subnets = ingress_subnets();
+  let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5353);
+  let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5353);
+  for (src, family, hop, pkt_iface, what) in [
+    // The ordinary case: our own echo, conforming hop limit, reported on the
+    // interface we bound.
+    (
+      v4,
+      Family::V4,
+      Some(255),
+      INGRESS_BOUND,
+      "v4 echo on the bound index",
+    ),
+    (
+      v6,
+      Family::V6,
+      Some(255),
+      INGRESS_BOUND,
+      "v6 echo on the bound index",
+    ),
+    // `IP_RECVTTL` is enabled best-effort at bind, so a host whose enable failed
+    // delivers the same traffic with no hop limit at all.
+    (
+      v4,
+      Family::V4,
+      None,
+      INGRESS_BOUND,
+      "v4 echo with no hop limit",
+    ),
+    // A platform is free to place the echo on NO interface, which is the whole
+    // extent of the exception: absent provenance, never contradicted
+    // provenance. A REPORTED foreign index is refused even here — see
+    // `a_loopback_bound_endpoint_still_refuses_a_reported_foreign_interface`.
+    (v4, Family::V4, Some(255), 0, "v4 echo with no index at all"),
+  ] {
+    assert!(
+      ingress_admits(Arrival::new(src, family, hop, pkt_iface), &subnets, true),
+      "{what}: a loopback-bound endpoint must admit this, or its own \
+       suppression and every loopback fixture stop working"
+    );
+  }
 }
 
 // ── The self-send tracker (`hick_udp::selfsend`) as this driver drives it ────
@@ -4093,6 +4901,10 @@ async fn a_credit_sealed_before_the_park_expires_across_it_and_cannot_suppress_a
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    // A multicast echo carries the group destination, which is what §11 admits
+    // it on now that the inbound TTL is not a test.
+    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    delivery: None,
     hop_limit: Some(255),
   });
 
@@ -4168,6 +4980,10 @@ async fn the_seal_predates_the_park_and_the_generation_proves_it() {
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    // A multicast echo carries the group destination, which is what §11 admits
+    // it on now that the inbound TTL is not a test.
+    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    delivery: None,
     hop_limit: Some(255),
   });
   assert_eq!(
@@ -4256,6 +5072,10 @@ async fn a_receive_reached_without_parking_is_not_weighed_against_a_stale_park()
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::from_caller_parsed_cmsg(SystemTime::now()),
+    // A multicast echo carries the group destination, which is what §11 admits
+    // it on now that the inbound TTL is not a test.
+    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    delivery: None,
     hop_limit: Some(255),
   });
 
@@ -4312,6 +5132,10 @@ async fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::none(),
+    // A multicast echo carries the group destination, which is what §11 admits
+    // it on now that the inbound TTL is not a test.
+    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    delivery: None,
     hop_limit: Some(255),
   };
   state.handle_packet(ephemeral);
@@ -4331,6 +5155,10 @@ async fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     interface_index: 0,
     rx: RxEvidence::none(),
+    // A multicast echo carries the group destination, which is what §11 admits
+    // it on now that the inbound TTL is not a test.
+    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    delivery: None,
     hop_limit: Some(255),
   });
   assert!(

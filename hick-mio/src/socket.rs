@@ -1033,6 +1033,17 @@ pub(crate) struct Sockets {
   /// link and one an adjacent network can drive, so it must not go untested.
   #[cfg(test)]
   forced_rx_interface: Option<u32>,
+  /// Report this IP header destination for every received datagram, overriding
+  /// the cmsg metadata. See [`Sockets::rx_destination`].
+  ///
+  /// The third of the same family as [`Sockets::forced_rx_interface`] and
+  /// [`Sockets::forced_rx_peer`], and there for the same reason. RFC 6762 §11
+  /// selects its arms by the destination, and a loopback fixture only ever
+  /// receives its own multicast — so without this the UNICAST arm, and with it
+  /// everything the source-prefix comparison decides, is unreachable through
+  /// the real receive path on every platform.
+  #[cfg(test)]
+  forced_rx_destination: Option<Option<core::net::IpAddr>>,
   /// Report this address as the peer every received datagram came from,
   /// overriding the cmsg metadata. See [`Sockets::rx_peer`].
   ///
@@ -1174,6 +1185,8 @@ impl Sockets {
       #[cfg(test)]
       forced_rx_interface: None,
       #[cfg(test)]
+      forced_rx_destination: None,
+      #[cfg(test)]
       forced_rx_peer: None,
       #[cfg(test)]
       forced_no_rx_time: false,
@@ -1207,12 +1220,42 @@ impl Sockets {
   /// Production reads it straight off the cmsg metadata; the `#[cfg(test)]`
   /// override is the only way to present a peer from a link this host is not on.
   /// See [`Sockets::forced_rx_peer`].
+  /// The IP header destination a datagram carried, as §11 selects its arms by.
+  ///
+  /// Production reads it straight off the cmsg metadata; the `#[cfg(test)]`
+  /// override is the only way to present a UNICAST arrival to a loopback
+  /// fixture, which otherwise only ever sees its own multicast. See
+  /// [`Sockets::forced_rx_destination`].
+  pub(crate) fn rx_destination(&self, meta: &RecvMeta) -> Option<core::net::IpAddr> {
+    #[cfg(test)]
+    if let Some(dst) = self.forced_rx_destination {
+      return dst;
+    }
+    meta.destination()
+  }
+
   pub(crate) fn rx_peer(&self, meta: &RecvMeta) -> SocketAddr {
     #[cfg(test)]
     if let Some(peer) = self.forced_rx_peer {
       return peer;
     }
     meta.peer()
+  }
+
+  /// Whether THIS driver's receive path reports the interface a datagram from
+  /// `peer`'s address family arrived on, as the ingress trust boundary must be
+  /// told it.
+  ///
+  /// Capability belongs to the receive path and not to the platform: a driver
+  /// reading its datagrams with `recvfrom` recovers no interface on a target
+  /// whose `recvmsg` would have supplied one, so [`onlink::admits_ingress`]
+  /// takes this as a parameter rather than reading a constant. This crate reads
+  /// EVERY datagram through [`hick_udp::recv_with_meta`] on both of its targets
+  /// — see [`raw_recv`] — so what that call reports is the whole answer.
+  ///
+  /// [`onlink::admits_ingress`]: hick_udp::onlink::admits_ingress
+  pub(crate) const fn rx_interface_reported(&self, peer: SocketAddr) -> bool {
+    hick_udp::onlink::reports_rx_interface(peer)
   }
 
   /// The ordering evidence a datagram carried, as the self-send match must read
@@ -1936,6 +1979,12 @@ impl Sockets {
   #[cfg(test)]
   pub(crate) const fn force_rx_interface_for_test(&mut self, idx: Option<u32>) {
     self.forced_rx_interface = idx;
+  }
+  /// Present this IP header destination on every subsequent receive. See
+  /// [`Sockets::forced_rx_destination`].
+  #[cfg(test)]
+  pub(crate) fn force_rx_destination_for_test(&mut self, dst: Option<Option<core::net::IpAddr>>) {
+    self.forced_rx_destination = dst;
   }
 
   /// Report `peer` as the source of every subsequent receive, scope id and all.

@@ -418,10 +418,13 @@ pub fn query_param(service_type: &str, timeout: Duration) -> QueryParam {
 ///   host's **default** multicast interface, and an endpoint joined only on
 ///   loopback never sees them. Observed on macOS: 400 datagrams sent, zero
 ///   delivered.
-/// * `IP_MULTICAST_TTL` = 255. RFC 6762 §11's on-link gate drops anything whose
-///   TTL is not 255, and the default multicast TTL is 1 — without this the burst
-///   never reaches the proto layer and `packets_rx` stays at zero for entirely
-///   the wrong reason.
+/// * `IP_MULTICAST_TTL` = 255. Fixture normalisation, and load-bearing for
+///   nothing: the ingress boundary reads no hop limit, RFC 1112 requires the
+///   local loopback copy whatever the TTL, and §11's 255 recommendation is about
+///   RESPONSES while this burst is queries. An earlier version of this note
+///   claimed the default of 1 would prevent delivery — it does not, and saying
+///   so was false evidence about the setup. It is set so the fixture emits what
+///   a conforming responder would.
 /// * `IP_MULTICAST_LOOP`. On by default, but set explicitly: the whole point is
 ///   that a same-host socket receives these.
 ///

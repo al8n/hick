@@ -153,6 +153,39 @@ pub const fn reports_rx_interface_v6() -> bool {
   cfg!(any(has_ipv6_pktinfo, windows))
 }
 
+/// How the link layer delivered a datagram, where the receive path can tell.
+///
+/// This is the coarse stand-in for an IP header destination on the receive
+/// squares that recover none — see [`RecvMeta::destination`]. It names the
+/// DELIVERY, never the address: [`Self::Multicast`] does not say which group,
+/// which is why RFC 6762 §11's group arm can be over-approximated by it and its
+/// unicast arm cannot be replaced by it.
+///
+/// Not `#[non_exhaustive]` on purpose. Every value is a decision in a trust
+/// boundary, so a fourth class must break every `match` that admits or refuses
+/// on this type rather than fall into a wildcard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkDelivery {
+  /// Addressed to this host rather than to a group or a broadcast address.
+  ///
+  /// It does NOT say to which of this host's addresses; where the IP header
+  /// destination itself was recovered, use that instead.
+  Unicast,
+  /// Delivered to a multicast group — but not to WHICH group. A datagram
+  /// addressed to `224.0.0.251` and one addressed to LLMNR's `224.0.0.252` are
+  /// the same value here.
+  Multicast,
+  /// Delivered as a link-layer broadcast: `255.255.255.255`, a subnet-directed
+  /// broadcast, or whatever address the interface was configured to answer
+  /// broadcasts on.
+  ///
+  /// Definitive NEGATIVE evidence, which is what makes it worth carrying: the
+  /// delivery was neither unicast to an address this host holds nor multicast to
+  /// an mDNS group, so RFC 6762 §11 offers it no arm at all — without ever
+  /// naming the address.
+  Broadcast,
+}
+
 /// Metadata about a received datagram.
 #[derive(Debug, Clone, Copy)]
 pub struct RecvMeta {
@@ -163,7 +196,7 @@ pub struct RecvMeta {
   interface_index: u32,
   rx_time: Option<SystemTime>,
   hop_limit: Option<u8>,
-  multicast_flag: Option<bool>,
+  delivery: Option<LinkDelivery>,
 }
 impl RecvMeta {
   /// `destination` is `Option<IpAddr>` rather than a second `IpAddr` so no call
@@ -186,7 +219,7 @@ impl RecvMeta {
       interface_index: iface,
       rx_time,
       hop_limit: None,
-      multicast_flag: None,
+      delivery: None,
     }
   }
   /// Datagram length in bytes.
@@ -231,8 +264,8 @@ impl RecvMeta {
   /// receive whose PKTINFO cmsg was absent or truncated reports. RFC 6762 §11
   /// selects between its two local-link tests by destination, so a caller
   /// holding `None` has to decide on something else — see
-  /// [`RecvMeta::multicast_flag`], which is that something on the netbsdlike
-  /// half of the gap.
+  /// [`RecvMeta::delivery`], which is that something on the netbsdlike half of
+  /// the gap.
   #[inline(always)]
   pub const fn destination(&self) -> Option<IpAddr> {
     self.destination
@@ -264,10 +297,12 @@ impl RecvMeta {
   /// the platform did not provide it (sockopt unavailable, cmsg absent or
   /// truncated, or a non-Unix target).
   ///
-  /// RFC 6762 §11: a Multicast DNS receiver should ignore packets whose
-  /// TTL/Hop Limit is not 255, since a value below 255 proves the packet
-  /// crossed a router and did not originate on the local link. The driver
-  /// enforces this when the value is present.
+  /// This is a DIAGNOSTIC, not a test. RFC 6762 §11 states its receive test
+  /// exhaustively and both ways are about the destination address; the RFC's one
+  /// receive-side TTL sentence explains why responses SHOULD be SENT at 255, for
+  /// the benefit of 2004-draft queriers, and describes those implementations in
+  /// the past tense. Nothing in this workspace refuses or admits a datagram on
+  /// this value — see [`crate::onlink`]. Outbound TTL 255 is unaffected.
   #[inline(always)]
   pub const fn hop_limit(&self) -> Option<u8> {
     self.hop_limit
@@ -281,23 +316,30 @@ impl RecvMeta {
     self.hop_limit = hop_limit;
   }
 
-  /// Whether the kernel flagged this datagram as delivered to a multicast
-  /// group rather than to this host alone (`MSG_MCAST` in the `msg_flags`
-  /// `recvmsg` returns), on targets that have that flag.
+  /// How the kernel says the link delivered this datagram — decoded from
+  /// `MSG_MCAST`/`MSG_BCAST` in the `msg_flags` `recvmsg` returns, on targets
+  /// that bind them.
   ///
-  /// `None` means the flag does not exist here — **not** that the datagram was
-  /// unicast. Of the targets this crate supports, only OpenBSD and NetBSD bind
-  /// `MSG_MCAST` in `libc`.
+  /// `None` means neither flag exists here — **not**
+  /// [`LinkDelivery::Unicast`]. Of the targets this crate supports, only OpenBSD
+  /// and NetBSD bind them (`libc`'s `src/unix/bsd/netbsdlike/mod.rs:576-577`).
   ///
-  /// `Some(true)` is coarse on purpose: it says the datagram was delivered as a
-  /// multicast, not which group it was addressed to, and the flag follows the
-  /// link-layer delivery. It exists because on OpenBSD/NetBSD IPv4 it is the
-  /// only destination evidence available at all — [`RecvMeta::destination`] is
-  /// `None` on every datagram there — and RFC 6762 §11 needs to tell a group
-  /// destination from a unicast one to pick the right local-link test.
+  /// It is coarse on purpose and it exists because on OpenBSD/NetBSD IPv4 it is
+  /// the only destination evidence available at all — [`RecvMeta::destination`]
+  /// is `None` on every datagram there — and RFC 6762 §11 picks its local-link
+  /// test by destination.
+  ///
+  /// The three values are worth very different amounts to that test.
+  /// [`LinkDelivery::Multicast`] over-approximates §11's group arm: it admits
+  /// LLMNR's group as readily as ours, which is a real residual and one no flag
+  /// can close, since "which group" is not a bit.
+  /// [`LinkDelivery::Broadcast`] is the opposite — definitive NEGATIVE evidence,
+  /// exact rather than approximate, because §11 offers a broadcast no arm at
+  /// all. [`LinkDelivery::Unicast`] says only "neither of those", so the source
+  /// arm still decides.
   #[inline(always)]
-  pub const fn multicast_flag(&self) -> Option<bool> {
-    self.multicast_flag
+  pub const fn delivery(&self) -> Option<LinkDelivery> {
+    self.delivery
   }
 
   /// Overwrite the multicast-delivery flag, threaded in by `recv_with_meta`
@@ -305,8 +347,8 @@ impl RecvMeta {
   /// `MSG_CTRUNC`: it rides on the header, not on the control buffer.
   #[cfg(unix)]
   #[inline(always)]
-  pub(crate) fn set_multicast_flag(&mut self, multicast_flag: Option<bool>) {
-    self.multicast_flag = multicast_flag;
+  pub(crate) fn set_delivery(&mut self, delivery: Option<LinkDelivery>) {
+    self.delivery = delivery;
   }
 }
 
@@ -363,8 +405,9 @@ fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
   // platforms that lack the sockopt. A missing timestamp just leaves
   // RecvMeta::rx_time as None.
   let _ = platform::set_recv_timestamp(&std_sock);
-  // Best-effort: enabling IP_RECVTTL lets the driver enforce the RFC 6762 §11
-  // on-link check. A missing value leaves RecvMeta::hop_limit as None.
+  // Best-effort: enabling IP_RECVTTL surfaces the inbound TTL as a diagnostic on
+  // `RecvMeta::hop_limit`. No admission decision reads it — §11's receive test
+  // is about the destination address — so a missing value costs nothing.
   let _ = platform::set_recv_ttl_v4(&std_sock);
   Ok(std_sock)
 }
@@ -482,8 +525,10 @@ fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   // platforms that lack the sockopt. A missing timestamp just leaves
   // RecvMeta::rx_time as None.
   let _ = platform::set_recv_timestamp(&std_sock);
-  // Best-effort: enabling IPV6_RECVHOPLIMIT lets the driver enforce the RFC
-  // 6762 §11 on-link check. A missing value leaves RecvMeta::hop_limit as None.
+  // Best-effort: enabling IPV6_RECVHOPLIMIT surfaces the inbound hop limit as a
+  // diagnostic on `RecvMeta::hop_limit`. No admission decision reads it — §11's
+  // receive test is about the destination address — so a missing value costs
+  // nothing.
   let _ = platform::set_recv_hoplimit_v6(&std_sock);
   Ok(std_sock)
 }
@@ -1059,7 +1104,7 @@ pub fn recv_with_meta(
   // The kernel's own multicast-delivery flag, read from the header rather than
   // from a cmsg — so it survives MSG_CTRUNC, and it is available on the targets
   // that parse no IPv4 PKTINFO at all. `None` where libc binds no MSG_MCAST.
-  let multicast_flag = msg_multicast_flag(msg.msg_flags);
+  let delivery = msg_link_delivery(msg.msg_flags);
 
   // Helper: a RecvMeta carrying the real peer + length but an UNSPECIFIED
   // local address and NO destination, used when PKTINFO is absent. The datagram
@@ -1085,7 +1130,7 @@ pub fn recv_with_meta(
   // data; treat that as "no pktinfo" and fall back (data is preserved).
   if msg.msg_flags & libc::MSG_CTRUNC != 0 {
     let mut meta = unspecified_meta();
-    meta.set_multicast_flag(multicast_flag);
+    meta.set_delivery(delivery);
     return Ok(meta);
   }
 
@@ -1124,30 +1169,70 @@ pub fn recv_with_meta(
   // it onto the meta. A missing/short timestamp leaves rx_time as None — never
   // an error, since the datagram has already been consumed.
   meta.set_rx_time(parse_rx_time(control_slice));
-  // thread the IPv4 TTL / IPv6 Hop Limit so the driver can enforce
-  // the RFC 6762 §11 on-link check (==255). Absent/short cmsg leaves it None
-  // (degraded: the driver cannot enforce and passes the packet through).
+  // Thread the IPv4 TTL / IPv6 Hop Limit onto the meta as a DIAGNOSTIC. RFC 6762
+  // §11's receive test is stated exhaustively and both ways are about the
+  // destination address, so nothing weighs this value; an absent or short cmsg
+  // leaves it `None` and changes no admission decision.
   meta.set_hop_limit(parse_hop_limit(control_slice, is_v4));
-  meta.set_multicast_flag(multicast_flag);
+  meta.set_delivery(delivery);
   Ok(meta)
 }
 
-/// Read `MSG_MCAST` out of the `msg_flags` `recvmsg` returned: whether the
-/// datagram was delivered as a multicast rather than addressed to this host
-/// alone.
+/// Decode the link-layer delivery class out of the `msg_flags` a `recvmsg`
+/// returned: whether the kernel delivered this datagram to a multicast group, as
+/// a link-layer broadcast, or to this host alone.
 ///
-/// `None` where `libc` binds no `MSG_MCAST` — every supported target but
-/// OpenBSD and NetBSD. See [`RecvMeta::multicast_flag`] for why a coarse
-/// "some group" answer is worth carrying at all.
-#[cfg(all(unix, has_msg_mcast))]
-fn msg_multicast_flag(msg_flags: libc::c_int) -> Option<bool> {
-  Some(msg_flags & libc::MSG_MCAST != 0)
+/// `None` means "this target binds neither flag" — every supported target but
+/// OpenBSD and NetBSD — and never [`LinkDelivery::Unicast`]. RFC 6762 §11 treats
+/// the three completely differently, so the distinction has to survive into
+/// [`RecvMeta::delivery`].
+///
+/// Exposed because a driver with its own receive path still has to decode the
+/// same flags from the same field: `msg_flags` is the kernel's, this crate owns
+/// what its bits mean, and a second hand-rolled reading of them is how a
+/// capability gets quietly lost. Takes a plain `i32` so no caller has to name
+/// `libc` to use it.
+#[cfg(unix)]
+#[inline]
+pub fn link_delivery_from_msg_flags(msg_flags: i32) -> Option<LinkDelivery> {
+  msg_link_delivery(msg_flags as libc::c_int)
 }
 
-/// Fallback for targets where `libc` binds no `MSG_MCAST`: always `None`,
-/// meaning "this target has no such flag", never "the datagram was unicast".
-#[cfg(all(unix, not(has_msg_mcast)))]
-fn msg_multicast_flag(_msg_flags: libc::c_int) -> Option<bool> {
+/// Read `MSG_MCAST`/`MSG_BCAST` out of the `msg_flags` `recvmsg` returned.
+///
+/// `None` where `libc` binds neither — every supported target but OpenBSD and
+/// NetBSD, which bind both on adjacent lines
+/// (`src/unix/bsd/netbsdlike/mod.rs:576-577`). See [`RecvMeta::delivery`] for
+/// why a coarse answer is worth carrying at all.
+///
+/// # `MSG_MCAST` wins a contradiction, deliberately
+///
+/// The two bits are mutually exclusive in every stack that sets them: a datagram
+/// is delivered to a group or as a broadcast, never both. If a kernel set both
+/// anyway, reading it as a broadcast would REFUSE it, and the datagram most
+/// likely to carry a multicast bit here is mDNS group traffic, which §11 calls
+/// *essential* to admit. So the contradiction resolves toward the reading that
+/// cannot make an endpoint silently deaf. Nothing an attacker chooses reaches
+/// this: which bits the kernel sets follows from the destination they sent to,
+/// and a sender cannot make one datagram both.
+#[cfg(all(unix, any(has_msg_mcast, has_msg_bcast)))]
+fn msg_link_delivery(msg_flags: libc::c_int) -> Option<LinkDelivery> {
+  #[cfg(has_msg_mcast)]
+  if msg_flags & libc::MSG_MCAST != 0 {
+    return Some(LinkDelivery::Multicast);
+  }
+  #[cfg(has_msg_bcast)]
+  if msg_flags & libc::MSG_BCAST != 0 {
+    return Some(LinkDelivery::Broadcast);
+  }
+  let _ = msg_flags;
+  Some(LinkDelivery::Unicast)
+}
+
+/// Fallback for targets where `libc` binds neither flag: always `None`, meaning
+/// "this target cannot say", never [`LinkDelivery::Unicast`].
+#[cfg(all(unix, not(any(has_msg_mcast, has_msg_bcast))))]
+fn msg_link_delivery(_msg_flags: libc::c_int) -> Option<LinkDelivery> {
   None
 }
 
@@ -1182,8 +1267,9 @@ fn parse_hop_limit(cmsgs: &[u8], is_v4: bool) -> Option<u8> {
   None
 }
 
-/// Fallback for targets without the TTL/Hop-Limit cmsg wired up (OpenBSD/NetBSD):
-/// always `None` (the driver then cannot enforce the §11 on-link check).
+/// Fallback for targets without the TTL/Hop-Limit cmsg (OpenBSD/NetBSD):
+/// always `None`. Costs nothing — the value is a diagnostic and no §11
+/// admission decision reads it.
 #[cfg(all(unix, not(has_recv_hoplimit)))]
 fn parse_hop_limit(_cmsgs: &[u8], _is_v4: bool) -> Option<u8> {
   None
