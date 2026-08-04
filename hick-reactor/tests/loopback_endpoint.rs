@@ -106,10 +106,21 @@ async fn loopback_v4_endpoint() -> Option<Endpoint> {
   }
 }
 
-/// A registered service must complete probing and reach `Established` (or, if
-/// the looped-back probe is treated as a simultaneous-probe tiebreak, `Renamed`
-/// — both mean the service finished probing and is now advertised). Probing is
-/// timer-driven, so this resolves without depending on cross-socket delivery.
+/// A registered service must complete probing and reach `Established`, or
+/// report `Renamed` if a looped-back probe is treated as a simultaneous-probe
+/// tiebreak.
+///
+/// `Renamed` does NOT mean the service is advertised — it is emitted at the
+/// rename DECISION, which sends the service back to `Init` to probe the new
+/// label from scratch (`mdns-proto`'s
+/// `renamed_update_means_probing_restarted_not_advertised` pins that). It is
+/// accepted here only as evidence that the lifecycle ran, and nothing below
+/// depends on the service actually being advertised. A caller that needs
+/// "advertised" must wait for `Established`, the way
+/// `hick-mio/tests/loopback.rs`'s `advertise` helper does.
+///
+/// Probing is timer-driven, so this resolves without depending on cross-socket
+/// delivery.
 #[tokio::test]
 async fn registered_service_reaches_advertised_state() {
   let Some(ep) = loopback_v4_endpoint().await else {
