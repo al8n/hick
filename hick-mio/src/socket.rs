@@ -1263,9 +1263,25 @@ impl Sockets {
   /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded).
   ///
   /// Taken from the [`RecvMeta`] rather than from a `SystemTime` this crate
-  /// passes along, so the provenance is structural: `RecvMeta` is minted only by
-  /// `hick-udp`'s own receive path, and this crate has no way to present a
-  /// userspace read time as a kernel stamp even by mistake.
+  /// passes along, so the stamp's ORIGIN is structural: `RecvMeta` is minted
+  /// only by `hick-udp`'s own receive path, and this crate has no way to present
+  /// a userspace read time as a kernel stamp even by mistake.
+  ///
+  /// **Which datagram the stamp belongs to is not.** `hick-udp` cannot check
+  /// that for any form of the evidence — `SelfSendTracker::take` takes the body
+  /// and the evidence as separate arguments and `RxEvidence` is `Copy`, so a
+  /// stamp a kernel really did write, for a *different* receive, is weighed at
+  /// `Ordered` strength all the same. A later stamp lets a datagram the kernel
+  /// saw before our `sendto` take the credit; an earlier one rejects the genuine
+  /// echo. Both end at a phantom RFC 6762 §9 conflict against ourselves.
+  ///
+  /// That obligation is discharged at the caller rather than here, and
+  /// structurally: the drain claims `recv_buf[..meta.len()]`, sliced out of the
+  /// receive buffer by this very `meta`, so the body and the stamp cannot come
+  /// from different receives without the length coming from the wrong one too.
+  /// Passing a `RecvMeta` kept from some other receive would compile and be
+  /// wrong. See [`RxEvidence`](hick_udp::selfsend::RxEvidence) on origin versus
+  /// association.
   ///
   /// The `#[cfg(test)]` override is the only way to present the timestamp-less
   /// datagram a Windows host hands the drain on every single receive. See

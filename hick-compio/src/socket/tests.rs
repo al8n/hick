@@ -6,7 +6,7 @@ fn recv_meta_default_is_safe_and_unspecified() {
   assert!(m.local_ip.is_unspecified());
   assert_eq!(m.interface_index, 0);
   assert!(m.hop_limit.is_none());
-  assert!(m.kernel_rx_time.is_none());
+  assert_eq!(m.rx, RxEvidence::none());
 }
 
 /// Direct proof that the cmsg recv path delivers PKTINFO over loopback.

@@ -1303,11 +1303,27 @@ pub const RX_TIMESTAMP_GRAIN: core::time::Duration = core::time::Duration::from_
 /// Linux/Android deliver `SCM_TIMESTAMPNS` (a `libc::timespec`); Apple and the
 /// BSDs deliver `SCM_TIMESTAMP` (a `libc::timeval`), both at level
 /// `SOL_SOCKET`. Returns `None` when no such cmsg is present, the data slice is
-/// too short, or the seconds field is negative (pre-epoch / malformed). Other
-/// Unix targets have no timestamp cmsg and always return `None`.
+/// too short, the seconds field is negative (pre-epoch / malformed), or the
+/// sub-second field is outside its own modulus. Other Unix targets have no
+/// timestamp cmsg and always return `None`.
+///
+/// **The sub-second gate is a half-open range, not a sign test.** `tv_nsec`
+/// must be in `0..1_000_000_000` and `tv_usec` in `0..1_000_000`, because
+/// `Duration::new` would otherwise *normalize* an out-of-range field into the
+/// next second instead of rejecting it — a malformed stamp would come back as
+/// `Some`, one second later than it reads, and run the self-send match at
+/// [`crate::selfsend::MatchMode::Ordered`] strength on it. Declining is the
+/// documented answer for malformed input and it costs only the ordering arm.
+///
+/// **The workspace's only reading of that wire format.** It is reached two ways
+/// and both land here: [`recv_with_meta`] threads the result onto a
+/// [`RecvMeta`] for a driver that receives through this crate, and
+/// [`crate::selfsend::RxEvidence::from_cmsgs`] is the door for a driver that
+/// owns its own `recvmsg` and holds only the control buffer. A driver decoding
+/// these cmsgs a second time for itself is how the two readings drift.
 // Targets that deliver a `libc::timespec` via `SCM_TIMESTAMPNS` (Linux/Android).
 #[cfg(recv_timestamp_ns)]
-fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {
+pub(crate) fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {
   use std::time::Duration;
 
   for cmsg in CmsgIter::new(cmsgs) {
@@ -1324,11 +1340,16 @@ fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {
       #[allow(unsafe_code)]
       let ts: libc::timespec =
         unsafe { core::ptr::read_unaligned(cmsg.data.as_ptr().cast::<libc::timespec>()) };
-      if ts.tv_sec < 0 || ts.tv_nsec < 0 {
+      // Half-open range, not `< 0`: `tv_nsec == 1_000_000_000` is malformed,
+      // and `Duration::new` would carry it into the next second rather than
+      // reject it. See this function's docs.
+      if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
         return None;
       }
       // `checked_add` (not `+`) keeps the denied `arithmetic_side_effects` lint
-      // satisfied and degrades a pathological overflow to None.
+      // satisfied and degrades a pathological overflow to None. The gate above
+      // leaves `tv_nsec` inside `u32` and below its modulus, so `Duration::new`
+      // has no carry to make and cannot overflow on the sub-second field.
       return SystemTime::UNIX_EPOCH
         .checked_add(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
     }
@@ -1339,7 +1360,7 @@ fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {
 // Apple + BSD targets that deliver a `libc::timeval` via `SCM_TIMESTAMP` (every
 // supported timestamp target that is NOT the nanosecond Linux/Android variant).
 #[cfg(all(has_recv_timestamp, not(recv_timestamp_ns)))]
-fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {
+pub(crate) fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {
   use std::time::Duration;
 
   for cmsg in CmsgIter::new(cmsgs) {
@@ -1356,12 +1377,15 @@ fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {
       #[allow(unsafe_code)]
       let tv: libc::timeval =
         unsafe { core::ptr::read_unaligned(cmsg.data.as_ptr().cast::<libc::timeval>()) };
-      if tv.tv_sec < 0 || tv.tv_usec < 0 {
+      // Half-open range, not `< 0`: `tv_usec == 1_000_000` is malformed, and
+      // `Duration::new` would carry the resulting 1e9 nanoseconds into the next
+      // second rather than reject it. See this function's docs.
+      if tv.tv_sec < 0 || !(0..1_000_000).contains(&tv.tv_usec) {
         return None;
       }
       // microseconds -> nanoseconds; saturating_mul + checked_add keep the
-      // denied `arithmetic_side_effects` lint satisfied (tv_usec is normally
-      // < 1e6, so neither actually saturates/overflows in practice).
+      // denied `arithmetic_side_effects` lint satisfied (the gate above pins
+      // tv_usec below 1e6, so neither actually saturates/overflows).
       let nanos = (tv.tv_usec as u32).saturating_mul(1000);
       return SystemTime::UNIX_EPOCH.checked_add(Duration::new(tv.tv_sec as u64, nanos));
     }
@@ -1372,7 +1396,7 @@ fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {
 // Unix targets with no receive-timestamp cmsg wired up; the sockopt is a no-op,
 // so always report None.
 #[cfg(all(unix, not(has_recv_timestamp)))]
-fn parse_rx_time(_cmsgs: &[u8]) -> Option<SystemTime> {
+pub(crate) fn parse_rx_time(_cmsgs: &[u8]) -> Option<SystemTime> {
   None
 }
 

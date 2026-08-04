@@ -6,7 +6,6 @@
 #![allow(dead_code)]
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::SystemTime;
 
 use hick_udp::selfsend::RxEvidence;
 
@@ -70,8 +69,22 @@ pub struct RecvMeta {
   interface_index: u32,
   /// IP TTL / IPv6 hop limit if the kernel exposed it.
   hop_limit: Option<u8>,
-  /// Kernel-stamped rx time (SO_TIMESTAMP / SO_TIMESTAMPNS).
-  kernel_rx_time: Option<SystemTime>,
+  /// What this datagram's arrival says about its order against our own sends.
+  ///
+  /// An [`RxEvidence`] rather than an `Option<SystemTime>` so there is exactly
+  /// one line that decides it — [`Socket::recv`]'s `RxEvidence::from_cmsgs`
+  /// call, over the buffer that receive filled — instead of a plain timestamp
+  /// field any later code could assign a clock reading to. That is a narrowed
+  /// blast radius, not a proof: `hick-udp` cannot check that the bytes are a
+  /// kernel's, so the obligation still rests on that one call site being fed
+  /// the real control buffer.
+  ///
+  /// Living HERE, on the `RecvMeta` [`Socket::recv`] returns beside the very
+  /// datagram it decoded, is what discharges the *other* half of that
+  /// obligation: `hick-udp` cannot check which datagram a stamp belongs to
+  /// either, and one struct carrying both is how this driver keeps them from
+  /// being paired wrongly. See [`RxEvidence`] on origin versus association.
+  rx: RxEvidence,
   /// Bytes of payload received.
   len: usize,
   /// The kernel's `MSG_MCAST`, where this target binds one: whether the
@@ -100,7 +113,7 @@ impl RecvMeta {
       destination: None,
       interface_index: 0,
       hop_limit: None,
-      kernel_rx_time: None,
+      rx: RxEvidence::none(),
       delivery: None,
       len: 0,
       truncated: false,
@@ -149,40 +162,53 @@ impl RecvMeta {
     self.hop_limit
   }
 
-  /// The kernel-stamped rx time, if available.
-  #[inline(always)]
-  pub(crate) const fn kernel_rx_time(&self) -> Option<SystemTime> {
-    self.kernel_rx_time
-  }
-
   /// This datagram's ordering evidence for the self-send match.
   ///
-  /// # Why this driver asserts rather than proves it
+  /// # This driver still asserts it. What changed is who decodes it
   ///
-  /// The strong form is [`RxEvidence::from_meta`], which reads the stamp out of a
-  /// `hick_udp::RecvMeta` — a type `hick-udp` alone can mint, off its own
-  /// `recvmsg`. This driver is completion-based: it submits its own `recv_msg`
-  /// and walks the returned control buffer itself (see the cmsg decoder in
-  /// `socket::unix`), so there is no `hick_udp::RecvMeta` anywhere on its receive
-  /// path and nothing for that constructor to read.
+  /// [`RxEvidence::from_meta`] reads the stamp out of a `hick_udp::RecvMeta` — a
+  /// type `hick-udp` alone can mint, off its own `recvmsg`, and the one form of
+  /// this evidence whose ORIGIN `hick-udp` can actually check. That door is shut
+  /// to this driver: it is completion-based, submits its own `recv_msg` and owns
+  /// the control buffer that comes back, so there is no `hick_udp::RecvMeta`
+  /// anywhere on its receive path, and there will not be one until `hick-udp`
+  /// can own a completion-model receive.
   ///
-  /// So the obligation is discharged HERE, at the single point where this crate's
-  /// own cmsg decoding meets the tracker, and it is an obligation `hick-udp`
-  /// cannot check: [`Self::kernel_rx_time`] must only ever hold a value the
-  /// KERNEL wrote into `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS`. It is populated in
-  /// exactly one place, by that decoder, and is never defaulted to a userspace
-  /// reading — a datagram whose cmsg carried no timestamp keeps `None` and
-  /// degrades the match, which is the correct and safe answer.
+  /// So this remains an obligation `hick-udp` cannot check, discharged HERE:
+  /// [`Socket::recv`] must pass `RxEvidence::from_cmsgs` the control buffer its
+  /// own `recv_msg` just filled, and nothing else. `hick-udp` parses those
+  /// bytes but cannot tell them from bytes this crate encoded, so a buffer kept
+  /// from an earlier receive, or one built by hand, would produce ordering
+  /// evidence that orders nothing.
   ///
-  /// Substituting a read time here would not lose a byte: a read time is
-  /// at-or-after our send in every case, so the ordering test could never reject
-  /// on it and the claim would run at `Ordered` strength on `Degraded` evidence,
-  /// re-opening the credit-theft window that ordering exists to close.
+  /// What the change did buy is that the *decode* is no longer this crate's.
+  /// The stamp comes out of the same parser every other driver here uses, so
+  /// this crate can no longer disagree with them about what a
+  /// `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS` cmsg says — and the assertion above
+  /// shrank from a whole cmsg decoder to one argument at one call site.
+  ///
+  /// Getting it wrong would not lose a byte: a stamp that does not order the
+  /// datagram against our `sendto` is at-or-after our send in every case, so the
+  /// ordering test could never reject on it and the claim would run at `Ordered`
+  /// strength on evidence that carries no order, re-opening the credit-theft
+  /// window that ordering exists to close.
+  ///
+  /// # The other unchecked half: which datagram the stamp belongs to
+  ///
+  /// `hick-udp` would not be able to check that even for a `hick_udp::RecvMeta`.
+  /// `SelfSendTracker::take` takes the body and the evidence as separate
+  /// arguments and `RxEvidence` is `Copy`, so a stamp a kernel really did write
+  /// — for a *different* receive — is weighed at `Ordered` strength all the
+  /// same. A later stamp lets a datagram the kernel saw before our `sendto` take
+  /// the credit; an earlier one rejects the genuine echo. Both end at a phantom
+  /// RFC 6762 §9 conflict against ourselves.
+  ///
+  /// This driver discharges it structurally rather than by care at the call: the
+  /// stamp is a field of the `RecvMeta` that `Socket::recv` returns beside the
+  /// datagram, and `DriverState`'s claim reads body and evidence out of that one
+  /// value. See `hick_udp::selfsend::RxEvidence` for the full contract.
   pub(crate) const fn rx_evidence(&self) -> RxEvidence {
-    match self.kernel_rx_time {
-      Some(rx) => RxEvidence::from_caller_parsed_cmsg(rx),
-      None => RxEvidence::none(),
-    }
+    self.rx
   }
 
   /// True when the datagram exceeded the socket's configured
@@ -209,7 +235,7 @@ impl RecvMeta {
     destination: Option<IpAddr>,
     interface_index: u32,
     hop_limit: Option<u8>,
-    kernel_rx_time: Option<SystemTime>,
+    rx: RxEvidence,
     len: usize,
   ) -> Self {
     Self {
@@ -218,7 +244,7 @@ impl RecvMeta {
       destination,
       interface_index,
       hop_limit,
-      kernel_rx_time,
+      rx,
       delivery: None,
       len,
       truncated: false,
@@ -328,6 +354,28 @@ impl Socket {
       meta.delivery = hick_udp::link_delivery_from_msg_flags(recv_flags.bits() as i32);
       let ctrl_bytes = ctrl.filled(ctrl_len);
       decode_unix_cmsgs(ctrl_bytes, &mut meta);
+      // The kernel receive timestamp is read out of the SAME buffer by
+      // `hick-udp`, not by the decoder above: `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS`
+      // is one wire format, and a driver-local copy of its decode is how two
+      // readings of one kernel ABI drift.
+      //
+      // `ctrl_bytes` and nothing else. `hick-udp` parses these bytes but cannot
+      // check where they came from, so this line IS the self-send ordering
+      // contract for this driver: it must be the control buffer the `recv_msg`
+      // directly above just filled. A retained buffer, or one assembled here,
+      // would still produce `Ordered` evidence — and evidence that orders
+      // nothing is what re-opens the credit-theft race. See
+      // `RecvMeta::rx_evidence`.
+      //
+      // Assigning it onto THIS `meta`, which is returned with the very bytes
+      // that receive produced, is equally load-bearing: `hick-udp` cannot check
+      // which datagram a stamp belongs to either, so a stamp landing on some
+      // other receive's meta would be weighed at `Ordered` strength against the
+      // wrong payload. Keeping the two in one value is what rules that out.
+      //
+      // `None` — no cmsg, a short one, a target without the sockopt — is
+      // `RxEvidence::none()` and correctly degrades the match.
+      meta.rx = RxEvidence::from_cmsgs(ctrl_bytes);
       Ok((data, meta))
     }
     #[cfg(not(unix))]

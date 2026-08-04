@@ -218,7 +218,7 @@ fn pre_drop_short_qr1_counts_rx_and_dropped_exactly_once() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255), // carried, never read
-    None,
+    RxEvidence::none(),
     len as usize,
   );
   s.handle_datagram(Family::V4, &meta, &data);
@@ -256,7 +256,7 @@ fn pre_drop_untrusted_qr1_response_counts_rx_and_dropped_exactly_once() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255), // on-link
-    None,
+    RxEvidence::none(),
     len as usize,
   );
   s.handle_datagram(Family::V4, &meta, &data);
@@ -301,7 +301,7 @@ fn pre_drop_off_link_datagram_counts_rx_and_dropped_exactly_once() {
     None,
     1,
     Some(64), // carried, never read — see the doc above
-    None,
+    RxEvidence::none(),
     len as usize,
   );
   s.handle_datagram(Family::V4, &meta, &data);
@@ -348,7 +348,7 @@ fn handle_datagram_refuses_a_source_outside_every_configured_prefix() {
       Some(INGRESS_OUR_ADDR),
       1,
       Some(64),
-      Some(SystemTime::now()),
+      RxEvidence::from_stamp_for_test(SystemTime::now()),
       body.len(),
     );
     s.handle_datagram(Family::V4, &meta, &body);
@@ -512,7 +512,7 @@ fn ingress_admits(a: Arrival, subnets: &[(IpAddr, u8)], bound_is_loopback: bool)
     a.destination,
     a.pkt_iface,
     a.hop_limit,
-    Some(SystemTime::now()),
+    RxEvidence::from_stamp_for_test(SystemTime::now()),
     body.len(),
   )
   .with_delivery(a.delivery);
@@ -801,7 +801,7 @@ fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
       None,
       INGRESS_BOUND,
       None,
-      Some(SystemTime::now()),
+      RxEvidence::from_stamp_for_test(SystemTime::now()),
       body.len(),
     );
     state.handle_datagram(Family::V4, &meta, &body);
@@ -2300,7 +2300,7 @@ fn rename_collision_with_local_service_frees_proto_route() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    None,
+    RxEvidence::none(),
     conflict.len(),
   );
   let mut conflicted = false;
@@ -2522,7 +2522,7 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    None,
+    RxEvidence::none(),
     conflict.len(),
   );
   let mut conflicted = false;
@@ -2698,7 +2698,7 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255), // on-link
-    None,
+    RxEvidence::none(),
     conflict.len(),
   );
 
@@ -3483,7 +3483,7 @@ fn truncated_datagram_counts_rx_and_dropped_not_delivered_to_proto() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     0,
     Some(255),
-    None,
+    RxEvidence::none(),
     len,
   )
   .with_truncated();
@@ -3552,7 +3552,7 @@ fn normal_non_truncated_datagram_routes_to_proto() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    None,
+    RxEvidence::none(),
     len,
   );
   // `truncated()` must be false — the normal routing path.
@@ -3707,7 +3707,7 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    None,
+    RxEvidence::none(),
     conflict.len(),
   );
 
@@ -4087,7 +4087,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    None,
+    RxEvidence::none(),
     conflict.len(),
   );
   let mut renamed = false;
@@ -4280,14 +4280,14 @@ fn a_backwards_wall_step_must_not_turn_our_own_echo_into_a_phantom_self_conflict
   // A minimal empty query header: QR=0, so the §11 untrusted-response gate does
   // not fire and the datagram reaches the self-send match.
   let body: Vec<u8> = vec![0u8; 12];
-  let on_link = |rx: Option<SystemTime>| {
+  let on_link = |rx: SystemTime| {
     RecvMeta::new(
       SocketAddr::from(([127, 0, 0, 1], 5353)),
       IpAddr::V4(Ipv4Addr::UNSPECIFIED),
       Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
       1,
       Some(255), // §11 on-link
-      rx,
+      RxEvidence::from_stamp_for_test(rx),
       body.len(),
     )
   };
@@ -4303,7 +4303,7 @@ fn a_backwards_wall_step_must_not_turn_our_own_echo_into_a_phantom_self_conflict
 
   // Our own echo, stamped by the kernel on the post-step timeline and therefore
   // an hour before the credit it belongs to.
-  s.handle_datagram(Family::V4, &on_link(Some(SystemTime::now())), &body);
+  s.handle_datagram(Family::V4, &on_link(SystemTime::now()), &body);
   assert!(
     s.selfsend.is_empty(),
     "the credit's two elapsed times disagree by an hour, so its wall stamp is not \
@@ -4322,7 +4322,7 @@ fn a_backwards_wall_step_must_not_turn_our_own_echo_into_a_phantom_self_conflict
   s.note_park_entry();
   s.handle_datagram(
     Family::V4,
-    &on_link(Some(unstepped.wall - Duration::from_secs(1))),
+    &on_link(unstepped.wall - Duration::from_secs(1)),
     &body,
   );
   assert_eq!(
@@ -4972,7 +4972,7 @@ fn inject_ptr_query(s: &mut State, src: core::net::SocketAddr, t: StdInstant) {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255), // §11 on-link
-    None,
+    RxEvidence::none(),
     n,
   );
   let _ = t;
@@ -5374,7 +5374,7 @@ fn a_credit_sealed_before_the_park_expires_across_it_and_cannot_suppress_a_peer(
       Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
       1,
       Some(255),
-      Some(SystemTime::now()),
+      RxEvidence::from_stamp_for_test(SystemTime::now()),
       body.len(),
     );
     s.handle_datagram(family, &meta, &body);
@@ -5460,7 +5460,7 @@ fn the_seal_predates_the_park_and_the_generation_proves_it() {
       Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
       1,
       Some(255),
-      Some(SystemTime::now()),
+      RxEvidence::from_stamp_for_test(SystemTime::now()),
       body.len(),
     );
     s.handle_datagram(family, &meta, &body);
@@ -5521,7 +5521,7 @@ fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
       Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
       1,
       Some(255),
-      None,
+      RxEvidence::none(),
       body.len(),
     )
   };

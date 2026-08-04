@@ -200,6 +200,62 @@ impl<'a> CMsgBuilder<'a> {
     Ok(())
   }
 
+  /// Append a cmsg whose payload is already a **byte image**.
+  ///
+  /// # Why a second path rather than another `push::<T>` caller
+  ///
+  /// [`Self::push`] stores its payload with a *typed* `write_unaligned::<T>`,
+  /// and a typed copy does not preserve padding initializedness: for a `T` that
+  /// has padding — `libc::timeval` is `{ time_t, suseconds_t }`, 12 bytes of
+  /// fields in a 16-byte type on Apple/aarch64 — the destination's padding bytes
+  /// become UNINITIALIZED, and reading the encoded range back as `&[u8]` is then
+  /// undefined behaviour.
+  ///
+  /// **Pre-zeroing the destination does not save it.** [`Self::new`] already
+  /// zeroes the whole buffer, and the typed write de-initializes that padding
+  /// again regardless of what the destination held. That is the trap in the
+  /// obvious fix, which is why the answer is to keep a padded struct out of
+  /// `push::<T>` entirely rather than to prepare the buffer for it.
+  ///
+  /// So a caller whose encoded bytes must stay readable as `[u8]` builds the
+  /// payload field by field, at each `core::mem::offset_of!` position inside a
+  /// zeroed buffer, and hands the result here. Copying `[u8]` to `[u8]`
+  /// initializes every byte it writes and de-initializes nothing.
+  ///
+  /// The header setup mirrors [`Self::push`] line for line, `CMSG_DATA`
+  /// included, so the two paths cannot drift on where a payload begins.
+  #[cfg(test)]
+  pub(crate) fn push_bytes(
+    &mut self,
+    level: libc::c_int,
+    ty: libc::c_int,
+    payload: &[u8],
+  ) -> Result<(), ()> {
+    // SAFETY: CMSG_SPACE is a pure macro over its size argument; no pointers.
+    let space = unsafe { libc::CMSG_SPACE(payload.len() as u32) } as usize;
+    let end = self.cursor.checked_add(space).ok_or(())?;
+    if end > self.buf.len() {
+      return Err(());
+    }
+    // SAFETY: `space` is bounds-checked above and `new()` enforced the buffer's
+    // `cmsghdr` alignment, so the header store is aligned. The header fields are
+    // assigned INDIVIDUALLY rather than by storing a whole `cmsghdr` value: a
+    // whole-struct store would de-initialize `cmsghdr`'s own padding (musl's
+    // `__pad1`) exactly the way `push`'s typed payload store does. The payload
+    // is then a byte-to-byte `copy_nonoverlapping` out of an initialized slice,
+    // which can neither require nor destroy initializedness anywhere.
+    unsafe {
+      let hdr = self.buf.as_mut_ptr().add(self.cursor) as *mut cmsghdr;
+      (*hdr).cmsg_len = libc::CMSG_LEN(payload.len() as u32) as _;
+      (*hdr).cmsg_level = level;
+      (*hdr).cmsg_type = ty;
+      let data = libc::CMSG_DATA(hdr);
+      core::ptr::copy_nonoverlapping(payload.as_ptr(), data, payload.len());
+    }
+    self.cursor = end;
+    Ok(())
+  }
+
   /// Consume the builder and return the number of bytes written, i.e. the
   /// `msg_controllen` value to hand to `sendmsg`.
   #[inline]
@@ -326,11 +382,15 @@ pub(super) fn enable_recv_cmsgs(sock: &std::net::UdpSocket) -> std::io::Result<(
     set_int(fd, libc::IPPROTO_IP, libc::IP_RECVTTL, on)?;
   }
   // SO_TIMESTAMP[NS] — kernel rx time for ordered self-send classification.
-  // Family-agnostic (`SOL_SOCKET`); best-effort, the recv path degrades to
-  // read-time when it is absent. We ENABLE via the SO_* sockopt (the kernel
-  // then tags the received cmsg with the matching SCM_* type, which
-  // `decode_unix_cmsgs` matches). `recv_timestamp_ns` selects the nanosecond
-  // SO_TIMESTAMPNS (Linux/Android) over the microsecond SO_TIMESTAMP.
+  // Family-agnostic (`SOL_SOCKET`); best-effort, and a socket without it simply
+  // yields no evidence, degrading the self-send match rather than breaking it.
+  // We ENABLE via the SO_* sockopt; the kernel then tags the received cmsg with
+  // the matching SCM_* type, which `hick-udp` — not this crate — decodes out of
+  // the control buffer (see `RxEvidence::from_cmsgs` in `Socket::recv`).
+  // `recv_timestamp_ns` selects the nanosecond SO_TIMESTAMPNS (Linux/Android)
+  // over the microsecond SO_TIMESTAMP; `hick-udp`'s matching cfg selects the
+  // SCM_* type it looks for, and both crates emit that cfg from the same
+  // build.rs matrix.
   #[cfg(all(has_recv_timestamp, recv_timestamp_ns))]
   set_int(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, on).ok();
   #[cfg(all(has_recv_timestamp, not(recv_timestamp_ns)))]
@@ -437,46 +497,14 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta) {
         let v = unsafe { core::ptr::read_unaligned(c.data::<libc::c_int>()) };
         meta.hop_limit = Some(v as u8);
       }
-      // Kernel receive timestamp. The kernel tags the cmsg with the SCM_* TYPE,
-      // which is NOT always equal to the SO_* sockopt used to enable it
-      // (Linux happens to share values; on Darwin/BSD SCM_TIMESTAMP == 0x02 !=
-      // SO_TIMESTAMP). Match the SCM_* type the kernel actually delivers.
-      // `recv_timestamp_ns` selects the nanosecond SCM_TIMESTAMPNS (timespec,
-      // Linux/Android) over the microsecond SCM_TIMESTAMP (timeval, Apple/BSD).
-      #[cfg(all(has_recv_timestamp, recv_timestamp_ns))]
-      (libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS) => {
-        if c.data_len() < core::mem::size_of::<libc::timespec>() {
-          continue;
-        }
-        // SAFETY: kernel writes a `timespec` for `SCM_TIMESTAMPNS`, and the
-        // length guard above ensures at least `size_of::<timespec>()` payload
-        // bytes are present before this read.
-        let ts = unsafe { core::ptr::read_unaligned(c.data::<libc::timespec>()) };
-        // Checked arithmetic so a garbage `tv_sec`/`tv_nsec` declines the stamp
-        // (leaving `kernel_rx_time` untouched) instead of panicking the driver.
-        let nanos = u32::try_from(ts.tv_nsec).unwrap_or(0).min(999_999_999);
-        if let Ok(secs) = u64::try_from(ts.tv_sec) {
-          meta.kernel_rx_time =
-            std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, nanos));
-        }
-      }
-      #[cfg(all(has_recv_timestamp, not(recv_timestamp_ns)))]
-      (libc::SOL_SOCKET, libc::SCM_TIMESTAMP) => {
-        if c.data_len() < core::mem::size_of::<libc::timeval>() {
-          continue;
-        }
-        // SAFETY: kernel writes a `timeval` for `SCM_TIMESTAMP`, and the length
-        // guard above ensures at least `size_of::<timeval>()` payload bytes are
-        // present before this read.
-        let tv = unsafe { core::ptr::read_unaligned(c.data::<libc::timeval>()) };
-        // Checked arithmetic so a garbage `tv_sec`/`tv_usec` declines the stamp
-        // (leaving `kernel_rx_time` untouched) instead of panicking the driver.
-        let micros = u32::try_from(tv.tv_usec).unwrap_or(0).min(999_999);
-        if let Ok(secs) = u64::try_from(tv.tv_sec) {
-          meta.kernel_rx_time =
-            std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, micros * 1000));
-        }
-      }
+      // The kernel receive-timestamp cmsg is deliberately NOT decoded here.
+      // `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS` is one wire format, `hick-udp` already
+      // reads it, and `Socket::recv` hands it this same buffer through
+      // `RxEvidence::from_cmsgs`. Two readings of one kernel ABI drift silently
+      // — a wrong stamp still type-checks — and that is the cost this crate
+      // stopped paying. It does NOT make the resulting evidence checkable: that
+      // is still a caller contract, discharged at the `from_cmsgs` call site.
+      // An arm added back here would re-take the cost and buy nothing.
       _ => {}
     }
   }
@@ -523,12 +551,125 @@ async fn from_std_enables_cmsgs_on_v4_socket() {
   );
 }
 
+/// The kernel receive-timestamp payload as a **byte image**: `libc::timespec`
+/// on Linux/Android, `libc::timeval` on Apple/BSD, with every byte initialized.
+///
+/// Assembled field by field at each `core::mem::offset_of!` position inside a
+/// zeroed buffer; the struct never exists as a value at all. That is a
+/// soundness requirement rather than a style choice. On Apple/aarch64
+/// `libc::timeval` is `{ time_t, suseconds_t }` — 12 bytes of fields in a
+/// 16-byte type — so a struct literal leaves four TAIL-PADDING bytes
+/// uninitialized, and any *typed* store of such a value (`write_unaligned::<T>`,
+/// which is what [`CMsgBuilder::push`] does) carries that uninitializedness into
+/// the control buffer. Reading the encoded range back as `&[u8]` is then
+/// undefined behaviour.
+///
+/// **Zeroing the destination first does not help.** A typed copy does not
+/// preserve padding initializedness, so the padding is de-initialized again
+/// whatever the destination held — which is exactly why the fix is to keep the
+/// padded struct out of the typed path rather than to prepare the buffer for it.
+///
+/// # Which targets actually pad, measured rather than assumed
+///
+/// It is not an Apple quirk and it is not the whole `timeval` family either, so
+/// neither "it is only Darwin" nor "it is only `timeval`" is a safe shortcut:
+///
+/// * `aarch64-apple-darwin` — `timeval` **pads**, 12 bytes of fields in 16
+///   (`suseconds_t` is `i32` beside an `i64` `time_t`);
+/// * `x86_64-unknown-netbsd` — `timeval` **pads**, for the same reason;
+/// * `x86_64-unknown-freebsd` — `timeval` does NOT pad; `suseconds_t` is 8 bytes
+///   there, so the fields tile the struct;
+/// * `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-musl` — `timespec` does
+///   NOT pad, two 8-byte fields in 16.
+///
+/// This construction does not consult that table — it is padding-correct either
+/// way, which is the point of writing at `offset_of!` into zeroed bytes rather
+/// than reasoning per target. The table is here so a future reader knows the
+/// hazard is real on more than one supported target, and
+/// `timestamp_payload_padding_is_measured_not_assumed` keeps the numbers honest
+/// on whatever target actually runs.
+#[cfg(all(unix, has_recv_timestamp, test))]
+fn ts_payload_bytes(secs: i64, sub: i64) -> Vec<u8> {
+  #[cfg(recv_timestamp_ns)]
+  use libc::timespec as TsPayload;
+  #[cfg(not(recv_timestamp_ns))]
+  use libc::timeval as TsPayload;
+
+  let mut buf = vec![0u8; core::mem::size_of::<TsPayload>()];
+  {
+    let mut put = |offset: usize, bytes: &[u8]| {
+      buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+    };
+    put(
+      core::mem::offset_of!(TsPayload, tv_sec),
+      &(secs as libc::time_t).to_ne_bytes(),
+    );
+    #[cfg(recv_timestamp_ns)]
+    put(
+      core::mem::offset_of!(TsPayload, tv_nsec),
+      &(sub as libc::c_long).to_ne_bytes(),
+    );
+    #[cfg(not(recv_timestamp_ns))]
+    put(
+      core::mem::offset_of!(TsPayload, tv_usec),
+      &(sub as libc::suseconds_t).to_ne_bytes(),
+    );
+  }
+  buf
+}
+
+/// Which of the two layouts this target uses, and whether it has tail padding —
+/// measured rather than assumed, because the whole padding defect turns on it
+/// and a target that quietly grew padding would otherwise re-open it silently.
+///
+/// This asserts nothing about *which* answer is right: [`ts_payload_bytes`] is
+/// correct either way. It exists so the answer is on the record per target — on
+/// Apple/aarch64 `timeval` is 16 bytes over 12 bytes of fields (4 padding) while
+/// `timespec` is 16 over 16 (none).
+#[cfg(all(unix, has_recv_timestamp, test))]
+#[test]
+fn timestamp_payload_padding_is_measured_not_assumed() {
+  #[cfg(not(recv_timestamp_ns))]
+  let (name, size, fields) = (
+    "timeval",
+    core::mem::size_of::<libc::timeval>(),
+    core::mem::size_of::<libc::time_t>() + core::mem::size_of::<libc::suseconds_t>(),
+  );
+  #[cfg(recv_timestamp_ns)]
+  let (name, size, fields) = (
+    "timespec",
+    core::mem::size_of::<libc::timespec>(),
+    core::mem::size_of::<libc::time_t>() + core::mem::size_of::<libc::c_long>(),
+  );
+  assert!(
+    fields <= size,
+    "{name}: fields ({fields}) cannot exceed the struct ({size})"
+  );
+  // The byte image must cover the WHOLE struct, padding included, or the bytes
+  // handed to `push_bytes` would be short of `CMSG_LEN`'s payload length.
+  assert_eq!(
+    ts_payload_bytes(1, 2).len(),
+    size,
+    "{name}: the byte image must span the struct, not just its fields"
+  );
+  println!(
+    "{name}: size={size} fields={fields} padding={}",
+    size - fields
+  );
+}
+
 /// Build a minimal control buffer containing a single SOL_SOCKET receive-
 /// timestamp cmsg (the SCM_* TYPE the kernel actually delivers — and that
 /// `decode_unix_cmsgs` matches), then iterate it and verify level/type/data.
 /// The constant + payload are chosen by `recv_timestamp_ns`: nanosecond
 /// SCM_TIMESTAMPNS/timespec on Linux/Android, microsecond SCM_TIMESTAMP/timeval
 /// on Apple/BSD.
+///
+/// The buffer is built by hand rather than through [`CMsgBuilder`] on purpose:
+/// this is `CMsgIter`'s test, and routing it through the builder would make the
+/// two halves of one round trip prove each other. What it does share is
+/// [`ts_payload_bytes`] — the payload goes in as an initialized byte image and
+/// is copied byte-to-byte, never stored as a padded struct value.
 #[cfg(all(unix, has_recv_timestamp, test))]
 #[test]
 fn cmsg_iter_walks_a_single_timestamp_cmsg() {
@@ -537,17 +678,9 @@ fn cmsg_iter_walks_a_single_timestamp_cmsg() {
   #[cfg(recv_timestamp_ns)]
   use libc::{SCM_TIMESTAMPNS as TS_TYPE, timespec as TsPayload};
   use libc::{SOL_SOCKET, cmsghdr};
-  #[cfg(recv_timestamp_ns)]
-  let payload = TsPayload {
-    tv_sec: 1234,
-    tv_nsec: 56,
-  };
-  #[cfg(not(recv_timestamp_ns))]
-  let payload = TsPayload {
-    tv_sec: 1234,
-    tv_usec: 56,
-  };
-  let payload_bytes = core::mem::size_of::<TsPayload>();
+  let payload = ts_payload_bytes(1234, 56);
+  let payload_bytes = payload.len();
+  assert_eq!(payload_bytes, core::mem::size_of::<TsPayload>());
   let total = unsafe { libc::CMSG_SPACE(payload_bytes as u32) } as usize;
   // Use a u64-backed allocation to guarantee at least 8-byte alignment,
   // which covers every cmsghdr alignment on supported targets. A plain
@@ -560,18 +693,33 @@ fn cmsg_iter_walks_a_single_timestamp_cmsg() {
   // borrowed for the lifetime of this scope.
   let buf: &mut [u8] =
     unsafe { core::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), total) };
-  // SAFETY: buf is correctly sized and zero-initialised; we write a valid cmsghdr.
-  // The header pointer is aligned (Vec<u64> backing), but CMSG_DATA may be
-  // under-aligned for the payload type (`timeval` on macOS), so use
-  // `write_unaligned` to match the eventual `read_unaligned` below.
+  // SAFETY: buf is correctly sized and zero-initialised; we write a valid
+  // cmsghdr. The header pointer is aligned (Vec<u64> backing). Its fields are
+  // assigned INDIVIDUALLY, never by storing a whole `cmsghdr` value, so the
+  // header's own padding (musl's `__pad1`) keeps the zeroes above. The payload
+  // is a byte-to-byte `copy_nonoverlapping` out of an initialized slice, which
+  // needs no alignment and — unlike the `write_unaligned::<TsPayload>` this
+  // replaced — cannot de-initialize the struct's tail padding. See
+  // `ts_payload_bytes`.
   unsafe {
     let hdr = buf.as_mut_ptr() as *mut cmsghdr;
     (*hdr).cmsg_len = libc::CMSG_LEN(payload_bytes as u32) as _;
     (*hdr).cmsg_level = SOL_SOCKET;
     (*hdr).cmsg_type = TS_TYPE;
-    let data = libc::CMSG_DATA(hdr) as *mut TsPayload;
-    core::ptr::write_unaligned(data, payload);
+    let data = libc::CMSG_DATA(hdr);
+    core::ptr::copy_nonoverlapping(payload.as_ptr(), data, payload_bytes);
   }
+  // Every encoded byte must be genuinely INITIALIZED, not merely zero. Only a
+  // real per-byte read asserts that: the walk below reads the header fields and
+  // then the payload as a typed `TsPayload`, and a typed read does not require
+  // padding to be initialized — so without this loop the uninitialized-padding
+  // regression is invisible here. Under Miri this is the regression test; in a
+  // normal build it is a cheap checksum.
+  let mut acc: u64 = 0;
+  for b in buf.iter() {
+    acc = acc.wrapping_add(u64::from(*b));
+  }
+  assert!(acc > 0, "the encoded cmsg must not be all-zero");
   let mut iter = CMsgIter::new(buf);
   let first = iter.next().expect("one cmsg");
   assert_eq!(first.level(), SOL_SOCKET);
@@ -688,76 +836,83 @@ fn truncated_pktinfo_cmsg_is_skipped_not_read() {
   );
 }
 
-/// An absurd, malformed timestamp cmsg must not panic the decoder. Two
-/// panic vectors are exercised at once: `tv_sec = i64::MAX` (which the old
-/// `UNIX_EPOCH + Duration` `Add` could overflow-panic on) and an
-/// out-of-range sub-second field (`tv_nsec`/`tv_usec` far past its modulus,
-/// which the old `Duration::new(secs, nanos)` could carry-overflow-panic on).
-/// The checked/clamped arithmetic must absorb both: reaching the final
-/// assertion at all proves no panic. We then require `kernel_rx_time` to be
-/// well-defined — either declined (`None`, if the platform's `SystemTime`
-/// range overflowed) or a valid stamp — but never a panic.
+/// The receive-timestamp cmsg is `hick-udp`'s to read, and this crate must not
+/// grow a second reading of it.
 ///
-/// Note: we do *not* hard-assert `None`. `tv_sec`/`tv_nsec` are `i64`/`i64`
-/// (`time_t`), and on Linux/Darwin `UNIX_EPOCH.checked_add(Duration::new(
-/// i64::MAX as u64, _))` stays in range and returns `Some`; `None` is only
-/// reachable with a seconds value larger than `i64` can hold, which a real
-/// kernel timestamp field cannot carry. The fix's guarantee is "no panic",
-/// not a forced `None`.
+/// Both halves are asserted over the SAME bytes: `decode_unix_cmsgs` walks a
+/// buffer carrying a perfectly good timestamp cmsg and must leave
+/// `RecvMeta::rx` exactly as `RecvMeta::empty` set it, while
+/// `RxEvidence::from_cmsgs` — the constructor `Socket::recv` routes that buffer
+/// through — must be what recovers the stamp. An arm added back to the decoder
+/// fails the first assertion; a `Socket::recv` that stopped calling
+/// `from_cmsgs` would leave the driver claiming self-sends on `Degraded`
+/// evidence forever, which nothing louder than the second assertion detects.
+///
+/// Malformed and absurd payloads are not retried here. That parser has one
+/// implementation now and `hick-udp` tests it against `i64::MAX` in both
+/// fields; re-proving it from this side is the duplication this change removed.
 #[cfg(all(unix, has_recv_timestamp, test))]
 #[test]
-fn absurd_timestamp_does_not_panic() {
+fn timestamp_cmsg_is_decoded_by_hick_udp_and_not_by_this_crate() {
+  use hick_udp::selfsend::RxEvidence;
   use libc::{SOL_SOCKET, cmsghdr};
 
-  // Use the SCM_* TYPE the decoder now matches (the kernel-delivered cmsg
-  // type), selected by `recv_timestamp_ns` like the decode arms.
+  // The SCM_* TYPE the kernel delivers, selected by `recv_timestamp_ns` exactly
+  // as `hick-udp`'s parser selects the type it looks for — both cfgs come from
+  // the same build.rs matrix, which is what keeps the two crates in step.
   #[cfg(not(recv_timestamp_ns))]
   use libc::{SCM_TIMESTAMP as TS_TYPE, timeval as TsPayload};
   #[cfg(recv_timestamp_ns)]
   use libc::{SCM_TIMESTAMPNS as TS_TYPE, timespec as TsPayload};
 
-  // `tv_sec = i64::MAX` plus an out-of-range sub-second value: the latter is
-  // exactly the input `Duration::new` would reject by panicking (nanos must
-  // be < 1e9), so the decoder's clamp is what keeps this sound.
-  #[cfg(recv_timestamp_ns)]
-  let payload = TsPayload {
-    tv_sec: i64::MAX,
-    tv_nsec: i64::MAX,
-  };
-  #[cfg(not(recv_timestamp_ns))]
-  let payload = TsPayload {
-    tv_sec: i64::MAX as _,
-    tv_usec: i64::MAX as _,
+  // The payload goes in as an initialized BYTE IMAGE and never exists as a
+  // padded `TsPayload` value — see `ts_payload_bytes` for why that is a
+  // soundness requirement rather than a style choice, and `push_bytes` for why
+  // the builder needs a second path to accept it. Both assertions below read the
+  // encoded range as `&[u8]`, which is undefined behaviour over an
+  // uninitialized byte.
+  let payload = ts_payload_bytes(1_700_000_000, 123_456);
+  assert_eq!(payload.len(), core::mem::size_of::<TsPayload>());
+
+  // `vec![0u8; _]` is only alignment 1, which `CMsgBuilder::new` refuses; back
+  // the buffer with a `Vec<u64>` for ≥8-byte alignment as the tests above do.
+  const TOTAL: usize = 128;
+  assert!(core::mem::align_of::<cmsghdr>() <= core::mem::align_of::<u64>());
+  let mut backing: Vec<u64> = vec![0u64; TOTAL / core::mem::size_of::<u64>()];
+  // SAFETY: backing owns `TOTAL` zeroed bytes; the slice fits inside the
+  // allocation and stays borrowed for this scope.
+  let buf: &mut [u8] =
+    unsafe { core::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), TOTAL) };
+  let written = {
+    let mut b = CMsgBuilder::new(buf);
+    b.push_bytes(SOL_SOCKET, TS_TYPE, &payload).expect("fits");
+    b.finish()
   };
 
-  let payload_bytes = core::mem::size_of::<TsPayload>();
-  let total = unsafe { libc::CMSG_SPACE(payload_bytes as u32) } as usize;
-  assert!(core::mem::align_of::<cmsghdr>() <= core::mem::align_of::<u64>());
-  let words = total.div_ceil(core::mem::size_of::<u64>());
-  let mut backing: Vec<u64> = vec![0u64; words.max(1)];
-  // SAFETY: backing owns `words * 8 >= total` zeroed bytes; the slice fits
-  // inside the allocation and stays borrowed for this scope.
-  let buf: &mut [u8] =
-    unsafe { core::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), total) };
-  // SAFETY: buf is correctly sized and zero-initialised; we write a valid
-  // header and an absurd-but-well-formed payload via `write_unaligned`
-  // (CMSG_DATA may be under-aligned for the payload type on some targets).
-  unsafe {
-    let hdr = buf.as_mut_ptr() as *mut cmsghdr;
-    (*hdr).cmsg_len = libc::CMSG_LEN(payload_bytes as u32) as _;
-    (*hdr).cmsg_level = SOL_SOCKET;
-    (*hdr).cmsg_type = TS_TYPE;
-    let data = libc::CMSG_DATA(hdr) as *mut TsPayload;
-    core::ptr::write_unaligned(data, payload);
+  // Every byte of the encoded cmsg must be genuinely INITIALIZED, not merely
+  // zero — the distinction the padding defect turns on, and one that only a
+  // real per-byte read can assert. A `to_vec`/`copy_from_slice` would propagate
+  // uninitializedness instead of tripping over it, and the two assertions below
+  // would not catch it either: `decode_unix_cmsgs` skips this cmsg and
+  // `parse_rx_time` reads it back as a typed `timeval`, neither of which needs
+  // the padding initialized. Under Miri this loop is the whole regression test;
+  // in a normal build it is a cheap checksum.
+  let mut acc: u64 = 0;
+  for b in &buf[..written] {
+    acc = acc.wrapping_add(u64::from(*b));
   }
+  assert!(acc > 0, "the encoded cmsg must not be all-zero");
+
   let mut meta = RecvMeta::empty(([0u8, 0, 0, 0], 0).into());
-  // Must return without panicking despite the absurd seconds + out-of-range
-  // sub-second field. Reaching the line after this call is the proof.
-  decode_unix_cmsgs(buf, &mut meta);
-  if let Some(t) = meta.kernel_rx_time {
-    // If a stamp was produced it must be a real `SystemTime` (no panic in
-    // `duration_since` either); the exact value is unspecified for garbage
-    // input, we only require well-definedness.
-    let _ = t.duration_since(std::time::UNIX_EPOCH);
-  }
+  decode_unix_cmsgs(&buf[..written], &mut meta);
+  assert_eq!(
+    meta.rx,
+    RxEvidence::none(),
+    "this crate's decoder must not read the timestamp cmsg for itself"
+  );
+  assert_ne!(
+    RxEvidence::from_cmsgs(&buf[..written]),
+    RxEvidence::none(),
+    "hick-udp's parse, over the very same bytes, is what must recover it"
+  );
 }
