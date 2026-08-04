@@ -36,10 +36,21 @@ fn http_service(instance: &str) -> ServiceSpec {
   ServiceSpec::new(recs)
 }
 
-/// A registered service must complete probing and reach `Established` (or
-/// `Renamed` if a looped-back probe triggers the simultaneous-probe tiebreak —
-/// both mean probing finished and the service is advertised). Probing is
-/// timer-driven, so this resolves without depending on cross-socket delivery.
+/// A registered service must complete probing and reach `Established`, or
+/// report `Renamed` if a looped-back probe is treated as a simultaneous-probe
+/// tiebreak.
+///
+/// `Renamed` does NOT mean the service is advertised — it is emitted at the
+/// rename DECISION, which sends the service back to `Init` to probe the new
+/// label from scratch (`mdns-proto`'s
+/// `renamed_update_means_probing_restarted_not_advertised` pins that). It is
+/// accepted here only as evidence that the lifecycle ran, and nothing below
+/// depends on the service actually being advertised. A caller that needs
+/// "advertised" must wait for `Established`, the way
+/// `hick-mio/tests/loopback.rs`'s `advertise` helper does.
+///
+/// Probing is timer-driven, so this resolves without depending on cross-socket
+/// delivery.
 #[compio::test]
 async fn registered_service_reaches_advertised_state() {
   let Some(ep) = common::loopback_v4_endpoint().await else {
