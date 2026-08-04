@@ -21,9 +21,15 @@
 mod common;
 
 use std::{
-  net::{IpAddr, Ipv4Addr, Ipv6Addr},
-  time::{Duration, Instant},
+  net::{IpAddr, Ipv6Addr},
+  time::Duration,
 };
+// `Ipv4Addr` and `Instant` are reached only from the `#[cfg(unix)]` witness
+// below (`MDNS_GROUP`, `to_in_addr`, `select_multicast_egress`,
+// `LoopbackWitness`); gate any new user onto them too, or these go dead under
+// `-D warnings` on non-unix targets again.
+#[cfg(unix)]
+use std::{net::Ipv4Addr, time::Instant};
 
 use hick_reactor::{
   CollectedAnswer, Name, QueryEvent, QueryParam, QuerySpec, ServerOptions, Service, ServiceRecords,
@@ -198,6 +204,7 @@ async fn run_query(
 /// The mDNS multicast group. Restated here, deliberately, rather than
 /// imported from hick — this witness must not be able to inherit a defect in
 /// hick's own constant.
+#[cfg(unix)]
 const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 
 /// Why [`LoopbackWitness`] could not settle the question.
