@@ -68,8 +68,8 @@ fn destination_is_ipi_addr_while_local_ip_stays_ipi_spec_dst() {
   let peer: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5353).into();
   let meta = parse_pktinfo_v4(&cmsgs, 200, peer).unwrap();
   assert_eq!(
-    meta.destination(),
-    Some(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
+    meta.destination_witness(),
+    crate::onlink::DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
     "destination must be ipi_addr, the group the sender addressed"
   );
   assert_eq!(
@@ -77,7 +77,10 @@ fn destination_is_ipi_addr_while_local_ip_stays_ipi_spec_dst() {
     IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
     "local_ip must stay ipi_spec_dst on the very same buffer"
   );
-  assert_ne!(Some(meta.local_ip()), meta.destination());
+  assert_ne!(
+    crate::onlink::DestinationWitness::Witnessed(meta.local_ip()),
+    meta.destination_witness()
+  );
   // Nothing sets the flag on this path: the PKTINFO parsers never see
   // `msg_flags`, and `None` is "no such flag here", not "unicast".
   assert_eq!(meta.delivery(), None);
@@ -414,12 +417,17 @@ fn rx_evidence_from_cmsgs_carries_the_same_stamp_as_from_meta() {
 
   let buf = synth_rx_timestamp_cmsg(1_700_000_000, 123_456);
   let stamp = parse_rx_time(&buf).expect("a well-formed timestamp cmsg must parse");
+  // The witnesses are BLIND rather than absent-for-a-reason, and that is the
+  // honest filler: this `RecvMeta` exists only to carry the stamp to
+  // `RxEvidence::from_meta`, and RFC 6762 §11 reads neither witness on this
+  // path. A `Lost` or `Declined` here would assert something about a kernel that
+  // never ran.
   let meta = RecvMeta::new(
     0,
     std::net::SocketAddr::from(([127, 0, 0, 1], 5353)),
     std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-    None,
-    0,
+    crate::onlink::DestinationWitness::blind(),
+    crate::onlink::IfaceWitness::blind(),
     Some(stamp),
   );
   assert_eq!(
@@ -1287,4 +1295,45 @@ fn scan_netbsd_pktinfo_is_none_without_its_own_cmsg() {
     (libc::IPPROTO_IP, libc::IP_TTL, &ttl.to_ne_bytes()),
   ]);
   assert_eq!(scan_netbsd_pktinfo(&unrelated, IP_PKTINFO_TY_NETBSD), None);
+}
+
+/// A kernel that emits `IP_PKTINFO` but names NO interface is a decline, not a
+/// failed proof — and its destination is still witnessed.
+///
+/// Linux reaches this: `ipv4_pktinfo_prepare` (`net/ipv4/ip_sockglue.c`) sets
+/// `pktinfo->ipi_ifindex = 0` and `ipi_spec_dst = 0` in its `else` branch, taken
+/// when `skb_rtable(skb)` is `NULL`, while `ip_cmsg_recv_pktinfo` fills
+/// `info.ipi_addr` from `ip_hdr(skb)->daddr` regardless. Apple's
+/// `ip6_savecontrol_v4` has the same shape:
+/// `pi6.ipi6_ifindex = (m && m->m_pkthdr.rcvif) ? m->m_pkthdr.rcvif->if_index : 0`.
+///
+/// It is the ONLY form of `Declined` reachable on those two platforms — an
+/// absent cmsg is not a state either produces, because Linux's `put_cmsg` writes
+/// into the caller's own buffer and flags `MSG_CTRUNC`, and Apple returns
+/// `ENOBUFS` and drops the datagram. So this is where the RFC 6762 §11 widening
+/// actually lands there, and it is much narrower than a blind square: the
+/// destination partition still runs in full and only the link scoping is lost.
+#[cfg(has_ip_pktinfo)]
+#[test]
+fn a_present_pktinfo_naming_no_interface_declines_rather_than_failing_a_proof() {
+  let cmsgs = synth_cmsg_v4(Ipv4Addr::new(192, 168, 1, 100), 0);
+  let peer: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5353).into();
+  let meta = parse_pktinfo_v4(&cmsgs, 200, peer).expect("a present cmsg parses");
+
+  assert_eq!(
+    meta.iface_witness(),
+    crate::onlink::IfaceWitness::Declined,
+    "a zero ipi_ifindex inside a PRESENT cmsg is the kernel answering \"I do \
+     not know which interface\" — nothing was lost on our side, and a bigger \
+     control buffer would not change it"
+  );
+  assert_eq!(
+    meta.destination_witness(),
+    crate::onlink::DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
+    "and the DESTINATION off the same cmsg is untouched, so §11's destination \
+     partition still decides in full"
+  );
+  // Not `Lost`: that is reserved for `MSG_CTRUNC`, which rides on the message
+  // header and which a parser defined over a byte slice cannot even observe.
+  assert_ne!(meta.iface_witness(), crate::onlink::IfaceWitness::Lost);
 }

@@ -1,10 +1,56 @@
-use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use core::{
+  net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+  num::NonZeroU32,
+};
 
 use super::{
-  BoundLink, LinkDelivery, addr_in_subnet, admits_ingress, arrived_on_bound_interface,
-  collect_local_subnets, is_loopback_interface, is_mdns_group, reports_rx_interface,
-  src_on_local_link,
+  Admit, BoundLink, DestinationWitness, IfaceWitness, LinkDelivery, Refuse, Verdict,
+  addr_in_subnet, admits_ingress, arrived_on_bound_interface, collect_local_subnets,
+  is_loopback_interface, is_mdns_group, reports_rx_interface, src_on_local_link,
 };
+
+/// `n` as a WITNESSED interface index.
+///
+/// Spelled with a `match` rather than `unwrap`: this crate denies
+/// `clippy::unwrap_used` everywhere, tests included. A zero would be a fixture
+/// bug, and [`IfaceWitness::Lost`] is the value that cannot silently widen the
+/// gate if one ever appeared.
+fn witnessed(n: u32) -> IfaceWitness {
+  match NonZeroU32::new(n) {
+    Some(idx) => IfaceWitness::Witnessed(idx),
+    None => IfaceWitness::Lost,
+  }
+}
+
+/// The pre-witness `(pkt_iface, iface_reported)` pair, as the witness a receive
+/// path of that shape mints — `(n, _) => Witnessed(n)`, `(0, true) => Lost`,
+/// `(0, false) => Blind`.
+///
+/// It exists so the cases written before the witnesses existed keep asserting
+/// EXACTLY what they asserted: `(0, true)` was the pair that refused, and `Lost`
+/// is the witness that refuses. Nothing here maps onto
+/// [`IfaceWitness::Declined`], which is a state the old pair could not express —
+/// the enumeration covers that one from its own literals.
+fn ifw(pkt_iface: u32, iface_reported: bool) -> IfaceWitness {
+  match (NonZeroU32::new(pkt_iface), iface_reported) {
+    (Some(idx), _) => IfaceWitness::Witnessed(idx),
+    (None, true) => IfaceWitness::Lost,
+    (None, false) => IfaceWitness::Blind,
+  }
+}
+
+/// The pre-witness `Option<IpAddr>` destination, as the witness a receive path
+/// mints for it: a recovered address is `Witnessed`, and `None` is the path that
+/// recovers none by construction.
+///
+/// As with [`ifw`], `None` maps to the state the old value BEHAVED as — a
+/// structurally blind square — so no case written under it changes meaning.
+fn dstw(destination: Option<IpAddr>) -> DestinationWitness {
+  match destination {
+    Some(dst) => DestinationWitness::Witnessed(dst),
+    None => DestinationWitness::Blind,
+  }
+}
 
 /// The interface this fixture's endpoint is pinned to.
 const BOUND: u32 = 5;
@@ -137,6 +183,22 @@ const UNSPECIFIED_V6_DST: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 const V4_GROUP: IpAddr = IpAddr::V4(crate::constants::MDNS_IPV4_GROUP);
 const V6_GROUP: IpAddr = IpAddr::V6(crate::constants::MDNS_IPV6_GROUP);
 
+/// The IPv4 mDNS group wearing an IPv4-MAPPED IPv6 address: `::ffff:224.0.0.251`.
+///
+/// It is neither of the two groups above — `V6_GROUP` is `ff02::fb` — and
+/// `Ipv6Addr::is_multicast` answers **false** for it, because `::ffff:0:0/96` is
+/// not `ff00::/8`. So a partition that sorted IPv6 destinations into "group" and
+/// "everything else" would put an mDNS group into "everything else" without ever
+/// naming it, which is the exact shape four review rounds kept finding.
+///
+/// It is unreachable on this workspace's sockets: `IPV6_V6ONLY` is set at bind
+/// on Unix (`platform/unix.rs`) and on Windows (`platform/windows.rs`), so no
+/// v4-mapped datagram is delivered to them. That is a reason to CLASSIFY it —
+/// the rule must not depend on a sockopt three files away for its partition to
+/// be exhaustive — and not a reason to leave it in a terminal bucket.
+const V4_MAPPED_GROUP_DST: IpAddr =
+  IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xe000, 0x00fb));
+
 /// Routable sources on prefixes the bound interface does NOT have configured:
 /// the overlaid-subnet host §11 names, which the source-prefix arm cannot admit
 /// and must not be asked to.
@@ -195,17 +257,17 @@ fn admits(
 ) -> bool {
   admits_ingress(
     src,
-    destination,
+    dstw(destination),
     delivery,
     nic(bound, subnets),
-    pkt_iface,
-    true,
+    ifw(pkt_iface, true),
   )
+  .is_admit()
 }
 
 /// [`arrived_on_bound_interface`] for a NIC-bound endpoint.
 fn arrived(src: SocketAddr, bound: u32, pkt_iface: u32, iface_reported: bool) -> bool {
-  arrived_on_bound_interface(src, nic(bound, &[]), pkt_iface, iface_reported)
+  arrived_on_bound_interface(src, nic(bound, &[]), ifw(pkt_iface, iface_reported)).is_none()
 }
 
 /// [`src_on_local_link`] for a NIC-bound endpoint.
@@ -216,7 +278,7 @@ fn on_local_link(
   pkt_iface: u32,
   iface_reported: bool,
 ) -> bool {
-  src_on_local_link(src, nic(bound, subnets), pkt_iface, iface_reported)
+  src_on_local_link(src, nic(bound, subnets), ifw(pkt_iface, iface_reported))
 }
 
 #[test]
@@ -367,14 +429,16 @@ fn link_local_v6_requires_matching_interface() {
   // A foreign witness is stage 1's refusal, not this arm's — §11's second arm
   // asks only about the prefix. Asserted where the question is decided, and
   // with a destination this interface HOLDS, so nothing but stage 1 can refuse.
-  assert!(!admits_ingress(
-    src,
-    Some(LL_UNICAST_V6_DST),
-    None,
-    nic(BOUND, &LL_PREFIXES),
-    OTHER,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      src,
+      DestinationWitness::Witnessed(LL_UNICAST_V6_DST),
+      None,
+      nic(BOUND, &LL_PREFIXES),
+      witnessed(OTHER)
+    )
+    .is_admit()
+  );
   // No witness at all -> REFUSED, whatever the platform can report. A
   // link-local address names some link and never ours, so absent provenance is
   // absent membership: nothing hands a source the link it is claiming.
@@ -393,7 +457,14 @@ fn an_unwitnessed_ipv4_link_local_source_is_refused() {
   for reported in [true, false] {
     assert!(!on_local_link(v4_ll, &[], BOUND, 0, reported));
     assert!(
-      !admits_ingress(v4_ll, None, None, nic(BOUND, &SUBNETS), 0, reported),
+      !admits_ingress(
+        v4_ll,
+        DestinationWitness::Blind,
+        None,
+        nic(BOUND, &SUBNETS),
+        ifw(0, reported)
+      )
+      .is_admit(),
       "an unwitnessed link-local source outside every configured prefix has \
        nothing left to be admitted on"
     );
@@ -412,14 +483,16 @@ fn an_unwitnessed_ipv4_link_local_source_is_refused() {
     false
   ));
   // A contradicting scope refuses at stage 1, prefix or not.
-  assert!(!admits_ingress(
-    scoped(LINK_LOCAL, OTHER),
-    None,
-    None,
-    nic(BOUND, &LL_PREFIXES),
-    0,
-    false
-  ));
+  assert!(
+    !admits_ingress(
+      scoped(LINK_LOCAL, OTHER),
+      DestinationWitness::Blind,
+      None,
+      nic(BOUND, &LL_PREFIXES),
+      IfaceWitness::Blind
+    )
+    .is_admit()
+  );
 }
 
 #[test]
@@ -432,39 +505,45 @@ fn a_link_local_source_must_also_match_on_its_scope_id() {
   let foreign_zone = scoped(LINK_LOCAL, OTHER);
   for reported in [true, false] {
     for pkt_iface in [0, BOUND] {
-      assert!(!admits_ingress(
-        foreign_zone,
-        Some(LL_UNICAST_V6_DST),
-        None,
-        nic(BOUND, &LL_PREFIXES),
-        pkt_iface,
-        reported
-      ));
+      assert!(
+        !admits_ingress(
+          foreign_zone,
+          DestinationWitness::Witnessed(LL_UNICAST_V6_DST),
+          None,
+          nic(BOUND, &LL_PREFIXES),
+          ifw(pkt_iface, reported)
+        )
+        .is_admit()
+      );
     }
   }
   // Our own zone passes stage 1 whether or not an index backs it up, and the
   // prefix then admits.
   for pkt_iface in [0, BOUND] {
-    assert!(admits_ingress(
-      scoped(LINK_LOCAL, BOUND),
-      Some(LL_UNICAST_V6_DST),
-      None,
-      nic(BOUND, &LL_PREFIXES),
-      pkt_iface,
-      true
-    ));
+    assert!(
+      admits_ingress(
+        scoped(LINK_LOCAL, BOUND),
+        DestinationWitness::Witnessed(LL_UNICAST_V6_DST),
+        None,
+        nic(BOUND, &LL_PREFIXES),
+        witnessed(pkt_iface)
+      )
+      .is_admit()
+    );
   }
   // ... and with no matching prefix it is refused even so, because the witness
   // was never an admission ground of its own. The destination is one this
   // interface DOES hold, so the destination test cannot be what refuses.
-  assert!(!admits_ingress(
-    scoped(LINK_LOCAL, BOUND),
-    Some(UNICAST_V6_DST),
-    None,
-    nic(BOUND, &SUBNETS),
-    BOUND,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      scoped(LINK_LOCAL, BOUND),
+      DestinationWitness::Witnessed(UNICAST_V6_DST),
+      None,
+      nic(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 #[test]
@@ -477,15 +556,35 @@ fn loopback_is_on_link_for_a_loopback_bound_endpoint_and_nobody_else() {
     IpAddr::V6(Ipv6Addr::LOCALHOST),
   ] {
     // Matching witness, loopback-bound: our own traffic.
-    assert!(src_on_local_link(peer(ip), lo(BOUND, &[]), BOUND, true));
+    assert!(src_on_local_link(
+      peer(ip),
+      lo(BOUND, &[]),
+      witnessed(BOUND)
+    ));
     // No witness at all, loopback-bound: the exception, and its whole extent.
-    assert!(src_on_local_link(peer(ip), lo(BOUND, &[]), 0, true));
+    assert!(src_on_local_link(
+      peer(ip),
+      lo(BOUND, &[]),
+      IfaceWitness::Lost
+    ));
     // A REPORTED foreign interface outranks the source address, even for the
     // endpoint the exception exists for.
-    assert!(!src_on_local_link(peer(ip), lo(BOUND, &[]), OTHER, true));
+    assert!(!src_on_local_link(
+      peer(ip),
+      lo(BOUND, &[]),
+      witnessed(OTHER)
+    ));
     // And a NIC-bound endpoint has no loopback traffic to protect at all.
-    assert!(!src_on_local_link(peer(ip), nic(BOUND, &[]), BOUND, true));
-    assert!(!src_on_local_link(peer(ip), nic(BOUND, &[]), 0, false));
+    assert!(!src_on_local_link(
+      peer(ip),
+      nic(BOUND, &[]),
+      witnessed(BOUND)
+    ));
+    assert!(!src_on_local_link(
+      peer(ip),
+      nic(BOUND, &[]),
+      IfaceWitness::Blind
+    ));
   }
 }
 
@@ -674,23 +773,23 @@ fn admits_ingress_uses_the_capability_its_caller_states() {
   assert!(
     !admits_ingress(
       on_subnet(),
-      Some(UNICAST_V4_DST),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
       None,
       nic(BOUND, &SUBNETS),
-      0,
-      true
-    ),
+      IfaceWitness::Lost
+    )
+    .is_admit(),
     "a path that DOES report an interface handed us a zero: a failed proof"
   );
   assert!(
     admits_ingress(
       on_subnet(),
-      Some(UNICAST_V4_DST),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
       None,
       nic(BOUND, &SUBNETS),
-      0,
-      false
-    ),
+      IfaceWitness::Blind
+    )
+    .is_admit(),
     "a path with no interface to give is silent, not contradicted — and the \
      source is inside the bound interface's own subnet"
   );
@@ -725,18 +824,10 @@ fn a_bound_interface_of_zero_proves_nothing_and_so_forbids_nothing() {
   //
   // It forbids nothing AT STAGE 1. §11's own arms still decide after it — an
   // unbound endpoint is not an open door.
-  assert!(arrived_on_bound_interface(
-    on_subnet(),
-    nic(0, &[]),
-    OTHER,
-    true
-  ));
-  assert!(arrived_on_bound_interface(
-    scoped(LINK_LOCAL, OTHER),
-    nic(0, &[]),
-    OTHER,
-    true
-  ));
+  assert!(arrived_on_bound_interface(on_subnet(), nic(0, &[]), witnessed(OTHER)).is_none());
+  assert!(
+    arrived_on_bound_interface(scoped(LINK_LOCAL, OTHER), nic(0, &[]), witnessed(OTHER)).is_none()
+  );
   assert!(admits(
     on_subnet(),
     Some(UNICAST_V4_DST),
@@ -780,27 +871,31 @@ fn a_loopback_source_is_admitted_only_by_a_loopback_bound_endpoint() {
     peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
   ] {
-    assert!(arrived_on_bound_interface(src, lo(BOUND, &[]), 0, true));
-    assert!(arrived_on_bound_interface(src, lo(BOUND, &[]), BOUND, true));
+    assert!(arrived_on_bound_interface(src, lo(BOUND, &[]), IfaceWitness::Lost).is_none());
+    assert!(arrived_on_bound_interface(src, lo(BOUND, &[]), witnessed(BOUND)).is_none());
   }
-  assert!(admits_ingress(
-    peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-    Some(UNICAST_V6_DST),
-    None,
-    lo(BOUND, &[]),
-    0,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+      DestinationWitness::Witnessed(UNICAST_V6_DST),
+      None,
+      lo(BOUND, &[]),
+      IfaceWitness::Lost
+    )
+    .is_admit()
+  );
   // The exception is the SOURCE's, not the destination's: it still holds on the
   // unicast arm, with no group destination and no hop limit to carry it.
-  assert!(admits_ingress(
-    peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-    Some(UNICAST_V4_DST),
-    None,
-    lo(BOUND, &[]),
-    0,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      lo(BOUND, &[]),
+      IfaceWitness::Lost
+    )
+    .is_admit()
+  );
 }
 
 #[test]
@@ -816,28 +911,27 @@ fn a_reported_foreign_interface_outranks_a_loopback_source() {
     peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
     scoped(Ipv6Addr::LOCALHOST, OTHER),
   ] {
-    assert!(!arrived_on_bound_interface(
-      src,
-      lo(BOUND, &[]),
-      OTHER,
-      true
-    ));
-    assert!(!admits_ingress(
-      src,
-      Some(UNICAST_V6_DST),
-      None,
-      lo(BOUND, &[]),
-      OTHER,
-      true
-    ));
+    assert!(!arrived_on_bound_interface(src, lo(BOUND, &[]), witnessed(OTHER)).is_none());
+    assert!(
+      !admits_ingress(
+        src,
+        DestinationWitness::Witnessed(UNICAST_V6_DST),
+        None,
+        lo(BOUND, &[]),
+        witnessed(OTHER)
+      )
+      .is_admit()
+    );
   }
   // A contradicting SCOPE is a witness too, with no index to back it up.
-  assert!(!arrived_on_bound_interface(
-    scoped(Ipv6Addr::LOCALHOST, OTHER),
-    lo(BOUND, &[]),
-    0,
-    true
-  ));
+  assert!(
+    !arrived_on_bound_interface(
+      scoped(Ipv6Addr::LOCALHOST, OTHER),
+      lo(BOUND, &[]),
+      IfaceWitness::Lost
+    )
+    .is_none()
+  );
 }
 
 #[test]
@@ -854,21 +948,16 @@ fn a_spoofed_loopback_source_is_rejected_on_a_foreign_interface() {
     peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
     scoped(Ipv6Addr::LOCALHOST, OTHER),
   ] {
-    assert!(!arrived_on_bound_interface(
-      src,
-      nic(BOUND, &SUBNETS),
-      OTHER,
-      true
-    ));
+    assert!(!arrived_on_bound_interface(src, nic(BOUND, &SUBNETS), witnessed(OTHER)).is_none());
     assert!(
       !admits_ingress(
         src,
-        Some(UNICAST_V4_DST),
+        DestinationWitness::Witnessed(UNICAST_V4_DST),
         None,
         nic(BOUND, &SUBNETS),
-        OTHER,
-        true
-      ),
+        witnessed(OTHER)
+      )
+      .is_admit(),
       "a NIC-bound endpoint has no loopback traffic to protect, so a loopback \
        source from another link is just a spoofed source"
     );
@@ -883,9 +972,9 @@ fn a_spoofed_loopback_source_is_rejected_on_a_foreign_interface() {
     !arrived_on_bound_interface(
       peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
       nic(BOUND, &SUBNETS),
-      0,
-      true
-    ),
+      IfaceWitness::Lost
+    )
+    .is_none(),
     "the loopback exception is the loopback-BOUND endpoint's; a loopback \
      SOURCE must not open it at stage 1"
   );
@@ -895,8 +984,7 @@ fn a_spoofed_loopback_source_is_rejected_on_a_foreign_interface() {
   assert!(!src_on_local_link(
     peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     nic(BOUND, &SUBNETS),
-    0,
-    true
+    IfaceWitness::Lost
   ));
   // And it does NOT degrade open on a path with no interface to give: a
   // loopback source is this endpoint's own traffic or it is nothing, and a
@@ -904,8 +992,7 @@ fn a_spoofed_loopback_source_is_rejected_on_a_foreign_interface() {
   assert!(!src_on_local_link(
     peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     nic(BOUND, &SUBNETS),
-    0,
-    false
+    IfaceWitness::Blind
   ));
 }
 
@@ -1127,22 +1214,26 @@ fn the_multicast_flag_does_not_excuse_a_foreign_link() {
   // Same order of gates as the group destination gets: the interface check runs
   // first. A multicast delivery proves the datagram was addressed to SOME
   // group, never that it arrived on our link.
-  assert!(!admits_ingress(
-    peer(OFF_SUBNET_V4),
-    None,
-    Some(LinkDelivery::Multicast),
-    nic(BOUND, &SUBNETS),
-    OTHER,
-    true
-  ));
-  assert!(!admits_ingress(
-    scoped(LINK_LOCAL, OTHER),
-    None,
-    Some(LinkDelivery::Multicast),
-    nic(BOUND, &SUBNETS),
-    BOUND,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      peer(OFF_SUBNET_V4),
+      DestinationWitness::Blind,
+      Some(LinkDelivery::Multicast),
+      nic(BOUND, &SUBNETS),
+      witnessed(OTHER)
+    )
+    .is_admit()
+  );
+  assert!(
+    !admits_ingress(
+      scoped(LINK_LOCAL, OTHER),
+      DestinationWitness::Blind,
+      Some(LinkDelivery::Multicast),
+      nic(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 #[test]
@@ -1216,7 +1307,7 @@ fn an_unwitnessed_apipa_source_answers_to_the_configured_prefix() {
     // The bound interface carries the same link-local prefix: admitted, on the
     // same evidence any other in-prefix source is admitted on.
     assert!(
-      src_on_local_link(peer_ll, nic(BOUND, &APIPA), 0, reported),
+      src_on_local_link(peer_ll, nic(BOUND, &APIPA), ifw(0, reported)),
       "a link-local peer on a link-local-configured interface is on-link per §11"
     );
     // And with no matching prefix it is still refused, so the arm did not turn
@@ -1224,8 +1315,7 @@ fn an_unwitnessed_apipa_source_answers_to_the_configured_prefix() {
     assert!(!src_on_local_link(
       peer_ll,
       nic(BOUND, &SUBNETS),
-      0,
-      reported
+      ifw(0, reported)
     ));
   }
 
@@ -1233,45 +1323,57 @@ fn an_unwitnessed_apipa_source_answers_to_the_configured_prefix() {
   // path with no interface to give. With `iface_reported` true a zero index is
   // a failed proof and never reaches the source arm at all — see
   // `an_unreported_interface_is_absent_evidence_and_a_reported_zero_is_a_failed_proof`.
-  assert!(admits_ingress(
-    peer_ll,
-    None,
-    None,
-    nic(BOUND, &APIPA),
-    0,
-    false
-  ));
+  assert!(
+    admits_ingress(
+      peer_ll,
+      DestinationWitness::Blind,
+      None,
+      nic(BOUND, &APIPA),
+      IfaceWitness::Blind
+    )
+    .is_admit()
+  );
 
   // A contradicting witness still refuses — at stage 1, which is where that
   // question belongs. §11's second arm asks only about the prefix.
-  assert!(!admits_ingress(
+  assert!(
+    !admits_ingress(
+      peer_ll,
+      DestinationWitness::Blind,
+      None,
+      nic(BOUND, &APIPA),
+      witnessed(OTHER)
+    )
+    .is_admit()
+  );
+  assert!(src_on_local_link(
     peer_ll,
-    None,
-    None,
     nic(BOUND, &APIPA),
-    OTHER,
-    true
+    witnessed(BOUND)
   ));
-  assert!(src_on_local_link(peer_ll, nic(BOUND, &APIPA), BOUND, true));
   // The IPv6 twin, through the boundary: a foreign scope refuses at stage 1, and
   // a matching one is admitted only because the interface also carries
   // `fe80::/64`.
-  assert!(!admits_ingress(
-    scoped(LINK_LOCAL, OTHER),
-    None,
-    None,
-    nic(BOUND, &LL_PREFIXES),
-    0,
-    true
-  ));
-  assert!(admits_ingress(
-    scoped(LINK_LOCAL, BOUND),
-    None,
-    None,
-    nic(BOUND, &LL_PREFIXES),
-    0,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      scoped(LINK_LOCAL, OTHER),
+      DestinationWitness::Blind,
+      None,
+      nic(BOUND, &LL_PREFIXES),
+      IfaceWitness::Lost
+    )
+    .is_admit()
+  );
+  assert!(
+    admits_ingress(
+      scoped(LINK_LOCAL, BOUND),
+      DestinationWitness::Blind,
+      None,
+      nic(BOUND, &LL_PREFIXES),
+      IfaceWitness::Lost
+    )
+    .is_admit()
+  );
 }
 
 /// The staged contract, checked exhaustively over every combination of its
@@ -1359,40 +1461,61 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
   // directed broadcasts under "multicast or not"; the operator-configured
   // broadcast, the martian and a neighbour's address under "computes to a
   // broadcast of one of our prefixes, or not".
+  //
+  // The last three are the ABSENCES, and they are three values rather than one
+  // because they lead to different verdicts: `Lost` refuses, `Declined` and
+  // `Blind` take the source arm. The old `Option<IpAddr>` axis could spell only
+  // one of the three.
   let dests = [
-    None,
-    Some(V4_GROUP),
-    Some(V6_GROUP),
-    Some(OUR_V4_ADDR),
-    Some(OUR_V6_ADDR),
-    Some(OUR_V4_LL_ADDR),
-    Some(V6_PREFIX_ADDR),
-    Some(NON_DEFAULT_BROADCAST_HOST),
-    Some(LOOPBACK_V4_ADDR),
-    Some(LOOPBACK_V6_ADDR),
-    Some(LOOPBACK_ALT_V4_ADDR),
-    Some(FOREIGN_V4_GROUP),
-    Some(FOREIGN_V6_GROUP),
-    Some(LIMITED_BROADCAST),
-    Some(DIRECTED_BROADCAST),
-    Some(NON_DEFAULT_BROADCAST),
-    Some(LOOPBACK_BROADCAST),
-    Some(UNSPECIFIED_V4_DST),
-    Some(UNSPECIFIED_V6_DST),
-    Some(MARTIAN_V4_DST),
-    Some(NEIGHBOUR_V4_DST),
-    Some(NEIGHBOUR_V6_DST),
+    DestinationWitness::Witnessed(V4_GROUP),
+    DestinationWitness::Witnessed(V6_GROUP),
+    DestinationWitness::Witnessed(OUR_V4_ADDR),
+    DestinationWitness::Witnessed(OUR_V6_ADDR),
+    DestinationWitness::Witnessed(OUR_V4_LL_ADDR),
+    DestinationWitness::Witnessed(V6_PREFIX_ADDR),
+    DestinationWitness::Witnessed(NON_DEFAULT_BROADCAST_HOST),
+    DestinationWitness::Witnessed(LOOPBACK_V4_ADDR),
+    DestinationWitness::Witnessed(LOOPBACK_V6_ADDR),
+    DestinationWitness::Witnessed(LOOPBACK_ALT_V4_ADDR),
+    DestinationWitness::Witnessed(FOREIGN_V4_GROUP),
+    DestinationWitness::Witnessed(FOREIGN_V6_GROUP),
+    DestinationWitness::Witnessed(LIMITED_BROADCAST),
+    DestinationWitness::Witnessed(DIRECTED_BROADCAST),
+    DestinationWitness::Witnessed(NON_DEFAULT_BROADCAST),
+    DestinationWitness::Witnessed(LOOPBACK_BROADCAST),
+    DestinationWitness::Witnessed(UNSPECIFIED_V4_DST),
+    DestinationWitness::Witnessed(UNSPECIFIED_V6_DST),
+    DestinationWitness::Witnessed(MARTIAN_V4_DST),
+    DestinationWitness::Witnessed(NEIGHBOUR_V4_DST),
+    DestinationWitness::Witnessed(NEIGHBOUR_V6_DST),
+    DestinationWitness::Witnessed(V4_MAPPED_GROUP_DST),
+    DestinationWitness::Lost,
+    DestinationWitness::Declined,
+    DestinationWitness::Blind,
   ];
   // The three delivery classes plus "this target reports none". `Broadcast`
-  // is new: it is the only value that REFUSES on its own, and only where no
-  // destination was recovered.
+  // is the only value that REFUSES on its own, and only where no destination
+  // was witnessed.
   let flags = [
     None,
     Some(LinkDelivery::Multicast),
     Some(LinkDelivery::Unicast),
     Some(LinkDelivery::Broadcast),
   ];
-  let pkt_ifaces = [0u32, BOUND, OTHER];
+  // Every value the interface witness can take, written as literals. The old
+  // axes were `pkt_iface x iface_reported` = 6 pairs, and two of those were
+  // duplicates the rule could not tell apart: `iface_reported` was never read
+  // when the index was nonzero, so `(BOUND, true)` and `(BOUND, false)` were the
+  // same case run twice, as were `(OTHER, true)` and `(OTHER, false)`. The
+  // remaining pairs are `Lost` and `Blind`; `Declined` is the state the pair
+  // could not express at all.
+  let ifaces = [
+    witnessed(BOUND),
+    witnessed(OTHER),
+    IfaceWitness::Lost,
+    IfaceWitness::Declined,
+    IfaceWitness::Blind,
+  ];
   let bounds = [(BOUND, false), (BOUND, true), (0, false)];
 
   // Per-family firing counts, so neither family can go unprobed. Named rather
@@ -1421,6 +1544,11 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
   let mut non_default_broadcast_fired = Fired::default();
   let mut loopback_broadcast_fired = Fired::default();
   let mut martian_fired = Fired::default();
+  let mut v4_mapped_fired = Fired::default();
+  let mut absent_iface_degrades_fired = Fired::default();
+  let mut dst_lost_fired = Fired::default();
+  let mut degraded_admit_fired = Fired::default();
+  let mut residual_refusal_fired = Fired::default();
   let mut cases = 0u32;
 
   for &src in &sources {
@@ -1428,16 +1556,40 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
     for &(subnets, assigned) in &links {
       for &(bound_iface, is_lo) in &bounds {
         let link = BoundLink::new(bound_iface, is_lo, subnets);
-        for &pkt_iface in &pkt_ifaces {
-          for &reported in &[false, true] {
+        for &iface in &ifaces {
+          {
             for &dst in &dests {
               for &flag in &flags {
                 cases = cases.saturating_add(1);
-                let got = admits_ingress(src, dst, flag, link, pkt_iface, reported);
+                let verdict = admits_ingress(src, dst, flag, link, iface);
+                let got = verdict.is_admit();
                 let scope = match src {
                   SocketAddr::V6(a) => a.scope_id(),
                   SocketAddr::V4(_) => 0,
                 };
+                // Read back out of the ENUMERATED literal, never by asking
+                // production what it made of it. `witnessed_index` is a `match`
+                // over the value this loop wrote, which is the same thing as
+                // writing the table twice — and the reason the destination
+                // classes below read `assigned` rather than `is_bound_address`.
+                let pkt_iface = match iface {
+                  IfaceWitness::Witnessed(idx) => idx.get(),
+                  IfaceWitness::Lost | IfaceWitness::Declined | IfaceWitness::Blind => 0,
+                };
+                let iface_lost = matches!(iface, IfaceWitness::Lost);
+                // The same reading for the destination witness: the address it
+                // carries, and which of the three absences it is.
+                let dst_addr = match dst {
+                  DestinationWitness::Witnessed(addr) => Some(addr),
+                  DestinationWitness::Lost
+                  | DestinationWitness::Declined
+                  | DestinationWitness::Blind => None,
+                };
+                let dst_lost = matches!(dst, DestinationWitness::Lost);
+                let dst_absent = matches!(
+                  dst,
+                  DestinationWitness::Declined | DestinationWitness::Blind
+                );
                 let witnesses = [pkt_iface, scope];
                 let contradicted =
                   bound_iface != 0 && witnesses.iter().any(|&w| w != 0 && w != bound_iface);
@@ -1446,7 +1598,7 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 let in_prefix = subnets
                   .iter()
                   .any(|&(n, pfx)| addr_in_subnet(n, pfx, src.ip()));
-                let stage1 = arrived_on_bound_interface(src, link, pkt_iface, reported);
+                let stage1 = arrived_on_bound_interface(src, link, iface).is_none();
                 // Whether §11's SOURCE arm would take this source on this link:
                 // a loopback source belongs to a loopback-BOUND endpoint and
                 // nobody else, and every other source answers to the prefix.
@@ -1464,14 +1616,50 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 if contradicted {
                   contradicted_fired.hit(src_v6);
                   assert!(!got, "stage 1: {src} vs bound {bound_iface} on {pkt_iface}");
+                  assert_eq!(
+                    verdict,
+                    Verdict::Refuse(Refuse::ForeignLink),
+                    "stage 1 names the arm it refused on: {src} vs bound \
+                     {bound_iface} on {pkt_iface}"
+                  );
                 }
-                // 2. No witness at all on a path that COULD name the link is a
-                //    failed proof, except a loopback-bound endpoint's own.
-                if bound_iface != 0 && !witnessed && reported && !loopback_own {
+                // 2. No witness at all, on a path whose control buffer was too
+                //    small, is a failed proof — except a loopback-bound
+                //    endpoint's own. Our buffer, our bug, so this one refuses.
+                if bound_iface != 0 && !witnessed && iface_lost && !loopback_own {
                   absent_iface_fired.hit(src_v6);
                   assert!(
                     !got,
-                    "stage 1: an expected-but-absent interface fails closed"
+                    "stage 1: a LOST interface witness fails closed: {src}"
+                  );
+                  assert_eq!(
+                    verdict,
+                    Verdict::Refuse(Refuse::LinkWitnessLost),
+                    "stage 1 names a lost witness as such: {src}"
+                  );
+                }
+                // 2b. ... and the OTHER two absences do not. A kernel that
+                //     declined to emit the cmsg, and a path that never emits
+                //     one, are both silence rather than a failed proof: stage 1
+                //     must pass them and leave §11's own arms to decide.
+                //
+                //     This is the arm the whole witness split exists for. Every
+                //     BSD builds its ancillary mbufs with `M_NOWAIT` and skips
+                //     the cmsg on failure with no error and no flag, so refusing
+                //     `Declined` would take a responder off the air under
+                //     exactly the flood that exhausted the mbufs. Asserted on
+                //     `stage1` rather than on the whole verdict because §11's
+                //     arms below may still refuse the datagram for their own
+                //     reasons — the claim here is that STAGE 1 does not.
+                if bound_iface != 0
+                  && !witnessed
+                  && matches!(iface, IfaceWitness::Declined | IfaceWitness::Blind)
+                {
+                  absent_iface_degrades_fired.hit(src_v6);
+                  assert!(
+                    stage1,
+                    "stage 1: a declined or blind interface witness is silence, \
+                     not a failed proof: {src} {iface:?}"
                   );
                 }
 
@@ -1485,9 +1673,9 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 // Four rounds of review found a class that a residual defined as
                 // "none of the above" had absorbed. There is no such residual to
                 // write here any more, and that is the whole of what changed.
-                let ours_group = dst == Some(V4_GROUP) || dst == Some(V6_GROUP);
-                let assigned_here = matches!(dst, Some(d) if assigned.contains(&d));
-                let dst_v6 = matches!(dst, Some(d) if d.is_ipv6());
+                let ours_group = dst_addr == Some(V4_GROUP) || dst_addr == Some(V6_GROUP);
+                let assigned_here = matches!(dst_addr, Some(d) if assigned.contains(&d));
+                let dst_v6 = matches!(dst_addr, Some(d) if d.is_ipv6());
                 // RFC 1122 §3.2.1.3 makes the whole `127.0.0.0/8` block (and
                 // `::1`) this host's own, so a loopback-BOUND endpoint holds
                 // every address in it whether or not the enumeration named it.
@@ -1495,26 +1683,40 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 // destinations that fall inside; the oracle reads it rather than
                 // calling `is_loopback()`, which is the question production
                 // asks and so cannot be the question that checks production.
-                let in_loopback_block = matches!(dst, Some(d) if LOOPBACK_BLOCK.contains(&d));
+                let in_loopback_block = matches!(dst_addr, Some(d) if LOOPBACK_BLOCK.contains(&d));
                 let held_by_block = is_lo && in_loopback_block;
-                let held_here = assigned_here || held_by_block;
+                // The loopback class is answered by the BINDING and does not
+                // fall through to the snapshot — including when the snapshot
+                // names `127.0.0.1` anyway, which is one `ifconfig` away and the
+                // ordinary shape of a snapshot taken from a host. `assigned_here
+                // || held_by_block` was the older reading and it over-counted
+                // exactly that pair; it survived only because the fixture's
+                // source arm refused those cases for its own reasons.
+                let held_here = if in_loopback_block {
+                  is_lo
+                } else {
+                  assigned_here
+                };
                 // The one exception, and it is about the SNAPSHOT rather than
                 // about any destination: an empty list is a failed enumeration,
                 // not a verdict, so it defers to the source arm. Invariant 7
                 // pins exactly how far that can go.
                 let empty_snapshot = subnets.is_empty();
-                let no_arm = dst.is_some() && !ours_group && !held_here && !empty_snapshot;
-                // With NO destination recovered, a broadcast DELIVERY refuses
+                let no_arm = dst_addr.is_some() && !ours_group && !held_here && !empty_snapshot;
+                // With NO destination witnessed, a broadcast DELIVERY refuses
                 // on its own. It is the only value of the coarse signal that
                 // does, and it is exact rather than approximate: §11 gives a
                 // broadcast no arm, so no address is needed to decide it.
-                let no_dst_broadcast = dst.is_none() && flag == Some(LinkDelivery::Broadcast);
+                //
+                // `dst_absent` and NOT "no address": a LOST witness never
+                // reaches the coarse signal at all, because it refuses first.
+                let no_dst_broadcast = dst_absent && flag == Some(LinkDelivery::Broadcast);
                 // What reaches §11's second arm: a destination this endpoint
-                // holds, a destination on a link that enumerated nothing, or no
-                // destination at all with the coarse signal saying neither
-                // multicast nor broadcast.
-                let host_address_arm = (dst.is_some() && !ours_group && !no_arm)
-                  || (dst.is_none() && flag != Some(LinkDelivery::Multicast) && !no_dst_broadcast);
+                // holds, a destination on a link that enumerated nothing, or an
+                // ABSENT-not-lost destination with the coarse signal saying
+                // neither multicast nor broadcast.
+                let host_address_arm = (dst_addr.is_some() && !ours_group && !no_arm)
+                  || (dst_absent && flag != Some(LinkDelivery::Multicast) && !no_dst_broadcast);
 
                 // 3. Past stage 1, OUR group admits regardless of source —
                 //    §11's "regardless of source IP address". Keyed by the
@@ -1523,14 +1725,25 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 if stage1 && ours_group {
                   group_arm_fired.hit(dst_v6);
                   assert!(got, "stage 2: the group arm must admit {src}");
+                  assert_eq!(
+                    verdict,
+                    Verdict::Admit(Admit::MdnsGroup),
+                    "the group arm names itself: {src} -> {dst:?}"
+                  );
                 }
                 // 3b. The coarse flag stands in where no destination was
                 //     recovered. Keyed by the SOURCE's family — there is no
                 //     destination here to key on, which is the whole point of
                 //     this square.
-                if stage1 && dst.is_none() && flag == Some(LinkDelivery::Multicast) {
+                if stage1 && dst_absent && flag == Some(LinkDelivery::Multicast) {
                   coarse_flag_fired.hit(src_v6);
                   assert!(got, "stage 2: a multicast delivery must admit {src}");
+                  assert_eq!(
+                    verdict,
+                    Verdict::Admit(Admit::BlindMulticastDelivery),
+                    "a blind multicast admission names itself, so it can be \
+                     counted apart from a witnessed group: {src}"
+                  );
                 }
                 // 3c. A broadcast delivery with no destination is REFUSED,
                 //     whatever the source, the witnesses or the prefixes say.
@@ -1546,6 +1759,33 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                   );
                   if source_arm_admits {
                     broadcast_delivery_fired.hit(src_v6);
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::BroadcastDelivery),
+                      "the delivery class is what refused, and it says so: {src}"
+                    );
+                  }
+                }
+                // 3d. A LOST destination witness refuses on its own, past stage
+                //     1, whatever the source, the prefixes or the coarse flag
+                //     say. It is the one absence that does — our control buffer
+                //     was too small, so the kernel HAD the destination and this
+                //     side dropped it. Counted only against a source the source
+                //     arm WOULD have admitted, so the refusal is attributable to
+                //     the witness and not to the source.
+                if stage1 && dst_lost {
+                  assert!(
+                    !got,
+                    "a lost destination witness is a failed proof, not silence: \
+                     {src}"
+                  );
+                  if source_arm_admits {
+                    dst_lost_fired.hit(src_v6);
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::DestinationWitnessLost),
+                      "and it names which witness was lost: {src}"
+                    );
                   }
                 }
                 // 4. A destination this endpoint HOLDS is what §11 means by
@@ -1559,6 +1799,22 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                     "stage 2: a destination this endpoint holds decides on the \
                      source and nothing else: {src} -> {dst:?}"
                   );
+                  // Both directions name the arm they took — but only once
+                  // stage 1 has passed. A datagram stage 1 refused never reached
+                  // §11's arms at all, and its verdict rightly names the LINK
+                  // rather than the source.
+                  if stage1 {
+                    assert_eq!(
+                      verdict,
+                      if source_arm_admits {
+                        Verdict::Admit(Admit::HeldDestination)
+                      } else {
+                        Verdict::Refuse(Refuse::SourceOffLink)
+                      },
+                      "a destination this endpoint holds names its arm in both \
+                       directions: {src} -> {dst:?}"
+                    );
+                  }
                 }
                 // 4b. ... and the loopback BLOCK is one of the two ways to hold
                 //     one. Counted separately where the block is the ONLY thing
@@ -1579,12 +1835,20 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 //     destination and stays refused. The block widens exactly
                 //     one configuration and this is where that scoping is
                 //     checked, rather than left to the `no_arm` aggregate.
-                if in_loopback_block && !is_lo && !assigned_here && !empty_snapshot {
+                if in_loopback_block && !is_lo && !empty_snapshot {
                   assert!(
                     !got,
                     "the loopback block is a loopback-BOUND endpoint's; on a \
                      NIC a 127/8 destination is a martian: {src} -> {dst:?}"
                   );
+                  if source_arm_admits {
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::LoopbackDestinationOffLoopbackBinding),
+                      "and the refusal names the BINDING, which is what scopes \
+                       the class: {src} -> {dst:?}"
+                    );
+                  }
                 }
                 // 5. Every other destination, on a link that DID enumerate, has
                 //    no §11 arm and is refused — whatever the source, the
@@ -1605,45 +1869,102 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 //        loopback block) leaves its class counter alone instead
                 //        of asserting a refusal that is no longer correct.
                 if source_arm_admits && no_arm {
-                  if matches!(dst, Some(FOREIGN_V4_GROUP) | Some(FOREIGN_V6_GROUP)) {
+                  if matches!(dst_addr, Some(FOREIGN_V4_GROUP) | Some(FOREIGN_V6_GROUP)) {
                     foreign_group_fired.hit(dst_v6);
                     assert!(!got, "a foreign multicast group has no §11 arm: {src}");
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::ForeignGroup),
+                      "and it is refused AS a group, not as a leftover: {src}"
+                    );
                   }
-                  if matches!(dst, Some(UNSPECIFIED_V4_DST) | Some(UNSPECIFIED_V6_DST)) {
+                  if matches!(
+                    dst_addr,
+                    Some(UNSPECIFIED_V4_DST) | Some(UNSPECIFIED_V6_DST)
+                  ) {
                     unspecified_dst_fired.hit(dst_v6);
                     assert!(!got, "an unspecified destination has no §11 arm: {src}");
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::UnspecifiedDestination),
+                      "and it names itself rather than landing in the residual: {src}"
+                    );
                   }
-                  if matches!(dst, Some(NEIGHBOUR_V4_DST) | Some(NEIGHBOUR_V6_DST)) {
+                  if matches!(dst_addr, Some(NEIGHBOUR_V4_DST) | Some(NEIGHBOUR_V6_DST)) {
                     neighbour_dst_fired.hit(dst_v6);
                     assert!(
                       !got,
                       "a neighbour's address on our own subnet was not addressed \
                        to us: {src} -> {dst:?}"
                     );
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::DestinationNotHeld),
+                      "a neighbour's address IS the residual, and is counted as \
+                       one: {src} -> {dst:?}"
+                    );
                   }
-                  if dst == Some(LIMITED_BROADCAST) {
+                  if dst_addr == Some(V4_MAPPED_GROUP_DST) {
+                    v4_mapped_fired.hit(dst_v6);
+                    assert!(
+                      !got,
+                      "::ffff:224.0.0.251 has no §11 arm — it is not the IPv6 \
+                       group and `Ipv6Addr::is_multicast` does not see it: {src}"
+                    );
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::Ipv4MappedDestination),
+                      "and it is classified rather than absorbed by the residual: \
+                       {src}"
+                    );
+                  }
+                  if dst_addr == Some(LIMITED_BROADCAST) {
                     limited_broadcast_fired.hit(dst_v6);
                     assert!(!got, "255.255.255.255 has no §11 arm: {src}");
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::BroadcastAddressed),
+                      "RFC 919's limited broadcast is the one an address names by \
+                       itself, so it is named: {src}"
+                    );
                   }
-                  if dst == Some(DIRECTED_BROADCAST) {
+                  if dst_addr == Some(DIRECTED_BROADCAST) {
                     directed_broadcast_fired.hit(dst_v6);
                     assert!(!got, "192.168.1.255 has no §11 arm: {src}");
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::DestinationNotHeld),
+                      "a SUBNET-directed broadcast is refused as the residual and \
+                       not as a broadcast: identifying one needs the prefix \
+                       arithmetic this partition deliberately does not do: {src}"
+                    );
                   }
-                  if dst == Some(NON_DEFAULT_BROADCAST) {
+                  if dst_addr == Some(NON_DEFAULT_BROADCAST) {
                     non_default_broadcast_fired.hit(dst_v6);
                     assert!(
                       !got,
                       "192.168.1.200 is a broadcast no arithmetic over \
                        192.168.1.5/24 finds, and has no §11 arm: {src}"
                     );
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::DestinationNotHeld),
+                      "and the residual is what refuses it, which is the whole \
+                       reason the residual must stay fail-closed: {src}"
+                    );
                   }
-                  if dst == Some(LOOPBACK_BROADCAST) {
+                  if dst_addr == Some(LOOPBACK_BROADCAST) {
                     loopback_broadcast_fired.hit(dst_v6);
                     assert!(!got, "127.255.255.255 has no §11 arm: {src}");
                   }
-                  if dst == Some(MARTIAN_V4_DST) {
+                  if dst_addr == Some(MARTIAN_V4_DST) {
                     martian_fired.hit(dst_v6);
                     assert!(!got, "240.0.0.1 has no §11 arm: {src}");
+                    assert_eq!(
+                      verdict,
+                      Verdict::Refuse(Refuse::DestinationNotHeld),
+                      "a martian is the residual too: {src}"
+                    );
                   }
                 }
                 // 6. Past stage 1 and on the host-address arm, an in-prefix
@@ -1673,7 +1994,7 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 //    traffic and nothing whatsoever else. Written as an
                 //    equality, because the claim this decision rests on is that
                 //    the fallback is bounded, not merely that it is not open.
-                if empty_snapshot && dst.is_some() && !ours_group {
+                if empty_snapshot && dst_addr.is_some() && !ours_group {
                   empty_snapshot_fired.hit(dst_v6);
                   assert_eq!(
                     got,
@@ -1681,6 +2002,28 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                     "an empty snapshot runs the source arm, which then admits \
                      only a loopback-bound endpoint's own traffic: {src} -> \
                      {dst:?}"
+                  );
+                }
+                // 9. Every degraded admission is NAMED as one, and every
+                //    residual refusal is NAMED as one. These are the two
+                //    counters the conformance gaps are measured with, so the
+                //    predicates a driver reads have to agree with the arm that
+                //    actually fired rather than with a second reading of it.
+                if verdict.is_degraded_admit() {
+                  degraded_admit_fired.hit(src_v6);
+                  assert!(
+                    dst_absent,
+                    "only a datagram with NO destination witness can be a \
+                     degraded admission: {src} -> {dst:?}"
+                  );
+                  assert!(got, "a degraded admission is still an admission: {src}");
+                }
+                if verdict.is_residual_refusal() {
+                  residual_refusal_fired.hit(dst_v6);
+                  assert!(
+                    no_arm,
+                    "the residual refusal is only ever a destination this \
+                     endpoint does not hold: {src} -> {dst:?}"
                   );
                 }
                 // 8. An endpoint that knows no link of its own forbids nothing
@@ -1697,11 +2040,37 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
     }
   }
 
+  // The size of the space, pinned. Nothing in-tree pinned it before, so a change
+  // that silently dropped an axis — or collapsed one back into a flag — read as
+  // a passing test over a smaller product. The arithmetic is written out because
+  // that is the part a reader has to check:
+  //
+  //   10 sources x 6 links x 3 bounds x 5 interface witnesses
+  //     x 25 destination witnesses x 4 delivery classes = 90_000
+  //
+  // The previous space was 95_040 = 10 x 6 x 3 x (3 pkt_ifaces x 2 reported)
+  // x 22 destinations x 4. The interface axis went 6 -> 5 because two of the six
+  // pairs were duplicates the rule could never distinguish and one state
+  // (`Declined`) was unreachable through the pair; the destination axis went
+  // 22 -> 25 because one `None` became three distinct absences and one new
+  // literal (`::ffff:224.0.0.251`) was added.
+  assert_eq!(
+    cases, 90_000,
+    "the enumerated space changed size; update the arithmetic above with it"
+  );
+
   // Invariants whose subject exists in both families: each must have fired for
   // both, or half the rule went unprobed.
   for (fired, what) in [
     (contradicted_fired, "contradicted witness"),
-    (absent_iface_fired, "expected-but-absent interface"),
+    (absent_iface_fired, "a LOST interface witness"),
+    (
+      absent_iface_degrades_fired,
+      "a declined or blind interface witness, which must NOT refuse",
+    ),
+    (dst_lost_fired, "a LOST destination witness"),
+    (degraded_admit_fired, "a degraded admission"),
+    (residual_refusal_fired, "the residual refusal"),
     (in_prefix_fired, "in-prefix source at the host-address arm"),
     (nothing_left_fired, "nothing left to admit on"),
     (unbound_fired, "unbound endpoint"),
@@ -1750,6 +2119,17 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
       fired.v6
     );
   }
+  // An IPv4-MAPPED destination is an IPv6 address carrying an IPv4 one, so it
+  // is keyed to IPv6 — and `v4 == 0` is asserted as hard as `v6 > 0` for the
+  // same reason the IPv4-only list asserts the mirror: a counter that fires for
+  // the other family is keyed off something other than the destination.
+  assert!(
+    v4_mapped_fired.only_v6(),
+    "the IPv4-mapped class must fire for IPv6 and NEVER for IPv4 over {cases} \
+     cases (v4 {}, v6 {})",
+    v4_mapped_fired.v4,
+    v4_mapped_fired.v6
+  );
 }
 
 /// One link of the enumeration above: the snapshot a driver would hand
@@ -1794,6 +2174,12 @@ impl Fired {
   fn only_v4(&self) -> bool {
     self.v4 > 0 && self.v6 == 0
   }
+
+  /// The mirror of [`Fired::only_v4`], for a class that exists only in the IPv6
+  /// form — an IPv4-MAPPED destination is one.
+  fn only_v6(&self) -> bool {
+    self.v6 > 0 && self.v4 == 0
+  }
 }
 
 // ── three counterexamples to a staged decision described as a table ─────────
@@ -1810,33 +2196,39 @@ fn a_witnessed_datagram_still_answers_to_the_destination_and_the_prefix() {
   // conforming TTL was admitted before either §11 arm was read, so a witnessed
   // OUT-OF-PREFIX unicast was admitted where §11 expects a receiver to ignore
   // it. There is no TTL input any more, and the arms decide.
-  assert!(!admits_ingress(
-    peer(OFF_SUBNET_V4),
-    Some(UNICAST_V4_DST),
-    None,
-    nic(BOUND, &[]),
-    BOUND,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      peer(OFF_SUBNET_V4),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      nic(BOUND, &[]),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // The same witnessed datagram addressed to the group is admitted, because §11
   // says a group destination is local-link origin regardless of source.
-  assert!(admits_ingress(
-    peer(OFF_SUBNET_V4),
-    Some(V4_GROUP),
-    None,
-    nic(BOUND, &[]),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      peer(OFF_SUBNET_V4),
+      DestinationWitness::Witnessed(V4_GROUP),
+      None,
+      nic(BOUND, &[]),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // And in-prefix unicast is admitted by the unicast arm.
-  assert!(admits_ingress(
-    on_subnet(),
-    Some(UNICAST_V4_DST),
-    None,
-    nic(BOUND, &SUBNETS),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      nic(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 #[test]
@@ -1851,12 +2243,12 @@ fn an_expected_but_missing_interface_refuses_before_the_group_arm() {
       assert!(
         !admits_ingress(
           peer(OFF_SUBNET_V4),
-          dst,
+          dstw(dst),
           flag,
           nic(BOUND, &SUBNETS),
-          0,
-          true
-        ),
+          IfaceWitness::Lost
+        )
+        .is_admit(),
         "a capable path reporting index 0 must fail closed at the interface \
          stage, whatever the destination says"
       );
@@ -1865,14 +2257,16 @@ fn an_expected_but_missing_interface_refuses_before_the_group_arm() {
   // The SAME datagram on a path that reports no interface reaches the group arm
   // and is admitted. Identical provenance value, opposite outcome — decided by
   // the capability, which the table did not carry.
-  assert!(admits_ingress(
-    peer(OFF_SUBNET_V4),
-    Some(V4_GROUP),
-    None,
-    nic(BOUND, &SUBNETS),
-    0,
-    false
-  ));
+  assert!(
+    admits_ingress(
+      peer(OFF_SUBNET_V4),
+      DestinationWitness::Witnessed(V4_GROUP),
+      None,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Blind
+    )
+    .is_admit()
+  );
 }
 
 #[test]
@@ -1887,35 +2281,41 @@ fn a_scope_id_is_provenance_even_where_no_interface_index_is() {
   for reported in [false, true] {
     // Scope names our link: stage 1 passes on it alone, and §11's second arm
     // then admits because the interface carries the matching prefix.
-    assert!(admits_ingress(
-      scoped(LINK_LOCAL, BOUND),
-      None,
-      None,
-      nic(BOUND, &LL_PREFIXES),
-      0,
-      reported
-    ));
+    assert!(
+      admits_ingress(
+        scoped(LINK_LOCAL, BOUND),
+        DestinationWitness::Blind,
+        None,
+        nic(BOUND, &LL_PREFIXES),
+        ifw(0, reported)
+      )
+      .is_admit()
+    );
     // Scope names another: refused at the interface stage, prefix or not.
-    assert!(!admits_ingress(
-      scoped(LINK_LOCAL, OTHER),
-      None,
-      None,
-      nic(BOUND, &LL_PREFIXES),
-      0,
-      reported
-    ));
+    assert!(
+      !admits_ingress(
+        scoped(LINK_LOCAL, OTHER),
+        DestinationWitness::Blind,
+        None,
+        nic(BOUND, &LL_PREFIXES),
+        ifw(0, reported)
+      )
+      .is_admit()
+    );
   }
   // A scopeless IPv6 source on the same path has no witness at all, so it lands
   // in the genuinely provenance-less case and answers to the source prefix.
   let global_v6 = peer(OFF_SUBNET_V6);
-  assert!(!admits_ingress(
-    global_v6,
-    None,
-    None,
-    nic(BOUND, &SUBNETS),
-    0,
-    false
-  ));
+  assert!(
+    !admits_ingress(
+      global_v6,
+      DestinationWitness::Blind,
+      None,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Blind
+    )
+    .is_admit()
+  );
 }
 
 #[test]
@@ -1938,32 +2338,43 @@ fn a_matching_witness_does_not_admit_a_link_local_source_without_a_prefix() {
     (v6_ll, UNICAST_V6_DST, LL_UNICAST_V6_DST, "fe80::/10"),
   ] {
     assert!(
-      !src_on_local_link(src, nic(BOUND, &SUBNETS), BOUND, true),
+      !src_on_local_link(src, nic(BOUND, &SUBNETS), witnessed(BOUND)),
       "{what}: a matching witness must not stand in for §11's prefix test"
     );
     assert!(
-      !admits_ingress(src, Some(ours), None, nic(BOUND, &SUBNETS), BOUND, true),
+      !admits_ingress(
+        src,
+        DestinationWitness::Witnessed(ours),
+        None,
+        nic(BOUND, &SUBNETS),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{what}: and the whole boundary must refuse it too"
     );
     // The interface carrying the matching prefix is what admits it — §11's own
     // second arm, and the APIPA case that arm exists to serve.
-    assert!(admits_ingress(
-      src,
-      Some(theirs),
-      None,
-      nic(BOUND, &LL_PREFIXES),
-      BOUND,
-      true
-    ));
+    assert!(
+      admits_ingress(
+        src,
+        DestinationWitness::Witnessed(theirs),
+        None,
+        nic(BOUND, &LL_PREFIXES),
+        witnessed(BOUND)
+      )
+      .is_admit()
+    );
     // A group destination still admits regardless of prefix, as §11 requires.
-    assert!(admits_ingress(
-      src,
-      Some(V6_GROUP),
-      None,
-      nic(BOUND, &SUBNETS),
-      BOUND,
-      true
-    ));
+    assert!(
+      admits_ingress(
+        src,
+        DestinationWitness::Witnessed(V6_GROUP),
+        None,
+        nic(BOUND, &SUBNETS),
+        witnessed(BOUND)
+      )
+      .is_admit()
+    );
   }
 }
 
@@ -1981,47 +2392,53 @@ fn a_multicast_destination_that_is_not_ours_has_no_arm_and_is_refused() {
     assert!(
       !admits_ingress(
         on_subnet(),
-        Some(foreign),
+        DestinationWitness::Witnessed(foreign),
         None,
         nic(BOUND, &SUBNETS),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{foreign} is not an mDNS group, so §11 has no arm that admits it"
     );
     // Not rescued by the coarse flag either, which is a weaker signal than the
     // destination it would be overruling.
-    assert!(!admits_ingress(
-      on_subnet(),
-      Some(foreign),
-      Some(LinkDelivery::Multicast),
-      nic(BOUND, &SUBNETS),
-      BOUND,
-      true
-    ));
+    assert!(
+      !admits_ingress(
+        on_subnet(),
+        DestinationWitness::Witnessed(foreign),
+        Some(LinkDelivery::Multicast),
+        nic(BOUND, &SUBNETS),
+        witnessed(BOUND)
+      )
+      .is_admit()
+    );
   }
   // Ours, same everything else: admitted. So the rejection above is the group
   // and not the source or the interface.
   for ours in [V4_GROUP, V6_GROUP] {
-    assert!(admits_ingress(
-      on_subnet(),
-      Some(ours),
-      None,
-      nic(BOUND, &SUBNETS),
-      BOUND,
-      true
-    ));
+    assert!(
+      admits_ingress(
+        on_subnet(),
+        DestinationWitness::Witnessed(ours),
+        None,
+        nic(BOUND, &SUBNETS),
+        witnessed(BOUND)
+      )
+      .is_admit()
+    );
   }
   // And a unicast destination with the same source still reaches the prefix
   // arm, so the partition did not swallow arm two.
-  assert!(admits_ingress(
-    on_subnet(),
-    Some(UNICAST_V4_DST),
-    None,
-    nic(BOUND, &SUBNETS),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      nic(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 #[test]
@@ -2065,12 +2482,12 @@ fn a_destination_this_interface_does_not_hold_has_no_section_11_arm() {
     assert!(
       !admits_ingress(
         on_subnet(),
-        Some(dst),
+        DestinationWitness::Witnessed(dst),
         None,
         nic(BOUND, &SUBNETS),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{what} is not an address this interface holds, so §11 gives it no arm"
     );
     // Not rescued by the coarse flag either, in either direction: a recovered
@@ -2085,12 +2502,12 @@ fn a_destination_this_interface_does_not_hold_has_no_section_11_arm() {
       assert!(
         !admits_ingress(
           on_subnet(),
-          Some(dst),
+          DestinationWitness::Witnessed(dst),
           flag,
           nic(BOUND, &SUBNETS),
-          BOUND,
-          true
-        ),
+          witnessed(BOUND)
+        )
+        .is_admit(),
         "{what} is refused whatever the coarse flag says"
       );
     }
@@ -2099,12 +2516,12 @@ fn a_destination_this_interface_does_not_hold_has_no_section_11_arm() {
     assert!(
       !admits_ingress(
         peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        Some(dst),
+        DestinationWitness::Witnessed(dst),
         None,
         lo(BOUND, &SUBNETS),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{what} is refused for a loopback-bound endpoint's own traffic too"
     );
   }
@@ -2117,12 +2534,12 @@ fn a_destination_this_interface_does_not_hold_has_no_section_11_arm() {
     assert!(
       !admits_ingress(
         on_subnet(),
-        Some(dst),
+        DestinationWitness::Witnessed(dst),
         None,
         nic(BOUND, &SUBNETS),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{dst} is a martian destination on an interface that is not the loopback \
        one, and this endpoint does not hold it"
     );
@@ -2135,12 +2552,12 @@ fn a_destination_this_interface_does_not_hold_has_no_section_11_arm() {
     assert!(
       admits_ingress(
         on_subnet(),
-        Some(ours),
+        DestinationWitness::Witnessed(ours),
         None,
         nic(BOUND, &SUBNETS),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{ours} must still be admitted, or the refusals above prove nothing"
     );
   }
@@ -2165,49 +2582,53 @@ fn an_operator_configured_broadcast_address_is_refused_with_no_arithmetic() {
   assert!(
     !admits_ingress(
       src,
-      Some(NON_DEFAULT_BROADCAST),
+      DestinationWitness::Witnessed(NON_DEFAULT_BROADCAST),
       None,
       nic(BOUND, &NON_DEFAULT_BROADCAST_LINK),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "192.168.1.200 is not an address 192.168.1.5/24 holds, whatever a \
      computation over that prefix would have derived"
   );
   // The derived one is refused for the SAME reason rather than by arithmetic,
   // so closing the leak did not open the case that used to be closed.
-  assert!(!admits_ingress(
-    src,
-    Some(DIRECTED_BROADCAST),
-    None,
-    nic(BOUND, &NON_DEFAULT_BROADCAST_LINK),
-    BOUND,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      src,
+      DestinationWitness::Witnessed(DIRECTED_BROADCAST),
+      None,
+      nic(BOUND, &NON_DEFAULT_BROADCAST_LINK),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // The control: the one address this interface does hold, same source, same
   // witnesses — admitted. So the two refusals are the destination and not the
   // source or the link.
   assert!(
     admits_ingress(
       src,
-      Some(NON_DEFAULT_BROADCAST_HOST),
+      DestinationWitness::Witnessed(NON_DEFAULT_BROADCAST_HOST),
       None,
       nic(BOUND, &NON_DEFAULT_BROADCAST_LINK),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "192.168.1.5 IS this interface's address, so §11's second arm decides it"
   );
   // ... and the source arm really is what decides it there: an off-prefix source
   // to the same held address is refused.
-  assert!(!admits_ingress(
-    peer(OFF_SUBNET_V4),
-    Some(NON_DEFAULT_BROADCAST_HOST),
-    None,
-    nic(BOUND, &NON_DEFAULT_BROADCAST_LINK),
-    BOUND,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      peer(OFF_SUBNET_V4),
+      DestinationWitness::Witnessed(NON_DEFAULT_BROADCAST_HOST),
+      None,
+      nic(BOUND, &NON_DEFAULT_BROADCAST_LINK),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 /// A directed broadcast is refused on EVERY link now, not only on the one it
@@ -2229,48 +2650,52 @@ fn a_directed_broadcast_is_refused_whatever_subnet_this_link_carries() {
   assert!(
     !admits_ingress(
       on_subnet(),
-      Some(DIRECTED_BROADCAST),
+      DestinationWitness::Witnessed(DIRECTED_BROADCAST),
       None,
       nic(BOUND, &SUBNETS),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "on a 192.168.1.2/24 link, 192.168.1.255 is not the address we hold"
   );
   assert!(
     !admits_ingress(
       apipa_src,
-      Some(DIRECTED_BROADCAST),
+      DestinationWitness::Witnessed(DIRECTED_BROADCAST),
       None,
       nic(BOUND, &APIPA),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "and on a 169.254.0.2/16 link it is not the address we hold either — the \
      old rule admitted this one, because it could not compute a broadcast for a \
      subnet the link does not carry"
   );
   // The control for the second case: the APIPA link's own address, same source,
   // is admitted. So the refusal above is the destination and not the source.
-  assert!(admits_ingress(
-    apipa_src,
-    Some(LL_UNICAST_V4_DST),
-    None,
-    nic(BOUND, &APIPA),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      apipa_src,
+      DestinationWitness::Witnessed(LL_UNICAST_V4_DST),
+      None,
+      nic(BOUND, &APIPA),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // The limited broadcast needs no subnet to be recognised and never did, so it
   // is refused on both links as it always was.
   for subnets in [&SUBNETS[..], &APIPA[..]] {
-    assert!(!admits_ingress(
-      apipa_src,
-      Some(LIMITED_BROADCAST),
-      None,
-      nic(BOUND, subnets),
-      BOUND,
-      true
-    ));
+    assert!(
+      !admits_ingress(
+        apipa_src,
+        DestinationWitness::Witnessed(LIMITED_BROADCAST),
+        None,
+        nic(BOUND, subnets),
+        witnessed(BOUND)
+      )
+      .is_admit()
+    );
   }
 }
 
@@ -2299,12 +2724,12 @@ fn a_short_prefix_needs_no_broadcast_arithmetic() {
   assert!(
     admits_ingress(
       peer(host),
-      Some(host),
+      DestinationWitness::Witnessed(host),
       None,
       nic(BOUND, &HOST_32),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "a /32-configured interface must still hear unicast addressed to it"
   );
 
@@ -2315,23 +2740,23 @@ fn a_short_prefix_needs_no_broadcast_arithmetic() {
   assert!(
     admits_ingress(
       peer(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))),
-      Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4))),
+      DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4))),
       None,
       nic(BOUND, &P2P_31),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "198.51.100.4 is the address this /31 holds, so §11's second arm decides it"
   );
   assert!(
     !admits_ingress(
       peer(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))),
-      Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))),
+      DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))),
       None,
       nic(BOUND, &P2P_31),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "198.51.100.5 is the PEER's address on this /31, not ours"
   );
 
@@ -2342,25 +2767,27 @@ fn a_short_prefix_needs_no_broadcast_arithmetic() {
     assert!(
       !admits_ingress(
         peer(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))),
-        Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, other))),
+        DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(198, 51, 100, other))),
         None,
         nic(BOUND, &NET_30),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "198.51.100.{other} is not the address 198.51.100.4/30 holds"
     );
   }
   // ... and the address it does hold is admitted, so the /30 refusals are the
   // destination and not the prefix length.
-  assert!(admits_ingress(
-    peer(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))),
-    Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4))),
-    None,
-    nic(BOUND, &NET_30),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      peer(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))),
+      DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4))),
+      None,
+      nic(BOUND, &NET_30),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 /// RFC 1122 §3.2.1.3: a loopback-bound endpoint holds the whole `127.0.0.0/8`
@@ -2388,26 +2815,28 @@ fn a_loopback_bound_endpoint_holds_the_whole_rfc_1122_block() {
     assert!(
       admits_ingress(
         peer(LOOPBACK_V4_ADDR),
-        Some(dst),
+        DestinationWitness::Witnessed(dst),
         None,
         lo(BOUND, &LOOPBACK_LINK),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{dst} is inside 127.0.0.0/8 (or is ::1), so a loopback-bound endpoint \
        holds it whether or not `getifs` reported it"
     );
   }
   // The block holds even when the enumeration named NOTHING of the sort: the
   // rule is the endpoint's binding, not the snapshot's contents.
-  assert!(admits_ingress(
-    peer(LOOPBACK_V4_ADDR),
-    Some(LOOPBACK_ALT_V4_ADDR),
-    None,
-    lo(BOUND, &SUBNETS),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      peer(LOOPBACK_V4_ADDR),
+      DestinationWitness::Witnessed(LOOPBACK_ALT_V4_ADDR),
+      None,
+      lo(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // Reaching the second arm is NOT admission. The block decides the
   // destination; the source still has to be this endpoint's own traffic or
   // inside a configured prefix, so an off-prefix source to the same
@@ -2416,12 +2845,12 @@ fn a_loopback_bound_endpoint_holds_the_whole_rfc_1122_block() {
     assert!(
       !admits_ingress(
         peer(OFF_SUBNET_V4),
-        Some(dst),
+        DestinationWitness::Witnessed(dst),
         None,
         lo(BOUND, &LOOPBACK_LINK),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{dst}: the block holds the destination, and the SOURCE arm still decides"
     );
   }
@@ -2433,12 +2862,12 @@ fn a_loopback_bound_endpoint_holds_the_whole_rfc_1122_block() {
     assert!(
       !admits_ingress(
         on_subnet(),
-        Some(dst),
+        DestinationWitness::Witnessed(dst),
         None,
         nic(BOUND, &SUBNETS),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{dst} on a NIC-bound endpoint is a martian destination"
     );
     // Not even when the NIC-bound endpoint's snapshot literally contains the
@@ -2450,12 +2879,12 @@ fn a_loopback_bound_endpoint_holds_the_whole_rfc_1122_block() {
       assert!(
         !admits_ingress(
           peer(LOOPBACK_V4_ADDR),
-          Some(dst),
+          DestinationWitness::Witnessed(dst),
           None,
           nic(BOUND, &LOOPBACK_LINK),
-          BOUND,
-          true
-        ),
+          witnessed(BOUND)
+        )
+        .is_admit(),
         "{dst}: the block is opened by the BINDING, never by the snapshot"
       );
     }
@@ -2494,12 +2923,12 @@ fn a_mixed_snapshot_does_not_let_a_nic_bound_endpoint_hold_the_loopback_block() 
     assert!(
       !admits_ingress(
         on_subnet(),
-        Some(dst),
+        DestinationWitness::Witnessed(dst),
         None,
         nic(BOUND, &MIXED),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{dst} is in this NIC's snapshot verbatim, and a NIC-bound endpoint must \
        still not hold a loopback destination"
     );
@@ -2507,27 +2936,31 @@ fn a_mixed_snapshot_does_not_let_a_nic_bound_endpoint_hold_the_loopback_block() 
   // The rest of the block, which is not in the snapshot, is refused too — so the
   // rule is the same one for every address in it.
   for dst in [LOOPBACK_ALT_V4_ADDR, LOOPBACK_BROADCAST] {
-    assert!(!admits_ingress(
-      on_subnet(),
-      Some(dst),
-      None,
-      nic(BOUND, &MIXED),
-      BOUND,
-      true
-    ));
+    assert!(
+      !admits_ingress(
+        on_subnet(),
+        DestinationWitness::Witnessed(dst),
+        None,
+        nic(BOUND, &MIXED),
+        witnessed(BOUND)
+      )
+      .is_admit()
+    );
   }
   // The controls: the same snapshot's NON-loopback addresses are held and reach
   // the source arm, so the four refusals are the loopback class and not the
   // snapshot, the source or the interface.
   for dst in [OUR_V4_ADDR, OUR_V6_ADDR] {
-    assert!(admits_ingress(
-      on_subnet(),
-      Some(dst),
-      None,
-      nic(BOUND, &MIXED),
-      BOUND,
-      true
-    ));
+    assert!(
+      admits_ingress(
+        on_subnet(),
+        DestinationWitness::Witnessed(dst),
+        None,
+        nic(BOUND, &MIXED),
+        witnessed(BOUND)
+      )
+      .is_admit()
+    );
   }
   // ... and the SAME mixed snapshot on a loopback-BOUND endpoint holds the whole
   // block, so the fence swings both ways on the binding alone.
@@ -2535,12 +2968,12 @@ fn a_mixed_snapshot_does_not_let_a_nic_bound_endpoint_hold_the_loopback_block() 
     assert!(
       admits_ingress(
         peer(LOOPBACK_V4_ADDR),
-        Some(dst),
+        DestinationWitness::Witnessed(dst),
         None,
         lo(BOUND, &MIXED),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{dst}: a loopback-bound endpoint holds the block whatever else the \
        snapshot lists"
     );
@@ -2561,12 +2994,12 @@ fn a_broadcast_delivery_is_refused_where_no_destination_was_recovered() {
   assert!(
     !admits_ingress(
       on_subnet(),
-      None,
+      DestinationWitness::Blind,
       Some(LinkDelivery::Broadcast),
       nic(BOUND, &SUBNETS),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "a datagram the kernel delivered as a broadcast has no §11 arm, and the \
      source prefix must not decide it"
   );
@@ -2575,63 +3008,74 @@ fn a_broadcast_delivery_is_refused_where_no_destination_was_recovered() {
   assert!(
     admits_ingress(
       on_subnet(),
-      None,
+      DestinationWitness::Blind,
       Some(LinkDelivery::Unicast),
       nic(BOUND, &SUBNETS),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "a unicast delivery still takes the source arm, which admits an in-prefix \
      source"
   );
   assert!(
     admits_ingress(
       on_subnet(),
-      None,
+      DestinationWitness::Blind,
       Some(LinkDelivery::Multicast),
       nic(BOUND, &SUBNETS),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "a multicast delivery still takes the group arm"
   );
   assert!(
-    admits_ingress(on_subnet(), None, None, nic(BOUND, &SUBNETS), BOUND, true),
+    admits_ingress(
+      on_subnet(),
+      DestinationWitness::Blind,
+      None,
+      nic(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "and a target that reports no delivery class at all is unchanged — this is \
      the FreeBSD/DragonFly and compio-Windows residual, still open"
   );
   // It refuses regardless of the source, so it is not a source test wearing a
   // different name: a loopback-bound endpoint's own traffic is refused too.
-  assert!(!admits_ingress(
-    peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-    None,
-    Some(LinkDelivery::Broadcast),
-    lo(BOUND, &LOOPBACK_LINK),
-    BOUND,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+      DestinationWitness::Blind,
+      Some(LinkDelivery::Broadcast),
+      lo(BOUND, &LOOPBACK_LINK),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // And a RECOVERED destination outranks it in both directions: the delivery
   // class only decides where there is no address to decide from.
   assert!(
     admits_ingress(
       on_subnet(),
-      Some(V4_GROUP),
+      DestinationWitness::Witnessed(V4_GROUP),
       Some(LinkDelivery::Broadcast),
       nic(BOUND, &SUBNETS),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "a recovered group destination is §11's first arm whatever the coarse \
      delivery class says"
   );
-  assert!(admits_ingress(
-    on_subnet(),
-    Some(UNICAST_V4_DST),
-    Some(LinkDelivery::Broadcast),
-    nic(BOUND, &SUBNETS),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      Some(LinkDelivery::Broadcast),
+      nic(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 /// §11's source arm treats every assigned IPv6 prefix as on-link, and assignment
@@ -2667,12 +3111,12 @@ fn an_assigned_ipv6_prefix_is_treated_as_on_link_which_it_need_not_be() {
   assert!(
     admits_ingress(
       routed_peer,
-      Some(AUTOCONF_ADDR),
+      DestinationWitness::Witnessed(AUTOCONF_ADDR),
       None,
       nic(BOUND, &AUTOCONF),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "KNOWN WRONG, pinned deliberately: assignment is being read as on-link \
      evidence. Fixing it means populating `BoundLink::with_onlink_prefixes` \
      from a real on-link source and flipping this assertion to `!`"
@@ -2685,12 +3129,12 @@ fn an_assigned_ipv6_prefix_is_treated_as_on_link_which_it_need_not_be() {
   assert!(
     !admits_ingress(
       routed_peer,
-      Some(AUTOCONF_ADDR),
+      DestinationWitness::Witnessed(AUTOCONF_ADDR),
       None,
       BoundLink::with_onlink_prefixes(BOUND, false, &AUTOCONF, &NO_ONLINK_PREFIX),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "with the on-link list supplied separately and empty, the routed source is \
      refused — so the split is what the fix needs and the destination side is \
      unaffected"
@@ -2698,14 +3142,16 @@ fn an_assigned_ipv6_prefix_is_treated_as_on_link_which_it_need_not_be() {
   // The destination side really is unaffected: an address NOT in `local_addrs`
   // is still refused no matter what the on-link list says, so the two roles
   // cannot be confused by the new constructor either.
-  assert!(!admits_ingress(
-    routed_peer,
-    Some(NEIGHBOUR_V6_DST),
-    None,
-    BoundLink::with_onlink_prefixes(BOUND, false, &AUTOCONF, &AUTOCONF),
-    BOUND,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      routed_peer,
+      DestinationWitness::Witnessed(NEIGHBOUR_V6_DST),
+      None,
+      BoundLink::with_onlink_prefixes(BOUND, false, &AUTOCONF, &AUTOCONF),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 /// Each of [`BoundLink`]'s two lists is read by exactly one consumer, and this
@@ -2732,7 +3178,14 @@ fn each_bound_link_list_is_read_by_exactly_one_arm() {
   let link = BoundLink::with_onlink_prefixes(BOUND, false, &LOCAL_ONLY, &ONLINK_ONLY);
 
   assert!(
-    admits_ingress(onlink_src, Some(OUR_V4_ADDR), None, link, BOUND, true),
+    admits_ingress(
+      onlink_src,
+      DestinationWitness::Witnessed(OUR_V4_ADDR),
+      None,
+      link,
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "the destination test must read `local_addrs` (which holds 192.168.1.2) \
      and the source arm must read `onlink_prefixes` (which holds 10.9.0.0/16); \
      either read taken from the other list refuses this"
@@ -2740,12 +3193,26 @@ fn each_bound_link_list_is_read_by_exactly_one_arm() {
   // The two halves, separately, so a failure above says which read is wrong.
   // A destination in the ON-LINK list but not in `local_addrs` is not ours.
   assert!(
-    !admits_ingress(onlink_src, Some(ONLINK_ADDR), None, link, BOUND, true),
+    !admits_ingress(
+      onlink_src,
+      DestinationWitness::Witnessed(ONLINK_ADDR),
+      None,
+      link,
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "10.9.0.1 is an on-link prefix's address, not an address we hold"
   );
   // A source in `local_addrs`' prefix but not in the on-link list is not on-link.
   assert!(
-    !admits_ingress(on_subnet(), Some(OUR_V4_ADDR), None, link, BOUND, true),
+    !admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(OUR_V4_ADDR),
+      None,
+      link,
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "192.168.1.7 is inside an address we hold, which is not the same fact as \
      being inside a prefix this interface treats as on-link"
   );
@@ -2772,12 +3239,12 @@ fn a_locally_delivered_address_absent_from_the_snapshot_is_refused() {
   assert!(
     !admits_ingress(
       on_subnet(),
-      Some(ANYCAST_DST),
+      DestinationWitness::Witnessed(ANYCAST_DST),
       None,
       nic(BOUND, &SUBNETS),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "an address the host holds but `getifs` 0.6.1 cannot report takes no §11 \
      arm; closing this needs the dependency to surface IFA_ANYCAST, after which \
      it joins `collect_local_subnets` and nothing here changes"
@@ -2790,14 +3257,16 @@ fn a_locally_delivered_address_absent_from_the_snapshot_is_refused() {
     (OUR_V6_ADDR, 64u8),
     (ANYCAST_DST, 32u8),
   ];
-  assert!(admits_ingress(
-    on_subnet(),
-    Some(ANYCAST_DST),
-    None,
-    nic(BOUND, &WITH_ANYCAST),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(ANYCAST_DST),
+      None,
+      nic(BOUND, &WITH_ANYCAST),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 /// A snapshot that enumerated one family and not the other refuses that family's
@@ -2816,63 +3285,73 @@ fn a_snapshot_missing_one_family_fails_closed_for_that_family_only() {
   assert!(
     !admits_ingress(
       on_subnet(),
-      Some(UNICAST_V4_DST),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
       None,
       nic(BOUND, &V6_ONLY),
-      BOUND,
-      true
-    ),
+      witnessed(BOUND)
+    )
+    .is_admit(),
     "a non-empty snapshot is a successful enumeration, so an IPv4 destination \
      missing from it is refused rather than deferred to the source arm"
   );
   // ... and the family that WAS enumerated is unaffected, so this fails closed
   // for one family rather than for the endpoint.
-  assert!(admits_ingress(
-    peer(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 7))),
-    Some(UNICAST_V6_DST),
-    None,
-    nic(BOUND, &V6_ONLY),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      peer(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 7))),
+      DestinationWitness::Witnessed(UNICAST_V6_DST),
+      None,
+      nic(BOUND, &V6_ONLY),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // The mirror, so neither family is the special one.
   static V4_ONLY: [(IpAddr, u8); 1] = [(OUR_V4_ADDR, 24u8)];
-  assert!(!admits_ingress(
-    peer(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 7))),
-    Some(UNICAST_V6_DST),
-    None,
-    nic(BOUND, &V4_ONLY),
-    BOUND,
-    true
-  ));
-  assert!(admits_ingress(
-    on_subnet(),
-    Some(UNICAST_V4_DST),
-    None,
-    nic(BOUND, &V4_ONLY),
-    BOUND,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      peer(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 7))),
+      DestinationWitness::Witnessed(UNICAST_V6_DST),
+      None,
+      nic(BOUND, &V4_ONLY),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
+  assert!(
+    admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      nic(BOUND, &V4_ONLY),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // And it is NOT the empty-snapshot fallback: an empty snapshot for a
   // loopback-bound endpoint admits its own traffic, a half-empty one does not
   // change what the enumerated family answers. Same endpoint, same destination,
   // opposite verdicts — decided by whether anything was enumerated at all.
-  assert!(admits_ingress(
-    peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-    Some(NEIGHBOUR_V4_DST),
-    None,
-    lo(BOUND, &[]),
-    BOUND,
-    true
-  ));
-  assert!(!admits_ingress(
-    peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-    Some(NEIGHBOUR_V4_DST),
-    None,
-    lo(BOUND, &V6_ONLY),
-    BOUND,
-    true
-  ));
+  assert!(
+    admits_ingress(
+      peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+      DestinationWitness::Witnessed(NEIGHBOUR_V4_DST),
+      None,
+      lo(BOUND, &[]),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
+  assert!(
+    !admits_ingress(
+      peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+      DestinationWitness::Witnessed(NEIGHBOUR_V4_DST),
+      None,
+      lo(BOUND, &V6_ONLY),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
 }
 
 /// The empty-snapshot decision, and the bound that makes it safe.
@@ -2897,12 +3376,12 @@ fn an_empty_snapshot_defers_to_the_source_arm_which_still_fails_closed() {
     assert!(
       admits_ingress(
         peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        Some(dst),
+        DestinationWitness::Witnessed(dst),
         None,
         lo(BOUND, &[]),
-        0,
-        true
-      ),
+        IfaceWitness::Lost
+      )
+      .is_admit(),
       "an endpoint that could not enumerate its loopback interface must still \
        hear its own traffic ({dst})"
     );
@@ -2920,48 +3399,419 @@ fn an_empty_snapshot_defers_to_the_source_arm_which_still_fails_closed() {
     assert!(
       !admits_ingress(
         src,
-        Some(UNICAST_V4_DST),
+        DestinationWitness::Witnessed(UNICAST_V4_DST),
         None,
         nic(BOUND, &[]),
-        BOUND,
-        true
-      ),
+        witnessed(BOUND)
+      )
+      .is_admit(),
       "{src}: an empty snapshot admits nothing for a NIC-bound endpoint"
     );
   }
   // A loopback SOURCE does not open it either, for an endpoint the loopback
   // interface is not the link of.
-  assert!(!admits_ingress(
-    peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-    Some(UNICAST_V4_DST),
-    None,
-    nic(BOUND, &[]),
-    BOUND,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      nic(BOUND, &[]),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // Nor does it survive stage 1: the fallback runs the source arm, and the
   // source arm asks `arrived_on_bound_interface` about a loopback source too.
-  assert!(!admits_ingress(
-    peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-    Some(UNICAST_V4_DST),
-    None,
-    lo(BOUND, &[]),
-    OTHER,
-    true
-  ));
+  assert!(
+    !admits_ingress(
+      peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      lo(BOUND, &[]),
+      witnessed(OTHER)
+    )
+    .is_admit()
+  );
   // The contrast that makes "empty" the operative fact rather than "small": the
   // SAME destination on a link that DID enumerate — and does not hold it — is
   // refused for the loopback-bound endpoint's own traffic.
   assert!(
     !admits_ingress(
       peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-      Some(NEIGHBOUR_V4_DST),
+      DestinationWitness::Witnessed(NEIGHBOUR_V4_DST),
       None,
       lo(BOUND, &LOOPBACK_LINK),
-      0,
-      true
-    ),
+      IfaceWitness::Lost
+    )
+    .is_admit(),
     "a non-empty snapshot that does not hold the destination is a verdict, not \
      a failed enumeration"
   );
+}
+
+// ── the two absences that are not the same absence ──────────────────────────
+//
+// RFC 6762 §11 has nothing to say about `MSG_CTRUNC`; these four cases are about
+// the INPUT model, and they are the ones the witness split exists for.
+
+/// A witness the KERNEL declined to emit decides exactly as a path that never
+/// emits one — the whole of §2's correction, stated as an equality.
+///
+/// Refusing on a declined cmsg is attacker-triggerable deafness rather than a
+/// safety property. Every BSD builds its ancillary mbufs with `M_NOWAIT` and,
+/// when `sbcreatecontrol` returns `NULL`, skips the cmsg with no error, no
+/// counter and no truncation flag while still delivering the datagram
+/// (FreeBSD `kern/uipc_sockbuf.c`, NetBSD `kern/uipc_socket2.c`; XNU is the
+/// counter-example and returns `ENOBUFS` instead). Mbuf exhaustion is normally
+/// CAUSED by a flood, so a responder that refuses here goes silently deaf
+/// exactly while it is under attack — and the fallback it refuses is not a new
+/// exposure, it is the standing behaviour of every structurally blind square.
+#[test]
+fn a_declined_witness_decides_exactly_as_a_blind_one() {
+  let sources = [
+    on_subnet(),
+    peer(OFF_SUBNET_V4),
+    peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+    peer(OFF_SUBNET_V6),
+    scoped(LINK_LOCAL, BOUND),
+  ];
+  let flags = [
+    None,
+    Some(LinkDelivery::Multicast),
+    Some(LinkDelivery::Unicast),
+    Some(LinkDelivery::Broadcast),
+  ];
+  let mut compared = 0u32;
+  for src in sources {
+    for subnets in [&SUBNETS[..], &LOOPBACK_LINK[..], &[][..]] {
+      for link in [nic(BOUND, subnets), lo(BOUND, subnets)] {
+        for flag in flags {
+          // The destination witness.
+          for iface in [
+            witnessed(BOUND),
+            IfaceWitness::Declined,
+            IfaceWitness::Blind,
+          ] {
+            compared = compared.saturating_add(1);
+            assert_eq!(
+              admits_ingress(src, DestinationWitness::Declined, flag, link, iface),
+              admits_ingress(src, DestinationWitness::Blind, flag, link, iface),
+              "a DECLINED destination witness must take the same arm as a BLIND \
+               one: {src} {flag:?} {iface:?}"
+            );
+          }
+          // ... and the interface witness, which comes off the same cmsg and so
+          // must split the same way.
+          for dst in [
+            DestinationWitness::Witnessed(UNICAST_V4_DST),
+            DestinationWitness::Witnessed(V4_GROUP),
+            DestinationWitness::Declined,
+            DestinationWitness::Blind,
+          ] {
+            compared = compared.saturating_add(1);
+            assert_eq!(
+              admits_ingress(src, dst, flag, link, IfaceWitness::Declined),
+              admits_ingress(src, dst, flag, link, IfaceWitness::Blind),
+              "a DECLINED interface witness must take the same arm as a BLIND \
+               one: {src} {dst:?} {flag:?}"
+            );
+          }
+        }
+      }
+    }
+  }
+  assert!(compared > 0, "the comparison never ran");
+}
+
+/// ... and a witness OUR OWN control buffer lost refuses where a declined one
+/// admits. The same datagram, the same link, the same source: only the reason
+/// the fact is missing differs, and it is the whole difference.
+///
+/// Safe to fail closed on precisely because it is not reachable from the wire:
+/// `MSG_CTRUNC` says the kernel HAD the fact and this side could not take it,
+/// and `CmsgBuf` is sized at 512 bytes against a worst case of about 152.
+#[test]
+fn a_lost_witness_refuses_where_a_declined_one_admits() {
+  let src = on_subnet();
+  let link = nic(BOUND, &SUBNETS);
+
+  // The interface half. Nothing else witnesses the link — an IPv4 peer carries
+  // no scope id — so the witness is the whole of stage 1's evidence.
+  assert!(
+    admits_ingress(
+      src,
+      DestinationWitness::Blind,
+      None,
+      link,
+      IfaceWitness::Declined
+    )
+    .is_admit(),
+    "a declined interface witness leaves §11's source arm deciding, and an \
+     in-prefix source passes it"
+  );
+  assert_eq!(
+    admits_ingress(
+      src,
+      DestinationWitness::Blind,
+      None,
+      link,
+      IfaceWitness::Lost
+    ),
+    Verdict::Refuse(Refuse::LinkWitnessLost),
+    "a LOST interface witness fails closed on the same datagram"
+  );
+
+  // The destination half, with the link witnessed so stage 1 cannot be what
+  // decides either case.
+  assert!(
+    admits_ingress(
+      src,
+      DestinationWitness::Declined,
+      None,
+      link,
+      witnessed(BOUND)
+    )
+    .is_admit(),
+    "a declined destination witness leaves §11's source arm deciding"
+  );
+  assert_eq!(
+    admits_ingress(src, DestinationWitness::Lost, None, link, witnessed(BOUND)),
+    Verdict::Refuse(Refuse::DestinationWitnessLost),
+    "a LOST destination witness fails closed on the same datagram"
+  );
+
+  // And a lost destination witness outranks even the coarse multicast flag,
+  // which would otherwise admit: `Lost` is a failed proof, and no later stage
+  // overturns one.
+  assert_eq!(
+    admits_ingress(
+      src,
+      DestinationWitness::Lost,
+      Some(LinkDelivery::Multicast),
+      link,
+      witnessed(BOUND)
+    ),
+    Verdict::Refuse(Refuse::DestinationWitnessLost),
+    "a lost destination witness is not rescued by the delivery class"
+  );
+}
+
+/// A receive path cannot spell "I do not know" as an interface, and cannot
+/// declare itself blind one datagram at a time.
+///
+/// `Witnessed(0)` is unrepresentable — that is what [`NonZeroU32`] buys — so the
+/// pair that used to pass a zero index positionally into the permissive arm has
+/// no way to say it any more. And `Blind` comes only from [`IfaceWitness::blind`]
+/// / [`DestinationWitness::blind`], never from a per-datagram absence, so a truncated cmsg
+/// can never masquerade as a platform that reports nothing.
+#[test]
+fn a_reporting_path_can_never_mint_a_zero_witness_or_declare_itself_blind() {
+  assert_eq!(
+    IfaceWitness::from_reporting_path(BOUND, false),
+    witnessed(BOUND),
+    "a nonzero index is witnessed whatever the truncation flag says"
+  );
+  assert_eq!(
+    IfaceWitness::from_reporting_path(BOUND, true),
+    witnessed(BOUND),
+    "a recovered index is a recovered index: truncation only matters when it \
+     cost us the fact"
+  );
+  assert_eq!(
+    IfaceWitness::from_reporting_path(0, true),
+    IfaceWitness::Lost,
+    "no index and OUR buffer truncated is a failed proof"
+  );
+  assert_eq!(
+    IfaceWitness::from_reporting_path(0, false),
+    IfaceWitness::Declined,
+    "no index and no truncation is the kernel declining, NOT a blind path: a \
+     capability is declared once and cannot be inferred from one datagram"
+  );
+  assert_eq!(IfaceWitness::blind(), IfaceWitness::Blind);
+  assert_eq!(IfaceWitness::Blind.witnessed_index(), None);
+  assert_eq!(IfaceWitness::Lost.witnessed_index(), None);
+  assert_eq!(IfaceWitness::Declined.witnessed_index(), None);
+  assert_eq!(
+    witnessed(BOUND).witnessed_index().map(NonZeroU32::get),
+    Some(BOUND)
+  );
+
+  let dst = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2));
+  assert_eq!(
+    DestinationWitness::from_reporting_path(Some(dst), false),
+    DestinationWitness::Witnessed(dst)
+  );
+  assert_eq!(
+    DestinationWitness::from_reporting_path(Some(dst), true),
+    DestinationWitness::Witnessed(dst),
+    "a recovered destination survives a truncation that cost us something else"
+  );
+  assert_eq!(
+    DestinationWitness::from_reporting_path(None, true),
+    DestinationWitness::Lost,
+    "no destination and OUR buffer truncated is a failed proof"
+  );
+  assert_eq!(
+    DestinationWitness::from_reporting_path(None, false),
+    DestinationWitness::Declined,
+    "no destination and no truncation is the kernel declining, not a blind path"
+  );
+  assert_eq!(DestinationWitness::blind(), DestinationWitness::Blind);
+  assert_eq!(DestinationWitness::Blind.witnessed_destination(), None);
+  assert_eq!(DestinationWitness::Lost.witnessed_destination(), None);
+  assert_eq!(DestinationWitness::Declined.witnessed_destination(), None);
+  assert_eq!(
+    DestinationWitness::Witnessed(dst).witnessed_destination(),
+    Some(dst),
+    "and the address comes back out for a log to read"
+  );
+}
+
+/// An IPv4-MAPPED IPv6 destination is CLASSIFIED, not absorbed.
+///
+/// `::ffff:224.0.0.251` is the IPv4 mDNS group written as an IPv6 address, and
+/// `Ipv6Addr::is_multicast` answers **false** for it: `::ffff:0:0/96` is not
+/// `ff00::/8`. A partition that sorted IPv6 destinations into "group" and
+/// "everything else" would therefore put an mDNS group into "everything else"
+/// and never say so — the exact shape four review rounds kept finding.
+///
+/// `IPV6_V6ONLY` is set at bind on both Unix and Windows, so nothing here is
+/// reachable on this workspace's sockets today. That is a reason to name the
+/// class rather than to leave the partition depending on a sockopt three files
+/// away for its exhaustiveness.
+#[test]
+fn an_ipv4_mapped_destination_is_named_rather_than_left_to_the_residual() {
+  let mapped_group = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xe000, 0x00fb));
+  let mapped_unicast = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc0a8, 0x0102));
+
+  // The premise the classification rests on, stated rather than assumed.
+  assert!(
+    !matches!(mapped_group, IpAddr::V6(a) if a.is_multicast()),
+    "::ffff:224.0.0.251 is not an IPv6 multicast address, which is why it needs \
+     an arm of its own"
+  );
+  assert!(
+    !is_mdns_group(mapped_group),
+    "and it is not one of §11's two groups either"
+  );
+
+  for dst in [mapped_group, mapped_unicast] {
+    assert_eq!(
+      admits_ingress(
+        on_subnet(),
+        DestinationWitness::Witnessed(dst),
+        None,
+        nic(BOUND, &SUBNETS),
+        witnessed(BOUND)
+      ),
+      Verdict::Refuse(Refuse::Ipv4MappedDestination),
+      "an IPv4-mapped destination is refused AS one: {dst}"
+    );
+  }
+}
+
+/// The two counters the conformance gaps are measured with, pinned at the
+/// verdicts they are supposed to count.
+///
+/// [`Verdict::is_degraded_admit`] is what makes a datagram admitted with no
+/// destination witness visible — a `Declined` cmsg would otherwise be an
+/// admission indistinguishable from a fully-witnessed one.
+/// [`Verdict::is_residual_refusal`] is the size of what §11 gives no arm and
+/// this partition does not name.
+#[test]
+fn the_two_gap_counters_count_exactly_their_own_arms() {
+  let link = nic(BOUND, &SUBNETS);
+
+  // A degraded admission: no destination witnessed, source in prefix.
+  let degraded = admits_ingress(
+    on_subnet(),
+    DestinationWitness::Declined,
+    None,
+    link,
+    witnessed(BOUND),
+  );
+  assert_eq!(degraded, Verdict::Admit(Admit::BlindSourceOnLink));
+  assert!(
+    degraded.is_degraded_admit(),
+    "an admission with no destination witness is a DEGRADED one and must count \
+     as such"
+  );
+  assert!(!degraded.is_residual_refusal());
+
+  // So is the coarse multicast flag: it names no group, so it admits LLMNR's as
+  // readily as ours.
+  let coarse = admits_ingress(
+    on_subnet(),
+    DestinationWitness::Blind,
+    Some(LinkDelivery::Multicast),
+    link,
+    witnessed(BOUND),
+  );
+  assert_eq!(coarse, Verdict::Admit(Admit::BlindMulticastDelivery));
+  assert!(
+    coarse.is_degraded_admit(),
+    "a group admitted on a flag that cannot say WHICH group is degraded too"
+  );
+
+  // A fully witnessed admission is NOT degraded, in either arm.
+  for (dst, arm) in [
+    (DestinationWitness::Witnessed(V4_GROUP), Admit::MdnsGroup),
+    (
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      Admit::HeldDestination,
+    ),
+  ] {
+    let full = admits_ingress(on_subnet(), dst, None, link, witnessed(BOUND));
+    assert_eq!(full, Verdict::Admit(arm));
+    assert!(
+      !full.is_degraded_admit(),
+      "a witnessed destination is not a degraded admission: {dst:?}"
+    );
+  }
+
+  // The residual: a destination this endpoint does not hold and that no named
+  // class describes.
+  let residual = admits_ingress(
+    on_subnet(),
+    DestinationWitness::Witnessed(NEIGHBOUR_V4_DST),
+    None,
+    link,
+    witnessed(BOUND),
+  );
+  assert_eq!(residual, Verdict::Refuse(Refuse::DestinationNotHeld));
+  assert!(
+    residual.is_residual_refusal(),
+    "a neighbour's address is the residual, and the counter must see it"
+  );
+  assert!(!residual.is_degraded_admit());
+
+  // A NAMED refusal is not the residual, however much it looks like one.
+  for (dst, reason) in [
+    (
+      DestinationWitness::Witnessed(FOREIGN_V4_GROUP),
+      Refuse::ForeignGroup,
+    ),
+    (
+      DestinationWitness::Witnessed(LIMITED_BROADCAST),
+      Refuse::BroadcastAddressed,
+    ),
+    (
+      DestinationWitness::Witnessed(UNSPECIFIED_V4_DST),
+      Refuse::UnspecifiedDestination,
+    ),
+    (
+      DestinationWitness::Witnessed(LOOPBACK_V4_ADDR),
+      Refuse::LoopbackDestinationOffLoopbackBinding,
+    ),
+  ] {
+    let named = admits_ingress(on_subnet(), dst, None, link, witnessed(BOUND));
+    assert_eq!(named, Verdict::Refuse(reason), "{dst:?}");
+    assert!(
+      !named.is_residual_refusal(),
+      "a class with a name of its own must not inflate the residual's count: \
+       {dst:?}"
+    );
+  }
 }
