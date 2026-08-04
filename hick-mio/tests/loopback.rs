@@ -251,6 +251,12 @@ fn shutdown_drives_goodbyes_to_idle_and_a_peer_observes_them() {
 
   #[cfg(feature = "stats")]
   let expirations_before = observer.mdns.stats().cache_expirations;
+  // Independent of `goodbyes_tx`: bumped inside `Sockets::send_one`, a code
+  // path `drain_withdrawals`'s own `goodbyes_tx` bump never touches, so a
+  // regression that stops the latter cannot silently move this one too. See
+  // the disjunction built from it below.
+  #[cfg(feature = "stats")]
+  let packets_before = responder.mdns.stats().packets_tx;
 
   responder.mdns.shutdown();
   let idle = common::pump_pair(
@@ -267,16 +273,66 @@ fn shutdown_drives_goodbyes_to_idle_and_a_peer_observes_them() {
 
   #[cfg(feature = "stats")]
   {
-    // Independent of whether the observer resolved anything: `advertise`
-    // above already proved this responder's own sends work, so reaching
-    // is_idle must mean at least one §10.1 round was actually delivered.
-    // `goodbyes_tx` was once bumped nowhere in the crate; this is the
-    // end-to-end guard for that.
-    assert!(
-      responder.mdns.stats().goodbyes_tx > 0,
-      "shutdown reached is_idle, so at least one delivered withdrawal round must have bumped \
-       goodbyes_tx"
-    );
+    // `is_idle` is NOT a delivery guarantee — `drain_withdrawals` exits once
+    // every family's debt clears OR the §10.1 anti-pin ceiling force-completes
+    // the item regardless of debt (see `hick-mio/src/driver/withdrawal.rs`'s
+    // `drain_withdrawals` and `mdns-proto/src/endpoint/withdrawal.rs`'s
+    // `poll_withdrawal_transmit`/`drain_completed_withdrawals`), and
+    // `goodbyes_tx` is bumped only at the round level when a family reaches
+    // `Accepted`. Three test binaries sharing one multicast group is exactly
+    // what makes the ceiling path reachable: every round can legitimately be
+    // refused or gated for the whole 2 s ceiling, so `goodbyes_tx == 0` here is
+    // not automatically a regression.
+    //
+    // `degraded_families` alone is NOT sufficient evidence for that, though:
+    // on a dual-stack host `degraded_families` is per family, and a family
+    // that never sent anything can be degraded while the OTHER family
+    // delivered every round fine — a real `goodbyes_tx` regression would then
+    // still reach `is_idle` with `goodbyes_tx == 0` and a degraded v6, and
+    // that must still fail. `packets_tx` is the independent signal that
+    // closes this: it is bumped inside `Sockets::send_one`, a code path
+    // `drain_withdrawals`'s own `goodbyes_tx` bump never touches, so it moves
+    // if and only if a real send reached the kernel, on either family. If it
+    // rose during this withdrawal, `goodbyes_tx` MUST have risen too —
+    // unconditionally, regardless of what the other family's health looks
+    // like.
+    //
+    // The converse — `packets_tx` did NOT move — is by itself the FULL proof
+    // that `goodbyes_tx` correctly stayed put too, with no further
+    // corroboration needed: `goodbyes_tx` can rise only after a family's
+    // attempt resolves `Accepted`, which cannot happen without that same
+    // attempt already having bumped `packets_tx` first. An EARLIER version of
+    // this check additionally required `degraded_families` to explain the
+    // zero, which is a strictly WEAKER fact than `packets_tx` not moving
+    // (`degraded_families` needs three CONSECUTIVE non-`Accepted` outcomes,
+    // so it can still read `false` after only one or two attempts — e.g. a
+    // scheduler that starved this test's own thread until close to the
+    // ceiling) and made this test flake on exactly the kind of contention it
+    // exists to tolerate. Keeping it would have reintroduced a discriminator
+    // that is not independent of *how many* attempts the scheduler allowed,
+    // the same shape of defect this whole rewrite exists to remove.
+    let goodbyes_tx = responder.mdns.stats().goodbyes_tx;
+    let packets_tx = responder.mdns.stats().packets_tx;
+    if packets_tx > packets_before {
+      assert!(
+        goodbyes_tx > 0,
+        "a raw send reached the kernel during this withdrawal (packets_tx {packets_before} -> \
+         {packets_tx}), so goodbyes_tx must have bumped too; it stayed at 0"
+      );
+    } else {
+      assert_eq!(
+        goodbyes_tx, 0,
+        "no raw send reached the kernel this withdrawal (packets_tx stayed at {packets_before}), \
+         so goodbyes_tx cannot have moved either — it went to {goodbyes_tx}"
+      );
+      let (v4_degraded, v6_degraded) = responder.mdns.degraded_families();
+      eprintln!(
+        "skipping: the peer-side goodbye observation: every withdrawal round was refused or \
+         gated for this responder's whole anti-pin ceiling (degraded v4={v4_degraded} \
+         v6={v6_degraded}), so no goodbye ever reached the wire to observe"
+      );
+      return;
+    }
     if !observed {
       eprintln!(
         "skipping: the peer-side goodbye observation: the observer never resolved the service, \

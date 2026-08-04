@@ -21,8 +21,8 @@
 mod common;
 
 use std::{
-  net::{IpAddr, Ipv6Addr},
-  time::Duration,
+  net::{IpAddr, Ipv4Addr, Ipv6Addr},
+  time::{Duration, Instant},
 };
 
 use hick_reactor::{
@@ -153,6 +153,336 @@ async fn run_query(
   .unwrap_or_default()
 }
 
+// ── an independent witness that multicast loopback actually carries ────────
+//
+// `packets_rx`, hick's own receive counter, is NOT independent of the driver
+// these tests exist to catch a regression in: a regression that stops query
+// transmission, stops response generation, or stops receive processing
+// yields `packets_rx == 0` exactly like a genuinely silent environment, so a
+// discriminator built from it would let every affected test skip instead of
+// fail. `hick-reactor/tests/parity_bonjour.rs` (PR #59) already solved this
+// class of problem for the harder case — hick versus an external daemon on
+// the real NIC — with a control socket deliberately outside hick's own
+// stack, whose OWN observations decide environment from regression rather
+// than a counter the system under test produced. This is the same shape, cut
+// down for the easier case this file needs: one host, the loopback
+// interface, no daemon involved. Send a throwaway multicast datagram from a
+// socket of our own, joined to the mDNS group on loopback exactly as
+// `loopback_index()` pins hick's own endpoints, and require that SAME socket
+// to receive its own copy back.
+//
+// Built on `std::net::UdpSocket` wherever its stable API covers what this
+// needs — bind, group membership, loopback delivery, the receive timeout,
+// and the send/receive calls themselves — rather than hand-rolled `libc`
+// throughout. `std` is exactly as independent of hick-reactor's driver as raw
+// `libc` is (independence from THIS CRATE's driver is the property the
+// witness needs, not independence from the standard library), and it gets
+// every per-platform width and layout right on its own — which raw `libc`
+// does NOT, for free, the moment a caller has to choose an option's value
+// type by hand. `IP_MULTICAST_LOOP` used to be exactly that: a hardcoded
+// `c_int`, when FreeBSD, DragonFly, OpenBSD and NetBSD define the option as a
+// one-byte `c_uchar` and reject the wrong width with `EINVAL` — which
+// `refuses_the_link` below correctly does NOT treat as an environment fact,
+// so the witness panicked on every run on those four targets instead of
+// working. `hick-udp/src/platform/unix.rs`'s `set_int_sockopt` documents the
+// exact same divergence and keeps `set_multicast_loop_v4`/
+// `set_multicast_ttl_v4` off that chokepoint for exactly this reason — this
+// was in-repo prior art this file failed to reuse the first time.
+//
+// Only `IP_MULTICAST_IF` — selecting an interface for multicast EGRESS, as
+// opposed to group membership — has no `std::net` equivalent, so that one
+// option alone still goes through a raw `setsockopt`; see
+// `select_multicast_egress` for why it does not have a comparable
+// width-mismatch risk.
+
+/// The mDNS multicast group. Restated here, deliberately, rather than
+/// imported from hick — this witness must not be able to inherit a defect in
+/// hick's own constant.
+const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+
+/// Why [`LoopbackWitness`] could not settle the question.
+#[cfg(unix)]
+enum WitnessError {
+  /// The kernel refused an operation that NAMES the loopback link itself
+  /// (joining the group on it, selecting it for egress, or sending through
+  /// it), and the errno is on the narrow allowlist below. This is the one
+  /// case that may report "environment unavailable" rather than fail the
+  /// test outright.
+  LinkRefused(String),
+  /// Anything else — the socket could not even be opened, an option that
+  /// names no link was refused, the receive call itself errored. This is a
+  /// bug in this harness, never evidence about the host, and must fail the
+  /// test like any other bug would.
+  Harness(String),
+}
+
+/// The errnos on which the kernel is refusing the LOOPBACK LINK itself,
+/// rather than refusing something about our own call. Restated from
+/// `parity_bonjour.rs`'s `refuses_the_link` (PR #59) — same allowlist, same
+/// discipline: matched on `raw_os_error` rather than `ErrorKind`, and
+/// deliberately narrow. `EINVAL` stays off it on purpose: a malformed call
+/// here is this harness's own bug — the exact shape of the `IP_MULTICAST_LOOP`
+/// width defect this file once had — and admitting it would let a real
+/// defect in this file read as an unavailable environment instead of failing
+/// loudly.
+#[cfg(unix)]
+fn refuses_the_link(e: &std::io::Error) -> bool {
+  matches!(
+    e.raw_os_error(),
+    Some(libc::EHOSTUNREACH)
+      | Some(libc::ENETUNREACH)
+      | Some(libc::ENETDOWN)
+      | Some(libc::EADDRNOTAVAIL)
+  )
+}
+
+/// Classify `e` from an operation that names `context` (join / select-egress
+/// / send) — the only three calls that name the loopback link itself.
+///
+/// Takes the error as a VALUE rather than re-reading `std::io::Error::
+/// last_os_error()`: every call site here now goes through `std::net`
+/// methods, which already hand back the `io::Error` they failed with, so
+/// there is no `errno` left to race by reading it back out of thin air a
+/// statement later.
+#[cfg(unix)]
+fn link_call_failed(e: std::io::Error, context: &str) -> WitnessError {
+  let described = format!("{context}: {e}");
+  if refuses_the_link(&e) {
+    WitnessError::LinkRefused(described)
+  } else {
+    WitnessError::Harness(described)
+  }
+}
+
+#[cfg(unix)]
+fn to_in_addr(addr: Ipv4Addr) -> libc::in_addr {
+  libc::in_addr {
+    s_addr: u32::from_ne_bytes(addr.octets()),
+  }
+}
+
+/// Select `interface` for multicast EGRESS (`IP_MULTICAST_IF`) — distinct
+/// from group MEMBERSHIP, which `std::net::UdpSocket::join_multicast_v4`
+/// already covers. This is the one option in this witness with no
+/// `std::net` equivalent (std can join a group and enable loopback delivery,
+/// but never lets a caller choose the outbound interface for a multicast
+/// send), so it alone still goes through a raw `setsockopt`.
+///
+/// NOT the same class of bug `IP_MULTICAST_LOOP` was: that option's value is
+/// a bare scalar whose C type a caller has to choose by hand, and BSD
+/// documents it as `u_char` where this file had hardcoded `c_int`. This
+/// option's value is `libc::in_addr` — a STRUCT `libc` itself defines per
+/// target, whose `size_of` is therefore already correct per target, the same
+/// way `size_of::<libc::sockaddr_in>()` was never the problem when `sin_len`
+/// was (see `to_in_addr`'s caller history). There is no hand-chosen width
+/// here to get wrong.
+#[cfg(unix)]
+fn select_multicast_egress(sock: &std::net::UdpSocket, interface: Ipv4Addr) -> std::io::Result<()> {
+  let addr = to_in_addr(interface);
+  // SAFETY: `sock` owns a valid UDP fd for the duration of the call; `addr`
+  // is a live, correctly-sized `in_addr` and its length is passed alongside;
+  // `setsockopt` does not retain the pointer past the call.
+  let rc = unsafe {
+    libc::setsockopt(
+      std::os::fd::AsRawFd::as_raw_fd(sock),
+      libc::IPPROTO_IP,
+      libc::IP_MULTICAST_IF,
+      std::ptr::from_ref(&addr).cast(),
+      size_of::<libc::in_addr>() as libc::socklen_t,
+    )
+  };
+  if rc < 0 {
+    Err(std::io::Error::last_os_error())
+  } else {
+    Ok(())
+  }
+}
+
+/// Not a native-execution proof — this workspace's FreeBSD CI job
+/// (`.github/workflows/ci.yml`'s `freebsd`) runs only `hick-udp`, and no
+/// native NetBSD/OpenBSD/DragonFly execution exists anywhere in it, so
+/// nothing available from this file's own test run ever puts a real
+/// `setsockopt(IP_MULTICAST_LOOP, ...)` in front of one of those kernels to
+/// confirm it rejects a `c_int`-sized value. What this DOES pin, on every
+/// target where it runs, is the Rust-level size fact the original defect
+/// depended on: `hick-udp/src/platform/unix.rs`'s `set_int_sockopt` documents
+/// `IP_MULTICAST_LOOP`/`IP_MULTICAST_TTL` as `u_char`-valued on the BSD
+/// family, one byte, where this file used to hardcode a four-byte `c_int`.
+/// If a future change reintroduces a raw `setsockopt` for either option sized
+/// from `size_of::<libc::c_int>()`, this is the assertion that should have
+/// been sitting next to it to update consciously rather than the gap being
+/// silent again — the same reasoning `to_in_addr`'s sibling `sin_len` fix
+/// left behind for the sockaddr case.
+#[cfg(unix)]
+#[test]
+fn c_uchar_is_not_c_int_sized_where_bsd_multicast_options_need_the_distinction() {
+  assert_eq!(
+    size_of::<libc::c_uchar>(),
+    1,
+    "IP_MULTICAST_LOOP/IP_MULTICAST_TTL's documented BSD-family value type"
+  );
+  assert_ne!(
+    size_of::<libc::c_uchar>(),
+    size_of::<libc::c_int>(),
+    "a setsockopt for IP_MULTICAST_LOOP or IP_MULTICAST_TTL sized from \
+     size_of::<libc::c_int>() is the exact width this file's IP_MULTICAST_LOOP \
+     bug was; use std::net::UdpSocket's own set_multicast_loop_v4/\
+     set_multicast_ttl_v4 instead of hand-rolling either (see \
+     hick-udp/src/platform/unix.rs's set_int_sockopt doc for the kernel-side \
+     EINVAL a mismatched width produces)"
+  );
+}
+
+/// An independent socket: opened, joined to the mDNS group on loopback, and
+/// sent from without touching hick's driver at all. See the module doc above
+/// for why this wraps `std::net::UdpSocket` rather than a raw fd — its own
+/// `Drop` closes the socket, so this type needs none of its own.
+#[cfg(unix)]
+struct LoopbackWitness {
+  sock: std::net::UdpSocket,
+}
+
+#[cfg(unix)]
+impl LoopbackWitness {
+  /// Open a UDP socket bound to an ephemeral port — no need to coexist with
+  /// hick's own `:5353`, since this witness never talks to hick at all — join
+  /// the mDNS group on the loopback interface, and select loopback for
+  /// multicast egress: the same membership and egress selection hick's own
+  /// endpoints take when `loopback_index()` picks the loopback interface.
+  fn open() -> Result<Self, WitnessError> {
+    let sock = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+      .map_err(|e| WitnessError::Harness(format!("witness socket could not bind: {e}")))?;
+    sock
+      .join_multicast_v4(&MDNS_GROUP, &Ipv4Addr::LOCALHOST)
+      .map_err(|e| link_call_failed(e, "could not join the mDNS group on loopback"))?;
+    select_multicast_egress(&sock, Ipv4Addr::LOCALHOST)
+      .map_err(|e| link_call_failed(e, "could not select loopback for multicast egress"))?;
+    sock.set_multicast_loop_v4(true).map_err(|e| {
+      WitnessError::Harness(format!(
+        "witness socket could not enable multicast loopback: {e}"
+      ))
+    })?;
+    sock
+      .set_read_timeout(Some(Duration::from_secs(1)))
+      .map_err(|e| {
+        WitnessError::Harness(format!(
+          "witness socket could not take a receive timeout: {e}"
+        ))
+      })?;
+    Ok(Self { sock })
+  }
+
+  /// The ephemeral port this socket actually bound to.
+  fn port(&self) -> Result<u16, WitnessError> {
+    self.sock.local_addr().map(|a| a.port()).map_err(|e| {
+      WitnessError::Harness(format!(
+        "witness socket's own address could not be read: {e}"
+      ))
+    })
+  }
+
+  /// Send one throwaway datagram to the mDNS group, addressed to this
+  /// socket's own bound port so the SAME socket is the one that must receive
+  /// it back.
+  fn send_throwaway(&self, port: u16, payload: &[u8]) -> Result<(), WitnessError> {
+    self
+      .sock
+      .send_to(payload, (MDNS_GROUP, port))
+      .map(|_| ())
+      .map_err(|e| link_call_failed(e, "could not send to the mDNS group"))
+  }
+
+  /// Wait up to `budget` for this socket to receive `payload` back, whole and
+  /// unchanged.
+  fn receives_back(&self, payload: &[u8], budget: Duration) -> Result<bool, WitnessError> {
+    let deadline = Instant::now() + budget;
+    let mut buf = [0u8; 128];
+    while Instant::now() < deadline {
+      match self.sock.recv(&mut buf) {
+        Ok(n) if buf.get(..n) == Some(payload) => return Ok(true),
+        // Something else arrived on the group (another test's own traffic);
+        // keep waiting out the budget for our own copy.
+        Ok(_) => continue,
+        // A window that expires with nothing in it is not an error: it is an
+        // unproven link, which the caller reads as such.
+        Err(e)
+          if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+          ) =>
+        {
+          continue;
+        }
+        Err(e) => {
+          return Err(WitnessError::Harness(format!(
+            "witness socket could not receive: {e}"
+          )));
+        }
+      }
+    }
+    Ok(false)
+  }
+}
+
+/// Whether multicast loopback delivery is available on this host right now,
+/// proven independently of hick's own driver — see the module doc above.
+///
+/// Only a kernel refusal of the loopback LINK ITSELF, corroborated by the
+/// narrow errno allowlist above, may report `false` ("environment
+/// unavailable", the one condition under which a caller may skip). Anything
+/// that is this harness's own fault — the witness socket could not even be
+/// opened, an unrelated option was refused, the receive call itself errored —
+/// panics instead of quietly returning either `bool`: a broken witness proves
+/// nothing about the host, and folding it into either answer would let a bug
+/// in this file masquerade as a skip or, just as bad, as a passing case that
+/// never actually witnessed anything.
+///
+/// Non-unix targets have no independent witness here yet — `parity_bonjour.rs`
+/// itself is `target_os = "macos"`-only for the same reason — so nothing in
+/// this file may skip on them: an occasional environmental false failure
+/// there is preferable to ever masking a real regression.
+fn multicast_loopback_carries() -> bool {
+  #[cfg(unix)]
+  {
+    let outcome = (|| -> Result<bool, WitnessError> {
+      let witness = LoopbackWitness::open()?;
+      let port = witness.port()?;
+      let payload = format!("hick-loopback-witness-{:x}", std::process::id()).into_bytes();
+      witness.send_throwaway(port, &payload)?;
+      witness.receives_back(&payload, Duration::from_secs(2))
+    })();
+    match outcome {
+      Ok(true) => true,
+      Ok(false) => {
+        eprintln!(
+          "note: the independent loopback witness sent a datagram to the mDNS group and did \
+           not receive it back within budget; treating multicast loopback as unavailable on \
+           this host"
+        );
+        false
+      }
+      Err(WitnessError::LinkRefused(reason)) => {
+        eprintln!(
+          "note: the independent loopback witness had the loopback link itself refused ({reason}); \
+           treating multicast loopback as unavailable on this host"
+        );
+        false
+      }
+      Err(WitnessError::Harness(reason)) => {
+        panic!(
+          "the independent loopback witness could not run ({reason}); this is a bug in this \
+           test file, not evidence about the environment, so it must fail rather than let a \
+           caller read it as either a skip or a pass"
+        );
+      }
+    }
+  }
+  #[cfg(not(unix))]
+  {
+    true
+  }
+}
+
 #[tokio::test]
 async fn loopback_ptr_query_returns_instance() {
   let pair = match build_pair(Duration::from_millis(1300)).await {
@@ -171,6 +501,13 @@ async fn loopback_ptr_query_returns_instance() {
     answers.len(),
     answers.iter().map(|a| a.rtype()).collect::<Vec<_>>()
   );
+  if !saw_ptr && !multicast_loopback_carries() {
+    eprintln!(
+      "skipping: the querier's socket received no datagram at all in this run: this run did \
+       not deliver multicast loopback to it"
+    );
+    return;
+  }
   assert!(saw_ptr, "expected PTR answer; got {}", answers.len());
 }
 
@@ -192,6 +529,13 @@ async fn loopback_srv_query_returns_target() {
     answers.iter().map(|a| a.rtype()).collect::<Vec<_>>()
   );
   let saw_srv = answers.iter().any(|a| a.rtype() == ResourceType::Srv);
+  if !saw_srv && !multicast_loopback_carries() {
+    eprintln!(
+      "skipping: the querier's socket received no datagram at all in this run: this run did \
+       not deliver multicast loopback to it"
+    );
+    return;
+  }
   assert!(saw_srv, "expected SRV answer; got {}", answers.len());
 }
 
@@ -210,6 +554,13 @@ async fn loopback_a_query_returns_address() {
     answers.iter().map(|a| a.rtype()).collect::<Vec<_>>()
   );
   let saw_a = answers.iter().any(|a| a.rtype() == ResourceType::A);
+  if !saw_a && !multicast_loopback_carries() {
+    eprintln!(
+      "skipping: the querier's socket received no datagram at all in this run: this run did \
+       not deliver multicast loopback to it"
+    );
+    return;
+  }
   assert!(saw_a, "expected A answer; got {}", answers.len());
   let a_rdata = answers
     .iter()
@@ -235,8 +586,15 @@ async fn loopback_aaaa_query_returns_address() {
   );
   // AAAA over an IPv4-only loopback socket only works if the responder
   // includes AAAA in its response (it does — write_announce emits all
-  // record types regardless of socket family). Soft-assert and log.
+  // record types regardless of socket family).
   let saw_aaaa = answers.iter().any(|a| a.rtype() == ResourceType::AAAA);
+  if !saw_aaaa && !multicast_loopback_carries() {
+    eprintln!(
+      "skipping: the querier's socket received no datagram at all in this run: this run did \
+       not deliver multicast loopback to it"
+    );
+    return;
+  }
   assert!(saw_aaaa, "expected AAAA answer; got {}", answers.len());
 }
 
@@ -258,6 +616,13 @@ async fn loopback_txt_query_returns_payload() {
     answers.iter().map(|a| a.rtype()).collect::<Vec<_>>()
   );
   let saw_txt = answers.iter().any(|a| a.rtype() == ResourceType::Txt);
+  if !saw_txt && !multicast_loopback_carries() {
+    eprintln!(
+      "skipping: the querier's socket received no datagram at all in this run: this run did \
+       not deliver multicast loopback to it"
+    );
+    return;
+  }
   assert!(saw_txt, "expected TXT answer; got {}", answers.len());
 }
 
@@ -284,6 +649,13 @@ async fn loopback_any_query_returns_full_record_set() {
   );
   let saw_srv = answers.iter().any(|a| a.rtype() == ResourceType::Srv);
   let saw_txt = answers.iter().any(|a| a.rtype() == ResourceType::Txt);
+  if !(saw_srv && saw_txt) && !multicast_loopback_carries() {
+    eprintln!(
+      "skipping: the querier's socket received no datagram at all in this run: this run did \
+       not deliver multicast loopback to it"
+    );
+    return;
+  }
   assert!(saw_srv && saw_txt, "expected SRV+TXT; got {answers:?}");
 }
 
@@ -345,7 +717,16 @@ async fn loopback_browse_resolves_service_entry() {
 
   let entry = match entry {
     Some(e) => e,
-    None => panic!("browse did not resolve any instance of {UNIQUE_SERVICE}"),
+    None => {
+      if !multicast_loopback_carries() {
+        eprintln!(
+          "skipping: the querier's socket received no datagram at all in this run: this run \
+           did not deliver multicast loopback to it"
+        );
+        return;
+      }
+      panic!("browse did not resolve any instance of {UNIQUE_SERVICE}");
+    }
   };
   assert_eq!(entry.port(), SERVICE_PORT, "wrong port");
   assert!(
@@ -389,6 +770,13 @@ async fn loopback_resolve_host_returns_addresses() {
     }
   };
   eprintln!("resolve_host: {addrs:?}");
+  if !addrs.contains(&IpAddr::V4(ADVERTISED_V4.into())) && !multicast_loopback_carries() {
+    eprintln!(
+      "skipping: the querier's socket received no datagram at all in this run: this run did \
+       not deliver multicast loopback to it"
+    );
+    return;
+  }
   assert!(
     addrs.contains(&IpAddr::V4(ADVERTISED_V4.into())),
     "expected {ADVERTISED_V4:?} in {addrs:?}"
@@ -419,7 +807,16 @@ async fn loopback_resolve_instance_returns_entry() {
   .await;
   let entry = match resolved {
     Ok(Ok(Some(e))) => e,
-    other => panic!("resolve_instance did not resolve {INST}: {other:?}"),
+    other => {
+      if !multicast_loopback_carries() {
+        eprintln!(
+          "skipping: the querier's socket received no datagram at all in this run: this run \
+           did not deliver multicast loopback to it"
+        );
+        return;
+      }
+      panic!("resolve_instance did not resolve {INST}: {other:?}");
+    }
   };
   eprintln!(
     "resolve_instance: host={} port={} v4={:?} v6={:?}",
