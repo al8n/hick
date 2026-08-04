@@ -73,12 +73,25 @@ jobs:
   # OpenBSD, which has no rustup std); Android covers the linux_like NDK build.
   # These are the capability families behind `hick-udp/build.rs`.
   #
+  # `--all-targets` below is load-bearing, not decorative: plain `cargo check`
+  # builds only lib + bins, never `#[cfg(test)]` code, so a test-only
+  # portability break on these targets was invisible to this job. That was
+  # not hypothetical — a test in hick-compio named `libc::IP_PKTINFO`/
+  # `in_pktinfo` under a bare `#[cfg(all(unix, test))]`, which FreeBSD's libc
+  # does not bind, and this job stayed green through it. The same shape sent
+  # `libc::sockaddr_in::sin_len` — a BSD-only field — into a `#[cfg(unix)]`
+  # test in PR #72; only an external reviewer caught that one, since macOS
+  # (which does run `--all-targets`, see `os-clippy` below) has the field and
+  # so could not have.
+  #
   # NetBSD is scoped to the sans-io crates (mdns-proto + hick-udp): the
   # hick-reactor tokio driver depends on mio, which does not build on NetBSD —
   # and so does hick-mio, which depends on mio directly rather than through
   # tokio. The NetBSD portability target is the sans-io mechanism + socket
   # layer, not a mio-based policy layer. FreeBSD/Android check the whole
-  # workspace.
+  # workspace. `--all-targets` does not widen that scope, only what gets
+  # checked within it: NetBSD stays `-p mdns-proto -p hick-udp`, now including
+  # those two crates' test/bench/example targets alongside their libs.
   cross-check:
     runs-on: ubuntu-latest
     strategy:
@@ -97,7 +110,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check ${{ matrix.scope }} --target ${{ matrix.target }}
+      - run: cargo check ${{ matrix.scope }} --all-targets --target ${{ matrix.target }}
 
   # The first NATIVE execution of this workspace's tests on a BSD. `cross-check`
   # above only COMPILES FreeBSD, so hick-udp's cmsg tests — the whole evidence
