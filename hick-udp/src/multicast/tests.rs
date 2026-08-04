@@ -1337,3 +1337,690 @@ fn a_present_pktinfo_naming_no_interface_declines_rather_than_failing_a_proof() 
   // header and which a parser defined over a byte slice cannot even observe.
   assert_ne!(meta.iface_witness(), crate::onlink::IfaceWitness::Lost);
 }
+
+// ============================================================================
+// EVIDENCE FOR `has_ip_dstaddr_recvif`, the capability flip in `build.rs`.
+//
+// Item 4 (`MSG_CTRUNC` stays clear) is measured below on EVERY host: it is
+// arithmetic over `libc`'s own `CMSG_SPACE` and needs no BSD to be true. Items
+// 1-3 need a kernel that actually delivers the cmsgs, so they are the two live
+// tests after it — compiled only where the capability is set, and executed by
+// ci.yml's `freebsd` job, which names all three in `REQUIRED_TESTS`.
+// ============================================================================
+
+/// `CMSG_SPACE` for one cmsg of `payload` bytes, asked of `libc` rather than
+/// derived: `CMSG_ALIGN` is 4 on x86 NetBSD and 8 on x86_64, and the header it
+/// pads is 12 bytes on the BSDs against 16 on Linux, so no constant written here
+/// would be right on more than one target.
+fn cmsg_space(payload: usize) -> usize {
+  // SAFETY: `CMSG_SPACE` is pure length arithmetic on an integer and
+  // dereferences nothing; `libc` marks it `unsafe` by convention only. This is
+  // the same call `cmsg_advance` makes in the production walk, which is what
+  // makes this measurement and the parser agree on every target.
+  #[allow(unsafe_code)]
+  unsafe {
+    libc::CMSG_SPACE(payload as libc::c_uint) as usize
+  }
+}
+
+/// EVIDENCE ITEM 4 for `has_ip_dstaddr_recvif`: our own control buffer is large
+/// enough that the kernel never has to set `MSG_CTRUNC`.
+///
+/// This matters more than a sizing check normally would.
+/// [`crate::onlink::DestinationWitness::Lost`] REFUSES, and `MSG_CTRUNC` is the
+/// only thing that mints it — so a buffer we sized too small is a self-inflicted
+/// outage wearing the shape of a security decision. Adding the
+/// `IP_RECVDSTADDR`/`IP_RECVIF` pair is exactly the kind of change that could
+/// cause one, and the standing rule at the `build.rs` emit site requires the
+/// figure to be MEASURED rather than asserted.
+///
+/// The worst case is summed per-target from what `try_bind_v4`/`try_bind_v6`
+/// actually enable, at the widest payload each cmsg can carry, with every term a
+/// literal size taken from the kernel that emits it — not from a production
+/// function, which would agree with itself whatever it did. One socket is one
+/// family, so the two families are summed separately and the larger taken.
+#[test]
+fn control_buffer_holds_every_cmsg_this_target_enables() {
+  // The IPv4 destination/interface shape. Exactly one of the two is enabled on
+  // any target — see `try_bind_v4_inner` — so this is a choice, not a sum.
+  let v4_destination = if cfg!(has_ip_pktinfo) {
+    // `struct in_pktinfo`, 12 bytes on Linux/Apple: ipi_ifindex, ipi_spec_dst,
+    // ipi_addr.
+    cmsg_space(12)
+  } else if cfg!(has_ip_dstaddr_recvif) {
+    // Two separate cmsgs. `IP_RECVDSTADDR` is a bare `struct in_addr`.
+    // `IP_RECVIF` is a `struct sockaddr_dl` of `sdl_len` bytes, and the kernels
+    // copy the interface's own — so the widest payload is the full struct: 54
+    // bytes on FreeBSD (46-byte `sdl_data`), 32 on OpenBSD, 24 on DragonFly and
+    // 20 on NetBSD. FreeBSD's is the largest and is used for all four, so the
+    // bound holds on every one of them whatever this host happens to be.
+    cmsg_space(4) + cmsg_space(54)
+  } else {
+    0
+  };
+  // `IP_RECVTTL`: an `int` on Linux, a single `u_char` on the BSDs. The wider
+  // reading is the safe one here.
+  let v4_ttl = if cfg!(has_recv_hoplimit) {
+    cmsg_space(4)
+  } else {
+    0
+  };
+  // `struct in6_pktinfo` is 20 bytes (ipi6_addr + ipi6_ifindex); `IPV6_HOPLIMIT`
+  // is an `int`.
+  let v6_destination = if cfg!(has_ipv6_pktinfo) {
+    cmsg_space(20)
+  } else {
+    0
+  };
+  let v6_hoplimit = if cfg!(has_recv_hoplimit) {
+    cmsg_space(4)
+  } else {
+    0
+  };
+  // Shared by both families: a `timespec` on Linux/Android, a `timeval`
+  // elsewhere — 16 bytes either way.
+  let timestamp = if cfg!(has_recv_timestamp) {
+    cmsg_space(16)
+  } else {
+    0
+  };
+
+  let v4_worst = v4_destination + v4_ttl + timestamp;
+  let v6_worst = v6_destination + v6_hoplimit + timestamp;
+  let worst = v4_worst.max(v6_worst);
+
+  // The buffer itself, read off the production type rather than restated.
+  let capacity = core::mem::size_of::<CmsgBuf>();
+  eprintln!("cmsg worst case: IPv4 {v4_worst}, IPv6 {v6_worst}, CmsgBuf {capacity}");
+  assert!(
+    worst <= capacity,
+    "control buffer too small: this target's worst case is {worst} bytes (IPv4 \
+     {v4_worst}, IPv6 {v6_worst}) against a {capacity}-byte CmsgBuf. MSG_CTRUNC \
+     mints DestinationWitness::Lost, which REFUSES, so this would be a \
+     self-inflicted outage and not a degradation — grow CmsgBuf and update its doc"
+  );
+  // Headroom for a cmsg this crate did not ask for. Not a second spelling of the
+  // check above: this one fails while the buffer still technically fits, which
+  // is the point at which the figure in `CmsgBuf`'s own doc has stopped holding.
+  assert!(
+    worst * 2 <= capacity,
+    "this target's worst case is {worst} bytes against a {capacity}-byte \
+     CmsgBuf — under 2x headroom for an unrequested cmsg. Re-derive the figure \
+     in CmsgBuf's doc before relaxing this"
+  );
+  // The completion marker CI requires for evidence item 4. Spelled out rather
+  // than routed through `evidence_complete`, which only exists where the BSD
+  // capability is set; this test runs on every target.
+  // Leading newline for the same reason as `evidence_complete`'s.
+  eprintln!("\nhick-udp-evidence-complete: control_buffer_holds_every_cmsg_this_target_enables");
+}
+
+/// Emit the completion marker for one evidence test.
+///
+/// **Called only as the last statement, after every assertion.** CI requires
+/// this line rather than libtest's `test <name> ... ok`, because those are
+/// different claims: the status line says the test function RETURNED, and a
+/// function that returned early because a precondition was unmet returns `ok`
+/// just as loudly as one that asserted. This line says the test reached its
+/// end, which is the only thing that makes the four evidence items behind
+/// `has_ip_dstaddr_recvif` rest on execution rather than on a process starting.
+///
+/// It is not a defence against a hostile branch — that branch could print this
+/// line directly, exactly as it could hollow out the assertions above it. It
+/// closes the accidental case: an unmet precondition, a silently skipped body,
+/// a test renamed out of the required list. See `ci.yml`'s `freebsd` job.
+#[cfg(has_ip_dstaddr_recvif)]
+fn evidence_complete(test: &str) {
+  // The LEADING NEWLINE is load-bearing. Under `--nocapture` libtest writes
+  // `test <name> ... ` to stdout without a newline, runs the test, then writes
+  // `ok`; a marker printed into that gap lands mid-line and no whole-line match
+  // finds it. This was caught by simulating the CI check against a real harness
+  // log rather than by reasoning about it. The newline closes libtest's partial
+  // line so the marker always starts at column 0, which is what lets the check
+  // stay an exact whole-line match — a substring match would find
+  // `...-complete: foo` inside `...-complete: foo_v2` and re-open the rename
+  // hole the whole-line matches exist to close.
+  eprintln!("\nhick-udp-evidence-complete: {test}");
+}
+
+/// The index of an UP loopback interface.
+///
+/// FATAL rather than `Option`: every caller needs loopback to carry the group,
+/// and a host without one cannot produce this evidence — which is a finding, not
+/// a reason to report success.
+#[cfg(has_ip_dstaddr_recvif)]
+fn up_loopback_index() -> u32 {
+  let ifaces = getifs::interfaces().expect(
+    "interface enumeration must succeed: the BSD IPv4 evidence tests cannot run without it, \
+     and returning early here would report success for a run that proved nothing",
+  );
+  ifaces
+    .iter()
+    .find(|i| i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP))
+    .map(|i| i.index())
+    .expect("no UP loopback interface: the BSD IPv4 evidence tests cannot be exercised here")
+}
+
+/// Send `payload` to `dst` from a socket pinned to `via` with `IP_MULTICAST_IF`,
+/// on an EPHEMERAL port.
+///
+/// Ephemeral matters: the receiver below is on 5353 with `SO_REUSEPORT`, so a
+/// sender sharing that port would join the same reuse group and the kernel could
+/// hand it the unicast datagram the test is waiting for.
+#[cfg(has_ip_dstaddr_recvif)]
+fn send_from_interface(
+  via: std::net::Ipv4Addr,
+  dst: std::net::SocketAddrV4,
+  payload: &[u8],
+) -> std::io::Result<()> {
+  let sock = socket2::Socket::new(
+    socket2::Domain::IPV4,
+    socket2::Type::DGRAM,
+    Some(socket2::Protocol::UDP),
+  )?;
+  sock.bind(&std::net::SocketAddrV4::new(via, 0).into())?;
+  sock.set_multicast_if_v4(&via)?;
+  sock.set_multicast_loop_v4(true)?;
+  sock.send_to(payload, &dst.into())?;
+  Ok(())
+}
+
+/// Read from `fd` until the datagram carrying exactly `want` arrives, or give up.
+///
+/// Matching on the payload is what keeps these tests honest on a host with real
+/// mDNS traffic: an assertion about "the destination of the datagram that came
+/// back" is worth nothing if the datagram came from somebody else's responder.
+/// Returns `None` on timeout, which each caller decides how to treat.
+#[cfg(has_ip_dstaddr_recvif)]
+fn recv_matching(fd: std::os::fd::RawFd, want: &[u8]) -> Option<RecvMeta> {
+  let mut buf = [0u8; 2048];
+  for _ in 0..400 {
+    match recv_with_meta(fd, &mut buf, true) {
+      Ok(meta) => {
+        if buf.get(..meta.len()) == Some(want) {
+          return Some(meta);
+        }
+      }
+      Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+      }
+      // Not a timeout and not something to report as "no datagram": the receive
+      // path itself failed, which is the defect these tests exist to catch.
+      Err(e) => panic!("recv_with_meta failed while waiting for the probe datagram: {e:?}"),
+    }
+  }
+  None
+}
+
+/// EVIDENCE ITEM 1 for `has_ip_dstaddr_recvif`, verbatim: the enable returns 0
+/// on a wildcard-bound `0.0.0.0:5353` socket joined to `224.0.0.251`.
+///
+/// `try_bind_v4` is the whole subject here. It calls
+/// `platform::set_recv_dstaddr_recvif_v4` and then `verify_rx_dstaddr_recvif_v4`,
+/// so a bind that returns `Ok` has ALREADY proven the kernel took both options —
+/// a `setsockopt` failure would be `BindError::Io` and a kernel that accepted the
+/// call without holding the flag would be `BindError::RxDestinationNotEnabled`.
+/// The explicit read-back below is not a second copy of that check: it asserts
+/// the values a caller can observe, so a `verify_` that had been silently
+/// weakened to accept zero would fail HERE rather than passing quietly inside the
+/// bind.
+///
+/// Nothing about this test can be lost to a delivery race — it sends no
+/// datagram — which is why item 1 is separated from the destination evidence
+/// below instead of being implied by it.
+#[cfg(has_ip_dstaddr_recvif)]
+#[test]
+fn bsd_ipv4_bind_enables_the_receive_metadata_pair() {
+  // NOT `expect_bind_or_skip`. That helper's whole job is to turn an
+  // environment refusal into a silent success, which is right for a test that
+  // merely happens to need a socket and wrong for the one that IS the evidence:
+  // a run where the bind never happened has proven nothing about the enable, and
+  // must not report `ok`. `try_bind_v4` sets SO_REUSEADDR/SO_REUSEPORT before
+  // bind, so coexisting with another responder on 5353 is not a refusal here.
+  let sock = try_bind_v4(MulticastOptionsV4::new(0)).expect(
+    "try_bind_v4 on 0.0.0.0:5353 must succeed: this IS evidence item 1, so a bind that did \
+     not happen is a failure and never a skip",
+  );
+  // The join half of item 1, on the interface that always exists. Fatal for the
+  // same reason: item 1 is stated over a socket JOINED to 224.0.0.251.
+  let lo = up_loopback_index();
+  try_join_v4(&sock, lo).expect("joining 224.0.0.251 on loopback is part of evidence item 1");
+  let (dstaddr, recvif) = crate::platform::get_recv_dstaddr_recvif_v4(&sock)
+    .expect("getsockopt for IP_RECVDSTADDR/IP_RECVIF must succeed on this target");
+  assert_ne!(
+    dstaddr, 0,
+    "IP_RECVDSTADDR must read back as enabled after try_bind_v4 — the whole \
+     has_ip_dstaddr_recvif capability rests on this enable taking"
+  );
+  assert_ne!(
+    recvif, 0,
+    "IP_RECVIF must read back as enabled after try_bind_v4"
+  );
+  evidence_complete("bsd_ipv4_bind_enables_the_receive_metadata_pair");
+}
+
+/// A socket with the BSD receive-metadata pair enabled through the PRODUCTION
+/// enabler and verifier, on an EPHEMERAL port.
+///
+/// Not `try_bind_v4`, and the reason is a real defect this harness caught rather
+/// than a preference. `try_bind_v4` binds `0.0.0.0:5353` with `SO_REUSEPORT`, so
+/// on any host already running an mDNS responder — every macOS, and any Linux or
+/// BSD with Avahi — our socket joins that responder's reuse group and a UNICAST
+/// datagram to port 5353 is delivered to exactly one member of it, chosen by the
+/// kernel. The test would then fail, or worse pass, depending on which process
+/// won. Multicast has no such lottery (every joined member gets a copy), which is
+/// why only the unicast half was affected and why the port, not the send, is what
+/// had to change. Item 1 is proven separately and deterministically by
+/// `bsd_ipv4_bind_enables_the_receive_metadata_pair` above.
+#[cfg(has_ip_dstaddr_recvif)]
+fn bind_ephemeral_with_rx_metadata() -> std::net::UdpSocket {
+  let sock = std::net::UdpSocket::bind("0.0.0.0:0")
+    .expect("binding an ephemeral UDP socket must succeed; a host that cannot is not evidence");
+  crate::platform::set_recv_dstaddr_recvif_v4(&sock)
+    .expect("the IP_RECVDSTADDR/IP_RECVIF enable must succeed on this target");
+  verify_rx_dstaddr_recvif_v4(&sock)
+    .expect("the kernel must report both options enabled after the setsockopt calls");
+  sock
+    .set_nonblocking(true)
+    .expect("setting O_NONBLOCK on our own socket must succeed");
+  sock
+}
+
+/// EVIDENCE ITEMS 2 (address half) and 3 for `has_ip_dstaddr_recvif`, on a real
+/// kernel: a group datagram yields the GROUP as its destination and a unicast
+/// datagram yields the address it was sent to.
+///
+/// Both on ONE socket, because that is the pin that matters. RFC 6762 §11
+/// partitions by destination: a parse that returned the group for a unicast
+/// arrival would admit anything from anywhere, and one that returned a local
+/// address for a group arrival would refuse the multicast §11 calls *essential*.
+/// Two separate tests would not show that the two readings cannot collapse onto
+/// each other.
+///
+/// # A datagram that does not come back is a FAILURE, not a skip
+///
+/// Everything environmental is checked before the sends and skips loudly: the
+/// bind, the loopback interface, the join. Past that point the kernel has
+/// accepted our membership and our send, the port is ours alone, and the BSD
+/// `ip_output` loops a multicast datagram back whenever `IP_MULTICAST_LOOP` is
+/// set. So a missing datagram is a real finding about this square and is reported
+/// as one. Skipping instead is how this evidence would come to be "proven" by a
+/// run that never asserted anything.
+#[cfg(has_ip_dstaddr_recvif)]
+#[test]
+fn bsd_ipv4_recv_witnesses_the_group_and_a_unicast_destination() {
+  use crate::onlink::DestinationWitness;
+  use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    os::fd::AsRawFd,
+  };
+
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+  let sock = bind_ephemeral_with_rx_metadata();
+  let port = sock
+    .local_addr()
+    .expect("our own socket must report its address")
+    .port();
+
+  let lo = up_loopback_index();
+  try_join_v4(&sock, lo)
+    .unwrap_or_else(|e| panic!("cannot join {group} on loopback index {lo}: {e:?}"));
+
+  // 1) THE GROUP. Sent through loopback, so this needs no physical NIC.
+  let group_payload = b"hick bsd ipv4 group probe";
+  send_from_interface(
+    Ipv4Addr::LOCALHOST,
+    SocketAddrV4::new(group, port),
+    group_payload,
+  )
+  .unwrap_or_else(|e| panic!("cannot send to {group} via 127.0.0.1: {e:?}"));
+  let meta = recv_matching(sock.as_raw_fd(), group_payload).expect(
+    "the group datagram never looped back, although the join and the send both \
+     succeeded — see this test's doc for why that is a finding and not a skip",
+  );
+  assert_eq!(
+    meta.destination_witness(),
+    DestinationWitness::Witnessed(IpAddr::V4(group)),
+    "IP_RECVDSTADDR must yield the GROUP the sender addressed. A local unicast \
+     address here would send every multicast arrival to RFC 6762 §11's \
+     source-prefix arm, which §11 says must not decide it"
+  );
+  // The refusal-minting flag, asserted directly rather than inferred: had
+  // MSG_CTRUNC been set, `recv_with_meta` would have returned `Lost` for both
+  // witnesses and never reached the parser at all.
+  assert!(
+    !meta.destination_witness().is_lost() && !meta.iface_witness().is_lost(),
+    "MSG_CTRUNC must stay clear with the pair enabled — see \
+     `control_buffer_holds_every_cmsg_this_target_enables` for the measured bound"
+  );
+
+  // 2) THE UNICAST, to one of this host's own addresses, on the very same
+  //    socket. It must yield THAT address and not the group.
+  let unicast_payload = b"hick bsd ipv4 unicast probe";
+  send_from_interface(
+    Ipv4Addr::LOCALHOST,
+    SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+    unicast_payload,
+  )
+  .expect("sending to 127.0.0.1 from 127.0.0.1 cannot fail");
+  let meta = recv_matching(sock.as_raw_fd(), unicast_payload)
+    .expect("the unicast datagram to 127.0.0.1 never arrived");
+  assert_eq!(
+    meta.destination_witness(),
+    DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    "IP_RECVDSTADDR must yield the host address the sender addressed, so §11's \
+     group arm is not taken for a unicast arrival"
+  );
+  assert_ne!(
+    meta.destination_witness(),
+    DestinationWitness::Witnessed(IpAddr::V4(group)),
+    "and it must not be the group: §11's two arms would then be \
+     indistinguishable on this square"
+  );
+  assert!(
+    !meta.destination_witness().is_lost() && !meta.iface_witness().is_lost(),
+    "MSG_CTRUNC must stay clear on the unicast arrival too"
+  );
+  evidence_complete("bsd_ipv4_recv_witnesses_the_group_and_a_unicast_destination");
+}
+
+/// EVIDENCE ITEM 2 (index half) for `has_ip_dstaddr_recvif`: `IP_RECVIF` names
+/// the interface that actually carried the datagram.
+///
+/// Telling "arrived elsewhere" from "this platform never says" is the whole
+/// value of the flip — `arrived_on_bound_interface` REFUSES on the first and
+/// passes on the second — so an index that were merely non-zero would be
+/// evidence of nothing. Each arrival is checked against `getifs`' own index for
+/// the interface it was sent through, and where the host has a second
+/// multicast-capable NIC the two indices are required to DIFFER.
+///
+/// A single-interface host cannot show that second half and SAYS SO rather than
+/// passing it vacuously: the loop counts what it actually observed, the
+/// assertions are on that count, and observing nothing at all is a failure.
+#[cfg(has_ip_dstaddr_recvif)]
+#[test]
+fn bsd_ipv4_recv_witnesses_the_interface_that_carried_the_datagram() {
+  use std::{
+    net::{Ipv4Addr, SocketAddrV4},
+    os::fd::AsRawFd,
+  };
+
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+  let sock = bind_ephemeral_with_rx_metadata();
+  let port = sock
+    .local_addr()
+    .expect("our own socket must report its address")
+    .port();
+  let loopback = up_loopback_index();
+
+  // Every UP interface with an IPv4 address that can carry multicast, paired
+  // with the index `getifs` reports — the value `IP_RECVIF` has to reproduce.
+  let ifaces = getifs::interfaces().expect(
+    "interface enumeration must succeed: without it there is no index for IP_RECVIF to be \
+     checked against, and returning early would report success for a run that proved nothing",
+  );
+  let mut candidates: Vec<(u32, Ipv4Addr)> = Vec::new();
+  for iface in ifaces.iter() {
+    let flags = iface.flags();
+    if !flags.contains(getifs::Flags::UP) {
+      continue;
+    }
+    // Loopback carries the group without the MULTICAST flag on some BSDs.
+    if !flags.contains(getifs::Flags::MULTICAST) && !flags.contains(getifs::Flags::LOOPBACK) {
+      continue;
+    }
+    let Ok(addrs) = iface.ipv4_addrs() else {
+      continue;
+    };
+    if let Some(addr) = addrs.first() {
+      candidates.push((iface.index(), addr.addr()));
+    }
+  }
+  // The per-interface `continue`s below are SELECTION, not preconditions: a NIC
+  // that refuses the join or the send is simply not one this host can use, and
+  // the assertions on `observed` are what stop that from emptying the test out.
+  // These two are different — they are the test's own inputs.
+  assert!(
+    !candidates.is_empty(),
+    "no UP interface with an IPv4 address: IP_RECVIF cannot be exercised at all here, so \
+     this run is not evidence"
+  );
+  assert!(
+    candidates.iter().any(|(idx, _)| *idx == loopback),
+    "the UP loopback interface ({loopback}) is not among the candidates, so the one \
+     interface guaranteed to carry the group would go unchecked"
+  );
+
+  let mut observed: Vec<u32> = Vec::new();
+  for (index, addr) in &candidates {
+    if try_join_v4(&sock, *index).is_err() {
+      continue;
+    }
+    // The index goes IN THE PAYLOAD, so `recv_matching` returns this
+    // iteration's datagram or nothing. Without that, a datagram from an earlier
+    // interface still in the socket buffer would be asserted against the
+    // current interface's index and the test would fail for the wrong reason —
+    // or worse, pass for one.
+    let payload = format!("hick recvif probe idx={index}").into_bytes();
+    if send_from_interface(*addr, SocketAddrV4::new(group, port), &payload).is_err() {
+      continue;
+    }
+    let Some(meta) = recv_matching(sock.as_raw_fd(), &payload) else {
+      eprintln!("note: no loopback copy from interface {index} ({addr}); not counted");
+      continue;
+    };
+    assert_eq!(
+      meta.iface_witness().witnessed_index().map(|i| i.get()),
+      Some(*index),
+      "IP_RECVIF must report the index getifs gives for the interface that \
+       carried the datagram (index {index}, address {addr}). A wrong or absent \
+       index makes `arrived_on_bound_interface` refuse traffic that DID arrive \
+       on the bound link"
+    );
+    observed.push(*index);
+  }
+
+  assert!(
+    !observed.is_empty(),
+    "no interface delivered a group datagram back to this socket, so IP_RECVIF \
+     was never exercised — this test proved nothing and must not pass"
+  );
+  // Not implied by the line above. Without this, a host where the loopback
+  // delivery silently stopped working would still pass on some other NIC, and
+  // loopback is the one interface every runner has and every other evidence test
+  // depends on.
+  assert!(
+    observed.contains(&loopback),
+    "the loopback interface ({loopback}) delivered no group datagram, although it is UP and \
+     was joined: IP_RECVIF was checked only on interfaces that happen to exist on this host"
+  );
+  observed.sort_unstable();
+  observed.dedup();
+  if observed.len() >= 2 {
+    // The half a single-NIC runner cannot show: two interfaces, two DIFFERENT
+    // indices, so the value is the interface's own and not a constant.
+    eprintln!(
+      "IP_RECVIF distinguished {} interfaces: {observed:?}",
+      observed.len()
+    );
+  } else {
+    eprintln!(
+      "note: only interface {observed:?} delivered a datagram on this host, so \
+       'distinguishes a NIC that is not the bound one' is NOT covered by this run"
+    );
+  }
+  evidence_complete("bsd_ipv4_recv_witnesses_the_interface_that_carried_the_datagram");
+}
+
+/// The capability [`reports_rx_interface_v4`] publishes, spelled from TARGET
+/// LITERALS rather than from the cfgs the function reads.
+///
+/// Asking the production answer to confirm itself would pass whatever `build.rs`
+/// emitted — including the state this change is closing, where the four BSDs
+/// answered `false`. The list below is the claim: every supported target
+/// witnesses an IPv4 destination and receive interface through `recv_with_meta`,
+/// by one of three routes, and nothing supported is left out of it.
+#[test]
+fn reports_rx_interface_v4_names_every_supported_target() {
+  // `IP_PKTINFO` (Linux/Android/Apple), the `IP_RECVDSTADDR` + `IP_RECVIF` pair
+  // (the four BSDs), or `WSARecvMsg` (Windows).
+  let pktinfo = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+  ));
+  let bsd_pair = cfg!(any(
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+  ));
+  let wsarecvmsg = cfg!(windows);
+  assert_eq!(
+    reports_rx_interface_v4(),
+    pktinfo || bsd_pair || wsarecvmsg,
+    "reports_rx_interface_v4 must follow the enumerated capability routes, not \
+     the other way round"
+  );
+  // This host is one of them, so a future target added without a route would
+  // not be able to reach this assertion by making both sides `false`.
+  assert!(
+    reports_rx_interface_v4(),
+    "every target this crate supports witnesses an IPv4 destination through \
+     recv_with_meta; if this fails, a supported target lost its route"
+  );
+  // IPv6 was already uniform and stays so — asserted here so the two families
+  // are pinned by one test and cannot drift into disagreeing about "supported".
+  assert!(reports_rx_interface_v6());
+}
+
+/// A BSD square that recovers ONLY the destination reports the interface as
+/// `Declined`, and KEEPS the destination — through the real parser, not through
+/// the scan under it.
+///
+/// The scan's half of this is already covered by
+/// `scan_dstaddr_recvif_reports_each_half_of_the_pair_independently`. What is
+/// asserted here is what [`parse_dstaddr_recvif_v4`] builds out of a half-recovered
+/// pair, because that is the decision `admits_ingress` actually reads and it is
+/// the one a "require both cmsgs" simplification would silently change.
+///
+/// This state exists on no other square. `IP_RECVDSTADDR` and `IP_RECVIF` are two
+/// cmsgs from two `sbcreatecontrol` calls, not two fields of one struct, so an
+/// mbuf shortage can take either alone — and NetBSD's `ip_savecontrol` splits
+/// them deterministically, emitting `IP_RECVDSTADDR` before its
+/// `m_get_rcvif_psref() == NULL` early return and `IP_RECVIF` after it. A
+/// detached receive interface on NetBSD produces exactly this buffer.
+///
+/// `Declined` and not `Lost`: nothing was lost on our side and a larger control
+/// buffer would change nothing, so RFC 6762 §11's destination partition still
+/// decides in full and only the link scoping goes. Refusing here would make a
+/// NetBSD responder deaf on every datagram whose receive interface had detached.
+#[cfg(has_ip_dstaddr_recvif)]
+#[test]
+fn a_dstaddr_without_recvif_declines_the_interface_and_keeps_the_destination() {
+  use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+  let peer: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5353).into();
+  let cmsgs = synth_cmsgs(&[(libc::IPPROTO_IP, libc::IP_RECVDSTADDR, &group.octets())]);
+
+  let meta = parse_dstaddr_recvif_v4(&cmsgs, 200, peer)
+    .expect("one half of the pair is still a parse, not a MissingPktinfo");
+  assert_eq!(
+    meta.destination_witness(),
+    crate::onlink::DestinationWitness::Witnessed(IpAddr::V4(group)),
+    "the destination survives its sibling's absence — §11's group arm still fires"
+  );
+  assert_eq!(
+    meta.iface_witness(),
+    crate::onlink::IfaceWitness::Declined,
+    "a missing IP_RECVIF with MSG_CTRUNC clear is the kernel declining, which \
+     DEGRADES; Lost would refuse a datagram nothing on our side mishandled"
+  );
+  assert_ne!(meta.iface_witness(), crate::onlink::IfaceWitness::Lost);
+
+  // And the mirror: only the interface. It costs the destination partition for
+  // this one datagram and must not cost the link scoping too.
+  let sdl = synth_sockaddr_dl(7, b"em0");
+  let cmsgs = synth_cmsgs(&[(libc::IPPROTO_IP, libc::IP_RECVIF, &sdl)]);
+  let meta =
+    parse_dstaddr_recvif_v4(&cmsgs, 200, peer).expect("the other half alone is also a parse");
+  assert_eq!(
+    meta.iface_witness().witnessed_index().map(|i| i.get()),
+    Some(7),
+    "the interface survives its sibling's absence"
+  );
+  assert_eq!(
+    meta.destination_witness(),
+    crate::onlink::DestinationWitness::Declined,
+    "and the absent destination declines rather than being invented"
+  );
+}
+
+/// The read-back is CALLED BY `try_bind_v4`, proven through the public API with
+/// the `FORCE_RX_DSTADDR_READBACK_V4` seam forcing one option to read back as
+/// disabled.
+///
+/// Without this, the two lines
+/// `verify_rx_dstaddr_recvif_v4(&std_sock)?` in `try_bind_v4_inner` could be
+/// deleted and every other test would stay green on a healthy kernel: the bind
+/// test reads the options back independently, and the packet tests use an
+/// ephemeral helper that calls the verifier directly. Those prove the
+/// COMPARISON. Only this proves the CALL SITE — and the call site is the whole
+/// of what DragonFly, OpenBSD and NetBSD have in place of a CI runner, since
+/// none of them has one.
+///
+/// A seam is unavoidable, for the same reason `try_bind_v6`'s is: on a correctly
+/// functioning kernel the enable always takes, so no value reachable through
+/// `MulticastOptionsV4` or `try_bind_v4` can make the read-back return zero.
+/// The alternative is to reintroduce a real bug.
+///
+/// Deleting the verifier call makes `try_bind_v4` return `Ok` here and this test
+/// fails; neutering the `== 0` comparison does the same. The forced pair is
+/// asymmetric — `(1, 0)` — so it also pins that the check is an `||` over BOTH
+/// options and not a test of one of them.
+#[cfg(has_ip_dstaddr_recvif)]
+#[test]
+fn try_bind_v4_rejects_a_half_enabled_socket_forced_through_production_wiring() {
+  // dstaddr enabled, recvif not: the exact shape a half-applied enable takes,
+  // and the one an `&&` comparison would wave through.
+  FORCE_RX_DSTADDR_READBACK_V4.with(|cell| cell.set(Some((1, 0))));
+  let result = try_bind_v4(MulticastOptionsV4::new(0));
+  // Reset before anything below can fail an assertion, so the override never
+  // leaks into a later test on this thread even on an early failure here. The
+  // FreeBSD CI job runs `--test-threads=1`, so "a later test on this thread"
+  // means every test that follows.
+  FORCE_RX_DSTADDR_READBACK_V4.with(|cell| cell.set(None));
+
+  let err = match result {
+    // The one legitimate non-regression outcome: the environment refused the
+    // bind outright, so the verifier was never reached. Open-coded rather than
+    // routed through `expect_bind_or_skip`, which would treat the
+    // `RxDestinationNotEnabled` this test EXPECTS as a failure.
+    Err(BindError::Io(e)) if is_environment_refusal(&e) => {
+      eprintln!("skipping: environment refused the IPv4 bind needed to exercise this seam ({e})");
+      return;
+    }
+    other => other.expect_err(
+      "try_bind_v4 must reject a bind whose IP_RECVDSTADDR/IP_RECVIF read-back reports one \
+       option disabled — an Ok here means either the verify_rx_dstaddr_recvif_v4 call was \
+       removed from try_bind_v4_inner or its comparison no longer detects a half-enabled socket",
+    ),
+  };
+  let detail = err.try_unwrap_rx_destination_not_enabled().expect(
+    "expected BindError::RxDestinationNotEnabled — a different variant means try_bind_v4 \
+     failed for a reason unrelated to the forced read-back",
+  );
+  assert_eq!(
+    detail.dstaddr(),
+    1,
+    "the detail must carry the value the read-back reported for IP_RECVDSTADDR"
+  );
+  assert_eq!(
+    detail.recvif(),
+    0,
+    "the detail must carry the value the read-back reported for IP_RECVIF, which is the \
+     option that was disabled"
+  );
+  evidence_complete("try_bind_v4_rejects_a_half_enabled_socket_forced_through_production_wiring");
+}

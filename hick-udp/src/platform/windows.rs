@@ -89,6 +89,15 @@ pub(crate) fn set_recv_pktinfo_v4(sock: &UdpSocket) -> std::io::Result<()> {
   set_bool_sockopt(sock, IPPROTO_IP, IP_PKTINFO)
 }
 
+/// No-op on Windows: `IP_RECVDSTADDR` / `IP_RECVIF` are the BSD spelling of the
+/// two facts `IP_PKTINFO` above already delivers here, and Winsock defines
+/// neither. See the unix twin for the `has_ip_dstaddr_recvif` capability they
+/// gate; Windows reaches `reports_rx_interface_v4() == true` through
+/// `cfg!(windows)` instead.
+pub(crate) fn set_recv_dstaddr_recvif_v4(_sock: &UdpSocket) -> std::io::Result<()> {
+  Ok(())
+}
+
 /// Enable `IPV6_PKTINFO` so `WSARecvMsg` reports the receiving interface index
 /// and local destination address for each IPv6 datagram.
 pub(crate) fn set_recv_pktinfo_v6(sock: &UdpSocket) -> std::io::Result<()> {
