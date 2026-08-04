@@ -591,7 +591,13 @@ fn cmsg_iter_walks_a_single_timestamp_cmsg() {
 /// Round-trip an `IP_PKTINFO` cmsg through `CMsgBuilder` and `CMsgIter`:
 /// the builder encodes the header + payload, then the iterator must read
 /// back the same level/type/payload.
-#[cfg(all(unix, test))]
+///
+/// `has_ip_pktinfo`-gated: `IP_PKTINFO`/`in_pktinfo` are only bound where
+/// `build.rs` sets that cfg (Linux/Android/Apple); the BSDs have no
+/// `IP_PKTINFO` (NetBSD's `in_pktinfo` is a different, incompatible shape —
+/// see `build.rs`), so a bare `#[cfg(all(unix, test))]` here fails to link
+/// the import on FreeBSD/OpenBSD/DragonFly/NetBSD.
+#[cfg(all(unix, has_ip_pktinfo, test))]
 #[test]
 fn cmsg_builder_emits_a_round_trippable_pktinfo() {
   use libc::{IP_PKTINFO, IPPROTO_IP, in_addr, in_pktinfo};
@@ -637,7 +643,11 @@ fn cmsg_builder_emits_a_round_trippable_pktinfo() {
 /// not read: reading `in_pktinfo` out of it would run past the bytes the
 /// kernel deposited. `decode_unix_cmsgs` must return without panicking and
 /// leave `local_ip` / `interface_index` at their `RecvMeta::empty` defaults.
-#[cfg(all(unix, test))]
+///
+/// `has_ip_pktinfo`-gated: same reason as
+/// [`cmsg_builder_emits_a_round_trippable_pktinfo`] — `IP_PKTINFO`/`in_pktinfo`
+/// are unbound on the BSDs.
+#[cfg(all(unix, has_ip_pktinfo, test))]
 #[test]
 fn truncated_pktinfo_cmsg_is_skipped_not_read() {
   use libc::{IP_PKTINFO, IPPROTO_IP, cmsghdr};
