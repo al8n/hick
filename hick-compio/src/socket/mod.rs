@@ -7,7 +7,10 @@
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use hick_udp::selfsend::RxEvidence;
+use hick_udp::{
+  onlink::{DestinationWitness, IfaceWitness},
+  selfsend::RxEvidence,
+};
 
 #[cfg(test)]
 mod tests;
@@ -58,15 +61,16 @@ pub struct RecvMeta {
   peer: SocketAddr,
   /// The destination address recorded by the kernel (from PKTINFO).
   local_ip: IpAddr,
-  /// The IP header DESTINATION, where the cmsg carried one. Distinct from
-  /// `local_ip`: on Unix IPv4 that field is `in_pktinfo.ipi_spec_dst`, the
+  /// What this receive path WITNESSED about the IP header DESTINATION. Distinct
+  /// from `local_ip`: on Unix IPv4 that field is `in_pktinfo.ipi_spec_dst`, the
   /// receiving interface's own unicast address, which never equals a multicast
   /// group — so reading it as a destination makes every multicast arrival look
   /// unicast. `ipi_addr` (IPv4) and `ipi6_addr` (IPv6) are the header
   /// destination and are what this carries.
-  destination: Option<IpAddr>,
-  /// Receiving interface index, taken from PKTINFO.
-  interface_index: u32,
+  destination: DestinationWitness,
+  /// What this receive path WITNESSED about the receiving interface, from
+  /// PKTINFO.
+  iface: IfaceWitness,
   /// IP TTL / IPv6 hop limit if the kernel exposed it.
   hop_limit: Option<u8>,
   /// What this datagram's arrival says about its order against our own sends.
@@ -98,6 +102,11 @@ pub struct RecvMeta {
   /// the buffer is over-allocated by is the proxy for `MSG_TRUNC`). The driver
   /// treats such datagrams as consumed-but-unusable (bumps `packets_rx` +
   /// `packets_dropped`) without routing them to proto.
+  ///
+  /// Nothing to do with the kernel's `MSG_CTRUNC`, which is about OUR CONTROL
+  /// buffer rather than the datagram, and which decides between
+  /// [`DestinationWitness::Lost`] and [`DestinationWitness::Declined`] instead — see
+  /// [`RecvMeta::declare_cmsg_absent`].
   truncated: bool,
 }
 
@@ -110,13 +119,42 @@ impl RecvMeta {
     Self {
       peer,
       local_ip,
-      destination: None,
-      interface_index: 0,
+      // BLIND, which is the honest declaration for the one production caller
+      // that stops here: the Windows arm reads with `recv_from` and recovers no
+      // ancillary data at all, so it witnesses nothing by construction. The unix
+      // arm calls `declare_cmsg_absent` immediately after, which replaces these
+      // with the per-datagram absence its own capability makes them.
+      destination: DestinationWitness::blind(),
+      iface: IfaceWitness::blind(),
       hop_limit: None,
       rx: RxEvidence::none(),
       delivery: None,
       len: 0,
       truncated: false,
+    }
+  }
+
+  /// Declare, for a path that DOES decode ancillary data, that no PKTINFO cmsg
+  /// arrived for this datagram — and say which kind of absence it was.
+  ///
+  /// Called once per receive, before the decoder runs, so a cmsg that IS present
+  /// simply overwrites it. `control_truncated` is the kernel's `MSG_CTRUNC`, and
+  /// it is the whole difference between:
+  ///
+  /// * [`DestinationWitness::Lost`] — our own control buffer was too small. The kernel had
+  ///   the facts and this side could not take them, so §11 REFUSES;
+  /// * [`DestinationWitness::Declined`] — the kernel emitted nothing and flagged no
+  ///   truncation. Every BSD skips an ancillary mbuf it cannot allocate, with no
+  ///   error and no counter, and mbuf exhaustion is normally caused by a flood —
+  ///   so §11 DEGRADES to the source-prefix arm rather than going deaf.
+  ///
+  /// On a path with no capability at all this leaves both witnesses `Blind`: a
+  /// capability is declared once, and a datagram cannot make one up.
+  #[cfg(unix)]
+  pub(crate) fn declare_cmsg_absent(&mut self, control_truncated: bool) {
+    if rx_interface_reported(self.peer) {
+      self.destination = DestinationWitness::from_reporting_path(None, control_truncated);
+      self.iface = IfaceWitness::from_reporting_path(0, control_truncated);
     }
   }
 
@@ -132,28 +170,50 @@ impl RecvMeta {
     self.local_ip
   }
 
-  /// The datagram's IP header destination, where this receive path recovered
-  /// one. RFC 6762 §11 states its local-link test two ways and selects between
-  /// them by this — arrival at `224.0.0.251` / `FF02::FB` is local-link origin
-  /// on its own, regardless of source address — so it is emphatically NOT
-  /// [`RecvMeta::local_ip`]. `None` means "this receive recovered none", never
-  /// "the destination was unspecified".
-  pub(crate) const fn destination(&self) -> Option<IpAddr> {
+  /// What this receive path WITNESSED about the datagram's IP header
+  /// destination, as RFC 6762 §11's trust boundary must read it.
+  ///
+  /// §11 states its local-link test two ways and selects between them by this —
+  /// arrival at `224.0.0.251` / `FF02::FB` is local-link origin on its own,
+  /// regardless of source address — so it is emphatically NOT
+  /// [`RecvMeta::local_ip`].
+  ///
+  /// A [`DestinationWitness`] and not an `Option<IpAddr>`, because the three ways a
+  /// destination can be missing lead to different verdicts. This driver decodes
+  /// its OWN ancillary data and does not call `hick_udp::recv_with_meta`, so the
+  /// capability behind `Blind` is ITS path's — see [`rx_interface_reported`] —
+  /// and the `Lost`/`Declined` split is minted in `Socket::recv`, from the same
+  /// `msg_flags` the delivery class comes out of.
+  pub(crate) const fn destination_witness(&self) -> DestinationWitness {
     self.destination
   }
 
+  /// What this receive path WITNESSED about the interface the datagram arrived
+  /// on. The twin of [`RecvMeta::destination_witness`], split the same way for
+  /// the same reason: both halves ride on one PKTINFO cmsg, so a rule that
+  /// refused one absence and degraded the other would leave the degradation
+  /// unreachable.
+  pub(crate) const fn iface_witness(&self) -> IfaceWitness {
+    self.iface
+  }
+
   /// Whether the kernel delivered this datagram as a multicast, where this
-  /// target reports it. Coarser than [`RecvMeta::destination`] — "some group"
-  /// rather than which one — and consulted by §11's group arm only when no
-  /// destination was recovered. `None` is "this target has no such flag".
+  /// target reports it. Coarser than [`RecvMeta::destination_witness`] — "some
+  /// group" rather than which one — and consulted by §11's group arm only where
+  /// no destination was WITNESSED. `None` is "this target has no such flag".
   pub(crate) const fn delivery(&self) -> Option<hick_udp::LinkDelivery> {
     self.delivery
   }
 
-  /// The receiving interface index (PKTINFO).
+  /// The receiving interface index, or `0` where none was witnessed.
+  ///
+  /// **A DIAGNOSTIC and a routing hint.** It flattens the three ways an index
+  /// can be absent, which RFC 6762 §11 decides differently — hand the trust
+  /// boundary [`RecvMeta::iface_witness`] instead, which
+  /// `hick_udp::onlink::admits_ingress` is the only consumer of.
   #[inline(always)]
   pub(crate) const fn interface_index(&self) -> u32 {
-    self.interface_index
+    self.iface.index_or_zero()
   }
 
   /// The IP TTL / IPv6 hop limit, if the kernel exposed it.
@@ -223,13 +283,32 @@ impl RecvMeta {
   }
 
   /// Full constructor. Test-only: production code builds a `RecvMeta` via
-  /// [`Self::empty`] plus in-module cmsg decoding.
-  #[cfg(test)]
+  /// [`Self::empty`] plus [`Self::declare_cmsg_absent`] plus in-module cmsg
+  /// decoding.
+  ///
   /// `destination` is `Option<IpAddr>` rather than a second `IpAddr` so no
   /// call site can pass it positionally in place of `local_ip`: the two carry
   /// different addresses on Unix IPv4, and the compiler rather than review is
   /// what keeps them apart.
-  pub(crate) const fn new(
+  ///
+  /// # The two absences it reproduces, and why they differ
+  ///
+  /// This constructor predates the witnesses, and every case built with it was
+  /// written under what the old pair MEANT, so it maps each half onto the state
+  /// that decides the same way:
+  ///
+  /// * `destination: None` meant "this receive path recovers no destination" —
+  ///   a capability — so it becomes [`DestinationWitness::Blind`], which DEGRADES;
+  /// * `interface_index: 0` meant "the path could have named the link and did
+  ///   not" wherever the path reports one — a failed proof — so it becomes
+  ///   [`IfaceWitness::Lost`], which REFUSES, and `Blind` where it does not.
+  ///
+  /// [`IfaceWitness::Declined`] is deliberately unreachable here: it is the
+  /// absence that now degrades, and routing the old cases into it would silently
+  /// rewrite what they assert. It is reached through
+  /// [`Self::with_cmsg_declined`].
+  #[cfg(test)]
+  pub(crate) fn new(
     peer: SocketAddr,
     local_ip: IpAddr,
     destination: Option<IpAddr>,
@@ -241,14 +320,44 @@ impl RecvMeta {
     Self {
       peer,
       local_ip,
-      destination,
-      interface_index,
+      destination: match destination {
+        Some(dst) => DestinationWitness::Witnessed(dst),
+        None => DestinationWitness::blind(),
+      },
+      iface: match core::num::NonZeroU32::new(interface_index) {
+        Some(idx) => IfaceWitness::Witnessed(idx),
+        None if rx_interface_reported(peer) => IfaceWitness::Lost,
+        None => IfaceWitness::blind(),
+      },
       hop_limit,
       rx,
       delivery: None,
       len,
       truncated: false,
     }
+  }
+
+  /// Present both witnesses as the KERNEL having declined to emit the PKTINFO
+  /// cmsg for this datagram: no interface, no destination, and no `MSG_CTRUNC`
+  /// to say our own buffer was at fault.
+  ///
+  /// Both halves go at once because that is what happens — the two facts ride on
+  /// one cmsg, and `sbcreatecontrol` either allocates the mbuf or skips the whole
+  /// message. Test-only; production mints this in `Socket::recv`.
+  #[cfg(test)]
+  pub(crate) const fn with_cmsg_declined(mut self) -> Self {
+    self.destination = DestinationWitness::Declined;
+    self.iface = IfaceWitness::Declined;
+    self
+  }
+
+  /// Present both witnesses as LOST: `MSG_CTRUNC`, our own control buffer too
+  /// small. Test-only; production mints this in `Socket::recv`.
+  #[cfg(test)]
+  pub(crate) const fn with_cmsg_lost(mut self) -> Self {
+    self.destination = DestinationWitness::Lost;
+    self.iface = IfaceWitness::Lost;
+    self
   }
 
   /// Set the kernel's multicast-delivery flag. Test-only; production sets it
@@ -352,8 +461,18 @@ impl Socket {
       // and was refused whenever the sender's prefix was not one of ours —
       // traffic §11 requires be accepted.
       meta.delivery = hick_udp::link_delivery_from_msg_flags(recv_flags.bits() as i32);
+      // The other bit this crate reads out of the same field, and the only thing
+      // that separates a cmsg OUR buffer could not hold from one the kernel
+      // declined to emit. §11 refuses the first and degrades the second, so the
+      // distinction has to survive into `RecvMeta` rather than being flattened
+      // into "no pktinfo". What the bits mean is `hick-udp`'s business, exactly
+      // as for the delivery class above.
+      let control_truncated = hick_udp::control_truncated_from_msg_flags(recv_flags.bits() as i32);
+      // Declare the absence FIRST, so a cmsg that is present simply overwrites
+      // it and a cmsg that is not leaves the honest reason behind.
+      meta.declare_cmsg_absent(control_truncated);
       let ctrl_bytes = ctrl.filled(ctrl_len);
-      decode_unix_cmsgs(ctrl_bytes, &mut meta);
+      decode_unix_cmsgs(ctrl_bytes, &mut meta, control_truncated);
       // The kernel receive timestamp is read out of the SAME buffer by
       // `hick-udp`, not by the decoder above: `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS`
       // is one wire format, and a driver-local copy of its decode is how two

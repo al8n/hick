@@ -442,11 +442,21 @@ struct Arrival {
   pkt_iface: u32,
   destination: Option<IpAddr>,
   delivery: Option<hick_udp::LinkDelivery>,
+  /// Present both witnesses as the kernel having DECLINED to emit the PKTINFO
+  /// cmsg — see [`Arrival::cmsg_declined`].
+  cmsg_declined: bool,
 }
 
 impl Arrival {
-  /// A datagram whose receive path recovered neither a destination nor a
+  /// A datagram whose receive path witnessed neither a destination nor a
   /// multicast flag.
+  ///
+  /// The two absences map onto the states that decide the same way the old pair
+  /// did — see `RecvMeta::new`, which does the mapping: `destination: None` is a
+  /// path that recovers none (`Blind`, degrades), and `pkt_iface: 0` on a path
+  /// that reports one is a failed proof (`Lost`, refuses). The absence that now
+  /// degrades on the interface side is reached through
+  /// [`Arrival::cmsg_declined`] and has cases of its own.
   fn new(src: SocketAddr, family: Family, hop_limit: Option<u8>, pkt_iface: u32) -> Self {
     Self {
       src,
@@ -455,19 +465,34 @@ impl Arrival {
       pkt_iface,
       destination: None,
       delivery: None,
+      cmsg_declined: false,
     }
   }
 
-  /// The IP header destination this receive path recovered.
+  /// The IP header destination this receive path witnessed.
   fn addressed_to(mut self, dst: IpAddr) -> Self {
     self.destination = Some(dst);
     self
   }
 
   /// The kernel's `MSG_MCAST`, where the target reports one and no destination
-  /// was recovered.
+  /// was witnessed.
   fn delivered_as_multicast(mut self) -> Self {
     self.delivery = Some(hick_udp::LinkDelivery::Multicast);
+    self
+  }
+
+  /// The kernel DECLINED to emit the PKTINFO cmsg for this datagram: no
+  /// interface, no destination, and NO `MSG_CTRUNC` to say our own buffer was at
+  /// fault.
+  ///
+  /// Both halves go at once because that is what actually happens — the two
+  /// facts ride on one cmsg, and `sbcreatecontrol` either allocates the mbuf or
+  /// skips the whole message.
+  fn cmsg_declined(mut self) -> Self {
+    self.pkt_iface = 0;
+    self.destination = None;
+    self.cmsg_declined = true;
     self
   }
 }
@@ -506,7 +531,7 @@ fn ingress_admits(a: Arrival, subnets: &[(IpAddr, u8)], bound_is_loopback: bool)
     SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
   };
-  let meta = RecvMeta::new(
+  let mut meta = RecvMeta::new(
     a.src,
     local,
     a.destination,
@@ -516,6 +541,9 @@ fn ingress_admits(a: Arrival, subnets: &[(IpAddr, u8)], bound_is_loopback: bool)
     body.len(),
   )
   .with_delivery(a.delivery);
+  if a.cmsg_declined {
+    meta = meta.with_cmsg_declined();
+  }
   s.handle_datagram(a.family, &meta, &body);
   s.selfsend.is_empty()
 }
@@ -1112,8 +1140,16 @@ fn a_receive_path_that_recovers_nothing_still_admits_an_in_subnet_peer() {
   #[cfg(debug_assertions)]
   s.note_park_entry();
 
-  // Byte-for-byte what the Windows arm builds.
-  let meta = RecvMeta::empty(peer);
+  // Byte-for-byte what the Windows arm builds — plus, on a target whose unix
+  // decoder DOES report, the `MSG_CTRUNC` that makes this the absence the
+  // assertion below is about. `RecvMeta::empty` alone is now the OTHER absence,
+  // a kernel that declined to emit, which degrades rather than refusing; see
+  // `a_declined_cmsg_degrades_to_the_source_arm_rather_than_going_deaf`.
+  let meta = if rx_interface_reported(peer) {
+    RecvMeta::empty(peer).with_cmsg_lost()
+  } else {
+    RecvMeta::empty(peer)
+  };
   s.handle_datagram(Family::V4, &meta, &body);
 
   assert_eq!(
@@ -1121,6 +1157,42 @@ fn a_receive_path_that_recovers_nothing_still_admits_an_in_subnet_peer() {
     !rx_interface_reported(peer),
     "a path with no interface to give must fall to §11's source rule, not be \
      read as a kernel that declined to place the datagram"
+  );
+}
+
+/// A cmsg the KERNEL declined to emit must not make this driver deaf.
+///
+/// The case above it is about our own control buffer being too small, which is
+/// this side's bug and still refuses. This one is the other absence, and it is
+/// the one an attacker can provoke: every BSD builds its ancillary mbufs with
+/// `M_NOWAIT` and, when `sbcreatecontrol` returns `NULL`, skips the cmsg with no
+/// error, no counter and no `MSG_CTRUNC`, while still delivering the datagram
+/// (FreeBSD `kern/uipc_sockbuf.c`, NetBSD `kern/uipc_socket2.c`). Mbuf
+/// exhaustion is normally caused by a flood, so refusing here takes the
+/// responder off the air exactly during the traffic that caused it.
+///
+/// This driver decodes its OWN ancillary data, so it has its own copy of that
+/// exposure and needs its own case.
+#[test]
+fn a_declined_cmsg_degrades_to_the_source_arm_rather_than_going_deaf() {
+  let subnets = ingress_subnets();
+  assert!(
+    ingress_admits(
+      Arrival::new(ingress_on_subnet_peer(), Family::V4, None, INGRESS_BOUND).cmsg_declined(),
+      &subnets,
+      false
+    ),
+    "a kernel that skipped the PKTINFO cmsg leaves §11's source arm deciding, \
+     and an in-prefix source passes it"
+  );
+  // Degrading is not admitting: the fallback still rests on positive evidence.
+  assert!(
+    !ingress_admits(
+      Arrival::new(ingress_off_subnet_peer(), Family::V4, None, INGRESS_BOUND).cmsg_declined(),
+      &subnets,
+      false
+    ),
+    "the degraded arm is §11's source rule, not an open door"
   );
 }
 
