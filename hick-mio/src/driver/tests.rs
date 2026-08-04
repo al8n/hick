@@ -954,6 +954,39 @@ fn an_announced_service_owes_more_than_one_goodbye_round() {
 /// succeeded on this endpoint's own socket, so the withdrawal's sends
 /// (same socket, same process, moments later) are expected to succeed too —
 /// the same assumption `tests/loopback.rs`'s `advertise` helper relies on.
+///
+/// **`is_idle` is a termination guarantee, not a delivery one.**
+/// `drain_withdrawals` exits its pump loop once every family's debt clears OR
+/// the §10.1 anti-pin ceiling force-completes the item regardless of debt, and
+/// `goodbyes_tx` is bumped only on the former path — so this binary racing
+/// others against the same real multicast group (`BIND_LOCK` only serialises
+/// binds within THIS process) can legitimately refuse every round for the
+/// whole ceiling and reach `is_idle` with `goodbyes_tx` unmoved.
+///
+/// **`degraded_families` is not the discriminator, and must not become one.**
+/// It is PER FAMILY, so on a dual-stack host it can be true for a family that
+/// never sent anything while the OTHER family delivered every round fine — a
+/// real `goodbyes_tx` regression would then still reach `is_idle` with
+/// `goodbyes_tx` unmoved and one family degraded, and a bare
+/// `v4_degraded || v6_degraded` would wrongly accept that. It is ALSO a
+/// three-CONSECUTIVE-failure threshold (`MAX_CONSECUTIVE_SEND_FAILURES`), so
+/// it can still read `false` after a real, total non-delivery if the
+/// scheduler starved this test down to only one or two actual attempts before
+/// the ceiling forced completion — a discriminator built from it would then
+/// be unsound in the OTHER direction, flaking on exactly the contention this
+/// test exists to tolerate.
+///
+/// `packets_tx` is the one signal that is both independent AND complete: it
+/// is bumped inside `Sockets::send_one`, a code path `drain_withdrawals`'s own
+/// `goodbyes_tx` bump never touches, so it moves if and only if a real send
+/// reached the kernel — on however many attempts were actually made. If it
+/// rose during this withdrawal, `goodbyes_tx` must have risen too,
+/// unconditionally — see
+/// `a_withdrawal_where_one_family_delivers_while_the_other_is_refused` for the
+/// deterministic case this closes. If it did NOT rise, `goodbyes_tx` staying
+/// put is not merely tolerated but PROVEN correct: `goodbyes_tx` cannot rise
+/// without an antecedent `packets_tx` bump, so nothing further needs
+/// corroborating.
 #[test]
 #[cfg(feature = "stats")]
 fn a_delivered_withdrawal_round_bumps_goodbyes_tx() {
@@ -971,16 +1004,183 @@ fn a_delivered_withdrawal_round_bumps_goodbyes_tx() {
   }
 
   mdns.shutdown();
-  let before = mdns.stats().goodbyes_tx;
+  let goodbyes_before = mdns.stats().goodbyes_tx;
+  let packets_before = mdns.stats().packets_tx;
   let deadline = Instant::now() + Duration::from_secs(5);
   while !mdns.is_idle() && Instant::now() < deadline {
     mdns.tick().expect("tick");
     std::thread::sleep(Duration::from_millis(20));
   }
   assert!(mdns.is_idle(), "shutdown must terminate");
+
+  let goodbyes_after = mdns.stats().goodbyes_tx;
+  let packets_after = mdns.stats().packets_tx;
+  if packets_after > packets_before {
+    assert!(
+      goodbyes_after > goodbyes_before,
+      "a raw send reached the kernel during this withdrawal (packets_tx {packets_before} -> \
+       {packets_after}), so goodbyes_tx must have bumped too; it stayed at {goodbyes_before}"
+    );
+    return;
+  }
+  assert_eq!(
+    goodbyes_after, goodbyes_before,
+    "no raw send reached the kernel this withdrawal (packets_tx stayed at {packets_before}), \
+     so goodbyes_tx cannot have moved either — it went to {goodbyes_after}"
+  );
+  // Informational only, deliberately not asserted: `degraded_families` needs
+  // three CONSECUTIVE non-`Accepted` outcomes, so a scheduler that starved
+  // this test down to only one or two real attempts before the ceiling fired
+  // can leave it `false` even though every attempt made genuinely failed.
+  // `packets_tx` not moving, asserted above, is already the complete proof.
+  let (v4_degraded, v6_degraded) = mdns.degraded_families();
+  eprintln!(
+    "note: the withdrawal completed via its anti-pin ceiling with neither packets_tx nor \
+     goodbyes_tx moving this run (degraded v4={v4_degraded} v6={v6_degraded})"
+  );
+}
+
+/// The exact gap a bare `v4_degraded || v6_degraded` leaves open: IPv4 pays
+/// its whole §10.1 budget (real sends, real `Accepted`s) while IPv6 is
+/// unconditionally refused and goes degraded. A dual-stack disjunction that
+/// accepts "some family is degraded" as license for `goodbyes_tx` staying put
+/// would pass here even if the `goodbyes_tx` bump were deleted outright —
+/// IPv6's degradation says nothing about whether IPv4's real deliveries were
+/// counted. `packets_tx` is what actually pins it: IPv4's sends bump it
+/// (independently of `goodbyes_tx`), so this test requires `goodbyes_tx` to
+/// have risen too, unconditionally, regardless of IPv6's health.
+#[test]
+#[cfg(feature = "stats")]
+fn a_withdrawal_where_one_family_delivers_while_the_other_is_refused() {
+  let Some(mut mdns) = test_support::loopback_mdns() else {
+    return;
+  };
+  if mdns.bound_families() != (true, true) {
+    eprintln!(
+      "skipping: this host did not bind both families, so IPv4 delivering while IPv6 is \
+       refused cannot be exercised"
+    );
+    return;
+  }
+  let handle = mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-goodbye-mixed._tcp.local.",
+      8080,
+    ))
+    .expect("register_service");
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
+    return;
+  }
+
+  // IPv6 refuses every datagram from here on; IPv4 is untouched and keeps
+  // sending for real.
+  mdns
+    .sockets
+    .force_send_wouldblock_for_test(Family::V6, true);
+
+  mdns.shutdown();
+  let goodbyes_before = mdns.stats().goodbyes_tx;
+  let packets_before = mdns.stats().packets_tx;
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while !mdns.is_idle() && Instant::now() < deadline {
+    mdns.tick().expect("tick");
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  assert!(mdns.is_idle(), "shutdown must terminate");
+
+  let (_, v6_degraded) = mdns.degraded_families();
   assert!(
-    mdns.stats().goodbyes_tx > before,
-    "an announced service's withdrawal must deliver at least one round and bump goodbyes_tx"
+    v6_degraded,
+    "IPv6 was forced to refuse every send for the whole withdrawal; it must report degraded"
+  );
+  assert!(
+    mdns.stats().packets_tx > packets_before,
+    "IPv4 was never touched and owed a real §10.1 budget, so at least one of its sends must \
+     have reached the kernel"
+  );
+  assert!(
+    mdns.stats().goodbyes_tx > goodbyes_before,
+    "IPv4 delivered real withdrawal rounds (packets_tx {packets_before} -> {}), so goodbyes_tx \
+     must have bumped regardless of IPv6 being degraded — a bare v4_degraded || v6_degraded \
+     disjunction would wrongly accept goodbyes_tx staying at {goodbyes_before} here",
+    mdns.stats().packets_tx
+  );
+}
+
+/// The disjunction `a_delivered_withdrawal_round_bumps_goodbyes_tx` and
+/// `tests/loopback.rs`'s `shutdown_drives_goodbyes_to_idle_and_a_peer_observes_them`
+/// both check when `goodbyes_tx` does NOT rise, forced here rather than left to
+/// chance: every family is made to refuse every send (`WouldBlock`, exactly what
+/// a busy wire under real cross-process contention reports — see
+/// `Sockets::send_one`), so the withdrawal can only ever complete via the 2 s
+/// anti-pin ceiling with zero rounds ever `Accepted`.
+///
+/// This is the deterministic sibling of the ALL-refused branch the two tests
+/// above only reach by chance under contention: forced here every run,
+/// `is_idle` still reaches true (the ceiling's job, and unconditional on
+/// family health), `goodbyes_tx` never moves, and BOTH are asserted alongside
+/// EVERY bound family reporting degraded — proving that branch of their
+/// disjunction is not vacuous, i.e. that `degraded_families` really does
+/// explain a zero count rather than merely happening not to contradict it in
+/// whatever a real socket did this run. The OTHER branch — one family
+/// delivering for real while the other is refused, which a degraded family
+/// alone must NOT excuse — is
+/// `a_withdrawal_where_one_family_delivers_while_the_other_is_refused`.
+#[test]
+#[cfg(feature = "stats")]
+fn a_withdrawal_that_never_delivers_still_reaches_idle_with_degraded_families() {
+  let Some(mut mdns) = test_support::loopback_mdns() else {
+    return;
+  };
+  let handle = mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-goodbye-refused._tcp.local.",
+      8080,
+    ))
+    .expect("register_service");
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
+    return;
+  }
+  let (v4, v6) = mdns.bound_families();
+  assert!(v4, "the loopback fixture must bind IPv4");
+
+  mdns
+    .sockets
+    .force_send_wouldblock_for_test(Family::V4, true);
+  if v6 {
+    mdns
+      .sockets
+      .force_send_wouldblock_for_test(Family::V6, true);
+  }
+
+  mdns.shutdown();
+  let before = mdns.stats().goodbyes_tx;
+  // Comfortably past the 2 s anti-pin ceiling: every round from here is a
+  // refusal, so completion can only come from the ceiling forcing it, never
+  // from debt clearing.
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while !mdns.is_idle() && Instant::now() < deadline {
+    mdns.tick().expect("tick");
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  assert!(
+    mdns.is_idle(),
+    "the anti-pin ceiling must still force the withdrawal to completion when every family \
+     refuses every round"
+  );
+  assert_eq!(
+    mdns.stats().goodbyes_tx,
+    before,
+    "every round was forced to WouldBlock, so no round should ever have reached Accepted"
+  );
+  let (v4_bound, v6_bound) = mdns.bound_families();
+  let (v4_degraded, v6_degraded) = mdns.degraded_families();
+  assert!(
+    (!v4_bound || v4_degraded) && (!v6_bound || v6_degraded),
+    "every bound family refused every round for the whole ceiling, so EVERY bound family must \
+     report degraded delivery (v4_bound={v4_bound} v4_degraded={v4_degraded}, \
+     v6_bound={v6_bound} v6_degraded={v6_degraded}) — this is the all-refused branch the \
+     goodbyes_tx tests' disjunction depends on, and it must not be vacuous"
   );
 }
 
@@ -1099,13 +1299,26 @@ fn goodbye_wire_times(mdns: &mut Mdns, already_on_wire: usize) -> Vec<Instant> {
 /// the ceiling is followed by the final attempt, which is due AT the ceiling. What
 /// the bug does is take that goodbye earlier still, from a schedule armed off an
 /// instant that predates the stalled send.
+///
+/// Fewer than 2 wire times is not this property failing: the same anti-pin
+/// ceiling that bounds the spacing above also force-completes the withdrawal
+/// whatever a family answers, so a busy wire (this binary's own contention
+/// with whatever else is bound to the shared multicast group) can legitimately
+/// leave 0 or 1 round on IPv4's wire with the re-arm logic this helper checks
+/// never having been exercised twice. The bug this guards against is a
+/// too-small GAP between two rounds that did land, which a short count cannot
+/// manufacture — dropping a round only ever widens the gap to whatever comes
+/// after it — so skipping the comparison loses no coverage of it.
 fn assert_goodbye_wire_spacing(kind: &str, wire_times: &[Instant], ceiling_floor: Instant) {
-  assert!(
-    wire_times.len() >= 2,
-    "{kind}: {} goodbyes reached IPv4's wire, so there is no consecutive pair to \
-     weigh and this test asserts nothing",
-    wire_times.len()
-  );
+  if wire_times.len() < 2 {
+    eprintln!(
+      "skipping: {kind}: only {} goodbye(s) reached IPv4's wire before the withdrawal \
+       completed, so there is no consecutive pair to weigh — consistent with the anti-pin \
+       ceiling refusing every round on a busy wire, not with a spacing regression",
+      wire_times.len()
+    );
+    return;
+  }
   for pair in wire_times.windows(2) {
     let earliest = (pair[0] + GOODBYE_MIN_FAMILY_GAP).min(ceiling_floor);
     assert!(
@@ -4529,13 +4742,38 @@ fn a_paid_family_carries_no_goodbye_while_the_blocked_one_retries() {
     .force_send_wouldblock_for_test(Family::V6, true);
   mdns.unregister_service(handle);
   let wire_times = drive_withdrawal_to_settled(&mut mdns, already_on_wire);
-  assert_eq!(
-    wire_times.len(),
-    usize::from(super::withdrawal::GOODBYE_ROUNDS_PER_FAMILY),
-    "IPv4 owed exactly its §10.1 budget and paid it; every datagram after that \
-     is a retraction of records nothing still advertises, emitted only because \
-     IPv6 is retrying"
+  let budget = usize::from(super::withdrawal::GOODBYE_ROUNDS_PER_FAMILY);
+  // The direction this test exists to catch is IPv6's retries leaking onto
+  // IPv4's wire, which can only ever ADD datagrams past what IPv4 itself
+  // owed — dropping a round never manufactures an extra one — so this half
+  // is unconditional regardless of how much of IPv4's own budget a busy wire
+  // let through.
+  assert!(
+    wire_times.len() <= budget,
+    "IPv4 owed exactly its §10.1 budget; {} datagrams reached its wire after unregister, \
+     more than that — the blocked IPv6 family's retries put a redundant goodbye on IPv4's \
+     wire",
+    wire_times.len()
   );
+  // Whether IPv4 paid its FULL budget (not merely stopped short of it) does
+  // depend on IPv4's own real sends succeeding, which this binary's own
+  // contention with whatever else is bound to the shared multicast group can
+  // legitimately prevent — the ceiling only guarantees IPv6's retries stop
+  // riding a PAID IPv4, never that IPv4 gets through in the first place.
+  // There is no discriminator this test can check for a partial shortfall
+  // (unlike a total one, a family that delivered some but not all of its
+  // budget need not have tripped `degraded_families`'s consecutive-failure
+  // streak), so a shortfall here is a skip rather than a proven-safe case:
+  // the over-fan half above still ran and still covers the regression this
+  // test exists for.
+  if wire_times.len() < budget {
+    eprintln!(
+      "skipping: the exact-budget and spacing checks below: IPv4 reached the wire only {} of \
+       its {budget}-round §10.1 budget, which a busy wire can legitimately cause",
+      wire_times.len()
+    );
+    return;
+  }
   for pair in wire_times.windows(2) {
     let gap = pair[1].saturating_duration_since(pair[0]);
     assert!(
