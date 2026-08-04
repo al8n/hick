@@ -268,6 +268,9 @@ pub mod stats {
     bytes_rx: AtomicU64,
     bytes_tx: AtomicU64,
     packets_dropped: AtomicU64,
+    ingress_witness_declined: AtomicU64,
+    ingress_degraded_admits: AtomicU64,
+    ingress_residual_refusals: AtomicU64,
     parse_errors: AtomicU64,
     send_errors: AtomicU64,
     questions_rx: AtomicU64,
@@ -303,6 +306,26 @@ pub mod stats {
       bytes_rx => "mdns_bytes_rx",
       bytes_tx => "mdns_bytes_tx",
       packets_dropped => "mdns_packets_dropped",
+      // ── RFC 6762 §11 ingress, the three facts a boolean verdict hid ──────
+      //
+      // The kernel declined to emit a receive cmsg it normally emits: the
+      // datagram's destination or receive interface went missing without a
+      // `MSG_CTRUNC` to explain it. Every BSD builds its ancillary mbufs with
+      // `M_NOWAIT` and skips the cmsg on allocation failure with no error and no
+      // counter of its own, and mbuf exhaustion is normally caused by a flood —
+      // so this is the counter that says "we are being degraded", and it is the
+      // only warning a host gets.
+      ingress_witness_declined => "mdns_ingress_witness_declined",
+      // A datagram ADMITTED with no destination witness at all, on §11's
+      // source-prefix arm or on the kernel's coarse multicast flag. The
+      // destination partition's guarantees do not hold for these, so the count
+      // is the size of the exposure on a blind receive square.
+      ingress_degraded_admits => "mdns_ingress_degraded_admits",
+      // A datagram REFUSED because its witnessed destination is one this
+      // endpoint does not hold and no named class describes — §11's residual.
+      // Counted so the conformance gap is an observation rather than an
+      // argument.
+      ingress_residual_refusals => "mdns_ingress_residual_refusals",
       parse_errors => "mdns_parse_errors",
       send_errors => "mdns_send_errors",
       questions_rx => "mdns_questions_rx",
@@ -354,6 +377,9 @@ pub mod stats {
         bytes_rx: self.bytes_rx.load(Relaxed),
         bytes_tx: self.bytes_tx.load(Relaxed),
         packets_dropped: self.packets_dropped.load(Relaxed),
+        ingress_witness_declined: self.ingress_witness_declined.load(Relaxed),
+        ingress_degraded_admits: self.ingress_degraded_admits.load(Relaxed),
+        ingress_residual_refusals: self.ingress_residual_refusals.load(Relaxed),
         parse_errors: self.parse_errors.load(Relaxed),
         send_errors: self.send_errors.load(Relaxed),
         questions_rx: self.questions_rx.load(Relaxed),
@@ -392,6 +418,16 @@ pub mod stats {
     pub bytes_rx: u64,
     pub bytes_tx: u64,
     pub packets_dropped: u64,
+    /// A receive cmsg the kernel normally emits was absent with no
+    /// `MSG_CTRUNC`: the datagram's RFC 6762 §11 witness was DECLINED rather
+    /// than lost or unavailable. See `hick_udp::onlink::DestinationWitness::Declined`.
+    pub ingress_witness_declined: u64,
+    /// Datagrams admitted with no destination witness at all, where the §11
+    /// destination partition's guarantees do not hold.
+    pub ingress_degraded_admits: u64,
+    /// Datagrams refused because their witnessed destination takes no §11 arm
+    /// and no named class describes it.
+    pub ingress_residual_refusals: u64,
     pub parse_errors: u64,
     pub send_errors: u64,
     pub questions_rx: u64,
