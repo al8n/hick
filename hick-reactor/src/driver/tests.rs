@@ -149,11 +149,11 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
     data: body.clone(),
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("192.0.2.9:40000".parse().unwrap()),
     rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
-    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     delivery: None,
     hop_limit: Some(255),
   };
@@ -170,11 +170,11 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
     data: body,
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
     rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
-    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     delivery: None,
     hop_limit: Some(255),
   };
@@ -220,11 +220,11 @@ fn pre_drop_short_qr1_counts_rx_and_dropped_exactly_once() {
     data: body,
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("192.0.2.7:40000".parse().unwrap()),
     rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
-    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     delivery: None,
     hop_limit: Some(255),
   };
@@ -284,11 +284,11 @@ fn pre_drop_untrusted_qr1_response_counts_rx_and_dropped_exactly_once() {
     data: body,
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("192.0.2.8:54321".parse().unwrap()),
     rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
-    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     delivery: None,
     hop_limit: Some(255), // carried, never read
   };
@@ -342,9 +342,9 @@ fn pre_drop_off_link_datagram_counts_rx_and_dropped_exactly_once() {
     data: body,
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("203.0.113.5:5353".parse().unwrap()),
     rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
-    destination: None,
+    destination: DestinationWitness::blind(),
     delivery: None,
     hop_limit: Some(64), // carried, never read — see the doc above
   };
@@ -473,37 +473,86 @@ struct Arrival {
   src: SocketAddr,
   family: Family,
   hop_limit: Option<u8>,
-  pkt_iface: u32,
-  destination: Option<IpAddr>,
+  iface: IfaceWitness,
+  destination: DestinationWitness,
   delivery: Option<hick_udp::LinkDelivery>,
 }
 
 #[cfg(feature = "tokio")]
 impl Arrival {
-  /// A datagram whose receive path recovered neither a destination nor a
+  /// A datagram whose receive path witnessed neither a destination nor a
   /// multicast flag.
+  ///
+  /// `pkt_iface` becomes the witness a path of THIS driver's shape would mint
+  /// for it — see [`packet_iface_witness`] for the zero case, which is the one
+  /// every case here turns on.
   fn new(src: SocketAddr, family: Family, hop_limit: Option<u8>, pkt_iface: u32) -> Self {
     Self {
       src,
       family,
       hop_limit,
-      pkt_iface,
-      destination: None,
+      iface: match core::num::NonZeroU32::new(pkt_iface) {
+        Some(idx) => IfaceWitness::Witnessed(idx),
+        None => packet_iface_witness(src),
+      },
+      destination: DestinationWitness::blind(),
       delivery: None,
     }
   }
 
-  /// The IP header destination this receive path recovered.
+  /// The IP header destination this receive path witnessed.
   fn addressed_to(mut self, dst: IpAddr) -> Self {
-    self.destination = Some(dst);
+    self.destination = DestinationWitness::Witnessed(dst);
     self
   }
 
   /// The kernel's `MSG_MCAST`, where the target reports one and no destination
-  /// was recovered.
+  /// was witnessed.
   fn delivered_as_multicast(mut self) -> Self {
     self.delivery = Some(hick_udp::LinkDelivery::Multicast);
     self
+  }
+
+  /// The kernel DECLINED to name the receiving interface for this datagram: no
+  /// index, and no `MSG_CTRUNC` to say our own buffer was at fault.
+  fn iface_declined(mut self) -> Self {
+    self.iface = IfaceWitness::Declined;
+    self
+  }
+
+  /// The kernel DECLINED to report the IP header destination for this datagram.
+  fn destination_declined(mut self) -> Self {
+    self.destination = DestinationWitness::Declined;
+    self
+  }
+}
+
+/// The interface witness a `Packet` built with a ZERO index was equivalent to
+/// before the witnesses existed — the pair `(0, rx_interface_reported(src))`.
+///
+/// A zero from a path that reports interfaces becomes [`IfaceWitness::Lost`],
+/// which is the absence that still REFUSES, so every case written under the old
+/// pair keeps asserting exactly what it asserted. [`IfaceWitness::Declined`] —
+/// the absence that now degrades — is deliberately never produced here: routing
+/// the old cases into it would silently rewrite them. It has cases of its own,
+/// reached through [`Arrival::iface_declined`].
+#[cfg(feature = "tokio")]
+fn packet_iface_witness(src: SocketAddr) -> IfaceWitness {
+  if rx_interface_reported(src) {
+    IfaceWitness::Lost
+  } else {
+    IfaceWitness::Blind
+  }
+}
+
+/// [`INGRESS_BOUND`] as a witnessed interface index.
+#[cfg(feature = "tokio")]
+fn ingress_bound_witness() -> IfaceWitness {
+  match core::num::NonZeroU32::new(INGRESS_BOUND) {
+    Some(idx) => IfaceWitness::Witnessed(idx),
+    // `INGRESS_BOUND` is a nonzero literal; `Lost` is the value that cannot
+    // silently widen the §11 gate if that ever changed.
+    None => IfaceWitness::Lost,
   }
 }
 
@@ -548,7 +597,7 @@ fn ingress_admits(a: Arrival, subnets: &[(IpAddr, u8)], bound_is_loopback: bool)
     data: body,
     family: a.family,
     local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-    interface_index: a.pkt_iface,
+    iface: a.iface,
     rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     destination: a.destination,
     delivery: a.delivery,
@@ -902,9 +951,9 @@ fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
       data: body,
       family: Family::V4,
       local_ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-      interface_index: INGRESS_BOUND,
+      iface: ingress_bound_witness(),
       rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
-      destination: None,
+      destination: DestinationWitness::blind(),
       delivery: None,
       hop_limit: None,
     });
@@ -1187,10 +1236,16 @@ fn a_loopback_bound_endpoint_still_refuses_a_reported_foreign_interface() {
 /// the production receive entry.
 ///
 /// Unix and Windows both read through `hick_udp::recv_with_meta`; every other
-/// target takes an arm that builds its `Packet` with `interface_index: 0` and
-/// `hop_limit: None`. Capability therefore belongs to the receive path and not
-/// to the platform, and telling the rule otherwise would make every zero index a
-/// failed proof and drop every non-loopback datagram there.
+/// target takes an arm that declares `IfaceWitness::blind()` /
+/// `DestinationWitness::blind()` once, from its own construction, and `hop_limit: None`.
+/// Capability therefore belongs to the receive path and not to the platform, and
+/// telling the rule otherwise would make every absent index a failed proof and
+/// drop every non-loopback datagram there.
+///
+/// The fixture goes through [`packet_iface_witness`], so on a host whose path
+/// DOES report the case exercised is the LOST one — our own control buffer too
+/// small — which is what the assertion below is about. The blind arm's own case
+/// is `a_blind_receive_path_admits_an_in_subnet_peer_on_every_target`.
 ///
 /// The expectation is derived from this driver's own capability rather than
 /// hardcoded, so the case runs on every target: where the path DOES report an
@@ -1231,9 +1286,9 @@ fn a_receive_path_that_recovers_nothing_still_admits_an_in_subnet_peer() {
     data: body,
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-    interface_index: 0,
+    iface: packet_iface_witness(src),
     rx: RxEvidence::none(),
-    destination: None,
+    destination: DestinationWitness::blind(),
     delivery: None,
     hop_limit: None,
   });
@@ -1243,6 +1298,89 @@ fn a_receive_path_that_recovers_nothing_still_admits_an_in_subnet_peer() {
     !rx_interface_reported(src),
     "a path with no interface to give must fall to §11's source rule, not be \
      read as a kernel that declined to place the datagram"
+  );
+}
+
+/// A witness the KERNEL declined to emit must not make this driver deaf.
+///
+/// The narrower case above it — `a_receive_path_that_recovers_nothing_...` —
+/// is about our own control buffer being too small, which is this side's bug and
+/// still refuses. This one is the other absence, and it is the one an attacker
+/// can provoke: every BSD builds its ancillary mbufs with `M_NOWAIT` and, when
+/// `sbcreatecontrol` returns `NULL`, skips the cmsg with no error, no counter and
+/// no `MSG_CTRUNC`, while still delivering the datagram (FreeBSD
+/// `kern/uipc_sockbuf.c`, NetBSD `kern/uipc_socket2.c`). Mbuf exhaustion is
+/// normally caused by a flood, so refusing here takes the responder off the air
+/// exactly during the traffic that caused it.
+///
+/// What it degrades to is not a new exposure: it is §11's source-prefix arm, the
+/// standing rule on every structurally blind square.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_declined_witness_degrades_to_the_source_arm_rather_than_going_deaf() {
+  let subnets = ingress_subnets();
+  let src = ingress_on_subnet_peer();
+
+  // The interface witness. Same datagram, same in-subnet source: declined
+  // admits, and the LOST twin above it does not.
+  assert!(
+    ingress_admits(
+      Arrival::new(src, Family::V4, None, INGRESS_BOUND).iface_declined(),
+      &subnets,
+      false
+    ),
+    "a kernel that skipped the PKTINFO cmsg leaves §11's source arm deciding,      and an in-prefix source passes it"
+  );
+
+  // The destination witness, with the link witnessed so stage 1 cannot be what
+  // decides.
+  assert!(
+    ingress_admits(
+      Arrival::new(src, Family::V4, None, INGRESS_BOUND).destination_declined(),
+      &subnets,
+      false
+    ),
+    "and the same for a declined destination cmsg"
+  );
+
+  // Degrading is not admitting: an OFF-prefix source is still refused, so the
+  // fallback rests on positive evidence exactly as the blind squares' does.
+  assert!(
+    !ingress_admits(
+      Arrival::new(ingress_off_subnet_peer(), Family::V4, None, INGRESS_BOUND).iface_declined(),
+      &subnets,
+      false
+    ),
+    "the degraded arm is §11's source rule, not an open door"
+  );
+}
+
+/// The plain `recv_from` arm's own case, stated on every target rather than only
+/// where that arm compiles.
+///
+/// `recv_task` builds `IfaceWitness::blind()` / `DestinationWitness::blind()` there — a
+/// declaration made ONCE from the arm's own construction, never inferred from a
+/// datagram — and the boundary must fall back to §11's source rule on it. The
+/// fixture presents those witnesses directly, so the case runs on a Unix host
+/// too, where that arm is not compiled at all.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_blind_receive_path_admits_an_in_subnet_peer_on_every_target() {
+  let subnets = ingress_subnets();
+  let mut arrival = Arrival::new(ingress_on_subnet_peer(), Family::V4, None, INGRESS_BOUND);
+  arrival.iface = IfaceWitness::blind();
+  arrival.destination = DestinationWitness::blind();
+  assert!(
+    ingress_admits(arrival, &subnets, false),
+    "a path with nothing to witness must fall to §11's source rule rather than      read its own silence as a failed proof"
+  );
+
+  let mut off = Arrival::new(ingress_off_subnet_peer(), Family::V4, None, INGRESS_BOUND);
+  off.iface = IfaceWitness::blind();
+  off.destination = DestinationWitness::blind();
+  assert!(
+    !ingress_admits(off, &subnets, false),
+    "and it is still the source rule: an off-prefix source is refused"
   );
 }
 
@@ -1749,7 +1887,7 @@ async fn same_name_replacement_is_rejected_until_withdrawal_completes() {
   };
 
   // 1. Register A and drive its proto to an announced state so the withdrawal
-  //    snapshot is NON-empty (records were confirmed-emitted). Delivery is
+  //    snapshot is NON-empty (records were confirmed-emitted). DestinationWitness is
   //    simulated via `deliver_both` so the announce/host guards latch (no
   //    sockets are bound).
   let a = state.register_service(mk(), now).unwrap().handle;
@@ -4899,11 +5037,11 @@ async fn a_credit_sealed_before_the_park_expires_across_it_and_cannot_suppress_a
     data: body.clone(),
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
     rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
-    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     delivery: None,
     hop_limit: Some(255),
   });
@@ -4978,11 +5116,11 @@ async fn the_seal_predates_the_park_and_the_generation_proves_it() {
     data: body.clone(),
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
     rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
-    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     delivery: None,
     hop_limit: Some(255),
   });
@@ -5070,11 +5208,11 @@ async fn a_receive_reached_without_parking_is_not_weighed_against_a_stale_park()
     data: vec![0u8; 12],
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
     rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
-    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     delivery: None,
     hop_limit: Some(255),
   });
@@ -5130,11 +5268,11 @@ async fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
     data: body.clone(),
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("192.0.2.9:40000".parse().unwrap()),
     rx: RxEvidence::none(),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
-    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     delivery: None,
     hop_limit: Some(255),
   };
@@ -5153,11 +5291,11 @@ async fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
     data: body,
     family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-    interface_index: 0,
+    iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
     rx: RxEvidence::none(),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
-    destination: Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     delivery: None,
     hop_limit: Some(255),
   });
