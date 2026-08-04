@@ -1677,8 +1677,8 @@ fn default_setup_rejects_off_link_unicast() {
   // could send unicast (or an ephemeral-port probe) to the device's :5353 and inject
   // conflict/answer data — link-scoped multicast does not protect a unicast path.
   // The SAME conflict that renames over multicast (above) must be ignored when its
-  // destination is the device's own unicast address and no hop-limit/subnets vouch
-  // for it.
+  // destination is the device's own unicast address and no subnet vouches for
+  // it (the received hop-limit, if any, is never consulted).
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(59));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
@@ -1710,8 +1710,8 @@ fn default_setup_rejects_off_link_unicast() {
   }
   assert!(
     !reacted,
-    "off-link unicast must NOT drive a conflict rename when no hop-limit or subnet \
-       vouches for it — only link-scoped multicast is trusted by default"
+    "off-link unicast must NOT drive a conflict rename when no subnet vouches \
+       for it — only link-scoped multicast is trusted by default"
   );
 }
 

@@ -199,10 +199,13 @@ fn loopback_udpio_roundtrip() {
 
 #[test]
 fn egress_packets_carry_hop_limit_255() {
-  // RFC 6762 §11: every outgoing mDNS packet MUST leave with IP TTL /
-  // hop-limit 255, and conformant peers reject anything else at their on-link gate.
-  // smoltcp defaults a UDP socket's hop-limit to 64, so the DualStack send path must
-  // force 255 — assert it on the ACTUAL egressed IPv4 header, not just socket state.
+  // RFC 6762 §11: every outgoing mDNS packet SHOULD leave with IP TTL /
+  // hop-limit 255 — for compatibility with OLDER queriers implementing the
+  // February-2004 draft, which discard everything but 255 on reception. A
+  // modern §11-conformant receiver's on-link test never consults it. smoltcp
+  // defaults a UDP socket's hop-limit to 64, so the DualStack send path must
+  // force 255 regardless — assert it on the ACTUAL egressed IPv4 header, not
+  // just socket state.
   let mut device = CapturingDevice::default();
   let config = Config::new(HardwareAddress::Ip);
   let mut iface = Interface::new(config, &mut device, RawInstant::ZERO);
@@ -242,8 +245,8 @@ fn egress_packets_carry_hop_limit_255() {
   assert_eq!(
     ip.hop_limit(),
     255,
-    "RFC 6762 §11: every outgoing mDNS packet must leave with IP TTL 255, not the \
-       smoltcp default 64"
+    "hick-smoltcp always forces IP TTL 255 on egress (RFC 6762 §11's transmit \
+       SHOULD), never the smoltcp default 64"
   );
 }
 

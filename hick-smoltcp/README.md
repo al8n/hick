@@ -125,13 +125,17 @@ instead for observability on embedded.
 - **`UdpIo` transport seam** — a two-method, non-blocking trait (`try_recv` /
   `try_send`). The family-aware `DualStack` implements it over smoltcp UDP sockets
   (routing each multicast to the socket of its own family); bring your own and the
-  engine is transport-agnostic.
-- **RFC 6762 §11 on-link gate** — a present hop-limit (`== 255`) is decisive;
-  otherwise a datagram addressed to the mDNS group is admitted outright
-  (arrival at the group is its own §11 admission ground; a peer outside your
-  configured subnets is still on your link if its multicast reached you);
-  otherwise, for a non-group destination, subnet membership decides; otherwise
-  reject.
+  engine is transport-agnostic. One implementation MUST represent exactly one
+  interface (dual v4/v6 on that one interface is fine) — the on-link gate's
+  subnet check has no interface identity to scope itself with, so an
+  aggregating implementation silently admits cross-interface unicast.
+- **RFC 6762 §11 on-link gate** — a datagram addressed to the mDNS group is
+  admitted outright (arrival at the group is its own §11 admission ground; a
+  peer outside your configured subnets is still on your link if its multicast
+  reached you); otherwise, for a non-group destination, subnet membership
+  decides; otherwise reject. The received hop-limit / TTL is not part of this
+  test — §11's receive-side check is exhaustively destination and source, never
+  TTL.
 - **RFC 6762 §10.1 goodbye** — unregistering an announced service emits a TTL=0
   goodbye, bursted a few times by the pump.
 

@@ -42,22 +42,25 @@ impl<R: Rng> MdnsState<R> {
     }
   }
 
-  /// Set the device's local subnets — consulted by the RFC 6762 §11 on-link gate
-  /// when the transport can't surface the received hop-limit (embassy-net
-  /// re-exports smoltcp's `UdpMetadata`, which carries no RX TTL). The gate
-  /// falls through in order: a present hop-limit is decisive; otherwise a
+  /// Set the device's local subnets — consulted by the RFC 6762 §11 on-link
+  /// gate for a non-group-destined datagram. The gate falls through in order: a
   /// datagram addressed to the mDNS group is admitted outright (arrival at the
   /// group is its own §11 admission ground; a peer outside your configured
   /// subnets is still on your link if its multicast reached you); otherwise,
   /// for a non-group destination, subnet membership decides; otherwise reject.
+  /// The received hop-limit / TTL is not consulted — §11's receive-side test is
+  /// exhaustively the two checks above (and embassy-net's `UdpMetadata` does
+  /// not currently surface one regardless).
   ///
   /// OPTIONAL. With no subnets configured, the group and reject steps above
   /// still apply: a default node admits group-destined mDNS and is not deaf,
-  /// but not unicast — because this driver's `DualUdp` transport always
-  /// constructs `RecvMeta` with `hop_limit: None` (embassy-net's `UdpMetadata`
-  /// does not currently surface a received hop limit), so the hop-limit step
-  /// above never short-circuits ahead of it. Configure the device's own
-  /// subnets to admit on-subnet unicast too.
+  /// but not unicast. Configure the device's own subnets to admit on-subnet
+  /// unicast too.
+  ///
+  /// `subnets` must be this device's own single interface's prefixes — see
+  /// [`UdpIo`](hick_smoltcp::UdpIo)'s one-interface-per-implementation
+  /// contract. Running this state with a `UdpIo` that aggregates more than one
+  /// physical interface admits cross-interface unicast here, silently.
   pub fn set_local_subnets(&self, subnets: Vec<IpCidr>) {
     self.engine.borrow_mut().set_local_subnets(subnets);
   }
