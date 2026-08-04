@@ -78,9 +78,24 @@ struct Packet {
   ///
   /// It is an [`RxEvidence`] the whole way from the receive task to the claim,
   /// built by [`RxEvidence::from_meta`] off the [`hick_udp::RecvMeta`] the
-  /// `recvmsg` produced. That keeps the provenance structural rather than
+  /// `recvmsg` produced. That keeps the stamp's ORIGIN structural rather than
   /// conventional: this driver never holds the stamp as a bare `SystemTime`, so
   /// no later edit can substitute a read time for it without changing the type.
+  ///
+  /// **Which datagram it belongs to is a separate question, and `hick-udp`
+  /// cannot check that one for any form of the evidence.**
+  /// `SelfSendTracker::take` takes the body and the stamp as separate arguments
+  /// and [`RxEvidence`] is `Copy`, so a stamp a kernel really did write — for a
+  /// *different* receive — is weighed at `Ordered` strength all the same. A
+  /// later stamp lets a datagram the kernel saw before our `sendto` take the
+  /// credit; an earlier one rejects the genuine echo. Both end at a phantom
+  /// RFC 6762 §9 conflict against ourselves.
+  ///
+  /// Being a FIELD of this struct is what discharges that here. The stamp and
+  /// [`Packet::data`] are filled from one `recv_with_meta` and cross the channel
+  /// as one value, and the claim reads both off that value — so there is no
+  /// point at which one receive's stamp could meet another's payload. See
+  /// [`RxEvidence`] on origin versus association.
   rx: RxEvidence,
   /// The datagram's IP header **destination**, where this receive path
   /// recovered one ([`hick_udp::RecvMeta::destination`]), and `None` where it
@@ -3019,9 +3034,12 @@ async fn recv_loop<N: Net>(
             local_ip: meta.local_ip(),
             interface_index: meta.interface_index(),
             // The evidence is built from the `RecvMeta` this crate's own
-            // `recvmsg` produced, so its provenance is carried by the type: an
+            // `recvmsg` produced, so its ORIGIN is carried by the type: an
             // absent cmsg stays absent, and there is no step at which a
-            // userspace stamp could be substituted for a kernel one.
+            // userspace stamp could be substituted for a kernel one. Which
+            // datagram it belongs to is not carried by the type — it is carried
+            // by this struct literal, which pairs the stamp with the `data`
+            // sliced from that same receive. See `Packet::rx`.
             rx: RxEvidence::from_meta(&meta),
             // The two facts §11 selects its fallback arm by, carried rather
             // than discarded — see `Packet::destination`.
