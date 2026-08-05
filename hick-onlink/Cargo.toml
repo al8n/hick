@@ -1,0 +1,29 @@
+[package]
+name = "hick-onlink"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+license = "MIT OR Apache-2.0"
+description = "The RFC 6762 §11 on-link ingress rule for mDNS, as a pure `no_std` function over what a receive path witnessed."
+repository = "https://github.com/al8n/hick"
+homepage = "https://github.com/al8n/hick"
+documentation = "https://docs.rs/hick-onlink"
+readme = "README.md"
+keywords = ["mdns", "rfc6762", "on-link", "no-std", "zeroconf"]
+categories = ["network-programming", "no-std", "no-std::no-alloc"]
+
+# No dependencies, and that is a property of this crate rather than an accident
+# of its size: it is the one admission decision every driver in this workspace
+# shares, it is reached on `thumbv6m-none-eabi` as readily as on Linux, and a
+# `core::net`-only rule is auditable in full without reading anything else. The
+# `is_*` predicates are written out by hand for the same reason — a derive would
+# put a proc macro in a bare-metal build graph to save twenty-six one-line
+# `matches!`.
+[dependencies]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

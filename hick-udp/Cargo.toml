@@ -28,6 +28,7 @@ metrics = ["hick-trace/metrics"]
 stats = ["hick-trace/stats"]
 
 [dependencies]
+hick-onlink.workspace = true
 hick-trace.workspace = true
 thiserror = { workspace = true, features = ["std"] }
 derive_more.workspace = true
