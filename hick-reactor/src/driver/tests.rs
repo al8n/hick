@@ -2129,13 +2129,20 @@ async fn dropped_reply_reclaiming_register_keeps_old_name_goodbye() {
     );
   }
 
-  // A conflicting SRV authority for "Old" with rival rdata (port 9999): we lose
-  // the §8.2 tiebreak and rename away.
+  // A conflicting SRV RESPONSE for "Old" with rival rdata (port 9999): the RFC
+  // 6762 §9 signal that reverts this ESTABLISHED service to probing, where it
+  // loses the §8.2 tiebreak and renames away. §9 defines the conflict over a
+  // response — "it receives a Multicast DNS response message containing a
+  // record with the same name, rrtype and rrclass, but inconsistent rdata" — so
+  // the same rdata in the Authority section of a peer's QUERY would leave this
+  // service established and defending, which is what §8.1 asks of it.
   let conflict = {
     let target = Name::try_from_str("rival-host.local.").unwrap();
     let mut cbuf = [0u8; 512];
-    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
-    b.push_srv_authority(&old_inst, 120, 0, 0, 9999, &target)
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, header).unwrap();
+    b.push_srv_answer(&old_inst, 120, 0, 0, 9999, &target, true)
       .unwrap();
     let n = b.finish().unwrap();
     cbuf[..n].to_vec()
@@ -2284,10 +2291,28 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   }
 
   // 2. Feed a §9 host conflict (a peer claims our host name with a DIFFERENT
-  //    address) through the REAL inbound path, so the proto emits a HostConflict
-  //    via poll() — the proto-emitted terminal `push_updates` must retire. This
-  //    mirrors the driver's own receive routing (split-borrow + ToService).
+  //    address in an authoritative RESPONSE) through the REAL inbound path, so
+  //    the proto emits a HostConflict via poll() — the proto-emitted terminal
+  //    `push_updates` must retire. This mirrors the driver's own receive routing
+  //    (split-borrow + ToService).
+  //
+  //    A response, not a probe: §9 defines the conflict over one, and this
+  //    update retires the service, so honouring a peer's mere PROBE for a shared
+  //    host name would let one ordinary probe retire every service using it.
   let conflict = {
+    let mut cbuf = [0u8; 512];
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, header).unwrap();
+    b.push_a_answer(&host, 120, Ipv4Addr::new(10, 0, 0, 99), true)
+      .unwrap();
+    let n = b.finish().unwrap();
+    cbuf[..n].to_vec()
+  };
+  // The SAME record carried as a peer PROBING our host name (QR=0, Authority
+  // Section), fed first against this same service so the contrast below is the
+  // origin and nothing else.
+  let probe = {
     let mut cbuf = [0u8; 512];
     let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
     b.push_a_authority(&host, 120, Ipv4Addr::new(10, 0, 0, 99))
@@ -2295,17 +2320,20 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
     let n = b.finish().unwrap();
     cbuf[..n].to_vec()
   };
-  {
+  // Written as a generic fn rather than a closure so it can be called twice with
+  // `push_updates` in between; a closure capturing `&mut state` would hold that
+  // borrow across both calls.
+  fn feed<N: agnostic_net::Net>(state: &mut DriverState<N>, now: StdInstant, datagram: &[u8]) {
     let DriverState {
       endpoint, services, ..
-    } = &mut state;
+    } = state;
     let route_events = endpoint
       .handle(
         now,
         SocketAddr::from(([192, 168, 1, 200], 5353)),
         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
         0,
-        &conflict,
+        datagram,
         false,
       )
       .expect("endpoint.handle must accept the host-conflict packet");
@@ -2317,6 +2345,25 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
       }
     }
   }
+
+  // ── QR=0 phase: a probe must NOT retire us ──
+  // §9 defines its conflict over a RESPONSE, and this terminal retires the
+  // service — so a probe reaching it would let any on-link host retire every
+  // service sharing a host name just by probing for it.
+  feed(&mut state, now, &probe);
+  state.push_updates(now).await;
+  assert!(
+    !state
+      .services
+      .get(&handle)
+      .map(|c| c.withdrawing)
+      .unwrap_or(true),
+    "a peer's tentative probe for our host name is not §9's conflict, so it must \
+     not begin the withdrawal"
+  );
+
+  // ── QR=1 phase ──
+  feed(&mut state, now, &conflict);
 
   // 3. push_updates drains the proto's HostConflict; the fix routes the terminal
   //    through retirement (deliver + begin the endpoint-owned withdrawal).
@@ -3107,13 +3154,18 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     "Old must announce before the rename (so the goodbye is non-empty)"
   );
 
-  // A conflicting SRV authority for "Old" with rival rdata: we lose the §8.2
-  // tiebreak and rename away.
+  // A conflicting SRV RESPONSE for "Old" with rival rdata: the RFC 6762 §9
+  // signal that reverts this ESTABLISHED service to probing, where it loses the
+  // §8.2 tiebreak and renames away. §9 defines the conflict over a response, so
+  // the same rdata in the Authority section of a peer's QUERY would leave this
+  // service established and defending, which is what §8.1 asks of it.
   let conflict = {
     let target = Name::try_from_str("rival-host.local.").unwrap();
     let mut cbuf = [0u8; 512];
-    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
-    b.push_srv_authority(&old_inst, 120, 0, 0, 9999, &target)
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, header).unwrap();
+    b.push_srv_answer(&old_inst, 120, 0, 0, 9999, &target, true)
       .unwrap();
     let n = b.finish().unwrap();
     cbuf[..n].to_vec()
