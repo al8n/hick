@@ -647,23 +647,62 @@ pub enum IfaceWitness {
   /// The kernel named the receiving interface for this datagram.
   Witnessed(NonZeroU32),
   /// This path reports interfaces, and OUR OWN control buffer was too small
-  /// (`MSG_CTRUNC`). REFUSES — see [`DestinationWitness::Lost`], which is the same flag
-  /// read for the other half of the same cmsg.
+  /// (`MSG_CTRUNC`). REFUSES — see [`DestinationWitness::Lost`], which is the
+  /// same flag read for the other half of the same MESSAGE. `MSG_CTRUNC` rides
+  /// on the message header and not on any one cmsg, so it is a single fact about
+  /// the whole receive however many cmsgs carried the two halves.
   Lost,
   /// This path reports interfaces, the kernel named none for this datagram, and
   /// flagged no truncation. DEGRADES exactly as
-  /// [`DestinationWitness::Declined`] does, and for the same kernel-source
-  /// reason: on every wired path the two ride on ONE `PKTINFO` cmsg, so refusing
-  /// on this one and degrading on that one would leave the degradation
-  /// unreachable.
+  /// [`DestinationWitness::Declined`] does.
+  ///
+  /// # Why it degrades — and why the two halves are SEPARATE values
+  ///
+  /// On the single-`PKTINFO` paths — `IP_PKTINFO` on Linux/Android/Apple,
+  /// `IPV6_PKTINFO` everywhere — the interface and the destination are two
+  /// fields of ONE cmsg. `sbcreatecontrol` either allocates it or skips the
+  /// whole message, so the two absences arrive together, and refusing on this
+  /// half while degrading on that one would leave the degradation unreachable
+  /// there.
+  ///
+  /// **That is not the only wired shape, and this contract must not be read as
+  /// if it were.** BSD IPv4 uses `IP_RECVDSTADDR` + `IP_RECVIF`: TWO cmsgs built
+  /// by two `sbcreatecontrol` calls, not two fields of one struct. An mbuf
+  /// shortage can take either without the other, and NetBSD adds a deterministic
+  /// form of the same split — `ip_savecontrol` emits `IP_RECVDSTADDR` before its
+  /// `m_get_rcvif_psref() == NULL` early return and `IP_RECVIF` after it, so a
+  /// detached receive interface loses one and keeps the other every time. Every
+  /// combination below is reachable:
+  ///
+  /// | which of the pair arrived | `MSG_CTRUNC` clear | `MSG_CTRUNC` set |
+  /// |---|---|---|
+  /// | both | `Witnessed` + `Witnessed` | `Witnessed` + `Witnessed` |
+  /// | `IP_RECVDSTADDR` only | `Witnessed` + `Declined` | `Witnessed` + **`Lost`** |
+  /// | `IP_RECVIF` only | `Declined` + `Witnessed` | **`Lost`** + `Witnessed` |
+  /// | neither | `Declined` + `Declined` | **`Lost`** + **`Lost`** |
+  ///
+  /// (destination + interface, in that order.) A driver may be MORE conservative
+  /// than the right-hand column: `hick-udp`'s `recv_with_meta` reports `Lost` for
+  /// both halves under `MSG_CTRUNC` without parsing at all, while `hick-compio`
+  /// keeps a half the kernel delivered whole. Both are sound — a partially
+  /// copied cmsg is short and no decoder here will read one — and this rule has
+  /// to decide correctly for either.
+  ///
+  /// **So do not collapse the per-half handling.** `Lost` REFUSES and `Declined`
+  /// DEGRADES, and on this path one half can be each at the same time; a
+  /// maintainer who takes "they always arrive together" from the
+  /// single-`PKTINFO` paragraph above and folds the two together re-opens
+  /// exactly that distinction on the path that most needs it. `hick-compio`'s
+  /// `bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was` pins the
+  /// partial rows against real cmsg bytes.
   ///
   /// Two different kernel events reach it, and the reachability table in this
   /// module's header says which squares produce each: the cmsg missing entirely
   /// (live on the BSD IPv6 square, where `sbcreatecontrol` is called `M_NOWAIT`
-  /// and its `NULL` return skipped without a flag), and the cmsg present with a
-  /// zero index (live on Linux IPv4 and Apple IPv6 — see
-  /// [`Self::from_reporting_path`]). The second keeps its destination witness,
-  /// so it loses only the link scoping.
+  /// and its `NULL` return skipped without a flag, and on the BSD IPv4 pair per
+  /// the table above), and the cmsg present with a zero index (live on Linux
+  /// IPv4 and Apple IPv6 — see [`Self::from_reporting_path`]). The second keeps
+  /// its destination witness, so it loses only the link scoping.
   Declined,
   /// This path cannot report interfaces by construction. Declared once per
   /// receive path.
@@ -693,9 +732,16 @@ impl IfaceWitness {
   /// a larger control buffer would fix — so [`Self::Lost`] would be a false
   /// accusation against this side's own sizing. It is also the only form of
   /// `Declined` reachable on the primary platforms (see the reachability table
-  /// in this module's header), and the datagram still carries the DESTINATION
-  /// the same cmsg witnessed, so §11's destination partition decides it in full
-  /// and only the link scoping is lost.
+  /// in this module's header).
+  ///
+  /// On the single-`PKTINFO` paths the datagram still carries the DESTINATION
+  /// out of that very cmsg, so §11's destination partition decides it in full
+  /// and only the link scoping is lost. **That is a property of those paths and
+  /// not of this constructor.** BSD IPv4 recovers the destination from a
+  /// SEPARATE cmsg (`IP_RECVDSTADDR`), which may itself be absent — see
+  /// [`Self::Declined`] for the four reachable combinations — so a zero index
+  /// there says nothing about whether a destination was witnessed. The caller
+  /// mints the two halves independently for exactly that reason.
   #[inline]
   #[must_use]
   pub const fn from_reporting_path(index: u32, control_truncated: bool) -> Self {
@@ -735,8 +781,14 @@ impl IfaceWitness {
   /// kernel already delivered — the same false accusation
   /// [`Self::from_reporting_path`] refuses to make for a zero index. A negative
   /// therefore joins `0` in the one absence, which the truncation flag then
-  /// partitions exactly as it does there, and the datagram keeps the
-  /// DESTINATION the same cmsg witnessed, so only the link scoping is lost.
+  /// partitions exactly as it does there, and the datagram keeps the DESTINATION
+  /// that same cmsg witnessed, so only the link scoping is lost.
+  ///
+  /// The "same cmsg" holds here and is not the loose claim it would be on
+  /// [`Self::from_reporting_path`]: a signed index is an `in_pktinfo` /
+  /// `in6_pktinfo` field, so every caller of THIS constructor is on a
+  /// single-`PKTINFO` path. BSD IPv4's `IP_RECVIF` carries an unsigned
+  /// `sockaddr_dl::sdl_index` and goes through the unsigned constructor.
   ///
   /// Neither kernel is known to hand one over: Linux's
   /// `ip6_datagram_recv_common_ctl` wraps its `put_cmsg` in

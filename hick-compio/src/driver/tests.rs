@@ -482,13 +482,17 @@ impl Arrival {
     self
   }
 
-  /// The kernel DECLINED to emit the PKTINFO cmsg for this datagram: no
-  /// interface, no destination, and NO `MSG_CTRUNC` to say our own buffer was at
-  /// fault.
+  /// The kernel DECLINED to emit the destination/interface cmsg for this
+  /// datagram: no interface, no destination, and NO `MSG_CTRUNC` to say our own
+  /// buffer was at fault.
   ///
-  /// Both halves go at once because that is what actually happens — the two
-  /// facts ride on one cmsg, and `sbcreatecontrol` either allocates the mbuf or
-  /// skips the whole message.
+  /// Both halves go at once because that is what happens on the single-PKTINFO
+  /// paths — the two facts ride on one cmsg, and `sbcreatecontrol` either
+  /// allocates the mbuf or skips the whole message. On the BSD IPv4 pair it is
+  /// one of four reachable shapes rather than the only one, and the other three
+  /// are covered where they can be built out of real cmsg bytes instead of
+  /// asserted into a fixture: `socket::unix`'s
+  /// `bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was`.
   fn cmsg_declined(mut self) -> Self {
     self.pkt_iface = 0;
     self.destination = None;
