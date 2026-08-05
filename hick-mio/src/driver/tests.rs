@@ -1498,8 +1498,8 @@ fn a_surviving_rename_holds_the_old_name_until_its_retraction_is_paid() {
     return;
   }
 
-  let probe = test_support::conflict_probe(&old);
-  let new_name = drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
+  let conflict = test_support::conflict_response(&old);
+  let new_name = drive_to_rename(&mut mdns, &conflict).expect(RENAME_IS_NOT_ENVIRONMENTAL);
   assert_ne!(new_name, old, "a rename must change the instance name");
   assert!(
     !mdns
@@ -1575,8 +1575,8 @@ fn an_unpaid_ipv6_retraction_holds_the_old_name_against_immediate_reuse() {
     return;
   }
 
-  let probe = test_support::conflict_probe(&old);
-  drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
+  let conflict = test_support::conflict_response(&old);
+  drive_to_rename(&mut mdns, &conflict).expect(RENAME_IS_NOT_ENVIRONMENTAL);
 
   // IPv4 pays, IPv6 fails, round after round: v4's debt runs out and v6's never
   // does, which is exactly the state a same-name reuse must not be able to
@@ -1639,8 +1639,8 @@ fn consecutive_renames_each_retract_their_own_old_name() {
     return;
   }
 
-  let probe = test_support::conflict_probe(&first);
-  let second = drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
+  let conflict = test_support::conflict_response(&first);
+  let second = drive_to_rename(&mut mdns, &conflict).expect(RENAME_IS_NOT_ENVIRONMENTAL);
   let round_one = goodbyes_now(&mut mdns);
   assert!(
     round_one.iter().any(|d| test_support::retracts(d, &first)),
@@ -1653,8 +1653,8 @@ fn consecutive_renames_each_retract_their_own_old_name() {
   if !test_support::drive_to_advertised(&mut mdns, handle) {
     return;
   }
-  let probe = test_support::conflict_probe(&second);
-  let third = drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
+  let conflict = test_support::conflict_response(&second);
+  let third = drive_to_rename(&mut mdns, &conflict).expect(RENAME_IS_NOT_ENVIRONMENTAL);
   assert_ne!(
     third, second,
     "the second rename must change the name again"
@@ -1691,11 +1691,11 @@ fn a_colliding_rename_holds_the_old_name_until_it_is_retracted() {
     return;
   }
 
-  let probe = test_support::conflict_probe(&old);
+  let conflict = test_support::conflict_response(&old);
   let deadline = Instant::now() + Duration::from_secs(10);
   let mut conflicted = false;
   while Instant::now() < deadline && !conflicted {
-    test_support::ingest(&mut mdns, &probe, Instant::now());
+    test_support::ingest(&mut mdns, &conflict, Instant::now());
     mdns.tick().expect("tick");
     while let Some(ev) = mdns.next_event() {
       if let Event::Service { handle: h, update } = ev
@@ -1756,10 +1756,10 @@ fn rename_leaving_the_handoff_parked(
     renamed
   }
 
-  let probe = test_support::conflict_probe(old);
+  let conflict = test_support::conflict_response(old);
   let deadline = Instant::now() + Duration::from_secs(10);
   while Instant::now() < deadline {
-    test_support::ingest(mdns, &probe, Instant::now());
+    test_support::ingest(mdns, &conflict, Instant::now());
     if took_the_rename(mdns, handle) {
       return true;
     }
@@ -2530,8 +2530,8 @@ fn a_rename_leaves_no_transmit_still_awaiting_a_confirm() {
     return;
   }
 
-  let probe = test_support::conflict_probe(&old);
-  let new_name = drive_to_rename(&mut mdns, &probe).expect(RENAME_IS_NOT_ENVIRONMENTAL);
+  let conflict = test_support::conflict_response(&old);
+  let new_name = drive_to_rename(&mut mdns, &conflict).expect(RENAME_IS_NOT_ENVIRONMENTAL);
   assert_ne!(new_name, old, "the rename must have chosen a fresh label");
 
   // A full §8.1 sequence is three probes 250 ms apart plus the first §8.3

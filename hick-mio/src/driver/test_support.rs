@@ -247,18 +247,30 @@ pub(crate) fn drive_to_advertised(mdns: &mut Mdns, handle: ServiceHandle) -> boo
   false
 }
 
-/// A peer's RFC 6762 §8.1 probe for `instance`: an authority-section SRV
-/// claiming that name for a different target and a higher port, so the §8.2
-/// lexicographic tiebreak goes against us and the service renames.
-pub(crate) fn conflict_probe(instance: &str) -> Vec<u8> {
+/// A peer's authoritative RESPONSE claiming `instance`: a QR=1 answer-section
+/// SRV for that name with a different target and a higher port, so the RFC 6762
+/// §9 conflict reverts an ESTABLISHED service to probing and the §8.2 tiebreak
+/// that re-probe runs then goes against us and renames it.
+///
+/// A response, not a probe, because every caller feeds this to a service that
+/// has already announced. §9 defines the conflict over one — "it receives a
+/// Multicast DNS response message containing a record with the same name,
+/// rrtype and rrclass, but inconsistent rdata" — and the same rdata in the
+/// Authority section of a peer's QUERY deliberately does NOT revert an
+/// established service: that peer is probing, and §8.1 has us defend the name
+/// by answering it instead. Use this only against an advertised service; a
+/// service still probing is what a peer's tentative probe is for.
+pub(crate) fn conflict_response(instance: &str) -> Vec<u8> {
   let mut buf = vec![0u8; 512];
   let name = Name::try_from_str(instance).expect("instance name");
   let target = Name::try_from_str("rival.local.").expect("target name");
+  let mut header = Header::new();
+  header.flags_mut().set_response();
   let mut builder: MessageBuilder<'_> =
-    MessageBuilder::try_new(&mut buf, Header::new()).expect("message builder");
+    MessageBuilder::try_new(&mut buf, header).expect("message builder");
   builder
-    .push_srv_authority(&name, 120, 0, 0, 9999, &target)
-    .expect("push_srv_authority");
+    .push_srv_answer(&name, 120, 0, 0, 9999, &target, true)
+    .expect("push_srv_answer");
   let n = builder.finish().expect("finish");
   buf.truncate(n);
   buf
