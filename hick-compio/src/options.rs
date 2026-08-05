@@ -112,9 +112,12 @@ impl ServerOptions {
   /// IPv6 scope id. Where it does, traffic from another interface is refused
   /// outright.
   ///
-  /// It does NOT where the path recovers none: IPv4 on FreeBSD, DragonFly,
-  /// OpenBSD and NetBSD, and on **Windows**, where this crate's receive path is
-  /// a plain `recv_from` that recovers no ancillary data.
+  /// It does NOT where the path recovers none, which is now **Windows** alone:
+  /// this crate's Windows receive path is a plain `recv_from` that recovers no
+  /// ancillary data. Every supported unix is isolated in both families —
+  /// `IP_PKTINFO` on Linux/Android/Apple, the `IP_RECVDSTADDR` + `IP_RECVIF`
+  /// pair on FreeBSD, DragonFly, OpenBSD and NetBSD, and `IPV6_PKTINFO`
+  /// everywhere.
   ///
   /// Windows is split by source rather than uniform, and it is worth being
   /// exact: `recv_from` still recovers the peer `sockaddr_in6`, and Windows

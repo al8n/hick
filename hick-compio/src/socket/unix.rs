@@ -267,7 +267,7 @@ impl<'a> CMsgBuilder<'a> {
   }
 }
 
-/// Boxed 256-byte ancillary buffer whose backing storage is ≥8-byte aligned,
+/// Boxed 512-byte ancillary buffer whose backing storage is ≥8-byte aligned,
 /// which is what `compio-net`'s `recv_msg` / `send_msg` assert for the
 /// control parameter and what [`CMsgIter::new`] requires for sound walking.
 ///
@@ -276,12 +276,27 @@ impl<'a> CMsgBuilder<'a> {
 /// a `#[repr(align(8))]` array. The wrapper implements `IoBuf` / `IoBufMut`
 /// / `SetLen` over a manually tracked `init_len`; `SetLen::set_len` accepts
 /// values up to `CMSG_CAP` and never resizes (the buffer is fixed-size).
+///
+/// # Why the capacity is a security parameter and not a tuning knob
+///
+/// `MSG_CTRUNC` — the kernel saying THIS buffer was too small — is the only
+/// thing that mints [`hick_udp::onlink::DestinationWitness::Lost`], and that
+/// witness REFUSES. A buffer sized too small is therefore a self-inflicted
+/// outage wearing the shape of a security decision, and the figure has to be
+/// measured against what this crate actually enables rather than picked. It was
+/// 256 with nothing behind that number;
+/// `control_buffer_holds_every_cmsg_this_target_enables` now sums
+/// `libc::CMSG_SPACE` over every enabled cmsg at its widest payload and requires
+/// the total to fit TWICE over. On FreeBSD/amd64 the worst case is 152 bytes
+/// (`IP_RECVDSTADDR` 24 + `IP_RECVIF` 72 + `IP_RECVTTL` 24 + `SCM_TIMESTAMP`
+/// 32), which fits 256 once but not twice — hence 512, matching `hick-udp`'s
+/// `CmsgBuf`, whose recv path enables the same set on the same socket.
 pub(super) struct AlignedCtrlBuf {
   storage: Box<AlignedCtrlStorage>,
   init_len: usize,
 }
 
-const CMSG_CAP: usize = 256;
+const CMSG_CAP: usize = 512;
 
 #[repr(align(8))]
 struct AlignedCtrlStorage([u8; CMSG_CAP]);
@@ -378,6 +393,22 @@ pub(super) fn enable_recv_cmsgs(sock: &std::net::UdpSocket) -> std::io::Result<(
     // defines the shared in_pktinfo layout (`has_ip_pktinfo`; BSDs excluded).
     #[cfg(has_ip_pktinfo)]
     set_int(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, on)?;
+    // IP_RECVDSTADDR + IP_RECVIF — the BSD spelling of those same two facts,
+    // in two separate cmsgs (`has_ip_dstaddr_recvif`; the four BSDs, and
+    // mutually exclusive with `has_ip_pktinfo` by construction in build.rs).
+    //
+    // FATAL, exactly like `IP_PKTINFO` above and for the same reason: setting
+    // the cfg makes `rx_interface_reported` answer `true` for IPv4, which in
+    // turn makes a missing interface witness REFUSE instead of admit. A
+    // best-effort enable that silently failed would leave every datagram
+    // witness-less on a path that has declared it can witness, and a responder
+    // that is deaf on IPv4 while still looking healthy is worse than one that
+    // fails to construct.
+    #[cfg(has_ip_dstaddr_recvif)]
+    {
+      set_int(fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR, on)?;
+      set_int(fd, libc::IPPROTO_IP, libc::IP_RECVIF, on)?;
+    }
     // IP_RECVTTL — TTL, carried as a diagnostic and read by no admission
     // decision. Only where libc defines the
     // hop-limit cmsg (`has_recv_hoplimit`; absent on OpenBSD/NetBSD).
@@ -424,6 +455,145 @@ fn set_int(
   }
 }
 
+/// Recover the BSD IPv4 destination and receive interface out of the
+/// `IP_RECVDSTADDR` + `IP_RECVIF` cmsg pair, through **`hick-udp`'s parser** and
+/// not a second reading of it.
+///
+/// # Why this is a delegated parse when the `IP_PKTINFO` arm is not
+///
+/// `IP_PKTINFO` is one cmsg carrying one fixed struct, and the arm below reads
+/// three fields out of it. This pair is not that: the payloads are a bare
+/// `struct in_addr` and a VARIABLE-LENGTH `struct sockaddr_dl` whose only
+/// readable part is a `u_short` at a fixed offset, the two cmsgs are allocated
+/// separately so either may arrive without the other, and the constants differ
+/// per target — `IP_RECVIF` is 20 on FreeBSD/DragonFly/NetBSD and 30 on OpenBSD,
+/// while `sockaddr_dl` has a different trailing shape and size on each of the
+/// four. `hick_udp::parse_dstaddr_recvif_v4` already decodes exactly that, with
+/// `const _` assertions pinning `offset_of!(sockaddr_dl, sdl_index)` against
+/// `libc` for whichever BSD is compiled and unit tests over synthesized buffers
+/// behind them. A hand-rolled copy here would be a second reading of one kernel
+/// ABI — the cost this crate already stopped paying for `SCM_TIMESTAMP` — and
+/// the four §11 gates disagreeing about what a control buffer says is the defect
+/// this whole redesign exists to close.
+///
+/// The CAPABILITY answer stays this crate's own (see
+/// [`super::rx_interface_reported`]); what is delegated is the byte decode.
+///
+/// # Only the halves the parser WITNESSED are taken, and this is the subtle part
+///
+/// The parser's VALUES are taken verbatim — a recovered address or index is
+/// never re-derived here. Its ABSENCES are not taken at all, and must not be.
+///
+/// `parse_dstaddr_recvif_v4` is defined over a byte slice, so it cannot see
+/// `msg_flags`. It spells every absence with `from_reporting_path(.., false)` —
+/// a hardcoded "not truncated" — because [`hick_udp::onlink::DestinationWitness::Lost`]
+/// accuses OUR control buffer and a parser has no way to know whether that
+/// buffer overflowed. `Declined` is the only absence it can honestly return.
+/// The caller DOES know: [`super::RecvMeta::declare_cmsg_absent`] has already
+/// spelled both absences for this datagram from the kernel's own `MSG_CTRUNC`.
+///
+/// Copying both witnesses wholesale would therefore overwrite a correct `Lost`
+/// with a wrong `Declined` on a PARTIAL pair under truncation — the two cmsgs
+/// are allocated separately, so one can survive a truncation the other did not.
+/// That downgrade turns REFUSE into DEGRADE on precisely the two squares this
+/// capability exists to close: an absent interface would stop refusing group
+/// traffic that arrived on another link, and an absent destination would reopen
+/// the in-prefix broadcast admission. `Lost` accuses us, `Declined` says the
+/// kernel answered and its answer named nothing — the distinction the whole
+/// witness redesign is built around, erased at exactly the seam where the two
+/// halves of the information meet.
+///
+/// So each half is taken only when it is `Witnessed`, and every absent half is
+/// left as the caller declared it. No `control_truncated` parameter is needed
+/// and none is taken: the flag is already encoded in the values this overwrites,
+/// and a second reading of it here would be a second place to get it wrong.
+///
+/// **A `Witnessed` half is trustworthy even under `MSG_CTRUNC`.** `hick-udp`'s
+/// `CmsgIter` bounds the walk by the slice — it ends the walk on a `cmsg_len`
+/// that overruns and clips the payload to what is actually there — and
+/// `decode_recvdstaddr` requires a full `in_addr` while `decode_recvif_index`
+/// requires the full `sockaddr_dl` prefix. A partially-copied cmsg is short and
+/// is rejected; it cannot present as `Witnessed`. So keeping it is not optimism,
+/// and it is the same thing the `IP_PKTINFO` arm below has always done — that
+/// arm decodes under truncation too and overwrites the predeclared witness when
+/// a complete cmsg is present. Doing otherwise here would make one crate's two
+/// IPv4 paths disagree about what `MSG_CTRUNC` means.
+///
+/// This is the one place this driver is deliberately MORE informative than
+/// `hick_udp::recv_with_meta`, which returns `Lost` for both halves under
+/// `MSG_CTRUNC` without parsing at all. The difference is only ever in the
+/// admitting direction on a witness the kernel really did deliver — a complete
+/// `IP_RECVDSTADDR` naming the mDNS group is local-link origin under §11 on its
+/// own — so that path is being conservative rather than this one permissive.
+/// Every ABSENCE is spelled identically by both.
+///
+/// `local_ip` is deliberately untouched. Neither cmsg carries an `ipi_spec_dst`
+/// equivalent, so the receiving interface's own unicast address is simply absent
+/// from the ancillary data on these platforms, and `RecvMeta::empty` already left
+/// it UNSPECIFIED — which callers read as "fall back to content-hash self-detection".
+///
+/// # No address-family guard, on purpose
+///
+/// The cmsg LEVEL is the discriminator, exactly as it is for every arm below:
+/// the parser matches `IPPROTO_IP` (0) and no cmsg a v6 socket receives carries
+/// that level, so on a v6 receive this returns `Err` and changes nothing.
+/// Running before the loop also means the `IPV6_PKTINFO` arm wins any
+/// contradiction, which is the correct precedence for a socket that somehow saw
+/// both.
+#[cfg(has_ip_dstaddr_recvif)]
+fn decode_bsd_ipv4_dstaddr_recvif(ctrl: &[u8], meta: &mut RecvMeta) {
+  use hick_udp::onlink::{DestinationWitness, IfaceWitness};
+
+  // `len` is only used to populate the parsed meta's own length field, which is
+  // discarded here — this driver's length comes from `recv_msg`.
+  let Ok(parsed) = hick_udp::parse_dstaddr_recvif_v4(ctrl, meta.len, meta.peer) else {
+    return;
+  };
+  // `Witnessed` only. An absent half keeps whatever `declare_cmsg_absent` put
+  // there, which is the only spelling that knows about `MSG_CTRUNC` — see this
+  // function's doc for why taking the parser's absence instead downgrades
+  // REFUSE to DEGRADE on a partial pair.
+  //
+  // THE INTERFACE HALF IS PROMOTED UNCONDITIONALLY. It can only ever REFUSE:
+  // `arrived_on_bound_interface` runs before the destination arm and returns
+  // `ForeignLink` when the index disagrees with the binding, so taking it can
+  // only narrow what is admitted, never widen it.
+  if let IfaceWitness::Witnessed(idx) = parsed.iface_witness() {
+    meta.iface = IfaceWitness::Witnessed(idx);
+  }
+  // THE DESTINATION HALF IS PROMOTED ONLY WITH THE INTERFACE HALF BESIDE IT,
+  // and that is a rule about a PRIVILEGE, not a coupling assumption about the
+  // two cmsgs.
+  //
+  // §11's arm one admits a datagram to the mDNS group "regardless of source IP
+  // address". Scoping that to the link this endpoint bound is this workspace's
+  // own addition, and it is the only thing between arm one and "any host
+  // anywhere may write to our cache" — so it is what makes the exemption safe
+  // to grant at all. That scoping needs the interface half.
+  //
+  // A destination witnessed WITHOUT it buys an unconditional admit backed by
+  // nothing. `arrived_on_bound_interface` PERMITS `Declined` — a deliberate
+  // availability invariant, tested as `Declined` deciding exactly as `Blind` —
+  // so the group arm would admit a datagram that no longer has to have arrived
+  // on our link. Under the ancillary-mbuf pressure a flood causes, that is a
+  // group packet from another NIC entering the cache and §9 conflict handling
+  // with no proof of provenance; and on FreeBSD/DragonFly, which bind no
+  // `MSG_MCAST`, it would be strictly WIDER than not decoding the pair at all,
+  // because without a destination the datagram reaches the source-prefix rule
+  // and an off-prefix sender is refused there.
+  //
+  // So an incomplete pair reports the destination as the absence the kernel
+  // actually produced, routing the datagram to exactly the rule it took before
+  // this pair was wired. Nothing is assumed about the two cmsgs arriving
+  // together: they are still decoded independently, and the interface half
+  // above is taken whether or not the destination arrived.
+  if let (DestinationWitness::Witnessed(dst), IfaceWitness::Witnessed(_)) =
+    (parsed.destination_witness(), parsed.iface_witness())
+  {
+    meta.destination = DestinationWitness::Witnessed(dst);
+  }
+}
+
 pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta, control_truncated: bool) {
   // `ctrl` originates from `AlignedCtrlBuf::filled`, whose storage is the
   // start of a `#[repr(align(8))]` array — so the slice's first byte is
@@ -435,6 +605,8 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta, control_trunca
   if !ctrl.as_ptr().cast::<libc::cmsghdr>().is_aligned() {
     return;
   }
+  #[cfg(has_ip_dstaddr_recvif)]
+  decode_bsd_ipv4_dstaddr_recvif(ctrl, meta);
   for c in CMsgIter::new(ctrl) {
     match (c.level(), c.ty()) {
       // IPv4 PKTINFO — only where libc defines the shared in_pktinfo layout
@@ -935,4 +1107,738 @@ fn timestamp_cmsg_is_decoded_by_hick_udp_and_not_by_this_crate() {
     RxEvidence::none(),
     "hick-udp's parse, over the very same bytes, is what must recover it"
   );
+}
+
+// ============================================================================
+// EVIDENCE FOR `has_ip_dstaddr_recvif`, the capability flip in this crate's
+// `build.rs`.
+//
+// Item 4 (`MSG_CTRUNC` stays clear) is measured below on EVERY unix host: it is
+// arithmetic over `libc`'s own `CMSG_SPACE` and needs no BSD to be true. Items
+// 1-3 need a kernel that actually delivers the cmsgs, so they are the live
+// tests after it — compiled only where the capability is set, and executed by
+// ci.yml's `freebsd` job, which names them in `REQUIRED_COMPIO_EVIDENCE`.
+//
+// The synthesized-buffer test between them is not one of the four items. It
+// pins the WIRING — that `decode_unix_cmsgs` routes the pair into the two
+// witnesses at all — over bytes no kernel had to produce, so a break in the
+// wiring fails on a host rather than only on the one target with a runner.
+// ============================================================================
+
+/// `CMSG_SPACE` for one cmsg of `payload` bytes, asked of `libc` rather than
+/// derived: `CMSG_ALIGN` is 4 on x86 NetBSD and 8 on x86_64, and the header it
+/// pads is 12 bytes on the BSDs against 16 on Linux, so no constant written here
+/// would be right on more than one target.
+#[cfg(all(unix, test))]
+fn cmsg_space(payload: usize) -> usize {
+  // SAFETY: `CMSG_SPACE` is pure length arithmetic on an integer and
+  // dereferences nothing; `libc` marks it `unsafe` by convention only. This is
+  // the same call `CMsgBuilder::push` makes in the production encode, which is
+  // what makes this measurement and the buffer walk agree on every target.
+  unsafe { libc::CMSG_SPACE(payload as libc::c_uint) as usize }
+}
+
+/// EVIDENCE ITEM 4 for `has_ip_dstaddr_recvif`: this driver's own control buffer
+/// is large enough that the kernel never has to set `MSG_CTRUNC`.
+///
+/// This matters more than a sizing check normally would.
+/// [`hick_udp::onlink::DestinationWitness::Lost`] REFUSES, and `MSG_CTRUNC` is
+/// the only thing that mints it — so a buffer we sized too small is a
+/// self-inflicted outage wearing the shape of a security decision. Adding the
+/// `IP_RECVDSTADDR`/`IP_RECVIF` pair is exactly the kind of change that could
+/// cause one, and the standing rule at the `build.rs` emit site requires the
+/// figure to be MEASURED rather than asserted. [`AlignedCtrlBuf`] carried a
+/// 256-byte capacity with no measurement behind it at all until this test.
+///
+/// The worst case is summed per-target from what [`enable_recv_cmsgs`] actually
+/// enables, at the widest payload each cmsg can carry, with every term a literal
+/// size taken from the kernel that emits it — not from a production function,
+/// which would agree with itself whatever it did. One socket is one family, so
+/// the two families are summed separately and the larger taken.
+///
+/// It is the same set `hick_udp::try_bind_v4` enables on the very same fd (see
+/// `endpoint.rs`), so the union of the two enables is this sum and not more.
+#[cfg(all(unix, test))]
+#[test]
+fn control_buffer_holds_every_cmsg_this_target_enables() {
+  // The IPv4 destination/interface shape. Exactly one of the two is enabled on
+  // any target — see `build.rs` — so this is a choice, not a sum.
+  let v4_destination = if cfg!(has_ip_pktinfo) {
+    // `struct in_pktinfo`, 12 bytes on Linux/Apple: ipi_ifindex, ipi_spec_dst,
+    // ipi_addr.
+    cmsg_space(12)
+  } else if cfg!(has_ip_dstaddr_recvif) {
+    // Two separate cmsgs. `IP_RECVDSTADDR` is a bare `struct in_addr`.
+    // `IP_RECVIF` is a `struct sockaddr_dl` of `sdl_len` bytes, and the kernels
+    // copy the interface's own — so the widest payload is the full struct: 54
+    // bytes on FreeBSD (46-byte `sdl_data`), 32 on OpenBSD, 24 on DragonFly and
+    // 20 on NetBSD. FreeBSD's is the largest and is used for all four, so the
+    // bound holds on every one of them whatever this host happens to be.
+    cmsg_space(4) + cmsg_space(54)
+  } else {
+    0
+  };
+  // `IP_RECVTTL`: an `int` on Linux, a single `u_char` on the BSDs. The wider
+  // reading is the safe one here.
+  let v4_ttl = if cfg!(has_recv_hoplimit) {
+    cmsg_space(4)
+  } else {
+    0
+  };
+  // `struct in6_pktinfo` is 20 bytes (ipi6_addr + ipi6_ifindex); `IPV6_HOPLIMIT`
+  // is an `int`.
+  let v6_destination = if cfg!(has_ipv6_pktinfo) {
+    cmsg_space(20)
+  } else {
+    0
+  };
+  let v6_hoplimit = if cfg!(has_recv_hoplimit) {
+    cmsg_space(4)
+  } else {
+    0
+  };
+  // Shared by both families: a `timespec` on Linux/Android, a `timeval`
+  // elsewhere — 16 bytes either way.
+  let timestamp = if cfg!(has_recv_timestamp) {
+    cmsg_space(16)
+  } else {
+    0
+  };
+
+  let v4_worst = v4_destination + v4_ttl + timestamp;
+  let v6_worst = v6_destination + v6_hoplimit + timestamp;
+  let worst = v4_worst.max(v6_worst);
+
+  // The buffer itself, read off the production constant rather than restated.
+  let capacity = CMSG_CAP;
+  eprintln!("cmsg worst case: IPv4 {v4_worst}, IPv6 {v6_worst}, CMSG_CAP {capacity}");
+  assert!(
+    worst <= capacity,
+    "control buffer too small: this target's worst case is {worst} bytes (IPv4 \
+     {v4_worst}, IPv6 {v6_worst}) against a {capacity}-byte AlignedCtrlBuf. \
+     MSG_CTRUNC mints DestinationWitness::Lost, which REFUSES, so this would be \
+     a self-inflicted outage and not a degradation — grow CMSG_CAP and update \
+     its doc"
+  );
+  // Headroom for a cmsg this crate did not ask for. Not a second spelling of the
+  // check above: this one fails while the buffer still technically fits, which
+  // is the point at which the figure in `AlignedCtrlBuf`'s own doc has stopped
+  // holding. 256 passed the first assertion and failed this one on FreeBSD,
+  // which is why the buffer is 512.
+  assert!(
+    worst * 2 <= capacity,
+    "this target's worst case is {worst} bytes against a {capacity}-byte \
+     AlignedCtrlBuf — under 2x headroom for an unrequested cmsg. Re-derive the \
+     figure in AlignedCtrlBuf's doc before relaxing this"
+  );
+  // The completion marker CI requires for evidence item 4. Spelled out rather
+  // than routed through `evidence_complete`, which only exists where the BSD
+  // capability is set; this test runs on every unix target.
+  // Leading newline for the same reason as `evidence_complete`'s.
+  eprintln!("\nhick-compio-evidence-complete: control_buffer_holds_every_cmsg_this_target_enables");
+}
+
+/// Emit the completion marker for one evidence test.
+///
+/// **Called only as the last statement, after every assertion.** CI requires
+/// this line rather than libtest's `test <name> ... ok`, because those are
+/// different claims: the status line says the test function RETURNED, and a
+/// function that returned early because a precondition was unmet returns `ok`
+/// just as loudly as one that asserted. This line says the test reached its
+/// end, which is the only thing that makes the four evidence items behind
+/// `has_ip_dstaddr_recvif` rest on execution rather than on a process starting.
+///
+/// It is not a defence against a hostile branch — that branch could print this
+/// line directly, exactly as it could hollow out the assertions above it. It
+/// closes the accidental case: an unmet precondition, a silently skipped body,
+/// a test renamed out of the required list. See `ci.yml`'s `freebsd` job.
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+fn evidence_complete(test: &str) {
+  // The LEADING NEWLINE is load-bearing. Under `--nocapture` libtest writes
+  // `test <name> ... ` to stdout without a newline, runs the test, then writes
+  // `ok`; a marker printed into that gap lands mid-line and no whole-line match
+  // finds it. The newline closes libtest's partial line so the marker always
+  // starts at column 0, which is what lets the check stay an exact whole-line
+  // match — a substring match would find `...-complete: foo` inside
+  // `...-complete: foo_v2` and re-open the rename hole the whole-line matches
+  // exist to close.
+  eprintln!("\nhick-compio-evidence-complete: {test}");
+}
+
+/// Read one integer socket option back, so an enable can be checked against what
+/// the kernel actually holds rather than against its own return code.
+///
+/// The GET direction of `IP_RECVDSTADDR`/`IP_RECVIF` is handled by all four BSD
+/// kernels — cited per kernel at `hick-udp/build.rs`'s evidence item 1 — which is
+/// what makes it safe to treat a zero read-back as a failure.
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+fn get_int(
+  fd: std::os::fd::RawFd,
+  level: libc::c_int,
+  optname: libc::c_int,
+) -> std::io::Result<libc::c_int> {
+  let mut val: libc::c_int = 0;
+  let mut len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+  // SAFETY: `&mut val` is a valid, writable pointer to a `c_int` and `len` is
+  // its size; `getsockopt` writes at most `len` bytes there and updates `len`.
+  let rc = unsafe {
+    libc::getsockopt(
+      fd,
+      level,
+      optname,
+      &mut val as *mut _ as *mut _,
+      &mut len as *mut _,
+    )
+  };
+  if rc != 0 {
+    Err(std::io::Error::last_os_error())
+  } else {
+    Ok(val)
+  }
+}
+
+/// EVIDENCE ITEM 1 for `has_ip_dstaddr_recvif`, verbatim: the enable returns 0
+/// on the AF_INET socket this driver wraps, and the kernel holds both flags
+/// afterwards.
+///
+/// [`enable_recv_cmsgs`] is the whole subject — the function `Socket::from_std`
+/// calls, driven here directly so no runtime is needed and no delivery race can
+/// reach it. It applies both options with a fatal `?`, so a `setsockopt` failure
+/// would already be an `Err` here; the read-back below is not a second copy of
+/// that check but the observable half of it, which is what catches a kernel that
+/// accepted the call without holding the flag.
+///
+/// Every precondition is FATAL. A run where the bind never happened has proven
+/// nothing about the enable and must not report `ok`.
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+#[test]
+fn bsd_ipv4_enable_recv_cmsgs_sets_the_receive_metadata_pair() {
+  use std::os::fd::AsRawFd;
+
+  let sock = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).expect(
+    "binding a wildcard AF_INET socket must succeed: this IS evidence item 1, so a bind that \
+     did not happen is a failure and never a skip",
+  );
+  enable_recv_cmsgs(&sock).expect(
+    "enable_recv_cmsgs must apply IP_RECVDSTADDR + IP_RECVIF on an AF_INET socket — the whole \
+     has_ip_dstaddr_recvif capability rests on this enable taking",
+  );
+  let fd = sock.as_raw_fd();
+  let dstaddr = get_int(fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR)
+    .expect("getsockopt for IP_RECVDSTADDR must succeed on this target");
+  let recvif = get_int(fd, libc::IPPROTO_IP, libc::IP_RECVIF)
+    .expect("getsockopt for IP_RECVIF must succeed on this target");
+  assert_ne!(
+    dstaddr, 0,
+    "IP_RECVDSTADDR must read back as enabled after enable_recv_cmsgs"
+  );
+  assert_ne!(
+    recvif, 0,
+    "IP_RECVIF must read back as enabled after enable_recv_cmsgs"
+  );
+  evidence_complete("bsd_ipv4_enable_recv_cmsgs_sets_the_receive_metadata_pair");
+}
+
+/// The `IP_RECVIF` payload as a byte image: a `struct sockaddr_dl` cut to its
+/// FIXED PREFIX, which is the shortest payload the BSD kernels emit (their "no
+/// receive interface" dummy is exactly this long) and the only part
+/// `hick-udp`'s decoder may read — the four targets disagree on the struct's
+/// total size.
+///
+/// `sdl_index` is a HOST-order `u_short` at offset 2. Built by hand rather than
+/// through `libc::sockaddr_dl` so this test states the layout it expects instead
+/// of borrowing it from the same source the parser's `const _` assertions pin
+/// against.
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+fn sockaddr_dl_prefix_bytes(index: u16) -> Vec<u8> {
+  let mut b = vec![0u8; 8];
+  b[0] = 8; // sdl_len
+  b[1] = libc::AF_LINK as u8; // sdl_family
+  b[2..4].copy_from_slice(&index.to_ne_bytes()); // sdl_index, host order
+  b
+}
+
+/// The wiring behind evidence items 2 and 3, over bytes no kernel had to
+/// produce: `decode_unix_cmsgs` must route an `IP_RECVDSTADDR` + `IP_RECVIF`
+/// pair into BOTH witnesses on the [`RecvMeta`] it was handed.
+///
+/// Not one of the four evidence items — it proves nothing about what a kernel
+/// delivers — and that is exactly its value. Items 2 and 3 run only where a real
+/// BSD does, and this runs wherever the capability compiles, so a wiring break
+/// (a dropped `meta.destination =`, a call deleted from `decode_unix_cmsgs`) is
+/// caught by the same `cargo test` that compiles it rather than only by the one
+/// target with a runner. It is silent and has no preconditions, so libtest's
+/// status line and "concluded" are the same claim.
+///
+/// The `IP_RECVDSTADDR` payload is the GROUP, so this also pins that the group
+/// address survives the decode as itself: reading the receiving interface's own
+/// address instead — the `ipi_spec_dst` mistake the `IP_PKTINFO` arm carries a
+/// comment about — would make every multicast arrival look unicast.
+///
+/// Covers the COMPLETE pair and the nothing-recovered case. A partial pair is
+/// its own subject, because what the absent half must say depends on
+/// `MSG_CTRUNC` rather than on the bytes:
+/// [`bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was`].
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+#[test]
+fn bsd_ipv4_decode_recovers_both_witnesses_from_a_synthesized_pair() {
+  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+  use hick_udp::onlink::{DestinationWitness, IfaceWitness};
+
+  const TOTAL: usize = 256;
+  assert!(core::mem::align_of::<cmsghdr>() <= core::mem::align_of::<u64>());
+  let mut backing: Vec<u64> = vec![0u64; TOTAL / core::mem::size_of::<u64>()];
+  // SAFETY: backing owns `TOTAL` zeroed bytes; the slice fits inside the
+  // allocation and stays borrowed for this scope.
+  let buf: &mut [u8] =
+    unsafe { core::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), TOTAL) };
+  // Network-order `struct in_addr` for 224.0.0.251, i.e. the four octets
+  // verbatim — which is exactly what the kernels copy out of `ip->ip_dst`.
+  let group = [224u8, 0, 0, 251];
+  let iface_index: u16 = 9;
+  let written = {
+    let mut b = CMsgBuilder::new(buf);
+    b.push_bytes(libc::IPPROTO_IP, libc::IP_RECVDSTADDR, &group)
+      .expect("the dstaddr cmsg fits");
+    b.push_bytes(
+      libc::IPPROTO_IP,
+      libc::IP_RECVIF,
+      &sockaddr_dl_prefix_bytes(iface_index),
+    )
+    .expect("the recvif cmsg fits");
+    b.finish()
+  };
+
+  let peer: SocketAddr = ([192, 0, 2, 1], 5353).into();
+  let mut meta = RecvMeta::empty(peer);
+  // Production order: the absence is declared first, so what follows is an
+  // overwrite and not a fill-in. `false` = no MSG_CTRUNC.
+  meta.declare_cmsg_absent(false);
+  decode_unix_cmsgs(&buf[..written], &mut meta, false);
+
+  assert_eq!(
+    meta.destination_witness(),
+    DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
+    "the IP_RECVDSTADDR payload is the IP header destination and must reach the \
+     destination witness as itself — §11 selects its local-link test on this value"
+  );
+  assert_eq!(
+    meta.iface_witness(),
+    IfaceWitness::Witnessed(
+      core::num::NonZeroU32::new(u32::from(iface_index)).expect("a non-zero test index")
+    ),
+    "the IP_RECVIF sdl_index must reach the interface witness"
+  );
+
+  // The nothing-recovered case is the one `decode_bsd_ipv4_dstaddr_recvif`
+  // leaves alone, so the CTRUNC-aware absence the caller declared has to survive
+  // it. `Lost` and not `Declined` is what makes that distinction observable.
+  //
+  // The buffer is NON-EMPTY and carries a SHORT `IP_RECVDSTADDR` — two payload
+  // bytes where an `in_addr` is four. An empty buffer would prove nothing here:
+  // `decode_unix_cmsgs` returns at its own `ctrl.is_empty()` guard before
+  // reaching the parser at all, so the assertion would hold whatever the parser
+  // arm did. That is not hypothetical — it is how the first version of this
+  // assertion passed a mutation that clobbered the destination before parsing.
+  // A short cmsg reaches the parser, is refused by it, and so pins the early
+  // return on `Err` as well as that a truncated cmsg is skipped rather than read
+  // as garbage.
+  let short_written = {
+    let mut b = CMsgBuilder::new(buf);
+    b.push_bytes(libc::IPPROTO_IP, libc::IP_RECVDSTADDR, &[0u8, 0])
+      .expect("the short dstaddr cmsg fits");
+    b.finish()
+  };
+  let mut absent_meta = RecvMeta::empty(peer);
+  absent_meta.declare_cmsg_absent(true);
+  decode_unix_cmsgs(&buf[..short_written], &mut absent_meta, true);
+  assert_eq!(
+    absent_meta.destination_witness(),
+    DestinationWitness::Lost,
+    "with nothing recovered the parser reports Err and the declared MSG_CTRUNC \
+     absence must stand — a parser over a byte slice cannot see the message \
+     header, so it can never mint Lost itself"
+  );
+  assert_eq!(
+    absent_meta.iface_witness(),
+    IfaceWitness::Lost,
+    "and the interface half of that same declared absence"
+  );
+}
+
+/// A PARTIAL pair — one cmsg of the two — must spell the absent half by WHOSE
+/// failure it was, and that is decided by `MSG_CTRUNC` and not by the parser.
+///
+/// # The defect this exists to pin
+///
+/// `parse_dstaddr_recvif_v4` is defined over a byte slice. It cannot see
+/// `msg_flags`, so it spells every absence `Declined` —
+/// `from_reporting_path(.., false)`, hardcoded — because
+/// [`hick_udp::onlink::DestinationWitness::Lost`] accuses OUR control buffer and
+/// a parser cannot know whether that buffer overflowed. An adapter that copied
+/// BOTH of the parser's witnesses onto the meta therefore overwrote a correct
+/// `Lost` with a wrong `Declined` whenever one cmsg of the pair survived a
+/// truncation the other did not — turning REFUSE into DEGRADE on the two squares
+/// this capability exists to close. The first version of this decode did exactly
+/// that, and an earlier version of this test asserted `Declined` under
+/// truncation and so locked it in.
+///
+/// # Why the rows are what they are
+///
+/// The two cmsgs are separately allocated by `sbcreatecontrol`, so either can
+/// arrive without the other, and the reason differs per row:
+///
+/// # The PRIVILEGE rule, and why two rows below are not what the parser said
+///
+/// A destination is promoted only when the interface half arrived beside it.
+/// §11 arm one admits a group datagram "regardless of source IP address", and
+/// the only thing making that safe is this workspace's scoping of it to the
+/// bound link — which needs the interface. `arrived_on_bound_interface` PERMITS
+/// `Declined` (a deliberate availability invariant, tested as `Declined`
+/// deciding exactly as `Blind`), so a lone destination would take arm one with
+/// nothing proving the datagram reached us on our own link. On FreeBSD and
+/// DragonFly, which bind no `MSG_MCAST`, that was strictly WIDER than not
+/// decoding the pair at all. See `decode_bsd_ipv4_dstaddr_recvif`.
+///
+/// The interface half is still promoted alone: it can only refuse.
+///
+/// * NOT truncated, `IP_RECVDSTADDR` only — NetBSD's documented psref square.
+///   `ip_savecontrol` emits `IP_RECVDSTADDR` before its
+///   `m_get_rcvif_psref() == NULL -> return` and `IP_RECVIF` after it, so a
+///   detached receive interface loses the interface cmsg and nothing else. The
+///   kernel answered and named no interface: `Declined`, which DEGRADES. Our
+///   buffer lost nothing, so `Lost` here would refuse a datagram nobody failed
+///   to deliver.
+/// * NOT truncated, `IP_RECVIF` only — the mirror, under mbuf pressure: every
+///   BSD builds ancillary mbufs with `M_NOWAIT` and skips one it cannot allocate
+///   with no error and no flag. `Declined` again, and degrading is the whole
+///   point — refusing would take the responder off the air during the flood that
+///   caused the shortage.
+/// * TRUNCATED, either half absent — OUR buffer was too small. `Lost`, which
+///   REFUSES. Nothing about the kernel's behaviour changed; what changed is that
+///   the failure is ours, and §11 is entitled to refuse on our own bug where it
+///   must not refuse on the kernel's shortage.
+///
+/// The half that DID arrive is `Witnessed` in every row, truncation included. A
+/// partially-copied cmsg cannot present as `Witnessed` — `CmsgIter` ends the
+/// walk on a `cmsg_len` that overruns the slice and the payload decoders require
+/// their full fixed length — so keeping it is not optimism, and discarding it
+/// would refuse a datagram on a witness the kernel really did deliver.
+///
+/// Expectations are enumerated literally, never computed from
+/// `control_truncated` by the same rule the code under test applies.
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+#[test]
+fn bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was() {
+  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+  use hick_udp::onlink::{DestinationWitness, IfaceWitness};
+
+  const TOTAL: usize = 256;
+  let peer: SocketAddr = ([192, 0, 2, 1], 5353).into();
+  let group = [224u8, 0, 0, 251];
+  let iface_index: u16 = 9;
+  let witnessed_dst = DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)));
+  let witnessed_if = IfaceWitness::Witnessed(
+    core::num::NonZeroU32::new(u32::from(iface_index)).expect("a non-zero test index"),
+  );
+
+  // (truncated, push dstaddr, push recvif, expected destination, expected iface,
+  //  what the row is about)
+  let rows: [(bool, bool, bool, DestinationWitness, IfaceWitness, &str); 6] = [
+    // The COMPLETE pair, both truncation states. Here and only here does the
+    // destination reach the group arm, because here and only here is there a
+    // link proof beside it for `arrived_on_bound_interface` to check.
+    (
+      false,
+      true,
+      true,
+      witnessed_dst,
+      witnessed_if,
+      "no truncation, both cmsgs: the pair is complete, so the destination is \
+       promoted and the interface is there to scope arm one with",
+    ),
+    (
+      true,
+      true,
+      true,
+      witnessed_dst,
+      witnessed_if,
+      "TRUNCATED but both cmsgs arrived whole: a partially copied cmsg is short \
+       and cannot present as Witnessed, so MSG_CTRUNC costs this datagram \
+       nothing",
+    ),
+    (
+      false,
+      true,
+      false,
+      // NOT `witnessed_dst`, and this row is the security fix. Promoting the
+      // destination here bought §11 arm one's unconditional admit — "regardless
+      // of source IP address" — on a datagram with NO link proof, because
+      // `arrived_on_bound_interface` permits `Declined`. On FreeBSD/DragonFly
+      // that was strictly WIDER than main, where an absent destination sent the
+      // same packet to the source-prefix rule and an off-prefix sender was
+      // refused. The pair is incomplete, so the destination stays the absence
+      // the kernel produced and the datagram takes that same source rule.
+      DestinationWitness::Declined,
+      IfaceWitness::Declined,
+      "no truncation, destination only: the group arm's unconditional admit \
+       needs the link proof this datagram does not have, so the destination is \
+       NOT promoted and the source rule decides",
+    ),
+    (
+      false,
+      false,
+      true,
+      DestinationWitness::Declined,
+      witnessed_if,
+      "no truncation, interface only: the kernel emitted no destination, so the \
+       destination half DEGRADES to the source-prefix arm",
+    ),
+    (
+      true,
+      true,
+      false,
+      // Same privilege rule as the non-truncated row above: no interface half,
+      // no promoted destination. `Lost` rather than `Declined` because our own
+      // buffer is what lost it, and `arrived_on_bound_interface` refuses on
+      // `Lost` — so this row refuses on the interface half whichever way the
+      // destination is spelled, and the spelling still has to be honest.
+      DestinationWitness::Lost,
+      IfaceWitness::Lost,
+      "TRUNCATED, destination only: the missing interface is OUR buffer's \
+       failure and REFUSES; the destination is not promoted without it either",
+    ),
+    (
+      true,
+      false,
+      true,
+      DestinationWitness::Lost,
+      witnessed_if,
+      "TRUNCATED, interface only: the missing destination is OUR buffer's \
+       failure and must REFUSE — a Declined here reopens the in-prefix \
+       broadcast admission this capability exists to close",
+    ),
+  ];
+
+  for (truncated, push_dst, push_if, want_dst, want_if, what) in rows {
+    assert!(
+      core::mem::align_of::<cmsghdr>() <= core::mem::align_of::<u64>(),
+      "{what}: the u64 backing must satisfy cmsghdr alignment"
+    );
+    let mut backing: Vec<u64> = vec![0u64; TOTAL / core::mem::size_of::<u64>()];
+    // SAFETY: backing owns `TOTAL` zeroed bytes; the slice fits inside the
+    // allocation and stays borrowed for this iteration.
+    let buf: &mut [u8] =
+      unsafe { core::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), TOTAL) };
+    let written = {
+      let mut b = CMsgBuilder::new(buf);
+      if push_dst {
+        b.push_bytes(libc::IPPROTO_IP, libc::IP_RECVDSTADDR, &group)
+          .expect("the dstaddr cmsg fits");
+      }
+      if push_if {
+        b.push_bytes(
+          libc::IPPROTO_IP,
+          libc::IP_RECVIF,
+          &sockaddr_dl_prefix_bytes(iface_index),
+        )
+        .expect("the recvif cmsg fits");
+      }
+      b.finish()
+    };
+    // Production order: declare the absence first — that is the only step that
+    // sees MSG_CTRUNC — then decode over the bytes.
+    let mut meta = RecvMeta::empty(peer);
+    meta.declare_cmsg_absent(truncated);
+    decode_unix_cmsgs(&buf[..written], &mut meta, truncated);
+    assert_eq!(meta.destination_witness(), want_dst, "{what}");
+    assert_eq!(meta.iface_witness(), want_if, "{what}");
+
+    // The witnesses are the means; THIS is the end. Drive the real §11 boundary
+    // with what the decoder produced, for an OFF-PREFIX source sending to the
+    // group under FreeBSD/DragonFly conditions (`delivery: None` — those two
+    // bind no `MSG_MCAST`), and require that a datagram is admitted only where
+    // something actually proved it reached us on the bound link.
+    //
+    // Asserting the witnesses alone would not have caught the defect this test
+    // was rewritten for: `Witnessed(group)` + `Declined` looks perfectly
+    // reasonable as a pair of values, and is an unconditional admit with no
+    // link proof once `admits_ingress` sees it.
+    let local_addrs = [(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 24u8)];
+    let bound = hick_udp::onlink::BoundLink::new(u32::from(iface_index), false, &local_addrs);
+    let off_prefix: SocketAddr = ([203, 0, 113, 9], 5353).into();
+    let verdict = hick_udp::onlink::admits_ingress(
+      off_prefix,
+      meta.destination_witness(),
+      None,
+      bound,
+      meta.iface_witness(),
+    );
+    // Literal per row, never computed: admitted exactly when the pair was
+    // complete, which is exactly when the link was proven.
+    let want_admit = push_dst && push_if;
+    assert_eq!(
+      verdict.is_admit(),
+      want_admit,
+      "{what}: an off-prefix group datagram may be admitted only with the link \
+       proof arm one's exemption rests on"
+    );
+  }
+}
+
+/// The index of an UP loopback interface.
+///
+/// FATAL rather than `Option`: both live evidence tests need loopback to carry
+/// the datagram, and a host without one cannot produce this evidence — which is
+/// a finding, not a reason to report success.
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+fn up_loopback_index() -> u32 {
+  let ifaces = getifs::interfaces().expect(
+    "interface enumeration must succeed: the BSD IPv4 evidence tests cannot run without it, \
+     and returning early here would report success for a run that proved nothing",
+  );
+  ifaces
+    .iter()
+    .find(|i| i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP))
+    .map(|i| i.index())
+    .expect("no UP loopback interface: the BSD IPv4 evidence tests cannot be exercised here")
+}
+
+/// Read from `sock` until the datagram carrying exactly `want` arrives.
+///
+/// Matching on the payload is what keeps these tests honest on a host with real
+/// mDNS traffic: an assertion about "the destination of the datagram that came
+/// back" is worth nothing if the datagram came from somebody else's responder.
+/// FATAL on timeout — a receive that never happened proves nothing.
+///
+/// ONE timeout around the whole loop rather than one per receive. A per-receive
+/// timeout drops an in-flight `recv_msg` on every tick, and a datagram that
+/// lands in the window between readiness and cancellation is consumed by a
+/// future nobody is awaiting any more — which would turn this into a flaky test
+/// that reports "never arrived" for a datagram the kernel did deliver. Wrapping
+/// the loop means the only cancellation happens after the deadline, when the
+/// test has already failed.
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+async fn recv_matching(sock: &super::Socket, want: &[u8]) -> RecvMeta {
+  compio::time::timeout(std::time::Duration::from_secs(10), async {
+    loop {
+      let (data, meta) = sock
+        .recv(2048)
+        .await
+        .expect("the receive path itself must not fail while waiting");
+      if data == want {
+        return meta;
+      }
+    }
+  })
+  .await
+  .expect("the probe datagram never arrived: this evidence item cannot be established here")
+}
+
+/// EVIDENCE ITEM 2 for `has_ip_dstaddr_recvif`: a datagram to 224.0.0.251 is
+/// witnessed as arriving at 224.0.0.251, on the interface that carried it.
+///
+/// End to end through THIS driver's receive path — compio's `recv_msg` and
+/// [`decode_unix_cmsgs`], never `hick_udp::recv_with_meta` — which is the half
+/// of the kernel fact that belongs to this crate. That `ip_savecontrol` copies
+/// `ip->ip_dst` verbatim is established once, per kernel, at
+/// `hick-udp/build.rs`'s item 2.
+///
+/// The exact group address is asserted, not "is multicast": RFC 6762 §11's group
+/// arm is stated over the mDNS group and an over-approximation would admit any
+/// multicast destination on its strength.
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+#[compio::test]
+async fn bsd_ipv4_recv_witnesses_the_group_destination() {
+  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+  use hick_udp::{MulticastOptionsV4, onlink::DestinationWitness, try_bind_v4, try_join_v4};
+
+  let lo = up_loopback_index();
+  // Sender and receiver both go through `try_bind_v4`, which pins IP_MULTICAST_IF
+  // to `lo` so the datagram leaves on loopback. Only the receiver joins. Both are
+  // on 5353 with SO_REUSEPORT, which is safe for a MULTICAST probe — every joined
+  // member of the reuse group is delivered a copy — and would not be for the
+  // unicast one below.
+  let tx = try_bind_v4(MulticastOptionsV4::new(lo))
+    .expect("try_bind_v4 for the sender must succeed: this IS evidence item 2");
+  let rx = try_bind_v4(MulticastOptionsV4::new(lo))
+    .expect("try_bind_v4 for the receiver must succeed: this IS evidence item 2");
+  try_join_v4(&rx, lo).expect("joining 224.0.0.251 on loopback is part of evidence item 2");
+  let tx = super::Socket::from_std(tx)
+    .await
+    .expect("wrapping the sender must succeed");
+  let rx = super::Socket::from_std(rx)
+    .await
+    .expect("wrapping the receiver must succeed");
+
+  let payload = b"hick-compio bsd group destination probe";
+  let dst: SocketAddr = (Ipv4Addr::new(224, 0, 0, 251), 5353).into();
+  tx.send_to(payload, dst, None)
+    .await
+    .expect("sending to the group must succeed: evidence item 2 needs the datagram");
+
+  let meta = recv_matching(&rx, payload).await;
+  assert_eq!(
+    meta.destination_witness(),
+    DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
+    "a datagram to the mDNS group must be witnessed AT the group, exactly — \
+     anything else sends it to §11's source-prefix arm, which refuses an on-link \
+     peer sourcing from a prefix this interface does not carry"
+  );
+  assert_eq!(
+    meta.interface_index(),
+    lo,
+    "and on the interface that actually carried it — telling 'arrived elsewhere' \
+     apart from 'the platform never says' is the whole value of this capability"
+  );
+  evidence_complete("bsd_ipv4_recv_witnesses_the_group_destination");
+}
+
+/// EVIDENCE ITEM 3 for `has_ip_dstaddr_recvif`: a datagram to one of the host's
+/// own addresses is witnessed at THAT address, so §11's group arm is not taken
+/// for a unicast arrival.
+///
+/// Also evidence item 1 end to end. The receiving socket is a plain
+/// `UdpSocket::bind` wrapped by `Socket::from_std`, so the ONLY thing that
+/// enabled the pair on it is this crate's own [`enable_recv_cmsgs`] —
+/// `hick_udp::try_bind_v4` never touches this fd. A decode that worked only
+/// because some other crate's bind had set the options would fail here.
+///
+/// Ephemeral port, deliberately: `try_bind_v4` binds 5353 with SO_REUSEPORT, and
+/// a UNICAST datagram to a reuse group is delivered to exactly one member of it,
+/// which on any host running another responder is not necessarily us.
+#[cfg(all(unix, has_ip_dstaddr_recvif, test))]
+#[compio::test]
+async fn bsd_ipv4_recv_witnesses_a_unicast_destination() {
+  use core::net::{IpAddr, Ipv4Addr};
+  use hick_udp::onlink::DestinationWitness;
+
+  let rx_std = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+    .expect("binding 127.0.0.1:0 must succeed: this IS evidence item 3");
+  let local = rx_std
+    .local_addr()
+    .expect("the receiver's own address is what this item asserts against");
+  let rx = super::Socket::from_std(rx_std)
+    .await
+    .expect("wrapping the receiver must succeed — from_std is what enables the pair here");
+
+  let tx = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+    .expect("binding the sender must succeed: this IS evidence item 3");
+  let payload = b"hick-compio bsd unicast destination probe";
+  tx.send_to(payload, local)
+    .expect("sending the unicast probe must succeed");
+
+  let meta = recv_matching(&rx, payload).await;
+  assert_eq!(
+    meta.destination_witness(),
+    DestinationWitness::Witnessed(local.ip()),
+    "a unicast datagram must be witnessed at the address it was sent to"
+  );
+  assert_ne!(
+    meta.destination_witness(),
+    DestinationWitness::Witnessed(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
+    "and must NOT collapse onto the group, which is the reading that would admit \
+     a unicast arrival through §11's group arm"
+  );
+  evidence_complete("bsd_ipv4_recv_witnesses_a_unicast_destination");
 }

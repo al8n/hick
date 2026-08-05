@@ -1292,26 +1292,30 @@ impl State {
     // the source-prefix arm, which refuses a sender whose prefix is not one of
     // ours — traffic §11 requires be accepted.
     //
-    // THIS DRIVER HAS ITS OWN DECODER, AND ITS OWN GAPS. It does not call
-    // `hick_udp::recv_with_meta`; `crate::socket` decodes the ancillary data,
-    // gated by THIS crate's `build.rs`, whose `has_ip_pktinfo` covers
-    // Linux/Android/Apple only. So `destination` is `None`, and
-    // `admits_ingress` is in its second regime, on:
+    // THIS DRIVER HAS ITS OWN DECODER, AND ITS OWN REMAINING GAP. It does not
+    // call `hick_udp::recv_with_meta`; `crate::socket` decodes the ancillary
+    // data, gated by THIS crate's `build.rs`. That matrix now covers every
+    // supported unix in both families — `has_ip_pktinfo` on Linux/Android/Apple,
+    // `has_ip_dstaddr_recvif` (`IP_RECVDSTADDR` + `IP_RECVIF`) on FreeBSD,
+    // DragonFly, OpenBSD and NetBSD, `has_ipv6_pktinfo` everywhere — so
+    // `destination` is witnessed there and `admits_ingress` runs in its FIRST
+    // regime. The BSD IPv4 square was closed by wiring THIS crate's enable and
+    // decode, not by anything in `hick-udp`: the two paths are separate decoders
+    // reading the same kernel, which is why each carries its own capability and
+    // its own evidence.
     //
-    //   * unix IPv4 on FreeBSD, DragonFly, OpenBSD and NetBSD — the same four
-    //     targets `hick-udp` degrades on, but through a SEPARATE decoder, so
-    //     wiring `hick-udp`'s BSD IPv4 parsers does nothing for this crate;
+    // `admits_ingress` is still in its second regime on:
+    //
     //   * Windows, where the receive path is `recv_from` and returns no
     //     ancillary data and no `msg_flags` at all.
     //
     // The first regime's guarantee — a recovered destination this endpoint does
-    // not hold is refused — DOES NOT HOLD on those squares. `delivery` recovers
-    // part of it on OpenBSD/NetBSD, where `MSG_BCAST` refuses the IPv4
-    // broadcast class; on FreeBSD/DragonFly and on Windows there is no such
-    // flag, so a broadcast is indistinguishable from a unicast and is admitted
-    // for an in-prefix source. Closing those needs work HERE — this crate's own
-    // `has_ip_pktinfo` and IPv4 decoder, and a `WSARecvMsg` path for Windows —
-    // not in `hick-udp`. Both are tracked separately and neither is done here.
+    // not hold is refused — DOES NOT HOLD on that square. There is no
+    // `MSG_BCAST` equivalent to recover part of it either, so a broadcast is
+    // indistinguishable from a unicast and is admitted for an in-prefix source.
+    // Closing it needs work HERE, a `WSARecvMsg` receive path — `hick-udp`'s
+    // `platform::windows` already has the `WSAIoctl`/`WSAID_WSARECVMSG` dance
+    // and this crate simply does not call it — and is tracked separately.
     //
     // NOT the hop limit: RFC 6762 §11's receive test is stated exhaustively
     // and is about the destination address. Inbound TTL appears in the RFC
