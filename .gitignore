@@ -32,3 +32,6 @@ Cargo.lock
 # Stray compiled artifacts that escape target/ (e.g. proc-macro / no-panic build products)
 *.rlib
 *.rmeta
+
+# Python bytecode from `hick-onlink/probes/mutations.py`.
+__pycache__/

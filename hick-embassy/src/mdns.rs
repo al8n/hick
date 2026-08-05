@@ -42,27 +42,34 @@ impl<R: Rng> MdnsState<R> {
     }
   }
 
-  /// Set the device's local subnets — consulted by the RFC 6762 §11 on-link
-  /// gate for a non-group-destined datagram. The gate falls through in order: a
-  /// datagram addressed to the mDNS group is admitted outright (arrival at the
-  /// group is its own §11 admission ground; a peer outside your configured
-  /// subnets is still on your link if its multicast reached you); otherwise,
-  /// for a non-group destination, subnet membership decides; otherwise reject.
-  /// The received hop-limit / TTL is not consulted — §11's receive-side test is
-  /// exhaustively the two checks above (and embassy-net's `UdpMetadata` does
-  /// not currently surface one regardless).
+  /// Tell the RFC 6762 §11 ingress gate which addresses this device HOLDS.
   ///
-  /// OPTIONAL. With no subnets configured, the group and reject steps above
-  /// still apply: a default node admits group-destined mDNS and is not deaf,
-  /// but not unicast. Configure the device's own subnets to admit on-subnet
-  /// unicast too.
+  /// Pass exactly what the stack reports — `Stack::config_v4().address` /
+  /// `config_v6().address`, which is an ASSIGNED address with its prefix
+  /// length, not a masked network. The address alone answers *"was this
+  /// addressed to us"* (§11's *"received via unicast"*); the address and mask
+  /// together answer *"is this source on a prefix we carry"*. Passing
+  /// `192.168.1.0/24` where the device holds `192.168.1.10` answers the first
+  /// question wrongly and refuses unicast addressed to it.
   ///
-  /// `subnets` must be this device's own single interface's prefixes — see
+  /// A destination that is one of the two mDNS groups is admitted regardless of
+  /// source; a destination this device holds puts the SOURCE to the on-link
+  /// comparison; every other destination — a foreign multicast group, a
+  /// broadcast, a neighbour's address — takes no §11 arm and is refused. The
+  /// received hop-limit / TTL is not consulted, and embassy-net's `UdpMetadata`
+  /// does not surface one regardless.
+  ///
+  /// OPTIONAL. With nothing configured a node is not deaf — group-destined
+  /// mDNS, which is almost all of it, is still admitted — but it cannot accept a
+  /// unicast response or a §5.5 direct query, because it cannot say the datagram
+  /// was addressed to it.
+  ///
+  /// `addrs` must be this device's own single interface's addresses — see
   /// [`UdpIo`](hick_smoltcp::UdpIo)'s one-interface-per-implementation
   /// contract. Running this state with a `UdpIo` that aggregates more than one
   /// physical interface admits cross-interface unicast here, silently.
-  pub fn set_local_subnets(&self, subnets: Vec<IpCidr>) {
-    self.engine.borrow_mut().set_local_subnets(subnets);
+  pub fn set_local_addrs(&self, addrs: &[IpCidr]) {
+    self.engine.borrow_mut().set_local_addrs(addrs);
   }
 
   /// Register a service; the driver starts probing/announcing it promptly.

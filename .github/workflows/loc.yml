@@ -43,7 +43,7 @@ jobs:
           set -euo pipefail
           tokeit
           mv tokeit.json loc-hick.json
-          for c in mdns-proto hick-udp hick-reactor hick-compio hick-mio hick-smoltcp hick-embassy; do
+          for c in mdns-proto hick-onlink hick-udp hick-reactor hick-compio hick-mio hick-smoltcp hick-embassy; do
             ( cd "$c" && tokeit )
             mv "$c/tokeit.json" "loc-$c.json"
           done
@@ -60,6 +60,7 @@ jobs:
             // crate READMEs (…/raw/<name>).
             const crates = [
               'mdns-proto',
+              'hick-onlink',
               'hick-udp',
               'hick-reactor',
               'hick-compio',

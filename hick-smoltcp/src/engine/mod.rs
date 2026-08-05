@@ -12,7 +12,10 @@ use alloc::{
   collections::{BTreeMap, VecDeque},
   vec::Vec,
 };
-use core::{net::SocketAddr, time::Duration};
+use core::{
+  net::{IpAddr, SocketAddr},
+  time::Duration,
+};
 
 use mdns_proto::{
   CollectedAnswer, EndpointConfig, Instant, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec,
@@ -30,7 +33,7 @@ use smoltcp::wire::IpCidr;
 
 use crate::{
   constants::{MDNS_SOCKET_V4, MDNS_SOCKET_V6},
-  onlink,
+  ingress,
   udpio::{SendError, UdpIo},
 };
 
@@ -777,7 +780,10 @@ pub struct Engine<I: Instant, R> {
   endpoint: ProtoEndpoint<I, R>,
   services: BTreeMap<ServiceHandle, ServiceSlot<I>>,
   queries: BTreeMap<QueryHandle, QuerySlot<I>>,
-  subnets: Vec<IpCidr>,
+  /// The addresses assigned to this engine's one interface, each paired with
+  /// its prefix length — RFC 6762 §11 reads both halves, so they are stored
+  /// converted once by [`Engine::set_local_addrs`] rather than per datagram.
+  local_addrs: Vec<(IpAddr, u8)>,
   /// Reusable scratch for the handles of endpoint-owned withdrawals that
   /// completed in a pump (so [`Endpoint::drain_completed_withdrawals`] can push
   /// into it and the pump can GC each one's driver slot). Kept on the engine and
@@ -819,7 +825,7 @@ where
       endpoint,
       services: BTreeMap::new(),
       queries: BTreeMap::new(),
-      subnets: Vec::new(),
+      local_addrs: Vec::new(),
       completed_withdrawals: Vec::new(),
       svc_handle_scratch: Vec::new(),
       query_handle_scratch: Vec::new(),
@@ -847,25 +853,52 @@ where
     self.stats.snapshot()
   }
 
-  /// Set the device's local subnets — consulted by the RFC 6762 §11 on-link
-  /// gate for a non-group-destined datagram. The gate falls through in order: a
-  /// datagram addressed to the mDNS group is admitted outright (arrival at the
-  /// group is its own §11 admission ground; a peer outside your configured
-  /// subnets is still on your link if its multicast reached you); otherwise,
-  /// for a non-group destination, subnet membership decides; otherwise reject.
-  /// The received hop-limit / TTL, if a transport reports one, is not
-  /// consulted — §11's receive-side test is exhaustively the two checks above.
+  /// Tell the RFC 6762 §11 ingress gate which addresses this device HOLDS.
   ///
-  /// OPTIONAL. With no subnets configured, the group and reject steps above
-  /// still apply: a default node admits group-destined mDNS and is not deaf,
-  /// but not unicast. Configure local subnets to admit on-subnet unicast too.
+  /// Pass exactly what you handed `Interface::update_ip_addrs` (or, on embassy,
+  /// what `Stack::config_v4()` / `config_v6()` reports): each entry is an
+  /// **assigned address** with its prefix length, not a masked network. Both
+  /// halves are read, for two different §11 questions:
   ///
-  /// `subnets` must be THIS `Engine`'s own single interface's prefixes — see
+  /// * the ADDRESS alone answers *"was this datagram addressed to us"* — §11's
+  ///   *"received via unicast"*. `192.168.1.10/24` says the device holds
+  ///   `192.168.1.10`;
+  /// * the address AND mask answer *"is this source on a prefix we carry"* —
+  ///   §11's source comparison, `(I & M) == (P & M)`.
+  ///
+  /// Passing a masked network (`192.168.1.0/24`) answers the first question
+  /// wrongly for every address the device actually has, and unicast addressed to
+  /// it is then refused.
+  ///
+  /// # What the gate does with it
+  ///
+  /// A destination that is one of the two mDNS groups is admitted regardless of
+  /// source — §11 deems it on-link *"regardless of source IP address"*, and
+  /// configuring addresses never vetoes that. A destination this device holds
+  /// puts the SOURCE to the on-link comparison. Every other destination — a
+  /// foreign multicast group, a broadcast in any form, a neighbour's address on
+  /// our own subnet — takes no §11 arm and is refused. The received hop-limit is
+  /// not consulted at all; §11's receive-side test is exhaustively the two
+  /// above. See [`hick_onlink`] for the whole rule.
+  ///
+  /// # Optional, and what it costs to leave unset
+  ///
+  /// With nothing configured a node is not deaf: group-destined mDNS — which is
+  /// almost all of it — is still admitted. What it cannot do is accept a unicast
+  /// response or a §5.5 direct query, because it cannot say the datagram was
+  /// addressed to it.
+  ///
+  /// `addrs` must be THIS `Engine`'s own single interface's addresses — see
   /// [`UdpIo`]'s one-interface-per-implementation contract. Pumping this
   /// `Engine` with a `UdpIo` that aggregates more than one physical interface
   /// admits cross-interface unicast here, silently.
-  pub fn set_local_subnets(&mut self, subnets: Vec<IpCidr>) {
-    self.subnets = subnets;
+  pub fn set_local_addrs(&mut self, addrs: &[IpCidr]) {
+    self.local_addrs.clear();
+    self.local_addrs.extend(
+      addrs
+        .iter()
+        .map(|cidr| (IpAddr::from(cidr.address()), cidr.prefix_len())),
+    );
   }
 
   /// Register a service. The proto state machine is owned by the engine and
@@ -1057,15 +1090,34 @@ where
       // on the shared Arc — do NOT bump them here too (double-count).
       #[cfg(feature = "defmt")]
       defmt::trace!("rx {} bytes", len);
-      if onlink::on_link(meta.src.ip(), meta.local, &self.subnets) {
-        self.handle_one(now, meta.src, meta.local, &scratch[..len]);
+      // RFC 6762 §11 picks its local-link test by the IP header DESTINATION, so
+      // a transport that reports none has nothing for the gate to decide on.
+      // Both supplied transports always report one — smoltcp fills
+      // `local_address` from the header on every receive — so this is a foreign
+      // `UdpIo`, and the datagram is DROPPED and counted rather than handed to
+      // the gate as an absence. Absence selecting the widest arm is exactly what
+      // `hick-onlink`'s typed witnesses exist to prevent; see `crate::ingress`.
+      let Some(destination) = meta.local else {
+        #[cfg(feature = "stats")]
+        {
+          self.stats.packets_rx(1);
+          self.stats.bytes_rx(len as u64);
+          self.stats.packets_dropped(1);
+        }
+        #[cfg(feature = "defmt")]
+        defmt::debug!("rx drop: transport reported no destination address");
+        continue;
+      };
+      if ingress::verdict(meta.src, destination, &self.local_addrs).is_admit() {
+        self.handle_one(now, meta.src, destination, &scratch[..len]);
       } else {
-        // RFC 6762 §11: off-link datagram — neither an mDNS-group destination
-        // nor an on-subnet source. Discard without calling into the proto layer.
-        // The datagram WAS received off the socket, so count packets_rx/bytes_rx
-        // here (handle() never runs for it) plus the packets_dropped reject —
-        // matching the reactor/compio pre-handle drop accounting so receive
-        // volume and the drop stay driver-consistent rather than hidden here.
+        // RFC 6762 §11: off-link datagram — the destination takes no §11 arm, or
+        // it is one this device holds and the source is not on any prefix it
+        // carries. Discard without calling into the proto layer. The datagram WAS
+        // received off the socket, so count packets_rx/bytes_rx here (handle()
+        // never runs for it) plus the packets_dropped reject — matching the
+        // reactor/compio pre-handle drop accounting so receive volume and the
+        // drop stay driver-consistent rather than hidden here.
         #[cfg(feature = "stats")]
         {
           self.stats.packets_rx(1);
@@ -1383,10 +1435,9 @@ where
   /// an instant describes an event on the egress path — every send attempt's own
   /// acceptance and gate stamp, and the anchor each fan-out re-arms from — and
   /// nowhere on this path.
-  fn handle_one(&mut self, now: I, src: SocketAddr, local: Option<core::net::IpAddr>, data: &[u8]) {
-    // `local_ip` is only used by the proto for tracing / the opt-in
-    // advertised-source check; any valid address is acceptable.
-    let local_ip = local.unwrap_or_else(|| src.ip());
+  fn handle_one(&mut self, now: I, src: SocketAddr, local_ip: IpAddr, data: &[u8]) {
+    // `local_ip` is the IP header destination the §11 gate has just decided on.
+    // The proto uses it only for tracing and the opt-in advertised-source check.
     // RFC 6762 self-loopback guard: a datagram matching one we just multicast is
     // our own loopback (some stacks echo multicast to local sockets). Tell the
     // proto via `caller_is_self` so it does not interpret our own

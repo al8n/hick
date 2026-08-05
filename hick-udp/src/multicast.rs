@@ -173,36 +173,10 @@ pub const fn reports_rx_interface_v6() -> bool {
 
 /// How the link layer delivered a datagram, where the receive path can tell.
 ///
-/// This is the coarse stand-in for an IP header destination on the receive
-/// squares that witness none — see [`RecvMeta::destination_witness`]. It names the
-/// DELIVERY, never the address: [`Self::Multicast`] does not say which group,
-/// which is why RFC 6762 §11's group arm can be over-approximated by it and its
-/// unicast arm cannot be replaced by it.
-///
-/// Not `#[non_exhaustive]` on purpose. Every value is a decision in a trust
-/// boundary, so a fourth class must break every `match` that admits or refuses
-/// on this type rather than fall into a wildcard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LinkDelivery {
-  /// Addressed to this host rather than to a group or a broadcast address.
-  ///
-  /// It does NOT say to which of this host's addresses; where the IP header
-  /// destination itself was witnessed, use that instead.
-  Unicast,
-  /// Delivered to a multicast group — but not to WHICH group. A datagram
-  /// addressed to `224.0.0.251` and one addressed to LLMNR's `224.0.0.252` are
-  /// the same value here.
-  Multicast,
-  /// Delivered as a link-layer broadcast: `255.255.255.255`, a subnet-directed
-  /// broadcast, or whatever address the interface was configured to answer
-  /// broadcasts on.
-  ///
-  /// Definitive NEGATIVE evidence, which is what makes it worth carrying: the
-  /// delivery was neither unicast to an address this host holds nor multicast to
-  /// an mDNS group, so RFC 6762 §11 offers it no arm at all — without ever
-  /// naming the address.
-  Broadcast,
-}
+/// Re-exported from [`hick_onlink`], which is where RFC 6762 §11 reads it: it is
+/// an INPUT to the rule, so the decoder below and the gate must name the same
+/// three classes. See its own documentation for what each is worth to §11.
+pub use hick_onlink::LinkDelivery;
 
 /// Metadata about a received datagram.
 #[derive(Debug, Clone, Copy)]

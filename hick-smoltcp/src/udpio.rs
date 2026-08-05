@@ -5,13 +5,22 @@ use core::net::{IpAddr, SocketAddr};
 /// Normalized metadata for one received datagram.
 ///
 /// Carries no interface identity — see [`UdpIo`]'s one-interface-per-implementation
-/// contract, which is what makes the §11 on-link gate's use of [`Self::src`] sound.
+/// contract, which is what makes the §11 ingress gate's use of [`Self::src`] sound.
 #[derive(Debug, Clone, Copy)]
 pub struct RecvMeta {
   /// Source endpoint (the sender).
   pub src: SocketAddr,
-  /// The local/destination address the datagram arrived on, if the transport
-  /// surfaces it: the mDNS group for multicast, our own address for unicast.
+  /// The IP header DESTINATION the datagram was addressed to: the mDNS group for
+  /// multicast, one of this device's own addresses for unicast.
+  ///
+  /// **RFC 6762 §11 picks its local-link test by this field**, so an
+  /// implementation that leaves it `None` has its datagram DROPPED and counted
+  /// rather than admitted on a weaker rule — a missing destination is not
+  /// grounds for a wider arm. Both supplied transports always fill it: smoltcp
+  /// sets `UdpMetadata::local_address` from the IP header on every receive, and
+  /// its documentation says *"Incoming datagrams always have this set"*. The
+  /// `Option` is a SEND-direction artifact of that type, kept here so the
+  /// mapping is a plain `.map()`.
   pub local: Option<IpAddr>,
   /// The received IP TTL / IPv6 hop-limit, if the transport surfaces it.
   ///
@@ -20,11 +29,11 @@ pub struct RecvMeta {
   /// is done in two ways"): mDNS-group destination, or source-subnet
   /// membership. The received hop-limit is neither; the RFC's only TTL
   /// provision is the outbound `SHOULD` (send at 255, a compatibility
-  /// concession to 2004-draft queriers), not a receive check. The §11 on-link
-  /// gate (`onlink::on_link`) does not take this field at all — it is carried
-  /// here only so a caller/transport that has a hop-limit available can record
-  /// or otherwise use it for its own purposes (logging, metrics, a stricter
-  /// caller-side policy).
+  /// concession to 2004-draft queriers), not a receive check. The §11 ingress
+  /// gate (`hick_onlink::admits_ingress`) does not take this field at all — it is
+  /// carried here only so a caller/transport that has a hop-limit available can
+  /// record or otherwise use it for its own purposes (logging, metrics, a
+  /// stricter caller-side policy).
   pub hop_limit: Option<u8>,
   /// Number of payload bytes written into the receive buffer.
   pub len: usize,
@@ -67,21 +76,22 @@ pub enum SendError {
 ///
 /// RFC 6762 §11's unicast on-link test is defined over "the interface
 /// receiving the packet" (singular), but neither [`RecvMeta`] nor
-/// [`Engine::set_local_subnets`](crate::Engine::set_local_subnets) carries or
-/// is keyed by interface identity: an `Engine` holds one flat subnet list,
+/// [`Engine::set_local_addrs`](crate::Engine::set_local_addrs) carries or
+/// is keyed by interface identity: an `Engine` holds one flat address list,
 /// checked against every `RecvMeta::src` its `UdpIo` hands it, with no way to
 /// tell which physical interface a datagram arrived on. An implementation
 /// MUST therefore represent exactly one link: a `DualStack` / `DualUdp` over
 /// one interface's v4 AND v6 sockets is fine (one link, two address
 /// families); one that ALSO relays a second interface's socket(s) through the
 /// same `UdpIo` is not — use two `Engine`s (each with its own `UdpIo` and
-/// subnet list) instead, one per interface.
+/// address list) instead, one per interface.
 ///
 /// This is not runtime-checked, because there is nothing here to check it
 /// against. Violating it is silent: a datagram received on interface A is
 /// admitted because its source happens to fall inside interface B's
-/// configured prefix, defeating the subnet check exactly where §11 relies on
-/// it. See `onlink::on_link`'s cross-interface test for a pinned example.
+/// configured prefix, defeating the source comparison exactly where §11 relies
+/// on it. See `crate::ingress`'s `aggregated_interfaces_defeat_the_source_arm`
+/// for a pinned example.
 pub trait UdpIo {
   /// Pull one queued datagram into `buf`, returning its metadata, or `None`
   /// when the receive queue is empty. Non-blocking.

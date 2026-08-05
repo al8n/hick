@@ -1622,13 +1622,13 @@ fn a_constrained_transport_drains_a_withdrawal_after_each_family_gets_a_round() 
 }
 
 #[test]
-fn default_setup_processes_rx_without_hop_limit_or_subnets() {
+fn default_setup_processes_rx_without_hop_limit_or_addrs() {
   // Both supplied transports report hop_limit: None (smoltcp's UdpMetadata
   // carries no RX TTL, and hick-embassy re-exports it), and Engine::new starts with
-  // no local subnets. The §11 gate must NOT then drop every inbound datagram — a
+  // no local addresses. The §11 gate must NOT then drop every inbound datagram — a
   // default node could announce but never see a query, answer, or conflict. Feed a
   // conflict with the real supplied-transport metadata shape (hop_limit None) and NO
-  // set_local_subnets; it must be PROCESSED (the service renames), not silently
+  // set_local_addrs; it must be PROCESSED (the service renames), not silently
   // dropped. The rename is the observable that the conflict reached the proto.
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(47));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
@@ -1639,7 +1639,7 @@ fn default_setup_processes_rx_without_hop_limit_or_subnets() {
     while engine.poll_service_update(handle).is_some() {}
   }
 
-  // The default deaf scenario: no subnets configured, hop_limit None on every RX.
+  // The default deaf scenario: no addresses configured, hop_limit None on every RX.
   let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
   let mut t = 6_000_000i64;
   let mut reacted = false;
@@ -1716,12 +1716,12 @@ fn default_setup_rejects_off_link_unicast() {
 }
 
 #[test]
-fn subnets_configured_still_admits_group_destined_off_subnet_source() {
+fn addrs_configured_still_admits_group_destined_off_subnet_source() {
   // RFC 6762 §11 deems a datagram addressed to the mDNS group on-link
   // "regardless of source IP address" — that admission ground does not go away
-  // once local subnets ARE configured. The SAME conflict that the default (no
-  // subnets) test above admits must still be admitted here, from a source
-  // outside the one configured subnet.
+  // once local addresses ARE configured. The SAME conflict that the default (no
+  // addresses) test above admits must still be admitted here, from a source
+  // outside the one configured prefix.
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(61));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
@@ -1731,8 +1731,8 @@ fn subnets_configured_still_admits_group_destined_off_subnet_source() {
     while engine.poll_service_update(handle).is_some() {}
   }
 
-  // A subnet that does NOT cover the conflicting peer fed below.
-  engine.set_local_subnets(vec![IpCidr::new(IpAddress::v4(10, 0, 0, 0), 24)]);
+  // An address on a prefix that does NOT cover the conflicting peer fed below.
+  engine.set_local_addrs(&[IpCidr::new(IpAddress::v4(10, 0, 0, 5), 24)]);
 
   let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
   let mut t = 6_000_000i64;
@@ -1829,8 +1829,8 @@ fn reported_hop_limit_255_does_not_admit_off_prefix_unicast() {
     while engine.poll_service_update(handle).is_some() {}
   }
 
-  // A subnet that does NOT cover the source fed below.
-  engine.set_local_subnets(vec![IpCidr::new(IpAddress::v4(10, 0, 0, 0), 24)]);
+  // An address on a prefix that does NOT cover the source fed below.
+  engine.set_local_addrs(&[IpCidr::new(IpAddress::v4(10, 0, 0, 5), 24)]);
 
   let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
   let mut t = 6_000_000i64;
@@ -3126,8 +3126,9 @@ fn stats_off_link_datagram_counts_rx_bytes_and_dropped() {
   let pkt = build_conflict_srv_authority("Test._ipp._tcp.local.");
   let pkt_len = pkt.len();
 
-  // Off-link: unicast destination (not the mDNS group), no subnets configured,
-  // so no source can vouch for it — REGARDLESS of the reported hop limit. A
+  // Off-link: unicast destination (not the mDNS group), no addresses configured,
+  // so nothing establishes it was addressed to us — REGARDLESS of the reported
+  // hop limit. A
   // reported 255 used to be decisive here on its own; it no longer is. len > 0
   // so the on-link gate is actually exercised, not the len==0 marker path.
   io.inbound.push_back((
