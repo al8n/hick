@@ -2286,12 +2286,22 @@ fn rename_collision_with_local_service_frees_proto_route() {
   // Build an mDNS authority-section packet that claims our instance name
   // with different SRV rdata — this is the §8.2 conflict signal that forces
   // the proto to revert to probing and eventually rename.
+  // A QR=1 RESPONSE claiming our instance name with different SRV rdata: the
+  // RFC 6762 §9 conflict signal, which is what reverts an ESTABLISHED service
+  // to probing and eventually renames it. §9 is explicit that a response is
+  // what does this — "it receives a Multicast DNS response message containing a
+  // record with the same name, rrtype and rrclass, but inconsistent rdata" — so
+  // the same rdata in the Authority section of a peer's QUERY would not, and
+  // must not: that peer is merely probing, and the answer to a probe for a name
+  // we own is to defend it.
   fn conflict_for(instance: &str) -> Vec<u8> {
     let mut buf = [0u8; 512];
     let name = Name::try_from_str(instance).unwrap();
     let target = Name::try_from_str("rival.local.").unwrap();
-    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
-    b.push_srv_authority(&name, 120, 0, 0, 9999, &target)
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, header).unwrap();
+    b.push_srv_answer(&name, 120, 0, 0, 9999, &target, true)
       .unwrap();
     let n = b.finish().unwrap();
     buf[..n].to_vec()
@@ -2519,12 +2529,22 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
     wire::{Header, MessageBuilder},
   };
 
+  // A QR=1 RESPONSE claiming our instance name with different SRV rdata: the
+  // RFC 6762 §9 conflict signal, which is what reverts an ESTABLISHED service
+  // to probing and eventually renames it. §9 is explicit that a response is
+  // what does this — "it receives a Multicast DNS response message containing a
+  // record with the same name, rrtype and rrclass, but inconsistent rdata" — so
+  // the same rdata in the Authority section of a peer's QUERY would not, and
+  // must not: that peer is merely probing, and the answer to a probe for a name
+  // we own is to defend it.
   fn conflict_for(instance: &str) -> Vec<u8> {
     let mut buf = [0u8; 512];
     let name = Name::try_from_str(instance).unwrap();
     let target = Name::try_from_str("rival.local.").unwrap();
-    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
-    b.push_srv_authority(&name, 120, 0, 0, 9999, &target)
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, header).unwrap();
+    b.push_srv_answer(&name, 120, 0, 0, 9999, &target, true)
       .unwrap();
     let n = b.finish().unwrap();
     buf[..n].to_vec()
@@ -2766,10 +2786,44 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
     "service must reach Established before the host conflict"
   );
 
-  // A peer claims our host name with a DIFFERENT address (10.0.0.99): a genuine
-  // §9 host conflict. The proto does NOT auto-rename a host conflict — it emits
-  // `ServiceUpdate::HostConflict` via `poll()`.
+  // A peer claims our host name with a DIFFERENT address (10.0.0.99) in an
+  // authoritative RESPONSE: the genuine RFC 6762 §9 host conflict. The proto
+  // does NOT auto-rename a host conflict — it emits `ServiceUpdate::HostConflict`
+  // via `poll()`, which is TERMINAL here.
+  //
+  // A response, not a probe. §9 defines the conflict over one, and this update
+  // retires the service — so honouring a peer's mere PROBE for a shared host
+  // name would let one ordinary probe retire every service using it. The QR=0
+  // phase below feeds the identical record as a probe FIRST, against this same
+  // service, so the contrast is the origin and nothing else.
+  let meta_for = |len: usize| {
+    RecvMeta::new(
+      SocketAddr::from(([192, 168, 1, 200], 5353)),
+      IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)),
+      Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+      1,
+      Some(255), // on-link
+      RxEvidence::none(),
+      len,
+    )
+  };
   let conflict = {
+    let mut cbuf = [0u8; 512];
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, header).unwrap();
+    b.push_a_answer(&host, 120, Ipv4Addr::new(10, 0, 0, 99), true)
+      .unwrap();
+    let n = b.finish().unwrap();
+    cbuf[..n].to_vec()
+  };
+  let peer = meta_for(conflict.len());
+
+  // ── QR=0 phase: the same record, carried as a peer PROBING our host name ──
+  // RFC 6762 §9 defines its conflict over a RESPONSE, and this update is
+  // terminal, so a probe must not reach it. Otherwise any on-link host retires
+  // every service sharing a host name just by probing for it.
+  let probe = {
     let mut cbuf = [0u8; 512];
     let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
     b.push_a_authority(&host, 120, Ipv4Addr::new(10, 0, 0, 99))
@@ -2777,16 +2831,27 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
     let n = b.finish().unwrap();
     cbuf[..n].to_vec()
   };
-  let peer = RecvMeta::new(
-    SocketAddr::from(([192, 168, 1, 200], 5353)),
-    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)),
-    Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
-    1,
-    Some(255), // on-link
-    RxEvidence::none(),
-    conflict.len(),
+  let probe_peer = meta_for(probe.len());
+  for _ in 0..40 {
+    t += Duration::from_millis(300);
+    s.fire_timeouts(t);
+    s.handle_datagram(Family::V4, &probe_peer, &probe);
+    pump_transmits(&mut s, t, &mut buf);
+    s.push_service_updates(t);
+  }
+  assert!(
+    !s.services.get(&handle).map(|c| c.errored).unwrap_or(true),
+    "a peer's tentative probe for our host name is not §9's conflict, so it must \
+     not retire the service"
   );
+  while let Some(u) = mailbox.borrow_mut().drain_for_test() {
+    assert!(
+      !u.is_host_conflict(),
+      "…and must queue no terminal HostConflict for the caller either"
+    );
+  }
 
+  // ── QR=1 phase ──
   // Feed the conflict; `push_service_updates` drains the proto's HostConflict and
   // (with the fix) begins the withdrawal — `errored` flips true.
   let mut retired = false;
@@ -3700,12 +3765,22 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     wire::{Header, MessageBuilder},
   };
 
+  // A QR=1 RESPONSE claiming our instance name with different SRV rdata: the
+  // RFC 6762 §9 conflict signal, which is what reverts an ESTABLISHED service
+  // to probing and eventually renames it. §9 is explicit that a response is
+  // what does this — "it receives a Multicast DNS response message containing a
+  // record with the same name, rrtype and rrclass, but inconsistent rdata" — so
+  // the same rdata in the Authority section of a peer's QUERY would not, and
+  // must not: that peer is merely probing, and the answer to a probe for a name
+  // we own is to defend it.
   fn conflict_for(instance: &str) -> Vec<u8> {
     let mut buf = [0u8; 512];
     let name = Name::try_from_str(instance).unwrap();
     let target = Name::try_from_str("rival.local.").unwrap();
-    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
-    b.push_srv_authority(&name, 120, 0, 0, 9999, &target)
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, header).unwrap();
+    b.push_srv_answer(&name, 120, 0, 0, 9999, &target, true)
       .unwrap();
     let n = b.finish().unwrap();
     buf[..n].to_vec()
@@ -4154,14 +4229,19 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     "Old must announce before the rename (so the goodbye is non-empty)"
   );
 
-  // A conflicting SRV authority for "Old" with rival rdata: we lose the §8.2
-  // tiebreak and rename away. No LOCAL service owns the new name, so this is a
-  // SURVIVING rename and its old-name goodbye is enqueued reclaimable.
+  // A conflicting SRV RESPONSE for "Old" with rival rdata: the §9 signal that
+  // reverts this ESTABLISHED service to probing, where it loses the §8.2
+  // tiebreak and renames away. It has to be a response — §9 defines a conflict
+  // over one, and a peer merely PROBING this name is defended against instead.
+  // No LOCAL service owns the new name, so this is a SURVIVING rename and its
+  // old-name goodbye is enqueued reclaimable.
   let conflict = {
     let target = Name::try_from_str("rival.local.").unwrap();
     let mut cbuf = [0u8; 512];
-    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, Header::new()).unwrap();
-    b.push_srv_authority(&old_inst, 120, 0, 0, 9999, &target)
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, header).unwrap();
+    b.push_srv_answer(&old_inst, 120, 0, 0, 9999, &target, true)
       .unwrap();
     let n = b.finish().unwrap();
     cbuf[..n].to_vec()
