@@ -103,14 +103,64 @@ pub(crate) fn bind_v6(
   Ok(UdpSocket::from(fd))
 }
 
+/// Set `IP_MULTICAST_LOOP`, at the width THIS target's kernel demands.
+///
+/// # Deliberately not rustix, and not a hand-rolled `setsockopt` either
+///
+/// This is the second option in this file to route around rustix, and it is a
+/// different defect from `set_multicast_hops_v6`'s wrong LEVEL below: this one
+/// is the wrong WIDTH. As of rustix 1.1.4 (the newest published)
+/// `backend/libc/net/sockopt.rs` declares `type RawSocketBool = c::c_int` at
+/// `:1376` and `set_ip_multicast_loop` (`:578`) sends `from_bool(..)` through
+/// it, so the payload is four bytes on every target; `set_ip_multicast_ttl`
+/// (`:593`) passes its `u32` straight through, likewise four. Neither has a
+/// single BSD `cfg` anywhere near it — there is no per-target sizing in that
+/// crate at all.
+///
+/// The 4.4BSD multicast API defined both options as a one-byte `u_char`, and
+/// the descendants did not converge. FreeBSD's `inp_setmoptions` accepts EITHER
+/// width — its own comment says the char argument "is inconsistent with the rest
+/// of the socket API" and that it allows a char or an int — which is why this
+/// defect is invisible on the one BSD this workspace can execute. OpenBSD's
+/// `ip_setmoptions` is the strict reading and rejects anything but one byte with
+/// `EINVAL`. Both setters run unconditionally inside `try_bind_v4_inner` with
+/// `?`, so on a kernel that takes the strict reading this is not a degraded
+/// socket: **IPv4 endpoint construction fails outright**, and none of the BSD
+/// receive-metadata work this crate carries is ever reached.
+///
+/// `std::net::UdpSocket` is what gets it right, and it is the only widely-used
+/// implementation that does: `library/std/src/sys/net/connection/socket/mod.rs`
+/// resolves `type IpV4MultiCastType` per target — `c_uchar` for `dragonfly`,
+/// `freebsd`, `openbsd`, `netbsd`, `solaris`, `illumos`, `nto` and `qnx`, and
+/// `c_int` for everything else — and uses that ONE alias for both
+/// `IP_MULTICAST_LOOP` (`:754`) and `IP_MULTICAST_TTL` (`:775`). Delegating is
+/// therefore correct per option and per target without this crate maintaining a
+/// table of its own, and a hand-rolled `setsockopt` here would just be that
+/// table by another name — the exact thing `set_int_sockopt`'s doc warns about
+/// and that `hick-reactor`'s loopback control had to be moved off twice.
+///
+/// # What is NOT established
+///
+/// No runner in this workspace executes OpenBSD, NetBSD or DragonFly. The
+/// FreeBSD VM job cannot speak for them, and — because FreeBSD accepts both
+/// widths — it would stay green with the defect in place. What is verified here
+/// is the Rust side: rustix sends four bytes unconditionally, std sends one on
+/// those four targets, and this crate now sends std's. The kernel-side claim
+/// rests on the 4.4BSD lineage and on std carrying that per-target table at all,
+/// which the Rust project does not do for options whose width is uniform.
 pub(crate) fn set_multicast_loop_v4(sock: &UdpSocket, on: bool) -> std::io::Result<()> {
-  sockopt::set_ip_multicast_loop(sock.as_fd(), on)
-    .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
+  sock.set_multicast_loop_v4(on)
 }
 
+/// Set `IP_MULTICAST_TTL`, at the width this target's kernel demands. The twin
+/// of [`set_multicast_loop_v4`] above, which carries the whole argument —
+/// rustix passes four bytes here too, and std sizes this option from the same
+/// `IpV4MultiCastType` alias.
+///
+/// Takes `u8` because RFC 6762 §11 wants 255 and a TTL is a byte on the wire;
+/// std's setter takes `u32` and narrows it per target itself.
 pub(crate) fn set_multicast_ttl_v4(sock: &UdpSocket, ttl: u8) -> std::io::Result<()> {
-  sockopt::set_ip_multicast_ttl(sock.as_fd(), ttl as u32)
-    .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
+  sock.set_multicast_ttl_v4(u32::from(ttl))
 }
 
 /// Set the IPv6 multicast hop limit (`IPV6_MULTICAST_HOPS`, the v6 sibling of

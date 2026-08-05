@@ -224,6 +224,7 @@ jobs:
         bsd_ipv4_recv_witnesses_the_interface_that_carried_the_datagram
         try_bind_v4_rejects_a_half_enabled_socket_forced_through_production_wiring
         std_set_multicast_loop_v4_is_accepted_by_this_kernel
+        production_ipv4_multicast_setters_are_accepted_and_held_by_this_kernel
       REQUIRED_REACTOR_EVIDENCE: >-
         control_abi_applies_ip_multicast_loop_at_this_target_s_width
         control_abi_delivery_stage_runs_end_to_end_on_this_kernel

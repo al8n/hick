@@ -2070,3 +2070,61 @@ fn std_set_multicast_loop_v4_is_accepted_by_this_kernel() {
   );
   evidence_complete("std_set_multicast_loop_v4_is_accepted_by_this_kernel");
 }
+
+/// The PRODUCTION IPv4 multicast setters, executed through the functions
+/// `try_bind_v4_inner` actually calls, and read back.
+///
+/// # Why this is not the guard it looks like
+///
+/// Stated first so nobody reads more into it than it carries. The defect these
+/// two setters had — rustix sending a four-byte value where the 4.4BSD API
+/// defines a one-byte `u_char` — is INVISIBLE on FreeBSD, whose
+/// `inp_setmoptions` deliberately accepts either width. So this test would have
+/// passed with the defect in place on the only BSD this workspace can execute,
+/// and it does not establish anything about OpenBSD, NetBSD or DragonFly, which
+/// have no runner anywhere.
+///
+/// What it does do is pin the CALL SITE on a real kernel: it goes through
+/// `platform::set_multicast_loop_v4` / `set_multicast_ttl_v4` rather than
+/// alongside them, so a future change that makes either universally wrong —
+/// a bad level, a bad optname, a width no kernel takes — fails here rather than
+/// at a caller's bind. A test positioned next to the thing proves nothing about
+/// the thing; this one is at least through it.
+///
+/// The read-backs are the point of doing it at all: a `setsockopt` that takes
+/// the call and does not hold the value is the false success this crate already
+/// met once on `IPV6_MULTICAST_HOPS`.
+///
+/// An ephemeral port, for the reuse-group reason `bind_ephemeral_with_rx_metadata`
+/// documents.
+#[test]
+fn production_ipv4_multicast_setters_are_accepted_and_held_by_this_kernel() {
+  let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect(
+    "binding an ephemeral UDP socket must succeed: this IS the evidence, so a bind that did \
+     not happen is a failure and never a skip",
+  );
+  crate::platform::set_multicast_loop_v4(&sock, true).expect(
+    "platform::set_multicast_loop_v4 must be accepted by this kernel. EINVAL here is a value \
+     width no kernel takes — IP_MULTICAST_LOOP is a one-byte u_char on the BSD family and a \
+     four-byte c_int elsewhere, and only std sizes it per target",
+  );
+  assert!(
+    sock
+      .multicast_loop_v4()
+      .expect("reading IP_MULTICAST_LOOP back must succeed"),
+    "the kernel accepted the enable and then reported the option off"
+  );
+  crate::platform::set_multicast_ttl_v4(&sock, 255).expect(
+    "platform::set_multicast_ttl_v4 must be accepted by this kernel; see the loop option above \
+     for the width this depends on",
+  );
+  assert_eq!(
+    sock
+      .multicast_ttl_v4()
+      .expect("reading IP_MULTICAST_TTL back must succeed"),
+    255,
+    "RFC 6762 §11 wants 255 on the wire, and a setsockopt that takes the call without holding \
+     the value would leave the kernel default of 1"
+  );
+  evidence_complete("production_ipv4_multicast_setters_are_accepted_and_held_by_this_kernel");
+}
