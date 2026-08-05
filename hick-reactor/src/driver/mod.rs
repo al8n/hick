@@ -58,9 +58,13 @@ struct Packet {
   /// unexpected address on either socket would silently key the claim to the
   /// wrong family. See [`SelfSendTracker::take`].
   family: Family,
-  /// local receive address from PKTINFO (ipi_spec_dst / ipi6_addr).
-  /// `UNSPECIFIED` when PKTINFO is unavailable (Windows, or a kernel that didn't
-  /// deliver it). It is not part of the self-loopback decision at all — that is
+  /// The local receive address the ancillary data named, where it names one:
+  /// `ipi_spec_dst` / `ipi6_addr` on the Unix `PKTINFO` squares, and `ipi_addr`
+  /// on Windows, whose `IN_PKTINFO` has no `ipi_spec_dst` twin. `UNSPECIFIED`
+  /// where nothing names it — the BSD `IP_RECVDSTADDR` + `IP_RECVIF` pair
+  /// carries no interface address either, the `recv_from` arm carries no
+  /// ancillary data at all, and any kernel may decline the cmsg for one
+  /// datagram. It is not part of the self-loopback decision at all — that is
   /// [`DriverState::selfsend`]'s, taken before the proto layer sees the datagram.
   local_ip: IpAddr,
   /// What this receive path WITNESSED about the interface the datagram arrived
@@ -126,26 +130,32 @@ struct Packet {
   /// The kernel's own `MSG_MCAST` where this receive path reports it
   /// ([`hick_udp::RecvMeta::delivery`]), else `None`. Coarser than
   /// [`Packet::destination`] — "some multicast group" rather than which one —
-  /// and consulted only where no destination was WITNESSED. That is the
-  /// OpenBSD/NetBSD IPv4 square, which has no PKTINFO parse wired in and would
-  /// otherwise lose the same §11 group arm.
+  /// and consulted only where no destination was WITNESSED. On the OpenBSD and
+  /// NetBSD IPv4 square it is what stands between a cmsg the kernel declined to
+  /// emit and the loss of §11's group arm.
   ///
   /// **An unwitnessed destination is a different admission regime, not a
   /// coarser one.** `hick_udp::onlink::admits_ingress` refuses a WITNESSED
   /// destination this endpoint does not hold; with none witnessed it cannot.
-  /// This driver reads through `hick_udp::recv_with_meta`, so its `Blind`
-  /// squares are IPv4 on FreeBSD, DragonFly, OpenBSD and NetBSD, and what is
-  /// left there is exactly this field:
+  /// On Unix and Windows this driver reads through `hick_udp::recv_with_meta`,
+  /// which witnesses a destination on every one of those targets and in both
+  /// families — `IP_PKTINFO` on Linux/Android/Apple, the `IP_RECVDSTADDR` +
+  /// `IP_RECVIF` pair on FreeBSD, DragonFly, OpenBSD and NetBSD, `IPV6_PKTINFO`
+  /// for IPv6, `WSARecvMsg` on Windows — so the only structurally `Blind` square
+  /// left is the plain `recv_from` arm of `recv_task`, which serves every target
+  /// that is neither Unix nor Windows and reports no `delivery` either.
+  ///
+  /// What remains on the witnessing squares is per-datagram: a `Declined`
+  /// destination, wherever a kernel skipped the cmsg under mbuf pressure — every
+  /// BSD does, `sbcreatecontrol` running with `M_NOWAIT`. For that datagram what
+  /// is left is exactly this field:
   ///
   /// * `Broadcast` (OpenBSD/NetBSD only — `libc` binds `MSG_BCAST` nowhere else)
   ///   REFUSES, which closes the IPv4 broadcast class on those two;
   /// * `Multicast` admits and names no group, so any foreign group is admitted
   ///   there from any source;
-  /// * `None` — FreeBSD/DragonFly — leaves the source arm deciding, so an IPv4
+  /// * `None` — every other target — leaves the source arm deciding, so an IPv4
   ///   broadcast is still admitted there for an in-prefix source.
-  ///
-  /// A `Declined` destination lands in that same residual for one datagram,
-  /// wherever a kernel skipped the cmsg under mbuf pressure.
   ///
   /// Stated here so a reader of this struct is not left with the witnessed
   /// regime's guarantee; `admits_ingress` carries the full statement and what
