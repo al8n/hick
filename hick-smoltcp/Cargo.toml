@@ -32,6 +32,7 @@ stats = ["atomic", "mdns-proto/stats", "hick-trace/stats"]
 defmt = ["dep:defmt"]
 
 [dependencies]
+hick-onlink.workspace = true
 hick-trace.workspace = true
 mdns-proto.workspace = true
 defmt = { workspace = true, optional = true }

@@ -16,7 +16,7 @@ fn state() -> MdnsState<StdRng> {
 #[test]
 fn handle_api_register_query_poll_cancel() {
   let s = state();
-  s.set_local_subnets(alloc::vec![IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24)]);
+  s.set_local_addrs(&[IpCidr::new(IpAddress::v4(192, 168, 1, 10), 24)]);
 
   let mut recs = ServiceRecords::new(
     Name::try_from_str("_http._tcp.local.").unwrap(),

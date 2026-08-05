@@ -36,13 +36,13 @@ fn recv_from(socket: &mut udp::Socket<'_>, buf: &mut [u8]) -> Option<RecvMeta> {
         // smoltcp's `udp::Socket` UDP metadata (`UdpMetadata`) exposes no received
         // hop-limit — verified against 0.13.1 (only `endpoint` / `local_address` /
         // `meta`) — so this is diagnostic-only `None`; the engine's §11 RECEIVE
-        // gate (`onlink::on_link`) does not take a hop-limit input at all. It
-        // decides on destination and source alone: the mDNS group is admitted
-        // outright (arrival at the group is its own §11 admission ground; a peer
-        // outside your configured subnets is still on your link if its multicast
-        // reached you); otherwise, for a non-group destination, subnet membership
-        // decides; otherwise reject. The §11 TRANSMIT `SHOULD` (TTL 255 out) is
-        // honoured separately in `send_from`, not here.
+        // gate (`hick_onlink::admits_ingress`) does not take a hop-limit input at
+        // all. It decides on destination and source alone: the mDNS group is
+        // admitted outright (arrival at the group is its own §11 admission
+        // ground, "regardless of source IP address"); a destination this device
+        // HOLDS puts the source to the on-link comparison; every other
+        // destination takes no §11 arm and is refused. The §11 TRANSMIT `SHOULD`
+        // (TTL 255 out) is honoured separately in `send_from`, not here.
         hop_limit: None,
         len,
       })
@@ -91,7 +91,7 @@ fn send_from(socket: &mut udp::Socket<'_>, buf: &[u8], dst: SocketAddr) -> Resul
   // recommendation for backwards-compatibility with OLDER queriers implementing
   // the February-2004 draft, which discard everything but 255 on reception. A
   // modern §11-conformant receiver's on-link test (the same gate
-  // `onlink::on_link` applies on RX) never consults the received hop-limit at
+  // `hick_onlink::admits_ingress` applies on RX) never consults the received hop-limit at
   // all. smoltcp dispatches a UDP datagram with the socket's configured
   // hop-limit and DEFAULTS it to 64 when unset, so a probe/announcement/goodbye
   // would otherwise egress at 64 and those older queriers would silently drop

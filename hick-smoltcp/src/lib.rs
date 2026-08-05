@@ -15,7 +15,7 @@ compile_error!("hick-smoltcp: enable one storage tier — `atomic` (default) or 
 
 pub mod constants;
 pub mod engine;
-mod onlink;
+mod ingress;
 mod smoltcp_io;
 pub mod time;
 pub mod udpio;
