@@ -68,10 +68,11 @@ getifs.workspace = true
 # socket must not share hick's own socket layer, or a defect there would make
 # the control and the code under test fail together and read as a host problem.
 libc.workspace = true
-# The independent control socket in `tests/loopback_endpoint.rs` has to do two
-# things `std::net` cannot express — set `SO_REUSEADDR`/`SO_REUSEPORT` before
-# binding `:5353`, and select an interface for multicast EGRESS — and has to do
-# them on Windows as well as Unix, or that platform has no control and can only
+# The independent control sockets in `tests/loopback_lookup.rs` and
+# `tests/loopback_endpoint.rs` each have to do two things `std::net` cannot
+# express — set `SO_REUSEADDR`/`SO_REUSEPORT` before binding `:5353`, and select
+# an interface for multicast EGRESS — and have to do them on Windows as well as
+# Unix, or that platform has no control and can only
 # skip on faith. socket2 is independent of THIS crate's driver, which is the
 # property a control needs, and it sizes every option itself rather than making
 # a caller choose a C type by hand.
