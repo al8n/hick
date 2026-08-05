@@ -3012,7 +3012,8 @@ fn a_broadcast_delivery_is_refused_where_no_destination_was_recovered() {
     )
     .is_admit(),
     "and a target that reports no delivery class at all is unchanged — this is \
-     the FreeBSD/DragonFly and compio-Windows residual, still open"
+     the compio-Windows residual, still open, and where FreeBSD/DragonFly lands \
+     for a datagram whose cmsg the kernel declined"
   );
   // It refuses regardless of the source, so it is not a source test wearing a
   // different name: a loopback-bound endpoint's own traffic is refused too.

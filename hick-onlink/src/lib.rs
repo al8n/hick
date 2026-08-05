@@ -88,7 +88,7 @@
 //! | `hick-udp` `recv_with_meta` | both | Windows | witnessed | witnessed | no |
 //! | `hick-compio` unix decoder | IPv6 | all supported unix | witnessed | witnessed | OpenBSD/NetBSD only |
 //! | `hick-compio` unix decoder | IPv4 | Linux/Android, Apple | witnessed | witnessed | no |
-//! | `hick-compio` unix decoder | IPv4 | the four BSDs | **blind** | **blind** | OpenBSD/NetBSD only |
+//! | `hick-compio` unix decoder | IPv4 | the four BSDs | witnessed | witnessed | OpenBSD/NetBSD only |
 //! | `hick-compio` Windows (`recv_from`) | both | Windows | **blind** | **blind** | **no** |
 //!
 //! An IPv6 peer's **scope id** is a second interface witness and it is carried on
@@ -98,21 +98,29 @@
 //! scopeless IPv6 peer and every IPv4 peer are not.
 //!
 //! `hick-compio` decodes its own ancillary data (`hick-compio/src/socket/unix.rs`,
-//! gated by `hick-compio/build.rs`) rather than calling this crate's
-//! `recv_with_meta`, so it is a SECOND decoder with the same gap and not a share
-//! of `hick-udp`'s. The BSD IPv4 rows for `recv_with_meta` are now witnessed —
-//! `try_bind_v4` enables `IP_RECVDSTADDR` + `IP_RECVIF` and
-//! `multicast::parse_dstaddr_recvif_v4` reads the pair, behind the
-//! `has_ip_dstaddr_recvif` capability whose evidence is written at its emit site
-//! in `hick-udp/build.rs` — which covers `hick-mio` and `hick-reactor`. Two
-//! pieces of work remain, and each moves rows this crate's flip does not reach:
+//! gated by `hick-compio/build.rs`) rather than calling `recv_with_meta`, so it
+//! is a SECOND decoder and never a share of `hick-udp`'s — its
+//! `socket::rx_interface_reported` answers from its own cfgs for exactly that
+//! reason, and a flip in one crate moves no row of the other.
 //!
-//! * the same work again in `hick-compio/src/socket/unix.rs` behind that crate's
-//!   own `has_ip_pktinfo`. `hick-compio` does not call `recv_with_meta`, so
-//!   `hick-udp`'s flip does nothing for it — its
-//!   `socket::rx_interface_reported` answers from its own cfgs for exactly that
-//!   reason;
-//! * a `WSARecvMsg` receive path for `hick-compio` on Windows.
+//! The BSD IPv4 rows are witnessed on BOTH paths now, and each got there by its
+//! own work. `hick-udp`'s `try_bind_v4` enables `IP_RECVDSTADDR` + `IP_RECVIF`
+//! and `multicast::parse_dstaddr_recvif_v4` reads the pair, behind the
+//! `has_ip_dstaddr_recvif` capability whose four evidence items are written at
+//! its emit site in `hick-udp/build.rs` — which covers `hick-mio` and
+//! `hick-reactor`. `hick-compio` then enables the same pair in its own
+//! `socket::unix::enable_recv_cmsgs` and calls that same parser from
+//! `decode_unix_cmsgs`, behind ITS OWN `has_ip_dstaddr_recvif` with its own four
+//! evidence items in `hick-compio/build.rs`. **Not `has_ip_pktinfo`**, which an
+//! earlier draft of this list predicted: no BSD defines a usable one — NetBSD's
+//! `in_pktinfo` is a different 8-byte layout — so the pair is the only spelling
+//! available there.
+//!
+//! One piece of work remains, and it moves the last blind row:
+//!
+//! * a `WSARecvMsg` receive path for `hick-compio` on Windows. `hick-udp`'s
+//!   `platform::windows` already has the `WSAIoctl`/`WSAID_WSARECVMSG` dance;
+//!   `hick-compio` simply does not call it, and reads with `recv_from` instead.
 //!
 //! # What a blind square costs, stated once
 //!
@@ -123,9 +131,10 @@
 //! * where `MSG_BCAST` is bound (OpenBSD/NetBSD), an IPv4 broadcast is REFUSED;
 //! * where `MSG_MCAST` is bound, **any** foreign multicast group is admitted from
 //!   **any** source, because the flag names no group;
-//! * where neither is bound — `hick-compio`'s IPv4 rows on FreeBSD/DragonFly, and
-//!   `hick-compio` on Windows — an IPv4 broadcast is indistinguishable from a
-//!   unicast and is admitted for an in-prefix source.
+//! * where neither is bound — `hick-compio` on **Windows**, now the only
+//!   structurally blind row in the table, plus any FreeBSD/DragonFly datagram
+//!   that reaches this residual through `Declined` — an IPv4 broadcast is
+//!   indistinguishable from a unicast and is admitted for an in-prefix source.
 //!
 //! A datagram whose witness was `Declined` lands in that same residual for one
 //! datagram, and [`Admit::BlindSourceOnLink`] is what makes it countable. That is
@@ -338,12 +347,12 @@
 //! * [`LinkDelivery::Multicast`] admits, and it names no group, so **any**
 //!   foreign group is admitted there from any source, and no flag can close it;
 //! * everything else takes the source arm, so on every square with no delivery
-//!   class either — `hick-compio` IPv4 on **FreeBSD/DragonFly**, and
-//!   `hick-compio` on **Windows** — an IPv4 **broadcast** is still admitted for
-//!   an in-prefix source. `hick-udp`'s own FreeBSD/DragonFly IPv4 row left this
-//!   list when it started witnessing the destination: it now refuses a broadcast
-//!   in the first regime, by address, and reaches this one only for a datagram
-//!   whose cmsg the kernel declined.
+//!   class either — `hick-compio` on **Windows** — an IPv4 **broadcast** is still
+//!   admitted for an in-prefix source. BOTH FreeBSD/DragonFly IPv4 rows left this
+//!   list when they started witnessing the destination, `hick-udp`'s through
+//!   `recv_with_meta` and `hick-compio`'s through its own decoder: each now
+//!   refuses a broadcast in the first regime, by address, and reaches this one
+//!   only for a datagram whose cmsg the kernel declined.
 //!
 //! **[`DestinationWitness::Lost`] is the one absence that refuses**, and it is deliberately
 //! not the one an attacker can provoke. `MSG_CTRUNC` says the kernel had the fact
@@ -1268,8 +1277,8 @@ const fn scope_of(src: SocketAddr) -> u32 {
 ///
 /// **With NO witness at all, the kind of absence decides, and only one of the
 /// three refuses.** [`IfaceWitness::Blind`] is the path's silence — `hick-compio`'s
-/// IPv4 decoder on the four BSDs, its Windows `recv_from` arm, and any driver
-/// reading datagrams with `recvfrom` — and rejecting silence would
+/// Windows `recv_from` arm, and any driver reading datagrams with `recvfrom` —
+/// and rejecting silence would
 /// take mDNS off the air there entirely. [`IfaceWitness::Declined`] is the
 /// kernel skipping a cmsg it could not allocate, which is an availability event
 /// and not evidence about the sender, so it degrades the same way.
@@ -1592,8 +1601,8 @@ pub fn admits_ingress(
     // it. That is a reason those squares are not fully closed, not a reason to
     // leave a closable part of them open.
     //
-    // The full closure is the destination itself; the three pieces of work that
-    // reach it are named once, in this module's header.
+    // The full closure is the destination itself; the one piece of work that
+    // still reaches it is named once, in this module's header.
     DestinationWitness::Declined | DestinationWitness::Blind => match delivery {
       Some(LinkDelivery::Broadcast) => Verdict::Refuse(Refuse::BroadcastDelivery),
       Some(LinkDelivery::Multicast) => Verdict::Admit(Admit::BlindMulticastDelivery),
