@@ -85,6 +85,44 @@ impl MulticastHopsNotAppliedDetail {
   }
 }
 
+/// Detail for [`BindError::RxDestinationNotEnabled`].
+///
+/// Both fields are the raw values `getsockopt` reported for `IP_RECVDSTADDR`
+/// and `IP_RECVIF` immediately after the `setsockopt` calls that were supposed
+/// to enable them, so a report says WHICH of the pair the kernel did not take
+/// rather than only that one of them did not.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
+#[display(
+  "IPv4 receive-metadata options not enabled: IP_RECVDSTADDR reads {dstaddr}, IP_RECVIF reads \
+   {recvif} (both must be non-zero)"
+)]
+pub struct RxDestinationNotEnabledDetail {
+  dstaddr: i32,
+  recvif: i32,
+}
+impl RxDestinationNotEnabledDetail {
+  /// Build a new detail payload.
+  // Constructed only where `has_ip_dstaddr_recvif` is set (the four BSDs);
+  // every other target has no read-back to fail.
+  #[cfg_attr(not(has_ip_dstaddr_recvif), allow(dead_code))]
+  #[inline(always)]
+  pub(crate) const fn new(dstaddr: i32, recvif: i32) -> Self {
+    Self { dstaddr, recvif }
+  }
+  /// What `getsockopt(IPPROTO_IP, IP_RECVDSTADDR)` reported. Non-zero means the
+  /// kernel holds the option; `0` means the enable did not take.
+  #[inline(always)]
+  pub const fn dstaddr(&self) -> i32 {
+    self.dstaddr
+  }
+  /// What `getsockopt(IPPROTO_IP, IP_RECVIF)` reported, read the same way and
+  /// meaning the same thing.
+  #[inline(always)]
+  pub const fn recvif(&self) -> i32 {
+    self.recvif
+  }
+}
+
 /// Detail for [`ParseRecvMetaError::BufferTooShort`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
 #[display("cmsg buffer too short: needed {needed} bytes, had {have}")]
@@ -131,6 +169,19 @@ pub enum BindError {
   /// read-back shows it did not actually apply the requested value.
   #[error(transparent)]
   MulticastHopsNotApplied(MulticastHopsNotAppliedDetail),
+
+  /// The kernel accepted the `IP_RECVDSTADDR` / `IP_RECVIF` `setsockopt` calls,
+  /// but a read-back shows at least one of them is not actually enabled.
+  ///
+  /// Raised only on the four BSDs, where those two options are how
+  /// `recv_with_meta` witnesses an IPv4 datagram's destination and receiving
+  /// interface. The bind fails rather than returning a socket that would report
+  /// no witness for every datagram: on a target
+  /// [`reports_rx_interface_v4`](crate::reports_rx_interface_v4) calls capable,
+  /// a receiver is entitled to act on a missing witness, so continuing would be
+  /// deafness dressed as degradation.
+  #[error(transparent)]
+  RxDestinationNotEnabled(RxDestinationNotEnabledDetail),
 
   /// An I/O error occurred.
   #[error(transparent)]

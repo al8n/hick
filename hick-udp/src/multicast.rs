@@ -131,14 +131,31 @@ impl MulticastOptionsV6 {
 /// adjacent network. The capability is fixed at compile time, so the choice can
 /// be made once per target rather than per datagram.
 ///
-/// True on Linux/Android, Apple and Windows. **False on FreeBSD, DragonFly,
-/// OpenBSD and NetBSD**: the first three define no `IP_PKTINFO` at all (they
-/// use `IP_RECVDSTADDR`/`IP_RECVIF`), and NetBSD's `in_pktinfo` is a different,
-/// 8-byte layout this crate's parser does not decode. See `build.rs` for the
-/// capability matrix these track.
+// The two IPv4 ancillary shapes are ALTERNATIVES, never both. `recv_with_meta`
+// selects between them with two `#[cfg]` blocks in one expression tail, which
+// would fail to type-check if both were set — but as a type error naming
+// neither cfg, which is not what a reader needs to see. Say it here instead.
+#[cfg(all(has_ip_pktinfo, has_ip_dstaddr_recvif))]
+compile_error!(
+  "has_ip_pktinfo and has_ip_dstaddr_recvif are alternative IPv4 ancillary \
+   shapes and must not both be set: try_bind_v4 would enable both sockopts and \
+   recv_with_meta would have two parsers for one datagram. Fix the emit \
+   conditions in build.rs."
+);
+
+/// True on every supported target, by one of three routes: `IP_PKTINFO` on
+/// Linux/Android and Apple (`has_ip_pktinfo`), the `IP_RECVDSTADDR` +
+/// `IP_RECVIF` pair on FreeBSD, DragonFly, OpenBSD and NetBSD
+/// (`has_ip_dstaddr_recvif`), and `WSARecvMsg` on Windows. See `build.rs` for
+/// the capability matrix these track and for the evidence behind the BSD one.
+///
+/// **This answers for `recv_with_meta` and for nothing else.** A driver with its
+/// own receive path — `hick-compio` decodes its own cmsgs — must answer for that
+/// path from its own cfgs, because the capability belongs to the path rather
+/// than to the platform.
 #[inline(always)]
 pub const fn reports_rx_interface_v4() -> bool {
-  cfg!(any(has_ip_pktinfo, windows))
+  cfg!(any(has_ip_pktinfo, has_ip_dstaddr_recvif, windows))
 }
 
 /// Whether this target can report the interface an **IPv6** datagram arrived
@@ -246,12 +263,18 @@ impl RecvMeta {
   }
   /// Local IP the datagram was received on.
   ///
-  /// On Unix IPv4 this is `in_pktinfo.ipi_spec_dst`, the receiving interface's
-  /// own unicast address — deliberately, because self-send detection on a
-  /// multi-homed host needs to know which of this host's addresses the datagram
-  /// landed on. It is therefore NOT the address the sender wrote in the IP
-  /// header; for that, and only for that, use
-  /// [`RecvMeta::destination_witness`].
+  /// Where `IP_PKTINFO` is the IPv4 shape (Linux/Android/Apple) this is
+  /// `in_pktinfo.ipi_spec_dst`, the receiving interface's own unicast address —
+  /// deliberately, because self-send detection on a multi-homed host needs to
+  /// know which of this host's addresses the datagram landed on. It is therefore
+  /// NOT the address the sender wrote in the IP header; for that, and only for
+  /// that, use [`RecvMeta::destination_witness`].
+  ///
+  /// On the four BSDs it is UNSPECIFIED, and that is the honest answer rather
+  /// than a placeholder: `IP_RECVDSTADDR` is a bare `struct in_addr` with no
+  /// `ipi_spec_dst` twin, so the interface's own address is simply not in the
+  /// ancillary data there. Callers already read an unspecified local address as
+  /// "fall back to content-hash self-detection".
   #[inline(always)]
   pub const fn local_ip(&self) -> IpAddr {
     self.local_ip
@@ -259,18 +282,21 @@ impl RecvMeta {
 
   /// What this receive WITNESSED about the datagram's IP header **destination**.
   ///
-  /// Distinct from [`RecvMeta::local_ip`] on exactly one square: Unix IPv4,
-  /// where PKTINFO carries both `ipi_spec_dst` (the interface address, returned
-  /// by `local_ip`) and `ipi_addr` (the header destination, carried here). For
-  /// IPv6, and on Windows, PKTINFO carries only the header destination and the
-  /// two accessors agree.
+  /// Distinct from [`RecvMeta::local_ip`] on Unix IPv4, and for two different
+  /// reasons. Under `IP_PKTINFO` the cmsg carries both `ipi_spec_dst` (the
+  /// interface address, returned by `local_ip`) and `ipi_addr` (the header
+  /// destination, carried here). Under the BSDs' `IP_RECVDSTADDR` there is only
+  /// the header destination, so `local_ip` is UNSPECIFIED and this is the whole
+  /// of what the kernel said. For IPv6, and on Windows, PKTINFO carries only the
+  /// header destination and the two accessors agree.
   ///
   /// A [`DestinationWitness`] and not an `Option<IpAddr>`, because absence is three
-  /// different facts that RFC 6762 §11 decides differently: a platform that
-  /// never reports one ([`DestinationWitness::Blind`] — Unix IPv4 without `IP_PKTINFO`, on
-  /// FreeBSD/DragonFly/OpenBSD/NetBSD), a kernel that declined to emit the cmsg
-  /// for THIS datagram ([`DestinationWitness::Declined`]), and a control buffer of ours
-  /// that was too small ([`DestinationWitness::Lost`]). Where none is witnessed the coarser
+  /// different facts that RFC 6762 §11 decides differently: a path that never
+  /// reports one ([`DestinationWitness::Blind`] — not `recv_with_meta` on any
+  /// supported target any more, but still every driver reading with `recvfrom`),
+  /// a kernel that declined to emit the cmsg for THIS datagram
+  /// ([`DestinationWitness::Declined`]), and a control buffer of ours that was
+  /// too small ([`DestinationWitness::Lost`]). Where none is witnessed the coarser
   /// [`RecvMeta::delivery`] is what is left to decide on.
   #[inline(always)]
   pub const fn destination_witness(&self) -> DestinationWitness {
@@ -350,10 +376,13 @@ impl RecvMeta {
   /// [`LinkDelivery::Unicast`]. Of the targets this crate supports, only OpenBSD
   /// and NetBSD bind them (`libc`'s `src/unix/bsd/netbsdlike/mod.rs:576-577`).
   ///
-  /// It is coarse on purpose and it exists because on OpenBSD/NetBSD IPv4 it is
-  /// the only destination evidence available at all —
-  /// [`RecvMeta::destination_witness`] is [`DestinationWitness::Blind`] on every datagram
-  /// there — and RFC 6762 §11 picks its local-link test by destination.
+  /// It is coarse on purpose. It used to be the ONLY destination evidence on the
+  /// OpenBSD/NetBSD IPv4 square, where [`RecvMeta::destination_witness`] was
+  /// [`DestinationWitness::Blind`] on every datagram; `IP_RECVDSTADDR` now
+  /// witnesses the address itself there. What is left to it is the datagram
+  /// whose cmsg the kernel DECLINED to emit — every BSD skips an ancillary mbuf
+  /// it cannot allocate, silently — and RFC 6762 §11 picks its local-link test by
+  /// destination, so a coarse answer for that datagram beats none.
   ///
   /// The three values are worth very different amounts to that test.
   /// [`LinkDelivery::Multicast`] over-approximates §11's group arm: it admits
@@ -423,10 +452,17 @@ fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
   // calls capable, a receiver is entitled to read a zero interface index as "this
   // datagram was not delivered on my link" and drop it; if the enable silently
   // failed, every index would be zero and that receiver would be totally deaf
-  // rather than degraded. On an incapable target the setter is a no-op returning
-  // `Ok(())`, so this changes nothing there — the index stays zero and the
-  // receiver knows from the constant that it means "unknown".
+  // rather than degraded. Exactly one of the two enables below does anything on
+  // any given target — `IP_PKTINFO` on Linux/Android/Apple/Windows, the
+  // `IP_RECVDSTADDR` + `IP_RECVIF` pair on the four BSDs — and the other is a
+  // no-op returning `Ok(())`.
   platform::set_recv_pktinfo_v4(&std_sock)?;
+  platform::set_recv_dstaddr_recvif_v4(&std_sock)?;
+  // Read the BSD pair back. Unlike `verify_multicast_hops_v6` this is not
+  // chasing a known defect — see the function's own doc for why three targets
+  // with no CI runner are the reason.
+  #[cfg(has_ip_dstaddr_recvif)]
+  verify_rx_dstaddr_recvif_v4(&std_sock)?;
   // Best-effort: enabling kernel receive timestamps must not fail the bind on
   // platforms that lack the sockopt. A missing timestamp just leaves
   // RecvMeta::rx_time as None.
@@ -452,21 +488,96 @@ pub fn try_bind_v6(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   })
 }
 
+/// Read `IP_RECVDSTADDR` and `IP_RECVIF` back immediately after
+/// `platform::set_recv_dstaddr_recvif_v4` and fail the bind unless the kernel
+/// reports BOTH enabled.
+///
+/// # Why this one gets a read-back, when the `IP_PKTINFO` enabler does not
+///
+/// Not a known defect — that is `verify_multicast_hops_v6`'s reason, and the two
+/// are deliberately different. This pair is what `has_ip_dstaddr_recvif` rests
+/// on, and three of the four targets that reach it (DragonFly, OpenBSD, NetBSD)
+/// have no runner anywhere in this workspace, so `build.rs`'s evidence item 1
+/// has no execution to point at on them. Checking on every bind is what stands
+/// in: two syscalls once per socket, turning "libc binds the constant" into
+/// "this kernel accepted and holds it". `IP_PKTINFO` needs no equivalent — it
+/// runs on Linux, Apple and Windows, all three of which this workspace tests
+/// natively.
+///
+/// A packet probe would have proved more and was rejected for it: loopback
+/// filtering, a caller's `with_multicast_loop(false)`, a jail, seccomp or plain
+/// scheduler delay would each turn into a hard bind failure on precisely the
+/// three targets nobody can test. This cannot — all four kernels handle both
+/// options under the GET direction as well as the SET one, cited per kernel at
+/// `build.rs`'s evidence item 1 — so the only way it fails is the way it means
+/// to.
+///
+/// **Zero is the failure, not an error return.** A `getsockopt` that itself
+/// errors propagates as [`BindError::Io`]; a successful read of `0` means the
+/// kernel took the call and did not set the flag, which is the false success no
+/// return code could show.
+#[cfg(has_ip_dstaddr_recvif)]
+fn verify_rx_dstaddr_recvif_v4(sock: &UdpSocket) -> Result<(), BindError> {
+  let (dstaddr, recvif) = platform::get_recv_dstaddr_recvif_v4(sock)?;
+  // `(dstaddr, recvif)` is what the kernel reported in every real build. See
+  // `FORCE_RX_DSTADDR_READBACK_V4` for why the `#[cfg(test)]` override exists.
+  #[cfg(test)]
+  let (dstaddr, recvif) = FORCE_RX_DSTADDR_READBACK_V4
+    .with(|cell| cell.get())
+    .unwrap_or((dstaddr, recvif));
+  if dstaddr == 0 || recvif == 0 {
+    return Err(BindError::RxDestinationNotEnabled(
+      crate::error::RxDestinationNotEnabledDetail::new(dstaddr, recvif),
+    ));
+  }
+  Ok(())
+}
+
+// Test-only seam for `verify_rx_dstaddr_recvif_v4`, above: when set with
+// `.set(Some((d, r)))` from inside a test, makes the verifier read `(d, r)` as
+// though `getsockopt` had returned it, while leaving the REAL production call
+// sequence — `try_bind_v4` → `set_recv_dstaddr_recvif_v4` →
+// `verify_rx_dstaddr_recvif_v4` — completely intact.
+//
+// This is the only way to pin the CALL SITE. On a correctly functioning kernel
+// the enable always takes, so no input reachable through `MulticastOptionsV4`
+// or `try_bind_v4` can make the read-back return zero — which means that
+// without this, deleting the `verify_rx_dstaddr_recvif_v4(&std_sock)?` line
+// from `try_bind_v4_inner` would leave every test green. That line is what
+// DragonFly, OpenBSD and NetBSD rely on in place of a CI runner, so it is
+// exactly the line that must not be deletable in silence. See
+// `crate::multicast::tests::try_bind_v4_rejects_a_half_enabled_socket_forced_through_production_wiring`,
+// and `FORCE_APPLIED_HOPS_V6` for the same pattern applied to the other
+// read-back.
+//
+// `None` (the default) means "report what the kernel said", identical to
+// production; it is the ONLY possible value outside `#[cfg(test)]` builds,
+// since the item does not exist at all there. Thread-local rather than a plain
+// `static` so concurrent tests cannot interfere through it — and every setter
+// resets it before asserting, because `--test-threads=1` (which the FreeBSD CI
+// job uses) runs every test on one thread, where a leaked override would reach
+// the next test.
+#[cfg(all(test, has_ip_dstaddr_recvif))]
+thread_local! {
+  static FORCE_RX_DSTADDR_READBACK_V4: std::cell::Cell<Option<(i32, i32)>> =
+    const { std::cell::Cell::new(None) };
+}
+
 /// Read `IPV6_MULTICAST_HOPS` back immediately after
 /// `platform::set_multicast_hops_v6` and turn a mismatch into a distinct,
 /// diagnosable [`BindError`] instead of letting the bind silently return a
 /// socket configured differently than the caller asked for.
 ///
-/// This is the ONLY sockopt `try_bind_v6`/`try_bind_v4` verify this way — see
-/// `crate::platform::unix::set_multicast_hops_v6` for why: it is the one
-/// option in this crate that has already failed silently in production (the
-/// rustix wrong-protocol-level defect landed on Linux's unrelated
-/// `IP_PASSSEC` boolean, reporting success while the real hop limit stayed at
-/// its default of 1, violating the 255 RFC 6762 §11 requires). No other option
-/// these two functions set has a comparable history: the PKTINFO enablers do
-/// fail the bind now (see their call sites), but on a plain error return, which
-/// no known defect turns into a false success; the timestamp and TTL enablers
-/// degrade legitimately and stay best-effort. Re-reading any of them would add
+/// One of two sockopt read-backs in this crate, and the two exist for different
+/// reasons — see `verify_rx_dstaddr_recvif_v4` above for the other. This one
+/// chases a KNOWN DEFECT: see `crate::platform::unix::set_multicast_hops_v6`
+/// for the rustix wrong-protocol-level bug, which landed on Linux's unrelated
+/// `IP_PASSSEC` boolean and reported success while the real hop limit stayed at
+/// its default of 1, violating the 255 RFC 6762 §11 requires. No other option
+/// these two functions set has a comparable history: the `IP_PKTINFO` enabler
+/// does fail the bind (see its call site), but on a plain error return, which no
+/// known defect turns into a false success; the timestamp and TTL enablers
+/// degrade legitimately and stay best-effort. Re-reading any of those would add
 /// a syscall without adding safety.
 ///
 /// Unix-only: the read-back chokepoint (`get_int_sockopt`) only exists on
@@ -689,33 +800,42 @@ pub fn parse_pktinfo_v4(
 }
 
 // ============================================================================
-// BSD IPv4 receive metadata — PARSED BUT NOT YET TRUSTED.
+// BSD IPv4 receive metadata.
 //
 // The two shapes below recover for FreeBSD/DragonFly/OpenBSD/NetBSD what
-// `parse_pktinfo_v4` recovers for Linux/Apple. Neither is reachable from
-// `recv_with_meta`, neither has a matching `setsockopt` enabler, and neither
-// changes `reports_rx_interface_v4()`, which still answers `false` on all four
-// targets. They are landed inert on purpose: promoting them flips a receiver's
-// ingress rule for a witness-less datagram from "admit" to "drop", so a parse
-// that is quietly wrong would produce IPv4 deafness rather than a visible
-// failure. `build.rs` lists, at the emit site for the two `ipv4_rx_*` cfgs,
-// exactly what a real host of each target has to show before that flip.
+// `parse_pktinfo_v4` recovers for Linux/Apple. They are NOT interchangeable and
+// only ONE of them is wired:
 //
-// What is verifiable here, and is: the byte layouts, against `libc`'s own
-// structs (the `const _` assertions below, checked by any cross-compile) and
-// against synthesized cmsg buffers (the unit tests, which run on every host).
-// What is not verifiable here: that a kernel delivers these cmsgs at all.
+//   * `parse_dstaddr_recvif_v4` — `IP_RECVDSTADDR` + `IP_RECVIF`, the pair all
+//     four kernels emit. `try_bind_v4` enables it, `recv_with_meta` calls it,
+//     and `reports_rx_interface_v4()` answers `true` on its account. Gated on
+//     the `has_ip_dstaddr_recvif` CAPABILITY, whose four evidence items are
+//     written at its emit site in `build.rs`;
+//   * `parse_netbsd_pktinfo_v4` — NetBSD's own 8-byte `in_pktinfo`. Compiled,
+//     exported, and deliberately not wired: NetBSD's `ip_savecontrol` emits
+//     `IP_RECVDSTADDR` BEFORE its `m_get_rcvif_psref() == NULL` early return and
+//     `IP_PKTINFO` after it, so a detached receive interface loses the
+//     destination through this cmsg and keeps it through the pair. Gated on
+//     `ipv4_rx_netbsd_pktinfo`, which stays a parser selector and not a
+//     capability for exactly that reason.
+//
+// What the assertions and unit tests below establish is the byte layouts —
+// against `libc`'s own structs (`const _`, checked by any cross-compile) and
+// against synthesized cmsg buffers (unit tests, on every host). What they cannot
+// establish is that a kernel delivers these cmsgs at all; that is the FreeBSD
+// runner's job (ci.yml's `freebsd`) and, on the three targets with no runner,
+// the on-bind `getsockopt` read-back in `verify_rx_dstaddr_recvif_v4`.
 // ============================================================================
 
 /// `offsetof(struct sockaddr_dl, sdl_index)`. Pinned against `libc` by the
 /// assertion beside `parse_dstaddr_recvif_v4`.
-#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+#[cfg(all(unix, any(has_ip_dstaddr_recvif, test)))]
 const SDL_INDEX_OFFSET: usize = 2;
 
 /// `offsetof(struct sockaddr_dl, sdl_data[0])` — the fixed prefix every
 /// `sockaddr_dl` carries, and the shortest `IP_RECVIF` payload the BSD kernels
 /// emit (their "no receive interface" dummy is exactly this long).
-#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+#[cfg(all(unix, any(has_ip_dstaddr_recvif, test)))]
 const SOCKADDR_DL_FIXED_LEN: usize = 8;
 
 /// Decode an `IP_RECVDSTADDR` payload: a bare `struct in_addr`, which the
@@ -727,7 +847,7 @@ const SOCKADDR_DL_FIXED_LEN: usize = 8;
 /// `s_addr` is in network byte order and `Ipv4Addr::from([u8; 4])` reads
 /// big-endian octets, so the four bytes transfer verbatim. `None` for a payload
 /// shorter than an `in_addr`.
-#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+#[cfg(all(unix, any(has_ip_dstaddr_recvif, test)))]
 fn decode_recvdstaddr(data: &[u8]) -> Option<Ipv4Addr> {
   data.first_chunk::<4>().map(|b| Ipv4Addr::from(*b))
 }
@@ -752,7 +872,7 @@ fn decode_recvdstaddr(data: &[u8]) -> Option<Ipv4Addr> {
 /// cmsg reports. `sdl_family` is not checked: the cmsg level and type already
 /// identify the producer as the kernel's `IP_RECVIF` writer, and `AF_LINK` is
 /// the only family it ever sets.
-#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+#[cfg(all(unix, any(has_ip_dstaddr_recvif, test)))]
 fn decode_recvif_index(data: &[u8]) -> Option<u32> {
   if data.len() < SOCKADDR_DL_FIXED_LEN {
     return None;
@@ -777,7 +897,7 @@ fn decode_recvif_index(data: &[u8]) -> Option<u32> {
 /// A malformed cmsg header ends the walk with whatever was recovered before it,
 /// mirroring the other parsers: the datagram has already been consumed, so a
 /// bad control buffer must not cost the caller its data.
-#[cfg(all(unix, any(ipv4_rx_dstaddr_recvif, test)))]
+#[cfg(all(unix, any(has_ip_dstaddr_recvif, test)))]
 fn scan_dstaddr_recvif(
   cmsgs: &[u8],
   dstaddr_ty: libc::c_int,
@@ -800,13 +920,13 @@ fn scan_dstaddr_recvif(
 }
 
 /// Parse the FreeBSD/DragonFly/OpenBSD IPv4 receive metadata — the
-/// `IP_RECVDSTADDR` + `IP_RECVIF` cmsg pair — into a [`RecvMeta`].
+/// `IP_RECVDSTADDR`/`IP_RECVIF` cmsg pair — into a [`RecvMeta`].
 ///
-/// The IPv4 counterpart of `parse_pktinfo_v4` on the targets that define no
-/// `IP_PKTINFO`. **Not wired into [`recv_with_meta`]**, which still degrades on
-/// these targets, and does not affect [`reports_rx_interface_v4`]; see the
-/// comment block above this function and `build.rs` for the evidence a
-/// promotion requires.
+/// The IPv4 counterpart of `parse_pktinfo_v4` on the four BSDs, and what
+/// [`recv_with_meta`] calls there. [`reports_rx_interface_v4`] answers `true` on
+/// its account; see the comment block above this function, and `build.rs` at
+/// the `has_ip_dstaddr_recvif` emit site for the four evidence items that
+/// carries.
 ///
 /// [`RecvMeta::local_ip`] is UNSPECIFIED, and that is the honest answer rather
 /// than a placeholder: neither cmsg carries an `ipi_spec_dst` equivalent, so the
@@ -818,7 +938,7 @@ fn scan_dstaddr_recvif(
 /// present. Recovering one without the other is reported, not discarded: the
 /// destination and the interface answer different RFC 6762 §11 questions, and a
 /// caller that got one of them is better off than a caller that got neither.
-#[cfg(ipv4_rx_dstaddr_recvif)]
+#[cfg(has_ip_dstaddr_recvif)]
 pub fn parse_dstaddr_recvif_v4(
   cmsgs: &[u8],
   len: usize,
@@ -850,11 +970,11 @@ pub fn parse_dstaddr_recvif_v4(
 // OpenBSD's 24, and DragonFly follows a 12-byte `sdl_data` with `sdl_rcf` and
 // `sdl_route` — so the OFFSET of the index, not the size of the struct, is what
 // this parse may rely on. A cross-compile for any of the three checks it.
-#[cfg(ipv4_rx_dstaddr_recvif)]
+#[cfg(has_ip_dstaddr_recvif)]
 const _: () = assert!(core::mem::offset_of!(libc::sockaddr_dl, sdl_index) == SDL_INDEX_OFFSET);
-#[cfg(ipv4_rx_dstaddr_recvif)]
+#[cfg(has_ip_dstaddr_recvif)]
 const _: () = assert!(core::mem::offset_of!(libc::sockaddr_dl, sdl_data) == SOCKADDR_DL_FIXED_LEN);
-#[cfg(ipv4_rx_dstaddr_recvif)]
+#[cfg(has_ip_dstaddr_recvif)]
 const _: () = assert!(core::mem::size_of::<libc::in_addr>() == 4);
 
 /// `sizeof(struct in_pktinfo)` on NetBSD, whose layout is `ipi_addr` (4) then
@@ -919,9 +1039,22 @@ fn scan_netbsd_pktinfo(cmsgs: &[u8], pktinfo_ty: libc::c_int) -> Option<(Ipv4Add
 /// NetBSD is the one BSD here that does define `IP_PKTINFO`, but its
 /// `in_pktinfo` is an 8-byte `ipi_addr`/`ipi_ifindex` pair rather than the
 /// 12-byte Linux/Apple struct, so `parse_pktinfo_v4` cannot serve it — it
-/// would reject the payload as truncated. **Not wired into [`recv_with_meta`]**
-/// and does not affect [`reports_rx_interface_v4`]; see the comment block above
-/// `parse_dstaddr_recvif_v4` and `build.rs`.
+/// would reject the payload as truncated.
+///
+/// **Not wired into [`recv_with_meta`], and NetBSD is not missing anything by
+/// it.** NetBSD takes [`parse_dstaddr_recvif_v4`] instead, because
+/// `ip_savecontrol` (`sys/netinet/ip_input.c`) emits `IP_RECVDSTADDR` at :1366,
+/// BEFORE its `ifp = m_get_rcvif_psref(m, &psref); if (ifp == NULL) return;` at
+/// :1381-1387, and `IP_PKTINFO` at :1389 after it. A datagram whose receive
+/// interface has detached therefore arrives with NO cmsg at all through this
+/// one and with its destination intact through the other — and the destination
+/// is the fact RFC 6762 §11 partitions on, while the interface only scopes the
+/// link. The pair strictly dominates, so this is the weaker shape rather than a
+/// second option, and promoting it would be a regression.
+///
+/// It stays compiled for what its `const _` layout assertions pin, and exported
+/// so a caller on a real NetBSD can drive it against live ancillary data. See
+/// the comment block above `parse_dstaddr_recvif_v4` and `build.rs`.
 ///
 /// [`RecvMeta::local_ip`] is UNSPECIFIED for the same reason as in the
 /// `IP_RECVDSTADDR` parser: NetBSD's `in_pktinfo` has no `ipi_spec_dst` field,
@@ -1030,10 +1163,17 @@ pub fn parse_pktinfo_v6(
 ///
 /// Every cmsg this crate enables, at the widest layout any supported target
 /// uses, with `CMSG_SPACE`'s per-message header and padding: `IPV6_PKTINFO`
-/// (20-byte payload), `IP_RECVDSTADDR` + `IP_RECVIF` (4 bytes and a padded
+/// (20-byte payload), `IP_RECVDSTADDR`/`IP_RECVIF` (4 bytes and a padded
 /// `sockaddr_dl`), `SCM_TIMESTAMPNS` (16), `IP_TTL`/`IPV6_HOPLIMIT` (4). The
-/// worst case measures about 152 bytes. 512 leaves better than three times that
-/// for a kernel that attaches something this crate did not ask for.
+/// worst case is 152 bytes, on FreeBSD/amd64, of which `IP_RECVIF`'s padded
+/// 54-byte `sockaddr_dl` is 72. 512 leaves better than three times that for a
+/// kernel that attaches something this crate did not ask for.
+///
+/// **That figure is a test, not a claim.**
+/// `tests::control_buffer_holds_every_cmsg_this_target_enables` re-derives it
+/// from `libc::CMSG_SPACE` for whichever target it is compiled on, and fails if
+/// the total does not fit here twice over — so enabling one more cmsg cannot
+/// quietly outgrow this buffer and start refusing datagrams.
 #[cfg(unix)]
 #[repr(align(8))]
 struct CmsgBuf([u8; 512]);
@@ -1235,13 +1375,22 @@ pub fn recv_with_meta(
   let controllen = msg.msg_controllen as usize;
   let control_slice = control.0.get(..controllen).unwrap_or(&control.0);
   let parsed = if is_v4 {
-    // parse_pktinfo_v4 only exists where libc defines IP_PKTINFO
-    // (`has_ip_pktinfo`); elsewhere the v4 path degrades to unspecified-local.
+    // Two spellings of the same two facts, one per target, and the cfgs are
+    // mutually exclusive by construction (see `build.rs`): `IP_PKTINFO` on
+    // Linux/Android/Apple, the `IP_RECVDSTADDR` + `IP_RECVIF` pair on the four
+    // BSDs. `try_bind_v4` enables whichever one this target parses and fails the
+    // bind when the enable does not take, so a socket that reaches here has the
+    // matching option on. On a target with neither the v4 path degrades to
+    // unspecified-local.
     #[cfg(has_ip_pktinfo)]
     {
       parse_pktinfo_v4(control_slice, n, peer)
     }
-    #[cfg(not(has_ip_pktinfo))]
+    #[cfg(has_ip_dstaddr_recvif)]
+    {
+      parse_dstaddr_recvif_v4(control_slice, n, peer)
+    }
+    #[cfg(not(any(has_ip_pktinfo, has_ip_dstaddr_recvif)))]
     {
       let _ = control_slice;
       Err(ParseRecvMetaError::MissingPktinfo)

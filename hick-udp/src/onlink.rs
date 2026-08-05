@@ -61,8 +61,8 @@
 //! |---|---|---|---|---|---|
 //! | `hick-udp` `recv_with_meta` | IPv6 | all supported unix | witnessed | witnessed | OpenBSD/NetBSD only |
 //! | `hick-udp` `recv_with_meta` | IPv4 | Linux/Android, Apple | witnessed | witnessed | no |
-//! | `hick-udp` `recv_with_meta` | IPv4 | FreeBSD, DragonFly | **blind** | **blind** | no |
-//! | `hick-udp` `recv_with_meta` | IPv4 | OpenBSD, NetBSD | **blind** | **blind** | **yes** |
+//! | `hick-udp` `recv_with_meta` | IPv4 | FreeBSD, DragonFly | witnessed | witnessed | no |
+//! | `hick-udp` `recv_with_meta` | IPv4 | OpenBSD, NetBSD | witnessed | witnessed | **yes** |
 //! | `hick-udp` `recv_with_meta` | both | Windows | witnessed | witnessed | no |
 //! | `hick-compio` unix decoder | IPv6 | all supported unix | witnessed | witnessed | OpenBSD/NetBSD only |
 //! | `hick-compio` unix decoder | IPv4 | Linux/Android, Apple | witnessed | witnessed | no |
@@ -78,16 +78,18 @@
 //! `hick-compio` decodes its own ancillary data (`hick-compio/src/socket/unix.rs`,
 //! gated by `hick-compio/build.rs`) rather than calling this crate's
 //! `recv_with_meta`, so it is a SECOND decoder with the same gap and not a share
-//! of this crate's. Three separate pieces of work move the blind rows into the
-//! witnessed ones, and all three are tracked separately:
+//! of this crate's. The BSD IPv4 rows for `recv_with_meta` are now witnessed —
+//! `try_bind_v4` enables `IP_RECVDSTADDR` + `IP_RECVIF` and
+//! `multicast::parse_dstaddr_recvif_v4` reads the pair, behind the
+//! `has_ip_dstaddr_recvif` capability whose evidence is written at its emit site
+//! in `hick-udp/build.rs` — which covers `hick-mio` and `hick-reactor`. Two
+//! pieces of work remain, and each moves rows this crate's flip does not reach:
 //!
-//! * `hick-udp`'s `multicast::parse_dstaddr_recvif_v4` and
-//!   `multicast::parse_netbsd_pktinfo_v4` — written and unit-tested, no callers,
-//!   sockopts never set; see `hick-udp/build.rs` for the per-target evidence a
-//!   flip needs. This covers `hick-mio` and `hick-reactor`;
 //! * the same work again in `hick-compio/src/socket/unix.rs` behind that crate's
 //!   own `has_ip_pktinfo`. `hick-compio` does not call `recv_with_meta`, so
-//!   `hick-udp`'s flip does nothing for it;
+//!   `hick-udp`'s flip does nothing for it — its
+//!   `socket::rx_interface_reported` answers from its own cfgs for exactly that
+//!   reason;
 //! * a `WSARecvMsg` receive path for `hick-compio` on Windows.
 //!
 //! # What a blind square costs, stated once
@@ -99,12 +101,16 @@
 //! * where `MSG_BCAST` is bound (OpenBSD/NetBSD), an IPv4 broadcast is REFUSED;
 //! * where `MSG_MCAST` is bound, **any** foreign multicast group is admitted from
 //!   **any** source, because the flag names no group;
-//! * where neither is bound (FreeBSD/DragonFly, and `hick-compio` on Windows), an
-//!   IPv4 broadcast is indistinguishable from a unicast and is admitted for an
-//!   in-prefix source.
+//! * where neither is bound — `hick-compio`'s IPv4 rows on FreeBSD/DragonFly, and
+//!   `hick-compio` on Windows — an IPv4 broadcast is indistinguishable from a
+//!   unicast and is admitted for an in-prefix source.
 //!
 //! A datagram whose witness was `Declined` lands in that same residual for one
-//! datagram, and [`Admit::BlindSourceOnLink`] is what makes it countable.
+//! datagram, and [`Admit::BlindSourceOnLink`] is what makes it countable. That is
+//! now the ONLY way a `recv_with_meta` square reaches the residual: no row of
+//! this crate's own receive path is structurally blind any more, so what used to
+//! be four permanent squares is a per-datagram degradation the kernel has to
+//! cause.
 //!
 //! # Where `Declined` can actually occur, read out of each kernel
 //!
@@ -121,7 +127,22 @@
 //! | Apple IPv4 | **unreachable** — datagram dropped instead | not applicable |
 //! | Apple IPv6 | **unreachable** — datagram dropped instead | **reachable** |
 //! | FreeBSD/DragonFly/OpenBSD/NetBSD IPv6 | **reachable, and wired today** | reachable |
+//! | FreeBSD/DragonFly/OpenBSD/NetBSD IPv4 | **reachable, and wired today** | **reachable** |
 //! | Windows (`WSARecvMsg`) | no documented case | undocumented |
+//!
+//! **The BSD IPv4 row can decline each witness SEPARATELY**, and no other row
+//! can. `IP_RECVDSTADDR` and `IP_RECVIF` are two cmsgs built by two
+//! `sbcreatecontrol` calls, not two fields of one struct, so an mbuf shortage
+//! can take either without the other; NetBSD adds a deterministic form of the
+//! same split, emitting `IP_RECVDSTADDR` before its
+//! `m_get_rcvif_psref() == NULL` early return and `IP_RECVIF` after it. The
+//! reachable state is therefore `Witnessed` destination with `Declined`
+//! interface: the destination partition still decides in full and only the link
+//! scoping is lost, which is the same narrow widening Linux IPv4 has. The
+//! reverse — interface without destination — is possible too and costs only the
+//! partition, landing in the residual for that one datagram. Both are why
+//! `parse_dstaddr_recvif_v4` returns what it recovered instead of insisting on
+//! the pair.
 //!
 //! **Linux cannot lose a cmsg silently.** `put_cmsg` (`net/core/scm.c`) writes
 //! straight into the CALLER's control buffer — there is no allocation to fail —
@@ -295,9 +316,12 @@
 //! * [`LinkDelivery::Multicast`] admits, and it names no group, so **any**
 //!   foreign group is admitted there from any source, and no flag can close it;
 //! * everything else takes the source arm, so on every square with no delivery
-//!   class either — `hick-udp` and `hick-compio` IPv4 on **FreeBSD/DragonFly**,
-//!   and `hick-compio` on **Windows** — an IPv4 **broadcast** is still admitted
-//!   for an in-prefix source.
+//!   class either — `hick-compio` IPv4 on **FreeBSD/DragonFly**, and
+//!   `hick-compio` on **Windows** — an IPv4 **broadcast** is still admitted for
+//!   an in-prefix source. `hick-udp`'s own FreeBSD/DragonFly IPv4 row left this
+//!   list when it started witnessing the destination: it now refuses a broadcast
+//!   in the first regime, by address, and reaches this one only for a datagram
+//!   whose cmsg the kernel declined.
 //!
 //! **[`DestinationWitness::Lost`] is the one absence that refuses**, and it is deliberately
 //! not the one an attacker can provoke. `MSG_CTRUNC` says the kernel had the fact
@@ -772,7 +796,7 @@ pub enum Refuse {
   LinkWitnessLost,
   /// The destination witness was [`DestinationWitness::Lost`]: our own control buffer was
   /// too small. Distinct from [`Self::LinkWitnessLost`] because the two halves
-  /// can come from different cmsgs on the BSD `IP_RECVDSTADDR` + `IP_RECVIF`
+  /// can come from different cmsgs on the BSD `IP_RECVDSTADDR`/`IP_RECVIF`
   /// pair, and a driver that sees only one of them should be able to say which.
   DestinationWitnessLost,
   /// The witnessed destination is a multicast group that is not one of the two
@@ -1018,9 +1042,9 @@ const fn scope_of(src: SocketAddr) -> u32 {
 /// live endpoint always has a real one.
 ///
 /// **With NO witness at all, the kind of absence decides, and only one of the
-/// three refuses.** [`IfaceWitness::Blind`] is the path's silence — IPv4 on
-/// FreeBSD/DragonFly/OpenBSD/NetBSD, which define no usable `IP_PKTINFO`, and
-/// any driver reading datagrams with `recvfrom` — and rejecting silence would
+/// three refuses.** [`IfaceWitness::Blind`] is the path's silence — `hick-compio`'s
+/// IPv4 decoder on the four BSDs, its Windows `recv_from` arm, and any driver
+/// reading datagrams with `recvfrom` — and rejecting silence would
 /// take mDNS off the air there entirely. [`IfaceWitness::Declined`] is the
 /// kernel skipping a cmsg it could not allocate, which is an availability event
 /// and not evidence about the sender, so it degrades the same way.
@@ -1208,10 +1232,13 @@ fn is_mdns_group(dst: IpAddr) -> bool {
 ///
 /// There is no branch that skips this reading, so getting it wrong is not a
 /// corner case: every arrival on every target would take the source-prefix arm.
-/// On OpenBSD/NetBSD there is no IPv4 PKTINFO parse at all, the destination is
-/// [`DestinationWitness::Blind`], and the kernel's multicast flag is the only thing left to
-/// reach the group arm with — against precisely the overlaid-subnet multicast
-/// §11 calls "essential" to admit.
+/// The BSD IPv4 squares reach it through `IP_RECVDSTADDR` rather than PKTINFO —
+/// a bare `struct in_addr` with no `ipi_spec_dst` twin to confuse it with, so
+/// `local_ip` is UNSPECIFIED there and this accessor is the only destination
+/// there is. Where a kernel declines the cmsg for one datagram, OpenBSD and
+/// NetBSD still have the coarse multicast flag to reach the group arm with, and
+/// FreeBSD/DragonFly have nothing — against precisely the overlaid-subnet
+/// multicast §11 calls "essential" to admit.
 ///
 /// # Two regimes, and the contract differs between them
 ///

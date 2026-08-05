@@ -13,6 +13,7 @@
 //! rustix is missing here:
 //!
 //!   * `IP_PKTINFO` / `IP_RECVPKTINFO`  — no `sockopt::set_ip_(recv)pktinfo`
+//!   * `IP_RECVDSTADDR` / `IP_RECVIF`   — no setter for either
 //!   * `IPV6_RECVPKTINFO`               — no `sockopt::set_ipv6_recvpktinfo`
 //!   * `SO_TIMESTAMP` / `SO_TIMESTAMPNS`— no `sockopt::set_socket_timestamp[ns]`
 //!   * `IP_RECVTTL`                     — no `sockopt::set_ip_recvttl`
@@ -159,13 +160,11 @@ pub(crate) fn set_multicast_loop_v6(sock: &UdpSocket, on: bool) -> std::io::Resu
 ///
 /// Gated on the `has_ip_pktinfo` capability cfg (see `build.rs`), which is
 /// Linux/Android and Apple ONLY — every BSD is excluded. FreeBSD, DragonFly and
-/// OpenBSD define no `IP_PKTINFO` at all (they use `IP_RECVDSTADDR`/`IP_RECVIF`),
-/// and NetBSD's `in_pktinfo` is a different, 8-byte layout that
-/// [`crate::parse_pktinfo_v4`] would misread as truncated — so NetBSD is
-/// excluded too, despite spelling the enable `IP_RECVPKTINFO`. On all four this
-/// is a no-op, `recv_with_meta` degrades to an UNSPECIFIED local address and
-/// interface index `0`, and [`crate::reports_rx_interface_v4`] reports `false`
-/// so a caller can tell that zero from a real answer.
+/// OpenBSD define no `IP_PKTINFO` at all, and NetBSD's `in_pktinfo` is a
+/// different, 8-byte layout that [`crate::parse_pktinfo_v4`] would misread as
+/// truncated. All four recover the same two facts through
+/// `set_recv_dstaddr_recvif_v4` below instead, so this being a no-op there is a
+/// spelling difference and no longer a capability gap.
 ///
 /// rustix has no setter for this option (see the module docs), so it routes
 /// through the single `libc::setsockopt` chokepoint.
@@ -179,6 +178,69 @@ pub(crate) fn set_recv_pktinfo_v4(sock: &UdpSocket) -> std::io::Result<()> {
 #[cfg(not(has_ip_pktinfo))]
 pub(crate) fn set_recv_pktinfo_v4(_sock: &UdpSocket) -> std::io::Result<()> {
   Ok(())
+}
+
+/// Enable the BSD IPv4 receive-metadata pair — `IP_RECVDSTADDR`, which delivers
+/// the IP header destination as a bare `struct in_addr`, and `IP_RECVIF`, which
+/// delivers the receiving interface as a `struct sockaddr_dl` — so
+/// [`crate::parse_dstaddr_recvif_v4`] has something to parse.
+///
+/// The BSD counterpart of `set_recv_pktinfo_v4`, and gated on the
+/// `has_ip_dstaddr_recvif` capability cfg (see `build.rs` for the four evidence
+/// items it rests on). Both options are `int`-valued booleans in every one of
+/// the four kernels' `ip_ctloutput`, so they may go through the
+/// `set_bool_sockopt` chokepoint.
+///
+/// # Both, or neither, and the bind fails
+///
+/// NOT best-effort, for the reason `set_recv_pktinfo_v4`'s call site gives: on a
+/// target `reports_rx_interface_v4` calls capable, a receiver is entitled to
+/// read a missing witness as evidence and act on it, so an enable that failed
+/// silently would be deafness rather than degradation. `?` on the first also
+/// means a socket never ends up with the destination enabled and the interface
+/// not: the two are separate `setsockopt` calls but one capability, and a
+/// half-enabled socket would witness destinations while reporting every
+/// interface as `Declined`.
+///
+/// rustix has no setter for either option (see the module docs).
+#[cfg(has_ip_dstaddr_recvif)]
+pub(crate) fn set_recv_dstaddr_recvif_v4(sock: &UdpSocket) -> std::io::Result<()> {
+  set_bool_sockopt(sock, libc::IPPROTO_IP, libc::IP_RECVDSTADDR)?;
+  set_bool_sockopt(sock, libc::IPPROTO_IP, libc::IP_RECVIF)
+}
+
+/// Fallback where the BSD pair isn't available (Linux/Android/Apple, which use
+/// `IP_PKTINFO` above): no-op.
+#[cfg(not(has_ip_dstaddr_recvif))]
+pub(crate) fn set_recv_dstaddr_recvif_v4(_sock: &UdpSocket) -> std::io::Result<()> {
+  Ok(())
+}
+
+/// Read `IP_RECVDSTADDR` and `IP_RECVIF` back through the `get_int_sockopt`
+/// chokepoint, as `(dstaddr, recvif)`. The only caller is
+/// `crate::multicast::verify_rx_dstaddr_recvif_v4`, immediately after
+/// `set_recv_dstaddr_recvif_v4`.
+///
+/// This is the SECOND option group in this crate to get a read-back, and unlike
+/// `IPV6_MULTICAST_HOPS` it is not because of a known defect. It is because
+/// three of the four targets that reach it — DragonFly, OpenBSD, NetBSD — have
+/// no CI runner anywhere in this workspace, so `build.rs`'s evidence item 1 has
+/// no execution to point at on them. Checking the enable on every bind is what
+/// replaces that execution: it is two syscalls once per socket, and it turns
+/// "libc binds the constant" into "this kernel accepted and holds it".
+///
+/// A packet probe was considered for the same job and rejected. It would turn
+/// loopback filtering, a caller's `with_multicast_loop(false)`, a jail, seccomp
+/// or plain scheduler delay into a hard bind failure on exactly the three
+/// targets nobody can test, which is a worse failure than the one it detects.
+/// This cannot: all four kernels handle both options under the GET direction as
+/// well as the SET one (see `build.rs` item 1 for the per-kernel citation), so
+/// the only way it fails is the way it is meant to.
+#[cfg(has_ip_dstaddr_recvif)]
+pub(crate) fn get_recv_dstaddr_recvif_v4(sock: &UdpSocket) -> std::io::Result<(i32, i32)> {
+  let dstaddr = get_int_sockopt(sock, libc::IPPROTO_IP, libc::IP_RECVDSTADDR)?;
+  let recvif = get_int_sockopt(sock, libc::IPPROTO_IP, libc::IP_RECVIF)?;
+  Ok((dstaddr, recvif))
 }
 
 /// Enable delivery of `IPV6_RECVPKTINFO` ancillary data on an IPv6 socket so
@@ -263,8 +325,9 @@ pub(crate) fn set_recv_hoplimit_v6(_sock: &UdpSocket) -> std::io::Result<()> {
 /// The SINGLE `libc::setsockopt` call site in the crate: set an arbitrary
 /// `c_int`-valued sockopt. Every non-rustix option in this module funnels
 /// through here — the boolean receive-cmsg enablers via the `set_bool_sockopt`
-/// wrapper just below (`set_recv_pktinfo_v4/v6`, `set_recv_timestamp`,
-/// `set_recv_ttl_v4`, `set_recv_hoplimit_v6`), and the `IPV6_MULTICAST_HOPS`
+/// wrapper just below (`set_recv_pktinfo_v4/v6`,
+/// `set_recv_dstaddr_recvif_v4`, `set_recv_timestamp`, `set_recv_ttl_v4`,
+/// `set_recv_hoplimit_v6`), and the `IPV6_MULTICAST_HOPS`
 /// rustix workaround in `set_multicast_hops_v6` directly — so all the
 /// `unsafe` ffi for these options lives in one audited place. Always
 /// compiled — `set_recv_pktinfo_v6` is unconditional, so this is reached on
@@ -313,8 +376,9 @@ fn set_int_sockopt(
 /// `setsockopt(level, optname, 1)`: enable a boolean-valued receive-cmsg
 /// option. Thin, `unsafe`-free wrapper around the `set_int_sockopt` chokepoint
 /// above for the common "just turn this on" case; every receive-cmsg setter
-/// (`set_recv_pktinfo_v4/v6`, `set_recv_timestamp`, `set_recv_ttl_v4`,
-/// `set_recv_hoplimit_v6`) goes through this, not `set_int_sockopt` directly.
+/// (`set_recv_pktinfo_v4/v6`, `set_recv_dstaddr_recvif_v4`,
+/// `set_recv_timestamp`, `set_recv_ttl_v4`, `set_recv_hoplimit_v6`) goes
+/// through this, not `set_int_sockopt` directly.
 fn set_bool_sockopt(
   sock: &UdpSocket,
   level: libc::c_int,
@@ -324,16 +388,23 @@ fn set_bool_sockopt(
 }
 
 /// The SINGLE `libc::getsockopt` call site in the crate: read back an
-/// arbitrary `c_int`-valued sockopt. Its only caller is
-/// `get_multicast_hops_v6` just below, which exists solely so
-/// `crate::multicast::try_bind_v6` can confirm `set_multicast_hops_v6`
-/// actually took — see that function's doc for the RFC 6762 §11
-/// justification and the Linux wrong-level history that makes a read-back
-/// necessary for this ONE option. No other sockopt in this module is read
-/// back: every other rustix-covered setter has no comparable known defect,
-/// and the other `set_int_sockopt` consumers (the receive-cmsg enablers) are
-/// already deliberately best-effort, so confirming them would add a syscall
-/// without adding safety.
+/// arbitrary `c_int`-valued sockopt. It has exactly two callers, and each is
+/// read back for a DIFFERENT reason:
+///
+///   * `get_multicast_hops_v6` just below, so `crate::multicast::try_bind_v6`
+///     can confirm `set_multicast_hops_v6` actually took — see that function's
+///     doc for the RFC 6762 §11 justification and the Linux wrong-level history
+///     that makes a read-back necessary for that option;
+///   * `get_recv_dstaddr_recvif_v4` above, not for a known defect but because
+///     three of the four targets it runs on have no CI runner, so an on-bind
+///     check is the only execution `build.rs`'s evidence item 1 can point at
+///     there.
+///
+/// Nothing else is read back. The remaining rustix-covered setters have no
+/// comparable known defect, and the remaining receive-cmsg enablers
+/// (`set_recv_timestamp`, `set_recv_ttl_v4`, `set_recv_hoplimit_v6`) are
+/// deliberately best-effort and feed only diagnostics, so confirming them would
+/// add a syscall without adding safety.
 ///
 /// Valid ONLY for genuinely `int`-sized options — the same caveat as
 /// `set_int_sockopt` above applies to the read side. A `getsockopt` that

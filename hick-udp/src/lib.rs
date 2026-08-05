@@ -24,7 +24,7 @@ mod family;
 
 pub use error::{
   AddressInUseDetail, BindError, BufferTooShortDetail, InterfaceNotFoundDetail, JoinError,
-  MulticastHopsNotAppliedDetail, ParseRecvMetaError,
+  MulticastHopsNotAppliedDetail, ParseRecvMetaError, RxDestinationNotEnabledDetail,
 };
 pub use family::Family;
 
@@ -61,15 +61,21 @@ pub use platform::recv_with_meta;
 // dangle on FreeBSD/OpenBSD/DragonFly (which use IP_RECVDSTADDR/IP_RECVIF).
 #[cfg(has_ip_pktinfo)]
 pub use multicast::parse_pktinfo_v4;
-// The BSD IPv4 ancillary parsers, each compiled only where its cmsg shape
-// exists. They are NOT part of the receive path — `recv_with_meta` still
-// degrades on those targets and `reports_rx_interface_v4` still answers
-// `false` there — so they are exported for the same reason they exist: a
-// caller on a real FreeBSD/DragonFly/OpenBSD/NetBSD host can drive them
-// against live ancillary data and produce the evidence `build.rs` names as
-// the precondition for wiring them in.
-#[cfg(ipv4_rx_dstaddr_recvif)]
+// The BSD IPv4 ancillary parser: `IP_RECVDSTADDR` + `IP_RECVIF`, and what
+// `recv_with_meta` calls on FreeBSD, DragonFly, OpenBSD and NetBSD — the IPv4
+// counterpart of `parse_pktinfo_v4`, gated on the capability that says the
+// bind enables the pair (`has_ip_dstaddr_recvif`, see build.rs). Public for the
+// same reason `parse_pktinfo_v4` is: a driver with its own `recvmsg` decodes
+// the same cmsgs and should not hand-roll a second reading of them.
+#[cfg(has_ip_dstaddr_recvif)]
 pub use multicast::parse_dstaddr_recvif_v4;
+// NetBSD's own `IP_PKTINFO` shape. Compiled but NOT wired: NetBSD takes the
+// `IP_RECVDSTADDR` pair above instead, because its `ip_savecontrol` emits
+// IP_RECVDSTADDR before the `m_get_rcvif_psref() == NULL` early return and
+// IP_PKTINFO after it, so a detached receive interface loses the destination
+// here and keeps it there. See `build.rs` at the `ipv4_rx_netbsd_pktinfo` emit
+// site. Exported so a caller on a real NetBSD can drive it against live
+// ancillary data.
 #[cfg(ipv4_rx_netbsd_pktinfo)]
 pub use multicast::parse_netbsd_pktinfo_v4;
 pub use sync::{MulticastSocketV4, MulticastSocketV6};

@@ -1,5 +1,71 @@
 use super::*;
 
+/// [`rx_interface_reported`] answers for THIS crate's decoder, and the expected
+/// value is spelled from target literals rather than from the `has_ip_pktinfo`
+/// cfg the function itself reads — asking the production answer to confirm
+/// itself would pass no matter what either crate's `build.rs` emitted.
+///
+/// The IPv4 row is the one that matters. `decode_unix_cmsgs` reads `IP_PKTINFO`
+/// and nothing else, so it recovers nothing on any BSD; `hick-udp`'s
+/// `recv_with_meta` enables `IP_RECVDSTADDR` + `IP_RECVIF` there and does. This
+/// function used to delegate to `hick-udp`'s answer, and the four BSD IPv4
+/// squares are exactly where that delegation would now claim a capability this
+/// decoder does not have — turning a `MSG_CTRUNC` on a path with nothing to
+/// lose into [`DestinationWitness::Lost`], which refuses. Both halves are
+/// asserted: what this crate answers, and that a BSD is where it must differ
+/// from `hick-udp`.
+#[test]
+fn ipv4_capability_is_this_decoders_own_and_not_hick_udps() {
+  let v4: SocketAddr = ([192, 0, 2, 1], 5353).into();
+  let v6: SocketAddr = "[2001:db8::1]:5353".parse().expect("literal v6 addr");
+
+  // The decoder's IPv4 cmsg is `IP_PKTINFO`, whose 12-byte Linux/Apple
+  // `in_pktinfo` it decodes: Linux, Android and the Apple platforms, enumerated
+  // rather than read back off the cfg.
+  let decodes_v4_pktinfo = cfg!(all(
+    unix,
+    any(
+      target_os = "linux",
+      target_os = "android",
+      target_vendor = "apple"
+    )
+  ));
+  assert_eq!(
+    rx_interface_reported(v4),
+    decodes_v4_pktinfo,
+    "this crate's IPv4 answer must follow ITS OWN decoder's cmsg support"
+  );
+  // Every supported Unix defines IPV6_PKTINFO, so the v6 row is uniform and
+  // the delegation was never wrong about it.
+  assert_eq!(
+    rx_interface_reported(v6),
+    cfg!(unix),
+    "this crate decodes IPV6_PKTINFO on every supported unix"
+  );
+
+  // The divergence itself, on the squares where it exists. `hick-udp` witnesses
+  // an IPv4 destination on the BSDs and this decoder does not, so the two
+  // answers MUST disagree there; anywhere else they must agree.
+  let bsd_v4 = cfg!(any(
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+  ));
+  if bsd_v4 {
+    assert!(
+      !rx_interface_reported(v4),
+      "this decoder reads no IPv4 cmsg on a BSD, whatever hick-udp's own path recovers there"
+    );
+  } else if cfg!(unix) {
+    assert_eq!(
+      rx_interface_reported(v4),
+      hick_udp::onlink::reports_rx_interface(v4),
+      "off the BSDs the two receive paths decode the same IPv4 cmsg"
+    );
+  }
+}
+
 #[test]
 fn recv_meta_default_is_safe_and_unspecified() {
   let m = RecvMeta::empty(([127, 0, 0, 1], 5353).into());

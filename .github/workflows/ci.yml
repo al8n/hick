@@ -121,11 +121,20 @@ jobs:
   # is wrong on exactly the targets those parsers exist for. Running here puts
   # the assertions on the layout they were written for.
   #
+  # It is no longer only the PARSE. `REQUIRED_TESTS` below now also names the
+  # four live tests behind the `has_ip_dstaddr_recvif` capability: the control
+  # buffer measurement, and three that bind a real 0.0.0.0:5353 socket through
+  # `try_bind_v4` — so through the real `IP_RECVDSTADDR`/`IP_RECVIF` enable and
+  # its `getsockopt` read-back — and assert the destination and interface a real
+  # kernel reports for a group datagram and for a unicast one. Those are the four
+  # numbered evidence items at that cfg's emit site in `hick-udp/build.rs`,
+  # executed rather than argued.
+  #
   # This is FreeBSD's evidence and no other target's: `IP_RECVIF` is 20 here and
-  # 30 on OpenBSD, and NetBSD carries a different `in_pktinfo` entirely. It is
-  # also still only the PARSE — see the four numbered items at the emit site in
-  # `hick-udp/build.rs` for what a capability flip additionally requires from a
-  # real host.
+  # 30 on OpenBSD, and `struct sockaddr_dl` has a different trailing shape on
+  # each of the four. DragonFly, OpenBSD and NetBSD have no runner anywhere, and
+  # what stands in for one there is the on-bind read-back in
+  # `verify_rx_dstaddr_recvif_v4`, not this job.
   #
   # GitHub has no FreeBSD runner. `vmactions/freebsd-vm` boots one under QEMU on
   # the ubuntu runner and pipes the script below to `sh` over ssh, failing the
@@ -149,9 +158,23 @@ jobs:
     permissions:
       contents: read
     env:
-      # One list, read twice: once inside the guest and once on the runner after
-      # copyback. Keeping a single copy is what stops the two checks drifting
-      # into disagreeing about what counts as evidence.
+      # TWO lists, each read twice — once inside the guest and once on the runner
+      # after copyback. Keeping one copy of each is what stops the two checks
+      # drifting into disagreeing about what counts as evidence.
+      #
+      # WHY TWO, and it is the difference between "returned" and "concluded".
+      # libtest prints `test <name> ... ok` for a test that RETURNED. A test that
+      # returned early because a precondition was unmet — no loopback, a refused
+      # join, a send that failed — prints exactly the same line as one that
+      # asserted, so for any test with an environmental precondition that line
+      # proves only that the process started. That is the shape of two defects
+      # already fixed in this workspace.
+      #
+      # REQUIRED_TESTS are pure unit tests over synthesized buffers. They have no
+      # preconditions and no output, so `... ok` and "concluded" are the same
+      # claim and the status line is sufficient. They must STAY silent: anything
+      # they print lands mid-line under --nocapture and the exact-match below
+      # stops finding them.
       REQUIRED_TESTS: >-
         synth_cmsg_agrees_with_libc_on_payload_offset_and_stride
         cmsg_iter_is_sound_on_crafted_and_unaligned_input
@@ -162,6 +185,24 @@ jobs:
         decode_recvdstaddr_reads_a_network_order_in_addr
         decode_recvif_index_reads_sdl_index_out_of_the_fixed_prefix
         scan_dstaddr_recvif_skips_unrelated_cmsgs_and_recovers_both
+        reports_rx_interface_v4_names_every_supported_target
+        a_dstaddr_without_recvif_declines_the_interface_and_keeps_the_destination
+      # REQUIRED_EVIDENCE are the tests that touch a real socket, and they are the
+      # four numbered evidence items behind `has_ip_dstaddr_recvif` plus the pin
+      # on the production read-back's call site. Every unmet precondition in them
+      # is now FATAL rather than an early return, and each emits
+      # `hick-udp-evidence-complete: <name>` as its last statement, after every
+      # assertion. This job requires that MARKER and not the status line, so a
+      # test that returns without concluding cannot report success. (It is not a
+      # defence against a hostile branch, which could print the line directly —
+      # see the supply-chain note below for what this job does and does not
+      # establish.)
+      REQUIRED_EVIDENCE: >-
+        control_buffer_holds_every_cmsg_this_target_enables
+        bsd_ipv4_bind_enables_the_receive_metadata_pair
+        bsd_ipv4_recv_witnesses_the_group_and_a_unicast_destination
+        bsd_ipv4_recv_witnesses_the_interface_that_carried_the_datagram
+        try_bind_v4_rejects_a_half_enabled_socket_forced_through_production_wiring
       # HARNESS_LOG and RUN_NONCE are deliberately NOT set here. They are minted
       # per run by the step below and published through $GITHUB_ENV, because a
       # value written in this file is a value a branch can predict.
@@ -270,7 +311,7 @@ jobs:
           copyback: true
           # The VM is a separate machine, so this job's `env:` block does not
           # reach it; these get there through this hand-off and nowhere else.
-          envs: "RUSTFLAGS RUST_BACKTRACE REQUIRED_TESTS HARNESS_LOG RUN_NONCE"
+          envs: "RUSTFLAGS RUST_BACKTRACE REQUIRED_TESTS REQUIRED_EVIDENCE HARNESS_LOG RUN_NONCE"
           prepare: |
             pkg install -y rust
           run: |
@@ -288,7 +329,8 @@ jobs:
             nonce="$RUN_NONCE"
             final_log="$HARNESS_LOG"
             required="$REQUIRED_TESTS"
-            unset RUN_NONCE HARNESS_LOG REQUIRED_TESTS
+            required_evidence="$REQUIRED_EVIDENCE"
+            unset RUN_NONCE HARNESS_LOG REQUIRED_TESTS REQUIRED_EVIDENCE
 
             freebsd-version
             rustc --version
@@ -313,8 +355,16 @@ jobs:
             # Build first so compile output streams, then capture the harness
             # output. Piping into `tee` instead would report `tee`'s status and
             # hide a failing run.
+            # --nocapture so the completion markers reach the log at all:
+            # libtest swallows a PASSING test's output otherwise, which is
+            # exactly the case the markers exist for. --test-threads=1 because
+            # --nocapture interleaves output from concurrent tests into each
+            # other's lines, and both checks below are whole-line exact matches.
+            # It also makes the thread-local test seams (FORCE_APPLIED_HOPS_V6,
+            # FORCE_RX_DSTADDR_READBACK_V4) share one thread, which each test
+            # already handles by resetting before it asserts.
             cargo test -p hick-udp --all-features --no-run
-            if ! cargo test -p hick-udp --all-features --no-fail-fast -- --color never >"$raw_log" 2>&1; then
+            if ! cargo test -p hick-udp --all-features --no-fail-fast -- --color never --nocapture --test-threads=1 >"$raw_log" 2>&1; then
               cat "$raw_log"
               exit 1
             fi
@@ -333,6 +383,12 @@ jobs:
             for t in $required; do
               if ! grep -Fqx "test multicast::tests::$t ... ok" "$final_log"; then
                 echo "::error::hick-udp test $t did not run and pass on FreeBSD"
+                exit 1
+              fi
+            done
+            for t in $required_evidence; do
+              if ! grep -Fqx "hick-udp-evidence-complete: $t" "$final_log"; then
+                echo "::error::hick-udp evidence test $t did not reach its completion marker on FreeBSD"
                 exit 1
               fi
             done
@@ -372,6 +428,10 @@ jobs:
             echo "::error::REQUIRED_TESTS is empty; there is no evidence list to check."
             exit 1
           fi
+          if [ -z "${REQUIRED_EVIDENCE// /}" ]; then
+            echo "::error::REQUIRED_EVIDENCE is empty; there is no evidence list to check."
+            exit 1
+          fi
 
           if grep -q '^test result: FAILED' "$HARNESS_LOG"; then
             echo "::error::a FreeBSD test binary reported failures."
@@ -384,11 +444,21 @@ jobs:
           fi
 
           missing=0
-          # Word splitting is the point: REQUIRED_TESTS is a space-separated list.
+          # Word splitting is the point: both lists are space-separated.
           # shellcheck disable=SC2086
           for t in $REQUIRED_TESTS; do
             if ! grep -Fqx "test multicast::tests::$t ... ok" "$HARNESS_LOG"; then
               echo "::error::hick-udp test $t did not run and pass on FreeBSD"
+              missing=1
+            fi
+          done
+          # The status line above says a test RETURNED. For the tests that touch
+          # a real socket that is not the same claim as "concluded", so those are
+          # checked by the marker each emits after its last assertion instead.
+          # shellcheck disable=SC2086
+          for t in $REQUIRED_EVIDENCE; do
+            if ! grep -Fqx "hick-udp-evidence-complete: $t" "$HARNESS_LOG"; then
+              echo "::error::hick-udp evidence test $t did not reach its completion marker on FreeBSD. It either failed, was skipped, or returned early before asserting — the four evidence items behind has_ip_dstaddr_recvif are not established by this run."
               missing=1
             fi
           done
@@ -397,6 +467,8 @@ jobs:
           fi
           echo "FreeBSD executed every required cmsg test:"
           for t in $REQUIRED_TESTS; do echo "  ok  $t"; done
+          echo "FreeBSD concluded every required evidence test:"
+          for t in $REQUIRED_EVIDENCE; do echo "  done  $t"; done
 
   # Bare-metal proof: the `no_std` + `alloc` engine (`hick-smoltcp`) and its
   # embassy driver (`hick-embassy`) must build for a real embedded target. A

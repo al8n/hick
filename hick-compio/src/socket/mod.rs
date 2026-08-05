@@ -29,10 +29,26 @@ mod unix;
 /// [`hick_udp::onlink::admits_ingress`] takes it as a parameter rather than
 /// reading a constant. This crate does NOT read its datagrams through
 /// `hick-udp`: [`Socket::recv`] runs compio's own `recv_msg` plus
-/// [`decode_unix_cmsgs`] on Unix — gated on the same `has_ip_pktinfo` /
-/// `has_ipv6_pktinfo` cfgs `hick-udp` uses, so the answer there is identical —
-/// and plain `recv_from` everywhere else, which recovers no ancillary data at
-/// all.
+/// [`decode_unix_cmsgs`] on Unix, and plain `recv_from` everywhere else, which
+/// recovers no ancillary data at all.
+///
+/// # It answers from THIS crate's cfgs, and delegating was a latent defect
+///
+/// This used to read `hick_udp::onlink::reports_rx_interface`, justified by the
+/// two crates' `build.rs` files emitting `has_ip_pktinfo` / `has_ipv6_pktinfo`
+/// for identical target sets — true when it was written, and not a property
+/// either crate enforced. `hick-udp` has since widened its IPv4 answer to the
+/// four BSDs, where `recv_with_meta` now enables `IP_RECVDSTADDR` + `IP_RECVIF`
+/// and parses the pair. THIS decoder does neither: `decode_unix_cmsgs` reads
+/// `IP_PKTINFO` only, behind this crate's own `has_ip_pktinfo`, which is
+/// Linux/Android and Apple. Delegating would therefore have claimed a
+/// capability this path does not have, and [`RecvMeta::declare_cmsg_absent`]
+/// converts that claim into witnesses: `MSG_CTRUNC` would mint
+/// [`hick_udp::onlink::DestinationWitness::Lost`], which REFUSES, on a BSD IPv4
+/// square that recovers nothing to lose, and a clear flag would mint
+/// `Declined` — "the kernel skipped it for this datagram" — where the truth is
+/// that the path never asked. So the answer is stated here, from the cfgs that
+/// gate the decoder that has to honour it.
 ///
 /// # Windows recovers nothing, and says so
 ///
@@ -48,7 +64,10 @@ mod unix;
 /// The gate is not weakened so much as absent, because this path supplies
 /// nothing for it to weigh. A `WSARecvMsg` port is what turns it on.
 pub(crate) const fn rx_interface_reported(peer: core::net::SocketAddr) -> bool {
-  cfg!(unix) && hick_udp::onlink::reports_rx_interface(peer)
+  match peer {
+    SocketAddr::V4(_) => cfg!(all(unix, has_ip_pktinfo)),
+    SocketAddr::V6(_) => cfg!(all(unix, has_ipv6_pktinfo)),
+  }
 }
 
 /// Decoded recv metadata pulled from cmsgs.
