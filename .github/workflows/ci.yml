@@ -84,14 +84,21 @@ jobs:
   # (which does run `--all-targets`, see `os-clippy` below) has the field and
   # so could not have.
   #
-  # NetBSD is scoped to the sans-io crates (mdns-proto + hick-udp): the
-  # hick-reactor tokio driver depends on mio, which does not build on NetBSD —
-  # and so does hick-mio, which depends on mio directly rather than through
-  # tokio. The NetBSD portability target is the sans-io mechanism + socket
-  # layer, not a mio-based policy layer. FreeBSD/Android check the whole
-  # workspace. `--all-targets` does not widen that scope, only what gets
-  # checked within it: NetBSD stays `-p mdns-proto -p hick-udp`, now including
-  # those two crates' test/bench/example targets alongside their libs.
+  # NetBSD is scoped rather than `--workspace`: the hick-reactor tokio driver
+  # depends on mio, which does not build on NetBSD — and so does hick-mio, which
+  # depends on mio directly rather than through tokio. FreeBSD/Android check the
+  # whole workspace. `--all-targets` does not widen that scope, only what gets
+  # checked within it — those crates' test/bench/example targets alongside their
+  # libs.
+  #
+  # hick-compio IS in the NetBSD scope, and deliberately: it depends on compio
+  # rather than mio (which does build here), and it now carries its own
+  # `IP_RECVDSTADDR` + `IP_RECVIF` decode behind its own `has_ip_dstaddr_recvif`.
+  # The FreeBSD leg cannot stand in for that — `IP_RECVIF` is 20 on
+  # FreeBSD/DragonFly/NetBSD but 30 on OpenBSD, and `struct sockaddr_dl` has a
+  # different trailing shape and size on each of the four — so this is the only
+  # job that type-checks that code against netbsdlike constants at all. OpenBSD
+  # has no rustup std and NetBSD is its proxy here, exactly as for hick-udp.
   cross-check:
     runs-on: ubuntu-latest
     strategy:
@@ -101,7 +108,7 @@ jobs:
           - target: x86_64-unknown-freebsd
             scope: --workspace
           - target: x86_64-unknown-netbsd
-            scope: -p mdns-proto -p hick-udp
+            scope: -p mdns-proto -p hick-udp -p hick-compio
           - target: aarch64-linux-android
             scope: --workspace
     steps:
@@ -130,6 +137,16 @@ jobs:
   # numbered evidence items at that cfg's emit site in `hick-udp/build.rs`,
   # executed rather than argued.
   #
+  # IT RUNS TWO CRATES, and the second is not a convenience. `hick-compio` does
+  # NOT read its datagrams through `hick-udp`: it submits its own `recv_msg` and
+  # decodes its own control buffer, behind its own `build.rs` capability matrix.
+  # Its `has_ip_dstaddr_recvif` therefore needs its own four evidence items, and
+  # they can execute NOWHERE ELSE — the decode arm is cfg'd off on every host
+  # this workspace can otherwise run, so a break in it would be invisible to
+  # every other job here. `REQUIRED_COMPIO_TESTS` and `REQUIRED_COMPIO_EVIDENCE`
+  # below name them; the markers use a `hick-compio-` prefix so the two crates'
+  # evidence can never be read for each other's.
+  #
   # This is FreeBSD's evidence and no other target's: `IP_RECVIF` is 20 here and
   # 30 on OpenBSD, and `struct sockaddr_dl` has a different trailing shape on
   # each of the four. DragonFly, OpenBSD and NetBSD have no runner anywhere, and
@@ -151,18 +168,22 @@ jobs:
   freebsd:
     name: Test (FreeBSD)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 45 was sized for one crate. `hick-compio` pulls the whole compio runtime
+    # into the guest build, which is the bulk of the increase.
+    timeout-minutes: 60
     # Least privilege for the one job that runs a runtime-downloaded provisioner
     # on this runner (see the supply-chain note below). Nothing here writes to
     # the repository.
     permissions:
       contents: read
     env:
-      # TWO lists, each read twice — once inside the guest and once on the runner
-      # after copyback. Keeping one copy of each is what stops the two checks
-      # drifting into disagreeing about what counts as evidence.
+      # FIVE lists across three crates — a status-line list and a marker list
+      # where a crate needs both, a marker list alone where every entry touches a
+      # real socket — each read twice, once inside the guest and once on the
+      # runner after copyback. Keeping one copy of each is what stops the two
+      # checks drifting into disagreeing about what counts as evidence.
       #
-      # WHY TWO, and it is the difference between "returned" and "concluded".
+      # WHY TWO KINDS, and it is the difference between "returned" and "concluded".
       # libtest prints `test <name> ... ok` for a test that RETURNED. A test that
       # returned early because a precondition was unmet — no loopback, a refused
       # join, a send that failed — prints exactly the same line as one that
@@ -228,6 +249,31 @@ jobs:
       REQUIRED_REACTOR_EVIDENCE: >-
         control_abi_applies_ip_multicast_loop_at_this_target_s_width
         control_abi_delivery_stage_runs_end_to_end_on_this_kernel
+      # `hick-compio`'s own two lists, for its own `has_ip_dstaddr_recvif`. These
+      # carry the FULL module path because this crate's socket tests live in two
+      # modules (`socket::unix` beside the decoder, `socket::tests` beside the
+      # capability constant), where hick-udp's are all under `multicast::tests`
+      # and the path is spelled once in the check.
+      #
+      # Silent, precondition-free unit tests over synthesized buffers, so the
+      # status line and "concluded" are the same claim.
+      REQUIRED_COMPIO_TESTS: >-
+        socket::tests::ipv4_capability_is_this_decoders_own_and_not_hick_udps
+        socket::unix::bsd_ipv4_decode_recovers_both_witnesses_from_a_synthesized_pair
+        socket::unix::bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was
+      # The four numbered evidence items behind `hick-compio`'s capability: the
+      # control buffer measurement, the enable read back off the socket
+      # `Socket::from_std` wraps, and two that read a real datagram through this
+      # driver's OWN receive path — compio's `recv_msg` plus `decode_unix_cmsgs`,
+      # never `recv_with_meta`. Every unmet precondition in them is fatal rather
+      # than an early return, and each emits `hick-compio-evidence-complete:
+      # <name>` as its last statement. The prefix differs from hick-udp's so the
+      # two crates' markers cannot be read for each other's.
+      REQUIRED_COMPIO_EVIDENCE: >-
+        control_buffer_holds_every_cmsg_this_target_enables
+        bsd_ipv4_enable_recv_cmsgs_sets_the_receive_metadata_pair
+        bsd_ipv4_recv_witnesses_the_group_destination
+        bsd_ipv4_recv_witnesses_a_unicast_destination
       # HARNESS_LOG and RUN_NONCE are deliberately NOT set here. They are minted
       # per run by the step below and published through $GITHUB_ENV, because a
       # value written in this file is a value a branch can predict.
@@ -273,7 +319,7 @@ jobs:
             echo "HARNESS_LOG=$log"
           } >> "$GITHUB_ENV"
 
-      - name: cargo test -p hick-udp natively on FreeBSD
+      - name: cargo test -p hick-udp -p hick-compio natively on FreeBSD
         # Pinned to an immutable commit rather than the moving `v1`. This action
         # boots the VM, ships the tree into it, and decides whether the guest's
         # exit status ever reaches the runner — so the guest's own `set -eu`
@@ -336,7 +382,7 @@ jobs:
           copyback: true
           # The VM is a separate machine, so this job's `env:` block does not
           # reach it; these get there through this hand-off and nowhere else.
-          envs: "RUSTFLAGS RUST_BACKTRACE REQUIRED_TESTS REQUIRED_EVIDENCE REQUIRED_REACTOR_EVIDENCE HARNESS_LOG RUN_NONCE"
+          envs: "RUSTFLAGS RUST_BACKTRACE REQUIRED_TESTS REQUIRED_EVIDENCE REQUIRED_REACTOR_EVIDENCE REQUIRED_COMPIO_TESTS REQUIRED_COMPIO_EVIDENCE HARNESS_LOG RUN_NONCE"
           prepare: |
             pkg install -y rust
           run: |
@@ -356,7 +402,10 @@ jobs:
             required="$REQUIRED_TESTS"
             required_evidence="$REQUIRED_EVIDENCE"
             required_reactor_evidence="$REQUIRED_REACTOR_EVIDENCE"
-            unset RUN_NONCE HARNESS_LOG REQUIRED_TESTS REQUIRED_EVIDENCE REQUIRED_REACTOR_EVIDENCE
+            required_compio="$REQUIRED_COMPIO_TESTS"
+            required_compio_evidence="$REQUIRED_COMPIO_EVIDENCE"
+            unset RUN_NONCE HARNESS_LOG REQUIRED_TESTS REQUIRED_EVIDENCE \
+                  REQUIRED_REACTOR_EVIDENCE REQUIRED_COMPIO_TESTS REQUIRED_COMPIO_EVIDENCE
 
             freebsd-version
             rustc --version
@@ -419,6 +468,21 @@ jobs:
               exit 1
             fi
 
+            # `hick-compio`'s socket layer, APPENDED to the same log so the
+            # host-side check reads one file. Scoped to `socket::` rather than
+            # the whole crate: what can only execute here is the BSD IPv4 cmsg
+            # path, and the crate's loopback integration suites would add VM
+            # time and multicast-delivery flakiness without adding evidence for
+            # this capability. They run on the Linux/macOS/Windows legs of
+            # coverage.yml, where they are not cfg'd out.
+            compio_log=/var/tmp/hick-compio-harness.raw
+            cargo test -p hick-compio --all-features --no-run
+            if ! cargo test -p hick-compio --all-features --no-fail-fast socket:: -- --color never --nocapture --test-threads=1 >"$compio_log" 2>&1; then
+              cat "$compio_log"
+              exit 1
+            fi
+            cat "$compio_log" >> "$raw_log"
+
             # Cargo has exited. The shell — not the build — writes the nonce
             # line and assembles the log into the workspace for copyback.
             {
@@ -445,6 +509,18 @@ jobs:
             for t in $required_reactor_evidence; do
               if ! grep -Fqx "hick-reactor-evidence-complete: $t" "$final_log"; then
                 echo "::error::hick-reactor evidence test $t did not reach its completion marker on FreeBSD"
+                exit 1
+              fi
+            done
+            for t in $required_compio; do
+              if ! grep -Fqx "test $t ... ok" "$final_log"; then
+                echo "::error::hick-compio test $t did not run and pass on FreeBSD"
+                exit 1
+              fi
+            done
+            for t in $required_compio_evidence; do
+              if ! grep -Fqx "hick-compio-evidence-complete: $t" "$final_log"; then
+                echo "::error::hick-compio evidence test $t did not reach its completion marker on FreeBSD"
                 exit 1
               fi
             done
@@ -492,6 +568,14 @@ jobs:
             echo "::error::REQUIRED_REACTOR_EVIDENCE is empty; there is no evidence list to check."
             exit 1
           fi
+          if [ -z "${REQUIRED_COMPIO_TESTS// /}" ]; then
+            echo "::error::REQUIRED_COMPIO_TESTS is empty; there is no evidence list to check."
+            exit 1
+          fi
+          if [ -z "${REQUIRED_COMPIO_EVIDENCE// /}" ]; then
+            echo "::error::REQUIRED_COMPIO_EVIDENCE is empty; there is no evidence list to check."
+            exit 1
+          fi
 
           if grep -q '^test result: FAILED' "$HARNESS_LOG"; then
             echo "::error::a FreeBSD test binary reported failures."
@@ -529,14 +613,32 @@ jobs:
               missing=1
             fi
           done
+          # `hick-compio`'s halves of the same two checks. Its entries carry the
+          # full module path already, so the prefix is not spelled here.
+          # shellcheck disable=SC2086
+          for t in $REQUIRED_COMPIO_TESTS; do
+            if ! grep -Fqx "test $t ... ok" "$HARNESS_LOG"; then
+              echo "::error::hick-compio test $t did not run and pass on FreeBSD"
+              missing=1
+            fi
+          done
+          # shellcheck disable=SC2086
+          for t in $REQUIRED_COMPIO_EVIDENCE; do
+            if ! grep -Fqx "hick-compio-evidence-complete: $t" "$HARNESS_LOG"; then
+              echo "::error::hick-compio evidence test $t did not reach its completion marker on FreeBSD. It either failed, was skipped, or returned early before asserting — the four evidence items behind hick-compio's own has_ip_dstaddr_recvif are not established by this run, and no other job in this workspace can establish them."
+              missing=1
+            fi
+          done
           if [ "$missing" -ne 0 ]; then
             exit 1
           fi
           echo "FreeBSD executed every required cmsg test:"
           for t in $REQUIRED_TESTS; do echo "  ok  $t"; done
+          for t in $REQUIRED_COMPIO_TESTS; do echo "  ok  $t"; done
           echo "FreeBSD concluded every required evidence test:"
-          for t in $REQUIRED_EVIDENCE; do echo "  done  $t"; done
-          for t in $REQUIRED_REACTOR_EVIDENCE; do echo "  done  $t"; done
+          for t in $REQUIRED_EVIDENCE; do echo "  done  hick-udp $t"; done
+          for t in $REQUIRED_REACTOR_EVIDENCE; do echo "  done  hick-reactor $t"; done
+          for t in $REQUIRED_COMPIO_EVIDENCE; do echo "  done  hick-compio $t"; done
 
   # Bare-metal proof: the `no_std` + `alloc` engine (`hick-smoltcp`) and its
   # embassy driver (`hick-embassy`) must build for a real embedded target. A
