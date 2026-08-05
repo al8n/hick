@@ -386,14 +386,19 @@ impl RecvMeta {
   /// destination/interface cmsg for this datagram: no interface, no
   /// destination, and no `MSG_CTRUNC` to say our own buffer was at fault.
   ///
-  /// Both halves go at once because that is what happens on the PKTINFO paths —
-  /// the two facts ride on one cmsg, and `sbcreatecontrol` either allocates the
-  /// mbuf or skips the whole message. It is not the only reachable shape on the
-  /// BSD IPv4 path, where each fact has its own cmsg and its own allocation;
-  /// that half-and-half square is covered directly against the decoder in
-  /// `socket::unix`, which is where it can be built out of real cmsg bytes
-  /// rather than asserted into a meta. Test-only; production mints this in
-  /// `Socket::recv`.
+  /// Both halves go at once because on the PKTINFO paths they are two fields of
+  /// ONE cmsg, so its presence is decided once and neither field can go missing
+  /// alone. That is the payload SHAPE and not any kernel's failure mode — the
+  /// targets differ there and no shared mechanism may be appealed to. What each
+  /// one does is audited in `hick-onlink`'s module header and stated nowhere
+  /// else; see [`hick_udp::onlink::IfaceWitness::Declined`] for why that is one
+  /// place rather than several.
+  ///
+  /// It is not the only reachable shape on the BSD IPv4 path, where each fact
+  /// has its own cmsg and its own allocation; that half-and-half square is
+  /// covered directly against the decoder in `socket::unix`, which is where it
+  /// can be built out of real cmsg bytes rather than asserted into a meta.
+  /// Test-only; production mints this in `Socket::recv`.
   #[cfg(test)]
   pub(crate) const fn with_cmsg_declined(mut self) -> Self {
     self.destination = DestinationWitness::Declined;

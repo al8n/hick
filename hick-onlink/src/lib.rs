@@ -658,15 +658,56 @@ pub enum IfaceWitness {
   ///
   /// # Why it degrades — and why the two halves are SEPARATE values
   ///
-  /// On the single-`PKTINFO` paths — `IP_PKTINFO` on Linux/Android/Apple,
-  /// `IPV6_PKTINFO` everywhere — the interface and the destination are two
-  /// fields of ONE cmsg. `sbcreatecontrol` either allocates it or skips the
-  /// whole message, so the two absences arrive together, and refusing on this
-  /// half while degrading on that one would leave the degradation unreachable
-  /// there.
+  /// ## The coupling argument, which appeals to no kernel behaviour at all
   ///
-  /// **That is not the only wired shape, and this contract must not be read as
-  /// if it were.** BSD IPv4 uses `IP_RECVDSTADDR` + `IP_RECVIF`: TWO cmsgs built
+  /// A single `PKTINFO` cmsg carries both facts in ONE message: `in_pktinfo`
+  /// holds `ipi_addr` beside `ipi_ifindex`, `in6_pktinfo` holds `ipi6_addr`
+  /// beside `ipi6_ifindex`. Presence is therefore decided once — for the cmsg,
+  /// never per field — so a cmsg that is absent, or too short to read, cannot
+  /// take the interface while leaving the destination. **That is a property of
+  /// the payload SHAPE**, it holds whatever a target does when it cannot deliver
+  /// one, and it is the entire basis for not splitting the two absences on those
+  /// paths. Refusing on this half while degrading on that one would leave the
+  /// degradation unreachable there.
+  ///
+  /// ## There is no shared failure mechanism — do not appeal to one
+  ///
+  /// The targets behave differently when the cmsg cannot be delivered, so any
+  /// sentence resting on a common failure mode is wrong for at least one of
+  /// them. This doc has had two goes at that sentence: the first attributed
+  /// `sbcreatecontrol` allocate-or-skip to every target, and the second replaced
+  /// it with a per-target summary of the header's audit. The summary had drifted
+  /// from the audit in three of its four entries before the round that added it
+  /// was over — a family qualifier dropped here, a scope widened there — because
+  /// nothing but care was holding the two copies equal.
+  ///
+  /// **So this states no kernel behaviour at all, and the omission is the
+  /// point.** What a kernel can and cannot leave out is written down in exactly
+  /// one place: this module's header, under "Where `Declined` can actually
+  /// occur, read out of each kernel", with the reachability table above it. That
+  /// audit covers Linux/Android, Apple, the BSDs and Windows, per address family
+  /// wherever the families differ — which they do. Read it there. A summary here
+  /// would be a second statement of facts only the header establishes, kept true
+  /// by nothing a compiler checks, which is the arrangement that has now failed
+  /// twice in this file.
+  ///
+  /// None of it reaches the coupling argument above, which is why that argument
+  /// is stated over the payload shape and not over any kernel's behaviour.
+  ///
+  /// ## A cmsg that IS present and names no interface is a DIFFERENT case
+  ///
+  /// It must not be folded into the one above: nothing went missing, so the
+  /// coupling argument does not apply and is not needed. `ipi_ifindex = 0`
+  /// arrives with the destination witnessed out of the very same struct — live
+  /// on Linux IPv4 (`ipv4_pktinfo_prepare`'s `else` branch) and Apple IPv6 — so
+  /// only the link scoping is lost; see [`Self::from_reporting_path`]. A
+  /// NEGATIVE index is the same absence on the same terms; see
+  /// [`Self::from_reporting_path_signed`]. Both reach this variant, and neither
+  /// is an absent cmsg.
+  ///
+  /// ## BSD IPv4 is TWO cmsgs, and the shape invariant does not reach it
+  ///
+  /// BSD IPv4 uses `IP_RECVDSTADDR` + `IP_RECVIF`: TWO cmsgs built
   /// by two `sbcreatecontrol` calls, not two fields of one struct. An mbuf
   /// shortage can take either without the other, and NetBSD adds a deterministic
   /// form of the same split — `ip_savecontrol` emits `IP_RECVDSTADDR` before its
@@ -696,13 +737,14 @@ pub enum IfaceWitness {
   /// `bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was` pins the
   /// partial rows against real cmsg bytes.
   ///
-  /// Two different kernel events reach it, and the reachability table in this
-  /// module's header says which squares produce each: the cmsg missing entirely
-  /// (live on the BSD IPv6 square, where `sbcreatecontrol` is called `M_NOWAIT`
-  /// and its `NULL` return skipped without a flag, and on the BSD IPv4 pair per
-  /// the table above), and the cmsg present with a zero index (live on Linux
-  /// IPv4 and Apple IPv6 — see [`Self::from_reporting_path`]). The second keeps
-  /// its destination witness, so it loses only the link scoping.
+  /// ## Which squares produce which of the two events
+  ///
+  /// The two are the sections above — a cmsg MISSING, and a cmsg PRESENT that
+  /// names no interface — and the reachability table in this module's header
+  /// says which squares reach each. Absent is live on BSD IPv6 and on the BSD
+  /// IPv4 pair; present-with-no-interface is live on Linux IPv4 and Apple IPv6.
+  /// The header is the sourced version of both; this variant states what they
+  /// MEAN, not where they come from.
   Declined,
   /// This path cannot report interfaces by construction. Declared once per
   /// receive path.
