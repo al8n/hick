@@ -187,22 +187,46 @@ jobs:
         scan_dstaddr_recvif_skips_unrelated_cmsgs_and_recovers_both
         reports_rx_interface_v4_names_every_supported_target
         a_dstaddr_without_recvif_declines_the_interface_and_keeps_the_destination
-      # REQUIRED_EVIDENCE are the tests that touch a real socket, and they are the
-      # four numbered evidence items behind `has_ip_dstaddr_recvif` plus the pin
-      # on the production read-back's call site. Every unmet precondition in them
-      # is now FATAL rather than an early return, and each emits
-      # `hick-udp-evidence-complete: <name>` as its last statement, after every
-      # assertion. This job requires that MARKER and not the status line, so a
-      # test that returns without concluding cannot report success. (It is not a
-      # defence against a hostile branch, which could print the line directly —
-      # see the supply-chain note below for what this job does and does not
-      # establish.)
+      # REQUIRED_EVIDENCE and REQUIRED_REACTOR_EVIDENCE are the tests that touch a
+      # real socket. Every unmet precondition in them is FATAL rather than an
+      # early return, and each emits a `<crate>-evidence-complete: <name>` line as
+      # its last statement, after every assertion. This job requires that MARKER
+      # and not the status line, so a test that returns without concluding cannot
+      # report success. (It is not a defence against a hostile branch, which could
+      # print the line directly — see the supply-chain note below for what this
+      # job does and does not establish.)
+      #
+      # WHAT THESE LISTS ARE FOR, stated once, because the first list outgrew its
+      # original description. It began as "the four numbered evidence items behind
+      # `has_ip_dstaddr_recvif`", which is no longer what it holds. The real
+      # subject is broader and coherent: CLAIMS THAT ONLY A NATIVE BSD KERNEL CAN
+      # SETTLE. A cross-compile establishes that code builds for FreeBSD; it
+      # establishes nothing about what the kernel accepts at run time, and this
+      # is the one job in the workspace that can. Everything in either list is
+      # here because Linux, Apple and Windows would answer it differently or not
+      # at all — the `IP_RECVDSTADDR`/`IP_RECVIF` capability those four items
+      # rest on, and the `IP_MULTICAST_LOOP` value WIDTH, which is a one-byte
+      # `u_char` here and a four-byte `c_int` on every target that has a runner.
+      #
+      # REQUIRED_REACTOR_EVIDENCE is a second list rather than more names in the
+      # first because it is a different crate, a different cargo invocation and a
+      # different marker prefix. Both halves of the width question are wanted and
+      # they are not the same question: hick-udp's
+      # `std_set_multicast_loop_v4_is_accepted_by_this_kernel` asks whether STD's
+      # setter is right on this kernel, and hick-reactor's `control_abi_*` ask
+      # whether the loopback control's OWN option path is — a test next to the
+      # code proves nothing about the code, which is the defect that put the
+      # reactor entries here.
       REQUIRED_EVIDENCE: >-
         control_buffer_holds_every_cmsg_this_target_enables
         bsd_ipv4_bind_enables_the_receive_metadata_pair
         bsd_ipv4_recv_witnesses_the_group_and_a_unicast_destination
         bsd_ipv4_recv_witnesses_the_interface_that_carried_the_datagram
         try_bind_v4_rejects_a_half_enabled_socket_forced_through_production_wiring
+        std_set_multicast_loop_v4_is_accepted_by_this_kernel
+      REQUIRED_REACTOR_EVIDENCE: >-
+        control_abi_applies_ip_multicast_loop_at_this_target_s_width
+        control_abi_delivery_stage_runs_end_to_end_on_this_kernel
       # HARNESS_LOG and RUN_NONCE are deliberately NOT set here. They are minted
       # per run by the step below and published through $GITHUB_ENV, because a
       # value written in this file is a value a branch can predict.
@@ -311,7 +335,7 @@ jobs:
           copyback: true
           # The VM is a separate machine, so this job's `env:` block does not
           # reach it; these get there through this hand-off and nowhere else.
-          envs: "RUSTFLAGS RUST_BACKTRACE REQUIRED_TESTS REQUIRED_EVIDENCE HARNESS_LOG RUN_NONCE"
+          envs: "RUSTFLAGS RUST_BACKTRACE REQUIRED_TESTS REQUIRED_EVIDENCE REQUIRED_REACTOR_EVIDENCE HARNESS_LOG RUN_NONCE"
           prepare: |
             pkg install -y rust
           run: |
@@ -330,7 +354,8 @@ jobs:
             final_log="$HARNESS_LOG"
             required="$REQUIRED_TESTS"
             required_evidence="$REQUIRED_EVIDENCE"
-            unset RUN_NONCE HARNESS_LOG REQUIRED_TESTS REQUIRED_EVIDENCE
+            required_reactor_evidence="$REQUIRED_REACTOR_EVIDENCE"
+            unset RUN_NONCE HARNESS_LOG REQUIRED_TESTS REQUIRED_EVIDENCE REQUIRED_REACTOR_EVIDENCE
 
             freebsd-version
             rustc --version
@@ -369,6 +394,30 @@ jobs:
               exit 1
             fi
 
+            # The hick-reactor loopback control's OWN option path, on this
+            # kernel. Cross-compiling hick-reactor for FreeBSD says nothing about
+            # what the kernel accepts at run time, and `IP_MULTICAST_LOOP` is a
+            # one-byte u_char here against four bytes on every target that has a
+            # runner — so this is the only place the control's ABI is ever
+            # actually exercised. A test that called std directly instead of the
+            # control's own helper stayed green through a revert to socket2's
+            # four-byte value; these two go through `apply_control_multicast_options`
+            # and through `control_delivery` itself.
+            #
+            # DEFAULT FEATURES, not --all-features: the file is
+            # `#![cfg(feature = "tokio")]` and tokio is the default, so this
+            # keeps smol and the metrics graph out of a QEMU build.
+            #
+            # FILTERED to `control_abi_`. The other thirteen tests in this file
+            # bind :5353 and drive real multicast exchanges, which is a fair
+            # thing to ask of a CI runner and not of a nested VM; the completion
+            # markers below are what catch a rename out of this prefix.
+            cargo test -p hick-reactor --test loopback_lookup --no-run
+            if ! cargo test -p hick-reactor --test loopback_lookup --no-fail-fast -- --color never --nocapture --test-threads=1 control_abi_ >>"$raw_log" 2>&1; then
+              cat "$raw_log"
+              exit 1
+            fi
+
             # Cargo has exited. The shell — not the build — writes the nonce
             # line and assembles the log into the workspace for copyback.
             {
@@ -389,6 +438,12 @@ jobs:
             for t in $required_evidence; do
               if ! grep -Fqx "hick-udp-evidence-complete: $t" "$final_log"; then
                 echo "::error::hick-udp evidence test $t did not reach its completion marker on FreeBSD"
+                exit 1
+              fi
+            done
+            for t in $required_reactor_evidence; do
+              if ! grep -Fqx "hick-reactor-evidence-complete: $t" "$final_log"; then
+                echo "::error::hick-reactor evidence test $t did not reach its completion marker on FreeBSD"
                 exit 1
               fi
             done
@@ -432,6 +487,10 @@ jobs:
             echo "::error::REQUIRED_EVIDENCE is empty; there is no evidence list to check."
             exit 1
           fi
+          if [ -z "${REQUIRED_REACTOR_EVIDENCE// /}" ]; then
+            echo "::error::REQUIRED_REACTOR_EVIDENCE is empty; there is no evidence list to check."
+            exit 1
+          fi
 
           if grep -q '^test result: FAILED' "$HARNESS_LOG"; then
             echo "::error::a FreeBSD test binary reported failures."
@@ -458,7 +517,14 @@ jobs:
           # shellcheck disable=SC2086
           for t in $REQUIRED_EVIDENCE; do
             if ! grep -Fqx "hick-udp-evidence-complete: $t" "$HARNESS_LOG"; then
-              echo "::error::hick-udp evidence test $t did not reach its completion marker on FreeBSD. It either failed, was skipped, or returned early before asserting — the four evidence items behind has_ip_dstaddr_recvif are not established by this run."
+              echo "::error::hick-udp evidence test $t did not reach its completion marker on FreeBSD. It either failed, was skipped, or returned early before asserting — a claim only a native BSD kernel can settle is not established by this run."
+              missing=1
+            fi
+          done
+          # shellcheck disable=SC2086
+          for t in $REQUIRED_REACTOR_EVIDENCE; do
+            if ! grep -Fqx "hick-reactor-evidence-complete: $t" "$HARNESS_LOG"; then
+              echo "::error::hick-reactor evidence test $t did not reach its completion marker on FreeBSD. The loopback control's own option path is unproven on this kernel, which is the only kernel that can reject it."
               missing=1
             fi
           done
@@ -469,6 +535,7 @@ jobs:
           for t in $REQUIRED_TESTS; do echo "  ok  $t"; done
           echo "FreeBSD concluded every required evidence test:"
           for t in $REQUIRED_EVIDENCE; do echo "  done  $t"; done
+          for t in $REQUIRED_REACTOR_EVIDENCE; do echo "  done  $t"; done
 
   # Bare-metal proof: the `no_std` + `alloc` engine (`hick-smoltcp`) and its
   # embassy driver (`hick-embassy`) must build for a real embedded target. A
@@ -559,34 +626,67 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack
-      - run: cargo hack build -p mdns-proto --each-feature
-      - run: cargo hack test -p mdns-proto --each-feature
-      - run: cargo hack build -p hick-onlink --each-feature
-      - run: cargo hack test -p hick-onlink --each-feature
+      # Two flags for two different axes, and neither substitutes for the other.
+      #
+      # `--keep-going` is cargo-hack's own and belongs on EVERY step here, build
+      # included: without it cargo-hack stops at the first feature set that
+      # fails, so a change that breaks `--no-default-features` and the
+      # `no-atomic` tier differently is reported as one break under
+      # `--all-features` — which defeats the whole reason `--each-feature` is
+      # here. Verified on hick-trace with one always-failing test: 1 of 6 feature
+      # sets ran without it, all 6 with it.
+      #
+      # `--no-fail-fast` is NOT cargo-hack's: it is forwarded verbatim into every
+      # per-feature-set `cargo test` cargo-hack spawns (cargo-hack 0.6.39 echoes
+      # "running cargo test --no-fail-fast ... (1/6)"), so it works INSIDE one
+      # feature set, making it report all of its failing test targets instead of
+      # stopping at the first. It is therefore on the `test` steps only; a
+      # `build` step has nothing for it to enumerate.
+      - run: cargo hack build -p mdns-proto --each-feature --keep-going
+      - run: cargo hack test -p mdns-proto --each-feature --keep-going --no-fail-fast
+      - run: cargo hack build -p hick-onlink --each-feature --keep-going
+      - run: cargo hack test -p hick-onlink --each-feature --keep-going --no-fail-fast
 
   # Exercise the tracing + stats feature legs in tests so the counters and
   # subscriber wiring are verified on every CI run.
+  #
+  # `--no-fail-fast` on every `cargo test` step below. `cargo test` is fail-fast
+  # ACROSS TEST TARGETS, not just within one: without the flag a failing `--lib`
+  # run means the crate's integration tests and doctests never execute at all,
+  # so a change that broke several of mdns-proto's nine targets (lib, seven
+  # integration tests, doctests) is reported as one. Measured, with a failing
+  # test injected into `src/transmit/tests.rs`
+  # and another into `tests/conformance.rs`: `cargo test -p mdns-proto
+  # --all-features` reports the `--lib` failure and stops; with the flag it
+  # reports both and ends with `error: 2 targets failed`. It changes nothing
+  # about a green run and does not swallow the failure — the exit status is
+  # still 101 (that would be `--ignore-run-fail`, which must never appear here).
+  #
+  # It cannot reach ACROSS the steps of this job: GitHub stops a job at the
+  # first failing step, so a red `-p mdns-proto` step still hides the
+  # `-p hick-mio` one below it. Only a single workspace-wide invocation could
+  # close that, and this job is deliberately per-crate.
   test-observability:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p mdns-proto --features tracing,stats
-      - run: cargo test -p mdns-proto --all-features
-      - run: cargo test -p hick-reactor --features stats
+      - run: cargo test -p mdns-proto --features tracing,stats --no-fail-fast
+      - run: cargo test -p mdns-proto --all-features --no-fail-fast
+      - run: cargo test -p hick-reactor --features stats --no-fail-fast
       # A metrics-only build must compile the stats code (metrics
       # implies stats).  If the implication is missing, `metrics` links the
       # backend but constructs no Stats objects and emits nothing.
       - run: cargo build -p mdns-proto --features metrics
       - run: cargo build -p hick-reactor --features metrics
       # Verify the hick-trace no-op tests run clean (default = no tracing).
-      - run: cargo test -p hick-trace
+      - run: cargo test -p hick-trace --no-fail-fast
       # hick-mio: `stats` is the only public window into queries_active /
       # packets_rx, and 3 of its 5 loopback integration tests are compiled only
       # under that feature (`#[cfg(feature = "stats")]` on the `#[test]`
       # itself) — a default-feature run would silently skip them, not fail.
-      - run: cargo test -p hick-mio --features stats
+      - run: cargo test -p hick-mio --features stats --no-fail-fast
       - run: cargo build -p hick-mio --features metrics
       # The maximal leg for both socket-layer crates. Every feature either owns
       # has is an observability one (`tracing` / `metrics` / `stats`), so
@@ -605,8 +705,8 @@ jobs:
       # Nothing beyond an ordinary unprivileged runner is needed either — binding
       # UDP 5353 on `lo` and joining 224.0.0.251 takes no capability the
       # `--test loopback` step above does not already rely on.
-      - run: cargo test -p hick-mio --all-features
-      - run: cargo test -p hick-udp --all-features
+      - run: cargo test -p hick-mio --all-features --no-fail-fast
+      - run: cargo test -p hick-udp --all-features --no-fail-fast
       # Anti-flake gate for hick-mio's loopback integration tests
       # (hick-mio/tests/loopback.rs). They are deliberately designed to
       # self-skip — print a `skipping:` line and return early — on a host that
@@ -621,6 +721,12 @@ jobs:
       # are printed) for a passing test unless asked not to. `note:` lines (the
       # IPv4-only degradation a host with no bindable IPv6 falls back to) are
       # deliberately NOT matched — they weaken no assertion.
+      #
+      # No `--no-fail-fast` here, and that is a decision rather than an
+      # oversight: `--test loopback` selects exactly ONE test target, and
+      # cargo's fail-fast is across targets. libtest already runs every test in
+      # the binary it was given and reports all of their failures, so the flag
+      # would change nothing about what this step prints.
       - name: hick-mio loopback tests must not silently self-skip on Linux
         run: |
           # MANDATORY. GitHub's implicit shell is `bash -e {0}`, NOT
@@ -648,9 +754,17 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
       - run: cargo miri setup
+      # `--no-fail-fast` for the reason every other test step here has it, and
+      # this is the step where the evidence is hardest to come by: `cargo miri
+      # test -p mdns-proto` selects the library plus seven integration binaries,
+      # and without the flag the first one to report undefined behaviour or a
+      # strict-provenance violation hides whatever the other seven would have
+      # found. Miri costs more per run than the rest of CI, which is an argument
+      # for learning everything a red run has to teach on the first attempt
+      # rather than serialising the fixes one binary at a time.
       - env:
           MIRIFLAGS: -Zmiri-strict-provenance
-        run: cargo miri test -p mdns-proto --all-features
+        run: cargo miri test -p mdns-proto --all-features --no-fail-fast
 
   bloat-panic-scan:
     runs-on: ubuntu-latest

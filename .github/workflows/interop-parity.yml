@@ -45,6 +45,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Bonjour (mDNSResponder) is built in on macOS; nothing to install. hick
       # and the daemon coexist on :5353 via SO_REUSEPORT.
+      #
+      # Neither parity step takes `--no-fail-fast`, and that is a decision:
+      # `--test parity_bonjour` / `--test parity_avahi` each select exactly ONE
+      # test target, and cargo's fail-fast is ACROSS targets. libtest already
+      # runs every test in the binary it was handed and reports all of their
+      # failures, so the flag would change nothing here. Compare ci.yml's
+      # per-crate steps, where it does change what is reported.
       - name: hick <-> Bonjour (dns-sd) interop
         run: |
           for attempt in 1 2; do
