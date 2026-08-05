@@ -28,10 +28,49 @@ use crate::{
 #[derive(Clone)]
 pub struct Endpoint {
   cmd: Sender<Command>,
+  /// Shared receive-health flags, written by the per-family receive tasks.
+  ///
+  /// NOT feature-gated, deliberately: see [`crate::DeafFamilies`] for why a
+  /// signal a Cargo feature can delete is not a signal.
+  recv_health: std::sync::Arc<crate::driver::RecvHealth>,
   /// Shared stats handle cloned from the driver's proto endpoint. Present
   /// only when the `stats` Cargo feature is enabled.
   #[cfg(feature = "stats")]
   stats: std::sync::Arc<stats::Stats>,
+}
+
+/// Ask Winsock, at construction, whether it can supply `WSARecvMsg` for THIS
+/// socket.
+///
+/// # Why the answer is discarded here and resolved again in the receive task
+///
+/// `hick_udp::resolve_recv_with_meta` issues a real `WSAIoctl` for the socket it
+/// is handed, every time, and returns a handle carrying both the pointer and
+/// that socket. The receive task resolves its own handle for the same socket and
+/// receives through it, so the pointer verified and the pointer used are the
+/// same provider's — which is the property that matters, and which a
+/// process-wide cache could not offer: Winsock extension pointers are
+/// provider-specific and are invoked directly, so one cached globally could
+/// certify a socket it had never examined.
+///
+/// What this call buys on top of the task's own resolution is WHEN the failure
+/// lands. A provider that cannot supply the extension is a permanent property of
+/// the stack, so it should fail `Endpoint::server` rather than reach a receive
+/// loop — where the resolution would sit between peeking a datagram and
+/// consuming one, leaving the datagram queued while every retry rediscovered the
+/// same gap.
+///
+/// A no-op everywhere else: no other target resolves anything to receive.
+#[inline]
+fn verify_recv_capability(sock: &std::net::UdpSocket) -> Result<(), ServerError> {
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::AsSocket;
+    hick_udp::resolve_recv_with_meta(sock.as_socket()).map_err(ServerError::Io)?;
+  }
+  #[cfg(not(windows))]
+  let _ = sock;
+  Ok(())
 }
 
 impl Endpoint {
@@ -89,6 +128,7 @@ impl Endpoint {
             }
           }
           std_sock.set_nonblocking(true)?;
+          verify_recv_capability(&std_sock)?;
           let async_sock = N::UdpSocket::try_from(std_sock).map_err(ServerError::WrapSocket)?;
           Some(async_sock)
         }
@@ -115,6 +155,7 @@ impl Endpoint {
             }
           }
           std_sock.set_nonblocking(true)?;
+          verify_recv_capability(&std_sock)?;
           let async_sock = N::UdpSocket::try_from(std_sock).map_err(ServerError::WrapSocket)?;
           Some(async_sock)
         }
@@ -140,7 +181,7 @@ impl Endpoint {
     };
     #[cfg(feature = "stats")]
     let mut stats_slot: Option<std::sync::Arc<stats::Stats>> = None;
-    driver::spawn::<N>(
+    let recv_health = driver::spawn::<N>(
       opts,
       sockets,
       cmd_rx,
@@ -150,9 +191,34 @@ impl Endpoint {
 
     Ok(Self {
       cmd: cmd_tx,
+      recv_health,
       #[cfg(feature = "stats")]
       stats: stats_slot.expect("spawn always populates stats_slot when stats feature is enabled"),
     })
+  }
+
+  /// Which address families have stopped receiving.
+  ///
+  /// # The one degradation signal that no Cargo feature can delete
+  ///
+  /// Each address family is served by its own detached receive task. A task
+  /// that gives up — a socket the kernel will never read again, or a transient
+  /// condition that has outlasted
+  /// `DEAF_AFTER_CONSECUTIVE_TRANSIENT_RECV_ERRORS` — leaves the rest of the
+  /// endpoint working: commands are still answered, sends still go out, and the
+  /// other family still receives. Without this there is no way to tell that
+  /// apart from a quiet link.
+  ///
+  /// It is a plain value rather than a log line or a counter because the first
+  /// attempt at this WAS a log line and a counter, and both compile to nothing
+  /// under this crate's default features (`tracing` and `stats` are opt-in).
+  ///
+  /// A family reported deaf by the transient budget clears itself on the next
+  /// successful receive, so this is a live reading and not a latch. One that
+  /// failed permanently does not: rebuild the endpoint.
+  #[inline]
+  pub fn deaf_families(&self) -> crate::DeafFamilies {
+    self.recv_health.snapshot()
   }
 
   /// Return a point-in-time snapshot of the I/O + protocol counters for this
