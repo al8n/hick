@@ -532,6 +532,24 @@ jobs:
           RUSTDOCFLAGS: -D warnings --cfg docsrs
         run: cargo doc --workspace --all-features --no-deps
 
+  # Re-run the RFC 6762 §11 mutation probes. Each one applies a defect this gate
+  # actually had — or was argued into having — and requires the ONE named
+  # assertion to fail. The set lived in review transcripts until it was written
+  # down, which made it indistinguishable from a set that never existed; a probe
+  # nobody runs decays back into that within a release. It is ~20 seconds
+  # against a dependency-free crate.
+  #
+  # A failure here is a finding in one of three directions, and the runner says
+  # which: the anchor moved (re-aim the probe), the mutation stopped compiling,
+  # or the assertion stopped catching the defect.
+  onlink-probes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ./hick-onlink/probes/mutations.py
+
   hack:
     runs-on: ubuntu-latest
     steps:
@@ -543,6 +561,8 @@ jobs:
           tool: cargo-hack
       - run: cargo hack build -p mdns-proto --each-feature
       - run: cargo hack test -p mdns-proto --each-feature
+      - run: cargo hack build -p hick-onlink --each-feature
+      - run: cargo hack test -p hick-onlink --each-feature
 
   # Exercise the tracing + stats feature legs in tests so the counters and
   # subscriber wiring are verified on every CI run.

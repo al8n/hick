@@ -76,6 +76,29 @@ per-platform capability table, and what each residual costs.
 
 [`Verdict`]: https://docs.rs/hick-onlink/latest/hick_onlink/enum.Verdict.html
 
+## Verifying the gate
+
+The tests are one half of the evidence; the other half is that each of them
+still catches the defect it was written for. `probes/mutations.py` applies
+sixteen mutations — every one a defect this gate actually had, or was argued
+into having — and requires the ONE named assertion to fail for each:
+
+```console
+$ ./hick-onlink/probes/mutations.py
+pristine tree: running the whole hick-onlink suite ...
+pristine tree: green
+
+[1/16] link-gate-precedes-the-group-arm ... caught by a_group_destination_does_not_excuse_a_foreign_interface_or_scope
+[2/16] scope-id-is-a-second-link-witness ... caught by a_conflicting_scope_rejects_whatever_the_index_says
+...
+16/16 probes caught
+```
+
+`--list` prints the table and what each probe is about without building
+anything. A failure is a finding, and the runner says which of three it is: the
+anchor moved (re-aim the probe), the mutation no longer compiles, or the
+assertion stopped catching the defect. CI runs it on every push.
+
 #### License
 
 `hick-onlink` is under the terms of both the MIT license and the Apache License
