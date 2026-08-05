@@ -193,14 +193,23 @@ pub(crate) fn set_recv_pktinfo_v4(_sock: &UdpSocket) -> std::io::Result<()> {
 ///
 /// # Both, or neither, and the bind fails
 ///
-/// NOT best-effort, for the reason `set_recv_pktinfo_v4`'s call site gives: on a
-/// target `reports_rx_interface_v4` calls capable, a receiver is entitled to
-/// read a missing witness as evidence and act on it, so an enable that failed
-/// silently would be deafness rather than degradation. `?` on the first also
-/// means a socket never ends up with the destination enabled and the interface
-/// not: the two are separate `setsockopt` calls but one capability, and a
-/// half-enabled socket would witness destinations while reporting every
-/// interface as `Declined`.
+/// NOT best-effort, and not for the intuitive reason: an enable that failed
+/// silently would NOT make the socket deaf. A missing, non-truncated cmsg is
+/// `Declined`, and `hick_onlink::admits_ingress` passes `Declined` exactly as it
+/// passes `Blind`. What it costs is a REFUSAL, quietly and for the life of the
+/// socket, and which refusal depends on which option went missing — because
+/// these are two cmsgs and not one `IP_PKTINFO`:
+///
+/// * without `IP_RECVDSTADDR` the destination partition is gone
+///   (`Refuse::ForeignGroup`, `BroadcastAddressed`, `DestinationNotHeld`, …)
+///   while `Refuse::ForeignLink` still refuses on the interface index;
+/// * without `IP_RECVIF` the interface index is `Declined`, so `ForeignLink` is
+///   unreachable for IPv4, while every destination refusal still fires.
+///
+/// `?` on the first is what keeps this crate from CREATING that state: the two
+/// are separate `setsockopt` calls but one capability, and the read-back in
+/// `crate::multicast::verify_rx_dstaddr_recvif_v4` catches the case a kernel
+/// creates by accepting both calls and honouring one.
 ///
 /// rustix has no setter for either option (see the module docs).
 #[cfg(has_ip_dstaddr_recvif)]

@@ -1469,7 +1469,6 @@ fn control_buffer_holds_every_cmsg_this_target_enables() {
 /// line directly, exactly as it could hollow out the assertions above it. It
 /// closes the accidental case: an unmet precondition, a silently skipped body,
 /// a test renamed out of the required list. See `ci.yml`'s `freebsd` job.
-#[cfg(has_ip_dstaddr_recvif)]
 fn evidence_complete(test: &str) {
   // The LEADING NEWLINE is load-bearing. Under `--nocapture` libtest writes
   // `test <name> ... ` to stdout without a newline, runs the test, then writes
@@ -2023,4 +2022,51 @@ fn try_bind_v4_rejects_a_half_enabled_socket_forced_through_production_wiring() 
      option that was disabled"
   );
   evidence_complete("try_bind_v4_rejects_a_half_enabled_socket_forced_through_production_wiring");
+}
+
+/// `IP_MULTICAST_LOOP` is a one-byte `u_char` on this kernel and a four-byte
+/// `c_int` on Linux, Apple and Windows, and the ONLY native BSD execution in
+/// this workspace runs here — so this is where the setter's ABI is put in front
+/// of a real BSD kernel rather than argued about.
+///
+/// # Why a test about `std` lives in this crate
+///
+/// The fact under test is neither crate's: it is whether
+/// `std::net::UdpSocket::set_multicast_loop_v4` sizes the option the way THIS
+/// kernel demands. `hick-reactor`'s loopback control depends on that answer —
+/// its `std_sets_ip_multicast_loop_at_this_target_s_width` makes the same call —
+/// but no BSD runs `hick-reactor`'s tests anywhere in CI, so its copy can only
+/// establish the Linux/Apple/Windows half, where a wrong width is accepted and
+/// proves nothing. `ci.yml`'s `freebsd` job names this test in
+/// `REQUIRED_EVIDENCE`, so the BSD half is executed per run.
+///
+/// It is deliberately NOT a size assertion. `size_of::<c_uchar>() != size_of::<c_int>()`
+/// is true on every target and would have passed while socket2 0.6.5 —
+/// `loop_v4 as c_int`, unconditionally — was the setter in that control. Only
+/// the syscall itself distinguishes them, and only on a kernel that cares.
+///
+/// An ephemeral port, not `:5353`: this establishes an option's ABI and needs no
+/// particular port, and staying off 5353 keeps it clear of the reuse-group
+/// lottery documented on `bind_ephemeral_with_rx_metadata`.
+#[test]
+fn std_set_multicast_loop_v4_is_accepted_by_this_kernel() {
+  let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect(
+    "binding an ephemeral UDP socket must succeed: this IS the evidence, so a bind that did \
+     not happen is a failure and never a skip",
+  );
+  sock.set_multicast_loop_v4(true).expect(
+    "std::net::UdpSocket::set_multicast_loop_v4 must be accepted by this kernel. EINVAL here \
+     is the four-byte-value defect: IP_MULTICAST_LOOP is a one-byte u_char on FreeBSD, \
+     DragonFly, OpenBSD and NetBSD, and a setter that hardcodes c_int — socket2 0.6.5 does — \
+     is rejected outright",
+  );
+  assert!(
+    sock
+      .multicast_loop_v4()
+      .expect("reading IP_MULTICAST_LOOP back must succeed"),
+    "the kernel accepted the enable and then reported the option off; a setsockopt that takes \
+     the call without holding the value is the exact false success this crate's other \
+     read-backs exist for"
+  );
+  evidence_complete("std_set_multicast_loop_v4_is_accepted_by_this_kernel");
 }
