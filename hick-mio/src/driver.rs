@@ -635,6 +635,14 @@ impl Mdns {
       // `Multicast` admits any group from any source; and every other target
       // binds neither flag, so a broadcast is still admitted there for an
       // in-prefix source.
+      //
+      // A `Declined` INTERFACE witness beside a witnessed destination is a
+      // different square and is NOT this fallback: the destination is still read
+      // and every class it names is still refused. What such a datagram loses is
+      // §11 arm one's "regardless of source IP address" exemption, which
+      // `admits_ingress` grants only to a datagram something scoped to the bound
+      // link — see `Admit::UnscopedMdnsGroup`. Nothing here has to enforce that:
+      // the rule is stated over the witness pair this driver already hands in.
       let iface_witness = sockets.rx_iface_witness(&meta);
       let destination = sockets.rx_destination_witness(&meta);
       let peer = sockets.rx_peer(&meta);
@@ -673,6 +681,16 @@ impl Mdns {
         }
         if verdict.is_residual_refusal() {
           stats.ingress_residual_refusals(1);
+        }
+        // The two sides of §11 arm one's link scoping. The refusal is the one to
+        // alert on: it is a datagram §11 says to admit, dropped because nothing
+        // established which link it arrived on — which every BSD produces under
+        // the mbuf shortage a flood causes.
+        if verdict.is_unscoped_group_admit() {
+          stats.ingress_unscoped_group_admits(1);
+        }
+        if verdict.is_unscoped_group_refusal() {
+          stats.ingress_unscoped_group_refusals(1);
         }
       }
       #[cfg(test)]
