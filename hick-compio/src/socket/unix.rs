@@ -561,35 +561,29 @@ fn decode_bsd_ipv4_dstaddr_recvif(ctrl: &[u8], meta: &mut RecvMeta) {
   if let IfaceWitness::Witnessed(idx) = parsed.iface_witness() {
     meta.iface = IfaceWitness::Witnessed(idx);
   }
-  // THE DESTINATION HALF IS PROMOTED ONLY WITH THE INTERFACE HALF BESIDE IT,
-  // and that is a rule about a PRIVILEGE, not a coupling assumption about the
-  // two cmsgs.
+  // THE DESTINATION HALF IS PROMOTED THE SAME WAY, and on its own account: the
+  // two cmsgs are decoded independently and each is taken whether or not the
+  // other arrived.
   //
-  // §11's arm one admits a datagram to the mDNS group "regardless of source IP
-  // address". Scoping that to the link this endpoint bound is this workspace's
-  // own addition, and it is the only thing between arm one and "any host
-  // anywhere may write to our cache" — so it is what makes the exemption safe
-  // to grant at all. That scoping needs the interface half.
+  // An earlier version of this function took the destination only WITH the
+  // interface beside it, to keep §11 arm one's "regardless of source IP address"
+  // exemption from being granted to a datagram nothing scoped to the bound link.
+  // The goal was right and the mechanism was wrong: gating the PROMOTION erases
+  // the address, and the address is what every NEGATIVE class is decided by.
+  // Dropped here, a foreign multicast group stopped being refused as
+  // `ForeignGroup` and fell to the coarse arms — admitted outright by `MSG_MCAST`
+  // on OpenBSD/NetBSD, and admitted for any in-prefix sender on
+  // FreeBSD/DragonFly. Withholding a privilege by destroying the evidence it
+  // rests on gives away everything else that evidence was refusing.
   //
-  // A destination witnessed WITHOUT it buys an unconditional admit backed by
-  // nothing. `arrived_on_bound_interface` PERMITS `Declined` — a deliberate
-  // availability invariant, tested as `Declined` deciding exactly as `Blind` —
-  // so the group arm would admit a datagram that no longer has to have arrived
-  // on our link. Under the ancillary-mbuf pressure a flood causes, that is a
-  // group packet from another NIC entering the cache and §9 conflict handling
-  // with no proof of provenance; and on FreeBSD/DragonFly, which bind no
-  // `MSG_MCAST`, it would be strictly WIDER than not decoding the pair at all,
-  // because without a destination the datagram reaches the source-prefix rule
-  // and an off-prefix sender is refused there.
-  //
-  // So an incomplete pair reports the destination as the absence the kernel
-  // actually produced, routing the datagram to exactly the rule it took before
-  // this pair was wired. Nothing is assumed about the two cmsgs arriving
-  // together: they are still decoded independently, and the interface half
-  // above is taken whether or not the destination arrived.
-  if let (DestinationWitness::Witnessed(dst), IfaceWitness::Witnessed(_)) =
-    (parsed.destination_witness(), parsed.iface_witness())
-  {
+  // The rule now lives where both witnesses already meet:
+  // `hick_onlink::admits_ingress` withholds the exemption from a datagram
+  // nothing scoped and hands it §11's source arm, while every negative arm keeps
+  // reading the address. It is stated over the WITNESS PAIR rather than over a
+  // cmsg shape, so it also covers the `IP_PKTINFO` square below — one cmsg, one
+  // zero `ipi_ifindex`, the same pair — which a rule written here could not
+  // reach and did not.
+  if let DestinationWitness::Witnessed(dst) = parsed.destination_witness() {
     meta.destination = DestinationWitness::Witnessed(dst);
   }
 }
@@ -1488,19 +1482,23 @@ fn bsd_ipv4_decode_recovers_both_witnesses_from_a_synthesized_pair() {
 /// The two cmsgs are separately allocated by `sbcreatecontrol`, so either can
 /// arrive without the other, and the reason differs per row:
 ///
-/// # The PRIVILEGE rule, and why two rows below are not what the parser said
+/// # Each half is promoted ALONE, and the privilege rule is not here
 ///
-/// A destination is promoted only when the interface half arrived beside it.
-/// §11 arm one admits a group datagram "regardless of source IP address", and
-/// the only thing making that safe is this workspace's scoping of it to the
-/// bound link — which needs the interface. `arrived_on_bound_interface` PERMITS
-/// `Declined` (a deliberate availability invariant, tested as `Declined`
-/// deciding exactly as `Blind`), so a lone destination would take arm one with
-/// nothing proving the datagram reached us on our own link. On FreeBSD and
-/// DragonFly, which bind no `MSG_MCAST`, that was strictly WIDER than not
-/// decoding the pair at all. See `decode_bsd_ipv4_dstaddr_recvif`.
+/// A version of this decode promoted the destination only when the interface
+/// half arrived beside it, to keep §11 arm one's "regardless of source IP
+/// address" exemption from a datagram nothing scoped to the bound link. The rule
+/// was right; enforcing it by dropping the address was not. The address is what
+/// every NEGATIVE class is decided by, so dropping it stopped a foreign group
+/// being refused AS a foreign group and reopened the broadcast class beside it.
 ///
-/// The interface half is still promoted alone: it can only refuse.
+/// The rule now lives in `hick_onlink::admits_ingress`, over the witness PAIR
+/// both halves reach anyway: an unscoped datagram loses arm one and takes §11's
+/// source arm, and keeps every refusal the destination earns. That also covers
+/// the `IP_PKTINFO` square, which is one cmsg and can carry the same pair — a
+/// rule written at this decoder never could.
+///
+/// So both halves are promoted alone here, and the rows below say what the
+/// PARSER recovered, which is now also what the meta carries.
 ///
 /// * NOT truncated, `IP_RECVDSTADDR` only — NetBSD's documented psref square.
 ///   `ip_savecontrol` emits `IP_RECVDSTADDR` before its
@@ -1571,19 +1569,16 @@ fn bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was() {
       false,
       true,
       false,
-      // NOT `witnessed_dst`, and this row is the security fix. Promoting the
-      // destination here bought §11 arm one's unconditional admit — "regardless
-      // of source IP address" — on a datagram with NO link proof, because
-      // `arrived_on_bound_interface` permits `Declined`. On FreeBSD/DragonFly
-      // that was strictly WIDER than main, where an absent destination sent the
-      // same packet to the source-prefix rule and an off-prefix sender was
-      // refused. The pair is incomplete, so the destination stays the absence
-      // the kernel produced and the datagram takes that same source rule.
-      DestinationWitness::Declined,
+      // The kernel gave us this address and the meta carries it. It buys LESS
+      // than a paired one — `admits_ingress` withholds §11 arm one's source
+      // exemption from a datagram nothing scoped to the bound link — but it is
+      // still what every negative class is decided by, and an earlier version of
+      // this decode dropped it here and lost those refusals with it. What a
+      // witness buys is the gate's question; what arrived is this function's.
+      witnessed_dst,
       IfaceWitness::Declined,
-      "no truncation, destination only: the group arm's unconditional admit \
-       needs the link proof this datagram does not have, so the destination is \
-       NOT promoted and the source rule decides",
+      "no truncation, destination only: the address the kernel produced is \
+       carried, and the gate decides what it is worth without it",
     ),
     (
       false,
@@ -1598,15 +1593,17 @@ fn bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was() {
       true,
       true,
       false,
-      // Same privilege rule as the non-truncated row above: no interface half,
-      // no promoted destination. `Lost` rather than `Declined` because our own
-      // buffer is what lost it, and `arrived_on_bound_interface` refuses on
-      // `Lost` — so this row refuses on the interface half whichever way the
-      // destination is spelled, and the spelling still has to be honest.
-      DestinationWitness::Lost,
+      // The destination is promoted under truncation too: a partially copied
+      // cmsg is short and cannot present as `Witnessed`, so this address really
+      // did arrive whole. The MISSING half is `Lost` rather than `Declined`
+      // because our own buffer is what lost it, and `arrived_on_bound_interface`
+      // REFUSES on `Lost` — so this row refuses on the interface half, and the
+      // destination it refuses with is honest about having been there.
+      witnessed_dst,
       IfaceWitness::Lost,
       "TRUNCATED, destination only: the missing interface is OUR buffer's \
-       failure and REFUSES; the destination is not promoted without it either",
+       failure and REFUSES, and the destination that did arrive is still \
+       carried",
     ),
     (
       true,
@@ -1662,8 +1659,12 @@ fn bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was() {
     //
     // Asserting the witnesses alone would not have caught the defect this test
     // was rewritten for: `Witnessed(group)` + `Declined` looks perfectly
-    // reasonable as a pair of values, and is an unconditional admit with no
-    // link proof once `admits_ingress` sees it.
+    // reasonable as a pair of values, and it once WAS an unconditional admit
+    // with no link proof. What decides it is `admits_ingress`, which withholds
+    // §11 arm one's source exemption from a datagram nothing scoped — so this
+    // assertion is about the pair this decoder hands over, not about a rule this
+    // crate implements. It must keep passing whether the rule lives here or
+    // there, and it now lives there.
     let local_addrs = [(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 24u8)];
     let bound = hick_udp::onlink::BoundLink::new(u32::from(iface_index), false, &local_addrs);
     let off_prefix: SocketAddr = ([203, 0, 113, 9], 5353).into();
