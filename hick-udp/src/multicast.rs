@@ -947,13 +947,50 @@ fn scan_dstaddr_recvif(
 /// present. Recovering one without the other is reported, not discarded: the
 /// destination and the interface answer different RFC 6762 §11 questions, and a
 /// caller that got one of them is better off than a caller that got neither.
+///
+/// # A lone destination is reported, and it buys less than a paired one
+///
+/// The square where this cmsg arrives and `IP_RECVIF` does not is real, and what
+/// it costs is decided at the GATE rather than here. `hick_onlink::admits_ingress`
+/// withholds §11 arm one's *"regardless of source IP address"* exemption from any
+/// datagram nothing scoped to the bound link — the exemption is the one admission
+/// in that rule which weighs nothing about the datagram's origin, so it is the
+/// one that needs the link to have been named — and hands it §11's source arm
+/// instead. Every NEGATIVE class still reads this address: a foreign group, a
+/// broadcast or a martian is refused by name whether or not the interface half
+/// arrived.
+///
+/// So no receive path has to encode that rule, and none may pre-empt it by
+/// rewriting the witness: the rule is over the PAIR, both halves reach the gate,
+/// and a path that erased the address to withhold the privilege would take the
+/// classification with it. Report what the kernel produced.
 #[cfg(has_ip_dstaddr_recvif)]
 pub fn parse_dstaddr_recvif_v4(
   cmsgs: &[u8],
   len: usize,
   peer: SocketAddr,
 ) -> Result<RecvMeta, ParseRecvMetaError> {
-  let (destination, iface) = scan_dstaddr_recvif(cmsgs, libc::IP_RECVDSTADDR, libc::IP_RECVIF);
+  dstaddr_recvif_meta(cmsgs, libc::IP_RECVDSTADDR, libc::IP_RECVIF, len, peer)
+}
+
+/// [`parse_dstaddr_recvif_v4`] with the two cmsg type numbers as parameters,
+/// for the same reason [`scan_dstaddr_recvif`] takes them: the numbers are the
+/// one thing `libc` answers per target, and everything built on top of them —
+/// here, the mapping from a recovered half onto a typed witness — is then
+/// testable on every host rather than only on a BSD nobody can run.
+///
+/// A test that reassembled this mapping itself would be testing its own copy;
+/// the square this exists to pin lives in what a CONSUMER does with the pair, so
+/// the pair has to be minted by the production path.
+#[cfg(all(unix, any(has_ip_dstaddr_recvif, test)))]
+fn dstaddr_recvif_meta(
+  cmsgs: &[u8],
+  dstaddr_ty: libc::c_int,
+  recvif_ty: libc::c_int,
+  len: usize,
+  peer: SocketAddr,
+) -> Result<RecvMeta, ParseRecvMetaError> {
+  let (destination, iface) = scan_dstaddr_recvif(cmsgs, dstaddr_ty, recvif_ty);
   if destination.is_none() && iface.is_none() {
     return Err(ParseRecvMetaError::MissingPktinfo);
   }
@@ -1402,6 +1439,15 @@ pub fn recv_with_meta(
     }
     #[cfg(has_ip_dstaddr_recvif)]
     {
+      // Both halves are reported exactly as the kernel produced them, including
+      // a destination with no interface beside it: the BSD pair is TWO
+      // separately-allocated cmsgs and that square is real. What such a pair may
+      // BUY is not decided here — `hick_onlink::admits_ingress` withholds §11
+      // arm one's source exemption from any datagram nothing scoped to the bound
+      // link, over the witness pair rather than over any cmsg shape, and it
+      // still reads the destination for every negative class. A receive path
+      // that pre-empted that by rewriting the witness would erase the address
+      // along with the privilege.
       parse_dstaddr_recvif_v4(control_slice, n, peer)
     }
     #[cfg(not(any(has_ip_pktinfo, has_ip_dstaddr_recvif)))]

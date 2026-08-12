@@ -1366,6 +1366,16 @@ impl State {
       if verdict.is_residual_refusal() {
         self.stats.ingress_residual_refusals(1);
       }
+      // The two sides of §11 arm one's link scoping. The refusal is the one to
+      // alert on: it is a datagram §11 says to admit, dropped because nothing
+      // established which link it arrived on — which every BSD produces under
+      // the mbuf shortage a flood causes.
+      if verdict.is_unscoped_group_admit() {
+        self.stats.ingress_unscoped_group_admits(1);
+      }
+      if verdict.is_unscoped_group_refusal() {
+        self.stats.ingress_unscoped_group_refusals(1);
+      }
     }
     if !verdict.is_admit() {
       debug!(

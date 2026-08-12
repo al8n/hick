@@ -267,7 +267,7 @@ fn admits(
 
 /// [`arrived_on_bound_interface`] for a NIC-bound endpoint.
 fn arrived(src: SocketAddr, bound: u32, pkt_iface: u32, iface_reported: bool) -> bool {
-  arrived_on_bound_interface(src, nic(bound, &[]), ifw(pkt_iface, iface_reported)).is_none()
+  arrived_on_bound_interface(src, nic(bound, &[]), ifw(pkt_iface, iface_reported)).is_ok()
 }
 
 /// [`src_on_local_link`] for a NIC-bound endpoint.
@@ -819,9 +819,9 @@ fn a_bound_interface_of_zero_proves_nothing_and_so_forbids_nothing() {
   //
   // It forbids nothing AT STAGE 1. §11's own arms still decide after it — an
   // unbound endpoint is not an open door.
-  assert!(arrived_on_bound_interface(on_subnet(), nic(0, &[]), witnessed(OTHER)).is_none());
+  assert!(arrived_on_bound_interface(on_subnet(), nic(0, &[]), witnessed(OTHER)).is_ok());
   assert!(
-    arrived_on_bound_interface(scoped(LINK_LOCAL, OTHER), nic(0, &[]), witnessed(OTHER)).is_none()
+    arrived_on_bound_interface(scoped(LINK_LOCAL, OTHER), nic(0, &[]), witnessed(OTHER)).is_ok()
   );
   assert!(admits(
     on_subnet(),
@@ -866,8 +866,8 @@ fn a_loopback_source_is_admitted_only_by_a_loopback_bound_endpoint() {
     peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
   ] {
-    assert!(arrived_on_bound_interface(src, lo(BOUND, &[]), IfaceWitness::Lost).is_none());
-    assert!(arrived_on_bound_interface(src, lo(BOUND, &[]), witnessed(BOUND)).is_none());
+    assert!(arrived_on_bound_interface(src, lo(BOUND, &[]), IfaceWitness::Lost).is_ok());
+    assert!(arrived_on_bound_interface(src, lo(BOUND, &[]), witnessed(BOUND)).is_ok());
   }
   assert!(
     admits_ingress(
@@ -906,7 +906,7 @@ fn a_reported_foreign_interface_outranks_a_loopback_source() {
     peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
     scoped(Ipv6Addr::LOCALHOST, OTHER),
   ] {
-    assert!(!arrived_on_bound_interface(src, lo(BOUND, &[]), witnessed(OTHER)).is_none());
+    assert!(!arrived_on_bound_interface(src, lo(BOUND, &[]), witnessed(OTHER)).is_ok());
     assert!(
       !admits_ingress(
         src,
@@ -925,7 +925,7 @@ fn a_reported_foreign_interface_outranks_a_loopback_source() {
       lo(BOUND, &[]),
       IfaceWitness::Lost
     )
-    .is_none()
+    .is_ok()
   );
 }
 
@@ -943,7 +943,7 @@ fn a_spoofed_loopback_source_is_rejected_on_a_foreign_interface() {
     peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
     scoped(Ipv6Addr::LOCALHOST, OTHER),
   ] {
-    assert!(!arrived_on_bound_interface(src, nic(BOUND, &SUBNETS), witnessed(OTHER)).is_none());
+    assert!(!arrived_on_bound_interface(src, nic(BOUND, &SUBNETS), witnessed(OTHER)).is_ok());
     assert!(
       !admits_ingress(
         src,
@@ -969,7 +969,7 @@ fn a_spoofed_loopback_source_is_rejected_on_a_foreign_interface() {
       nic(BOUND, &SUBNETS),
       IfaceWitness::Lost
     )
-    .is_none(),
+    .is_ok(),
     "the loopback exception is the loopback-BOUND endpoint's; a loopback \
      SOURCE must not open it at stage 1"
   );
@@ -1513,6 +1513,7 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
   let mut coarse_flag_fired = Fired::default();
   let mut broadcast_delivery_fired = Fired::default();
   let mut group_arm_fired = Fired::default();
+  let mut unscoped_group_fired = Fired::default();
   let mut arm_two_fired = Fired::default();
   let mut loopback_block_fired = Fired::default();
   let mut no_arm_fired = Fired::default();
@@ -1579,7 +1580,7 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 let in_prefix = subnets
                   .iter()
                   .any(|&(n, pfx)| addr_in_subnet(n, pfx, src.ip()));
-                let stage1 = arrived_on_bound_interface(src, link, iface).is_none();
+                let stage1 = arrived_on_bound_interface(src, link, iface).is_ok();
                 // Whether §11's SOURCE arm would take this source on this link:
                 // a loopback source belongs to a loopback-BOUND endpoint and
                 // nobody else, and every other source answers to the prefix.
@@ -1699,17 +1700,74 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 let host_address_arm = (dst_addr.is_some() && !ours_group && !no_arm)
                   || (dst_absent && flag != Some(LinkDelivery::Multicast) && !no_dst_broadcast);
 
-                // 3. Past stage 1, OUR group admits regardless of source —
-                //    §11's "regardless of source IP address". Keyed by the
-                //    DESTINATION's family: it is the destination that selects
-                //    this arm.
-                if stage1 && ours_group {
+                // Whether §11 arm one's source exemption is available to this
+                // datagram, restated here from the ENUMERATION's own values
+                // rather than read back from production: something named the
+                // link, or a loopback-bound endpoint is taking its own traffic,
+                // or this endpoint bound no interface and so scopes to nothing.
+                // A CONTRADICTING witness is not considered — stage 1 already
+                // refused it, and every assertion below is guarded by `stage1`.
+                let group_exemption = bound_iface == 0 || witnessed || loopback_own;
+
+                // 3. Past stage 1 and SCOPED to this endpoint's link, OUR group
+                //    admits regardless of source — §11's "regardless of source
+                //    IP address". Keyed by the DESTINATION's family: it is the
+                //    destination that selects this arm.
+                if stage1 && ours_group && group_exemption {
                   group_arm_fired.hit(dst_v6);
                   assert!(got, "stage 2: the group arm must admit {src}");
                   assert_eq!(
                     verdict,
                     Verdict::Admit(Admit::MdnsGroup),
                     "the group arm names itself: {src} -> {dst:?}"
+                  );
+                }
+                // 3a. ... and UNSCOPED it is withheld: the source arm decides
+                //     instead, in both directions. An equality, so this pins
+                //     that withholding is not refusing — an on-prefix sender is
+                //     still admitted, and it says which arm took it.
+                //
+                //     The exemption is the only admission in this rule that
+                //     weighs nothing about the datagram's origin, so it is the
+                //     only one that needs the link to have been named. Nothing
+                //     here reads the destination differently: invariants 5 and
+                //     5a-5h below run over these same unscoped combinations and
+                //     still refuse a foreign group, a broadcast and a martian BY
+                //     NAME, which is the property an earlier fix — rewriting the
+                //     destination witness at the receive path — destroyed.
+                if stage1 && ours_group && !group_exemption {
+                  unscoped_group_fired.hit(dst_v6);
+                  // The coarse flag decides here exactly as it decides for a
+                  // datagram with NO destination witness, which is the
+                  // monotonicity requirement: this square carries strictly more
+                  // evidence than that one and must never do worse. Enumerated
+                  // literally, never computed by the rule under test.
+                  let want = match flag {
+                    Some(LinkDelivery::Broadcast) => Verdict::Refuse(Refuse::BroadcastDelivery),
+                    Some(LinkDelivery::Multicast) => Verdict::Admit(Admit::UnscopedMdnsGroup),
+                    Some(LinkDelivery::Unicast) | None => {
+                      if source_arm_admits {
+                        Verdict::Admit(Admit::UnscopedMdnsGroup)
+                      } else {
+                        Verdict::Refuse(Refuse::UnscopedGroupSourceOffLink)
+                      }
+                    }
+                  };
+                  assert_eq!(
+                    verdict, want,
+                    "an unscoped group takes the same arm a witness-less \
+                     datagram would, and names it: {src} -> {dst:?} {flag:?}"
+                  );
+                  // ... and never WORSE than that datagram would have fared.
+                  // The comparison is against production's own answer for the
+                  // blind square, so a change that made this arm stricter than
+                  // the one below it fails here whatever the table says.
+                  let blind_beside_it =
+                    admits_ingress(src, DestinationWitness::Declined, flag, link, iface);
+                  assert!(
+                    got || !blind_beside_it.is_admit(),
+                    "monotonicity: more evidence must not refuse what less \
+                     evidence admits: {src} -> {dst:?} {flag:?}"
                   );
                 }
                 // 3b. The coarse flag stands in where no destination was
@@ -2060,7 +2118,14 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
       broadcast_delivery_fired,
       "no destination, broadcast delivery, against an admitting source",
     ),
-    (group_arm_fired, "our group destination"),
+    (
+      group_arm_fired,
+      "our group destination, SCOPED to the bound link",
+    ),
+    (
+      unscoped_group_fired,
+      "our group destination with nothing scoping it, which takes the source arm",
+    ),
     (arm_two_fired, "a destination this endpoint holds"),
     (
       loopback_block_fired,
@@ -2235,21 +2300,283 @@ fn an_expected_but_missing_interface_refuses_before_the_group_arm() {
       );
     }
   }
-  // The SAME datagram on a path that reports no interface reaches the group arm
-  // and is admitted. Identical provenance value, opposite outcome — decided by
-  // the capability, which the table did not carry.
-  assert!(
+  // The SAME datagram on a path that reports no interface is judged somewhere
+  // else entirely — identical provenance value, different stage, decided by the
+  // capability, which the table did not carry. `Lost` returns AT the interface
+  // stage; `Blind` passes it and lets §11's own arms decide.
+  //
+  // Which arm is a second question and it moved. Nothing scoped this datagram to
+  // the bound link, so §11 arm one's "regardless of source IP address" exemption
+  // is WITHHELD and the source arm decides instead — and this source is
+  // off-prefix, so it refuses. The two refusals are not the same refusal, and
+  // naming both is what keeps this test's subject (the stage, not the verdict)
+  // legible now that the group arm has a precondition.
+  assert_eq!(
+    admits_ingress(
+      peer(OFF_SUBNET_V4),
+      DestinationWitness::Witnessed(V4_GROUP),
+      None,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Lost
+    ),
+    Verdict::Refuse(Refuse::LinkWitnessLost),
+    "a failed proof returns at the interface stage, before §11 is consulted"
+  );
+  assert_eq!(
     admits_ingress(
       peer(OFF_SUBNET_V4),
       DestinationWitness::Witnessed(V4_GROUP),
       None,
       nic(BOUND, &SUBNETS),
       IfaceWitness::Blind
-    )
-    .is_admit()
+    ),
+    Verdict::Refuse(Refuse::UnscopedGroupSourceOffLink),
+    "an absent capability passes the interface stage and reaches §11, which \
+     withholds arm one's exemption for want of link scoping and applies the \
+     source arm — named apart from a plain off-link source so the availability \
+     cost of the scoping is countable"
+  );
+  // And the same datagram from an ON-prefix source is ADMITTED there, which is
+  // what makes the line above a withheld privilege rather than a refusal: the
+  // interface stage let it through and §11's source arm took it.
+  assert_eq!(
+    admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(V4_GROUP),
+      None,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Blind
+    ),
+    Verdict::Admit(Admit::UnscopedMdnsGroup),
+    "withholding arm one is not refusing: the source arm still admits"
   );
 }
 
+/// §11 arm one's *"regardless of source IP address"* exemption is granted only
+/// to a datagram something SCOPED to the bound link — and withholding it costs
+/// the datagram arm one and nothing else.
+///
+/// # What the exemption is, and why it alone needs scoping
+///
+/// Every other admission this rule makes weighs something: an address this
+/// endpoint holds, a source inside a prefix it carries. Arm one weighs nothing
+/// at all — the RFC is explicit that a group destination is *"necessarily deemed
+/// to have originated on the local link, regardless of source IP address"*, and
+/// calls that essential. So arm one is the one place where "did this reach us on
+/// OUR link" is the entire remaining question, and this crate's scoping of the
+/// RFC's "a local link" to "the link this endpoint bound" is the only thing that
+/// answers it. Granted to a datagram nothing scoped, arm one admits a
+/// wildcard-bound socket's copy of another NIC's group traffic straight into the
+/// cache and §9 conflict handling.
+///
+/// # The pair, not the cmsg
+///
+/// The condition is a WITNESSED destination beside an unscoped link, and it
+/// arises three ways: the BSD `IP_RECVDSTADDR`/`IP_RECVIF` split delivering one
+/// cmsg and not the other, a Linux/Android/Apple `IP_PKTINFO` carrying a zero
+/// `ipi_ifindex`, and `IPV6_PKTINFO` the same way. A rule enforced at one
+/// decoder closes one of those. This one is stated in `admits_ingress`, over the
+/// witnesses every receive path already hands in.
+///
+/// # Withholding is not refusing, and it is not erasing
+///
+/// The datagram takes exactly the arm it would have taken with no destination
+/// witness at all: the coarse [`LinkDelivery`] where the target binds one, and
+/// §11's source arm otherwise. So an on-prefix sender is still admitted, and so
+/// is an off-prefix one wherever `MSG_MCAST` exists — under
+/// [`Admit::UnscopedMdnsGroup`], countable apart from arm one. Sending this
+/// square straight to the source arm made it REFUSE what the strictly
+/// less-informed square beside it ADMITS, which is asserted against below.
+///
+/// And the destination is still READ. An earlier fix withheld the privilege by
+/// rewriting the witness to `Declined` at one receive path, which threw away the
+/// address every negative class is decided by and let a foreign group through
+/// the coarse arms. **Only a destination that IS an mDNS group takes the
+/// unscoped arm** — a foreign group, an IPv4 broadcast and a destination this
+/// endpoint does not hold are matched by the arms below it and refused BY NAME,
+/// with the coarse flag never consulted. That is asserted last, under both
+/// delivery regimes, from a source the source arm would have admitted.
+#[test]
+fn an_unscoped_group_destination_does_not_take_arm_ones_exemption() {
+  // Nothing names the link on either of these, and the endpoint HAS one bound.
+  for iface in [IfaceWitness::Declined, IfaceWitness::Blind] {
+    for group in [V4_GROUP, V6_GROUP] {
+      // FreeBSD/DragonFly, and every target that binds no `MSG_MCAST`: the
+      // unscoped group reaches §11's source arm, and an off-prefix sender is
+      // REFUSED there. This is the availability residual, named so it is
+      // countable rather than hidden inside `SourceOffLink`.
+      assert_eq!(
+        admits_ingress(
+          peer(OFF_SUBNET_V4),
+          DestinationWitness::Witnessed(group),
+          None,
+          nic(BOUND, &SUBNETS),
+          iface
+        ),
+        Verdict::Refuse(Refuse::UnscopedGroupSourceOffLink),
+        "with no coarse flag an unscoped group takes the source arm, and this \
+         source is off-prefix: {group:?} {iface:?}"
+      );
+      // OpenBSD/NetBSD: the same datagram is ADMITTED, because the coarse flag
+      // is worth here exactly what it is worth to a datagram with no
+      // destination witness at all. Sending this square to the source arm made
+      // it REFUSE what the strictly less-informed square beside it ADMITS —
+      // punishing partial evidence — and an attacker who can drop one cmsg can
+      // drop both, so that refusal stopped nobody and taxed legitimate peers.
+      // It is `UnscopedMdnsGroup`, never `MdnsGroup`: the flag does not buy
+      // arm one.
+      assert_eq!(
+        admits_ingress(
+          peer(OFF_SUBNET_V4),
+          DestinationWitness::Witnessed(group),
+          Some(LinkDelivery::Multicast),
+          nic(BOUND, &SUBNETS),
+          iface
+        ),
+        Verdict::Admit(Admit::UnscopedMdnsGroup),
+        "the coarse multicast flag is worth the same to a witnessed group as to \
+         a witness-less datagram: {group:?} {iface:?}"
+      );
+      // Monotonicity, stated against production's own answer for the square
+      // below: an unscoped group must never fare worse than the same datagram
+      // with its destination thrown away.
+      for flag in [None, Some(LinkDelivery::Multicast)] {
+        let more = admits_ingress(
+          peer(OFF_SUBNET_V4),
+          DestinationWitness::Witnessed(group),
+          flag,
+          nic(BOUND, &SUBNETS),
+          iface,
+        );
+        let less = admits_ingress(
+          peer(OFF_SUBNET_V4),
+          DestinationWitness::Declined,
+          flag,
+          nic(BOUND, &SUBNETS),
+          iface,
+        );
+        assert!(
+          more.is_admit() || !less.is_admit(),
+          "more evidence must not refuse what less evidence admits: \
+           {group:?} {iface:?} {flag:?}"
+        );
+      }
+      for flag in [None, Some(LinkDelivery::Multicast)] {
+        // ... and on-prefix it is ADMITTED there, which is what makes the line
+        // above a withheld privilege rather than a refusal. The coarse
+        // multicast flag changes neither answer: a witnessed destination is
+        // finer evidence than a bit that says only "some group".
+        assert_eq!(
+          admits_ingress(
+            on_subnet(),
+            DestinationWitness::Witnessed(group),
+            flag,
+            nic(BOUND, &SUBNETS),
+            iface
+          ),
+          Verdict::Admit(Admit::UnscopedMdnsGroup),
+          "withholding is not refusing: {group:?} {iface:?} {flag:?}"
+        );
+        // The SAME datagram with a witness that names our link takes arm one,
+        // off-prefix source and all. The control: the source did not change,
+        // the scoping did.
+        assert_eq!(
+          admits_ingress(
+            peer(OFF_SUBNET_V4),
+            DestinationWitness::Witnessed(group),
+            flag,
+            nic(BOUND, &SUBNETS),
+            witnessed(BOUND)
+          ),
+          Verdict::Admit(Admit::MdnsGroup),
+          "a scoped group destination still takes arm one verbatim: {group:?}"
+        );
+      }
+      // An endpoint that bound NO interface scopes to nothing, so there is no
+      // rule to have failed and the exemption is granted. `hick-smoltcp` runs
+      // here permanently; withholding would take arm one from it forever in
+      // exchange for no scoping at all.
+      assert_eq!(
+        admits_ingress(
+          peer(OFF_SUBNET_V4),
+          DestinationWitness::Witnessed(group),
+          None,
+          nic(0, &SUBNETS),
+          iface
+        ),
+        Verdict::Admit(Admit::MdnsGroup),
+        "an endpoint with no bound interface withholds nothing: {group:?}"
+      );
+    }
+
+    // An IPv6 source's scope id scopes the datagram on its own, with no cmsg
+    // involved — so a v6 group datagram whose PKTINFO the kernel declined still
+    // takes arm one when the zone names our link, and is refused outright when
+    // it names another. The exemption follows the LINK evidence, whichever
+    // witness carried it.
+    assert_eq!(
+      admits_ingress(
+        scoped(LINK_LOCAL, BOUND),
+        DestinationWitness::Witnessed(V6_GROUP),
+        None,
+        nic(BOUND, &SUBNETS),
+        iface
+      ),
+      Verdict::Admit(Admit::MdnsGroup),
+      "a scope id is link evidence in its own right: {iface:?}"
+    );
+    assert_eq!(
+      admits_ingress(
+        scoped(LINK_LOCAL, OTHER),
+        DestinationWitness::Witnessed(V6_GROUP),
+        None,
+        nic(BOUND, &SUBNETS),
+        iface
+      ),
+      Verdict::Refuse(Refuse::ForeignLink),
+      "and a contradicting one refuses before any arm: {iface:?}"
+    );
+
+    // THE CLASSIFICATION SURVIVES. Same unscoped square, same in-prefix source
+    // the source arm would have admitted — so the refusal is attributable to the
+    // destination — and every class is still named. Erasing the witness to
+    // withhold the privilege is what this half exists to forbid.
+    for (dst, want, what) in [
+      (FOREIGN_V4_GROUP, Refuse::ForeignGroup, "LLMNR's IPv4 group"),
+      (FOREIGN_V6_GROUP, Refuse::ForeignGroup, "LLMNR's IPv6 group"),
+      (
+        LIMITED_BROADCAST,
+        Refuse::BroadcastAddressed,
+        "RFC 919's limited broadcast",
+      ),
+      (
+        NEIGHBOUR_V4_DST,
+        Refuse::DestinationNotHeld,
+        "a neighbour's address on our own subnet",
+      ),
+      (
+        V4_MAPPED_GROUP_DST,
+        Refuse::Ipv4MappedDestination,
+        "the IPv4 group wearing a v4-mapped address",
+      ),
+    ] {
+      for flag in [None, Some(LinkDelivery::Multicast)] {
+        assert_eq!(
+          admits_ingress(
+            on_subnet(),
+            DestinationWitness::Witnessed(dst),
+            flag,
+            nic(BOUND, &SUBNETS),
+            iface
+          ),
+          Verdict::Refuse(want),
+          "{what}: an unscoped datagram loses arm one and keeps every refusal \
+           its destination earns: {iface:?} {flag:?}"
+        );
+      }
+    }
+  }
+}
 #[test]
 fn a_scope_id_is_provenance_even_where_no_interface_index_is() {
   // The completion-path square, corrected. A driver whose receive path is a
@@ -3771,8 +4098,16 @@ fn an_ipv4_mapped_destination_is_named_rather_than_left_to_the_residual() {
 /// admission indistinguishable from a fully-witnessed one.
 /// [`Verdict::is_residual_refusal`] is the size of what §11 gives no arm and
 /// this partition does not name.
+///
+/// Two more join them here, for the scoping of §11 arm one:
+/// [`Verdict::is_unscoped_group_refusal`] is its availability cost — a datagram
+/// the RFC says to admit *"regardless of source IP address"*, refused because
+/// nothing established which link it arrived on — and
+/// [`Verdict::is_unscoped_group_admit`] is the exposure that remains when it is
+/// admitted anyway. Each is pinned against the other three so a counter cannot
+/// quietly start counting its neighbour's arm.
 #[test]
-fn the_two_gap_counters_count_exactly_their_own_arms() {
+fn the_four_gap_counters_count_exactly_their_own_arms() {
   let link = nic(BOUND, &SUBNETS);
 
   // A degraded admission: no destination witnessed, source in prefix.
@@ -3837,6 +4172,75 @@ fn the_two_gap_counters_count_exactly_their_own_arms() {
     "a neighbour's address is the residual, and the counter must see it"
   );
   assert!(!residual.is_degraded_admit());
+
+  // ── the two UNSCOPED-GROUP counters ────────────────────────────────────
+  //
+  // The availability cost of scoping §11 arm one, and the residual exposure of
+  // having a fallback for it at all. Both had to become counters for the same
+  // reason the two above did: without them the trade is an argument rather than
+  // an observation, and the refusal in particular is what an operator alerts on.
+  let unscoped_refused = admits_ingress(
+    peer(OFF_SUBNET_V4),
+    DestinationWitness::Witnessed(V4_GROUP),
+    None,
+    link,
+    IfaceWitness::Declined,
+  );
+  assert_eq!(
+    unscoped_refused,
+    Verdict::Refuse(Refuse::UnscopedGroupSourceOffLink)
+  );
+  assert!(
+    unscoped_refused.is_unscoped_group_refusal(),
+    "a group datagram §11 says to admit, refused for want of link scoping, is \
+     the availability cost and must be countable"
+  );
+  // It is NOT the residual refusal: that counter's subject is a destination no
+  // named class describes, and this destination is an mDNS group.
+  assert!(!unscoped_refused.is_residual_refusal());
+  assert!(!unscoped_refused.is_unscoped_group_admit());
+
+  for (flag, why) in [
+    (None, "admitted on §11's source arm"),
+    (
+      Some(LinkDelivery::Multicast),
+      "admitted on the coarse multicast flag",
+    ),
+  ] {
+    let unscoped_admitted = admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(V4_GROUP),
+      flag,
+      link,
+      IfaceWitness::Declined,
+    );
+    assert_eq!(unscoped_admitted, Verdict::Admit(Admit::UnscopedMdnsGroup));
+    assert!(
+      unscoped_admitted.is_unscoped_group_admit(),
+      "{why}: an admission with nothing scoping it to the bound link is the \
+       residual exposure and must be countable"
+    );
+    // And NOT a degraded admit: that counter's subject is an admission with no
+    // DESTINATION witness, and this destination is witnessed and is ours.
+    assert!(
+      !unscoped_admitted.is_degraded_admit(),
+      "{why}: the destination is witnessed, so this is not a degraded admission"
+    );
+    assert!(!unscoped_admitted.is_unscoped_group_refusal());
+  }
+
+  // Arm one proper is neither: it was scoped, so nothing about it is unscoped.
+  let scoped = admits_ingress(
+    peer(OFF_SUBNET_V4),
+    DestinationWitness::Witnessed(V4_GROUP),
+    None,
+    link,
+    witnessed(BOUND),
+  );
+  assert_eq!(scoped, Verdict::Admit(Admit::MdnsGroup));
+  assert!(!scoped.is_unscoped_group_admit());
+  assert!(!scoped.is_unscoped_group_refusal());
+  assert!(!scoped.is_degraded_admit());
 
   // A NAMED refusal is not the residual, however much it looks like one.
   for (dst, reason) in [

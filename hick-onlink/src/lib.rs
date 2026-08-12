@@ -244,6 +244,97 @@
 //! not evidence about the sender. The zero-index form, meanwhile, is reachable
 //! on the primary platforms and is where their widening actually lands.
 //!
+//! # The residual: an mDNS group refused for want of link scoping
+//!
+//! §11 arm one's *"regardless of source IP address"* exemption is granted only
+//! to a datagram something SCOPED to the bound link — see [`admits_ingress`] for
+//! why the exemption in particular needs it. Where nothing scoped it, the
+//! datagram takes the arm it would have taken with no destination witness at
+//! all, and on a target that binds no `MSG_MCAST` that is §11's source arm. An
+//! OFF-PREFIX sender is then refused: [`Refuse::UnscopedGroupSourceOffLink`],
+//! which is exactly the overlaid-subnet peer the RFC calls the exemption
+//! essential for. **This is a known conformance cost, and it is the deliberate
+//! side of a trade.**
+//!
+//! | row | reaches the unscoped square | residual |
+//! |---|---|---|
+//! | FreeBSD/DragonFly IPv4 + IPv6 | **yes — flood-inducible** | **off-prefix group senders REFUSED** |
+//! | OpenBSD/NetBSD IPv4 + IPv6 | **yes — flood-inducible** | none: `MSG_MCAST` admits, see below |
+//! | Linux/Android IPv4 | rare, NOT unreachable — `ipv4_pktinfo_prepare`'s `else` branch zeroes `ipi_ifindex` when `skb_rtable(skb)` is `NULL` | off-prefix group senders REFUSED |
+//! | Apple IPv6 | index `0`, same shape | off-prefix group senders REFUSED |
+//! | Apple IPv4, Linux/Android IPv6, Windows | not established | none known |
+//!
+//! **OpenBSD and NetBSD carry no residual, and the reason is monotonicity rather
+//! than luck.** An unscoped group destination takes the same coarse
+//! [`LinkDelivery`] arm the blind square takes, so where `MSG_MCAST` is bound it
+//! is ADMITTED — as [`Admit::UnscopedMdnsGroup`], never as arm one. Routing it
+//! straight to the source arm instead made this square REFUSE what the strictly
+//! less-informed square beside it ADMITTED, which is incoherent: an attacker who
+//! can make one cmsg go missing can make both go missing and be admitted anyway,
+//! so the refusal stopped nobody and taxed legitimate peers in full. **FreeBSD
+//! and DragonFly bind no `MSG_MCAST` and so keep the residual.**
+//!
+//! **The destination partition is untouched by any of this.** Only a destination
+//! that IS an mDNS group takes the unscoped arm. A foreign group, an IPv4
+//! broadcast, a martian and a neighbour's address are matched by the arms below
+//! it and refused BY NAME, with the coarse flag never consulted — the flag
+//! admits "any group" only where no group was witnessed.
+//!
+//! **Why this way round.** The alternative is what this crate did before: grant
+//! the exemption whenever the link witness is absent. That admits a
+//! wildcard-bound socket's copy of ANOTHER NIC's group traffic, from any source,
+//! into the cache and §9 conflict handling — a durable write from a link the
+//! sender has no business reaching, silent, and persisting after the flood that
+//! produced it stops. The refusal costs an off-prefix peer a datagram while the
+//! shortage lasts, and an mbuf shortage means the host is already dropping
+//! datagrams wholesale, so it is an increment on an outage already in progress.
+//! **Neither state is §11-clean**: granting the exemption unscoped satisfies the
+//! RFC's letter by handing it to datagrams §11 never meant it for, because §11
+//! assumes one link and these sockets are wildcard-bound across many. One of the
+//! two also hands out write access.
+//!
+//! **It is counted, not merely argued.** [`Verdict::is_unscoped_group_refusal`]
+//! is the availability cost and [`Verdict::is_unscoped_group_admit`] is the
+//! residual exposure; the hosted drivers feed them to
+//! `mdns_ingress_unscoped_group_refusals` and
+//! `mdns_ingress_unscoped_group_admits`. Sustained movement in the first on a
+//! BSD row is this attack in progress.
+//!
+//! **This residual is about ADMISSION, not about trust downstream.** Everything
+//! above concerns whether a datagram crosses the boundary. What an admitted
+//! datagram may then DO is not graded here and is not graded anywhere: every
+//! hosted driver reduces the verdict to [`Verdict::is_admit`] and hands the
+//! datagram to the same `mdns-proto` `Endpoint::handle` path, so
+//! [`Admit::UnscopedMdnsGroup`] reaches cache, §9 conflict and known-answer
+//! processing with exactly the trust [`Admit::MdnsGroup`] does. The names and
+//! counters here are an observation, not a capability boundary.
+//!
+//! The mechanism, so the next reader does not go looking for a lever that is not
+//! there: `Endpoint::handle` has ONE trust input, a boolean latch shared with
+//! self-loopback and untrusted-response suppression, and it DROPS a datagram
+//! wholesale rather than restricting what it may touch. A tier therefore has to
+//! be introduced rather than threaded, must cover [`Admit::BlindMulticastDelivery`]
+//! in the same change — restricting one and not the other would break the
+//! monotonicity above — and is tracked as its own work. Note also that the cheap
+//! driver-side substitute is wrong: dropping RESPONSES on an unscoped admission
+//! needs no protocol change, but a response is exactly what §11 arm one exists
+//! to admit, so it reinstates the availability cost on the square the
+//! coarse-delivery arm resolved while leaving conflict handling reachable from a
+//! query's authority section.
+//!
+//! **What would close it.** Not granting the exemption unscoped — that is the
+//! failure above. Link provenance the datagram cannot lose: a receive socket
+//! genuinely restricted to one interface, so that every datagram on it is on
+//! that link by construction and no cmsg is needed to prove it. `libc` binds
+//! `SO_BINDTODEVICE` for Linux/Android (requiring `CAP_NET_RAW`) and
+//! `IP_BOUND_IF`/`IPV6_BOUND_IF` for Apple, so those rows are closable. It binds
+//! **no such option for FreeBSD, DragonFly, OpenBSD or NetBSD at any privilege
+//! level**, and Windows' `IP_UNICAST_IF` selects the egress interface only. The
+//! four kernels that silently omit cmsgs are exactly the four with no
+//! socket-level substitute, so the residual's home is also the one place this
+//! layer cannot reach; closing it there is a deployment-level answer (jail/VNET,
+//! rdomain) or a different socket API.
+//!
 //! # What this boundary does and does not guarantee
 //!
 //! §11 states its receive test exhaustively — *"The test for whether a response
@@ -965,6 +1056,30 @@ impl Verdict {
     )
   }
 
+  /// Whether an mDNS-group datagram was ADMITTED without anything scoping it to
+  /// the bound link — on the coarse multicast flag or on §11's source arm.
+  ///
+  /// The residual exposure of granting the group arm's fallback at all: these
+  /// admissions did not prove they reached this endpoint on its own link. Not
+  /// folded into [`Self::is_degraded_admit`], whose subject is an admission with
+  /// no DESTINATION witness; here the destination is witnessed and it is ours.
+  #[inline]
+  #[must_use]
+  pub const fn is_unscoped_group_admit(self) -> bool {
+    matches!(self, Self::Admit(Admit::UnscopedMdnsGroup))
+  }
+
+  /// Whether an mDNS-group datagram was REFUSED for want of link scoping.
+  ///
+  /// The availability cost of the rule above, and the counter that turns it from
+  /// an argument into an observation: §11 says to admit this datagram and this
+  /// endpoint did not. See [`Refuse::UnscopedGroupSourceOffLink`].
+  #[inline]
+  #[must_use]
+  pub const fn is_unscoped_group_refusal(self) -> bool {
+    matches!(self, Self::Refuse(Refuse::UnscopedGroupSourceOffLink))
+  }
+
   /// Whether this refusal is the RESIDUAL one: a witnessed destination that no
   /// named class describes and that this endpoint does not hold.
   ///
@@ -984,6 +1099,66 @@ pub enum Admit {
   /// *"necessarily deemed to have originated on the local link, regardless of
   /// source IP address"*.
   MdnsGroup,
+  /// The witnessed destination IS an mDNS group, but nothing scoped the
+  /// datagram to the link this endpoint bound, so §11 arm one's *"regardless of
+  /// source IP address"* exemption was WITHHELD and the source arm admitted
+  /// instead.
+  ///
+  /// The exemption is the one admission in this whole boundary that tests
+  /// nothing the datagram carries about its origin. What makes it safe here is
+  /// not §11 — §11 grants it unconditionally — but this crate's scoping of it to
+  /// the bound link, and that scoping needs the link to have been named. A
+  /// wildcard-bound socket on a multi-homed host is handed every NIC's copy of
+  /// the group traffic, so granting the exemption unscoped admits another link's
+  /// datagram into the cache and §9 conflict handling with no proof of
+  /// provenance at all.
+  ///
+  /// Withheld, the datagram is not refused — it takes exactly the arm a datagram
+  /// with NO destination witness would have taken: the kernel's coarse
+  /// [`LinkDelivery`] where there is one, and §11's source arm otherwise. So a
+  /// square carrying more evidence can never do worse than the square below it,
+  /// and the cost falls on an off-prefix sender on a target with no
+  /// `MSG_MCAST` — FreeBSD and DragonFly. The destination is still read by every
+  /// NEGATIVE arm: a foreign group or a broadcast is refused by name here
+  /// exactly as it is when the exemption is granted. See [`admits_ingress`].
+  ///
+  /// Counted separately from [`Self::MdnsGroup`] because they are different
+  /// claims: one is arm one, the other is the source rule standing in for it.
+  ///
+  /// # What this variant does NOT buy
+  ///
+  /// **It is an observation, not a capability boundary.** This distinction is
+  /// about ADMISSION — whether the datagram crosses the boundary at all — and
+  /// says nothing about what an admitted datagram may then DO. Every hosted
+  /// driver reduces the verdict to [`Verdict::is_admit`] and hands the datagram
+  /// to the same `mdns-proto` `Endpoint::handle` path as [`Self::MdnsGroup`], so
+  /// an unscoped admission reaches cache, RFC 6762 §9 conflict and known-answer
+  /// processing with exactly the trust a scoped one does.
+  ///
+  /// That is not an oversight at the call sites. `Endpoint::handle` has ONE
+  /// trust input and it is a boolean — the latch that also carries self-loopback
+  /// and untrusted-response suppression — and it is all-or-nothing: it discards
+  /// the datagram wholesale and counts it as dropped rather than restricting
+  /// what it may touch. So there is no graded tier to route this variant into,
+  /// and expressing one means INTRODUCING a trust model rather than passing a
+  /// value that already exists. That work is separate, and it has to cover
+  /// [`Self::BlindMulticastDelivery`] in the same change: restricting one and
+  /// not the other would break the monotonicity that
+  /// [`admits_ingress`]'s unscoped arm is built on.
+  ///
+  /// **The obvious cheap substitute is wrong, and it is worth knowing why.** A
+  /// driver can read `QR` from the raw header before `handle` — every hosted one
+  /// already does, for §11's source-port rule — so it could drop RESPONSES on an
+  /// unscoped admission without touching `mdns-proto` at all. But a response is
+  /// exactly what §11 arm one exists to admit, so that reinstates the
+  /// availability cost on the very square the coarse-delivery arm was added to
+  /// resolve, and it still leaves conflict handling reachable from a QUERY,
+  /// whose authority section drives §8.1 tiebreaking. Partial security, full
+  /// availability cost.
+  ///
+  /// Until the tier exists, what this variant draws is visible in
+  /// [`Verdict::is_unscoped_group_admit`] and in logs, and nowhere else.
+  UnscopedMdnsGroup,
   /// §11 arm two: the witnessed destination is an address this endpoint HOLDS —
   /// a response *"received via unicast"* — and the source passed the on-link
   /// comparison.
@@ -1013,6 +1188,17 @@ impl Admit {
   #[must_use]
   pub const fn is_mdns_group(&self) -> bool {
     matches!(self, Self::MdnsGroup)
+  }
+  /// Whether this is [`Admit::UnscopedMdnsGroup`].
+  ///
+  /// Worth its own counter: sustained movement here is a path that witnesses
+  /// destinations but keeps failing to name the link — a kernel declining
+  /// `IP_RECVIF` under mbuf pressure, which a flood causes — and each one is an
+  /// admission §11 would have granted unconditionally and this crate did not.
+  #[inline]
+  #[must_use]
+  pub const fn is_unscoped_mdns_group(&self) -> bool {
+    matches!(self, Self::UnscopedMdnsGroup)
   }
   /// Whether this is [`Admit::HeldDestination`].
   #[inline]
@@ -1103,6 +1289,27 @@ pub enum Refuse {
   /// §11's source arm refused: the source is neither this loopback-bound
   /// endpoint's own traffic nor inside any prefix the bound interface carries.
   SourceOffLink,
+  /// The witnessed destination IS an mDNS group, nothing scoped the datagram to
+  /// the bound link, and §11's source arm then refused it.
+  ///
+  /// **The availability cost of scoping arm one, made countable.** §11 requires
+  /// a group datagram be admitted *"regardless of source IP address"*; this
+  /// endpoint could not establish that the datagram reached it on the link it
+  /// bound, so it fell back to the source test and the sender was off-prefix —
+  /// which is precisely the overlaid-subnet peer the RFC calls the exemption
+  /// essential for.
+  ///
+  /// Separate from [`Self::SourceOffLink`] because the two are different events
+  /// with different remedies. That one is §11 working as written. This one is a
+  /// datagram §11 says to admit, refused for want of link evidence a kernel
+  /// declined to supply — and every BSD declines under the ancillary-mbuf
+  /// shortage a flood causes, so sustained movement here is an availability
+  /// attack in progress rather than a misconfigured peer.
+  ///
+  /// Reachable on FreeBSD and DragonFly, which bind no `MSG_MCAST`; OpenBSD and
+  /// NetBSD reach the coarse multicast arm instead and admit. See this module's
+  /// header for the residual and which rows carry it.
+  UnscopedGroupSourceOffLink,
 }
 
 impl Refuse {
@@ -1111,6 +1318,12 @@ impl Refuse {
   #[must_use]
   pub const fn is_foreign_link(&self) -> bool {
     matches!(self, Self::ForeignLink)
+  }
+  /// Whether this is [`Refuse::UnscopedGroupSourceOffLink`].
+  #[inline]
+  #[must_use]
+  pub const fn is_unscoped_group_source_off_link(&self) -> bool {
+    matches!(self, Self::UnscopedGroupSourceOffLink)
   }
   /// Whether this is [`Refuse::LinkWitnessLost`].
   #[inline]
@@ -1440,14 +1653,26 @@ fn arrived_on_bound_interface(
   src: SocketAddr,
   link: BoundLink<'_>,
   iface: IfaceWitness,
-) -> Option<Refuse> {
+) -> Result<GroupExemption, Refuse> {
   if link.iface() == 0 {
-    return None;
+    // This endpoint named no interface, so there is no link to scope TO. The
+    // scoping forbids nothing here, and therefore withholds nothing either: an
+    // exemption is withheld because a rule could not be applied, never because
+    // the rule does not exist. `hick-smoltcp` runs permanently on this square —
+    // one interface, nothing to compare a witness against — and withholding
+    // there would take §11 arm one away from that driver forever in exchange
+    // for no scoping at all.
+    return Ok(GroupExemption::Granted);
   }
   // The witnesses are read FIRST and nothing overrules them. A present witness is
   // evidence the kernel attached to this datagram; a source ADDRESS is a claim
   // the sender wrote. No exception below may let the second answer over the
   // first.
+  //
+  // EITHER witness scopes the datagram, which is why this is a loop and not a
+  // read of `iface` alone: an IPv6 peer's scope id names the link independently
+  // of any cmsg, so a v6 datagram whose `IPV6_PKTINFO` the kernel declined can
+  // still be scoped by the address family itself.
   let mut witnessed = false;
   for witness in [iface.witnessed_index(), NonZeroU32::new(scope_of(src))] {
     let Some(witness) = witness else {
@@ -1455,29 +1680,76 @@ fn arrived_on_bound_interface(
     };
     witnessed = true;
     if witness.get() != link.iface() {
-      return Some(Refuse::ForeignLink);
+      return Err(Refuse::ForeignLink);
     }
   }
   if witnessed {
-    return None;
+    return Ok(GroupExemption::Granted);
   }
   // Nothing named the link. Only now may a loopback-BOUND endpoint take its own
   // loopback traffic on the source address, and only because the loopback
-  // interface IS its link.
+  // interface IS its link — which is exactly the scoping the exemption needs, so
+  // this passes as SCOPED rather than merely as not-refused.
   if link.is_loopback() && src.ip().is_loopback() {
-    return None;
+    return Ok(GroupExemption::Granted);
   }
   match iface {
-    IfaceWitness::Lost => Some(Refuse::LinkWitnessLost),
-    // The kernel declined, or this path never reports one: absent evidence in
-    // both cases, and §11's own arms still have to be satisfied below.
-    IfaceWitness::Declined | IfaceWitness::Blind => None,
+    IfaceWitness::Lost => Err(Refuse::LinkWitnessLost),
+    // The kernel DECLINED on a path that normally names the link. Admission
+    // continues — that is the availability invariant this function is built
+    // around and nothing here inverts it — but nothing scoped this datagram, so
+    // §11 arm one's source exemption is not available to it.
+    //
+    // This is the state an attacker can MANUFACTURE, which is what separates it
+    // from `Blind` below. Every BSD builds its ancillary mbufs with `M_NOWAIT`
+    // and skips one it cannot allocate; a flood exhausts them; and the datagrams
+    // that would have carried link proof arrive without it. Granting the
+    // exemption here hands the attacker an unconditional admit from any NIC,
+    // paid for with the flood they were running anyway.
+    // ... and a path that names a link for NO datagram is the same answer, not a
+    // softer one. `a_declined_witness_decides_exactly_as_a_blind_one` is the
+    // invariant that says so, and it survives this change intact — precisely
+    // because withholding is not refusing. Both spellings route the datagram to
+    // §11's source arm, which is where a `Blind` DESTINATION has always sent it,
+    // so the availability argument that invariant rests on is untouched: nothing
+    // here makes a responder deaf that was not already deaf to the same sender.
+    //
+    // Splitting them was tried and rejected. `Declined` is the attacker-inducible
+    // one — flood the host, exhaust its `M_NOWAIT` mbufs, and the link proof
+    // stops arriving — which is a reason it is URGENT, not a reason to grant an
+    // unbacked exemption to the structurally blind square beside it. Granting
+    // there buys nothing checkable and costs the one equality this input model
+    // is built on.
+    IfaceWitness::Declined | IfaceWitness::Blind => Ok(GroupExemption::Withheld),
     // Unreachable: a `Witnessed` index is nonzero, so it set `witnessed` above
     // and returned. Spelled as a pass rather than a panic because this crate
     // denies `clippy::unreachable` on a trust boundary, and because refusing
     // here would refuse a datagram whose witness AGREED with the binding.
-    IfaceWitness::Witnessed(_) => None,
+    IfaceWitness::Witnessed(_) => Ok(GroupExemption::Granted),
   }
+}
+
+/// Whether RFC 6762 §11 arm one's *"regardless of source IP address"* exemption
+/// may be granted to one datagram.
+///
+/// Produced by [`arrived_on_bound_interface`] — the ONE place that decides what
+/// scoped a datagram to this endpoint's link — so the gate cannot come to
+/// disagree with itself about what "our link" means. The alternative, letting
+/// each receive path encode "witnessed but unscoped" into the witness it hands
+/// over, was rejected: the rule is over the PAIR of witnesses, both of which
+/// arrive here anyway, and pushing it outward gives it one site per decoder to
+/// be forgotten at. It was forgotten at exactly one of them once already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupExemption {
+  /// Something named the link and agreed with the binding — a receive interface
+  /// index, an IPv6 source's scope id, a loopback-bound endpoint's own loopback
+  /// traffic — or this endpoint bound no interface, so there is no link to scope
+  /// TO and the scoping forbids nothing.
+  Granted,
+  /// Nothing named the link, on an endpoint that bound one to scope to. The
+  /// datagram is not refused on that account; it takes §11's source arm instead
+  /// of arm one.
+  Withheld,
 }
 
 /// Whether `dst` is one of the two mDNS link-local multicast groups, the
@@ -1531,6 +1803,32 @@ fn is_mdns_group(dst: IpAddr) -> bool {
 /// never that it was ours, and a wildcard-bound socket on a multi-homed host is
 /// handed every NIC's copy.
 ///
+/// # Arm one's exemption is a PRIVILEGE, and it is scoped
+///
+/// Arm one admits with no test on anything the datagram carries about its
+/// origin. Every other admission in this function weighs something — an address
+/// this endpoint holds, a source inside a prefix it carries. So arm one is the
+/// one place where "did this reach us on OUR link" is the entire remaining
+/// question, and it is answered by the interface check above.
+///
+/// That check REFUSES a witness naming another link, and it deliberately does
+/// not refuse an ABSENT one: a kernel that skipped a cmsg under mbuf pressure
+/// must not take a responder off the air. Those two are not the same answer, and
+/// collapsing them is what let a datagram with no link evidence take arm one.
+/// So the check reports which of the two it was, and arm one is granted only on
+/// the first. On the second the datagram takes §11's source arm instead
+/// ([`Admit::UnscopedMdnsGroup`]) — admitted if it is on-prefix, refused if it
+/// is not, which is the same rule a datagram with no destination witness takes.
+///
+/// **The destination is still read.** Withholding the exemption costs the
+/// datagram arm one and nothing else: the negative arms below match the same
+/// address and refuse a foreign group, a broadcast, a martian or a neighbour's
+/// address by name exactly as they do when the exemption is granted. An earlier
+/// attempt rewrote the destination witness itself at one receive path, which
+/// erased the address along with the privilege and reopened every class those
+/// arms close. The privilege and the classification are separate, and this is
+/// where they are separated.
+///
 /// # Where the destination comes from, and why not `local_ip`
 ///
 /// `destination` is
@@ -1561,7 +1859,8 @@ fn is_mdns_group(dst: IpAddr) -> bool {
 /// broadcast in any form, a martian, the unspecified address, a neighbour's
 /// address on our own subnet — and [`Refuse`] names which. That guarantee is
 /// this function's, in full, for every driver on a square that witnesses a
-/// destination.
+/// destination, and it does NOT depend on the interface witness: an unscoped
+/// datagram loses arm one's exemption and keeps every one of these refusals.
 ///
 /// **[`DestinationWitness::Blind`] and [`DestinationWitness::Declined`].** None of the above holds,
 /// and this is a promise this function does not make there. `MSG_MCAST` stands
@@ -1589,9 +1888,10 @@ pub fn admits_ingress(
   // the packet", so the RFC's test is already interface-scoped — this is what
   // makes that model enforceable for a wildcard-bound socket on a multi-homed
   // host.
-  if let Some(refusal) = arrived_on_bound_interface(src, link, iface) {
-    return Verdict::Refuse(refusal);
-  }
+  let exemption = match arrived_on_bound_interface(src, link, iface) {
+    Ok(exemption) => exemption,
+    Err(refusal) => return Verdict::Refuse(refusal),
+  };
   // §11 partitions by DESTINATION and names exactly two kinds. Each arm below
   // says what a destination IS. Nothing here is spelled as "everything that is
   // not one of the classes named above", which is the shape that admitted a
@@ -1600,16 +1900,39 @@ pub fn admits_ingress(
   // subtracting one more class from a residual that kept another.
   match destination {
     // Arm one, verbatim: "necessarily deemed to have originated on the local
-    // link, regardless of source IP address".
-    DestinationWitness::Witnessed(dst) if is_mdns_group(dst) => Verdict::Admit(Admit::MdnsGroup),
+    // link, regardless of source IP address" — and it is granted only to a
+    // datagram something SCOPED to this endpoint's link.
+    //
+    // The exemption is the one admission in this boundary that tests nothing
+    // about where the datagram came from. §11 grants it unconditionally; what
+    // makes it safe HERE is this crate's scoping of it to the bound link, so a
+    // datagram nothing scoped has not earned it. Withholding is not refusing:
+    // the datagram falls to §11's source arm, the same test it would take with
+    // no destination at all, and every NEGATIVE arm below still reads the
+    // address — a foreign group and a broadcast are refused by name whichever
+    // way this goes.
+    //
+    // Stated over the WITNESS PAIR rather than over any receive path's cmsg
+    // shape. The pair arises on the BSD `IP_RECVDSTADDR`/`IP_RECVIF` split, on
+    // a Linux/Apple `IP_PKTINFO` carrying a zero `ipi_ifindex`, and on
+    // `IPV6_PKTINFO` the same way; a rule written at one decoder would have
+    // closed one of those and left the others standing, which is what happened.
+    DestinationWitness::Witnessed(dst) if is_mdns_group(dst) => match exemption {
+      GroupExemption::Granted => Verdict::Admit(Admit::MdnsGroup),
+      GroupExemption::Withheld => unscoped_group_arm(src, delivery, link, iface),
+    },
     // Arm two: §11 scopes its source comparison to a response "received via
     // unicast", and a datagram received via unicast BY US is one addressed to
     // an address of ours. So the destination is matched against the receiving
     // interface's own configuration, which is the same configuration the
     // source is about to be matched against.
-    DestinationWitness::Witnessed(dst) if is_bound_address(dst, link) => {
-      source_arm(src, link, iface, Admit::HeldDestination)
-    }
+    DestinationWitness::Witnessed(dst) if is_bound_address(dst, link) => source_arm(
+      src,
+      link,
+      iface,
+      Admit::HeldDestination,
+      Refuse::SourceOffLink,
+    ),
     // An EMPTY snapshot is the one place the arm above must not be believed,
     // and this is the deliberate choice at this site.
     //
@@ -1635,9 +1958,13 @@ pub fn admits_ingress(
     // means the enumeration succeeded, so a destination missing from it is a
     // real "not ours" until the next refresh. That fails closed for at most
     // `SUBNET_REFRESH_INTERVAL` and heals itself; see this module's header.
-    DestinationWitness::Witnessed(_) if link.local_addrs().is_empty() => {
-      source_arm(src, link, iface, Admit::UnenumeratedDestination)
-    }
+    DestinationWitness::Witnessed(_) if link.local_addrs().is_empty() => source_arm(
+      src,
+      link,
+      iface,
+      Admit::UnenumeratedDestination,
+      Refuse::SourceOffLink,
+    ),
     // §11 offers no arm for any other destination, and this is a trust
     // boundary, so it is refused rather than handed to the arm next door.
     // `classify_unheld` runs strictly AFTER that decision and only names which
@@ -1702,7 +2029,13 @@ pub fn admits_ingress(
       Some(LinkDelivery::Multicast) => Verdict::Admit(Admit::BlindMulticastDelivery),
       // `Unicast` says only "neither of those", so the source arm still decides;
       // `None` is a target that binds no flag at all and says nothing.
-      Some(LinkDelivery::Unicast) | None => source_arm(src, link, iface, Admit::BlindSourceOnLink),
+      Some(LinkDelivery::Unicast) | None => source_arm(
+        src,
+        link,
+        iface,
+        Admit::BlindSourceOnLink,
+        Refuse::SourceOffLink,
+      ),
     },
   }
 }
@@ -1710,16 +2043,87 @@ pub fn admits_ingress(
 /// §11's source arm as a [`Verdict`]: `admit` when the source is on-link,
 /// [`Refuse::SourceOffLink`] when it is not.
 ///
-/// Three arms of [`admits_ingress`] end here and each supplies its OWN [`Admit`]
-/// — a destination this endpoint holds, a snapshot that enumerated nothing, and
-/// a datagram with no destination witness — because they are three different
-/// claims that happen to share one test. Sharing the refusal is safe; sharing
-/// the admission would erase the distinction the counters exist for.
-fn source_arm(src: SocketAddr, link: BoundLink<'_>, iface: IfaceWitness, admit: Admit) -> Verdict {
+/// Four arms of [`admits_ingress`] end here and each supplies its OWN [`Admit`]
+/// — a destination this endpoint holds, a snapshot that enumerated nothing, a
+/// datagram with no destination witness, and an mDNS group nothing scoped to
+/// this endpoint's link — because they are four different claims that happen to
+/// share one test. Sharing the refusal is safe; sharing the admission would
+/// erase the distinction the counters exist for.
+fn source_arm(
+  src: SocketAddr,
+  link: BoundLink<'_>,
+  iface: IfaceWitness,
+  admit: Admit,
+  refuse: Refuse,
+) -> Verdict {
   if src_on_local_link(src, link, iface) {
     Verdict::Admit(admit)
   } else {
-    Verdict::Refuse(Refuse::SourceOffLink)
+    Verdict::Refuse(refuse)
+  }
+}
+
+/// What becomes of an mDNS-group destination whose link nothing scoped: the
+/// SAME arm a datagram with no destination witness at all would have taken.
+///
+/// # Monotonicity, which is the whole reason this is not just `source_arm`
+///
+/// This square carries strictly MORE evidence than the square below it — the
+/// group address itself, on top of whatever the coarse [`LinkDelivery`] says —
+/// and a rule where more evidence produces a worse outcome for a legitimate peer
+/// is incoherent whichever way it errs. Sending it straight to the source arm
+/// did exactly that on OpenBSD and NetBSD: the destination-only datagram was
+/// REFUSED for an off-prefix sender while the neither-cmsg datagram beside it was
+/// ADMITTED on `MSG_MCAST`. An attacker who can make one cmsg go missing can make
+/// both go missing, so that refusal stopped nobody who mattered and taxed the
+/// off-prefix peers §11 calls essential in full.
+///
+/// This is NOT the rule that was rejected in the other direction — using a coarse
+/// signal to grant what finer evidence just failed to earn. That rule is about
+/// UPGRADING on worse information and it still holds: the exemption
+/// ([`Admit::MdnsGroup`]) is not granted here, and the flag never buys arm one.
+/// What the flag buys is exactly what it buys one arm down, no more, so this
+/// square can never do worse than the less-informed square below it.
+///
+/// # It does not re-open the destination partition
+///
+/// Only a destination `is_mdns_group` reaches this function; the caller's guard
+/// sees to that. A foreign multicast group, an IPv4 broadcast, a martian and a
+/// neighbour's address are all still matched by the arms BELOW the caller's and
+/// refused by name — [`Refuse::ForeignGroup`], [`Refuse::BroadcastAddressed`],
+/// [`Refuse::DestinationNotHeld`] — with the coarse flag never consulted. The
+/// flag admits "any group" only where no group was witnessed; here the group is
+/// witnessed and it is ours.
+///
+/// # FreeBSD and DragonFly are not resolved by this
+///
+/// They bind no `MSG_MCAST`, so `delivery` is `None` there and this returns them
+/// to the source test — which is where the availability residual lives, named in
+/// this module's header and counted as
+/// [`Refuse::UnscopedGroupSourceOffLink`].
+fn unscoped_group_arm(
+  src: SocketAddr,
+  delivery: Option<LinkDelivery>,
+  link: BoundLink<'_>,
+  iface: IfaceWitness,
+) -> Verdict {
+  match delivery {
+    // Definitive NEGATIVE evidence, and it decides here for the same reason it
+    // decides one arm down: §11 gives a link-layer broadcast no arm at all.
+    Some(LinkDelivery::Broadcast) => Verdict::Refuse(Refuse::BroadcastDelivery),
+    // The kernel says this was delivered to a group and the address says WHICH
+    // group, and it is ours. That is not arm one — nothing scoped the link — but
+    // it is exactly what the same flag is worth to the datagram beside this one.
+    Some(LinkDelivery::Multicast) => Verdict::Admit(Admit::UnscopedMdnsGroup),
+    // No flag, or one that says only "neither of those": §11's source arm, and
+    // its refusal is named so the availability cost is measurable.
+    Some(LinkDelivery::Unicast) | None => source_arm(
+      src,
+      link,
+      iface,
+      Admit::UnscopedMdnsGroup,
+      Refuse::UnscopedGroupSourceOffLink,
+    ),
   }
 }
 
@@ -1963,7 +2367,11 @@ fn src_on_local_link(src: SocketAddr, link: BoundLink<'_>, iface: IfaceWitness) 
     // NIC wherever an operator has stopped treating `127/8` as martian.
     // Whether a witness contradicts it is `arrived_on_bound_interface`'s
     // question, asked there rather than restated here.
-    return link.is_loopback() && arrived_on_bound_interface(src, link, iface).is_none();
+    // `is_ok` and not a test on the exemption: this asks only whether the link
+    // evidence REFUSED. Whether §11 arm one's source exemption was earned is a
+    // question for the destination arms, and a loopback source is being weighed
+    // here precisely because it did not take one of them.
+    return link.is_loopback() && arrived_on_bound_interface(src, link, iface).is_ok();
   }
   // EVERY other source — routable or link-local, witnessed or not — answers to
   // §11's unicast test as the RFC states it: the source address against the
