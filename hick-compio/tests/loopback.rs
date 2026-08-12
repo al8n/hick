@@ -1,4 +1,13 @@
 //! End-to-end loopback tests for the compio driver.
+//!
+//! Endpoint construction goes through [`common::loopback_v4_endpoint`], which
+//! skips only when an independent control socket was refused the construction
+//! the exact same way — see `tests/common/mod.rs`. Every test here used to
+//! hand-roll its own `match Endpoint::server(opts).await { Ok(e) => e, Err(_)
+//! => return }`, uncorroborated, which reported a false "all tests passed" the
+//! moment `Endpoint::server` started failing for a real reason (forcing
+//! `hick_udp::try_bind_v4` to return `PermissionDenied` used to leave this
+//! whole file green).
 #![cfg(any(unix, windows))]
 #![allow(clippy::unwrap_used)]
 
@@ -6,53 +15,19 @@ mod common;
 
 use std::time::Duration;
 
-fn super_loopback_index() -> Option<u32> {
-  let ifs = getifs::interfaces().ok()?;
-  ifs
-    .iter()
-    .find(|i| i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP))
-    .map(|i| i.index())
-}
-
 #[compio::test]
 async fn endpoint_server_constructs_and_drops_cleanly() {
-  use hick_compio::{Endpoint, ServerOptions};
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
-  };
-  let opts = ServerOptions::default()
-    .with_interface_index(Some(idx))
-    .with_ipv6(false);
-  let ep = match Endpoint::server(opts).await {
-    Ok(e) => e,
-    Err(e) => {
-      eprintln!("skip: {e:?}");
-      return;
-    }
+  let Some(ep) = common::loopback_v4_endpoint().await else {
+    return;
   };
   drop(ep);
 }
 
 #[compio::test]
 async fn register_service_handle_is_returned() {
-  use hick_compio::{Endpoint, Name, ServerOptions, ServiceRecords, ServiceSpec};
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
-  };
-  let ep = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(e) => {
-      eprintln!("skip: {e:?}");
-      return;
-    }
+  use hick_compio::{Name, ServiceRecords, ServiceSpec};
+  let Some(ep) = common::loopback_v4_endpoint().await else {
+    return;
   };
   let stype = Name::try_from_str("_t._tcp.local.").unwrap();
   let inst = Name::try_from_str("R._t._tcp.local.").unwrap();
@@ -65,21 +40,10 @@ async fn register_service_handle_is_returned() {
 
 #[compio::test]
 async fn start_query_returns_handle_and_next_terminates_on_timeout() {
-  use hick_compio::{Endpoint, Name, QueryEvent, QuerySpec, ServerOptions};
+  use hick_compio::{Name, QueryEvent, QuerySpec};
   use mdns_proto::wire::ResourceType;
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
-  };
-  let ep = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
+  let Some(ep) = common::loopback_v4_endpoint().await else {
+    return;
   };
   let spec = QuerySpec::new(
     Name::try_from_str("_nx._tcp.local.").unwrap(),
@@ -99,20 +63,9 @@ async fn start_query_returns_handle_and_next_terminates_on_timeout() {
 
 #[compio::test]
 async fn responder_reaches_established_on_loopback() {
-  use hick_compio::{Endpoint, Name, ServerOptions, ServiceRecords, ServiceSpec, ServiceUpdate};
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
-  };
-  let ep = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
+  use hick_compio::{Name, ServiceRecords, ServiceSpec, ServiceUpdate};
+  let Some(ep) = common::loopback_v4_endpoint().await else {
+    return;
   };
   let stype = Name::try_from_str("_resp._tcp.local.").unwrap();
   let inst = Name::try_from_str("R._resp._tcp.local.").unwrap();
@@ -139,34 +92,13 @@ async fn responder_reaches_established_on_loopback() {
 
 #[compio::test]
 async fn responder_to_querier_loopback_ptr() {
-  use hick_compio::{
-    Endpoint, Name, QueryEvent, QuerySpec, ServerOptions, ServiceRecords, ServiceSpec,
-  };
+  use hick_compio::{Name, QueryEvent, QuerySpec, ServiceRecords, ServiceSpec};
   use mdns_proto::wire::ResourceType;
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
+  let Some(responder) = common::loopback_v4_endpoint().await else {
+    return;
   };
-
-  let responder = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
-  };
-  let querier = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
+  let Some(querier) = common::loopback_v4_endpoint().await else {
+    return;
   };
 
   let stype = Name::try_from_str("_ptr._tcp.local.").unwrap();
@@ -210,30 +142,12 @@ async fn responder_to_querier_loopback_ptr() {
 
 #[compio::test]
 async fn browse_returns_registered_instance() {
-  use hick_compio::{Endpoint, Name, QueryParam, ServerOptions, ServiceRecords, ServiceSpec};
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
+  use hick_compio::{Name, QueryParam, ServiceRecords, ServiceSpec};
+  let Some(responder) = common::loopback_v4_endpoint().await else {
+    return;
   };
-  let responder = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
-  };
-  let querier = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
+  let Some(querier) = common::loopback_v4_endpoint().await else {
+    return;
   };
 
   let stype = Name::try_from_str("_b._tcp.local.").unwrap();
@@ -270,34 +184,13 @@ async fn browse_returns_registered_instance() {
 
 #[compio::test]
 async fn responder_to_querier_loopback_srv() {
-  use hick_compio::{
-    Endpoint, Name, QueryEvent, QuerySpec, ServerOptions, ServiceRecords, ServiceSpec,
-  };
+  use hick_compio::{Name, QueryEvent, QuerySpec, ServiceRecords, ServiceSpec};
   use mdns_proto::wire::ResourceType;
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
+  let Some(responder) = common::loopback_v4_endpoint().await else {
+    return;
   };
-
-  let responder = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
-  };
-  let querier = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
+  let Some(querier) = common::loopback_v4_endpoint().await else {
+    return;
   };
 
   let stype = Name::try_from_str("_srv._tcp.local.").unwrap();
@@ -341,34 +234,13 @@ async fn responder_to_querier_loopback_srv() {
 
 #[compio::test]
 async fn responder_to_querier_loopback_txt() {
-  use hick_compio::{
-    Endpoint, Name, QueryEvent, QuerySpec, ServerOptions, ServiceRecords, ServiceSpec,
-  };
+  use hick_compio::{Name, QueryEvent, QuerySpec, ServiceRecords, ServiceSpec};
   use mdns_proto::wire::ResourceType;
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
+  let Some(responder) = common::loopback_v4_endpoint().await else {
+    return;
   };
-
-  let responder = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
-  };
-  let querier = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
+  let Some(querier) = common::loopback_v4_endpoint().await else {
+    return;
   };
 
   let stype = Name::try_from_str("_txt._tcp.local.").unwrap();
@@ -412,34 +284,13 @@ async fn responder_to_querier_loopback_txt() {
 
 #[compio::test]
 async fn responder_to_querier_loopback_a() {
-  use hick_compio::{
-    Endpoint, Name, QueryEvent, QuerySpec, ServerOptions, ServiceRecords, ServiceSpec,
-  };
+  use hick_compio::{Name, QueryEvent, QuerySpec, ServiceRecords, ServiceSpec};
   use mdns_proto::wire::ResourceType;
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
+  let Some(responder) = common::loopback_v4_endpoint().await else {
+    return;
   };
-
-  let responder = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
-  };
-  let querier = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
+  let Some(querier) = common::loopback_v4_endpoint().await else {
+    return;
   };
 
   let stype = Name::try_from_str("_a._tcp.local.").unwrap();
@@ -483,32 +334,14 @@ async fn responder_to_querier_loopback_a() {
 
 #[compio::test]
 async fn resolve_host_returns_addresses() {
-  use hick_compio::{Endpoint, Name, ServerOptions, ServiceRecords, ServiceSpec};
+  use hick_compio::{Name, ServiceRecords, ServiceSpec};
   use std::net::IpAddr;
 
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
+  let Some(responder) = common::loopback_v4_endpoint().await else {
+    return;
   };
-  let responder = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
-  };
-  let querier = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
+  let Some(querier) = common::loopback_v4_endpoint().await else {
+    return;
   };
 
   let stype = Name::try_from_str("_rh._tcp.local.").unwrap();
@@ -560,23 +393,9 @@ async fn resolve_host_returns_addresses() {
 /// withdrawal — not leaked (the original Drop bug) and not held forever.
 #[compio::test]
 async fn dropping_service_releases_proto_slot_for_reregister() {
-  use hick_compio::{Endpoint, Name, RegisterError, ServerOptions, ServiceRecords, ServiceSpec};
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
-  };
-  let ep = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(e) => {
-      eprintln!("skip: {e:?}");
-      return;
-    }
+  use hick_compio::{Name, RegisterError, ServiceRecords, ServiceSpec};
+  let Some(ep) = common::loopback_v4_endpoint().await else {
+    return;
   };
   let stype = Name::try_from_str("_gb._tcp.local.").unwrap();
   let inst = Name::try_from_str("GB._gb._tcp.local.").unwrap();
@@ -635,23 +454,9 @@ async fn dropping_service_releases_proto_slot_for_reregister() {
 /// and the bounded sleep lets the driver run its shutdown drain.
 #[compio::test]
 async fn dropping_endpoint_and_service_shuts_down_cleanly() {
-  use hick_compio::{Endpoint, Name, ServerOptions, ServiceRecords, ServiceSpec};
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
-  };
-  let ep = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(e) => {
-      eprintln!("skip: {e:?}");
-      return;
-    }
+  use hick_compio::{Name, ServiceRecords, ServiceSpec};
+  let Some(ep) = common::loopback_v4_endpoint().await else {
+    return;
   };
   let stype = Name::try_from_str("_sd._tcp.local.").unwrap();
   let inst = Name::try_from_str("SD._sd._tcp.local.").unwrap();
@@ -677,31 +482,13 @@ async fn dropping_endpoint_and_service_shuts_down_cleanly() {
 
 #[compio::test]
 async fn resolve_instance_returns_entry() {
-  use hick_compio::{Endpoint, Name, ServerOptions, ServiceRecords, ServiceSpec};
+  use hick_compio::{Name, ServiceRecords, ServiceSpec};
 
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
+  let Some(responder) = common::loopback_v4_endpoint().await else {
+    return;
   };
-  let responder = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
-  };
-  let querier = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(_) => return,
+  let Some(querier) = common::loopback_v4_endpoint().await else {
+    return;
   };
 
   let stype = Name::try_from_str("_ri._tcp.local.").unwrap();
@@ -758,31 +545,17 @@ async fn resolve_instance_returns_entry() {
 /// liveness proof).
 #[compio::test]
 async fn timeoutless_query_makes_progress_without_other_traffic() {
-  use hick_compio::{Endpoint, Name, QuerySpec, ServerOptions};
+  use hick_compio::QuerySpec;
   use mdns_proto::wire::ResourceType;
 
-  let idx = match super_loopback_index() {
-    Some(i) => i,
-    None => return,
-  };
-  let ep = match Endpoint::server(
-    ServerOptions::default()
-      .with_interface_index(Some(idx))
-      .with_ipv6(false),
-  )
-  .await
-  {
-    Ok(e) => e,
-    Err(e) => {
-      eprintln!("skip: {e:?}");
-      return;
-    }
+  let Some(ep) = common::loopback_v4_endpoint().await else {
+    return;
   };
 
   // Default QuerySpec → timeout: None. The ONLY thing that schedules a deadline
   // is the first transmit actually being pumped; if start_query's wake is lost
   // the driver has nothing to wake on.
-  let qname = Name::try_from_str("liveness-probe.local.").unwrap();
+  let qname = hick_compio::Name::try_from_str("liveness-probe.local.").unwrap();
   let q = ep
     .start_query(QuerySpec::new(qname, ResourceType::A))
     .await
@@ -801,7 +574,7 @@ async fn timeoutless_query_makes_progress_without_other_traffic() {
   let q2 = compio::time::timeout(
     Duration::from_secs(2),
     ep.start_query(QuerySpec::new(
-      Name::try_from_str("liveness-probe-2.local.").unwrap(),
+      hick_compio::Name::try_from_str("liveness-probe-2.local.").unwrap(),
       ResourceType::A,
     )),
   )
