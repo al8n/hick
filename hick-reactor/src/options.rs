@@ -126,6 +126,17 @@ impl ServerOptions {
   /// NetBSD and nowhere else). Where both are absent, group traffic §11 requires
   /// be accepted is refused whenever the sender's prefix is not one of ours.
   ///
+  /// A datagram that recovered the DESTINATION but not the interface is a third
+  /// case and behaves like neither. It keeps every refusal its destination earns
+  /// — a foreign group is still refused AS a foreign group — and loses only §11
+  /// arm one's *"regardless of source IP address"* exemption, which
+  /// `hick_onlink::admits_ingress` grants solely to a datagram something scoped
+  /// to this interface. So an off-prefix group sender is refused there too, and
+  /// an on-prefix one is admitted under `Admit::UnscopedMdnsGroup`. On the four
+  /// BSDs the IPv4 pair is two separately-allocated cmsgs and that square is
+  /// ordinary; a zero `ipi_ifindex` inside an `IP_PKTINFO` is the same square
+  /// everywhere else.
+  ///
   /// The boundary is a STAGED decision and no summary of two of its inputs
   /// describes it — an interface index of zero means opposite things depending
   /// on whether this path could have supplied one. The inbound TTL decides
