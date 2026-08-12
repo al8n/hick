@@ -271,6 +271,8 @@ pub mod stats {
     ingress_witness_declined: AtomicU64,
     ingress_degraded_admits: AtomicU64,
     ingress_residual_refusals: AtomicU64,
+    ingress_unscoped_group_admits: AtomicU64,
+    ingress_unscoped_group_refusals: AtomicU64,
     parse_errors: AtomicU64,
     send_errors: AtomicU64,
     recv_errors: AtomicU64,
@@ -327,6 +329,24 @@ pub mod stats {
       // Counted so the conformance gap is an observation rather than an
       // argument.
       ingress_residual_refusals => "mdns_ingress_residual_refusals",
+      // A datagram addressed to an mDNS group that was ADMITTED without
+      // anything scoping it to the bound link — on the kernel's coarse
+      // multicast flag, or on §11's source arm. RFC 6762 §11 arm one's
+      // "regardless of source IP address" exemption was NOT granted to these;
+      // they are the residual exposure of having a fallback for the group arm
+      // at all, so the count is the size of that exposure.
+      ingress_unscoped_group_admits => "mdns_ingress_unscoped_group_admits",
+      // The other side of the same rule, and the one an operator alerts on: a
+      // datagram §11 says to admit "regardless of source IP address", REFUSED
+      // because nothing established that it arrived on the link this endpoint
+      // bound and its source was off-prefix.
+      //
+      // Every BSD skips ancillary cmsgs under the mbuf shortage a flood causes,
+      // so sustained movement here is an availability attack in progress rather
+      // than a misconfigured peer — and without this counter that cost is an
+      // argument rather than an observation. Reachable on FreeBSD and DragonFly,
+      // which bind no `MSG_MCAST`; OpenBSD and NetBSD admit on the flag instead.
+      ingress_unscoped_group_refusals => "mdns_ingress_unscoped_group_refusals",
       parse_errors => "mdns_parse_errors",
       send_errors => "mdns_send_errors",
       // A receive call that failed WITHOUT consuming a datagram — `ENOBUFS`
@@ -393,6 +413,8 @@ pub mod stats {
         ingress_witness_declined: self.ingress_witness_declined.load(Relaxed),
         ingress_degraded_admits: self.ingress_degraded_admits.load(Relaxed),
         ingress_residual_refusals: self.ingress_residual_refusals.load(Relaxed),
+        ingress_unscoped_group_admits: self.ingress_unscoped_group_admits.load(Relaxed),
+        ingress_unscoped_group_refusals: self.ingress_unscoped_group_refusals.load(Relaxed),
         parse_errors: self.parse_errors.load(Relaxed),
         send_errors: self.send_errors.load(Relaxed),
         recv_errors: self.recv_errors.load(Relaxed),
@@ -442,6 +464,15 @@ pub mod stats {
     /// Datagrams refused because their witnessed destination takes no §11 arm
     /// and no named class describes it.
     pub ingress_residual_refusals: u64,
+    /// Datagrams addressed to an mDNS group and admitted with nothing scoping
+    /// them to the bound link — the residual exposure of the group arm's
+    /// fallback. RFC 6762 §11 arm one was not granted to these.
+    pub ingress_unscoped_group_admits: u64,
+    /// Datagrams RFC 6762 §11 says to admit "regardless of source IP address",
+    /// refused for want of link scoping. The availability cost of that scoping,
+    /// and the counter to alert on: every BSD drops ancillary cmsgs under the
+    /// mbuf shortage a flood causes.
+    pub ingress_unscoped_group_refusals: u64,
     pub parse_errors: u64,
     pub send_errors: u64,
     /// Receive calls that failed without consuming a datagram (see the counter
