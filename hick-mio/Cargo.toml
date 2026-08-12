@@ -43,8 +43,11 @@ getifs.workspace = true
 # loopback interface via `IP_MULTICAST_IF`; `std::net::UdpSocket` exposes
 # multicast TTL and loop but not the egress interface, so a `0.0.0.0`-bound
 # sender egresses on the host's default multicast interface and never reaches an
-# endpoint joined on loopback.
-socket2 = { version = "0.6" }
+# endpoint joined on loopback. `features = ["all"]` additionally buys the
+# independent control socket in `tests/common/mod.rs` `SO_REUSEADDR`/
+# `SO_REUSEPORT`, which `std::net` cannot express and which the control needs to
+# match what an endpoint's own bind does.
+socket2 = { version = "0.6", features = ["all"] }
 
 [package.metadata.docs.rs]
 all-features = true
