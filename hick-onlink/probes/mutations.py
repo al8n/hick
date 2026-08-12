@@ -84,11 +84,69 @@ PROBES: tuple[Probe, ...] = (
             "wildcard-bound socket 'regardless of source IP address'."
         ),
         file=LIB,
-        find="""  if let Some(refusal) = arrived_on_bound_interface(src, link, iface) {
-    return Verdict::Refuse(refusal);
-  }""",
-        replace="""  let _ = arrived_on_bound_interface(src, link, iface);""",
+        find="""  let exemption = match arrived_on_bound_interface(src, link, iface) {
+    Ok(exemption) => exemption,
+    Err(refusal) => return Verdict::Refuse(refusal),
+  };""",
+        replace="""  let exemption =
+    arrived_on_bound_interface(src, link, iface).unwrap_or(GroupExemption::Granted);""",
         caught_by="a_group_destination_does_not_excuse_a_foreign_interface_or_scope",
+    ),
+    Probe(
+        name="arm-one-needs-the-link-scoping",
+        why=(
+            "§11 arm one admits 'regardless of source IP address' — the one "
+            "admission in this rule that weighs nothing about where the "
+            "datagram came from. What makes it safe here is the scoping of it "
+            "to the bound link, so granting it to a datagram nothing scoped "
+            "admits a wildcard-bound socket's copy of another NIC's group "
+            "traffic with no proof of provenance at all."
+        ),
+        file=LIB,
+        find="""    DestinationWitness::Witnessed(dst) if is_mdns_group(dst) => match exemption {
+      GroupExemption::Granted => Verdict::Admit(Admit::MdnsGroup),
+      GroupExemption::Withheld => unscoped_group_arm(src, delivery, link, iface),
+    },""",
+        replace="""    DestinationWitness::Witnessed(dst) if is_mdns_group(dst) => {
+      let _ = exemption;
+      Verdict::Admit(Admit::MdnsGroup)
+    }""",
+        caught_by="an_unscoped_group_destination_does_not_take_arm_ones_exemption",
+    ),
+    Probe(
+        name="an-unscoped-group-is-never-worse-than-a-blind-one",
+        why=(
+            "The unscoped group square carries strictly MORE evidence than the "
+            "square with no destination witness at all, and must never fare "
+            "worse. Send it straight to the source arm and OpenBSD/NetBSD REFUSE "
+            "an off-prefix peer that the blind square beside it ADMITS on "
+            "MSG_MCAST — punishing partial evidence, while an attacker who can "
+            "drop one cmsg can drop both and be admitted anyway."
+        ),
+        file=LIB,
+        find="    Some(LinkDelivery::Multicast) => Verdict::Admit(Admit::UnscopedMdnsGroup),",
+        replace="""    Some(LinkDelivery::Multicast) => source_arm(
+      src,
+      link,
+      iface,
+      Admit::UnscopedMdnsGroup,
+      Refuse::UnscopedGroupSourceOffLink,
+    ),""",
+        caught_by="an_unscoped_group_destination_does_not_take_arm_ones_exemption",
+    ),
+    Probe(
+        name="an-absent-link-witness-scopes-nothing",
+        why=(
+            "The other end of the same rule. A kernel that declined the cmsg, "
+            "and a path that emits none, both leave the link unnamed — and an "
+            "unnamed link cannot be the bound one. Call either of them scoped "
+            "and arm one's exemption is granted on the exact squares an "
+            "ancillary-mbuf shortage produces, which a flood causes."
+        ),
+        file=LIB,
+        find="    IfaceWitness::Declined | IfaceWitness::Blind => Ok(GroupExemption::Withheld),",
+        replace="    IfaceWitness::Declined | IfaceWitness::Blind => Ok(GroupExemption::Granted),",
+        caught_by="an_unscoped_group_destination_does_not_take_arm_ones_exemption",
     ),
     Probe(
         name="scope-id-is-a-second-link-witness",
@@ -113,8 +171,8 @@ PROBES: tuple[Probe, ...] = (
             "fail closed."
         ),
         file=LIB,
-        find="    IfaceWitness::Lost => Some(Refuse::LinkWitnessLost),",
-        replace="    IfaceWitness::Lost => None,",
+        find="    IfaceWitness::Lost => Err(Refuse::LinkWitnessLost),",
+        replace="    IfaceWitness::Lost => Ok(GroupExemption::Withheld),",
         caught_by="an_unreported_interface_is_absent_evidence_and_a_reported_zero_is_a_failed_proof",
     ),
     Probe(
@@ -126,9 +184,9 @@ PROBES: tuple[Probe, ...] = (
             "takes the responder off the air exactly when it is under attack."
         ),
         file=LIB,
-        find="    IfaceWitness::Declined | IfaceWitness::Blind => None,",
-        replace="""    IfaceWitness::Declined => Some(Refuse::LinkWitnessLost),
-    IfaceWitness::Blind => None,""",
+        find="    IfaceWitness::Declined | IfaceWitness::Blind => Ok(GroupExemption::Withheld),",
+        replace="""    IfaceWitness::Declined => Err(Refuse::LinkWitnessLost),
+    IfaceWitness::Blind => Ok(GroupExemption::Withheld),""",
         caught_by="a_declined_witness_decides_exactly_as_a_blind_one",
     ),
     Probe(
@@ -141,7 +199,7 @@ PROBES: tuple[Probe, ...] = (
         ),
         file=LIB,
         find="    DestinationWitness::Lost => Verdict::Refuse(Refuse::DestinationWitnessLost),",
-        replace="    DestinationWitness::Lost => source_arm(src, link, iface, Admit::BlindSourceOnLink),",
+        replace="    DestinationWitness::Lost => source_arm(src, link, iface, Admit::BlindSourceOnLink, Refuse::SourceOffLink),",
         caught_by="a_lost_witness_refuses_where_a_declined_one_admits",
     ),
     Probe(
@@ -172,7 +230,7 @@ PROBES: tuple[Probe, ...] = (
         ),
         file=LIB,
         find="      Some(LinkDelivery::Broadcast) => Verdict::Refuse(Refuse::BroadcastDelivery),",
-        replace="      Some(LinkDelivery::Broadcast) => source_arm(src, link, iface, Admit::BlindSourceOnLink),",
+        replace="      Some(LinkDelivery::Broadcast) => source_arm(src, link, iface, Admit::BlindSourceOnLink, Refuse::SourceOffLink),",
         caught_by="a_broadcast_delivery_is_refused_where_no_destination_was_recovered",
     ),
     Probe(
@@ -184,8 +242,8 @@ PROBES: tuple[Probe, ...] = (
             "residual four review rounds spent subtracting classes from."
         ),
         file=LIB,
-        find="    DestinationWitness::Witnessed(_) if link.local_addrs().is_empty() => {",
-        replace="    DestinationWitness::Witnessed(_) if !link.local_addrs().is_empty() => {",
+        find="    DestinationWitness::Witnessed(_) if link.local_addrs().is_empty() => source_arm(",
+        replace="    DestinationWitness::Witnessed(_) if !link.local_addrs().is_empty() => source_arm(",
         caught_by="a_destination_this_interface_does_not_hold_has_no_section_11_arm",
     ),
     Probe(
@@ -229,7 +287,7 @@ PROBES: tuple[Probe, ...] = (
             "adjacent spoofer the whole boundary."
         ),
         file=LIB,
-        find="    return link.is_loopback() && arrived_on_bound_interface(src, link, iface).is_none();",
+        find="    return link.is_loopback() && arrived_on_bound_interface(src, link, iface).is_ok();",
         replace="    return true;",
         caught_by="loopback_is_on_link_for_a_loopback_bound_endpoint_and_nobody_else",
     ),
@@ -285,7 +343,22 @@ PROBES: tuple[Probe, ...] = (
         file=LIB,
         find="    matches!(self, Self::Refuse(Refuse::DestinationNotHeld))",
         replace="    matches!(self, Self::Refuse(Refuse::ForeignGroup))",
-        caught_by="the_two_gap_counters_count_exactly_their_own_arms",
+        caught_by="the_four_gap_counters_count_exactly_their_own_arms",
+    ),
+    Probe(
+        name="the-unscoped-group-refusal-is-counted-apart",
+        why=(
+            "The availability cost of scoping arm one has to be measurable or "
+            "the trade is an argument. Fold it back into the generic "
+            "SourceOffLink and an operator can no longer tell a datagram §11 "
+            "said to admit, dropped for want of link evidence, from an ordinary "
+            "off-link source — which is the signal that a flood is degrading "
+            "this host."
+        ),
+        file=LIB,
+        find="      Refuse::UnscopedGroupSourceOffLink,\n    ),",
+        replace="      Refuse::SourceOffLink,\n    ),",
+        caught_by="the_four_gap_counters_count_exactly_their_own_arms",
     ),
     Probe(
         name="degraded-admit-counts-both-blind-arms",
@@ -297,7 +370,7 @@ PROBES: tuple[Probe, ...] = (
         file=LIB,
         find="      Self::Admit(Admit::BlindSourceOnLink | Admit::BlindMulticastDelivery)",
         replace="      Self::Admit(Admit::BlindSourceOnLink)",
-        caught_by="the_two_gap_counters_count_exactly_their_own_arms",
+        caught_by="the_four_gap_counters_count_exactly_their_own_arms",
     ),
 )
 
