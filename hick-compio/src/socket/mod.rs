@@ -37,18 +37,21 @@ mod unix;
 /// This used to read `hick_udp::onlink::reports_rx_interface`, justified by the
 /// two crates' `build.rs` files emitting `has_ip_pktinfo` / `has_ipv6_pktinfo`
 /// for identical target sets — true when it was written, and not a property
-/// either crate enforced. `hick-udp` has since widened its IPv4 answer to the
-/// four BSDs, where `recv_with_meta` now enables `IP_RECVDSTADDR` + `IP_RECVIF`
-/// and parses the pair. THIS decoder does neither: `decode_unix_cmsgs` reads
-/// `IP_PKTINFO` only, behind this crate's own `has_ip_pktinfo`, which is
-/// Linux/Android and Apple. Delegating would therefore have claimed a
-/// capability this path does not have, and [`RecvMeta::declare_cmsg_absent`]
-/// converts that claim into witnesses: `MSG_CTRUNC` would mint
-/// [`hick_udp::onlink::DestinationWitness::Lost`], which REFUSES, on a BSD IPv4
-/// square that recovers nothing to lose, and a clear flag would mint
-/// `Declined` — "the kernel skipped it for this datagram" — where the truth is
-/// that the path never asked. So the answer is stated here, from the cfgs that
-/// gate the decoder that has to honour it.
+/// either crate enforced. `hick-udp` then widened its IPv4 answer to the four
+/// BSDs while this decoder still read `IP_PKTINFO` only, and delegation would
+/// have claimed a capability this path did not have: [`RecvMeta::declare_cmsg_absent`]
+/// converts that claim into witnesses, so `MSG_CTRUNC` would have minted
+/// [`hick_udp::onlink::DestinationWitness::Lost`] — which REFUSES — on a BSD
+/// IPv4 square that recovered nothing to lose.
+///
+/// **That gap is now closed and the rule still stands.** `enable_recv_cmsgs`
+/// sets `IP_RECVDSTADDR` + `IP_RECVIF` on the BSDs and `decode_unix_cmsgs`
+/// recovers the pair through `hick_udp::parse_dstaddr_recvif_v4`, so the IPv4
+/// answer below is `true` on all four — but it says so from THIS crate's
+/// `has_ip_dstaddr_recvif`, which gates the code that has to honour it, and not
+/// from `hick-udp`'s. The two crates agreeing about a target is a fact to be
+/// re-established whenever either decoder changes, never a mechanism; the
+/// divergence that remains live is Windows, immediately below.
 ///
 /// # Windows recovers nothing, and says so
 ///
@@ -65,7 +68,10 @@ mod unix;
 /// nothing for it to weigh. A `WSARecvMsg` port is what turns it on.
 pub(crate) const fn rx_interface_reported(peer: core::net::SocketAddr) -> bool {
   match peer {
-    SocketAddr::V4(_) => cfg!(all(unix, has_ip_pktinfo)),
+    // Two spellings of one pair of facts, and exactly one of them is set on any
+    // target: `IP_PKTINFO` on Linux/Android/Apple, `IP_RECVDSTADDR` +
+    // `IP_RECVIF` on the four BSDs. Either one makes this path a witnessing one.
+    SocketAddr::V4(_) => cfg!(all(unix, any(has_ip_pktinfo, has_ip_dstaddr_recvif))),
     SocketAddr::V6(_) => cfg!(all(unix, has_ipv6_pktinfo)),
   }
 }
@@ -78,17 +84,24 @@ pub(crate) const fn rx_interface_reported(peer: core::net::SocketAddr) -> bool {
 pub struct RecvMeta {
   /// The peer that sent the datagram.
   peer: SocketAddr,
-  /// The destination address recorded by the kernel (from PKTINFO).
+  /// The receiving interface's own unicast address, where the ancillary data
+  /// carries one — `in_pktinfo.ipi_spec_dst` on Linux/Apple IPv4,
+  /// `in6_pktinfo.ipi6_addr` on IPv6. UNSPECIFIED on the BSD IPv4 path, and
+  /// that is the honest answer rather than a placeholder: neither
+  /// `IP_RECVDSTADDR` nor `IP_RECVIF` has an `ipi_spec_dst` equivalent, so the
+  /// fact is simply absent from the ancillary data there. Callers read an
+  /// unspecified local address as "fall back to content-hash self-detection".
   local_ip: IpAddr,
   /// What this receive path WITNESSED about the IP header DESTINATION. Distinct
-  /// from `local_ip`: on Unix IPv4 that field is `in_pktinfo.ipi_spec_dst`, the
-  /// receiving interface's own unicast address, which never equals a multicast
-  /// group — so reading it as a destination makes every multicast arrival look
-  /// unicast. `ipi_addr` (IPv4) and `ipi6_addr` (IPv6) are the header
-  /// destination and are what this carries.
+  /// from `local_ip`: on Linux/Apple IPv4 that field is
+  /// `in_pktinfo.ipi_spec_dst`, the receiving interface's own unicast address,
+  /// which never equals a multicast group — so reading it as a destination makes
+  /// every multicast arrival look unicast. The header destination is `ipi_addr`
+  /// (Linux/Apple IPv4), the whole `IP_RECVDSTADDR` payload (BSD IPv4) or
+  /// `ipi6_addr` (IPv6), and that is what this carries.
   destination: DestinationWitness,
-  /// What this receive path WITNESSED about the receiving interface, from
-  /// PKTINFO.
+  /// What this receive path WITNESSED about the receiving interface: PKTINFO's
+  /// index, or `sockaddr_dl::sdl_index` out of `IP_RECVIF` on the BSD IPv4 path.
   iface: IfaceWitness,
   /// IP TTL / IPv6 hop limit if the kernel exposed it.
   hop_limit: Option<u8>,
@@ -153,12 +166,18 @@ impl RecvMeta {
     }
   }
 
-  /// Declare, for a path that DOES decode ancillary data, that no PKTINFO cmsg
-  /// arrived for this datagram — and say which kind of absence it was.
+  /// Declare, for a path that DOES decode ancillary data, that no
+  /// destination/interface cmsg arrived for this datagram — and say which kind
+  /// of absence it was.
   ///
   /// Called once per receive, before the decoder runs, so a cmsg that IS present
-  /// simply overwrites it. `control_truncated` is the kernel's `MSG_CTRUNC`, and
-  /// it is the whole difference between:
+  /// simply overwrites it. On the BSD IPv4 path the two facts arrive in two
+  /// separately-allocated cmsgs (`IP_RECVDSTADDR` and `IP_RECVIF`), so ONE of
+  /// them can overwrite its half while the other's declaration stands — which is
+  /// why the two witnesses are separate values rather than one.
+  ///
+  /// `control_truncated` is the kernel's `MSG_CTRUNC`, and it is the whole
+  /// difference between:
   ///
   /// * [`DestinationWitness::Lost`] — our own control buffer was too small. The kernel had
   ///   the facts and this side could not take them, so §11 REFUSES;
@@ -183,7 +202,10 @@ impl RecvMeta {
     self.peer
   }
 
-  /// The destination address the kernel recorded for the datagram (PKTINFO).
+  /// The receiving interface's own unicast address, where the ancillary data
+  /// carries one. **Not the datagram's destination** — see
+  /// [`RecvMeta::destination_witness`] — and UNSPECIFIED on the BSD IPv4 path,
+  /// whose two cmsgs have no `ipi_spec_dst` equivalent.
   #[inline(always)]
   pub(crate) const fn local_ip(&self) -> IpAddr {
     self.local_ip
@@ -209,9 +231,13 @@ impl RecvMeta {
 
   /// What this receive path WITNESSED about the interface the datagram arrived
   /// on. The twin of [`RecvMeta::destination_witness`], split the same way for
-  /// the same reason: both halves ride on one PKTINFO cmsg, so a rule that
-  /// refused one absence and degraded the other would leave the degradation
-  /// unreachable.
+  /// the same reason: on the PKTINFO paths both halves ride on ONE cmsg, so a
+  /// rule that refused one absence and degraded the other would leave the
+  /// degradation unreachable. On the BSD IPv4 path they ride on two, and the
+  /// split stops being merely uniform and starts being load-bearing — NetBSD's
+  /// `ip_savecontrol` returns between the two emit sites when the receive
+  /// interface has detached, so a datagram can genuinely witness its destination
+  /// and not its interface.
   pub(crate) const fn iface_witness(&self) -> IfaceWitness {
     self.iface
   }
@@ -356,13 +382,23 @@ impl RecvMeta {
     }
   }
 
-  /// Present both witnesses as the KERNEL having declined to emit the PKTINFO
-  /// cmsg for this datagram: no interface, no destination, and no `MSG_CTRUNC`
-  /// to say our own buffer was at fault.
+  /// Present both witnesses as the KERNEL having declined to emit the
+  /// destination/interface cmsg for this datagram: no interface, no
+  /// destination, and no `MSG_CTRUNC` to say our own buffer was at fault.
   ///
-  /// Both halves go at once because that is what happens — the two facts ride on
-  /// one cmsg, and `sbcreatecontrol` either allocates the mbuf or skips the whole
-  /// message. Test-only; production mints this in `Socket::recv`.
+  /// Both halves go at once because on the PKTINFO paths they are two fields of
+  /// ONE cmsg, so its presence is decided once and neither field can go missing
+  /// alone. That is the payload SHAPE and not any kernel's failure mode — the
+  /// targets differ there and no shared mechanism may be appealed to. What each
+  /// one does is audited in `hick-onlink`'s module header and stated nowhere
+  /// else; see [`hick_udp::onlink::IfaceWitness::Declined`] for why that is one
+  /// place rather than several.
+  ///
+  /// It is not the only reachable shape on the BSD IPv4 path, where each fact
+  /// has its own cmsg and its own allocation; that half-and-half square is
+  /// covered directly against the decoder in `socket::unix`, which is where it
+  /// can be built out of real cmsg bytes rather than asserted into a meta.
+  /// Test-only; production mints this in `Socket::recv`.
   #[cfg(test)]
   pub(crate) const fn with_cmsg_declined(mut self) -> Self {
     self.destination = DestinationWitness::Declined;
@@ -399,8 +435,9 @@ impl RecvMeta {
 /// `compio` UDP socket wrapper + cmsg-aware recv/send.
 ///
 /// The constructor enables the kernel ancillary-data options the driver needs:
-/// PKTINFO for the receiving interface and the IP header destination, which are
-/// what RFC 6762 §11's arms actually read; RECVTTL/HOPLIMIT for the hop-limit
+/// the receiving interface and the IP header destination — PKTINFO on
+/// Linux/Android/Apple, `IP_RECVDSTADDR` + `IP_RECVIF` on the BSD IPv4 path —
+/// which are what RFC 6762 §11's arms actually read; RECVTTL/HOPLIMIT for the hop-limit
 /// diagnostic, which no admission decision reads; and
 /// `SO_TIMESTAMP`/`SO_TIMESTAMPNS` for ordered self-send classification. It then
 /// wraps the file descriptor as a `compio` socket.
@@ -424,13 +461,14 @@ impl Socket {
     Ok(Self { inner })
   }
 
-  /// One `recv_msg` with a 256-byte ancillary buffer; decode the metadata
+  /// One `recv_msg` with a 512-byte ancillary buffer; decode the metadata
   /// into [`RecvMeta`]. Owns its data + control buffers across the completion.
   ///
   /// Control buffer is backed by an `AlignedCtrlBuf` newtype that wraps a
-  /// `[u8; 256]` inside a `#[repr(align(8))]` struct — guaranteeing the
+  /// `[u8; 512]` inside a `#[repr(align(8))]` struct — guaranteeing the
   /// `cmsghdr` alignment that [`CMsgIter::new`] / `compio-net`'s `recv_msg`
-  /// both require.
+  /// both require. The capacity is a measured figure and not a tuning knob —
+  /// `MSG_CTRUNC` mints a witness that REFUSES — see `AlignedCtrlBuf`.
   pub async fn recv(&self, max: usize) -> std::io::Result<(Vec<u8>, RecvMeta)> {
     // Over-allocate by one sentinel byte beyond `max` (= max_recv_packet_size).
     // A legal datagram of up to and including `max` bytes then fits without

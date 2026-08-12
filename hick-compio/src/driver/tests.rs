@@ -482,13 +482,21 @@ impl Arrival {
     self
   }
 
-  /// The kernel DECLINED to emit the PKTINFO cmsg for this datagram: no
-  /// interface, no destination, and NO `MSG_CTRUNC` to say our own buffer was at
-  /// fault.
+  /// The kernel DECLINED to emit the destination/interface cmsg for this
+  /// datagram: no interface, no destination, and NO `MSG_CTRUNC` to say our own
+  /// buffer was at fault.
   ///
-  /// Both halves go at once because that is what actually happens — the two
-  /// facts ride on one cmsg, and `sbcreatecontrol` either allocates the mbuf or
-  /// skips the whole message.
+  /// Both halves go at once because on the single-PKTINFO paths they are two
+  /// fields of ONE cmsg, so its presence is decided once and neither field can
+  /// go missing alone. That follows from the payload SHAPE and from no kernel's
+  /// failure mode: the targets differ there, and what each one does is audited
+  /// in `hick-onlink`'s module header and stated nowhere else on purpose —
+  /// naming any of it here would be a third copy of facts one place establishes.
+  ///
+  /// On the BSD IPv4 pair this is one of four reachable shapes rather than the
+  /// only one, and the other three are covered where they can be built out of
+  /// real cmsg bytes instead of asserted into a fixture: `socket::unix`'s
+  /// `bsd_ipv4_decode_spells_each_absent_half_by_whose_failure_it_was`.
   fn cmsg_declined(mut self) -> Self {
     self.pkt_iface = 0;
     self.destination = None;
@@ -601,10 +609,14 @@ fn a_group_destination_admits_a_peer_from_an_unshared_prefix() {
     );
   }
 
-  // The OpenBSD/NetBSD IPv4 square: no PKTINFO parse wired in, so no
-  // destination — but `recvmsg`'s own `msg_flags` carries `MSG_MCAST`, which
-  // this driver reads off compio's `ReturnFlags` instead of discarding, and
-  // §11's group arm is what that stands in for.
+  // The OpenBSD/NetBSD IPv4 square with the destination cmsg DECLINED. The
+  // decoder asks for `IP_RECVDSTADDR` there, but each cmsg is its own
+  // `sbcreatecontrol` and every BSD skips one it cannot allocate, so "no
+  // destination" stays reachable under mbuf pressure — the state this covers.
+  // `recvmsg`'s own `msg_flags` still carries `MSG_MCAST`, which rides on the
+  // header rather than the control buffer and which this driver reads off
+  // compio's `ReturnFlags` instead of discarding; §11's group arm is what that
+  // stands in for.
   assert!(
     ingress_admits(
       Arrival::new(ingress_off_subnet_peer(), Family::V4, None, INGRESS_BOUND)
@@ -650,10 +662,11 @@ fn a_group_destination_admits_a_peer_from_an_unshared_prefix() {
 /// receive path.
 ///
 /// `169.254/16` names some link and never ours. Where the receive path reports
-/// no interface — IPv4 on the four BSDs, and any driver reading datagrams with
-/// `recvfrom` — nothing else names one either, so admitting it let a peer on a
-/// neighbouring NIC unicast straight into the cache and §8.2 conflict handling
-/// with no shared prefix and no forged address.
+/// no interface — this driver's Windows arm, which reads with `recv_from`, and
+/// any unix square where the kernel declined the cmsg — nothing else names one
+/// either, so admitting it let a peer on a neighbouring NIC unicast straight
+/// into the cache and §8.2 conflict handling with no shared prefix and no forged
+/// address.
 #[test]
 fn an_unwitnessed_link_local_source_is_refused() {
   let subnets = ingress_subnets();
@@ -1253,10 +1266,10 @@ fn a_loopback_source_from_a_foreign_interface_is_rejected() {
 /// of them, discovery stops working there and no rejecting test would notice.
 ///
 /// `iface_reported` is production's own value, not a fixture constant: it is
-/// `true` for both families on every target this driver builds for except the
-/// BSD IPv4 square, which is exactly the condition under which the interface
-/// check is live. A shape that survives it here survives it on the platforms
-/// that enforce it.
+/// `true` for both families on every unix this driver builds for and `false` on
+/// Windows, and `true` is exactly the condition under which the interface check
+/// is live. A shape that survives it here survives it on the platforms that
+/// enforce it.
 #[test]
 fn a_loopback_bound_endpoint_admits_its_own_traffic_in_every_shape() {
   let subnets = ingress_subnets();

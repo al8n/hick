@@ -451,8 +451,11 @@ fn an_unwitnessed_ipv4_link_local_source_is_refused() {
   // The bypass this closes: with no interface to give, `169.254/16` from a
   // neighbouring NIC used to reach the cache and §8.2 conflict handling on the
   // strength of its own address — no shared prefix, no spoofing, hop limit 255
-  // or none at all. That is every IPv4 receive on the four BSDs, and any driver
-  // reading its datagrams with `recvfrom`.
+  // or none at all. That is any driver reading its datagrams with `recvfrom`
+  // (`hick-compio` on Windows), and any datagram whose interface cmsg the kernel
+  // declined. IPv4 on the four BSDs used to be a permanent member of that set
+  // and no longer is: both receive paths witness the interface there now, so it
+  // reaches this state only per-datagram.
   let v4_ll = peer(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)));
   for reported in [true, false] {
     assert!(!on_local_link(v4_ll, &[], BOUND, 0, reported));
@@ -1101,19 +1104,23 @@ fn a_group_destination_does_not_excuse_a_foreign_interface_or_scope() {
 
 // ── The fallback's third reading: no destination at all ─────────────────────
 //
-// `RecvMeta::destination` is `None` wherever this crate recovers no IP header
-// destination — every IPv4 datagram on FreeBSD/DragonFly/OpenBSD/NetBSD, and
-// any receive whose PKTINFO cmsg was absent or truncated. §11 selects its arm by
-// destination, so `None` needs an answer of its own, and on OpenBSD/NetBSD the
-// kernel's `MSG_MCAST` is the one signal there is.
+// A datagram reaches this reading wherever the receive path recovered no IP
+// header destination: a path that witnesses none at all (`hick-compio` on
+// Windows), or any receive whose destination cmsg the kernel declined or our own
+// buffer truncated. §11 selects its arm by destination, so that needs an answer
+// of its own, and on OpenBSD/NetBSD the kernel's `MSG_MCAST` is the one signal
+// there is. IPv4 on the four BSDs was once permanently here and is not now —
+// both receive paths witness the destination there — but `Declined` still
+// arrives per datagram under mbuf pressure, which is exactly what these cases
+// cover.
 
 #[test]
 fn no_destination_but_a_kernel_multicast_flag_takes_the_group_arm() {
-  // The netbsdlike square, whole: no IPv4 PKTINFO parse (so no destination), no
-  // IP_RECVTTL binding (so no hop limit), and a source on a prefix the bound
-  // interface does not have configured — the overlaid subnet §11 calls it
-  // "essential" to admit. Before the flag was consulted, the source-prefix arm
-  // decided this and dropped it.
+  // The netbsdlike square with the destination cmsg DECLINED: no destination to
+  // partition on, no IP_RECVTTL binding (so no hop limit either), and a source on
+  // a prefix the bound interface does not have configured — the overlaid subnet
+  // §11 calls it "essential" to admit. Before the flag was consulted, the
+  // source-prefix arm decided this and dropped it.
   assert!(admits(
     peer(OFF_SUBNET_V4),
     None,
@@ -2954,8 +2961,11 @@ fn a_mixed_snapshot_does_not_let_a_nic_bound_endpoint_hold_the_loopback_block() 
   }
 }
 
-/// A broadcast DELIVERY is refused where no destination was recovered — the
-/// OpenBSD/NetBSD square, and the only exact destination fact it has.
+/// A broadcast DELIVERY is refused where no destination was recovered — on
+/// OpenBSD/NetBSD, the only exact destination fact left once the destination
+/// cmsg is gone. Those two targets witness the destination now, so this is the
+/// `Declined` path rather than a permanent square; the flag rides on the message
+/// header, so it survives the absence that put the datagram here.
 ///
 /// `MSG_BCAST` says the delivery was neither unicast to an address this host
 /// holds nor multicast to a group, which is precisely the class RFC 6762 §11
@@ -3012,7 +3022,8 @@ fn a_broadcast_delivery_is_refused_where_no_destination_was_recovered() {
     )
     .is_admit(),
     "and a target that reports no delivery class at all is unchanged — this is \
-     the FreeBSD/DragonFly and compio-Windows residual, still open"
+     the compio-Windows residual, still open, and where FreeBSD/DragonFly lands \
+     for a datagram whose cmsg the kernel declined"
   );
   // It refuses regardless of the source, so it is not a source test wearing a
   // different name: a loopback-bound endpoint's own traffic is refused too.
@@ -3475,8 +3486,11 @@ fn a_declined_witness_decides_exactly_as_a_blind_one() {
                one: {src} {flag:?} {iface:?}"
             );
           }
-          // ... and the interface witness, which comes off the same cmsg and so
-          // must split the same way.
+          // ... and the interface witness, which must split the same way. On the
+          // single-PKTINFO paths that is because both halves come off one cmsg;
+          // on the BSD IPv4 pair they come off two and can differ per datagram,
+          // which makes the symmetry a requirement on the RULE rather than a
+          // consequence of how the kernel packaged the facts.
           for dst in [
             DestinationWitness::Witnessed(UNICAST_V4_DST),
             DestinationWitness::Witnessed(V4_GROUP),
