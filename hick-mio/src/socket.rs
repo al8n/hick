@@ -746,8 +746,21 @@ struct BoundSocket {
 }
 
 impl BoundSocket {
-  fn new(sock: UdpSocket) -> Self {
-    Self {
+  /// Fallible on Windows only: resolving `WSARecvMsg` for this socket is the
+  /// capability check, and a provider that cannot supply it can never serve a
+  /// receive — so it fails here, at construction, rather than failing every
+  /// receive for the life of the socket.
+  fn new(sock: UdpSocket) -> io::Result<Self> {
+    #[cfg(windows)]
+    {
+      // Resolve once here purely as the CAPABILITY CHECK, and drop the result:
+      // `hick_udp::RecvMsgFn` borrows the socket it was resolved for, so it
+      // cannot be stored in this struct beside `sock` — that would be a borrow
+      // of a sibling field. `raw_recv` resolves its own, per receive.
+      use std::os::windows::io::AsSocket;
+      hick_udp::resolve_recv_with_meta(sock.as_socket())?;
+    }
+    Ok(Self {
       sock,
       token: None,
       interest: Interest::READABLE,
@@ -782,7 +795,7 @@ impl BoundSocket {
       forced_deregister_error: false,
       #[cfg(test)]
       reregisters: 0,
-    }
+    })
   }
 
   /// Whether this family may be selected for a read right now: mio reported it
@@ -825,7 +838,23 @@ impl BoundSocket {
       self.forced_recv_errors -= 1;
       return Err(io::Error::other("forced transient recv failure"));
     }
-    raw_recv(&self.sock, buf, is_v4)
+    #[cfg(unix)]
+    {
+      raw_recv(&self.sock, buf, is_v4)
+    }
+    #[cfg(windows)]
+    {
+      // Resolved per receive, for THIS socket, and used inside the same
+      // expression. It cannot be hoisted into a field — `RecvMsgFn<'a>` borrows
+      // the socket, and a struct holding both would be self-referential — and it
+      // cannot be hoisted into the drain loop either, because that loop reaches
+      // this socket through `&mut self`. The cost is one extra user-mode
+      // `WSAIoctl` per receive, against the `WSARecvMsg` syscall it precedes;
+      // the alternative was a token outliving its socket, which is the defect
+      // this shape exists to make unrepresentable.
+      use std::os::windows::io::AsSocket;
+      hick_udp::resolve_recv_with_meta(self.sock.as_socket())?.recv(buf, is_v4)
+    }
   }
 
   /// One `send_to` on this family's socket, retrying once on `EINTR`, and the
@@ -2321,14 +2350,6 @@ fn raw_recv(sock: &UdpSocket, buf: &mut [u8], is_v4: bool) -> io::Result<RecvMet
   hick_udp::recv_with_meta(sock.as_raw_fd(), buf, is_v4)
 }
 
-/// One `WSARecvMsg` with cmsg metadata, straight on the raw socket. See the
-/// Unix twin.
-#[cfg(windows)]
-fn raw_recv(sock: &UdpSocket, buf: &mut [u8], is_v4: bool) -> io::Result<RecvMeta> {
-  use std::os::windows::io::AsRawSocket;
-  hick_udp::recv_with_meta(sock.as_raw_socket(), buf, is_v4)
-}
-
 /// Re-arm a socket's readiness registration after we stopped reading it.
 ///
 /// mio's `IoSource::do_io` re-arms the AFD registration on `WouldBlock`. We read
@@ -2382,7 +2403,7 @@ fn bind_v4_family(interface_index: u32) -> Result<BoundSocket, ServerError> {
   // `mio::net::UdpSocket::from_std` assumes nothing about blocking mode, so the
   // non-blocking flag is ours to set.
   std_sock.set_nonblocking(true)?;
-  Ok(BoundSocket::new(UdpSocket::from_std(std_sock)))
+  BoundSocket::new(UdpSocket::from_std(std_sock)).map_err(ServerError::Io)
 }
 
 /// Bind + join the IPv6 mDNS group on `interface_index`.
@@ -2401,7 +2422,7 @@ fn bind_v6_family(interface_index: u32) -> Result<BoundSocket, ServerError> {
   }
   hick_trace::debug!(interface_index, "joined v6 mDNS multicast group");
   std_sock.set_nonblocking(true)?;
-  Ok(BoundSocket::new(UdpSocket::from_std(std_sock)))
+  BoundSocket::new(UdpSocket::from_std(std_sock)).map_err(ServerError::Io)
 }
 
 fn map_join_to_bind_v4(e: hick_udp::JoinError) -> ServerError {

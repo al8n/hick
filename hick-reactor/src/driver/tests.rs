@@ -5305,3 +5305,216 @@ async fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
      refused"
   );
 }
+
+/// The four kinds `is_permanent_recv_error` names are the only ones that end a
+/// family's receive task.
+///
+/// Pinned as a list rather than asserted one by one, because the DEFAULT is what
+/// the defect turned on: this loop used to treat every error but `WouldBlock`
+/// and `InvalidData` as fatal, so a transient `ENOBUFS` left the endpoint deaf
+/// on a family for the life of the process with sends still working.
+#[test]
+fn only_a_structurally_broken_socket_ends_a_receive_task() {
+  for kind in [
+    std::io::ErrorKind::NotConnected,
+    std::io::ErrorKind::PermissionDenied,
+    std::io::ErrorKind::Unsupported,
+    std::io::ErrorKind::InvalidInput,
+  ] {
+    assert!(
+      is_permanent_recv_error(&std::io::Error::from(kind)),
+      "{kind:?} must end the receive task: no retry gets past it"
+    );
+  }
+}
+
+/// Everything else is retried, and these are the ones that actually happen.
+///
+/// `ConnectionReset` is the Windows case in particular: a UDP socket is handed
+/// `WSAECONNRESET` after an ICMP port-unreachable for one of OUR OWN earlier
+/// sends, which says nothing about this socket and used to be fatal here.
+/// `OutOfMemory`/`Other` stand in for `ENOBUFS` under memory pressure, which is
+/// the case the reviewer named.
+#[test]
+fn a_transient_receive_error_is_retried_rather_than_fatal() {
+  for kind in [
+    std::io::ErrorKind::ConnectionReset,
+    std::io::ErrorKind::OutOfMemory,
+    std::io::ErrorKind::Interrupted,
+    std::io::ErrorKind::TimedOut,
+    std::io::ErrorKind::Other,
+  ] {
+    assert!(
+      !is_permanent_recv_error(&std::io::Error::from(kind)),
+      "{kind:?} must be retried: a receive path abandoned by mistake is deaf until the \
+       process restarts, while a permanent error read as transient costs only the backoff"
+    );
+  }
+}
+
+/// `InvalidData` is a consumed-but-unusable datagram, not a broken socket, and
+/// it is handled before the classification is ever reached. Pinned because the
+/// two names are one character apart and swapping them would make an oversized
+/// datagram kill the family.
+#[test]
+fn invalid_data_is_not_invalid_input() {
+  assert!(!is_permanent_recv_error(&std::io::Error::from(
+    std::io::ErrorKind::InvalidData
+  )));
+  assert!(is_permanent_recv_error(&std::io::Error::from(
+    std::io::ErrorKind::InvalidInput
+  )));
+}
+
+/// The backoff is monotonic, starts at a millisecond, and is capped — so a
+/// persistent transient error costs a bounded sleep per round rather than a hot
+/// loop or an unbounded wait.
+#[test]
+fn the_transient_receive_backoff_is_bounded_and_monotonic() {
+  let mut previous = Duration::ZERO;
+  for streak in 0..64u32 {
+    let d = transient_recv_backoff(streak);
+    assert!(
+      d >= previous,
+      "backoff must not shrink as the streak grows: {streak} gave {d:?} after {previous:?}"
+    );
+    assert!(
+      d <= Duration::from_millis(64),
+      "backoff must stay capped; {streak} gave {d:?}"
+    );
+    previous = d;
+  }
+  assert_eq!(transient_recv_backoff(0), Duration::from_millis(1));
+  assert_eq!(transient_recv_backoff(6), Duration::from_millis(64));
+  assert_eq!(
+    transient_recv_backoff(u32::MAX),
+    Duration::from_millis(64),
+    "a saturating streak must not shift past the cap"
+  );
+}
+
+/// `WSAEOPNOTSUPP` reads as `Uncategorized` through `ErrorKind`, so a classifier
+/// written over kinds alone calls it transient — and the Windows receive path
+/// would then peek the same queued datagram, rerun the same failing
+/// `WSARecvMsg` lookup, and make no progress forever.
+///
+/// This is the mirror of the defect that produced the retry path in the first
+/// place: that one returned on everything including recoverable errors, this one
+/// retried forever on an unrecoverable one. Same axis, opposite end.
+#[cfg(windows)]
+#[test]
+fn a_winsock_capability_gap_is_permanent_even_though_no_error_kind_names_it() {
+  // 10045 = WSAEOPNOTSUPP.
+  let e = std::io::Error::from_raw_os_error(10045);
+  // The property, asserted WITHOUT naming `ErrorKind::Uncategorized` — that
+  // variant is unstable, so a test that spelled it would not compile for this
+  // target at all. What matters is not which kind it is but that the kind-based
+  // rule cannot reach it: if Rust ever maps this to a kind the classifier
+  // already names, the raw-code entry becomes redundant and this assertion is
+  // what says so.
+  assert!(
+    !matches!(
+      e.kind(),
+      std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::PermissionDenied
+        | std::io::ErrorKind::Unsupported
+        | std::io::ErrorKind::InvalidInput
+    ),
+    "the kind-based rule is not supposed to be able to name this one"
+  );
+  assert!(
+    is_permanent_recv_error(&e),
+    "a provider that cannot supply WSARecvMsg will not start being able to"
+  );
+}
+
+/// `WSAECONNRESET` is delivered to a UDP socket after an ICMP port-unreachable
+/// for one of OUR OWN earlier sends. It says nothing about this socket, and it
+/// must stay retryable — it is the case the transient path exists for.
+#[cfg(windows)]
+#[test]
+fn a_spurious_udp_connection_reset_stays_transient_on_windows() {
+  // 10054 = WSAECONNRESET.
+  assert!(!is_permanent_recv_error(
+    &std::io::Error::from_raw_os_error(10054)
+  ));
+}
+
+/// The raw-code list is consulted, but it must not swallow the kind-based rule:
+/// an error with no raw code at all still classifies.
+#[test]
+fn an_error_without_a_raw_os_code_still_classifies_by_kind() {
+  let e = std::io::Error::new(std::io::ErrorKind::Unsupported, "synthetic");
+  assert_eq!(e.raw_os_error(), None);
+  assert!(is_permanent_recv_error(&e));
+}
+
+/// The transient budget exists so that whatever `Uncategorized` hides next
+/// cannot spin forever. Pinned as a real number because "bounded" without one is
+/// the claim, not the property.
+#[test]
+fn the_transient_budget_is_bounded_and_reaches_the_backoff_ceiling_long_before_it() {
+  // A `const` block: the relationship is between two constants, so it holds at
+  // compile time or not at all.
+  const {
+    assert!(
+      DEAF_AFTER_CONSECUTIVE_TRANSIENT_RECV_ERRORS > 6,
+      "the budget must outlast the doubling phase, or a brief flurry reports deafness"
+    );
+  }
+  let ceiling = transient_recv_backoff(DEAF_AFTER_CONSECUTIVE_TRANSIENT_RECV_ERRORS);
+  assert_eq!(
+    ceiling,
+    Duration::from_millis(64),
+    "the budget is spent at the ceiling, so its wall-clock cost is bounded"
+  );
+}
+
+/// `RecvHealth` is per family, both directions, and independent.
+///
+/// The "clear" direction is not decoration: a family reported deaf by the
+/// transient budget recovers on its next successful receive, so this must be a
+/// live reading and not a latch.
+#[test]
+fn recv_health_tracks_each_family_independently_and_both_ways() {
+  let health = RecvHealth::default();
+  assert_eq!(health.snapshot(), DeafFamilies::default());
+  assert!(!health.snapshot().any());
+
+  health.set(true, true);
+  assert!(health.snapshot().ipv4());
+  assert!(!health.snapshot().ipv6(), "v4 must not speak for v6");
+  assert!(health.snapshot().any());
+
+  health.set(false, true);
+  assert!(health.snapshot().ipv4() && health.snapshot().ipv6());
+
+  health.set(true, false);
+  assert!(
+    !health.snapshot().ipv4() && health.snapshot().ipv6(),
+    "a recovered family must clear, or the transient budget would be a one-way latch"
+  );
+}
+
+/// The signal has to survive the build almost everyone makes.
+///
+/// This crate's default features are `["tokio"]`. The first version of this fix
+/// reported a permanently deaf family with `hick_trace::warn!` and a `stats`
+/// counter, and BOTH compile to nothing here — `warn!` becomes `if false { .. }`
+/// without the `tracing` feature, and the counter is `#[cfg(feature = "stats")]`.
+/// So the endpoint went deaf in silence under default features, which is exactly
+/// what the fix claimed to have prevented.
+///
+/// `cfg!` rather than a `#[cfg]` on the test, so this reads as an assertion
+/// about the shipping configuration rather than quietly not running in it.
+#[test]
+fn the_deaf_family_signal_does_not_depend_on_optional_telemetry() {
+  let health = RecvHealth::default();
+  health.set(true, true);
+  assert!(
+    health.snapshot().ipv4(),
+    "DeafFamilies must be readable with tracing={} and stats={}",
+    cfg!(feature = "tracing"),
+    cfg!(feature = "stats")
+  );
+}

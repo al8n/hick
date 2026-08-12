@@ -422,14 +422,45 @@ fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
   )?;
   platform::set_multicast_loop_v4(&std_sock, opts.multicast_loop())?;
   platform::set_multicast_ttl_v4(&std_sock, opts.ttl())?;
-  // NOT best-effort where the option exists. On a target `reports_rx_interface_v4`
-  // calls capable, a receiver is entitled to read a zero interface index as "this
-  // datagram was not delivered on my link" and drop it; if the enable silently
-  // failed, every index would be zero and that receiver would be totally deaf
-  // rather than degraded. Exactly one of the two enables below does anything on
-  // any given target — `IP_PKTINFO` on Linux/Android/Apple/Windows, the
-  // `IP_RECVDSTADDR` + `IP_RECVIF` pair on the four BSDs — and the other is a
-  // no-op returning `Ok(())`.
+  // NOT best-effort where the option exists — and NOT because a silent failure
+  // would make this socket deaf. It would do the opposite, which is exactly why
+  // it has to fail HERE: `admits_ingress` passes a `Declined` witness the same
+  // way it passes `Blind`, so the socket keeps answering and simply stops being
+  // able to REFUSE, for its whole life, with no error and no return code.
+  //
+  // Which refusal it stops being able to make depends on which option is
+  // missing, and the two enables below differ in exactly that. `IP_PKTINFO` is
+  // ONE cmsg carrying both facts, so losing it costs the interface stage
+  // (`Refuse::ForeignLink`) and the whole destination partition
+  // (`ForeignGroup`, `BroadcastAddressed`, `DestinationNotHeld`, …) together.
+  // The BSD pair is TWO cmsgs the kernel allocates separately and
+  // `parse_dstaddr_recvif_v4` reports independently, so losing one costs one:
+  // no `IP_RECVDSTADDR` leaves `ForeignLink` working and the destination
+  // partition gone; no `IP_RECVIF` leaves the destination partition working and
+  // `ForeignLink` unreachable for IPv4. Either is half the trust boundary, which
+  // is reason enough for `?`.
+  //
+  // What is NOT lost is worth stating so this comment does not overclaim, and it
+  // is enumerated per delivery class rather than summarised, because a general
+  // sentence here has been wrong three times. With the destination `Declined`,
+  // `admits_ingress` decides on the kernel's coarse `LinkDelivery` alone:
+  //
+  //   Some(Broadcast)  refused, `BroadcastDelivery`   (OpenBSD/NetBSD only)
+  //   Some(Multicast)  ADMITTED, `BlindMulticastDelivery` — names no group, and
+  //                    the source arm never runs, so an out-of-prefix multicast
+  //                    source is admitted and `SourceOffLink` has no say
+  //                                                     (OpenBSD/NetBSD only)
+  //   Some(Unicast)    source arm — `SourceOffLink` refuses out-of-prefix
+  //                                                     (OpenBSD/NetBSD only)
+  //   None             source arm — same, on every other supported target
+  //
+  // An IPv6 peer's scope id remains a second interface witness, and every
+  // degraded admission is counted on `ingress_witness_declined`.
+  //
+  // Exactly one of the two enables below does anything on any given target —
+  // `IP_PKTINFO` on Linux/Android/Apple/Windows, the `IP_RECVDSTADDR` +
+  // `IP_RECVIF` pair on the four BSDs — and the other is a no-op returning
+  // `Ok(())`.
   platform::set_recv_pktinfo_v4(&std_sock)?;
   platform::set_recv_dstaddr_recvif_v4(&std_sock)?;
   // Read the BSD pair back. Unlike `verify_multicast_hops_v6` this is not
@@ -628,9 +659,13 @@ fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   verify_multicast_hops_v6(&std_sock, opts.hops())?;
   // NOT best-effort: `reports_rx_interface_v6` promises every supported target
   // reports the receiving interface, and a receiver that scopes itself to one
-  // link is entitled to drop what arrived elsewhere. See the IPv4 twin in
-  // `try_bind_v4_inner` for why a silent failure here would be deafness rather
-  // than degradation.
+  // link refuses what a witness places elsewhere. `IPV6_PKTINFO` is a single
+  // cmsg carrying both the destination and the interface, so unlike the BSD IPv4
+  // pair a silent failure here costs BOTH at once. See the IPv4 twin in
+  // `try_bind_v4_inner` for why that is a lost refusal rather than deafness, and
+  // why the quiet direction is the one that has to fail the bind. An IPv6 peer's
+  // scope id survives it as a second interface witness for link-local sources;
+  // nothing survives it for the destination.
   platform::set_recv_pktinfo_v6(&std_sock)?;
   // Best-effort: enabling kernel receive timestamps must not fail the bind on
   // platforms that lack the sockopt. A missing timestamp just leaves
@@ -1287,9 +1322,14 @@ pub fn recv_with_meta(
 
   // Whether THIS path witnesses a destination and a receive interface for this
   // family at all — a compile-time capability, read once here rather than
-  // inferred per datagram from a missing cmsg. The two go together because both
-  // ride on the same PKTINFO cmsg; the BSD `IP_RECVDSTADDR` + `IP_RECVIF` pair
-  // that would separate them is not wired into this path.
+  // inferred per datagram from a missing cmsg. ONE answer covers both facts
+  // because every target this function parses for supplies both or neither:
+  // `IP_PKTINFO` / `IPV6_PKTINFO` carry them in a single cmsg, and while the BSD
+  // `IP_RECVDSTADDR` + `IP_RECVIF` pair is two cmsgs that CAN arrive singly,
+  // `try_bind_v4` enables and verifies the two together, so the capability is
+  // joint there too. What varies per datagram is not this value's business:
+  // `parse_dstaddr_recvif_v4` reports each witness separately, and this is only
+  // reached when neither cmsg came back at all.
   //
   // Read through the same two functions the crate publishes as its capability
   // answer, so a target can never be blind to a driver and witnessing to the

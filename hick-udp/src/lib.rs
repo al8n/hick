@@ -54,8 +54,13 @@ pub use multicast::parse_pktinfo_v6;
 // Windows recovers the receiving interface index via WSARecvMsg
 // (IP_PKTINFO / IPV6_PKTINFO) so the driver's RFC 6762 §11 bound-interface
 // link-local scoping works there too. Mirrors the Unix `recv_with_meta`.
+// Windows receives through a per-socket handle rather than a free function, so
+// the `WSARecvMsg` pointer that was verified for a socket is the pointer that
+// socket's receives use. Winsock extension pointers are provider-specific and
+// are called directly, so a process-wide cache — which this was — could certify
+// a socket it had never examined. See `RecvMsgFn`.
 #[cfg(windows)]
-pub use platform::recv_with_meta;
+pub use platform::{RecvMsgFn, resolve_recv_with_meta};
 // `parse_pktinfo_v4` only exists on Unix targets that define `libc::IP_PKTINFO`
 // (`has_ip_pktinfo`, see build.rs); gate the re-export identically so it doesn't
 // dangle on FreeBSD/OpenBSD/DragonFly (which use IP_RECVDSTADDR/IP_RECVIF).

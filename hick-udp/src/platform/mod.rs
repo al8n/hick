@@ -13,4 +13,4 @@ pub(crate) use windows::*;
 // the crate root can surface it as `hick_udp::recv_with_meta` (mirroring the
 // Unix `recv_with_meta`).
 #[cfg(windows)]
-pub use windows::recv_with_meta;
+pub use windows::{RecvMsgFn, resolve_recv_with_meta};

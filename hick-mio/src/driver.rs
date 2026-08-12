@@ -622,17 +622,19 @@ impl Mdns {
       // and can never equal a group — see `admits_ingress` for why reading it
       // here rejected the very traffic §11 exists to admit.
       //
-      // Where the destination witness is `Blind` — `recv_with_meta`'s IPv4
-      // receives on FreeBSD, DragonFly, OpenBSD and NetBSD — or `Declined`,
-      // where a kernel skipped the cmsg for this one datagram, `admits_ingress`
-      // is in its SECOND regime and its guarantee that a destination this
-      // endpoint does not hold is refused does not apply. What is left there is
-      // `delivery`: `Broadcast` refuses on OpenBSD/NetBSD, which closes the IPv4
-      // broadcast class on those two; `Multicast` admits any group from any
-      // source; and FreeBSD/DragonFly have neither flag, so a broadcast is still
-      // admitted there for an in-prefix source. Wiring the BSD IPv4 ancillary
-      // parsers is what moves those squares into the first regime; see
-      // `hick-udp/build.rs`.
+      // `recv_with_meta` witnesses a destination on every square this crate
+      // builds for — `IP_PKTINFO` on Linux/Android/Apple, the `IP_RECVDSTADDR` +
+      // `IP_RECVIF` pair on FreeBSD, DragonFly, OpenBSD and NetBSD (enabled and
+      // read back inside `try_bind_v4`), `IPV6_PKTINFO` for IPv6, `WSARecvMsg`
+      // on Windows — so nothing reached from here is structurally `Blind`. What
+      // remains is `Declined`: ONE datagram whose cmsg a kernel skipped under
+      // mbuf pressure. For it `admits_ingress` is in its SECOND regime and its
+      // guarantee that a destination this endpoint does not hold is refused does
+      // not apply, and what is left is `delivery`: `Broadcast` refuses on
+      // OpenBSD/NetBSD, which closes the IPv4 broadcast class on those two;
+      // `Multicast` admits any group from any source; and every other target
+      // binds neither flag, so a broadcast is still admitted there for an
+      // in-prefix source.
       let iface_witness = sockets.rx_iface_witness(&meta);
       let destination = sockets.rx_destination_witness(&meta);
       let peer = sockets.rx_peer(&meta);

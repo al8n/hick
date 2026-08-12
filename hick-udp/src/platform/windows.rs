@@ -9,8 +9,7 @@
 
 use std::{
   net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
-  os::windows::io::RawSocket,
-  sync::OnceLock,
+  os::windows::io::{AsRawSocket, BorrowedSocket},
 };
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -148,12 +147,6 @@ fn set_bool_sockopt(sock: &UdpSocket, level: i32, optname: i32) -> std::io::Resu
   Ok(())
 }
 
-/// Process-wide cache of the `WSARecvMsg` extension function pointer, stored as
-/// a `usize`. The pointer is obtained once via `WSAIoctl`
-/// (`SIO_GET_EXTENSION_FUNCTION_POINTER`) and is stable for the lifetime of the
-/// Winsock provider.
-static WSARECVMSG_PTR: OnceLock<usize> = OnceLock::new();
-
 /// The `WSARecvMsg` extension function pointer. windows-sys does not export the
 /// `LPFN_WSARECVMSG` alias, so we declare the ABI here. The trailing overlapped
 /// / completion-routine parameters are nullable pointers (we always pass null
@@ -166,19 +159,86 @@ type WsaRecvMsgFn = unsafe extern "system" fn(
   lpcompletionroutine: *mut core::ffi::c_void,
 ) -> i32;
 
-/// Resolve the `WSARecvMsg` extension function pointer for `s` (cached).
-fn wsarecvmsg_fn(s: SOCKET) -> std::io::Result<WsaRecvMsgFn> {
-  if let Some(&p) = WSARECVMSG_PTR.get() {
-    // SAFETY: `p` was produced from a valid `WSARecvMsg` pointer below; the
-    // transmute restores the same function-pointer type.
-    #[allow(unsafe_code)]
-    return Ok(unsafe { core::mem::transmute::<usize, WsaRecvMsgFn>(p) });
+/// `WSARecvMsg`, resolved for ONE socket and **borrowing** that socket.
+///
+/// # Why a borrow, and not a number
+///
+/// This has now been wrong twice, one level apart, and the lifetime is what ends
+/// both.
+///
+/// It began as a process-wide `OnceLock`: resolved for whichever socket asked
+/// first and handed to every later caller. Winsock extension pointers are
+/// provider-specific and are invoked directly, without Ws2_32 routing, so a
+/// pointer obtained through one provider's socket is not valid for another's —
+/// the cache was keyed by nothing and could certify a socket it had never
+/// examined.
+///
+/// The first fix captured the socket, which fixed **identity** and said nothing
+/// about **liveness**. It stored a bare numeric `SOCKET` and derived `Copy`
+/// behind a safe constructor, so safe code could resolve socket A, copy the
+/// token, close A, and invoke the pointer once Windows had reused that number
+/// for socket B — the same cross-provider mismatch through a different door, and
+/// unsound rather than merely unwise. A `SOCKET` is a number that names a socket
+/// until it doesn't.
+///
+/// So the token borrows. [`BorrowedSocket<'a>`](std::os::windows::io::BorrowedSocket)
+/// is the standard "this socket is open for `'a`" witness, and holding one makes
+/// use-after-close a **compile error** rather than a documented rule. That is
+/// the whole design: the unsound use is unrepresentable, so there is no `unsafe`
+/// contract for a caller to read, believe, and get wrong.
+///
+/// Neither `Copy` nor `Clone`. The lifetime alone would make copying sound, but
+/// every use here is through `&self`, so nothing needs it — and a token that
+/// cannot be duplicated is one fewer way to end up holding it somewhere its
+/// socket does not reach.
+///
+/// # Why it is not an owning receiver
+///
+/// The natural stronger shape — a type that owns the socket and receives through
+/// itself — is not available to this crate: its consumers hold
+/// `mio::net::UdpSocket` and `agnostic_net`'s socket, not `std::net::UdpSocket`,
+/// and they need those for sending and readiness registration. Borrowing is the
+/// strongest shape that fits.
+pub struct RecvMsgFn<'a> {
+  func: WsaRecvMsgFn,
+  socket: BorrowedSocket<'a>,
+}
+
+impl core::fmt::Debug for RecvMsgFn<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    // The pointer is not printed: it is an address inside a provider DLL and
+    // says nothing a reader can act on. The socket it belongs to does.
+    f.debug_struct("RecvMsgFn")
+      .field("socket", &self.socket.as_raw_socket())
+      .finish_non_exhaustive()
   }
+}
+
+/// Resolve `WSARecvMsg` **for this socket**, with a real `WSAIoctl` every time.
+///
+/// Both the capability check and the thing the receives use: call it once per
+/// socket at bind and keep the result for that socket's receives, or call it per
+/// receive where a borrow cannot be stored. A provider that cannot supply the
+/// extension fails here rather than failing every receive afterwards — and
+/// because the resolution would otherwise sit between peeking a datagram and
+/// consuming one, "afterwards" means the datagram stays queued while every retry
+/// rediscovers the same gap, forever.
+///
+/// `WSAEOPNOTSUPP` is what comes back in that case, and it is worse than it
+/// looks from Rust: `std::io::Error::kind()` maps it to `Uncategorized`, which no
+/// `ErrorKind` match can name, so a classifier written over kinds alone reads a
+/// permanent capability gap as a transient hiccup.
+///
+/// Deliberately not cached anywhere — see [`RecvMsgFn`] for what caching cost,
+/// twice.
+pub fn resolve_recv_with_meta(socket: BorrowedSocket<'_>) -> std::io::Result<RecvMsgFn<'_>> {
+  let s = socket.as_raw_socket() as SOCKET;
   let guid = WSAID_WSARECVMSG;
   let mut func: Option<WsaRecvMsgFn> = None;
   let mut returned: u32 = 0;
-  // SAFETY: `s` is a live socket. The in-buffer is the GUID (sized exactly);
-  // the out-buffer is `func` (sized exactly). WSAIoctl writes at most
+  // SAFETY: `socket` is a live socket for `'a` (that is what `BorrowedSocket`
+  // witnesses). The in-buffer is the GUID (sized exactly); the out-buffer is
+  // `func` (sized exactly). WSAIoctl writes at most
   // `size_of::<LPFN_WSARECVMSG>()` bytes into `func` and the byte count into
   // `returned`. A null overlapped/completion routine performs a blocking ioctl.
   #[allow(unsafe_code)]
@@ -204,9 +264,7 @@ fn wsarecvmsg_fn(s: SOCKET) -> std::io::Result<WsaRecvMsgFn> {
       "WSARecvMsg extension unavailable",
     )
   })?;
-  let p = func as usize;
-  let _ = WSARECVMSG_PTR.set(p);
-  Ok(func)
+  Ok(RecvMsgFn { func, socket })
 }
 
 /// Receive one datagram together with its `IP_PKTINFO` / `IPV6_PKTINFO`
@@ -217,9 +275,26 @@ fn wsarecvmsg_fn(s: SOCKET) -> std::io::Result<WsaRecvMsgFn> {
 /// socket. A `WSAEWOULDBLOCK` surfaces as [`std::io::ErrorKind::WouldBlock`].
 /// Missing/truncated PKTINFO degrades to an UNSPECIFIED local address and a
 /// `0` interface index (never an error) so the datagram is not lost.
-pub fn recv_with_meta(socket: RawSocket, buf: &mut [u8], is_v4: bool) -> std::io::Result<RecvMeta> {
-  let s = socket as SOCKET;
-  let recvmsg = wsarecvmsg_fn(s)?;
+impl RecvMsgFn<'_> {
+  /// Receive one datagram on the socket this token borrows, together with its
+  /// `IP_PKTINFO` / `IPV6_PKTINFO` ancillary data.
+  ///
+  /// Takes no socket argument, deliberately: the pointer that was verified and
+  /// the socket it is invoked on cannot disagree, because there is nothing to
+  /// pass. See [`RecvMsgFn`] for the two revisions that reached that shape.
+  ///
+  /// The caller must have signalled readiness (e.g. via `peek_from`).
+  /// `WSAEWOULDBLOCK` surfaces as [`std::io::ErrorKind::WouldBlock`]; missing or
+  /// truncated `PKTINFO` degrades to an UNSPECIFIED local address and a `0`
+  /// interface index rather than an error, so the datagram is not lost.
+  pub fn recv(&self, buf: &mut [u8], is_v4: bool) -> std::io::Result<RecvMeta> {
+    recv_with_meta_on(self, buf, is_v4)
+  }
+}
+
+fn recv_with_meta_on(f: &RecvMsgFn<'_>, buf: &mut [u8], is_v4: bool) -> std::io::Result<RecvMeta> {
+  let recvmsg = f.func;
+  let s = f.socket.as_raw_socket() as SOCKET;
 
   let mut name: SOCKADDR_STORAGE = zeroed_sockaddr_storage();
   let mut wsabuf = WSABUF {

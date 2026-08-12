@@ -70,11 +70,30 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+      # `--no-fail-fast` is cargo-llvm-cov's own flag ("Run all tests regardless
+      # of failure"), not something forwarded blind, and this is the only
+      # WORKSPACE-WIDE test invocation in CI — so it is the one place where a
+      # protocol change that breaks several drivers differently can report all of
+      # them rather than the first crate to go red. Measured on the scoped musl
+      # leg below, with a failing test injected into hick-udp and two into
+      # mdns-proto: without the flag only hick-udp's `--lib` failure is reported
+      # and the run stops there; with it, `error: 3 targets failed` across both
+      # crates.
+      #
+      # It does not perturb the coverage number. Every test binary runs on a
+      # GREEN run either way, so the profraw set is identical — measured by
+      # running `cargo llvm-cov -p mdns-proto -p hick-udp --all-features
+      # --summary-only` with and without it, where every row of both tables
+      # matched, TOTAL included. On a RED run no report is produced at all and
+      # the step fails, unchanged: `--no-fail-fast` still exits non-zero. The
+      # flag that WOULD swallow the failure is `--ignore-run-fail`, and it must
+      # never appear here.
       - name: Generate coverage (Cobertura)
         shell: bash
         run: |
           mkdir -p coverage
           cargo llvm-cov --all-features --workspace ${{ matrix.exclude }} \
+            --no-fail-fast \
             --cobertura --output-path coverage/cobertura.xml ${{ matrix.gate }}
       - name: Upload coverage artifact
         continue-on-error: true
@@ -118,6 +137,7 @@ jobs:
         run: |
           mkdir -p coverage
           cargo llvm-cov -p mdns-proto -p hick-udp --all-features \
+            --no-fail-fast \
             --target x86_64-unknown-linux-musl \
             --cobertura --output-path coverage/cobertura.xml
       - name: Upload coverage artifact

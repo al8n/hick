@@ -55,37 +55,83 @@ family, at compile time:
 | Linux, Android | yes (`IP_PKTINFO`) | yes (`IPV6_PKTINFO`) |
 | macOS, iOS, tvOS, watchOS, visionOS | yes (`IP_PKTINFO`) | yes (`IPV6_PKTINFO`) |
 | Windows | yes (`IP_PKTINFO` via `WSARecvMsg`) | yes (`IPV6_PKTINFO`) |
-| **FreeBSD, DragonFly, OpenBSD, NetBSD** | **no** | yes (`IPV6_PKTINFO`) |
+| FreeBSD, DragonFly, OpenBSD, NetBSD | yes (`IP_RECVDSTADDR` + `IP_RECVIF`) | yes (`IPV6_PKTINFO`) |
 
-**The residual limitation.** On FreeBSD, DragonFly, OpenBSD and NetBSD there is
-no usable IPv4 `IP_PKTINFO`: the first three do not define it, and NetBSD's
-`in_pktinfo` is a different 8-byte layout that the shared parser reads as
-truncated. Every IPv4 `RecvMeta` on those targets reports interface index `0`,
-so an IPv4 datagram **cannot be proved to have arrived on the interface you
-bound**. A receiver has to choose between dropping all IPv4 traffic and
-admitting some that came from another link; the drivers in this family choose
-to admit it, because the alternative takes IPv4 mDNS off the air entirely
-there. Where the whole trust boundary matters — a host with more than one
-network, where an adjacent network must not be able to reach your responder's
-cache — prefer IPv6, which is provable on every supported target, or a platform
-in the first three rows.
+Every supported target, in both families, and the last row gets there by a
+different spelling rather than by `IP_PKTINFO`: FreeBSD, DragonFly and OpenBSD
+do not define that option at all, and NetBSD's `in_pktinfo` is a different
+8-byte layout that the shared parser reads as truncated. All four instead emit
+the IP header destination as a bare `struct in_addr` under `IP_RECVDSTADDR` and
+the receiving interface as a `struct sockaddr_dl` under `IP_RECVIF`.
+`try_bind_v4` enables the pair and `multicast::parse_dstaddr_recvif_v4` reads
+it, behind the `has_ip_dstaddr_recvif` capability cfg. NetBSD takes that pair
+rather than its own `IP_RECVPKTINFO` deliberately: its `ip_savecontrol` emits
+`IP_RECVDSTADDR` before the early return for a detached receive interface and
+`IP_PKTINFO` after it, so the pair still witnesses the destination exactly where
+the single cmsg witnesses nothing. `multicast::parse_netbsd_pktinfo_v4` stays
+compiled and unwired for that reason.
 
-The gap is this crate's, not the kernels'. All four BSDs do report an IPv4
-destination and receive interface, through `IP_RECVDSTADDR` + `IP_RECVIF`
-(FreeBSD, DragonFly, OpenBSD) or NetBSD's own `IP_RECVPKTINFO`, and
-`multicast::parse_dstaddr_recvif_v4` / `multicast::parse_netbsd_pktinfo_v4`
-decode both shapes. Those parsers are **not wired into `recv_with_meta`** and do
-not change the table above. Promoting them inverts the ingress rule for a
-datagram with no interface witness — from "admit" to "drop" — so a parse that
-was quietly wrong would make a responder deaf on IPv4 while still looking
-healthy, and no amount of cross-compiling can rule that out. `build.rs` records,
-at the emit site for the `ipv4_rx_*` cfgs, exactly what a real host of each
-target has to demonstrate first.
+**Setup fails; a missing control message only degrades.** The two are worth
+keeping apart, because only one of them is loud.
 
-IPv6 has no such gap, and `try_bind_v4`/`try_bind_v6` now **fail the bind**
-rather than continue if enabling `PKTINFO` fails on a target that claims the
-capability: a silently disabled option would make every index `0` and turn a
-link-scoped receiver deaf instead of merely degraded.
+A `setsockopt` that returns an error fails the bind — `try_bind_v4` /
+`try_bind_v6` propagate it rather than continuing best-effort. On the four BSDs
+the pair is additionally read back with `getsockopt` on every bind
+(`verify_rx_dstaddr_recvif_v4`), and a zero for either option fails the bind
+too: that is the false success no return code would show, and DragonFly, OpenBSD
+and NetBSD have no CI runner anywhere in this workspace, so the read-back is what
+stands in for execution on them. `build.rs` records, at the
+`has_ip_dstaddr_recvif` emit site, the four evidence items the capability rests
+on and where each has run.
+
+A datagram that arrives with **no control message at all** is a different thing,
+and it does **not** fail closed. `recv_with_meta` reports it as a `Declined`
+witness, and `hick-onlink`'s rule treats `Declined` exactly like `Blind`: it
+passes the interface stage and takes the residual arm — the kernel's
+`LinkDelivery` class where the target reports one, and RFC 6762 §11's
+source-prefix rule otherwise. The isolation **degrades** for that datagram; it is
+not refused. That is deliberate: every BSD builds its ancillary mbufs with
+`M_NOWAIT` and skips the cmsg with no error, no counter and no truncation flag
+when the allocation fails, so refusing there would take a responder off the air
+during exactly the flood that caused the shortage. The one absence that *does*
+refuse is `Lost` — `MSG_CTRUNC`, meaning the kernel had the fact and **our**
+buffer could not hold it — and `CmsgBuf` is sized (512 bytes against a worst case
+near 152) so that flag is a defect report rather than something the wire can
+provoke.
+
+Those two facts together are why the enable is checked rather than assumed. An
+enable that failed silently would **not** make the responder deaf. It would cost
+a **refusal**, permanently and quietly, while the endpoint went on answering —
+and which refusal depends on which option went missing, because the BSD row is
+two cmsgs rather than one:
+
+| lost | destination | interface | what stops refusing |
+|---|---|---|---|
+| `IP_PKTINFO` / `IPV6_PKTINFO` (one cmsg) | `Declined` | `Declined` | the interface stage *and* the whole destination partition |
+| `IP_RECVDSTADDR` only | `Declined` | still witnessed | `ForeignGroup`, `BroadcastAddressed`, `DestinationNotHeld`, … — `ForeignLink` still works |
+| `IP_RECVIF` only | still witnessed | `Declined` | `ForeignLink` for IPv4 — every destination refusal still fires |
+
+None of those is "isolating nothing", and none is silent: an IPv6 peer's scope id
+remains a second interface witness, and the drivers count every degraded
+admission on `ingress_witness_declined`. What survives on the destination side
+depends entirely on the kernel's coarse delivery class, so it is enumerated
+rather than summarised — a general sentence here has been wrong three times:
+
+| kernel `LinkDelivery` | where it occurs | verdict with no destination witness |
+|---|---|---|
+| `Broadcast` | OpenBSD / NetBSD only (`MSG_BCAST`) | **refused**, `BroadcastDelivery` |
+| `Multicast` | OpenBSD / NetBSD only (`MSG_MCAST`) | **admitted**, `BlindMulticastDelivery` — any source, any group, and the source arm never runs |
+| `Unicast` | OpenBSD / NetBSD only | source arm — `SourceOffLink` refuses an out-of-prefix source |
+| absent (`None`) | every other supported target | source arm — `SourceOffLink` refuses an out-of-prefix source |
+
+The `Multicast` row is the one that keeps catching people out: `admits_ingress`
+answers it immediately, so an out-of-prefix multicast source is **admitted** and
+`SourceOffLink` never gets a say.
+
+What justifies failing the bind is narrower than any of that and still enough:
+losing **either** witness dimension is a permanent, per-socket loss of half the
+trust boundary that no return code reported, and the read-back is the only thing
+that sees it.
 
 ## Installation
 

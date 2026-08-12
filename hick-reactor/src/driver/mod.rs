@@ -58,9 +58,13 @@ struct Packet {
   /// unexpected address on either socket would silently key the claim to the
   /// wrong family. See [`SelfSendTracker::take`].
   family: Family,
-  /// local receive address from PKTINFO (ipi_spec_dst / ipi6_addr).
-  /// `UNSPECIFIED` when PKTINFO is unavailable (Windows, or a kernel that didn't
-  /// deliver it). It is not part of the self-loopback decision at all — that is
+  /// The local receive address the ancillary data named, where it names one:
+  /// `ipi_spec_dst` / `ipi6_addr` on the Unix `PKTINFO` squares, and `ipi_addr`
+  /// on Windows, whose `IN_PKTINFO` has no `ipi_spec_dst` twin. `UNSPECIFIED`
+  /// where nothing names it — the BSD `IP_RECVDSTADDR` + `IP_RECVIF` pair
+  /// carries no interface address either, the `recv_from` arm carries no
+  /// ancillary data at all, and any kernel may decline the cmsg for one
+  /// datagram. It is not part of the self-loopback decision at all — that is
   /// [`DriverState::selfsend`]'s, taken before the proto layer sees the datagram.
   local_ip: IpAddr,
   /// What this receive path WITNESSED about the interface the datagram arrived
@@ -126,26 +130,32 @@ struct Packet {
   /// The kernel's own `MSG_MCAST` where this receive path reports it
   /// ([`hick_udp::RecvMeta::delivery`]), else `None`. Coarser than
   /// [`Packet::destination`] — "some multicast group" rather than which one —
-  /// and consulted only where no destination was WITNESSED. That is the
-  /// OpenBSD/NetBSD IPv4 square, which has no PKTINFO parse wired in and would
-  /// otherwise lose the same §11 group arm.
+  /// and consulted only where no destination was WITNESSED. On the OpenBSD and
+  /// NetBSD IPv4 square it is what stands between a cmsg the kernel declined to
+  /// emit and the loss of §11's group arm.
   ///
   /// **An unwitnessed destination is a different admission regime, not a
   /// coarser one.** `hick_udp::onlink::admits_ingress` refuses a WITNESSED
   /// destination this endpoint does not hold; with none witnessed it cannot.
-  /// This driver reads through `hick_udp::recv_with_meta`, so its `Blind`
-  /// squares are IPv4 on FreeBSD, DragonFly, OpenBSD and NetBSD, and what is
-  /// left there is exactly this field:
+  /// On Unix and Windows this driver reads through `hick_udp::recv_with_meta`,
+  /// which witnesses a destination on every one of those targets and in both
+  /// families — `IP_PKTINFO` on Linux/Android/Apple, the `IP_RECVDSTADDR` +
+  /// `IP_RECVIF` pair on FreeBSD, DragonFly, OpenBSD and NetBSD, `IPV6_PKTINFO`
+  /// for IPv6, `WSARecvMsg` on Windows — so the only structurally `Blind` square
+  /// left is the plain `recv_from` arm of `recv_task`, which serves every target
+  /// that is neither Unix nor Windows and reports no `delivery` either.
+  ///
+  /// What remains on the witnessing squares is per-datagram: a `Declined`
+  /// destination, wherever a kernel skipped the cmsg under mbuf pressure — every
+  /// BSD does, `sbcreatecontrol` running with `M_NOWAIT`. For that datagram what
+  /// is left is exactly this field:
   ///
   /// * `Broadcast` (OpenBSD/NetBSD only — `libc` binds `MSG_BCAST` nowhere else)
   ///   REFUSES, which closes the IPv4 broadcast class on those two;
   /// * `Multicast` admits and names no group, so any foreign group is admitted
   ///   there from any source;
-  /// * `None` — FreeBSD/DragonFly — leaves the source arm deciding, so an IPv4
+  /// * `None` — every other target — leaves the source arm deciding, so an IPv4
   ///   broadcast is still admitted there for an in-prefix source.
-  ///
-  /// A `Declined` destination lands in that same residual for one datagram,
-  /// wherever a kernel skipped the cmsg under mbuf pressure.
   ///
   /// Stated here so a reader of this struct is not left with the witnessed
   /// regime's guarantee; `admits_ingress` carries the full statement and what
@@ -2696,7 +2706,7 @@ pub(crate) fn spawn<N: Net>(
   sockets: BoundSockets<N>,
   cmd_rx: async_channel::Receiver<Command>,
   #[cfg(feature = "stats")] stats_out: &mut Option<std::sync::Arc<hick_trace::stats::Stats>>,
-) {
+) -> Arc<RecvHealth> {
   let max_send = opts.max_payload_size();
   let max_recv = opts.max_recv_packet_size();
   let state = DriverState::<N>::new(&opts, sockets);
@@ -2704,7 +2714,18 @@ pub(crate) fn spawn<N: Net>(
   {
     *stats_out = Some(state.stats.clone());
   }
-  <N::Runtime as RuntimeLite>::spawn_detach(driver_task::<N>(state, cmd_rx, max_send, max_recv));
+  // Created HERE rather than inside the task, because the caller has to hold a
+  // clone: it is the only signal `Endpoint::deaf_families` can read, and a value
+  // minted inside a detached task cannot be handed back out of one.
+  let health = Arc::new(RecvHealth::default());
+  <N::Runtime as RuntimeLite>::spawn_detach(driver_task::<N>(
+    state,
+    cmd_rx,
+    max_send,
+    max_recv,
+    health.clone(),
+  ));
+  health
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip_all))]
@@ -2713,6 +2734,7 @@ async fn driver_task<N: Net>(
   cmd_rx: async_channel::Receiver<Command>,
   max_send: usize,
   max_recv: usize,
+  health: Arc<RecvHealth>,
 ) {
   let mut scratch: Vec<u8> = vec![0u8; max_send.max(512)];
   let (packet_tx, packet_rx) = async_channel::bounded::<Packet>(64);
@@ -2735,6 +2757,7 @@ async fn driver_task<N: Net>(
       sd,
       true,
       max_recv,
+      health.clone(),
       #[cfg(feature = "stats")]
       stats,
     ));
@@ -2750,12 +2773,16 @@ async fn driver_task<N: Net>(
       sd,
       false,
       max_recv,
+      health.clone(),
       #[cfg(feature = "stats")]
       stats,
     ));
   }
   drop(packet_tx);
   drop(shutdown_rx); // recv loops hold their own clones; the sender stays with us.
+  // The driver task itself never reads the flags; the receive tasks own the
+  // writes and `Endpoint` owns the reads.
+  drop(health);
 
   loop {
     // drain any already-arrived packets BEFORE firing timers
@@ -3003,6 +3030,202 @@ fn count_consumed_oversized(stats: &hick_trace::stats::Stats, buf_len: usize) {
   stats.packets_dropped(1);
 }
 
+/// Which address families' receive paths have stopped receiving.
+///
+/// # Mandatory, not telemetry
+///
+/// This exists because the first attempt at this fix was wrong in a way worth
+/// recording. It made a permanently-failed receive task emit a `warn!` and bump
+/// a stats counter, and called that "loud but unsupervised" — but `hick-trace`'s
+/// `warn!` expands to `if false { … }` without the `tracing` feature and the
+/// counter is `#[cfg(feature = "stats")]`, and this crate's default features are
+/// `["tokio"]`. Under the configuration almost everyone builds, a family went
+/// deaf with no signal whatsoever. An observability guarantee that a feature
+/// flag can delete is not a guarantee.
+///
+/// So this is a plain value on the public API, readable with default features,
+/// no subscriber, and no opt-in: [`crate::Endpoint::deaf_families`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct DeafFamilies {
+  ipv4: bool,
+  ipv6: bool,
+}
+
+impl DeafFamilies {
+  /// Whether the IPv4 receive path has stopped receiving.
+  #[inline]
+  pub const fn ipv4(&self) -> bool {
+    self.ipv4
+  }
+
+  /// Whether the IPv6 receive path has stopped receiving.
+  #[inline]
+  pub const fn ipv6(&self) -> bool {
+    self.ipv6
+  }
+
+  /// Whether either family has. The common check, so it does not have to be
+  /// spelled as an `||` at every call site.
+  #[inline]
+  pub const fn any(&self) -> bool {
+    self.ipv4 || self.ipv6
+  }
+}
+
+/// The shared flags behind [`DeafFamilies`], written by the receive tasks and
+/// read by [`crate::Endpoint`].
+///
+/// `Relaxed` is the right ordering and not a shortcut: each flag is an
+/// independent one-way-then-back announcement about one family, nothing else is
+/// published through it, and a reader that sees a stale value gets the answer
+/// from a moment ago rather than a wrong one.
+#[derive(Debug, Default)]
+pub(crate) struct RecvHealth {
+  v4_deaf: std::sync::atomic::AtomicBool,
+  v6_deaf: std::sync::atomic::AtomicBool,
+}
+
+impl RecvHealth {
+  fn flag(&self, via_v4: bool) -> &std::sync::atomic::AtomicBool {
+    if via_v4 { &self.v4_deaf } else { &self.v6_deaf }
+  }
+
+  fn set(&self, via_v4: bool, deaf: bool) {
+    self
+      .flag(via_v4)
+      .store(deaf, std::sync::atomic::Ordering::Relaxed);
+  }
+
+  pub(crate) fn snapshot(&self) -> DeafFamilies {
+    use std::sync::atomic::Ordering::Relaxed;
+    DeafFamilies {
+      ipv4: self.v4_deaf.load(Relaxed),
+      ipv6: self.v6_deaf.load(Relaxed),
+    }
+  }
+}
+
+/// How many CONSECUTIVE transient receive errors — errors with not one
+/// successful receive between them — a family absorbs before it is reported
+/// deaf.
+///
+/// This is the backstop for a classifier that cannot see what it is looking at.
+/// `std::io::Error::kind()` maps a great many OS codes to `Uncategorized`, which
+/// no match arm can name, so an error that is structurally unrecoverable can
+/// read as transient and be retried forever. That is not hypothetical: Windows
+/// `WSAEOPNOTSUPP` from the `WSARecvMsg` lookup is exactly it, and because that
+/// lookup happens after the peek and before the receive, the datagram stays
+/// queued and every retry rediscovers the same gap.
+///
+/// The budget does NOT end the task. Reaching it reports the family deaf and
+/// keeps retrying at the backoff ceiling, and the next successful receive clears
+/// the flag. That combination is what makes the state safe to enter: a genuine
+/// flood that outlasts the budget is reported and then recovers by itself, while
+/// a structural gap is reported and costs one wakeup every 64 ms instead of a
+/// hot loop. Exiting instead would make a recoverable condition permanent, which
+/// is the defect this whole area started with.
+///
+/// 256 against a 64 ms ceiling is about 16 s of not receiving anything at all.
+const DEAF_AFTER_CONSECUTIVE_TRANSIENT_RECV_ERRORS: u32 = 256;
+
+/// Winsock codes that mean "this stack will never do this", which
+/// [`std::io::Error::kind`] flattens to `Uncategorized`.
+///
+/// Deliberately a raw-code list and deliberately short. The kind-based
+/// classifier below cannot express these at all — that is the whole reason this
+/// exists — and every entry is a capability statement about the provider rather
+/// than a condition that can clear:
+///
+/// * `WSAEOPNOTSUPP` (10045) — the operation is not supported for this socket
+///   type. `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` returns it when the
+///   provider cannot supply `WSARecvMsg`;
+/// * `WSAENOTSOCK` (10038) — the descriptor is not a socket;
+/// * `WSAEPROTONOSUPPORT` (10043) / `WSAEAFNOSUPPORT` (10047) — the protocol or
+///   address family is not supported by this provider.
+///
+/// `WSAECONNRESET` (10054) is deliberately ABSENT: it is delivered to a UDP
+/// socket after an ICMP port-unreachable for one of OUR OWN earlier sends and is
+/// routine, which is the case the transient path exists for.
+#[cfg(windows)]
+const fn is_permanent_winsock_code(raw: i32) -> bool {
+  matches!(raw, 10045 | 10038 | 10043 | 10047)
+}
+
+/// Whether a receive error is a property of the **socket** rather than of one
+/// datagram or one moment, so no number of retries will ever get past it.
+///
+/// # This list is hick-mio's, copied rather than re-derived
+///
+/// `hick-mio`'s `is_permanent_recv_error` already answers this question, and it
+/// answers it correctly; this driver answered it with "everything except
+/// `WouldBlock` and `InvalidData` is fatal", which made a transient `ENOBUFS`
+/// under memory pressure — or a Windows `WSAECONNRESET` after an ICMP
+/// port-unreachable for one of our OWN sends, which is routine for UDP — end the
+/// family's receive task for good. Two drivers with two answers is itself the
+/// finding, so this is the same set with the same reasoning and not a second
+/// opinion.
+///
+/// The default for an unrecognised error must stay **transient**: a receive path
+/// abandoned by mistake is deaf until the process restarts, whereas a permanent
+/// error misclassified as transient costs only the bounded retry budget below.
+///
+/// * `NotConnected` — `ENOTSOCK`/`ENOTCONN`: the descriptor is not a socket we
+///   can read, which no later event changes;
+/// * `PermissionDenied` — the kernel refuses this receive outright (a sandbox or
+///   MAC policy); nothing about it is rate-related;
+/// * `Unsupported` — `EOPNOTSUPP`/`ENOSYS`, or a `WSARecvMsg` this platform does
+///   not provide;
+/// * `InvalidInput` — `EINVAL` on the receive call. The arguments this crate
+///   passes are fixed, so a rejection is structural. NOT `InvalidData`, which is
+///   a consumed-but-unusable datagram and is handled before this is reached.
+fn is_permanent_recv_error(e: &std::io::Error) -> bool {
+  // Ask the raw code FIRST on Windows. A classifier that reads only
+  // `ErrorKind` cannot distinguish "transient" from "structurally unsupported",
+  // because `Uncategorized` is where that distinction goes to die — see
+  // `is_permanent_winsock_code`.
+  #[cfg(windows)]
+  if let Some(raw) = e.raw_os_error()
+    && is_permanent_winsock_code(raw)
+  {
+    return true;
+  }
+  matches!(
+    e.kind(),
+    std::io::ErrorKind::NotConnected
+      | std::io::ErrorKind::PermissionDenied
+      | std::io::ErrorKind::Unsupported
+      | std::io::ErrorKind::InvalidInput
+  )
+}
+
+/// How long a receive task sleeps after its `n`th consecutive transient error.
+///
+/// Bounded and short: 1 ms doubling to a 64 ms ceiling. The point is not to wait
+/// out the condition — `ENOBUFS` clears when the pressure does — but to stop a
+/// hot loop from spinning a core while it clears, without adding latency a
+/// working socket would ever pay. A successful receive resets the streak, so the
+/// steady state is zero.
+const fn transient_recv_backoff(streak: u32) -> Duration {
+  Duration::from_millis(1u64 << if streak > 6 { 6 } else { streak })
+}
+
+/// Wait out one transient-receive backoff. `false` means the driver asked this
+/// task to stop while it waited, so the caller must return rather than loop.
+///
+/// The `select_biased!` is why this is a function and not a bare `sleep`: a
+/// receive task that is backing off must still tear down promptly when the
+/// driver drops its shutdown sender, or a socket and its group memberships stay
+/// held for the length of the backoff.
+async fn backoff_or_shutdown<N: Net>(shutdown: &async_channel::Receiver<()>, streak: u32) -> bool {
+  let sleep_fut = <N::Runtime as RuntimeLite>::sleep(transient_recv_backoff(streak)).fuse();
+  let shutdown_fut = shutdown.recv().fuse();
+  pin_mut!(sleep_fut, shutdown_fut);
+  select_biased! {
+    _ = shutdown_fut => false,
+    _ = sleep_fut => true,
+  }
+}
+
 #[cfg_attr(
   feature = "tracing",
   tracing::instrument(level = "trace", skip_all, fields(via_v4))
@@ -3013,6 +3236,7 @@ async fn recv_loop<N: Net>(
   shutdown: async_channel::Receiver<()>,
   via_v4: bool,
   max_recv: usize,
+  health: Arc<RecvHealth>,
   #[cfg(feature = "stats")] stats: std::sync::Arc<hick_trace::stats::Stats>,
 ) {
   // This task owns exactly one socket, so every datagram it reads arrived on one
@@ -3028,6 +3252,34 @@ async fn recv_loop<N: Net>(
   // via ServerOptions::with_max_recv_packet_size). Larger sources include
   // exhaustive PTR responses with many KAS records.
   let mut buf = vec![0u8; max_recv.max(1500)];
+  // Consecutive transient receive errors, reset by any successful receive. It
+  // drives `transient_recv_backoff` and nothing else; see
+  // `is_permanent_recv_error` for why an unrecognised error counts here rather
+  // than ending the task.
+  let mut transient_streak: u32 = 0;
+  // Resolved ONCE, for this task's own socket, and used for every receive on it.
+  // Per socket rather than process-wide because Winsock extension pointers are
+  // provider-specific and are called directly: a pointer resolved through
+  // another socket may not be this provider's. `Endpoint::server` has already
+  // asked the same question of the same socket, so a failure here means the
+  // provider changed under a bound socket, which it cannot — it is a permanent
+  // error either way.
+  #[cfg(windows)]
+  let recvmsg = {
+    use std::os::windows::io::AsSocket;
+    match hick_udp::resolve_recv_with_meta(sock.as_socket()) {
+      Ok(f) => f,
+      Err(e) => {
+        health.set(via_v4, true);
+        hick_trace::warn!(
+          error = %e,
+          via_v4,
+          "WSARecvMsg could not be resolved for this family's socket; it will never receive"
+        );
+        return;
+      }
+    }
+  };
   loop {
     // select! over readiness vs shutdown so this task exits
     // promptly when the driver drops its shutdown sender, releasing the
@@ -3052,15 +3304,40 @@ async fn recv_loop<N: Net>(
           r = peek_fut => r,
         }
       };
-      if let Err(_e) = ready {
-        hick_trace::debug!(error = %_e, via_v4, "peek_from failed");
-        return;
+      if let Err(e) = ready {
+        // `peek_from` consumed nothing, so this is a fact about the socket or
+        // the moment, and it is classified exactly like the receive below.
+        #[cfg(feature = "stats")]
+        stats.recv_errors(1);
+        if is_permanent_recv_error(&e) {
+          health.set(via_v4, true);
+          hick_trace::warn!(
+            error = %e,
+            via_v4,
+            "this family's receive path failed permanently; the endpoint is now deaf on it"
+          );
+          return;
+        }
+        hick_trace::debug!(error = %e, via_v4, "peek_from failed transiently; retrying");
+        transient_streak = transient_streak.saturating_add(1);
+        if transient_streak >= DEAF_AFTER_CONSECUTIVE_TRANSIENT_RECV_ERRORS {
+          health.set(via_v4, true);
+        }
+        if !backoff_or_shutdown::<N>(&shutdown, transient_streak).await {
+          return;
+        }
+        continue;
       }
       // Data is ready in the socket queue; consume it with PKTINFO.
       use std::os::fd::AsRawFd;
       let fd = sock.as_raw_fd();
       match hick_udp::recv_with_meta(fd, &mut buf, via_v4) {
         Ok(meta) => {
+          // A datagram arrived, so whatever the transient errors were about is
+          // over: the backoff starts from zero the next time one appears, and a
+          // family reported deaf by the transient budget is receiving again.
+          transient_streak = 0;
+          health.set(via_v4, false);
           let n = meta.len();
           hick_trace::trace!(src = %meta.peer(), len = n, via_v4, "recv datagram");
           // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
@@ -3111,9 +3388,36 @@ async fn recv_loop<N: Net>(
           count_consumed_oversized(&stats, buf.len());
           continue;
         }
-        Err(_e) => {
-          hick_trace::debug!(error = %_e, via_v4, "recv_with_meta failed");
-          return;
+        // Everything else. The old rule here was "anything that is not
+        // WouldBlock or InvalidData is fatal", which ended the task for good on
+        // a transient `ENOBUFS` under memory pressure — leaving the endpoint
+        // silently deaf on this family, with sends still working and nothing
+        // saying so. See `is_permanent_recv_error`.
+        Err(e) => {
+          #[cfg(feature = "stats")]
+          stats.recv_errors(1);
+          if is_permanent_recv_error(&e) {
+            // Mandatory first, telemetry second: the flag is what a caller can
+            // see with default features. See `DeafFamilies`.
+            health.set(via_v4, true);
+            hick_trace::warn!(
+              error = %e,
+              via_v4,
+              "this family's receive path failed permanently; the endpoint is now deaf on it"
+            );
+            return;
+          }
+          hick_trace::debug!(error = %e, via_v4, "transient receive error; retrying");
+          transient_streak = transient_streak.saturating_add(1);
+          if transient_streak >= DEAF_AFTER_CONSECUTIVE_TRANSIENT_RECV_ERRORS {
+            // Still retrying — see the constant for why this does not return —
+            // but no longer claiming to be receiving.
+            health.set(via_v4, true);
+          }
+          if !backoff_or_shutdown::<N>(&shutdown, transient_streak).await {
+            return;
+          }
+          continue;
         }
       }
     }
@@ -3127,7 +3431,6 @@ async fn recv_loop<N: Net>(
     // weighing no reference at all rather than substituting a read time for one.
     #[cfg(windows)]
     {
-      use std::os::windows::io::AsRawSocket;
       // Winsock WSAEMSGSIZE: the datagram was larger than the supplied buffer.
       // Unlike Unix recvmsg (which truncates silently and succeeds),
       // peek/WSARecvMsg ERROR here. Such a datagram is non-conformant (RFC 6762
@@ -3151,14 +3454,44 @@ async fn recv_loop<N: Net>(
         // through to WSARecvMsg, which consumes it so we make progress.
         Err(ref e) if e.raw_os_error() == Some(WSAEMSGSIZE) => {}
         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-        Err(_e) => {
-          hick_trace::debug!(error = %_e, via_v4, "peek_from failed");
-          return;
+        Err(ref e) => {
+          // Same classification as Unix, and Windows has one more reason to
+          // want it: `WSAECONNRESET` is delivered to a UDP socket after an ICMP
+          // port-unreachable for one of OUR OWN earlier sends, which is routine
+          // on a link where a peer went away and says nothing about this socket.
+          #[cfg(feature = "stats")]
+          stats.recv_errors(1);
+          if is_permanent_recv_error(e) {
+            // Mandatory first, telemetry second: the flag is what a caller can
+            // see with default features. See `DeafFamilies`.
+            health.set(via_v4, true);
+            hick_trace::warn!(
+              error = %e,
+              via_v4,
+              "this family's receive path failed permanently; the endpoint is now deaf on it"
+            );
+            return;
+          }
+          hick_trace::debug!(error = %e, via_v4, "peek_from failed transiently; retrying");
+          transient_streak = transient_streak.saturating_add(1);
+          if transient_streak >= DEAF_AFTER_CONSECUTIVE_TRANSIENT_RECV_ERRORS {
+            // Still retrying — see the constant for why this does not return —
+            // but no longer claiming to be receiving.
+            health.set(via_v4, true);
+          }
+          if !backoff_or_shutdown::<N>(&shutdown, transient_streak).await {
+            return;
+          }
+          continue;
         }
       }
-      let raw = sock.as_raw_socket();
-      match hick_udp::recv_with_meta(raw, &mut buf, via_v4) {
+      match recvmsg.recv(&mut buf, via_v4) {
         Ok(meta) => {
+          // A datagram arrived, so whatever the transient errors were about is
+          // over: the backoff starts from zero the next time one appears, and a
+          // family reported deaf by the transient budget is receiving again.
+          transient_streak = 0;
+          health.set(via_v4, false);
           let n = meta.len();
           hick_trace::trace!(src = %meta.peer(), len = n, via_v4, "recv datagram");
           // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
@@ -3194,9 +3527,34 @@ async fn recv_loop<N: Net>(
           count_consumed_oversized(&stats, buf.len());
           continue;
         }
-        Err(_e) => {
-          hick_trace::debug!(error = %_e, via_v4, "recv_with_meta (windows) failed");
-          return;
+        // See the Unix twin and `is_permanent_recv_error`: a transient failure
+        // must not end this task. `WSAECONNRESET` in particular is spurious for
+        // UDP and used to be fatal here.
+        Err(ref e) => {
+          #[cfg(feature = "stats")]
+          stats.recv_errors(1);
+          if is_permanent_recv_error(e) {
+            // Mandatory first, telemetry second: the flag is what a caller can
+            // see with default features. See `DeafFamilies`.
+            health.set(via_v4, true);
+            hick_trace::warn!(
+              error = %e,
+              via_v4,
+              "this family's receive path failed permanently; the endpoint is now deaf on it"
+            );
+            return;
+          }
+          hick_trace::debug!(error = %e, via_v4, "transient receive error (windows); retrying");
+          transient_streak = transient_streak.saturating_add(1);
+          if transient_streak >= DEAF_AFTER_CONSECUTIVE_TRANSIENT_RECV_ERRORS {
+            // Still retrying — see the constant for why this does not return —
+            // but no longer claiming to be receiving.
+            health.set(via_v4, true);
+          }
+          if !backoff_or_shutdown::<N>(&shutdown, transient_streak).await {
+            return;
+          }
+          continue;
         }
       }
     }
@@ -3215,6 +3573,8 @@ async fn recv_loop<N: Net>(
       };
       match recv_result {
         Ok((n, src)) => {
+          transient_streak = 0;
+          health.set(via_v4, false);
           hick_trace::trace!(src = %src, len = n, via_v4, "recv datagram");
           // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
           // on the shared Arc — do NOT bump them here too (double-count).
@@ -3244,9 +3604,35 @@ async fn recv_loop<N: Net>(
             return;
           }
         }
-        Err(_e) => {
-          hick_trace::debug!(error = %_e, via_v4, "recv_from failed");
-          return;
+        // The third copy of the same rule. Fixing the Unix and Windows arms and
+        // leaving this one is how `set_multicast_hops_v6` came to be the only
+        // one of three siblings that had been corrected — see
+        // `is_permanent_recv_error`, which is the single answer all three use.
+        Err(e) => {
+          #[cfg(feature = "stats")]
+          stats.recv_errors(1);
+          if is_permanent_recv_error(&e) {
+            // Mandatory first, telemetry second: the flag is what a caller can
+            // see with default features. See `DeafFamilies`.
+            health.set(via_v4, true);
+            hick_trace::warn!(
+              error = %e,
+              via_v4,
+              "this family's receive path failed permanently; the endpoint is now deaf on it"
+            );
+            return;
+          }
+          hick_trace::debug!(error = %e, via_v4, "transient receive error; retrying");
+          transient_streak = transient_streak.saturating_add(1);
+          if transient_streak >= DEAF_AFTER_CONSECUTIVE_TRANSIENT_RECV_ERRORS {
+            // Still retrying — see the constant for why this does not return —
+            // but no longer claiming to be receiving.
+            health.set(via_v4, true);
+          }
+          if !backoff_or_shutdown::<N>(&shutdown, transient_streak).await {
+            return;
+          }
+          continue;
         }
       }
     }

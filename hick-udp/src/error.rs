@@ -175,11 +175,48 @@ pub enum BindError {
   ///
   /// Raised only on the four BSDs, where those two options are how
   /// `recv_with_meta` witnesses an IPv4 datagram's destination and receiving
-  /// interface. The bind fails rather than returning a socket that would report
-  /// no witness for every datagram: on a target
-  /// [`reports_rx_interface_v4`](crate::reports_rx_interface_v4) calls capable,
-  /// a receiver is entitled to act on a missing witness, so continuing would be
-  /// deafness dressed as degradation.
+  /// interface. Unlike `IP_PKTINFO`, they are TWO cmsgs the kernel allocates
+  /// separately, and `multicast::parse_dstaddr_recvif_v4` reports each witness on
+  /// its own — it fails only when NEITHER arrived. So a socket that holds one
+  /// option and not the other is a real state, and it loses one isolation
+  /// dimension while keeping the other:
+  ///
+  /// * `IP_RECVDSTADDR` not held — the destination is `Declined` on every
+  ///   datagram, so the whole destination partition goes with it
+  ///   ([`Refuse::ForeignGroup`](hick_onlink::Refuse::ForeignGroup),
+  ///   [`BroadcastAddressed`](hick_onlink::Refuse::BroadcastAddressed),
+  ///   [`DestinationNotHeld`](hick_onlink::Refuse::DestinationNotHeld) and the
+  ///   rest). The interface is still `Witnessed`, so
+  ///   [`ForeignLink`](hick_onlink::Refuse::ForeignLink) still refuses a
+  ///   datagram from another link;
+  /// * `IP_RECVIF` not held — the mirror image. The interface is `Declined`, so
+  ///   `ForeignLink` is unreachable for IPv4, while the destination is still
+  ///   `Witnessed` and every refusal in the destination partition still fires.
+  ///
+  /// Neither half is "isolating nothing", and neither is silent: the drivers count
+  /// a degraded admission on `ingress_witness_declined`. What survives on the
+  /// destination side once it is `Declined` is decided ENTIRELY by the kernel's
+  /// coarse [`LinkDelivery`](hick_onlink::LinkDelivery), so it is enumerated
+  /// rather than summarised:
+  ///
+  /// * `Some(Broadcast)` — refused,
+  ///   [`BroadcastDelivery`](hick_onlink::Refuse::BroadcastDelivery). OpenBSD and
+  ///   NetBSD only, the two targets `libc` binds `MSG_BCAST` for;
+  /// * `Some(Multicast)` — **admitted**,
+  ///   [`BlindMulticastDelivery`](hick_onlink::Admit::BlindMulticastDelivery). It
+  ///   names no group and the source arm NEVER RUNS, so an out-of-prefix
+  ///   multicast source is admitted and
+  ///   [`SourceOffLink`](hick_onlink::Refuse::SourceOffLink) has no say. OpenBSD
+  ///   and NetBSD only;
+  /// * `Some(Unicast)` — the source arm runs, so `SourceOffLink` refuses an
+  ///   out-of-prefix source. OpenBSD and NetBSD only;
+  /// * `None` — every other supported target, which binds neither flag: the
+  ///   source arm runs and `SourceOffLink` refuses an out-of-prefix source.
+  ///
+  /// What justifies failing the bind is narrower than any of that and still
+  /// sufficient: losing EITHER witness dimension is a permanent, per-socket loss
+  /// of half the trust boundary that no return code reported, and the read-back is
+  /// the only thing that sees it.
   #[error(transparent)]
   RxDestinationNotEnabled(RxDestinationNotEnabledDetail),
 

@@ -89,12 +89,37 @@ fn main() {
   //
   // This drives `multicast::parse_dstaddr_recvif_v4`, the matching
   // `platform::set_recv_dstaddr_recvif_v4` enable + read-back, and
-  // `reports_rx_interface_v4()`. Setting it INVERTS the ingress rule a receiver
-  // applies to a datagram with no interface witness — "no witness ⇒ admit"
-  // becomes "no witness ⇒ drop" (see `onlink::arrived_on_bound_interface`) — so
-  // a silently wrong parse would not degrade, it would make the responder deaf
-  // on IPv4 while still looking healthy. That is what the standing rule below
-  // exists for.
+  // `reports_rx_interface_v4()`. Setting it is what makes REFUSALS reachable on
+  // this square: `Refuse::ForeignLink` off the witnessed interface index, and the
+  // destination partition — `ForeignGroup`, `BroadcastAddressed`,
+  // `DestinationNotHeld` and the rest — off the witnessed destination. It does
+  // NOT change what an ABSENT witness means: a missing, non-truncated cmsg is
+  // `Declined`, and `hick_onlink::admits_ingress` passes `Declined` exactly as it
+  // passes `Blind` (it clears the interface stage and takes the residual
+  // delivery/source arm). Only `Lost` — `MSG_CTRUNC`, our own buffer too small —
+  // refuses.
+  //
+  // So a silently wrong parse does not make the responder deaf. It does something
+  // quieter: a refusal stops being reachable while the endpoint keeps answering.
+  // And because this is a PAIR of cmsgs rather than one `IP_PKTINFO`, the two
+  // halves fail separately — `parse_dstaddr_recvif_v4` returns whichever it
+  // recovered — so a wrong `IP_RECVDSTADDR` parse costs the destination partition
+  // while `ForeignLink` still works, and a wrong `IP_RECVIF` parse costs
+  // `ForeignLink` while every destination refusal still fires.
+  //
+  // What survives a `Declined` destination is real, and is enumerated here per
+  // delivery class rather than summarised, because the summary has been wrong
+  // three times: `Some(Broadcast)` refuses (`BroadcastDelivery`, OpenBSD/NetBSD
+  // only); `Some(Multicast)` ADMITS (`BlindMulticastDelivery`, OpenBSD/NetBSD
+  // only) and the source arm never runs, so an out-of-prefix multicast source is
+  // admitted and `SourceOffLink` has no say; `Some(Unicast)` and `None` take the
+  // source arm, where `SourceOffLink` refuses an out-of-prefix source. An IPv6
+  // scope id survives as a second interface witness, and every degraded
+  // admission is counted on `ingress_witness_declined`.
+  //
+  // Half a trust boundary, lost permanently and reported by nothing, is what the
+  // standing rule below exists for: a failure mode nothing observes from the
+  // outside has to be established before the cfg is emitted, not after.
   //
   // NETBSD TAKES THIS PAIR AND NOT ITS OWN `IP_PKTINFO`, deliberately. NetBSD is
   // the one BSD that also defines IP_PKTINFO/IP_RECVPKTINFO
@@ -232,10 +257,12 @@ fn main() {
   // decode.
   //
   // NOT one of the flips the block above sets an evidence bar for, and the
-  // distinction is worth stating. That bar exists because promoting
-  // `has_ip_pktinfo` INVERTS what an absent interface witness means, so a
-  // silently wrong parse turns into silent deafness. This cfg sets no sockopt,
-  // parses no cmsg and touches no witness rule: it reads one more bit of a word
+  // distinction is worth stating. That bar exists because promoting an ancillary
+  // capability makes refusals reachable off a WITNESSED value while leaving an
+  // absent one degrading exactly as before, so a silently wrong parse costs those
+  // refusals without costing a single answer — invisible from outside. This cfg
+  // sets no sockopt, parses no cmsg and touches no witness rule at all: it reads
+  // one more bit of a word
   // `recvmsg` already returns and this crate already reads, and it can only make
   // `admits_ingress` refuse a datagram the kernel called a broadcast — which
   // §11 gives no arm to whatever else is true of it. The one way it could cost

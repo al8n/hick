@@ -273,6 +273,7 @@ pub mod stats {
     ingress_residual_refusals: AtomicU64,
     parse_errors: AtomicU64,
     send_errors: AtomicU64,
+    recv_errors: AtomicU64,
     questions_rx: AtomicU64,
     answers_rx: AtomicU64,
     answers_collected: AtomicU64,
@@ -328,6 +329,18 @@ pub mod stats {
       ingress_residual_refusals => "mdns_ingress_residual_refusals",
       parse_errors => "mdns_parse_errors",
       send_errors => "mdns_send_errors",
+      // A receive call that failed WITHOUT consuming a datagram — `ENOBUFS`
+      // under memory pressure, a Windows `WSAECONNRESET` after an ICMP
+      // port-unreachable for one of our own sends, or a socket that has broken
+      // structurally. Distinct from `packets_dropped`, which counts datagrams
+      // that DID leave the kernel queue and were then discarded.
+      //
+      // It exists because a driver's receive task can stop reading a family
+      // without anything else in the process changing: sends still work, the
+      // endpoint still answers commands, and the only symptom is silence. A
+      // rising count is the degradation, and a count that stops rising while the
+      // endpoint reports no traffic is the deafness.
+      recv_errors => "mdns_recv_errors",
       questions_rx => "mdns_questions_rx",
       answers_rx => "mdns_answers_rx",
       answers_collected => "mdns_answers_collected",
@@ -382,6 +395,7 @@ pub mod stats {
         ingress_residual_refusals: self.ingress_residual_refusals.load(Relaxed),
         parse_errors: self.parse_errors.load(Relaxed),
         send_errors: self.send_errors.load(Relaxed),
+        recv_errors: self.recv_errors.load(Relaxed),
         questions_rx: self.questions_rx.load(Relaxed),
         answers_rx: self.answers_rx.load(Relaxed),
         answers_collected: self.answers_collected.load(Relaxed),
@@ -430,6 +444,9 @@ pub mod stats {
     pub ingress_residual_refusals: u64,
     pub parse_errors: u64,
     pub send_errors: u64,
+    /// Receive calls that failed without consuming a datagram (see the counter
+    /// declaration for why this is not `packets_dropped`).
+    pub recv_errors: u64,
     pub questions_rx: u64,
     pub answers_rx: u64,
     pub answers_collected: u64,

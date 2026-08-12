@@ -115,7 +115,7 @@ impl ServerOptions {
   /// (the default), the first multicast-capable, non-loopback interface is
   /// picked.
   ///
-  /// # This is not an isolation guarantee on every platform
+  /// # This is not an unconditional isolation guarantee
   ///
   /// Both mDNS sockets are wildcard bound — they must be, to receive traffic
   /// addressed to a multicast group — so the kernel delivers every interface's
@@ -125,20 +125,34 @@ impl ServerOptions {
   /// IPv6 scope id. Where it does, traffic from another interface is refused
   /// outright.
   ///
-  /// It does NOT where the path recovers none: IPv4 on FreeBSD, DragonFly,
-  /// OpenBSD and NetBSD, which define no usable `IP_PKTINFO`. Every other
-  /// target, and IPv6 everywhere, is isolated.
+  /// This driver reads every datagram through `hick_udp::recv_with_meta`, and
+  /// that path recovers both facts on every target this crate builds for, in
+  /// both families: `IP_PKTINFO` for IPv4 on Linux, Android and Apple; the
+  /// `IP_RECVDSTADDR` + `IP_RECVIF` pair for IPv4 on FreeBSD, DragonFly, OpenBSD
+  /// and NetBSD, enabled AND read back inside `hick_udp::try_bind_v4` — two
+  /// separate cmsgs, so a socket that holds one and not the other keeps half the
+  /// boundary and loses the other half silently (no `IP_RECVDSTADDR` costs the
+  /// destination partition, no `IP_RECVIF` costs the foreign-link refusal), which
+  /// is why the bind fails rather than continuing; `IPV6_PKTINFO`, one cmsg
+  /// carrying both facts, for IPv6 on every supported Unix; and
+  /// `WSARecvMsg`'s `IP_PKTINFO` / `IPV6_PKTINFO` on Windows. No square reached
+  /// from here loses the isolation by construction.
   ///
-  /// On those squares admission falls back to RFC 6762 §11's own source rules,
-  /// which weigh values the SENDER controls. An adjacent sender that sources
-  /// from inside this interface's prefix is admitted, as is a second NIC
-  /// sharing that prefix — legitimately. The exposure is narrowed, not removed,
-  /// and no rule over those inputs could remove it.
+  /// What is left is per-datagram, not per-platform. The BSD kernels allocate
+  /// ancillary data with `M_NOWAIT` and simply omit it under mbuf pressure, so
+  /// an individual datagram can arrive carrying no witness. THAT datagram —
+  /// and only it — falls back to RFC 6762 §11's own source rules, which weigh
+  /// values the SENDER controls: an adjacent sender that sources from inside
+  /// this interface's prefix is admitted, as is a second NIC sharing that
+  /// prefix — legitimately. The exposure is narrowed, not removed, and no rule
+  /// over those inputs could remove it.
   ///
-  /// Whether §11's group arm is available there is a separate question and the
-  /// two do not move together: it needs a recovered IP header destination or the
-  /// kernel's multicast flag. Where both are absent, group traffic §11 requires
-  /// be accepted is refused whenever the sender's prefix is not one of ours.
+  /// Whether §11's group arm survives that datagram is a separate question and
+  /// the two do not move together: it needs a recovered IP header destination or
+  /// the kernel's multicast flag (`MSG_MCAST`, which `libc` binds for OpenBSD
+  /// and NetBSD and nowhere else). Where both are absent, group traffic §11
+  /// requires be accepted is refused whenever the sender's prefix is not one of
+  /// ours.
   ///
   /// The boundary is a STAGED decision and no summary of two of its inputs
   /// describes it — an interface index of zero means opposite things depending

@@ -18,6 +18,10 @@ mod service;
 mod trace_cov;
 
 pub use discovery::{Lookup, QueryParam, ServiceEntry};
+// Mandatory degradation state: readable with default features, no `tracing`
+// subscriber and no `stats` opt-in. See the type's own doc for why that
+// property is the point of it.
+pub use driver::DeafFamilies;
 pub use endpoint::Endpoint;
 pub use error::{CancelError, RegisterError, ServerError, StartQueryError};
 pub use options::ServerOptions;
