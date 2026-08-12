@@ -3,28 +3,25 @@
 //! These bind actual UDP sockets on the loopback interface and spin the compio
 //! driver task, exercising the bind → spawn → poll → send/recv → shutdown paths
 //! that the in-process unit tests (which drive the `State` directly) cannot
-//! reach. Every test skips gracefully when the environment forbids a multicast
-//! bind, so they never produce a false failure.
+//! reach.
+//!
+//! Endpoint construction goes through [`common::loopback_v4_endpoint`] /
+//! [`common::resolved_loopback_index`], which skip only when an independent
+//! control socket was refused the exact same way — see `tests/common/mod.rs`
+//! for why an uncorroborated skip here used to report a false "all tests
+//! passed" under a forced `PermissionDenied` bind failure.
 
+#![cfg(any(unix, windows))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 
-use std::{net::Ipv4Addr, time::Duration};
+use std::time::Duration;
 
 use hick_compio::{
-  Endpoint, Name, QueryEvent, QuerySpec, ServerOptions, ServiceRecords, ServiceSpec, ServiceUpdate,
+  Name, QueryEvent, QuerySpec, ServerOptions, ServiceRecords, ServiceSpec, ServiceUpdate,
   wire::ResourceType,
 };
-
-/// The loopback interface index, or `None` if it can't be resolved.
-fn loopback_index() -> Option<u32> {
-  let ifs = getifs::interfaces().ok()?;
-  ifs
-    .iter()
-    .find(|i| i.flags().contains(getifs::Flags::LOOPBACK))
-    .map(|i| i.index())
-}
 
 /// A `_http._tcp` service advertised on 127.0.0.1.
 fn http_service(instance: &str) -> ServiceSpec {
@@ -35,24 +32,8 @@ fn http_service(instance: &str) -> ServiceSpec {
     80,
     120,
   );
-  recs.add_a(Ipv4Addr::new(127, 0, 0, 1));
+  recs.add_a(std::net::Ipv4Addr::new(127, 0, 0, 1));
   ServiceSpec::new(recs)
-}
-
-/// Bind a v4-only endpoint pinned to loopback, or `None` to skip the test when
-/// the environment refuses the multicast bind.
-async fn loopback_v4_endpoint() -> Option<Endpoint> {
-  let idx = loopback_index()?;
-  let opts = ServerOptions::default()
-    .with_interface_index(Some(idx))
-    .with_ipv6(false);
-  match Endpoint::server(opts).await {
-    Ok(ep) => Some(ep),
-    Err(e) => {
-      eprintln!("loopback multicast bind unavailable ({e}); skipping");
-      None
-    }
-  }
 }
 
 /// A registered service must complete probing and reach `Established` (or
@@ -61,7 +42,7 @@ async fn loopback_v4_endpoint() -> Option<Endpoint> {
 /// timer-driven, so this resolves without depending on cross-socket delivery.
 #[compio::test]
 async fn registered_service_reaches_advertised_state() {
-  let Some(ep) = loopback_v4_endpoint().await else {
+  let Some(ep) = common::loopback_v4_endpoint().await else {
     return;
   };
   let svc = ep.register_service(http_service("alpha")).await.unwrap();
@@ -81,10 +62,10 @@ async fn registered_service_reaches_advertised_state() {
 /// server and the full recv/parse path on the client are driven either way.
 #[compio::test]
 async fn browse_drives_both_run_loops() {
-  let Some(server) = loopback_v4_endpoint().await else {
+  let Some(server) = common::loopback_v4_endpoint().await else {
     return;
   };
-  let Some(client) = loopback_v4_endpoint().await else {
+  let Some(client) = common::loopback_v4_endpoint().await else {
     return;
   };
 
@@ -114,7 +95,7 @@ async fn browse_drives_both_run_loops() {
 /// short tick lets the driver process them before the endpoint shuts down.
 #[compio::test]
 async fn dropping_handles_tears_down_via_driver() {
-  let Some(ep) = loopback_v4_endpoint().await else {
+  let Some(ep) = common::loopback_v4_endpoint().await else {
     return;
   };
 
@@ -140,7 +121,7 @@ async fn dropping_handles_tears_down_via_driver() {
 #[compio::test]
 async fn server_rejects_no_family_enabled() {
   let opts = ServerOptions::default().with_ipv4(false).with_ipv6(false);
-  match Endpoint::server(opts).await {
+  match hick_compio::Endpoint::server(opts).await {
     Err(hick_compio::ServerError::NoFamilyEnabled) => {}
     Err(e) => panic!("expected NoFamilyEnabled, got {e:?}"),
     Ok(_) => panic!("expected NoFamilyEnabled, but server() succeeded"),
@@ -153,11 +134,11 @@ async fn server_rejects_no_family_enabled() {
 /// v6 bind/join code the v4-only tests skip.
 #[compio::test]
 async fn dual_stack_loopback_exercises_v6_setup() {
-  let Some(idx) = loopback_index() else {
+  let Some(idx) = common::resolved_loopback_index().await else {
     return;
   };
   let opts = ServerOptions::default().with_interface_index(Some(idx));
-  match Endpoint::server(opts).await {
+  match hick_compio::Endpoint::server(opts).await {
     Ok(_ep) => {}
     Err(hick_compio::ServerError::BindV6(_) | hick_compio::ServerError::JoinV6(_)) => {}
     Err(e) => panic!("unexpected dual-stack setup error: {e:?}"),

@@ -20,6 +20,24 @@
 //! once by the test and passed to [`endpoint`] by reference, rather than being
 //! taken inside it — a second acquisition of a non-reentrant `Mutex` on the same
 //! thread would deadlock.
+//!
+//! # Every skip is corroborated
+//!
+//! [`endpoint`] used to fold every failure — interface enumeration, `Mdns::new`
+//! (even retried IPv4-only), `mio::Poll::new`, `Mdns::register` — into an
+//! uncorroborated `None`, and every caller in `tests/loopback.rs` returned
+//! successfully on `None`. That shape reports a false "all tests passed" the
+//! moment any of those calls starts failing for a real reason: forcing
+//! `hick_udp::try_bind_v4` to return `PermissionDenied` used to leave this
+//! whole suite green.
+//!
+//! The fix, ported from `hick-reactor/tests/loopback_lookup.rs` rather than
+//! reinvented (there is no shared test-support crate to pull it from, so it is
+//! duplicated verbatim): a skip is legitimate only when an INDEPENDENT control —
+//! a socket that shares none of `hick_mio`'s own bind/join code — was refused
+//! the exact same `io::ErrorKind`. Anything else is this crate's own bug and
+//! must fail loudly. See [`only_a_corroborated_environment_may_skip`] and
+//! [`control_prerequisites`] below.
 
 // Each test binary uses a subset of these helpers, and an unused one here is not
 // dead code in any meaningful sense.
@@ -68,13 +86,21 @@ pub fn bind_lock() -> BindGuard {
   BindGuard(BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// The index of an interface that is both `LOOPBACK` and `UP`, if any.
-fn loopback_index() -> Option<u32> {
-  getifs::interfaces()
-    .ok()?
-    .into_iter()
-    .find(|i| i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP))
-    .map(|i| i.index())
+/// The index of an interface that is both `LOOPBACK` and `UP`, or `Ok(None)` if
+/// this host genuinely has none. `Err` is preserved with its real
+/// `io::ErrorKind` rather than flattened into `None` — see
+/// [`only_an_absent_loopback_may_skip`] / [`only_a_corroborated_environment_may_skip`]
+/// for why the distinction matters: a caller that labels every enumeration
+/// failure with a fabricated kind cannot corroborate a REAL one against an
+/// independent control, and every test in this suite used to false-pass on a
+/// `PermissionDenied` enumeration failure as a result.
+fn loopback_index() -> Result<Option<u32>, std::io::Error> {
+  for i in getifs::interfaces()?.into_iter() {
+    if i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP) {
+      return Ok(Some(i.index()));
+    }
+  }
+  Ok(None)
 }
 
 /// An [`Mdns`] plus the `mio` loop the test drives it from, and every event it
@@ -265,6 +291,188 @@ fn carries_ipv6_multicast(idx: u32) -> bool {
   }
 }
 
+// ── the independent control ────────────────────────────────────────────────
+//
+// Ported from `hick-reactor/tests/loopback_lookup.rs` rather than reinvented.
+// Duplicated, not shared, because there is no test-support crate for two
+// crates' integration-test binaries to pull common code from.
+//
+// The rule: **a skip requires an independent control that failed the SAME way,
+// and a control that SUCCEEDS turns any failure back into a regression.**
+// Without the first half, a product defect reads as a hostile environment;
+// without the second, a hostile environment reads as a product defect.
+
+/// The mDNS multicast group. Restated here, deliberately, rather than imported
+/// from hick — this control must not be able to inherit a defect in hick's own
+/// constant.
+const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+
+/// The mDNS port. Restated for the same reason as [`MDNS_GROUP`].
+const MDNS_PORT: u16 = 5353;
+
+/// Every [`std::io::ErrorKind`] this suite reads as a fact about the HOST
+/// rather than about hick. Closed and deliberately not a catch-all — see
+/// `hick-reactor/tests/loopback_lookup.rs`'s own copy of this allowlist for the
+/// per-kind reasoning.
+fn is_environmental(kind: std::io::ErrorKind) -> bool {
+  matches!(
+    kind,
+    std::io::ErrorKind::PermissionDenied
+      | std::io::ErrorKind::AddrInUse
+      | std::io::ErrorKind::AddrNotAvailable
+      | std::io::ErrorKind::Unsupported
+      | std::io::ErrorKind::NetworkDown
+      | std::io::ErrorKind::NetworkUnreachable
+      | std::io::ErrorKind::HostUnreachable
+  )
+}
+
+/// The `io::ErrorKind` behind a [`hick_udp::BindError`], where one exists and
+/// the environment could have produced it. `None` means "not an environment
+/// fact" — including the two read-back variants, which mean the kernel ACCEPTED
+/// a `setsockopt` and then silently did not honour it, and which no environment
+/// produces.
+fn bind_error_kind(e: &hick_udp::BindError) -> Option<std::io::ErrorKind> {
+  match e {
+    hick_udp::BindError::Io(io) => Some(io.kind()),
+    hick_udp::BindError::AddressInUse(_) => Some(std::io::ErrorKind::AddrInUse),
+    hick_udp::BindError::InterfaceNotFound(_) => Some(std::io::ErrorKind::AddrNotAvailable),
+    _ => None,
+  }
+}
+
+/// The `io::ErrorKind` behind a [`hick_mio::ServerError`], where one exists and
+/// the environment could have produced it. `None` is a hard failure.
+fn server_error_kind(e: &hick_mio::ServerError) -> Option<std::io::ErrorKind> {
+  let kind = match e {
+    hick_mio::ServerError::BindV4(b) | hick_mio::ServerError::BindV6(b) => bind_error_kind(b)?,
+    hick_mio::ServerError::Io(io) => io.kind(),
+    // `NoFamilyEnabled` is a caller choosing both families off, which this
+    // fixture never does. `BufferSizeUnsupported`/`BufferAllocation` are this
+    // fixture's own construction request failing against `Mdns::new`'s
+    // documented bounds/allocator, never an environment. Anything added to
+    // this `#[non_exhaustive]` enum later must be classified deliberately
+    // rather than inherited as "environment".
+    _ => return None,
+  };
+  is_environmental(kind).then_some(kind)
+}
+
+/// What the control could establish about the host's willingness to let a
+/// process do what an endpoint does.
+#[derive(Debug)]
+enum Prerequisites {
+  /// Every call an endpoint needs succeeded on a socket that is not hick's.
+  Available,
+  /// The kernel refused the control with an environmental error kind.
+  Refused(std::io::ErrorKind, String),
+}
+
+/// Attempt an endpoint's own prerequisites on an independent socket: a UDP
+/// socket, `SO_REUSEADDR` (+ `SO_REUSEPORT` where it exists), a bind on
+/// `0.0.0.0:5353`, and the mDNS group joined on the loopback interface.
+///
+/// A refusal whose kind is NOT in [`is_environmental`] panics rather than being
+/// reported: it describes this control's own call, and a broken control must
+/// never be readable as evidence about the host.
+fn control_prerequisites() -> Prerequisites {
+  use socket2::{Domain, Protocol, Socket, Type};
+
+  let refused = |stage: &str, e: &std::io::Error| -> Prerequisites {
+    let kind = e.kind();
+    assert!(
+      is_environmental(kind),
+      "the independent control could not {stage} ({e}), and {kind:?} is not a kind this host \
+       could have produced on its own — that is a bug in this test file, which must never be \
+       readable as evidence about the environment"
+    );
+    Prerequisites::Refused(kind, format!("{stage}: {e}"))
+  };
+
+  let sock = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
+    Ok(s) => s,
+    Err(e) => return refused("open a UDP socket", &e),
+  };
+  if let Err(e) = sock.set_reuse_address(true) {
+    return refused("set SO_REUSEADDR", &e);
+  }
+  #[cfg(unix)]
+  if let Err(e) = sock.set_reuse_port(true) {
+    return refused("set SO_REUSEPORT", &e);
+  }
+  let bind_addr: std::net::SocketAddr = (Ipv4Addr::UNSPECIFIED, MDNS_PORT).into();
+  if let Err(e) = sock.bind(&bind_addr.into()) {
+    return refused("bind 0.0.0.0:5353", &e);
+  }
+  if let Err(e) = sock.join_multicast_v4(&MDNS_GROUP, &Ipv4Addr::LOCALHOST) {
+    return refused("join the mDNS group on loopback", &e);
+  }
+  Prerequisites::Available
+}
+
+/// A FAILED operation may be skipped over only when its error kind is one the
+/// environment can produce AND an independent control was refused THE SAME WAY.
+///
+/// `what` names the operation. `kind` is `None` when nothing about the error
+/// says "environment" — which panics unconditionally, since there is nothing
+/// about the host to blame.
+#[track_caller]
+fn only_a_corroborated_environment_may_skip(what: &str, kind: Option<std::io::ErrorKind>) {
+  let Some(kind) = kind else {
+    panic!(
+      "{what} — and that is not a failure any environment produces, so there is nothing about \
+       this host to blame for it"
+    );
+  };
+  match control_prerequisites() {
+    Prerequisites::Available => panic!(
+      "{what} — but an independent control socket opened, took the reuse options, bound \
+       0.0.0.0:{MDNS_PORT} and joined the mDNS group on loopback without complaint. This host \
+       permits exactly what the operation above failed at, so that failure is a regression, not \
+       an environment."
+    ),
+    Prerequisites::Refused(control_kind, reason) if control_kind != kind => panic!(
+      "{what} — the independent control was refused too, but with {control_kind:?} ({reason}) \
+       rather than {kind:?}. A skip has to be corroborated by a control that failed the SAME \
+       way; two different refusals are two different facts."
+    ),
+    Prerequisites::Refused(_, reason) => eprintln!(
+      "skipping: {what}; an independent control socket was refused the same way ({reason})"
+    ),
+  }
+}
+
+/// Whether an independent socket can bind `127.0.0.1`, asked directly — the
+/// same question `loopback_index()`'s enumeration was answering.
+fn control_loopback_present() -> bool {
+  match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
+    Ok(_) => true,
+    Err(e) if is_environmental(e.kind()) => {
+      eprintln!("note: an independent control could not bind 127.0.0.1 either ({e})");
+      false
+    }
+    Err(e) => panic!(
+      "the independent control could not bind 127.0.0.1 ({e}), and {:?} is not a kind this \
+       host could have produced on its own — that is a bug in this test file, which must never \
+       be readable as evidence about the environment",
+      e.kind()
+    ),
+  }
+}
+
+/// A genuine "this host has no loopback interface" may be skipped over only
+/// when an independent socket cannot bind `127.0.0.1` either.
+#[track_caller]
+fn only_an_absent_loopback_may_skip(what: &str) {
+  assert!(
+    !control_loopback_present(),
+    "{what} — but an independent control socket bound 127.0.0.1 without complaint, so this \
+     host does have a loopback interface with an IPv4 address. Enumeration missing it is a \
+     regression, not an environment."
+  );
+  eprintln!("skipping: {what}; an independent control could not bind 127.0.0.1 either");
+}
+
 /// Build an endpoint pinned to the loopback interface, or print why the test is
 /// skipping.
 ///
@@ -280,9 +488,22 @@ fn carries_ipv6_multicast(idx: u32) -> bool {
 ///
 /// Both are printed, so a run that covers less than it looks like says so.
 pub fn endpoint<'lock>(_lock: &'lock BindGuard, label: &'static str) -> Option<Endpoint<'lock>> {
-  let Some(idx) = loopback_index() else {
-    eprintln!("skipping: no UP loopback interface reported by getifs");
-    return None;
+  let idx = match loopback_index() {
+    Ok(Some(idx)) => idx,
+    Ok(None) => {
+      only_an_absent_loopback_may_skip(&format!(
+        "{label}: interface enumeration succeeded and found no UP loopback interface"
+      ));
+      return None;
+    }
+    Err(e) => {
+      let kind = e.kind();
+      only_a_corroborated_environment_may_skip(
+        &format!("{label}: interface enumeration failed: {e:?}"),
+        is_environmental(kind).then_some(kind),
+      );
+      return None;
+    }
   };
   let want_v6 = carries_ipv6_multicast(idx);
   let opts = ServerOptions::default()
@@ -295,13 +516,21 @@ pub fn endpoint<'lock>(_lock: &'lock BindGuard, label: &'static str) -> Option<E
       match Mdns::new(opts.with_ipv6(false)) {
         Ok(m) => m,
         Err(e) => {
-          eprintln!("skipping: {label}: loopback bind failed even IPv4-only ({e:?})");
+          let kind = server_error_kind(&e);
+          only_a_corroborated_environment_may_skip(
+            &format!("{label}: loopback bind failed even IPv4-only: {e:?}"),
+            kind,
+          );
           return None;
         }
       }
     }
     Err(e) => {
-      eprintln!("skipping: {label}: loopback bind failed even IPv4-only ({e:?})");
+      let kind = server_error_kind(&e);
+      only_a_corroborated_environment_may_skip(
+        &format!("{label}: loopback bind failed even IPv4-only: {e:?}"),
+        kind,
+      );
       return None;
     }
   };
@@ -318,7 +547,11 @@ pub fn endpoint<'lock>(_lock: &'lock BindGuard, label: &'static str) -> Option<E
   let poll = match Poll::new() {
     Ok(p) => p,
     Err(e) => {
-      eprintln!("skipping: {label}: mio::Poll::new failed ({e:?})");
+      let kind = e.kind();
+      only_a_corroborated_environment_may_skip(
+        &format!("{label}: mio::Poll::new failed: {e:?}"),
+        is_environmental(kind).then_some(kind),
+      );
       return None;
     }
   };
@@ -331,7 +564,11 @@ pub fn endpoint<'lock>(_lock: &'lock BindGuard, label: &'static str) -> Option<E
     _lock: PhantomData,
   };
   if let Err(e) = ep.mdns.register(ep.poll.registry(), V4, V6) {
-    eprintln!("skipping: {label}: registering the sockets with mio failed ({e:?})");
+    let kind = e.kind();
+    only_a_corroborated_environment_may_skip(
+      &format!("{label}: registering the sockets with mio failed: {e:?}"),
+      is_environmental(kind).then_some(kind),
+    );
     return None;
   }
   Some(ep)
@@ -445,7 +682,11 @@ pub fn loopback_flooder() -> Option<socket2::Socket> {
   match build() {
     Ok(s) => Some(s),
     Err(e) => {
-      eprintln!("skipping: the flooding socket could not be set up ({e:?})");
+      let kind = e.kind();
+      only_a_corroborated_environment_may_skip(
+        &format!("the flooding socket could not be set up: {e:?}"),
+        is_environmental(kind).then_some(kind),
+      );
       None
     }
   }

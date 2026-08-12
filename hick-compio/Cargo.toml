@@ -51,6 +51,14 @@ compio = { version = "0.19", features = ["macros", "time"] }
 getifs.workspace = true
 tracing-core.workspace = true
 ctor.workspace = true
+# The independent control socket in `tests/common/mod.rs` has to do two things
+# `std::net` cannot express — set `SO_REUSEADDR`/`SO_REUSEPORT` before binding
+# `:5353`, and select an interface for multicast EGRESS — and has to do them on
+# Windows as well as Unix, or that platform has no control and can only skip on
+# faith. socket2 is independent of THIS crate's driver, which is the property a
+# control needs, and it sizes every option itself rather than making a caller
+# choose a C type by hand.
+socket2 = { version = "0.6", features = ["all"] }
 
 [package.metadata.docs.rs]
 all-features = true
