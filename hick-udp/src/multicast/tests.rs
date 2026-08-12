@@ -1189,6 +1189,390 @@ fn scan_dstaddr_recvif_reports_each_half_of_the_pair_independently() {
   );
 }
 
+// ── The BSD IPv4 pair, as RFC 6762 §11 SEES it ──────────────────────────────
+//
+// Everything above asserts what the decoders recover. Nothing above asserts what
+// the recovered pair DECIDES, and that gap is where the defect lived: a
+// `DestinationWitness::Witnessed(224.0.0.251)` sitting beside an
+// `IfaceWitness::Declined` reads as a perfectly reasonable pair, and a test that
+// compares witness values calls it correct. It is not — that pair used to take
+// §11's arm one, whose text is "regardless of source IP address", with nothing
+// proving the datagram reached this endpoint on the link it bound.
+//
+// So the tests below drive `admits_ingress` and assert the VERDICT. The witness
+// values are an intermediate, not the subject.
+//
+// This crate does not implement the rule they check. `hick_onlink::admits_ingress`
+// withholds arm one's exemption from any datagram nothing scoped to the bound
+// link, stated over the witness PAIR rather than over a cmsg shape — so it
+// covers `IP_PKTINFO`'s zero-index square identically. What is checked HERE is
+// that this crate's BSD receive path hands that rule an honest pair: both halves
+// as the kernel produced them, with nothing pre-empted and nothing erased.
+
+/// The bound interface index the §11 gate scopes to, and a different one for the
+/// datagram that arrived on another NIC.
+const BOUND_IFACE: u32 = 9;
+const FOREIGN_IFACE: u32 = 11;
+
+/// The receive-side sequence of `recv_with_meta` for the BSD IPv4 square,
+/// without the syscall: `MSG_CTRUNC` short-circuits to the Lost/Lost pair before
+/// any parse, and otherwise the parse runs and its result is taken as-is.
+///
+/// The `unwrap_or_else` arm spells the two absences with the same
+/// `from_reporting_path` constructors `recv_with_meta`'s `witness_absent`
+/// closure uses, since that closure is local to it.
+fn bsd_v4_witnesses(cmsgs: &[u8], truncated: bool) -> (DestinationWitness, IfaceWitness) {
+  if truncated {
+    return (
+      DestinationWitness::from_reporting_path(None, true),
+      IfaceWitness::from_reporting_path(0, true),
+    );
+  }
+  let peer: SocketAddr = ([203, 0, 113, 7], 5353).into();
+  let meta =
+    dstaddr_recvif_meta(cmsgs, IP_RECVDSTADDR_TY, IP_RECVIF_TY, 64, peer).unwrap_or_else(|_| {
+      RecvMeta::new(
+        64,
+        peer,
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        DestinationWitness::from_reporting_path(None, false),
+        IfaceWitness::from_reporting_path(0, false),
+        None,
+      )
+    });
+  (meta.destination_witness(), meta.iface_witness())
+}
+
+/// Build the ancillary buffer for one square of the pair.
+fn bsd_v4_cmsgs(destination: Option<Ipv4Addr>, iface: Option<u32>) -> Vec<u8> {
+  let mut parts: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
+  if let Some(dst) = destination {
+    parts.push((libc::IPPROTO_IP, IP_RECVDSTADDR_TY, dst.octets().to_vec()));
+  }
+  if let Some(idx) = iface {
+    parts.push((
+      libc::IPPROTO_IP,
+      IP_RECVIF_TY,
+      synth_sockaddr_dl(u16::try_from(idx).unwrap(), b"em0"),
+    ));
+  }
+  let borrowed: Vec<(libc::c_int, libc::c_int, &[u8])> = parts
+    .iter()
+    .map(|(l, t, d)| (*l, *t, d.as_slice()))
+    .collect();
+  synth_cmsgs(&borrowed)
+}
+
+/// The four-square table — both cmsgs, destination only, interface only,
+/// neither — across both truncation states, decided by `admits_ingress` under
+/// FreeBSD/DragonFly conditions: `libc` binds no `MSG_MCAST` there, so
+/// `delivery` is `None` and a datagram with no witnessed destination reaches
+/// §11's source-prefix rule.
+///
+/// # The square this test exists for
+///
+/// Destination only, not truncated. The parse reports
+/// `Witnessed(224.0.0.251)` + `Declined`, and both halves reach the gate
+/// untouched. What CHANGED is what the gate does with that pair: §11 arm one's
+/// exemption is the one admission in the whole rule that weighs nothing about
+/// where the datagram came from, so it is granted only to a datagram something
+/// scoped to the bound link. Nothing scoped this one —
+/// `arrived_on_bound_interface` PERMITS `Declined`, an availability invariant it
+/// is tested for — so the source arm decides instead.
+///
+/// Every source below is OFF this interface's prefix. That is the point: an
+/// off-prefix source is refused by every rule §11 has EXCEPT arm one, so it is
+/// the probe that separates "arm one was taken" from "arm one was not".
+#[test]
+fn bsd_v4_partial_pair_does_not_buy_arm_one_without_link_proof() {
+  use crate::onlink::{Admit, BoundLink, Refuse, Verdict, admits_ingress};
+
+  // Named so the row shape does not read as a `clippy::type_complexity` blob.
+  type Row = (bool, Option<Ipv4Addr>, Option<u32>, Verdict, &'static str);
+
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+  // Off this interface's prefix, so only §11 arm one can admit it.
+  let src: SocketAddr = ([203, 0, 113, 7], 5353).into();
+  let addrs = [(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 24u8)];
+  let link = BoundLink::new(BOUND_IFACE, false, &addrs);
+
+  // (truncated, destination cmsg, interface cmsg, expected verdict, what it is)
+  let rows: [Row; 8] = [
+    (
+      false,
+      Some(group),
+      Some(BOUND_IFACE),
+      // WIDER than the behaviour before the pair was decoded at all, and
+      // CORRECT: §11 calls admitting a group datagram regardless of source
+      // "essential ... in unusual configurations, such as multiple logical IP
+      // subnets overlayed on a single link". Refusing it was the bug. It is safe
+      // here and only here, because the interface half scoped it.
+      Verdict::Admit(Admit::MdnsGroup),
+      "both cmsgs, our interface: arm one, with the scoping that makes its \
+       source exemption safe to grant",
+    ),
+    (
+      false,
+      Some(group),
+      Some(FOREIGN_IFACE),
+      // The scoping doing its job. A wildcard-bound socket on a multi-homed
+      // host is handed every NIC's copy of the group traffic.
+      Verdict::Refuse(Refuse::ForeignLink),
+      "both cmsgs, another NIC: the interface check runs first and refuses \
+       before arm one is reached",
+    ),
+    (
+      false,
+      Some(group),
+      None,
+      // THE FIX. On `main` this was `Admit(Admit::MdnsGroup)` — arm one taken on
+      // a datagram that never proved it arrived on our link. The destination is
+      // still WITNESSED here; what it no longer buys is the exemption.
+      //
+      // This refusal is the KNOWN availability residual, and FreeBSD/DragonFly
+      // are where it lands: they bind no `MSG_MCAST`, so the unscoped group has
+      // nothing but §11's source arm to fall back on. It is spelled apart from a
+      // plain `SourceOffLink` so an operator can watch it — see
+      // `mdns_ingress_unscoped_group_refusals`.
+      Verdict::Refuse(Refuse::UnscopedGroupSourceOffLink),
+      "destination only: nothing scoped this datagram, so arm one's exemption \
+       is withheld and the source arm refuses an off-prefix sender",
+    ),
+    (
+      false,
+      None,
+      Some(BOUND_IFACE),
+      Verdict::Refuse(Refuse::SourceOffLink),
+      "interface only, our interface: no destination, so the source rule \
+       decides and an off-prefix sender is refused",
+    ),
+    (
+      false,
+      None,
+      Some(FOREIGN_IFACE),
+      Verdict::Refuse(Refuse::ForeignLink),
+      "interface only, another NIC: the lone interface half still refuses",
+    ),
+    (
+      false,
+      None,
+      None,
+      Verdict::Refuse(Refuse::SourceOffLink),
+      "neither cmsg: the kernel skipped both under mbuf pressure, the parse \
+       degrades rather than erroring the datagram away, and the source rule \
+       decides",
+    ),
+    // Both truncation rows below: `recv_with_meta` returns Lost/Lost on
+    // `MSG_CTRUNC` WITHOUT parsing, so all four squares collapse onto one, and
+    // `Lost` accuses our own control buffer rather than the sender. The
+    // interface check refuses on it before the destination is looked at.
+    (
+      true,
+      Some(group),
+      Some(BOUND_IFACE),
+      Verdict::Refuse(Refuse::LinkWitnessLost),
+      "TRUNCATED, both cmsgs on the wire: our buffer overflowed, which is this \
+       side's defect and refuses",
+    ),
+    (
+      true,
+      Some(group),
+      None,
+      Verdict::Refuse(Refuse::LinkWitnessLost),
+      "TRUNCATED, destination only: same refusal, decided at the interface \
+       stage before any destination arm",
+    ),
+  ];
+
+  for (truncated, dst, iface, want, what) in rows {
+    let cmsgs = bsd_v4_cmsgs(dst, iface);
+    let (destination, iface_witness) = bsd_v4_witnesses(&cmsgs, truncated);
+    assert_eq!(
+      admits_ingress(src, destination, None, link, iface_witness),
+      want,
+      "{what} (destination={destination:?}, iface={iface_witness:?})"
+    );
+  }
+
+  // Withholding is not refusing, and this is the row that says so: the SAME
+  // unscoped group datagram from an ON-prefix sender is admitted, on the source
+  // arm and named as such. A rule that refused here would be deafness rather
+  // than scoping.
+  let on_prefix: SocketAddr = ([192, 168, 1, 50], 5353).into();
+  let (destination, iface_witness) = bsd_v4_witnesses(&bsd_v4_cmsgs(Some(group), None), false);
+  assert_eq!(
+    destination,
+    DestinationWitness::Witnessed(IpAddr::V4(group)),
+    "the destination reaches the gate WITNESSED — the privilege is withheld at \
+     the gate, never by erasing the address"
+  );
+  assert_eq!(
+    admits_ingress(on_prefix, destination, None, link, iface_witness),
+    Verdict::Admit(Admit::UnscopedMdnsGroup),
+    "an unscoped group from an on-prefix sender is admitted on the source arm, \
+     under its own name"
+  );
+}
+
+/// The same table under OpenBSD/NetBSD conditions, where `libc` binds
+/// `MSG_MCAST` and `recv_with_meta` therefore hands §11 a
+/// `LinkDelivery::Multicast` beside the witnesses.
+///
+/// Those two targets are where the availability residual does NOT land. An
+/// unscoped mDNS-group destination takes the same coarse-delivery arm a datagram
+/// with no destination witness takes, so `MSG_MCAST` admits it — as
+/// `Admit::UnscopedMdnsGroup`, never as arm one, because the flag says only
+/// "some group" and cannot buy an exemption the finer evidence failed to earn.
+///
+/// That is monotonicity rather than leniency: this square carries strictly more
+/// evidence than the one below it and must not fare worse. FreeBSD and DragonFly
+/// bind no `MSG_MCAST`, so the same datagram reaches §11's source arm there and
+/// an off-prefix sender IS refused — the residual, named in `hick-onlink`'s
+/// module header and counted as `Refuse::UnscopedGroupSourceOffLink`.
+#[test]
+fn bsd_v4_partial_pair_on_netbsdlike_is_admitted_by_the_coarse_multicast_flag() {
+  use crate::onlink::{Admit, BoundLink, LinkDelivery, Refuse, Verdict, admits_ingress};
+
+  type Row = (bool, Option<Ipv4Addr>, Option<u32>, Verdict, &'static str);
+
+  let group = Ipv4Addr::new(224, 0, 0, 251);
+  let src: SocketAddr = ([203, 0, 113, 7], 5353).into();
+  let addrs = [(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 24u8)];
+  let link = BoundLink::new(BOUND_IFACE, false, &addrs);
+
+  let rows: [Row; 5] = [
+    (
+      false,
+      Some(group),
+      Some(BOUND_IFACE),
+      Verdict::Admit(Admit::MdnsGroup),
+      "both cmsgs: the witnessed destination names WHICH group, so arm one is \
+       taken by address rather than by flag",
+    ),
+    (
+      false,
+      Some(group),
+      None,
+      // ADMITTED, and NOT as arm one. The coarse flag is worth here exactly what
+      // it is worth to the datagram beside this one that recovered no
+      // destination at all — no more, so it never buys the exemption, and no
+      // less, so this square cannot REFUSE what the strictly less-informed
+      // square ADMITS. Refusing here punished partial evidence: an attacker who
+      // can make one cmsg go missing can make both go missing and be admitted
+      // through the blind square anyway, so it stopped nobody and taxed the
+      // off-prefix peers §11 calls essential in full.
+      Verdict::Admit(Admit::UnscopedMdnsGroup),
+      "destination only: the coarse flag admits it, under its own name rather \
+       than as arm one — so OpenBSD/NetBSD carry no availability residual",
+    ),
+    (
+      false,
+      Some(group),
+      Some(FOREIGN_IFACE),
+      Verdict::Refuse(Refuse::ForeignLink),
+      "both cmsgs, another NIC: MSG_MCAST does not outrank the link scoping",
+    ),
+    (
+      false,
+      None,
+      Some(BOUND_IFACE),
+      // Where the flag DOES decide: no destination at all. This is the residual
+      // `hick-onlink` names and does not close — a foreign group is admitted
+      // here too, because "which group" is not a bit.
+      Verdict::Admit(Admit::BlindMulticastDelivery),
+      "interface only: with no destination the coarse flag is all there is, and \
+       it admits any group",
+    ),
+    (
+      true,
+      Some(group),
+      None,
+      Verdict::Refuse(Refuse::LinkWitnessLost),
+      "TRUNCATED: our own buffer failed, and the coarse flag is not evidence \
+       about that",
+    ),
+  ];
+
+  for (truncated, dst, iface, want, what) in rows {
+    let cmsgs = bsd_v4_cmsgs(dst, iface);
+    let (destination, iface_witness) = bsd_v4_witnesses(&cmsgs, truncated);
+    assert_eq!(
+      admits_ingress(
+        src,
+        destination,
+        Some(LinkDelivery::Multicast),
+        link,
+        iface_witness
+      ),
+      want,
+      "{what} (destination={destination:?}, iface={iface_witness:?})"
+    );
+  }
+}
+
+/// Withholding the privilege must NOT cost the classification, on the very
+/// square where the privilege is withheld.
+///
+/// The first attempt at this fix enforced the rule in this crate by rewriting a
+/// lone `Witnessed` destination to `Declined`. That withheld arm one — and threw
+/// away the address, which is what every NEGATIVE class is decided by. A foreign
+/// multicast group stopped being refused AS a foreign group and fell to the
+/// coarse arms: admitted outright by `MSG_MCAST` on OpenBSD/NetBSD, and admitted
+/// for any in-prefix sender on FreeBSD/DragonFly. Withholding a privilege by
+/// destroying the evidence it rests on gives away everything else that evidence
+/// was refusing.
+///
+/// So this asserts the opposite of what it once did: the address survives, and
+/// every refusal it earns is still named — under both delivery regimes, from an
+/// IN-prefix sender the source arm would otherwise have admitted, so the refusal
+/// is attributable to the destination and cannot be the source's doing.
+#[test]
+fn bsd_v4_withholding_the_privilege_keeps_the_negative_classification() {
+  use crate::onlink::{BoundLink, LinkDelivery, Refuse, Verdict, admits_ingress};
+
+  // IN-prefix, so the source arm would admit and only the destination can refuse.
+  let src: SocketAddr = ([192, 168, 1, 50], 5353).into();
+  let addrs = [(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 24u8)];
+  let link = BoundLink::new(BOUND_IFACE, false, &addrs);
+
+  for (dst, want, what) in [
+    (
+      Ipv4Addr::new(224, 0, 0, 252),
+      Refuse::ForeignGroup,
+      "LLMNR's group, not ours",
+    ),
+    (
+      Ipv4Addr::BROADCAST,
+      Refuse::BroadcastAddressed,
+      "RFC 919's limited broadcast",
+    ),
+    (
+      Ipv4Addr::new(192, 168, 1, 200),
+      Refuse::DestinationNotHeld,
+      "a neighbour's address on our own subnet",
+    ),
+  ] {
+    let cmsgs = bsd_v4_cmsgs(Some(dst), None);
+    let (destination, iface_witness) = bsd_v4_witnesses(&cmsgs, false);
+    assert_eq!(
+      destination,
+      DestinationWitness::Witnessed(IpAddr::V4(dst)),
+      "{what}: the lone destination reaches the gate as the kernel produced it"
+    );
+    // Both delivery regimes: a witnessed destination puts `admits_ingress` in
+    // its first regime, where the coarse flag decides nothing, so all four BSDs
+    // must name the same refusal.
+    for delivery in [None, Some(LinkDelivery::Multicast)] {
+      assert_eq!(
+        admits_ingress(src, destination, delivery, link, iface_witness),
+        Verdict::Refuse(want),
+        "{what}: an unscoped datagram loses arm one and keeps every refusal its \
+         destination earns ({delivery:?})"
+      );
+    }
+  }
+}
+
 #[test]
 fn decode_netbsd_pktinfo_reads_the_eight_byte_layout() {
   let group = Ipv4Addr::new(224, 0, 0, 251);
