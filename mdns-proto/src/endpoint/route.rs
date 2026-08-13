@@ -188,20 +188,58 @@ where
   /// conflicts are only routed for class-IN records — a record with
   /// class ANY or an unknown class is not the same-class RRset RFC 6762 §9
   /// requires, so it must not drive rename / host-conflict surfacing.
-  /// Does this datagram's Authority Section carry at least one instance-owned
-  /// record for `name`? A §8.2 proposal is only worth delivering if it proposes
-  /// something about a name we own.
+  /// Does this datagram's Authority Section carry at least one record proposing
+  /// something about `name`? A §8.2 proposal is only worth delivering if it
+  /// proposes something about a name we own.
+  ///
+  /// # Every type, because the probe asks ANY
+  ///
+  /// EVERY positive-TTL IN record at the name counts, not just SRV/TXT. The
+  /// uniqueness question a probe asks is type ANY, so the peer's proposed list —
+  /// the one §8.2.1 sorts against ours — is everything it puts at that name.
+  /// Filtering to SRV/TXT here made a peer proposing only an AAAA invisible:
+  /// that peer folds our SRV/TXT into its own comparison, finds its AAAA sorts
+  /// later, and continues as the winner, while this endpoint receives no
+  /// `ProbeProposal` at all and also continues. Two conforming peers, one name,
+  /// and duplicate ownership — the outcome the whole mechanism exists to
+  /// prevent, invisible unless the peer proposes a type we do not.
+  ///
+  /// The SRV/TXT restriction survives only where it is actually the rule: RFC
+  /// 6762 §9's post-establishment conflict, which `Service` applies to the
+  /// unique RRset it is authoritative for.
+  ///
+  /// # …but only what the query ASKS about
+  ///
+  /// §8.1 defines a probe as a query "with the record name in question in the
+  /// Question Section", and §8.2 reads the proposal off "the Authority Section
+  /// of *that query*". An Authority Section read without its questions is not a
+  /// proposal at all: a QDCOUNT=0 packet, or one asking about an unrelated name,
+  /// would trigger §8.2 on any authority record that happens to mention a name
+  /// of ours — records it never proposed, and a free one-second deferral on
+  /// demand.
+  ///
+  /// # One predicate, one home
+  ///
+  /// Both halves above are [`proposal_admits`], CALLED rather than restated —
+  /// `service::proposal::adjudicate` scopes the fold with the same call over the
+  /// same records, so the two layers cannot answer differently. Spelling the rule
+  /// out twice is exactly what produced the SRV/TXT defect: the fold's copy was
+  /// corrected and this one was left, and a peer proposing a type we do not
+  /// publish went unseen by a whole endpoint while it considered itself the
+  /// winner.
+  ///
+  /// The invariant that buys — ROUTING OVER-APPROXIMATES ADMISSION: if the fold
+  /// would reach a verdict or an abandonment for a datagram, a `ProbeProposal`
+  /// was routed for it. Pinned by
+  /// `routing_over_approximates_what_the_fold_adjudicates`, which drives
+  /// `Endpoint::handle` and `Service::handle_event` over the SAME constructed
+  /// datagrams rather than trusting two spellings to agree.
   fn authority_proposes_for(&self, name: &crate::Name) -> bool {
-    for r in self.reader.authority().flatten() {
-      if r.ttl() != 0
-        && r.rclass() == ResourceClass::In
-        && names_match_record(name, &r)
-        && is_instance_conflict_rtype(r.rtype())
-      {
-        return true;
-      }
-    }
-    false
+    self
+      .reader
+      .authority()
+      .flatten()
+      .any(|r| proposal_admits(&r, || self.reader.questions(), name))
   }
 
   /// The HOST half of the conflict fan-out, for the QR=0 authority path whose
@@ -260,21 +298,41 @@ where
       if route.withdrawing {
         continue;
       }
-      if names_match_record(route.name(), r) && is_instance_conflict_rtype(r.rtype()) {
-        return Some((
-          key,
-          RouteEvent::ToService(ToService::new(
-            route.handle(),
-            ServiceEvent::ProbeConflict(ProbeConflict::new(self.src, *r, self.datagram)),
-          )),
-        ));
-      }
+      // HOST first, INSTANCE second — the reverse of the old order, and only
+      // observable when one service's instance and host names are the SAME
+      // name. The instance test below no longer screens by rtype, so leading
+      // with it would swallow an A/AAAA that the host test owns and turn a
+      // `HostConflict` into a `ProbeConflict`. Testing the narrower rule first
+      // keeps every A/AAAA-at-the-host-name decision byte-identical to before
+      // and confines the widening to records only the instance test claims.
       if names_match_record(route.host(), r) && is_host_conflict_rtype(r.rtype()) {
         return Some((
           key,
           RouteEvent::ToService(ToService::new(
             route.handle(),
             ServiceEvent::HostConflict(HostConflict::new(*r, origin)),
+          )),
+        ));
+      }
+      // EVERY type at the instance name, not just SRV/TXT. A probing host owes
+      // §8.1 a deferral on "any conflicting Multicast DNS response" for a name
+      // it is probing, and the name it is probing is asked about as type ANY —
+      // so an existing owner's A, AAAA or NSEC at that name is a response
+      // claiming our tentative name just as much as its SRV is. Screening
+      // those out here let this service finish probing and announce over a peer
+      // that already holds the name.
+      //
+      // Widening is safe because the narrowing lives where the narrow rule is
+      // true: §9's post-establishment arm in `Service::handle_event` tests
+      // SRV/TXT itself before reverting an ESTABLISHED service to probing, so
+      // an extra type reaching an established service is dropped there. What
+      // reaches a PRE-authoritative one is §8.1's input, which is every type.
+      if names_match_record(route.name(), r) {
+        return Some((
+          key,
+          RouteEvent::ToService(ToService::new(
+            route.handle(),
+            ServiceEvent::ProbeConflict(ProbeConflict::new(self.src, *r, self.datagram)),
           )),
         ));
       }

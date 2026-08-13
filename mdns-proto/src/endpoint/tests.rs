@@ -311,16 +311,27 @@ fn build_probe_authority_for_host(buf: &mut [u8; 512], host_str: &str) -> usize 
   b.finish().unwrap()
 }
 
-/// Helper: encode a probe message with an SRV record in the authority section
-/// for `name`. Use for INSTANCE-name conflicts. The endpoint gates ProbeConflict
-/// to the instance's unique RRset (SRV/TXT), so an A record owned by the
-/// instance name is no longer a conflict.
+/// Helper: encode a PROBE for `instance_str` — the §8.1 ANY question plus an SRV
+/// record in the authority section. Use for INSTANCE-name conflicts.
+///
+/// The question is not decoration: §8.1 defines a probe as "a query with the
+/// record name in question in the Question Section" (§5.4 sets the
+/// unicast-response bit on it), and §8.2 reads the proposal off "the Authority
+/// Section of *that query*". A QDCOUNT=0 packet proposes nothing, so building
+/// one here asserted the routing of a datagram no prober sends.
 fn build_probe_srv_authority(buf: &mut [u8; 512], instance_str: &str) -> usize {
   use crate::wire::{Header, MessageBuilder};
   let hdr = Header::new();
   let mut b = MessageBuilder::<'_, 32>::try_new(buf, hdr).unwrap();
   let name = Name::try_from_str(instance_str).unwrap();
   let target = Name::try_from_str("other-host.local.").unwrap();
+  b.push_question(
+    &name,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
   b.push_srv_authority(&name, 120, 0, 0, 8080, &target)
     .unwrap();
   b.finish().unwrap()
@@ -403,28 +414,23 @@ fn authority_instance_name_routes_as_probe_proposal() {
   let n = build_probe_srv_authority(&mut buf, "Printer._ipp._tcp.local.");
   let data = &buf[..n];
 
-  let mut events = e
+  // A probe routes TWO things to the owner of the name, and both are §8.1's:
+  // the QUESTION it must defend the name by answering, and the §8.2 PROPOSAL
+  // its Authority Section makes. The question is routed first (Question Section
+  // precedes Authority), so this scans rather than taking the head.
+  let proposal_handle = e
     .handle(StdInstant::now(), src, local_ip, 0, data, false)
-    .unwrap();
-  let ev = events
-    .next()
-    .expect("expected at least one routing event")
-    .expect("expected Ok");
-
-  match ev {
-    RouteEvent::ToService(ts) => {
-      assert_eq!(ts.handle(), expected_handle);
-      assert!(
-        ts.event().is_probe_proposal(),
-        "expected ProbeProposal for an instance-name authority record, got {:?}",
-        ts.event()
-      );
-    }
-    other => panic!(
-      "expected RouteEvent::ToService(ProbeProposal), got {:?}",
-      other
-    ),
-  }
+    .unwrap()
+    .filter_map(|ev| match ev.expect("expected Ok") {
+      RouteEvent::ToService(ts) if ts.event().is_probe_proposal() => Some(ts.handle()),
+      _ => None,
+    })
+    .next();
+  assert_eq!(
+    proposal_handle,
+    Some(expected_handle),
+    "an instance-name authority record on a probe must route as a ProbeProposal to that service"
+  );
 }
 
 /// the SAME probe-shaped authority record that triggers a
@@ -1218,24 +1224,18 @@ fn self_packet_does_not_route_as_probe_conflict() {
   // MUST still emit ProbeConflict — proves suppression is driven by the
   // flag, not a broken routing path.
   let peer_src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 55), 5353));
-  let mut peer_events = e
+  // The probe's own §8.1 question routes ahead of its §8.2 proposal, so scan.
+  let saw_proposal = e
     .handle(StdInstant::now(), peer_src, local_ip, 0, data, false)
-    .unwrap();
-  let ev = peer_events
-    .next()
-    .expect("control: foreign-source probe MUST still produce a routing event")
-    .expect("control: routing event must be Ok");
-  match ev {
-    RouteEvent::ToService(ts) => assert!(
-      ts.event().is_probe_proposal(),
-      "control: foreign-source probe must still emit ProbeProposal; got {:?}",
-      ts.event()
-    ),
-    other => panic!(
-      "control: expected RouteEvent::ToService(ProbeProposal), got {:?}",
-      other
-    ),
-  }
+    .unwrap()
+    .any(|ev| match ev.expect("control: routing event must be Ok") {
+      RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
+      _ => false,
+    });
+  assert!(
+    saw_proposal,
+    "control: foreign-source probe must still emit ProbeProposal"
+  );
 }
 
 /// self-packet guard must also suppress cache population.  A
@@ -1400,6 +1400,15 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   let hdr = Header::new();
   let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
     MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  // §8.1's question, which is what makes this a probe (see
+  // `build_probe_srv_authority`).
+  b.push_question(
+    &inst,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
   b.push_srv_authority(
     &inst,
     120,
@@ -1432,22 +1441,18 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   // and not some other suppression.
   let peer_v6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0099);
   let peer_src: SocketAddr = SocketAddr::from((peer_v6, 5353));
-  let mut peer_events = e.handle(now, peer_src, local_ip, 0, data, false).unwrap();
-  let ev = peer_events
-    .next()
-    .expect("control: foreign IPv6 probe MUST still produce a routing event")
-    .expect("control: routing event must be Ok");
-  match ev {
-    RouteEvent::ToService(ts) => assert!(
-      ts.event().is_probe_proposal(),
-      "control: foreign IPv6 probe must still emit ProbeProposal; got {:?}",
-      ts.event()
-    ),
-    other => panic!(
-      "control: expected RouteEvent::ToService(ProbeProposal), got {:?}",
-      other
-    ),
-  }
+  // The probe's §8.1 question routes ahead of its §8.2 proposal, so scan.
+  let saw_proposal = e
+    .handle(now, peer_src, local_ip, 0, data, false)
+    .unwrap()
+    .any(|ev| match ev.expect("control: routing event must be Ok") {
+      RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
+      _ => false,
+    });
+  assert!(
+    saw_proposal,
+    "control: foreign IPv6 probe must still emit ProbeProposal"
+  );
 }
 
 // ── terminal-then-cancel cleanup, no leak ───────────
@@ -4117,6 +4122,15 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   let hdr = Header::new();
   let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
     MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  // §8.1's question, which is what makes this a probe (see
+  // `build_probe_srv_authority`).
+  b.push_question(
+    &inst,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
   b.push_srv_authority(
     &inst,
     120,
@@ -4143,23 +4157,19 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   // (2) Foreign peer on a different interface (ifindex=3) using the
   //     same numeric link-local.  This is the regression case — must
   //     route as ProbeConflict, not be silently dropped.
-  let mut peer_events = e.handle(now, self_src, local_ip, 3, data, false).unwrap();
-  let ev = peer_events
-    .next()
-    .expect("link-local from a DIFFERENT interface must still produce a routing event")
-    .expect("event must be Ok");
-  match ev {
-    RouteEvent::ToService(ts) => assert!(
-      ts.event().is_probe_proposal(),
-      "link-local from ifindex=3 must emit ProbeProposal (not be misclassified \
-         as self because of bare-address match); got {:?}",
-      ts.event()
-    ),
-    other => panic!(
-      "expected RouteEvent::ToService(ProbeProposal), got {:?}",
-      other
-    ),
-  }
+  // The probe's §8.1 question routes ahead of its §8.2 proposal, so scan.
+  let saw_proposal = e
+    .handle(now, self_src, local_ip, 3, data, false)
+    .unwrap()
+    .any(|ev| match ev.expect("event must be Ok") {
+      RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
+      _ => false,
+    });
+  assert!(
+    saw_proposal,
+    "link-local from ifindex=3 must emit ProbeProposal (not be misclassified \
+       as self because of bare-address match)"
+  );
 }
 
 // ── response answers fan out to all type-compatible routes ──
@@ -7338,11 +7348,20 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
     let n = b.finish().unwrap();
     buf[..n].to_vec()
   };
-  // A peer claiming our INSTANCE name with rival rdata → §9 ProbeConflict.
+  // A peer PROBING for our INSTANCE name with rival rdata → §8.2 ProbeProposal.
+  // The §8.1 question is what makes it a probe: without it the Authority Section
+  // proposes nothing and the datagram routes nowhere at all.
   let inst_pkt = {
     let target = Name::try_from_str("rival.local.").unwrap();
     let mut buf = [0u8; 512];
     let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(
+      &inst,
+      crate::wire::ResourceType::Any,
+      crate::wire::ResourceClass::In,
+      true,
+    )
+    .unwrap();
     b.push_srv_authority(&inst, 120, 0, 0, 9999, &target)
       .unwrap();
     let n = b.finish().unwrap();
@@ -8366,6 +8385,387 @@ fn a_zero_debt_family_report_is_masked() {
       "{}: nor may it count as progress and re-arm at the full interval, which \
        would starve the family that still owes",
       invented.as_str()
+    );
+  }
+}
+
+// ── R10 finding 1: §8 conflict routing is not scoped to SRV/TXT ────────
+
+/// R10 finding 1: a peer PROBING our instance name with a type we do not
+/// publish must still deliver a `ProbeProposal`.
+///
+/// The uniqueness question a probe asks is type ANY, so the peer's proposed
+/// list — the one §8.2.1 sorts against ours — is everything it puts at that
+/// name. Requiring SRV or TXT here made a peer proposing only an AAAA invisible:
+/// that peer folds OUR SRV and TXT into its own comparison, finds its AAAA sorts
+/// later, and continues as the winner, while this endpoint receives no proposal
+/// at all and also continues. Two conforming peers, one name, and duplicate
+/// ownership — the outcome the whole mechanism exists to prevent.
+#[test]
+fn a_probe_proposing_only_an_aaaa_still_delivers_a_proposal() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+  b.push_question(
+    &inst,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
+  b.push_aaaa_authority(&inst, 120, Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))
+    .unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| {
+      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_proposal())
+    });
+  assert!(
+    saw,
+    "a probe proposing ONLY an AAAA at our instance name is still a §8.2 \
+     proposal — the probe's question is type ANY"
+  );
+}
+
+/// R10 finding 1: an existing owner's RESPONSE at our instance name routes a
+/// `ProbeConflict` whatever its type.
+///
+/// RFC 6762 §8.1 makes a probing host defer to "any conflicting Multicast DNS
+/// response" for a name it is probing, and the name is asked about as type ANY.
+/// Screening the route down to SRV/TXT dropped an existing owner's A, AAAA or
+/// NSEC on the floor and let this service announce over it.
+///
+/// The narrow SRV/TXT rule is §9's, and `Service` applies it there itself — this
+/// is only about what the ROUTER, which cannot see lifecycle state, delivers.
+#[test]
+fn a_response_of_any_type_at_our_instance_name_routes_a_conflict() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  b.push_a_answer(&inst, 120, Ipv4Addr::new(10, 0, 0, 7), true)
+    .unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| {
+      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_conflict())
+    });
+  assert!(
+    saw,
+    "an A record at our INSTANCE name on a response is a peer claiming a name \
+     we are probing — §8.1 must see it"
+  );
+}
+
+/// R10 finding 1: widening the instance route must not steal the HOST route.
+///
+/// The instance test no longer screens by rtype, so if a service's instance and
+/// host names were ever the same name, testing it first would swallow an A/AAAA
+/// the host rule owns and turn a `HostConflict` into a `ProbeConflict`. The host
+/// rule is therefore tested FIRST, and this pins that ordering for the ordinary
+/// case where the two names differ.
+#[test]
+fn a_host_address_response_still_routes_a_host_conflict() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, expected) = build_endpoint_with_printer();
+  let host = Name::try_from_str("printer-host.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  b.push_a_answer(&host, 120, Ipv4Addr::new(10, 0, 0, 8), true)
+    .unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| {
+      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_host_conflict())
+    });
+  assert!(
+    saw,
+    "an A at the HOST name is still a HostConflict — widening the instance rule \
+     must not take it"
+  );
+}
+
+/// R10 finding 5: an Authority Section with no matching QUESTION is not a
+/// proposal, so no `ProbeProposal` is routed.
+///
+/// §8.2 reads the proposal off "the Authority Section of *that query*". A
+/// QDCOUNT=0 packet asks nothing, so its authority records answer nothing —
+/// admitting them let any peer impose a one-second §8.2 deferral on demand.
+#[test]
+fn an_authority_section_with_no_question_routes_no_proposal() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, _expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+  let target = Name::try_from_str("other-host.local.").unwrap();
+  b.push_srv_authority(&inst, 120, 0, 0, 8080, &target).unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
+  assert!(
+    !saw,
+    "a QR=0 packet that asks no question proposes nothing, however its \
+     Authority Section is filled"
+  );
+}
+
+/// R10 finding 5: a query asking about ANOTHER name proposes nothing about
+/// ours, even when its Authority Section names ours.
+#[test]
+fn a_question_for_another_name_routes_no_proposal_for_ours() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, _expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let other = Name::try_from_str("Scanner._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+  b.push_question(
+    &other,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
+  let target = Name::try_from_str("other-host.local.").unwrap();
+  b.push_srv_authority(&inst, 120, 0, 0, 8080, &target).unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
+  assert!(
+    !saw,
+    "the query asks about Scanner, so its authority records are not a proposal \
+     for Printer"
+  );
+}
+
+// ── the cross-layer invariant R10-1 broke ──────────────────────────────
+
+/// ROUTING OVER-APPROXIMATES ADMISSION: whenever the fold would act on a
+/// datagram, the endpoint routed a `ProbeProposal` for it.
+///
+/// This is the invariant R10's first finding broke, and it broke MECHANICALLY.
+/// The two layers each spelled out `ttl != 0 && class == IN && the name matches
+/// && a question admits it`; the fold's copy was corrected to admit every RTYPE
+/// and the router's was left at SRV/TXT. Nothing failed, because every fixture
+/// drove ONE layer. A peer proposing only an AAAA then folded our records into
+/// its own comparison and continued as the winner while this endpoint, never
+/// handed the proposal, also continued — two conforming peers, one name.
+///
+/// So this drives BOTH layers over the SAME constructed datagrams and requires
+/// the implication to hold for each. Deliberately not an equivalence: the router
+/// may deliver a proposal the fold then declines or abandons, because a
+/// non-verdict costs nothing — but it must never withhold one the fold would
+/// have acted on.
+///
+/// Both layers now call `endpoint::proposal_admits`, so this is testing that the
+/// single predicate really is reached from both — which is the part a shared
+/// function does not prove on its own.
+#[test]
+fn routing_over_approximates_what_the_fold_adjudicates() {
+  use crate::{
+    event::RouteEvent,
+    records::ServiceRecords,
+    wire::{Header, MessageBuilder, ResourceClass, ResourceType},
+  };
+  use core::net::SocketAddr;
+
+  const INSTANCE: &str = "Printer._ipp._tcp.local.";
+
+  fn srv_txt(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    let t = Name::try_from_str("other-host.local.").unwrap();
+    b.push_srv_authority(n, 120, 0, 0, 9999, &t).unwrap();
+    let segs: [&[u8]; 0] = [];
+    b.push_txt_authority(n, 120, segs).unwrap();
+  }
+  fn aaaa_only(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    b.push_aaaa_authority(n, 120, Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))
+      .unwrap();
+  }
+  fn a_only(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    b.push_a_authority(n, 120, Ipv4Addr::new(10, 0, 0, 9)).unwrap();
+  }
+  fn srv_only(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    let t = Name::try_from_str("other-host.local.").unwrap();
+    b.push_srv_authority(n, 120, 0, 0, 9999, &t).unwrap();
+  }
+  fn goodbye_srv(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    let t = Name::try_from_str("other-host.local.").unwrap();
+    b.push_srv_authority(n, 0, 0, 0, 9999, &t).unwrap();
+  }
+
+  /// One case: description, the question's name and QTYPE, and the authority
+  /// records to push (all at the instance name).
+  type Case = (
+    &'static str,
+    &'static str,
+    ResourceType,
+    fn(&mut MessageBuilder<'_, 32>, &Name),
+  );
+  let cases: [Case; 7] = [
+    (
+      "the conforming probe: ANY question, SRV+TXT proposed",
+      INSTANCE,
+      ResourceType::Any,
+      srv_txt,
+    ),
+    (
+      "R10-1: ANY question, only an AAAA — a type we do not publish",
+      INSTANCE,
+      ResourceType::Any,
+      aaaa_only,
+    ),
+    (
+      "R10-1: ANY question, only an A",
+      INSTANCE,
+      ResourceType::Any,
+      a_only,
+    ),
+    (
+      "R10-5: a question for ANOTHER name, our name in the authority section",
+      "Scanner._ipp._tcp.local.",
+      ResourceType::Any,
+      srv_txt,
+    ),
+    (
+      "R10-5: a SPECIFIC qtype that admits the proposed record",
+      INSTANCE,
+      ResourceType::Srv,
+      srv_only,
+    ),
+    (
+      "R10-5: a SPECIFIC qtype that admits NONE of the proposed records",
+      INSTANCE,
+      ResourceType::Txt,
+      srv_only,
+    ),
+    (
+      "a TTL=0 authority record is a withdrawal, not a claim",
+      INSTANCE,
+      ResourceType::Any,
+      goodbye_srv,
+    ),
+  ];
+
+  let instance = Name::try_from_str(INSTANCE).unwrap();
+  // The SAME records the endpoint registers in `build_endpoint_with_printer`, so
+  // the two layers are asked about one service and not two.
+  let records = || {
+    ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str(INSTANCE).unwrap(),
+      Name::try_from_str("printer-host.local.").unwrap(),
+      631,
+      120,
+    )
+  };
+
+  for (what, qname, qtype, push_recs) in cases {
+    let mut buf = [0u8; 512];
+    let q = Name::try_from_str(qname).unwrap();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(&q, qtype, ResourceClass::In, true).unwrap();
+    push_recs(&mut b, &instance);
+    let n = b.finish().unwrap();
+    let datagram = buf[..n].to_vec();
+
+    // LAYER 1 — the endpoint: was a ProbeProposal routed?
+    let (mut e, _h) = build_endpoint_with_printer();
+    let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+    let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+    let routed = e
+      .handle(StdInstant::now(), src, local_ip, 0, &datagram, false)
+      .unwrap()
+      .filter_map(Result::ok)
+      .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
+
+    // LAYER 2 — the fold: is any record of this datagram IN the proposal? That is
+    // precisely "the fold would act on it": an admitted record is one it folds,
+    // and a §8.2 verdict can only come from folded records.
+    let reader = crate::wire::MessageReader::try_parse(&datagram).unwrap();
+    let recs = records();
+    let admits_any = reader
+      .authority()
+      .flatten()
+      .any(|r| crate::endpoint::proposal_admits(&r, || reader.questions(), recs.instance()));
+
+    assert!(
+      !admits_any || routed,
+      "{what}: the fold admits a record from this datagram, so a ProbeProposal \
+       MUST have been routed for it — routing must OVER-approximate admission, \
+       never under-approximate it"
     );
   }
 }

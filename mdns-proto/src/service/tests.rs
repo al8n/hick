@@ -143,6 +143,20 @@ fn proposal_bytes(owner: &str, recs: &[Rec<'_>]) -> std::vec::Vec<u8> {
   let mut buf = [0u8; 1024];
   let name = Name::try_from_str(owner).unwrap();
   let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+  // The QUESTION a probe asks, because it is what makes the Authority Section a
+  // proposal at all: §8.1 sends "a query with the record name in question in the
+  // Question Section", §5.4 sets the unicast-response bit on it, and §8.2 reads
+  // the proposed rdata off "the Authority Section of *that query*". These
+  // fixtures carried QDCOUNT=0 and were therefore not probes — a receiver that
+  // adjudicated them was adjudicating records that answered nothing. Exactly
+  // what `respond::write_probe` emits.
+  b.push_question(
+    &name,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
   for r in recs {
     match *r {
       Rec::Srv { port, target } => {
@@ -172,14 +186,40 @@ fn proposal_bytes(owner: &str, recs: &[Rec<'_>]) -> std::vec::Vec<u8> {
 /// not parse, cannot be expressed through it at all. Those fixtures write the
 /// wire bytes themselves and assemble them here.
 fn raw_proposal_bytes(records: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+  raw_proposal_bytes_asking(PROBED_NAME, records)
+}
+
+/// [`raw_proposal_bytes`] with the probe's QUESTION named explicitly, for the
+/// fixtures that turn on what the query asks rather than on what it proposes.
+fn raw_proposal_bytes_asking(qname: &str, records: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+  raw_proposal_bytes_asking_type(qname, crate::wire::ResourceType::Any, records)
+}
+
+/// [`raw_proposal_bytes_asking`] with the QTYPE named too — a conforming probe
+/// asks ANY (§8.1), and a query asking a specific type proposes only that type.
+fn raw_proposal_bytes_asking_type(
+  qname: &str,
+  qtype: crate::wire::ResourceType,
+  records: &[std::vec::Vec<u8>],
+) -> std::vec::Vec<u8> {
   let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
   msg.extend_from_slice(&0u16.to_be_bytes()); // ID
   msg.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0 — a probe is a QUERY
-  msg.extend_from_slice(&0u16.to_be_bytes()); // QDCOUNT
+  msg.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT — a probe asks about the name
   msg.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
   #[allow(clippy::cast_possible_truncation)]
   msg.extend_from_slice(&(records.len() as u16).to_be_bytes()); // NSCOUNT
   msg.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+  // The §8.1 question, uncompressed, with the §5.4 unicast-response bit set —
+  // the same shape `respond::write_probe` sends.
+  for label in qname.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    msg.push(label.len() as u8);
+    msg.extend_from_slice(label.as_bytes());
+  }
+  msg.push(0);
+  msg.extend_from_slice(&qtype.to_u16().to_be_bytes());
+  msg.extend_from_slice(&(0x8000u16 | 1).to_be_bytes()); // QU | class IN
   for r in records {
     msg.extend_from_slice(r);
   }
@@ -3602,7 +3642,7 @@ fn srv_wire_form_canonical() {
   // Wire-form encoding of "aa.local." should be:
   // \x02 a a \x05 l o c a l \x00
   let mut out_aa: std::vec::Vec<u8> = std::vec::Vec::new();
-  write_canonical_wire_name("aa.local.", &mut out_aa);
+  proposal::write_canonical_wire_name("aa.local.", &mut out_aa);
   assert_eq!(
     out_aa,
     std::vec![2u8, b'a', b'a', 5, b'l', b'o', b'c', b'a', b'l', 0],
@@ -3612,7 +3652,7 @@ fn srv_wire_form_canonical() {
   // Wire-form encoding of "b.local." should be:
   // \x01 b \x05 l o c a l \x00
   let mut out_b: std::vec::Vec<u8> = std::vec::Vec::new();
-  write_canonical_wire_name("b.local.", &mut out_b);
+  proposal::write_canonical_wire_name("b.local.", &mut out_b);
   assert_eq!(
     out_b,
     std::vec![1u8, b'b', 5, b'l', b'o', b'c', b'a', b'l', 0],
@@ -4281,7 +4321,7 @@ fn tiebreak_always_includes_empty_txt() {
       .map(|r| {
         let view = r.rdata_view().unwrap();
         let mut scratch = std::vec::Vec::new();
-        let canonical = respond::rdata_for_tiebreak(&view, &mut scratch)
+        let canonical = proposal::tiebreak_bytes_for_fixture(r.rtype(), &view, &mut scratch)
           .unwrap()
           .to_vec();
         (r.rtype(), canonical)
@@ -4507,7 +4547,7 @@ fn tiebreak_records_that_flatten_alike_are_not_a_tie() {
   // collision payload is — this site used the identity one and passed — so the
   // wrong choice would only surface once a fixture proposed an empty TXT or a
   // mixed-case name, and then it would be asserting bytes §8.2 never compares.
-  let canonical = respond::rdata_for_tiebreak(&view, &mut scratch)
+  let canonical = proposal::tiebreak_bytes_for_fixture(peer_rec.rtype(), &view, &mut scratch)
     .unwrap()
     .to_vec();
   assert_eq!(
@@ -9477,4 +9517,610 @@ fn draw_first_probe(
     }
   }
   panic!("no probe was drawn within the §8.1 initial delay");
+}
+
+// ── R10: the §8.2 proposal is scoped by what the query ASKS ────────────
+
+/// Byte offset at which the first authority record of
+/// [`raw_proposal_bytes_asking`] begins: the 12-byte header, then the question's
+/// uncompressed name, QTYPE and QCLASS.
+///
+/// Fixtures that hand-build a COMPRESSION POINTER need it — a pointer is an
+/// absolute offset into the datagram, so a record that points at itself can only
+/// be written once its own position is known.
+fn first_record_offset(qname: &str) -> usize {
+  let mut n = 12usize;
+  for label in qname.trim_end_matches('.').split('.') {
+    n += 1 + label.len();
+  }
+  n + 1 + 4
+}
+
+/// A record whose OWNER NAME is a compression pointer to `at_offset` — the
+/// record's own position, so following it loops forever.
+///
+/// `Ref` parsing accepts a pointer without resolving it, so this record parses
+/// and only fails when its labels are walked. That is precisely the shape that
+/// used to read as "some other name" and get skipped.
+fn make_cyclic_owner_record(
+  buf: &mut std::vec::Vec<u8>,
+  at_offset: usize,
+  rtype: u16,
+  ttl: u32,
+  rdata: &[u8],
+) {
+  buf.clear();
+  #[allow(clippy::cast_possible_truncation)]
+  {
+    buf.push(0xC0 | ((at_offset >> 8) as u8));
+    buf.push(at_offset as u8);
+  }
+  buf.extend_from_slice(&rtype.to_be_bytes());
+  buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  buf.extend_from_slice(&ttl.to_be_bytes());
+  #[allow(clippy::cast_possible_truncation)]
+  buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+  buf.extend_from_slice(rdata);
+}
+
+/// An NSEC at `PROBED_NAME` whose `next_name` is a compression pointer to
+/// `rdata_offset` — the pointer's own position inside the rdata, so it cycles.
+fn make_cyclic_nsec_record(buf: &mut std::vec::Vec<u8>, ttl: u32, rdata_offset: usize) {
+  buf.clear();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    buf.push(label.len() as u8);
+    buf.extend_from_slice(label.as_bytes());
+  }
+  buf.push(0u8);
+  buf.extend_from_slice(&47u16.to_be_bytes()); // TYPE NSEC
+  buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  buf.extend_from_slice(&ttl.to_be_bytes());
+  // rdata = cyclic next_name (2 bytes) + a window-0 bitmap asserting SRV.
+  let rdata: [u8; 7] = [
+    #[allow(clippy::cast_possible_truncation)]
+    {
+      0xC0 | ((rdata_offset >> 8) as u8)
+    },
+    #[allow(clippy::cast_possible_truncation)]
+    {
+      rdata_offset as u8
+    },
+    0,
+    5,
+    0,
+    0,
+    0x40,
+  ];
+  #[allow(clippy::cast_possible_truncation)]
+  buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+  buf.extend_from_slice(&rdata);
+}
+
+/// The peer list every abandonment fixture below starts from: a proposal that
+/// BEATS ours outright (SRV port 9999 against our 631, and the same empty TXT),
+/// so "we did not lose" can only be the abandonment under test and never a
+/// proposal that was harmless anyway.
+fn winning_pair() -> (std::vec::Vec<u8>, std::vec::Vec<u8>) {
+  let mut txt = std::vec::Vec::new();
+  make_txt_record_ref(&mut txt, PROBED_NAME, 120, &[&[]]);
+  let mut srv = std::vec::Vec::new();
+  make_srv_record_ref(&mut srv, PROBED_NAME, 120, 0, 0, 9999, "host.local.");
+  (txt, srv)
+}
+
+/// CONTROL for every abandonment fixture below: the winning pair ON ITS OWN is
+/// adjudicated and DOES take the round. Without this, "no loss recorded" proves
+/// nothing — a fixture that stopped reaching the comparator at all would pass
+/// every one of them.
+#[test]
+fn the_winning_pair_control_really_does_lose_the_round() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  let bytes = raw_proposal_bytes(&[txt, srv]);
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    svc.tiebreak_lost,
+    "control: the peer's SRV port 9999 beats our 631, so this proposal must \
+     take the round — every abandonment fixture below is built on it"
+  );
+}
+
+/// R10 finding 3: a proposal carrying an UNDECODABLE OWNER NAME is abandoned
+/// whole, not adjudicated from the records that happened to read.
+///
+/// The name matcher answers `false` both for "a different name" and for "a name
+/// I could not decode", and `Ref` parsing accepts a compression pointer without
+/// ever resolving it — so a cyclic owner name arrived looking exactly like an
+/// out-of-scope record and was silently dropped from the list being compared.
+/// Dropping records only ever shortens the peer's list, which only ever flatters
+/// us: here the readable subset alone would have taken the round, and the
+/// unreadable record could have been anything.
+#[test]
+fn an_undecodable_owner_name_abandons_the_whole_proposal() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  // The third record sits after the two readable ones; its owner name is a
+  // pointer to its own offset.
+  let at = first_record_offset(PROBED_NAME) + txt.len() + srv.len();
+  let mut cyclic = std::vec::Vec::new();
+  make_cyclic_owner_record(&mut cyclic, at, 1, 120, &[10, 0, 0, 7]);
+  let bytes = raw_proposal_bytes(&[txt, srv, cyclic]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a proposal with an undecodable owner name is not a list §8.2.1 can sort — \
+     it must be ABANDONED, not adjudicated from the records that read"
+  );
+}
+
+/// R10 finding 4: an NSEC's `next_name` is part of the bytes §8.2 compares, so
+/// an NSEC that will not decode abandons the proposal.
+///
+/// `rdata_for_tiebreak` dropped `next_name` entirely and kept only the bitmap.
+/// Two things followed: an NSEC with a cyclic next-name produced bytes at all,
+/// so a proposal of "our SRV, our TXT and one unreadable NSEC" counted as three
+/// records and won §8.2.1 on list length against our two; and two NSECs denying
+/// the same types at different names compared equal.
+#[test]
+fn an_undecodable_nsec_next_name_abandons_the_proposal() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  // The NSEC's rdata begins after its owner name (PROBED_NAME uncompressed),
+  // type, class, TTL and RDLENGTH.
+  let owner_len = PROBED_NAME
+    .trim_end_matches('.')
+    .split('.')
+    .map(|l| 1 + l.len())
+    .sum::<usize>()
+    + 1;
+  let nsec_at = first_record_offset(PROBED_NAME) + txt.len() + srv.len();
+  let mut nsec = std::vec::Vec::new();
+  make_cyclic_nsec_record(&mut nsec, 120, nsec_at + owner_len + 2 + 2 + 4 + 2);
+  let bytes = raw_proposal_bytes(&[txt, srv, nsec]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "an NSEC whose next_name will not decode is a record §8.2 cannot compare, \
+     so the whole proposal is abandoned — it must NOT be scored as a third \
+     record that wins on list length"
+  );
+}
+
+/// R10 finding 4: a well-known COMPRESSION-ELIGIBLE type this crate does not
+/// parse (NS/SOA/MX/DNAME) cannot be compared as raw bytes, so it abandons the
+/// proposal too.
+///
+/// RFC 3597 §4 forbids compression inside truly-unknown types, which is what
+/// makes their raw bytes a stable comparison. These types are the exception:
+/// their rdata MAY carry a compression pointer, and a raw copy of one is
+/// message-OFFSET-dependent — the same record at a different position in the
+/// packet yields different comparison bytes, so the two sides stop computing the
+/// same function and the tiebreak stops resolving.
+///
+/// DNAME (39) rather than NS (2), and the choice is load-bearing. §8.2.1's
+/// ordering key begins with the record TYPE, so an extra NS would sort BELOW our
+/// TXT(16), become the peer's smallest element, and hand US the round at element
+/// 0 — the right verdict for the wrong reason, and one that holds whether or not
+/// the proposal was abandoned. DNAME sorts above our SRV(33), so it displaces no
+/// comparison: the round is decided by the `winning_pair` control either way,
+/// and the only thing that can keep the name here is the abandonment.
+#[test]
+fn an_unparsed_compressible_type_abandons_the_proposal() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  // A DNAME (type 39) at the probed name whose rdata is a compression pointer.
+  // The OWNER name is readable, so this fixture turns on the rdata rule and not
+  // on finding 3's owner-name rule.
+  let mut dname = std::vec::Vec::new();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    dname.push(label.len() as u8);
+    dname.extend_from_slice(label.as_bytes());
+  }
+  dname.push(0u8);
+  dname.extend_from_slice(&39u16.to_be_bytes()); // TYPE DNAME
+  dname.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  dname.extend_from_slice(&120u32.to_be_bytes());
+  dname.extend_from_slice(&2u16.to_be_bytes()); // RDLENGTH
+  dname.extend_from_slice(&[0xC0, 0x0C]); // a compression pointer
+  let bytes = raw_proposal_bytes(&[txt, srv, dname]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a compression-eligible type this crate does not parse has no well-defined \
+     comparison bytes, so the proposal is abandoned rather than compared over a \
+     raw copy whose value depends on where in the packet it sat"
+  );
+}
+
+/// R10 finding 5: an Authority Section with NO QUESTION is not a proposal.
+///
+/// §8.2 reads the proposed rdata off "the Authority Section of *that query*",
+/// and §8.1 defines the query as one carrying "the record name in question in
+/// the Question Section". A QDCOUNT=0 packet asks nothing, so its authority
+/// records answer nothing — adjudicating them let any peer impose a one-second
+/// §8.2 deferral by sending records it never proposed.
+#[test]
+fn a_proposal_with_no_question_is_not_adjudicated() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  let mut bytes = raw_proposal_bytes(&[txt, srv]);
+  // Strip the question: QDCOUNT → 0, and drop the question bytes.
+  let qlen = first_record_offset(PROBED_NAME) - 12;
+  bytes[4] = 0;
+  bytes[5] = 0;
+  bytes.drain(12..12 + qlen);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a query that asks nothing proposes nothing — its authority records must \
+     record no §8.2 verdict"
+  );
+}
+
+/// R10 finding 5: a query asking about a DIFFERENT name proposes nothing about
+/// ours, however its Authority Section is filled.
+#[test]
+fn a_question_for_another_name_proposes_nothing_about_ours() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  let bytes = raw_proposal_bytes_asking("someone-else._ipp._tcp.local.", &[txt, srv]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "the query asks about another name, so its authority records are not a \
+     proposal for ours"
+  );
+}
+
+/// R10 finding 5: a query asking a SPECIFIC QTYPE proposes only that type, and
+/// the fold honours it.
+///
+/// The peer asks TXT and puts in the Authority Section a TXT byte-identical to
+/// ours plus the SRV(9999) that the `winning_pair` control proves takes the
+/// round. The two readings give OPPOSITE verdicts, which is what makes this
+/// fixture discriminate:
+///
+/// * honouring the question folds the TXT alone: element 0 ties, our list still
+///   has its SRV where the peer's has run out, and §8.2.1's "the list with
+///   records remaining is deemed to have won" keeps the name;
+/// * ignoring it folds both: element 0 ties, and at element 1 the peer's SRV
+///   port 9999 beats our 631, so we defer for a second to a host that proposed
+///   no SRV at all.
+#[test]
+fn a_specific_qtype_proposes_only_that_type() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  let bytes =
+    raw_proposal_bytes_asking_type(PROBED_NAME, crate::wire::ResourceType::Txt, &[txt, srv]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "the query asks TXT, so only the TXT is proposed — and it ties, leaving our \
+     SRV as the record remaining. Folding the SRV the question does not admit \
+     compares a list the peer never made, and loses the round to it"
+  );
+}
+
+// ── R10 finding 2: nothing of a superseded generation reaches the wire ──
+
+/// R10 finding 2: a probe QUEUED before the losing verdict arrived must not be
+/// transmitted.
+///
+/// The permitted order is `handle_timeout` (which queues the probe),
+/// `handle_event` (a winning `ProbeProposal`, which latches the loss), then
+/// `poll_transmit`. §8.2 does not tell the loser to stop asserting — it tells it
+/// to stop: "it defers to the winning host by waiting one second, and then
+/// begins probing for this record again". A probe that escapes here is the
+/// loser probing through the very second it owes.
+#[test]
+fn a_probe_queued_before_the_loss_does_not_escape_the_deferral() {
+  let mut svc = make_service(120);
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+
+  // Drive to the tick that QUEUES a probe, without polling it out.
+  let mut queued = false;
+  for _ in 0..8 {
+    now = now.advance(100);
+    svc.handle_timeout(now).unwrap();
+    if svc.peek_pending().is_some() {
+      queued = true;
+      break;
+    }
+  }
+  assert!(queued, "precondition: a probe is queued and not yet drawn");
+
+  // The winning proposal arrives before the queue is drained.
+  let bytes = srv_txt_proposal(9999);
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    now,
+  );
+  assert!(
+    svc.tiebreak_lost,
+    "precondition: the peer's proposal took the round"
+  );
+
+  assert!(
+    svc.poll_transmit(now, &mut buf).unwrap().is_none(),
+    "a §8.2 loser owes one second of silence, so the probe its previous \
+     generation queued must be WITHHELD — not sent because a probe 'asserts \
+     nothing'"
+  );
+  assert!(
+    svc.peek_pending().is_some(),
+    "…and withheld is a PAUSE, not a drop: the queue is left intact for the \
+     deferral to clear"
+  );
+}
+
+// ── R10 finding 6: a shared PTR claims no instance name ────────────────
+
+/// R10 finding 6: a confirmed response that emitted only the SHARED
+/// service-type PTR must not close the pre-authoritative window.
+///
+/// `is_preauthoritative` asks whether this generation has CLAIMED the name.
+/// The service-type and RFC 6763 §7.1 subtype PTRs are owned by shared names
+/// that any number of responders answer for, so emitting one claims nothing —
+/// and §7.1 known-answer suppression can trim a response down to exactly those
+/// (a querier that already holds our SRV and TXT). Counting it left the window
+/// shut with no instance-owned record anywhere on the link, and the next winning
+/// `ProbeProposal` was dropped unadjudicated.
+#[test]
+fn a_shared_ptr_only_response_does_not_close_the_preauthoritative_window() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  // A confirmed Response that emitted the shared PTRs and NOTHING the instance
+  // owns — what §7.1 leaves after suppressing a querier's known SRV and TXT.
+  svc.awaiting_confirm = Some(AwaitingConfirm::Response(
+    respond::EmittedRecords::new(
+      true,
+      false,
+      false,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      true,
+    ),
+    0,
+  ));
+  svc.note_delivery(t0, TransmitDelivery::ALL);
+
+  assert!(
+    svc.goodbye.ptr,
+    "precondition: goodbye ownership DOES count the shared PTR — a peer caches \
+     it from us and it must be withdrawn"
+  );
+  assert!(
+    !svc.generation_advertised,
+    "…but a shared PTR claims no instance name, so this generation has \
+     advertised nothing"
+  );
+
+  // The consequence, which is the whole point: a winning proposal is still
+  // adjudicated.
+  let bytes = srv_txt_proposal(9999);
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    svc.tiebreak_lost,
+    "a service that has put no instance-owned record on the wire is still \
+     pre-authoritative, so §8.2 still governs it"
+  );
+}
+
+// ── R10 finding 1: §8.1 defers to an existing owner of ANY type ────────
+
+/// R10 finding 1: an existing owner's A record at our instance name is a
+/// conflicting RESPONSE for a name we are probing, and §8.1 defers to it.
+///
+/// "If any conflicting Multicast DNS response is received, then the probing host
+/// MUST defer to the existing host" — and the name we are probing is asked about
+/// as type ANY, so every type at it is ours to defend or to lose. Screening the
+/// conflict down to SRV/TXT let this service finish probing and announce over a
+/// peer that already held the name.
+#[test]
+fn a_response_of_any_type_at_our_instance_name_defeats_the_probe() {
+  let mut svc = make_service(120);
+  let start = probe_once(&mut svc, FakeInstant::zero());
+
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_a_record_ref(&mut buf, PROBED_NAME, 120, [10, 0, 0, 7]);
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+
+  assert!(
+    svc.probe_defeated,
+    "an existing owner's A record at the name we are probing is a conflicting \
+     response, whatever type it happens to be"
+  );
+}
+
+/// R10 finding 1, the other half: widening the types must not make a
+/// byte-identical TWIN a conflict.
+///
+/// `write_announce` and `write_response` both ride an instance NSEC in the
+/// Additional section (RFC 6762 §6.1), so a proxy or fault-tolerance twin — the
+/// case §9 names as the reason for the identical-rdata rule — sends the same
+/// NSEC we do. With SRV and TXT correctly screened out as identical, that NSEC
+/// alone would otherwise have renamed us.
+#[test]
+fn an_identical_twins_instance_nsec_is_never_a_conflict() {
+  let mut svc = make_service(120);
+  let start = probe_once(&mut svc, FakeInstant::zero());
+
+  // The NSEC this service itself emits: owner name as next_name, bitmap
+  // asserting exactly {SRV, TXT}.
+  let mut msg = [0u8; 512];
+  let inst = Name::try_from_str(PROBED_NAME).unwrap();
+  let mut b =
+    crate::wire::MessageBuilder::<'_, 32>::try_new(&mut msg, crate::wire::Header::new()).unwrap();
+  b.push_nsec_additional(&inst, 120, &respond::INSTANCE_NSEC_TYPES, true)
+    .unwrap();
+  let n = b.finish().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
+  let rec = reader.additional().flatten().next().unwrap();
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+  assert!(
+    !svc.probe_defeated,
+    "identical rdata is never a conflict (§9), and our own instance NSEC is \
+     exactly what a byte-identical twin sends"
+  );
+}
+
+/// The duplication `respond::our_nsec_identity` warns about, pinned.
+///
+/// It reconstructs the RFC 4034 §4.1.2 type bitmap that
+/// `MessageBuilder::push_nsec_additional` writes, because the builder works
+/// through a fixed cursor with no allocator and cannot be reused. If either side
+/// changes without the other, our own NSEC stops being recognisable as ours and
+/// a twin's copy of it renames us.
+#[test]
+fn our_nsec_identity_matches_what_the_builder_emits() {
+  let mut msg = [0u8; 512];
+  let inst = Name::try_from_str(PROBED_NAME).unwrap();
+  let mut b =
+    crate::wire::MessageBuilder::<'_, 32>::try_new(&mut msg, crate::wire::Header::new()).unwrap();
+  b.push_nsec_additional(&inst, 120, &respond::INSTANCE_NSEC_TYPES, true)
+    .unwrap();
+  let n = b.finish().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
+  let rec = reader.additional().flatten().next().unwrap();
+  let view = rec.rdata_view().unwrap();
+  let mut scratch = std::vec::Vec::new();
+  let on_the_wire = respond::rdata_for_identity(&view, &mut scratch).unwrap();
+  assert_eq!(
+    on_the_wire,
+    respond::our_nsec_identity().as_slice(),
+    "the reconstructed instance-NSEC identity must equal the identity of the \
+     NSEC the builder actually emits"
+  );
+}
+
+// ── the reader property the fold relies on ──
+
+/// The reader property the fold depends on, pinned rather than asserted in a
+/// comment: a question section that will not parse leaves the authority section
+/// UNLOCATABLE, so no authority record is surfaced at all.
+///
+/// `service::proposal::adjudicate` has no separate "abandon on an unreadable
+/// question section" arm, and that is only safe if this holds. If it did not,
+/// a record admitted by a question parsing BEFORE a broken one would be folded
+/// while the rest of the section went unseen — silently shortening the peer's
+/// list, which is the failure direction that matters: a shorter peer list only
+/// ever flatters us.
+#[test]
+fn an_unparseable_question_section_surfaces_no_authority_records() {
+  let (txt, srv) = winning_pair();
+  let mut bytes = raw_proposal_bytes(&[txt, srv]);
+  // An OVERSTATED QDCOUNT. Question one is perfectly readable; the rest are
+  // parsed off the authority records' bytes and then run off the end of the
+  // datagram, so the question section stops parsing partway. That ordering is
+  // the whole point — a reader that surfaced records anyway would surface the
+  // ones question one admits and silently drop whatever lay past the failure.
+  //
+  // Overstating the count is the only way to get there, and that is itself worth
+  // recording: a question whose NAME is an unresolvable compression pointer does
+  // NOT break section location, because `QuestionRef::try_parse` consumes the
+  // two pointer bytes without following them. Such a question is still
+  // fail-closed at the fold — `names_match` walks the labels, the walk errors,
+  // and the question admits nothing — but it is not this case.
+  bytes[5] = 8;
+  let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+  assert!(
+    reader.questions().any(|q| q.is_err()),
+    "precondition: the question section really does fail to parse"
+  );
+  assert_eq!(
+    reader.authority().count(),
+    0,
+    "an unlocatable authority section must surface NO records — the fold relies \
+     on this instead of carrying its own abandonment arm for the case"
+  );
+
+  // …and therefore the proposal records no verdict, though its records would
+  // otherwise have taken the round (see `the_winning_pair_control_really_does_lose_the_round`).
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a datagram whose question section will not parse yields no §8.2 verdict"
+  );
 }

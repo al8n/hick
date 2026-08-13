@@ -3,6 +3,7 @@
 cfg_heap! {
   use crate::trace::*;
 
+  mod proposal;
   mod respond;
 }
 pub(crate) mod schedule;
@@ -80,33 +81,6 @@ cfg_heap! {
 }
 
 cfg_heap! {
-  /// Write a DNS name in canonical wire form (length-prefixed labels, root
-  /// terminator). Used for SRV target encoding in RFC §8.2 tiebreak comparison.
-  /// This produces byte-identical output for both OUR outgoing SRV and for a
-  /// peer SRV parsed via `rdata_for_identity`, ensuring the bytewise
-  /// comparison is correct.
-  fn write_canonical_wire_name(name_str: &str, out: &mut std::vec::Vec<u8>) {
-    let trimmed = match name_str.strip_suffix('.') {
-      Some(t) => t,
-      None => name_str,
-    };
-    if trimmed.is_empty() {
-      out.push(0);
-      return;
-    }
-    for label in trimmed.split('.') {
-      if label.is_empty() {
-        continue;
-      }
-      let len = label.len().min(63);
-      #[allow(clippy::cast_possible_truncation)]
-      out.push(len as u8);
-      for &b in label.as_bytes().iter().take(63) {
-        out.push(b.to_ascii_lowercase());
-      }
-    }
-    out.push(0); // root terminator
-  }
 
   /// FNV-1a hash of rdata bytes — used to dedupe KAS hints without storing rdata.
   fn hash_rdata(bytes: &[u8]) -> u64 {
@@ -188,142 +162,6 @@ cfg_heap! {
       out.push('.');
     }
     out
-  }
-
-  /// Our own RFC 6762 §8.2 proposal, sorted: the records this service would
-  /// claim for its instance name.
-  ///
-  /// SRV and TXT, because those are exactly what `write_probe` puts in the
-  /// Authority Section under the instance name. A/AAAA belong to the HOST name,
-  /// so they are neither proposed here nor compared. The peer's side is not
-  /// limited this way — a probe asks type ANY, so anything at that name counts
-  /// for them; see `Service::handle_probe_proposal`.
-  ///
-  /// # These bytes must be the bytes we TRANSMIT
-  ///
-  /// §8.2's comparison only resolves a name if both hosts compute the same
-  /// function over the same two lists, and the peer compares against what we
-  /// actually sent. So this side deliberately LOWERCASES the SRV target and
-  /// renders an empty TXT as a single zero-length string — not because §8.2
-  /// wants normalisation (it does not; see
-  /// [`respond::rdata_for_tiebreak`](crate::service::respond) for the peer side,
-  /// which normalises nothing) but because that is precisely what
-  /// [`crate::wire::MessageBuilder`] emits for us:
-  /// `write_name` lowercases, and `push_txt_authority` writes one zero-length
-  /// string for an empty TXT.
-  ///
-  /// LOAD-BEARING COUPLING, and it is not local: the correctness of this
-  /// function depends on `MessageBuilder::write_name` lowercasing on transmit.
-  /// That is otherwise an unrelated builder detail. If transmission stops
-  /// lowercasing, THIS must stop lowercasing in the same change, or our
-  /// comparison bytes and our wire bytes diverge and the tiebreak stops being
-  /// symmetric with every peer.
-  fn our_proposal(our: &crate::records::ServiceRecords) -> std::vec::Vec<std::vec::Vec<u8>> {
-    let mut set: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
-    // SRV — priority(2 BE) + weight(2 BE) + port(2 BE) + wire-form target name.
-    {
-      let mut buf = std::vec::Vec::new();
-      buf.extend_from_slice(&crate::wire::ResourceType::Srv.to_u16().to_be_bytes());
-      buf.extend_from_slice(&our.priority().to_be_bytes());
-      buf.extend_from_slice(&our.weight().to_be_bytes());
-      buf.extend_from_slice(&our.port().to_be_bytes());
-      write_canonical_wire_name(our.host().as_str(), &mut buf);
-      set.push(buf);
-    }
-    // TXT — always, because `write_probe` emits one unconditionally. Omitting an
-    // empty TXT here would compare a list we never proposed; an empty TXT
-    // canonicalizes to the rtype prefix plus one zero-length string, so both
-    // sides agree byte-for-byte.
-    {
-      let mut buf = std::vec::Vec::new();
-      buf.extend_from_slice(&crate::wire::ResourceType::Txt.to_u16().to_be_bytes());
-      respond::write_canonical_txt(our.txt_segments(), &mut buf);
-      set.push(buf);
-    }
-    set.sort();
-    set
-  }
-
-  /// Folds ONE peer proposal into an RFC 6762 §8.2.1 verdict without ever
-  /// holding the proposal.
-  ///
-  /// §8.2.1 sorts both lists and compares them pairwise "until a difference is
-  /// found"; if one runs out first "the list with records remaining is deemed to
-  /// have won", and if both run out together there is no conflict. Against a
-  /// local list of `keep` records that needs only the peer's `keep` SMALLEST
-  /// elements and its TOTAL count — everything past the local list's length can
-  /// only matter as "the peer has more", which the count already says.
-  ///
-  /// So the peer's proposal is streamed, never buffered. There is no per-round
-  /// proposal cap and no per-proposal record cap to exhaust, which is what makes
-  /// "capacity exhaustion read as a lexicographic loss" unrepresentable rather
-  /// than guarded against: a bound on our memory is a fact about us, and it can
-  /// no longer become a claim about the wire.
-  ///
-  /// `keep` is taken from THE LOCAL LIST, never from a constant. It bounds only
-  /// what we retain of the peer's list; the peer's list itself is unbounded,
-  /// because a probe asks type ANY and may carry any number of records at the
-  /// name. That asymmetry is the point: `keep` smallest plus a total `count` is
-  /// everything §8.2.1 needs however long the peer's proposal is, since anything
-  /// sorting past the local list's length can only matter as "the peer has
-  /// more", which `count` already answers.
-  ///
-  /// DUPLICATES ARE NOT REMOVED. §8.2.1 says sort and compare; it does not say
-  /// deduplicate, and the comparison only resolves a name if BOTH hosts compute
-  /// the same function over the same two lists. A peer that repeats a record and
-  /// a responder that silently drops the repeat reach different verdicts about
-  /// the same pair of lists, and "both sides think they won" is the one outcome
-  /// §8.2 exists to prevent. Comparing what the peer actually sent is what keeps
-  /// the two sides symmetric.
-  struct ProposalFold {
-    /// The `keep` smallest peer elements seen so far, ascending.
-    smallest: std::vec::Vec<std::vec::Vec<u8>>,
-    /// Every element seen, including any beyond `keep` and any repeated.
-    count: usize,
-    keep: usize,
-  }
-
-  impl ProposalFold {
-    fn new(keep: usize) -> Self {
-      Self {
-        smallest: std::vec::Vec::new(),
-        count: 0,
-        keep,
-      }
-    }
-
-    /// Offer one canonical element (`rtype` big-endian, then canonical rdata).
-    fn offer(&mut self, elem: std::vec::Vec<u8>) {
-      self.count = self.count.saturating_add(1);
-      let at = self.smallest.partition_point(|e| e <= &elem);
-      // Only the `keep` smallest can matter: anything sorting past them lies
-      // beyond the local list's length, where §8.2.1 asks only whether the peer
-      // has MORE records — which `count` already answers. `at <= len`, so when
-      // the buffer is short of `keep` this branch always takes it.
-      if at < self.keep {
-        self.smallest.insert(at, elem);
-        self.smallest.truncate(self.keep);
-      }
-    }
-
-    /// §8.2.1's verdict: did this peer's proposal beat `our` sorted list?
-    fn peer_wins(&self, our: &[std::vec::Vec<u8>]) -> bool {
-      debug_assert_eq!(
-        self.keep,
-        our.len(),
-        "the fold retains exactly as many elements as the local list it will be \
-         compared against; a mismatch silently truncates the comparison"
-      );
-      for (peer_elem, our_elem) in self.smallest.iter().zip(our.iter()) {
-        match peer_elem.cmp(our_elem) {
-          core::cmp::Ordering::Equal => {}
-          other => return other == core::cmp::Ordering::Greater,
-        }
-      }
-      // Equal on every record both lists have: the longer list wins, and equal
-      // lengths are §8.2.1's "there is, in fact, no conflict".
-      self.count > our.len()
-    }
   }
 
 }
@@ -859,6 +697,14 @@ cfg_heap! {
   /// stale confirm for a datagram the previous generation encoded does not set
   /// it: those records reached peers, which is why goodbye still owns them, but
   /// the generation now probing has claimed nothing.
+  ///
+  /// "Instance records" is [`respond::EmittedRecords::claims_instance_name`],
+  /// which is SRV or TXT and nothing else. The service-type PTR and the RFC 6763
+  /// §7.1 subtype PTRs are owned by shared names, so emitting them claims no
+  /// instance — and a §7.1 known-answer-filtered response can emit exactly those
+  /// alone. Counting them here closed the pre-authoritative window with nothing
+  /// instance-owned on the link at all, and the next winning `ProbeProposal` went
+  /// unadjudicated.
   generation_advertised: bool,
   /// Set when some peer's COMPLETE §8.2 proposal beat ours this round.
   ///
@@ -1510,9 +1356,12 @@ where
         // even though it advances nothing.
         self.goodbye.record_emitted(&emitted);
         // …and this generation has now claimed the name, which is what the
-        // conflict rules key on. See `generation_advertised`.
-        self.generation_advertised |=
-          emitted.ptr() || emitted.srv() || emitted.txt() || emitted.subtypes();
+        // conflict rules key on. Ownership and CLAIM are different questions
+        // over the same report — see `EmittedRecords::claims_instance_name` and
+        // `generation_advertised`. (A full announcement always carries SRV and
+        // TXT, so this is unconditional here in practice; it is written as the
+        // shared predicate so the rule has one definition, not two.)
+        self.generation_advertised |= emitted.claims_instance_name();
         if matches!(advance, PhaseAdvance::Partial) {
           // §8.3 phase does NOT advance — some obligated family has not been told.
           // The re-arm is lossless: `announce_count` and the state are untouched,
@@ -1612,10 +1461,20 @@ where
             }
           }
           self.goodbye.record_emitted(&emitted);
-          // …and this generation has now claimed the name, which is what the
-          // conflict rules key on. See `generation_advertised`.
-          self.generation_advertised |=
-            emitted.ptr() || emitted.srv() || emitted.txt() || emitted.subtypes();
+          // …and this generation has claimed the name only if a record the
+          // INSTANCE owns reached the wire. The two lines above and below are
+          // deliberately different questions over the same report: goodbye
+          // ownership counts every record a peer may now cache from us, INCLUDING
+          // the shared service-type and subtype PTRs, while the §8 conflict rules
+          // key on whether this name was claimed — which a shared PTR does not do.
+          //
+          // A §7.1 known-answer-filtered response CAN emit the shared PTRs alone
+          // (a querier that already holds our SRV and TXT), and it is reachable
+          // in `Announcing(0)` after a failed announcement. Counting that closed
+          // `is_preauthoritative`'s window with no instance-owned record anywhere
+          // on the link, and the next winning `ProbeProposal` was then dropped
+          // unadjudicated — a §8.2 loss silently not taken.
+          self.generation_advertised |= emitted.claims_instance_name();
         }
       }
       AwaitingConfirm::MetaResponse => {
@@ -2139,7 +1998,19 @@ where
   /// `respond::rdata_for_identity` produces for a peer record, so a §9
   /// conflict check can tell identical (consistent) rdata from a real conflict.
   /// SRV → priority+weight+port (BE) + lowercased wire-form host; TXT →
-  /// length-prefixed segments. Other types → empty (never matched as conflicts).
+  /// length-prefixed segments; NSEC → the §6.1 instance type bitmap.
+  ///
+  /// The arms are EXACTLY the record types this service emits under its instance
+  /// name, because that is what "identical to ours" can be true of. NSEC joined
+  /// them when conflict routing widened past SRV/TXT: `write_announce` and
+  /// `write_response` both ride an instance NSEC in the Additional section, so a
+  /// byte-identical twin sends one too, and without this arm that twin's NSEC —
+  /// alone, with matching SRV and TXT correctly screened out — read as a
+  /// conflicting response and renamed us.
+  ///
+  /// Any other type → empty, which never matches a peer record: a peer record
+  /// canonicalizes to at least one byte for every type, and we assert nothing
+  /// else at this name.
   fn our_canonical_record_for(&self, rtype: crate::wire::ResourceType) -> std::vec::Vec<u8> {
     let mut out = std::vec::Vec::new();
     match rtype {
@@ -2147,13 +2018,14 @@ where
         out.extend_from_slice(&self.records.priority().to_be_bytes());
         out.extend_from_slice(&self.records.weight().to_be_bytes());
         out.extend_from_slice(&self.records.port().to_be_bytes());
-        write_canonical_wire_name(self.records.host().as_str(), &mut out);
+        proposal::write_canonical_wire_name(self.records.host().as_str(), &mut out);
       }
       crate::wire::ResourceType::Txt => {
         // empty TXT → single zero-length string (one 0x00), matching
         // both our wire form and a peer's compliant empty TXT canonicalization.
         respond::write_canonical_txt(self.records.txt_segments(), &mut out);
       }
+      crate::wire::ResourceType::Nsec => out = respond::our_nsec_identity(),
       _ => {}
     }
     out
@@ -2178,11 +2050,21 @@ where
     self.meta_known_answered = false;
   }
 
-  /// clear all per-advertised-name generation state on a conflict-
-  /// driven RENAME. The NEW instance name has not been announced, so the
-  /// instance goodbye must not fire for it (host ownership persists — the host
-  /// name is unchanged); the response-cycle state tied to the OLD
-  /// name must not carry over either.
+  /// clear the state that is about a NAME, on a conflict-driven RENAME. The NEW
+  /// instance name has not been announced, so the instance goodbye must not fire
+  /// for it (host ownership persists — the host name is unchanged).
+  ///
+  /// ONLY the per-NAME facts. Everything about the probing GENERATION —
+  /// `probe_on_wire`, both §8 latches, `generation_advertised`, `partial_rounds`,
+  /// the response cycle — belongs to [`Service::restart_probe_cycle`], which
+  /// every regress path runs including this one, and which a rename calls just
+  /// before this. They used to be set in both places; that is harmless while the
+  /// two agree and is exactly the drift that made a regress path's post-state
+  /// hard to reason about, so each fact now has one owner. The test for whether
+  /// something belongs here: would a SAME-name regress (§9's revert, §8.2's
+  /// deferral) want it? If yes it is the generation's, not the name's —
+  /// `fully_announced` is the canonical example of one that is genuinely the
+  /// name's.
   fn reset_advertised_name_state(&mut self) {
     self.goodbye.reset_instance();
     // The NEW name has announced nothing, so it cannot yet supersede the old
@@ -2190,22 +2072,9 @@ where
     self.fully_announced = false;
     // A fresh name restarts the §8.3 announcement sequence at the bottom rung.
     self.partial_announce_streak = 0;
-    // …and restarts the §8.1 sequence, so the patience already spent waiting for
-    // a lagging family under the OLD name may not excuse a probe of the new one.
-    self.partial_rounds = [FamilyPatience::default(); 2];
     // The NEW name has been announced to nobody, so no family is owed a refresh
     // of it. Each is re-anchored by its first announcement round under this name.
     self.last_delivered = [None, None];
-    // …and nothing of ours has ever claimed it on the link, so RFC 6762 §8.1's
-    // "before the first probe packet is sent" window shuts again for it.
-    self.probe_on_wire = false;
-    // Any §8.1 deferral the OLD name owed died with it: that response conflicted
-    // with a name this service no longer proposes.
-    self.probe_defeated = false;
-    self.tiebreak_lost = false;
-    // A NEW name has advertised nothing, whatever the old one had.
-    self.generation_advertised = false;
-    self.clear_response_cycle_state();
   }
 
   /// whether `record` (an A/AAAA owned by our host name) carries an
@@ -2256,14 +2125,16 @@ where
   ///
   /// A malformed or unparseable record is NOT ours: it falls through to the
   /// matrix, whose arms drop it.
+  ///
+  /// No rtype pre-screen. Which types can be "ours" is
+  /// [`Service::our_canonical_record_for`]'s question, and it answers it by
+  /// enumerating what this service actually emits at its instance name; a type
+  /// it does not emit yields empty bytes, which no peer record equals. A screen
+  /// here would be a second, independently-maintained copy of that list — and
+  /// when conflict routing widened past SRV/TXT it was the copy that went stale,
+  /// so a twin's identical instance NSEC read as a conflicting response.
   fn response_rdata_is_ours(&self, pc: &crate::event::ProbeConflict<'_>) -> bool {
     let rtype = pc.record().rtype();
-    if !matches!(
-      rtype,
-      crate::wire::ResourceType::Srv | crate::wire::ResourceType::Txt
-    ) {
-      return false;
-    }
     let Ok(view) = pc.record().rdata_view() else {
       return false;
     };
@@ -2271,7 +2142,160 @@ where
     let Ok(peer_canonical) = respond::rdata_for_identity(&view, &mut scratch) else {
       return false;
     };
-    peer_canonical == self.our_canonical_record_for(rtype).as_slice()
+    let ours = self.our_canonical_record_for(rtype);
+    // EMPTY means "we assert no record of this type at this name", which is not
+    // the same as "we assert a zero-length one" — and a peer CAN send zero-length
+    // rdata for an unknown type, whose identity bytes are also empty. Without
+    // this, that record would compare equal to nothing at all and be waved
+    // through as ours.
+    if ours.is_empty() {
+      return false;
+    }
+    peer_canonical == ours.as_slice()
+  }
+
+  /// THE one way this service re-enters RFC 6762 §8's startup steps.
+  ///
+  /// Three rules send it back there: §9's revert-to-probe, §8.2's one-second
+  /// deferral, and §8.1's rename. Each REPLACES the current generation, and
+  /// "replaced" is a conjunction of a dozen facts rather than a state name — so
+  /// while each site spelled the conjunction out for itself, each site could
+  /// omit a different conjunct, and they did. The §8.2 deferral alone was found
+  /// incomplete three separate times: once for not clearing the response cycle,
+  /// once for not staling the live commit token, once for a queued probe that
+  /// outran it.
+  ///
+  /// An assertion over the conjuncts was the first fix and is kept — as this
+  /// function's single exit check — but it is not the fix. It catches a missing
+  /// conjunct in a test that happens to drive the path; this makes a conjunct
+  /// impossible to miss, because a caller has none to spell. A FOURTH regress
+  /// path added later gets the whole set by construction.
+  ///
+  /// What every caller passes, and nothing else:
+  ///
+  /// * `deadline` — when the fresh §8.1 sequence may begin. §9 and a rename use
+  ///   the randomized `probe_deadline`; §8.2's loser uses `now +
+  ///   TIEBREAK_DEFER_WAIT`, which is the one second it "defers to the winning
+  ///   host by waiting".
+  /// * `renamed_from` — `Some(old records)` ONLY when the name is changing, so a
+  ///   parked datagram's confirm latches ownership under the name it actually
+  ///   advertised. `None` for the two SAME-name regressions, where ownership
+  ///   latches exactly as it would have without the regression.
+  ///
+  /// Callers keep only what is genuinely their own: §9 also stamps
+  /// `last_conflict_reprobe` (its own rate limit), and a rename also calls
+  /// `set_instance` and `reset_advertised_name_state` (per-advertised-NAME state,
+  /// which a same-name regression must NOT reset — see `fully_announced`).
+  fn restart_probe_cycle(&mut self, deadline: Option<I>, renamed_from: Option<ServiceRecords>) {
+    // A parked datagram belongs to the generation this regress replaces, so its
+    // confirm must not advance the fresh §8.1 sequence: `Init → Probing(0)` costs
+    // no datagram, so an old probe confirming into it would claim the name after
+    // TWO probes on the wire where §8.1 requires three. Taken FIRST, while
+    // `self.records` still names the generation being replaced — by confirm time
+    // nothing else says which name its records went out under.
+    self.stale_live_commit_token(renamed_from);
+    self.state = ServiceState::Init;
+    self.probe_count = 0;
+    self.announce_count = 0;
+    // §8.1's window is SHUT again. Its rule is scoped to "the first probe packet"
+    // of the sequence it introduces, not to the first one this name ever sent, so
+    // a conflicting response arriving before the restarted sequence reaches the
+    // wire is one §8.1 requires be ignored.
+    self.probe_on_wire = false;
+    // Both classifications are spent by definition: this regress IS their
+    // resolution, and leaving one live would re-fire it against the fresh
+    // sequence — and keep `poll_transmit` withholding forever.
+    //
+    // Today's two callers have already spent them before arriving here
+    // (`handle_timeout` takes them to decide WHICH regress this is; §9's arm is
+    // only reachable when neither is set), so this pair is the one conjunct no
+    // mutation probe can currently observe. It stays anyway, and that is the
+    // whole argument for a single regress operation: a caller added later
+    // inherits the complete post-state without having to know it must spend a
+    // latch first. `assert_generation_replaced` is what holds the line.
+    self.probe_defeated = false;
+    self.tiebreak_lost = false;
+    // This generation has advertised nothing, however loudly the one it replaces
+    // did. `goodbye` deliberately still owns what reached peer caches; these are
+    // different questions (see `generation_advertised`).
+    self.generation_advertised = false;
+    self.pending_transmits = [None, None];
+    self.response_deadline = None;
+    // A fresh §8.1 sequence: patience already spent waiting for a lagging link
+    // must not excuse a probe of the sequence that replaces it.
+    self.partial_rounds = [FamilyPatience::default(); 2];
+    // …and we must not ANSWER for a name that is back under verification.
+    // `pending_legacy` is drained by `poll_transmit` ahead of every state check,
+    // so a §6.7 reply queued while announcing would otherwise put the full
+    // positive-TTL record set on the wire during the regress.
+    self.clear_response_cycle_state();
+    self.lifecycle_deadline = deadline;
+    #[cfg(debug_assertions)]
+    self.assert_generation_replaced();
+  }
+
+  /// The post-state [`Service::restart_probe_cycle`] owes, checked as a SET on
+  /// the way out of it.
+  ///
+  /// Kept after the callers were unified, because it is what makes the
+  /// unification self-checking: the conjuncts are established in one place, and
+  /// this asserts that place established all of them. It is the guard against
+  /// the NEXT edit to that function, not against its callers — they can no
+  /// longer omit anything.
+  ///
+  /// 1. the lifecycle is back at the start — `Init`, no probes or announcements
+  ///    counted;
+  /// 2. §8.1's window is SHUT;
+  /// 3. no classification is left live — both latches spent, or this transition
+  ///    would immediately re-fire and `poll_transmit` would withhold forever;
+  /// 4. the transmit queue is empty, so nothing the replaced generation
+  ///    scheduled can still be drained;
+  /// 5. no response is scheduled for a name that is back under verification;
+  /// 6. this generation has advertised nothing;
+  /// 7. any datagram still awaiting a confirm has been STALED, so its confirm
+  ///    lands as a wire fact and never as a lifecycle advance of the fresh
+  ///    sequence — except a `MetaResponse`, which never had a lifecycle meaning
+  ///    to void: the RFC 6763 §9 meta-PTR is shared, claims nothing about this
+  ///    instance, and its confirm only counts `responses_tx`;
+  /// 8. the service is still on a clock — a regress that armed no deadline would
+  ///    strand it.
+  ///
+  /// Debug-only: these are internal consistency facts and a release build pays
+  /// nothing for them. `cargo test` builds with debug assertions on, so every
+  /// test that drives any regress path checks the whole set.
+  #[cfg(debug_assertions)]
+  fn assert_generation_replaced(&self) {
+    debug_assert_eq!(self.state, ServiceState::Init, "regress: state");
+    debug_assert_eq!(self.probe_count, 0, "regress: probe_count");
+    debug_assert_eq!(self.announce_count, 0, "regress: announce_count");
+    debug_assert!(!self.probe_on_wire, "regress: probe_on_wire");
+    debug_assert!(
+      !self.conflict_classified_unresolved(),
+      "regress: a classification is still live"
+    );
+    debug_assert!(
+      self.pending_transmits.iter().all(Option::is_none),
+      "regress: queued transmit"
+    );
+    debug_assert!(
+      self.response_deadline.is_none(),
+      "regress: scheduled response"
+    );
+    debug_assert!(
+      !self.generation_advertised,
+      "regress: the replaced generation's claim is still latched"
+    );
+    debug_assert!(
+      self.awaiting_confirm.as_ref().is_none_or(|c| matches!(
+        c,
+        AwaitingConfirm::Stale { .. } | AwaitingConfirm::MetaResponse
+      )),
+      "regress: a live commit token still carries lifecycle meaning"
+    );
+    debug_assert!(
+      self.lifecycle_deadline.is_some(),
+      "regress: no lifecycle deadline"
+    );
   }
 
   /// Whether a conflict has been CLASSIFIED pre-authoritative and not yet
@@ -2288,11 +2312,13 @@ where
   /// response is silently never spent. So the latches themselves ARE the
   /// classification, and they are spent on their own terms.
   ///
-  /// While one is live, [`Service::poll_transmit`] emits no positive-TTL claim
-  /// to this name (announcement, question response, or legacy reply). Claiming
+  /// While one is live, [`Service::poll_transmit`] emits NOTHING from the queue
+  /// — announcement, question response, legacy reply, and probe alike. Claiming
   /// a name whose ownership is under adjudication is what turns an unresolved
-  /// conflict into two owners; probes and the shared meta-PTR are unaffected,
-  /// since neither asserts this instance.
+  /// conflict into two owners, and a §8.2 loser owes a full second of silence
+  /// before it may probe again, so the queue pauses whole rather than by kind.
+  /// The shared §9 meta-PTR is unaffected: it asserts nothing about this
+  /// instance.
   fn conflict_classified_unresolved(&self) -> bool {
     self.probe_defeated || self.tiebreak_lost
   }
@@ -2490,85 +2516,41 @@ where
 
   /// Fold one peer's COMPLETE RFC 6762 §8.2 proposal into this round's verdict.
   ///
-  /// The proposal arrives whole — see [`ProbeProposal`](crate::event::ProbeProposal)
-  /// — so it is compared the moment it arrives and never retained. That is what
-  /// makes two failures unrepresentable rather than checked for: a partial list
-  /// cannot be adjudicated because no partial list exists, and a capacity bound
-  /// cannot become a lexicographic verdict because there is no buffer to bound.
+  /// The comparison itself lives in [`proposal`] — the module that owns BOTH
+  /// sides' serializers, because §8.2 only resolves a name if the two hosts
+  /// compute the same function over the same two lists, which makes them a
+  /// matched pair. This method's whole job is to turn its [`Verdict`] into
+  /// lifecycle state and a trace: it does not, and cannot, serialize a record
+  /// itself. That is the point of the split — reaching for the wrong
+  /// canonicalizer is what silently broke the tiebreak twice, and outside
+  /// `proposal` the right one is no longer nameable.
+  ///
+  /// An abandonment is a NON-VERDICT, not a win for either side: the peer's
+  /// Authority Section was not a list §8.2.1 could sort, so this round records
+  /// nothing and the §8.1 sequence continues untouched.
   fn handle_probe_proposal(&mut self, pp: &crate::event::ProbeProposal<'_>) {
-    let ours = our_proposal(&self.records);
-    let mut fold = ProposalFold::new(ours.len());
-    let mut scratch = std::vec::Vec::new();
-    for r in pp.authority() {
-      // An iteration error means the Authority Section stopped being parseable,
-      // so everything after it is unknown. §8.2 requires the section to "contain
-      // *all* the records and proposed rdata being probed for uniqueness", and a
-      // list we could only read part of is not that list — scoring it would be
-      // adjudicating a proposal the peer has not finished making, which is the
-      // same defect as scoring one record at a time. ABANDON the whole proposal
-      // with no verdict.
-      let Ok(r) = r else {
+    match proposal::adjudicate(pp, &self.records) {
+      proposal::Verdict::PeerWins => {
         trace!(
           target: "mdns_proto::service",
           handle = self.handle.raw(),
+          state = ?self.state,
           src = %pp.src(),
-          "service: unparseable authority section — abandoning the whole proposal (§8.2)"
+          "service: peer proposal beats ours (§8.2.1) — losing this round"
         );
-        return;
-      };
-      // Scope: the uniqueness question a probe asks is type ANY, so EVERY
-      // positive-TTL IN record at the probed name is part of the proposal, not
-      // just SRV and TXT. A peer proposing our SRV and TXT byte-for-byte plus one
-      // more record at that name has a record remaining where our list runs out,
-      // and §8.2.1 gives it the win — dropping the extra scored that as a tie and
-      // left the peer believing it had won while we kept probing, which is two
-      // owners.
-      //
-      // A TTL=0 record is a withdrawal, not a claim, so it is not in the
-      // proposal at all.
-      if r.ttl() == 0
-        || r.rclass() != crate::wire::ResourceClass::In
-        || !crate::endpoint::names_match_record(self.records.instance(), &r)
-      {
-        continue;
+        self.tiebreak_lost = true;
       }
-      // In scope but not representable: same abandonment, same reason. Skipping
-      // it would silently shorten the very list being compared, and shortening
-      // only ever flatters us.
-      let Ok(view) = r.rdata_view() else {
+      proposal::Verdict::WeHold => {}
+      proposal::Verdict::Abandoned(_why) => {
         trace!(
           target: "mdns_proto::service",
           handle = self.handle.raw(),
+          state = ?self.state,
           src = %pp.src(),
-          "service: unreadable rdata in a proposal record — abandoning the proposal (§8.2)"
+          why = ?_why,
+          "service: proposal is not a list §8.2.1 can sort — abandoning it with no verdict"
         );
-        return;
-      };
-      let Ok(raw) = respond::rdata_for_tiebreak(&view, &mut scratch) else {
-        trace!(
-          target: "mdns_proto::service",
-          handle = self.handle.raw(),
-          src = %pp.src(),
-          "service: undecompressable name in a proposal record — abandoning the proposal (§8.2)"
-        );
-        return;
-      };
-      // §8.2's ordering key: class, then type, then rdata. Class is invariant
-      // (only IN reaches here), so type then the peer's own bytes.
-      let mut elem = std::vec::Vec::new();
-      elem.extend_from_slice(&r.rtype().to_u16().to_be_bytes());
-      elem.extend_from_slice(raw);
-      fold.offer(elem);
-    }
-    if fold.peer_wins(&ours) {
-      trace!(
-        target: "mdns_proto::service",
-        handle = self.handle.raw(),
-        state = ?self.state,
-        src = %pp.src(),
-        "service: peer proposal beats ours (§8.2.1) — losing this round"
-      );
-      self.tiebreak_lost = true;
+      }
     }
   }
 
@@ -2683,10 +2665,15 @@ where
         // message" is satisfied by the type rather than by a check. The right
         // answer to a probe for a name we own is still to defend it, which the
         // `Question` arm does from the same datagram.
-        if !matches!(
-          pc.record().rtype(),
-          crate::wire::ResourceType::Srv | crate::wire::ResourceType::Txt
-        ) {
+        //
+        // The rtype screen is §9's OWN, and it is applied HERE rather than in
+        // the router because the router cannot see lifecycle state. §8.1 needs
+        // every type at this name delivered (a peer's existing A/AAAA/NSEC is a
+        // conflicting response for a name we are probing), so the router routes
+        // every type and the narrow rule lives where it is true: on the
+        // established side, where "a unique record for which it is currently
+        // authoritative" means SRV and TXT.
+        if !crate::endpoint::is_instance_conflict_rtype(pc.record().rtype()) {
           return;
         }
         // A record whose rdata will not parse or canonicalize is not one this
@@ -2728,54 +2715,29 @@ where
           s.conflicts(1);
         }
         self.last_conflict_reprobe = Some(now);
-        self.state = ServiceState::Init;
-        self.probe_count = 0;
         // §9 sends this service through a FRESH §8 startup sequence — "MUST
         // immediately reset its conflicted unique record to probing state, and
-        // go through the startup steps described above in Section 8" — so §8.1's
-        // window closes with it and re-opens on the first probe of the new
-        // sequence. There is no per-name exception: §8.1 scopes its rule to the
-        // first probe packet of the sequence it introduces, not to the first one
-        // this name ever sent.
+        // go through the startup steps described above in Section 8" — which is
+        // exactly what `restart_probe_cycle` is. The NAME is unchanged (§9
+        // re-verifies what we still own), so `renamed_from` is `None` and a
+        // parked datagram's records still latch into `goodbye` under this name.
         //
-        // It is also what stops one datagram being scored as two. A driver
-        // dispatches a response's records one at a time, so a response carrying
-        // a differing TXT and then a differing SRV reverts on the TXT and hands
-        // the SRV straight to the arm above — which would buffer a peer "list"
-        // holding only the SRV and let the next timeout decide the tiebreak
-        // against a fragment of what the peer actually sent, before any probe of
-        // the restarted sequence. Now the SRV is a response arriving before that
-        // first probe, and §8.1 says to ignore it.
-        self.probe_on_wire = false;
-        // A §9 revert re-verifies a name this service still owns, so it starts
-        // owing no §8.1 deferral; only a conflicting response inside the
-        // RESTARTED probing window can impose one.
-        self.probe_defeated = false;
-        self.tiebreak_lost = false;
-        // §9 restarts the §8 startup steps, so this generation has advertised
-        // nothing — even though `goodbye` still owns what the previous one put
-        // in peer caches under this same name.
-        self.generation_advertised = false;
-        self.announce_count = 0;
-        self.pending_transmits = [None, None];
-        self.response_deadline = None;
-        // A parked datagram belongs to the generation this revert just replaced,
-        // so its confirm must not advance the fresh §8.1 sequence. The NAME is
-        // unchanged, so whatever it emitted still latches into `goodbye` —
-        // see `stale_live_commit_token`.
-        self.stale_live_commit_token(None);
-        // A fresh §8.1 sequence: the patience already spent waiting for a lagging
-        // link must not excuse a probe of the name we are re-verifying. This is
-        // the SAME name, so unlike a rename the per-advertised-name state stays
-        // put — `fully_announced` in particular. Ferrying it into the re-probe is
-        // sound: the only thing it can do is cancel a renamed-away predecessor's
-        // §10.1 goodbye, and any goodbye this name could cancel was already
-        // cancelled when it first fully announced. A NEW same-name detached
-        // goodbye cannot appear meanwhile — the endpoint's name guard rejects a
-        // same-name registration while this service holds the route.
-        self.partial_rounds = [FamilyPatience::default(); 2];
-        self.clear_response_cycle_state();
-        self.lifecycle_deadline = probe_deadline(now, 0, &mut self.rng);
+        // Shutting §8.1's window is part of that regress and it is also what
+        // stops ONE datagram being scored as two: a driver dispatches a
+        // response's records one at a time, so a response carrying a differing
+        // TXT and then a differing SRV reverts on the TXT and hands the SRV
+        // straight to the arm above — which would adjudicate a peer "list"
+        // holding only the SRV, a fragment of what the peer actually sent. With
+        // the window shut, the SRV is a response arriving before the restarted
+        // sequence's first probe, and §8.1 says to ignore it.
+        //
+        // Note what is NOT reset with it: the per-advertised-NAME state, and
+        // `fully_announced` in particular. This is the same name, so unlike a
+        // rename it carries over — the only thing it can do is cancel a
+        // renamed-away predecessor's §10.1 goodbye, and any goodbye this name
+        // could cancel was already cancelled when it first fully announced.
+        let deadline = probe_deadline(now, 0, &mut self.rng);
+        self.restart_probe_cycle(deadline, None);
       }
       (ServiceState::Established | ServiceState::Announcing(_), ServiceEvent::Question(sq)) => {
         let src = sq.src();
@@ -3224,31 +3186,15 @@ where
         if let Some(s) = self.stat() {
           s.conflicts(1);
         }
-        self.state = ServiceState::Init;
-        self.probe_count = 0;
-        // A fresh §8.1 sequence: its window has not opened yet, and the patience
-        // spent under the previous attempt may not excuse this one's probes.
-        self.probe_on_wire = false;
-        self.partial_rounds = [FamilyPatience::default(); 2];
-        self.pending_transmits = [None, None];
-        self.response_deadline = None;
-        // A parked datagram belongs to the sequence this deferral just replaced,
-        // so its confirm must not advance the fresh one — `Init → Probing(0)`
-        // costs no datagram, so an old probe confirming into it would claim the
-        // name after TWO probes on the wire where §8.1 requires three. The NAME
-        // is unchanged (that is the whole point of the deferral), so whatever it
-        // emitted still latches into `goodbye` — same call, same argument, as the
-        // §9 revert.
-        self.stale_live_commit_token(None);
-        // …and we must not ANSWER for the name while it is back under
-        // verification. `pending_legacy` is drained by `poll_transmit` ahead of
-        // every state check, so a §6.7 reply queued while announcing would
-        // otherwise put the full positive-TTL record set on the wire during the
-        // deferral — a claim to a name this host has just been told it may not
-        // have. Same reasoning as the §9 revert, which is where this call is
-        // documented.
-        self.clear_response_cycle_state();
-        self.lifecycle_deadline = now.checked_add_duration(schedule::rfc::TIEBREAK_DEFER_WAIT);
+        // The SAME regress the §9 revert runs, differing only in WHEN the fresh
+        // sequence may begin: §8.2's loser "defers to the winning host by
+        // waiting one second". The NAME is kept — that is the whole point of the
+        // deferral — so `renamed_from` is `None` and a parked datagram's records
+        // still latch into `goodbye` under it.
+        self.restart_probe_cycle(
+          now.checked_add_duration(schedule::rfc::TIEBREAK_DEFER_WAIT),
+          None,
+        );
         return Ok(());
       }
       if defeated_by_owner {
@@ -3303,22 +3249,25 @@ where
         let renamed_from = self.records.clone();
         match crate::Name::try_from_str(&new_name_str) {
           Ok(new_name) => {
-            self.stale_live_commit_token(Some(renamed_from));
+            // The SAME regress as §9 and §8.2 — this is the third caller, and
+            // the only one that changes the name. `renamed_from` carries the OLD
+            // records so a parked datagram's confirm latches ownership under the
+            // name it actually advertised; `set_instance` runs INSIDE the regress
+            // window, between the stale-token capture the regress does first and
+            // the per-name reset below.
+            let deadline = probe_deadline(now, 0, &mut self.rng);
+            self.restart_probe_cycle(deadline, Some(renamed_from));
             self.records.set_instance(new_name.clone());
             let _ = self.pending_updates.insert(ServiceUpdate::Renamed(
               crate::event::ServiceRenamed::new(new_name),
             ));
-            self.state = ServiceState::Init;
-            self.probe_count = 0;
-            self.announce_count = 0;
-            self.pending_transmits = [None, None];
-            self.response_deadline = None;
-            self.lifecycle_deadline = probe_deadline(now, 0, &mut self.rng);
-            // the new name has NOT been announced yet, and the
-            // old name's per-advertised-name state must not leak into it —
-            // otherwise a later unregister/local-collision could goodbye a
-            // never-announced name, and queued legacy replies / KAS hints
-            // would advertise/suppress under the wrong (un-probed) name.
+            // The NEW name has announced nothing, and the old name's
+            // per-advertised-NAME state must not leak into it — otherwise a later
+            // unregister/local-collision could goodbye a never-announced name,
+            // and queued legacy replies / KAS hints would advertise/suppress
+            // under the wrong (un-probed) name. This is what a rename does and
+            // the two SAME-name regressions must NOT: `fully_announced` is about
+            // a NAME, and their name did not change.
             self.reset_advertised_name_state();
           }
           Err(_) => {
@@ -3684,24 +3633,42 @@ where
       Some(k) => k,
       None => return Ok(None),
     };
-    // A classified, unresolved conflict withholds every positive-TTL claim to
-    // this name. The queue is left intact — this is a pause, not a drop — and
-    // `poll_timeout` reports the service due immediately so the next
-    // `handle_timeout` spends the classification and either renames or releases
-    // it. A probe is a QUESTION and asserts nothing, so §8.1's own sequence
-    // continues underneath.
-    if self.conflict_classified_unresolved()
-      && matches!(
-        kind,
-        PendingTransmitKind::Announcement | PendingTransmitKind::Response
-      )
-    {
+    // A classified, unresolved conflict withholds EVERY queued datagram of the
+    // generation under adjudication — probe included. The queue is left intact —
+    // this is a pause, not a drop — and `poll_timeout` reports the service due
+    // immediately so the next `handle_timeout` spends the classification and
+    // either renames or defers.
+    //
+    // # Why the probe is no longer excepted
+    //
+    // "A probe is a question and asserts nothing" is true, and it is not the
+    // rule. §8.2 does not tell the loser to stop ASSERTING; it tells it to STOP:
+    // "it defers to the winning host by waiting one second, and then begins
+    // probing for this record again". A probe queued by `handle_timeout` before
+    // the winning proposal arrived is a probe of the generation that just lost,
+    // and this method is the only thing standing between it and the wire —
+    // `handle_timeout` clears `pending_transmits`, but a permitted call order
+    // (queue `Probe`, `handle_event` a winning `ProbeProposal`, `poll_transmit`)
+    // reaches the wire first. The loser then keeps probing through the very
+    // second it owes, and against a real winner that is a race it may win.
+    //
+    // Stated as one rule over the whole queue rather than a list of kinds,
+    // because the list is what went stale: withholding `Announcement` and
+    // `Response` was correct for §8.1's pending rename and simply had no entry
+    // for the deferral §8.2 gained. Enumerating what may pass invites the same
+    // omission; nothing of a superseded generation may pass.
+    //
+    // The two things this does NOT gate are unaffected by construction: a §6.7
+    // legacy reply is withheld by its own filter above (it is drained before the
+    // queue is even peeked), and the §9 meta-PTR is a SHARED record that asserts
+    // nothing about this instance.
+    if self.conflict_classified_unresolved() {
       trace!(
         target: "mdns_proto::service",
         handle = self.handle.raw(),
         state = ?self.state,
         kind = ?kind,
-        "service: withholding a claim to a name under §8 adjudication"
+        "service: withholding a datagram of a generation under §8 adjudication"
       );
       return Ok(None);
     }

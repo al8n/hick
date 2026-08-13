@@ -21,15 +21,20 @@ use crate::{
 ///
 /// # The other one
 ///
-/// [`rdata_for_tiebreak`] has the same signature and answers a different
-/// question — which of two proposals sorts later (RFC 6762 §8.2), over the bytes
-/// a side actually put on the wire. It decompresses and normalises nothing.
+/// `service::proposal::rdata_for_tiebreak` answers a DIFFERENT question — which
+/// of two proposals sorts later (RFC 6762 §8.2), over the bytes a side actually
+/// put on the wire. It decompresses and normalises nothing.
 ///
 /// Picking the wrong one of the pair FAILS SILENTLY on ordinary inputs: the two
 /// agree on every all-lowercase name and every non-empty TXT, which covers most
 /// fixtures and most real records, and they diverge exactly where a tiebreak has
-/// to be right. Choose by the question being asked, never by which one is
-/// already imported.
+/// to be right. Two fixtures had already made that mistake.
+///
+/// Which is why the pair is no longer reachable from one place. The tiebreak
+/// serializer is PRIVATE to `service::proposal`, which exports only a finished
+/// verdict, so a §8.2 caller cannot serialize a record itself and this function
+/// cannot be substituted for one. This one stays here, with its own consumers:
+/// §7.1 known-answer suppression and the §9 identical-rdata screen.
 ///
 /// The result is appended into `scratch`; the returned slice references `scratch`.
 ///
@@ -159,110 +164,6 @@ fn write_canonical_wire_name(
   Ok(())
 }
 
-/// Write `name` into `out` in uncompressed wire form, PRESERVING CASE.
-///
-/// The RFC 6762 §8.2 tiebreak's counterpart to [`write_canonical_wire_name`],
-/// which lowercases. See [`rdata_for_tiebreak`] for why the two must differ.
-fn write_wire_name_preserving_case(
-  name: &crate::wire::NameRef<'_>,
-  out: &mut std::vec::Vec<u8>,
-) -> Result<(), crate::error::ParseError> {
-  for label in name.labels() {
-    let label = label?;
-    if label.is_empty() {
-      break;
-    }
-    let len = label.len().min(63);
-    #[allow(clippy::cast_possible_truncation)]
-    out.push(len as u8);
-    // `.iter().take(len)` rather than `&label[..len]`: the crate denies
-    // `clippy::indexing_slicing`, and this is the same truncation-by-iterator
-    // `write_canonical_wire_name` uses — the two must stay byte-for-byte
-    // parallel apart from the case fold.
-    out.extend(label.iter().take(len));
-  }
-  out.push(0); // root terminator
-  Ok(())
-}
-
-/// A PEER record's rdata as RFC 6762 §8.2 compares it: the bytes that peer put
-/// on the wire, with embedded names decompressed and nothing else changed.
-///
-/// # Why this is not [`rdata_for_identity`]
-///
-/// §8.2 compares "raw comparison of the binary content of the rdata without
-/// regard for meaning or structure", and the ONLY transformation it mandates is
-/// decompression: "In the case of resource records containing rdata that is
-/// subject to name compression, the names MUST be uncompressed before
-/// comparison."
-///
-/// The identity canonicalizer answers a different question — "are these two
-/// records the same record" — and so lowercases SRV targets and rewrites an
-/// empty TXT to a single zero-length string. Both are right for identity and
-/// wrong for the tiebreak, because the tiebreak only resolves a name if BOTH
-/// hosts compute the same function over the same two lists. Normalising the
-/// peer's bytes while a byte-comparing peer does not normalise ours makes the
-/// two sides disagree:
-///
-/// | our target `m.local`, peer's `Z.local` | compares | verdict |
-/// |---|---|---|
-/// | peer, raw | `Z`(0x5A) vs `m`(0x6D), theirs earlier | peer loses |
-/// | us, normalising | `m`(0x6D) vs `z`(0x7A), ours earlier | we lose |
-///
-/// Both abdicate; the mirror case gives two owners.
-///
-/// The two have the SAME SIGNATURE and agree on every all-lowercase name and
-/// every non-empty TXT, so calling the wrong one compiles, passes, and stays
-/// wrong until a mixed-case target or an empty TXT turns up. Two fixtures had
-/// already done exactly that.
-///
-/// # The rule is per SIDE, not "raw everywhere"
-///
-/// EACH SIDE COMPARES THE BYTES THAT SIDE PUT ON THE WIRE. This function is the
-/// peer's side. OUR side keeps lowercasing — see `Service::our_proposal` — and
-/// that is not an inconsistency: [`crate::wire::MessageBuilder`]'s `write_name`
-/// lowercases on transmit, so lowercased bytes ARE what we send, and a peer
-/// comparing against us compares those. Making our side "raw" too would make our
-/// comparison bytes differ from our own wire bytes and open a second asymmetry
-/// while looking like a fix.
-///
-/// LOAD-BEARING COUPLING: this correctness argument depends on
-/// `MessageBuilder::write_name` lowercasing. If transmission ever stops
-/// lowercasing, `Service::our_proposal` must stop lowercasing with it, or the
-/// two sides diverge again.
-pub(crate) fn rdata_for_tiebreak<'s>(
-  view: &Rdata<'_>,
-  scratch: &'s mut std::vec::Vec<u8>,
-) -> Result<&'s [u8], crate::error::ParseError> {
-  scratch.clear();
-  match view {
-    Rdata::A(a) => scratch.extend_from_slice(&a.addr().octets()),
-    Rdata::AAAA(a) => scratch.extend_from_slice(&a.addr().octets()),
-    // Names subject to compression: decompressed, case untouched.
-    Rdata::Ptr(p) => write_wire_name_preserving_case(p.target(), scratch)?,
-    Rdata::Cname(c) => write_wire_name_preserving_case(c.target(), scratch)?,
-    Rdata::Srv(s) => {
-      scratch.extend_from_slice(&s.priority().to_be_bytes());
-      scratch.extend_from_slice(&s.weight().to_be_bytes());
-      scratch.extend_from_slice(&s.port().to_be_bytes());
-      write_wire_name_preserving_case(s.target(), scratch)?;
-    }
-    Rdata::Txt(t) => {
-      // Exactly as sent. No empty-TXT rewriting: a peer that sent zero-length
-      // rdata proposed zero-length rdata, and that is what it will compare.
-      for seg in t.segments() {
-        let seg = seg?;
-        #[allow(clippy::cast_possible_truncation)]
-        scratch.push(seg.len() as u8);
-        scratch.extend_from_slice(seg);
-      }
-    }
-    Rdata::Nsec(n) => scratch.extend_from_slice(n.type_bitmap_slice()),
-    Rdata::Other(bytes) => scratch.extend_from_slice(bytes),
-  }
-  Ok(scratch.as_slice())
-}
-
 /// Write the labels of `name` into `out` as lowercased bytes joined by `'.'`.
 /// No length prefixes and no trailing dot are emitted.
 /// Propagates any [`crate::error::ParseError`] from the label iterator
@@ -362,13 +263,64 @@ fn push_service_nsec<const COMP_N: usize>(
     .push_nsec_additional(
       records.instance(),
       records.ttl_secs(),
-      &[ResourceType::Srv.to_u16(), ResourceType::Txt.to_u16()],
+      &INSTANCE_NSEC_TYPES,
       true,
     )
     .is_err()
   {
     b.restore(checkpoint);
   }
+}
+
+/// The exact RRset an instance NSEC asserts, in ONE place because two sides
+/// read it: [`push_service_nsec`] encodes it onto the wire, and
+/// `Service::our_canonical_record_for` reconstructs the same bytes to recognise
+/// our own NSEC coming back. A peer that publishes a byte-identical instance —
+/// a proxy or a fault-tolerance twin, the case RFC 6762 §9 names — sends this
+/// record too, and "identical rdata is never a conflict" has to cover it or a
+/// twin's NSEC alone renames us.
+pub(crate) const INSTANCE_NSEC_TYPES: [u16; 2] =
+  [ResourceType::Srv.to_u16(), ResourceType::Txt.to_u16()];
+
+/// The RFC 4034 §4.1.2 type-bitmap bytes for `present_types`, appended to `out`.
+///
+/// MIRRORS [`crate::wire::MessageBuilder::push_nsec_additional`], which cannot
+/// be reused: it writes through a fixed-size cursor with no allocator, because
+/// it must work on the bare-metal targets. The duplication is pinned by a test
+/// that builds a real NSEC with the builder, parses it back, and requires the
+/// two encodings to be byte-identical — so a change to either side that is not
+/// made to both fails rather than silently un-recognising our own record.
+fn write_nsec_type_bitmap(present_types: &[u16], out: &mut std::vec::Vec<u8>) {
+  let mut bitmap = [0u8; 32];
+  let mut max_byte: Option<usize> = None;
+  for &t in present_types {
+    if t >= 256 {
+      continue;
+    }
+    let byte_idx = usize::from(t >> 3);
+    #[allow(clippy::cast_possible_truncation)]
+    let mask = 0x80u8 >> (t & 0x07);
+    if let Some(slot) = bitmap.get_mut(byte_idx) {
+      *slot |= mask;
+      max_byte = Some(max_byte.map_or(byte_idx, |m| m.max(byte_idx)));
+    }
+  }
+  let Some(max_byte) = max_byte else {
+    return;
+  };
+  let blen = max_byte.saturating_add(1);
+  out.push(0); // window block number 0
+  #[allow(clippy::cast_possible_truncation)]
+  out.push(blen as u8);
+  out.extend(bitmap.iter().take(blen));
+}
+
+/// The bytes [`rdata_for_identity`] yields for the instance NSEC this service
+/// emits — the identity form, which for NSEC is the type bitmap alone.
+pub(crate) fn our_nsec_identity() -> std::vec::Vec<u8> {
+  let mut out = std::vec::Vec::new();
+  write_nsec_type_bitmap(&INSTANCE_NSEC_TYPES, &mut out);
+  out
 }
 
 /// Write an unsolicited announcement: SRV, TXT, A, AAAA records.
@@ -678,6 +630,28 @@ impl EmittedRecords {
       && self.aaaa.is_empty()
   }
 
+  /// True when this send put a record the INSTANCE NAME uniquely owns on the
+  /// wire — the SRV or the TXT (RFC 6763 §4).
+  ///
+  /// This is what "this generation has claimed the name" means, and it is a
+  /// narrower fact than "something was emitted". The PTRs are the difference:
+  /// the service-type PTR and the RFC 6763 §7.1 subtype PTRs are owned by SHARED
+  /// names that any number of responders answer for, so emitting one asserts
+  /// nothing about who owns this instance. A §7.1 known-answer-filtered response
+  /// can emit exactly those and nothing else — reachable in `Announcing(0)`,
+  /// after a failed announcement, from a querier that already holds our SRV and
+  /// TXT — and counting it closed `Service::is_preauthoritative`'s window with no
+  /// instance-owned record anywhere on the link. A winning `ProbeProposal`
+  /// arriving after that was then silently not adjudicated.
+  ///
+  /// Goodbye ownership is a DIFFERENT question and keeps counting the PTRs: a
+  /// shared PTR we emitted is one a peer now caches from us, and it has to be
+  /// withdrawn whether or not it claimed anything. See
+  /// `Service::generation_advertised`.
+  pub(crate) const fn claims_instance_name(&self) -> bool {
+    self.srv || self.txt
+  }
+
   /// Construct from an explicit record set (used by callers in other modules
   /// that latch goodbye ownership without going through the encoders).
   pub(crate) fn new(
@@ -819,7 +793,7 @@ where
     scratch.extend_from_slice(&records.priority().to_be_bytes());
     scratch.extend_from_slice(&records.weight().to_be_bytes());
     scratch.extend_from_slice(&records.port().to_be_bytes());
-    super::write_canonical_wire_name(records.host().as_str(), &mut scratch);
+    super::proposal::write_canonical_wire_name(records.host().as_str(), &mut scratch);
     if !hint_matches(ResourceType::Srv, &scratch) {
       // SRV — unique record: set cache-flush bit (RFC 6762 §10.2).
       b.push_srv_answer(

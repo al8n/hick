@@ -10,7 +10,7 @@ cfg_heap! {
 }
 use crate::{
   QueryHandle, ServiceHandle,
-  wire::{MessageReader, QuestionRef, Records, Ref},
+  wire::{MessageReader, QuestionRef, Questions, Records, Ref},
 };
 
 /// A question routed to a registered service.
@@ -223,6 +223,23 @@ impl<'a> ProbeProposal<'a> {
   #[inline(always)]
   pub fn authority(&self) -> Records<'a> {
     self.reader.authority()
+  }
+  /// The query's Question Section: a fresh iterator, minted per call like
+  /// [`Self::authority`].
+  ///
+  /// The Authority Section alone does not say what is being proposed. RFC 6762
+  /// §8.2 reads it as "the Authority Section of that query" — the records are
+  /// the proposed rdata for the names *the query asks about*, and §8.1 defines
+  /// the query as one "with the record name in question in the Question
+  /// Section". An Authority Section read without its questions admits records
+  /// that answer nothing: a QDCOUNT=0 packet, or one asking about an unrelated
+  /// name, would drive §8.2 purely on records that happen to mention ours.
+  ///
+  /// So a receiver scopes the proposal to the records that answer a question
+  /// this query actually asked about the name being adjudicated.
+  #[inline(always)]
+  pub fn questions(&self) -> Questions<'a> {
+    self.reader.questions()
   }
 }
 

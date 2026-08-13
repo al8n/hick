@@ -42,7 +42,7 @@ use crate::{
   service::{FullyAnnounced, Service},
   trace::*,
   transmit::{FamilyAttempt, Transmit, TransmitConfirm},
-  wire::{MessageReader, NameRef, ResourceClass, ResourceType},
+  wire::{MessageReader, NameRef, QuestionRef, ResourceClass, ResourceType},
 };
 
 cfg_heap! {
