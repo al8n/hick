@@ -80,7 +80,7 @@ per-platform capability table, and what each residual costs.
 
 The tests are one half of the evidence; the other half is that each of them
 still catches the defect it was written for. `probes/mutations.py` applies
-sixteen mutations — every one a defect this gate actually had, or was argued
+twenty-seven mutations — every one a defect this gate actually had, or was argued
 into having — and requires the ONE named assertion to fail for each:
 
 ```console
@@ -88,10 +88,10 @@ $ ./hick-onlink/probes/mutations.py
 pristine tree: running the whole hick-onlink suite ...
 pristine tree: green
 
-[1/16] link-gate-precedes-the-group-arm ... caught by a_group_destination_does_not_excuse_a_foreign_interface_or_scope
-[2/16] scope-id-is-a-second-link-witness ... caught by a_conflicting_scope_rejects_whatever_the_index_says
+[1/27] link-gate-precedes-the-group-arm ... caught by a_group_destination_does_not_excuse_a_foreign_interface_or_scope
+[2/27] arm-one-needs-the-link-scoping ... caught by an_unscoped_group_destination_does_not_take_arm_ones_exemption
 ...
-16/16 probes caught
+27/27 probes caught
 ```
 
 `--list` prints the table and what each probe is about without building
