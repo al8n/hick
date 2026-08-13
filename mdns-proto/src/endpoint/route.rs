@@ -235,11 +235,25 @@ where
   /// `Endpoint::handle` and `Service::handle_event` over the SAME constructed
   /// datagrams rather than trusting two spellings to agree.
   fn authority_proposes_for(&self, name: &crate::Name) -> bool {
-    self
-      .reader
-      .authority()
-      .flatten()
-      .any(|r| proposal_admits(&r, || self.reader.questions(), name))
+    for r in self.reader.authority() {
+      // Every undecidable answer is YES here, and that is the whole job of this
+      // layer. A record that will not parse, or a question section that will not
+      // read, means this datagram MIGHT be a proposal for `name` — and the fold
+      // is where a proposal that cannot be read is abandoned. Withholding it
+      // would not be caution, it would be deciding the question in the one place
+      // that must not decide it.
+      //
+      // `.flatten()` used to drop an unparseable record silently, and `Records`
+      // STOPS at its first error, so a single malformed record hid every record
+      // after it — including the one the fold needed to see to abandon on.
+      let Ok(r) = r else {
+        return true;
+      };
+      if proposal_admits(&r, || self.reader.questions(), name).unwrap_or(true) {
+        return true;
+      }
+    }
+    false
   }
 
   /// The HOST half of the conflict fan-out, for the QR=0 authority path whose

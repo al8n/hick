@@ -32,6 +32,9 @@ pub use question::QuestionRef;
 
 mod record;
 pub use record::{A, AAAA, Ptr, Rdata, Ref, Srv, Txt};
+cfg_heap! {
+  pub(crate) use record::rdata_is_position_independent;
+}
 
 mod reader;
 pub use reader::{MessageReader, Questions, Records};

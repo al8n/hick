@@ -55,9 +55,13 @@ pub(crate) enum Abandon {
   /// An in-scope record's rdata would not parse.
   UnreadableRdata,
   /// An in-scope record's rdata has no well-defined comparison bytes — an
-  /// undecompressable embedded name, or a compression-eligible type this crate
-  /// does not parse.
+  /// undecompressable embedded name, or rdata of an unparsed type that could
+  /// hold a compression pointer (see
+  /// [`rdata_is_position_independent`](crate::wire::rdata_is_position_independent)).
   UncomparableRdata,
+  /// The Question Section did not read to the end, so what the query ASKS — and
+  /// therefore what its Authority Section proposes — is unknown.
+  UnreadableQuestions,
 }
 
 /// Adjudicate ONE peer's complete §8.2 proposal against our own.
@@ -67,17 +71,43 @@ pub(crate) enum Abandon {
 /// makes two failures unrepresentable rather than checked for: a partial list
 /// cannot be adjudicated because no partial list exists, and a capacity bound
 /// cannot become a lexicographic verdict because there is no buffer to bound.
+///
+/// # The one property
+///
+/// NO PROPOSAL CONTAINING ANYTHING UNDECODABLE PRODUCES A VERDICT — it abandons.
+///
+/// That is a single property rather than a list of guards, and it is the TYPE
+/// that enforces it: every fallible step of [`fold`] is a `?`, so the only way
+/// to reach a `PeerWins` or `WeHold` is for every part of the proposal that had
+/// to be read to have read. There is no arm that can quietly `continue` past an
+/// error, because a `Result` cannot be ignored.
+///
+/// It matters which way that fails. Skipping an unreadable record SHORTENS the
+/// peer's list, and a shorter peer list only ever flatters us: §8.2.1 gives "the
+/// list with records remaining" the win, so dropping the peer's records is
+/// systematically biased toward deciding we won. Every failure therefore
+/// abandons the whole proposal, which decides nothing at all.
 pub(crate) fn adjudicate(
   pp: &crate::event::ProbeProposal<'_>,
   ours_records: &ServiceRecords,
 ) -> Verdict {
+  match fold(pp, ours_records) {
+    Ok(verdict) => verdict,
+    Err(why) => Verdict::Abandoned(why),
+  }
+}
+
+/// The fold proper. Every step that can fail returns through `?`, which is what
+/// makes [`adjudicate`]'s property structural rather than reviewed.
+fn fold(
+  pp: &crate::event::ProbeProposal<'_>,
+  ours_records: &ServiceRecords,
+) -> Result<Verdict, Abandon> {
   let ours = our_proposal(ours_records);
   let mut fold = ProposalFold::new(ours.len());
   let mut scratch = std::vec::Vec::new();
   for r in pp.authority() {
-    let Ok(r) = r else {
-      return Verdict::Abandoned(Abandon::UnparseableAuthority);
-    };
+    let r = r.map_err(|_| Abandon::UnparseableAuthority)?;
     // OWNER NAME FIRST, before any filter that could read a decode failure as an
     // answer. `names_match_record` returns false BOTH for "a different name" and
     // for "a name that would not decode" — and `Ref` parsing accepts a
@@ -89,37 +119,38 @@ pub(crate) fn adjudicate(
     // including on records owned by names that are not ours, because whose name
     // it is, is exactly what could not be read.
     if !crate::endpoint::name_fully_decodes(r.name()) {
-      return Verdict::Abandoned(Abandon::UndecodableOwnerName);
+      return Err(Abandon::UndecodableOwnerName);
     }
     // Scope: EXACTLY the endpoint's admission rule, called rather than restated.
     // See [`crate::endpoint::proposal_admits`] — the two layers held independent
     // copies of this once and one of them went stale, which is how a peer
     // proposing a type we do not publish became invisible to a whole endpoint.
     //
-    // There is no separate arm for an unreadable QUESTION section, and that is a
-    // verified property of the reader rather than an oversight: locating the
-    // authority section requires skipping the questions, so a question section
-    // that will not parse leaves it unlocatable and `pp.authority()` yields
-    // NOTHING — there is no partial list to abandon. Pinned by
-    // `an_unparseable_question_section_surfaces_no_authority_records`, because a
-    // comment asserting it would be exactly the kind of claim that silently
-    // stops being true.
+    // Its `Err` is "I cannot tell whether this is admitted", and here that
+    // abandons. The ROUTER answers the same `Err` with "deliver anyway", which is
+    // what gets the datagram here to be abandoned in the first place; the two
+    // dispositions are the whole reason admission is fallible rather than a
+    // `bool` that folds undecodable into "no".
     //
-    // A question whose NAME is an unresolvable compression pointer is a
-    // different case and is fail-closed here: `try_parse` consumes the pointer
-    // without following it, so the section still parses, and the admission test
-    // then walks the labels, errors, and admits nothing on that question.
-    if !crate::endpoint::proposal_admits(&r, || pp.questions(), ours_records.instance()) {
+    // TWO DIFFERENT MALFORMED-QUESTION CASES, and they fail closed by different
+    // routes. A question section that will not PARSE leaves the authority section
+    // unlocatable — locating it means skipping the questions — so `pp.authority()`
+    // yields nothing and this loop never runs; that is pinned by
+    // `an_unparseable_question_section_surfaces_no_authority_records`. A question
+    // whose QNAME is an unresolvable POINTER does not do that: `try_parse`
+    // consumes the two pointer bytes without following them, so the section
+    // parses and the records ARE surfaced. That case is caught here, by
+    // admission decoding every QNAME in full.
+    if !crate::endpoint::proposal_admits(&r, || pp.questions(), ours_records.instance())
+      .map_err(|_| Abandon::UnreadableQuestions)?
+    {
       continue;
     }
     // In scope but not representable: same abandonment, same reason. Skipping it
     // would silently shorten the very list being compared.
-    let Ok(view) = r.rdata_view() else {
-      return Verdict::Abandoned(Abandon::UnreadableRdata);
-    };
-    let Ok(raw) = rdata_for_tiebreak(r.rtype(), &view, &mut scratch) else {
-      return Verdict::Abandoned(Abandon::UncomparableRdata);
-    };
+    let view = r.rdata_view().map_err(|_| Abandon::UnreadableRdata)?;
+    let raw = rdata_for_tiebreak(r.rtype(), &view, &mut scratch)
+      .map_err(|_| Abandon::UncomparableRdata)?;
     // §8.2's ordering key: class, then type, then rdata. Class is invariant
     // (only IN is admitted above), so type then the peer's own bytes.
     let mut elem = std::vec::Vec::new();
@@ -127,11 +158,11 @@ pub(crate) fn adjudicate(
     elem.extend_from_slice(raw);
     fold.offer(elem);
   }
-  if fold.peer_wins(&ours) {
+  Ok(if fold.peer_wins(&ours) {
     Verdict::PeerWins
   } else {
     Verdict::WeHold
-  }
+  })
 }
 
 /// Our own RFC 6762 §8.2 proposal, sorted: the records this service would claim
@@ -309,11 +340,19 @@ fn rdata_for_tiebreak<'s>(
       scratch.extend_from_slice(n.type_bitmap_slice());
     }
     Rdata::Other(bytes) => {
-      // RFC 3597 §4 forbids compression in truly-unknown types, so their raw
-      // bytes are position-independent and comparable as sent. A WELL-KNOWN
-      // compressible type this crate does not parse is the opposite: it may
-      // arrive compressed, and no comparison over it is well defined.
-      if rtype.is_unhandled_compressible_name() {
+      // §8.2 compares bytes, so the only question is whether these bytes MEAN
+      // the same thing in another packet. They do exactly when they cannot
+      // contain a compression pointer — asked of the bytes themselves, never of
+      // a list of types. See [`rdata_is_position_independent`].
+      //
+      // The list this replaced enumerated the compression-eligible types we do
+      // not parse and omitted five of them (RP, AFSDB, RT, PX, KX). A KX with a
+      // cyclic or truncated compressed target therefore produced comparison
+      // bytes instead of an error: with otherwise identical SRV and TXT the
+      // extra element made the peer's list longer, §8.2.1 handed it the win, and
+      // repeating the packet could defer this host indefinitely. A list that
+      // must track a spec is fail-OPEN on omission; this cannot omit anything.
+      if !crate::wire::rdata_is_position_independent(bytes) {
         return Err(crate::error::ParseError::UnsupportedNameBearingType(
           rtype.to_u16(),
         ));

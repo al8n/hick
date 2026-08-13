@@ -25,6 +25,47 @@ cfg_heap! {
 use super::{NameRef, ResourceClass, ResourceType};
 use crate::error::{BufferTooShortDetail, ParseError, RdlengthOverrunDetail};
 
+cfg_heap! {
+  /// Can `rdata` be compared or stored as the bytes it arrived in?
+  ///
+  /// Only when it provably contains no DNS compression pointer. A pointer is a
+  /// two-octet sequence whose first octet has its top two bits set (RFC 1035
+  /// §4.1.4), so it is always a byte `>= 0xC0`; rdata with no such byte cannot
+  /// contain one, whatever its type's format is, and is therefore
+  /// position-INDEPENDENT — the same record at a different offset in a different
+  /// packet yields the same bytes.
+  ///
+  /// # Why this is not a list of types
+  ///
+  /// It replaces a predicate that enumerated the compression-eligible RR types
+  /// this stack does not parse (NS, MD, MF, SOA, MB, MG, MR, MINFO, MX, DNAME)
+  /// and raw-copied everything else. That enumeration was INCOMPLETE — it omitted
+  /// RP(17), AFSDB(18), RT(21), PX(26) and KX(36), all compression-eligible — and
+  /// a list that must be kept in sync with a spec is fail-OPEN on omission: a
+  /// missing type silently produced position-dependent bytes. For the §8.2
+  /// tiebreak that meant a malformed KX yielded comparison bytes instead of an
+  /// error, lengthening the peer's list and driving a one-second deferral off a
+  /// proposal that should have been abandoned.
+  ///
+  /// Asking the BYTES cannot be incomplete, because there is nothing to keep in
+  /// sync. It is conservative in the safe direction: rdata that happens to hold a
+  /// `>= 0xC0` byte for some non-pointer reason is refused rather than risked. And
+  /// it is strictly more accurate than the list in both directions — an
+  /// UNCOMPRESSED MX or KX now compares and caches correctly, where the list
+  /// refused it outright, and a compressed one is refused whatever its type.
+  ///
+  /// Only for rdata this stack does NOT parse. A type with a parser (PTR, CNAME,
+  /// SRV, NSEC) resolves its own names and never consults this.
+  ///
+  /// Gated to the heap tiers like the predicate it replaces: both callers
+  /// (`Ref::canonical_rdata_inner` and `service::proposal`) are themselves
+  /// `cfg_heap`, so without a matching gate this is dead code in the core-only
+  /// tiers and trips `#[deny(dead_code)]`.
+  pub(crate) fn rdata_is_position_independent(rdata: &[u8]) -> bool {
+    rdata.iter().all(|&b| b < 0xC0)
+  }
+}
+
 /// Parsed resource record (zero-copy view into a message). Stores the full
 /// message reference so type-specific rdata parsers can resolve compression
 /// pointers inside record data.
@@ -262,7 +303,11 @@ impl<'a> Ref<'a> {
       // MAY arrive compressed/case-varied and can't be canonicalized; it's not
       // an mDNS/DNS-SD type, so drop it.
       Rdata::Other(bytes) => {
-        if self.rtype.is_unhandled_compressible_name() {
+        // Asked of the BYTES, not of a list of types — see
+        // [`rdata_is_position_independent`]. Raw bytes are a stable identity only
+        // when they cannot move with the packet, and the list this replaced was
+        // missing five compression-eligible types.
+        if !rdata_is_position_independent(bytes) {
           return Err(ParseError::UnsupportedNameBearingType(self.rtype.to_u16()));
         }
         Ok(rdata_from_vec(bytes.to_vec()))

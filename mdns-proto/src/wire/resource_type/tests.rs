@@ -29,27 +29,35 @@ fn as_str_slug_for_every_variant() {
   assert_eq!(ResourceType::Unknown(999).as_str(), "unknown");
 }
 
-/// RFC 1035 §3.3 compression-eligible name-bearing types this stack does not
-/// type-specifically parse must be flagged so callers drop (not cache) them;
-/// the types we parse or that carry no compressible name must not be.
+/// Whether rdata may be stored or compared as sent is asked of the BYTES, not of
+/// a list of types — see `wire::record::rdata_is_position_independent`.
+///
+/// This replaces a test that pinned an enumeration of compression-eligible RR
+/// types (NS, MD, MF, SOA, MB, MG, MR, MINFO, MX, DNAME). The enumeration was
+/// incomplete — RP(17), AFSDB(18), RT(21), PX(26) and KX(36) are compression
+/// eligible too — and pinning it only froze the omission in place. A list that
+/// must track a spec is fail-OPEN when it falls behind; asking the bytes cannot
+/// fall behind, because there is nothing to keep in sync.
 #[cfg(any(feature = "alloc", feature = "std"))]
 #[test]
-fn unhandled_compressible_name_classification() {
-  for v in [2u16, 3, 4, 6, 7, 8, 9, 14, 15, 39] {
-    assert!(
-      ResourceType::from_u16(v).is_unhandled_compressible_name(),
-      "rtype {v} is a compression-eligible name-bearing type we don't parse"
-    );
+fn rdata_comparability_is_decided_by_the_bytes_not_a_type_list() {
+  use crate::wire::rdata_is_position_independent;
+
+  // A compression pointer is any octet >= 0xC0 (RFC 1035 §4.1.4), so rdata
+  // holding one cannot be trusted to mean the same thing in another packet…
+  assert!(!rdata_is_position_independent(&[0xC0, 0x0C]));
+  assert!(!rdata_is_position_independent(&[0x00, 0x01, 0xC0, 0x0C]));
+  assert!(!rdata_is_position_independent(&[0xFF]));
+  // …including for the five types the old enumeration omitted, which is the
+  // whole point: no type is named here, so none can be missed.
+  for omitted_by_the_old_list in [17u16, 18, 21, 26, 36] {
+    let _ = ResourceType::from_u16(omitted_by_the_old_list);
+    assert!(!rdata_is_position_independent(&[0xC0, 0x0C]));
   }
-  for t in [
-    ResourceType::A,
-    ResourceType::Cname,
-    ResourceType::Ptr,
-    ResourceType::Srv,
-    ResourceType::Txt,
-    ResourceType::Nsec,
-    ResourceType::Any,
-  ] {
-    assert!(!t.is_unhandled_compressible_name());
-  }
+
+  // Rdata with no such octet cannot contain a pointer whatever its type is, so
+  // it is self-contained and comparable/storable verbatim.
+  assert!(rdata_is_position_independent(&[]));
+  assert!(rdata_is_position_independent(&[192 - 1]));
+  assert!(rdata_is_position_independent(b"\x04mail\x05local\x00"));
 }

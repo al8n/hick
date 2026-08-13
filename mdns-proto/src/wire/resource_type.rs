@@ -67,29 +67,6 @@ impl ResourceType {
     }
   }
 
-  cfg_heap! {
-  /// Whether this is a standardized RR type whose RDATA contains a (potentially
-  /// compressed) domain name but which this stack does NOT type-specifically
-  /// parse. Per RFC 1035 §3.3 the compression-eligible
-  /// name-bearing types are NS(2), MD(3), MF(4), CNAME(5), SOA(6), MB(7),
-  /// MG(8), MR(9), PTR(12), MINFO(14), MX(15) — plus DNAME(39). We parse CNAME
-  /// and PTR; the rest map to `Unknown` and a sender that knows them MAY
-  /// compress / case-vary their embedded names, so storing raw bytes would be
-  /// compression/case-sensitive and break cache dedup / TTL=0 removal. They are
-  /// not mDNS/DNS-SD record types, so callers DROP them rather than cache a
-  /// non-canonical entry. (RFC 3597 §4: types defined after RFC 1035 are sent
-  /// uncompressed, so genuinely-unknown opaque RDATA is safe to store verbatim.)
-  ///
-  /// Gated to the heap tiers: the sole caller is `Rdata::canonical_rdata_inner`
-  /// (`wire::record`, gated on `alloc` / `std` / `no-atomic`), so without a
-  /// matching gate this is dead code in the core-only (no-storage) tiers and
-  /// trips `#[deny(dead_code)]`.
-    #[inline(always)]
-    pub(crate) const fn is_unhandled_compressible_name(self) -> bool {
-      matches!(self.to_u16(), 2 | 3 | 4 | 6 | 7 | 8 | 9 | 14 | 15 | 39)
-    }
-  }
-
   /// Reconstructs a `ResourceType` from a wire-format `u16`. Always succeeds —
   /// unknown values land in `Unknown(v)`.
   #[inline(always)]

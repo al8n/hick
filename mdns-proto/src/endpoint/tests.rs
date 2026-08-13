@@ -8732,14 +8732,93 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     )
   };
 
-  for (what, qname, qtype, push_recs) in cases {
+  // …plus the R11 datagrams, which are the ones the interaction turns on: each
+  // must reach the fold PRECISELY so the fold can abandon it. A router that
+  // treated "undecodable" as "not for us" would withhold them, the fold would
+  // never see them, and nothing would abandon.
+  let mut extra: std::vec::Vec<(&str, std::vec::Vec<u8>)> = std::vec::Vec::new();
+  {
+    // A question whose QNAME is an unresolvable pointer, alongside a valid one.
+    let mut buf = [0u8; 512];
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(&instance, ResourceType::Any, ResourceClass::In, true)
+      .unwrap();
+    srv_txt(&mut b, &instance);
+    let n = b.finish().unwrap();
+    let good = buf[..n].to_vec();
+    // Rebuild with a second, pointer-named question spliced in after the first.
+    let qlen = {
+      let mut k = 12usize;
+      for label in "Printer._ipp._tcp.local".split('.') {
+        k += 1 + label.len();
+      }
+      k + 1 + 4 - 12
+    };
+    let mut d: std::vec::Vec<u8> = std::vec::Vec::new();
+    d.extend_from_slice(&good[..12]);
+    d[5] = 2;
+    d.extend_from_slice(&good[12..12 + qlen]);
+    let at = 12 + qlen;
+    #[allow(clippy::cast_possible_truncation)]
+    d.extend_from_slice(&[0xC0 | ((at >> 8) as u8), at as u8]);
+    d.extend_from_slice(&ResourceType::Any.to_u16().to_be_bytes());
+    d.extend_from_slice(&1u16.to_be_bytes());
+    d.extend_from_slice(&good[12 + qlen..]);
+    extra.push(("R11-2: a pointer-named QNAME beside a valid question", d));
+  }
+  {
+    // A KX whose rdata may hold a compression pointer.
+    let mut buf = [0u8; 512];
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(&instance, ResourceType::Any, ResourceClass::In, true)
+      .unwrap();
+    srv_txt(&mut b, &instance);
+    let n = b.finish().unwrap();
+    let mut d = buf[..n].to_vec();
+    for label in "Printer._ipp._tcp.local".split('.') {
+      #[allow(clippy::cast_possible_truncation)]
+      d.push(label.len() as u8);
+      d.extend_from_slice(label.as_bytes());
+    }
+    d.push(0u8);
+    d.extend_from_slice(&36u16.to_be_bytes()); // KX
+    d.extend_from_slice(&1u16.to_be_bytes());
+    d.extend_from_slice(&120u32.to_be_bytes());
+    d.extend_from_slice(&4u16.to_be_bytes());
+    d.extend_from_slice(&[0x00, 0x0A, 0xC0, 0x0C]);
+    d[9] = 3; // NSCOUNT 2 -> 3
+    extra.push(("R11-1: a KX whose rdata may hold a compression pointer", d));
+  }
+  {
+    // An authority section that stops PARSING partway. `Records` halts at its
+    // first error, so every record after it is invisible — including, possibly,
+    // the one at our name. The router must deliver on that, or the fold never
+    // gets the chance to abandon.
+    // The truncated record is the ONLY one: with valid records ahead of it the
+    // router would still find something to admit, and the case would pass
+    // whether or not it over-approximates on the error.
+    let mut buf = [0u8; 512];
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(&instance, ResourceType::Any, ResourceClass::In, true)
+      .unwrap();
+    let n = b.finish().unwrap();
+    let mut d = buf[..n].to_vec();
+    d[9] = 1; // NSCOUNT claims one record …
+    d.extend_from_slice(&[0x05, b'h', b'e', b'l', b'l']); // … which is truncated
+    extra.push(("R11: an authority section that stops parsing at its first record", d));
+  }
+
+  let built = cases.into_iter().map(|(what, qname, qtype, push_recs)| {
     let mut buf = [0u8; 512];
     let q = Name::try_from_str(qname).unwrap();
     let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
     b.push_question(&q, qtype, ResourceClass::In, true).unwrap();
     push_recs(&mut b, &instance);
     let n = b.finish().unwrap();
-    let datagram = buf[..n].to_vec();
+    (what, buf[..n].to_vec())
+  });
+
+  for (what, datagram) in built.chain(extra) {
 
     // LAYER 1 — the endpoint: was a ProbeProposal routed?
     let (mut e, _h) = build_endpoint_with_printer();
@@ -8756,10 +8835,16 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     // and a §8.2 verdict can only come from folded records.
     let reader = crate::wire::MessageReader::try_parse(&datagram).unwrap();
     let recs = records();
-    let admits_any = reader
-      .authority()
-      .flatten()
-      .any(|r| crate::endpoint::proposal_admits(&r, || reader.questions(), recs.instance()));
+    // `Err` is "cannot tell", which the fold treats as ABANDON — and an
+    // abandonment is still the fold acting on the datagram, so it counts here
+    // exactly like an admission. That is what the router must over-approximate.
+    let admits_any = reader.authority().any(|r| {
+      r.as_ref().is_err()
+        || r.as_ref().is_ok_and(|r| {
+          crate::endpoint::proposal_admits(r, || reader.questions(), recs.instance())
+            .unwrap_or(true)
+        })
+    });
 
     assert!(
       !admits_any || routed,

@@ -10124,3 +10124,123 @@ fn an_unparseable_question_section_surfaces_no_authority_records() {
     "a datagram whose question section will not parse yields no §8.2 verdict"
   );
 }
+
+// ── R11: nothing undecodable produces a verdict ────────────────────────
+
+/// R11-1: a KX(36) whose compressed target cannot be resolved must ABANDON the
+/// proposal, not lengthen the peer's list.
+///
+/// The guard was an enumeration of compression-eligible types and it omitted
+/// RP(17), AFSDB(18), RT(21), PX(26) and KX(36). So a KX raw-copied into
+/// comparison bytes: with otherwise identical SRV and TXT the extra element made
+/// the peer's list longer, §8.2.1's "the list with records remaining is deemed to
+/// have won" handed it the round, and a peer repeating that packet could defer
+/// this host past every probe it ever schedules — establishment prevented
+/// indefinitely by a malformed proposal.
+///
+/// The type is no longer consulted: the rdata holds a `0xC0` octet, so it might
+/// be a compression pointer, so it has no position-independent comparison bytes.
+#[test]
+fn a_compressed_kx_abandons_rather_than_lengthening_the_peers_list() {
+  // Every type the old enumeration missed, so a re-narrowing to any list fails
+  // here rather than only for the one type a fixture happened to pick.
+  for rtype in [36u16, 17, 18, 21, 26] {
+    let mut svc = make_service(120);
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap();
+
+    // A TIE on SRV and TXT, so the round turns entirely on the third record.
+    let mut txt = std::vec::Vec::new();
+    make_txt_record_ref(&mut txt, PROBED_NAME, 120, &[&[]]);
+    let mut srv = std::vec::Vec::new();
+    make_srv_record_ref(&mut srv, PROBED_NAME, 120, 0, 0, 631, "host.local.");
+    let mut exotic = std::vec::Vec::new();
+    for label in PROBED_NAME.trim_end_matches('.').split('.') {
+      #[allow(clippy::cast_possible_truncation)]
+      exotic.push(label.len() as u8);
+      exotic.extend_from_slice(label.as_bytes());
+    }
+    exotic.push(0u8);
+    exotic.extend_from_slice(&rtype.to_be_bytes());
+    exotic.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+    exotic.extend_from_slice(&120u32.to_be_bytes());
+    // preference(2) + a compression pointer that cycles onto itself.
+    exotic.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+    exotic.extend_from_slice(&[0x00, 0x0A, 0xC0, 0x0C]);
+    let bytes = raw_proposal_bytes(&[txt, srv, exotic]);
+
+    let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+      t0,
+    );
+    assert!(
+      !svc.tiebreak_lost,
+      "type {rtype}: a record whose rdata may hold a compression pointer has no \
+       comparison bytes, so the proposal is ABANDONED — it must not be scored as \
+       a third record that wins §8.2.1 on list length"
+    );
+  }
+}
+
+/// R11-2: a question whose QNAME is an unresolvable compression pointer makes
+/// the whole proposal undecodable, even when ANOTHER question admits.
+///
+/// This is the case the section-location property does NOT cover, and the two
+/// statements have to be read together. A question section that will not PARSE
+/// leaves the authority section unlocatable, so nothing is folded. But
+/// `QuestionRef::try_parse` consumes a compression pointer WITHOUT following it,
+/// so a pointer-named question parses, the section is locatable, and the records
+/// are surfaced — and `.flatten()` then dropped the error and read the bad
+/// question as a non-match, letting the good one admit and the fold return a
+/// verdict.
+///
+/// The valid question is placed FIRST on purpose: admission now walks the whole
+/// section instead of stopping at the first match, so ordering cannot hide it.
+#[test]
+fn a_pointer_named_question_abandons_even_when_another_question_admits() {
+  let (txt, srv) = winning_pair();
+  let good = raw_proposal_bytes(&[txt, srv]);
+  let qlen = first_record_offset(PROBED_NAME) - 12;
+
+  let mut bytes: std::vec::Vec<u8> = std::vec::Vec::new();
+  bytes.extend_from_slice(&good[..12]);
+  bytes[5] = 2; // QDCOUNT = 2
+  bytes.extend_from_slice(&good[12..12 + qlen]); // question 1: valid, ANY, admits
+  // question 2: QNAME is a pointer to its own offset, so following it cycles.
+  let q2_at = 12 + qlen;
+  #[allow(clippy::cast_possible_truncation)]
+  bytes.extend_from_slice(&[0xC0 | ((q2_at >> 8) as u8), q2_at as u8]);
+  bytes.extend_from_slice(&crate::wire::ResourceType::Any.to_u16().to_be_bytes());
+  bytes.extend_from_slice(&1u16.to_be_bytes());
+  bytes.extend_from_slice(&good[12 + qlen..]); // the winning authority pair
+
+  // Precondition: the section really does PARSE — this is not the unlocatable
+  // case — and the records really are surfaced, so the fold does run.
+  let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+  assert!(
+    reader.questions().all(|q| q.is_ok()),
+    "precondition: a pointer QNAME parses; only walking its labels fails"
+  );
+  assert_eq!(
+    reader.authority().count(),
+    2,
+    "precondition: the authority section is locatable and its records are surfaced"
+  );
+
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a question section holding a name that will not decode leaves what the \
+     query ASKS unknown, so the proposal is abandoned — the readable question \
+     must not adjudicate it alone (control: \
+     `the_winning_pair_control_really_does_lose_the_round`)"
+  );
+}

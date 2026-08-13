@@ -144,19 +144,57 @@ pub(crate) fn question_admits_record(
 /// checks `name_fully_decodes` FIRST and abandons the whole proposal; the router
 /// simply does not deliver. Both reach a non-verdict, which is why the
 /// asymmetry is sound — see the `routing over-approximates admission` test.
+///
+/// # The Err case is the answer "I cannot tell"
+///
+/// It is NOT "no". A question section that will not read leaves admission
+/// undecidable, and the two callers owe that fact opposite dispositions, which
+/// is precisely why it is returned rather than folded into the `bool`:
+///
+/// * the ROUTER treats it as YES (`unwrap_or(true)`), because a proposal that
+///   might concern us must still reach the fold — that is what lets the fold
+///   ABANDON it, and routing must over-approximate admission;
+/// * the FOLD treats it as ABANDON, because a list it could not finish reading
+///   is not a list §8.2.1 can sort.
+///
+/// Returning `false` for both — which is what `.flatten()` did here — reads
+/// "undecodable" as "not for us" at BOTH layers: the router does not deliver,
+/// so the fold never gets to abandon, and a datagram carrying a valid admitting
+/// question alongside a cyclic one is simply adjudicated. `.flatten()` over a
+/// fallible wire iterator is a fail-OPEN default and this branch has now paid
+/// for it twice.
 pub(crate) fn proposal_admits<'a, F>(
   r: &crate::wire::Ref<'a>,
   questions: F,
   name: &Name,
-) -> bool
+) -> Result<bool, QuestionsUnreadable>
 where
   F: Fn() -> crate::wire::Questions<'a>,
 {
-  r.ttl() != 0
-    && r.rclass() == ResourceClass::In
-    && names_match_record(name, r)
-    && questions().flatten().any(|q| question_admits_record(&q, name, r.rtype()))
+  if r.ttl() == 0 || r.rclass() != ResourceClass::In || !names_match_record(name, r) {
+    return Ok(false);
+  }
+  let mut admitted = false;
+  // The WHOLE section, never short-circuited on the first admitting question: a
+  // malformed question sitting AFTER one that admits still makes the proposal
+  // unreadable, and `.any()` would have returned before reaching it.
+  for q in questions() {
+    let q = q.map_err(|_| QuestionsUnreadable)?;
+    if !name_fully_decodes(q.qname()) {
+      return Err(QuestionsUnreadable);
+    }
+    if question_admits_record(&q, name, r.rtype()) {
+      admitted = true;
+    }
+  }
+  Ok(admitted)
 }
+
+/// The datagram's Question Section could not be read to the end, so whether it
+/// admits a record is UNKNOWN — see [`proposal_admits`] for why that is not the
+/// same as "no", and why its two callers answer it differently.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct QuestionsUnreadable;
 
 /// the RR types a host name is authoritative for — the address
 /// records (A / AAAA). Only these constitute a host-name conflict; a record of
