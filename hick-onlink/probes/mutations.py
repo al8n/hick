@@ -84,12 +84,12 @@ PROBES: tuple[Probe, ...] = (
             "wildcard-bound socket 'regardless of source IP address'."
         ),
         file=LIB,
-        find="""  let exemption = match arrived_on_bound_interface(src, link, iface) {
-    Ok(exemption) => exemption,
+        find="""  let provenance = match arrived_on_bound_interface(src, link, iface) {
+    Ok(provenance) => provenance,
     Err(refusal) => return Verdict::Refuse(refusal),
   };""",
-        replace="""  let exemption =
-    arrived_on_bound_interface(src, link, iface).unwrap_or(GroupExemption::Granted);""",
+        replace="""  let provenance =
+    arrived_on_bound_interface(src, link, iface).unwrap_or(LinkProvenance::Established);""",
         caught_by="a_group_destination_does_not_excuse_a_foreign_interface_or_scope",
     ),
     Probe(
@@ -103,12 +103,12 @@ PROBES: tuple[Probe, ...] = (
             "traffic with no proof of provenance at all."
         ),
         file=LIB,
-        find="""    DestinationWitness::Witnessed(dst) if is_mdns_group(dst) => match exemption {
-      GroupExemption::Granted => Verdict::Admit(Admit::MdnsGroup),
-      GroupExemption::Withheld => unscoped_group_arm(src, delivery, link, iface),
+        find="""    DestinationWitness::Witnessed(dst) if is_mdns_group(dst) => match provenance {
+      LinkProvenance::Established | LinkProvenance::Unbound => Verdict::Admit(Admit::MdnsGroup),
+      LinkProvenance::Unproven => unscoped_group_arm(src, delivery, link, iface, provenance),
     },""",
         replace="""    DestinationWitness::Witnessed(dst) if is_mdns_group(dst) => {
-      let _ = exemption;
+      let _ = provenance;
       Verdict::Admit(Admit::MdnsGroup)
     }""",
         caught_by="an_unscoped_group_destination_does_not_take_arm_ones_exemption",
@@ -129,6 +129,7 @@ PROBES: tuple[Probe, ...] = (
       src,
       link,
       iface,
+      provenance,
       Admit::UnscopedMdnsGroup,
       Refuse::UnscopedGroupSourceOffLink,
     ),""",
@@ -144,8 +145,8 @@ PROBES: tuple[Probe, ...] = (
             "ancillary-mbuf shortage produces, which a flood causes."
         ),
         file=LIB,
-        find="    IfaceWitness::Declined | IfaceWitness::Blind => Ok(GroupExemption::Withheld),",
-        replace="    IfaceWitness::Declined | IfaceWitness::Blind => Ok(GroupExemption::Granted),",
+        find="    IfaceWitness::Declined | IfaceWitness::Blind => Ok(LinkProvenance::Unproven),",
+        replace="    IfaceWitness::Declined | IfaceWitness::Blind => Ok(LinkProvenance::Established),",
         caught_by="an_unscoped_group_destination_does_not_take_arm_ones_exemption",
     ),
     Probe(
@@ -172,7 +173,7 @@ PROBES: tuple[Probe, ...] = (
         ),
         file=LIB,
         find="    IfaceWitness::Lost => Err(Refuse::LinkWitnessLost),",
-        replace="    IfaceWitness::Lost => Ok(GroupExemption::Withheld),",
+        replace="    IfaceWitness::Lost => Ok(LinkProvenance::Unproven),",
         caught_by="an_unreported_interface_is_absent_evidence_and_a_reported_zero_is_a_failed_proof",
     ),
     Probe(
@@ -184,9 +185,9 @@ PROBES: tuple[Probe, ...] = (
             "takes the responder off the air exactly when it is under attack."
         ),
         file=LIB,
-        find="    IfaceWitness::Declined | IfaceWitness::Blind => Ok(GroupExemption::Withheld),",
+        find="    IfaceWitness::Declined | IfaceWitness::Blind => Ok(LinkProvenance::Unproven),",
         replace="""    IfaceWitness::Declined => Err(Refuse::LinkWitnessLost),
-    IfaceWitness::Blind => Ok(GroupExemption::Withheld),""",
+    IfaceWitness::Blind => Ok(LinkProvenance::Unproven),""",
         caught_by="a_declined_witness_decides_exactly_as_a_blind_one",
     ),
     Probe(
@@ -199,7 +200,7 @@ PROBES: tuple[Probe, ...] = (
         ),
         file=LIB,
         find="    DestinationWitness::Lost => Verdict::Refuse(Refuse::DestinationWitnessLost),",
-        replace="    DestinationWitness::Lost => source_arm(src, link, iface, Admit::BlindSourceOnLink, Refuse::SourceOffLink),",
+        replace="    DestinationWitness::Lost => source_arm(src, link, iface, provenance, Admit::BlindSourceOnLink, Refuse::SourceOffLink),",
         caught_by="a_lost_witness_refuses_where_a_declined_one_admits",
     ),
     Probe(
@@ -230,7 +231,7 @@ PROBES: tuple[Probe, ...] = (
         ),
         file=LIB,
         find="      Some(LinkDelivery::Broadcast) => Verdict::Refuse(Refuse::BroadcastDelivery),",
-        replace="      Some(LinkDelivery::Broadcast) => source_arm(src, link, iface, Admit::BlindSourceOnLink, Refuse::SourceOffLink),",
+        replace="      Some(LinkDelivery::Broadcast) => source_arm(src, link, iface, provenance, Admit::BlindSourceOnLink, Refuse::SourceOffLink),",
         caught_by="a_broadcast_delivery_is_refused_where_no_destination_was_recovered",
     ),
     Probe(
@@ -242,8 +243,8 @@ PROBES: tuple[Probe, ...] = (
             "residual four review rounds spent subtracting classes from."
         ),
         file=LIB,
-        find="    DestinationWitness::Witnessed(_) if link.local_addrs().is_empty() => source_arm(",
-        replace="    DestinationWitness::Witnessed(_) if !link.local_addrs().is_empty() => source_arm(",
+        find="    DestinationWitness::Witnessed(dst) if link.local_addrs().is_empty() => {",
+        replace="    DestinationWitness::Witnessed(dst) if !link.local_addrs().is_empty() => {",
         caught_by="a_destination_this_interface_does_not_hold_has_no_section_11_arm",
     ),
     Probe(
@@ -332,6 +333,138 @@ PROBES: tuple[Probe, ...] = (
     return true;
   }""",
         caught_by="prefix_beyond_address_width_is_rejected_not_clamped",
+    ),
+    Probe(
+        name="the-link-local-prefix-is-seeded-not-derived",
+        why=(
+            "RFC 5942 §3 makes `fe80::/64` on-link by default and RFC 4861 makes "
+            "it permanent — neither depends on the host holding an address in "
+            "it. Delete the seed and the source arm falls back to whatever the "
+            "interface enumerated, which is RFC 5942 §4 rule 1's forbidden "
+            "inference wearing a right answer: it works only while getifs "
+            "reports the link-local address at a /64, and a DHCPv6 /128, an "
+            "interface without one, or a failed enumeration then silently stops "
+            "matching link-local peers. That costs §11 unicast responses — what "
+            "a QU query asks for — and the FreeBSD/DragonFly square PR #88 "
+            "routes to the source arm."
+        ),
+        file=LIB,
+        find="""  if matches!(provenance, LinkProvenance::Established)
+    && addr_in_subnet(IpAddr::V6(LINK_LOCAL_V6_NET), LINK_LOCAL_V6_PREFIX_LEN, ip)
+  {
+    return true;
+  }""",
+        replace="",
+        caught_by="the_link_local_prefix_is_on_link_with_no_assigned_address",
+    ),
+    Probe(
+        name="the-link-local-seed-is-a-64-and-not-a-10",
+        why=(
+            "RFC 4291 §2.4's table names the link-local unicast TYPE `FE80::/10`, "
+            "and a reader who stops there seeds /10. §2.5.6 gives the ADDRESS its "
+            "format — ten prefix bits, 54 ZERO bits, then a 64-bit interface "
+            "identifier — so a conforming link-local address is exactly a member "
+            "of `fe80::/64`. A /10 seed answers ON-LINK for `fe80:1234::1`, which "
+            "no stack can autoconfigure or assign, on 54 bits of claim the subnet "
+            "model never makes."
+        ),
+        file=LIB,
+        find="const LINK_LOCAL_V6_PREFIX_LEN: u8 = 64;",
+        replace="const LINK_LOCAL_V6_PREFIX_LEN: u8 = 10;",
+        caught_by="the_link_local_seed_is_the_64_bit_prefix_and_not_the_10_bit_block",
+    ),
+    Probe(
+        name="the-seed-needs-the-link-to-have-been-established",
+        why=(
+            "`fe80::/64` is on-link on EVERY interface, so matching it says the "
+            "sender is on some link and nothing about whether it is ours. Drop "
+            "the provenance conjunct and the seed decides on a blind or degraded "
+            "path: a datagram that arrived on another NIC of this same host is "
+            "admitted for being link-local, and PR #88's unscoped-group square — "
+            "which routes to the source arm on FreeBSD/DragonFly precisely "
+            "BECAUSE nothing scoped it — gets arm one's exemption back under "
+            "another name. A prefix never establishes a link."
+        ),
+        file=LIB,
+        find="""  if matches!(provenance, LinkProvenance::Established)
+    && addr_in_subnet(IpAddr::V6(LINK_LOCAL_V6_NET), LINK_LOCAL_V6_PREFIX_LEN, ip)
+  {""",
+        replace="""  if addr_in_subnet(IpAddr::V6(LINK_LOCAL_V6_NET), LINK_LOCAL_V6_PREFIX_LEN, ip) {""",
+        caught_by="the_link_local_seed_needs_the_link_to_have_been_established",
+    ),
+    Probe(
+        name="the-seed-gate-closes-the-unscoped-group-path",
+        why=(
+            "The same defect, caught at the square it matters most on rather "
+            "than at the gate. `unscoped_group_arm` is selected BY "
+            "`LinkProvenance::Unproven` and forwards it, so the seed is "
+            "unreachable there; forge `Established` on the way in and a "
+            "link-local sender is admitted at a group destination nothing "
+            "scoped, which is exactly what #88 spent four rounds closing."
+        ),
+        file=LIB,
+        find="""    Some(LinkDelivery::Unicast) | None => source_arm(
+      src,
+      link,
+      iface,
+      provenance,
+      Admit::UnscopedMdnsGroup,""",
+        replace="""    Some(LinkDelivery::Unicast) | None => source_arm(
+      src,
+      link,
+      iface,
+      LinkProvenance::Established,
+      Admit::UnscopedMdnsGroup,""",
+        caught_by="the_unscoped_group_path_cannot_reach_the_seed",
+    ),
+    Probe(
+        name="a-zero-binding-does-not-prove-a-link",
+        why=(
+            "A bound interface of zero satisfies §11 arm one vacuously — an "
+            "endpoint that named no link can call none foreign — and proves "
+            "NOTHING to the seed, which needs 'this arrived on our link' and has "
+            "no our-link to be about. Collapse the two back into `Established` "
+            "and `BoundLink::new(0, ...)` admits a `fe80::x%7` source with no "
+            "link-local prefix enumerated, which the same inputs on a named "
+            "binding refuse. A prefix on every link plus a binding on none is "
+            "two absences, not a proof."
+        ),
+        file=LIB,
+        find="    return Ok(LinkProvenance::Unbound);",
+        replace="    return Ok(LinkProvenance::Established);",
+        caught_by="a_bound_interface_of_zero_grants_arm_one_and_never_the_seed",
+    ),
+    Probe(
+        name="a-zero-binding-still-grants-arm-one",
+        why=(
+            "The other direction of the same distinction, and it is an "
+            "availability property rather than a safety one. Demote a zero "
+            "binding to `Unproven` and every single-link caller — hick-smoltcp, "
+            "hick-embassy — loses §11 arm one forever in exchange for no scoping "
+            "at all, because there was never a second link for the scoping to "
+            "separate it from."
+        ),
+        file=LIB,
+        find="    return Ok(LinkProvenance::Unbound);",
+        replace="    return Ok(LinkProvenance::Unproven);",
+        caught_by="a_bound_interface_of_zero_grants_arm_one_and_never_the_seed",
+    ),
+    Probe(
+        name="the-empty-snapshot-arm-defers-only-the-residual",
+        why=(
+            "A failed enumeration is ignorance about which addresses this host "
+            "HOLDS, never about what an address IS. Defer every witnessed "
+            "destination and a transient enumeration failure turns `ff02::1` — "
+            "the all-nodes group, which §11 gives no arm and no enumeration was "
+            "ever consulted about — into protocol input on UDP/5353 for any "
+            "source the arm goes on to admit."
+        ),
+        file=LIB,
+        find="""      match classify_unheld(dst, link) {
+        Refuse::DestinationNotHeld => source_arm(""",
+        replace="""      match Refuse::DestinationNotHeld {
+        Refuse::DestinationNotHeld => source_arm(""",
+        caught_by="an_empty_snapshot_refuses_the_destination_classes_it_can_still_decide",
     ),
     Probe(
         name="residual-refusal-counts-only-its-own-arm",

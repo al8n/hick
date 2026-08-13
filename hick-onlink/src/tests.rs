@@ -4,8 +4,9 @@ use core::{
 };
 
 use super::{
-  Admit, BoundLink, DestinationWitness, IfaceWitness, LinkDelivery, Refuse, Verdict,
-  addr_in_subnet, admits_ingress, arrived_on_bound_interface, is_mdns_group, src_on_local_link,
+  Admit, BoundLink, DestinationWitness, IfaceWitness, LinkDelivery, LinkProvenance, Refuse,
+  Verdict, addr_in_subnet, admits_ingress, arrived_on_bound_interface, is_mdns_group,
+  src_on_local_link,
 };
 
 /// `n` as a WITNESSED interface index.
@@ -226,6 +227,25 @@ fn scoped(ip: Ipv6Addr, scope: u32) -> SocketAddr {
 /// A link-local IPv6 source, the family of address a scope id is really about.
 const LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
 
+/// Inside `fe80::/10` and OUTSIDE `fe80::/64`: the address the seeded link-local
+/// prefix must NOT admit, and the whole of the difference between the two
+/// candidate seed lengths.
+///
+/// RFC 4291 §2.4's table names the link-local unicast type `FE80::/10`, but
+/// §2.5.6 gives the address a format — ten prefix bits, then **54 zero bits**,
+/// then a 64-bit interface identifier — so a conforming link-local address has
+/// its first 64 bits fixed and lives in `fe80::/64`. RFC 4862 §5.3 forms them
+/// the same way. Nothing can autoconfigure or assign this address, so admitting
+/// it would be 54 bits of on-link claim the subnet model never makes.
+const MALFORMED_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0x1234, 0, 0, 0, 0, 0, 1);
+
+/// An interface an operator configured `fe80:1234::2/64` on by hand, and the
+/// address it holds. The only way [`MALFORMED_LINK_LOCAL`] is on-link anywhere:
+/// through the COLLECTED list, which still governs every prefix the seed does
+/// not name.
+const MALFORMED_LL_HOST: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfe80, 0x1234, 0, 0, 0, 0, 0, 2));
+static MALFORMED_LL_LINK: [(IpAddr, u8); 1] = [(MALFORMED_LL_HOST, 64u8)];
+
 /// A NIC-bound endpoint on `bound` carrying `subnets`: the shape every case
 /// below was written under, and never the loopback interface.
 fn nic(bound: u32, subnets: &[(IpAddr, u8)]) -> BoundLink<'_> {
@@ -270,7 +290,27 @@ fn arrived(src: SocketAddr, bound: u32, pkt_iface: u32, iface_reported: bool) ->
   arrived_on_bound_interface(src, nic(bound, &[]), ifw(pkt_iface, iface_reported)).is_ok()
 }
 
-/// [`src_on_local_link`] for a NIC-bound endpoint.
+/// [`src_on_local_link`] as [`admits_ingress`] reaches it: with the
+/// [`LinkProvenance`] stage 1 actually produced for these inputs, never a value
+/// a case chose for itself.
+///
+/// The seed gate reads that value, so a fixture that supplied its own would be
+/// asserting about a state the boundary may never put the function in. A stage-1
+/// REFUSAL produces no provenance at all — production never reaches this stage
+/// then — so the arm is evaluated at its NARROWEST,
+/// [`LinkProvenance::Unproven`], which is the value that cannot make the seed
+/// answer. Every case below is about the arm in isolation; the boundary's own
+/// verdict for those inputs is asserted through [`admits_ingress`] beside them.
+///
+/// The gate itself is pinned separately, against explicit literals, in
+/// `the_link_local_seed_needs_the_link_to_have_been_established` — so nothing
+/// here has to derive what it is testing.
+fn arm_two(src: SocketAddr, link: BoundLink<'_>, iface: IfaceWitness) -> bool {
+  let provenance = arrived_on_bound_interface(src, link, iface).unwrap_or(LinkProvenance::Unproven);
+  src_on_local_link(src, link, iface, provenance)
+}
+
+/// [`arm_two`] for a NIC-bound endpoint.
 fn on_local_link(
   src: SocketAddr,
   subnets: &[(IpAddr, u8)],
@@ -278,7 +318,7 @@ fn on_local_link(
   pkt_iface: u32,
   iface_reported: bool,
 ) -> bool {
-  src_on_local_link(src, nic(bound, subnets), ifw(pkt_iface, iface_reported))
+  arm_two(src, nic(bound, subnets), ifw(pkt_iface, iface_reported))
 }
 
 #[test]
@@ -420,28 +460,42 @@ fn prefix_beyond_address_width_is_rejected_not_clamped() {
 #[test]
 fn link_local_v6_requires_matching_interface() {
   let src = peer(IpAddr::V6(LINK_LOCAL));
-  // Arrived on the bound interface AND inside a prefix that interface carries:
-  // §11's second arm admits it. Both halves are required — a witness alone is
-  // not a third arm.
+  // Inside a prefix the interface treats as on-link: §11's second arm admits it.
+  // It reads the same whether the interface reported `fe80::<iid>/64` itself or
+  // reported nothing of the sort, because `fe80::/64` is on the on-link list
+  // unconditionally — RFC 5942 §3, RFC 4861's Prefix List.
   assert!(on_local_link(src, &LL_PREFIXES, BOUND, BOUND, true));
-  // The witness agrees but the interface carries no matching prefix: refused.
-  assert!(!on_local_link(src, &SUBNETS, BOUND, BOUND, true));
+  assert!(on_local_link(src, &SUBNETS, BOUND, BOUND, true));
+  assert!(on_local_link(src, &[], BOUND, BOUND, true));
+  // The seed is a PREFIX and not a family: an address inside `fe80::/10` but
+  // outside `fe80::/64` matches nothing, on any of the same links.
+  let malformed = peer(IpAddr::V6(MALFORMED_LINK_LOCAL));
+  assert!(!on_local_link(malformed, &LL_PREFIXES, BOUND, BOUND, true));
+  assert!(!on_local_link(malformed, &SUBNETS, BOUND, BOUND, true));
+  assert!(!on_local_link(malformed, &[], BOUND, BOUND, true));
   // A foreign witness is stage 1's refusal, not this arm's — §11's second arm
-  // asks only about the prefix. Asserted where the question is decided, and
-  // with a destination this interface HOLDS, so nothing but stage 1 can refuse.
-  assert!(
-    !admits_ingress(
-      src,
-      DestinationWitness::Witnessed(LL_UNICAST_V6_DST),
-      None,
-      nic(BOUND, &LL_PREFIXES),
-      witnessed(OTHER)
-    )
-    .is_admit()
-  );
-  // No witness at all -> REFUSED, whatever the platform can report. A
-  // link-local address names some link and never ours, so absent provenance is
-  // absent membership: nothing hands a source the link it is claiming.
+  // asks only about the prefix, and the seed did not give the source arm a link
+  // opinion. Asserted where the question is decided, and with a destination this
+  // interface HOLDS, so nothing but stage 1 can refuse.
+  for subnets in [&LL_PREFIXES[..], &SUBNETS[..], &[][..]] {
+    assert!(
+      !admits_ingress(
+        src,
+        DestinationWitness::Witnessed(LL_UNICAST_V6_DST),
+        None,
+        nic(BOUND, subnets),
+        witnessed(OTHER)
+      )
+      .is_admit(),
+      "the link gate decides link membership, seeded prefix or not"
+    );
+  }
+  // No witness at all -> REFUSED, whatever the platform can report, and the
+  // seed does not change that. A link-local address names some link and never
+  // ours: `fe80::/64` is on EVERY interface, so matching it proves the sender is
+  // on a link and not that it is on this one. Absent provenance is absent
+  // membership, and the seed is gated on provenance precisely so that stays
+  // true — see `the_link_local_seed_needs_the_link_to_have_been_established`.
   assert!(!on_local_link(src, &[], BOUND, 0, false));
   assert!(!on_local_link(src, &[], BOUND, 0, true));
 }
@@ -475,12 +529,22 @@ fn an_unwitnessed_ipv4_link_local_source_is_refused() {
   // An index that names our own interface is the witness it was missing, so the
   // arm is intact rather than merely unreachable.
   assert!(on_local_link(v4_ll, &LL_PREFIXES, BOUND, BOUND, true));
-  // IPv6 needs no special case: an interface holding a link-local address
-  // carries `fe80::/64`, which is one of the "on-link IPv6 prefixes" §11 points
-  // at, so the same arm admits a link-local peer there.
+  // IPv6 is where the two families diverge, and this is the only place they do.
+  // `fe80::/64` is one of the "on-link IPv6 prefixes" §11 points at on EVERY
+  // interface — RFC 5942 §3, RFC 4861's Prefix List — so the same arm admits a
+  // link-local peer there whether or not the interface reported a link-local
+  // address of its own. IPv4 has no such default, which is why every assertion
+  // above still refuses.
   assert!(on_local_link(
     scoped(LINK_LOCAL, BOUND),
     &LL_PREFIXES,
+    BOUND,
+    0,
+    false
+  ));
+  assert!(on_local_link(
+    scoped(LINK_LOCAL, BOUND),
+    &[],
     BOUND,
     0,
     false
@@ -534,12 +598,27 @@ fn a_link_local_source_must_also_match_on_its_scope_id() {
       .is_admit()
     );
   }
-  // ... and with no matching prefix it is refused even so, because the witness
-  // was never an admission ground of its own. The destination is one this
-  // interface DOES hold, so the destination test cannot be what refuses.
+  // ... and with no link-local prefix ENUMERATED it is admitted anyway, because
+  // `fe80::/64` is on the interface's on-link list by the subnet model rather
+  // than by the enumeration. The destination is one this interface DOES hold, so
+  // the destination test is not what decides it either way.
+  assert!(
+    admits_ingress(
+      scoped(LINK_LOCAL, BOUND),
+      DestinationWitness::Witnessed(UNICAST_V6_DST),
+      None,
+      nic(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
+  // The witness is still not an admission ground of its own, which is what this
+  // case is named for: swap the source for one the seed does not cover — same
+  // scope, same index, same held destination — and it is refused. So the scope
+  // id proves WHICH link and never on-link membership, seed or no seed.
   assert!(
     !admits_ingress(
-      scoped(LINK_LOCAL, BOUND),
+      scoped(MALFORMED_LINK_LOCAL, BOUND),
       DestinationWitness::Witnessed(UNICAST_V6_DST),
       None,
       nic(BOUND, &SUBNETS),
@@ -559,35 +638,15 @@ fn loopback_is_on_link_for_a_loopback_bound_endpoint_and_nobody_else() {
     IpAddr::V6(Ipv6Addr::LOCALHOST),
   ] {
     // Matching witness, loopback-bound: our own traffic.
-    assert!(src_on_local_link(
-      peer(ip),
-      lo(BOUND, &[]),
-      witnessed(BOUND)
-    ));
+    assert!(arm_two(peer(ip), lo(BOUND, &[]), witnessed(BOUND)));
     // No witness at all, loopback-bound: the exception, and its whole extent.
-    assert!(src_on_local_link(
-      peer(ip),
-      lo(BOUND, &[]),
-      IfaceWitness::Lost
-    ));
+    assert!(arm_two(peer(ip), lo(BOUND, &[]), IfaceWitness::Lost));
     // A REPORTED foreign interface outranks the source address, even for the
     // endpoint the exception exists for.
-    assert!(!src_on_local_link(
-      peer(ip),
-      lo(BOUND, &[]),
-      witnessed(OTHER)
-    ));
+    assert!(!arm_two(peer(ip), lo(BOUND, &[]), witnessed(OTHER)));
     // And a NIC-bound endpoint has no loopback traffic to protect at all.
-    assert!(!src_on_local_link(
-      peer(ip),
-      nic(BOUND, &[]),
-      witnessed(BOUND)
-    ));
-    assert!(!src_on_local_link(
-      peer(ip),
-      nic(BOUND, &[]),
-      IfaceWitness::Blind
-    ));
+    assert!(!arm_two(peer(ip), nic(BOUND, &[]), witnessed(BOUND)));
+    assert!(!arm_two(peer(ip), nic(BOUND, &[]), IfaceWitness::Blind));
   }
 }
 
@@ -849,6 +908,37 @@ fn a_bound_interface_of_zero_proves_nothing_and_so_forbids_nothing() {
     0,
     OTHER
   ));
+  // **But it proves nothing to the SEED**, which is the half a zero cannot
+  // supply. "Nothing here can be foreign" is what the group arm above needs and
+  // an unbound endpoint satisfies it vacuously; "this datagram arrived on OUR
+  // link" is what `fe80::/64` needs, and there is no our-link for it to be
+  // about. So the same link-local source that a NAMED binding admits on the seed
+  // is refused here, and is refused for the same reason it was before the seed
+  // existed: no prefix this endpoint reported covers it.
+  assert_eq!(
+    admits_ingress(
+      scoped(LINK_LOCAL, OTHER),
+      DestinationWitness::Witnessed(UNICAST_V6_DST),
+      None,
+      nic(0, &SUBNETS),
+      IfaceWitness::Blind
+    ),
+    Verdict::Refuse(Refuse::SourceOffLink),
+    "a bound interface of zero forbids nothing and proves nothing; the seed \
+     needs the second half"
+  );
+  // The contrast that makes it the BINDING and not the source: name the
+  // interface the scope id already names, and the seed answers.
+  assert!(
+    admits_ingress(
+      scoped(LINK_LOCAL, OTHER),
+      DestinationWitness::Witnessed(UNICAST_V6_DST),
+      None,
+      nic(OTHER, &SUBNETS),
+      IfaceWitness::Blind
+    )
+    .is_admit()
+  );
 }
 
 #[test]
@@ -976,7 +1066,7 @@ fn a_spoofed_loopback_source_is_rejected_on_a_foreign_interface() {
   // Nor by way of the source arm, where the same short-circuit used to sit: a
   // loopback source now answers to exactly the link evidence every other source
   // does, so a reported zero is a failed proof there too.
-  assert!(!src_on_local_link(
+  assert!(!arm_two(
     peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     nic(BOUND, &SUBNETS),
     IfaceWitness::Lost
@@ -984,7 +1074,7 @@ fn a_spoofed_loopback_source_is_rejected_on_a_foreign_interface() {
   // And it does NOT degrade open on a path with no interface to give: a
   // loopback source is this endpoint's own traffic or it is nothing, and a
   // NIC-bound endpoint has none. Absent provenance is not membership.
-  assert!(!src_on_local_link(
+  assert!(!arm_two(
     peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     nic(BOUND, &SUBNETS),
     IfaceWitness::Blind
@@ -1288,16 +1378,15 @@ fn an_unwitnessed_apipa_source_answers_to_the_configured_prefix() {
     // The bound interface carries the same link-local prefix: admitted, on the
     // same evidence any other in-prefix source is admitted on.
     assert!(
-      src_on_local_link(peer_ll, nic(BOUND, &APIPA), ifw(0, reported)),
+      arm_two(peer_ll, nic(BOUND, &APIPA), ifw(0, reported)),
       "a link-local peer on a link-local-configured interface is on-link per §11"
     );
     // And with no matching prefix it is still refused, so the arm did not turn
-    // into a blanket link-local exemption.
-    assert!(!src_on_local_link(
-      peer_ll,
-      nic(BOUND, &SUBNETS),
-      ifw(0, reported)
-    ));
+    // into a blanket link-local exemption. IPv4 gets no seeded prefix: RFC 5942
+    // is an IPv6 document and `169.254.0.0/16` is on-link nowhere by default, so
+    // an APIPA peer is on-link only where the interface says the host is on that
+    // link too.
+    assert!(!arm_two(peer_ll, nic(BOUND, &SUBNETS), ifw(0, reported)));
   }
 
   // Through the whole boundary, on the square this is actually for: a receive
@@ -1327,14 +1416,11 @@ fn an_unwitnessed_apipa_source_answers_to_the_configured_prefix() {
     )
     .is_admit()
   );
-  assert!(src_on_local_link(
-    peer_ll,
-    nic(BOUND, &APIPA),
-    witnessed(BOUND)
-  ));
+  assert!(arm_two(peer_ll, nic(BOUND, &APIPA), witnessed(BOUND)));
   // The IPv6 twin, through the boundary: a foreign scope refuses at stage 1, and
-  // a matching one is admitted only because the interface also carries
-  // `fe80::/64`.
+  // a matching one is admitted on the source arm — where `fe80::/64` is on the
+  // on-link list whatever this interface enumerated, so unlike the APIPA case
+  // above it does not need `LL_PREFIXES` to carry it.
   assert!(
     !admits_ingress(
       scoped(LINK_LOCAL, OTHER),
@@ -1401,7 +1487,7 @@ fn an_unwitnessed_apipa_source_answers_to_the_configured_prefix() {
 fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
   // Sources covering every shape stages 1 and 3 distinguish, in both families:
   // loopback, link-local with each scope value, routable in and out of prefix.
-  let sources: [SocketAddr; 10] = [
+  let sources: [SocketAddr; 11] = [
     on_subnet(),
     peer(OFF_SUBNET_V4),
     peer(IpAddr::V4(Ipv4Addr::new(169, 254, 3, 9))),
@@ -1414,6 +1500,10 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
     peer(IpAddr::V6(LINK_LOCAL)),
     scoped(LINK_LOCAL, BOUND),
     scoped(LINK_LOCAL, OTHER),
+    // Inside `fe80::/10` and outside `fe80::/64`: the source that separates the
+    // seeded prefix from the address TYPE, over the whole space rather than at
+    // the points a hand-written case chose.
+    scoped(MALFORMED_LINK_LOCAL, BOUND),
   ];
   // Each enumerated link, paired with the addresses it HOLDS. Both sides name
   // the same constants, so the pairing cannot drift from the fixture — and the
@@ -1509,6 +1599,8 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
   let mut absent_iface_fired = Fired::default();
   let mut in_prefix_fired = Fired::default();
   let mut nothing_left_fired = Fired::default();
+  let mut seeded_link_local_fired = Fired::default();
+  let mut unproven_is_collected_only_fired = Fired::default();
   let mut unbound_fired = Fired::default();
   let mut coarse_flag_fired = Fired::default();
   let mut broadcast_delivery_fired = Fired::default();
@@ -1518,6 +1610,7 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
   let mut loopback_block_fired = Fired::default();
   let mut no_arm_fired = Fired::default();
   let mut empty_snapshot_fired = Fired::default();
+  let mut empty_snapshot_named_fired = Fired::default();
   let mut foreign_group_fired = Fired::default();
   let mut unspecified_dst_fired = Fired::default();
   let mut neighbour_dst_fired = Fired::default();
@@ -1580,17 +1673,52 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 let in_prefix = subnets
                   .iter()
                   .any(|&(n, pfx)| addr_in_subnet(n, pfx, src.ip()));
+                // The seeded on-link prefix, written out of RFC 4291 §2.5.6's
+                // format rather than read from production's constant: ten
+                // prefix bits `1111111010` followed by 54 zero bits is the one
+                // 64-bit value `fe80:0000:0000:0000`, so a conforming
+                // link-local address is exactly one whose first four segments
+                // are these. Stating it here is what makes this enumeration an
+                // oracle for the seed's WIDTH and not a second reading of it.
+                // The two link facts, restated here from the ENUMERATION's own
+                // values rather than read back from production — and they are
+                // TWO because production's two consumers need different things
+                // and a bound interface of zero is where those part company. A
+                // CONTRADICTING witness is not considered in either: stage 1
+                // already refused it, and every assertion below is guarded by
+                // `stage1`.
+                //
+                // §11 arm one needs "nothing here can be foreign", which an
+                // endpoint that named no link satisfies vacuously.
+                let exemption_available = bound_iface == 0 || witnessed || loopback_own;
+                // The seeded `fe80::/64` needs "this arrived on OUR link", which
+                // a zero cannot supply — there is no our-link for it to be
+                // about. So the seed requires a NAMED binding and a witness that
+                // agreed with it, or a loopback-bound endpoint's own traffic.
+                let seed_provenance = bound_iface != 0 && (witnessed || loopback_own);
+                let in_seeded_prefix = match src.ip() {
+                  IpAddr::V6(a) => matches!(a.segments(), [0xfe80, 0, 0, 0, ..]),
+                  IpAddr::V4(_) => false,
+                };
+                // The seed decides only where BOTH hold. `fe80::/64` is on every
+                // interface, so membership says the sender is on some link and
+                // never that it is ours; the link has to have been established by
+                // something else, and that is the whole of the difference
+                // between this and a collected prefix.
+                let seeded_link_local = in_seeded_prefix && seed_provenance;
                 let stage1 = arrived_on_bound_interface(src, link, iface).is_ok();
                 // Whether §11's SOURCE arm would take this source on this link:
                 // a loopback source belongs to a loopback-BOUND endpoint and
-                // nobody else, and every other source answers to the prefix.
+                // nobody else, and every other source answers to the prefixes
+                // this interface treats as on-link — the collected ones, plus
+                // the seeded link-local one that is on every interface.
                 // The control every destination-class counter below requires, so
                 // that a refusal there is attributable to the destination.
                 let source_arm_admits = stage1
                   && if src.ip().is_loopback() {
                     is_lo
                   } else {
-                    in_prefix
+                    in_prefix || seeded_link_local
                   };
 
                 // 1. A nonzero witness that disagrees refuses, and no later
@@ -1684,7 +1812,24 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 // not a verdict, so it defers to the source arm. Invariant 7
                 // pins exactly how far that can go.
                 let empty_snapshot = subnets.is_empty();
-                let no_arm = dst_addr.is_some() && !ours_group && !held_here && !empty_snapshot;
+                // The destination classes the ADDRESS and the BINDING settle
+                // on their own, hand-written from this enumeration's literals.
+                // A failed enumeration is ignorance about which addresses this
+                // host HOLDS, so it cannot excuse any of these — and the
+                // empty-snapshot arm therefore does not defer them.
+                let snapshot_free_class = dst_addr.is_some_and(|d| {
+                  d == FOREIGN_V4_GROUP
+                    || d == FOREIGN_V6_GROUP
+                    || d == LIMITED_BROADCAST
+                    || d == UNSPECIFIED_V4_DST
+                    || d == UNSPECIFIED_V6_DST
+                    || d == V4_MAPPED_GROUP_DST
+                    || (d.is_loopback() && !is_lo)
+                });
+                let no_arm = dst_addr.is_some()
+                  && !ours_group
+                  && !held_here
+                  && !(empty_snapshot && !snapshot_free_class);
                 // With NO destination witnessed, a broadcast DELIVERY refuses
                 // on its own. It is the only value of the coarse signal that
                 // does, and it is exact rather than approximate: §11 gives a
@@ -1700,20 +1845,11 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 let host_address_arm = (dst_addr.is_some() && !ours_group && !no_arm)
                   || (dst_absent && flag != Some(LinkDelivery::Multicast) && !no_dst_broadcast);
 
-                // Whether §11 arm one's source exemption is available to this
-                // datagram, restated here from the ENUMERATION's own values
-                // rather than read back from production: something named the
-                // link, or a loopback-bound endpoint is taking its own traffic,
-                // or this endpoint bound no interface and so scopes to nothing.
-                // A CONTRADICTING witness is not considered — stage 1 already
-                // refused it, and every assertion below is guarded by `stage1`.
-                let group_exemption = bound_iface == 0 || witnessed || loopback_own;
-
                 // 3. Past stage 1 and SCOPED to this endpoint's link, OUR group
                 //    admits regardless of source — §11's "regardless of source
                 //    IP address". Keyed by the DESTINATION's family: it is the
                 //    destination that selects this arm.
-                if stage1 && ours_group && group_exemption {
+                if stage1 && ours_group && exemption_available {
                   group_arm_fired.hit(dst_v6);
                   assert!(got, "stage 2: the group arm must admit {src}");
                   assert_eq!(
@@ -1735,7 +1871,7 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 //     still refuse a foreign group, a broadcast and a martian BY
                 //     NAME, which is the property an earlier fix — rewriting the
                 //     destination witness at the receive path — destroyed.
-                if stage1 && ours_group && !group_exemption {
+                if stage1 && ours_group && !exemption_available {
                   unscoped_group_fired.hit(dst_v6);
                   // The coarse flag decides here exactly as it decides for a
                   // datagram with NO destination witness, which is the
@@ -2014,33 +2150,91 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
                 }
                 // 6b. ... and one with no prefix, no group and no loopback claim
                 //     is refused. Nothing admits on arrival alone.
-                // NO carve-out for a witnessed link-local source. There used
+                // NO carve-out for a WITNESSED link-local source. There used
                 // to be one, and it was what let a third §11 arm survive
                 // unnoticed: the invariant exempted exactly the branch that
                 // deviated, so the enumeration ratified the deviation instead
-                // of detecting it. The only exemption left is loopback, which
-                // is a documented arm of its own rather than a shortcut around
-                // this one.
-                if stage1 && host_address_arm && !in_prefix && !loopback_own {
+                // of detecting it. The two exemptions here are loopback and the
+                // seeded `fe80::/64`, and both are stated over the SOURCE
+                // ADDRESS alone — neither can be satisfied by a witness, so a
+                // witness-driven admission still fails this assertion for every
+                // source outside those two literals. `fe80:1234::1` is in this
+                // space to keep that true of link-local-looking sources too.
+                if stage1 && host_address_arm && !in_prefix && !loopback_own && !seeded_link_local {
                   nothing_left_fired.hit(src_v6);
                   assert!(!got, "stage 3: nothing left to admit on: {src}");
                 }
-                // 7. The empty-snapshot decision, and its EXACT bound. With
-                //    nothing enumerated, "not one of our addresses" is not a
-                //    fact this endpoint established, so the destination test
-                //    defers to the source arm — and the source arm with no
-                //    prefixes to match admits a loopback-BOUND endpoint's own
-                //    traffic and nothing whatsoever else. Written as an
-                //    equality, because the claim this decision rests on is that
-                //    the fallback is bounded, not merely that it is not open.
-                if empty_snapshot && dst_addr.is_some() && !ours_group {
+                // 6c. The seed itself, over the whole space: a source inside
+                //     `fe80::/64` that cleared stage 1 is admitted on the
+                //     host-address arm whatever the interface enumerated,
+                //     INCLUDING an interface that enumerated nothing. It is
+                //     IPv6-only, so `v4 == 0` is asserted as hard as `v6 > 0`.
+                if stage1 && host_address_arm && seeded_link_local {
+                  seeded_link_local_fired.hit(src_v6);
+                  assert!(
+                    got,
+                    "stage 3: `fe80::/64` is on-link on every interface: {src}"
+                  );
+                }
+                // 6d. **PR #88's squares, restated as an equality.** Where
+                //     the link is UNPROVEN the seed is not consulted at all, so
+                //     this rule decides exactly as it did before that prefix
+                //     existed: the COLLECTED comparison and nothing else. Every
+                //     square #88 is about — an unscoped mDNS group on
+                //     FreeBSD/DragonFly, the `Declined` cmsg a flood induces,
+                //     the withheld-privilege square #88 routed here — is by
+                //     definition one where nothing named the link, so this
+                //     covers all of them at once and covers them over the whole
+                //     product rather than at chosen points.
+                //
+                //     A loopback source is excluded because it has an arm of its
+                //     own, decided by the BINDING, which this equality is not
+                //     about.
+                if stage1 && host_address_arm && !seed_provenance && !src.ip().is_loopback() {
+                  unproven_is_collected_only_fired.hit(src_v6);
+                  assert_eq!(
+                    got, in_prefix,
+                    "an unproven link decides on the collected prefixes alone, \
+                     exactly as it did before `fe80::/64` was seeded: {src} -> \
+                     {dst:?}"
+                  );
+                }
+                // 7. The empty-snapshot decision, and its EXACT bound — in two
+                //    halves, because a failed enumeration is ignorance about
+                //    which addresses THIS HOST HOLDS and not about what an
+                //    address IS.
+                //
+                //    7a. The classes the address and the binding settle on their
+                //    own. A hand-written list of THIS enumeration's literals,
+                //    never a call into production's classifier: these are
+                //    refused whatever the snapshot did, because no snapshot was
+                //    ever consulted about them.
+                if empty_snapshot && dst_addr.is_some() && !ours_group && snapshot_free_class {
+                  empty_snapshot_named_fired.hit(dst_v6);
+                  assert!(
+                    !got,
+                    "an empty snapshot excuses only what the enumeration would \
+                     have decided; this class is decided by the address: {src} \
+                     -> {dst:?}"
+                  );
+                }
+                //    7b. The residual — syntactically a unicast address, and
+                //    whether it is ours is exactly what could not be read. This
+                //    is the only class that defers, and the source arm with no
+                //    COLLECTED prefixes to match then admits a loopback-BOUND
+                //    endpoint's own traffic and a source in the seeded
+                //    `fe80::/64` whose link stage 1 established, and nothing
+                //    whatsoever else. Written as an equality, because the claim
+                //    this decision rests on is that the fallback is bounded, not
+                //    merely that it is not open.
+                if empty_snapshot && dst_addr.is_some() && !ours_group && !snapshot_free_class {
                   empty_snapshot_fired.hit(dst_v6);
                   assert_eq!(
                     got,
-                    stage1 && is_lo && src.ip().is_loopback(),
+                    stage1 && (loopback_own || seeded_link_local),
                     "an empty snapshot runs the source arm, which then admits \
-                     only a loopback-bound endpoint's own traffic: {src} -> \
-                     {dst:?}"
+                     a loopback-bound endpoint's own traffic and a source in \
+                     the seeded `fe80::/64`, and nothing else: {src} -> {dst:?}"
                   );
                 }
                 // 9. Every degraded admission is NAMED as one, and every
@@ -2084,8 +2278,13 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
   // a passing test over a smaller product. The arithmetic is written out because
   // that is the part a reader has to check:
   //
-  //   10 sources x 6 links x 3 bounds x 5 interface witnesses
-  //     x 25 destination witnesses x 4 delivery classes = 90_000
+  //   11 sources x 6 links x 3 bounds x 5 interface witnesses
+  //     x 25 destination witnesses x 4 delivery classes = 99_000
+  //
+  // The source axis went 10 -> 11 when `fe80::/64` became a seeded on-link
+  // prefix: `fe80:1234::1` is inside the link-local address TYPE and outside the
+  // seeded prefix, and without it no case in this space could tell a `/64` seed
+  // from a `/10` one.
   //
   // The previous space was 95_040 = 10 x 6 x 3 x (3 pkt_ifaces x 2 reported)
   // x 22 destinations x 4. The interface axis went 6 -> 5 because two of the six
@@ -2094,7 +2293,7 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
   // 22 -> 25 because one `None` became three distinct absences and one new
   // literal (`::ffff:224.0.0.251`) was added.
   assert_eq!(
-    cases, 90_000,
+    cases, 99_000,
     "the enumerated space changed size; update the arithmetic above with it"
   );
 
@@ -2112,6 +2311,10 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
     (residual_refusal_fired, "the residual refusal"),
     (in_prefix_fired, "in-prefix source at the host-address arm"),
     (nothing_left_fired, "nothing left to admit on"),
+    (
+      unproven_is_collected_only_fired,
+      "an unproven link deciding on the collected prefixes alone",
+    ),
     (unbound_fired, "unbound endpoint"),
     (coarse_flag_fired, "no destination, coarse multicast flag"),
     (
@@ -2133,6 +2336,10 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
     ),
     (no_arm_fired, "a destination this endpoint does not hold"),
     (empty_snapshot_fired, "empty-snapshot fallback"),
+    (
+      empty_snapshot_named_fired,
+      "empty-snapshot arm refusing a class the address decides",
+    ),
     (foreign_group_fired, "foreign multicast destination"),
     (unspecified_dst_fired, "unspecified destination"),
     (neighbour_dst_fired, "a neighbour's address"),
@@ -2175,6 +2382,18 @@ fn the_staged_contract_holds_over_every_combination_of_its_inputs() {
      cases (v4 {}, v6 {})",
     v4_mapped_fired.v4,
     v4_mapped_fired.v6
+  );
+  // The seeded on-link prefix is IPv6's and IPv6's alone. RFC 5942 is an IPv6
+  // document and IPv4's model has no default on-link prefix, so a firing keyed
+  // to an IPv4 source would mean the seed had leaked into `169.254.0.0/16` —
+  // which `an_unwitnessed_ipv4_link_local_source_is_refused` covers at a point
+  // and this covers over the whole space.
+  assert!(
+    seeded_link_local_fired.only_v6(),
+    "the seeded `fe80::/64` must fire for IPv6 and NEVER for IPv4 over {cases} \
+     cases (v4 {}, v6 {})",
+    seeded_link_local_fired.v4,
+    seeded_link_local_fired.v6
   );
 }
 
@@ -2636,17 +2855,40 @@ fn a_matching_witness_does_not_admit_a_link_local_source_without_a_prefix() {
   // interface configured only for `192.168.1.0/24` admitted unicast from
   // `169.254.7.7` and from `fe80::…` purely because the receive index or scope
   // agreed.
+  //
+  // The IPv6 source below is `fe80:1234::1`, INSIDE `fe80::/10` and outside
+  // `fe80::/64`. That is deliberate and it is what keeps this case honest now
+  // that `fe80::/64` is a seeded on-link prefix: a well-formed link-local source
+  // is admitted here, and it is admitted by that PREFIX rather than by the
+  // witness — see `the_link_local_prefix_is_on_link_with_no_assigned_address`
+  // for the seed and `a_link_local_source_must_also_match_on_its_scope_id` for
+  // the pair of sources that separates the two grounds. An address the seed does
+  // not cover still has nothing but the witness behind it, so this case still
+  // asks the question it was written to ask.
   let v4_ll = peer(IpAddr::V4(Ipv4Addr::new(169, 254, 7, 7)));
-  let v6_ll = scoped(LINK_LOCAL, BOUND);
+  let v6_ll = scoped(MALFORMED_LINK_LOCAL, BOUND);
   // Each source is paired with the address of ITS OWN family that each link
-  // holds, so every assertion below reaches §11's second arm and the prefix is
-  // the only thing left to decide it.
-  for (src, ours, theirs, what) in [
-    (v4_ll, UNICAST_V4_DST, LL_UNICAST_V4_DST, "169.254/16"),
-    (v6_ll, UNICAST_V6_DST, LL_UNICAST_V6_DST, "fe80::/10"),
+  // holds, and with the link that DOES carry a prefix covering it, so every
+  // assertion below reaches §11's second arm and the prefix is the only thing
+  // left to decide it.
+  for (src, ours, theirs, their_link, what) in [
+    (
+      v4_ll,
+      UNICAST_V4_DST,
+      LL_UNICAST_V4_DST,
+      &LL_PREFIXES[..],
+      "169.254/16",
+    ),
+    (
+      v6_ll,
+      UNICAST_V6_DST,
+      MALFORMED_LL_HOST,
+      &MALFORMED_LL_LINK[..],
+      "fe80::/10 outside fe80::/64",
+    ),
   ] {
     assert!(
-      !src_on_local_link(src, nic(BOUND, &SUBNETS), witnessed(BOUND)),
+      !arm_two(src, nic(BOUND, &SUBNETS), witnessed(BOUND)),
       "{what}: a matching witness must not stand in for §11's prefix test"
     );
     assert!(
@@ -2661,13 +2903,17 @@ fn a_matching_witness_does_not_admit_a_link_local_source_without_a_prefix() {
       "{what}: and the whole boundary must refuse it too"
     );
     // The interface carrying the matching prefix is what admits it — §11's own
-    // second arm, and the APIPA case that arm exists to serve.
+    // second arm, and the APIPA case that arm exists to serve. For the IPv6 half
+    // that is a link an operator configured `fe80:1234::2/64` on by hand: the
+    // COLLECTED list still governs every prefix the seed does not name, which is
+    // what makes the seed an addition to this arm rather than a replacement of
+    // it.
     assert!(
       admits_ingress(
         src,
         DestinationWitness::Witnessed(theirs),
         None,
-        nic(BOUND, &LL_PREFIXES),
+        nic(BOUND, their_link),
         witnessed(BOUND)
       )
       .is_admit()
@@ -3409,6 +3655,13 @@ fn a_broadcast_delivery_is_refused_where_no_destination_was_recovered() {
 /// a genuinely on-link peer is refused — is the same root cause and is tracked
 /// alongside it. [`BoundLink::with_onlink_prefixes`] is the constructor both
 /// fixes use; nothing populates it yet.
+///
+/// **`fe80::/64` is no longer one of the two.** It is seeded as a constant, so
+/// neither direction can reach it — see
+/// `the_link_local_prefix_is_on_link_with_no_assigned_address`. What is pinned
+/// here is the RA/route half that remains: every prefix a router advertises, and
+/// every prefix a host takes an address from, still arrives at this boundary as
+/// an assigned address or not at all.
 #[test]
 fn an_assigned_ipv6_prefix_is_treated_as_on_link_which_it_need_not_be() {
   // The shape an A=1, L=0 advertisement leaves behind: one address, and a /64
@@ -3464,6 +3717,609 @@ fn an_assigned_ipv6_prefix_is_treated_as_on_link_which_it_need_not_be() {
     )
     .is_admit()
   );
+}
+
+/// `fe80::/64` is on-link on every interface, and no assigned address is
+/// required for it — the half of RFC 5942 this crate does close.
+///
+/// RFC 5942 §3: *"In IPv6, by default, a host treats only the link-local prefix
+/// as on-link."* RFC 4861's Prefix List definition gives it no expiry: *"The
+/// link-local prefix is considered to be on the prefix list with an infinite
+/// invalidation timer regardless of whether routers are advertising a prefix for
+/// it."*
+///
+/// Before the seed, a link-local peer was admitted only because `getifs`
+/// happened to report the interface's own link-local address at a `/64`, which
+/// is RFC 5942 §4 rule 1's forbidden inference — *"The assignment of an IPv6
+/// address … MUST NOT implicitly cause a prefix derived from that address to be
+/// treated as on-link"* — landing on the right answer by luck. The three shapes
+/// below are where that luck runs out, and each is an ordinary host:
+///
+/// * a DHCPv6 host, whose address is commonly reported as a `/128`, so the
+///   derived prefix matched only the one peer holding our own address;
+/// * an interface with no IPv6 link-local address of its own to derive from;
+/// * an interface whose enumeration failed, which reports nothing at all.
+///
+/// The cost of getting this wrong is not "all IPv6 dropped" — the common mDNS
+/// path is a group destination, which takes §11's first arm regardless of source
+/// — but §11 unicast RESPONSES, which is what a QU query asks for, and the
+/// FreeBSD/DragonFly square that PR #88 routes to the source arm when the
+/// destination witness was withheld.
+#[test]
+fn the_link_local_prefix_is_on_link_with_no_assigned_address() {
+  // A DHCPv6-style host: one global address, and its link-local one reported as
+  // a /128 rather than a /64. Both are what several stacks report for an
+  // address DHCPv6 handed out, and the /128 is the shape that used to make the
+  // derived prefix match only the one peer holding our own address.
+  static DHCPV6_128: [(IpAddr, u8); 2] = [(OUR_V6_ADDR, 128u8), (OUR_V6_LL_ADDR, 128u8)];
+  // An interface with no IPv6 link-local address at all.
+  static NO_LINK_LOCAL: [(IpAddr, u8); 1] = [(OUR_V6_ADDR, 64u8)];
+  // And one that enumerated nothing. Its destination arm takes the
+  // empty-snapshot fallback, so the destination below is chosen to be one the
+  // other two links HOLD and this one cannot contradict.
+  static UNENUMERATED: [(IpAddr, u8); 0] = [];
+
+  let peer_ll = scoped(LINK_LOCAL, BOUND);
+  for (subnets, what) in [
+    (&DHCPV6_128[..], "a /128 link-local report"),
+    (&NO_LINK_LOCAL[..], "no link-local address at all"),
+    (&UNENUMERATED[..], "an enumeration that failed"),
+  ] {
+    assert!(
+      arm_two(peer_ll, nic(BOUND, subnets), witnessed(BOUND)),
+      "{what}: `fe80::/64` is on-link by the subnet model, not by assignment"
+    );
+    // Through the whole boundary, on §11's unicast arm: the destination is an
+    // address the interface holds — except on the unenumerated link, where the
+    // empty-snapshot fallback reaches the same source arm.
+    assert!(
+      admits_ingress(
+        peer_ll,
+        DestinationWitness::Witnessed(OUR_V6_ADDR),
+        None,
+        nic(BOUND, subnets),
+        witnessed(BOUND)
+      )
+      .is_admit(),
+      "{what}: a §11 unicast response from a link-local peer must be admitted"
+    );
+    // The square PR #88 made load-bearing: FreeBSD/DragonFly withheld the
+    // destination witness, so this datagram takes the source arm with no
+    // destination to help it.
+    assert!(
+      admits_ingress(
+        peer_ll,
+        DestinationWitness::Declined,
+        None,
+        nic(BOUND, subnets),
+        witnessed(BOUND)
+      )
+      .is_admit(),
+      "{what}: and the degraded square answers the same way"
+    );
+    // What the seed does NOT do: it is not a link opinion. A peer claiming a
+    // different link is still refused at stage 1 on every one of these links.
+    assert!(
+      !admits_ingress(
+        scoped(LINK_LOCAL, OTHER),
+        DestinationWitness::Witnessed(OUR_V6_ADDR),
+        None,
+        nic(BOUND, subnets),
+        witnessed(BOUND)
+      )
+      .is_admit(),
+      "{what}: stage 1 still decides which link, seed or no seed"
+    );
+    // Nor is it a family exemption: a GLOBAL IPv6 source outside every prefix
+    // this link carries is refused exactly as before.
+    assert!(
+      !admits_ingress(
+        peer(OFF_SUBNET_V6),
+        DestinationWitness::Witnessed(OUR_V6_ADDR),
+        None,
+        nic(BOUND, subnets),
+        witnessed(BOUND)
+      )
+      .is_admit(),
+      "{what}: the seed names one prefix and not a family"
+    );
+  }
+}
+
+/// The seed decides only once stage 1 has ESTABLISHED the link, and where it has
+/// not it falls THROUGH rather than refusing.
+///
+/// This is the one on-link prefix that is not specific to the bound interface.
+/// `192.168.1.0/24` is a prefix that interface reports, so matching it is §11's
+/// own *"apparently on a local subnet"* evidence — weak and forgeable, which the
+/// RFC knows — but it is evidence about THIS link. `fe80::/64` is on every link
+/// there has ever been, so matching it says the sender is on SOME link and
+/// nothing whatever about whether it is ours.
+///
+/// Consulted without provenance it would admit a datagram that arrived on
+/// another NIC of this same host on a blind or degraded path, purely for being
+/// link-local. RFC 4291's *"Routers must not forward any packets with Link-Local
+/// source or destination addresses to other links"* does not save that: no
+/// router is involved when a datagram is delivered to the wrong interface of the
+/// machine it reached.
+///
+/// # Fall-through, not refusal, and that is what keeps this a pure addition
+///
+/// On [`LinkProvenance::Unproven`] the collected comparison still runs, so an
+/// unprovenanced datagram decides exactly as it did before this prefix existed —
+/// including admitting a link-local peer when the interface's OWN enumerated
+/// `fe80::<iid>/64` covers it, which is the same-prefix residual this boundary
+/// has always carried and not the seed's doing. The gate can therefore only
+/// remove admissions the seed added; it can never remove one the collected list
+/// was already making.
+#[test]
+fn the_link_local_seed_needs_the_link_to_have_been_established() {
+  let peer_ll = peer(IpAddr::V6(LINK_LOCAL));
+  // The pair the whole gate is: same source, same link, same witness — only the
+  // provenance differs, and it is passed as a LITERAL so nothing here derives
+  // what it is testing. `SUBNETS` carries no link-local prefix, so the seed is
+  // the only thing that could admit.
+  assert!(
+    src_on_local_link(
+      peer_ll,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Blind,
+      LinkProvenance::Established
+    ),
+    "with the link established, `fe80::/64` is an on-link prefix of it"
+  );
+  assert!(
+    !src_on_local_link(
+      peer_ll,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Blind,
+      LinkProvenance::Unproven
+    ),
+    "a prefix that is on EVERY interface cannot stand in for knowing which \
+     interface this datagram arrived on"
+  );
+  // And the fall-through: with the interface's own link-local prefix enumerated,
+  // the unprovenanced datagram is admitted by the COLLECTED list exactly as it
+  // was before the seed existed. The gate subtracts nothing.
+  assert!(src_on_local_link(
+    peer_ll,
+    nic(BOUND, &LL_PREFIXES),
+    IfaceWitness::Blind,
+    LinkProvenance::Unproven
+  ));
+  // Through the whole boundary, on the square that produces `Unproven`: a blind
+  // path and a scope-less source, so nothing named the link. The destination is
+  // an address each link HOLDS, so only the source arm can decide.
+  for (subnets, dst, want, what) in [
+    (
+      &SUBNETS[..],
+      OUR_V6_ADDR,
+      false,
+      "no link-local prefix enumerated",
+    ),
+    (
+      &LL_PREFIXES[..],
+      LL_UNICAST_V6_DST,
+      true,
+      "the interface's own `fe80::/64`",
+    ),
+  ] {
+    assert_eq!(
+      admits_ingress(
+        peer_ll,
+        DestinationWitness::Witnessed(dst),
+        None,
+        nic(BOUND, subnets),
+        IfaceWitness::Blind
+      )
+      .is_admit(),
+      want,
+      "{what}: an unprovenanced link-local source decides on the collected \
+       list and on nothing else"
+    );
+  }
+  // The same datagram with a scope id naming our link IS provenanced — that is
+  // the shape every supported kernel actually produces for a link-local peer —
+  // so the seed decides and the enumeration stops mattering. This is the defect
+  // the seed exists for, and it survives the gate intact.
+  assert!(
+    admits_ingress(
+      scoped(LINK_LOCAL, BOUND),
+      DestinationWitness::Witnessed(OUR_V6_ADDR),
+      None,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Blind
+    )
+    .is_admit(),
+    "a scope id is provenance in its own right, and the seed then answers"
+  );
+}
+
+/// A bound interface of ZERO grants §11 arm one's exemption and does NOT feed
+/// the seed, because those are two different facts.
+///
+/// This is the `iface() == 0` hole, and this branch is what made it matter: on
+/// the base commit the source arm read only collected prefixes, so a zero could
+/// not admit anything by itself. Give the seed the same value arm one reads and
+/// it can — `BoundLink::new(0, false, <no link-local prefix>)` with a
+/// `fe80::1%7` source and a held destination went from `Refuse(SourceOffLink)`
+/// to `Admit(HeldDestination)`.
+///
+/// The distinction the type now draws:
+///
+/// * arm one needs *"nothing here can be foreign"*, and an endpoint that named
+///   no link satisfies that vacuously — withholding it would take arm one from
+///   every single-link caller forever in exchange for no scoping at all;
+/// * the seed needs *"this datagram arrived on OUR link"*, and a zero cannot
+///   supply it: `fe80::/64` is on every link, and a binding that names no link
+///   is the second absence, not a proof.
+///
+/// `Unbound` is those two facts kept apart. It also covers two callers this
+/// crate cannot tell apart — one structurally single-link, one that could not
+/// resolve an index — and gives both the conservative answer, because "I am
+/// single-link" is a guarantee no `BoundLink` can check, while "my interface is
+/// 7" is one any caller can simply state.
+#[test]
+fn a_bound_interface_of_zero_grants_arm_one_and_never_the_seed() {
+  const OURS: IpAddr = OUR_V6_ADDR;
+  // No link-local prefix enumerated, so the seed is the only thing that could
+  // admit this source.
+  let src = scoped(LINK_LOCAL, 7);
+  for iface in [IfaceWitness::Blind, IfaceWitness::Declined, witnessed(7)] {
+    assert_eq!(
+      admits_ingress(
+        src,
+        DestinationWitness::Witnessed(OURS),
+        None,
+        nic(0, &SUBNETS),
+        iface
+      ),
+      Verdict::Refuse(Refuse::SourceOffLink),
+      "a zero binding proves no link, so the seed must not answer for it \
+       ({iface:?})"
+    );
+  }
+  // Arm one is untouched, which is the whole reason `Unbound` is not `Unproven`:
+  // a single-link caller keeps §11's group arm on every one of those squares.
+  for iface in [IfaceWitness::Blind, IfaceWitness::Declined, witnessed(7)] {
+    assert_eq!(
+      admits_ingress(
+        src,
+        DestinationWitness::Witnessed(V6_GROUP),
+        None,
+        nic(0, &SUBNETS),
+        iface
+      ),
+      Verdict::Admit(Admit::MdnsGroup),
+      "an unbound endpoint can call no link foreign, so arm one still applies \
+       ({iface:?})"
+    );
+  }
+  // And the collected list still decides for it exactly as it did before the
+  // seed existed — the same fall-through `Unproven` gets.
+  assert!(
+    admits_ingress(
+      src,
+      DestinationWitness::Witnessed(LL_UNICAST_V6_DST),
+      None,
+      nic(0, &LL_PREFIXES),
+      IfaceWitness::Blind
+    )
+    .is_admit(),
+    "an unbound endpoint that DID enumerate `fe80::/64` admits on that prefix, \
+     which is the pre-seed rule and not the seed"
+  );
+}
+
+/// **KNOWN WRONG, pinned deliberately, and NOT this branch's to fix.**
+///
+/// `classify_unheld` names only `255.255.255.255` as a broadcast — a
+/// subnet-directed `192.168.1.255` and an operator-configured one need
+/// arithmetic over a prefix, which `is_bound_address` documents as wrong in
+/// three separate directions — so both stay in the `DestinationNotHeld`
+/// residual. The empty-snapshot arm defers that residual, so a link whose
+/// `local_addrs` are empty while its `onlink_prefixes` are not admits an
+/// in-prefix source to a directed broadcast as `Admit::UnenumeratedDestination`.
+///
+/// **Verified identical on the base commit** (`ae1504e`): both trees return
+/// `Admit(UnenumeratedDestination)` for the case below. This branch narrowed
+/// that arm — every class `classify_unheld` NAMES is now refused there rather
+/// than deferred — so it made the deferral set strictly smaller and left this
+/// case exactly where it found it. Recording it here rather than fixing it
+/// keeps the two separable: closing it means teaching the destination partition
+/// a broadcast it currently, and deliberately, does not compute.
+///
+/// The split-list constructor is what makes it reachable at all, since
+/// `BoundLink::new` aliases the two lists and an empty `local_addrs` therefore
+/// implies an empty `onlink_prefixes`. Nothing in this workspace calls it yet.
+#[test]
+fn a_directed_broadcast_survives_an_empty_snapshot_which_is_a_known_gap() {
+  static NO_LOCAL: [(IpAddr, u8); 0] = [];
+  static ONLINK: [(IpAddr, u8); 1] = [(OUR_V4_ADDR, 24u8)];
+  assert_eq!(
+    admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(DIRECTED_BROADCAST),
+      None,
+      BoundLink::with_onlink_prefixes(BOUND, false, &NO_LOCAL, &ONLINK),
+      witnessed(BOUND)
+    ),
+    Verdict::Admit(Admit::UnenumeratedDestination),
+    "KNOWN WRONG, pre-existing and identical on the base commit: the residual \
+     defers a directed broadcast because `classify_unheld` computes no such \
+     class. Fixing it flips this assertion to a refusal"
+  );
+  // What is NOT wrong, and what this branch did change: the classes the address
+  // settles are refused on the same link rather than deferred with it.
+  assert_eq!(
+    admits_ingress(
+      on_subnet(),
+      DestinationWitness::Witnessed(LIMITED_BROADCAST),
+      None,
+      BoundLink::with_onlink_prefixes(BOUND, false, &NO_LOCAL, &ONLINK),
+      witnessed(BOUND)
+    ),
+    Verdict::Refuse(Refuse::BroadcastAddressed),
+    "the limited broadcast IS named, so an empty snapshot no longer excuses it"
+  );
+}
+
+/// §11 arm one's withheld path cannot reach the seed, which is PR #88's square
+/// and the one this seed must not touch.
+///
+/// #88 established that the *"regardless of source IP address"* exemption is safe
+/// only when something scoped the datagram to the bound link, and routed the
+/// unscoped square to §11's source arm — where FreeBSD and DragonFly, which bind
+/// no `MSG_MCAST`, land. A seed consulted there would hand the exemption back
+/// under another name: every link-local sender would be admitted at a group
+/// destination that nothing scoped.
+///
+/// It cannot, and by construction rather than by care: `unscoped_group_arm` is
+/// selected BY [`LinkProvenance::Unproven`] and forwards that same value, so the
+/// gate is closed on every path into it.
+#[test]
+fn the_unscoped_group_path_cannot_reach_the_seed() {
+  // The FreeBSD/DragonFly square: our group witnessed, nothing scoped it, and no
+  // `MSG_MCAST` to fall back on. `SUBNETS` carries no link-local prefix, so an
+  // ungated seed would be the only thing that could admit — and #88's residual
+  // is exactly that this refuses.
+  assert_eq!(
+    admits_ingress(
+      peer(IpAddr::V6(LINK_LOCAL)),
+      DestinationWitness::Witnessed(V6_GROUP),
+      None,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Declined
+    ),
+    Verdict::Refuse(Refuse::UnscopedGroupSourceOffLink),
+    "the unscoped group square refuses an off-prefix sender, link-local or not \
+     — this is PR #88's residual and the seed must not spend it"
+  );
+  // Monotonicity, which is the other half of #88: where the kernel DOES report a
+  // multicast delivery (OpenBSD/NetBSD), the same square admits — on the flag,
+  // as `UnscopedMdnsGroup`, and still not on the seed.
+  assert_eq!(
+    admits_ingress(
+      peer(IpAddr::V6(LINK_LOCAL)),
+      DestinationWitness::Witnessed(V6_GROUP),
+      Some(LinkDelivery::Multicast),
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Declined
+    ),
+    Verdict::Admit(Admit::UnscopedMdnsGroup)
+  );
+  // And where something DID scope it, the datagram takes arm one itself. The
+  // seed is not consulted there either: arm one weighs no source at all.
+  assert_eq!(
+    admits_ingress(
+      scoped(LINK_LOCAL, BOUND),
+      DestinationWitness::Witnessed(V6_GROUP),
+      None,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Declined
+    ),
+    Verdict::Admit(Admit::MdnsGroup)
+  );
+  // The blind-delivery square below it is likewise untouched: no destination
+  // witness, no flag, an unprovenanced link-local source and no link-local
+  // prefix enumerated.
+  assert_eq!(
+    admits_ingress(
+      peer(IpAddr::V6(LINK_LOCAL)),
+      DestinationWitness::Declined,
+      None,
+      nic(BOUND, &SUBNETS),
+      IfaceWitness::Declined
+    ),
+    Verdict::Refuse(Refuse::SourceOffLink)
+  );
+}
+
+/// An empty snapshot excuses only the class the missing enumeration would have
+/// decided.
+///
+/// `collect_local_subnets` collapses a failed read to *nothing collected*, and
+/// that is ignorance about which addresses THIS HOST HOLDS. It is not ignorance
+/// about what an address IS. Deferring every witnessed destination conflated the
+/// two, and with a link-local source admitted by the seed the result was that a
+/// transient enumeration failure turned `ff02::1` — the all-nodes group, which
+/// §11 gives no arm and which no enumeration was ever consulted about — into
+/// protocol input on UDP/5353.
+///
+/// So the destination is classified first and only the residual defers. Every
+/// class below is settled by the address and the binding alone.
+#[test]
+fn an_empty_snapshot_refuses_the_destination_classes_it_can_still_decide() {
+  static NOTHING: [(IpAddr, u8); 0] = [];
+  // A source the arm WOULD admit, so nothing but the destination can refuse:
+  // link-local, scoped to our link, hence provenanced and covered by the seed.
+  let src = scoped(LINK_LOCAL, BOUND);
+  for (dst, want, what) in [
+    (FOREIGN_V6_GROUP, Refuse::ForeignGroup, "ff02::1:3"),
+    (FOREIGN_V4_GROUP, Refuse::ForeignGroup, "224.0.0.252"),
+    (
+      IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+      Refuse::ForeignGroup,
+      "ff02::1, the all-nodes group",
+    ),
+    (
+      LIMITED_BROADCAST,
+      Refuse::BroadcastAddressed,
+      "255.255.255.255",
+    ),
+    (
+      UNSPECIFIED_V6_DST,
+      Refuse::UnspecifiedDestination,
+      "the unspecified address",
+    ),
+    (
+      V4_MAPPED_GROUP_DST,
+      Refuse::Ipv4MappedDestination,
+      "::ffff:224.0.0.251",
+    ),
+    (
+      LOOPBACK_V4_ADDR,
+      Refuse::LoopbackDestinationOffLoopbackBinding,
+      "127.0.0.1 on a NIC-bound endpoint",
+    ),
+  ] {
+    assert_eq!(
+      admits_ingress(
+        src,
+        DestinationWitness::Witnessed(dst),
+        None,
+        nic(BOUND, &NOTHING),
+        witnessed(BOUND)
+      ),
+      Verdict::Refuse(want),
+      "{what}: a failed enumeration is not a reason to stop knowing what an \
+       address is"
+    );
+  }
+  // The residual, which is the only class the fallback is for: a syntactically
+  // unicast address whose ownership is exactly what could not be read. It still
+  // defers, so the fallback that keeps a loopback-bound endpoint hearing its own
+  // traffic is untouched.
+  assert!(
+    admits_ingress(
+      src,
+      DestinationWitness::Witnessed(NEIGHBOUR_V6_DST),
+      None,
+      nic(BOUND, &NOTHING),
+      witnessed(BOUND)
+    )
+    .is_admit(),
+    "the residual class still defers to the source arm"
+  );
+  assert!(
+    admits_ingress(
+      peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      lo(BOUND, &NOTHING),
+      IfaceWitness::Lost
+    )
+    .is_admit(),
+    "and a loopback-bound endpoint that could not enumerate still hears itself"
+  );
+  // The mDNS groups are decided one arm ABOVE this one and are untouched by it.
+  assert!(
+    admits_ingress(
+      src,
+      DestinationWitness::Witnessed(V6_GROUP),
+      None,
+      nic(BOUND, &NOTHING),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
+}
+
+/// The seed is `fe80::/64`, and the 54 bits between the type prefix and the
+/// interface identifier are load-bearing.
+///
+/// RFC 4291 §2.4's table names the link-local unicast TYPE `FE80::/10`, and a
+/// note that stops there would seed `/10`. §2.5.6 gives the address its format
+/// and fixes what follows the type bits:
+///
+/// ```text
+/// |   10     |
+/// |  bits    |         54 bits         |          64 bits           |
+/// +----------+-------------------------+----------------------------+
+/// |1111111010|           0             |       interface ID         |
+/// +----------+-------------------------+----------------------------+
+/// ```
+///
+/// Ten prefix bits and 54 zero bits are one fixed 64-bit value, so a conforming
+/// link-local address is exactly a member of `fe80::/64`. RFC 4862 §5.3 forms
+/// them the same way: the address is *"formed by combining the well-known
+/// link-local prefix FE80::0 \[RFC4291\] (of appropriate length) with an
+/// interface identifier"*, and *"the bits in the address to the right of the
+/// link-local prefix are set to all zeroes"* before the identifier replaces the
+/// rightmost N.
+///
+/// So a `/10` seed would answer ON-LINK for `fe80:1234::1` — an address no
+/// conforming stack autoconfigures or assigns — on 54 bits of claim the subnet
+/// model never makes. `/64` is both the correct width and the narrower one,
+/// which is the rare case where the two agree; this pins that the narrower one
+/// is what shipped.
+#[test]
+fn the_link_local_seed_is_the_64_bit_prefix_and_not_the_10_bit_block() {
+  let inside = scoped(LINK_LOCAL, BOUND);
+  let outside = scoped(MALFORMED_LINK_LOCAL, BOUND);
+  // Same scope, same witness, same link, same held destination: the ONLY
+  // difference is the 54 bits §2.5.6 requires to be zero.
+  assert!(arm_two(inside, nic(BOUND, &SUBNETS), witnessed(BOUND)));
+  assert!(!arm_two(outside, nic(BOUND, &SUBNETS), witnessed(BOUND)));
+  assert!(
+    admits_ingress(
+      inside,
+      DestinationWitness::Witnessed(OUR_V6_ADDR),
+      None,
+      nic(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
+  assert!(
+    !admits_ingress(
+      outside,
+      DestinationWitness::Witnessed(OUR_V6_ADDR),
+      None,
+      nic(BOUND, &SUBNETS),
+      witnessed(BOUND)
+    )
+    .is_admit(),
+    "a `/10` seed would admit this, and `fe80:1234::1` is not an address RFC \
+     4291 §2.5.6's format can produce"
+  );
+  // The boundary of the seed, walked from both sides at the bit that decides it.
+  // `fe80:0:0:1::` is the first address outside `fe80::/64` and inside
+  // `fe80::/10`; `fe80::ffff:ffff:ffff:ffff` is the last one inside.
+  let first_outside = scoped(Ipv6Addr::new(0xfe80, 0, 0, 1, 0, 0, 0, 0), BOUND);
+  let last_inside = scoped(
+    Ipv6Addr::new(0xfe80, 0, 0, 0, 0xffff, 0xffff, 0xffff, 0xffff),
+    BOUND,
+  );
+  assert!(arm_two(last_inside, nic(BOUND, &SUBNETS), witnessed(BOUND)));
+  assert!(!arm_two(
+    first_outside,
+    nic(BOUND, &SUBNETS),
+    witnessed(BOUND)
+  ));
+  // And the seed does not reach the other addresses that share `fe80::`'s first
+  // byte or its multicast neighbourhood: `ff02::fb` is a DESTINATION arm and
+  // never a source prefix, and `fec0::` (deprecated site-local) is outside both.
+  for stray in [
+    Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1),
+    Ipv6Addr::new(0xfe00, 0, 0, 0, 0, 0, 0, 1),
+    Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb),
+  ] {
+    assert!(
+      !arm_two(scoped(stray, BOUND), nic(BOUND, &SUBNETS), witnessed(BOUND)),
+      "{stray} is not in `fe80::/64`"
+    );
+  }
 }
 
 /// Each of [`BoundLink`]'s two lists is read by exactly one consumer, and this
@@ -3675,15 +4531,17 @@ fn a_snapshot_missing_one_family_fails_closed_for_that_family_only() {
 /// it defers to the source arm — the same reading `arrived_on_bound_interface`
 /// gives a bound interface of `0`.
 ///
-/// It is a fallback and not a fail-open, and this is the proof: with no prefixes
-/// to match, §11's source arm admits a loopback-BOUND endpoint's own traffic and
-/// refuses everything else, so the fallback cannot admit anything the source arm
-/// would not have. A STALE snapshot gets no such treatment — non-empty means the
-/// enumeration succeeded — and fails closed for at most `SUBNET_REFRESH_INTERVAL`.
+/// It is a fallback and not a fail-open, and this is the proof: with no
+/// collected prefixes to match, §11's source arm admits a loopback-BOUND
+/// endpoint's own traffic and an IPv6 source inside the seeded `fe80::/64`, and
+/// refuses everything else — so the fallback cannot admit anything the source
+/// arm would not have. A STALE snapshot gets no such treatment — non-empty means
+/// the enumeration succeeded — and fails closed for at most
+/// `SUBNET_REFRESH_INTERVAL`.
 #[test]
 fn an_empty_snapshot_defers_to_the_source_arm_which_still_fails_closed() {
-  // The whole of what the fallback admits: a loopback-bound endpoint's own
-  // traffic, to a destination nothing could have vouched for.
+  // The first of the two things the fallback admits: a loopback-bound
+  // endpoint's own traffic, to a destination nothing could have vouched for.
   for dst in [UNICAST_V4_DST, UNICAST_V6_DST, NEIGHBOUR_V4_DST] {
     assert!(
       admits_ingress(
@@ -3706,7 +4564,8 @@ fn an_empty_snapshot_defers_to_the_source_arm_which_still_fails_closed() {
     on_subnet(),
     peer(OFF_SUBNET_V4),
     peer(OFF_SUBNET_V6),
-    scoped(LINK_LOCAL, BOUND),
+    peer(IpAddr::V4(Ipv4Addr::new(169, 254, 3, 9))),
+    peer(IpAddr::V6(MALFORMED_LINK_LOCAL)),
   ] {
     assert!(
       !admits_ingress(
@@ -3720,6 +4579,37 @@ fn an_empty_snapshot_defers_to_the_source_arm_which_still_fails_closed() {
       "{src}: an empty snapshot admits nothing for a NIC-bound endpoint"
     );
   }
+  // The second and last thing it admits, and it is the SEEDED prefix rather than
+  // the snapshot: `fe80::/64` is on-link on every interface whether or not the
+  // enumeration that failed would have said so (RFC 5942 §3, RFC 4861's Prefix
+  // List). A failed enumeration is not evidence about the IPv6 subnet model, so
+  // it must not take link-local peers off the air. The refusals above are what
+  // keep this bound to two members — and `MALFORMED_LINK_LOCAL` is in that list
+  // because the seed is `/64` and not `/10`.
+  assert!(
+    admits_ingress(
+      scoped(LINK_LOCAL, BOUND),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      nic(BOUND, &[]),
+      witnessed(BOUND)
+    )
+    .is_admit(),
+    "a link-local peer is on-link by the subnet model, not by the snapshot"
+  );
+  // ... and stage 1 still bounds it, exactly as it bounds the loopback member:
+  // the same source claiming a different link is refused before the source arm
+  // is reached at all.
+  assert!(
+    !admits_ingress(
+      scoped(LINK_LOCAL, OTHER),
+      DestinationWitness::Witnessed(UNICAST_V4_DST),
+      None,
+      nic(BOUND, &[]),
+      witnessed(BOUND)
+    )
+    .is_admit()
+  );
   // A loopback SOURCE does not open it either, for an endpoint the loopback
   // interface is not the link of.
   assert!(
