@@ -1,11 +1,49 @@
-use super::rdata_for_identity;
-use crate::wire::{A, AAAA, Ptr, Rdata, Srv, Txt};
+use crate::{
+  error::ParseError,
+  wire::{Ref, ResourceClass, ResourceType},
+};
+
+/// Where [`record_bytes`] places the RDATA: the owner name `x.local.` (9
+/// octets) then type, class, TTL and RDLENGTH (10 more). Fixtures that need a
+/// compression pointer INTO the rdata compute their target from this.
+const RDATA_START: usize = 19;
+
+/// One resource record, owner `x.local.`, ready for [`Ref::try_parse`] at
+/// offset 0.
+fn record_bytes(rtype: ResourceType, rdata: &[u8]) -> std::vec::Vec<u8> {
+  let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in [b"x".as_slice(), b"local"] {
+    msg.push(u8::try_from(label.len()).unwrap());
+    msg.extend_from_slice(label);
+  }
+  msg.push(0u8); // owner root
+  msg.extend_from_slice(&rtype.to_u16().to_be_bytes());
+  msg.extend_from_slice(&ResourceClass::In.to_u16().to_be_bytes());
+  msg.extend_from_slice(&120u32.to_be_bytes());
+  msg.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+  assert_eq!(msg.len(), RDATA_START, "RDATA_START must track this layout");
+  msg.extend_from_slice(rdata);
+  msg
+}
+
+/// A record's IDENTITY bytes — `Ref::canonical_rdata_folded`, the ONE decoder
+/// under `RdataForm::FOLDED`, which is what §7.1 known-answer suppression and
+/// the §9 identical-rdata screen compare over.
+///
+/// Taken from a parsed `Ref` rather than from an `Rdata` view, because the view
+/// is not where the failures are: `NameRef::try_parse` accepts a compression
+/// pointer without following it, so `rdata_view` succeeds on a record whose
+/// embedded name is a cycle and only the decode below discovers it.
+fn identity_of(rtype: ResourceType, rdata: &[u8]) -> Result<std::vec::Vec<u8>, ParseError> {
+  let msg = record_bytes(rtype, rdata);
+  let (rec, _next) = Ref::try_parse(&msg, 0).unwrap();
+  assert_eq!(rec.rtype(), rtype);
+  rec.canonical_rdata_folded().map(|b| b.to_vec())
+}
 
 #[test]
 fn canonical_a_is_4_bytes() {
-  let a = A::try_from_rdata(&[192, 168, 1, 10]).unwrap();
-  let mut scratch = std::vec::Vec::new();
-  let out = rdata_for_identity(&Rdata::A(a), &mut scratch).unwrap();
+  let out = identity_of(ResourceType::A, &[192, 168, 1, 10]).unwrap();
   assert_eq!(out, [192u8, 168, 1, 10].as_slice());
 }
 
@@ -67,10 +105,7 @@ fn write_announce_filtered_reports_emitted_groups() {
 fn canonical_aaaa_is_16_bytes() {
   use core::net::Ipv6Addr;
   let addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-  let rdata = addr.octets();
-  let rec = AAAA::try_from_rdata(&rdata).unwrap();
-  let mut scratch = std::vec::Vec::new();
-  let out = rdata_for_identity(&Rdata::AAAA(rec), &mut scratch).unwrap();
+  let out = identity_of(ResourceType::AAAA, &addr.octets()).unwrap();
   assert_eq!(out.len(), 16);
   assert_eq!(out, &addr.octets());
 }
@@ -79,9 +114,7 @@ fn canonical_aaaa_is_16_bytes() {
 fn canonical_txt_roundtrips_wire_form() {
   // Wire form: 0x07 "key=val" 0x01 "x"
   let raw: &[u8] = &[7, b'k', b'e', b'y', b'=', b'v', b'a', b'l', 1, b'x'];
-  let txt = Txt::from_rdata(raw);
-  let mut scratch = std::vec::Vec::new();
-  let out = rdata_for_identity(&Rdata::Txt(txt), &mut scratch).unwrap();
+  let out = identity_of(ResourceType::Txt, raw).unwrap();
   assert_eq!(out, raw, "canonical TXT must match wire bytes verbatim");
 }
 
@@ -89,30 +122,27 @@ fn canonical_txt_roundtrips_wire_form() {
 fn canonical_txt_malformed_segment_returns_err() {
   // Segment claims 10 bytes but only 2 follow — should return Err, not silently truncate.
   let raw: &[u8] = &[10, b'a', b'b'];
-  let txt = Txt::from_rdata(raw);
-  let mut scratch = std::vec::Vec::new();
   assert!(
-    rdata_for_identity(&Rdata::Txt(txt), &mut scratch).is_err(),
+    identity_of(ResourceType::Txt, raw).is_err(),
     "malformed TXT segment must produce an Err"
   );
 }
 
+/// PTR identity is the target in case-folded WIRE form — length-octet, label
+/// bytes, root terminator. It was dot-joined bytes with no length prefixes, a
+/// form that is both unmatched by the one decoder and ambiguous: labels
+/// `["a.b"]` and `["a", "b"]` join to the same string.
 #[test]
-fn canonical_ptr_is_lowercase_dotted_labels() {
-  // Build a minimal DNS message containing the PTR rdata "MyPrinter._ipp._tcp.local."
-  // as uncompressed length-prefixed labels so Ptr can parse it.
-  let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
-  for label in &[b"MyPrinter".as_slice(), b"_ipp", b"_tcp", b"local"] {
-    msg.push(label.len() as u8);
-    msg.extend_from_slice(label);
+fn canonical_ptr_is_lowercase_wire_form_labels() {
+  let mut rdata: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in [b"MyPrinter".as_slice(), b"_ipp", b"_tcp", b"local"] {
+    rdata.push(u8::try_from(label.len()).unwrap());
+    rdata.extend_from_slice(label);
   }
-  msg.push(0u8); // root label
-  let rdata_len = msg.len();
-  let ptr = Ptr::try_from_message(&msg, 0, rdata_len).unwrap();
-  let mut scratch = std::vec::Vec::new();
-  let out = rdata_for_identity(&Rdata::Ptr(ptr), &mut scratch).unwrap();
-  // Expected: "myprinter._ipp._tcp.local" (lowercase, dot-separated, no trailing dot)
-  assert_eq!(out, b"myprinter._ipp._tcp.local".as_slice());
+  rdata.push(0u8); // root label
+  let out = identity_of(ResourceType::Ptr, &rdata).unwrap();
+  let expected: &[u8] = b"\x09myprinter\x04_ipp\x04_tcp\x05local\x00";
+  assert_eq!(out, expected);
 }
 
 #[test]
@@ -124,13 +154,14 @@ fn canonical_ptr_forward_pointer_returns_err() {
   // malformed peer-supplied name that the old `.flatten()` would silently
   // swallow, producing an empty hash.
   //
-  // Layout: [ 0xC0, 0x00 ]  — a pointer at offset 0 that targets offset 0.
-  // target (0) >= cursor (0) → PointerForward error during label iteration.
-  let msg: std::vec::Vec<u8> = std::vec![0xC0u8, 0x00];
-  let ptr = Ptr::try_from_message(&msg, 0, msg.len()).unwrap();
-  let mut scratch = std::vec::Vec::new();
+  // A pointer that targets its own offset: target >= cursor → PointerForward
+  // during label iteration.
+  let rdata = std::vec![
+    0xC0u8 | u8::try_from(RDATA_START >> 8).unwrap(),
+    u8::try_from(RDATA_START & 0xFF).unwrap(),
+  ];
   assert!(
-    rdata_for_identity(&Rdata::Ptr(ptr), &mut scratch).is_err(),
+    identity_of(ResourceType::Ptr, &rdata).is_err(),
     "forward compression pointer in PTR target must produce an Err"
   );
 }
@@ -138,19 +169,16 @@ fn canonical_ptr_forward_pointer_returns_err() {
 #[test]
 fn canonical_srv_starts_with_priority_weight_port() {
   // Build SRV rdata: priority=0, weight=0, port=631, target="printer.local."
-  let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
-  msg.extend_from_slice(&0u16.to_be_bytes()); // priority
-  msg.extend_from_slice(&0u16.to_be_bytes()); // weight
-  msg.extend_from_slice(&631u16.to_be_bytes()); // port
-  for label in &[b"printer".as_slice(), b"local"] {
-    msg.push(label.len() as u8);
-    msg.extend_from_slice(label);
+  let mut rdata: std::vec::Vec<u8> = std::vec::Vec::new();
+  rdata.extend_from_slice(&0u16.to_be_bytes()); // priority
+  rdata.extend_from_slice(&0u16.to_be_bytes()); // weight
+  rdata.extend_from_slice(&631u16.to_be_bytes()); // port
+  for label in [b"printer".as_slice(), b"local"] {
+    rdata.push(u8::try_from(label.len()).unwrap());
+    rdata.extend_from_slice(label);
   }
-  msg.push(0u8); // root
-  let rdata_len = msg.len();
-  let srv = Srv::try_from_message(&msg, 0, rdata_len).unwrap();
-  let mut scratch = std::vec::Vec::new();
-  let out = rdata_for_identity(&Rdata::Srv(srv), &mut scratch).unwrap();
+  rdata.push(0u8); // root
+  let out = identity_of(ResourceType::Srv, &rdata).unwrap();
   // First 6 bytes: priority(0,0) weight(0,0) port(2,119 = 631 big-endian)
   assert_eq!(&out[..2], &0u16.to_be_bytes()); // priority
   assert_eq!(&out[2..4], &0u16.to_be_bytes()); // weight
@@ -415,85 +443,37 @@ fn nsec_omitted_when_it_does_not_fit_but_answers_still_send() {
 }
 
 /// CNAME rdata is one domain name (RFC 1035 §3.3.1), structurally identical to
-/// PTR — `rdata_for_identity` must case-fold it to dot-joined lowercase
-/// labels with no length prefixes and no trailing dot, exactly like PTR. mDNS-SD
-/// never emits CNAME, so the only way to obtain one is to parse it off the wire;
-/// build a single CNAME resource record by hand and take its `rdata_view`.
+/// PTR — its identity form is the same case-folded wire-form name. mDNS-SD never
+/// emits CNAME, so the only way to obtain one is to parse it off the wire.
 #[test]
-fn canonical_cname_is_lowercase_dotted_labels() {
-  use crate::wire::{Rdata, Ref, ResourceClass, ResourceType};
-
-  // Owner name "x.local." then type=CNAME(5), class=IN(1), ttl=120, RDLENGTH,
-  // and the CNAME target "Target.Local." as uncompressed length-prefixed labels.
-  let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
-  for label in &[b"x".as_slice(), b"local"] {
-    msg.push(label.len() as u8);
-    msg.extend_from_slice(label);
-  }
-  msg.push(0u8); // owner root
-  msg.extend_from_slice(&ResourceType::Cname.to_u16().to_be_bytes());
-  msg.extend_from_slice(&ResourceClass::In.to_u16().to_be_bytes());
-  msg.extend_from_slice(&120u32.to_be_bytes()); // ttl
-  // Encode the rdata (the target name) into a scratch buffer to learn RDLENGTH.
+fn canonical_cname_is_lowercase_wire_form_labels() {
   let mut rdata: std::vec::Vec<u8> = std::vec::Vec::new();
-  for label in &[b"Target".as_slice(), b"Local"] {
-    rdata.push(label.len() as u8);
+  for label in [b"Target".as_slice(), b"Local"] {
+    rdata.push(u8::try_from(label.len()).unwrap());
     rdata.extend_from_slice(label);
   }
   rdata.push(0u8); // target root
-  msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes()); // RDLENGTH
-  msg.extend_from_slice(&rdata);
-
-  let (rec, _next) = Ref::try_parse(&msg, 0).unwrap();
-  assert_eq!(rec.rtype(), ResourceType::Cname);
-  let Rdata::Cname(_) = rec.rdata_view().unwrap() else {
-    panic!("record must parse as CNAME rdata");
-  };
-  let view = rec.rdata_view().unwrap();
-  let mut scratch = std::vec::Vec::new();
-  let out = rdata_for_identity(&view, &mut scratch).unwrap();
-  // PTR-style canonical form: lowercase, dot-separated, no trailing dot.
-  assert_eq!(out, b"target.local".as_slice());
+  let out = identity_of(ResourceType::Cname, &rdata).unwrap();
+  assert_eq!(out, b"\x06target\x05local\x00".as_slice());
 }
 
 /// A CNAME whose rdata target is a forward compression pointer must surface the
-/// label-iteration error from `rdata_for_identity` (the CNAME arm hashes
-/// the target via `write_canonical_name`, which propagates `ParseError`), never
-/// a silent empty hash.
+/// label-iteration error, never a silent empty hash.
+///
+/// `NameRef::try_parse` accepts the pointer — both its bytes exist — so
+/// `rdata_view` succeeds and only writing the name out walks the labels and
+/// fails. That is exactly why the decode, not the view, is what every consumer
+/// of this record has to agree about.
 #[test]
 fn canonical_cname_forward_pointer_returns_err() {
-  use crate::wire::{Rdata, Ref, ResourceClass, ResourceType};
-
-  // Owner "x." (single root-terminated label), CNAME header, then a 2-byte
-  // rdata that is a compression pointer targeting offset 0 (forward → invalid).
-  let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
-  msg.push(1u8);
-  msg.push(b'x');
-  msg.push(0u8); // owner root
-  msg.extend_from_slice(&ResourceType::Cname.to_u16().to_be_bytes());
-  msg.extend_from_slice(&ResourceClass::In.to_u16().to_be_bytes());
-  msg.extend_from_slice(&120u32.to_be_bytes());
-  msg.extend_from_slice(&2u16.to_be_bytes()); // RDLENGTH = 2 (a pointer)
-  let rdata_start = msg.len();
   // A self-referential pointer: it targets its own offset, so target >= cursor
-  // → `ParseError::PointerForward` on label iteration. NameRef::try_parse still
-  // accepts it (both pointer bytes exist); the error only surfaces when
-  // `write_canonical_name` walks the labels.
+  // → `ParseError::PointerForward` on label iteration.
+  let rdata = std::vec![
+    0xC0u8 | u8::try_from(RDATA_START >> 8).unwrap(),
+    u8::try_from(RDATA_START & 0xFF).unwrap(),
+  ];
   assert!(
-    rdata_start < 0x40,
-    "pointer offset must fit a single high-bit byte"
-  );
-  msg.push(0xC0 | (rdata_start >> 8) as u8);
-  msg.push((rdata_start & 0xFF) as u8);
-
-  let (rec, _next) = Ref::try_parse(&msg, 0).unwrap();
-  let Rdata::Cname(_) = rec.rdata_view().unwrap() else {
-    panic!("record must parse as CNAME rdata");
-  };
-  let view = rec.rdata_view().unwrap();
-  let mut scratch = std::vec::Vec::new();
-  assert!(
-    rdata_for_identity(&view, &mut scratch).is_err(),
+    identity_of(ResourceType::Cname, &rdata).is_err(),
     "forward compression pointer in CNAME target must produce an Err"
   );
 }
@@ -679,4 +659,63 @@ fn write_announce_filtered_propagates_encode_error_at_every_boundary() {
   assert_truncation_safe_at_every_boundary(n_full, |buf| {
     super::write_announce_filtered(&recs, buf, |_, _| false).map(|(n, _)| n)
   });
+}
+
+/// RFC 6762 §7.1 known-answer suppression compares HASHES of two byte strings
+/// built by different code: `write_announce_filtered` derives one from our own
+/// `ServiceRecords`, and `Service::handle_event` derives the other from the
+/// querier's record with `Ref::canonical_rdata_folded`. A disagreement is
+/// SILENT — the hint simply never matches and nothing is ever suppressed.
+///
+/// SRV was broken that way once (dot-joined bytes against wire form), and PTR
+/// was broken the same way until its producer moved to wire form here. So the
+/// pairing is pinned rather than commented: every record the filter offers must
+/// be offered in exactly the bytes the decoder yields for that same record
+/// coming back off the wire.
+#[test]
+fn the_kas_filter_offers_the_bytes_the_identity_decoder_yields() {
+  use crate::{Name, records::ServiceRecords, wire::MessageReader};
+
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("MyPrinter._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("Host.local.").unwrap(),
+    631,
+    120,
+  );
+  recs.add_a(core::net::Ipv4Addr::new(192, 168, 1, 1));
+  recs.add_aaaa(core::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+
+  // Suppress nothing, but record what each candidate was offered as.
+  let mut offered: std::vec::Vec<(ResourceType, std::vec::Vec<u8>)> = std::vec::Vec::new();
+  let mut buf = [0u8; 1500];
+  let (n, _) = super::write_announce_filtered(&recs, &mut buf, |rtype, rdata| {
+    offered.push((rtype, rdata.to_vec()));
+    false
+  })
+  .unwrap();
+  assert!(
+    offered
+      .iter()
+      .any(|(rtype, _)| *rtype == ResourceType::Ptr),
+    "precondition: the PTR candidate really is KAS-filtered"
+  );
+
+  let msg = MessageReader::try_parse(buf.get(..n).unwrap()).unwrap();
+  let mut checked = 0usize;
+  for rr in msg.answers().flatten() {
+    let identity = rr.canonical_rdata_folded().unwrap();
+    assert!(
+      offered
+        .iter()
+        .any(|(rtype, bytes)| *rtype == rr.rtype() && bytes.as_slice() == &*identity),
+      "a {:?} answer canonicalizes to {:?}, which is not among the byte strings \
+       the filter was offered ({offered:?}) — a hint for this record could \
+       never suppress it",
+      rr.rtype(),
+      &*identity
+    );
+    checked = checked.saturating_add(1);
+  }
+  assert!(checked >= 4, "PTR, SRV, TXT and the addresses must all be checked");
 }

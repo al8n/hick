@@ -135,40 +135,228 @@ fn canonical_rdata_folds_case_but_preserved_form_does_not() {
   assert_eq!(rec.canonical_rdata_folded().unwrap(), folded_expected);
 }
 
+/// RFC 6762 §18.14's list decides this, and BOTH answers are a "yes": a listed
+/// type is decompressed, an unlisted one is copied verbatim. Neither is dropped.
+///
+/// A revision dropped both — every name-bearing type this crate does not parse,
+/// on the reasoning that a raw copy of it "MAY arrive compressed". §18.14 says
+/// otherwise for the unlisted ones ("names that appear within the rdata of any
+/// type not listed above MUST NOT be compressed"), and for the LISTED ones the
+/// answer is to decompress rather than to discard: RP, AFSDB, RT, PX and KX are
+/// all on §18.14's list, all decodable by the one generic layout decoder, and
+/// all were being thrown away by the query and cache paths.
 #[test]
-fn canonical_rdata_rejects_unhandled_name_bearing_type() {
-  // a well-known compressible name-bearing type we don't parse
-  // (NS = 2) maps to Unknown; its rdata (a possibly-compressed name) can't be
-  // canonicalized, so canonical_rdata must drop it rather than store
-  // compression/case-sensitive bytes. Here the NS target is a pointer.
-  let rdata = [0xC0, 0x0C];
-  let msg = message_with_pointered_record(2 /* NS */, &rdata);
+fn canonical_rdata_decompresses_listed_types_and_copies_unlisted_ones_verbatim() {
+  // ── on §18.14's list: the embedded names are decompressed in place ──
+  //
+  // NS(2) is `(lead 0, names 1)` — the whole rdata is one name.
+  let msg = message_with_pointered_record(2 /* NS */, &[0xC0, 0x0C]);
+  let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+  assert_eq!(
+    rec.canonical_rdata().unwrap(),
+    std::vec::Vec::from(SVC_LOCAL_WIRE),
+    "NS is on §18.14's list, so its name is decompressed — not dropped"
+  );
+
+  // `(lead 2, names 1)` — a 16-bit preference, then a name: MX, AFSDB, RT, KX.
+  for rtype in [15u16, 18, 21, 36] {
+    let msg = message_with_pointered_record(rtype, &[0x00, 0x0A, 0xC0, 0x0C]);
+    let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+    let mut expected = std::vec::Vec::from(&[0x00u8, 0x0A][..]);
+    expected.extend_from_slice(SVC_LOCAL_WIRE);
+    assert_eq!(
+      rec.canonical_rdata().unwrap(),
+      expected,
+      "rtype {rtype} is preference + one name, and every one of these was \
+       dropped outright"
+    );
+  }
+
+  // `(lead 0, names 2)` — RP. (SOA is the same shape with a name-free
+  // remainder, covered by its own case below.)
+  let msg = message_with_pointered_record(17 /* RP */, &[0xC0, 0x0C, 0xC0, 0x0C]);
+  let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+  let mut expected = std::vec::Vec::from(SVC_LOCAL_WIRE);
+  expected.extend_from_slice(SVC_LOCAL_WIRE);
+  assert_eq!(rec.canonical_rdata().unwrap(), expected, "RP is two names");
+
+  // SOA(6): two names, then 20 octets of timers that carry no name and are
+  // therefore self-contained as sent.
+  let mut soa = std::vec::Vec::from(&[0xC0u8, 0x0C, 0xC0, 0x0C][..]);
+  soa.extend_from_slice(&[0xAB; 20]);
+  let msg = message_with_pointered_record(6 /* SOA */, &soa);
+  let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+  let mut expected = std::vec::Vec::from(SVC_LOCAL_WIRE);
+  expected.extend_from_slice(SVC_LOCAL_WIRE);
+  expected.extend_from_slice(&[0xAB; 20]);
+  assert_eq!(
+    rec.canonical_rdata().unwrap(),
+    expected,
+    "SOA's timers are the name-free remainder after its two names"
+  );
+
+  // `(lead 2, names 2)` — PX.
+  let msg = message_with_pointered_record(26 /* PX */, &[0x00, 0x0A, 0xC0, 0x0C, 0xC0, 0x0C]);
+  let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+  let mut expected = std::vec::Vec::from(&[0x00u8, 0x0A][..]);
+  expected.extend_from_slice(SVC_LOCAL_WIRE);
+  expected.extend_from_slice(SVC_LOCAL_WIRE);
+  assert_eq!(
+    rec.canonical_rdata().unwrap(),
+    expected,
+    "PX is pref + 2 names"
+  );
+
+  // ── absent from §18.14: copied verbatim, whatever the octets are ──
+  //
+  // A genuinely-unknown private type, including one holding pointer syntax as
+  // ordinary data.
+  let opaque = [0x01u8, 0x02, 0x03];
+  let msg = message_with_pointered_record(64, &opaque);
+  let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+  assert_eq!(
+    rec.canonical_rdata().unwrap(),
+    std::vec::Vec::from(&opaque[..])
+  );
+
+  // SIG(24), NXT(30), NAPTR(35), A6(38) — RFC 3597 §4 explicitly UPDATED RFC
+  // 2535 to forbid the compression SIG and NXT once allowed, and §18.14 does not
+  // list any of them. Their absence is a decision, not our ignorance, so their
+  // bytes are self-contained and comparable. MD(3), MF(4), MB(7), MG(8), MR(9)
+  // and MINFO(14) are unlisted for the same reason.
+  for rtype in [24u16, 30, 35, 38, 3, 4, 7, 8, 9, 14] {
+    let raw = [0xC0u8, 0x0C, 0x77];
+    let msg = message_with_pointered_record(rtype, &raw);
+    let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+    assert_eq!(
+      rec.canonical_rdata().unwrap(),
+      std::vec::Vec::from(&raw[..]),
+      "rtype {rtype} is absent from §18.14, so its rdata is copied verbatim"
+    );
+  }
+
+  // ── decompressing is not accepting anything ──
+  //
+  // A listed type whose name will not resolve still fails, so the caller drops
+  // the record rather than storing bytes nobody could read. The record's rdata
+  // begins at offset 35, so a pointer to 35 targets itself.
+  let msg = message_with_pointered_record(2 /* NS */, &[0xC0, 35]);
+  let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+  assert!(
+    rec.canonical_rdata().is_err(),
+    "a compressed name that cannot be resolved has no canonical form"
+  );
+
+  // A fixed prefix that does not fit inside RDLENGTH at all: AFSDB is
+  // `(lead 2, names 1)` and this record declares one octet of rdata.
+  let msg = message_with_pointered_record(18 /* AFSDB */, &[0x00]);
+  let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+  assert!(
+    matches!(
+      rec.canonical_rdata(),
+      Err(ParseError::UnsupportedNameBearingType(18))
+    ),
+    "a fixed prefix longer than the whole rdata is malformed"
+  );
+
+  // And a name that PARSES but runs past the record's own RDLENGTH: an NS whose
+  // RDLENGTH claims one octet while a full uncompressed name follows. The
+  // remainder after such a name would be nonsense, so it fails rather than
+  // comparing it.
+  let mut msg = message_with_pointered_record(2 /* NS */, SVC_LOCAL_WIRE);
+  // Rewrite RDLENGTH (offset 33..35) to 1, leaving the name bytes in place.
+  msg[33] = 0;
+  msg[34] = 1;
   let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
   assert!(
     matches!(
       rec.canonical_rdata(),
       Err(ParseError::UnsupportedNameBearingType(2))
     ),
-    "NS must be dropped as an unsupported name-bearing type"
+    "a name overrunning its RDLENGTH is not decodable"
   );
-  // A genuinely-unknown opaque type (e.g. 64) is stored verbatim (RFC 3597
-  // §4: such types are never compressed).
-  let opaque = [0x01, 0x02, 0x03];
-  let msg2 = message_with_pointered_record(64, &opaque);
-  let (rec2, _) = Ref::try_parse(&msg2, 23).unwrap();
-  assert_eq!(
-    rec2.canonical_rdata().unwrap(),
-    std::vec::Vec::from(&opaque[..])
-  );
+}
 
-  // MINFO (14) is another RFC 1035 compressible name-bearing type
-  // we don't parse — it must be dropped too, not just NS/SOA/MX/DNAME.
-  let msg3 = message_with_pointered_record(14 /* MINFO */, &[0xC0, 0x0C]);
-  let (rec3, _) = Ref::try_parse(&msg3, 23).unwrap();
-  assert!(matches!(
-    rec3.canonical_rdata(),
-    Err(ParseError::UnsupportedNameBearingType(14))
-  ));
+/// THE property the one decoder exists for: the three [`RdataForm`]s differ in
+/// NORMALISATION only. Whether a record decodes at all is not a per-consumer
+/// answer.
+///
+/// It was one, and the divergence renamed services. The identity form raw-copied
+/// unparsed rdata and dropped NSEC's `next_name`, so it never failed on either,
+/// while the §8.2 form decompressed both and did. The same bytes therefore
+/// answered "unreadable, decide nothing" on the §8.2 path and "differing rdata"
+/// on the identity path — and differing rdata at a name a service is probing is
+/// an RFC 6762 §8.1 defeat. One malformed IN/NS response, needing no knowledge of
+/// the victim's records, was enough.
+///
+/// Note how many of these get past `rdata_view`. `NameRef::try_parse` accepts a
+/// compression pointer without following it, so SRV and NSEC records whose
+/// embedded name is a cycle PARSE, and only the decode below discovers them.
+#[test]
+fn every_form_agrees_about_which_records_decode() {
+  // The rdata of a record built by `message_with_pointered_record` starts here,
+  // so a pointer to this offset targets itself: forward, and unresolvable.
+  const SELF: u8 = 35;
+
+  let cases: &[(&str, u16, &[u8], bool)] = &[
+    (
+      "an opaque type holding pointer syntax as data",
+      64000,
+      &[0xC0, 0x0C, 0x01],
+      true,
+    ),
+    (
+      "NS whose name is a resolvable pointer",
+      2,
+      &[0xC0, 0x0C],
+      true,
+    ),
+    (
+      "NS whose name is an unresolvable pointer",
+      2,
+      &[0xC0, SELF],
+      false,
+    ),
+    (
+      "SRV whose target is an unresolvable pointer — `rdata_view` succeeds",
+      33,
+      &[0, 10, 0, 20, 0x1F, 0x90, 0xC0, SELF + 6],
+      false,
+    ),
+    (
+      "NSEC whose next_name is an unresolvable pointer — `rdata_view` succeeds",
+      47,
+      &[0xC0, SELF, 0, 1, 0x40],
+      false,
+    ),
+    (
+      "TXT whose length octet overruns its rdata",
+      16,
+      &[10, b'a', b'b'],
+      false,
+    ),
+  ];
+
+  for &(what, rtype, rdata, expected) in cases {
+    let msg = message_with_pointered_record(rtype, rdata);
+    let (rec, _) = Ref::try_parse(&msg, 23).unwrap();
+    let mut scratch = std::vec::Vec::new();
+    let as_sent = rec
+      .write_canonical_rdata(RdataForm::AS_SENT, &mut scratch)
+      .is_ok();
+    assert_eq!(as_sent, expected, "{what}: §8.2's form");
+    assert_eq!(
+      rec.canonical_rdata().is_ok(),
+      expected,
+      "{what}: the case-preserving form must agree with §8.2's"
+    );
+    assert_eq!(
+      rec.canonical_rdata_folded().is_ok(),
+      expected,
+      "{what}: the identity form must agree with §8.2's — a record that is \
+       undecodable for one consumer is undecodable for every consumer"
+    );
+  }
 }
 
 #[test]

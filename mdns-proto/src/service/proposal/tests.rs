@@ -1,9 +1,9 @@
-//! Unit tests for the §8.2 serializers that are private to this module.
+//! Unit tests for the §8.2 fold and for the peer-side bytes it compares.
 //!
-//! They live here because `rdata_for_tiebreak` and `write_wire_name_preserving_case`
-//! are private — which is the point of the module — so nothing outside it can
-//! test them directly. The behaviour a caller CAN reach is tested through
-//! `Service` in `service::tests`.
+//! They live here because nothing outside this module chooses an [`RdataForm`]
+//! for §8.2 — that seal is the point of the module — so the `AS_SENT` rendering
+//! of a peer record is only reachable from in here. The behaviour a caller CAN
+//! reach is tested through `Service` in `service::tests`.
 
 use super::*;
 
@@ -11,11 +11,9 @@ use super::*;
 fn tiebreak_bytes_of(msg: &[u8]) -> std::vec::Vec<u8> {
   let reader = crate::wire::MessageReader::try_parse(msg).unwrap();
   let rec = reader.additional().flatten().next().unwrap();
-  let view = rec.rdata_view().unwrap();
-  let mut scratch = std::vec::Vec::new();
-  rdata_for_tiebreak(rec.rtype(), &view, &mut scratch)
-    .unwrap()
-    .to_vec()
+  let mut out = std::vec::Vec::new();
+  rec.write_canonical_rdata(RdataForm::AS_SENT, &mut out).unwrap();
+  out
 }
 
 fn nsec_message(owner: &str) -> std::vec::Vec<u8> {
@@ -41,9 +39,9 @@ fn an_nsecs_tiebreak_bytes_carry_its_next_name() {
   );
 }
 
-/// The peer's bytes are compared AS SENT — case included. This is the difference
-/// from `respond::rdata_for_identity`, and the whole reason the two functions
-/// exist separately.
+/// The peer's bytes are compared AS SENT — case included. That is the whole
+/// difference between `RdataForm::AS_SENT` and `RdataForm::FOLDED`, and the
+/// reason the §8.2 path may not reach for the identity form.
 #[test]
 fn a_peers_case_survives_into_the_tiebreak_bytes() {
   let build = |target: &str| {
@@ -81,54 +79,147 @@ fn a_peers_case_survives_into_the_tiebreak_bytes() {
   );
 }
 
-/// Rdata this crate does not parse has comparison bytes exactly when those bytes
-/// cannot move with the packet — decided by the BYTES, not by a list of types.
+/// Whether unparsed rdata has comparison bytes is a per-TYPE question, and the
+/// answer is never inferred from the bytes.
 ///
-/// R11 found the list incomplete: it omitted RP(17), AFSDB(18), RT(21), PX(26)
-/// and KX(36), all compression-eligible, so a KX with a cyclic or truncated
-/// compressed target produced comparison bytes instead of an error. With
-/// otherwise identical SRV and TXT the extra element made the peer's list
-/// longer, §8.2.1 handed it the win, and repeating the packet could defer this
-/// host indefinitely.
-///
-/// The replacement cannot be incomplete, because it names no types at all. It is
-/// also strictly more accurate in BOTH directions, which the two halves below
-/// pin: a compressed record of ANY unparsed type is refused, and an UNCOMPRESSED
-/// one of a formerly-listed type now compares correctly where the list refused
-/// it outright.
+/// R12 found the byte-sniffing predicate that briefly stood here wrong in both
+/// directions, and the severe one is the first case below: pointer syntax is
+/// meaningful only inside a field the type DEFINES as a name, so an opaque RR
+/// may validly contain `0xC0`. Refusing it meant the peer compared that record
+/// correctly and won while we abandoned and kept probing — BOTH then claimed
+/// the name. The enumeration is the honest encoding, and RFC 3597 §4 closed it
+/// in 2003, so it is a finite historical set rather than a moving target.
 #[test]
-fn comparability_of_unparsed_rdata_is_decided_by_the_bytes() {
-  let mut scratch = std::vec::Vec::new();
-  // Every type the old list named, every type it MISSED, and a genuinely unknown
-  // one: rdata that could hold a compression pointer has no comparison bytes.
-  let compressed = Rdata::Other(&[0xC0, 0x0C]);
-  for raw in [2u16, 6, 15, 39, 17, 18, 21, 26, 36, 64000] {
-    assert!(
-      rdata_for_tiebreak(
-        crate::wire::ResourceType::from_u16(raw),
-        &compressed,
-        &mut scratch
-      )
-      .is_err(),
-      "type {raw}: rdata holding a 0xC0 octet may be a compression pointer, so \
-       it has no position-independent comparison bytes"
+fn comparability_of_unparsed_rdata_is_a_per_type_question() {
+  /// A message whose single record sits after `extra_questions` + 1 questions.
+  ///
+  /// The first question's QNAME is always at offset 12, so a pointer to 12
+  /// resolves to the same name in every variant while the RECORD's own offset
+  /// moves — which is exactly the position-independence being asserted.
+  fn message(rtype: u16, rdata: &[u8], extra_questions: usize) -> std::vec::Vec<u8> {
+    let mut m = std::vec::Vec::new();
+    m.extend_from_slice(&0u16.to_be_bytes());
+    m.extend_from_slice(&0u16.to_be_bytes());
+    m.extend_from_slice(&u16::try_from(1 + extra_questions).unwrap().to_be_bytes());
+    m.extend_from_slice(&0u16.to_be_bytes());
+    m.extend_from_slice(&0u16.to_be_bytes());
+    m.extend_from_slice(&1u16.to_be_bytes()); // ARCOUNT = 1
+    let question = |name: &[&str], m: &mut std::vec::Vec<u8>| {
+      for label in name {
+        m.push(u8::try_from(label.len()).unwrap());
+        m.extend_from_slice(label.as_bytes());
+      }
+      m.push(0);
+      m.extend_from_slice(&crate::wire::ResourceType::Any.to_u16().to_be_bytes());
+      m.extend_from_slice(&1u16.to_be_bytes());
+    };
+    question(&["x", "local"], &mut m); // QNAME at offset 12, in every variant
+    for _ in 0..extra_questions {
+      question(&["filler", "local"], &mut m);
+    }
+    for label in ["rec", "local"] {
+      m.push(u8::try_from(label.len()).unwrap());
+      m.extend_from_slice(label.as_bytes());
+    }
+    m.push(0);
+    m.extend_from_slice(&rtype.to_be_bytes());
+    m.extend_from_slice(&1u16.to_be_bytes()); // IN
+    m.extend_from_slice(&120u32.to_be_bytes());
+    m.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+    m.extend_from_slice(rdata);
+    m
+  }
+  fn bytes_of(rtype: u16, rdata: &[u8], extra_questions: usize) -> Result<std::vec::Vec<u8>, ()> {
+    let msg = message(rtype, rdata, extra_questions);
+    let reader = crate::wire::MessageReader::try_parse(&msg).unwrap();
+    let rec = reader.additional().flatten().next().ok_or(())?;
+    let mut out = std::vec::Vec::new();
+    rec
+      .write_canonical_rdata(RdataForm::AS_SENT, &mut out)
+      .map(|()| out)
+      .map_err(|_| ())
+  }
+
+  // (1) THE DUPLICATE-OWNERSHIP CASE. An opaque private type may hold `0xC0` as
+  // ordinary data. RFC 3597 §4 forbids compression in it, so those bytes are
+  // self-contained and MUST compare — refusing them is what let a peer win a
+  // round we then declined to lose.
+  assert_eq!(
+    bytes_of(64000, &[0xC0, 0x0C, 0x01], 0),
+    Ok(std::vec![0xC0, 0x0C, 0x01]),
+    "an opaque type is copied verbatim whatever octets it holds"
+  );
+
+  // (2) A compression-eligible type is DECOMPRESSED rather than refused, so it
+  // takes part in the comparison instead of abandoning the whole proposal. MX is
+  // `(lead 2, names 1)`: preference, then a name.
+  let mut mx = std::vec::Vec::new();
+  mx.extend_from_slice(&10u16.to_be_bytes());
+  for label in ["mail", "local"] {
+    mx.push(u8::try_from(label.len()).unwrap());
+    mx.extend_from_slice(label.as_bytes());
+  }
+  mx.push(0);
+  let uncompressed = bytes_of(15, &mx, 0).expect("an uncompressed MX compares");
+  assert_eq!(
+    uncompressed, mx,
+    "an already-uncompressed name is its own comparison form"
+  );
+
+  // (3) …and the point of decompressing: the SAME record compressed, sitting at
+  // two DIFFERENT offsets, yields the same bytes as the uncompressed form. That
+  // is the position-independence §8.2 needs — achieved by decompressing, not by
+  // refusing to look.
+  let mut expected = std::vec::Vec::new();
+  expected.extend_from_slice(&10u16.to_be_bytes());
+  for label in ["x", "local"] {
+    expected.push(u8::try_from(label.len()).unwrap());
+    expected.extend_from_slice(label.as_bytes());
+  }
+  expected.push(0);
+  let mut compressed = std::vec::Vec::new();
+  compressed.extend_from_slice(&10u16.to_be_bytes());
+  compressed.extend_from_slice(&(0xC000u16 | 12).to_be_bytes());
+  for extra in [0usize, 1, 2] {
+    assert_eq!(
+      bytes_of(15, &compressed, extra),
+      Ok(expected.clone()),
+      "{extra} filler question(s): a compressed MX decompresses to the same \
+       bytes wherever the record sat in the packet"
     );
   }
 
-  // …and the same types compare fine when the rdata provably holds no pointer.
-  // The old list refused these outright on type alone, which was both incomplete
-  // AND over-strict.
-  let uncompressed = Rdata::Other(b"\x04mail\x05local\x00");
-  for raw in [2u16, 15, 36, 64000] {
-    assert!(
-      rdata_for_tiebreak(
-        crate::wire::ResourceType::from_u16(raw),
-        &uncompressed,
-        &mut scratch
-      )
-      .is_ok(),
-      "type {raw}: an uncompressed name is already the form §8.2 compares, so \
-       these bytes mean the same thing in any packet"
+  // (4) A compression-eligible type whose name will NOT decode still abandons —
+  // decompressing is not the same as accepting anything.
+  {
+    // The pointer targets its own position inside the rdata, so following it
+    // loops. That position is `header + questions + owner(rec.local) + type +
+    // class + ttl + rdlength + preference`.
+    let rdata_at = 12 + (1 + 1 + 1 + 5 + 1 + 2 + 2) + (1 + 3 + 1 + 5 + 1) + 2 + 2 + 4 + 2;
+    let mut cyclic = std::vec::Vec::new();
+    cyclic.extend_from_slice(&10u16.to_be_bytes());
+    cyclic.extend_from_slice(&(0xC000u16 | u16::try_from(rdata_at + 2).unwrap()).to_be_bytes());
+    assert_eq!(
+      bytes_of(15, &cyclic, 0),
+      Err(()),
+      "a compressed name that cannot be resolved has no comparison bytes"
+    );
+  }
+
+  // (5) THE OTHER HALF OF (1), and the one an earlier revision got backwards.
+  // SIG(24), NXT(30), NAPTR(35) and A6(38) are ABSENT from RFC 6762 §18.14, and
+  // §18.14 closes its list: "names that appear within the rdata of any type not
+  // listed above MUST NOT be compressed". Absence is therefore a positive fact —
+  // these never carry a pointer, so their bytes are self-contained and compare
+  // verbatim like any other unlisted type. Reading absence as "eligible with a
+  // layout we cannot locate" made this crate abandon comparisons that every
+  // conforming peer completes, which is (1)'s duplicate-ownership outcome
+  // reached by declining instead of by refusing.
+  for rtype in [24u16, 30, 35, 38] {
+    assert_eq!(
+      bytes_of(rtype, &[0x00, 0x0A, 0x00, 0x0A, 0x00], 0),
+      Ok(std::vec![0x00, 0x0A, 0x00, 0x0A, 0x00]),
+      "rtype {rtype} is absent from §18.14, so its rdata compares verbatim"
     );
   }
 }
@@ -251,12 +342,17 @@ fn anything_undecodable_yields_no_verdict() {
   bad_owner.extend_from_slice(&4u16.to_be_bytes());
   bad_owner.extend_from_slice(&[10, 0, 0, 1]);
 
-  // UNCOMPARABLE RDATA: a KX whose rdata may hold a compression pointer — the
-  // type the old enumeration missed.
+  // UNCOMPARABLE RDATA: a KX (one of the types R11's enumeration missed) whose
+  // compressed target points past the end of the datagram and cannot resolve.
+  //
+  // It has to be UNRESOLVABLE to abandon. A KX whose pointer resolves now
+  // decompresses and takes part in the comparison — that is R12's fix, and
+  // `comparability_of_unparsed_rdata_is_a_per_type_question` pins it. Abandoning
+  // is for rdata that genuinely has no comparison bytes, not for a type.
   let mut bad_rdata = header(1, 3);
   any_question(&mut bad_rdata, INSTANCE);
   tying_pair(&mut bad_rdata);
-  record(&mut bad_rdata, 36, 120, &[0x00, 0x0A, 0xC0, 0x0C]);
+  record(&mut bad_rdata, 36, 120, &[0x00, 0x0A, 0xFF, 0xFF]);
 
   // UNREADABLE QUESTIONS: a valid admitting question, then one whose QNAME is a
   // pointer that cannot be resolved.
@@ -283,7 +379,7 @@ fn anything_undecodable_yields_no_verdict() {
     (
       "rdata that may hold a compression pointer",
       &bad_rdata,
-      Verdict::Abandoned(Abandon::UncomparableRdata),
+      Verdict::Abandoned(Abandon::UndecodableRdata),
     ),
     (
       "a question section holding a QNAME that will not decode",
@@ -303,5 +399,97 @@ fn anything_undecodable_yields_no_verdict() {
        be read, read — and skipping the unreadable part instead would shorten \
        the peer's list, which only ever flatters us"
     );
+  }
+}
+
+/// THE property §8.2 exists to provide: two differing proposals produce EXACTLY
+/// ONE winner, whichever side is asked.
+///
+/// Run in BOTH directions on purpose. A one-directional fixture cannot see the
+/// failure R12 found: when `instance == host`, `write_probe` emits the address
+/// records under the contested owner, the peer's fold counted them and our list
+/// did not, and with identical A records — which sort before TXT — each side saw
+/// the other as sorting earlier. Both returned `WeHold`, both announced, and
+/// nothing in a single-direction test was wrong.
+///
+/// So the assertion is on the PAIR: exactly one `PeerWins` for differing
+/// records, and zero for identical ones (§8.2.1's "there is, in fact, no
+/// conflict").
+#[test]
+fn two_differing_proposals_produce_exactly_one_winner() {
+  fn records(instance: &str, host: &str, port: u16, addr: [u8; 4]) -> ServiceRecords {
+    let mut r = ServiceRecords::new(
+      crate::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      crate::Name::try_from_str(instance).unwrap(),
+      crate::Name::try_from_str(host).unwrap(),
+      port,
+      120,
+    );
+    r.add_a(core::net::Ipv4Addr::from(addr));
+    r
+  }
+  /// What `other` decides when it adjudicates `probing`'s actual probe.
+  fn verdict_of(other: &ServiceRecords, probing: &ServiceRecords) -> Verdict {
+    let mut buf = std::vec![0u8; 4096];
+    let n = respond::write_probe(probing, &mut buf).expect("probe encodes");
+    let reader = crate::wire::MessageReader::try_parse(&buf[..n]).unwrap();
+    let src: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+    let pp = crate::event::ProbeProposal::new(src, reader, crate::event::DatagramId::new(1));
+    adjudicate(&pp, other)
+  }
+
+  const INST: &str = "myprinter._ipp._tcp.local.";
+  let cases: [(&str, ServiceRecords, ServiceRecords, bool); 4] = [
+    (
+      "distinct host name, differing SRV port",
+      records(INST, "host-a.local.", 631, [10, 0, 0, 1]),
+      records(INST, "host-a.local.", 9999, [10, 0, 0, 1]),
+      true,
+    ),
+    (
+      // The R12 case: the address records land under the CONTESTED owner.
+      "instance == host, differing SRV port, IDENTICAL addresses",
+      records(INST, INST, 631, [10, 0, 0, 1]),
+      records(INST, INST, 9999, [10, 0, 0, 1]),
+      true,
+    ),
+    (
+      "instance == host, same SRV, differing addresses",
+      records(INST, INST, 631, [10, 0, 0, 1]),
+      records(INST, INST, 631, [10, 0, 0, 2]),
+      true,
+    ),
+    (
+      "byte-identical: §8.2.1's \"there is, in fact, no conflict\"",
+      records(INST, INST, 631, [10, 0, 0, 1]),
+      records(INST, INST, 631, [10, 0, 0, 1]),
+      false,
+    ),
+  ];
+
+  for (what, a, b, differ) in cases {
+    let a_says = verdict_of(&a, &b);
+    let b_says = verdict_of(&b, &a);
+    for (side, v) in [("a", a_says), ("b", b_says)] {
+      assert!(
+        !matches!(v, Verdict::Abandoned(_)),
+        "{what}: side {side} must reach a verdict on a well-formed probe, got {v:?}"
+      );
+    }
+    let winners = usize::from(a_says == Verdict::PeerWins) + usize::from(b_says == Verdict::PeerWins);
+    if differ {
+      assert_eq!(
+        winners, 1,
+        "{what}: differing proposals must resolve to exactly ONE loser — \
+         a={a_says:?}, b={b_says:?}. Two `WeHold` means both hosts keep the \
+         name and announce; two `PeerWins` means both defer and neither takes it"
+      );
+    } else {
+      assert_eq!(
+        winners, 0,
+        "{what}: identical record sets are not a conflict at all — \
+         a={a_says:?}, b={b_says:?}"
+      );
+    }
   }
 }

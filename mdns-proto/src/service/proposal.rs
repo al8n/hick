@@ -5,24 +5,27 @@
 //!
 //! §8.2's comparison only resolves a name if BOTH hosts compute the same
 //! function over the same two lists. That makes the two serializers a matched
-//! PAIR — [`our_proposal`] for the bytes we transmit, [`rdata_for_tiebreak`] for
-//! the bytes the peer transmitted — and a pair is only correct together.
+//! PAIR — [`our_proposal`] for the bytes we transmit, and
+//! [`RdataForm::AS_SENT`](crate::wire::RdataForm::AS_SENT) applied to the peer's
+//! record for the bytes the peer transmitted — and a pair is only correct
+//! together.
 //!
-//! There is a second serializer in this crate that answers a DIFFERENT question:
-//! `respond::rdata_for_identity`, "are these two records the same record", which
-//! normalises (lowercased SRV target, empty TXT rewritten). It agrees with the
-//! tiebreak form on every all-lowercase name and every non-empty TXT, so calling
-//! it here compiles, passes most fixtures, and is wrong exactly where a tiebreak
-//! has to be right. Two fixtures had already done it.
+//! The peer's side is no longer a serializer of this module's own. There is ONE
+//! rdata decoder in this crate — `wire::Ref::write_canonical_rdata` — and the
+//! §8.2 form is one of its three [`RdataForm`](crate::wire::RdataForm) settings.
+//! That is deliberate: the identity form ("are these two records the same
+//! record", used by §7.1 known-answer suppression and the §9 screen) normalises
+//! where §8.2 must not, and when the two were separate functions they also
+//! disagreed about which records DECODE AT ALL — which is how a malformed record
+//! became a §8.1 defeat. A knob may change the bytes; it cannot change whether
+//! there are bytes.
 //!
-//! Documenting that hazard was not enough, so the shape now forbids it:
-//! [`rdata_for_tiebreak`] and its name writer are PRIVATE to this module,
-//! `rdata_for_identity` lives with its own consumers, and the only thing this
+//! What stays sealed is the direction that actually went wrong twice: nothing
+//! outside this module serializes a record for §8.2, because the only thing this
 //! module exports is a finished [`Verdict`]. A caller cannot reach past the
-//! verdict to serialize a record itself, which is the only way the wrong
-//! canonicalizer got used.
+//! verdict and pick a form.
 
-use crate::{records::ServiceRecords, service::respond, wire::Rdata};
+use crate::{records::ServiceRecords, service::respond, wire::RdataForm};
 
 /// RFC 6762 §8.2.1's answer for ONE peer proposal.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -52,13 +55,13 @@ pub(crate) enum Abandon {
   /// checked before scope: the unreadable record may have been the one at our
   /// name.
   UndecodableOwnerName,
-  /// An in-scope record's rdata would not parse.
-  UnreadableRdata,
-  /// An in-scope record's rdata has no well-defined comparison bytes — an
-  /// undecompressable embedded name, or rdata of an unparsed type that could
-  /// hold a compression pointer (see
-  /// [`rdata_is_position_independent`](crate::wire::rdata_is_position_independent)).
-  UncomparableRdata,
+  /// An in-scope record's rdata would not decode — a bad RDLENGTH, a TXT length
+  /// octet that overruns, or an embedded name that will not decompress. ONE
+  /// reason, because there is one decoder: `wire::Ref::write_canonical_rdata`
+  /// parses and decompresses in a single pass, so "would not parse" and "has no
+  /// comparison bytes" are no longer separable answers — which is the point,
+  /// since a record that is undecodable here must be undecodable everywhere.
+  UndecodableRdata,
   /// The Question Section did not read to the end, so what the query ASKS — and
   /// therefore what its Authority Section proposes — is unknown.
   UnreadableQuestions,
@@ -105,7 +108,6 @@ fn fold(
 ) -> Result<Verdict, Abandon> {
   let ours = our_proposal(ours_records);
   let mut fold = ProposalFold::new(ours.len());
-  let mut scratch = std::vec::Vec::new();
   for r in pp.authority() {
     let r = r.map_err(|_| Abandon::UnparseableAuthority)?;
     // OWNER NAME FIRST, before any filter that could read a decode failure as an
@@ -146,16 +148,15 @@ fn fold(
     {
       continue;
     }
-    // In scope but not representable: same abandonment, same reason. Skipping it
-    // would silently shorten the very list being compared.
-    let view = r.rdata_view().map_err(|_| Abandon::UnreadableRdata)?;
-    let raw = rdata_for_tiebreak(r.rtype(), &view, &mut scratch)
-      .map_err(|_| Abandon::UncomparableRdata)?;
     // §8.2's ordering key: class, then type, then rdata. Class is invariant
     // (only IN is admitted above), so type then the peer's own bytes.
+    //
+    // In scope but not decodable: same abandonment, same reason. Skipping it
+    // would silently shorten the very list being compared.
     let mut elem = std::vec::Vec::new();
     elem.extend_from_slice(&r.rtype().to_u16().to_be_bytes());
-    elem.extend_from_slice(raw);
+    r.write_canonical_rdata(RdataForm::AS_SENT, &mut elem)
+      .map_err(|_| Abandon::UndecodableRdata)?;
     fold.offer(elem);
   }
   Ok(if fold.peer_wins(&ours) {
@@ -180,8 +181,9 @@ fn fold(
 /// function over the same two lists, and the peer compares against what we
 /// actually sent. So this side deliberately LOWERCASES the SRV target and
 /// renders an empty TXT as a single zero-length string — not because §8.2 wants
-/// normalisation (it does not; see [`rdata_for_tiebreak`] for the peer side,
-/// which normalises nothing) but because that is precisely what
+/// normalisation (it does not — see
+/// [`RdataForm::AS_SENT`](crate::wire::RdataForm::AS_SENT), the peer side, which
+/// normalises nothing) but because that is precisely what
 /// [`crate::wire::MessageBuilder`] emits for us: `write_name` lowercases, and
 /// `push_txt_authority` writes one zero-length string for an empty TXT.
 ///
@@ -212,8 +214,45 @@ fn our_proposal(our: &ServiceRecords) -> std::vec::Vec<std::vec::Vec<u8>> {
     respond::write_canonical_txt(our.txt_segments(), &mut buf);
     set.push(buf);
   }
+  // A/AAAA — but ONLY when the host name IS the instance name, because then
+  // `write_probe`'s address records are emitted under the contested owner too.
+  //
+  // Normally the host is a separate name, its addresses answer a different
+  // question, and they are neither proposed nor compared. `instance == host` is
+  // a supported configuration, though, and there the two sides were computing
+  // different functions: the peer fold admits EVERY record answering the
+  // instance's ANY question, so it counted our addresses, while this list held
+  // only SRV and TXT. With identical A records — which sort before TXT — two
+  // peers whose SRV differ each saw the other's list as sorting earlier, BOTH
+  // returned `WeHold`, and both announced.
+  //
+  // §8.2's comparison only resolves a name if both hosts compute the same
+  // function over the same two lists, so what goes in this list is decided by
+  // what `write_probe` puts on the wire under this owner — not by a fixed
+  // "SRV and TXT" that was only ever true of the common configuration.
+  if names_equal_ignoring_case(our.instance().as_str(), our.host().as_str()) {
+    for a in our.a_addrs_slice() {
+      let mut buf = std::vec::Vec::new();
+      buf.extend_from_slice(&crate::wire::ResourceType::A.to_u16().to_be_bytes());
+      buf.extend_from_slice(&a.octets());
+      set.push(buf);
+    }
+    for a in our.aaaa_addrs_slice() {
+      let mut buf = std::vec::Vec::new();
+      buf.extend_from_slice(&crate::wire::ResourceType::AAAA.to_u16().to_be_bytes());
+      buf.extend_from_slice(&a.octets());
+      set.push(buf);
+    }
+  }
   set.sort();
   set
+}
+
+/// Are these two owner names the same name? DNS names are case-insensitive
+/// (RFC 6762 §16) and a trailing root dot is not part of the name.
+pub(crate) fn names_equal_ignoring_case(a: &str, b: &str) -> bool {
+  let trim = |s: &str| s.strip_suffix('.').unwrap_or(s).to_owned();
+  trim(a).eq_ignore_ascii_case(&trim(b))
 }
 
 /// Write a DNS name in canonical wire form (length-prefixed labels, root
@@ -240,153 +279,6 @@ pub(crate) fn write_canonical_wire_name(name_str: &str, out: &mut std::vec::Vec<
     }
   }
   out.push(0); // root terminator
-}
-
-/// A PEER record's rdata as RFC 6762 §8.2 compares it: the bytes that peer put
-/// on the wire, with embedded names decompressed and nothing else changed.
-///
-/// §8.2 compares "raw comparison of the binary content of the rdata without
-/// regard for meaning or structure", and the ONLY transformation it mandates is
-/// decompression: "In the case of resource records containing rdata that is
-/// subject to name compression, the names MUST be uncompressed before
-/// comparison."
-///
-/// # Why this is not `rdata_for_identity`
-///
-/// That one answers "are these two records the same record" and so lowercases
-/// SRV targets and rewrites an empty TXT to a single zero-length string. Both
-/// are right for identity and wrong for the tiebreak, because the tiebreak only
-/// resolves a name if BOTH hosts compute the same function over the same two
-/// lists. Normalising the peer's bytes while a byte-comparing peer does not
-/// normalise ours makes the two sides disagree:
-///
-/// | our target `m.local`, peer's `Z.local` | compares | verdict |
-/// |---|---|---|
-/// | peer, raw | `Z`(0x5A) vs `m`(0x6D), theirs earlier | peer loses |
-/// | us, normalising | `m`(0x6D) vs `z`(0x7A), ours earlier | we lose |
-///
-/// Both abdicate; the mirror case gives two owners.
-///
-/// # The rule is per SIDE, not "raw everywhere"
-///
-/// EACH SIDE COMPARES THE BYTES THAT SIDE PUT ON THE WIRE. This function is the
-/// peer's side. OUR side keeps lowercasing — see [`our_proposal`] — and that is
-/// not an inconsistency: [`crate::wire::MessageBuilder`]'s `write_name`
-/// lowercases on transmit, so lowercased bytes ARE what we send, and a peer
-/// comparing against us compares those. Making our side "raw" too would make our
-/// comparison bytes differ from our own wire bytes and open a second asymmetry
-/// while looking like a fix.
-///
-/// LOAD-BEARING COUPLING: this correctness argument depends on
-/// `MessageBuilder::write_name` lowercasing. If transmission ever stops
-/// lowercasing, [`our_proposal`] must stop lowercasing with it, or the two sides
-/// diverge again.
-///
-/// # Every name-bearing type, or none
-///
-/// `rtype` is a parameter because [`Rdata::Other`] has already thrown the type
-/// away, and the type is what says whether the bytes may contain a compression
-/// pointer. Two omissions made the comparison bytes wrong in the two ways §8.2
-/// cannot tolerate:
-///
-/// * NSEC's `next_name` was DROPPED, leaving only the bitmap. Two NSECs denying
-///   the same types at different names then compared equal, and — worse — an
-///   NSEC whose `next_name` is a pointer cycle produced bytes at all, so a
-///   proposal of "our SRV, our TXT, and one unreadable NSEC" was scored as three
-///   records and won §8.2.1 on list length against our two.
-/// * `Other` was raw-copied, including the compression-eligible types this crate
-///   does not parse (NS/SOA/MX/DNAME). A raw copy of a compressed name is
-///   message-OFFSET-dependent: the same record at a different position in the
-///   packet yields different comparison bytes, so the two sides do not compute
-///   the same function and the tiebreak stops resolving.
-///
-/// Both now return `Err`, and [`adjudicate`] ABANDONS the proposal on `Err`
-/// rather than skipping the record — skipping shortens the list being compared,
-/// and shortening only ever flatters us.
-fn rdata_for_tiebreak<'s>(
-  rtype: crate::wire::ResourceType,
-  view: &Rdata<'_>,
-  scratch: &'s mut std::vec::Vec<u8>,
-) -> Result<&'s [u8], crate::error::ParseError> {
-  scratch.clear();
-  match view {
-    Rdata::A(a) => scratch.extend_from_slice(&a.addr().octets()),
-    Rdata::AAAA(a) => scratch.extend_from_slice(&a.addr().octets()),
-    // Names subject to compression: decompressed, case untouched.
-    Rdata::Ptr(p) => write_wire_name_preserving_case(p.target(), scratch)?,
-    Rdata::Cname(c) => write_wire_name_preserving_case(c.target(), scratch)?,
-    Rdata::Srv(s) => {
-      scratch.extend_from_slice(&s.priority().to_be_bytes());
-      scratch.extend_from_slice(&s.weight().to_be_bytes());
-      scratch.extend_from_slice(&s.port().to_be_bytes());
-      write_wire_name_preserving_case(s.target(), scratch)?;
-    }
-    Rdata::Txt(t) => {
-      // Exactly as sent. No empty-TXT rewriting: a peer that sent zero-length
-      // rdata proposed zero-length rdata, and that is what it will compare.
-      for seg in t.segments() {
-        let seg = seg?;
-        #[allow(clippy::cast_possible_truncation)]
-        scratch.push(seg.len() as u8);
-        scratch.extend_from_slice(seg);
-      }
-    }
-    // NSEC rdata is `next_name` THEN the type bitmap (RFC 4034 §4.1). The name
-    // is compression-subject, so it decompresses like every other one here, and
-    // it is part of what the peer proposed — dropping it discarded both a
-    // difference §8.2 must see and the parse that fails closed on a bad name.
-    Rdata::Nsec(n) => {
-      write_wire_name_preserving_case(n.next_name(), scratch)?;
-      scratch.extend_from_slice(n.type_bitmap_slice());
-    }
-    Rdata::Other(bytes) => {
-      // §8.2 compares bytes, so the only question is whether these bytes MEAN
-      // the same thing in another packet. They do exactly when they cannot
-      // contain a compression pointer — asked of the bytes themselves, never of
-      // a list of types. See [`rdata_is_position_independent`].
-      //
-      // The list this replaced enumerated the compression-eligible types we do
-      // not parse and omitted five of them (RP, AFSDB, RT, PX, KX). A KX with a
-      // cyclic or truncated compressed target therefore produced comparison
-      // bytes instead of an error: with otherwise identical SRV and TXT the
-      // extra element made the peer's list longer, §8.2.1 handed it the win, and
-      // repeating the packet could defer this host indefinitely. A list that
-      // must track a spec is fail-OPEN on omission; this cannot omit anything.
-      if !crate::wire::rdata_is_position_independent(bytes) {
-        return Err(crate::error::ParseError::UnsupportedNameBearingType(
-          rtype.to_u16(),
-        ));
-      }
-      scratch.extend_from_slice(bytes);
-    }
-  }
-  Ok(scratch.as_slice())
-}
-
-/// Write `name` into `out` in uncompressed wire form, PRESERVING CASE.
-///
-/// The §8.2 tiebreak's counterpart to [`write_canonical_wire_name`], which
-/// lowercases. See [`rdata_for_tiebreak`] for why the two must differ.
-fn write_wire_name_preserving_case(
-  name: &crate::wire::NameRef<'_>,
-  out: &mut std::vec::Vec<u8>,
-) -> Result<(), crate::error::ParseError> {
-  for label in name.labels() {
-    let label = label?;
-    if label.is_empty() {
-      break;
-    }
-    let len = label.len().min(63);
-    #[allow(clippy::cast_possible_truncation)]
-    out.push(len as u8);
-    // `.iter().take(len)` rather than `&label[..len]`: the crate denies
-    // `clippy::indexing_slicing`, and this is the same truncation-by-iterator
-    // `write_canonical_wire_name` uses — the two must stay byte-for-byte
-    // parallel apart from the case fold.
-    out.extend(label.iter().take(len));
-  }
-  out.push(0); // root terminator
-  Ok(())
 }
 
 /// Folds ONE peer proposal into an RFC 6762 §8.2.1 verdict without ever holding
@@ -471,28 +363,28 @@ impl ProposalFold {
   }
 }
 
-/// TEST-ONLY window onto [`rdata_for_tiebreak`], for fixtures that pin the
-/// compared bytes against enumerated literals.
+/// TEST-ONLY window onto the §8.2 form, for fixtures that pin the compared
+/// bytes against enumerated literals.
 ///
 /// The seal this module exists for is against PRODUCTION code: outside here,
-/// nothing can serialize a record for §8.2, so nothing can reach for
-/// `respond::rdata_for_identity` by mistake — the failure that silently broke
-/// the tiebreak twice. A `#[cfg(test)]` accessor does not weaken that; it is
-/// unreachable from any shipped path. It exists because the byte-level fixtures
-/// in `service::tests` assert what a peer's records COMPARE AS, and a fixture
-/// that re-derived those bytes itself would be asserting its own arithmetic
-/// rather than this function's.
+/// nothing chooses an [`RdataForm`] for §8.2, so nothing can pick the
+/// normalising one by mistake — the failure that silently broke the tiebreak
+/// twice. A `#[cfg(test)]` accessor does not weaken that; it is unreachable from
+/// any shipped path. It exists because the byte-level fixtures in
+/// `service::tests` assert what a peer's records COMPARE AS, and a fixture that
+/// re-derived those bytes itself would be asserting its own arithmetic rather
+/// than the decoder's.
 // The only consumer is `service::tests`, which is gated on `std` + `slab`; under
 // a `cargo hack --each-feature` leg such as `--no-default-features --features
 // alloc` this module still compiles for test but that consumer does not exist.
 #[allow(dead_code)]
 #[cfg(test)]
-pub(crate) fn tiebreak_bytes_for_fixture<'s>(
-  rtype: crate::wire::ResourceType,
-  view: &Rdata<'_>,
-  scratch: &'s mut std::vec::Vec<u8>,
-) -> Result<&'s [u8], crate::error::ParseError> {
-  rdata_for_tiebreak(rtype, view, scratch)
+pub(crate) fn tiebreak_bytes_for_fixture(
+  record: &crate::wire::Ref<'_>,
+  out: &mut std::vec::Vec<u8>,
+) -> Result<(), crate::error::ParseError> {
+  out.clear();
+  record.write_canonical_rdata(RdataForm::AS_SENT, out)
 }
 
 #[cfg(test)]

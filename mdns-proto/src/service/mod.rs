@@ -1995,10 +1995,10 @@ where
   }
 
   /// OUR canonical rdata for `rtype`, in the SAME byte format
-  /// `respond::rdata_for_identity` produces for a peer record, so a §9
-  /// conflict check can tell identical (consistent) rdata from a real conflict.
-  /// SRV → priority+weight+port (BE) + lowercased wire-form host; TXT →
-  /// length-prefixed segments; NSEC → the §6.1 instance type bitmap.
+  /// [`RdataForm::FOLDED`](crate::wire::RdataForm::FOLDED) produces for a peer
+  /// record, so a §9 conflict check can tell identical (consistent) rdata from a
+  /// real conflict. SRV → priority+weight+port (BE) + lowercased wire-form host;
+  /// TXT → length-prefixed segments; NSEC → see [`respond::our_nsec_identities`].
   ///
   /// The arms are EXACTLY the record types this service emits under its instance
   /// name, because that is what "identical to ours" can be true of. NSEC joined
@@ -2008,24 +2008,36 @@ where
   /// alone, with matching SRV and TXT correctly screened out — read as a
   /// conflicting response and renamed us.
   ///
-  /// Any other type → empty, which never matches a peer record: a peer record
-  /// canonicalizes to at least one byte for every type, and we assert nothing
-  /// else at this name.
-  fn our_canonical_record_for(&self, rtype: crate::wire::ResourceType) -> std::vec::Vec<u8> {
+  /// A LIST, because one rtype can have more than one indistinguishable
+  /// spelling: §9's rule is about proxies and fault-tolerance twins, which are
+  /// required to be correct rather than to be this crate, and NSEC is a type
+  /// where the two currently differ. See [`respond::our_nsec_identities`].
+  ///
+  /// Empty → we assert no record of this type at this name, which never matches
+  /// a peer record: a peer record canonicalizes to at least one byte for every
+  /// type. That is NOT the same as asserting a zero-length one.
+  fn our_canonical_records_for(
+    &self,
+    rtype: crate::wire::ResourceType,
+  ) -> std::vec::Vec<std::vec::Vec<u8>> {
     let mut out = std::vec::Vec::new();
     match rtype {
       crate::wire::ResourceType::Srv => {
-        out.extend_from_slice(&self.records.priority().to_be_bytes());
-        out.extend_from_slice(&self.records.weight().to_be_bytes());
-        out.extend_from_slice(&self.records.port().to_be_bytes());
-        proposal::write_canonical_wire_name(self.records.host().as_str(), &mut out);
+        let mut srv = std::vec::Vec::new();
+        srv.extend_from_slice(&self.records.priority().to_be_bytes());
+        srv.extend_from_slice(&self.records.weight().to_be_bytes());
+        srv.extend_from_slice(&self.records.port().to_be_bytes());
+        proposal::write_canonical_wire_name(self.records.host().as_str(), &mut srv);
+        out.push(srv);
       }
       crate::wire::ResourceType::Txt => {
         // empty TXT → single zero-length string (one 0x00), matching
         // both our wire form and a peer's compliant empty TXT canonicalization.
-        respond::write_canonical_txt(self.records.txt_segments(), &mut out);
+        let mut txt = std::vec::Vec::new();
+        respond::write_canonical_txt(self.records.txt_segments(), &mut txt);
+        out.push(txt);
       }
-      crate::wire::ResourceType::Nsec => out = respond::our_nsec_identity(),
+      crate::wire::ResourceType::Nsec => out = respond::our_nsec_identities(&self.records),
       _ => {}
     }
     out
@@ -2088,7 +2100,7 @@ where
   /// (Our own echo is already filtered upstream by self-loopback detection, so
   /// surfacing a link-local match never re-reports our own packet.) A different
   /// address, or malformed/unparseable rdata, is also treated as a conflict.
-  fn host_record_is_ours(&self, record: &crate::wire::Ref<'_>) -> bool {
+  fn classify_host_rdata(&self, record: &crate::wire::Ref<'_>) -> PeerRdata {
     match record.rdata_view() {
       // A LINK-LOCAL CARVE-OUT USED TO LIVE HERE, and it was wrong. Matching
       // link-local addresses were reported as conflicts on the reasoning that
@@ -2105,9 +2117,19 @@ where
       // ownership (#73) rather than here. Carrying `interface_index` through
       // `HostConflict` alone would not help: without per-address scope on OUR
       // side there is nothing to compare it against.
-      Ok(crate::wire::Rdata::A(a)) => self.records.a_addrs_slice().contains(&a.addr()),
-      Ok(crate::wire::Rdata::AAAA(a)) => self.records.aaaa_addrs_slice().contains(&a.addr()),
-      _ => false,
+      Ok(crate::wire::Rdata::A(a)) => {
+        PeerRdata::from_identical(self.records.a_addrs_slice().contains(&a.addr()))
+      }
+      Ok(crate::wire::Rdata::AAAA(a)) => {
+        PeerRdata::from_identical(self.records.aaaa_addrs_slice().contains(&a.addr()))
+      }
+      // Rdata that will not parse tells us NOTHING about whether it conflicts,
+      // so it must not be reported as differing — that is a terminal
+      // `HostConflict` driven by a record nobody could read.
+      Err(_) => PeerRdata::Invalid,
+      // A readable non-address type at the host name: the host arm's own rtype
+      // gate decides what to do with it.
+      Ok(_) => PeerRdata::Different,
     }
   }
 
@@ -2127,31 +2149,34 @@ where
   /// matrix, whose arms drop it.
   ///
   /// No rtype pre-screen. Which types can be "ours" is
-  /// [`Service::our_canonical_record_for`]'s question, and it answers it by
+  /// [`Service::our_canonical_records_for`]'s question, and it answers it by
   /// enumerating what this service actually emits at its instance name; a type
-  /// it does not emit yields empty bytes, which no peer record equals. A screen
-  /// here would be a second, independently-maintained copy of that list — and
-  /// when conflict routing widened past SRV/TXT it was the copy that went stale,
-  /// so a twin's identical instance NSEC read as a conflicting response.
-  fn response_rdata_is_ours(&self, pc: &crate::event::ProbeConflict<'_>) -> bool {
-    let rtype = pc.record().rtype();
-    let Ok(view) = pc.record().rdata_view() else {
-      return false;
+  /// it does not emit yields no forms at all, which no peer record equals. A
+  /// screen here would be a second, independently-maintained copy of that list —
+  /// and when conflict routing widened past SRV/TXT it was the copy that went
+  /// stale, so a twin's identical instance NSEC read as a conflicting response.
+  fn classify_instance_rdata(&self, record: &crate::wire::Ref<'_>) -> PeerRdata {
+    let rtype = record.rtype();
+    // NOT `Different`. A record whose rdata will not decode is one this service
+    // cannot reason about at all, and reporting it as differing is what made a
+    // malformed SRV response a real §8.1 probe defeat.
+    //
+    // `canonical_rdata_folded` is THE decoder — the same one §8.2's fold runs,
+    // under a different `RdataForm`. That is what keeps this answer and the
+    // tiebreak's agreeing about which records are readable at all: while the two
+    // paths held separate serializers, an undecodable NS at this name abandoned
+    // the §8.2 comparison but reached here as ordinary DIFFERING rdata, and
+    // differing rdata at a name we are probing is an §8.1 defeat.
+    let Ok(peer_canonical) = record.canonical_rdata_folded() else {
+      return PeerRdata::Invalid;
     };
-    let mut scratch = std::vec::Vec::new();
-    let Ok(peer_canonical) = respond::rdata_for_identity(&view, &mut scratch) else {
-      return false;
-    };
-    let ours = self.our_canonical_record_for(rtype);
-    // EMPTY means "we assert no record of this type at this name", which is not
-    // the same as "we assert a zero-length one" — and a peer CAN send zero-length
-    // rdata for an unknown type, whose identity bytes are also empty. Without
-    // this, that record would compare equal to nothing at all and be waved
-    // through as ours.
-    if ours.is_empty() {
-      return false;
-    }
-    peer_canonical == ours.as_slice()
+    let ours = self.our_canonical_records_for(rtype);
+    // NO FORMS means "we assert no record of this type at this name", which is
+    // not the same as "we assert a zero-length one" — and a peer CAN send
+    // zero-length rdata for an unknown type, whose identity bytes are also
+    // empty. Without this, that record would compare equal to nothing at all and
+    // be waved through as ours.
+    PeerRdata::from_identical(ours.iter().any(|form| form.as_slice() == &*peer_canonical))
   }
 
   /// THE one way this service re-enters RFC 6762 §8's startup steps.
@@ -2599,23 +2624,49 @@ where
     // RESPONSES only, and that is now a property of the TYPE: a peer's tentative
     // proposal arrives as `ProbeProposal` and is §8.2.1's input as a LIST, where
     // dropping members would hand the comparator a list the peer never made.
-    let identical_to_ours = match &event {
-      ServiceEvent::ProbeConflict(pc) => self.response_rdata_is_ours(pc),
-      // The HOST half of the same rule, now stated in the same place rather
-      // than a fourth time inside its own arm. It is the last of the four
-      // places this rule went missing: the §8.2.1 tie, the §9
-      // post-establishment path, the probing path, and here.
-      ServiceEvent::HostConflict(hc) => self.host_record_is_ours(hc.record()),
-      _ => false,
+    // THREE answers, not two. A peer's record is identical to ours, genuinely
+    // different, or NOT DECODABLE AT ALL — and collapsing the third into
+    // "different" is what let malformed data drive a real §8.1 defeat: a QR=1
+    // IN/SRV response whose target is a cyclic or forward pointer set
+    // `probe_defeated` and RENAMED the service, and repeating it gave unbounded
+    // suffix churn and eventually a terminal conflict. An attacker needed one
+    // malformed record and no knowledge of our rdata at all.
+    //
+    // The established §9 arm already dropped the same invalid data instead of
+    // reverting on it, so the two halves of one rule disagreed. Now the
+    // classification is made ONCE, here, and invalid stops before every conflict
+    // arm rather than in some of them.
+    let peer_rdata = match &event {
+      ServiceEvent::ProbeConflict(pc) => self.classify_instance_rdata(pc.record()),
+      // The HOST half of the same rule, stated in the same place rather than a
+      // fourth time inside its own arm. It is the last of the four places this
+      // rule went missing: the §8.2.1 tie, the §9 post-establishment path, the
+      // probing path, and here — and it had the identical invalid-reads-as-
+      // differing defect, where a malformed A/AAAA at our host name surfaced a
+      // TERMINAL, caller-visible `HostConflict`.
+      ServiceEvent::HostConflict(hc) => self.classify_host_rdata(hc.record()),
+      _ => PeerRdata::Different,
     };
-    if identical_to_ours {
-      trace!(
-        target: "mdns_proto::service",
-        handle = self.handle.raw(),
-        state = ?self.state,
-        "service: record carries rdata we already advertise — never a conflict (§9)"
-      );
-      return;
+    match peer_rdata {
+      PeerRdata::Identical => {
+        trace!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          state = ?self.state,
+          "service: record carries rdata we already advertise — never a conflict (§9)"
+        );
+        return;
+      }
+      PeerRdata::Invalid => {
+        trace!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          state = ?self.state,
+          "service: record's rdata will not decode — not a conflict either way, dropping it"
+        );
+        return;
+      }
+      PeerRdata::Different => {}
     }
     match (self.state, event) {
       // Pre-authoritative: nothing of this name is announced, so RFC 6762
@@ -2676,15 +2727,11 @@ where
         if !crate::endpoint::is_instance_conflict_rtype(pc.record().rtype()) {
           return;
         }
-        // A record whose rdata will not parse or canonicalize is not one this
-        // service can reason about; drop it rather than revert on it. The
-        // identical-rdata check that used to follow is now the precondition
-        // above `match (self.state, event)`, so every arm gets it.
-        let Ok(view) = pc.record().rdata_view() else {
-          return;
-        };
-        let mut scratch = std::vec::Vec::new();
-        if respond::rdata_for_identity(&view, &mut scratch).is_err() {
+        // A record whose rdata will not decode is not one this service can
+        // reason about; drop it rather than revert on it. The identical-rdata
+        // check that used to follow is now the precondition above
+        // `match (self.state, event)`, so every arm gets it.
+        if pc.record().canonical_rdata_folded().is_err() {
           return;
         }
         // Rate-limit (§9): don't thrash on a conflict flood — if we reverted to
@@ -2965,17 +3012,12 @@ where
         };
         // Use canonical rdata bytes so the hash matches what write_announce_filtered
         // produces, regardless of wire-level name compression in the incoming packet.
-        // Drop the hint on any parse error rather than storing an incorrect hash.
-        let view = match ka.record().rdata_view() {
-          Ok(v) => v,
-          Err(_) => return, // malformed rdata — drop the hint
-        };
-        let mut scratch = std::vec::Vec::new();
-        let canonical = match respond::rdata_for_identity(&view, &mut scratch) {
+        // Drop the hint on any decode error rather than storing an incorrect hash.
+        let canonical = match ka.record().canonical_rdata_folded() {
           Ok(c) => c,
-          Err(_) => return, // canonicalization error (e.g. pointer cycle) — drop the hint
+          Err(_) => return, // malformed rdata / pointer cycle — drop the hint
         };
-        let rdata_hash = hash_rdata(canonical);
+        let rdata_hash = hash_rdata(&canonical);
         // a known-answer may only suppress an RRset WE own, so bind the
         // hint to which of our owner names its record name matches. A KA whose
         // name is none of ours suppresses nothing (dropped here); one whose name
@@ -3876,3 +3918,30 @@ where
 #[cfg(test)]
 #[cfg(all(any(feature = "alloc", feature = "std"), feature = "slab"))]
 mod tests;
+
+cfg_heap! {
+  /// What a peer's record says about ours: it matches, it differs, or it could
+  /// not be read.
+  ///
+  /// The third answer is the one that has to exist. Folding "unreadable" into
+  /// "differs" is a fail-OPEN default that hands an attacker a rename for the
+  /// price of one malformed record, and it is the same class as the two
+  /// `.flatten()` defects on this branch — an error becoming an ordinary answer.
+  #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+  enum PeerRdata {
+    /// The rdata would not parse or canonicalize. It supports NO conclusion, so
+    /// it must reach neither the §8.1 deferral nor the §9 revert.
+    Invalid,
+    /// Byte-identical to what we advertise — RFC 6762 §9's "resource records
+    /// with identical rdata are never considered inconsistent".
+    Identical,
+    /// Decoded, and genuinely not ours. Only this may drive a conflict.
+    Different,
+  }
+
+  impl PeerRdata {
+    const fn from_identical(identical: bool) -> Self {
+      if identical { Self::Identical } else { Self::Different }
+    }
+  }
+}

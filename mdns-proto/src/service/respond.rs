@@ -6,101 +6,8 @@ use crate::{
   constants::{MDNS_IPV4_GROUP, MDNS_PORT},
   error::EncodeError,
   records::ServiceRecords,
-  wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, Rdata, ResourceClass, ResourceType},
+  wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType},
 };
-
-/// A record's rdata reduced to its IDENTITY — the bytes that answer "are these
-/// two records the same record", for §7.1 known-answer suppression and the §9
-/// identical-rdata screen.
-///
-/// The canonical form is the same regardless of whether the rdata was read from
-/// a compressed wire message or assembled locally, so that storage (from an
-/// incoming `KnownAnswer`) and filtering (of outgoing records) always hash
-/// identically. Getting there NORMALISES: SRV targets are lowercased, an empty
-/// TXT is rewritten to a single zero-length string.
-///
-/// # The other one
-///
-/// `service::proposal::rdata_for_tiebreak` answers a DIFFERENT question — which
-/// of two proposals sorts later (RFC 6762 §8.2), over the bytes a side actually
-/// put on the wire. It decompresses and normalises nothing.
-///
-/// Picking the wrong one of the pair FAILS SILENTLY on ordinary inputs: the two
-/// agree on every all-lowercase name and every non-empty TXT, which covers most
-/// fixtures and most real records, and they diverge exactly where a tiebreak has
-/// to be right. Two fixtures had already made that mistake.
-///
-/// Which is why the pair is no longer reachable from one place. The tiebreak
-/// serializer is PRIVATE to `service::proposal`, which exports only a finished
-/// verdict, so a §8.2 caller cannot serialize a record itself and this function
-/// cannot be substituted for one. This one stays here, with its own consumers:
-/// §7.1 known-answer suppression and the §9 identical-rdata screen.
-///
-/// The result is appended into `scratch`; the returned slice references `scratch`.
-///
-/// Returns `Err` on any label-iteration error (pointer cycle, forward pointer,
-/// truncated name, etc.). Callers should drop the hint/record on error rather
-/// than storing a potentially incorrect partial hash.
-pub(crate) fn rdata_for_identity<'s>(
-  view: &Rdata<'_>,
-  scratch: &'s mut std::vec::Vec<u8>,
-) -> Result<&'s [u8], crate::error::ParseError> {
-  scratch.clear();
-  match view {
-    Rdata::A(a) => {
-      scratch.extend_from_slice(&a.addr().octets());
-    }
-    Rdata::AAAA(a) => {
-      scratch.extend_from_slice(&a.addr().octets());
-    }
-    Rdata::Ptr(p) => {
-      // Lowercase label bytes joined by '.', no length prefixes, no null terminator.
-      write_canonical_name(p.target(), scratch)?;
-    }
-    Rdata::Cname(c) => {
-      // CNAME rdata is one domain name — hash it like PTR.
-      write_canonical_name(c.target(), scratch)?;
-    }
-    Rdata::Srv(s) => {
-      // priority (2 BE) + weight (2 BE) + port (2 BE) + wire-form target name.
-      // Wire form: length-octet + label bytes, repeated, terminated by 0x00.
-      // This matches the encoding used in compare_rr_sets_we_lose for our own
-      // SRV records, ensuring bytewise symmetry between our side and peer side.
-      scratch.extend_from_slice(&s.priority().to_be_bytes());
-      scratch.extend_from_slice(&s.weight().to_be_bytes());
-      scratch.extend_from_slice(&s.port().to_be_bytes());
-      write_canonical_wire_name(s.target(), scratch)?;
-    }
-    Rdata::Txt(t) => {
-      // Raw wire bytes (length-prefixed segments); no compression in TXT rdata.
-      let mut wrote_any = false;
-      for seg in t.segments() {
-        let seg = seg?;
-        #[allow(clippy::cast_possible_truncation)]
-        scratch.push(seg.len() as u8);
-        scratch.extend_from_slice(seg);
-        wrote_any = true;
-      }
-      // normalize an empty TXT to a single zero-length string (one
-      // 0x00), so a peer's empty TXT — whether sent compliantly as a single
-      // empty string or (non-compliantly) as empty rdata — canonicalizes to the
-      // same bytes as our own empty TXT. Keeps tiebreak / §9 conflict / KAS
-      // comparisons symmetric (RFC 6763 §6.1).
-      if !wrote_any {
-        scratch.push(0);
-      }
-    }
-    Rdata::Nsec(n) => {
-      // For NSEC we use the raw type-bitmap bytes (next_name is compression-
-      // sensitive so we skip it, similar to "Other" fallback).
-      scratch.extend_from_slice(n.type_bitmap_slice());
-    }
-    Rdata::Other(bytes) => {
-      scratch.extend_from_slice(bytes);
-    }
-  }
-  Ok(scratch.as_slice())
-}
 
 /// Append the canonical wire form of a TXT record's rdata to `out`: each
 /// segment as a length-octet followed by its bytes, in order.
@@ -111,8 +18,8 @@ pub(crate) fn rdata_for_identity<'s>(
 /// `MessageBuilder::push_txt_answer` / `push_txt_authority`, so the local TXT
 /// canonical used for §8.2 tiebreak, §9 conflict comparison, and KAS-hint
 /// matching stays byte-symmetric with what a peer actually receives (a peer's
-/// compliant empty TXT — a single 0x00 — canonicalizes to the same bytes via
-/// `rdata_for_identity`).
+/// compliant empty TXT — a single 0x00 — canonicalizes to the same bytes under
+/// [`RdataForm::FOLDED`](crate::wire::RdataForm::FOLDED)).
 // `'a` reads as single-use, but it cannot be elided at our 1.91 MSRV:
 // anonymous lifetimes in `impl Trait` are unstable before they stabilized
 // (rustc E0658), so the lifetime must stay named.
@@ -133,58 +40,6 @@ pub(crate) fn write_canonical_txt<'a>(
   if !wrote_any {
     out.push(0);
   }
-}
-
-/// Write the labels of `name` into `out` in DNS wire form:
-/// `length_byte label_bytes ... 0x00`. Each label byte is lowercased.
-/// Propagates any [`crate::error::ParseError`] from the label iterator
-/// (pointer cycle, forward pointer, truncation, etc.).
-///
-/// This is used for SRV target encoding in `rdata_for_identity` so that
-/// the peer-side canonical bytes are byte-identical to what
-/// `write_canonical_wire_name` in `mod.rs` produces for our own SRV records.
-fn write_canonical_wire_name(
-  name: &crate::wire::NameRef<'_>,
-  out: &mut std::vec::Vec<u8>,
-) -> Result<(), crate::error::ParseError> {
-  for label in name.labels() {
-    let label = label?;
-    if label.is_empty() {
-      // Empty label = root; stop (root terminator added below)
-      break;
-    }
-    let len = label.len().min(63);
-    #[allow(clippy::cast_possible_truncation)]
-    out.push(len as u8);
-    for &b in label.iter().take(63) {
-      out.push(b.to_ascii_lowercase());
-    }
-  }
-  out.push(0); // root terminator
-  Ok(())
-}
-
-/// Write the labels of `name` into `out` as lowercased bytes joined by `'.'`.
-/// No length prefixes and no trailing dot are emitted.
-/// Propagates any [`crate::error::ParseError`] from the label iterator
-/// (pointer cycle, forward pointer, truncation, etc.).
-#[allow(dead_code)]
-fn write_canonical_name(
-  name: &crate::wire::NameRef<'_>,
-  out: &mut std::vec::Vec<u8>,
-) -> Result<(), crate::error::ParseError> {
-  let mut first = true;
-  for label in name.labels() {
-    let label = label?;
-    if !first {
-      out.push(b'.');
-    }
-    for &b in label {
-      out.push(b.to_ascii_lowercase());
-    }
-    first = false;
-  }
-  Ok(())
 }
 
 /// Write a probe message per RFC 6762 §8.1: an ANY question for the instance
@@ -274,8 +129,8 @@ fn push_service_nsec<const COMP_N: usize>(
 
 /// The exact RRset an instance NSEC asserts, in ONE place because two sides
 /// read it: [`push_service_nsec`] encodes it onto the wire, and
-/// `Service::our_canonical_record_for` reconstructs the same bytes to recognise
-/// our own NSEC coming back. A peer that publishes a byte-identical instance —
+/// [`our_nsec_identities`] reconstructs the same bytes to recognise our own NSEC
+/// coming back. A peer that publishes a byte-identical instance —
 /// a proxy or a fault-tolerance twin, the case RFC 6762 §9 names — sends this
 /// record too, and "identical rdata is never a conflict" has to cover it or a
 /// twin's NSEC alone renames us.
@@ -315,12 +170,64 @@ fn write_nsec_type_bitmap(present_types: &[u16], out: &mut std::vec::Vec<u8>) {
   out.extend(bitmap.iter().take(blen));
 }
 
-/// The bytes [`rdata_for_identity`] yields for the instance NSEC this service
-/// emits — the identity form, which for NSEC is the type bitmap alone.
-pub(crate) fn our_nsec_identity() -> std::vec::Vec<u8> {
-  let mut out = std::vec::Vec::new();
-  write_nsec_type_bitmap(&INSTANCE_NSEC_TYPES, &mut out);
-  out
+/// Every instance-NSEC rdata that is INDISTINGUISHABLE FROM OURS, in the
+/// identity form [`RdataForm::FOLDED`](crate::wire::RdataForm::FOLDED) yields
+/// for a peer's record: `next_name` — the owner name itself (§6.1) — in
+/// case-folded wire form, then the RFC 4034 §4.1.2 type bitmap.
+///
+/// # Why a SET, when we emit exactly one
+///
+/// RFC 6762 §9's "resource records with identical rdata are never considered
+/// inconsistent" exists for "proxies and other fault-tolerance mechanisms",
+/// which means the twin at the other end is not required to be this crate. It is
+/// required to be CORRECT — and where the two differ, both spellings have to be
+/// recognised as ours or the twin renames us.
+///
+/// They differ in exactly one configuration. When the host name IS the instance
+/// name, this service publishes its A/AAAA records at the instance name too (see
+/// `write_probe` and `proposal::our_proposal`, which counts them for the same
+/// reason), so the complete RRset at that name is `{SRV, TXT, A, AAAA}` and a
+/// conforming responder's NSEC says so. Ours says `{SRV, TXT}` — a false
+/// negative, denying address records we ourselves emit. That defect is in NSEC
+/// GENERATION, it predates this branch, and it is filed against `main` rather
+/// than patched here; fixing it changes what goes on the wire for every
+/// same-name deployment and belongs in its own change.
+///
+/// Its consequence on the CONFLICT side does not get to wait, because it is a
+/// rename: without the second form, a correct twin's correct bitmap reads as
+/// inconsistent rdata at a name we are probing, which is an RFC 6762 §8.1
+/// defeat. So this recognises both what we emit and what a conforming responder
+/// emits, and the two coincide — one entry — in every configuration where the
+/// host is a separate name.
+pub(crate) fn our_nsec_identities(records: &ServiceRecords) -> std::vec::Vec<std::vec::Vec<u8>> {
+  let identity = |types: &[u16]| {
+    let mut out = std::vec::Vec::new();
+    // §6.1: the Next Domain Name of an mDNS NSEC is the owner name itself, and
+    // this NSEC's owner is the instance name.
+    super::proposal::write_canonical_wire_name(records.instance().as_str(), &mut out);
+    write_nsec_type_bitmap(types, &mut out);
+    out
+  };
+  let mut forms = std::vec::Vec::new();
+  forms.push(identity(&INSTANCE_NSEC_TYPES));
+
+  if super::proposal::names_equal_ignoring_case(
+    records.instance().as_str(),
+    records.host().as_str(),
+  ) {
+    let mut conforming: std::vec::Vec<u16> = INSTANCE_NSEC_TYPES.to_vec();
+    if !records.a_addrs_slice().is_empty() {
+      conforming.push(ResourceType::A.to_u16());
+    }
+    if !records.aaaa_addrs_slice().is_empty() {
+      conforming.push(ResourceType::AAAA.to_u16());
+    }
+    let conforming = identity(&conforming);
+    if !forms.contains(&conforming) {
+      forms.push(conforming);
+    }
+  }
+  forms
 }
 
 /// Write an unsolicited announcement: SRV, TXT, A, AAAA records.
@@ -747,23 +654,14 @@ where
   let mut emitted = EmittedRecords::default();
   let mut scratch: std::vec::Vec<u8> = std::vec::Vec::new();
 
-  // PTR — canonical: lowercase label bytes joined by '.', no length prefixes.
+  // PTR — canonical: the target name in case-folded WIRE form (length-octet +
+  // label bytes …, root 0x00), which is what the one decoder yields for an
+  // inbound PTR under `RdataForm::FOLDED`. It used to be dot-joined bytes with
+  // no length prefixes, and that form is ambiguous as well as unmatched: labels
+  // `["a.b"]` and `["a", "b"]` join to the same string.
   {
     scratch.clear();
-    for (i, label) in records
-      .instance()
-      .as_str()
-      .trim_end_matches('.')
-      .split('.')
-      .enumerate()
-    {
-      if i > 0 {
-        scratch.push(b'.');
-      }
-      for &b in label.as_bytes() {
-        scratch.push(b.to_ascii_lowercase());
-      }
-    }
+    super::proposal::write_canonical_wire_name(records.instance().as_str(), &mut scratch);
     if !hint_matches(ResourceType::Ptr, &scratch) {
       b.push_ptr_answer(
         records.service_type(),
@@ -784,10 +682,9 @@ where
 
   // SRV — canonical: priority (2 BE) + weight (2 BE) + port (2 BE) +
   // wire-form target name (length-octet + label bytes, root 0x00 terminator).
-  // MUST use the same wire-form encoding as rdata_for_identity
-  // (which parses incoming SRV records via write_canonical_wire_name). Using
-  // dot-joined plain bytes here while rdata_for_identity uses wire-form
-  // means SRV KAS hints never match — the hashes diverge.
+  // MUST use the same wire-form encoding the one decoder yields for an inbound
+  // SRV under `RdataForm::FOLDED`. Using dot-joined plain bytes here while the
+  // decoder uses wire-form means SRV KAS hints never match — the hashes diverge.
   {
     scratch.clear();
     scratch.extend_from_slice(&records.priority().to_be_bytes());

@@ -678,7 +678,7 @@ impl<'a, const COMP_N: usize> MessageBuilder<'a, COMP_N> {
       // LOAD-BEARING BEYOND THIS FILE: the RFC 6762 §8.2 tiebreak compares raw
       // rdata bytes, and it only resolves a name if both hosts compare the same
       // pair of lists. `Service::our_proposal` therefore lowercases OUR side to
-      // match what this emits, while `respond::rdata_for_tiebreak` leaves a PEER's
+      // match what this emits, while `RdataForm::AS_SENT` leaves a PEER's
       // bytes exactly as received. If this stops lowercasing, `our_proposal`
       // must stop in the same change, or our comparison bytes stop being the
       // bytes we transmit and every tiebreak against a byte-comparing peer can

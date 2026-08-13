@@ -22,49 +22,8 @@ cfg_heap! {
   use crate::backend::{RdataBuf, rdata_from_vec};
 }
 
-use super::{NameRef, ResourceClass, ResourceType};
+use super::{NameRef, RdataNames, ResourceClass, ResourceType};
 use crate::error::{BufferTooShortDetail, ParseError, RdlengthOverrunDetail};
-
-cfg_heap! {
-  /// Can `rdata` be compared or stored as the bytes it arrived in?
-  ///
-  /// Only when it provably contains no DNS compression pointer. A pointer is a
-  /// two-octet sequence whose first octet has its top two bits set (RFC 1035
-  /// §4.1.4), so it is always a byte `>= 0xC0`; rdata with no such byte cannot
-  /// contain one, whatever its type's format is, and is therefore
-  /// position-INDEPENDENT — the same record at a different offset in a different
-  /// packet yields the same bytes.
-  ///
-  /// # Why this is not a list of types
-  ///
-  /// It replaces a predicate that enumerated the compression-eligible RR types
-  /// this stack does not parse (NS, MD, MF, SOA, MB, MG, MR, MINFO, MX, DNAME)
-  /// and raw-copied everything else. That enumeration was INCOMPLETE — it omitted
-  /// RP(17), AFSDB(18), RT(21), PX(26) and KX(36), all compression-eligible — and
-  /// a list that must be kept in sync with a spec is fail-OPEN on omission: a
-  /// missing type silently produced position-dependent bytes. For the §8.2
-  /// tiebreak that meant a malformed KX yielded comparison bytes instead of an
-  /// error, lengthening the peer's list and driving a one-second deferral off a
-  /// proposal that should have been abandoned.
-  ///
-  /// Asking the BYTES cannot be incomplete, because there is nothing to keep in
-  /// sync. It is conservative in the safe direction: rdata that happens to hold a
-  /// `>= 0xC0` byte for some non-pointer reason is refused rather than risked. And
-  /// it is strictly more accurate than the list in both directions — an
-  /// UNCOMPRESSED MX or KX now compares and caches correctly, where the list
-  /// refused it outright, and a compressed one is refused whatever its type.
-  ///
-  /// Only for rdata this stack does NOT parse. A type with a parser (PTR, CNAME,
-  /// SRV, NSEC) resolves its own names and never consults this.
-  ///
-  /// Gated to the heap tiers like the predicate it replaces: both callers
-  /// (`Ref::canonical_rdata_inner` and `service::proposal`) are themselves
-  /// `cfg_heap`, so without a matching gate this is dead code in the core-only
-  /// tiers and trips `#[deny(dead_code)]`.
-  pub(crate) fn rdata_is_position_independent(rdata: &[u8]) -> bool {
-    rdata.iter().all(|&b| b < 0xC0)
-  }
-}
 
 /// Parsed resource record (zero-copy view into a message). Stores the full
 /// message reference so type-specific rdata parsers can resolve compression
@@ -199,6 +158,18 @@ impl<'a> Ref<'a> {
     self.ttl
   }
 
+  /// The whole message this record came from, plus where its RDATA starts and
+  /// how long it is.
+  ///
+  /// A compression pointer inside RDATA is an offset into the WHOLE message, so
+  /// a decoder holding only the rdata slice cannot follow one. That is why
+  /// [`Rdata::Other`] is not enough to decompress a name-bearing type this crate
+  /// has no parser for — see `ResourceType::rdata_names`.
+  #[allow(dead_code)]
+  pub(crate) const fn rdata_location(&self) -> (&'a [u8], usize, usize) {
+    (self.message, self.rdata_start, self.rdata_len)
+  }
+
   /// Raw rdata slice borrowed from the message.
   pub fn rdata(&self) -> &'a [u8] {
     self
@@ -242,21 +213,15 @@ impl<'a> Ref<'a> {
 
   cfg_heap! {
   /// Copies this record's rdata with internal DNS compression pointers
-  /// EXPANDED to self-contained wire form, PRESERVING name case. PTR/SRV/NSEC
-  /// rdata carries a domain name that responders — and this crate's own builder
-  /// — may compress with a back-pointer into the packet; a raw copy would
-  /// dangle once the source datagram is gone. Case is preserved so a query
-  /// caller can surface the name for display (RFC 6762 §16). A/AAAA/TXT/Other
-  /// carry no name we expand and are copied verbatim. Malformed typed rdata
-  /// (bad RDLENGTH, an over-length name, or a name with a pointer cycle /
-  /// forward pointer) yields `Err` so the caller can drop the record instead of
-  /// storing undecodable bytes.
+  /// EXPANDED to self-contained wire form, PRESERVING name case. Case is
+  /// preserved so a query caller can surface the name for display (RFC 6762
+  /// §16).
   ///
   /// For record IDENTITY comparison use [`Self::canonical_rdata_folded`], which
   /// additionally case-folds so two encodings differing only in name case (or
   /// compression) compare equal.
   pub(crate) fn canonical_rdata(&self) -> Result<RdataBuf, ParseError> {
-    self.canonical_rdata_inner(false)
+    self.canonical_rdata_inner(RdataForm::PRESERVING_CASE)
   }
 
   /// Like [`Self::canonical_rdata`] but case-FOLDS names (ASCII lowercase) —
@@ -266,63 +231,96 @@ impl<'a> Ref<'a> {
   /// folding, a peer announcing then withdrawing the same record with differing
   /// case would leave a stale entry (and case variants could bloat the bounded
   /// cache). The cache never surfaces rdata for display, so folding is safe
-  /// there.
+  /// there. It is also the form the service layer's §7.1 known-answer
+  /// suppression and §9 identical-rdata screen compare over.
   pub(crate) fn canonical_rdata_folded(&self) -> Result<RdataBuf, ParseError> {
-    self.canonical_rdata_inner(true)
+    self.canonical_rdata_inner(RdataForm::FOLDED)
   }
 
-  fn canonical_rdata_inner(&self, fold_case: bool) -> Result<RdataBuf, ParseError> {
+  fn canonical_rdata_inner(&self, form: RdataForm) -> Result<RdataBuf, ParseError> {
+    let mut out = std::vec::Vec::new();
+    self.write_canonical_rdata(form, &mut out)?;
+    Ok(rdata_from_vec(out))
+  }
+
+  /// THE structural decode of this record's rdata, appended to `out`.
+  ///
+  /// # One decoder, because the failures have to agree
+  ///
+  /// Three questions are asked of a peer's rdata in this crate — "which of two
+  /// §8.2 proposals sorts later", "are these two records the same record", and
+  /// "what do I store for this record" — and they differ ONLY in the two knobs
+  /// [`RdataForm`] carries. Everything else is one job: FIND THE NAMES THE TYPE
+  /// DEFINES, DECOMPRESS THEM, AND FAIL WHEN THEY DO NOT DECODE.
+  ///
+  /// They were three separate serializers, and the divergence was not cosmetic.
+  /// The identity form raw-copied [`Rdata::Other`] and dropped NSEC's
+  /// `next_name`, so it never failed on either; the §8.2 form decompressed both
+  /// and did. The same bytes therefore answered "unreadable, decide nothing" on
+  /// one path and "differing rdata" on the other — and "differing rdata" at a
+  /// name we are probing IS an RFC 6762 §8.1 defeat. One malformed IN/NS
+  /// response, needing no knowledge of our records at all, renamed a probing
+  /// service.
+  ///
+  /// With one decoder that is unrepresentable rather than fixed: a type cannot
+  /// be safe for one consumer and fatal for another, because there is only one
+  /// answer to be had. A knob may change the BYTES; none can change whether
+  /// there are bytes.
+  ///
+  /// Note what the laziness of the typed parsers means here. `Srv`, `Nsec`,
+  /// `Ptr` and `Cname` all obtain their name through `NameRef::try_parse`,
+  /// which accepts a compression pointer WITHOUT following it — so
+  /// [`Self::rdata_view`] succeeds on a record whose embedded name is a pointer
+  /// cycle, and only writing the name out discovers it. The validation this
+  /// function performs is therefore not a duplicate of `rdata_view`'s; it is
+  /// the only place those names are decoded at all.
+  pub(crate) fn write_canonical_rdata(
+    &self,
+    form: RdataForm,
+    out: &mut std::vec::Vec<u8>,
+  ) -> Result<(), ParseError> {
     match self.rdata_view()? {
-      Rdata::Ptr(p) => {
-        let mut out = std::vec::Vec::new();
-        p.target().write_wire(&mut out, fold_case)?;
-        Ok(rdata_from_vec(out))
-      }
-      Rdata::Cname(c) => {
-        let mut out = std::vec::Vec::new();
-        c.target().write_wire(&mut out, fold_case)?;
-        Ok(rdata_from_vec(out))
-      }
+      Rdata::Ptr(p) => p.target().write_wire(out, form.fold_case)?,
+      Rdata::Cname(c) => c.target().write_wire(out, form.fold_case)?,
       Rdata::Srv(s) => {
-        let mut out = std::vec::Vec::new();
         out.extend_from_slice(&s.priority().to_be_bytes());
         out.extend_from_slice(&s.weight().to_be_bytes());
         out.extend_from_slice(&s.port().to_be_bytes());
-        s.target().write_wire(&mut out, fold_case)?;
-        Ok(rdata_from_vec(out))
+        s.target().write_wire(out, form.fold_case)?;
       }
+      // NSEC rdata is `next_name` THEN the type bitmap (RFC 4034 §4.1), and the
+      // name is on §18.14's compressible list. Dropping it — which the identity
+      // form used to do — discarded both a difference the comparison must see
+      // (two NSECs denying the same types at different names compared equal) and
+      // the decode that fails closed on an unreadable name.
       Rdata::Nsec(n) => {
-        let mut out = std::vec::Vec::new();
-        n.next_name().write_wire(&mut out, fold_case)?;
+        n.next_name().write_wire(out, form.fold_case)?;
         out.extend_from_slice(n.type_bitmap_slice());
-        Ok(rdata_from_vec(out))
       }
-      // Truly-unknown types are opaque (RFC 3597 §4 forbids name compression in
-      // them) so raw bytes are a stable identity — EXCEPT a well-known
-      // compressible name-bearing type we don't parse (NS/SOA/MX/DNAME), which
-      // MAY arrive compressed/case-varied and can't be canonicalized; it's not
-      // an mDNS/DNS-SD type, so drop it.
-      Rdata::Other(bytes) => {
-        // Asked of the BYTES, not of a list of types — see
-        // [`rdata_is_position_independent`]. Raw bytes are a stable identity only
-        // when they cannot move with the packet, and the list this replaced was
-        // missing five compression-eligible types.
-        if !rdata_is_position_independent(bytes) {
-          return Err(ParseError::UnsupportedNameBearingType(self.rtype.to_u16()));
+      Rdata::Other(bytes) => match self.rtype.rdata_names() {
+        // Absent from RFC 6762 §18.14, so §18.14's own closing sentence says its
+        // names MUST NOT be compressed: the bytes mean the same thing in any
+        // packet WHATEVER octets they hold, and they are copied verbatim.
+        // Deliberately WITHOUT sniffing for `0xC0` — pointer syntax is
+        // meaningful only inside a field a type defines as a name, so a `0xC0`
+        // here is ordinary data. A byte-sniffing predicate briefly refused such
+        // a record, and because the peer compared it correctly and won while we
+        // abandoned, both hosts went on to claim the name.
+        RdataNames::Opaque => out.extend_from_slice(bytes),
+        // On §18.14's list: decompress the names in place. A raw copy would be
+        // message-OFFSET-dependent, so the same record at a different position
+        // in the packet would yield different bytes.
+        RdataNames::Compressible { lead, names } => {
+          self.write_decompressed_rdata(lead, names, form.fold_case, out)?;
         }
-        Ok(rdata_from_vec(bytes.to_vec()))
-      }
+      },
       Rdata::Txt(t) => {
-        // TXT rdata is a sequence of length-prefixed strings (RFC 6763
-        // §6), NOT opaque bytes. Walk the segments to VALIDATE: a length octet
-        // that overruns the rdata makes `segments()` yield Err, which propagates
-        // so the caller DROPS the record. Without this a malformed TXT (e.g. a
-        // length byte of 5 followed by 2 bytes) passed this canonical-rdata
-        // validity gate and was admitted to the cache / query results. Rebuild
-        // the canonical bytes from the validated segments; an empty TXT
-        // normalizes to a single zero-length string (§6.1) so it matches both
-        // `respond::write_canonical_txt` and a peer's compliant empty TXT.
-        let mut out = std::vec::Vec::new();
+        // TXT rdata is a sequence of length-prefixed strings (RFC 6763 §6), NOT
+        // opaque bytes. Walking the segments VALIDATES: a length octet that
+        // overruns the rdata makes `segments()` yield Err, which propagates so
+        // the caller drops the record. Without this a malformed TXT (a length
+        // byte of 5 followed by 2 bytes) passed the validity gate and was
+        // admitted to the cache / query results.
         let mut wrote_any = false;
         for seg in t.segments() {
           let seg = seg?;
@@ -332,17 +330,117 @@ impl<'a> Ref<'a> {
           out.extend_from_slice(seg);
           wrote_any = true;
         }
-        if !wrote_any {
+        // RFC 6763 §6.1: a TXT record MUST contain at least one string, so the
+        // identity of an empty one is a single zero-length string — which is
+        // what this crate's builder emits and what a compliant peer sends.
+        // §8.2 does NOT normalise: a peer that sent zero-length rdata proposed
+        // zero-length rdata, and that is the byte string it will compare.
+        if !wrote_any && form.normalise_empty_txt {
           out.push(0);
         }
-        Ok(rdata_from_vec(out))
       }
       // A / AAAA carry no domain name and no internal structure — copy verbatim.
-      // (`_` also satisfies the `#[non_exhaustive]` enum.)
-      _ => Ok(rdata_from_vec(self.rdata().to_vec())),
+      // (`_` also satisfies the `#[non_exhaustive]` enum.) `rdata_view` above
+      // already rejected an oversize A/AAAA, so these bytes are the address.
+      _ => out.extend_from_slice(self.rdata()),
     }
+    Ok(())
+  }
+
+  /// Rewrite a §18.14-compressible RDATA into self-contained form: `lead` fixed
+  /// octets verbatim, then `names` domain names UNCOMPRESSED, then whatever
+  /// remains verbatim.
+  ///
+  /// ONE decoder for every eligible type, because they all share that shape —
+  /// `(0,1)` for NS/CNAME/PTR/DNAME, `(0,2)` for RP and for SOA (whose 20 octets
+  /// of timers are simply the remainder), `(2,1)` for MX/AFSDB/RT/KX, `(2,2)`
+  /// for PX. The alternative was a parser per type, which is far more code for
+  /// types that cannot legitimately appear at a DNS-SD instance name.
+  ///
+  /// Needs the whole message, not the rdata slice: a compression pointer is an
+  /// offset into the message, which is why [`Rdata::Other`] alone cannot do this.
+  fn write_decompressed_rdata(
+    &self,
+    lead: usize,
+    names: u8,
+    fold_case: bool,
+    out: &mut std::vec::Vec<u8>,
+  ) -> Result<(), ParseError> {
+    let (message, rdata_start, rdata_len) = self.rdata_location();
+    let rdata_end = rdata_start.saturating_add(rdata_len);
+    let mut cursor = rdata_start.saturating_add(lead);
+    if cursor > rdata_end {
+      return Err(ParseError::UnsupportedNameBearingType(self.rtype.to_u16()));
+    }
+    // The fixed prefix carries no name, so it is already self-contained.
+    out.extend_from_slice(message.get(rdata_start..cursor).unwrap_or(&[]));
+    for _ in 0..names {
+      let (name, consumed) = NameRef::try_parse(message, cursor)?;
+      name.write_wire(out, fold_case)?;
+      cursor = cursor.saturating_add(consumed);
+      // A name that ran past the record's own RDLENGTH is malformed, and the
+      // remainder below would be nonsense; fail rather than compare it.
+      if cursor > rdata_end {
+        return Err(ParseError::UnsupportedNameBearingType(self.rtype.to_u16()));
+      }
+    }
+    // Everything after the names is fixed data of the type (SOA's timers) and
+    // carries no name, so it too is self-contained as sent.
+    out.extend_from_slice(message.get(cursor..rdata_end).unwrap_or(&[]));
+    Ok(())
   }
   }
+}
+
+cfg_heap! {
+/// The two knobs that separate this crate's three canonical-rdata consumers.
+///
+/// They are knobs rather than three functions because the STRUCTURAL decode
+/// — see [`Ref::write_canonical_rdata`] — must be identical for all three: a
+/// record that cannot be decoded has to be undecodable for every consumer, or
+/// one of them reads malformed data as an ordinary answer. Only the
+/// normalisation may differ, and only in these two ways.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct RdataForm {
+  /// Lowercase the ASCII bytes of every embedded name (RFC 6762 §16's
+  /// case-insensitive canonical form).
+  fold_case: bool,
+  /// Render a TXT with no strings as one zero-length string (RFC 6763 §6.1).
+  normalise_empty_txt: bool,
+}
+
+impl RdataForm {
+  /// RFC 6762 §8.2's form: EXACTLY what the sender put on the wire, with names
+  /// decompressed and nothing else touched.
+  ///
+  /// §8.2 mandates one transformation and no others — "the names MUST be
+  /// uncompressed before comparison" — over a "raw comparison of the binary
+  /// content of the rdata without regard for meaning or structure". Normalising
+  /// here breaks the tiebreak's symmetry, because the peer compares OUR bytes
+  /// unnormalised: with our SRV target `m.local` and the peer's `Z.local`, the
+  /// peer sees `Z`(0x5A) before `m`(0x6D) and loses, while a normalising us
+  /// sees `m`(0x6D) before `z`(0x7A) and also loses. Both abdicate, and the
+  /// mirror case gives two owners.
+  pub(crate) const AS_SENT: Self = Self {
+    fold_case: false,
+    normalise_empty_txt: false,
+  };
+
+  /// Self-contained bytes with name case PRESERVED, for a caller that may
+  /// surface the name for display (RFC 6762 §16).
+  pub(crate) const PRESERVING_CASE: Self = Self {
+    fold_case: false,
+    normalise_empty_txt: true,
+  };
+
+  /// The IDENTITY form — "are these two records the same record". Names are
+  /// case-folded and an empty TXT is normalised, so two encodings of one record
+  /// compare equal however the sender spelled them.
+  pub(crate) const FOLDED: Self = Self {
+    fold_case: true,
+    normalise_empty_txt: true,
+  };
+}
 }
 
 /// Dispatched rdata view — interprets `rdata` per `rtype`.

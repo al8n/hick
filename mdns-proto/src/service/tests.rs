@@ -2526,9 +2526,9 @@ fn tiebreak_we_lose_defers_and_reprobes() {
 /// The peer proposes our port and an equal TXT, so the whole round turns on the
 /// SRV target: theirs `HOSU.local.`, ours `host.local.`.
 ///
-/// * as sent (`rdata_for_tiebreak`): the first label byte is `H`(0x48) against
+/// * as sent (`RdataForm::AS_SENT`): the first label byte is `H`(0x48) against
 ///   our `h`(0x68), so the peer's SRV sorts BELOW ours and the peer loses.
-/// * normalised (`rdata_for_identity`): lowercased to `hosu.local.`, where
+/// * normalised (`RdataForm::FOLDED`): lowercased to `hosu.local.`, where
 ///   `u`(0x75) beats our `t`(0x74), so the peer's SRV sorts ABOVE ours and we
 ///   would defer to a host we in fact beat.
 ///
@@ -2539,7 +2539,7 @@ fn tiebreak_we_lose_defers_and_reprobes() {
 /// the mirror case, both believe they won and take the name.
 ///
 /// The datagram is hand-built because `MessageBuilder::write_name` LOWERCASES on
-/// transmit (the coupling `rdata_for_tiebreak` documents), so the ordinary
+/// transmit (the coupling `proposal::our_proposal` documents), so the ordinary
 /// fixture builder cannot express a peer that sent mixed case at all.
 #[test]
 fn a_peers_mixed_case_target_is_compared_as_the_peer_sent_it() {
@@ -3814,13 +3814,14 @@ fn question_does_not_push_out_announce_deadline() {
 
 // ── SRV KAS suppression — wire-form hash matches incoming hint ─
 
-/// A KnownAnswer hint for our SRV record (stored via rdata_for_identity,
-/// which uses wire-form target encoding) MUST match the filter built by
+/// A KnownAnswer hint for our SRV record (stored via the identity form, which
+/// uses wire-form target encoding) MUST match the filter built by
 /// write_announce_filtered (which now also uses wire-form encoding).
 ///
-/// Previously the filter used dot-joined plain bytes for the SRV target
-/// while rdata_for_identity used wire-form, so the hashes never matched
-/// and SRV hints could never suppress our SRV answer.
+/// Previously the filter used dot-joined plain bytes for the SRV target while
+/// the identity form used wire-form, so the hashes never matched and SRV hints
+/// could never suppress our SRV answer. `the_kas_filter_offers_the_bytes_the_
+/// identity_decoder_yields` now pins that pairing for every filtered type.
 #[test]
 fn srv_kas_hint_suppresses_srv_in_filtered_response() {
   use crate::{
@@ -4302,28 +4303,25 @@ fn tiebreak_always_includes_empty_txt() {
       ],
     );
 
-    // The peer's proposal through `respond::rdata_for_tiebreak` — the function
-    // the service actually runs over an inbound Authority Section — so the
-    // enumerated precondition below is about the bytes actually compared.
+    // The peer's proposal under `RdataForm::AS_SENT` — the form the service
+    // actually runs over an inbound Authority Section — so the enumerated
+    // precondition below is about the bytes actually compared.
     //
-    // THERE ARE TWO CANONICALIZERS AND PICKING THE WRONG ONE FAILS SILENTLY.
-    // `rdata_for_identity` answers "are these the same record" and normalises
-    // (lowercased SRV target, empty TXT rewritten to one zero-length string);
-    // `rdata_for_tiebreak` answers §8.2's "which sorts later" over the bytes the
-    // peer sent. They agree on this fixture's all-lowercase `host.local.` — this
-    // site used the identity one and passed — and diverge the moment a fixture
-    // uses a mixed-case target, at which point the expectations below would be
-    // asserting bytes the comparison never sees.
+    // THERE ARE TWO FORMS AND PICKING THE WRONG ONE FAILS SILENTLY. `FOLDED`
+    // answers "are these the same record" and normalises (lowercased SRV target,
+    // empty TXT rewritten to one zero-length string); `AS_SENT` answers §8.2's
+    // "which sorts later" over the bytes the peer sent. They agree on this
+    // fixture's all-lowercase `host.local.` — this site used the identity one and
+    // passed — and diverge the moment a fixture uses a mixed-case target, at
+    // which point the expectations below would be asserting bytes the comparison
+    // never sees.
     let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
     let peer_canonical = reader
       .authority()
       .flatten()
       .map(|r| {
-        let view = r.rdata_view().unwrap();
-        let mut scratch = std::vec::Vec::new();
-        let canonical = proposal::tiebreak_bytes_for_fixture(r.rtype(), &view, &mut scratch)
-          .unwrap()
-          .to_vec();
+        let mut canonical = std::vec::Vec::new();
+        proposal::tiebreak_bytes_for_fixture(&r, &mut canonical).unwrap();
         (r.rtype(), canonical)
       })
       .collect::<std::vec::Vec<_>>();
@@ -4537,19 +4535,16 @@ fn tiebreak_records_that_flatten_alike_are_not_a_tie() {
     crate::wire::ResourceType::Txt,
     "precondition: the peer's proposal is the single TXT, not a pair"
   );
-  let view = peer_rec.rdata_view().unwrap();
-  let mut scratch = std::vec::Vec::new();
-  // `rdata_for_tiebreak`, the function the §8.2 comparison actually runs over an
-  // inbound record — not `rdata_for_identity`, which normalises.
+  // `RdataForm::AS_SENT`, the form the §8.2 comparison actually runs over an
+  // inbound record — not `FOLDED`, which normalises.
   //
-  // THERE ARE TWO CANONICALIZERS AND PICKING THE WRONG ONE FAILS SILENTLY. They
-  // have the same signature and agree on every non-empty TXT, which is what this
-  // collision payload is — this site used the identity one and passed — so the
-  // wrong choice would only surface once a fixture proposed an empty TXT or a
-  // mixed-case name, and then it would be asserting bytes §8.2 never compares.
-  let canonical = proposal::tiebreak_bytes_for_fixture(peer_rec.rtype(), &view, &mut scratch)
-    .unwrap()
-    .to_vec();
+  // THERE ARE TWO FORMS AND PICKING THE WRONG ONE FAILS SILENTLY. They agree on
+  // every non-empty TXT, which is what this collision payload is — this site used
+  // the identity one and passed — so the wrong choice would only surface once a
+  // fixture proposed an empty TXT or a mixed-case name, and then it would be
+  // asserting bytes §8.2 never compares.
+  let mut canonical = std::vec::Vec::new();
+  proposal::tiebreak_bytes_for_fixture(&peer_rec, &mut canonical).unwrap();
   assert_eq!(
     canonical, their_txt_rdata,
     "precondition: the peer's compared TXT rdata is the enumerated collision \
@@ -6060,15 +6055,21 @@ fn post_establishment_conflict_is_rate_limited() {
 fn service_handle_and_canonical_record_accessors() {
   let svc = make_service(120);
   let _ = svc.handle();
-  // our_canonical_record_for covers the SRV, TXT, and fallback arms.
-  let _ = svc.our_canonical_record_for(crate::wire::ResourceType::Srv);
-  let _ = svc.our_canonical_record_for(crate::wire::ResourceType::Txt);
-  let _ = svc.our_canonical_record_for(crate::wire::ResourceType::A);
+  // our_canonical_records_for covers the SRV, TXT, and fallback arms.
+  let _ = svc.our_canonical_records_for(crate::wire::ResourceType::Srv);
+  let _ = svc.our_canonical_records_for(crate::wire::ResourceType::Txt);
+  assert!(
+    svc
+      .our_canonical_records_for(crate::wire::ResourceType::A)
+      .is_empty(),
+    "a type this service does not emit at its instance name has no form that \
+     could be ours"
+  );
 }
 
 #[test]
-fn rdata_for_identity_handles_nsec_and_unknown() {
-  // NSEC record → canonicalized via the raw type-bitmap bytes.
+fn identity_form_handles_nsec_and_unknown() {
+  // NSEC record → next_name then the type-bitmap bytes.
   let mut nbuf: std::vec::Vec<u8> = std::vec::Vec::new();
   nbuf.extend_from_slice(&[1, b'x', 5, b'l', b'o', b'c', b'a', b'l', 0]); // name
   nbuf.extend_from_slice(&47u16.to_be_bytes()); // TYPE NSEC
@@ -6077,9 +6078,11 @@ fn rdata_for_identity_handles_nsec_and_unknown() {
   nbuf.extend_from_slice(&12u16.to_be_bytes()); // RDLENGTH = next_name(9) + bitmap(3)
   nbuf.extend_from_slice(&[1, b'x', 5, b'l', b'o', b'c', b'a', b'l', 0, 0, 1, 0x40]);
   let (nrec, _) = Ref::try_parse(&nbuf, 0).unwrap();
-  let nview = nrec.rdata_view().unwrap();
-  let mut scratch = std::vec::Vec::new();
-  respond::rdata_for_identity(&nview, &mut scratch).unwrap();
+  assert_eq!(
+    &*nrec.canonical_rdata_folded().unwrap(),
+    &[1, b'x', 5, b'l', b'o', b'c', b'a', b'l', 0, 0, 1, 0x40],
+    "NSEC identity is its next_name, case-folded, then its bitmap"
+  );
 
   // Unknown record type → canonicalized via the raw rdata bytes (Other arm).
   let mut obuf: std::vec::Vec<u8> = std::vec::Vec::new();
@@ -6090,9 +6093,11 @@ fn rdata_for_identity_handles_nsec_and_unknown() {
   obuf.extend_from_slice(&3u16.to_be_bytes()); // RDLENGTH = 3
   obuf.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
   let (orec, _) = Ref::try_parse(&obuf, 0).unwrap();
-  let oview = orec.rdata_view().unwrap();
-  let mut scratch2 = std::vec::Vec::new();
-  respond::rdata_for_identity(&oview, &mut scratch2).unwrap();
+  assert_eq!(
+    &*orec.canonical_rdata_folded().unwrap(),
+    &[0xAA, 0xBB, 0xCC],
+    "a type absent from §18.14 is copied verbatim"
+  );
 }
 
 #[test]
@@ -9672,7 +9677,7 @@ fn an_undecodable_owner_name_abandons_the_whole_proposal() {
 /// R10 finding 4: an NSEC's `next_name` is part of the bytes §8.2 compares, so
 /// an NSEC that will not decode abandons the proposal.
 ///
-/// `rdata_for_tiebreak` dropped `next_name` entirely and kept only the bitmap.
+/// The §8.2 form dropped `next_name` entirely and kept only the bitmap.
 /// Two things followed: an NSEC with a cyclic next-name produced bytes at all,
 /// so a proposal of "our SRV, our TXT and one unreadable NSEC" counted as three
 /// records and won §8.2.1 on list length against our two; and two NSECs denying
@@ -9749,7 +9754,7 @@ fn an_unparsed_compressible_type_abandons_the_proposal() {
   dname.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
   dname.extend_from_slice(&120u32.to_be_bytes());
   dname.extend_from_slice(&2u16.to_be_bytes()); // RDLENGTH
-  dname.extend_from_slice(&[0xC0, 0x0C]); // a compression pointer
+  dname.extend_from_slice(&[0xFF, 0xFF]); // a pointer past the end of the datagram
   let bytes = raw_proposal_bytes(&[txt, srv, dname]);
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
@@ -10002,6 +10007,57 @@ fn a_response_of_any_type_at_our_instance_name_defeats_the_probe() {
   );
 }
 
+/// R13 finding 2. A malformed record at the probed name must not rename us, and
+/// the reason it used to is that two consumers disagreed about the same bytes.
+///
+/// Conflict routing widened from SRV/TXT to every positive-TTL IN record at the
+/// probed name, because §8.1's question is type ANY — which made an NS at that
+/// name reachable for the first time. The identity path then raw-copied unparsed
+/// rdata and always succeeded, so a compression pointer that resolves to nothing
+/// canonicalized to two bytes, compared unequal to the nothing we assert for NS,
+/// and became `Different` — an §8.1 defeat. The §8.2 path decompressed the same
+/// record, failed, and abandoned. One decoder later, both answer "undecodable".
+///
+/// The attack this closes costs one datagram and needs no knowledge of the
+/// victim's records at all.
+#[test]
+fn a_malformed_record_at_the_probed_name_is_not_a_conflict() {
+  // An NS record whose whole rdata is a compression pointer targeting its own
+  // offset — forward, so it resolves to nothing. `rdata_view` yields
+  // `Rdata::Other` and succeeds; only the decode discovers it.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    buf.push(u8::try_from(label.len()).unwrap());
+    buf.extend_from_slice(label.as_bytes());
+  }
+  buf.push(0u8);
+  buf.extend_from_slice(&2u16.to_be_bytes()); // TYPE NS
+  buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  buf.extend_from_slice(&120u32.to_be_bytes());
+  buf.extend_from_slice(&2u16.to_be_bytes()); // RDLENGTH = 2
+  let rdata_at = u16::try_from(buf.len()).unwrap();
+  buf.extend_from_slice(&(0xC000u16 | rdata_at).to_be_bytes());
+
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  assert!(
+    rec.rdata_view().is_ok(),
+    "precondition: this record PARSES — the divergence was never about parsing"
+  );
+
+  let mut svc = make_service(120);
+  let start = probe_once(&mut svc, FakeInstant::zero());
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+  assert!(
+    !svc.probe_defeated,
+    "a record nobody can decode supports no conclusion, so it must reach \
+     neither the §8.1 deferral nor the §9 revert"
+  );
+}
+
 /// R10 finding 1, the other half: widening the types must not make a
 /// byte-identical TWIN a conflict.
 ///
@@ -10039,7 +10095,96 @@ fn an_identical_twins_instance_nsec_is_never_a_conflict() {
   );
 }
 
-/// The duplication `respond::our_nsec_identity` warns about, pinned.
+/// R13 finding 3, CONFLICT SIDE ONLY. A conforming twin's CORRECT NSEC must not
+/// rename us just because ours is wrong.
+///
+/// When the host name IS the instance name, `write_probe` and `write_announce`
+/// put this service's A/AAAA records under the instance name too, so the
+/// complete RRset at that name is `{A, AAAA, SRV, TXT}` — and a conforming
+/// responder's §6.1 NSEC asserts exactly that. Ours asserts `{SRV, TXT}`,
+/// denying address records we ourselves emit. THAT defect is in NSEC generation,
+/// predates this branch, and is filed against `main`: fixing it changes the wire
+/// for every same-name deployment.
+///
+/// Its consequence here does not get to wait, because it is a rename. A correct
+/// twin's correct bitmap differs from our incorrect one, and differing rdata at a
+/// name we are probing is an RFC 6762 §8.1 defeat — so the twin the
+/// identical-rdata rule exists to protect would take our name from us for being
+/// right.
+#[test]
+fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name() {
+  use crate::wire::ResourceType;
+
+  let shared = Name::try_from_str(PROBED_NAME).unwrap();
+  let mut records = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    shared.clone(),
+    shared.clone(),
+    631,
+    120,
+  );
+  records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+  records.add_aaaa(core::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::try_new(
+      ServiceHandle::from_raw(0),
+      records,
+      FakeInstant::zero(),
+      [0u8; 32],
+      true,
+    );
+  let start = probe_once(&mut svc, FakeInstant::zero());
+
+  let nsec_record = |types: &[u16], buf: &mut [u8; 512]| -> std::vec::Vec<u8> {
+    let mut b =
+      crate::wire::MessageBuilder::<'_, 32>::try_new(buf, crate::wire::Header::new()).unwrap();
+    b.push_nsec_additional(&shared, 120, types, true).unwrap();
+    let n = b.finish().unwrap();
+    buf.get(..n).unwrap().to_vec()
+  };
+
+  // The bitmap a CONFORMING responder publishes for this name.
+  let mut buf = [0u8; 512];
+  let conforming = nsec_record(
+    &[
+      ResourceType::A.to_u16(),
+      ResourceType::AAAA.to_u16(),
+      ResourceType::Srv.to_u16(),
+      ResourceType::Txt.to_u16(),
+    ],
+    &mut buf,
+  );
+  let reader = crate::wire::MessageReader::try_parse(&conforming).unwrap();
+  let rec = reader.additional().flatten().next().unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+  assert!(
+    !svc.probe_defeated,
+    "a twin that correctly asserts {{A, AAAA, SRV, TXT}} at a name that really \
+     holds all four is indistinguishable from us, however our own NSEC spells it"
+  );
+
+  // And the leniency stays narrow: a bitmap that is neither what we emit nor
+  // what a conforming responder would emit here is still a conflict.
+  let mut buf2 = [0u8; 512];
+  let foreign = nsec_record(&[ResourceType::Ptr.to_u16()], &mut buf2);
+  let reader2 = crate::wire::MessageReader::try_parse(&foreign).unwrap();
+  let rec2 = reader2.additional().flatten().next().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec2, dg(2))),
+    start,
+  );
+  assert!(
+    svc.probe_defeated,
+    "an NSEC asserting an RRset that is not ours is another owner answering for \
+     our name"
+  );
+}
+
+/// The duplication `respond::our_nsec_identities` warns about, pinned.
 ///
 /// It reconstructs the RFC 4034 §4.1.2 type bitmap that
 /// `MessageBuilder::push_nsec_additional` writes, because the builder works
@@ -10047,7 +10192,8 @@ fn an_identical_twins_instance_nsec_is_never_a_conflict() {
 /// changes without the other, our own NSEC stops being recognisable as ours and
 /// a twin's copy of it renames us.
 #[test]
-fn our_nsec_identity_matches_what_the_builder_emits() {
+fn our_nsec_identities_match_what_the_builder_emits() {
+  let svc = make_service(120);
   let mut msg = [0u8; 512];
   let inst = Name::try_from_str(PROBED_NAME).unwrap();
   let mut b =
@@ -10057,14 +10203,13 @@ fn our_nsec_identity_matches_what_the_builder_emits() {
   let n = b.finish().unwrap();
   let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
   let rec = reader.additional().flatten().next().unwrap();
-  let view = rec.rdata_view().unwrap();
-  let mut scratch = std::vec::Vec::new();
-  let on_the_wire = respond::rdata_for_identity(&view, &mut scratch).unwrap();
-  assert_eq!(
-    on_the_wire,
-    respond::our_nsec_identity().as_slice(),
-    "the reconstructed instance-NSEC identity must equal the identity of the \
-     NSEC the builder actually emits"
+  let on_the_wire = rec.canonical_rdata_folded().unwrap();
+  let recognised = respond::our_nsec_identities(svc.records());
+  assert!(
+    recognised.iter().any(|f| f.as_slice() == &*on_the_wire),
+    "the reconstructed instance-NSEC identity must be among the forms we \
+     recognise as ours; the builder emits {on_the_wire:?}, we recognise \
+     {recognised:?}"
   );
 }
 
@@ -10164,9 +10309,13 @@ fn a_compressed_kx_abandons_rather_than_lengthening_the_peers_list() {
     exotic.extend_from_slice(&rtype.to_be_bytes());
     exotic.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
     exotic.extend_from_slice(&120u32.to_be_bytes());
-    // preference(2) + a compression pointer that cycles onto itself.
+    // preference(2) + a compressed target pointing past the end of the datagram,
+    // so it cannot be resolved. UNRESOLVABLE is the point: since R12 these types
+    // are decompressed and COMPARED when their names resolve, so a resolvable
+    // pointer would (correctly) make the peer's longer list win rather than
+    // abandon. See `comparability_of_unparsed_rdata_is_a_per_type_question`.
     exotic.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
-    exotic.extend_from_slice(&[0x00, 0x0A, 0xC0, 0x0C]);
+    exotic.extend_from_slice(&[0x00, 0x0A, 0xFF, 0xFF]);
     let bytes = raw_proposal_bytes(&[txt, srv, exotic]);
 
     let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
@@ -10242,5 +10391,69 @@ fn a_pointer_named_question_abandons_even_when_another_question_admits() {
      query ASKS unknown, so the proposal is abandoned — the readable question \
      must not adjudicate it alone (control: \
      `the_winning_pair_control_really_does_lose_the_round`)"
+  );
+}
+
+/// R12-2: a malformed authoritative RESPONSE must not defeat the probe.
+///
+/// `response_rdata_is_ours` returned a plain `bool`, so a parse or
+/// canonicalisation failure came back as `false` — which dispatch read as
+/// DIFFERING rdata. A QR=1 IN/SRV response whose target is a cyclic or
+/// forward-pointing name therefore set `probe_defeated` and renamed the service,
+/// and repeating it gave unbounded suffix churn and finally a terminal conflict.
+/// An attacker needed one malformed record and no knowledge of our rdata.
+///
+/// Invalid is now its own answer and stops before every conflict arm — which is
+/// what the ESTABLISHED §9 path already did with the same data, so the two
+/// halves of one rule had disagreed.
+#[test]
+fn a_malformed_response_does_not_defeat_the_probe() {
+  let mut svc = make_service(120);
+  let start = probe_once(&mut svc, FakeInstant::zero());
+  let before = svc.name().as_str().to_owned();
+
+  // An SRV at our instance name whose target is a compression pointer past the
+  // end of the datagram: it parses as a record, and only resolving the name
+  // fails.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    buf.push(label.len() as u8);
+    buf.extend_from_slice(label.as_bytes());
+  }
+  buf.push(0u8);
+  buf.extend_from_slice(&33u16.to_be_bytes()); // SRV
+  buf.extend_from_slice(&1u16.to_be_bytes()); // IN
+  buf.extend_from_slice(&120u32.to_be_bytes());
+  buf.extend_from_slice(&8u16.to_be_bytes()); // RDLENGTH
+  buf.extend_from_slice(&[0, 0, 0, 0, 0x27, 0x0F, 0xFF, 0xFF]); // …target unresolvable
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+
+  assert!(
+    !svc.probe_defeated,
+    "rdata that will not decode supports no conclusion — it must not be read as \
+     DIFFERING rdata and latch an §8.1 defeat"
+  );
+  let spent = start.advance(500);
+  svc.handle_timeout(spent).unwrap();
+  assert_eq!(
+    svc.name().as_str(),
+    before,
+    "…and so the service must not rename: repeating this record would otherwise \
+     give unbounded suffix churn on one malformed packet"
+  );
+  let mut updates = std::vec::Vec::new();
+  while let Some(u) = svc.poll() {
+    updates.push(u);
+  }
+  assert!(
+    !updates.iter().any(ServiceUpdate::is_renamed),
+    "…and queue no Renamed update; got {updates:?}"
   );
 }
