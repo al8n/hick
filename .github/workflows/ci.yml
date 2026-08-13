@@ -888,7 +888,16 @@ jobs:
       - name: hick-compio cmsg parser under Miri
         env:
           MIRIFLAGS: -Zmiri-permissive-provenance
-        run: cargo miri test -p hick-compio --lib --no-fail-fast -- socket::unix:: --skip from_std
+        # Block scalar, not a plain one: the filter ends `socket::unix:: ` and a
+        # colon-space inside an unquoted YAML scalar is a mapping indicator, so
+        # the plain form makes this FILE unparseable. GitHub then reports
+        # "This run likely failed because of a workflow file issue" and, far
+        # worse, contributes NO checks at all — a PR's check list simply goes
+        # short while every check present says pass. That shipped: #89 and #90
+        # both merged with this file never running, 10 checks apiece where the
+        # PR before them had 25, and nothing red anywhere.
+        run: |
+          cargo miri test -p hick-compio --lib --no-fail-fast -- socket::unix:: --skip from_std
       # The SAME tests again, interpreted for Android. Miri executes no machine
       # code, so a foreign target costs a sysroot and nothing else — and this is
       # not redundancy. `cmsghdr` layout, `CMSG_ALIGN` and libc's own macro
