@@ -868,6 +868,43 @@ jobs:
       - env:
           MIRIFLAGS: -Zmiri-strict-provenance
         run: cargo miri test -p mdns-proto --all-features --no-fail-fast
+      # `-p mdns-proto` cannot reach the ONE parser in this workspace that walks
+      # kernel-supplied memory with raw pointers: `hick-compio`'s `CMsgIter` /
+      # `CMsgRef`, where `data::<T>()` hands callers a pointer PAST the header it
+      # was minted from. That shipped for months as a Stacked Borrows violation
+      # — the payload pointer was derived from a `&cmsghdr`, whose retag narrows
+      # provenance to the header — and no CI step could see it, because the only
+      # tool that can see it was pointed at a different crate. The filter selects
+      # the `socket::unix` cmsg tests and skips the two that bind a real socket
+      # (Miri has no kernel to `setsockopt` against).
+      #
+      # NOT `-Zmiri-strict-provenance`, unlike the step above: `libc::CMSG_NXTHDR`
+      # computes the next header as `cmsg as usize + CMSG_ALIGN(..)` and casts the
+      # sum back, and strict provenance rejects that inside libc before any of
+      # this workspace's code runs. `CMsgIter::anchor` re-derives libc's answer
+      # from the control buffer's own base pointer, which is what puts a real,
+      # bounds-checkable tag back on the walk; `-Zmiri-permissive-provenance` only
+      # silences libc's warning about libc's own cast.
+      - name: hick-compio cmsg parser under Miri
+        env:
+          MIRIFLAGS: -Zmiri-permissive-provenance
+        run: cargo miri test -p hick-compio --lib --no-fail-fast -- socket::unix:: --skip from_std
+      # The SAME tests again, interpreted for Android. Miri executes no machine
+      # code, so a foreign target costs a sysroot and nothing else — and this is
+      # not redundancy. `cmsghdr` layout, `CMSG_ALIGN` and libc's own macro
+      # bodies all differ per target, and Android's `CMSG_NXTHDR` evaluates
+      # `next.offset(1)` in order to decide whether `next` was in range, which
+      # is undefined the moment `next` is the end of the allocation — something
+      # an ordinary FULL control buffer produces from well-formed ancillary
+      # data. The x86_64-linux leg above stayed green on exactly that code;
+      # only this one was red. `cross-check` compiles Android and never runs it,
+      # so no other job in this workflow could have seen it.
+      - name: hick-compio cmsg parser under Miri (Android ABI)
+        env:
+          MIRIFLAGS: -Zmiri-permissive-provenance
+        run: |
+          cargo miri setup --target aarch64-linux-android
+          cargo miri test --target aarch64-linux-android -p hick-compio --lib --no-fail-fast -- socket::unix:: --skip from_std
 
   bloat-panic-scan:
     runs-on: ubuntu-latest

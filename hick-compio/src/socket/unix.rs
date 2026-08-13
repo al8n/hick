@@ -1,4 +1,4 @@
-use libc::{cmsghdr, msghdr};
+use libc::cmsghdr;
 
 // Each address type is used only inside its matching capability-gated cmsg arm
 // below (`IpAddr` in both); gate the imports the same way so platforms that lack
@@ -16,35 +16,96 @@ use hick_udp::onlink::{DestinationWitness, IfaceWitness};
 use super::RecvMeta;
 
 /// One ancillary control message inside a filled control buffer.
+///
+/// # Why a raw pointer rather than a `&'a cmsghdr`
+///
+/// [`CMsgRef::data`] hands back a pointer to the payload that FOLLOWS the
+/// header, and callers read `size_of::<T>()` bytes through it. A `&'a cmsghdr`
+/// cannot license that read: under Stacked Borrows the retag that creates the
+/// reference narrows provenance to the `size_of::<cmsghdr>()` bytes of the
+/// header itself, so every payload byte derived from it is out of bounds *for
+/// that tag* even though it sits well inside the control buffer the kernel
+/// filled — the arithmetic is right and the tag is wrong. Miri said exactly
+/// that: "attempting a read access using `<tag>` at `alloc[0xc]`, but that tag
+/// does not exist in the borrow stack for this location", against a tag
+/// "created by a SharedReadOnly retag at offsets `[0x0..0xc]`" (0xc =
+/// `size_of::<cmsghdr>()` on Darwin).
+///
+/// So the header is held as a `*const cmsghdr` whose provenance spans the WHOLE
+/// control buffer — [`CMsgIter`] anchors every header pointer it mints to the
+/// buffer's own base pointer — the borrow is carried by `PhantomData` instead
+/// of by the pointer, and the header's fields are read through `&raw const`
+/// place projections, which compute an address without materialising a
+/// reference and therefore without re-narrowing the tag.
+///
+/// # Why the payload length is a field
+///
+/// `cmsg_len` is a number the KERNEL wrote into a buffer, and on a truncated
+/// receive it describes a cmsg longer than the bytes that actually arrived —
+/// `MSG_CTRUNC` on Darwin copies a prefix of the final cmsg while leaving its
+/// original `cmsg_len` intact. Recomputing the payload length from that field
+/// on demand therefore reports a length the buffer does not back, and the
+/// caller-side `data_len() >= size_of::<T>()` guard passes on it. So the length
+/// is not recomputed: [`CMsgIter`] validates `cmsg_len` against the bytes that
+/// remain and stores the surviving bound here at construction. A `CMsgRef` that
+/// exists is a cmsg whose payload is present, and no caller can ask it for a
+/// length the buffer does not hold.
 pub(crate) struct CMsgRef<'a> {
-  inner: &'a cmsghdr,
+  hdr: *const cmsghdr,
+  /// Payload bytes PROVEN present in the control buffer — `cmsg_len` minus the
+  /// payload offset, already clamped to what the buffer actually holds. See
+  /// [`CMsgIter::next`], which is the only thing that may set it.
+  data_len: usize,
+  _lt: core::marker::PhantomData<&'a [u8]>,
 }
 
 impl CMsgRef<'_> {
+  /// Read one header field without forming a `&cmsghdr`.
+  ///
+  /// `read_unaligned` rather than a plain read: it compiles to the same thing
+  /// for these word-sized fields on every supported target, and it keeps the
+  /// accessors sound on their own terms instead of leaning on
+  /// [`CMsgIter::new`]'s alignment assert.
+  ///
+  /// # Safety
+  ///
+  /// `field` must be a `&raw const` projection of a header that [`CMsgIter`]
+  /// has established lies wholly inside the control buffer, so it is valid for
+  /// reads of `T`.
+  #[inline]
+  unsafe fn field<T: Copy>(field: *const T) -> T {
+    // SAFETY: the caller passes a projection of a header pointer derived from
+    // the control buffer and bounds-checked against it.
+    unsafe { core::ptr::read_unaligned(field) }
+  }
+
   #[inline]
   pub(crate) fn level(&self) -> libc::c_int {
-    self.inner.cmsg_level
+    // SAFETY: `hdr` addresses a `cmsghdr` inside the buffer borrowed for `'a`;
+    // `&raw const` projects to the field without retagging.
+    unsafe { Self::field(&raw const (*self.hdr).cmsg_level) }
   }
 
   #[inline]
   pub(crate) fn ty(&self) -> libc::c_int {
-    self.inner.cmsg_type
+    // SAFETY: as in `level`.
+    unsafe { Self::field(&raw const (*self.hdr).cmsg_type) }
   }
 
-  /// Number of payload bytes this cmsg actually carries (`cmsg_len` minus the
-  /// header/alignment offset). Saturating so a corrupt short cmsg yields 0.
+  /// Number of payload bytes this cmsg actually carries — `cmsg_len` minus the
+  /// header/alignment offset, saturating so a corrupt short cmsg yields 0, and
+  /// clamped to the bytes the control buffer really holds.
   ///
-  /// Callers must check `data_len() >= size_of::<T>()` before reading the
-  /// payload as `T` via [`CMsgRef::data`]; otherwise the read would run past
-  /// the bytes the kernel actually deposited for this cmsg.
+  /// Both halves are established once, in [`CMsgIter::next`], and read back
+  /// from a field here; see the type-level note on why this is not recomputed
+  /// from `cmsg_len` on demand.
+  ///
+  /// Callers must still check `data_len() >= size_of::<T>()` before reading the
+  /// payload as `T` via [`CMsgRef::data`]: this is the length of the payload,
+  /// not a promise that it is as wide as any particular `T`.
   #[inline]
-  // `cmsg_len` is `usize` on Linux but `socklen_t` (u32) on the BSDs/macOS, so
-  // the `as usize` is platform-conditionally necessary.
-  #[allow(clippy::unnecessary_cast)]
   pub(crate) fn data_len(&self) -> usize {
-    // SAFETY: CMSG_LEN is a pure size macro (no pointer deref).
-    let base = unsafe { libc::CMSG_LEN(0) } as usize;
-    (self.inner.cmsg_len as usize).saturating_sub(base)
+    self.data_len
   }
 
   /// View the cmsg payload as `T`.
@@ -52,8 +113,11 @@ impl CMsgRef<'_> {
   /// # Safety
   ///
   /// - Caller must guarantee `T` matches the actual cmsg payload type/size,
-  ///   and the underlying buffer must outlive any read through the returned
-  ///   pointer.
+  ///   and must have checked `data_len() >= size_of::<T>()` — that bound is
+  ///   verified against the control buffer (see the type-level note), so
+  ///   honouring it is what keeps the read inside the buffer as well as inside
+  ///   the cmsg. The underlying buffer must outlive any read through the
+  ///   returned pointer.
   /// - **Alignment caveat:** `CMSG_DATA` is only guaranteed to be aligned
   ///   to `align_of::<libc::cmsghdr>()` (4 bytes on Darwin). When
   ///   `align_of::<T>() > align_of::<libc::cmsghdr>()` — for example
@@ -63,12 +127,15 @@ impl CMsgRef<'_> {
   ///   are UB on misaligned data.
   #[inline]
   pub(crate) unsafe fn data<T>(&self) -> *const T {
-    // SAFETY: caller asserts T matches; CMSG_DATA returns a pointer into
-    // the same allocation as `inner`, which is borrowed for 'a. The caller
-    // is responsible for honoring T's alignment (see method-level alignment
-    // caveat above) — `*ptr` reads of misaligned data are UB, and they must
-    // use `core::ptr::read_unaligned` in that case.
-    unsafe { libc::CMSG_DATA(self.inner as *const cmsghdr) as *const T }
+    // SAFETY: caller asserts T matches. `CMSG_DATA` is a pure `offset` off the
+    // header pointer, so the result inherits `hdr`'s provenance — and `hdr`
+    // spans the whole control buffer (see the type's docs and `CMsgIter`),
+    // which is what makes the payload bytes the caller then reads in bounds
+    // FOR THIS TAG and not merely in bounds for the allocation. The caller is
+    // responsible for honoring T's alignment (see the alignment caveat above)
+    // — `*ptr` reads of misaligned data are UB, and they must use
+    // `core::ptr::read_unaligned` in that case.
+    unsafe { libc::CMSG_DATA(self.hdr) as *const T }
   }
 }
 
@@ -77,9 +144,76 @@ impl CMsgRef<'_> {
 /// The buffer must be aligned to `align_of::<cmsghdr>()` — see
 /// [`CMsgIter::new`]. In production this is satisfied by routing the kernel's
 /// fill through a `cmsghdr`-aligned scratch buffer.
+///
+/// # Why this forms no pointer libc could have formed
+///
+/// The walk is pure integer arithmetic over an `off`/`len` pair, and a pointer
+/// is derived from `base` only once the offset it names has been proven to hold
+/// a whole header. `CMSG_FIRSTHDR` and `CMSG_NXTHDR` are NOT USED. That is not
+/// stylistic:
+///
+/// * **`CMSG_NXTHDR` can be UB to call at all.** On Android it is
+///   `let next = (cmsg as usize + CMSG_ALIGN(cmsg_len)) as *mut cmsghdr;` and
+///   then `if (next.offset(1)) as usize > max` — libc forms a pointer one
+///   `cmsghdr` PAST its candidate before comparing anything, so a candidate at
+///   the end of the buffer offsets past the end of the allocation. Validating
+///   the return value cannot help: the UB is inside the macro, before it
+///   returns. Our own `AlignedCtrlBuf` is a fixed 512 bytes, so an ordinary
+///   full buffer whose last cmsg ends exactly at 512 reaches it while parsing
+///   well-formed ancillary data — a kernel-shaped case, not a corrupt-input
+///   one. (`libc-0.2.189`, `src/unix/linux_like/android/mod.rs:3471`. Linux's
+///   own copy in `linux_l4re_shared.rs` uses `wrapping_add` and is fine;
+///   Apple/FreeBSD/DragonFly/NetBSD/OpenBSD compute entirely in `usize` and
+///   are also fine. Android is the one that offsets a raw pointer.)
+/// * **`CMSG_NXTHDR` is not a bounds check.** On Darwin and the BSDs it
+///   computes `cmsg + CMSG_ALIGN(cmsg_len)`, which for a `cmsg_len` of zero is
+///   the header it started from, so a walk that trusts it REPEATS THAT HEADER
+///   FOR EVER.
+/// * **Its arithmetic is unchecked.** `CMSG_ALIGN(len)` is `(len + ALIGNBYTES)
+///   & !ALIGNBYTES` on every supported target, and `cmsg as usize + ...` is a
+///   plain `+`. A large `cmsg_len` overflows before any comparison happens.
+///
+/// # What is computed instead
+///
+/// The stride to the next header is `CMSG_SPACE(data_len)` — a pointer-free
+/// length macro that encodes each target's own `CMSG_ALIGN`, so nothing here
+/// re-derives an alignment constant by hand (a hand-rolled `apple ? 4 :
+/// size_of::<usize>()` is wrong on BSD arches whose `_ALIGNBYTES` differs from
+/// the pointer width, e.g. NetBSD/aarch64, where it is 4). It is the same
+/// quantity `CMSG_NXTHDR` advances by: with `cmsg_len == CMSG_LEN(data_len) ==
+/// A(hdr) + data_len` and `A` idempotent on its own output, `A(cmsg_len) =
+/// A(hdr) + A(data_len) = CMSG_SPACE(data_len)`.
+///
+/// Before any cmsg is yielded [`CMsgIter::next`] establishes, in order: a
+/// complete header is present; `cmsg_len` covers its own header and does not
+/// exceed the bytes that remain; the payload offset is inside the buffer; and
+/// the successor offset both clears the cmsg just read and leaves room for a
+/// WHOLE header inside `len`. Every step is `checked_*`. Anything else FUSES
+/// the walk — a malformed `cmsg_len` is the only route to the next header, so
+/// once it is unusable nothing beyond it is recoverable, and repeating or
+/// guessing is worse than stopping.
+///
+/// This is `hick-udp`'s `CmsgIter`, arrived at from the other side: same
+/// pointer-free stride, same three validations, over the same kernel ABI. The
+/// two implementations exist because they parse into different types, and every
+/// finding against this one so far has been a place where it had not yet
+/// converged.
+///
+/// The header pointer handed to a [`CMsgRef`] is derived from `base` — see
+/// [`CMsgIter::anchor`] — so the payload pointer a caller ultimately reads
+/// through carries provenance over the entire control buffer.
 pub(crate) struct CMsgIter<'a> {
-  msg: msghdr,
-  next: *const cmsghdr,
+  /// The control buffer's own base pointer, kept as the provenance root for
+  /// every header pointer minted below. Never dereferenced through directly.
+  base: *const u8,
+  /// The control buffer's length. Authoritative for every bound below. No
+  /// `msghdr` is kept beside it: with libc's pointer macros gone there is
+  /// nothing to hand one to, and `msg_controllen` is a narrower integer type on
+  /// the BSDs than the length it would be copied from.
+  len: usize,
+  /// Byte offset of the next candidate header, or `None` once the walk has
+  /// ended — either normally or by fusing on malformed input.
+  next: Option<usize>,
   _lt: core::marker::PhantomData<&'a [u8]>,
 }
 
@@ -96,37 +230,126 @@ impl<'a> CMsgIter<'a> {
       buf.as_ptr().cast::<cmsghdr>().is_aligned(),
       "control buffer is not aligned for cmsghdr"
     );
-    // SAFETY: msghdr's all-zero pattern is a valid empty header. We then
-    // patch the control pointer/len to point at the borrowed buffer.
-    let mut msg: msghdr = unsafe { core::mem::zeroed() };
-    msg.msg_control = buf.as_ptr() as *mut _;
-    msg.msg_controllen = buf.len() as _;
-    // SAFETY: msg has its control fields set to the borrowed buffer, which
-    // outlives 'a; CMSG_FIRSTHDR reads only those fields.
-    let next = unsafe { libc::CMSG_FIRSTHDR(&msg) } as *const cmsghdr;
+    let base = buf.as_ptr();
+    let len = buf.len();
+    // The first header is at offset 0 when one fits — which is all
+    // `CMSG_FIRSTHDR` says on every supported target (`msg_controllen >=
+    // size_of::<cmsghdr>()` then `msg_control`, else null; `linux_like/mod.rs`
+    // and `bsd/mod.rs` are byte-for-byte the same test). Stating it here costs
+    // nothing and keeps the `msghdr` this walk no longer needs out of the type.
     Self {
-      msg,
-      next,
+      base,
+      len,
+      next: (len >= core::mem::size_of::<cmsghdr>()).then_some(0),
       _lt: core::marker::PhantomData,
     }
+  }
+
+  /// Offset of the header FOLLOWING the one at `off`, or `None` when the buffer
+  /// holds no further whole header or its own arithmetic cannot be trusted.
+  ///
+  /// Everything here is integers, and every step is checked, because libc's
+  /// version of this is neither. Three things must hold before an offset is
+  /// handed back:
+  ///
+  /// * the stride is representable — `CMSG_SPACE` takes and returns `c_uint`
+  ///   while computing in `usize`, so a `data_len` near `u32::MAX` truncates on
+  ///   return to something smaller than the cmsg it was meant to skip;
+  /// * the stride actually CLEARS the cmsg just read (`stride >= cmsg_len`), so
+  ///   the walk cannot be handed back a position at or before where it started;
+  /// * a WHOLE successor header fits — `next + size_of::<cmsghdr>() <= len`,
+  ///   not merely `next <= len`. Its start being inside the buffer says nothing
+  ///   about the header that would be read there.
+  #[inline]
+  fn successor(off: usize, cmsg_len: usize, data_len: usize, len: usize) -> Option<usize> {
+    let dl = u32::try_from(data_len).ok()?;
+    // SAFETY: CMSG_SPACE is pure length arithmetic — it takes an integer and
+    // dereferences no memory (libc marks it `unsafe` by convention only).
+    let stride = unsafe { libc::CMSG_SPACE(dl) } as usize;
+    if stride < cmsg_len {
+      return None;
+    }
+    let next = off.checked_add(stride)?;
+    (next.checked_add(core::mem::size_of::<cmsghdr>())? <= len).then_some(next)
+  }
+
+  /// Derive a header pointer from the buffer's own base pointer.
+  ///
+  /// This is the ONLY place a pointer is formed, and it takes an offset that
+  /// [`CMsgIter::next`] has already proven names a whole header inside the
+  /// buffer. Deriving from `base` is what gives the result — and the payload
+  /// pointer [`CMsgRef::data`] later offsets out of it — provenance over the
+  /// whole control buffer rather than over one header or over nothing at all.
+  ///
+  /// Deriving a pointer for an address does not VALIDATE that address, and must
+  /// not be mistaken for having done so. The validation is the checked integer
+  /// arithmetic in [`CMsgIter::next`] and [`CMsgIter::successor`], which runs
+  /// first and never forms a pointer to test a candidate — the mistake libc's
+  /// `CMSG_NXTHDR` makes on Android, where `next.offset(1)` is evaluated to
+  /// decide whether `next` was in range.
+  #[inline]
+  fn anchor(base: *const u8, off: usize) -> *const cmsghdr {
+    base.wrapping_add(off).cast::<cmsghdr>()
   }
 }
 
 impl<'a> Iterator for CMsgIter<'a> {
   type Item = CMsgRef<'a>;
 
+  // `cmsg_len` is `usize` on Linux but `socklen_t` (u32) on the BSDs/macOS, so
+  // the `as usize` is platform-conditionally necessary.
+  #[allow(clippy::unnecessary_cast)]
   fn next(&mut self) -> Option<Self::Item> {
-    if self.next.is_null() {
+    // `take` fuses by default: every path out of here leaves the walk ended
+    // unless it explicitly sets a validated successor at the bottom.
+    let off = self.next.take()?;
+    let hdr_size = core::mem::size_of::<cmsghdr>();
+    // `off + hdr_size <= self.len` is guaranteed by whichever of `new` or
+    // `successor` set it, so this cannot wrap.
+    let remaining = self.len - off;
+    // A whole header must be present before a single field of it is read.
+    if remaining < hdr_size {
       return None;
     }
-    // SAFETY: CMSG_FIRSTHDR / CMSG_NXTHDR returned a pointer inside the
-    // control buffer that outlives 'a, or null when exhausted. Alignment
-    // is ensured at `CMsgIter::new`.
-    let cur = unsafe { &*self.next };
-    // SAFETY: same as above; `next` is either a valid header pointer or
-    // null at this point. CMSG_NXTHDR walks the control buffer.
-    self.next = unsafe { libc::CMSG_NXTHDR(&self.msg, self.next) } as *const cmsghdr;
-    Some(CMsgRef { inner: cur })
+    let hdr = Self::anchor(self.base, off);
+    // SAFETY: the check above puts all `size_of::<cmsghdr>()` bytes of the
+    // header inside the buffer, and `hdr` is derived from that buffer's base.
+    let cmsg_len = unsafe { CMsgRef::field(&raw const (*hdr).cmsg_len) } as usize;
+    // `cmsg_len` must cover its own header, and must not claim more bytes than
+    // the buffer holds. THE SECOND TEST IS THE TRUNCATION CASE: on a Darwin
+    // `MSG_CTRUNC` receive the kernel copies a prefix of the final cmsg and
+    // leaves `cmsg_len` describing the whole of it, so without this the payload
+    // bound below would be a length the buffer does not back.
+    if cmsg_len < hdr_size || cmsg_len > remaining {
+      return None;
+    }
+    // The payload begins at `CMSG_LEN(0)` — the header size rounded up to the
+    // platform's cmsg alignment, which exceeds `size_of::<cmsghdr>()` on the
+    // BSDs. Pure length arithmetic, no pointer.
+    // SAFETY: CMSG_LEN is a pure size macro (no pointer deref).
+    let data_start = unsafe { libc::CMSG_LEN(0) } as usize;
+    // A cmsg whose padded payload offset runs off the end carries no payload
+    // this buffer can serve, and `CMSG_DATA` would compute a pointer past the
+    // end of the allocation just to describe it. Refuse rather than form it.
+    if data_start > remaining {
+      return None;
+    }
+    // Saturating, so a `cmsg_len` too short to reach the payload offset yields
+    // an empty payload rather than wrapping; then clamped to the bytes actually
+    // present, which after the `cmsg_len > remaining` test above is a
+    // belt-and-braces bound rather than the load-bearing one.
+    let data_len = cmsg_len
+      .saturating_sub(data_start)
+      .min(remaining - data_start);
+    // The successor is computed, checked, and only then believed — no pointer
+    // is formed for a candidate position, which is the whole point (see the
+    // type-level note on Android's `next.offset(1)`).
+    self.next = Self::successor(off, cmsg_len, data_len, self.len);
+    Some(CMsgRef {
+      hdr,
+      data_len,
+      _lt: core::marker::PhantomData,
+    })
   }
 }
 
@@ -158,8 +381,8 @@ impl<'a> CMsgBuilder<'a> {
       "control buffer is not aligned for cmsghdr"
     );
     // recvmsg/sendmsg expect the inter-cmsg padding bytes to be zero; just
-    // zero the whole buffer up front so subsequent CMSG_NXTHDR walks see
-    // well-defined padding.
+    // zero the whole buffer up front so any subsequent walk — this crate's or
+    // the kernel's — sees well-defined padding.
     for b in buf.iter_mut() {
       *b = 0;
     }
@@ -969,6 +1192,305 @@ fn cmsg_builder_emits_a_round_trippable_pktinfo() {
   let got = unsafe { core::ptr::read_unaligned(cmsg.data::<in_pktinfo>()) };
   assert_eq!(got.ipi_ifindex, 7);
   assert!(iter.next().is_none(), "no second cmsg");
+}
+
+/// Read the payload of EVERY cmsg in a two-entry buffer, second one included.
+///
+/// This is the provenance test, and it is deliberately not covered by the
+/// single-cmsg tests above. [`CMsgRef::data`] returns a pointer derived from
+/// the header pointer [`CMsgIter`] minted, and the two headers are minted by
+/// different routes: the first is the walk's starting offset and would be right
+/// even if the stride arithmetic were not, while the second is the one
+/// [`CMsgIter::successor`] has to compute. A `CMsgRef` that held a `&cmsghdr`
+/// narrowed that pointer's provenance to the header, making the payload read
+/// out of bounds for its own tag on BOTH of them. Neither property is
+/// observable in a normal build — `cargo miri test -p hick-compio
+/// --lib` is where this test does its work.
+///
+/// The payload type is `u32` and the levels/types are arbitrary: `CMsgIter`
+/// walks by `cmsg_len` alone and never interprets either field, so nothing here
+/// needs a platform capability cfg, and this runs on every unix target.
+#[cfg(all(unix, test))]
+#[test]
+fn cmsg_iter_reads_the_payload_of_every_cmsg_it_walks() {
+  const FIRST: (libc::c_int, libc::c_int) = (libc::SOL_SOCKET, 0x11);
+  const SECOND: (libc::c_int, libc::c_int) = (libc::SOL_SOCKET, 0x22);
+  // `Vec<u64>` backing for ≥8-byte alignment, as in the tests above; a plain
+  // `vec![0u8; N]` is alignment 1 and would trip `CMsgIter::new`.
+  assert!(core::mem::align_of::<cmsghdr>() <= core::mem::align_of::<u64>());
+  let mut backing: Vec<u64> = vec![0u64; 128 / core::mem::size_of::<u64>()];
+  // SAFETY: backing owns `len * 8 == 128` zeroed bytes; the resulting slice is
+  // borrowed for the rest of this scope and never aliased.
+  let buf: &mut [u8] =
+    unsafe { core::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), 128) };
+  let written = {
+    let mut b = CMsgBuilder::new(buf);
+    b.push(FIRST.0, FIRST.1, &0xa1a2_a3a4u32)
+      .expect("first fits");
+    b.push(SECOND.0, SECOND.1, &0xb1b2_b3b4u32)
+      .expect("second fits");
+    b.finish()
+  };
+  let walked: Vec<(libc::c_int, libc::c_int, u32)> = CMsgIter::new(&buf[..written])
+    .map(|c| {
+      assert!(
+        c.data_len() >= core::mem::size_of::<u32>(),
+        "the builder wrote a full u32 payload"
+      );
+      // CMSG_DATA guarantees only `cmsghdr` alignment, so read unaligned —
+      // the same rule `CMsgRef::data` documents for `timeval`/`timespec`.
+      let v = unsafe { core::ptr::read_unaligned(c.data::<u32>()) };
+      (c.level(), c.ty(), v)
+    })
+    .collect();
+  assert_eq!(
+    walked,
+    vec![
+      (FIRST.0, FIRST.1, 0xa1a2_a3a4u32),
+      (SECOND.0, SECOND.1, 0xb1b2_b3b4u32),
+    ],
+    "both cmsgs must round-trip, the second through the computed stride"
+  );
+}
+
+/// A `cmsghdr`-aligned scratch buffer plus the number of bytes a builder wrote
+/// into it, for the malformed-input tests below. Mirrors `AlignedCtrlBuf`'s
+/// shape — a fixed backing array, of which only a prefix is ever presented —
+/// because that is what makes the truncation test faithful AND detectable: the
+/// slice handed to `CMsgIter` is a PREFIX of a larger live allocation, exactly
+/// as `AlignedCtrlBuf::filled(kernel_len)` produces, so a read past the prefix
+/// is out of bounds for the slice's tag while still landing on readable memory.
+/// A test that instead sized the allocation to the prefix would catch the same
+/// bug for the wrong reason, and would stop catching it the moment the
+/// production buffer went back to being fixed-size.
+#[cfg(all(unix, test))]
+struct CtrlScratch {
+  backing: Vec<u64>,
+}
+
+#[cfg(all(unix, test))]
+impl CtrlScratch {
+  const BYTES: usize = 128;
+
+  fn new() -> Self {
+    assert!(core::mem::align_of::<cmsghdr>() <= core::mem::align_of::<u64>());
+    Self {
+      backing: vec![0u64; Self::BYTES / core::mem::size_of::<u64>()],
+    }
+  }
+
+  /// The whole scratch area as bytes.
+  fn bytes(&mut self) -> &mut [u8] {
+    // SAFETY: `backing` owns `len * 8 == BYTES` initialised bytes, and the
+    // slice borrows it for no longer than `self`.
+    unsafe { core::slice::from_raw_parts_mut(self.backing.as_mut_ptr().cast::<u8>(), Self::BYTES) }
+  }
+
+  /// The first `n` bytes, as a kernel-filled control buffer of length `n`.
+  fn filled(&self, n: usize) -> &[u8] {
+    assert!(n <= Self::BYTES);
+    // SAFETY: as in `bytes`, narrowed to `n <= BYTES`.
+    unsafe { core::slice::from_raw_parts(self.backing.as_ptr().cast::<u8>(), n) }
+  }
+}
+
+/// A final cmsg whose `cmsg_len` claims more bytes than the control buffer
+/// holds must not be yielded — and the well-formed cmsg in front of it must
+/// still be.
+///
+/// This is the `MSG_CTRUNC` shape, and it is the kernel's normal behaviour
+/// rather than a corrupt-input hypothetical: on Darwin a truncated receive
+/// copies a PREFIX of the last cmsg and leaves its original `cmsg_len` in
+/// place. An iterator that reports `data_len()` straight off that field passes
+/// the caller-side `data_len() >= size_of::<T>()` guard and then reads past the
+/// end of the buffer — which is what `decode_unix_cmsgs` does, verbatim, in the
+/// loop below.
+///
+/// Under Miri the read is a hard error. In a normal build it is silent, which
+/// is the whole reason this test reads the payload rather than merely asserting
+/// on `data_len()`: an assertion on the length alone would go green on a build
+/// where the length is wrong AND the read runs off the end.
+#[cfg(all(unix, test))]
+#[test]
+fn a_cmsg_claiming_more_than_the_buffer_holds_is_refused_and_its_predecessor_kept() {
+  const KEPT: (libc::c_int, libc::c_int) = (libc::SOL_SOCKET, 0x31);
+  const TRUNCATED: (libc::c_int, libc::c_int) = (libc::SOL_SOCKET, 0x32);
+  // Both payloads are `u64` so the SAME guard-and-read covers both cmsgs: the
+  // survivor is genuinely read back, and the truncated one — if it were
+  // yielded — would be read past the end of the buffer rather than merely
+  // reported with a wrong length.
+  let payload = core::mem::size_of::<u64>();
+  let mut scratch = CtrlScratch::new();
+  let written = {
+    let buf = scratch.bytes();
+    let mut b = CMsgBuilder::new(buf);
+    b.push(KEPT.0, KEPT.1, &0xc1c2_c3c4_c5c6_c7c8u64)
+      .expect("first fits");
+    b.push(TRUNCATED.0, TRUNCATED.1, &0xd1d2_d3d4_d5d6_d7d8u64)
+      .expect("second fits");
+    b.finish()
+  };
+  // SAFETY: CMSG_SPACE is pure length arithmetic over an integer.
+  let first_end = unsafe { libc::CMSG_SPACE(payload as u32) } as usize;
+  // Chop the tail of the SECOND cmsg's payload while leaving its header — and
+  // its `cmsg_len` — intact, which is precisely what MSG_CTRUNC delivers.
+  let kernel_len = written - payload / 2;
+  assert!(
+    kernel_len > first_end + core::mem::size_of::<cmsghdr>(),
+    "the truncation must leave the second header addressable, or the test \
+     degenerates into the ordinary end-of-buffer case"
+  );
+  let ctrl = scratch.filled(kernel_len);
+
+  let mut seen = Vec::new();
+  for c in CMsgIter::new(ctrl) {
+    // Exactly `decode_unix_cmsgs`'s guard-then-read shape.
+    assert!(
+      c.data_len() >= payload,
+      "every cmsg this walk yields must carry a payload the buffer backs"
+    );
+    let v = unsafe { core::ptr::read_unaligned(c.data::<u64>()) };
+    seen.push((c.level(), c.ty(), v));
+  }
+  assert_eq!(
+    seen,
+    vec![(KEPT.0, KEPT.1, 0xc1c2_c3c4_c5c6_c7c8u64)],
+    "the intact cmsg must survive and the truncated one must not be yielded"
+  );
+}
+
+/// A control buffer whose FINAL cmsg's successor lands exactly at `len`, and
+/// one where it lands past `len`, must both walk to completion.
+///
+/// This is the case libc's Android `CMSG_NXTHDR` makes undefined. It evaluates
+///
+/// ```text
+/// let next = (cmsg as usize + CMSG_ALIGN((*cmsg).cmsg_len as usize)) as *mut cmsghdr;
+/// let max  = (*mhdr).msg_control as usize + (*mhdr).msg_controllen as usize;
+/// if (next.offset(1)) as usize > max { ... }
+/// ```
+///
+/// — `libc-0.2.189`, `src/unix/linux_like/android/mod.rs:3468`. The `offset(1)`
+/// forms a pointer one whole `cmsghdr` PAST `next` in order to decide whether
+/// `next` was in range, so when `next` is the end of the allocation the pointer
+/// is already out of bounds by the time libc returns anything to check. That is
+/// reachable with WELL-FORMED ancillary data in a full control buffer, which is
+/// why the buffer below is packed to its last byte rather than corrupted.
+///
+/// The allocation is sized EXACTLY to the bytes presented, so the final
+/// successor is the end of the allocation and not merely the end of a slice:
+/// pointer `offset` is bounds-checked against the allocation, so a prefix of a
+/// larger buffer would hide the very thing this test exists to catch.
+///
+/// Run under `cargo miri test --target aarch64-linux-android`; on every other
+/// target it still asserts the walk's arithmetic, which is stated over all of
+/// them.
+#[cfg(all(unix, test))]
+#[test]
+fn a_control_buffer_packed_to_its_last_byte_walks_to_completion() {
+  let hdr_size = core::mem::size_of::<cmsghdr>();
+  let payload = 12usize;
+  // SAFETY: CMSG_LEN/CMSG_SPACE are pure length arithmetic over integers.
+  let data_start = unsafe { libc::CMSG_LEN(0) } as usize;
+  let cmsg_len = data_start + payload;
+  // SAFETY: as above.
+  let stride = unsafe { libc::CMSG_SPACE(payload as u32) } as usize;
+  assert!(stride >= cmsg_len, "a stride must clear its own cmsg");
+  // `count` is chosen so the total is a multiple of 8 and `vec![0u64; n]`
+  // allocates EXACTLY the presented byte count — Darwin's cmsg alignment is 4,
+  // so one stride need not be 8-aligned on its own.
+  let word = core::mem::size_of::<u64>();
+  let count = if stride.is_multiple_of(word) { 1 } else { 2 };
+  let packed = stride * count;
+  assert_eq!(
+    packed % word,
+    0,
+    "the packed total must size a Vec<u64> exactly"
+  );
+
+  // Two shapes, differing only in how many bytes are presented:
+  //   `packed`                        — the successor lands EXACTLY at len;
+  //   `packed - (stride - cmsg_len)`  — the final cmsg's declared bytes end at
+  //                                     len while its padded successor is past.
+  for total in [packed, packed - (stride - cmsg_len)] {
+    let words = total.div_ceil(word);
+    let mut backing: Vec<u64> = vec![0u64; words];
+    {
+      // SAFETY: `backing` owns `words * 8 >= total` initialised bytes.
+      let buf: &mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), total) };
+      for i in 0..count {
+        let at = i * stride;
+        if at + hdr_size > total {
+          break;
+        }
+        // SAFETY: the bound above keeps the whole header inside `buf`, and the
+        // `Vec<u64>` backing satisfies `cmsghdr` alignment. Fields are assigned
+        // individually so the header's own padding keeps its zeroes.
+        unsafe {
+          let h = buf.as_mut_ptr().add(at).cast::<cmsghdr>();
+          (&raw mut (*h).cmsg_len).write_unaligned(cmsg_len.min(total - at) as _);
+          (&raw mut (*h).cmsg_level).write_unaligned(libc::SOL_SOCKET);
+          (&raw mut (*h).cmsg_type).write_unaligned(0x51);
+        }
+      }
+    }
+    // SAFETY: as above, read-only and narrowed to the presented length.
+    let ctrl: &[u8] = unsafe { core::slice::from_raw_parts(backing.as_ptr().cast::<u8>(), total) };
+    let walked = CMsgIter::new(ctrl).take(64).count();
+    assert!(
+      walked <= count,
+      "a buffer of {total} bytes holding at most {count} cmsg(s) must not yield \
+       {walked} (stride={stride}, cmsg_len={cmsg_len})"
+    );
+  }
+}
+
+/// A `cmsg_len` that libc's own successor arithmetic cannot advance past must
+/// end the walk, not repeat the header for ever.
+///
+/// `CMSG_NXTHDR` on Darwin and the BSDs is `cmsg + CMSG_ALIGN(cmsg_len)`, which
+/// for `cmsg_len == 0` is `cmsg` — the same header, returned indefinitely, so a
+/// walk that trusts it never terminates and `decode_unix_cmsgs` never returns.
+/// Linux's copy rejects a `cmsg_len` below the header size and returns null
+/// instead, so the non-termination is real on some supported targets and not
+/// others; the fix (require strict forward progress) is stated over all of
+/// them, and so is this test.
+///
+/// `take` bounds the walk so that a REGRESSION FAILS THIS TEST INSTEAD OF
+/// HANGING IT. A hang is not evidence — it is indistinguishable from a slow
+/// machine in CI, and it takes the whole test binary with it.
+#[cfg(all(unix, test))]
+#[test]
+fn a_cmsg_length_that_cannot_advance_the_walk_ends_it() {
+  let hdr_size = core::mem::size_of::<cmsghdr>();
+  for bad_len in [0usize, 1, hdr_size - 1] {
+    let mut scratch = CtrlScratch::new();
+    let total = {
+      let buf = scratch.bytes();
+      let mut b = CMsgBuilder::new(buf);
+      b.push(libc::SOL_SOCKET, 0x41, &0u32).expect("fits");
+      let total = b.finish();
+      // Overwrite only `cmsg_len`, leaving a structurally valid header —
+      // assigned through a field projection so the header's own padding
+      // (musl's `__pad1`) keeps the builder's zeroes.
+      // SAFETY: `CMsgBuilder::new` asserted the buffer's `cmsghdr` alignment
+      // and wrote a header at offset 0, so this addresses that header's own
+      // `cmsg_len` field.
+      unsafe {
+        let hdr = buf.as_mut_ptr().cast::<cmsghdr>();
+        (&raw mut (*hdr).cmsg_len).write_unaligned(bad_len as _);
+      }
+      total
+    };
+    let ctrl = scratch.filled(total);
+    let yielded = CMsgIter::new(ctrl).take(64).count();
+    assert_eq!(
+      yielded, 0,
+      "a cmsg_len of {bad_len} covers no header: the walk must fuse, not \
+       yield (and on Darwin/BSD, not repeat this header for ever)"
+    );
+  }
 }
 
 /// A cmsg that advertises `IPPROTO_IP` / `IP_PKTINFO` but whose `cmsg_len`
