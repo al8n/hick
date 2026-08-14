@@ -9863,6 +9863,125 @@ fn a_specific_qtype_proposes_only_that_type() {
   );
 }
 
+/// Build a raw CNAME record in wire format, for the fixture below.
+///
+/// [`crate::wire::MessageBuilder`] has no CNAME writer — this crate never
+/// publishes one — so a fixture about a PEER's CNAME writes the bytes itself.
+fn make_cname_record_ref(buf: &mut std::vec::Vec<u8>, owner_str: &str, ttl: u32, target_str: &str) {
+  buf.clear();
+  for label in owner_str.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    buf.push(label.len() as u8);
+    buf.extend_from_slice(label.as_bytes());
+  }
+  buf.push(0u8); // root label
+
+  buf.extend_from_slice(&5u16.to_be_bytes()); // TYPE CNAME
+  buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  buf.extend_from_slice(&ttl.to_be_bytes());
+
+  let mut rdata: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in target_str.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    rdata.push(label.len() as u8);
+    rdata.extend_from_slice(label.as_bytes());
+  }
+  rdata.push(0u8); // root label
+
+  #[allow(clippy::cast_possible_truncation)]
+  buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes()); // RDLENGTH
+  buf.extend_from_slice(&rdata);
+}
+
+/// A peer's CNAME is in its §8.2 proposal whatever QTYPE the probe asked.
+///
+/// RFC 1034 §3.6.2 makes a CNAME the answer to a query of ANY type at its owner
+/// name, so §8.2.1's "tiebreaker records answering a given probe question in the
+/// Question Section" covers it however narrow that question is. Scoping it away
+/// by QTYPE shortens the peer's list, and §8.2.1 gives "the list with records
+/// remaining" the win — so the omission decides in our favour every time.
+///
+/// The fixture needs `instance == host`: only then does `write_probe` put the
+/// A/AAAA records under the contested owner, so our sorted list OPENS with type
+/// 1 and the peer's type 5 sorts after it. The peer proposes nothing but the
+/// CNAME, so dropping it leaves an empty list to adjudicate and we hold — while
+/// the peer, folding the type-ANY probe §8.1 tells us to send, sees our whole
+/// proposal and wins. Two conforming peers, one name.
+#[test]
+fn a_peers_cname_is_proposed_whatever_qtype_the_probe_asked() {
+  // Every QTYPE a probe could narrow to that is not the CNAME's own type.
+  for qtype in [
+    crate::wire::ResourceType::A,
+    crate::wire::ResourceType::Srv,
+    crate::wire::ResourceType::Txt,
+  ] {
+    let shared = Name::try_from_str(PROBED_NAME).unwrap();
+    let mut records = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      shared.clone(),
+      shared,
+      631,
+      120,
+    );
+    records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+    let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+      Service::try_new(
+        ServiceHandle::from_raw(0),
+        records,
+        FakeInstant::zero(),
+        [0u8; 32],
+        true,
+      );
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap();
+
+    let mut cname = std::vec::Vec::new();
+    make_cname_record_ref(&mut cname, PROBED_NAME, 120, "elsewhere.local.");
+    let bytes = raw_proposal_bytes_asking_type(PROBED_NAME, qtype, &[cname]);
+
+    let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+      t0,
+    );
+    assert!(
+      svc.tiebreak_lost,
+      "a CNAME answers a {qtype:?} question like any other, so it is in the \
+       proposal §8.2.1 sorts — and type 5 sorts after the type 1 our own list \
+       opens with, which is the peer winning the round"
+    );
+  }
+}
+
+/// The control for the fixture above: admitting the CNAME is ADJUDICATING it,
+/// not conceding to it.
+///
+/// With a separate host name our proposal is `{SRV, TXT}` and opens with type
+/// 16, so the same CNAME sorts EARLIER and §8.2.1 leaves us the winner. Without
+/// this, a fold that simply lost every round it could not read would pass the
+/// fixture above.
+#[test]
+fn a_peers_cname_still_loses_a_round_it_sorts_earlier_than() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let mut cname = std::vec::Vec::new();
+  make_cname_record_ref(&mut cname, PROBED_NAME, 120, "elsewhere.local.");
+  let bytes = raw_proposal_bytes_asking_type(PROBED_NAME, crate::wire::ResourceType::A, &[cname]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "the CNAME is admitted and compared, and type 5 sorts before the type 16 \
+     this service's list opens with — §8.2.1 keeps the name"
+  );
+}
+
 // ── R10 finding 2: nothing of a superseded generation reaches the wire ──
 
 /// R10 finding 2: a probe QUEUED before the losing verdict arrived must not be

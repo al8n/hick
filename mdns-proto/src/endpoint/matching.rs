@@ -89,12 +89,27 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
 /// type at the name in the proposal — or exactly `rtype`. A query asking a
 /// specific type proposes only that type; folding its other authority records
 /// would compare a list the peer never made.
+///
+/// CNAME IS THE ONE TYPE A NARROW QTYPE STILL ADMITS. RFC 1034 §3.6.2 makes a
+/// CNAME the answer to a query of ANY type at its owner name — "if a CNAME RR is
+/// present at a node, no other data should be present" — so a peer's CNAME
+/// answers whatever its probe asked, and §8.2.1's "tiebreaker records answering
+/// a given probe question in the Question Section" therefore covers it however
+/// narrow that question is.
+///
+/// The direction of the error is why this is not a nicety. Dropping a record
+/// SHORTENS the peer's list, and §8.2.1 gives "the list with records remaining"
+/// the win, so every omission decides in our favour. A peer whose proposal is a
+/// CNAME went unadmitted here while its own fold — of the type-ANY probe §8.1
+/// tells us to send — counted every record we proposed and put its type-5 record
+/// after our type-1 A. Both sides then held the name.
 pub(crate) fn question_admits_record(
   q: &QuestionRef<'_>,
   name: &Name,
   rtype: ResourceType,
 ) -> bool {
-  question_is_about(q, name) && (q.qtype() == ResourceType::Any || q.qtype() == rtype)
+  question_is_about(q, name)
+    && (q.qtype() == ResourceType::Any || q.qtype() == rtype || rtype == ResourceType::Cname)
 }
 
 /// Is `r` part of the RFC 6762 §8.2 proposal that this query's Authority Section
@@ -123,7 +138,8 @@ pub(crate) fn question_admits_record(
 ///   QDCOUNT=0 packet proposes nothing however its Authority Section is filled.
 ///   Type is honoured too: a conforming probe asks ANY (§8.1) and then every
 ///   type at the name is proposed, while a query asking a SPECIFIC type proposes
-///   only that.
+///   only that — plus any CNAME, which answers every QTYPE at its owner name
+///   (RFC 1034 §3.6.2). See [`question_admits_record`].
 ///
 /// `questions` is a CLOSURE returning a fresh iterator, not an iterator: this is
 /// called once per authority record and the question section must be re-walked
