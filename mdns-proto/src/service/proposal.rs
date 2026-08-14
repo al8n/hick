@@ -27,6 +27,13 @@
 
 use crate::{records::ServiceRecords, service::respond, wire::RdataForm};
 
+// Under the `alloc` / `no-atomic` tiers (no `std`) this module is `no_std` and
+// `std` is `extern crate alloc as std` (see `lib.rs`) — `ToOwned` is not in the
+// `core` prelude the way it is in `std`'s, so `&str::to_owned()` below fails to
+// resolve without it. `feature = "std"` already has it via the prelude.
+#[cfg(all(not(feature = "std"), any(feature = "alloc", feature = "no-atomic")))]
+use crate::std::borrow::ToOwned as _;
+
 /// RFC 6762 §8.2.1's answer for ONE peer proposal.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum Verdict {

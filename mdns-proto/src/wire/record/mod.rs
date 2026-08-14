@@ -22,8 +22,15 @@ cfg_heap! {
   use crate::backend::{RdataBuf, rdata_from_vec};
 }
 
-use super::{NameRef, RdataNames, ResourceClass, ResourceType};
+use super::{NameRef, ResourceClass, ResourceType};
 use crate::error::{BufferTooShortDetail, ParseError, RdlengthOverrunDetail};
+
+// `RdataNames` is only consumed by `write_canonical_rdata` below, which is
+// itself `cfg_heap!`-gated — without a matching cfg here the import is dead
+// (and denied by `-D warnings`) on every tier without a heap.
+cfg_heap! {
+  use super::RdataNames;
+}
 
 /// Parsed resource record (zero-copy view into a message). Stores the full
 /// message reference so type-specific rdata parsers can resolve compression
