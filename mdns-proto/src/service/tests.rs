@@ -2520,6 +2520,76 @@ fn tiebreak_we_lose_defers_and_reprobes() {
   assert_tiebreak_deferred(&mut svc, &original_name, t1, "a losing SRV proposal");
 }
 
+/// §8.2 compares an empty TXT AS THE PEER SENT IT — the SECOND knob the identity
+/// form turns and the tiebreak must not.
+///
+/// RFC 6763 §6.1 says a TXT record MUST contain at least one string, so the
+/// identity question ("are these two records the same record") normalises a
+/// zero-length rdata to the single zero-length string a compliant sender would
+/// have used. §8.2 asks a different question — "a raw comparison of the binary
+/// content of the rdata without regard for meaning or structure" — and only
+/// resolves a name if BOTH hosts compute the same function over the same two
+/// lists. A peer that sent empty rdata will compare empty rdata; rewriting it on
+/// our side alone makes the two sides disagree.
+///
+/// The arithmetic, since one input has to give opposite verdicts for the fixture
+/// to be worth anything. TXT (rtype 16) sorts before SRV (rtype 33) in both
+/// lists, and the peer here holds the HIGHER SRV:
+///
+/// | form | peer's TXT element | vs our `[0x00, 0x10, 0x00]` | decided by |
+/// |---|---|---|---|
+/// | `AS_SENT` | `[0x00, 0x10]` | shorter, so sorts EARLIER | element 0 — we hold |
+/// | `FOLDED` | `[0x00, 0x10, 0x00]` | equal | the SRV — the peer wins |
+///
+/// So normalising the peer's empty TXT hands away a name that the peer itself
+/// scores as ours. Every existing fixture spells a peer's empty TXT with
+/// `make_txt_record_ref(.., &[&[]])`, which writes the COMPLIANT single
+/// zero-length string; both forms render that identically, which is why none of
+/// them could see this. Hand-built, because `push_txt_authority` always emits
+/// the compliant form and cannot express this peer at all.
+#[test]
+fn a_peers_empty_txt_rdata_is_compared_as_the_peer_sent_it() {
+  let mut svc = make_service(120); // our SRV: port 631, target `host.local.`
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
+
+  // A TXT record with RDLENGTH = 0 — no strings at all, which is what §6.1
+  // forbids and what a normalising comparator would silently rewrite.
+  let mut txt: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    txt.push(label.len() as u8);
+    txt.extend_from_slice(label.as_bytes());
+  }
+  txt.push(0u8);
+  txt.extend_from_slice(&crate::wire::ResourceType::Txt.to_u16().to_be_bytes());
+  txt.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  txt.extend_from_slice(&120u32.to_be_bytes());
+  txt.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH = 0
+
+  // A WINNING SRV, so that if the TXT elements tie the peer takes the round.
+  // Ours is port 631 (0x0277); theirs 65535 (0xFFFF) sorts above it.
+  let mut srv = std::vec::Vec::new();
+  make_srv_record_ref(&mut srv, PROBED_NAME, 120, 0, 0, 65535, "host.local.");
+
+  let bytes = raw_proposal_bytes(&[txt, srv]);
+  let peer: core::net::SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+
+  assert!(
+    !svc.tiebreak_lost,
+    "the peer's TXT rdata is EMPTY as sent, so its element is the rtype prefix \
+     alone and sorts below our compliant `0x00` — the round is decided at that \
+     first element and the peer's higher SRV never gets to speak. Normalising \
+     the peer's empty TXT to §6.1's single zero-length string ties element 0 \
+     instead, hands the round to the SRV, and loses the name to a host the peer \
+     itself scores as the loser"
+  );
+}
+
 /// §8.2 compares the bytes the PEER put on the wire, case and all — and this is
 /// the fixture where the two canonicalizers give OPPOSITE verdicts on one input.
 ///
