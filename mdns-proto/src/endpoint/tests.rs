@@ -8700,13 +8700,14 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
       srv_txt,
     ),
     (
-      "R10-5: a SPECIFIC qtype that admits the proposed record",
+      "a SPECIFIC qtype naming the proposed record's own type",
       INSTANCE,
       ResourceType::Srv,
       srv_only,
     ),
     (
-      "R10-5: a SPECIFIC qtype that admits NONE of the proposed records",
+      "a SPECIFIC qtype naming NO proposed record's type — the Authority \
+       Section is the peer's whole §8.2 proposal either way",
       INSTANCE,
       ResourceType::Txt,
       srv_only,

@@ -63,21 +63,6 @@ pub(crate) fn name_fully_decodes(name: &NameRef<'_>) -> bool {
 
 /// Is question `q` about `name`, in class IN?
 ///
-/// QCLASS is `In`, or the wildcard `Any` (255). The RFC 6762 §5.4
-/// unicast-response bit is already stripped by [`QuestionRef::qclass`], so a QU
-/// probe — which is what `respond::write_probe` sends — reads as `In` here.
-///
-/// The QTYPE is deliberately NOT considered: this answers "is this query about
-/// our name at all", which is what a caller with no record in hand can ask. See
-/// [`question_admits_record`] for the per-record question.
-pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
-  (q.qclass() == ResourceClass::In || q.qclass() == ResourceClass::Any)
-    && names_match(name, q.qname())
-}
-
-/// Does question `q` ask about `name` in a way that admits a record of `rtype`
-/// as an answer?
-///
 /// The RFC 6762 §8.2 scoping rule, in ONE place because two layers apply it: the
 /// endpoint decides whether a datagram's Authority Section is a proposal for a
 /// registered name at all, and `Service` decides which of that section's records
@@ -85,31 +70,37 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
 /// SRV/TXT rule once, one was fixed and the other left, and the gap was
 /// duplicate ownership between two conforming peers.
 ///
-/// QTYPE is `Any` — which a conforming probe asks (§8.1), and which puts every
-/// type at the name in the proposal — or exactly `rtype`. A query asking a
-/// specific type proposes only that type; folding its other authority records
-/// would compare a list the peer never made.
+/// QCLASS is `In`, or the wildcard `Any` (255). The RFC 6762 §5.4
+/// unicast-response bit is already stripped by [`QuestionRef::qclass`], so a QU
+/// probe — which is what `respond::write_probe` sends — reads as `In` here.
 ///
-/// CNAME IS THE ONE TYPE A NARROW QTYPE STILL ADMITS. RFC 1034 §3.6.2 makes a
-/// CNAME the answer to a query of ANY type at its owner name — "if a CNAME RR is
-/// present at a node, no other data should be present" — so a peer's CNAME
-/// answers whatever its probe asked, and §8.2.1's "tiebreaker records answering
-/// a given probe question in the Question Section" therefore covers it however
-/// narrow that question is.
+/// # QTYPE is deliberately NOT considered
 ///
-/// The direction of the error is why this is not a nicety. Dropping a record
-/// SHORTENS the peer's list, and §8.2.1 gives "the list with records remaining"
-/// the win, so every omission decides in our favour. A peer whose proposal is a
-/// CNAME went unadmitted here while its own fold — of the type-ANY probe §8.1
-/// tells us to send — counted every record we proposed and put its type-5 record
-/// after our type-1 A. Both sides then held the name.
-pub(crate) fn question_admits_record(
-  q: &QuestionRef<'_>,
-  name: &Name,
-  rtype: ResourceType,
-) -> bool {
-  question_is_about(q, name)
-    && (q.qtype() == ResourceType::Any || q.qtype() == rtype || rtype == ResourceType::Cname)
+/// §8.2: "each host populates the query message's Authority Section with the
+/// record or records with the rdata that it would be proposing to use, should
+/// its probing be successful", and "for tiebreaking to work correctly in all
+/// cases, the Authority Section must contain *all* the records and proposed
+/// rdata being probed for uniqueness". The Authority Section is therefore the
+/// SENDER'S COMPLETE PROPOSAL — fixed by what that host intends to claim, not by
+/// what its Question Section narrows to. §8.2's other phrasing, about records
+/// that answer the query, sits inside the section's own stated assumption that
+/// the probe asks QTYPE ANY (§8.1); the work it really does is partitioning a
+/// MULTI-QUESTION probe's Authority Section per contested name, which the
+/// name-and-class match here already does completely.
+///
+/// A QTYPE gate did not merely over-restrict; it broke the symmetry §8.2 rests
+/// on. Our own proposal — `service::proposal::our_proposal` — is not
+/// question-scoped: it always lists SRV and TXT, plus A/AAAA when the instance
+/// name IS the host name. So against a peer that narrowed its QTYPE the two
+/// hosts sorted DIFFERENT PAIRS of lists and both concluded they had won. A peer
+/// probing QTYPE=TXT with an Authority Section of `[TXT identical to ours, SRV
+/// port 9999]` had only its TXT folded here: element 0 tied, our SRV was the
+/// record remaining, and §8.2.1 left us the name. That peer folded our whole
+/// type-ANY probe, tied on TXT, and its SRV port 9999 sorted after our 631 — so
+/// it kept the name too. Two conforming peers, one name.
+pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
+  (q.qclass() == ResourceClass::In || q.qclass() == ResourceClass::Any)
+    && names_match(name, q.qname())
 }
 
 /// Is `r` part of the RFC 6762 §8.2 proposal that this query's Authority Section
@@ -132,25 +123,24 @@ pub(crate) fn question_admits_record(
 /// * **class IN** — §8.2.1 orders by class, then type, then rdata; a record of
 ///   another class is not in the same RRset being contended.
 /// * **owned by `name`** — the proposal is about the name being adjudicated.
-/// * **answers a question this query asked** — §8.2 reads the proposal off "the
-///   Authority Section of *that query*" and §8.1 defines the query as one
-///   carrying "the record name in question in the Question Section", so a
-///   QDCOUNT=0 packet proposes nothing however its Authority Section is filled.
-///   Type is honoured too: a conforming probe asks ANY (§8.1) and then every
-///   type at the name is proposed, while a query asking a SPECIFIC type proposes
-///   only that — plus any CNAME, which answers every QTYPE at its owner name
-///   (RFC 1034 §3.6.2). See [`question_admits_record`].
+/// * **in the scope of a question this query asked** — §8.2 reads the proposal
+///   off "the Authority Section of *that query*" and §8.1 defines the query as
+///   one carrying "the record name in question in the Question Section", so a
+///   QDCOUNT=0 packet proposes nothing however its Authority Section is filled,
+///   and neither does a query asking only about somebody else's name. That scope
+///   is NAME AND CLASS, never QTYPE — see [`question_is_about`], which is where
+///   the reason lives, since a §8.2 Authority Section is the sender's whole
+///   proposal rather than an answer to its own question.
 ///
 /// `questions` is a CLOSURE returning a fresh iterator, not an iterator: this is
 /// called once per authority record and the question section must be re-walked
-/// for each. The scan is nested rather than reduced to a summary first, which is
-/// `O(questions x records)` and deliberately so — a summary of admitted QTYPEs
-/// is a SET of `u16`, and any bounded set would make capacity a possible answer
-/// to "did the peer propose this", which is the class of defect this path exists
-/// to make unrepresentable. Both sections come from ONE link-local datagram
-/// whose sections `Endpoint::handle` has already walked, so the product is
-/// bounded by that datagram's size, and the inner scan only runs for a record
-/// already matched to `name`.
+/// for each. What that walk decides no longer varies with the record — scope is
+/// the owner name and the class — yet it is re-derived here rather than
+/// summarised once by each caller, because a per-caller summary is exactly the
+/// second copy of the rule this function exists to prevent. Both sections come
+/// from ONE link-local datagram whose sections `Endpoint::handle` has already
+/// walked, so the product is bounded by that datagram's size, and the scan only
+/// runs for a record already matched to `name`.
 ///
 /// # What this does NOT do
 ///
@@ -199,7 +189,7 @@ where
     if !name_fully_decodes(q.qname()) {
       return Err(QuestionsUnreadable);
     }
-    if question_admits_record(&q, name, r.rtype()) {
+    if question_is_about(&q, name) {
       admitted = true;
     }
   }

@@ -218,6 +218,12 @@ where
   /// of ours — records it never proposed, and a free one-second deferral on
   /// demand.
   ///
+  /// "Asks about" is the QUESTION'S NAME and class, never its QTYPE. §8.2
+  /// requires the Authority Section to carry "*all* the records and proposed
+  /// rdata being probed for uniqueness", so it is the sender's complete
+  /// proposal, and narrowing it by the sender's own QTYPE compares a list that
+  /// host never made — see [`question_is_about`].
+  ///
   /// # One predicate, one home
   ///
   /// Both halves above are [`proposal_admits`], CALLED rather than restated —

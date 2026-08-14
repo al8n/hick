@@ -178,9 +178,10 @@ fn fold(
 ///
 /// SRV and TXT, because those are exactly what `write_probe` puts in the
 /// Authority Section under the instance name. A/AAAA belong to the HOST name, so
-/// they are neither proposed here nor compared. The peer's side is not limited
-/// this way — a probe asks type ANY, so anything at that name counts for them;
-/// see [`adjudicate`].
+/// they are normally neither proposed here nor compared — see the branch below
+/// for the configuration where they are. The peer's side is not limited this
+/// way: §8.2 makes ITS Authority Section its complete proposal, so every record
+/// it puts at the contested name counts for it; see [`adjudicate`].
 ///
 /// # These bytes must be the bytes we TRANSMIT
 ///
@@ -223,6 +224,16 @@ fn our_proposal(our: &ServiceRecords) -> std::vec::Vec<std::vec::Vec<u8>> {
   }
   // A/AAAA — but ONLY when the host name IS the instance name, because then
   // `write_probe`'s address records are emitted under the contested owner too.
+  //
+  // THE SHARED CONDITION, and it is not spelled the same way on both sides:
+  // `respond::write_probe` pushes its A and AAAA records under
+  // `records.host()`, unconditionally — they land under the name being probed
+  // exactly when `instance == host`, which is the condition this branch tests
+  // directly. The two are one fact written twice, so a change to either side
+  // alone (a probe that stops emitting addresses, or emits them under the
+  // instance name always) silently desymmetrises §8.2: our comparison list would
+  // stop matching the records a peer folds off our wire bytes, and neither side
+  // would fail loudly. Change them together.
   //
   // Normally the host is a separate name, its addresses answer a different
   // question, and they are neither proposed nor compared. `instance == host` is
@@ -306,7 +317,8 @@ pub(crate) fn write_canonical_wire_name(name_str: &str, out: &mut std::vec::Vec<
 ///
 /// `keep` is taken from THE LOCAL LIST, never from a constant. It bounds only
 /// what we retain of the peer's list; the peer's list itself is unbounded,
-/// because a probe asks type ANY and may carry any number of records at the name.
+/// because §8.2 makes its Authority Section the peer's COMPLETE proposal and
+/// that may carry any number of records at the contested name.
 /// That asymmetry is the point: `keep` smallest plus a total `count` is
 /// everything §8.2.1 needs however long the peer's proposal is, since anything
 /// sorting past the local list's length can only matter as "the peer has more",

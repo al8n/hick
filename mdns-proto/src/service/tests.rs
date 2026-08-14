@@ -9896,22 +9896,33 @@ fn a_question_for_another_name_proposes_nothing_about_ours() {
   );
 }
 
-/// R10 finding 5: a query asking a SPECIFIC QTYPE proposes only that type, and
-/// the fold honours it.
+/// A peer that NARROWS its probe's QTYPE still proposes its whole Authority
+/// Section — the both-win regression, and the other half of
+/// `the_winning_pair_control_really_does_lose_the_round`.
 ///
-/// The peer asks TXT and puts in the Authority Section a TXT byte-identical to
-/// ours plus the SRV(9999) that the `winning_pair` control proves takes the
-/// round. The two readings give OPPOSITE verdicts, which is what makes this
-/// fixture discriminate:
+/// The peer asks TXT and carries the `winning_pair`: a TXT byte-identical to
+/// ours plus the SRV port 9999 that the control proves takes the round outright.
+/// Scoping the fold by QTYPE keeps only that TXT — it ties, our SRV is the
+/// record remaining, and §8.2.1's "the list with records remaining is deemed to
+/// have won" leaves us holding the name. The PEER meanwhile folds the type-ANY
+/// probe §8.1 tells us to send, ties on TXT, and finds its SRV 9999 sorting
+/// after our 631, so it holds the name too. Both sides win, both announce, and
+/// two responders own one name — the single outcome §8.2 exists to prevent.
 ///
-/// * honouring the question folds the TXT alone: element 0 ties, our list still
-///   has its SRV where the peer's has run out, and §8.2.1's "the list with
-///   records remaining is deemed to have won" keeps the name;
-/// * ignoring it folds both: element 0 ties, and at element 1 the peer's SRV
-///   port 9999 beats our 631, so we defer for a second to a host that proposed
-///   no SRV at all.
+/// The conflation that once made the narrow reading look right, so it is not
+/// adjudicated a third time: this fixture's peer was described as having
+/// "proposed no SRV at all". It proposed one. §8.2 says a host "populates the
+/// query message's Authority Section with the record or records with the rdata
+/// that it would be proposing to use", and that the section must contain "*all*
+/// the records and proposed rdata being probed for uniqueness" — the Authority
+/// Section IS the proposal. The Question Section says only what the sender wants
+/// ANSWERED, which is a different thing and no bound on what it claims.
+///
+/// The asymmetry is what makes the defect ours and not the peer's:
+/// `our_proposal` is not question-scoped either, so a QTYPE gate had the two
+/// hosts sorting different PAIRS of lists rather than one pair.
 #[test]
-fn a_specific_qtype_proposes_only_that_type() {
+fn a_narrowed_qtype_still_proposes_the_whole_authority_section() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
   svc.handle_timeout(t0).unwrap();
@@ -9926,10 +9937,10 @@ fn a_specific_qtype_proposes_only_that_type() {
     t0,
   );
   assert!(
-    !svc.tiebreak_lost,
-    "the query asks TXT, so only the TXT is proposed — and it ties, leaving our \
-     SRV as the record remaining. Folding the SRV the question does not admit \
-     compares a list the peer never made, and loses the round to it"
+    svc.tiebreak_lost,
+    "the peer's Authority Section is its whole §8.2 proposal whatever its QTYPE \
+     asks, so its SRV port 9999 is compared and beats our 631 — dropping it \
+     would leave BOTH hosts believing they won this round"
   );
 }
 
@@ -9963,22 +9974,24 @@ fn make_cname_record_ref(buf: &mut std::vec::Vec<u8>, owner_str: &str, ttl: u32,
   buf.extend_from_slice(&rdata);
 }
 
-/// A peer's CNAME is in its §8.2 proposal whatever QTYPE the probe asked.
+/// A record of a type the probe's QTYPE never asked for is STILL in the peer's
+/// §8.2 proposal — pinned over a CNAME, a type this crate publishes and probes
+/// for nowhere, so no QTYPE in the sweep below can match it by accident.
 ///
-/// RFC 1034 §3.6.2 makes a CNAME the answer to a query of ANY type at its owner
-/// name, so §8.2.1's "tiebreaker records answering a given probe question in the
-/// Question Section" covers it however narrow that question is. Scoping it away
-/// by QTYPE shortens the peer's list, and §8.2.1 gives "the list with records
-/// remaining" the win — so the omission decides in our favour every time.
+/// §8.2 requires the Authority Section to carry "*all* the records and proposed
+/// rdata being probed for uniqueness": it is the sender's complete proposal, and
+/// the sender's own QTYPE narrows nothing about it. Scoping any of it away
+/// shortens the peer's list, and §8.2.1 gives "the list with records remaining"
+/// the win — so every such omission decides in our own favour.
 ///
 /// The fixture needs `instance == host`: only then does `write_probe` put the
 /// A/AAAA records under the contested owner, so our sorted list OPENS with type
-/// 1 and the peer's type 5 sorts after it. The peer proposes nothing but the
-/// CNAME, so dropping it leaves an empty list to adjudicate and we hold — while
-/// the peer, folding the type-ANY probe §8.1 tells us to send, sees our whole
-/// proposal and wins. Two conforming peers, one name.
+/// 1 and the peer's type 5 sorts after it. The peer proposes nothing but that
+/// one record, so dropping it leaves an empty list to adjudicate and we hold —
+/// while the peer, folding the type-ANY probe §8.1 tells us to send, sees our
+/// whole proposal and wins. Two conforming peers, one name.
 #[test]
-fn a_peers_cname_is_proposed_whatever_qtype_the_probe_asked() {
+fn a_record_outside_the_probes_qtype_is_still_proposed() {
   // Every QTYPE a probe could narrow to that is not the CNAME's own type.
   for qtype in [
     crate::wire::ResourceType::A,
@@ -10016,22 +10029,23 @@ fn a_peers_cname_is_proposed_whatever_qtype_the_probe_asked() {
     );
     assert!(
       svc.tiebreak_lost,
-      "a CNAME answers a {qtype:?} question like any other, so it is in the \
-       proposal §8.2.1 sorts — and type 5 sorts after the type 1 our own list \
-       opens with, which is the peer winning the round"
+      "the peer's Authority Section is its whole proposal, so this record is in \
+       the list §8.2.1 sorts however narrow the {qtype:?} question was — and \
+       type 5 sorts after the type 1 our own list opens with, which is the peer \
+       winning the round"
     );
   }
 }
 
-/// The control for the fixture above: admitting the CNAME is ADJUDICATING it,
-/// not conceding to it.
+/// The control for the fixture above: admitting an off-QTYPE record is
+/// ADJUDICATING it, not conceding to it.
 ///
 /// With a separate host name our proposal is `{SRV, TXT}` and opens with type
-/// 16, so the same CNAME sorts EARLIER and §8.2.1 leaves us the winner. Without
-/// this, a fold that simply lost every round it could not read would pass the
-/// fixture above.
+/// 16, so the same type-5 record sorts EARLIER and §8.2.1 leaves us the winner.
+/// Without this, a fold that simply lost every round it could not read would
+/// pass the fixture above.
 #[test]
-fn a_peers_cname_still_loses_a_round_it_sorts_earlier_than() {
+fn a_record_outside_the_qtype_still_loses_a_round_it_sorts_earlier_than() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
   svc.handle_timeout(t0).unwrap();
@@ -10047,7 +10061,7 @@ fn a_peers_cname_still_loses_a_round_it_sorts_earlier_than() {
   );
   assert!(
     !svc.tiebreak_lost,
-    "the CNAME is admitted and compared, and type 5 sorts before the type 16 \
+    "the record is admitted and compared, and type 5 sorts before the type 16 \
      this service's list opens with — §8.2.1 keeps the name"
   );
 }
