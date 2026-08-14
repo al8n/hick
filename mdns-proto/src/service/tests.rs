@@ -195,11 +195,25 @@ fn raw_proposal_bytes_asking(qname: &str, records: &[std::vec::Vec<u8>]) -> std:
   raw_proposal_bytes_asking_type(qname, crate::wire::ResourceType::Any, records)
 }
 
-/// [`raw_proposal_bytes_asking`] with the QTYPE named too — a conforming probe
-/// asks ANY (§8.1), and a query asking a specific type proposes only that type.
+/// [`raw_proposal_bytes_asking`] with the QTYPE named too. A conforming probe
+/// asks ANY (§8.1); a query naming one type still proposes its WHOLE Authority
+/// Section, which `a_narrowed_qtype_still_proposes_the_whole_authority_section`
+/// is about.
 fn raw_proposal_bytes_asking_type(
   qname: &str,
   qtype: crate::wire::ResourceType,
+  records: &[std::vec::Vec<u8>],
+) -> std::vec::Vec<u8> {
+  // QU | class IN — the shape `respond::write_probe` sends.
+  raw_proposal_bytes_asking_type_class(qname, qtype, 0x8000u16 | 1, records)
+}
+
+/// [`raw_proposal_bytes_asking_type`] with the raw QCLASS word named too, for
+/// the one fixture that asks in a class §8.2 does not scope.
+fn raw_proposal_bytes_asking_type_class(
+  qname: &str,
+  qtype: crate::wire::ResourceType,
+  qclass_raw: u16,
   records: &[std::vec::Vec<u8>],
 ) -> std::vec::Vec<u8> {
   let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
@@ -219,7 +233,7 @@ fn raw_proposal_bytes_asking_type(
   }
   msg.push(0);
   msg.extend_from_slice(&qtype.to_u16().to_be_bytes());
-  msg.extend_from_slice(&(0x8000u16 | 1).to_be_bytes()); // QU | class IN
+  msg.extend_from_slice(&qclass_raw.to_be_bytes());
   for r in records {
     msg.extend_from_slice(r);
   }
@@ -9870,6 +9884,51 @@ fn a_proposal_with_no_question_is_not_adjudicated() {
     !svc.tiebreak_lost,
     "a query that asks nothing proposes nothing — its authority records must \
      record no §8.2 verdict"
+  );
+}
+
+/// The other half of §8.2's scope, and the half nothing checked. Admission is
+/// OWNER NAME **and CLASS**; a probe surfaced the class conjunct as unasserted.
+///
+/// §8.2.1 orders the compared lists "by class, then type, then rdata", so a
+/// query asking in another class is contending a different namespace and its
+/// Authority Section is no proposal for our IN record — even when the records it
+/// carries are themselves class IN and sit at our exact name. The record-level
+/// `rclass` screen in `proposal_admits` cannot stand in for this: that one reads
+/// the RECORD's class, and this reads the QUESTION's.
+///
+/// The payload is `winning_pair`, which
+/// `the_winning_pair_control_really_does_lose_the_round` proves takes the round
+/// outright when it IS admitted — so this fixture fails loudly if the class
+/// scope ever stops being applied, rather than passing for want of a conflict.
+#[test]
+fn a_question_asking_in_another_class_proposes_nothing_about_ours() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  // QCLASS 3 = CH (Chaos). The §5.4 unicast-response bit is the top bit and is
+  // stripped before `qclass()` is read, so it is set here exactly as a real
+  // probe sets it — the fixture must differ from a conforming probe in CLASS
+  // alone, or it would be proving something else.
+  let bytes = raw_proposal_bytes_asking_type_class(
+    PROBED_NAME,
+    crate::wire::ResourceType::Any,
+    0x8000u16 | 3,
+    &[txt, srv],
+  );
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "the query contends a name in class CH, so its Authority Section is not a \
+     proposal for the IN record we are probing — and this payload is the one \
+     that takes the round outright when it IS admitted"
   );
 }
 
