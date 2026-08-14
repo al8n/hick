@@ -9059,6 +9059,135 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
   }
 }
 
+/// A QDCOUNT=0 datagram whose ONLY declared authority record is truncated
+/// proposes nothing to anybody, and costs the endpoint work proportional to the
+/// datagram rather than to the number of registered services.
+///
+/// It is the cheapest amplification input the §8.2 path admits: QR=0, source
+/// port 5353, no questions, and roughly thirty bytes of which five are a
+/// half-written record. §8.1 defines a probe as a query carrying "the record
+/// name in question in the Question Section" and §8.2 reads the proposal off
+/// "the Authority Section of *that query*", so a query that asks nothing
+/// proposes nothing — and `Records` stops at its first error, so the section
+/// carries no readable record either.
+///
+/// Routed anyway, it fans out to EVERY registered service: `AuthorityProposals`
+/// restarts the service scan on each `next()`, so N deliveries cost Θ(N²) slab
+/// visits, and every pre-authoritative service then builds and sorts its own
+/// proposal before the fold dies on that same record. The fold's only terminal
+/// value for it is `Verdict::Abandoned`, which
+/// `an_abandoned_proposal_behaves_exactly_like_we_hold` shows changes nothing —
+/// so all of that work buys no service any information at all.
+///
+/// Two assertions, neither of them timing-based: nothing is delivered, and the
+/// number of routing events the datagram produces does not grow with the service
+/// count. The control at the end registers the same services and sends a real
+/// probe, so a fixture whose registrations silently failed cannot pass.
+#[test]
+fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
+  use crate::event::RouteEvent;
+  use core::net::SocketAddr;
+
+  /// An endpoint with `n` distinct services registered, and the instance name of
+  /// the first one.
+  fn endpoint_with(n: usize) -> (TestEndp, Name) {
+    let mut e = build_endpoint();
+    let mut first = None;
+    for i in 0..n {
+      let st = Name::try_from_str("_ipp._tcp.local.").unwrap();
+      let inst = Name::try_from_str(&std::format!("Printer{i}._ipp._tcp.local.")).unwrap();
+      let host = Name::try_from_str(&std::format!("printer-host{i}.local.")).unwrap();
+      if first.is_none() {
+        first = Some(inst.clone());
+      }
+      #[allow(clippy::cast_possible_truncation)]
+      let recs = ServiceRecords::new(st, inst, host, 631 + i as u16, 120);
+      e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        StdInstant::now(),
+      )
+      .unwrap();
+    }
+    (e, first.unwrap())
+  }
+
+  // QR=0, QDCOUNT=0, NSCOUNT=1 — and the one declared record is five bytes of a
+  // label that claims to be longer than what follows it.
+  let mut datagram: std::vec::Vec<u8> = std::vec::Vec::new();
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // ID
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // QDCOUNT — asks nothing
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+  datagram.extend_from_slice(&1u16.to_be_bytes()); // NSCOUNT — claims one record
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+  datagram.extend_from_slice(&[0x05, b'h', b'e', b'l', b'l']); // …which is truncated
+
+  // Port 5353: the §8.2 proposal path is gated on it, so this is the shape that
+  // reaches the fan-out at all.
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+
+  let mut counts = std::vec::Vec::new();
+  for n in [4usize, 256] {
+    let (mut e, _first) = endpoint_with(n);
+    let mut proposals = 0usize;
+    let mut events = 0usize;
+    for ev in e
+      .handle(StdInstant::now(), src, local_ip, 0, &datagram, false)
+      .unwrap()
+    {
+      events = events.saturating_add(1);
+      if matches!(&ev, Ok(RouteEvent::ToService(ts)) if ts.event().is_probe_proposal()) {
+        proposals = proposals.saturating_add(1);
+      }
+    }
+    assert_eq!(
+      proposals, 0,
+      "{n} services: a query that asks nothing proposes nothing, and a section \
+       that stops parsing at its first record carries no readable proposal \
+       either — so no service may be handed a §8.2 proposal for it"
+    );
+    counts.push(events);
+  }
+  assert_eq!(
+    counts.first(),
+    counts.last(),
+    "the routing work this datagram causes must be a function of the DATAGRAM, \
+     not of how many services are registered — a per-service fan-out here is an \
+     amplification primitive, since `AuthorityProposals` rescans the service \
+     slab on every delivery"
+  );
+
+  // CONTROL: the same registrations really are live, and a real §8.2 probe for
+  // one of those names still reaches exactly its own service.
+  let (mut e, first) = endpoint_with(4);
+  let mut buf = [0u8; 512];
+  let mut b = crate::wire::MessageBuilder::<'_, 32>::try_new(&mut buf, crate::wire::Header::new())
+    .unwrap();
+  b.push_question(
+    &first,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
+  let target = Name::try_from_str("rival-host.local.").unwrap();
+  b.push_srv_authority(&first, 120, 0, 0, 9999, &target).unwrap();
+  let n = b.finish().unwrap();
+  let probe = buf[..n].to_vec();
+  let delivered = e
+    .handle(StdInstant::now(), src, local_ip, 0, &probe, false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()))
+    .count();
+  assert_eq!(
+    delivered, 1,
+    "control: a genuine probe for a registered name is still delivered, to \
+     exactly the one service that owns it"
+  );
+}
+
 /// One §8.2 admission scope reads the Question Section AT MOST ONCE, however
 /// many Authority records it is asked about — and does not read it at all when
 /// none of them is at the scope's name.

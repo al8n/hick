@@ -234,35 +234,54 @@ where
   /// publish went unseen by a whole endpoint while it considered itself the
   /// winner.
   ///
-  /// The invariant that buys — ROUTING OVER-APPROXIMATES ADMISSION: if the fold
-  /// would reach a verdict or an abandonment for a datagram, a `ProbeProposal`
-  /// was routed for it. Pinned by
+  /// The invariant that buys — ROUTING OVER-APPROXIMATES VERDICTS: if the fold
+  /// would reach `PeerWins` or `WeHold` for a datagram, a `ProbeProposal` was
+  /// routed for it. Non-verdicts need not be delivered. Pinned by
   /// `routing_over_approximates_what_the_fold_adjudicates`, which drives
-  /// `Endpoint::handle` and `Service::handle_event` over the SAME constructed
-  /// datagrams rather than trusting two spellings to agree.
+  /// `Endpoint::handle` and `service::proposal::adjudicate` over the SAME
+  /// constructed datagrams rather than trusting two spellings to agree.
+  ///
+  /// # …and it fails CLOSED, unlike [`Self::is_probe_for`]
+  ///
+  /// Undecodable bytes answer NO here. Nothing is lost by that, because the only
+  /// terminal value the fold has for such a datagram is `Verdict::Abandoned`,
+  /// and an abandonment is behaviourally identical to `WeHold` — it traces and
+  /// changes nothing. So not delivering and delivering-then-abandoning are
+  /// indistinguishable to the `Service`, and withholding a whole proposal decides
+  /// no more than abandoning it does.
+  ///
+  /// What it avoids is an amplification primitive. A QR=0, port-5353, QDCOUNT=0
+  /// packet carrying one truncated declared authority record would otherwise be
+  /// routed as a proposal to EVERY registered service: `AuthorityProposals`
+  /// restarts the service iterator on each `next()`, so the fan-out costs Θ(N²)
+  /// slab visits, and every pre-authoritative service then allocates and sorts
+  /// its own proposal before the fold dies on that same record. Roughly thirty
+  /// bytes of spoofable link-local traffic buys all of it.
+  ///
+  /// `Verdict::Abandoned` being a non-yield is what makes this equivalence hold,
+  /// and it is pinned by `an_abandoned_proposal_behaves_exactly_like_we_hold`. If
+  /// abandonment ever becomes a yield, this disposition must be revisited.
   fn authority_proposes_for(&self, name: &crate::Name) -> bool {
     // ONE scope for the whole section: the question section decides scope by
     // owner name and class, which does not vary with the record, so it is read
     // at most once here instead of once per authority record.
     let mut scope = ProposalScope::new(|| self.reader.questions(), name);
     for r in self.reader.authority() {
-      // Every undecidable answer is YES here, and that is the whole job of this
-      // layer. A record that will not parse, or a question section that will not
-      // read, means this datagram MIGHT be a proposal for `name` — and the fold
-      // is where a proposal that cannot be read is abandoned. Withholding it
-      // would not be caution, it would be deciding the question in the one place
-      // that must not decide it.
-      //
-      // `.flatten()` used to drop an unparseable record silently, and `Records`
-      // STOPS at its first error, so a single malformed record hid every record
-      // after it — including the one the fold needed to see to abandon on.
+      // A record that will not parse is not a readable proposal for `name`, and
+      // `Records` STOPS at its first error — so every record before it has
+      // already been tested and nothing readable follows. The section is decided.
       let Ok(r) = r else {
-        return true;
+        return false;
       };
-      // Exhaustive on purpose: `Admission` has no arm meaning "ours, but skip".
+      // Exhaustive on purpose: `Admission` has no arm meaning "ours, but skip",
+      // so a record admitted here is one the fold folds.
       match scope.admits(&r) {
-        Ok(Admission::Ours) | Err(QuestionsUnreadable) => return true,
+        Ok(Admission::Ours) => return true,
         Ok(Admission::NotOurs(_)) => continue,
+        // Scope is undecidable for the whole datagram, so no later record can
+        // answer differently; the fold's only terminal value here is an
+        // abandonment, which changes nothing.
+        Err(QuestionsUnreadable) => return false,
       }
     }
     false
@@ -287,18 +306,25 @@ where
   /// which is why the gate is per question and service rather than per datagram —
   /// a peer probing our host name proposes nothing about our instance name.
   ///
-  /// # …and it fails CLOSED, unlike [`Self::authority_proposes_for`]
+  /// # …and it OVER-approximates, unlike [`Self::authority_proposes_for`]
   ///
-  /// The two gates answer malformed input oppositely because what they release
-  /// is opposite. Delivering a `ProbeProposal` that cannot be read costs
-  /// nothing — the fold ABANDONS it, reaching no verdict — so that gate must
-  /// over-approximate. Releasing a question here produces a RESPONSE from an
-  /// endpoint configured not to answer, so undecodable bytes must not buy one.
+  /// The two gates answer an unreadable Question Section oppositely because what
+  /// they release is opposite, and this is the one that must say YES.
   ///
-  /// A `QuestionsUnreadable` is still answered YES, and only that. It is
-  /// reachable only from a record already matched to `name` in class IN, so the
-  /// datagram is probe-shaped already, and §8.1 makes defending a name in use a
-  /// duty this endpoint has not opted out of.
+  /// It is not on the verdict path at all. What it releases is a §8.1 DEFENCE of
+  /// a name this endpoint has already established — "a host that is not currently
+  /// probing … MUST … defend" — against a datagram that is already probe-shaped
+  /// at that name in class IN, since `QuestionsUnreadable` is only reachable
+  /// after a record has matched `name` in class IN. Failing closed here would let
+  /// a prober whose Question Section will not read take an advertised name from a
+  /// passive endpoint, purely because the endpoint could not read the section.
+  /// §8.1 makes defending a name in use a duty this configuration has not opted
+  /// out of.
+  ///
+  /// The other direction has no such cost: withholding a whole `ProbeProposal`
+  /// decides nothing, exactly as abandoning one decides nothing, so the proposal
+  /// gate is free to fail closed. A RECORD that will not parse is still NO here —
+  /// the exemption is owed to a record that reads, not to a nonzero NSCOUNT.
   fn is_probe_for(&self, name: &crate::Name) -> bool {
     let mut scope = ProposalScope::new(|| self.reader.questions(), name);
     for r in self.reader.authority() {
@@ -315,6 +341,8 @@ where
         continue;
       }
       match scope.admits(&r) {
+        // FAIL-OPEN, and deliberately: see above. An undecidable Question
+        // Section must not cost an established name its §8.1 defence.
         Ok(Admission::Ours) | Err(QuestionsUnreadable) => return true,
         Ok(Admission::NotOurs(_)) => continue,
       }
