@@ -266,6 +266,59 @@ where
     false
   }
 
+  /// Is this datagram a probe for `name` — a query actually PROPOSING to take
+  /// it, rather than one merely asking about it?
+  ///
+  /// The RFC 6762 §8.1 defence gate under `answer_questions(false)`. §8.2
+  /// defines the probe by what it carries: "each host populates the query
+  /// message's Authority Section with the record or records with the rdata that
+  /// it would be proposing to use". So the exemption a passive endpoint grants
+  /// is owed to a datagram that carries such a record FOR THE QUESTIONED NAME —
+  /// not to any datagram that merely declares a nonzero NSCOUNT, and not to a
+  /// discovery query that happens to carry an unrelated Authority record. Either
+  /// of those would walk a normal query past the suppression boundary that
+  /// configuration exists to draw, and out to the service response path.
+  ///
+  /// [`ProposalScope`] again, so the record this asks for is exactly the record
+  /// §8.2 adjudication would fold: owner name and class IN, in the scope of a
+  /// question this query asked. The scope's name is the one the question matched,
+  /// which is why the gate is per question and service rather than per datagram —
+  /// a peer probing our host name proposes nothing about our instance name.
+  ///
+  /// # …and it fails CLOSED, unlike [`Self::authority_proposes_for`]
+  ///
+  /// The two gates answer malformed input oppositely because what they release
+  /// is opposite. Delivering a `ProbeProposal` that cannot be read costs
+  /// nothing — the fold ABANDONS it, reaching no verdict — so that gate must
+  /// over-approximate. Releasing a question here produces a RESPONSE from an
+  /// endpoint configured not to answer, so undecodable bytes must not buy one.
+  ///
+  /// A `QuestionsUnreadable` is still answered YES, and only that. It is
+  /// reachable only from a record already matched to `name` in class IN, so the
+  /// datagram is probe-shaped already, and §8.1 makes defending a name in use a
+  /// duty this endpoint has not opted out of.
+  fn is_probe_for(&self, name: &crate::Name) -> bool {
+    let mut scope = ProposalScope::new(|| self.reader.questions(), name);
+    for r in self.reader.authority() {
+      // A record that will not parse is not a proposed record. `Records` stops
+      // at its first error, so nothing follows it either.
+      let Ok(r) = r else {
+        return false;
+      };
+      // `names_match_record` is already false for an owner name that will not
+      // decode, but the requirement is stated where it is required: the
+      // exemption is owed to a record that is fully readable, not to one whose
+      // owner merely might have been ours.
+      if !name_fully_decodes(r.name()) {
+        continue;
+      }
+      if scope.admits(&r).unwrap_or(true) {
+        return true;
+      }
+    }
+    false
+  }
+
   /// The HOST half of the conflict fan-out, for the QR=0 authority path whose
   /// INSTANCE half is delivered whole as a [`ProbeProposal`] instead.
   fn next_host_conflict(
@@ -416,11 +469,20 @@ where
           // would make passive endpoints answer on demand. Only the UNIQUE names
           // are defended below; a probe naming the shared service type is not a
           // uniqueness probe and stays suppressed.
+          //
+          // What the header says is only the CHEAP half of that, and on its own
+          // it is not the rule: a nonzero NSCOUNT is a claim about the datagram,
+          // not a proposed record in it. The half that decides is
+          // `Self::is_probe_for`, applied per question and service below,
+          // against the name the question actually matched. It is split this way
+          // so an ordinary datagram — every datagram, on an endpoint that
+          // answers nothing — leaves at the header test without either section
+          // being walked.
           let defence_only = !self.endpoint.config.answer_questions();
-          let is_probe_query = !self.is_response
+          let could_be_a_probe = !self.is_response
             && self.reader.header().authority_count() > 0
             && self.src.port() == crate::constants::MDNS_PORT;
-          if defence_only && !is_probe_query {
+          if defence_only && !could_be_a_probe {
             self.section = Section::Answers;
             continue;
           }
@@ -453,6 +515,11 @@ where
           // receive a ServiceEvent::Question for this question before we move on.
           let cursor = self.service_cursor;
           let mut found: Option<(usize, RouteEvent<'a>)> = None;
+          // The §8.1 defence gate's answer for THIS question, taken at most once.
+          // Every route reached below matched on a name equal to this question's
+          // own QNAME, so the Authority Section proposes for one of them exactly
+          // when it proposes for all of them.
+          let mut is_a_probe: Option<bool> = None;
           for (key, route) in self.endpoint.services.iter() {
             if key < cursor {
               continue;
@@ -467,8 +534,30 @@ where
             }
             // The UNIQUE names this route owns, and the only ones a §8.1
             // defence covers — which is all `defence_only` mode routes.
-            let unique_name_match = names_match(route.name(), q.qname())
-              || names_match(route.host(), q.qname());
+            let questioned_unique_name = if names_match(route.name(), q.qname()) {
+              Some(route.name())
+            } else if names_match(route.host(), q.qname()) {
+              Some(route.host())
+            } else {
+              None
+            };
+            let unique_name_match = match questioned_unique_name {
+              None => false,
+              // Answering is enabled, so the question routes on the name alone.
+              Some(_) if !defence_only => true,
+              // Passive: only a datagram that actually PROPOSES to take this
+              // name gets the §8.1 exemption. A discovery query carrying an
+              // unrelated Authority record, or one that only declares a nonzero
+              // NSCOUNT, is an ordinary query and stays suppressed.
+              Some(name) => match is_a_probe {
+                Some(known) => known,
+                None => {
+                  let probe = self.is_probe_for(name);
+                  is_a_probe = Some(probe);
+                  probe
+                }
+              },
+            };
             if unique_name_match
               || (!defence_only
                 && (names_match(route.service_type(), q.qname())

@@ -3548,6 +3548,121 @@ fn answer_questions_false_still_defends_a_probed_unique_name() {
   );
 }
 
+/// The §8.1 exemption is owed to a datagram that PROPOSES to take the questioned
+/// name — not to every QR=0 datagram whose header declares an Authority Section.
+///
+/// RFC 6762 §8.2 defines the probe by what it carries: "each host populates the
+/// query message's Authority Section with the record or records with the rdata
+/// that it would be proposing to use". A query carrying no such record for the
+/// name it asks about is an ordinary query however its NSCOUNT reads, and
+/// `answer_questions(false)` suppresses ordinary queries — so admitting one
+/// walks a discovery query out to the service response path and past the whole
+/// point of the configuration. A nonzero NSCOUNT costs an attacker two bytes.
+#[test]
+fn answer_questions_false_defends_only_against_a_real_proposal() {
+  use core::net::SocketAddr;
+
+  use rand::SeedableRng;
+
+  use crate::{
+    config::ServiceSpec,
+    records::ServiceRecords,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceType},
+  };
+
+  const INSTANCE: &str = "WebServer._http._tcp.local.";
+  const SERVICE_TYPE: &str = "_http._tcp.local.";
+  const HOST: &str = "web.local.";
+
+  // A QR=0 query asking about `qname`, with `authority_owner`'s SRV proposed (or
+  // nothing at all when it is `None`).
+  let query = |qname: &str, authority_owner: Option<&str>| -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let name = Name::try_from_str(qname).unwrap();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(
+      &name,
+      ResourceType::Any,
+      crate::wire::ResourceClass::In,
+      false,
+    )
+    .unwrap();
+    if let Some(owner) = authority_owner {
+      let owner = Name::try_from_str(owner).unwrap();
+      let target = Name::try_from_str("rival-host.local.").unwrap();
+      b.push_srv_authority(&owner, 120, 0, 0, 9999, &target).unwrap();
+    }
+    let n = b.finish().unwrap();
+    buf[..n].to_vec()
+  };
+
+  // The same query, but its Authority Section is a claim in the header and five
+  // bytes of rubbish on the wire.
+  let mut declared_only = query(INSTANCE, None);
+  declared_only[9] = 1; // NSCOUNT
+  declared_only.extend_from_slice(&[0x05, b'h', b'e', b'l', b'l']);
+
+  let mut e = {
+    let rng = rand::rngs::StdRng::from_seed([11u8; 32]);
+    let cfg = EndpointConfig::new().with_answer_questions(false);
+    TestEndp::try_new(cfg, rng)
+  };
+  let now = StdInstant::now();
+  let recs = ServiceRecords::new(
+    Name::try_from_str(SERVICE_TYPE).unwrap(),
+    Name::try_from_str(INSTANCE).unwrap(),
+    Name::try_from_str(HOST).unwrap(),
+    80,
+    120,
+  );
+  let (_h, _svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let peer: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let mut questions_for = |datagram: &[u8]| -> usize {
+    // `filter_map` and not `unwrap`: the truncated-authority case below yields a
+    // parse error of its own, which is not what this fixture is measuring.
+    e.handle(now, peer, local_ip, 0, datagram, false)
+      .unwrap()
+      .filter_map(Result::ok)
+      .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_question()))
+      .count()
+  };
+
+  assert_eq!(
+    questions_for(&query(INSTANCE, Some(INSTANCE))),
+    1,
+    "CONTROL: a genuine probe for our instance name still gets its §8.1 defence, \
+     so every negative below is the gate and not the fixture"
+  );
+  assert_eq!(
+    questions_for(&query(INSTANCE, Some("printer._ipp._tcp.local."))),
+    0,
+    "an Authority record for somebody ELSE'S name proposes nothing about ours — \
+     the datagram is a discovery query with a passenger, and passive mode \
+     suppresses discovery"
+  );
+  assert_eq!(
+    questions_for(&query(INSTANCE, Some(HOST))),
+    0,
+    "and a proposal for our HOST name is not a proposal for our INSTANCE name: \
+     the gate is per questioned name, not per datagram"
+  );
+  assert_eq!(
+    questions_for(&declared_only),
+    0,
+    "a nonzero NSCOUNT is a claim about the datagram, not a proposed record in \
+     it — undecodable authority bytes must not buy a response out of an endpoint \
+     configured not to answer"
+  );
+}
+
 // ── authority-section host fan-out ───────────────────────────
 
 /// Multiple services can legitimately share a host name.  An authority
