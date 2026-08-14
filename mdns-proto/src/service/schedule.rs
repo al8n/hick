@@ -19,6 +19,20 @@ pub(crate) mod rfc {
   /// Inter-probe interval (RFC §8.1).
   #[allow(dead_code)]
   pub const PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+  /// RFC 6762 §8.2: a host that LOSES the simultaneous-probe tiebreak "defers to
+  /// the winning host by waiting one second, and then begins probing for this
+  /// record again".
+  ///
+  /// It keeps its name. The wait is what makes a stale packet harmless — §8.2:
+  /// "if the apparently winning simultaneous probe was in fact just an old stale
+  /// packet on the network (maybe from the host itself), then when it retries
+  /// its probing in one second, its probes will go unanswered, and it will
+  /// successfully claim the name."
+  // Like its neighbours: the only reader is the `Service` state machine, which
+  // no-default-features does not compile.
+  #[allow(dead_code)]
+  pub const TIEBREAK_DEFER_WAIT: Duration = Duration::from_secs(1);
   /// First announce delay after probing (RFC §8.3).
   #[allow(dead_code)]
   pub const FIRST_ANNOUNCE_DELAY: Duration = Duration::from_secs(0);

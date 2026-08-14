@@ -5,7 +5,7 @@ use core::time::Duration;
 use super::*;
 use crate::{
   Name, ServiceHandle,
-  event::{KnownAnswer, ProbeConflict, ServiceEvent},
+  event::{ConflictOrigin, KnownAnswer, ProbeConflict, ProbeProposal, ServiceEvent},
   records::ServiceRecords,
   transmit::{FamilyDelivery, V4, V6},
   wire::Ref,
@@ -115,6 +115,262 @@ fn make_service(
   Service::try_new(handle, records, FakeInstant::zero(), [0u8; 32], true)
 }
 
+/// One record of a peer's §8.2 proposal, as it goes on the wire.
+#[derive(Clone, Copy)]
+enum Rec<'a> {
+  Srv {
+    port: u16,
+    target: &'a str,
+  },
+  Txt(&'a [&'a [u8]]),
+  /// A real prober puts its host records in the same Authority Section. A probe
+  /// asks a type-ANY question, so an A record AT THE PROBED NAME is part of the
+  /// proposal like any other — this variant exists to let a fixture prove it is
+  /// compared rather than passed over.
+  A([u8; 4]),
+}
+
+/// Bytes of a peer's §8.2 proposal for `owner`: a QR=0 query whose Authority
+/// Section carries `recs`, exactly as a prober puts them there.
+///
+/// Fixtures build the DATAGRAM rather than synthesising per-record events,
+/// because §8.2's unit is the whole section — "the Authority Section must
+/// contain *all* the records and proposed rdata being probed for uniqueness".
+/// Constructing records individually was how a partial proposal became
+/// representable in the first place.
+fn proposal_bytes(owner: &str, recs: &[Rec<'_>]) -> std::vec::Vec<u8> {
+  use crate::wire::{Header, MessageBuilder};
+  let mut buf = [0u8; 1024];
+  let name = Name::try_from_str(owner).unwrap();
+  let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+  // The QUESTION a probe asks, because it is what makes the Authority Section a
+  // proposal at all: §8.1 sends "a query with the record name in question in the
+  // Question Section", §5.4 sets the unicast-response bit on it, and §8.2 reads
+  // the proposed rdata off "the Authority Section of *that query*". These
+  // fixtures carried QDCOUNT=0 and were therefore not probes — a receiver that
+  // adjudicated them was adjudicating records that answered nothing. Exactly
+  // what `respond::write_probe` emits.
+  b.push_question(
+    &name,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
+  for r in recs {
+    match *r {
+      Rec::Srv { port, target } => {
+        let t = Name::try_from_str(target).unwrap();
+        b.push_srv_authority(&name, 120, 0, 0, port, &t).unwrap();
+      }
+      Rec::Txt(segs) => {
+        b.push_txt_authority(&name, 120, segs.iter().copied())
+          .unwrap();
+      }
+      Rec::A(octets) => {
+        b.push_a_authority(&name, 120, core::net::Ipv4Addr::from(octets))
+          .unwrap();
+      }
+    }
+  }
+  let n = b.finish().unwrap();
+  buf[..n].to_vec()
+}
+
+/// Bytes of a peer's §8.2 proposal assembled from HAND-BUILT records.
+///
+/// [`proposal_bytes`] goes through [`crate::wire::MessageBuilder`], which is OUR
+/// transmit path: it lowercases every name it writes and always emits a
+/// compliant TXT. Both are right for what we send and wrong for a fixture about
+/// what a PEER sent — a peer's mixed-case target, or a record whose rdata does
+/// not parse, cannot be expressed through it at all. Those fixtures write the
+/// wire bytes themselves and assemble them here.
+fn raw_proposal_bytes(records: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+  raw_proposal_bytes_asking(PROBED_NAME, records)
+}
+
+/// [`raw_proposal_bytes`] with the probe's QUESTION named explicitly, for the
+/// fixtures that turn on what the query asks rather than on what it proposes.
+fn raw_proposal_bytes_asking(qname: &str, records: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+  raw_proposal_bytes_asking_type(qname, crate::wire::ResourceType::Any, records)
+}
+
+/// [`raw_proposal_bytes_asking`] with the QTYPE named too. A conforming probe
+/// asks ANY (§8.1); a query naming one type still proposes its WHOLE Authority
+/// Section, which `a_narrowed_qtype_still_proposes_the_whole_authority_section`
+/// is about.
+fn raw_proposal_bytes_asking_type(
+  qname: &str,
+  qtype: crate::wire::ResourceType,
+  records: &[std::vec::Vec<u8>],
+) -> std::vec::Vec<u8> {
+  // QU | class IN — the shape `respond::write_probe` sends.
+  raw_proposal_bytes_asking_type_class(qname, qtype, 0x8000u16 | 1, records)
+}
+
+/// [`raw_proposal_bytes_asking_type`] with the raw QCLASS word named too, for
+/// the one fixture that asks in a class §8.2 does not scope.
+fn raw_proposal_bytes_asking_type_class(
+  qname: &str,
+  qtype: crate::wire::ResourceType,
+  qclass_raw: u16,
+  records: &[std::vec::Vec<u8>],
+) -> std::vec::Vec<u8> {
+  let mut msg: std::vec::Vec<u8> = std::vec::Vec::new();
+  msg.extend_from_slice(&0u16.to_be_bytes()); // ID
+  msg.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0 — a probe is a QUERY
+  msg.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT — a probe asks about the name
+  msg.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+  #[allow(clippy::cast_possible_truncation)]
+  msg.extend_from_slice(&(records.len() as u16).to_be_bytes()); // NSCOUNT
+  msg.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+  // The §8.1 question, uncompressed, with the §5.4 unicast-response bit set —
+  // the same shape `respond::write_probe` sends.
+  for label in qname.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    msg.push(label.len() as u8);
+    msg.extend_from_slice(label.as_bytes());
+  }
+  msg.push(0);
+  msg.extend_from_slice(&qtype.to_u16().to_be_bytes());
+  msg.extend_from_slice(&qclass_raw.to_be_bytes());
+  for r in records {
+    msg.extend_from_slice(r);
+  }
+  msg
+}
+
+/// The instance name every proposal fixture probes for.
+const PROBED_NAME: &str = "myprinter._ipp._tcp.local.";
+
+/// Parse proposal bytes into the event a peer's probe delivers.
+fn probe_proposal<'a>(
+  bytes: &'a [u8],
+  src: core::net::SocketAddr,
+  datagram: crate::event::DatagramId,
+) -> crate::event::ProbeProposal<'a> {
+  let reader = crate::wire::MessageReader::try_parse(bytes).expect("proposal parses");
+  crate::event::ProbeProposal::new(src, reader, datagram)
+}
+
+/// The common fixture: a peer proposing SRV(`port`) plus the empty TXT that
+/// `write_probe` always emits — the same shape this service proposes.
+fn srv_txt_proposal(port: u16) -> std::vec::Vec<u8> {
+  proposal_bytes(
+    "myprinter._ipp._tcp.local.",
+    &[
+      Rec::Txt(&[]),
+      Rec::Srv {
+        port,
+        target: "host.local.",
+      },
+    ],
+  )
+}
+
+/// A distinct RFC 6762 §8.2 proposal identity for a fixture: "these records
+/// arrived in datagram N".
+///
+/// Fixtures that stage ONE peer probe pass one value for all of its records,
+/// because §8.2's proposal is one query's whole Authority Section. Two values
+/// mean two datagrams, which is what
+/// `a_retransmitted_probe_is_not_a_longer_proposal` and
+/// `two_proposals_from_one_source_are_compared_separately` turn on.
+fn dg(n: u64) -> crate::event::DatagramId {
+  crate::event::DatagramId::new(n)
+}
+
+/// Drive a freshly-registered service until one probe has actually reached the
+/// wire, and return the `now` at which it did.
+///
+/// RFC 6762 §8.1: "Apparently conflicting Multicast DNS responses received
+/// *before* the first probe packet is sent MUST be silently ignored". So a test
+/// that wants a conflicting RESPONSE to be ACTED on must first open that window
+/// the way a driver does — transmit a probe and confirm its delivery.
+///
+/// Only responses need it. A `ConflictOrigin::TentativeProbe` is §8.2's input
+/// and carries no such precondition, which is why the §8.2 tiebreak tests inject
+/// one straight after `make_service` and do not call this.
+fn probe_once(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  start: FakeInstant,
+) -> FakeInstant {
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = start;
+  for _ in 0..10 {
+    now = now.advance(300);
+    svc.handle_timeout(now).unwrap();
+    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_delivery(now, TransmitDelivery::ALL);
+      return now;
+    }
+  }
+  panic!(
+    "no probe reached the wire within 10 ticks; state={:?}",
+    svc.state()
+  );
+}
+
+/// Assert RFC 6762 §8.2's DEFERRAL in full: the host that loses the
+/// simultaneous-probe tiebreak KEEPS ITS NAME and probes for it again one second
+/// later.
+///
+/// §8.2: "it defers to the winning host by waiting one second, and then begins
+/// probing for this record again."
+///
+/// Every conjunct is load-bearing, and "the name did not change" is deliberately
+/// not asserted on its own: a service that dropped the proposal on the floor and
+/// carried on probing satisfies that just as well, and dropping a verdict is the
+/// one failure a tiebreak fixture exists to catch. So the restart (`Init`,
+/// `probe_count == 0`) and the one-second wait (`lifecycle_deadline`) are pinned
+/// with it, plus the absence of any `ServiceUpdate::Renamed`.
+///
+/// `deferred_at` is the instant of the `handle_timeout` that SPENT the verdict:
+/// §8.2's second is measured from the deferral, not from the proposal's arrival.
+fn assert_tiebreak_deferred(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  kept_name: &str,
+  deferred_at: FakeInstant,
+  what: &str,
+) {
+  assert_eq!(
+    svc.name().as_str(),
+    kept_name,
+    "{what}: a §8.2 loss KEEPS the name — \"it defers to the winning host by \
+     waiting one second, and then begins probing for this record again\""
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "{what}: …and \"begins probing for this record again\" means the §8.1 \
+     sequence restarts from the start"
+  );
+  assert_eq!(
+    svc.probe_count, 0,
+    "{what}: …with no probe of the restarted sequence credited yet"
+  );
+  assert_eq!(
+    svc.lifecycle_deadline,
+    Some(deferred_at.advance(1000)),
+    "{what}: …after \"waiting one second\" exactly — \
+     schedule::rfc::TIEBREAK_DEFER_WAIT"
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "{what}: and the verdict is spent by the deferral, leaving no latched loss \
+     behind"
+  );
+  let mut updates = std::vec::Vec::new();
+  while let Some(u) = svc.poll() {
+    updates.push(u);
+  }
+  assert!(
+    !updates.iter().any(ServiceUpdate::is_renamed),
+    "{what}: a §8.2 loss queues NO ServiceUpdate::Renamed — only a §8.1 loss to \
+     a host that already OWNS the name renames; got {updates:?}"
+  );
+}
+
 impl GoodbyeOwnership {
   /// Test helper: simulate that the instance records (PTR/SRV/TXT) were
   /// confirmed-announced. The ownership model uses per-record flags rather than a
@@ -221,68 +477,52 @@ fn make_txt_record_ref(buf: &mut std::vec::Vec<u8>, owner_str: &str, ttl: u32, s
 
 // ── service_resumes_probing_after_rename ───────────────────────
 
-/// After a ProbeConflict where the peer wins the RFC §8.2 tiebreak, the service must:
-///   - Eventually transition back to Init (after the tiebreak handle_timeout).
+/// After a conflicting authoritative RESPONSE inside §8.1's probing window, the
+/// service must:
+///   - Eventually transition back to Init (after the rename handle_timeout).
 ///   - Have a non-None lifecycle_deadline (fresh probe delay).
 ///   - Eventually advance through Probing for the renamed instance.
 ///
-/// The peer sends SRV with port=9999; ours has port=631. Since 9999 > 631 in
-/// the SRV rdata bytes, the peer's set is lexicographically greater, so we lose
-/// and must rename. (tiebreak now compares SRV+TXT only, not A.)
+/// The STIMULUS changed with §8.2's deferral: a peer merely PROBING this name
+/// owns nothing, so losing that tiebreak now keeps the name (see
+/// `tiebreak_we_lose_defers_and_reprobes`). A rename is §8.1's rule — "the
+/// probing host MUST defer to the existing host, and SHOULD choose new names" —
+/// and its input is a conflicting RESPONSE from a host that already HOLDS the
+/// name. Every assertion about what a rename does is unchanged.
 #[test]
 fn service_resumes_probing_after_rename() {
   let mut svc = make_service(120);
 
-  // Initial tick: advances Init → Probing(0) and gives last_now a value.
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
-  // The service is now in Init (just scheduled a probe delay) or Probing(0)
-  // depending on whether the probe deadline already fired. Either way, we
-  // need last_now to be set.
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
   assert!(
     svc.last_now.is_some(),
     "last_now should be set after first handle_timeout"
   );
 
-  // Synthesise a ProbeConflict event with a peer SRV record that beats ours.
-  // Our SRV: port=631. Peer SRV: port=9999 (9999 > 631 → peer wins in SRV
-  // byte comparison). The tiebreak now compares SRV+TXT only.
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,    // priority
-    0,    // weight
-    9999, // port > 631 → peer SRV canonical bytes are larger → peer wins
-    "host.local.",
-  );
-  let (record_ref, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer_src_a: core::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
-  let conflict = ProbeConflict::new(peer_src_a, record_ref);
-  svc.handle_event(ServiceEvent::ProbeConflict(conflict), t0);
+  // Put a probe on the wire first: §8.1 requires a conflicting response arriving
+  // before it to be silently ignored, so the window has to be open first.
+  let t0 = probe_once(&mut svc, t0);
 
-  // After handle_event: the record is buffered but rename has NOT happened yet.
+  // An existing owner answers with a DIFFERING SRV (port 9999 against our 631).
+  deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
+
+  // After handle_event: the deferral is recorded but rename has NOT happened yet.
   assert!(
-    svc.tiebreak_pending,
-    "tiebreak_pending must be set after ProbeConflict"
-  );
-  assert_eq!(
-    svc.peer_probes.len(),
-    1,
-    "one peer probe bucket must be created"
+    svc.probe_defeated,
+    "the response must be classified as a §8.1 deferral on arrival"
   );
 
-  // Drive the tiebreak: advance time so the next deadline fires and the
-  // tiebreak comparison runs. Peer wins → rename applied.
+  // Drive the decision: advance time so the next deadline fires and the stored
+  // classification is spent. The existing owner wins → rename applied.
   let t1 = t0.advance(500);
   svc.handle_timeout(t1).unwrap();
 
-  // After the tiebreak handle_timeout: state must be Init.
+  // After the decision handle_timeout: state must be Init.
   assert_eq!(
     svc.state(),
     ServiceState::Init,
-    "state must return to Init after tiebreak rename"
+    "state must return to Init after the §8.1 rename"
   );
 
   // fix: lifecycle_deadline must be Some (not None) — the service must
@@ -523,29 +763,18 @@ fn rename_handoff_withdraws_only_advertised_instance_records() {
   // into the handoff (instance ownership latched at rename time); the endpoint's
   // detached item then emits only those records.
   let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
+  // A probe on the wire first: §8.1 acts on a conflicting RESPONSE only once one
+  // has been sent. The stimulus is a response because a §8.2 tiebreak loss now
+  // DEFERS and keeps the name, while this fixture needs a rename.
+  let t0 = probe_once(&mut svc, FakeInstant::zero());
   // The old name advertised ONLY its PTR (SRV/TXT were KAS-suppressed on the one
   // confirmed response before the rename).
   svc.goodbye.ptr = true;
 
-  // Drive a losing §8.2 tiebreak (peer SRV port 9999 > ours 631) → rename.
-  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut sbuf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&sbuf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  let now = FakeInstant::zero().advance(500);
+  // An existing owner answers with a DIFFERING SRV (port 9999 > ours 631) → §8.1
+  // deferral → rename.
+  deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
+  let now = t0.advance(500);
   svc.handle_timeout(now).unwrap();
   assert!(
     svc.name().as_str().contains("-1"),
@@ -861,16 +1090,11 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
   // Drive through probing to Announcing(0), confirming each probe; stop the
   // instant we reach Announcing(0), BEFORE any announcement is emitted.
   let mut now = FakeInstant::zero();
-  'drive: for _ in 0..20 {
-    now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
-    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_delivery(now, TransmitDelivery::ALL);
-      if matches!(svc.state(), ServiceState::Announcing(0)) {
-        break 'drive;
-      }
-    }
-  }
+  // Via the shared helper: it checks the state after `handle_timeout`, not only
+  // inside the drain loop, so it sees `Announcing(0)` on the tick that RFC 6762
+  // §8.1's post-third-probe settling window closes — a transition that costs no
+  // datagram and therefore never appears mid-drain.
+  now = drive_to_announcing_zero(&mut svc);
   assert!(matches!(svc.state(), ServiceState::Announcing(0)));
   assert!(
     !svc.advertises_host() && !svc.goodbye.any_instance(),
@@ -950,16 +1174,11 @@ fn legacy_a_query_reply_latches_full_set() {
   let mut svc = make_service(120);
   let mut buf = std::vec![0u8; 4096];
   let mut now = FakeInstant::zero();
-  'drive: for _ in 0..20 {
-    now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
-    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_delivery(now, TransmitDelivery::ALL);
-      if matches!(svc.state(), ServiceState::Announcing(0)) {
-        break 'drive;
-      }
-    }
-  }
+  // Via the shared helper: it checks the state after `handle_timeout`, not only
+  // inside the drain loop, so it sees `Announcing(0)` on the tick that RFC 6762
+  // §8.1's post-third-probe settling window closes — a transition that costs no
+  // datagram and therefore never appears mid-drain.
+  now = drive_to_announcing_zero(&mut svc);
   assert!(matches!(svc.state(), ServiceState::Announcing(0)));
 
   // Legacy A query for our host name.
@@ -1799,7 +2018,7 @@ fn host_conflict_does_not_rename_instance() {
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut buf, "host.local.", 120, [192, 168, 1, 99]);
   let (record_ref, _) = Ref::try_parse(&buf, 0).unwrap();
-  let hc = HostConflict::new(record_ref);
+  let hc = HostConflict::new(record_ref, ConflictOrigin::AuthoritativeResponse);
   svc.handle_event(ServiceEvent::HostConflict(hc), t0);
 
   // Instance name must be unchanged.
@@ -1845,7 +2064,10 @@ fn host_conflict_ignores_our_own_advertised_address() {
   make_a_record_ref(&mut buf, "host.local.", 120, [192, 168, 1, 10]); // OUR address
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   svc.handle_event(
-    ServiceEvent::HostConflict(HostConflict::new(rec)),
+    ServiceEvent::HostConflict(HostConflict::new(
+      rec,
+      ConflictOrigin::AuthoritativeResponse,
+    )),
     FakeInstant::zero(),
   );
   assert!(
@@ -1865,7 +2087,10 @@ fn host_conflict_surfaces_for_different_address() {
   make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 99]); // NOT ours
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   svc.handle_event(
-    ServiceEvent::HostConflict(HostConflict::new(rec)),
+    ServiceEvent::HostConflict(HostConflict::new(
+      rec,
+      ConflictOrigin::AuthoritativeResponse,
+    )),
     FakeInstant::zero(),
   );
   assert!(
@@ -1922,7 +2147,7 @@ fn section9_reprobe_clears_queued_legacy_reply() {
   let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec)),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec, dg(1))),
     now,
   );
 
@@ -1947,28 +2172,15 @@ fn section9_reprobe_clears_queued_legacy_reply() {
 #[test]
 fn conflict_rename_hands_off_old_announced_name() {
   let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
+  // A probe on the wire first, then a conflicting RESPONSE: §8.1's "the probing
+  // host MUST defer to the existing host, and SHOULD choose new names" is the
+  // rule that renames. A §8.2 tiebreak loss now defers and keeps the name, so it
+  // stages no handoff at all.
+  let t0 = probe_once(&mut svc, FakeInstant::zero());
   svc.goodbye.mark_instance(); // the original name was announced
 
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc
-    .handle_timeout(FakeInstant::zero().advance(500))
-    .unwrap();
+  deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
+  svc.handle_timeout(t0.advance(500)).unwrap();
   assert!(
     svc.name().as_str().contains("-1"),
     "service should have renamed"
@@ -2005,7 +2217,7 @@ fn conflict_rename_hands_off_old_announced_name() {
   // endpoint's detached item). The next transmit is the new-name probe sequence,
   // never a TTL=0 record for `myprinter`.
   let mut out = std::vec![0u8; 4096];
-  if let Ok(Some(t)) = svc.poll_transmit(FakeInstant::zero().advance(500), &mut out) {
+  if let Ok(Some(t)) = svc.poll_transmit(t0.advance(500), &mut out) {
     let reader = crate::wire::MessageReader::try_parse(&out[..t.size()]).unwrap();
     for rr in reader.answers() {
       let rr = rr.unwrap();
@@ -2028,38 +2240,95 @@ fn conflict_rename_hands_off_old_announced_name() {
 // `conflict_rename_hands_off_old_announced_name` and
 // `rename_handoff_withdraws_only_advertised_instance_records` above/below.
 
-/// a link-local host A is scope-ambiguous — the same raw address on
-/// a different interface is a real conflict — so it must surface a HostConflict
-/// even when the address matches one we advertise.
+/// A link-local host A whose rdata is BYTE-IDENTICAL to one we advertise is not a
+/// conflict, and a DIFFERENT link-local address still is.
+///
+/// INVERTED, deliberately, and the function was renamed with it
+/// (`host_conflict_for_link_local_address_is_not_suppressed` →
+/// `host_conflict_for_identical_link_local_address_is_suppressed`). It used to
+/// assert that a matching link-local A surfaced `ServiceUpdate::HostConflict`
+/// anyway, on the reasoning that a link-local address is scope-ambiguous — "the
+/// same raw address on a different interface is a real conflict".
+///
+/// That carve-out has been DROPPED from `host_record_is_ours`, and the old
+/// assertion is replaced rather than narrowed, because no admitted input reaches
+/// it. RFC 6762 §9: "resource records with identical rdata are never considered
+/// inconsistent, even if they originate from different hosts. This is to permit
+/// use of proxies and other fault-tolerance mechanisms that may cause more than
+/// one responder to be capable of issuing identical answers on the network." On
+/// the SAME link, identical rdata is §9's explicit non-conflict; across
+/// DIFFERENT links a link-local address is not routable, so no observer ever
+/// sees a collision. Neither case leaves a scope in which the old behaviour was
+/// right, and it cost a terminal, caller-visible retirement in precisely the
+/// fault-tolerance case §9 exists to protect.
+///
+/// The positive case is kept below so the rule cannot be satisfied by ignoring
+/// link-local addresses altogether: a DIFFERENT link-local address is a genuine
+/// §9 conflict and must still surface `HostConflict`.
 #[test]
-fn host_conflict_for_link_local_address_is_not_suppressed() {
+fn host_conflict_for_identical_link_local_address_is_suppressed() {
   use crate::event::{HostConflict, ServiceEvent};
-  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
-  let inst = Name::try_from_str("myprinter._ipp._tcp.local.").unwrap();
-  let host = Name::try_from_str("host.local.").unwrap();
-  let mut r = ServiceRecords::new(stype, inst, host, 631, 120);
-  r.add_a(core::net::Ipv4Addr::new(169, 254, 1, 1)); // link-local, advertised
-  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
-      ServiceHandle::from_raw(0),
-      r,
-      FakeInstant::zero(),
-      [0u8; 32],
-      true,
-    );
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  let make = || {
+    let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+    let inst = Name::try_from_str("myprinter._ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("host.local.").unwrap();
+    let mut r = ServiceRecords::new(stype, inst, host, 631, 120);
+    r.add_a(core::net::Ipv4Addr::new(169, 254, 1, 1)); // link-local, advertised
+    let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+      Service::try_new(
+        ServiceHandle::from_raw(0),
+        r,
+        FakeInstant::zero(),
+        [0u8; 32],
+        true,
+      );
+    svc.handle_timeout(FakeInstant::zero()).unwrap();
+    svc
+  };
+  let deliver =
+    |svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+     addr: [u8; 4]| {
+      let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+      make_a_record_ref(&mut buf, "host.local.", 120, addr);
+      let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+      svc.handle_event(
+        ServiceEvent::HostConflict(HostConflict::new(
+          rec,
+          ConflictOrigin::AuthoritativeResponse,
+        )),
+        FakeInstant::zero(),
+      );
+    };
 
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_a_record_ref(&mut buf, "host.local.", 120, [169, 254, 1, 1]); // same link-local addr
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
-    ServiceEvent::HostConflict(HostConflict::new(rec)),
-    FakeInstant::zero(),
-  );
-  assert!(
-    svc.poll().is_some_and(|u| u.is_host_conflict()),
-    "a link-local host A must surface HostConflict even when the raw address matches"
-  );
+  // ── The identical link-local address: §9's non-conflict ──────────────────
+  {
+    let mut svc = make();
+    deliver(&mut svc, [169, 254, 1, 1]); // the SAME link-local addr we advertise
+    let mut updates = std::vec::Vec::new();
+    while let Some(u) = svc.poll() {
+      updates.push(u);
+    }
+    assert!(
+      !updates.iter().any(ServiceUpdate::is_host_conflict),
+      "§9: \"resource records with identical rdata are never considered \
+       inconsistent, even if they originate from different hosts\" — a \
+       link-local A byte-identical to one we advertise queues NO HostConflict, \
+       because on the same link it is that sentence and across links the \
+       address is not routable, so no observer sees a collision; got {updates:?}"
+    );
+  }
+
+  // ── A DIFFERENT link-local address: still a genuine §9 conflict ──────────
+  {
+    let mut svc = make();
+    deliver(&mut svc, [169, 254, 9, 9]); // a different link-local addr
+    assert!(
+      svc.poll().is_some_and(|u| u.is_host_conflict()),
+      "the suppression is a property of the RDATA, not of link-local scope: a \
+       DIFFERENT address at our host name is inconsistent and must still \
+       surface HostConflict"
+    );
+  }
 }
 
 /// when a conflict rename fails (the suffixed name is invalid), the
@@ -2083,30 +2352,16 @@ fn failed_conflict_rename_clears_stale_transmit_state() {
       [0u8; 32],
       true,
     );
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
+  // A probe on the wire first, then a conflicting RESPONSE — §8.1's rename is
+  // the one that can FAIL here. A §8.2 tiebreak loss now defers and keeps the
+  // name, so it never attempts the suffix at all.
+  let t0 = probe_once(&mut svc, FakeInstant::zero());
   // Stale queued state that must be cleared if the rename fails.
   svc.pending_transmits[0] = Some(PendingTransmitKind::Probe);
-  svc.response_deadline = Some(FakeInstant::zero().advance(50));
+  svc.response_deadline = Some(t0.advance(50));
 
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    &std::format!("{long_label}._ipp._tcp.local."),
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc
-    .handle_timeout(FakeInstant::zero().advance(500))
-    .unwrap();
+  deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
+  svc.handle_timeout(t0.advance(500)).unwrap();
 
   assert_eq!(
     svc.state(),
@@ -2130,10 +2385,10 @@ fn failed_conflict_rename_clears_stale_transmit_state() {
 /// the service must NOT rename after the tiebreak handle_timeout — probing
 /// continues uninterrupted.
 ///
-/// only SRV and TXT records are accepted into the peer bucket.
-/// Non-SRV/TXT records (A, NSEC, etc.) are dropped silently without setting
-/// tiebreak_pending. This sub-test verifies the A-record-drop path separately,
-/// then the main tiebreak-win path uses a peer SRV with port=80 (< our 631).
+/// Only SRV and TXT records are compared. Non-SRV/TXT records (A, NSEC, etc.)
+/// are passed over, changing neither the elements of the peer's list nor its
+/// length. This sub-test verifies the A-record-drop path separately, then the
+/// main tiebreak-win path uses a peer SRV with port=80 (< our 631).
 ///
 /// Tiebreak win: peer SRV port=80 < our port=631 → peer's sorted set is
 /// lexicographically smaller → `peer >= our` is FALSE → we WIN (no rename).
@@ -2142,33 +2397,42 @@ fn tiebreak_we_win_continues_probing() {
   let mut svc = make_service(120);
 
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
 
-  // sub-check: a ProbeConflict carrying an A record must be silently
-  // dropped — A records are NOT SRV or TXT, so they don't belong in the
-  // tiebreak bucket. tiebreak_pending must NOT be set.
+  // sub-check: the scope is ANY, so an A record at the probed name IS part of
+  // the peer's proposal — and here it is the record that WINS us the round. A
+  // probe asks a type-ANY question, so every positive-TTL IN record at that name
+  // is "the records and proposed rdata being probed for uniqueness".
+  //
+  // The fixture is built so the answer DISCRIMINATES, in the direction that
+  // costs us the name if the scope is narrowed. A sorts as type 1, below our
+  // first record (TXT, type 16), so it is the peer's first element and it
+  // compares LOWER — the peer loses on record one. Scope the fold to SRV/TXT and
+  // the A vanishes, leaving {TXT(empty), SRV(9999)} against our {TXT(empty),
+  // SRV(631)}, which beats us and defers.
   {
-    let mut buf_a: std::vec::Vec<u8> = std::vec::Vec::new();
-    make_a_record_ref(
-      &mut buf_a,
-      "myprinter._ipp._tcp.local.",
-      120,
-      [192, 168, 1, 10],
+    let bytes = proposal_bytes(
+      PROBED_NAME,
+      &[
+        Rec::Txt(&[]),
+        Rec::Srv {
+          port: 9999, // beats our 631 — and is never reached
+          target: "host.local.",
+        },
+        Rec::A([192, 168, 1, 10]),
+      ],
     );
-    let (rref_a, _) = Ref::try_parse(&buf_a, 0).unwrap();
     let src_a: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
     svc.handle_event(
-      ServiceEvent::ProbeConflict(ProbeConflict::new(src_a, rref_a)),
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, src_a, dg(1))),
       t0,
     );
     assert!(
-      !svc.tiebreak_pending,
-      "ProbeConflict with an A record must NOT set tiebreak_pending"
-    );
-    assert_eq!(
-      svc.peer_probes.len(),
-      0,
-      "A-record ProbeConflict must NOT create a peer-probe bucket"
+      !svc.tiebreak_lost,
+      "§8.2 compares the whole list in order: the peer's first record is an A \
+       that sorts below our first, so the peer loses there and its later \
+       SRV(9999) is never reached. Dropping the A from the proposal would hand \
+       the round to that SRV"
     );
   }
 
@@ -2179,29 +2443,19 @@ fn tiebreak_we_win_continues_probing() {
   // Our SRV port=631 > peer SRV port=80 → our_concat > peer_concat → we WIN.
   let peer_src_win: core::net::SocketAddr = "192.168.1.10:5353".parse().unwrap();
 
-  // Send peer SRV(port=80).
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,  // priority
-    0,  // weight
-    80, // port < our 631 → peer SRV bytes are smaller → peer loses
-    "host.local.",
+  // One proposal carrying both records: SRV(port=80) — smaller than our 631, so
+  // the peer loses on it — and the TXT(empty) a prober emits alongside.
+  let bytes = srv_txt_proposal(80);
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src_win, dg(1))),
+    t0,
   );
-  let (record_ref, _) = Ref::try_parse(&buf, 0).unwrap();
-  let conflict = ProbeConflict::new(peer_src_win, record_ref);
-  svc.handle_event(ServiceEvent::ProbeConflict(conflict), t0);
 
-  // Send peer TXT(empty) — peer's probe emits TXT; we must too for symmetry.
-  let mut buf_txt: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_txt_record_ref(&mut buf_txt, "myprinter._ipp._tcp.local.", 120, &[]);
-  let (txt_ref, _) = Ref::try_parse(&buf_txt, 0).unwrap();
-  let conflict_txt = ProbeConflict::new(peer_src_win, txt_ref);
-  svc.handle_event(ServiceEvent::ProbeConflict(conflict_txt), t0);
-
-  assert!(svc.tiebreak_pending, "tiebreak_pending must be set");
+  assert!(
+    !svc.tiebreak_lost,
+    "the proposal is compared the moment it arrives, and ours sorts later, so \
+     this round records no loss"
+  );
   let state_before = svc.state();
   let name_before = svc.name().as_str().to_owned();
 
@@ -2216,13 +2470,9 @@ fn tiebreak_we_win_continues_probing() {
     "tiebreak win must NOT rename the service"
   );
   assert!(
-    !svc.tiebreak_pending,
-    "tiebreak_pending must be cleared after comparison"
-  );
-  assert_eq!(
-    svc.peer_probes.len(),
-    0,
-    "peer_probes must be cleared after tiebreak"
+    !svc.tiebreak_lost,
+    "and the round's verdict is spent by the comparison, leaving no latched \
+     loss behind"
   );
   // No Renamed update queued.
   assert!(
@@ -2241,67 +2491,925 @@ fn tiebreak_we_win_continues_probing() {
 // ── RFC §8.2 tiebreak — we LOSE ──────────────────────────────
 
 /// When the peer's SRV record beats ours (peer's is lexicographically greater),
-/// the service must rename after the tiebreak handle_timeout.
+/// the service DEFERS after the tiebreak handle_timeout: it keeps its name and
+/// re-probes for it one second later.
 ///
 /// Our SRV: port=631. Peer SRV: port=9999. Since 9999 > 631, peer set is
-/// greater → we lose → rename. (tiebreak compares SRV+TXT only.)
+/// greater → we lose the §8.2 tiebreak. (tiebreak compares SRV+TXT only.)
 #[test]
-fn tiebreak_we_lose_renames() {
+fn tiebreak_we_lose_defers_and_reprobes() {
   let mut svc = make_service(120); // our SRV: port=631
 
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
 
-  // Peer sends a SRV record with port=9999 (greater than our 631).
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,    // priority
-    0,    // weight
-    9999, // port > 631 → peer wins
-    "host.local.",
-  );
-  let (record_ref, _) = Ref::try_parse(&buf, 0).unwrap();
+  // Peer proposes SRV(port=9999) — greater than our 631 — with the TXT(empty)
+  // a prober emits alongside, so the comparison turns on the port alone.
+  let bytes = srv_txt_proposal(9999);
   let peer_src_lose: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  let conflict = ProbeConflict::new(peer_src_lose, record_ref);
-  svc.handle_event(ServiceEvent::ProbeConflict(conflict), t0);
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src_lose, dg(1))),
+    t0,
+  );
 
-  assert!(svc.tiebreak_pending);
+  assert!(svc.tiebreak_lost);
   let original_name = svc.name().as_str().to_owned();
 
   // Trigger the tiebreak: peer wins.
   let t1 = t0.advance(500);
   svc.handle_timeout(t1).unwrap();
 
-  // We lost: service must have renamed.
-  assert!(
-    svc.name().as_str().contains("-1"),
-    "tiebreak loss must rename the service (expected '-1' suffix); got {}",
-    svc.name().as_str()
+  // INVERTED, deliberately, and the function was renamed with it
+  // (`tiebreak_we_lose_renames` → `tiebreak_we_lose_defers_and_reprobes`). The
+  // old claim was "a §8.2 loss renames". The admitted outcome that replaces it
+  // is that a §8.2 loss KEEPS the name and re-probes it after one second — RFC
+  // 6762 §8.2: "it defers to the winning host by waiting one second, and then
+  // begins probing for this record again." Only a §8.1 loss to a host that
+  // already OWNS the name renames, which is a conflicting authoritative RESPONSE
+  // and not the tentative proposal delivered above.
+  //
+  // Neither host owns this name yet: both are still asking for it, so the loser
+  // has nothing to give up — and if the winning proposal was only a stale echo,
+  // the retry a second later goes unanswered and the name is simply kept.
+  assert_tiebreak_deferred(&mut svc, &original_name, t1, "a losing SRV proposal");
+}
+
+/// §8.2 compares an empty TXT AS THE PEER SENT IT — the SECOND knob the identity
+/// form turns and the tiebreak must not.
+///
+/// RFC 6763 §6.1 says a TXT record MUST contain at least one string, so the
+/// identity question ("are these two records the same record") normalises a
+/// zero-length rdata to the single zero-length string a compliant sender would
+/// have used. §8.2 asks a different question — "a raw comparison of the binary
+/// content of the rdata without regard for meaning or structure" — and only
+/// resolves a name if BOTH hosts compute the same function over the same two
+/// lists. A peer that sent empty rdata will compare empty rdata; rewriting it on
+/// our side alone makes the two sides disagree.
+///
+/// The arithmetic, since one input has to give opposite verdicts for the fixture
+/// to be worth anything. TXT (rtype 16) sorts before SRV (rtype 33) in both
+/// lists, and the peer here holds the HIGHER SRV:
+///
+/// | form | peer's TXT element | vs our `[0x00, 0x10, 0x00]` | decided by |
+/// |---|---|---|---|
+/// | `AS_SENT` | `[0x00, 0x10]` | shorter, so sorts EARLIER | element 0 — we hold |
+/// | `FOLDED` | `[0x00, 0x10, 0x00]` | equal | the SRV — the peer wins |
+///
+/// So normalising the peer's empty TXT hands away a name that the peer itself
+/// scores as ours. Every existing fixture spells a peer's empty TXT with
+/// `make_txt_record_ref(.., &[&[]])`, which writes the COMPLIANT single
+/// zero-length string; both forms render that identically, which is why none of
+/// them could see this. Hand-built, because `push_txt_authority` always emits
+/// the compliant form and cannot express this peer at all.
+#[test]
+fn a_peers_empty_txt_rdata_is_compared_as_the_peer_sent_it() {
+  let mut svc = make_service(120); // our SRV: port 631, target `host.local.`
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
+
+  // A TXT record with RDLENGTH = 0 — no strings at all, which is what §6.1
+  // forbids and what a normalising comparator would silently rewrite.
+  let mut txt: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    txt.push(label.len() as u8);
+    txt.extend_from_slice(label.as_bytes());
+  }
+  txt.push(0u8);
+  txt.extend_from_slice(&crate::wire::ResourceType::Txt.to_u16().to_be_bytes());
+  txt.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  txt.extend_from_slice(&120u32.to_be_bytes());
+  txt.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH = 0
+
+  // A WINNING SRV, so that if the TXT elements tie the peer takes the round.
+  // Ours is port 631 (0x0277); theirs 65535 (0xFFFF) sorts above it.
+  let mut srv = std::vec::Vec::new();
+  make_srv_record_ref(&mut srv, PROBED_NAME, 120, 0, 0, 65535, "host.local.");
+
+  let bytes = raw_proposal_bytes(&[txt, srv]);
+  let peer: core::net::SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
   );
+
+  assert!(
+    !svc.tiebreak_lost,
+    "the peer's TXT rdata is EMPTY as sent, so its element is the rtype prefix \
+     alone and sorts below our compliant `0x00` — the round is decided at that \
+     first element and the peer's higher SRV never gets to speak. Normalising \
+     the peer's empty TXT to §6.1's single zero-length string ties element 0 \
+     instead, hands the round to the SRV, and loses the name to a host the peer \
+     itself scores as the loser"
+  );
+}
+
+/// §8.2 compares the bytes the PEER put on the wire, case and all — and this is
+/// the fixture where the two canonicalizers give OPPOSITE verdicts on one input.
+///
+/// The peer proposes our port and an equal TXT, so the whole round turns on the
+/// SRV target: theirs `HOSU.local.`, ours `host.local.`.
+///
+/// * as sent (`RdataForm::AS_SENT`): the first label byte is `H`(0x48) against
+///   our `h`(0x68), so the peer's SRV sorts BELOW ours and the peer loses.
+/// * normalised (`RdataForm::FOLDED`): lowercased to `hosu.local.`, where
+///   `u`(0x75) beats our `t`(0x74), so the peer's SRV sorts ABOVE ours and we
+///   would defer to a host we in fact beat.
+///
+/// Which is right is settled by symmetry, not by taste: the peer is comparing
+/// the bytes IT sent against the bytes WE sent, and it will score this round as
+/// a win for us. A responder that normalises the peer's side scores the same
+/// round as a win for the peer, and then both hosts believe they lost — or, in
+/// the mirror case, both believe they won and take the name.
+///
+/// The datagram is hand-built because `MessageBuilder::write_name` LOWERCASES on
+/// transmit (the coupling `proposal::our_proposal` documents), so the ordinary
+/// fixture builder cannot express a peer that sent mixed case at all.
+#[test]
+fn a_peers_mixed_case_target_is_compared_as_the_peer_sent_it() {
+  let mut svc = make_service(120); // our SRV: port 631, target `host.local.`
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  let original = svc.name().as_str().to_owned();
+
+  // One zero-length string: byte-for-byte what our own probe puts on the wire
+  // for an empty TXT, so the TXT records cancel and the SRV decides.
+  let mut txt = std::vec::Vec::new();
+  make_txt_record_ref(&mut txt, PROBED_NAME, 120, &[&[]]);
+  let mut srv = std::vec::Vec::new();
+  make_srv_record_ref(&mut srv, PROBED_NAME, 120, 0, 0, 631, "HOSU.local.");
+  let bytes = raw_proposal_bytes(&[txt, srv]);
+  let peer: core::net::SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+
+  assert!(
+    !svc.tiebreak_lost,
+    "`HOSU` is what the peer sent and `H` sorts below our `h`, so the peer's \
+     proposal is the lower one and this round records no loss — case-folding it \
+     to `hosu` would invert the verdict against the very bytes the peer is \
+     comparing"
+  );
+
+  let t1 = t0.advance(500);
+  svc.handle_timeout(t1).unwrap();
+  assert_eq!(
+    svc.name().as_str(),
+    original,
+    "…so nothing is deferred and nothing renamed"
+  );
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(_)),
+    "…and the §8.1 sequence carries on; got {:?}",
+    svc.state()
+  );
+}
+
+/// An in-scope record whose rdata does not parse ABANDONS the whole proposal:
+/// §8.2's input is "*all* the records and proposed rdata being probed for
+/// uniqueness", and a list with one member unread is not that list.
+///
+/// The fixture discriminates in the direction that matters. Skipping the
+/// unreadable record leaves {TXT(empty), SRV(9999)}, which beats our
+/// {TXT(empty), SRV(631)} and defers — so a shortened list does not merely lose
+/// information, it manufactures a verdict against us out of a proposal we could
+/// not read. Abandoning records no verdict at all and the probe sequence
+/// continues.
+#[test]
+fn an_unreadable_record_abandons_the_whole_proposal() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  let original = svc.name().as_str().to_owned();
+
+  let mut txt = std::vec::Vec::new();
+  make_txt_record_ref(&mut txt, PROBED_NAME, 120, &[&[]]);
+  let mut srv = std::vec::Vec::new();
+  make_srv_record_ref(&mut srv, PROBED_NAME, 120, 0, 0, 9999, "host.local.");
+
+  // A CNAME at the probed name whose rdata does not parse: the name inside it
+  // ends one byte short of RDLENGTH, which `Cname::try_from_message` rejects and
+  // `Ref::rdata_view` propagates. The record itself is well-formed enough to
+  // ITERATE past — the section stays readable, so this is not the
+  // unparseable-section case but the per-record one.
+  let mut cname: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    cname.push(label.len() as u8);
+    cname.extend_from_slice(label.as_bytes());
+  }
+  cname.push(0u8); // root
+  cname.extend_from_slice(&5u16.to_be_bytes()); // TYPE CNAME
+  cname.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  cname.extend_from_slice(&120u32.to_be_bytes()); // TTL — positive, so in scope
+  let rdata: &[u8] = &[
+    3, b's', b'v', b'c', 5, b'l', b'o', b'c', b'a', b'l', 0,    // `svc.local.`
+    0xFF, // one trailing octet inside RDLENGTH
+  ];
+  #[allow(clippy::cast_possible_truncation)]
+  cname.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+  cname.extend_from_slice(rdata);
+
+  let bytes = raw_proposal_bytes(&[txt, srv, cname]);
+  let peer: core::net::SocketAddr = "192.168.1.78:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+
+  assert!(
+    !svc.tiebreak_lost,
+    "one unreadable in-scope record abandons the proposal with NO verdict — \
+     scoring the two records we could read would adjudicate a list the peer \
+     never proposed, and here that shortened list beats ours"
+  );
+
+  let t1 = t0.advance(500);
+  svc.handle_timeout(t1).unwrap();
+  assert_eq!(svc.name().as_str(), original, "…so nothing is deferred");
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(_)),
+    "…and the §8.1 sequence carries on; got {:?}",
+    svc.state()
+  );
+}
+
+/// "Begins probing for this record again" puts the name back under verification,
+/// and a host that is verifying a name does not answer for it — so the deferral
+/// drops the response cycle exactly as the §9 revert does.
+///
+/// `pending_legacy` is the one that bites: `poll_transmit` drains queued §6.7
+/// unicast replies AHEAD of every state check, so a reply queued while
+/// announcing would otherwise leave the host during the deferral carrying the
+/// full positive-TTL record set — a claim to a name this service has just been
+/// told it may not have, sent while it is asking whether it may.
+#[test]
+fn the_tiebreak_deferral_stops_answering_for_the_name_it_re_verifies() {
+  use crate::{event::ServiceQuestion, wire::QuestionRef};
+
+  let mut svc = make_service(120);
+  // `Announcing(0)` with nothing latched and no datagram in flight is the last
+  // phase that is still pre-authoritative, so it is the one phase where a
+  // response cycle and a §8.2 verdict can both be live at once.
+  let now = drive_to_announcing_zero(&mut svc);
+
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in "myprinter._ipp._tcp.local."
+    .trim_end_matches('.')
+    .split('.')
+  {
+    qbuf.push(label.len() as u8);
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8);
+  qbuf.extend_from_slice(&255u16.to_be_bytes()); // QTYPE ANY
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  let legacy_src: core::net::SocketAddr = "192.168.1.50:40000".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x99)),
+    now,
+  );
+  assert!(
+    !svc.pending_legacy.is_empty(),
+    "precondition: a legacy querier queues a unicast reply"
+  );
+
+  // Peer proposes SRV(port=9999) — greater than our 631 — so we lose.
+  let bytes = srv_txt_proposal(9999);
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    now,
+  );
+  assert!(svc.tiebreak_lost, "precondition: the peer's proposal wins");
+
+  let deferred_at = now.advance(500);
+  svc.handle_timeout(deferred_at).unwrap();
+  assert_eq!(svc.state(), ServiceState::Init);
+
+  assert!(
+    svc.pending_legacy.is_empty(),
+    "the deferral must drop the queued legacy reply — the name is back under \
+     §8.1 verification and answering for it is the claim the deferral exists to \
+     withhold"
+  );
+  assert!(
+    svc
+      .poll_transmit(deferred_at, &mut std::vec![0u8; 4096])
+      .unwrap()
+      .is_none(),
+    "…so nothing at all leaves the host during the one-second wait"
+  );
+}
+
+/// A probe parked across the deferral belongs to the sequence the deferral
+/// REPLACED, so its confirm may not re-open §8.1's window on the restarted one.
+///
+/// The deferral shuts that window deliberately (`probe_on_wire = false`): the
+/// restarted sequence has sent nothing, and §8.1 requires a conflicting response
+/// arriving "before the first probe packet is sent" to be silently ignored. A
+/// confirm that re-opened it would arm the §8.1 rename against the stale echo
+/// §8.2's deferral exists to survive — the loss would be handed straight back as
+/// a rename, one event later.
+#[test]
+fn a_probe_parked_across_the_tiebreak_deferral_leaves_the_window_shut() {
+  let mut svc = make_non_compliant_service(120);
+  let now = drive_to_probing_zero(&mut svc);
+
+  // One probe of THIS sequence reaches the wire and is confirmed, which is the
+  // only thing that opens §8.1's window.
+  let first = emit_probe(&mut svc, now);
+  svc.note_delivery(first, TransmitDelivery::ALL);
+  assert!(svc.probe_on_wire, "precondition: the window is open");
+
+  // A SECOND probe is encoded and PARKED.
+  let at = emit_probe(&mut svc, first);
+
+  let bytes = srv_txt_proposal(9999);
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    at,
+  );
+  assert!(svc.tiebreak_lost, "precondition: the peer's proposal wins");
+  let kept_name = svc.name().as_str().to_owned();
+
+  let deferred_at = at.advance(300);
+  svc.handle_timeout(deferred_at).unwrap();
+  assert!(
+    !svc.probe_on_wire,
+    "the deferral restarts the §8.1 sequence, so its window is shut"
+  );
+
+  // The parked datagram is delivered after the deferral has already replaced the
+  // sequence it was a step of.
+  svc.note_delivery(deferred_at, TransmitDelivery::ALL);
+  assert!(
+    !svc.probe_on_wire,
+    "…and a probe of the sequence the deferral replaced does not re-open it: \
+     nothing of the RESTARTED sequence has reached a link"
+  );
+  assert_tiebreak_deferred(
+    &mut svc,
+    &kept_name,
+    deferred_at,
+    "a probe parked across the deferral",
+  );
+}
+
+/// Two responders proposing BYTE-IDENTICAL record sets is RFC 6762 §8.2.1's
+/// "two devices are advertising identical sets of records, as is sometimes done
+/// for fault tolerance, and there is, in fact, no conflict" — so neither side
+/// renames, and the probe sequence they are both running carries on.
+///
+/// The whole-`Service` counterpart to `tiebreak_always_includes_empty_txt`'s
+/// Case A: that one pins the comparator, this one pins that a tie moves no
+/// lifecycle state, queues no `ServiceUpdate`, and keeps the name.
+#[test]
+fn tiebreak_tie_keeps_the_name_and_the_probe_sequence() {
+  let mut svc = make_service(120); // SRV: priority 0, weight 0, port 631, host.local.
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  let original_name = svc.name().as_str().to_owned();
+
+  // The peer proposes exactly what `make_records` proposes. Enumerated
+  // literally, not read back from our own `ServiceRecords`: priority 0, weight
+  // 0, port 631, target `host.local.`, and the empty TXT `write_probe` always
+  // emits.
+  let peer: core::net::SocketAddr = "192.168.1.42:5353".parse().unwrap();
+  let bytes = proposal_bytes(
+    "myprinter._ipp._tcp.local.",
+    &[
+      Rec::Txt(&[]),
+      Rec::Srv {
+        port: 631,
+        target: "host.local.",
+      },
+    ],
+  );
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "precondition: the peer's proposal was compared and found identical, so it \
+     recorded no loss"
+  );
+
+  svc.handle_timeout(t0.advance(500)).unwrap();
+
+  assert_eq!(
+    svc.name().as_str(),
+    original_name,
+    "§8.2.1: identical record sets are \"no conflict\", so the name must not \
+     change — a fault-tolerant pair must not rename each other away"
+  );
+  assert!(
+    svc.poll().is_none(),
+    "a tie queues no ServiceUpdate at all: not Renamed, not Conflict"
+  );
+  assert!(
+    matches!(svc.state(), ServiceState::Probing(_) | ServiceState::Init),
+    "the §8.1 sequence continues through a tie; got {:?}",
+    svc.state()
+  );
+  assert_eq!(
+    svc.rename_attempt, 0,
+    "a tie is not a loss, so it spends no rename attempt"
+  );
+}
+
+/// RFC 6762 §8.1: "Apparently conflicting Multicast DNS RESPONSES received
+/// *before* the first probe packet is sent MUST be silently ignored (see
+/// discussion of stale probe packets in Section 8.2)."
+///
+/// The failure this pins was observed cross-process: the losing responder had
+/// `packets_tx 0`, `probes_tx 0`, `packets_dropped 0` and still renamed itself
+/// 0.32 s after registering — faster than §8.1's three probes 250 ms apart can
+/// possibly complete. §8.2 gives the reason the rule exists: what arrives that
+/// early may be a stale probe "sent moments ago by this host itself, before some
+/// configuration change, which may be echoed back after a short delay by some
+/// Ethernet switches".
+///
+/// The fence is on RESPONSES and on nothing else, which the second half asserts.
+/// §8.2's tiebreak input is a peer's QUERY — "When a host that is probing for a
+/// record sees another host issue a query for the same record, it consults the
+/// Authority Section of that query" — and it states no such precondition, so a
+/// simultaneous prober's proposal arriving in the same window is compared, not
+/// discarded. Fencing both would blind the tiebreak for the whole of this
+/// responder's own 0–250 ms initial delay.
+#[test]
+fn probe_conflict_before_our_first_probe_is_ignored() {
+  let mut svc = make_service(120); // our SRV: port 631
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing(0): nothing on the wire yet
+  let original_name = svc.name().as_str().to_owned();
+
+  // A peer whose list would beat ours outright (port 9999 > our 631), so
+  // nothing but the §8.1 window can be what keeps the name.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut buf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    t0,
+  );
+
+  assert!(
+    !svc.tiebreak_lost,
+    "a conflicting RESPONSE received before our first probe must not be \
+     compared, so it can record no §8.2 loss"
+  );
+
+  let t1 = t0.advance(500);
+  svc.handle_timeout(t1).unwrap();
+  assert_eq!(
+    svc.name().as_str(),
+    original_name,
+    "a service that has transmitted nothing must not rename itself"
+  );
+  assert!(
+    svc.poll().is_none(),
+    "and it must queue no ServiceUpdate either"
+  );
+
+  // Same window, same rdata, different EVENT: a simultaneous prober's whole
+  // Authority Section is §8.2's input and is compared regardless. That the two
+  // halves differ only in which event carries them is now a property of the
+  // type — §8.1's rule is about RESPONSES, and a response is what
+  // `ProbeConflict` is.
+  let proposal = proposal_bytes(
+    "myprinter._ipp._tcp.local.",
+    &[Rec::Srv {
+      port: 9999,
+      target: "host.local.",
+    }],
+  );
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&proposal, peer, dg(1))),
+    t1,
+  );
+  assert!(
+    svc.tiebreak_lost,
+    "§8.1's pre-probe rule is about RESPONSES; a peer's tentative probe is what \
+     §8.2 requires comparing, and it must reach the comparator and be scored — \
+     not merely be acknowledged"
+  );
+  // Undo the verdict so the response half below is measured on a clean round.
+  svc.tiebreak_lost = false;
+
+  // The response rule is about the WINDOW, not about the record: once a probe
+  // has reached the wire, the very same response IS acted on.
+  //
+  // INVERTED, from `tiebreak_pending` to `probe_defeated`. This used to assert
+  // that a response inside the window is buffered for the §8.2 comparator, and
+  // §8.1 leaves no room for a comparison: "if any conflicting Multicast DNS
+  // response is received, then the probing host MUST defer to the existing
+  // host, and SHOULD choose new names for some or all of its resource records
+  // as appropriate." The admitted input that replaces it is the one below —
+  // response inside the window ⇒ §8.1 deferral, not a tiebreak entry. What the
+  // old assertion existed to pin, that the earlier no-rename was the WINDOW and
+  // not a broken comparator, is unchanged and still asserted: the same bytes
+  // that did nothing before the probe now cost the service its name.
+  // `tiebreak_records_that_flatten_alike_are_not_a_tie` and
+  // `tiebreak_two_peers_one_wins_we_lose` keep the buffering path covered, from
+  // the tentative probes that are actually its input.
+  let t2 = probe_once(&mut svc, t1);
+  let (rec_again, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec_again, dg(1))),
+    t2,
+  );
+  assert!(
+    svc.probe_defeated,
+    "after our first probe reached the wire the same response IS acted on — as \
+     a §8.1 deferral to a host that already owns the name"
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "…and never as a §8.2 tiebreak entry: that rule is for two hosts probing at \
+     once, and this peer is not probing"
+  );
+  svc.handle_timeout(t2.advance(500)).unwrap();
   assert_ne!(
     svc.name().as_str(),
     original_name,
-    "name must change after tiebreak loss"
+    "…so the service defers and renames, and the earlier no-rename was the \
+     §8.1 window and not a broken comparator"
+  );
+}
+
+/// RFC 6762 §8.1: "During probing, from the time the first probe packet is sent
+/// until 250 ms after the third probe, if any conflicting Multicast DNS response
+/// is received, then the probing host MUST defer to the existing host, and
+/// SHOULD choose new names for some or all of its resource records as
+/// appropriate."
+///
+/// The peer's SRV here sorts EARLIER than ours (port 80 against our 631), so the
+/// §8.2 comparator would say we win and keep probing. That is the case the
+/// later-sorting fixture in `probe_conflict_before_our_first_probe_is_ignored`
+/// cannot see: there, deferral and the comparator happen to agree, so a
+/// comparator applied to a response looks correct.
+///
+/// It is not correct. §8.2's lexicographic rule resolves two hosts probing
+/// SIMULTANEOUSLY, where neither owns the name — "if two hosts are probing for
+/// the same name simultaneously, neither will receive any response to the
+/// probe". A response means someone already answered for it. Comparing there
+/// would let any newcomer whose records happen to sort later keep probing toward
+/// a name an existing responder holds, and then announce over it.
+#[test]
+fn a_response_beats_our_probe_even_when_our_records_sort_later() {
+  let mut svc = make_service(120); // our SRV: port 631 (0x0277)
+  let t0 = probe_once(&mut svc, FakeInstant::zero()); // §8.1 window open
+  let original_name = svc.name().as_str().to_owned();
+
+  // The peer's list has the SAME SHAPE as ours — an empty TXT and one SRV — so
+  // the comparison turns on the port and nothing else: 80 (0x0050) is earlier
+  // than our 631 (0x0277) at the first differing rdata byte, making the peer's
+  // list lexicographically EARLIER and handing us the §8.2 win. (A peer sending
+  // only an SRV would lose on shape instead, its `00 21` sorting after our TXT's
+  // `00 10`, which is what `tiebreak_always_includes_empty_txt` Case B pins.)
+  let peer: core::net::SocketAddr = "192.168.1.60:5353".parse().unwrap();
+  let mut buf_srv: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut buf_srv,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    80,
+    "host.local.",
+  );
+  let (srv_ref, _) = Ref::try_parse(&buf_srv, 0).unwrap();
+  let mut buf_txt: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_txt_record_ref(&mut buf_txt, "myprinter._ipp._tcp.local.", 120, &[]);
+  let (txt_ref, _) = Ref::try_parse(&buf_txt, 0).unwrap();
+
+  // The §8.2 verdict on this very list, so the test states what it is overriding
+  // rather than assuming it. Driven through a SEPARATE service and a real
+  // `ProbeProposal`, because §8.2's answer is no longer readable as a value: a
+  // proposal is folded on arrival and the only thing it leaves behind is whether
+  // the next `handle_timeout` renames.
+  {
+    let mut as_if_probing = make_service(120); // same records as `svc`
+    let p0 = FakeInstant::zero();
+    as_if_probing.handle_timeout(p0).unwrap(); // Init → Probing
+    let before = as_if_probing.name().as_str().to_owned();
+    let bytes = srv_txt_proposal(80); // the peer's TXT(empty) + SRV(80)
+    as_if_probing.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+      p0,
+    );
+    as_if_probing.handle_timeout(p0.advance(500)).unwrap();
+    assert_eq!(
+      as_if_probing.name().as_str(),
+      before,
+      "precondition: had this been a simultaneous PROBE, §8.2 would say we win \
+       — which is exactly why routing a RESPONSE through it is unsound"
+    );
+  }
+
+  for rref in [txt_ref, srv_ref] {
+    svc.handle_event(
+      ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rref, dg(1))),
+      t0,
+    );
+  }
+  assert!(
+    svc.probe_defeated,
+    "a conflicting response inside the probing window is a §8.1 deferral, \
+     whatever our records sort like"
+  );
+
+  svc.handle_timeout(t0.advance(500)).unwrap();
+  assert_ne!(
+    svc.name().as_str(),
+    original_name,
+    "§8.1: the probing host MUST defer to the existing host and SHOULD choose a \
+     new name — keeping this one would announce over a responder that already \
+     holds it"
   );
   assert_eq!(
     svc.state(),
     ServiceState::Init,
-    "state must reset to Init after tiebreak rename"
+    "and it re-probes the new name from scratch"
   );
-  assert!(!svc.tiebreak_pending, "tiebreak_pending must be cleared");
-  assert_eq!(svc.peer_probes.len(), 0, "buffer must be cleared");
+}
 
-  // A Renamed update must be queued.
+/// A peer PROBING our host name must not retire the service.
+///
+/// `ServiceUpdate::HostConflict` is terminal — every driver withdraws and retires
+/// on it — and RFC 6762 §9 defines a conflict over a RESPONSE. A probe is a peer
+/// asking whether a name is free, so honouring one here would let a single
+/// ordinary probe retire every service sharing that host name: the same denial
+/// of service the instance path closes, reached through the host route.
+#[test]
+fn a_peer_probing_our_host_name_does_not_retire_us() {
+  let mut svc = make_service(120); // host.local. -> 192.168.1.10
+  let now = drive_to_established(&mut svc);
+  while svc.poll().is_some() {}
+
+  // A DIFFERENT address for our host name: a genuine §9 conflict had it come in
+  // a response, so only the origin can be what keeps this service alive.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 99]);
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::HostConflict(crate::event::HostConflict::new(
+      rec,
+      ConflictOrigin::TentativeProbe,
+    )),
+    now,
+  );
+  assert!(
+    svc.poll().is_none(),
+    "a peer's tentative probe for our host name is not §9's conflict, so it must \
+     queue no terminal HostConflict"
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "and the service keeps serving"
+  );
+
+  // The same record in a RESPONSE is the §9 conflict, so the difference is the
+  // origin and not the address.
+  let (rec_resp, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::HostConflict(crate::event::HostConflict::new(
+      rec_resp,
+      ConflictOrigin::AuthoritativeResponse,
+    )),
+    now,
+  );
+  assert!(
+    svc.poll().is_some_and(|u| u.is_host_conflict()),
+    "the identical record in a response DOES surface HostConflict"
+  );
+}
+
+/// `ServiceUpdate::Renamed` is emitted at the rename DECISION, and that decision
+/// puts the service back in `Init` to probe the new label from scratch. It never
+/// means "advertised": at the moment it is queued the new name has not been
+/// probed once, let alone announced.
+///
+/// Pins the claim `hick-mio/tests/loopback.rs`'s `advertise` helper rests on —
+/// that helper waits for `Established` and treats `Renamed` as "keep waiting".
+#[test]
+fn renamed_update_means_probing_restarted_not_advertised() {
+  let mut svc = make_service(120);
+  // The stimulus is a conflicting RESPONSE, because that is what renames: §8.1
+  // requires one to arrive after a probe of ours has been sent, and a §8.2
+  // tiebreak loss now defers and keeps the name instead.
+  let t0 = probe_once(&mut svc, FakeInstant::zero());
+  deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
+  svc.handle_timeout(t0.advance(500)).unwrap();
+
   let update = svc
     .poll()
-    .expect("ServiceUpdate::Renamed must be queued after tiebreak loss");
+    .expect("a §8.1 deferral to an existing owner queues exactly one update");
   assert!(
     update.is_renamed(),
-    "update must be Renamed, got {:?}",
-    update
+    "the §8.1 deferral reports Renamed, got {update:?}"
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "Renamed is queued with the service back in Init — a fresh §8.1 sequence, \
+     not a finished one"
+  );
+  assert_eq!(
+    svc.probe_count, 0,
+    "the new name has not been probed even once when Renamed is reported"
+  );
+  assert!(
+    !svc.has_fully_announced().get(),
+    "and it has announced nothing, so Renamed cannot mean advertised"
+  );
+  assert!(
+    !svc.advertises_instance(),
+    "no instance record of the new name is in any peer cache yet"
+  );
+
+  // Being advertised is a LATER and DIFFERENT update. Drive the new name's own
+  // probe → announce sequence and confirm that is what reports it.
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = t0.advance(500);
+  let mut established = false;
+  for _ in 0..20 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_delivery(now, TransmitDelivery::ALL);
+    }
+    while let Some(u) = svc.poll() {
+      established |= matches!(u, ServiceUpdate::Established);
+    }
+    if established {
+      break;
+    }
+  }
+  assert!(
+    established,
+    "the renamed service reports being advertised with Established, which is \
+     the update `advertise` must wait for; state={:?}",
+    svc.state()
+  );
+}
+
+/// RFC 6762 §9 defines a conflict over a RESPONSE — "it receives a Multicast
+/// DNS response message containing a record with the same name, rrtype and
+/// rrclass, but inconsistent rdata" — so a peer merely PROBING a name this
+/// service already owns must not push it back into probing.
+///
+/// The right answer to that probe is to defend the name (§8.1: "it SHOULD
+/// generate its response to defend that name immediately"), which the `Question`
+/// arm does from the question the same probe carries. Reverting instead would
+/// hand any host a way to stop an established service serving its name just by
+/// probing for it — and then to take the name outright on the §8.2 tiebreak the
+/// re-probe runs.
+#[test]
+fn a_peer_probing_our_established_name_does_not_revert_us() {
+  let mut svc = make_service(120); // our SRV: port 631
+  let now = drive_to_established(&mut svc);
+  while svc.poll().is_some() {} // drain Established
+
+  // Rdata that WOULD be a §9 conflict had it arrived in a response, and that
+  // would also beat us on the §8.2 tiebreak — so only which event carries it can
+  // be what keeps this service established.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut buf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  let proposal = proposal_bytes(
+    "myprinter._ipp._tcp.local.",
+    &[Rec::Srv {
+      port: 9999,
+      target: "host.local.",
+    }],
+  );
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&proposal, peer, dg(1))),
+    now,
+  );
+
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "§9 needs a RESPONSE; a peer's tentative probe for a name we own is \
+     answered, not deferred to"
+  );
+  assert!(
+    svc.poll().is_none(),
+    "and it queues no update — nothing about this service changed"
+  );
+
+  // The same rdata in a RESPONSE is a genuine §9 conflict, so the difference
+  // really is the event and not the record.
+  let (rec_resp, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec_resp, dg(1))),
+    now,
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "the identical record in a response DOES revert us to re-probing (§9)"
+  );
+}
+
+/// RFC 6762 §9 sends a conflicted responder through a FRESH §8 startup sequence
+/// — "reset its conflicted unique record to probing state, and go through the
+/// startup steps described above in Section 8" — so §8.1's pre-probe window
+/// re-opens with it, and a conflicting response arriving before the restarted
+/// sequence's first probe is ignored.
+///
+/// This is also what stops ONE datagram being scored as two. A driver dispatches
+/// a response's records one at a time, so a response carrying a differing TXT
+/// and then a differing SRV reverts on the TXT and offers the SRV to the
+/// probing-state arm — which, with the window still open, would buffer a peer
+/// "list" holding only the SRV and decide the tiebreak against a fragment of
+/// what the peer actually sent. Our own list would then lose on the first record
+/// (`00 21…` beats our TXT's `00 10…`) even where the peer's real list loses.
+#[test]
+fn the_section9_revert_shuts_the_pre_probe_window_again() {
+  let mut svc = make_service(120);
+  let now = drive_to_established(&mut svc);
+  while svc.poll().is_some() {}
+  let original_name = svc.name().as_str().to_owned();
+
+  // Record 1 of the peer's response: a differing TXT. This is the §9 conflict,
+  // and it reverts us to probing.
+  let mut buf_txt: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_txt_record_ref(
+    &mut buf_txt,
+    "myprinter._ipp._tcp.local.",
+    120,
+    &[b"different"],
+  );
+  let (txt_ref, _) = Ref::try_parse(&buf_txt, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, txt_ref, dg(1))),
+    now,
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "precondition: the differing TXT is a §9 conflict and reverts us"
+  );
+
+  // Record 2 of the SAME response: a differing SRV, dispatched immediately
+  // after. Alone it would beat our list; as part of the peer's real list it may
+  // not, and either way it arrives before the restarted sequence has probed.
+  let mut buf_srv: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut buf_srv,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (srv_ref, _) = Ref::try_parse(&buf_srv, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srv_ref, dg(1))),
+    now,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "the §9 revert restarted the §8.1 sequence, so this response arrived before \
+     its first probe and §8.1 requires it be ignored — no tiebreak may be \
+     decided on the fragment of a response the revert split in half"
+  );
+
+  svc.handle_timeout(now.advance(500)).unwrap();
+  assert_eq!(
+    svc.name().as_str(),
+    original_name,
+    "so the re-verification runs as §9 asks — probe the name again — instead of \
+     renaming off a one-record fragment"
   );
 }
 
@@ -2332,7 +3440,7 @@ fn established_service_reprobes_on_different_rdata_conflict() {
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   let t = FakeInstant::zero().advance(100_000);
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
     t,
   );
 
@@ -2376,7 +3484,7 @@ fn established_service_ignores_identical_rdata() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
     FakeInstant::zero().advance(100_000),
   );
   assert_eq!(
@@ -2391,34 +3499,19 @@ fn established_service_ignores_identical_rdata() {
 #[test]
 fn conflict_rename_resets_announce_emitted() {
   let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
+  // A probe on the wire, then a conflicting RESPONSE — §8.1's rename. A §8.2
+  // tiebreak loss now defers and keeps the name, so it renames nothing.
+  let t0 = probe_once(&mut svc, FakeInstant::zero());
   // Simulate that the original name was announced (peers cached it).
   svc.goodbye.mark_instance();
 
-  // A winning peer conflict (port 9999 > 631) → tiebreak loss → rename.
-  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  svc
-    .handle_timeout(FakeInstant::zero().advance(500))
-    .unwrap();
+  // An existing owner's differing SRV (port 9999 > 631) → §8.1 deferral → rename.
+  deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
+  svc.handle_timeout(t0.advance(500)).unwrap();
 
   assert!(
     svc.name().as_str().contains("-1"),
-    "tiebreak loss must rename"
+    "the §8.1 deferral to an existing owner must rename"
   );
   assert!(
     !svc.goodbye.any_instance(),
@@ -2561,80 +3654,65 @@ fn question_during_announcing_does_not_shortcut_sequence() {
 
 // ── two peers, one wins → we lose ─────────────────────────────
 
-/// When two different peers send ProbeConflicts and at least one of them has
-/// a larger SRV set (port > ours), the service MUST rename. The tiebreak
+/// When two different peers send proposals and at least one of them has
+/// a larger SRV set (port > ours), the service MUST defer. The tiebreak
 /// must evaluate each peer bucket independently; a peer that loses must not
 /// protect us from a peer that wins.
 ///
 /// Our SRV: port=631. Peer A: port=80 (loses). Peer B: port=9999 (wins).
-/// Because Peer B wins, we must rename.
+/// Because Peer B wins, we must defer to it.
 #[test]
 fn tiebreak_two_peers_one_wins_we_lose() {
   let mut svc = make_service(120); // our SRV: port=631
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
 
-  // Peer A (src=.10) sends SRV with port=80 → Peer A loses (our 631 > 80).
+  // Peer A (src=.10) proposes TXT(empty) + SRV(80) → Peer A loses (our 631 > 80).
+  //
+  // The TXT matters: a proposal of SRV alone would WIN on shape, its `00 21`
+  // beating our TXT's `00 10` at the first record, whatever the port. Peer A
+  // used to send the bare SRV, so "the loser" in this fixture was in fact a
+  // winner and the rename below was never evidence that Peer B was consulted.
   let peer_a: core::net::SocketAddr = "192.168.1.10:5353".parse().unwrap();
-  let mut buf_a: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf_a,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,  // priority
-    0,  // weight
-    80, // port < our 631 → Peer A loses
-    "host.local.",
-  );
-  let (rref_a, _) = Ref::try_parse(&buf_a, 0).unwrap();
+  let bytes_a = srv_txt_proposal(80);
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer_a, rref_a)),
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes_a, peer_a, dg(1))),
     t0,
   );
+  assert!(
+    !svc.tiebreak_lost,
+    "precondition: Peer A's proposal really does lose, so any loss recorded \
+     below can only have come from Peer B"
+  );
 
-  // Peer B (src=.200) sends SRV with port=9999 → Peer B wins (9999 > 631).
+  // Peer B (src=.200) proposes TXT(empty) + SRV(9999) → Peer B wins (9999 > 631).
   let peer_b: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  let mut buf_b: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf_b,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,    // priority
-    0,    // weight
-    9999, // port > our 631 → Peer B wins
-    "host.local.",
-  );
-  let (rref_b, _) = Ref::try_parse(&buf_b, 0).unwrap();
+  let bytes_b = srv_txt_proposal(9999);
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer_b, rref_b)),
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes_b, peer_b, dg(1))),
     t0,
   );
 
-  // Two distinct peer source buckets should be created.
-  assert_eq!(svc.peer_probes.len(), 2, "should have 2 peer probe buckets");
-  assert!(svc.tiebreak_pending, "tiebreak_pending must be set");
+  assert!(
+    svc.tiebreak_lost,
+    "each proposal is scored on its own, so a peer we beat cannot shield us \
+     from one that beats us"
+  );
   let original_name = svc.name().as_str().to_owned();
 
-  // Trigger the tiebreak: Peer B wins → we rename.
+  // Trigger the tiebreak: Peer B wins → we defer to it.
   let t1 = t0.advance(500);
   svc.handle_timeout(t1).unwrap();
 
-  // We lost (because Peer B won): service must have renamed.
-  assert!(
-    svc.name().as_str().contains("-1"),
-    "service must rename when any peer wins the tiebreak; got: {}",
-    svc.name().as_str()
-  );
-  assert_ne!(svc.name().as_str(), original_name, "name must change");
-  assert_eq!(svc.state(), ServiceState::Init, "state must reset to Init");
-  assert!(!svc.tiebreak_pending, "tiebreak_pending must be cleared");
-  assert_eq!(svc.peer_probes.len(), 0, "peer buckets must be cleared");
-  let update = svc.poll().expect("ServiceUpdate::Renamed must be queued");
-  assert!(
-    update.is_renamed(),
-    "update must be Renamed, got {:?}",
-    update
-  );
+  // INVERTED, deliberately. The old claim was "a §8.2 loss renames"; the
+  // admitted outcome now is that a §8.2 loss KEEPS the name and re-probes it
+  // after one second — RFC 6762 §8.2: "it defers to the winning host by waiting
+  // one second, and then begins probing for this record again." Only a §8.1 loss
+  // to a host that already OWNS the name renames. What this fixture pins is
+  // unchanged either way: the verdict came from Peer B, because Peer A's
+  // proposal on its own recorded none (asserted above), and the deferral below
+  // can only have come from the peer that beat us.
+  assert_tiebreak_deferred(&mut svc, &original_name, t1, "one of two peers beating us");
 }
 
 // ── wire-form canonical SRV name encoding ─────────────────────
@@ -2648,7 +3726,7 @@ fn srv_wire_form_canonical() {
   // Wire-form encoding of "aa.local." should be:
   // \x02 a a \x05 l o c a l \x00
   let mut out_aa: std::vec::Vec<u8> = std::vec::Vec::new();
-  write_canonical_wire_name("aa.local.", &mut out_aa);
+  proposal::write_canonical_wire_name("aa.local.", &mut out_aa);
   assert_eq!(
     out_aa,
     std::vec![2u8, b'a', b'a', 5, b'l', b'o', b'c', b'a', b'l', 0],
@@ -2658,7 +3736,7 @@ fn srv_wire_form_canonical() {
   // Wire-form encoding of "b.local." should be:
   // \x01 b \x05 l o c a l \x00
   let mut out_b: std::vec::Vec<u8> = std::vec::Vec::new();
-  write_canonical_wire_name("b.local.", &mut out_b);
+  proposal::write_canonical_wire_name("b.local.", &mut out_b);
   assert_eq!(
     out_b,
     std::vec![1u8, b'b', 5, b'l', b'o', b'c', b'a', b'l', 0],
@@ -2820,13 +3898,14 @@ fn question_does_not_push_out_announce_deadline() {
 
 // ── SRV KAS suppression — wire-form hash matches incoming hint ─
 
-/// A KnownAnswer hint for our SRV record (stored via canonical_rdata_for_hash,
-/// which uses wire-form target encoding) MUST match the filter built by
+/// A KnownAnswer hint for our SRV record (stored via the identity form, which
+/// uses wire-form target encoding) MUST match the filter built by
 /// write_announce_filtered (which now also uses wire-form encoding).
 ///
-/// Previously the filter used dot-joined plain bytes for the SRV target
-/// while canonical_rdata_for_hash used wire-form, so the hashes never matched
-/// and SRV hints could never suppress our SRV answer.
+/// Previously the filter used dot-joined plain bytes for the SRV target while
+/// the identity form used wire-form, so the hashes never matched and SRV hints
+/// could never suppress our SRV answer. `the_kas_filter_offers_the_bytes_the_
+/// identity_decoder_yields` now pins that pairing for every filtered type.
 #[test]
 fn srv_kas_hint_suppresses_srv_in_filtered_response() {
   use crate::{
@@ -3261,7 +4340,7 @@ fn announcement_sets_cache_flush_on_unique_records() {
 
 // ── tiebreak always includes TXT (even when empty) ────────────
 
-/// compare_rr_sets_we_lose must include TXT in our local set even when
+/// The §8.2 comparison must include TXT in our local set even when
 /// txt_segments is empty, matching what write_probe emits unconditionally.
 ///
 /// Previously the TXT was omitted when empty, while write_probe still
@@ -3269,70 +4348,131 @@ fn announcement_sets_cache_flush_on_unique_records() {
 ///
 /// This test verifies two cases:
 ///
-/// Case A — Peer sends SRV + TXT(empty) with the SAME port as ours: sets are
-/// identical → tie → we lose (§8.2.1). Previously, our set would be
-/// {SRV only} while peer had {SRV + TXT}, so we would NOT lose (incorrect).
+/// Case A — Peer sends SRV + TXT(empty) with the SAME port as ours: the sets are
+/// byte-identical, which §8.2.1 calls "no conflict", so we must NOT lose. (This
+/// assertion was inverted; the in-body comment records why, and which admitted
+/// input replaces the one it used to assert.)
 ///
 /// Case B — Peer sends only SRV(same port) with NO TXT: our set (with TXT
 /// prefix) starts with rtype=0x0010(TXT) while peer's starts with 0x0021(SRV).
-/// peer_concat > our_concat → we LOSE. Previously both sets were {SRV only}
-/// → tie → we lose (also loss but for different reason).
+/// peer_concat > our_concat → we LOSE, and a §8.2 loss DEFERS. This is the case
+/// that still discriminates a local set carrying the empty TXT from one that
+/// drops it: without the TXT, both sides would be {SRV(631)} and this would be a
+/// tie — no loss and so no deferral — instead of a loss.
 #[test]
 fn tiebreak_always_includes_empty_txt() {
-  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
-  let inst = Name::try_from_str("myprinter._ipp._tcp.local.").unwrap();
-  let host = Name::try_from_str("host.local.").unwrap();
-  // Construct records with NO TXT segments.
-  let our = ServiceRecords::new(stype, inst.clone(), host.clone(), 631, 120);
+  // `make_service` proposes SRV(priority 0, weight 0, port 631, `host.local.`)
+  // and NO TXT segments, which is the local set under test: the empty TXT its
+  // proposal carries is supplied by the proposal builder, not by the records.
+  let our = make_records(120);
   assert_eq!(
     our.txt_segments().count(),
     0,
     "precondition: no TXT segments"
   );
+  drop(our);
 
   let peer_src: core::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
 
-  // ── Case A: Peer sends SRV(631) + TXT(empty) → tie → we lose ────────
+  // ── Case A: Peer sends SRV(631) + TXT(empty) → tie → no rename ──────
   {
-    let mut buf_srv: std::vec::Vec<u8> = std::vec::Vec::new();
-    make_srv_record_ref(
-      &mut buf_srv,
+    let bytes = proposal_bytes(
       "myprinter._ipp._tcp.local.",
-      120,
-      0,   // priority
-      0,   // weight
-      631, // SAME port as ours
-      "host.local.",
+      &[
+        Rec::Srv {
+          port: 631, // SAME port as ours
+          target: "host.local.",
+        },
+        Rec::Txt(&[]),
+      ],
     );
-    let (srv_ref, _) = Ref::try_parse(&buf_srv, 0).unwrap();
 
-    let mut buf_txt: std::vec::Vec<u8> = std::vec::Vec::new();
-    make_txt_record_ref(&mut buf_txt, "myprinter._ipp._tcp.local.", 120, &[]);
-    let (txt_ref, _) = Ref::try_parse(&buf_txt, 0).unwrap();
+    // The peer's proposal under `RdataForm::AS_SENT` — the form the service
+    // actually runs over an inbound Authority Section — so the enumerated
+    // precondition below is about the bytes actually compared.
+    //
+    // THERE ARE TWO FORMS AND PICKING THE WRONG ONE FAILS SILENTLY. `FOLDED`
+    // answers "are these the same record" and normalises (lowercased SRV target,
+    // empty TXT rewritten to one zero-length string); `AS_SENT` answers §8.2's
+    // "which sorts later" over the bytes the peer sent. They agree on this
+    // fixture's all-lowercase `host.local.` — this site used the identity one and
+    // passed — and diverge the moment a fixture uses a mixed-case target, at
+    // which point the expectations below would be asserting bytes the comparison
+    // never sees.
+    let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+    let peer_canonical = reader
+      .authority()
+      .flatten()
+      .map(|r| {
+        let mut canonical = std::vec::Vec::new();
+        proposal::tiebreak_bytes_for_fixture(&r, &mut canonical).unwrap();
+        (r.rtype(), canonical)
+      })
+      .collect::<std::vec::Vec<_>>();
 
-    let mut peer_probes_a = std::vec![PeerProbe {
-      src: peer_src,
-      records: std::vec![],
-    }];
-    // Canonicalize and insert both records.
-    for rref in &[srv_ref, txt_ref] {
-      let view = rref.rdata_view().unwrap();
-      let mut scratch = std::vec::Vec::new();
-      let canonical = respond::canonical_rdata_for_hash(&view, &mut scratch)
-        .unwrap()
-        .to_vec();
-      peer_probes_a[0].records.push(PeerRecord {
-        rtype: rref.rtype(),
-        canonical: canonical.into(),
-      });
-    }
+    // The tie is established from ENUMERATED LITERALS, never by asking the
+    // comparator whether it thinks these are equal. Canonical rdata, byte for
+    // byte, for the two records both sides propose:
+    //   SRV  = priority 0, weight 0, port 631 (0x0277), target `host.local.`
+    //          in uncompressed wire form (§8.2: "the names MUST be
+    //          uncompressed before comparison").
+    //   TXT  = one zero-length string, the single 0x00 byte `push_txt_authority`
+    //          puts on the wire for an empty TXT — and therefore the byte a
+    //          §8.2 comparison of "the bytes that side sent" sees.
+    const SRV_CANONICAL: &[u8] = &[
+      0x00, 0x00, // priority
+      0x00, 0x00, // weight
+      0x02, 0x77, // port 631
+      0x04, b'h', b'o', b's', b't', // "host"
+      0x05, b'l', b'o', b'c', b'a', b'l', // "local"
+      0x00, // root
+    ];
+    const TXT_CANONICAL: &[u8] = &[0x00];
+    assert_eq!(
+      peer_canonical,
+      std::vec![
+        (crate::wire::ResourceType::Srv, SRV_CANONICAL.to_vec()),
+        (crate::wire::ResourceType::Txt, TXT_CANONICAL.to_vec()),
+      ],
+      "precondition: the peer proposes exactly the SRV(631)+TXT(empty) this \
+       service proposes, so the two sets are byte-identical by construction"
+    );
 
-    // Sets are identical (SRV(631)+TXT(empty) on both sides) → tie → we lose.
-    let we_lose = compare_rr_sets_we_lose(&our, &peer_probes_a);
-    assert!(
-      we_lose,
-      "Case A: identical SRV(631)+TXT(empty) on both sides must be a tie \
-         → we lose (§8.2.1); we_lose={we_lose}"
+    // INVERTED, deliberately. This asserted `we_lose` while the comparator used
+    // `>=`, citing a §8.2.1 sentence — "the host MUST rename itself" — that does
+    // not exist: the word "rename" appears nowhere in RFC 6762 §8. What §8.2.1
+    // actually says about this exact input is the opposite: "If both lists run
+    // out of records at the same time without any difference being found, then
+    // this indicates that two devices are advertising identical sets of records,
+    // as is sometimes done for fault tolerance, and there is, in fact, no
+    // conflict." §9 agrees — "resource records with identical rdata are never
+    // considered inconsistent, even if they originate from different hosts".
+    //
+    // The old assertion is NOT preserved as a narrower still-passing case,
+    // because no admitted input reaches it: `we_lose` on a byte-identical set is
+    // unreachable under §8.2.1 for every input, not merely for this one. What
+    // the old assertion was written to PIN — that our local set always carries a
+    // TXT entry even with no segments, matching what `write_probe` emits — is
+    // preserved by Case B below, whose assertion is unchanged and still passing,
+    // and which still discriminates the two implementations under the new rule:
+    // with TXT in our set Case B is a LOSS (peer's 0x0021 > our 0x0010); with TXT
+    // omitted both sides would be {SRV(631)} and Case B would be a tie, i.e. no
+    // loss. So Case B alone still fails if the TXT is ever dropped again.
+    let mut svc = make_service(120);
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap(); // Init → Probing
+    let original = svc.name().as_str().to_owned();
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src, dg(1))),
+      t0,
+    );
+    svc.handle_timeout(t0.advance(500)).unwrap();
+    assert_eq!(
+      svc.name().as_str(),
+      original,
+      "Case A: byte-identical SRV(631)+TXT(empty) on both sides is §8.2.1's \
+       \"there is, in fact, no conflict\", NOT a loss — two devices deliberately \
+       advertising identical records must both keep the name"
     );
   }
 
@@ -3342,41 +4482,1039 @@ fn tiebreak_always_includes_empty_txt() {
   // our_concat[0..2] = 0x00,0x10 (TXT type); peer_concat[0..2] = 0x00,0x21 (SRV type).
   // peer_concat > our_concat → we lose.
   {
-    let mut buf_srv: std::vec::Vec<u8> = std::vec::Vec::new();
-    make_srv_record_ref(
-      &mut buf_srv,
+    let bytes = proposal_bytes(
       "myprinter._ipp._tcp.local.",
-      120,
-      0,   // priority
-      0,   // weight
-      631, // SAME port as ours — no TXT from peer
-      "host.local.",
+      &[Rec::Srv {
+        port: 631, // SAME port as ours — no TXT from peer
+        target: "host.local.",
+      }],
     );
-    let (srv_ref, _) = Ref::try_parse(&buf_srv, 0).unwrap();
-
-    let mut peer_probes_b = std::vec![PeerProbe {
-      src: peer_src,
-      records: std::vec![],
-    }];
-    let view = srv_ref.rdata_view().unwrap();
-    let mut scratch = std::vec::Vec::new();
-    let canonical = respond::canonical_rdata_for_hash(&view, &mut scratch)
-      .unwrap()
-      .to_vec();
-    peer_probes_b[0].records.push(PeerRecord {
-      rtype: srv_ref.rtype(),
-      canonical: canonical.into(),
-    });
 
     // peer set {SRV(631)} starts with 0x0021; our set starts with 0x0010 (TXT)
-    // → peer_concat > our_concat → we lose.
-    let we_lose = compare_rr_sets_we_lose(&our, &peer_probes_b);
-    assert!(
-      we_lose,
+    // → the peer's first record is greater → we lose.
+    let mut svc = make_service(120);
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap(); // Init → Probing
+    let original = svc.name().as_str().to_owned();
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src, dg(1))),
+      t0,
+    );
+    let spent = t0.advance(500);
+    svc.handle_timeout(spent).unwrap();
+    // INVERTED, deliberately: the LOSS is unchanged, what a loss DOES changed.
+    // The old claim was "a §8.2 loss renames" and this asserted the name moved;
+    // the admitted outcome now is that a §8.2 loss KEEPS the name and re-probes
+    // it after one second — RFC 6762 §8.2: "it defers to the winning host by
+    // waiting one second, and then begins probing for this record again." Only a
+    // §8.1 loss to a host that already OWNS the name renames.
+    //
+    // What Case B exists to discriminate survives the inversion intact, because
+    // the deferral is asserted rather than merely "no rename": with the empty TXT
+    // in our local set the peer's 0x0021 beats our 0x0010 and we defer; with the
+    // TXT dropped both sides are {SRV(631)}, §8.2.1's tie, and NOTHING is
+    // deferred — `Init` + a one-second `lifecycle_deadline` would both be absent.
+    assert_tiebreak_deferred(
+      &mut svc,
+      &original,
+      spent,
       "Case B: peer set starting with SRV(0x0021) > our set starting with \
-         TXT(0x0010) → we lose; we_lose={we_lose}"
+       TXT(0x0010)",
     );
   }
+}
+
+// ── tiebreak compares record LISTS, never their concatenation ─
+
+/// Two genuinely different record lists can flatten to identical bytes, so
+/// RFC 6762 §8.2.1's pairwise comparison must never be reduced to a byte
+/// comparison of the concatenated lists.
+///
+/// The collision is constructible against this crate's own canonical encoding
+/// (`rtype` big-endian, then canonical rdata, per record):
+///
+/// * OURS is two records — `TXT("k=v")` and an `SRV` whose rdata is 33 bytes
+///   (2+2+2 for priority/weight/port, plus a 27-byte uncompressed target).
+///   Flattened: `00 10 | 03 "k=v" | 00 21 | <33 SRV bytes>`.
+/// * THEIRS is ONE record — `TXT("k=v", "", <those same 33 SRV bytes>)`.
+///   Flattened: `00 10 | 03 "k=v" 00 21 <33 SRV bytes>`.
+///
+/// The SRV element's `00 21` type prefix is re-read as an empty TXT segment
+/// (`00`) followed by a 33-byte one (`21`), and this crate accepts empty TXT
+/// segments, so both flatten to the same 41 bytes. Concatenated, that is a tie
+/// — "there is, in fact, no conflict" — and BOTH owners would keep the name
+/// while serving different rdata, which is the outcome §8.2 exists to prevent.
+/// Compared as lists, our first record is a proper prefix of their only record,
+/// so they win outright and we defer to them.
+#[test]
+fn tiebreak_records_that_flatten_alike_are_not_a_tie() {
+  // A 27-byte uncompressed target name: `15` + 21 × 'a', `03` + "loc", `00`.
+  const TARGET: &str = "aaaaaaaaaaaaaaaaaaaaa.loc.";
+  const PORT: u16 = 631; // 0x0277
+
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let inst = Name::try_from_str("myprinter._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str(TARGET).unwrap();
+  let mut our = ServiceRecords::new(stype, inst, host, PORT, 120);
+  our.add_txt_segment(std::vec![b'k', b'=', b'v']);
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::try_new(
+      ServiceHandle::from_raw(0),
+      our,
+      FakeInstant::zero(),
+      [0u8; 32],
+      true,
+    );
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  let original = svc.name().as_str().to_owned();
+
+  // Every byte below is enumerated, so the collision is established by
+  // construction rather than by asking the comparator whether it sees one.
+  let mut srv_rdata: std::vec::Vec<u8> = std::vec::Vec::new();
+  srv_rdata.extend_from_slice(&[0x00, 0x00]); // priority 0
+  srv_rdata.extend_from_slice(&[0x00, 0x00]); // weight 0
+  srv_rdata.extend_from_slice(&[0x02, 0x77]); // port 631
+  srv_rdata.push(21);
+  srv_rdata.extend_from_slice(&[b'a'; 21]);
+  srv_rdata.push(3);
+  srv_rdata.extend_from_slice(b"loc");
+  srv_rdata.push(0);
+  assert_eq!(
+    srv_rdata.len(),
+    33,
+    "precondition: the SRV rdata must be exactly 33 bytes, so that the `21` of \
+     its `00 21` type prefix is re-read as a segment length that consumes all \
+     of it"
+  );
+
+  // OUR list, sorted: TXT (type 0x0010) then SRV (type 0x0021).
+  let mut our_flat: std::vec::Vec<u8> = std::vec![0x00, 0x10, 0x03, b'k', b'=', b'v'];
+  our_flat.extend_from_slice(&[0x00, 0x21]);
+  our_flat.extend_from_slice(&srv_rdata);
+
+  // THEIR single TXT: segments "k=v", "" and the 33 SRV bytes.
+  let mut their_txt_rdata: std::vec::Vec<u8> = std::vec![0x03, b'k', b'=', b'v', 0x00, 0x21];
+  their_txt_rdata.extend_from_slice(&srv_rdata);
+  let mut their_flat: std::vec::Vec<u8> = std::vec![0x00, 0x10];
+  their_flat.extend_from_slice(&their_txt_rdata);
+
+  assert_eq!(
+    our_flat, their_flat,
+    "precondition: the two lists flatten to identical bytes — this is the \
+     collision, and it is what a concatenating comparator cannot see"
+  );
+
+  // The peer's proposal: ONE TXT carrying the colliding segments, run through
+  // the same canonicalization the service applies to a real inbound record.
+  let peer_src: core::net::SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let bytes = proposal_bytes(
+    "myprinter._ipp._tcp.local.",
+    &[Rec::Txt(&[b"k=v", b"", &srv_rdata[..]])],
+  );
+  let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+  let peer_rec = reader.authority().flatten().next().unwrap();
+  assert_eq!(
+    peer_rec.rtype(),
+    crate::wire::ResourceType::Txt,
+    "precondition: the peer's proposal is the single TXT, not a pair"
+  );
+  // `RdataForm::AS_SENT`, the form the §8.2 comparison actually runs over an
+  // inbound record — not `FOLDED`, which normalises.
+  //
+  // THERE ARE TWO FORMS AND PICKING THE WRONG ONE FAILS SILENTLY. They agree on
+  // every non-empty TXT, which is what this collision payload is — this site used
+  // the identity one and passed — so the wrong choice would only surface once a
+  // fixture proposed an empty TXT or a mixed-case name, and then it would be
+  // asserting bytes §8.2 never compares.
+  let mut canonical = std::vec::Vec::new();
+  proposal::tiebreak_bytes_for_fixture(&peer_rec, &mut canonical).unwrap();
+  assert_eq!(
+    canonical, their_txt_rdata,
+    "precondition: the peer's compared TXT rdata is the enumerated collision \
+     payload, so the comparison under test really is the colliding one"
+  );
+
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src, dg(1))),
+    t0,
+  );
+  let spent = t0.advance(500);
+  svc.handle_timeout(spent).unwrap();
+
+  // INVERTED, deliberately. The old claim was "a §8.2 loss renames" and this
+  // asserted the name moved; the admitted outcome now is that a §8.2 loss KEEPS
+  // the name and re-probes it after one second — RFC 6762 §8.2: "it defers to
+  // the winning host by waiting one second, and then begins probing for this
+  // record again." Only a §8.1 loss to a host that already OWNS the name
+  // renames.
+  //
+  // The collision this fixture is about is untouched by that: a concatenating
+  // comparator sees a TIE here, and a tie moves NOTHING — no `Init`, no
+  // one-second deadline — so asserting the deferral still separates the two
+  // implementations exactly as asserting the rename used to.
+  assert_tiebreak_deferred(
+    &mut svc,
+    &original,
+    spent,
+    "§8.2.1 compares the lists pairwise: our first record is a proper prefix of \
+     the peer's only record, so the peer is lexicographically later and we \
+     lose. Reading the flattened bytes instead makes this a tie, and leaves two \
+     owners on one name with different rdata",
+  );
+}
+
+/// A peer's probe delivered TWICE before one `handle_timeout` is one proposal
+/// seen twice, not a longer proposal.
+///
+/// RFC 6762 §8.2 takes "the Authority Section of THAT query", and requires it to
+/// "contain *all* the records and proposed rdata being probed for uniqueness" —
+/// so a proposal is per-datagram. Accumulating both copies into one
+/// source-addressed bucket produces `[TXT, TXT, SRV, SRV]`, whose SECOND element
+/// is the duplicated TXT (`00 10 …`) where ours is the SRV (`00 21 …`); ours
+/// then compares later and a responder that should have LOST concludes it won.
+///
+/// Reachable without a hostile peer: plain UDP duplication, a `handle_timeout`
+/// delayed past two of the peer's own §8.1 retransmissions (which are 250 ms
+/// apart, the same cadence as our own probe deadlines), or two co-resident
+/// responders sharing one `IP:5353`.
+#[test]
+fn a_retransmitted_probe_is_not_a_longer_proposal() {
+  let peer: core::net::SocketAddr = "192.168.1.90:5353".parse().unwrap();
+
+  // One losing-for-us proposal: SRV(9999) beats our SRV(631), same empty TXT.
+  let bytes = srv_txt_proposal(9999);
+
+  // INVERTED, deliberately, in both blocks below. The old claim was "a §8.2 loss
+  // renames" and each block asserted the name moved; the admitted outcome now is
+  // that a §8.2 loss KEEPS the name and re-probes it after one second — RFC 6762
+  // §8.2: "it defers to the winning host by waiting one second, and then begins
+  // probing for this record again." Only a §8.1 loss to a host that already OWNS
+  // the name renames, and a retransmitted PROBE is by definition not that.
+  //
+  // The subject is unchanged: whether two copies of one proposal can be read as
+  // one longer list. Asserting the DEFERRAL rather than merely "no rename" is
+  // what keeps that legible — the merged `[TXT, TXT, SRV, SRV]` reading is a WIN
+  // for us, which defers nothing at all.
+
+  // Delivered ONCE: the peer wins and we defer. This is the control — without
+  // it, the duplicate case below could pass for want of any conflict at all.
+  {
+    let mut svc = make_service(120);
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap();
+    let original = svc.name().as_str().to_owned();
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+      t0,
+    );
+    let spent = t0.advance(500);
+    svc.handle_timeout(spent).unwrap();
+    assert_tiebreak_deferred(
+      &mut svc,
+      &original,
+      spent,
+      "control: one copy of this proposal beats ours",
+    );
+  }
+
+  // Delivered TWICE before the timeout — the SAME proposal, retransmitted.
+  // Each datagram is its own `ProbeProposal` and is scored the moment it
+  // arrives, so the two copies cannot accumulate into one longer list: the
+  // `[TXT, TXT, SRV, SRV]` the old buffer could build is no longer a value this
+  // code can hold.
+  {
+    let mut svc = make_service(120);
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap();
+    let original = svc.name().as_str().to_owned();
+    for datagram in [dg(1), dg(2)] {
+      svc.handle_event(
+        ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, datagram)),
+        t0,
+      );
+    }
+    assert!(
+      svc.tiebreak_lost,
+      "two datagrams are two proposals, even from one source address, and each \
+       is scored as exactly the {{TXT, SRV}} the peer actually proposed"
+    );
+    let spent = t0.advance(500);
+    svc.handle_timeout(spent).unwrap();
+    assert_tiebreak_deferred(
+      &mut svc,
+      &original,
+      spent,
+      "a retransmission cannot turn a loss into a win: merging the two copies \
+       into one bucket would sort as [TXT, TXT, SRV, SRV], whose second element \
+       is below our SRV, and we would wrongly win outright and defer nothing",
+    );
+  }
+}
+
+/// An established peer defending with BYTE-IDENTICAL records must not cost a
+/// probing responder its name — in initial probing or in a §9 re-probe.
+///
+/// This is the defect this whole PR opened on, in the one arm that still had
+/// it. RFC 6762 §9: "resource records with identical rdata are never considered
+/// inconsistent, even if they originate from different hosts. This is to permit
+/// use of proxies and other fault-tolerance mechanisms that may cause more than
+/// one responder to be capable of issuing identical answers on the network."
+/// §8.2.1 says it for the probing path: identical sets are "sometimes done for
+/// fault tolerance, and there is, in fact, no conflict."
+///
+/// The endpoint routes a `ProbeConflict` for EVERY same-name SRV/TXT response,
+/// so the identical case reaches this arm and used to set `probe_defeated` from
+/// origin and `probe_on_wire` alone — never asking whether the rdata differed.
+/// Two appliances configured to advertise one service redundantly would take
+/// turns renaming each other away, which is exactly the deployment §9 names.
+///
+/// Both rows are covered because they take different paths to the same arm:
+/// initial probing (row B) and a §9 re-probe holding the previous generation's
+/// goodbye ownership (row B′).
+#[test]
+fn an_identical_defending_response_never_costs_a_probing_service_its_name() {
+  // `make_service` proposes SRV(priority 0, weight 0, port 631, host.local.)
+  // and an empty TXT — so these are byte-identical to ours.
+  let identical = |buf: &mut std::vec::Vec<u8>, srv: bool| {
+    if srv {
+      make_srv_record_ref(
+        buf,
+        "myprinter._ipp._tcp.local.",
+        120,
+        0,
+        0,
+        631,
+        "host.local.",
+      );
+    } else {
+      make_txt_record_ref(buf, "myprinter._ipp._tcp.local.", 120, &[]);
+    }
+  };
+  let peer: core::net::SocketAddr = "192.168.1.31:5353".parse().unwrap();
+
+  // ── Row B: initial probing, first probe already on the wire ──────────────
+  {
+    let mut svc = make_service(120);
+    let t0 = probe_once(&mut svc, FakeInstant::zero());
+    let original = svc.name().as_str().to_owned();
+    for srv in [false, true] {
+      let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+      identical(&mut buf, srv);
+      let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+      svc.handle_event(
+        ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+        t0,
+      );
+    }
+    assert!(
+      !svc.probe_defeated,
+      "row B: a defending response carrying OUR OWN rdata is not a conflict, so \
+       it must not latch a §8.1 deferral"
+    );
+    svc.handle_timeout(t0.advance(500)).unwrap();
+    assert_eq!(
+      svc.name().as_str(),
+      original,
+      "row B: two responders advertising identical records is the fault-tolerance \
+       case §9 exists to permit — neither may rename the other away"
+    );
+  }
+
+  // ── Row B′: §9 re-probe, previous generation's goodbye still latched ─────
+  {
+    let mut svc = make_service(120);
+    let established_at = drive_to_established(&mut svc);
+    while svc.poll().is_some() {}
+    // A DIFFERING response reverts us (that part is a real §9 conflict).
+    deliver_losing_srv_conflict(
+      &mut svc,
+      established_at,
+      ConflictOrigin::AuthoritativeResponse,
+    );
+    assert_eq!(
+      svc.state(),
+      ServiceState::Init,
+      "precondition: §9 reverted us"
+    );
+    assert!(
+      svc.goodbye.any_instance(),
+      "precondition: the previous generation's ownership is still latched"
+    );
+    let now = probe_once(&mut svc, established_at);
+    let original = svc.name().as_str().to_owned();
+
+    for srv in [false, true] {
+      let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+      identical(&mut buf, srv);
+      let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+      svc.handle_event(
+        ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+        now,
+      );
+    }
+    assert!(
+      !svc.probe_defeated,
+      "row B′: the rule is a property of the RECORDS, so a re-probe screens \
+       identical rdata exactly as initial probing does"
+    );
+    svc.handle_timeout(now.advance(500)).unwrap();
+    assert_eq!(
+      svc.name().as_str(),
+      original,
+      "row B′: and the re-probe keeps the name it is re-verifying"
+    );
+  }
+}
+
+/// A §9 re-probe classifies conflicts the same way whichever order the driver
+/// ran its loop — even though the PREVIOUS generation's goodbye ownership is
+/// still latched.
+///
+/// §9 keeps that ownership on purpose: peers hold the old records under this
+/// same name and a §10.1 withdrawal must still retract them. But §9 also sends
+/// the responder "through the startup steps described above in Section 8", so
+/// the conflict rules are §8's again. Keying on `goodbye.any_instance()` made
+/// `is_preauthoritative()` true in `Probing(3)` and false the instant a
+/// timer-first driver stepped to `Announcing(0)` — so an RX-first driver
+/// compared a winning proposal and renamed, and a timer-first driver routed the
+/// identical proposal through the post-authoritative arm and ignored it. Both
+/// contenders could then announce.
+///
+/// The never-advertised two-order test cannot see this: it starts from a
+/// generation with no goodbye ownership at all, so the two latches agree there.
+#[test]
+fn a_section9_reprobe_classifies_the_same_in_both_driver_orders() {
+  for rx_first in [true, false] {
+    let mut svc = make_service(120);
+    let established_at = drive_to_established(&mut svc);
+    while svc.poll().is_some() {}
+    assert!(
+      svc.goodbye.any_instance(),
+      "precondition: the FIRST generation advertised, so goodbye owns its records"
+    );
+
+    // §9: a conflicting response reverts us into a fresh §8 startup sequence.
+    deliver_losing_srv_conflict(
+      &mut svc,
+      established_at,
+      ConflictOrigin::AuthoritativeResponse,
+    );
+    assert_eq!(
+      svc.state(),
+      ServiceState::Init,
+      "precondition: §9 reverted us"
+    );
+    assert!(
+      svc.goodbye.any_instance(),
+      "precondition: and it KEPT the old generation's ownership — that latch is \
+       what used to leak into the conflict rules"
+    );
+
+    // Re-probe to the settling window.
+    let mut now = established_at;
+    for _ in 0..12 {
+      now = svc.poll_timeout().unwrap_or(now.advance(250));
+      svc.handle_timeout(now).unwrap();
+      let mut buf = std::vec![0u8; 4096];
+      while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+        svc.note_delivery(now, TransmitDelivery::ALL);
+      }
+      if matches!(svc.state(), ServiceState::Probing(3)) {
+        break;
+      }
+    }
+    assert!(
+      matches!(svc.state(), ServiceState::Probing(3)),
+      "precondition: the re-probe reached §8.1's settling window; got {:?}",
+      svc.state()
+    );
+    let original = svc.name().as_str().to_owned();
+
+    let due = svc.poll_timeout().expect("the settling window re-arms");
+    let bytes = srv_txt_proposal(9999);
+    let peer: core::net::SocketAddr = "192.168.1.66:5353".parse().unwrap();
+    let deliver = |svc: &mut Service<_, _, _>| {
+      svc.handle_event(
+        ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+        due,
+      );
+    };
+    // The verdict is spent by the FIRST `handle_timeout` that sees it, which is
+    // the one at `due` when the datagram was drained first and the one 500 ms
+    // later when the deadline transition ran first. §8.2's second is measured
+    // from that instant.
+    let spent = if rx_first {
+      deliver(&mut svc);
+      svc.handle_timeout(due).unwrap();
+      due
+    } else {
+      svc.handle_timeout(due).unwrap();
+      deliver(&mut svc);
+      due.advance(500)
+    };
+
+    svc.handle_timeout(due.advance(500)).unwrap();
+    // INVERTED, deliberately. The old claim was "a §8.2 loss renames" and this
+    // asserted the name moved; the admitted outcome now is that a §8.2 loss
+    // KEEPS the name and re-probes it after one second — RFC 6762 §8.2: "it
+    // defers to the winning host by waiting one second, and then begins probing
+    // for this record again." Only a §8.1 loss to a host that already OWNS the
+    // name renames.
+    //
+    // The subject — that both driver orders classify identically — is if
+    // anything sharper for it: the deferral is a five-part observable, and both
+    // orders must produce all five.
+    assert_tiebreak_deferred(
+      &mut svc,
+      &original,
+      spent,
+      &std::format!(
+        "rx_first={rx_first}: a §9 re-probe is inside §8's startup steps, so a \
+         winning proposal is deferred to whichever order the driver ran — the \
+         old generation's goodbye ownership is a withdrawal obligation, not a \
+         claim by the generation now probing"
+      ),
+    );
+  }
+}
+
+/// A queued announcement must not overtake a classified conflict.
+///
+/// The classification and its decision are two separate calls, and state moves
+/// between them. Reachable in `hick-smoltcp`, whose `pump` caps RX at
+/// `MAX_RX_PER_PUMP`: one pass closes §8.1's settling window and fills the cap,
+/// the next queues the first announcement, drains the conflicting response that
+/// sets the latch, then transmits and confirms that announcement — and by the
+/// following timeout a decision site that re-derived its predicate would find
+/// the service advertised and silently never spend the existing owner's
+/// response.
+///
+/// Two things stop it, and this exercises both: `poll_transmit` withholds every
+/// positive-TTL claim to the name while a classification is unresolved, and the
+/// decision site spends the stored latch rather than reclassifying.
+#[test]
+fn a_queued_announcement_cannot_overtake_a_classified_conflict() {
+  let mut svc = make_service(120);
+  let mut now = drive_to_probing_zero(&mut svc);
+  for _ in 0..3 {
+    let at = emit_probe(&mut svc, now);
+    svc.note_delivery(at, TransmitDelivery::ALL);
+    now = at;
+  }
+  // Close the settling window, then queue the first announcement.
+  now = svc.poll_timeout().expect("settling re-arms");
+  svc.handle_timeout(now).unwrap();
+  now = svc.poll_timeout().expect("the announcement is due");
+  svc.handle_timeout(now).unwrap();
+  assert!(
+    svc
+      .pending_transmits
+      .contains(&Some(PendingTransmitKind::Announcement)),
+    "precondition: an announcement is queued and not yet transmitted"
+  );
+  let original = svc.name().as_str().to_owned();
+
+  // The conflicting response lands while that announcement is still queued.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut buf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.44:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    now,
+  );
+  assert!(
+    svc.probe_defeated,
+    "precondition: the response was classified as a §8.1 deferral"
+  );
+
+  // The driver now does what it was going to do: transmit and confirm.
+  let mut out = std::vec![0u8; 4096];
+  let emitted = svc.poll_transmit(now, &mut out).unwrap();
+  assert!(
+    emitted.is_none(),
+    "the queued announcement must be WITHHELD: claiming a name whose ownership \
+     is under adjudication is what turns an unresolved conflict into two owners"
+  );
+  assert!(
+    !svc.generation_advertised,
+    "…so nothing of this generation reached the wire, and the decision site \
+     cannot be told otherwise"
+  );
+
+  svc.handle_timeout(now.advance(500)).unwrap();
+  assert_ne!(
+    svc.name().as_str(),
+    original,
+    "the stored classification is spent on its own terms: an announcement that \
+     slipped out in between must not be able to answer the question differently"
+  );
+}
+
+// The per-round proposal cap and the per-proposal record cap are gone, and with
+// them `probing_conflict_caps_distinct_peer_sources`,
+// `probing_conflict_caps_records_per_source` and
+// `proposals_beyond_the_cap_force_a_loss_rather_than_a_win`. A proposal is now
+// folded into the round's verdict on arrival and never retained, so there is no
+// capacity to exhaust — and no way for exhausting capacity to be read as a
+// lexicographic verdict. The defect those three guarded is unrepresentable
+// rather than checked for.
+
+/// The §8.1/§8.2 classification must not depend on whether the driver drained
+/// RX before or after it fired timeouts.
+///
+/// The four drivers disagree and cannot be made to agree: `hick-mio` and
+/// `hick-reactor` drain RX first, `hick-smoltcp`'s `pump` calls `fire_timeouts`
+/// first, and `hick-compio` races them in an unbiased `futures::select!` whose
+/// winner is randomized per iteration. So this is `mdns-proto`'s obligation, and
+/// the test is shaped like the one this crate already uses for the same class,
+/// `duplicate_suppresses_due_retry_independent_of_driver_order`: run BOTH
+/// orders, require the same outcome.
+///
+/// The hazard is concrete. §8.1's settling window ends on a timeout that flips
+/// `Probing(3) → Announcing(0)`; a conflict that arrived inside the window but
+/// is processed after that flip would be reclassified out of §8.1 and ignored,
+/// and two contenders whose third probes are milliseconds apart would both
+/// announce.
+#[test]
+fn the_conflict_classification_is_independent_of_driver_loop_order() {
+  for rx_first in [true, false] {
+    let mut svc = make_service(120);
+    let mut now = drive_to_probing_zero(&mut svc);
+    for _ in 0..3 {
+      let at = emit_probe(&mut svc, now);
+      svc.note_delivery(at, TransmitDelivery::ALL);
+      now = at;
+    }
+    assert!(
+      matches!(svc.state(), ServiceState::Probing(3)),
+      "precondition: in §8.1's settling window; got {:?}",
+      svc.state()
+    );
+    let original = svc.name().as_str().to_owned();
+
+    // The instant the settling deadline is due — the tick a driver wakes on,
+    // carrying a datagram that arrived earlier in the window.
+    let due = svc.poll_timeout().expect("the settling window re-arms");
+    let bytes = srv_txt_proposal(9999);
+    let peer: core::net::SocketAddr = "192.168.1.55:5353".parse().unwrap();
+    let deliver = |svc: &mut Service<_, _, _>| {
+      svc.handle_event(
+        ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+        due,
+      );
+    };
+
+    // The verdict is spent by the FIRST `handle_timeout` that sees it, so §8.2's
+    // second runs from `due` in the RX-first order and from 500 ms later in the
+    // timer-first one.
+    let spent = if rx_first {
+      // hick-mio / hick-reactor shape.
+      deliver(&mut svc);
+      svc.handle_timeout(due).unwrap();
+      due
+    } else {
+      // hick-smoltcp shape: the deadline transition runs BEFORE the queued
+      // datagram is drained, so the conflict is seen in `Announcing(0)`.
+      svc.handle_timeout(due).unwrap();
+      deliver(&mut svc);
+      due.advance(500)
+    };
+
+    svc.handle_timeout(due.advance(500)).unwrap();
+    // INVERTED, deliberately. The old claim was "a §8.2 loss renames" and this
+    // asserted the name moved; the admitted outcome now is that a §8.2 loss
+    // KEEPS the name and re-probes it after one second — RFC 6762 §8.2: "it
+    // defers to the winning host by waiting one second, and then begins probing
+    // for this record again." Only a §8.1 loss to a host that already OWNS the
+    // name renames.
+    //
+    // The two-order subject is unchanged, and the assertion is strictly stronger
+    // than the rename it replaces: both orders must reach the SAME five-part
+    // deferral, not merely agree that the name moved.
+    assert_tiebreak_deferred(
+      &mut svc,
+      &original,
+      spent,
+      &std::format!(
+        "rx_first={rx_first}: the same conflict at the same instant must be \
+         resolved the same way whichever order the driver ran — the decision is \
+         keyed on what has been ANNOUNCED, which is nothing either way, not on \
+         the state the deadline happened to leave behind"
+      ),
+    );
+  }
+}
+
+/// A record repeated inside ONE Authority Section is compared exactly as sent.
+///
+/// RFC 6762 §8.2.1 says the two record sets "are sorted into order, and then
+/// compared pairwise". It does not say deduplicate. Three copies of one TXT is a
+/// THREE-record proposal, and that is what this responder compares against.
+///
+/// INVERTED, deliberately. This test used to assert the opposite — that the
+/// repeat was counted once — on the reasoning that an RRset holds distinct rdata
+/// so a repeat is malformed and cheap to reject. The dedup has been REMOVED and
+/// the old assertion is replaced rather than narrowed, because the tiebreak only
+/// resolves a name if BOTH hosts compute the same function over the same two
+/// lists. A conforming peer that repeats a record and does not itself dedup, met
+/// by a responder that silently drops the repeat, has the two sides comparing
+/// different lists — and "both hosts conclude they won" is the single outcome
+/// §8.2 exists to prevent. Interop symmetry between the two hosts outranks
+/// tidiness about a peer's malformed section.
+#[test]
+fn a_record_repeated_within_one_proposal_is_compared_as_sent() {
+  let peer: core::net::SocketAddr = "192.168.1.92:5353".parse().unwrap();
+
+  // INVERTED, deliberately, in both blocks below — as to the CONSEQUENCE only;
+  // the "compared as sent" subject is untouched. The old claim was "a §8.2 loss
+  // renames" and each block asserted the name moved. The admitted outcome now is
+  // that a §8.2 loss KEEPS the name and re-probes it after one second — RFC 6762
+  // §8.2: "it defers to the winning host by waiting one second, and then begins
+  // probing for this record again." Only a §8.1 loss to a host that already OWNS
+  // the name renames, and a peer's Authority Section is not that.
+  //
+  // Deduplicating still fails these blocks: it makes the second one a TIE, and a
+  // tie leaves the service in its probe sequence with no `Init` and no
+  // one-second deadline — which is precisely what `assert_tiebreak_deferred`
+  // requires, so "no rename" cannot be reached by dropping the verdict.
+
+  // The repeat is not filtered out on the way in: this proposal is compared,
+  // and its TXT("k=v") beats our TXT(empty) at the first record, so we lose.
+  {
+    let mut svc = make_service(120);
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap();
+    let original = svc.name().as_str().to_owned();
+    // ONE datagram: this is a repeat within a single proposal.
+    let bytes = proposal_bytes(
+      "myprinter._ipp._tcp.local.",
+      &[
+        Rec::Txt(&[b"k=v"]),
+        Rec::Txt(&[b"k=v"]),
+        Rec::Txt(&[b"k=v"]),
+      ],
+    );
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+      t0,
+    );
+    let spent = t0.advance(500);
+    svc.handle_timeout(spent).unwrap();
+    assert_tiebreak_deferred(
+      &mut svc,
+      &original,
+      spent,
+      "the repeated proposal is compared, not rejected, and it beats ours",
+    );
+  }
+
+  // …and the repeat really is COUNTED, which the block above cannot show: with
+  // three copies of one TXT the peer wins on the first record whether or not the
+  // duplicates survive. Here the peer's smallest two records are byte-identical
+  // to ours, so the verdict turns on length alone — §8.2.1's "if either list of
+  // records runs out of records before any difference is found, then the list
+  // with records remaining is deemed to have won". Deduplicated, the peer's
+  // list is our list and the answer is "no conflict"; compared as sent it is one
+  // record longer and takes the name.
+  {
+    let mut svc = make_service(120);
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap();
+    let original = svc.name().as_str().to_owned();
+    let bytes = proposal_bytes(
+      "myprinter._ipp._tcp.local.",
+      &[
+        Rec::Txt(&[]),
+        Rec::Srv {
+          port: 631,
+          target: "host.local.",
+        },
+        Rec::Srv {
+          port: 631,
+          target: "host.local.",
+        },
+      ],
+    );
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+      t0,
+    );
+    let spent = t0.advance(500);
+    svc.handle_timeout(spent).unwrap();
+    assert_tiebreak_deferred(
+      &mut svc,
+      &original,
+      spent,
+      "three records, one of them a repeat, is a THREE-record proposal: it has \
+       a record remaining where ours runs out, so it wins. Deduplicating would \
+       make this a tie, which defers nothing and lets both hosts probe on",
+    );
+  }
+}
+
+/// Two proposals arriving from ONE source address are compared separately, not
+/// unioned.
+///
+/// Two co-resident responders behind one `IP:5353` propose different rdata for
+/// the same name. §8.2 compares against each proposal — this responder loses if
+/// ANY peer beats it — and a union of the two is a list neither of them sent.
+/// Here each proposal on its own LOSES to ours, while their union would win,
+/// which is the direction that silently costs a name.
+#[test]
+fn two_proposals_from_one_source_are_compared_separately() {
+  let peer: core::net::SocketAddr = "192.168.1.91:5353".parse().unwrap();
+  let mut svc = make_service(120); // SRV(631) + empty TXT
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+  let original = svc.name().as_str().to_owned();
+
+  // Proposal A: {TXT(empty)} alone — runs out first, so WE win.
+  // Proposal B: {SRV(80)} alone — starts `00 21` against our `00 10`, so it wins.
+  // Their union {TXT, SRV(80)} would compare equal-then-lower and hand us a win.
+  let bytes_a = proposal_bytes("myprinter._ipp._tcp.local.", &[Rec::Txt(&[])]);
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes_a, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "proposal A on its own runs out of records first, so we win it"
+  );
+
+  let bytes_b = proposal_bytes(
+    "myprinter._ipp._tcp.local.",
+    &[Rec::Srv {
+      port: 80,
+      target: "host.local.",
+    }],
+  );
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes_b, peer, dg(2))),
+    t0,
+  );
+
+  assert!(
+    svc.tiebreak_lost,
+    "one source address, two datagrams, two proposals — and proposal B is \
+     scored on its own rather than folded into A"
+  );
+  let spent = t0.advance(500);
+  svc.handle_timeout(spent).unwrap();
+  // INVERTED, deliberately. The old claim was "a §8.2 loss renames" and this
+  // asserted the name moved; the admitted outcome now is that a §8.2 loss KEEPS
+  // the name and re-probes it after one second — RFC 6762 §8.2: "it defers to
+  // the winning host by waiting one second, and then begins probing for this
+  // record again." Only a §8.1 loss to a host that already OWNS the name
+  // renames, and two co-resident PROBERS own nothing yet.
+  //
+  // The union hazard is still what is being separated: unioning hands us the
+  // WIN, and a win defers nothing — no `Init`, no one-second deadline.
+  assert_tiebreak_deferred(
+    &mut svc,
+    &original,
+    spent,
+    "the SRV-only proposal beats ours on its own, so we lose — unioning the two \
+     into {TXT, SRV(80)} would compare TXT-equal then SRV-lower and wrongly \
+     hand us the win",
+  );
+}
+
+/// RFC 6762 §8.1 keeps the conflict window open for 250 ms PAST the third probe:
+/// the deferral rule runs "from the time the first probe packet is sent until
+/// 250 ms after the third probe", and announcing is permitted only "if, by
+/// 250 ms after the third probe, no conflicting Multicast DNS responses have
+/// been received".
+///
+/// `FIRST_ANNOUNCE_DELAY` is zero, so before the settling state the third
+/// probe's confirm flipped straight to `Announcing` and that window did not
+/// exist. A peer's tentative probe arriving in it hit the established-state
+/// "defend, don't revert" return, and a conflicting response was misrouted
+/// through §9 — so two contenders whose third probes are a few ms apart could
+/// both announce.
+#[test]
+fn the_section81_window_stays_open_250ms_past_the_third_probe() {
+  for (origin, what) in [
+    (ConflictOrigin::TentativeProbe, "a simultaneous prober"),
+    (ConflictOrigin::AuthoritativeResponse, "an existing owner"),
+  ] {
+    let mut svc = make_service(120);
+    let mut now = drive_to_probing_zero(&mut svc);
+    // Three probes on the wire, each confirmed — §8.1's sequence is complete.
+    for _ in 0..3 {
+      let at = emit_probe(&mut svc, now);
+      svc.note_delivery(at, TransmitDelivery::ALL);
+      now = at;
+    }
+    assert!(
+      matches!(svc.state(), ServiceState::Probing(3)),
+      "{what}: the third probe is confirmed, and §8.1 keeps probing active for \
+       250 ms more; got {:?}",
+      svc.state()
+    );
+    let original = svc.name().as_str().to_owned();
+
+    // 1 ms into the window — inside it by any reading.
+    let inside = now.advance(1);
+    let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+    make_srv_record_ref(
+      &mut buf,
+      "myprinter._ipp._tcp.local.",
+      120,
+      0,
+      0,
+      9999,
+      "host.local.",
+    );
+    let peer: core::net::SocketAddr = "192.168.1.77:5353".parse().unwrap();
+    // The origin is now carried by the EVENT: §8.2's input is a peer's whole
+    // Authority Section, §8.1's is a response's record.
+    let proposal = proposal_bytes(
+      "myprinter._ipp._tcp.local.",
+      &[Rec::Srv {
+        port: 9999,
+        target: "host.local.",
+      }],
+    );
+    match origin {
+      ConflictOrigin::TentativeProbe => svc.handle_event(
+        ServiceEvent::ProbeProposal(probe_proposal(&proposal, peer, dg(1))),
+        inside,
+      ),
+      ConflictOrigin::AuthoritativeResponse => {
+        let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+        svc.handle_event(
+          ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+          inside,
+        );
+      }
+    }
+    assert!(
+      svc.tiebreak_lost || svc.probe_defeated,
+      "{what}: a conflict inside §8.1's window must be resolved by §8.2/§8.1, \
+       not by the post-establishment rules"
+    );
+
+    let spent = inside.advance(500);
+    svc.handle_timeout(spent).unwrap();
+    // The two origins part company HERE, and that contrast is the point of
+    // running both. INVERTED for the §8.2 half only: the old claim was "a §8.2
+    // loss renames", and the admitted outcome now is that a §8.2 loss KEEPS the
+    // name and re-probes it after one second — RFC 6762 §8.2: "it defers to the
+    // winning host by waiting one second, and then begins probing for this
+    // record again." Only a §8.1 loss to a host that already OWNS the name
+    // renames, and the §8.1 half below still asserts exactly that.
+    //
+    // What the fixture pins is untouched: both origins are still resolved INSIDE
+    // §8.1's 250 ms window rather than by the post-establishment rules, and each
+    // is resolved by its own rule.
+    match origin {
+      ConflictOrigin::TentativeProbe => assert_tiebreak_deferred(
+        &mut svc,
+        &original,
+        spent,
+        &std::format!(
+          "{what}: losing to a simultaneous prober inside the window defers for \
+           one second and keeps the name, exactly as it would one millisecond \
+           earlier"
+        ),
+      ),
+      ConflictOrigin::AuthoritativeResponse => assert_ne!(
+        svc.name().as_str(),
+        original,
+        "{what}: a conflicting RESPONSE inside the window is §8.1's \"the \
+         probing host MUST defer to the existing host, and SHOULD choose new \
+         names\" — the peer already HOLDS this name, so it costs us the name, \
+         exactly as it would one millisecond earlier"
+      ),
+    }
+  }
+}
+
+/// RFC 6762 §8.2.1: "If either list of records runs out of records before any
+/// difference is found, then the list with records remaining is deemed to have
+/// won the tiebreak." Both directions, since a comparator can get one right and
+/// the other backwards.
+#[test]
+fn tiebreak_the_list_with_records_remaining_wins() {
+  // OURS is always exactly two records: SRV(631) + the empty TXT `write_probe`
+  // emits unconditionally — which is what `make_service` proposes.
+  let peer_src: core::net::SocketAddr = "192.168.1.88:5353".parse().unwrap();
+
+  // INVERTED, deliberately, in the losing direction. The old claim was "a §8.2
+  // loss renames", and `run` reported the verdict as "did the name move". The
+  // admitted outcome now is that a §8.2 loss KEEPS the name and re-probes it
+  // after one second — RFC 6762 §8.2: "it defers to the winning host by waiting
+  // one second, and then begins probing for this record again." Only a §8.1 loss
+  // to a host that already OWNS the name renames. So `run` now reports the
+  // verdict as "did the service defer", and asserts on BOTH paths that the name
+  // never moved, which is a §8.2 invariant the old shape could not state.
+  //
+  // Each direction runs on its own service, because the verdict is no longer a
+  // value to read: it is the deferral the next `handle_timeout` does or does not
+  // perform.
+  let run = |recs: &[Rec<'_>]| -> bool {
+    let mut svc = make_service(120);
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap(); // Init → Probing
+    let original = svc.name().as_str().to_owned();
+    let bytes = proposal_bytes("myprinter._ipp._tcp.local.", recs);
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src, dg(1))),
+      t0,
+    );
+    let spent = t0.advance(500);
+    svc.handle_timeout(spent).unwrap();
+    assert_eq!(
+      svc.name().as_str(),
+      original,
+      "§8.2 never renames in either direction — winner and loser both keep the \
+       name; only §8.1's deferral to an existing OWNER chooses a new one"
+    );
+    // The deferral, whole: `Init` + a fresh sequence + exactly one second. A
+    // dropped verdict leaves the service mid-probe-sequence and matches neither.
+    svc.state() == ServiceState::Init
+      && svc.probe_count == 0
+      && svc.lifecycle_deadline == Some(spent.advance(1000))
+  };
+
+  // ── THEIR list runs out first: {TXT(empty)} against our {TXT(empty), SRV} ──
+  // Record 0 matches; they have nothing left and we still hold the SRV, so we
+  // have records remaining and we WIN.
+  assert!(
+    !run(&[Rec::Txt(&[])]),
+    "their list ran out first, so OUR list has records remaining and is \
+     deemed to have won — we must not defer, and our probe sequence carries on"
+  );
+
+  // ── OUR list runs out first: {TXT(empty), SRV(631), SRV(9999)} ────────────
+  // Records 0 and 1 match ours exactly; we then run out while they still hold
+  // an SRV, so they have records remaining and we LOSE.
+  assert!(
+    run(&[
+      Rec::Txt(&[]),
+      Rec::Srv {
+        port: 631, // byte-identical to ours
+        target: "host.local.",
+      },
+      Rec::Srv {
+        port: 9999, // sorts after SRV(631), so it is the surplus record
+        target: "host.local.",
+      },
+    ]),
+    "our list ran out first, so THEIR list has records remaining and is \
+     deemed to have won — we must defer to them for one second and then probe \
+     for this same name again"
+  );
 }
 
 // ── poll_transmit does not lose pending on buffer-too-small ───
@@ -3845,82 +5983,59 @@ fn make_bad_srv_record_ref(buf: &mut std::vec::Vec<u8>, owner_str: &str) {
   buf.extend_from_slice(&rdata);
 }
 
+/// A record whose rdata will not canonicalize is passed over, and passing it
+/// over must not change the size of the list §8.2.1 compares.
+///
+/// The fixture DISCRIMINATES on that second half. Beside the malformed SRV the
+/// peer proposes the SRV(631) + TXT(empty) this service proposes, so with the
+/// bad record passed over the two lists run out together — §8.2.1's "there is,
+/// in fact, no conflict" — and the name is kept. Counted as a member (of any
+/// value at all), the peer would hold three records to our two and win on "the
+/// list with records remaining".
 #[test]
 fn probing_conflict_drops_malformed_rdata() {
   let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
-  let mut buf = std::vec::Vec::new();
-  make_bad_srv_record_ref(&mut buf, "myprinter._ipp._tcp.local.");
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  let original = svc.name().as_str().to_owned();
+
+  // The two well-formed records, then the malformed SRV appended by hand — the
+  // builder cannot emit one — with the Authority count corrected to match.
+  let mut bytes = proposal_bytes(
+    "myprinter._ipp._tcp.local.",
+    &[
+      Rec::Txt(&[]),
+      Rec::Srv {
+        port: 631,
+        target: "host.local.",
+      },
+    ],
+  );
+  let mut bad = std::vec::Vec::new();
+  make_bad_srv_record_ref(&mut bad, "myprinter._ipp._tcp.local.");
+  bytes.extend_from_slice(&bad);
+  let nscount = u16::from_be_bytes([bytes[8], bytes[9]]);
+  assert_eq!(
+    nscount, 2,
+    "precondition: the builder wrote two authority records"
+  );
+  bytes[8..10].copy_from_slice(&(nscount + 1).to_be_bytes());
+
   let src: core::net::SocketAddr = "192.168.1.88:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(src, rec)),
-    FakeInstant::zero(),
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, src, dg(1))),
+    t0,
   );
   assert!(
-    svc.peer_probes.is_empty(),
-    "a malformed probe-conflict record must not create a peer-probe bucket"
+    !svc.tiebreak_lost,
+    "a record whose rdata will not canonicalize is not a member of the peer's \
+     list, so an otherwise byte-identical proposal stays a tie"
   );
-}
-
-#[test]
-fn probing_conflict_caps_distinct_peer_sources() {
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
-  let mut buf = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut buf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  // MAX_PEER_PROBES distinct sources are bucketed; the next is dropped.
-  for i in 0..(MAX_PEER_PROBES + 1) {
-    let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-    let src: core::net::SocketAddr = std::format!("192.168.1.{}:5353", 100 + i).parse().unwrap();
-    svc.handle_event(
-      ServiceEvent::ProbeConflict(ProbeConflict::new(src, rec)),
-      FakeInstant::zero(),
-    );
-  }
+  svc.handle_timeout(t0.advance(500)).unwrap();
   assert_eq!(
-    svc.peer_probes.len(),
-    MAX_PEER_PROBES,
-    "distinct peer-probe sources must be capped at MAX_PEER_PROBES"
-  );
-}
-
-#[test]
-fn probing_conflict_caps_records_per_source() {
-  let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
-  let src: core::net::SocketAddr = "192.168.1.77:5353".parse().unwrap();
-  // MAX_PEER_PROBE_RECORDS records for one source are kept; the next is dropped.
-  for port in 0..(MAX_PEER_PROBE_RECORDS + 1) as u16 {
-    let mut buf = std::vec::Vec::new();
-    make_srv_record_ref(
-      &mut buf,
-      "myprinter._ipp._tcp.local.",
-      120,
-      0,
-      0,
-      1000 + port,
-      "host.local.",
-    );
-    let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-    svc.handle_event(
-      ServiceEvent::ProbeConflict(ProbeConflict::new(src, rec)),
-      FakeInstant::zero(),
-    );
-  }
-  let bucket = svc.peer_probes.iter().find(|b| b.src == src).unwrap();
-  assert_eq!(
-    bucket.records.len(),
-    MAX_PEER_PROBE_RECORDS,
-    "per-source peer-probe records must be capped"
+    svc.name().as_str(),
+    original,
+    "…and the malformed record therefore costs us nothing"
   );
 }
 
@@ -3935,7 +6050,7 @@ fn post_establishment_conflict_drops_non_srv_txt_record() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
     now,
   );
   assert_eq!(svc.state(), ServiceState::Established);
@@ -3960,7 +6075,7 @@ fn post_establishment_conflict_ignores_identical_srv() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
     now,
   );
   assert_eq!(
@@ -3979,7 +6094,7 @@ fn post_establishment_conflict_drops_malformed_srv() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
     now,
   );
   assert_eq!(
@@ -4010,7 +6125,7 @@ fn post_establishment_conflict_is_rate_limited() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
     now,
   );
   assert_eq!(
@@ -4024,15 +6139,21 @@ fn post_establishment_conflict_is_rate_limited() {
 fn service_handle_and_canonical_record_accessors() {
   let svc = make_service(120);
   let _ = svc.handle();
-  // our_canonical_record_for covers the SRV, TXT, and fallback arms.
-  let _ = svc.our_canonical_record_for(crate::wire::ResourceType::Srv);
-  let _ = svc.our_canonical_record_for(crate::wire::ResourceType::Txt);
-  let _ = svc.our_canonical_record_for(crate::wire::ResourceType::A);
+  // our_canonical_records_for covers the SRV, TXT, and fallback arms.
+  let _ = svc.our_canonical_records_for(crate::wire::ResourceType::Srv);
+  let _ = svc.our_canonical_records_for(crate::wire::ResourceType::Txt);
+  assert!(
+    svc
+      .our_canonical_records_for(crate::wire::ResourceType::A)
+      .is_empty(),
+    "a type this service does not emit at its instance name has no form that \
+     could be ours"
+  );
 }
 
 #[test]
-fn canonical_rdata_for_hash_handles_nsec_and_unknown() {
-  // NSEC record → canonicalized via the raw type-bitmap bytes.
+fn identity_form_handles_nsec_and_unknown() {
+  // NSEC record → next_name then the type-bitmap bytes.
   let mut nbuf: std::vec::Vec<u8> = std::vec::Vec::new();
   nbuf.extend_from_slice(&[1, b'x', 5, b'l', b'o', b'c', b'a', b'l', 0]); // name
   nbuf.extend_from_slice(&47u16.to_be_bytes()); // TYPE NSEC
@@ -4041,9 +6162,11 @@ fn canonical_rdata_for_hash_handles_nsec_and_unknown() {
   nbuf.extend_from_slice(&12u16.to_be_bytes()); // RDLENGTH = next_name(9) + bitmap(3)
   nbuf.extend_from_slice(&[1, b'x', 5, b'l', b'o', b'c', b'a', b'l', 0, 0, 1, 0x40]);
   let (nrec, _) = Ref::try_parse(&nbuf, 0).unwrap();
-  let nview = nrec.rdata_view().unwrap();
-  let mut scratch = std::vec::Vec::new();
-  respond::canonical_rdata_for_hash(&nview, &mut scratch).unwrap();
+  assert_eq!(
+    &*nrec.canonical_rdata_folded().unwrap(),
+    &[1, b'x', 5, b'l', b'o', b'c', b'a', b'l', 0, 0, 1, 0x40],
+    "NSEC identity is its next_name, case-folded, then its bitmap"
+  );
 
   // Unknown record type → canonicalized via the raw rdata bytes (Other arm).
   let mut obuf: std::vec::Vec<u8> = std::vec::Vec::new();
@@ -4054,9 +6177,11 @@ fn canonical_rdata_for_hash_handles_nsec_and_unknown() {
   obuf.extend_from_slice(&3u16.to_be_bytes()); // RDLENGTH = 3
   obuf.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
   let (orec, _) = Ref::try_parse(&obuf, 0).unwrap();
-  let oview = orec.rdata_view().unwrap();
-  let mut scratch2 = std::vec::Vec::new();
-  respond::canonical_rdata_for_hash(&oview, &mut scratch2).unwrap();
+  assert_eq!(
+    &*orec.canonical_rdata_folded().unwrap(),
+    &[0xAA, 0xBB, 0xCC],
+    "a type absent from §18.14 is copied verbatim"
+  );
 }
 
 #[test]
@@ -4065,16 +6190,11 @@ fn poll_transmit_announcement_surfaces_buffer_too_small() {
   let mut buf = std::vec![0u8; 4096];
   let mut now = FakeInstant::zero();
   // Drive to Announcing(0) (third probe confirmed), confirming each probe.
-  'drive: for _ in 0..20 {
-    now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
-    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_delivery(now, TransmitDelivery::ALL);
-      if matches!(svc.state(), ServiceState::Announcing(0)) {
-        break 'drive;
-      }
-    }
-  }
+  // Via the shared helper: it checks the state after `handle_timeout`, not only
+  // inside the drain loop, so it sees `Announcing(0)` on the tick that RFC 6762
+  // §8.1's post-third-probe settling window closes — a transition that costs no
+  // datagram and therefore never appears mid-drain.
+  now = drive_to_announcing_zero(&mut svc);
   assert!(matches!(svc.state(), ServiceState::Announcing(0)));
   // Arm + poll the announcement with a header-only buffer → BufferTooSmall.
   let mut tiny = std::vec![0u8; 12];
@@ -4116,30 +6236,18 @@ fn poll_transmit_question_response_surfaces_buffer_too_small() {
 #[test]
 fn withdrawal_snapshot_after_rename_captures_only_current() {
   let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
+  // A probe on the wire first, then a conflicting RESPONSE: §8.1's deferral to
+  // an existing owner is what renames. A §8.2 tiebreak loss now keeps the name.
+  let t0 = probe_once(&mut svc, FakeInstant::zero());
   // The original name `myprinter` was announced (instance records + its host A).
   svc.goodbye.mark_instance();
   let host_addr = core::net::Ipv4Addr::new(192, 168, 1, 10); // matches make_records
   svc.goodbye.a.push(host_addr);
 
-  // Losing §8.2 tiebreak (peer SRV port 9999 > ours 631) → rename to `myprinter-1`.
-  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut sbuf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&sbuf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  let now = FakeInstant::zero().advance(500);
+  // An existing owner's differing SRV (port 9999 > ours 631) → rename to
+  // `myprinter-1`.
+  deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
+  let now = t0.advance(500);
   svc.handle_timeout(now).unwrap();
   assert!(
     svc.name().as_str().contains("-1"),
@@ -5158,30 +7266,17 @@ fn a_conflict_rename_closes_the_reclaim_cancel_gate() {
   // would — otherwise the renamed service would cancel its own old name's
   // goodbye before ever announcing the replacement.
   let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap(); // Init → Probing
+  // A probe on the wire first, then a conflicting RESPONSE — §8.1's deferral to
+  // an existing owner is what renames; a §8.2 tiebreak loss now keeps the name.
+  let t0 = probe_once(&mut svc, FakeInstant::zero());
   // Precondition: the OLD name had fully announced (the state a §9 rename
   // inherits from an Established service reverted to probing).
   svc.goodbye.mark_instance();
   svc.fully_announced = true;
 
-  // Lose an §8.2 tiebreak (peer SRV port 9999 > ours 631) → rename.
-  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut sbuf,
-    "myprinter._ipp._tcp.local.",
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (rec, _) = Ref::try_parse(&sbuf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec)),
-    FakeInstant::zero(),
-  );
-  let later = FakeInstant::zero().advance(500);
+  // An existing owner's differing SRV (port 9999 > ours 631) → rename.
+  deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
+  let later = t0.advance(500);
   svc.handle_timeout(later).unwrap();
   assert!(
     svc.name().as_str().contains("-1"),
@@ -5765,7 +7860,7 @@ fn a_conflict_rename_clears_the_partial_bound() {
   let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec)),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec, dg(1))),
     now,
   );
   now = now.advance(300);
@@ -5812,7 +7907,7 @@ fn the_section9_revert_to_probe_clears_the_partial_bound() {
   let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec)),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec, dg(1))),
     at,
   );
 
@@ -5854,55 +7949,164 @@ fn make_non_compliant_service(
   svc
 }
 
-/// Deliver a probe conflict whose SRV rdata differs from ours (port 9999 vs our
+/// Deliver a conflicting SRV whose rdata differs from ours (port 9999 vs our
 /// 631) — a genuine §9 conflict when established, and a tiebreak we LOSE when
-/// probing, since the peer's sorted set compares greater than ours.
+/// probing, since the peer's sorted list compares greater than ours.
+///
+/// `origin` is explicit rather than defaulted because the two rules take
+/// different inputs, do different things, and the caller is what knows which one
+/// it is staging:
+///
+/// * `TentativeProbe` — a peer's §8.2 proposal. Losing it DEFERS: the name is
+///   kept and probed for again one second later ("it defers to the winning host
+///   by waiting one second, and then begins probing for this record again").
+/// * `AuthoritativeResponse` — one record of a RESPONSE. §9 acts only on this,
+///   and inside §8.1's probing window it is the deferral that RENAMES ("the
+///   probing host MUST defer to the existing host, and SHOULD choose new
+///   names"). It is acted on only once a probe of the current sequence has
+///   reached the wire, so callers staging a rename open that window first.
 fn deliver_losing_srv_conflict(
   svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
   now: FakeInstant,
+  origin: ConflictOrigin,
 ) {
-  let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
-  make_srv_record_ref(
-    &mut sbuf,
-    svc.name().as_str(),
-    120,
-    0,
-    0,
-    9999,
-    "host.local.",
-  );
-  let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec)),
-    now,
-  );
+  // The origin is carried by the EVENT now: §8.2's input is a peer's whole
+  // Authority Section, §8.1's and §9's is one record of a RESPONSE.
+  match origin {
+    ConflictOrigin::TentativeProbe => {
+      let bytes = proposal_bytes(
+        svc.name().as_str(),
+        &[Rec::Srv {
+          port: 9999,
+          target: "host.local.",
+        }],
+      );
+      svc.handle_event(
+        ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+        now,
+      );
+    }
+    ConflictOrigin::AuthoritativeResponse => {
+      let mut sbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+      make_srv_record_ref(
+        &mut sbuf,
+        svc.name().as_str(),
+        120,
+        0,
+        0,
+        9999,
+        "host.local.",
+      );
+      let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
+      svc.handle_event(
+        ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec, dg(1))),
+        now,
+      );
+    }
+  }
 }
 
-/// Drive an announcing service through a §9 revert and a lost §8.2 tiebreak, so
-/// it ends up renamed with the datagram encoded before the regression still
-/// parked. Returns the instant the rename completed at.
-fn regress_and_rename_with_a_parked_datagram(
-  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
-  at: FakeInstant,
-) -> FakeInstant {
-  // §9: a genuine conflict reverts the established name to re-probing.
-  deliver_losing_srv_conflict(svc, at);
+/// A rename CANNOT happen while an ANNOUNCEMENT is parked across a §9 revert,
+/// and this asserts that rather than fabricating it.
+///
+/// Four facts close the path, and they close it by construction:
+///
+/// 1. §9's revert clears `probe_on_wire`, because it restarts the §8.1 sequence.
+/// 2. §8.1 acts on a conflicting response only once a probe of the CURRENT
+///    sequence has reached a link — so with the window shut, responses are
+///    ignored.
+/// 3. `probe_on_wire` is set by a confirmed delivery and by nothing else, and
+///    the single commit token is held by the parked datagram, so `poll_transmit`
+///    yields nothing and no probe of the restarted sequence can be sent, let
+///    alone confirmed.
+/// 4. A §8.2 tiebreak loss no longer renames — it keeps the name and re-probes
+///    after one second. §8.2 is the ONE conflict rule that never required
+///    `probe_on_wire` (neither host owns the name yet, so there is no window to
+///    be inside), so before that change it was the way past fact 1, and it was
+///    the last one.
+///
+/// `StaleRecords::OldName` is the consequence: the only place it is built is a
+/// rename over a live commit token, and the four facts say no rename can happen
+/// over one. The parked token therefore stays `SameName`, which is asserted
+/// below so this test fails if the premise stops holding rather than merely
+/// passing more easily.
+///
+/// If a future change re-opens the path, this fails loudly, which is exactly
+/// when someone would want to know. The fixture this replaces got its rename by
+/// delivering a losing §8.2 proposal after the revert — the fourth fact above is
+/// exactly what stopped that working, and re-staging it would mean asserting
+/// behaviour for an input production can no longer produce.
+#[test]
+fn no_rename_is_reachable_with_an_announcement_parked_across_a_section9_revert() {
+  let mut svc = make_non_compliant_service(120);
+  let now = drive_to_announcing_zero(&mut svc);
+  // The first announcement of the name is encoded and PARKED. Nothing has
+  // latched yet, so this datagram is the ONLY thing that ever exposed the name —
+  // the case a rename would have to hand off to the old name's §10.1 goodbye.
+  let at = emit_announcement(&mut svc, now);
+  assert!(!svc.advertises_instance());
+  assert!(svc.rename_goodbye_handoff.is_none());
+  let before = svc.name().as_str().to_owned();
+
+  // §9: a genuine conflicting RESPONSE reverts the established name to
+  // re-probing. Only a response can — a peer merely probing is answered.
+  deliver_losing_srv_conflict(&mut svc, at, ConflictOrigin::AuthoritativeResponse);
   assert_eq!(
     svc.state(),
     ServiceState::Init,
     "a §9 conflict must revert to re-probing"
   );
-  // §8.2: the conflict persists during the re-probe and we lose the tiebreak.
-  deliver_losing_srv_conflict(svc, at);
+  assert!(
+    !svc.probe_on_wire,
+    "fact 1: the revert restarts the §8.1 sequence, so its window is shut"
+  );
+
+  // Every further conflict, of either kind, now bounces off.
+  deliver_losing_srv_conflict(&mut svc, at, ConflictOrigin::AuthoritativeResponse);
+  assert!(
+    !svc.probe_defeated,
+    "fact 2: a response before the restarted sequence's first probe is one §8.1 \
+     requires be ignored"
+  );
+
   let now = at.advance(300);
   svc.handle_timeout(now).unwrap();
   assert!(
-    svc.name().as_str().contains("-1"),
-    "the service must have lost the tiebreak and renamed; name={}",
-    svc.name().as_str()
+    svc
+      .poll_transmit(now, &mut std::vec![0u8; 4096])
+      .unwrap()
+      .is_none(),
+    "fact 3: the parked datagram holds the single commit token, so no probe of \
+     the restarted sequence can be emitted — and only a CONFIRMED probe could \
+     re-open the window"
   );
-  now
+  assert_eq!(
+    svc.name().as_str(),
+    before,
+    "so the name survives: with the §8.1 window shut and no way to re-open it \
+     while the datagram is parked, and a §8.2 loss now deferring rather than \
+     renaming, no rename is reachable from here"
+  );
+  assert!(
+    matches!(
+      svc.awaiting_confirm,
+      Some(AwaitingConfirm::Stale {
+        records: StaleRecords::SameName(_),
+        ..
+      })
+    ),
+    "…so the parked announcement's records are still attributed to the name \
+     this service holds: nothing renamed them away, and `StaleRecords::OldName` \
+     is what a rename over a live token would have produced; got {:?}",
+    svc.awaiting_confirm
+  );
+  svc.note_delivery(now, TransmitDelivery::ALL);
+  assert!(
+    svc.rename_goodbye_handoff.is_none(),
+    "and a same-name confirm hands nothing off — there is no old name to \
+     withdraw under"
+  );
 }
 
 /// `Init → Probing(0)` costs no datagram, so an old-generation probe confirming
@@ -5913,10 +8117,19 @@ fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
   let mut svc = make_non_compliant_service(120);
   let mut now = drive_to_probing_zero(&mut svc);
 
-  // A probe for the ORIGINAL name is encoded and parked.
-  let at = emit_probe(&mut svc, now);
-  // We lose the §8.2 tiebreak and rename away while it is still in flight.
-  deliver_losing_srv_conflict(&mut svc, at);
+  // One probe of this sequence reaches the wire and is CONFIRMED, which is the
+  // only thing that opens §8.1's window — `probe_on_wire` is set by a confirmed
+  // delivery and by nothing else, so a fixture that sets it directly would be
+  // asserting a state the production machine cannot occupy.
+  let first = emit_probe(&mut svc, now);
+  svc.note_delivery(first, TransmitDelivery::ALL);
+
+  // A SECOND probe for the ORIGINAL name is encoded and parked.
+  let at = emit_probe(&mut svc, first);
+  // We defer to an existing owner under §8.1 and rename away while that probe is
+  // still in flight. A RESPONSE is the stimulus because a §8.2 tiebreak loss now
+  // keeps the name.
+  deliver_losing_srv_conflict(&mut svc, at, ConflictOrigin::AuthoritativeResponse);
   now = at.advance(300);
   svc.handle_timeout(now).unwrap();
   assert!(
@@ -5960,67 +8173,49 @@ fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
   );
 }
 
-/// A datagram parked across a conflict rename put its records in peer caches
-/// under the OLD name. Latching them into the live `goodbye` would claim the NEW
-/// name owns records it never sent — so a later unregister withdraws the wrong
-/// name and the old name is never retracted at all.
-#[test]
-fn a_stale_announcement_confirm_withdraws_under_the_old_name() {
-  let mut svc = make_non_compliant_service(120);
-  let now = drive_to_announcing_zero(&mut svc);
-  // The first announcement of the ORIGINAL name is encoded and parked. Nothing
-  // has latched yet, so this datagram is the ONLY thing that ever exposed it.
-  let at = emit_announcement(&mut svc, now);
-  assert!(!svc.advertises_instance());
-  assert!(svc.rename_goodbye_handoff.is_none());
-
-  let now = regress_and_rename_with_a_parked_datagram(&mut svc, at);
-  svc.note_delivery(now, TransmitDelivery::ALL);
-
-  assert!(
-    !svc.advertises_instance(),
-    "the NEW name has put nothing on any wire, so it owns nothing to withdraw"
-  );
-  assert!(
-    svc.advertises_host(),
-    "the host name is invariant across an instance rename, so the addresses the \
-     parked datagram carried stay this service's to withdraw"
-  );
-  let handoff = svc
-    .take_rename_goodbye_handoff()
-    .expect("the old name's records really are in peer caches and must be retracted");
-  assert_eq!(
-    handoff.records.instance().as_str(),
-    "myprinter._ipp._tcp.local.",
-    "the goodbye must name the instance the datagram actually advertised"
-  );
-  assert!(
-    handoff.owned.ptr() && handoff.owned.srv() && handoff.owned.txt(),
-    "an unfiltered announcement carries the whole instance record set"
-  );
-  assert!(
-    handoff.owned.a_slice().is_empty() && handoff.owned.aaaa_slice().is_empty(),
-    "a rename never withdraws host A/AAAA"
-  );
-}
-
 /// The reclaim-cancel gate and the `Established` update are the app-visible half:
 /// a confirm from a generation that was replaced must not report that the CURRENT
-/// name completed a §8.3 announcement, because cancelling the renamed-away name's
-/// §10.1 goodbye on that basis strands its records in every peer cache.
+/// name completed a §8.3 announcement, because a predecessor's §10.1 goodbye is
+/// cancelled on exactly that basis and would strand its records in every peer
+/// cache.
+///
+/// The regression here is the §9 same-name revert, which is where a parked
+/// ANNOUNCEMENT can actually be caught by one — see
+/// `no_rename_is_reachable_with_an_announcement_parked_across_a_section9_revert`
+/// for why a rename cannot catch it. Both halves are load-bearing on this path:
+/// the revert does NOT reset `fully_announced` (the name is unchanged, so what
+/// it says about this name stays true), so a stale confirm that took the live
+/// `Announcement` arm would set it here — the gate is `false` going in precisely
+/// because this datagram is the first announcement and it has not been
+/// confirmed.
 #[test]
 fn a_stale_announcement_confirm_neither_establishes_nor_opens_the_reclaim_gate() {
   let mut svc = make_non_compliant_service(120);
   let now = drive_to_announcing_zero(&mut svc);
   let at = emit_announcement(&mut svc, now);
-  let now = regress_and_rename_with_a_parked_datagram(&mut svc, at);
+  assert!(
+    !svc.has_fully_announced().get(),
+    "precondition: the parked datagram is this name's FIRST announcement, so \
+     the gate is shut until something confirms one"
+  );
 
-  svc.note_delivery(now, TransmitDelivery::ALL);
+  deliver_losing_srv_conflict(&mut svc, at, ConflictOrigin::AuthoritativeResponse);
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "a §9 conflict must revert to re-probing"
+  );
+
+  // ALL, deliberately: `fully_announced` is an all-delivered fact, so a partial
+  // confirm could not open the gate even through the live arm. This is the
+  // delivery that would.
+  svc.note_delivery(at, TransmitDelivery::ALL);
 
   assert!(
     !svc.has_fully_announced().get(),
-    "no announcement of the CURRENT name has reached any link, let alone all of \
-     them — the renamed-away name's goodbye must keep going"
+    "the confirm belongs to the generation this revert replaced — no \
+     announcement of the CURRENT §8.1 sequence has reached any link, let alone \
+     all of them, and a predecessor's goodbye must keep going"
   );
   let mut updates = std::vec::Vec::new();
   while let Some(upd) = svc.poll() {
@@ -6045,7 +8240,7 @@ fn a_stale_announcement_confirm_latches_ownership_without_recharging_the_sequenc
   let at = emit_announcement(&mut svc, now);
   assert!(!svc.advertises_instance());
 
-  deliver_losing_srv_conflict(&mut svc, at);
+  deliver_losing_srv_conflict(&mut svc, at, ConflictOrigin::AuthoritativeResponse);
   assert_eq!(svc.state(), ServiceState::Init);
   assert_eq!(
     svc.partial_rounds,
@@ -6121,7 +8316,7 @@ fn a_regression_leaves_a_meta_response_token_alone() {
     Some(AwaitingConfirm::MetaResponse)
   ));
 
-  deliver_losing_srv_conflict(&mut svc, at);
+  deliver_losing_srv_conflict(&mut svc, at, ConflictOrigin::AuthoritativeResponse);
   assert_eq!(svc.state(), ServiceState::Init);
   assert!(
     matches!(svc.awaiting_confirm, Some(AwaitingConfirm::MetaResponse)),
@@ -6938,11 +9133,26 @@ fn a_recovered_family_is_owed_the_whole_bound_again() {
     "a delivery clears the whole of the family's patience, latch included"
   );
   assert!(
-    matches!(svc.state(), ServiceState::Announcing(0)),
-    "the third probe was confirmed by every obligated family; got {:?}",
+    matches!(svc.state(), ServiceState::Probing(3)),
+    "the third probe was confirmed by every obligated family, which enters RFC \
+     6762 §8.1's settling window — probing stays active for 250 ms more, so this \
+     is Probing(3) and not yet Announcing; got {:?}",
     svc.state()
   );
   now = at;
+
+  // Close that window so the §8.3 rounds below start from `Announcing(0)`,
+  // exactly where they did before it existed. It costs no datagram, so the
+  // announcement counters this test is about are untouched by it.
+  now = svc
+    .poll_timeout()
+    .expect("the §8.1 settling window always re-arms");
+  svc.handle_timeout(now).unwrap();
+  assert!(
+    matches!(svc.state(), ServiceState::Announcing(0)),
+    "the settling window closes into announcing; got {:?}",
+    svc.state()
+  );
 
   // …and now it fails again. This is a NEW failure and is owed the whole bound: the
   // §8.3 phase must hold for `MAX_PARTIAL_ROUNDS` rounds before the next excusal,
@@ -7129,7 +9339,7 @@ fn handle_event_under_a_live_commit_token_trips_the_contract_assertion() {
   let mut svc = make_service(120);
   let now = drive_to_probing_zero(&mut svc);
   let at = emit_probe(&mut svc, now);
-  deliver_losing_srv_conflict(&mut svc, at);
+  deliver_losing_srv_conflict(&mut svc, at, ConflictOrigin::TentativeProbe);
 }
 
 /// Teardown is the row the contract does the most work on, and the only one whose
@@ -7396,4 +9606,1251 @@ fn draw_first_probe(
     }
   }
   panic!("no probe was drawn within the §8.1 initial delay");
+}
+
+// ── R10: the §8.2 proposal is scoped by what the query ASKS ────────────
+
+/// Byte offset at which the first authority record of
+/// [`raw_proposal_bytes_asking`] begins: the 12-byte header, then the question's
+/// uncompressed name, QTYPE and QCLASS.
+///
+/// Fixtures that hand-build a COMPRESSION POINTER need it — a pointer is an
+/// absolute offset into the datagram, so a record that points at itself can only
+/// be written once its own position is known.
+fn first_record_offset(qname: &str) -> usize {
+  let mut n = 12usize;
+  for label in qname.trim_end_matches('.').split('.') {
+    n += 1 + label.len();
+  }
+  n + 1 + 4
+}
+
+/// A record whose OWNER NAME is a compression pointer to `at_offset` — the
+/// record's own position, so following it loops forever.
+///
+/// `Ref` parsing accepts a pointer without resolving it, so this record parses
+/// and only fails when its labels are walked. That is precisely the shape that
+/// used to read as "some other name" and get skipped.
+fn make_cyclic_owner_record(
+  buf: &mut std::vec::Vec<u8>,
+  at_offset: usize,
+  rtype: u16,
+  ttl: u32,
+  rdata: &[u8],
+) {
+  buf.clear();
+  #[allow(clippy::cast_possible_truncation)]
+  {
+    buf.push(0xC0 | ((at_offset >> 8) as u8));
+    buf.push(at_offset as u8);
+  }
+  buf.extend_from_slice(&rtype.to_be_bytes());
+  buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  buf.extend_from_slice(&ttl.to_be_bytes());
+  #[allow(clippy::cast_possible_truncation)]
+  buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+  buf.extend_from_slice(rdata);
+}
+
+/// An NSEC at `PROBED_NAME` whose `next_name` is a compression pointer to
+/// `rdata_offset` — the pointer's own position inside the rdata, so it cycles.
+fn make_cyclic_nsec_record(buf: &mut std::vec::Vec<u8>, ttl: u32, rdata_offset: usize) {
+  buf.clear();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    buf.push(label.len() as u8);
+    buf.extend_from_slice(label.as_bytes());
+  }
+  buf.push(0u8);
+  buf.extend_from_slice(&47u16.to_be_bytes()); // TYPE NSEC
+  buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  buf.extend_from_slice(&ttl.to_be_bytes());
+  // rdata = cyclic next_name (2 bytes) + a window-0 bitmap asserting SRV.
+  let rdata: [u8; 7] = [
+    #[allow(clippy::cast_possible_truncation)]
+    {
+      0xC0 | ((rdata_offset >> 8) as u8)
+    },
+    #[allow(clippy::cast_possible_truncation)]
+    {
+      rdata_offset as u8
+    },
+    0,
+    5,
+    0,
+    0,
+    0x40,
+  ];
+  #[allow(clippy::cast_possible_truncation)]
+  buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+  buf.extend_from_slice(&rdata);
+}
+
+/// The peer list every abandonment fixture below starts from: a proposal that
+/// BEATS ours outright (SRV port 9999 against our 631, and the same empty TXT),
+/// so "we did not lose" can only be the abandonment under test and never a
+/// proposal that was harmless anyway.
+fn winning_pair() -> (std::vec::Vec<u8>, std::vec::Vec<u8>) {
+  let mut txt = std::vec::Vec::new();
+  make_txt_record_ref(&mut txt, PROBED_NAME, 120, &[&[]]);
+  let mut srv = std::vec::Vec::new();
+  make_srv_record_ref(&mut srv, PROBED_NAME, 120, 0, 0, 9999, "host.local.");
+  (txt, srv)
+}
+
+/// CONTROL for every abandonment fixture below: the winning pair ON ITS OWN is
+/// adjudicated and DOES take the round. Without this, "no loss recorded" proves
+/// nothing — a fixture that stopped reaching the comparator at all would pass
+/// every one of them.
+#[test]
+fn the_winning_pair_control_really_does_lose_the_round() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  let bytes = raw_proposal_bytes(&[txt, srv]);
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    svc.tiebreak_lost,
+    "control: the peer's SRV port 9999 beats our 631, so this proposal must \
+     take the round — every abandonment fixture below is built on it"
+  );
+}
+
+/// R10 finding 3: a proposal carrying an UNDECODABLE OWNER NAME is abandoned
+/// whole, not adjudicated from the records that happened to read.
+///
+/// The name matcher answers `false` both for "a different name" and for "a name
+/// I could not decode", and `Ref` parsing accepts a compression pointer without
+/// ever resolving it — so a cyclic owner name arrived looking exactly like an
+/// out-of-scope record and was silently dropped from the list being compared.
+/// A dropped record leaves a list the peer never sent, and §8.2.1 walks the two
+/// sorted lists pairwise — so the omission can decide the round in either
+/// direction. Here the readable subset alone would have taken the round, and the
+/// unreadable record could have been anything.
+#[test]
+fn an_undecodable_owner_name_abandons_the_whole_proposal() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  // The third record sits after the two readable ones; its owner name is a
+  // pointer to its own offset.
+  let at = first_record_offset(PROBED_NAME) + txt.len() + srv.len();
+  let mut cyclic = std::vec::Vec::new();
+  make_cyclic_owner_record(&mut cyclic, at, 1, 120, &[10, 0, 0, 7]);
+  let bytes = raw_proposal_bytes(&[txt, srv, cyclic]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a proposal with an undecodable owner name is not a list §8.2.1 can sort — \
+     it must be ABANDONED, not adjudicated from the records that read"
+  );
+}
+
+/// R10 finding 4: an NSEC's `next_name` is part of the bytes §8.2 compares, so
+/// an NSEC that will not decode abandons the proposal.
+///
+/// The §8.2 form dropped `next_name` entirely and kept only the bitmap.
+/// Two things followed: an NSEC with a cyclic next-name produced bytes at all,
+/// so a proposal of "our SRV, our TXT and one unreadable NSEC" counted as three
+/// records and won §8.2.1 on list length against our two; and two NSECs denying
+/// the same types at different names compared equal.
+#[test]
+fn an_undecodable_nsec_next_name_abandons_the_proposal() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  // The NSEC's rdata begins after its owner name (PROBED_NAME uncompressed),
+  // type, class, TTL and RDLENGTH.
+  let owner_len = PROBED_NAME
+    .trim_end_matches('.')
+    .split('.')
+    .map(|l| 1 + l.len())
+    .sum::<usize>()
+    + 1;
+  let nsec_at = first_record_offset(PROBED_NAME) + txt.len() + srv.len();
+  let mut nsec = std::vec::Vec::new();
+  make_cyclic_nsec_record(&mut nsec, 120, nsec_at + owner_len + 2 + 2 + 4 + 2);
+  let bytes = raw_proposal_bytes(&[txt, srv, nsec]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "an NSEC whose next_name will not decode is a record §8.2 cannot compare, \
+     so the whole proposal is abandoned — it must NOT be scored as a third \
+     record that wins on list length"
+  );
+}
+
+/// R10 finding 4: a well-known COMPRESSION-ELIGIBLE type this crate does not
+/// parse (NS/SOA/MX/DNAME) cannot be compared as raw bytes, so it abandons the
+/// proposal too.
+///
+/// RFC 3597 §4 forbids compression inside truly-unknown types, which is what
+/// makes their raw bytes a stable comparison. These types are the exception:
+/// their rdata MAY carry a compression pointer, and a raw copy of one is
+/// message-OFFSET-dependent — the same record at a different position in the
+/// packet yields different comparison bytes, so the two sides stop computing the
+/// same function and the tiebreak stops resolving.
+///
+/// DNAME (39) rather than NS (2), and the choice is load-bearing. §8.2.1's
+/// ordering key begins with the record TYPE, so an extra NS would sort BELOW our
+/// TXT(16), become the peer's smallest element, and hand US the round at element
+/// 0 — the right verdict for the wrong reason, and one that holds whether or not
+/// the proposal was abandoned. DNAME sorts above our SRV(33), so it displaces no
+/// comparison: the round is decided by the `winning_pair` control either way,
+/// and the only thing that can keep the name here is the abandonment.
+#[test]
+fn an_unparsed_compressible_type_abandons_the_proposal() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  // A DNAME (type 39) at the probed name whose rdata is a compression pointer.
+  // The OWNER name is readable, so this fixture turns on the rdata rule and not
+  // on finding 3's owner-name rule.
+  let mut dname = std::vec::Vec::new();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    dname.push(label.len() as u8);
+    dname.extend_from_slice(label.as_bytes());
+  }
+  dname.push(0u8);
+  dname.extend_from_slice(&39u16.to_be_bytes()); // TYPE DNAME
+  dname.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  dname.extend_from_slice(&120u32.to_be_bytes());
+  dname.extend_from_slice(&2u16.to_be_bytes()); // RDLENGTH
+  dname.extend_from_slice(&[0xFF, 0xFF]); // a pointer past the end of the datagram
+  let bytes = raw_proposal_bytes(&[txt, srv, dname]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a compression-eligible type this crate does not parse has no well-defined \
+     comparison bytes, so the proposal is abandoned rather than compared over a \
+     raw copy whose value depends on where in the packet it sat"
+  );
+}
+
+/// R10 finding 5: an Authority Section with NO QUESTION is not a proposal.
+///
+/// §8.2 reads the proposed rdata off "the Authority Section of *that query*",
+/// and §8.1 defines the query as one carrying "the record name in question in
+/// the Question Section". A QDCOUNT=0 packet asks nothing, so its authority
+/// records answer nothing — adjudicating them let any peer impose a one-second
+/// §8.2 deferral by sending records it never proposed.
+#[test]
+fn a_proposal_with_no_question_is_not_adjudicated() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  let mut bytes = raw_proposal_bytes(&[txt, srv]);
+  // Strip the question: QDCOUNT → 0, and drop the question bytes.
+  let qlen = first_record_offset(PROBED_NAME) - 12;
+  bytes[4] = 0;
+  bytes[5] = 0;
+  bytes.drain(12..12 + qlen);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a query that asks nothing proposes nothing — its authority records must \
+     record no §8.2 verdict"
+  );
+}
+
+/// The other half of §8.2's scope, and the half nothing checked. Admission is
+/// OWNER NAME **and CLASS**; a probe surfaced the class conjunct as unasserted.
+///
+/// §8.2.1 orders the compared lists "by class, then type, then rdata", so a
+/// query asking in another class is contending a different namespace and its
+/// Authority Section is no proposal for our IN record — even when the records it
+/// carries are themselves class IN and sit at our exact name. The record-level
+/// `rclass` screen in `ProposalScope::admits` cannot stand in for this: that
+/// one reads the RECORD's class, and this reads the QUESTION's.
+///
+/// The payload is `winning_pair`, which
+/// `the_winning_pair_control_really_does_lose_the_round` proves takes the round
+/// outright when it IS admitted — so this fixture fails loudly if the class
+/// scope ever stops being applied, rather than passing for want of a conflict.
+#[test]
+fn a_question_asking_in_another_class_proposes_nothing_about_ours() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  // QCLASS 3 = CH (Chaos). The §5.4 unicast-response bit is the top bit and is
+  // stripped before `qclass()` is read, so it is set here exactly as a real
+  // probe sets it — the fixture must differ from a conforming probe in CLASS
+  // alone, or it would be proving something else.
+  let bytes = raw_proposal_bytes_asking_type_class(
+    PROBED_NAME,
+    crate::wire::ResourceType::Any,
+    0x8000u16 | 3,
+    &[txt, srv],
+  );
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "the query contends a name in class CH, so its Authority Section is not a \
+     proposal for the IN record we are probing — and this payload is the one \
+     that takes the round outright when it IS admitted"
+  );
+}
+
+/// R10 finding 5: a query asking about a DIFFERENT name proposes nothing about
+/// ours, however its Authority Section is filled.
+#[test]
+fn a_question_for_another_name_proposes_nothing_about_ours() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  let bytes = raw_proposal_bytes_asking("someone-else._ipp._tcp.local.", &[txt, srv]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "the query asks about another name, so its authority records are not a \
+     proposal for ours"
+  );
+}
+
+/// A peer that NARROWS its probe's QTYPE still proposes its whole Authority
+/// Section — the both-win regression, and the other half of
+/// `the_winning_pair_control_really_does_lose_the_round`.
+///
+/// The peer asks TXT and carries the `winning_pair`: a TXT byte-identical to
+/// ours plus the SRV port 9999 that the control proves takes the round outright.
+/// Scoping the fold by QTYPE keeps only that TXT — it ties, our SRV is the
+/// record remaining, and §8.2.1's "the list with records remaining is deemed to
+/// have won" leaves us holding the name. The PEER meanwhile folds the type-ANY
+/// probe §8.1 tells us to send, ties on TXT, and finds its SRV 9999 sorting
+/// after our 631, so it holds the name too. Both sides win, both announce, and
+/// two responders own one name — the single outcome §8.2 exists to prevent.
+///
+/// The conflation that once made the narrow reading look right, so it is not
+/// adjudicated a third time: this fixture's peer was described as having
+/// "proposed no SRV at all". It proposed one. §8.2 says a host "populates the
+/// query message's Authority Section with the record or records with the rdata
+/// that it would be proposing to use", and that the section must contain "*all*
+/// the records and proposed rdata being probed for uniqueness" — the Authority
+/// Section IS the proposal. The Question Section says only what the sender wants
+/// ANSWERED, which is a different thing and no bound on what it claims.
+///
+/// The asymmetry is what makes the defect ours and not the peer's:
+/// `our_proposal` is not question-scoped either, so a QTYPE gate had the two
+/// hosts sorting different PAIRS of lists rather than one pair.
+#[test]
+fn a_narrowed_qtype_still_proposes_the_whole_authority_section() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let (txt, srv) = winning_pair();
+  let bytes =
+    raw_proposal_bytes_asking_type(PROBED_NAME, crate::wire::ResourceType::Txt, &[txt, srv]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    svc.tiebreak_lost,
+    "the peer's Authority Section is its whole §8.2 proposal whatever its QTYPE \
+     asks, so its SRV port 9999 is compared and beats our 631 — dropping it \
+     would leave BOTH hosts believing they won this round"
+  );
+}
+
+/// Build a raw CNAME record in wire format, for the fixture below.
+///
+/// [`crate::wire::MessageBuilder`] has no CNAME writer — this crate never
+/// publishes one — so a fixture about a PEER's CNAME writes the bytes itself.
+fn make_cname_record_ref(buf: &mut std::vec::Vec<u8>, owner_str: &str, ttl: u32, target_str: &str) {
+  buf.clear();
+  for label in owner_str.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    buf.push(label.len() as u8);
+    buf.extend_from_slice(label.as_bytes());
+  }
+  buf.push(0u8); // root label
+
+  buf.extend_from_slice(&5u16.to_be_bytes()); // TYPE CNAME
+  buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  buf.extend_from_slice(&ttl.to_be_bytes());
+
+  let mut rdata: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in target_str.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    rdata.push(label.len() as u8);
+    rdata.extend_from_slice(label.as_bytes());
+  }
+  rdata.push(0u8); // root label
+
+  #[allow(clippy::cast_possible_truncation)]
+  buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes()); // RDLENGTH
+  buf.extend_from_slice(&rdata);
+}
+
+/// A record of a type the probe's QTYPE never asked for is STILL in the peer's
+/// §8.2 proposal — pinned over a CNAME, a type this crate publishes and probes
+/// for nowhere, so no QTYPE in the sweep below can match it by accident.
+///
+/// §8.2 requires the Authority Section to carry "*all* the records and proposed
+/// rdata being probed for uniqueness": it is the sender's complete proposal, and
+/// the sender's own QTYPE narrows nothing about it. Scoping any of it away
+/// shortens the peer's list, and §8.2.1 sorts both lists and walks them
+/// pairwise — so the omission changes which elements meet and decides the round
+/// over a list the peer never sent, in whichever direction the removed record's
+/// sort position happens to push it.
+///
+/// The fixture needs `instance == host`: only then does `write_probe` put the
+/// A/AAAA records under the contested owner, so our sorted list OPENS with type
+/// 1 and the peer's type 5 sorts after it. The peer proposes nothing but that
+/// one record, so dropping it leaves an empty list to adjudicate and we hold —
+/// while the peer, folding the type-ANY probe §8.1 tells us to send, sees our
+/// whole proposal and wins. Two conforming peers, one name.
+#[test]
+fn a_record_outside_the_probes_qtype_is_still_proposed() {
+  // Every QTYPE a probe could narrow to that is not the CNAME's own type.
+  for qtype in [
+    crate::wire::ResourceType::A,
+    crate::wire::ResourceType::Srv,
+    crate::wire::ResourceType::Txt,
+  ] {
+    let shared = Name::try_from_str(PROBED_NAME).unwrap();
+    let mut records = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      shared.clone(),
+      shared,
+      631,
+      120,
+    );
+    records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+    let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+      Service::try_new(
+        ServiceHandle::from_raw(0),
+        records,
+        FakeInstant::zero(),
+        [0u8; 32],
+        true,
+      );
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap();
+
+    let mut cname = std::vec::Vec::new();
+    make_cname_record_ref(&mut cname, PROBED_NAME, 120, "elsewhere.local.");
+    let bytes = raw_proposal_bytes_asking_type(PROBED_NAME, qtype, &[cname]);
+
+    let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+      t0,
+    );
+    assert!(
+      svc.tiebreak_lost,
+      "the peer's Authority Section is its whole proposal, so this record is in \
+       the list §8.2.1 sorts however narrow the {qtype:?} question was — and \
+       type 5 sorts after the type 1 our own list opens with, which is the peer \
+       winning the round"
+    );
+  }
+}
+
+/// The control for the fixture above: admitting an off-QTYPE record is
+/// ADJUDICATING it, not conceding to it.
+///
+/// With a separate host name our proposal is `{SRV, TXT}` and opens with type
+/// 16, so the same type-5 record sorts EARLIER and §8.2.1 leaves us the winner.
+/// Without this, a fold that simply lost every round it could not read would
+/// pass the fixture above.
+#[test]
+fn a_record_outside_the_qtype_still_loses_a_round_it_sorts_earlier_than() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  let mut cname = std::vec::Vec::new();
+  make_cname_record_ref(&mut cname, PROBED_NAME, 120, "elsewhere.local.");
+  let bytes = raw_proposal_bytes_asking_type(PROBED_NAME, crate::wire::ResourceType::A, &[cname]);
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "the record is admitted and compared, and type 5 sorts before the type 16 \
+     this service's list opens with — §8.2.1 keeps the name"
+  );
+}
+
+// ── R10 finding 2: nothing of a superseded generation reaches the wire ──
+
+/// R10 finding 2: a probe QUEUED before the losing verdict arrived must not be
+/// transmitted.
+///
+/// The permitted order is `handle_timeout` (which queues the probe),
+/// `handle_event` (a winning `ProbeProposal`, which latches the loss), then
+/// `poll_transmit`. §8.2 does not tell the loser to stop asserting — it tells it
+/// to stop: "it defers to the winning host by waiting one second, and then
+/// begins probing for this record again". A probe that escapes here is the
+/// loser probing through the very second it owes.
+#[test]
+fn a_probe_queued_before_the_loss_does_not_escape_the_deferral() {
+  let mut svc = make_service(120);
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+
+  // Drive to the tick that QUEUES a probe, without polling it out.
+  let mut queued = false;
+  for _ in 0..8 {
+    now = now.advance(100);
+    svc.handle_timeout(now).unwrap();
+    if svc.peek_pending().is_some() {
+      queued = true;
+      break;
+    }
+  }
+  assert!(queued, "precondition: a probe is queued and not yet drawn");
+
+  // The winning proposal arrives before the queue is drained.
+  let bytes = srv_txt_proposal(9999);
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    now,
+  );
+  assert!(
+    svc.tiebreak_lost,
+    "precondition: the peer's proposal took the round"
+  );
+
+  assert!(
+    svc.poll_transmit(now, &mut buf).unwrap().is_none(),
+    "a §8.2 loser owes one second of silence, so the probe its previous \
+     generation queued must be WITHHELD — not sent because a probe 'asserts \
+     nothing'"
+  );
+  assert!(
+    svc.peek_pending().is_some(),
+    "…and withheld is a PAUSE, not a drop: the queue is left intact for the \
+     deferral to clear"
+  );
+}
+
+// ── R10 finding 6: a shared PTR claims no instance name ────────────────
+
+/// R10 finding 6: a confirmed response that emitted only the SHARED
+/// service-type PTR must not close the pre-authoritative window.
+///
+/// `is_preauthoritative` asks whether this generation has CLAIMED the name.
+/// The service-type and RFC 6763 §7.1 subtype PTRs are owned by shared names
+/// that any number of responders answer for, so emitting one claims nothing —
+/// and §7.1 known-answer suppression can trim a response down to exactly those
+/// (a querier that already holds our SRV and TXT). Counting it left the window
+/// shut with no instance-owned record anywhere on the link, and the next winning
+/// `ProbeProposal` was dropped unadjudicated.
+#[test]
+fn a_shared_ptr_only_response_does_not_close_the_preauthoritative_window() {
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+
+  // A confirmed Response that emitted the shared PTRs and NOTHING the instance
+  // owns — what §7.1 leaves after suppressing a querier's known SRV and TXT.
+  svc.awaiting_confirm = Some(AwaitingConfirm::Response(
+    respond::EmittedRecords::new(
+      true,
+      false,
+      false,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      true,
+    ),
+    0,
+  ));
+  svc.note_delivery(t0, TransmitDelivery::ALL);
+
+  assert!(
+    svc.goodbye.ptr,
+    "precondition: goodbye ownership DOES count the shared PTR — a peer caches \
+     it from us and it must be withdrawn"
+  );
+  assert!(
+    !svc.generation_advertised,
+    "…but a shared PTR claims no instance name, so this generation has \
+     advertised nothing"
+  );
+
+  // The consequence, which is the whole point: a winning proposal is still
+  // adjudicated.
+  let bytes = srv_txt_proposal(9999);
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    svc.tiebreak_lost,
+    "a service that has put no instance-owned record on the wire is still \
+     pre-authoritative, so §8.2 still governs it"
+  );
+}
+
+// ── R10 finding 1: §8.1 defers to an existing owner of ANY type ────────
+
+/// R10 finding 1: an existing owner's A record at our instance name is a
+/// conflicting RESPONSE for a name we are probing, and §8.1 defers to it.
+///
+/// "If any conflicting Multicast DNS response is received, then the probing host
+/// MUST defer to the existing host" — and the name we are probing is asked about
+/// as type ANY, so every type at it is ours to defend or to lose. Screening the
+/// conflict down to SRV/TXT let this service finish probing and announce over a
+/// peer that already held the name.
+#[test]
+fn a_response_of_any_type_at_our_instance_name_defeats_the_probe() {
+  let mut svc = make_service(120);
+  let start = probe_once(&mut svc, FakeInstant::zero());
+
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_a_record_ref(&mut buf, PROBED_NAME, 120, [10, 0, 0, 7]);
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+
+  assert!(
+    svc.probe_defeated,
+    "an existing owner's A record at the name we are probing is a conflicting \
+     response, whatever type it happens to be"
+  );
+}
+
+/// R13 finding 2. A malformed record at the probed name must not rename us, and
+/// the reason it used to is that two consumers disagreed about the same bytes.
+///
+/// Conflict routing widened from SRV/TXT to every positive-TTL IN record at the
+/// probed name, because §8.1's question is type ANY — which made an NS at that
+/// name reachable for the first time. The identity path then raw-copied unparsed
+/// rdata and always succeeded, so a compression pointer that resolves to nothing
+/// canonicalized to two bytes, compared unequal to the nothing we assert for NS,
+/// and became `Different` — an §8.1 defeat. The §8.2 path decompressed the same
+/// record, failed, and abandoned. One decoder later, both answer "undecodable".
+///
+/// The attack this closes costs one datagram and needs no knowledge of the
+/// victim's records at all.
+#[test]
+fn a_malformed_record_at_the_probed_name_is_not_a_conflict() {
+  // An NS record whose whole rdata is a compression pointer targeting its own
+  // offset — forward, so it resolves to nothing. `rdata_view` yields
+  // `Rdata::Other` and succeeds; only the decode discovers it.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    buf.push(u8::try_from(label.len()).unwrap());
+    buf.extend_from_slice(label.as_bytes());
+  }
+  buf.push(0u8);
+  buf.extend_from_slice(&2u16.to_be_bytes()); // TYPE NS
+  buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  buf.extend_from_slice(&120u32.to_be_bytes());
+  buf.extend_from_slice(&2u16.to_be_bytes()); // RDLENGTH = 2
+  let rdata_at = u16::try_from(buf.len()).unwrap();
+  buf.extend_from_slice(&(0xC000u16 | rdata_at).to_be_bytes());
+
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  assert!(
+    rec.rdata_view().is_ok(),
+    "precondition: this record PARSES — the divergence was never about parsing"
+  );
+
+  let mut svc = make_service(120);
+  let start = probe_once(&mut svc, FakeInstant::zero());
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+  assert!(
+    !svc.probe_defeated,
+    "a record nobody can decode supports no conclusion, so it must reach \
+     neither the §8.1 deferral nor the §9 revert"
+  );
+}
+
+/// R10 finding 1, the other half: widening the types must not make a
+/// byte-identical TWIN a conflict.
+///
+/// `write_announce` and `write_response` both ride an instance NSEC in the
+/// Additional section (RFC 6762 §6.1), so a proxy or fault-tolerance twin — the
+/// case §9 names as the reason for the identical-rdata rule — sends the same
+/// NSEC we do. With SRV and TXT correctly screened out as identical, that NSEC
+/// alone would otherwise have renamed us.
+#[test]
+fn an_identical_twins_instance_nsec_is_never_a_conflict() {
+  let mut svc = make_service(120);
+  let start = probe_once(&mut svc, FakeInstant::zero());
+
+  // The NSEC this service itself emits: owner name as next_name, bitmap
+  // asserting exactly {SRV, TXT}.
+  let mut msg = [0u8; 512];
+  let inst = Name::try_from_str(PROBED_NAME).unwrap();
+  let mut b =
+    crate::wire::MessageBuilder::<'_, 32>::try_new(&mut msg, crate::wire::Header::new()).unwrap();
+  b.push_nsec_additional(&inst, 120, &respond::INSTANCE_NSEC_TYPES, true)
+    .unwrap();
+  let n = b.finish().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
+  let rec = reader.additional().flatten().next().unwrap();
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+  assert!(
+    !svc.probe_defeated,
+    "identical rdata is never a conflict (§9), and our own instance NSEC is \
+     exactly what a byte-identical twin sends"
+  );
+}
+
+/// R13 finding 3, CONFLICT SIDE ONLY. A conforming twin's CORRECT NSEC must not
+/// rename us just because ours is wrong.
+///
+/// When the host name IS the instance name, `write_probe` and `write_announce`
+/// put this service's A/AAAA records under the instance name too, so the
+/// complete RRset at that name is `{A, AAAA, SRV, TXT}` — and a conforming
+/// responder's §6.1 NSEC asserts exactly that. Ours asserts `{SRV, TXT}`,
+/// denying address records we ourselves emit. THAT defect is in NSEC generation,
+/// predates this branch, and is filed against `main`: fixing it changes the wire
+/// for every same-name deployment.
+///
+/// Its consequence here does not get to wait, because it is a rename. A correct
+/// twin's correct bitmap differs from our incorrect one, and differing rdata at a
+/// name we are probing is an RFC 6762 §8.1 defeat — so the twin the
+/// identical-rdata rule exists to protect would take our name from us for being
+/// right.
+#[test]
+fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name() {
+  use crate::wire::ResourceType;
+
+  let shared = Name::try_from_str(PROBED_NAME).unwrap();
+  let mut records = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    shared.clone(),
+    shared.clone(),
+    631,
+    120,
+  );
+  records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+  records.add_aaaa(core::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::try_new(
+      ServiceHandle::from_raw(0),
+      records,
+      FakeInstant::zero(),
+      [0u8; 32],
+      true,
+    );
+  let start = probe_once(&mut svc, FakeInstant::zero());
+
+  let nsec_record = |types: &[u16], buf: &mut [u8; 512]| -> std::vec::Vec<u8> {
+    let mut b =
+      crate::wire::MessageBuilder::<'_, 32>::try_new(buf, crate::wire::Header::new()).unwrap();
+    b.push_nsec_additional(&shared, 120, types, true).unwrap();
+    let n = b.finish().unwrap();
+    buf.get(..n).unwrap().to_vec()
+  };
+
+  // The bitmap a CONFORMING responder publishes for this name.
+  let mut buf = [0u8; 512];
+  let conforming = nsec_record(
+    &[
+      ResourceType::A.to_u16(),
+      ResourceType::AAAA.to_u16(),
+      ResourceType::Srv.to_u16(),
+      ResourceType::Txt.to_u16(),
+    ],
+    &mut buf,
+  );
+  let reader = crate::wire::MessageReader::try_parse(&conforming).unwrap();
+  let rec = reader.additional().flatten().next().unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+  assert!(
+    !svc.probe_defeated,
+    "a twin that correctly asserts {{A, AAAA, SRV, TXT}} at a name that really \
+     holds all four is indistinguishable from us, however our own NSEC spells it"
+  );
+
+  // And the leniency stays narrow: a bitmap that is neither what we emit nor
+  // what a conforming responder would emit here is still a conflict.
+  let mut buf2 = [0u8; 512];
+  let foreign = nsec_record(&[ResourceType::Ptr.to_u16()], &mut buf2);
+  let reader2 = crate::wire::MessageReader::try_parse(&foreign).unwrap();
+  let rec2 = reader2.additional().flatten().next().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec2, dg(2))),
+    start,
+  );
+  assert!(
+    svc.probe_defeated,
+    "an NSEC asserting an RRset that is not ours is another owner answering for \
+     our name"
+  );
+}
+
+/// The duplication `respond::our_nsec_identities` warns about, pinned.
+///
+/// It reconstructs the RFC 4034 §4.1.2 type bitmap that
+/// `MessageBuilder::push_nsec_additional` writes, because the builder works
+/// through a fixed cursor with no allocator and cannot be reused. If either side
+/// changes without the other, our own NSEC stops being recognisable as ours and
+/// a twin's copy of it renames us.
+#[test]
+fn our_nsec_identities_match_what_the_builder_emits() {
+  let svc = make_service(120);
+  let mut msg = [0u8; 512];
+  let inst = Name::try_from_str(PROBED_NAME).unwrap();
+  let mut b =
+    crate::wire::MessageBuilder::<'_, 32>::try_new(&mut msg, crate::wire::Header::new()).unwrap();
+  b.push_nsec_additional(&inst, 120, &respond::INSTANCE_NSEC_TYPES, true)
+    .unwrap();
+  let n = b.finish().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
+  let rec = reader.additional().flatten().next().unwrap();
+  let on_the_wire = rec.canonical_rdata_folded().unwrap();
+  let recognised = respond::our_nsec_identities(svc.records());
+  assert!(
+    recognised.iter().any(|f| f.as_slice() == &*on_the_wire),
+    "the reconstructed instance-NSEC identity must be among the forms we \
+     recognise as ours; the builder emits {on_the_wire:?}, we recognise \
+     {recognised:?}"
+  );
+}
+
+// ── the reader property the fold relies on ──
+
+/// The reader property the fold depends on, pinned rather than asserted in a
+/// comment: a question section that will not parse leaves the authority section
+/// UNLOCATABLE, so no authority record is surfaced at all.
+///
+/// `service::proposal::adjudicate` has no separate "abandon on an unreadable
+/// question section" arm, and that is only safe if this holds. If it did not,
+/// a record admitted by a question parsing BEFORE a broken one would be folded
+/// while the rest of the section went unseen — silently shortening the peer's
+/// list. §8.2.1 walks the two sorted lists pairwise, so an omission changes which
+/// elements meet and can decide the round in either direction, over a list the
+/// peer never sent.
+#[test]
+fn an_unparseable_question_section_surfaces_no_authority_records() {
+  let (txt, srv) = winning_pair();
+  let mut bytes = raw_proposal_bytes(&[txt, srv]);
+  // An OVERSTATED QDCOUNT. Question one is perfectly readable; the rest are
+  // parsed off the authority records' bytes and then run off the end of the
+  // datagram, so the question section stops parsing partway. That ordering is
+  // the whole point — a reader that surfaced records anyway would surface the
+  // ones question one admits and silently drop whatever lay past the failure.
+  //
+  // Overstating the count is the only way to get there, and that is itself worth
+  // recording: a question whose NAME is an unresolvable compression pointer does
+  // NOT break section location, because `QuestionRef::try_parse` consumes the
+  // two pointer bytes without following them. Such a question is still
+  // fail-closed at the fold — `names_match` walks the labels, the walk errors,
+  // and the question admits nothing — but it is not this case.
+  bytes[5] = 8;
+  let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+  assert!(
+    reader.questions().any(|q| q.is_err()),
+    "precondition: the question section really does fail to parse"
+  );
+  assert_eq!(
+    reader.authority().count(),
+    0,
+    "an unlocatable authority section must surface NO records — the fold relies \
+     on this instead of carrying its own abandonment arm for the case"
+  );
+
+  // …and therefore the proposal records no verdict, though its records would
+  // otherwise have taken the round (see `the_winning_pair_control_really_does_lose_the_round`).
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a datagram whose question section will not parse yields no §8.2 verdict"
+  );
+}
+
+/// ABANDONMENT IS BEHAVIOURALLY IDENTICAL TO `WeHold`. Two services in the same
+/// state, one handed a proposal the fold abandons and one handed a proposal it
+/// resolves in our favour, are indistinguishable from that point on — same
+/// state, same name, same deadlines, same bytes on the wire.
+///
+/// This is an equivalence other code RELIES on, not a curiosity.
+/// `RouteEvents::authority_proposes_for` withholds a `ProbeProposal` it cannot
+/// read instead of delivering one the fold would only abandon, and that is sound
+/// exactly because delivering-then-abandoning and never-delivering leave the
+/// `Service` in the same place. §8.2.1 resolves a contest between two lists; a
+/// section that is not a list it can sort resolves nothing, and "nothing" is what
+/// a host that has not lost its round does next.
+///
+/// So if `Verdict::Abandoned` ever becomes a yield — a deferral, a rename, a
+/// backoff — this test fails FIRST, and the router's fail-closed disposition on
+/// the proposal path has to be revisited with it.
+///
+/// The abandoning fixture is built so a regression is loud rather than quiet: its
+/// readable subset is `winning_pair`, which
+/// `the_winning_pair_control_really_does_lose_the_round` proves takes the round
+/// outright. A fold that skipped the undecodable record instead of abandoning
+/// would defer this service, and the two sides would diverge on the first
+/// comparison below.
+#[test]
+fn an_abandoned_proposal_behaves_exactly_like_we_hold() {
+  use crate::service::proposal::{Abandon, Verdict, adjudicate};
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+
+  // A peer proposal §8.2.1 resolves in our favour: SRV port 1 sorts before our
+  // 631, and the TXTs tie.
+  let holds = srv_txt_proposal(1);
+  // The same winning pair the control fixture uses, plus a third record whose
+  // owner name is a pointer to its own offset: §8.2 requires "*all* the records
+  // and proposed rdata", and this section cannot be read to that standard.
+  let (txt, srv) = winning_pair();
+  let at = first_record_offset(PROBED_NAME) + txt.len() + srv.len();
+  let mut cyclic = std::vec::Vec::new();
+  make_cyclic_owner_record(&mut cyclic, at, 1, 120, &[10, 0, 0, 7]);
+  let abandons = raw_proposal_bytes(&[txt, srv, cyclic]);
+
+  // PRECONDITION: the two datagrams really do reach the two different terminal
+  // values. Without this the comparison below could pass by comparing a verdict
+  // against itself.
+  let records = make_records(120);
+  assert_eq!(
+    adjudicate(&probe_proposal(&holds, peer, dg(1)), &records),
+    Verdict::WeHold,
+    "precondition: the peer's SRV port 1 sorts before our 631"
+  );
+  assert_eq!(
+    adjudicate(&probe_proposal(&abandons, peer, dg(1)), &records),
+    Verdict::Abandoned(Abandon::UndecodableOwnerName),
+    "precondition: an owner name that will not decode abandons the proposal"
+  );
+
+  let t0 = FakeInstant::zero();
+  let mut held = make_service(120);
+  let mut abandoned = make_service(120);
+  held.handle_timeout(t0).unwrap();
+  abandoned.handle_timeout(t0).unwrap();
+
+  held.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&holds, peer, dg(1))),
+    t0,
+  );
+  abandoned.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&abandons, peer, dg(1))),
+    t0,
+  );
+
+  // The two §8.1/§8.2 latches, the lifecycle state, the name, and the next
+  // deadline — everything the event could have moved.
+  assert_eq!(
+    (
+      abandoned.tiebreak_lost,
+      abandoned.probe_defeated,
+      abandoned.state(),
+      abandoned.name().as_str(),
+      abandoned.poll_timeout(),
+    ),
+    (
+      held.tiebreak_lost,
+      held.probe_defeated,
+      held.state(),
+      held.name().as_str(),
+      held.poll_timeout(),
+    ),
+    "an abandonment must leave the service exactly where a WeHold leaves it"
+  );
+
+  // …and it stays identical through the rest of the §8.1 sequence, byte for
+  // byte. Both services were seeded identically, so any divergence in jitter,
+  // deadlines or emitted records shows up here.
+  let mut held_buf = std::vec![0u8; 4096];
+  let mut abandoned_buf = std::vec![0u8; 4096];
+  let mut now = t0;
+  for tick in 0..20 {
+    now = now.advance(500);
+    held.handle_timeout(now).unwrap();
+    abandoned.handle_timeout(now).unwrap();
+    let h = held.poll_transmit(now, &mut held_buf).unwrap();
+    let a = abandoned.poll_transmit(now, &mut abandoned_buf).unwrap();
+    assert_eq!(
+      h.map(|t| t.size()),
+      a.map(|t| t.size()),
+      "tick {tick}: the two services must transmit the same datagram or neither"
+    );
+    if let Some(tx) = h {
+      assert_eq!(
+        abandoned_buf.get(..tx.size()),
+        held_buf.get(..tx.size()),
+        "tick {tick}: byte-for-byte identical datagrams"
+      );
+      held.note_delivery(now, TransmitDelivery::ALL);
+      abandoned.note_delivery(now, TransmitDelivery::ALL);
+    }
+    assert_eq!(
+      (abandoned.state(), abandoned.name().as_str()),
+      (held.state(), held.name().as_str()),
+      "tick {tick}: the two services must stay in lockstep"
+    );
+  }
+  assert_eq!(
+    held.state(),
+    ServiceState::Established,
+    "the control really did carry on and establish, so the lockstep above is \
+     over a sequence that goes somewhere"
+  );
+}
+
+// ── R11: nothing undecodable produces a verdict ────────────────────────
+
+/// R11-1: a KX(36) whose compressed target cannot be resolved must ABANDON the
+/// proposal, not lengthen the peer's list.
+///
+/// The guard was an enumeration of compression-eligible types and it omitted
+/// RP(17), AFSDB(18), RT(21), PX(26) and KX(36). So a KX raw-copied into
+/// comparison bytes: with otherwise identical SRV and TXT the extra element made
+/// the peer's list longer, §8.2.1's "the list with records remaining is deemed to
+/// have won" handed it the round, and a peer repeating that packet could defer
+/// this host past every probe it ever schedules — establishment prevented
+/// indefinitely by a malformed proposal.
+///
+/// The type is no longer consulted: the rdata holds a `0xC0` octet, so it might
+/// be a compression pointer, so it has no position-independent comparison bytes.
+#[test]
+fn a_compressed_kx_abandons_rather_than_lengthening_the_peers_list() {
+  // Every type the old enumeration missed, so a re-narrowing to any list fails
+  // here rather than only for the one type a fixture happened to pick.
+  for rtype in [36u16, 17, 18, 21, 26] {
+    let mut svc = make_service(120);
+    let t0 = FakeInstant::zero();
+    svc.handle_timeout(t0).unwrap();
+
+    // A TIE on SRV and TXT, so the round turns entirely on the third record.
+    let mut txt = std::vec::Vec::new();
+    make_txt_record_ref(&mut txt, PROBED_NAME, 120, &[&[]]);
+    let mut srv = std::vec::Vec::new();
+    make_srv_record_ref(&mut srv, PROBED_NAME, 120, 0, 0, 631, "host.local.");
+    let mut exotic = std::vec::Vec::new();
+    for label in PROBED_NAME.trim_end_matches('.').split('.') {
+      #[allow(clippy::cast_possible_truncation)]
+      exotic.push(label.len() as u8);
+      exotic.extend_from_slice(label.as_bytes());
+    }
+    exotic.push(0u8);
+    exotic.extend_from_slice(&rtype.to_be_bytes());
+    exotic.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+    exotic.extend_from_slice(&120u32.to_be_bytes());
+    // preference(2) + a compressed target pointing past the end of the datagram,
+    // so it cannot be resolved. UNRESOLVABLE is the point: since R12 these types
+    // are decompressed and COMPARED when their names resolve, so a resolvable
+    // pointer would (correctly) make the peer's longer list win rather than
+    // abandon. See `comparability_of_unparsed_rdata_is_a_per_type_question`.
+    exotic.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+    exotic.extend_from_slice(&[0x00, 0x0A, 0xFF, 0xFF]);
+    let bytes = raw_proposal_bytes(&[txt, srv, exotic]);
+
+    let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+    svc.handle_event(
+      ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+      t0,
+    );
+    assert!(
+      !svc.tiebreak_lost,
+      "type {rtype}: a record whose rdata may hold a compression pointer has no \
+       comparison bytes, so the proposal is ABANDONED — it must not be scored as \
+       a third record that wins §8.2.1 on list length"
+    );
+  }
+}
+
+/// R11-2: a question whose QNAME is an unresolvable compression pointer makes
+/// the whole proposal undecodable, even when ANOTHER question admits.
+///
+/// This is the case the section-location property does NOT cover, and the two
+/// statements have to be read together. A question section that will not PARSE
+/// leaves the authority section unlocatable, so nothing is folded. But
+/// `QuestionRef::try_parse` consumes a compression pointer WITHOUT following it,
+/// so a pointer-named question parses, the section is locatable, and the records
+/// are surfaced — and `.flatten()` then dropped the error and read the bad
+/// question as a non-match, letting the good one admit and the fold return a
+/// verdict.
+///
+/// The valid question is placed FIRST on purpose: admission now walks the whole
+/// section instead of stopping at the first match, so ordering cannot hide it.
+#[test]
+fn a_pointer_named_question_abandons_even_when_another_question_admits() {
+  let (txt, srv) = winning_pair();
+  let good = raw_proposal_bytes(&[txt, srv]);
+  let qlen = first_record_offset(PROBED_NAME) - 12;
+
+  let mut bytes: std::vec::Vec<u8> = std::vec::Vec::new();
+  bytes.extend_from_slice(&good[..12]);
+  bytes[5] = 2; // QDCOUNT = 2
+  bytes.extend_from_slice(&good[12..12 + qlen]); // question 1: valid, ANY, admits
+  // question 2: QNAME is a pointer to its own offset, so following it cycles.
+  let q2_at = 12 + qlen;
+  #[allow(clippy::cast_possible_truncation)]
+  bytes.extend_from_slice(&[0xC0 | ((q2_at >> 8) as u8), q2_at as u8]);
+  bytes.extend_from_slice(&crate::wire::ResourceType::Any.to_u16().to_be_bytes());
+  bytes.extend_from_slice(&1u16.to_be_bytes());
+  bytes.extend_from_slice(&good[12 + qlen..]); // the winning authority pair
+
+  // Precondition: the section really does PARSE — this is not the unlocatable
+  // case — and the records really are surfaced, so the fold does run.
+  let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+  assert!(
+    reader.questions().all(|q| q.is_ok()),
+    "precondition: a pointer QNAME parses; only walking its labels fails"
+  );
+  assert_eq!(
+    reader.authority().count(),
+    2,
+    "precondition: the authority section is locatable and its records are surfaced"
+  );
+
+  let mut svc = make_service(120);
+  let t0 = FakeInstant::zero();
+  svc.handle_timeout(t0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    t0,
+  );
+  assert!(
+    !svc.tiebreak_lost,
+    "a question section holding a name that will not decode leaves what the \
+     query ASKS unknown, so the proposal is abandoned — the readable question \
+     must not adjudicate it alone (control: \
+     `the_winning_pair_control_really_does_lose_the_round`)"
+  );
+}
+
+/// R12-2: a malformed authoritative RESPONSE must not defeat the probe.
+///
+/// `response_rdata_is_ours` returned a plain `bool`, so a parse or
+/// canonicalisation failure came back as `false` — which dispatch read as
+/// DIFFERING rdata. A QR=1 IN/SRV response whose target is a cyclic or
+/// forward-pointing name therefore set `probe_defeated` and renamed the service,
+/// and repeating it gave unbounded suffix churn and finally a terminal conflict.
+/// An attacker needed one malformed record and no knowledge of our rdata.
+///
+/// Invalid is now its own answer and stops before every conflict arm — which is
+/// what the ESTABLISHED §9 path already did with the same data, so the two
+/// halves of one rule had disagreed.
+#[test]
+fn a_malformed_response_does_not_defeat_the_probe() {
+  let mut svc = make_service(120);
+  let start = probe_once(&mut svc, FakeInstant::zero());
+  let before = svc.name().as_str().to_owned();
+
+  // An SRV at our instance name whose target is a compression pointer past the
+  // end of the datagram: it parses as a record, and only resolving the name
+  // fails.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in PROBED_NAME.trim_end_matches('.').split('.') {
+    #[allow(clippy::cast_possible_truncation)]
+    buf.push(label.len() as u8);
+    buf.extend_from_slice(label.as_bytes());
+  }
+  buf.push(0u8);
+  buf.extend_from_slice(&33u16.to_be_bytes()); // SRV
+  buf.extend_from_slice(&1u16.to_be_bytes()); // IN
+  buf.extend_from_slice(&120u32.to_be_bytes());
+  buf.extend_from_slice(&8u16.to_be_bytes()); // RDLENGTH
+  buf.extend_from_slice(&[0, 0, 0, 0, 0x27, 0x0F, 0xFF, 0xFF]); // …target unresolvable
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    start,
+  );
+
+  assert!(
+    !svc.probe_defeated,
+    "rdata that will not decode supports no conclusion — it must not be read as \
+     DIFFERING rdata and latch an §8.1 defeat"
+  );
+  let spent = start.advance(500);
+  svc.handle_timeout(spent).unwrap();
+  assert_eq!(
+    svc.name().as_str(),
+    before,
+    "…and so the service must not rename: repeating this record would otherwise \
+     give unbounded suffix churn on one malformed packet"
+  );
+  let mut updates = std::vec::Vec::new();
+  while let Some(u) = svc.poll() {
+    updates.push(u);
+  }
+  assert!(
+    !updates.iter().any(ServiceUpdate::is_renamed),
+    "…and queue no Renamed update; got {updates:?}"
+  );
 }

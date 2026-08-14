@@ -49,6 +49,23 @@ impl EndpointConfig {
   }
 
   /// Whether to answer incoming questions for registered services.
+  ///
+  /// # A probe for a name we own is answered either way
+  ///
+  /// Disabling this suppresses DISCOVERY: browse and resolve questions, the
+  /// shared service-type PTR, and the RFC 6763 §9 meta-query. It does NOT
+  /// suppress the RFC 6762 §8.1 defence of a unique name this endpoint has
+  /// already claimed — "when a device receives a probe query for a name that it
+  /// is currently using, it SHOULD generate its response to defend that name
+  /// immediately". A probe query (QR=0, proposed records in the Authority
+  /// Section, from port 5353) naming a registered service's INSTANCE or HOST
+  /// name still reaches that service.
+  ///
+  /// Without that exemption a passive endpoint answers nothing, a conforming
+  /// peer's probe goes unanswered, and the peer completes probing and claims the
+  /// name the endpoint is still advertising — two owners, no resolution. Passive
+  /// mode opts out of answering queries, not out of owning the names it
+  /// advertises.
   #[inline(always)]
   pub const fn answer_questions(&self) -> bool {
     self.answer_questions
@@ -68,6 +85,9 @@ impl EndpointConfig {
   }
 
   /// Set whether to answer incoming questions for registered services.
+  ///
+  /// See [`Self::answer_questions`]: `false` suppresses discovery, not the
+  /// RFC 6762 §8.1 defence of an already-claimed unique name.
   #[must_use]
   pub const fn with_answer_questions(mut self, v: bool) -> Self {
     self.answer_questions = v;

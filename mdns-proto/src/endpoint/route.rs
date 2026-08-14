@@ -58,6 +58,12 @@ where
   /// extracted from QUERY packets (QR=0); response packets must not poison
   /// the KAS ring.
   pub(crate) is_response: bool,
+  /// Identifies THIS datagram, stamped on every conflict it raises so a
+  /// service keeps one query's proposal separate from the next. See
+  /// [`DatagramId`].
+  pub(crate) datagram: crate::event::DatagramId,
+  /// Cursor for the one-proposal-per-service fan-out of `AuthorityProposals`.
+  pub(crate) proposal_service_cursor: Option<usize>,
   pub(crate) question_idx: u16,
   /// Per-question service cursor: the slab key from which to resume iterating
   /// services for the current question. Allows ALL matching services to receive
@@ -144,6 +150,9 @@ where
 pub(crate) enum Section {
   Questions,
   Answers,
+  /// QR=0 only: one whole §8.2 proposal per matching service, before the
+  /// per-record authority fan-out below.
+  AuthorityProposals,
   Authority,
   Additional,
   Done,
@@ -160,7 +169,7 @@ where
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
 {
-  /// the ONE conflict-routing decision for a QR=1 record `r`,
+  /// the ONE conflict-routing decision for a record `r`,
   /// shared by the Answers, Authority, and Additional sections (previously
   /// triplicated). Scans registered services from slab key `start` and returns
   /// the next `(key, event)`:
@@ -168,13 +177,216 @@ where
   ///     RRset; service-type / shared names are never conflicts);
   ///   * host-name match + A/AAAA → HostConflict.
   ///
+  /// `origin` is the caller's witness for HOW `r` arrived, and it is a
+  /// parameter rather than something inferred here because only the caller
+  /// knows: this helper sees one record and cannot tell an Authority-section
+  /// proposal from an Answer-section assertion. It rides on the `ProbeConflict`
+  /// so `Service` can apply §8.2's tiebreak to a peer's tentative probe and
+  /// §8.1/§9 to a peer's response — different rules over different inputs. See
+  /// [`ConflictOrigin`].
+  ///
   /// conflicts are only routed for class-IN records — a record with
   /// class ANY or an unknown class is not the same-class RRset RFC 6762 §9
   /// requires, so it must not drive rename / host-conflict surfacing.
+  /// Does this datagram's Authority Section carry at least one record proposing
+  /// something about `name`? A §8.2 proposal is only worth delivering if it
+  /// proposes something about a name we own.
+  ///
+  /// # Every type, because the probe asks ANY
+  ///
+  /// EVERY positive-TTL IN record at the name counts, not just SRV/TXT. The
+  /// uniqueness question a probe asks is type ANY, so the peer's proposed list —
+  /// the one §8.2.1 sorts against ours — is everything it puts at that name.
+  /// Filtering to SRV/TXT here made a peer proposing only an AAAA invisible:
+  /// that peer folds our SRV/TXT into its own comparison, finds its AAAA sorts
+  /// later, and continues as the winner, while this endpoint receives no
+  /// `ProbeProposal` at all and also continues. Two conforming peers, one name,
+  /// and duplicate ownership — the outcome the whole mechanism exists to
+  /// prevent, invisible unless the peer proposes a type we do not.
+  ///
+  /// The SRV/TXT restriction survives only where it is actually the rule: RFC
+  /// 6762 §9's post-establishment conflict, which `Service` applies to the
+  /// unique RRset it is authoritative for.
+  ///
+  /// # …but only what the query ASKS about
+  ///
+  /// §8.1 defines a probe as a query "with the record name in question in the
+  /// Question Section", and §8.2 reads the proposal off "the Authority Section
+  /// of *that query*". An Authority Section read without its questions is not a
+  /// proposal at all: a QDCOUNT=0 packet, or one asking about an unrelated name,
+  /// would trigger §8.2 on any authority record that happens to mention a name
+  /// of ours — records it never proposed, and a free one-second deferral on
+  /// demand.
+  ///
+  /// "Asks about" is the QUESTION'S NAME and class, never its QTYPE. §8.2
+  /// requires the Authority Section to carry "*all* the records and proposed
+  /// rdata being probed for uniqueness", so it is the sender's complete
+  /// proposal, and narrowing it by the sender's own QTYPE compares a list that
+  /// host never made — see [`question_is_about`].
+  ///
+  /// # One predicate, one home
+  ///
+  /// Both halves above are [`ProposalScope`], USED rather than restated —
+  /// `service::proposal::adjudicate` scopes the fold with the same type over the
+  /// same records, so the two layers cannot answer differently. Spelling the rule
+  /// out twice is exactly what produced the SRV/TXT defect: the fold's copy was
+  /// corrected and this one was left, and a peer proposing a type we do not
+  /// publish went unseen by a whole endpoint while it considered itself the
+  /// winner.
+  ///
+  /// The invariant that buys — ROUTING OVER-APPROXIMATES VERDICTS: if the fold
+  /// would reach `PeerWins` or `WeHold` for a datagram, a `ProbeProposal` was
+  /// routed for it. Non-verdicts need not be delivered. Pinned by
+  /// `routing_over_approximates_what_the_fold_adjudicates`, which drives
+  /// `Endpoint::handle` and `service::proposal::adjudicate` over the SAME
+  /// constructed datagrams rather than trusting two spellings to agree.
+  ///
+  /// # …and it fails CLOSED, unlike [`Self::is_probe_for`]
+  ///
+  /// Undecodable bytes answer NO here. Nothing is lost by that, because the only
+  /// terminal value the fold has for such a datagram is `Verdict::Abandoned`,
+  /// and an abandonment is behaviourally identical to `WeHold` — it traces and
+  /// changes nothing. So not delivering and delivering-then-abandoning are
+  /// indistinguishable to the `Service`, and withholding a whole proposal decides
+  /// no more than abandoning it does.
+  ///
+  /// What it avoids is an amplification primitive. A QR=0, port-5353, QDCOUNT=0
+  /// packet carrying one truncated declared authority record would otherwise be
+  /// routed as a proposal to EVERY registered service: `AuthorityProposals`
+  /// restarts the service iterator on each `next()`, so the fan-out costs Θ(N²)
+  /// slab visits, and every pre-authoritative service then allocates and sorts
+  /// its own proposal before the fold dies on that same record. Roughly thirty
+  /// bytes of spoofable link-local traffic buys all of it.
+  ///
+  /// `Verdict::Abandoned` being a non-yield is what makes this equivalence hold,
+  /// and it is pinned by `an_abandoned_proposal_behaves_exactly_like_we_hold`. If
+  /// abandonment ever becomes a yield, this disposition must be revisited.
+  fn authority_proposes_for(&self, name: &crate::Name) -> bool {
+    // ONE scope for the whole section: the question section decides scope by
+    // owner name and class, which does not vary with the record, so it is read
+    // at most once here instead of once per authority record.
+    let mut scope = ProposalScope::new(|| self.reader.questions(), name);
+    for r in self.reader.authority() {
+      // A record that will not parse is not a readable proposal for `name`, and
+      // `Records` STOPS at its first error — so every record before it has
+      // already been tested and nothing readable follows. The section is decided.
+      let Ok(r) = r else {
+        return false;
+      };
+      // Exhaustive on purpose: `Admission` has no arm meaning "ours, but skip",
+      // so a record admitted here is one the fold folds.
+      match scope.admits(&r) {
+        Ok(Admission::Ours) => return true,
+        Ok(Admission::NotOurs(_)) => continue,
+        // Scope is undecidable for the whole datagram, so no later record can
+        // answer differently; the fold's only terminal value here is an
+        // abandonment, which changes nothing.
+        Err(QuestionsUnreadable) => return false,
+      }
+    }
+    false
+  }
+
+  /// Is this datagram a probe for `name` — a query actually PROPOSING to take
+  /// it, rather than one merely asking about it?
+  ///
+  /// The RFC 6762 §8.1 defence gate under `answer_questions(false)`. §8.2
+  /// defines the probe by what it carries: "each host populates the query
+  /// message's Authority Section with the record or records with the rdata that
+  /// it would be proposing to use". So the exemption a passive endpoint grants
+  /// is owed to a datagram that carries such a record FOR THE QUESTIONED NAME —
+  /// not to any datagram that merely declares a nonzero NSCOUNT, and not to a
+  /// discovery query that happens to carry an unrelated Authority record. Either
+  /// of those would walk a normal query past the suppression boundary that
+  /// configuration exists to draw, and out to the service response path.
+  ///
+  /// [`ProposalScope`] again, so the record this asks for is exactly the record
+  /// §8.2 adjudication would fold: owner name and class IN, in the scope of a
+  /// question this query asked. The scope's name is the one the question matched,
+  /// which is why the gate is per question and service rather than per datagram —
+  /// a peer probing our host name proposes nothing about our instance name.
+  ///
+  /// # …and it OVER-approximates, unlike [`Self::authority_proposes_for`]
+  ///
+  /// The two gates answer an unreadable Question Section oppositely because what
+  /// they release is opposite, and this is the one that must say YES.
+  ///
+  /// It is not on the verdict path at all. What it releases is a §8.1 DEFENCE of
+  /// a name this endpoint has already established — "a host that is not currently
+  /// probing … MUST … defend" — against a datagram that is already probe-shaped
+  /// at that name in class IN, since `QuestionsUnreadable` is only reachable
+  /// after a record has matched `name` in class IN. Failing closed here would let
+  /// a prober whose Question Section will not read take an advertised name from a
+  /// passive endpoint, purely because the endpoint could not read the section.
+  /// §8.1 makes defending a name in use a duty this configuration has not opted
+  /// out of.
+  ///
+  /// The other direction has no such cost: withholding a whole `ProbeProposal`
+  /// decides nothing, exactly as abandoning one decides nothing, so the proposal
+  /// gate is free to fail closed. A RECORD that will not parse is still NO here —
+  /// the exemption is owed to a record that reads, not to a nonzero NSCOUNT.
+  fn is_probe_for(&self, name: &crate::Name) -> bool {
+    let mut scope = ProposalScope::new(|| self.reader.questions(), name);
+    for r in self.reader.authority() {
+      // A record that will not parse is not a proposed record. `Records` stops
+      // at its first error, so nothing follows it either.
+      let Ok(r) = r else {
+        return false;
+      };
+      // `names_match_record` is already false for an owner name that will not
+      // decode, but the requirement is stated where it is required: the
+      // exemption is owed to a record that is fully readable, not to one whose
+      // owner merely might have been ours.
+      if !name_fully_decodes(r.name()) {
+        continue;
+      }
+      match scope.admits(&r) {
+        // FAIL-OPEN, and deliberately: see above. An undecidable Question
+        // Section must not cost an established name its §8.1 defence.
+        Ok(Admission::Ours) | Err(QuestionsUnreadable) => return true,
+        Ok(Admission::NotOurs(_)) => continue,
+      }
+    }
+    false
+  }
+
+  /// The HOST half of the conflict fan-out, for the QR=0 authority path whose
+  /// INSTANCE half is delivered whole as a [`ProbeProposal`] instead.
+  fn next_host_conflict(
+    &self,
+    r: &crate::wire::Ref<'a>,
+    start: usize,
+    origin: ConflictOrigin,
+  ) -> Option<(usize, RouteEvent<'a>)> {
+    if r.rclass() != ResourceClass::In {
+      return None;
+    }
+    for (key, route) in self.endpoint.services.iter() {
+      if key < start {
+        continue;
+      }
+      #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+      if route.withdrawing {
+        continue;
+      }
+      if names_match_record(route.host(), r) && is_host_conflict_rtype(r.rtype()) {
+        return Some((
+          key,
+          RouteEvent::ToService(ToService::new(
+            route.handle(),
+            ServiceEvent::HostConflict(HostConflict::new(*r, origin)),
+          )),
+        ));
+      }
+    }
+    None
+  }
+
   fn next_service_conflict(
     &self,
     r: &crate::wire::Ref<'a>,
     start: usize,
+    origin: ConflictOrigin,
   ) -> Option<(usize, RouteEvent<'a>)> {
     if r.rclass() != ResourceClass::In {
       return None;
@@ -194,21 +406,41 @@ where
       if route.withdrawing {
         continue;
       }
-      if names_match_record(route.name(), r) && is_instance_conflict_rtype(r.rtype()) {
-        return Some((
-          key,
-          RouteEvent::ToService(ToService::new(
-            route.handle(),
-            ServiceEvent::ProbeConflict(ProbeConflict::new(self.src, *r)),
-          )),
-        ));
-      }
+      // HOST first, INSTANCE second — the reverse of the old order, and only
+      // observable when one service's instance and host names are the SAME
+      // name. The instance test below no longer screens by rtype, so leading
+      // with it would swallow an A/AAAA that the host test owns and turn a
+      // `HostConflict` into a `ProbeConflict`. Testing the narrower rule first
+      // keeps every A/AAAA-at-the-host-name decision byte-identical to before
+      // and confines the widening to records only the instance test claims.
       if names_match_record(route.host(), r) && is_host_conflict_rtype(r.rtype()) {
         return Some((
           key,
           RouteEvent::ToService(ToService::new(
             route.handle(),
-            ServiceEvent::HostConflict(HostConflict::new(*r)),
+            ServiceEvent::HostConflict(HostConflict::new(*r, origin)),
+          )),
+        ));
+      }
+      // EVERY type at the instance name, not just SRV/TXT. A probing host owes
+      // §8.1 a deferral on "any conflicting Multicast DNS response" for a name
+      // it is probing, and the name it is probing is asked about as type ANY —
+      // so an existing owner's A, AAAA or NSEC at that name is a response
+      // claiming our tentative name just as much as its SRV is. Screening
+      // those out here let this service finish probing and announce over a peer
+      // that already holds the name.
+      //
+      // Widening is safe because the narrowing lives where the narrow rule is
+      // true: §9's post-establishment arm in `Service::handle_event` tests
+      // SRV/TXT itself before reverting an ESTABLISHED service to probing, so
+      // an extra type reaching an established service is dropped there. What
+      // reaches a PRE-authoritative one is §8.1's input, which is every type.
+      if names_match_record(route.name(), r) {
+        return Some((
+          key,
+          RouteEvent::ToService(ToService::new(
+            route.handle(),
+            ServiceEvent::ProbeConflict(ProbeConflict::new(self.src, *r, self.datagram)),
           )),
         ));
       }
@@ -250,7 +482,38 @@ where
           // `ServiceEvent::Question` events fire at all, so registered
           // services never schedule responses to inbound queries.
           // This is the "advertise but don't respond" / passive mode.
-          if !self.endpoint.config.answer_questions() {
+          //
+          // ONE exception, and it is not discovery: defending a unique name this
+          // endpoint has already claimed. RFC 6762 §8.1 puts that on the
+          // responder as a duty — "it is important that when a device receives a
+          // probe query for a name that it is currently using, it SHOULD
+          // generate its response to defend that name immediately" — and it is
+          // the only thing that stops a conforming prober taking an advertised
+          // name. Passive mode opts out of ANSWERING QUERIES, not out of owning
+          // the names it advertises; without this a peer's probe went unanswered
+          // and the peer completed probing and claimed the name.
+          //
+          // The exemption is drawn as narrowly as the duty: a probe is a QUERY
+          // (QR=0) carrying its proposed records in the Authority Section (§8.2
+          // requires them there), from a real Multicast DNS peer on port 5353 —
+          // an ephemeral-port sender is an off-path artifact, and admitting one
+          // would make passive endpoints answer on demand. Only the UNIQUE names
+          // are defended below; a probe naming the shared service type is not a
+          // uniqueness probe and stays suppressed.
+          //
+          // What the header says is only the CHEAP half of that, and on its own
+          // it is not the rule: a nonzero NSCOUNT is a claim about the datagram,
+          // not a proposed record in it. The half that decides is
+          // `Self::is_probe_for`, applied per question and service below,
+          // against the name the question actually matched. It is split this way
+          // so an ordinary datagram — every datagram, on an endpoint that
+          // answers nothing — leaves at the header test without either section
+          // being walked.
+          let defence_only = !self.endpoint.config.answer_questions();
+          let could_be_a_probe = !self.is_response
+            && self.reader.header().authority_count() > 0
+            && self.src.port() == crate::constants::MDNS_PORT;
+          if defence_only && !could_be_a_probe {
             self.section = Section::Answers;
             continue;
           }
@@ -283,6 +546,11 @@ where
           // receive a ServiceEvent::Question for this question before we move on.
           let cursor = self.service_cursor;
           let mut found: Option<(usize, RouteEvent<'a>)> = None;
+          // The §8.1 defence gate's answer for THIS question, taken at most once.
+          // Every route reached below matched on a name equal to this question's
+          // own QNAME, so the Authority Section proposes for one of them exactly
+          // when it proposes for all of them.
+          let mut is_a_probe: Option<bool> = None;
           for (key, route) in self.endpoint.services.iter() {
             if key < cursor {
               continue;
@@ -295,9 +563,35 @@ where
             if route.withdrawing {
               continue;
             }
-            if names_match(route.name(), q.qname())
-              || names_match(route.service_type(), q.qname())
-              || names_match(route.host(), q.qname())
+            // The UNIQUE names this route owns, and the only ones a §8.1
+            // defence covers — which is all `defence_only` mode routes.
+            let questioned_unique_name = if names_match(route.name(), q.qname()) {
+              Some(route.name())
+            } else if names_match(route.host(), q.qname()) {
+              Some(route.host())
+            } else {
+              None
+            };
+            let unique_name_match = match questioned_unique_name {
+              None => false,
+              // Answering is enabled, so the question routes on the name alone.
+              Some(_) if !defence_only => true,
+              // Passive: only a datagram that actually PROPOSES to take this
+              // name gets the §8.1 exemption. A discovery query carrying an
+              // unrelated Authority record, or one that only declares a nonzero
+              // NSCOUNT, is an ordinary query and stays suppressed.
+              Some(name) => match is_a_probe {
+                Some(known) => known,
+                None => {
+                  let probe = self.is_probe_for(name);
+                  is_a_probe = Some(probe);
+                  probe
+                }
+              },
+            };
+            if unique_name_match
+              || (!defence_only
+                && (names_match(route.service_type(), q.qname())
               || route
                 .subtypes
                 .iter()
@@ -313,7 +607,7 @@ where
               // of one type emitting the identical meta-PTR is benign (receivers
               // dedup the identical RR); true per-type dedup would require
               // state-aware, cross-service handling at the driver layer.
-              || is_meta_query_name(q.qname())
+              || is_meta_query_name(q.qname())))
             {
               found = Some((
                 key,
@@ -345,7 +639,7 @@ where
         }
         Section::Answers => {
           if self.answer_idx >= self.reader.header().answer_count() {
-            self.section = Section::Authority;
+            self.section = Section::AuthorityProposals;
             continue;
           }
           let mut ans = self.reader.answers();
@@ -361,11 +655,11 @@ where
               // parse_errors was already bumped in the eager walk in
               // Endpoint::handle (which covers answers AND additionals);
               // do NOT bump it here to avoid double-counting.
-              self.section = Section::Authority;
+              self.section = Section::AuthorityProposals;
               return Some(Err(HandleError::Parse(e)));
             }
             None => {
-              self.section = Section::Authority;
+              self.section = Section::AuthorityProposals;
               continue;
             }
           };
@@ -419,8 +713,10 @@ where
             let next_event = if self.is_response {
               // QR=1: ProbeConflict / HostConflict via the shared conflict
               // helper (name + rtype + class gates). Service-type (shared)
-              // names are never conflicts.
-              self.next_service_conflict(&r, start)
+              // names are never conflicts. An ANSWER-section record of a
+              // response is a peer asserting a name it owns, so it carries
+              // `AuthoritativeResponse` — §8.1 and §9's input, never §8.2's.
+              self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse)
             } else {
               // QR=0: records are KAS hints. ANY name match (instance / host /
               // service-type) emits a KnownAnswer for suppression — conflicts
@@ -517,6 +813,55 @@ where
           self.answer_query_cursor = None;
           continue;
         }
+        Section::AuthorityProposals => {
+          // RFC 6762 §8.2's tiebreak input is a whole query: "it consults the
+          // Authority Section of that query", which §8.2 requires to "contain
+          // *all* the records and proposed rdata being probed for uniqueness".
+          // So the proposal is delivered ONCE per (datagram, service), whole —
+          // never record by record, which would make a partial list
+          // representable and let a service adjudicate a proposal the peer has
+          // not finished making.
+          //
+          // QR=0 only: an authority record on a QR=1 response is not a
+          // proposal, and falls through to the per-record arm below as a
+          // response. The source-port gate is the same trust boundary that arm
+          // documents — a genuine prober multicasts from 5353.
+          if self.is_response || self.src.port() != crate::constants::MDNS_PORT {
+            self.section = Section::Authority;
+            continue;
+          }
+          let start = self.proposal_service_cursor.unwrap_or(0);
+          let mut found: Option<(usize, RouteEvent<'a>)> = None;
+          for (key, route) in self.endpoint.services.iter() {
+            if key < start {
+              continue;
+            }
+            #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+            if route.withdrawing {
+              continue;
+            }
+            if self.authority_proposes_for(route.name()) {
+              found = Some((
+                key,
+                RouteEvent::ToService(ToService::new(
+                  route.handle(),
+                  ServiceEvent::ProbeProposal(ProbeProposal::new(
+                    self.src,
+                    self.reader,
+                    self.datagram,
+                  )),
+                )),
+              ));
+              break;
+            }
+          }
+          if let Some((key, ev)) = found {
+            self.proposal_service_cursor = Some(key.saturating_add(1));
+            return Some(Ok(ev));
+          }
+          self.section = Section::Authority;
+          continue;
+        }
         Section::Authority => {
           // authority-section records are tentative-probe claims
           // (RFC 6762 §8.2) — a peer asserting ownership of a name. Routing
@@ -583,8 +928,24 @@ where
           // same name — route as ProbeConflict / HostConflict to EVERY matching
           // service (multiple services can share a host) via the shared
           // conflict helper (name + rtype + class gates centralized there).
+          //
+          // The QR bit is what makes it §8.2's input or not. §8.2 consults "the
+          // Authority Section of that QUERY", so only QR=0 carries a tentative
+          // proposal. An authority record riding on a QR=1 response is not a
+          // proposal at all — it comes from a host that is answering, not
+          // probing — so it is classed with the responses.
+          //
+          // The INSTANCE half of a QR=0 section was already delivered whole by
+          // `AuthorityProposals` above, so this fan-out is host-only there. A
+          // QR=1 authority record is a response and keeps the full per-record
+          // treatment.
           let start = self.authority_service_cursor.unwrap_or(0);
-          if let Some((key, ev)) = self.next_service_conflict(&r, start) {
+          let next = if self.is_response {
+            self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse)
+          } else {
+            self.next_host_conflict(&r, start, ConflictOrigin::TentativeProbe)
+          };
+          if let Some((key, ev)) = next {
             self.authority_service_cursor = Some(key.saturating_add(1));
             return Some(Ok(ev));
           }
@@ -644,7 +1005,12 @@ where
           // service-type (shared) matches are never conflicts.
           if !self.additional_service_done {
             let start = self.additional_service_cursor.unwrap_or(0);
-            if let Some((key, ev)) = self.next_service_conflict(&r, start) {
+            // This arm is QR=1 only (the `!self.is_response` guard above
+            // returns), so an additional here is a supplementary ANSWER — a
+            // peer asserting a name it owns, never a §8.2 proposal.
+            if let Some((key, ev)) =
+              self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse)
+            {
               self.additional_service_cursor = Some(key.saturating_add(1));
               return Some(Ok(ev));
             }

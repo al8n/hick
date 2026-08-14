@@ -57,10 +57,27 @@ const RESOLVE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Register `spec` on `ep` and pump it until the service is advertised.
 ///
-/// `Renamed` counts: it means probing finished and the service is advertised
-/// under a rebranded instance label, which every assertion here tolerates
-/// because it matches on the service-type suffix rather than the label. This
-/// wait is timer-driven, so it resolves without depending on cross-socket
+/// # `Renamed` does NOT count
+///
+/// It once did, on the claim that it "means probing finished and the service is
+/// advertised under a rebranded instance label". That is false in both halves.
+/// `ServiceUpdate::Renamed` is emitted at the rename DECISION, and that decision
+/// sends the service back to `Init` to probe the new label from scratch — see
+/// `mdns-proto`'s own state table (`service/mod.rs`, the `AwaitingConfirm`
+/// lifecycle table: "§8.2 tiebreak → rename (`Init`) … `lifecycle_deadline` =
+/// fresh probe") and the test that pins it,
+/// `renamed_update_means_probing_restarted_not_advertised`. At the instant
+/// `Renamed` arrives the new name has not been probed once, so nothing is
+/// announced and no peer can resolve it.
+///
+/// Returning here on `Renamed` therefore handed every caller a responder that
+/// was still probing, and made the `packets_tx > 0` assertion below claim
+/// something the endpoint had not yet done. A rename is still tolerated — every
+/// assertion in this file matches on the service-type suffix rather than the
+/// label, so a service that renames and then announces resolves normally — it
+/// just is not the event that says so. `Established` is.
+///
+/// This wait is timer-driven, so it resolves without depending on cross-socket
 /// **delivery** — but it does depend on the probes reaching the wire at all,
 /// which is the one environmental cause of a failure here.
 ///
@@ -83,7 +100,7 @@ fn advertise(ep: &mut common::Endpoint<'_>, spec: hick_mio::ServiceSpec) -> bool
       matches!(
         e,
         Event::Service {
-          update: ServiceUpdate::Established | ServiceUpdate::Renamed(_),
+          update: ServiceUpdate::Established,
           ..
         }
       )
@@ -92,9 +109,9 @@ fn advertise(ep: &mut common::Endpoint<'_>, spec: hick_mio::ServiceSpec) -> bool
   if !advertised {
     assert!(
       !ep.saw_own_loopback(),
-      "{}: the service never reached Established or Renamed in {ADVERTISE_BUDGET:?}, yet this \
-       endpoint ingested its own multicast loopback copies — the probes did reach the wire, so \
-       probing, announcing or ServiceUpdate emission has regressed",
+      "{}: the service never reached Established in {ADVERTISE_BUDGET:?}, yet this endpoint \
+       ingested its own multicast loopback copies — the probes did reach the wire, so probing, \
+       announcing or ServiceUpdate emission has regressed",
       ep.label
     );
     eprintln!(
@@ -105,9 +122,9 @@ fn advertise(ep: &mut common::Endpoint<'_>, spec: hick_mio::ServiceSpec) -> bool
     );
   } else {
     // A relationship that holds on every host, unlike a family count or a
-    // `sent` literal: reaching Established/Renamed means at least one real
-    // `send_to` already succeeded on this endpoint's own socket (the probes
-    // and the announcement), so packets_tx/bytes_tx must have risen. Shared by
+    // `sent` literal: reaching Established means at least one real `send_to`
+    // already succeeded on this endpoint's own socket (the probes and the
+    // announcement), so packets_tx/bytes_tx must have risen. Shared by
     // every test in this file that calls `advertise`, so each one doubles as a
     // regression guard for the tx-side counters, which once stayed at zero no
     // matter how much a responder sent.
@@ -122,6 +139,18 @@ fn advertise(ep: &mut common::Endpoint<'_>, spec: hick_mio::ServiceSpec) -> bool
       assert!(
         s.bytes_tx > 0,
         "{}: advertised successfully, so bytes_tx must be > 0, not 0",
+        ep.label
+      );
+      // The counter half of the predicate above, and the one that catches a
+      // widening of it: `services_established` is bumped only at the
+      // `Announcing → Established` transition, so any future edit that lets this
+      // helper return on a mid-lifecycle update — `Renamed` is the one it used
+      // to return on — reports "advertised" with this still at zero.
+      assert!(
+        s.services_established > 0,
+        "{}: advertised means the §8.3 announcement sequence COMPLETED, so \
+         services_established must be > 0, not 0 — this helper returned on an \
+         update that does not mean the service is advertised",
         ep.label
       );
     }
@@ -202,6 +231,116 @@ fn two_endpoints_register_browse_and_resolve() {
     entry.host().as_str().eq_ignore_ascii_case(HOST),
     "wrong host: {}",
     entry.host()
+  );
+}
+
+/// Two endpoints probe the SAME instance name at the same time with DIFFERENT
+/// SRV rdata: RFC 6762 §8.2's simultaneous-probe race, with a real winner.
+///
+/// The only place in this suite where `ServiceUpdate::Renamed` is produced
+/// against real sockets, and therefore the only place its meaning is observable
+/// rather than asserted in a state machine. It is emitted at the rename
+/// DECISION, with the loser back in `Init` probing a label it has never put on
+/// the wire, so it strictly PRECEDES the `Established` that says the service is
+/// advertised. That ordering is the whole reason [`advertise`] waits for
+/// `Established` and treats `Renamed` as "keep waiting".
+///
+/// The port is the only difference between the two proposed record sets, so
+/// §8.2's bytewise comparison of the sorted sets turns on it alone: 9090
+/// (0x2382) is lexicographically later than 8090 (0x1F9A), so the 8090 side
+/// loses. Byte-identical sets would be §8.2.1's "there is, in fact, no conflict"
+/// and neither side would rename — which is why the two ports differ here.
+#[test]
+fn a_lost_probe_tiebreak_rebrands_before_it_establishes() {
+  const SERVICE: &str = "_hick-mio-tie._tcp.local.";
+  const INSTANCE: &str = "contested._hick-mio-tie._tcp.local.";
+  const HOST: &str = "hick-mio-tie-host.local.";
+  const LOSER_PORT: u16 = 8090;
+  const WINNER_PORT: u16 = 9090;
+
+  fn is_renamed(e: &Event) -> bool {
+    matches!(
+      e,
+      Event::Service {
+        update: ServiceUpdate::Renamed(_),
+        ..
+      }
+    )
+  }
+  fn is_established(e: &Event) -> bool {
+    matches!(
+      e,
+      Event::Service {
+        update: ServiceUpdate::Established,
+        ..
+      }
+    )
+  }
+
+  let lock = common::bind_lock();
+  let Some(mut loser) = common::endpoint(&lock, "loser") else {
+    return;
+  };
+  let Some(mut winner) = common::endpoint(&lock, "winner") else {
+    return;
+  };
+
+  loser
+    .mdns
+    .register_service(common::service_spec(SERVICE, INSTANCE, HOST, LOSER_PORT))
+    .expect("register_service (loser)");
+  winner
+    .mdns
+    .register_service(common::service_spec(SERVICE, INSTANCE, HOST, WINNER_PORT))
+    .expect("register_service (winner)");
+
+  let rebranded = common::pump_pair(&mut loser, &mut winner, ADVERTISE_BUDGET, |loser, _| {
+    loser.seen.iter().any(is_renamed)
+  });
+  if !rebranded {
+    if !loser.saw_peer_answers() {
+      eprintln!(
+        "skipping: the loser ingested no peer record in {ADVERTISE_BUDGET:?}: this environment \
+         binds and joins the loopback group but does not deliver across it, so the two \
+         responders never see each other's records and there is no tiebreak to lose"
+      );
+      return;
+    }
+    panic!(
+      "the {LOSER_PORT} side must lose the §8.2 tiebreak to {WINNER_PORT} and rebrand; the \
+       records did cross the group, so the tiebreak or the rename has regressed"
+    );
+  }
+
+  // The claim the `advertise` helper rests on, checked on the event log rather
+  // than on a clock, so no timing can make it pass by accident: nothing said
+  // this service was advertised BEFORE it announced it had rebranded.
+  let renamed_at = loser
+    .seen
+    .iter()
+    .position(is_renamed)
+    .expect("the rename was just observed");
+  assert!(
+    !loser.seen[..renamed_at].iter().any(is_established),
+    "Renamed is emitted at the rename decision, with the new label not yet probed — so it \
+     cannot be preceded by the Established that means advertised"
+  );
+
+  // …and the rebranded label goes on to finish its own §8.1 probe sequence and
+  // announce, which is the event `advertise` returns on.
+  let established = common::pump_pair(&mut loser, &mut winner, ADVERTISE_BUDGET, |loser, _| {
+    loser.seen.iter().any(is_established)
+  });
+  assert!(
+    established,
+    "the rebranded label must complete probing and announcing within \
+     {ADVERTISE_BUDGET:?}; the rename already proved the records cross the group"
+  );
+  #[cfg(feature = "stats")]
+  assert!(
+    loser.mdns.stats().services_established > 0,
+    "the counter half of the same fact: Established is bumped only at the \
+     Announcing → Established transition, never at a rename"
   );
 }
 

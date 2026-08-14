@@ -311,16 +311,27 @@ fn build_probe_authority_for_host(buf: &mut [u8; 512], host_str: &str) -> usize 
   b.finish().unwrap()
 }
 
-/// Helper: encode a probe message with an SRV record in the authority section
-/// for `name`. Use for INSTANCE-name conflicts. The endpoint gates ProbeConflict
-/// to the instance's unique RRset (SRV/TXT), so an A record owned by the
-/// instance name is no longer a conflict.
+/// Helper: encode a PROBE for `instance_str` — the §8.1 ANY question plus an SRV
+/// record in the authority section. Use for INSTANCE-name conflicts.
+///
+/// The question is not decoration: §8.1 defines a probe as "a query with the
+/// record name in question in the Question Section" (§5.4 sets the
+/// unicast-response bit on it), and §8.2 reads the proposal off "the Authority
+/// Section of *that query*". A QDCOUNT=0 packet proposes nothing, so building
+/// one here asserted the routing of a datagram no prober sends.
 fn build_probe_srv_authority(buf: &mut [u8; 512], instance_str: &str) -> usize {
   use crate::wire::{Header, MessageBuilder};
   let hdr = Header::new();
   let mut b = MessageBuilder::<'_, 32>::try_new(buf, hdr).unwrap();
   let name = Name::try_from_str(instance_str).unwrap();
   let target = Name::try_from_str("other-host.local.").unwrap();
+  b.push_question(
+    &name,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
   b.push_srv_authority(&name, 120, 0, 0, 8080, &target)
     .unwrap();
   b.finish().unwrap()
@@ -387,9 +398,11 @@ fn host_question_routes_to_service() {
 // ── authority-section HostConflict vs ProbeConflict routing ────
 
 /// A probe authority record matching the instance name must route as
-/// ProbeConflict (triggers auto-rename in Service).
+/// ProbeProposal — the peer is PROBING, so RFC 6762 §8.2's tiebreak is what
+/// governs it, and its input is that query's whole Authority Section.
+/// `ProbeConflict` is now responses only.
 #[test]
-fn authority_instance_name_routes_as_probe_conflict() {
+fn authority_instance_name_routes_as_probe_proposal() {
   use crate::event::RouteEvent;
   use core::net::SocketAddr;
 
@@ -401,33 +414,28 @@ fn authority_instance_name_routes_as_probe_conflict() {
   let n = build_probe_srv_authority(&mut buf, "Printer._ipp._tcp.local.");
   let data = &buf[..n];
 
-  let mut events = e
+  // A probe routes TWO things to the owner of the name, and both are §8.1's:
+  // the QUESTION it must defend the name by answering, and the §8.2 PROPOSAL
+  // its Authority Section makes. The question is routed first (Question Section
+  // precedes Authority), so this scans rather than taking the head.
+  let proposal_handle = e
     .handle(StdInstant::now(), src, local_ip, 0, data, false)
-    .unwrap();
-  let ev = events
-    .next()
-    .expect("expected at least one routing event")
-    .expect("expected Ok");
-
-  match ev {
-    RouteEvent::ToService(ts) => {
-      assert_eq!(ts.handle(), expected_handle);
-      assert!(
-        ts.event().is_probe_conflict(),
-        "expected ProbeConflict for an instance-name authority record, got {:?}",
-        ts.event()
-      );
-    }
-    other => panic!(
-      "expected RouteEvent::ToService(ProbeConflict), got {:?}",
-      other
-    ),
-  }
+    .unwrap()
+    .filter_map(|ev| match ev.expect("expected Ok") {
+      RouteEvent::ToService(ts) if ts.event().is_probe_proposal() => Some(ts.handle()),
+      _ => None,
+    })
+    .next();
+  assert_eq!(
+    proposal_handle,
+    Some(expected_handle),
+    "an instance-name authority record on a probe must route as a ProbeProposal to that service"
+  );
 }
 
 /// the SAME probe-shaped authority record that triggers a
 /// ProbeConflict from port 5353 (see
-/// `authority_instance_name_routes_as_probe_conflict`) must NOT route as any
+/// `authority_instance_name_routes_as_probe_proposal`) must NOT route as any
 /// conflict when it arrives from an EPHEMERAL source port. Authority records
 /// are tentative-probe claims trusted only from a real mDNS peer (port 5353);
 /// an off-path / forged ephemeral-port packet must not force our rename.
@@ -748,7 +756,7 @@ fn non_in_class_record_does_not_route_conflict() {
 /// suppression), NEVER ProbeConflict.  Treating a QR=0 answer as a
 /// conflict signal would let a hostile querier trigger our auto-rename
 /// trivially.  Real probe-time conflicts arrive in the AUTHORITY
-/// section (peer probes); see `authority_instance_name_routes_as_probe_conflict`.
+/// section (peer probes); see `authority_instance_name_routes_as_probe_proposal`.
 #[test]
 fn query_answer_for_instance_name_emits_known_answer_only() {
   use crate::wire::{
@@ -1216,24 +1224,18 @@ fn self_packet_does_not_route_as_probe_conflict() {
   // MUST still emit ProbeConflict — proves suppression is driven by the
   // flag, not a broken routing path.
   let peer_src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 55), 5353));
-  let mut peer_events = e
+  // The probe's own §8.1 question routes ahead of its §8.2 proposal, so scan.
+  let saw_proposal = e
     .handle(StdInstant::now(), peer_src, local_ip, 0, data, false)
-    .unwrap();
-  let ev = peer_events
-    .next()
-    .expect("control: foreign-source probe MUST still produce a routing event")
-    .expect("control: routing event must be Ok");
-  match ev {
-    RouteEvent::ToService(ts) => assert!(
-      ts.event().is_probe_conflict(),
-      "control: foreign-source probe must still emit ProbeConflict; got {:?}",
-      ts.event()
-    ),
-    other => panic!(
-      "control: expected RouteEvent::ToService(ProbeConflict), got {:?}",
-      other
-    ),
-  }
+    .unwrap()
+    .any(|ev| match ev.expect("control: routing event must be Ok") {
+      RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
+      _ => false,
+    });
+  assert!(
+    saw_proposal,
+    "control: foreign-source probe must still emit ProbeProposal"
+  );
 }
 
 /// self-packet guard must also suppress cache population.  A
@@ -1398,6 +1400,15 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   let hdr = Header::new();
   let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
     MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  // §8.1's question, which is what makes this a probe (see
+  // `build_probe_srv_authority`).
+  b.push_question(
+    &inst,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
   b.push_srv_authority(
     &inst,
     120,
@@ -1430,22 +1441,18 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   // and not some other suppression.
   let peer_v6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0099);
   let peer_src: SocketAddr = SocketAddr::from((peer_v6, 5353));
-  let mut peer_events = e.handle(now, peer_src, local_ip, 0, data, false).unwrap();
-  let ev = peer_events
-    .next()
-    .expect("control: foreign IPv6 probe MUST still produce a routing event")
-    .expect("control: routing event must be Ok");
-  match ev {
-    RouteEvent::ToService(ts) => assert!(
-      ts.event().is_probe_conflict(),
-      "control: foreign IPv6 probe must still emit ProbeConflict; got {:?}",
-      ts.event()
-    ),
-    other => panic!(
-      "control: expected RouteEvent::ToService(ProbeConflict), got {:?}",
-      other
-    ),
-  }
+  // The probe's §8.1 question routes ahead of its §8.2 proposal, so scan.
+  let saw_proposal = e
+    .handle(now, peer_src, local_ip, 0, data, false)
+    .unwrap()
+    .any(|ev| match ev.expect("control: routing event must be Ok") {
+      RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
+      _ => false,
+    });
+  assert!(
+    saw_proposal,
+    "control: foreign IPv6 probe must still emit ProbeProposal"
+  );
 }
 
 // ── terminal-then-cancel cleanup, no leak ───────────
@@ -3426,6 +3433,304 @@ fn answer_questions_false_suppresses_question_events() {
   );
 }
 
+/// `answer_questions=false` suppresses DISCOVERY, not the RFC 6762 §8.1 defence
+/// of a name this endpoint has already claimed.
+///
+/// §8.1 puts the defence on the responder as a duty: "it is important that when
+/// a device receives a probe query for a name that it is currently using, it
+/// SHOULD generate its response to defend that name immediately and send it as
+/// quickly as possible." Suppressing it leaves the prober unanswered, and §8.1's
+/// own next step is that an unanswered prober claims the name — so a passive
+/// endpoint would keep advertising a name a conforming peer has just taken, with
+/// nothing left to resolve it.
+///
+/// The exemption is drawn as narrowly as the duty. Each negative below is a way
+/// the exemption could be over-wide, and is asserted separately.
+#[test]
+fn answer_questions_false_still_defends_a_probed_unique_name() {
+  use core::net::SocketAddr;
+
+  use rand::SeedableRng;
+
+  use crate::{
+    config::ServiceSpec,
+    records::ServiceRecords,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceType},
+  };
+
+  const INSTANCE: &str = "WebServer._http._tcp.local.";
+  const SERVICE_TYPE: &str = "_http._tcp.local.";
+  const HOST: &str = "web.local.";
+
+  /// A peer's §8.1 probe: QR=0, a question for `qname`, and the proposed record
+  /// in the Authority Section (§8.2 requires it there). `with_authority` off
+  /// makes it an ordinary query instead, which is the discovery case.
+  fn probe_for(qname: &str, with_authority: bool, buf: &mut [u8; 512]) -> usize {
+    let name = Name::try_from_str(qname).unwrap();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(buf, Header::new()).unwrap();
+    b.push_question(
+      &name,
+      ResourceType::Any,
+      crate::wire::ResourceClass::In,
+      false,
+    )
+    .unwrap();
+    if with_authority {
+      let target = Name::try_from_str("rival-host.local.").unwrap();
+      b.push_srv_authority(&name, 120, 0, 0, 9999, &target).unwrap();
+    }
+    b.finish().unwrap()
+  }
+
+  let mut e = {
+    let rng = rand::rngs::StdRng::from_seed([9u8; 32]);
+    let cfg = EndpointConfig::new().with_answer_questions(false);
+    TestEndp::try_new(cfg, rng)
+  };
+  let now = StdInstant::now();
+  let recs = ServiceRecords::new(
+    Name::try_from_str(SERVICE_TYPE).unwrap(),
+    Name::try_from_str(INSTANCE).unwrap(),
+    Name::try_from_str(HOST).unwrap(),
+    80,
+    120,
+  );
+  let (_h, _svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let mdns_peer: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let mut questions_for = |qname: &str, with_authority: bool, src: SocketAddr| -> usize {
+    let mut buf = [0u8; 512];
+    let n = probe_for(qname, with_authority, &mut buf);
+    e.handle(now, src, local_ip, 0, &buf[..n], false)
+      .unwrap()
+      .map(Result::unwrap)
+      .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_question()))
+      .count()
+  };
+
+  assert_eq!(
+    questions_for(INSTANCE, true, mdns_peer),
+    1,
+    "a probe for our INSTANCE name must reach the service even with \
+     answer_questions=false: §8.1 requires defending a name we are using, and an \
+     unanswered prober claims it"
+  );
+  assert_eq!(
+    questions_for(HOST, true, mdns_peer),
+    1,
+    "and a probe for our HOST name likewise — it is the other unique name this \
+     service owns"
+  );
+  assert_eq!(
+    questions_for(SERVICE_TYPE, true, mdns_peer),
+    0,
+    "but NOT the shared service type: many responders own it, so a query naming \
+     it is discovery and not a uniqueness probe, however it is shaped"
+  );
+  assert_eq!(
+    questions_for(INSTANCE, false, mdns_peer),
+    0,
+    "and not an ordinary query for the same name: no Authority Section means the \
+     peer is asking about the name, not proposing to take it"
+  );
+  assert_eq!(
+    questions_for(INSTANCE, true, "192.168.1.77:40404".parse().unwrap()),
+    0,
+    "and not one from an ephemeral port: a real prober multicasts from 5353, and \
+     admitting an off-path sender would make passive endpoints answer on demand"
+  );
+}
+
+/// The §8.1 exemption is owed to a datagram that PROPOSES to take the questioned
+/// name — not to every QR=0 datagram whose header declares an Authority Section.
+///
+/// RFC 6762 §8.2 defines the probe by what it carries: "each host populates the
+/// query message's Authority Section with the record or records with the rdata
+/// that it would be proposing to use". A query carrying no such record for the
+/// name it asks about is an ordinary query however its NSCOUNT reads, and
+/// `answer_questions(false)` suppresses ordinary queries — so admitting one
+/// walks a discovery query out to the service response path and past the whole
+/// point of the configuration. A nonzero NSCOUNT costs an attacker two bytes.
+///
+/// # …but an unreadable QUESTION SECTION still releases the defence
+///
+/// The last case is the one that reads backwards and must not be "corrected".
+/// This gate OVER-approximates on an undecidable Question Section, unlike
+/// `RouteEvents::authority_proposes_for`, which fails closed. The two are not
+/// inconsistent: withholding a §8.2 proposal decides nothing, because the fold's
+/// only terminal value for a datagram it cannot read is an abandonment, and an
+/// abandonment changes nothing. Withholding a §8.1 DEFENCE is not symmetric —
+/// §8.1 requires a host that is not probing to defend a name it has established,
+/// and refusing here would let a prober whose questions will not read take an
+/// advertised name from a passive endpoint. `QuestionsUnreadable` is reachable
+/// only from a record already matched to the questioned name in class IN, so the
+/// datagram is probe-shaped before the question is asked.
+#[test]
+fn answer_questions_false_defends_only_against_a_real_proposal() {
+  use core::net::SocketAddr;
+
+  use rand::SeedableRng;
+
+  use crate::{
+    config::ServiceSpec,
+    records::ServiceRecords,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceType},
+  };
+
+  const INSTANCE: &str = "WebServer._http._tcp.local.";
+  const SERVICE_TYPE: &str = "_http._tcp.local.";
+  const HOST: &str = "web.local.";
+
+  // A QR=0 query asking about `qname`, with `authority_owner`'s SRV proposed (or
+  // nothing at all when it is `None`).
+  let query = |qname: &str, authority_owner: Option<&str>| -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let name = Name::try_from_str(qname).unwrap();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(
+      &name,
+      ResourceType::Any,
+      crate::wire::ResourceClass::In,
+      false,
+    )
+    .unwrap();
+    if let Some(owner) = authority_owner {
+      let owner = Name::try_from_str(owner).unwrap();
+      let target = Name::try_from_str("rival-host.local.").unwrap();
+      b.push_srv_authority(&owner, 120, 0, 0, 9999, &target).unwrap();
+    }
+    let n = b.finish().unwrap();
+    buf[..n].to_vec()
+  };
+
+  // The same query, but its Authority Section is a claim in the header and five
+  // bytes of rubbish on the wire.
+  let mut declared_only = query(INSTANCE, None);
+  declared_only[9] = 1; // NSCOUNT
+  declared_only.extend_from_slice(&[0x05, b'h', b'e', b'l', b'l']);
+
+  // A genuine probe for our instance name, with a SECOND question spliced in
+  // whose QNAME is a compression pointer to its own offset. `try_parse` consumes
+  // the two pointer bytes without following them, so the section still parses and
+  // the authority record is still surfaced — but the QNAME will not decode, so
+  // admission answers `QuestionsUnreadable` for the datagram.
+  let unreadable_questions = {
+    let good = query(INSTANCE, Some(INSTANCE));
+    let qlen = {
+      let mut k = 0usize;
+      for label in INSTANCE.trim_end_matches('.').split('.') {
+        k += 1 + label.len();
+      }
+      k + 1 + 4 // root terminator + QTYPE + QCLASS
+    };
+    let mut d: std::vec::Vec<u8> = std::vec::Vec::new();
+    d.extend_from_slice(&good[..12]);
+    d[5] = 2; // QDCOUNT 1 -> 2
+    d.extend_from_slice(&good[12..12 + qlen]);
+    let at = 12 + qlen;
+    #[allow(clippy::cast_possible_truncation)]
+    d.extend_from_slice(&[0xC0 | ((at >> 8) as u8), at as u8]);
+    d.extend_from_slice(&ResourceType::Any.to_u16().to_be_bytes());
+    d.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+    d.extend_from_slice(&good[12 + qlen..]);
+    d
+  };
+
+  let mut e = {
+    let rng = rand::rngs::StdRng::from_seed([11u8; 32]);
+    let cfg = EndpointConfig::new().with_answer_questions(false);
+    TestEndp::try_new(cfg, rng)
+  };
+  let now = StdInstant::now();
+  let recs = ServiceRecords::new(
+    Name::try_from_str(SERVICE_TYPE).unwrap(),
+    Name::try_from_str(INSTANCE).unwrap(),
+    Name::try_from_str(HOST).unwrap(),
+    80,
+    120,
+  );
+  let (_h, _svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let peer: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+  let mut questions_for = |datagram: &[u8]| -> usize {
+    // `filter_map` and not `unwrap`: the truncated-authority case below yields a
+    // parse error of its own, which is not what this fixture is measuring.
+    e.handle(now, peer, local_ip, 0, datagram, false)
+      .unwrap()
+      .filter_map(Result::ok)
+      .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_question()))
+      .count()
+  };
+
+  assert_eq!(
+    questions_for(&query(INSTANCE, Some(INSTANCE))),
+    1,
+    "CONTROL: a genuine probe for our instance name still gets its §8.1 defence, \
+     so every negative below is the gate and not the fixture"
+  );
+  assert_eq!(
+    questions_for(&query(INSTANCE, Some("printer._ipp._tcp.local."))),
+    0,
+    "an Authority record for somebody ELSE'S name proposes nothing about ours — \
+     the datagram is a discovery query with a passenger, and passive mode \
+     suppresses discovery"
+  );
+  assert_eq!(
+    questions_for(&query(INSTANCE, Some(HOST))),
+    0,
+    "and a proposal for our HOST name is not a proposal for our INSTANCE name: \
+     the gate is per questioned name, not per datagram"
+  );
+  assert_eq!(
+    questions_for(&declared_only),
+    0,
+    "a nonzero NSCOUNT is a claim about the datagram, not a proposed record in \
+     it — undecodable authority bytes must not buy a response out of an endpoint \
+     configured not to answer"
+  );
+  // PRECONDITION: the section really is undecidable, so the assertion below is
+  // about the gate's disposition and not about a datagram that reads fine.
+  {
+    let reader = crate::wire::MessageReader::try_parse(&unreadable_questions).unwrap();
+    assert!(
+      reader
+        .questions()
+        .any(|q| !crate::endpoint::name_fully_decodes(q.unwrap().qname())),
+      "precondition: one QNAME really does fail to decode"
+    );
+    assert_eq!(
+      reader.authority().filter(|r| r.is_ok()).count(),
+      1,
+      "precondition: the authority record is still surfaced, so the gate reaches \
+       the question section at all"
+    );
+  }
+  assert_eq!(
+    questions_for(&unreadable_questions),
+    1,
+    "FAIL-OPEN, deliberately: this gate releases a §8.1 defence of a name already \
+     established, against a datagram carrying a proposed record at that name in \
+     class IN. Failing closed on a Question Section that will not read would let \
+     a prober take an advertised name from a passive endpoint. The §8.2 proposal \
+     route answers the same input the opposite way because withholding a proposal \
+     decides nothing"
+  );
+}
+
 // ── authority-section host fan-out ───────────────────────────
 
 /// Multiple services can legitimately share a host name.  An authority
@@ -4000,6 +4305,15 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   let hdr = Header::new();
   let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
     MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  // §8.1's question, which is what makes this a probe (see
+  // `build_probe_srv_authority`).
+  b.push_question(
+    &inst,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
   b.push_srv_authority(
     &inst,
     120,
@@ -4026,23 +4340,19 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   // (2) Foreign peer on a different interface (ifindex=3) using the
   //     same numeric link-local.  This is the regression case — must
   //     route as ProbeConflict, not be silently dropped.
-  let mut peer_events = e.handle(now, self_src, local_ip, 3, data, false).unwrap();
-  let ev = peer_events
-    .next()
-    .expect("link-local from a DIFFERENT interface must still produce a routing event")
-    .expect("event must be Ok");
-  match ev {
-    RouteEvent::ToService(ts) => assert!(
-      ts.event().is_probe_conflict(),
-      "link-local from ifindex=3 must emit ProbeConflict (not be misclassified \
-         as self because of bare-address match); got {:?}",
-      ts.event()
-    ),
-    other => panic!(
-      "expected RouteEvent::ToService(ProbeConflict), got {:?}",
-      other
-    ),
-  }
+  // The probe's §8.1 question routes ahead of its §8.2 proposal, so scan.
+  let saw_proposal = e
+    .handle(now, self_src, local_ip, 3, data, false)
+    .unwrap()
+    .any(|ev| match ev.expect("event must be Ok") {
+      RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
+      _ => false,
+    });
+  assert!(
+    saw_proposal,
+    "link-local from ifindex=3 must emit ProbeProposal (not be misclassified \
+       as self because of bare-address match)"
+  );
 }
 
 // ── response answers fan out to all type-compatible routes ──
@@ -7221,11 +7531,20 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
     let n = b.finish().unwrap();
     buf[..n].to_vec()
   };
-  // A peer claiming our INSTANCE name with rival rdata → §9 ProbeConflict.
+  // A peer PROBING for our INSTANCE name with rival rdata → §8.2 ProbeProposal.
+  // The §8.1 question is what makes it a probe: without it the Authority Section
+  // proposes nothing and the datagram routes nowhere at all.
   let inst_pkt = {
     let target = Name::try_from_str("rival.local.").unwrap();
     let mut buf = [0u8; 512];
     let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(
+      &inst,
+      crate::wire::ResourceType::Any,
+      crate::wire::ResourceClass::In,
+      true,
+    )
+    .unwrap();
     b.push_srv_authority(&inst, 120, 0, 0, 9999, &target)
       .unwrap();
     let n = b.finish().unwrap();
@@ -8251,4 +8570,920 @@ fn a_zero_debt_family_report_is_masked() {
       invented.as_str()
     );
   }
+}
+
+// ── R10 finding 1: §8 conflict routing is not scoped to SRV/TXT ────────
+
+/// R10 finding 1: a peer PROBING our instance name with a type we do not
+/// publish must still deliver a `ProbeProposal`.
+///
+/// The uniqueness question a probe asks is type ANY, so the peer's proposed
+/// list — the one §8.2.1 sorts against ours — is everything it puts at that
+/// name. Requiring SRV or TXT here made a peer proposing only an AAAA invisible:
+/// that peer folds OUR SRV and TXT into its own comparison, finds its AAAA sorts
+/// later, and continues as the winner, while this endpoint receives no proposal
+/// at all and also continues. Two conforming peers, one name, and duplicate
+/// ownership — the outcome the whole mechanism exists to prevent.
+#[test]
+fn a_probe_proposing_only_an_aaaa_still_delivers_a_proposal() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+  b.push_question(
+    &inst,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
+  b.push_aaaa_authority(&inst, 120, Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))
+    .unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| {
+      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_proposal())
+    });
+  assert!(
+    saw,
+    "a probe proposing ONLY an AAAA at our instance name is still a §8.2 \
+     proposal — the probe's question is type ANY"
+  );
+}
+
+/// R10 finding 1: an existing owner's RESPONSE at our instance name routes a
+/// `ProbeConflict` whatever its type.
+///
+/// RFC 6762 §8.1 makes a probing host defer to "any conflicting Multicast DNS
+/// response" for a name it is probing, and the name is asked about as type ANY.
+/// Screening the route down to SRV/TXT dropped an existing owner's A, AAAA or
+/// NSEC on the floor and let this service announce over it.
+///
+/// The narrow SRV/TXT rule is §9's, and `Service` applies it there itself — this
+/// is only about what the ROUTER, which cannot see lifecycle state, delivers.
+#[test]
+fn a_response_of_any_type_at_our_instance_name_routes_a_conflict() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  b.push_a_answer(&inst, 120, Ipv4Addr::new(10, 0, 0, 7), true)
+    .unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| {
+      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_conflict())
+    });
+  assert!(
+    saw,
+    "an A record at our INSTANCE name on a response is a peer claiming a name \
+     we are probing — §8.1 must see it"
+  );
+}
+
+/// R10 finding 1: widening the instance route must not steal the HOST route.
+///
+/// The instance test no longer screens by rtype, so if a service's instance and
+/// host names were ever the same name, testing it first would swallow an A/AAAA
+/// the host rule owns and turn a `HostConflict` into a `ProbeConflict`. The host
+/// rule is therefore tested FIRST, and this pins that ordering for the ordinary
+/// case where the two names differ.
+#[test]
+fn a_host_address_response_still_routes_a_host_conflict() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, expected) = build_endpoint_with_printer();
+  let host = Name::try_from_str("printer-host.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  b.push_a_answer(&host, 120, Ipv4Addr::new(10, 0, 0, 8), true)
+    .unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| {
+      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_host_conflict())
+    });
+  assert!(
+    saw,
+    "an A at the HOST name is still a HostConflict — widening the instance rule \
+     must not take it"
+  );
+}
+
+/// R10 finding 5: an Authority Section with no matching QUESTION is not a
+/// proposal, so no `ProbeProposal` is routed.
+///
+/// §8.2 reads the proposal off "the Authority Section of *that query*". A
+/// QDCOUNT=0 packet asks nothing, so its authority records answer nothing —
+/// admitting them let any peer impose a one-second §8.2 deferral on demand.
+#[test]
+fn an_authority_section_with_no_question_routes_no_proposal() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, _expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+  let target = Name::try_from_str("other-host.local.").unwrap();
+  b.push_srv_authority(&inst, 120, 0, 0, 8080, &target).unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
+  assert!(
+    !saw,
+    "a QR=0 packet that asks no question proposes nothing, however its \
+     Authority Section is filled"
+  );
+}
+
+/// R10 finding 5: a query asking about ANOTHER name proposes nothing about
+/// ours, even when its Authority Section names ours.
+#[test]
+fn a_question_for_another_name_routes_no_proposal_for_ours() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, _expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let other = Name::try_from_str("Scanner._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+  b.push_question(
+    &other,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
+  let target = Name::try_from_str("other-host.local.").unwrap();
+  b.push_srv_authority(&inst, 120, 0, 0, 8080, &target).unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
+  assert!(
+    !saw,
+    "the query asks about Scanner, so its authority records are not a proposal \
+     for Printer"
+  );
+}
+
+/// A probe whose proposed records all carry TTL 0 is still a §8.2 proposal, so
+/// it is still delivered.
+///
+/// §8.2.1 orders the compared lists by class, then type, then rdata — the TTL is
+/// not among them, and §8.2 requires the Authority Section to hold "*all* the
+/// records and proposed rdata being probed for uniqueness". §10.1's goodbye
+/// encoding is a property of an unsolicited RESPONSE; a QR=0 probe's Authority
+/// Section is a claim whatever TTL it carries.
+///
+/// Withholding it here does not merely skip a record: it is what lets the fold
+/// compare a SHORTER peer list than the peer sent, while the peer compares our
+/// complete one. §8.2.1 sorts both lists and walks them pairwise, so removing an
+/// element changes WHICH elements meet — the two sides then answer differently,
+/// and not always in our favour (see `crate::endpoint::Admission`).
+///
+/// The per-record §8.1/§9 conflict route keeps its own TTL=0 guard, which
+/// `authority_ttl_zero_does_not_emit_conflict_events` pins: that path turns a
+/// peer's record into a rename, and a withdrawal must not.
+#[test]
+fn a_probe_proposing_a_ttl_zero_record_still_delivers_a_proposal() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+  b.push_question(
+    &inst,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
+  let target = Name::try_from_str("rival-host.local.").unwrap();
+  b.push_srv_authority(&inst, 0, 0, 0, 9999, &target).unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| {
+      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_proposal())
+    });
+  assert!(
+    saw,
+    "a TTL of 0 is not one of the fields §8.2.1 compares, so the record is in \
+     the peer's proposal and the proposal must reach the fold"
+  );
+}
+
+// ── the cross-layer invariant R10-1 broke ──────────────────────────────
+
+/// ROUTING OVER-APPROXIMATES VERDICTS: whenever the fold would reach
+/// `PeerWins` or `WeHold` for a service's name, the endpoint routed a
+/// `ProbeProposal` for that datagram.
+///
+/// The invariant is stated over VERDICTS, not over admission, because a verdict
+/// is the only thing delivery can change. §8.2.1's two outcomes move a
+/// `Service`: `PeerWins` loses the round, `WeHold` keeps it. `Abandoned` moves
+/// nothing — it traces and returns — so a datagram whose only terminal value is
+/// an abandonment is one the router may withhold, and withholding it decides
+/// exactly as much as abandoning it would (nothing). That equivalence is pinned
+/// separately by `an_abandoned_proposal_behaves_exactly_like_we_hold`; if it ever
+/// stops holding, `authority_proposes_for`'s fail-closed disposition has to be
+/// revisited and this test's statement with it.
+///
+/// It is deliberately an implication and not an equivalence in the other
+/// direction either: the router may deliver a proposal the fold then abandons.
+///
+/// The failure it exists for is mechanical drift. The two layers each spelled out
+/// `ttl != 0 && class == IN && the name matches && a question admits it`; the
+/// fold's copy was corrected to admit every RTYPE and the router's was left at
+/// SRV/TXT. Nothing failed, because every fixture drove ONE layer. A peer
+/// proposing only an AAAA then folded our records into its own comparison and
+/// continued as the winner while this endpoint, never handed the proposal, also
+/// continued — two conforming peers, one name.
+///
+/// So this drives `Endpoint::handle` and `service::proposal::adjudicate` over the
+/// SAME constructed datagrams. Layer two calls the real fold rather than
+/// re-deriving what it would admit, which is the part a shared predicate does not
+/// prove on its own.
+#[test]
+fn routing_over_approximates_what_the_fold_adjudicates() {
+  use crate::{
+    event::RouteEvent,
+    records::ServiceRecords,
+    wire::{Header, MessageBuilder, ResourceClass, ResourceType},
+  };
+  use core::net::SocketAddr;
+
+  const INSTANCE: &str = "Printer._ipp._tcp.local.";
+
+  fn srv_txt(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    let t = Name::try_from_str("other-host.local.").unwrap();
+    b.push_srv_authority(n, 120, 0, 0, 9999, &t).unwrap();
+    let segs: [&[u8]; 0] = [];
+    b.push_txt_authority(n, 120, segs).unwrap();
+  }
+  fn aaaa_only(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    b.push_aaaa_authority(n, 120, Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))
+      .unwrap();
+  }
+  fn a_only(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    b.push_a_authority(n, 120, Ipv4Addr::new(10, 0, 0, 9)).unwrap();
+  }
+  fn srv_only(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    let t = Name::try_from_str("other-host.local.").unwrap();
+    b.push_srv_authority(n, 120, 0, 0, 9999, &t).unwrap();
+  }
+  fn goodbye_srv(b: &mut MessageBuilder<'_, 32>, n: &Name) {
+    let t = Name::try_from_str("other-host.local.").unwrap();
+    b.push_srv_authority(n, 0, 0, 0, 9999, &t).unwrap();
+  }
+
+  /// One case: description, the question's name and QTYPE, and the authority
+  /// One case: description, whether the datagram is a §8.2 proposal for our
+  /// instance name AT ALL, the question's name and QTYPE, and the authority
+  /// records to push (all at the instance name).
+  ///
+  /// The second field is DECLARED GROUND TRUTH about the bytes, read off §8.1
+  /// and §8.2 by hand — never computed from the admission rule, which is one of
+  /// the two things this test is cross-checking. It is needed because
+  /// `adjudicate` overloads `WeHold`: §8.2.1's "there is, in fact, no conflict"
+  /// and "this query proposed nothing for me" are the same value, since a fold
+  /// that compared nothing cannot have records remaining. Only the first is a
+  /// verdict ABOUT something, and only the first has to be delivered.
+  type Case = (
+    &'static str,
+    bool,
+    &'static str,
+    ResourceType,
+    fn(&mut MessageBuilder<'_, 32>, &Name),
+  );
+  let cases: [Case; 7] = [
+    (
+      "the conforming probe: ANY question, SRV+TXT proposed",
+      true,
+      INSTANCE,
+      ResourceType::Any,
+      srv_txt,
+    ),
+    (
+      "ANY question, only an AAAA — a type we do not publish",
+      true,
+      INSTANCE,
+      ResourceType::Any,
+      aaaa_only,
+    ),
+    (
+      "ANY question, only an A",
+      true,
+      INSTANCE,
+      ResourceType::Any,
+      a_only,
+    ),
+    (
+      // §8.2 reads the proposal off "the Authority Section of *that query*", and
+      // this query asks about Scanner — so it proposes nothing about Printer,
+      // however its Authority Section is filled.
+      "a question for ANOTHER name, our name in the authority section",
+      false,
+      "Scanner._ipp._tcp.local.",
+      ResourceType::Any,
+      srv_txt,
+    ),
+    (
+      "a SPECIFIC qtype naming the proposed record's own type",
+      true,
+      INSTANCE,
+      ResourceType::Srv,
+      srv_only,
+    ),
+    (
+      "a SPECIFIC qtype naming NO proposed record's type — the Authority \
+       Section is the peer's whole §8.2 proposal either way",
+      true,
+      INSTANCE,
+      ResourceType::Txt,
+      srv_only,
+    ),
+    (
+      "a TTL=0 authority record — §8.2.1 compares class, type and rdata, so the \
+       TTL cannot take a record out of the peer's proposal",
+      true,
+      INSTANCE,
+      ResourceType::Any,
+      goodbye_srv,
+    ),
+  ];
+
+  let instance = Name::try_from_str(INSTANCE).unwrap();
+  // The SAME records the endpoint registers in `build_endpoint_with_printer`, so
+  // the two layers are asked about one service and not two.
+  let records = || {
+    ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str(INSTANCE).unwrap(),
+      Name::try_from_str("printer-host.local.").unwrap(),
+      631,
+      120,
+    )
+  };
+
+  // …plus the malformed datagrams, carrying the same declared ground truth. Two
+  // of them still propose something readable at our name; the third proposes
+  // nothing readable at all, and the fold's only terminal value for it is an
+  // abandonment.
+  let mut extra: std::vec::Vec<(&str, bool, std::vec::Vec<u8>)> = std::vec::Vec::new();
+  {
+    // A question whose QNAME is an unresolvable pointer, alongside a valid one.
+    let mut buf = [0u8; 512];
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(&instance, ResourceType::Any, ResourceClass::In, true)
+      .unwrap();
+    srv_txt(&mut b, &instance);
+    let n = b.finish().unwrap();
+    let good = buf[..n].to_vec();
+    // Rebuild with a second, pointer-named question spliced in after the first.
+    let qlen = {
+      let mut k = 12usize;
+      for label in "Printer._ipp._tcp.local".split('.') {
+        k += 1 + label.len();
+      }
+      k + 1 + 4 - 12
+    };
+    let mut d: std::vec::Vec<u8> = std::vec::Vec::new();
+    d.extend_from_slice(&good[..12]);
+    d[5] = 2;
+    d.extend_from_slice(&good[12..12 + qlen]);
+    let at = 12 + qlen;
+    #[allow(clippy::cast_possible_truncation)]
+    d.extend_from_slice(&[0xC0 | ((at >> 8) as u8), at as u8]);
+    d.extend_from_slice(&ResourceType::Any.to_u16().to_be_bytes());
+    d.extend_from_slice(&1u16.to_be_bytes());
+    d.extend_from_slice(&good[12 + qlen..]);
+    extra.push(("a pointer-named QNAME beside a valid question", true, d));
+  }
+  {
+    // A KX whose rdata may hold a compression pointer.
+    let mut buf = [0u8; 512];
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(&instance, ResourceType::Any, ResourceClass::In, true)
+      .unwrap();
+    srv_txt(&mut b, &instance);
+    let n = b.finish().unwrap();
+    let mut d = buf[..n].to_vec();
+    for label in "Printer._ipp._tcp.local".split('.') {
+      #[allow(clippy::cast_possible_truncation)]
+      d.push(label.len() as u8);
+      d.extend_from_slice(label.as_bytes());
+    }
+    d.push(0u8);
+    d.extend_from_slice(&36u16.to_be_bytes()); // KX
+    d.extend_from_slice(&1u16.to_be_bytes());
+    d.extend_from_slice(&120u32.to_be_bytes());
+    d.extend_from_slice(&4u16.to_be_bytes());
+    d.extend_from_slice(&[0x00, 0x0A, 0xC0, 0x0C]);
+    d[9] = 3; // NSCOUNT 2 -> 3
+    extra.push((
+      "a KX whose rdata may hold a compression pointer",
+      true,
+      d,
+    ));
+  }
+  {
+    // An authority section that stops PARSING at its first record, with no
+    // readable record ahead of it. `Records` halts at its first error, so the
+    // section carries nothing this query proposes for any name.
+    let mut buf = [0u8; 512];
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(&instance, ResourceType::Any, ResourceClass::In, true)
+      .unwrap();
+    let n = b.finish().unwrap();
+    let mut d = buf[..n].to_vec();
+    d[9] = 1; // NSCOUNT claims one record …
+    d.extend_from_slice(&[0x05, b'h', b'e', b'l', b'l']); // … which is truncated
+    extra.push((
+      "an authority section that stops parsing at its first record",
+      false,
+      d,
+    ));
+  }
+
+  let built = cases
+    .into_iter()
+    .map(|(what, proposes_for_us, qname, qtype, push_recs)| {
+      let mut buf = [0u8; 512];
+      let q = Name::try_from_str(qname).unwrap();
+      let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+      b.push_question(&q, qtype, ResourceClass::In, true).unwrap();
+      push_recs(&mut b, &instance);
+      let n = b.finish().unwrap();
+      (what, proposes_for_us, buf[..n].to_vec())
+    });
+
+  for (what, proposes_for_us, datagram) in built.chain(extra) {
+    // LAYER 1 — the endpoint: was a ProbeProposal routed?
+    let (mut e, _h) = build_endpoint_with_printer();
+    let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+    let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+    let routed = e
+      .handle(StdInstant::now(), src, local_ip, 0, &datagram, false)
+      .unwrap()
+      .filter_map(Result::ok)
+      .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
+
+    // LAYER 2 — the fold, called for real rather than re-derived. Its terminal
+    // value is the whole question: `PeerWins` and `WeHold` are §8.2.1's two
+    // verdicts, `Abandoned` is not a verdict at all.
+    let reader = crate::wire::MessageReader::try_parse(&datagram).unwrap();
+    let recs = records();
+    let pp = crate::event::ProbeProposal::new(src, reader, crate::event::DatagramId::new(1));
+    let verdict = crate::service::proposal::adjudicate(&pp, &recs);
+    let reaches_a_verdict = !matches!(verdict, crate::service::proposal::Verdict::Abandoned(_));
+
+    assert!(
+      !(proposes_for_us && reaches_a_verdict) || routed,
+      "{what}: this datagram proposes something at our name and the fold reaches \
+       {verdict:?} over it, so a ProbeProposal MUST have been routed — routing \
+       must OVER-approximate verdicts, never under-approximate them"
+    );
+  }
+}
+
+/// A QDCOUNT=0 datagram whose ONLY declared authority record is truncated
+/// proposes nothing to anybody, and costs the endpoint work proportional to the
+/// datagram rather than to the number of registered services.
+///
+/// It is the cheapest amplification input the §8.2 path admits: QR=0, source
+/// port 5353, no questions, and roughly thirty bytes of which five are a
+/// half-written record. §8.1 defines a probe as a query carrying "the record
+/// name in question in the Question Section" and §8.2 reads the proposal off
+/// "the Authority Section of *that query*", so a query that asks nothing
+/// proposes nothing — and `Records` stops at its first error, so the section
+/// carries no readable record either.
+///
+/// Routed anyway, it fans out to EVERY registered service: `AuthorityProposals`
+/// restarts the service scan on each `next()`, so N deliveries cost Θ(N²) slab
+/// visits, and every pre-authoritative service then builds and sorts its own
+/// proposal before the fold dies on that same record. The fold's only terminal
+/// value for it is `Verdict::Abandoned`, which
+/// `an_abandoned_proposal_behaves_exactly_like_we_hold` shows changes nothing —
+/// so all of that work buys no service any information at all.
+///
+/// Two assertions, neither of them timing-based: nothing is delivered, and the
+/// number of routing events the datagram produces does not grow with the service
+/// count. The control at the end registers the same services and sends a real
+/// probe, so a fixture whose registrations silently failed cannot pass.
+#[test]
+fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
+  use crate::event::RouteEvent;
+  use core::net::SocketAddr;
+
+  /// An endpoint with `n` distinct services registered, and the instance name of
+  /// the first one.
+  fn endpoint_with(n: usize) -> (TestEndp, Name) {
+    let mut e = build_endpoint();
+    let mut first = None;
+    for i in 0..n {
+      let st = Name::try_from_str("_ipp._tcp.local.").unwrap();
+      let inst = Name::try_from_str(&std::format!("Printer{i}._ipp._tcp.local.")).unwrap();
+      let host = Name::try_from_str(&std::format!("printer-host{i}.local.")).unwrap();
+      if first.is_none() {
+        first = Some(inst.clone());
+      }
+      #[allow(clippy::cast_possible_truncation)]
+      let recs = ServiceRecords::new(st, inst, host, 631 + i as u16, 120);
+      e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        StdInstant::now(),
+      )
+      .unwrap();
+    }
+    (e, first.unwrap())
+  }
+
+  // QR=0, QDCOUNT=0, NSCOUNT=1 — and the one declared record is five bytes of a
+  // label that claims to be longer than what follows it.
+  let mut datagram: std::vec::Vec<u8> = std::vec::Vec::new();
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // ID
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // QDCOUNT — asks nothing
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+  datagram.extend_from_slice(&1u16.to_be_bytes()); // NSCOUNT — claims one record
+  datagram.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+  datagram.extend_from_slice(&[0x05, b'h', b'e', b'l', b'l']); // …which is truncated
+
+  // Port 5353: the §8.2 proposal path is gated on it, so this is the shape that
+  // reaches the fan-out at all.
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+
+  let mut counts = std::vec::Vec::new();
+  for n in [4usize, 256] {
+    let (mut e, _first) = endpoint_with(n);
+    let mut proposals = 0usize;
+    let mut events = 0usize;
+    for ev in e
+      .handle(StdInstant::now(), src, local_ip, 0, &datagram, false)
+      .unwrap()
+    {
+      events = events.saturating_add(1);
+      if matches!(&ev, Ok(RouteEvent::ToService(ts)) if ts.event().is_probe_proposal()) {
+        proposals = proposals.saturating_add(1);
+      }
+    }
+    assert_eq!(
+      proposals, 0,
+      "{n} services: a query that asks nothing proposes nothing, and a section \
+       that stops parsing at its first record carries no readable proposal \
+       either — so no service may be handed a §8.2 proposal for it"
+    );
+    counts.push(events);
+  }
+  assert_eq!(
+    counts.first(),
+    counts.last(),
+    "the routing work this datagram causes must be a function of the DATAGRAM, \
+     not of how many services are registered — a per-service fan-out here is an \
+     amplification primitive, since `AuthorityProposals` rescans the service \
+     slab on every delivery"
+  );
+
+  // CONTROL: the same registrations really are live, and a real §8.2 probe for
+  // one of those names still reaches exactly its own service.
+  let (mut e, first) = endpoint_with(4);
+  let mut buf = [0u8; 512];
+  let mut b = crate::wire::MessageBuilder::<'_, 32>::try_new(&mut buf, crate::wire::Header::new())
+    .unwrap();
+  b.push_question(
+    &first,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
+  let target = Name::try_from_str("rival-host.local.").unwrap();
+  b.push_srv_authority(&first, 120, 0, 0, 9999, &target).unwrap();
+  let n = b.finish().unwrap();
+  let probe = buf[..n].to_vec();
+  let delivered = e
+    .handle(StdInstant::now(), src, local_ip, 0, &probe, false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()))
+    .count();
+  assert_eq!(
+    delivered, 1,
+    "control: a genuine probe for a registered name is still delivered, to \
+     exactly the one service that owns it"
+  );
+}
+
+/// The OTHER fail-closed input on the §8.2 proposal route, and the one nothing
+/// covered: a question section that PARSES but cannot be decoded, behind an
+/// authority record that is perfectly readable and sits at a registered name.
+///
+/// The two inputs reach the same `return false` by different doors, and only one
+/// of them had a test. A record that will not parse is caught by
+/// `a_questionless_truncated_authority_packet_is_routed_to_no_service`; this is
+/// the `Err(QuestionsUnreadable)` arm, which needs the record to be GOOD so that
+/// the owner-and-class gate passes and the question walk is actually taken.
+/// `QuestionRef::try_parse` consumes a compression pointer without following it,
+/// so a pointer-named question parses — the section is locatable and the
+/// authority records ARE surfaced — and only `name_fully_decodes` rejects it.
+///
+/// Fail-closed is the right disposition here because this route releases a
+/// VERDICT PATH: the fold's only terminal value for an undecidable section is
+/// `Abandoned`, which `an_abandoned_proposal_behaves_exactly_like_we_hold` shows
+/// changes nothing, so delivering it buys no service any information while
+/// costing a fan-out to every registered one. The §8.1 DEFENCE route answers the
+/// identical input the opposite way — see
+/// `answer_questions_false_defends_only_against_a_real_proposal` — because what
+/// it releases is a defence of a name already established, and §8.1 makes
+/// mounting that defence a duty. The pair is the decision; either alone reads as
+/// an accident.
+#[test]
+fn an_undecodable_question_section_routes_no_proposal_though_its_record_is_good() {
+  use crate::event::RouteEvent;
+  use core::net::SocketAddr;
+
+  let mut e = build_endpoint();
+  let st = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("printer-host.local.").unwrap();
+  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ServiceSpec::new(ServiceRecords::new(st, inst.clone(), host, 631, 120)),
+    StdInstant::now(),
+  )
+  .unwrap();
+
+  // A well-formed SRV authority record at the registered instance name, so the
+  // owner-and-class gate passes and the question walk is genuinely reached.
+  let mut record = std::vec::Vec::new();
+  for label in "Printer._ipp._tcp.local.".trim_end_matches('.').split('.') {
+    record.push(u8::try_from(label.len()).unwrap());
+    record.extend_from_slice(label.as_bytes());
+  }
+  record.push(0);
+  record.extend_from_slice(&33u16.to_be_bytes()); // SRV
+  record.extend_from_slice(&1u16.to_be_bytes()); // class IN
+  record.extend_from_slice(&120u32.to_be_bytes());
+  let mut rdata = std::vec::Vec::new();
+  rdata.extend_from_slice(&0u16.to_be_bytes());
+  rdata.extend_from_slice(&0u16.to_be_bytes());
+  rdata.extend_from_slice(&9999u16.to_be_bytes());
+  for label in ["rival-host", "local"] {
+    rdata.push(u8::try_from(label.len()).unwrap());
+    rdata.extend_from_slice(label.as_bytes());
+  }
+  rdata.push(0);
+  record.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+  record.extend_from_slice(&rdata);
+
+  let datagram = |decodable: bool| -> std::vec::Vec<u8> {
+    let mut d: std::vec::Vec<u8> = std::vec::Vec::new();
+    d.extend_from_slice(&0u16.to_be_bytes()); // ID
+    d.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0 — a probe is a query
+    d.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    d.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    d.extend_from_slice(&1u16.to_be_bytes()); // NSCOUNT
+    d.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    if decodable {
+      for label in "Printer._ipp._tcp.local.".trim_end_matches('.').split('.') {
+        d.push(u8::try_from(label.len()).unwrap());
+        d.extend_from_slice(label.as_bytes());
+      }
+      d.push(0);
+    } else {
+      // A QNAME that is a pointer to its own offset: `try_parse` accepts it (both
+      // bytes exist) so the section PARSES and the authority record is surfaced;
+      // following it cycles, so `name_fully_decodes` says no.
+      let at = u16::try_from(d.len()).unwrap();
+      d.extend_from_slice(&(0xC000u16 | at).to_be_bytes());
+    }
+    d.extend_from_slice(&crate::wire::ResourceType::Any.to_u16().to_be_bytes());
+    d.extend_from_slice(&(0x8000u16 | 1).to_be_bytes()); // QU | QCLASS IN
+    d.extend_from_slice(&record);
+    d
+  };
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let proposals = |e: &mut TestEndp, bytes: &[u8]| -> usize {
+    e.handle(StdInstant::now(), src, local_ip, 0, bytes, false)
+      .unwrap()
+      .filter_map(Result::ok)
+      .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()))
+      .count()
+  };
+
+  // CONTROL FIRST: the identical record behind a DECODABLE question really is
+  // delivered, so the assertion below cannot pass because the fixture was inert.
+  assert_eq!(
+    proposals(&mut e, &datagram(true)),
+    1,
+    "control: the same authority record behind a readable question is a genuine \
+     §8.2 proposal and reaches the service that owns the name"
+  );
+
+  assert_eq!(
+    proposals(&mut e, &datagram(false)),
+    0,
+    "the question section cannot be decoded, so whether this datagram proposes \
+     anything for that name is UNKNOWN — and the proposal route answers unknown \
+     with no, because the fold's only terminal value for it is an abandonment \
+     that changes nothing while the delivery costs a fan-out to every service"
+  );
+}
+
+/// One §8.2 admission scope reads the Question Section AT MOST ONCE, however
+/// many Authority records it is asked about — and does not read it at all when
+/// none of them is at the scope's name.
+///
+/// Admission used to re-parse and fully decode every question for every
+/// authority record. Scope is the owner name and class, which does not vary with
+/// the record, so that product was pure repetition: a maximum-size datagram
+/// carries roughly 5,400 minimal questions and 2,700 minimal records, and both
+/// the router and the fold scan, so one link-local packet bought ~15 million
+/// pair iterations twice over before any compression-chain work.
+///
+/// The second half is the part that keeps behaviour identical rather than merely
+/// faster. `QuestionsUnreadable` — the answer whose two callers owe it OPPOSITE
+/// dispositions, fail-open at the router and abandon at the fold — is produced
+/// by that walk, so hoisting it above the owner-and-class gate would surface it
+/// on datagrams that never reached it: ones whose authority records are all at
+/// other names, and ones with no authority records at all. Memoising on first
+/// use, rather than reading eagerly, is what leaves those datagrams alone.
+#[test]
+fn one_admission_scope_reads_the_question_section_at_most_once() {
+  use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType};
+
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let other = Name::try_from_str("Scanner._ipp._tcp.local.").unwrap();
+  let target = Name::try_from_str("rival-host.local.").unwrap();
+
+  // `at_ours` authority records at the instance name, then `at_theirs` at
+  // another name, behind a question that puts the instance in scope.
+  let datagram = |at_ours: usize, at_theirs: usize| -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 2048];
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(&instance, ResourceType::Any, ResourceClass::In, true)
+      .unwrap();
+    for i in 0..at_ours {
+      #[allow(clippy::cast_possible_truncation)]
+      b.push_srv_authority(&instance, 120, 0, 0, 9000 + i as u16, &target)
+        .unwrap();
+    }
+    for i in 0..at_theirs {
+      #[allow(clippy::cast_possible_truncation)]
+      b.push_srv_authority(&other, 120, 0, 0, 9500 + i as u16, &target)
+        .unwrap();
+    }
+    let n = b.finish().unwrap();
+    buf[..n].to_vec()
+  };
+
+  // Eight records at our name and four at another: the answer is unchanged for
+  // every one of them, so one walk of the questions covers all twelve.
+  let bytes = datagram(8, 4);
+  let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+  let walks = core::cell::Cell::new(0usize);
+  let mut scope = crate::endpoint::ProposalScope::new(
+    || {
+      walks.set(walks.get().saturating_add(1));
+      reader.questions()
+    },
+    &instance,
+  );
+  let admitted = reader
+    .authority()
+    .filter(|r| {
+      r.as_ref()
+        .is_ok_and(|r| scope.admits(r).unwrap() == crate::endpoint::Admission::Ours)
+    })
+    .count();
+  assert_eq!(
+    admitted, 8,
+    "every record at the scope's name is admitted, and none of the others"
+  );
+  assert_eq!(
+    walks.get(),
+    1,
+    "the question section decides scope by owner name and class, which does not \
+     vary with the record — so it is read once for the whole section, not once \
+     per record"
+  );
+
+  // And a datagram proposing nothing at our name never reaches the questions at
+  // all, which is what keeps `QuestionsUnreadable` reachable from exactly the
+  // datagrams that reached it before.
+  let bytes = datagram(0, 4);
+  let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+  let walks = core::cell::Cell::new(0usize);
+  let mut scope = crate::endpoint::ProposalScope::new(
+    || {
+      walks.set(walks.get().saturating_add(1));
+      reader.questions()
+    },
+    &instance,
+  );
+  // …and each is refused for the STRUCTURAL reason, not merely refused: these
+  // records are at another owner name, so they are part of another name's
+  // proposal and leaving them out cannot shorten the list §8.2.1 compares here.
+  let answers: std::vec::Vec<_> = reader
+    .authority()
+    .map(|r| scope.admits(r.as_ref().unwrap()).unwrap())
+    .collect();
+  assert_eq!(
+    answers,
+    std::vec![
+      crate::endpoint::Admission::NotOurs(crate::endpoint::NotOurs::DifferentOwner);
+      4
+    ],
+    "none of these records is at the scope's name"
+  );
+  assert_eq!(
+    walks.get(),
+    0,
+    "the owner-and-class gate comes first, so a datagram whose authority records \
+     are all out of scope never causes the question section to be read"
+  );
 }

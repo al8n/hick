@@ -15,6 +15,9 @@ mod resource_type;
 mod response_code;
 
 pub use resource_class::{CACHE_FLUSH_BIT, ResourceClass, UNICAST_RESPONSE_BIT};
+cfg_heap! {
+  pub(crate) use resource_type::RdataNames;
+}
 pub use resource_type::ResourceType;
 pub use response_code::ResponseCode;
 
@@ -32,6 +35,9 @@ pub use question::QuestionRef;
 
 mod record;
 pub use record::{A, AAAA, Ptr, Rdata, Ref, Srv, Txt};
+cfg_heap! {
+  pub(crate) use record::RdataForm;
+}
 
 mod reader;
 pub use reader::{MessageReader, Questions, Records};

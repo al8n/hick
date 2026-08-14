@@ -34,14 +34,15 @@ use crate::{
     RegisterServiceError, StartQueryError, StorageFullError, TransmitError,
   },
   event::{
-    EndpointEvent, HostConflict, KnownAnswer, ProbeConflict, QueryEvent, QueryUpdate, RouteEvent,
-    ServiceEvent, ServiceQuestion, ToQuery, ToService,
+    ConflictOrigin, EndpointEvent, HostConflict, KnownAnswer, ProbeConflict,
+    ProbeProposal, QueryEvent, QueryUpdate, RouteEvent, ServiceEvent, ServiceQuestion, ToQuery,
+    ToService,
   },
   query::{CollectedAnswer, Query},
   service::{FullyAnnounced, Service},
   trace::*,
   transmit::{FamilyAttempt, Transmit, TransmitConfirm},
-  wire::{MessageReader, NameRef, ResourceClass, ResourceType},
+  wire::{MessageReader, NameRef, QuestionRef, ResourceClass, ResourceType},
 };
 
 cfg_heap! {
@@ -571,6 +572,13 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   next_service_handle: u32,
   next_query_handle: u32,
   next_txid: u16,
+  /// Monotonic per-accepted-datagram counter, stamped onto every conflict a
+  /// datagram raises. Its only use is telling one datagram's RFC 6762 §8.2
+  /// proposal from the next when both come from the same source address; see
+  /// [`DatagramId`](crate::event::DatagramId). Wraps, which is harmless: it is
+  /// only ever compared for equality between conflicts buffered inside one
+  /// probe round, and 2^64 datagrams cannot arrive within one.
+  datagram_seq: u64,
   /// In-progress withdrawal items, keyed by an opaque [`WithdrawalToken`].  Each
   /// entry is ONE name's TTL=0 goodbye lifecycle; a route-attached item keeps its
   /// route in `self.services` alive until the goodbye sequence completes (so the
@@ -634,6 +642,7 @@ where
       next_service_handle: 0,
       next_query_handle: 0,
       next_txid,
+      datagram_seq: 0,
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       withdrawals: std::vec::Vec::new(),
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]

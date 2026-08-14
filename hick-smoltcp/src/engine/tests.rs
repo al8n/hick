@@ -1389,28 +1389,57 @@ fn a_recovered_family_resumes_the_obligated_set_on_its_next_send() {
   );
 }
 
-/// Build a probe-shaped message carrying a CONFLICTING SRV authority record for
+/// Build an authoritative RESPONSE carrying a CONFLICTING SRV answer record for
 /// `instance_str` (different rdata than ours — port 9999, a rival target). From
 /// an mDNS peer (source port 5353) this routes a §9 `ProbeConflict`, which
 /// reverts an established service to probing and then loses the §8.2 tiebreak,
 /// renaming and queuing the old-name goodbye.
-fn build_conflict_srv_authority(instance_str: &str) -> Vec<u8> {
+///
+/// A RESPONSE is what §9 defines the conflict over: "it receives a Multicast DNS
+/// response message containing a record with the same name, rrtype and rrclass,
+/// but inconsistent rdata". The same rdata in the Authority section of a peer's
+/// QUERY is that peer PROBING, which leaves an established service established
+/// and defending — §8.1's answer to a probe for a name we own.
+fn build_conflict_srv_response(instance_str: &str) -> Vec<u8> {
   use mdns_proto::wire::{Header, MessageBuilder};
   let mut buf = [0u8; 512];
-  let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+  let mut header = Header::new();
+  header.flags_mut().set_response();
+  let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, header).unwrap();
   let name = Name::try_from_str(instance_str).unwrap();
   let target = Name::try_from_str("rival-host.local.").unwrap();
-  b.push_srv_authority(&name, 120, 0, 0, 9999, &target)
+  b.push_srv_answer(&name, 120, 0, 0, 9999, &target, true)
     .unwrap();
   let n = b.finish().unwrap();
   buf[..n].to_vec()
 }
 
-/// Build a probe-shaped message carrying a CONFLICTING A authority record for
+/// Build an authoritative RESPONSE carrying a CONFLICTING A answer record for
 /// `host_str` (a peer claiming our host name with a DIFFERENT address). From an
 /// mDNS peer this routes a §9 host conflict; the proto does NOT auto-rename a host
 /// conflict — it queues a `ServiceUpdate::HostConflict`.
-fn build_conflict_a_authority(host_str: &str, addr: [u8; 4]) -> Vec<u8> {
+///
+/// A RESPONSE is what §9 defines the conflict over, and that update is terminal
+/// for every driver. The same record in the Authority Section of a peer's QUERY
+/// is that peer PROBING the host name, which must NOT retire us — otherwise one
+/// ordinary probe retires every service sharing the host name. See
+/// [`build_probe_a_authority`].
+fn build_conflict_a_response(host_str: &str, addr: [u8; 4]) -> Vec<u8> {
+  use mdns_proto::wire::{Header, MessageBuilder};
+  let mut buf = [0u8; 512];
+  let mut header = Header::new();
+  header.flags_mut().set_response();
+  let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, header).unwrap();
+  let name = Name::try_from_str(host_str).unwrap();
+  b.push_a_answer(&name, 120, Ipv4Addr::from(addr), true)
+    .unwrap();
+  let n = b.finish().unwrap();
+  buf[..n].to_vec()
+}
+
+/// The same conflicting A record as [`build_conflict_a_response`], carried the
+/// way a peer PROBING that host name carries it: QR=0, Authority Section.
+fn build_probe_a_authority(host_str: &str, addr: [u8; 4]) -> Vec<u8> {
   use mdns_proto::wire::{Header, MessageBuilder};
   let mut buf = [0u8; 512];
   let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
@@ -1640,7 +1669,7 @@ fn default_setup_processes_rx_without_hop_limit_or_addrs() {
   }
 
   // The default deaf scenario: no addresses configured, hop_limit None on every RX.
-  let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
+  let conflict = build_conflict_srv_response("Test._ipp._tcp.local.");
   let mut t = 6_000_000i64;
   let mut reacted = false;
   for _ in 0..16 {
@@ -1688,7 +1717,7 @@ fn default_setup_rejects_off_link_unicast() {
     while engine.poll_service_update(handle).is_some() {}
   }
 
-  let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
+  let conflict = build_conflict_srv_response("Test._ipp._tcp.local.");
   let mut t = 6_000_000i64;
   let mut reacted = false;
   for _ in 0..16 {
@@ -1734,7 +1763,7 @@ fn addrs_configured_still_admits_group_destined_off_subnet_source() {
   // An address on a prefix that does NOT cover the conflicting peer fed below.
   engine.set_local_addrs(&[IpCidr::new(IpAddress::v4(10, 0, 0, 5), 24)]);
 
-  let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
+  let conflict = build_conflict_srv_response("Test._ipp._tcp.local.");
   let mut t = 6_000_000i64;
   let mut reacted = false;
   for _ in 0..16 {
@@ -1784,7 +1813,7 @@ fn reported_hop_limit_is_not_consulted_group_destined_admitted_at_254() {
     while engine.poll_service_update(handle).is_some() {}
   }
 
-  let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
+  let conflict = build_conflict_srv_response("Test._ipp._tcp.local.");
   let mut t = 6_000_000i64;
   let mut reacted = false;
   for _ in 0..16 {
@@ -1832,7 +1861,7 @@ fn reported_hop_limit_255_does_not_admit_off_prefix_unicast() {
   // An address on a prefix that does NOT cover the source fed below.
   engine.set_local_addrs(&[IpCidr::new(IpAddress::v4(10, 0, 0, 5), 24)]);
 
-  let conflict = build_conflict_srv_authority("Test._ipp._tcp.local.");
+  let conflict = build_conflict_srv_response("Test._ipp._tcp.local.");
   let mut t = 6_000_000i64;
   let mut reacted = false;
   for _ in 0..16 {
@@ -1893,7 +1922,7 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_smoltcp_service() {
   // A peer claims our HOST name with a DIFFERENT address: a genuine §9 host
   // conflict. The proto emits ServiceUpdate::HostConflict via poll(), which
   // drain_service_updates must now route through retirement.
-  let conflict = build_conflict_a_authority("test.local.", [10, 0, 0, 99]);
+  let conflict = build_conflict_a_response("test.local.", [10, 0, 0, 99]);
   let mut t = 6_000_000i64;
   let mut retired = false;
   for _ in 0..16 {
@@ -1950,6 +1979,124 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_smoltcp_service() {
   );
 }
 
+/// The QR=0 half of the test above: the identical conflicting A record, carried
+/// as a peer PROBING our host name, must NOT retire the service.
+///
+/// `ServiceUpdate::HostConflict` is terminal — the test above shows it retiring
+/// and GC'ing the slot — and RFC 6762 §9 defines a conflict over a RESPONSE. A
+/// probe is a peer asking whether the name is free. Honouring one here would let
+/// a single ordinary probe retire every service sharing that host name, which is
+/// a denial of service any on-link host could run.
+#[test]
+fn a_peer_probing_our_host_name_does_not_retire_the_smoltcp_service() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(83));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+
+  let mut established = false;
+  for micros in pump_schedule() {
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+    while let Some(u) = engine.poll_service_update(handle) {
+      established |= matches!(u, ServiceUpdate::Established);
+    }
+  }
+  assert!(
+    established,
+    "service must reach Established before the host probe"
+  );
+
+  let probe = build_probe_a_authority("test.local.", [10, 0, 0, 99]);
+  let mut t = 6_000_000i64;
+  for _ in 0..16 {
+    io.inbound.push_back((
+      probe.clone(),
+      RecvMeta {
+        src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
+        local: Some(MDNS_SOCKET_V4.ip()),
+        hop_limit: None,
+        len: 0,
+      },
+    ));
+    engine.pump(|| at(t), &mut io, &mut scratch);
+    t += 250_000;
+  }
+
+  let slot = engine
+    .services
+    .get(&handle)
+    .expect("a probed host name must not GC the service");
+  assert!(
+    !slot.errored,
+    "a peer's tentative probe for our host name is not §9's conflict, so it must \
+     not begin the endpoint-owned withdrawal"
+  );
+  let mut saw_host_conflict = false;
+  while let Some(u) = engine.poll_service_update(handle) {
+    saw_host_conflict |= u.is_host_conflict();
+  }
+  assert!(
+    !saw_host_conflict,
+    "and it must queue no terminal HostConflict for the caller"
+  );
+}
+
+/// A conflict queued BEYOND `MAX_RX_PER_PUMP` must still cost the name, even
+/// though the pump that reaches it has already queued an announcement.
+///
+/// This is the driver-side shape of the core regression
+/// `a_queued_announcement_cannot_overtake_a_classified_conflict`. `pump` fires
+/// timeouts BEFORE draining RX and caps the drain, so the sequence is real: one
+/// pass closes RFC 6762 §8.1's settling window and fills the cap with harmless
+/// datagrams, the next pass queues the first announcement, drains the
+/// conflicting response behind the cap, and would then transmit and confirm the
+/// announcement. A service that let the announcement out would be advertised by
+/// the following timeout and would never spend the existing owner's response —
+/// two owners, from nothing worse than a busy link.
+#[test]
+fn a_conflict_behind_the_rx_cap_still_costs_the_name() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(97));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+
+  let meta = || RecvMeta {
+    src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
+    local: Some(MDNS_SOCKET_V4.ip()),
+    hop_limit: None,
+    len: 0,
+  };
+  // Filler for a name we do not own: it costs RX-cap budget and nothing else.
+  let filler = build_conflict_srv_response("Someone-Else._ipp._tcp.local.");
+  // The real conflict, for OUR name, parked behind the whole cap.
+  let conflict = build_conflict_srv_response("Test._ipp._tcp.local.");
+
+  let mut t = 0i64;
+  let mut renamed = false;
+  for round in 0..40 {
+    if round == 6 {
+      for _ in 0..MAX_RX_PER_PUMP {
+        io.inbound.push_back((filler.clone(), meta()));
+      }
+      io.inbound.push_back((conflict.clone(), meta()));
+    }
+    t += 250_000;
+    engine.pump(|| at(t), &mut io, &mut scratch);
+    while let Some(u) = engine.poll_service_update(handle) {
+      renamed |= matches!(u, ServiceUpdate::Renamed(_));
+    }
+    if renamed {
+      break;
+    }
+  }
+
+  assert!(
+    renamed,
+    "the conflict was behind the per-pump RX cap, so the pump that reached it \
+     had already queued an announcement — it must still be spent, not overtaken"
+  );
+}
+
 #[test]
 fn rx_drain_is_capped_per_pump_with_immediate_repump() {
   // The per-pump RX drain is capped at MAX_RX_PER_PUMP so an on-link flood
@@ -1960,7 +2107,7 @@ fn rx_drain_is_capped_per_pump_with_immediate_repump() {
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(53));
   let mut io = MockUdp::default();
   let mut scratch = [0u8; 1500];
-  let pkt = build_conflict_srv_authority("Whatever._ipp._tcp.local.");
+  let pkt = build_conflict_srv_response("Whatever._ipp._tcp.local.");
   let flood = MAX_RX_PER_PUMP + 10;
   for _ in 0..flood {
     io.inbound.push_back((
@@ -3123,7 +3270,7 @@ fn stats_off_link_datagram_counts_rx_bytes_and_dropped() {
   let mut scratch = [0u8; 1500];
 
   // Well-formed mDNS packet so the only reject reason is the on-link gate.
-  let pkt = build_conflict_srv_authority("Test._ipp._tcp.local.");
+  let pkt = build_conflict_srv_response("Test._ipp._tcp.local.");
   let pkt_len = pkt.len();
 
   // Off-link: unicast destination (not the mDNS group), no addresses configured,
