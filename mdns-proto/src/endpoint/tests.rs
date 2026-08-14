@@ -9256,6 +9256,123 @@ fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
   );
 }
 
+/// The OTHER fail-closed input on the §8.2 proposal route, and the one nothing
+/// covered: a question section that PARSES but cannot be decoded, behind an
+/// authority record that is perfectly readable and sits at a registered name.
+///
+/// The two inputs reach the same `return false` by different doors, and only one
+/// of them had a test. A record that will not parse is caught by
+/// `a_questionless_truncated_authority_packet_is_routed_to_no_service`; this is
+/// the `Err(QuestionsUnreadable)` arm, which needs the record to be GOOD so that
+/// the owner-and-class gate passes and the question walk is actually taken.
+/// `QuestionRef::try_parse` consumes a compression pointer without following it,
+/// so a pointer-named question parses — the section is locatable and the
+/// authority records ARE surfaced — and only `name_fully_decodes` rejects it.
+///
+/// Fail-closed is the right disposition here because this route releases a
+/// VERDICT PATH: the fold's only terminal value for an undecidable section is
+/// `Abandoned`, which `an_abandoned_proposal_behaves_exactly_like_we_hold` shows
+/// changes nothing, so delivering it buys no service any information while
+/// costing a fan-out to every registered one. The §8.1 DEFENCE route answers the
+/// identical input the opposite way — see
+/// `answer_questions_false_defends_only_against_a_real_proposal` — because what
+/// it releases is a defence of a name already established, and §8.1 makes
+/// mounting that defence a duty. The pair is the decision; either alone reads as
+/// an accident.
+#[test]
+fn an_undecodable_question_section_routes_no_proposal_though_its_record_is_good() {
+  use crate::event::RouteEvent;
+  use core::net::SocketAddr;
+
+  let mut e = build_endpoint();
+  let st = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("printer-host.local.").unwrap();
+  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ServiceSpec::new(ServiceRecords::new(st, inst.clone(), host, 631, 120)),
+    StdInstant::now(),
+  )
+  .unwrap();
+
+  // A well-formed SRV authority record at the registered instance name, so the
+  // owner-and-class gate passes and the question walk is genuinely reached.
+  let mut record = std::vec::Vec::new();
+  for label in "Printer._ipp._tcp.local.".trim_end_matches('.').split('.') {
+    record.push(u8::try_from(label.len()).unwrap());
+    record.extend_from_slice(label.as_bytes());
+  }
+  record.push(0);
+  record.extend_from_slice(&33u16.to_be_bytes()); // SRV
+  record.extend_from_slice(&1u16.to_be_bytes()); // class IN
+  record.extend_from_slice(&120u32.to_be_bytes());
+  let mut rdata = std::vec::Vec::new();
+  rdata.extend_from_slice(&0u16.to_be_bytes());
+  rdata.extend_from_slice(&0u16.to_be_bytes());
+  rdata.extend_from_slice(&9999u16.to_be_bytes());
+  for label in ["rival-host", "local"] {
+    rdata.push(u8::try_from(label.len()).unwrap());
+    rdata.extend_from_slice(label.as_bytes());
+  }
+  rdata.push(0);
+  record.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+  record.extend_from_slice(&rdata);
+
+  let datagram = |decodable: bool| -> std::vec::Vec<u8> {
+    let mut d: std::vec::Vec<u8> = std::vec::Vec::new();
+    d.extend_from_slice(&0u16.to_be_bytes()); // ID
+    d.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0 — a probe is a query
+    d.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    d.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    d.extend_from_slice(&1u16.to_be_bytes()); // NSCOUNT
+    d.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    if decodable {
+      for label in "Printer._ipp._tcp.local.".trim_end_matches('.').split('.') {
+        d.push(u8::try_from(label.len()).unwrap());
+        d.extend_from_slice(label.as_bytes());
+      }
+      d.push(0);
+    } else {
+      // A QNAME that is a pointer to its own offset: `try_parse` accepts it (both
+      // bytes exist) so the section PARSES and the authority record is surfaced;
+      // following it cycles, so `name_fully_decodes` says no.
+      let at = u16::try_from(d.len()).unwrap();
+      d.extend_from_slice(&(0xC000u16 | at).to_be_bytes());
+    }
+    d.extend_from_slice(&crate::wire::ResourceType::Any.to_u16().to_be_bytes());
+    d.extend_from_slice(&(0x8000u16 | 1).to_be_bytes()); // QU | QCLASS IN
+    d.extend_from_slice(&record);
+    d
+  };
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let proposals = |e: &mut TestEndp, bytes: &[u8]| -> usize {
+    e.handle(StdInstant::now(), src, local_ip, 0, bytes, false)
+      .unwrap()
+      .filter_map(Result::ok)
+      .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()))
+      .count()
+  };
+
+  // CONTROL FIRST: the identical record behind a DECODABLE question really is
+  // delivered, so the assertion below cannot pass because the fixture was inert.
+  assert_eq!(
+    proposals(&mut e, &datagram(true)),
+    1,
+    "control: the same authority record behind a readable question is a genuine \
+     §8.2 proposal and reaches the service that owns the name"
+  );
+
+  assert_eq!(
+    proposals(&mut e, &datagram(false)),
+    0,
+    "the question section cannot be decoded, so whether this datagram proposes \
+     anything for that name is UNKNOWN — and the proposal route answers unknown \
+     with no, because the fold's only terminal value for it is an abandonment \
+     that changes nothing while the delivery costs a fan-out to every service"
+  );
+}
+
 /// One §8.2 admission scope reads the Question Section AT MOST ONCE, however
 /// many Authority records it is asked about — and does not read it at all when
 /// none of them is at the scope's name.

@@ -410,15 +410,138 @@ fn a_record_of_another_class_is_not_in_the_peers_proposal() {
   record(&mut msg, 38, 3, &[0x2a]);
 
   let src: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  let reader = crate::wire::MessageReader::try_parse(&msg).unwrap();
-  let pp = crate::event::ProbeProposal::new(src, reader, crate::event::DatagramId::new(1));
+  let adjudicate_bytes = |bytes: &[u8]| {
+    let reader = crate::wire::MessageReader::try_parse(bytes).unwrap();
+    let pp = crate::event::ProbeProposal::new(src, reader, crate::event::DatagramId::new(1));
+    adjudicate(&pp, &records)
+  };
+
+  // THE COMPANION, and it is load-bearing rather than tidy. `WeHold` is an
+  // OVERLOADED terminal value: `adjudicate` returns it both for §8.2.1's "there
+  // is, in fact, no conflict" AND for "this query proposed nothing for me",
+  // because a fold that compared nothing has no records remaining either. So a
+  // bare `WeHold` does not prove that a comparison happened, and this fixture
+  // would keep passing if a regression stopped admitting the tying pair too.
+  //
+  // Flipping the third record's class to IN — changing nothing else — must give
+  // the opposite verdict. That pins the payload as decisive AND proves the fold
+  // really is comparing, so the `WeHold` above means "compared and tied" rather
+  // than "compared nothing".
+  let mut admitted = msg.clone();
+  let class_at = admitted.len() - (2 + 4 + 2 + 1);
+  admitted.splice(class_at..class_at + 2, 1u16.to_be_bytes());
   assert_eq!(
-    adjudicate(&pp, &records),
+    adjudicate_bytes(&admitted),
+    Verdict::PeerWins,
+    "precondition: in class IN the very same record IS one of §8.2.1's records \
+     remaining and takes the round — so the verdict below turns on the class \
+     screen and on nothing else"
+  );
+
+  assert_eq!(
+    adjudicate_bytes(&msg),
     Verdict::WeHold,
     "a class-CH record is not in the IN RRset being contended, so it is not one \
      of the records §8.2.1 sorts — admitting it would compare it as though it \
      were IN, since the fold leaves class out of its sort key on the strength of \
      exactly this screen"
+  );
+}
+
+/// DROPPING A RECORD CAN MAKE THE PEER WIN, not only us — the direction every
+/// shortening fixture in this crate has missed.
+///
+/// The rationale everywhere used to say a shortened peer list "only ever
+/// flatters us", reasoning from §8.2.1's "the list with records remaining is
+/// deemed to have won". That is false, and this is the counterexample.
+/// [`ProposalFold::peer_wins`] zips the peer's `keep` SMALLEST elements against
+/// ours and returns on the first non-equal pair, so removing a LOW-sorting peer
+/// record PROMOTES a high-sorting one into the compared prefix:
+///
+/// | peer's list | element 0 | verdict |
+/// |---|---|---|
+/// | `[A(ttl 0), TYPE38]` | `A`(0x0001) vs our TXT(0x0010) — peer lower | we hold |
+/// | `[TYPE38]` | `TYPE38`(0x0026) vs our TXT(0x0010) — peer higher | PEER WINS |
+///
+/// So a screen that drops an admitted record does not merely lose information in
+/// our favour; it can hand away a name we lawfully won. Every other fixture here
+/// puts the discriminating record AFTER ours in the sort order, where dropping
+/// it can only ever help us — which is precisely why the suite never caught this
+/// direction, and why the corrected rationale is STRONGER than the one it
+/// replaced rather than weaker.
+///
+/// Both datagrams are adjudicated, so neither terminal value is load-bearing on
+/// its own — see the `WeHold` overloading noted above.
+#[test]
+fn a_dropped_record_can_make_the_peer_win_not_only_us() {
+  const INSTANCE: &str = "myprinter._ipp._tcp.local.";
+
+  fn labels(out: &mut std::vec::Vec<u8>, name: &str) {
+    for label in name.trim_end_matches('.').split('.') {
+      out.push(u8::try_from(label.len()).unwrap());
+      out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+  }
+  fn record(out: &mut std::vec::Vec<u8>, rtype: u16, ttl: u32, rdata: &[u8]) {
+    labels(out, INSTANCE);
+    out.extend_from_slice(&rtype.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // class IN
+    out.extend_from_slice(&ttl.to_be_bytes());
+    out.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(rdata);
+  }
+
+  let records = ServiceRecords::new(
+    crate::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    crate::Name::try_from_str(INSTANCE).unwrap(),
+    crate::Name::try_from_str("host.local.").unwrap(),
+    631,
+    120,
+  );
+
+  // `nscount` records: the low-sorting A is present only in the full datagram.
+  let datagram = |with_low: bool| -> std::vec::Vec<u8> {
+    let mut msg = std::vec::Vec::new();
+    msg.extend_from_slice(&0u16.to_be_bytes());
+    msg.extend_from_slice(&0u16.to_be_bytes()); // QR=0 — a probe is a query
+    msg.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    msg.extend_from_slice(&0u16.to_be_bytes());
+    msg.extend_from_slice(&(if with_low { 2u16 } else { 1u16 }).to_be_bytes());
+    msg.extend_from_slice(&0u16.to_be_bytes());
+    labels(&mut msg, INSTANCE);
+    msg.extend_from_slice(&crate::wire::ResourceType::Any.to_u16().to_be_bytes());
+    msg.extend_from_slice(&(0x8000u16 | 1).to_be_bytes()); // QU | QCLASS IN
+    // The LOW-sorting record: rtype 1 (A) sorts before our TXT (16) and SRV (33).
+    // Its TTL is zero so that a reinstated TTL screen is exactly what drops it.
+    if with_low {
+      record(&mut msg, 1, 0, &[10, 0, 0, 7]);
+    }
+    // The HIGH-sorting record: rtype 38 sorts after both of ours, and is absent
+    // from RFC 6762 §18.14 so its rdata compares verbatim.
+    record(&mut msg, 38, 120, &[0x2a]);
+    msg
+  };
+
+  let src: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  let verdict = |bytes: &[u8]| {
+    let reader = crate::wire::MessageReader::try_parse(bytes).unwrap();
+    let pp = crate::event::ProbeProposal::new(src, reader, crate::event::DatagramId::new(1));
+    adjudicate(&pp, &records)
+  };
+
+  assert_eq!(
+    verdict(&datagram(true)),
+    Verdict::WeHold,
+    "with the peer's whole list compared, its lowest record sorts below our \
+     lowest and §8.2.1 stops there — we hold the name"
+  );
+  assert_eq!(
+    verdict(&datagram(false)),
+    Verdict::PeerWins,
+    "drop that one low-sorting record and the peer's HIGH record is promoted \
+     into the compared prefix, so the same peer now wins — a shortened list is \
+     not a safe approximation in either direction"
   );
 }
 
