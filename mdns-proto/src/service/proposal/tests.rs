@@ -248,6 +248,86 @@ fn the_fold_gives_the_longer_list_the_win_and_ties_no_conflict() {
   assert!(!shorter.peer_wins(&ours), "and ours is the longer one here");
 }
 
+/// A TTL-zero record in the peer's Authority Section is part of the list §8.2.1
+/// sorts, exactly like every other record there.
+///
+/// §8.2 requires the Authority Section to hold "*all* the records and proposed
+/// rdata being probed for uniqueness" and §8.2.1 orders by class, then type,
+/// then rdata — the TTL is not compared. §10.1's goodbye encoding belongs to an
+/// unsolicited RESPONSE, not to a QR=0 probe's proposal.
+///
+/// The fixture is built so the two dispositions give OPPOSITE verdicts. The
+/// peer's SRV and TXT tie ours byte for byte, so the whole comparison turns on
+/// its third record: counted, the peer's list has records remaining and §8.2.1
+/// gives it the name; dropped, the lists tie and we keep the name. A screen that
+/// shortens the peer's list can therefore only ever flatter us — which is the
+/// defect, since the peer compares OUR complete list and reaches the other
+/// answer, leaving two conforming hosts each holding the name.
+#[test]
+fn a_ttl_zero_record_is_still_part_of_the_peers_proposal() {
+  const INSTANCE: &str = "myprinter._ipp._tcp.local.";
+
+  fn labels(out: &mut std::vec::Vec<u8>, name: &str) {
+    for label in name.trim_end_matches('.').split('.') {
+      out.push(u8::try_from(label.len()).unwrap());
+      out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+  }
+  fn record(out: &mut std::vec::Vec<u8>, rtype: u16, ttl: u32, rdata: &[u8]) {
+    labels(out, INSTANCE);
+    out.extend_from_slice(&rtype.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // class IN
+    out.extend_from_slice(&ttl.to_be_bytes());
+    out.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(rdata);
+  }
+
+  let records = ServiceRecords::new(
+    crate::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    crate::Name::try_from_str(INSTANCE).unwrap(),
+    crate::Name::try_from_str("host.local.").unwrap(),
+    631,
+    120,
+  );
+
+  let mut msg = std::vec::Vec::new();
+  msg.extend_from_slice(&0u16.to_be_bytes());
+  msg.extend_from_slice(&0u16.to_be_bytes()); // QR=0 — a probe is a query
+  msg.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+  msg.extend_from_slice(&0u16.to_be_bytes());
+  msg.extend_from_slice(&3u16.to_be_bytes()); // NSCOUNT
+  msg.extend_from_slice(&0u16.to_be_bytes());
+  labels(&mut msg, INSTANCE);
+  msg.extend_from_slice(&crate::wire::ResourceType::Any.to_u16().to_be_bytes());
+  msg.extend_from_slice(&(0x8000u16 | 1).to_be_bytes());
+  // SRV(0, 0, 631, host.local.) and an empty TXT — byte-identical to ours.
+  let mut srv = std::vec::Vec::new();
+  srv.extend_from_slice(&0u16.to_be_bytes());
+  srv.extend_from_slice(&0u16.to_be_bytes());
+  srv.extend_from_slice(&631u16.to_be_bytes());
+  labels(&mut srv, "host.local.");
+  record(&mut msg, 33, 120, &srv);
+  record(&mut msg, 16, 120, &[0x00]);
+  // …and a third record carrying TTL 0. Its rtype (38) sorts after both of
+  // ours, so it is exactly §8.2.1's record REMAINING once the tying pair is
+  // exhausted — not an element that could win or lose on its own bytes. Type 38
+  // is absent from §18.14, so its rdata compares verbatim; see
+  // `comparability_of_unparsed_rdata_is_a_per_type_question`.
+  record(&mut msg, 38, 0, &[0x2a]);
+
+  let src: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg).unwrap();
+  let pp = crate::event::ProbeProposal::new(src, reader, crate::event::DatagramId::new(1));
+  assert_eq!(
+    adjudicate(&pp, &records),
+    Verdict::PeerWins,
+    "§8.2.1 compares class, type and rdata — never the TTL — so the peer's \
+     TTL-zero record is one of the records remaining after the tying pair, and \
+     dropping it would decide the tiebreak over a list the peer never sent"
+  );
+}
+
 /// THE property, asserted where it actually lives: on the [`Verdict`].
 ///
 /// "No proposal containing anything undecodable produces a verdict" is a

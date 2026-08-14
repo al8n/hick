@@ -118,8 +118,6 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
 ///
 /// The conjuncts, each with its own reason:
 ///
-/// * **positive TTL** — a TTL=0 record is a §10.1 goodbye, a withdrawal rather
-///   than a claim, so it is not in the proposal at all.
 /// * **class IN** — §8.2.1 orders by class, then type, then rdata; a record of
 ///   another class is not in the same RRset being contended.
 /// * **owned by `name`** — the proposal is about the name being adjudicated.
@@ -141,6 +139,28 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
 /// from ONE link-local datagram whose sections `Endpoint::handle` has already
 /// walked, so the product is bounded by that datagram's size, and the scan only
 /// runs for a record already matched to `name`.
+///
+/// # TTL is deliberately NOT considered
+///
+/// §8.2.1 orders the two lists "by class (then type, then rdata)" — the TTL is
+/// not one of the fields compared, and §8.2 requires the Authority Section to
+/// carry "*all* the records and proposed rdata being probed for uniqueness". A
+/// TTL of zero is §10.1's goodbye encoding for an unsolicited RESPONSE (QR=1),
+/// which is a different message in a different section; it says nothing about a
+/// QR=0 probe's Authority Section, and this predicate only ever runs on that.
+///
+/// So a TTL screen here is one more way to SHORTEN the peer's list, and §8.2.1
+/// awards "the list with records remaining" the win — a shortened peer list is
+/// a verdict in our own favour, reached over a list the peer never made. A peer
+/// whose proposal held a TTL-zero record sorting after ours compared our
+/// complete list and kept the name, while we compared a truncated copy of its
+/// list and kept the name too: two conforming peers, one name. That is the same
+/// defect a QTYPE screen produced — see [`question_is_about`] — and it has the
+/// same shape whatever the screening field is.
+///
+/// The positive-TTL rule is correct where it governs a record ASSERTED rather
+/// than proposed: the §9 post-establishment conflict and the goodbye handling
+/// on the QR=1 answer/authority paths keep it, in `RouteEvents::next`.
 ///
 /// # What this does NOT do
 ///
@@ -177,7 +197,7 @@ pub(crate) fn proposal_admits<'a, F>(
 where
   F: Fn() -> crate::wire::Questions<'a>,
 {
-  if r.ttl() == 0 || r.rclass() != ResourceClass::In || !names_match_record(name, r) {
+  if r.rclass() != ResourceClass::In || !names_match_record(name, r) {
     return Ok(false);
   }
   let mut admitted = false;

@@ -8611,6 +8611,64 @@ fn a_question_for_another_name_routes_no_proposal_for_ours() {
   );
 }
 
+/// A probe whose proposed records all carry TTL 0 is still a §8.2 proposal, so
+/// it is still delivered.
+///
+/// §8.2.1 orders the compared lists by class, then type, then rdata — the TTL is
+/// not among them, and §8.2 requires the Authority Section to hold "*all* the
+/// records and proposed rdata being probed for uniqueness". §10.1's goodbye
+/// encoding is a property of an unsolicited RESPONSE; a QR=0 probe's Authority
+/// Section is a claim whatever TTL it carries.
+///
+/// Withholding it here does not merely skip a record: it is what lets the fold
+/// compare a SHORTER peer list than the peer sent, and §8.2.1 awards the name to
+/// "the list with records remaining", so the shortening always favours us while
+/// the peer — comparing our complete list — reaches the opposite answer.
+///
+/// The per-record §8.1/§9 conflict route keeps its own TTL=0 guard, which
+/// `authority_ttl_zero_does_not_emit_conflict_events` pins: that path turns a
+/// peer's record into a rename, and a withdrawal must not.
+#[test]
+fn a_probe_proposing_a_ttl_zero_record_still_delivers_a_proposal() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let (mut e, expected) = build_endpoint_with_printer();
+  let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  let mut buf = [0u8; 512];
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+  b.push_question(
+    &inst,
+    crate::wire::ResourceType::Any,
+    crate::wire::ResourceClass::In,
+    true,
+  )
+  .unwrap();
+  let target = Name::try_from_str("rival-host.local.").unwrap();
+  b.push_srv_authority(&inst, 0, 0, 0, 9999, &target).unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
+  let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
+  let saw = e
+    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .unwrap()
+    .filter_map(Result::ok)
+    .any(|ev| {
+      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_proposal())
+    });
+  assert!(
+    saw,
+    "a TTL of 0 is not one of the fields §8.2.1 compares, so the record is in \
+     the peer's proposal and the proposal must reach the fold"
+  );
+}
+
 // ── the cross-layer invariant R10-1 broke ──────────────────────────────
 
 /// ROUTING OVER-APPROXIMATES ADMISSION: whenever the fold would act on a
@@ -8713,7 +8771,8 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
       srv_only,
     ),
     (
-      "a TTL=0 authority record is a withdrawal, not a claim",
+      "a TTL=0 authority record — §8.2.1 compares class, type and rdata, so the \
+       TTL cannot take a record out of the peer's proposal",
       INSTANCE,
       ResourceType::Any,
       goodbye_srv,
