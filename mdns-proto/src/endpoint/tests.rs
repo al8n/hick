@@ -3558,6 +3558,20 @@ fn answer_questions_false_still_defends_a_probed_unique_name() {
 /// `answer_questions(false)` suppresses ordinary queries — so admitting one
 /// walks a discovery query out to the service response path and past the whole
 /// point of the configuration. A nonzero NSCOUNT costs an attacker two bytes.
+///
+/// # …but an unreadable QUESTION SECTION still releases the defence
+///
+/// The last case is the one that reads backwards and must not be "corrected".
+/// This gate OVER-approximates on an undecidable Question Section, unlike
+/// `RouteEvents::authority_proposes_for`, which fails closed. The two are not
+/// inconsistent: withholding a §8.2 proposal decides nothing, because the fold's
+/// only terminal value for a datagram it cannot read is an abandonment, and an
+/// abandonment changes nothing. Withholding a §8.1 DEFENCE is not symmetric —
+/// §8.1 requires a host that is not probing to defend a name it has established,
+/// and refusing here would let a prober whose questions will not read take an
+/// advertised name from a passive endpoint. `QuestionsUnreadable` is reachable
+/// only from a record already matched to the questioned name in class IN, so the
+/// datagram is probe-shaped before the question is asked.
 #[test]
 fn answer_questions_false_defends_only_against_a_real_proposal() {
   use core::net::SocketAddr;
@@ -3602,6 +3616,33 @@ fn answer_questions_false_defends_only_against_a_real_proposal() {
   let mut declared_only = query(INSTANCE, None);
   declared_only[9] = 1; // NSCOUNT
   declared_only.extend_from_slice(&[0x05, b'h', b'e', b'l', b'l']);
+
+  // A genuine probe for our instance name, with a SECOND question spliced in
+  // whose QNAME is a compression pointer to its own offset. `try_parse` consumes
+  // the two pointer bytes without following them, so the section still parses and
+  // the authority record is still surfaced — but the QNAME will not decode, so
+  // admission answers `QuestionsUnreadable` for the datagram.
+  let unreadable_questions = {
+    let good = query(INSTANCE, Some(INSTANCE));
+    let qlen = {
+      let mut k = 0usize;
+      for label in INSTANCE.trim_end_matches('.').split('.') {
+        k += 1 + label.len();
+      }
+      k + 1 + 4 // root terminator + QTYPE + QCLASS
+    };
+    let mut d: std::vec::Vec<u8> = std::vec::Vec::new();
+    d.extend_from_slice(&good[..12]);
+    d[5] = 2; // QDCOUNT 1 -> 2
+    d.extend_from_slice(&good[12..12 + qlen]);
+    let at = 12 + qlen;
+    #[allow(clippy::cast_possible_truncation)]
+    d.extend_from_slice(&[0xC0 | ((at >> 8) as u8), at as u8]);
+    d.extend_from_slice(&ResourceType::Any.to_u16().to_be_bytes());
+    d.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+    d.extend_from_slice(&good[12 + qlen..]);
+    d
+  };
 
   let mut e = {
     let rng = rand::rngs::StdRng::from_seed([11u8; 32]);
@@ -3660,6 +3701,33 @@ fn answer_questions_false_defends_only_against_a_real_proposal() {
     "a nonzero NSCOUNT is a claim about the datagram, not a proposed record in \
      it — undecodable authority bytes must not buy a response out of an endpoint \
      configured not to answer"
+  );
+  // PRECONDITION: the section really is undecidable, so the assertion below is
+  // about the gate's disposition and not about a datagram that reads fine.
+  {
+    let reader = crate::wire::MessageReader::try_parse(&unreadable_questions).unwrap();
+    assert!(
+      reader
+        .questions()
+        .any(|q| !crate::endpoint::name_fully_decodes(q.unwrap().qname())),
+      "precondition: one QNAME really does fail to decode"
+    );
+    assert_eq!(
+      reader.authority().filter(|r| r.is_ok()).count(),
+      1,
+      "precondition: the authority record is still surfaced, so the gate reaches \
+       the question section at all"
+    );
+  }
+  assert_eq!(
+    questions_for(&unreadable_questions),
+    1,
+    "FAIL-OPEN, deliberately: this gate releases a §8.1 defence of a name already \
+     established, against a datagram carrying a proposed record at that name in \
+     class IN. Failing closed on a Question Section that will not read would let \
+     a prober take an advertised name from a passive endpoint. The §8.2 proposal \
+     route answers the same input the opposite way because withholding a proposal \
+     decides nothing"
   );
 }
 
