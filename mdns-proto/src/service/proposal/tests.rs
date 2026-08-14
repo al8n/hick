@@ -328,6 +328,94 @@ fn a_ttl_zero_record_is_still_part_of_the_peers_proposal() {
   );
 }
 
+/// A record whose CLASS is not IN is not in the peer's proposal — the RECORD's
+/// class, which is a different screen from the QUESTION's.
+///
+/// `a_question_asking_in_another_class_proposes_nothing_about_ours` pins the
+/// question side: a query contending a name in another class proposes nothing
+/// about our IN record. This pins the record side, and neither substitutes for
+/// the other — a conforming IN probe may still carry a record of another class
+/// in its Authority Section, and that record is not part of the RRset being
+/// contended.
+///
+/// It is load-bearing rather than cosmetic because of how the fold keys its
+/// elements. §8.2.1 orders "by class (then type, then rdata)", but
+/// [`ProposalFold`] omits the class from the sort key entirely — precisely
+/// BECAUSE only IN is admitted, so it is invariant. Admit a CH record and it is
+/// compared as though it were IN, at a position its real class would never have
+/// put it in.
+///
+/// Built so the two dispositions give OPPOSITE verdicts, like the TTL fixture
+/// above: the peer's SRV and TXT tie ours byte for byte, so the round turns
+/// entirely on the third record. Screened, the lists tie and §8.2.1's "no
+/// conflict" leaves us the name; admitted, the peer has a record remaining and
+/// takes it.
+#[test]
+fn a_record_of_another_class_is_not_in_the_peers_proposal() {
+  const INSTANCE: &str = "myprinter._ipp._tcp.local.";
+
+  fn labels(out: &mut std::vec::Vec<u8>, name: &str) {
+    for label in name.trim_end_matches('.').split('.') {
+      out.push(u8::try_from(label.len()).unwrap());
+      out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+  }
+  fn record(out: &mut std::vec::Vec<u8>, rtype: u16, rclass: u16, rdata: &[u8]) {
+    labels(out, INSTANCE);
+    out.extend_from_slice(&rtype.to_be_bytes());
+    out.extend_from_slice(&rclass.to_be_bytes());
+    out.extend_from_slice(&120u32.to_be_bytes());
+    out.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(rdata);
+  }
+
+  let records = ServiceRecords::new(
+    crate::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    crate::Name::try_from_str(INSTANCE).unwrap(),
+    crate::Name::try_from_str("host.local.").unwrap(),
+    631,
+    120,
+  );
+
+  let mut msg = std::vec::Vec::new();
+  msg.extend_from_slice(&0u16.to_be_bytes());
+  msg.extend_from_slice(&0u16.to_be_bytes()); // QR=0 — a probe is a query
+  msg.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+  msg.extend_from_slice(&0u16.to_be_bytes());
+  msg.extend_from_slice(&3u16.to_be_bytes()); // NSCOUNT
+  msg.extend_from_slice(&0u16.to_be_bytes());
+  labels(&mut msg, INSTANCE);
+  msg.extend_from_slice(&crate::wire::ResourceType::Any.to_u16().to_be_bytes());
+  msg.extend_from_slice(&(0x8000u16 | 1).to_be_bytes()); // QU | QCLASS IN
+  // SRV(0, 0, 631, host.local.) and an empty TXT — byte-identical to ours, both
+  // in class IN so the question and record classes both admit them.
+  let mut srv = std::vec::Vec::new();
+  srv.extend_from_slice(&0u16.to_be_bytes());
+  srv.extend_from_slice(&0u16.to_be_bytes());
+  srv.extend_from_slice(&631u16.to_be_bytes());
+  labels(&mut srv, "host.local.");
+  record(&mut msg, 33, 1, &srv);
+  record(&mut msg, 16, 1, &[0x00]);
+  // …and a third record in class CH(3). Its rtype (38) sorts after both of ours,
+  // so if it were admitted it would be exactly §8.2.1's record REMAINING once
+  // the tying pair is exhausted. Type 38 is absent from RFC 6762 §18.14, so its
+  // rdata compares verbatim and the fixture turns on the class alone.
+  record(&mut msg, 38, 3, &[0x2a]);
+
+  let src: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg).unwrap();
+  let pp = crate::event::ProbeProposal::new(src, reader, crate::event::DatagramId::new(1));
+  assert_eq!(
+    adjudicate(&pp, &records),
+    Verdict::WeHold,
+    "a class-CH record is not in the IN RRset being contended, so it is not one \
+     of the records §8.2.1 sorts — admitting it would compare it as though it \
+     were IN, since the fold leaves class out of its sort key on the strength of \
+     exactly this screen"
+  );
+}
+
 /// THE property, asserted where it actually lives: on the [`Verdict`].
 ///
 /// "No proposal containing anything undecodable produces a verdict" is a
