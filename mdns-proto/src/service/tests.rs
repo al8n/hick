@@ -9894,8 +9894,8 @@ fn a_proposal_with_no_question_is_not_adjudicated() {
 /// query asking in another class is contending a different namespace and its
 /// Authority Section is no proposal for our IN record — even when the records it
 /// carries are themselves class IN and sit at our exact name. The record-level
-/// `rclass` screen in `proposal_admits` cannot stand in for this: that one reads
-/// the RECORD's class, and this reads the QUESTION's.
+/// `rclass` screen in `ProposalScope::admits` cannot stand in for this: that
+/// one reads the RECORD's class, and this reads the QUESTION's.
 ///
 /// The payload is `winning_pair`, which
 /// `the_winning_pair_control_really_does_lose_the_round` proves takes the round

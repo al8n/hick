@@ -8803,7 +8803,7 @@ fn a_probe_proposing_a_ttl_zero_record_still_delivers_a_proposal() {
 /// non-verdict costs nothing — but it must never withhold one the fold would
 /// have acted on.
 ///
-/// Both layers now call `endpoint::proposal_admits`, so this is testing that the
+/// Both layers now use `endpoint::ProposalScope`, so this is testing that the
 /// single predicate really is reached from both — which is the part a shared
 /// function does not prove on its own.
 #[test]
