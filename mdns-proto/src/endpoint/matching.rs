@@ -103,6 +103,93 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
     && names_match(name, q.qname())
 }
 
+/// The admission rule's answer for ONE record of a §8.2 Authority Section.
+///
+/// There is deliberately no arm meaning "ours, but skip" and no arm meaning
+/// "ours, but abandon": a readable in-scope record has exactly ONE lawful
+/// consumption, the fold. §8.2 makes the Authority Section the sender's COMPLETE
+/// proposal — "the Authority Section must contain *all* the records and proposed
+/// rdata being probed for uniqueness" — and §8.2.1 adjudicates by comparing that
+/// list against ours. A predicate that quietly removes a record from the peer's
+/// list therefore does not filter noise; it fabricates a different proposal and
+/// decides the name over it.
+///
+/// # Why removal is a CORRECTNESS failure, not merely an unfair one
+///
+/// §8.2.1 sorts both lists and compares them pairwise "until a difference is
+/// found", awarding the name to "the list with records remaining". Removing an
+/// element does not only change the lengths: it changes WHICH elements occupy
+/// the compared prefix, so it can flip the verdict in EITHER direction.
+///
+/// Peer `[a, z]` against our `[b, c]`, with `a < b < c < z`. Compared in full,
+/// the first pair is `(a, b)`, `a` sorts earlier, and we hold the name. Drop `a`
+/// and the first pair becomes `(z, b)`: `z` sorts later, the peer wins, and we
+/// defer a round we lawfully won — then re-probe into the now-established peer's
+/// §8.1 defence, which renames us off our own name.
+///
+/// So "a shorter peer list flatters us" is not the rule. The rule is that a
+/// shortened list is a list nobody sent, and adjudicating it is wrong in both
+/// directions — which is why every failure abandons the whole proposal (a
+/// non-verdict, deciding nothing) instead of skipping the offending record.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum Admission {
+  /// Structurally part of a DIFFERENT proposal or a different RRset, so leaving
+  /// it out cannot shorten the list §8.2.1 compares for this name. Every variant
+  /// must name that structural reason; a predicate that cannot claim one does
+  /// not belong here.
+  NotOurs(NotOurs),
+  /// In the peer's proposal for this name. Fold it — there is nothing else to do
+  /// with it.
+  Ours,
+}
+
+/// WHY a record is not in this proposal, as a closed and greppable enum.
+///
+/// Each variant names a fact about which RRset or which proposal the record
+/// belongs to — never a judgement about whether it is worth comparing. That
+/// distinction is the whole contract:
+///
+/// * a record in another CLASS is in another namespace, and §8.2.1's ordering
+///   begins with the class;
+/// * a record at another OWNER name is a proposal about another name;
+/// * a record at our name in a datagram that asks about no such name is not part
+///   of a proposal at all, because §8.1 defines the probe as a query carrying
+///   "the record name in question in the Question Section" and §8.2 reads the
+///   proposal off "the Authority Section of *that query*".
+///
+/// # Adding a conjunct
+///
+/// A new screen means a new variant here, and the variant's documentation must
+/// defend that the records it excludes belong to SOMEONE ELSE'S proposal. That
+/// review is deliberately hard to pass, and three screens that once lived on
+/// this path would each have failed it visibly:
+///
+/// * a QTYPE screen — the sender's own QTYPE says what it wants ANSWERED; §8.2
+///   makes its Authority Section what it CLAIMS, and the two are different
+///   sections saying different things. The excluded records are the peer's own.
+/// * an RTYPE carve-out (compare only the types we publish) — a probe asks type
+///   ANY (§8.1), so every type the peer puts at the contested name is part of
+///   its proposal. The excluded records are the peer's own.
+/// * a TTL screen — §8.2.1 orders "by class (then type, then rdata)"; the TTL is
+///   not compared, and §10.1's TTL-zero goodbye is an encoding for an
+///   unsolicited RESPONSE, a different message in a different section. The
+///   excluded records are the peer's own.
+///
+/// Each shortened the peer's list, and by [`Admission`]'s reasoning each could
+/// decide the name in either direction over a list the peer never sent.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum NotOurs {
+  /// The record's CLASS is not IN. §8.2.1 orders by class first, so a record of
+  /// another class is not in the RRset being contended.
+  DifferentClass,
+  /// The record's OWNER name is not the name being adjudicated.
+  DifferentOwner,
+  /// No question in this query puts the scope's name in contention, so the
+  /// datagram's Authority Section is not a proposal for it — however that
+  /// section is filled, and including when QDCOUNT is zero.
+  NameOutOfQuestionScope,
+}
+
 /// The RFC 6762 §8.2 admission rule for ONE (query, name) pair: which of a
 /// query's Authority Section records are in the proposal it makes for `name`.
 ///
@@ -168,14 +255,16 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
 /// which is a different message in a different section; it says nothing about a
 /// QR=0 probe's Authority Section, and this predicate only ever runs on that.
 ///
-/// So a TTL screen here is one more way to SHORTEN the peer's list, and §8.2.1
-/// awards "the list with records remaining" the win — a shortened peer list is
-/// a verdict in our own favour, reached over a list the peer never made. A peer
-/// whose proposal held a TTL-zero record sorting after ours compared our
-/// complete list and kept the name, while we compared a truncated copy of its
-/// list and kept the name too: two conforming peers, one name. That is the same
-/// defect a QTYPE screen produced — see [`question_is_about`] — and it has the
-/// same shape whatever the screening field is.
+/// So a TTL screen here is one more way to SHORTEN the peer's list, and a
+/// shortened list is a list the peer never sent — which §8.2.1 can resolve in
+/// EITHER direction, never merely in ours (see [`Admission`]). A peer whose
+/// proposal held a TTL-zero record sorting after ours compared our complete list
+/// and kept the name, while we compared a truncated copy of its list and kept
+/// the name too: two conforming peers, one name. Reorder the same fixture so the
+/// screened record sorts FIRST and the loss lands on us instead, over a round we
+/// had won. That is the same defect a QTYPE screen produced — see
+/// [`question_is_about`] — and it has the same shape whatever the screening
+/// field is.
 ///
 /// The positive-TTL rule is correct where it governs a record ASSERTED rather
 /// than proposed: the §9 post-establishment conflict and the goodbye handling
@@ -187,27 +276,39 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
 /// need different things from a failure. `names_match_record` answers `false`
 /// both for "a different name" and for "a name I could not read", so the fold
 /// checks `name_fully_decodes` FIRST and abandons the whole proposal; the router
-/// simply does not deliver. Both reach a non-verdict, which is why the
-/// asymmetry is sound — see the `routing over-approximates admission` test.
+/// simply does not deliver. Both reach a NON-VERDICT, and a non-verdict decides
+/// nothing either way — which is why the asymmetry is sound. Pinned by
+/// `routing_over_approximates_what_the_fold_adjudicates`.
 ///
 /// # The Err case is the answer "I cannot tell"
 ///
-/// It is NOT "no". A question section that will not read leaves admission
-/// undecidable, and the two callers owe that fact opposite dispositions, which
-/// is precisely why it is returned rather than folded into the `bool`:
+/// It is NOT "no", and it is not per record: a Question Section that will not
+/// read leaves admission undecidable for the whole DATAGRAM, which is the honest
+/// scope for the fact and the reason it lives in the `Err` channel rather than
+/// as an [`Admission`] arm. There is no representable "this record is ours, but
+/// skip it".
 ///
-/// * the ROUTER treats it as YES (`unwrap_or(true)`), because a proposal that
-///   might concern us must still reach the fold — that is what lets the fold
-///   ABANDON it, and routing must over-approximate admission;
-/// * the FOLD treats it as ABANDON, because a list it could not finish reading
-///   is not a list §8.2.1 can sort.
+/// The three callers dispose of it differently, because what each RELEASES is
+/// different:
 ///
-/// Returning `false` for both — which is what `.flatten()` did here — reads
-/// "undecodable" as "not for us" at BOTH layers: the router does not deliver,
-/// so the fold never gets to abandon, and a datagram carrying a valid admitting
-/// question alongside a cyclic one is simply adjudicated. `.flatten()` over a
-/// fallible wire iterator is a fail-OPEN default and this branch has now paid
-/// for it twice.
+/// * the FOLD abandons the whole proposal, because a list it could not finish
+///   reading is not a list §8.2.1 can sort;
+/// * `RouteEvents::authority_proposes_for` treats it as NON-ADMISSION. The fold's
+///   terminal value for such a datagram is an abandonment, and abandonment is
+///   behaviourally identical to holding the name — so not delivering and
+///   delivering-then-abandoning are indistinguishable to a `Service`, while
+///   delivering costs a whole-endpoint fan-out per malformed packet;
+/// * `RouteEvents::is_probe_for` treats it as YES, and is the ONE fail-open of
+///   the three. It sits on no verdict path: it releases a §8.1 DEFENCE of a name
+///   already established, from an endpoint configured not to answer, against a
+///   datagram already probe-shaped at that name in class IN. Failing closed there
+///   would let a prober with an unreadable Question Section take an advertised
+///   name.
+///
+/// Folding all three into a plain "no" — which is what `.flatten()` did here —
+/// would also silently make the FOLD adjudicate a datagram carrying a valid
+/// admitting question alongside a cyclic one. `.flatten()` over a fallible wire
+/// iterator is a fail-OPEN default and this branch has paid for it twice.
 pub(crate) struct ProposalScope<'n, F> {
   questions: F,
   name: &'n Name,
@@ -229,16 +330,33 @@ where
   }
 
   /// Is `r` in the proposal this query makes for the scope's name?
-  pub(crate) fn admits(&mut self, r: &crate::wire::Ref<'_>) -> Result<bool, QuestionsUnreadable> {
-    if r.rclass() != ResourceClass::In || !names_match_record(self.name, r) {
-      return Ok(false);
+  ///
+  /// Every `Ok` answer is one of [`Admission`]'s two arms, and the negative arm
+  /// carries the structural reason it is not this proposal's record. There is no
+  /// third answer: a record that is [`Admission::Ours`] is folded.
+  pub(crate) fn admits(
+    &mut self,
+    r: &crate::wire::Ref<'_>,
+  ) -> Result<Admission, QuestionsUnreadable> {
+    if r.rclass() != ResourceClass::In {
+      return Ok(Admission::NotOurs(NotOurs::DifferentClass));
     }
-    if let Some(scoped) = self.scoped {
-      return scoped;
+    if !names_match_record(self.name, r) {
+      return Ok(Admission::NotOurs(NotOurs::DifferentOwner));
     }
-    let scoped = self.read_questions();
-    self.scoped = Some(scoped);
-    scoped
+    let scoped = match self.scoped {
+      Some(scoped) => scoped,
+      None => {
+        let scoped = self.read_questions();
+        self.scoped = Some(scoped);
+        scoped
+      }
+    };
+    Ok(if scoped? {
+      Admission::Ours
+    } else {
+      Admission::NotOurs(NotOurs::NameOutOfQuestionScope)
+    })
   }
 
   /// Does this query ask a question that puts `name` in scope? Read once; every
@@ -264,7 +382,11 @@ where
 
 /// The datagram's Question Section could not be read to the end, so whether it
 /// admits a record is UNKNOWN — see [`ProposalScope`] for why that is not the
-/// same as "no", and why its two callers answer it differently.
+/// same as "no", and why its callers answer it differently.
+///
+/// Its scope is the DATAGRAM, not one record, which is why it is an `Err` rather
+/// than a [`NotOurs`] variant: nothing about it claims the record belongs to
+/// someone else's proposal.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct QuestionsUnreadable;
 

@@ -8736,9 +8736,10 @@ fn a_question_for_another_name_routes_no_proposal_for_ours() {
 /// Section is a claim whatever TTL it carries.
 ///
 /// Withholding it here does not merely skip a record: it is what lets the fold
-/// compare a SHORTER peer list than the peer sent, and §8.2.1 awards the name to
-/// "the list with records remaining", so the shortening always favours us while
-/// the peer — comparing our complete list — reaches the opposite answer.
+/// compare a SHORTER peer list than the peer sent, while the peer compares our
+/// complete one. §8.2.1 sorts both lists and walks them pairwise, so removing an
+/// element changes WHICH elements meet — the two sides then answer differently,
+/// and not always in our favour (see `crate::endpoint::Admission`).
 ///
 /// The per-record §8.1/§9 conflict route keeps its own TTL=0 guard, which
 /// `authority_ttl_zero_does_not_emit_conflict_events` pins: that path turns a
@@ -8786,26 +8787,35 @@ fn a_probe_proposing_a_ttl_zero_record_still_delivers_a_proposal() {
 
 // ── the cross-layer invariant R10-1 broke ──────────────────────────────
 
-/// ROUTING OVER-APPROXIMATES ADMISSION: whenever the fold would act on a
-/// datagram, the endpoint routed a `ProbeProposal` for it.
+/// ROUTING OVER-APPROXIMATES VERDICTS: whenever the fold would reach
+/// `PeerWins` or `WeHold` for a service's name, the endpoint routed a
+/// `ProbeProposal` for that datagram.
 ///
-/// This is the invariant R10's first finding broke, and it broke MECHANICALLY.
-/// The two layers each spelled out `ttl != 0 && class == IN && the name matches
-/// && a question admits it`; the fold's copy was corrected to admit every RTYPE
-/// and the router's was left at SRV/TXT. Nothing failed, because every fixture
-/// drove ONE layer. A peer proposing only an AAAA then folded our records into
-/// its own comparison and continued as the winner while this endpoint, never
-/// handed the proposal, also continued — two conforming peers, one name.
+/// The invariant is stated over VERDICTS, not over admission, because a verdict
+/// is the only thing delivery can change. §8.2.1's two outcomes move a
+/// `Service`: `PeerWins` loses the round, `WeHold` keeps it. `Abandoned` moves
+/// nothing — it traces and returns — so a datagram whose only terminal value is
+/// an abandonment is one the router may withhold, and withholding it decides
+/// exactly as much as abandoning it would (nothing). That equivalence is pinned
+/// separately by `an_abandoned_proposal_behaves_exactly_like_we_hold`; if it ever
+/// stops holding, `authority_proposes_for`'s fail-closed disposition has to be
+/// revisited and this test's statement with it.
 ///
-/// So this drives BOTH layers over the SAME constructed datagrams and requires
-/// the implication to hold for each. Deliberately not an equivalence: the router
-/// may deliver a proposal the fold then declines or abandons, because a
-/// non-verdict costs nothing — but it must never withhold one the fold would
-/// have acted on.
+/// It is deliberately an implication and not an equivalence in the other
+/// direction either: the router may deliver a proposal the fold then abandons.
 ///
-/// Both layers now use `endpoint::ProposalScope`, so this is testing that the
-/// single predicate really is reached from both — which is the part a shared
-/// function does not prove on its own.
+/// The failure it exists for is mechanical drift. The two layers each spelled out
+/// `ttl != 0 && class == IN && the name matches && a question admits it`; the
+/// fold's copy was corrected to admit every RTYPE and the router's was left at
+/// SRV/TXT. Nothing failed, because every fixture drove ONE layer. A peer
+/// proposing only an AAAA then folded our records into its own comparison and
+/// continued as the winner while this endpoint, never handed the proposal, also
+/// continued — two conforming peers, one name.
+///
+/// So this drives `Endpoint::handle` and `service::proposal::adjudicate` over the
+/// SAME constructed datagrams. Layer two calls the real fold rather than
+/// re-deriving what it would admit, which is the part a shared predicate does not
+/// prove on its own.
 #[test]
 fn routing_over_approximates_what_the_fold_adjudicates() {
   use crate::{
@@ -8840,9 +8850,20 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
   }
 
   /// One case: description, the question's name and QTYPE, and the authority
+  /// One case: description, whether the datagram is a §8.2 proposal for our
+  /// instance name AT ALL, the question's name and QTYPE, and the authority
   /// records to push (all at the instance name).
+  ///
+  /// The second field is DECLARED GROUND TRUTH about the bytes, read off §8.1
+  /// and §8.2 by hand — never computed from the admission rule, which is one of
+  /// the two things this test is cross-checking. It is needed because
+  /// `adjudicate` overloads `WeHold`: §8.2.1's "there is, in fact, no conflict"
+  /// and "this query proposed nothing for me" are the same value, since a fold
+  /// that compared nothing cannot have records remaining. Only the first is a
+  /// verdict ABOUT something, and only the first has to be delivered.
   type Case = (
     &'static str,
+    bool,
     &'static str,
     ResourceType,
     fn(&mut MessageBuilder<'_, 32>, &Name),
@@ -8850,30 +8871,38 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
   let cases: [Case; 7] = [
     (
       "the conforming probe: ANY question, SRV+TXT proposed",
+      true,
       INSTANCE,
       ResourceType::Any,
       srv_txt,
     ),
     (
-      "R10-1: ANY question, only an AAAA — a type we do not publish",
+      "ANY question, only an AAAA — a type we do not publish",
+      true,
       INSTANCE,
       ResourceType::Any,
       aaaa_only,
     ),
     (
-      "R10-1: ANY question, only an A",
+      "ANY question, only an A",
+      true,
       INSTANCE,
       ResourceType::Any,
       a_only,
     ),
     (
-      "R10-5: a question for ANOTHER name, our name in the authority section",
+      // §8.2 reads the proposal off "the Authority Section of *that query*", and
+      // this query asks about Scanner — so it proposes nothing about Printer,
+      // however its Authority Section is filled.
+      "a question for ANOTHER name, our name in the authority section",
+      false,
       "Scanner._ipp._tcp.local.",
       ResourceType::Any,
       srv_txt,
     ),
     (
       "a SPECIFIC qtype naming the proposed record's own type",
+      true,
       INSTANCE,
       ResourceType::Srv,
       srv_only,
@@ -8881,6 +8910,7 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     (
       "a SPECIFIC qtype naming NO proposed record's type — the Authority \
        Section is the peer's whole §8.2 proposal either way",
+      true,
       INSTANCE,
       ResourceType::Txt,
       srv_only,
@@ -8888,6 +8918,7 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     (
       "a TTL=0 authority record — §8.2.1 compares class, type and rdata, so the \
        TTL cannot take a record out of the peer's proposal",
+      true,
       INSTANCE,
       ResourceType::Any,
       goodbye_srv,
@@ -8907,11 +8938,11 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     )
   };
 
-  // …plus the R11 datagrams, which are the ones the interaction turns on: each
-  // must reach the fold PRECISELY so the fold can abandon it. A router that
-  // treated "undecodable" as "not for us" would withhold them, the fold would
-  // never see them, and nothing would abandon.
-  let mut extra: std::vec::Vec<(&str, std::vec::Vec<u8>)> = std::vec::Vec::new();
+  // …plus the malformed datagrams, carrying the same declared ground truth. Two
+  // of them still propose something readable at our name; the third proposes
+  // nothing readable at all, and the fold's only terminal value for it is an
+  // abandonment.
+  let mut extra: std::vec::Vec<(&str, bool, std::vec::Vec<u8>)> = std::vec::Vec::new();
   {
     // A question whose QNAME is an unresolvable pointer, alongside a valid one.
     let mut buf = [0u8; 512];
@@ -8939,7 +8970,7 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     d.extend_from_slice(&ResourceType::Any.to_u16().to_be_bytes());
     d.extend_from_slice(&1u16.to_be_bytes());
     d.extend_from_slice(&good[12 + qlen..]);
-    extra.push(("R11-2: a pointer-named QNAME beside a valid question", d));
+    extra.push(("a pointer-named QNAME beside a valid question", true, d));
   }
   {
     // A KX whose rdata may hold a compression pointer.
@@ -8962,16 +8993,16 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     d.extend_from_slice(&4u16.to_be_bytes());
     d.extend_from_slice(&[0x00, 0x0A, 0xC0, 0x0C]);
     d[9] = 3; // NSCOUNT 2 -> 3
-    extra.push(("R11-1: a KX whose rdata may hold a compression pointer", d));
+    extra.push((
+      "a KX whose rdata may hold a compression pointer",
+      true,
+      d,
+    ));
   }
   {
-    // An authority section that stops PARSING partway. `Records` halts at its
-    // first error, so every record after it is invisible — including, possibly,
-    // the one at our name. The router must deliver on that, or the fold never
-    // gets the chance to abandon.
-    // The truncated record is the ONLY one: with valid records ahead of it the
-    // router would still find something to admit, and the case would pass
-    // whether or not it over-approximates on the error.
+    // An authority section that stops PARSING at its first record, with no
+    // readable record ahead of it. `Records` halts at its first error, so the
+    // section carries nothing this query proposes for any name.
     let mut buf = [0u8; 512];
     let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
     b.push_question(&instance, ResourceType::Any, ResourceClass::In, true)
@@ -8980,21 +9011,26 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     let mut d = buf[..n].to_vec();
     d[9] = 1; // NSCOUNT claims one record …
     d.extend_from_slice(&[0x05, b'h', b'e', b'l', b'l']); // … which is truncated
-    extra.push(("R11: an authority section that stops parsing at its first record", d));
+    extra.push((
+      "an authority section that stops parsing at its first record",
+      false,
+      d,
+    ));
   }
 
-  let built = cases.into_iter().map(|(what, qname, qtype, push_recs)| {
-    let mut buf = [0u8; 512];
-    let q = Name::try_from_str(qname).unwrap();
-    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
-    b.push_question(&q, qtype, ResourceClass::In, true).unwrap();
-    push_recs(&mut b, &instance);
-    let n = b.finish().unwrap();
-    (what, buf[..n].to_vec())
-  });
+  let built = cases
+    .into_iter()
+    .map(|(what, proposes_for_us, qname, qtype, push_recs)| {
+      let mut buf = [0u8; 512];
+      let q = Name::try_from_str(qname).unwrap();
+      let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, Header::new()).unwrap();
+      b.push_question(&q, qtype, ResourceClass::In, true).unwrap();
+      push_recs(&mut b, &instance);
+      let n = b.finish().unwrap();
+      (what, proposes_for_us, buf[..n].to_vec())
+    });
 
-  for (what, datagram) in built.chain(extra) {
-
+  for (what, proposes_for_us, datagram) in built.chain(extra) {
     // LAYER 1 — the endpoint: was a ProbeProposal routed?
     let (mut e, _h) = build_endpoint_with_printer();
     let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
@@ -9005,24 +9041,20 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
       .filter_map(Result::ok)
       .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
 
-    // LAYER 2 — the fold: is any record of this datagram IN the proposal? That is
-    // precisely "the fold would act on it": an admitted record is one it folds,
-    // and a §8.2 verdict can only come from folded records.
+    // LAYER 2 — the fold, called for real rather than re-derived. Its terminal
+    // value is the whole question: `PeerWins` and `WeHold` are §8.2.1's two
+    // verdicts, `Abandoned` is not a verdict at all.
     let reader = crate::wire::MessageReader::try_parse(&datagram).unwrap();
     let recs = records();
-    // `Err` is "cannot tell", which the fold treats as ABANDON — and an
-    // abandonment is still the fold acting on the datagram, so it counts here
-    // exactly like an admission. That is what the router must over-approximate.
-    let mut scope = crate::endpoint::ProposalScope::new(|| reader.questions(), recs.instance());
-    let admits_any = reader
-      .authority()
-      .any(|r| r.as_ref().is_err() || r.as_ref().is_ok_and(|r| scope.admits(r).unwrap_or(true)));
+    let pp = crate::event::ProbeProposal::new(src, reader, crate::event::DatagramId::new(1));
+    let verdict = crate::service::proposal::adjudicate(&pp, &recs);
+    let reaches_a_verdict = !matches!(verdict, crate::service::proposal::Verdict::Abandoned(_));
 
     assert!(
-      !admits_any || routed,
-      "{what}: the fold admits a record from this datagram, so a ProbeProposal \
-       MUST have been routed for it — routing must OVER-approximate admission, \
-       never under-approximate it"
+      !(proposes_for_us && reaches_a_verdict) || routed,
+      "{what}: this datagram proposes something at our name and the fold reaches \
+       {verdict:?} over it, so a ProbeProposal MUST have been routed — routing \
+       must OVER-approximate verdicts, never under-approximate them"
     );
   }
 }
@@ -9089,7 +9121,10 @@ fn one_admission_scope_reads_the_question_section_at_most_once() {
   );
   let admitted = reader
     .authority()
-    .filter(|r| r.as_ref().is_ok_and(|r| scope.admits(r).unwrap()))
+    .filter(|r| {
+      r.as_ref()
+        .is_ok_and(|r| scope.admits(r).unwrap() == crate::endpoint::Admission::Ours)
+    })
     .count();
   assert_eq!(
     admitted, 8,
@@ -9116,11 +9151,21 @@ fn one_admission_scope_reads_the_question_section_at_most_once() {
     },
     &instance,
   );
-  let admitted = reader
+  // …and each is refused for the STRUCTURAL reason, not merely refused: these
+  // records are at another owner name, so they are part of another name's
+  // proposal and leaving them out cannot shorten the list §8.2.1 compares here.
+  let answers: std::vec::Vec<_> = reader
     .authority()
-    .filter(|r| r.as_ref().is_ok_and(|r| scope.admits(r).unwrap()))
-    .count();
-  assert_eq!(admitted, 0, "none of these records is at the scope's name");
+    .map(|r| scope.admits(r.as_ref().unwrap()).unwrap())
+    .collect();
+  assert_eq!(
+    answers,
+    std::vec![
+      crate::endpoint::Admission::NotOurs(crate::endpoint::NotOurs::DifferentOwner);
+      4
+    ],
+    "none of these records is at the scope's name"
+  );
   assert_eq!(
     walks.get(),
     0,

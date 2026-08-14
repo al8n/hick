@@ -259,10 +259,16 @@ fn the_fold_gives_the_longer_list_the_win_and_ties_no_conflict() {
 /// The fixture is built so the two dispositions give OPPOSITE verdicts. The
 /// peer's SRV and TXT tie ours byte for byte, so the whole comparison turns on
 /// its third record: counted, the peer's list has records remaining and §8.2.1
-/// gives it the name; dropped, the lists tie and we keep the name. A screen that
-/// shortens the peer's list can therefore only ever flatter us — which is the
-/// defect, since the peer compares OUR complete list and reaches the other
-/// answer, leaving two conforming hosts each holding the name.
+/// gives it the name; dropped, the lists tie and we keep the name. The peer
+/// compares OUR complete list and reaches the other answer, so two conforming
+/// hosts each hold the name.
+///
+/// This arrangement — the screened record sorting LAST — is the one where the
+/// omission happens to favour us. It is not the general case: because §8.2.1
+/// walks the two sorted lists pairwise, dropping a LOW-sorting record promotes a
+/// higher one into the compared prefix and can lose us a round we had won. See
+/// [`crate::endpoint::Admission`]; the rule is the same either way, and it is
+/// that a shortened list is a list nobody sent.
 #[test]
 fn a_ttl_zero_record_is_still_part_of_the_peers_proposal() {
   const INSTANCE: &str = "myprinter._ipp._tcp.local.";
@@ -420,12 +426,15 @@ fn a_record_of_another_class_is_not_in_the_peers_proposal() {
 ///
 /// "No proposal containing anything undecodable produces a verdict" is a
 /// statement about `adjudicate`'s RESULT, and a `Service`-level fixture cannot
-/// see it — `Abandoned` and `WeHold` both leave `tiebreak_lost` false, so a
-/// regression that silently SKIPPED the undecodable part instead of abandoning
-/// would keep every service-level test green. Only the verdict tells them apart,
-/// and the difference matters: skipping shortens the peer's list, and §8.2.1
-/// gives the longer list the win, so a skip is systematically biased toward
-/// deciding we won.
+/// see it — `Abandoned` and `WeHold` are behaviourally identical, which
+/// `an_abandoned_proposal_behaves_exactly_like_we_hold` pins, so a regression
+/// that silently SKIPPED the undecodable part instead of abandoning would keep
+/// every service-level test green. Only the verdict tells them apart, and the
+/// difference matters: skipping shortens the peer's list, and §8.2.1 walks the
+/// two sorted lists pairwise, so removing an element changes which elements meet
+/// and can flip the round in EITHER direction — see
+/// [`crate::endpoint::Admission`]. A skip is not a thumb on the scale, it is a
+/// verdict over a list nobody sent.
 ///
 /// Every reason the fold can abandon for is driven from a real datagram here, so
 /// each `?` in `fold` has a case behind it.
@@ -564,8 +573,9 @@ fn anything_undecodable_yields_no_verdict() {
       adjudicate(&pp, &records()),
       expected,
       "{what}: a proposal is adjudicated only when every part of it that had to \
-       be read, read — and skipping the unreadable part instead would shorten \
-       the peer's list, which only ever flatters us"
+       be read, read — and skipping the unreadable part instead would compare a \
+       shortened list the peer never sent, which §8.2.1 can resolve in either \
+       direction"
     );
   }
 }

@@ -259,8 +259,10 @@ where
       let Ok(r) = r else {
         return true;
       };
-      if scope.admits(&r).unwrap_or(true) {
-        return true;
+      // Exhaustive on purpose: `Admission` has no arm meaning "ours, but skip".
+      match scope.admits(&r) {
+        Ok(Admission::Ours) | Err(QuestionsUnreadable) => return true,
+        Ok(Admission::NotOurs(_)) => continue,
       }
     }
     false
@@ -312,8 +314,9 @@ where
       if !name_fully_decodes(r.name()) {
         continue;
       }
-      if scope.admits(&r).unwrap_or(true) {
-        return true;
+      match scope.admits(&r) {
+        Ok(Admission::Ours) | Err(QuestionsUnreadable) => return true,
+        Ok(Admission::NotOurs(_)) => continue,
       }
     }
     false

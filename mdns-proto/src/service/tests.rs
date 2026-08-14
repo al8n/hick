@@ -9729,8 +9729,9 @@ fn the_winning_pair_control_really_does_lose_the_round() {
 /// I could not decode", and `Ref` parsing accepts a compression pointer without
 /// ever resolving it — so a cyclic owner name arrived looking exactly like an
 /// out-of-scope record and was silently dropped from the list being compared.
-/// Dropping records only ever shortens the peer's list, which only ever flatters
-/// us: here the readable subset alone would have taken the round, and the
+/// A dropped record leaves a list the peer never sent, and §8.2.1 walks the two
+/// sorted lists pairwise — so the omission can decide the round in either
+/// direction. Here the readable subset alone would have taken the round, and the
 /// unreadable record could have been anything.
 #[test]
 fn an_undecodable_owner_name_abandons_the_whole_proposal() {
@@ -10040,8 +10041,10 @@ fn make_cname_record_ref(buf: &mut std::vec::Vec<u8>, owner_str: &str, ttl: u32,
 /// §8.2 requires the Authority Section to carry "*all* the records and proposed
 /// rdata being probed for uniqueness": it is the sender's complete proposal, and
 /// the sender's own QTYPE narrows nothing about it. Scoping any of it away
-/// shortens the peer's list, and §8.2.1 gives "the list with records remaining"
-/// the win — so every such omission decides in our own favour.
+/// shortens the peer's list, and §8.2.1 sorts both lists and walks them
+/// pairwise — so the omission changes which elements meet and decides the round
+/// over a list the peer never sent, in whichever direction the removed record's
+/// sort position happens to push it.
 ///
 /// The fixture needs `instance == host`: only then does `write_probe` put the
 /// A/AAAA records under the contested owner, so our sorted list OPENS with type
@@ -10485,8 +10488,9 @@ fn our_nsec_identities_match_what_the_builder_emits() {
 /// question section" arm, and that is only safe if this holds. If it did not,
 /// a record admitted by a question parsing BEFORE a broken one would be folded
 /// while the rest of the section went unseen — silently shortening the peer's
-/// list, which is the failure direction that matters: a shorter peer list only
-/// ever flatters us.
+/// list. §8.2.1 walks the two sorted lists pairwise, so an omission changes which
+/// elements meet and can decide the round in either direction, over a list the
+/// peer never sent.
 #[test]
 fn an_unparseable_question_section_surfaces_no_authority_records() {
   let (txt, srv) = winning_pair();
@@ -10529,6 +10533,137 @@ fn an_unparseable_question_section_surfaces_no_authority_records() {
   assert!(
     !svc.tiebreak_lost,
     "a datagram whose question section will not parse yields no §8.2 verdict"
+  );
+}
+
+/// ABANDONMENT IS BEHAVIOURALLY IDENTICAL TO `WeHold`. Two services in the same
+/// state, one handed a proposal the fold abandons and one handed a proposal it
+/// resolves in our favour, are indistinguishable from that point on — same
+/// state, same name, same deadlines, same bytes on the wire.
+///
+/// This is an equivalence other code RELIES on, not a curiosity.
+/// `RouteEvents::authority_proposes_for` withholds a `ProbeProposal` it cannot
+/// read instead of delivering one the fold would only abandon, and that is sound
+/// exactly because delivering-then-abandoning and never-delivering leave the
+/// `Service` in the same place. §8.2.1 resolves a contest between two lists; a
+/// section that is not a list it can sort resolves nothing, and "nothing" is what
+/// a host that has not lost its round does next.
+///
+/// So if `Verdict::Abandoned` ever becomes a yield — a deferral, a rename, a
+/// backoff — this test fails FIRST, and the router's fail-closed disposition on
+/// the proposal path has to be revisited with it.
+///
+/// The abandoning fixture is built so a regression is loud rather than quiet: its
+/// readable subset is `winning_pair`, which
+/// `the_winning_pair_control_really_does_lose_the_round` proves takes the round
+/// outright. A fold that skipped the undecodable record instead of abandoning
+/// would defer this service, and the two sides would diverge on the first
+/// comparison below.
+#[test]
+fn an_abandoned_proposal_behaves_exactly_like_we_hold() {
+  use crate::service::proposal::{Abandon, Verdict, adjudicate};
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+
+  // A peer proposal §8.2.1 resolves in our favour: SRV port 1 sorts before our
+  // 631, and the TXTs tie.
+  let holds = srv_txt_proposal(1);
+  // The same winning pair the control fixture uses, plus a third record whose
+  // owner name is a pointer to its own offset: §8.2 requires "*all* the records
+  // and proposed rdata", and this section cannot be read to that standard.
+  let (txt, srv) = winning_pair();
+  let at = first_record_offset(PROBED_NAME) + txt.len() + srv.len();
+  let mut cyclic = std::vec::Vec::new();
+  make_cyclic_owner_record(&mut cyclic, at, 1, 120, &[10, 0, 0, 7]);
+  let abandons = raw_proposal_bytes(&[txt, srv, cyclic]);
+
+  // PRECONDITION: the two datagrams really do reach the two different terminal
+  // values. Without this the comparison below could pass by comparing a verdict
+  // against itself.
+  let records = make_records(120);
+  assert_eq!(
+    adjudicate(&probe_proposal(&holds, peer, dg(1)), &records),
+    Verdict::WeHold,
+    "precondition: the peer's SRV port 1 sorts before our 631"
+  );
+  assert_eq!(
+    adjudicate(&probe_proposal(&abandons, peer, dg(1)), &records),
+    Verdict::Abandoned(Abandon::UndecodableOwnerName),
+    "precondition: an owner name that will not decode abandons the proposal"
+  );
+
+  let t0 = FakeInstant::zero();
+  let mut held = make_service(120);
+  let mut abandoned = make_service(120);
+  held.handle_timeout(t0).unwrap();
+  abandoned.handle_timeout(t0).unwrap();
+
+  held.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&holds, peer, dg(1))),
+    t0,
+  );
+  abandoned.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&abandons, peer, dg(1))),
+    t0,
+  );
+
+  // The two §8.1/§8.2 latches, the lifecycle state, the name, and the next
+  // deadline — everything the event could have moved.
+  assert_eq!(
+    (
+      abandoned.tiebreak_lost,
+      abandoned.probe_defeated,
+      abandoned.state(),
+      abandoned.name().as_str(),
+      abandoned.poll_timeout(),
+    ),
+    (
+      held.tiebreak_lost,
+      held.probe_defeated,
+      held.state(),
+      held.name().as_str(),
+      held.poll_timeout(),
+    ),
+    "an abandonment must leave the service exactly where a WeHold leaves it"
+  );
+
+  // …and it stays identical through the rest of the §8.1 sequence, byte for
+  // byte. Both services were seeded identically, so any divergence in jitter,
+  // deadlines or emitted records shows up here.
+  let mut held_buf = std::vec![0u8; 4096];
+  let mut abandoned_buf = std::vec![0u8; 4096];
+  let mut now = t0;
+  for tick in 0..20 {
+    now = now.advance(500);
+    held.handle_timeout(now).unwrap();
+    abandoned.handle_timeout(now).unwrap();
+    let h = held.poll_transmit(now, &mut held_buf).unwrap();
+    let a = abandoned.poll_transmit(now, &mut abandoned_buf).unwrap();
+    assert_eq!(
+      h.map(|t| t.size()),
+      a.map(|t| t.size()),
+      "tick {tick}: the two services must transmit the same datagram or neither"
+    );
+    if let Some(tx) = h {
+      assert_eq!(
+        abandoned_buf.get(..tx.size()),
+        held_buf.get(..tx.size()),
+        "tick {tick}: byte-for-byte identical datagrams"
+      );
+      held.note_delivery(now, TransmitDelivery::ALL);
+      abandoned.note_delivery(now, TransmitDelivery::ALL);
+    }
+    assert_eq!(
+      (abandoned.state(), abandoned.name().as_str()),
+      (held.state(), held.name().as_str()),
+      "tick {tick}: the two services must stay in lockstep"
+    );
+  }
+  assert_eq!(
+    held.state(),
+    ServiceState::Established,
+    "the control really did carry on and establish, so the lockstep above is \
+     over a sequence that goes somewhere"
   );
 }
 

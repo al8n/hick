@@ -45,7 +45,8 @@ pub(crate) enum Verdict {
   WeHold,
   /// The Authority Section is not a list §8.2.1 can sort, so it yields NO
   /// verdict at all. Never a silent skip of the offending record: dropping one
-  /// shortens the peer's list, and a shorter peer list only ever flatters us.
+  /// shortens the peer's list, and §8.2.1 resolves a shortened list in EITHER
+  /// direction — see [`adjudicate`].
   Abandoned(Abandon),
 }
 
@@ -92,11 +93,25 @@ pub(crate) enum Abandon {
 /// to be read to have read. There is no arm that can quietly `continue` past an
 /// error, because a `Result` cannot be ignored.
 ///
-/// It matters which way that fails. Skipping an unreadable record SHORTENS the
-/// peer's list, and a shorter peer list only ever flatters us: §8.2.1 gives "the
-/// list with records remaining" the win, so dropping the peer's records is
-/// systematically biased toward deciding we won. Every failure therefore
-/// abandons the whole proposal, which decides nothing at all.
+/// It matters which way that fails, and the failure is worse than unfair.
+/// Skipping an unreadable record SHORTENS the peer's list, and §8.2.1 does not
+/// merely count: it sorts both lists and compares them pairwise "until a
+/// difference is found", awarding the name to "the list with records remaining".
+/// Removing an element changes WHICH elements meet in that comparison, so it can
+/// flip the verdict in EITHER direction.
+///
+/// [`ProposalFold`] shows it directly: it keeps the peer's `keep` SMALLEST
+/// elements and zips them against ours, returning on the first non-`Equal` pair.
+/// With the peer proposing `[a, z]` against our `[b, c]`, `a < b < c < z`, the
+/// full lists meet as `(a, b)` — `Less`, so we hold. Drop `a` and the surviving
+/// `z` is promoted into the compared prefix: `(z, b)` is `Greater`, the peer
+/// wins, and we defer a round that was lawfully ours, re-probe into the
+/// now-established peer's §8.1 defence, and get renamed off our own name.
+///
+/// So a skip is not a thumb on the scale in our favour; it is a verdict computed
+/// over a list nobody sent, which can hand us a name we did not win and can
+/// equally lose us one we did. Every failure therefore abandons the whole
+/// proposal, which decides nothing at all.
 pub(crate) fn adjudicate(
   pp: &crate::event::ProbeProposal<'_>,
   ours_records: &ServiceRecords,
@@ -135,15 +150,14 @@ fn fold(
       return Err(Abandon::UndecodableOwnerName);
     }
     // Scope: EXACTLY the endpoint's admission rule, used rather than restated.
-    // See [`crate::endpoint::ProposalScope`] — the two layers held independent
-    // copies of this once and one of them went stale, which is how a peer
-    // proposing a type we do not publish became invisible to a whole endpoint.
+    // See [`crate::endpoint::Admission`] — the two layers held independent copies
+    // of this once and one of them went stale, which is how a peer proposing a
+    // type we do not publish became invisible to a whole endpoint.
     //
     // Its `Err` is "I cannot tell whether this is admitted", and here that
-    // abandons. The ROUTER answers the same `Err` with "deliver anyway", which is
-    // what gets the datagram here to be abandoned in the first place; the two
-    // dispositions are the whole reason admission is fallible rather than a
-    // `bool` that folds undecodable into "no".
+    // abandons. `Admission` has no arm meaning "ours, but skip", which is why the
+    // match below has only the two arms it has: an in-scope readable record is
+    // folded, and everything unreadable leaves through a `?`.
     //
     // TWO DIFFERENT MALFORMED-QUESTION CASES, and they fail closed by different
     // routes. A question section that will not PARSE leaves the authority section
@@ -154,19 +168,23 @@ fn fold(
     // consumes the two pointer bytes without following them, so the section
     // parses and the records ARE surfaced. That case is caught here, by
     // admission decoding every QNAME in full.
-    if !scope.admits(&r).map_err(|_| Abandon::UnreadableQuestions)? {
-      continue;
+    match scope.admits(&r).map_err(|_| Abandon::UnreadableQuestions)? {
+      // Structurally another proposal's record or another RRset's, so leaving it
+      // out cannot shorten the list §8.2.1 compares for our name.
+      crate::endpoint::Admission::NotOurs(_) => continue,
+      crate::endpoint::Admission::Ours => {
+        // §8.2's ordering key: class, then type, then rdata. Class is invariant
+        // (only IN is admitted above), so type then the peer's own bytes.
+        //
+        // In scope but not decodable: same abandonment, same reason. Skipping it
+        // would silently shorten the very list being compared.
+        let mut elem = std::vec::Vec::new();
+        elem.extend_from_slice(&r.rtype().to_u16().to_be_bytes());
+        r.write_canonical_rdata(RdataForm::AS_SENT, &mut elem)
+          .map_err(|_| Abandon::UndecodableRdata)?;
+        fold.offer(elem);
+      }
     }
-    // §8.2's ordering key: class, then type, then rdata. Class is invariant
-    // (only IN is admitted above), so type then the peer's own bytes.
-    //
-    // In scope but not decodable: same abandonment, same reason. Skipping it
-    // would silently shorten the very list being compared.
-    let mut elem = std::vec::Vec::new();
-    elem.extend_from_slice(&r.rtype().to_u16().to_be_bytes());
-    r.write_canonical_rdata(RdataForm::AS_SENT, &mut elem)
-      .map_err(|_| Abandon::UndecodableRdata)?;
-    fold.offer(elem);
   }
   Ok(if fold.peer_wins(&ours) {
     Verdict::PeerWins

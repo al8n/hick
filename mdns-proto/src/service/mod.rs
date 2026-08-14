@@ -3,7 +3,13 @@
 cfg_heap! {
   use crate::trace::*;
 
-  mod proposal;
+  /// `pub(crate)` for the PATH only. The seal this module keeps is that nothing
+  /// outside it picks an `RdataForm` for §8.2 — see its own documentation — and
+  /// that is enforced by what it exports (a finished `Verdict`), not by where it
+  /// can be named from. The endpoint's routing tests adjudicate real datagrams
+  /// through `adjudicate` rather than restating the fold, which is the whole
+  /// point of `routing_over_approximates_what_the_fold_adjudicates`.
+  pub(crate) mod proposal;
   mod respond;
 }
 pub(crate) mod schedule;
