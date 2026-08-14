@@ -103,18 +103,43 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
     && names_match(name, q.qname())
 }
 
-/// Is `r` part of the RFC 6762 §8.2 proposal that this query's Authority Section
-/// makes for `name`?
+/// The RFC 6762 §8.2 admission rule for ONE (query, name) pair: which of a
+/// query's Authority Section records are in the proposal it makes for `name`.
 ///
 /// THE admission rule, and the only copy of it. Two layers ask this question —
 /// `RouteEvents::authority_proposes_for` decides whether a datagram is a
 /// proposal for a registered name at all, and `service::proposal::adjudicate`
-/// decides which of that section's records are in the list it folds — and until
-/// now each spelled it out itself. That is not a hypothetical drift channel: the
+/// decides which of that section's records are in the list it folds — and each
+/// once spelled it out itself. That is not a hypothetical drift channel: the
 /// two copies once disagreed about which RTYPES count, the fold was fixed and
 /// the router was left, and the result was that a peer proposing a type we do
 /// not publish was invisible to a whole endpoint while it considered itself the
 /// winner. Duplicate ownership between two conforming peers.
+///
+/// # Why it is a value and not a function
+///
+/// Scope is decided by the QUESTION Section, and the question section says the
+/// same thing for every record in the datagram: after the QTYPE gate came out,
+/// what admission reads off the questions is "does this query ask about `name`,
+/// in class IN", which does not vary with the record being tested. Asking it per
+/// record re-parsed and fully decoded every question for every authority record.
+/// A maximum-size UDP datagram carries roughly 5,400 minimal questions and 2,700
+/// minimal records, so a peer could buy ~15 million pair iterations — before any
+/// compression-chain work — with one link-local packet, twice over, since the
+/// router scans as well as the fold.
+///
+/// So the walk is hoisted to the pair, not to the caller. A per-caller summary
+/// would be the second copy of the rule this type exists to prevent — the exact
+/// drift that produced the SRV/TXT defect — whereas binding `questions` and
+/// `name` together here keeps one rule with one home and reads the Question
+/// Section AT MOST ONCE per (query, name).
+///
+/// It is memoised rather than computed eagerly in [`Self::new`] so the walk
+/// still happens at exactly the moment it happened before: on the first record
+/// that passes the owner-and-class gate, and never on a datagram whose authority
+/// records are all out of scope. That keeps [`QuestionsUnreadable`] — and both
+/// callers' dispositions of it — reachable on precisely the datagrams that
+/// reached it before, so the fail-open/fail-closed split below is not widened.
 ///
 /// The conjuncts, each with its own reason:
 ///
@@ -130,15 +155,9 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
 ///   the reason lives, since a §8.2 Authority Section is the sender's whole
 ///   proposal rather than an answer to its own question.
 ///
-/// `questions` is a CLOSURE returning a fresh iterator, not an iterator: this is
-/// called once per authority record and the question section must be re-walked
-/// for each. What that walk decides no longer varies with the record — scope is
-/// the owner name and the class — yet it is re-derived here rather than
-/// summarised once by each caller, because a per-caller summary is exactly the
-/// second copy of the rule this function exists to prevent. Both sections come
-/// from ONE link-local datagram whose sections `Endpoint::handle` has already
-/// walked, so the product is bounded by that datagram's size, and the scan only
-/// runs for a record already matched to `name`.
+/// `questions` is a CLOSURE returning a fresh iterator rather than an iterator,
+/// because [`crate::wire::Questions`] is single-pass and the walk must start
+/// from the top of the section whenever it is taken.
 ///
 /// # TTL is deliberately NOT considered
 ///
@@ -189,35 +208,62 @@ pub(crate) fn question_is_about(q: &QuestionRef<'_>, name: &Name) -> bool {
 /// question alongside a cyclic one is simply adjudicated. `.flatten()` over a
 /// fallible wire iterator is a fail-OPEN default and this branch has now paid
 /// for it twice.
-pub(crate) fn proposal_admits<'a, F>(
-  r: &crate::wire::Ref<'a>,
+pub(crate) struct ProposalScope<'n, F> {
   questions: F,
-  name: &Name,
-) -> Result<bool, QuestionsUnreadable>
+  name: &'n Name,
+  /// The question section's answer, taken at most once: `None` until some record
+  /// passes the owner-and-class gate and makes it matter.
+  scoped: Option<Result<bool, QuestionsUnreadable>>,
+}
+
+impl<'a, 'n, F> ProposalScope<'n, F>
 where
   F: Fn() -> crate::wire::Questions<'a>,
 {
-  if r.rclass() != ResourceClass::In || !names_match_record(name, r) {
-    return Ok(false);
-  }
-  let mut admitted = false;
-  // The WHOLE section, never short-circuited on the first admitting question: a
-  // malformed question sitting AFTER one that admits still makes the proposal
-  // unreadable, and `.any()` would have returned before reaching it.
-  for q in questions() {
-    let q = q.map_err(|_| QuestionsUnreadable)?;
-    if !name_fully_decodes(q.qname()) {
-      return Err(QuestionsUnreadable);
-    }
-    if question_is_about(&q, name) {
-      admitted = true;
+  pub(crate) const fn new(questions: F, name: &'n Name) -> Self {
+    Self {
+      questions,
+      name,
+      scoped: None,
     }
   }
-  Ok(admitted)
+
+  /// Is `r` in the proposal this query makes for the scope's name?
+  pub(crate) fn admits(&mut self, r: &crate::wire::Ref<'_>) -> Result<bool, QuestionsUnreadable> {
+    if r.rclass() != ResourceClass::In || !names_match_record(self.name, r) {
+      return Ok(false);
+    }
+    if let Some(scoped) = self.scoped {
+      return scoped;
+    }
+    let scoped = self.read_questions();
+    self.scoped = Some(scoped);
+    scoped
+  }
+
+  /// Does this query ask a question that puts `name` in scope? Read once; every
+  /// later record reuses the answer, because nothing about it depends on the
+  /// record.
+  fn read_questions(&self) -> Result<bool, QuestionsUnreadable> {
+    let mut admitted = false;
+    // The WHOLE section, never short-circuited on the first admitting question: a
+    // malformed question sitting AFTER one that admits still makes the proposal
+    // unreadable, and `.any()` would have returned before reaching it.
+    for q in (self.questions)() {
+      let q = q.map_err(|_| QuestionsUnreadable)?;
+      if !name_fully_decodes(q.qname()) {
+        return Err(QuestionsUnreadable);
+      }
+      if question_is_about(&q, self.name) {
+        admitted = true;
+      }
+    }
+    Ok(admitted)
+  }
 }
 
 /// The datagram's Question Section could not be read to the end, so whether it
-/// admits a record is UNKNOWN — see [`proposal_admits`] for why that is not the
+/// admits a record is UNKNOWN — see [`ProposalScope`] for why that is not the
 /// same as "no", and why its two callers answer it differently.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct QuestionsUnreadable;

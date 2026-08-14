@@ -226,8 +226,8 @@ where
   ///
   /// # One predicate, one home
   ///
-  /// Both halves above are [`proposal_admits`], CALLED rather than restated —
-  /// `service::proposal::adjudicate` scopes the fold with the same call over the
+  /// Both halves above are [`ProposalScope`], USED rather than restated —
+  /// `service::proposal::adjudicate` scopes the fold with the same type over the
   /// same records, so the two layers cannot answer differently. Spelling the rule
   /// out twice is exactly what produced the SRV/TXT defect: the fold's copy was
   /// corrected and this one was left, and a peer proposing a type we do not
@@ -241,6 +241,10 @@ where
   /// `Endpoint::handle` and `Service::handle_event` over the SAME constructed
   /// datagrams rather than trusting two spellings to agree.
   fn authority_proposes_for(&self, name: &crate::Name) -> bool {
+    // ONE scope for the whole section: the question section decides scope by
+    // owner name and class, which does not vary with the record, so it is read
+    // at most once here instead of once per authority record.
+    let mut scope = ProposalScope::new(|| self.reader.questions(), name);
     for r in self.reader.authority() {
       // Every undecidable answer is YES here, and that is the whole job of this
       // layer. A record that will not parse, or a question section that will not
@@ -255,7 +259,7 @@ where
       let Ok(r) = r else {
         return true;
       };
-      if proposal_admits(&r, || self.reader.questions(), name).unwrap_or(true) {
+      if scope.admits(&r).unwrap_or(true) {
         return true;
       }
     }

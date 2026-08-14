@@ -8898,13 +8898,10 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     // `Err` is "cannot tell", which the fold treats as ABANDON — and an
     // abandonment is still the fold acting on the datagram, so it counts here
     // exactly like an admission. That is what the router must over-approximate.
-    let admits_any = reader.authority().any(|r| {
-      r.as_ref().is_err()
-        || r.as_ref().is_ok_and(|r| {
-          crate::endpoint::proposal_admits(r, || reader.questions(), recs.instance())
-            .unwrap_or(true)
-        })
-    });
+    let mut scope = crate::endpoint::ProposalScope::new(|| reader.questions(), recs.instance());
+    let admits_any = reader
+      .authority()
+      .any(|r| r.as_ref().is_err() || r.as_ref().is_ok_and(|r| scope.admits(r).unwrap_or(true)));
 
     assert!(
       !admits_any || routed,
@@ -8913,4 +8910,106 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
        never under-approximate it"
     );
   }
+}
+
+/// One §8.2 admission scope reads the Question Section AT MOST ONCE, however
+/// many Authority records it is asked about — and does not read it at all when
+/// none of them is at the scope's name.
+///
+/// Admission used to re-parse and fully decode every question for every
+/// authority record. Scope is the owner name and class, which does not vary with
+/// the record, so that product was pure repetition: a maximum-size datagram
+/// carries roughly 5,400 minimal questions and 2,700 minimal records, and both
+/// the router and the fold scan, so one link-local packet bought ~15 million
+/// pair iterations twice over before any compression-chain work.
+///
+/// The second half is the part that keeps behaviour identical rather than merely
+/// faster. `QuestionsUnreadable` — the answer whose two callers owe it OPPOSITE
+/// dispositions, fail-open at the router and abandon at the fold — is produced
+/// by that walk, so hoisting it above the owner-and-class gate would surface it
+/// on datagrams that never reached it: ones whose authority records are all at
+/// other names, and ones with no authority records at all. Memoising on first
+/// use, rather than reading eagerly, is what leaves those datagrams alone.
+#[test]
+fn one_admission_scope_reads_the_question_section_at_most_once() {
+  use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceClass, ResourceType};
+
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let other = Name::try_from_str("Scanner._ipp._tcp.local.").unwrap();
+  let target = Name::try_from_str("rival-host.local.").unwrap();
+
+  // `at_ours` authority records at the instance name, then `at_theirs` at
+  // another name, behind a question that puts the instance in scope.
+  let datagram = |at_ours: usize, at_theirs: usize| -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 2048];
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(&mut buf, Header::new()).unwrap();
+    b.push_question(&instance, ResourceType::Any, ResourceClass::In, true)
+      .unwrap();
+    for i in 0..at_ours {
+      #[allow(clippy::cast_possible_truncation)]
+      b.push_srv_authority(&instance, 120, 0, 0, 9000 + i as u16, &target)
+        .unwrap();
+    }
+    for i in 0..at_theirs {
+      #[allow(clippy::cast_possible_truncation)]
+      b.push_srv_authority(&other, 120, 0, 0, 9500 + i as u16, &target)
+        .unwrap();
+    }
+    let n = b.finish().unwrap();
+    buf[..n].to_vec()
+  };
+
+  // Eight records at our name and four at another: the answer is unchanged for
+  // every one of them, so one walk of the questions covers all twelve.
+  let bytes = datagram(8, 4);
+  let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+  let walks = core::cell::Cell::new(0usize);
+  let mut scope = crate::endpoint::ProposalScope::new(
+    || {
+      walks.set(walks.get().saturating_add(1));
+      reader.questions()
+    },
+    &instance,
+  );
+  let admitted = reader
+    .authority()
+    .filter(|r| r.as_ref().is_ok_and(|r| scope.admits(r).unwrap()))
+    .count();
+  assert_eq!(
+    admitted, 8,
+    "every record at the scope's name is admitted, and none of the others"
+  );
+  assert_eq!(
+    walks.get(),
+    1,
+    "the question section decides scope by owner name and class, which does not \
+     vary with the record — so it is read once for the whole section, not once \
+     per record"
+  );
+
+  // And a datagram proposing nothing at our name never reaches the questions at
+  // all, which is what keeps `QuestionsUnreadable` reachable from exactly the
+  // datagrams that reached it before.
+  let bytes = datagram(0, 4);
+  let reader = crate::wire::MessageReader::try_parse(&bytes).unwrap();
+  let walks = core::cell::Cell::new(0usize);
+  let mut scope = crate::endpoint::ProposalScope::new(
+    || {
+      walks.set(walks.get().saturating_add(1));
+      reader.questions()
+    },
+    &instance,
+  );
+  let admitted = reader
+    .authority()
+    .filter(|r| r.as_ref().is_ok_and(|r| scope.admits(r).unwrap()))
+    .count();
+  assert_eq!(admitted, 0, "none of these records is at the scope's name");
+  assert_eq!(
+    walks.get(),
+    0,
+    "the owner-and-class gate comes first, so a datagram whose authority records \
+     are all out of scope never causes the question section to be read"
+  );
 }

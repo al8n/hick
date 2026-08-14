@@ -115,6 +115,10 @@ fn fold(
 ) -> Result<Verdict, Abandon> {
   let ours = our_proposal(ours_records);
   let mut fold = ProposalFold::new(ours.len());
+  // ONE scope for the whole proposal. What the Question Section decides — is
+  // this name in scope, in class IN — is the same for every record of the
+  // datagram, so it is read at most once instead of once per authority record.
+  let mut scope = crate::endpoint::ProposalScope::new(|| pp.questions(), ours_records.instance());
   for r in pp.authority() {
     let r = r.map_err(|_| Abandon::UnparseableAuthority)?;
     // OWNER NAME FIRST, before any filter that could read a decode failure as an
@@ -130,8 +134,8 @@ fn fold(
     if !crate::endpoint::name_fully_decodes(r.name()) {
       return Err(Abandon::UndecodableOwnerName);
     }
-    // Scope: EXACTLY the endpoint's admission rule, called rather than restated.
-    // See [`crate::endpoint::proposal_admits`] — the two layers held independent
+    // Scope: EXACTLY the endpoint's admission rule, used rather than restated.
+    // See [`crate::endpoint::ProposalScope`] — the two layers held independent
     // copies of this once and one of them went stale, which is how a peer
     // proposing a type we do not publish became invisible to a whole endpoint.
     //
@@ -150,9 +154,7 @@ fn fold(
     // consumes the two pointer bytes without following them, so the section
     // parses and the records ARE surfaced. That case is caught here, by
     // admission decoding every QNAME in full.
-    if !crate::endpoint::proposal_admits(&r, || pp.questions(), ours_records.instance())
-      .map_err(|_| Abandon::UnreadableQuestions)?
-    {
+    if !scope.admits(&r).map_err(|_| Abandon::UnreadableQuestions)? {
       continue;
     }
     // §8.2's ordering key: class, then type, then rdata. Class is invariant
