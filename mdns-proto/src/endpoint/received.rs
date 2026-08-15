@@ -26,13 +26,13 @@ pub enum Provenance {
   ///
   /// **One route, and it is the ordering that earns it.** A content match with no
   /// ordering evidence is [`Self::OwnEchoLikely`] however stale the generation it
-  /// matched — see that variant's obligation. A SUPERSEDED match was reported
-  /// here once, and it was the same false axiom `relinquished_retention`'s screen
-  /// abandoned: byte equality read as proof of origin. An old local responder and
-  /// a live RFC 6762 §9 fault-tolerance twin can put the same bytes on the link,
+  /// matched — see that variant's obligation. A SUPERSEDED match does not belong
+  /// here: that is the false axiom `relinquished_retention`'s screen is built to
+  /// avoid, byte equality read as proof of origin. An old local responder and a
+  /// live RFC 6762 §9 fault-tolerance twin can put the same bytes on the link,
   /// and a peer can replay them, so a stale-generation match says what the
   /// datagram CONTAINS and not who sent it — and a driver's superseded entry is
-  /// typically non-consuming, so reporting it here made every matching peer
+  /// typically non-consuming, so reporting it here makes every matching peer
   /// defence invisible for the credit's whole lifetime.
   ///
   /// The only tier that suppresses everything, which is why nothing but ordering
@@ -62,8 +62,8 @@ pub enum Provenance {
   /// credit is not mistaken for an ordered one; both stale and current unordered
   /// matches land here.
   ///
-  /// **A service REGISTRATION is not a mutation, and this list once said it
-  /// was** — against its own quantifier. A registration only inserts a route:
+  /// **A service REGISTRATION is not a mutation**, despite falling inside that
+  /// quantifier at a glance. A registration only inserts a route:
   /// [`Endpoint::try_register_service`](super::Endpoint::try_register_service)
   /// refuses a duplicate instance name, a name a collision goodbye still holds,
   /// and a host name a live route publishes with a different A or AAAA set, and
