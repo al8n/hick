@@ -355,6 +355,11 @@ impl State {
     let (handle, svc) = self
       .endpoint
       .try_register_service::<Slab<_>, Slab<_>>(spec, now)?;
+    // A new live route publishes records no credit recorded so far knows about,
+    // and the reverse: an in-flight echo of a WITHDRAWING route's announcement
+    // can now be routed to this one. After the `?`, so a rejected registration
+    // advances nothing. See `SelfSendTracker::supersede`.
+    self.selfsend.supersede();
     self.services.insert(
       handle,
       ServiceCtx {
@@ -499,6 +504,12 @@ impl State {
       // completes so a re-register cannot cancel it.
       self.endpoint.enqueue_rename_withdrawal(handoff, now, true);
     }
+    // The withdrawing route stops holding its host name for the registration
+    // guard, so a replacement may take that name with a DIFFERENT address set
+    // while this goodbye drains — and a delayed echo of the announcement we
+    // recorded a credit for would then be differing host rdata against the
+    // replacement. See `SelfSendTracker::supersede`.
+    self.selfsend.supersede();
     self.endpoint.begin_withdrawal(handle, snap, now);
   }
 
@@ -1500,6 +1511,18 @@ impl State {
       match self.selfsend.claim(rx) {
         SelfSendMatch::Ordered => Provenance::OwnEcho,
         SelfSendMatch::Degraded => Provenance::OwnEchoLikely,
+        // Our bytes, but from a generation of our own records that no longer
+        // exists — a service registered or began withdrawing since the send. It
+        // maps to `OwnEcho` because that is the only tier which denies
+        // ADJUDICATION, and adjudication is precisely what a stale echo must not
+        // have: its RFC 6762 §8.2 proposal is for a name this endpoint may no
+        // longer be defending, and its §9 rdata is rdata no live route holds, so
+        // routing it fans our own withdrawn generation into the REPLACEMENT
+        // service, which classifies it as differing host rdata and retires
+        // terminally. This is not a claim of stronger evidence than the match
+        // carried — see `SelfSendMatch::Superseded` and
+        // `SelfSendTracker::supersede`.
+        SelfSendMatch::Superseded => Provenance::OwnEcho,
         SelfSendMatch::NoCredit => Provenance::NotFromUs,
       }
     } else {

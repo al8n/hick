@@ -3969,3 +3969,88 @@ fn a_permanently_too_large_goodbye_holds_the_name_to_the_ceiling() {
     .register_service(sample_spec(), at(t))
     .expect("the ceiling force-completes the withdrawal and releases the name");
 }
+
+/// A withdrawing service's delayed echo must not retire the service that
+/// REPLACED it.
+///
+/// `Endpoint::host_addresses_disagree` deliberately skips withdrawing routes, so
+/// a replacement may take a host name with a DIFFERENT address set while the
+/// outgoing RFC 6762 §10.1 goodbye is still draining. That is the whole point of
+/// the skip — the alternative is blocking every replacement until the goodbye
+/// finishes — but it means an announcement recorded in this engine's five-second
+/// self-send log can outlive the records it describes.
+///
+/// The `OwnEchoLikely` adjudication cell is documented as safe partly because
+/// "§8.4 record updating is unimplemented, so no self-echo can carry differing
+/// rdata". Service REPLACEMENT reaches the same state across generations without
+/// any record-update API: the stale echo carries A's address, the routing table
+/// fans it to B (live, same host name), and B classifies it against ITS OWN
+/// records as differing host rdata — a terminal `HostConflict`, raised by this
+/// engine's own past against its own present.
+#[test]
+fn a_withdrawn_services_echo_cannot_retire_its_replacement() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(77));
+  let host = "shared.local.";
+  let a = engine
+    .register_service(
+      spec_for(
+        "_ipp._tcp.local.",
+        "A._ipp._tcp.local.",
+        host,
+        Ipv4Addr::new(10, 0, 0, 1),
+      ),
+      at(0),
+    )
+    .unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+  // Drive A to Established so an ANNOUNCEMENT — authoritative A records at the
+  // shared host name — has gone out and been recorded in the self-send log.
+  for micros in pump_schedule() {
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+  }
+  let (_, announcement) = io.sent.last().cloned().expect("A announced");
+
+  // A retires. Its route stops holding the host name for the registration
+  // guard, so B may take it with a different address set.
+  engine.unregister_service(a, at(5_100_000));
+  let b = engine
+    .register_service(
+      spec_for(
+        "_ipp._tcp.local.",
+        "B._ipp._tcp.local.",
+        host,
+        Ipv4Addr::new(10, 0, 0, 2),
+      ),
+      at(5_200_000),
+    )
+    .expect("a withdrawing route no longer holds its host name");
+
+  // A's announcement arrives late — still well inside RECENT_SEND_TTL, and from
+  // a source the advertised-source fallback cannot catch, so only the self-send
+  // log has anything to say about it.
+  io.inbound.push_back((
+    announcement,
+    RecvMeta {
+      src: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 99), 5353)),
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
+      len: 0,
+    },
+  ));
+  engine.pump(|| at(5_300_000), &mut io, &mut scratch);
+
+  let mut terminal = false;
+  while let Some(update) = engine.poll_service_update(b) {
+    terminal |= matches!(
+      update,
+      ServiceUpdate::Conflict | ServiceUpdate::HostConflict
+    );
+  }
+  assert!(
+    !terminal,
+    "an echo of the WITHDRAWN service's announcement adjudicated against its \
+     replacement and terminally retired it — the credit outlived the records it \
+     describes"
+  );
+}

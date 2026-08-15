@@ -155,7 +155,7 @@ impl Mdns {
         .map(|(&handle, _)| handle),
     );
     for &handle in svc_scratch.iter() {
-      crate::endpoint::begin_service_withdrawal(endpoint, services, handle);
+      crate::endpoint::begin_service_withdrawal(endpoint, services, selfsend, handle);
     }
 
     // THE stage instant, and the only one this pass polls and completes

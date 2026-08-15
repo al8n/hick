@@ -560,6 +560,11 @@ impl Mdns {
     let (handle, proto) = self
       .endpoint
       .try_register_service::<Slab<_>, Slab<_>>(spec, now)?;
+    // A new live route publishes records no credit recorded so far knows about,
+    // and the reverse: an in-flight echo of a WITHDRAWING route's announcement
+    // can now be routed to this one. After the `?`, so a rejected registration
+    // advances nothing.
+    self.selfsend.supersede();
     self.services.insert(
       handle,
       ServiceCtx {
@@ -595,9 +600,12 @@ impl Mdns {
   /// Unknown and already-unregistered handles are accepted and ignored.
   pub fn unregister_service(&mut self, handle: ServiceHandle) {
     let Self {
-      endpoint, services, ..
+      endpoint,
+      services,
+      selfsend,
+      ..
     } = self;
-    begin_service_withdrawal(endpoint, services, handle);
+    begin_service_withdrawal(endpoint, services, selfsend, handle);
   }
 
   /// Begin the RFC 6762 §10.1 goodbye for every live service and refuse further
@@ -651,6 +659,7 @@ impl Mdns {
     let Self {
       endpoint,
       services,
+      selfsend,
       svc_scratch,
       ..
     } = self;
@@ -662,7 +671,7 @@ impl Mdns {
         .map(|(&handle, _)| handle),
     );
     for &handle in svc_scratch.iter() {
-      begin_service_withdrawal(endpoint, services, handle);
+      begin_service_withdrawal(endpoint, services, selfsend, handle);
     }
   }
 
@@ -864,9 +873,24 @@ fn alloc_buf(size: usize, setting: &'static str) -> Result<Vec<u8>, ServerError>
 /// the channel, and every caller that has one will eventually pass the one it
 /// happens to be holding. Same shape as
 /// [`SelfSendTracker::claim`](hick_udp::selfsend::SelfSendTracker::claim).
+///
+/// # Why the tracker is a parameter too
+///
+/// Beginning a withdrawal changes which routes are live and what the live ones
+/// publish: the withdrawing route stops holding its host name for the
+/// registration guard, so a replacement may take that name with a DIFFERENT
+/// address set while this goodbye drains. Every credit recorded before that
+/// point therefore describes a state this endpoint has left, and an echo of one
+/// must be suppressed rather than adjudicated against the replacement — see
+/// [`SelfSendTracker::supersede`](hick_udp::selfsend::SelfSendTracker::supersede).
+///
+/// It is threaded through rather than read off `Mdns`, because this is a free
+/// function precisely so its two hot callers can reach it from a split borrow,
+/// and both of those already hold the tracker.
 pub(crate) fn begin_service_withdrawal(
   endpoint: &mut ProtoEndpoint,
   services: &mut HashMap<ServiceHandle, ServiceCtx>,
+  selfsend: &mut SelfSendTracker,
   handle: ServiceHandle,
 ) {
   // Scoped so the borrow of `services` ends before `endpoint` is touched; the
@@ -896,6 +920,9 @@ pub(crate) fn begin_service_withdrawal(
     // retraction the renamed-away name will ever get.
     endpoint.enqueue_rename_withdrawal(handoff, StdInstant::now(), true);
   }
+  // After the early return above, so an unknown or already-withdrawing handle
+  // changes nothing and advances nothing.
+  selfsend.supersede();
   endpoint.begin_withdrawal(handle, snapshot, StdInstant::now());
 }
 
