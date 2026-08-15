@@ -140,54 +140,101 @@ impl Admits {
       //     INVALIDATED BY: moving that classification back inside individual
       //     arms, or admitting a conflict arm that runs before it.
       //
-      //  3. EVERY DATAGRAM THIS ARM MAY TREAT AS OUR OWN ECHO WAS SENT UNDER
-      //     THE RECORD GENERATION THIS ENDPOINT STILL PUBLISHES. Invariant 2
-      //     holds only while our records have not changed under a recorded
-      //     send, and a self-echo that outlives such a change IS reachable —
-      //     not through RFC 6762 §8.4 record updating, which is unimplemented,
-      //     but through SERVICE REPLACEMENT, which crosses generations rather
-      //     than mutating one. A withdrawing route is skipped by the host
-      //     address-set guard on purpose (invariant 4), so a replacement may
-      //     take host `H` with address set `A2` while the route that held `H`
-      //     with `A1` is still draining its §10.1 goodbye. A delayed
-      //     positive-TTL echo of `A1` is still matched as ours and carries
-      //     rdata no live route holds, so invariant 2 does not stop it; the
-      //     withdrawing route is skipped by every conflict fan-out too, leaving
-      //     the REPLACEMENT as its only recipient and a TERMINAL
-      //     `ServiceUpdate::HostConflict` as the result. Same-instance reuse
-      //     with changed SRV/TXT reaches a false §8.1 probe defeat the same
-      //     way.
-      //     What keeps such an echo out of THIS arm is driver-side, and it is
-      //     the one invariant here the crate cannot check for itself: a
-      //     self-send credit is bound to the record generation it was sent
-      //     under, and a credit from a superseded generation is DEMOTED to
-      //     `OwnEcho` — the only tier that denies adjudication — rather than
-      //     discarded. Demoted, because discarding it makes the same echo read
-      //     as no credit at all, hence `NotFromUs`, hence full adjudication AND
-      //     full observation: the same failure, louder.
+      //  3. A CONFLICT CANDIDATE CARRYING RDATA THIS ENDPOINT RECENTLY
+      //     TRANSMITTED AND RELINQUISHED NEVER REACHES A SERVICE AT ALL — it is
+      //     screened out by `Endpoint::relinquished_asserts` in the conflict
+      //     fan-out, before any `HostConflict` or `ProbeConflict` is built.
+      //     TRANSMITTED, not merely configured, and the distinction is the
+      //     invariant's own boundary: the screen answers only for the record
+      //     IDENTITIES a confirmed positive authoritative send actually emitted
+      //     (`Service`'s `GoodbyeOwnership` latch, carried on
+      //     `WithdrawalSnapshot` / `RenameGoodbyeHandoff`). A record no
+      //     transport accepted has no echo of ours to disown, so retaining it
+      //     could only discard a GENUINE incumbent's records and let a same-name
+      //     successor announce over a peer that already holds the name — the
+      //     opposite error, and the worse one. A relinquishment with no exposure
+      //     at all therefore retains nothing.
+      //     Invariant 2 holds only while our records have not changed under a
+      //     recorded send, and a self-echo that outlives such a change IS
+      //     reachable — not through RFC 6762 §8.4 record updating, which is
+      //     unimplemented, but through SERVICE REPLACEMENT, which crosses
+      //     generations rather than mutating one. A withdrawing route is skipped
+      //     by the host address-set guard on purpose (invariant 4), so a
+      //     replacement may take host `H` with address set `A2` while the route
+      //     that held `H` with `A1` is still draining its §10.1 goodbye. A
+      //     delayed positive-TTL echo of `A1` carries rdata no live route holds,
+      //     so invariant 2 does not stop it; the withdrawing route is skipped by
+      //     every conflict fan-out too, leaving the REPLACEMENT as its only
+      //     recipient and a TERMINAL `ServiceUpdate::HostConflict` as the
+      //     result. Same-instance reuse with changed SRV/TXT reaches a false
+      //     §8.1 probe defeat the same way.
+      //     Invariant 3 is that gap closed WHERE §9 already put the rule:
+      //     "identical rdata is never a conflict", asked of the sets this
+      //     ENDPOINT recently published as well as of the receiving service's
+      //     own. Service B structurally cannot know that `A1` was ours; only the
+      //     endpoint can, so the endpoint decides it — over withdrawal items
+      //     still resident and a retention list of what has lapsed, ONE ROW PER
+      //     RELINQUISHED GENERATION, each living to its own expiry. See the
+      //     `endpoint::relinquished` module.
+      //     THE LIST'S CEILING DROPS NOTHING. Every live row is an obligation
+      //     still owed, so reaching `MAX_RELINQUISHED_RRSETS` quarantines this
+      //     endpoint's own adjudication — every conflict withheld for one
+      //     retention window — instead of evicting a row. An endpoint that
+      //     cannot say "that record was not ours" must not say the opposite
+      //     either. That degradation is recoverable where an eviction's is not:
+      //     mDNS re-raises a missed conflict on the next announcement, while a
+      //     dropped relinquishment's echo arrives once and retires a live
+      //     service permanently.
+      //     The quarantine is NOT a name-reuse embargo — registration and rename
+      //     are untouched — and it pauses neither §8.2 nor the §8.1 defence,
+      //     since neither consults the screen.
+      //     THE DRIVER-SIDE GENERATION BINDING IS NOW DEFENCE IN DEPTH, NOT THE
+      //     LOAD-BEARING MECHANISM, and moving the weight off it was the point.
+      //     Every driver-side RECOGNITION of such an echo is defeasible, three
+      //     ways, none of which the crate can bound: a replaying on-link peer
+      //     reproduces every signal a send log weighs (family, exact bytes,
+      //     source port 5353, age — and a kernel receive stamp adds none, since
+      //     it only rejects arrivals BEFORE our send); one send is credited once
+      //     per family while the medium may deliver several copies, so the copy
+      //     that loses the race reads `NotFromUs` with no attacker involved; and
+      //     recognition state is evicted under traffic while the obligation is
+      //     per copy. Three consecutive rounds patched recognition and each left
+      //     the class open. This invariant depends on none of it.
       //     STILL OPEN: an in-place record update is a SECOND route to a
-      //     self-echo carrying rdata we no longer hold, and no generation
-      //     advance covers it. Implementing §8.4 must re-argue this cell, not
-      //     merely add the API.
-      //     INVALIDATED BY: a driver that stops superseding its credits at
-      //     EVERY MUTATION OF WHAT IT PUBLISHES — a service registration; the
-      //     `begin_withdrawal` that retires a route however that retirement was
-      //     reached (caller unregister, shutdown, rename collision, internal
-      //     retirement); and the §9 AUTOMATIC RENAME, at the driver's own
-      //     `ServiceUpdate::Renamed`, which is `Service::set_instance` already
-      //     applied and is the one of the three that reaches no lifecycle seam
-      //     when it succeeds — or that discards a superseded credit instead of
-      //     demoting it.
-      //     The rename belongs here as a MUTATION, and deliberately not because
-      //     a consequence was traced from it. A driver holds ONE generation for
-      //     its whole send log, so the next registration or withdrawal demotes
-      //     the renamer's stale credit too; what the advance at the rename
-      //     closes is the stretch between the rename and that next seam, during
-      //     which a credit for the abandoned instance name still claims as
-      //     current and still adjudicates. Arguing from reachability instead is
-      //     what left the rename off this list once already — a reachability
-      //     argument has to be re-made after every change to the routing, and
-      //     this invariant does not.
+      //     self-echo carrying rdata we no longer hold. It does not cross a
+      //     lifecycle seam, so nothing feeds the screen for it. Implementing
+      //     §8.4 must call `Endpoint::retain_relinquished` with the superseded
+      //     set, and must re-argue this cell rather than merely add the API.
+      //     INVALIDATED BY: a relinquishment that reaches none of
+      //     `Endpoint::drain_completed_withdrawals`,
+      //     `Endpoint::enqueue_rename_withdrawal` or
+      //     `Endpoint::unregister_service` — a new teardown path that frees a
+      //     route without draining its withdrawal item, or a rename whose
+      //     old-name handoff is not enqueued; a conflict event built
+      //     anywhere other than `RouteEvents::next_host_conflict` /
+      //     `next_service_conflict`, which are the two sites that consult the
+      //     screen; a retention window (`EndpointConfig::relinquished_retention`)
+      //     shorter than the driver's own self-send recency window, which would
+      //     leave a stretch where the echo is neither recognised nor screened;
+      //     `relinquished::asserts` drifting from
+      //     `Service::classify_host_rdata` / `classify_instance_rdata`, so that
+      //     one of the two answers "ours" and the other "differing" for the same
+      //     record; a record type gaining a `respond::canonical_rdata_forms` arm
+      //     without the matching `respond::instance_rtype_exposed` row, which
+      //     silently drops that type out of the screen; the exposure inputs
+      //     ceasing to mean "confirmed emitted" — `GoodbyeOwnership` latching
+      //     from anything but a delivered send, or a retain site passing a
+      //     CONFIGURED record set in place of the snapshot's; or the retention
+      //     list dropping an UNEXPIRED row again, whether by merging two
+      //     generations onto one owner pair or by evicting at the ceiling.
+      //     The driver-side binding — a credit bound to the record generation it
+      //     was sent under, and a superseded credit DEMOTED to `OwnEcho` rather
+      //     than discarded — is still owed, and still documented on
+      //     `Provenance::OwnEchoLikely`. What it buys now is the second half of
+      //     the harm: a stale echo that reaches this arm also POPULATES THE
+      //     CACHE with records we no longer publish and QUIETS our own traffic,
+      //     and invariant 3 governs adjudication only. Losing it re-opens that,
+      //     not the terminal conflict.
       //
       //  4. Two live routes sharing a HOST NAME publish the SAME address set FOR
       //     EACH RRTYPE THEY BOTH PUBLISH — enforced at registration and rename

@@ -103,7 +103,9 @@ cfg_heap! {
 
 cfg_heap! {
   #[allow(unused_imports)]
-  pub(crate) use respond::{EmittedRecords, multicast_dst, write_goodbye};
+  pub(crate) use respond::{
+    EmittedRecords, canonical_rdata_forms, instance_rtype_exposed, multicast_dst, write_goodbye,
+  };
 }
 #[allow(unused_imports)]
 pub(crate) use schedule::{
@@ -430,6 +432,16 @@ cfg_heap! {
     a: std::vec::Vec<core::net::Ipv4Addr>,
     /// Host AAAA addresses advertised FROM US, tracked per address. Survives rename.
     aaaa: std::vec::Vec<core::net::Ipv6Addr>,
+    /// The RFC 6762 §6.1 instance NSEC has been put on the wire. Reset on rename
+    /// (the NSEC is owned by the INSTANCE name).
+    ///
+    /// Not part of [`Self::any_instance`], and no goodbye withdraws it: this
+    /// latch is the record set's EXPOSURE, and the NSEC is exposed without being
+    /// retractable. `Endpoint::relinquished_asserts` is what reads it — a
+    /// relinquished set must disown an echo of every identity it transmitted,
+    /// and an instance NSEC is one of the three
+    /// [`respond::canonical_rdata_forms`] can name.
+    nsec: bool,
   }
 
   impl GoodbyeOwnership {
@@ -440,6 +452,7 @@ cfg_heap! {
       self.srv |= e.srv();
       self.txt |= e.txt();
       self.subtypes |= e.subtypes();
+      self.nsec |= e.nsec();
       self.record_host_emitted(e);
     }
     /// Latch ONLY the host-owned addresses of a confirmed-delivered send.
@@ -469,6 +482,10 @@ cfg_heap! {
       self.srv = false;
       self.txt = false;
       self.subtypes = false;
+      // The §6.1 NSEC is owned by the instance name, so it goes with them: the
+      // NEW name has put no NSEC on the wire, and the OLD name's is carried away
+      // by the rename handoff.
+      self.nsec = false;
     }
     /// Whether ANY instance-owned record (PTR/SRV/TXT or a subtype PTR) has been
     /// advertised.
@@ -1563,6 +1580,9 @@ where
               std::vec::Vec::new(),
               std::vec::Vec::new(),
               emitted.subtypes(),
+              // The §6.1 NSEC is owned by the OLD instance name too, so it
+              // travels with the instance half rather than with the addresses.
+              emitted.nsec(),
             );
             if instance.is_empty() {
               // §7.1 trimmed every instance record: the old name put nothing in
@@ -1829,6 +1849,7 @@ where
       std::vec::Vec::new(), // addresses are passed separately below
       std::vec::Vec::new(),
       self.goodbye.subtypes,
+      self.goodbye.nsec,
     );
     WithdrawalSnapshot {
       records: self.records.clone(),
@@ -2022,31 +2043,16 @@ where
   /// Empty → we assert no record of this type at this name, which never matches
   /// a peer record: a peer record canonicalizes to at least one byte for every
   /// type. That is NOT the same as asserting a zero-length one.
+  ///
+  /// THE rule lives in [`respond::canonical_rdata_forms`], over a bare
+  /// `&ServiceRecords`, because the endpoint asks the same question of record
+  /// sets this endpoint has RELINQUISHED — sets no live `Service` holds. This is
+  /// the `Service`-shaped door onto it, not a second copy.
   fn our_canonical_records_for(
     &self,
     rtype: crate::wire::ResourceType,
   ) -> std::vec::Vec<std::vec::Vec<u8>> {
-    let mut out = std::vec::Vec::new();
-    match rtype {
-      crate::wire::ResourceType::Srv => {
-        let mut srv = std::vec::Vec::new();
-        srv.extend_from_slice(&self.records.priority().to_be_bytes());
-        srv.extend_from_slice(&self.records.weight().to_be_bytes());
-        srv.extend_from_slice(&self.records.port().to_be_bytes());
-        proposal::write_canonical_wire_name(self.records.host().as_str(), &mut srv);
-        out.push(srv);
-      }
-      crate::wire::ResourceType::Txt => {
-        // empty TXT → single zero-length string (one 0x00), matching
-        // both our wire form and a peer's compliant empty TXT canonicalization.
-        let mut txt = std::vec::Vec::new();
-        respond::write_canonical_txt(self.records.txt_segments(), &mut txt);
-        out.push(txt);
-      }
-      crate::wire::ResourceType::Nsec => out = respond::our_nsec_identities(&self.records),
-      _ => {}
-    }
-    out
+    respond::canonical_rdata_forms(&self.records, rtype)
   }
 
   /// clear pending response-CYCLE state — queued legacy unicast
@@ -3295,7 +3301,14 @@ where
           s.conflicts(1);
           s.renames(1);
         }
-        if self.goodbye.any_instance() {
+        // `|| nsec` covers the one exposure a §10.1 goodbye cannot: a
+        // §7.1-filtered response that emitted only host addresses still carried
+        // the instance NSEC, so the OLD name has an identity on the wire while
+        // owning no retractable instance record. The handoff is what carries
+        // that fact to `Endpoint::enqueue_rename_withdrawal`, which retains it —
+        // and the goodbye ITEM is still not created, because `owned.is_empty()`
+        // decides that and an NSEC is not withdrawable.
+        if self.goodbye.any_instance() || self.goodbye.nsec {
           // capture WHICH instance records the old name actually put on
           // the wire (§7.1 KAS may have emitted only a subset), so the rename
           // goodbye withdraws exactly those — not all of PTR/SRV/TXT, which
@@ -3312,6 +3325,7 @@ where
             std::vec::Vec::new(),
             std::vec::Vec::new(),
             self.goodbye.subtypes,
+            self.goodbye.nsec,
           );
           self.rename_goodbye_handoff = Some(RenameGoodbyeHandoff {
             records: self.records.clone(),
@@ -3752,6 +3766,10 @@ where
     }
     // which owner groups a Response actually emitted (after KAS).
     let mut resp_emitted = respond::EmittedRecords::default();
+    // Whether an Announcement's best-effort §6.1 instance NSEC survived into the
+    // encoded message — read by the `AwaitingConfirm::Announcement` arm below,
+    // which is where an announcement's emitted set is built.
+    let mut announce_nsec = false;
     // Per-response KAS suppression count (incremented inside the filter closure
     // via shared Cell, then bumped into stats after encoding).
     #[cfg(feature = "stats")]
@@ -3782,7 +3800,7 @@ where
         // Unsolicited announcements (Announcing(_) phase and periodic re-announce
         // from Established) are sent without KAS filtering. RFC 6762 §7.1
         // known-answer suppression only applies to question responses.
-        let n = respond::write_announce(&self.records, buf).map_err(|_| {
+        let (n, nsec) = respond::write_announce(&self.records, buf).map_err(|_| {
           warn!(
             target: "mdns_proto::service",
             handle = self.handle.raw(),
@@ -3793,6 +3811,10 @@ where
             buf.len(),
           ))
         })?;
+        // The §6.1 NSEC is best-effort — `write_announce` rolls it back rather
+        // than fail when the buffer is full — so exposure is latched from what
+        // the encoder REPORTS, never from the fact that it was asked for.
+        announce_nsec = nsec;
         debug!(
           target: "mdns_proto::service",
           handle = self.handle.raw(),
@@ -3896,6 +3918,7 @@ where
           self.records.a_addrs_slice().to_vec(),
           self.records.aaaa_addrs_slice().to_vec(),
           !self.records.subtype_names().is_empty(),
+          announce_nsec,
         )))
       }
       Some(PendingTransmitKind::Response) => {

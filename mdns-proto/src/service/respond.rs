@@ -42,6 +42,87 @@ pub(crate) fn write_canonical_txt<'a>(
   }
 }
 
+/// The canonical rdata forms `records` puts at its INSTANCE name for `rtype`, in
+/// the SAME byte format [`RdataForm::FOLDED`](crate::wire::RdataForm::FOLDED)
+/// produces for a peer record — so a §9 conflict check can tell identical
+/// (consistent) rdata from a real conflict. SRV → priority+weight+port (BE) +
+/// lowercased wire-form host; TXT → length-prefixed segments; NSEC → see
+/// [`our_nsec_identities`].
+///
+/// The arms are EXACTLY the record types a service emits under its instance
+/// name, because that is what "identical to these records" can be true of. A
+/// type not emitted yields NO forms, and no peer record equals none of them: a
+/// peer record canonicalizes to at least one byte for every type, so an empty
+/// answer is "this set asserts no record of this type at this name" rather than
+/// "it asserts a zero-length one".
+///
+/// A LIST, because one rtype can have more than one indistinguishable spelling:
+/// §9's rule is about proxies and fault-tolerance twins, which are required to
+/// be correct rather than to be this crate, and NSEC is a type where the two
+/// currently differ. See [`our_nsec_identities`].
+///
+/// # It takes the RECORDS, not a `Service`
+///
+/// Two screens ask this question of two different record sets, and both must get
+/// the same answer or the second is a second copy of the rule. `Service` asks it
+/// of the set it still publishes ([`Service::classify_instance_rdata`]);
+/// `Endpoint` asks it of a set it has RELINQUISHED — a withdrawing route's, or
+/// one in its retention list — which no live `Service` holds at all. Keeping one
+/// function over `&ServiceRecords` is what stops the endpoint's copy going stale
+/// the way the pre-screen list did when conflict routing widened past SRV/TXT.
+///
+/// [`Service::classify_instance_rdata`]: crate::service::Service
+pub(crate) fn canonical_rdata_forms(
+  records: &ServiceRecords,
+  rtype: ResourceType,
+) -> std::vec::Vec<std::vec::Vec<u8>> {
+  let mut out = std::vec::Vec::new();
+  match rtype {
+    ResourceType::Srv => {
+      let mut srv = std::vec::Vec::new();
+      srv.extend_from_slice(&records.priority().to_be_bytes());
+      srv.extend_from_slice(&records.weight().to_be_bytes());
+      srv.extend_from_slice(&records.port().to_be_bytes());
+      super::proposal::write_canonical_wire_name(records.host().as_str(), &mut srv);
+      out.push(srv);
+    }
+    ResourceType::Txt => {
+      // empty TXT → single zero-length string (one 0x00), matching both our wire
+      // form and a peer's compliant empty TXT canonicalization.
+      let mut txt = std::vec::Vec::new();
+      write_canonical_txt(records.txt_segments(), &mut txt);
+      out.push(txt);
+    }
+    ResourceType::Nsec => out = our_nsec_identities(records),
+    _ => {}
+  }
+  out
+}
+
+/// Did `emitted` put a record of `rtype` on the wire under the INSTANCE name?
+///
+/// The exposure half of [`canonical_rdata_forms`], and its arms MIRROR that
+/// function's — one says which types a record set CAN assert at its instance
+/// name, this says which of them a given generation actually did assert. The
+/// endpoint's relinquished-RRset screen needs both: a set it retains only
+/// disowns an echo of a record that was genuinely transmitted, since a record
+/// never transmitted has no echo to disown and screening for it would suppress a
+/// GENUINE peer conflict instead.
+///
+/// A type this record set asserts no form of answers `false` here too, which is
+/// why the `_` arm is safe: the two functions are read together and a type
+/// absent from one is absent from the other. `instance_rtype_forms_are_tracked`
+/// in the tests pins them to each other, because a type added to
+/// `canonical_rdata_forms` without a row here would silently lose its screen.
+pub(crate) fn instance_rtype_exposed(emitted: &EmittedRecords, rtype: ResourceType) -> bool {
+  match rtype {
+    ResourceType::Srv => emitted.srv(),
+    ResourceType::Txt => emitted.txt(),
+    ResourceType::Nsec => emitted.nsec(),
+    _ => false,
+  }
+}
+
 /// Write a probe message per RFC 6762 §8.1: an ANY question for the instance
 /// name (with unicast-response bit set) and the proposed unique records in the
 /// authority section.
@@ -109,10 +190,15 @@ pub(crate) fn write_probe(records: &ServiceRecords, out: &mut [u8]) -> Result<us
 /// the remaining buffer the builder is rolled back to before it and the
 /// positive answers already written are sent unchanged — adding the hint must
 /// never turn a deliverable response into a dropped one.
+///
+/// Returns whether the NSEC actually made it into the message. The rollback is
+/// why that answer must be reported rather than assumed: exposure tracking asks
+/// "did this record reach the wire", and a rolled-back hint did not. See
+/// [`EmittedRecords::nsec`].
 fn push_service_nsec<const COMP_N: usize>(
   b: &mut MessageBuilder<'_, COMP_N>,
   records: &ServiceRecords,
-) {
+) -> bool {
   let checkpoint = b.checkpoint();
   if b
     .push_nsec_additional(
@@ -124,7 +210,9 @@ fn push_service_nsec<const COMP_N: usize>(
     .is_err()
   {
     b.restore(checkpoint);
+    return false;
   }
+  true
 }
 
 /// The exact RRset an instance NSEC asserts, in ONE place because two sides
@@ -228,10 +316,14 @@ pub(crate) fn our_nsec_identities(records: &ServiceRecords) -> std::vec::Vec<std
 }
 
 /// Write an unsolicited announcement: SRV, TXT, A, AAAA records.
+///
+/// Returns the encoded length and whether the RFC 6762 §6.1 instance NSEC rode
+/// with it — best-effort, so it can be rolled back when the buffer is full, and
+/// the caller latches exposure for what actually went out.
 pub(crate) fn write_announce(
   records: &ServiceRecords,
   out: &mut [u8],
-) -> Result<usize, EncodeError> {
+) -> Result<(usize, bool), EncodeError> {
   let header = Header::new().with_flags(
     crate::wire::Flags::new()
       .with_response()
@@ -275,8 +367,8 @@ pub(crate) fn write_announce(
     b.push_aaaa_answer(records.host(), records.ttl_secs(), *a, true)?;
   }
   // RFC 6762 §6.1 negative responses (Additional section).
-  push_service_nsec(&mut b, records);
-  b.finish()
+  let nsec = push_service_nsec(&mut b, records);
+  Ok((b.finish()?, nsec))
 }
 
 /// Write an RFC 6763 §9 meta-query answer: a single shared PTR
@@ -387,6 +479,9 @@ pub(crate) fn write_legacy_response(
     a: records.a_addrs_slice().to_vec(),
     aaaa: records.aaaa_addrs_slice().to_vec(),
     subtypes: !records.subtype_names().is_empty(),
+    // A legacy reply carries no §6.1 NSEC: it is answered to one off-group
+    // resolver that asked a specific question, not multicast to the group.
+    nsec: false,
   };
   Ok((b.finish()?, emitted))
 }
@@ -503,7 +598,7 @@ fn push_goodbye_records<const COMP_N: usize>(
 /// ownership latches per record reported here, so a later TTL=0 goodbye
 /// withdraws ONLY records this responder truly transmitted (withdrawing one it
 /// never sent could cache-flush a peer's matching shared record).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct EmittedRecords {
   /// The instance PTR (service-type → instance) was emitted.
   ptr: bool,
@@ -519,12 +614,29 @@ pub(crate) struct EmittedRecords {
   /// KAS-filtered, so they are emitted all-or-nothing together with the
   /// instance — a single bit suffices (no per-subtype tracking).
   subtypes: bool,
+  /// The RFC 6762 §6.1 instance NSEC rode in the Additional section.
+  ///
+  /// Tracked rather than derived, because the three encoders differ: an
+  /// announcement always carries it, a §7.1-filtered response carries it only
+  /// when some positive answer survived, a §6.7 legacy unicast reply never
+  /// carries it — and [`push_service_nsec`] can roll it back when the buffer is
+  /// full. It is not a goodbye-able record (a §10.1 goodbye emits no NSEC), so
+  /// it is deliberately outside [`Self::is_empty`] and
+  /// `GoodbyeOwnership::any_instance`; what reads it is the endpoint's
+  /// relinquished-RRset screen, which must know which record IDENTITIES this
+  /// endpoint actually put on the wire.
+  nsec: bool,
 }
 
 impl EmittedRecords {
   /// True when nothing positive-TTL reached the wire (every record was §7.1
   /// suppressed → a header-only response): the caller must not send it and
   /// latches no goodbye ownership.
+  ///
+  /// [`Self::nsec`] is NOT a term here, and cannot be: the NSEC is an
+  /// Additional-section hint that only ever rides a message some positive answer
+  /// already survived into, so it can never be the sole emitted record. Counting
+  /// it would make this predicate — which is the SEND decision — circular.
   pub fn is_empty(&self) -> bool {
     !self.ptr
       && !self.srv
@@ -565,6 +677,7 @@ impl EmittedRecords {
     a: std::vec::Vec<Ipv4Addr>,
     aaaa: std::vec::Vec<Ipv6Addr>,
     subtypes: bool,
+    nsec: bool,
   ) -> Self {
     Self {
       ptr,
@@ -573,21 +686,25 @@ impl EmittedRecords {
       a,
       aaaa,
       subtypes,
+      nsec,
     }
   }
 
-  /// OR another report's INSTANCE records (PTR/SRV/TXT/subtypes) into this one.
+  /// OR another report's INSTANCE records (PTR/SRV/TXT/subtypes, and the
+  /// instance NSEC) into this one.
   ///
   /// Ownership is a union of what reached the wire, so merging two reports for
   /// the SAME name is the same operation the goodbye latch performs. Host
   /// addresses are deliberately not merged: the only caller is the RFC 6763 §9
   /// rename handoff, which withdraws instance records exclusively (the host name
-  /// is invariant across an instance rename).
+  /// is invariant across an instance rename). The NSEC is an INSTANCE-owned
+  /// identity, so it merges with them.
   pub(crate) fn merge_instance(&mut self, other: &Self) {
     self.ptr |= other.ptr;
     self.srv |= other.srv;
     self.txt |= other.txt;
     self.subtypes |= other.subtypes;
+    self.nsec |= other.nsec;
   }
 
   /// Whether the instance PTR was emitted.
@@ -612,6 +729,12 @@ impl EmittedRecords {
   #[inline(always)]
   pub(crate) const fn subtypes(&self) -> bool {
     self.subtypes
+  }
+
+  /// Whether the RFC 6762 §6.1 instance NSEC was emitted. See the field.
+  #[inline(always)]
+  pub(crate) const fn nsec(&self) -> bool {
+    self.nsec
   }
 
   /// The host A addresses actually emitted.
@@ -745,9 +868,13 @@ where
   // response is header-only and the caller drops it (it keys the send decision on
   // `emitted.is_empty()`), so a lone NSEC there would never reach the wire — and
   // a querier that already holds every record we own does not need it.
-  // NSEC is not a goodbye-able owned record, so it stays out of `emitted`.
+  //
+  // It is not a goodbye-able owned record, so it changes neither `is_empty` nor
+  // what a §10.1 goodbye withdraws — but it IS a record identity this endpoint
+  // put on its instance name, so it is reported, and reported only when the
+  // best-effort push actually kept it.
   if !emitted.is_empty() {
-    push_service_nsec(&mut b, records);
+    emitted.nsec = push_service_nsec(&mut b, records);
   }
 
   let n = b.finish()?;

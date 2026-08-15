@@ -1229,9 +1229,9 @@ fn recv_datagram_slices_the_body_to_its_own_receives_length() {
 /// A credit outlives the generation it was recorded in, and says so.
 ///
 /// The match itself is untouched — same bytes, same family, same ordering
-/// evidence, inside the TTL — and that is the point: the credit is still ours,
-/// so it must still be SPENT and still suppress. What changes is that it may no
-/// longer adjudicate, which the caller reads off the variant.
+/// evidence, inside the TTL — and that is the point: the credit is still ours.
+/// What changes is that it may no longer adjudicate, which the caller reads off
+/// the variant.
 #[test]
 fn a_credit_recorded_before_a_supersede_is_reported_as_superseded() {
   let mut t = SelfSendTracker::new();
@@ -1250,9 +1250,90 @@ fn a_credit_recorded_before_a_supersede_is_reported_as_superseded() {
     "an echo of a datagram sent before the records changed must not reach the \
      adjudicating tier"
   );
-  assert!(
-    t.is_empty(),
-    "and it is still take-once: a superseded credit is spent, not skipped"
+  assert_eq!(
+    t.len(),
+    1,
+    "and it is a STANDING tombstone: the claim spends nothing"
+  );
+}
+
+/// THE TOMBSTONE. Every byte-identical copy inside the TTL reads `Superseded`,
+/// however many arrive.
+///
+/// Take-once used to apply here too, so the FIRST copy consumed the credit and
+/// every copy behind it read `NoCredit` — `Provenance::NotFromUs` — and was
+/// admitted as peer traffic. That second copy needs no attacker: one send is
+/// credited once per family while the medium may deliver several copies (kernel
+/// loopback plus an 802.11 base-station re-broadcast, which RFC 6762 §8.2 names
+/// as an echo source), so the loser of that race wrote records this endpoint no
+/// longer publishes into this endpoint's own cache.
+///
+/// Spending bought nothing in exchange. These bytes assert a record set this
+/// endpoint has GIVEN UP: suppressing every copy can only mask an assertion no
+/// live route holds, or a byte-identical twin still asserting our withdrawn
+/// records — a bounded detection delay — while an attacker "denied" the replay
+/// could always have forged the same assertion without our bytes.
+#[test]
+fn a_superseded_credit_answers_every_copy_of_the_same_datagram() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"withdrawn-announcement", sent);
+  t.supersede();
+  for round in 1..=5u32 {
+    let gap = Duration::from_millis(u64::from(round));
+    assert_eq!(
+      t.claim_at(
+        &RxDatagram::from_stamp_for_test(
+          Family::V4,
+          &b"withdrawn-announcement"[..],
+          sent.wall + gap
+        ),
+        claim(sent, gap)
+      ),
+      SelfSendMatch::Superseded,
+      "copy {round} of a datagram whose records we no longer publish must not \
+       become peer traffic because an earlier copy consumed the credit"
+    );
+  }
+  assert_eq!(t.len(), 1, "no copy spends the tombstone");
+}
+
+/// A CURRENT credit is preferred over a superseded one holding the same bytes.
+///
+/// The same datagram can be recorded on both sides of a generation change — a
+/// service re-announcing bytes it also sent before an unrelated service
+/// registered. With the tombstone standing, taking the first match in order
+/// would let the older superseded copy answer for the whole TTL, and the current
+/// tier's take-once — which exists so a conforming RFC 6762 §9 twin becomes
+/// visible from its second datagram — would never run at all.
+#[test]
+fn a_current_credit_wins_over_an_older_superseded_copy_of_itself() {
+  let mut t = SelfSendTracker::new();
+  let first = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"same-bytes-both-sides", first);
+  t.supersede();
+  recorded_and_sealed(&mut t, Family::V4, b"same-bytes-both-sides", first);
+  let gap = Duration::from_millis(1);
+  assert_eq!(
+    t.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, &b"same-bytes-both-sides"[..], first.wall + gap),
+      claim(first, gap)
+    ),
+    SelfSendMatch::Ordered,
+    "the still-current credit decides, not the superseded copy ahead of it"
+  );
+  assert_eq!(
+    t.len(),
+    1,
+    "and it was the CURRENT one that was spent — the tombstone remains"
+  );
+  assert_eq!(
+    t.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, &b"same-bytes-both-sides"[..], first.wall + gap),
+      claim(first, gap)
+    ),
+    SelfSendMatch::Superseded,
+    "with the current credit spent, the tombstone answers the next copy"
   );
 }
 

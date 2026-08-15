@@ -77,6 +77,14 @@ where
   /// event this guards against, and `withdrawing` is set once and never cleared.
   /// Counting one would block a replacement service from taking over a host name
   /// with a new address set until the outgoing goodbye drained.
+  ///
+  /// Skipped as a PARTY to the conflict, that is — its record set is still read
+  /// as EVIDENCE. Letting the replacement in is precisely what puts a delayed
+  /// echo of the outgoing route's own addresses in front of a service that holds
+  /// different ones, so `Endpoint::relinquished_asserts` screens every conflict
+  /// candidate against the withdrawing route's set before the fan-out builds an
+  /// event from it. The two halves belong together: relaxing this guard without
+  /// that screen is what makes our own past retire our own present.
   fn host_addresses_disagree(
     &self,
     host: &Name,
@@ -306,6 +314,36 @@ where
   ///
   /// The drivers retire services via that lifecycle, NOT this method.
   ///
+  /// # It still RELINQUISHES, so it still has to say what it asserted
+  ///
+  /// Sending no goodbye does not make this path quiet. A service force-removed
+  /// straight after a confirmed positive send has records on the wire and none
+  /// resident anywhere, and the caller may register a replacement at the same
+  /// owner names in the very next statement. A delayed echo of the removed
+  /// service's own records then reaches normal conflict adjudication and retires
+  /// the replacement — the exact class
+  /// [`Self::retain_relinquished`] exists to close, reached by the one path that
+  /// used to relinquish a record set WITHOUT retaining it.
+  ///
+  /// So `asserted` is the removed service's
+  /// [`Service::withdrawal_snapshot`](crate::service::Service::withdrawal_snapshot)
+  /// — the same value [`Self::begin_withdrawal`] takes, reporting what a
+  /// confirmed send actually emitted. Pass `Some(..)` whenever the `Service`
+  /// still exists; only its exposure is retained, so a never-announced service's
+  /// snapshot retains nothing at all.
+  ///
+  /// `None` is for a caller that genuinely has no `Service` to ask: the state
+  /// machine was already dropped, or its goodbye already drained (in which case
+  /// [`Self::drain_completed_withdrawals`] retained the set when it completed).
+  /// Passing `None` while holding a live, announced `Service` re-opens the class
+  /// above.
+  ///
+  /// A still-draining ROUTE-ATTACHED withdrawal item is retained here too,
+  /// whatever `asserted` says: dropping the item removes the last resident
+  /// description of that set, which is the same relinquishment
+  /// `drain_completed_withdrawals` would have retained had the goodbye been
+  /// allowed to finish.
+  ///
   /// # Behaviour
   ///
   /// Returns `true` if a route was found and removed, `false` if the handle
@@ -313,13 +351,29 @@ where
   /// same instance name via [`Self::try_register_service`] succeeds immediately
   /// (no [`RegisterServiceError::NameAlreadyRegistered`] guard remains), and
   /// inbound packets no longer match the removed route.
-  pub fn unregister_service(&mut self, handle: ServiceHandle) -> bool {
+  pub fn unregister_service(
+    &mut self,
+    handle: ServiceHandle,
+    asserted: Option<crate::service::WithdrawalSnapshot>,
+    now: I,
+  ) -> bool {
     let key = self
       .services
       .iter()
       .find(|(_, route)| route.handle() == handle)
       .map(|(k, _)| k);
     if let Some(k) = key {
+      // BEFORE the route goes: what this service put on the wire outlives it,
+      // and once the name is released there is nothing left to say it was ours.
+      if let Some(snapshot) = asserted {
+        self.retain_relinquished(
+          snapshot.records,
+          snapshot.owned,
+          snapshot.host_a,
+          snapshot.host_aaaa,
+          now,
+        );
+      }
       let removed = self.services.try_remove(k).is_some();
       // Force-remove is a NO-goodbye primitive: also drop any ROUTE-attached
       // withdrawal item for this handle. Otherwise removing the route (and thus
@@ -327,10 +381,30 @@ where
       // route-attached item still owes a TTL=0 goodbye — a late goodbye would
       // then flush the same-name replacement, contradicting "no goodbye". Detached items (renamed-away OLD names) are independent of this
       // handle's route and are left to drain / be cancelled on reclaim.
+      //
+      // Each dropped item's record set is RELINQUISHED on the way out, exactly
+      // as `drain_completed_withdrawals` would have relinquished it: the item
+      // was the last resident copy of a set this endpoint transmitted, and this
+      // is the moment it stops being consultable.
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
-      self
-        .withdrawals
-        .retain(|(_, item)| item.route != Some(handle));
+      {
+        let mut dropped = std::vec::Vec::new();
+        self.withdrawals.retain(|(_, item)| {
+          let keep = item.route != Some(handle);
+          if !keep {
+            dropped.push((
+              item.records.clone(),
+              item.owned.clone(),
+              item.host_a.clone(),
+              item.host_aaaa.clone(),
+            ));
+          }
+          keep
+        });
+        for (records, owned, host_a, host_aaaa) in dropped {
+          self.retain_relinquished(records, owned, host_a, host_aaaa, now);
+        }
+      }
       #[cfg(feature = "stats")]
       if removed {
         self.stats.decr_services_active(1);

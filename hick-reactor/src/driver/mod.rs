@@ -793,16 +793,22 @@ impl<N: Net> DriverState<N> {
         SelfSendMatch::Degraded => Provenance::OwnEchoLikely,
         // Our bytes, but from a generation of our own records that no longer
         // exists — a service registered, began withdrawing, or took an RFC 6762
-        // §9 automatic rename since the send. It
-        // maps to `OwnEcho` because that is the only tier which denies
-        // ADJUDICATION, and adjudication is precisely what a stale echo must not
-        // have: its RFC 6762 §8.2 proposal is for a name this endpoint may no
-        // longer be defending, and its §9 rdata is rdata no live route holds, so
-        // routing it fans our own withdrawn generation into the REPLACEMENT
-        // service, which classifies it as differing host rdata and retires
-        // terminally. This is not a claim of stronger evidence than the match
-        // carried — see `SelfSendMatch::Superseded` and
-        // `SelfSendTracker::supersede`.
+        // §9 automatic rename since the send. It maps to `OwnEcho` because that
+        // is the only tier which denies OBSERVATION and QUIETING, and a stale
+        // echo must reach neither: it would write records this endpoint no
+        // longer publishes into its own cache, and defer this endpoint's own
+        // retransmits on their behalf. This is not a claim of stronger evidence
+        // than the match carried — see `SelfSendMatch::Superseded`.
+        //
+        // IT IS NOT WHAT KEEPS OUR OWN WITHDRAWN GENERATION FROM RETIRING THE
+        // SERVICE THAT REPLACED IT. That is decided inside `mdns-proto`, by the
+        // `Endpoint` screen behind `EndpointConfig::relinquished_retention`,
+        // and it has to be: this classification is defeasible three independent
+        // ways no driver can close — a peer replaying our bytes reproduces
+        // everything weighed here, one send can be delivered as several copies
+        // while it is credited once, and credits are evicted under load. Each
+        // leaves the GENUINE echo reading `NoCredit`, hence `NotFromUs`, hence
+        // fully adjudicated. See `SelfSendTracker::supersede`.
         SelfSendMatch::Superseded => Provenance::OwnEcho,
         SelfSendMatch::NoCredit => Provenance::NotFromUs,
       }

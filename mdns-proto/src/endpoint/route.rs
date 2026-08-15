@@ -383,6 +383,13 @@ where
     if r.rclass() != ResourceClass::In {
       return None;
     }
+    // THE RELINQUISHED-RRSET SCREEN. See the note on the same call in
+    // `next_service_conflict`: a record this endpoint recently asserted and gave
+    // up is ours whatever a driver's send log did or did not recognise, and the
+    // service that now holds the owner name cannot know that.
+    if self.endpoint.relinquished_asserts(r, self.now) {
+      return None;
+    }
     for (key, route) in self.endpoint.services.iter() {
       if key < start {
         continue;
@@ -414,6 +421,32 @@ where
     origin: ConflictOrigin,
   ) -> Option<(usize, RouteEvent<'a>)> {
     if r.rclass() != ResourceClass::In {
+      return None;
+    }
+    // ── THE RELINQUISHED-RRSET SCREEN ────────────────────────────────────────
+    //
+    // RFC 6762 §9's "identical rdata is never a conflict", asked of what this
+    // ENDPOINT recently asserted rather than only of what the receiving service
+    // still publishes. It is a whole-record answer, so it is taken once here
+    // rather than per candidate route.
+    //
+    // The gap it closes: a withdrawing route stops holding its host name for the
+    // registration guard, so a replacement may take host `H` with address set
+    // `A2` while the route that held `H` with `A1` is still draining its §10.1
+    // goodbye. A delayed positive-TTL echo of `A1` — OUR OWN BYTES — is then
+    // adjudicated against `A2` and retires a live service with a TERMINAL
+    // `ServiceUpdate::HostConflict`. Service B structurally cannot recognise
+    // `A1`; only the endpoint can, which is why the screen is here and not in
+    // `Service::handle_event` beside the rule it extends.
+    //
+    // It is NOT a fourth attempt at RECOGNISING the datagram as our own echo.
+    // Three of those failed, and the reasons are in `endpoint::relinquished`:
+    // a replaying peer reproduces every signal a driver's send log weighs, one
+    // send can be delivered as several copies while a credit is spent once, and
+    // recognition state is evicted under traffic while the obligation is per
+    // copy. This screen turns on none of that — it reads what this endpoint
+    // published and gave up.
+    if self.endpoint.relinquished_asserts(r, self.now) {
       return None;
     }
     for (key, route) in self.endpoint.services.iter() {
