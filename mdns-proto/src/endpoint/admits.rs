@@ -198,11 +198,12 @@ impl Admits {
       //         for one round, recorded here as a deliberate non-change on the
       //         premise that §9 self-heals because a live incumbent's traffic
       //         recurs. THAT PREMISE WAS FALSE, and §8.3 is what falsifies it: a
-      //         conforming responder announces "two or three times, at intervals
-      //         of at least one second" and is then SILENT until something
-      //         queries it. A screen that consumes those responses inside the
-      //         retention window consumes EVERY COPY THERE WAS, and nothing
-      //         replays a conflict when the window lapses — so §9's "MUST
+      //         conforming responder announces AT LEAST TWICE, one second apart,
+      //         MAY continue to eight times with the interval at least doubling
+      //         each time, and is then SILENT until something queries it. A
+      //         screen that consumes a burst landing wholly inside the retention
+      //         window consumes EVERY COPY THERE WAS, and nothing replays a
+      //         conflict when the window lapses — so §9's "MUST
       //         immediately reset its conflicted unique record to probing state"
       //         was not honoured late, it was not honoured at all, and duplicate
       //         ownership of an ADVERTISED name stood until unrelated traffic
