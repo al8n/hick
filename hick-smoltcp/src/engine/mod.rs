@@ -75,6 +75,103 @@ const RECENT_SEND_BYTES: usize = 16 * 1024;
 /// family, once, and not every copy that arrives before the entry ages out — see
 /// [`Multicaster::claim`].
 const RECENT_SEND_TTL: Duration = Duration::from_secs(5);
+/// Whether a recorded datagram ASSERTS records this engine publishes, and
+/// therefore whether [`Multicaster::supersede`] can make its echo stale.
+///
+/// # Why the class exists at all
+///
+/// The generation answers exactly one question: *has what this engine publishes
+/// changed since this datagram was sent?* That is meaningful for a datagram that
+/// asserts records — an announcement, a probe, a goodbye — because a later echo
+/// of it can carry rdata this engine no longer holds. A question asserts
+/// nothing: its records ARE the questions, so no registration, withdrawal or RFC
+/// 6762 §9 rename can invalidate them.
+///
+/// Superseding a question's entry therefore turned it into a standing tombstone
+/// for a datagram that could never have carried a stale assertion — and because
+/// a superseded entry is deliberately non-consuming, EVERY byte-identical copy
+/// was then suppressed rather than only the first. A peer's query retransmission
+/// from port 5353 is ordinary traffic under §5.2's retry schedule, so that made
+/// legitimate peer questions invisible for the whole of [`RECENT_SEND_TTL`],
+/// every time an unrelated service registered or withdrew.
+///
+/// # It is on the ENTRY, and there is no second epoch
+///
+/// The class describes the datagram, so it belongs beside the datagram. A
+/// second, query-side epoch was the alternative and it is the wrong shape:
+/// nothing would ever advance it, because a question describes no state of ours
+/// that could move on. A counter frozen at zero is worse than none for the
+/// reader who has to work out what could move it.
+///
+/// # It is DERIVED, never declared
+///
+/// From the datagram's own bytes, by [`Self::of`], at [`record_into`] — so the
+/// classification is read off the very bytes the entry stores and the claim
+/// compares, and cannot disagree with them. `hick-udp`'s `SelfSendTracker` holds
+/// the same rule for the `std` drivers; the two stacks keep their own send logs
+/// (this one has no wall clock and no kernel receive stamp at all), so the rule
+/// is written out twice on purpose and the two copies must be changed together.
+///
+/// Being a function of the body also settles the interaction with the
+/// current-beats-superseded scan in [`Multicaster::claim`]: a claim only weighs
+/// entries whose bytes it matched exactly, so every candidate for one datagram
+/// carries the same class, and the two tiers can never interleave for a single
+/// set of bytes.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+enum SendClass {
+  /// The datagram asserts records — a response of any kind, or a query carrying
+  /// records outside the Answer section (the RFC 6762 §8.2 probe proposal). A
+  /// change in what this engine publishes can leave its echo asserting rdata no
+  /// live route holds, so its entry is supersedable.
+  Assertion,
+  /// The datagram asks and asserts nothing, so nothing this engine does to its
+  /// own records can make its echo stale. Its entry stays take-once per family
+  /// for its whole life.
+  Question,
+}
+
+impl SendClass {
+  /// Read the class off the datagram's own 12-byte DNS header.
+  ///
+  /// # What each section is weighed as
+  ///
+  /// * **QR set** — a response. Every record in it is an assertion of ours, in
+  ///   whichever section it sits;
+  /// * **AUTHORITY records in a query** — the RFC 6762 §8.2 probe proposal, and
+  ///   the whole reason the class cannot be the QR bit: a probe is a query by the
+  ///   header and asserts by its content;
+  /// * **ADDITIONAL records in a query** — no §7.x query shape puts publishable
+  ///   records there, so this is the unclassifiable case rather than a known one,
+  ///   and it takes the supersedable reading;
+  /// * **ANSWER records in a query** — §7.1 known answers, which are records read
+  ///   out of the CACHE. They are what peers publish, not what this engine
+  ///   publishes. (`mdns-proto` does not emit them today: a query datagram is the
+  ///   question alone.)
+  ///
+  /// A body too short to hold a header cannot be classified, so it takes the
+  /// reading that suppresses more. Nothing this engine sends is shorter than a
+  /// DNS header.
+  fn of(data: &[u8]) -> Self {
+    // RFC 1035 §4.1.1: ID, flags, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT — six
+    // 16-bit big-endian fields. Destructured rather than indexed, so every octet
+    // this rule reads is named here and a short body cannot index out of one.
+    let Some(&[_, _, flags_hi, _, _, _, _, _, ns_hi, ns_lo, ar_hi, ar_lo]) =
+      data.first_chunk::<12>()
+    else {
+      return Self::Assertion;
+    };
+    // QR is the high bit of the first flags octet.
+    if flags_hi & 0x80 != 0 {
+      return Self::Assertion;
+    }
+    // Non-zero NSCOUNT or ARCOUNT, read without assembling either `u16`.
+    if ns_hi | ns_lo | ar_hi | ar_lo != 0 {
+      return Self::Assertion;
+    }
+    Self::Question
+  }
+}
+
 /// A recent multicast datagram we handed to the transport, kept (exact bytes +
 /// send time) for self-loopback detection.
 struct SelfSend<I> {
@@ -82,7 +179,13 @@ struct SelfSend<I> {
   at: I,
   /// Which generation of this engine's own records this datagram was sent
   /// under. See [`Multicaster::generation`].
+  ///
+  /// It is half the supersede question: [`Self::class`] is the other half, and
+  /// says whether this field bears on the entry at all.
   generation: u64,
+  /// What this datagram asserts, and therefore whether a publication change can
+  /// retire it. Derived from the bytes at record time; see [`SendClass`].
+  class: SendClass,
   /// Which families ([0] = v4, [1] = v6) this datagram was actually TRANSMITTED
   /// on — every family whose socket ACCEPTED it — and IMMUTABLE for the entry's
   /// life.
@@ -172,9 +275,14 @@ enum SelfLog {
   /// Matched a datagram sent under the generation of records this engine still
   /// publishes.
   Current,
-  /// Matched a datagram sent BEFORE the records changed under it — a service
-  /// registered, began withdrawing, or took an RFC 6762 §9 automatic rename
-  /// since the send.
+  /// Matched an ASSERTING datagram sent BEFORE the records changed under it — a
+  /// service registered, began withdrawing, or took an RFC 6762 §9 automatic
+  /// rename since the send.
+  ///
+  /// A datagram that asserts nothing never reaches this tier however many
+  /// generations have passed: see [`SendClass`] for what the generation is
+  /// entitled to retire, and why a standing tombstone for a question is a defect
+  /// rather than caution.
   ///
   /// A withdrawing route stops holding its host name for the registration
   /// guard, so a replacement may take that name with a different address set
@@ -713,6 +821,9 @@ fn record_into<I: Instant>(
   }
   *recent_bytes = recent_bytes.saturating_add(data.len());
   recent.push_back(SelfSend {
+    // Classified from the bytes being stored, so the class and the body a claim
+    // compares can never be two different datagrams. See `SendClass`.
+    class: SendClass::of(data),
     data: data.to_vec(),
     at: now,
     generation,
@@ -1052,7 +1163,12 @@ impl<I: Instant> Multicaster<I> {
       if !s.sent_on.get(idx).copied().unwrap_or(false) {
         continue;
       }
-      if s.generation == self.generation {
+      // A QUESTION is never superseded, whatever the generation reads: it
+      // asserts nothing, so no change to what this engine publishes can have
+      // made its echo stale, and the tombstone it would otherwise become would
+      // suppress every byte-identical peer retransmission for the entry's whole
+      // life. See `SendClass`.
+      if s.generation == self.generation || s.class == SendClass::Question {
         // The CURRENT tier is take-once, so only an entry that still owes this
         // family a loopback copy can answer for one.
         if s.owed.get(idx).copied().unwrap_or(false) {
@@ -1110,7 +1226,13 @@ impl<I: Instant> Multicaster<I> {
   }
 
   /// Declare that what this engine publishes has changed, so every entry already
-  /// recorded describes a state it has left. See [`SelfLog::Superseded`].
+  /// recorded that ASSERTS records describes a state it has left. See
+  /// [`SelfLog::Superseded`].
+  ///
+  /// The advance is global to the log, but what it can retire is not: an entry
+  /// for a datagram that asserts nothing is untouched by it, because there is
+  /// nothing in a question for a publication change to invalidate. See
+  /// [`SendClass`].
   ///
   /// It does NOT clear the log: clearing would make exactly the echoes this
   /// protects against read as `NotFromUs` — full peer traffic, full adjudication

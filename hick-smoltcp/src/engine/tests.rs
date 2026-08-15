@@ -4496,6 +4496,109 @@ fn a_tombstone_still_answers_every_copy_on_the_family_that_sent() {
   }
 }
 
+/// A structurally valid mDNS QUERY: one question for `_http._tcp.local. PTR IN`
+/// and not a single resource record.
+///
+/// QR=0 and every record count is zero, which is the shape `mdns-proto` puts on
+/// the wire for a continuous query — the question alone, with no RFC 6762 §7.1
+/// known-answer list behind it.
+const QUERY_HTTP_PTR: &[u8] = &[
+  // ID, flags (QR=0, opcode QUERY), QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0.
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+  // QNAME `_http._tcp.local.`
+  0x05, b'_', b'h', b't', b't', b'p', 0x04, b'_', b't', b'c', b'p', 0x05, b'l', b'o', b'c', b'a',
+  b'l', 0x00, //
+  // QTYPE = PTR, QCLASS = IN
+  0x00, 0x0c, 0x00, 0x01,
+];
+
+/// A structurally valid RFC 6762 §8.2 PROBE: `hick.local. ANY IN` asked with the
+/// proposed `A` record in the AUTHORITY section.
+///
+/// QR=0, so it is a query by the header's own bit — and it still asserts, which
+/// is why the class cannot be read off that bit alone.
+const PROBE_HICK_A: &[u8] = &[
+  // ID, flags (QR=0), QDCOUNT=1, ANCOUNT=0, NSCOUNT=1, ARCOUNT=0.
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, //
+  // QNAME `hick.local.`, QTYPE = ANY, QCLASS = IN
+  0x04, b'h', b'i', b'c', b'k', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00, 0x00, 0xff, 0x00, 0x01,
+  //
+  // AUTHORITY: name compressed to offset 12, A, IN, TTL 120, 192.0.2.1
+  0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 0xc0, 0x00, 0x02, 0x01,
+];
+
+/// A QUESTION SURVIVES A PUBLICATION CHANGE AS A TAKE-ONCE ENTRY.
+///
+/// The generation was applied to the whole log, so a service registration — or a
+/// withdrawal, or a §9 rename — retired every outstanding entry including the
+/// ones for datagrams that assert nothing. A superseded entry is deliberately
+/// non-consuming and ignores [`SelfSend::owed`], so a query entry became a
+/// STANDING TOMBSTONE: every byte-identical copy read `SelfLog::Superseded`,
+/// which is `Provenance::OwnEcho`, which suppresses the whole datagram. A peer's
+/// query retransmission from port 5353 — RFC 6762 §5.2 schedules them, so these
+/// are ordinary traffic — was then invisible for the rest of `RECENT_SEND_TTL`
+/// instead of for the one copy take-once costs.
+///
+/// A question asserts nothing this engine publishes, so no lifecycle event can
+/// make its echo stale, and the take-once rule is the whole of what it needs.
+#[test]
+fn a_question_entry_stays_take_once_across_a_publication_change() {
+  let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
+  tx.record(QUERY_HTTP_PTR, at(0), [true, true]);
+  // An UNRELATED service registers, withdraws, or renames.
+  tx.supersede();
+
+  assert_eq!(
+    tx.claim(Family::V4, QUERY_HTTP_PTR, at(1_000)),
+    SelfLog::Current,
+    "a publication change says nothing about a question, so the entry still \
+     answers for the v4 loopback copy it owes"
+  );
+  assert_eq!(
+    tx.claim(Family::V4, QUERY_HTTP_PTR, at(2_000)),
+    SelfLog::None,
+    "and take-once still holds, so a peer's byte-identical §5.2 retransmission \
+     is peer traffic rather than a datagram a tombstone answered for"
+  );
+  assert_eq!(
+    tx.claim(Family::V6, QUERY_HTTP_PTR, at(3_000)),
+    SelfLog::Current,
+    "the v6 socket is still owed a copy of its own"
+  );
+  assert_eq!(
+    tx.claim(Family::V6, QUERY_HTTP_PTR, at(4_000)),
+    SelfLog::None,
+    "both copies spent"
+  );
+  assert!(
+    tx.recent.is_empty(),
+    "a question entry is SPENT, not left standing — an entry that survives every \
+     copy it answers is the tombstone this test exists to refuse"
+  );
+}
+
+/// The boundary is what the datagram ASSERTS, not the header's QR bit: an RFC
+/// 6762 §8.2 probe is a query that proposes records, and those records are
+/// exactly what a registration or a withdrawal can retire.
+///
+/// So the tombstone still stands here, and it stands for every copy — the
+/// property the previous round bought, which this one must not spend.
+#[test]
+fn a_probe_is_still_superseded_although_its_header_says_query() {
+  let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
+  tx.record(PROBE_HICK_A, at(0), [true, true]);
+  tx.supersede();
+  for round in 1..=4i64 {
+    assert_eq!(
+      tx.claim(Family::V4, PROBE_HICK_A, at(round * 1_000)),
+      SelfLog::Superseded,
+      "copy {round} proposes rdata this engine may no longer hold, so the \
+       tombstone answers it"
+    );
+  }
+  assert_eq!(tx.recent.len(), 1, "and no copy spends it");
+}
+
 /// Both of this engine's sockets send from 5353, so every loopback copy arrives
 /// from 5353 and any other source port is proof the datagram is not our echo.
 ///

@@ -807,11 +807,16 @@ pub enum SelfSendMatch {
   /// evidence to weigh. See [`MatchMode::Degraded`] — including for why a
   /// conforming twin's byte-identical datagram matches this way too.
   Degraded,
-  /// A credit matched, at either strength, but it was recorded **before the
-  /// caller last called [`SelfSendTracker::supersede`]** — so these are our bytes
-  /// from a generation of our own records that no longer exists, because a
-  /// service registered, began withdrawing, or took an RFC 6762 §9 automatic
-  /// rename since the send.
+  /// An **asserting** credit matched, at either strength, but it was recorded
+  /// **before the caller last called [`SelfSendTracker::supersede`]** — so these
+  /// are our bytes from a generation of our own records that no longer exists,
+  /// because a service registered, began withdrawing, or took an RFC 6762 §9
+  /// automatic rename since the send.
+  ///
+  /// A datagram that asserts nothing never reaches this tier however many
+  /// generations have passed: see [`SendClass`] for what the generation is
+  /// entitled to retire, and why a standing tombstone for a question is a defect
+  /// rather than caution.
   ///
   /// # Why a generation is needed at all
   ///
@@ -884,6 +889,111 @@ impl SelfSendMatch {
   }
 }
 
+/// Whether a recorded datagram ASSERTS records this endpoint publishes, and
+/// therefore whether [`SelfSendTracker::supersede`] can make its echo stale.
+///
+/// # Why the class exists at all
+///
+/// The generation answers exactly one question: *has what this endpoint
+/// publishes changed since this datagram was sent?* That question is meaningful
+/// for a datagram that asserts records — an announcement, a probe, a goodbye —
+/// because a later echo of it can carry rdata we no longer hold. A question
+/// asserts nothing: its records ARE the questions, so no registration,
+/// withdrawal or RFC 6762 §9 rename can invalidate them.
+///
+/// Superseding a question's credit therefore converted it into a standing
+/// tombstone for a datagram that could never have carried a stale assertion —
+/// and because a superseded entry is deliberately non-consuming, EVERY
+/// byte-identical copy was then suppressed rather than only the first. A peer's
+/// query retransmission from port 5353 is ordinary traffic under §5.2's retry
+/// schedule, so that made legitimate peer questions invisible for the whole of
+/// [`SELF_SEND_TTL`], every time an unrelated service registered or withdrew.
+///
+/// # It is on the ENTRY, and there is no second epoch
+///
+/// The class describes the datagram, so it belongs beside the datagram. A
+/// second, query-side epoch was the alternative and it is the wrong shape:
+/// nothing would ever advance it. An epoch exists to retire outstanding credits
+/// when some state they described has moved on, and a question describes no
+/// state of ours at all — so a query epoch would be a counter frozen at zero,
+/// which is strictly worse than none for the reader who has to work out what
+/// could move it.
+///
+/// # It is DERIVED, never declared
+///
+/// From the datagram's own bytes, by [`Self::of`], at
+/// [`SelfSendTracker::record`] — the same rule [`MatchMode`] follows and for the
+/// same reason. No caller passes a class, so no signature can carry a wrong one:
+/// the classification is read off the very bytes the credit stores and the claim
+/// compares, and cannot disagree with them. A `class` PARAMETER added to any
+/// function here would undo that, whatever this paragraph says.
+///
+/// Being a function of the body also settles the interaction with the
+/// current-beats-superseded scan in [`SelfSendTracker::claim`]: a claim only
+/// weighs credits whose bytes it matched exactly, so every candidate for one
+/// datagram carries the same class, and the two tiers can never interleave for a
+/// single set of bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SendClass {
+  /// The datagram asserts records — a response of any kind, or a query carrying
+  /// records outside the Answer section (the RFC 6762 §8.2 probe proposal). A
+  /// change in what this endpoint publishes can leave its echo asserting rdata
+  /// no live route holds, so its credit is supersedable.
+  Assertion,
+  /// The datagram asks and asserts nothing, so nothing this endpoint does to its
+  /// own records can make its echo stale. Its credit stays take-once for its
+  /// whole life.
+  Question,
+}
+
+impl SendClass {
+  /// Read the class off the datagram's own 12-byte DNS header.
+  ///
+  /// # What each section is weighed as
+  ///
+  /// * **QR set** — a response. Every record in it is an assertion of ours, in
+  ///   whichever section it sits: announcement, goodbye, or a reply to a query;
+  /// * **AUTHORITY records in a query** — the RFC 6762 §8.2 probe proposal. This
+  ///   is the whole reason the class cannot be the QR bit: a probe is a query by
+  ///   the header and asserts by its content, and its proposal is exactly what a
+  ///   registration or a withdrawal retires;
+  /// * **ADDITIONAL records in a query** — no §7.x query shape puts publishable
+  ///   records there, so this is the unclassifiable case rather than a known
+  ///   one, and it takes the supersedable reading;
+  /// * **ANSWER records in a query** — §7.1 known answers, which are records
+  ///   read out of the CACHE. They are what peers publish, not what this
+  ///   endpoint publishes, so a change to ours says nothing about them. (This
+  ///   workspace's core does not emit them today: `Query::poll_transmit` encodes
+  ///   the question alone.)
+  ///
+  /// # A body that cannot be read is an ASSERTION
+  ///
+  /// Shorter than a header, there is nothing to classify, and the answer that
+  /// suppresses more is the one to fall back to — the same direction every other
+  /// unusable-evidence decision in this module takes. Nothing this endpoint
+  /// sends is shorter than a DNS header, so the arm is unreachable from a real
+  /// send.
+  fn of(body: &[u8]) -> Self {
+    // RFC 1035 §4.1.1: ID, flags, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT — six
+    // 16-bit big-endian fields. Destructured rather than indexed, so every octet
+    // this rule reads is named here and a short body cannot index out of one.
+    let Some(&[_, _, flags_hi, _, _, _, _, _, ns_hi, ns_lo, ar_hi, ar_lo]) =
+      body.first_chunk::<12>()
+    else {
+      return Self::Assertion;
+    };
+    // QR is the high bit of the first flags octet.
+    if flags_hi & 0x80 != 0 {
+      return Self::Assertion;
+    }
+    // Non-zero NSCOUNT or ARCOUNT, read without assembling either `u16`.
+    if ns_hi | ns_lo | ar_hi | ar_lo != 0 {
+      return Self::Assertion;
+    }
+    Self::Question
+  }
+}
+
 /// One recorded send, waiting for its multicast loopback copy.
 ///
 /// **Two clocks, two jobs, and they are not interchangeable.** Each stamp is
@@ -904,11 +1014,16 @@ struct Credit {
   /// under, taken from [`SelfSendTracker::generation`] at
   /// [`SelfSendTracker::record`].
   ///
-  /// A credit whose generation is no longer the tracker's is still OURS —
-  /// nothing about the match weakened — but what it says about our records has
-  /// expired, so it may be suppressed and must not be adjudicated. See
-  /// [`SelfSendMatch::Superseded`].
+  /// An ASSERTING credit whose generation is no longer the tracker's is still
+  /// OURS — nothing about the match weakened — but what it says about our
+  /// records has expired, so it may be suppressed and must not be adjudicated.
+  /// See [`SelfSendMatch::Superseded`]. It is only half the question: see
+  /// [`Credit::class`] for the datagrams this field does not speak for.
   generation: u64,
+  /// What this datagram asserts, and therefore whether [`Credit::generation`]
+  /// bears on it at all. Derived from the body at record time; see
+  /// [`SendClass`].
+  class: SendClass,
   /// Both clocks, read **before** the `sendto`. Used for **ordering only**: an
   /// echo the kernel stamped at-or-after [`ClockPair::wall`] cannot be a peer
   /// datagram that predated our send.
@@ -1094,6 +1209,15 @@ impl SelfSendTracker {
   /// is protecting against read as [`SelfSendMatch::NoCredit`] — full peer
   /// traffic, full adjudication — which is the failure it exists to prevent,
   /// only louder.
+  ///
+  /// # It retires ASSERTIONS, and it leaves questions alone
+  ///
+  /// The advance is global to the log, but what it can retire is not: a credit
+  /// for a datagram that asserts nothing is untouched by it, because there is
+  /// nothing in a question for a publication change to invalidate. That is not a
+  /// caller's decision — the class is read off each datagram's own bytes at
+  /// [`Self::record`]. See [`SendClass`], which is also where the reason a
+  /// SEPARATE query epoch would be worse than none is written down.
   pub fn supersede(&mut self) {
     self.generation = self.generation.wrapping_add(1);
   }
@@ -1218,6 +1342,9 @@ impl SelfSendTracker {
       self.bytes = self.bytes.saturating_add(body.len());
       self.entries.push(Credit {
         family,
+        // Classified from the bytes being stored, so the class and the body a
+        // claim compares can never be two different datagrams. See `SendClass`.
+        class: SendClass::of(body),
         body: body.to_vec(),
         generation: self.generation,
         sent,
@@ -1658,6 +1785,13 @@ impl SelfSendTracker {
   /// [`Self::reclaim_expired_sealed`] and [`Self::admit`] — so the retention is
   /// bounded by exactly the same two limits as before.
   ///
+  /// **Only an ASSERTING credit can reach that tier.** A question's credit stays
+  /// take-once for its whole life however many times the generation advances,
+  /// because a question asserts nothing that a change to our own records could
+  /// retire — and a standing tombstone for one would suppress every
+  /// byte-identical peer retransmission rather than the single copy take-once
+  /// costs. See [`SendClass`].
+  ///
   /// Take-once was applied here too, on the reasoning that total suppression of
   /// bytes a peer could be replaying needs a bound. It does not: what those bytes
   /// assert is a record set this endpoint HAS GIVEN UP, so suppressing every copy
@@ -1701,7 +1835,12 @@ impl SelfSendTracker {
       if !reference_ordered(rx, c.sent, mode) {
         continue;
       }
-      if c.generation == self.generation {
+      // A QUESTION is never superseded, whatever the generation reads: it
+      // asserts nothing, so no change to what this endpoint publishes can have
+      // made its echo stale, and the tombstone it would otherwise become would
+      // suppress every byte-identical peer retransmission for the credit's whole
+      // life. See `SendClass`.
+      if c.generation == self.generation || c.class == SendClass::Question {
         current = Some((pos, mode));
         break;
       }

@@ -2759,14 +2759,28 @@ where
         // answer to a probe for a name we own is still to defend it, which the
         // `Question` arm does from the same datagram.
         //
-        // The rtype screen is §9's OWN, and it is applied HERE rather than in
-        // the router because the router cannot see lifecycle state. §8.1 needs
-        // every type at this name delivered (a peer's existing A/AAAA/NSEC is a
-        // conflicting response for a name we are probing), so the router routes
-        // every type and the narrow rule lives where it is true: on the
-        // established side, where "a unique record for which it is currently
-        // authoritative" means SRV and TXT.
-        if !crate::endpoint::is_instance_conflict_rtype(pc.record().rtype()) {
+        // The rtype screen is §9's OWN — "a unique record for which it is
+        // CURRENTLY AUTHORITATIVE … with the same name, rrtype and rrclass" —
+        // and it is applied HERE rather than in the router because the router
+        // cannot see lifecycle state. §8.1 needs every type at this name
+        // delivered (a peer's existing A/AAAA/NSEC is a conflicting response for
+        // a name we are PROBING), so the router routes every type and the narrow
+        // rule lives where it is true: on the established side.
+        //
+        // "Authoritative for" is asked of the RECORD SET, through the same
+        // function the classifier just used, rather than of a hand-written list
+        // of rrtypes. The hand-written one — `Srv | Txt` — went stale when
+        // `canonical_rdata_forms` gained its NSEC arm: a peer's authoritative,
+        // cache-flushed NSEC at this instance name with DIFFERENT rdata was
+        // classified as conflicting and then dropped here for being an NSEC, so
+        // an NSEC-only response left duplicate ownership of this name undetected
+        // until unrelated SRV/TXT traffic arrived. A shared PTR is still
+        // excluded, and by the rule rather than by a special case: it is owned
+        // by the service-type name, so this set asserts no form of it.
+        if self
+          .our_canonical_records_for(pc.record().rtype())
+          .is_empty()
+        {
           return;
         }
         // A record whose rdata will not decode is not one this service can

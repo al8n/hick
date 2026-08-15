@@ -2,7 +2,7 @@ use std::time::{Duration, Instant as StdInstant, SystemTime};
 
 use super::{
   ClockPair, Credit, MAX_SELF_SEND_BYTES, MAX_SELF_SEND_ENTRIES, RxDatagram, SELF_SEND_TTL,
-  SelfSendMatch, SelfSendTracker, WALL_STEP_TOLERANCE,
+  SelfSendMatch, SelfSendTracker, SendClass, WALL_STEP_TOLERANCE,
 };
 use crate::Family;
 
@@ -836,12 +836,18 @@ const STALL_PAST_TTL: Duration = SELF_SEND_TTL.saturating_add(Duration::from_mil
 fn full_tracker(sent: ClockPair, aged_from: Option<StdInstant>) -> SelfSendTracker {
   SelfSendTracker {
     entries: (0..MAX_SELF_SEND_ENTRIES)
-      .map(|i| Credit {
-        family: Family::V4,
-        body: (i as u64).to_be_bytes().to_vec(),
-        generation: 0,
-        sent,
-        aged_from,
+      .map(|i| {
+        let body = (i as u64).to_be_bytes().to_vec();
+        Credit {
+          family: Family::V4,
+          // Derived here as `record` derives it, so a fixture cannot seed a
+          // class its own bytes disagree with. See `SendClass`.
+          class: SendClass::of(&body),
+          body,
+          generation: 0,
+          sent,
+          aged_from,
+        }
       })
       .collect(),
     // Seeded straight into `entries`, so the byte accounting `admit` reads has
@@ -1377,6 +1383,123 @@ fn a_supersede_retires_credits_without_discarding_them() {
     "a discarded credit would send our own echo to the protocol layer as a \
      peer's datagram, which is strictly worse than not adjudicating it"
   );
+}
+
+// ── what the generation may retire, and what it may not ─────────────────────
+//
+// The generation answers one question: has what this endpoint PUBLISHES changed
+// since this datagram was sent? A datagram that asserts records can go stale
+// that way. A question cannot — it asserts nothing, so there is nothing in it
+// for a registration or a withdrawal to invalidate.
+
+/// A structurally valid mDNS QUERY: one question for `_http._tcp.local. PTR IN`
+/// and not a single resource record.
+///
+/// QR=0 and every record count is zero, which is exactly the shape this
+/// workspace's core puts on the wire for a continuous query — `Query::poll_transmit`
+/// encodes the question alone, with no RFC 6762 §7.1 known-answer list behind it.
+const QUERY_HTTP_PTR: &[u8] = &[
+  // ID, flags (QR=0, opcode QUERY), QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0.
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+  // QNAME `_http._tcp.local.`
+  0x05, b'_', b'h', b't', b't', b'p', 0x04, b'_', b't', b'c', b'p', 0x05, b'l', b'o', b'c', b'a',
+  b'l', 0x00, //
+  // QTYPE = PTR, QCLASS = IN
+  0x00, 0x0c, 0x00, 0x01,
+];
+
+/// A structurally valid RFC 6762 §8.2 PROBE: `hick.local. ANY IN` asked with the
+/// proposed `A` record in the AUTHORITY section.
+///
+/// QR=0, so it is a query by the header's own bit — and it still asserts, which
+/// is why the class cannot be read off that bit alone. The rdata it proposes is
+/// exactly what a registration or a withdrawal can make stale.
+const PROBE_HICK_A: &[u8] = &[
+  // ID, flags (QR=0), QDCOUNT=1, ANCOUNT=0, NSCOUNT=1, ARCOUNT=0.
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, //
+  // QNAME `hick.local.`, QTYPE = ANY, QCLASS = IN
+  0x04, b'h', b'i', b'c', b'k', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00, 0x00, 0xff, 0x00, 0x01,
+  //
+  // AUTHORITY: name compressed to offset 12, A, IN, TTL 120, 192.0.2.1
+  0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 0xc0, 0x00, 0x02, 0x01,
+];
+
+/// A QUESTION SURVIVES A PUBLICATION CHANGE AS A TAKE-ONCE CREDIT.
+///
+/// The generation was applied to the whole log, so a service registration — or a
+/// withdrawal, or a §9 rename — retired every outstanding credit including the
+/// ones for datagrams that assert nothing. A superseded credit is deliberately
+/// non-consuming, so a query credit became a STANDING TOMBSTONE: every
+/// byte-identical copy read `Superseded`, every driver maps that to
+/// `Provenance::OwnEcho`, and `OwnEcho` suppresses the whole datagram. A peer's
+/// query retransmission from port 5353 — RFC 6762 §5.2 schedules them, so these
+/// are ordinary traffic and not a corner case — was then invisible for the rest
+/// of the credit's life instead of for the one copy take-once costs.
+///
+/// Nothing about a question can be made stale by what this endpoint publishes:
+/// its records are questions rather than claims, so its echo can carry no rdata
+/// we have given up.
+#[test]
+fn a_question_credit_stays_take_once_across_a_publication_change() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, QUERY_HTTP_PTR, sent);
+  // An UNRELATED service registers, withdraws, or renames.
+  t.supersede();
+
+  let first = Duration::from_millis(1);
+  assert_eq!(
+    t.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, QUERY_HTTP_PTR, sent.wall + first),
+      claim(sent, first)
+    ),
+    SelfSendMatch::Ordered,
+    "a publication change says nothing about a question, so the credit is still \
+     current and our own echo takes it"
+  );
+  assert!(
+    t.is_empty(),
+    "and taking it SPENDS it — a question left standing as a tombstone would \
+     answer every copy for the rest of the TTL"
+  );
+
+  let second = Duration::from_millis(2);
+  assert_eq!(
+    t.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, QUERY_HTTP_PTR, sent.wall + second),
+      claim(sent, second)
+    ),
+    SelfSendMatch::NoCredit,
+    "so a peer's byte-identical §5.2 retransmission is peer traffic, which is \
+     the whole of what take-once buys"
+  );
+}
+
+/// The boundary is what the datagram ASSERTS, not the header's QR bit: an RFC
+/// 6762 §8.2 probe is a query that proposes records, and those records are
+/// exactly what a registration or a withdrawal can retire.
+///
+/// So the tombstone still stands here, and it stands for every copy — the
+/// property the previous round bought, which this one must not spend.
+#[test]
+fn a_probe_is_still_superseded_although_its_header_says_query() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, PROBE_HICK_A, sent);
+  t.supersede();
+  for round in 1..=3u32 {
+    let gap = Duration::from_millis(u64::from(round));
+    assert_eq!(
+      t.claim_at(
+        &RxDatagram::from_stamp_for_test(Family::V4, PROBE_HICK_A, sent.wall + gap),
+        claim(sent, gap)
+      ),
+      SelfSendMatch::Superseded,
+      "copy {round} proposes rdata this endpoint may no longer hold, so the \
+       tombstone answers it"
+    );
+  }
+  assert_eq!(t.len(), 1, "and no copy spends it");
 }
 
 // ── the byte budget ─────────────────────────────────────────────────────────

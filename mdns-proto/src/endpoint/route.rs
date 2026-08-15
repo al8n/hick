@@ -133,9 +133,10 @@ where
   /// index into the ADDITIONAL section, plus the
   /// service-conflict and query fan-out cursors for the current additional
   /// record (same shape as the answer-section cursors). DNS-SD responders carry
-  /// SRV/TXT/A/AAAA here, so QR=1 additionals run conflict detection (instance
-  /// SRV/TXT → ProbeConflict, host A/AAAA → HostConflict) AND query fan-out —
-  /// but never KAS (additionals are not known-answer hints).
+  /// SRV/TXT/A/AAAA — and the §6.1 instance NSEC — here, so QR=1 additionals run
+  /// conflict detection (any type at the instance name → ProbeConflict, host
+  /// A/AAAA → HostConflict) AND query fan-out — but never KAS (additionals are
+  /// not known-answer hints).
   pub(crate) additional_idx: u16,
   pub(crate) additional_service_cursor: Option<usize>,
   /// like `answer_service_done`, marks the additional-record
@@ -195,8 +196,10 @@ where
   /// shared by the Answers, Authority, and Additional sections (previously
   /// triplicated). Scans registered services from slab key `start` and returns
   /// the next `(key, event)`:
-  ///   * instance-name match + SRV/TXT → ProbeConflict (the instance's unique
-  ///     RRset; service-type / shared names are never conflicts);
+  ///   * instance-name match, ANY rrtype → ProbeConflict. §8.1's input is every
+  ///     type at a name being probed, so the router routes every type and the
+  ///     narrower §9 rule is applied by `Service` on the established side.
+  ///     Service-type / shared names are never conflicts;
   ///   * host-name match + A/AAAA → HostConflict.
   ///
   /// `origin` is the caller's witness for HOW `r` arrived, and it is a
@@ -226,9 +229,10 @@ where
   /// and duplicate ownership — the outcome the whole mechanism exists to
   /// prevent, invisible unless the peer proposes a type we do not.
   ///
-  /// The SRV/TXT restriction survives only where it is actually the rule: RFC
-  /// 6762 §9's post-establishment conflict, which `Service` applies to the
-  /// unique RRset it is authoritative for.
+  /// A narrowing survives only where it is actually the rule: RFC 6762 §9's
+  /// post-establishment conflict, which `Service` applies to exactly the records
+  /// it is authoritative for at that name — asked of its own canonical rdata
+  /// forms rather than of a list of rrtypes.
   ///
   /// # …but only what the query ASKS about
   ///
@@ -478,9 +482,10 @@ where
       // independent predicates over different names, and when one service's
       // instance name IS its host name a record we hold no host RRset for is
       // still a peer asserting something at a UNIQUE INSTANCE name — §8.1's
-      // "any conflicting Multicast DNS response" while probing, and dropped by
-      // the established arm's own SRV/TXT screen once advertised. Declining the
-      // host rule must not also delete the instance rule's input.
+      // "any conflicting Multicast DNS response" while probing, and once
+      // advertised, screened by the established arm against the records this
+      // service is actually authoritative for there. Declining the host rule
+      // must not also delete the instance rule's input.
       if names_match_record(route.host(), r)
         && is_host_conflict_rtype(r.rtype())
         && route_publishes_host_rtype(route, r.rtype())
@@ -502,10 +507,13 @@ where
       // that already holds the name.
       //
       // Widening is safe because the narrowing lives where the narrow rule is
-      // true: §9's post-establishment arm in `Service::handle_event` tests
-      // SRV/TXT itself before reverting an ESTABLISHED service to probing, so
-      // an extra type reaching an established service is dropped there. What
-      // reaches a PRE-authoritative one is §8.1's input, which is every type.
+      // true: §9's post-establishment arm in `Service::handle_event` asks its
+      // OWN canonical rdata forms whether it is authoritative for this type at
+      // this name before reverting an ESTABLISHED service to probing, so a type
+      // it asserts nothing of — a shared PTR, say — is dropped there. A record
+      // it does assert (SRV, TXT, and the §6.1 instance NSEC) is §9's conflict
+      // and is adjudicated. What reaches a PRE-authoritative service is §8.1's
+      // input, which is every type.
       if names_match_record(route.name(), r) {
         return Some((
           key,
