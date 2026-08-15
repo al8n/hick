@@ -581,11 +581,19 @@ where
     // The router still cannot see lifecycle state and does not need to: it
     // states the fact, and `Service::handle_event` — which knows the phase —
     // decides. NEITHER instance cell drops a labelled record. An ESTABLISHED
-    // service spends the label on nothing at all: §9's revert-to-probing runs as
-    // it would unlabelled, because dropping it there consumed a conforming
-    // peer's whole BOUNDED §8.3 announcement burst — "two or three times, at
-    // intervals of at least one second", then silence until queried — inside the
-    // window, and nothing replays a conflict once the window lapses.
+    // service spends the label on nothing at all: §9's revert-to-probing runs as it
+    // would unlabelled, because dropping it there risked consuming a conforming
+    // peer's whole BOUNDED §8.3 announcement burst — at least two responses one
+    // second apart, MAY continue to eight with the interval at least doubling each
+    // time, then silence until queried — inside the window, and nothing replays a
+    // conflict once the window lapses.
+    //
+    // THE DOUBLING FLOOR BOUNDS HOW MUCH OF THAT BURST THE WINDOW CAN EVER COVER
+    // WHOLE. By the fourth response, elapsed time since the first is at least 1 +
+    // 2 + 4 = 7 seconds, and no 5-second window that holds the first response can
+    // also hold one 7 seconds later — so only a MINIMUM-CONFORMANT burst (two or
+    // three responses, near the one-second floor) is ever wholly swallowed. A peer
+    // that sends four or more always leaves a later response outside the window.
     //
     // The gap it closes: a withdrawing route stops holding its host name for the
     // registration guard, so a replacement may take host `H` with address set
@@ -694,6 +702,20 @@ where
         // instance rule below and takes the labelled `ProbeConflict`. A route
         // with no second role to fall through to is skipped as before.
         if !names_match_record(route.name(), r) {
+          // EXTENDING "the cell that did not change", above: that stays true
+          // AND becomes observable rather than silent. Standing obligation,
+          // filed as issue #92 — once host-name ownership gets its own probing
+          // and defence, this suppression becomes delivery-labelled, exactly
+          // as the instance cells already are.
+          warn!(
+            target: "mdns_proto::endpoint",
+            handle = route.handle().raw(),
+            rtype = ?r.rtype(),
+            "next_service_conflict: relinquished-history host match dropped — no \
+             instance role to fall through to"
+          );
+          #[cfg(feature = "stats")]
+          self.endpoint.stats.relinquished_host_conflicts_suppressed(1);
           continue;
         }
         // AND IT FALLS THROUGH WEARING BOTH ROLES. Suppressing the host

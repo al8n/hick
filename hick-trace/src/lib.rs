@@ -287,6 +287,7 @@ pub mod stats {
     goodbyes_tx: AtomicU64,
     conflicts: AtomicU64,
     renames: AtomicU64,
+    relinquished_host_conflicts_suppressed: AtomicU64,
     cache_inserts: AtomicU64,
     cache_refreshes: AtomicU64,
     cache_evictions: AtomicU64,
@@ -372,6 +373,14 @@ pub mod stats {
       goodbyes_tx => "mdns_goodbyes_tx",
       conflicts => "mdns_conflicts",
       renames => "mdns_renames",
+      // A peer's record matched this endpoint's own recently-relinquished
+      // history at a HOST name, and RFC 6762 §9 conflict detection for it was
+      // suppressed because the owning route had no INSTANCE role to fall back
+      // to. Deliberate and deferred, not a bug: see `mdns-proto`'s
+      // `RouteEvents::next_service_conflict` and issue #92 (host-name
+      // ownership) for the obligation this counts against — until that lands,
+      // this is how the gap is an observation instead of an argument.
+      relinquished_host_conflicts_suppressed => "mdns_relinquished_host_conflicts_suppressed",
       cache_inserts => "mdns_cache_inserts",
       cache_refreshes => "mdns_cache_refreshes",
       cache_evictions => "mdns_cache_evictions",
@@ -429,6 +438,9 @@ pub mod stats {
         goodbyes_tx: self.goodbyes_tx.load(Relaxed),
         conflicts: self.conflicts.load(Relaxed),
         renames: self.renames.load(Relaxed),
+        relinquished_host_conflicts_suppressed: self
+          .relinquished_host_conflicts_suppressed
+          .load(Relaxed),
         cache_inserts: self.cache_inserts.load(Relaxed),
         cache_refreshes: self.cache_refreshes.load(Relaxed),
         cache_evictions: self.cache_evictions.load(Relaxed),
@@ -489,6 +501,13 @@ pub mod stats {
     pub goodbyes_tx: u64,
     pub conflicts: u64,
     pub renames: u64,
+    /// A peer's record matched this endpoint's own recently-relinquished
+    /// history at a HOST name, and RFC 6762 §9 conflict detection was
+    /// suppressed for it because the owning route had no INSTANCE role to
+    /// fall back to. Deliberate and deferred pending host-name-ownership
+    /// probing and defence (`mdns-proto` issue #92); until then this is the
+    /// only field evidence the suppression ever ran.
+    pub relinquished_host_conflicts_suppressed: u64,
     pub cache_inserts: u64,
     pub cache_refreshes: u64,
     pub cache_evictions: u64,

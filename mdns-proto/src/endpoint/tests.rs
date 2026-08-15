@@ -11212,6 +11212,74 @@ fn a_completed_withdrawals_echo_does_not_retire_the_replacement_at_its_host() {
   );
 }
 
+/// The DROP above is now counted, not merely silent. Same setup as
+/// [`a_completed_withdrawals_echo_does_not_retire_the_replacement_at_its_host`]:
+/// `B`'s instance name differs from the shared host name, so the labelled
+/// match has no second (instance) role to fall through to and hits the
+/// `continue` in `RouteEvents::next_service_conflict` — the site issue #92
+/// tracks for host-name-ownership probing and defence.
+#[cfg(feature = "stats")]
+#[test]
+fn dropping_a_labelled_host_match_increments_relinquished_host_conflicts_suppressed() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let host = Name::try_from_str("shared-host.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  e.begin_withdrawal(a_handle, snap, now);
+  let freed = finish_withdrawal(&mut e, a_handle, now);
+  assert_eq!(
+    freed,
+    std::vec![a_handle],
+    "precondition: the goodbye must have completed"
+  );
+
+  let _b_handle = register_with_addr_sets(
+    &mut e,
+    "B._ipp._tcp.local.",
+    "shared-host.local.",
+    &[a2],
+    &[],
+  )
+  .unwrap();
+
+  assert_eq!(
+    e.stats().relinquished_host_conflicts_suppressed,
+    0,
+    "precondition: nothing has been dropped yet"
+  );
+
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  assert!(
+    host_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "precondition: the relinquished-history screen still suppresses the \
+     HostConflict — this test must not change that"
+  );
+  assert_eq!(
+    e.stats().relinquished_host_conflicts_suppressed,
+    1,
+    "the drop must be counted exactly once for this one suppressed match"
+  );
+
+  // A second, unrelated peer record at an address neither route ever
+  // published is a genuine conflict and must not move this counter.
+  let n = build_host_a_response(&mut buf, &host, Ipv4Addr::new(10, 0, 0, 99));
+  assert!(
+    !host_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "precondition: an address neither route asserted is a genuine conflict"
+  );
+  assert_eq!(
+    e.stats().relinquished_host_conflicts_suppressed,
+    1,
+    "a genuine, delivered conflict must not bump the suppression counter"
+  );
+}
+
 /// THE SECTION, and the serious half of the pair: a CONFORMING responder
 /// reaches this with ORDINARY TRAFFIC.
 ///

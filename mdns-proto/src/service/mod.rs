@@ -2516,7 +2516,7 @@ where
       // on `ServiceRecords`, so "we advertise fe80::1 on eth0" could be
       // distinguished from "a peer advertises fe80::1 on wlan0". `ServiceRecords`
       // cannot express that today, and adding it belongs with host-name
-      // ownership (#73) rather than here. Carrying `interface_index` through
+      // ownership (#92) rather than here. Carrying `interface_index` through
       // `HostConflict` alone would not help: without per-address scope on OUR
       // side there is nothing to compare it against.
       //
@@ -3310,9 +3310,10 @@ where
         // This cell dropped a labelled record for one round, on the premise that
         // §9 self-heals because a real incumbent's traffic recurs. THAT PREMISE
         // IS FALSE, and §8.3 is what falsifies it: a conforming responder
-        // announces "two or three times, at intervals of at least one second"
-        // and is then SILENT until something queries it. A screen that consumes
-        // those responses inside the retention window consumes every copy there
+        // announces AT LEAST TWICE, one second apart, MAY continue to eight
+        // times with the interval at least doubling each time, and is then
+        // SILENT until something queries it. A screen that consumes a burst
+        // landing wholly inside the retention window consumes every copy there
         // was, and nothing replays a conflict when the window lapses — so
         // duplicate ownership of an ADVERTISED name stood until unrelated
         // traffic happened to arrive, which is §9's "MUST immediately reset its
