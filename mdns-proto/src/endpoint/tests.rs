@@ -311,6 +311,23 @@ fn build_probe_authority_for_host(buf: &mut [u8; 512], host_str: &str) -> usize 
   b.finish().unwrap()
 }
 
+/// Helper: encode a PROBE for `host_str` — the §8.1 ANY question plus the A
+/// record the prober proposes to put at that name. Unlike
+/// [`build_probe_authority_for_host`] this carries the question too, which is
+/// what makes it a probe rather than a bare authority record: §8.1 defines the
+/// probe as "a query with the record name in question in the Question Section",
+/// and `RouteEvents::is_probe_for` — the §8.1 defence gate — requires both.
+fn build_probe_for_host(buf: &mut [u8; 512], host_str: &str, addr: Ipv4Addr) -> usize {
+  use crate::wire::{Header, MessageBuilder, ResourceClass, ResourceType};
+  let hdr = Header::new();
+  let mut b = MessageBuilder::<'_, 32>::try_new(buf, hdr).unwrap();
+  let name = Name::try_from_str(host_str).unwrap();
+  b.push_question(&name, ResourceType::Any, ResourceClass::In, true)
+    .unwrap();
+  b.push_a_authority(&name, 120, addr).unwrap();
+  b.finish().unwrap()
+}
+
 /// Helper: encode a PROBE for `instance_str` — the §8.1 ANY question plus an SRV
 /// record in the authority section. Use for INSTANCE-name conflicts.
 ///
@@ -339,12 +356,20 @@ fn build_probe_srv_authority(buf: &mut [u8; 512], instance_str: &str) -> usize {
 
 /// Helper: build a test endpoint with one registered service whose host is
 /// "printer-host.local." and instance is "Printer._ipp._tcp.local.".
+///
+/// The host publishes an A record, because a host name that owns no address
+/// RRset owns nothing that RFC 6762 §9 can put in conflict — its conflict is
+/// over "the same name, rrtype and rrclass", so an addressless route is not a
+/// party to any A/AAAA at its host name and receives no `HostConflict` for one.
+/// An addressless fixture would assert host-conflict routing no real responder
+/// reaches.
 fn build_endpoint_with_printer() -> (TestEndp, ServiceHandle) {
   let mut e = build_endpoint();
   let st = Name::try_from_str("_ipp._tcp.local.").unwrap();
   let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
   let host = Name::try_from_str("printer-host.local.").unwrap();
-  let recs = ServiceRecords::new(st, inst, host, 631, 120);
+  let mut recs = ServiceRecords::new(st, inst, host, 631, 120);
+  recs.add_a(Ipv4Addr::new(192, 168, 7, 7));
   let now = StdInstant::now();
   let (handle, _svc) = e
     .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
@@ -1415,16 +1440,17 @@ fn cache_goodbye_matches_differently_encoded_and_cased_ptr() {
 /// is the multicast group, and they never match.  This detects self via
 /// membership in any registered service's advertised AAAA list.
 ///
-/// Test: register a service publishing `fe80::1`, then feed back a
-/// probe-shaped packet with `src.ip() == fe80::1` and `local_ip == ff02::fb`.
-/// Without the membership signal the packet's §8.1 question would route to the
-/// service as one to answer.  Control half: a foreign IPv6 source must still
-/// produce a ProbeProposal.
+/// Test: register a service publishing `fe80::1`, then feed back packets with
+/// `src.ip() == fe80::1` and `local_ip == ff02::fb`. Without the membership
+/// signal a DISCOVERY question from that source would route to the service as
+/// one to answer.  Control half: a foreign IPv6 source must still produce a
+/// ProbeProposal and must still have its discovery question answered.
 ///
-/// What the heuristic does NOT suppress is the RFC 6762 §8.2 proposal. An
-/// address-based guess matches any co-resident host publishing an address we
-/// publish — including a peer that has taken it — and a deleted proposal costs a
-/// name permanently, so adjudication survives the guess. See `Admits`.
+/// What the heuristic does NOT suppress is the RFC 6762 §8.2 proposal, or the
+/// §8.1 defence of a name we already hold. An address-based guess matches any
+/// co-resident host publishing an address we publish — including a peer that has
+/// taken it — and a deleted proposal or a skipped defence costs a name
+/// permanently, so both survive the guess. See `Admits`.
 #[test]
 fn ipv6_self_packet_detected_via_advertised_aaaa() {
   use crate::{
@@ -1499,15 +1525,6 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
     .unwrap()
     .map(|ev| ev.expect("routing event must be Ok"))
     .collect();
-  assert!(
-    !self_events.iter().any(|ev| matches!(
-      ev,
-      RouteEvent::ToService(ts) if ts.event().is_question()
-    )),
-    "IPv6 self-packet (src ∈ advertised AAAA) must not be answered as a peer's \
-       question; local_ip == ff02::fb cannot detect this, so the membership \
-       branch must catch it"
-  );
   assert_eq!(
     self_events
       .iter()
@@ -1519,6 +1536,15 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
     1,
     "the §8.2 proposal survives the advertised-source guess — an opt-in \
        convenience knob must not be able to delete one"
+  );
+  assert!(
+    self_events.iter().any(|ev| matches!(
+      ev,
+      RouteEvent::ToService(ts) if ts.event().is_question()
+    )),
+    "and so does the §8.1 defence: this datagram PROPOSES to take a unique name \
+       we hold, and the guess matches every co-resident host publishing an \
+       address we publish — so skipping the defence would let a real one take it"
   );
 
   // (2) Control: a foreign IPv6 source must still emit ProbeConflict on
@@ -1537,6 +1563,34 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   assert!(
     saw_proposal,
     "control: foreign IPv6 probe must still emit ProbeProposal"
+  );
+
+  // (3) What the membership branch DOES still withhold, and the discriminator
+  // this test now turns on: an ordinary discovery question. It proposes nothing,
+  // so §8.1 owes it no defence and `Answering::DefenceOnly` withholds it from a
+  // matched source while `Answering::All` routes it from a foreign one.
+  let mut qbuf = [0u8; 512];
+  let qn = build_query_for_host(&mut qbuf, "Printer._ipp._tcp.local.");
+  let mut routes_question = |src: SocketAddr| {
+    e.handle(
+      now,
+      Received::new(src, &qbuf[..qn], Provenance::Unknown).with_local_ip(local_ip),
+    )
+    .unwrap()
+    .any(|ev| matches!(
+      ev.expect("routing event must be Ok"),
+      RouteEvent::ToService(ts) if ts.event().is_question()
+    ))
+  };
+  assert!(
+    !routes_question(self_src),
+    "IPv6 self-packet (src ∈ advertised AAAA) must not have its DISCOVERY \
+       question answered as a peer's; local_ip == ff02::fb cannot detect this, \
+       so the membership branch must catch it"
+  );
+  assert!(
+    routes_question(peer_src),
+    "control: the same question from a foreign IPv6 source is answered"
   );
 }
 
@@ -2820,7 +2874,10 @@ fn qr1_answer_for_host_name_emits_host_conflict() {
   let st = Name::try_from_str("_http._tcp.local.").unwrap();
   let inst = Name::try_from_str("Alpha._http._tcp.local.").unwrap();
   let host = Name::try_from_str("alpha.local.").unwrap();
-  let recs = ServiceRecords::new(st, inst.clone(), host.clone(), 80, 120);
+  let mut recs = ServiceRecords::new(st, inst.clone(), host.clone(), 80, 120);
+  // The host must OWN an A RRset for a peer's A at that name to conflict with
+  // it — §9 compares the same name AND rrtype.
+  recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
   let now = StdInstant::now();
   let (_handle, _svc) = e
     .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
@@ -3864,7 +3921,11 @@ fn authority_host_conflict_fans_out_to_all_same_host_services() {
     let inst_str = std::format!("{inst_label}._ipp._tcp.local.");
     let st = Name::try_from_str("_ipp._tcp.local.").unwrap();
     let inst = Name::try_from_str(&inst_str).unwrap();
-    let recs = ServiceRecords::new(st, inst, host.clone(), 631, 120);
+    let mut recs = ServiceRecords::new(st, inst, host.clone(), 631, 120);
+    // All three share the host AND its address set — the only way the
+    // registration invariant lets them share a host name, and what makes each
+    // of them an owner of the A RRset a peer's probe contends for.
+    recs.add_a(Ipv4Addr::new(192, 168, 1, 5));
     let (h, _svc) = e
       .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
         ServiceSpec::new(recs),
@@ -4372,15 +4433,15 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 /// suppressed.
 ///
 /// Test: register a service publishing `fe80::1` scoped to interface
-/// index 2, then feed back a probe-shaped AAAA-authority packet with
-/// `src = fe80::1`.  The same packet must:
-///   * have its §8.1 question suppressed when delivered with
-///     `interface_index == 2` (true self-loopback), AND
+/// index 2, then feed back packets with `src = fe80::1`.  A DISCOVERY question
+/// must:
+///   * be suppressed when delivered with `interface_index == 2` (true
+///     self-loopback), AND
 ///   * be routed normally when delivered with `interface_index == 3` (a remote
 ///     peer on another interface).
 ///
-/// The §8.2 proposal is routed in BOTH cases: an address-based guess must not be
-/// able to delete one. See `Admits`.
+/// The §8.2 proposal and the §8.1 defence are routed in BOTH cases: an
+/// address-based guess must not be able to delete either. See `Admits`.
 #[test]
 fn ipv6_link_local_self_check_is_interface_scoped() {
   use crate::{
@@ -4454,19 +4515,20 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
     .map(|ev| ev.expect("event must be Ok"))
     .collect();
   assert!(
-    !self_events.iter().any(|ev| matches!(
-      ev,
-      RouteEvent::ToService(ts) if ts.event().is_question()
-    )),
-    "link-local from OUR interface (ifindex=2) must not be answered as a peer's \
-       question"
-  );
-  assert!(
     self_events.iter().any(|ev| matches!(
       ev,
       RouteEvent::ToService(ts) if ts.event().is_probe_proposal()
     )),
-    "…but its §8.2 proposal is still adjudicated"
+    "its §8.2 proposal is still adjudicated"
+  );
+  assert!(
+    self_events.iter().any(|ev| matches!(
+      ev,
+      RouteEvent::ToService(ts) if ts.event().is_question()
+    )),
+    "…and so is its §8.1 defence: this datagram proposes to take a unique name \
+       we hold, and the guess cannot tell a co-resident responder from our own \
+       echo"
   );
 
   // (2) Foreign peer on a different interface (ifindex=3) using the
@@ -4489,6 +4551,35 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
     saw_proposal,
     "link-local from ifindex=3 must emit ProbeProposal (not be misclassified \
        as self because of bare-address match)"
+  );
+
+  // (3) The interface scoping itself, read off what the guess still withholds:
+  //     an ordinary discovery question, which proposes nothing and so is owed no
+  //     §8.1 defence. Withheld on OUR interface, answered on any other.
+  let mut qbuf = [0u8; 512];
+  let qn = build_query_for_host(&mut qbuf, "Printer._ipp._tcp.local.");
+  let mut routes_question = |ifindex: u32| {
+    e.handle(
+      now,
+      Received::new(self_src, &qbuf[..qn], Provenance::Unknown)
+        .with_interface(Some(ifindex))
+        .with_local_ip(local_ip),
+    )
+    .unwrap()
+    .any(|ev| matches!(
+      ev.expect("event must be Ok"),
+      RouteEvent::ToService(ts) if ts.event().is_question()
+    ))
+  };
+  assert!(
+    !routes_question(2),
+    "link-local from OUR interface (ifindex=2) must not have its discovery \
+       question answered as a peer's"
+  );
+  assert!(
+    routes_question(3),
+    "the same address on ifindex=3 is a peer, and its discovery question is \
+       answered — the bare-address match must not decide this"
   );
 }
 
@@ -7664,13 +7755,16 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
   let now = StdInstant::now();
   let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
   let host = Name::try_from_str("printer-host.local.").unwrap();
-  let recs = ServiceRecords::new(
+  let mut recs = ServiceRecords::new(
     Name::try_from_str("_ipp._tcp.local.").unwrap(),
     inst.clone(),
     host.clone(),
     631,
     120,
   );
+  // The host must OWN an A RRset for the peer's A at that name to reach it as a
+  // §9 HostConflict at all.
+  recs.add_a(Ipv4Addr::new(192, 168, 7, 7));
   let (handle, mut svc) = e
     .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
       ServiceSpec::new(recs),
@@ -9838,6 +9932,60 @@ fn not_from_us_declines_the_advertised_source_guess() {
   );
 }
 
+/// The advertised-source guess denies observation and quieting, but it may not
+/// deny the RFC 6762 §8.1 DEFENCE — the same rule the `OwnEchoLikely` row
+/// already follows, against evidence that is WEAKER, not stronger.
+///
+/// `src_matches_advertised` matches any co-resident host publishing an address
+/// we publish, so a second responder on this machine shares the source address
+/// and its legitimate probe lands in this cell. Skipping that probe's question
+/// left nothing to stop it: the QR=0 proposal riding with it is §8.2's
+/// pre-authoritative input and has no effect on an established service, so the
+/// peer finished probing onto a name we already hold — duplicate ownership.
+#[test]
+fn a_matched_advertised_source_still_defends_an_established_name() {
+  use crate::event::RouteEvent;
+  use rand::SeedableRng;
+  let rng = rand::rngs::StdRng::from_seed([99u8; 32]);
+  let mut e = TestEndp::try_new(
+    EndpointConfig::new().with_trust_advertised_src_as_self(true),
+    rng,
+  );
+  let our_v4 = Ipv4Addr::new(192, 168, 1, 7);
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("Printer._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("printer-host.local.").unwrap(),
+    631,
+    120,
+  );
+  recs.add_a(our_v4);
+  let now = StdInstant::now();
+  let (handle, _svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  // A co-resident responder probing for the host name we already hold. Its
+  // source IS an address we advertise, so the guess fires and the caller —
+  // having no send log — says `Unknown`.
+  let mut buf = [0u8; 512];
+  let n = build_probe_for_host(&mut buf, "printer-host.local.", Ipv4Addr::new(10, 0, 0, 9));
+  let src = core::net::SocketAddr::from((our_v4, 5353));
+  assert!(
+    e.handle(now, Received::new(src, &buf[..n], Provenance::Unknown))
+      .unwrap()
+      .any(|ev| matches!(
+        ev.expect("event must be Ok"),
+        RouteEvent::ToService(ts) if ts.handle() == handle && ts.event().is_question()
+      )),
+    "§8.1 requires the probe for a name we are using to be answered immediately; \
+     an address guess must not be able to skip it"
+  );
+}
+
 // ── the host address-set registration invariant ─────────────────────────────
 
 fn register_with_addrs(
@@ -9894,6 +10042,44 @@ fn same_host_with_the_same_address_set_is_accepted() {
   register_with_addrs(&mut e, "C._ipp._tcp.local.", "other.local.", &[]).unwrap();
 }
 
+/// `Name` preserves the optional trailing root dot, but the wire encoder and
+/// the routing path both strip it — so `h.local` and `h.local.` are ONE DNS
+/// owner. A raw string comparison answers otherwise, and the spelling that
+/// differs only by that dot registered past the guard and then collided on the
+/// wire exactly as a matching spelling would have.
+#[test]
+fn the_host_address_guard_sees_through_a_trailing_root_dot() {
+  let mut e = build_endpoint();
+  register_with_addrs(
+    &mut e,
+    "A._ipp._tcp.local.",
+    "h.local.",
+    &[Ipv4Addr::new(192, 168, 1, 5)],
+  )
+  .unwrap();
+  assert!(
+    matches!(
+      register_with_addrs(
+        &mut e,
+        "B._ipp._tcp.local.",
+        "h.local", // same owner, no root dot
+        &[Ipv4Addr::new(192, 168, 1, 6)],
+      ),
+      Err(RegisterServiceError::HostAddressesDiffer(_))
+    ),
+    "a root dot is not part of the name, so this is the same host with a \
+     different address set"
+  );
+  // …and the same host WITHOUT the dot still shares addresses freely.
+  register_with_addrs(
+    &mut e,
+    "C._ipp._tcp.local.",
+    "h.local",
+    &[Ipv4Addr::new(192, 168, 1, 5)],
+  )
+  .expect("the same address set under the same owner is not a disagreement");
+}
+
 /// Host names are matched case-insensitively, exactly as the routing path
 /// matches a record against one — otherwise a second case spelling would
 /// register past the guard and conflict on the wire anyway.
@@ -9916,4 +10102,277 @@ fn the_host_address_guard_is_case_insensitive() {
     ),
     Err(RegisterServiceError::HostAddressesDiffer(_))
   ));
+}
+
+// ── the trailing root dot in the INSTANCE-name and host-sibling guards ───────
+//
+// Same hole as the host address-set guard's, in guards that predate it: `Name`
+// preserves the optional trailing root dot and these compared the stored
+// strings, so one DNS owner spelled two ways passed every one of them.
+
+/// Two live services may not hold one instance name. `A._ipp._tcp.local` and
+/// `A._ipp._tcp.local.` ARE one instance name — they encode to the same wire
+/// bytes and every peer sees one owner — so the second registration must be
+/// rejected rather than left to probe for a name this endpoint already holds.
+#[test]
+fn the_duplicate_instance_name_guard_sees_through_a_trailing_root_dot() {
+  let mut e = build_endpoint();
+  register_with_addrs(&mut e, "A._ipp._tcp.local.", "h.local.", &[]).unwrap();
+  assert!(
+    matches!(
+      register_with_addrs(&mut e, "A._ipp._tcp.local", "h.local.", &[]),
+      Err(RegisterServiceError::NameAlreadyRegistered(_))
+    ),
+    "a root dot is not part of the name, so this is the name already registered"
+  );
+}
+
+/// The same rule at the rename enforcement point: an auto-rename may not land on
+/// a name a different live route already owns, whichever way that name is spelled.
+#[test]
+fn the_rename_duplicate_guard_sees_through_a_trailing_root_dot() {
+  let mut e = build_endpoint();
+  register_with_addrs(&mut e, "A._ipp._tcp.local.", "h.local.", &[]).unwrap();
+  let b = register_with_addrs(&mut e, "B._ipp._tcp.local.", "h.local.", &[]).unwrap();
+  assert!(
+    matches!(
+      e.handle_service_renamed(b, Name::try_from_str("A._ipp._tcp.local").unwrap()),
+      Err(HandleServiceRenamedError::NameAlreadyRegistered(_))
+    ),
+    "renaming onto the same owner under a different spelling must be rejected"
+  );
+}
+
+/// And at the retract-before-reuse guard: a rename-COLLISION goodbye still
+/// holding its name blocks reuse of that NAME, not of one spelling of it.
+/// Otherwise the dead service's stale records are never retracted — the held
+/// goodbye is deliberately not cancelled on announce — while a replacement
+/// advertises the same owner.
+#[test]
+fn a_held_goodbye_holds_its_name_through_a_trailing_root_dot() {
+  let mut ep = build_endpoint();
+  let now = StdInstant::now();
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("printer.local.").unwrap();
+  let old_records = ServiceRecords::new(
+    stype.clone(),
+    Name::try_from_str("Printer._ipp._tcp.local.").unwrap(),
+    host.clone(),
+    631,
+    120,
+  );
+  ep.enqueue_rename_withdrawal(
+    crate::service::RenameGoodbyeHandoff {
+      records: old_records,
+      owned: crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+      ),
+    },
+    now,
+    true, // holds_name
+  );
+  let recs = ServiceRecords::new(
+    stype,
+    Name::try_from_str("Printer._ipp._tcp.local").unwrap(),
+    host,
+    631,
+    120,
+  );
+  assert!(
+    matches!(
+      ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+        ServiceSpec::new(recs),
+        now
+      ),
+      Err(RegisterServiceError::NameAlreadyRegistered(_))
+    ),
+    "the held goodbye owns this name, however the re-registration spells it"
+  );
+}
+
+/// A withdrawing service must RETAIN an address a live same-host sibling still
+/// advertises, or its TTL=0 goodbye deletes from every peer's cache a record the
+/// sibling still owns. The sibling is found by host name, so a spelling that
+/// differs only by the root dot must not hide it.
+#[test]
+fn sibling_host_retention_sees_through_a_trailing_root_dot() {
+  let mut e = build_endpoint();
+  let shared = Ipv4Addr::new(192, 168, 1, 5);
+  let leaving = register_with_addrs(&mut e, "A._ipp._tcp.local.", "h.local.", &[shared]).unwrap();
+  let staying = register_with_addrs(&mut e, "B._ipp._tcp.local.", "h.local", &[shared]).unwrap();
+  // Only a CONFIRMED-ADVERTISED address is retained, so announce the sibling's.
+  e.note_service_announced(FullyAnnounced::new(staying, true), &[shared], &[]);
+  assert_eq!(
+    e.sibling_retained_addrs(leaving),
+    std::vec![core::net::IpAddr::V4(shared)],
+    "the sibling shares this host name and still advertises the address"
+  );
+}
+
+// ── the host invariant and the host fan-out are PER RRTYPE ───────────────────
+
+fn register_with_addr_sets(
+  e: &mut TestEndp,
+  instance: &str,
+  host: &str,
+  a_addrs: &[Ipv4Addr],
+  aaaa_addrs: &[core::net::Ipv6Addr],
+) -> Result<ServiceHandle, RegisterServiceError> {
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str(instance).unwrap(),
+    Name::try_from_str(host).unwrap(),
+    631,
+    120,
+  );
+  for a in a_addrs {
+    recs.add_a(*a);
+  }
+  for a in aaaa_addrs {
+    recs.add_aaaa(*a);
+  }
+  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ServiceSpec::new(recs),
+    StdInstant::now(),
+  )
+  .map(|(h, _svc)| h)
+}
+
+/// RFC 6762 §9's conflict is over "the same name, **rrtype** and rrclass, but
+/// inconsistent rdata", so the A RRset at a host name and the AAAA RRset at it
+/// are two distinct unique RRsets, each singly owned. An IPv4-only service and
+/// an IPv6-only service may therefore share one host name: their records are
+/// disjoint and cannot be inconsistent with one another.
+///
+/// Requiring both complete sets to be independently equal banned that legitimate
+/// mixed-family configuration outright.
+#[test]
+fn an_ipv4_only_and_an_ipv6_only_service_may_share_a_host() {
+  let mut e = build_endpoint();
+  let v4 = Ipv4Addr::new(192, 168, 1, 5);
+  let v6 = core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+  register_with_addr_sets(&mut e, "A._ipp._tcp.local.", "h.local.", &[v4], &[]).unwrap();
+  register_with_addr_sets(&mut e, "B._ipp._tcp.local.", "h.local.", &[], &[v6])
+    .expect("disjoint A and AAAA RRsets at one host name are not a disagreement");
+  // …and a third, publishing NEITHER family, disagrees with neither.
+  register_with_addr_sets(&mut e, "C._ipp._tcp.local.", "h.local.", &[], &[]).unwrap();
+  // The rule is still enforced WITHIN a type both routes publish.
+  assert!(matches!(
+    register_with_addr_sets(
+      &mut e,
+      "D._ipp._tcp.local.",
+      "h.local.",
+      &[Ipv4Addr::new(192, 168, 1, 6)],
+      &[v6],
+    ),
+    Err(RegisterServiceError::HostAddressesDiffer(_))
+  ));
+}
+
+/// The fan-out half of the same rule, which must land with the registration
+/// half: a route that publishes no record of the record's RRtype at its host
+/// name is not a party to that RRset, so no `HostConflict` is routed to it.
+///
+/// Relaxing registration alone would admit the mixed-family pair above and then
+/// let the fan-out — which read an ABSENT RRtype as differing — raise a terminal
+/// `HostConflict` on the IPv4-only sibling the moment the IPv6-only one
+/// announced, over an address it never published.
+#[test]
+fn a_host_conflict_is_routed_only_to_routes_publishing_that_rrtype() {
+  use crate::{
+    event::RouteEvent,
+    wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
+  };
+  use core::net::SocketAddr;
+
+  let mut e = build_endpoint();
+  let v4 = Ipv4Addr::new(192, 168, 1, 5);
+  let v6 = core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+  let v4_only =
+    register_with_addr_sets(&mut e, "A._ipp._tcp.local.", "h.local.", &[v4], &[]).unwrap();
+  let v6_only =
+    register_with_addr_sets(&mut e, "B._ipp._tcp.local.", "h.local.", &[], &[v6]).unwrap();
+
+  // The IPv6-only sibling's own announcement: a QR=1 AAAA at the shared host.
+  let host = Name::try_from_str("h.local.").unwrap();
+  let mut buf = [0u8; 512];
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(&mut buf, hdr).unwrap();
+  b.push_aaaa_answer(&host, 120, v6, true).unwrap();
+  let n = b.finish().unwrap();
+
+  let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
+  let conflicted: std::vec::Vec<_> = e
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::NotFromUs),
+    )
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter_map(|ev| match ev {
+      RouteEvent::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
+      _ => None,
+    })
+    .collect();
+  assert!(
+    !conflicted.contains(&v4_only),
+    "the IPv4-only route publishes no AAAA at this host name, so this record is \
+     not its RRset; got {conflicted:?}"
+  );
+  assert!(
+    conflicted.contains(&v6_only),
+    "the route that DOES own the AAAA RRset still receives it — the gate is \
+     ownership, not family; got {conflicted:?}"
+  );
+}
+
+/// The same gate on the QR=0 authority path (`next_host_conflict`), which a
+/// peer's probe for the shared host name takes.
+#[test]
+fn a_probe_host_conflict_is_routed_only_to_routes_publishing_that_rrtype() {
+  use crate::event::RouteEvent;
+  use core::net::SocketAddr;
+
+  let mut e = build_endpoint();
+  let v6 = core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+  let v4_only = register_with_addr_sets(
+    &mut e,
+    "A._ipp._tcp.local.",
+    "h.local.",
+    &[Ipv4Addr::new(192, 168, 1, 5)],
+    &[],
+  )
+  .unwrap();
+  let v6_only =
+    register_with_addr_sets(&mut e, "B._ipp._tcp.local.", "h.local.", &[], &[v6]).unwrap();
+
+  // A peer probing for the shared host with an A record it proposes to use.
+  let mut buf = [0u8; 512];
+  let n = build_probe_authority_for_host(&mut buf, "h.local.");
+  let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
+  let conflicted: std::vec::Vec<_> = e
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::NotFromUs),
+    )
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter_map(|ev| match ev {
+      RouteEvent::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    conflicted,
+    std::vec![v4_only],
+    "only the route that owns an A RRset at this host name is a party to the \
+     peer's A; the IPv6-only route ({v6_only:?}) is not"
+  );
 }

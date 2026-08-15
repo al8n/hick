@@ -605,7 +605,7 @@ where
         self.withdrawals.retain(|(_, item)| {
           !(item.route.is_none()
             && !item.holds_name
-            && item.records.instance().as_str() == name.as_str())
+            && item.records.instance().same_owner(&name))
         });
       }
     }
@@ -637,7 +637,7 @@ where
       };
       let mut retained = std::vec::Vec::new();
       for (_, route) in self.services.iter() {
-        if route.handle() != handle && !route.withdrawing && route.host() == &host {
+        if route.handle() != handle && !route.withdrawing && route.host().same_owner(&host) {
           retained.extend(
             route
               .advertised_a()

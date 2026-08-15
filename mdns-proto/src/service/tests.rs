@@ -10854,3 +10854,141 @@ fn a_malformed_response_does_not_defeat_the_probe() {
     "…and queue no Renamed update; got {updates:?}"
   );
 }
+
+// ── §9's conflict is per RRTYPE: an unowned type is not our RRset ────────────
+
+/// Build a minimal raw AAAA record in wire format. The `Ref` lives as long as
+/// `buf`. Counterpart of [`make_a_record_ref`].
+fn make_aaaa_record_ref(buf: &mut std::vec::Vec<u8>, name_str: &str, ttl: u32, addr: [u8; 16]) {
+  buf.clear();
+  for label in name_str.trim_end_matches('.').split('.') {
+    buf.push(label.len() as u8);
+    buf.extend_from_slice(label.as_bytes());
+  }
+  buf.push(0u8); // root label
+  buf.extend_from_slice(&28u16.to_be_bytes()); // TYPE AAAA
+  buf.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+  buf.extend_from_slice(&ttl.to_be_bytes());
+  buf.extend_from_slice(&16u16.to_be_bytes()); // RDLENGTH
+  buf.extend_from_slice(&addr);
+}
+
+fn make_service_with(
+  a: &[core::net::Ipv4Addr],
+  aaaa: &[core::net::Ipv6Addr],
+) -> Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> {
+  let mut r = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("myprinter._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("host.local.").unwrap(),
+    631,
+    120,
+  );
+  for addr in a {
+    r.add_a(*addr);
+  }
+  for addr in aaaa {
+    r.add_aaaa(*addr);
+  }
+  Service::try_new(
+    ServiceHandle::from_raw(0),
+    r,
+    FakeInstant::zero(),
+    [0u8; 32],
+    true,
+  )
+}
+
+/// RFC 6762 §9 makes a conflict "the same name, **rrtype** and rrclass, but
+/// inconsistent rdata". An IPv6-only service asserts no A RRset at its host
+/// name, so a peer's A there is not that service's record and cannot be
+/// inconsistent with rdata it never published — and never could.
+///
+/// `contains` over an empty slice answered "differing", which surfaced a
+/// TERMINAL `ServiceUpdate::HostConflict`: a same-host sibling's first
+/// announcement retired the service over an address it does not advertise.
+#[test]
+fn a_host_a_record_is_not_a_conflict_for_a_service_publishing_no_a() {
+  use crate::event::{HostConflict, ServiceEvent};
+  let mut svc = make_service_with(
+    &[],
+    &[core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)],
+  );
+  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 99]);
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::HostConflict(HostConflict::new(
+      rec,
+      ConflictOrigin::AuthoritativeResponse,
+    )),
+    FakeInstant::zero(),
+  );
+  assert!(
+    svc.poll().is_none(),
+    "we publish no A at this host name, so a peer's A there is not our RRset"
+  );
+}
+
+/// The same rule in the other family: an IPv4-only service holds no AAAA RRset.
+#[test]
+fn a_host_aaaa_record_is_not_a_conflict_for_a_service_publishing_no_aaaa() {
+  use crate::event::{HostConflict, ServiceEvent};
+  let mut svc = make_service_with(&[core::net::Ipv4Addr::new(192, 168, 1, 5)], &[]);
+  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_aaaa_record_ref(
+    &mut buf,
+    "host.local.",
+    120,
+    [
+      0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99,
+    ],
+  );
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::HostConflict(HostConflict::new(
+      rec,
+      ConflictOrigin::AuthoritativeResponse,
+    )),
+    FakeInstant::zero(),
+  );
+  assert!(
+    svc.poll().is_none(),
+    "we publish no AAAA at this host name, so a peer's AAAA there is not our RRset"
+  );
+}
+
+/// Control: once the service DOES own that RRset, a differing address in it is
+/// a genuine §9 conflict again — the rule turns on ownership, not on family.
+#[test]
+fn a_host_aaaa_record_still_conflicts_when_we_own_an_aaaa_rrset() {
+  use crate::event::{HostConflict, ServiceEvent};
+  let mut svc = make_service_with(
+    &[],
+    &[core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)],
+  );
+  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_aaaa_record_ref(
+    &mut buf,
+    "host.local.",
+    120,
+    [
+      0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99,
+    ],
+  );
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::HostConflict(HostConflict::new(
+      rec,
+      ConflictOrigin::AuthoritativeResponse,
+    )),
+    FakeInstant::zero(),
+  );
+  assert!(
+    svc.poll().is_some_and(|u| u.is_host_conflict()),
+    "a different address inside an RRset we DO own is still a §9 conflict"
+  );
+}

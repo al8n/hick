@@ -20,9 +20,24 @@ use core::net::{IpAddr, SocketAddr};
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Provenance {
-  /// Content match AND evidence that ORDERS it: the kernel stamped this arrival
-  /// at or after our own `sendto`, so nothing else could have put these bytes on
-  /// the wire in between.
+  /// Our own bytes, by one of two routes — and only the first of them is a
+  /// claim about the strength of the evidence.
+  ///
+  /// **Ordered.** A content match AND evidence that ORDERS it: the kernel
+  /// stamped this arrival at or after our own `sendto`, so nothing else could
+  /// have put these bytes on the wire in between.
+  ///
+  /// **Superseded.** A content match — ordered or NOT — against a datagram the
+  /// caller sent under a generation of its own records that no longer exists,
+  /// because a service registered or began withdrawing since the send. This
+  /// route claims no more evidence than [`Self::OwnEchoLikely`] carries; it
+  /// reports an echo that has less left it may safely say. A stale echo's RFC
+  /// 6762 §8.2 proposal is for a name this endpoint may no longer be defending
+  /// and its §9 rdata is rdata no live route holds, so ADJUDICATION is exactly
+  /// the permission it must not have — and this is the only tier that denies
+  /// it. Adjudicated instead, our own withdrawn generation fans out to the
+  /// service that REPLACED it, which compares that rdata against its own and
+  /// retires terminally.
   ///
   /// The only tier that suppresses everything.
   OwnEcho,
@@ -31,6 +46,12 @@ pub enum Provenance {
   /// A byte-identical datagram from a conforming twin — the RFC 6762 §9
   /// fault-tolerance case, where two responders issue identical answers — matches
   /// exactly this way, so the claim cannot be trusted with a name.
+  ///
+  /// **Obligation.** Report this tier only when the datagram matched a record
+  /// of something this endpoint sent under the record generation it still
+  /// publishes, and report a match against a superseded generation as
+  /// [`Self::OwnEcho`] instead. See the `OwnEchoLikely` adjudication cell in
+  /// `admits.rs` for why.
   OwnEchoLikely,
   /// The caller logs every datagram it sends and this datagram matched none it
   /// still holds.

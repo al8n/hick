@@ -391,7 +391,10 @@ where
       if route.withdrawing {
         continue;
       }
-      if names_match_record(route.host(), r) && is_host_conflict_rtype(r.rtype()) {
+      if names_match_record(route.host(), r)
+        && is_host_conflict_rtype(r.rtype())
+        && route_publishes_host_rtype(route, r.rtype())
+      {
         return Some((
           key,
           RouteEvent::ToService(ToService::new(
@@ -433,9 +436,22 @@ where
       // name. The instance test below no longer screens by rtype, so leading
       // with it would swallow an A/AAAA that the host test owns and turn a
       // `HostConflict` into a `ProbeConflict`. Testing the narrower rule first
-      // keeps every A/AAAA-at-the-host-name decision byte-identical to before
-      // and confines the widening to records only the instance test claims.
-      if names_match_record(route.host(), r) && is_host_conflict_rtype(r.rtype()) {
+      // keeps every A/AAAA-at-the-host-name decision the host rule's, and
+      // confines the widening to records only the instance test claims.
+      //
+      // `route_publishes_host_rtype` is the RRSET-OWNERSHIP half of the host
+      // rule, and a route that fails it FALLS THROUGH to the instance test
+      // rather than being skipped. That is deliberate: the two rules are
+      // independent predicates over different names, and when one service's
+      // instance name IS its host name a record we hold no host RRset for is
+      // still a peer asserting something at a UNIQUE INSTANCE name — §8.1's
+      // "any conflicting Multicast DNS response" while probing, and dropped by
+      // the established arm's own SRV/TXT screen once advertised. Declining the
+      // host rule must not also delete the instance rule's input.
+      if names_match_record(route.host(), r)
+        && is_host_conflict_rtype(r.rtype())
+        && route_publishes_host_rtype(route, r.rtype())
+      {
         return Some((
           key,
           RouteEvent::ToService(ToService::new(

@@ -13,20 +13,21 @@ where
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
 {
-  /// Does any LIVE route publish `host` with an A/AAAA set other than the one
-  /// given? `exclude` skips one route key, for a check that re-examines a route
-  /// already in the table.
+  /// Does any LIVE route publish `host` with an A or AAAA set that CONTRADICTS
+  /// the one given? `exclude` skips one route key, for a check that re-examines a
+  /// route already in the table.
   ///
   /// # The invariant, and what it protects
   ///
   /// Two services may share a host name — that is how several services on one
   /// machine advertise one set of addresses, and it is supported. What must not
-  /// differ is the ADDRESSES: RFC 6762 §9's conflict test compares a record
-  /// against the RECEIVING service's own records, so a sibling's A/AAAA at a
-  /// shared host name with rdata this service does not hold is, by that test, a
-  /// genuine conflict — and `Endpoint` has no auto-rename for a host name, so it
-  /// surfaces as a TERMINAL `ServiceUpdate::HostConflict`, raised by a sibling
-  /// on the same machine rather than by any peer.
+  /// differ is the ADDRESSES WITHIN AN RRTYPE BOTH PUBLISH: RFC 6762 §9's
+  /// conflict test compares a record against the RECEIVING service's own records,
+  /// so a sibling's A/AAAA at a shared host name with rdata this service holds a
+  /// contradicting set for is, by that test, a genuine conflict — and `Endpoint`
+  /// has no auto-rename for a host name, so it surfaces as a TERMINAL
+  /// `ServiceUpdate::HostConflict`, raised by a sibling on the same machine
+  /// rather than by any peer.
   ///
   /// That path was previously unreachable only because self-detection suppressed
   /// every effect of an echoed announcement. It is not suppressed any more: a
@@ -34,13 +35,32 @@ where
   /// [`Provenance::OwnEchoLikely`](crate::Provenance::OwnEchoLikely)), which is
   /// what makes this guard the FOURTH invariant that cell's safety rests on.
   ///
+  /// # PER RRTYPE, and only where both routes publish that type
+  ///
+  /// §9 makes a conflict "the same name, **rrtype** and rrclass, but
+  /// inconsistent rdata", so the A RRset at a host name and the AAAA RRset at it
+  /// are two DISTINCT unique RRsets, each singly owned. An IPv4-only service and
+  /// an IPv6-only service sharing one host name publish disjoint RRsets that
+  /// cannot be inconsistent with each other — a legitimate configuration this
+  /// crate documents as supported, which an all-or-nothing comparison banned.
+  ///
+  /// A route that publishes no record of a type asserts nothing at that name for
+  /// the other to disagree with, so that type is simply not compared. This is
+  /// the same rule the conflict fan-out applies — see
+  /// [`route_publishes_host_rtype`](crate::endpoint::route_publishes_host_rtype)
+  /// and `Service::classify_host_rdata` — and the two halves must stay together:
+  /// relaxing only this one would admit the split-family pair and then let a
+  /// fan-out that reads an ABSENT RRtype as differing raise a terminal
+  /// `HostConflict` on the sibling's first announcement.
+  ///
   /// # Set equality, and only of what is configured
   ///
-  /// Compared as SETS in both directions, because the conflict classifier asks
-  /// `contains`, and mutual containment is exactly what makes it answer
-  /// "identical" for every address either side can put on the wire. Order and
-  /// repetition are therefore irrelevant, and a re-registration that lists the
-  /// same addresses differently is not rejected.
+  /// Where both DO publish a type, the two sets are compared as SETS in both
+  /// directions, because the conflict classifier asks `contains`, and mutual
+  /// containment is exactly what makes it answer "identical" for every address
+  /// either side can put on the wire. Order and repetition are therefore
+  /// irrelevant, and a re-registration that lists the same addresses differently
+  /// is not rejected.
   ///
   /// The CONFIGURED sets are compared, not the confirmed-advertised ones: what a
   /// service has advertised so far is a subset of what it may advertise next, so
@@ -64,8 +84,15 @@ where
     aaaa_addrs: &[Ipv6Addr],
     exclude: Option<usize>,
   ) -> bool {
-    fn same_set<T: PartialEq>(a: &[T], b: &[T]) -> bool {
-      a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
+    /// Do these two routes DISAGREE about one RRtype at the shared host name?
+    ///
+    /// Only when both publish it: an empty side is a route that asserts no
+    /// record of that type there, which §9 leaves out of the conflict entirely.
+    fn rrset_disagrees<T: PartialEq>(theirs: &[T], ours: &[T]) -> bool {
+      if theirs.is_empty() || ours.is_empty() {
+        return false;
+      }
+      !(theirs.iter().all(|x| ours.contains(x)) && ours.iter().all(|x| theirs.contains(x)))
     }
     self.services.iter().any(|(key, route)| {
       if Some(key) == exclude {
@@ -75,13 +102,15 @@ where
       if route.withdrawing {
         return false;
       }
-      // Case-insensitive, because that is how the routing path matches a record
-      // against a host name — an equality test here would let one case spelling
-      // register past the guard and conflict on the wire anyway.
-      if !route.host().as_str().eq_ignore_ascii_case(host.as_str()) {
+      // Semantic DNS-name equality, because that is how the routing path
+      // matches a record against a host name — a string test here lets a
+      // spelling that differs only in case or in the optional trailing root dot
+      // register past the guard and conflict on the wire anyway. See
+      // [`Name::same_owner`], which is where the rule lives.
+      if !route.host().same_owner(host) {
         return false;
       }
-      !same_set(route.a_addrs(), a_addrs) || !same_set(route.aaaa_addrs(), aaaa_addrs)
+      rrset_disagrees(route.a_addrs(), a_addrs) || rrset_disagrees(route.aaaa_addrs(), aaaa_addrs)
     })
   }
 
@@ -101,16 +130,24 @@ where
   /// for is the kind of surprise a registration API should not hand back.
   ///
   /// Returns [`RegisterServiceError::HostAddressesDiffer`] if a live route
-  /// already publishes this host name with a different A/AAAA set. **Two live
-  /// services may share a host name, but only by publishing the same addresses
-  /// under it.** RFC 6762 §9 classifies a conflict against the RECEIVING
-  /// service's own records, so a sibling advertising that host with a different
-  /// set is a genuine conflict by that test — and a host name has no auto-rename,
-  /// so it surfaces as a terminal update rather than resolving itself. The two
-  /// address sets are compared as SETS, so order and repeats do not matter and an
-  /// IPv6 scope id does; the host name is matched case-insensitively, the way the
-  /// routing path matches a record against it. A route already withdrawing under
-  /// §10.1 no longer holds its host name for this test.
+  /// already publishes this host name with a different A or AAAA set. **Two live
+  /// services may share a host name, but where both publish an RRtype they must
+  /// publish the same addresses under it.** RFC 6762 §9 classifies a conflict
+  /// against the RECEIVING service's own records, so a sibling advertising that
+  /// host with a different set is a genuine conflict by that test — and a host
+  /// name has no auto-rename, so it surfaces as a terminal update rather than
+  /// resolving itself.
+  ///
+  /// The comparison is PER RRTYPE, because §9's conflict is "the same name,
+  /// rrtype and rrclass, but inconsistent rdata": an IPv4-only service and an
+  /// IPv6-only service may share a host name, since disjoint A and AAAA RRsets
+  /// cannot be inconsistent with one another. Where both routes do publish a
+  /// type, its two sets are compared as SETS, so order and repeats do not matter
+  /// and an IPv6 scope id does. The host name is matched by DNS-name equality
+  /// ([`Name::same_owner`] — case-insensitive, and blind to the optional
+  /// trailing root dot), the way the routing path matches a record against it. A
+  /// route already withdrawing under §10.1 no longer holds its host name for
+  /// this test.
   ///
   /// Returns [`RegisterServiceError::StorageFull`] if the routing pool is at
   /// capacity.
@@ -131,9 +168,12 @@ where
     if ttl_secs < crate::constants::MIN_SERVICE_TTL_SECS {
       return Err(RegisterServiceError::TtlTooSmall(ttl_secs));
     }
-    // Reject duplicate names.
+    // Reject duplicate names. DNS-name equality, not string equality: a name
+    // differing only in the optional trailing root dot is the SAME owner on the
+    // wire, so a string test lets both spellings register and probe for one
+    // name. See [`Name::same_owner`].
     for (_, route) in self.services.iter() {
-      if route.name().as_str() == spec.records().instance().as_str() {
+      if route.name().same_owner(spec.records().instance()) {
         return Err(RegisterServiceError::NameAlreadyRegistered(
           spec.records().instance().clone(),
         ));
@@ -149,7 +189,7 @@ where
     for (_, item) in self.withdrawals.iter() {
       if item.route.is_none()
         && item.holds_name
-        && item.records.instance().as_str() == spec.records().instance().as_str()
+        && item.records.instance().same_owner(spec.records().instance())
       {
         return Err(RegisterServiceError::NameAlreadyRegistered(
           spec.records().instance().clone(),
@@ -341,7 +381,7 @@ where
 
     // Reject if new_name collides with another route.
     for (other_key, route) in self.services.iter() {
-      if other_key != key && route.name().as_str() == new_name.as_str() {
+      if other_key != key && route.name().same_owner(&new_name) {
         return Err(HandleServiceRenamedError::NameAlreadyRegistered(new_name));
       }
     }
@@ -356,7 +396,7 @@ where
     for (_, item) in self.withdrawals.iter() {
       if item.route.is_none()
         && item.holds_name
-        && item.records.instance().as_str() == new_name.as_str()
+        && item.records.instance().same_owner(&new_name)
       {
         return Err(HandleServiceRenamedError::NameAlreadyRegistered(new_name));
       }
