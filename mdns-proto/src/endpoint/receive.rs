@@ -159,8 +159,12 @@ where
     // timestamp — facilities that live naturally in the std I/O layer, not in
     // this `no_std` protocol core. Routing our own multicast loopback as a peer
     // packet would cause false ProbeConflicts (self-rename), false
-    // HostConflicts, spurious KAS suppression, and double cache writes, so we
-    // suppress all side effects when the caller claims the datagram as its own.
+    // HostConflicts, spurious KAS suppression, and double cache writes, so a
+    // datagram the caller claims as its own is suppressed as far as its tier
+    // warrants: entirely for `OwnEcho`, and for `OwnEchoLikely` only in §10
+    // cache population and §7.1/§7.3 quieting — that tier still adjudicates and
+    // still answers an §8.1 defence. `Admits::for_datagram` is where the split
+    // and its reasons live.
     //
     // `local_ip` is NOT consulted, deliberately. PKTINFO's local receive address
     // is HOST/interface-level — every same-host mDNS sender egresses from the

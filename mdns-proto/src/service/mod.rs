@@ -2097,15 +2097,19 @@ where
 
   /// whether `record` (an A/AAAA owned by our host name) carries an
   /// address WE advertise — CONSISTENT rdata (our own multicast echo, or another
-  /// instance correctly sharing the host), not a §9 conflict.
+  /// instance correctly sharing the host), which RFC 6762 §9 makes no conflict
+  /// at all.
   ///
-  /// a LINK-LOCAL address (IPv4 169.254/16, IPv6 fe80::/10) is scoped
-  /// to a single interface, so the same raw address on a DIFFERENT interface is
-  /// a genuine conflict. `HostConflict` carries no receive interface to
-  /// disambiguate, so we do NOT suppress link-local matches — we surface them.
-  /// (Our own echo is already filtered upstream by self-loopback detection, so
-  /// surfacing a link-local match never re-reports our own packet.) A different
-  /// address, or malformed/unparseable rdata, is also treated as a conflict.
+  /// FOUR answers, not two, and the body says why each of the other three is
+  /// not `Different`: an address we hold is `Identical`, LINK-LOCAL INCLUDED;
+  /// rdata that will not decode is `Invalid`; an RRtype we publish no record of
+  /// at this name is `UnownedRrtype`; and only a decodable address we do not
+  /// hold is `Different`.
+  ///
+  /// It does not assume the record came from a peer. A self-echo DOES reach
+  /// here — [`Provenance::OwnEchoLikely`](crate::Provenance::OwnEchoLikely)
+  /// adjudicates — and an echo of what this service still publishes answers
+  /// `Identical` by this test, rather than by any upstream suppression.
   fn classify_host_rdata(&self, record: &crate::wire::Ref<'_>) -> PeerRdata {
     match record.rdata_view() {
       // A LINK-LOCAL CARVE-OUT USED TO LIVE HERE, and it was wrong. Matching
@@ -2123,11 +2127,28 @@ where
       // ownership (#73) rather than here. Carrying `interface_index` through
       // `HostConflict` alone would not help: without per-address scope on OUR
       // side there is nothing to compare it against.
+      //
+      // PER RRTYPE, because §9's conflict is "the same name, RRTYPE and rrclass,
+      // but inconsistent rdata". An IPv4-only service holds no AAAA RRset at its
+      // host name and an IPv6-only one holds no A RRset, so the other family's
+      // record is not that service's record at all — `contains` over an empty
+      // slice answers "differing" for it, which is how a same-host sibling's
+      // first announcement retired a service over an address it never published.
       Ok(crate::wire::Rdata::A(a)) => {
-        PeerRdata::from_identical(self.records.a_addrs_slice().contains(&a.addr()))
+        let ours = self.records.a_addrs_slice();
+        if ours.is_empty() {
+          PeerRdata::UnownedRrtype
+        } else {
+          PeerRdata::from_identical(ours.contains(&a.addr()))
+        }
       }
       Ok(crate::wire::Rdata::AAAA(a)) => {
-        PeerRdata::from_identical(self.records.aaaa_addrs_slice().contains(&a.addr()))
+        let ours = self.records.aaaa_addrs_slice();
+        if ours.is_empty() {
+          PeerRdata::UnownedRrtype
+        } else {
+          PeerRdata::from_identical(ours.contains(&a.addr()))
+        }
       }
       // Rdata that will not parse tells us NOTHING about whether it conflicts,
       // so it must not be reported as differing — that is a terminal
@@ -2669,6 +2690,15 @@ where
           handle = self.handle.raw(),
           state = ?self.state,
           "service: record's rdata will not decode — not a conflict either way, dropping it"
+        );
+        return;
+      }
+      PeerRdata::UnownedRrtype => {
+        trace!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          state = ?self.state,
+          "service: we publish no record of this rrtype at this name — not our RRset (§9)"
         );
         return;
       }
@@ -3926,18 +3956,35 @@ where
 mod tests;
 
 cfg_heap! {
-  /// What a peer's record says about ours: it matches, it differs, or it could
-  /// not be read.
+  /// What a peer's record says about ours: it matches, it differs, we hold no
+  /// RRset of that type at all, or it could not be read.
   ///
-  /// The third answer is the one that has to exist. Folding "unreadable" into
+  /// The last two are the answers that have to exist. Folding "unreadable" into
   /// "differs" is a fail-OPEN default that hands an attacker a rename for the
   /// price of one malformed record, and it is the same class as the two
   /// `.flatten()` defects on this branch — an error becoming an ordinary answer.
+  /// Folding "we hold none" into "differs" is the same mistake about ownership
+  /// rather than readability.
   #[derive(Debug, Copy, Clone, Eq, PartialEq)]
   enum PeerRdata {
     /// The rdata would not parse or canonicalize. It supports NO conclusion, so
     /// it must reach neither the §8.1 deferral nor the §9 revert.
     Invalid,
+    /// We assert NO record of this rrtype at this name, so §9's "same name,
+    /// rrtype and rrclass" test has nothing of ours to be inconsistent with.
+    ///
+    /// Not [`Self::Different`]: differing means we hold that RRset and the
+    /// peer's copy of it disagrees. Holding none is a statement about
+    /// OWNERSHIP, and folding it into "differs" is what retired an IPv6-only
+    /// service over a same-host sibling's A record — an address it never
+    /// published and never could.
+    ///
+    /// Only the HOST path produces it. At the INSTANCE name a type we do not
+    /// publish is deliberately `Different`: a probe asks type ANY, so §8.1's
+    /// "any conflicting response" covers every type at a name we are claiming.
+    /// The host name is not probed at all — see the `HostConflict` arm of
+    /// `Service::handle_event` — which is exactly why only §9 governs it.
+    UnownedRrtype,
     /// Byte-identical to what we advertise — RFC 6762 §9's "resource records
     /// with identical rdata are never considered inconsistent".
     Identical,

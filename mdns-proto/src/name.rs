@@ -167,6 +167,34 @@ impl Name {
   pub fn is_empty(&self) -> bool {
     self.as_str().is_empty()
   }
+
+  /// Do `self` and `other` name the same DNS owner?
+  ///
+  /// THE equality every guard that decides "are these two registrations the
+  /// same name" must ask, and the only copy of the rule.
+  ///
+  /// [`Self::try_from_str`] canonicalises CASE but deliberately preserves the
+  /// optional trailing root dot, which is not part of the name: `device.local`
+  /// and `device.local.` are one owner, encode to the same wire bytes (see
+  /// `write_canonical_wire_name`) and match the same records at routing time
+  /// (`names_match_str` strips it before comparing labels). Derived
+  /// `PartialEq`, and any `eq_ignore_ascii_case` over [`Self::as_str`], compare
+  /// the STORED strings and so answer `false` for that pair — which is how one
+  /// spelling registers past a guard and then collides on the wire anyway.
+  ///
+  /// Only ONE trailing dot is trimmed, because only one is representable:
+  /// `validate_name` rejects the empty label a second dot would create. The
+  /// case fold is belt-and-braces — both sides are already lowercase — and is
+  /// kept so the answer does not depend on that invariant holding elsewhere.
+  pub fn same_owner(&self, other: &Self) -> bool {
+    fn trim(s: &str) -> &str {
+      match s.strip_suffix('.') {
+        Some(rest) => rest,
+        None => s,
+      }
+    }
+    trim(self.as_str()).eq_ignore_ascii_case(trim(other.as_str()))
+  }
 }
 
 impl core::fmt::Display for Name {

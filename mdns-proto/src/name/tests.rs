@@ -191,3 +191,43 @@ fn name_too_long_detail_accessors() {
     other => panic!("expected NameTooLong, got {other:?}"),
   }
 }
+
+/// `Name` canonicalises case but PRESERVES the optional trailing root dot, so
+/// derived `PartialEq` says `device.local` and `device.local.` are different —
+/// while the wire encoder and the routing path both strip it and treat them as
+/// one owner. `same_owner` is the equality that agrees with the wire.
+#[test]
+fn same_owner_ignores_the_optional_root_dot() {
+  let dotted = Name::try_from_str("device.local.").unwrap();
+  let bare = Name::try_from_str("device.local").unwrap();
+  assert_ne!(dotted, bare, "the stored strings genuinely differ");
+  assert!(dotted.same_owner(&bare));
+  assert!(bare.same_owner(&dotted));
+  assert!(dotted.same_owner(&dotted));
+
+  // Case is already folded at construction; assert the comparison does not
+  // depend on that holding.
+  assert!(
+    Name::try_from_str("DEVICE.LOCAL")
+      .unwrap()
+      .same_owner(&dotted)
+  );
+
+  // The root is spelled "" and ONLY "": `validate_name` rejects "." for the
+  // empty label the trailing dot leaves behind, which is also why exactly one
+  // dot is ever trimmable.
+  assert!(matches!(
+    Name::try_from_str("."),
+    Err(NameError::EmptyLabel)
+  ));
+  let root = Name::try_from_str("").unwrap();
+  assert!(root.same_owner(&root));
+  assert!(!root.same_owner(&dotted));
+
+  // A different name stays different, with or without the dot.
+  let other = Name::try_from_str("other.local.").unwrap();
+  assert!(!dotted.same_owner(&other));
+  assert!(!bare.same_owner(&other));
+  // …and a shorter name is not a prefix match.
+  assert!(!dotted.same_owner(&Name::try_from_str("local.").unwrap()));
+}

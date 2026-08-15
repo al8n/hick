@@ -27,12 +27,13 @@ impl EndpointConfig {
   /// Construct with defaults: probe on registration, answer questions, cache
   /// observations, and DO NOT trust advertised-source matching as a self-
   /// loopback signal. The default is appropriate for the supported async
-  /// driver, which passes an authoritative self-loopback flag to
-  /// [`Endpoint::handle`](crate::Endpoint::handle) (its `caller_is_self`
-  /// parameter) for every inbound datagram and so does not need the lossy
-  /// fallback. Single-process callers that cannot supply `caller_is_self` should
-  /// enable `trust_advertised_src_as_self` to recover the legacy
-  /// behaviour.
+  /// driver, which computes a [`Provenance`](crate::Provenance) from its own
+  /// send log for every inbound datagram and passes it to
+  /// [`Endpoint::handle`](crate::Endpoint::handle) inside a
+  /// [`Received`](crate::Received), and so does not need the lossy fallback.
+  /// Callers whose driver keeps no send log — and so can report no better than
+  /// [`Provenance::Unknown`](crate::Provenance::Unknown) — should enable
+  /// `trust_advertised_src_as_self` to opt into the coarser guess.
   pub const fn new() -> Self {
     Self {
       probe_unique_names: true,
@@ -104,12 +105,17 @@ impl EndpointConfig {
   /// Whether to treat any inbound packet whose source IP matches an
   /// advertised A/AAAA record as a self-loopback.
   ///
-  /// Default: `false`. The driver-side self-send hash cache — surfaced to
-  /// the proto via the `caller_is_self` argument of
-  /// [`Endpoint::handle`](crate::Endpoint::handle) — supersedes this signal and
-  /// avoids the false positives that drop legitimate same-host peer traffic.
-  /// Enable only when running a single-process responder that cannot supply
-  /// `caller_is_self`.
+  /// Default: `false`. A driver reporting
+  /// [`Provenance::NotFromUs`](crate::Provenance::NotFromUs) keeps a send log
+  /// and found no match in it — better evidence than this guess — so the guess
+  /// is not consulted at all under that tier. Under
+  /// [`Provenance::Unknown`](crate::Provenance::Unknown), where the driver
+  /// keeps no send log, the guess is still consulted: a match answers an RFC
+  /// 6762 §8.1 defence of an already-claimed name rather than leaving the
+  /// question unanswered, though it still suppresses cache population and
+  /// duplicate-question suppression. Enable only for a sync / single-process
+  /// responder that keeps no send log and so reports
+  /// [`Provenance::Unknown`](crate::Provenance::Unknown).
   #[inline(always)]
   pub const fn trust_advertised_src_as_self(&self) -> bool {
     self.trust_advertised_src_as_self

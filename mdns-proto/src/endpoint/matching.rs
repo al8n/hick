@@ -398,6 +398,38 @@ pub(crate) fn is_host_conflict_rtype(rt: ResourceType) -> bool {
   matches!(rt, ResourceType::A | ResourceType::AAAA)
 }
 
+/// Does `route` publish any record of `rt` at its HOST name?
+///
+/// [`is_host_conflict_rtype`] is the half of the host rule that turns on the
+/// RECORD; this is the half that turns on US. RFC 6762 §9's conflict is over "a
+/// unique record for which it is currently authoritative … with the same name,
+/// **rrtype** and rrclass, but inconsistent rdata", so a route publishing no
+/// record of that type at that name is not a party to this record's RRset at
+/// all — there is nothing of ours for the peer's rdata to be inconsistent with.
+/// It is IRRELEVANT, which is not the same answer as "differing".
+///
+/// Reading an absent RRtype as differing is what retired a service over an
+/// address it never published: an IPv6-only responder received a same-host
+/// sibling's A announcement, held no A to compare it against, and surfaced a
+/// TERMINAL `ServiceUpdate::HostConflict`. `Service::classify_host_rdata`
+/// applies the same rule on the receiving side, and
+/// `Endpoint::host_addresses_disagree` applies it at registration; all three are
+/// one rule about RRset ownership and must answer alike.
+///
+/// The CONFIGURED sets are read, not the confirmed-advertised ones — the same
+/// choice `host_addresses_disagree` makes, and for the same reason: what a
+/// service has advertised so far is a subset of what it may advertise next, and
+/// the classifier this gate feeds compares against the configured set too.
+pub(crate) fn route_publishes_host_rtype(route: &ServiceRoute, rt: ResourceType) -> bool {
+  match rt {
+    ResourceType::A => !route.a_addrs().is_empty(),
+    ResourceType::AAAA => !route.aaaa_addrs().is_empty(),
+    // Not a host RRtype at all — `is_host_conflict_rtype` is that gate, and this
+    // one never decides for a type it does not cover.
+    _ => false,
+  }
+}
+
 /// the RR types a service INSTANCE name is authoritative for — SRV and TXT (RFC
 /// 6763 §4) — and so the scope of RFC 6762 §9's post-establishment conflict:
 /// "a Multicast DNS responder has a unique record for which it is currently

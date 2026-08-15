@@ -211,10 +211,7 @@ pub(crate) fn our_nsec_identities(records: &ServiceRecords) -> std::vec::Vec<std
   let mut forms = std::vec::Vec::new();
   forms.push(identity(&INSTANCE_NSEC_TYPES));
 
-  if super::proposal::names_equal_ignoring_case(
-    records.instance().as_str(),
-    records.host().as_str(),
-  ) {
+  if records.instance().same_owner(records.host()) {
     let mut conforming: std::vec::Vec<u16> = INSTANCE_NSEC_TYPES.to_vec();
     if !records.a_addrs_slice().is_empty() {
       conforming.push(ResourceType::A.to_u16());

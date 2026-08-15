@@ -24,41 +24,56 @@ BREAKING
   suppression, where believing a peer is the more harmful error, and answers
   only §8.1 defences.
 - `mdns-proto`: the opt-in `trust_advertised_src_as_self` heuristic no longer
-  suppresses adjudication. It matches any co-resident host publishing an address
+  suppresses adjudication, and no longer skips the §8.1 defence of a name this
+  endpoint already holds. It matches any co-resident host publishing an address
   we publish — including a peer that has taken it — and a convenience knob must
-  not be able to delete a §8 proposal. `Provenance::NotFromUs` declines the
-  heuristic outright: a caller that logs what it sends has better evidence than a
-  source address does. A user who enabled the knob as a backup for an evicted
-  send-log credit loses that backup, and such an echo now runs full effects.
+  not be able to delete a §8 proposal, nor let a conforming prober take an
+  advertised name. It still suppresses cache population and duplicate-question
+  suppression, and still withholds ordinary discovery questions.
+  `Provenance::NotFromUs` declines the heuristic outright: a caller that logs what
+  it sends has better evidence than a source address does. A user who enabled the
+  knob as a backup for an evicted send-log credit loses that backup, and such an
+  echo now runs full effects.
 - `mdns-proto`: new `RegisterServiceError::HostAddressesDiffer`. Two live
   services may share a host name — that is how one machine advertises one address
-  set from several services — but they may no longer DISAGREE about the
-  addresses. Each would otherwise read the other's announcement as a host
-  claiming its own host name with rdata it does not hold, which §9 makes a
-  conflict and which surfaces as a TERMINAL `ServiceUpdate::HostConflict` raised
-  by a sibling on the same machine. That path was unreachable only while
-  self-detection suppressed everything, so this guard is what makes the
-  adjudication change above safe. `HandleServiceRenamedError` gains the matching
-  variant as the invariant's second enforcement point.
+  set from several services — but they may no longer DISAGREE about the addresses
+  of an RRTYPE THEY BOTH PUBLISH. Each would otherwise read the other's
+  announcement as a host claiming its own host name with rdata it does not hold,
+  which §9 makes a conflict and which surfaces as a TERMINAL
+  `ServiceUpdate::HostConflict` raised by a sibling on the same machine. That path
+  was unreachable only while self-detection suppressed everything, so this guard
+  is what makes the adjudication change above safe. `HandleServiceRenamedError`
+  gains the matching variant as the invariant's second enforcement point. The
+  check is per RRtype because §9's conflict is "the same name, **rrtype** and
+  rrclass, but inconsistent rdata": an IPv4-only service and an IPv6-only service
+  sharing a host name publish disjoint RRsets and are accepted.
 - **`hick-smoltcp` and `hick-embassy` lose all-effects suppression of their own
-  loopback.** Their `is_self` is a content match and nothing more —
+  loopback.** Their self-send log is a content match and nothing more —
   non-consuming, with no address-family key, no ordering evidence and no
-  source-port gate at the call site — so it reports `OwnEchoLikely` and can never
-  report `OwnEcho`. Their own echo now reaches §8.2's tiebreak and §8.1's
-  defence instead of being deleted; it still populates no cache entry and quiets
-  no query of ours. That is safe because an echo of our own records carries rdata
-  identical to ours, which §9 makes no conflict at all, and it is the point of
-  the change rather than a side effect: their self-detection was never strong
-  enough to justify deleting a §8 proposal.
+  source-port gate at the call site — so a match against the records they STILL
+  publish reports `OwnEchoLikely` and never the ordered tier. Their own echo now
+  reaches §8.2's tiebreak and §8.1's defence instead of being deleted; it still
+  populates no cache entry and quiets no query of ours. That is safe because an
+  echo of records still published carries rdata identical to ours, which §9
+  makes no conflict at all, and it is the point of the change rather than a side
+  effect: their self-detection was never strong enough to justify deleting a §8
+  proposal. The one echo for which that does not hold — one sent before a
+  service registered or began withdrawing, so it may assert records no live
+  route holds — reports `OwnEcho` and is suppressed whole. That is not a
+  stronger claim about the evidence but a weaker claim about what the bytes may
+  still say.
 - `hick-reactor`, `hick-mio` and `hick-compio` report all three tiers instead of
   two. A claim the kernel's receive stamp ORDERED against our `sendto` stays
   `OwnEcho`; one that matched on content, family and the TTL alone becomes
   `OwnEchoLikely` and adjudicates — that is what a conforming §9 twin's
   byte-identical datagram produces, so it may not be trusted with a name. It is
   the whole of the match on Windows and on any kernel that delivers no timestamp
-  cmsg. No credit, or a source port this endpoint never sends from, becomes
-  `NotFromUs` rather than `Unknown`, which additionally declines
-  `trust_advertised_src_as_self` on these drivers.
+  cmsg. A match at EITHER strength against a credit recorded before a service
+  registered or began withdrawing reports `OwnEcho` as well, for the reason the
+  bullet above gives: a stale echo may no longer adjudicate anything. No credit,
+  or a source port this endpoint never sends from, becomes `NotFromUs` rather
+  than `Unknown`, which additionally declines `trust_advertised_src_as_self` on
+  these drivers.
 
 OTHER
 
@@ -69,6 +84,31 @@ OTHER
   the parse-error latch like any other processed datagram's. The
   exactly-one-reject-counter-per-`packets_rx` invariant is unchanged and still
   holds in both directions.
+- `mdns-proto`: new `Name::same_owner` — DNS-name equality, blind to case and to
+  the optional trailing root dot. `Name` canonicalises case at construction but
+  preserves the dot, so derived `PartialEq` calls `device.local` and
+  `device.local.` different names while the wire encoder and the routing path
+  call them one. The host address-set guard compared the stored strings and let
+  the second spelling register past it; it now asks `same_owner`.
+- `mdns-proto`: the INSTANCE-name guards had the same trailing-root-dot hole, and
+  older — the duplicate-name checks in `try_register_service` and
+  `handle_service_renamed`, the retract-before-reuse checks against a
+  name-holding goodbye, the reclaim-cancel on announce, and the same-host sibling
+  address retention that a withdrawal's goodbye honours. Each now asks
+  `Name::same_owner`. Two spellings of one instance name can no longer both
+  register and probe for it, a held goodbye holds its name however a
+  re-registration spells it, and a withdrawing service retains an address its
+  same-host sibling still advertises.
+- `mdns-proto`: host conflicts are routed and classified by owner **plus
+  RRtype**. A route that publishes no record of a record's RRtype at its host
+  name is not a party to that RRset — §9's conflict is "the same name, rrtype and
+  rrclass, but inconsistent rdata" — so it receives no `HostConflict` for it, and
+  `Service` drops one that reaches it by another path. An absent RRtype used to
+  read as differing, which surfaced a TERMINAL `ServiceUpdate::HostConflict`:
+  a same-host sibling's first announcement retired a service over an address that
+  service never published. This is the half that must accompany the per-RRtype
+  registration check above; either alone leaves the false terminal conflict
+  reachable.
 
 ## A receive's evidence travels with the datagram it came from
 
@@ -104,6 +144,44 @@ BREAKING
   the echo this endpoint was waiting for has been accounted for, nothing was
   told what it was, and the genuine echo behind it — if this was not it — finds
   no credit left.
+- `hick-udp`: a claim now matches a credit on the datagram's exact bytes rather
+  than a 64-bit FNV-1a digest of them. FNV's state update is an odd-multiplier
+  bijection, so a second-preimage is a meet-in-the-middle over it rather than a
+  search of the output space: a full second-preimage against a FIXED victim
+  datagram — the exact bytes a responder emits, no attacker influence on them —
+  took about fifteen seconds on a laptop, with the solution riding in trailing
+  bytes `MessageReader` never reads, because it bounds every section by the
+  header counts. The forged datagram was a valid mDNS response announcing a
+  different address at the same host name, and matching it bought a whole
+  credit: every driver elevates an ordered match to `Provenance::OwnEcho`, so
+  the forged datagram's own RFC 6762 §8.2 proposal and §9 conflict rdata were
+  deleted with it, and the genuine echo behind it found no credit left and
+  reached the protocol layer as peer traffic — a phantom conflict against
+  ourselves. A wider digest would not have fixed this: full suppression is only
+  safe for a datagram that says exactly what ours said, a property no digest
+  can carry, only exact bytes. The credit store now holds the body instead of a
+  hash, and new `MAX_SELF_SEND_BYTES` (1 MiB) bounds how many bytes those
+  bodies may hold, alongside the unchanged `MAX_SELF_SEND_ENTRIES`; neither cap
+  implies the other, and either can refuse a new credit.
+- `hick-udp`: new `SelfSendMatch::Superseded`, reported for a credit that
+  matched — at either strength — but was recorded before the caller last
+  called new `SelfSendTracker::supersede`. RFC 6762 §8.4 record updating is
+  unimplemented, but SERVICE REPLACEMENT reaches the same state without it: a
+  withdrawing route is deliberately not blocked from replacement, so a service
+  may take a host name while the route that previously held it is still
+  draining its §10.1 goodbye, and a delayed echo of that route's own
+  announcement then carries rdata no live route holds. Suppressing such an
+  echo is still safe — take-once still spends the credit — but adjudicating it
+  is not: its §8.2 proposal is for a name this endpoint may no longer be
+  defending, and its §9 rdata is rdata no live route holds. A driver calls
+  `supersede` at the two lifecycle seams that can leave a recorded send stale —
+  a service registration, and the withdrawal that retires a route however it
+  was reached — and maps `Superseded` onto `Provenance::OwnEcho`, the only
+  tier that denies adjudication, rather than discarding the credit: discarding
+  would make the same echo read as `NoCredit`, full peer traffic and full
+  adjudication, the same failure louder. `SelfSendMatch` stays
+  non-`#[non_exhaustive]`, so the new variant is itself the breaking change:
+  every existing match over the type must add an arm.
 
 OTHER
 

@@ -39,7 +39,7 @@ pub(crate) enum Answering {
 /// | `OwnEcho` | deny | deny | deny | `None` |
 /// | `OwnEchoLikely` | deny | deny | **allow** | **`DefenceOnly`** |
 /// | `NotFromUs` | allow | allow | allow | `All` / `DefenceOnly` |
-/// | `Unknown`, heuristic fired | deny | deny | **allow** | `None` |
+/// | `Unknown`, heuristic fired | deny | deny | **allow** | **`DefenceOnly`** |
 /// | `Unknown`, otherwise | allow | allow | allow | `All` / `DefenceOnly` |
 ///
 /// `untrusted_response` — a QR=1 datagram from a non-5353 source port — is a
@@ -140,22 +140,57 @@ impl Admits {
       //     INVALIDATED BY: moving that classification back inside individual
       //     arms, or admitting a conflict arm that runs before it.
       //
-      //  3. RFC 6762 §8.4 RECORD UPDATING IS UNIMPLEMENTED. A stale echo — our
-      //     own bytes from before a record change — is the one self-echo that
-      //     WOULD carry differing rdata and so survive invariant 2. `Service`
-      //     exposes no records mutator, so no such datagram can exist.
-      //     INVALIDATED BY: implementing §8.4. That change must re-argue this
-      //     cell, not merely add the API.
+      //  3. EVERY DATAGRAM THIS ARM MAY TREAT AS OUR OWN ECHO WAS SENT UNDER
+      //     THE RECORD GENERATION THIS ENDPOINT STILL PUBLISHES. Invariant 2
+      //     holds only while our records have not changed under a recorded
+      //     send, and a self-echo that outlives such a change IS reachable —
+      //     not through RFC 6762 §8.4 record updating, which is unimplemented,
+      //     but through SERVICE REPLACEMENT, which crosses generations rather
+      //     than mutating one. A withdrawing route is skipped by the host
+      //     address-set guard on purpose (invariant 4), so a replacement may
+      //     take host `H` with address set `A2` while the route that held `H`
+      //     with `A1` is still draining its §10.1 goodbye. A delayed
+      //     positive-TTL echo of `A1` is still matched as ours and carries
+      //     rdata no live route holds, so invariant 2 does not stop it; the
+      //     withdrawing route is skipped by every conflict fan-out too, leaving
+      //     the REPLACEMENT as its only recipient and a TERMINAL
+      //     `ServiceUpdate::HostConflict` as the result. Same-instance reuse
+      //     with changed SRV/TXT reaches a false §8.1 probe defeat the same
+      //     way.
+      //     What keeps such an echo out of THIS arm is driver-side, and it is
+      //     the one invariant here the crate cannot check for itself: a
+      //     self-send credit is bound to the record generation it was sent
+      //     under, and a credit from a superseded generation is DEMOTED to
+      //     `OwnEcho` — the only tier that denies adjudication — rather than
+      //     discarded. Demoted, because discarding it makes the same echo read
+      //     as no credit at all, hence `NotFromUs`, hence full adjudication AND
+      //     full observation: the same failure, louder.
+      //     STILL OPEN: an in-place record update is a SECOND route to a
+      //     self-echo carrying rdata we no longer hold, and no generation
+      //     advance covers it. Implementing §8.4 must re-argue this cell, not
+      //     merely add the API.
+      //     INVALIDATED BY: a driver that stops superseding its credits at the
+      //     SERVICE LIFECYCLE SEAMS — a service registration, and the
+      //     `begin_withdrawal` that retires a route however that retirement was
+      //     reached (caller unregister, shutdown, rename collision, internal
+      //     retirement) — or that discards a superseded credit instead of
+      //     demoting it.
       //
-      //  4. Two live routes sharing a HOST NAME publish the SAME A/AAAA set,
-      //     enforced at registration and rename by `Endpoint`'s host
-      //     address-set guard. Without it, a sibling service's echoed
-      //     announcement reaches THIS service as an A/AAAA at its own host name
-      //     with rdata it does not hold — invariant 2 does not save it, because
-      //     the classifier compares against the RECEIVING service's records —
-      //     and surfaces a TERMINAL `ServiceUpdate::HostConflict` on every
-      //     sibling echo.
-      //     INVALIDATED BY: relaxing that guard, or adding any path that lets a
+      //  4. Two live routes sharing a HOST NAME publish the SAME address set FOR
+      //     EACH RRTYPE THEY BOTH PUBLISH — enforced at registration and rename
+      //     by `Endpoint`'s host address-set guard — and a route publishing no
+      //     record of an RRtype receives no conflict for that type at all, in
+      //     the routing fan-out and in `Service::classify_host_rdata` alike.
+      //     Without BOTH halves, a sibling service's echoed announcement reaches
+      //     THIS service as an A/AAAA at its own host name with rdata it does not
+      //     hold — invariant 2 does not save it, because the classifier compares
+      //     against the RECEIVING service's records — and surfaces a TERMINAL
+      //     `ServiceUpdate::HostConflict` on every sibling echo. §9 scopes the
+      //     conflict by rrtype, so the guard cannot be tightened to a
+      //     whole-address-set match without banning the legitimate
+      //     IPv4-only-plus-IPv6-only pair, and cannot be relaxed per rrtype
+      //     without the fan-out's matching half.
+      //     INVALIDATED BY: relaxing either half, or adding any path that lets a
       //     live route's host name or address set change without re-checking it.
       //
       // ANSWERING stays open to defence for the reason §8.1 gives: "it is
@@ -200,7 +235,26 @@ impl Admits {
             // source-address guess must not be able to buy that, so this cell
             // allows adjudication whatever the guess says.
             adjudication: true,
-            answering: Answering::None,
+            // AND SO DOES THE §8.1 DEFENCE, for the same reason and by the same
+            // rule as the `OwnEchoLikely` row above: "when a device receives a
+            // probe query for a name that it is currently using, it SHOULD
+            // generate its response to defend that name immediately".
+            //
+            // This guess is WEAKER than that row's evidence, not stronger. It
+            // matches any co-resident host publishing an address we publish, so
+            // a second responder on this machine shares the source address and
+            // its legitimate probe lands here. `Answering::None` skipped that
+            // probe's question entirely; the QR=0 proposal riding with it has no
+            // conflict effect on an ESTABLISHED service — §8.2 is the
+            // pre-authoritative path — so nothing else stopped the peer, and it
+            // finished probing onto a name we already hold.
+            //
+            // Defending when we should not have is at worst one redundant
+            // truthful response: `DefenceOnly` releases nothing but a probe for
+            // a UNIQUE name we already own, and our own probe's question reaches
+            // our own service only while it is `Probing`, which the `Question`
+            // arm does not answer. Discovery stays suppressed either way.
+            answering: Answering::DefenceOnly,
           }
         } else {
           Self::everything(answer_questions)

@@ -268,7 +268,7 @@ fn our_proposal(our: &ServiceRecords) -> std::vec::Vec<std::vec::Vec<u8>> {
   // function over the same two lists, so what goes in this list is decided by
   // what `write_probe` puts on the wire under this owner — not by a fixed
   // "SRV and TXT" that was only ever true of the common configuration.
-  if names_equal_ignoring_case(our.instance().as_str(), our.host().as_str()) {
+  if our.instance().same_owner(our.host()) {
     for a in our.a_addrs_slice() {
       let mut buf = std::vec::Vec::new();
       buf.extend_from_slice(&crate::wire::ResourceType::A.to_u16().to_be_bytes());
@@ -284,13 +284,6 @@ fn our_proposal(our: &ServiceRecords) -> std::vec::Vec<std::vec::Vec<u8>> {
   }
   set.sort();
   set
-}
-
-/// Are these two owner names the same name? DNS names are case-insensitive
-/// (RFC 6762 §16) and a trailing root dot is not part of the name.
-pub(crate) fn names_equal_ignoring_case(a: &str, b: &str) -> bool {
-  let trim = |s: &str| s.strip_suffix('.').unwrap_or(s).to_owned();
-  trim(a).eq_ignore_ascii_case(&trim(b))
 }
 
 /// Write a DNS name in canonical wire form (length-prefixed labels, root
