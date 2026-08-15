@@ -305,6 +305,15 @@ impl RecvMeta {
   /// the `SCM_TIMESTAMPNS`/`SCM_TIMESTAMP` ancillary cmsg. `None` when the
   /// platform did not provide a timestamp (sockopt unavailable, cmsg absent or
   /// truncated, or a non-Unix target).
+  ///
+  /// **A DIAGNOSTIC, and no longer a self-send input.** This value orders a
+  /// datagram against a send only while it is still attached to the datagram it
+  /// was stamped for, and a `SystemTime` read out of here is attached to nothing:
+  /// [`RecvMeta`] is [`Copy`], so a stamp lifted from one receive can be laid
+  /// beside another receive's bytes and no type notices. Self-send claims take a
+  /// [`RxDatagram`](crate::selfsend::RxDatagram), which carries the stamp and the
+  /// body together and hands the stamp to nobody. Read this for traces, logs and
+  /// latency measurements.
   #[inline(always)]
   pub const fn rx_time(&self) -> Option<SystemTime> {
     self.rx_time
@@ -1862,10 +1871,12 @@ pub const RX_TIMESTAMP_GRAIN: core::time::Duration = core::time::Duration::from_
 ///
 /// **The workspace's only reading of that wire format.** It is reached two ways
 /// and both land here: [`recv_with_meta`] threads the result onto a
-/// [`RecvMeta`] for a driver that receives through this crate, and
-/// [`crate::selfsend::RxEvidence::from_cmsgs`] is the door for a driver that
-/// owns its own `recvmsg` and holds only the control buffer. A driver decoding
-/// these cmsgs a second time for itself is how the two readings drift.
+/// [`RecvMeta`], which [`crate::selfsend::recv_datagram`] then binds to the body
+/// that receive produced, and
+/// [`crate::selfsend::RxDatagram::from_recv_parts`] is the door for a driver
+/// that owns its own `recvmsg` and holds only the control buffer. A driver
+/// decoding these cmsgs a second time for itself is how the two readings
+/// drift.
 // Targets that deliver a `libc::timespec` via `SCM_TIMESTAMPNS` (Linux/Android).
 #[cfg(recv_timestamp_ns)]
 pub(crate) fn parse_rx_time(cmsgs: &[u8]) -> Option<SystemTime> {

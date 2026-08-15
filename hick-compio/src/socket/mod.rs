@@ -8,8 +8,9 @@
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use hick_udp::{
+  Family,
   onlink::{DestinationWitness, IfaceWitness},
-  selfsend::RxEvidence,
+  selfsend::RxDatagram,
 };
 
 #[cfg(test)]
@@ -105,22 +106,6 @@ pub struct RecvMeta {
   iface: IfaceWitness,
   /// IP TTL / IPv6 hop limit if the kernel exposed it.
   hop_limit: Option<u8>,
-  /// What this datagram's arrival says about its order against our own sends.
-  ///
-  /// An [`RxEvidence`] rather than an `Option<SystemTime>` so there is exactly
-  /// one line that decides it — [`Socket::recv`]'s `RxEvidence::from_cmsgs`
-  /// call, over the buffer that receive filled — instead of a plain timestamp
-  /// field any later code could assign a clock reading to. That is a narrowed
-  /// blast radius, not a proof: `hick-udp` cannot check that the bytes are a
-  /// kernel's, so the obligation still rests on that one call site being fed
-  /// the real control buffer.
-  ///
-  /// Living HERE, on the `RecvMeta` [`Socket::recv`] returns beside the very
-  /// datagram it decoded, is what discharges the *other* half of that
-  /// obligation: `hick-udp` cannot check which datagram a stamp belongs to
-  /// either, and one struct carrying both is how this driver keeps them from
-  /// being paired wrongly. See [`RxEvidence`] on origin versus association.
-  rx: RxEvidence,
   /// Bytes of payload received.
   len: usize,
   /// The kernel's `MSG_MCAST`, where this target binds one: whether the
@@ -159,7 +144,6 @@ impl RecvMeta {
       destination: DestinationWitness::blind(),
       iface: IfaceWitness::blind(),
       hop_limit: None,
-      rx: RxEvidence::none(),
       delivery: None,
       len: 0,
       truncated: false,
@@ -267,55 +251,6 @@ impl RecvMeta {
     self.hop_limit
   }
 
-  /// This datagram's ordering evidence for the self-send match.
-  ///
-  /// # This driver still asserts it. What changed is who decodes it
-  ///
-  /// [`RxEvidence::from_meta`] reads the stamp out of a `hick_udp::RecvMeta` — a
-  /// type `hick-udp` alone can mint, off its own `recvmsg`, and the one form of
-  /// this evidence whose ORIGIN `hick-udp` can actually check. That door is shut
-  /// to this driver: it is completion-based, submits its own `recv_msg` and owns
-  /// the control buffer that comes back, so there is no `hick_udp::RecvMeta`
-  /// anywhere on its receive path, and there will not be one until `hick-udp`
-  /// can own a completion-model receive.
-  ///
-  /// So this remains an obligation `hick-udp` cannot check, discharged HERE:
-  /// [`Socket::recv`] must pass `RxEvidence::from_cmsgs` the control buffer its
-  /// own `recv_msg` just filled, and nothing else. `hick-udp` parses those
-  /// bytes but cannot tell them from bytes this crate encoded, so a buffer kept
-  /// from an earlier receive, or one built by hand, would produce ordering
-  /// evidence that orders nothing.
-  ///
-  /// What the change did buy is that the *decode* is no longer this crate's.
-  /// The stamp comes out of the same parser every other driver here uses, so
-  /// this crate can no longer disagree with them about what a
-  /// `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS` cmsg says — and the assertion above
-  /// shrank from a whole cmsg decoder to one argument at one call site.
-  ///
-  /// Getting it wrong would not lose a byte: a stamp that does not order the
-  /// datagram against our `sendto` is at-or-after our send in every case, so the
-  /// ordering test could never reject on it and the claim would run at `Ordered`
-  /// strength on evidence that carries no order, re-opening the credit-theft
-  /// window that ordering exists to close.
-  ///
-  /// # The other unchecked half: which datagram the stamp belongs to
-  ///
-  /// `hick-udp` would not be able to check that even for a `hick_udp::RecvMeta`.
-  /// `SelfSendTracker::take` takes the body and the evidence as separate
-  /// arguments and `RxEvidence` is `Copy`, so a stamp a kernel really did write
-  /// — for a *different* receive — is weighed at `Ordered` strength all the
-  /// same. A later stamp lets a datagram the kernel saw before our `sendto` take
-  /// the credit; an earlier one rejects the genuine echo. Both end at a phantom
-  /// RFC 6762 §9 conflict against ourselves.
-  ///
-  /// This driver discharges it structurally rather than by care at the call: the
-  /// stamp is a field of the `RecvMeta` that `Socket::recv` returns beside the
-  /// datagram, and `DriverState`'s claim reads body and evidence out of that one
-  /// value. See `hick_udp::selfsend::RxEvidence` for the full contract.
-  pub(crate) const fn rx_evidence(&self) -> RxEvidence {
-    self.rx
-  }
-
   /// True when the datagram exceeded the socket's configured
   /// `max_recv_packet_size` (overflowing into the one-byte over-allocation
   /// sentinel) and was therefore silently truncated by the kernel. A legal
@@ -359,7 +294,6 @@ impl RecvMeta {
     destination: Option<IpAddr>,
     interface_index: u32,
     hop_limit: Option<u8>,
-    rx: RxEvidence,
     len: usize,
   ) -> Self {
     Self {
@@ -375,7 +309,6 @@ impl RecvMeta {
         None => IfaceWitness::blind(),
       },
       hop_limit,
-      rx,
       delivery: None,
       len,
       truncated: false,
@@ -469,7 +402,11 @@ impl Socket {
   /// `cmsghdr` alignment that [`CMsgIter::new`] / `compio-net`'s `recv_msg`
   /// both require. The capacity is a measured figure and not a tuning knob —
   /// `MSG_CTRUNC` mints a witness that REFUSES — see `AlignedCtrlBuf`.
-  pub async fn recv(&self, max: usize) -> std::io::Result<(Vec<u8>, RecvMeta)> {
+  pub async fn recv(
+    &self,
+    max: usize,
+    family: Family,
+  ) -> std::io::Result<(RxDatagram<'static>, RecvMeta)> {
     // Over-allocate by one sentinel byte beyond `max` (= max_recv_packet_size).
     // A legal datagram of up to and including `max` bytes then fits without
     // touching the sentinel (`data_len <= max`), while an oversized datagram
@@ -535,24 +472,26 @@ impl Socket {
       // is one wire format, and a driver-local copy of its decode is how two
       // readings of one kernel ABI drift.
       //
-      // `ctrl_bytes` and nothing else. `hick-udp` parses these bytes but cannot
-      // check where they came from, so this line IS the self-send ordering
-      // contract for this driver: it must be the control buffer the `recv_msg`
-      // directly above just filled. A retained buffer, or one assembled here,
-      // would still produce `Ordered` evidence — and evidence that orders
-      // nothing is what re-opens the credit-theft race. See
-      // `RecvMeta::rx_evidence`.
+      // THIS STATEMENT IS THIS DRIVER'S WHOLE SELF-SEND CONTRACT, and it is one
+      // statement rather than a field, a channel and a claim. `ctrl_bytes` must
+      // be the control buffer the `recv_msg` directly above just filled, and
+      // `data` the body it filled at the same time: `hick-udp` parses those
+      // bytes but cannot tell them from bytes this crate encoded, so a retained
+      // buffer, or one assembled here, would still produce `Ordered` evidence —
+      // and evidence that orders nothing re-opens the credit-theft race. What
+      // the mint does settle is the pairing: body and stamp go into one value
+      // that is neither `Copy` nor `Clone` and has no stamp accessor, so from
+      // here on there is no step at which this receive's stamp could meet
+      // another receive's payload.
       //
-      // Assigning it onto THIS `meta`, which is returned with the very bytes
-      // that receive produced, is equally load-bearing: `hick-udp` cannot check
-      // which datagram a stamp belongs to either, so a stamp landing on some
-      // other receive's meta would be weighed at `Ordered` strength against the
-      // wrong payload. Keeping the two in one value is what rules that out.
+      // The body is MOVED, not copied. `data` is the `Vec` compio handed back
+      // out of its own `BufResult`, and `Into<Cow<'_, [u8]>>` for `Vec<u8>` is
+      // `Cow::Owned(data)` — so the completion model's owned buffer becomes the
+      // datagram's body with no second allocation and no memcpy.
       //
-      // `None` — no cmsg, a short one, a target without the sockopt — is
-      // `RxEvidence::none()` and correctly degrades the match.
-      meta.rx = RxEvidence::from_cmsgs(ctrl_bytes);
-      Ok((data, meta))
+      // No cmsg, a short one, or a target without the sockopt yields no stamp
+      // and correctly degrades the match.
+      Ok((RxDatagram::from_recv_parts(family, data, ctrl_bytes), meta))
     }
     #[cfg(not(unix))]
     {
@@ -574,7 +513,10 @@ impl Socket {
       // datagram is preserved). The Windows WSARecvMsg port (follow-up task)
       // will use `dwFlags & MSG_TRUNC` once landed.
       meta.truncated = data_len > max;
-      Ok((data, meta))
+      // No cmsg plumbing on this path at all, so the absence of a receive
+      // timestamp is DECLARED rather than parsed out of a control buffer there
+      // is none of. The claim runs under `MatchMode::Degraded`.
+      Ok((RxDatagram::without_stamp(family, data), meta))
     }
   }
 

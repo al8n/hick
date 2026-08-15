@@ -753,10 +753,28 @@ impl<I: Instant> Multicaster<I> {
   }
 
   /// Whether `data` exactly matches a recent self-send within the recency window
-  /// — no hash collisions, bounded false-positive window. A byte-identical peer
-  /// could match, but suppressing it is harmless: a duplicate query is re-asked
-  /// anyway (§7.3), and our unique probe/announce records would only match an
-  /// impersonator.
+  /// — no hash collisions, bounded false-positive window.
+  ///
+  /// # This is `OwnEchoLikely` and can never be `OwnEcho`
+  ///
+  /// Four things this test does not have, each one on its own enough to keep it
+  /// out of the ordered tier:
+  ///
+  ///  * it is **non-consuming**. There is no take-once credit here, so a
+  ///    byte-identical datagram matches for the whole of [`RECENT_SEND_TTL`], not
+  ///    once. A conforming RFC 6762 §9 fault-tolerance twin — "capable of issuing
+  ///    identical answers" — matches every time it speaks;
+  ///  * it has **no family key**, so an echo on either stack claims the same
+  ///    record;
+  ///  * it weighs **no ordering evidence at all**. There is no kernel receive
+  ///    stamp on this path and no wall clock to put one on, so nothing says the
+  ///    datagram arrived at or after our own send rather than before it;
+  ///  * the call site applies **no source-port gate**, so a datagram from a port
+  ///    this endpoint never sends from is weighed like any other.
+  ///
+  /// A match therefore means "these bytes look like ours", which is exactly what
+  /// `Provenance::OwnEchoLikely` means and nothing stronger. `false` is a
+  /// negative claim about this log and nothing else, which is `NotFromUs`.
   fn is_self(&self, data: &[u8], now: I) -> bool {
     self.recent.iter().any(|s| {
       s.data.as_slice() == data
@@ -1438,13 +1456,33 @@ where
   fn handle_one(&mut self, now: I, src: SocketAddr, local_ip: IpAddr, data: &[u8]) {
     // `local_ip` is the IP header destination the §11 gate has just decided on.
     // The proto uses it only for tracing and the opt-in advertised-source check.
+    //
     // RFC 6762 self-loopback guard: a datagram matching one we just multicast is
-    // our own loopback (some stacks echo multicast to local sockets). Tell the
-    // proto via `caller_is_self` so it does not interpret our own
-    // probe/announcement as a conflicting peer — independent of the source
-    // address, which the proto's advertised-source fallback cannot always match
-    // (e.g. an IPv6 link-local source).
-    let caller_is_self = self.tx.is_self(data, now);
+    // probably our own loopback (some stacks echo multicast to local sockets),
+    // and the proto is told so it does not read our own probe or announcement as
+    // a conflicting peer — independent of the source address, which the proto's
+    // advertised-source fallback cannot always match (e.g. an IPv6 link-local
+    // source).
+    //
+    // **`OwnEchoLikely`, and never `OwnEcho`.** This engine's self-detection has
+    // none of the four things the ordered tier asserts — see `is_self` for each
+    // one — so it may not claim them. What that costs is real and deliberate: a
+    // match no longer suppresses everything, so our own echo now populates no
+    // cache entry and quiets nothing, but it DOES reach §8.2's tiebreak and
+    // §8.1's defence. That is the safe direction. Suppressing a §8.2 proposal
+    // this engine merely suspects is its own costs a name permanently and
+    // silently between two conforming hosts; adjudicating our own echo costs at
+    // worst one §8.2 second.
+    //
+    // `false` is a negative claim about this engine's own send log, which is
+    // `NotFromUs` — and `NotFromUs` declines `trust_advertised_src_as_self`,
+    // because a caller that logs what it sends has better evidence than a source
+    // address that any co-resident publisher matches.
+    let provenance = if self.tx.is_self(data, now) {
+      Provenance::OwnEchoLikely
+    } else {
+      Provenance::NotFromUs
+    };
     // Split borrow: `endpoint.handle` holds `&mut self.endpoint` while the
     // route-event iterator is alive, so per-service routing reads
     // `self.services` through the disjoint field.
@@ -1453,16 +1491,7 @@ where
     } = self;
     let events = match endpoint.handle(
       now,
-      Received::new(
-        src,
-        data,
-        if caller_is_self {
-          Provenance::OwnEcho
-        } else {
-          Provenance::Unknown
-        },
-      )
-      .with_local_ip(local_ip),
+      Received::new(src, data, provenance).with_local_ip(local_ip),
     ) {
       Ok(events) => events,
       Err(_) => return,

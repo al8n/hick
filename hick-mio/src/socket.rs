@@ -40,7 +40,7 @@ use hick_udp::{
   MulticastOptionsV4, MulticastOptionsV6, RecvMeta,
   constants::{MDNS_IPV4_GROUP, MDNS_IPV6_GROUP, MDNS_PORT},
   onlink::{DestinationWitness, IfaceWitness},
-  selfsend::RxEvidence,
+  selfsend::RxDatagram,
   try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
 use mio::{Interest, Registry, Token, net::UdpSocket};
@@ -57,27 +57,29 @@ pub(crate) const MDNS_V4_DST: SocketAddr =
 pub(crate) const MDNS_V6_DST: SocketAddr =
   SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6_GROUP, MDNS_PORT, 0, 0));
 
-/// How many datagrams one [`Sockets::recv`] call may consume-and-discard
-/// (oversized or unparseable) or retry after `EINTR` before handing control
-/// back to the caller.
+/// How many datagrams one drained datagram's worth of retries may
+/// consume-and-discard (oversized or unparseable) or retry after `EINTR` before
+/// handing control back to the caller.
 ///
 /// Each such datagram is already out of the kernel queue, so looping is what
-/// makes progress — but `recv` runs inside the caller's own event loop, and an
-/// unbounded loop would let a peer flooding oversized datagrams starve every
-/// other token the caller is polling. On exhaustion `recv` returns `None` with
-/// the readable flag still set, so [`Sockets::has_readable`] keeps reporting
-/// work and the drain resumes on the next tick.
+/// makes progress — but the drain runs inside the caller's own event loop, and
+/// an unbounded loop would let a peer flooding oversized datagrams starve every
+/// other token the caller is polling. On exhaustion [`Sockets::recv_once`]
+/// reports [`RecvStep::Idle`] with the readable flag still set, so
+/// [`Sockets::has_readable`] keeps reporting work and the drain resumes on the
+/// next tick.
 ///
-/// **Per `recv` call, not per tick**, and therefore composed with
-/// [`RECV_BUDGET`](crate::driver::RECV_BUDGET), which bounds how many times one
-/// [`Mdns::tick`](crate::Mdns::tick) calls [`Sockets::recv`]: the two multiply,
-/// so a tick facing an interleaved oversized/valid stream can reach ~4096
-/// `recvmsg` calls. See `RECV_BUDGET` for why that product is accepted rather
-/// than capped.
+/// **Per drained datagram, not per tick** — the counter is created fresh for
+/// each one — and therefore composed with
+/// [`RECV_BUDGET`](crate::driver::RECV_BUDGET), which bounds how many datagrams
+/// one [`Mdns::tick`](crate::Mdns::tick) drains: the two multiply, so a tick
+/// facing an interleaved oversized/valid stream can reach ~4096 `recvmsg`
+/// calls. See `RECV_BUDGET` for why that product is accepted rather than
+/// capped.
 pub(crate) const MAX_DISCARDED_PER_RECV: usize = 64;
 
 /// Transient receive errors one family may return, within one
-/// [`Mdns::tick`](crate::Mdns::tick), before [`Sockets::recv`] stops selecting
+/// [`Mdns::tick`](crate::Mdns::tick), before [`Sockets::recv_once`] stops selecting
 /// it for the rest of that tick.
 ///
 /// A non-consuming receive error (`ENOBUFS`, Windows `WSAECONNRESET` after an
@@ -121,6 +123,35 @@ pub(crate) static BIND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// can never be indexed differently.
 pub(crate) use hick_udp::Family;
 
+/// What one receive attempt produced.
+///
+/// A step rather than an outcome, because the retry loop this is stepped by
+/// lives in [`Mdns::drain_recv`](crate::driver::Mdns) rather than here. That is
+/// a borrow-checking necessity, not a preference: a minted [`RxDatagram`]
+/// borrows the receive buffer for the CALLER's lifetime, which is a free region
+/// and therefore live at every point of whatever function returns it — so a loop
+/// that conditionally returns one can never re-borrow the buffer for its next
+/// attempt (NLL problem case #3). Retrying where the buffer's OWNER is is what
+/// makes the borrow per-iteration again.
+///
+/// Every decision the loop used to make inside [`Sockets::recv_once`] still is:
+/// the family rotation, the readiness clearing, the error classification, the
+/// stats and the [`MAX_DISCARDED_PER_RECV`] budget. What moved out is only the
+/// `loop` keyword.
+pub(crate) enum RecvStep<'b> {
+  /// A datagram, with its family, body and stamp already bound together, and the
+  /// metadata the RFC 6762 §11 gate reads. The family is not carried beside it:
+  /// it is `RxDatagram::family`, which is where the credit key reads it from.
+  Datagram(RxDatagram<'b>, RecvMeta),
+  /// Nothing usable, and the read should be attempted again with the same
+  /// buffer: an `EINTR`, a consumed-but-unusable datagram, a transient error, or
+  /// a `WouldBlock` that only cleared one family's readiness.
+  Retry,
+  /// Stop draining: nothing is readable, or this sequence's discard budget is
+  /// spent. The readable flag is left exactly as this call decided it.
+  Idle,
+}
+
 /// The largest UDP payload `family` can **ever** carry, and therefore the only
 /// sound proof that a refused datagram can never be sent. See
 /// [`SendOutcome::TooLarge`] for why an errno is not one.
@@ -159,7 +190,7 @@ pub(crate) const fn max_udp_payload(family: Family) -> usize {
 
 /// Round-robin cursor over the two receive sockets.
 ///
-/// Which socket [`Sockets::recv`] reads has to rotate, and a per-tick receive
+/// Which socket [`Sockets::recv_once`] reads has to rotate, and a per-tick receive
 /// budget does not make it rotate. `readable` clears only on `WouldBlock`, so a
 /// family under a sustained on-link flood is readable at the top of *every*
 /// tick; a fixed preference then spends every tick's whole budget on it and the
@@ -168,8 +199,9 @@ pub(crate) const fn max_udp_payload(family: Family) -> usize {
 /// about which family wins the next one.
 ///
 /// The rotation is on **selection**, not on a successful read, and that is what
-/// makes it hold under every outcome. One `recv` call performs at most one
-/// usable read before returning, so with both families readable the calls
+/// makes it hold under every outcome. One [`Sockets::recv_once`] call performs
+/// at most one usable read before returning, so with both families readable the
+/// calls
 /// strictly alternate; a selection that turns out to be `WouldBlock`, an
 /// oversized discard, or a transient error has still moved the cursor, so it
 /// cannot be repeated in a loop either.
@@ -589,7 +621,7 @@ struct BoundSocket {
   interest: Interest,
   /// The registration the selector holds for this socket is not the one we
   /// need, and the call that would have fixed it failed: a receive re-arm that
-  /// failed in [`Sockets::recv`].
+  /// failed in [`Sockets::recv_once`].
   ///
   /// The recovery is a *re-registration*, not a flag: the interest we want is
   /// the plain `READABLE` already recorded, and the point of the retry is the
@@ -813,13 +845,18 @@ impl BoundSocket {
     self.recv_error_rounds = 0;
   }
 
-  /// One `recvmsg`/`WSARecvMsg` with cmsg metadata on this family's socket.
+  /// One `recvmsg`/`WSARecvMsg` on this family's socket, minting the
+  /// [`RxDatagram`] the self-send claim is made against.
   ///
   /// Wraps the free [`raw_recv`] purely so a test can inject what no healthy
   /// loopback socket will produce: the transient, non-consuming receive error of
   /// [`BoundSocket::forced_recv_errors`], and the mid-drain stall of
   /// [`BoundSocket::forced_recv_delays`].
-  fn raw_recv(&mut self, buf: &mut [u8], is_v4: bool) -> io::Result<RecvMeta> {
+  fn raw_recv<'b>(
+    &mut self,
+    buf: &'b mut [u8],
+    family: Family,
+  ) -> io::Result<(RxDatagram<'b>, RecvMeta)> {
     // Deliberately BEFORE the read, and before the injected errors: that is
     // where a preempted drain thread really loses the CPU, and the stall has to
     // be charged whether or not this particular read yields a datagram.
@@ -840,7 +877,11 @@ impl BoundSocket {
     }
     #[cfg(unix)]
     {
-      raw_recv(&self.sock, buf, is_v4)
+      // `hick-udp` performs the receive, so it also slices the body and reads
+      // the stamp: no length, no buffer and no time is an argument this crate
+      // supplies, and there is no step at which the two are separate values.
+      use std::os::fd::AsRawFd;
+      hick_udp::selfsend::recv_datagram(self.sock.as_raw_fd(), buf, family)
     }
     #[cfg(windows)]
     {
@@ -853,7 +894,27 @@ impl BoundSocket {
       // the alternative was a token outliving its socket, which is the defect
       // this shape exists to make unrepresentable.
       use std::os::windows::io::AsSocket;
-      hick_udp::resolve_recv_with_meta(self.sock.as_socket())?.recv(buf, is_v4)
+      let recvmsg = hick_udp::resolve_recv_with_meta(self.sock.as_socket())?;
+      let meta = recvmsg.recv(&mut *buf, family.is_v4())?;
+      let n = meta.len();
+      // A length the receive did not deliver is a DROP, never the whole buffer
+      // and never a truncated report: this is where the body a self-send credit
+      // is keyed on gets chosen, so a body longer than what arrived would be
+      // hashed into the claim. `hick-udp` clamps the reported length to the
+      // buffer it was given, so this is unreachable — the rule is applied anyway
+      // because it must be the same on every path. It is stated once, on
+      // `RxDatagram`; the Unix arm above gets it from `recv_datagram`, which
+      // reports the same `InvalidData` this arm does.
+      if n > buf.len() {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidData,
+          "the receive reported more bytes than the buffer holds",
+        ));
+      }
+      // Windows delivers no receive-timestamp cmsg at all, so the absence is
+      // DECLARED rather than read off a meta that would always report `None`.
+      // The claim runs under `MatchMode::Degraded`.
+      Ok((RxDatagram::without_stamp(family, &buf[..n]), meta))
     }
   }
 
@@ -985,7 +1046,7 @@ impl BoundSocket {
   /// Stop reading this family and re-arm it, recording a failed re-arm as a
   /// stale registration so the next [`Sockets::sync_interests`] retries it.
   ///
-  /// **Called only from the `WouldBlock` arm of [`Sockets::recv`]**, and that
+  /// **Called only from the `WouldBlock` arm of [`Sockets::recv_once`]**, and that
   /// restriction is the invariant: readiness is cleared exactly when the kernel
   /// has told us its queue is empty, never on the strength of an error that
   /// says nothing about it. A transient receive error is retried with readiness
@@ -1041,7 +1102,7 @@ pub(crate) struct Sockets {
   /// is not bound: [`Sockets::owns`] must claim both, or the caller would route
   /// a token it gave away back into its own handler.
   tokens: Option<(Token, Token)>,
-  /// Which family the next [`Sockets::recv`] reads from. Lives here, not in the
+  /// Which family the next [`Sockets::recv_once`] reads from. Lives here, not in the
   /// call, because the starvation it prevents is across ticks: a per-call or
   /// per-tick preference resets to the same family every time.
   recv_rotor: RecvRotor,
@@ -1092,7 +1153,8 @@ pub(crate) struct Sockets {
   #[cfg(test)]
   forced_rx_peer: Option<SocketAddr>,
   /// Report every received datagram as carrying no kernel receive timestamp,
-  /// overriding the cmsg metadata. See [`Sockets::rx_time`].
+  /// overriding the cmsg metadata — applied in [`Sockets::recv_once`], by stripping
+  /// the stamp off the datagram the receive minted.
   ///
   /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded) is the whole
   /// of the self-send match on Windows and on any Unix kernel that delivers no
@@ -1278,42 +1340,6 @@ impl Sockets {
       return peer;
     }
     meta.peer()
-  }
-
-  /// The ordering evidence a datagram carried, as the self-send match must read
-  /// it — no timestamp cmsg means
-  /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded).
-  ///
-  /// Taken from the [`RecvMeta`] rather than from a `SystemTime` this crate
-  /// passes along, so the stamp's ORIGIN is structural: `RecvMeta` is minted
-  /// only by `hick-udp`'s own receive path, and this crate has no way to present
-  /// a userspace read time as a kernel stamp even by mistake.
-  ///
-  /// **Which datagram the stamp belongs to is not.** `hick-udp` cannot check
-  /// that for any form of the evidence — `SelfSendTracker::take` takes the body
-  /// and the evidence as separate arguments and `RxEvidence` is `Copy`, so a
-  /// stamp a kernel really did write, for a *different* receive, is weighed at
-  /// `Ordered` strength all the same. A later stamp lets a datagram the kernel
-  /// saw before our `sendto` take the credit; an earlier one rejects the genuine
-  /// echo. Both end at a phantom RFC 6762 §9 conflict against ourselves.
-  ///
-  /// That obligation is discharged at the caller rather than here, and
-  /// structurally: the drain claims `recv_buf[..meta.len()]`, sliced out of the
-  /// receive buffer by this very `meta`, so the body and the stamp cannot come
-  /// from different receives without the length coming from the wrong one too.
-  /// Passing a `RecvMeta` kept from some other receive would compile and be
-  /// wrong. See [`RxEvidence`](hick_udp::selfsend::RxEvidence) on origin versus
-  /// association.
-  ///
-  /// The `#[cfg(test)]` override is the only way to present the timestamp-less
-  /// datagram a Windows host hands the drain on every single receive. See
-  /// [`Sockets::forced_no_rx_time`].
-  pub(crate) fn rx_evidence(&self, meta: &RecvMeta) -> RxEvidence {
-    #[cfg(test)]
-    if self.forced_no_rx_time {
-      return RxEvidence::none();
-    }
-    RxEvidence::from_meta(meta)
   }
 
   /// The interface both sockets are scoped to. The RFC 6762 §11 fallback needs
@@ -1533,16 +1559,27 @@ impl Sockets {
       .unwrap_or(0)
   }
 
-  /// Drain the next datagram from a socket flagged readable, with its cmsg
-  /// metadata. The `bool` is `via_v4`: which family it arrived on.
+  /// **One** attempt at reading the next datagram off a socket flagged readable,
+  /// minting it with its cmsg metadata and the family it arrived on.
   ///
   /// **Which family is read rotates on every selection** — see [`RecvRotor`],
   /// which owns that policy and the reason a per-tick budget is not a substitute
   /// for it.
   ///
-  /// Returns `None` once nothing is readable, having cleared each drained
-  /// family's flag and re-armed it. Error handling follows the design's §8
-  /// table:
+  /// # The retry loop is the caller's, and that is structural
+  ///
+  /// This used to loop here. It cannot any more: the [`RxDatagram`] it returns
+  /// borrows `buf` for the caller's lifetime, which is a free region and so live
+  /// at every point of this function — a loop that conditionally returns one can
+  /// never re-borrow `buf` for a second attempt. The loop therefore lives where
+  /// the buffer's owner is, and this reports [`RecvStep::Retry`] instead of
+  /// looping. `discarded` is that loop's counter, carried in so this method
+  /// still enforces [`MAX_DISCARDED_PER_RECV`] — the caller stores it and
+  /// nothing more. Every other decision is unchanged and still made here.
+  ///
+  /// [`RecvStep::Idle`] means stop draining: nothing readable, or the discard
+  /// budget spent, having cleared each drained family's flag and re-armed it.
+  /// Error handling follows the design's §8 table:
   ///
   /// * `WouldBlock` — the kernel queue is empty. **The only outcome that clears
   ///   the readable flag**: clear it, re-arm, try the other family.
@@ -1569,16 +1606,24 @@ impl Sockets {
   /// them. Nor is a bare `Interrupted` — no bytes were consumed, so it has
   /// nothing to add to either counter; only the arm that reads a datagram off
   /// the kernel queue and then finds it unusable does.
-  pub(crate) fn recv(&mut self, buf: &mut [u8]) -> Option<(RecvMeta, Family)> {
+  pub(crate) fn recv_once<'b>(&mut self, buf: &'b mut [u8], discarded: &mut usize) -> RecvStep<'b> {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
-    let mut discarded = 0usize;
-    loop {
+    // Read before the receive borrows the buffer for the returned datagram's
+    // lifetime. It is the best-effort byte count for a consumed-but-unusable
+    // datagram, which recvmsg truncated to fill exactly this buffer.
+    #[cfg(feature = "stats")]
+    let buf_len = buf.len() as u64;
+    #[cfg(test)]
+    let forced_no_rx_time = self.forced_no_rx_time;
+    {
       // Round-robin, never a fixed preference: see [`RecvRotor`] for why a
       // per-tick budget does not stop one family starving the other.
       let v4_readable = self.v4.as_ref().is_some_and(BoundSocket::recv_selectable);
       let v6_readable = self.v6.as_ref().is_some_and(BoundSocket::recv_selectable);
-      let family = self.recv_rotor.pick(v4_readable, v6_readable)?;
+      let Some(family) = self.recv_rotor.pick(v4_readable, v6_readable) else {
+        return RecvStep::Idle;
+      };
       let via_v4 = family.is_v4();
       // Disjoint field borrows: the family we read from and the registry we
       // re-arm through.
@@ -1586,53 +1631,69 @@ impl Sockets {
         v4, v6, registry, ..
       } = self;
       // The readable test above already proved this family is bound, so the
-      // `?` never actually short-circuits.
-      let fam = (if via_v4 { v4.as_mut() } else { v6.as_mut() })?;
+      // `else` never actually fires.
+      let Some(fam) = (if via_v4 { v4.as_mut() } else { v6.as_mut() }) else {
+        return RecvStep::Idle;
+      };
 
-      match fam.raw_recv(buf, via_v4) {
-        Ok(meta) => {
+      let e = match fam.raw_recv(buf, family) {
+        Ok((rx, meta)) => {
           fam.note_recv_progress();
-          return Some((meta, family));
+          // The only way to present the timestamp-less datagram a Windows host
+          // hands the drain on every single receive. It STRIPS the stamp from
+          // the minted datagram rather than assembling a second one, so the body
+          // is still the one this receive sliced and no second value ever holds
+          // the stamp. See `Sockets::forced_no_rx_time`.
+          #[cfg(test)]
+          let rx = if forced_no_rx_time {
+            RxDatagram::without_stamp(family, rx.into_body())
+          } else {
+            rx
+          };
+          return RecvStep::Datagram(rx, meta);
         }
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+        Err(e) => e,
+      };
+      match e {
+        e if e.kind() == io::ErrorKind::WouldBlock => {
           fam.stop_reading(registry.as_ref());
         }
         // Interrupted before anything was consumed: nothing landed in `buf`, so
         // there is nothing to add to packets_rx/bytes_rx. Budgeted the same way
         // as the arm below — both make progress only by looping.
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+        e if e.kind() == io::ErrorKind::Interrupted => {
           hick_trace::debug!(error = %e, via_v4, "retrying an interrupted recv");
-          discarded = discarded.saturating_add(1);
-          if discarded >= MAX_DISCARDED_PER_RECV {
+          *discarded = discarded.saturating_add(1);
+          if *discarded >= MAX_DISCARDED_PER_RECV {
             // Flag deliberately left set: `has_readable` keeps reporting work
             // so the caller ticks again instead of blocking.
-            return None;
+            return RecvStep::Idle;
           }
         }
         // Consumed but unusable (oversized / MSG_TRUNC / unparseable source):
         // the datagram DID leave the kernel queue, so — unlike `Interrupted`
         // above — it counts toward packets_rx/bytes_rx, with packets_dropped
         // marking the reject. See this method's doc comment for why.
-        Err(e) if is_consumed_but_unusable(&e) => {
+        e if is_consumed_but_unusable(&e) => {
           hick_trace::debug!(error = %e, via_v4, "dropping an unusable datagram");
           #[cfg(feature = "stats")]
           {
             stats.packets_rx(1);
-            stats.bytes_rx(buf.len() as u64);
+            stats.bytes_rx(buf_len);
             stats.packets_dropped(1);
           }
-          discarded = discarded.saturating_add(1);
-          if discarded >= MAX_DISCARDED_PER_RECV {
+          *discarded = discarded.saturating_add(1);
+          if *discarded >= MAX_DISCARDED_PER_RECV {
             // Flag deliberately left set: `has_readable` keeps reporting work
             // so the caller ticks again instead of blocking.
-            return None;
+            return RecvStep::Idle;
           }
         }
         // Structurally broken rather than merely unlucky: this socket will
         // answer every read the same way for as long as it exists, so retrying
         // it is a busy-loop that leaves the family deaf and says so nowhere.
         // Stop reading it, and let `deaf_families` make the state public.
-        Err(e) if is_permanent_recv_error(&e) => {
+        e if is_permanent_recv_error(&e) => {
           hick_trace::warn!(
             error = %e,
             via_v4,
@@ -1645,7 +1706,7 @@ impl Sockets {
           fam.recv_error_streak = 0;
           fam.recv_error_rounds = 0;
         }
-        Err(_e) => {
+        _e => {
           // A bound UDP socket can fail transiently (`ENOBUFS`, or Windows
           // `WSAECONNRESET` after an ICMP port-unreachable for one of our
           // sends) without consuming anything. Readiness is deliberately
@@ -1663,13 +1724,14 @@ impl Sockets {
               "a socket kept failing to receive; backing off with its readiness retained"
             );
           }
-          discarded = discarded.saturating_add(1);
-          if discarded >= MAX_DISCARDED_PER_RECV {
+          *discarded = discarded.saturating_add(1);
+          if *discarded >= MAX_DISCARDED_PER_RECV {
             // Flag deliberately left set: the drain resumes next round.
-            return None;
+            return RecvStep::Idle;
           }
         }
       }
+      RecvStep::Retry
     }
   }
 
@@ -2102,7 +2164,7 @@ impl Sockets {
     }
   }
 
-  /// The family the next [`Sockets::recv`] selection prefers. Proves that
+  /// The family the next [`Sockets::recv_once`] selection prefers. Proves that
   /// `recv` really consults and advances [`RecvRotor`], which is otherwise
   /// invisible: a single-family endpoint reads the same socket either way.
   #[cfg(test)]
@@ -2338,16 +2400,6 @@ fn is_permanent_recv_error(e: &io::Error) -> bool {
       | io::ErrorKind::Unsupported
       | io::ErrorKind::InvalidInput
   )
-}
-
-/// One `recvmsg` with cmsg metadata, straight on the raw socket.
-///
-/// `mio::net::UdpSocket` has no API for ancillary data, so this goes around it
-/// — which is exactly why [`rearm_readiness`] exists.
-#[cfg(unix)]
-fn raw_recv(sock: &UdpSocket, buf: &mut [u8], is_v4: bool) -> io::Result<RecvMeta> {
-  use std::os::fd::AsRawFd;
-  hick_udp::recv_with_meta(sock.as_raw_fd(), buf, is_v4)
 }
 
 /// Re-arm a socket's readiness registration after we stopped reading it.

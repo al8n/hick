@@ -2239,8 +2239,27 @@ fn permanently_failing_family_does_not_stall_the_healthy_one() {
   );
 }
 
+/// Our own looped-back multicast ADJUDICATES and finds no conflict — which is
+/// not the same thing as vanishing, and is what changed.
+///
+/// This engine's `is_self` is a content match and nothing more: non-consuming,
+/// with no family key, no ordering evidence and no source-port gate at the call
+/// site. It therefore reports `Provenance::OwnEchoLikely`, never `OwnEcho`, so
+/// the datagram is no longer suppressed outright — it reaches RFC 6762 §8.2's
+/// tiebreak and §8.1's defence like any other. **The assertion below is
+/// therefore about a different mechanism than it used to be.** It used to hold
+/// because nothing looked at the datagram at all; it now holds because §9
+/// defines a conflict as the same name, rrtype and rrclass with DIFFERENT rdata,
+/// and our own echo carries rdata identical to ours by construction. That is the
+/// no-op property the whole tier rests on, and asserting it here is worth more
+/// than asserting that suppression happened.
+///
+/// The `packets_dropped` half is what pins the tier itself. `Endpoint::handle`
+/// bumps that counter on exactly the "nothing admits this datagram" condition,
+/// which is what `OwnEcho` produces and what `OwnEchoLikely` does not — so a
+/// regression back to the ordered tier fails here rather than passing silently.
 #[test]
-fn own_multicast_loopback_is_not_treated_as_conflict() {
+fn own_multicast_loopback_adjudicates_and_finds_no_conflict() {
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(9));
   let handle = engine.register_service(sample_spec(), at(0)).unwrap();
   let mut io = MockUdp::default();
@@ -2264,6 +2283,8 @@ fn own_multicast_loopback_is_not_treated_as_conflict() {
       len: 0,
     },
   ));
+  #[cfg(feature = "stats")]
+  let dropped_before = engine.stats().packets_dropped;
   // Process the loopback promptly — within RECENT_SEND_TTL of the announcement.
   engine.pump(|| at(5_000_001), &mut io, &mut scratch);
 
@@ -2276,7 +2297,16 @@ fn own_multicast_loopback_is_not_treated_as_conflict() {
   }
   assert!(
     !conflict,
-    "our own looped-back multicast must not be seen as a conflicting peer"
+    "our own looped-back multicast carries rdata identical to ours, so §9 makes \
+     it no conflict — adjudicating it must stay a no-op"
+  );
+  #[cfg(feature = "stats")]
+  assert_eq!(
+    engine.stats().packets_dropped,
+    dropped_before,
+    "`OwnEchoLikely` adjudicates, so the datagram is not a whole-datagram \
+     reject — a count here means this engine claimed the ordered tier it has no \
+     evidence for"
   );
 }
 

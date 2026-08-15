@@ -114,7 +114,6 @@ fn recv_meta_default_is_safe_and_unspecified() {
   assert!(m.local_ip.is_unspecified());
   assert_eq!(m.interface_index(), 0);
   assert!(m.hop_limit.is_none());
-  assert_eq!(m.rx, RxEvidence::none());
 }
 
 /// Direct proof that the cmsg recv path delivers PKTINFO over loopback.
@@ -161,11 +160,14 @@ async fn raw_loopback_round_trip_carries_pktinfo_local_ip() {
   let payload = b"compio mdns hello";
   let dst: SocketAddr = (Ipv4Addr::new(224, 0, 0, 251), 5353).into();
   sock1.send_to(payload, dst, None).await.unwrap();
-  let (data, meta) = compio::time::timeout(Duration::from_secs(2), sock2.recv(2048))
-    .await
-    .expect("recv timed out")
-    .unwrap();
-  assert_eq!(&data[..payload.len()], payload);
+  let (rx, meta) = compio::time::timeout(
+    Duration::from_secs(2),
+    sock2.recv(2048, hick_udp::Family::V4),
+  )
+  .await
+  .expect("recv timed out")
+  .unwrap();
+  assert_eq!(&rx.body()[..payload.len()], payload);
   // local_ip and interface_index are populated from PKTINFO on Linux/macOS;
   // soft-assert because some loopback configs deliver UNSPECIFIED.
   if meta.local_ip.is_unspecified() {

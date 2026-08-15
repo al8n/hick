@@ -643,7 +643,7 @@ pub(super) fn enable_recv_cmsgs(sock: &std::net::UdpSocket) -> std::io::Result<(
   // yields no evidence, degrading the self-send match rather than breaking it.
   // We ENABLE via the SO_* sockopt; the kernel then tags the received cmsg with
   // the matching SCM_* type, which `hick-udp` — not this crate — decodes out of
-  // the control buffer (see `RxEvidence::from_cmsgs` in `Socket::recv`).
+  // the control buffer (see `RxDatagram::from_recv_parts` in `Socket::recv`).
   // `recv_timestamp_ns` selects the nanosecond SO_TIMESTAMPNS (Linux/Android)
   // over the microsecond SO_TIMESTAMP; `hick-udp`'s matching cfg selects the
   // SCM_* type it looks for, and both crates emit that cfg from the same
@@ -908,11 +908,13 @@ pub(super) fn decode_unix_cmsgs(ctrl: &[u8], meta: &mut RecvMeta, control_trunca
       // The kernel receive-timestamp cmsg is deliberately NOT decoded here.
       // `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS` is one wire format, `hick-udp` already
       // reads it, and `Socket::recv` hands it this same buffer through
-      // `RxEvidence::from_cmsgs`. Two readings of one kernel ABI drift silently
-      // — a wrong stamp still type-checks — and that is the cost this crate
-      // stopped paying. It does NOT make the resulting evidence checkable: that
-      // is still a caller contract, discharged at the `from_cmsgs` call site.
-      // An arm added back here would re-take the cost and buy nothing.
+      // `RxDatagram::from_recv_parts`. Two readings of one kernel ABI drift
+      // silently — a wrong stamp still type-checks — and that is the cost this
+      // crate stopped paying. It does NOT make the resulting evidence checkable:
+      // that is still a caller contract, discharged at the mint's call site.
+      // An arm added back here would re-take the cost and buy nothing — and it
+      // now has nowhere to put what it decodes, since `RecvMeta` carries no
+      // stamp field at all.
       _ => {}
     }
   }
@@ -1547,14 +1549,19 @@ fn truncated_pktinfo_cmsg_is_skipped_not_read() {
 /// The receive-timestamp cmsg is `hick-udp`'s to read, and this crate must not
 /// grow a second reading of it.
 ///
-/// Both halves are asserted over the SAME bytes: `decode_unix_cmsgs` walks a
-/// buffer carrying a perfectly good timestamp cmsg and must leave
-/// `RecvMeta::rx` exactly as `RecvMeta::empty` set it, while
-/// `RxEvidence::from_cmsgs` — the constructor `Socket::recv` routes that buffer
-/// through — must be what recovers the stamp. An arm added back to the decoder
-/// fails the first assertion; a `Socket::recv` that stopped calling
-/// `from_cmsgs` would leave the driver claiming self-sends on `Degraded`
-/// evidence forever, which nothing louder than the second assertion detects.
+/// **One half of that is now structural rather than asserted.** `RecvMeta` has
+/// no field a stamp can land in: the stamp travels inside the `RxDatagram` that
+/// `Socket::recv` mints beside the body it belongs to, and there is no accessor
+/// to read it back out. A decoder arm added here has nowhere to put what it
+/// decodes, which is a stronger statement than the equality this test used to
+/// make about `RecvMeta::rx`.
+///
+/// What is left needs asserting, and it is the half that fails silently: a
+/// `Socket::recv` that stopped routing its control buffer through
+/// `RxDatagram::from_recv_parts` would leave this driver claiming every
+/// self-send on `Degraded` evidence forever, and nothing else would say so. The
+/// stamp is observable only through the STRENGTH a claim runs at, so that is
+/// what this measures — the same bytes, minted both ways, against one credit.
 ///
 /// Malformed and absurd payloads are not retried here. That parser has one
 /// implementation now and `hick-udp` tests it against `i64::MAX` in both
@@ -1562,7 +1569,12 @@ fn truncated_pktinfo_cmsg_is_skipped_not_read() {
 #[cfg(all(unix, has_recv_timestamp, test))]
 #[test]
 fn timestamp_cmsg_is_decoded_by_hick_udp_and_not_by_this_crate() {
-  use hick_udp::selfsend::RxEvidence;
+  use std::time::{Duration, Instant as StdInstant, SystemTime};
+
+  use hick_udp::{
+    Family,
+    selfsend::{ClockPair, RxDatagram, SelfSendMatch, SelfSendTracker},
+  };
   use libc::{SOL_SOCKET, cmsghdr};
 
   // The SCM_* TYPE the kernel delivers, selected by `recv_timestamp_ns` exactly
@@ -1611,17 +1623,47 @@ fn timestamp_cmsg_is_decoded_by_hick_udp_and_not_by_this_crate() {
   }
   assert!(acc > 0, "the encoded cmsg must not be all-zero");
 
+  // The decoder still walks the buffer, and still must not choke on a cmsg it
+  // does not consume. Where the stamp would have gone there is no longer a
+  // field, so the assertion below is about the mint instead.
   let mut meta = RecvMeta::empty(([0u8, 0, 0, 0], 0).into());
   decode_unix_cmsgs(&buf[..written], &mut meta, false);
-  assert_eq!(
-    meta.rx,
-    RxEvidence::none(),
-    "this crate's decoder must not read the timestamp cmsg for itself"
+
+  // One credit, sent a second before the stamp encoded above, and claimed on a
+  // clock that has not stepped. A stamp recovered from the buffer is at-or-after
+  // the send, so the claim weighs it and reports `Ordered`; a mint that recovered
+  // nothing has no ordering evidence and can only report `Degraded`. The two
+  // outcomes are what the stamp's presence is observable as.
+  const ENCODED_SECS: u64 = 1_700_000_000;
+  let body = b"a datagram this credit was recorded for";
+  let sent = ClockPair::new(
+    SystemTime::UNIX_EPOCH + Duration::from_secs(ENCODED_SECS - 1),
+    StdInstant::now(),
   );
-  assert_ne!(
-    RxEvidence::from_cmsgs(&buf[..written]),
-    RxEvidence::none(),
-    "hick-udp's parse, over the very same bytes, is what must recover it"
+  let now = ClockPair::new(sent.wall, sent.mono);
+
+  let mut tracker = SelfSendTracker::new();
+  tracker.record(Family::V4, body, sent);
+  tracker.seal_at(sent.mono);
+  assert_eq!(
+    tracker.claim_at(
+      &RxDatagram::from_recv_parts(Family::V4, &body[..], &buf[..written]),
+      now
+    ),
+    SelfSendMatch::Ordered,
+    "hick-udp's parse, over the very bytes `Socket::recv` routes to the mint, is \
+     what must recover the stamp — without it every claim runs degraded"
+  );
+
+  // The control, and it is what keeps the assertion above about the STAMP rather
+  // than about the credit matching at all: the same credit, the same bytes, no
+  // control buffer.
+  tracker.record(Family::V4, body, sent);
+  tracker.seal_at(sent.mono);
+  assert_eq!(
+    tracker.claim_at(&RxDatagram::without_stamp(Family::V4, &body[..]), now),
+    SelfSendMatch::Degraded,
+    "and a mint with no control buffer weighs no ordering evidence at all"
   );
 }
 

@@ -15,7 +15,7 @@ use super::{
 };
 use hick_udp::{
   onlink::{DestinationWitness, IfaceWitness},
-  selfsend::{RxEvidence, SELF_SEND_TTL},
+  selfsend::{RxDatagram, SELF_SEND_TTL, SelfSendMatch},
 };
 
 use crate::{
@@ -24,6 +24,18 @@ use crate::{
   event::{Event, EventQueue},
   socket::{Family, MDNS_V4_DST},
 };
+
+/// Whether a claim consumed a credit at all, at either strength.
+///
+/// A test whose subject is the take-once bookkeeping — which credit was
+/// consumed, which survived — says so through this, so the tier tests stay the
+/// only place a strength is asserted and a change to one is not lost in the
+/// other. It is deliberately NOT a method on `SelfSendMatch`: a driver mapping
+/// an echo onto a trust tier must read the variant, and a public flattener is
+/// exactly the collapse the tier exists to prevent.
+fn consumed(m: SelfSendMatch) -> bool {
+  !matches!(m, SelfSendMatch::NoCredit)
+}
 
 /// `idx` as the interface witness a receive path that DID name the link would
 /// mint.
@@ -410,12 +422,10 @@ fn a_multicast_send_takes_one_credit_per_family_that_reached_the_wire() {
   // Take it back with the body: the credit is keyed to the family that carried
   // it and to the fingerprint of what went out. No receive stamp is offered, so
   // the claim runs on content and family alone.
-  assert!(selfsend.take_at(
-    Family::V4,
-    &body,
-    RxEvidence::none(),
+  assert!(consumed(selfsend.claim_at(
+    &RxDatagram::without_stamp(Family::V4, &body[..]),
     hick_udp::selfsend::ClockPair::now()
-  ));
+  )));
 }
 
 /// A refused send takes no credit and reports the family `Missed`, inside the
@@ -3612,9 +3622,10 @@ fn echo_matched_at_next_tick_top(mdns: &mut Mdns, family: Family, body: &[u8]) -
   // how much time has passed since the send and the claim keeps full ordering
   // evidence — which is what makes this an `Ordered` claim rather than a
   // degraded one.
-  mdns
-    .selfsend
-    .take_at(family, body, RxEvidence::from_stamp_for_test(top.wall), top)
+  consumed(mdns.selfsend.claim_at(
+    &RxDatagram::from_stamp_for_test(family, body, top.wall),
+    top,
+  ))
 }
 
 /// Send once through stage 4 and claim the echo at the next tick's top.
@@ -3820,12 +3831,10 @@ fn a_caller_gap_after_the_claim_window_opened_still_expires_the_credit() {
   let after_the_gap =
     hick_udp::selfsend::ClockPair::new(top.wall + STALL_PAST_TTL, top.mono + STALL_PAST_TTL);
   assert!(
-    !mdns.selfsend.take_at(
-      Family::V4,
-      &body,
-      RxEvidence::from_stamp_for_test(after_the_gap.wall),
-      after_the_gap,
-    ),
+    !consumed(mdns.selfsend.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, &body[..], after_the_gap.wall),
+      after_the_gap
+    )),
     "post-opportunity time is charged in full, caller stalls included, or the \
      false-suppression bound is not a bound"
   );
@@ -3843,7 +3852,7 @@ fn a_caller_gap_after_the_claim_window_opened_still_expires_the_credit() {
 // The upper half of the same invariant, through the real drain. Once a credit's
 // window has opened, `SELF_SEND_TTL` charges elapsed time in full — and the
 // receive stage's own runtime is elapsed time like any other. So the credit is
-// aged against a live read inside `SelfSendTracker::take` and against nothing
+// aged against a live read inside `SelfSendTracker::claim` and against nothing
 // else: the tick's instant stays the protocol `now` for the schedules the core
 // owns, and the datagram's own processing instant — read per datagram for the
 // caller-facing bounds `Endpoint::handle` weighs — is not an age either.
@@ -4011,7 +4020,7 @@ fn a_prompt_claim_inside_the_receive_stage_still_suppresses_our_own_echo() {
 // it reaches the protocol layer as peer traffic: a phantom conflict against
 // ourselves and the RFC 6762 §9 rename that follows.
 //
-// So `SelfSendTracker::take` now takes no instant from anyone and reads the
+// So `SelfSendTracker::claim` takes no instant from anyone and reads the
 // monotonic clock at its own liveness decision. No caller can supply a stale one
 // because no caller can supply one at all.
 //

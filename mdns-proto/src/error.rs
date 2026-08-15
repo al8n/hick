@@ -340,8 +340,7 @@ cfg_heap! {
 
     /// Applying the rename would leave this route sharing a HOST name with
     /// another live route that publishes a different A/AAAA set. Carries the
-    /// host name. See
-    /// [`RegisterServiceError::HostAddressesDiffer`](crate::error::RegisterServiceError::HostAddressesDiffer).
+    /// host name. See [`RegisterServiceError::HostAddressesDiffer`].
     ///
     /// **Not reachable today, and deliberately kept.** A rename replaces a
     /// route's INSTANCE name and touches neither its host name nor its

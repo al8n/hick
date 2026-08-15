@@ -18,7 +18,7 @@ use hick_udp::{
     BoundLink, DestinationWitness, IfaceWitness, admits_ingress, collect_local_subnets,
     is_loopback_interface,
   },
-  selfsend::{ClockPair, RxEvidence, SelfSendTracker},
+  selfsend::{ClockPair, RxDatagram, SelfSendMatch, SelfSendTracker},
 };
 use mdns_proto::{
   FamilyAttempt, Provenance, QueryHandle, QuerySpec, Received, ServiceHandle, ServiceSpec,
@@ -49,15 +49,6 @@ pub(crate) struct BoundSockets<N: Net> {
 /// One inbound packet from a recv subtask.
 struct Packet {
   src: SocketAddr,
-  data: Vec<u8>,
-  /// The socket this datagram was read from, and therefore the ONLY family whose
-  /// self-send credit it can claim: a multicast loopback copy arrives on the
-  /// socket its original was sent from and on no other. Carried from the recv
-  /// task that owns the socket rather than derived from [`Packet::src`] — a
-  /// source address describes the sender, and an IPv4-mapped or otherwise
-  /// unexpected address on either socket would silently key the claim to the
-  /// wrong family. See [`SelfSendTracker::take`].
-  family: Family,
   /// The local receive address the ancillary data named, where it names one:
   /// `ipi_spec_dst` / `ipi6_addr` on the Unix `PKTINFO` squares, and `ipi_addr`
   /// on Windows, whose `IN_PKTINFO` has no `ipi_spec_dst` twin. `UNSPECIFIED`
@@ -77,41 +68,37 @@ struct Packet {
   /// The plain `recv_from` arm of `recv_task` — every target that is neither Unix
   /// nor Windows — declares `Blind` once, and cannot mint the other two.
   iface: IfaceWitness,
-  /// the *kernel* receive timestamp (from `SO_TIMESTAMP(NS)`
-  /// via `RecvMeta::rx_time`) when the OS delivered one, else `None`.
-  /// When present it is the authoritative ordering signal for the
-  /// self-send tracker: a datagram the kernel stamped BEFORE our send
-  /// cannot be our own loopback, so it can't steal that send's credit
-  /// even when read later (behind a bounded packet-pump backlog).
+  /// The datagram itself: its bytes, the family it arrived on, and the kernel
+  /// receive timestamp that orders it against our own sends — one value that
+  /// cannot be taken apart.
   ///
-  /// The absence is carried as an absence, never papered over with a userspace
-  /// read time: a stamp taken when this task got around to the datagram says
-  /// nothing about when the kernel saw it, and handing one over as ordering
-  /// evidence is what
-  /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded) exists to
-  /// refuse.
+  /// All three used to be separate fields (`data`, `family`, and the stamp),
+  /// which made pairing them correctly a convention this struct literal happened
+  /// to keep. It is now a property of the type: [`RxDatagram`] is
+  /// neither `Copy` nor `Clone` and has no stamp accessor, so a stamp a kernel
+  /// really did write — for a *different* receive — cannot be lifted out and laid
+  /// beside these bytes. A later stamp would let a datagram the kernel saw before
+  /// our `sendto` take the credit; an earlier one would reject the genuine echo;
+  /// both end at a phantom RFC 6762 §9 conflict against ourselves.
   ///
-  /// It is an [`RxEvidence`] the whole way from the receive task to the claim,
-  /// built by [`RxEvidence::from_meta`] off the [`hick_udp::RecvMeta`] the
-  /// `recvmsg` produced. That keeps the stamp's ORIGIN structural rather than
-  /// conventional: this driver never holds the stamp as a bare `SystemTime`, so
-  /// no later edit can substitute a read time for it without changing the type.
+  /// The family is half the credit key, and it comes from the recv task that owns
+  /// the socket rather than from [`Packet::src`]: a source address describes the
+  /// sender, and an IPv4-mapped or otherwise unexpected address on either socket
+  /// would silently key the claim to the wrong family. A multicast loopback copy
+  /// arrives on the socket its original left from and on no other.
   ///
-  /// **Which datagram it belongs to is a separate question, and `hick-udp`
-  /// cannot check that one for any form of the evidence.**
-  /// `SelfSendTracker::take` takes the body and the stamp as separate arguments
-  /// and [`RxEvidence`] is `Copy`, so a stamp a kernel really did write — for a
-  /// *different* receive — is weighed at `Ordered` strength all the same. A
-  /// later stamp lets a datagram the kernel saw before our `sendto` take the
-  /// credit; an earlier one rejects the genuine echo. Both end at a phantom
-  /// RFC 6762 §9 conflict against ourselves.
+  /// The stamp's absence is carried as an absence — the Windows and `recv_from`
+  /// arms mint through [`RxDatagram::without_stamp`] — never papered over with a
+  /// userspace read time, which says nothing about when the kernel saw the
+  /// datagram. Such a claim runs under
+  /// [`MatchMode::Degraded`](hick_udp::selfsend::MatchMode::Degraded).
   ///
-  /// Being a FIELD of this struct is what discharges that here. The stamp and
-  /// [`Packet::data`] are filled from one `recv_with_meta` and cross the channel
-  /// as one value, and the claim reads both off that value — so there is no
-  /// point at which one receive's stamp could meet another's payload. See
-  /// [`RxEvidence`] on origin versus association.
-  rx: RxEvidence,
+  /// The body is OWNED, because it crosses a channel: the Unix arm mints against
+  /// the recv task's reused buffer through [`recv_datagram`] and calls
+  /// [`RxDatagram::into_owned`], which is the same copy this driver made with
+  /// `to_vec` before. Owning consumes the datagram rather than copying it, so the
+  /// stamp still has no second value to travel in.
+  rx: RxDatagram<'static>,
   /// What this receive path WITNESSED about the datagram's IP header
   /// **destination** ([`hick_udp::RecvMeta::destination_witness`]). NOT
   /// [`Packet::local_ip`]: on Unix IPv4 that is the receiving interface's own
@@ -684,7 +671,7 @@ impl<N: Net> DriverState<N> {
       #[cfg(feature = "stats")]
       {
         self.stats.packets_rx(1);
-        self.stats.bytes_rx(pkt.data.len() as u64);
+        self.stats.bytes_rx(pkt.rx.body().len() as u64);
         self.stats.packets_dropped(1);
       }
       return;
@@ -699,7 +686,7 @@ impl<N: Net> DriverState<N> {
     // arrives with no credit and is mis-processed as a trusted peer. Drop
     // untrusted responses here so they are never offered a credit. (Queries,
     // QR=0, are exempt — legacy unicast queriers use ephemeral ports.)
-    if packet_is_response(&pkt.data) && pkt.src.port() != hick_udp::constants::MDNS_PORT {
+    if packet_is_response(pkt.rx.body()) && pkt.src.port() != hick_udp::constants::MDNS_PORT {
       hick_trace::debug!(
         src = %pkt.src,
         "dropping untrusted response (source port != 5353) before self-send match"
@@ -710,7 +697,7 @@ impl<N: Net> DriverState<N> {
       #[cfg(feature = "stats")]
       {
         self.stats.packets_rx(1);
-        self.stats.bytes_rx(pkt.data.len() as u64);
+        self.stats.bytes_rx(pkt.rx.body().len() as u64);
         self.stats.packets_dropped(1);
       }
       return;
@@ -734,7 +721,7 @@ impl<N: Net> DriverState<N> {
     // first echo's credit and leave its own owner facing a credit stamped after
     // the kernel saw it.
     //
-    // How much ordering evidence this claim has is DERIVED inside `take`, never
+    // How much ordering evidence this claim has is DERIVED inside `claim`, never
     // declared here: it comes from whether the kernel delivered a receive
     // timestamp, and is weakened per credit when that credit's own wall stamp did
     // not survive a clock step between the send and now. Both fall back to
@@ -747,12 +734,12 @@ impl<N: Net> DriverState<N> {
     // read time taken at this line would order every claim trivially and carry no
     // information about when the kernel saw the datagram.
     //
-    // Only ordering is asked here. The credit's AGE is read inside `take`, at the
-    // decision, because everything between this datagram's arrival and this line
-    // — both admission gates above, the packet-pump backlog, and whatever the
-    // scheduler does among them — is elapsed time the credit must be charged.
+    // Only ordering is asked here. The credit's AGE is read inside `claim`, at
+    // the decision, because everything between this datagram's arrival and this
+    // line — both admission gates above, the packet-pump backlog, and whatever
+    // the scheduler does among them — is elapsed time the credit must be charged.
     // **Only port 5353 may be offered a credit**, and that is this driver's half
-    // of `SelfSendTracker::take`'s contract rather than a local nicety. Both of
+    // of `SelfSendTracker::claim`'s contract rather than a local nicety. Both of
     // this endpoint's sockets bind 5353, so every datagram it sends leaves from
     // that port and every loopback copy arrives from it — a different source port
     // is proof the datagram is not our echo, and it is proof the tracker cannot
@@ -766,8 +753,44 @@ impl<N: Net> DriverState<N> {
     // The reply that querier is owed would never be sent, and the genuine echo
     // behind it would find no credit and reach the protocol layer as peer
     // traffic. The `&&` short-circuits, so such a datagram is never offered one.
-    let caller_is_self = pkt.src.port() == hick_udp::constants::MDNS_PORT
-      && self.selfsend.take(pkt.family, &pkt.data, pkt.rx);
+    //
+    // ── THE TIER THIS DRIVER CAN HONESTLY REPORT ─────────────────────────────
+    //
+    // Three answers, not two, and each is a claim about THIS DRIVER'S OWN SEND
+    // LOG rather than about the network — no platform reports "this is your own
+    // multicast echo".
+    //
+    //  * `Ordered` weighed evidence that the kernel saw this datagram at or
+    //    after our own `sendto`, so nothing else could have put these bytes on
+    //    the wire in between. That is `OwnEcho`, the only tier that suppresses
+    //    everything.
+    //  * `Degraded` matched on content, family and the TTL with NOTHING ordering
+    //    it — and a byte-identical datagram from a conforming RFC 6762 §9
+    //    fault-tolerance twin matches exactly that way, so the claim cannot be
+    //    trusted with a name. `OwnEchoLikely` still declines §10 cache
+    //    population and §7.1/§7.3 quieting, where believing a peer is the more
+    //    harmful error, and it still ADJUDICATES: suppressing a §8.2 proposal
+    //    costs a name permanently and silently, while adjudicating our own echo
+    //    costs at worst §8.2's one-second deferral.
+    //  * `NoCredit` is a negative claim about this log — no credit matched, an
+    //    evicted one included — which is what `NotFromUs` means. So is a source
+    //    port this endpoint never sends from, and that one is decided WITHOUT
+    //    offering a credit at all: the `if` is the short circuit the old `&&`
+    //    was, and it is load-bearing. A §6.7 legacy unicast query from an
+    //    ephemeral port carrying the same bytes as one we just multicast would
+    //    otherwise take that credit under `Degraded` and be reported as our own
+    //    echo — the reply that querier is owed would never be sent, and the
+    //    genuine echo behind it would find no credit and reach the protocol
+    //    layer as a peer's.
+    let provenance = if pkt.src.port() == hick_udp::constants::MDNS_PORT {
+      match self.selfsend.claim(&pkt.rx) {
+        SelfSendMatch::Ordered => Provenance::OwnEcho,
+        SelfSendMatch::Degraded => Provenance::OwnEchoLikely,
+        SelfSendMatch::NoCredit => Provenance::NotFromUs,
+      }
+    } else {
+      Provenance::NotFromUs
+    };
 
     // proto `now` is monotonic; process time is fine for cache TTL /
     // scheduling (the self-loopback ordering used the SystemTime rx stamp
@@ -790,17 +813,9 @@ impl<N: Net> DriverState<N> {
 
     let route_events = match endpoint.handle(
       now,
-      Received::new(
-        pkt.src,
-        &pkt.data,
-        if caller_is_self {
-          Provenance::OwnEcho
-        } else {
-          Provenance::Unknown
-        },
-      )
-      .with_interface(interface_index)
-      .with_local_ip(local_ip),
+      Received::new(pkt.src, pkt.rx.body(), provenance)
+        .with_interface(interface_index)
+        .with_local_ip(local_ip),
     ) {
       Ok(it) => it,
       Err(_e) => {
@@ -3347,32 +3362,28 @@ async fn recv_loop<N: Net>(
       // Data is ready in the socket queue; consume it with PKTINFO.
       use std::os::fd::AsRawFd;
       let fd = sock.as_raw_fd();
-      match hick_udp::recv_with_meta(fd, &mut buf, via_v4) {
-        Ok(meta) => {
+      // `hick-udp` performs this receive, so it also slices the body and reads
+      // the stamp: the length, the buffer and the time are not arguments this
+      // task supplies, and the `buf.get(..n).unwrap_or(&buf)` this line replaced
+      // is gone with them. See `hick_udp::selfsend::recv_datagram`.
+      match hick_udp::selfsend::recv_datagram(fd, &mut buf, family) {
+        Ok((rx, meta)) => {
           // A datagram arrived, so whatever the transient errors were about is
           // over: the backoff starts from zero the next time one appears, and a
           // family reported deaf by the transient budget is receiving again.
           transient_streak = 0;
           health.set(via_v4, false);
-          let n = meta.len();
-          hick_trace::trace!(src = %meta.peer(), len = n, via_v4, "recv datagram");
+          hick_trace::trace!(src = %meta.peer(), len = meta.len(), via_v4, "recv datagram");
           // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
           // on the shared Arc — do NOT bump them here too (double-count).
-          let data = buf.get(..n).unwrap_or(&buf).to_vec();
           let pkt = Packet {
             src: meta.peer(),
-            data,
-            family,
             local_ip: meta.local_ip(),
             iface: meta.iface_witness(),
-            // The evidence is built from the `RecvMeta` this crate's own
-            // `recvmsg` produced, so its ORIGIN is carried by the type: an
-            // absent cmsg stays absent, and there is no step at which a
-            // userspace stamp could be substituted for a kernel one. Which
-            // datagram it belongs to is not carried by the type — it is carried
-            // by this struct literal, which pairs the stamp with the `data`
-            // sliced from that same receive. See `Packet::rx`.
-            rx: RxEvidence::from_meta(&meta),
+            // Owned so it can cross the channel — the same copy `to_vec` made
+            // here before, except that it CONSUMES the datagram, so the stamp
+            // never exists beside a body it did not arrive with. See `Packet::rx`.
+            rx: rx.into_owned(),
             // The two facts §11 selects its fallback arm by, carried rather
             // than discarded — see `Packet::destination`.
             destination: meta.destination_witness(),
@@ -3389,9 +3400,10 @@ async fn recv_loop<N: Net>(
           // still be present; a spurious WouldBlock just means retry.
           continue;
         }
-        // recv_with_meta returns InvalidData for a datagram we must
-        // DROP but keep serving — an oversized/truncated datagram (MSG_TRUNC)
-        // or one with an unparseable source address. The datagram was already
+        // recv_datagram returns InvalidData for a datagram we must
+        // DROP but keep serving — an oversized/truncated datagram (MSG_TRUNC),
+        // one with an unparseable source address, or one whose receive reported
+        // more bytes than the buffer holds. The datagram was already
         // consumed by recvmsg, so drop+log+continue rather than killing the
         // receive task.
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -3510,16 +3522,35 @@ async fn recv_loop<N: Net>(
           health.set(via_v4, false);
           let n = meta.len();
           hick_trace::trace!(src = %meta.peer(), len = n, via_v4, "recv datagram");
+          // A length the receive did not deliver is a DROP, never the whole
+          // buffer and never a truncated report: this arm mints the datagram a
+          // self-send credit is keyed on, so a body longer than what arrived is
+          // hashed into the claim. `WSARecvMsg` is read through `hick-udp`, which
+          // clamps to the buffer it was given, so this is unreachable here — it
+          // is written out because the rule must be the same on every path. See
+          // `hick_udp::selfsend::RxDatagram`, which states it once, and the Unix
+          // arm above, where `recv_datagram` enforces it.
+          let Some(data) = buf.get(..n) else {
+            hick_trace::debug!(
+              via_v4,
+              len = n,
+              buf = buf.len(),
+              "dropping a datagram whose receive reported more bytes than the buffer holds"
+            );
+            #[cfg(feature = "stats")]
+            count_consumed_oversized(&stats, buf.len());
+            continue;
+          };
           // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
           // on the shared Arc — do NOT bump them here too (double-count).
-          let data = buf.get(..n).unwrap_or(&buf).to_vec();
           let pkt = Packet {
             src: meta.peer(),
-            data,
-            family,
             local_ip: meta.local_ip(),
             iface: meta.iface_witness(),
-            rx: RxEvidence::from_meta(&meta),
+            // Windows delivers no receive-timestamp cmsg at all, so the absence
+            // is DECLARED rather than read out of a meta that would always
+            // report `None`. The claim runs under `MatchMode::Degraded`.
+            rx: RxDatagram::without_stamp(family, data.to_vec()),
             destination: meta.destination_witness(),
             delivery: meta.delivery(),
             hop_limit: meta.hop_limit(),
@@ -3592,9 +3623,28 @@ async fn recv_loop<N: Net>(
           transient_streak = 0;
           health.set(via_v4, false);
           hick_trace::trace!(src = %src, len = n, via_v4, "recv datagram");
+          // A length the receive did not deliver is a DROP, never the whole
+          // buffer and never a truncated report — see
+          // `hick_udp::selfsend::RxDatagram`, which states the rule once, and the
+          // Windows arm above, which applies it against a receive `hick-udp`
+          // clamps. This is the arm where it is NOT unreachable: `n` is whatever
+          // the `agnostic-net` implementation reports, and nothing between there
+          // and here bounds it by `buf`. The old `unwrap_or(&buf)` answered with
+          // the whole buffer, so a body longer than the datagram would have been
+          // hashed into the self-send credit and parsed by the protocol layer.
+          let Some(data) = buf.get(..n) else {
+            hick_trace::debug!(
+              via_v4,
+              len = n,
+              buf = buf.len(),
+              "dropping a datagram whose receive reported more bytes than the buffer holds"
+            );
+            #[cfg(feature = "stats")]
+            count_consumed_oversized(&stats, buf.len());
+            continue;
+          };
           // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
           // on the shared Arc — do NOT bump them here too (double-count).
-          let data = buf.get(..n).unwrap_or(&buf).to_vec();
           let local_ip = if via_v4 {
             IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
           } else {
@@ -3602,8 +3652,6 @@ async fn recv_loop<N: Net>(
           };
           let pkt = Packet {
             src,
-            data,
-            family,
             local_ip,
             // A plain `recv_from` recovers no ancillary data at all, so this
             // path declares itself BLIND for both witnesses — once, here, from
@@ -3611,7 +3659,7 @@ async fn recv_loop<N: Net>(
             // there is no cmsg for a kernel to skip and no control buffer of
             // ours to truncate. Same silence `rx` and `hop_limit` carry here.
             iface: IfaceWitness::blind(),
-            rx: RxEvidence::none(),
+            rx: RxDatagram::without_stamp(family, data.to_vec()),
             destination: DestinationWitness::blind(),
             delivery: None,
             hop_limit: None,

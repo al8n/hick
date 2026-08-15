@@ -394,65 +394,79 @@ fn synth_rx_timestamp_cmsg(secs: i64, sub: i64) -> Vec<u8> {
   synth_cmsg(libc::SOL_SOCKET, ty, &payload)
 }
 
-/// The two doors onto a receive stamp must return the same evidence for the
-/// same bytes.
+/// The control-buffer door onto a receive stamp must recover what the shared
+/// parser reads, and a claim minted through it must run ORDERED.
 ///
-/// [`RxEvidence::from_meta`] serves a driver that receives through this crate;
-/// [`RxEvidence::from_cmsgs`] serves one that owns its own `recvmsg` and holds
-/// only the control buffer. They exist so no driver has to decode
-/// `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS` for itself — which is worth nothing if the
-/// second door drops the stamp or reads it differently, and neither failure is
-/// visible from outside: `RxEvidence` is opaque, and a lost stamp only weakens a
-/// claim to `Degraded` rather than breaking anything a test would notice.
+/// [`RxDatagram::from_recv_parts`] is the door for a driver that owns its own
+/// `recvmsg` and holds only the control buffer, and it exists so no such driver
+/// has to decode `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS` for itself. That is worth
+/// nothing if the door drops the stamp, and dropping it is INVISIBLE from
+/// outside: there is no stamp accessor, and a lost stamp only weakens a claim to
+/// `Degraded` rather than breaking anything a shape assertion would notice. The
+/// strength a claim runs at is therefore the observable, and the control below
+/// is what keeps this about the stamp rather than about the credit matching at
+/// all.
 ///
-/// Note what this test does to run at all: it **synthesizes** the buffer. That
-/// is the plain demonstration that `from_cmsgs` cannot tell a kernel's control
-/// buffer from an encoded one, and why its documentation states the origin of
-/// the bytes as an obligation on the caller rather than as something checked
-/// here.
+/// Note what this test does to run: it **synthesizes** the buffer. That is the
+/// plain demonstration that this door cannot tell a kernel's control buffer from
+/// an encoded one, and why its documentation states the origin of the bytes as
+/// an obligation on the caller rather than as something checked here.
 #[cfg(has_recv_timestamp)]
 #[test]
-fn rx_evidence_from_cmsgs_carries_the_same_stamp_as_from_meta() {
-  use crate::selfsend::RxEvidence;
+fn a_datagram_minted_from_a_timestamp_cmsg_claims_with_ordering_evidence() {
+  use std::time::{Duration, Instant as StdInstant};
+
+  use crate::{
+    Family,
+    selfsend::{ClockPair, RxDatagram, SelfSendMatch, SelfSendTracker},
+  };
 
   let buf = synth_rx_timestamp_cmsg(1_700_000_000, 123_456);
   let stamp = parse_rx_time(&buf).expect("a well-formed timestamp cmsg must parse");
-  // The witnesses are BLIND rather than absent-for-a-reason, and that is the
-  // honest filler: this `RecvMeta` exists only to carry the stamp to
-  // `RxEvidence::from_meta`, and RFC 6762 §11 reads neither witness on this
-  // path. A `Lost` or `Declined` here would assert something about a kernel that
-  // never ran.
-  let meta = RecvMeta::new(
-    0,
-    std::net::SocketAddr::from(([127, 0, 0, 1], 5353)),
-    std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-    crate::onlink::DestinationWitness::blind(),
-    crate::onlink::IfaceWitness::blind(),
-    Some(stamp),
-  );
+
+  // One credit, sent a second before the stamp encoded in that buffer, claimed
+  // on a clock that has not stepped: a stamp the door recovered is at-or-after
+  // the send and orders the echo, so the claim reports `Ordered`.
+  let body = b"the datagram this credit was recorded for";
+  let sent = ClockPair::new(stamp - Duration::from_secs(1), StdInstant::now());
+  let now = ClockPair::new(sent.wall, sent.mono);
+
+  let mut t = SelfSendTracker::new();
+  t.record(Family::V4, body, sent);
+  t.seal_at(sent.mono);
   assert_eq!(
-    RxEvidence::from_cmsgs(&buf),
-    RxEvidence::from_meta(&meta),
-    "the control-buffer door must carry the stamp the RecvMeta door carries"
+    t.claim_at(
+      &RxDatagram::from_recv_parts(Family::V4, &body[..], &buf),
+      now
+    ),
+    SelfSendMatch::Ordered,
+    "the control-buffer door must recover the stamp the shared parser reads"
   );
-  assert_ne!(
-    RxEvidence::from_cmsgs(&buf),
-    RxEvidence::none(),
-    "a buffer that does carry a timestamp must not degrade to no evidence"
+
+  // The control: the same credit and the same bytes, with no control buffer.
+  t.record(Family::V4, body, sent);
+  t.seal_at(sent.mono);
+  assert_eq!(
+    t.claim_at(&RxDatagram::without_stamp(Family::V4, &body[..]), now),
+    SelfSendMatch::Degraded,
+    "and without one there is no ordering evidence to weigh at all"
   );
 }
 
 /// A buffer with nothing in it — or nothing this crate can read — degrades
-/// rather than inventing a stamp. `none()` is the safe answer: it costs only the
-/// ordering arm of the match.
+/// rather than inventing a stamp. Degrading is the safe answer: it costs only
+/// the ordering arm of the match.
+///
+/// Asserted through `parse_rx_time`, which is the whole of what
+/// [`RxDatagram::from_recv_parts`] does with the buffer, because the datagram
+/// itself exposes no stamp to compare. The test above is what pins that the mint
+/// really does route the buffer through this parser.
 #[test]
-fn rx_evidence_from_cmsgs_degrades_on_a_buffer_with_no_timestamp() {
-  use crate::selfsend::RxEvidence;
-
-  assert_eq!(RxEvidence::from_cmsgs(&[]), RxEvidence::none());
+fn the_cmsg_parser_degrades_on_a_buffer_with_no_timestamp() {
+  assert_eq!(parse_rx_time(&[]), None);
   assert_eq!(
-    RxEvidence::from_cmsgs(&synth_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4])),
-    RxEvidence::none(),
+    parse_rx_time(&synth_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4])),
+    None,
     "a cmsg that is not a receive timestamp must not be read as one"
   );
 }
@@ -476,7 +490,7 @@ fn rx_evidence_from_cmsgs_degrades_on_a_buffer_with_no_timestamp() {
 #[cfg(has_recv_timestamp)]
 #[test]
 fn absurd_timestamp_cmsg_does_not_panic() {
-  use crate::selfsend::RxEvidence;
+  use crate::{Family, selfsend::RxDatagram};
 
   for buf in [
     // Absurd in both fields; the sub-second gate is what declines it.
@@ -495,7 +509,7 @@ fn absurd_timestamp_cmsg_does_not_panic() {
     }
     // And the constructor a driver actually reaches must absorb it identically,
     // since that is the path a completion-based driver's buffer takes.
-    let _ = RxEvidence::from_cmsgs(&buf);
+    let _ = RxDatagram::from_recv_parts(Family::V4, &b"body"[..], &buf);
   }
 }
 

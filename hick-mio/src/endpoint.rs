@@ -863,7 +863,7 @@ fn alloc_buf(size: usize, setting: &'static str) -> Result<Vec<u8>, ServerError>
 /// Deleting the parameter is the fix rather than moving the read: a parameter is
 /// the channel, and every caller that has one will eventually pass the one it
 /// happens to be holding. Same shape as
-/// [`SelfSendTracker::take`](hick_udp::selfsend::SelfSendTracker::take).
+/// [`SelfSendTracker::claim`](hick_udp::selfsend::SelfSendTracker::claim).
 pub(crate) fn begin_service_withdrawal(
   endpoint: &mut ProtoEndpoint,
   services: &mut HashMap<ServiceHandle, ServiceCtx>,
