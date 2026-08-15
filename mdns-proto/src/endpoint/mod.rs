@@ -37,7 +37,8 @@ use crate::{
   config::{EndpointConfig, QuerySpec, ServiceSpec},
   error::{
     CancelQueryError, HandleError, HandleServiceRenamedError, HandleTimeoutError,
-    RegisterServiceError, StartQueryError, StorageFullError, TransmitError,
+    RegisterServiceError, ServiceTypeNotParentDetail, StartQueryError, StorageFullError,
+    TransmitError,
   },
   event::{
     ConflictHistory, ConflictOrigin, ConflictRole, EndpointEvent, HostConflict, KnownAnswer,

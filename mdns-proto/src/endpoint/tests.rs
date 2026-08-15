@@ -9039,6 +9039,102 @@ fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
   }
 }
 
+// ── service_type must be the parent label sequence of instance ───────────
+
+fn spec_with_names(service_type: &str, instance: &str) -> ServiceSpec {
+  let stype = Name::try_from_str(service_type).unwrap();
+  let inst = Name::try_from_str(instance).unwrap();
+  let host = Name::try_from_str("h.local.").unwrap();
+  ServiceSpec::new(ServiceRecords::new(stype, inst, host, 631, 120))
+}
+
+/// A service type unrelated to the instance name would publish a PTR whose
+/// owner the instance's SRV does not belong to — internally inconsistent on
+/// the wire. `ServiceRecords::new` documents the parent-label-sequence
+/// requirement but cannot enforce it (it is an infallible constructor), so
+/// registration is where it is caught.
+#[test]
+fn registration_rejects_a_service_type_that_is_not_the_instance_parent() {
+  let mut e = build_endpoint();
+  let err = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    spec_with_names("_http._tcp.local.", "MyPrinter._ipp._tcp.local."),
+    StdInstant::now(),
+  ) {
+    Ok(_) => panic!("an unrelated service type must be rejected"),
+    Err(e) => e,
+  };
+  assert!(
+    matches!(
+      &err,
+      RegisterServiceError::ServiceTypeNotParent(d)
+        if d.service_type().as_str() == "_http._tcp.local."
+        && d.instance().as_str() == "myprinter._ipp._tcp.local."
+    ),
+    "expected ServiceTypeNotParent, got {err:?}"
+  );
+  assert!(
+    e.services.iter().next().is_none(),
+    "a rejected registration must reserve no name"
+  );
+}
+
+/// RFC 6763 §4.1.1 stores `<Instance>` as a SINGLE DNS label, so a Service
+/// Instance Name has EXACTLY one label more than its service type — never two
+/// or more. Two extra labels is not a valid instance of that service type
+/// even though `service_type` names a real suffix of it.
+#[test]
+fn registration_rejects_an_instance_with_more_than_one_extra_label() {
+  let mut e = build_endpoint();
+  let err = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    spec_with_names("_ipp._tcp.local.", "a.b._ipp._tcp.local."),
+    StdInstant::now(),
+  ) {
+    Ok(_) => panic!("two extra labels is not a single <Instance> label"),
+    Err(e) => e,
+  };
+  assert!(
+    matches!(err, RegisterServiceError::ServiceTypeNotParent(_)),
+    "expected ServiceTypeNotParent, got {err:?}"
+  );
+}
+
+/// The guard must not reject a spelling that differs only in CASE — RFC 6762
+/// §16 makes DNS names case-insensitive, so a stricter-than-the-wire check
+/// here would be a regression for a caller who spells their service type in
+/// another case than their instance name's suffix.
+#[test]
+fn registration_accepts_a_case_differing_service_type() {
+  let mut e = build_endpoint();
+  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    spec_with_names("_IPP._TCP.LOCAL.", "MyPrinter._ipp._tcp.local."),
+    StdInstant::now(),
+  )
+  .expect("a case-differing service type is the same owner on the wire");
+}
+
+/// Nor may it reject a spelling that differs only in the optional trailing
+/// root dot — `device.local` and `device.local.` are one DNS owner (see
+/// [`Name::same_owner`]), and this guard extends that same rule to the
+/// parent/child relation.
+#[test]
+fn registration_accepts_a_trailing_dot_differing_service_type() {
+  let mut e = build_endpoint();
+  // service_type has no trailing dot; instance's parent portion does.
+  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    spec_with_names("_ipp._tcp.local", "MyPrinter._ipp._tcp.local."),
+    StdInstant::now(),
+  )
+  .expect("a trailing-dot-differing service type is the same owner on the wire");
+
+  let mut e2 = build_endpoint();
+  // The reverse: service_type has a trailing dot, the instance's does not.
+  e2.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    spec_with_names("_ipp._tcp.local.", "MyPrinter._ipp._tcp.local"),
+    StdInstant::now(),
+  )
+  .expect("a trailing-dot-differing service type is the same owner on the wire");
+}
+
 /// A withdrawal item whose goodbye owns PTR/SRV/TXT, so its per-family resend
 /// budget is non-zero and the spend / keep / write-off table is actually
 /// exercised. Returns the handle and the item's token.
@@ -11992,13 +12088,17 @@ fn an_incumbents_labelled_defence_defers_a_successor_whose_instance_is_its_host(
   let now = StdInstant::now();
   let mut e = build_endpoint();
   // ONE name, worn as both roles — the configuration the fan-out's ordering
-  // comment calls pathological and routes for anyway.
-  let shared = Name::try_from_str("h.local.").unwrap();
+  // comment calls pathological and routes for anyway. Still a valid instance
+  // of `register_service_with_a`'s hardcoded `_ipp._tcp.local.` service type
+  // (RFC 6763 §4.1.1: one label above it), which is what lets it ALSO serve
+  // as its own SRV target.
+  let shared = Name::try_from_str("h._ipp._tcp.local.").unwrap();
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
   // `A` announced `A1` under that name and gave it up.
-  let (a_handle, a_svc) = register_service_with_a(&mut e, "h.local.", "h.local.", a1);
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "h._ipp._tcp.local.", "h._ipp._tcp.local.", a1);
   let snap = announced_snapshot(a_svc.records(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(
@@ -12100,12 +12200,16 @@ fn an_incumbents_labelled_defence_defers_a_successor_whose_instance_is_its_host(
 fn an_incumbents_labelled_address_reverts_a_successor_whose_instance_is_its_host() {
   let now = StdInstant::now();
   let mut e = build_endpoint();
-  let shared = Name::try_from_str("h.local.").unwrap();
+  // Valid instance of `register_service_with_a`'s hardcoded `_ipp._tcp.local.`
+  // service type (RFC 6763 §4.1.1: one label above it), which is what lets it
+  // ALSO serve as its own SRV target below.
+  let shared = Name::try_from_str("h._ipp._tcp.local.").unwrap();
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
   // `A` announced `A1` under the one name it wears as both roles, and gave it up.
-  let (a_handle, a_svc) = register_service_with_a(&mut e, "h.local.", "h.local.", a1);
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "h._ipp._tcp.local.", "h._ipp._tcp.local.", a1);
   let snap = announced_snapshot(a_svc.records(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(
@@ -12198,12 +12302,16 @@ fn an_incumbents_labelled_address_reverts_a_successor_whose_instance_is_its_host
 fn a_labelled_address_this_service_publishes_is_no_conflict_at_a_shared_name() {
   let now = StdInstant::now();
   let mut e = build_endpoint();
-  let shared = Name::try_from_str("h.local.").unwrap();
+  // Valid instance of `register_service_with_a`'s hardcoded `_ipp._tcp.local.`
+  // service type (RFC 6763 §4.1.1: one label above it), which is what lets it
+  // ALSO serve as its own SRV target below.
+  let shared = Name::try_from_str("h._ipp._tcp.local.").unwrap();
   let addr = Ipv4Addr::new(192, 168, 1, 5);
 
   // `A` announced this address at the shared name and gave it up, so the address
   // is this endpoint's own history…
-  let (a_handle, a_svc) = register_service_with_a(&mut e, "h.local.", "h.local.", addr);
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "h._ipp._tcp.local.", "h._ipp._tcp.local.", addr);
   let snap = announced_snapshot(a_svc.records(), &[addr]);
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(

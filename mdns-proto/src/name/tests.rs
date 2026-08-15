@@ -231,3 +231,48 @@ fn same_owner_ignores_the_optional_root_dot() {
   // …and a shorter name is not a prefix match.
   assert!(!dotted.same_owner(&Name::try_from_str("local.").unwrap()));
 }
+
+/// RFC 6763 §4.1: a Service Instance Name is
+/// `<Instance> . <Service> . <Domain>`, and §4.1.1 stores `<Instance>` as a
+/// SINGLE DNS label — so a service type is the parent of an instance only
+/// when the instance has EXACTLY one label more, never zero and never two
+/// or more.
+#[test]
+fn is_parent_of_requires_exactly_one_more_label() {
+  let service_type = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let instance = Name::try_from_str("MyPrinter._ipp._tcp.local.").unwrap();
+  assert!(service_type.is_parent_of(&instance));
+  // Not symmetric: the child is not the parent of its own parent.
+  assert!(!instance.is_parent_of(&service_type));
+  // A name is not its own parent (zero extra labels).
+  assert!(!service_type.is_parent_of(&service_type));
+  // Two extra labels is not "the parent label sequence" — RFC 6763 §4.1.1
+  // allows exactly one <Instance> label, not a multi-label prefix.
+  let two_extra = Name::try_from_str("a.b._ipp._tcp.local.").unwrap();
+  assert!(!service_type.is_parent_of(&two_extra));
+  // An unrelated name, even with the right label count, is not a match.
+  let unrelated = Name::try_from_str("MyPrinter._http._tcp.local.").unwrap();
+  assert!(!service_type.is_parent_of(&unrelated));
+}
+
+/// The RFC 6762 §16 case-insensitivity and the optional trailing root dot
+/// both apply to `is_parent_of` exactly as they do to [`Name::same_owner`] —
+/// a caller must not be able to register past this guard with a spelling
+/// that would collide with an already-accepted one on the wire.
+#[test]
+fn is_parent_of_ignores_case_and_the_optional_root_dot() {
+  let lower = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let upper = Name::try_from_str("_IPP._TCP.LOCAL.").unwrap();
+  let instance = Name::try_from_str("MyPrinter._ipp._tcp.local.").unwrap();
+  let instance_no_dot = Name::try_from_str("MyPrinter._ipp._tcp.local").unwrap();
+
+  assert!(lower.is_parent_of(&instance));
+  // Case-folded at construction, so this only proves the comparison itself
+  // does not depend on that invariant (belt-and-braces, like `same_owner`).
+  assert!(upper.is_parent_of(&instance));
+  // A trailing root dot on either name, or neither, is the same owner.
+  assert!(lower.is_parent_of(&instance_no_dot));
+  let service_type_no_dot = Name::try_from_str("_ipp._tcp.local").unwrap();
+  assert!(service_type_no_dot.is_parent_of(&instance));
+  assert!(service_type_no_dot.is_parent_of(&instance_no_dot));
+}

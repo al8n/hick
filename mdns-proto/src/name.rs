@@ -195,6 +195,38 @@ impl Name {
     }
     trim(self.as_str()).eq_ignore_ascii_case(trim(other.as_str()))
   }
+
+  /// Is `self` the immediate PARENT label sequence of `other` — does `other`
+  /// consist of exactly one label followed by `self`?
+  ///
+  /// This is RFC 6763 §4.1's Service Instance Name structure,
+  /// `<Instance> . <Service> . <Domain>`: §4.1.1 stores `<Instance>` "directly
+  /// in the DNS as a single DNS label", so a well-formed instance name always
+  /// has EXACTLY one label more than its `<Service>.<Domain>` service type —
+  /// never zero (that would make them the same owner) and never two or more
+  /// (that would need a multi-label `<Instance>`, which §4.1.1 does not
+  /// allow). `self.is_parent_of(other)` asks exactly that: drop `other`'s
+  /// first label, and ask whether what remains is the same owner as `self`.
+  ///
+  /// Case-insensitive per label and blind to the optional trailing root dot on
+  /// either side, extending [`Self::same_owner`]'s rule from whole-name
+  /// equality to this one-label-shorter suffix relation rather than
+  /// duplicating it.
+  pub fn is_parent_of(&self, other: &Self) -> bool {
+    fn trim(s: &str) -> &str {
+      match s.strip_suffix('.') {
+        Some(rest) => rest,
+        None => s,
+      }
+    }
+    match trim(other.as_str()).split_once('.') {
+      // `rest` is everything after `other`'s first label — for `self` to be
+      // the immediate parent, that must be exactly `self`.
+      Some((_first_label, rest)) => trim(self.as_str()).eq_ignore_ascii_case(rest),
+      // `other` has only one label: no room for a parent above it.
+      None => false,
+    }
+  }
 }
 
 impl core::fmt::Display for Name {

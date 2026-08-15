@@ -272,6 +272,34 @@ pub enum HandleError {
 }
 
 cfg_heap! {
+  /// Detail payload for [`RegisterServiceError::ServiceTypeNotParent`].
+  #[derive(Debug, Clone, Eq, PartialEq, Hash, Display, thiserror::Error)]
+  #[display("service type `{service_type}` is not the parent label sequence of instance `{instance}`")]
+  pub struct ServiceTypeNotParentDetail {
+    service_type: Name,
+    instance: Name,
+  }
+
+  impl ServiceTypeNotParentDetail {
+    /// Creates a new detail payload.
+    #[inline(always)]
+    pub const fn new(service_type: Name, instance: Name) -> Self {
+      Self { service_type, instance }
+    }
+
+    /// The registration's declared service type.
+    #[inline(always)]
+    pub fn service_type(&self) -> &Name {
+      &self.service_type
+    }
+
+    /// The registration's instance name.
+    #[inline(always)]
+    pub fn instance(&self) -> &Name {
+      &self.instance
+    }
+  }
+
   /// Errors raised by `Endpoint::try_register_service`.
   #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
   #[unwrap(ref)]
@@ -308,6 +336,18 @@ cfg_heap! {
     /// record cannot be kept alive at a legal rate. Carries the rejected TTL.
     #[error("record TTL {0} s is below the {min} s minimum a service can be advertised at", min = crate::constants::MIN_SERVICE_TTL_SECS)]
     TtlTooSmall(u32),
+
+    /// `service_type` is not the parent label sequence of `instance`.
+    ///
+    /// RFC 6763 §4.1: a Service Instance Name is
+    /// `<Instance> . <Service> . <Domain>`, and §4.1.1 stores `<Instance>` as
+    /// a single DNS label — so a valid `instance` always has EXACTLY one
+    /// label more than its `service_type`. The comparison is
+    /// case-insensitive and blind to the optional trailing root dot on either
+    /// name, the same rule [`Name::same_owner`] applies to whole-name
+    /// equality (see `Name::is_parent_of`).
+    #[error(transparent)]
+    ServiceTypeNotParent(ServiceTypeNotParentDetail),
 
     /// The internal routing pool is full.
     #[error(transparent)]

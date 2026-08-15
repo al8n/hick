@@ -136,6 +136,14 @@ where
   /// clamped — silently publishing a service at a lifetime the caller did not ask
   /// for is the kind of surprise a registration API should not hand back.
   ///
+  /// Returns [`RegisterServiceError::ServiceTypeNotParent`] if `service_type`
+  /// is not the parent label sequence of `instance` — i.e. `instance` is not
+  /// exactly one label longer than `service_type` (case-insensitively, and
+  /// blind to the optional trailing root dot on either name). RFC 6763 §4.1: a
+  /// Service Instance Name is `<Instance> . <Service> . <Domain>`, and §4.1.1
+  /// stores `<Instance>` as a single DNS label, so this can only ever be
+  /// EXACTLY one label — never zero, never several.
+  ///
   /// Returns [`RegisterServiceError::HostAddressesDiffer`] if a live route
   /// already publishes this host name with a different A or AAAA set. **Two live
   /// services may share a host name, but where both publish an RRtype they must
@@ -174,6 +182,24 @@ where
     let ttl_secs = spec.records().ttl_secs();
     if ttl_secs < crate::constants::MIN_SERVICE_TTL_SECS {
       return Err(RegisterServiceError::TtlTooSmall(ttl_secs));
+    }
+    // `service_type` must be the parent label sequence of `instance`
+    // (`ServiceRecords::new` documents this but is an infallible constructor
+    // and cannot enforce it itself) — rejected before the name is reserved,
+    // same as the TTL above. Otherwise the PTR this service answers for
+    // points into a service type its own SRV owner does not belong to: a
+    // registration that is internally inconsistent on the wire.
+    if !spec
+      .records()
+      .service_type()
+      .is_parent_of(spec.records().instance())
+    {
+      return Err(RegisterServiceError::ServiceTypeNotParent(
+        ServiceTypeNotParentDetail::new(
+          spec.records().service_type().clone(),
+          spec.records().instance().clone(),
+        ),
+      ));
     }
     // Reject duplicate names. DNS-name equality, not string equality: a name
     // differing only in the optional trailing root dot is the SAME owner on the

@@ -63,7 +63,10 @@ impl ServiceRecords {
   /// (records, txt, priority, weight) start empty/default.
   ///
   /// `service_type` is the DNS-SD PTR owner, e.g. `_ipp._tcp.local.`.
-  /// It must be the parent label sequence of `instance`.
+  /// It must be the parent label sequence of `instance`. This constructor is
+  /// infallible and does not check that itself — it is enforced at
+  /// registration, by
+  /// [`Endpoint::try_register_service`](crate::endpoint::Endpoint::try_register_service).
   pub fn new(service_type: Name, instance: Name, host: Name, port: u16, ttl_secs: u32) -> Self {
     Self {
       service_type,
