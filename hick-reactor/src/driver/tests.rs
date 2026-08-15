@@ -1,8 +1,21 @@
 use super::*;
-// The tracker's public bounds. Its clock seams (`take_at`, `seal_at`, `len`)
+// The tracker's public bounds. Its clock seams (`claim_at`, `seal_at`, `len`)
 // come with the `test-support` feature this crate carries in `dev-dependencies`
 // only, so a claim or a loop top can be placed without sleeping to it.
 use hick_udp::selfsend::{MAX_SELF_SEND_ENTRIES, SELF_SEND_TTL, WALL_STEP_TOLERANCE};
+
+/// Whether a claim consumed a credit at all, at either strength.
+///
+/// A test whose subject is the take-once bookkeeping — which credit was
+/// consumed, which survived — says so through this, so the tier tests stay the
+/// only place a strength is asserted and a change to one is not lost in the
+/// other. It is deliberately NOT a method on `SelfSendMatch`: a driver mapping
+/// an echo onto a trust tier must read the variant, and a public flattener is
+/// exactly the collapse the tier exists to prevent.
+fn consumed(m: SelfSendMatch) -> bool {
+  !matches!(m, SelfSendMatch::NoCredit)
+}
+
 // Every caller of this import and the three helpers below is a `#[cfg(feature
 // = "tokio")]` test (they drive the driver via `agnostic_net::tokio::Net`), so
 // all four are gated the same way rather than compiled — and reported dead —
@@ -146,11 +159,9 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
   // response — must be dropped before it can be offered the credit.
   let untrusted = Packet {
     src: "192.0.2.9:40000".parse().unwrap(),
-    data: body.clone(),
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("192.0.2.9:40000".parse().unwrap()),
-    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+    rx: RxDatagram::from_stamp_for_test(Family::V4, body.clone(), SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -167,11 +178,9 @@ async fn untrusted_response_does_not_burn_self_send_credit() {
   // The genuine loopback from port 5353 passes the gate and consumes it.
   let loopback = Packet {
     src: "192.0.2.9:5353".parse().unwrap(),
-    data: body,
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
-    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+    rx: RxDatagram::from_stamp_for_test(Family::V4, body, SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -217,11 +226,9 @@ fn pre_drop_short_qr1_counts_rx_and_dropped_exactly_once() {
   // Source port ≠ 5353 → untrusted-response pre-drop path; §11 admits it.
   let pkt = Packet {
     src: "192.0.2.7:40000".parse().unwrap(),
-    data: body,
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("192.0.2.7:40000".parse().unwrap()),
-    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+    rx: RxDatagram::from_stamp_for_test(Family::V4, body, SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -281,11 +288,9 @@ fn pre_drop_untrusted_qr1_response_counts_rx_and_dropped_exactly_once() {
 
   let pkt = Packet {
     src: "192.0.2.8:54321".parse().unwrap(), // non-5353 → untrusted
-    data: body,
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("192.0.2.8:54321".parse().unwrap()),
-    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+    rx: RxDatagram::from_stamp_for_test(Family::V4, body, SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -339,11 +344,9 @@ fn pre_drop_off_link_datagram_counts_rx_and_dropped_exactly_once() {
 
   let pkt = Packet {
     src: "203.0.113.5:5353".parse().unwrap(),
-    data: body,
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("203.0.113.5:5353".parse().unwrap()),
-    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+    rx: RxDatagram::from_stamp_for_test(Family::V4, body, SystemTime::now()),
     destination: DestinationWitness::blind(),
     delivery: None,
     hop_limit: Some(64), // carried, never read — see the doc above
@@ -594,11 +597,9 @@ fn ingress_admits(a: Arrival, subnets: &[(IpAddr, u8)], bound_is_loopback: bool)
 
   state.handle_packet(Packet {
     src: a.src,
-    data: body,
-    family: a.family,
     local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     iface: a.iface,
-    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+    rx: RxDatagram::from_stamp_for_test(a.family, body, SystemTime::now()),
     destination: a.destination,
     delivery: a.delivery,
     hop_limit: a.hop_limit,
@@ -948,11 +949,9 @@ fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
     let before = state.selfsend.len();
     state.handle_packet(Packet {
       src,
-      data: body,
-      family: Family::V4,
       local_ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
       iface: ingress_bound_witness(),
-      rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+      rx: RxDatagram::from_stamp_for_test(Family::V4, body, SystemTime::now()),
       destination: DestinationWitness::blind(),
       delivery: None,
       hop_limit: None,
@@ -1283,11 +1282,9 @@ fn a_receive_path_that_recovers_nothing_still_admits_an_in_subnet_peer() {
   // What the no-ancillary-data arm of `recv_task` builds.
   state.handle_packet(Packet {
     src,
-    data: body,
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     iface: packet_iface_witness(src),
-    rx: RxEvidence::none(),
+    rx: RxDatagram::without_stamp(Family::V4, body),
     destination: DestinationWitness::blind(),
     delivery: None,
     hop_limit: None,
@@ -1536,11 +1533,17 @@ fn self_send_consume_once() {
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"hello", sent);
   let now = claim(sent, Duration::from_millis(1));
-  let rx = RxEvidence::from_stamp_for_test(now.wall);
+  let rx = now.wall;
   // The loopback the kernel stamped at-or-after our send is matched and consumed.
-  assert!(tracker.take_at(Family::V4, b"hello", rx, now));
+  assert!(consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"hello"[..], rx),
+    now
+  )));
   // A second byte-identical datagram finds no credit -> treated as a peer's.
-  assert!(!tracker.take_at(Family::V4, b"hello", rx, now));
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"hello"[..], rx),
+    now
+  )));
   assert!(tracker.is_empty());
 }
 
@@ -1550,10 +1553,16 @@ fn self_send_distinct_payloads_do_not_match() {
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"alpha", sent);
   let now = claim(sent, Duration::from_millis(1));
-  let rx = RxEvidence::from_stamp_for_test(now.wall);
-  assert!(!tracker.take_at(Family::V4, b"beta", rx, now));
+  let rx = now.wall;
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"beta"[..], rx),
+    now
+  )));
   // The unrelated credit is left intact for its own loopback.
-  assert!(tracker.take_at(Family::V4, b"alpha", rx, now));
+  assert!(consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"alpha"[..], rx),
+    now
+  )));
 }
 
 #[test]
@@ -1567,12 +1576,10 @@ fn self_send_expires_after_ttl() {
   // Past the TTL on the MONOTONIC half, which is the only clock the age is
   // measured on; the wall half moves with it so nothing here is a step.
   let too_late = claim(sent, SELF_SEND_TTL + Duration::from_millis(1));
-  assert!(!tracker.take_at(
-    Family::V4,
-    b"hello",
-    RxEvidence::from_stamp_for_test(too_late.wall),
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"hello"[..], too_late.wall),
     too_late
-  ));
+  )));
   tracker.seal_at(too_late.mono);
   assert!(
     tracker.is_empty(),
@@ -1582,12 +1589,10 @@ fn self_send_expires_after_ttl() {
   recorded_and_sealed(&mut tracker, Family::V4, b"other", too_late);
   assert_eq!(tracker.len(), 1);
   let now = claim(too_late, Duration::from_millis(1));
-  assert!(tracker.take_at(
-    Family::V4,
-    b"other",
-    RxEvidence::from_stamp_for_test(now.wall),
+  assert!(consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"other"[..], now.wall),
     now
-  ));
+  )));
 }
 
 #[test]
@@ -1599,16 +1604,17 @@ fn self_send_peer_before_our_send_cannot_steal_credit() {
   let mut tracker = SelfSendTracker::new();
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"probe", sent);
-  let peer_rx = RxEvidence::from_stamp_for_test(sent.wall - Duration::from_millis(500));
-  assert!(!tracker.take_at(Family::V4, b"probe", peer_rx, sent));
+  let peer_rx = sent.wall - Duration::from_millis(500);
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"probe"[..], peer_rx),
+    sent
+  )));
   // Our genuine loopback arrives at-or-after the send and is matched.
   let now = claim(sent, Duration::from_millis(1));
-  assert!(tracker.take_at(
-    Family::V4,
-    b"probe",
-    RxEvidence::from_stamp_for_test(now.wall),
+  assert!(consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"probe"[..], now.wall),
     now
-  ));
+  )));
 }
 
 // On microsecond `timeval` sources (Apple/BSD) RX_TIMESTAMP_GRAIN is 1µs, so a
@@ -1623,21 +1629,17 @@ fn self_send_ordered_tolerates_microsecond_truncation() {
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"trunc", sent);
   let truncated_rx = sent.wall - (hick_udp::RX_TIMESTAMP_GRAIN - Duration::from_nanos(1));
-  assert!(tracker.take_at(
-    Family::V4,
-    b"trunc",
-    RxEvidence::from_stamp_for_test(truncated_rx),
+  assert!(consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"trunc"[..], truncated_rx),
     sent
-  ));
+  )));
 
   recorded_and_sealed(&mut tracker, Family::V4, b"trunc", sent);
   let too_early = sent.wall - (hick_udp::RX_TIMESTAMP_GRAIN + Duration::from_micros(4));
-  assert!(!tracker.take_at(
-    Family::V4,
-    b"trunc",
-    RxEvidence::from_stamp_for_test(too_early),
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"trunc"[..], too_early),
     sent
-  ));
+  )));
 }
 
 // On nanosecond `SO_TIMESTAMPNS` (Linux/Android) the kernel timestamp is exact,
@@ -1652,20 +1654,16 @@ fn self_send_ordered_nanosecond_rejects_pre_send() {
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"probe", sent);
   let pre_send = sent.wall - Duration::from_nanos(500);
-  assert!(!tracker.take_at(
-    Family::V4,
-    b"probe",
-    RxEvidence::from_stamp_for_test(pre_send),
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"probe"[..], pre_send),
     sent
-  ));
+  )));
   // The credit survives the non-match; our genuine loopback (at-or-after the
   // send) is still matched.
-  assert!(tracker.take_at(
-    Family::V4,
-    b"probe",
-    RxEvidence::from_stamp_for_test(sent.wall),
+  assert!(consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"probe"[..], sent.wall),
     sent
-  ));
+  )));
 }
 
 /// Degraded matching is reached by presenting NO kernel receive stamp, and it
@@ -1683,12 +1681,18 @@ fn self_send_degraded_matches_take_once_within_ttl() {
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"win", sent);
   let now = claim(sent, Duration::from_millis(10));
-  assert!(tracker.take_at(Family::V4, b"win", RxEvidence::none(), now));
+  assert!(consumed(tracker.claim_at(
+    &RxDatagram::without_stamp(Family::V4, &b"win"[..]),
+    now
+  )));
   // Take-once: the credit is gone. A byte-identical PEER datagram read next
   // would now be treated as a peer's — and, conversely, a pre-buffered peer
   // datagram read first could consume this credit. That credit-theft exposure is
   // the documented degradation when no kernel rx timestamp is available.
-  assert!(!tracker.take_at(Family::V4, b"win", RxEvidence::none(), now));
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::without_stamp(Family::V4, &b"win"[..]),
+    now
+  )));
 }
 
 #[test]
@@ -1698,7 +1702,10 @@ fn self_send_degraded_expires_after_ttl() {
   let sent = send_stamps();
   recorded_and_sealed(&mut tracker, Family::V4, b"win", sent);
   let too_late = claim(sent, SELF_SEND_TTL + Duration::from_millis(1));
-  assert!(!tracker.take_at(Family::V4, b"win", RxEvidence::none(), too_late));
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::without_stamp(Family::V4, &b"win"[..]),
+    too_late
+  )));
 }
 
 #[test]
@@ -1711,12 +1718,24 @@ fn self_send_dual_stack_records_two_entries() {
   recorded_and_sealed(&mut tracker, Family::V6, b"resp", sent);
   assert_eq!(tracker.len(), 2);
   let now = claim(sent, Duration::from_millis(1));
-  let rx = RxEvidence::from_stamp_for_test(now.wall);
-  assert!(tracker.take_at(Family::V4, b"resp", rx, now));
-  assert!(tracker.take_at(Family::V6, b"resp", rx, now));
+  let rx = now.wall;
+  assert!(consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"resp"[..], rx),
+    now
+  )));
+  assert!(consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V6, &b"resp"[..], rx),
+    now
+  )));
   // Both credits are spent; a third copy on either family is a peer's.
-  assert!(!tracker.take_at(Family::V4, b"resp", rx, now));
-  assert!(!tracker.take_at(Family::V6, b"resp", rx, now));
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V4, &b"resp"[..], rx),
+    now
+  )));
+  assert!(!consumed(tracker.claim_at(
+    &RxDatagram::from_stamp_for_test(Family::V6, &b"resp"[..], rx),
+    now
+  )));
 }
 
 #[test]
@@ -1737,13 +1756,19 @@ fn self_send_cap_declines_without_evicting_live_entries() {
   assert_eq!(tracker.len(), MAX_SELF_SEND_ENTRIES);
 
   let now = claim(sent, Duration::from_millis(1));
-  let rx = RxEvidence::from_stamp_for_test(now.wall);
+  let rx = now.wall;
   assert!(
-    !tracker.take_at(Family::V4, b"overflow", rx, now),
+    !consumed(tracker.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, &b"overflow"[..], rx),
+      now
+    )),
     "the would-be new credit was refused, never admitted"
   );
   assert!(
-    tracker.take_at(Family::V4, b"live", rx, now),
+    consumed(tracker.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, &b"live"[..], rx),
+      now
+    )),
     "and a resident LIVE credit is still claimable by its own loopback"
   );
 }
@@ -1779,10 +1804,13 @@ fn self_send_wall_step_no_longer_makes_us_ingest_our_own_echo_as_a_peer() {
   let stepped = ClockPair::new(sent.wall - STEP, sent.mono + Duration::from_millis(1));
   // The kernel stamped our own echo on the far side of the step, so it reads as
   // predating the send it is the echo OF.
-  let rx = RxEvidence::from_stamp_for_test(stepped.wall + Duration::from_millis(1));
+  let rx = stepped.wall + Duration::from_millis(1);
 
   assert!(
-    tracker.take_at(Family::V4, b"announce", rx, stepped),
+    consumed(tracker.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, &b"announce"[..], rx),
+      stepped
+    )),
     "the credit's wall stamp is not on the timeline this receive stamp was taken \
      on, so the ordering evidence must be discarded rather than weighed — \
      weighing it refuses our own echo and renames this service under §9"
@@ -1811,7 +1839,10 @@ fn self_send_ttl_is_monotonic_so_a_wall_step_neither_expires_nor_resurrects() {
   recorded_and_sealed(&mut tracker, Family::V4, b"probe", sent);
   let wall_far_ahead = ClockPair::new(sent.wall + HOURS, sent.mono + Duration::from_millis(1));
   assert!(
-    tracker.take_at(Family::V4, b"probe", RxEvidence::none(), wall_far_ahead),
+    consumed(tracker.claim_at(
+      &RxDatagram::without_stamp(Family::V4, &b"probe"[..]),
+      wall_far_ahead
+    )),
     "a wall clock that stepped hours forward is not hours of elapsed time; \
      ageing on it would expire a credit whose echo is still in flight"
   );
@@ -1826,7 +1857,10 @@ fn self_send_ttl_is_monotonic_so_a_wall_step_neither_expires_nor_resurrects() {
     sent.mono + SELF_SEND_TTL + Duration::from_millis(1),
   );
   assert!(
-    !tracker.take_at(Family::V4, b"probe", RxEvidence::none(), mono_expired),
+    !consumed(tracker.claim_at(
+      &RxDatagram::without_stamp(Family::V4, &b"probe"[..]),
+      mono_expired
+    )),
     "real elapsed time is past the TTL, so these bytes are a co-resident peer's \
      and not our echo; no wall-clock reading may resurrect the credit"
   );
@@ -5096,11 +5130,9 @@ async fn a_credit_sealed_before_the_park_expires_across_it_and_cannot_suppress_a
   // port 5353 and on-link, offered to the production receive path.
   state.handle_packet(Packet {
     src: "192.0.2.9:5353".parse().unwrap(),
-    data: body.clone(),
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
-    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+    rx: RxDatagram::from_stamp_for_test(Family::V4, body.clone(), SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -5175,11 +5207,9 @@ async fn the_seal_predates_the_park_and_the_generation_proves_it() {
   // must be the one the boundary recorded.
   state.handle_packet(Packet {
     src: "192.0.2.9:5353".parse().unwrap(),
-    data: body.clone(),
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
-    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+    rx: RxDatagram::from_stamp_for_test(Family::V4, body.clone(), SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -5267,11 +5297,9 @@ async fn a_receive_reached_without_parking_is_not_weighed_against_a_stale_park()
   // no park entry runs — and the next iteration's packet pump receives this.
   state.handle_packet(Packet {
     src: "192.0.2.9:5353".parse().unwrap(),
-    data: vec![0u8; 12],
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
-    rx: RxEvidence::from_stamp_for_test(SystemTime::now()),
+    rx: RxDatagram::from_stamp_for_test(Family::V4, vec![0u8; 12], SystemTime::now()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -5327,11 +5355,9 @@ async fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
   // send and content plus family plus the TTL is the whole of the match.
   let ephemeral = Packet {
     src: "192.0.2.9:40000".parse().unwrap(),
-    data: body.clone(),
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("192.0.2.9:40000".parse().unwrap()),
-    rx: RxEvidence::none(),
+    rx: RxDatagram::without_stamp(Family::V4, body.clone()),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
@@ -5350,11 +5376,9 @@ async fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
   // arriving from 5353 are our echo and claim it.
   state.handle_packet(Packet {
     src: "192.0.2.9:5353".parse().unwrap(),
-    data: body,
-    family: Family::V4,
     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
     iface: packet_iface_witness("192.0.2.9:5353".parse().unwrap()),
-    rx: RxEvidence::none(),
+    rx: RxDatagram::without_stamp(Family::V4, body),
     // A multicast echo carries the group destination, which is what §11 admits
     // it on now that the inbound TTL is not a test.
     destination: DestinationWitness::Witnessed(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),

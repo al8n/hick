@@ -7,10 +7,32 @@ use std::{
 use mio::{Interest, Poll, Token};
 
 use super::{
-  BIND_LOCK, Family, MAX_DISCARDED_PER_RECV, MAX_RECV_ERRORS_PER_ROUND, Mask, RecvRotor,
-  SendOutcome, SendReport, Sockets, Ungated, max_udp_payload,
+  BIND_LOCK, Family, MAX_DISCARDED_PER_RECV, MAX_RECV_ERRORS_PER_ROUND, Mask, RecvMeta, RecvRotor,
+  RecvStep, SendOutcome, SendReport, Sockets, Ungated, max_udp_payload,
 };
 use crate::options::ServerOptions;
+
+/// Drain the next datagram, stepping [`Sockets::recv_once`] the way
+/// [`Mdns::drain_recv`](crate::driver::Mdns) does — the retry loop production
+/// runs, so these tests still cover every arm of it.
+///
+/// The body comes back OWNED, and that is the whole reason this is a helper
+/// rather than a method on `Sockets`: a borrowed one would tie the receive
+/// buffer to the caller's lifetime, which is exactly the borrow that cannot be
+/// re-taken by a loop's next attempt. A copy costs nothing in a test.
+fn recv_next(socks: &mut Sockets, buf: &mut [u8]) -> Option<(Vec<u8>, RecvMeta, Family)> {
+  let mut discarded = 0usize;
+  loop {
+    match socks.recv_once(buf, &mut discarded) {
+      RecvStep::Datagram(rx, meta) => {
+        let family = rx.family();
+        return Some((rx.into_body().into_owned(), meta, family));
+      }
+      RecvStep::Retry => {}
+      RecvStep::Idle => return None,
+    }
+  }
+}
 
 /// The IPv4 mDNS group: the destination every proto-layer multicast transmit
 /// carries, and therefore the one that triggers the dual-stack fan-out.
@@ -289,7 +311,7 @@ fn recv_with_nothing_pending_returns_none() {
     .expect("register");
   let mut buf = vec![0u8; 2048];
   // No readiness recorded -> nothing to drain.
-  assert!(socks.recv(&mut buf).is_none());
+  assert!(recv_next(&mut socks, &mut buf).is_none());
   socks.deregister().expect("deregister");
 }
 
@@ -348,15 +370,15 @@ fn readiness_is_recorded_then_cleared_by_draining_to_wouldblock() {
   let mut buf = vec![0u8; 2048];
   let mut ours = None;
   let mut drained = 0usize;
-  while let Some((meta, family)) = socks.recv(&mut buf) {
+  while let Some((body, meta, family)) = recv_next(&mut socks, &mut buf) {
     drained += 1;
     assert_eq!(family, Family::V4, "only the v4 family is bound");
-    // Still flagged: `recv` clears only once the kernel says WouldBlock.
+    // Still flagged: the drain clears only once the kernel says WouldBlock.
     assert!(
       socks.has_readable(),
       "the flag must survive a successful recv"
     );
-    if meta.len() == 4 && buf.get(..4) == Some(&b"ping"[..]) {
+    if body == b"ping" {
       ours = Some(meta);
     }
     assert!(drained < 64, "the socket never drained to WouldBlock");
@@ -1305,7 +1327,7 @@ fn a_truncated_datagram_bumps_packets_rx_bytes_rx_and_packets_dropped() {
   // `recv` loops internally past a truncated entry rather than returning it
   // (see its own doc comment) and may end up returning `None` here — what
   // matters is only that the counters moved, not this call's return value.
-  let _ = socks.recv(&mut small_buf);
+  let _ = recv_next(&mut socks, &mut small_buf);
 
   let after = socks.stats.snapshot();
   assert!(
@@ -1396,7 +1418,7 @@ fn recv_consults_and_advances_the_family_rotor() {
   let mut buf = vec![0u8; 2048];
   // Nothing is actually pending, so this drains straight to `WouldBlock` — but
   // it selected v4 on the way, and it is the selection that must rotate.
-  assert!(socks.recv(&mut buf).is_none());
+  assert!(recv_next(&mut socks, &mut buf).is_none());
   assert_eq!(
     socks.recv_rotor_next_for_test(),
     Family::V6,
@@ -1431,7 +1453,7 @@ fn a_failed_receive_rearm_brings_the_caller_back_with_nothing_queued() {
   socks.force_rearm_error_for_test(Family::V4, true);
   socks.set_readable_for_test(Family::V4, true);
   let mut buf = vec![0u8; 2048];
-  assert!(socks.recv(&mut buf).is_none());
+  assert!(recv_next(&mut socks, &mut buf).is_none());
 
   assert!(
     !socks.has_readable(),
@@ -1529,10 +1551,10 @@ fn seed_one_datagram(socks: &mut Sockets, poll: &mut Poll, body: &[u8]) -> bool 
 fn drain_for(socks: &mut Sockets, body: &[u8]) -> bool {
   let mut buf = vec![0u8; 2048];
   for _ in 0..MAX_DISCARDED_PER_RECV {
-    let Some((meta, _)) = socks.recv(&mut buf) else {
+    let Some((received, _, _)) = recv_next(socks, &mut buf) else {
       return false;
     };
-    if buf.get(..meta.len()) == Some(body) {
+    if received == body {
       return true;
     }
   }
@@ -1596,7 +1618,7 @@ fn repeated_receive_errors_retain_readiness_and_escalate_the_backoff() {
   let mut buf = vec![0u8; 2048];
 
   socks.begin_recv_round();
-  assert!(socks.recv(&mut buf).is_none());
+  assert!(recv_next(&mut socks, &mut buf).is_none());
   assert!(
     socks.is_readable_for_test(Family::V4),
     "the kernel queue was never proved empty, so the flag must survive"
@@ -1623,7 +1645,7 @@ fn repeated_receive_errors_retain_readiness_and_escalate_the_backoff() {
     socks.has_readable(),
     "the retry happens: the family is selectable again"
   );
-  assert!(socks.recv(&mut buf).is_none());
+  assert!(recv_next(&mut socks, &mut buf).is_none());
   assert_eq!(
     socks.recv_error_backoff_level(),
     2,
@@ -1634,7 +1656,7 @@ fn repeated_receive_errors_retain_readiness_and_escalate_the_backoff() {
   // and everything resets.
   socks.begin_recv_round();
   socks.force_recv_errors_for_test(Family::V4, 0);
-  assert!(socks.recv(&mut buf).is_none());
+  assert!(recv_next(&mut socks, &mut buf).is_none());
   assert!(
     !socks.is_readable_for_test(Family::V4),
     "WouldBlock is what clears readiness"
@@ -1667,7 +1689,7 @@ fn a_permanent_receive_error_gives_up_on_the_family() {
   let mut buf = vec![0u8; 2048];
 
   socks.begin_recv_round();
-  assert!(socks.recv(&mut buf).is_none());
+  assert!(recv_next(&mut socks, &mut buf).is_none());
   assert_eq!(
     socks.deaf_families(),
     (true, false),
@@ -1686,7 +1708,7 @@ fn a_permanent_receive_error_gives_up_on_the_family() {
   // A fresh round does not resurrect it, which is the whole difference from the
   // transient path.
   socks.begin_recv_round();
-  assert!(socks.recv(&mut buf).is_none());
+  assert!(recv_next(&mut socks, &mut buf).is_none());
   assert_eq!(socks.deaf_families(), (true, false));
   assert_eq!(socks.recv_error_backoff_level(), 0);
   socks.deregister().expect("deregister");
@@ -1703,7 +1725,7 @@ fn a_transient_receive_error_never_marks_the_family_deaf() {
   socks.force_recv_errors_for_test(Family::V4, u32::MAX);
   let mut buf = vec![0u8; 2048];
   socks.begin_recv_round();
-  assert!(socks.recv(&mut buf).is_none());
+  assert!(recv_next(&mut socks, &mut buf).is_none());
   assert_eq!(socks.deaf_families(), (false, false));
 }
 

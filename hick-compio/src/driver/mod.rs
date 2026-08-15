@@ -14,7 +14,7 @@ use core::{
 use hick_trace::*;
 use hick_udp::{
   onlink::{BoundLink, admits_ingress},
-  selfsend::{ClockPair, SelfSendTracker},
+  selfsend::{ClockPair, RxDatagram, SelfSendMatch, SelfSendTracker},
 };
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
@@ -1221,14 +1221,14 @@ impl State {
     best
   }
 
-  /// Apply §11 + self-send + `proto.handle` for one datagram received on
-  /// `family`.
+  /// Apply §11 + self-send + `proto.handle` for one received datagram.
   ///
   /// The §11 on-link gate lives in [`hick_udp::onlink`]; the take-once self-send
-  /// classification lives in [`hick_udp::selfsend`]. `family` is the socket this
-  /// datagram was read off, threaded down from the `select!` arm that read it
-  /// rather than derived from the peer address: it is half the credit key, and
-  /// only the receive site knows it for certain.
+  /// classification lives in [`hick_udp::selfsend`]. The family is the socket
+  /// this datagram was read off, and it travels inside `rx` — put there by the
+  /// `select!` arm that armed the receive rather than derived from the peer
+  /// address: it is half the credit key, and only the receive site knows it for
+  /// certain.
   /// The park entry: check that the seal this iteration relies on has already
   /// happened, and record WHICH seal it was so [`Self::handle_datagram`] can
   /// prove it predated the park.
@@ -1246,12 +1246,8 @@ impl State {
     self.sealed_generation_at_park = self.selfsend.seal_generation();
   }
 
-  pub(crate) fn handle_datagram(
-    &mut self,
-    family: Family,
-    meta: &crate::socket::RecvMeta,
-    data: &[u8],
-  ) {
+  pub(crate) fn handle_datagram(&mut self, meta: &crate::socket::RecvMeta, rx: &RxDatagram<'_>) {
+    let data = rx.body();
     // Defence in depth, and deliberately NOT the proof of placement: by the time
     // this runs the park is over, so "nothing is unsealed" is equally true of a
     // driver that sealed before parking and one that sealed in its receive arm
@@ -1434,22 +1430,30 @@ impl State {
     // echo read can consume the first echo's credit and leave its own owner
     // facing a credit stamped after the kernel saw it.
     //
-    // How much ordering evidence the claim has is DERIVED inside `take`, never
+    // How much ordering evidence the claim has is DERIVED inside `claim`, never
     // declared here. A kernel receive timestamp orders the echo against the send,
     // which is what stops a byte-identical peer datagram the kernel saw BEFORE
     // our `sendto` from stealing the credit; its absence is handed over as an
     // absence rather than papered over with a userspace `SystemTime::now()`,
-    // which says nothing about when the kernel saw the datagram. `take` then
+    // which says nothing about when the kernel saw the datagram. `claim` then
     // weakens the mode per credit when that credit's own wall stamp did not
     // survive a clock step between the send and here — the stamp is no longer on
     // the timeline the receive stamp was taken on, and refusing the credit on it
     // would make this endpoint ingest its own announcement as peer traffic.
     //
-    // The credit's AGE is a separate question, read inside `take` at the decision
-    // and on the monotonic clock only. See `SelfSendTracker::take`.
+    // All three — family, body and stamp — travel inside `rx`, which is why the
+    // claim takes one argument. It is neither `Copy` nor `Clone` and exposes no
+    // stamp, so a stamp from a different receive has no way to reach these
+    // bytes. This driver owns its `recv_msg`, so `hick-udp` still cannot check
+    // that the control buffer the stamp came out of is a kernel's — that
+    // obligation stays, discharged at `Socket::recv`'s mint, one statement
+    // adjacent to the syscall with both buffers in scope.
+    //
+    // The credit's AGE is a separate question, read inside `claim` at the
+    // decision and on the monotonic clock only. See `SelfSendTracker::claim`.
     //
     // **Only port 5353 may be offered a credit**, and that is this driver's half
-    // of `SelfSendTracker::take`'s contract rather than a local nicety. Both of
+    // of `SelfSendTracker::claim`'s contract rather than a local nicety. Both of
     // this endpoint's sockets bind 5353, so every datagram it sends leaves from
     // that port and every loopback copy arrives from it — a different source port
     // is proof the datagram is not our echo, and it is proof the tracker cannot
@@ -1463,8 +1467,44 @@ impl State {
     // The reply that querier is owed would never be sent, and the genuine echo
     // behind it would find no credit and reach the protocol layer as peer
     // traffic. The `&&` short-circuits, so such a datagram is never offered one.
-    let caller_is_self = meta.peer().port() == hick_udp::constants::MDNS_PORT
-      && self.selfsend.take(family, data, meta.rx_evidence());
+    //
+    // ── THE TIER THIS DRIVER CAN HONESTLY REPORT ───────────────────────────
+    //
+    // Three answers, not two, and each is a claim about THIS DRIVER'S OWN SEND
+    // LOG rather than about the network — no platform reports "this is your
+    // own multicast echo".
+    //
+    //  * `Ordered` weighed evidence that the kernel saw this datagram at or
+    //    after our own `sendto`, so nothing else could have put these bytes on
+    //    the wire in between. That is `OwnEcho`, the only tier that suppresses
+    //    everything.
+    //  * `Degraded` matched on content, family and the TTL with NOTHING
+    //    ordering it — and a byte-identical datagram from a conforming RFC 6762
+    //    §9 fault-tolerance twin matches exactly that way, so the claim cannot
+    //    be trusted with a name. `OwnEchoLikely` still declines §10 cache
+    //    population and §7.1/§7.3 quieting, where believing a peer is the more
+    //    harmful error, and it still ADJUDICATES: suppressing a §8.2 proposal
+    //    costs a name permanently and silently, while adjudicating our own echo
+    //    costs at worst §8.2's one-second deferral.
+    //  * `NoCredit` is a negative claim about this log — no credit matched, an
+    //    evicted one included — which is what `NotFromUs` means. So is a source
+    //    port this endpoint never sends from, and that one is decided WITHOUT
+    //    offering a credit at all: the `if` is the short circuit the old `&&`
+    //    was, and it is load-bearing. A §6.7 legacy unicast query from an
+    //    ephemeral port carrying the same bytes as one we just multicast would
+    //    otherwise take that credit under `Degraded` and be reported as our own
+    //    echo — the reply that querier is owed would never be sent, and the
+    //    genuine echo behind it would find no credit and reach the protocol
+    //    layer as a peer's.
+    let provenance = if meta.peer().port() == hick_udp::constants::MDNS_PORT {
+      match self.selfsend.claim(rx) {
+        SelfSendMatch::Ordered => Provenance::OwnEcho,
+        SelfSendMatch::Degraded => Provenance::OwnEchoLikely,
+        SelfSendMatch::NoCredit => Provenance::NotFromUs,
+      }
+    } else {
+      Provenance::NotFromUs
+    };
 
     // Use a process-monotonic `now` for proto scheduling; the kernel receive
     // stamp above is ordering evidence for the self-send credit and nothing else.
@@ -1489,15 +1529,7 @@ impl State {
 
     let route_events = match endpoint.handle(
       now,
-      Received::new(
-        meta.peer(),
-        data,
-        if caller_is_self {
-          Provenance::OwnEcho
-        } else {
-          Provenance::Unknown
-        },
-      )
+      Received::new(meta.peer(), data, provenance)
       // A ROUTING hint only — the §11 trust decision was made against the
       // witness itself, which is why the absent case is `None` here rather than
       // the `0` `RecvMeta::interface_index` flattens three absences onto.
@@ -2066,30 +2098,30 @@ pub(crate) async fn run(
     let mut woke_state = false;
     match (sock_v4.as_ref(), sock_v6.as_ref()) {
       (Some(s4), Some(s6)) => {
-        let r4 = s4.recv(max_recv).fuse();
-        let r6 = s6.recv(max_recv).fuse();
+        let r4 = s4.recv(max_recv, Family::V4).fuse();
+        let r6 = s6.recv(max_recv, Family::V6).fuse();
         futures::pin_mut!(r4, r6);
         futures::select! {
-          r = r4 => { handle_recv(&inner, Family::V4, r); woke_state = true; }
-          r = r6 => { handle_recv(&inner, Family::V6, r); woke_state = true; }
+          r = r4 => { handle_recv(&inner, r); woke_state = true; }
+          r = r6 => { handle_recv(&inner, r); woke_state = true; }
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
           _ = notify_fut => {}
         }
       }
       (Some(s4), None) => {
-        let r4 = s4.recv(max_recv).fuse();
+        let r4 = s4.recv(max_recv, Family::V4).fuse();
         futures::pin_mut!(r4);
         futures::select! {
-          r = r4 => { handle_recv(&inner, Family::V4, r); woke_state = true; }
+          r = r4 => { handle_recv(&inner, r); woke_state = true; }
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
           _ = notify_fut => {}
         }
       }
       (None, Some(s6)) => {
-        let r6 = s6.recv(max_recv).fuse();
+        let r6 = s6.recv(max_recv, Family::V6).fuse();
         futures::pin_mut!(r6);
         futures::select! {
-          r = r6 => { handle_recv(&inner, Family::V6, r); woke_state = true; }
+          r = r6 => { handle_recv(&inner, r); woke_state = true; }
           _ = timer_fut => { inner.state.borrow_mut().fire_timeouts(StdInstant::now()); woke_state = true; }
           _ = notify_fut => {}
         }
@@ -3006,17 +3038,17 @@ async fn drain_withdrawals(
   budget_stopped
 }
 
-/// Route one completed receive from the socket bound to `family`.
+/// Route one completed receive.
 ///
-/// `family` travels down from the `select!` arm that produced `r` rather than
-/// being recovered from the peer address: it is half the self-send credit key
-/// (see [`State::handle_datagram`]), and the arm is the only place that knows
-/// which socket was read.
+/// The family travels INSIDE the datagram, put there by the `select!` arm that
+/// armed the receive rather than recovered from the peer address: it is half the
+/// self-send credit key (see [`State::handle_datagram`]), and the arm is the
+/// only place that knows which socket was read.
 #[inline]
-fn handle_recv(inner: &Rc<EndpointInner>, family: Family, r: std::io::Result<(Vec<u8>, RecvMeta)>) {
+fn handle_recv(inner: &Rc<EndpointInner>, r: std::io::Result<(RxDatagram<'static>, RecvMeta)>) {
   match r {
-    Ok((data, meta)) => {
-      trace!(src = %meta.peer(), len = data.len(), truncated = meta.truncated(), "recv datagram");
+    Ok((rx, meta)) => {
+      trace!(src = %meta.peer(), len = rx.body().len(), truncated = meta.truncated(), "recv datagram");
       if meta.truncated() {
         // The datagram exceeded `max_recv_packet_size` (it overflowed the
         // one-byte sentinel the recv buffer is over-allocated by), so the
@@ -3029,14 +3061,14 @@ fn handle_recv(inner: &Rc<EndpointInner>, family: Family, r: std::io::Result<(Ve
         // an incomplete message. Do NOT call handle_datagram.
         debug!(
           src = %meta.peer(),
-          len = data.len(),
+          len = rx.body().len(),
           "dropping truncated (oversized) datagram before proto routing"
         );
         #[cfg(feature = "stats")]
         {
           let s = inner.state.borrow();
           s.stats.packets_rx(1);
-          s.stats.bytes_rx(data.len() as u64);
+          s.stats.bytes_rx(rx.body().len() as u64);
           s.stats.packets_dropped(1);
         }
         return;
@@ -3044,7 +3076,7 @@ fn handle_recv(inner: &Rc<EndpointInner>, family: Family, r: std::io::Result<(Ve
       // NOTE: packets_rx / bytes_rx are bumped by ProtoEndpoint::handle()
       // on the shared Arc — do NOT bump them here too (double-count).
       let mut s = inner.state.borrow_mut();
-      s.handle_datagram(family, &meta, &data);
+      s.handle_datagram(&meta, &rx);
     }
     Err(_e) => {
       // A generic recv error is a socket/driver failure — NOT a consumed-and-

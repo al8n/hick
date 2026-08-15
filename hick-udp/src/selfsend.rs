@@ -10,7 +10,7 @@
 //! peer, not swallowed as our own echo.
 //!
 //! Every credit is keyed to the **address family it was sent on** — see
-//! [`SelfSendTracker::take`] for the dual-stack echo race that makes
+//! [`SelfSendTracker::claim`] for the dual-stack echo race that makes
 //! content-and-time matching alone insufficient.
 //!
 //! # One implementation, because three drifted
@@ -28,6 +28,16 @@
 //! fourth copy of this one. The `no_std` stacks are exactly that case: they own
 //! their IP stack, match on exact bytes, and cannot have a [`SystemTime`] at
 //! all.
+//!
+//! # The evidence travels with its datagram
+//!
+//! A claim weighs a body against a stamp, and the two are only worth anything
+//! together: a genuine kernel stamp belonging to some *other* receive is weighed
+//! at full strength against whatever body it arrives beside. [`RxDatagram`] is
+//! that pair — family, body and stamp in one value that cannot be taken apart —
+//! and [`SelfSendTracker::claim`] accepts nothing else. [`recv_datagram`] mints
+//! one by performing the receive itself, so on the paths that can use it no
+//! caller chooses a length or a time at all.
 
 // The invariants this module turns on live in its private half — the two-stamp
 // `Credit`, the expiry-ordered `entries`, the derivation in `evidence_mode`.
@@ -36,7 +46,10 @@
 // to satisfy the link checker would put internal seams into this crate's API.
 #![allow(rustdoc::private_intra_doc_links)]
 
-use std::time::{Duration, Instant as StdInstant, SystemTime};
+use std::{
+  borrow::Cow,
+  time::{Duration, Instant as StdInstant, SystemTime},
+};
 
 use crate::{Family, RX_TIMESTAMP_GRAIN, RecvMeta};
 
@@ -182,225 +195,359 @@ pub const MAX_SELF_SEND_ENTRIES: usize = 65536;
 /// which is by far the more common condition.
 pub const WALL_STEP_TOLERANCE: Duration = Duration::from_millis(50);
 
-/// What a claim is TOLD about **when the kernel saw** the datagram being
-/// weighed. Told, not shown: see the two questions below for which half of that
-/// this crate can check and which half it takes on the caller's word.
+/// One received datagram **and** the evidence about when the kernel saw it, in a
+/// value that cannot be taken apart.
 ///
-/// [`SelfSendTracker::take`] takes one of these rather than a bare
-/// [`SystemTime`] because the two things a `SystemTime` could be are not
-/// interchangeable and the tracker cannot tell them apart by looking. A kernel
-/// receive timestamp orders the datagram against our `sendto`. A userspace read
-/// time — taken when the driver got round to the buffer — orders nothing: it is
-/// at-or-after our send whatever the datagram is, so weighing it as ordering
-/// evidence grants [`MatchMode::Ordered`] strength to a value that carries no
-/// order, which is the credit-theft race `Ordered` exists to close.
+/// **Association is a property of this type, not an obligation on the caller.**
+/// Is this stamp the stamp for the bytes it is being weighed against? Here the
+/// question cannot be asked wrongly: [`SelfSendTracker::claim`] takes one value,
+/// and the three facts inside it came from one receive. There is nothing to
+/// pair, so there is no pairing to get wrong.
 ///
-/// # Two questions, and no constructor here answers the second
+/// # NOT `Copy`, and NOT `Clone`
 ///
-/// **Origin** — did a kernel write this stamp, or did something else? — and
-/// **association** — is it the stamp for the datagram it is about to be weighed
-/// against? A claim is only as good as both. They are separate properties, one
-/// constructor settles origin, and *none* of them settles association.
-///
-/// ## Origin: one of them this crate can check
-///
-/// The rest are the caller's word, and the list says which is which because
-/// that difference is the only thing standing between a claim and the
-/// credit-theft race above.
-///
-/// * [`Self::from_meta`] — **origin checked here**. [`RecvMeta`] has no public
-///   constructor, so outside this crate the only way to obtain one is this
-///   crate's own `recvmsg` and cmsg parse. A caller cannot fabricate it, and
-///   cannot mistake a read time for one. That is the whole of what it settles:
-///   the stamp came from a receive this crate performed, not that it came from
-///   the receive now being claimed.
-/// * [`Self::none`] — **nothing to be wrong about**, on either question. The
-///   platform delivered no timestamp cmsg, and an absence carries no order to
-///   misattribute.
-/// * `from_cmsgs` — **a contract this crate cannot check**, for a driver that
-///   owns its own `recvmsg` and therefore its own control buffer. This crate
-///   performs the *parse*, which is worth having on its own — one reading of
-///   `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS` instead of one per driver — but it
-///   cannot tell a buffer a kernel just filled from a buffer a caller encoded,
-///   and a caller who encodes one gets ordering evidence for whatever value is
-///   in it. See that constructor. Unix only, hence backticks rather than a
-///   link.
-/// * `from_stamp_for_test` — **the same contract, stated in one line instead of
-///   a buffer**, behind `test-support` and out of every default build.
-///
-/// So the type does not make ordering evidence unforgeable, and no version of it
-/// short of this crate owning the receive syscall could: whatever a driver hands
-/// over — a time, a byte buffer, a token — is something the driver produced, and
-/// this crate is not present at the `recvmsg` that would make it true. What the
-/// type does is keep the checked case and the promised cases apart, and force
-/// the promised ones to be named at the call site rather than reached by
-/// passing a `SystemTime` that happened to be lying around.
-///
-/// ## Association: the caller's obligation, in EVERY form
-///
-/// Owning the receive syscall would not settle this one either, because the
-/// coupling that would settle it is missing from the signature:
-/// [`SelfSendTracker::take`] takes the evidence and the body as **separate
-/// arguments**, and both this type and [`RecvMeta`] are [`Copy`]. A stamp this
-/// crate itself minted, off a receive that really happened, can therefore be
-/// weighed against a *different* datagram — nothing in the types couples the
-/// two, and nothing here can notice. `from_meta` shuts the fabrication door and
-/// leaves this one open.
-///
-/// Both directions are live, and neither costs merely a lost byte:
+/// Deliberately, and it is the whole mechanism rather than an oversight. A stamp
+/// that cannot be lifted out of its datagram cannot be laid beside another one.
+/// The three-argument claim this replaced weighed the family, the body and the
+/// evidence independently, over `Copy` evidence and a `Copy` [`RecvMeta`], which
+/// is what made a stamp from one receive weighable against another receive's
+/// body — both directions live, and neither costing merely a lost byte:
 ///
 /// * a stamp from a **later** receive lets a byte-identical datagram the kernel
 ///   saw *before* our `sendto` pass the ordering test and take the take-once
 ///   credit. A real peer's datagram is then swallowed as our loopback — so a
 ///   conflict it carried is never seen — and our own echo, finding no credit
-///   left, reaches the protocol layer as peer traffic instead;
-/// * a stamp from an **earlier** receive rejects the genuine echo, which
-///   reaches the protocol layer as peer traffic for the other reason. Either
-///   way it is a phantom RFC 6762 §9 conflict against ourselves and the rename
-///   that follows.
+///   left, reaches the protocol layer as peer traffic;
+/// * a stamp from an **earlier** receive rejects the genuine echo, which reaches
+///   the protocol layer as peer traffic for the other reason.
 ///
-/// **The evidence handed to a claim must be the stamp from the very receive
-/// that produced that body.** Discharge it structurally — carry stamp and
-/// payload together out of the receive that produced them, as the drivers in
-/// this workspace do — rather than by lining them up at the call. Making the
-/// signature carry the coupling is a breaking change and is deferred to the
-/// next major version; until then this is a contract, not a check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RxEvidence(Option<SystemTime>);
+/// Either way it is a phantom RFC 6762 §9 conflict against ourselves and the
+/// rename that follows. **Neither is reachable now**, and that is what the
+/// missing traits buy. There is also no public accessor for the stamp: it is
+/// read by [`SelfSendTracker::claim`] and by nothing else, so it has no path out
+/// of the datagram it arrived with.
+///
+/// The absence of `Clone` is the whole mechanism, so it is pinned rather than
+/// stated — this does not compile, and a derive added later would make it:
+///
+/// ```compile_fail
+/// fn assert_clone<T: Clone>() {}
+/// // `Copy` requires `Clone`, so refusing this refuses both.
+/// assert_clone::<hick_udp::selfsend::RxDatagram<'static>>();
+/// ```
+///
+/// # What it does NOT settle: origin
+///
+/// The second question — did a KERNEL write this stamp? — is untouched, and it
+/// stays an obligation because nothing here can discharge it. Where this crate
+/// performs the receive itself ([`recv_datagram`]) origin is a property of the
+/// call, and there is nothing left for a caller to get wrong on those paths at
+/// all. Where a driver performs its own, [`RxDatagram::from_recv_parts`] parses
+/// the caller's control buffer and **cannot tell a buffer a kernel filled from a
+/// buffer a caller encoded**.
+///
+/// **What changes there is distance, not enforcement, and it is worth being
+/// precise about how much.** `hick-compio` is completion-based: it submits its
+/// own `recv_msg` and owns the control buffer that comes back, so this crate is
+/// not present at its receive and `from_recv_parts` remains a caller contract
+/// there — stated as one, in that driver, at the one statement that has to be
+/// right. But the obligation shrinks from one that spans a mint, a struct field,
+/// a channel and a claim to one statement adjacent to the syscall with both
+/// buffers already in scope. Getting it wrong is not a lost byte: a stamp that
+/// does not order the datagram against our `sendto` still runs the claim at
+/// [`MatchMode::Ordered`] strength, which re-opens the credit-theft window
+/// above.
+///
+/// # No public constructor takes a bare [`SystemTime`]
+///
+/// Outside `test-support` there is none, and that is load-bearing rather than
+/// tidy: [`RecvMeta::rx_time`] is still public, so a constructor accepting a
+/// time would re-open the decoupled path in one line — read a stamp off one
+/// meta, build a datagram around another body. The two production constructors
+/// take a control buffer ([`RxDatagram::from_recv_parts`]) or declare the
+/// absence of one ([`RxDatagram::without_stamp`]).
+///
+/// # Why the body is a [`Cow`]
+///
+/// Because the drivers carry payloads three ways and a single choice would cost
+/// one of them: `hick-reactor` moves the payload across a channel inside its
+/// packet type, which a borrowing-only body would make self-referential;
+/// `hick-mio` slices from a reused buffer, where an owning-only body would add
+/// an allocation that does not exist today; and `hick-compio` already owns a
+/// `Vec`. Do not "simplify" it to a bare lifetime or to an owned `Vec`.
+///
+/// # A reported length longer than the buffer is a DROP
+///
+/// **This is the one answer, stated once so a driver cannot pick a second.** A
+/// receive that reports more bytes than the buffer it was given did not deliver
+/// them, so there is no datagram here to weigh: drop it. Never fall back to the
+/// whole buffer, and never truncate the report and carry on.
+///
+/// Both wrong answers hand a body downstream that is not what arrived, and after
+/// this type that body is what a self-send credit is keyed on: [`fnv1a`] runs
+/// over whatever is passed, so a buffer's stale tail is hashed into the claim.
+/// The claim then misses the credit our own echo was recorded for — and the echo
+/// that follows finds none left and reaches the protocol layer as peer traffic,
+/// which is a phantom RFC 6762 §9 conflict against ourselves and the rename that
+/// follows. The same bytes are also what the protocol layer parses.
+///
+/// [`recv_datagram`] enforces it for the paths it serves — it slices the body
+/// itself and returns [`std::io::ErrorKind::InvalidData`] rather than a body the
+/// receive did not report. A path that mints through [`Self::without_stamp`]
+/// does its own receive and must apply the same rule before it constructs one:
+/// `hick-reactor`'s plain `recv_from` arm and both Windows arms are exactly
+/// those paths.
+pub struct RxDatagram<'a> {
+  /// The socket the datagram arrived on, and therefore the only family whose
+  /// credits it may claim. See [`SelfSendTracker::claim`] for the dual-stack echo
+  /// race this key closes.
+  family: Family,
+  /// The datagram body, exactly as long as the receive reported.
+  body: Cow<'a, [u8]>,
+  /// The kernel receive timestamp for THIS body, or `None` where the platform
+  /// delivered no timestamp cmsg. Read only by [`SelfSendTracker::claim`].
+  stamp: Option<SystemTime>,
+}
 
-impl RxEvidence {
-  /// The kernel receive timestamp this crate parsed for `meta`, if the platform
-  /// delivered one.
-  ///
-  /// The strongest form, and the one to prefer — strongest in exactly one
-  /// respect. [`RecvMeta`] has no public constructor and is minted only by this
-  /// crate's receive path, so a stamp read out of one did come from a receive
-  /// this crate performed: its **origin** is a property of the type rather than
-  /// a promise made at the call site.
-  ///
-  /// **Its association with a particular datagram is not.** This type and
-  /// [`RecvMeta`] are both [`Copy`], and [`SelfSendTracker::take`] takes the
-  /// body as a separate argument, so a genuine stamp from one receive can be
-  /// weighed against another receive's datagram and nothing here can tell.
-  /// Pass the stamp of the receive that produced the body being claimed. See
-  /// this type's own docs for what a mismatch costs in each direction.
-  #[must_use]
-  pub const fn from_meta(meta: &RecvMeta) -> Self {
-    Self(meta.rx_time())
-  }
-
-  /// No kernel receive timestamp — Windows, or a Unix kernel that delivered no
-  /// timestamp cmsg.
-  ///
-  /// The claim is weighed under [`MatchMode::Degraded`]: content, family and
-  /// [`SELF_SEND_TTL`], and no ordering test at all. Passing this is never
-  /// unsound, only weaker.
-  #[must_use]
-  pub const fn none() -> Self {
-    Self(None)
-  }
-
-  /// The kernel receive timestamp in `cmsgs`, if one is there — read by **this
-  /// crate's** parser rather than the caller's.
+impl<'a> RxDatagram<'a> {
+  /// The datagram, with its stamp read out of the control buffer **that
+  /// receive** produced — by this crate's parser rather than the caller's.
   ///
   /// For a driver whose I/O model this crate's blocking receive path does not
-  /// fit — a completion-based one that submits its own `recvmsg` and owns the
-  /// control buffer that comes back — so there is no [`RecvMeta`] for
-  /// [`Self::from_meta`] to read.
+  /// fit: a completion-based one that submits its own `recvmsg` and owns the
+  /// control buffer that comes back, so there is no [`recv_datagram`] to call.
   ///
-  /// # What this does buy: one reading of the cmsg, not two
+  /// # What it buys: one reading of the cmsg, and one statement to get wrong
   ///
   /// The stamp comes out of the same parser [`crate::recv_with_meta`] uses, so
-  /// every driver in this workspace agrees on what a
+  /// every driver in this workspace agrees on what an
   /// `SCM_TIMESTAMP`/`SCM_TIMESTAMPNS` cmsg says — the sub-second field's width
-  /// and units, which `SCM_*` type this target delivers, what a short or
-  /// negative field means. A driver that decodes the cmsg itself is a second
-  /// reading of one kernel ABI, and the two drift silently because a wrong
-  /// stamp still type-checks.
+  /// and units, which `SCM_*` type this target delivers, what a short or negative
+  /// field means. It is also sound on arbitrary input: every offset is
+  /// slice-bounds-checked and each header read unaligned, so a truncated,
+  /// misaligned or malformed buffer yields no stamp rather than a misread one.
   ///
-  /// It is also sound on arbitrary input — every offset is slice-bounds-checked
-  /// and each header is read unaligned — so a truncated, misaligned or
-  /// malformed buffer yields [`Self::none`] rather than a misread stamp.
+  /// And because body and buffer are arguments to the same call, the two are
+  /// paired where both are in scope — one statement, next to the syscall —
+  /// rather than at a claim somewhere downstream.
   ///
   /// # What it does NOT buy: this crate cannot check where the bytes came from
   ///
-  /// **`cmsgs` must be the control buffer a kernel filled for a receive the
-  /// caller just performed** — `msg_control` truncated to the reported
+  /// **`cmsgs` must be the control buffer a kernel filled for the receive that
+  /// produced `body`** — `msg_control` truncated to the reported
   /// `msg_controllen`. Nothing here can verify that. A caller can encode a
-  /// perfectly well-formed timestamp cmsg carrying a value it invented and get
-  /// back ordering evidence for that value; this crate is not present at the
-  /// `recvmsg` that would make the buffer true, so the obligation is the
-  /// caller's exactly as it was when the constructor took a bare
-  /// [`SystemTime`]. Taking bytes instead of a time raises the effort and moves
-  /// the parse somewhere it can be shared. It does not make the evidence
-  /// checkable.
+  /// well-formed timestamp cmsg carrying a value it invented and get back
+  /// ordering evidence for that value; this crate is not present at the
+  /// `recvmsg` that would make the buffer true.
   ///
   /// Getting it wrong is not a lost byte. A stamp that does not order the
-  /// datagram against our `sendto` — a userspace read time, an invented value,
-  /// a buffer kept from an earlier receive — still runs the claim at
-  /// [`MatchMode::Ordered`] strength, which re-opens the credit-theft window:
-  /// a byte-identical datagram the kernel saw *before* our `sendto` takes the
-  /// take-once credit, and our own echo then reaches the protocol layer as peer
-  /// traffic. That is a phantom RFC 6762 §9 conflict against ourselves and the
-  /// rename that follows.
+  /// datagram against our `sendto` — a userspace read time, an invented value, a
+  /// buffer kept from an earlier receive — still runs the claim at
+  /// [`MatchMode::Ordered`] strength, which re-opens the credit-theft window this
+  /// type's own docs describe.
   ///
-  /// The buffer must also be **that** receive's, for the body being claimed:
-  /// this constructor cannot check the association any more than
-  /// [`Self::from_meta`] can, and "a buffer kept from an earlier receive" above
-  /// is exactly that failure with the bytes genuinely a kernel's. See this
-  /// type's docs for the obligation and for what each direction of a mismatch
-  /// costs.
-  ///
-  /// If you do not have such a buffer, [`Self::none`] is the correct answer and
-  /// costs only the ordering arm. It is also what you get from a buffer with no
-  /// timestamp cmsg in it, a short one, or a target that has none: the claim is
-  /// weighed under [`MatchMode::Degraded`], never unsound, only weaker.
+  /// If you do not have such a buffer, [`Self::without_stamp`] is the correct
+  /// answer and costs only the ordering arm. It is also what a buffer with no
+  /// timestamp cmsg in it produces: the claim is weighed under
+  /// [`MatchMode::Degraded`], never unsound, only weaker.
   #[cfg(unix)]
   #[must_use]
-  pub fn from_cmsgs(cmsgs: &[u8]) -> Self {
-    Self(crate::multicast::parse_rx_time(cmsgs))
+  pub fn from_recv_parts(family: Family, body: impl Into<Cow<'a, [u8]>>, cmsgs: &[u8]) -> Self {
+    Self {
+      family,
+      body: body.into(),
+      stamp: crate::multicast::parse_rx_time(cmsgs),
+    }
   }
 
-  /// A stamp a **test** chose, standing in for one a kernel wrote.
+  /// The datagram, declaring that **no kernel receive timestamp is available**
+  /// for it.
   ///
-  /// The same unverifiable contract `from_cmsgs` carries, in the shape a test
-  /// can actually use: `rx` is meant to be a value a kernel stamped on a
-  /// datagram, and nothing here can check that. It is not a weaker gate than
-  /// `from_cmsgs` so much as an honest one — a test wanting a stamp one
-  /// millisecond after a credit's send would otherwise hand-encode a native
-  /// timestamp cmsg to say so, which is `unsafe`, per-target, and proves
+  /// Windows, a `recv_from`-shaped receive path that never asks for ancillary
+  /// data, and a Unix kernel that delivered no timestamp cmsg all reach the same
+  /// state, and it is a state rather than a failure: the claim is weighed under
+  /// [`MatchMode::Degraded`] — content, family and [`SELF_SEND_TTL`], with no
+  /// ordering test at all. Passing this is never unsound, only weaker.
+  ///
+  /// It exists as its own constructor because [`Self::from_recv_parts`] is
+  /// cmsg-based and Unix-only, and the paths above have no cmsgs to hand it —
+  /// not even an empty buffer would be honest, since "the kernel emitted no
+  /// timestamp" and "this path never asked for one" are the same answer here but
+  /// not the same fact.
+  #[must_use]
+  pub fn without_stamp(family: Family, body: impl Into<Cow<'a, [u8]>>) -> Self {
+    Self {
+      family,
+      body: body.into(),
+      stamp: None,
+    }
+  }
+
+  /// A datagram carrying a stamp a **test** chose, standing in for one a kernel
+  /// wrote.
+  ///
+  /// The same unverifiable contract [`Self::from_recv_parts`] carries, in the
+  /// shape a test can actually use: `rx` is meant to be the value a kernel
+  /// stamped on this body, and nothing here can check that. A test wanting a
+  /// stamp one millisecond after a credit's send would otherwise hand-encode a
+  /// native timestamp cmsg to say so, which is `unsafe`, per-target, and proves
   /// nothing the one-liner does not.
   ///
-  /// Behind `test-support` because that is where the tracker's other clock
-  /// seams are ([`SelfSendTracker::take_at`], [`SelfSendTracker::seal_at`]) and
-  /// for the same reason: a default build reaches every liveness decision
-  /// through
-  /// [`SelfSendTracker::take`], and a driver has no business placing a claim at
-  /// a time of its choosing. The gate is a speed bump on the trivial door, not
-  /// a proof that no door exists — `from_cmsgs` is safe, public, and reachable
-  /// from any dependent.
+  /// Behind `test-support` because it is the **only** public door through which
+  /// a bare [`SystemTime`] becomes ordering evidence, and a default build must
+  /// not have one: [`RecvMeta::rx_time`] is public, so a production constructor
+  /// taking a time would let any caller re-assemble the decoupled pair this type
+  /// exists to prevent. The gate is a speed bump on the trivial door rather than
+  /// a proof that no door exists — [`Self::from_recv_parts`] is safe, public and
+  /// reachable from any dependent, at the cost of encoding a real cmsg.
   ///
-  /// Getting it wrong is not a lost byte. A read time is at-or-after our send in
-  /// every case, so [`reference_ordered`]'s test can never reject on it, and the
-  /// claim silently runs at `Ordered` strength while carrying `Degraded`
-  /// evidence — which re-opens the credit-theft window: a byte-identical
-  /// datagram the kernel saw *before* our `sendto` takes the take-once credit,
-  /// and our own echo then reaches the protocol layer as peer traffic. That is a
-  /// phantom RFC 6762 §9 conflict against ourselves and the rename that follows.
-  ///
-  /// It is also the only deterministic way to put a stamp at a chosen offset
-  /// from a credit's send, which is the whole subject of
-  /// [`crate::RX_TIMESTAMP_GRAIN`] and [`WALL_STEP_TOLERANCE`].
+  /// It is also the only deterministic way to put a stamp at a chosen offset from
+  /// a credit's send, which is the whole subject of [`crate::RX_TIMESTAMP_GRAIN`]
+  /// and [`WALL_STEP_TOLERANCE`].
   #[cfg(any(test, feature = "test-support"))]
   #[must_use]
-  pub const fn from_stamp_for_test(rx: SystemTime) -> Self {
-    Self(Some(rx))
+  pub fn from_stamp_for_test(
+    family: Family,
+    body: impl Into<Cow<'a, [u8]>>,
+    rx: SystemTime,
+  ) -> Self {
+    Self {
+      family,
+      body: body.into(),
+      stamp: Some(rx),
+    }
   }
 
-  /// The stamp, for this module's own weighing.
-  const fn stamp(self) -> Option<SystemTime> {
-    self.0
+  /// The family whose socket carried this datagram.
+  #[must_use]
+  pub const fn family(&self) -> Family {
+    self.family
   }
+
+  /// The datagram body.
+  #[must_use]
+  pub fn body(&self) -> &[u8] {
+    &self.body
+  }
+
+  /// Take the body out, consuming the datagram.
+  ///
+  /// Consuming rather than borrowing because that is the only way to hand the
+  /// payload onward without leaving a stamp behind that could be weighed against
+  /// something else: once the body is out, the datagram is gone. A driver that
+  /// still needs to claim should do so first — [`SelfSendTracker::claim`] borrows.
+  #[must_use]
+  pub fn into_body(self) -> Cow<'a, [u8]> {
+    self.body
+  }
+
+  /// The same datagram with its body owned, so it can outlive the buffer it was
+  /// received into.
+  ///
+  /// For a driver that receives on one task and claims on another:
+  /// `hick-reactor` reads into a reused buffer and moves the result across a
+  /// channel, which a borrowed body cannot cross. It copies only when the body
+  /// is still borrowed, and it is exactly the `to_vec` that driver already did
+  /// before this type existed.
+  ///
+  /// # It is not a `Clone` door
+  ///
+  /// It **consumes** the datagram and carries the same stamp onto the same
+  /// bytes, so there is never a second value to lay beside a different body —
+  /// which is the whole of what the absent `Clone` buys (see this type's docs).
+  /// A `&self` version returning a new datagram would be `Clone` under another
+  /// name, and must not be added.
+  #[must_use]
+  pub fn into_owned(self) -> RxDatagram<'static> {
+    RxDatagram {
+      family: self.family,
+      body: Cow::Owned(self.body.into_owned()),
+      stamp: self.stamp,
+    }
+  }
+
+  /// The stamp, for this module's own weighing. Private, and there is no public
+  /// counterpart: see this type's docs for why the stamp has no path out.
+  const fn stamp(&self) -> Option<SystemTime> {
+    self.stamp
+  }
+}
+
+// Manual rather than derived, on both halves. The body is printed as a LENGTH
+// because a datagram is peer-controlled bytes and a trace line is not the place
+// to spill them; the stamp is printed as presence rather than value because
+// publishing it in a `Debug` string would hand back exactly what having no
+// accessor withholds.
+impl core::fmt::Debug for RxDatagram<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("RxDatagram")
+      .field("family", &self.family)
+      .field("len", &self.body.len())
+      .field("stamped", &self.stamp.is_some())
+      .finish()
+  }
+}
+
+/// Receive one datagram on `fd` and mint the [`RxDatagram`] for it, so that the
+/// body and the stamp are never separately chosen by a caller.
+///
+/// The strongest form this crate has, and the reason is narrow: **this crate
+/// performs the receive**, so the stamp's origin is a property of the call and
+/// the association is a property of the slicing, which happens here. There is no
+/// argument a caller can get wrong — no length, no buffer, no time.
+///
+/// `fd` must be a valid UDP socket fd, and non-blocking if the caller expects
+/// [`std::io::ErrorKind::WouldBlock`] rather than a park. The returned
+/// [`RecvMeta`] carries everything the receive witnessed — peer, destination,
+/// interface, hop limit, delivery class — and the RFC 6762 §11 admission
+/// decision is made on it, not on the datagram.
+///
+/// The buffer is downgraded from `&mut` to a shared borrow of the same lifetime,
+/// so the body borrows the caller's buffer with no copy; a driver that needs to
+/// own the payload converts afterwards, and one that reuses the buffer holds the
+/// datagram only as long as the borrow.
+///
+/// # Errors
+///
+/// Whatever [`crate::recv_with_meta`] returns: `WouldBlock` when no datagram is
+/// ready, and [`std::io::ErrorKind::InvalidData`] for a datagram too large for
+/// `buf` (`MSG_TRUNC`) or an unrecognized peer address family. A datagram that
+/// arrived with no ancillary metadata is NOT an error — it degrades, and the
+/// resulting claim runs under [`MatchMode::Degraded`].
+///
+/// `InvalidData` is also what a receive reporting more bytes than `buf` holds
+/// produces, because that datagram is dropped rather than approximated — see
+/// [`RxDatagram`] for the one answer and why the two approximations are worse
+/// than losing it.
+#[cfg(unix)]
+pub fn recv_datagram<'b>(
+  fd: std::os::fd::RawFd,
+  buf: &'b mut [u8],
+  family: Family,
+) -> std::io::Result<(RxDatagram<'b>, RecvMeta)> {
+  let meta = crate::recv_with_meta(fd, buf, family.is_v4())?;
+  let len = meta.len();
+  // The mint slices, so no caller picks a length. `recv_with_meta` clamps the
+  // reported length to the buffer it was given, so the error arm is unreachable
+  // from here; it is an ERROR rather than a fallback to the whole buffer because
+  // this is the one place that answer is written down, and a driver reading it
+  // for its own Windows or `recv_from` arm must find the rule and not an
+  // approximation. See `RxDatagram`.
+  let buf: &'b [u8] = buf;
+  let Some(body) = buf.get(..len) else {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidData,
+      "the receive reported more bytes than the buffer holds",
+    ));
+  };
+  Ok((
+    RxDatagram {
+      family,
+      body: Cow::Borrowed(body),
+      stamp: meta.rx_time(),
+    },
+    meta,
+  ))
 }
 
 /// One reading of BOTH clocks, taken back to back.
@@ -416,7 +563,7 @@ impl RxEvidence {
 /// each end and cancel in the subtraction rather than accumulating into
 /// [`WALL_STEP_TOLERANCE`]; and the monotonic read — the one [`SELF_SEND_TTL`]
 /// is measured on — stays the last thing that happens before the comparison it
-/// feeds, which is the floor [`SelfSendTracker::take`] documents.
+/// feeds, which is the floor [`SelfSendTracker::claim`] documents.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ClockPair {
   /// Wall clock. Ordering only — never an age, on either end of the comparison.
@@ -449,27 +596,31 @@ impl ClockPair {
 
 /// How much ordering evidence a claim actually has.
 ///
-/// It is **derived, never declared**: [`SelfSendTracker::take`] settles it from
+/// It is **derived, never declared**: [`SelfSendTracker::claim`] settles it from
 /// whether the platform delivered a kernel receive timestamp, and
 /// [`evidence_mode`] then weakens it per credit when that credit's own wall
 /// stamp did not survive a clock step. No caller can hand in a mode.
 ///
-/// That is structural, not a convention: the only function that consumes a mode
-/// is [`reference_ordered`], which is module-private, and **this type appears in
-/// no public signature at all**. It is public so that a driver's own
-/// documentation can name the two states its suppression runs in. A later change
-/// that adds a mode parameter to a public function undoes the guarantee, whatever
-/// this paragraph says.
+/// That is structural, not a convention: this type has no public constructor,
+/// and no function anywhere — public or private — takes a mode from outside this
+/// module. What a claim now does is **report** the mode it derived, through
+/// [`SelfSendMatch`], because a driver mapping an echo onto a trust tier needs to
+/// know which of the two strengths its suppression actually ran at. So the
+/// value escapes; the ability to choose it does not. It stays public so a
+/// driver's own documentation can name the two states. A later change that adds
+/// a mode PARAMETER to any function undoes the guarantee, whatever this
+/// paragraph says.
 ///
 /// # What the derivation bounds, and what it does not
 ///
 /// It bounds what a caller can *declare*. It does not make `Ordered` mean the
-/// stamp orders the datagram being weighed: the derivation reads whether an
-/// [`RxEvidence`] carries a value, and cannot read whether that value is this
-/// datagram's kernel receive stamp. A genuine kernel stamp belonging to some
-/// OTHER receive derives `Ordered` and is weighed at full strength. That
-/// association is the caller's obligation in every form the evidence can take
-/// — see [`RxEvidence`].
+/// stamp is a KERNEL's: the derivation reads whether the datagram carries a
+/// stamp, and cannot read where that stamp came from. A value a caller invented
+/// and encoded as a timestamp cmsg derives `Ordered` and is weighed at full
+/// strength. What association it belongs to is settled — the stamp arrived
+/// inside the datagram being weighed and could not have come from another
+/// receive — but origin remains the caller's obligation wherever the caller owns
+/// the `recvmsg`. See [`RxDatagram`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatchMode {
   /// The reference is a receive timestamp presented as the kernel's for this
@@ -510,7 +661,7 @@ pub enum MatchMode {
   /// queued when the send it claims was made. It still has to arrive on the same
   /// family, from source port 5353 (a driver offers a credit to no other port,
   /// since that is the only port an mDNS endpoint sends from — see
-  /// [`SelfSendTracker::take`]), carrying the same content fingerprint, inside
+  /// [`SelfSendTracker::claim`]), carrying the same content fingerprint, inside
   /// [`SELF_SEND_TTL`].
   ///
   /// # What one costs, and the bound on the fingerprint
@@ -547,6 +698,67 @@ pub enum MatchMode {
   /// and rename under §9, and under a clock that keeps stepping it does so
   /// repeatedly.
   Degraded,
+}
+
+/// What a claim found, and **how much the finding is worth**.
+///
+/// [`SelfSendTracker::claim`] returns this instead of a `bool` because the two
+/// positive answers are not the same claim. `Ordered` says a credit matched AND
+/// the kernel stamped the arrival at or after our `sendto`; `Degraded` says a
+/// credit matched on content, family and [`SELF_SEND_TTL`] with no ordering
+/// evidence weighed at all — which is also what a byte-identical datagram from a
+/// conforming co-resident twin looks like. A caller that collapses the two into
+/// "it was ours" asserts more than the second one supports; see
+/// [`MatchMode::Degraded`] for exactly what is given up and what one mistake
+/// costs.
+///
+/// # Deliberately NOT `#[non_exhaustive]`
+///
+/// Its consumers map it onto a trust tier, and `#[non_exhaustive]` would force a
+/// wildcard arm at every one of those sites — precisely the wrong behaviour for
+/// a trust classification. A variant added later would be swept silently into
+/// whichever tier that arm names, and nothing would report the
+/// misclassification. Exhaustive matching makes a new variant a **compile
+/// error** in every driver instead, which is where an author choosing trust
+/// levels should be interrupted. Adding a variant here is therefore a breaking
+/// change, on purpose.
+///
+/// # `#[must_use]`, because producing one SPENDS something
+///
+/// [`SelfSendTracker::claim`] is not a query. It consumes a take-once credit,
+/// so discarding what it returns loses the credit *and* the answer: the echo
+/// this endpoint was waiting for has been accounted for, and nothing was told
+/// what it was. The datagram then reaches the protocol layer at whatever tier
+/// the discarding caller passes instead — and the genuine echo behind it, if
+/// this was not it, finds no credit left. That is the phantom RFC 6762 §9
+/// conflict against ourselves this whole module exists to prevent, reached by
+/// an unused expression.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use]
+pub enum SelfSendMatch {
+  /// A credit matched, with ordering evidence: the kernel stamped this arrival
+  /// at or after the recorded send. See [`MatchMode::Ordered`].
+  Ordered,
+  /// A credit matched on content, family and [`SELF_SEND_TTL`], with no ordering
+  /// evidence to weigh. See [`MatchMode::Degraded`] — including for why a
+  /// conforming twin's byte-identical datagram matches this way too.
+  Degraded,
+  /// No credit matched. A negative claim about the tracker's OWN records, never
+  /// about the network: a credit refused at the cap, or expired past
+  /// [`SELF_SEND_TTL`], reads as this exactly as a peer's datagram does.
+  NoCredit,
+}
+
+impl SelfSendMatch {
+  /// The outcome for a credit that matched under `mode`. Private: the mapping is
+  /// this module's, and a public `From` impl would put [`MatchMode`] into a
+  /// public signature — see that type's derivation guarantee.
+  const fn from_mode(mode: MatchMode) -> Self {
+    match mode {
+      MatchMode::Ordered => Self::Ordered,
+      MatchMode::Degraded => Self::Degraded,
+    }
+  }
 }
 
 /// One recorded send, waiting for its multicast loopback copy.
@@ -604,7 +816,7 @@ struct Credit {
 
 /// Content-addressed record of datagrams this endpoint has recently sent, so
 /// their multicast loopback copies are recognized instead of being ingested
-/// as a peer's traffic. Take-once: [`SelfSendTracker::take`] removes the
+/// as a peer's traffic. Take-once: [`SelfSendTracker::claim`] removes the
 /// entry it matches, so a later, genuinely distinct datagram with the same
 /// bytes (a co-resident peer) is still seen.
 pub struct SelfSendTracker {
@@ -629,7 +841,7 @@ pub struct SelfSendTracker {
   ///   unsealed credits are exactly the suffix appended since the previous seal,
   ///   and the anchor is a monotonic reading taken inside that call — so the
   ///   suffix takes an anchor at or after every anchor already assigned;
-  /// * [`Self::take`] and [`Self::reclaim_expired_sealed`] only ever remove, and
+  /// * [`Self::claim`] and [`Self::reclaim_expired_sealed`] only ever remove, and
   ///   removal preserves relative order.
   ///
   /// The non-decreasing anchor was the one half a caller could break while
@@ -640,7 +852,7 @@ pub struct SelfSendTracker {
   ///
   /// Bumped by [`Self::open_window_at`] — the one place a window opens — and by
   /// nothing else, so it counts seals and is untouched by [`Self::record`] or
-  /// [`Self::take`]. See [`Self::seal_generation`] for what a driver does with
+  /// [`Self::claim`]. See [`Self::seal_generation`] for what a driver does with
   /// it. `u64` at one increment per loop iteration cannot wrap in any runtime
   /// this endpoint will see.
   seal_generation: u64,
@@ -685,11 +897,11 @@ impl SelfSendTracker {
   /// # `sent` is a contract this type CANNOT enforce
   ///
   /// Stated plainly because the receive side has one form this crate can check
-  /// and this side has none: [`Self::take`] takes an [`RxEvidence`], and
-  /// [`RxEvidence::from_meta`] reads its stamp off a [`RecvMeta`] only this
-  /// crate can mint, because this crate performed that `recvmsg`. There is no
-  /// equivalent here, and no honest way to build one — **this crate does not
-  /// own the send**. It has no
+  /// and this side has none: [`recv_datagram`] mints its datagram off a
+  /// `recvmsg` this crate performed, so the stamp's origin and its association
+  /// with the body are both properties of the call. There is no equivalent here,
+  /// and no honest way to build one — **this crate does not own the send**. It
+  /// has no
   /// `sendto` to stamp, so whatever it accepted would be a value the caller read,
   /// and wrapping that in a newtype would move the promise without checking it.
   ///
@@ -726,7 +938,7 @@ impl SelfSendTracker {
   /// These are two different jobs and only one of them belongs here.
   ///
   /// **Reclaiming.** A sealed credit past [`SELF_SEND_TTL`] is garbage:
-  /// [`Self::take`] already refuses it, and nothing but the next [`Self::seal`]
+  /// [`Self::claim`] already refuses it, and nothing but the next [`Self::seal`]
   /// removes it. So a full tracker whose loop then stalls past the TTL is
   /// [`MAX_SELF_SEND_ENTRIES`] corpses, and a later send in that same iteration would
   /// be refused a credit by entries that are every one of them dead. A refused
@@ -770,7 +982,7 @@ impl SelfSendTracker {
   /// Behind `test-support`, permanently. It fakes only the sweep; the admission
   /// decision below reads the live clock in every build, so there is no build in
   /// which the cap is decided against an instant a caller handed in. Same seam
-  /// as [`Self::take_at`].
+  /// as [`Self::claim_at`].
   #[cfg(any(test, feature = "test-support"))]
   pub fn record_with_stale_sweep(
     &mut self,
@@ -814,7 +1026,7 @@ impl SelfSendTracker {
   /// the earliest expiry there is is the **front** — so "is anything dead now?"
   /// is one comparison, and the clock read sits immediately before it with
   /// nothing but that comparison in between. That is the same floor
-  /// [`Self::take`] reaches: something must read a clock before something can
+  /// [`Self::claim`] reaches: something must read a clock before something can
   /// compare against it, and there is no work left inside the gap to move out.
   ///
   /// A scan would not do. Weighing every entry against one reading is what the
@@ -938,13 +1150,13 @@ impl SelfSendTracker {
   /// anchor is read after all of it, because that instant is not a convenient
   /// earlier reading but the thing being defined. The caller's parameter is
   /// deleted rather than moved for the same reason it was deleted from
-  /// [`Self::take`]: a parameter is the channel through which a reading taken
+  /// [`Self::claim`]: a parameter is the channel through which a reading taken
   /// somewhere else arrives, and moving the read nearer never removes the
   /// channel.
   ///
   /// The sweep spending a stale reading is harmless in the only direction it can
   /// be wrong: a credit that died while the sweep ran is merely retained until
-  /// the next seal, and [`Self::take`] refuses it meanwhile.
+  /// the next seal, and [`Self::claim`] refuses it meanwhile.
   ///
   /// It also settles the non-decreasing-anchor contract this used to state and
   /// rely on a caller for. The anchor is now a monotonic reading taken here, so
@@ -976,7 +1188,7 @@ impl SelfSendTracker {
   /// the tests whose subject is *not* the gap between them — `StdInstant` has no
   /// constructor, so a chosen loop top cannot be expressed any other way. The
   /// gap itself is tested through [`Self::pause_next_seal_for_test`], against
-  /// the real [`Self::seal`]. Same seam as [`Self::take_at`].
+  /// the real [`Self::seal`]. Same seam as [`Self::claim_at`].
   #[cfg(any(test, feature = "test-support"))]
   pub fn seal_at(&mut self, at: StdInstant) {
     self.reclaim_expired_sealed(at);
@@ -1004,53 +1216,50 @@ impl SelfSendTracker {
     self.seal_generation = self.seal_generation.wrapping_add(1);
   }
 
-  /// Consume the tracker entry (if any) recorded for `family` whose content
-  /// hash matches `body`, whose recorded send is ordered before `rx`, and whose
-  /// claim window is **still open at the instant this call weighs it**. Returns
-  /// `true` when a credit was consumed, i.e. `body` is this endpoint's own
-  /// loopback rather than a peer's datagram.
+  /// Consume the tracker entry (if any) this datagram is the loopback copy of —
+  /// the one recorded for its family, whose content hash matches its body, whose
+  /// recorded send is ordered before its stamp, and whose claim window is
+  /// **still open at the instant this call weighs it** — and report **how much
+  /// the match is worth**.
   ///
-  /// **`rx` must be the kernel's receive timestamp for `body` — this body, from
-  /// the receive that produced it — or the absence of one.** That is stated as
-  /// a requirement on the caller rather than as a fact about the argument,
-  /// because nothing here can check either half of it. Whatever arrives in that
-  /// argument is the whole of the ordering evidence.
+  /// # One argument, so there is nothing to pair
   ///
-  /// No caller supplies anything else, and no caller supplies a mode:
-  /// [`MatchMode`] is derived from it here rather than declared, so there is no
-  /// way to ask for `Ordered` matching against a stamp that carries no order —
-  /// a userspace read time taken at the claim says nothing about when the kernel
-  /// saw the datagram. What that closes is the *declaration* channel, and only
-  /// that one; the two paragraphs below are what it leaves open.
+  /// [`RxDatagram`] carries the family, the body and the stamp out of one
+  /// receive, and is neither `Copy` nor `Clone`, so the stamp cannot be lifted
+  /// out and laid beside another datagram's bytes. **That is a property of the
+  /// type rather than an obligation on the caller**, and it is what the three
+  /// separate arguments this method replaced could never be: a stamp a kernel
+  /// really did write, for some OTHER receive, used to be weighed here at
+  /// `Ordered` strength against whatever body it was handed with. Both
+  /// mismatches were live — a stamp from a LATER receive lets a byte-identical
+  /// datagram the kernel saw *before* our `sendto` take the take-once credit, so
+  /// a real peer's datagram is swallowed as our loopback and any conflict it
+  /// carried is never seen, while our own echo finds no credit and reaches the
+  /// protocol layer as peer traffic; a stamp from an EARLIER receive rejects the
+  /// genuine echo outright, reaching the same place by the other route. Either
+  /// is a phantom RFC 6762 §9 conflict against ourselves and the rename that
+  /// follows.
   ///
-  /// It is an [`RxEvidence`] and not a bare [`SystemTime`] because that
-  /// distinction is the whole game and a `SystemTime` cannot carry it. Prefer
-  /// [`RxEvidence::from_meta`], the one form whose ORIGIN this crate can check:
-  /// it reads the stamp off a [`RecvMeta`] only this crate mints. The rest are
-  /// the caller's word even on origin — `RxEvidence::from_cmsgs` included, which
-  /// parses the caller's own control buffer here but cannot tell that a kernel
-  /// is what filled it. See that type for which is which and what each one does
-  /// and does not prove.
+  /// What this does NOT settle is **origin**, and that is stated rather than
+  /// claimed away: where a driver performs its own receive,
+  /// [`RxDatagram::from_recv_parts`] parses a control buffer this crate cannot
+  /// prove a kernel filled. On the paths that reach [`recv_datagram`] there is
+  /// nothing left for a caller to get wrong at all. See [`RxDatagram`] for
+  /// exactly how much distance each shape buys.
   ///
-  /// # `rx` and `body` are separate arguments, and pairing them is the caller's
+  /// No caller supplies a mode either: [`MatchMode`] is derived here from
+  /// whether the datagram carries a stamp, never declared, so there is no way to
+  /// ask for `Ordered` matching against a value that carries no order.
   ///
-  /// No constructor of [`RxEvidence`] settles which datagram a stamp belongs
-  /// to, this one included: [`RxEvidence`] is [`Copy`], and a stamp a kernel
-  /// really did write — for some other receive — is weighed here at `Ordered`
-  /// strength against whatever `body` it is handed with. Both mismatches are
-  /// live. A stamp from a LATER receive lets a byte-identical datagram the
-  /// kernel saw *before* our `sendto` take the take-once credit: a real peer's
-  /// datagram swallowed as our loopback, so a conflict it carried is never seen,
-  /// while our own echo finds no credit and reaches the protocol layer as peer
-  /// traffic. A stamp from an EARLIER receive rejects the genuine echo outright,
-  /// reaching the same place by the other route. Either is a phantom RFC 6762 §9
-  /// conflict against ourselves and the rename that follows.
+  /// # A tier, not a bool
   ///
-  /// Discharge it structurally, by carrying stamp and payload together out of
-  /// the receive that produced them — one struct, or two locals of one receive,
-  /// which is what every driver in this workspace does — rather than by lining
-  /// them up at this call. Putting the coupling in the signature is a breaking
-  /// change and is deferred to the next major version.
+  /// [`SelfSendMatch::Ordered`] and [`SelfSendMatch::Degraded`] are both matches
+  /// and are not the same claim: only the first weighed evidence that the kernel
+  /// saw this datagram at or after our `sendto`, and the second is also what a
+  /// conforming co-resident twin's byte-identical datagram produces. A caller
+  /// deciding what to suppress should decide on the variant. See
+  /// [`SelfSendMatch`], and [`MatchMode::Degraded`] for what the weaker one gives
+  /// up.
   ///
   /// # It takes no instant, and no caller can supply one
   ///
@@ -1079,17 +1288,17 @@ impl SelfSendTracker {
   ///
   /// # Two clocks, two questions, and a third that keeps the first honest
   ///
-  /// `rx` answers *ordering* — could the kernel have seen this datagram before
-  /// we sent ours? — and is a wall stamp because that is the only clock a kernel
-  /// receive timestamp is expressed in. The age is the other question, answered
-  /// on the monotonic clock, because an age must not be a wall-clock
-  /// subtraction.
+  /// The datagram's stamp answers *ordering* — could the kernel have seen this
+  /// datagram before we sent ours? — and is a wall stamp because that is the only
+  /// clock a kernel receive timestamp is expressed in. The age is the other
+  /// question, answered on the monotonic clock, because an age must not be a
+  /// wall-clock subtraction.
   ///
   /// The third question is whether the ordering answer is worth anything, and it
   /// exists because the wall clock is not monotonic. A step between the send and
-  /// this claim leaves [`Credit::sent`]'s wall half describing a timeline `rx`
-  /// was never taken on, and the credit's own echo then looks like a peer
-  /// datagram that predated it. So every claim reads both clocks — see
+  /// this claim leaves [`Credit::sent`]'s wall half describing a timeline the
+  /// receive stamp was never taken on, and the credit's own echo then looks like
+  /// a peer datagram that predated it. So every claim reads both clocks — see
   /// [`ClockPair`] — and a credit whose two elapsed times disagree past
   /// [`WALL_STEP_TOLERANCE`] is weighed under [`MatchMode::Degraded`] instead of
   /// being refused. See [`evidence_mode`] for the direction that trade takes and
@@ -1145,66 +1354,82 @@ impl SelfSendTracker {
   /// else. That is exact rather than probabilistic, which is why it is
   /// preferred over consuming the newest eligible credit: newest-first only
   /// reorders the same interchangeable set, and a third credit for the same
-  /// bytes (a queued copy completing out of order) defeats it again.
-  pub fn take(&mut self, family: Family, body: &[u8], rx: RxEvidence) -> bool {
-    self.take_by(family, body, rx, ClockPair::now)
+  /// bytes (a queued copy completing out of order) defeats it again. The family
+  /// is the datagram's own, read off the socket it arrived on, so there is no
+  /// separate argument that could disagree with the body.
+  pub fn claim(&mut self, rx: &RxDatagram<'_>) -> SelfSendMatch {
+    self.claim_by(rx.family(), rx.body(), rx.stamp(), ClockPair::now)
   }
 
-  /// [`Self::take`] against a caller-chosen reading of both clocks, so a test can
-  /// place a claim anywhere in a credit's window without sleeping through it,
-  /// and can put the wall clock somewhere the monotonic one says it cannot be.
+  /// [`Self::claim`] against a caller-chosen reading of both clocks, so a test
+  /// can place a claim anywhere in a credit's window without sleeping through
+  /// it, and can put the wall clock somewhere the monotonic one says it cannot
+  /// be.
   ///
   /// Behind `test-support`, permanently, and that gate is the entire point: no
   /// default build has this at all, and production reaches the liveness decision
-  /// only through [`Self::take`], which reads both clocks itself — so there is no
-  /// build a driver ships in which a stale reading can be handed in.
+  /// only through [`Self::claim`], which reads both clocks itself — so there is
+  /// no build a driver ships in which a stale reading can be handed in.
   ///
   /// It is also the only deterministic way to present a wall-clock step: no test
   /// can ask a host to run `settimeofday` under it, and the whole subject of
   /// [`WALL_STEP_TOLERANCE`] is what a claim does when the wall clock moved
   /// between the send and here.
   #[cfg(any(test, feature = "test-support"))]
-  pub fn take_at(&mut self, family: Family, body: &[u8], rx: RxEvidence, now: ClockPair) -> bool {
-    self.take_by(family, body, rx, move || now)
+  pub fn claim_at(&mut self, rx: &RxDatagram<'_>, now: ClockPair) -> SelfSendMatch {
+    self.claim_by(rx.family(), rx.body(), rx.stamp(), move || now)
   }
 
-  /// The one body behind [`Self::take`] and [`Self::take_at`].
+  /// The one body behind both claim entry points, production and `test-support`.
   ///
-  /// `clock` is invoked **in the predicate**, at the [`still_live`] test of each
+  /// `clock` is invoked **in the loop**, at the [`still_live`] test of each
   /// candidate that already matched on family and content — so the production
   /// path's read lands at the decision itself, with nothing between the
   /// monotonic half and the comparison it feeds. Private, and taking a clock
   /// rather than a reading, so the only way to reach it with a value fixed in
-  /// advance is the `#[cfg(test)]` door above.
-  fn take_by(
+  /// advance is the `test-support` door above.
+  ///
+  /// The mode that decided the winning candidate is carried out rather than
+  /// discarded: it is the whole difference between [`SelfSendMatch::Ordered`] and
+  /// [`SelfSendMatch::Degraded`], and it is not recoverable afterwards — the
+  /// credit it was derived from has been removed by then, and re-deriving it
+  /// would read the clock a second time.
+  fn claim_by(
     &mut self,
     family: Family,
     body: &[u8],
-    rx: RxEvidence,
+    rx: Option<SystemTime>,
     clock: impl Fn() -> ClockPair,
-  ) -> bool {
-    let rx = rx.stamp();
+  ) -> SelfSendMatch {
     let needle = fnv1a(body);
-    match self.entries.iter().position(|c| {
+    let mut matched = None;
+    for (pos, c) in self.entries.iter().enumerate() {
       if c.family != family || c.hash != needle {
-        return false;
+        continue;
       }
       let now = clock();
-      still_live(now.mono, c.aged_from)
-        && reference_ordered(rx, c.sent, evidence_mode(rx, c.sent, now))
-    }) {
-      Some(pos) => {
-        self.entries.remove(pos);
-        true
+      if !still_live(now.mono, c.aged_from) {
+        continue;
       }
-      None => false,
+      let mode = evidence_mode(rx, c.sent, now);
+      if reference_ordered(rx, c.sent, mode) {
+        matched = Some((pos, mode));
+        break;
+      }
+    }
+    match matched {
+      Some((pos, mode)) => {
+        self.entries.remove(pos);
+        SelfSendMatch::from_mode(mode)
+      }
+      None => SelfSendMatch::NoCredit,
     }
   }
 
   /// Number of live entries.
   ///
   /// Behind `test-support`, permanently: a driver drives this type entirely
-  /// through [`Self::record`], [`Self::seal`] and [`Self::take`] and never reads
+  /// through [`Self::record`], [`Self::seal`] and [`Self::claim`] and never reads
   /// its depth, so this stays gated rather than becoming ordinary public surface
   /// that a caller could start depending on.
   #[cfg(any(test, feature = "test-support"))]
@@ -1216,7 +1441,7 @@ impl SelfSendTracker {
   /// How many times a claim window has been opened here.
   ///
   /// Advances on every [`Self::seal`], and on nothing else — [`Self::record`] and
-  /// [`Self::take`] leave it alone.
+  /// [`Self::claim`] leave it alone.
   ///
   /// # What it is for: proving WHEN a driver sealed, not merely that it did
   ///
@@ -1276,7 +1501,7 @@ impl SelfSendTracker {
   /// expiry order [`Self::admit`] depends on.
   ///
   /// Behind `test-support`, permanently, and for the same reason as
-  /// [`Self::len`]: a driver drives this type through `record`, `seal` and `take`
+  /// [`Self::len`]: a driver drives this type through `record`, `seal` and `claim`
   /// and never reads its layout.
   #[cfg(any(test, feature = "test-support"))]
   pub fn anchors_for_test(&self) -> Vec<Option<StdInstant>> {

@@ -40,6 +40,25 @@ BREAKING
   self-detection suppressed everything, so this guard is what makes the
   adjudication change above safe. `HandleServiceRenamedError` gains the matching
   variant as the invariant's second enforcement point.
+- **`hick-smoltcp` and `hick-embassy` lose all-effects suppression of their own
+  loopback.** Their `is_self` is a content match and nothing more —
+  non-consuming, with no address-family key, no ordering evidence and no
+  source-port gate at the call site — so it reports `OwnEchoLikely` and can never
+  report `OwnEcho`. Their own echo now reaches §8.2's tiebreak and §8.1's
+  defence instead of being deleted; it still populates no cache entry and quiets
+  no query of ours. That is safe because an echo of our own records carries rdata
+  identical to ours, which §9 makes no conflict at all, and it is the point of
+  the change rather than a side effect: their self-detection was never strong
+  enough to justify deleting a §8 proposal.
+- `hick-reactor`, `hick-mio` and `hick-compio` report all three tiers instead of
+  two. A claim the kernel's receive stamp ORDERED against our `sendto` stays
+  `OwnEcho`; one that matched on content, family and the TTL alone becomes
+  `OwnEchoLikely` and adjudicates — that is what a conforming §9 twin's
+  byte-identical datagram produces, so it may not be trusted with a name. It is
+  the whole of the match on Windows and on any kernel that delivers no timestamp
+  cmsg. No credit, or a source port this endpoint never sends from, becomes
+  `NotFromUs` rather than `Unknown`, which additionally declines
+  `trust_advertised_src_as_self` on these drivers.
 
 OTHER
 
@@ -50,6 +69,50 @@ OTHER
   the parse-error latch like any other processed datagram's. The
   exactly-one-reject-counter-per-`packets_rx` invariant is unchanged and still
   holds in both directions.
+
+## A receive's evidence travels with the datagram it came from
+
+BREAKING
+
+- `hick-udp`: `RxEvidence` and `SelfSendTracker::take` / `take_at` are removed.
+  A claim now takes one `RxDatagram<'a>` — the family, the body and the kernel
+  receive stamp out of one receive, in a value that is neither `Copy` nor
+  `Clone` and exposes no stamp. The three loose arguments could disagree, and a
+  stamp a kernel really did write for a DIFFERENT receive was weighed at full
+  `Ordered` strength against whatever body it was handed with; both directions
+  ended at a phantom RFC 6762 §9 conflict against this responder itself. That is
+  now unrepresentable rather than documented.
+- `hick-udp`: new `recv_datagram(fd, buf, family)` performs the receive and
+  slices the body to that receive's own reported length, so on the paths that can
+  use it no caller picks a length, a buffer or a time at all. A driver that owns
+  its own `recvmsg` mints through `RxDatagram::from_recv_parts(family, body,
+  cmsgs)`, which pairs the two where both are in scope; that one remains a caller
+  contract, because this crate is not present at the syscall that would make the
+  control buffer true. `RxDatagram::into_owned` converts a borrowed body for a
+  driver that hands the datagram to another task.
+- `hick-udp`: a claim reports `SelfSendMatch { Ordered, Degraded, NoCredit }`
+  instead of a bool, so a caller can tell a match the kernel's stamp ORDERED
+  against our `sendto` from one that matched on content, family and the TTL
+  alone — which is also what a conforming §9 twin's byte-identical datagram
+  produces. Deliberately not `#[non_exhaustive]`: consumers map it onto a trust
+  tier, and a forced wildcard arm would sweep a future variant silently into
+  whichever tier that arm names.
+- `hick-udp`: `RecvMeta::rx_time` is demoted in its documentation to a
+  diagnostic. It is no longer an input to any self-send decision.
+- `hick-udp`: `SelfSendMatch` is `#[must_use]`. A claim SPENDS a take-once
+  credit, so discarding what it returns loses the credit and the answer both:
+  the echo this endpoint was waiting for has been accounted for, nothing was
+  told what it was, and the genuine echo behind it — if this was not it — finds
+  no credit left.
+
+OTHER
+
+- `hick-reactor`: a receive that reports more bytes than the buffer holds is now
+  DROPPED. Three sites answered it with the whole buffer — a longer payload than
+  arrived, sent downstream — where `hick-mio` already dropped it. That body is
+  what a self-send credit is keyed on, so the divergence became load-bearing.
+  The rule is stated once, on `hick_udp::selfsend::RxDatagram`, and `recv_datagram`
+  reports `InvalidData` rather than approximating.
 
 # RELEASED
 

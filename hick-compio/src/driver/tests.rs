@@ -1,9 +1,21 @@
 use core::cell::Cell;
 
-use hick_udp::selfsend::RxEvidence;
+use hick_udp::selfsend::{RxDatagram, SelfSendMatch};
 use std::rc::Rc;
 
 use super::*;
+
+/// Whether a claim consumed a credit at all, at either strength.
+///
+/// A test whose subject is the take-once bookkeeping — which credit was
+/// consumed, which survived — says so through this, so the tier tests stay the
+/// only place a strength is asserted and a change to one is not lost in the
+/// other. It is deliberately NOT a method on `SelfSendMatch`: a driver mapping
+/// an echo onto a trust tier must read the variant, and a public flattener is
+/// exactly the collapse the tier exists to prevent.
+fn consumed(m: SelfSendMatch) -> bool {
+  !matches!(m, SelfSendMatch::NoCredit)
+}
 
 #[compio::test]
 async fn local_notify_wakes_a_listener() {
@@ -218,10 +230,9 @@ fn pre_drop_short_qr1_counts_rx_and_dropped_exactly_once() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255), // carried, never read
-    RxEvidence::none(),
     len as usize,
   );
-  s.handle_datagram(Family::V4, &meta, &data);
+  s.handle_datagram(&meta, &RxDatagram::without_stamp(Family::V4, &data));
 
   let snap = s.stats.snapshot();
   assert_eq!(snap.packets_rx, 1, "packets_rx +1 (datagram was received)");
@@ -256,10 +267,9 @@ fn pre_drop_untrusted_qr1_response_counts_rx_and_dropped_exactly_once() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255), // on-link
-    RxEvidence::none(),
     len as usize,
   );
-  s.handle_datagram(Family::V4, &meta, &data);
+  s.handle_datagram(&meta, &RxDatagram::without_stamp(Family::V4, &data));
 
   // Self-send tracker must be untouched (never reached).
   assert!(
@@ -301,10 +311,9 @@ fn pre_drop_off_link_datagram_counts_rx_and_dropped_exactly_once() {
     None,
     1,
     Some(64), // carried, never read — see the doc above
-    RxEvidence::none(),
     len as usize,
   );
-  s.handle_datagram(Family::V4, &meta, &data);
+  s.handle_datagram(&meta, &RxDatagram::without_stamp(Family::V4, &data));
 
   let snap = s.stats.snapshot();
   assert_eq!(snap.packets_rx, 1, "packets_rx +1 (datagram was received)");
@@ -348,10 +357,12 @@ fn handle_datagram_refuses_a_source_outside_every_configured_prefix() {
       Some(INGRESS_OUR_ADDR),
       1,
       Some(64),
-      RxEvidence::from_stamp_for_test(SystemTime::now()),
       body.len(),
     );
-    s.handle_datagram(Family::V4, &meta, &body);
+    s.handle_datagram(
+      &meta,
+      &RxDatagram::from_stamp_for_test(Family::V4, &body, SystemTime::now()),
+    );
     // The DELTA: a refused datagram leaves its credit behind, so `is_empty`
     // stops discriminating after the first refusal.
     s.selfsend.len() < before
@@ -545,14 +556,16 @@ fn ingress_admits(a: Arrival, subnets: &[(IpAddr, u8)], bound_is_loopback: bool)
     a.destination,
     a.pkt_iface,
     a.hop_limit,
-    RxEvidence::from_stamp_for_test(SystemTime::now()),
     body.len(),
   )
   .with_delivery(a.delivery);
   if a.cmsg_declined {
     meta = meta.with_cmsg_declined();
   }
-  s.handle_datagram(a.family, &meta, &body);
+  s.handle_datagram(
+    &meta,
+    &RxDatagram::from_stamp_for_test(a.family, &body, SystemTime::now()),
+  );
   s.selfsend.is_empty()
 }
 
@@ -842,10 +855,12 @@ fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
       None,
       INGRESS_BOUND,
       None,
-      RxEvidence::from_stamp_for_test(SystemTime::now()),
       body.len(),
     );
-    state.handle_datagram(Family::V4, &meta, &body);
+    state.handle_datagram(
+      &meta,
+      &RxDatagram::from_stamp_for_test(Family::V4, &body, SystemTime::now()),
+    );
     state.selfsend.len() < before
   };
 
@@ -1163,7 +1178,7 @@ fn a_receive_path_that_recovers_nothing_still_admits_an_in_subnet_peer() {
   } else {
     RecvMeta::empty(peer)
   };
-  s.handle_datagram(Family::V4, &meta, &body);
+  s.handle_datagram(&meta, &RxDatagram::without_stamp(Family::V4, &body));
 
   assert_eq!(
     s.selfsend.is_empty(),
@@ -2395,14 +2410,13 @@ fn rename_collision_with_local_service_frees_proto_route() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    RxEvidence::none(),
     conflict.len(),
   );
   let mut conflicted = false;
   for _ in 0..80 {
     t += Duration::from_millis(300);
     s.fire_timeouts(t);
-    s.handle_datagram(Family::V4, &peer, &conflict);
+    s.handle_datagram(&peer, &RxDatagram::without_stamp(Family::V4, &conflict));
     pump_transmits(&mut s, t, &mut buf);
     s.push_service_updates(t);
 
@@ -2627,14 +2641,13 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    RxEvidence::none(),
     conflict.len(),
   );
   let mut conflicted = false;
   for _ in 0..80 {
     t += Duration::from_millis(300);
     s.fire_timeouts(t);
-    s.handle_datagram(Family::V4, &peer, &conflict);
+    s.handle_datagram(&peer, &RxDatagram::without_stamp(Family::V4, &conflict));
     pump_transmits(&mut s, t, &mut buf);
     s.push_service_updates(t);
 
@@ -2803,7 +2816,6 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
       Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
       1,
       Some(255), // on-link
-      RxEvidence::none(),
       len,
     )
   };
@@ -2835,7 +2847,7 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   for _ in 0..40 {
     t += Duration::from_millis(300);
     s.fire_timeouts(t);
-    s.handle_datagram(Family::V4, &probe_peer, &probe);
+    s.handle_datagram(&probe_peer, &RxDatagram::without_stamp(Family::V4, &probe));
     pump_transmits(&mut s, t, &mut buf);
     s.push_service_updates(t);
   }
@@ -2858,7 +2870,7 @@ fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   for _ in 0..40 {
     t += Duration::from_millis(300);
     s.fire_timeouts(t);
-    s.handle_datagram(Family::V4, &peer, &conflict);
+    s.handle_datagram(&peer, &RxDatagram::without_stamp(Family::V4, &conflict));
     pump_transmits(&mut s, t, &mut buf);
     s.push_service_updates(t);
     if s.services.get(&handle).map(|c| c.errored).unwrap_or(false) {
@@ -3591,7 +3603,7 @@ fn generic_recv_error_does_not_increment_packets_dropped() {
 
   // Inject a generic I/O error (connection refused — not InvalidData).
   let err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "injected recv error");
-  handle_recv(&inner, Family::V4, Err(err));
+  handle_recv(&inner, Err(err));
 
   let after = inner.state.borrow().stats.snapshot();
   assert_eq!(
@@ -3633,7 +3645,6 @@ fn truncated_datagram_counts_rx_and_dropped_not_delivered_to_proto() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     0,
     Some(255),
-    RxEvidence::none(),
     len,
   )
   .with_truncated();
@@ -3643,7 +3654,10 @@ fn truncated_datagram_counts_rx_and_dropped_not_delivered_to_proto() {
   assert_eq!(before.bytes_rx, 0);
   assert_eq!(before.packets_dropped, 0);
 
-  handle_recv(&inner, Family::V4, Ok((data, meta)));
+  handle_recv(
+    &inner,
+    Ok((RxDatagram::without_stamp(Family::V4, data), meta)),
+  );
 
   let after = inner.state.borrow().stats.snapshot();
   assert_eq!(
@@ -3702,7 +3716,6 @@ fn normal_non_truncated_datagram_routes_to_proto() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    RxEvidence::none(),
     len,
   );
   // `truncated()` must be false — the normal routing path.
@@ -3711,7 +3724,10 @@ fn normal_non_truncated_datagram_routes_to_proto() {
     "sanity: RecvMeta::new must not set truncated"
   );
 
-  handle_recv(&inner, Family::V4, Ok((data, meta)));
+  handle_recv(
+    &inner,
+    Ok((RxDatagram::without_stamp(Family::V4, data), meta)),
+  );
 
   let after = inner.state.borrow().stats.snapshot();
   assert_eq!(
@@ -3867,7 +3883,6 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    RxEvidence::none(),
     conflict.len(),
   );
 
@@ -3878,7 +3893,7 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
   for _ in 0..80 {
     t += Duration::from_millis(300);
     s.fire_timeouts(t);
-    s.handle_datagram(Family::V4, &peer, &conflict);
+    s.handle_datagram(&peer, &RxDatagram::without_stamp(Family::V4, &conflict));
     pump_transmits(&mut s, t, &mut buf);
 
     // Probe BEFORE push_service_updates (wrong-order pump position).
@@ -4252,13 +4267,12 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255),
-    RxEvidence::none(),
     conflict.len(),
   );
   let mut renamed = false;
   for _ in 0..80 {
     t += Duration::from_millis(250);
-    s.handle_datagram(Family::V4, &peer, &conflict);
+    s.handle_datagram(&peer, &RxDatagram::without_stamp(Family::V4, &conflict));
     confirm_service_round(&mut s, handle, t, &mut buf, whole_fanout(t));
     s.push_service_updates(t);
     if s
@@ -4407,6 +4421,86 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
 // `handle_datagram`, and the ageing stamp, which nothing but the monotonic clock
 // may decide.
 
+/// The two match strengths reach the protocol layer as two DIFFERENT tiers, and
+/// the weaker one no longer deletes the datagram.
+///
+/// This is the behaviour change, not a mechanical follow-on. `Ordered` weighed
+/// evidence that the kernel saw the datagram at or after our own `sendto`, so
+/// nothing else could have put those bytes on the wire in between: `OwnEcho`,
+/// and every permission denied, which `Endpoint::handle` counts as a
+/// whole-datagram reject. `Degraded` matched on content, family and the TTL with
+/// nothing ordering it — which is also exactly what a byte-identical datagram
+/// from a conforming RFC 6762 §9 fault-tolerance twin produces — so it is
+/// `OwnEchoLikely`, which still declines the cache and §7.1/§7.3 quieting but
+/// ADJUDICATES. A datagram that adjudicates is not a drop.
+///
+/// `packets_dropped` is the observable because it is the counter
+/// `Endpoint::handle` bumps on exactly the "nothing admits this" condition, so it
+/// distinguishes the two tiers without this driver reaching into the protocol
+/// core's routing. The two halves share one body and one credit, so the only
+/// difference between them is the stamp.
+#[test]
+fn the_two_match_strengths_reach_the_protocol_layer_as_different_tiers() {
+  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+  use crate::socket::RecvMeta;
+
+  // A minimal empty query header: QR=0, opcode QUERY, rcode NoError, and no
+  // sections. It must PARSE, or `handle` would fail before any permission is
+  // weighed and neither half would count anything.
+  let body: Vec<u8> = vec![0u8; 12];
+  let on_link = || {
+    RecvMeta::new(
+      SocketAddr::from(([127, 0, 0, 1], 5353)),
+      IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+      Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+      1,
+      Some(255), // §11 on-link
+      body.len(),
+    )
+  };
+
+  let mut ordered = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+  ordered.local_subnets = vec![(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8)];
+  ordered.bound_interface = 1;
+  let sent = ClockPair::now();
+  ordered.selfsend.record(Family::V4, &body, sent);
+  ordered.selfsend.seal();
+  #[cfg(debug_assertions)]
+  ordered.note_park_entry();
+  ordered.handle_datagram(
+    &on_link(),
+    &RxDatagram::from_stamp_for_test(Family::V4, &body, sent.wall + Duration::from_millis(1)),
+  );
+  assert!(ordered.selfsend.is_empty(), "the credit was claimed");
+  assert_eq!(
+    ordered.stats.snapshot().packets_dropped,
+    1,
+    "an ORDERED match is `OwnEcho`, which denies every permission — and a \
+     datagram nothing admits is a whole-datagram reject"
+  );
+
+  let mut degraded = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+  degraded.local_subnets = vec![(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8)];
+  degraded.bound_interface = 1;
+  let sent = ClockPair::now();
+  degraded.selfsend.record(Family::V4, &body, sent);
+  degraded.selfsend.seal();
+  #[cfg(debug_assertions)]
+  degraded.note_park_entry();
+  degraded.handle_datagram(&on_link(), &RxDatagram::without_stamp(Family::V4, &body));
+  assert!(
+    degraded.selfsend.is_empty(),
+    "the same credit was claimed, at the weaker strength"
+  );
+  assert_eq!(
+    degraded.stats.snapshot().packets_dropped,
+    0,
+    "a DEGRADED match is `OwnEchoLikely`, which adjudicates — so the datagram \
+     reaches the §8 paths instead of vanishing, and is not a reject"
+  );
+}
+
 /// A wall clock that stepped backwards after the send must not make this
 /// endpoint ingest its own announcement as a peer's.
 ///
@@ -4445,17 +4539,20 @@ fn a_backwards_wall_step_must_not_turn_our_own_echo_into_a_phantom_self_conflict
   // A minimal empty query header: QR=0, so the §11 untrusted-response gate does
   // not fire and the datagram reaches the self-send match.
   let body: Vec<u8> = vec![0u8; 12];
-  let on_link = |rx: SystemTime| {
+  let on_link = || {
     RecvMeta::new(
       SocketAddr::from(([127, 0, 0, 1], 5353)),
       IpAddr::V4(Ipv4Addr::UNSPECIFIED),
       Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
       1,
       Some(255), // §11 on-link
-      RxEvidence::from_stamp_for_test(rx),
       body.len(),
     )
   };
+  // The stamp lives with the bytes it belongs to now, not on the §11 metadata
+  // beside them: the whole subject of this test is which timeline a receive
+  // stamp was taken on, and it can only order the datagram it arrived with.
+  let echo = |rx: SystemTime| RxDatagram::from_stamp_for_test(Family::V4, &body, rx);
 
   // The multicast send, with the pre-submit pair `note_multicast_attempt` hands
   // over, and the pre-park seal opening its claim window.
@@ -4468,7 +4565,7 @@ fn a_backwards_wall_step_must_not_turn_our_own_echo_into_a_phantom_self_conflict
 
   // Our own echo, stamped by the kernel on the post-step timeline and therefore
   // an hour before the credit it belongs to.
-  s.handle_datagram(Family::V4, &on_link(SystemTime::now()), &body);
+  s.handle_datagram(&on_link(), &echo(SystemTime::now()));
   assert!(
     s.selfsend.is_empty(),
     "the credit's two elapsed times disagree by an hour, so its wall stamp is not \
@@ -4485,11 +4582,7 @@ fn a_backwards_wall_step_must_not_turn_our_own_echo_into_a_phantom_self_conflict
   s.selfsend.seal();
   #[cfg(debug_assertions)]
   s.note_park_entry();
-  s.handle_datagram(
-    Family::V4,
-    &on_link(unstepped.wall - Duration::from_secs(1)),
-    &body,
-  );
+  s.handle_datagram(&on_link(), &echo(unstepped.wall - Duration::from_secs(1)));
   assert_eq!(
     s.selfsend.len(),
     1,
@@ -4530,12 +4623,10 @@ fn the_self_send_ttl_is_measured_monotonically_not_on_the_wall_clock() {
     sent.mono + Duration::from_millis(5),
   );
   assert!(
-    t.take_at(
-      Family::V6,
-      b"announcement",
-      RxEvidence::none(),
+    consumed(t.claim_at(
+      &RxDatagram::without_stamp(Family::V6, &b"announcement"[..]),
       wall_ran_ahead
-    ),
+    )),
     "five milliseconds of real time elapsed, so the credit is live however far \
      the wall clock jumped"
   );
@@ -4547,12 +4638,10 @@ fn the_self_send_ttl_is_measured_monotonically_not_on_the_wall_clock() {
   t.seal_at(sent.mono);
   let expired = sent.mono + SELF_SEND_TTL + Duration::from_millis(1);
   assert!(
-    !t.take_at(
-      Family::V6,
-      b"announcement",
-      RxEvidence::none(),
+    !consumed(t.claim_at(
+      &RxDatagram::without_stamp(Family::V6, &b"announcement"[..]),
       ClockPair::new(sent.wall, expired)
-    ),
+    )),
     "the monotonic clock is past the TTL, so the credit is dead however the wall \
      clock reads"
   );
@@ -4563,12 +4652,10 @@ fn the_self_send_ttl_is_measured_monotonically_not_on_the_wall_clock() {
   );
   // Nor does a wall clock that stepped BACKWARDS revive it.
   assert!(
-    !t.take_at(
-      Family::V6,
-      b"announcement",
-      RxEvidence::none(),
+    !consumed(t.claim_at(
+      &RxDatagram::without_stamp(Family::V6, &b"announcement"[..]),
       ClockPair::new(sent.wall - Duration::from_secs(900), expired)
-    ),
+    )),
     "a backwards step cannot buy a dead credit more window than the monotonic \
      clock allows"
   );
@@ -5137,11 +5224,10 @@ fn inject_ptr_query(s: &mut State, src: core::net::SocketAddr, t: StdInstant) {
     Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
     1,
     Some(255), // §11 on-link
-    RxEvidence::none(),
     n,
   );
   let _ = t;
-  s.handle_datagram(Family::V4, &meta, &qbuf[..n]);
+  s.handle_datagram(&meta, &RxDatagram::without_stamp(Family::V4, &qbuf[..n]));
 }
 
 /// Bypassing the bound for a one-shot datagram must not bypass the CORE confirm:
@@ -5539,10 +5625,12 @@ fn a_credit_sealed_before_the_park_expires_across_it_and_cannot_suppress_a_peer(
       Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
       1,
       Some(255),
-      RxEvidence::from_stamp_for_test(SystemTime::now()),
       body.len(),
     );
-    s.handle_datagram(family, &meta, &body);
+    s.handle_datagram(
+      &meta,
+      &RxDatagram::from_stamp_for_test(family, &body, SystemTime::now()),
+    );
 
     assert_eq!(
       s.selfsend.len(),
@@ -5625,10 +5713,12 @@ fn the_seal_predates_the_park_and_the_generation_proves_it() {
       Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
       1,
       Some(255),
-      RxEvidence::from_stamp_for_test(SystemTime::now()),
       body.len(),
     );
-    s.handle_datagram(family, &meta, &body);
+    s.handle_datagram(
+      &meta,
+      &RxDatagram::from_stamp_for_test(family, &body, SystemTime::now()),
+    );
     assert_eq!(
       s.selfsend.seal_generation(),
       at_boundary,
@@ -5686,11 +5776,10 @@ fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
       Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
       1,
       Some(255),
-      RxEvidence::none(),
       body.len(),
     )
   };
-  s.handle_datagram(Family::V4, &from(40000), &body);
+  s.handle_datagram(&from(40000), &RxDatagram::without_stamp(Family::V4, &body));
   assert_eq!(
     s.selfsend.len(),
     1,
@@ -5700,7 +5789,7 @@ fn a_legacy_query_from_an_ephemeral_port_is_never_offered_a_credit() {
 
   // And the credit is still there for the datagram it belongs to: the same bytes
   // arriving from 5353 are our echo and claim it.
-  s.handle_datagram(Family::V4, &from(5353), &body);
+  s.handle_datagram(&from(5353), &RxDatagram::without_stamp(Family::V4, &body));
   assert!(
     s.selfsend.is_empty(),
     "the genuine echo, from 5353, still finds the credit the legacy query was \

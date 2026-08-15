@@ -101,8 +101,16 @@ where
   /// for is the kind of surprise a registration API should not hand back.
   ///
   /// Returns [`RegisterServiceError::HostAddressesDiffer`] if a live route
-  /// already publishes this host name with a different A/AAAA set — see
-  /// [`Self::host_addresses_disagree`].
+  /// already publishes this host name with a different A/AAAA set. **Two live
+  /// services may share a host name, but only by publishing the same addresses
+  /// under it.** RFC 6762 §9 classifies a conflict against the RECEIVING
+  /// service's own records, so a sibling advertising that host with a different
+  /// set is a genuine conflict by that test — and a host name has no auto-rename,
+  /// so it surfaces as a terminal update rather than resolving itself. The two
+  /// address sets are compared as SETS, so order and repeats do not matter and an
+  /// IPv6 scope id does; the host name is matched case-insensitively, the way the
+  /// routing path matches a record against it. A route already withdrawing under
+  /// §10.1 no longer holds its host name for this test.
   ///
   /// Returns [`RegisterServiceError::StorageFull`] if the routing pool is at
   /// capacity.

@@ -75,7 +75,7 @@
 //! admits the question stage 4 is about to draw or the answer stage 1 is about
 //! to apply — is read at the decision by the code that makes it. The strongest
 //! form is to take no instant at all, which is what
-//! [`SelfSendTracker::take`](hick_udp::selfsend::SelfSendTracker::take),
+//! [`SelfSendTracker::claim`](hick_udp::selfsend::SelfSendTracker::claim),
 //! [`send_and_credit`], [`Mdns::push_updates`], [`Mdns::advance_lookups`] and
 //! [`Mdns::drain_withdrawals`] all do: a parameter is a channel through which a
 //! caller hands in a reading taken somewhere else, and moving the read nearer
@@ -169,9 +169,9 @@ use mdns_proto::{
   TransmitObligation, event::RouteEvent,
 };
 
-use hick_udp::onlink;
+use hick_udp::{onlink, selfsend::SelfSendMatch};
 
-use crate::{endpoint::Mdns, error::TickError, event::Event};
+use crate::{endpoint::Mdns, error::TickError, event::Event, socket::RecvStep};
 
 pub(crate) use sends::{FamilyWireGate, SendHealth, send_and_credit};
 /// One datagram's passage through the ingress trust boundary, as a test needs to
@@ -219,13 +219,13 @@ mod withdrawal;
 /// at the budget leaves the socket's readable flag set, which is exactly what
 /// makes [`Mdns::next_timeout`] report zero and the drain resume immediately.
 ///
-/// # It bounds `recv` calls, not syscalls
+/// # It bounds DRAINED DATAGRAMS, not syscalls
 ///
-/// This counts iterations of the drain loop, and each one calls
-/// [`Sockets::recv`] once — but a single `recv` may itself consume and discard
-/// up to [`MAX_DISCARDED_PER_RECV`](crate::socket::MAX_DISCARDED_PER_RECV)
-/// unusable datagrams (oversized, unparseable, or `EINTR`) before it returns
-/// one this loop can use. **The two budgets multiply**: against a peer
+/// This counts iterations of the drain loop, and each one yields at most one
+/// datagram — but reaching it may consume and discard up to
+/// [`MAX_DISCARDED_PER_RECV`](crate::socket::MAX_DISCARDED_PER_RECV) unusable
+/// ones (oversized, unparseable, or `EINTR`) first, through as many
+/// [`Sockets::recv_once`] calls. **The two budgets multiply**: against a peer
 /// interleaving oversized and valid datagrams, one `tick` can issue up to
 /// `RECV_BUDGET * MAX_DISCARDED_PER_RECV` ~= 4096 `recvmsg` calls.
 ///
@@ -590,21 +590,40 @@ impl Mdns {
         ..
       } = &mut *self;
 
-      let Some((meta, family)) = sockets.recv(recv_buf.as_mut_slice()) else {
-        return;
-      };
+      // The receive mints the datagram: its family, its body sliced to the
+      // length that receive reported, and the kernel stamp that orders it
+      // against our own sends, in one value that cannot be taken apart. The
+      // `recv_buf.get(..meta.len())` this replaced chose the body HERE, several
+      // statements from the read, which is the distance the mint removes. A
+      // receive reporting more bytes than the buffer holds is dropped inside
+      // `Sockets::recv_once` — see `hick_udp::selfsend::RxDatagram`, which
+      // states that rule once for every driver.
+      //
       // No clock read at this line, and the one below is not for the credit.
       // `SELF_SEND_TTL` is no deadline but a real-time bound on FALSE
-      // suppression, so a credit's age belongs to `SelfSendTracker::take`, which
-      // reads it at its own liveness decision and accepts an instant from
+      // suppression, so a credit's age belongs to `SelfSendTracker::claim`,
+      // which reads it at its own liveness decision and accepts an instant from
       // nobody. An instant captured here would already be stale by the two
       // admission gates below — see that method's docs for why the parameter was
       // the defect rather than the fix.
-      let Some(data) = recv_buf.get(..meta.len()) else {
-        // `recv` never reports more bytes than the buffer holds; a datagram
-        // that would not fit was already rejected as truncated.
-        continue;
+      //
+      // The retry loop `Sockets::recv` used to run internally lives here now,
+      // and only because it must: a minted datagram borrows `recv_buf` for as
+      // long as this iteration uses it, and a loop that hands such a borrow out
+      // of `Sockets` can never re-borrow the buffer for its next attempt. Every
+      // decision inside it is still `recv_once`'s — the family rotation, the
+      // readiness clearing, the error classification, the stats, and the
+      // `MAX_DISCARDED_PER_RECV` budget this counter feeds, reset once per
+      // drained datagram exactly as it was per `recv` call.
+      let mut discarded = 0usize;
+      let (rx, meta) = loop {
+        match sockets.recv_once(recv_buf.as_mut_slice(), &mut discarded) {
+          RecvStep::Datagram(rx, meta) => break (rx, meta),
+          RecvStep::Retry => {}
+          RecvStep::Idle => return,
+        }
       };
+      let data = rx.body();
 
       // The ingress trust boundary, applied BEFORE the proto layer can cache or
       // act on attacker-injected records and BEFORE the take-once credit is
@@ -695,7 +714,7 @@ impl Mdns {
       }
       #[cfg(test)]
       ingress_log.push(IngressRecord {
-        family,
+        family: rx.family(),
         body: body_fingerprint(data),
         reported_interface: meta.interface_index(),
         admitted,
@@ -751,7 +770,7 @@ impl Mdns {
       // two separately-stamped credits, and the rotor does not fix which socket
       // is read first — so without the family key the second echo read can
       // consume the first echo's credit and leave its own owner facing a credit
-      // stamped after the kernel saw it. See `SelfSendTracker::take`.
+      // stamped after the kernel saw it. See `SelfSendTracker::claim`.
       //
       // A kernel receive timestamp additionally carries ordering information,
       // which is what stops a byte-identical peer datagram the kernel saw
@@ -761,9 +780,15 @@ impl Mdns {
       // papered over with a userspace stamp, because a read time taken here
       // says nothing about when the kernel saw the datagram.
       //
+      // Both facts travel INSIDE the datagram, which is why the claim takes one
+      // argument. `RxDatagram` is neither `Copy` nor `Clone` and exposes no
+      // stamp, so a stamp a kernel really did write — for a different receive —
+      // has no way to reach these bytes; pairing them used to be a convention
+      // held by this call site.
+      //
       // The kernel stamp only ORDERS the echo against the send. Two clocks
       // answer two questions and this call supplies exactly one of them: the
-      // credit's AGE is read inside `take`, at the decision, because everything
+      // credit's AGE is read inside `claim`, at the decision, because everything
       // between the read above and this line — both admission gates, and
       // whatever the scheduler does among them — is elapsed time the credit must
       // be charged.
@@ -780,10 +805,46 @@ impl Mdns {
       // behind it would find no credit and reach the protocol layer as peer
       // traffic. The short circuit is load-bearing — a datagram that cannot be
       // ours must not consume the credit it failed to match either.
+      //
+      // ── THE TIER THIS DRIVER CAN HONESTLY REPORT ───────────────────────────
+      //
+      // Three answers, not two, and each is a claim about THIS DRIVER'S OWN SEND
+      // LOG rather than about the network — no platform reports "this is your
+      // own multicast echo".
+      //
+      //  * `Ordered` weighed evidence that the kernel saw this datagram at or
+      //    after our own `sendto`, so nothing else could have put these bytes on
+      //    the wire in between. That is `OwnEcho`, the only tier that suppresses
+      //    everything.
+      //  * `Degraded` matched on content, family and the TTL with NOTHING
+      //    ordering it — and a byte-identical datagram from a conforming RFC 6762
+      //    §9 fault-tolerance twin matches exactly that way, so the claim cannot
+      //    be trusted with a name. `OwnEchoLikely` still declines §10 cache
+      //    population and §7.1/§7.3 quieting, where believing a peer is the more
+      //    harmful error, and it still ADJUDICATES: suppressing a §8.2 proposal
+      //    costs a name permanently and silently, while adjudicating our own echo
+      //    costs at worst §8.2's one-second deferral.
+      //  * `NoCredit` is a negative claim about this log — no credit matched, an
+      //    evicted one included — which is what `NotFromUs` means. So is a source
+      //    port this endpoint never sends from, and that one is decided WITHOUT
+      //    offering a credit at all: the `if` is the short circuit the old `&&`
+      //    was, and it is load-bearing. A §6.7 legacy unicast query from an
+      //    ephemeral port carrying the same bytes as one we just multicast would
+      //    otherwise take that credit under `Degraded` and be reported as our own
+      //    echo — the reply that querier is owed would never be sent, and the
+      //    genuine echo behind it would find no credit and reach the protocol
+      //    layer as a peer's.
       #[cfg(test)]
       Self::stall_before_claim(forced_claim_delays);
-      let caller_is_self =
-        from_mdns_port && selfsend.take(family, data, sockets.rx_evidence(&meta));
+      let provenance = if from_mdns_port {
+        match selfsend.claim(&rx) {
+          SelfSendMatch::Ordered => Provenance::OwnEcho,
+          SelfSendMatch::Degraded => Provenance::OwnEchoLikely,
+          SelfSendMatch::NoCredit => Provenance::NotFromUs,
+        }
+      } else {
+        Provenance::NotFromUs
+      };
 
       // This datagram's own processing instant, read here rather than taken from
       // the tick, because `Endpoint::handle` weighs a bound the CALLER holds
@@ -804,15 +865,7 @@ impl Mdns {
 
       let route_events = match endpoint.handle(
         processed_at,
-        Received::new(
-          meta.peer(),
-          data,
-          if caller_is_self {
-            Provenance::OwnEcho
-          } else {
-            Provenance::Unknown
-          },
-        )
+        Received::new(meta.peer(), data, provenance)
         // The protocol core takes the index as a ROUTING hint and admits nothing
         // on it — the trust decision was made above, against the witness itself.
         .with_interface(iface_witness.witnessed_index().map(|i| i.get()))
