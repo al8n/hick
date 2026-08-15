@@ -13,7 +13,7 @@ use std::{
 use futures::future::select_all;
 use hick_trace::*;
 use hick_udp::{
-  MulticastOptionsV4, MulticastOptionsV6,
+  Family, MulticastOptionsV4, MulticastOptionsV6,
   onlink::{collect_local_subnets, is_loopback_interface},
   try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
@@ -53,27 +53,35 @@ impl Endpoint {
 
     let interface_index = match opts.interface_index() {
       Some(i) => i,
-      None => pick_default_interface_index(opts.ipv4(), opts.ipv6()).ok_or_else(|| {
-        ServerError::Io(io::Error::new(
-          ErrorKind::NotFound,
-          "no multicast-capable interface found",
-        ))
-      })?,
+      None => pick_default_interface_index(opts.ipv4(), opts.ipv6())
+        .map_err(ServerError::Io)?
+        .ok_or_else(|| {
+          ServerError::Io(io::Error::new(
+            ErrorKind::NotFound,
+            "no multicast-capable interface found",
+          ))
+        })?,
     };
 
-    // Gracefully degrade — if the chosen interface lacks one of the
-    // requested families, bind only the family it can support rather than
-    // failing the entire endpoint.
-    let iface_has_v4 = match getifs::interface_by_index(interface_index) {
-      Ok(Some(i)) => matches!(i.ipv4_addrs(), Ok(ref a) if !a.is_empty()),
-      _ => false,
+    // Ok(empty) degrades a family; Err is not absence — see has_addr_in.
+    let (bind_v4, bind_v6) = match getifs::interface_by_index(interface_index) {
+      Ok(Some(i)) => (
+        opts.ipv4() && has_addr_in(&i, Family::V4).map_err(ServerError::Io)?,
+        opts.ipv6() && has_addr_in(&i, Family::V6).map_err(ServerError::Io)?,
+      ),
+      Ok(None) => {
+        return Err(ServerError::Io(io::Error::new(
+          ErrorKind::NotFound,
+          format!("no interface with index {interface_index}"),
+        )));
+      }
+      Err(e) => {
+        return Err(ServerError::Io(io::Error::new(
+          e.kind(),
+          format!("looking up interface {interface_index}: {e}"),
+        )));
+      }
     };
-    let iface_has_v6 = match getifs::interface_by_index(interface_index) {
-      Ok(Some(i)) => matches!(i.ipv6_addrs(), Ok(ref a) if !a.is_empty()),
-      _ => false,
-    };
-    let bind_v4 = opts.ipv4() && iface_has_v4;
-    let bind_v6 = opts.ipv6() && iface_has_v6;
     if !bind_v4 && !bind_v6 {
       return Err(ServerError::Io(io::Error::new(
         ErrorKind::AddrNotAvailable,
@@ -400,39 +408,132 @@ impl Drop for Endpoint {
   }
 }
 
-/// Pick a default interface index when the caller didn't pin one. Mirrors
-/// the algorithm in `hick-reactor::endpoint::pick_default_interface_index`:
-/// prefer a non-loopback, multicast-up interface that satisfies every
-/// requested family; fall back through looser predicates ending at the
-/// loopback interface.
-fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> Option<u32> {
-  let ifs = getifs::interfaces().ok()?;
-  let has_v4 = |i: &getifs::Interface| matches!(i.ipv4_addrs(), Ok(ref v) if !v.is_empty());
-  let has_v6 = |i: &getifs::Interface| matches!(i.ipv6_addrs(), Ok(ref v) if !v.is_empty());
-  let multicast_up_non_loopback = |i: &getifs::Interface| -> bool {
-    let f = i.flags();
-    f.contains(getifs::Flags::UP)
-      && f.contains(getifs::Flags::MULTICAST)
-      && !f.contains(getifs::Flags::LOOPBACK)
-      && i.index() != 0
+/// Pick a default interface index when the caller didn't pin one.
+///
+/// Dispatches to [`rank_candidates`], which probes a candidate's addresses only
+/// while its answer can still outrank the incumbent. An error is propagated
+/// when reading a candidate that could change the pick, preserving the rule
+/// that transient enumeration failures (e.g. `EINTR`) are hard errors and not
+/// mistaken for an absent family.
+fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<Option<u32>> {
+  let ifs = getifs::interfaces()
+    .map_err(|e| io::Error::new(e.kind(), format!("enumerating network interfaces: {e}")))?;
+  rank_candidates(
+    ifs
+      .iter()
+      .filter_map(|i| Some((tier_base(i)?, i.index(), i))),
+    want_v4,
+    want_v6,
+    |iface, family| has_addr_in(iface, family),
+  )
+}
+
+/// The best tier `iface`'s FLAGS alone can qualify it for, or `None` when they
+/// disqualify it outright.
+///
+/// Tier 0 is an up, multicast-capable, non-loopback interface and tier 2 is an
+/// up loopback one; each tier's odd neighbour above it is the same interface
+/// serving only some of the requested families. Reading no address here is what
+/// keeps an interface the picker would never choose from costing a syscall — or
+/// failing one.
+fn tier_base(iface: &getifs::Interface) -> Option<u8> {
+  let f = iface.flags();
+  if f.contains(getifs::Flags::UP)
+    && f.contains(getifs::Flags::MULTICAST)
+    && !f.contains(getifs::Flags::LOOPBACK)
+    && iface.index() != 0
+  {
+    Some(0)
+  } else if f.contains(getifs::Flags::LOOPBACK) && f.contains(getifs::Flags::UP) {
+    Some(2)
+  } else {
+    None
+  }
+}
+
+/// Rank already-classified candidates and return the winner's interface index.
+///
+/// `candidates` yields `(tier_base, index, subject)`, where `subject` is
+/// whatever `has_addr` needs to read that candidate's addresses.
+///
+/// One pass over four preference tiers, lowest wins, first-seen wins within a
+/// tier. Probes for a family only while its answer can still outrank the
+/// incumbent.
+fn rank_candidates<S>(
+  candidates: impl IntoIterator<Item = (u8, u32, S)>,
+  want_v4: bool,
+  want_v6: bool,
+  mut has_addr: impl FnMut(&S, Family) -> io::Result<bool>,
+) -> io::Result<Option<u32>> {
+  let mut best: Option<(u8, u32)> = None;
+  'candidates: for (tier_base, index, subject) in candidates {
+    let mut reachable = tier_base;
+    let mut serves_any = false;
+    for (family, wanted) in [(Family::V4, want_v4), (Family::V6, want_v6)] {
+      if best.is_some_and(|(seen, _)| reachable >= seen) {
+        continue 'candidates;
+      }
+      let serves = wanted && has_addr(&subject, family)?;
+      serves_any |= serves;
+      if wanted && !serves {
+        reachable = tier_base + 1;
+      }
+    }
+    if !serves_any && reachable > tier_base {
+      continue;
+    }
+    if best.is_none_or(|(seen, _)| reachable < seen) {
+      best = Some((reachable, index));
+    }
+  }
+  Ok(best.map(|(_, index)| index))
+}
+
+/// Address presence for `family`. `false` only means Ok(empty); Err is not absence.
+fn has_addr_in(iface: &getifs::Interface, family: Family) -> io::Result<bool> {
+  let index = iface.index();
+  let (label, addrs) = match family {
+    Family::V4 => ("IPv4", iface.ipv4_addrs().map(|a| !a.is_empty())),
+    Family::V6 => ("IPv6", iface.ipv6_addrs().map(|a| !a.is_empty())),
   };
-  let loopback_up = |i: &getifs::Interface| -> bool {
-    i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP)
+  #[cfg(test)]
+  let addrs = match forced_enumeration_error() {
+    Some(forced) if forced == family => Err(io::Error::from(ErrorKind::PermissionDenied)),
+    _ => addrs,
   };
-  let strict =
-    |i: &&getifs::Interface| -> bool { (!want_v4 || has_v4(i)) && (!want_v6 || has_v6(i)) };
-  let loose = |i: &&getifs::Interface| -> bool { (want_v4 && has_v4(i)) || (want_v6 && has_v6(i)) };
-  ifs
-    .iter()
-    .find(|i| multicast_up_non_loopback(i) && strict(i))
-    .or_else(|| {
-      ifs
-        .iter()
-        .find(|i| multicast_up_non_loopback(i) && loose(i))
-    })
-    .or_else(|| ifs.iter().find(|i| loopback_up(i) && strict(i)))
-    .or_else(|| ifs.iter().find(|i| loopback_up(i) && loose(i)))
-    .map(|i| i.index())
+  addrs.map_err(|e| {
+    io::Error::new(
+      e.kind(),
+      format!("reading the {label} addresses of interface {index}: {e}"),
+    )
+  })
+}
+
+#[cfg(test)]
+thread_local! {
+  static FORCED_ENUMERATION_ERROR: core::cell::Cell<Option<Family>> =
+    const { core::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn forced_enumeration_error() -> Option<Family> {
+  FORCED_ENUMERATION_ERROR.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn force_enumeration_error_for_test(family: Family) -> ForcedEnumerationError {
+  FORCED_ENUMERATION_ERROR.with(|c| c.set(Some(family)));
+  ForcedEnumerationError
+}
+
+#[cfg(test)]
+struct ForcedEnumerationError;
+
+#[cfg(test)]
+impl Drop for ForcedEnumerationError {
+  fn drop(&mut self) {
+    FORCED_ENUMERATION_ERROR.with(|c| c.set(None));
+  }
 }
 
 #[cfg(test)]
