@@ -1390,7 +1390,7 @@ fn a_supersede_retires_credits_without_discarding_them() {
 // The generation answers one question: has what this endpoint PUBLISHES changed
 // since this datagram was sent? A datagram that asserts records can go stale
 // that way. A question cannot — it asserts nothing, so there is nothing in it
-// for a registration or a withdrawal to invalidate.
+// for a withdrawal or a rename to invalidate.
 
 /// A structurally valid mDNS QUERY: one question for `_http._tcp.local. PTR IN`
 /// and not a single resource record.
@@ -1413,7 +1413,7 @@ const QUERY_HTTP_PTR: &[u8] = &[
 ///
 /// QR=0, so it is a query by the header's own bit — and it still asserts, which
 /// is why the class cannot be read off that bit alone. The rdata it proposes is
-/// exactly what a registration or a withdrawal can make stale.
+/// exactly what a withdrawal or a rename can make stale.
 const PROBE_HICK_A: &[u8] = &[
   // ID, flags (QR=0), QDCOUNT=1, ANCOUNT=0, NSCOUNT=1, ARCOUNT=0.
   0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, //
@@ -1426,15 +1426,16 @@ const PROBE_HICK_A: &[u8] = &[
 
 /// A QUESTION SURVIVES A PUBLICATION CHANGE AS A TAKE-ONCE CREDIT.
 ///
-/// The generation was applied to the whole log, so a service registration — or a
-/// withdrawal, or a §9 rename — retired every outstanding credit including the
-/// ones for datagrams that assert nothing. A superseded credit is deliberately
+/// The generation was applied to the whole log, so a withdrawal — or a §9
+/// rename — retired every outstanding credit including the ones for datagrams
+/// that assert nothing. A superseded credit is deliberately
 /// non-consuming, so a query credit became a STANDING TOMBSTONE: every
-/// byte-identical copy read `Superseded`, every driver maps that to
-/// `Provenance::OwnEcho`, and `OwnEcho` suppresses the whole datagram. A peer's
-/// query retransmission from port 5353 — RFC 6762 §5.2 schedules them, so these
-/// are ordinary traffic and not a corner case — was then invisible for the rest
-/// of the credit's life instead of for the one copy take-once costs.
+/// byte-identical copy read `Superseded`, which every driver maps to
+/// `Provenance::OwnEchoLikely` — §10 cache population and §7.1/§7.3 quieting
+/// denied. A peer's query retransmission from port 5353 — RFC 6762 §5.2 schedules
+/// them, so these are ordinary traffic and not a corner case — then contributed
+/// neither for the rest of the credit's life, instead of for the one copy
+/// take-once costs.
 ///
 /// Nothing about a question can be made stale by what this endpoint publishes:
 /// its records are questions rather than claims, so its echo can carry no rdata
@@ -1477,7 +1478,7 @@ fn a_question_credit_stays_take_once_across_a_publication_change() {
 
 /// The boundary is what the datagram ASSERTS, not the header's QR bit: an RFC
 /// 6762 §8.2 probe is a query that proposes records, and those records are
-/// exactly what a registration or a withdrawal can retire.
+/// exactly what a withdrawal or a rename can retire.
 ///
 /// So the tombstone still stands here, and it stands for every copy — the
 /// property the previous round bought, which this one must not spend.

@@ -5,7 +5,9 @@ use core::time::Duration;
 use super::*;
 use crate::{
   Name, ServiceHandle,
-  event::{ConflictOrigin, KnownAnswer, ProbeConflict, ProbeProposal, ServiceEvent},
+  event::{
+    ConflictHistory, ConflictOrigin, KnownAnswer, ProbeConflict, ProbeProposal, ServiceEvent,
+  },
   records::ServiceRecords,
   transmit::{FamilyDelivery, V4, V6},
   wire::Ref,
@@ -2251,7 +2253,12 @@ fn section9_reprobe_clears_queued_legacy_reply() {
   let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      srec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
 
@@ -3068,7 +3075,12 @@ fn probe_conflict_before_our_first_probe_is_ignored() {
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     t0,
   );
 
@@ -3134,7 +3146,12 @@ fn probe_conflict_before_our_first_probe_is_ignored() {
   let t2 = probe_once(&mut svc, t1);
   let (rec_again, _) = Ref::try_parse(&buf, 0).unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec_again, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec_again,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     t2,
   );
   assert!(
@@ -3228,7 +3245,12 @@ fn a_response_beats_our_probe_even_when_our_records_sort_later() {
 
   for rref in [txt_ref, srv_ref] {
     svc.handle_event(
-      ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rref, dg(1))),
+      ServiceEvent::ProbeConflict(ProbeConflict::new(
+        peer,
+        rref,
+        dg(1),
+        ConflictHistory::Unmatched,
+      )),
       t0,
     );
   }
@@ -3432,7 +3454,12 @@ fn a_peer_probing_our_established_name_does_not_revert_us() {
   // really is the event and not the record.
   let (rec_resp, _) = Ref::try_parse(&buf, 0).unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec_resp, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec_resp,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert_eq!(
@@ -3474,7 +3501,12 @@ fn the_section9_revert_shuts_the_pre_probe_window_again() {
   let (txt_ref, _) = Ref::try_parse(&buf_txt, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, txt_ref, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      txt_ref,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert_eq!(
@@ -3498,7 +3530,12 @@ fn the_section9_revert_shuts_the_pre_probe_window_again() {
   );
   let (srv_ref, _) = Ref::try_parse(&buf_srv, 0).unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srv_ref, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      srv_ref,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert!(
@@ -3544,7 +3581,12 @@ fn established_service_reprobes_on_different_rdata_conflict() {
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   let t = FakeInstant::zero().advance(100_000);
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     t,
   );
 
@@ -3588,7 +3630,12 @@ fn established_service_ignores_identical_rdata() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     FakeInstant::zero().advance(100_000),
   );
   assert_eq!(
@@ -4907,7 +4954,12 @@ fn an_identical_defending_response_never_costs_a_probing_service_its_name() {
       identical(&mut buf, srv);
       let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
       svc.handle_event(
-        ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+        ServiceEvent::ProbeConflict(ProbeConflict::new(
+          peer,
+          rec,
+          dg(1),
+          ConflictHistory::Unmatched,
+        )),
         t0,
       );
     }
@@ -4953,7 +5005,12 @@ fn an_identical_defending_response_never_costs_a_probing_service_its_name() {
       identical(&mut buf, srv);
       let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
       svc.handle_event(
-        ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+        ServiceEvent::ProbeConflict(ProbeConflict::new(
+          peer,
+          rec,
+          dg(1),
+          ConflictHistory::Unmatched,
+        )),
         now,
       );
     }
@@ -5133,7 +5190,12 @@ fn a_queued_announcement_cannot_overtake_a_classified_conflict() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.44:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert!(
@@ -5497,7 +5559,12 @@ fn the_section81_window_stays_open_250ms_past_the_third_probe() {
       ConflictOrigin::AuthoritativeResponse => {
         let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
         svc.handle_event(
-          ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+          ServiceEvent::ProbeConflict(ProbeConflict::new(
+            peer,
+            rec,
+            dg(1),
+            ConflictHistory::Unmatched,
+          )),
           inside,
         );
       }
@@ -6154,7 +6221,12 @@ fn post_establishment_conflict_drops_non_srv_txt_record() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert_eq!(svc.state(), ServiceState::Established);
@@ -6179,7 +6251,12 @@ fn post_establishment_conflict_ignores_identical_srv() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert_eq!(
@@ -6198,7 +6275,12 @@ fn post_establishment_conflict_drops_malformed_srv() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert_eq!(
@@ -6229,7 +6311,12 @@ fn post_establishment_conflict_is_rate_limited() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert_eq!(
@@ -7979,7 +8066,12 @@ fn a_conflict_rename_clears_the_partial_bound() {
   let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      srec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   now = now.advance(300);
@@ -8026,7 +8118,12 @@ fn the_section9_revert_to_probe_clears_the_partial_bound() {
   let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      srec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     at,
   );
 
@@ -8119,7 +8216,12 @@ fn deliver_losing_srv_conflict(
       );
       let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
       svc.handle_event(
-        ServiceEvent::ProbeConflict(ProbeConflict::new(peer, srec, dg(1))),
+        ServiceEvent::ProbeConflict(ProbeConflict::new(
+          peer,
+          srec,
+          dg(1),
+          ConflictHistory::Unmatched,
+        )),
         now,
       );
     }
@@ -10381,7 +10483,12 @@ fn a_response_of_any_type_at_our_instance_name_defeats_the_probe() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     start,
   );
 
@@ -10433,7 +10540,12 @@ fn a_malformed_record_at_the_probed_name_is_not_a_conflict() {
   let start = probe_once(&mut svc, FakeInstant::zero());
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     start,
   );
   assert!(
@@ -10470,7 +10582,12 @@ fn an_identical_twins_instance_nsec_is_never_a_conflict() {
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     start,
   );
   assert!(
@@ -10524,7 +10641,12 @@ fn a_differing_instance_nsec_reverts_an_established_service() {
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert_eq!(
@@ -10556,7 +10678,12 @@ fn a_shared_ptr_at_the_instance_name_still_makes_no_established_conflict() {
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     now,
   );
   assert_eq!(
@@ -10629,7 +10756,12 @@ fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name(
   let rec = reader.additional().flatten().next().unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     start,
   );
   assert!(
@@ -10645,7 +10777,12 @@ fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name(
   let reader2 = crate::wire::MessageReader::try_parse(&foreign).unwrap();
   let rec2 = reader2.additional().flatten().next().unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec2, dg(2))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec2,
+      dg(2),
+      ConflictHistory::Unmatched,
+    )),
     start,
   );
   assert!(
@@ -11034,7 +11171,12 @@ fn a_malformed_response_does_not_defeat_the_probe() {
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+    )),
     start,
   );
 

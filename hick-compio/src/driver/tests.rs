@@ -4359,18 +4359,21 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
 /// The proto calls `Service::set_instance` before it emits `Renamed`, so by the
 /// time `push_service_updates` observes the update this service publishes a
 /// different set of records — the rename is a published-record mutation, and
-/// `SelfSendTracker::supersede` is owed at that site as much as at a
-/// registration or a withdrawal.
+/// `SelfSendTracker::supersede` is owed at that site as much as at a withdrawal
+/// — the only other seam there is, a registration having turned out not to be
+/// one.
 ///
 /// Left un-superseded, a credit older than the rename claims at the CURRENT
 /// generation: `Provenance::OwnEchoLikely`, the tier that declines §10 caching
 /// but still ADJUDICATES — and what it would adjudicate is an §8.2 proposal for
 /// a name this endpoint no longer defends, carrying §9 rdata no live route
-/// holds. The window runs from the rename to the next registration or
-/// withdrawal: the tracker holds ONE generation for the whole log, so either of
-/// those demotes the stale credit too. The advance is owed at the MUTATION
-/// rather than argued from where a stale credit can reach — that argument has to
-/// be re-made after every change to the routing, and this one does not.
+/// holds. The window runs from the rename to the next seam of either kind: the
+/// tracker holds ONE generation for the whole log, so a later withdrawal or
+/// rename demotes the stale credit too. A registration does NOT — it mutates no
+/// record already asserted — so nothing else closes this window. The advance is
+/// owed at the MUTATION rather than argued from where a stale credit can reach —
+/// that argument has to be re-made after every change to the routing, and this
+/// one does not.
 ///
 /// The rename asserted here must SURVIVE. A rename COLLISION is retired through
 /// `begin_service_withdrawal`, which supersedes for a reason of its own, so a
@@ -4502,10 +4505,88 @@ fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
       .claim(&RxDatagram::without_stamp(Family::V4, MARKER)),
     SelfSendMatch::Superseded,
     "a successful auto-rename mutates the records this service publishes, so a \
-     credit recorded before it describes a state this endpoint has left; left \
-     un-superseded it claims as current, reaches `Provenance::OwnEchoLikely` and \
-     still adjudicates — letting a delayed echo of the abandoned instance name \
-     defeat whatever holds that name next under RFC 6762 §8.1"
+     credit recorded before it describes a state this endpoint has left. Both \
+     tiers report `Provenance::OwnEchoLikely` — a content match claims no more \
+     for naming an older generation — so what the seam buys is the STANDING \
+     property: left un-superseded the credit is CURRENT and take-once, the first \
+     delayed echo spends it, and every copy behind it reads `NoCredit`, hence \
+     `NotFromUs`, hence full RFC 6762 §10 cache population and §7.1/§7.3 quieting \
+     for records no live route of ours holds"
+  );
+}
+
+/// A SERVICE REGISTRATION IS NOT A PUBLICATION CHANGE, SO IT SUPERSEDES NOTHING.
+///
+/// This seam used to advance the generation and it was a falsehood. A
+/// registration only INSERTS a route: it mutates no record this endpoint has
+/// already asserted. There is no RFC 6762 §8.4 records mutator, a duplicate
+/// instance name and a name a collision goodbye still holds are both refused,
+/// and a live route publishing the same host name with a different A or AAAA set
+/// makes the registration FAIL (`Endpoint::host_addresses_disagree`). The
+/// negative assertions are covered as well — the encoder emits exactly one §6.1
+/// NSEC per service, owned by the INSTANCE name — so no sibling registration can
+/// flip a host-name NSEC's truth either.
+///
+/// What the falsehood cost is not one datagram. A superseded credit is a
+/// STANDING tombstone: it answers EVERY byte-identical copy for the rest of
+/// `SELF_SEND_TTL` and no claim spends it. So one unrelated registration denied
+/// §10 observation and §7.1/§7.3 quieting to every copy of a LIVE service's own
+/// bytes for the whole window — to a conforming §9 fault-tolerance twin's
+/// identical answers, and to a peer's TTL=0 §10.1 goodbye burst, which then
+/// reaches no cache and leaves the entry it exists to retract standing for its
+/// full original TTL instead of §10.1's one-second clamp.
+///
+/// The body is response-shaped on purpose: only an ASSERTING credit can be
+/// superseded at all, so a body `SendClass` read as a QUESTION would make every
+/// assertion below pass while testing nothing.
+#[test]
+fn a_registration_leaves_a_live_services_credits_observable() {
+  const ANNOUNCEMENT: &[u8] = &[
+    // RFC 1035 §4.1.1 header: ID, flags (QR|AA), QDCOUNT, ANCOUNT, NSCOUNT,
+    // ARCOUNT — then one tag octet so these bytes are this test's alone.
+    0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xAB,
+  ];
+
+  let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+  let now = StdInstant::now();
+  let live = s
+    .test_register_service(delivery_test_spec("Live"), now)
+    .expect("the live service registers");
+  // A credit for a datagram that LIVE service sent. Nothing below retires it.
+  s.selfsend
+    .record(Family::V4, ANNOUNCEMENT, ClockPair::now());
+  s.selfsend.seal();
+  #[cfg(debug_assertions)]
+  s.note_park_entry();
+
+  // An entirely unrelated service registers: different instance name, different
+  // host name, so it asserts nothing the live route asserts and contradicts
+  // nothing it asserts.
+  s.test_register_service(delivery_test_spec("Unrelated"), now)
+    .expect("an unrelated registration");
+
+  assert_eq!(
+    s.selfsend
+      .claim(&RxDatagram::without_stamp(Family::V4, ANNOUNCEMENT)),
+    SelfSendMatch::Degraded,
+    "the registration left nothing behind for this credit to describe, so it \
+     must still read at the CURRENT tier"
+  );
+  for copy in 2..=4u32 {
+    assert_eq!(
+      s.selfsend
+        .claim(&RxDatagram::without_stamp(Family::V4, ANNOUNCEMENT)),
+      SelfSendMatch::NoCredit,
+      "take-once must be intact across the registration: copy {copy} of these \
+       bytes is a PEER's — a §9 twin's answer or a §10.1 goodbye — and a \
+       tombstone standing here would deny it this endpoint's cache and quieting \
+       for the whole recency window"
+    );
+  }
+  assert!(
+    s.services.contains_key(&live),
+    "precondition: the credit's own service is still LIVE, so this is the \
+     unrelated-registration case and not a withdrawal in disguise"
   );
 }
 

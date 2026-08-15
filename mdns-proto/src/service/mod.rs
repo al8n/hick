@@ -2616,10 +2616,41 @@ where
   /// | phase | instance / `ProbeProposal` (§8.2) | instance / `ProbeConflict` (response) | host / TentativeProbe | host / AuthoritativeResponse |
   /// |---|---|---|---|---|
   /// | **A. nothing of ours on the link** (`Init`/`Probing(_)`, `!probe_on_wire`) | §8.2: buffer the proposal | §8.1: silently ignore — "responses received *before* the first probe packet is sent MUST be silently ignored" | ignore (filed gap) | §9: surface terminal `HostConflict` |
-  /// | **B. probed, nothing announced** (`Init`/`Probing(_)`, or `Announcing(0)` with no announcement latched or in flight) | §8.2: buffer the proposal | §8.1: defer to the existing host, `probe_defeated` → rename. No comparison | ignore (filed gap) | §9: surface terminal `HostConflict` |
-  /// | **B′. previous generation advertised, current one re-probing** (§9 revert: `goodbye.any_instance()` but `!generation_advertised`) | §8.2: buffer the proposal | §8.1: defer → rename | ignore (filed gap) | §9: surface terminal `HostConflict` |
-  /// | **C. advertised** (`generation_advertised`) | not §9 — defend by answering the probe's own question (§8.1) | §9: revert to probing | ignore (filed gap) | §9: surface terminal `HostConflict` |
+  /// | **B. probed, nothing announced** (`Init`/`Probing(_)`, or `Announcing(0)` with no announcement latched or in flight) | §8.2: buffer the proposal | §8.1: defer to the existing host, `probe_defeated` → rename. No comparison. History-labelled: §8.2's regress instead — see below | ignore (filed gap) | §9: surface terminal `HostConflict` |
+  /// | **B′. previous generation advertised, current one re-probing** (§9 revert: `goodbye.any_instance()` but `!generation_advertised`) | §8.2: buffer the proposal | §8.1: defer → rename; history-labelled as row B | ignore (filed gap) | §9: surface terminal `HostConflict` |
+  /// | **C. advertised** (`generation_advertised`) | not §9 — defend by answering the probe's own question (§8.1) | §9: revert to probing; history-labelled: dropped | ignore (filed gap) | §9: surface terminal `HostConflict` |
   /// | **D. terminal** (`Conflicting`) | ignore | ignore | ignore | ignore |
+  ///
+  /// # The history label crosses the table, and does NOT read the same in every cell
+  ///
+  /// A `ProbeConflict` may carry [`crate::event::ConflictHistory::Relinquished`]:
+  /// its rdata repeats a set this endpoint recently transmitted and gave up. The
+  /// label is a FACT the endpoint alone can state and a DECISION only this table
+  /// can make, because what a match licenses depends entirely on what the cell
+  /// would otherwise do:
+  ///
+  /// | cell | with the label | why |
+  /// |---|---|---|
+  /// | **B / B′, instance `ProbeConflict`** | §8.2's regress instead of §8.1's rename — `tiebreak_lost`, one second, SAME name | reversible, and the re-probe is the only thing that can tell a ghost from a twin |
+  /// | **C, instance `ProbeConflict`** | dropped | §9's own answer is already defer-and-re-verify behind a rate limit, so the cell is near-free either way; left as it was |
+  /// | **any host / AuthoritativeResponse** | the `HostConflict` is dropped, in the router | terminal and caller-visible, and host-name probing is unimplemented — there is no re-probe whose silence could convict a ghost |
+  ///
+  /// The last row drops an EVENT, not a record. Where a route's instance name IS
+  /// its host name the router tests the host rule first but does not let it
+  /// consume a labelled A/AAAA: the record is also a member of the §8.2 proposal
+  /// this service is probing with, so it falls through and arrives as a labelled
+  /// `ProbeConflict`, read by rows B / B′ and C exactly as the table says. Only
+  /// the unlabelled record is the host rule's alone.
+  ///
+  /// What the label is NOT is "this record was ours". That question has no
+  /// answer at the instant of the lookup: §9 protects a fault-tolerance twin
+  /// "capable of issuing identical answers", and such a twin's defence is
+  /// byte-identical to our own ghost's echo. Row B once acted as though a match
+  /// settled it — the record never reached a service at all — and a successor
+  /// could then probe and announce clean over an incumbent that was defending
+  /// correctly, inside the retention window and with nothing replaying the lost
+  /// defences afterwards. Deferring asks the only question that CAN separate
+  /// them, and asks it of the future rather than of a table.
   ///
   /// Where each decision lives: rows A and B are this method, plus the
   /// `probe_defeated` / `tiebreak_lost` latches it
@@ -2718,6 +2749,44 @@ where
     // name — applying it here would let a later-sorting newcomer keep probing
     // toward a name an existing responder holds, and then take it.
     //
+    // ── THE HISTORY-LABELLED DEFEAT ─────────────────────────────────────────
+    //
+    // The record repeats rdata this endpoint recently transmitted and gave up
+    // (see [`crate::event::ConflictHistory`]), so it is EITHER our own delayed
+    // echo — a rename or unregister whose records are still in flight — OR a §9
+    // fault-tolerance twin defending the name with the same bytes we used to
+    // publish. At this instant those two ARE the same datagram and no lookup can
+    // separate them: §9 exists precisely to protect the twin, and the twin's
+    // defence is byte-for-byte what the ghost's echo would be.
+    //
+    // Only FUTURE behaviour separates them, and §8.2 already knows how to ask.
+    // "It defers to the winning host by waiting one second, and then begins
+    // probing for this record again" — and §8.2 names this very case as its
+    // reason, a probe "maybe from the host itself … echoed back after a short
+    // delay by some Ethernet switches and some 802.11 base stations". A GHOST
+    // cannot answer that re-probe, so the name is claimed a second later. A LIVE
+    // INCUMBENT answers it, and once the label lapses with the retention window
+    // that defeat renames us — §8.1 honoured, late rather than never.
+    //
+    // Latching §8.2's regress rather than §8.1's rename is the whole difference,
+    // and it is a REGRESS, not a suppression: the endpoint used to drop this
+    // record before any service saw it, which let a successor probe and announce
+    // clean over an incumbent that was defending its name correctly. A defence
+    // that reaches no service is not delayed, it is unappealable — while a
+    // deferral costs a second and claims nothing in the meantime, because
+    // `conflict_classified_unresolved` withholds every claim to this name until
+    // the latch is spent.
+    if pc.history().is_relinquished() {
+      trace!(
+        target: "mdns_proto::service",
+        handle = self.handle.raw(),
+        state = ?self.state,
+        src = %pc.src(),
+        "service: conflicting response repeats rdata this endpoint relinquished — deferring one second and re-probing the SAME name (§8.2)"
+      );
+      self.tiebreak_lost = true;
+      return;
+    }
     // Latched rather than acted on, because renaming is a lifecycle move and
     // `handle_event` makes none: `handle_timeout` owns the single rename path,
     // and routing both defeats through it keeps one implementation of it.
@@ -2940,6 +3009,30 @@ where
           .our_canonical_records_for(pc.record().rtype())
           .is_empty()
         {
+          return;
+        }
+        // THE HISTORY LABEL, SPENT AS A SUPPRESSION — the one instance cell
+        // where it still is one, and unchanged in effect from when the router
+        // dropped the record before any service saw it. Only the SITE moved: the
+        // pre-authoritative cell needs the same record delivered, so the drop
+        // could no longer live upstream of both.
+        //
+        // Deliberately left as it was rather than turned into a deferral with
+        // the cell above. §9's answer to a conflict is ALREADY defer-and-
+        // re-verify — `restart_probe_cycle` on the same name — behind a
+        // `CONFLICT_REPROBE_MIN_INTERVAL` rate limit, so this cell is close to
+        // free either way and changing it would widen a fix whose blast radius
+        // is worth keeping to the cell that was actually broken. What it costs
+        // is what it always cost: an established service does not re-verify on a
+        // record matching its endpoint's own recent history until that history
+        // lapses.
+        if pc.history().is_relinquished() {
+          trace!(
+            target: "mdns_proto::service",
+            handle = self.handle.raw(),
+            state = ?self.state,
+            "service: §9 conflict repeats rdata this endpoint relinquished — not re-verifying on our own recent past"
+          );
           return;
         }
         // A record whose rdata will not decode is not one this service can
@@ -3428,6 +3521,19 @@ where
         // is `defeated_by_owner` above, which renames. Telling the two apart is
         // exactly what `ConflictOrigin` bought — before it, an unconditional
         // defer could loop against a real owner forever.
+        //
+        // A HISTORY-LABELLED defeat reaches this same branch, and its
+        // termination argument is a DIFFERENT one, because the incumbent's next
+        // defence carries the same rdata and so carries the same label: the
+        // label is what lapses, not the traffic. It lapses on a deadline fixed
+        // when the record was relinquished — `EndpointConfig::
+        // relinquished_retention` past the last resident copy of that set — so
+        // the loop is bounded by the window rather than by the peer, and the
+        // first unlabelled defence after it renames. Within the window nothing
+        // is claimed: the classification stays unresolved between rounds, and
+        // `poll_transmit` withholds every claim to the name while it is. So the
+        // cost of a wrong guess here is latency, bounded and self-clearing,
+        // where the cost of the drop it replaces was the name itself.
         //
         // And if the "winner" was only a stale echo of our own earlier probe,
         // the retry goes unanswered and we keep the name. That is the whole

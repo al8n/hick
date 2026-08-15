@@ -841,24 +841,35 @@ impl Mdns {
           SelfSendMatch::Ordered => Provenance::OwnEcho,
           SelfSendMatch::Degraded => Provenance::OwnEchoLikely,
           // Our bytes, but from a generation of our own records that no longer
-          // exists — a service registered, began withdrawing, or took an RFC 6762
-          // §9 automatic rename since the send. It maps to `OwnEcho` because that
-          // is the only tier which denies OBSERVATION and QUIETING, and a stale
-          // echo must reach neither: it would write records this endpoint no
-          // longer publishes into its own cache, and defer this endpoint's own
-          // retransmits on their behalf. This is not a claim of stronger evidence
-          // than the match carried — see `SelfSendMatch::Superseded`.
+          // exists — a service began withdrawing, or took an RFC 6762 §9
+          // automatic rename, since the send. `OwnEchoLikely`, the same tier
+          // `Degraded` reports, and for the same reason: the match establishes
+          // CONTENT, not origin, so it may deny OBSERVATION and QUIETING — a
+          // stale echo must reach neither, or it writes records this endpoint no
+          // longer publishes into its own cache and defers this endpoint's own
+          // retransmits on their behalf — and it may not deny ADJUDICATION.
           //
-          // IT IS NOT WHAT KEEPS OUR OWN WITHDRAWN GENERATION FROM RETIRING THE
-          // SERVICE THAT REPLACED IT. That is decided inside `mdns-proto`, by the
-          // `Endpoint` screen behind `EndpointConfig::relinquished_retention`,
-          // and it has to be: this classification is defeasible three independent
+          // `OwnEcho` HERE WAS THE SAME FALSE AXIOM THE PROTO SCREEN ABANDONED,
+          // one layer down: byte equality read as proof these bytes are ours. A
+          // superseded entry is a standing tombstone, so under that mapping an
+          // old local responder and a live §9 fault-tolerance twin producing the
+          // same bytes — or a peer replaying them — made EVERY matching peer
+          // defence invisible for the whole credit lifetime, and a successor
+          // could finish probing while the incumbent went unheard.
+          //
+          // What `OwnEcho` used to buy is bought better elsewhere: our own
+          // withdrawn generation is kept from retiring the service that replaced
+          // it by the `Endpoint` screen behind
+          // `EndpointConfig::relinquished_retention`, which labels the record and
+          // leaves the terminal `HostConflict` dropped in the router while a
+          // pre-authoritative instance conflict merely defers. That has to be
+          // where it lives: this classification is defeasible three independent
           // ways no driver can close — a peer replaying our bytes reproduces
           // everything weighed here, one send can be delivered as several copies
           // while it is credited once, and credits are evicted under load. Each
           // leaves the GENUINE echo reading `NoCredit`, hence `NotFromUs`, hence
-          // fully adjudicated. See `SelfSendTracker::supersede`.
-          SelfSendMatch::Superseded => Provenance::OwnEcho,
+          // fully adjudicated already. See `SelfSendTracker::supersede`.
+          SelfSendMatch::Superseded => Provenance::OwnEchoLikely,
           SelfSendMatch::NoCredit => Provenance::NotFromUs,
         }
       } else {
@@ -1389,12 +1400,13 @@ impl Mdns {
             // state this endpoint has left. Advance at the mutation, and
             // UNCONDITIONALLY — the collision arm below is retired through
             // `begin_service_withdrawal`, which supersedes as well, but a
-            // SURVIVING rename crosses no lifecycle seam at all. The vacated
-            // name can then be taken by another local service, and THAT
-            // registration advances the generation of its own credits, not of
-            // this rename's; a delayed echo of the abandoned owner would
-            // otherwise still read as current, adjudicate, and defeat the new
-            // holder under RFC 6762 §8.1. See `SelfSendTracker::supersede`.
+            // SURVIVING rename crosses no other seam at all. The vacated name
+            // can then be taken by another local service, and THAT registration
+            // advances nothing whatever — a registration mutates no record this
+            // endpoint has already asserted — so without the advance here a
+            // delayed echo of the abandoned owner would still read as current,
+            // adjudicate, and defeat the new holder under RFC 6762 §8.1. See
+            // `SelfSendTracker::supersede`.
             selfsend.supersede();
             // Nothing the OLD name put in flight can still be outstanding here.
             // Every datagram this service produced was confirmed inside the
