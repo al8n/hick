@@ -836,6 +836,7 @@ fn advertised_host_addrs_are_the_emitted_subset_not_configured() {
     std::vec![a2],
     std::vec::Vec::new(),
     false,
+    false,
   ));
   assert_eq!(
     svc.advertised_a_addrs(),
@@ -1238,6 +1239,7 @@ fn goodbye_ownership_accumulates_and_resets_instance_only() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   ));
   assert!(
     g.ptr && !g.srv && g.txt,
@@ -1252,6 +1254,7 @@ fn goodbye_ownership_accumulates_and_resets_instance_only() {
     std::vec![ip],
     std::vec::Vec::new(),
     false,
+    false,
   ));
   assert!(
     g.any_instance() && g.any_host(),
@@ -1265,6 +1268,7 @@ fn goodbye_ownership_accumulates_and_resets_instance_only() {
     false,
     std::vec![ip],
     std::vec::Vec::new(),
+    false,
     false,
   ));
   assert_eq!(g.a, [ip], "duplicate address emit is idempotent");
@@ -10210,6 +10214,7 @@ fn a_shared_ptr_only_response_does_not_close_the_preauthoritative_window() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       true,
+      false,
     ),
     0,
   ));

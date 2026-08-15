@@ -22,6 +22,8 @@ mod query;
 mod receive;
 mod received;
 pub use received::{Provenance, Received};
+mod relinquished;
+use relinquished::Relinquished;
 mod service;
 mod withdrawal;
 
@@ -599,6 +601,31 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   /// (or nothing, once that item drained) — there is no ABA on the poll/note key.
   #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
   next_withdrawal_token: u64,
+  /// Record sets this endpoint recently ASSERTED AND RELINQUISHED, screened
+  /// against every conflict candidate before it reaches a service so our own
+  /// past cannot retire our own present. See the [`relinquished`] module for the
+  /// whole argument, [`Self::retain_relinquished`] for what feeds it, and
+  /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention)
+  /// for how long a row lives.
+  ///
+  /// A `Vec` for the same reason [`Self::withdrawals`] is one: [`ServiceRoute`]
+  /// is non-generic public API, so state that needs the endpoint's `I` cannot be
+  /// hung off it without adding a parameter to every downstream
+  /// `Pool<ServiceRoute>` declaration.
+  #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+  relinquished: std::vec::Vec<Relinquished<I>>,
+  /// The deadline of a relinquishment this endpoint could NOT record, because
+  /// [`relinquished::MAX_RELINQUISHED_RRSETS`] was reached with every row still
+  /// live.
+  ///
+  /// While it is in the future [`Self::relinquished_asserts`] answers `true` for
+  /// every candidate, so no conflict is built at all: an endpoint that cannot
+  /// say "that record was not ours" must not say the opposite either. ONE
+  /// deadline rather than a list of the affected owners, so this backstop cannot
+  /// itself overflow. `None` is the state of every normally-operating endpoint —
+  /// see [`Self::retain_relinquished`] for what it takes to leave it.
+  #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+  relinquished_quarantine_until: Option<I>,
   #[cfg(feature = "stats")]
   stats: std::sync::Arc<hick_trace::stats::Stats>,
   /// Real time to burn inside the next [`Self::poll_query_transmit`], between
@@ -651,6 +678,10 @@ where
       withdrawals: std::vec::Vec::new(),
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       next_withdrawal_token: 0,
+      #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+      relinquished: std::vec::Vec::new(),
+      #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+      relinquished_quarantine_until: None,
       #[cfg(feature = "stats")]
       stats,
       #[cfg(all(test, feature = "std"))]

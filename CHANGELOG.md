@@ -1,5 +1,59 @@
 # UNRELEASED
 
+## A relinquished record set can no longer retire its own replacement
+
+- `mdns-proto`: `Endpoint` screens every conflict candidate against the record
+  sets it recently **asserted and relinquished**, not only against the receiving
+  service's current records, before any `HostConflict` / `ProbeConflict` is
+  built. A withdrawing route stops holding its host name for the registration
+  guard, so a replacement may take host `H` with address set `A2` while the route
+  that held `H` with `A1` is still draining its RFC 6762 §10.1 goodbye; a delayed
+  positive-TTL echo of `A1` — **our own bytes** — was then adjudicated against
+  `A2` and retired a live service with a TERMINAL `ServiceUpdate::HostConflict`.
+  Same-instance reuse with changed SRV/TXT reached a false §8.1 probe defeat the
+  same way. The screen reads two sources: withdrawal items still resident (a
+  withdrawing route's own set, and a §9 rename's abandoned instance name), and a
+  bounded retention list fed at withdrawal completion and at the rename.
+  Service B structurally cannot know the stale set was ours, so only the endpoint
+  can decide this.
+- `mdns-proto`: new `EndpointConfig::relinquished_retention` /
+  `with_relinquished_retention`, defaulting to five seconds — long enough to
+  outlast both a driver's self-send recency window and the §10.1 goodbye ceiling.
+  `Duration::ZERO` disables the retention half. The residual is stated rather
+  than hidden: a real peer asserting, within the window, rdata exactly equal to a
+  set we just relinquished at that same owner has its detection delayed by up to
+  that long. It self-corrects, and it is not an attack surface — mDNS is
+  unauthenticated, so a forger never needed our bytes.
+- `mdns-proto`, `hick-udp`, `hick-mio`, `hick-reactor`, `hick-compio`,
+  `hick-smoltcp`: the driver-side generation binding behind
+  `Provenance::OwnEcho`'s superseded route is now **defence in depth**, and every
+  doc that said otherwise is corrected. It cannot be the load-bearing check:
+  recognising the echo is defeasible three independent ways, none of which a
+  driver can close — an on-link peer replaying captured bytes reproduces every
+  signal a send log weighs, one send is credited once per family while the medium
+  may deliver several copies (kernel loopback plus an 802.11 base-station
+  re-broadcast, which §8.2 names), and credits are evicted under load. Each
+  leaves the GENUINE echo reading "no credit", hence `NotFromUs`, hence fully
+  adjudicated. What the binding still buys is the other half of the harm: a stale
+  echo must not populate this endpoint's cache with records it no longer
+  publishes, nor quiet its own traffic on their behalf.
+- `hick-udp`, `hick-smoltcp`: a SUPERSEDED self-send credit is a **standing
+  tombstone** rather than a take-once one. Every byte-identical copy inside the
+  recency window reports it, and no claim consumes it; only the TTL and the byte
+  budget retire one, so the memory bound is unchanged. Take-once survives at the
+  CURRENT tier, where a conforming RFC 6762 §9 twin's datagram must become
+  visible from its second one, and where a leaked copy is harmless anyway because
+  it asserts rdata still published. Spending a superseded credit bought nothing —
+  what those bytes assert is a set this endpoint has given up, so suppressing
+  every copy can only delay detecting an assertion no live route holds, and an
+  attacker "denied" the replay could forge the same assertion without our bytes —
+  and it cost this: one send is credited once per family while the medium may
+  deliver several copies, so the copy that spent the credit left the GENUINE echo
+  behind it admitted as peer traffic, writing our own withdrawn records into our
+  own cache. `hick-udp` also now prefers a CURRENT credit over a superseded copy
+  of the same bytes, the rule `hick-smoltcp` already applied, without which a
+  standing tombstone would shadow the current tier for the whole window.
+
 ## A typed trust tier for received datagrams
 
 BREAKING

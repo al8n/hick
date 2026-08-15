@@ -828,19 +828,43 @@ pub enum SelfSendMatch {
   /// against our own present. Same-instance reuse with changed SRV/TXT reaches a
   /// false probe defeat the same way.
   ///
-  /// # What a caller must do with it
+  /// # This tier does NOT close that, and must not be relied on to
+  ///
+  /// It cannot, and neither can any refinement of it. **Recognition is
+  /// defeasible**, three independent ways, and each of the three leaves the
+  /// GENUINE echo reporting [`Self::NoCredit`] — which every driver maps to
+  /// `Provenance::NotFromUs`, the tier that adjudicates in full:
+  ///
+  /// * a peer replaying bytes it captured off the link reproduces every signal
+  ///   weighed here — family, exact bytes, source port 5353, age — and the
+  ///   kernel receive stamp adds none, because [`reference_ordered`] rejects an
+  ///   arrival from BEFORE our send while a replay arrives after;
+  /// * one send is credited once per family, but the medium may deliver more
+  ///   than one copy: kernel loopback plus an 802.11 base-station re-broadcast,
+  ///   which RFC 6762 §8.2 names as an echo source. Whichever copy loses the
+  ///   race finds nothing. **No attacker is required**;
+  /// * credits are refused at [`MAX_SELF_SEND_ENTRIES`] and reclaimed under
+  ///   [`MAX_SELF_SEND_BYTES`], so recognition state is traffic-scaled and
+  ///   bounded while the obligation is per copy and unbounded.
+  ///
+  /// The terminal `HostConflict` above is closed in `mdns-proto` instead, by
+  /// `Endpoint` screening every conflict candidate against the record sets it
+  /// recently asserted and RELINQUISHED (`EndpointConfig::relinquished_retention`).
+  /// That decision turns on this endpoint's own lifecycle rather than on whether
+  /// a datagram was recognised, so none of the three holes above reaches it.
+  ///
+  /// # What a caller must still do with it
   ///
   /// Suppress the datagram completely — the `OwnEcho` tier — and never the
   /// adjudicating one. That is not a claim of stronger evidence: it is that a
-  /// superseded echo has nothing left it may safely say. Its §8.2 proposal is a
-  /// proposal for a name this endpoint may no longer be defending, and its §9
-  /// rdata is rdata this endpoint no longer holds, so the only two things the
-  /// adjudicating tier exists to preserve are exactly the two that have gone
-  /// stale.
+  /// superseded echo has nothing left it may safely say. What it is worth is
+  /// **defence in depth on the OTHER half of the harm**: a stale echo admitted
+  /// as a peer's writes records this endpoint no longer publishes into its own
+  /// cache and defers this endpoint's own retransmits, and no screen in
+  /// `mdns-proto` covers observation or quieting.
   ///
-  /// The cost is bounded the same way every other suppression here is: the
-  /// datagram must still be byte-identical to one we sent, on the same family,
-  /// from port 5353, inside [`SELF_SEND_TTL`], and take-once means one of them.
+  /// The cost is bounded: the datagram must still be byte-identical to one we
+  /// sent, on the same family, from port 5353, inside [`SELF_SEND_TTL`].
   Superseded,
   /// No credit matched. A negative claim about the tracker's OWN records, never
   /// about the network: a credit refused at the cap, or expired past
@@ -1056,8 +1080,15 @@ impl SelfSendTracker {
   /// A spurious advance costs at most the adjudication of one byte-identical
   /// in-flight datagram, and a datagram byte-identical to one of ours ties under
   /// §8.2.1 and is "never a conflict" under §9 — so there was nothing there to
-  /// lose. A missing advance costs a live service a terminal `HostConflict`
-  /// raised by our own withdrawn generation. See [`SelfSendMatch::Superseded`].
+  /// lose. A missing advance lets a stale echo populate this endpoint's cache
+  /// with records it no longer publishes, and quiet its own traffic on their
+  /// behalf.
+  ///
+  /// It no longer costs a live service a terminal `HostConflict`: that is
+  /// screened in `mdns-proto` by `EndpointConfig::relinquished_retention`, which
+  /// had to move there because no send log can be relied on to recognise the
+  /// echo at all. See [`SelfSendMatch::Superseded`] for the three ways
+  /// recognition fails without a bug anywhere.
   ///
   /// It does NOT drop the credits. Dropping them would make the very echoes this
   /// is protecting against read as [`SelfSendMatch::NoCredit`] — full peer
@@ -1610,6 +1641,44 @@ impl SelfSendTracker {
   /// [`SelfSendMatch::Degraded`], and it is not recoverable afterwards — the
   /// credit it was derived from has been removed by then, and re-deriving it
   /// would read the clock a second time.
+  ///
+  /// # Take-once is the CURRENT tier's rule, and only its
+  ///
+  /// A current-generation credit is spent by the match that takes it, because a
+  /// byte-identical datagram from a conforming RFC 6762 §9 fault-tolerance twin
+  /// matches exactly the same way and must become visible from its second
+  /// datagram onwards. Spending is affordable there because a leaked copy is
+  /// harmless anyway: it asserts rdata this endpoint still publishes, which §9
+  /// calls "never a conflict" and §8.2.1 ties on.
+  ///
+  /// A SUPERSEDED credit is not spent. It is a **standing tombstone**: every
+  /// byte-identical copy inside [`SELF_SEND_TTL`] reports
+  /// [`SelfSendMatch::Superseded`] for as long as the credit lives, and nothing
+  /// about that claim removes it. Only expiry and the budgets do — see
+  /// [`Self::reclaim_expired_sealed`] and [`Self::admit`] — so the retention is
+  /// bounded by exactly the same two limits as before.
+  ///
+  /// Take-once was applied here too, on the reasoning that total suppression of
+  /// bytes a peer could be replaying needs a bound. It does not: what those bytes
+  /// assert is a record set this endpoint HAS GIVEN UP, so suppressing every copy
+  /// can only mask an assertion no live route holds, or a byte-identical twin
+  /// still asserting our withdrawn records — a bounded detection delay in either
+  /// case. Meanwhile an attacker "denied" the replay never needed our bytes at
+  /// all: mDNS is unauthenticated, so it could forge the same assertion freely.
+  /// Spending bought nothing, and cost this: the copy that spent the credit left
+  /// the GENUINE echo behind it reading [`SelfSendMatch::NoCredit`], hence
+  /// `Provenance::NotFromUs`, hence a datagram carrying our own withdrawn records
+  /// written into our own cache.
+  ///
+  /// # A CURRENT credit is preferred over a superseded one
+  ///
+  /// The same datagram can be recorded on both sides of a generation change — a
+  /// service re-announcing bytes it also sent before an UNRELATED service
+  /// registered, for instance — and with the tombstone standing, an older
+  /// superseded copy would otherwise shadow the current one for the whole TTL and
+  /// take the twin's visibility with it. So the scan runs to the first CURRENT
+  /// candidate and only falls back to a superseded one, which is the rule
+  /// `hick-smoltcp`'s `Multicaster::claim` already states.
   fn claim_by(
     &mut self,
     family: Family,
@@ -1617,7 +1686,8 @@ impl SelfSendTracker {
     rx: Option<SystemTime>,
     clock: impl Fn() -> ClockPair,
   ) -> SelfSendMatch {
-    let mut matched = None;
+    let mut current = None;
+    let mut superseded = false;
     for (pos, c) in self.entries.iter().enumerate() {
       // The BYTES, not a digest of them. See `MAX_SELF_SEND_BYTES`.
       if c.family != family || c.body != body {
@@ -1628,24 +1698,25 @@ impl SelfSendTracker {
         continue;
       }
       let mode = evidence_mode(rx, c.sent, now);
-      if reference_ordered(rx, c.sent, mode) {
-        matched = Some((pos, mode, c.generation));
+      if !reference_ordered(rx, c.sent, mode) {
+        continue;
+      }
+      if c.generation == self.generation {
+        current = Some((pos, mode));
         break;
       }
+      // Remembered, not returned: a current candidate further along still wins.
+      superseded = true;
     }
-    match matched {
-      Some((pos, mode, generation)) => {
+    match current {
+      // TAKE-ONCE, and only at this tier.
+      Some((pos, mode)) => {
         let taken = self.entries.remove(pos);
         self.bytes = self.bytes.saturating_sub(taken.body.len());
-        // Take-once first, tier second. A superseded credit is still spent —
-        // it was ours and this datagram is it — so the genuine echo behind a
-        // replay still finds nothing, exactly as at every other tier.
-        if generation == self.generation {
-          SelfSendMatch::from_mode(mode)
-        } else {
-          SelfSendMatch::Superseded
-        }
+        SelfSendMatch::from_mode(mode)
       }
+      // The standing tombstone. Nothing is spent and nothing is removed.
+      None if superseded => SelfSendMatch::Superseded,
       None => SelfSendMatch::NoCredit,
     }
   }

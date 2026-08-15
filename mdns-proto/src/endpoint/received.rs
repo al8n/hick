@@ -35,11 +35,18 @@ pub enum Provenance {
   /// route claims no more evidence than [`Self::OwnEchoLikely`] carries; it
   /// reports an echo that has less left it may safely say. A stale echo's RFC
   /// 6762 §8.2 proposal is for a name this endpoint may no longer be defending
-  /// and its §9 rdata is rdata no live route holds, so ADJUDICATION is exactly
-  /// the permission it must not have — and this is the only tier that denies
-  /// it. Adjudicated instead, our own withdrawn generation fans out to the
-  /// service that REPLACED it, which compares that rdata against its own and
-  /// retires terminally.
+  /// and its §9 rdata is rdata no live route holds, so it should reach neither
+  /// the cache nor the quieting rules, and this is the only tier that denies
+  /// every one of them.
+  ///
+  /// It is no longer what stops a withdrawn generation retiring the service
+  /// that REPLACED it: that is
+  /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention)'s
+  /// endpoint-side screen, which decides on what this endpoint published rather
+  /// than on whether one datagram was recognised. This tier still matters
+  /// because the screen governs ADJUDICATION only — a stale echo admitted as a
+  /// peer's still writes records we no longer publish into our own cache and
+  /// still defers our own retransmits.
   ///
   /// The only tier that suppresses everything.
   OwnEcho,
@@ -52,8 +59,7 @@ pub enum Provenance {
   /// **Obligation.** Report this tier only when the datagram matched a record
   /// of something this endpoint sent under the record generation it still
   /// publishes, and report a match against a superseded generation as
-  /// [`Self::OwnEcho`] instead. See the `OwnEchoLikely` adjudication cell in
-  /// `admits.rs` for why.
+  /// [`Self::OwnEcho`] instead.
   ///
   /// A generation is superseded by **every mutation of what this endpoint
   /// publishes**, and a driver owes the advance at each of them, at the site
@@ -64,6 +70,22 @@ pub enum Provenance {
   /// `ServiceUpdate::Renamed` — a successful rename reaches none of the other
   /// two, and it has already mutated the service's records by the time the
   /// update is observed.
+  ///
+  /// **What that obligation is, and is not, worth.** It is DEFENCE IN DEPTH.
+  /// What it buys is that a stale echo does not poison this endpoint's own cache
+  /// with records it no longer publishes, and does not quiet its own traffic on
+  /// their behalf. It is emphatically NOT what keeps our own withdrawn
+  /// generation from retiring the service that replaced it: that is decided
+  /// inside `Endpoint`, by screening every conflict candidate against the record
+  /// sets this endpoint recently asserted and relinquished (see
+  /// [`EndpointConfig::relinquished_retention`]).
+  ///
+  /// The distinction is load-bearing for a driver author. Getting the generation
+  /// binding wrong — or losing the match entirely, which a replaying peer, a
+  /// duplicated delivery, or an evicted credit can each cause without any bug at
+  /// all — degrades cache hygiene. It does not cost a live service its name.
+  ///
+  /// [`EndpointConfig::relinquished_retention`]: crate::EndpointConfig::relinquished_retention
   OwnEchoLikely,
   /// The caller logs every datagram it sends and this datagram matched none it
   /// still holds.

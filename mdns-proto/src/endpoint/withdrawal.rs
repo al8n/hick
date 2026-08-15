@@ -165,6 +165,20 @@ where
     /// the host name is invariant across an instance rename). It is a **no-op when
     /// the handoff owned nothing** (the old name never advertised an instance
     /// record, so there is nothing for peers to evict).
+    ///
+    /// # It also RELINQUISHES the old name's record set
+    ///
+    /// A §9 rename is one of the two points at which this endpoint stops
+    /// publishing a set it recently put on the wire, so the old name's records
+    /// are retained here — at the rename, not when this
+    /// item finishes — for
+    /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention),
+    /// so a delayed echo of them cannot be adjudicated against whatever takes
+    /// the vacated name. The item's own residency is not enough on its own: a
+    /// SURVIVING rename's detached goodbye is reclaim-cancelled by
+    /// [`Self::note_service_announced`] the moment a service fully announces
+    /// that same name, which is precisely the moment a replacement has taken it
+    /// and the evidence is most needed.
     pub fn enqueue_rename_withdrawal(
       &mut self,
       handoff: crate::service::RenameGoodbyeHandoff,
@@ -172,6 +186,26 @@ where
       holds_name: bool,
     ) {
       let crate::service::RenameGoodbyeHandoff { records, owned } = handoff;
+      // RETAIN FIRST, and independently of whether an item is owed. The two
+      // questions differ: a goodbye retracts what peers CACHE, the screen
+      // disowns what we TRANSMITTED, and the §6.1 instance NSEC is transmitted
+      // without being retractable. A §7.1-filtered response that emitted only
+      // host addresses put the old name's NSEC on the wire and nothing this
+      // goodbye can withdraw, so keying the retention on `owned.is_empty()`
+      // would drop exactly that echo's evidence.
+      //
+      // NO HOST ADDRESSES: a rename replaces the INSTANCE name and the host name
+      // is invariant, so the live service still publishes its addresses and
+      // `Service::classify_host_rdata` recognises their echoes itself. Retaining
+      // them here would screen a GENUINE peer's A/AAAA conflict at a host name
+      // this endpoint still holds.
+      self.retain_relinquished(
+        records.clone(),
+        owned.clone(),
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        now,
+      );
       // Nothing for peers to evict → no item.
       if owned.is_empty() {
         return;
@@ -780,6 +814,13 @@ where
     ///     removed: it owns no route, holds no name, and is reported to NOBODY (push
     ///     nothing into `out`).
     ///
+    /// Either way the item's record set is RETAINED as relinquished for
+    /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention)
+    /// first. This item was the last resident description of a set this endpoint
+    /// put on the wire, and a route-attached one is about to release its owner
+    /// names for re-registration — so without that hand-off a delayed
+    /// positive-TTL echo of it would be adjudicated against its own successor.
+    ///
     /// Call once per pump, after draining withdrawal transmits.
     ///
     /// The ceiling guarantees that an item whose families are permanently
@@ -814,7 +855,27 @@ where
           continue;
         };
         let (_, item) = self.withdrawals.remove(pos);
-        let Some(handle) = item.route else {
+        let route = item.route;
+        // This item was the last resident copy of a record set this endpoint
+        // asserted, and a route-attached one is about to release its owner names
+        // for re-registration. Move the set into the relinquished list so a
+        // delayed positive-TTL echo of it is still recognised as OURS by the
+        // conflict fan-out — the successor at those names cannot recognise it.
+        //
+        // The item's own EXPOSURE goes with it, and the whole of it: these are
+        // the sets `Service::withdrawal_snapshot` reported as confirmed-emitted,
+        // so the row disowns exactly the records that were transmitted. A
+        // never-announced service's item carries none, and `retain_relinquished`
+        // then retains nothing at all rather than screening its whole configured
+        // record set.
+        self.retain_relinquished(
+          item.records,
+          item.owned,
+          item.host_a,
+          item.host_aaaa,
+          now,
+        );
+        let Some(handle) = route else {
           // Detached (renamed-away old name): no route, no name, report to nobody.
           continue;
         };

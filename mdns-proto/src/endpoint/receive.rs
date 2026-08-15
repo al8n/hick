@@ -668,8 +668,15 @@ where
     }
   }
 
-  /// Drive timer-based work (cache TTL sweep).
+  /// Drive timer-based work (cache TTL sweep, and reclaiming lapsed
+  /// relinquished record sets).
   pub fn handle_timeout(&mut self, now: I) -> Result<(), HandleTimeoutError> {
+    // Hygiene only: a lapsed row already screens nothing (see
+    // `Endpoint::relinquished_asserts`), so this reclaims memory rather than
+    // deciding anything. It is here and not on `poll_timeout` for that reason —
+    // nothing needs waking for it.
+    #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+    self.sweep_relinquished(now);
     let n = self.cache.sweep_expired(now);
     if n > 0 {
       let _ = self

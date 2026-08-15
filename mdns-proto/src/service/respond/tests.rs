@@ -301,7 +301,8 @@ fn write_announce_emits_instance_nsec_negative_response() {
   recs.add_a(Ipv4Addr::new(192, 168, 1, 5)); // IPv4 only.
 
   let mut buf = [0u8; 1500];
-  let n = super::write_announce(&recs, &mut buf).unwrap();
+  let (n, nsec) = super::write_announce(&recs, &mut buf).unwrap();
+  assert!(nsec, "an announcement that fits reports the NSEC it emitted");
   let msg = MessageReader::try_parse(&buf[..n]).unwrap();
 
   assert_eq!(
@@ -411,7 +412,8 @@ fn nsec_omitted_when_it_does_not_fit_but_answers_still_send() {
 
   // Baseline: full message including the instance NSEC.
   let mut big = [0u8; 1500];
-  let n_full = super::write_announce(&recs, &mut big).unwrap();
+  let (n_full, nsec_full) = super::write_announce(&recs, &mut big).unwrap();
+  assert!(nsec_full, "baseline reports the NSEC it emitted");
   let full = MessageReader::try_parse(&big[..n_full]).unwrap();
   assert_eq!(full.header().additional_count(), 1, "baseline NSEC present");
   let answers = full.header().answer_count();
@@ -421,7 +423,12 @@ fn nsec_omitted_when_it_does_not_fit_but_answers_still_send() {
   // every answer while excluding the hint.)
   let cut = n_full - 8;
   let mut small = std::vec![0u8; cut];
-  let n = super::write_announce(&recs, &mut small).unwrap();
+  let (n, nsec_small) = super::write_announce(&recs, &mut small).unwrap();
+  assert!(
+    !nsec_small,
+    "a rolled-back NSEC must be reported as NOT emitted — exposure tracking \
+     reads this answer, and a record that was rolled back never reached a wire"
+  );
   let msg = MessageReader::try_parse(&small[..n]).unwrap();
 
   assert_eq!(
@@ -476,6 +483,46 @@ fn canonical_cname_forward_pointer_returns_err() {
     identity_of(ResourceType::Cname, &rdata).is_err(),
     "forward compression pointer in CNAME target must produce an Err"
   );
+}
+
+/// `canonical_rdata_forms` says which types a record set CAN assert at its
+/// INSTANCE name; `instance_rtype_exposed` says which of them one generation
+/// DID. They are two spellings of one list, and this pins them to each other: a
+/// type added to the first without a row in the second silently loses the
+/// endpoint's relinquished-RRset screen for it, so a stale echo of that type
+/// would adjudicate against whatever now holds the name.
+#[test]
+fn instance_rtype_exposure_mirrors_the_canonical_forms() {
+  let recs = dual_stack_records();
+  // Everything this record set could ever put on a wire.
+  let everything = super::EmittedRecords::new(
+    true,
+    true,
+    true,
+    recs.a_addrs_slice().to_vec(),
+    recs.aaaa_addrs_slice().to_vec(),
+    true,
+    true,
+  );
+  for rtype in [
+    ResourceType::A,
+    ResourceType::AAAA,
+    ResourceType::Ptr,
+    ResourceType::Srv,
+    ResourceType::Txt,
+    ResourceType::Nsec,
+    ResourceType::Hinfo,
+    ResourceType::Cname,
+    ResourceType::Any,
+    ResourceType::Unknown(0xBEEF),
+  ] {
+    assert_eq!(
+      !super::canonical_rdata_forms(&recs, rtype).is_empty(),
+      super::instance_rtype_exposed(&everything, rtype),
+      "{rtype}: the two halves of the instance-rdata rule disagree about \
+       whether this type can be ours"
+    );
+  }
 }
 
 /// Build a dual-stack `ServiceRecords` with a TXT segment, a subtype, an IPv4
@@ -564,8 +611,10 @@ fn write_probe_propagates_encode_error_at_every_boundary() {
 fn write_announce_propagates_encode_error_at_every_boundary() {
   let recs = dual_stack_records();
   let mut big = [0u8; 1500];
-  let n_full = super::write_announce(&recs, &mut big).unwrap();
-  assert_truncation_safe_at_every_boundary(n_full, |buf| super::write_announce(&recs, buf));
+  let (n_full, _) = super::write_announce(&recs, &mut big).unwrap();
+  assert_truncation_safe_at_every_boundary(n_full, |buf| {
+    super::write_announce(&recs, buf).map(|(n, _)| n)
+  });
 }
 
 /// `write_legacy_response` propagates `EncodeError` from the SRV and AAAA answer

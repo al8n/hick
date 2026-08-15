@@ -4865,6 +4865,7 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       true,
+      false,
     ),
     host_a: std::vec![shared, unique],
     host_aaaa: std::vec::Vec::new(),
@@ -5002,6 +5003,7 @@ fn host_a_snapshot(
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: host_a.to_vec(),
@@ -5208,6 +5210,7 @@ fn note_withdrawal_delivered_spends_failed_rearms() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       false,
+      false,
     ),
     host_a: std::vec::Vec::new(),
     host_aaaa: std::vec::Vec::new(),
@@ -5331,6 +5334,7 @@ fn withdrawal_not_freed_until_every_family_sent() {
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -5458,6 +5462,7 @@ fn a_withdrawal_round_names_the_families_that_still_owe() {
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -5587,6 +5592,7 @@ fn withdrawal_writeoff_family_completes() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       false,
+      false,
     ),
     host_a: std::vec::Vec::new(),
     host_aaaa: std::vec::Vec::new(),
@@ -5664,6 +5670,7 @@ fn withdrawal_retries_owed_family_at_backoff_when_other_is_paid() {
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -5774,6 +5781,7 @@ fn writeoff_only_zeroes_its_own_family() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       false,
+      false,
     ),
     host_a: std::vec::Vec::new(),
     host_aaaa: std::vec::Vec::new(),
@@ -5836,6 +5844,7 @@ fn encode_failing_withdrawal_does_not_block_a_sibling() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       false,
+      false,
     ),
     host_a: big_a,
     host_aaaa: std::vec::Vec::new(),
@@ -5865,6 +5874,7 @@ fn encode_failing_withdrawal_does_not_block_a_sibling() {
       false,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -5958,6 +5968,7 @@ fn teardown_during_rename_goodbye_withdraws_old_and_new_name() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   );
 
   // A teardown DURING a still-draining rename is now two SEPARATE calls, each
@@ -5980,6 +5991,7 @@ fn teardown_during_rename_goodbye_withdraws_old_and_new_name() {
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec![host_v4],
@@ -6128,6 +6140,7 @@ fn collision_old_name_holds_against_reregister_until_goodbye_completes() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   );
   ep.enqueue_rename_withdrawal(
     crate::service::RenameGoodbyeHandoff {
@@ -6210,6 +6223,7 @@ fn surviving_rename_old_name_is_reclaimable_on_announce() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   );
   ep.enqueue_rename_withdrawal(
     crate::service::RenameGoodbyeHandoff {
@@ -6275,6 +6289,7 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
         true,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
+        false,
         false,
       ),
     },
@@ -6348,6 +6363,7 @@ fn rename_enqueues_a_detached_withdrawal_for_the_old_name() {
     true,
     std::vec::Vec::new(),
     std::vec::Vec::new(),
+    false,
     false,
   );
   ep.enqueue_rename_withdrawal(
@@ -6443,6 +6459,7 @@ fn rename_enqueues_a_detached_withdrawal_for_the_old_name() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   );
   let empty_records = ServiceRecords::new(
     Name::try_from_str("_ipp._tcp.local.").unwrap(),
@@ -6503,6 +6520,7 @@ fn rename_only_withdrawal_emits_old_name_goodbye() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   );
 
   // The rename happened first: enqueue the old name's goodbye as its own
@@ -6525,6 +6543,7 @@ fn rename_only_withdrawal_emits_old_name_goodbye() {
       false,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -6655,6 +6674,7 @@ fn dual_name_each_fits_but_combined_would_not() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   );
 
   // The rename happened first → its old-name goodbye is its own detached item;
@@ -6769,6 +6789,7 @@ fn independent_items_unencodable_current_does_not_starve_rename() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   );
   // The rename happened first → its old-name goodbye is its own detached item;
   // the teardown then begins the route-attached (huge current) withdrawal.
@@ -6788,6 +6809,7 @@ fn independent_items_unencodable_current_does_not_starve_rename() {
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -6888,6 +6910,7 @@ fn unregister_service_drops_route_attached_withdrawal_no_stale_goodbye() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       false,
+      false,
     ),
     host_a: std::vec::Vec::new(),
     host_aaaa: std::vec::Vec::new(),
@@ -6899,7 +6922,10 @@ fn unregister_service_drops_route_attached_withdrawal_no_stale_goodbye() {
   );
 
   // Force-remove must drop the route-attached withdrawal item (no goodbye).
-  assert!(ep.unregister_service(h), "the route was found and removed");
+  assert!(
+    ep.unregister_service(h, None, now),
+    "the route was found and removed"
+  );
   assert!(
     ep.route_withdrawal_owed(h).is_none(),
     "force-remove dropped the route-attached withdrawal item"
@@ -6959,6 +6985,7 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   );
   ep.enqueue_rename_withdrawal(
     crate::service::RenameGoodbyeHandoff {
@@ -6976,6 +7003,7 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
       false,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -7069,6 +7097,7 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
     std::vec::Vec::new(),
     std::vec::Vec::new(),
     false,
+    false,
   );
   // C2's rename enqueued a DETACHED item owning `target`; its teardown then
   // began a current-only withdrawal (owns nothing here).
@@ -7088,6 +7117,7 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
       false,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -7158,6 +7188,7 @@ fn rename_onto_a_held_detached_name_is_rejected_reclaimable_is_not() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       false,
+      false,
     ),
   };
   // A HELD (collision) detached goodbye for `held`, and a RECLAIMABLE one.
@@ -7225,6 +7256,7 @@ fn owed_family_gets_a_final_attempt_at_ceiling() {
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -7340,6 +7372,7 @@ fn past_ceiling_owed_withdrawal_is_held_until_final_attempt() {
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -7495,6 +7528,7 @@ fn host_only_snapshot(
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       false,
+      false,
     ),
     host_a: host_a.to_vec(),
     host_aaaa: std::vec::Vec::new(),
@@ -7557,6 +7591,7 @@ fn retained_only_withdrawal_completes_and_does_not_block_a_sibling() {
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -8009,6 +8044,7 @@ fn next_withdrawal_deadline_reflects_only_withdrawals() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
       false,
+      false,
     ),
     host_a: std::vec::Vec::new(),
     host_aaaa: std::vec::Vec::new(),
@@ -8024,7 +8060,7 @@ fn next_withdrawal_deadline_reflects_only_withdrawals() {
   // Force-remove drops the route-attached item → the withdrawal deadline is gone
   // again, so a shutdown flush would exit (None) rather than wait on any cache
   // or query deadline.
-  assert!(ep.unregister_service(h));
+  assert!(ep.unregister_service(h, None, now));
   assert_eq!(ep.next_withdrawal_deadline(), None);
   assert!(!ep.has_pending_withdrawals());
 }
@@ -8363,6 +8399,7 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
         false,
+        false,
       ),
     },
     now,
@@ -8469,6 +8506,7 @@ fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
         false,
+        false,
       ),
     },
     now,
@@ -8529,6 +8567,7 @@ fn a_fully_announced_proof_cancels_only_its_own_services_goodbye() {
           true,
           std::vec::Vec::new(),
           std::vec::Vec::new(),
+          false,
           false,
         ),
       },
@@ -8698,6 +8737,7 @@ fn withdrawing_route(ep: &mut TestEndp, now: StdInstant) -> (ServiceHandle, supe
       true,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
+      false,
       false,
     ),
     host_a: std::vec::Vec::new(),
@@ -10171,6 +10211,7 @@ fn a_held_goodbye_holds_its_name_through_a_trailing_root_dot() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
         false,
+        false,
       ),
     },
     now,
@@ -10374,5 +10415,827 @@ fn a_probe_host_conflict_is_routed_only_to_routes_publishing_that_rrtype() {
     std::vec![v4_only],
     "only the route that owns an A RRset at this host name is a party to the \
      peer's A; the IPv6-only route ({v6_only:?}) is not"
+  );
+}
+
+// ── the relinquished-RRset screen (`endpoint::relinquished`) ─────────────────
+//
+// A stale positive-TTL echo — OUR OWN bytes, carrying records we no longer
+// publish — must not be adjudicated against whatever now holds that owner name.
+// Every test below feeds the echo with `Provenance::NotFromUs`, because that is
+// what a driver honestly reports for it: a replaying peer spends the one credit
+// the send was given, or the medium delivers a second copy (kernel loopback plus
+// an 802.11 base-station re-broadcast, which RFC 6762 §8.2 names), or the credit
+// was evicted under load. Whichever it is, the datagram reaches adjudication
+// with no driver-side recognition left, so what screens it has to be here.
+
+/// Build a QR=1 authoritative response carrying one A record at `owner`.
+fn build_host_a_response(buf: &mut [u8], owner: &Name, addr: Ipv4Addr) -> usize {
+  use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder};
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(buf, hdr).unwrap();
+  b.push_a_answer(owner, 120, addr, true).unwrap();
+  b.finish().unwrap()
+}
+
+/// Build a QR=1 authoritative response carrying one SRV record at `owner`.
+fn build_instance_srv_response(buf: &mut [u8], owner: &Name, port: u16, target: &Name) -> usize {
+  use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder};
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+    MessageBuilder::try_new(buf, hdr).unwrap();
+  b.push_srv_answer(owner, 120, 0, 0, port, target, true)
+    .unwrap();
+  b.finish().unwrap()
+}
+
+/// The withdrawal snapshot of a service that CONFIRMED-EMITTED its instance
+/// records (SRV, TXT, the §6.1 NSEC) and `host_a` — i.e. one that actually
+/// announced.
+///
+/// Every screen test states its exposure explicitly, because that is the fact
+/// the screen turns on: it disowns an echo of a record this endpoint
+/// TRANSMITTED, and a set nothing ever carried has no echo to disown.
+/// `Service::withdrawal_snapshot` on a never-announced service reports no
+/// exposure at all — see
+/// `a_never_transmitted_withdrawal_does_not_screen_a_genuine_peer_conflict`.
+fn announced_snapshot(
+  records: &ServiceRecords,
+  host_a: &[Ipv4Addr],
+) -> crate::service::WithdrawalSnapshot {
+  crate::service::WithdrawalSnapshot {
+    records: records.clone(),
+    owned: crate::service::EmittedRecords::new(
+      true,
+      true,
+      true,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+      true,
+    ),
+    host_a: host_a.to_vec(),
+    host_aaaa: std::vec::Vec::new(),
+  }
+}
+
+/// Settle `handle`'s route-attached goodbye and free its route, returning what
+/// `drain_completed_withdrawals` reported.
+///
+/// Both families write their debt off — [`WithdrawalSend::WriteOff`] is the
+/// "nothing bound on this family" row, the one outcome that clears a debt rather
+/// than keeping it — so the item completes in one round. A test that snapshots a
+/// service which ACTUALLY ANNOUNCED needs this: such an item owes a real §10.1
+/// budget, where a never-announced one settled on the first drain with nothing
+/// owed at all.
+fn finish_withdrawal(
+  e: &mut TestEndp,
+  handle: ServiceHandle,
+  now: StdInstant,
+) -> std::vec::Vec<ServiceHandle> {
+  e.note_route_withdrawal_result(
+    handle,
+    now,
+    super::WithdrawalSend::WriteOff,
+    super::WithdrawalSend::WriteOff,
+  );
+  let mut freed: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+  e.drain_completed_withdrawals(now, &mut freed);
+  freed
+}
+
+/// Every `ServiceHandle` this datagram raises a `HostConflict` on.
+fn host_conflicted(e: &mut TestEndp, pkt: &[u8], now: StdInstant) -> std::vec::Vec<ServiceHandle> {
+  let src: core::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
+  e.handle(now, Received::new(src, pkt, Provenance::NotFromUs))
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter_map(|ev| match ev {
+      RouteEvent::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
+      _ => None,
+    })
+    .collect()
+}
+
+/// Every `ServiceHandle` this datagram raises a `ProbeConflict` on.
+fn probe_conflicted(e: &mut TestEndp, pkt: &[u8], now: StdInstant) -> std::vec::Vec<ServiceHandle> {
+  let src: core::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
+  e.handle(now, Received::new(src, pkt, Provenance::NotFromUs))
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter_map(|ev| match ev {
+      RouteEvent::ToService(ts) if ts.event().is_probe_conflict() => Some(ts.handle()),
+      _ => None,
+    })
+    .collect()
+}
+
+/// Register `instance` at `host` with one A address, and hand back BOTH the
+/// handle and the `Service`, so a test can take a withdrawal snapshot from it.
+fn register_service_with_a(
+  e: &mut TestEndp,
+  instance: &str,
+  host: &str,
+  addr: Ipv4Addr,
+) -> (
+  ServiceHandle,
+  crate::service::Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+) {
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str(instance).unwrap(),
+    Name::try_from_str(host).unwrap(),
+    631,
+    120,
+  );
+  recs.add_a(addr);
+  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ServiceSpec::new(recs),
+    StdInstant::now(),
+  )
+  .unwrap()
+}
+
+/// THE DEFECT, while the §10.1 goodbye is still draining.
+///
+/// Service `A` publishes host `H` with address set `A1` and is withdrawn. The
+/// withdrawing route no longer holds `H` for the registration guard, so `B`
+/// registers `H` with a DIFFERENT set `A2` while the goodbye drains. `A`'s
+/// delayed positive-TTL announcement of `A1` then arrives: it is our own past,
+/// but `B` compares it against `A2`, finds differing rdata at its own host name,
+/// and surfaces a TERMINAL `ServiceUpdate::HostConflict` that retires a live
+/// service.
+///
+/// The withdrawing route's record set is resident for the whole drain and is
+/// what disowns the echo. Before the screen existed it was consulted only to
+/// decide that the route must not RECEIVE conflicts — never as evidence about
+/// the record itself.
+#[test]
+fn a_draining_predecessors_echo_does_not_retire_the_replacement_at_its_host() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let host = Name::try_from_str("shared-host.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  e.begin_withdrawal(a_handle, snap, now);
+  let b_handle = register_with_addr_sets(
+    &mut e,
+    "B._ipp._tcp.local.",
+    "shared-host.local.",
+    &[a2],
+    &[],
+  )
+  .unwrap();
+
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  assert!(
+    host_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "an echo of the WITHDRAWING route's own address set is this endpoint's own \
+     past — it must not reach the replacement as a §9 conflict"
+  );
+
+  // NOT a blanket suppression of the owner name: a genuine peer asserting an
+  // address neither route ever published still reaches `B`.
+  let n = build_host_a_response(&mut buf, &host, Ipv4Addr::new(10, 0, 0, 99));
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "rdata this endpoint never asserted at this owner is a real conflict"
+  );
+}
+
+/// THE DEFECT, after the goodbye has COMPLETED — round 3's exact scenario.
+///
+/// The withdrawing route is gone by the time the echo lands: `drain_completed_
+/// withdrawals` has freed it, released the name, and removed the item. Nothing
+/// resident describes `A1` any more, so the retention list is the only evidence
+/// there is.
+///
+/// The echo is reported as `Provenance::NotFromUs` deliberately. Round 3 found
+/// that a take-once credit can be spent by a peer replaying our bytes, after
+/// which the GENUINE echo finds no credit and is reported exactly this way — so
+/// this is the case no amount of driver-side recognition can reach.
+#[test]
+fn a_completed_withdrawals_echo_does_not_retire_the_replacement_at_its_host() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let host = Name::try_from_str("shared-host.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  e.begin_withdrawal(a_handle, snap, now);
+  // Drain it to completion: the route is freed and the item removed, so the
+  // relinquished set survives only in the retention list.
+  let freed = finish_withdrawal(&mut e, a_handle, now);
+  assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
+
+  // The name is free again, so the replacement can even reuse `A`'s INSTANCE
+  // name — the sharpest form of the takeover.
+  let b_handle = register_with_addr_sets(
+    &mut e,
+    "A._ipp._tcp.local.",
+    "shared-host.local.",
+    &[a2],
+    &[],
+  )
+  .unwrap();
+
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  assert!(
+    host_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "a delayed echo of the RELINQUISHED address set must not retire the service \
+     that replaced it"
+  );
+
+  // The window is finite, and after it the same record adjudicates normally.
+  let lapsed = now
+    .checked_add(EndpointConfig::new().relinquished_retention())
+    .unwrap();
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], lapsed),
+    std::vec![b_handle],
+    "the screen must LAPSE — it delays detection of a peer that happens to \
+     assert exactly our relinquished rdata, it does not suppress it forever"
+  );
+}
+
+/// The INSTANCE half of the same defect: same-name reuse with changed SRV rdata
+/// reaches a false RFC 6762 §8.1 probe defeat by the same route.
+#[test]
+fn a_relinquished_instances_echo_does_not_defeat_the_probe_of_its_successor() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let target = Name::try_from_str("h.local.").unwrap();
+  let addr = Ipv4Addr::new(192, 168, 1, 5);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  e.begin_withdrawal(a_handle, snap, now);
+  let freed = finish_withdrawal(&mut e, a_handle, now);
+  assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
+
+  // The successor takes the same instance name on a different port.
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    instance.clone(),
+    target.clone(),
+    9999,
+    120,
+  );
+  recs.add_a(addr);
+  let (b_handle, _b_svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let mut buf = [0u8; 512];
+  // The predecessor's own SRV (port 631) — rdata `B` does not hold.
+  let n = build_instance_srv_response(&mut buf, &instance, 631, &target);
+  assert!(
+    probe_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "an echo of the relinquished instance's own SRV must not reach its successor"
+  );
+
+  // A third port is nobody's record here, and still conflicts.
+  let n = build_instance_srv_response(&mut buf, &instance, 1234, &target);
+  assert_eq!(
+    probe_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "SRV rdata this endpoint never asserted at this instance is a real conflict"
+  );
+}
+
+/// The RFC 6762 §9 RENAME is the other point a record set stops being published,
+/// and its detached goodbye is not enough on its own: a SURVIVING rename's
+/// old-name goodbye is reclaim-cancelled by `note_service_announced` the moment
+/// a service fully announces that same name — which is exactly the moment a
+/// replacement has taken it. So `enqueue_rename_withdrawal` retains the set at
+/// the rename itself.
+#[test]
+fn a_renamed_away_instances_echo_does_not_conflict_after_its_goodbye_is_reclaimed() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let old = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let target = Name::try_from_str("h.local.").unwrap();
+  let addr = Ipv4Addr::new(192, 168, 1, 5);
+
+  let (handle, svc) =
+    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  // The service renames away; the driver hands the old name's goodbye over.
+  e.handle_service_renamed(
+    handle,
+    Name::try_from_str("Printer (2)._ipp._tcp.local.").unwrap(),
+  )
+  .unwrap();
+  let handoff = crate::service::RenameGoodbyeHandoff {
+    records: svc.records().clone(),
+    owned: crate::service::EmittedRecords::new(
+      true,
+      true,
+      true,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+      false,
+    ),
+  };
+  e.enqueue_rename_withdrawal(handoff, now, false);
+
+  // A replacement takes the vacated name and fully announces it, which cancels
+  // the detached goodbye — removing the last resident copy of the old set.
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    old.clone(),
+    target.clone(),
+    9999,
+    120,
+  );
+  recs.add_a(addr);
+  let (b_handle, _b_svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+  e.note_service_announced(FullyAnnounced::new(b_handle, true), &[addr], &[]);
+  assert!(
+    e.detached_withdrawal_owed_for(&old).is_none(),
+    "the reclaim-cancel must have removed the old name's detached goodbye"
+  );
+
+  let mut buf = [0u8; 512];
+  let n = build_instance_srv_response(&mut buf, &old, 631, &target);
+  assert!(
+    probe_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "the renamed-away name's own SRV echo must not conflict with the service \
+     that reclaimed the name"
+  );
+}
+
+/// FORCE-REMOVAL relinquishes too, so it retains too.
+///
+/// `unregister_service` sends no goodbye and releases the owner names the
+/// instant it returns — but a service force-removed after a confirmed positive
+/// send has records on the wire and, once its route is gone, none resident
+/// anywhere. It used to delete the route and any attached withdrawal item
+/// WITHOUT retaining either, so a caller that unregistered and re-registered at
+/// the same names left a delayed echo free to reach normal adjudication and
+/// retire the replacement. That is a direct path relinquishing a record set
+/// without retaining it — precisely what the design claims cannot happen.
+#[test]
+fn a_force_removed_services_echo_does_not_retire_its_replacement() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("h.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", a1);
+  // The caller holds the `Service`, so it can say exactly what was asserted.
+  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  assert!(
+    e.unregister_service(a_handle, Some(snap), now),
+    "the route was found and removed"
+  );
+
+  // …and re-registers at BOTH owner names in the very next breath.
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    instance.clone(),
+    host.clone(),
+    9999,
+    120,
+  );
+  recs.add_a(a2);
+  let (b_handle, _b_svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  assert!(
+    host_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "a delayed echo of the force-removed service's own address must not retire \
+     the replacement at its host name"
+  );
+  let n = build_instance_srv_response(&mut buf, &instance, 631, &host);
+  assert!(
+    probe_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "nor its own SRV defeat the replacement's probe at the instance name"
+  );
+
+  // Still bounded, and still not a blanket suppression.
+  let n = build_host_a_response(&mut buf, &host, Ipv4Addr::new(10, 0, 0, 99));
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "rdata the removed service never asserted is a real conflict"
+  );
+}
+
+/// The same duty for a force-removal that lands MID-GOODBYE: dropping the
+/// route-attached withdrawal item removes the last resident copy of a set this
+/// endpoint transmitted, which is the same relinquishment
+/// `drain_completed_withdrawals` would have retained had the goodbye finished.
+#[test]
+fn force_removing_a_draining_service_retains_the_item_it_drops() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let host = Name::try_from_str("shared-host.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  e.begin_withdrawal(a_handle, announced_snapshot(a_svc.records(), &[a1]), now);
+  assert!(
+    e.route_withdrawal_owed(a_handle).is_some(),
+    "the goodbye is still draining"
+  );
+  // No snapshot this time: the caller has nothing left to ask. The ITEM is the
+  // description that must survive.
+  assert!(e.unregister_service(a_handle, None, now));
+  assert!(
+    e.route_withdrawal_owed(a_handle).is_none(),
+    "force-remove drops the route-attached item"
+  );
+
+  let b_handle = register_with_addr_sets(
+    &mut e,
+    "B._ipp._tcp.local.",
+    "shared-host.local.",
+    &[a2],
+    &[],
+  )
+  .unwrap();
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  assert!(
+    host_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "the dropped item's record set must have moved into the retention list"
+  );
+  let n = build_host_a_response(&mut buf, &host, Ipv4Addr::new(10, 0, 0, 99));
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "and only that set — a peer's own address still conflicts"
+  );
+}
+
+/// THE OPPOSITE ERROR, and the more serious one: a relinquishment that
+/// TRANSMITTED NOTHING must screen nothing.
+///
+/// A withdrawal with no owned and no confirmed host records owes no goodbye —
+/// registration followed by immediate withdrawal, or a service whose every send
+/// failed — but it used to be retained with the service's whole CONFIGURED
+/// record set anyway. For the retention window a genuine incumbent's matching
+/// QR=1 records were then discarded before any conflict was built, letting a
+/// same-name successor finish probing and announce over a peer that already held
+/// the name. There is no possible stale positive-TTL echo to justify that: the
+/// records were never on any wire.
+#[test]
+fn a_never_transmitted_withdrawal_does_not_screen_a_genuine_peer_conflict() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("h.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  // `A` is registered and withdrawn with nothing on the wire, so its own
+  // snapshot reports no exposure at all. This is the DEFAULT path — no test
+  // fixture is needed to reach it.
+  let (a_handle, mut a_svc) =
+    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", a1);
+  let snap = a_svc.withdrawal_snapshot();
+  assert!(
+    snap.owned.is_empty() && snap.host_a.is_empty() && snap.host_aaaa.is_empty(),
+    "a never-announced service must report no exposure"
+  );
+  e.begin_withdrawal(a_handle, snap, now);
+  let freed = finish_withdrawal(&mut e, a_handle, now);
+  assert_eq!(freed, std::vec![a_handle], "the empty goodbye completes at once");
+  assert!(
+    e.relinquished.is_empty(),
+    "a relinquishment with no transmitted record must retain no row: there is \
+     no echo of it for a row to disown, and the row would screen a peer's"
+  );
+
+  // The successor takes both owner names, with its own address and port.
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    instance.clone(),
+    host.clone(),
+    9999,
+    120,
+  );
+  recs.add_a(a2);
+  let (b_handle, _b_svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  // A GENUINE incumbent answers for both names with rdata that happens to match
+  // what `A` was configured with — the peer's own address, and the port `A`
+  // would have published had it ever announced.
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "a peer's A at our host name is a real conflict when nothing we relinquished \
+     ever carried that address"
+  );
+  let n = build_instance_srv_response(&mut buf, &instance, 631, &host);
+  assert_eq!(
+    probe_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "and so is its SRV at the instance name the successor is probing"
+  );
+}
+
+/// `Duration::ZERO` retains nothing that is ever live, so the screen reduces to
+/// the withdrawal items still resident — the documented way to turn the
+/// retention half off.
+#[test]
+fn a_zero_retention_window_keeps_only_the_resident_half_of_the_screen() {
+  let now = StdInstant::now();
+  use rand::SeedableRng;
+  let mut e = TestEndp::try_new(
+    EndpointConfig::new().with_relinquished_retention(core::time::Duration::ZERO),
+    rand::rngs::StdRng::from_seed([7u8; 32]),
+  );
+  let host = Name::try_from_str("shared-host.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  e.begin_withdrawal(a_handle, snap, now);
+  let b_handle = register_with_addr_sets(
+    &mut e,
+    "B._ipp._tcp.local.",
+    "shared-host.local.",
+    &[a2],
+    &[],
+  )
+  .unwrap();
+
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  // Resident half: the withdrawing item still describes `A1`.
+  assert!(host_conflicted(&mut e, &buf[..n], now).is_empty());
+  // Retention half: disabled, so completing the goodbye reopens the window.
+  let freed = finish_withdrawal(&mut e, a_handle, now);
+  assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "with a zero window nothing is retained past the item"
+  );
+}
+
+/// The retention list is bounded, and reaching the bound QUARANTINES this
+/// endpoint's own adjudication rather than dropping an unexpired row.
+///
+/// Every live row is an obligation still owed, so the earliest-expiring one is
+/// no more droppable than any other — evicting it silently discarded protection
+/// whose window had not elapsed.
+#[test]
+fn the_relinquished_ceiling_quarantines_rather_than_dropping_a_live_row() {
+  let mut e = build_endpoint();
+  let base = StdInstant::now();
+  let host = Name::try_from_str("h.local.").unwrap();
+  let addr = Ipv4Addr::new(192, 168, 1, 5);
+  // Retain more sets than the ceiling admits, each one instant later than the
+  // last so their expiries are strictly ordered.
+  for i in 0..(super::relinquished::MAX_RELINQUISHED_RRSETS + 8) {
+    let mut recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str(&std::format!("S{i}._ipp._tcp.local.")).unwrap(),
+      host.clone(),
+      631,
+      120,
+    );
+    recs.add_a(addr);
+    e.retain_relinquished(
+      recs,
+      crate::service::EmittedRecords::new(
+        true,
+        true,
+        true,
+        std::vec::Vec::new(),
+        std::vec::Vec::new(),
+        false,
+        true,
+      ),
+      std::vec![addr],
+      std::vec::Vec::new(),
+      base + core::time::Duration::from_millis(i as u64),
+    );
+  }
+  assert_eq!(
+    e.relinquished.len(),
+    super::relinquished::MAX_RELINQUISHED_RRSETS,
+    "the list must never exceed its ceiling"
+  );
+  // NOTHING UNEXPIRED WAS DROPPED. Every row that was there before the ceiling
+  // was reached is still there — including the very first, which the
+  // earliest-expiry eviction used to take.
+  let first = Name::try_from_str("S0._ipp._tcp.local.").unwrap();
+  assert!(
+    e.relinquished
+      .iter()
+      .any(|r| r.records.instance().same_owner(&first)),
+    "the earliest-expiring row is still an UNEXPIRED obligation — reaching the \
+     ceiling must not evict it"
+  );
+
+  // What the overflow costs instead: this endpoint stops adjudicating at all
+  // until the relinquishments it could not record would have lapsed. It cannot
+  // say "that record was not ours", so it does not say the opposite either.
+  let overflow_at = base
+    + core::time::Duration::from_millis(
+      (super::relinquished::MAX_RELINQUISHED_RRSETS + 7) as u64,
+    );
+  let b_handle = register_with_addr_sets(
+    &mut e,
+    "Live._ipp._tcp.local.",
+    "live-host.local.",
+    &[Ipv4Addr::new(10, 0, 0, 1)],
+    &[],
+  )
+  .unwrap();
+  let live_host = Name::try_from_str("live-host.local.").unwrap();
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &live_host, Ipv4Addr::new(10, 0, 0, 99));
+  assert!(
+    host_conflicted(&mut e, &buf[..n], overflow_at).is_empty(),
+    "while the quarantine is live NO conflict is built — a delayed conflict is \
+     re-raised by the next announcement, a dropped relinquishment is terminal"
+  );
+
+  // And it LAPSES: one retention window past the last unrecordable
+  // relinquishment, adjudication resumes.
+  let lapsed = overflow_at
+    .checked_add(EndpointConfig::new().relinquished_retention())
+    .unwrap()
+    + core::time::Duration::from_millis(1);
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], lapsed),
+    std::vec![b_handle],
+    "the quarantine is bounded by the window of the relinquishment that caused it"
+  );
+}
+
+/// RAPID SAME-OWNER REUSE: `R1 → R2 → R3` at ONE instance/host pair.
+///
+/// The list used to be keyed by owner pair, so relinquishing a second rdata
+/// generation for the same names OVERWROTE the first — even with the first's
+/// window nowhere near elapsed. A delayed `R1` echo then adjudicated against
+/// `R3` and recreated the terminal conflict this whole design exists to
+/// prevent. Each generation now lives to its own expiry.
+#[test]
+fn every_relinquished_generation_of_one_owner_pair_screens_to_its_own_expiry() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("h.local.").unwrap();
+
+  // Three generations of ONE owner pair, differing only in SRV rdata, each
+  // relinquished a moment after the last.
+  let emitted = crate::service::EmittedRecords::new(
+    true,
+    true,
+    true,
+    std::vec::Vec::new(),
+    std::vec::Vec::new(),
+    false,
+    true,
+  );
+  for (i, port) in [631u16, 632, 633].into_iter().enumerate() {
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      instance.clone(),
+      host.clone(),
+      port,
+      120,
+    );
+    e.retain_relinquished(
+      recs,
+      emitted.clone(),
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      now + core::time::Duration::from_millis(i as u64),
+    );
+  }
+  assert_eq!(
+    e.relinquished.len(),
+    3,
+    "three distinct generations, three rows"
+  );
+
+  // A successor takes the name with a fourth rdata.
+  let recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    instance.clone(),
+    host.clone(),
+    9999,
+    120,
+  );
+  let (b_handle, _b_svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let mut buf = [0u8; 512];
+  for port in [631u16, 632, 633] {
+    let n = build_instance_srv_response(&mut buf, &instance, port, &host);
+    assert!(
+      probe_conflicted(&mut e, &buf[..n], now).is_empty(),
+      "generation {port}'s own echo must not defeat the successor's probe while \
+       ITS window is still open"
+    );
+  }
+  // Still not a blanket suppression of the name.
+  let n = build_instance_srv_response(&mut buf, &instance, 1234, &host);
+  assert_eq!(
+    probe_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "rdata no generation ever carried is a real conflict"
+  );
+}
+
+/// An IDENTICAL generation relinquished twice is ONE row whose window takes the
+/// LATER expiry — the merge that is safe, because the identity set is the same
+/// one and the new window covers whatever the old still had to.
+#[test]
+fn an_identical_relinquished_generation_merges_by_extending_its_window() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("h.local.").unwrap();
+  let emitted = crate::service::EmittedRecords::new(
+    true,
+    true,
+    true,
+    std::vec::Vec::new(),
+    std::vec::Vec::new(),
+    false,
+    true,
+  );
+  let recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    instance.clone(),
+    host.clone(),
+    631,
+    120,
+  );
+  let later = now + core::time::Duration::from_secs(1);
+  e.retain_relinquished(
+    recs.clone(),
+    emitted.clone(),
+    std::vec::Vec::new(),
+    std::vec::Vec::new(),
+    now,
+  );
+  e.retain_relinquished(
+    recs,
+    emitted,
+    std::vec::Vec::new(),
+    std::vec::Vec::new(),
+    later,
+  );
+  assert_eq!(e.relinquished.len(), 1, "the same generation is one row");
+  assert_eq!(
+    e.relinquished.first().map(|r| r.expires_at),
+    later.checked_add(EndpointConfig::new().relinquished_retention()),
+    "and it screens to the LATER of the two windows"
   );
 }

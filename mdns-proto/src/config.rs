@@ -14,6 +14,17 @@ cfg_heap! {
   };
 }
 
+/// How long a record set this endpoint has RELINQUISHED keeps screening its own
+/// delayed echoes, by default. See
+/// [`EndpointConfig::relinquished_retention`].
+///
+/// Sized against the two windows a stale echo can survive in, both of which it
+/// must outlast: a driver's own self-send recency window (2 s in `hick-udp`, 5 s
+/// in `hick-smoltcp`) bounds how long a datagram can still be recognised as
+/// ours, and the RFC 6762 §10.1 goodbye ceiling (2 s) bounds how long the
+/// withdrawing route that first covered it stays resident.
+const DEFAULT_RELINQUISHED_RETENTION: core::time::Duration = core::time::Duration::from_secs(5);
+
 /// Configuration for an `Endpoint`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct EndpointConfig {
@@ -21,12 +32,15 @@ pub struct EndpointConfig {
   answer_questions: bool,
   populate_cache: bool,
   trust_advertised_src_as_self: bool,
+  relinquished_retention: core::time::Duration,
 }
 
 impl EndpointConfig {
   /// Construct with defaults: probe on registration, answer questions, cache
-  /// observations, and DO NOT trust advertised-source matching as a self-
-  /// loopback signal. The default is appropriate for the supported async
+  /// observations, DO NOT trust advertised-source matching as a self-
+  /// loopback signal, and screen a relinquished record set's own echoes for five
+  /// seconds (see [`Self::relinquished_retention`]). The default is appropriate
+  /// for the supported async
   /// driver, which computes a [`Provenance`](crate::Provenance) from its own
   /// send log for every inbound datagram and passes it to
   /// [`Endpoint::handle`](crate::Endpoint::handle) inside a
@@ -40,6 +54,7 @@ impl EndpointConfig {
       answer_questions: true,
       populate_cache: true,
       trust_advertised_src_as_self: false,
+      relinquished_retention: DEFAULT_RELINQUISHED_RETENTION,
     }
   }
 
@@ -125,6 +140,53 @@ impl EndpointConfig {
   #[must_use]
   pub const fn with_trust_advertised_src_as_self(mut self, v: bool) -> Self {
     self.trust_advertised_src_as_self = v;
+    self
+  }
+
+  /// How long a record set this endpoint has RELINQUISHED keeps screening
+  /// conflict candidates that carry it, measured from the moment the set stopped
+  /// being resident: the RFC 6762 §10.1 goodbye completing, or the §9 rename
+  /// that abandoned the name.
+  ///
+  /// # What it buys
+  ///
+  /// A conflict candidate is screened against the RECEIVING service's records —
+  /// RFC 6762 §9's "identical rdata is never a conflict" — and a service that
+  /// has just taken over a name cannot know that the rdata in front of it was
+  /// its PREDECESSOR'S. Only the endpoint can, so the endpoint screens against
+  /// what it recently asserted and gave up as well.
+  ///
+  /// Without it, a delayed positive-TTL echo of a withdrawn service's own
+  /// announcement is adjudicated against whatever now holds that owner name and
+  /// surfaces a TERMINAL `ServiceUpdate::HostConflict` on a live service — our
+  /// own past retiring our own present. Every driver-side recognition of such an
+  /// echo is defeasible (a replaying peer reproduces every signal a driver
+  /// weighs, one send can be delivered as more than one copy, and recognition
+  /// state is traffic-scaled while the obligation is per copy), so the screen
+  /// that decides is here rather than there.
+  ///
+  /// # What it costs
+  ///
+  /// A real peer that asserts, within this window, rdata EXACTLY EQUAL to the
+  /// set we just relinquished at that same owner has its detection delayed by up
+  /// to this long. That self-corrects — the peer's later traffic and its own §9
+  /// view of our announcements still collide — and it is not an attack surface:
+  /// mDNS is unauthenticated, so a forger never needed our bytes.
+  ///
+  /// # Zero disables it
+  ///
+  /// A window of `Duration::ZERO` retains nothing that is ever live, so the
+  /// screen reduces to the withdrawing routes still resident. Choose it only
+  /// with the terminal `HostConflict` above in view.
+  #[inline(always)]
+  pub const fn relinquished_retention(&self) -> core::time::Duration {
+    self.relinquished_retention
+  }
+
+  /// Set [`Self::relinquished_retention`].
+  #[must_use]
+  pub const fn with_relinquished_retention(mut self, v: core::time::Duration) -> Self {
+    self.relinquished_retention = v;
     self
   }
 }

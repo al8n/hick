@@ -4168,24 +4168,33 @@ fn a_surviving_rename_supersedes_the_entries_recorded_before_it() {
   );
 }
 
-/// Exact equality with a past send establishes CONTENT, not ORIGIN. Any peer can
-/// replay bytes it captured off the link, so `SelfLog::Superseded` — which maps
-/// to `Provenance::OwnEcho` and therefore denies observation, quieting,
-/// adjudication AND the RFC 6762 §8.1 defence — is only affordable while a match
-/// can be claimed at most once.
+/// A REPLAYED WITHDRAWN ANNOUNCEMENT IS SUPPRESSED FOR EVERY COPY, AND THE
+/// REPLACEMENT SURVIVES IT TWICE OVER.
 ///
-/// Non-consuming, every copy of a replay stayed `Superseded` for the whole of
-/// `RECENT_SEND_TTL`. During a same-name replacement that is a real conflict made
-/// invisible: the withdrawn service's authoritative response asserts the shared
-/// host name with an address set the replacement does not hold, which is a §9
-/// conflict and a §8.1 probe defeat, and the replacement could be flooded with it
-/// through its entire three-probe window without one copy reaching it.
+/// Exact equality with a past send establishes CONTENT, not ORIGIN: any peer can
+/// replay bytes it captured off the link. Take-once was the bound on that, and
+/// it was the wrong trade — the first copy consumed the entry and every copy
+/// behind it read `SelfLog::None`, which is `Provenance::NotFromUs` and full
+/// adjudication. Denying the replay bought nothing (mDNS is unauthenticated, so
+/// the same assertion can simply be forged) while the copy that lost the race
+/// carried our own withdrawn records into our own cache.
 ///
-/// Take-once is the bound. The first copy spends the entry's remaining loopback
-/// for this family and is suppressed; every copy behind it finds nothing, reads
-/// as `SelfLog::None`, and adjudicates in full.
+/// So a superseded entry is now a STANDING tombstone: the flood below outruns
+/// every loopback copy the log genuinely owes, and not one round of it reaches
+/// the protocol layer.
+///
+/// The replacement is protected on the OTHER side too, and independently. Its
+/// survival does not rest on the log at all: the datagram asserts the shared host
+/// name with an address set the replacement does not hold, which by the receiving
+/// service's own records is an RFC 6762 §9 conflict and an §8.1 probe defeat, and
+/// `Endpoint` screens it out because the rdata is a set THIS ENDPOINT recently
+/// asserted and relinquished at that owner — a fact no `Service` and no send log
+/// can supply.
+///
+/// Six rounds at the §8.1 probe interval is twice the replacement's whole
+/// probing window.
 #[test]
-fn a_replayed_superseded_response_outruns_the_copies_it_can_spend() {
+fn a_replayed_superseded_response_is_suppressed_for_every_copy() {
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(53));
   let host = "shared.local.";
   let a = engine
@@ -4266,32 +4275,31 @@ fn a_replayed_superseded_response_outruns_the_copies_it_can_spend() {
     );
   }
   assert!(
-    terminal,
-    "a peer replayed a captured response asserting our host name with an address \
-     set the live route does not hold, {REPLAYS} times across the replacement's \
-     whole probing window, and not one copy reached it — a superseded match that \
-     cannot be spent suppresses every copy, which is the property `OwnEcho` may \
-     not be granted without"
+    !terminal,
+    "a peer replayed our own withdrawn announcement {REPLAYS} times across the \
+     replacement's whole probing window and it retired a live service"
   );
+  // The tombstone stands: nothing the flood did consumed it, so the copy behind
+  // the last one would be suppressed too.
   assert!(
     engine
       .tx
       .recent
       .iter()
-      .all(|s| s.data.as_slice() != announcement.as_slice() || !s.owed[0]),
-    "the flood left a v4 loopback copy of these bytes still owed, so the match \
-     spent nothing and the next copy would be swallowed too"
+      .any(|s| s.data.as_slice() == announcement.as_slice() && s.owed[0]),
+    "a superseded entry must not be spent by the copies it answers — spent, the \
+     next copy reaches the protocol layer as peer traffic carrying records this \
+     engine no longer publishes"
   );
-  // Take-once, not "no suppression": the copies genuinely owed were still the
-  // whole-datagram reject `OwnEcho` produces, and every copy past them
-  // adjudicated.
+  // EVERY copy was the whole-datagram reject `OwnEcho` produces, not just the
+  // `owed_v4` the log would have credited under take-once.
   #[cfg(feature = "stats")]
   assert_eq!(
     engine.stats().packets_dropped,
-    dropped_before + owed_v4 as u64,
-    "one whole-datagram reject per loopback copy this entry still owed, and not \
-     one more; a higher count means a match that cannot be spent, a lower one \
-     means the credit was never offered"
+    dropped_before + REPLAYS as u64,
+    "the flood outran the loopback copies genuinely owed ({owed_v4}), so a \
+     take-once superseded credit would have let {} of these through",
+    REPLAYS - owed_v4
   );
 }
 
@@ -4347,6 +4355,145 @@ fn each_family_spends_only_its_own_loopback_copy() {
     SelfLog::Current,
     "the family that did queue it is still owed its copy"
   );
+}
+
+/// TAKE-ONCE IS THE CURRENT TIER'S RULE, AND ONLY ITS.
+///
+/// A superseded entry is a standing tombstone: it answers every byte-identical
+/// copy inside `RECENT_SEND_TTL`, it is not consumed by any of them, and
+/// `SelfSend::owed` does not gate it — so a family that has already taken the
+/// loopback copy it was owed still disowns the copies behind it, which is where
+/// the medium's second delivery and a peer's replay both land.
+#[test]
+fn a_superseded_entry_disowns_every_copy_and_is_spent_by_none() {
+  let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
+  let datagram = b"records this engine has given up".as_slice();
+  tx.record(datagram, at(0), [true, true]);
+
+  // While CURRENT, take-once still holds: the v4 copy is spent by its echo.
+  assert_eq!(tx.claim(Family::V4, datagram, at(1_000)), SelfLog::Current);
+  assert_eq!(
+    tx.claim(Family::V4, datagram, at(2_000)),
+    SelfLog::None,
+    "a current entry is take-once, so a §9 twin's second datagram is visible"
+  );
+
+  // The service that sent it retires: what this engine publishes has changed.
+  tx.supersede();
+  for round in 1..=4i64 {
+    assert_eq!(
+      tx.claim(Family::V4, datagram, at(2_000 + round * 1_000)),
+      SelfLog::Superseded,
+      "copy {round} carries records no live route holds — the spent v4 flag must \
+       not let it through as peer traffic"
+    );
+  }
+  assert_eq!(tx.recent.len(), 1, "no copy spends the tombstone");
+
+  // Only the recency window retires it, exactly as before.
+  assert_eq!(
+    tx.claim(
+      Family::V4,
+      datagram,
+      at(RECENT_SEND_TTL.as_micros() as i64 + 1_000)
+    ),
+    SelfLog::None,
+    "past the recency window the tombstone answers nothing"
+  );
+}
+
+/// A TOMBSTONE SPEAKS ONLY FOR THE FAMILIES THAT ACTUALLY SENT.
+///
+/// A fan-out is two `try_send` calls, and either may be refused: v6 reporting
+/// `Busy` for a round leaves a datagram v4 alone ever carried. No IPv6 loopback
+/// copy of those bytes exists, so an IPv6 datagram carrying them is provably a
+/// peer's — and `SelfSend::sent_on` is what says so, immutably, for as long as
+/// the entry lives.
+///
+/// `SelfSend::owed` cannot answer that question. It decays: the superseded tier
+/// deliberately never consults it (a tombstone must answer every copy, not the
+/// first), so before the family precondition existed a superseded entry matched
+/// on bytes alone. A v4-only send then disowned IPv6 traffic, and `OwnEcho`
+/// denies observation, quieting, adjudication AND the §8.1 defence — so a peer's
+/// byte-identical §8.2 probe went invisible for the rest of `RECENT_SEND_TTL`.
+/// Five seconds is longer than the peer's whole probing window, so it would
+/// finish probing unopposed and both hosts would own the same records.
+#[test]
+fn a_tombstone_never_answers_for_a_family_that_never_sent() {
+  let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
+  let datagram = b"v4 queued this one; v6 reported busy".as_slice();
+  tx.record(datagram, at(0), [true, false]);
+  tx.supersede();
+
+  // Every copy, not just the first: the tombstone stands for the whole window,
+  // so a family precondition that only held on the first arrival would leave the
+  // rest of a peer's probe sequence suppressed all the same.
+  for round in 1..=4i64 {
+    assert_eq!(
+      tx.claim(Family::V6, datagram, at(round * 1_000)),
+      SelfLog::None,
+      "copy {round} arrived on a family no `try_send` ever queued these bytes on, \
+       so it cannot be a local echo of them; claimed, a peer's identical IPv6 \
+       probe is `OwnEcho` and invisible for the whole recency window"
+    );
+  }
+  assert_eq!(
+    tx.recent.len(),
+    1,
+    "a refused v6 claim must leave the entry exactly as it found it — the v4 \
+     tombstone it holds is still owed"
+  );
+}
+
+/// The other half of the precondition: on a family that DID send, the tombstone
+/// still answers EVERY copy, and no copy consumes it.
+///
+/// The mask narrows which families a superseded entry speaks for. It must not
+/// narrow WHEN it speaks for them, and it must not be collapsed back into
+/// `SelfSend::owed` — the second leg below is the one that fails if a future
+/// reader "simplifies" the two masks into one, because there `owed` is already
+/// spent while `sent_on` still holds.
+///
+/// Spent, the copy that spends it leaves the GENUINE echo behind it reading
+/// `SelfLog::None`, hence `NotFromUs`, hence this engine's own withdrawn records
+/// written into its own cache and its own retransmits deferred on their behalf.
+/// One send is credited once per family while the medium may deliver several
+/// copies — kernel loopback plus an 802.11 base-station re-broadcast, which §8.2
+/// names as an echo source — so that needs no attacker at all.
+#[test]
+fn a_tombstone_still_answers_every_copy_on_the_family_that_sent() {
+  let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
+
+  // A v4-only send, superseded with its loopback copy still outstanding.
+  let v4_only = b"v4 queued this one; v6 reported busy".as_slice();
+  tx.record(v4_only, at(0), [true, false]);
+  tx.supersede();
+  for round in 1..=4i64 {
+    assert_eq!(
+      tx.claim(Family::V4, v4_only, at(round * 1_000)),
+      SelfLog::Superseded,
+      "copy {round} carries records no live route holds, and v4 is exactly the \
+       family that put them on the wire"
+    );
+  }
+  assert_eq!(tx.recent.len(), 1, "no copy spends the tombstone");
+
+  // A both-family send whose v4 copy is SPENT while current, so only the
+  // immutable mask can still answer for v4 once the entry is superseded. The v6
+  // copy is left outstanding so the spent entry survives to become a tombstone.
+  let both = b"both sockets took this one".as_slice();
+  tx.record(both, at(10_000), [true, true]);
+  assert_eq!(tx.claim(Family::V4, both, at(11_000)), SelfLog::Current);
+  tx.supersede();
+  for round in 1..=4i64 {
+    assert_eq!(
+      tx.claim(Family::V4, both, at(12_000 + round * 1_000)),
+      SelfLog::Superseded,
+      "copy {round}: v4 transmitted these bytes, so it disowns them even though \
+       it already took the one loopback copy it was owed — a precondition read \
+       off `owed` instead would let this reach the proto layer as peer traffic"
+    );
+  }
 }
 
 /// Both of this engine's sockets send from 5353, so every loopback copy arrives

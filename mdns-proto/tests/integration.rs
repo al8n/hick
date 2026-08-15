@@ -464,7 +464,7 @@ fn r37_unregister_service_allows_reregister_same_name() {
   }
 
   // Unregister and re-register: this must succeed.
-  let removed = e.unregister_service(h);
+  let removed = e.unregister_service(h, None, now);
   assert!(removed, "unregister must report a removal");
 
   let recs3 = ServiceRecords::new(stype, inst, host, 631, 120);
@@ -499,11 +499,11 @@ fn r37_double_unregister_is_idempotent() {
     )
     .unwrap();
   assert!(
-    e.unregister_service(h),
+    e.unregister_service(h, None, now),
     "first unregister removes the route"
   );
   assert!(
-    !e.unregister_service(h),
+    !e.unregister_service(h, None, now),
     "second unregister of the same handle is a no-op"
   );
 }
