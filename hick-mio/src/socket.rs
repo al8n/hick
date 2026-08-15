@@ -134,10 +134,9 @@ pub(crate) use hick_udp::Family;
 /// attempt (NLL problem case #3). Retrying where the buffer's OWNER is is what
 /// makes the borrow per-iteration again.
 ///
-/// Every decision the loop used to make inside [`Sockets::recv_once`] still is:
-/// the family rotation, the readiness clearing, the error classification, the
-/// stats and the [`MAX_DISCARDED_PER_RECV`] budget. What moved out is only the
-/// `loop` keyword.
+/// Only the `loop` keyword lives outside. Every decision is still
+/// [`Sockets::recv_once`]'s: the family rotation, the readiness clearing, the
+/// error classification, the stats and the [`MAX_DISCARDED_PER_RECV`] budget.
 pub(crate) enum RecvStep<'b> {
   /// A datagram, with its family, body and stamp already bound together, and the
   /// metadata the RFC 6762 §11 gate reads. The family is not carried beside it:
@@ -345,11 +344,11 @@ pub(crate) enum SendOutcome {
     /// 50 ms of true spacing, and it would do so on exactly the loaded host the
     /// spacing exists to protect.
     ///
-    /// The self-send credit's ageing used to share this stamp. It no longer may:
-    /// the gate is asking "when did these bytes leave", which is a property of
-    /// this send, while the credit is asking "how long has the echo had to come
-    /// back", which cannot start before the next tick lets it. Same direction,
-    /// different question — see the type-level note above.
+    /// The self-send credit's ageing may NOT share this stamp: the gate asks
+    /// "when did these bytes leave", a property of this send, while the credit
+    /// asks "how long has the echo had to come back", which cannot start before
+    /// the next tick lets it. Same direction, different question — see the
+    /// type-level note above.
     wire_at: StdInstant,
   },
   /// A bound socket was **not offered** the datagram, because the caller's
@@ -1568,14 +1567,14 @@ impl Sockets {
   ///
   /// # The retry loop is the caller's, and that is structural
   ///
-  /// This used to loop here. It cannot any more: the [`RxDatagram`] it returns
-  /// borrows `buf` for the caller's lifetime, which is a free region and so live
-  /// at every point of this function — a loop that conditionally returns one can
-  /// never re-borrow `buf` for a second attempt. The loop therefore lives where
-  /// the buffer's owner is, and this reports [`RecvStep::Retry`] instead of
-  /// looping. `discarded` is that loop's counter, carried in so this method
-  /// still enforces [`MAX_DISCARDED_PER_RECV`] — the caller stores it and
-  /// nothing more. Every other decision is unchanged and still made here.
+  /// This cannot loop: the [`RxDatagram`] it returns borrows `buf` for the
+  /// caller's lifetime, which is a free region and so live at every point of
+  /// this function — a loop that conditionally returns one can never re-borrow
+  /// `buf` for a second attempt. The loop therefore lives where the buffer's
+  /// owner is, and this reports [`RecvStep::Retry`] instead of looping.
+  /// `discarded` is that loop's counter, carried in so this method still
+  /// enforces [`MAX_DISCARDED_PER_RECV`] — the caller stores it and nothing
+  /// more. Every other decision is made here.
   ///
   /// [`RecvStep::Idle`] means stop draining: nothing readable, or the discard
   /// budget spent, having cleared each drained family's flag and re-armed it.

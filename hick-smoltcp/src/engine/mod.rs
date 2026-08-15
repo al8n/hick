@@ -87,21 +87,21 @@ const RECENT_SEND_TTL: Duration = Duration::from_secs(5);
 /// nothing: its records ARE the questions, so no registration, withdrawal or RFC
 /// 6762 §9 rename can invalidate them.
 ///
-/// Superseding a question's entry therefore turned it into a standing tombstone
+/// Superseding a question's entry would therefore make it a standing tombstone
 /// for a datagram that could never have carried a stale assertion — and because
 /// a superseded entry is deliberately non-consuming, EVERY byte-identical copy
-/// was then suppressed rather than only the first. A peer's query retransmission
-/// from port 5353 is ordinary traffic under §5.2's retry schedule, so that made
+/// would be suppressed rather than only the first. A peer's query retransmission
+/// from port 5353 is ordinary traffic under §5.2's retry schedule, so that makes
 /// legitimate peer questions invisible for the whole of [`RECENT_SEND_TTL`],
-/// every time an unrelated service crossed a lifecycle seam.
+/// every time an unrelated service crosses a lifecycle seam.
 ///
 /// # It is on the ENTRY, and there is no second epoch
 ///
 /// The class describes the datagram, so it belongs beside the datagram. A
-/// second, query-side epoch was the alternative and it is the wrong shape:
-/// nothing would ever advance it, because a question describes no state of ours
-/// that could move on. A counter frozen at zero is worse than none for the
-/// reader who has to work out what could move it.
+/// second, query-side epoch is the wrong shape: nothing would ever advance it,
+/// because a question describes no state of ours that could move on, and a
+/// counter frozen at zero is worse than none for the reader who has to work out
+/// what could move it.
 ///
 /// # It is DERIVED, never declared
 ///
@@ -323,14 +323,14 @@ enum SelfLog {
   /// retransmits, and that half no screen in `mdns-proto` covers; withheld from
   /// adjudication it would take a name from a peer that holds one.
   ///
-  /// **`OwnEcho` HERE WAS THE FALSE AXIOM, ONE LAYER DOWN.** This tier carries no
-  /// better evidence than [`SelfLog::Current`] — it is the same content
-  /// comparison, said of an older generation — and the proto's relinquished
-  /// screen has already abandoned the premise that a byte match proves origin. A
-  /// §9 fault-tolerance twin publishing the records we gave up sends exactly
-  /// these bytes by design, and a peer may replay them; under `OwnEcho` every
-  /// such datagram was invisible for the whole entry lifetime, so a successor
-  /// could finish probing while the incumbent's defences went unheard.
+  /// **NOT `OwnEcho`**, which would take a byte match as proof of origin. This
+  /// tier carries no better evidence than [`SelfLog::Current`] — it is the same
+  /// content comparison, said of an older generation — and the proto's
+  /// relinquished screen does not rest on that premise either. A §9
+  /// fault-tolerance twin publishing the records we gave up sends exactly these
+  /// bytes by design, and a peer may replay them; under `OwnEcho` every such
+  /// datagram is invisible for the whole entry lifetime, so a successor can
+  /// finish probing while the incumbent's defences go unheard.
   ///
   /// # It is a STANDING TOMBSTONE, not a take-once credit
   ///
@@ -338,22 +338,22 @@ enum SelfLog {
   /// can replay bytes it captured off the link, and a conforming twin can produce
   /// them without replaying anything.
   ///
-  /// Take-once was the bound on that, and it was the wrong trade. What these
-  /// bytes assert is a record set this engine HAS GIVEN UP, so withholding
-  /// observation and quieting for every copy of them can only mask an assertion
-  /// no live route holds, or a byte-identical twin still asserting our withdrawn
-  /// records — a bounded cache-freshness delay either way, self-correcting from
-  /// the twin's next datagram, and it costs no conflict at all now that the tier
-  /// adjudicates. And it denies an attacker nothing: mDNS is unauthenticated, so
-  /// a forger can assert the same records without our bytes.
+  /// Take-once would be the obvious bound on that, and it is the wrong trade.
+  /// What these bytes assert is a record set this engine HAS GIVEN UP, so
+  /// withholding observation and quieting for every copy of them can only mask
+  /// an assertion no live route holds, or a byte-identical twin still asserting
+  /// our withdrawn records — a bounded cache-freshness delay either way,
+  /// self-correcting from the twin's next datagram, and costing no conflict
+  /// since the tier adjudicates. And it denies an attacker nothing: mDNS is
+  /// unauthenticated, so a forger can assert the same records without our bytes.
   ///
-  /// What spending cost was real and needed no attacker: one send is credited
+  /// What spending costs is real and needs no attacker: one send is credited
   /// once per family while the medium may deliver several copies — kernel
   /// loopback plus an 802.11 base-station re-broadcast, which §8.2 names as an
-  /// echo source — so the copy that spent the credit left the GENUINE echo behind
-  /// it reading [`SelfLog::None`], hence `NotFromUs`, hence our own withdrawn
-  /// records written into our own cache and our own retransmits deferred on their
-  /// behalf.
+  /// echo source — so the copy that spends the credit leaves the GENUINE echo
+  /// behind it reading [`SelfLog::None`], hence `NotFromUs`, hence our own
+  /// withdrawn records written into our own cache and our own retransmits
+  /// deferred on their behalf.
   ///
   /// So a match at this tier consumes nothing. Take-once survives at
   /// [`SelfLog::Current`], where a twin's datagram must stay visible and where a
@@ -1177,18 +1177,16 @@ impl<I: Instant> Multicaster<I> {
   /// a CURRENT match already spent — the generation change is a fact about our
   /// records, not a second echo.
   ///
-  /// Take-once was applied here too, on the reasoning that total suppression of
-  /// bytes a peer could be replaying needs a bound. It does not: what those bytes
-  /// assert is a record set this engine HAS GIVEN UP, so suppressing every copy
-  /// can only mask an assertion no live route holds, or a byte-identical twin
-  /// still asserting our withdrawn records — a bounded detection delay either
-  /// way — while an attacker "denied" the replay never needed our bytes, since
-  /// mDNS is unauthenticated and the same assertion can simply be forged. What
-  /// spending cost was real: the copy that spent it left the GENUINE echo behind
-  /// it reading [`SelfLog::None`], hence `NotFromUs`, hence our own withdrawn
-  /// records written into our own cache. One send is credited once per family
-  /// while the medium may deliver several copies, so that needs no attacker at
-  /// all.
+  /// Take-once must not be applied here as a bound on total suppression. What
+  /// these bytes assert is a record set this engine HAS GIVEN UP, so suppressing
+  /// every copy can only mask an assertion no live route holds, or a
+  /// byte-identical twin still asserting our withdrawn records — a bounded
+  /// detection delay either way — while an attacker "denied" the replay never
+  /// needed our bytes, mDNS being unauthenticated. Spending costs something
+  /// real: the copy that spends it leaves the GENUINE echo behind it reading
+  /// [`SelfLog::None`], hence `NotFromUs`, hence our own withdrawn records
+  /// written into our own cache. One send is credited once per family while the
+  /// medium may deliver several copies, so that needs no attacker at all.
   ///
   /// A CURRENT entry is preferred over a superseded one holding the same bytes:
   /// the same datagram can be recorded on both sides of a generation change, and
@@ -1748,7 +1746,7 @@ where
           transmit.min_family_gap(),
         );
         self.set_wire_gate(origin, gate);
-        // ── Per-family accounting, INDEPENDENT of the coarse outcome ────────────
+        // Per-family accounting, INDEPENDENT of the coarse outcome.
         // A partial fan-out (v4 Sent + v6 TooLarge) queues one datagram AND
         // raises one error; keying either counter off the outcome arm would
         // silently drop one of them. Bump both here, before the match, from the
@@ -1880,7 +1878,7 @@ where
     // again so confirmed transitions are visible to `poll_service_update` now.
     self.drain_service_updates(now);
 
-    // ── Endpoint-owned withdrawals (RFC 6762 §10.1 goodbyes) ─────────────────
+    // Endpoint-owned withdrawals (RFC 6762 §10.1 goodbyes).
     // Pump every due TTL=0 goodbye datagram. The endpoint encodes each (with
     // fresh sibling host-address retention computed internally), hands back the
     // multicast datagram + the item's opaque withdrawal token and per-family debt;
@@ -2033,8 +2031,8 @@ where
     //
     // **A CURRENT match is `OwnEchoLikely`, and never `OwnEcho`.** This engine
     // weighs no ordering evidence — see `Multicaster::claim` — so it may not
-    // claim the ordered tier. What that costs is real and deliberate: a match no
-    // longer suppresses everything, so our own echo now populates no cache entry
+    // claim the ordered tier. What that costs is real and deliberate: a match
+    // suppresses less than everything, so our own echo populates no cache entry
     // and quiets nothing, but it DOES reach §8.2's tiebreak and §8.1's defence.
     // That is the safe direction. Suppressing a §8.2 proposal this engine merely
     // suspects is its own costs a name permanently and silently between two
@@ -2045,14 +2043,13 @@ where
     // the same content comparison, said of an older generation — so it may deny
     // OBSERVATION and QUIETING, where believing a peer poisons this engine's own
     // cache with records it no longer publishes and defers its own retransmits,
-    // and it may not deny ADJUDICATION. `OwnEcho` here was the false axiom the
-    // proto's relinquished screen abandoned, sitting one layer down: byte
-    // equality read as proof of origin. A superseded entry is a STANDING
-    // tombstone, so under that mapping a §9 fault-tolerance twin publishing the
-    // bytes we gave up — or a peer replaying them — was invisible for every copy
-    // it sent, and a successor could finish probing while the incumbent went
-    // unheard. What the tier used to buy is bought better by the
-    // `relinquished_retention` screen: see `SelfLog::Superseded`.
+    // and it may not deny ADJUDICATION. NOT `OwnEcho`, which would read byte
+    // equality as proof of origin. A superseded entry is a STANDING tombstone,
+    // so under that mapping a §9 fault-tolerance twin publishing the bytes we
+    // gave up — or a peer replaying them — is invisible for every copy it sends,
+    // and a successor can finish probing while the incumbent goes unheard. The
+    // terminal outcome is held by the `relinquished_retention` screen instead:
+    // see `SelfLog::Superseded`.
     //
     // `SelfLog::None` is a negative claim about this engine's own send log, which
     // is `NotFromUs` — and `NotFromUs` declines `trust_advertised_src_as_self`,

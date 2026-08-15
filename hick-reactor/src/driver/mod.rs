@@ -72,14 +72,14 @@ struct Packet {
   /// receive timestamp that orders it against our own sends — one value that
   /// cannot be taken apart.
   ///
-  /// All three used to be separate fields (`data`, `family`, and the stamp),
-  /// which made pairing them correctly a convention this struct literal happened
-  /// to keep. It is now a property of the type: [`RxDatagram`] is
-  /// neither `Copy` nor `Clone` and has no stamp accessor, so a stamp a kernel
-  /// really did write — for a *different* receive — cannot be lifted out and laid
-  /// beside these bytes. A later stamp would let a datagram the kernel saw before
-  /// our `sendto` take the credit; an earlier one would reject the genuine echo;
-  /// both end at a phantom RFC 6762 §9 conflict against ourselves.
+  /// One field rather than three (`data`, `family`, and the stamp), so pairing
+  /// them correctly is a property of the type rather than a convention this
+  /// struct literal has to keep: [`RxDatagram`] is neither `Copy` nor `Clone`
+  /// and has no stamp accessor, so a stamp a kernel really did write — for a
+  /// *different* receive — cannot be lifted out and laid beside these bytes. A
+  /// later stamp would let a datagram the kernel saw before our `sendto` take
+  /// the credit; an earlier one would reject the genuine echo; both end at a
+  /// phantom RFC 6762 §9 conflict against ourselves.
   ///
   /// The family is half the credit key, and it comes from the recv task that owns
   /// the socket rather than from [`Packet::src`]: a source address describes the
@@ -758,13 +758,12 @@ impl<N: Net> DriverState<N> {
     // credit of a query we had just multicast and be reported as our own echo.
     // The reply that querier is owed would never be sent, and the genuine echo
     // behind it would find no credit and reach the protocol layer as peer
-    // traffic. The `&&` short-circuits, so such a datagram is never offered one.
+    // traffic. The port test below is the outer `if`, so such a datagram never
+    // reaches a claim at all.
     //
-    // ── THE TIER THIS DRIVER CAN HONESTLY REPORT ─────────────────────────────
-    //
-    // Three answers, not two, and each is a claim about THIS DRIVER'S OWN SEND
-    // LOG rather than about the network — no platform reports "this is your own
-    // multicast echo".
+    // THE TIER THIS DRIVER CAN HONESTLY REPORT. Three answers, not two, and each
+    // is a claim about THIS DRIVER'S OWN SEND LOG rather than about the network
+    // — no platform reports "this is your own multicast echo".
     //
     //  * `Ordered` weighed evidence that the kernel saw this datagram at or
     //    after our own `sendto`, so nothing else could have put these bytes on
@@ -780,14 +779,8 @@ impl<N: Net> DriverState<N> {
     //    costs at worst §8.2's one-second deferral.
     //  * `NoCredit` is a negative claim about this log — no credit matched, an
     //    evicted one included — which is what `NotFromUs` means. So is a source
-    //    port this endpoint never sends from, and that one is decided WITHOUT
-    //    offering a credit at all: the `if` is the short circuit the old `&&`
-    //    was, and it is load-bearing. A §6.7 legacy unicast query from an
-    //    ephemeral port carrying the same bytes as one we just multicast would
-    //    otherwise take that credit under `Degraded` and be reported as our own
-    //    echo — the reply that querier is owed would never be sent, and the
-    //    genuine echo behind it would find no credit and reach the protocol
-    //    layer as a peer's.
+    //    port this endpoint never sends from, decided by the `if` WITHOUT
+    //    offering a credit at all, for the reason given above.
     let provenance = if pkt.src.port() == hick_udp::constants::MDNS_PORT {
       match self.selfsend.claim(&pkt.rx) {
         SelfSendMatch::Ordered => Provenance::OwnEcho,
@@ -801,26 +794,24 @@ impl<N: Net> DriverState<N> {
         // longer publishes into its own cache and defers this endpoint's own
         // retransmits on their behalf — and it may not deny ADJUDICATION.
         //
-        // `OwnEcho` HERE WAS THE SAME FALSE AXIOM THE PROTO SCREEN ABANDONED,
-        // one layer down: byte equality read as proof these bytes are ours. A
-        // superseded entry is a standing tombstone, so under that mapping an
+        // NOT `OwnEcho`: that reads byte equality as proof these bytes are ours.
+        // A superseded entry is a standing tombstone, so under that mapping an
         // old local responder and a live §9 fault-tolerance twin producing the
-        // same bytes — or a peer replaying them — made EVERY matching peer
-        // defence invisible for the whole credit lifetime, and a successor
-        // could finish probing while the incumbent went unheard.
+        // same bytes — or a peer replaying them — make EVERY matching peer
+        // defence invisible for the whole credit lifetime, and a successor can
+        // finish probing while the incumbent goes unheard.
         //
-        // What `OwnEcho` used to buy is bought better elsewhere: our own
-        // withdrawn generation is kept from retiring the service that replaced
-        // it by the `Endpoint` screen behind
+        // Keeping our own withdrawn generation from retiring the service that
+        // replaced it belongs one layer up, at the `Endpoint` screen behind
         // `EndpointConfig::relinquished_retention`, which labels the record and
         // leaves the terminal `HostConflict` dropped in the router while a
-        // pre-authoritative instance conflict merely defers. That has to be
-        // where it lives: this classification is defeasible three independent
-        // ways no driver can close — a peer replaying our bytes reproduces
-        // everything weighed here, one send can be delivered as several copies
-        // while it is credited once, and credits are evicted under load. Each
-        // leaves the GENUINE echo reading `NoCredit`, hence `NotFromUs`, hence
-        // fully adjudicated already. See `SelfSendTracker::supersede`.
+        // pre-authoritative instance conflict merely defers. It has to live
+        // there: this classification is defeasible three independent ways no
+        // driver can close — a peer replaying our bytes reproduces everything
+        // weighed here, one send can be delivered as several copies while it is
+        // credited once, and credits are evicted under load. Each leaves the
+        // GENUINE echo reading `NoCredit`, hence `NotFromUs`, hence fully
+        // adjudicated already. See `SelfSendTracker::supersede`.
         SelfSendMatch::Superseded => Provenance::OwnEchoLikely,
         SelfSendMatch::NoCredit => Provenance::NotFromUs,
       }
@@ -946,7 +937,7 @@ impl<N: Net> DriverState<N> {
         ..
       } = self;
 
-      // ── Service updates ───────────────────────────────────────────────
+      // Service updates.
       for (handle, ctx) in services.iter_mut() {
         // A service already withdrawing has a finished proto state machine and
         // the endpoint owns its goodbye schedule; skip it (the ctx is GC'd by
@@ -1049,7 +1040,7 @@ impl<N: Net> DriverState<N> {
         }
       }
 
-      // ── Query answers + terminals ─────────────────────────────────────
+      // Query answers + terminals.
       let mut terminated: Vec<QueryHandle> = Vec::new();
       query_handle_scratch.clear();
       query_handle_scratch.extend(queries.keys().copied());
