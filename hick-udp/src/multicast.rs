@@ -22,11 +22,29 @@ use crate::platform;
 ///
 /// Used by `try_bind_v4` to set `IP_MULTICAST_IF` to a single address; for
 /// the multicast-join path that needs every IPv4 address of the interface,
-/// see `try_join_v4`.
+/// see `try_join_v4`. For the IPv6 sibling, see `ipv6_addr_for_index`.
 fn ipv4_addr_for_index(idx: u32) -> Option<Ipv4Addr> {
   let iface = getifs::interface_by_index(idx).ok().flatten()?;
   let v4s = iface.ipv4_addrs().ok()?;
   v4s.first().map(|a| a.addr())
+}
+
+/// Look up the first IPv6 address assigned to the interface with the given
+/// OS index. Returns `None` if the interface cannot be found or carries no
+/// IPv6 address (e.g. IPv4-only or the lookup failed).
+///
+/// `IPV6_MULTICAST_IF` takes the interface index directly rather than an
+/// address, so unlike `ipv4_addr_for_index` the resolved address itself is
+/// never handed to the kernel — this exists only to confirm the index names a
+/// real, IPv6-capable interface before `try_bind_v6` commits to it. The
+/// kernel validates that the index names a real device, but not that the
+/// device carries an IPv6 address, so without this check a caller could pin
+/// IPv6 multicast egress to an IPv4-only NIC and get no signal that it can
+/// never actually leave from there.
+fn ipv6_addr_for_index(idx: u32) -> Option<Ipv6Addr> {
+  let iface = getifs::interface_by_index(idx).ok().flatten()?;
+  let v6s = iface.ipv6_addrs().ok()?;
+  v6s.first().map(|a| a.addr())
 }
 
 /// Options for binding an IPv4 mDNS multicast socket.
@@ -850,6 +868,28 @@ thread_local! {
 }
 
 fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
+  // Resolve the requested egress interface (if any) and confirm it carries an
+  // IPv6 address; a non-zero index that doesn't resolve is a hard error. This
+  // is the v6 twin of the check just above in `try_bind_v4_inner` — until now
+  // `try_bind_v6` had no resolution step at all here and relied entirely on
+  // `platform::bind_v6`'s `IPV6_MULTICAST_IF` call to the kernel, which
+  // rejects a nonexistent device but does NOT reject an existing device with
+  // no IPv6 address, so a caller could silently pin egress to an interface
+  // IPv6 traffic can never leave.
+  //
+  // This is a different failure than the one `warn_if_multicast_if_v4_drifted`
+  // warns on instead of failing: that one is a kernel-ACCEPTED `setsockopt`
+  // whose read-back semantics are unverified on four untested BSDs, so a hard
+  // failure there could brick a bind that actually worked. Here the request
+  // could never have worked, and `BindError::InterfaceNotFound` is already
+  // the established, hard-failing response to that — see `ipv4_addr_for_index`
+  // above and `try_join_v4_inner` below — so this follows that existing
+  // policy rather than choosing a new one.
+  if opts.interface_index() != 0 && ipv6_addr_for_index(opts.interface_index()).is_none() {
+    return Err(BindError::InterfaceNotFound(
+      crate::error::InterfaceNotFoundDetail::new(opts.interface_index()),
+    ));
+  }
   // Create + bind the socket. IPV6_V6ONLY is set before bind so a `[::]:5353`
   // socket doesn't also accept IPv4 (as v4-mapped) and collide with the separate
   // IPv4 socket bound to `0.0.0.0:5353` on dual-stack-default systems (e.g. Linux
