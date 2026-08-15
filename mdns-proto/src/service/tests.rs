@@ -10365,6 +10365,92 @@ fn an_identical_twins_instance_nsec_is_never_a_conflict() {
   );
 }
 
+/// …and the OTHER half of the same widening: a peer's DIFFERING instance NSEC
+/// is a §9 conflict for an ESTABLISHED service, and must be adjudicated as one.
+///
+/// The established-state gate used to admit `Srv | Txt` and nothing else, from a
+/// hand-written list beside the classifier's. When `canonical_rdata_forms` grew
+/// its NSEC arm the list did not follow, so a peer's authoritative,
+/// cache-flushed NSEC at our instance name — same owner, class and rrtype,
+/// DIFFERENT rdata — was routed, classified as conflicting, and then discarded
+/// solely for being an NSEC. An NSEC-only response or additional record left
+/// duplicate ownership of this instance name undetected until unrelated SRV/TXT
+/// traffic happened to arrive.
+///
+/// The gate now derives from the same canonical forms the classifier uses, so
+/// the two cannot disagree about which types can be ours.
+#[test]
+fn a_differing_instance_nsec_reverts_an_established_service() {
+  let mut svc = make_service(120);
+  let now = drive_to_established(&mut svc);
+  while svc.poll().is_some() {}
+
+  // A conforming peer's NSEC for the SAME name asserting a DIFFERENT RRset —
+  // `{SRV, TXT, A}` where ours asserts `{SRV, TXT}`. Same owner, class and
+  // rrtype; inconsistent rdata; §9's conflict exactly.
+  let mut msg = [0u8; 512];
+  let inst = Name::try_from_str(PROBED_NAME).unwrap();
+  let mut b =
+    crate::wire::MessageBuilder::<'_, 32>::try_new(&mut msg, crate::wire::Header::new()).unwrap();
+  b.push_nsec_additional(
+    &inst,
+    120,
+    &[
+      crate::wire::ResourceType::Srv.to_u16(),
+      crate::wire::ResourceType::Txt.to_u16(),
+      crate::wire::ResourceType::A.to_u16(),
+    ],
+    true,
+  )
+  .unwrap();
+  let n = b.finish().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
+  let rec = reader.additional().flatten().next().unwrap();
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    now,
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "a peer's differing instance NSEC is a §9 conflict — it must send this \
+     service back through §8's startup steps, not be dropped for its rrtype"
+  );
+}
+
+/// The widening is still bounded by the RULE rather than by a list: a PTR at the
+/// instance name is owned by the SHARED service-type name, so this service
+/// asserts no canonical form of it and it can make no §9 conflict.
+#[test]
+fn a_shared_ptr_at_the_instance_name_still_makes_no_established_conflict() {
+  let mut svc = make_service(120);
+  let now = drive_to_established(&mut svc);
+  while svc.poll().is_some() {}
+
+  let mut msg = [0u8; 512];
+  let inst = Name::try_from_str(PROBED_NAME).unwrap();
+  let other = Name::try_from_str("somewhere-else.local.").unwrap();
+  let mut b =
+    crate::wire::MessageBuilder::<'_, 32>::try_new(&mut msg, crate::wire::Header::new()).unwrap();
+  b.push_ptr_answer(&inst, 120, &other).unwrap();
+  let n = b.finish().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
+  let rec = reader.answers().flatten().next().unwrap();
+
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(peer, rec, dg(1))),
+    now,
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "a shared PTR is not a record this instance name is authoritative for"
+  );
+}
+
 /// R13 finding 3, CONFLICT SIDE ONLY. A conforming twin's CORRECT NSEC must not
 /// rename us just because ours is wrong.
 ///

@@ -430,25 +430,20 @@ pub(crate) fn route_publishes_host_rtype(route: &ServiceRoute, rt: ResourceType)
   }
 }
 
-/// the RR types a service INSTANCE name is authoritative for — SRV and TXT (RFC
-/// 6763 §4) — and so the scope of RFC 6762 §9's post-establishment conflict:
-/// "a Multicast DNS responder has a unique record for which it is currently
-/// authoritative, and it receives a ... response ... with the same name, rrtype
-/// and rrclass, but inconsistent rdata". SRV and TXT are the records an
-/// established instance is authoritative FOR; a record of another type at that
-/// name is not one of them, so it cannot make §9's conflict. The PTR that maps a
-/// service type to an instance is owned by the SHARED service-type name, not the
-/// instance, and is excluded separately.
-///
-/// §9 ONLY. It is emphatically NOT the scope of §8's PROBING rules: a probe asks
-/// type ANY, so every type at the name is part of the proposal §8.2.1 compares
-/// and part of the "any conflicting response" §8.1 defers to. Applying this
-/// filter to the probing path made a peer proposing a type we do not publish
-/// invisible, and two conforming peers both kept the name. See
-/// `RouteEvents::authority_proposes_for`.
-pub(crate) fn is_instance_conflict_rtype(rt: ResourceType) -> bool {
-  matches!(rt, ResourceType::Srv | ResourceType::Txt)
-}
+// A SECOND SPELLING OF "which types can be ours at the instance name" USED TO
+// LIVE HERE, as `is_instance_conflict_rtype` — `matches!(rt, Srv | Txt)`, the
+// established-state gate in `Service::handle_event`. It went stale in exactly
+// the way a second spelling does: `respond::canonical_rdata_forms` gained an
+// NSEC arm when conflict routing widened past SRV/TXT, this list did not, and a
+// peer's authoritative cache-flushed NSEC at our instance name with DIFFERENT
+// rdata was routed, classified as conflicting, and then discarded solely for
+// being an NSEC. An NSEC-only response or additional record left duplicate
+// instance-name ownership undetected until unrelated SRV/TXT traffic arrived.
+//
+// The gate now asks `Service::our_canonical_records_for` — the same function the
+// classifier reaches — whether this service asserts ANY form of that type at its
+// instance name. Shared PTRs are still excluded, because `canonical_rdata_forms`
+// yields no form for them: they are owned by the service-type name.
 
 /// Does `q`'s QTYPE/QCLASS accept the answer record `r`?
 ///
