@@ -522,7 +522,112 @@ fn instance_rtype_exposure_mirrors_the_canonical_forms() {
       "{rtype}: the two halves of the instance-rdata rule disagree about \
        whether this type can be ours"
     );
+    assert_eq!(
+      !super::canonical_rdata_forms(&recs, rtype).is_empty(),
+      super::INSTANCE_CANONICAL_RTYPES.contains(&rtype),
+      "{rtype}: the stated DOMAIN of `canonical_rdata_forms` disagrees with the \
+       function itself — a type missing from the list is one the endpoint's \
+       relinquished-RRset screen never decomposes an identity for"
+    );
   }
+}
+
+/// `canonical_rdata_forms` is the LIVE classifier's list and
+/// `transmitted_rdata_forms` is HISTORY's, and the relation between them is
+/// one-directional: history may name fewer forms, never more, and never one the
+/// live rule would not have accepted.
+///
+/// A widening here is not a bigger version of the same answer — it is the
+/// endpoint's relinquished screen claiming a form no encoder wrote, which
+/// disowns a genuine peer's record and withholds the RFC 6762 §8.1 / §9 conflict
+/// it carried. Every type in the stated domain must also still HAVE a
+/// transmitted form, or that type silently drops out of both retention tiers.
+#[test]
+fn transmitted_forms_never_widen_the_canonical_ones() {
+  let recs = same_name_records();
+  for rtype in [
+    ResourceType::A,
+    ResourceType::AAAA,
+    ResourceType::Ptr,
+    ResourceType::Srv,
+    ResourceType::Txt,
+    ResourceType::Nsec,
+    ResourceType::Hinfo,
+    ResourceType::Cname,
+    ResourceType::Any,
+    ResourceType::Unknown(0xBEEF),
+  ] {
+    let live = super::canonical_rdata_forms(&recs, rtype);
+    let transmitted = super::transmitted_rdata_forms(&recs, rtype);
+    assert!(
+      transmitted.iter().all(|f| live.contains(f)),
+      "{rtype}: history claims a form the live classifier does not even accept; \
+       transmitted {transmitted:?}, live {live:?}"
+    );
+    assert_eq!(
+      !transmitted.is_empty(),
+      super::INSTANCE_CANONICAL_RTYPES.contains(&rtype),
+      "{rtype}: the stated domain of the instance-rdata rule disagrees with what \
+       history can name a transmitted form for"
+    );
+  }
+  // The point of the pair: at THIS record set the two lists differ, and they
+  // differ for exactly one type.
+  assert_eq!(
+    super::canonical_rdata_forms(&recs, ResourceType::Nsec).len(),
+    2,
+    "an instance name that is also the host name is where the conforming twin's \
+     bitmap is a second accepted form"
+  );
+  assert_eq!(
+    super::transmitted_rdata_forms(&recs, ResourceType::Nsec),
+    std::vec![super::emitted_nsec_identity(&recs)],
+    "history keeps the encoder's bitmap and nothing else"
+  );
+}
+
+/// `emitted_nsec_identity` claims to be the bytes `push_service_nsec` writes, so
+/// the encoder is run and the claim compared against what came off the wire. A
+/// drift here makes the relinquished screen answer for a record this endpoint
+/// never sent, or stop answering for one it did.
+#[test]
+fn the_emitted_nsec_identity_is_the_bitmap_the_encoder_writes() {
+  let recs = same_name_records();
+  let mut msg = [0u8; 512];
+  let mut b =
+    crate::wire::MessageBuilder::<'_, 32>::try_new(&mut msg, crate::wire::Header::new()).unwrap();
+  assert!(
+    super::push_service_nsec(&mut b, &recs),
+    "the NSEC must fit a 512-byte buffer"
+  );
+  let n = b.finish().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
+  let rec = reader.additional().flatten().next().unwrap();
+  let on_the_wire = rec.canonical_rdata_folded().unwrap();
+  assert_eq!(
+    super::emitted_nsec_identity(&recs).as_slice(),
+    &*on_the_wire,
+    "the identity history retains must be byte-identical to what the encoder put \
+     on the wire"
+  );
+}
+
+/// A record set whose INSTANCE name IS its HOST name, with both address
+/// families — the configuration in which `our_nsec_identities` names a second,
+/// CONFORMING bitmap that this crate's encoder never writes.
+fn same_name_records() -> crate::records::ServiceRecords {
+  use core::net::{Ipv4Addr, Ipv6Addr};
+  let name = crate::Name::try_from_str("MyPrinter._ipp._tcp.local.").unwrap();
+  let mut r = crate::records::ServiceRecords::new(
+    crate::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    name.clone(),
+    name,
+    631,
+    120,
+  );
+  r.add_a(Ipv4Addr::new(192, 168, 1, 5));
+  r.add_aaaa(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+  r
 }
 
 /// Build a dual-stack `ServiceRecords` with a TXT segment, a subtype, an IPv4

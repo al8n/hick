@@ -377,10 +377,40 @@ impl GoodbyeOwnership {
   /// single `instance` bool, so a "the original name was announced" precondition sets
   /// all three.
   fn mark_instance(&mut self) {
-    self.ptr = true;
-    self.srv = true;
-    self.txt = true;
+    self.ptr = [true; 2];
+    self.srv = [true; 2];
+    self.txt = [true; 2];
   }
+
+  /// Test helper: simulate that `ip` was confirmed-emitted on both families.
+  ///
+  /// It goes through the ONE writer rather than pushing onto `a` directly: the
+  /// address list and its family masks are index-for-index, so a raw push would
+  /// leave an address no family claims — which projects to nothing, exactly as a
+  /// never-emitted address should.
+  fn mark_host_a(&mut self, ip: core::net::Ipv4Addr) {
+    self.record_host_emitted(
+      &respond::EmittedRecords::new(
+        false,
+        false,
+        false,
+        std::vec![ip],
+        std::vec::Vec::new(),
+        false,
+        false,
+      ),
+      [true; 2],
+    );
+  }
+}
+
+/// The IPv4 half of a per-family exposure pair.
+///
+/// The tests below deliver on both families unless they say otherwise, so the
+/// halves agree and either one states the per-record fact under test. The tests
+/// that are ABOUT a partial fan-out read both halves explicitly.
+fn v4_half(e: &[respond::EmittedRecords; 2]) -> &respond::EmittedRecords {
+  crate::transmit::Family::V4.pick_ref(e)
 }
 
 /// Build a minimal raw A record in wire format and parse it via Ref::try_parse.
@@ -769,7 +799,7 @@ fn rename_handoff_withdraws_only_advertised_instance_records() {
   let t0 = probe_once(&mut svc, FakeInstant::zero());
   // The old name advertised ONLY its PTR (SRV/TXT were KAS-suppressed on the one
   // confirmed response before the rename).
-  svc.goodbye.ptr = true;
+  svc.goodbye.ptr = [true; 2];
 
   // An existing owner answers with a DIFFERING SRV (port 9999 > ours 631) → §8.1
   // deferral → rename.
@@ -789,15 +819,15 @@ fn rename_handoff_withdraws_only_advertised_instance_records() {
     .take_rename_goodbye_handoff()
     .expect("a rename of an (PTR-)announced service must hand off the old-name goodbye");
   assert!(
-    old_owned.ptr(),
+    v4_half(&old_owned).ptr(),
     "the advertised PTR is in the handoff ownership"
   );
   assert!(
-    !old_owned.srv() && !old_owned.txt(),
+    !v4_half(&old_owned).srv() && !v4_half(&old_owned).txt(),
     "the KAS-suppressed SRV/TXT must NOT be in the handoff ownership"
   );
   assert!(
-    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
+    v4_half(&old_owned).a_slice().is_empty() && v4_half(&old_owned).aaaa_slice().is_empty(),
     "a rename handoff is instance-only — never host A/AAAA"
   );
 }
@@ -829,15 +859,18 @@ fn advertised_host_addrs_are_the_emitted_subset_not_configured() {
     "nothing advertised before any confirmed send"
   );
   // A confirmed response that emitted ONLY a2 (a1 was KAS-suppressed).
-  svc.goodbye.record_emitted(&respond::EmittedRecords::new(
-    false,
-    false,
-    false,
-    std::vec![a2],
-    std::vec::Vec::new(),
-    false,
-    false,
-  ));
+  svc.goodbye.record_emitted(
+    &respond::EmittedRecords::new(
+      false,
+      false,
+      false,
+      std::vec![a2],
+      std::vec::Vec::new(),
+      false,
+      false,
+    ),
+    [true; 2],
+  );
   assert_eq!(
     svc.advertised_a_addrs(),
     [a2],
@@ -1065,12 +1098,12 @@ fn no_goodbye_after_final_probe_before_first_announcement() {
   // snapshot) owns no records and no host addresses.
   let snap = svc.withdrawal_snapshot();
   assert!(
-    !snap.owned.ptr()
-      && !snap.owned.srv()
-      && !snap.owned.txt()
-      && !snap.owned.subtypes()
-      && snap.host_a.is_empty()
-      && snap.host_aaaa.is_empty(),
+    !v4_half(&snap.owned).ptr()
+      && !v4_half(&snap.owned).srv()
+      && !v4_half(&snap.owned).txt()
+      && !v4_half(&snap.owned).subtypes()
+      && v4_half(&snap.owned).a_slice().is_empty()
+      && v4_half(&snap.owned).aaaa_slice().is_empty(),
     "no goodbye until an announcement has actually been emitted"
   );
 }
@@ -1221,6 +1254,64 @@ fn legacy_a_query_reply_latches_full_set() {
   );
 }
 
+/// The exposure is per family at its SOURCE, across every path that latches one:
+/// the §8.3 announcement, a §7.1-filtered response, the §9 rename handoff, and
+/// the snapshot a forced withdrawal hands to `Endpoint::unregister_service`.
+///
+/// Without this the endpoint-level tests above would be testing their own
+/// fixtures: `GoodbyeOwnership` is where the family fact is either kept or lost.
+#[test]
+fn goodbye_ownership_latches_only_the_delivering_family() {
+  let ip = core::net::Ipv4Addr::new(192, 168, 1, 10);
+  let mut g = GoodbyeOwnership::default();
+  // An announcement IPv4 accepted and IPv6 refused.
+  g.record_emitted(
+    &respond::EmittedRecords::new(
+      true,
+      true,
+      true,
+      std::vec![ip],
+      std::vec::Vec::new(),
+      false,
+      true,
+    ),
+    [true, false],
+  );
+  let [v4, v6] = g.per_family();
+  assert!(
+    v4.srv() && v4.txt() && v4.nsec() && v4.a_slice() == [ip],
+    "IPv4 carried the whole announcement"
+  );
+  assert!(
+    v6.is_empty() && !v6.nsec(),
+    "IPv6 refused it, so it exposed nothing at all"
+  );
+
+  // A §7.1-filtered response that emitted only the TXT, this time on IPv6 alone.
+  g.record_emitted(
+    &respond::EmittedRecords::new(
+      false,
+      false,
+      true,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+      false,
+    ),
+    [false, true],
+  );
+  let [v4, v6] = g.per_family();
+  assert!(
+    v4.srv() && v4.a_slice() == [ip],
+    "the IPv4 half is unchanged by a send IPv4 did not carry"
+  );
+  assert!(
+    v6.txt() && !v6.srv() && v6.a_slice().is_empty(),
+    "IPv6 exposed the TXT and nothing else — not the SRV or the address that \
+     only ever went out on IPv4"
+  );
+}
+
 #[test]
 fn goodbye_ownership_accumulates_and_resets_instance_only() {
   // The GoodbyeOwnership contract: record_emitted OR-accumulates per
@@ -1232,45 +1323,54 @@ fn goodbye_ownership_accumulates_and_resets_instance_only() {
   assert!(!g.any_instance() && !g.any_host());
   // A response that emitted only PTR + TXT (SRV was KAS-suppressed): only those
   // two latch — NOT SRV.
-  g.record_emitted(&respond::EmittedRecords::new(
-    true,
-    false,
-    true,
-    std::vec::Vec::new(),
-    std::vec::Vec::new(),
-    false,
-    false,
-  ));
+  g.record_emitted(
+    &respond::EmittedRecords::new(
+      true,
+      false,
+      true,
+      std::vec::Vec::new(),
+      std::vec::Vec::new(),
+      false,
+      false,
+    ),
+    [true; 2],
+  );
   assert!(
-    g.ptr && !g.srv && g.txt,
-    "only the emitted instance records latch"
+    g.ptr == [true; 2] && g.srv == [false; 2] && g.txt == [true; 2],
+    "only the emitted instance records latch, and on both delivering families"
   );
   assert!(g.any_instance() && !g.any_host());
   // A later host-only send (one A address) accumulates independently.
-  g.record_emitted(&respond::EmittedRecords::new(
-    false,
-    false,
-    false,
-    std::vec![ip],
-    std::vec::Vec::new(),
-    false,
-    false,
-  ));
+  g.record_emitted(
+    &respond::EmittedRecords::new(
+      false,
+      false,
+      false,
+      std::vec![ip],
+      std::vec::Vec::new(),
+      false,
+      false,
+    ),
+    [true; 2],
+  );
   assert!(
     g.any_instance() && g.any_host(),
     "records accumulate independently"
   );
   assert_eq!(g.a, [ip], "the emitted address is tracked");
   // A duplicate emit must not double-insert the address.
-  g.record_emitted(&respond::EmittedRecords::new(
-    false,
-    false,
-    false,
-    std::vec![ip],
-    std::vec::Vec::new(),
-    false,
-    false,
-  ));
+  g.record_emitted(
+    &respond::EmittedRecords::new(
+      false,
+      false,
+      false,
+      std::vec![ip],
+      std::vec::Vec::new(),
+      false,
+      false,
+    ),
+    [true; 2],
+  );
   assert_eq!(g.a, [ip], "duplicate address emit is idempotent");
   g.reset_instance(); // conflict rename
   assert!(
@@ -2203,11 +2303,11 @@ fn conflict_rename_hands_off_old_announced_name() {
     "the handoff carries the OLD instance name (captured before set_instance)"
   );
   assert!(
-    old_owned.ptr() && old_owned.srv() && old_owned.txt(),
+    v4_half(&old_owned).ptr() && v4_half(&old_owned).srv() && v4_half(&old_owned).txt(),
     "the OLD name's advertised instance records (PTR/SRV/TXT) are handed off"
   );
   assert!(
-    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
+    v4_half(&old_owned).a_slice().is_empty() && v4_half(&old_owned).aaaa_slice().is_empty(),
     "a rename never withdraws host A/AAAA — the handoff is instance-only"
   );
 
@@ -6246,7 +6346,7 @@ fn withdrawal_snapshot_after_rename_captures_only_current() {
   // The original name `myprinter` was announced (instance records + its host A).
   svc.goodbye.mark_instance();
   let host_addr = core::net::Ipv4Addr::new(192, 168, 1, 10); // matches make_records
-  svc.goodbye.a.push(host_addr);
+  svc.goodbye.mark_host_a(host_addr);
 
   // An existing owner's differing SRV (port 9999 > ours 631) → rename to
   // `myprinter-1`.
@@ -6273,11 +6373,11 @@ fn withdrawal_snapshot_after_rename_captures_only_current() {
     "the handoff carries the OLD instance name"
   );
   assert!(
-    old_owned.ptr() && old_owned.srv() && old_owned.txt(),
+    v4_half(&old_owned).ptr() && v4_half(&old_owned).srv() && v4_half(&old_owned).txt(),
     "the OLD name's advertised instance records are handed off"
   );
   assert!(
-    old_owned.a_slice().is_empty() && old_owned.aaaa_slice().is_empty(),
+    v4_half(&old_owned).a_slice().is_empty() && v4_half(&old_owned).aaaa_slice().is_empty(),
     "the OLD-name handoff is instance-only (a rename never withdraws host addrs)"
   );
 
@@ -6304,11 +6404,11 @@ fn withdrawal_snapshot_after_rename_captures_only_current() {
     "the snapshot's records must be the re-announced `myprinter-1`"
   );
   assert!(
-    snap.owned.ptr() && snap.owned.srv() && snap.owned.txt(),
+    v4_half(&snap.owned).ptr() && v4_half(&snap.owned).srv() && v4_half(&snap.owned).txt(),
     "the CURRENT name's confirmed instance records are captured"
   );
   assert!(
-    snap.host_a.contains(&host_addr),
+    v4_half(&snap.owned).a_slice().contains(&host_addr),
     "the CURRENT (still-owned) host A address is captured for withdrawal"
   );
 
@@ -6763,14 +6863,14 @@ fn withdrawal_snapshot_of_established_service_owns_its_records() {
   let snap = svc.withdrawal_snapshot();
 
   // PTR/SRV/TXT must all be owned after a full announcement cycle.
-  assert!(snap.owned.ptr(), "snapshot must own PTR");
-  assert!(snap.owned.srv(), "snapshot must own SRV");
-  assert!(snap.owned.txt(), "snapshot must own TXT");
+  assert!(v4_half(&snap.owned).ptr(), "snapshot must own PTR");
+  assert!(v4_half(&snap.owned).srv(), "snapshot must own SRV");
+  assert!(v4_half(&snap.owned).txt(), "snapshot must own TXT");
 
   // make_records adds 192.168.1.10 — it must appear in the snapshot.
   let expected = core::net::Ipv4Addr::new(192, 168, 1, 10);
   assert!(
-    snap.host_a.contains(&expected),
+    v4_half(&snap.owned).a_slice().contains(&expected),
     "snapshot host_a must contain {expected}"
   );
 }
@@ -6786,16 +6886,28 @@ fn withdrawal_snapshot_of_never_announced_service_is_empty() {
 
   let snap = svc.withdrawal_snapshot();
 
-  assert!(!snap.owned.ptr(), "unanounced: PTR must not be owned");
-  assert!(!snap.owned.srv(), "unannounced: SRV must not be owned");
-  assert!(!snap.owned.txt(), "unannounced: TXT must not be owned");
   assert!(
-    !snap.owned.subtypes(),
+    !v4_half(&snap.owned).ptr(),
+    "unanounced: PTR must not be owned"
+  );
+  assert!(
+    !v4_half(&snap.owned).srv(),
+    "unannounced: SRV must not be owned"
+  );
+  assert!(
+    !v4_half(&snap.owned).txt(),
+    "unannounced: TXT must not be owned"
+  );
+  assert!(
+    !v4_half(&snap.owned).subtypes(),
     "unannounced: subtypes must not be owned"
   );
-  assert!(snap.host_a.is_empty(), "unannounced: host_a must be empty");
   assert!(
-    snap.host_aaaa.is_empty(),
+    v4_half(&snap.owned).a_slice().is_empty(),
+    "unannounced: host_a must be empty"
+  );
+  assert!(
+    v4_half(&snap.owned).aaaa_slice().is_empty(),
     "unannounced: host_aaaa must be empty"
   );
 }
@@ -6897,11 +7009,11 @@ fn partial_announcement_latches_ownership_without_advancing_the_phase() {
   // state must still produce a non-empty goodbye.
   let snap = svc.withdrawal_snapshot();
   assert!(
-    snap.owned.ptr() && snap.owned.srv() && snap.owned.txt(),
+    v4_half(&snap.owned).ptr() && v4_half(&snap.owned).srv() && v4_half(&snap.owned).txt(),
     "a partially-announced service must still withdraw its instance records"
   );
   assert!(
-    !snap.host_a.is_empty(),
+    !v4_half(&snap.owned).a_slice().is_empty(),
     "a partially-announced service must still withdraw its host addresses"
   );
 }
@@ -6948,7 +7060,10 @@ fn undelivered_announcement_neither_latches_nor_advances() {
   );
   let snap = svc.withdrawal_snapshot();
   assert!(
-    !snap.owned.ptr() && !snap.owned.srv() && !snap.owned.txt() && snap.host_a.is_empty(),
+    !v4_half(&snap.owned).ptr()
+      && !v4_half(&snap.owned).srv()
+      && !v4_half(&snap.owned).txt()
+      && v4_half(&snap.owned).a_slice().is_empty(),
     "an undelivered announcement must leave the goodbye empty"
   );
 }
@@ -10220,8 +10335,8 @@ fn a_shared_ptr_only_response_does_not_close_the_preauthoritative_window() {
   ));
   svc.note_delivery(t0, TransmitDelivery::ALL);
 
-  assert!(
-    svc.goodbye.ptr,
+  assert_eq!(
+    svc.goodbye.ptr, [true; 2],
     "precondition: goodbye ownership DOES count the shared PTR — a peer caches \
      it from us and it must be withdrawn"
   );

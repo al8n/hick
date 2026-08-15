@@ -99,23 +99,19 @@ where
       let ceiling_at = now.checked_add_duration(WITHDRAWAL_CEILING).unwrap_or(now);
 
       // ── route-attached item: the CURRENT (live / re-announced) name ──────────
-      // Owes a goodbye iff it actually advertised an instance record OR a host
-      // address; otherwise `[0, 0]` so the next `drain_completed_withdrawals` frees
-      // the name at once with no spurious goodbye and no 2 s ceiling wait.
-      let current_has_something =
-        !snapshot.owned.is_empty() || !snapshot.host_a.is_empty() || !snapshot.host_aaaa.is_empty();
-      let current_owed = if current_has_something {
-        [WITHDRAWAL_SENDS, WITHDRAWAL_SENDS]
-      } else {
-        [0, 0]
-      };
+      // A family owes a goodbye iff IT actually advertised an instance record or
+      // a host address; otherwise `0`, so the next `drain_completed_withdrawals`
+      // frees the name at once with no spurious goodbye and no 2 s ceiling wait.
+      //
+      // PER FAMILY, not per item. A fan-out is two sends and either may be
+      // refused, so an announcement IPv6 never carried put nothing in an IPv6
+      // peer's cache — and a TTL=0 goodbye sent there would retract records this
+      // endpoint never advertised on that family, which can cache-flush a peer's
+      // matching shared record. That is the same over-withdrawal class the
+      // per-record `EmittedRecords` granularity closes, one dimension over.
+      let current_owed = owed_per_family(&snapshot.owned);
 
-      let crate::service::WithdrawalSnapshot {
-        records,
-        owned,
-        host_a,
-        host_aaaa,
-      } = snapshot;
+      let crate::service::WithdrawalSnapshot { records, owned } = snapshot;
 
       let token = self.mint_withdrawal_token();
       self.withdrawals.push((
@@ -123,8 +119,6 @@ where
         WithdrawalItem {
           records,
           owned,
-          host_a,
-          host_aaaa,
           owed: current_owed,
           next_at: now,
           ceiling_at,
@@ -198,16 +192,12 @@ where
       // is invariant, so the live service still publishes its addresses and
       // `Service::classify_host_rdata` recognises their echoes itself. Retaining
       // them here would screen a GENUINE peer's A/AAAA conflict at a host name
-      // this endpoint still holds.
-      self.retain_relinquished(
-        records.clone(),
-        owned.clone(),
-        std::vec::Vec::new(),
-        std::vec::Vec::new(),
-        now,
-      );
-      // Nothing for peers to evict → no item.
-      if owned.is_empty() {
+      // this endpoint still holds. The handoff carries none, so the exposure
+      // pair goes across whole.
+      self.retain_relinquished(records.clone(), owned.clone(), now);
+      // Nothing for peers to evict on either family → no item.
+      let owed = owed_per_family(&owned);
+      if owed == [0, 0] {
         return;
       }
       let ceiling_at = now.checked_add_duration(WITHDRAWAL_CEILING).unwrap_or(now);
@@ -217,9 +207,7 @@ where
         WithdrawalItem {
           records,
           owned,
-          host_a: std::vec::Vec::new(),
-          host_aaaa: std::vec::Vec::new(),
-          owed: [WITHDRAWAL_SENDS, WITHDRAWAL_SENDS],
+          owed,
           next_at: now,
           ceiling_at,
           final_attempt: false,
@@ -361,17 +349,35 @@ where
         // that reads the records it encodes, so the debt handed out can only ever
         // be the debt the emitted datagram was chosen for.
         let debt = FamilyDebt::new(w.owed);
-        let owned = &w.owned;
+        // WHAT THE OWING FAMILIES ACTUALLY PUT ON THE WIRE — the union over the
+        // families this round is FOR, not over both halves of the exposure. A
+        // family whose debt is spent or was never owed contributes nothing, so a
+        // generation IPv6 never carried is never named in a goodbye IPv6
+        // receives: `owed[v6]` is `0` from the start (see `owed_per_family`), so
+        // the round is v4's alone and so is its content.
+        //
+        // KNOWN RESIDUAL: while BOTH families still owe and their exposures
+        // DIFFER — reachable when one confirmed send was partial and a later,
+        // §7.1-trimmed one was not — the union names records the lesser family
+        // did not carry. One item emits one datagram and the round's
+        // `FamilyDebt` is what a driver fans it by, so separating the content
+        // would mean handing out one round per family and teaching
+        // `note_withdrawal_result` the difference between "owes" and "owes THIS
+        // round" — a change to `WithdrawalTransmit`'s contract with every
+        // driver. The narrowing above removes the case the exposure was designed
+        // around (a family that carried NOTHING); what is left is a pre-existing,
+        // strictly smaller instance of it.
+        let owned = union_owed(&w.owned, w.owed);
         let has_something = owned.ptr()
           || owned.srv()
           || owned.txt()
           || owned.subtypes()
-          || w
-            .host_a
+          || owned
+            .a_slice()
             .iter()
             .any(|ip| !retained.contains(&core::net::IpAddr::V4(*ip)))
-          || w
-            .host_aaaa
+          || owned
+            .aaaa_slice()
             .iter()
             .any(|ip| !retained.contains(&core::net::IpAddr::V6(*ip)));
 
@@ -399,11 +405,13 @@ where
           owned.srv(),
           owned.txt(),
           owned.subtypes(),
-          w.host_a
+          owned
+            .a_slice()
             .iter()
             .copied()
             .filter(|ip| !retained.contains(&core::net::IpAddr::V4(*ip))),
-          w.host_aaaa
+          owned
+            .aaaa_slice()
             .iter()
             .copied()
             .filter(|ip| !retained.contains(&core::net::IpAddr::V6(*ip))),
@@ -610,7 +618,8 @@ where
       };
       // CANCEL-ON-ANNOUNCE: a service that has CONFIRMED-ADVERTISED
       // its instance records under `name` supersedes any RECLAIMABLE detached
-      // old-name goodbye for the same name — cancel it. This lives here, on a certain
+      // old-name goodbye for the same name — retire what it supersedes. This lives
+      // here, on a certain
       // live event, rather than in `try_register_service` (a registration is only
       // async-committed across the reactor's reply boundary; cancelling at register
       // time could lose the goodbye if the caller dropped the registration before
@@ -634,14 +643,104 @@ where
       //
       // If the new service never fully announces, the goodbye is NEVER cancelled and
       // completes normally. A name-HOLDING collision goodbye is left intact.
+      //
+      // WHAT AN ANNOUNCEMENT SUPERSEDES IS NOT THE WHOLE ITEM — see
+      // [`Self::reclaim_detached_goodbyes`].
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       if fully_announced {
-        self.withdrawals.retain(|(_, item)| {
-          !(item.route.is_none()
-            && !item.holds_name
-            && item.records.instance().same_owner(&name))
-        });
+        self.reclaim_detached_goodbyes(handle, &name);
       }
+    }
+
+    /// Retire everything a fully-announced replacement at `name` SUPERSEDES of
+    /// the reclaimable detached goodbyes still draining for that name — and keep
+    /// what it does not.
+    ///
+    /// # An announcement retracts nothing it does not itself carry
+    ///
+    /// The cancel used to delete the whole item, on the reasoning that a
+    /// complete §10.2 announcement of the same name leaves the old goodbye
+    /// nothing to do. That holds record by record, and not for every record:
+    ///
+    /// * the SRV and the TXT are UNIQUE at the instance name and the replacement
+    ///   announces them with the cache-flush bit, so its own answer supersedes
+    ///   the stale one — nothing left to retract;
+    /// * the service-type PTR is SHARED, but the replacement asserts the
+    ///   IDENTICAL record (same browse owner, and rdata is the instance name the
+    ///   two share), so the cached entry is not stale at all — retracting it
+    ///   would delete a record the replacement is currently publishing;
+    /// * a REMOVED SUBTYPE PTR is neither. It is shared, so it carries no
+    ///   cache-flush bit and nothing supersedes it implicitly; it is owned by a
+    ///   `<sub>._sub.<type>` browse name the replacement does not publish, so no
+    ///   answer of the replacement's carries it at all. RFC 6762 §10.1's TTL=0
+    ///   goodbye is the ONLY way it is ever retracted. Deleting the item while it
+    ///   still owed a family left that family's peers listing the instance under
+    ///   a subtype it no longer has, for the full positive TTL.
+    ///
+    /// So the item is NARROWED to the shared PTRs the replacement's own record
+    /// set does not assert, and drains its remaining per-family debt for those
+    /// alone. When nothing survives the narrowing — the ordinary case, since
+    /// most renames keep their subtypes and most services have none — the item is
+    /// removed outright, exactly as before.
+    ///
+    /// # What the narrowing costs the relinquished screen: nothing
+    ///
+    /// A narrowed item stops answering [`Self::relinquished_asserts`] for the
+    /// SRV / TXT / NSEC identities it used to, since those are read out of the
+    /// same exposure. That is not a loss:
+    /// [`Self::enqueue_rename_withdrawal`] retains the old name's whole record
+    /// set at the RENAME — up front, unconditionally, and for the full
+    /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention)
+    /// — precisely because a surviving rename's goodbye can be reclaimed long
+    /// before that. The alternative, deleting the item, answers for nothing at
+    /// all, so this direction cannot be the worse one.
+    ///
+    /// A no-op unless something is actually draining for `name`: the common
+    /// announce confirm never reads the replacement's record set.
+    fn reclaim_detached_goodbyes(&mut self, handle: ServiceHandle, name: &Name) {
+      if !self
+        .withdrawals
+        .iter()
+        .any(|(_, item)| reclaimable_for(item, name))
+      {
+        return;
+      }
+      // WHAT THE REPLACEMENT ITSELF ASSERTS at a shared owner name — its service
+      // type and its subtype browse names, as registered. The route was resolved
+      // a moment ago by the only caller, so this cannot miss; if it ever did,
+      // cancelling nothing is the safe answer, because "superseded" is a claim
+      // about the replacement's records and there would be none to read.
+      let Some((_, route)) = self.services.iter().find(|(_, r)| r.handle() == handle) else {
+        return;
+      };
+      let (service_type, subtypes) = (route.service_type().clone(), route.subtypes.clone());
+      self.withdrawals.retain_mut(|(_, item)| {
+        if !reclaimable_for(item, name) {
+          return true;
+        }
+        // A shared PTR survives iff the replacement publishes no record at its
+        // owner name. Their rdata needs no comparison: both PTRs point at the
+        // instance name, and that the two names are the same is what put this
+        // item in scope.
+        let type_ptr = !item.records.service_type().same_owner(&service_type);
+        item
+          .records
+          .retain_subtypes(|sub| !subtypes.iter().any(|kept| kept.same_owner(sub)));
+        let subtypes_left = !item.records.subtype_names().is_empty();
+        for (half, debt) in item.owned.iter_mut().zip(item.owed.iter_mut()) {
+          half.keep_only_shared_ptrs(type_ptr, subtypes_left);
+          // A family left with nothing to retract owes no further round, and
+          // must not be sent one: it would carry the OTHER family's surviving
+          // PTR as a TTL=0 record this family never advertised, which is the
+          // over-withdrawal `owed_per_family` closes at the item's birth.
+          if half.is_empty() {
+            *debt = 0;
+          }
+        }
+        // Kept only while some family still owes a record the announcement
+        // cannot supersede. Otherwise this IS the whole-item cancel.
+        item.owed != [0, 0]
+      });
     }
 
     /// Host addresses that a LIVE same-host SIBLING route (any non-withdrawing
@@ -868,13 +967,7 @@ where
         // never-announced service's item carries none, and `retain_relinquished`
         // then retains nothing at all rather than screening its whole configured
         // record set.
-        self.retain_relinquished(
-          item.records,
-          item.owned,
-          item.host_a,
-          item.host_aaaa,
-          now,
-        );
+        self.retain_relinquished(item.records, item.owned, now);
         let Some(handle) = route else {
           // Detached (renamed-away old name): no route, no name, report to nobody.
           continue;
@@ -982,5 +1075,65 @@ where
       .iter()
       .find(|(_, w)| w.route == Some(handle))
       .map(|(_, w)| w.next_at)
+  }
+}
+
+cfg_heap! {
+  /// Is `item` a RECLAIMABLE detached goodbye for `name` — a SURVIVING §9
+  /// rename's renamed-away old name, which a replacement at that name may
+  /// reclaim?
+  ///
+  /// The three conjuncts are the whole of the reclaim scope. A route-attached
+  /// item belongs to a live route and is freed by its own drain; a `holds_name`
+  /// item is a rename-COLLISION teardown's, whose dead service's records must be
+  /// retracted BEFORE the name is reused and which is therefore never cancelled;
+  /// and the name is matched by DNS-name equality, not string equality, since a
+  /// spelling differing only in the trailing root dot is the same owner on the
+  /// wire.
+  fn reclaimable_for<I>(item: &WithdrawalItem<I>, name: &Name) -> bool {
+    item.route.is_none() && !item.holds_name && item.records.instance().same_owner(name)
+  }
+
+  /// What the families that STILL OWE a goodbye round put on the wire, as one
+  /// report.
+  ///
+  /// A family whose debt is `0` — spent, written off, or never owed because it
+  /// carried nothing — contributes nothing, so its records are never named in a
+  /// datagram the remaining families receive. See the residual noted at the call
+  /// site for the case this does not reach.
+  pub(crate) fn union_owed(
+    owned: &[crate::service::EmittedRecords; 2],
+    owed: [u8; 2],
+  ) -> crate::service::EmittedRecords {
+    let mut out = crate::service::EmittedRecords::default();
+    for (e, debt) in owned.iter().zip(owed) {
+      if debt == 0 {
+        continue;
+      }
+      out.merge_instance(e);
+      out.merge_addrs(e);
+    }
+    out
+  }
+
+  /// The RFC 6762 §10.1 goodbye budget each family owes for `owned`.
+  ///
+  /// `WITHDRAWAL_SENDS` for a family that actually put a retractable record in
+  /// its peers' caches, `0` for one that did not. A family with nothing cached
+  /// from us has nothing to retract, and a TTL=0 goodbye it never earned can
+  /// cache-flush a peer's matching shared record — the same over-withdrawal
+  /// class `EmittedRecords`' per-record granularity closes, one dimension over.
+  ///
+  /// [`EmittedRecords::is_empty`](crate::service::EmittedRecords::is_empty) is
+  /// the right test and the §6.1 NSEC's absence from it is deliberate: a goodbye
+  /// emits no NSEC, so an exposure that is nothing BUT an NSEC owes no rounds.
+  /// The relinquished-RRset screen still sees it — that is a different question,
+  /// asked of what we TRANSMITTED rather than of what peers can be told to drop.
+  pub(crate) fn owed_per_family(owned: &[crate::service::EmittedRecords; 2]) -> [u8; 2] {
+    let [v4, v6] = owned;
+    let budget = |e: &crate::service::EmittedRecords| {
+      if e.is_empty() { 0 } else { WITHDRAWAL_SENDS }
+    };
+    [budget(v4), budget(v6)]
   }
 }

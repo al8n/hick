@@ -42,6 +42,24 @@ pub(crate) fn write_canonical_txt<'a>(
   }
 }
 
+/// The DOMAIN of [`canonical_rdata_forms`] — every rrtype it can name a form
+/// for at the INSTANCE name.
+///
+/// A caller that must ENUMERATE the instance identities of a record set (rather
+/// than ask about one rtype it already holds) has no other way to reach them,
+/// and the endpoint's relinquished-RRset screen is such a caller: it decomposes
+/// a set it has given up into the identities that set transmitted. Stating the
+/// domain here keeps it in the same file as the rule, and
+/// `instance_rtype_exposure_mirrors_the_canonical_forms` walks EVERY rtype and
+/// pins all three spellings — this list, `canonical_rdata_forms`'s arms, and
+/// [`instance_rtype_exposed`]'s — to each other, so a type added to one without
+/// the others fails a test rather than silently losing the screen.
+pub(crate) const INSTANCE_CANONICAL_RTYPES: [ResourceType; 3] = [
+  ResourceType::Srv,
+  ResourceType::Txt,
+  ResourceType::Nsec,
+];
+
 /// The canonical rdata forms `records` puts at its INSTANCE name for `rtype`, in
 /// the SAME byte format [`RdataForm::FOLDED`](crate::wire::RdataForm::FOLDED)
 /// produces for a peer record — so a §9 conflict check can tell identical
@@ -288,16 +306,8 @@ fn write_nsec_type_bitmap(present_types: &[u16], out: &mut std::vec::Vec<u8>) {
 /// emits, and the two coincide — one entry — in every configuration where the
 /// host is a separate name.
 pub(crate) fn our_nsec_identities(records: &ServiceRecords) -> std::vec::Vec<std::vec::Vec<u8>> {
-  let identity = |types: &[u16]| {
-    let mut out = std::vec::Vec::new();
-    // §6.1: the Next Domain Name of an mDNS NSEC is the owner name itself, and
-    // this NSEC's owner is the instance name.
-    super::proposal::write_canonical_wire_name(records.instance().as_str(), &mut out);
-    write_nsec_type_bitmap(types, &mut out);
-    out
-  };
   let mut forms = std::vec::Vec::new();
-  forms.push(identity(&INSTANCE_NSEC_TYPES));
+  forms.push(emitted_nsec_identity(records));
 
   if records.instance().same_owner(records.host()) {
     let mut conforming: std::vec::Vec<u16> = INSTANCE_NSEC_TYPES.to_vec();
@@ -307,12 +317,77 @@ pub(crate) fn our_nsec_identities(records: &ServiceRecords) -> std::vec::Vec<std
     if !records.aaaa_addrs_slice().is_empty() {
       conforming.push(ResourceType::AAAA.to_u16());
     }
-    let conforming = identity(&conforming);
+    let conforming = nsec_identity(records, &conforming);
     if !forms.contains(&conforming) {
       forms.push(conforming);
     }
   }
   forms
+}
+
+/// The instance-NSEC identity for one type bitmap: `next_name` — the owner name
+/// itself (§6.1) — in case-folded wire form, then the RFC 4034 §4.1.2 bitmap.
+fn nsec_identity(records: &ServiceRecords, types: &[u16]) -> std::vec::Vec<u8> {
+  let mut out = std::vec::Vec::new();
+  super::proposal::write_canonical_wire_name(records.instance().as_str(), &mut out);
+  write_nsec_type_bitmap(types, &mut out);
+  out
+}
+
+/// The instance-NSEC rdata THIS ENCODER PUTS ON THE WIRE for `records` — the one
+/// form [`push_service_nsec`] writes, and the only NSEC bytes any echo of ours
+/// can carry.
+///
+/// It is the first entry of [`our_nsec_identities`] BY CONSTRUCTION rather than
+/// by coincidence, which is the whole point of naming it: the two callers want
+/// opposite things from that list and only one of them may have the whole of it.
+/// See [`transmitted_rdata_forms`].
+pub(crate) fn emitted_nsec_identity(records: &ServiceRecords) -> std::vec::Vec<u8> {
+  nsec_identity(records, &INSTANCE_NSEC_TYPES)
+}
+
+/// The canonical rdata forms `records` ACTUALLY TRANSMITS at its instance name
+/// for `rtype` — the HISTORY half of [`canonical_rdata_forms`], and never wider
+/// than it.
+///
+/// # Why history may not use the classifier's list
+///
+/// [`canonical_rdata_forms`] answers *"could a record set indistinguishable from
+/// ours have sent this?"*. That leniency is correct where it is asked: a
+/// conforming RFC 6762 §9 fault-tolerance twin publishing the ACCURATE NSEC
+/// bitmap at a name that really does hold all four types is a legitimate twin,
+/// and §9's identical-rdata rule protects it from our rename.
+///
+/// The endpoint's relinquished-RRset screen asks something narrower and purely
+/// factual: *"did these exact bytes leave this endpoint, on this family, in this
+/// generation?"* — and a form this crate never encodes did not. Answering that
+/// one from the classifier's list converts semantic compatibility into false
+/// wire provenance: a GENUINE peer's conforming NSEC reads as an old self-echo,
+/// and the decisive §8.1 / §9 conflict against a successor is withheld for the
+/// whole retention window. See [`crate::endpoint::relinquished::asserts`].
+///
+/// # The arms
+///
+/// SRV and TXT DELEGATE, because each yields exactly one form there and that
+/// form IS the encoded one — `push_srv_answer` and `push_txt_answer` write the
+/// same bytes [`canonical_rdata_forms`] builds, which is what makes the §8.2
+/// byte-symmetry invariant hold. NSEC is the one rtype whose classifier list is
+/// strictly wider than what the encoder emits.
+///
+/// A type absent from every arm yields NOTHING, and that is the direction to
+/// fail in: retaining too little re-opens a stale echo for the identities
+/// dropped, while retaining too much suppresses a genuine peer's conflict — the
+/// terminal outcome from the other side. `transmitted_forms_never_widen_the_
+/// canonical_ones` walks [`INSTANCE_CANONICAL_RTYPES`] and pins both halves.
+pub(crate) fn transmitted_rdata_forms(
+  records: &ServiceRecords,
+  rtype: ResourceType,
+) -> std::vec::Vec<std::vec::Vec<u8>> {
+  match rtype {
+    ResourceType::Srv | ResourceType::Txt => canonical_rdata_forms(records, rtype),
+    ResourceType::Nsec => std::vec![emitted_nsec_identity(records)],
+    _ => std::vec::Vec::new(),
+  }
 }
 
 /// Write an unsolicited announcement: SRV, TXT, A, AAAA records.
@@ -705,6 +780,50 @@ impl EmittedRecords {
     self.txt |= other.txt;
     self.subtypes |= other.subtypes;
     self.nsec |= other.nsec;
+  }
+
+  /// OR another report's HOST ADDRESSES into this one.
+  ///
+  /// The companion of [`Self::merge_instance`], split from it because the one
+  /// caller that merges instance records — the RFC 6763 §9 rename handoff — must
+  /// NOT merge addresses (the host name is invariant across an instance rename).
+  /// The endpoint's goodbye encoder merges both: it is folding the two halves of
+  /// a per-family exposure back into the one datagram a round emits.
+  pub(crate) fn merge_addrs(&mut self, other: &Self) {
+    for ip in &other.a {
+      if !self.a.contains(ip) {
+        self.a.push(*ip);
+      }
+    }
+    for ip in &other.aaaa {
+      if !self.aaaa.contains(ip) {
+        self.aaaa.push(*ip);
+      }
+    }
+  }
+
+  /// Narrow this report to the SHARED PTRs a caller says are still owed a
+  /// retraction, dropping everything else it recorded.
+  ///
+  /// The one caller is the reclaim-cancel in
+  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced),
+  /// and the asymmetry it needs is RFC 6762's own. A same-name replacement's
+  /// §10.2 announcement carries the SRV and TXT with the cache-flush bit, so it
+  /// SUPERSEDES the stale unique records at that instance name and the goodbye
+  /// for them has nothing left to do. It supersedes no SHARED record it does not
+  /// itself carry: a PTR is owned by a browse name, arrives with no cache-flush
+  /// bit, and is retracted only by its own §10.1 TTL=0 goodbye. So which shared
+  /// PTRs survive is a question about the REPLACEMENT'S record set, which only
+  /// the endpoint can answer — hence the two flags rather than a rule here.
+  ///
+  /// The §6.1 NSEC goes with the superseded records: a goodbye never emits one,
+  /// so keeping it could only ever hold an item open with nothing to send.
+  pub(crate) fn keep_only_shared_ptrs(&mut self, type_ptr: bool, subtypes: bool) {
+    *self = Self {
+      ptr: self.ptr && type_ptr,
+      subtypes: self.subtypes && subtypes,
+      ..Self::default()
+    };
   }
 
   /// Whether the instance PTR was emitted.
