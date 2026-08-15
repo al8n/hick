@@ -1131,7 +1131,8 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
   // things to the core and must not be folded to one bit:
   //
   //   * goodbye ownership LATCHES — v4 peers may now cache the records v4 sent,
-  //     so a later unregister owes them a §10.1 TTL=0 withdrawal;
+  //     so a later unregister owes them a §10.1 TTL=0 withdrawal — and it
+  //     latches PER FAMILY: the debt is v4's exposure, never the service's;
   //   * the §8.1/§8.3 phase does NOT advance — v6 has been neither asked nor
   //     told, and claiming a name on a link that never heard the probe is what
   //     §8.1 forbids.
@@ -1191,17 +1192,55 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
       .map(|(dst, d)| (*dst, datagram_kind(d)))
       .collect::<Vec<_>>()
   );
-  // v6 recovers BEFORE the withdrawal's resend budget is spent → a later
-  // goodbye round reaches v6 too (the busy family catches up). Resends are
-  // 250 ms apart; recover v6 and pump the next due rounds.
+  // The other half of the same per-family latch, and the leg that has to be said
+  // out loud to read right: v6 recovering does NOT buy it a goodbye.
+  //
+  // A §10.1 TTL=0 record exists to RETRACT a record from the caches holding it.
+  // v6 carried none of these, so no peer on that link ever cached them from us
+  // and there is nothing there to retract. Recovery restores the TRANSPORT, not
+  // the history — the records were never on that link, and a working socket does
+  // not make them retroactively sent.
+  //
+  // Emitting one anyway would be worse than merely pointless. A TTL=0 answer is
+  // matched by name/type/rdata, not by responder, so the only v6 peers it can
+  // act on are the ones holding an IDENTICAL record from a DIFFERENT responder —
+  // the §9 fault-tolerance twin this codebase deliberately supports — and it
+  // would flush a live registration this host never advertised there. Withholding
+  // the v6 goodbye is protective, not tidy.
+  //
+  // `mdns-proto`'s `a_family_that_carried_nothing_owes_no_goodbye` pins the rule
+  // at the core; this is the same rule observed through the driver's transport.
+  // Resends are 250 ms apart; recover v6 and pump the next due rounds.
   io.v6_fail = None;
   io.sent.clear();
   for micros in [t + 250_001, t + 500_001] {
     engine.pump(|| at(micros), &mut io, &mut scratch);
   }
   assert!(
-    io.sent.iter().any(|(dst, _)| *dst == MDNS_SOCKET_V6),
-    "the goodbye must reach v6 once it recovers"
+    !io
+      .sent
+      .iter()
+      .any(|(dst, d)| *dst == MDNS_SOCKET_V6 && datagram_kind(d) == Some(true)),
+    "v6 carried none of these records, so a recovered v6 transport is owed no \
+     §10.1 goodbye; sent = {:?}",
+    io.sent
+      .iter()
+      .map(|(dst, d)| (*dst, datagram_kind(d)))
+      .collect::<Vec<_>>()
+  );
+  // …and the withheld v6 goodbye is a PER-FAMILY verdict, not a silenced
+  // withdrawal: the family that did carry the records keeps draining its own
+  // §10.1 rounds across the very pumps that found v6 healthy.
+  assert!(
+    io.sent
+      .iter()
+      .any(|(dst, d)| *dst == MDNS_SOCKET_V4 && datagram_kind(d) == Some(true)),
+    "v4 owes these records a goodbye and must go on emitting its remaining \
+     §10.1 rounds; sent = {:?}",
+    io.sent
+      .iter()
+      .map(|(dst, d)| (*dst, datagram_kind(d)))
+      .collect::<Vec<_>>()
   );
 }
 
@@ -4359,11 +4398,17 @@ fn each_family_spends_only_its_own_loopback_copy() {
 
 /// TAKE-ONCE IS THE CURRENT TIER'S RULE, AND ONLY ITS.
 ///
-/// A superseded entry is a standing tombstone: it answers every byte-identical
-/// copy inside `RECENT_SEND_TTL`, it is not consumed by any of them, and
-/// `SelfSend::owed` does not gate it — so a family that has already taken the
-/// loopback copy it was owed still disowns the copies behind it, which is where
-/// the medium's second delivery and a peer's replay both land.
+/// A superseded entry is a standing tombstone: on a family still OWED its
+/// loopback copy it answers every byte-identical datagram inside
+/// `RECENT_SEND_TTL` and is consumed by none of them. Take-once there would let
+/// the medium's second delivery — kernel loopback plus an 802.11 base-station
+/// re-broadcast — through as peer traffic, carrying records this engine has
+/// given up into its own cache.
+///
+/// The credit itself is still per family and still spent once: what a
+/// generation change may not do is hand back a copy this engine already
+/// answered. See
+/// `a_consumed_family_credit_is_not_resurrected_by_a_generation_change`.
 #[test]
 fn a_superseded_entry_disowns_every_copy_and_is_spent_by_none() {
   let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
@@ -4379,13 +4424,16 @@ fn a_superseded_entry_disowns_every_copy_and_is_spent_by_none() {
   );
 
   // The service that sent it retires: what this engine publishes has changed.
+  // v6's copy was never delivered, so that is the family the tombstone speaks
+  // for.
   tx.supersede();
   for round in 1..=4i64 {
     assert_eq!(
-      tx.claim(Family::V4, datagram, at(2_000 + round * 1_000)),
+      tx.claim(Family::V6, datagram, at(2_000 + round * 1_000)),
       SelfLog::Superseded,
-      "copy {round} carries records no live route holds — the spent v4 flag must \
-       not let it through as peer traffic"
+      "copy {round} carries records no live route holds, and v6 is still owed a \
+       copy of them — take-once here would let every copy after the first \
+       through as peer traffic"
     );
   }
   assert_eq!(tx.recent.len(), 1, "no copy spends the tombstone");
@@ -4393,7 +4441,7 @@ fn a_superseded_entry_disowns_every_copy_and_is_spent_by_none() {
   // Only the recency window retires it, exactly as before.
   assert_eq!(
     tx.claim(
-      Family::V4,
+      Family::V6,
       datagram,
       at(RECENT_SEND_TTL.as_micros() as i64 + 1_000)
     ),
@@ -4445,21 +4493,21 @@ fn a_tombstone_never_answers_for_a_family_that_never_sent() {
   );
 }
 
-/// The other half of the precondition: on a family that DID send, the tombstone
-/// still answers EVERY copy, and no copy consumes it.
+/// The other half of the precondition: on a family that DID send and is still
+/// OWED its loopback copy, the tombstone answers EVERY copy, and no copy
+/// consumes it.
 ///
-/// The mask narrows which families a superseded entry speaks for. It must not
-/// narrow WHEN it speaks for them, and it must not be collapsed back into
-/// `SelfSend::owed` — the second leg below is the one that fails if a future
-/// reader "simplifies" the two masks into one, because there `owed` is already
-/// spent while `sent_on` still holds.
-///
-/// Spent, the copy that spends it leaves the GENUINE echo behind it reading
+/// The standing property is about repetition. Take-once here was the wrong
+/// bound: the copy that spent the credit left the GENUINE echo behind it reading
 /// `SelfLog::None`, hence `NotFromUs`, hence this engine's own withdrawn records
 /// written into its own cache and its own retransmits deferred on their behalf.
 /// One send is credited once per family while the medium may deliver several
 /// copies — kernel loopback plus an 802.11 base-station re-broadcast, which §8.2
 /// names as an echo source — so that needs no attacker at all.
+///
+/// What it is NOT about is resurrection: a family whose credit a CURRENT claim
+/// already spent is owed nothing further, which is
+/// `a_consumed_family_credit_is_not_resurrected_by_a_generation_change`.
 #[test]
 fn a_tombstone_still_answers_every_copy_on_the_family_that_sent() {
   let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
@@ -4478,22 +4526,83 @@ fn a_tombstone_still_answers_every_copy_on_the_family_that_sent() {
   }
   assert_eq!(tx.recent.len(), 1, "no copy spends the tombstone");
 
-  // A both-family send whose v4 copy is SPENT while current, so only the
-  // immutable mask can still answer for v4 once the entry is superseded. The v6
-  // copy is left outstanding so the spent entry survives to become a tombstone.
+  // A both-family send whose v4 copy is SPENT while current. v6's is not, so the
+  // entry survives the spend and the tombstone it becomes stands for v6.
   let both = b"both sockets took this one".as_slice();
   tx.record(both, at(10_000), [true, true]);
   assert_eq!(tx.claim(Family::V4, both, at(11_000)), SelfLog::Current);
   tx.supersede();
   for round in 1..=4i64 {
     assert_eq!(
-      tx.claim(Family::V4, both, at(12_000 + round * 1_000)),
+      tx.claim(Family::V6, both, at(12_000 + round * 1_000)),
       SelfLog::Superseded,
-      "copy {round}: v4 transmitted these bytes, so it disowns them even though \
-       it already took the one loopback copy it was owed — a precondition read \
-       off `owed` instead would let this reach the proto layer as peer traffic"
+      "copy {round}: v6 queued these bytes and has taken no loopback copy of \
+       them, so the entry disowns every copy of them and is spent by none"
     );
   }
+  assert_eq!(
+    tx.recent.len(),
+    2,
+    "no superseded copy spends either entry — the v4-only tombstone above and \
+     this one both stand"
+  );
+}
+
+/// A CONSUMED FAMILY CREDIT IS NOT HANDED BACK BY A GENERATION CHANGE.
+///
+/// One entry carries both families, and a current claim clears only the arriving
+/// family's `owed` bit — the entry itself survives while the other family is
+/// still outstanding. The superseded branch then read only the immutable
+/// `sent_on` mask, so once the generation moved, the v4 credit this engine had
+/// ALREADY paid out came back as a standing tombstone: an identical GENUINE peer
+/// datagram on v4 mapped to `Provenance::OwnEcho`, which denies observation,
+/// quieting, adjudication AND the §8.1 defence, for up to `RECENT_SEND_TTL`.
+///
+/// A loopback copy is owed once per family that transmitted. Once it has been
+/// answered, a later byte-identical arrival on that family is not this entry's
+/// to answer — a change in what this engine publishes is a fact about our
+/// records, not a second echo. `hick-udp`'s `SelfSendTracker` keeps a separate
+/// credit per family and removes the one a current claim takes, so it already
+/// reports no credit for this sequence; the two stacks must not disagree.
+#[test]
+fn a_consumed_family_credit_is_not_resurrected_by_a_generation_change() {
+  let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
+  let both = b"an announcement both sockets took".as_slice();
+  tx.record(both, at(0), [true, true]);
+
+  // v4's loopback copy arrives while the entry is current, and is spent.
+  assert_eq!(tx.claim(Family::V4, both, at(1_000)), SelfLog::Current);
+  assert_eq!(
+    tx.recent.len(),
+    1,
+    "v6 is still owed a copy, so the entry stands after the v4 spend"
+  );
+
+  // An UNRELATED service registers, withdraws, or takes a §9 rename.
+  tx.supersede();
+
+  for round in 1..=3i64 {
+    assert_eq!(
+      tx.claim(Family::V4, both, at(2_000 + round * 1_000)),
+      SelfLog::None,
+      "copy {round}: v4's one loopback copy was already answered, so this is a \
+       peer's datagram — resurrecting the spent credit suppresses it entirely"
+    );
+  }
+
+  for round in 1..=3i64 {
+    assert_eq!(
+      tx.claim(Family::V6, both, at(6_000 + round * 1_000)),
+      SelfLog::Superseded,
+      "copy {round}: v6's copy is still outstanding, so the tombstone stands for \
+       it — the narrowing is per family, not a disabled tier"
+    );
+  }
+  assert_eq!(
+    tx.recent.len(),
+    1,
+    "no superseded claim spends the entry, on either family"
+  );
 }
 
 /// A structurally valid mDNS QUERY: one question for `_http._tcp.local. PTR IN`

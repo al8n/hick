@@ -264,13 +264,17 @@ cfg_heap! {
   /// and lapsed on the family an earlier one did. See
   /// [`RelinquishedIdentity::expires_at`].
   ///
-  /// Rdata that will not decode answers `false`, for the reason [`asserts`]
-  /// gives: this screen only ever WITHHOLDS a conflict, and `Service` drops an
-  /// undecodable record as `PeerRdata::Invalid` before every conflict arm
-  /// anyway.
+  /// `peer` is `r`'s canonical FOLDED rdata, decoded ONCE by the caller and
+  /// `None` when it will not decode — which answers `false`, for the reason
+  /// [`asserts`] gives: this screen only ever WITHHOLDS a conflict, and
+  /// `Service` drops an undecodable record as `PeerRdata::Invalid` before every
+  /// conflict arm anyway. It is the caller's because the answer does not vary
+  /// with the identity, and this runs once per row of a list bounded by
+  /// [`MAX_RELINQUISHED_IDENTITIES`].
   pub(crate) fn identity_asserts<I: Instant>(
     identity: &RelinquishedIdentity<I>,
     r: &crate::wire::Ref<'_>,
+    peer: Option<&[u8]>,
     now: I,
     family: crate::transmit::Family,
   ) -> bool {
@@ -278,7 +282,7 @@ cfg_heap! {
       && r.rclass() == ResourceClass::In
       && r.rtype() == identity.rtype
       && names_match_record(&identity.owner, r)
-      && matches!(r.canonical_rdata_folded(), Ok(peer) if *peer == identity.rdata)
+      && peer == Some(identity.rdata.as_slice())
   }
 
   /// Is this identity still screening on EITHER family?
@@ -367,14 +371,19 @@ cfg_heap! {
   /// generation reaching one family and not the other is an ordinary partial
   /// round rather than an exotic case.
   ///
-  /// Rdata that will not decode answers `false`. This screen only ever
+  /// `peer` is `r`'s canonical FOLDED rdata, decoded ONCE by the caller. Rdata
+  /// that will not decode is `None` and answers `false`: this screen only ever
   /// WITHHOLDS a conflict, so failing closed here costs nothing the classifier
-  /// does not already refund: `Service` drops an undecodable record as
-  /// `PeerRdata::Invalid` before every conflict arm.
+  /// does not already refund — `Service` drops an undecodable record as
+  /// `PeerRdata::Invalid` before every conflict arm. It is a parameter because
+  /// the decode does not vary with the record SET, while this runs once per
+  /// resident withdrawal item and once per row of a list bounded by
+  /// [`MAX_RELINQUISHED_RRSETS`].
   pub(crate) fn asserts(
     records: &crate::records::ServiceRecords,
     emitted: &[crate::service::EmittedRecords; 2],
     r: &crate::wire::Ref<'_>,
+    peer: Option<&[u8]>,
     family: crate::transmit::Family,
   ) -> bool {
     // §9's conflict is over "the same name, rrtype and RRCLASS", so a record of
@@ -400,11 +409,11 @@ cfg_heap! {
     }
     if names_match_record(records.instance(), r)
       && crate::service::instance_rtype_exposed(emitted, r.rtype())
-      && let Ok(peer) = r.canonical_rdata_folded()
+      && let Some(peer) = peer
     {
       return crate::service::transmitted_rdata_forms(records, r.rtype())
         .iter()
-        .any(|form| form.as_slice() == &*peer);
+        .any(|form| form.as_slice() == peer);
     }
     false
   }
@@ -486,23 +495,40 @@ where
     /// about the records it CAN still name, and saying `true` for those is a
     /// false negative at every name it holds. See [`Self::retain_relinquished`]
     /// for what reaching a ceiling costs instead.
+    ///
+    /// # The canonical rdata is decoded ONCE, here
+    ///
+    /// All three sources compare the same bytes — `r`'s canonical FOLDED rdata
+    /// — against their own stored form, and every one of them is a LIST: the
+    /// resident withdrawal items, up to [`MAX_RELINQUISHED_RRSETS`] rows and up
+    /// to [`MAX_RELINQUISHED_IDENTITIES`] identities. Decoding per row made one
+    /// screen cost hundreds of canonicalizations of the same record. It is
+    /// decoded before the first source and handed down; `None` — rdata that
+    /// will not decode — is `false` everywhere, exactly as before.
+    ///
+    /// The other half of the same bound is that the SCREEN itself runs once per
+    /// section record rather than once per candidate service; that lives in
+    /// `RouteEvents::relinquished_screen`, because only the iterator knows when
+    /// the record advances.
     pub(crate) fn relinquished_asserts(
       &self,
       r: &crate::wire::Ref<'_>,
       now: I,
       family: crate::transmit::Family,
     ) -> bool {
+      let folded = r.canonical_rdata_folded().ok();
+      let peer = folded.as_deref();
       self
         .withdrawals
         .iter()
-        .any(|(_, w)| relinquished::asserts(&w.records, &w.owned, r, family))
+        .any(|(_, w)| relinquished::asserts(&w.records, &w.owned, r, peer, family))
         || self.relinquished.iter().any(|e| {
-          now < e.expires_at && relinquished::asserts(&e.records, &e.emitted, r, family)
+          now < e.expires_at && relinquished::asserts(&e.records, &e.emitted, r, peer, family)
         })
         || self
           .relinquished_identities
           .iter()
-          .any(|e| relinquished::identity_asserts(e, r, now, family))
+          .any(|e| relinquished::identity_asserts(e, r, peer, now, family))
     }
 
     /// Retain `records` as a relinquished set for

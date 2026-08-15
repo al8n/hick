@@ -11718,6 +11718,87 @@ fn a_conforming_nsec_this_endpoint_never_encoded_is_not_disowned_as_its_own_echo
   );
 }
 
+/// THE HISTORY SCREEN IS PER RECORD, NOT PER CANDIDATE SERVICE.
+///
+/// `Endpoint::relinquished_asserts` is a whole-record answer, but the conflict
+/// helper that consults it is re-entered after every match the cursor yields —
+/// one event per `next()` — so a record matching `S` services ran the same scan
+/// `S + 1` times. Each scan walks the withdrawal map plus up to
+/// `MAX_RELINQUISHED_RRSETS` rows and `MAX_RELINQUISHED_IDENTITIES` identities,
+/// so a multi-record datagram cost `records × services × history` receive-side
+/// work for its sender's `records` bytes.
+///
+/// The assertion is on WORK DONE rather than on elapsed time, because that is
+/// the property and it is deterministic: `RECORDS` screens for `RECORDS`
+/// records, whatever the fan-out width. Before the cache it was
+/// `RECORDS * (SERVICES + 1)` — fifteen here.
+///
+/// The routed events are asserted too: a bound that also dropped conflicts would
+/// be the far worse defect.
+#[test]
+fn the_history_screen_runs_once_per_record_however_many_services_match() {
+  const SERVICES: usize = 4;
+  const RECORDS: usize = 3;
+
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let host = Name::try_from_str("shared.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+
+  // Services sharing ONE host name — the registration guard requires them to
+  // publish the same address set there, which is exactly the shape that makes a
+  // single A record match every one of them.
+  for i in 0..SERVICES {
+    register_with_addr_sets(
+      &mut e,
+      &std::format!("S{i}._ipp._tcp.local."),
+      "shared.local.",
+      &[a1],
+      &[],
+    )
+    .unwrap();
+  }
+  // …and one relinquished generation, so the screen has history to walk rather
+  // than an empty list to fall off the end of.
+  retain_generation(&mut e, 99, Ipv4Addr::new(192, 168, 1, 77), now);
+
+  let mut buf = [0u8; 512];
+  let n = {
+    use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder};
+    let mut hdr = Header::new();
+    hdr.flags_mut().set_response();
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(&mut buf, hdr).unwrap();
+    for i in 0..RECORDS {
+      let addr = Ipv4Addr::new(198, 51, 100, u8::try_from(i).unwrap().saturating_add(1));
+      b.push_a_answer(&host, 120, addr, true).unwrap();
+    }
+    b.finish().unwrap()
+  };
+
+  let src: core::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
+  let mut events = e
+    .handle(now, Received::new(src, &buf[..n], Provenance::NotFromUs))
+    .unwrap();
+  let conflicts = events
+    .by_ref()
+    .filter_map(Result::ok)
+    .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_host_conflict()))
+    .count();
+  assert_eq!(
+    conflicts,
+    RECORDS * SERVICES,
+    "every service sharing the host name must still receive every record's \
+     conflict"
+  );
+  assert_eq!(
+    events.history_screens, RECORDS,
+    "the screen's answer does not vary with the route, so it must be taken once \
+     per record — re-deriving it per candidate service is what multiplies a \
+     hostile packet's receive cost by the fan-out width"
+  );
+}
+
 /// PARTIAL-FAMILY DELIVERY MUST NOT BECOME GLOBAL EXPOSURE — the goodbye half,
 /// which is independent of the screen.
 ///

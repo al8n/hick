@@ -167,6 +167,56 @@ where
   /// read differently from the pass that set it.
   pub(crate) admits: Admits,
   pub(crate) section: Section,
+  /// The relinquished-history screen's answer for ONE section record, kept so
+  /// the service fan-out cannot re-derive it per candidate service.
+  ///
+  /// # Why it has to be cached rather than merely cheap
+  ///
+  /// `Endpoint::relinquished_asserts` is a WHOLE-RECORD answer — it depends on
+  /// the record, this endpoint's own history and the arriving family, never on
+  /// which route the fan-out is visiting — but the helper that consults it is
+  /// re-entered after EVERY yielded match, because the cursor model returns one
+  /// event per `next()`. So a record matching `S` services ran the same scan
+  /// `S + 1` times, and each scan walks the withdrawal map plus up to
+  /// `MAX_RELINQUISHED_RRSETS` exact rows and `MAX_RELINQUISHED_IDENTITIES`
+  /// compact identities. Multiplied by the records in one datagram, a hostile
+  /// packet bought `records × services × history` receive-side work for its
+  /// sender's `records` bytes.
+  ///
+  /// # The key IS the invalidation
+  ///
+  /// A [`RecordSlot`] names the section and the index within it, so a read for
+  /// any other record — the next one, one in a later section, or one reached
+  /// again after a parse error changed `section` — misses and recomputes. There
+  /// is no reset to forget at a record-advance site, and no cursor path that can
+  /// leave a stale answer readable.
+  ///
+  /// Nothing can mutate the history UNDER the cache while the iterator lives:
+  /// [`RouteEvents`] holds the endpoint mutably for the whole iteration, and
+  /// `next` only ever READS `endpoint.services`, `endpoint.queries` and the
+  /// screen. The three lists the screen consults are written by
+  /// `retain_relinquished`, `sweep_relinquished` and the withdrawal lifecycle,
+  /// none of which this iterator can reach. `now` is likewise fixed for the
+  /// datagram — see the field.
+  pub(crate) relinquished_screen: Option<(RecordSlot, bool)>,
+  /// How many times the screen was actually RUN, as opposed to answered from
+  /// [`Self::relinquished_screen`]. The bound this cache exists for is a
+  /// statement about work done, so it is asserted on directly rather than
+  /// inferred from a wall clock.
+  #[cfg(test)]
+  pub(crate) history_screens: usize,
+}
+
+/// Which section record the conflict fan-out is currently visiting.
+///
+/// The cache key for [`RouteEvents::relinquished_screen`], and stated as a value
+/// rather than derived from `self.section` so a call site that is wrong about
+/// which record it holds cannot silently share another record's answer.
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub(crate) enum RecordSlot {
+  Answer(u16),
+  Authority(u16),
+  Additional(u16),
 }
 
 #[derive(Copy, Clone)]
@@ -376,13 +426,37 @@ where
     false
   }
 
+  /// The relinquished-history screen for the record at `slot`, run at most ONCE
+  /// per section record however many services the fan-out then visits.
+  ///
+  /// See [`Self::relinquished_screen`] for why the caching is load-bearing
+  /// rather than an optimisation, and why the key alone is the invalidation.
+  fn relinquished_screens(&mut self, r: &crate::wire::Ref<'_>, slot: RecordSlot) -> bool {
+    if let Some((cached, answer)) = self.relinquished_screen
+      && cached == slot
+    {
+      return answer;
+    }
+    let answer =
+      self
+        .endpoint
+        .relinquished_asserts(r, self.now, crate::transmit::Family::of(self.src));
+    self.relinquished_screen = Some((slot, answer));
+    #[cfg(test)]
+    {
+      self.history_screens = self.history_screens.saturating_add(1);
+    }
+    answer
+  }
+
   /// The HOST half of the conflict fan-out, for the QR=0 authority path whose
   /// INSTANCE half is delivered whole as a [`ProbeProposal`] instead.
   fn next_host_conflict(
-    &self,
+    &mut self,
     r: &crate::wire::Ref<'a>,
     start: usize,
     origin: ConflictOrigin,
+    slot: RecordSlot,
   ) -> Option<(usize, RouteEvent<'a>)> {
     if r.rclass() != ResourceClass::In {
       return None;
@@ -392,10 +466,7 @@ where
     // up is ours whatever a driver's send log did or did not recognise, and the
     // service that now holds the owner name cannot know that. Asked of the
     // family this datagram ARRIVED on, for the reason given there.
-    if self
-      .endpoint
-      .relinquished_asserts(r, self.now, crate::transmit::Family::of(self.src))
-    {
+    if self.relinquished_screens(r, slot) {
       return None;
     }
     for (key, route) in self.endpoint.services.iter() {
@@ -423,10 +494,11 @@ where
   }
 
   fn next_service_conflict(
-    &self,
+    &mut self,
     r: &crate::wire::Ref<'a>,
     start: usize,
     origin: ConflictOrigin,
+    slot: RecordSlot,
   ) -> Option<(usize, RouteEvent<'a>)> {
     if r.rclass() != ResourceClass::In {
       return None;
@@ -460,10 +532,12 @@ where
     // can hold no IPv6 echo — and disowning one would be silencing a GENUINE
     // peer's conflict purely for agreeing with a transmission that family never
     // saw.
-    if self
-      .endpoint
-      .relinquished_asserts(r, self.now, crate::transmit::Family::of(self.src))
-    {
+    //
+    // AND ONCE PER RECORD, not once per candidate service. The answer does not
+    // vary with the route, but this helper is re-entered after every match the
+    // cursor yields, so a record matching S services scanned the whole history
+    // S + 1 times. See `RouteEvents::relinquished_screen`.
+    if self.relinquished_screens(r, slot) {
       return None;
     }
     for (key, route) in self.endpoint.services.iter() {
@@ -822,7 +896,12 @@ where
               // response is a peer asserting a name it owns, so it carries
               // `AuthoritativeResponse` — §8.1 and §9's input, never §8.2's.
               if self.admits.adjudication() {
-                self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse)
+                self.next_service_conflict(
+                  &r,
+                  start,
+                  ConflictOrigin::AuthoritativeResponse,
+                  RecordSlot::Answer(self.answer_idx),
+                )
               } else {
                 None
               }
@@ -1072,10 +1151,11 @@ where
           // QR=1 authority record is a response and keeps the full per-record
           // treatment.
           let start = self.authority_service_cursor.unwrap_or(0);
+          let slot = RecordSlot::Authority(self.authority_idx);
           let next = if self.is_response {
-            self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse)
+            self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse, slot)
           } else {
-            self.next_host_conflict(&r, start, ConflictOrigin::TentativeProbe)
+            self.next_host_conflict(&r, start, ConflictOrigin::TentativeProbe, slot)
           };
           if let Some((key, ev)) = next {
             self.authority_service_cursor = Some(key.saturating_add(1));
@@ -1141,7 +1221,12 @@ where
             // returns), so an additional here is a supplementary ANSWER — a
             // peer asserting a name it owns, never a §8.2 proposal.
             let next_event = if self.admits.adjudication() {
-              self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse)
+              self.next_service_conflict(
+                &r,
+                start,
+                ConflictOrigin::AuthoritativeResponse,
+                RecordSlot::Additional(self.additional_idx),
+              )
             } else {
               None
             };

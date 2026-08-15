@@ -198,19 +198,20 @@ struct SelfSend<I> {
   /// A fan-out is two `try_send` calls and either may be refused — v6 reporting
   /// `Busy` for a round leaves a datagram v4 alone ever carried.
   ///
-  /// [`Self::owed`] cannot stand in for it, because `owed` DECAYS while this does
-  /// not. The superseded tier never consults `owed` (a tombstone must answer
-  /// every copy, not the first), so gated on `owed` alone a superseded entry
-  /// matches on bytes and recency and nothing else: a v4-only send then disowns
-  /// IPv6 traffic, and since `Provenance::OwnEcho` denies observation, quieting,
-  /// adjudication AND the §8.1 defence, a peer's byte-identical §8.2 probe goes
-  /// invisible for the rest of [`RECENT_SEND_TTL`] — longer than the peer's whole
-  /// probing window, so it finishes probing unopposed and both hosts end up
-  /// owning the same records. See [`Multicaster::claim`].
+  /// It is stated SEPARATELY from [`Self::owed`], and stays so. `owed` is seeded
+  /// from this mask and only ever cleared, so `owed[i]` implies `sent_on[i]` and
+  /// the two tests coincide today — but that implication is a property of how
+  /// `owed` is SEEDED, while this is the RULE. Written out here, no future change
+  /// to the credit accounting (a re-arm, a merge of two records of the same
+  /// bytes, a refresh) can silently credit a family that never sent: a v4-only
+  /// send disowning IPv6 traffic denies a peer observation, quieting,
+  /// adjudication AND the §8.1 defence for the rest of [`RECENT_SEND_TTL`] —
+  /// longer than its whole probing window, so it finishes probing unopposed and
+  /// both hosts end up owning the same records. See [`Multicaster::claim`].
   sent_on: [bool; 2],
-  /// Whether each family ([0] = v4, [1] = v6) still owes this entry a loopback
-  /// copy: starts as a copy of [`Self::sent_on`], cleared by the claim that
-  /// spends it.
+  /// Whether each family ([0] = v4, [1] = v6) is still OWED a loopback copy of
+  /// this datagram: starts as a copy of [`Self::sent_on`], cleared by the CURRENT
+  /// claim that spends it, and never cleared by a superseded one.
   ///
   /// # It is a per-family COUNT of one, not a family tag
   ///
@@ -221,13 +222,23 @@ struct SelfSend<I> {
   /// echo would then find nothing, reach the proto layer as peer traffic, and
   /// raise a phantom RFC 6762 §9 conflict against this engine itself.
   ///
-  /// The flags are also what makes a CURRENT-generation entry take-once per
-  /// family rather than a standing predicate, so a conforming RFC 6762 §9
-  /// fault-tolerance twin's byte-identical datagram becomes visible from its
-  /// second one. They deliberately do NOT gate a SUPERSEDED match: an entry whose
-  /// records this engine has given up disowns every copy of them for as long as
-  /// it lives. What that tier still requires is [`Self::sent_on`] — the family
-  /// question, which a spent flag stops answering. See [`Multicaster::claim`].
+  /// # It gates BOTH tiers, differently
+  ///
+  /// At the CURRENT tier a match SPENDS the flag, which is what makes such an
+  /// entry take-once per family rather than a standing predicate, so a conforming
+  /// RFC 6762 §9 fault-tolerance twin's byte-identical datagram becomes visible
+  /// from its second one.
+  ///
+  /// At the SUPERSEDED tier a match READS it and leaves it, which is what makes
+  /// that entry a standing tombstone — it answers every copy, not the first. But
+  /// it must still BE outstanding: a family whose one echo has already been
+  /// answered at the current tier is owed nothing further, and resurrecting the
+  /// spent credit as a tombstone means an identical GENUINE peer datagram on that
+  /// family is `Provenance::OwnEcho` and fully suppressed for the rest of
+  /// [`RECENT_SEND_TTL`]. `hick-udp` keeps a separate credit per family and
+  /// removes the one a current claim spends, so it reports no credit for exactly
+  /// this sequence; the two stacks answer it the same way. See
+  /// [`Multicaster::claim`].
   owed: [bool; 2],
 }
 
@@ -334,16 +345,29 @@ enum SelfLog {
   /// records written into our own cache and our own retransmits deferred on their
   /// behalf.
   ///
-  /// So a match at this tier consumes nothing, and [`SelfSend::owed`] does not
-  /// gate it. Take-once survives at [`SelfLog::Current`], where a twin's datagram
-  /// must stay visible and where a leaked copy is harmless anyway — it asserts
-  /// rdata this engine still publishes, which §9 calls "never a conflict".
+  /// So a match at this tier consumes nothing. Take-once survives at
+  /// [`SelfLog::Current`], where a twin's datagram must stay visible and where a
+  /// leaked copy is harmless anyway — it asserts rdata this engine still
+  /// publishes, which §9 calls "never a conflict".
   ///
-  /// What DOES gate it is [`SelfSend::sent_on`]: a tombstone speaks only for the
-  /// families that actually transmitted the datagram. Total suppression of bytes
-  /// this engine has given up is affordable; total suppression of bytes it never
-  /// put on that link is not, because there the datagram cannot be an echo at all
-  /// and the entry would be silencing a peer purely for agreeing with us.
+  /// # …for every copy a family is still OWED, and no others
+  ///
+  /// Two per-family facts gate it, and neither implies the other as a rule.
+  /// [`SelfSend::sent_on`] is which families TRANSMITTED the datagram: a
+  /// tombstone speaks only for those. Total suppression of bytes this engine has
+  /// given up is affordable; total suppression of bytes it never put on that link
+  /// is not, because there the datagram cannot be an echo at all and the entry
+  /// would be silencing a peer purely for agreeing with us.
+  ///
+  /// [`SelfSend::owed`] is which of those echoes are still OUTSTANDING. A family
+  /// that already took its one loopback copy at the current tier has had its echo
+  /// accounted, and a generation change does not hand it back: standing for a
+  /// consumed credit means an identical GENUINE peer datagram on that family is
+  /// `OwnEcho` and invisible for the rest of [`RECENT_SEND_TTL`], which is the
+  /// suppression this tier's family precondition exists to refuse, one dimension
+  /// over. Nothing here CLEARS `owed`, so a tombstone that has one still answers
+  /// every copy of it — the standing property is intact for exactly the copies
+  /// the entry is owed.
   Superseded,
   /// Matched nothing this log still holds.
   None,
@@ -1066,11 +1090,20 @@ impl<I: Instant> Multicaster<I> {
   /// about an IPv6 arrival — the bytes agree, but the datagram cannot be a local
   /// echo of them.
   ///
-  /// **A CURRENT match SPENDS what it matches; a SUPERSEDED one does not.** The
-  /// entry owes one loopback copy per family that queued the datagram
-  /// ([`SelfSend::owed`]), and a current match clears this family's copy; an
-  /// entry with no copies left is dropped. A superseded match reads the entry and
-  /// leaves it exactly as it found it — see below.
+  /// **Neither tier answers for a family whose echo has already been ACCOUNTED.**
+  /// The entry owes one loopback copy per family that queued the datagram
+  /// ([`SelfSend::owed`]), a current match spends this family's copy, and a
+  /// family with none left is owed nothing by either tier. `hick-udp`'s
+  /// `SelfSendTracker` reaches the same answer by a different shape: it keeps a
+  /// separate credit per family and REMOVES the one a current claim takes, so
+  /// the same sequence reports no credit there. The two stacks keep their own
+  /// send logs and must not disagree about it.
+  ///
+  /// **A CURRENT match SPENDS what it matches; a SUPERSEDED one does not.** A
+  /// current match clears this family's copy and an entry with no copies left is
+  /// dropped; a superseded match reads the entry and leaves it exactly as it
+  /// found it, which is what lets it answer every copy it is owed rather than the
+  /// first — see below.
   ///
   /// # What take-once, the family key and the port gate close
   ///
@@ -1082,15 +1115,17 @@ impl<I: Instant> Multicaster<I> {
   ///    rdata this engine still publishes, which §9 calls "never a conflict" and
   ///    §8.2.1 ties on;
   ///  * **the family key**, which is TWO masks because it answers two questions.
-  ///    [`SelfSend::sent_on`] says which families could echo these bytes at all
-  ///    and gates both tiers; [`SelfSend::owed`] says which of those copies are
-  ///    still outstanding and gates only the current one. One multicast is two
-  ///    `try_send` calls with identical bytes and one loopback copy per joined
-  ///    socket, so without `owed` the first echo to be read would spend both
-  ///    copies and the second would reach the proto layer as peer traffic — a
-  ///    phantom §9 conflict against this engine itself. And without `sent_on` an
-  ///    entry outlives the answer: `owed` is spent or ignored, and a family that
-  ///    never transmitted the datagram is credited with echoing it;
+  ///    [`SelfSend::sent_on`] says which families could echo these bytes at all;
+  ///    [`SelfSend::owed`] says which of those echoes are still outstanding. Both
+  ///    gate both tiers, and what differs is only whether a match SPENDS the
+  ///    second. One multicast is two `try_send` calls with identical bytes and
+  ///    one loopback copy per joined socket, so without `owed` the first echo to
+  ///    be read would spend both copies and the second would reach the proto
+  ///    layer as peer traffic — a phantom §9 conflict against this engine itself.
+  ///    Without `sent_on` the rule that a family which never sent may never claim
+  ///    would survive only as a consequence of how `owed` happens to be seeded;
+  ///  * **the accounting**, which is what stops a superseded entry resurrecting a
+  ///    credit its own family already took. See the tombstone section below;
   ///  * **the source-port gate**, applied by the caller ([`Engine::handle_one`]).
   ///    Both this engine's sockets send from 5353, so every loopback copy arrives
   ///    from 5353 and a different source port is proof the datagram is not our
@@ -1115,13 +1150,22 @@ impl<I: Instant> Multicaster<I> {
   /// whether what they assert is still ours to assert — and it answers it for
   /// EVERY copy inside the recency window, not for the first one only.
   ///
-  /// It answers for every copy on the families that SENT, and for none on the
-  /// families that did not. Standing where nothing was transmitted, it would
-  /// assert what no evidence supports — that a datagram we never put on this link
-  /// is our own echo on it — and deny every receive permission to a peer whose
-  /// only offence is proposing the same records, for the rest of
-  /// [`RECENT_SEND_TTL`]. That is longer than a peer's whole §8.1 probing
-  /// sequence, so the peer would take the name unopposed.
+  /// It answers for every copy a family is still OWED, and for none on a family
+  /// that is owed none — whether because it never sent the datagram, or because
+  /// it already took the one loopback copy it was owed while the entry was
+  /// current. Both spellings of "owed none" produce the same harm if the entry
+  /// answers anyway: it asserts what no evidence supports — that a datagram whose
+  /// echo this family cannot still be delivering is our own echo on it — and
+  /// denies every receive permission to a peer whose only offence is proposing
+  /// the same records, for the rest of [`RECENT_SEND_TTL`]. That is longer than a
+  /// peer's whole §8.1 probing sequence, so the peer would take the name
+  /// unopposed.
+  ///
+  /// The STANDING property is about repetition, not about resurrection: nothing
+  /// at this tier clears `owed`, so an entry that answers one copy answers every
+  /// later copy of it too. What it may not do is answer on a family whose credit
+  /// a CURRENT match already spent — the generation change is a fact about our
+  /// records, not a second echo.
   ///
   /// Take-once was applied here too, on the reasoning that total suppression of
   /// bytes a peer could be replaying needs a bound. It does not: what those bytes
@@ -1158,11 +1202,15 @@ impl<I: Instant> Multicaster<I> {
       }
       // BOTH tiers require it. A loopback copy comes back over the socket that
       // sent the datagram, so an entry no `try_send` on this family ever queued
-      // holds no echo this family could be delivering. `owed` does not imply it
-      // once spent, and the superseded tier holds no `owed` bit at all.
+      // holds no echo this family could be delivering. Stated separately from
+      // `owed` below even though `owed` is seeded from it: this is the rule,
+      // that is the accounting. See `SelfSend::sent_on`.
       if !s.sent_on.get(idx).copied().unwrap_or(false) {
         continue;
       }
+      // Whether this family's one loopback copy is still OUTSTANDING. Both tiers
+      // read it; only the current one spends it.
+      let owed_here = s.owed.get(idx).copied().unwrap_or(false);
       // A QUESTION is never superseded, whatever the generation reads: it
       // asserts nothing, so no change to what this engine publishes can have
       // made its echo stale, and the tombstone it would otherwise become would
@@ -1171,17 +1219,30 @@ impl<I: Instant> Multicaster<I> {
       if s.generation == self.generation || s.class == SendClass::Question {
         // The CURRENT tier is take-once, so only an entry that still owes this
         // family a loopback copy can answer for one.
-        if s.owed.get(idx).copied().unwrap_or(false) {
+        if owed_here {
           current = Some(pos);
           break;
         }
         continue;
       }
-      // The SUPERSEDED tier is not take-once, so `owed` does not gate it: an
-      // entry whose records this engine has given up disowns every copy of them
-      // for as long as it lives, including copies arriving after this family
-      // took the one it was owed. Remembered rather than returned, because a
-      // current candidate further along still wins.
+      // The SUPERSEDED tier does not SPEND the credit — that is what makes it a
+      // standing tombstone, answering every copy inside the window rather than
+      // the first — but it still requires there to BE one. This family's echo
+      // was already answered while the entry was current, and a generation
+      // change does not hand the spent copy back: standing on it would map an
+      // identical GENUINE peer datagram to `OwnEcho` for the rest of
+      // `RECENT_SEND_TTL`. `hick-udp` holds a separate credit per family and
+      // removes the one a current claim spends, so it reports no credit here;
+      // the two stacks must not disagree about the same sequence.
+      //
+      // Nothing below clears `owed`, so an entry that reaches this line once
+      // reaches it for every later copy — the tombstone stands for exactly the
+      // copies it is owed.
+      if !owed_here {
+        continue;
+      }
+      // Remembered rather than returned, because a current candidate further
+      // along still wins.
       superseded = true;
     }
     match current {
