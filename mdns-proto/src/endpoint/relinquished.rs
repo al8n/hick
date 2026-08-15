@@ -59,6 +59,38 @@
 //! confirmed send that emitted THAT record — and a relinquishment with no
 //! exposure retains nothing at all.
 //!
+//! # …and the MULTICAST half of that exposure, and only it
+//!
+//! `GoodbyeOwnership` answers two questions, and this screen may read only the
+//! narrower one. What a peer may hold FROM US counts an RFC 6762 §6.7 legacy
+//! reply — a positive-TTL send of the full record set — because that resolver's
+//! cache holds those records and the §10.1 goodbye owes them a retraction. What
+//! could still be ECHOING does not: a legacy reply is addressed to one
+//! ephemeral port, nothing re-broadcasts it to the group, and this screen only
+//! ever asks about a MULTICAST arrival. A set whose only positive send was such
+//! a reply therefore has no echo of its own anywhere, and a row built from the
+//! wider half disowned a GENUINE peer's multicast record on the strength of
+//! bytes no multicast socket ever carried — the same terminal outcome from the
+//! other side, for the whole window.
+//!
+//! # …and the WIRE ENVELOPE those bytes went out in
+//!
+//! Which SECTION, and the RFC 6762 §10.2 cache-flush bit. Both are asked through
+//! [`transmitted_envelope`](crate::service::transmitted_envelope), the one
+//! description of what this crate's positive multicast encoders write, so the
+//! screen cannot drift from them: SRV / TXT / A / AAAA in the ANSWER section, the
+//! §6.1 instance NSEC in the ADDITIONAL section, nothing at all in the AUTHORITY
+//! one, and every one of them with the bit SET.
+//!
+//! Neither qualifier can reject a real echo, because an echo is a re-DELIVERY of
+//! a datagram rather than a re-encoding of it: the header counts that place a
+//! record in its section, and the bit in its class field, are the ones this
+//! endpoint wrote. What they reject is a peer's ordinary browse answer — RFC 6763
+//! §12 has a responder bundle the addresses into ADDITIONAL beside the SRV that
+//! points at them, and this crate writes addresses only as ANSWERS, so such a
+//! record can be no echo of ours. Disowning it withheld the TERMINAL
+//! `HostConflict` for the whole retention window, on traffic nobody had to craft.
+//!
 //! # Two tiers, one question
 //!
 //! A row keeps the whole `ServiceRecords` and regenerates the comparison forms
@@ -130,10 +162,17 @@ cfg_heap! {
   /// [`asserts`] for why the second half is not optional.
   pub(crate) struct Relinquished<I> {
     pub(crate) records: crate::records::ServiceRecords,
-    /// What this set confirmed-emitted ON EACH FAMILY — `[v4, v6]`, instance
-    /// identities and host addresses together, exactly as a `WithdrawalItem`
-    /// carries them. [`asserts`] reads only the half belonging to the family the
-    /// candidate record ARRIVED on.
+    /// What this set confirmed-emitted BY MULTICAST ON EACH FAMILY — `[v4, v6]`,
+    /// instance identities and host addresses together, exactly as a
+    /// `WithdrawalItem`'s own `multicast` half carries them. [`asserts`] reads
+    /// only the half belonging to the family the candidate record ARRIVED on.
+    ///
+    /// MULTICAST, not every confirmed send. A §6.7 legacy unicast reply is a
+    /// positive-TTL send of these very records and it is deliberately absent
+    /// here: it went to one resolver's ephemeral port, so no copy of it was ever
+    /// on the group and no multicast arrival can be its echo. The goodbye's own
+    /// accounting still counts it — see `WithdrawalSnapshot::multicast` for the
+    /// split.
     pub(crate) emitted: [crate::service::EmittedRecords; 2],
     /// The instant this row stops screening. A row is skipped, never trusted,
     /// once `now` has reached it; the list is compacted on the next insert.
@@ -258,6 +297,11 @@ cfg_heap! {
   /// sixteen octets `write_canonical_rdata` copies verbatim for A / AAAA, so the
   /// one comparison covers both halves that [`asserts`] spells separately.
   ///
+  /// The WIRE ENVELOPE — `section` and the cache-flush bit — is asked through
+  /// the same [`transmitted_envelope`](crate::service::transmitted_envelope) the
+  /// exact tier asks, which is what keeps the two tiers answering for one set of
+  /// identities. See [`asserts`]'s own section on it.
+  ///
   /// THE WINDOW IS PART OF THE ANSWER HERE, and per family, which is why this
   /// takes `now` where the exact tier's caller tests the row's one expiry
   /// itself: an identity may be live on the family a later generation reached
@@ -277,9 +321,11 @@ cfg_heap! {
     peer: Option<&[u8]>,
     now: I,
     family: crate::transmit::Family,
+    section: crate::service::RecordSection,
   ) -> bool {
     matches!(family.pick(identity.expires_at), Some(expires_at) if now < expires_at)
       && r.rclass() == ResourceClass::In
+      && crate::service::transmitted_envelope(r.rtype(), section, r.cache_flush())
       && r.rtype() == identity.rtype
       && names_match_record(&identity.owner, r)
       && peer == Some(identity.rdata.as_slice())
@@ -323,8 +369,11 @@ cfg_heap! {
   ///
   /// A live `Service` compares against what it MAY yet advertise, because it may
   /// still advertise it. A relinquished set never will, so its bound is what it
-  /// DID advertise — the confirmed-emitted sets, not the configured ones, and
-  /// per identity:
+  /// DID advertise BY MULTICAST — the confirmed-emitted sets, not the configured
+  /// ones, and the multicast half of those, not every send. An RFC 6762 §6.7
+  /// legacy reply put these very records in one resolver's cache and put no copy
+  /// of them on the group, so it owes a §10.1 retraction and can produce no echo
+  /// this screen would ever be asked about. Per identity:
   ///
   /// * addresses through the exposure's own address lists, the
   ///   `GoodbyeOwnership` latch's per-address record of what a confirmed send
@@ -371,6 +420,31 @@ cfg_heap! {
   /// generation reaching one family and not the other is an ordinary partial
   /// round rather than an exotic case.
   ///
+  /// # …and the WIRE ENVELOPE: the SECTION, and the CACHE-FLUSH BIT
+  ///
+  /// The same condition two dimensions further over, and asked of
+  /// [`transmitted_envelope`](crate::service::transmitted_envelope) — the one
+  /// description of what this crate's positive multicast encoders write, kept
+  /// beside `transmitted_rdata_forms` so the screen cannot drift from them. A
+  /// record is this set's only if it arrives in the section that set's rrtype
+  /// was WRITTEN in (the answer section for SRV / TXT / A / AAAA, the additional
+  /// section for the §6.1 instance NSEC, never the authority section) and
+  /// carries the RFC 6762 §10.2 cache-flush bit those encoders set.
+  ///
+  /// Neither can reject a real echo. An echo is a re-DELIVERY of a datagram, not
+  /// a re-encoding of it, so the header counts that place a record in its
+  /// section and the bit in its class field are the ones this endpoint wrote.
+  ///
+  /// Without them a peer's ordinary browse response was disowned. A conforming
+  /// responder answers a PTR query with its SRV in the answer section and the
+  /// ADDRESS it points at in the additional section — RFC 6763 §12's own advice
+  /// — and this crate writes addresses only as answers, so such a record cannot
+  /// be an echo of ours; disowning it SUPPRESSED THE TERMINAL `HostConflict`
+  /// with ordinary traffic and no crafted case. The bit ranks below the section
+  /// only because exploiting it needs a non-conforming peer: every unique record
+  /// this crate multicasts sets it, so a peer record without it cannot be our
+  /// echo either.
+  ///
   /// `peer` is `r`'s canonical FOLDED rdata, decoded ONCE by the caller. Rdata
   /// that will not decode is `None` and answers `false`: this screen only ever
   /// WITHHOLDS a conflict, so failing closed here costs nothing the classifier
@@ -385,12 +459,21 @@ cfg_heap! {
     r: &crate::wire::Ref<'_>,
     peer: Option<&[u8]>,
     family: crate::transmit::Family,
+    section: crate::service::RecordSection,
   ) -> bool {
     // §9's conflict is over "the same name, rrtype and RRCLASS", so a record of
     // another class is not this set's record whatever its rdata says. The
     // callers gate on class IN already; stating it here keeps the predicate
     // true on its own terms.
     if r.rclass() != ResourceClass::In {
+      return false;
+    }
+    // THE WIRE ENVELOPE, before either half: an rrtype this crate does not write
+    // in THIS section, or one written with the §10.2 cache-flush bit and
+    // arriving without it, is not an echo of anything this endpoint multicast —
+    // whatever its owner name and rdata say. Ahead of the family narrowing
+    // because it is a fact about the encoders rather than about this generation.
+    if !crate::service::transmitted_envelope(r.rtype(), section, r.cache_flush()) {
       return false;
     }
     // ONLY the arriving family's half. See the section above.
@@ -474,10 +557,14 @@ where
     /// visiting — so the conflict helpers take it once per record rather than
     /// per candidate service.
     ///
-    /// Every source is asked with its own EXPOSURE, never with a configured
-    /// record set: a withdrawal item's `owned` came from
-    /// `Service::withdrawal_snapshot`, which reports only what a confirmed send
-    /// actually emitted, and on which family. See [`relinquished::asserts`].
+    /// Every source is asked with its own MULTICAST EXPOSURE, never with a
+    /// configured record set and never with the goodbye's wider one: a
+    /// withdrawal item's `multicast` came from `Service::withdrawal_snapshot`,
+    /// which reports what a confirmed send actually emitted, on which family,
+    /// and TO WHAT DESTINATION CLASS. A §6.7 legacy reply is a positive
+    /// authoritative send that reached no group, so it is in `owned` — the
+    /// goodbye must still retract it — and not here. See
+    /// [`relinquished::asserts`].
     /// A reclaim can NARROW an item to what a replacement's announcement did not
     /// supersede, which makes source 1 answer for LESS and never for more; the
     /// retention row taken at the relinquishment itself — source 2 — is what
@@ -488,6 +575,15 @@ where
     /// that carried it out, so a record only IPv4 ever sent can hold no IPv6
     /// echo — and an exposure that answered for both would be disowning a
     /// GENUINE peer's §8.1 or §9 conflict on the family it never reached.
+    ///
+    /// `section` is the section `r` ARRIVED in, and it is weighed the same way
+    /// against the section this crate's encoders WRITE that rrtype in — together
+    /// with the RFC 6762 §10.2 cache-flush bit they set. Both are envelope facts
+    /// about the datagram rather than about any one source, so every source is
+    /// asked with them; see [`relinquished::asserts`]. A conforming responder's
+    /// Additional-section address is the case that matters: this crate writes
+    /// addresses only as ANSWERS, so such a record can be no echo of ours, and
+    /// disowning it withheld the terminal `HostConflict` from ordinary traffic.
     ///
     /// NO SOURCE ANSWERS FOR A RECORD IT CANNOT NAME. There is no capacity
     /// fallback that answers `true` unconditionally, and there must not be: an
@@ -515,32 +611,37 @@ where
       r: &crate::wire::Ref<'_>,
       now: I,
       family: crate::transmit::Family,
+      section: crate::service::RecordSection,
     ) -> bool {
       let folded = r.canonical_rdata_folded().ok();
       let peer = folded.as_deref();
       self
         .withdrawals
         .iter()
-        .any(|(_, w)| relinquished::asserts(&w.records, &w.owned, r, peer, family))
+        .any(|(_, w)| relinquished::asserts(&w.records, &w.multicast, r, peer, family, section))
         || self.relinquished.iter().any(|e| {
-          now < e.expires_at && relinquished::asserts(&e.records, &e.emitted, r, peer, family)
+          now < e.expires_at
+            && relinquished::asserts(&e.records, &e.emitted, r, peer, family, section)
         })
         || self
           .relinquished_identities
           .iter()
-          .any(|e| relinquished::identity_asserts(e, r, peer, now, family))
+          .any(|e| relinquished::identity_asserts(e, r, peer, now, family, section))
     }
 
     /// Retain `records` as a relinquished set for
     /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention),
     /// measured from `now`.
     ///
-    /// `emitted` is that set's EXPOSURE — `[v4, v6]`, the per-identity and
-    /// per-family record of what a confirmed send actually put on the wire,
-    /// exactly as `Service::withdrawal_snapshot` reports it. A relinquishment
-    /// with no exposure on either family retains NOTHING: it has no echo of its
-    /// own to disown, and a row for it would screen a genuine peer's matching
-    /// records for the whole window. See [`relinquished::asserts`].
+    /// `emitted` is that set's MULTICAST EXPOSURE — `[v4, v6]`, the
+    /// per-identity and per-family record of what a confirmed send actually put
+    /// on the GROUP, exactly as `Service::withdrawal_snapshot` reports it in its
+    /// `multicast` half. A relinquishment with no such exposure on either family
+    /// retains NOTHING: it has no echo of its own to disown, and a row for it
+    /// would screen a genuine peer's matching records for the whole window. That
+    /// now includes a set whose only positive send was a §6.7 legacy reply —
+    /// real, confirmed, and incapable of producing a multicast echo. See
+    /// [`relinquished::asserts`].
     ///
     /// # Where this is owed
     ///

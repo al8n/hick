@@ -6,7 +6,8 @@ use super::*;
 use crate::{
   Name, ServiceHandle,
   event::{
-    ConflictHistory, ConflictOrigin, KnownAnswer, ProbeConflict, ProbeProposal, ServiceEvent,
+    ConflictHistory, ConflictOrigin, ConflictRole, KnownAnswer, ProbeConflict, ProbeProposal,
+    ServiceEvent,
   },
   records::ServiceRecords,
   transmit::{FamilyDelivery, V4, V6},
@@ -378,10 +379,14 @@ impl GoodbyeOwnership {
   /// confirmed-announced. The ownership model uses per-record flags rather than a
   /// single `instance` bool, so a "the original name was announced" precondition sets
   /// all three.
+  /// Both halves, so a fixture that says "the original name was announced"
+  /// means it multicast the name — which is what an announcement is.
   fn mark_instance(&mut self) {
-    self.ptr = [true; 2];
-    self.srv = [true; 2];
-    self.txt = [true; 2];
+    for half in [&mut self.all, &mut self.multicast] {
+      half.ptr = [true; 2];
+      half.srv = [true; 2];
+      half.txt = [true; 2];
+    }
   }
 
   /// Test helper: simulate that `ip` was confirmed-emitted on both families.
@@ -402,6 +407,7 @@ impl GoodbyeOwnership {
         false,
       ),
       [true; 2],
+      SendClass::Multicast,
     );
   }
 }
@@ -801,7 +807,7 @@ fn rename_handoff_withdraws_only_advertised_instance_records() {
   let t0 = probe_once(&mut svc, FakeInstant::zero());
   // The old name advertised ONLY its PTR (SRV/TXT were KAS-suppressed on the one
   // confirmed response before the rename).
-  svc.goodbye.ptr = [true; 2];
+  svc.goodbye.all.ptr = [true; 2];
 
   // An existing owner answers with a DIFFERING SRV (port 9999 > ours 631) → §8.1
   // deferral → rename.
@@ -872,6 +878,7 @@ fn advertised_host_addrs_are_the_emitted_subset_not_configured() {
       false,
     ),
     [true; 2],
+    SendClass::Multicast,
   );
   assert_eq!(
     svc.advertised_a_addrs(),
@@ -1170,7 +1177,7 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
   // positive-TTL record set (PTR/SRV/TXT + the host A), so the commit token
   // records every record actually emitted.
   match &svc.awaiting_confirm {
-    Some(AwaitingConfirm::Response(e, _)) => assert!(
+    Some(AwaitingConfirm::Response(e, _, _)) => assert!(
       e.ptr() && e.srv() && e.txt() && !e.a_slice().is_empty(),
       "a legacy reply emits all instance records plus the host A"
     ),
@@ -1196,6 +1203,97 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
     matches!(svc.state(), ServiceState::Announcing(0)),
     "a response must NOT advance the announce phase; got {:?}",
     svc.state()
+  );
+}
+
+/// …and the SAME confirmed send is exposure for the goodbye and NOT provenance
+/// for the relinquished-history screen, because a §6.7 reply cannot echo.
+///
+/// The two questions were one latch. "A peer may hold this record FROM US" is
+/// true of a legacy reply — that resolver's cache holds the full positive-TTL
+/// set, which the test above asserts and the §10.1 goodbye owes a retraction
+/// for. "A copy of these bytes may still be ECHOING" is not: the datagram went
+/// to one ephemeral port, nothing re-broadcasts it to the group, and the screen
+/// is only ever asked about a MULTICAST arrival. Answering the first where the
+/// second was asked labelled a genuine peer's multicast record as this
+/// endpoint's own relinquished history.
+#[test]
+fn a_legacy_unicast_reply_is_exposure_but_not_multicast_echo_provenance() {
+  use crate::{event::ServiceQuestion, wire::QuestionRef};
+  let mut svc = make_service(120);
+  let mut buf = std::vec![0u8; 4096];
+  let now = drive_to_announcing_zero(&mut svc);
+  assert!(matches!(svc.state(), ServiceState::Announcing(0)));
+
+  // A legacy querier (source port != 5353) asks for our PTR — one §6.7 unicast
+  // reply, drained ahead of the announcement queue, and the ONLY positive send
+  // this generation makes. The three probes before it are QUESTIONS and latch
+  // nothing at all.
+  let legacy_src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in "_ipp._tcp.local.".trim_end_matches('.').split('.') {
+    qbuf.push(label.len() as u8);
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8);
+  qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x4242)),
+    now,
+  );
+  let tx = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("a legacy reply should be emitted");
+  assert_eq!(
+    tx.dst(),
+    legacy_src,
+    "precondition: this datagram is addressed to ONE resolver, not the group"
+  );
+  svc.note_delivery(now, TransmitDelivery::ALL);
+
+  let snap = svc.withdrawal_snapshot();
+  let owned = v4_half(&snap.owned);
+  assert!(
+    owned.ptr() && owned.srv() && owned.txt() && !owned.a_slice().is_empty(),
+    "the goodbye's half counts it: those records are in the querier's cache and \
+     a §10.1 goodbye must retract them"
+  );
+  assert!(
+    snap.multicast.iter().all(|e| e.is_empty() && !e.nsec()),
+    "…and the SCREEN's half counts nothing, on either family. No copy of these \
+     bytes was ever on the group, so no multicast arrival can be an echo of \
+     them — and a row built from the goodbye's half disowns a GENUINE peer's \
+     record for the whole retention window"
+  );
+
+  // …and a MULTICAST send is both, which is what makes the narrowing a split
+  // rather than a deletion.
+  let mut at = now;
+  let mut announced = false;
+  for _ in 0..20 {
+    at = at.advance(300);
+    svc.handle_timeout(at).unwrap();
+    if let Ok(Some(tx)) = svc.poll_transmit(at, &mut buf) {
+      let dst = tx.dst();
+      svc.note_delivery(at, TransmitDelivery::ALL);
+      if dst == respond::multicast_dst() {
+        announced = true;
+        break;
+      }
+    }
+  }
+  assert!(
+    announced,
+    "precondition: the §8.3 announcement goes to the group"
+  );
+  let snap = svc.withdrawal_snapshot();
+  let multicast = v4_half(&snap.multicast);
+  assert!(
+    multicast.srv() && multicast.txt() && !multicast.a_slice().is_empty(),
+    "an announcement CAN echo, so it is provenance as well as exposure"
   );
 }
 
@@ -1239,7 +1337,7 @@ fn legacy_a_query_reply_latches_full_set() {
     .unwrap()
     .expect("a legacy A reply should be emitted");
   match &svc.awaiting_confirm {
-    Some(AwaitingConfirm::Response(e, _)) => assert!(
+    Some(AwaitingConfirm::Response(e, _, _)) => assert!(
       e.ptr() && e.srv() && e.txt() && !e.a_slice().is_empty(),
       "an A-query legacy reply still emits the instance records and the host A"
     ),
@@ -1278,6 +1376,7 @@ fn goodbye_ownership_latches_only_the_delivering_family() {
       true,
     ),
     [true, false],
+    SendClass::Multicast,
   );
   let [v4, v6] = g.per_family();
   assert!(
@@ -1301,6 +1400,7 @@ fn goodbye_ownership_latches_only_the_delivering_family() {
       false,
     ),
     [false, true],
+    SendClass::Multicast,
   );
   let [v4, v6] = g.per_family();
   assert!(
@@ -1336,9 +1436,10 @@ fn goodbye_ownership_accumulates_and_resets_instance_only() {
       false,
     ),
     [true; 2],
+    SendClass::Multicast,
   );
   assert!(
-    g.ptr == [true; 2] && g.srv == [false; 2] && g.txt == [true; 2],
+    g.all.ptr == [true; 2] && g.all.srv == [false; 2] && g.all.txt == [true; 2],
     "only the emitted instance records latch, and on both delivering families"
   );
   assert!(g.any_instance() && !g.any_host());
@@ -1354,12 +1455,13 @@ fn goodbye_ownership_accumulates_and_resets_instance_only() {
       false,
     ),
     [true; 2],
+    SendClass::Multicast,
   );
   assert!(
     g.any_instance() && g.any_host(),
     "records accumulate independently"
   );
-  assert_eq!(g.a, [ip], "the emitted address is tracked");
+  assert_eq!(g.all.a, [ip], "the emitted address is tracked");
   // A duplicate emit must not double-insert the address.
   g.record_emitted(
     &respond::EmittedRecords::new(
@@ -1372,14 +1474,15 @@ fn goodbye_ownership_accumulates_and_resets_instance_only() {
       false,
     ),
     [true; 2],
+    SendClass::Multicast,
   );
-  assert_eq!(g.a, [ip], "duplicate address emit is idempotent");
+  assert_eq!(g.all.a, [ip], "duplicate address emit is idempotent");
   g.reset_instance(); // conflict rename
   assert!(
     !g.any_instance() && g.any_host(),
     "rename drops instance records but the host name is unchanged"
   );
-  assert_eq!(g.a, [ip], "host addresses survive the rename");
+  assert_eq!(g.all.a, [ip], "host addresses survive the rename");
 }
 
 /// returns the destination of the Response transmit a service
@@ -2258,6 +2361,7 @@ fn section9_reprobe_clears_queued_legacy_reply() {
       srec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -2301,6 +2405,7 @@ fn conflict_rename_hands_off_old_announced_name() {
   let RenameGoodbyeHandoff {
     records: old_records,
     owned: old_owned,
+    ..
   } = svc
     .take_rename_goodbye_handoff()
     .expect("a rename of an announced service must hand off the old-name goodbye");
@@ -2487,6 +2592,87 @@ fn failed_conflict_rename_clears_stale_transmit_state() {
   assert!(
     svc.response_deadline.is_none(),
     "failed rename must clear response_deadline"
+  );
+}
+
+/// ROW D's HOST COLUMN, pinned: a `Conflicting` service still surfaces the
+/// terminal `HostConflict`.
+///
+/// The conflict matrix on `handle_preauthoritative_conflict` used to say row D
+/// ignored all four columns, and the code said otherwise — the `HostConflict`
+/// arm is `(_, ServiceEvent::HostConflict(hc))`, a wildcard state gated only by
+/// the origin test. The DOC was corrected, so the behaviour it now describes
+/// needs a test.
+///
+/// The code is the better rule because `Conflicting` is the INSTANCE name's
+/// terminal state and nothing else — it is entered when §8.1's rename cannot
+/// produce a valid suffixed name — while the HOST name is a separate name,
+/// invariant across renames and shareable with other local services. A caller
+/// told to rename and restart needs to know the host is contested too, or it
+/// re-registers under a fresh instance name straight back into the same
+/// conflict.
+#[test]
+fn a_terminal_service_still_surfaces_a_host_conflict() {
+  use crate::event::{HostConflict, ServiceEvent};
+
+  // Reach `Conflicting` the only way there is: a 63-byte instance label, so
+  // §8.1's "-1" suffix cannot make a valid name and the rename fails.
+  let long_label = "a".repeat(63);
+  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let inst = Name::try_from_str(&std::format!("{long_label}._ipp._tcp.local.")).unwrap();
+  let host = Name::try_from_str("host.local.").unwrap();
+  let mut r = ServiceRecords::new(stype, inst, host, 631, 120);
+  r.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::try_new(
+      ServiceHandle::from_raw(0),
+      r,
+      FakeInstant::zero(),
+      [0u8; 32],
+      true,
+    );
+  let t0 = probe_once(&mut svc, FakeInstant::zero());
+  deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
+  svc.handle_timeout(t0.advance(500)).unwrap();
+  assert_eq!(
+    svc.state(),
+    ServiceState::Conflicting,
+    "precondition: the failed rename must have left the service terminal"
+  );
+  while svc.poll().is_some() {}
+
+  // A peer claims the HOST name — a different name from the one that just went
+  // terminal — with an address this service does not publish.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 99]);
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::HostConflict(HostConflict::new(
+      rec,
+      ConflictOrigin::AuthoritativeResponse,
+    )),
+    t0.advance(600),
+  );
+  assert!(
+    svc.poll().is_some_and(|u| u.is_host_conflict()),
+    "the instance name's terminal state says nothing about the host name, which \
+     other local services may share — row D's host column surfaces §9's \
+     conflict exactly as rows A through C do"
+  );
+
+  // …and the origin gate still holds here: a peer PROBING the host name is
+  // asking whether it is free, not claiming it.
+  let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 98]);
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  svc.handle_event(
+    ServiceEvent::HostConflict(HostConflict::new(rec, ConflictOrigin::TentativeProbe)),
+    t0.advance(700),
+  );
+  assert!(
+    svc.poll().is_none(),
+    "row D's host column is §9's response rule, not a blanket delivery: a \
+     tentative probe is still ignored"
   );
 }
 
@@ -3080,6 +3266,7 @@ fn probe_conflict_before_our_first_probe_is_ignored() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     t0,
   );
@@ -3151,6 +3338,7 @@ fn probe_conflict_before_our_first_probe_is_ignored() {
       rec_again,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     t2,
   );
@@ -3250,6 +3438,7 @@ fn a_response_beats_our_probe_even_when_our_records_sort_later() {
         rref,
         dg(1),
         ConflictHistory::Unmatched,
+        ConflictRole::Instance,
       )),
       t0,
     );
@@ -3459,6 +3648,7 @@ fn a_peer_probing_our_established_name_does_not_revert_us() {
       rec_resp,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -3506,6 +3696,7 @@ fn the_section9_revert_shuts_the_pre_probe_window_again() {
       txt_ref,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -3535,6 +3726,7 @@ fn the_section9_revert_shuts_the_pre_probe_window_again() {
       srv_ref,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -3586,6 +3778,7 @@ fn established_service_reprobes_on_different_rdata_conflict() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     t,
   );
@@ -3635,6 +3828,7 @@ fn established_service_ignores_identical_rdata() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     FakeInstant::zero().advance(100_000),
   );
@@ -4959,6 +5153,7 @@ fn an_identical_defending_response_never_costs_a_probing_service_its_name() {
           rec,
           dg(1),
           ConflictHistory::Unmatched,
+          ConflictRole::Instance,
         )),
         t0,
       );
@@ -5010,6 +5205,7 @@ fn an_identical_defending_response_never_costs_a_probing_service_its_name() {
           rec,
           dg(1),
           ConflictHistory::Unmatched,
+          ConflictRole::Instance,
         )),
         now,
       );
@@ -5195,6 +5391,7 @@ fn a_queued_announcement_cannot_overtake_a_classified_conflict() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -5564,6 +5761,7 @@ fn the_section81_window_stays_open_250ms_past_the_third_probe() {
             rec,
             dg(1),
             ConflictHistory::Unmatched,
+            ConflictRole::Instance,
           )),
           inside,
         );
@@ -6226,6 +6424,7 @@ fn post_establishment_conflict_drops_non_srv_txt_record() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -6256,6 +6455,7 @@ fn post_establishment_conflict_ignores_identical_srv() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -6280,6 +6480,7 @@ fn post_establishment_conflict_drops_malformed_srv() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -6316,6 +6517,7 @@ fn post_establishment_conflict_is_rate_limited() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -6323,6 +6525,108 @@ fn post_establishment_conflict_is_rate_limited() {
     svc.state(),
     ServiceState::Established,
     "a rate-limited §9 conflict must not re-probe"
+  );
+}
+
+/// The history label is NOT an exemption from RFC 6762 §9's reset.
+///
+/// # This cell used to drop the record, and the reason it gave was wrong
+///
+/// The reason was that §9 self-heals: the revert is already defer-and-
+/// re-verify, so a conflict withheld now returns with the peer's next response.
+/// §8.3 is what falsifies that. A conforming responder announces "two or three
+/// times, at intervals of at least one second" and is then SILENT until
+/// something queries it, so a screen that consumes those responses inside the
+/// retention window consumes every copy there was — and nothing replays a
+/// conflict when the window lapses. §9's "MUST immediately reset its conflicted
+/// unique record to probing state" was then not honoured late, it was not
+/// honoured at all, and duplicate ownership of an advertised name stood.
+///
+/// The label could never mean "this record was ours": §9 exists to protect a
+/// fault-tolerance twin "capable of issuing identical answers", and such a twin
+/// asserting our predecessor's rdata sends the same bytes our ghost would. So
+/// this cell spends the label on nothing, and the revert — same name,
+/// reversible, rate-limited — asks the network the question no lookup can
+/// answer.
+#[test]
+fn post_establishment_conflict_is_not_exempted_by_the_history_label() {
+  let mut svc = make_service(120);
+  let now = drive_to_established(&mut svc);
+  let kept = svc.name().as_str().to_owned();
+  // A genuine incumbent's SRV, on a port this endpoint published under this
+  // name and then gave up. Labelled, and still a conflict.
+  let mut buf = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut buf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Relinquished,
+      ConflictRole::Instance,
+    )),
+    now,
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "§9's immediate reset is owed whatever this endpoint published in the past \
+     — a twin publishing our predecessor's rdata is exactly the incumbent §9 is \
+     about, and the drop left it holding the name alongside us"
+  );
+  assert_eq!(
+    svc.name().as_str(),
+    kept,
+    "…and it is §9's revert, not a rename: the name is re-verified, not given up"
+  );
+}
+
+/// …and the revert a labelled record now reaches is still the RATE-LIMITED one.
+///
+/// The screen sat ABOVE `CONFLICT_REPROBE_MIN_INTERVAL`, so removing it must not
+/// be read as removing the flood guard underneath it.
+#[test]
+fn a_history_labelled_post_establishment_conflict_is_still_rate_limited() {
+  let mut svc = make_service(120);
+  let now = drive_to_established(&mut svc);
+  svc.last_conflict_reprobe = Some(now);
+  let mut buf = std::vec::Vec::new();
+  make_srv_record_ref(
+    &mut buf,
+    "myprinter._ipp._tcp.local.",
+    120,
+    0,
+    0,
+    9999,
+    "host.local.",
+  );
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Relinquished,
+      ConflictRole::Instance,
+    )),
+    now,
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "a labelled §9 conflict is adjudicated on the same terms as any other, rate \
+     limit included"
   );
 }
 
@@ -6451,6 +6755,7 @@ fn withdrawal_snapshot_after_rename_captures_only_current() {
   let RenameGoodbyeHandoff {
     records: old_records,
     owned: old_owned,
+    ..
   } = svc
     .take_rename_goodbye_handoff()
     .expect("the rename hands off the OLD announced name's goodbye");
@@ -6475,7 +6780,7 @@ fn withdrawal_snapshot_after_rename_captures_only_current() {
     "reset_instance must clear the instance latch after a rename"
   );
   assert!(
-    svc.goodbye.a.contains(&host_addr),
+    svc.goodbye.all.a.contains(&host_addr),
     "the host A address survives the instance rename"
   );
 
@@ -7600,7 +7905,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
     .expect("the response deadline fired");
   assert!(matches!(
     &svc.awaiting_confirm,
-    Some(AwaitingConfirm::Response(_, _))
+    Some(AwaitingConfirm::Response(..))
   ));
   assert_eq!(
     response.obligation(),
@@ -7624,7 +7929,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
   assert_eq!(legacy.dst(), legacy_src);
   assert!(matches!(
     &svc.awaiting_confirm,
-    Some(AwaitingConfirm::Response(_, _))
+    Some(AwaitingConfirm::Response(..))
   ));
   assert_eq!(
     legacy.obligation(),
@@ -8014,7 +8319,7 @@ fn a_response_confirm_cannot_move_the_partial_bound() {
     .expect("the response deadline fired");
   assert!(matches!(
     svc.awaiting_confirm,
-    Some(AwaitingConfirm::Response(_, _))
+    Some(AwaitingConfirm::Response(..))
   ));
   svc.note_delivery(now, TransmitDelivery::V4_ONLY);
   assert_eq!(
@@ -8071,6 +8376,7 @@ fn a_conflict_rename_clears_the_partial_bound() {
       srec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -8123,6 +8429,7 @@ fn the_section9_revert_to_probe_clears_the_partial_bound() {
       srec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     at,
   );
@@ -8221,6 +8528,7 @@ fn deliver_losing_srv_conflict(
           srec,
           dg(1),
           ConflictHistory::Unmatched,
+          ConflictRole::Instance,
         )),
         now,
       );
@@ -8313,7 +8621,7 @@ fn no_rename_is_reachable_with_an_announcement_parked_across_a_section9_revert()
     matches!(
       svc.awaiting_confirm,
       Some(AwaitingConfirm::Stale {
-        records: StaleRecords::SameName(_),
+        records: StaleRecords::SameName { .. },
         ..
       })
     ),
@@ -10434,11 +10742,12 @@ fn a_shared_ptr_only_response_does_not_close_the_preauthoritative_window() {
       false,
     ),
     0,
+    SendClass::Multicast,
   ));
   svc.note_delivery(t0, TransmitDelivery::ALL);
 
   assert_eq!(
-    svc.goodbye.ptr, [true; 2],
+    svc.goodbye.all.ptr, [true; 2],
     "precondition: goodbye ownership DOES count the shared PTR — a peer caches \
      it from us and it must be withdrawn"
   );
@@ -10488,6 +10797,7 @@ fn a_response_of_any_type_at_our_instance_name_defeats_the_probe() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     start,
   );
@@ -10545,6 +10855,7 @@ fn a_malformed_record_at_the_probed_name_is_not_a_conflict() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     start,
   );
@@ -10587,6 +10898,7 @@ fn an_identical_twins_instance_nsec_is_never_a_conflict() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     start,
   );
@@ -10646,6 +10958,7 @@ fn a_differing_instance_nsec_reverts_an_established_service() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -10683,6 +10996,7 @@ fn a_shared_ptr_at_the_instance_name_still_makes_no_established_conflict() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     now,
   );
@@ -10761,6 +11075,7 @@ fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name(
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     start,
   );
@@ -10782,6 +11097,7 @@ fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name(
       rec2,
       dg(2),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     start,
   );
@@ -11176,6 +11492,7 @@ fn a_malformed_response_does_not_defeat_the_probe() {
       rec,
       dg(1),
       ConflictHistory::Unmatched,
+      ConflictRole::Instance,
     )),
     start,
   );

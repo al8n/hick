@@ -390,6 +390,99 @@ pub(crate) fn transmitted_rdata_forms(
   }
 }
 
+/// WHICH SECTION of a message a record sits in — the arriving half of the
+/// qualifier [`transmitted_envelope`] states the transmitted half of.
+///
+/// Three variants because the QR=1 conflict fan-out walks three sections. The
+/// question section carries no records at all, and the iterator's
+/// `AuthorityProposals` phase is a second pass over the SAME authority records
+/// rather than a fourth section, so it needs no variant of its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecordSection {
+  /// The answer section — where every positive multicast record this crate
+  /// encodes goes EXCEPT the RFC 6762 §6.1 instance NSEC.
+  Answer,
+  /// The authority section. QR=0 it carries a peer's §8.2 proposal; QR=1 it is
+  /// classed with the responses. [`write_probe`] is the only encoder here that
+  /// writes one, and a probe latches no exposure — see [`transmitted_envelope`].
+  Authority,
+  /// The additional section — where [`push_service_nsec`] puts the §6.1
+  /// instance NSEC, and where a CONFORMING responder routinely puts the
+  /// addresses this crate keeps in the answer section.
+  Additional,
+}
+
+/// Could a record of `rtype` arriving in `section` with this `cache_flush` bit
+/// be an ECHO of something this crate put on the MULTICAST group?
+///
+/// The WIRE ENVELOPE half of the same question [`transmitted_rdata_forms`]
+/// answers for rdata, and it lives beside that function for the same reason:
+/// "what this endpoint transmitted" gets ONE description, so the endpoint's
+/// relinquished-history screen cannot drift from the encoders it is describing.
+/// Both of this crate's positive multicast encoders — [`write_announce`] and
+/// [`write_announce_filtered`] — write:
+///
+/// * the unique instance SRV / TXT and the host A / AAAA in the ANSWER section,
+///   each with the RFC 6762 §10.2 cache-flush bit SET;
+/// * the §6.1 instance NSEC in the ADDITIONAL section, through the single
+///   [`push_service_nsec`] call site, also cache-flushed;
+/// * nothing whatever in the AUTHORITY section. [`write_probe`] writes one, but
+///   a probe is QR=0 and latches no exposure (`AwaitingConfirm::Probe` records
+///   none), so no identity this screen can answer for has ever been in a QR=1
+///   authority section.
+///
+/// # Why both qualifiers are exact for a real echo, and what a mismatch means
+///
+/// An echo is a RE-DELIVERY of a datagram — kernel loopback, or the 802.11
+/// base-station re-broadcast RFC 6762 §8.2 names — not a re-encoding of it.
+/// The UDP payload is the same bytes, so the header counts that place a record
+/// in its section are ours, and the cache-flush bit, which is bit 15 of the
+/// record's own CLASS field, is ours. A genuine echo therefore arrives in the
+/// section we wrote it in with the bit we set, and NEITHER qualifier can reject
+/// one.
+///
+/// So a mismatch says the datagram is not our echo, and the two readings of
+/// that agree: either a conforming peer put an address in ADDITIONAL beside its
+/// SRV (RFC 6763 §12's own advice, and an ordinary browse response), or
+/// something re-encoded our bytes — which is a §9 fault-tolerance twin or a
+/// replaying peer, and this cell's whole premise is that neither may be
+/// disowned. Both point the same way: deliver the conflict.
+///
+/// # The direction it fails in
+///
+/// `false` for anything it does not recognise, exactly as
+/// [`transmitted_rdata_forms`] yields no form for a type it does not encode.
+/// Claiming an envelope this crate never wrote would suppress a GENUINE peer's
+/// terminal `HostConflict` — a conforming responder's Additional-section
+/// address is reachable with ordinary traffic, no crafted case required — while
+/// failing to claim one it did write can only re-open a stale self-echo, which
+/// the §8.2 deferral and §9's reversible same-name reset already bound.
+///
+/// # The cache-flush bit is per rrtype, not a flat conjunct
+///
+/// Because it would be WRONG for a shared record. The service-type and RFC 6763
+/// §7.1 subtype PTRs go out with the bit clear, and they are outside every arm
+/// here for the same reason [`instance_rtype_exposed`] has no PTR row: their
+/// owner is neither the instance name nor the host name, so the screen never
+/// answers for them. A PTR arm added here would need its own `!cache_flush`
+/// rule, not this one.
+pub(crate) const fn transmitted_envelope(
+  rtype: ResourceType,
+  section: RecordSection,
+  cache_flush: bool,
+) -> bool {
+  match rtype {
+    // The unique instance and host records, every one of them an answer.
+    ResourceType::Srv | ResourceType::Txt | ResourceType::A | ResourceType::AAAA => {
+      matches!(section, RecordSection::Answer) && cache_flush
+    }
+    // The §6.1 negative response, and the only thing this crate ever writes
+    // into the additional section.
+    ResourceType::Nsec => matches!(section, RecordSection::Additional) && cache_flush,
+    _ => false,
+  }
+}
+
 /// Write an unsolicited announcement: SRV, TXT, A, AAAA records.
 ///
 /// Returns the encoded length and whether the RFC 6762 §6.1 instance NSEC rode

@@ -173,8 +173,9 @@ where
   /// # Why it has to be cached rather than merely cheap
   ///
   /// `Endpoint::relinquished_asserts` is a WHOLE-RECORD answer — it depends on
-  /// the record, this endpoint's own history and the arriving family, never on
-  /// which route the fan-out is visiting — but the helper that consults it is
+  /// the record, this endpoint's own history, the arriving family and the
+  /// SECTION the record arrived in, never on which route the fan-out is
+  /// visiting — but the helper that consults it is
   /// re-entered after EVERY yielded match, because the cursor model returns one
   /// event per `next()`. So a record matching `S` services ran the same scan
   /// `S + 1` times, and each scan walks the withdrawal map plus up to
@@ -190,6 +191,11 @@ where
   /// again after a parse error changed `section` — misses and recomputes. There
   /// is no reset to forget at a record-advance site, and no cursor path that can
   /// leave a stale answer readable.
+  ///
+  /// The key having a SECTION in it is now load-bearing twice over: the screen's
+  /// answer depends on the arriving section, and it is read off this same slot
+  /// (see [`RecordSlot::section`]), so the cached answer and the input that
+  /// produced it cannot describe different sections.
   ///
   /// Nothing can mutate the history UNDER the cache while the iterator lives:
   /// [`RouteEvents`] holds the endpoint mutably for the whole iteration, and
@@ -217,6 +223,25 @@ pub(crate) enum RecordSlot {
   Answer(u16),
   Authority(u16),
   Additional(u16),
+}
+
+impl RecordSlot {
+  /// The SECTION half of this slot, stripped of the index — what the
+  /// relinquished-history screen weighs against the section this crate's
+  /// encoders actually wrote that rrtype in.
+  ///
+  /// It is read off the slot rather than off `self.section` for the reason the
+  /// slot exists at all: `section` is the ITERATOR's phase and moves ahead of
+  /// the record being fanned out, while a slot is the caller's statement about
+  /// the record in hand. The cache key and the screen's input are then the same
+  /// value, so a record can never be answered for under another's section.
+  const fn section(self) -> crate::service::RecordSection {
+    match self {
+      Self::Answer(_) => crate::service::RecordSection::Answer,
+      Self::Authority(_) => crate::service::RecordSection::Authority,
+      Self::Additional(_) => crate::service::RecordSection::Additional,
+    }
+  }
 }
 
 #[derive(Copy, Clone)]
@@ -445,10 +470,12 @@ where
     {
       return answer;
     }
-    let answer = if self
-      .endpoint
-      .relinquished_asserts(r, self.now, crate::transmit::Family::of(self.src))
-    {
+    let answer = if self.endpoint.relinquished_asserts(
+      r,
+      self.now,
+      crate::transmit::Family::of(self.src),
+      slot.section(),
+    ) {
       ConflictHistory::Relinquished
     } else {
       ConflictHistory::Unmatched
@@ -538,17 +565,27 @@ where
     //     retention window: a defence that never reaches a service is not merely
     //     delayed, it is unappealable.
     //   * A `HostConflict` is TERMINAL and caller-visible, and nothing in this
-    //     crate re-verifies it — host-name probing is unimplemented, so there is
-    //     no re-probe whose silence could convict a ghost. It stays suppressed.
+    //     crate re-verifies it — the HOST NAME is never probed, so there is no
+    //     re-probe whose silence could convict a ghost. It stays suppressed.
     //     Suppressing the EVENT is all that buys, though: where the owner is
     //     also the route's instance name the record is still delivered as a
-    //     labelled `ProbeConflict`, because the instance role is the one being
-    //     probed and it owes §8.1 an answer for every type at that name.
+    //     labelled `ProbeConflict` carrying [`ConflictRole::InstanceAndHost`],
+    //     because the instance role is the one being probed and it owes §8.1 an
+    //     answer for every type at that name — and because that premise, "the
+    //     name is never probed", is FALSE for this owner: `write_probe` asks ANY
+    //     for it and proposes exactly these A/AAAA, so §9's reversible same-name
+    //     reset has the re-verification the host cell lacks. The role is what
+    //     carries the host rule's proven AUTHORITY across the fall-through, so
+    //     the established cell can spend it.
     //
     // The router still cannot see lifecycle state and does not need to: it
     // states the fact, and `Service::handle_event` — which knows the phase —
-    // decides. The ESTABLISHED instance cell still drops a labelled record, for
-    // the reason it always did, but it drops it there rather than here.
+    // decides. NEITHER instance cell drops a labelled record. An ESTABLISHED
+    // service spends the label on nothing at all: §9's revert-to-probing runs as
+    // it would unlabelled, because dropping it there consumed a conforming
+    // peer's whole BOUNDED §8.3 announcement burst — "two or three times, at
+    // intervals of at least one second", then silence until queried — inside the
+    // window, and nothing replays a conflict once the window lapses.
     //
     // The gap it closes: a withdrawing route stops holding its host name for the
     // registration guard, so a replacement may take host `H` with address set
@@ -616,6 +653,13 @@ where
       // advertised, screened by the established arm against the records this
       // service is actually authoritative for there. Declining the host rule
       // must not also delete the instance rule's input.
+      //
+      // WHICH ROLE the record reaches the instance rule UNDER is a separate
+      // question from whether it reaches it, and the two fall-throughs answer it
+      // oppositely — see [`ConflictRole`]. Declining the host rule leaves the
+      // instance role alone to be authoritative; falling through a MATCHED host
+      // rule does not.
+      let mut role = ConflictRole::Instance;
       if names_match_record(route.host(), r)
         && is_host_conflict_rtype(r.rtype())
         && route_publishes_host_rtype(route, r.rtype())
@@ -647,15 +691,29 @@ where
         // to close, reached through the other role.
         //
         // So a route wearing both roles for this owner FALLS THROUGH to the
-        // instance rule below and takes the labelled `ProbeConflict`. The
-        // lifecycle cells are unchanged by that: pre-authoritatively it is
-        // §8.2's one-second deferral on the SAME name, and an ESTABLISHED
-        // service drops every A/AAAA at its instance name in the §9 arm's own
-        // rtype screen, which asserts no form of either. A route with no second
-        // role to fall through to is skipped as before.
+        // instance rule below and takes the labelled `ProbeConflict`. A route
+        // with no second role to fall through to is skipped as before.
         if !names_match_record(route.name(), r) {
           continue;
         }
+        // AND IT FALLS THROUGH WEARING BOTH ROLES. Suppressing the host
+        // CONSEQUENCE does not unprove the host AUTHORITY: this route publishes
+        // an RRset of this rrtype at this name, which is §9's "a unique record
+        // for which it is currently authoritative" in as many words. Delivering
+        // the record as a bare instance-role conflict threw that away, and the
+        // ESTABLISHED cell then dropped it — `canonical_rdata_forms` names SRV,
+        // TXT and NSEC and never an address, so its instance-authority gate
+        // answers "we assert no record of this type at this name" for an A/AAAA
+        // that we do in fact assert there. The same peer response was therefore
+        // handled while probing and silently discarded once announced.
+        //
+        // The host cell's own reason for suppressing does not reach this case.
+        // It suppresses because a `HostConflict` is terminal AND the host name
+        // is never probed, so nothing can re-verify a labelled record. Here the
+        // owner IS being probed — `write_probe` asks ANY for it and proposes
+        // exactly these A/AAAA — so the re-verification the host cell lacks
+        // already exists, and §9's reversible same-name reset can spend it.
+        role = ConflictRole::InstanceAndHost;
       }
       // EVERY type at the instance name, not just SRV/TXT. A probing host owes
       // §8.1 a deferral on "any conflicting Multicast DNS response" for a name
@@ -683,6 +741,7 @@ where
               *r,
               self.datagram,
               history,
+              role,
             )),
           )),
         ));

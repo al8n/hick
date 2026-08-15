@@ -130,6 +130,40 @@ pub enum ConflictHistory {
   Relinquished,
 }
 
+/// Which of a route's names a [`ProbeConflict`]'s record owns, when one name
+/// wears BOTH roles.
+///
+/// A service may register its instance name as its host name. Every A/AAAA it
+/// publishes is then a member of two RRsets at once — the §8.2 proposal its
+/// instance role probes with, and the address RRset its host role is
+/// authoritative for — and the routing fan-out has to choose ONE event to
+/// deliver it as. It tests the host rule first, so the record can only arrive
+/// here as a `ProbeConflict` by falling through that rule.
+///
+/// The fall-through must not lose what the host rule established, because the
+/// receiving cell needs it: `Service::handle_event`'s instance-authority gate
+/// asks `respond::canonical_rdata_forms`, which names SRV, TXT and NSEC and
+/// never an address, so an established service handed a bare instance-role
+/// A/AAAA drops it. That answer is right for a name that is ONLY an instance
+/// name and wrong for one that is also the host name, where §9's "a unique
+/// record for which it is currently authoritative" is plainly true. So the role
+/// travels with the record and the gate reads it.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, IsVariant)]
+#[non_exhaustive]
+pub enum ConflictRole {
+  /// The record's owner is this route's INSTANCE name and nothing else — or it
+  /// is also the host name, but this route publishes no RRset of that rrtype
+  /// there, so the host rule declined it. Either way the instance role is the
+  /// only one that can be authoritative for it.
+  Instance,
+  /// The record's owner is this route's instance name AND its host name, and
+  /// this route publishes an RRset of that rrtype at the host name. The record
+  /// reaches the instance role only because the host rule's consequence was
+  /// withheld; the AUTHORITY the host rule proved is unaffected by that and
+  /// travels with it.
+  InstanceAndHost,
+}
+
 /// Identifies the datagram a [`ProbeConflict`] arrived in.
 ///
 /// RFC 6762 §8.2's tiebreak input is one query's proposal — "the Authority
@@ -173,6 +207,7 @@ pub struct ProbeConflict<'a> {
   record: Ref<'a>,
   datagram: DatagramId,
   history: ConflictHistory,
+  role: ConflictRole,
 }
 impl<'a> ProbeConflict<'a> {
   #[allow(dead_code)]
@@ -182,13 +217,23 @@ impl<'a> ProbeConflict<'a> {
     record: Ref<'a>,
     datagram: DatagramId,
     history: ConflictHistory,
+    role: ConflictRole,
   ) -> Self {
     Self {
       src,
       record,
       datagram,
       history,
+      role,
     }
+  }
+  /// Returns which of the receiving route's names this record owns. See
+  /// [`ConflictRole`] — it is the authority the routing fan-out's host rule
+  /// established, carried across the fall-through that turned a `HostConflict`
+  /// into this event.
+  #[inline(always)]
+  pub const fn role(&self) -> ConflictRole {
+    self.role
   }
   /// Returns whether this record repeats rdata this endpoint recently
   /// transmitted and relinquished. See [`ConflictHistory`] — it is a label the

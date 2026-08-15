@@ -4858,9 +4858,9 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
 
   // A's withdrawal snapshot: owns PTR/SRV/TXT, the subtype PTR, and both host
   // A addresses.
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs_a,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs_a,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -4873,7 +4873,7 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
       std::vec![shared, unique],
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(a_handle, snap, now);
 
   let mut buf = std::vec![0u8; 4096];
@@ -4999,9 +4999,9 @@ fn host_a_snapshot(
   for a in host_a {
     recs.add_a(*a);
   }
-  crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -5014,7 +5014,7 @@ fn host_a_snapshot(
       host_a.to_vec(),
       std::vec::Vec::new(),
     ),
-  }
+  )
 }
 
 /// Regression: a withdrawing service MUST withdraw a host
@@ -5207,9 +5207,9 @@ fn note_withdrawal_delivered_spends_failed_rearms() {
     .unwrap();
   // A NON-empty snapshot (owns PTR/SRV/TXT) so the resend budget is non-zero
   // and the spend/backoff schedule is actually exercised.
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -5222,7 +5222,7 @@ fn note_withdrawal_delivered_spends_failed_rearms() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
   let token = ep.route_withdrawal_token(h).unwrap();
 
@@ -5334,9 +5334,9 @@ fn withdrawal_not_freed_until_every_family_sent() {
     )
     .unwrap();
   // Owns instance records (PTR/SRV/TXT), so the withdrawal has a real goodbye.
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -5349,7 +5349,7 @@ fn withdrawal_not_freed_until_every_family_sent() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
   let token = ep.route_withdrawal_token(h).unwrap();
 
@@ -5464,9 +5464,9 @@ fn a_withdrawal_round_names_the_families_that_still_owe() {
       now,
     )
     .unwrap();
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -5479,7 +5479,7 @@ fn a_withdrawal_round_names_the_families_that_still_owe() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
 
   let mut buf = std::vec![0u8; 4096];
@@ -5595,9 +5595,9 @@ fn withdrawal_writeoff_family_completes() {
       now,
     )
     .unwrap();
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -5610,7 +5610,7 @@ fn withdrawal_writeoff_family_completes() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
   let token = ep.route_withdrawal_token(h).unwrap();
 
@@ -5676,9 +5676,9 @@ fn withdrawal_retries_owed_family_at_backoff_when_other_is_paid() {
       now,
     )
     .unwrap();
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -5691,7 +5691,7 @@ fn withdrawal_retries_owed_family_at_backoff_when_other_is_paid() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
   let token = ep.route_withdrawal_token(h).unwrap();
 
@@ -5788,9 +5788,9 @@ fn writeoff_only_zeroes_its_own_family() {
       now,
     )
     .unwrap();
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -5803,7 +5803,7 @@ fn writeoff_only_zeroes_its_own_family() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
 
   // v4 written off (its debt → 0); v6 transiently busy (Retry, debt intact).
@@ -5853,9 +5853,9 @@ fn encode_failing_withdrawal_does_not_block_a_sibling() {
       now,
     )
     .unwrap();
-  let snap_a = crate::service::WithdrawalSnapshot {
-    records: recs_a,
-    owned: on_both(
+  let snap_a = crate::service::WithdrawalSnapshot::announced(
+    recs_a,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         false,
@@ -5868,7 +5868,7 @@ fn encode_failing_withdrawal_does_not_block_a_sibling() {
       big_a,
       std::vec::Vec::new(),
     ),
-  };
+  );
 
   // B (registered after A): owns only a single PTR — a minimal goodbye that
   // fits the small scratch.
@@ -5886,9 +5886,9 @@ fn encode_failing_withdrawal_does_not_block_a_sibling() {
       now,
     )
     .unwrap();
-  let snap_b = crate::service::WithdrawalSnapshot {
-    records: recs_b,
-    owned: on_both(
+  let snap_b = crate::service::WithdrawalSnapshot::announced(
+    recs_b,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         false,
@@ -5901,7 +5901,7 @@ fn encode_failing_withdrawal_does_not_block_a_sibling() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
 
   ep.begin_withdrawal(a, snap_a, now);
   ep.begin_withdrawal(b, snap_b, now);
@@ -5998,20 +5998,20 @@ fn teardown_during_rename_goodbye_withdraws_old_and_new_name() {
   // (A) goodbye was already enqueued as a DETACHED item; the teardown then
   // begins the route-attached (B) withdrawal from a current-only snapshot.
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         old_owned,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs_b,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs_b,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -6024,7 +6024,7 @@ fn teardown_during_rename_goodbye_withdraws_old_and_new_name() {
       std::vec![host_v4],
       std::vec![host_v6],
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
 
   // Both items owe a full per-family budget: the route item for B (it advertised
@@ -6171,14 +6171,14 @@ fn collision_old_name_holds_against_reregister_until_goodbye_completes() {
     false,
   );
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         old_owned,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     true,
   );
@@ -6258,14 +6258,14 @@ fn surviving_rename_old_name_is_reclaimable_on_announce() {
     false,
   );
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         old_owned,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
@@ -6317,9 +6317,9 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
   let host = Name::try_from_str("printer.local.").unwrap();
 
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: ServiceRecords::new(stype.clone(), old_name.clone(), host.clone(), 631, 120),
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      ServiceRecords::new(stype.clone(), old_name.clone(), host.clone(), 631, 120),
+      on_both(
         crate::service::EmittedRecords::new(
           true,
           true,
@@ -6332,7 +6332,7 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
@@ -6407,14 +6407,14 @@ fn rename_enqueues_a_detached_withdrawal_for_the_old_name() {
     false,
   );
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         old_owned,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
@@ -6513,14 +6513,14 @@ fn rename_enqueues_a_detached_withdrawal_for_the_old_name() {
     120,
   );
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: empty_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      empty_records,
+      on_both(
         empty_owned,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
@@ -6575,21 +6575,20 @@ fn rename_only_withdrawal_emits_old_name_goodbye() {
   // detached item. The teardown then begins a current-only withdrawal whose
   // snapshot owns nothing on the wire.
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         old_owned,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
-  let snap = crate::service::WithdrawalSnapshot {
-    records: cur_recs,
-    // CURRENT owns nothing on the wire.
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    cur_recs,
+    on_both(
       crate::service::EmittedRecords::new(
         false,
         false,
@@ -6602,7 +6601,7 @@ fn rename_only_withdrawal_emits_old_name_goodbye() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
 
   // The route-attached current-name item owes nothing (it advertised nothing on
@@ -6735,25 +6734,25 @@ fn dual_name_each_fits_but_combined_would_not() {
   // the teardown then begins the route-attached current-name withdrawal. Two
   // independent items, each its own single-name datagram.
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         owned_full.clone(),
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs_b,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs_b,
+    on_both(
       owned_full,
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
 
   // A scratch that fits each single-name goodbye but NOT their combined message.
@@ -6854,20 +6853,20 @@ fn independent_items_unencodable_current_does_not_starve_rename() {
   // The rename happened first → its old-name goodbye is its own detached item;
   // the teardown then begins the route-attached (huge current) withdrawal.
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         old_owned,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
-  let snap = crate::service::WithdrawalSnapshot {
-    records: cur_recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    cur_recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -6880,7 +6879,7 @@ fn independent_items_unencodable_current_does_not_starve_rename() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
 
   // Two independent items: a route-attached (huge current) + a detached (old).
@@ -6967,9 +6966,9 @@ fn unregister_service_drops_route_attached_withdrawal_no_stale_goodbye() {
     .unwrap();
 
   // Begin a ROUTE-attached withdrawal: a goodbye item now owes for `inst`.
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -6982,7 +6981,7 @@ fn unregister_service_drops_route_attached_withdrawal_no_stale_goodbye() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
   assert!(
     ep.route_withdrawal_owed(h).is_some(),
@@ -7056,20 +7055,20 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
     false,
   );
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         old_owned,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
-  let snap = crate::service::WithdrawalSnapshot {
-    records: cur_recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    cur_recs,
+    on_both(
       crate::service::EmittedRecords::new(
         false,
         false,
@@ -7082,7 +7081,7 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_some(),
@@ -7153,9 +7152,9 @@ fn a_reclaim_keeps_the_goodbye_a_dropped_subtype_still_needs() {
   old_records.add_subtype("_kept").unwrap();
   old_records.add_subtype("_removed").unwrap();
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         crate::service::EmittedRecords::new(
           true,
           true,
@@ -7168,7 +7167,7 @@ fn a_reclaim_keeps_the_goodbye_a_dropped_subtype_still_needs() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
@@ -7302,9 +7301,9 @@ fn a_reclaim_that_supersedes_every_shared_record_still_cancels_outright() {
   let mut old_records = ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120);
   old_records.add_subtype("_kept").unwrap();
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         crate::service::EmittedRecords::new(
           true,
           true,
@@ -7317,7 +7316,7 @@ fn a_reclaim_that_supersedes_every_shared_record_still_cancels_outright() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
@@ -7398,20 +7397,20 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
   // C2's rename enqueued a DETACHED item owning `target`; its teardown then
   // began a current-only withdrawal (owns nothing here).
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: target_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      target_records,
+      on_both(
         target_owned,
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
-  let snap2 = crate::service::WithdrawalSnapshot {
-    records: c2_recs,
-    owned: on_both(
+  let snap2 = crate::service::WithdrawalSnapshot::announced(
+    c2_recs,
+    on_both(
       crate::service::EmittedRecords::new(
         false,
         false,
@@ -7424,7 +7423,7 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h2, snap2, now);
   assert!(
     ep.detached_withdrawal_owed_for(&target).is_some(),
@@ -7481,9 +7480,9 @@ fn rename_onto_a_held_detached_name_is_rejected_reclaimable_is_not() {
     )
     .unwrap();
 
-  let mk = |name: &Name| crate::service::RenameGoodbyeHandoff {
-    records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
-    owned: on_both(
+  let mk = |name: &Name| crate::service::RenameGoodbyeHandoff::announced(
+    ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -7496,7 +7495,7 @@ fn rename_onto_a_held_detached_name_is_rejected_reclaimable_is_not() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   // A HELD (collision) detached goodbye for `held`, and a RECLAIMABLE one.
   ep.enqueue_rename_withdrawal(mk(&held), now, true);
   ep.enqueue_rename_withdrawal(mk(&reclaimable), now, false);
@@ -7554,9 +7553,9 @@ fn owed_family_gets_a_final_attempt_at_ceiling() {
     )
     .unwrap();
   // Owns instance records, so the withdrawal has a real goodbye to emit.
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -7569,7 +7568,7 @@ fn owed_family_gets_a_final_attempt_at_ceiling() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, t0);
   let ceiling = t0.checked_add_duration(super::WITHDRAWAL_CEILING).unwrap();
 
@@ -7672,9 +7671,9 @@ fn past_ceiling_owed_withdrawal_is_held_until_final_attempt() {
       t0,
     )
     .unwrap();
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -7687,7 +7686,7 @@ fn past_ceiling_owed_withdrawal_is_held_until_final_attempt() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, t0);
   let ceiling = t0.checked_add_duration(super::WITHDRAWAL_CEILING).unwrap();
 
@@ -7829,9 +7828,9 @@ fn host_only_snapshot(
   for a in host_a {
     recs.add_a(*a);
   }
-  crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         false,
         false,
@@ -7844,7 +7843,7 @@ fn host_only_snapshot(
       host_a.to_vec(),
       std::vec::Vec::new(),
     ),
-  }
+  )
 }
 
 /// Regression: a retained-only withdrawal must NOT head-of-line
@@ -7895,9 +7894,9 @@ fn retained_only_withdrawal_completes_and_does_not_block_a_sibling() {
       now,
     )
     .unwrap();
-  let snap_b = crate::service::WithdrawalSnapshot {
-    records: recs_b,
-    owned: on_both(
+  let snap_b = crate::service::WithdrawalSnapshot::announced(
+    recs_b,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -7910,7 +7909,7 @@ fn retained_only_withdrawal_completes_and_does_not_block_a_sibling() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
 
   // Both withdraw at the SAME time (A first in the vec, then B).
   ep.begin_withdrawal(
@@ -8349,9 +8348,9 @@ fn next_withdrawal_deadline_reflects_only_withdrawals() {
     .unwrap();
 
   // A route-attached withdrawal that owns instance records is due NOW.
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -8364,7 +8363,7 @@ fn next_withdrawal_deadline_reflects_only_withdrawals() {
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
   assert_eq!(
     ep.next_withdrawal_deadline(),
@@ -8706,9 +8705,9 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
 
   // A surviving rename left a RECLAIMABLE detached goodbye for the old name.
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+      on_both(
         crate::service::EmittedRecords::new(
           true,
           true,
@@ -8721,7 +8720,7 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
@@ -8817,9 +8816,9 @@ fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
   let mut ep = build_endpoint();
   let now = StdInstant::now();
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+      on_both(
         crate::service::EmittedRecords::new(
           true,
           true,
@@ -8832,7 +8831,7 @@ fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );
@@ -8883,9 +8882,9 @@ fn a_fully_announced_proof_cancels_only_its_own_services_goodbye() {
   // Both names have a RECLAIMABLE detached goodbye still draining.
   for name in [&name_a, &name_b] {
     ep.enqueue_rename_withdrawal(
-      crate::service::RenameGoodbyeHandoff {
-        records: ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
-        owned: on_both(
+      crate::service::RenameGoodbyeHandoff::announced(
+        ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
+        on_both(
           crate::service::EmittedRecords::new(
             true,
             true,
@@ -8898,7 +8897,7 @@ fn a_fully_announced_proof_cancels_only_its_own_services_goodbye() {
           std::vec::Vec::new(),
           std::vec::Vec::new(),
         ),
-      },
+      ),
       now,
       false,
     );
@@ -9057,9 +9056,9 @@ fn withdrawing_route(ep: &mut TestEndp, now: StdInstant) -> (ServiceHandle, supe
       now,
     )
     .unwrap();
-  let snap = crate::service::WithdrawalSnapshot {
-    records: recs,
-    owned: on_both(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    recs,
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -9072,7 +9071,7 @@ fn withdrawing_route(ep: &mut TestEndp, now: StdInstant) -> (ServiceHandle, supe
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   ep.begin_withdrawal(h, snap, now);
   let token = ep.route_withdrawal_token(h).unwrap();
   (h, token)
@@ -10532,9 +10531,9 @@ fn a_held_goodbye_holds_its_name_through_a_trailing_root_dot() {
     120,
   );
   ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_both(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_both(
         crate::service::EmittedRecords::new(
           true,
           true,
@@ -10547,7 +10546,7 @@ fn a_held_goodbye_holds_its_name_through_a_trailing_root_dot() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     true, // holds_name
   );
@@ -10763,15 +10762,105 @@ fn a_probe_host_conflict_is_routed_only_to_routes_publishing_that_rrtype() {
 // was evicted under load. Whichever it is, the datagram reaches adjudication
 // with no driver-side recognition left, so what screens it has to be here.
 
-/// Build a QR=1 authoritative response carrying one A record at `owner`.
+/// Build a QR=1 authoritative response carrying one A record at `owner`, with
+/// the RFC 6762 §10.2 cache-flush bit set — the way this crate's own encoders
+/// write every unique record they multicast.
 fn build_host_a_response(buf: &mut [u8], owner: &Name, addr: Ipv4Addr) -> usize {
+  build_host_a_response_with_flush(buf, owner, addr, true)
+}
+
+/// [`build_host_a_response`], with the cache-flush bit under the caller's
+/// control — so a test can send the one shape no positive multicast send of
+/// ours ever had.
+fn build_host_a_response_with_flush(
+  buf: &mut [u8],
+  owner: &Name,
+  addr: Ipv4Addr,
+  cache_flush: bool,
+) -> usize {
   use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder};
   let mut hdr = Header::new();
   hdr.flags_mut().set_response();
   let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
     MessageBuilder::try_new(buf, hdr).unwrap();
-  b.push_a_answer(owner, 120, addr, true).unwrap();
+  b.push_a_answer(owner, 120, addr, cache_flush).unwrap();
   b.finish().unwrap()
+}
+
+/// Byte offsets of the section counts in a DNS header: ANCOUNT, NSCOUNT and
+/// ARCOUNT, in wire order after the id, flags and QDCOUNT.
+const ANCOUNT_AT: usize = 6;
+const NSCOUNT_AT: usize = 8;
+const ARCOUNT_AT: usize = 10;
+
+/// Move ONE record off the answer count and onto `onto`, leaving every byte
+/// after the header untouched.
+///
+/// A record's own bytes say nothing about which section it is in — only the
+/// header counts do, and the sections are laid out contiguously in the order
+/// answers → authority → additional. So a message whose LAST record is an
+/// answer is byte-identical to the same message carrying that record in a later
+/// section, and moving one off ANCOUNT is the whole difference between them.
+///
+/// That is what lets these tests write the shapes a CONFORMING responder sends
+/// and this crate's encoders never do — an address in the additional section
+/// beside the SRV that points at it (RFC 6763 §12), or an authority record on a
+/// response.
+fn relabel_last_answer(pkt: &mut [u8], onto: usize) {
+  let take = |pkt: &[u8], at: usize| u16::from_be_bytes([pkt[at], pkt[at + 1]]);
+  let ancount = take(pkt, ANCOUNT_AT);
+  assert!(ancount > 0, "there must be an answer to relabel");
+  let moved = take(pkt, onto).checked_add(1).unwrap();
+  pkt[ANCOUNT_AT..ANCOUNT_AT + 2].copy_from_slice(&(ancount - 1).to_be_bytes());
+  pkt[onto..onto + 2].copy_from_slice(&moved.to_be_bytes());
+}
+
+/// Build the CONFORMING DNS-SD response shape: a peer's own SRV in the ANSWER
+/// section, and the address that SRV points at in the ADDITIONAL section.
+///
+/// RFC 6763 §12 tells a responder to bundle the address records with the SRV
+/// exactly this way, so this is ordinary browse traffic rather than a crafted
+/// datagram — and it is the shape this crate's encoders never produce, since
+/// they write every address as an ANSWER.
+fn build_srv_answer_plus_additional_a(
+  buf: &mut [u8],
+  peer_instance: &Name,
+  host: &Name,
+  addr: Ipv4Addr,
+) -> usize {
+  use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder};
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let n = {
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(buf, hdr).unwrap();
+    b.push_srv_answer(peer_instance, 120, 0, 0, 631, host, true)
+      .unwrap();
+    b.push_a_answer(host, 120, addr, true).unwrap();
+    b.finish().unwrap()
+  };
+  relabel_last_answer(buf, ARCOUNT_AT);
+  n
+}
+
+/// The `{SRV, TXT}` bitmap `push_service_nsec` writes, for the tests that build
+/// the §6.1 instance NSEC an echo of ours would carry.
+fn emitted_nsec_types() -> [u16; 2] {
+  [
+    crate::wire::ResourceType::Srv.to_u16(),
+    crate::wire::ResourceType::Txt.to_u16(),
+  ]
+}
+
+/// Move the sole ADDITIONAL record onto the answer count — the inverse of
+/// [`relabel_last_answer`], for the one identity this crate transmits in the
+/// additional section rather than the answer one.
+fn relabel_sole_additional_as_answer(pkt: &mut [u8]) {
+  let take = |pkt: &[u8], at: usize| u16::from_be_bytes([pkt[at], pkt[at + 1]]);
+  assert_eq!(take(pkt, ANCOUNT_AT), 0, "the answer section must be empty");
+  assert_eq!(take(pkt, ARCOUNT_AT), 1, "there must be one additional");
+  pkt[ANCOUNT_AT..ANCOUNT_AT + 2].copy_from_slice(&1u16.to_be_bytes());
+  pkt[ARCOUNT_AT..ARCOUNT_AT + 2].copy_from_slice(&0u16.to_be_bytes());
 }
 
 /// Build a QR=1 authoritative response carrying one SRV record at `owner`.
@@ -10800,9 +10889,9 @@ fn announced_snapshot(
   records: &ServiceRecords,
   host_a: &[Ipv4Addr],
 ) -> crate::service::WithdrawalSnapshot {
-  crate::service::WithdrawalSnapshot {
-    records: records.clone(),
-    owned: on_both(
+  crate::service::WithdrawalSnapshot::announced(
+    records.clone(),
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -10815,7 +10904,7 @@ fn announced_snapshot(
       host_a.to_vec(),
       std::vec::Vec::new(),
     ),
-  }
+  )
 }
 
 /// Settle `handle`'s route-attached goodbye and free its route, returning what
@@ -11120,6 +11209,202 @@ fn a_completed_withdrawals_echo_does_not_retire_the_replacement_at_its_host() {
     std::vec![b_handle],
     "the screen must LAPSE — it delays detection of a peer that happens to \
      assert exactly our relinquished rdata, it does not suppress it forever"
+  );
+}
+
+/// THE SECTION, and the serious half of the pair: a CONFORMING responder
+/// reaches this with ORDINARY TRAFFIC.
+///
+/// The exposure records an rrtype and never a section, while QR=1 conflict
+/// routing walks Answer, Authority AND Additional into `next_service_conflict`.
+/// Every positive multicast encoder in this crate writes A / AAAA / SRV / TXT as
+/// ANSWERS — an address of ours has never been in an additional or an authority
+/// section — yet a peer's A in either matched a relinquished identity and was
+/// disowned. The host cell SUPPRESSES rather than labels, so what went missing
+/// was the TERMINAL, caller-visible `HostConflict`, for the whole retention
+/// window.
+///
+/// And RFC 6763 §12 tells a responder to bundle the addresses with the SRV that
+/// points at them, which is what a DNS-SD browse answer looks like everywhere.
+/// Nothing here is crafted: the peer is answering a query correctly.
+///
+/// An echo cannot be caught by this narrowing, which is why it costs nothing. An
+/// echo is a re-DELIVERY of a datagram — kernel loopback, or the 802.11
+/// base-station re-broadcast RFC 6762 §8.2 names — not a re-encoding of it, so
+/// the header counts that place a record in its section are the ones this
+/// endpoint wrote. The control below is the same address in the section we
+/// actually sent it in, and it is still disowned.
+#[test]
+fn an_address_in_a_section_we_never_wrote_one_in_is_not_our_echo() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let host = Name::try_from_str("shared-host.local.").unwrap();
+  let peer_instance = Name::try_from_str("Peer._ipp._tcp.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  e.begin_withdrawal(a_handle, snap, now);
+  let freed = finish_withdrawal(&mut e, a_handle, now);
+  assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
+
+  let b_handle = register_with_addr_sets(
+    &mut e,
+    "B._ipp._tcp.local.",
+    "shared-host.local.",
+    &[a2],
+    &[],
+  )
+  .unwrap();
+
+  // THE CONTROL, first: arriving the way we actually sent it — an ANSWER with
+  // the cache-flush bit — the very same record is still disowned.
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  assert!(
+    host_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "precondition: in the section this endpoint writes addresses in, the echo \
+     of a relinquished address must still be screened"
+  );
+
+  // The conforming browse answer: the peer's SRV in the answer section, the
+  // address it points at in the ADDITIONAL section.
+  let mut buf = [0u8; 512];
+  let n = build_srv_answer_plus_additional_a(&mut buf, &peer_instance, &host, a1);
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "this crate writes addresses only as ANSWERS, so a peer's ADDITIONAL-section \
+     A cannot be an echo of ours — disowning it withheld the terminal \
+     HostConflict from ordinary DNS-SD traffic"
+  );
+
+  // And the authority section of a QR=1 response, which no encoder here writes
+  // under a latched exposure at all: `write_probe` is the only authority-section
+  // encoder and a probe latches none.
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  relabel_last_answer(&mut buf, NSCOUNT_AT);
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "no identity this screen can answer for was ever transmitted in a QR=1 \
+     authority section"
+  );
+}
+
+/// THE CACHE-FLUSH BIT. `rclass()` masks it off and `cache_flush()` preserves
+/// it, and neither tier of the screen used to read either.
+///
+/// Every unique record this crate MULTICASTS sets it — `write_announce`,
+/// `write_announce_filtered` and `push_service_nsec` alike — and the shared PTRs
+/// that do not are records this screen never answers for, since neither the
+/// service-type name nor a `_sub` name is an owner it tests. So every
+/// screen-eligible identity went out with the bit SET, and a peer record without
+/// it cannot be our echo: the bit is bit 15 of the record's own CLASS field, and
+/// an echo carries our bytes.
+///
+/// It ranks below the section because exploiting it takes a peer that does not
+/// set the bit on a unique record, which RFC 6762 §10.2 asks it to. The
+/// narrowing is the same shape and the same cost either way.
+#[test]
+fn a_record_without_the_cache_flush_bit_is_not_our_echo() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let host = Name::try_from_str("shared-host.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  e.begin_withdrawal(a_handle, snap, now);
+  let freed = finish_withdrawal(&mut e, a_handle, now);
+  assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
+
+  let b_handle = register_with_addr_sets(
+    &mut e,
+    "B._ipp._tcp.local.",
+    "shared-host.local.",
+    &[a2],
+    &[],
+  )
+  .unwrap();
+
+  // THE CONTROL: with the bit, exactly as every positive multicast send of ours
+  // carried it, the echo is still disowned.
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response_with_flush(&mut buf, &host, a1, true);
+  assert!(
+    host_conflicted(&mut e, &buf[..n], now).is_empty(),
+    "precondition: the bit set is how we sent it, so the screen still answers"
+  );
+
+  // Without it — the one shape no positive multicast send of ours ever had.
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response_with_flush(&mut buf, &host, a1, false);
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "every unique record this crate multicasts sets the §10.2 cache-flush bit, \
+     so a peer's record without it is not our echo and its conflict is owed"
+  );
+}
+
+/// …and the section rule is PER RRTYPE, not "the answer section".
+///
+/// The RFC 6762 §6.1 instance NSEC is the one identity this crate transmits in
+/// the ADDITIONAL section — `push_service_nsec` is the builder's only additional
+/// push, and both positive multicast encoders reach it. So the two sections
+/// invert for this rrtype, and a rule spelled "answers only" would stop
+/// screening our own NSEC echo: the under-claim direction, which re-opens the
+/// defect the screen exists for rather than the one this round closes.
+#[test]
+fn the_instance_nsec_is_screened_in_the_section_it_was_written_in_and_no_other() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let addr = Ipv4Addr::new(192, 168, 1, 5);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  e.begin_withdrawal(a_handle, snap, now);
+  let freed = finish_withdrawal(&mut e, a_handle, now);
+  assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
+
+  // The successor reuses the vacated instance name, so the NSEC routes to it.
+  let b_handle = register_with_addr_sets(
+    &mut e,
+    "Printer._ipp._tcp.local.",
+    "h2.local.",
+    &[Ipv4Addr::new(192, 168, 1, 9)],
+    &[],
+  )
+  .unwrap();
+
+  // THE CONTROL: the additional section, which is where `push_service_nsec`
+  // puts it and therefore where an echo of it would arrive.
+  let mut buf = [0u8; 512];
+  let n = build_instance_nsec_response(&mut buf, &instance, &emitted_nsec_types());
+  assert_eq!(
+    probe_disowned(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "precondition: the NSEC arriving where we wrote it is this endpoint's own \
+     recent past"
+  );
+
+  // The same NSEC as an ANSWER: a section this crate has never put one in.
+  let mut buf = [0u8; 512];
+  let n = build_instance_nsec_response(&mut buf, &instance, &emitted_nsec_types());
+  relabel_sole_additional_as_answer(&mut buf);
+  assert_eq!(
+    probe_unscreened(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "the section a record was written in is per RRTYPE — the NSEC's is the \
+     additional one, and an answer-section NSEC is no echo of ours"
   );
 }
 
@@ -11510,6 +11795,111 @@ fn a_ghosts_echo_costs_the_successor_one_second_and_not_the_name() {
   );
 }
 
+/// THE USURPATION SURVIVING THE PROBE — packet loss lets the successor finish,
+/// so the incumbent's next response arrives in row C instead of row B.
+///
+/// Nothing about the deferral in the tests above requires the incumbent's
+/// defence to arrive WHILE the successor is probing. Drop one datagram per
+/// probe — ordinary loss, no attacker — and `B` completes the RFC 6762 §8.1
+/// sequence and announces `R2` over a name `P` already holds with `R1`. `P`'s
+/// next response is then a §9 conflict against an ADVERTISED name.
+///
+/// # Why the established cell could not drop it
+///
+/// Because the cell's stated reason — §9 self-heals, since a live incumbent
+/// keeps talking — is false. §8.3 bounds what `P` says unprompted: "two or
+/// three times, at intervals of at least one second", and then silence until
+/// something queries it. A screen that consumes those responses inside the
+/// retention window consumes every copy there was, and nothing replays a
+/// conflict once the window lapses. §9's "MUST immediately reset its conflicted
+/// unique record to probing state" was then not late, it was never — and two
+/// responders held one advertised name until unrelated traffic happened by.
+///
+/// So the label buys nothing here and the revert runs: same name, rate-limited,
+/// claiming nothing while it runs. Against a GHOST the re-probe goes unanswered
+/// and `B` re-announces (the cost, and the whole of it); against `P` it is
+/// answered, and once the label lapses §8.1 renames `B`.
+#[test]
+fn an_incumbents_response_reverts_a_successor_that_established_inside_the_window() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let target = Name::try_from_str("h.local.").unwrap();
+  let addr = Ipv4Addr::new(192, 168, 1, 5);
+
+  // `A` announced `R1` = SRV(631) at this name, then gave it up. Peer `P` is a
+  // §9 fault-tolerance twin asserting that same `R1`, which §9 makes legal.
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  e.begin_withdrawal(a_handle, snap, now);
+  assert_eq!(
+    finish_withdrawal(&mut e, a_handle, now),
+    std::vec![a_handle],
+    "precondition: R1 is now this endpoint's relinquished history"
+  );
+
+  // `B` takes the same owner name with `R2` = SRV(9999), and NOTHING reaches it
+  // while it probes.
+  let (b_handle, mut b) = register_probing_successor(&mut e, &instance, &target, 9999, addr, now);
+  let kept = b.name().as_str().to_owned();
+  let mut txbuf = std::vec![0u8; 4096];
+  let mut at = now;
+  for _ in 0..40 {
+    at = at
+      .checked_add(core::time::Duration::from_millis(300))
+      .unwrap();
+    b.handle_timeout(at).unwrap();
+    while let Ok(Some(_)) = b.poll_transmit(at, &mut txbuf) {
+      b.note_delivery(at, TransmitDelivery::ALL);
+    }
+    if b.state() == crate::ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(
+    b.state(),
+    crate::ServiceState::Established,
+    "precondition: the loss let the successor finish probing and announce"
+  );
+  let window_ends = now
+    .checked_add(EndpointConfig::new().relinquished_retention())
+    .unwrap();
+  assert!(
+    at < window_ends,
+    "precondition: and it got there INSIDE the retention window — the §8.1 \
+     sequence and its announcements take about 2.25 s against a 5 s default, so \
+     this needs no unusual timing at all"
+  );
+
+  // `P`'s next response. Still `R1`, still labelled, and — §8.3's burst being
+  // bounded — quite possibly the last one `B` will ever see unprompted.
+  let mut buf = [0u8; 512];
+  let n = build_instance_srv_response(&mut buf, &instance, 631, &target);
+  assert_eq!(
+    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], at),
+    1,
+    "the incumbent's response must reach B"
+  );
+  assert_eq!(
+    b.state(),
+    crate::ServiceState::Init,
+    "…and §9's immediate reset must be honoured on it. Dropping it for matching \
+     this endpoint's own history left TWO responders owning one advertised \
+     name, with nothing to replay the conflict at expiry"
+  );
+  assert_eq!(
+    b.name().as_str(),
+    kept,
+    "…and it is §9's revert, on the SAME name: the re-probe is the only thing \
+     that can tell a live incumbent from our own ghost"
+  );
+  assert!(
+    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    "…so nothing is renamed on the evidence of one response"
+  );
+}
+
 /// THE SAME USURPATION, REACHED THROUGH THE HOST ROLE — when the instance name
 /// and the host name are ONE name.
 ///
@@ -11610,6 +12000,298 @@ fn an_incumbents_labelled_defence_defers_a_successor_whose_instance_is_its_host(
   );
 }
 
+/// THE SAME NAME, THE SAME PEER, ONE LIFECYCLE STATE LATER — and the record used
+/// to vanish.
+///
+/// The test above proves the labelled A/AAAA reaches the PRE-AUTHORITATIVE cell
+/// and is spent on §8.2's deferral. Let ordinary packet loss carry the successor
+/// past probing — no attacker and no unusual timing, exactly as
+/// `an_incumbents_response_reverts_a_successor_that_established_inside_the_window`
+/// does for a differing SRV — and the identical record arrives in row C instead,
+/// where it was delivered and then SILENTLY DISCARDED.
+///
+/// Two gates disagreed about which role owns it. The router's host rule proved
+/// this route authoritative for an A RRset at this name and then, having
+/// withheld the terminal `HostConflict`, handed the record on stripped of that
+/// proof; `Service::handle_event` asked its instance-authority gate —
+/// `respond::canonical_rdata_forms`, whose domain is SRV / TXT / NSEC — whether
+/// it asserts an A there, and answered no. It asserts one: the name is its HOST
+/// name. So the same peer response was handled while probing and dropped once
+/// announced, and §9's "MUST immediately reset its conflicted unique record to
+/// probing state" was not honoured late, it was not honoured at all — §8.3
+/// bounds the incumbent's burst, so the window swallowed every copy there was.
+///
+/// The host cell's own reason for suppressing does not reach this owner either.
+/// It suppresses because the host name is NEVER PROBED, so nothing can
+/// re-verify a labelled record — and here the owner IS being probed, by
+/// `write_probe`'s ANY question proposing exactly these A/AAAA. The
+/// re-verification the host cell lacks is the one this service already runs, so
+/// §9's reversible same-name reset is available and the label buys it, exactly
+/// as it does for a differing SRV.
+#[test]
+fn an_incumbents_labelled_address_reverts_a_successor_whose_instance_is_its_host() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let shared = Name::try_from_str("h.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  // `A` announced `A1` under the one name it wears as both roles, and gave it up.
+  let (a_handle, a_svc) = register_service_with_a(&mut e, "h.local.", "h.local.", a1);
+  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  e.begin_withdrawal(a_handle, snap, now);
+  assert_eq!(
+    finish_withdrawal(&mut e, a_handle, now),
+    std::vec![a_handle],
+    "precondition: A1 is now this endpoint's relinquished history"
+  );
+
+  // `B` takes the same name with `A2`, and NOTHING reaches it while it probes.
+  let (b_handle, mut b) = register_probing_successor(&mut e, &shared, &shared, 9999, a2, now);
+  let kept = b.name().as_str().to_owned();
+  let mut txbuf = std::vec![0u8; 4096];
+  let mut at = now;
+  for _ in 0..40 {
+    at = at
+      .checked_add(core::time::Duration::from_millis(300))
+      .unwrap();
+    b.handle_timeout(at).unwrap();
+    while let Ok(Some(_)) = b.poll_transmit(at, &mut txbuf) {
+      b.note_delivery(at, TransmitDelivery::ALL);
+    }
+    if b.state() == crate::ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(
+    b.state(),
+    crate::ServiceState::Established,
+    "precondition: the loss let the successor finish probing and announce"
+  );
+  assert!(
+    at
+      < now
+        .checked_add(EndpointConfig::new().relinquished_retention())
+        .unwrap(),
+    "precondition: and it got there INSIDE the retention window, so the \
+     incumbent's next defence still carries the label"
+  );
+
+  // The incumbent `P` defends with `A1` — labelled, and §8.3 says quite possibly
+  // the last copy `B` will ever see unprompted.
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &shared, a1);
+  assert_eq!(
+    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], at),
+    1,
+    "the incumbent's defence must REACH B — the fall-through already delivered \
+     it, which is why the loss was silent"
+  );
+  assert_eq!(
+    b.state(),
+    crate::ServiceState::Init,
+    "…and §9's immediate reset must be honoured ON IT. Delivering it stripped of \
+     the host role let row C's instance-authority gate answer 'we assert no A at \
+     this name' for an address we assert at exactly this name, so a record the \
+     probing cell acted on was discarded the moment the service announced"
+  );
+  assert_eq!(
+    b.name().as_str(),
+    kept,
+    "…and it is §9's revert, on the SAME name: reversible, rate-limited, and \
+     claiming nothing while it runs"
+  );
+  assert!(
+    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    "…so nothing is renamed on the evidence of one response"
+  );
+  assert!(
+    !drain_updates(&mut b)
+      .iter()
+      .any(ServiceUpdate::is_host_conflict),
+    "…and the TERMINAL host consequence is still withheld: the fall-through \
+     carries the host rule's AUTHORITY, never its verdict"
+  );
+}
+
+/// …and the host role it now carries is read by the identical-rdata precondition
+/// too, which is the other half of the same correction.
+///
+/// A labelled A/AAAA at a name that is both roles used to be classified by
+/// `classify_instance_rdata`, whose rule is `canonical_rdata_forms` — SRV, TXT,
+/// NSEC. That function can name no form of an address, so it answered
+/// `Different` for every address, INCLUDING one this service publishes at that
+/// very name. §9 and §8.2.1 both call that no conflict at all ("two devices
+/// advertising identical sets … there is, in fact, no conflict"), and the
+/// UNLABELLED copy of this very record is already dropped as consistent by the
+/// host rule. Labelling it must not make it MORE conflicting than not labelling
+/// it did.
+#[test]
+fn a_labelled_address_this_service_publishes_is_no_conflict_at_a_shared_name() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let shared = Name::try_from_str("h.local.").unwrap();
+  let addr = Ipv4Addr::new(192, 168, 1, 5);
+
+  // `A` announced this address at the shared name and gave it up, so the address
+  // is this endpoint's own history…
+  let (a_handle, a_svc) = register_service_with_a(&mut e, "h.local.", "h.local.", addr);
+  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  e.begin_withdrawal(a_handle, snap, now);
+  assert_eq!(
+    finish_withdrawal(&mut e, a_handle, now),
+    std::vec![a_handle],
+    "precondition: the address is now this endpoint's relinquished history"
+  );
+
+  // …and `B` re-registers the same name publishing the SAME address, which is
+  // what makes the arriving record both labelled and consistent.
+  let (b_handle, mut b) = register_probing_successor(&mut e, &shared, &shared, 9999, addr, now);
+  let kept = b.name().as_str().to_owned();
+  let at = probe_once_confirmed(&mut b, now);
+
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &shared, addr);
+  assert_eq!(
+    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], at),
+    1,
+    "precondition: the labelled record still reaches B as a `ProbeConflict` — \
+     what changed is which classifier reads it, not whether it is delivered"
+  );
+  let after = at
+    .checked_add(core::time::Duration::from_millis(10))
+    .unwrap();
+  b.handle_timeout(after).unwrap();
+  assert_ne!(
+    b.state(),
+    crate::ServiceState::Init,
+    "an address this service itself publishes is §9's 'never inconsistent', so \
+     it must spend NO deferral — the instance classifier could not read an \
+     address at all and called every one of them differing"
+  );
+  assert_eq!(
+    b.name().as_str(),
+    kept,
+    "…and the name is untouched either way"
+  );
+}
+
+/// A UNICAST-ONLY GENERATION DISOWNS NOTHING, because no multicast copy of its
+/// bytes ever existed.
+///
+/// An RFC 6762 §6.7 legacy reply is a real, confirmed, positive-TTL send of the
+/// FULL record set — so those records are in one resolver's cache and the §10.1
+/// goodbye owes them a retraction. It is addressed to that resolver's ephemeral
+/// port, nothing re-broadcasts it to the group, and this screen is only ever
+/// asked about a MULTICAST arrival. The two facts were one latch, so a service
+/// whose ONLY positive send was such a reply retained a row that disowned every
+/// matching multicast record for the whole retention window — suppressing a
+/// GENUINE peer's terminal host conflict on the strength of bytes no multicast
+/// socket ever carried.
+///
+/// End to end, with no hand-built exposure: the snapshot here is the one
+/// `Service::withdrawal_snapshot` actually produces after that reply, which
+/// `a_legacy_unicast_reply_is_exposure_but_not_multicast_echo_provenance` pins
+/// from the other side.
+#[test]
+fn a_unicast_only_generation_does_not_screen_a_genuine_peer_conflict() {
+  use crate::{event::ServiceQuestion, wire::QuestionRef};
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let host = Name::try_from_str("h.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  let (a_handle, mut a_svc) =
+    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", a1);
+
+  // Probe to `Announcing(0)` and stop there. A probe is a QUESTION (§8.1) and
+  // latches no exposure of any kind, so nothing this service has sent so far is
+  // a positive assertion.
+  let mut txbuf = std::vec![0u8; 4096];
+  let mut at = now;
+  for _ in 0..40 {
+    at = at
+      .checked_add(core::time::Duration::from_millis(300))
+      .unwrap();
+    a_svc.handle_timeout(at).unwrap();
+    if a_svc.state() == crate::ServiceState::Announcing(0) {
+      break;
+    }
+    if let Ok(Some(_)) = a_svc.poll_transmit(at, &mut txbuf) {
+      a_svc.note_delivery(at, TransmitDelivery::ALL);
+    }
+  }
+  assert_eq!(
+    a_svc.state(),
+    crate::ServiceState::Announcing(0),
+    "precondition: probing is done and nothing has been announced"
+  );
+
+  // ONE §6.7 legacy reply — drained ahead of the announcement queue, and the
+  // only positive send this service ever makes.
+  let legacy_src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in "_ipp._tcp.local.".trim_end_matches('.').split('.') {
+    qbuf.push(label.len() as u8);
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8);
+  qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  a_svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x4242)),
+    at,
+  );
+  let tx = a_svc
+    .poll_transmit(at, &mut txbuf)
+    .unwrap()
+    .expect("the legacy reply drains first");
+  assert_eq!(
+    tx.dst(),
+    legacy_src,
+    "precondition: the one positive send went to a resolver's ephemeral port"
+  );
+  a_svc.note_delivery(at, TransmitDelivery::ALL);
+
+  // …and is torn down, snapshot and all.
+  let snap = a_svc.withdrawal_snapshot();
+  assert!(
+    !crate::transmit::Family::V4.pick_ref(&snap.owned).a_slice().is_empty(),
+    "precondition: the goodbye's half DOES own the host address — the legacy \
+     querier caches it, so a §10.1 goodbye must retract it"
+  );
+  e.begin_withdrawal(a_handle, snap, at);
+  assert_eq!(
+    finish_withdrawal(&mut e, a_handle, at),
+    std::vec![a_handle],
+    "precondition: the withdrawal completed, so only the retention list is left"
+  );
+
+  // A successor takes the host name with a DIFFERENT address, and a genuine peer
+  // multicasts the old one. Those bytes match this endpoint's unicast history
+  // exactly — and cannot be an echo of it.
+  let (b_handle, _b_svc) = register_probing_successor(
+    &mut e,
+    &Name::try_from_str("Other._ipp._tcp.local.").unwrap(),
+    &host,
+    9999,
+    a2,
+    at,
+  );
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &host, a1);
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], at),
+    std::vec![b_handle],
+    "a set that was never on the group has no echo to disown, so the peer's \
+     conflict must reach the successor. Screening it withheld a TERMINAL, \
+     caller-visible host conflict for the whole retention window on the \
+     strength of a datagram addressed to one ephemeral port"
+  );
+}
+
 /// The RFC 6762 §9 RENAME is the other point a record set stops being published,
 /// and its detached goodbye is not enough on its own: a SURVIVING rename's
 /// old-name goodbye is reclaim-cancelled by `note_service_announced` the moment
@@ -11632,9 +12314,9 @@ fn a_renamed_away_instances_echo_does_not_conflict_after_its_goodbye_is_reclaime
     Name::try_from_str("Printer (2)._ipp._tcp.local.").unwrap(),
   )
   .unwrap();
-  let handoff = crate::service::RenameGoodbyeHandoff {
-    records: svc.records().clone(),
-    owned: on_both(
+  let handoff = crate::service::RenameGoodbyeHandoff::announced(
+    svc.records().clone(),
+    on_both(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -11647,7 +12329,7 @@ fn a_renamed_away_instances_echo_does_not_conflict_after_its_goodbye_is_reclaime
       std::vec::Vec::new(),
       std::vec::Vec::new(),
     ),
-  };
+  );
   e.enqueue_rename_withdrawal(handoff, now, false);
 
   // A replacement takes the vacated name and fully announces it, which cancels
@@ -11973,9 +12655,9 @@ fn a_relinquished_generation_is_disowned_only_on_the_family_that_carried_it() {
   // `A` announces, IPv4 accepts, IPv6 refuses. Then it is torn down.
   let (a_handle, a_svc) =
     register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "shared-host.local.", a1);
-  let snap = crate::service::WithdrawalSnapshot {
-    records: a_svc.records().clone(),
-    owned: on_v4_only(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    a_svc.records().clone(),
+    on_v4_only(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -11988,7 +12670,7 @@ fn a_relinquished_generation_is_disowned_only_on_the_family_that_carried_it() {
       std::vec![a1],
       std::vec::Vec::new(),
     ),
-  };
+  );
   e.begin_withdrawal(a_handle, snap, now);
   let freed = finish_withdrawal(&mut e, a_handle, now);
   assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
@@ -12052,9 +12734,9 @@ fn a_draining_withdrawals_exposure_screens_only_the_family_it_reached() {
 
   let (a_handle, a_svc) =
     register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
-  let snap = crate::service::WithdrawalSnapshot {
-    records: a_svc.records().clone(),
-    owned: on_v4_only(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    a_svc.records().clone(),
+    on_v4_only(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -12067,7 +12749,7 @@ fn a_draining_withdrawals_exposure_screens_only_the_family_it_reached() {
       std::vec![a1],
       std::vec::Vec::new(),
     ),
-  };
+  );
   // The item is still draining — nothing is retained yet, so the screen's
   // answer comes from the item itself.
   e.begin_withdrawal(a_handle, snap, now);
@@ -12323,9 +13005,9 @@ fn a_family_that_carried_nothing_owes_no_goodbye() {
 
   let (a_handle, a_svc) =
     register_service_with_a(&mut e, "A._ipp._tcp.local.", "h.local.", a1);
-  let snap = crate::service::WithdrawalSnapshot {
-    records: a_svc.records().clone(),
-    owned: on_v4_only(
+  let snap = crate::service::WithdrawalSnapshot::announced(
+    a_svc.records().clone(),
+    on_v4_only(
       crate::service::EmittedRecords::new(
         true,
         true,
@@ -12338,7 +13020,7 @@ fn a_family_that_carried_nothing_owes_no_goodbye() {
       std::vec![a1],
       std::vec::Vec::new(),
     ),
-  };
+  );
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(
     e.route_withdrawal_owed(a_handle),
@@ -12357,9 +13039,9 @@ fn a_family_that_carried_nothing_owes_no_goodbye() {
   );
   old_records.add_a(a1);
   e.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff {
-      records: old_records,
-      owned: on_v4_only(
+    crate::service::RenameGoodbyeHandoff::announced(
+      old_records,
+      on_v4_only(
         crate::service::EmittedRecords::new(
           true,
           true,
@@ -12372,7 +13054,7 @@ fn a_family_that_carried_nothing_owes_no_goodbye() {
         std::vec::Vec::new(),
         std::vec::Vec::new(),
       ),
-    },
+    ),
     now,
     false,
   );

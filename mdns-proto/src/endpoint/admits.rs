@@ -191,23 +191,38 @@ impl Admits {
       //         lapses. §8.1 is honoured late rather than never, and nothing is
       //         claimed in between — `conflict_classified_unresolved` withholds
       //         every claim to the name while the latch is pending.
-      //       * ESTABLISHED INSTANCE (`ProbeConflict`, row C): DROPPED, and
-      //         unchanged in effect — only the SITE moved, from the router into
-      //         the arm, because the pre-authoritative cell needs the same
-      //         record delivered. Deliberately not converted to a deferral: §9's
-      //         answer to a conflict is already defer-and-re-verify on the same
-      //         name behind `CONFLICT_REPROBE_MIN_INTERVAL`, so the cell is
-      //         near-free either way and widening the change would have taken
-      //         the blast radius past the cell that was actually broken.
+      //       * ESTABLISHED INSTANCE (`ProbeConflict`, row C): DELIVERED, and
+      //         the label buys NOTHING — §9's revert-to-probing runs exactly as
+      //         it would on an unlabelled record, on the same name and behind
+      //         `CONFLICT_REPROBE_MIN_INTERVAL`. This cell DROPPED the record
+      //         for one round, recorded here as a deliberate non-change on the
+      //         premise that §9 self-heals because a live incumbent's traffic
+      //         recurs. THAT PREMISE WAS FALSE, and §8.3 is what falsifies it: a
+      //         conforming responder announces "two or three times, at intervals
+      //         of at least one second" and is then SILENT until something
+      //         queries it. A screen that consumes those responses inside the
+      //         retention window consumes EVERY COPY THERE WAS, and nothing
+      //         replays a conflict when the window lapses — so §9's "MUST
+      //         immediately reset its conflicted unique record to probing state"
+      //         was not honoured late, it was not honoured at all, and duplicate
+      //         ownership of an ADVERTISED name stood until unrelated traffic
+      //         happened to arrive. Nor was the cell hard to reach: packet loss
+      //         over the successor's probes is enough to let it finish, and the
+      //         incumbent's next response then lands in row C instead of row B.
+      //         What our own delayed echo costs instead is that revert — one
+      //         rate-limited re-verification of a name we still hold, claiming
+      //         nothing while it runs, ending in a re-announcement because a
+      //         ghost cannot answer the re-probe. It cannot cost the name:
+      //         `probe_defeated` is the only path to a rename and the
+      //         pre-authoritative cell never latches it on a labelled record.
       //       * HOST (`HostConflict`, every row): DROPPED, in the router, and
       //         the screen stays fully load-bearing there. The consequence is
-      //         TERMINAL and caller-visible, and host-name probing is
-      //         unimplemented — so there is no re-probe whose silence could
-      //         convict a ghost, and no cheap reversible move to spend the
-      //         label on. When host-name probing lands, this cell must be
-      //         re-argued: it is the one place the false axiom is still being
-      //         relied on, and it is relied on only because nothing better
-      //         exists yet.
+      //         TERMINAL and caller-visible, and THE HOST NAME IS NEVER PROBED —
+      //         so there is no re-probe whose silence could convict a ghost, and
+      //         no cheap reversible move to spend the label on. When host-name
+      //         probing lands, this cell must be re-argued: it is the one place
+      //         the false axiom is still being relied on, and it is relied on
+      //         only because nothing better exists yet.
       //         WHAT IS DROPPED IS THE EVENT, NOT THE RECORD, and the two are
       //         only the same thing while one name wears one role. The fan-out
       //         tests the host rule first, so where a route's INSTANCE name IS
@@ -224,6 +239,26 @@ impl Admits {
       //         role to fall through to is skipped as before. Precedence chooses
       //         which EVENT a record becomes and may not decide it is no
       //         conflict at all.
+      //         AND THE FALL-THROUGH CARRIES THE HOST ROLE WITH IT
+      //         (`ConflictRole::InstanceAndHost`), because THIS CELL'S OWN
+      //         PREMISE IS FALSE FOR THIS OWNER. "The host name is never probed"
+      //         is what licenses the drop; when the host name IS the instance
+      //         name it is being probed, by an ANY question proposing exactly
+      //         these A/AAAA, so the re-verification the host cell lacks already
+      //         exists here and §9's reversible same-name reset can spend it.
+      //         Suppressing the host CONSEQUENCE does not unprove the host
+      //         AUTHORITY — the route publishes an RRset of that rrtype at that
+      //         name, which is §9's "currently authoritative" in as many words —
+      //         and delivering the record stripped of it made the two lifecycle
+      //         cells disagree about the same datagram: rows B / B′ deferred on
+      //         it, while row C asked `canonical_rdata_forms` (SRV, TXT, NSEC —
+      //         never an address) whether we assert it and dropped it silently.
+      //         Handled while probing, discarded once announced, and a live
+      //         incumbent's whole BOUNDED §8.3 burst consumed in between. So the
+      //         role travels with the record, the identical-rdata precondition
+      //         classifies it as a HOST record (an address we publish is §9's
+      //         "never inconsistent", which the instance classifier cannot even
+      //         read), and row C's instance-authority gate is not asked of it.
       //
       //     TRANSMITTED, not merely configured, and the distinction is the
       //     invariant's own boundary: the screen answers only for the record
@@ -235,6 +270,131 @@ impl Admits {
       //     successor announce over a peer that already holds the name — the
       //     opposite error, and the worse one. A relinquishment with no exposure
       //     at all therefore retains nothing.
+      //     AND TRANSMITTED BY MULTICAST, which is where the exposure record
+      //     stops being one fact and becomes two. "A peer may hold this record
+      //     FROM US" and "a copy of these bytes may still be ECHOING" were one
+      //     latch, and an RFC 6762 §6.7 LEGACY REPLY separates them: it is a
+      //     confirmed positive send of the FULL record set, so the first is true
+      //     of it and the §10.1 goodbye owes it a retraction — and it is
+      //     addressed to ONE resolver's ephemeral port, so the second is not,
+      //     because nothing re-broadcasts it to the group and this screen is
+      //     only ever asked about a MULTICAST arrival. A service whose only
+      //     positive send was such a reply therefore has no echo of its own
+      //     anywhere, and a row built from the wider fact disowned a GENUINE
+      //     peer's multicast A/AAAA — suppressing the host conflict for the
+      //     whole window — on the strength of bytes no multicast socket ever
+      //     carried. So `GoodbyeOwnership` keeps BOTH halves, every layer the
+      //     exposure crosses carries both, and only the narrower one reaches
+      //     this screen. The two are not interchangeable in either direction:
+      //     narrowing the goodbye's half would strand records in a legacy
+      //     querier's cache that nothing ever retracts.
+      //
+      //     THE REST OF THE CLAIM, AND WHAT HOLDS IT UP. This screen's answer
+      //     means "these exact bytes left this endpoint, on this family, by
+      //     multicast, in this generation, in this section, with this
+      //     cache-flush bit, and could still be echoing". Six qualifiers have
+      //     been added to it in five rounds — configured vs transmitted, which
+      //     family, whose, which destination class, which section, which
+      //     cache-flush bit — each because the record had claimed something it
+      //     could not justify. The dimensions BELOW are the ones where it still
+      //     could, and they are written down because three of them are true only
+      //     by an assumption made somewhere else:
+      //
+      //       * INTERFACE, and its IPv6 SCOPE half. The exposure's finest
+      //         spatial grain is `[v4, v6]`. `Transmit` carries no interface
+      //         (`src_ip` is `None` at every construction in this crate),
+      //         `TransmitDelivery` is two `FamilyDelivery`s, and
+      //         `EmittedRecords::aaaa` is a bare `Ipv6Addr` list even though
+      //         `ServiceRecords` knows each AAAA's scope id. The ARRIVAL side
+      //         knows more than the screen is told: `Received::interface_index`
+      //         reaches `Endpoint::handle` from PKTINFO and feeds ONLY
+      //         `src_matches_advertised` — `RouteEvents` is never given it, so
+      //         the screen reads `Family::of(src)` alone. This is sound TODAY
+      //         only because each family is one socket, which is a modelling
+      //         limitation and not a fact about mDNS. The moment a driver joins
+      //         the group on two interfaces per family, a record sent on one
+      //         link disowns an arrival on the other that cannot be its echo,
+      //         and closing it is a TWO-SIDED change: the send side must record
+      //         a link and the receive side must carry the one it already has.
+      //       * TIME, in the SOURCE-1 half. Sources 2 and 3 test their own
+      //         expiry; the resident-withdrawal-item source does not, so an item
+      //         screens for its whole residency. That is bounded by
+      //         `WITHDRAWAL_CEILING` plus however long the driver takes to call
+      //         `drain_completed_withdrawals` — a CALLER contract, not a bound
+      //         this module holds. A driver that stops draining leaves an item
+      //         screening past any window.
+      //       * TTL, which the canonical rdata form deliberately excludes, so a
+      //         §6.7-capped record and an announced one are byte-identical here.
+      //         That is right — §9's rule is over rdata — but it also means a
+      //         TTL=0 goodbye echo of our own bytes compares EQUAL, and what
+      //         stops it reaching this screen is the routing iterator's TTL=0
+      //         drop, three sites upstream, not anything here.
+      //       * PROBE vs ANNOUNCEMENT is already NARROWER than the claim, and
+      //         should stay so: `AwaitingConfirm::Probe` latches no exposure, so
+      //         `write_probe`'s Authority SRV / TXT / A / AAAA are outside this
+      //         record entirely. The resulting under-claim — our own probe echo
+      //         is never screened — is harmless because of invariant 1's
+      //         byte-symmetry on the instance half and the `HostConflict` arm's
+      //         `ConflictOrigin` gate on the host half, NOT because of anything
+      //         here. The envelope below now makes the same under-claim TWICE
+      //         over, since no rrtype is inside it in the Authority section, and
+      //         `the_envelope_is_the_one_the_encoders_actually_write` pins that
+      //         from the probe's side — but the reason it is harmless is still
+      //         the one above.
+      //
+      //     AND IN THE WIRE ENVELOPE THE ENCODER WROTE — the SECTION, and the
+      //     RFC 6762 §10.2 CACHE-FLUSH BIT. Both were open, both are now
+      //     enforced, and they are one qualifier in one place:
+      //     `respond::transmitted_envelope`, kept beside
+      //     `transmitted_rdata_forms` because "what this endpoint transmitted"
+      //     gets ONE description. `relinquished::asserts` and
+      //     `relinquished::identity_asserts` both ask it, so the two tiers
+      //     cannot answer differently, and `RouteEvents::relinquished_screens`
+      //     supplies the section off the SAME `RecordSlot` it caches under.
+      //     THE RULE IT ENFORCES: a class-IN record is this endpoint's echo only
+      //     if it arrives in the section this crate writes that rrtype in — the
+      //     ANSWER section for SRV / TXT / A / AAAA, the ADDITIONAL section for
+      //     the §6.1 instance NSEC, and no rrtype in the AUTHORITY section at
+      //     all — carrying the cache-flush bit those encoders set.
+      //     NEITHER CAN REJECT A REAL ECHO, which is why the narrowing is free.
+      //     An echo is a re-DELIVERY of a datagram, not a re-encoding of it: the
+      //     header counts that place a record in its section are ours and the
+      //     bit is bit 15 of the record's own class field, so a genuine echo
+      //     arrives in the section we wrote it in with the bit we set. A
+      //     mismatch therefore says "not our echo", and the two readings of that
+      //     agree — a conforming responder bundling its address into Additional
+      //     beside the SRV (RFC 6763 §12's own advice, and ordinary browse
+      //     traffic), or something that RE-ENCODED our bytes, which is a §9 twin
+      //     or a replaying peer and may not be disowned either.
+      //     WHAT THE SECTION HALF COST WHILE IT WAS OPEN: the terminal
+      //     `HostConflict`, on ordinary traffic and with no crafted case. QR=1
+      //     conflict routing walks Answer, Authority AND Additional into
+      //     `next_service_conflict`, and the host cell SUPPRESSES rather than
+      //     labels, so a peer's Additional-section A at our relinquished address
+      //     raised nothing at all for the whole retention window. The
+      //     cache-flush half ranks below it only because exploiting that one
+      //     needs a peer that declines to set a bit §10.2 asks it to set.
+      //     AND ONE OF THE TWO IS TRUE BY RULE, THE OTHER BY ACCIDENT, which is
+      //     the distinction a future change breaks first. The NSEC's section is
+      //     a rule with one home: `push_service_nsec` is the builder's only
+      //     `push_nsec_additional` caller and both positive multicast encoders
+      //     go through it. That A / AAAA / SRV / TXT are ANSWERS is an ACCIDENT
+      //     of how `write_announce` and `write_announce_filtered` happen to be
+      //     written — RFC 6763 §12 positively recommends the Additional-section
+      //     bundle this crate declines to write, so the day an encoder adopts it
+      //     the description must move with it. `the_envelope_is_the_one_the_
+      //     encoders_actually_write` runs both encoders and puts every record
+      //     they emit to the envelope at the section it actually landed in, so
+      //     the accident fails a test rather than silently losing the screen.
+      //     THE DESCRIPTION IS DERIVED FROM THE RRTYPE, NOT STORED PER ROW, and
+      //     that is deliberate: the exact tier keeps a whole `ServiceRecords`
+      //     plus `EmittedRecords` and has nowhere to put a per-identity section,
+      //     so storing one in the compact tier alone would let the two tiers
+      //     disagree about the same generation — the error this invariant
+      //     forbids by name. The cost is that an encoder change applies
+      //     RETROACTIVELY to rows retained before it, for at most one retention
+      //     window; that is the change's own re-argument to make, and it is
+      //     listed below.
       //     AND IN THE EXACT RDATA FORM THE ENCODER WROTE, which is the same
       //     boundary one dimension further in and the place the two screens part
       //     company. The exposure says which RRTYPES went out; it does not say
@@ -374,14 +534,18 @@ impl Admits {
       //     through role precedence, which is a suppression wearing an
       //     ordering's clothes; the same cell latching
       //     `probe_defeated` rather than `tiebreak_lost` on a labelled record,
-      //     which renames on a switch echo and gives up the name §8.2 keeps; a
-      //     labelled `ProbeConflict` reaching a service WITHOUT the established
-      //     arm's drop, which would let this endpoint's own recent past push an
-      //     established service back into probing; the §8.2 deferral ceasing to
-      //     hold the name — the bound on the labelled loop is the retention
-      //     window lapsing, not the peer falling silent, and it is only safe
-      //     because `conflict_classified_unresolved` claims nothing while it
-      //     runs; a retention window (`EndpointConfig::relinquished_retention`)
+      //     which renames on a switch echo and gives up the name §8.2 keeps; THE
+      //     ESTABLISHED INSTANCE CELL SCREENING ON THE LABEL AGAIN — a
+      //     `ProbeConflict` dropped, deferred, or exempted by any other means in
+      //     the `Announcing | Established` arm for carrying
+      //     `ConflictHistory::Relinquished`, which withholds §9's immediate
+      //     reset from a peer whose §8.3 burst is BOUNDED and never repeated, so
+      //     the retention window swallows the conflict entire rather than
+      //     delaying it; the §8.2 deferral ceasing to hold the name — the bound
+      //     on the labelled loop is the retention window lapsing, not the peer
+      //     falling silent, and it is only safe because
+      //     `conflict_classified_unresolved` claims nothing while it runs; a
+      //     retention window (`EndpointConfig::relinquished_retention`)
       //     shorter than the driver's own self-send recency window, which would
       //     leave a stretch where the echo is neither recognised nor screened;
       //     `relinquished::asserts` drifting from
@@ -397,17 +561,42 @@ impl Admits {
       //     of `transmitted_rdata_forms`, `transmitted_rdata_forms` widening to
       //     a form `write_announce` / `write_probe` / `push_service_nsec` never
       //     writes, or `respond::emitted_nsec_identity` drifting from the bitmap
-      //     `push_service_nsec` actually emits; `relinquished::
+      //     `push_service_nsec` actually emits; EITHER TIER READING AN ENVELOPE
+      //     THIS CRATE DOES NOT WRITE — `respond::transmitted_envelope` widened
+      //     to a section or a cleared cache-flush bit no positive MULTICAST
+      //     encoder produces (a §6.7 legacy reply clears the bit, and it is
+      //     outside the exposure this screen reads for a different reason
+      //     already), a call site passing the ITERATOR's `section` phase in
+      //     place of the visited record's own `RecordSlot::section`, or
+      //     `asserts` / `identity_asserts` ceasing to ask it, which un-narrows
+      //     one tier and makes the two disagree; AN ENCODER MOVING A
+      //     SCREEN-ELIGIBLE RECORD BETWEEN SECTIONS OR DROPPING ITS CACHE-FLUSH
+      //     BIT WITHOUT MOVING `transmitted_envelope` WITH IT — `write_announce`
+      //     or `write_announce_filtered` adopting RFC 6763 §12's
+      //     Additional-section address bundle, or a second
+      //     `push_nsec_additional` call site appearing, either of which stops
+      //     the screen recognising this endpoint's own echo (and note the
+      //     description is per RRTYPE, so the change applies retroactively to
+      //     rows already retained, for up to one retention window);
+      //     `relinquished::
       //     identities` decomposing a set into anything but what
       //     `relinquished::asserts` would have answered for, which makes the
       //     tiers disagree about the same generation; the exposure inputs
-      //     ceasing to mean "confirmed emitted BY THAT FAMILY" —
+      //     ceasing to mean "confirmed emitted BY MULTICAST ON THAT FAMILY" —
       //     `GoodbyeOwnership` latching from anything but a delivered send, a
       //     latch keyed on `TransmitDelivery::any_delivered` rather than
       //     `delivered_on`, any layer collapsing the `[v4, v6]` exposure pair
       //     back into one aggregate, or a screen call site that does not pass
       //     the ARRIVING datagram's family — or a retain site passing a
-      //     CONFIGURED record set in place of the snapshot's; A COMPACT
+      //     CONFIGURED record set in place of the snapshot's; THE TWO EXPOSURE
+      //     HALVES BEING COLLAPSED BACK INTO ONE — a screen or retain site
+      //     reading `WithdrawalSnapshot::owned` / `RenameGoodbyeHandoff::owned`
+      //     / `WithdrawalItem::owned` where it owes the `multicast` half, a
+      //     `SendClass` derived from lifecycle state rather than carried on the
+      //     commit token that named the destination, a positive send stamping
+      //     `SendClass::Multicast` for a datagram not addressed to the group, or
+      //     the goodbye's half narrowed to the screen's, which strands a legacy
+      //     querier's cached records with nothing to retract them; A COMPACT
       //     IDENTITY'S PER-FAMILY WINDOW reduced to one expiry — whether beside
       //     a presence mask or on its own — or a merge that writes a
       //     generation's expiry onto a family that generation did not reach, or
