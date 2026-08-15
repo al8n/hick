@@ -1,5 +1,6 @@
 use super::{
-  BindError, BufferTooShortDetail, InterfaceNotFoundDetail, JoinError, ParseRecvMetaError,
+  BindError, BufferTooShortDetail, InterfaceNotFoundDetail, JoinError,
+  MulticastLoopNotAppliedDetail, MulticastTtlNotAppliedDetail, ParseRecvMetaError,
 };
 
 #[test]
@@ -14,6 +15,25 @@ fn detail_accessors_and_display() {
   assert_eq!(
     b.to_string(),
     "cmsg buffer too short: needed 20 bytes, had 8"
+  );
+
+  // The two IPv4 multicast scalar read-backs report per option, so each carries
+  // its own requested/observed pair and names its own option in the message a
+  // failed bind logs.
+  let l = MulticastLoopNotAppliedDetail::new(true, false);
+  assert!(l.requested());
+  assert!(!l.observed());
+  assert_eq!(
+    l.to_string(),
+    "IPv4 multicast loopback not applied: requested true, observed false"
+  );
+
+  let t = MulticastTtlNotAppliedDetail::new(255, 0);
+  assert_eq!(t.requested(), 255);
+  assert_eq!(t.observed(), 0);
+  assert_eq!(
+    t.to_string(),
+    "IPv4 multicast TTL not applied: requested 255, observed 0"
   );
 }
 

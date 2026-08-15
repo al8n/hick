@@ -2512,3 +2512,210 @@ fn production_ipv4_multicast_setters_are_accepted_and_held_by_this_kernel() {
   );
   evidence_complete("production_ipv4_multicast_setters_are_accepted_and_held_by_this_kernel");
 }
+
+/// `verify_multicast_loop_v4`'s COMPARISON, in isolation: a socket whose real
+/// `IP_MULTICAST_LOOP` no longer matches what was requested must be rejected.
+///
+/// It proves the comparison and NOT the call site — deleting
+/// `verify_multicast_loop_v4(&std_sock, ..)` from `try_bind_v4_inner` leaves this
+/// test green, since the helper it calls still exists and still works. See
+/// `try_bind_v4_rejects_a_multicast_loop_mismatch_forced_through_production_wiring`
+/// for the wiring half.
+///
+/// The drift is honest rather than fabricated: it moves the REAL kernel state
+/// with the crate's own (correct) setter, so the read-back is reporting what the
+/// kernel really holds — the observable shape of both failures the verifier
+/// guards.
+///
+/// An ephemeral port, not `:5353`: this establishes an option's round-trip and
+/// needs no particular port, and staying off 5353 keeps it clear of the
+/// reuse-group lottery documented on `bind_ephemeral_with_rx_metadata`.
+#[test]
+fn verify_multicast_loop_v4_rejects_a_kernel_value_that_drifted_from_the_request() {
+  let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect(
+    "binding an ephemeral UDP socket must succeed: this test's subject is a sockopt round-trip, \
+     so a bind that did not happen is a failure and never a skip",
+  );
+  let requested = true;
+  crate::platform::set_multicast_loop_v4(&sock, requested)
+    .expect("the crate's own IP_MULTICAST_LOOP setter must be accepted by this kernel");
+  verify_multicast_loop_v4(&sock, requested)
+    .expect("a socket that just took the requested value must verify against it");
+
+  // Move the real kernel value away from `requested`, through the same setter
+  // production uses.
+  crate::platform::set_multicast_loop_v4(&sock, !requested)
+    .expect("re-applying the opposite loopback state for this simulation must itself succeed");
+
+  let err = verify_multicast_loop_v4(&sock, requested).expect_err(
+    "a socket whose real IP_MULTICAST_LOOP no longer matches `requested` must be rejected, not \
+     silently accepted",
+  );
+  let detail = err
+    .try_unwrap_multicast_loop_not_applied()
+    .expect("expected BindError::MulticastLoopNotApplied");
+  assert_eq!(detail.requested(), requested);
+  assert_eq!(detail.observed(), !requested);
+}
+
+/// `verify_multicast_ttl_v4`'s COMPARISON, in isolation. The twin of the
+/// `IP_MULTICAST_LOOP` test above, which carries the reasoning; the value drifts
+/// to 0, which is the value a big-endian wrong-width `setsockopt` would leave
+/// behind and the one under which nothing this endpoint sends ever reaches the
+/// wire.
+#[test]
+fn verify_multicast_ttl_v4_rejects_a_kernel_value_that_drifted_from_the_request() {
+  let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect(
+    "binding an ephemeral UDP socket must succeed: this test's subject is a sockopt round-trip, \
+     so a bind that did not happen is a failure and never a skip",
+  );
+  let requested = 255u8;
+  crate::platform::set_multicast_ttl_v4(&sock, requested)
+    .expect("the crate's own IP_MULTICAST_TTL setter must be accepted by this kernel");
+  verify_multicast_ttl_v4(&sock, requested)
+    .expect("a socket that just took the requested value must verify against it");
+
+  let drifted = 0u8;
+  crate::platform::set_multicast_ttl_v4(&sock, drifted)
+    .expect("re-applying a different multicast TTL for this simulation must itself succeed");
+
+  let err = verify_multicast_ttl_v4(&sock, requested).expect_err(
+    "a socket whose real IP_MULTICAST_TTL no longer matches `requested` must be rejected, not \
+     silently accepted",
+  );
+  let detail = err
+    .try_unwrap_multicast_ttl_not_applied()
+    .expect("expected BindError::MulticastTtlNotApplied");
+  assert_eq!(detail.requested(), requested);
+  assert_eq!(detail.observed(), u32::from(drifted));
+}
+
+/// The `IP_MULTICAST_LOOP` read-back is CALLED BY `try_bind_v4`, proven through
+/// the public API with the `FORCE_APPLIED_MULTICAST_LOOP_V4` seam making the
+/// value actually applied to the kernel differ from the value the caller asked
+/// for.
+///
+/// Only this proves the CALL SITE. The comparison test above would keep passing
+/// with the call deleted, and so would every other test on a healthy kernel: on
+/// a correct one no input reachable through `MulticastOptionsV4` can make the
+/// setter and the verifier disagree, which is why a seam is unavoidable and why
+/// the alternative is reintroducing a real bug. The call site is the whole of
+/// what a big-endian target has in place of a runner, and this project has no
+/// such runner anywhere.
+///
+/// Does NOT route `try_bind_v4`'s result through `expect_bind_or_skip`, which
+/// treats every non-`Io` `BindError` as a failure — including the
+/// `MulticastLoopNotApplied` this test exists to see. It open-codes the same
+/// allowlist for the one legitimate non-regression outcome (the environment
+/// refused the bind outright, so the verifier was never reached) and treats
+/// everything else — an unexpected `Ok`, or any other variant — as a failure.
+#[test]
+fn try_bind_v4_rejects_a_multicast_loop_mismatch_forced_through_production_wiring() {
+  let opts = MulticastOptionsV4::new(0);
+  let requested = opts.multicast_loop();
+
+  FORCE_APPLIED_MULTICAST_LOOP_V4.with(|cell| cell.set(Some(!requested)));
+  let result = try_bind_v4(opts);
+  // Reset before anything below can fail an assertion, so the override never
+  // leaks into a later test on this thread even on an early failure here. The
+  // FreeBSD CI job runs `--test-threads=1`, so "a later test on this thread"
+  // means every test that follows.
+  FORCE_APPLIED_MULTICAST_LOOP_V4.with(|cell| cell.set(None));
+
+  let err = match result {
+    Err(BindError::Io(e)) if is_environment_refusal(&e) => {
+      eprintln!("skipping: environment refused the IPv4 bind needed to exercise this seam ({e})");
+      return;
+    }
+    other => other.expect_err(
+      "try_bind_v4 must reject a bind whose IP_MULTICAST_LOOP read-back disagrees with what was \
+       requested — an Ok here means either the verify_multicast_loop_v4 call was removed from \
+       try_bind_v4_inner or its comparison no longer detects a real disagreement",
+    ),
+  };
+  let detail = err.try_unwrap_multicast_loop_not_applied().expect(
+    "expected BindError::MulticastLoopNotApplied — a different variant means try_bind_v4 failed \
+     for a reason unrelated to the forced loopback mismatch",
+  );
+  assert_eq!(detail.requested(), requested);
+  assert_eq!(detail.observed(), !requested);
+}
+
+/// The `IP_MULTICAST_TTL` read-back is CALLED BY `try_bind_v4`. The twin of the
+/// `IP_MULTICAST_LOOP` wiring test above, which carries the reasoning.
+///
+/// A separate seam and a separate test because the two options are set by two
+/// independent `setsockopt` calls: forcing one proves nothing about the other's
+/// call site, and a bundled override would let one test appear to cover both.
+#[test]
+fn try_bind_v4_rejects_a_multicast_ttl_mismatch_forced_through_production_wiring() {
+  let opts = MulticastOptionsV4::new(0);
+  let requested = opts.ttl();
+  // 255 wraps to 0 — the value a big-endian wrong-width setsockopt would leave
+  // behind, and one no `MulticastOptionsV4` input could produce here.
+  let forced = requested.wrapping_add(1);
+
+  FORCE_APPLIED_MULTICAST_TTL_V4.with(|cell| cell.set(Some(forced)));
+  let result = try_bind_v4(opts);
+  // Reset before any assertion below, for the reason the loop twin documents.
+  FORCE_APPLIED_MULTICAST_TTL_V4.with(|cell| cell.set(None));
+
+  let err = match result {
+    Err(BindError::Io(e)) if is_environment_refusal(&e) => {
+      eprintln!("skipping: environment refused the IPv4 bind needed to exercise this seam ({e})");
+      return;
+    }
+    other => other.expect_err(
+      "try_bind_v4 must reject a bind whose IP_MULTICAST_TTL read-back disagrees with what was \
+       requested — an Ok here means either the verify_multicast_ttl_v4 call was removed from \
+       try_bind_v4_inner or its comparison no longer detects a real disagreement",
+    ),
+  };
+  let detail = err.try_unwrap_multicast_ttl_not_applied().expect(
+    "expected BindError::MulticastTtlNotApplied — a different variant means try_bind_v4 failed \
+     for a reason unrelated to the forced TTL mismatch",
+  );
+  assert_eq!(detail.requested(), requested);
+  assert_eq!(detail.observed(), u32::from(forced));
+}
+
+/// The `IP_MULTICAST_IF` read-back's DECISION, over values rather than over a
+/// socket: it reports a different address and a failed read, and stays silent on
+/// agreement.
+///
+/// Deliberately not driven through a real socket, and that is the whole point of
+/// the split signature. The GET direction's round-trip semantics could not be
+/// established from source for FreeBSD, DragonFly, OpenBSD or NetBSD — a kernel
+/// answering with the interface's primary address, or with `INADDR_ANY`, would
+/// look like a drift — so a live assertion would be a test that can fail on a
+/// conforming host, which is exactly the false positive that made this option
+/// warn-only rather than fatal.
+///
+/// The other half of the policy needs no test: `warn_if_multicast_if_v4_drifted`
+/// returns `bool`, so there is no error for `try_bind_v4_inner` to propagate and
+/// no way for this read-back to fail a bind without someone changing the
+/// signature first.
+#[test]
+fn multicast_if_v4_read_back_reports_a_drift_and_a_failed_read() {
+  // TEST-NET-1 (RFC 5737), so nothing here can be mistaken for a real host's
+  // address in a log line.
+  let requested = Ipv4Addr::new(192, 0, 2, 1);
+  let other = Ipv4Addr::new(192, 0, 2, 2);
+
+  assert!(
+    !warn_if_multicast_if_v4_drifted(requested, Ok(requested)),
+    "a kernel holding exactly what was asked for is not a drift and must stay silent"
+  );
+  assert!(
+    warn_if_multicast_if_v4_drifted(requested, Ok(other)),
+    "a kernel reporting a different egress address must be reported"
+  );
+  assert!(
+    warn_if_multicast_if_v4_drifted(
+      requested,
+      Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+    ),
+    "a read-back that could not run leaves the egress interface unconfirmed, which is also worth \
+     a line — and, as with a drift, is not worth failing the bind over"
+  );
+}

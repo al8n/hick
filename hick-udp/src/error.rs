@@ -85,6 +85,77 @@ impl MulticastHopsNotAppliedDetail {
   }
 }
 
+/// Detail for [`BindError::MulticastLoopNotApplied`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
+#[display("IPv4 multicast loopback not applied: requested {requested}, observed {observed}")]
+pub struct MulticastLoopNotAppliedDetail {
+  requested: bool,
+  observed: bool,
+}
+impl MulticastLoopNotAppliedDetail {
+  /// Build a new detail payload.
+  // Constructed only by the Unix `try_bind_v4` read-back path; Windows sets
+  // this option through `socket2` at a fixed `DWORD` width, so there is no
+  // width ambiguity to read back there.
+  #[cfg_attr(not(unix), allow(dead_code))]
+  #[inline(always)]
+  pub(crate) const fn new(requested: bool, observed: bool) -> Self {
+    Self {
+      requested,
+      observed,
+    }
+  }
+  /// The `IP_MULTICAST_LOOP` state that was requested via `setsockopt`.
+  #[inline(always)]
+  pub const fn requested(&self) -> bool {
+    self.requested
+  }
+  /// The state `getsockopt` reports the kernel actually holds, read back
+  /// immediately after the `setsockopt` call that was supposed to set
+  /// `requested`.
+  #[inline(always)]
+  pub const fn observed(&self) -> bool {
+    self.observed
+  }
+}
+
+/// Detail for [`BindError::MulticastTtlNotApplied`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display, thiserror::Error)]
+#[display("IPv4 multicast TTL not applied: requested {requested}, observed {observed}")]
+pub struct MulticastTtlNotAppliedDetail {
+  requested: u8,
+  observed: u32,
+}
+impl MulticastTtlNotAppliedDetail {
+  /// Build a new detail payload.
+  // Constructed only by the Unix `try_bind_v4` read-back path; see the loop
+  // twin above.
+  #[cfg_attr(not(unix), allow(dead_code))]
+  #[inline(always)]
+  pub(crate) const fn new(requested: u8, observed: u32) -> Self {
+    Self {
+      requested,
+      observed,
+    }
+  }
+  /// The `IP_MULTICAST_TTL` value that was requested via `setsockopt`. A `u8`
+  /// because a TTL is a byte on the wire and RFC 6762 §11 wants 255.
+  #[inline(always)]
+  pub const fn requested(&self) -> u8 {
+    self.requested
+  }
+  /// The value `getsockopt` reports the kernel actually holds, read back
+  /// immediately after the `setsockopt` call that was supposed to set
+  /// `requested`. Kept at the width the read-back reports rather than narrowed
+  /// to `u8`: this field exists only to describe a value that has already
+  /// failed to be what was asked for, and truncating it could mask how wrong
+  /// it is.
+  #[inline(always)]
+  pub const fn observed(&self) -> u32 {
+    self.observed
+  }
+}
+
 /// Detail for [`BindError::RxDestinationNotEnabled`].
 ///
 /// Both fields are the raw values `getsockopt` reported for `IP_RECVDSTADDR`
@@ -169,6 +240,28 @@ pub enum BindError {
   /// read-back shows it did not actually apply the requested value.
   #[error(transparent)]
   MulticastHopsNotApplied(MulticastHopsNotAppliedDetail),
+
+  /// The kernel accepted the `IP_MULTICAST_LOOP` `setsockopt` call, but a
+  /// read-back shows it did not actually apply the requested value.
+  ///
+  /// Unix only. The IPv4 sibling of [`BindError::MulticastHopsNotApplied`],
+  /// raised per option rather than bundled with the TTL below so a report says
+  /// WHICH scalar the kernel did not take. See
+  /// `multicast::verify_multicast_loop_v4` for the two failures it guards: a
+  /// wrong-width `setsockopt` on a big-endian host, and any future re-route of
+  /// this setter onto a wrong level or a wrong constant, which is silent on
+  /// every target.
+  #[error(transparent)]
+  MulticastLoopNotApplied(MulticastLoopNotAppliedDetail),
+
+  /// The kernel accepted the `IP_MULTICAST_TTL` `setsockopt` call, but a
+  /// read-back shows it did not actually apply the requested value.
+  ///
+  /// Unix only, and the twin of [`BindError::MulticastLoopNotApplied`] — see
+  /// there. RFC 6762 §11 requires 255, and the value this failure leaves behind
+  /// is typically the kernel default of 1 or a 0 that never leaves the host.
+  #[error(transparent)]
+  MulticastTtlNotApplied(MulticastTtlNotAppliedDetail),
 
   /// The kernel accepted the `IP_RECVDSTADDR` / `IP_RECVIF` `setsockopt` calls,
   /// but a read-back shows at least one of them is not actually enabled.
