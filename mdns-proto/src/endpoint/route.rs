@@ -390,8 +390,12 @@ where
     // THE RELINQUISHED-RRSET SCREEN. See the note on the same call in
     // `next_service_conflict`: a record this endpoint recently asserted and gave
     // up is ours whatever a driver's send log did or did not recognise, and the
-    // service that now holds the owner name cannot know that.
-    if self.endpoint.relinquished_asserts(r, self.now) {
+    // service that now holds the owner name cannot know that. Asked of the
+    // family this datagram ARRIVED on, for the reason given there.
+    if self
+      .endpoint
+      .relinquished_asserts(r, self.now, crate::transmit::Family::of(self.src))
+    {
       return None;
     }
     for (key, route) in self.endpoint.services.iter() {
@@ -450,7 +454,16 @@ where
     // recognition state is evicted under traffic while the obligation is per
     // copy. This screen turns on none of that — it reads what this endpoint
     // published and gave up.
-    if self.endpoint.relinquished_asserts(r, self.now) {
+    //
+    // ASKED OF THIS DATAGRAM'S OWN FAMILY. A multicast datagram travels back
+    // over a socket that carried it out, so a record only IPv4 ever transmitted
+    // can hold no IPv6 echo — and disowning one would be silencing a GENUINE
+    // peer's conflict purely for agreeing with a transmission that family never
+    // saw.
+    if self
+      .endpoint
+      .relinquished_asserts(r, self.now, crate::transmit::Family::of(self.src))
+    {
       return None;
     }
     for (key, route) in self.endpoint.services.iter() {

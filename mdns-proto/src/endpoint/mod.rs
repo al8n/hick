@@ -23,7 +23,7 @@ mod receive;
 mod received;
 pub use received::{Provenance, Received};
 mod relinquished;
-use relinquished::Relinquished;
+use relinquished::{Relinquished, RelinquishedIdentity};
 mod service;
 mod withdrawal;
 
@@ -325,8 +325,8 @@ cfg_heap! {
   ///     to the driver. Only these items withdraw host A/AAAA (and so honour
   ///     sibling host-address retention).
   ///   * `None` — a DETACHED item (a renamed-away OLD name). It owns no route and
-  ///     no host addresses (`host_a`/`host_aaaa` are always empty); when it settles
-  ///     it is simply removed, reported to NOBODY.
+  ///     no host addresses (both halves of `owned` carry empty address lists);
+  ///     when it settles it is simply removed, reported to NOBODY.
   ///
   /// Stored as a parallel `Vec` rather than inline on [`ServiceRoute`] because
   /// `ServiceRoute` has no generic parameter: it is a public struct used by
@@ -338,24 +338,33 @@ cfg_heap! {
     // Read by `poll_withdrawal_transmit`.
     #[allow(dead_code)]
     records: crate::records::ServiceRecords,
-    /// Which instance record kinds (PTR/SRV/TXT/subtypes) this name put on the
-    /// wire — only these are withdrawn (§7.1 KAS can suppress a subset).
+    /// What this name put on EACH family's wire and still owes a retraction for
+    /// — `[v4, v6]`, instance record kinds (PTR/SRV/TXT/subtypes, plus the §6.1
+    /// NSEC exposure) and host addresses together. Only these are withdrawn
+    /// (§7.1 KAS can suppress a subset, and a fan-out's two sends can differ in
+    /// what each family accepted), and only from the family that carried them.
+    ///
+    /// It starts as the exposure exactly and only ever NARROWS: a reclaimable
+    /// detached item is trimmed to the shared records a same-name replacement's
+    /// announcement cannot supersede (see
+    /// [`Endpoint::note_service_announced`]). Narrowing is the safe direction
+    /// for both readers — a goodbye retracts less, and the relinquished screen
+    /// disowns less — while widening it past what was emitted is what
+    /// `EmittedRecords` exists to prevent.
+    ///
+    /// A detached item's address lists are ALWAYS empty on both halves
+    /// (`route == None`) — a rename never withdraws host A/AAAA, the host name
+    /// being invariant across renames.
     #[allow(dead_code)]
-    owned: crate::service::EmittedRecords,
-    /// Host A (IPv4) addresses confirmed-emitted; sibling-filtered per round before
-    /// encoding. ALWAYS empty for a detached item (`route == None`) — a rename
-    /// never withdraws host A/AAAA (the host name is invariant across renames).
-    #[allow(dead_code)]
-    host_a: std::vec::Vec<Ipv4Addr>,
-    /// Host AAAA (IPv6) addresses confirmed-emitted. Always empty for a detached
-    /// item (see `host_a`).
-    #[allow(dead_code)]
-    host_aaaa: std::vec::Vec<Ipv6Addr>,
+    owned: [crate::service::EmittedRecords; 2],
     /// PER-FAMILY goodbye-send debt: `[0]` IPv4, `[1]` IPv6, each initialised to
-    /// `WITHDRAWAL_SENDS` (or `[0, 0]` when this name has nothing to withdraw —
-    /// never announced, no host addrs). A family's counter is decremented only when
-    /// THAT family confirms a send ([`WithdrawalSend::Sent`]) and zeroed on a
-    /// permanent write-off ([`WithdrawalSend::WriteOff`]).
+    /// `WITHDRAWAL_SENDS` for a family that actually carried something and to `0`
+    /// for one that did not — a family with nothing in its peers' caches has
+    /// nothing to retract, and sending it a TTL=0 goodbye for records it never
+    /// heard can cache-flush a peer's matching shared record. A family's counter
+    /// is decremented only when THAT family confirms a send
+    /// ([`WithdrawalSend::Sent`]) and zeroed on a permanent write-off
+    /// ([`WithdrawalSend::WriteOff`]).
     // Read and mutated by `note_withdrawal_result`.
     #[allow(dead_code)]
     owed: [u8; 2],
@@ -614,18 +623,19 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   /// `Pool<ServiceRoute>` declaration.
   #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
   relinquished: std::vec::Vec<Relinquished<I>>,
-  /// The deadline of a relinquishment this endpoint could NOT record, because
+  /// The COMPACT tier of the same screen: the record IDENTITIES of
+  /// relinquishments that arrived while
   /// [`relinquished::MAX_RELINQUISHED_RRSETS`] was reached with every row still
   /// live.
   ///
-  /// While it is in the future [`Self::relinquished_asserts`] answers `true` for
-  /// every candidate, so no conflict is built at all: an endpoint that cannot
-  /// say "that record was not ours" must not say the opposite either. ONE
-  /// deadline rather than a list of the affected owners, so this backstop cannot
-  /// itself overflow. `None` is the state of every normally-operating endpoint —
-  /// see [`Self::retain_relinquished`] for what it takes to leave it.
+  /// An identity is `(owner name, rrtype, canonical rdata)` — the whole of what
+  /// [`Self::relinquished_asserts`] ever asks — so this answers exactly what a
+  /// row would have, decomposed once at the relinquishment instead of
+  /// regenerated per candidate record. Empty on every normally-operating
+  /// endpoint. See [`Self::retain_relinquished`] for why capacity exhaustion
+  /// degrades HERE, per identity, rather than endpoint-wide.
   #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
-  relinquished_quarantine_until: Option<I>,
+  relinquished_identities: std::vec::Vec<RelinquishedIdentity<I>>,
   #[cfg(feature = "stats")]
   stats: std::sync::Arc<hick_trace::stats::Stats>,
   /// Real time to burn inside the next [`Self::poll_query_transmit`], between
@@ -681,7 +691,7 @@ where
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       relinquished: std::vec::Vec::new(),
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
-      relinquished_quarantine_until: None,
+      relinquished_identities: std::vec::Vec::new(),
       #[cfg(feature = "stats")]
       stats,
       #[cfg(all(test, feature = "std"))]

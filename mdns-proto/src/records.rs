@@ -222,6 +222,27 @@ impl ServiceRecords {
     Ok(self)
   }
 
+  /// Drop every RFC 6763 §7.1 subtype browse name `keep` rejects.
+  ///
+  /// Crate-internal, and for ONE caller: a detached rename goodbye that a
+  /// same-name replacement has PARTLY superseded keeps draining for the subtype
+  /// PTRs the replacement does not publish, so its record set must stop naming
+  /// the ones it does. See
+  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced).
+  ///
+  /// This narrows what a set ADVERTISES and nothing else. A subtype PTR is a
+  /// shared record at its own browse name, so dropping one drops a record this
+  /// set answers for and retracts — never one another set holds. The common case
+  /// rebuilds nothing: `keep` accepting every name leaves the sealed slice
+  /// untouched, so a set with no subtypes, or one whose subtypes all survive,
+  /// pays no allocation.
+  pub(crate) fn retain_subtypes(&mut self, keep: impl Fn(&Name) -> bool) {
+    if self.subtypes.iter().all(&keep) {
+      return;
+    }
+    self.subtypes = self.subtypes.iter().filter(|n| keep(n)).cloned().collect();
+  }
+
   /// Set SRV priority.
   pub fn set_priority(&mut self, v: u16) -> &mut Self {
     self.priority = v;

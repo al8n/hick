@@ -104,7 +104,8 @@ cfg_heap! {
 cfg_heap! {
   #[allow(unused_imports)]
   pub(crate) use respond::{
-    EmittedRecords, canonical_rdata_forms, instance_rtype_exposed, multicast_dst, write_goodbye,
+    EmittedRecords, INSTANCE_CANONICAL_RTYPES, canonical_rdata_forms, instance_rtype_exposed,
+    multicast_dst, transmitted_rdata_forms, write_goodbye,
   };
 }
 #[allow(unused_imports)]
@@ -412,28 +413,57 @@ cfg_heap! {
   /// record). Per-record (not per-group) granularity closes the over-withdrawal
   /// class where §7.1 trims a subset of a group or a legacy reply emits a whole
   /// group the per-group latch mis-attributed.
+  ///
+  /// # …and PER FAMILY, for the same reason
+  ///
+  /// Every latch here is a `[v4, v6]` mask rather than a bool, because delivery
+  /// is per family and "peers may hold this record from us" is therefore a
+  /// per-family fact. A fan-out is two sends and either may be refused, so an
+  /// announcement IPv6 never carried put nothing in any IPv6 peer's cache. Two
+  /// things go wrong the moment the pair is collapsed into one bit:
+  ///
+  /// * the §10.1 goodbye withdraws records on a family that never heard them,
+  ///   which can cache-flush a peer's matching shared record — the very class
+  ///   the per-record granularity above exists to close, one level down;
+  /// * `Endpoint::relinquished_asserts` disowns an IPv6 arrival as an echo of an
+  ///   IPv4-only transmission. It cannot be one — a loopback copy comes back
+  ///   over a socket that carried the datagram out — so the screen would be
+  ///   silencing a GENUINE peer's §8.1 or §9 conflict.
   #[derive(Debug, Default, Clone)]
   struct GoodbyeOwnership {
-    /// The instance PTR (service-type → instance) has been advertised. RESET on a
-    /// conflict rename (the new instance name has not been advertised).
-    ptr: bool,
-    /// The instance SRV has been advertised. Reset on rename.
-    srv: bool,
-    /// The instance TXT has been advertised. Reset on rename.
-    txt: bool,
-    /// The RFC 6763 §7.1 subtype PTRs (`<sub>._sub.<type>` → instance) have been
-    /// advertised. Instance-associated (target = instance), so RESET on rename and
-    /// withdrawn with the instance records. All-or-nothing — subtype PTRs are not
-    /// KAS-filtered, so they are always emitted together.
-    subtypes: bool,
-    /// Host A addresses advertised FROM US, tracked per address. SURVIVES a
-    /// conflict rename: the host name is invariant across instance renames, so
-    /// peers keep caching the host records.
+    /// Which families the instance PTR (service-type → instance) has been
+    /// advertised on. RESET on a conflict rename (the new instance name has not
+    /// been advertised).
+    ptr: [bool; 2],
+    /// Which families the instance SRV has been advertised on. Reset on rename.
+    srv: [bool; 2],
+    /// Which families the instance TXT has been advertised on. Reset on rename.
+    txt: [bool; 2],
+    /// Which families the RFC 6763 §7.1 subtype PTRs (`<sub>._sub.<type>` →
+    /// instance) have been advertised on. Instance-associated (target =
+    /// instance), so RESET on rename and withdrawn with the instance records.
+    /// All-or-nothing per send — subtype PTRs are not KAS-filtered, so they are
+    /// always emitted together.
+    subtypes: [bool; 2],
+    /// Host A addresses advertised FROM US, tracked per address — the UNION over
+    /// families, which is what [`Service::advertised_a_addrs`] reports for the
+    /// endpoint's sibling-address retention (a union question: an address ANY
+    /// live sibling still advertises must not be withdrawn). SURVIVES a conflict
+    /// rename: the host name is invariant across instance renames, so peers keep
+    /// caching the host records.
     a: std::vec::Vec<core::net::Ipv4Addr>,
+    /// Which families carried `a[i]`, index for index. Only [`Self::latch_addr`]
+    /// writes either vector, so the two cannot desync; [`Self::project`] reads
+    /// them through `zip`, which stops at the shorter one, so a missing mask
+    /// reads as "no family carried it" — the direction that withdraws less and
+    /// screens less.
+    a_on: std::vec::Vec<[bool; 2]>,
     /// Host AAAA addresses advertised FROM US, tracked per address. Survives rename.
     aaaa: std::vec::Vec<core::net::Ipv6Addr>,
-    /// The RFC 6762 §6.1 instance NSEC has been put on the wire. Reset on rename
-    /// (the NSEC is owned by the INSTANCE name).
+    /// Which families carried `aaaa[i]`, index for index. See [`Self::a_on`].
+    aaaa_on: std::vec::Vec<[bool; 2]>,
+    /// Which families the RFC 6762 §6.1 instance NSEC has gone out on. Reset on
+    /// rename (the NSEC is owned by the INSTANCE name).
     ///
     /// Not part of [`Self::any_instance`], and no goodbye withdraws it: this
     /// latch is the record set's EXPOSURE, and the NSEC is exposed without being
@@ -441,63 +471,180 @@ cfg_heap! {
     /// relinquished set must disown an echo of every identity it transmitted,
     /// and an instance NSEC is one of the three
     /// [`respond::canonical_rdata_forms`] can name.
-    nsec: bool,
+    nsec: [bool; 2],
   }
 
   impl GoodbyeOwnership {
-    /// Latch the concrete records a confirmed-delivered send actually emitted — the
-    /// SOLE way ownership is gained (besides being reset to none on rename).
-    fn record_emitted(&mut self, e: &respond::EmittedRecords) {
-      self.ptr |= e.ptr();
-      self.srv |= e.srv();
-      self.txt |= e.txt();
-      self.subtypes |= e.subtypes();
-      self.nsec |= e.nsec();
-      self.record_host_emitted(e);
+    /// Latch the concrete records a confirmed send actually emitted, on the
+    /// families that actually accepted it — the SOLE way ownership is gained
+    /// (besides being reset to none on rename).
+    ///
+    /// `on` comes from [`TransmitDelivery::delivered_on`], never from
+    /// `any_delivered`: a family that missed the datagram put nothing in its
+    /// peers' caches and must not be recorded as having done so.
+    fn record_emitted(&mut self, e: &respond::EmittedRecords, on: [bool; 2]) {
+      or_on(&mut self.ptr, e.ptr(), on);
+      or_on(&mut self.srv, e.srv(), on);
+      or_on(&mut self.txt, e.txt(), on);
+      or_on(&mut self.subtypes, e.subtypes(), on);
+      or_on(&mut self.nsec, e.nsec(), on);
+      self.record_host_emitted(e, on);
     }
-    /// Latch ONLY the host-owned addresses of a confirmed-delivered send.
+    /// Latch ONLY the host-owned addresses of a confirmed send, on the families
+    /// that accepted it.
     ///
     /// Used when the send's INSTANCE records belong to a name the service has
     /// since renamed away from: the host name is invariant across an instance
     /// rename, so those addresses really are cached under a name this service
     /// still holds and stay its to withdraw, while the instance records go to the
     /// detached old-name goodbye instead.
-    fn record_host_emitted(&mut self, e: &respond::EmittedRecords) {
+    fn record_host_emitted(&mut self, e: &respond::EmittedRecords, on: [bool; 2]) {
+      if !any_family(on) {
+        // No family carried it, so nothing was exposed. Returning early keeps
+        // the ADDRESS LIST — the union `Service::advertised_a_addrs` reports —
+        // free of addresses whose mask says no family carried them, which would
+        // otherwise make a sibling retain an address no peer ever heard.
+        return;
+      }
       for ip in e.a_slice() {
-        if !self.a.contains(ip) {
-          self.a.push(*ip);
-        }
+        Self::latch_addr(&mut self.a, &mut self.a_on, *ip, on);
       }
       for ip in e.aaaa_slice() {
-        if !self.aaaa.contains(ip) {
-          self.aaaa.push(*ip);
-        }
+        Self::latch_addr(&mut self.aaaa, &mut self.aaaa_on, *ip, on);
       }
+    }
+    /// Push or update one address and its family mask, keeping the two vectors
+    /// index for index. The ONLY writer of either.
+    fn latch_addr<T: Copy + PartialEq>(
+      addrs: &mut std::vec::Vec<T>,
+      masks: &mut std::vec::Vec<[bool; 2]>,
+      ip: T,
+      on: [bool; 2],
+    ) {
+      if let Some(i) = addrs.iter().position(|x| *x == ip) {
+        if let Some(mask) = masks.get_mut(i) {
+          or_on(mask, true, on);
+        }
+        return;
+      }
+      addrs.push(ip);
+      masks.push(on);
     }
     /// Drop INSTANCE ownership (PTR/SRV/TXT) on a conflict rename; host A/AAAA
     /// ownership persists (the host name does not change on an instance rename).
     #[inline]
     fn reset_instance(&mut self) {
-      self.ptr = false;
-      self.srv = false;
-      self.txt = false;
-      self.subtypes = false;
+      self.ptr = [false; 2];
+      self.srv = [false; 2];
+      self.txt = [false; 2];
+      self.subtypes = [false; 2];
       // The §6.1 NSEC is owned by the instance name, so it goes with them: the
       // NEW name has put no NSEC on the wire, and the OLD name's is carried away
       // by the rename handoff.
-      self.nsec = false;
+      self.nsec = [false; 2];
     }
     /// Whether ANY instance-owned record (PTR/SRV/TXT or a subtype PTR) has been
-    /// advertised.
+    /// advertised, on any family.
     #[inline]
     fn any_instance(&self) -> bool {
-      self.ptr || self.srv || self.txt || self.subtypes
+      any_family(self.ptr) || any_family(self.srv) || any_family(self.txt)
+        || any_family(self.subtypes)
     }
-    /// Whether ANY host-owned address (A/AAAA) has been advertised.
+    /// Whether ANY host-owned address (A/AAAA) has been advertised, on any family.
     #[inline]
     fn any_host(&self) -> bool {
       !self.a.is_empty() || !self.aaaa.is_empty()
     }
+    /// What ONE family carried, as the same [`respond::EmittedRecords`] the
+    /// encoders report.
+    ///
+    /// This projection is what keeps the family dimension cheap everywhere else:
+    /// a withdrawal snapshot, a rename handoff, a withdrawal item and a
+    /// relinquished row all carry `[EmittedRecords; 2]`, so every consumer that
+    /// used to read one exposure now reads its own family's — with no new
+    /// vocabulary, and with no way to read the wrong half, because the pair is
+    /// only ever taken apart through
+    /// [`Family::pick_ref`](crate::transmit::Family::pick_ref).
+    fn project(&self, family: crate::transmit::Family) -> respond::EmittedRecords {
+      respond::EmittedRecords::new(
+        family.pick(self.ptr),
+        family.pick(self.srv),
+        family.pick(self.txt),
+        family_addrs(&self.a, &self.a_on, family),
+        family_addrs(&self.aaaa, &self.aaaa_on, family),
+        family.pick(self.subtypes),
+        family.pick(self.nsec),
+      )
+    }
+    /// This latch as the `[v4, v6]` exposure pair every relinquishment,
+    /// withdrawal snapshot and rename handoff carries.
+    fn per_family(&self) -> [respond::EmittedRecords; 2] {
+      [
+        self.project(crate::transmit::Family::V4),
+        self.project(crate::transmit::Family::V6),
+      ]
+    }
+  }
+
+  /// OR `on` into `mask` when `emitted`, leaving it untouched otherwise.
+  ///
+  /// A helper rather than five copies of the same two-element loop, and a
+  /// deliberate one: the mistake it exists to make hard is ORing a delivery mask
+  /// into a record the message did not carry.
+  #[inline]
+  fn or_on(mask: &mut [bool; 2], emitted: bool, on: [bool; 2]) {
+    if !emitted {
+      return;
+    }
+    for (slot, delivered) in mask.iter_mut().zip(on) {
+      *slot |= delivered;
+    }
+  }
+
+  /// Whether either half of a family mask is set.
+  #[inline]
+  const fn any_family(mask: [bool; 2]) -> bool {
+    let [v4, v6] = mask;
+    v4 || v6
+  }
+
+  /// Split one message's INSTANCE-only report into the `[v4, v6]` exposure pair,
+  /// crediting each family only with what it actually accepted.
+  ///
+  /// The rename handoff's own projection: the live latch has already been reset
+  /// for the new name, so the old name's exposure cannot be read back off it and
+  /// has to be built from the confirm that carried it.
+  fn per_family_instance(
+    instance: &respond::EmittedRecords,
+    on: [bool; 2],
+  ) -> [respond::EmittedRecords; 2] {
+    let credit = |carried: bool| {
+      if carried {
+        instance.clone()
+      } else {
+        respond::EmittedRecords::default()
+      }
+    };
+    let [v4, v6] = on;
+    [credit(v4), credit(v6)]
+  }
+
+  /// The addresses of `addrs` whose parallel mask names `family`.
+  ///
+  /// `zip` stops at the shorter vector, so an address with no mask contributes
+  /// nothing — it reads as "no family carried this", which under-withdraws and
+  /// under-screens rather than the reverse.
+  fn family_addrs<T: Copy>(
+    addrs: &[T],
+    masks: &[[bool; 2]],
+    family: crate::transmit::Family,
+  ) -> std::vec::Vec<T> {
+    addrs
+      .iter()
+      .zip(masks)
+      .filter(|(_, mask)| family.pick(**mask))
+      .map(|(ip, _)| *ip)
+      .collect()
   }
 }
 
@@ -517,20 +664,25 @@ cfg_heap! {
     /// The service records (names, port, TXT) for this withdrawal. Carried so
     /// the encoder can re-encode PTR/SRV/TXT at TTL=0 without a live `Service`.
     pub records: crate::records::ServiceRecords,
-    /// Which record kinds (PTR/SRV/TXT/subtypes) this service actually put on the
-    /// wire (per-record, not per-group). Mirrors the [`GoodbyeOwnership`] latch
-    /// semantics: only records that reached a peer cache need to be withdrawn.
+    /// What this service actually put on each family's wire — `[v4, v6]`, per
+    /// record and per host address, mirroring the [`GoodbyeOwnership`] latch it
+    /// is projected from. Only records that reached a peer cache need to be
+    /// withdrawn, and only from the family whose peers cached them.
+    ///
+    /// A PAIR rather than one report, because delivery is per family: a fan-out
+    /// is two sends and either may be refused, so an announcement IPv6 never
+    /// carried left nothing in any IPv6 peer's cache. The endpoint seeds each
+    /// family's §10.1 goodbye debt from its own half, and
+    /// `Endpoint::relinquished_asserts` screens an arrival against the half its
+    /// own family transmitted.
+    ///
     /// `pub(crate)` because `EmittedRecords` is a crate-internal type; the
-    /// endpoint (same crate) reads this directly.
+    /// endpoint (same crate) reads this directly, and a driver only ever moves
+    /// the whole snapshot.
     // `allow(dead_code)`: the field is read by the endpoint withdrawal state
     // machine; suppress the false positive here.
     #[allow(dead_code)]
-    pub(crate) owned: respond::EmittedRecords,
-    /// Host A (IPv4) addresses this service confirmed-emitted. The endpoint will
-    /// further filter these against same-host siblings before re-encoding.
-    pub host_a: std::vec::Vec<core::net::Ipv4Addr>,
-    /// Host AAAA (IPv6) addresses this service confirmed-emitted.
-    pub host_aaaa: std::vec::Vec<core::net::Ipv6Addr>,
+    pub(crate) owned: [respond::EmittedRecords; 2],
   }
 }
 
@@ -557,10 +709,12 @@ cfg_heap! {
     /// reads it directly.
     pub(crate) records: crate::records::ServiceRecords,
     /// Which instance records (PTR/SRV/TXT/subtypes) the OLD name actually put on
-    /// the wire — only these are withdrawn (§7.1 KAS can suppress a subset). The
-    /// address lists are always empty (a rename never withdraws host A/AAAA).
-    /// `pub(crate)`: `EmittedRecords` is a crate-internal type.
-    pub(crate) owned: respond::EmittedRecords,
+    /// EACH family's wire — `[v4, v6]`, only these are withdrawn (§7.1 KAS can
+    /// suppress a subset, and a fan-out's two sends can differ in what each
+    /// family accepted). The address lists are always empty (a rename never
+    /// withdraws host A/AAAA). `pub(crate)`: `EmittedRecords` is a crate-internal
+    /// type.
+    pub(crate) owned: [respond::EmittedRecords; 2],
   }
 }
 
@@ -1370,14 +1524,15 @@ where
           }
           return;
         }
-        // At least one obligated link accepted it → peers reachable over that
+        // At least one obligated link accepted it → peers reachable over THAT
         // link may now hold these records, so latch goodbye ownership for
         // exactly what the encoder reported it emitted (a full announcement
-        // carries all of PTR/SRV/TXT plus every host address). This is the
-        // ANY-delivered half of the invariant pair and happens BEFORE the
-        // all-delivered phase check below: partial delivery owns what it exposed
-        // even though it advances nothing.
-        self.goodbye.record_emitted(&emitted);
+        // carries all of PTR/SRV/TXT plus every host address), ON EXACTLY THE
+        // FAMILIES THAT ACCEPTED IT. This is the ANY-delivered half of the
+        // invariant pair and happens BEFORE the all-delivered phase check below:
+        // partial delivery owns what it exposed even though it advances nothing
+        // — and owns it only where it exposed it.
+        self.goodbye.record_emitted(&emitted, delivery.delivered_on());
         // …and this generation has now claimed the name, which is what the
         // conflict rules key on. Ownership and CLAIM are different questions
         // over the same report — see `EmittedRecords::claims_instance_name` and
@@ -1483,7 +1638,7 @@ where
               s.answers_suppressed_kas(kas_suppressed_count);
             }
           }
-          self.goodbye.record_emitted(&emitted);
+          self.goodbye.record_emitted(&emitted, delivery.delivered_on());
           // …and this generation has claimed the name only if a record the
           // INSTANCE owns reached the wire. The two lines above and below are
           // deliberately different questions over the same report: goodbye
@@ -1563,12 +1718,14 @@ where
           // records are in peer caches (hence the latch) but the generation now
           // probing has claimed nothing, and §9 puts it back through §8's
           // startup steps regardless.
-          StaleRecords::SameName(emitted) => self.goodbye.record_emitted(&emitted),
+          StaleRecords::SameName(emitted) => {
+            self.goodbye.record_emitted(&emitted, delivery.delivered_on());
+          }
           StaleRecords::OldName { records, emitted } => {
             // The host name is invariant across an instance rename, so the
             // addresses this datagram carried are cached under a name the service
             // still holds: they latch into the live goodbye as usual.
-            self.goodbye.record_host_emitted(&emitted);
+            self.goodbye.record_host_emitted(&emitted, delivery.delivered_on());
             // The instance records are not. `self.records` names the NEW
             // instance, so `withdrawal_snapshot` would encode them under a name
             // that never carried them — they belong to the OLD name's detached
@@ -1589,8 +1746,17 @@ where
               // any peer cache, so it has nothing to withdraw.
               return;
             }
+            // The old name's exposure is per family for the same reason the
+            // live latch is: only the families that ACCEPTED this datagram put
+            // these instance records in a peer cache, so only they owe the old
+            // name's §10.1 goodbye and only they can hold an echo of it.
+            let instance = per_family_instance(&instance, delivery.delivered_on());
             match &mut self.rename_goodbye_handoff {
-              Some(h) => h.owned.merge_instance(&instance),
+              Some(h) => {
+                for (held, new) in h.owned.iter_mut().zip(&instance) {
+                  held.merge_instance(new);
+                }
+              }
               // The driver takes the handoff the instant it observes `Renamed`,
               // and a parked confirm lands after that by construction, so
               // installing a fresh one is the ordinary case rather than the
@@ -1842,20 +2008,13 @@ where
     // After a rename the current name is the freshly re-announced one, and its
     // confirmed instance + host records still need withdrawing; the OLD name is
     // handled separately as its own detached item.
-    let owned = respond::EmittedRecords::new(
-      self.goodbye.ptr,
-      self.goodbye.srv,
-      self.goodbye.txt,
-      std::vec::Vec::new(), // addresses are passed separately below
-      std::vec::Vec::new(),
-      self.goodbye.subtypes,
-      self.goodbye.nsec,
-    );
     WithdrawalSnapshot {
       records: self.records.clone(),
-      owned,
-      host_a: self.goodbye.a.clone(),
-      host_aaaa: self.goodbye.aaaa.clone(),
+      // Per family, and whole: each half carries that family's instance records
+      // AND that family's host addresses, so the endpoint's goodbye debt and the
+      // relinquished-RRset screen both read one exposure rather than reassembling
+      // two.
+      owned: self.goodbye.per_family(),
     }
   }
 
@@ -3322,7 +3481,7 @@ where
         // that fact to `Endpoint::enqueue_rename_withdrawal`, which retains it —
         // and the goodbye ITEM is still not created, because `owned.is_empty()`
         // decides that and an NSEC is not withdrawable.
-        if self.goodbye.any_instance() || self.goodbye.nsec {
+        if self.goodbye.any_instance() || any_family(self.goodbye.nsec) {
           // capture WHICH instance records the old name actually put on
           // the wire (§7.1 KAS may have emitted only a subset), so the rename
           // goodbye withdraws exactly those — not all of PTR/SRV/TXT, which
@@ -3332,15 +3491,20 @@ where
           // still names the OLD instance. The Service no longer drains this —
           // it is handed off (`take_rename_goodbye_handoff`) to the endpoint as
           // an independent detached withdrawal item.
-          let owned = respond::EmittedRecords::new(
-            self.goodbye.ptr,
-            self.goodbye.srv,
-            self.goodbye.txt,
-            std::vec::Vec::new(),
-            std::vec::Vec::new(),
-            self.goodbye.subtypes,
-            self.goodbye.nsec,
-          );
+          // Per family, because the old name's exposure is: an announcement
+          // only IPv4 accepted put nothing under that name in an IPv6 peer's
+          // cache, so IPv6 owes it no goodbye and cannot hold an echo of it.
+          let owned = self.goodbye.per_family().map(|e| {
+            respond::EmittedRecords::new(
+              e.ptr(),
+              e.srv(),
+              e.txt(),
+              std::vec::Vec::new(),
+              std::vec::Vec::new(),
+              e.subtypes(),
+              e.nsec(),
+            )
+          });
           self.rename_goodbye_handoff = Some(RenameGoodbyeHandoff {
             records: self.records.clone(),
             owned,

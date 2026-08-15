@@ -154,6 +154,61 @@ impl Admits {
       //     successor announce over a peer that already holds the name — the
       //     opposite error, and the worse one. A relinquishment with no exposure
       //     at all therefore retains nothing.
+      //     AND IN THE EXACT RDATA FORM THE ENCODER WROTE, which is the same
+      //     boundary one dimension further in and the place the two screens part
+      //     company. The exposure says which RRTYPES went out; it does not say
+      //     which SPELLING of one, and `respond::canonical_rdata_forms` names
+      //     more than one for NSEC on purpose — the accurate `{SRV, TXT, A,
+      //     AAAA}` bitmap a CONFORMING responder publishes where the instance
+      //     name is also the host name, which this crate's encoder never writes.
+      //     Accepting it is right for the LIVE classifier, which asks whether a
+      //     peer's record is CONSISTENT with what we publish now and must not
+      //     rename a §9 fault-tolerance twin that is merely more correct than we
+      //     are. History asks something narrower and purely factual — these
+      //     exact bytes left this endpoint, on this family, in this generation —
+      //     and a form we never encoded did not. So both tiers read
+      //     `respond::transmitted_rdata_forms`, the history half of that
+      //     function, and the leniency stops at the classifier. Expanding an
+      //     exposure BOOLEAN through the live list converts semantic
+      //     compatibility into wire provenance, and a genuine twin's conforming
+      //     NSEC read as an old self-echo withholds the decisive §8.1 / §9
+      //     conflict against a successor for the whole window.
+      //     AND TRANSMITTED ON THE FAMILY THE CANDIDATE ARRIVED ON. Exposure is
+      //     a `[v4, v6]` pair at every layer it crosses — the latch, the
+      //     snapshot, the rename handoff, the withdrawal item, the retained row
+      //     and its compact identity — and the screen reads only the arriving
+      //     family's half. A multicast datagram travels back over a socket that
+      //     carried it out, so a generation IPv4 accepted and IPv6 refused can
+      //     hold no IPv6 echo, and an aggregate answering for both would silence
+      //     a GENUINE peer's §8.1 or §9 conflict purely for agreeing with a
+      //     transmission that family never saw. A fan-out is two sends and
+      //     either may be refused, so that is an ordinary partial round rather
+      //     than an exotic case — the same fact `hick-smoltcp`'s `sent_on` mask
+      //     keeps one layer down, for the same reason.
+      //     AND FOR AS LONG AS THAT FAMILY'S OWN WINDOW LASTS, which is a
+      //     SECOND per-family fact and only the compact tier has to carry it.
+      //     An exact row is one generation given up at one instant, so its two
+      //     halves lapse together and one expiry states that correctly; a
+      //     compact identity MERGES ACROSS GENERATIONS on `(owner, rrtype,
+      //     rdata)`, a key that says nothing about when or where, so the same
+      //     rdata retained first from IPv4 and later from IPv6 is one row
+      //     describing two transmissions with two deadlines. A single expiry
+      //     beside a presence mask writes the later one onto both families, and
+      //     an IPv4 peer asserting that rdata after the IPv4 generation's window
+      //     closed was still disowned — the two tiers then disagreeing about the
+      //     same generations. The window therefore lives IN the mask:
+      //     `[Option<I>; 2]`, `None` for a family that never carried the
+      //     identity, and a merge may only ever extend the half its own
+      //     generation reached.
+      //     A WITHDRAWAL ITEM'S EXPOSURE MAY NARROW, and only narrow. A
+      //     reclaimable detached item trims to the shared records a same-name
+      //     replacement's announcement cannot supersede, so it answers for less
+      //     than it once emitted; what it stops answering for, the row
+      //     `Endpoint::enqueue_rename_withdrawal` retained at the RENAME still
+      //     holds, which is why that retain is unconditional and taken before
+      //     the item exists. The direction is the whole of the argument — an
+      //     exposure that claimed MORE than a confirmed send emitted is the
+      //     error this invariant forbids.
       //     Invariant 2 holds only while our records have not changed under a
       //     recorded send, and a self-echo that outlives such a change IS
       //     reachable — not through RFC 6762 §8.4 record updating, which is
@@ -176,18 +231,29 @@ impl Admits {
       //     still resident and a retention list of what has lapsed, ONE ROW PER
       //     RELINQUISHED GENERATION, each living to its own expiry. See the
       //     `endpoint::relinquished` module.
-      //     THE LIST'S CEILING DROPS NOTHING. Every live row is an obligation
-      //     still owed, so reaching `MAX_RELINQUISHED_RRSETS` quarantines this
-      //     endpoint's own adjudication — every conflict withheld for one
-      //     retention window — instead of evicting a row. An endpoint that
-      //     cannot say "that record was not ours" must not say the opposite
-      //     either. That degradation is recoverable where an eviction's is not:
-      //     mDNS re-raises a missed conflict on the next announcement, while a
-      //     dropped relinquishment's echo arrives once and retires a live
-      //     service permanently.
-      //     The quarantine is NOT a name-reuse embargo — registration and rename
-      //     are untouched — and it pauses neither §8.2 nor the §8.1 defence,
-      //     since neither consults the screen.
+      //     THE LIST'S CEILING DROPS NOTHING AND DISABLES NOTHING. Every live
+      //     row is an obligation still owed, so reaching
+      //     `MAX_RELINQUISHED_RRSETS` evicts none of them; the relinquishment is
+      //     recorded COMPACTLY instead, decomposed into the `(owner name,
+      //     rrtype, canonical rdata)` identities it transmitted — each carrying
+      //     the window PER FAMILY, since that tier merges generations and their
+      //     windows are not shared — which is the whole of what this screen ever
+      //     asks. THE DEGRADATION IS BOUNDED TO
+      //     THE IDENTITY THAT COULD NOT BE RECORDED: at
+      //     `MAX_RELINQUISHED_IDENTITIES` the identities that do not fit are not
+      //     recorded and nothing already held is disturbed. An endpoint-wide
+      //     fallback is forbidden here and the argument is one of SCALE, not of
+      //     kind — this cell held a quarantine that answered `true` for every
+      //     candidate once the ceiling was reached, and withholding one
+      //     generation's conflicts risks that generation while withholding every
+      //     conflict guarantees false negatives at every name the endpoint
+      //     holds, including names it could still have adjudicated perfectly
+      //     well. On-link peers set the relinquishment rate through §9 re-probes
+      //     and §8.1 renames, which carry no fifteen-in-ten-seconds backoff, so
+      //     "fill the table, then probe over an incumbent" was reachable.
+      //     Neither ceiling is a name-reuse embargo — registration and rename are
+      //     untouched — and neither pauses §8.2 or the §8.1 defence, since
+      //     neither consults the screen.
       //     THE DRIVER-SIDE GENERATION BINDING IS NOW DEFENCE IN DEPTH, NOT THE
       //     LOAD-BEARING MECHANISM, and moving the weight off it was the point.
       //     Every driver-side RECOGNITION of such an echo is defeasible, three
@@ -220,13 +286,35 @@ impl Admits {
       //     `Service::classify_host_rdata` / `classify_instance_rdata`, so that
       //     one of the two answers "ours" and the other "differing" for the same
       //     record; a record type gaining a `respond::canonical_rdata_forms` arm
-      //     without the matching `respond::instance_rtype_exposed` row, which
-      //     silently drops that type out of the screen; the exposure inputs
-      //     ceasing to mean "confirmed emitted" — `GoodbyeOwnership` latching
-      //     from anything but a delivered send, or a retain site passing a
-      //     CONFIGURED record set in place of the snapshot's; or the retention
+      //     without the matching `respond::instance_rtype_exposed` row,
+      //     `respond::INSTANCE_CANONICAL_RTYPES` entry or
+      //     `respond::transmitted_rdata_forms` arm, any of which silently drops
+      //     that type out of one of the two tiers; EITHER TIER READING A FORM
+      //     THIS CRATE DOES NOT ENCODE — `relinquished::asserts` or
+      //     `relinquished::identities` reaching `canonical_rdata_forms` instead
+      //     of `transmitted_rdata_forms`, `transmitted_rdata_forms` widening to
+      //     a form `write_announce` / `write_probe` / `push_service_nsec` never
+      //     writes, or `respond::emitted_nsec_identity` drifting from the bitmap
+      //     `push_service_nsec` actually emits; `relinquished::
+      //     identities` decomposing a set into anything but what
+      //     `relinquished::asserts` would have answered for, which makes the
+      //     tiers disagree about the same generation; the exposure inputs
+      //     ceasing to mean "confirmed emitted BY THAT FAMILY" —
+      //     `GoodbyeOwnership` latching from anything but a delivered send, a
+      //     latch keyed on `TransmitDelivery::any_delivered` rather than
+      //     `delivered_on`, any layer collapsing the `[v4, v6]` exposure pair
+      //     back into one aggregate, or a screen call site that does not pass
+      //     the ARRIVING datagram's family — or a retain site passing a
+      //     CONFIGURED record set in place of the snapshot's; A COMPACT
+      //     IDENTITY'S PER-FAMILY WINDOW reduced to one expiry — whether beside
+      //     a presence mask or on its own — or a merge that writes a
+      //     generation's expiry onto a family that generation did not reach, or
+      //     a compaction that drops a row still live on ONE family; the retention
       //     list dropping an UNEXPIRED row again, whether by merging two
-      //     generations onto one owner pair or by evicting at the ceiling.
+      //     generations onto one owner pair or by evicting at the ceiling; or
+      //     ANY capacity path answering for a record it cannot name — an
+      //     eviction that lets a peer pick the victim by filling the table, or a
+      //     return to an endpoint-wide fallback.
       //     The driver-side binding — a credit bound to the record generation it
       //     was sent under, and a superseded credit DEMOTED to `OwnEcho` rather
       //     than discarded — is still owed, and still documented on
