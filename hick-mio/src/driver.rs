@@ -841,7 +841,8 @@ impl Mdns {
           SelfSendMatch::Ordered => Provenance::OwnEcho,
           SelfSendMatch::Degraded => Provenance::OwnEchoLikely,
           // Our bytes, but from a generation of our own records that no longer
-          // exists — a service registered or began withdrawing since the send. It
+          // exists — a service registered, began withdrawing, or took an RFC 6762
+          // §9 automatic rename since the send. It
           // maps to `OwnEcho` because that is the only tier which denies
           // ADJUDICATION, and adjudication is precisely what a stale echo must not
           // have: its RFC 6762 §8.2 proposal is for a name this endpoint may no
@@ -1356,6 +1357,7 @@ impl Mdns {
       services,
       queries,
       events,
+      selfsend,
       query_scratch,
       retired_scratch,
       ..
@@ -1375,6 +1377,19 @@ impl Mdns {
         };
         let update = match renamed_to {
           Some(name) => {
+            // A §9 auto-rename is a PUBLISHED-RECORD MUTATION: the proto called
+            // `Service::set_instance` before it emitted this update, so every
+            // credit recorded under the abandoned instance name describes a
+            // state this endpoint has left. Advance at the mutation, and
+            // UNCONDITIONALLY — the collision arm below is retired through
+            // `begin_service_withdrawal`, which supersedes as well, but a
+            // SURVIVING rename crosses no lifecycle seam at all. The vacated
+            // name can then be taken by another local service, and THAT
+            // registration advances the generation of its own credits, not of
+            // this rename's; a delayed echo of the abandoned owner would
+            // otherwise still read as current, adjudicate, and defeat the new
+            // holder under RFC 6762 §8.1. See `SelfSendTracker::supersede`.
+            selfsend.supersede();
             // Nothing the OLD name put in flight can still be outstanding here.
             // Every datagram this service produced was confirmed inside the
             // `poll_transmit` iteration that produced it — stage 4 — so there is

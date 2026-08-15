@@ -69,7 +69,13 @@ use std::{
   time::{Duration, Instant as StdInstant, SystemTime},
 };
 
-use crate::{Family, RX_TIMESTAMP_GRAIN, RecvMeta};
+use crate::{Family, RX_TIMESTAMP_GRAIN};
+// `recv_datagram` is the only code here that names the type, and it performs the
+// receive itself — a `recvmsg` this crate only has on Unix. Windows drivers do
+// their own receive and mint through `RxDatagram::without_stamp`, so an
+// unconditional import would be dead there.
+#[cfg(unix)]
+use crate::RecvMeta;
 
 /// How long a recorded send stays eligible to match an inbound loopback,
 /// measured from the **first instant its echo could be claimed** rather than
@@ -803,7 +809,9 @@ pub enum SelfSendMatch {
   Degraded,
   /// A credit matched, at either strength, but it was recorded **before the
   /// caller last called [`SelfSendTracker::supersede`]** — so these are our bytes
-  /// from a generation of our own records that no longer exists.
+  /// from a generation of our own records that no longer exists, because a
+  /// service registered, began withdrawing, or took an RFC 6762 §9 automatic
+  /// rename since the send.
   ///
   /// # Why a generation is needed at all
   ///
@@ -1013,19 +1021,35 @@ impl SelfSendTracker {
   ///
   /// # Where a driver must call this
   ///
-  /// At every point where a route this endpoint advertises is created or begins
-  /// withdrawing — a service registration, and the `begin_withdrawal` that
-  /// retires one, however that retirement was reached (caller unregister,
-  /// shutdown, rename collision, internal retirement). Those are the only events
-  /// that can leave an already-recorded datagram asserting records some LIVE
-  /// route no longer holds, because RFC 6762 §8.4 record updating is
-  /// unimplemented and a `Service` exposes no records mutator.
+  /// At **every mutation of what this endpoint publishes**, which is three
+  /// events and no more, because RFC 6762 §8.4 record updating is unimplemented
+  /// and a `Service` exposes no records mutator:
+  ///
+  /// * a service registration, which puts a live route's records on the wire
+  ///   that no earlier credit knows about;
+  /// * the `begin_withdrawal` that retires a route, however that retirement was
+  ///   reached (caller unregister, shutdown, rename collision, internal
+  ///   retirement);
+  /// * the §9 AUTOMATIC RENAME, taken at the driver's own
+  ///   `ServiceUpdate::Renamed` — `Service::set_instance` has already rewritten
+  ///   that service's records by the time the update is observed.
+  ///
+  /// The rename is the one that reaches neither of the others when it SUCCEEDS,
+  /// and it is owed on the strength of being a MUTATION rather than on a
+  /// consequence traced from it. This type holds ONE generation for the whole
+  /// log, so the next registration or withdrawal demotes the renamer's stale
+  /// credit as well; what the advance at the rename closes is the stretch
+  /// between it and that next seam, during which a credit for the abandoned
+  /// instance name still claims as current and still adjudicates. Arguing from
+  /// reachability instead is what left the rename off this list once already,
+  /// and a reachability argument has to be re-made after every change to the
+  /// routing.
   ///
   /// **Call it at the site, not once per loop iteration.** The obligation is
   /// relational — no credit recorded before the change may be claimed at the
   /// adjudicating tier after it — and a deferred bump has to be re-argued
   /// against every receive path that could run in between. Advancing it at the
-  /// lifecycle call itself is true whatever the loop shape.
+  /// mutation itself is true whatever the loop shape.
   ///
   /// # Erring towards calling it is cheap; erring away is not
   ///

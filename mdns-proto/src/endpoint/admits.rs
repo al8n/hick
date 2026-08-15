@@ -169,12 +169,25 @@ impl Admits {
       //     self-echo carrying rdata we no longer hold, and no generation
       //     advance covers it. Implementing §8.4 must re-argue this cell, not
       //     merely add the API.
-      //     INVALIDATED BY: a driver that stops superseding its credits at the
-      //     SERVICE LIFECYCLE SEAMS — a service registration, and the
+      //     INVALIDATED BY: a driver that stops superseding its credits at
+      //     EVERY MUTATION OF WHAT IT PUBLISHES — a service registration; the
       //     `begin_withdrawal` that retires a route however that retirement was
       //     reached (caller unregister, shutdown, rename collision, internal
-      //     retirement) — or that discards a superseded credit instead of
+      //     retirement); and the §9 AUTOMATIC RENAME, at the driver's own
+      //     `ServiceUpdate::Renamed`, which is `Service::set_instance` already
+      //     applied and is the one of the three that reaches no lifecycle seam
+      //     when it succeeds — or that discards a superseded credit instead of
       //     demoting it.
+      //     The rename belongs here as a MUTATION, and deliberately not because
+      //     a consequence was traced from it. A driver holds ONE generation for
+      //     its whole send log, so the next registration or withdrawal demotes
+      //     the renamer's stale credit too; what the advance at the rename
+      //     closes is the stretch between the rename and that next seam, during
+      //     which a credit for the abandoned instance name still claims as
+      //     current and still adjudicates. Arguing from reachability instead is
+      //     what left the rename off this list once already — a reachability
+      //     argument has to be re-made after every change to the routing, and
+      //     this invariant does not.
       //
       //  4. Two live routes sharing a HOST NAME publish the SAME address set FOR
       //     EACH RRTYPE THEY BOTH PUBLISH — enforced at registration and rename

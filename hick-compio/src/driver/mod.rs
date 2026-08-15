@@ -722,6 +722,19 @@ impl State {
         // kept: surface `Conflict`, flag it errored so every pump skips it, and stop
         // draining it.
         if let ServiceUpdate::Renamed(ref renamed) = upd {
+          // A §9 auto-rename is a PUBLISHED-RECORD MUTATION: the proto called
+          // `Service::set_instance` before it emitted this update, so every
+          // credit recorded under the abandoned instance name describes a state
+          // this endpoint has left. Advance at the mutation, and UNCONDITIONALLY
+          // — the collision arm below is retired through
+          // `begin_service_withdrawal`, which supersedes as well, but a
+          // SURVIVING rename crosses no lifecycle seam at all. The vacated name
+          // can then be taken by another local service, and THAT registration
+          // advances the generation of its own credits, not of this rename's; a
+          // delayed echo of the abandoned owner would otherwise still read as
+          // current, adjudicate, and defeat the new holder under RFC 6762 §8.1.
+          // See `SelfSendTracker::supersede`.
+          self.selfsend.supersede();
           let new_name = renamed.new_name().clone();
           let rename_result = self.endpoint.handle_service_renamed(h, new_name);
           // The §9 rename of an announced service hands its OLD-name TTL=0 goodbye
@@ -1512,7 +1525,8 @@ impl State {
         SelfSendMatch::Ordered => Provenance::OwnEcho,
         SelfSendMatch::Degraded => Provenance::OwnEchoLikely,
         // Our bytes, but from a generation of our own records that no longer
-        // exists — a service registered or began withdrawing since the send. It
+        // exists — a service registered, began withdrawing, or took an RFC 6762
+        // §9 automatic rename since the send. It
         // maps to `OwnEcho` because that is the only tier which denies
         // ADJUDICATION, and adjudication is precisely what a stale echo must not
         // have: its RFC 6762 §8.2 proposal is for a name this endpoint may no
