@@ -98,7 +98,7 @@ where
       // WITHDRAWAL_CEILING (hard anti-pin deadline).
       let ceiling_at = now.checked_add_duration(WITHDRAWAL_CEILING).unwrap_or(now);
 
-      // ── route-attached item: the CURRENT (live / re-announced) name ──────────
+      // Route-attached item: the CURRENT (live / re-announced) name.
       // A family owes a goodbye iff IT actually advertised an instance record or
       // a host address; otherwise `0`, so the next `drain_completed_withdrawals`
       // frees the name at once with no spurious goodbye and no 2 s ceiling wait.
@@ -673,9 +673,9 @@ where
     ///
     /// # An announcement retracts nothing it does not itself carry
     ///
-    /// The cancel used to delete the whole item, on the reasoning that a
-    /// complete §10.2 announcement of the same name leaves the old goodbye
-    /// nothing to do. That holds record by record, and not for every record:
+    /// Deleting the whole item would rest on the reasoning that a complete
+    /// §10.2 announcement of the same name leaves the old goodbye nothing to do.
+    /// That holds for some of its records and not others:
     ///
     /// * the SRV and the TXT are UNIQUE at the instance name and the replacement
     ///   announces them with the cache-flush bit, so its own answer supersedes
@@ -689,20 +689,20 @@ where
     ///   `<sub>._sub.<type>` browse name the replacement does not publish, so no
     ///   answer of the replacement's carries it at all. RFC 6762 §10.1's TTL=0
     ///   goodbye is the ONLY way it is ever retracted. Deleting the item while it
-    ///   still owed a family left that family's peers listing the instance under
-    ///   a subtype it no longer has, for the full positive TTL.
+    ///   still owes a family leaves that family's peers listing the instance
+    ///   under a subtype it no longer has, for the full positive TTL.
     ///
     /// So the item is NARROWED to the shared PTRs the replacement's own record
     /// set does not assert, and drains its remaining per-family debt for those
     /// alone. When nothing survives the narrowing — the ordinary case, since
     /// most renames keep their subtypes and most services have none — the item is
-    /// removed outright, exactly as before.
+    /// removed outright.
     ///
     /// # What the narrowing costs the relinquished screen: nothing
     ///
     /// A narrowed item stops answering [`Self::relinquished_asserts`] for the
-    /// SRV / TXT / NSEC identities it used to, since those are read out of the
-    /// same exposure. That is not a loss:
+    /// SRV / TXT / NSEC identities, since those are read out of the same
+    /// exposure. That is not a loss:
     /// [`Self::enqueue_rename_withdrawal`] retains the old name's whole record
     /// set at the RENAME — up front, unconditionally, and for the full
     /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention)

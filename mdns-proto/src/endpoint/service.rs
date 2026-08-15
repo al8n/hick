@@ -29,9 +29,8 @@ where
   /// `ServiceUpdate::HostConflict`, raised by a sibling on the same machine
   /// rather than by any peer.
   ///
-  /// That path was previously unreachable only because self-detection suppressed
-  /// every effect of an echoed announcement. It is not suppressed any more: a
-  /// content match with no ordering evidence now adjudicates (see
+  /// Nothing upstream blocks that path: a content match with no ordering
+  /// evidence adjudicates rather than being suppressed (see
   /// [`Provenance::OwnEchoLikely`](crate::Provenance::OwnEchoLikely)), which is
   /// what makes this guard the FOURTH invariant that cell's safety rests on.
   ///
@@ -42,7 +41,7 @@ where
   /// are two DISTINCT unique RRsets, each singly owned. An IPv4-only service and
   /// an IPv6-only service sharing one host name publish disjoint RRsets that
   /// cannot be inconsistent with each other — a legitimate configuration this
-  /// crate documents as supported, which an all-or-nothing comparison banned.
+  /// crate documents as supported, and one an all-or-nothing comparison bans.
   ///
   /// A route that publishes no record of a type asserts nothing at that name for
   /// the other to disagree with, so that type is simply not compared. This is
@@ -329,8 +328,9 @@ where
   /// and screened out of conflict adjudication — on the family that carried
   /// them, which is the only family an echo of them can arrive on — so a late
   /// echo is read as this endpoint's own past rather than as a peer contesting
-  /// the replacement's name. Force-removal is the one relinquishing path that
-  /// used to skip that retention.
+  /// the replacement's name. Force-removal sends no goodbye, which does not make
+  /// it quiet — the retention is owed here exactly as at the other two
+  /// relinquishing paths.
   ///
   /// So `asserted` is the removed service's
   /// [`Service::withdrawal_snapshot`](crate::service::Service::withdrawal_snapshot)

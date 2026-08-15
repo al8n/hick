@@ -638,8 +638,9 @@ pub(crate) fn write_legacy_response(
   // A §6.7 legacy reply is NOT KAS-filtered — it echoes the full positive-TTL
   // record set, so it advertises every instance record and every host address.
   // Report exactly that so the caller latches goodbye ownership matching what
-  // went on the wire (previously misclassified as instance-XOR-host by
-  // the echoed question name, under/over-withdrawing on a later goodbye).
+  // went on the wire. Deriving it from the echoed QUESTION name instead splits
+  // the set into instance-XOR-host and under- or over-withdraws on a later
+  // goodbye.
   let emitted = EmittedRecords {
     ptr: true,
     srv: true,
@@ -988,8 +989,8 @@ where
 
   // PTR — canonical: the target name in case-folded WIRE form (length-octet +
   // label bytes …, root 0x00), which is what the one decoder yields for an
-  // inbound PTR under `RdataForm::FOLDED`. It used to be dot-joined bytes with
-  // no length prefixes, and that form is ambiguous as well as unmatched: labels
+  // inbound PTR under `RdataForm::FOLDED`. Dot-joined bytes with no length
+  // prefixes would not match the decoder, and are ambiguous besides: labels
   // `["a.b"]` and `["a", "b"]` join to the same string.
   {
     scratch.clear();

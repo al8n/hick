@@ -198,12 +198,10 @@ where
       self.config.answer_questions(),
       untrusted_response,
     );
-    // A datagram nothing may act on. Identical to the old
-    // `is_self_packet || untrusted_response`, because the map above answers
-    // "everything" for every other case.
+    // A datagram nothing may act on.
     let inert = admits.all_denied();
 
-    // ── Single eager section-validation latch ──────────────────────────────
+    // Single eager section-validation latch.
     // Walk ALL FOUR sections (questions, answers, authority, additional) once
     // to detect whether any record in any section fails to parse.  If so,
     // bump `parse_errors(1)` exactly once per datagram.
@@ -250,15 +248,11 @@ where
     // by the routing iterator — lenient routing (process valid parts) is
     // preserved.
     //
-    // NOTE on non-5353-source authority suppression: a well-formed
-    // authority record from a non-5353 source is suppressed by the routing
-    // iterator's Authority gate, but the DATAGRAM is still processed (its
-    // question/answer/additional sections are still routed).  A section-level
-    // suppression where the datagram's OTHER sections continue to be
-    // processed is NOT a datagram drop, so no `packets_dropped` is bumped.
-    // `packets_dropped` counts only whole-datagram rejects (invalid opcode,
-    // invalid rcode, and an all-denied datagram).  A code comment
-    // in the Authority arm documents this decision.
+    // `packets_dropped` counts only WHOLE-DATAGRAM rejects: invalid opcode,
+    // invalid rcode, and an all-denied datagram. A section-level suppression —
+    // the routing iterator's Authority gate on a non-5353 source, say — leaves
+    // the datagram's other sections routing, so it is not a drop and bumps
+    // nothing. The Authority arm restates this where it applies it.
     #[cfg(feature = "stats")]
     if !inert {
       let mut section_parse_error = false;

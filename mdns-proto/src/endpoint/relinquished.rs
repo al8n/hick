@@ -59,37 +59,22 @@
 //! confirmed send that emitted THAT record — and a relinquishment with no
 //! exposure retains nothing at all.
 //!
-//! # …and the MULTICAST half of that exposure, and only it
+//! # …and only the MULTICAST half of it, in the ENVELOPE the encoders wrote
 //!
-//! `GoodbyeOwnership` answers two questions, and this screen may read only the
-//! narrower one. What a peer may hold FROM US counts an RFC 6762 §6.7 legacy
-//! reply — a positive-TTL send of the full record set — because that resolver's
-//! cache holds those records and the §10.1 goodbye owes them a retraction. What
-//! could still be ECHOING does not: a legacy reply is addressed to one
-//! ephemeral port, nothing re-broadcasts it to the group, and this screen only
-//! ever asks about a MULTICAST arrival. A set whose only positive send was such
-//! a reply therefore has no echo of its own anywhere, and a row built from the
-//! wider half disowned a GENUINE peer's multicast record on the strength of
-//! bytes no multicast socket ever carried — the same terminal outcome from the
-//! other side, for the whole window.
+//! `GoodbyeOwnership` answers two questions and this screen may read only the
+//! narrower one. "A peer may hold this FROM US" counts an RFC 6762 §6.7 legacy
+//! reply, so the §10.1 goodbye owes those records a retraction; "a copy may
+//! still be ECHOING" does not, because that reply went to one ephemeral port and
+//! nothing re-broadcasts it to the group.
 //!
-//! # …and the WIRE ENVELOPE those bytes went out in
-//!
-//! Which SECTION, and the RFC 6762 §10.2 cache-flush bit. Both are asked through
+//! The same narrowing continues into the wire envelope — which SECTION, and the
+//! §10.2 cache-flush bit — asked through
 //! [`transmitted_envelope`](crate::service::transmitted_envelope), the one
-//! description of what this crate's positive multicast encoders write, so the
-//! screen cannot drift from them: SRV / TXT / A / AAAA in the ANSWER section, the
-//! §6.1 instance NSEC in the ADDITIONAL section, nothing at all in the AUTHORITY
-//! one, and every one of them with the bit SET.
+//! description of what this crate's positive multicast encoders write. Neither
+//! qualifier can reject a real echo, and both reject a conforming peer's
+//! ordinary browse answer.
 //!
-//! Neither qualifier can reject a real echo, because an echo is a re-DELIVERY of
-//! a datagram rather than a re-encoding of it: the header counts that place a
-//! record in its section, and the bit in its class field, are the ones this
-//! endpoint wrote. What they reject is a peer's ordinary browse answer — RFC 6763
-//! §12 has a responder bundle the addresses into ADDITIONAL beside the SRV that
-//! points at them, and this crate writes addresses only as ANSWERS, so such a
-//! record can be no echo of ours. Disowning it withheld the TERMINAL
-//! `HostConflict` for the whole retention window, on traffic nobody had to craft.
+//! [`asserts`] states each qualifier and the traffic it turns on.
 //!
 //! # Two tiers, one question
 //!
@@ -386,9 +371,7 @@ cfg_heap! {
   /// is the OPPOSITE ERROR. A record no transport ever accepted has no echo of
   /// ours to disown, so screening for it can only discard a GENUINE incumbent's
   /// records — letting a same-name successor finish probing and announce over a
-  /// peer that already holds the name. That is what a withdrawal with no
-  /// exposure at all used to do to every matching QR=1 record for the whole
-  /// retention window.
+  /// peer that already holds the name, for the whole retention window.
   ///
   /// # …and the RDATA FORM, which is the same condition one dimension further in
   ///
@@ -542,9 +525,8 @@ where
     ///  1. **Every in-flight withdrawal item.** A route-attached one is the
     ///     withdrawing route's own set, resident for the whole RFC 6762 §10.1
     ///     drain; a detached one is a §9 rename's abandoned instance name. Both
-    ///     are already skipped as conflict RECIPIENTS; this is where they are
-    ///     finally read as exculpatory EVIDENCE, which is the half that was
-    ///     missing.
+    ///     are also skipped as conflict RECIPIENTS; this is where they are read
+    ///     as exculpatory EVIDENCE.
     ///  2. **The retention list**, from the moment the item above is gone. See
     ///     [`Self::retain_relinquished`].
     ///  3. **The compact identity list**, which holds what a relinquishment
@@ -597,10 +579,10 @@ where
     /// All three sources compare the same bytes — `r`'s canonical FOLDED rdata
     /// — against their own stored form, and every one of them is a LIST: the
     /// resident withdrawal items, up to [`MAX_RELINQUISHED_RRSETS`] rows and up
-    /// to [`MAX_RELINQUISHED_IDENTITIES`] identities. Decoding per row made one
-    /// screen cost hundreds of canonicalizations of the same record. It is
-    /// decoded before the first source and handed down; `None` — rdata that
-    /// will not decode — is `false` everywhere, exactly as before.
+    /// to [`MAX_RELINQUISHED_IDENTITIES`] identities. Decoding per row would
+    /// cost one screen hundreds of canonicalizations of the same record. It is
+    /// decoded before the first source and handed down; `None` — rdata that will
+    /// not decode — is `false` at every source.
     ///
     /// The other half of the same bound is that the SCREEN itself runs once per
     /// section record rather than once per candidate service; that lives in
@@ -662,10 +644,10 @@ where
     /// # Generations, not owners
     ///
     /// Each relinquishment is its own row, living to its own expiry. Keying the
-    /// list by owner pair and letting a later relinquishment REFRESH the row was
+    /// list by owner pair and letting a later relinquishment REFRESH the row is
     /// a silent loss: a rapid `R1 → R2 → R3` reuse of one instance/host pair
-    /// destroyed `R1`'s protection while `R1`'s echoes were still in flight, so
-    /// a delayed `R1` adjudicated against `R3` and recreated the exact terminal
+    /// destroys `R1`'s protection while `R1`'s echoes are still in flight, so a
+    /// delayed `R1` adjudicates against `R3` and recreates the exact terminal
     /// conflict this screen exists to prevent. Only an IDENTICAL generation —
     /// the same records and the same exposure — merges, and it merges by taking
     /// the LATER expiry, which drops nothing because the identity set is the
@@ -687,9 +669,9 @@ where
     /// far less here than a row apiece.
     ///
     /// CAPACITY EXHAUSTION MUST NEVER BECOME A GLOBAL "THIS WAS OURS". An
-    /// endpoint-wide fallback — this used to set a quarantine deadline past
-    /// which [`Self::relinquished_asserts`] answered `true` for every candidate
-    /// — is wrong in SCALE even where it is right in kind. Withholding one
+    /// endpoint-wide fallback — a quarantine deadline past which
+    /// [`Self::relinquished_asserts`] answers `true` for every candidate — is
+    /// wrong in SCALE even where it is right in kind. Withholding one
     /// generation's conflicts risks that generation; withholding every
     /// conflict guarantees false negatives at every name the endpoint holds,
     /// for names it could still perfectly well have adjudicated. On-link peers

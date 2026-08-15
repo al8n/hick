@@ -85,12 +85,11 @@ where
   /// `answer_idx` advances, so the cursor is always paired with the
   /// current answer record.
   ///
-  /// Replaces the unbounded `std::Vec` buffering — that
-  /// allocated on the inbound packet path with infallible `push`, which
-  /// under allocator pressure aborts/panics instead of surfacing an
-  /// error, and used `Vec::remove(0)` for drain (O(n²) on large
-  /// fan-outs).  The cursor model is O(1) state per record, O(n) total
-  /// work, and never allocates.
+  /// A cursor rather than a buffer because the inbound packet path may not
+  /// allocate: `Vec::push` is infallible, so under allocator pressure it aborts
+  /// instead of surfacing an error, and draining a buffer with `Vec::remove(0)`
+  /// is O(n²) on large fan-outs. This is O(1) state per record, O(n) total work,
+  /// and never allocates.
   pub(crate) answer_query_cursor: Option<usize>,
   /// cursor for fanning out KnownAnswer / ProbeConflict /
   /// HostConflict events across multiple registered services that all
@@ -101,11 +100,10 @@ where
   /// `Some(k)` = resume scan from slab key `k`.  Reset to `None` when
   /// `answer_idx` advances.
   ///
-  /// Previously the service-side scan stopped at the first matching
-  /// service, so the actual owning service of a PTR known-answer
-  /// (which had the right rdata to suppress) never received the hint —
-  /// the unrelated first-matching service got it instead and ignored
-  /// it by rdata mismatch.
+  /// The scan may not stop at the first matching service: the one that owns a
+  /// PTR known-answer — and so holds the rdata that would suppress — need not be
+  /// the first to match, and an unrelated first match ignores the hint on rdata
+  /// mismatch, losing it.
   pub(crate) answer_service_cursor: Option<usize>,
   /// whether the answer-record service-phase fan-out is COMPLETE for
   /// the current `answer_idx`. `answer_service_cursor` alone is ambiguous
@@ -120,11 +118,9 @@ where
   /// current authority record; `Some(k)` = resume scan from slab key
   /// `k`.  Same shape as the other answer/question cursors.
   ///
-  /// Previously the authority-section loop broke on the first
-  /// matching service and advanced `authority_idx`, so a peer probe
-  /// for a shared host name reached only one of the services
-  /// sharing that host; the rest never received the HostConflict
-  /// signal.
+  /// Breaking on the first match and advancing `authority_idx` would deliver a
+  /// peer probe for a shared host name to only one of the services sharing that
+  /// host; the rest would never see the HostConflict.
   pub(crate) authority_service_cursor: Option<usize>,
   /// When a QUERY-packet answer matches a registered service for both a
   /// ProbeConflict and a KnownAnswer event, we emit ProbeConflict first and
@@ -267,27 +263,6 @@ where
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
 {
-  /// the ONE conflict-routing decision for a record `r`,
-  /// shared by the Answers, Authority, and Additional sections (previously
-  /// triplicated). Scans registered services from slab key `start` and returns
-  /// the next `(key, event)`:
-  ///   * instance-name match, ANY rrtype → ProbeConflict. §8.1's input is every
-  ///     type at a name being probed, so the router routes every type and the
-  ///     narrower §9 rule is applied by `Service` on the established side.
-  ///     Service-type / shared names are never conflicts;
-  ///   * host-name match + A/AAAA → HostConflict.
-  ///
-  /// `origin` is the caller's witness for HOW `r` arrived, and it is a
-  /// parameter rather than something inferred here because only the caller
-  /// knows: this helper sees one record and cannot tell an Authority-section
-  /// proposal from an Answer-section assertion. It rides on the `ProbeConflict`
-  /// so `Service` can apply §8.2's tiebreak to a peer's tentative probe and
-  /// §8.1/§9 to a peer's response — different rules over different inputs. See
-  /// [`ConflictOrigin`].
-  ///
-  /// conflicts are only routed for class-IN records — a record with
-  /// class ANY or an unknown class is not the same-class RRset RFC 6762 §9
-  /// requires, so it must not drive rename / host-conflict surfacing.
   /// Does this datagram's Authority Section carry at least one record proposing
   /// something about `name`? A §8.2 proposal is only worth delivering if it
   /// proposes something about a name we own.
@@ -297,7 +272,7 @@ where
   /// EVERY positive-TTL IN record at the name counts, not just SRV/TXT. The
   /// uniqueness question a probe asks is type ANY, so the peer's proposed list —
   /// the one §8.2.1 sorts against ours — is everything it puts at that name.
-  /// Filtering to SRV/TXT here made a peer proposing only an AAAA invisible:
+  /// Filtering to SRV/TXT here makes a peer proposing only an AAAA invisible:
   /// that peer folds our SRV/TXT into its own comparison, finds its AAAA sorts
   /// later, and continues as the winner, while this endpoint receives no
   /// `ProbeProposal` at all and also continues. Two conforming peers, one name,
@@ -329,11 +304,10 @@ where
   ///
   /// Both halves above are [`ProposalScope`], USED rather than restated —
   /// `service::proposal::adjudicate` scopes the fold with the same type over the
-  /// same records, so the two layers cannot answer differently. Spelling the rule
-  /// out twice is exactly what produced the SRV/TXT defect: the fold's copy was
-  /// corrected and this one was left, and a peer proposing a type we do not
-  /// publish went unseen by a whole endpoint while it considered itself the
-  /// winner.
+  /// same records, so the two layers cannot answer differently. A second
+  /// spelling of the rule is what produces the SRV/TXT defect above: correct one
+  /// copy, leave the other, and a peer proposing a type we do not publish goes
+  /// unseen by a whole endpoint while it considers itself the winner.
   ///
   /// The invariant that buys — ROUTING OVER-APPROXIMATES VERDICTS: if the fold
   /// would reach `PeerWins` or `WeHold` for a datagram, a `ProbeProposal` was
@@ -532,6 +506,26 @@ where
     None
   }
 
+  /// The ONE conflict-routing decision for a record `r`, shared by the Answers,
+  /// Authority and Additional sections. Scans registered services from slab key
+  /// `start` and returns the next `(key, event)`:
+  ///   * instance-name match, ANY rrtype → ProbeConflict. §8.1's input is every
+  ///     type at a name being probed, so the router routes every type and the
+  ///     narrower §9 rule is applied by `Service` on the established side.
+  ///     Service-type / shared names are never conflicts;
+  ///   * host-name match + A/AAAA → HostConflict.
+  ///
+  /// Conflicts are only routed for class-IN records — a record with class ANY or
+  /// an unknown class is not the same-class RRset RFC 6762 §9 requires, so it
+  /// must not drive rename / host-conflict surfacing.
+  ///
+  /// `origin` is the caller's witness for HOW `r` arrived, and it is a parameter
+  /// rather than something inferred here because only the caller knows: this
+  /// helper sees one record and cannot tell an Authority-section proposal from
+  /// an Answer-section assertion. It rides on the `ProbeConflict` so `Service`
+  /// can apply §8.2's tiebreak to a peer's tentative probe and §8.1/§9 to a
+  /// peer's response — different rules over different inputs. See
+  /// [`ConflictOrigin`].
   fn next_service_conflict(
     &mut self,
     r: &crate::wire::Ref<'a>,
@@ -542,25 +536,24 @@ where
     if r.rclass() != ResourceClass::In {
       return None;
     }
-    // ── THE RELINQUISHED-RRSET SCREEN ────────────────────────────────────────
+    // THE RELINQUISHED-RRSET SCREEN.
     //
     // RFC 6762 §9's "identical rdata is never a conflict", asked of what this
     // ENDPOINT recently asserted rather than only of what the receiving service
     // still publishes. It is a whole-record answer, so it is taken once here
     // rather than per candidate route.
     //
-    // A LABEL FOR THE INSTANCE HALF, A SUPPRESSION FOR THE HOST HALF, and the
-    // asymmetry is the whole of this round's change. A match cannot mean "this
-    // was ours" — a §9 fault-tolerance twin publishing identical rdata is
-    // indistinguishable from our own ghost at the instant of the lookup, and §9
-    // exists to protect exactly that twin. What a match licenses therefore
-    // depends on what the receiver would DO with it:
+    // A LABEL FOR THE INSTANCE HALF, A SUPPRESSION FOR THE HOST HALF. A match
+    // cannot mean "this was ours" — a §9 fault-tolerance twin publishing
+    // identical rdata is indistinguishable from our own ghost at the instant of
+    // the lookup, and §9 exists to protect exactly that twin. What a match
+    // licenses therefore depends on what the receiver would DO with it:
     //
     //   * A pre-authoritative `ProbeConflict` costs, at most, §8.2's one-second
     //     deferral — and §8.2's own script separates the two cases for us,
     //     because a ghost cannot answer the re-probe and a live incumbent can.
     //     So it is DELIVERED carrying [`ConflictHistory::Relinquished`] and the
-    //     service defers instead of renaming. Dropping it here instead let a
+    //     service defers instead of renaming. Dropping it here instead lets a
     //     successor probe and announce clean over an incumbent inside the
     //     retention window: a defence that never reaches a service is not merely
     //     delayed, it is unappealable.
@@ -604,13 +597,13 @@ where
     // `A1`; only the endpoint can, which is why the screen is here and not in
     // `Service::handle_event` beside the rule it extends.
     //
-    // It is NOT a fourth attempt at RECOGNISING the datagram as our own echo.
-    // Three of those failed, and the reasons are in `endpoint::relinquished`:
-    // a replaying peer reproduces every signal a driver's send log weighs, one
-    // send can be delivered as several copies while a credit is spent once, and
-    // recognition state is evicted under traffic while the obligation is per
-    // copy. This screen turns on none of that — it reads what this endpoint
-    // published and gave up.
+    // It is NOT an attempt at RECOGNISING the datagram as our own echo, and no
+    // such attempt can be sound — the three independent reasons are in
+    // `endpoint::relinquished`: a replaying peer reproduces every signal a
+    // driver's send log weighs, one send can be delivered as several copies
+    // while a credit is spent once, and recognition state is evicted under
+    // traffic while the obligation is per copy. This screen turns on none of
+    // that — it reads what this endpoint published and gave up.
     //
     // ASKED OF THIS DATAGRAM'S OWN FAMILY. A multicast datagram travels back
     // over a socket that carried it out, so a record only IPv4 ever transmitted
@@ -620,8 +613,8 @@ where
     //
     // AND ONCE PER RECORD, not once per candidate service. The answer does not
     // vary with the route, but this helper is re-entered after every match the
-    // cursor yields, so a record matching S services scanned the whole history
-    // S + 1 times. See `RouteEvents::relinquished_screen`.
+    // cursor yields, so an uncached record matching S services would scan the
+    // whole history S + 1 times. See `RouteEvents::relinquished_screen`.
     let history = self.relinquished_screens(r, slot);
     for (key, route) in self.endpoint.services.iter() {
       if key < start {
@@ -631,18 +624,18 @@ where
       // draining) — never route a conflict to it. The route is retained for the
       // name guard, but dispatching ProbeConflict/HostConflict here would feed
       // terminal events into a proto the driver no longer drains (it skips
-      // withdrawing/errored contexts), letting a peer flood the proto event slab of
-      // a retiring service until GC — a bounded-time but unbounded-size growth path
-      //. Mirrors the question-dispatch and known-answer skips.
+      // withdrawing/errored contexts), letting a peer flood the proto event slab
+      // of a retiring service until GC — a bounded-time but unbounded-size
+      // growth path. Mirrors the question-dispatch and known-answer skips.
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       if route.withdrawing {
         continue;
       }
-      // HOST first, INSTANCE second — the reverse of the old order, and only
-      // observable when one service's instance and host names are the SAME
-      // name. The instance test below no longer screens by rtype, so leading
-      // with it would swallow an A/AAAA that the host test owns and turn a
-      // `HostConflict` into a `ProbeConflict`. Testing the narrower rule first
+      // HOST first, INSTANCE second, which is only observable when one service's
+      // instance and host names are the SAME name. The instance test below does
+      // not screen by rtype, so leading with it would swallow an A/AAAA that the
+      // host test owns and turn a `HostConflict` into a `ProbeConflict`. Testing
+      // the narrower rule first
       // keeps every A/AAAA-at-the-host-name decision the host rule's, and
       // confines the widening to records only the instance test claims.
       //
@@ -681,9 +674,8 @@ where
             )),
           ));
         }
-        // THE LABELLED RECORD RAISES NO `HostConflict`, exactly as before the
-        // label existed — the terminal consequence is the cell that did not
-        // change.
+        // THE LABELLED RECORD RAISES NO `HostConflict`: the terminal
+        // consequence is the one a history match still suppresses outright.
         //
         // WHAT THE DROP MAY NOT ALSO DO is answer for the INSTANCE role. When
         // this route's instance name IS its host name the record belongs to BOTH
@@ -691,22 +683,21 @@ where
         // service is probing with, and §8.1's "any conflicting Multicast DNS
         // response" covers every type at a name being probed. Role precedence
         // decides which EVENT a record becomes; it may not decide that the
-        // record is no conflict at all. An unconditional `continue` here —
-        // placed to stop a suppressed `HostConflict` sliding into the instance
-        // arm — discarded a live incumbent's defence of a name we were actively
-        // probing, and the successor then completed probing and announcing over
-        // it: precisely the usurpation the pre-authoritative cell was rewritten
-        // to close, reached through the other role.
+        // record is no conflict at all. An unconditional `continue` here — the
+        // obvious way to stop a suppressed `HostConflict` sliding into the
+        // instance arm — discards a live incumbent's defence of a name we are
+        // actively probing, and the successor then completes probing and
+        // announcing over it: precisely the usurpation the pre-authoritative
+        // cell prevents, reached through the other role.
         //
         // So a route wearing both roles for this owner FALLS THROUGH to the
         // instance rule below and takes the labelled `ProbeConflict`. A route
-        // with no second role to fall through to is skipped as before.
+        // with no second role to fall through to is skipped.
         if !names_match_record(route.name(), r) {
-          // EXTENDING "the cell that did not change", above: that stays true
-          // AND becomes observable rather than silent. Standing obligation,
-          // filed as issue #92 — once host-name ownership gets its own probing
-          // and defence, this suppression becomes delivery-labelled, exactly
-          // as the instance cells already are.
+          // The suppression stands here, but observably rather than silently.
+          // Standing obligation, filed as issue #92 — once host-name ownership
+          // gets its own probing and defence, this becomes delivery-labelled,
+          // exactly as the instance cells already are.
           warn!(
             target: "mdns_proto::endpoint",
             handle = route.handle().raw(),
@@ -722,11 +713,11 @@ where
         // CONSEQUENCE does not unprove the host AUTHORITY: this route publishes
         // an RRset of this rrtype at this name, which is §9's "a unique record
         // for which it is currently authoritative" in as many words. Delivering
-        // the record as a bare instance-role conflict threw that away, and the
-        // ESTABLISHED cell then dropped it — `canonical_rdata_forms` names SRV,
+        // the record as a bare instance-role conflict throws that away, and the
+        // ESTABLISHED cell then drops it — `canonical_rdata_forms` names SRV,
         // TXT and NSEC and never an address, so its instance-authority gate
         // answers "we assert no record of this type at this name" for an A/AAAA
-        // that we do in fact assert there. The same peer response was therefore
+        // that we do in fact assert there. The same peer response would then be
         // handled while probing and silently discarded once announced.
         //
         // The host cell's own reason for suppressing does not reach this case.

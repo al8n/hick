@@ -161,8 +161,8 @@ pub(crate) enum Admission {
 ///
 /// A new screen means a new variant here, and the variant's documentation must
 /// defend that the records it excludes belong to SOMEONE ELSE'S proposal. That
-/// review is deliberately hard to pass, and three screens that once lived on
-/// this path would each have failed it visibly:
+/// bar is deliberately hard to clear, and three screens that look reasonable
+/// each fail it visibly:
 ///
 /// * a QTYPE screen — the sender's own QTYPE says what it wants ANSWERED; §8.2
 ///   makes its Authority Section what it CLAIMS, and the two are different
@@ -175,7 +175,7 @@ pub(crate) enum Admission {
 ///   unsolicited RESPONSE, a different message in a different section. The
 ///   excluded records are the peer's own.
 ///
-/// Each shortened the peer's list, and by [`Admission`]'s reasoning each could
+/// Each shortens the peer's list, and by [`Admission`]'s reasoning each could
 /// decide the name in either direction over a list the peer never sent.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum NotOurs {

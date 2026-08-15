@@ -340,8 +340,8 @@ cfg_heap! {
     /// `probe_on_wire`; every regression that could park a record-carrying token
     /// (the §9 revert, the §8.2 deferral) clears `probe_on_wire`; and a parked
     /// token makes `poll_transmit` return `Ok(None)`, so no probe can be sent to
-    /// re-open it. §8.2 used to rename and never needed `probe_on_wire` — it was
-    /// the way through, and RFC 6762 §8.2's deferral closed it.
+    /// re-open it. A §8.2 arm that renamed without needing `probe_on_wire` would
+    /// be the way through; RFC 6762 §8.2's deferral is what removes it.
     /// `no_rename_is_reachable_with_an_announcement_parked_across_a_section9_revert`
     /// asserts the closure. Kept as a backstop rather than deleted: the argument
     /// rests on four separate invariants, and the failure it guards against —
@@ -580,8 +580,8 @@ cfg_heap! {
     ///
     /// This projection is what keeps the family dimension cheap everywhere else:
     /// a withdrawal snapshot, a rename handoff, a withdrawal item and a
-    /// relinquished row all carry `[EmittedRecords; 2]`, so every consumer that
-    /// used to read one exposure now reads its own family's — with no new
+    /// relinquished row all carry `[EmittedRecords; 2]`, so every consumer reads
+    /// its own family's half — with no new
     /// vocabulary, and with no way to read the wrong half, because the pair is
     /// only ever taken apart through
     /// [`Family::pick_ref`](crate::transmit::Family::pick_ref).
@@ -2132,17 +2132,18 @@ where
   ///
   /// The phase's own schedule is the §8.3 spacing — the doubling ladder while
   /// announcing, the periodic refresh once `Established` — and the per-family
-  /// term is the TTL bound. Composing them subsumes two arms this used to need:
+  /// term is the TTL bound. Composing them subsumes the two separate re-arms
+  /// this would otherwise need, each of which is wrong on its own:
   ///
-  /// * the honest-partial re-arm, which climbed the ladder to keep the served
-  ///   family's spacing legal but measured staleness per ROUND, so alternating
-  ///   families each fell a full interval behind;
-  /// * the excused re-arm, which REPLACED `Established`'s pre-armed periodic
-  ///   deadline with the earned rung so the missing family was not stranded a
-  ///   whole refresh interval away. A family in good standing now pulls the
-  ///   deadline in by itself, and one that has spent the core's patience is
-  ///   deliberately no longer chased — chasing it is what floods the healthy
-  ///   family at the one-second floor.
+  /// * an honest-partial re-arm that climbs the ladder to keep the served
+  ///   family's spacing legal, but measures staleness per ROUND, so alternating
+  ///   families each fall a full interval behind;
+  /// * an excused re-arm that REPLACES `Established`'s pre-armed periodic
+  ///   deadline with the earned rung so the missing family is not stranded a
+  ///   whole refresh interval away. Under the composed rule a family in good
+  ///   standing pulls the deadline in by itself, and one that has spent the
+  ///   core's patience is deliberately not chased — chasing it is what floods
+  ///   the healthy family at the one-second floor.
   ///
   /// `Established` is where the ladder retires: the announcement burst is over,
   /// the periodic refresh is the rate limit, and the ladder's cap was that same
@@ -2468,9 +2469,9 @@ where
   /// `probe_on_wire`, both §8 latches, `generation_advertised`, `partial_rounds`,
   /// the response cycle — belongs to [`Service::restart_probe_cycle`], which
   /// every regress path runs including this one, and which a rename calls just
-  /// before this. They used to be set in both places; that is harmless while the
-  /// two agree and is exactly the drift that made a regress path's post-state
-  /// hard to reason about, so each fact now has one owner. The test for whether
+  /// before this. Setting them in both places is harmless while the two agree,
+  /// and is exactly the drift that makes a regress path's post-state hard to
+  /// reason about, so each fact has one owner. The test for whether
   /// something belongs here: would a SAME-name regress (§9's revert, §8.2's
   /// deferral) want it? If yes it is the generation's, not the name's —
   /// `fully_announced` is the canonical example of one that is genuinely the
@@ -2826,19 +2827,18 @@ where
   /// about a record whose rdata DIFFERS from ours (or, for a tentative probe, a
   /// proposal that may or may not tie as a whole list).
   ///
-  /// Five rounds of review each found the next cell nobody had enumerated, so
-  /// here is the whole table. The rows are the only three phases that change a
-  /// decision, and they are named by what is TRUE OF THE WIRE rather than by the
-  /// state enum, because that is what each RFC rule actually keys on and it is
-  /// the state name that kept drifting from it.
+  /// The whole table, because an unenumerated cell is a cell decided by
+  /// accident. The rows are the only three phases that change a decision, and
+  /// they are named by what is TRUE OF THE WIRE rather than by the state enum,
+  /// because that is what each RFC rule actually keys on — a state name drifts
+  /// from it.
   ///
-  /// The two instance columns are now two TYPES, not two values of one field: a
+  /// The two instance columns are two TYPES, not two values of one field: a
   /// peer's tentative proposal arrives as `ProbeProposal` carrying a whole
   /// Authority Section, and an authoritative record arrives as `ProbeConflict`.
   /// The rules take different units of input, so they take different events, and
   /// a partial proposal is unrepresentable rather than screened for.
-  /// `ConflictOrigin` survives only on `HostConflict`, whose per-record shape is
-  /// unchanged.
+  /// `ConflictOrigin` survives only on `HostConflict`, whose shape is per record.
   ///
   /// | phase | instance / `ProbeProposal` (§8.2) | instance / `ProbeConflict` (response) | host / TentativeProbe | host / AuthoritativeResponse |
   /// |---|---|---|---|---|
@@ -2848,13 +2848,12 @@ where
   /// | **C. advertised** (`generation_advertised`) | not §9 — defend by answering the probe's own question (§8.1) | §9: revert to probing; the history label buys no exemption | ignore (filed gap) | §9: surface terminal `HostConflict` |
   /// | **D. terminal** (`Conflicting`) | ignore | ignore | ignore | §9: surface terminal `HostConflict` — see below |
   ///
-  /// # Row D's host column is NOT "ignore", and the CODE states the better rule
+  /// # Row D's host column is NOT "ignore"
   ///
   /// The `HostConflict` arm is `(_, ServiceEvent::HostConflict(hc))` — a
   /// wildcard state, gated only by the [`ConflictOrigin`](crate::event::ConflictOrigin)
   /// test — so a `Conflicting` service surfaces the terminal update like any
-  /// other. This row used to read "ignore" in all four columns and was wrong in
-  /// the fourth; the DOC was corrected rather than the code.
+  /// other.
   ///
   /// `Conflicting` is the INSTANCE name's terminal state and nothing else. It is
   /// entered from exactly one place — when §8.1's rename cannot produce a valid
@@ -2864,8 +2863,8 @@ where
   /// caller told to "rename and restart" needs: re-registering under a fresh
   /// instance name with the same host walks straight back into it.
   ///
-  /// Making the code match the doc would also put a lifecycle dependence into
-  /// the ONE column that has none. The host name is never probed here, so
+  /// Making it "ignore" would also put a lifecycle dependence into the ONE
+  /// column that has none. The host name is never probed here, so
   /// `is_preauthoritative` has nothing to say about it and rows A through C
   /// already answer identically; row D would become the sole exception, to save
   /// a duplicate that is benign anyway — `pending_updates` is a set, and a
@@ -2882,7 +2881,7 @@ where
   /// | cell | with the label | why |
   /// |---|---|---|
   /// | **B / B′, instance `ProbeConflict`** | §8.2's regress instead of §8.1's rename — `tiebreak_lost`, one second, SAME name | reversible, and the re-probe is the only thing that can tell a ghost from a twin |
-  /// | **C, instance `ProbeConflict`** | nothing — §9's revert runs exactly as it would unlabelled | that revert already IS the re-verification: same name, rate-limited, reversible. Dropping it instead consumed a conforming peer's whole BOUNDED §8.3 burst inside the window, and nothing replays a conflict at expiry |
+  /// | **C, instance `ProbeConflict`** | nothing — §9's revert runs exactly as it would unlabelled | that revert already IS the re-verification: same name, rate-limited, reversible. Dropping it instead consumes a conforming peer's whole BOUNDED §8.3 burst inside the window, and nothing replays a conflict at expiry |
   /// | **any host / AuthoritativeResponse** | the `HostConflict` is dropped, in the router | terminal and caller-visible, and the HOST NAME is never probed — there is no re-probe whose silence could convict a ghost |
   ///
   /// The last row drops an EVENT, not a record. Where a route's instance name IS
@@ -2907,19 +2906,19 @@ where
   ///   than a conflict the instance classifier cannot even read;
   /// * row C's instance-authority gate — `canonical_rdata_forms`, whose domain
   ///   is SRV / TXT / NSEC — is not asked of it, because the authority in
-  ///   question is the host name's. Asking it dropped every labelled A/AAAA the
-  ///   moment the service announced, so the same peer response was handled in
-  ///   rows B / B′ and discarded in row C.
+  ///   question is the host name's. Asking it drops every labelled A/AAAA the
+  ///   moment the service announces, so the same peer response would be handled
+  ///   in rows B / B′ and discarded in row C.
   ///
   /// What the label is NOT is "this record was ours". That question has no
   /// answer at the instant of the lookup: §9 protects a fault-tolerance twin
   /// "capable of issuing identical answers", and such a twin's defence is
-  /// byte-identical to our own ghost's echo. Row B once acted as though a match
-  /// settled it — the record never reached a service at all — and a successor
-  /// could then probe and announce clean over an incumbent that was defending
-  /// correctly, inside the retention window and with nothing replaying the lost
-  /// defences afterwards. Deferring asks the only question that CAN separate
-  /// them, and asks it of the future rather than of a table.
+  /// byte-identical to our own ghost's echo. A row B that acted as though a
+  /// match settled it would never let the record reach a service at all, and a
+  /// successor could then probe and announce clean over an incumbent that was
+  /// defending correctly — inside the retention window, with nothing replaying
+  /// the lost defences afterwards. Deferring asks the only question that CAN
+  /// separate them, and asks it of the future rather than of a table.
   ///
   /// Where each decision lives: rows A and B are this method, plus the
   /// `probe_defeated` / `tiebreak_lost` latches it
@@ -2929,8 +2928,8 @@ where
   /// under `answer_questions(false)`, which exempts a probe for a unique name).
   /// The host column is the `HostConflict` arm.
   ///
-  /// Row B′ is the one this table originally omitted, and the omission is
-  /// instructive: §9 deliberately KEEPS goodbye ownership across its revert,
+  /// Row B′ is the easiest row to leave out, because two obligations run
+  /// together there. §9 deliberately KEEPS goodbye ownership across its revert,
   /// because peers still hold the previous generation's records under this same
   /// name and a §10.1 withdrawal must still retract them. But §9 also sends the
   /// responder "through the startup steps described above in Section 8", so the
@@ -2941,8 +2940,8 @@ where
   /// # A classification and its decision are joined by a stored witness
   ///
   /// Not by re-deriving a predicate at each site. State moves between them, so
-  /// the same predicate asked twice is not the same answer — three findings in
-  /// this crate have now been exactly that shape:
+  /// the same predicate asked twice is not the same answer, and this crate has
+  /// been wrong that way three separate ways:
   ///
   /// * the classification arm and the decision site keyed on DIFFERENT
   ///   predicates, so a conflict was classified and its latch never spent;
@@ -3018,15 +3017,15 @@ where
     // name — applying it here would let a later-sorting newcomer keep probing
     // toward a name an existing responder holds, and then take it.
     //
-    // ── THE HISTORY-LABELLED DEFEAT ─────────────────────────────────────────
+    // THE HISTORY-LABELLED DEFEAT.
     //
     // The record repeats rdata this endpoint recently transmitted and gave up
     // (see [`crate::event::ConflictHistory`]), so it is EITHER our own delayed
     // echo — a rename or unregister whose records are still in flight — OR a §9
-    // fault-tolerance twin defending the name with the same bytes we used to
-    // publish. At this instant those two ARE the same datagram and no lookup can
-    // separate them: §9 exists precisely to protect the twin, and the twin's
-    // defence is byte-for-byte what the ghost's echo would be.
+    // fault-tolerance twin defending the name with the bytes we published until
+    // that relinquishment. At this instant those two ARE the same datagram and
+    // no lookup can separate them: §9 exists precisely to protect the twin, and
+    // the twin's defence is byte-for-byte what the ghost's echo would be.
     //
     // Only FUTURE behaviour separates them, and §8.2 already knows how to ask.
     // "It defers to the winning host by waiting one second, and then begins
@@ -3038,10 +3037,10 @@ where
     // that defeat renames us — §8.1 honoured, late rather than never.
     //
     // Latching §8.2's regress rather than §8.1's rename is the whole difference,
-    // and it is a REGRESS, not a suppression: the endpoint used to drop this
-    // record before any service saw it, which let a successor probe and announce
-    // clean over an incumbent that was defending its name correctly. A defence
-    // that reaches no service is not delayed, it is unappealable — while a
+    // and it is a REGRESS, not a suppression. Dropping this record in the
+    // endpoint before any service saw it would let a successor probe and
+    // announce clean over an incumbent that was defending its name correctly: a
+    // defence that reaches no service is not delayed, it is unappealable. A
     // deferral costs a second and claims nothing in the meantime, because
     // `conflict_classified_unresolved` withholds every claim to this name until
     // the latch is spent.
@@ -3253,20 +3252,17 @@ where
         // unique record for which it is currently authoritative, and it
         // receives a Multicast DNS RESPONSE message containing a record with
         // the same name, rrtype and rrclass, but inconsistent rdata." A peer
-        // merely PROBING this name is not that. The right answer to a probe for
-        // a name we own is to defend it, which §8.1 requires and which the
-        // `Question` arm below already does — that probe carries a question for
-        // this name, and answering it is what makes the prober back off. Letting
-        // the probe's Authority record through here instead would regress an
-        // established service to probing on demand: any host that probes our
-        // name could stop us serving it, and could then take it from us on the
-        // §8.2 tiebreak that the re-probe runs.
-        // No origin test needed: a `ProbeConflict` IS a response now, and a peer
-        // merely PROBING a name we own arrives as `ProbeProposal`, which this
-        // arm does not match — so §9's "receives a Multicast DNS response
-        // message" is satisfied by the type rather than by a check. The right
-        // answer to a probe for a name we own is still to defend it, which the
-        // `Question` arm does from the same datagram.
+        // merely PROBING this name is not that, and needs no origin test to
+        // exclude: it arrives as `ProbeProposal`, which this arm does not match,
+        // so §9's "receives a Multicast DNS response message" is satisfied by
+        // the event TYPE rather than by a check. The right answer to such a
+        // probe is to defend the name, which §8.1 requires and which the
+        // `Question` arm does from the same datagram — answering the probe's
+        // question is what makes the prober back off. Letting the probe's
+        // Authority record through here instead would regress an established
+        // service to probing on demand: any host that probes our name could stop
+        // us serving it, and could then take it from us on the §8.2 tiebreak
+        // that the re-probe runs.
         //
         // The rtype screen is §9's OWN — "a unique record for which it is
         // CURRENTLY AUTHORITATIVE … with the same name, rrtype and rrclass" —
@@ -3278,12 +3274,13 @@ where
         //
         // "Authoritative for" is asked of the RECORD SET, through the same
         // function the classifier just used, rather than of a hand-written list
-        // of rrtypes. The hand-written one — `Srv | Txt` — went stale when
-        // `canonical_rdata_forms` gained its NSEC arm: a peer's authoritative,
-        // cache-flushed NSEC at this instance name with DIFFERENT rdata was
-        // classified as conflicting and then dropped here for being an NSEC, so
-        // an NSEC-only response left duplicate ownership of this name undetected
-        // until unrelated SRV/TXT traffic arrived. A shared PTR is still
+        // of rrtypes. A hand-written `Srv | Txt` goes stale the moment
+        // `canonical_rdata_forms` gains an arm, as it did for NSEC: a peer's
+        // authoritative, cache-flushed NSEC at this instance name with DIFFERENT
+        // rdata is classified as conflicting and then dropped here for being an
+        // NSEC, so an NSEC-only response leaves duplicate ownership of this name
+        // undetected until unrelated SRV/TXT traffic arrives. A shared PTR is
+        // still
         // excluded, and by the rule rather than by a special case: it is owned
         // by the service-type name, so this set asserts no form of it.
         //
@@ -3295,7 +3292,7 @@ where
         // `UnownedRrtype` and never reaches this arm). Asking the instance
         // question of it returns "we assert no record of this type at this
         // name" for an address we assert at exactly this name, so the §9 reset
-        // this cell exists to run never ran — the record was handled while
+        // this cell exists to run would never run — the record handled while
         // probing, where §8.1 admits every type, and silently dropped the moment
         // the service announced. See [`crate::event::ConflictRole`].
         if pc.role().is_instance()
@@ -3338,9 +3335,9 @@ where
         // on a labelled record.
         //
         // A record whose rdata will not decode is not one this service can
-        // reason about; drop it rather than revert on it. The identical-rdata
-        // check that used to follow is now the precondition above
-        // `match (self.state, event)`, so every arm gets it.
+        // reason about; drop it rather than revert on it. The identical-rdata check
+        // is the precondition above `match (self.state, event)`, so every arm
+        // gets it.
         if pc.record().canonical_rdata_folded().is_err() {
           return;
         }
@@ -3678,14 +3675,14 @@ where
         // but never probed, and no peer's `Question` arm matches it unless that
         // peer happens to share the instance name too.
         //
-        // Two consequences, both predating the origin witness and neither
-        // introduced by it. A peer probing instance B with OUR host H gets no
-        // defence from us, because our question-matching never sees a question
-        // for H. And two fresh peers proposing the same H never tiebreak their
-        // host RRsets, so both can announce it. What the arm above changes is
-        // only WHEN the loser finds out: previously a peer's probe retired us
-        // immediately (letting any host retire every service sharing a host
-        // name), now the peer's ANNOUNCEMENT does — a response, which is what §9
+        // Two consequences follow from the gap, and the origin test below
+        // neither causes nor closes them. A peer probing instance B with OUR
+        // host H gets no defence from us, because our question-matching never
+        // sees a question for H. And two fresh peers proposing the same H never
+        // tiebreak their host RRsets, so both can announce it. What the origin
+        // test decides is only WHEN the loser finds out. A peer's PROBE does not
+        // retire us — that would let any host retire every service sharing a
+        // host name — its ANNOUNCEMENT does: a response, which is what §9
         // defines the conflict over, and the same end state by the legitimate
         // route.
         //
@@ -3709,9 +3706,8 @@ where
         // host A/AAAA whose address is one WE advertise is consistent (our own
         // multicast echo, or another instance correctly sharing the host) — not
         // a conflict. Ignore it; surface HostConflict only for a genuinely
-        // different address.
-        // The identical-rdata check that used to live here is the precondition
-        // above `match (self.state, event)`, so every arm gets it.
+        // different address. The identical-rdata check is the precondition above
+        // `match (self.state, event)`, so every arm gets it.
 
         // A peer is claiming our host name (A/AAAA owner) with a DIFFERENT
         // address. Unlike an instance-name conflict we do NOT auto-rename —
@@ -3816,13 +3812,13 @@ where
         // beginning after one second, and `poll_transmit` withholds every claim
         // to the name until then because the classification is still unresolved.
         //
-        // This TERMINATES, which is what previously blocked it: §8.2 explains
+        // This TERMINATES, which is what makes the deferral safe: §8.2 explains
         // that "if the winning simultaneous probe was from a real other host on
         // the network, then after one second it will have completed its probing,
         // and will answer subsequent probes." That answer is a RESPONSE, which
         // is `defeated_by_owner` above, which renames. Telling the two apart is
-        // exactly what `ConflictOrigin` bought — before it, an unconditional
-        // defer could loop against a real owner forever.
+        // what `ConflictOrigin` is for: an unconditional defer would otherwise
+        // loop against a real owner forever.
         //
         // A HISTORY-LABELLED defeat reaches this same branch, and its
         // termination argument is a DIFFERENT one, because the incumbent's next
