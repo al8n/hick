@@ -459,6 +459,7 @@ pub mod stats {
 
   /// Point-in-time snapshot of every [`Stats`] counter and gauge.
   #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+  #[non_exhaustive]
   pub struct StatsSnapshot {
     // Counters
     pub packets_rx: u64,

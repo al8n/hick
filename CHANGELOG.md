@@ -178,6 +178,36 @@
   completed. None of the four bundled drivers call this method directly, so
   this breaks only a direct caller of the `mdns-proto` core — exactly who has
   no wrapper to shield them and no other way to learn of it.
+- `hick-trace`: **BREAKING** — `StatsSnapshot` is now `#[non_exhaustive]`, and
+  gains the field `relinquished_host_conflicts_suppressed`, with the matching
+  `Stats` counter exported as `mdns_relinquished_host_conflicts_suppressed`.
+  The attribute is the breaking half: a downstream crate can no longer build a
+  `StatsSnapshot` with a struct literal, and that includes functional-update
+  syntax — `StatsSnapshot { conflicts: 3, ..Default::default() }` no longer
+  compiles outside `hick-trace`. Reads, `Default::default()`, `Clone`/`Copy`
+  and comparisons are unaffected, and nothing in this workspace constructed or
+  destructured one, so no bundled driver changes. It is deliberate and it is
+  the reason to do it in this release: the type exists to be read rather than
+  built, it accrues a counter whenever an accepted residual needs to become
+  observable, and without the attribute each of those is another breaking
+  change to `hick-trace` — which in practice means the counter does not get
+  added and the residual stays silent. From here a new counter is additive.
+  This is the first breaking change to `hick-trace`, which two earlier entries
+  in this file describe as unaffected. What the new counter counts is the one
+  place the relinquished screen still
+  DROPS a conflict rather than labelling it: a peer's record matching this
+  endpoint's own recently-relinquished history at a HOST name, on a route whose
+  instance name differs, leaving no instance role to fall through to. That drop
+  is deliberate and stays — the host cell has no recoverable, self-verifying
+  consequence to spend a label on, the way an instance cell spends one on
+  §8.2's defer-and-re-probe, so delivering it anyway would trade an
+  unverifiable silent error for an unverifiable loud one at higher frequency,
+  and a renamed host does not un-rename. Tracked as issue #92 (host-name
+  ownership), which carries the obligation that once the host name gets its own
+  probing and defence, this suppression becomes delivery-labelled like the
+  instance cells. Until then the counter is the only field evidence the
+  suppression ever ran — it was previously silent, which is why it took
+  adversarial review rather than a bug report to surface it.
 
 ## A typed trust tier for received datagrams
 
