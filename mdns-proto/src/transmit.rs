@@ -623,65 +623,61 @@ impl FamilyDelivery {
   }
 }
 
-/// WHICH address family — the index half of the crate's `[_; 2]` family pairs,
-/// named so a runtime choice between them never becomes a runtime index.
-///
-/// Every per-family fact in this crate is a two-element array with `[0] = v4`
-/// and `[1] = v6` (`FamilyPatience`, `last_delivered`, a withdrawal item's
-/// `owed`, the goodbye-ownership masks). Reading one of those with a `usize`
-/// computed at runtime is both a `clippy::indexing_slicing` site and a place a
-/// v4/v6 mix-up cannot be caught, so the choice is a value with one accessor
-/// instead.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Family {
-  /// IPv4 — slot `[0]`.
-  V4,
-  /// IPv6 — slot `[1]`.
-  V6,
-}
-
-#[allow(dead_code)]
-impl Family {
-  /// The family a datagram arriving from `src` came in on.
+cfg_heap! {
+  /// WHICH address family — the index half of the crate's `[_; 2]` family pairs,
+  /// named so a runtime choice between them never becomes a runtime index.
   ///
-  /// THE inbound family question. A multicast datagram travels back over a
-  /// socket of its own family, so this is what says which of our transmissions
-  /// could possibly be an echo of it.
-  #[inline(always)]
-  pub(crate) const fn of(src: core::net::SocketAddr) -> Self {
-    match src {
-      core::net::SocketAddr::V4(_) => Self::V4,
-      core::net::SocketAddr::V6(_) => Self::V6,
-    }
+  /// Every per-family fact in this crate is a two-element array with `[0] = v4`
+  /// and `[1] = v6` (`FamilyPatience`, `last_delivered`, a withdrawal item's
+  /// `owed`, the goodbye-ownership masks). Reading one of those with a `usize`
+  /// computed at runtime is both a `clippy::indexing_slicing` site and a place a
+  /// v4/v6 mix-up cannot be caught, so the choice is a value with one accessor
+  /// instead.
+  ///
+  /// Gated to the heap tier: every caller (`Endpoint`'s route/relinquished-screen
+  /// code, and `Service`'s own family-scoped withdrawal helpers) lives inside
+  /// `cfg_heap!` itself, so the bare tier never names this type.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) enum Family {
+    /// IPv4 — slot `[0]`.
+    V4,
+    /// IPv6 — slot `[1]`.
+    V6,
   }
 
-  /// This family's half of a `[v4, v6]` pair.
-  #[inline(always)]
-  pub(crate) fn pick<T: Copy>(self, pair: [T; 2]) -> T {
-    let [v4, v6] = pair;
-    match self {
-      Self::V4 => v4,
-      Self::V6 => v6,
+  impl Family {
+    /// The family a datagram arriving from `src` came in on.
+    ///
+    /// THE inbound family question. A multicast datagram travels back over a
+    /// socket of its own family, so this is what says which of our transmissions
+    /// could possibly be an echo of it.
+    #[inline(always)]
+    pub(crate) const fn of(src: core::net::SocketAddr) -> Self {
+      match src {
+        core::net::SocketAddr::V4(_) => Self::V4,
+        core::net::SocketAddr::V6(_) => Self::V6,
+      }
     }
-  }
 
-  /// This family's half of a `[v4, v6]` pair, by reference — for the pairs whose
-  /// members are not `Copy`.
-  #[inline(always)]
-  pub(crate) fn pick_ref<T>(self, pair: &[T; 2]) -> &T {
-    let [v4, v6] = pair;
-    match self {
-      Self::V4 => v4,
-      Self::V6 => v6,
+    /// This family's half of a `[v4, v6]` pair.
+    #[inline(always)]
+    pub(crate) fn pick<T: Copy>(self, pair: [T; 2]) -> T {
+      let [v4, v6] = pair;
+      match self {
+        Self::V4 => v4,
+        Self::V6 => v6,
+      }
     }
-  }
 
-  /// Canonical lowercase slug for this family.
-  #[inline(always)]
-  pub(crate) const fn as_str(self) -> &'static str {
-    match self {
-      Self::V4 => "v4",
-      Self::V6 => "v6",
+    /// This family's half of a `[v4, v6]` pair, by reference — for the pairs whose
+    /// members are not `Copy`.
+    #[inline(always)]
+    pub(crate) fn pick_ref<T>(self, pair: &[T; 2]) -> &T {
+      let [v4, v6] = pair;
+      match self {
+        Self::V4 => v4,
+        Self::V6 => v6,
+      }
     }
   }
 }

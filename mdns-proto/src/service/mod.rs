@@ -820,7 +820,6 @@ cfg_heap! {
     /// a genuine peer's record as this endpoint's own relinquished history and
     /// suppressed the host conflict for the whole retention window. See
     /// `GoodbyeOwnership`.
-    #[allow(dead_code)]
     pub(crate) multicast: [respond::EmittedRecords; 2],
   }
 
@@ -831,7 +830,15 @@ cfg_heap! {
     /// response is a §6 multicast by construction — so it is the shape almost
     /// every fixture wants, and naming it once keeps the assumption visible.
     /// A fixture that is ABOUT the split states both halves itself.
-    #[cfg(test)]
+    ///
+    /// Gated to match its only caller: every call site lives in
+    /// `endpoint/tests.rs`, whose `mod tests;` declaration itself requires
+    /// `all(test, feature = "std", feature = "slab")`, a strict subset of the
+    /// heap tier this `cfg_heap!` block grants. A bare `#[cfg(test)]` left this
+    /// compiled — and, under `-D warnings`, "never used" — in any `test` build
+    /// that reached the heap tier via `alloc` or `no-atomic` alone, or via
+    /// `std` without `slab`.
+    #[cfg(all(test, feature = "std", feature = "slab"))]
     pub(crate) fn announced(
       records: crate::records::ServiceRecords,
       owned: [respond::EmittedRecords; 2],
@@ -881,8 +888,9 @@ cfg_heap! {
 
   impl RenameGoodbyeHandoff {
     /// Test-only: a handoff whose WHOLE exposure was multicast. See
-    /// [`WithdrawalSnapshot::announced`].
-    #[cfg(test)]
+    /// [`WithdrawalSnapshot::announced`], including for why the gate below is
+    /// narrower than a bare `#[cfg(test)]`.
+    #[cfg(all(test, feature = "std", feature = "slab"))]
     pub(crate) fn announced(
       records: crate::records::ServiceRecords,
       owned: [respond::EmittedRecords; 2],
