@@ -104,8 +104,9 @@ cfg_heap! {
 cfg_heap! {
   #[allow(unused_imports)]
   pub(crate) use respond::{
-    EmittedRecords, INSTANCE_CANONICAL_RTYPES, canonical_rdata_forms, instance_rtype_exposed,
-    multicast_dst, transmitted_rdata_forms, write_goodbye,
+    EmittedRecords, INSTANCE_CANONICAL_RTYPES, RecordSection, canonical_rdata_forms,
+    instance_rtype_exposed, multicast_dst, transmitted_envelope, transmitted_rdata_forms,
+    write_goodbye,
   };
 }
 #[allow(unused_imports)]
@@ -257,7 +258,13 @@ cfg_heap! {
     /// the count of records §7.1 KAS suppressed from THIS response (partial
     /// suppression); it is bumped into `answers_suppressed_kas` ONLY on a
     /// confirmed delivery so a socket failure cannot inflate the counter.
-    Response(respond::EmittedRecords, u64),
+    ///
+    /// The third is the ONE token variant whose destination class is not fixed:
+    /// a jittered multicast reply and a §6.7 legacy unicast reply are both
+    /// positive-TTL sends of this service's records and both stamp this token.
+    /// The confirm needs to tell them apart — see [`SendClass`] — and by then
+    /// the destination is gone, so it is captured here at the stamp.
+    Response(respond::EmittedRecords, u64, SendClass),
     /// A RFC 6763 §9 service-type enumeration meta-response (multicast or legacy
     /// unicast) is awaiting confirmation. The meta-PTR is a shared record — it
     /// advertises no instance-owned records and is never withdrawn — so a confirmed
@@ -312,8 +319,16 @@ cfg_heap! {
     None,
     /// The service STILL holds the name these records were emitted under (the §9
     /// same-name revert-to-probe): they latch into the live `goodbye` exactly as
-    /// they would have without the regression.
-    SameName(respond::EmittedRecords),
+    /// they would have without the regression — including into the half that
+    /// depends on [`SendClass`], which a regression does not change.
+    SameName {
+      /// What the parked datagram emitted.
+      emitted: respond::EmittedRecords,
+      /// Where it went. Carried for the same reason
+      /// [`AwaitingConfirm::Response`] carries it: the confirm latches by
+      /// destination class and cannot re-derive one.
+      class: SendClass,
+    },
     /// The service has RENAMED AWAY from the name these instance records were
     /// emitted under. `records` is the OLD name, cloned at the regression site
     /// before `ServiceRecords::set_instance` overwrote it, so the detached
@@ -337,6 +352,8 @@ cfg_heap! {
       records: ServiceRecords,
       /// What the datagram actually emitted under that name.
       emitted: respond::EmittedRecords,
+      /// Where it went. See [`Self::SameName`].
+      class: SendClass,
     },
   }
 
@@ -364,9 +381,7 @@ cfg_heap! {
         // exists, so nothing will ever re-arm it either. (Unreachable in
         // practice: `stamped_obligation` reads the token `poll_transmit` just
         // stamped, and `poll_transmit` never stamps `Stale`.)
-        Self::Response(_, _) | Self::MetaResponse | Self::Stale { .. } => {
-          TransmitObligation::OneShot
-        }
+        Self::Response(..) | Self::MetaResponse | Self::Stale { .. } => TransmitObligation::OneShot,
       }
     }
 
@@ -392,7 +407,7 @@ cfg_heap! {
       match self {
         Self::Probe => schedule::rfc::PROBE_INTERVAL,
         Self::Announcement(_) => schedule::rfc::ANNOUNCE_INTERVAL,
-        Self::Response(_, _) | Self::MetaResponse | Self::Stale { .. } => Duration::ZERO,
+        Self::Response(..) | Self::MetaResponse | Self::Stale { .. } => Duration::ZERO,
       }
     }
   }
@@ -429,8 +444,13 @@ cfg_heap! {
   ///   IPv4-only transmission. It cannot be one — a loopback copy comes back
   ///   over a socket that carried the datagram out — so the screen would be
   ///   silencing a GENUINE peer's §8.1 or §9 conflict.
+  ///
+  /// # …and TWICE, because the two readers ask different questions
+  ///
+  /// See [`GoodbyeOwnership`]. This type is one destination class's answer; the
+  /// wrapper holds two of them.
   #[derive(Debug, Default, Clone)]
-  struct GoodbyeOwnership {
+  struct RecordExposure {
     /// Which families the instance PTR (service-type → instance) has been
     /// advertised on. RESET on a conflict rename (the new instance name has not
     /// been advertised).
@@ -474,7 +494,7 @@ cfg_heap! {
     nsec: [bool; 2],
   }
 
-  impl GoodbyeOwnership {
+  impl RecordExposure {
     /// Latch the concrete records a confirmed send actually emitted, on the
     /// families that actually accepted it — the SOLE way ownership is gained
     /// (besides being reset to none on rename).
@@ -586,6 +606,112 @@ cfg_heap! {
     }
   }
 
+  /// WHERE a confirmed positive send actually went, kept because the answer
+  /// decides whether a delayed ECHO of those bytes can exist at all.
+  ///
+  /// It is a fact about the DATAGRAM, so it is captured where every other such
+  /// fact is — on the commit token [`Service::poll_transmit`] stamps — rather
+  /// than reconstructed at confirm time, when the destination is gone.
+  #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+  enum SendClass {
+    /// The RFC 6762 §6 multicast group. A copy comes back over a socket that
+    /// carried the datagram out — kernel loopback, or the 802.11 base-station
+    /// re-broadcast §8.2 names — so these bytes can arrive again as a MULTICAST
+    /// datagram, which is the only kind this endpoint adjudicates.
+    Multicast,
+    /// A §6.7 legacy reply, addressed to ONE resolver's ephemeral port. Nothing
+    /// puts it on the group, so no multicast copy of these bytes ever existed.
+    Unicast,
+  }
+
+  /// The two exposure questions, kept apart because their answers differ and
+  /// only one of them may ever be read as multicast-echo provenance.
+  ///
+  /// Both are "which records did a confirmed send emit, on which family", and
+  /// for a long time one latch answered both. It cannot: an RFC 6762 §6.7 legacy
+  /// reply is a positive-TTL send of the FULL record set, and it goes to one
+  /// off-group resolver's ephemeral port.
+  ///
+  /// * WHAT MAY BE IN A PEER'S CACHE FROM US, and therefore what a §10.1 goodbye
+  ///   owes a retraction for, is [`Self::all`]. The legacy querier's cache holds
+  ///   those records exactly as a multicast listener's would, so the unicast
+  ///   send counts here, and so does everything else this latch feeds:
+  ///   `advertises_instance` (row B′'s "the previous generation advertised"),
+  ///   `advertises_host`, and the sibling-retained address union.
+  /// * WHAT COULD STILL BE ECHOING BACK AT US is [`Self::multicast`], and it is
+  ///   strictly narrower. `Endpoint::relinquished_asserts` screens a MULTICAST
+  ///   arrival, and a datagram that was never on the group cannot produce one —
+  ///   so a set whose only positive send was a legacy reply must disown nothing.
+  ///   Answering `all` there labelled a GENUINE peer's multicast A/AAAA as this
+  ///   endpoint's own relinquished history and suppressed the host conflict for
+  ///   the whole retention window, on the strength of bytes no multicast socket
+  ///   ever carried.
+  ///
+  /// One type with two halves rather than two fields on `Service`, so a mutator
+  /// cannot be applied to one and forgotten on the other: every writer here
+  /// takes the [`SendClass`] and updates both by the same rule.
+  #[derive(Debug, Default, Clone)]
+  struct GoodbyeOwnership {
+    /// Every confirmed positive send, whatever its destination class.
+    all: RecordExposure,
+    /// The MULTICAST subset of [`Self::all`] — never larger, and the only half
+    /// the relinquished-history screen may read.
+    multicast: RecordExposure,
+  }
+
+  impl GoodbyeOwnership {
+    /// Latch what a confirmed send emitted into `all`, and into `multicast` only
+    /// when the datagram was actually multicast.
+    fn record_emitted(&mut self, e: &respond::EmittedRecords, on: [bool; 2], class: SendClass) {
+      self.all.record_emitted(e, on);
+      if matches!(class, SendClass::Multicast) {
+        self.multicast.record_emitted(e, on);
+      }
+    }
+    /// The host-only counterpart of [`Self::record_emitted`], for a send whose
+    /// INSTANCE records belong to a name the service has since renamed away
+    /// from.
+    fn record_host_emitted(
+      &mut self,
+      e: &respond::EmittedRecords,
+      on: [bool; 2],
+      class: SendClass,
+    ) {
+      self.all.record_host_emitted(e, on);
+      if matches!(class, SendClass::Multicast) {
+        self.multicast.record_host_emitted(e, on);
+      }
+    }
+    /// Drop INSTANCE ownership on a conflict rename — in BOTH halves, since the
+    /// new name has put nothing on any wire by any means.
+    #[inline]
+    fn reset_instance(&mut self) {
+      self.all.reset_instance();
+      self.multicast.reset_instance();
+    }
+    /// Whether ANY instance-owned record has been advertised, on any family, BY
+    /// ANY MEANS. A legacy querier that cached our SRV holds this name's records
+    /// as surely as a multicast listener does.
+    #[inline]
+    fn any_instance(&self) -> bool {
+      self.all.any_instance()
+    }
+    /// Whether ANY host-owned address has been advertised, by any means.
+    #[inline]
+    fn any_host(&self) -> bool {
+      self.all.any_host()
+    }
+    /// The `[v4, v6]` exposure pair a §10.1 goodbye is owed for.
+    fn per_family(&self) -> [respond::EmittedRecords; 2] {
+      self.all.per_family()
+    }
+    /// The `[v4, v6]` exposure pair the relinquished-history screen may read —
+    /// multicast-positive emissions only. See [`Self::multicast`].
+    fn per_family_multicast(&self) -> [respond::EmittedRecords; 2] {
+      self.multicast.per_family()
+    }
+  }
+
   /// OR `on` into `mask` when `emitted`, leaving it untouched otherwise.
   ///
   /// A helper rather than five copies of the same two-element loop, and a
@@ -683,6 +809,39 @@ cfg_heap! {
     // machine; suppress the false positive here.
     #[allow(dead_code)]
     pub(crate) owned: [respond::EmittedRecords; 2],
+    /// The MULTICAST subset of [`Self::owned`], and the ONLY half
+    /// `Endpoint::relinquished_asserts` may read.
+    ///
+    /// A §6.7 legacy reply is a positive-TTL send of the full record set to one
+    /// resolver's ephemeral port. Its records are in that resolver's cache, so
+    /// they are `owned` and the §10.1 goodbye owes them a retraction — but no
+    /// multicast copy of those bytes ever existed, so a MULTICAST arrival
+    /// matching them cannot be an echo of ours. Answering `owned` there labelled
+    /// a genuine peer's record as this endpoint's own relinquished history and
+    /// suppressed the host conflict for the whole retention window. See
+    /// `GoodbyeOwnership`.
+    #[allow(dead_code)]
+    pub(crate) multicast: [respond::EmittedRecords; 2],
+  }
+
+  impl WithdrawalSnapshot {
+    /// Test-only: a snapshot whose WHOLE exposure was multicast.
+    ///
+    /// It is what "this service announced" means — RFC 6762 §8.3's unsolicited
+    /// response is a §6 multicast by construction — so it is the shape almost
+    /// every fixture wants, and naming it once keeps the assumption visible.
+    /// A fixture that is ABOUT the split states both halves itself.
+    #[cfg(test)]
+    pub(crate) fn announced(
+      records: crate::records::ServiceRecords,
+      owned: [respond::EmittedRecords; 2],
+    ) -> Self {
+      Self {
+        records,
+        multicast: owned.clone(),
+        owned,
+      }
+    }
   }
 }
 
@@ -715,6 +874,25 @@ cfg_heap! {
     /// withdraws host A/AAAA). `pub(crate)`: `EmittedRecords` is a crate-internal
     /// type.
     pub(crate) owned: [respond::EmittedRecords; 2],
+    /// The MULTICAST subset of [`Self::owned`] — see
+    /// [`WithdrawalSnapshot::multicast`] for why the two are not one field.
+    pub(crate) multicast: [respond::EmittedRecords; 2],
+  }
+
+  impl RenameGoodbyeHandoff {
+    /// Test-only: a handoff whose WHOLE exposure was multicast. See
+    /// [`WithdrawalSnapshot::announced`].
+    #[cfg(test)]
+    pub(crate) fn announced(
+      records: crate::records::ServiceRecords,
+      owned: [respond::EmittedRecords; 2],
+    ) -> Self {
+      Self {
+        records,
+        multicast: owned.clone(),
+        owned,
+      }
+    }
   }
 }
 
@@ -1223,14 +1401,14 @@ where
   /// retracts only addresses no remaining service actually advertised.
   #[inline]
   pub fn advertised_a_addrs(&self) -> &[core::net::Ipv4Addr] {
-    &self.goodbye.a
+    &self.goodbye.all.a
   }
 
   /// The host IPv6 addresses this service has actually ADVERTISED, per address
   /// (the AAAA counterpart of [`Self::advertised_a_addrs`]).
   #[inline]
   pub fn advertised_aaaa_addrs(&self) -> &[core::net::Ipv6Addr] {
-    &self.goodbye.aaaa
+    &self.goodbye.all.aaaa
   }
 
   /// Report what each address family's transport did with the datagram most
@@ -1532,7 +1710,10 @@ where
         // invariant pair and happens BEFORE the all-delivered phase check below:
         // partial delivery owns what it exposed even though it advances nothing
         // — and owns it only where it exposed it.
-        self.goodbye.record_emitted(&emitted, delivery.delivered_on());
+        self
+          .goodbye
+          // §8.3's unsolicited announcement is §6 multicast by construction.
+          .record_emitted(&emitted, delivery.delivered_on(), SendClass::Multicast);
         // …and this generation has now claimed the name, which is what the
         // conflict rules key on. Ownership and CLAIM are different questions
         // over the same report — see `EmittedRecords::claims_instance_name` and
@@ -1605,7 +1786,7 @@ where
           self.partial_announce_streak = self.partial_announce_streak.saturating_add(1);
         }
       }
-      AwaitingConfirm::Response(emitted, _kas_suppressed_count) => {
+      AwaitingConfirm::Response(emitted, _kas_suppressed_count, class) => {
         #[cfg(feature = "stats")]
         let kas_suppressed_count = _kas_suppressed_count;
         // a DELIVERED response (multicast question reply or §6.7
@@ -1638,7 +1819,9 @@ where
               s.answers_suppressed_kas(kas_suppressed_count);
             }
           }
-          self.goodbye.record_emitted(&emitted, delivery.delivered_on());
+          self
+            .goodbye
+            .record_emitted(&emitted, delivery.delivered_on(), class);
           // …and this generation has claimed the name only if a record the
           // INSTANCE owns reached the wire. The two lines above and below are
           // deliberately different questions over the same report: goodbye
@@ -1718,14 +1901,22 @@ where
           // records are in peer caches (hence the latch) but the generation now
           // probing has claimed nothing, and §9 puts it back through §8's
           // startup steps regardless.
-          StaleRecords::SameName(emitted) => {
-            self.goodbye.record_emitted(&emitted, delivery.delivered_on());
+          StaleRecords::SameName { emitted, class } => {
+            self
+              .goodbye
+              .record_emitted(&emitted, delivery.delivered_on(), class);
           }
-          StaleRecords::OldName { records, emitted } => {
+          StaleRecords::OldName {
+            records,
+            emitted,
+            class,
+          } => {
             // The host name is invariant across an instance rename, so the
             // addresses this datagram carried are cached under a name the service
             // still holds: they latch into the live goodbye as usual.
-            self.goodbye.record_host_emitted(&emitted, delivery.delivered_on());
+            self
+              .goodbye
+              .record_host_emitted(&emitted, delivery.delivered_on(), class);
             // The instance records are not. `self.records` names the NEW
             // instance, so `withdrawal_snapshot` would encode them under a name
             // that never carried them — they belong to the OLD name's detached
@@ -1751,9 +1942,24 @@ where
             // these instance records in a peer cache, so only they owe the old
             // name's §10.1 goodbye and only they can hold an echo of it.
             let instance = per_family_instance(&instance, delivery.delivered_on());
+            // …and its MULTICAST half is the same projection over a datagram
+            // that actually went to the group, or nothing at all. A §6.7 legacy
+            // reply parked across a rename put the old name's records in one
+            // resolver's cache — so the detached goodbye still owes them — and
+            // put no copy of them on the group, so no echo of them exists.
+            let instance_multicast = match class {
+              SendClass::Multicast => instance.clone(),
+              SendClass::Unicast => [
+                respond::EmittedRecords::default(),
+                respond::EmittedRecords::default(),
+              ],
+            };
             match &mut self.rename_goodbye_handoff {
               Some(h) => {
                 for (held, new) in h.owned.iter_mut().zip(&instance) {
+                  held.merge_instance(new);
+                }
+                for (held, new) in h.multicast.iter_mut().zip(&instance_multicast) {
                   held.merge_instance(new);
                 }
               }
@@ -1765,6 +1971,7 @@ where
                 self.rename_goodbye_handoff = Some(RenameGoodbyeHandoff {
                   records,
                   owned: instance,
+                  multicast: instance_multicast,
                 });
               }
             }
@@ -1810,8 +2017,12 @@ where
     let (fact, emitted) = match self.awaiting_confirm.take() {
       None => return,
       Some(AwaitingConfirm::Probe) => (StaleWireFact::Probe, None),
-      Some(AwaitingConfirm::Announcement(e)) => (StaleWireFact::Announcement, Some(e)),
-      Some(AwaitingConfirm::Response(e, kas)) => (StaleWireFact::Response(kas), Some(e)),
+      Some(AwaitingConfirm::Announcement(e)) => (
+        StaleWireFact::Announcement,
+        // An unsolicited announcement is §6 multicast by construction.
+        Some((e, SendClass::Multicast)),
+      ),
+      Some(AwaitingConfirm::Response(e, kas, class)) => (StaleWireFact::Response(kas), Some((e, class))),
       // The §9 meta-PTR names the SERVICE TYPE, which no instance rename or
       // same-name revert touches, and it latches no ownership at all. Nothing
       // about it can go stale, so it is put back exactly as it was.
@@ -1824,9 +2035,11 @@ where
       // being renamed away from.
       Some(AwaitingConfirm::Stale { fact, records }) => {
         let records = match (records, renamed_from) {
-          (StaleRecords::SameName(emitted), Some(records)) => {
-            StaleRecords::OldName { records, emitted }
-          }
+          (StaleRecords::SameName { emitted, class }, Some(records)) => StaleRecords::OldName {
+            records,
+            emitted,
+            class,
+          },
           (records, _) => records,
         };
         self.awaiting_confirm = Some(AwaitingConfirm::Stale { fact, records });
@@ -1835,8 +2048,12 @@ where
     };
     let records = match (emitted, renamed_from) {
       (None, _) => StaleRecords::None,
-      (Some(emitted), None) => StaleRecords::SameName(emitted),
-      (Some(emitted), Some(records)) => StaleRecords::OldName { records, emitted },
+      (Some((emitted, class)), None) => StaleRecords::SameName { emitted, class },
+      (Some((emitted, class)), Some(records)) => StaleRecords::OldName {
+        records,
+        emitted,
+        class,
+      },
     };
     self.awaiting_confirm = Some(AwaitingConfirm::Stale { fact, records });
   }
@@ -2015,6 +2232,8 @@ where
       // relinquished-RRset screen both read one exposure rather than reassembling
       // two.
       owned: self.goodbye.per_family(),
+      // The screen's half, narrowed to what actually went to the group.
+      multicast: self.goodbye.per_family_multicast(),
     }
   }
 
@@ -2618,8 +2837,31 @@ where
   /// | **A. nothing of ours on the link** (`Init`/`Probing(_)`, `!probe_on_wire`) | §8.2: buffer the proposal | §8.1: silently ignore — "responses received *before* the first probe packet is sent MUST be silently ignored" | ignore (filed gap) | §9: surface terminal `HostConflict` |
   /// | **B. probed, nothing announced** (`Init`/`Probing(_)`, or `Announcing(0)` with no announcement latched or in flight) | §8.2: buffer the proposal | §8.1: defer to the existing host, `probe_defeated` → rename. No comparison. History-labelled: §8.2's regress instead — see below | ignore (filed gap) | §9: surface terminal `HostConflict` |
   /// | **B′. previous generation advertised, current one re-probing** (§9 revert: `goodbye.any_instance()` but `!generation_advertised`) | §8.2: buffer the proposal | §8.1: defer → rename; history-labelled as row B | ignore (filed gap) | §9: surface terminal `HostConflict` |
-  /// | **C. advertised** (`generation_advertised`) | not §9 — defend by answering the probe's own question (§8.1) | §9: revert to probing; history-labelled: dropped | ignore (filed gap) | §9: surface terminal `HostConflict` |
-  /// | **D. terminal** (`Conflicting`) | ignore | ignore | ignore | ignore |
+  /// | **C. advertised** (`generation_advertised`) | not §9 — defend by answering the probe's own question (§8.1) | §9: revert to probing; the history label buys no exemption | ignore (filed gap) | §9: surface terminal `HostConflict` |
+  /// | **D. terminal** (`Conflicting`) | ignore | ignore | ignore | §9: surface terminal `HostConflict` — see below |
+  ///
+  /// # Row D's host column is NOT "ignore", and the CODE states the better rule
+  ///
+  /// The `HostConflict` arm is `(_, ServiceEvent::HostConflict(hc))` — a
+  /// wildcard state, gated only by the [`ConflictOrigin`](crate::event::ConflictOrigin)
+  /// test — so a `Conflicting` service surfaces the terminal update like any
+  /// other. This row used to read "ignore" in all four columns and was wrong in
+  /// the fourth; the DOC was corrected rather than the code.
+  ///
+  /// `Conflicting` is the INSTANCE name's terminal state and nothing else. It is
+  /// entered from exactly one place — when §8.1's rename cannot produce a valid
+  /// suffixed name — and says nothing whatever about the HOST name, which is a
+  /// different name, invariant across renames, and shareable with other local
+  /// services. Whether a peer is claiming it is an independent fact, and one a
+  /// caller told to "rename and restart" needs: re-registering under a fresh
+  /// instance name with the same host walks straight back into it.
+  ///
+  /// Making the code match the doc would also put a lifecycle dependence into
+  /// the ONE column that has none. The host name is never probed here, so
+  /// `is_preauthoritative` has nothing to say about it and rows A through C
+  /// already answer identically; row D would become the sole exception, to save
+  /// a duplicate that is benign anyway — `pending_updates` is a set, and a
+  /// caller already told about this service is not told twice.
   ///
   /// # The history label crosses the table, and does NOT read the same in every cell
   ///
@@ -2632,8 +2874,8 @@ where
   /// | cell | with the label | why |
   /// |---|---|---|
   /// | **B / B′, instance `ProbeConflict`** | §8.2's regress instead of §8.1's rename — `tiebreak_lost`, one second, SAME name | reversible, and the re-probe is the only thing that can tell a ghost from a twin |
-  /// | **C, instance `ProbeConflict`** | dropped | §9's own answer is already defer-and-re-verify behind a rate limit, so the cell is near-free either way; left as it was |
-  /// | **any host / AuthoritativeResponse** | the `HostConflict` is dropped, in the router | terminal and caller-visible, and host-name probing is unimplemented — there is no re-probe whose silence could convict a ghost |
+  /// | **C, instance `ProbeConflict`** | nothing — §9's revert runs exactly as it would unlabelled | that revert already IS the re-verification: same name, rate-limited, reversible. Dropping it instead consumed a conforming peer's whole BOUNDED §8.3 burst inside the window, and nothing replays a conflict at expiry |
+  /// | **any host / AuthoritativeResponse** | the `HostConflict` is dropped, in the router | terminal and caller-visible, and the HOST NAME is never probed — there is no re-probe whose silence could convict a ghost |
   ///
   /// The last row drops an EVENT, not a record. Where a route's instance name IS
   /// its host name the router tests the host rule first but does not let it
@@ -2641,6 +2883,25 @@ where
   /// this service is probing with, so it falls through and arrives as a labelled
   /// `ProbeConflict`, read by rows B / B′ and C exactly as the table says. Only
   /// the unlabelled record is the host rule's alone.
+  ///
+  /// AND IT FALLS THROUGH WEARING BOTH ROLES —
+  /// [`ConflictRole::InstanceAndHost`](crate::event::ConflictRole) — because the
+  /// last row's own reason does not reach this owner. It suppresses on the
+  /// premise that nothing can re-verify a labelled host record, and that premise
+  /// is FALSE where the host name is also the instance name: `write_probe` asks
+  /// ANY for exactly this owner and proposes exactly these A/AAAA, so the
+  /// re-probe the host cell lacks is the one this service already runs. The role
+  /// is what carries the host rule's proven authority across the fall-through,
+  /// and two gates read it:
+  ///
+  /// * the identical-rdata precondition classifies the record as a HOST record,
+  ///   so an address this service publishes is §9's "never inconsistent" rather
+  ///   than a conflict the instance classifier cannot even read;
+  /// * row C's instance-authority gate — `canonical_rdata_forms`, whose domain
+  ///   is SRV / TXT / NSEC — is not asked of it, because the authority in
+  ///   question is the host name's. Asking it dropped every labelled A/AAAA the
+  ///   moment the service announced, so the same peer response was handled in
+  ///   rows B / B′ and discarded in row C.
   ///
   /// What the label is NOT is "this record was ours". That question has no
   /// answer at the instant of the lookup: §9 protects a fault-tolerance twin
@@ -2898,6 +3159,18 @@ where
     // classification is made ONCE, here, and invalid stops before every conflict
     // arm rather than in some of them.
     let peer_rdata = match &event {
+      // BY ROLE, not by event type. A `ProbeConflict` whose owner is this
+      // service's HOST name as well as its instance name carries an A/AAAA that
+      // BOTH roles own, and the instance classifier cannot read it: its rule is
+      // `canonical_rdata_forms`, whose domain is SRV / TXT / NSEC, so it answers
+      // `Different` for every address — including one this service publishes at
+      // that very name, which §9 and §8.2.1 both call no conflict at all. The
+      // host classifier is the one that can compare an address against an
+      // address, and the routing fan-out has already proved this route
+      // authoritative for that RRset at that name.
+      ServiceEvent::ProbeConflict(pc) if pc.role().is_instance_and_host() => {
+        self.classify_host_rdata(pc.record())
+      }
       ServiceEvent::ProbeConflict(pc) => self.classify_instance_rdata(pc.record()),
       // The HOST half of the same rule, stated in the same place rather than a
       // fourth time inside its own arm. It is the last of the four places this
@@ -3005,36 +3278,56 @@ where
         // until unrelated SRV/TXT traffic arrived. A shared PTR is still
         // excluded, and by the rule rather than by a special case: it is owned
         // by the service-type name, so this set asserts no form of it.
-        if self
-          .our_canonical_records_for(pc.record().rtype())
-          .is_empty()
+        //
+        // ASKED OF THE ROLE THE RECORD ARRIVED UNDER. `canonical_rdata_forms`
+        // answers for the INSTANCE name's RRsets; a record that is also this
+        // service's host record is authoritative under the HOST name, and that
+        // authority was proved by the routing fan-out's host rule and re-checked
+        // by `classify_host_rdata` above (a type we hold no RRset of there is
+        // `UnownedRrtype` and never reaches this arm). Asking the instance
+        // question of it returns "we assert no record of this type at this
+        // name" for an address we assert at exactly this name, so the §9 reset
+        // this cell exists to run never ran — the record was handled while
+        // probing, where §8.1 admits every type, and silently dropped the moment
+        // the service announced. See [`crate::event::ConflictRole`].
+        if pc.role().is_instance()
+          && self
+            .our_canonical_records_for(pc.record().rtype())
+            .is_empty()
         {
           return;
         }
-        // THE HISTORY LABEL, SPENT AS A SUPPRESSION — the one instance cell
-        // where it still is one, and unchanged in effect from when the router
-        // dropped the record before any service saw it. Only the SITE moved: the
-        // pre-authoritative cell needs the same record delivered, so the drop
-        // could no longer live upstream of both.
+        // THE HISTORY LABEL BUYS NOTHING HERE, and its absence is the decision.
         //
-        // Deliberately left as it was rather than turned into a deferral with
-        // the cell above. §9's answer to a conflict is ALREADY defer-and-
-        // re-verify — `restart_probe_cycle` on the same name — behind a
-        // `CONFLICT_REPROBE_MIN_INTERVAL` rate limit, so this cell is close to
-        // free either way and changing it would widen a fix whose blast radius
-        // is worth keeping to the cell that was actually broken. What it costs
-        // is what it always cost: an established service does not re-verify on a
-        // record matching its endpoint's own recent history until that history
-        // lapses.
-        if pc.history().is_relinquished() {
-          trace!(
-            target: "mdns_proto::service",
-            handle = self.handle.raw(),
-            state = ?self.state,
-            "service: §9 conflict repeats rdata this endpoint relinquished — not re-verifying on our own recent past"
-          );
-          return;
-        }
+        // This cell dropped a labelled record for one round, on the premise that
+        // §9 self-heals because a real incumbent's traffic recurs. THAT PREMISE
+        // IS FALSE, and §8.3 is what falsifies it: a conforming responder
+        // announces "two or three times, at intervals of at least one second"
+        // and is then SILENT until something queries it. A screen that consumes
+        // those responses inside the retention window consumes every copy there
+        // was, and nothing replays a conflict when the window lapses — so
+        // duplicate ownership of an ADVERTISED name stood until unrelated
+        // traffic happened to arrive, which is §9's "MUST immediately reset its
+        // conflicted unique record to probing state" not happening at all.
+        // Reaching that costs a peer nothing to arrange: packet loss over the
+        // successor's probes is enough, and then the incumbent's next response
+        // lands here rather than pre-authoritatively.
+        //
+        // The label could not be spent as a suppression here for the same reason
+        // it could not be spent as one pre-authoritatively: a match says these
+        // bytes left this endpoint, not that this datagram did, and §9's
+        // fault-tolerance twin publishes them BY DESIGN. What differs between
+        // the two cells is only which reversible move the label buys — §8.2's
+        // one-second regress there, §9's own revert here — and both put the
+        // question to the network, which is the only place an answer exists.
+        //
+        // So our OWN delayed echo costs the revert below: the same name,
+        // rate-limited by `CONFLICT_REPROBE_MIN_INTERVAL`, claiming nothing
+        // while it runs, and ending in a re-announcement because a ghost cannot
+        // answer the re-probe. It cannot cost the name — `probe_defeated` is the
+        // only path to a rename, and the pre-authoritative cell never latches it
+        // on a labelled record.
+        //
         // A record whose rdata will not decode is not one this service can
         // reason about; drop it rather than revert on it. The identical-rdata
         // check that used to follow is now the precondition above
@@ -3587,7 +3880,7 @@ where
         // that fact to `Endpoint::enqueue_rename_withdrawal`, which retains it —
         // and the goodbye ITEM is still not created, because `owned.is_empty()`
         // decides that and an NSEC is not withdrawable.
-        if self.goodbye.any_instance() || any_family(self.goodbye.nsec) {
+        if self.goodbye.any_instance() || any_family(self.goodbye.all.nsec) {
           // capture WHICH instance records the old name actually put on
           // the wire (§7.1 KAS may have emitted only a subset), so the rename
           // goodbye withdraws exactly those — not all of PTR/SRV/TXT, which
@@ -3600,7 +3893,13 @@ where
           // Per family, because the old name's exposure is: an announcement
           // only IPv4 accepted put nothing under that name in an IPv6 peer's
           // cache, so IPv6 owes it no goodbye and cannot hold an echo of it.
-          let owned = self.goodbye.per_family().map(|e| {
+          // The instance-only projection of one exposure pair — applied to BOTH
+          // halves, because the screen's half narrows by destination class and
+          // by nothing else. The old name's records reached one legacy
+          // resolver's cache whether or not they reached the group, so `owned`
+          // still owes them a §10.1 retraction; only `multicast` decides whether
+          // an echo of them can exist.
+          let instance_only = |e: &respond::EmittedRecords| {
             respond::EmittedRecords::new(
               e.ptr(),
               e.srv(),
@@ -3610,10 +3909,16 @@ where
               e.subtypes(),
               e.nsec(),
             )
-          });
+          };
+          let owned = self.goodbye.per_family().map(|e| instance_only(&e));
+          let multicast = self
+            .goodbye
+            .per_family_multicast()
+            .map(|e| instance_only(&e));
           self.rename_goodbye_handoff = Some(RenameGoodbyeHandoff {
             records: self.records.clone(),
             owned,
+            multicast,
           });
         }
         self.rename_attempt = self.rename_attempt.saturating_add(1);
@@ -3978,7 +4283,10 @@ where
           // Legacy replies are not KAS-filtered, so the partial-suppression
           // count is always 0.
           self.awaiting_confirm = match emitted {
-            Some(e) => Some(AwaitingConfirm::Response(e, 0)),
+            // §6.7 LEGACY UNICAST: one resolver's ephemeral port, never the
+            // group — so these bytes can produce no multicast echo, and the
+            // relinquished-history screen must not answer for them.
+            Some(e) => Some(AwaitingConfirm::Response(e, 0, SendClass::Unicast)),
             None => Some(AwaitingConfirm::MetaResponse),
           };
           return Ok(Some(Transmit::new(
@@ -4240,7 +4548,11 @@ where
         #[cfg(not(feature = "stats"))]
         let partial_suppressed = 0u64;
         // Latch goodbye ownership only for the concrete records actually emitted.
-        Some(AwaitingConfirm::Response(resp_emitted, partial_suppressed))
+        Some(AwaitingConfirm::Response(
+          resp_emitted,
+          partial_suppressed,
+          SendClass::Multicast,
+        ))
       }
       None => None,
     };

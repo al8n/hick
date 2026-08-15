@@ -373,7 +373,9 @@ where
       // BEFORE the route goes: what this service put on the wire outlives it,
       // and once the name is released there is nothing left to say it was ours.
       if let Some(snapshot) = asserted {
-        self.retain_relinquished(snapshot.records, snapshot.owned, now);
+        // The MULTICAST half: the screen asks what could still be echoing, and
+        // a §6.7 legacy reply left no copy on the group to echo.
+        self.retain_relinquished(snapshot.records, snapshot.multicast, now);
       }
       let removed = self.services.try_remove(k).is_some();
       // Force-remove is a NO-goodbye primitive: also drop any ROUTE-attached
@@ -393,12 +395,12 @@ where
         self.withdrawals.retain(|(_, item)| {
           let keep = item.route != Some(handle);
           if !keep {
-            dropped.push((item.records.clone(), item.owned.clone()));
+            dropped.push((item.records.clone(), item.multicast.clone()));
           }
           keep
         });
-        for (records, owned) in dropped {
-          self.retain_relinquished(records, owned, now);
+        for (records, multicast) in dropped {
+          self.retain_relinquished(records, multicast, now);
         }
       }
       #[cfg(feature = "stats")]

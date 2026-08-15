@@ -873,3 +873,138 @@ fn the_kas_filter_offers_the_bytes_the_identity_decoder_yields() {
   }
   assert!(checked >= 4, "PTR, SRV, TXT and the addresses must all be checked");
 }
+
+/// [`transmitted_envelope`] claims to describe the WIRE ENVELOPE this crate's
+/// positive multicast encoders write — which section, and the RFC 6762 §10.2
+/// cache-flush bit — so the encoders are run and every record they emit is put
+/// to it at the section it actually landed in.
+///
+/// The endpoint's relinquished-history screen is what reads that description: it
+/// disowns a peer's record as an echo of ours only where the envelope matches.
+/// Drift in EITHER direction is a defect with a name. An encoder that starts
+/// writing addresses in the ADDITIONAL section — the RFC 6763 §12 bundle a
+/// conforming responder sends — while this function still says ANSWER makes the
+/// screen stop recognising our own echo. A function widened past what the
+/// encoders write makes it disown a GENUINE peer's record, which suppresses the
+/// terminal `HostConflict` for the whole retention window.
+///
+/// `write_probe` is checked from the other side: it is the ONLY encoder here
+/// that writes an authority section, and every record in it must be OUTSIDE the
+/// envelope. That is what makes the screen's under-claim for probes harmless —
+/// a probe latches no exposure, so no identity the screen answers for has ever
+/// been in a QR=1 authority section.
+#[test]
+fn the_envelope_is_the_one_the_encoders_actually_write() {
+  use crate::{
+    service::{RecordSection, transmitted_envelope},
+    wire::{MessageReader, ResourceType},
+  };
+
+  /// Every rrtype the relinquished screen can answer for: the instance
+  /// identities plus the host addresses.
+  const SCREENED: [ResourceType; 5] = [
+    ResourceType::Srv,
+    ResourceType::Txt,
+    ResourceType::Nsec,
+    ResourceType::A,
+    ResourceType::AAAA,
+  ];
+  const SECTIONS: [RecordSection; 3] = [
+    RecordSection::Answer,
+    RecordSection::Authority,
+    RecordSection::Additional,
+  ];
+
+  let recs = dual_stack_records();
+  let mut buf = [0u8; 1500];
+
+  // Both positive MULTICAST encoders, since either can latch the exposure the
+  // screen reads: the unsolicited announcement and the §7.1-filtered response.
+  let (announce, _) = super::write_announce(&recs, &mut buf).unwrap();
+  let announce = buf[..announce].to_vec();
+  let mut buf = [0u8; 1500];
+  let (filtered, _) = super::write_announce_filtered(&recs, &mut buf, |_, _| false).unwrap();
+  let filtered = buf[..filtered].to_vec();
+
+  for pkt in [&announce, &filtered] {
+    let msg = MessageReader::try_parse(pkt).unwrap();
+    let mut seen = 0usize;
+    let sections: [(RecordSection, std::vec::Vec<_>); 3] = [
+      (RecordSection::Answer, msg.answers().flatten().collect()),
+      (RecordSection::Authority, msg.authority().flatten().collect()),
+      (
+        RecordSection::Additional,
+        msg.additional().flatten().collect(),
+      ),
+    ];
+    for (section, records) in &sections {
+      for rr in records {
+        if !SCREENED.contains(&rr.rtype()) {
+          // The shared service-type and §7.1 subtype PTRs, which go out without
+          // the cache-flush bit and which the screen never answers for — no
+          // owner it tests is a shared name.
+          assert!(
+            !rr.cache_flush(),
+            "{:?} is outside the screen's rrtypes yet carries the cache-flush \
+             bit, so it is a unique record the envelope does not describe",
+            rr.rtype()
+          );
+          continue;
+        }
+        assert!(
+          transmitted_envelope(rr.rtype(), *section, rr.cache_flush()),
+          "the encoder put a {:?} in {section:?} with cache_flush={}, and \
+           `transmitted_envelope` does not recognise it — the relinquished \
+           screen would stop disowning this endpoint's own echo",
+          rr.rtype(),
+          rr.cache_flush()
+        );
+        // …and the envelope is not vacuously wide: the OTHER two sections must
+        // be rejected for this rrtype, or the qualifier buys nothing.
+        for other in SECTIONS {
+          if other == *section {
+            continue;
+          }
+          assert!(
+            !transmitted_envelope(rr.rtype(), other, rr.cache_flush()),
+            "a {:?} is accepted in {other:?} as well as {section:?}, but this \
+             crate writes it in one section only",
+            rr.rtype()
+          );
+        }
+        // …nor blind to the bit: the same record without it is not ours.
+        assert!(
+          !transmitted_envelope(rr.rtype(), *section, false),
+          "a {:?} is accepted without the §10.2 cache-flush bit, which no \
+           positive multicast send of ours ever cleared",
+          rr.rtype()
+        );
+        seen = seen.saturating_add(1);
+      }
+    }
+    assert!(
+      seen >= 5,
+      "SRV, TXT, A, AAAA and the §6.1 NSEC must all have been weighed; saw {seen}"
+    );
+  }
+
+  // The probe: QR=0, authority-section, and it latches NO exposure — so nothing
+  // it writes may be inside the envelope.
+  let mut buf = [0u8; 1500];
+  let n = super::write_probe(&recs, &mut buf).unwrap();
+  let msg = MessageReader::try_parse(&buf[..n]).unwrap();
+  let mut proposed = 0usize;
+  for rr in msg.authority().flatten() {
+    assert!(
+      !transmitted_envelope(rr.rtype(), RecordSection::Authority, rr.cache_flush()),
+      "a probe's proposed {:?} is inside the envelope, but a probe latches no \
+       exposure — the screen would answer for a record it was never told about",
+      rr.rtype()
+    );
+    proposed = proposed.saturating_add(1);
+  }
+  assert!(
+    proposed >= 4,
+    "the probe proposes SRV, TXT and both addresses; saw {proposed}"
+  );
+}

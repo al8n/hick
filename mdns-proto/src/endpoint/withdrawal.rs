@@ -111,7 +111,11 @@ where
       // per-record `EmittedRecords` granularity closes, one dimension over.
       let current_owed = owed_per_family(&snapshot.owned);
 
-      let crate::service::WithdrawalSnapshot { records, owned } = snapshot;
+      let crate::service::WithdrawalSnapshot {
+        records,
+        owned,
+        multicast,
+      } = snapshot;
 
       let token = self.mint_withdrawal_token();
       self.withdrawals.push((
@@ -119,6 +123,7 @@ where
         WithdrawalItem {
           records,
           owned,
+          multicast,
           owed: current_owed,
           next_at: now,
           ceiling_at,
@@ -179,7 +184,11 @@ where
       now: I,
       holds_name: bool,
     ) {
-      let crate::service::RenameGoodbyeHandoff { records, owned } = handoff;
+      let crate::service::RenameGoodbyeHandoff {
+        records,
+        owned,
+        multicast,
+      } = handoff;
       // RETAIN FIRST, and independently of whether an item is owed. The two
       // questions differ: a goodbye retracts what peers CACHE, the screen
       // disowns what we TRANSMITTED, and the §6.1 instance NSEC is transmitted
@@ -194,7 +203,12 @@ where
       // them here would screen a GENUINE peer's A/AAAA conflict at a host name
       // this endpoint still holds. The handoff carries none, so the exposure
       // pair goes across whole.
-      self.retain_relinquished(records.clone(), owned.clone(), now);
+      //
+      // THE SCREEN'S HALF, not the goodbye's. `owned` says which records a peer
+      // may hold from us and therefore what this goodbye must retract; only
+      // `multicast` says which bytes could still be echoing back, and only that
+      // question is the retention list's.
+      self.retain_relinquished(records.clone(), multicast.clone(), now);
       // Nothing for peers to evict on either family → no item.
       let owed = owed_per_family(&owned);
       if owed == [0, 0] {
@@ -207,6 +221,7 @@ where
         WithdrawalItem {
           records,
           owned,
+          multicast,
           owed,
           next_at: now,
           ceiling_at,
@@ -737,6 +752,13 @@ where
             *debt = 0;
           }
         }
+        // …and the SCREEN's half narrows in lockstep, so it never answers for
+        // more than the goodbye half does. `multicast` is a subset of `owned` by
+        // construction and this keeps it one; what either stops answering for,
+        // the row `enqueue_rename_withdrawal` retained at the RENAME still holds.
+        for half in item.multicast.iter_mut() {
+          half.keep_only_shared_ptrs(type_ptr, subtypes_left);
+        }
         // Kept only while some family still owes a record the announcement
         // cannot supersede. Otherwise this IS the whole-item cancel.
         item.owed != [0, 0]
@@ -967,7 +989,7 @@ where
         // never-announced service's item carries none, and `retain_relinquished`
         // then retains nothing at all rather than screening its whole configured
         // record set.
-        self.retain_relinquished(item.records, item.owned, now);
+        self.retain_relinquished(item.records, item.multicast, now);
         let Some(handle) = route else {
           // Detached (renamed-away old name): no route, no name, report to nobody.
           continue;

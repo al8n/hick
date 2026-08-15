@@ -21,10 +21,15 @@
   receiving cell would otherwise do: a pre-authoritative instance conflict is
   still delivered, and the service spends the label on RFC 6762 §8.2's existing
   one-second defer-and-re-probe instead of an immediate §8.1 rename — a ghost
-  cannot answer the re-probe and a live incumbent can; an established instance
-  conflict is still dropped, exactly as before; and a `HostConflict` is still
-  dropped in the fan-out, because it is terminal and caller-visible and
-  host-name probing is unimplemented, so no re-probe's silence could convict a
+  cannot answer the re-probe and a live incumbent can; an **established**
+  instance conflict is delivered too and the label buys it **nothing**, because
+  §9's revert-to-probing already is a rate-limited re-verification of the same
+  name — screening it instead withheld §9's "MUST immediately reset" from a peer
+  whose §8.3 announcement burst is bounded and never repeated, so the window
+  swallowed the conflict entire rather than delaying it and two responders kept
+  one advertised name; and a `HostConflict` is still
+  dropped in the fan-out, because it is terminal and caller-visible and the host
+  name is never probed, so no re-probe's silence could convict a
   ghost of it (a route whose instance name IS its host name still receives the
   record as a labelled `ProbeConflict`, since A/AAAA under that name also belong
   to that route's own §8.2 proposal). The screen reads two sources: withdrawal
@@ -33,13 +38,58 @@
   completion and at the rename. Service B structurally cannot know the stale set
   was ours; only the endpoint can state that fact, and only the service, which
   alone can see lifecycle phase, can decide what the fact is worth.
+- `mdns-proto`: the relinquished-history screen is now fed **only by confirmed
+  MULTICAST emissions**, and the exposure record is split in two to say so. "A
+  peer may hold this record from us" and "a copy of these bytes may still be
+  echoing" were one latch, and an RFC 6762 §6.7 legacy reply separates them: it
+  is a real, confirmed, positive-TTL send of the FULL record set, so the first is
+  true of it and the §10.1 goodbye owes it a retraction — and it is addressed to
+  one resolver's ephemeral port, so the second is not, because nothing
+  re-broadcasts it to the group and this screen is only ever asked about a
+  multicast arrival. A service whose only positive send was such a reply
+  therefore retained a row that disowned every matching multicast record for the
+  whole retention window, suppressing a GENUINE peer's terminal
+  `ServiceUpdate::HostConflict` on the strength of bytes no multicast socket ever
+  carried. `GoodbyeOwnership` now keeps both halves, every layer the exposure
+  crosses carries both (`WithdrawalSnapshot`, `RenameGoodbyeHandoff`, the
+  withdrawal item, the retained row), and only the narrower one reaches the
+  screen. The goodbye's half is unchanged and deliberately still counts the
+  unicast send — narrowing it would strand a legacy querier's cached records with
+  nothing to retract them — and so are `advertises_instance` /
+  `advertises_host` / the sibling-retained address union, which are questions
+  about peer caches rather than about echoes.
+- `mdns-proto`: a `ProbeConflict` now carries which of the receiving route's
+  names its record owns — new `ConflictRole` (`Instance` / `InstanceAndHost`),
+  read via new `ProbeConflict::role`. It matters only where one name wears both
+  roles. The fan-out tests the host rule first, so a labelled A/AAAA there
+  reaches the instance rule by falling through a host rule that MATCHED, and
+  that rule had already proved the route authoritative for an A/AAAA RRset at
+  that name. Delivering the record stripped of the proof made the two lifecycle
+  cells disagree about one datagram: pre-authoritatively it drove §8.2's
+  deferral, while an established service asked its instance-authority gate —
+  `canonical_rdata_forms`, whose domain is SRV/TXT/NSEC — whether it asserts an
+  address there, was told no, and **silently discarded** the record. §9's "MUST
+  immediately reset" therefore never ran, and §8.3 bounds the incumbent's burst,
+  so the retention window swallowed every copy there was. The host cell's own
+  reason for suppressing does not reach this owner either: it suppresses because
+  the host name is never probed, and this owner IS probed — `write_probe` asks
+  ANY for it and proposes exactly these A/AAAA — so the re-verification the host
+  cell lacks already exists. The role now travels with the record; the
+  identical-rdata precondition classifies it as a **host** record (so an address
+  this service publishes is §9's "never inconsistent", which the instance
+  classifier could not read at all and called differing), and the established
+  cell reaches §9's reversible same-name reset instead of dropping it. The
+  terminal `HostConflict` is still withheld — the fall-through carries the host
+  rule's authority, never its verdict.
 - `mdns-proto`: new `EndpointConfig::relinquished_retention` /
   `with_relinquished_retention`, defaulting to five seconds — long enough to
   outlast both a driver's self-send recency window and the §10.1 goodbye ceiling.
   `Duration::ZERO` disables the retention half. The residual is stated rather
   than hidden: a real peer asserting, within the window, rdata exactly equal to a
-  set we just relinquished at that same owner has the conflict's resolution
-  delayed by up to that long, per the cell-by-cell rule above. It self-corrects, and
+  set we just relinquished at that same owner has a **pre-authoritative** rename,
+  or a terminal `HostConflict`, delayed by up to that long, per the cell-by-cell
+  rule above — an established instance conflict is not delayed at
+  all. It self-corrects, and
   it is not an attack surface — mDNS is unauthenticated, so a forger never
   needed our bytes.
 - `mdns-proto`, `hick-udp`, `hick-mio`, `hick-reactor`, `hick-compio`,

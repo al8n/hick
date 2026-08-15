@@ -40,9 +40,9 @@ use crate::{
     RegisterServiceError, StartQueryError, StorageFullError, TransmitError,
   },
   event::{
-    ConflictHistory, ConflictOrigin, EndpointEvent, HostConflict, KnownAnswer, ProbeConflict,
-    ProbeProposal, QueryEvent, QueryUpdate, RouteEvent, ServiceEvent, ServiceQuestion, ToQuery,
-    ToService,
+    ConflictHistory, ConflictOrigin, ConflictRole, EndpointEvent, HostConflict, KnownAnswer,
+    ProbeConflict, ProbeProposal, QueryEvent, QueryUpdate, RouteEvent, ServiceEvent,
+    ServiceQuestion, ToQuery, ToService,
   },
   query::{CollectedAnswer, Query},
   service::{FullyAnnounced, Service},
@@ -357,6 +357,24 @@ cfg_heap! {
     /// being invariant across renames.
     #[allow(dead_code)]
     owned: [crate::service::EmittedRecords; 2],
+    /// The MULTICAST subset of [`Self::owned`], and the only half
+    /// [`Endpoint::relinquished_asserts`] reads from a resident item.
+    ///
+    /// The two answer different questions over the same records. `owned` is what
+    /// a peer may hold FROM US, so it counts an RFC 6762 §6.7 legacy reply: that
+    /// resolver's cache holds those records and this goodbye owes them a
+    /// retraction. `multicast` is what could still be ECHOING, and a datagram
+    /// addressed to one ephemeral port was never on the group, so no multicast
+    /// arrival can be a copy of it. Screening on `owned` labelled a GENUINE
+    /// peer's multicast A/AAAA as this endpoint's own relinquished history —
+    /// suppressing the host conflict for the item's whole residency — on the
+    /// strength of bytes no multicast socket ever carried.
+    ///
+    /// It narrows exactly where `owned` does (see
+    /// [`Endpoint::note_service_announced`]), so it is a subset of `owned` at
+    /// every instant.
+    #[allow(dead_code)]
+    multicast: [crate::service::EmittedRecords; 2],
     /// PER-FAMILY goodbye-send debt: `[0]` IPv4, `[1]` IPv6, each initialised to
     /// `WITHDRAWAL_SENDS` for a family that actually carried something and to `0`
     /// for one that did not — a family with nothing in its peers' caches has
