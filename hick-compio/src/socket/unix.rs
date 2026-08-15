@@ -2287,11 +2287,17 @@ fn up_loopback_index() -> u32 {
 async fn recv_matching(sock: &super::Socket, want: &[u8]) -> RecvMeta {
   compio::time::timeout(std::time::Duration::from_secs(10), async {
     loop {
+      // `recv` keys the datagram it mints by the family of the socket that
+      // carried it, and `has_ip_dstaddr_recvif` is the BSD IPv4 pair — every
+      // socket handed to this helper is v4.
       let (data, meta) = sock
-        .recv(2048)
+        .recv(2048, hick_udp::Family::V4)
         .await
         .expect("the receive path itself must not fail while waiting");
-      if data == want {
+      // The body alone identifies the probe. The datagram's other half is
+      // ordering evidence for a self-send claim this helper never makes, so it
+      // is left where it is rather than compared.
+      if data.body() == want {
         return meta;
       }
     }

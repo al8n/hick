@@ -48,20 +48,36 @@ BREAKING
   rrclass, but inconsistent rdata": an IPv4-only service and an IPv6-only service
   sharing a host name publish disjoint RRsets and are accepted.
 - **`hick-smoltcp` and `hick-embassy` lose all-effects suppression of their own
-  loopback.** Their self-send log is a content match and nothing more —
-  non-consuming, with no address-family key, no ordering evidence and no
-  source-port gate at the call site — so a match against the records they STILL
-  publish reports `OwnEchoLikely` and never the ordered tier. Their own echo now
+  loopback.** Their self-send log weighs no ordering evidence — there is no
+  kernel receive stamp on a bare-metal path and no wall clock to put one on — so
+  a match against the records they STILL publish reports `OwnEchoLikely` and
+  never the ordered tier. Their own echo now
   reaches §8.2's tiebreak and §8.1's defence instead of being deleted; it still
   populates no cache entry and quiets no query of ours. That is safe because an
   echo of records still published carries rdata identical to ours, which §9
   makes no conflict at all, and it is the point of the change rather than a side
   effect: their self-detection was never strong enough to justify deleting a §8
   proposal. The one echo for which that does not hold — one sent before a
-  service registered or began withdrawing, so it may assert records no live
-  route holds — reports `OwnEcho` and is suppressed whole. That is not a
+  service registered, began withdrawing or took a §9 automatic rename, so it
+  may assert records no live route holds — reports `OwnEcho` and is suppressed
+  whole. That is not a
   stronger claim about the evidence but a weaker claim about what the bytes may
   still say.
+- **`hick-smoltcp`'s self-send log becomes take-once, address-family keyed and
+  source-port gated**, and `hick-embassy` inherits all three. It is what the
+  `OwnEcho` above may not be granted without: exact equality with a past send
+  establishes CONTENT and not ORIGIN, so against a non-consuming log a peer
+  replaying bytes it captured off the link matched for the whole five-second
+  retention window, every copy — and during a same-name replacement an old
+  authoritative response really does conflict with the replacement's records
+  under §§8.1 and 9, so a flood of them stayed invisible through a whole probing
+  window. A recorded entry now owes one loopback copy per family whose socket
+  accepted the datagram, a claim SPENDS the copy it matches, and the call site
+  offers no credit at all to a datagram from a source port this engine never
+  sends from. The family key is separately load-bearing: one multicast is two
+  `try_send` calls with identical bytes and one echo per joined socket, and
+  without it the first echo read would spend both copies and leave the second to
+  reach the proto layer as peer traffic.
 - `hick-reactor`, `hick-mio` and `hick-compio` report all three tiers instead of
   two. A claim the kernel's receive stamp ORDERED against our `sendto` stays
   `OwnEcho`; one that matched on content, family and the TTL alone becomes
@@ -69,8 +85,8 @@ BREAKING
   byte-identical datagram produces, so it may not be trusted with a name. It is
   the whole of the match on Windows and on any kernel that delivers no timestamp
   cmsg. A match at EITHER strength against a credit recorded before a service
-  registered or began withdrawing reports `OwnEcho` as well, for the reason the
-  bullet above gives: a stale echo may no longer adjudicate anything. No credit,
+  registered, began withdrawing or took a §9 automatic rename reports `OwnEcho`
+  as well, for the reason the bullet above gives: a stale echo may no longer adjudicate anything. No credit,
   or a source port this endpoint never sends from, becomes `NotFromUs` rather
   than `Unknown`, which additionally declines `trust_advertised_src_as_self` on
   these drivers.
@@ -174,9 +190,12 @@ BREAKING
   echo is still safe — take-once still spends the credit — but adjudicating it
   is not: its §8.2 proposal is for a name this endpoint may no longer be
   defending, and its §9 rdata is rdata no live route holds. A driver calls
-  `supersede` at the two lifecycle seams that can leave a recorded send stale —
-  a service registration, and the withdrawal that retires a route however it
-  was reached — and maps `Superseded` onto `Provenance::OwnEcho`, the only
+  `supersede` at every mutation of what it publishes — a service registration,
+  the withdrawal that retires a route however it was reached, and the §9
+  AUTOMATIC RENAME, which `Service::set_instance` has already applied by the
+  time the driver sees `ServiceUpdate::Renamed` and which reaches neither of the
+  other two when it succeeds — and maps `Superseded` onto `Provenance::OwnEcho`,
+  the only
   tier that denies adjudication, rather than discarding the credit: discarding
   would make the same echo read as `NoCredit`, full peer traffic and full
   adjudication, the same failure louder. `SelfSendMatch` stays

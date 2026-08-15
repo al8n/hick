@@ -4353,6 +4353,162 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   );
 }
 
+/// RFC 6762 §9 surviving rename: every self-send credit recorded before it is
+/// SUPERSEDED.
+///
+/// The proto calls `Service::set_instance` before it emits `Renamed`, so by the
+/// time `push_service_updates` observes the update this service publishes a
+/// different set of records — the rename is a published-record mutation, and
+/// `SelfSendTracker::supersede` is owed at that site as much as at a
+/// registration or a withdrawal.
+///
+/// Left un-superseded, a credit older than the rename claims at the CURRENT
+/// generation: `Provenance::OwnEchoLikely`, the tier that declines §10 caching
+/// but still ADJUDICATES — and what it would adjudicate is an §8.2 proposal for
+/// a name this endpoint no longer defends, carrying §9 rdata no live route
+/// holds. The window runs from the rename to the next registration or
+/// withdrawal: the tracker holds ONE generation for the whole log, so either of
+/// those demotes the stale credit too. The advance is owed at the MUTATION
+/// rather than argued from where a stale credit can reach — that argument has to
+/// be re-made after every change to the routing, and this one does not.
+///
+/// The rename asserted here must SURVIVE. A rename COLLISION is retired through
+/// `begin_service_withdrawal`, which supersedes for a reason of its own, so a
+/// test that drifted onto the collision path would stay green with the mutation
+/// site deleted and prove nothing about it.
+#[test]
+fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
+  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+  use crate::socket::RecvMeta;
+  use mdns_proto::{
+    Name,
+    wire::{Header, MessageBuilder},
+  };
+
+  let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
+  s.local_subnets = vec![(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)), 24)];
+  s.bound_interface = 1;
+  let now = StdInstant::now();
+  let old_inst = Name::try_from_str("Old._ipp._tcp.local.").unwrap();
+  let handle = s
+    .test_register_service(delivery_test_spec("Old"), now)
+    .unwrap();
+  let mailbox = Rc::clone(&s.services.get(&handle).unwrap().mailbox);
+  let mut buf = vec![0u8; 4096];
+
+  // Drive "Old" to Established: only an ANNOUNCED service rewrites records a
+  // peer already holds when it renames, which is what makes the older credits
+  // stale rather than merely early.
+  let mut t = now;
+  let mut established = false;
+  for _ in 0..40 {
+    t += Duration::from_millis(300);
+    confirm_service_round(&mut s, handle, t, &mut buf, whole_fanout(t));
+    s.push_service_updates(t);
+    while let Some(u) = mailbox.borrow_mut().drain_for_test() {
+      if matches!(u, ServiceUpdate::Established) {
+        established = true;
+      }
+    }
+    if established {
+      break;
+    }
+  }
+  assert!(
+    established,
+    "Old must reach Established before the rename, or the rename mutates nothing \
+     any peer has seen"
+  );
+
+  // The credit under test: recorded and sealed while "Old" still owns its name,
+  // so the rename below is the only thing between it and the claim.
+  const MARKER: &[u8] = b"pre-rename-self-send-credit";
+  s.selfsend.record(Family::V4, MARKER, ClockPair::now());
+  s.selfsend.seal();
+  // The receive path proves the seal it relies on preceded the park; sealing
+  // outside `run`'s loop has to re-establish that boundary by hand.
+  #[cfg(debug_assertions)]
+  s.note_park_entry();
+
+  // A conflicting SRV RESPONSE for "Old" with rival rdata: the §9 signal that
+  // reverts this ESTABLISHED service to probing, where it loses the §8.2
+  // tiebreak and renames away. It has to be a response — §9 defines a conflict
+  // over one, and a peer merely PROBING this name is defended against instead.
+  // No LOCAL service owns the candidate name, so this rename SURVIVES.
+  let conflict = {
+    let target = Name::try_from_str("rival.local.").unwrap();
+    let mut cbuf = [0u8; 512];
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, header).unwrap();
+    b.push_srv_answer(&old_inst, 120, 0, 0, 9999, &target, true)
+      .unwrap();
+    let n = b.finish().unwrap();
+    cbuf[..n].to_vec()
+  };
+  let peer = RecvMeta::new(
+    SocketAddr::from(([192, 168, 1, 200], 5353)),
+    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)),
+    Some(IpAddr::V4(hick_udp::constants::MDNS_IPV4_GROUP)),
+    1,
+    Some(255),
+    conflict.len(),
+  );
+  // Fed on every iteration, not once: renaming an ANNOUNCED service takes two
+  // rounds — the §9 conflict first reverts it to probing, and only a conflict
+  // seen WHILE probing loses the §8.2 comparison.
+  let mut renamed = false;
+  for _ in 0..80 {
+    t += Duration::from_millis(250);
+    s.handle_datagram(&peer, &RxDatagram::without_stamp(Family::V4, &conflict));
+    confirm_service_round(&mut s, handle, t, &mut buf, whole_fanout(t));
+    s.push_service_updates(t);
+    // Read off the handle-owned mailbox, so what is observed is the update
+    // `push_service_updates` actually consumed — the site that owes the bump.
+    while let Some(u) = mailbox.borrow_mut().drain_for_test() {
+      if matches!(u, ServiceUpdate::Renamed(_)) {
+        renamed = true;
+      }
+    }
+    if renamed {
+      break;
+    }
+  }
+  assert!(
+    renamed,
+    "Old must rename away under sustained conflict, or nothing here reaches the \
+     mutation site"
+  );
+
+  let ctx = s
+    .services
+    .get(&handle)
+    .expect("a survived rename keeps its ctx");
+  assert!(
+    !ctx.errored,
+    "this must be the SURVIVING path: a rename COLLISION is retired through \
+     `begin_service_withdrawal`, which supersedes for its own reason and would \
+     prove nothing about the rename"
+  );
+  assert_ne!(
+    ctx.proto.name().as_str(),
+    old_inst.as_str(),
+    "the survivor must hold the NEW instance name"
+  );
+
+  assert_eq!(
+    s.selfsend
+      .claim(&RxDatagram::without_stamp(Family::V4, MARKER)),
+    SelfSendMatch::Superseded,
+    "a successful auto-rename mutates the records this service publishes, so a \
+     credit recorded before it describes a state this endpoint has left; left \
+     un-superseded it claims as current, reaches `Provenance::OwnEchoLikely` and \
+     still adjudicates — letting a delayed echo of the abandoned instance name \
+     defeat whatever holds that name next under RFC 6762 §8.1"
+  );
+}
+
 /// RFC 6762 §6.7 legacy unicast reply: no self-send credit.
 ///
 /// A unicast datagram leaves for the querier's own address and ephemeral port and
@@ -4439,6 +4595,7 @@ async fn a_legacy_unicast_reply_records_no_self_send_credit() {
 /// distinguishes the two tiers without this driver reaching into the protocol
 /// core's routing. The two halves share one body and one credit, so the only
 /// difference between them is the stamp.
+#[cfg(feature = "stats")]
 #[test]
 fn the_two_match_strengths_reach_the_protocol_layer_as_different_tiers() {
   use core::net::{IpAddr, Ipv4Addr, SocketAddr};

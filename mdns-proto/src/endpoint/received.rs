@@ -29,7 +29,9 @@ pub enum Provenance {
   ///
   /// **Superseded.** A content match — ordered or NOT — against a datagram the
   /// caller sent under a generation of its own records that no longer exists,
-  /// because a service registered or began withdrawing since the send. This
+  /// because what the caller publishes has been mutated since the send: a
+  /// service registered, a service began withdrawing, or a service took an RFC
+  /// 6762 §9 automatic rename. This
   /// route claims no more evidence than [`Self::OwnEchoLikely`] carries; it
   /// reports an echo that has less left it may safely say. A stale echo's RFC
   /// 6762 §8.2 proposal is for a name this endpoint may no longer be defending
@@ -52,6 +54,16 @@ pub enum Provenance {
   /// publishes, and report a match against a superseded generation as
   /// [`Self::OwnEcho`] instead. See the `OwnEchoLikely` adjudication cell in
   /// `admits.rs` for why.
+  ///
+  /// A generation is superseded by **every mutation of what this endpoint
+  /// publishes**, and a driver owes the advance at each of them, at the site
+  /// rather than once per loop: a service registration; the `begin_withdrawal`
+  /// that retires a route however that retirement was reached (caller
+  /// unregister, shutdown, rename collision, internal retirement); and the RFC
+  /// 6762 §9 automatic rename, taken at the driver's own
+  /// `ServiceUpdate::Renamed` — a successful rename reaches none of the other
+  /// two, and it has already mutated the service's records by the time the
+  /// update is observed.
   OwnEchoLikely,
   /// The caller logs every datagram it sends and this datagram matched none it
   /// still holds.

@@ -32,7 +32,7 @@ use rand_core::Rng;
 use smoltcp::wire::IpCidr;
 
 use crate::{
-  constants::{MDNS_SOCKET_V4, MDNS_SOCKET_V6},
+  constants::{MDNS_PORT, MDNS_SOCKET_V4, MDNS_SOCKET_V6},
   ingress,
   udpio::{SendError, UdpIo},
 };
@@ -68,6 +68,12 @@ const MAX_RX_PER_PUMP: usize = 64;
 const RECENT_SEND_BYTES: usize = 16 * 1024;
 /// How long a recorded self-send stays eligible to match a loopback — bounds the
 /// window in which a byte-identical peer datagram could be misread as self.
+///
+/// It bounds the window, and TAKE-ONCE bounds how many datagrams that window can
+/// cost: an entry owes one loopback copy per family that queued it, and a claim
+/// spends the copy it matches. So the price of a false match is one datagram per
+/// family, once, and not every copy that arrives before the entry ages out — see
+/// [`Multicaster::claim`].
 const RECENT_SEND_TTL: Duration = Duration::from_secs(5);
 /// A recent multicast datagram we handed to the transport, kept (exact bytes +
 /// send time) for self-loopback detection.
@@ -77,6 +83,60 @@ struct SelfSend<I> {
   /// Which generation of this engine's own records this datagram was sent
   /// under. See [`Multicaster::generation`].
   generation: u64,
+  /// Whether each family ([0] = v4, [1] = v6) still owes this entry a loopback
+  /// copy: `true` for every family whose socket ACCEPTED the datagram, cleared
+  /// by the claim that spends it.
+  ///
+  /// # It is a per-family COUNT of one, not a family tag
+  ///
+  /// One multicast is two `try_send` calls with identical bytes, and the
+  /// transport loops one copy back per joined socket — so a single recorded
+  /// datagram is owed up to two echoes, one on each stack, and a single flag
+  /// would let the first arrival spend the other family's copy too. The second
+  /// echo would then find nothing, reach the proto layer as peer traffic, and
+  /// raise a phantom RFC 6762 §9 conflict against this engine itself.
+  ///
+  /// The flags are also what makes an entry TAKE-ONCE per family rather than a
+  /// standing predicate: without them a replay of captured bytes matches for the
+  /// whole of [`RECENT_SEND_TTL`], every copy, which is what
+  /// `Provenance::OwnEcho`'s total suppression cannot survive. See
+  /// [`Multicaster::claim`].
+  owed: [bool; 2],
+}
+
+/// The address family a datagram was queued on or arrived on, and therefore the
+/// only socket its loopback copy can travel over.
+///
+/// Indices match [`family_order`]'s: `[0]` is v4, `[1]` is v6.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+enum Family {
+  V4,
+  V6,
+}
+
+impl Family {
+  /// The family of an address.
+  ///
+  /// Both supplied transports report a v4 datagram's peer as [`IpAddr::V4`] and
+  /// a v6 datagram's as [`IpAddr::V6`] — neither smoltcp nor embassy-net has a
+  /// v4-mapped form. A foreign [`UdpIo`] that reported one anyway would key the
+  /// claim to the wrong family and its own echo would read as a peer's, which is
+  /// the benign direction: the echo asserts records identical to ours, so §8.2.1
+  /// ties on it and §9 calls it no conflict.
+  const fn of(addr: IpAddr) -> Self {
+    match addr {
+      IpAddr::V4(_) => Self::V4,
+      IpAddr::V6(_) => Self::V6,
+    }
+  }
+
+  /// This family's slot in a `[_; 2]` keyed the way [`family_order`] keys one.
+  const fn index(self) -> usize {
+    match self {
+      Self::V4 => 0,
+      Self::V6 => 1,
+    }
+  }
 }
 
 /// What the self-send log says about an inbound datagram.
@@ -89,7 +149,8 @@ enum SelfLog {
   /// publishes.
   Current,
   /// Matched a datagram sent BEFORE the records changed under it — a service
-  /// registered, or began withdrawing, since the send.
+  /// registered, began withdrawing, or took an RFC 6762 §9 automatic rename
+  /// since the send.
   ///
   /// A withdrawing route stops holding its host name for the registration
   /// guard, so a replacement may take that name with a different address set
@@ -105,6 +166,28 @@ enum SelfLog {
   /// [`SelfLog::Current`] carries — it is that a stale echo has nothing left it
   /// may safely say, since its §8.2 proposal is for a name this engine may no
   /// longer be defending and its §9 rdata is rdata no live route holds.
+  ///
+  /// # What bounds the total suppression is TAKE-ONCE, and nothing else
+  ///
+  /// `OwnEcho` denies observation, quieting, adjudication AND the §8.1 defence,
+  /// so a datagram reported this way is invisible. Exact equality with a past
+  /// send establishes CONTENT, not origin: any peer can replay bytes it captured
+  /// off the link, and during a same-name replacement an old authoritative
+  /// response really can conflict with the replacement's records under §§8.1 and
+  /// 9.
+  ///
+  /// What keeps that to a bounded cost is that a claim SPENDS the copy it
+  /// matches ([`SelfSend::owed`]): the first replay is swallowed, and every copy
+  /// behind it finds nothing, reads as [`SelfLog::None`], and adjudicates in
+  /// full. A prober sends three probes and a defender answers each, so one
+  /// swallowed copy cannot hide a conflict for a whole probing window.
+  ///
+  /// **A non-consuming match may not be reported as this.** It would make every
+  /// copy of a replay invisible for the whole of [`RECENT_SEND_TTL`], which is
+  /// the defect the take-once bookkeeping exists to prevent — and mapping it to
+  /// [`SelfLog::Current`] instead is not the alternative, because that tier
+  /// adjudicates and is exactly how a withdrawn generation retires its own
+  /// replacement.
   Superseded,
   /// Matched nothing this log still holds.
   None,
@@ -546,12 +629,19 @@ fn family_order<I: Instant>(failing_since: &[Option<I>; 2]) -> [(usize, SocketAd
 /// pruning expired entries then evicting oldest to fit the byte budget —
 /// preserving the freshest sends so a large simultaneous burst stays covered
 /// until its loopbacks arrive.
+///
+/// `owed` names the families whose sockets ACCEPTED this datagram, and therefore
+/// the loopback copies this one entry may be spent on — see [`SelfSend::owed`].
+/// One entry covers both families rather than two copies of the same bytes,
+/// because the byte budget here is an embedded one and the datagram is
+/// identical on both stacks.
 fn record_into<I: Instant>(
   recent: &mut VecDeque<SelfSend<I>>,
   recent_bytes: &mut usize,
   data: &[u8],
   now: I,
   generation: u64,
+  owed: [bool; 2],
 ) {
   while let Some(front) = recent.front() {
     if now
@@ -575,6 +665,7 @@ fn record_into<I: Instant>(
     data: data.to_vec(),
     at: now,
     generation,
+    owed,
   });
 }
 
@@ -589,6 +680,8 @@ struct Multicaster<I> {
   /// family last succeeded.
   failing_since: [Option<I>; 2],
   /// Recent sent datagrams (exact bytes + time), for self-loopback detection.
+  /// TAKE-ONCE per family: [`Self::claim`] spends the copy it matches, so a
+  /// byte-identical datagram arriving after the real echo is seen as a peer's.
   recent: VecDeque<SelfSend<I>>,
   /// Total bytes buffered in `recent` (for the byte budget).
   recent_bytes: usize,
@@ -636,8 +729,9 @@ impl<I: Instant> Multicaster<I> {
   /// endpoint owns that retry schedule, so the driver just fans one due goodbye
   /// datagram to both families per round and reports `any_sent` back.
   ///
-  /// Records a self-send credit for every family that sent. Uses `data.len()` as
-  /// the byte count for both families (they encode the same datagram).
+  /// Records ONE self-send entry covering every family that sent, owing that
+  /// family one loopback copy apiece. Uses `data.len()` as the byte count for
+  /// both families (they encode the same datagram).
   ///
   /// # Three readings, three different questions
   ///
@@ -667,6 +761,10 @@ impl<I: Instant> Multicaster<I> {
   ) -> Fanout<I> {
     let mut results = [FamilySend::Unsupported; 2];
     let mut earliest_accepted: Option<I> = None;
+    // Which families this fan-out actually queued the datagram on, and therefore
+    // which loopback copies the entry recorded below is owed. See
+    // [`SelfSend::owed`].
+    let mut accepted_by = [false; 2];
     for (idx, group) in family_order(&self.failing_since) {
       // Read at this family's offer, and used for both halves of the pre-send
       // question: whether it has had its gap, and — should the socket take the
@@ -705,15 +803,18 @@ impl<I: Instant> Multicaster<I> {
       };
       if let Some(at) = outcome.accepted_at() {
         earliest_accepted = Some(earliest_accepted.map_or(at, |first| first.min(at)));
+        if let Some(slot) = accepted_by.get_mut(idx) {
+          *slot = true;
+        }
       }
       results[idx] = outcome;
     }
-    // The self-send credit is stamped at the EARLIEST family's pre-send
-    // instant: one fingerprint covers both families' loopbacks, and a stamp that
+    // The self-send entry is stamped at the EARLIEST family's pre-send
+    // instant: one entry covers both families' loopbacks, and a stamp that
     // outran a copy already echoed back would leave it unmatched and read as a
     // conflicting peer.
     if let Some(at) = earliest_accepted {
-      self.record(data, at);
+      self.record(data, at, accepted_by);
     }
     Fanout {
       v4: results[0],
@@ -792,69 +893,115 @@ impl<I: Instant> Multicaster<I> {
     }
   }
 
-  /// What this log says about `data`: an exact byte match against a recent
-  /// self-send inside the recency window — no hash collisions, bounded
-  /// false-positive window — and whether that send is still current.
+  /// What this log says about `data`, arriving on `family` — an exact byte match
+  /// against a recent self-send inside the recency window, no hash collisions —
+  /// and whether that send is still current.
   ///
-  /// # A CURRENT match is `OwnEchoLikely` and can never be `OwnEcho`
+  /// **It SPENDS what it matches.** The entry owes one loopback copy per family
+  /// that queued the datagram ([`SelfSend::owed`]), and a match clears this
+  /// family's copy; an entry with no copies left is dropped. That is not
+  /// bookkeeping hygiene, it is what the two tiers below are argued from, so a
+  /// non-consuming version of this method is not a weaker variant of it but a
+  /// different and unsound one.
   ///
-  /// Four things this test does not have, each one on its own enough to keep it
-  /// out of the ordered tier:
+  /// # What take-once, the family key and the port gate close
   ///
-  ///  * it is **non-consuming**. There is no take-once credit here, so a
-  ///    byte-identical datagram matches for the whole of [`RECENT_SEND_TTL`], not
-  ///    once. A conforming RFC 6762 §9 fault-tolerance twin — "capable of issuing
-  ///    identical answers" — matches every time it speaks;
-  ///  * it has **no family key**, so an echo on either stack claims the same
-  ///    record;
-  ///  * it weighs **no ordering evidence at all**. There is no kernel receive
-  ///    stamp on this path and no wall clock to put one on, so nothing says the
-  ///    datagram arrived at or after our own send rather than before it;
-  ///  * the call site applies **no source-port gate**, so a datagram from a port
-  ///    this endpoint never sends from is weighed like any other.
+  ///  * **take-once.** A byte-identical datagram matches once per family that
+  ///    sent, not for the whole of [`RECENT_SEND_TTL`]. So a peer replaying bytes
+  ///    it captured off the link costs one swallowed copy and no more, and a
+  ///    conforming RFC 6762 §9 fault-tolerance twin — "capable of issuing
+  ///    identical answers" — is seen from its second datagram onwards;
+  ///  * **the family key.** One multicast is two `try_send` calls with identical
+  ///    bytes and one loopback copy per joined socket. Without the key the first
+  ///    echo to be read would spend both copies and the second would reach the
+  ///    proto layer as peer traffic — a phantom §9 conflict against this engine
+  ///    itself;
+  ///  * **the source-port gate**, applied by the caller ([`Engine::handle_one`]).
+  ///    Both this engine's sockets send from 5353, so every loopback copy arrives
+  ///    from 5353 and a different source port is proof the datagram is not our
+  ///    echo. Offering it a credit anyway would let a §6.7 legacy unicast query
+  ///    carrying bytes we just multicast spend the credit our real echo needs.
   ///
-  /// A current match therefore means "these bytes look like ours", which is
-  /// exactly what `Provenance::OwnEchoLikely` means and nothing stronger.
-  /// [`SelfLog::None`] is a negative claim about this log and nothing else,
-  /// which is `NotFromUs`.
+  /// # A CURRENT match is still `OwnEchoLikely` and can never be `OwnEcho`
+  ///
+  /// One gap is left, and it is not closable here: this weighs **no ordering
+  /// evidence at all**. There is no kernel receive stamp on this path and no wall
+  /// clock to put one on, so nothing says the datagram arrived at or after our
+  /// own send rather than before it — and a conforming twin's first
+  /// byte-identical datagram matches exactly this way. A current match therefore
+  /// means "these bytes look like ours", which is what
+  /// `Provenance::OwnEchoLikely` means and nothing stronger. [`SelfLog::None`] is
+  /// a negative claim about this log and nothing else, which is `NotFromUs`.
   ///
   /// # A SUPERSEDED match is the one exception, and it goes the other way
   ///
-  /// It is weaker evidence by every measure above and still suppresses MORE,
+  /// It is weaker evidence by the measure above and still suppresses MORE,
   /// because the question it answers is not how strongly the bytes are ours but
   /// whether what they assert is still ours to assert. See
-  /// [`SelfLog::Superseded`].
+  /// [`SelfLog::Superseded`], including for why take-once is what makes that
+  /// total suppression affordable.
   ///
-  /// The freshest match wins when several entries hold the same bytes: this log
-  /// is non-consuming and the same datagram can be recorded across a generation
-  /// change, so a later, still-current send must not be reported as superseded
-  /// by an older copy of itself.
-  fn classify(&self, data: &[u8], now: I) -> SelfLog {
-    let mut verdict = SelfLog::None;
-    for s in &self.recent {
-      let fresh = s.data.as_slice() == data
-        && now
-          .checked_duration_since(s.at)
-          .is_some_and(|age| age <= RECENT_SEND_TTL);
-      if !fresh {
+  /// A CURRENT entry is preferred over a superseded one holding the same bytes:
+  /// the same datagram can be recorded on both sides of a generation change, and
+  /// a later, still-current send must not be spent as superseded by an older copy
+  /// of itself. Among equals the OLDEST is spent, so the earliest echo takes the
+  /// earliest copy.
+  fn claim(&mut self, family: Family, data: &[u8], now: I) -> SelfLog {
+    let idx = family.index();
+    let mut current: Option<usize> = None;
+    let mut superseded: Option<usize> = None;
+    for (pos, s) in self.recent.iter().enumerate() {
+      if !s.owed.get(idx).copied().unwrap_or(false) || s.data.as_slice() != data {
+        continue;
+      }
+      if !now
+        .checked_duration_since(s.at)
+        .is_some_and(|age| age <= RECENT_SEND_TTL)
+      {
         continue;
       }
       if s.generation == self.generation {
-        return SelfLog::Current;
+        current = Some(pos);
+        break;
       }
-      verdict = SelfLog::Superseded;
+      if superseded.is_none() {
+        superseded = Some(pos);
+      }
+    }
+    let (pos, verdict) = match (current, superseded) {
+      (Some(pos), _) => (pos, SelfLog::Current),
+      (None, Some(pos)) => (pos, SelfLog::Superseded),
+      (None, None) => return SelfLog::None,
+    };
+    // Spend this family's copy, and drop the entry once neither family is still
+    // owed one — the removal preserves the insertion order the byte-budget
+    // eviction walks. `pos` came from the scan above so the lookup always takes;
+    // it is a lookup rather than an index because nothing on a receive path here
+    // may panic.
+    if let Some(entry) = self.recent.get_mut(pos) {
+      entry.owed[idx] = false;
+      if !entry.owed[0]
+        && !entry.owed[1]
+        && let Some(spent) = self.recent.remove(pos)
+      {
+        self.recent_bytes = self.recent_bytes.saturating_sub(spent.data.len());
+      }
     }
     verdict
   }
 
   /// Record a sent datagram for self-loopback detection (see [`record_into`]).
-  fn record(&mut self, data: &[u8], now: I) {
+  ///
+  /// `accepted_by` names the families whose sockets took it, and therefore the
+  /// loopback copies this entry may be spent on.
+  fn record(&mut self, data: &[u8], now: I, accepted_by: [bool; 2]) {
     record_into(
       &mut self.recent,
       &mut self.recent_bytes,
       data,
       now,
       self.generation,
+      accepted_by,
     );
   }
 
@@ -1548,24 +1695,38 @@ where
     // advertised-source fallback cannot always match (e.g. an IPv6 link-local
     // source).
     //
-    // **`OwnEchoLikely`, and never `OwnEcho`.** This engine's self-detection has
-    // none of the four things the ordered tier asserts — see `is_self` for each
-    // one — so it may not claim them. What that costs is real and deliberate: a
-    // match no longer suppresses everything, so our own echo now populates no
-    // cache entry and quiets nothing, but it DOES reach §8.2's tiebreak and
-    // §8.1's defence. That is the safe direction. Suppressing a §8.2 proposal
-    // this engine merely suspects is its own costs a name permanently and
-    // silently between two conforming hosts; adjudicating our own echo costs at
-    // worst one §8.2 second.
+    // **A CURRENT match is `OwnEchoLikely`, and never `OwnEcho`.** This engine
+    // weighs no ordering evidence — see `Multicaster::claim` — so it may not
+    // claim the ordered tier. What that costs is real and deliberate: a match no
+    // longer suppresses everything, so our own echo now populates no cache entry
+    // and quiets nothing, but it DOES reach §8.2's tiebreak and §8.1's defence.
+    // That is the safe direction. Suppressing a §8.2 proposal this engine merely
+    // suspects is its own costs a name permanently and silently between two
+    // conforming hosts; adjudicating our own echo costs at worst one §8.2 second.
     //
-    // `false` is a negative claim about this engine's own send log, which is
-    // `NotFromUs` — and `NotFromUs` declines `trust_advertised_src_as_self`,
+    // `SelfLog::None` is a negative claim about this engine's own send log, which
+    // is `NotFromUs` — and `NotFromUs` declines `trust_advertised_src_as_self`,
     // because a caller that logs what it sends has better evidence than a source
     // address that any co-resident publisher matches.
-    let provenance = match self.tx.classify(data, now) {
-      SelfLog::Current => Provenance::OwnEchoLikely,
-      SelfLog::Superseded => Provenance::OwnEcho,
-      SelfLog::None => Provenance::NotFromUs,
+    //
+    // **THE SOURCE-PORT GATE IS THE `if`, not a term inside the match**, and the
+    // short circuit is load-bearing. Both of this engine's sockets send from
+    // 5353 — RFC 6762 §3 requires it, and `crate::smoltcp_io` already assumes
+    // that bind — so every loopback copy arrives from 5353 and any other source
+    // port is proof the datagram is not our echo. A §6.7 legacy unicast query
+    // from an ephemeral port carrying the same bytes as one we just multicast is
+    // offered no credit at all — offered one, it would SPEND the copy our real
+    // echo needs and be suppressed itself, so the querier's reply would never be
+    // sent and the genuine echo behind it would reach the proto layer as peer
+    // traffic.
+    let provenance = if src.port() == MDNS_PORT {
+      match self.tx.claim(Family::of(src.ip()), data, now) {
+        SelfLog::Current => Provenance::OwnEchoLikely,
+        SelfLog::Superseded => Provenance::OwnEcho,
+        SelfLog::None => Provenance::NotFromUs,
+      }
+    } else {
+      Provenance::NotFromUs
     };
     // Split borrow: `endpoint.handle` holds `&mut self.endpoint` while the
     // route-event iterator is alive, so per-service routing reads
@@ -1652,6 +1813,22 @@ where
         .and_then(|slot| slot.proto.poll())
       {
         if let ServiceUpdate::Renamed(ref renamed) = update {
+          // A §9 auto-rename is a PUBLISHED-RECORD MUTATION: the proto called
+          // `Service::set_instance` before it emitted this update, so every
+          // entry recorded under the abandoned instance name describes a state
+          // this engine has left.
+          //
+          // UNCONDITIONALLY, and at the mutation. A rename that COLLIDES is torn
+          // down through `begin_service_withdrawal`, which supersedes for its own
+          // reason; a SURVIVING one crosses no lifecycle seam at all, so until
+          // the next registration or withdrawal every entry for the abandoned
+          // owner still reads as `SelfLog::Current` and reaches
+          // `Provenance::OwnEchoLikely`, which ADJUDICATES. Whether a given stale
+          // entry can then reach an adverse route is a routing question that
+          // would have to be re-derived after every change to the routing; the
+          // invariant is stated over mutations so it does not have to be. See
+          // `Multicaster::supersede`.
+          self.tx.supersede();
           let new_name = renamed.new_name().clone();
           let rename_result = self.endpoint.handle_service_renamed(handle, new_name);
           // The §9 rename of an announced service hands its OLD-name TTL=0 goodbye

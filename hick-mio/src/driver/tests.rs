@@ -1550,6 +1550,94 @@ fn a_surviving_rename_holds_the_old_name_until_its_retraction_is_paid() {
     .expect("a paid-off retraction must release the old name");
 }
 
+/// A rename the service **survives** SUPERSEDES every self-send credit recorded
+/// before it.
+///
+/// The proto calls `Service::set_instance` before it emits `Renamed`, so by the
+/// time `push_updates` observes the update this service publishes a different
+/// set of records — the rename is a published-record mutation, and
+/// `SelfSendTracker::supersede` is owed at that site as much as at a
+/// registration or a withdrawal.
+///
+/// Left un-superseded, a credit older than the rename claims at the CURRENT
+/// generation: `Provenance::OwnEchoLikely`, the tier that declines §10 caching
+/// but still ADJUDICATES — and what it would adjudicate is an §8.2 proposal for
+/// a name this endpoint no longer defends, carrying §9 rdata no live route
+/// holds. The window runs from the rename to the next registration or
+/// withdrawal: the tracker holds ONE generation for the whole log, so either of
+/// those demotes the stale credit too. The advance is owed at the MUTATION
+/// rather than argued from where a stale credit can reach — that argument has to
+/// be re-made after every change to the routing, and this one does not.
+///
+/// The rename asserted here must SURVIVE. A rename COLLISION is retired through
+/// `begin_service_withdrawal`, which supersedes for a reason of its own, so a
+/// test that drifted onto the collision path would stay green with the mutation
+/// site deleted and prove nothing about it.
+///
+/// # Accepted residual
+///
+/// This is the one of the three drivers' copies that runs on real sockets and a
+/// real clock. The marker credit is sealed before [`drive_to_rename`], and every
+/// `tick` inside it reclaims sealed credits past
+/// [`SELF_SEND_TTL`](hick_udp::selfsend::SELF_SEND_TTL) — 2 s — so a host slow
+/// enough to spend that long reaching the rename reports `NoCredit` rather than
+/// `Superseded`. Measured at 288–512 ms here, a 4–7x margin, and the failure is
+/// loud rather than a false green: the assertion below rejects `NoCredit` too.
+/// `claim_at` would only move the claim-side half of that window; the reclaim
+/// inside `seal` is on the real clock either way.
+#[test]
+fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
+  let Some(mut mdns) = test_support::loopback_mdns() else {
+    return;
+  };
+  let ty = "_hick-mio-rn5._tcp.local.";
+  let old = format!("superseder.{ty}");
+  let handle = mdns
+    .register_service(test_support::named_service_spec("superseder", ty, 8080))
+    .expect("register_service");
+  // Only an ANNOUNCED service rewrites records a peer already holds when it
+  // renames, which is what makes the credits older than it stale rather than
+  // merely early.
+  if !test_support::drive_to_advertised(&mut mdns, handle) {
+    return;
+  }
+
+  // The credit under test: recorded and sealed while the old name is still this
+  // service's, so the rename below is the only thing between it and the claim.
+  const MARKER: &[u8] = b"pre-rename-self-send-credit";
+  mdns
+    .selfsend
+    .record(Family::V4, MARKER, hick_udp::selfsend::ClockPair::now());
+  mdns.selfsend.seal();
+
+  // No LOCAL service owns the candidate name, so this rename SURVIVES.
+  let conflict = test_support::conflict_response(&old);
+  let new_name = drive_to_rename(&mut mdns, &conflict).expect(RENAME_IS_NOT_ENVIRONMENTAL);
+  assert_ne!(new_name, old, "a rename must change the instance name");
+  assert!(
+    !mdns
+      .services
+      .get(&handle)
+      .expect("a survived rename keeps its context")
+      .withdrawing,
+    "this must be the SURVIVING path: a rename COLLISION is retired through \
+     `begin_service_withdrawal`, which supersedes for its own reason and would \
+     prove nothing about the rename"
+  );
+
+  assert_eq!(
+    mdns
+      .selfsend
+      .claim(&RxDatagram::without_stamp(Family::V4, MARKER)),
+    SelfSendMatch::Superseded,
+    "a successful auto-rename mutates the records this service publishes, so a \
+     credit recorded before it describes a state this endpoint has left; left \
+     un-superseded it claims as current, reaches `Provenance::OwnEchoLikely` and \
+     still adjudicates — letting a delayed echo of the abandoned instance name \
+     defeat whatever holds that name next under RFC 6762 §8.1"
+  );
+}
+
 /// **The per-family case.** A goodbye that reached IPv4 but not IPv6 has not
 /// been paid, and the vacated name must stay held until it is.
 ///

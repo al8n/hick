@@ -4054,3 +4054,350 @@ fn a_withdrawn_services_echo_cannot_retire_its_replacement() {
      describes"
   );
 }
+
+/// A SURVIVING RFC 6762 §9 automatic rename is a MUTATION of what this engine
+/// publishes: `Service::set_instance` has already rewritten the service's
+/// records by the time the driver sees `ServiceUpdate::Renamed`. So every
+/// self-send entry recorded under the abandoned instance name describes a state
+/// this engine has left, and the rename owes the generation advance for the same
+/// reason a registration and a `begin_withdrawal` do.
+///
+/// The rename is the one of the three that reaches NO lifecycle seam of its own.
+/// A service that survives one begins no withdrawal, and the registration that
+/// could take the vacated name has not happened yet — so nothing else advances
+/// the generation, and a delayed echo of the abandoned owner keeps classifying
+/// as `SelfLog::Current`. That is `Provenance::OwnEchoLikely`, which still
+/// ADJUDICATES: our own past then reaches §8.1 and §9 against whatever holds the
+/// vacated name next, and defeats it with rdata no live route of ours holds.
+///
+/// `packets_dropped` is what pins the tier, exactly as in
+/// [`own_multicast_loopback_adjudicates_and_finds_no_conflict`]:
+/// `Endpoint::handle` bumps it on the "nothing admits this datagram" condition,
+/// which `OwnEcho` produces and `OwnEchoLikely` does not. The counter is behind
+/// `stats`, so that half of the assertion is too.
+#[test]
+fn a_surviving_rename_supersedes_the_entries_recorded_before_it() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(31));
+  let handle = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+  // Drive to advertised so an ANNOUNCEMENT — authoritative records under the
+  // instance name the rename is about to abandon — has gone out and been
+  // recorded in the self-send log.
+  for micros in pump_schedule() {
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+  }
+  let (_, announcement) = io.sent.last().cloned().expect("the service announced");
+  while engine.poll_service_update(handle).is_some() {}
+
+  // A peer claims the instance name. Renaming an ANNOUNCED service takes two
+  // rounds: the §9 conflict first reverts it to probing, and only a conflict
+  // seen while it is probing loses. Feed it until the rename is observed.
+  let conflict = build_conflict_srv_response("Test._ipp._tcp.local.");
+  let mut renamed = false;
+  let mut micros = 5_100_000;
+  for _ in 0..20 {
+    io.inbound.push_back((
+      conflict.clone(),
+      RecvMeta {
+        src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
+        local: Some(MDNS_SOCKET_V4.ip()),
+        hop_limit: None,
+        len: 0,
+      },
+    ));
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+    micros += 100_000;
+    while let Some(update) = engine.poll_service_update(handle) {
+      renamed |= matches!(update, ServiceUpdate::Renamed(_));
+    }
+    if renamed {
+      break;
+    }
+  }
+  assert!(
+    renamed,
+    "an ingested §9 conflict for an announced service must rename it: nothing \
+     here touches a socket, so a rename that does not happen is a defect in the \
+     conflict path and not a property of this host"
+  );
+  assert!(
+    !engine
+      .services
+      .get(&handle)
+      .expect("a survived rename keeps its slot")
+      .errored,
+    "this must be the SURVIVING rename; a collision teardown supersedes through \
+     `begin_service_withdrawal` and would prove nothing about the rename itself"
+  );
+
+  // The abandoned owner's announcement arrives late — still inside
+  // RECENT_SEND_TTL, from a source the advertised-source fallback cannot catch,
+  // so only the self-send log has anything to say about it.
+  io.inbound.push_back((
+    announcement,
+    RecvMeta {
+      src: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 99), 5353)),
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
+      len: 0,
+    },
+  ));
+  #[cfg(feature = "stats")]
+  let dropped_before = engine.stats().packets_dropped;
+  engine.pump(|| at(micros), &mut io, &mut scratch);
+
+  #[cfg(feature = "stats")]
+  assert_eq!(
+    engine.stats().packets_dropped,
+    dropped_before + 1,
+    "the echo of the ABANDONED instance name still admitted something: the \
+     rename left the generation where it was, so the entry claimed as current \
+     and reached the adjudicating tier"
+  );
+  let mut terminal = false;
+  while let Some(update) = engine.poll_service_update(handle) {
+    terminal |= matches!(
+      update,
+      ServiceUpdate::Conflict | ServiceUpdate::HostConflict
+    );
+  }
+  assert!(
+    !terminal,
+    "the renamed service was retired by an echo of its own abandoned name"
+  );
+}
+
+/// Exact equality with a past send establishes CONTENT, not ORIGIN. Any peer can
+/// replay bytes it captured off the link, so `SelfLog::Superseded` — which maps
+/// to `Provenance::OwnEcho` and therefore denies observation, quieting,
+/// adjudication AND the RFC 6762 §8.1 defence — is only affordable while a match
+/// can be claimed at most once.
+///
+/// Non-consuming, every copy of a replay stayed `Superseded` for the whole of
+/// `RECENT_SEND_TTL`. During a same-name replacement that is a real conflict made
+/// invisible: the withdrawn service's authoritative response asserts the shared
+/// host name with an address set the replacement does not hold, which is a §9
+/// conflict and a §8.1 probe defeat, and the replacement could be flooded with it
+/// through its entire three-probe window without one copy reaching it.
+///
+/// Take-once is the bound. The first copy spends the entry's remaining loopback
+/// for this family and is suppressed; every copy behind it finds nothing, reads
+/// as `SelfLog::None`, and adjudicates in full.
+#[test]
+fn a_replayed_superseded_response_outruns_the_copies_it_can_spend() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(53));
+  let host = "shared.local.";
+  let a = engine
+    .register_service(
+      spec_for(
+        "_ipp._tcp.local.",
+        "A._ipp._tcp.local.",
+        host,
+        Ipv4Addr::new(10, 0, 0, 1),
+      ),
+      at(0),
+    )
+    .unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+  for micros in pump_schedule() {
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+  }
+  let (_, announcement) = io.sent.last().cloned().expect("A announced");
+
+  // A retires, so its route stops holding the host name and every entry recorded
+  // under it is superseded. B then takes that host name with a DIFFERENT address
+  // set — the replacement whose probing window the replay is aimed at.
+  engine.unregister_service(a, at(5_100_000));
+  let b = engine
+    .register_service(
+      spec_for(
+        "_ipp._tcp.local.",
+        "B._ipp._tcp.local.",
+        host,
+        Ipv4Addr::new(10, 0, 0, 2),
+      ),
+      at(5_200_000),
+    )
+    .expect("a withdrawing route no longer holds its host name");
+
+  // How many loopback copies of these bytes the v4 side still legitimately owes.
+  // An announcement burst sends the same datagram more than once, so each of
+  // those sends is owed its own echo — and the flood below is sized to outrun
+  // them, which is the whole point of the test.
+  let owed_v4 = engine
+    .tx
+    .recent
+    .iter()
+    .filter(|s| s.data.as_slice() == announcement.as_slice() && s.owed[0])
+    .count();
+  const REPLAYS: usize = 6;
+  assert!(
+    (1..REPLAYS).contains(&owed_v4),
+    "the flood must outrun the copies genuinely owed, or it proves nothing; \
+     owed {owed_v4}, replaying {REPLAYS}"
+  );
+
+  // A peer floods the captured response across the whole of B's three-probe
+  // window. Six rounds at the §8.1 probe interval is twice that window.
+  #[cfg(feature = "stats")]
+  let dropped_before = engine.stats().packets_dropped;
+  let mut micros = 5_300_000;
+  for _ in 0..REPLAYS {
+    io.inbound.push_back((
+      announcement.clone(),
+      RecvMeta {
+        src: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 99), 5353)),
+        local: Some(MDNS_SOCKET_V4.ip()),
+        hop_limit: None,
+        len: 0,
+      },
+    ));
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+    micros += 250_000;
+  }
+
+  let mut terminal = false;
+  while let Some(update) = engine.poll_service_update(b) {
+    terminal |= matches!(
+      update,
+      ServiceUpdate::Conflict | ServiceUpdate::HostConflict
+    );
+  }
+  assert!(
+    terminal,
+    "a peer replayed a captured response asserting our host name with an address \
+     set the live route does not hold, {REPLAYS} times across the replacement's \
+     whole probing window, and not one copy reached it — a superseded match that \
+     cannot be spent suppresses every copy, which is the property `OwnEcho` may \
+     not be granted without"
+  );
+  assert!(
+    engine
+      .tx
+      .recent
+      .iter()
+      .all(|s| s.data.as_slice() != announcement.as_slice() || !s.owed[0]),
+    "the flood left a v4 loopback copy of these bytes still owed, so the match \
+     spent nothing and the next copy would be swallowed too"
+  );
+  // Take-once, not "no suppression": the copies genuinely owed were still the
+  // whole-datagram reject `OwnEcho` produces, and every copy past them
+  // adjudicated.
+  #[cfg(feature = "stats")]
+  assert_eq!(
+    engine.stats().packets_dropped,
+    dropped_before + owed_v4 as u64,
+    "one whole-datagram reject per loopback copy this entry still owed, and not \
+     one more; a higher count means a match that cannot be spent, a lower one \
+     means the credit was never offered"
+  );
+}
+
+/// One multicast is TWO `try_send` calls with identical bytes, and the transport
+/// loops one copy back per joined socket — so a single recorded entry is owed one
+/// echo on each stack, and each family spends only its own.
+///
+/// Without the family key the first echo to be read would spend both copies. The
+/// second would then find nothing, reach the proto layer as peer traffic, and
+/// raise a phantom RFC 6762 §9 conflict against this engine itself; the receive
+/// order that decides which family loses is the transport's, so the failure would
+/// come and go with it.
+///
+/// The other half is take-once: once a family's copy is spent, the SAME bytes
+/// arriving again on that family are a peer's, whatever the entry still owes the
+/// other family.
+#[test]
+fn each_family_spends_only_its_own_loopback_copy() {
+  let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
+  let datagram = b"one datagram, two sockets".as_slice();
+  tx.record(datagram, at(0), [true, true]);
+
+  assert_eq!(
+    tx.claim(Family::V4, datagram, at(1_000)),
+    SelfLog::Current,
+    "the v4 socket's own loopback copy"
+  );
+  assert_eq!(
+    tx.claim(Family::V4, datagram, at(2_000)),
+    SelfLog::None,
+    "v4's copy is spent, so the next v4 datagram carrying these bytes is a peer's"
+  );
+  assert_eq!(
+    tx.claim(Family::V6, datagram, at(3_000)),
+    SelfLog::Current,
+    "v6 was owed a copy of its own and the v4 echo must not have spent it"
+  );
+  assert_eq!(
+    tx.claim(Family::V6, datagram, at(4_000)),
+    SelfLog::None,
+    "both copies are spent, so the entry is gone"
+  );
+
+  // A datagram only one family queued is owed only that family's echo.
+  tx.record(datagram, at(5_000), [true, false]);
+  assert_eq!(
+    tx.claim(Family::V6, datagram, at(6_000)),
+    SelfLog::None,
+    "no v6 socket took this datagram, so no v6 loopback copy of it exists"
+  );
+  assert_eq!(
+    tx.claim(Family::V4, datagram, at(7_000)),
+    SelfLog::Current,
+    "the family that did queue it is still owed its copy"
+  );
+}
+
+/// Both of this engine's sockets send from 5353, so every loopback copy arrives
+/// from 5353 and any other source port is proof the datagram is not our echo.
+///
+/// The gate is at the call site and short-circuits, so a datagram from another
+/// port is offered no credit at all. Offered one, an RFC 6762 §6.7 legacy unicast
+/// query carrying the same bytes as one we just multicast would SPEND the copy
+/// our real echo needs — the querier's reply would never be sent, because the
+/// query was suppressed as our own, and the genuine echo behind it would find
+/// nothing and reach the proto layer as peer traffic.
+#[test]
+fn a_datagram_from_another_source_port_is_offered_no_credit() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(67));
+  engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+  for micros in pump_schedule() {
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+  }
+  let (_, announcement) = io.sent.last().cloned().expect("a datagram was sent");
+  let owed_v4 = |engine: &TestEngine| {
+    engine
+      .tx
+      .recent
+      .iter()
+      .filter(|s| s.data.as_slice() == announcement.as_slice() && s.owed[0])
+      .count()
+  };
+  let before = owed_v4(&engine);
+  assert!(
+    before >= 1,
+    "the announcement must still owe a v4 loopback copy"
+  );
+
+  // The same bytes, from a port this engine never sends from.
+  io.inbound.push_back((
+    announcement.clone(),
+    RecvMeta {
+      src: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 99), 41234)),
+      local: Some(MDNS_SOCKET_V4.ip()),
+      hop_limit: None,
+      len: 0,
+    },
+  ));
+  engine.pump(|| at(5_100_000), &mut io, &mut scratch);
+
+  assert_eq!(
+    owed_v4(&engine),
+    before,
+    "a datagram from an ephemeral source port spent one of our loopback copies; \
+     the gate has to refuse before the claim, not decide inside it"
+  );
+}
