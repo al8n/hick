@@ -69,7 +69,7 @@ fn handle_rejects_a_malformed_packet_with_a_parse_error() {
   let local = "192.0.2.20".parse().unwrap();
   // A single byte cannot hold a DNS header — parsing must fail and the
   // endpoint must surface it as `HandleError::Parse`.
-  let res = e.handle(now, src, local, 0, &[0u8], false);
+  let res = e.handle(now, Received::new(src, &[0u8], Provenance::Unknown).with_local_ip(local));
   assert!(matches!(res, Err(HandleError::Parse(_))));
 }
 
@@ -152,13 +152,13 @@ fn handle_rejects_invalid_opcode_and_response_code() {
   // Header flags 0x1000 → opcode = Status (2), not Query → InvalidOpcode.
   let bad_opcode = [0u8, 0, 0x10, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
   assert!(matches!(
-    e.handle(now, src, local_ip, 0, &bad_opcode, false),
+    e.handle(now, Received::new(src, &bad_opcode, Provenance::Unknown).with_local_ip(local_ip)),
     Err(HandleError::InvalidOpcode(_))
   ));
   // Header flags 0x0001 → opcode = Query but RCODE = FormatError (1) → rejected.
   let bad_rcode = [0u8, 0, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0];
   assert!(matches!(
-    e.handle(now, src, local_ip, 0, &bad_rcode, false),
+    e.handle(now, Received::new(src, &bad_rcode, Provenance::Unknown).with_local_ip(local_ip)),
     Err(HandleError::InvalidResponseCode(_))
   ));
 }
@@ -371,7 +371,10 @@ fn host_question_routes_to_service() {
   let data = &buf[..n];
 
   let mut events = e
-    .handle(StdInstant::now(), src, local_ip, 0, data, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap();
   let ev = events
     .next()
@@ -419,7 +422,10 @@ fn authority_instance_name_routes_as_probe_proposal() {
   // its Authority Section makes. The question is routed first (Question Section
   // precedes Authority), so this scans rather than taking the head.
   let proposal_handle = e
-    .handle(StdInstant::now(), src, local_ip, 0, data, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .filter_map(|ev| match ev.expect("expected Ok") {
       RouteEvent::ToService(ts) if ts.event().is_probe_proposal() => Some(ts.handle()),
@@ -454,7 +460,10 @@ fn ephemeral_port_authority_record_does_not_trigger_conflict() {
   let data = &buf[..n];
 
   let events = e
-    .handle(StdInstant::now(), src, local_ip, 0, data, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap();
   for ev in events {
     let ev = ev.expect("expected Ok");
@@ -484,7 +493,10 @@ fn authority_host_name_routes_as_host_conflict() {
   let data = &buf[..n];
 
   let mut events = e
-    .handle(StdInstant::now(), src, local_ip, 0, data, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap();
   let ev = events
     .next()
@@ -534,7 +546,10 @@ fn txt_owned_by_host_name_does_not_route_host_conflict() {
   let n = b.finish().unwrap();
 
   let events = e
-    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap();
   for ev in events {
     if let Ok(RouteEvent::ToService(ts)) = ev {
@@ -583,7 +598,7 @@ fn additional_section_records_are_cached_and_delivered() {
   // Drain events; count the ToQuery emitted for the additional record (the
   // lazy Additional-section fan-out).
   let to_query = e
-    .handle(now, src, local_ip, 0, &msg, false)
+    .handle(now, Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .filter(|r| matches!(r, Ok(ev) if ev.is_to_query()))
     .count();
@@ -637,7 +652,10 @@ fn additional_section_srv_for_instance_routes_probe_conflict() {
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let saw_conflict = e
-      .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+      .handle(
+        StdInstant::now(),
+        Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+      )
       .unwrap()
       .filter_map(Result::ok)
       .any(|ev| {
@@ -690,7 +708,10 @@ fn additional_conflict_not_replayed_across_query_events() {
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let mut conflicts = 0usize;
   let mut to_query = 0usize;
-  for ev in e.handle(now, src, local_ip, 0, &buf[..n], false).unwrap() {
+  for ev in e.handle(
+    now,
+    Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap() {
     match ev.unwrap() {
       RouteEvent::ToService(ts) if ts.event().is_probe_conflict() => conflicts += 1,
       RouteEvent::ToQuery(_) => to_query += 1,
@@ -735,7 +756,10 @@ fn non_in_class_record_does_not_route_conflict() {
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   for ev in e
-    .handle(StdInstant::now(), src, local_ip, 0, &msg, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
   {
     if let Ok(RouteEvent::ToService(ts)) = ev {
@@ -792,7 +816,7 @@ fn query_answer_for_instance_name_emits_known_answer_only() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -857,7 +881,7 @@ fn qr0_answer_for_host_name_emits_host_conflict_not_probe_conflict() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -924,7 +948,10 @@ fn qr0_answer_does_not_populate_query() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events = e.handle(now, src, local_ip, 0, pkt, false).unwrap();
+  let events = e.handle(
+    now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
 
   // Drain all events. None should be a ToQuery(Answer).
   for ev in events {
@@ -983,7 +1010,10 @@ fn duplicate_qm_question_suppresses_planned_query() {
   b.push_question(&qname, ResourceType::Ptr, ResourceClass::In, false) // QM (no QU bit)
       .unwrap();
   let n = b.finish().unwrap();
-  let _ = e.handle(now, src, local_ip, 0, &qbuf[..n], false).unwrap();
+  let _ = e.handle(
+    now,
+    Received::new(src, &qbuf[..n], Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
 
   let mut buf = [0u8; 512];
   assert!(
@@ -1023,7 +1053,10 @@ fn qu_duplicate_question_does_not_suppress_query() {
   b.push_question(&qname, ResourceType::Ptr, ResourceClass::In, true) // QU bit set
       .unwrap();
   let n = b.finish().unwrap();
-  let _ = e.handle(now, src, local_ip, 0, &qbuf[..n], false).unwrap();
+  let _ = e.handle(
+    now,
+    Received::new(src, &qbuf[..n], Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
 
   let mut buf = [0u8; 512];
   assert!(
@@ -1060,7 +1093,7 @@ fn legacy_source_duplicate_does_not_suppress_query() {
       .unwrap();
   let n = b.finish().unwrap();
   let _ = e
-    .handle(now, legacy_src, local_ip, 0, &qbuf[..n], false)
+    .handle(now, Received::new(legacy_src, &qbuf[..n], Provenance::Unknown).with_local_ip(local_ip))
     .unwrap();
 
   let mut buf = [0u8; 512];
@@ -1104,7 +1137,10 @@ fn repeated_duplicate_questions_do_not_stall_query_forever() {
   let mut buf = [0u8; 512];
   let mut retired = false;
   for _ in 0..32 {
-    let _ = e.handle(now, src, local_ip, 0, &qbuf[..n], false).unwrap();
+    let _ = e.handle(
+      now,
+      Received::new(src, &qbuf[..n], Provenance::Unknown).with_local_ip(local_ip),
+    ).unwrap();
     assert!(
       e.poll_query_transmit(h, || now, &mut buf).unwrap().is_none(),
       "each duplicate suppresses the planned transmit"
@@ -1165,7 +1201,10 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
   b.push_question(&qname, ResourceType::Ptr, ResourceClass::In, false)
     .unwrap();
   let n = b.finish().unwrap();
-  let _ = e.handle(t1, src, local_ip, 0, &qbuf[..n], false).unwrap();
+  let _ = e.handle(
+    t1,
+    Received::new(src, &qbuf[..n], Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
 
   // The due slot was consumed: the next retry is deferred to a later instant.
   let t2 = e
@@ -1214,7 +1253,10 @@ fn self_packet_does_not_route_as_probe_conflict() {
   // (1) Self-packet: the caller (driver) flags self-loopback via
   // `caller_is_self = true`; handle() must then yield zero routing events.
   let self_src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 5353));
-  let mut self_events = e.handle(now, self_src, local_ip, 0, data, true).unwrap();
+  let mut self_events = e.handle(
+    now,
+    Received::new(self_src, data, Provenance::OwnEcho).with_local_ip(local_ip),
+  ).unwrap();
   assert!(
     self_events.next().is_none(),
     "self-packet (caller_is_self = true) must yield zero routing events"
@@ -1226,7 +1268,10 @@ fn self_packet_does_not_route_as_probe_conflict() {
   let peer_src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 55), 5353));
   // The probe's own §8.1 question routes ahead of its §8.2 proposal, so scan.
   let saw_proposal = e
-    .handle(StdInstant::now(), peer_src, local_ip, 0, data, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(peer_src, data, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .any(|ev| match ev.expect("control: routing event must be Ok") {
       RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
@@ -1267,7 +1312,10 @@ fn self_packet_does_not_populate_cache() {
   // flag (the driver content-matches against recent sends). With it
   // true, the cache write is suppressed.
   let self_src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 5353));
-  let _ = e.handle(now, self_src, local_ip, 0, data, true).unwrap();
+  let _ = e.handle(
+    now,
+    Received::new(self_src, data, Provenance::OwnEcho).with_local_ip(local_ip),
+  ).unwrap();
   assert!(
     !e.cache
       .contains(&observed, ResourceType::A, ResourceClass::In),
@@ -1277,7 +1325,10 @@ fn self_packet_does_not_populate_cache() {
 
   // Control: a foreign source must populate the cache.
   let peer_src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 55), 5353));
-  let _ = e.handle(now, peer_src, local_ip, 0, data, false).unwrap();
+  let _ = e.handle(
+    now,
+    Received::new(peer_src, data, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
   assert!(
     e.cache
       .contains(&observed, ResourceType::A, ResourceClass::In),
@@ -1316,7 +1367,10 @@ fn cache_goodbye_matches_differently_encoded_and_cased_ptr() {
   insert.extend_from_slice(&120u32.to_be_bytes()); // positive TTL
   insert.extend_from_slice(&7u16.to_be_bytes()); // RDLENGTH
   insert.extend_from_slice(&[4, b'i', b'n', b's', b't', 0xC0, 0x0C]);
-  let _ = e.handle(now, src, local_ip, 0, &insert, false).unwrap();
+  let _ = e.handle(
+    now,
+    Received::new(src, &insert, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
   assert!(
     e.cache
       .contains(&owner, ResourceType::Ptr, ResourceClass::In),
@@ -1334,7 +1388,10 @@ fn cache_goodbye_matches_differently_encoded_and_cased_ptr() {
   goodbye.extend_from_slice(&[
     4, b'I', b'N', b'S', b'T', 3, b'S', b'V', b'C', 5, b'L', b'O', b'C', b'A', b'L', 0,
   ]);
-  let _ = e.handle(now, src, local_ip, 0, &goodbye, false).unwrap();
+  let _ = e.handle(
+    now,
+    Received::new(src, &goodbye, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
   // a TTL=0 goodbye does NOT delete immediately — it clamps the
   // matched entry to a 1-second rescue window. The MATCH (canonicalization
   // worked across compression + case) is proven by the entry expiring after
@@ -1360,9 +1417,14 @@ fn cache_goodbye_matches_differently_encoded_and_cased_ptr() {
 ///
 /// Test: register a service publishing `fe80::1`, then feed back a
 /// probe-shaped packet with `src.ip() == fe80::1` and `local_ip == ff02::fb`.
-/// Without the membership signal the packet would be routed as a
-/// ProbeConflict (peer claiming our instance).  Control half: a foreign
-/// IPv6 source must still produce a ProbeConflict.
+/// Without the membership signal the packet's §8.1 question would route to the
+/// service as one to answer.  Control half: a foreign IPv6 source must still
+/// produce a ProbeProposal.
+///
+/// What the heuristic does NOT suppress is the RFC 6762 §8.2 proposal. An
+/// address-based guess matches any co-resident host publishing an address we
+/// publish — including a peer that has taken it — and a deleted proposal costs a
+/// name permanently, so adjudication survives the guess. See `Admits`.
 #[test]
 fn ipv6_self_packet_detected_via_advertised_aaaa() {
   use crate::{
@@ -1429,11 +1491,34 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
 
   // (1) Self-packet via membership: src matches our advertised AAAA.
   let self_src: SocketAddr = SocketAddr::from((our_v6, 5353));
-  let mut self_events = e.handle(now, self_src, local_ip, 0, data, false).unwrap();
+  let self_events: std::vec::Vec<_> = e
+    .handle(
+      now,
+      Received::new(self_src, data, Provenance::Unknown).with_local_ip(local_ip),
+    )
+    .unwrap()
+    .map(|ev| ev.expect("routing event must be Ok"))
+    .collect();
   assert!(
-    self_events.next().is_none(),
-    "IPv6 self-packet (src ∈ advertised AAAA) must yield zero routing events; \
-       local_ip == ff02::fb cannot detect this, so the membership branch must catch it"
+    !self_events.iter().any(|ev| matches!(
+      ev,
+      RouteEvent::ToService(ts) if ts.event().is_question()
+    )),
+    "IPv6 self-packet (src ∈ advertised AAAA) must not be answered as a peer's \
+       question; local_ip == ff02::fb cannot detect this, so the membership \
+       branch must catch it"
+  );
+  assert_eq!(
+    self_events
+      .iter()
+      .filter(|ev| matches!(
+        ev,
+        RouteEvent::ToService(ts) if ts.event().is_probe_proposal()
+      ))
+      .count(),
+    1,
+    "the §8.2 proposal survives the advertised-source guess — an opt-in \
+       convenience knob must not be able to delete one"
   );
 
   // (2) Control: a foreign IPv6 source must still emit ProbeConflict on
@@ -1443,7 +1528,7 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   let peer_src: SocketAddr = SocketAddr::from((peer_v6, 5353));
   // The probe's §8.1 question routes ahead of its §8.2 proposal, so scan.
   let saw_proposal = e
-    .handle(now, peer_src, local_ip, 0, data, false)
+    .handle(now, Received::new(peer_src, data, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .any(|ev| match ev.expect("control: routing event must be Ok") {
       RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
@@ -1730,7 +1815,10 @@ fn collected_answers_survive_terminal_until_cancel() {
   let pkt = &buf[..n];
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let _ = e.handle(now, src, local_ip, 0, pkt, false).unwrap().count();
+  let _ = e.handle(
+    now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap().count();
 
   // Confirm the answer landed.
   let answers_before: std::vec::Vec<_> = e.collected_answers(h).cloned().collect();
@@ -1817,7 +1905,10 @@ fn an_answer_processed_past_the_query_deadline_is_not_collected() {
 
   let mut buf = [0u8; 512];
   let n = response(Ipv4Addr::new(10, 0, 0, 7), &mut buf);
-  let _ = e.handle(now, src, local_ip, 0, &buf[..n], false).unwrap().count();
+  let _ = e.handle(
+    now,
+    Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap().count();
   assert_eq!(
     e.collected_answers(h).count(),
     1,
@@ -1828,7 +1919,7 @@ fn an_answer_processed_past_the_query_deadline_is_not_collected() {
   let after = now.checked_add(Duration::from_millis(300)).unwrap();
   let n = response(Ipv4Addr::new(10, 0, 0, 8), &mut buf);
   let _ = e
-    .handle(after, src, local_ip, 0, &buf[..n], false)
+    .handle(after, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .count();
 
@@ -1943,7 +2034,10 @@ fn a_refused_answer_is_not_routed_to_its_query() {
     let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
     let mut to_query = 0usize;
     let mut to_service = 0usize;
-    for ev in e.handle(at, src, local_ip, 0, pkt, false).unwrap() {
+    for ev in e.handle(
+      at,
+      Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+    ).unwrap() {
       match ev {
         Ok(ev) if ev.is_to_query() => to_query = to_query.saturating_add(1),
         Ok(ev) if ev.is_to_service() => to_service = to_service.saturating_add(1),
@@ -2067,7 +2161,7 @@ fn an_uncollected_answer_is_still_routed_to_its_query() {
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let to_query: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, &buf[..n], false)
+    .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .filter_map(|ev| match ev {
@@ -2134,7 +2228,10 @@ fn dropping_route_events_does_not_lose_query_state() {
 
   // Construct the iterator and IMMEDIATELY drop it — no .next() calls.
   {
-    let _events = e.handle(now, src, local_ip, 0, pkt, false).unwrap();
+    let _events = e.handle(
+      now,
+      Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+    ).unwrap();
     // _events is dropped at end of scope WITHOUT iteration.
   }
 
@@ -2199,7 +2296,7 @@ fn pre_poll_terminal_freeze_closes_race() {
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
 
   let to_query_events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .filter_map(|ev| match ev {
@@ -2261,7 +2358,7 @@ fn query_ignores_ttl_zero_goodbye_records() {
       .unwrap();
     let n = b.finish().unwrap();
     let _ = e
-      .handle(now, src, local_ip, 0, &buf[..n], false)
+      .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
       .unwrap()
       .count();
   }
@@ -2284,7 +2381,7 @@ fn query_ignores_ttl_zero_goodbye_records() {
       .unwrap();
     let n = b.finish().unwrap();
     let _ = e
-      .handle(now, src, local_ip, 0, &buf[..n], false)
+      .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
       .unwrap()
       .count();
   }
@@ -2350,7 +2447,7 @@ fn qr0_ptr_known_answer_fans_out_to_all_same_type_services() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -2433,7 +2530,7 @@ fn meta_ptr_known_answer_fans_out_to_all_services() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, &buf[..n], false)
+    .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -2503,7 +2600,7 @@ fn qr0_ttl_zero_does_not_emit_service_events() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -2523,7 +2620,7 @@ fn qr0_ttl_zero_does_not_emit_service_events() {
       .unwrap();
     let n = b.finish().unwrap();
     let events: std::vec::Vec<_> = e
-      .handle(now, src, local_ip, 0, &buf2[..n], false)
+      .handle(now, Received::new(src, &buf2[..n], Provenance::Unknown).with_local_ip(local_ip))
       .unwrap()
       .map(Result::unwrap)
       .collect();
@@ -2574,7 +2671,7 @@ fn authority_ttl_zero_does_not_emit_conflict_events() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -2592,7 +2689,7 @@ fn authority_ttl_zero_does_not_emit_conflict_events() {
     .unwrap();
   let n = b.finish().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, &buf2[..n], false)
+    .handle(now, Received::new(src, &buf2[..n], Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -2636,7 +2733,10 @@ fn cache_flush_within_one_packet_preserves_full_rrset() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let _ = e.handle(now, src, local_ip, 0, pkt, false).unwrap().count();
+  let _ = e.handle(
+    now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap().count();
 
   // All three A records must be in the cache for the same host.
   let count = e
@@ -2692,7 +2792,7 @@ fn qr1_answer_for_instance_name_emits_probe_conflict() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -2742,7 +2842,7 @@ fn qr1_answer_for_host_name_emits_host_conflict() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -2805,7 +2905,7 @@ fn qr0_answer_does_not_mutate_cache() {
     .unwrap();
   let n = b.finish().unwrap();
   let _ = e
-    .handle(now, src, local_ip, 0, &buf[..n], false)
+    .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .count();
   assert_eq!(
@@ -2824,7 +2924,7 @@ fn qr0_answer_does_not_mutate_cache() {
     .unwrap();
   let n = b.finish().unwrap();
   let _ = e
-    .handle(now, src, local_ip, 0, &buf[..n], false)
+    .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .count();
   assert_eq!(
@@ -2846,7 +2946,7 @@ fn qr0_answer_does_not_mutate_cache() {
   // clamped if the QR=0 cache-flush were honoured.
   let after_grace = now.checked_add(Duration::from_secs(2)).unwrap();
   let _ = e
-    .handle(after_grace, src, local_ip, 0, &buf[..n], false)
+    .handle(after_grace, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .count();
   // Sweep past where the clamp would have expired the seeded record.
@@ -2932,7 +3032,7 @@ fn cache_flush_deferred_expiry_preserves_refreshed_rrset() {
       .unwrap();
     let n = b.finish().unwrap();
     let _ = e
-      .handle(pkt1_t, src, local_ip, 0, &buf[..n], false)
+      .handle(pkt1_t, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
       .unwrap()
       .count();
   }
@@ -2957,7 +3057,7 @@ fn cache_flush_deferred_expiry_preserves_refreshed_rrset() {
       .unwrap();
     let n = b.finish().unwrap();
     let _ = e
-      .handle(pkt2_t, src, local_ip, 0, &buf[..n], false)
+      .handle(pkt2_t, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
       .unwrap()
       .count();
   }
@@ -3051,7 +3151,10 @@ fn flush_marker_keys_on_rclass_so_mixed_class_does_not_suppress() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let _ = e.handle(now, src, local_ip, 0, pkt, false).unwrap().count();
+  let _ = e.handle(
+    now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap().count();
 
   // The old IN sibling (10.0.0.1) must be clamped to expire at now+1s.
   // Sweep past that deadline; the OLD record is removed.
@@ -3181,7 +3284,7 @@ fn cache_flush_preserves_recent_siblings_across_packets() {
       .unwrap();
     let n = b.finish().unwrap();
     let _ = e
-      .handle(now, src, local_ip, 0, &buf[..n], false)
+      .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
       .unwrap()
       .count();
   }
@@ -3206,7 +3309,7 @@ fn cache_flush_preserves_recent_siblings_across_packets() {
       .unwrap();
     let n = b.finish().unwrap();
     let _ = e
-      .handle(later, src, local_ip, 0, &buf[..n], false)
+      .handle(later, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
       .unwrap()
       .count();
   }
@@ -3297,7 +3400,7 @@ fn ttl_zero_does_not_consume_flush_marker() {
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let _ = e
-    .handle(after_grace, src, local_ip, 0, pkt, false)
+    .handle(after_grace, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .count();
 
@@ -3347,7 +3450,10 @@ fn malformed_record_does_not_loop_forever() {
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
 
-  let events = e.handle(now, src, local_ip, 0, pkt, false).unwrap();
+  let events = e.handle(
+    now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
   let mut total_polls = 0u32;
   let mut error_count = 0u32;
   for ev in events {
@@ -3417,7 +3523,7 @@ fn answer_questions_false_suppresses_question_events() {
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -3508,7 +3614,7 @@ fn answer_questions_false_still_defends_a_probed_unique_name() {
   let mut questions_for = |qname: &str, with_authority: bool, src: SocketAddr| -> usize {
     let mut buf = [0u8; 512];
     let n = probe_for(qname, with_authority, &mut buf);
-    e.handle(now, src, local_ip, 0, &buf[..n], false)
+    e.handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
       .unwrap()
       .map(Result::unwrap)
       .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_question()))
@@ -3669,7 +3775,7 @@ fn answer_questions_false_defends_only_against_a_real_proposal() {
   let mut questions_for = |datagram: &[u8]| -> usize {
     // `filter_map` and not `unwrap`: the truncated-authority case below yields a
     // parse error of its own, which is not what this fixture is measuring.
-    e.handle(now, peer, local_ip, 0, datagram, false)
+    e.handle(now, Received::new(peer, datagram, Provenance::Unknown).with_local_ip(local_ip))
       .unwrap()
       .filter_map(Result::ok)
       .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_question()))
@@ -3780,7 +3886,7 @@ fn authority_host_conflict_fans_out_to_all_same_host_services() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -3843,7 +3949,7 @@ fn qr1_ttl_zero_does_not_emit_to_query_events() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -3906,7 +4012,10 @@ fn terminated_query_rejects_late_answers() {
     b.push_a_answer(&qn, 120, pre_terminal_addr, false).unwrap();
     let n = b.finish().unwrap();
     let pkt = &buf[..n];
-    let _ = e.handle(now, src, local_ip, 0, pkt, false).unwrap().count();
+    let _ = e.handle(
+      now,
+      Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+    ).unwrap().count();
   }
   assert_eq!(
     e.collected_answers(h).count(),
@@ -3939,7 +4048,7 @@ fn terminated_query_rejects_late_answers() {
   let pkt = &buf2[..n];
 
   let events: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .map(Result::unwrap)
     .collect();
@@ -4224,7 +4333,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
   // Now feed the peer question: note_duplicate_question → returns false → no bump.
   {
     let mut events = e
-      .handle(now, peer_src, multicast_ip, 0, &pkt, false)
+      .handle(now, Received::new(peer_src, &pkt, Provenance::Unknown).with_local_ip(multicast_ip))
       .unwrap();
     while events.next().is_some() {}
   }
@@ -4242,7 +4351,7 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 
   {
     let mut events = e
-      .handle(now, peer_src, multicast_ip, 0, &pkt, false)
+      .handle(now, Received::new(peer_src, &pkt, Provenance::Unknown).with_local_ip(multicast_ip))
       .unwrap();
     while events.next().is_some() {}
   }
@@ -4265,10 +4374,13 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 /// Test: register a service publishing `fe80::1` scoped to interface
 /// index 2, then feed back a probe-shaped AAAA-authority packet with
 /// `src = fe80::1`.  The same packet must:
-///   * be suppressed when delivered with `interface_index == 2` (true
-///     self-loopback), AND
-///   * be routed normally (ProbeConflict) when delivered with
-///     `interface_index == 3` (a remote peer on another interface).
+///   * have its §8.1 question suppressed when delivered with
+///     `interface_index == 2` (true self-loopback), AND
+///   * be routed normally when delivered with `interface_index == 3` (a remote
+///     peer on another interface).
+///
+/// The §8.2 proposal is routed in BOTH cases: an address-based guess must not be
+/// able to delete one. See `Admits`.
 #[test]
 fn ipv6_link_local_self_check_is_interface_scoped() {
   use crate::{
@@ -4331,10 +4443,30 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   let self_src: SocketAddr = SocketAddr::from((our_v6, 5353));
 
   // (1) Self-loopback: same address, same interface (ifindex=2).
-  let mut self_events = e.handle(now, self_src, local_ip, 2, data, false).unwrap();
+  let self_events: std::vec::Vec<_> = e
+    .handle(
+      now,
+      Received::new(self_src, data, Provenance::Unknown)
+        .with_interface(Some(2))
+        .with_local_ip(local_ip),
+    )
+    .unwrap()
+    .map(|ev| ev.expect("event must be Ok"))
+    .collect();
   assert!(
-    self_events.next().is_none(),
-    "link-local from OUR interface (ifindex=2) must be self-suppressed"
+    !self_events.iter().any(|ev| matches!(
+      ev,
+      RouteEvent::ToService(ts) if ts.event().is_question()
+    )),
+    "link-local from OUR interface (ifindex=2) must not be answered as a peer's \
+       question"
+  );
+  assert!(
+    self_events.iter().any(|ev| matches!(
+      ev,
+      RouteEvent::ToService(ts) if ts.event().is_probe_proposal()
+    )),
+    "…but its §8.2 proposal is still adjudicated"
   );
 
   // (2) Foreign peer on a different interface (ifindex=3) using the
@@ -4342,7 +4474,12 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   //     route as ProbeConflict, not be silently dropped.
   // The probe's §8.1 question routes ahead of its §8.2 proposal, so scan.
   let saw_proposal = e
-    .handle(now, self_src, local_ip, 3, data, false)
+    .handle(
+      now,
+      Received::new(self_src, data, Provenance::Unknown)
+        .with_interface(Some(3))
+        .with_local_ip(local_ip),
+    )
     .unwrap()
     .any(|ev| match ev.expect("event must be Ok") {
       RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
@@ -4400,7 +4537,10 @@ fn response_answer_fans_out_to_type_compatible_queries() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events = e.handle(now, src, local_ip, 0, pkt, false).unwrap();
+  let events = e.handle(
+    now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
 
   let mut answer_handles: std::vec::Vec<QueryHandle> = std::vec::Vec::new();
   for ev in events {
@@ -4459,7 +4599,10 @@ fn response_answer_fans_out_to_any_and_specific_routes() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events = e.handle(now, src, local_ip, 0, pkt, false).unwrap();
+  let events = e.handle(
+    now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap();
 
   let mut answer_handles: std::vec::Vec<QueryHandle> = std::vec::Vec::new();
   for ev in events {
@@ -4603,16 +4746,21 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
     632,
     120,
   );
+  // The CONFIGURED sets must agree across services sharing a host name — see
+  // `Endpoint::host_addresses_disagree`. What separates A from B here is what
+  // each has ADVERTISED, which is exactly what retention keys on.
   recs_b.add_a(shared);
+  recs_b.add_a(unique);
   let (b_handle, _svc_b) = ep
     .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
       ServiceSpec::new(recs_b),
       now,
     )
     .unwrap();
-  // B has CONFIRMED-ADVERTISED the shared address (its announce was delivered),
-  // so the route's advertised set is non-empty — otherwise retention would
-  // honour nothing and A would (wrongly) withdraw the shared address.
+  // B has CONFIRMED-ADVERTISED only the shared address (its announce was
+  // delivered), so the route's advertised set is non-empty — otherwise
+  // retention would honour nothing and A would (wrongly) withdraw the shared
+  // address.
   ep.note_service_announced(FullyAnnounced::new(b_handle, true), &[shared], &[]);
 
   // A's withdrawal snapshot: owns PTR/SRV/TXT, the subtype PTR, and both host
@@ -4790,8 +4938,15 @@ fn withdrawal_withdraws_addr_when_sibling_never_advertised() {
     &[shared, unique],
     Some(&[shared, unique]),
   );
-  // B is CONFIGURED with .5 but NEVER announced — its advertised set is EMPTY.
-  let _b = register_host_service(&mut ep, "B._ipp._tcp.local.", &host, &[shared], None);
+  // B shares the host name, so it is CONFIGURED with the same set A is — but it
+  // has NEVER announced, so its advertised set is EMPTY.
+  let _b = register_host_service(
+    &mut ep,
+    "B._ipp._tcp.local.",
+    &host,
+    &[shared, unique],
+    None,
+  );
 
   ep.begin_withdrawal(
     a,
@@ -4826,7 +4981,8 @@ fn withdrawal_retains_addr_advertised_by_live_sibling() {
   let shared = Ipv4Addr::new(192, 168, 1, 5);
   let unique = Ipv4Addr::new(192, 168, 1, 6);
 
-  // A advertises .5 + .6; B (LIVE) advertises .5.
+  // Both are CONFIGURED with .5 + .6 (a shared host name requires that), but A
+  // has advertised both and B (LIVE) has advertised only .5.
   let a = register_host_service(
     &mut ep,
     "A._ipp._tcp.local.",
@@ -4838,7 +4994,7 @@ fn withdrawal_retains_addr_advertised_by_live_sibling() {
     &mut ep,
     "B._ipp._tcp.local.",
     &host,
-    &[shared],
+    &[shared, unique],
     Some(&[shared]),
   );
 
@@ -7458,7 +7614,10 @@ fn withdrawing_route_is_not_answered_but_still_blocks_reregister() {
   let mut buf = [0u8; 512];
   let n = build_query_for_host(&mut buf, "printer-host.local.");
   let routed_to_service = e
-    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
   assert!(
@@ -7568,7 +7727,10 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
   // POSITIVE CONTROL: while LIVE, both conflicts DO route a ToService — so the
   // negative assertions below actually exercise the withdrawing skip.
   let live_host = e
-    .handle(StdInstant::now(), src, local_ip, 0, &host_pkt, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &host_pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
   assert!(
@@ -7576,7 +7738,10 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
     "sanity: a LIVE service must receive the HostConflict dispatch"
   );
   let live_inst = e
-    .handle(StdInstant::now(), src, local_ip, 0, &inst_pkt, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &inst_pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
   assert!(
@@ -7584,7 +7749,10 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
     "sanity: a LIVE service must receive the ProbeConflict dispatch"
   );
   let live_ka = e
-    .handle(StdInstant::now(), src, local_ip, 0, &ka_pkt, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &ka_pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
   assert!(
@@ -7597,7 +7765,10 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
 
   // While WITHDRAWING, neither conflict routes any ToService.
   let wd_host = e
-    .handle(StdInstant::now(), src, local_ip, 0, &host_pkt, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &host_pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
   assert!(
@@ -7605,7 +7776,10 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
     "a withdrawing service must not receive a HostConflict dispatch"
   );
   let wd_inst = e
-    .handle(StdInstant::now(), src, local_ip, 0, &inst_pkt, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &inst_pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
   assert!(
@@ -7613,7 +7787,10 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
     "a withdrawing service must not receive a ProbeConflict dispatch"
   );
   let wd_ka = e
-    .handle(StdInstant::now(), src, local_ip, 0, &ka_pkt, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &ka_pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
   assert!(
@@ -7847,7 +8024,7 @@ fn qr0_known_answer_fans_out_to_a_later_matching_service() {
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let known_answers: std::vec::Vec<_> = e
-    .handle(now, src, local_ip, 0, &buf[..n], false)
+    .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .filter_map(Result::ok)
     .filter_map(|ev| match ev {
@@ -7901,7 +8078,10 @@ fn additional_section_malformed_record_surfaces_parse_error() {
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let mut saw_to_query = false;
   let mut saw_parse_err = false;
-  for ev in e.handle(now, src, local_ip, 0, &msg, false).unwrap() {
+  for ev in e.handle(
+    now,
+    Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip),
+  ).unwrap() {
     match ev {
       Ok(RouteEvent::ToQuery(_)) => saw_to_query = true,
       Err(HandleError::Parse(_)) => saw_parse_err = true,
@@ -7958,7 +8138,7 @@ fn additional_section_ttl0_withdrawal_skipped_then_later_record_delivered() {
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let to_query = e
-    .handle(now, src, local_ip, 0, &msg, false)
+    .handle(now, Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip))
     .unwrap()
     .filter(|r| matches!(r, Ok(RouteEvent::ToQuery(_))))
     .count();
@@ -8612,7 +8792,10 @@ fn a_probe_proposing_only_an_aaaa_still_delivers_a_proposal() {
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let saw = e
-    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .filter_map(Result::ok)
     .any(|ev| {
@@ -8658,7 +8841,10 @@ fn a_response_of_any_type_at_our_instance_name_routes_a_conflict() {
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let saw = e
-    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .filter_map(Result::ok)
     .any(|ev| {
@@ -8701,7 +8887,10 @@ fn a_host_address_response_still_routes_a_host_conflict() {
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let saw = e
-    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .filter_map(Result::ok)
     .any(|ev| {
@@ -8741,7 +8930,10 @@ fn an_authority_section_with_no_question_routes_no_proposal() {
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let saw = e
-    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .filter_map(Result::ok)
     .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
@@ -8783,7 +8975,10 @@ fn a_question_for_another_name_routes_no_proposal_for_ours() {
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let saw = e
-    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .filter_map(Result::ok)
     .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
@@ -8840,7 +9035,10 @@ fn a_probe_proposing_a_ttl_zero_record_still_delivers_a_proposal() {
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let saw = e
-    .handle(StdInstant::now(), src, local_ip, 0, &buf[..n], false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .filter_map(Result::ok)
     .any(|ev| {
@@ -9104,7 +9302,10 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
     let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
     let routed = e
-      .handle(StdInstant::now(), src, local_ip, 0, &datagram, false)
+      .handle(
+        StdInstant::now(),
+        Received::new(src, &datagram, Provenance::Unknown).with_local_ip(local_ip),
+      )
       .unwrap()
       .filter_map(Result::ok)
       .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
@@ -9201,7 +9402,10 @@ fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
     let mut proposals = 0usize;
     let mut events = 0usize;
     for ev in e
-      .handle(StdInstant::now(), src, local_ip, 0, &datagram, false)
+      .handle(
+        StdInstant::now(),
+        Received::new(src, &datagram, Provenance::Unknown).with_local_ip(local_ip),
+      )
       .unwrap()
     {
       events = events.saturating_add(1);
@@ -9244,7 +9448,10 @@ fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
   let n = b.finish().unwrap();
   let probe = buf[..n].to_vec();
   let delivered = e
-    .handle(StdInstant::now(), src, local_ip, 0, &probe, false)
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &probe, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
     .filter_map(Result::ok)
     .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()))
@@ -9347,7 +9554,10 @@ fn an_undecodable_question_section_routes_no_proposal_though_its_record_is_good(
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let proposals = |e: &mut TestEndp, bytes: &[u8]| -> usize {
-    e.handle(StdInstant::now(), src, local_ip, 0, bytes, false)
+    e.handle(
+      StdInstant::now(),
+      Received::new(src, bytes, Provenance::Unknown).with_local_ip(local_ip),
+    )
       .unwrap()
       .filter_map(Result::ok)
       .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()))
@@ -9486,4 +9696,224 @@ fn one_admission_scope_reads_the_question_section_at_most_once() {
     "the owner-and-class gate comes first, so a datagram whose authority records \
      are all out of scope never causes the question section to be read"
   );
+}
+
+// ── the trust tier: what each `Provenance` admits ───────────────────────────
+
+/// Build an endpoint with one registered service, plus the datagram bytes for a
+/// probe naming that service's instance — the shape that exercises every
+/// permission at once: an RFC 6762 §8.1 question to answer, and an §8.2 proposal
+/// to adjudicate.
+fn probe_against_our_instance(buf: &mut [u8; 512]) -> (TestEndp, ServiceHandle, usize) {
+  let (e, handle) = build_endpoint_with_printer();
+  let n = build_probe_srv_authority(buf, "Printer._ipp._tcp.local.");
+  (e, handle, n)
+}
+
+/// A content match with NO ordering evidence still ADJUDICATES. Suppressing an
+/// RFC 6762 §8.2 proposal costs a name permanently and silently; routing our own
+/// echo to the tiebreak costs, at worst, §8.2's one-second deferral — and a
+/// byte-identical datagram from a conforming §9 twin is indistinguishable from
+/// our own echo, so this tier cannot be trusted with the name.
+#[test]
+fn own_echo_likely_still_adjudicates_the_proposal() {
+  use crate::event::RouteEvent;
+  let mut buf = [0u8; 512];
+  let (mut e, handle, n) = probe_against_our_instance(&mut buf);
+  let src: core::net::SocketAddr = "192.0.2.1:5353".parse().unwrap();
+  let events: std::vec::Vec<_> = e
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::OwnEchoLikely),
+    )
+    .unwrap()
+    .map(|ev| ev.expect("event must be Ok"))
+    .collect();
+  assert!(
+    events.iter().any(|ev| matches!(
+      ev,
+      RouteEvent::ToService(ts)
+        if ts.handle() == handle && ts.event().is_probe_proposal()
+    )),
+    "an unordered content match must still deliver the §8.2 proposal"
+  );
+}
+
+/// …and an ORDERED one does not. Nothing else could have put these bytes on the
+/// wire between our `sendto` and the kernel's receive stamp, so the datagram is
+/// dropped whole, exactly as before this tier existed.
+#[test]
+fn own_echo_admits_nothing_at_all() {
+  let mut buf = [0u8; 512];
+  let (mut e, _handle, n) = probe_against_our_instance(&mut buf);
+  let src: core::net::SocketAddr = "192.0.2.1:5353".parse().unwrap();
+  let mut events = e
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::OwnEcho),
+    )
+    .unwrap();
+  assert!(
+    events.next().is_none(),
+    "an ordered self-echo yields no routing event of any kind"
+  );
+}
+
+/// A content match with no ordering evidence answers a §8.1 DEFENCE but nothing
+/// else: `Answering::DefenceOnly`. Here the question names our host, and the
+/// datagram carries no proposal for it, so the defence exemption does not apply
+/// and the question is withheld — the discovery half of answering is shut.
+#[test]
+fn own_echo_likely_withholds_an_ordinary_question() {
+  use crate::event::RouteEvent;
+  let (mut e, _handle) = build_endpoint_with_printer();
+  let mut buf = [0u8; 512];
+  let n = build_query_for_host(&mut buf, "printer-host.local.");
+  let src: core::net::SocketAddr = "192.0.2.1:5353".parse().unwrap();
+  let mut events = e
+    .handle(
+      StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::OwnEchoLikely),
+    )
+    .unwrap();
+  assert!(
+    !events.any(|ev| matches!(
+      ev.expect("event must be Ok"),
+      RouteEvent::ToService(ts) if ts.event().is_question()
+    )),
+    "a plain discovery question is not a §8.1 defence, so DefenceOnly withholds it"
+  );
+}
+
+/// `NotFromUs` declines the advertised-source guess. A caller that logs every
+/// datagram it sends and matched none of them has better evidence than a source
+/// address does — `src_matches_advertised` matches ANY co-resident host
+/// publishing an address we publish, including a peer that has taken it.
+#[test]
+fn not_from_us_declines_the_advertised_source_guess() {
+  use crate::event::RouteEvent;
+  use rand::SeedableRng;
+  let rng = rand::rngs::StdRng::from_seed([99u8; 32]);
+  let mut e = TestEndp::try_new(
+    EndpointConfig::new().with_trust_advertised_src_as_self(true),
+    rng,
+  );
+  let our_v4 = Ipv4Addr::new(192, 168, 1, 7);
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("Printer._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("printer-host.local.").unwrap(),
+    631,
+    120,
+  );
+  recs.add_a(our_v4);
+  let now = StdInstant::now();
+  let (handle, _svc) = e
+    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ServiceSpec::new(recs),
+      now,
+    )
+    .unwrap();
+
+  let mut buf = [0u8; 512];
+  let n = build_query_for_host(&mut buf, "printer-host.local.");
+  // The source IS an address we advertise, so the heuristic fires.
+  let src = core::net::SocketAddr::from((our_v4, 5353));
+
+  let saw_question = |e: &mut TestEndp, prov| {
+    e.handle(now, Received::new(src, &buf[..n], prov))
+      .unwrap()
+      .any(|ev| matches!(
+        ev.expect("event must be Ok"),
+        RouteEvent::ToService(ts) if ts.handle() == handle && ts.event().is_question()
+      ))
+  };
+  assert!(
+    !saw_question(&mut e, Provenance::Unknown),
+    "a caller with nothing to say leaves the guess in charge"
+  );
+  assert!(
+    saw_question(&mut e, Provenance::NotFromUs),
+    "a caller that checked its send log overrides the guess"
+  );
+}
+
+// ── the host address-set registration invariant ─────────────────────────────
+
+fn register_with_addrs(
+  e: &mut TestEndp,
+  instance: &str,
+  host: &str,
+  a_addrs: &[Ipv4Addr],
+) -> Result<ServiceHandle, RegisterServiceError> {
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str(instance).unwrap(),
+    Name::try_from_str(host).unwrap(),
+    631,
+    120,
+  );
+  for a in a_addrs {
+    recs.add_a(*a);
+  }
+  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ServiceSpec::new(recs),
+    StdInstant::now(),
+  )
+  .map(|(h, _svc)| h)
+}
+
+/// Two services may share a host name — that is how one machine advertises one
+/// address set from several services — but they may not DISAGREE about the
+/// addresses. Each would read the other's announcement as a host claiming its
+/// own host name with rdata it does not hold, which RFC 6762 §9 makes a conflict
+/// and which surfaces as a TERMINAL `ServiceUpdate::HostConflict` raised by a
+/// sibling on the same machine.
+#[test]
+fn same_host_with_a_different_address_set_is_rejected() {
+  let mut e = build_endpoint();
+  let one = Ipv4Addr::new(192, 168, 1, 5);
+  let two = Ipv4Addr::new(192, 168, 1, 6);
+  register_with_addrs(&mut e, "A._ipp._tcp.local.", "h.local.", &[one]).unwrap();
+  let err = register_with_addrs(&mut e, "B._ipp._tcp.local.", "h.local.", &[one, two])
+    .expect_err("a disagreeing address set at a shared host name must be rejected");
+  assert!(matches!(err, RegisterServiceError::HostAddressesDiffer(h) if h.as_str() == "h.local."));
+}
+
+/// The same set in a different order is the same set: the conflict classifier
+/// asks `contains`, so mutual containment is what decides, not sequence.
+#[test]
+fn same_host_with_the_same_address_set_is_accepted() {
+  let mut e = build_endpoint();
+  let one = Ipv4Addr::new(192, 168, 1, 5);
+  let two = Ipv4Addr::new(192, 168, 1, 6);
+  register_with_addrs(&mut e, "A._ipp._tcp.local.", "h.local.", &[one, two]).unwrap();
+  register_with_addrs(&mut e, "B._ipp._tcp.local.", "h.local.", &[two, one])
+    .expect("the same set in another order is the same set");
+  // A DIFFERENT host name is unconstrained by the other's addresses.
+  register_with_addrs(&mut e, "C._ipp._tcp.local.", "other.local.", &[]).unwrap();
+}
+
+/// Host names are matched case-insensitively, exactly as the routing path
+/// matches a record against one — otherwise a second case spelling would
+/// register past the guard and conflict on the wire anyway.
+#[test]
+fn the_host_address_guard_is_case_insensitive() {
+  let mut e = build_endpoint();
+  register_with_addrs(
+    &mut e,
+    "A._ipp._tcp.local.",
+    "h.local.",
+    &[Ipv4Addr::new(192, 168, 1, 5)],
+  )
+  .unwrap();
+  assert!(matches!(
+    register_with_addrs(
+      &mut e,
+      "B._ipp._tcp.local.",
+      "H.LOCAL.",
+      &[Ipv4Addr::new(192, 168, 1, 6)],
+    ),
+    Err(RegisterServiceError::HostAddressesDiffer(_))
+  ));
 }

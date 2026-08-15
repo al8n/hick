@@ -2167,7 +2167,10 @@ async fn dropped_reply_reclaiming_register_keeps_old_name_goodbye() {
       let DriverState {
         endpoint, services, ..
       } = &mut state;
-      if let Ok(evs) = endpoint.handle(t, src, local_ip, 0, &conflict, false) {
+      if let Ok(evs) = endpoint.handle(
+        t,
+        Received::new(src, &conflict, Provenance::Unknown).with_local_ip(local_ip),
+      ) {
         for ev in evs {
           if let Ok(RouteEvent::ToService(ts)) = ev
             && let Some(ctx) = services.get_mut(&ts.handle())
@@ -2330,11 +2333,12 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
     let route_events = endpoint
       .handle(
         now,
-        SocketAddr::from(([192, 168, 1, 200], 5353)),
-        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
-        0,
-        datagram,
-        false,
+        Received::new(
+          SocketAddr::from(([192, 168, 1, 200], 5353)),
+          datagram,
+          Provenance::Unknown,
+        )
+        .with_local_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
       )
       .expect("endpoint.handle must accept the host-conflict packet");
     for ev in route_events {
@@ -3181,7 +3185,10 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
       let DriverState {
         endpoint, services, ..
       } = &mut state;
-      if let Ok(evs) = endpoint.handle(t, src, local_ip, 0, &conflict, false) {
+      if let Ok(evs) = endpoint.handle(
+        t,
+        Received::new(src, &conflict, Provenance::Unknown).with_local_ip(local_ip),
+      ) {
         for ev in evs {
           if let Ok(RouteEvent::ToService(ts)) = ev
             && let Some(ctx) = services.get_mut(&ts.handle())
@@ -3969,7 +3976,10 @@ fn inject_ptr_query(
   let DriverState {
     endpoint, services, ..
   } = state;
-  let Ok(evs) = endpoint.handle(t, src, local_ip, 0, &query, false) else {
+  let Ok(evs) = endpoint.handle(
+    t,
+    Received::new(src, &query, Provenance::Unknown).with_local_ip(local_ip),
+  ) else {
     panic!("the endpoint must accept a well-formed browse query");
   };
   for ev in evs {

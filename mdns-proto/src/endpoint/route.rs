@@ -143,6 +143,28 @@ where
   /// event mid-record cannot cause the conflict events to replay on re-entry.
   pub(crate) additional_service_done: bool,
   pub(crate) additional_query_cursor: Option<usize>,
+  /// What this datagram is permitted to do, decided once in `Endpoint::handle`
+  /// and consulted per ARM below rather than at the iterator's mouth.
+  ///
+  /// A whole-iterator gate can only answer all-or-nothing, and that is what made
+  /// a datagram this endpoint half-believed it had sent itself delete an RFC 6762
+  /// §8.2 proposal along with everything else. Gating each arm is what lets one
+  /// permission be denied while another stands — but it is also the shape that
+  /// resurrects the replay bugs the cursors and `*_service_done` latches above
+  /// exist for, so every gate below takes one of exactly two shapes already
+  /// present in this iterator:
+  ///
+  /// * a WHOLE-SECTION skip that advances `section` and touches no cursor —
+  ///   the same shape as the source-port gates on Authority and
+  ///   AuthorityProposals; or
+  /// * a gate INSIDE one phase of a record, which lets that phase reach its
+  ///   own "exhausted" exit, so a denied phase latches `*_service_done` exactly
+  ///   as an empty one does and the per-record advance stays the single place
+  ///   the cursors are reset.
+  ///
+  /// No gate skips a record, and none leaves a cursor in a state re-entry can
+  /// read differently from the pass that set it.
+  pub(crate) admits: Admits,
   pub(crate) section: Section,
 }
 
@@ -509,7 +531,20 @@ where
           // so an ordinary datagram — every datagram, on an endpoint that
           // answers nothing — leaves at the header test without either section
           // being walked.
-          let defence_only = !self.endpoint.config.answer_questions();
+          //
+          // TWO independent things reduce a datagram to defence — this
+          // endpoint's `answer_questions` configuration, and a datagram whose
+          // provenance it half-believes — and they are already folded into ONE
+          // value by `Admits`, so this arm reads a single local rather than
+          // combining two conditions that could be combined wrongly.
+          let defence_only = match self.admits.answering() {
+            Answering::All => false,
+            Answering::DefenceOnly => true,
+            Answering::None => {
+              self.section = Section::Answers;
+              continue;
+            }
+          };
           let could_be_a_probe = !self.is_response
             && self.reader.header().authority_count() > 0
             && self.src.port() == crate::constants::MDNS_PORT;
@@ -716,7 +751,17 @@ where
               // names are never conflicts. An ANSWER-section record of a
               // response is a peer asserting a name it owns, so it carries
               // `AuthoritativeResponse` — §8.1 and §9's input, never §8.2's.
-              self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse)
+              if self.admits.adjudication() {
+                self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse)
+              } else {
+                None
+              }
+            } else if !self.admits.quieting() {
+              // A known answer is §7.1 QUIETING — it exists to stop this
+              // endpoint saying something. Denied, the hint is simply not
+              // delivered and the response it would have suppressed still goes
+              // out; nothing is lost but a redundant-answer optimisation.
+              None
             } else {
               // QR=0: records are KAS hints. ANY name match (instance / host /
               // service-type) emits a KnownAnswer for suppression — conflicts
@@ -777,8 +822,11 @@ where
           // Informational is exactly why the caller's window is weighed here
           // too: a query past it collected nothing from this record, so
           // announcing it would describe a result the caller cannot find. See
-          // the `now` field.
-          if self.is_response {
+          // the `now` field. The OBSERVATION permission is weighed for the same
+          // reason: when it is denied the eager pass in `Endpoint::handle` never
+          // ran, so a `ToQuery` here would report a collection that did not
+          // happen.
+          if self.is_response && self.admits.observation() {
             let now = self.now;
             let start = self.answer_query_cursor.unwrap_or(0);
             let mut found: Option<(usize, RouteEvent<'a>)> = None;
@@ -827,6 +875,13 @@ where
           // response. The source-port gate is the same trust boundary that arm
           // documents — a genuine prober multicasts from 5353.
           if self.is_response || self.src.port() != crate::constants::MDNS_PORT {
+            self.section = Section::Authority;
+            continue;
+          }
+          // §8.2's tiebreak is ADJUDICATION, the permission a tier that is
+          // unsure keeps: withholding a proposal is what silently leaves two
+          // conforming hosts owning one name.
+          if !self.admits.adjudication() {
             self.section = Section::Authority;
             continue;
           }
@@ -884,6 +939,13 @@ where
           // authority regardless of source port), so malformed bytes are
           // always accounted even when conflict routing is suppressed.
           if self.src.port() != crate::constants::MDNS_PORT {
+            self.section = Section::Additional;
+            continue;
+          }
+          // Every event this arm can raise is a conflict, so the whole section is
+          // ADJUDICATION. Same accounting as the port gate above: a section-level
+          // suppression, not a datagram drop.
+          if !self.admits.adjudication() {
             self.section = Section::Additional;
             continue;
           }
@@ -1008,9 +1070,12 @@ where
             // This arm is QR=1 only (the `!self.is_response` guard above
             // returns), so an additional here is a supplementary ANSWER — a
             // peer asserting a name it owns, never a §8.2 proposal.
-            if let Some((key, ev)) =
+            let next_event = if self.admits.adjudication() {
               self.next_service_conflict(&r, start, ConflictOrigin::AuthoritativeResponse)
-            {
+            } else {
+              None
+            };
+            if let Some((key, ev)) = next_event {
               self.additional_service_cursor = Some(key.saturating_add(1));
               return Some(Ok(ev));
             }
@@ -1021,28 +1086,31 @@ where
           // Then query fan-out (informational; eager state update already done),
           // on the same terms as the Answer section: DNS-SD carries SRV/TXT/A/AAAA
           // here, so a query past the caller's window would otherwise be told
-          // about additionals it refused to collect.
-          let now = self.now;
-          let start = self.additional_query_cursor.unwrap_or(0);
-          let mut found: Option<(usize, RouteEvent<'a>)> = None;
-          for (key, q) in self.endpoint.queries.iter() {
-            if key < start {
-              continue;
+          // about additionals it refused to collect. Denied OBSERVATION says the
+          // same thing more strongly — the eager pass never ran at all.
+          if self.admits.observation() {
+            let now = self.now;
+            let start = self.additional_query_cursor.unwrap_or(0);
+            let mut found: Option<(usize, RouteEvent<'a>)> = None;
+            for (key, q) in self.endpoint.queries.iter() {
+              if key < start {
+                continue;
+              }
+              if q.is_done() || q.terminal_emitted() || q.caller_window_shut(now) {
+                continue;
+              }
+              if names_match_record(q.qname(), &r) && qry_query_accepts(q, &r) {
+                found = Some((
+                  key,
+                  RouteEvent::ToQuery(ToQuery::new(q.handle(), QueryEvent::Answer(r))),
+                ));
+                break;
+              }
             }
-            if q.is_done() || q.terminal_emitted() || q.caller_window_shut(now) {
-              continue;
+            if let Some((key, ev)) = found {
+              self.additional_query_cursor = Some(key.saturating_add(1));
+              return Some(Ok(ev));
             }
-            if names_match_record(q.qname(), &r) && qry_query_accepts(q, &r) {
-              found = Some((
-                key,
-                RouteEvent::ToQuery(ToQuery::new(q.handle(), QueryEvent::Answer(r))),
-              ));
-              break;
-            }
-          }
-          if let Some((key, ev)) = found {
-            self.additional_query_cursor = Some(key.saturating_add(1));
-            return Some(Ok(ev));
           }
           // Both fan-outs exhausted for this additional record; advance and
           // reset the per-record fan-out state.

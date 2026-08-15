@@ -5,7 +5,7 @@ use std::{
 
 use bytes::Bytes;
 use mdns_proto::{
-  CollectedAnswer, Name, QueryHandle, QuerySpec,
+  CollectedAnswer, Name, Provenance, QueryHandle, QuerySpec, Received,
   wire::{Header, MessageBuilder, ResourceClass, ResourceType},
 };
 
@@ -74,11 +74,12 @@ fn feed_response(mdns: &mut Mdns, records: &[Record<'_>]) {
     .endpoint
     .handle(
       Instant::now(),
-      SocketAddr::from(([192, 168, 1, 200], hick_udp::constants::MDNS_PORT)),
-      IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
-      0,
-      &buf[..len],
-      false,
+      Received::new(
+        SocketAddr::from(([192, 168, 1, 200], hick_udp::constants::MDNS_PORT)),
+        &buf[..len],
+        Provenance::Unknown,
+      )
+      .with_local_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
     )
     .expect("the endpoint accepts the response");
   // Query answers are dispatched inside `handle`; the route events are for

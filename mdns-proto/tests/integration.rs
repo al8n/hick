@@ -9,7 +9,7 @@ use mdns_proto::{
   CollectedAnswer, FamilyAttempt, Name, Query, QueryHandle, Service,
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec, ServiceSpec},
-  endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
+  endpoint::{Endpoint, EndpointEventEntry, Provenance, Received, ServiceRoute},
   event::{QueryUpdate, ServiceUpdate},
   records::ServiceRecords,
   transmit::Transmit,
@@ -328,7 +328,13 @@ fn r37r17_caller_is_self_suppresses_dispatch() {
   let qh_peer = e
     .try_start_query(QuerySpec::new(qname.clone(), ResourceType::Srv), now)
     .unwrap();
-  for ev in e.handle(now, src, local_ip, 0, &packet, false).unwrap() {
+  for ev in e
+    .handle(
+      now,
+      Received::new(src, &packet, Provenance::Unknown).with_local_ip(local_ip),
+    )
+    .unwrap()
+  {
     let _ = ev;
   }
   assert_eq!(
@@ -341,7 +347,13 @@ fn r37r17_caller_is_self_suppresses_dispatch() {
   let qh_self = e
     .try_start_query(QuerySpec::new(qname, ResourceType::Srv), now)
     .unwrap();
-  for ev in e.handle(now, src, local_ip, 0, &packet, true).unwrap() {
+  for ev in e
+    .handle(
+      now,
+      Received::new(src, &packet, Provenance::OwnEcho).with_local_ip(local_ip),
+    )
+    .unwrap()
+  {
     let _ = ev;
   }
   assert_eq!(
@@ -383,7 +395,13 @@ fn r37r27_response_from_non_5353_source_port_is_ignored() {
   let qh_bad = e
     .try_start_query(QuerySpec::new(qname.clone(), ResourceType::Srv), now)
     .unwrap();
-  for ev in e.handle(now, bad_src, local_ip, 0, &packet, false).unwrap() {
+  for ev in e
+    .handle(
+      now,
+      Received::new(bad_src, &packet, Provenance::Unknown).with_local_ip(local_ip),
+    )
+    .unwrap()
+  {
     let _ = ev;
   }
   assert_eq!(
@@ -398,7 +416,10 @@ fn r37r27_response_from_non_5353_source_port_is_ignored() {
     .try_start_query(QuerySpec::new(qname, ResourceType::Srv), now)
     .unwrap();
   for ev in e
-    .handle(now, good_src, local_ip, 0, &packet, false)
+    .handle(
+      now,
+      Received::new(good_src, &packet, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
   {
     let _ = ev;
@@ -526,7 +547,10 @@ fn r37r13_src_equals_local_ip_is_not_self() {
   // caller_is_self = false: the driver determined this is NOT our own
   // loopback. src == local_ip must not, by itself, suppress it.
   for ev in e
-    .handle(now, peer_src, local_ip, 0, &packet, false)
+    .handle(
+      now,
+      Received::new(peer_src, &packet, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .unwrap()
   {
     let _ = ev;

@@ -11,6 +11,8 @@
 )]
 mod tests;
 
+mod admits;
+pub(crate) use admits::{Admits, Answering};
 mod matching;
 pub(crate) use matching::*;
 mod route;
@@ -18,6 +20,8 @@ pub use route::RouteEvents;
 pub(crate) use route::Section;
 mod query;
 mod receive;
+mod received;
+pub use received::{Provenance, Received};
 mod service;
 mod withdrawal;
 

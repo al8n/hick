@@ -17,7 +17,7 @@ use mdns_proto::{
   CollectedAnswer, Name, Query,
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec},
-  endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
+  endpoint::{Endpoint, EndpointEventEntry, Provenance, Received, ServiceRoute},
   event::QueryUpdate,
   wire::{Flags, Header, MessageBuilder, ResourceType},
 };
@@ -126,7 +126,13 @@ fn handle_emits_at_least_one_tracing_event() {
     let src = "192.0.2.1:5353".parse().unwrap();
     let local_ip = "192.0.2.20".parse().unwrap();
 
-    for ev in e.handle(now, src, local_ip, 0, &packet, false).unwrap() {
+    for ev in e
+      .handle(
+        now,
+        Received::new(src, &packet, Provenance::Unknown).with_local_ip(local_ip),
+      )
+      .unwrap()
+    {
       let _ = ev;
     }
   });

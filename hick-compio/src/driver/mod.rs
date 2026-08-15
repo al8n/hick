@@ -18,8 +18,8 @@ use hick_udp::{
 };
 use mdns_proto::{
   CacheEntry, CollectedAnswer, Endpoint as ProtoEp, EndpointConfig, EndpointEventEntry,
-  FamilyAttempt, QueryHandle, QueryUpdate, ServiceHandle, ServiceRoute, ServiceUpdate,
-  TransmitConfirm, WithdrawalToken, WithdrawalTransmit, query::Query as ProtoQuery,
+  FamilyAttempt, Provenance, QueryHandle, QueryUpdate, Received, ServiceHandle, ServiceRoute,
+  ServiceUpdate, TransmitConfirm, WithdrawalToken, WithdrawalTransmit, query::Query as ProtoQuery,
   service::Service as ProtoSvc, transmit::Transmit,
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -1489,11 +1489,20 @@ impl State {
 
     let route_events = match endpoint.handle(
       now,
-      meta.peer(),
-      meta.local_ip(),
-      meta.interface_index(),
-      data,
-      caller_is_self,
+      Received::new(
+        meta.peer(),
+        data,
+        if caller_is_self {
+          Provenance::OwnEcho
+        } else {
+          Provenance::Unknown
+        },
+      )
+      // A ROUTING hint only — the §11 trust decision was made against the
+      // witness itself, which is why the absent case is `None` here rather than
+      // the `0` `RecvMeta::interface_index` flattens three absences onto.
+      .with_interface(meta.iface_witness().witnessed_index().map(|i| i.get()))
+      .with_local_ip(meta.local_ip()),
     ) {
       Ok(it) => it,
       Err(_) => return,
