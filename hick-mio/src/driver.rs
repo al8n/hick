@@ -592,29 +592,27 @@ impl Mdns {
 
       // The receive mints the datagram: its family, its body sliced to the
       // length that receive reported, and the kernel stamp that orders it
-      // against our own sends, in one value that cannot be taken apart. The
-      // `recv_buf.get(..meta.len())` this replaced chose the body HERE, several
-      // statements from the read, which is the distance the mint removes. A
-      // receive reporting more bytes than the buffer holds is dropped inside
-      // `Sockets::recv_once` — see `hick_udp::selfsend::RxDatagram`, which
-      // states that rule once for every driver.
+      // against our own sends, in one value that cannot be taken apart. Slicing
+      // the body here instead would put that choice several statements from the
+      // read. A receive reporting more bytes than the buffer holds is dropped
+      // inside `Sockets::recv_once` — see `hick_udp::selfsend::RxDatagram`,
+      // which states that rule once for every driver.
       //
       // No clock read at this line, and the one below is not for the credit.
       // `SELF_SEND_TTL` is no deadline but a real-time bound on FALSE
       // suppression, so a credit's age belongs to `SelfSendTracker::claim`,
       // which reads it at its own liveness decision and accepts an instant from
       // nobody. An instant captured here would already be stale by the two
-      // admission gates below — see that method's docs for why the parameter was
+      // admission gates below — see that method's docs for why a parameter is
       // the defect rather than the fix.
       //
-      // The retry loop `Sockets::recv` used to run internally lives here now,
-      // and only because it must: a minted datagram borrows `recv_buf` for as
-      // long as this iteration uses it, and a loop that hands such a borrow out
-      // of `Sockets` can never re-borrow the buffer for its next attempt. Every
-      // decision inside it is still `recv_once`'s — the family rotation, the
-      // readiness clearing, the error classification, the stats, and the
-      // `MAX_DISCARDED_PER_RECV` budget this counter feeds, reset once per
-      // drained datagram exactly as it was per `recv` call.
+      // The retry loop is out here rather than inside `Sockets` because it must
+      // be: a minted datagram borrows `recv_buf` for as long as this iteration
+      // uses it, and a loop that hands such a borrow out of `Sockets` can never
+      // re-borrow the buffer for its next attempt. Every decision inside it is
+      // still `recv_once`'s — the family rotation, the readiness clearing, the
+      // error classification, the stats, and the `MAX_DISCARDED_PER_RECV` budget
+      // this counter feeds, reset once per drained datagram.
       let mut discarded = 0usize;
       let (rx, meta) = loop {
         match sockets.recv_once(recv_buf.as_mut_slice(), &mut discarded) {
@@ -775,16 +773,16 @@ impl Mdns {
       // A kernel receive timestamp additionally carries ordering information,
       // which is what stops a byte-identical peer datagram the kernel saw
       // BEFORE our send from stealing the credit. Without one there is no
-      // ordering to check, so matching degrades to content hash inside the TTL
-      // window — and the absence is handed over as an absence rather than
+      // ordering to check, so matching degrades to the exact bytes inside the
+      // TTL window — and the absence is handed over as an absence rather than
       // papered over with a userspace stamp, because a read time taken here
       // says nothing about when the kernel saw the datagram.
       //
       // Both facts travel INSIDE the datagram, which is why the claim takes one
       // argument. `RxDatagram` is neither `Copy` nor `Clone` and exposes no
       // stamp, so a stamp a kernel really did write — for a different receive —
-      // has no way to reach these bytes; pairing them used to be a convention
-      // held by this call site.
+      // has no way to reach these bytes. Pairing them is a property of the type
+      // rather than a convention this call site has to hold.
       //
       // The kernel stamp only ORDERS the echo against the send. Two clocks
       // answer two questions and this call supplies exactly one of them: the
@@ -806,11 +804,9 @@ impl Mdns {
       // traffic. The short circuit is load-bearing — a datagram that cannot be
       // ours must not consume the credit it failed to match either.
       //
-      // ── THE TIER THIS DRIVER CAN HONESTLY REPORT ───────────────────────────
-      //
-      // Three answers, not two, and each is a claim about THIS DRIVER'S OWN SEND
-      // LOG rather than about the network — no platform reports "this is your
-      // own multicast echo".
+      // THE TIER THIS DRIVER CAN HONESTLY REPORT. Three answers, not two, and
+      // each is a claim about THIS DRIVER'S OWN SEND LOG rather than about the
+      // network — no platform reports "this is your own multicast echo".
       //
       //  * `Ordered` weighed evidence that the kernel saw this datagram at or
       //    after our own `sendto`, so nothing else could have put these bytes on
@@ -826,14 +822,8 @@ impl Mdns {
       //    costs at worst §8.2's one-second deferral.
       //  * `NoCredit` is a negative claim about this log — no credit matched, an
       //    evicted one included — which is what `NotFromUs` means. So is a source
-      //    port this endpoint never sends from, and that one is decided WITHOUT
-      //    offering a credit at all: the `if` is the short circuit the old `&&`
-      //    was, and it is load-bearing. A §6.7 legacy unicast query from an
-      //    ephemeral port carrying the same bytes as one we just multicast would
-      //    otherwise take that credit under `Degraded` and be reported as our own
-      //    echo — the reply that querier is owed would never be sent, and the
-      //    genuine echo behind it would find no credit and reach the protocol
-      //    layer as a peer's.
+      //    port this endpoint never sends from, decided by the `if` WITHOUT
+      //    offering a credit at all, for the reason given above.
       #[cfg(test)]
       Self::stall_before_claim(forced_claim_delays);
       let provenance = if from_mdns_port {
@@ -849,26 +839,24 @@ impl Mdns {
           // longer publishes into its own cache and defers this endpoint's own
           // retransmits on their behalf — and it may not deny ADJUDICATION.
           //
-          // `OwnEcho` HERE WAS THE SAME FALSE AXIOM THE PROTO SCREEN ABANDONED,
-          // one layer down: byte equality read as proof these bytes are ours. A
-          // superseded entry is a standing tombstone, so under that mapping an
-          // old local responder and a live §9 fault-tolerance twin producing the
-          // same bytes — or a peer replaying them — made EVERY matching peer
-          // defence invisible for the whole credit lifetime, and a successor
-          // could finish probing while the incumbent went unheard.
+          // NOT `OwnEcho`: that reads byte equality as proof these bytes are
+          // ours. A superseded entry is a standing tombstone, so under that
+          // mapping an old local responder and a live §9 fault-tolerance twin
+          // producing the same bytes — or a peer replaying them — make EVERY
+          // matching peer defence invisible for the whole credit lifetime, and a
+          // successor can finish probing while the incumbent goes unheard.
           //
-          // What `OwnEcho` used to buy is bought better elsewhere: our own
-          // withdrawn generation is kept from retiring the service that replaced
-          // it by the `Endpoint` screen behind
+          // Keeping our own withdrawn generation from retiring the service that
+          // replaced it belongs one layer up, at the `Endpoint` screen behind
           // `EndpointConfig::relinquished_retention`, which labels the record and
           // leaves the terminal `HostConflict` dropped in the router while a
-          // pre-authoritative instance conflict merely defers. That has to be
-          // where it lives: this classification is defeasible three independent
-          // ways no driver can close — a peer replaying our bytes reproduces
-          // everything weighed here, one send can be delivered as several copies
-          // while it is credited once, and credits are evicted under load. Each
-          // leaves the GENUINE echo reading `NoCredit`, hence `NotFromUs`, hence
-          // fully adjudicated already. See `SelfSendTracker::supersede`.
+          // pre-authoritative instance conflict merely defers. It has to live
+          // there: this classification is defeasible three independent ways no
+          // driver can close — a peer replaying our bytes reproduces everything
+          // weighed here, one send can be delivered as several copies while it is
+          // credited once, and credits are evicted under load. Each leaves the
+          // GENUINE echo reading `NoCredit`, hence `NotFromUs`, hence fully
+          // adjudicated already. See `SelfSendTracker::supersede`.
           SelfSendMatch::Superseded => Provenance::OwnEchoLikely,
           SelfSendMatch::NoCredit => Provenance::NotFromUs,
         }

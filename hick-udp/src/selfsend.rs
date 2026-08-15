@@ -9,20 +9,30 @@
 //! byte-identical datagram from a co-resident peer received afterwards is still
 //! seen as a peer, not swallowed as our own echo.
 //!
+//! # The asymmetry, stated once
+//!
+//! Nearly every decision below could go two ways, and they all go the same way
+//! for one reason. **Over-retaining a credit, or suppressing one datagram too
+//! many, costs a single byte-identical co-resident peer datagram inside a
+//! two-second window. Losing a credit costs this responder its own echo**: the
+//! echo reaches the protocol layer as peer traffic, which is a phantom RFC 6762
+//! §9 conflict against ourselves and the rename that follows. Wherever the
+//! evidence is unusable or a direction is in doubt, this module takes the first.
+//! Sites below say what the choice is; they do not re-derive why.
+//!
 //! # The match is the bytes, never a digest of them
 //!
-//! This held a 64-bit FNV-1a fingerprint until a second-preimage against one was
-//! demonstrated in **fifteen seconds** on a laptop — meet-in-the-middle over
-//! FNV's own invertible state update, with the free trailing bytes that
-//! `MessageReader` ignores carrying the solution. The forged datagram was a
-//! valid mDNS response announcing a *different* address at the same host name.
+//! A digest is the wrong shape for this job whatever its width: a
+//! second-preimage lets a *different* datagram claim the credit, be suppressed
+//! as our echo, and leave the genuine echo behind it reaching the protocol layer
+//! as peer traffic. Against the 64-bit FNV-1a fingerprint this once carried, one
+//! took **fifteen seconds** on a laptop — meet-in-the-middle over FNV's
+//! invertible state update, the solution held in the free trailing bytes
+//! `MessageReader` ignores, the result a valid mDNS response announcing a
+//! *different* address at the same host name.
 //!
-//! What that bought an attacker was the whole of a credit: the forged datagram
-//! consumed it, was suppressed as our echo, and the genuine echo behind it found
-//! nothing left and reached the protocol layer as peer traffic. A digest is the
-//! wrong shape for this job whatever its width, because the only thing
-//! suppression may safely swallow is a datagram that says exactly what ours
-//! said. Under exact matching a forged self-datagram must be byte-identical to
+//! The only datagram suppression may safely swallow is one that says exactly
+//! what ours said. Under exact matching a forgery must be byte-identical to
 //! ours, so it carries our own RFC 6762 §8.2 proposal and ties under §8.2.1, and
 //! its §9 rdata is ours and is "never a conflict" by definition. See
 //! [`MAX_SELF_SEND_BYTES`] for what holding the bytes costs.
@@ -31,16 +41,14 @@
 //! [`SelfSendTracker::claim`] for the dual-stack echo race that makes
 //! content-and-time matching alone insufficient.
 //!
-//! # One implementation, because three drifted
+//! # One implementation, shared by every `std` driver
 //!
-//! This lives here, one layer below the socket drivers, because it was written
-//! out three times and the three copies disagreed on seven points — four of them
-//! defects: the [`SELF_SEND_TTL`] measured on the wall clock, no wall-step
-//! detection, a hard-coded pre-send slack in place of
-//! [`crate::RX_TIMESTAMP_GRAIN`], and a sweep that dropped every future-stamped
-//! credit. Two of the three carried a comment claiming they matched the others,
-//! which is why a cross-reference is not the mechanism that keeps them together
-//! and a shared type is.
+//! Written out per-driver this drifts: three copies disagreed on four defects —
+//! [`SELF_SEND_TTL`] measured on the wall clock, no wall-step detection, a
+//! hard-coded pre-send slack in place of [`crate::RX_TIMESTAMP_GRAIN`], and a
+//! sweep that dropped every future-stamped credit — while two of the three
+//! carried a comment claiming they matched the others. A shared type, not a
+//! cross-reference, is what keeps them together.
 //!
 //! A driver that needs *different* semantics needs its own type rather than a
 //! fourth copy of this one. The `no_std` stacks are exactly that case: they own
@@ -95,42 +103,35 @@ use crate::RecvMeta;
 /// The recording iteration's outbound time is *structurally* claim-free: the
 /// stretch between a record and the end of the iteration it was recorded in is
 /// the driver's own scheduling, and charging it to a window that exists to bound
-/// the echo's *flight* is a defect. It expired credits three separate ways
-/// before this anchor moved: a stall between a send's pre-syscall stamp and its
-/// syscall, a later send in the same iteration stalling after an earlier credit
-/// was already recorded, and a goodbye recorded a full TTL after the
-/// announcement whose credit was still unclaimed. All three are the one bug, and
-/// [`SelfSendTracker::seal`] closes all three at once — by construction,
-/// wherever the outbound stages later move to.
+/// the echo's *flight* expires credits three ways — a stall between a send's
+/// pre-syscall stamp and its syscall, a later send in the same iteration
+/// stalling after an earlier credit was already recorded, and a goodbye recorded
+/// a full TTL after the announcement whose credit is still unclaimed. All three
+/// are one bug, and anchoring at [`SelfSendTracker::seal`] closes all three by
+/// construction, wherever the outbound stages later move to.
 ///
 /// Post-opportunity time, in contrast, **must** be charged, caller stalls
-/// included. This TTL's other job is bounding FALSE suppression, and a
+/// included, because this TTL's other job is bounding FALSE suppression and a
 /// co-resident peer's byte-identical datagram can arrive during a caller stall
 /// just as easily as during an iteration. Excluding non-running time — ageing by
-/// iteration count, say — would couple the suppression window to the driver's
-/// loop rate, which is wrong in both directions: a fast loop would expire live
-/// credits and a slow one would suppress peer traffic indefinitely.
+/// iteration count, say — couples the suppression window to the driver's loop
+/// rate, which is wrong in both directions: a fast loop expires live credits and
+/// a slow one suppresses peer traffic indefinitely.
 ///
-/// # Not the echo's arrival time
-///
-/// Ageing against when the echo *arrived* was considered and rejected. The only
+/// Ageing against when the echo *arrived* is not an option either. The only
 /// arrival stamp is the kernel's rx wall clock, which re-couples this bound to
-/// the wall clock and to the pre-syscall stamp — resurrecting the very defect
-/// the two-stamp split exists to prevent — and [`MatchMode::Degraded`] has no
-/// arrival stamp at all.
+/// the wall clock and to the pre-syscall stamp — the very defect the two-stamp
+/// split prevents — and [`MatchMode::Degraded`] has no arrival stamp at all.
 ///
 /// # It is measured on the MONOTONIC clock, and never on the wall clock
 ///
-/// Ageing a credit is a *duration* question — "has this credit been waiting
-/// longer than a loopback copy can take?" — and the wall clock answers it
+/// Ageing a credit is a *duration* question, and the wall clock answers it
 /// wrongly twice over. It steps, so an NTP correction either expires a live
 /// credit or keeps a dead one; and the only wall stamp a send has is read
-/// **before** its syscall, so every microsecond between that read and the
-/// kernel accepting the datagram is charged to the credit's life. Preemption, a
-/// signal handler, a page fault, or the `EINTR` retry can each stretch that gap,
-/// and a gap past this TTL makes a responder ingest its own announcement as
-/// peer traffic — a phantom conflict against itself and the RFC 6762 §9 rename
-/// that follows.
+/// **before** its syscall, so every microsecond between that read and the kernel
+/// accepting the datagram is charged to the credit's life. Preemption, a signal
+/// handler, a page fault, or the `EINTR` retry can each stretch that gap past
+/// this TTL, and then the credit is lost.
 ///
 /// So [`Credit`] carries two stamps that must not be folded together:
 /// [`Credit::sent`] orders the echo against the send, and
@@ -138,31 +139,26 @@ use crate::RecvMeta;
 /// is the only input to this bound. See both field docs for the one direction
 /// each may be wrong in.
 ///
-/// # What the false-suppression window really is
+/// # The false-suppression window is wider than this constant
 ///
-/// Not this constant alone. A byte-identical co-resident peer datagram can be
-/// swallowed as our echo for up to **this TTL, plus the outbound residue of the
-/// recording iteration, plus one caller gap** — the residue because the credit
-/// does not start ageing until the seal that follows the send, and the caller gap
-/// because a driver reaches that seal when it reaches it. On a loop running at any
-/// sane rate the extra is negligible against 2s, and it buys the elimination of
-/// the under-retention direction, which is the expensive one: over-retaining
-/// costs one mistaken peer datagram, while under-retaining makes this responder
-/// raise a phantom conflict against **itself** and rename under RFC 6762 §9.
+/// A byte-identical co-resident peer datagram can be swallowed as our echo for
+/// **this TTL, plus the outbound residue of the recording iteration, plus one
+/// caller gap** — the residue because ageing starts at the seal that follows the
+/// send, the caller gap because a driver reaches that seal when it reaches it.
+/// On a loop running at any sane rate the extra is negligible against 2s, and it
+/// buys the elimination of the under-retention direction.
 ///
 /// # Accepted residual
 ///
 /// A driver that stalls for `SELF_SEND_TTL` or longer **after the seal**, with
-/// an echo already pending, still expires that credit — between two iterations,
+/// an echo already pending, still expires that credit — between two iterations
 /// or inside the receive stage itself, since both are time the window was open
-/// and the claim did not happen. The seal happened, the clock ran, and no claim
-/// got to it. A stall that size degrades RFC 6762 probe timing and §8.3
-/// announcement spacing regardless, so the endpoint is mis-timed either way. It
-/// is unfixable without ageing from the echo's arrival time,
-/// which the section above rules out and which [`MatchMode::Degraded`] cannot
-/// supply at all — and forgiving it is not an option, because the forgiveness
-/// would have no bound: the same stall is indistinguishable from the one during
-/// which a co-resident peer's byte-identical datagram arrived.
+/// and the claim did not happen. A stall that size degrades RFC 6762 probe
+/// timing and §8.3 announcement spacing regardless, so the endpoint is mis-timed
+/// either way. It is unfixable without ageing from the echo's arrival time,
+/// ruled out above, and forgiving it would have no bound: the same stall is
+/// indistinguishable from the one during which a co-resident peer's
+/// byte-identical datagram arrived.
 pub const SELF_SEND_TTL: Duration = Duration::from_secs(2);
 
 /// Memory backstop on live [`SelfSendTracker`] entries. The real bound is
@@ -186,27 +182,18 @@ pub const SELF_SEND_TTL: Duration = Duration::from_secs(2);
 /// that refuses.
 pub const MAX_SELF_SEND_ENTRIES: usize = 65536;
 
-/// Memory backstop on the BYTES held in live credits, since a credit now stores
-/// the datagram rather than a digest of it.
+/// Memory backstop on the BYTES held in live credits, a credit storing the
+/// datagram rather than a digest of it.
 ///
-/// # Why storing the bytes is the only sound match, and why it is affordable
+/// # Why storing the bytes is affordable
 ///
-/// A digest lets a *different* datagram claim the credit, and that is the whole
-/// of the danger: a datagram byte-identical to ours carries our own RFC 6762
-/// §8.2 proposal (which ties under §8.2.1) and our own §9 rdata (which is "never
-/// a conflict"), so suppressing it completely can delete nothing that a
-/// conforming responder needed. A colliding datagram carries whatever its author
-/// chose. With a 64-bit FNV-1a fingerprint that author needed **fifteen seconds
-/// on a laptop** — see this module's header.
-///
-/// The naive worry about exact matching is
-/// [`MAX_SELF_SEND_ENTRIES`] × the largest datagram, which is 98 MB at a
-/// 1500-byte MTU and 4.3 GB at the 64 KiB ceiling. That product is not what the
-/// tracker holds, because the entry cap is a backstop rather than a working set:
-/// a credit lives from its send to its loopback copy, multicast loopback is
-/// delivered on the same host in microseconds, and [`SELF_SEND_TTL`] bounds even
-/// a lost one at two seconds. The resident set in normal operation is one credit
-/// per family per in-flight datagram — a handful.
+/// [`MAX_SELF_SEND_ENTRIES`] × the largest datagram — 98 MB at a 1500-byte MTU,
+/// 4.3 GB at the 64 KiB ceiling — is not what the tracker holds, because the
+/// entry cap is a backstop rather than a working set: a credit lives from its
+/// send to its loopback copy, multicast loopback is delivered on the same host
+/// in microseconds, and [`SELF_SEND_TTL`] bounds even a lost one at two seconds.
+/// The resident set in normal operation is one credit per family per in-flight
+/// datagram — a handful.
 ///
 /// So the bound that matters is a byte budget, exactly as `hick-smoltcp`'s
 /// no-`std` ring already uses one. This value holds ~715 datagrams at a
@@ -215,12 +202,9 @@ pub const MAX_SELF_SEND_ENTRIES: usize = 65536;
 /// seal. It costs one megabyte of resident memory in the pathological case and
 /// nothing measurable in the ordinary one.
 ///
-/// # Refusing is the expensive direction here too
-///
-/// A refused credit is this endpoint ingesting its own loopback as peer traffic
-/// — a phantom conflict against itself and the RFC 6762 §9 rename that follows —
-/// so this budget, like the entry cap, reclaims dead credits before it refuses a
-/// new one and never evicts a live one. See [`SelfSendTracker::admit`].
+/// Like the entry cap, it reclaims dead credits before it refuses a new one and
+/// never evicts a live one — refusing a credit is the expensive direction (see
+/// this module's header). [`SelfSendTracker::admit`] makes the decision.
 pub const MAX_SELF_SEND_BYTES: usize = 1 << 20;
 
 /// How far the wall clock may disagree with the monotonic clock across a
@@ -274,10 +258,10 @@ pub const WALL_STEP_TOLERANCE: Duration = Duration::from_millis(50);
 ///
 /// Deliberately, and it is the whole mechanism rather than an oversight. A stamp
 /// that cannot be lifted out of its datagram cannot be laid beside another one.
-/// The three-argument claim this replaced weighed the family, the body and the
-/// evidence independently, over `Copy` evidence and a `Copy` [`RecvMeta`], which
-/// is what made a stamp from one receive weighable against another receive's
-/// body — both directions live, and neither costing merely a lost byte:
+/// Weighing the family, the body and the evidence as three independent
+/// arguments — over `Copy` evidence and a `Copy` [`RecvMeta`] — is what makes a
+/// stamp from one receive weighable against another receive's body. Both
+/// directions are live, and neither costs merely a lost byte:
 ///
 /// * a stamp from a **later** receive lets a byte-identical datagram the kernel
 ///   saw *before* our `sendto` pass the ordering test and take the take-once
@@ -288,8 +272,8 @@ pub const WALL_STEP_TOLERANCE: Duration = Duration::from_millis(50);
 ///   the protocol layer as peer traffic for the other reason.
 ///
 /// Either way it is a phantom RFC 6762 §9 conflict against ourselves and the
-/// rename that follows. **Neither is reachable now**, and that is what the
-/// missing traits buy. There is also no public accessor for the stamp: it is
+/// rename that follows. **Neither is reachable through this type**, and that is
+/// what the missing traits buy. There is also no public accessor for the stamp: it is
 /// read by [`SelfSendTracker::claim`] and by nothing else, so it has no path out
 /// of the datagram it arrived with.
 ///
@@ -312,16 +296,14 @@ pub const WALL_STEP_TOLERANCE: Duration = Duration::from_millis(50);
 /// the caller's control buffer and **cannot tell a buffer a kernel filled from a
 /// buffer a caller encoded**.
 ///
-/// **What changes there is distance, not enforcement, and it is worth being
-/// precise about how much.** `hick-compio` is completion-based: it submits its
-/// own `recv_msg` and owns the control buffer that comes back, so this crate is
-/// not present at its receive and `from_recv_parts` remains a caller contract
-/// there — stated as one, in that driver, at the one statement that has to be
-/// right. But the obligation shrinks from one that spans a mint, a struct field,
-/// a channel and a claim to one statement adjacent to the syscall with both
-/// buffers already in scope. Getting it wrong is not a lost byte: a stamp that
-/// does not order the datagram against our `sendto` still runs the claim at
-/// [`MatchMode::Ordered`] strength, which re-opens the credit-theft window
+/// **What that buys is distance, not enforcement.** `hick-compio` is
+/// completion-based: it submits its own `recv_msg` and owns the control buffer
+/// that comes back, so `from_recv_parts` remains a caller contract there, stated
+/// as one in that driver. What shrinks is the span — from an obligation crossing
+/// a mint, a struct field, a channel and a claim, to one statement adjacent to
+/// the syscall with both buffers in scope. Getting it wrong is not a lost byte:
+/// a stamp that does not order the datagram against our `sendto` still runs the
+/// claim at [`MatchMode::Ordered`] strength, re-opening the credit-theft window
 /// above.
 ///
 /// # No public constructor takes a bare [`SystemTime`]
@@ -513,8 +495,7 @@ impl<'a> RxDatagram<'a> {
   /// For a driver that receives on one task and claims on another:
   /// `hick-reactor` reads into a reused buffer and moves the result across a
   /// channel, which a borrowed body cannot cross. It copies only when the body
-  /// is still borrowed, and it is exactly the `to_vec` that driver already did
-  /// before this type existed.
+  /// is still borrowed.
   ///
   /// # It is not a `Clone` door
   ///
@@ -669,13 +650,12 @@ impl ClockPair {
 ///
 /// That is structural, not a convention: this type has no public constructor,
 /// and no function anywhere — public or private — takes a mode from outside this
-/// module. What a claim now does is **report** the mode it derived, through
-/// [`SelfSendMatch`], because a driver mapping an echo onto a trust tier needs to
-/// know which of the two strengths its suppression actually ran at. So the
-/// value escapes; the ability to choose it does not. It stays public so a
-/// driver's own documentation can name the two states. A later change that adds
-/// a mode PARAMETER to any function undoes the guarantee, whatever this
-/// paragraph says.
+/// module. A claim **reports** the mode it derived, through [`SelfSendMatch`],
+/// because a driver mapping an echo onto a trust tier needs to know which of the
+/// two strengths its suppression actually ran at. So the value escapes; the
+/// ability to choose it does not, and the type stays public only so a driver's
+/// own documentation can name the two states. A later change that adds a mode
+/// PARAMETER to any function undoes the guarantee, whatever this paragraph says.
 ///
 /// # What the derivation bounds, and what it does not
 ///
@@ -698,7 +678,7 @@ pub enum MatchMode {
   /// stealing the take-once credit. The [`SELF_SEND_TTL`] bound is applied
   /// separately, on the monotonic clock.
   Ordered,
-  /// There is no ordering evidence to weigh, so matching is content hash plus
+  /// There is no ordering evidence to weigh, so matching is the exact bytes plus
   /// family, bounded by [`SELF_SEND_TTL`], and nothing else. **The reference is
   /// not consulted at all** — see [`reference_ordered`] for why weighing one
   /// here could only ever reject our own echo.
@@ -713,54 +693,39 @@ pub enum MatchMode {
   ///   own wall stamp is not on the timeline the receive stamp was taken on. See
   ///   [`WALL_STEP_TOLERANCE`].
   ///
-  /// It is enough to suppress our own loopback in the ordinary single-host case,
-  /// but by construction it cannot defend the credit-theft race that `Ordered`
-  /// guards against. **That is the cheap direction, and it is chosen
-  /// deliberately.**
+  /// It suppresses our own loopback in the ordinary single-host case but cannot
+  /// defend the credit-theft race `Ordered` guards against, which is the cheap
+  /// direction and is chosen deliberately.
   ///
   /// # What is given up is narrower than "ordering"
   ///
-  /// Ordering only ever *rejects*, and it only ever rejects a datagram the
-  /// kernel stamped BEFORE our `sendto`. Anything the kernel saw at or after it
-  /// already claims the credit under `Ordered` too — see [`reference_ordered`] —
-  /// so the whole of the marginal exposure here is a datagram that was already
-  /// queued when the send it claims was made. It still has to arrive on the same
+  /// Ordering only ever *rejects*, and only ever a datagram the kernel stamped
+  /// BEFORE our `sendto`; anything it saw at or after claims the credit under
+  /// `Ordered` too. So the whole marginal exposure is a datagram already queued
+  /// when the send it claims was made, which must still arrive on the same
   /// family, from source port 5353 (a driver offers a credit to no other port,
-  /// since that is the only port an mDNS endpoint sends from — see
+  /// that being the only port an mDNS endpoint sends from — see
   /// [`SelfSendTracker::claim`]), carrying the **same bytes**, inside
   /// [`SELF_SEND_TTL`].
   ///
-  /// # What one costs, and why matching on the bytes is what bounds it
+  /// # What one costs
   ///
   /// One datagram, once. The case that can arise without an author arranging it
   /// is a co-resident responder's byte-identical copy: every record in it
   /// asserts exactly what we assert, and RFC 6762 §9 defines a conflict as the
   /// same name, rrtype and rrclass with *different* rdata, so suppressing it
   /// cannot suppress a conflict. A query costs the answer to a question we had
-  /// just asked ourselves.
-  ///
-  /// **That argument is only available because the match is the body itself.**
-  /// It was a 64-bit FNV-1a fingerprint until a second-preimage against one was
-  /// demonstrated in fifteen seconds — a valid mDNS response announcing a
-  /// different address at the same host name, with the collision carried in the
-  /// trailing bytes `MessageReader` ignores. Under a digest "byte-identical" is
-  /// an assumption about the attacker, and every sentence above rests on it; under
-  /// exact bytes it is what was compared.
+  /// just asked ourselves. **That argument is only available because the match
+  /// is the body itself** — under a digest, "byte-identical" would be an
+  /// assumption about the attacker rather than what was compared.
   ///
   /// # The direction neither mode bounds
   ///
-  /// Whatever claims a credit takes it FROM our echo, which then reaches the
-  /// protocol layer as peer traffic. `Ordered` narrows that to datagrams the
-  /// kernel saw after our send and no further, so an exact replay of our own
-  /// bytes defeats both modes equally; it is the standing price of matching on
-  /// content at all, bounded by family, port, the bytes and the TTL. A replay is
-  /// the whole of what is left, and a replay of our own datagram asserts our own
-  /// records.
-  ///
-  /// Rejecting our own echo is the expensive direction, and it is what settles
-  /// the trade: it makes this responder raise a phantom conflict against itself
-  /// and rename under §9, and under a clock that keeps stepping it does so
-  /// repeatedly.
+  /// Whatever claims a credit takes it FROM our echo. `Ordered` narrows that to
+  /// datagrams the kernel saw after our send and no further, so an exact replay
+  /// of our own bytes defeats both modes equally: the standing price of matching
+  /// on content at all, bounded by family, port, the bytes and the TTL. A replay
+  /// of our own datagram asserts our own records.
   Degraded,
 }
 
@@ -871,14 +836,14 @@ pub enum SelfSendMatch {
   /// into its own cache and defers this endpoint's own retransmits, and no screen
   /// in `mdns-proto` covers observation or quieting.
   ///
-  /// **NOT `OwnEcho`.** That was this module's own false axiom — byte equality
-  /// read as proof of origin — and a superseded entry is deliberately
-  /// non-consuming, so it applied to EVERY copy. An old local responder and a
-  /// live §9 twin can produce the same bytes, and a peer can replay them; under
-  /// `OwnEcho` all of them were invisible for the whole of [`SELF_SEND_TTL`], so
-  /// a successor could finish probing while the incumbent's defences went
-  /// unheard. The terminal outcome this tier once stood in front of is held by
-  /// `mdns-proto`'s relinquished screen instead, as the section above says.
+  /// **NOT `OwnEcho`.** That reads byte equality as proof of origin, which it is
+  /// not, and a superseded entry is deliberately non-consuming, so the
+  /// misreading would apply to EVERY copy. An old local responder and a live §9
+  /// twin can produce the same bytes, and a peer can replay them; classified as
+  /// `OwnEcho` all of them go invisible for the whole of [`SELF_SEND_TTL`], and
+  /// a successor can finish probing while the incumbent's defences go unheard.
+  /// The terminal outcome is held by `mdns-proto`'s relinquished screen instead,
+  /// as the section above says.
   ///
   /// The cost is bounded: the datagram must still be byte-identical to one we
   /// sent, on the same family, from port 5353, inside [`SELF_SEND_TTL`].
@@ -913,13 +878,13 @@ impl SelfSendMatch {
 /// asserts nothing: its records ARE the questions, so no registration,
 /// withdrawal or RFC 6762 §9 rename can invalidate them.
 ///
-/// Superseding a question's credit therefore converted it into a standing
-/// tombstone for a datagram that could never have carried a stale assertion —
-/// and because a superseded entry is deliberately non-consuming, EVERY
-/// byte-identical copy was then suppressed rather than only the first. A peer's
-/// query retransmission from port 5353 is ordinary traffic under §5.2's retry
-/// schedule, so that made legitimate peer questions invisible for the whole of
-/// [`SELF_SEND_TTL`], every time an unrelated service crossed a lifecycle seam.
+/// Superseding a question's credit would therefore make it a standing tombstone
+/// for a datagram that could never have carried a stale assertion — and because
+/// a superseded entry is deliberately non-consuming, EVERY byte-identical copy
+/// would be suppressed rather than only the first. A peer's query retransmission
+/// from port 5353 is ordinary traffic under §5.2's retry schedule, so that makes
+/// legitimate peer questions invisible for the whole of [`SELF_SEND_TTL`], every
+/// time an unrelated service crosses a lifecycle seam.
 ///
 /// # It is on the ENTRY, and there is no second epoch
 ///
@@ -1010,17 +975,15 @@ impl SendClass {
 ///
 /// **Two clocks, two jobs, and they are not interchangeable.** Each stamp is
 /// allowed to be wrong in exactly one direction and the two directions do not
-/// agree, so folding them back together — which is what this crate did until
-/// the delayed-syscall defect — silently breaks whichever consumer needed the
-/// other direction.
+/// agree, so folding them back into one stamp silently breaks whichever consumer
+/// needed the other direction.
 struct Credit {
   /// The socket the datagram went out on, and therefore the **only** socket
   /// its loopback copy can arrive on.
   family: Family,
   /// The datagram body, kept whole. A claim compares these bytes against the
-  /// arriving ones and nothing else — see [`MAX_SELF_SEND_BYTES`] for why the
-  /// digest this replaced could not be made safe at any width, and what holding
-  /// the bytes costs.
+  /// arriving ones and nothing else — see [`MAX_SELF_SEND_BYTES`] for why a
+  /// digest cannot be made safe at any width, and what holding the bytes costs.
   body: Vec<u8>,
   /// Which generation of this endpoint's own records this datagram was sent
   /// under, taken from [`SelfSendTracker::generation`] at
@@ -1061,16 +1024,12 @@ struct Credit {
   /// why the seal must precede the driver's next receive: an unsealed credit
   /// reaching a claim is not merely young, it is ageless.
   /// [`SelfSendTracker::seal`] fills it in at the first instant a claim is
-  /// possible; see
-  /// [`SELF_SEND_TTL`] for why the window may not start any earlier.
+  /// possible; see [`SELF_SEND_TTL`] for why the window may not start earlier.
   ///
-  /// LATE is the safe direction here — the opposite of [`Credit::sent`], and
-  /// the whole reason this is a second stamp. Over-retaining a credit costs at
-  /// most one byte-identical co-resident peer datagram mistaken for our echo
-  /// inside a two-second window; under-retaining one makes this responder raise
-  /// a phantom conflict against **itself**. Anchoring the age anywhere inside
-  /// the recording iteration — at the pre-syscall wall stamp, or even at the
-  /// post-syscall monotonic one — gets the unsafe direction: it charges a
+  /// LATE is the safe direction here — the opposite of [`Credit::sent`], and the
+  /// whole reason this is a second stamp. Anchoring the age anywhere inside the
+  /// recording iteration, at the pre-syscall wall stamp or even at the
+  /// post-syscall monotonic one, takes the unsafe direction: it charges a
   /// stretch in which no claim was structurally possible to a window that was
   /// never meant to cover it.
   aged_from: Option<StdInstant>,
@@ -1106,9 +1065,8 @@ pub struct SelfSendTracker {
   /// * [`Self::claim`] and [`Self::reclaim_expired_sealed`] only ever remove, and
   ///   removal preserves relative order.
   ///
-  /// The non-decreasing anchor was the one half a caller could break while
-  /// [`Self::seal`] still took one, and deleting that parameter is what turned
-  /// its contract into a property of the monotonic clock.
+  /// The non-decreasing anchor is a property of the monotonic clock rather than
+  /// a caller contract, because [`Self::seal`] takes no instant.
   entries: Vec<Credit>,
   /// Total bytes held in [`Self::entries`], maintained by every path that adds
   /// or removes one, so [`Self::admit`] can weigh [`MAX_SELF_SEND_BYTES`]
@@ -1189,10 +1147,10 @@ impl SelfSendTracker {
   /// for the whole log, so the next seam of either kind demotes the renamer's
   /// stale credit as well; what the advance at the rename closes is the stretch
   /// between it and that next seam, during which a credit for the abandoned
-  /// instance name still claims as current and still adjudicates. Arguing from
-  /// reachability instead is what left the rename off this list once already,
-  /// and a reachability argument has to be re-made after every change to the
-  /// routing.
+  /// instance name still claims as current and still adjudicates. State the list
+  /// over mutations rather than over reachable harms: a reachability argument
+  /// has to be re-made after every change to the routing, and the rename is
+  /// exactly the entry such an argument drops.
   ///
   /// **Call it at the site, not once per loop iteration.** The obligation is
   /// relational — no credit recorded before the change may be claimed at the
@@ -1202,16 +1160,16 @@ impl SelfSendTracker {
   ///
   /// # A REGISTRATION IS NOT ONE OF THEM
   ///
-  /// It was on this list, and it was wrong. A registration only INSERTS a route.
-  /// It mutates no record this endpoint has already asserted: there is no §8.4
-  /// records mutator, a duplicate instance name and a name still held by a
-  /// collision goodbye are both refused, and a live route that publishes the
-  /// same host name with a different A or AAAA set makes the registration fail
-  /// (`Endpoint::host_addresses_disagree`). The NEGATIVE assertions are covered
-  /// too: the encoder emits exactly one §6.1 NSEC per service and it is owned by
-  /// the INSTANCE name, so no sibling registration can flip a host-name NSEC's
-  /// truth. Nothing this endpoint had asserted, positive or negative, changes
-  /// truth-value at a registration — so calling this there declared a falsehood.
+  /// A registration only INSERTS a route. It mutates no record this endpoint has
+  /// already asserted: there is no §8.4 records mutator, a duplicate instance
+  /// name and a name still held by a collision goodbye are both refused, and a
+  /// live route that publishes the same host name with a different A or AAAA set
+  /// makes the registration fail (`Endpoint::host_addresses_disagree`). The
+  /// NEGATIVE assertions are covered too: the encoder emits exactly one §6.1
+  /// NSEC per service and it is owned by the INSTANCE name, so no sibling
+  /// registration can flip a host-name NSEC's truth. Nothing this endpoint had
+  /// asserted, positive or negative, changes truth-value at a registration — so
+  /// calling this there declares a falsehood.
   ///
   /// Read the predicate, not the reachability. "A new route publishes records no
   /// earlier credit knows about" is true and beside the point: the question this
@@ -1220,29 +1178,25 @@ impl SelfSendTracker {
   ///
   /// # Erring towards calling it is NOT cheap
   ///
-  /// It was documented as cheap on the reasoning that a spurious advance costs
-  /// at most the adjudication of one byte-identical in-flight datagram. That
-  /// costing predates the standing tombstone. A superseded credit is no longer
-  /// take-once: it answers EVERY byte-identical copy for the rest of
-  /// [`SELF_SEND_TTL`] and no claim spends it, so one spurious advance denies
-  /// observation and quieting to every copy of those bytes for the whole window
-  /// — to a conforming §9 fault-tolerance twin's identical answers, and to a
-  /// peer's TTL=0 §10.1 goodbye burst, which then reaches no cache at all and
-  /// leaves the entry it exists to retract standing for its full original TTL
-  /// instead of §10.1's one-second clamp.
+  /// A superseded credit is not take-once: it answers EVERY byte-identical copy
+  /// for the rest of [`SELF_SEND_TTL`] and no claim spends it, so one spurious
+  /// advance denies observation and quieting to every copy of those bytes for
+  /// the whole window — to a conforming §9 fault-tolerance twin's identical
+  /// answers, and to a peer's TTL=0 §10.1 goodbye burst, which then reaches no
+  /// cache at all and leaves the entry it exists to retract standing for its
+  /// full original TTL instead of §10.1's one-second clamp.
   ///
-  /// A missing advance is still the worse direction, and that is why the list
-  /// above is stated over MUTATIONS rather than over reachable harms: it lets a
-  /// stale echo populate this endpoint's cache with records it no longer
-  /// publishes, and quiet its own traffic on their behalf. But "when unsure,
-  /// call it" is not the rule. The rule is the predicate — call it where what
-  /// this endpoint publishes CHANGED.
+  /// A missing advance is still the worse direction — it lets a stale echo
+  /// populate this endpoint's cache with records it no longer publishes, and
+  /// quiet its own traffic on their behalf. But "when unsure, call it" is not
+  /// the rule. The rule is the predicate: call it where what this endpoint
+  /// publishes CHANGED.
   ///
-  /// It no longer costs a live service a terminal `HostConflict`: that is
-  /// screened in `mdns-proto` by `EndpointConfig::relinquished_retention`, which
-  /// had to move there because no send log can be relied on to recognise the
-  /// echo at all. See [`SelfSendMatch::Superseded`] for the three ways
-  /// recognition fails without a bug anywhere.
+  /// It does not stand between a live service and a terminal `HostConflict`:
+  /// that is screened in `mdns-proto` by
+  /// `EndpointConfig::relinquished_retention`, because no send log can be relied
+  /// on to recognise the echo at all. See [`SelfSendMatch::Superseded`] for the
+  /// three ways recognition fails without a bug anywhere.
   ///
   /// It does NOT drop the credits. Dropping them would make the very echoes this
   /// is protecting against read as [`SelfSendMatch::NoCredit`] — full peer
@@ -1285,14 +1239,11 @@ impl SelfSendTracker {
   ///
   /// # `sent` is a contract this type CANNOT enforce
   ///
-  /// Stated plainly because the receive side has one form this crate can check
-  /// and this side has none: [`recv_datagram`] mints its datagram off a
-  /// `recvmsg` this crate performed, so the stamp's origin and its association
-  /// with the body are both properties of the call. There is no equivalent here,
-  /// and no honest way to build one — **this crate does not own the send**. It
-  /// has no
-  /// `sendto` to stamp, so whatever it accepted would be a value the caller read,
-  /// and wrapping that in a newtype would move the promise without checking it.
+  /// The receive side has a form this crate can check ([`recv_datagram`] mints
+  /// off a `recvmsg` it performed itself); this side has none, and no honest way
+  /// to build one, because **this crate does not own the send**. It has no
+  /// `sendto` to stamp, so whatever it accepted would be a value the caller
+  /// read, and a newtype would move the promise without checking it.
   ///
   /// What the caller owes, then, in full:
   ///
@@ -1329,37 +1280,30 @@ impl SelfSendTracker {
   /// **Reclaiming.** A sealed credit past [`SELF_SEND_TTL`] is garbage:
   /// [`Self::claim`] already refuses it, and nothing but the next [`Self::seal`]
   /// removes it. So a full tracker whose loop then stalls past the TTL is
-  /// [`MAX_SELF_SEND_ENTRIES`] corpses, and a later send in that same iteration would
-  /// be refused a credit by entries that are every one of them dead. A refused
-  /// credit is not a lost byte — it is this endpoint ingesting its own loopback
-  /// as peer traffic, a phantom conflict against itself and the RFC 6762 §9
-  /// rename that follows. So the cap is enforced against what is still alive:
+  /// [`MAX_SELF_SEND_ENTRIES`] corpses, and a later send in that same iteration
+  /// would be refused a credit by entries that are every one of them dead — the
+  /// expensive direction. So the cap is enforced against what is still alive:
   /// [`Self::reclaim_expired_sealed`] runs first, against a LIVE monotonic
   /// instant read here, on the same clock and with the same rule [`Self::seal`]
   /// uses.
   ///
-  /// **Ageing.** Not here, and not from anything this send carries. The
-  /// record-time sweep this once had aged every existing credit against whatever
-  /// instant *this* send happened to reach the kernel at, so a later send in the
-  /// same iteration — a second fan-out, or a goodbye after an announcement —
-  /// evicted credits whose echoes had not had a single
-  /// opportunity to claim them. That half is not coming back: an unsealed credit
-  /// has no window open, so [`Self::reclaim_expired_sealed`] retains it
-  /// unconditionally however late the clock reads, and [`Self::seal`] remains
-  /// the only place a window ever opens.
+  /// **Ageing.** Not here, and not from anything this send carries. A
+  /// record-time sweep that aged every existing credit against whatever instant
+  /// *this* send reached the kernel at would let a later send in the same
+  /// iteration — a second fan-out, or a goodbye after an announcement — evict
+  /// credits whose echoes had not had a single opportunity to claim them. So an
+  /// unsealed credit has no window open, [`Self::reclaim_expired_sealed`]
+  /// retains it unconditionally however late the clock reads, and
+  /// [`Self::seal`] is the only place a window ever opens.
   ///
   /// The reclaim is gated on the cap rather than run every time: below it there
   /// is nothing to make room for, so the clock read and the scan are both
   /// skipped and the routine sweep stays exactly where the anchor is.
   ///
-  /// # The sweep is a sweep; [`Self::admit`] is the decision
-  ///
-  /// The bulk reclaim above is bounded only by [`MAX_SELF_SEND_ENTRIES`], so it
-  /// weighs up to 65 536 credits against **one** instant read before it started.
-  /// A credit that was live when the sweep looked at it can be dead by the time
-  /// the sweep finishes, and deciding the cap on the length that sweep left
-  /// behind is a decision made against a stale reading. So the length test is not
-  /// the decision: [`Self::admit`] is, and it reads the clock at itself.
+  /// The sweep is only a sweep. Bounded by [`MAX_SELF_SEND_ENTRIES`], it weighs
+  /// up to 65 536 credits against ONE instant read before it started, so the
+  /// length it leaves behind is already stale. [`Self::admit`] makes the
+  /// admission decision, on a clock it reads at itself.
   pub fn record(&mut self, family: Family, body: &[u8], sent: ClockPair) {
     self.record_by(family, body, sent, StdInstant::now);
   }
@@ -1444,10 +1388,8 @@ impl SelfSendTracker {
   /// tracker exactly as it found it — reclaiming on the way to saying no would
   /// discard credits to make room for an entry that was never admitted.
   ///
-  /// Refusing here is not a lost byte. It is this endpoint ingesting its own
-  /// loopback as peer traffic — a phantom conflict against itself and the RFC
-  /// 6762 §9 rename that follows — so the direction that must never be taken
-  /// wrongly is the refusal.
+  /// Refusal is the direction that must never be taken wrongly; see this
+  /// module's header.
   fn admit(&mut self, len: usize) -> bool {
     let mut reclaimable = 0usize;
     let mut freed = 0usize;
@@ -1486,10 +1428,10 @@ impl SelfSendTracker {
   /// routine rather than a `retain` written out twice. A credit whose
   /// [`Credit::aged_from`] is `None` has not started ageing: it has no age to be
   /// past the TTL with, and no claim opportunity it could have missed, so
-  /// [`still_live`] answers `true` for it whatever `now` is. That is precisely
-  /// the guarantee the seal redesign exists to provide, and reclaiming garbage
-  /// must not quietly re-acquire the power to break it — conflating the two is
-  /// what made the old record-time sweep a defect rather than a cleanup.
+  /// [`still_live`] answers `true` for it whatever `now` is. That is the
+  /// guarantee the seal split exists to provide, and reclaiming garbage must not
+  /// quietly re-acquire the power to break it: conflating the two turns a
+  /// cleanup into a defect.
   ///
   /// [`Self::seal`] runs it once per iteration as ordinary garbage collection, on a
   /// reading of its own — spent here and not reused to anchor the survivors, who
@@ -1547,11 +1489,8 @@ impl SelfSendTracker {
   /// positional — so a driver's seal call site should name which records it closes
   /// and which receive it precedes.
   ///
-  /// Over-retention is bounded by one iteration's duration, and over-retention is
-  /// the **cheap** direction: a stale credit can at worst suppress one
-  /// byte-identical peer datagram, and take-once bounds it to that. Under-
-  /// retention is the expensive one — our own echo ingested as a peer, an RFC
-  /// 6762 §9 conflict against ourselves and the rename that follows.
+  /// Over-retention is bounded by one iteration's duration, and take-once bounds
+  /// it to one byte-identical peer datagram — the cheap direction, as ever.
   ///
   /// Ageing here rather than on `record` also means the anchor is taken once per
   /// iteration instead of once per send, and always against the monotonic clock
@@ -1566,31 +1505,24 @@ impl SelfSendTracker {
   /// consumers in a fixed order. The sweep is first, and it is a bulk one:
   /// bounded only by [`MAX_SELF_SEND_ENTRIES`], it weighs up to 65 536 credits
   /// against the reading it started from. Handing that same, already-spent
-  /// reading to the anchor is what made a caller-supplied `now` unsound — a long
-  /// sweep, or a preemption anywhere inside it, gave a window that had only just
-  /// opened an anchor from before it, and the first claim against that credit
-  /// then found it expired. A credit lost that way is not a lost byte: it is this
-  /// endpoint ingesting its own loopback as peer traffic, a phantom conflict
-  /// against itself and the RFC 6762 §9 rename that follows.
+  /// reading to the anchor is what makes a caller-supplied `now` unsound — a
+  /// long sweep, or a preemption anywhere inside it, gives a window that has
+  /// only just opened an anchor from before it, and the first claim against that
+  /// credit then finds it expired, losing the credit.
   ///
   /// So sealing is batch-oriented. Every piece of pre-claim work — the sweep, and
   /// anything a later pass adds before the anchor — completes first, and the
   /// anchor is read after all of it, because that instant is not a convenient
-  /// earlier reading but the thing being defined. The caller's parameter is
-  /// deleted rather than moved for the same reason it was deleted from
-  /// [`Self::claim`]: a parameter is the channel through which a reading taken
-  /// somewhere else arrives, and moving the read nearer never removes the
-  /// channel.
+  /// earlier reading but the thing being defined. There is no caller parameter,
+  /// for the reason [`Self::claim`] gives.
   ///
   /// The sweep spending a stale reading is harmless in the only direction it can
   /// be wrong: a credit that died while the sweep ran is merely retained until
   /// the next seal, and [`Self::claim`] refuses it meanwhile.
   ///
-  /// It also settles the non-decreasing-anchor contract this used to state and
-  /// rely on a caller for. The anchor is now a monotonic reading taken here, so
-  /// each seal's anchor is at or after every anchor already assigned and
-  /// [`SelfSendTracker::entries`]'s expiry order — which [`Self::admit`]'s `O(1)`
-  /// front check reads — holds by construction.
+  /// Reading the anchor here is also what makes it non-decreasing without a
+  /// caller contract, which is what [`SelfSendTracker::entries`]'s expiry order
+  /// rests on.
   pub fn seal(&mut self) {
     // The sweep completes FIRST, on a reading of its own.
     self.reclaim_expired_sealed(StdInstant::now());
@@ -1612,11 +1544,12 @@ impl SelfSendTracker {
   /// Behind `test-support`, permanently, and the gate is the point: no default
   /// build has this at all, and production reaches a seal only through
   /// [`Self::seal`], which reads the clock for each phase itself — so there is no
-  /// build a driver ships in which a caller's instant can anchor a window. Collapsing the two readings is exactly what makes this usable for
-  /// the tests whose subject is *not* the gap between them — `StdInstant` has no
-  /// constructor, so a chosen loop top cannot be expressed any other way. The
-  /// gap itself is tested through [`Self::pause_next_seal_for_test`], against
-  /// the real [`Self::seal`]. Same seam as [`Self::claim_at`].
+  /// build a driver ships in which a caller's instant can anchor a window.
+  /// Collapsing the two readings is what makes this usable for the tests whose
+  /// subject is *not* the gap between them: `StdInstant` has no constructor, so a
+  /// chosen loop top cannot be expressed any other way. The gap itself is tested
+  /// through [`Self::pause_next_seal_for_test`], against the real
+  /// [`Self::seal`]. Same seam as [`Self::claim_at`].
   #[cfg(any(test, feature = "test-support"))]
   pub fn seal_at(&mut self, at: StdInstant) {
     self.reclaim_expired_sealed(at);
@@ -1655,18 +1588,17 @@ impl SelfSendTracker {
   /// [`RxDatagram`] carries the family, the body and the stamp out of one
   /// receive, and is neither `Copy` nor `Clone`, so the stamp cannot be lifted
   /// out and laid beside another datagram's bytes. **That is a property of the
-  /// type rather than an obligation on the caller**, and it is what the three
-  /// separate arguments this method replaced could never be: a stamp a kernel
-  /// really did write, for some OTHER receive, used to be weighed here at
-  /// `Ordered` strength against whatever body it was handed with. Both
-  /// mismatches were live — a stamp from a LATER receive lets a byte-identical
-  /// datagram the kernel saw *before* our `sendto` take the take-once credit, so
-  /// a real peer's datagram is swallowed as our loopback and any conflict it
-  /// carried is never seen, while our own echo finds no credit and reaches the
-  /// protocol layer as peer traffic; a stamp from an EARLIER receive rejects the
-  /// genuine echo outright, reaching the same place by the other route. Either
-  /// is a phantom RFC 6762 §9 conflict against ourselves and the rename that
-  /// follows.
+  /// type rather than an obligation on the caller**, which is what separate
+  /// family, body and stamp arguments could never be: they let a stamp a kernel
+  /// really did write, for some OTHER receive, be weighed here at `Ordered`
+  /// strength against whatever body it was handed with. Both mismatches are
+  /// harmful — a stamp from a LATER receive lets a byte-identical datagram the
+  /// kernel saw *before* our `sendto` take the take-once credit, so a real
+  /// peer's datagram is swallowed as our loopback and any conflict it carried is
+  /// never seen, while our own echo finds no credit and reaches the protocol
+  /// layer as peer traffic; a stamp from an EARLIER receive rejects the genuine
+  /// echo outright, reaching the same place by the other route. Either is a
+  /// phantom RFC 6762 §9 conflict against ourselves and the rename that follows.
   ///
   /// What this does NOT settle is **origin**, and that is stated rather than
   /// claimed away: where a driver performs its own receive,
@@ -1698,25 +1630,20 @@ impl SelfSendTracker {
   /// The monotonic clock the [`SELF_SEND_TTL`] bound is measured on is read
   /// **inside this call, at the [`still_live`] test of the candidate being
   /// weighed** — not at the top of this function, and emphatically not by the
-  /// caller. The absent parameter is the fix, and it is structural rather than
-  /// another correction.
+  /// caller.
   ///
-  /// A credit's liveness was mis-evaluated six times, each in a different window
-  /// between some caller's clock read and this comparison: aged from a
-  /// pre-syscall wall stamp, aged before the receive resumed, swept across loop
-  /// stages by a later record, frozen at loop entry, counted as occupancy at the
-  /// cap while dead, and frozen immediately after `recv` with both admission
-  /// gates still to run. Each round closed its window by moving the read nearer,
-  /// and each round left the next one. The parameter *is* the defect class: it is
-  /// a channel through which a caller hands in an age measured somewhere else,
-  /// and moving the read closer never removes the channel. Deleting it is what
-  /// removed the channel.
+  /// A parameter *is* the defect class here rather than one instance of it: it
+  /// is a channel through which a caller hands in an age measured somewhere
+  /// else — at loop entry, at a pre-syscall stamp, immediately after `recv` with
+  /// both admission gates still to run — and moving the read nearer the
+  /// comparison narrows the window without removing the channel. Only deleting
+  /// the parameter removes it.
   ///
   /// **What is left is the instructions between that read and the comparison,
   /// and it is irreducible.** Every possible implementation has it: something
   /// must read a clock before something can compare against it. There is no work
-  /// left inside it to move out, so it is the floor rather than a seventh window
-  /// — a later pass hunting for one here should stop at this paragraph.
+  /// left inside it to move out, so it is the floor — a later pass hunting for
+  /// another window here should stop at this paragraph.
   ///
   /// # Two clocks, two questions, and a third that keeps the first honest
   ///
@@ -1737,23 +1664,17 @@ impl SelfSendTracker {
   /// why.
   ///
   /// The driver's own loop instant is not a substitute for the live read, which
-  /// is why this takes none: a driver keeps that reading for its protocol path
-  /// and hands it to nothing here. It is taken before the receive stage, so
+  /// is why this takes none: that reading is taken before the receive stage, so
   /// reusing it charges nothing for the drain's own runtime, for the admission
-  /// gates each datagram passes, or for a preemption anywhere among them; a
+  /// gates each datagram passes, or for a preemption anywhere among them, and a
   /// driver stalling mid-drain would find a credit still live an unbounded time
-  /// after its window opened. [`SELF_SEND_TTL`] bounds FALSE suppression and that bound is real
+  /// after its window opened. [`SELF_SEND_TTL`] bounds FALSE suppression in real
   /// time, so post-opportunity time is charged in full — see that constant.
-  /// Erring EARLY is still the safe direction within a live read, since
-  /// over-retention is cheap and losing a credit raises a phantom conflict
-  /// against ourselves.
   ///
   /// A credit [`Self::seal`] has not reached yet is live whatever the clock
   /// reads, and a driver honouring that seal's contract never presents one here:
   /// the seal sits between its records and this claim. The rule is stated rather
-  /// than assumed because the failure is silent — an unsealed credit that did
-  /// arrive would be retained (cheap) rather than expiring one that never had a
-  /// claim opportunity (a phantom self-conflict) — and because "cheap" is not
+  /// than assumed because the failure is silent, and because "cheap" is not
   /// "free": retention with no bound is the stale-credit suppression
   /// [`Self::has_unsealed`] exists to let a driver assert against.
   ///
@@ -1829,38 +1750,17 @@ impl SelfSendTracker {
   ///
   /// # Take-once is the CURRENT tier's rule, and only its
   ///
-  /// A current-generation credit is spent by the match that takes it, because a
-  /// byte-identical datagram from a conforming RFC 6762 §9 fault-tolerance twin
-  /// matches exactly the same way and must become visible from its second
-  /// datagram onwards. Spending is affordable there because a leaked copy is
-  /// harmless anyway: it asserts rdata this endpoint still publishes, which §9
+  /// A current-generation credit is spent by the match that takes it, so a
+  /// conforming RFC 6762 §9 fault-tolerance twin sending the same bytes becomes
+  /// visible from its second datagram onwards. Spending is affordable there
+  /// because a leaked copy asserts rdata this endpoint still publishes, which §9
   /// calls "never a conflict" and §8.2.1 ties on.
   ///
-  /// A SUPERSEDED credit is not spent. It is a **standing tombstone**: every
-  /// byte-identical copy inside [`SELF_SEND_TTL`] reports
-  /// [`SelfSendMatch::Superseded`] for as long as the credit lives, and nothing
-  /// about that claim removes it. Only expiry and the budgets do — see
-  /// [`Self::reclaim_expired_sealed`] and [`Self::admit`] — so the retention is
-  /// bounded by exactly the same two limits as before.
-  ///
-  /// **Only an ASSERTING credit can reach that tier.** A question's credit stays
-  /// take-once for its whole life however many times the generation advances,
-  /// because a question asserts nothing that a change to our own records could
-  /// retire — and a standing tombstone for one would suppress every
-  /// byte-identical peer retransmission rather than the single copy take-once
-  /// costs. See [`SendClass`].
-  ///
-  /// Take-once was applied here too, on the reasoning that total suppression of
-  /// bytes a peer could be replaying needs a bound. It does not: what those bytes
-  /// assert is a record set this endpoint HAS GIVEN UP, so suppressing every copy
-  /// can only mask an assertion no live route holds, or a byte-identical twin
-  /// still asserting our withdrawn records — a bounded detection delay in either
-  /// case. Meanwhile an attacker "denied" the replay never needed our bytes at
-  /// all: mDNS is unauthenticated, so it could forge the same assertion freely.
-  /// Spending bought nothing, and cost this: the copy that spent the credit left
-  /// the GENUINE echo behind it reading [`SelfSendMatch::NoCredit`], hence
-  /// `Provenance::NotFromUs`, hence a datagram carrying our own withdrawn records
-  /// written into our own cache.
+  /// A SUPERSEDED credit is not spent — a **standing tombstone**, answering every
+  /// byte-identical copy for as long as the credit lives, retired only by expiry
+  /// and the budgets ([`Self::reclaim_expired_sealed`], [`Self::admit`]). See
+  /// [`SelfSendMatch::Superseded`] for why take-once at that tier is the wrong
+  /// trade, and [`SendClass`] for why only an ASSERTING credit can reach it.
   ///
   /// # A CURRENT credit is preferred over a superseded one
   ///

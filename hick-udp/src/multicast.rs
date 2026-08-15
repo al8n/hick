@@ -306,7 +306,7 @@ impl RecvMeta {
   /// platform did not provide a timestamp (sockopt unavailable, cmsg absent or
   /// truncated, or a non-Unix target).
   ///
-  /// **A DIAGNOSTIC, and no longer a self-send input.** This value orders a
+  /// **A DIAGNOSTIC, not a self-send input.** This value orders a
   /// datagram against a send only while it is still attached to the datagram it
   /// was stamped for, and a `SystemTime` read out of here is attached to nothing:
   /// [`RecvMeta`] is [`Copy`], so a stamp lifted from one receive can be laid
@@ -541,7 +541,7 @@ pub fn try_bind_v6(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
 /// It is not in their class, on either half of their argument. Its payload is a
 /// 4-byte `struct in_addr` in both directions with no per-target narrowing, so
 /// there is no width to get wrong and no big-endian case to guard; and the
-/// historical silent-unset defect — a bind that quietly egressed the OS default
+/// silent-unset defect — a bind that quietly egresses the OS default
 /// interface — is already closed upstream of here by
 /// [`BindError::InterfaceNotFound`], which fires when the requested index
 /// resolves to no IPv4 address at all.
@@ -2122,8 +2122,8 @@ fn cmsg_advance(cmsg_len: usize, data_start: usize) -> Option<usize> {
 /// "address family not supported" on the two platform families this crate
 /// compiles for (`EAFNOSUPPORT` on Unix, `WSAEAFNOSUPPORT` on Windows). A
 /// skip arm that accepts anything wider than this can absorb the exact
-/// regressions these tests exist to catch — see `expect_bind_or_skip`'s doc
-/// for the finding that made this explicit. `ErrorKind::Uncategorized` /
+/// regressions these tests exist to catch — see `expect_bind_or_skip`'s doc.
+/// `ErrorKind::Uncategorized` /
 /// `InvalidInput` are deliberately NOT in this allowlist: broadening to
 /// either would re-admit `EINVAL`, the exact errno the whole branch this
 /// file belongs to exists to stop silently skipping.
