@@ -495,7 +495,6 @@ fn is_environmental(kind: std::io::ErrorKind) -> bool {
 fn bind_error_kind(e: &hick_udp::BindError) -> Option<std::io::ErrorKind> {
   match e {
     hick_udp::BindError::Io(io) => Some(io.kind()),
-    hick_udp::BindError::AddressInUse(_) => Some(std::io::ErrorKind::AddrInUse),
     hick_udp::BindError::InterfaceNotFound(_) => Some(std::io::ErrorKind::AddrNotAvailable),
     _ => None,
   }

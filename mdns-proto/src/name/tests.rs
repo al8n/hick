@@ -231,3 +231,100 @@ fn same_owner_ignores_the_optional_root_dot() {
   // …and a shorter name is not a prefix match.
   assert!(!dotted.same_owner(&Name::try_from_str("local.").unwrap()));
 }
+
+/// RFC 6763 §4.1: a Service Instance Name is
+/// `<Instance> . <Service> . <Domain>`, and §4.1.1 stores `<Instance>` as a
+/// SINGLE DNS label — so a service type is the parent of an instance only
+/// when the instance has EXACTLY one label more, never zero and never two
+/// or more.
+#[test]
+fn is_parent_of_requires_exactly_one_more_label() {
+  let service_type = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let instance = Name::try_from_str("MyPrinter._ipp._tcp.local.").unwrap();
+  assert!(service_type.is_parent_of(&instance));
+  // Not symmetric: the child is not the parent of its own parent.
+  assert!(!instance.is_parent_of(&service_type));
+  // A name is not its own parent (zero extra labels).
+  assert!(!service_type.is_parent_of(&service_type));
+  // Two extra labels is not "the parent label sequence" — RFC 6763 §4.1.1
+  // allows exactly one <Instance> label, not a multi-label prefix.
+  let two_extra = Name::try_from_str("a.b._ipp._tcp.local.").unwrap();
+  assert!(!service_type.is_parent_of(&two_extra));
+  // An unrelated name, even with the right label count, is not a match.
+  let unrelated = Name::try_from_str("MyPrinter._http._tcp.local.").unwrap();
+  assert!(!service_type.is_parent_of(&unrelated));
+}
+
+/// The RFC 6762 §16 case-insensitivity and the optional trailing root dot
+/// both apply to `is_parent_of` exactly as they do to [`Name::same_owner`] —
+/// a caller must not be able to register past this guard with a spelling
+/// that would collide with an already-accepted one on the wire.
+#[test]
+fn is_parent_of_ignores_case_and_the_optional_root_dot() {
+  let lower = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  let upper = Name::try_from_str("_IPP._TCP.LOCAL.").unwrap();
+  let instance = Name::try_from_str("MyPrinter._ipp._tcp.local.").unwrap();
+  let instance_no_dot = Name::try_from_str("MyPrinter._ipp._tcp.local").unwrap();
+
+  assert!(lower.is_parent_of(&instance));
+  // Case-folded at construction, so this only proves the comparison itself
+  // does not depend on that invariant (belt-and-braces, like `same_owner`).
+  assert!(upper.is_parent_of(&instance));
+  // A trailing root dot on either name, or neither, is the same owner.
+  assert!(lower.is_parent_of(&instance_no_dot));
+  let service_type_no_dot = Name::try_from_str("_ipp._tcp.local").unwrap();
+  assert!(service_type_no_dot.is_parent_of(&instance));
+  assert!(service_type_no_dot.is_parent_of(&instance_no_dot));
+}
+
+/// THE regression this predicate exists to fix: the DNS root genuinely is the
+/// immediate parent of any single-label name — dropping that name's one
+/// label leaves exactly the root. A naive `split_once('.') == None` read of
+/// "other has no more labels" must not collapse this case into "no parent
+/// exists" (see `nothing_is_the_parent_of_the_root`, which is the case that
+/// reasoning is actually correct for).
+#[test]
+fn root_is_the_parent_of_a_single_label_name() {
+  let root = Name::try_from_str("").unwrap();
+  let local = Name::try_from_str("local").unwrap();
+  assert!(root.is_parent_of(&local));
+  // The child's optional trailing dot does not change the answer.
+  let local_dot = Name::try_from_str("local.").unwrap();
+  assert!(root.is_parent_of(&local_dot));
+}
+
+/// The root has zero labels, so — exactly like every other name
+/// (`is_parent_of_requires_exactly_one_more_label`'s "a name is not its own
+/// parent") — it is not its own parent: there is no label to drop to get
+/// from the root back to the root.
+#[test]
+fn root_is_not_its_own_parent() {
+  let root = Name::try_from_str("").unwrap();
+  assert!(!root.is_parent_of(&root));
+}
+
+/// The root is the topmost owner: it has no label for any candidate parent
+/// to have stripped, so nothing is ITS parent — not the root itself, not a
+/// single-label name, not a multi-label one. `X.is_parent_of(root)` is
+/// `false` for every `X`.
+#[test]
+fn nothing_is_the_parent_of_the_root() {
+  let root = Name::try_from_str("").unwrap();
+  let single = Name::try_from_str("local").unwrap();
+  let multi = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  assert!(!root.is_parent_of(&root));
+  assert!(!single.is_parent_of(&root));
+  assert!(!multi.is_parent_of(&root));
+}
+
+/// Dropping a single-label `other`'s one label always leaves the root, so a
+/// NON-root single-label `self` can never be the parent — whether `self` and
+/// `other` are the same label or different ones. Only the root qualifies
+/// (`root_is_the_parent_of_a_single_label_name`).
+#[test]
+fn a_single_label_name_is_not_the_parent_of_another_single_label_name() {
+  let printer = Name::try_from_str("printer").unwrap();
+  let scanner = Name::try_from_str("scanner").unwrap();
+  assert!(!printer.is_parent_of(&scanner));
+  assert!(!printer.is_parent_of(&printer));
+}

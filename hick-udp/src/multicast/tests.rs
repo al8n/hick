@@ -2733,3 +2733,35 @@ fn multicast_if_v4_read_back_reports_a_drift_and_a_failed_read() {
      a line — and, as with a drift, is not worth failing the bind over"
   );
 }
+
+/// Regression test for the ONE state `try_bind_v6_inner` hard-fails on — the
+/// v6 twin of `try_bind_v4_errors_on_nonzero_index_with_no_ipv4_interface`
+/// (in `multicast.rs`'s `r4_f5_tests` module), pinning the guaranteed contract
+/// for an interface index that names nothing at all.
+///
+/// `u32::MAX` is reserved / unassignable — `getifs::interface_by_index`
+/// returns `Ok(None)` for it — so the look-up reports `NoSuchInterface` and
+/// `check_egress_interface_v6` returns `BindError::InterfaceNotFound` before
+/// `platform::bind_v6` is ever reached. Before that check existed, this same
+/// call instead reached the kernel's own `IPV6_MULTICAST_IF` validation, which
+/// rejects it too — but as a bare `BindError::Io` no caller could distinguish
+/// from an unrelated I/O error.
+///
+/// This state is the whole of the guarantee. An interface that EXISTS and
+/// reports no IPv6 address is warned and the bind proceeds, as is a look-up
+/// that failed; both are decided over values in
+/// `interface_lookup_decision_tests`, because no CI host can be made to
+/// present either one.
+#[test]
+fn try_bind_v6_errors_on_nonzero_index_with_no_ipv6_interface() {
+  let opts = MulticastOptionsV6::new(u32::MAX);
+  let result = try_bind_v6(opts);
+  assert!(
+    result.is_err(),
+    "expected error when interface has no IPv6 address"
+  );
+  assert!(
+    result.unwrap_err().is_interface_not_found(),
+    "expected InterfaceNotFound variant"
+  );
+}

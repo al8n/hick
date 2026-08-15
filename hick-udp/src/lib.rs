@@ -23,7 +23,7 @@ pub mod error;
 mod family;
 
 pub use error::{
-  AddressInUseDetail, BindError, BufferTooShortDetail, InterfaceNotFoundDetail, JoinError,
+  BindError, BufferTooShortDetail, InterfaceNotFoundDetail, JoinError,
   MulticastHopsNotAppliedDetail, MulticastLoopNotAppliedDetail, MulticastTtlNotAppliedDetail,
   ParseRecvMetaError, RxDestinationNotEnabledDetail,
 };

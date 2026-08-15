@@ -1,6 +1,5 @@
 //! Error types for `hick-udp` operations.
 
-use core::net::IpAddr;
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
 /// Detail for [`BindError::InterfaceNotFound`].
@@ -19,32 +18,6 @@ impl InterfaceNotFoundDetail {
   #[inline(always)]
   pub const fn index(&self) -> u32 {
     self.index
-  }
-}
-
-/// Detail for [`BindError::AddressInUse`].
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Display, thiserror::Error)]
-#[display("address {addr} already in use on interface {iface}")]
-pub struct AddressInUseDetail {
-  addr: IpAddr,
-  iface: u32,
-}
-impl AddressInUseDetail {
-  /// Build a new detail payload.
-  #[expect(dead_code, reason = "used by socket-bind helpers not yet wired in")]
-  #[inline(always)]
-  pub(crate) const fn new(addr: IpAddr, iface: u32) -> Self {
-    Self { addr, iface }
-  }
-  /// The address that was already in use.
-  #[inline(always)]
-  pub const fn addr(&self) -> IpAddr {
-    self.addr
-  }
-  /// The interface index involved.
-  #[inline(always)]
-  pub const fn iface(&self) -> u32 {
-    self.iface
   }
 }
 
@@ -228,13 +201,20 @@ impl BufferTooShortDetail {
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum BindError {
-  /// The requested interface was not found.
+  /// The requested interface was not found, or — on the IPv4 path — was found
+  /// and resolves no usable IPv4 address.
+  ///
+  /// Those two share a variant because the IPv4 bind cannot proceed from
+  /// either: the resolved address is the `IP_MULTICAST_IF` payload. The IPv6
+  /// bind raises this ONLY for an index that names no interface; an interface
+  /// that reports no IPv6 address is logged and the bind proceeds, because
+  /// `IPV6_MULTICAST_IF` takes the index and never needs the address.
+  ///
+  /// Neither path raises it for a look-up that FAILED. That is
+  /// [`BindError::Io`] carrying the platform's own kind, because a failed
+  /// address enumeration establishes nothing about the interface.
   #[error(transparent)]
   InterfaceNotFound(InterfaceNotFoundDetail),
-
-  /// The address was already in use on the chosen interface.
-  #[error(transparent)]
-  AddressInUse(AddressInUseDetail),
 
   /// The kernel accepted the `IPV6_MULTICAST_HOPS` `setsockopt` call, but a
   /// read-back shows it did not actually apply the requested value.
@@ -324,7 +304,10 @@ pub enum BindError {
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum JoinError {
-  /// The requested interface was not found.
+  /// The requested interface was not found, or was found and resolves no
+  /// usable IPv4 address — with none there is no membership to add. A look-up
+  /// that FAILED is [`JoinError::Io`] instead, for the reason on
+  /// [`BindError::InterfaceNotFound`].
   #[error(transparent)]
   InterfaceNotFound(InterfaceNotFoundDetail),
 

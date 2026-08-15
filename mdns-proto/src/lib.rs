@@ -86,7 +86,9 @@ pub use error::{
 };
 
 cfg_heap! {
-  pub use error::{CancelQueryError, HandleServiceRenamedError, RegisterServiceError};
+  pub use error::{
+    CancelQueryError, HandleServiceRenamedError, RegisterServiceError, ServiceTypeNotParentDetail,
+  };
 }
 
 /// mDNS wire format — panic-free parser and encoder.

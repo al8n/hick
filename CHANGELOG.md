@@ -466,7 +466,73 @@ OTHER
   risk bricking the IPv4 bind on a conforming host with no way to find out
   first. The historical silent-unset defect this guards against is already
   closed upstream by the pre-existing `BindError::InterfaceNotFound`, which
-  fires when the requested interface index resolves to no IPv4 address at all.
+  fires when the requested interface index names no interface or carries no
+  IPv4 address at all (and by `BindError::Io` when that look-up itself failed —
+  see below).
+
+## A bind that cannot honour the interface it was given now says so
+
+- `hick-udp`: **BREAKING** — `BindError::AddressInUse` and its
+  `AddressInUseDetail` are removed, and `AddressInUseDetail` is no longer
+  re-exported from the crate root. Nothing ever constructed the variant: an
+  address-in-use failure has always surfaced as `BindError::Io`, so a caller
+  matching on `AddressInUse` was matching a branch the library could not
+  produce. `BindError` is `#[non_exhaustive]`, but that permits *adding*
+  variants rather than removing one, so this can only happen in a major
+  release — hence now. A caller that matched it should match `BindError::Io`
+  and inspect `ErrorKind::AddrInUse`, which is what the four bundled drivers'
+  test helpers already did alongside the dead arm.
+- `hick-udp`: `try_bind_v6` now resolves a non-zero interface index before it
+  binds, and answers each of the three things that look-up can report on its
+  own terms. An index that names **no interface** is rejected with the existing
+  `BindError::InterfaceNotFound`, as `try_bind_v4` has done for some time: the
+  kernel rejects it too, but as a bare `BindError::Io` no caller can tell from
+  any other I/O error. An interface that reports **no IPv6 address**, and a
+  look-up that **failed**, are logged and the bind proceeds. That is not a
+  softer reading of how much those two matter — `IPV6_MULTICAST_IF` takes the
+  interface INDEX, so the address resolved here is evidence and never a
+  payload, nothing the bind does needs it, and a refusal on it would be bought
+  with no decision. Neither state is a reliable negative either: an addressless
+  interface is an IPv4-only NIC *or* one whose RA/SLAAC address has not landed
+  yet, and `getifs` returns `EINTR` by design when an address dump is
+  interrupted by DHCP, a VPN coming up or interface churn. Link-local-only
+  interfaces are unaffected and still bind silently: the "reports any IPv6
+  address" predicate includes `fe80::/10`.
+- `hick-udp`: `try_bind_v4` and `try_join_v4` now report an interface look-up
+  that **failed** as `BindError::Io` / `JoinError::Io`, carrying the platform's
+  own error kind plus the index and family, instead of `InterfaceNotFound`.
+  Both still fail on an index that names no interface and on one carrying no
+  IPv4 address — there the resolved address is the `IP_MULTICAST_IF` payload,
+  and each address is its own `IP_ADD_MEMBERSHIP`, so neither can proceed
+  without one — but an enumeration that could not be read establishes nothing
+  about the interface, and calling it "not found" sent a caller auditing an
+  interface nobody managed to read. `try_join_v4` runs at endpoint construction
+  in all three drivers that depend on this crate, where it surfaces as
+  `ServerError::BindV4`. No new public API in any of this: every error variant
+  and detail type used here already existed.
+- `mdns-proto`: `Endpoint::try_register_service` now rejects a `ServiceSpec`
+  whose `service_type` is not the immediate parent of its instance name,
+  with the new `RegisterServiceError::ServiceTypeNotParent` carrying both
+  names. `RegisterServiceError` is `#[non_exhaustive]`, so the variant is
+  additive. `ServiceRecords::new` has always documented the requirement —
+  "It must be the parent label sequence of `instance`" — and, being an
+  infallible constructor, could not enforce it; an unrelated pair published a
+  PTR whose owner the instance's SRV did not belong to, which is internally
+  inconsistent on the wire. Registration is where it is now caught, beside the
+  existing TTL check, before the name is reserved. The comparison is a DNS
+  owner comparison, not a string suffix test: a service type differing from
+  the instance's suffix only in case or in the optional trailing root dot is
+  **accepted**. RFC 6763 §4.1.1 stores `<Instance>` as a single DNS label, so
+  exactly one extra label is required — `a.b._ipp._tcp.local.` is not a valid
+  instance of `_ipp._tcp.local.` even though the type names a real suffix of
+  it. New public `ServiceTypeNotParentDetail`. `service_type` being the DNS
+  root (the empty name) is rejected separately, as new
+  `RegisterServiceError::ServiceTypeIsRoot` carrying the instance name: RFC
+  6763 §4.1.2 defines `<Service>` as exactly two labels, so the root can never
+  be valid, even though the owner comparison above genuinely treats the root
+  as the immediate parent of any single-label instance and so would otherwise
+  accept it. Only the root is rejected here; the full two-label `<Service>`
+  rule is not otherwise enforced.
 
 # RELEASED
 

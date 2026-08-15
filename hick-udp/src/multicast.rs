@@ -16,18 +16,249 @@ use crate::{
 use crate::error::ParseRecvMetaError;
 use crate::platform;
 
-/// Look up the first IPv4 address assigned to the interface with the given
-/// OS index. Returns `None` if the interface cannot be found or carries no
-/// IPv4 address (e.g. IPv6-only or the lookup failed).
+/// What a look-up of one interface's addresses actually observed: the three
+/// states `getifs` can report, where a single `Option` used to stand for all of
+/// them.
 ///
-/// Used by `try_bind_v4` to set `IP_MULTICAST_IF` to a single address; for
-/// the multicast-join path that needs every IPv4 address of the interface,
-/// see `try_join_v4`.
-fn ipv4_addr_for_index(idx: u32) -> Option<Ipv4Addr> {
-  let iface = getifs::interface_by_index(idx).ok().flatten()?;
-  let v4s = iface.ipv4_addrs().ok()?;
-  v4s.first().map(|a| a.addr())
+/// They are not interchangeable, and the three resolution sites below do not
+/// treat them alike:
+///
+/// * [`NoSuchInterface`](InterfaceLookup::NoSuchInterface) is the one
+///   deterministic negative. The index names nothing and no later moment
+///   changes that;
+/// * [`LookupFailed`](InterfaceLookup::LookupFailed) is not evidence about the
+///   interface at all. `getifs` returns `EINTR` by design when an address dump
+///   is interrupted, which DHCP, a VPN coming up or any interface churn can do
+///   at any time;
+/// * [`Addressless`](InterfaceLookup::Addressless) is ambiguous. An IPv4-only
+///   NIC reports exactly what a NIC whose RA/SLAAC address has not arrived yet
+///   reports, and only one of those two is permanent.
+///
+/// Collapsing them into one `None` — what this replaced — made a failed
+/// enumeration and an addressless interface arrive at every caller as "that
+/// interface does not exist", which is a claim neither one supports.
+#[derive(Debug)]
+enum InterfaceLookup<T> {
+  /// The interface exists and reports at least one address of the family asked
+  /// for; the payload is whatever the caller needed out of that list.
+  Found(T),
+  /// The interface exists and currently reports no address of that family.
+  Addressless,
+  /// The index names no interface.
+  NoSuchInterface,
+  /// The look-up itself failed, so it establishes nothing about the interface.
+  LookupFailed(std::io::Error),
 }
+
+/// Resolve `idx` and hand the interface to `select`, keeping the three states
+/// of [`InterfaceLookup`] distinct across both fallible `getifs` calls.
+///
+/// `select` returns `None` for a family with no addresses, which becomes
+/// [`InterfaceLookup::Addressless`]: every caller here wants an empty list read
+/// as an absence rather than as a payload it then has to re-check.
+fn lookup_interface<T>(
+  idx: u32,
+  select: impl FnOnce(&getifs::Interface) -> std::io::Result<Option<T>>,
+) -> InterfaceLookup<T> {
+  match getifs::interface_by_index(idx) {
+    Ok(Some(iface)) => match select(&iface) {
+      Ok(Some(found)) => InterfaceLookup::Found(found),
+      Ok(None) => InterfaceLookup::Addressless,
+      Err(e) => InterfaceLookup::LookupFailed(e),
+    },
+    Ok(None) => InterfaceLookup::NoSuchInterface,
+    Err(e) => InterfaceLookup::LookupFailed(e),
+  }
+}
+
+/// Name the interface and the family a failed look-up could not read, on top of
+/// the kind the platform reported, because "interrupted system call" alone
+/// names neither. The same shape `hick-mio`'s `has_addr_in` gives its own
+/// enumeration failures.
+///
+/// "Looking up" rather than "reading" because either `getifs` call can land
+/// here: the one that resolves the index, and the one that reads the addresses.
+fn interface_lookup_error(index: u32, family: &str, e: std::io::Error) -> std::io::Error {
+  std::io::Error::new(
+    e.kind(),
+    format!("looking up the {family} addresses of interface {index}: {e}"),
+  )
+}
+
+/// Look up the first IPv4 address assigned to the interface with the given OS
+/// index, for `try_bind_v4`'s `IP_MULTICAST_IF`.
+///
+/// For the join path, which needs every IPv4 address of the interface, see
+/// [`ipv4_addrs_for_index`]; for the IPv6 sibling, [`ipv6_addr_for_index`].
+fn ipv4_addr_for_index(idx: u32) -> InterfaceLookup<Ipv4Addr> {
+  lookup_interface(idx, |iface| {
+    iface
+      .ipv4_addrs()
+      .map(|addrs| addrs.first().map(|net| net.addr()))
+  })
+}
+
+/// Look up every IPv4 address assigned to the interface with the given OS
+/// index, for `try_join_v4`, which joins the group on each of them.
+fn ipv4_addrs_for_index(idx: u32) -> InterfaceLookup<Vec<Ipv4Addr>> {
+  lookup_interface(idx, |iface| {
+    iface.ipv4_addrs().map(|addrs| {
+      let addrs: Vec<Ipv4Addr> = addrs.iter().map(|net| net.addr()).collect();
+      (!addrs.is_empty()).then_some(addrs)
+    })
+  })
+}
+
+/// Look up the first IPv6 address assigned to the interface with the given OS
+/// index.
+///
+/// Unlike [`ipv4_addr_for_index`] the address is never handed to the kernel —
+/// `IPV6_MULTICAST_IF` takes the index — so this is evidence about the
+/// interface and nothing else. See [`check_egress_interface_v6`] for what
+/// `try_bind_v6` does with it.
+fn ipv6_addr_for_index(idx: u32) -> InterfaceLookup<Ipv6Addr> {
+  lookup_interface(idx, |iface| {
+    iface
+      .ipv6_addrs()
+      .map(|addrs| addrs.first().map(|net| net.addr()))
+  })
+}
+
+/// Decide what `try_bind_v4` does with the interface it was asked to egress on:
+/// every state that yields no address stops the bind.
+///
+/// That is a mechanical limit and not a judgement about the three states. The
+/// resolved address is the `IP_MULTICAST_IF` payload —
+/// `crate::platform::unix::bind_v4` calls
+/// `sockopt::set_ip_multicast_if(&fd, &ip)`, which cannot be issued at all
+/// without one — so with no address there is nothing to proceed to. The v6 twin
+/// observes the same three states and proceeds on two of them, because there
+/// the address is never sent; see [`check_egress_interface_v6`].
+///
+/// Which error each state becomes still follows the evidence:
+///
+/// * [`InterfaceLookup::NoSuchInterface`] and [`InterfaceLookup::Addressless`]
+///   both give [`BindError::InterfaceNotFound`], this crate's long-standing
+///   answer for an index that names no usable IPv4 address;
+/// * [`InterfaceLookup::LookupFailed`] gives [`BindError::Io`] carrying the
+///   platform's own kind plus the index and family. A failed enumeration is not
+///   a statement about the interface, and reporting it as `InterfaceNotFound`
+///   would send a caller auditing an interface nobody managed to read.
+fn require_multicast_if_v4(
+  index: u32,
+  observed: InterfaceLookup<Ipv4Addr>,
+) -> Result<Ipv4Addr, BindError> {
+  match observed {
+    InterfaceLookup::Found(addr) => Ok(addr),
+    InterfaceLookup::Addressless | InterfaceLookup::NoSuchInterface => Err(
+      BindError::InterfaceNotFound(crate::error::InterfaceNotFoundDetail::new(index)),
+    ),
+    InterfaceLookup::LookupFailed(e) => {
+      Err(BindError::Io(interface_lookup_error(index, "IPv4", e)))
+    }
+  }
+}
+
+/// Decide what `try_join_v4` does with the interface it was asked to join on.
+///
+/// The same split as [`require_multicast_if_v4`], for the same mechanical
+/// reason: every address in the list is its own `IP_ADD_MEMBERSHIP` call, so
+/// with none there is no join to perform. Only the error type differs.
+fn require_join_addrs_v4(
+  index: u32,
+  observed: InterfaceLookup<Vec<Ipv4Addr>>,
+) -> Result<Vec<Ipv4Addr>, JoinError> {
+  match observed {
+    InterfaceLookup::Found(addrs) => Ok(addrs),
+    InterfaceLookup::Addressless | InterfaceLookup::NoSuchInterface => Err(
+      JoinError::InterfaceNotFound(crate::error::InterfaceNotFoundDetail::new(index)),
+    ),
+    InterfaceLookup::LookupFailed(e) => {
+      Err(JoinError::Io(interface_lookup_error(index, "IPv4", e)))
+    }
+  }
+}
+
+/// What the pre-bind look-up of `try_bind_v6`'s egress interface established.
+#[derive(Debug)]
+enum EgressInterfaceV6 {
+  /// The interface reports an IPv6 address. Nothing to report.
+  Confirmed,
+  /// The look-up failed, so nothing was established either way. Warned.
+  Unconfirmed,
+  /// The interface exists and reports no IPv6 address. Warned.
+  Addressless,
+}
+
+/// Decide what `try_bind_v6` does with the interface it was asked to egress on:
+/// fail on the one deterministic negative, report the other two.
+///
+/// Where [`require_multicast_if_v4`] fails on all three, the difference is
+/// mechanical rather than a ranking of how bad each state is. For v6 the
+/// address is EVIDENCE and never a payload — `crate::platform::unix::bind_v6`
+/// sets `IPV6_MULTICAST_IF` from the index, `set_ipv6_multicast_if(&fd, index)`
+/// — so its absence prevents nothing, and a bind refused on it would be a
+/// refusal bought with no decision.
+///
+/// * [`InterfaceLookup::NoSuchInterface`] gives
+///   [`BindError::InterfaceNotFound`]. The index names nothing, no later moment
+///   changes that, and the kernel's own rejection arrives as a bare `EINVAL` a
+///   caller cannot tell from any other I/O error;
+/// * [`InterfaceLookup::LookupFailed`] warns and the bind proceeds. `getifs`
+///   returns `EINTR` by design when an address dump is interrupted by DHCP, a
+///   VPN coming up or interface churn, so it is a fact about the enumeration
+///   rather than about the interface;
+/// * [`InterfaceLookup::Addressless`] warns and the bind proceeds. The two
+///   readings need opposite responses and nothing here can separate them:
+///   permanent on an IPv4-only NIC, where IPv6 traffic can never leave, and
+///   transient at boot or after a carrier bounce, where failing would refuse a
+///   bind that works seconds later.
+///
+/// Reported through [`hick_trace::warn`] rather than a new `BindError` variant.
+/// `BindError` is `#[non_exhaustive]`, so a variant would be legal, but no
+/// caller today makes a decision that needs one. This is the category
+/// `warn_if_multicast_if_v4_drifted` established: fail where the crate cannot
+/// proceed or the negative is deterministic, report where the evidence is
+/// ambiguous or advisory.
+fn check_egress_interface_v6(
+  index: u32,
+  observed: InterfaceLookup<Ipv6Addr>,
+) -> Result<EgressInterfaceV6, BindError> {
+  match observed {
+    InterfaceLookup::Found(_) => Ok(EgressInterfaceV6::Confirmed),
+    InterfaceLookup::NoSuchInterface => Err(BindError::InterfaceNotFound(
+      crate::error::InterfaceNotFoundDetail::new(index),
+    )),
+    InterfaceLookup::LookupFailed(_e) => {
+      hick_trace::warn!(
+        interface_index = index,
+        family = "IPv6",
+        error = %_e,
+        error_kind = ?_e.kind(),
+        "could not read the requested egress interface's IPv6 addresses; the bind proceeds \
+         unconfirmed, because IPV6_MULTICAST_IF takes the index and an interrupted enumeration \
+         says nothing about the interface"
+      );
+      Ok(EgressInterfaceV6::Unconfirmed)
+    }
+    InterfaceLookup::Addressless => {
+      hick_trace::warn!(
+        interface_index = index,
+        family = "IPv6",
+        "the requested egress interface currently reports no IPv6 address; the bind proceeds. \
+         Transient at boot or after a carrier bounce, but permanent on an IPv4-only NIC, where \
+         IPv6 traffic can never leave this interface"
+      );
+      Ok(EgressInterfaceV6::Addressless)
+    }
+  }
+}
+
+// The decisions above are tested over VALUES rather than over a live socket —
+// see the module for why, and note that it is not `#[cfg(unix)]` the way
+// `multicast::tests` is: nothing in the classifier is Unix-only.
+#[cfg(test)]
+mod interface_lookup_decision_tests;
 
 /// Options for binding an IPv4 mDNS multicast socket.
 #[derive(Debug, Clone)]
@@ -406,16 +637,19 @@ pub fn try_bind_v4(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
 
 fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
   // Resolve the requested egress interface (if any) to an IPv4 address for
-  // IP_MULTICAST_IF; a non-zero index that doesn't resolve is a hard error.
+  // IP_MULTICAST_IF. Every state that yields no address is a hard error here,
+  // and the reason is mechanical: the address IS the `setsockopt` payload —
+  // `sockopt::set_ip_multicast_if(&fd, &ip)` in `platform::unix::bind_v4` — so
+  // there is nothing to proceed to without it. `try_bind_v6_inner` observes the
+  // same three states and proceeds on two, because `IPV6_MULTICAST_IF` takes
+  // the interface index and never needs this address. See
+  // `require_multicast_if_v4` for which error each state becomes, and
+  // `check_egress_interface_v6` for the other half of the split.
   let multicast_if = if opts.interface_index() != 0 {
-    match ipv4_addr_for_index(opts.interface_index()) {
-      Some(ip) => Some(ip),
-      None => {
-        return Err(BindError::InterfaceNotFound(
-          crate::error::InterfaceNotFoundDetail::new(opts.interface_index()),
-        ));
-      }
-    }
+    Some(require_multicast_if_v4(
+      opts.interface_index(),
+      ipv4_addr_for_index(opts.interface_index()),
+    )?)
   } else {
     None
   };
@@ -850,6 +1084,31 @@ thread_local! {
 }
 
 fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
+  // Resolve the requested egress interface (if any) before committing to it.
+  // Only ONE of the three things that look-up can report fails the bind: an
+  // index that names no interface, which is the deterministic negative and
+  // which `platform::bind_v6` would otherwise surface as a bare `BindError::Io`
+  // no caller can tell from any other I/O error. A failed enumeration and an
+  // interface that reports no IPv6 address are warned and the bind proceeds.
+  //
+  // That is narrower than the check `try_bind_v4_inner` runs above, and the
+  // difference is mechanical rather than a claim that these states matter less
+  // here. `platform::bind_v6` sets `IPV6_MULTICAST_IF` from the INDEX —
+  // `sockopt::set_ipv6_multicast_if(&fd, index)` — so the address resolved here
+  // is evidence and never a payload: nothing downstream reads it, nothing is
+  // prevented by its absence, and a bind refused on it would be a refusal
+  // bought with no decision. `try_bind_v4_inner` hands the resolved address
+  // itself to `IP_MULTICAST_IF` and genuinely cannot proceed without one.
+  //
+  // See `check_egress_interface_v6` for what each state is worth as evidence,
+  // and for why reporting is the right category for the two ambiguous ones —
+  // the same category `warn_if_multicast_if_v4_drifted` sits in.
+  if opts.interface_index() != 0 {
+    check_egress_interface_v6(
+      opts.interface_index(),
+      ipv6_addr_for_index(opts.interface_index()),
+    )?;
+  }
   // Create + bind the socket. IPV6_V6ONLY is set before bind so a `[::]:5353`
   // socket doesn't also accept IPv4 (as v4-mapped) and collide with the separate
   // IPv4 socket bound to `0.0.0.0:5353` on dual-stack-default systems (e.g. Linux
@@ -907,7 +1166,9 @@ fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
 /// Looks up the interface's IPv4 addresses via `getifs::interface_by_index`
 /// and joins the multicast group on every one of them.  Returns
 /// `JoinError::InterfaceNotFound` if the index does not resolve to an
-/// interface or the interface carries no IPv4 addresses.
+/// interface or the interface carries no IPv4 addresses, and `JoinError::Io`
+/// if the look-up itself failed — a failed enumeration is not a statement that
+/// the interface is missing. See `require_join_addrs_v4`.
 pub fn try_join_v4(sock: &UdpSocket, interface_index: u32) -> Result<(), JoinError> {
   try_join_v4_inner(sock, interface_index).inspect_err(|_e| {
     hick_trace::warn!(error = %_e, interface_index, "try_join_v4 failed");
@@ -915,22 +1176,15 @@ pub fn try_join_v4(sock: &UdpSocket, interface_index: u32) -> Result<(), JoinErr
 }
 
 fn try_join_v4_inner(sock: &UdpSocket, interface_index: u32) -> Result<(), JoinError> {
-  let iface = match getifs::interface_by_index(interface_index) {
-    Ok(Some(i)) => i,
-    _ => {
-      return Err(JoinError::InterfaceNotFound(
-        crate::error::InterfaceNotFoundDetail::new(interface_index),
-      ));
-    }
-  };
-  let v4_addrs = iface.ipv4_addrs().map_err(JoinError::Io)?;
-  if v4_addrs.is_empty() {
-    return Err(JoinError::InterfaceNotFound(
-      crate::error::InterfaceNotFoundDetail::new(interface_index),
-    ));
-  }
-  for ifv4 in v4_addrs.iter() {
-    sock.join_multicast_v4(&MDNS_IPV4_GROUP, &ifv4.addr())?;
+  // A missing interface and an addressless one are both `InterfaceNotFound`
+  // here, unchanged: with no address there is no `IP_ADD_MEMBERSHIP` to issue.
+  // A look-up that FAILED is neither of those and is now `JoinError::Io` — this
+  // runs at endpoint construction in all three drivers, where it reaches the
+  // caller as `ServerError::BindV4`, so an interrupted address dump used to
+  // report a missing interface to whoever had to act on it.
+  let v4_addrs = require_join_addrs_v4(interface_index, ipv4_addrs_for_index(interface_index))?;
+  for addr in v4_addrs.iter() {
+    sock.join_multicast_v4(&MDNS_IPV4_GROUP, addr)?;
   }
   Ok(())
 }

@@ -195,6 +195,58 @@ impl Name {
     }
     trim(self.as_str()).eq_ignore_ascii_case(trim(other.as_str()))
   }
+
+  /// Is `self` the immediate PARENT label sequence of `other` — does `other`
+  /// consist of exactly one label followed by `self`?
+  ///
+  /// This is RFC 6763 §4.1's Service Instance Name structure,
+  /// `<Instance> . <Service> . <Domain>`: §4.1.1 stores `<Instance>` "directly
+  /// in the DNS as a single DNS label", so a well-formed instance name always
+  /// has EXACTLY one label more than its `<Service>.<Domain>` service type —
+  /// never zero (that would make them the same owner) and never two or more
+  /// (that would need a multi-label `<Instance>`, which §4.1.1 does not
+  /// allow). `self.is_parent_of(other)` asks exactly that: drop `other`'s
+  /// first label, and ask whether what remains is the same owner as `self`.
+  ///
+  /// The DNS ROOT — the empty [`Name`] — is the one owner with no label to
+  /// drop. It can never itself be a valid CHILD: `X.is_parent_of(root)` is
+  /// `false` for every `X`, including `root`, because there is no label to
+  /// strip and so no shorter owner to compare against `X`. But the root
+  /// genuinely IS the immediate parent of every SINGLE-label name — dropping
+  /// that name's one label leaves exactly the root — so
+  /// `root.is_parent_of(single_label)` is `true`. An empty `other` and a
+  /// single-label `other` both leave no dot after trimming, but only the
+  /// former has no label to drop; the two must not be conflated.
+  ///
+  /// Case-insensitive per label and blind to the optional trailing root dot on
+  /// either side, extending [`Self::same_owner`]'s rule from whole-name
+  /// equality to this one-label-shorter suffix relation rather than
+  /// duplicating it.
+  ///
+  /// `pub(crate)`: a single-purpose structural check for
+  /// [`Endpoint::try_register_service`](crate::endpoint::Endpoint::try_register_service),
+  /// not a general-purpose DNS predicate — it has exactly one caller, and this
+  /// crate keeps public surface to demonstrated need.
+  pub(crate) fn is_parent_of(&self, other: &Self) -> bool {
+    fn trim(s: &str) -> &str {
+      match s.strip_suffix('.') {
+        Some(rest) => rest,
+        None => s,
+      }
+    }
+    let other_trimmed = trim(other.as_str());
+    match other_trimmed.split_once('.') {
+      // `rest` is everything after `other`'s first label — for `self` to be
+      // the immediate parent, that must be exactly `self`.
+      Some((_first_label, rest)) => trim(self.as_str()).eq_ignore_ascii_case(rest),
+      // `other` has at most one label left after trimming its optional
+      // trailing dot. An EMPTY `other` is the root itself: it has no label to
+      // drop, so nothing is its parent. A NON-EMPTY `other` is exactly one
+      // label, and dropping it leaves the root — so `self` qualifies only
+      // when `self` IS the root.
+      None => !other_trimmed.is_empty() && trim(self.as_str()).is_empty(),
+    }
+  }
 }
 
 impl core::fmt::Display for Name {
