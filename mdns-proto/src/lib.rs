@@ -148,7 +148,7 @@ cfg_heap! {
   /// Endpoint orchestrator.
   pub mod endpoint;
   pub use endpoint::{
-    Endpoint, EndpointEventEntry, FamilyDebt, RouteEvents, ServiceRoute, WithdrawalToken,
-    WithdrawalTransmit,
+    Endpoint, EndpointEventEntry, FamilyDebt, Provenance, Received, RouteEvents, ServiceRoute,
+    WithdrawalToken, WithdrawalTransmit,
   };
 }

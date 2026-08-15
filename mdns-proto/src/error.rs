@@ -282,6 +282,24 @@ cfg_heap! {
     #[error("service `{0}` already registered")]
     NameAlreadyRegistered(crate::Name),
 
+    /// Another live service publishes this HOST name with a DIFFERENT A/AAAA
+    /// set. Carries the host name.
+    ///
+    /// Sharing a host name across services is supported and normal — it is how
+    /// several services on one machine advertise one set of addresses. Sharing
+    /// it while DISAGREEING about the addresses is not: the two publish
+    /// contradictory A/AAAA for one name, and each reads the other's
+    /// announcement as a host claiming its own host name with rdata it does not
+    /// hold. RFC 6762 §9 makes that a conflict, and there is no auto-rename for
+    /// a host name, so it surfaces as a TERMINAL
+    /// [`ServiceUpdate::HostConflict`](crate::event::ServiceUpdate::HostConflict)
+    /// raised by a sibling on this same machine.
+    ///
+    /// Register the services with one address set, or give them different host
+    /// names.
+    #[error("host `{0}` is already published with a different address set")]
+    HostAddressesDiffer(crate::Name),
+
     /// The record TTL is below [`MIN_SERVICE_TTL_SECS`](crate::constants::MIN_SERVICE_TTL_SECS).
     ///
     /// A TTL of 0 is the RFC 6762 §10.1 goodbye encoding — it deletes the record
@@ -319,6 +337,21 @@ cfg_heap! {
     /// The new name is already registered to a different service.
     #[error("name `{0}` is already registered to a different service")]
     NameAlreadyRegistered(Name),
+
+    /// Applying the rename would leave this route sharing a HOST name with
+    /// another live route that publishes a different A/AAAA set. Carries the
+    /// host name. See
+    /// [`RegisterServiceError::HostAddressesDiffer`](crate::error::RegisterServiceError::HostAddressesDiffer).
+    ///
+    /// **Not reachable today, and deliberately kept.** A rename replaces a
+    /// route's INSTANCE name and touches neither its host name nor its
+    /// addresses, so it cannot break an invariant registration already
+    /// established. The check is the invariant's second enforcement point rather
+    /// than dead weight: it becomes reachable the moment a rename is allowed to
+    /// carry new records, which is exactly the change that would otherwise
+    /// re-open the terminal-`HostConflict`-on-every-sibling-echo path silently.
+    #[error("host `{0}` is already published with a different address set")]
+    HostAddressesDiffer(Name),
 
     /// The handle does not refer to a registered service.
     #[error("service handle {0} not found")]

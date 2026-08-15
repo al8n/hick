@@ -59,7 +59,7 @@ where
   }
 
   /// Process an incoming datagram. Returns an iterator over routing
-  /// decisions; the iterator borrows from `data` and from `self`.
+  /// decisions; the iterator borrows from `rx`'s payload and from `self`.
   ///
   /// # Contract
   ///
@@ -88,45 +88,39 @@ where
   /// admitted past the window EVICTS one collected inside it. Read the clock per
   /// datagram, adjacent to this call.
   ///
-  /// `local_ip` is the address of the interface that received the datagram
-  /// (as reported by IP_PKTINFO / IPV6_PKTINFO on Unix).  When the packet's
-  /// source IP equals `local_ip` the datagram is treated as a self-originated
-  /// multicast loopback: cache population and event routing are both
-  /// suppressed so we do not interpret our own probes/announcements as peer
-  /// conflicts, KAS hints, or query answers.
+  /// `rx` carries the datagram itself together with what the caller can say
+  /// about it — its source, its [`Provenance`], and optionally the receiving
+  /// interface and that interface's own address. See [`Received`] for why the
+  /// bytes and their provenance arrive as one value.
   ///
-  /// `interface_index` is the receiving interface index (typically
-  /// `if_nametoindex(3)` / PKTINFO `ipi_ifindex` / `ipi6_ifindex`).  It
-  /// disambiguates IPv6 link-local self-loopback on multi-homed hosts:
-  /// a peer reusing the same `fe80::*` on a different interface
-  /// must NOT be classified as self.  Pass `0` if the receiving interface
-  /// is unknown — link-local self-loopback detection then degrades
-  /// gracefully (matches only AAAA entries registered with
-  /// [`ServiceRecords::add_aaaa`] or [`add_aaaa_scoped`] with scope `0`).
-  ///
-  /// `caller_is_self` is the AUTHORITATIVE self-loopback signal:
-  /// pass `true` when the I/O layer has determined — by content-matching
-  /// the datagram against a recent outgoing packet, ordered by the kernel
-  /// receive timestamp — that this is our OWN multicast loopback. When
-  /// `true`, all side effects are suppressed (no peer-conflict, KAS, cache
-  /// writes, or query answers). Callers that cannot make that
-  /// determination (sync / single-process responders) pass `false` and may
-  /// instead opt into the coarser advertised-source fallback via
+  /// [`Received::with_local_ip`] is TRACE-ONLY, and the name is the only reason
+  /// it looks like a self signal. A source IP equal to it suppresses nothing:
+  /// PKTINFO's local receive address is host/interface level, so every same-host
+  /// mDNS sender egresses from the same interface IP, and treating `src ==
+  /// local_ip` as self would suppress legitimate co-resident peers and hide
+  /// same-host name conflicts. The self question is answered by
+  /// [`Received::provenance`], and — for callers that keep no send log — by the
+  /// interface-scoped advertised-source guess behind
   /// [`EndpointConfig::with_trust_advertised_src_as_self`].
   ///
-  /// [`add_aaaa_scoped`]: crate::records::ServiceRecords::add_aaaa_scoped
-  /// [`ServiceRecords::add_aaaa`]: crate::records::ServiceRecords::add_aaaa
   /// [`EndpointConfig::with_trust_advertised_src_as_self`]: crate::EndpointConfig::with_trust_advertised_src_as_self
   #[allow(clippy::type_complexity)]
   pub fn handle<'a, 'e>(
     &'e mut self,
     now: I,
-    src: SocketAddr,
-    local_ip: IpAddr,
-    interface_index: u32,
-    data: &'a [u8],
-    caller_is_self: bool,
+    rx: Received<'a>,
   ) -> Result<RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ>, HandleError> {
+    let Received {
+      src,
+      data,
+      provenance,
+      local_ip,
+      interface_index,
+    } = rx;
+    // `None` and `0` are the same instruction to `src_matches_advertised` —
+    // "no receiving interface known, so match only scope-0 AAAA entries" — and
+    // the `Option` exists so a caller states which one it means.
+    let interface_index = interface_index.unwrap_or(0);
     #[cfg(feature = "tracing")]
     let _span = trace_span!("handle", src = %src, len = data.len()).entered();
     #[cfg(feature = "stats")]
@@ -159,41 +153,51 @@ where
       ));
     }
     let is_response = reader.header().flags().is_response();
-    // Self-loopback detection. The AUTHORITATIVE per-Endpoint self
-    // signal is provided by the CALLER via `caller_is_self`. The driver
-    // computes it by content-matching the datagram against packets it
-    // recently sent, ordered by the kernel receive timestamp — facilities
-    // that live naturally in the std I/O layer, not in this `no_std`
-    // protocol core. Routing our own multicast loopback as a peer packet
-    // would cause false ProbeConflicts (self-rename), false HostConflicts,
-    // spurious KAS suppression, and double cache writes, so we suppress all
-    // side effects when the caller flags the datagram as self.
+    // Self-loopback detection. The AUTHORITATIVE per-Endpoint self signal is the
+    // caller's [`Provenance`]. The driver computes it by content-matching the
+    // datagram against packets it recently sent, ordered by the kernel receive
+    // timestamp — facilities that live naturally in the std I/O layer, not in
+    // this `no_std` protocol core. Routing our own multicast loopback as a peer
+    // packet would cause false ProbeConflicts (self-rename), false
+    // HostConflicts, spurious KAS suppression, and double cache writes, so we
+    // suppress all side effects when the caller claims the datagram as its own.
     //
-    // we deliberately do NOT use `src == local_ip` as a self
-    // signal. PKTINFO's local receive address is HOST/interface-level —
-    // every same-host mDNS sender egresses from the same interface IP, so
-    // `src == local_ip` would suppress legitimate co-resident peers and
-    // hide same-host name conflicts. `local_ip` / `interface_index` remain
-    // available for the opt-in advertised-source check below, which is
-    // interface-scoped for IPv6 link-local.
+    // `local_ip` is NOT consulted, deliberately. PKTINFO's local receive address
+    // is HOST/interface-level — every same-host mDNS sender egresses from the
+    // same interface IP, so `src == local_ip` would suppress legitimate
+    // co-resident peers and hide same-host name conflicts. It is carried for
+    // tracing; `interface_index` is real input, but only to the opt-in
+    // advertised-source check below, which is interface-scoped for IPv6
+    // link-local.
     //
-    // `src_matches_advertised` is an OPT-IN fallback
+    // `src_matches_advertised` is that OPT-IN fallback
     // (`EndpointConfig::trust_advertised_src_as_self`, default off) for
-    // single-process / sync callers that cannot supply `caller_is_self`.
-    let _ = local_ip;
+    // single-process / sync callers whose provenance is `Unknown`.
     let matched_advertised = self.config.trust_advertised_src_as_self()
       && self.src_matches_advertised(src.ip(), interface_index);
-    let is_self_packet = caller_is_self || matched_advertised;
     // RFC 6762 — a Multicast DNS RESPONSE (QR=1) is only
     // trustworthy when it originates from UDP source port 5353. A response
     // from an ephemeral port is an off-path/legacy-unicast artifact that must
     // not be allowed to populate the cache, answer active queries, or drive
     // service conflicts. QUERIES (QR=0) are exempt — legacy unicast queriers
     // legitimately use ephemeral source ports (RFC 6762 §6.7) and we must
-    // still respond to them. We fold the untrusted-response case into the
-    // same all-side-effects suppression as a self packet.
+    // still respond to them. It is a claim about the SOURCE PORT, not about who
+    // sent the datagram, so it is a second axis ANDed into the permissions
+    // rather than another `Provenance`.
     let untrusted_response = is_response && src.port() != crate::constants::MDNS_PORT;
-    let suppress_side_effects = is_self_packet || untrusted_response;
+    // THE decision, taken once. Every gate below — and every arm of the routing
+    // iterator, which carries this value — reads it rather than recomputing a
+    // condition that could drift.
+    let admits = Admits::for_datagram(
+      provenance,
+      matched_advertised,
+      self.config.answer_questions(),
+      untrusted_response,
+    );
+    // A datagram nothing may act on. Identical to the old
+    // `is_self_packet || untrusted_response`, because the map above answers
+    // "everything" for every other case.
+    let inert = admits.all_denied();
 
     // ── Single eager section-validation latch ──────────────────────────────
     // Walk ALL FOUR sections (questions, answers, authority, additional) once
@@ -201,21 +205,30 @@ where
     // bump `parse_errors(1)` exactly once per datagram.
     //
     // Precedence rule (exactly-one reject counter invariant):
-    //   Suppression (`packets_dropped`) takes precedence over malformed-section
-    //   `parse_errors`.  A suppressed datagram (self-loopback or untrusted
-    //   QR=1 response from a non-5353 source) is dropped wholesale — we never
-    //   process it — so `packets_dropped` is the sole meaningful reject counter
-    //   and the malformation is moot.  Running the latch for a suppressed packet
-    //   would bump BOTH `parse_errors` AND `packets_dropped`, violating the
-    //   exactly-one-reject-per-packets_rx invariant.  Therefore the latch only
-    //   runs when `!suppress_side_effects`.
+    //   `packets_dropped` takes precedence over malformed-section `parse_errors`,
+    //   and the two are mutually exclusive BY CONSTRUCTION: both are gated on
+    //   `Admits::all_denied`, in opposite directions, computed once above.  An
+    //   all-denied datagram is rejected wholesale — no permission it carries
+    //   admits anything — so `packets_dropped` is the sole meaningful reject
+    //   counter and the malformation is moot; running the latch for one would
+    //   bump BOTH and break the exactly-one-reject-per-`packets_rx` invariant.
+    //
+    //   The test is taken AFTER `untrusted_response` is ANDed in, which is what
+    //   keeps both directions true: a datagram denied on that axis alone is
+    //   still a whole-datagram reject and must still count as a drop, exactly as
+    //   a self-loopback one does.
+    //
+    //   A PARTIALLY permitted datagram is not a drop.  It is processed — some of
+    //   its sections route, and it can raise a §8.2 proposal or an §8.1 defence —
+    //   so it takes the not-suppressed rows below, and a malformed section in it
+    //   is counted as a parse error like any other processed datagram's.
     //
     // Counters per case:
-    //   • suppressed (self-loopback or untrusted QR=1), malformed or not
+    //   • all-denied (self-loopback and/or untrusted QR=1), malformed or not
     //       → `packets_dropped(1)` only (latch skipped)
-    //   • not-suppressed, malformed section
+    //   • anything admitted, malformed section
     //       → `parse_errors(1)` only (latch fires)
-    //   • not-suppressed, well-formed
+    //   • anything admitted, well-formed
     //       → 0 reject counters (latch fires, finds nothing)
     //   • header parse fail / invalid opcode / invalid rcode
     //       → their own single counter (unchanged, precede this point)
@@ -224,6 +237,9 @@ where
     //   • `answer_questions=false` → Questions arm skipped; latch still walks it
     //   • non-5353 source port → Authority conflict-routing skipped; latch walks
     //     authority regardless (port gate governs routing, not byte-validity)
+    //   • a denied PERMISSION → that arm yields nothing; latch walks its section
+    //     regardless, on the same reasoning — a permission governs routing, not
+    //     byte-validity
     //
     // Protocol-behaviour contract: this validation ONLY adds accounting.
     // It does NOT introduce new drops or change which records get processed
@@ -237,10 +253,10 @@ where
     // suppression where the datagram's OTHER sections continue to be
     // processed is NOT a datagram drop, so no `packets_dropped` is bumped.
     // `packets_dropped` counts only whole-datagram rejects (invalid opcode,
-    // invalid rcode, self-loopback, untrusted response).  A code comment
+    // invalid rcode, and an all-denied datagram).  A code comment
     // in the Authority arm documents this decision.
     #[cfg(feature = "stats")]
-    if !suppress_side_effects {
+    if !inert {
       let mut section_parse_error = false;
       // Questions: walk regardless of `answer_questions` config —
       // a malformed question byte-stream is a datagram-level error.
@@ -279,20 +295,23 @@ where
     trace!(
       target: "mdns_proto::endpoint",
       src = %src,
-      local_ip = %local_ip,
+      local_ip = ?local_ip,
       interface_index,
       is_response,
-      is_self_packet,
+      matched_advertised,
+      provenance = ?provenance,
+      admits = ?admits,
       data_len = data.len(),
       "handle: routing inbound packet"
     );
-    if suppress_side_effects {
+    if inert {
       debug!(
         target: "mdns_proto::endpoint",
         src = %src,
-        is_self_packet,
+        provenance = ?provenance,
+        matched_advertised,
         untrusted_response,
-        "handle: suppressed self/untrusted packet"
+        "handle: dropped a datagram nothing admits"
       );
       #[cfg(feature = "stats")]
       self.stats.packets_dropped(1);
@@ -308,7 +327,12 @@ where
     // here keeps the receive path allocation-free w.r.t. fan-out
     // bookkeeping (no Vec of matching keys — `Pool::iter_mut` lets us
     // mutate matching queries in-place).
-    if !suppress_side_effects {
+    //
+    // Both are RFC 6762 §10 OBSERVATION: believing what this datagram says about
+    // the link. `RouteEvents`' `ToQuery` fan-out reports what happened here, so
+    // it reads the same permission — the two must not disagree, or the caller is
+    // told about a collection that did not occur.
+    if admits.observation() {
       let populate_cache = self.config.populate_cache();
       // per-packet tracking of `(name, rtype)` pairs that have
       // already had their cache-flush eviction applied.  RFC 6762 §10.2
@@ -477,15 +501,21 @@ where
     // clear, so it cannot be suppressing records we still need) — treat our own
     // planned query as already sent and defer its next (re)transmit. The peer's
     // query elicits the same multicast answers, which we receive too, so we
-    // avoid adding a redundant query to the link. Self / untrusted packets are
-    // already excluded by `suppress_side_effects`.
+    // avoid adding a redundant query to the link. It is one of the two ways
+    // another host's traffic QUIETS ours, so the suppression below reads that
+    // permission — deferring our own query's retransmit on our own echo is one
+    // of the two places where believing a peer is the more harmful error.
     //
     // questions_rx is bumped for EVERY question in any QR=0 query from port 5353
     // (multicast querier), regardless of whether the answer section is empty.
     // Queries that carry a known-answer section (TC=0, answer_count>0) are still
     // genuine queries whose questions deserve to be counted; only the
     // duplicate-suppression side effect is gated on answer_count==0.
-    if !suppress_side_effects && !is_response && src.port() == crate::constants::MDNS_PORT {
+    //
+    // The COUNT reads `observation`, the permission that also gates `answers_rx`
+    // in the eager pass above: both tally what this endpoint took as a report
+    // about the link, so a datagram it does not believe should inflate neither.
+    if admits.observation() && !is_response && src.port() == crate::constants::MDNS_PORT {
       #[cfg(feature = "stats")]
       for q in reader.questions() {
         match q {
@@ -500,7 +530,7 @@ where
     // may be answered by UNICAST straight to it — answers we would never see —
     // so suppressing our own multicast query on its behalf could silently lose
     // us the response.
-    if !suppress_side_effects
+    if admits.quieting()
       && !is_response
       && src.port() == crate::constants::MDNS_PORT
       && reader.header().answer_count() == 0
@@ -565,10 +595,15 @@ where
       additional_service_cursor: None,
       additional_service_done: false,
       additional_query_cursor: None,
-      // a self-packet OR an untrusted response (QR=1
-      // from a non-5353 source port) yields zero events. We still construct
-      // a valid (but pre-drained) iterator so the caller's loop runs cleanly.
-      section: if suppress_side_effects {
+      admits,
+      // A datagram no permission admits yields zero events, and is handed back
+      // PRE-DRAINED rather than walked. The per-arm gates below would each
+      // decline it, but only after four sections had been iterated to produce
+      // nothing — and an endpoint whose driver has no source-port gate of its
+      // own reaches this from the network, so the walk is attacker-reachable
+      // work. We still construct a valid iterator so the caller's loop runs
+      // cleanly.
+      section: if inert {
         Section::Done
       } else {
         Section::Questions

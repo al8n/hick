@@ -14,7 +14,7 @@ use mdns_proto::{
   CollectedAnswer, FamilyAttempt, Name, Query,
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec, ServiceSpec},
-  endpoint::{Endpoint, EndpointEventEntry, ServiceRoute},
+  endpoint::{Endpoint, EndpointEventEntry, Provenance, Received, ServiceRoute},
   event::{QueryUpdate, ServiceUpdate},
   records::ServiceRecords,
   transmit::Transmit,
@@ -109,7 +109,13 @@ fn stats_packets_rx_and_answers_rx() {
   let local_ip = "192.0.2.20".parse().unwrap();
 
   // Consume the RouteEvents iterator so all side effects are applied.
-  for ev in e.handle(now, src, local_ip, 0, &packet, false).unwrap() {
+  for ev in e
+    .handle(
+      now,
+      Received::new(src, &packet, Provenance::Unknown).with_local_ip(local_ip),
+    )
+    .unwrap()
+  {
     let _ = ev;
   }
 
@@ -148,7 +154,13 @@ fn stats_questions_rx() {
   let src = "192.0.2.50:5353".parse().unwrap();
   let local_ip = "192.0.2.20".parse().unwrap();
 
-  for ev in e.handle(now, src, local_ip, 0, &packet, false).unwrap() {
+  for ev in e
+    .handle(
+      now,
+      Received::new(src, &packet, Provenance::Unknown).with_local_ip(local_ip),
+    )
+    .unwrap()
+  {
     let _ = ev;
   }
 
@@ -186,7 +198,13 @@ fn stats_combined_exchange() {
   let ans_pkt = build_srv_response(&inst);
   let src = "192.0.2.200:5353".parse().unwrap();
   let local_ip = "192.0.2.20".parse().unwrap();
-  for ev in e.handle(now, src, local_ip, 0, &ans_pkt, false).unwrap() {
+  for ev in e
+    .handle(
+      now,
+      Received::new(src, &ans_pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
+    .unwrap()
+  {
     let _ = ev;
   }
 
@@ -436,7 +454,10 @@ fn handle_invalid_opcode_bumps_packets_dropped() {
   // byte 2 in the wire header).
   let bad_opcode = [0u8, 0, 0x10, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
   let before = e.stats();
-  let result = e.handle(now, src, local_ip, 0, &bad_opcode, false);
+  let result = e.handle(
+    now,
+    Received::new(src, &bad_opcode, Provenance::Unknown).with_local_ip(local_ip),
+  );
   assert!(
     matches!(result, Err(mdns_proto::HandleError::InvalidOpcode(_))),
     "expected Err(InvalidOpcode)"
@@ -471,7 +492,10 @@ fn handle_invalid_rcode_bumps_packets_dropped() {
   // flags bytes are 0x00 0x01.
   let bad_rcode = [0u8, 0, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0];
   let before = e.stats();
-  let result = e.handle(now, src, local_ip, 0, &bad_rcode, false);
+  let result = e.handle(
+    now,
+    Received::new(src, &bad_rcode, Provenance::Unknown).with_local_ip(local_ip),
+  );
   assert!(
     matches!(result, Err(mdns_proto::HandleError::InvalidResponseCode(_))),
     "expected Err(InvalidResponseCode)"
@@ -541,7 +565,10 @@ fn handle_lazy_section_parse_error_bumps_parse_errors() {
   let before = e.stats();
   // Iterate the RouteEvents so the lazy section parse fires.
   let route = e
-    .handle(now, src, local_ip, 0, &pkt, false)
+    .handle(
+      now,
+      Received::new(src, &pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .expect("a well-formed header must not fail at handle() entry");
   let mut saw_parse_err = false;
   for ev in route {
@@ -666,7 +693,10 @@ fn assert_parse_error_exactly_once(e: &mut Endp, pkt: &[u8], src_port: u16, labe
   let now = StdInstant::now();
   let before = e.stats();
   let route = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(
+      now,
+      Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .expect("valid header — handle() must not fail at entry");
   for ev in route {
     let _ = ev; // drain fully; lazy parse errors fire here
@@ -812,7 +842,10 @@ fn assert_parse_error_exactly_once_port(e: &mut Endp, pkt: &[u8], src_port: u16,
   let now = StdInstant::now();
   let before = e.stats();
   let route = e
-    .handle(now, src, local_ip, 0, pkt, false)
+    .handle(
+      now,
+      Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .expect("valid header — handle() must not fail at entry");
   for ev in route {
     let _ = ev; // drain fully; lazy parse errors fire here
@@ -928,7 +961,10 @@ fn r11_well_formed_non_5353_authority_no_false_positive() {
   let now = StdInstant::now();
   let before = e.stats();
   let route = e
-    .handle(now, src, local_ip, 0, &pkt, false)
+    .handle(
+      now,
+      Received::new(src, &pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .expect("valid header");
   for ev in route {
     let _ = ev;
@@ -962,7 +998,10 @@ fn r11_well_formed_packet_does_not_bump_reject_counters() {
   let now = StdInstant::now();
   let before = e.stats();
   let route = e
-    .handle(now, src, local_ip, 0, &pkt, false)
+    .handle(
+      now,
+      Received::new(src, &pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .expect("valid header");
   for ev in route {
     let _ = ev;
@@ -995,7 +1034,10 @@ fn r10_well_formed_packet_does_not_bump_reject_counters() {
   let now = StdInstant::now();
   let before = e.stats();
   let route = e
-    .handle(now, src, local_ip, 0, &pkt, false)
+    .handle(
+      now,
+      Received::new(src, &pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .expect("valid header");
   for ev in route {
     let _ = ev;
@@ -1039,7 +1081,10 @@ fn r12_malformed_self_loopback_bumps_dropped_not_parse_errors() {
   let before = e.stats();
   // caller_is_self=true triggers self-loopback suppression.
   let route = e
-    .handle(now, src, local_ip, 0, &pkt, true)
+    .handle(
+      now,
+      Received::new(src, &pkt, Provenance::OwnEcho).with_local_ip(local_ip),
+    )
     .expect("valid header — suppression must not prevent handle() returning Ok");
   for ev in route {
     let _ = ev;
@@ -1075,7 +1120,10 @@ fn r12_malformed_untrusted_response_bumps_dropped_not_parse_errors() {
   let now = StdInstant::now();
   let before = e.stats();
   let route = e
-    .handle(now, src, local_ip, 0, &pkt, false)
+    .handle(
+      now,
+      Received::new(src, &pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .expect("valid header");
   for ev in route {
     let _ = ev;
@@ -1110,7 +1158,10 @@ fn r12_malformed_not_suppressed_bumps_parse_errors_not_dropped() {
   let now = StdInstant::now();
   let before = e.stats();
   let route = e
-    .handle(now, src, local_ip, 0, &pkt, false)
+    .handle(
+      now,
+      Received::new(src, &pkt, Provenance::Unknown).with_local_ip(local_ip),
+    )
     .expect("valid header");
   for ev in route {
     let _ = ev;
@@ -1145,7 +1196,10 @@ fn r12_well_formed_suppressed_bumps_dropped_not_parse_errors() {
   let now = StdInstant::now();
   let before = e.stats();
   let route = e
-    .handle(now, src, local_ip, 0, &pkt, true)
+    .handle(
+      now,
+      Received::new(src, &pkt, Provenance::OwnEcho).with_local_ip(local_ip),
+    )
     .expect("valid header");
   for ev in route {
     let _ = ev;

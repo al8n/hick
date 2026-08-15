@@ -165,8 +165,8 @@
 use std::time::{Duration, Instant as StdInstant};
 
 use mdns_proto::{
-  FamilyAttempt, QueryHandle, ServiceHandle, ServiceUpdate, TransmitConfirm, TransmitObligation,
-  event::RouteEvent,
+  FamilyAttempt, Provenance, QueryHandle, Received, ServiceHandle, ServiceUpdate, TransmitConfirm,
+  TransmitObligation, event::RouteEvent,
 };
 
 use hick_udp::onlink;
@@ -804,13 +804,19 @@ impl Mdns {
 
       let route_events = match endpoint.handle(
         processed_at,
-        meta.peer(),
-        meta.local_ip(),
+        Received::new(
+          meta.peer(),
+          data,
+          if caller_is_self {
+            Provenance::OwnEcho
+          } else {
+            Provenance::Unknown
+          },
+        )
         // The protocol core takes the index as a ROUTING hint and admits nothing
         // on it — the trust decision was made above, against the witness itself.
-        iface_witness.index_or_zero(),
-        data,
-        caller_is_self,
+        .with_interface(iface_witness.witnessed_index().map(|i| i.get()))
+        .with_local_ip(meta.local_ip()),
       ) {
         Ok(it) => it,
         Err(_e) => {

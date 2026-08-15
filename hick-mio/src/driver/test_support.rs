@@ -11,7 +11,7 @@ use std::{
 };
 
 use mdns_proto::{
-  FamilyAttempt, Name, QuerySpec, ServiceHandle, ServiceRecords, ServiceSpec,
+  FamilyAttempt, Name, Provenance, QuerySpec, Received, ServiceHandle, ServiceRecords, ServiceSpec,
   event::RouteEvent,
   wire::{Header, MessageBuilder, MessageReader, NameRef, ResourceType},
 };
@@ -296,11 +296,9 @@ pub(crate) fn ingest(mdns: &mut Mdns, data: &[u8], now: StdInstant) {
   let route_events = endpoint
     .handle(
       now,
-      peer,
-      IpAddr::V4(Ipv4Addr::LOCALHOST),
-      *bound_interface,
-      data,
-      false,
+      Received::new(peer, data, Provenance::Unknown)
+        .with_interface(Some(*bound_interface))
+        .with_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     )
     .expect("the endpoint must accept a well-formed probe");
   for ev in route_events {

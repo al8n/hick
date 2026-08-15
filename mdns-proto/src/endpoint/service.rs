@@ -13,6 +13,78 @@ where
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
 {
+  /// Does any LIVE route publish `host` with an A/AAAA set other than the one
+  /// given? `exclude` skips one route key, for a check that re-examines a route
+  /// already in the table.
+  ///
+  /// # The invariant, and what it protects
+  ///
+  /// Two services may share a host name — that is how several services on one
+  /// machine advertise one set of addresses, and it is supported. What must not
+  /// differ is the ADDRESSES: RFC 6762 §9's conflict test compares a record
+  /// against the RECEIVING service's own records, so a sibling's A/AAAA at a
+  /// shared host name with rdata this service does not hold is, by that test, a
+  /// genuine conflict — and `Endpoint` has no auto-rename for a host name, so it
+  /// surfaces as a TERMINAL `ServiceUpdate::HostConflict`, raised by a sibling
+  /// on the same machine rather than by any peer.
+  ///
+  /// That path was previously unreachable only because self-detection suppressed
+  /// every effect of an echoed announcement. It is not suppressed any more: a
+  /// content match with no ordering evidence now adjudicates (see
+  /// [`Provenance::OwnEchoLikely`](crate::Provenance::OwnEchoLikely)), which is
+  /// what makes this guard the FOURTH invariant that cell's safety rests on.
+  ///
+  /// # Set equality, and only of what is configured
+  ///
+  /// Compared as SETS in both directions, because the conflict classifier asks
+  /// `contains`, and mutual containment is exactly what makes it answer
+  /// "identical" for every address either side can put on the wire. Order and
+  /// repetition are therefore irrelevant, and a re-registration that lists the
+  /// same addresses differently is not rejected.
+  ///
+  /// The CONFIGURED sets are compared, not the confirmed-advertised ones: what a
+  /// service has advertised so far is a subset of what it may advertise next, so
+  /// only the configured sets bound every datagram a sibling can send.
+  ///
+  /// Interface SCOPES are not compared. The host-conflict classifier reads bare
+  /// A/AAAA rdata and has no scope to compare against, so scope cannot turn an
+  /// identical address into a conflict.
+  ///
+  /// # Withdrawing routes are skipped
+  ///
+  /// A withdrawing route is skipped by every conflict fan-out in
+  /// [`RouteEvents`](super::RouteEvents), so it can neither raise nor receive the
+  /// event this guards against, and `withdrawing` is set once and never cleared.
+  /// Counting one would block a replacement service from taking over a host name
+  /// with a new address set until the outgoing goodbye drained.
+  fn host_addresses_disagree(
+    &self,
+    host: &Name,
+    a_addrs: &[Ipv4Addr],
+    aaaa_addrs: &[Ipv6Addr],
+    exclude: Option<usize>,
+  ) -> bool {
+    fn same_set<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+      a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
+    }
+    self.services.iter().any(|(key, route)| {
+      if Some(key) == exclude {
+        return false;
+      }
+      #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+      if route.withdrawing {
+        return false;
+      }
+      // Case-insensitive, because that is how the routing path matches a record
+      // against a host name — an equality test here would let one case spelling
+      // register past the guard and conflict on the wire anyway.
+      if !route.host().as_str().eq_ignore_ascii_case(host.as_str()) {
+        return false;
+      }
+      !same_set(route.a_addrs(), a_addrs) || !same_set(route.aaaa_addrs(), aaaa_addrs)
+    })
+  }
+
   /// Register a new service. Returns the handle and a `Service` state-machine.
   ///
   /// # Errors
@@ -27,6 +99,10 @@ where
   /// refreshes inside §8.3's one-second floor. The TTL is rejected rather than
   /// clamped — silently publishing a service at a lifetime the caller did not ask
   /// for is the kind of surprise a registration API should not hand back.
+  ///
+  /// Returns [`RegisterServiceError::HostAddressesDiffer`] if a live route
+  /// already publishes this host name with a different A/AAAA set — see
+  /// [`Self::host_addresses_disagree`].
   ///
   /// Returns [`RegisterServiceError::StorageFull`] if the routing pool is at
   /// capacity.
@@ -71,6 +147,19 @@ where
           spec.records().instance().clone(),
         ));
       }
+    }
+    // Reject a host name shared with a live route that publishes DIFFERENT
+    // addresses. See `host_addresses_disagree` for what this buys and why it is
+    // checked here rather than left to the conflict path.
+    if self.host_addresses_disagree(
+      spec.records().host(),
+      spec.records().a_addrs_slice(),
+      spec.records().aaaa_addrs_slice(),
+      None,
+    ) {
+      return Err(RegisterServiceError::HostAddressesDiffer(
+        spec.records().host().clone(),
+      ));
     }
     let new_h = self.next_service_handle;
     self.next_service_handle = self.next_service_handle.saturating_add(1);
@@ -275,6 +364,27 @@ where
     // renamed service has announced this name on every obligated link. The rename is
     // still NOT rejected for a reclaimable name: a detached item holds no route, so
     // the duplicate-name scan above does not see it, and reuse proceeds.
+
+    // The host address-set invariant's second enforcement point. It cannot fail
+    // today — a rename replaces the INSTANCE name and touches neither the host
+    // name nor the addresses, so a route that satisfied the guard at
+    // registration still satisfies it here — and it is kept because the day a
+    // rename is allowed to carry new records is the day the terminal
+    // `HostConflict`-on-every-sibling-echo path reopens, silently, with no other
+    // site to catch it. `exclude` is this route's own key: it is already in the
+    // table, and a route never disagrees with itself.
+    let renaming_host = self.services.get(key).map(|route| {
+      (
+        route.host().clone(),
+        route.a_addrs().to_vec(),
+        route.aaaa_addrs().to_vec(),
+      )
+    });
+    if let Some((host, a_addrs, aaaa_addrs)) = renaming_host
+      && self.host_addresses_disagree(&host, &a_addrs, &aaaa_addrs, Some(key))
+    {
+      return Err(HandleServiceRenamedError::HostAddressesDiffer(host));
+    }
 
     // Apply the rename.
     if let Some(route) = self.services.get_mut(key) {

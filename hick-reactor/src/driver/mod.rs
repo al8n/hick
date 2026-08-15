@@ -21,8 +21,8 @@ use hick_udp::{
   selfsend::{ClockPair, RxEvidence, SelfSendTracker},
 };
 use mdns_proto::{
-  FamilyAttempt, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec, ServiceUpdate,
-  TransmitConfirm, endpoint::FamilyDebt, event::RouteEvent,
+  FamilyAttempt, Provenance, QueryHandle, QuerySpec, Received, ServiceHandle, ServiceSpec,
+  ServiceUpdate, TransmitConfirm, endpoint::FamilyDebt, event::RouteEvent,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use slab::Slab;
@@ -717,11 +717,11 @@ impl<N: Net> DriverState<N> {
     }
 
     // local_ip + interface_index come from PKTINFO (via
-    // hick_udp::recv_with_meta); UNSPECIFIED/0 when PKTINFO is unavailable. The
+    // hick_udp::recv_with_meta); UNSPECIFIED/None when PKTINFO is unavailable. The
     // protocol core takes the index as a ROUTING hint and admits nothing on it —
     // the trust decision was made above, against the witness itself.
     let local_ip = pkt.local_ip;
-    let interface_index = pkt.iface.index_or_zero();
+    let interface_index = pkt.iface.witnessed_index().map(|i| i.get());
 
     // The AUTHORITATIVE self-loopback decision happens HERE, in the std driver.
     // The result reaches the proto layer as an explicit flag; proto keeps no
@@ -790,11 +790,17 @@ impl<N: Net> DriverState<N> {
 
     let route_events = match endpoint.handle(
       now,
-      pkt.src,
-      local_ip,
-      interface_index,
-      &pkt.data,
-      caller_is_self,
+      Received::new(
+        pkt.src,
+        &pkt.data,
+        if caller_is_self {
+          Provenance::OwnEcho
+        } else {
+          Provenance::Unknown
+        },
+      )
+      .with_interface(interface_index)
+      .with_local_ip(local_ip),
     ) {
       Ok(it) => it,
       Err(_e) => {

@@ -1,3 +1,56 @@
+# UNRELEASED
+
+## A typed trust tier for received datagrams
+
+BREAKING
+
+- `mdns-proto`: `Endpoint::handle` takes a `Received<'a>` bundle instead of five
+  loose arguments. It carries the payload together with the caller's
+  `Provenance` claim about it, so a driver can no longer pair one datagram's
+  self-send verdict with another datagram's bytes. `local_ip` becomes optional
+  and is documented as trace-only — it never was a self signal, whatever the old
+  doc comment said — and the interface index becomes `Option<u32>` so a driver
+  that does not know says so rather than passing the `0` that also spelled
+  "unknown".
+- `mdns-proto`: `Provenance` replaces the `caller_is_self` boolean, and the
+  all-or-nothing suppression it drove is split into four permissions
+  (§10 observation, §7.1/§7.3 quieting, §8.1/§8.2/§9 adjudication, and how
+  widely questions are answered), gated per routing arm. **A content match with
+  no ordering evidence (`OwnEchoLikely`) now ADJUDICATES**: it is
+  indistinguishable from a byte-identical datagram sent by a conforming §9
+  fault-tolerance twin, and suppressing a §8.2 proposal costs a name permanently
+  while routing our own echo to the tiebreak costs at worst §8.2's one-second
+  deferral. It still suppresses cache population and duplicate-question
+  suppression, where believing a peer is the more harmful error, and answers
+  only §8.1 defences.
+- `mdns-proto`: the opt-in `trust_advertised_src_as_self` heuristic no longer
+  suppresses adjudication. It matches any co-resident host publishing an address
+  we publish — including a peer that has taken it — and a convenience knob must
+  not be able to delete a §8 proposal. `Provenance::NotFromUs` declines the
+  heuristic outright: a caller that logs what it sends has better evidence than a
+  source address does. A user who enabled the knob as a backup for an evicted
+  send-log credit loses that backup, and such an echo now runs full effects.
+- `mdns-proto`: new `RegisterServiceError::HostAddressesDiffer`. Two live
+  services may share a host name — that is how one machine advertises one address
+  set from several services — but they may no longer DISAGREE about the
+  addresses. Each would otherwise read the other's announcement as a host
+  claiming its own host name with rdata it does not hold, which §9 makes a
+  conflict and which surfaces as a TERMINAL `ServiceUpdate::HostConflict` raised
+  by a sibling on the same machine. That path was unreachable only while
+  self-detection suppressed everything, so this guard is what makes the
+  adjudication change above safe. `HandleServiceRenamedError` gains the matching
+  variant as the invariant's second enforcement point.
+
+OTHER
+
+- `mdns-proto`: `packets_dropped` counts a narrower set of datagrams. It counts
+  whole-datagram rejects, which is now "every permission denied" rather than "the
+  old suppression boolean was set" — so a datagram that is suppressed in part but
+  still adjudicates is no longer counted as a drop, and its sections are walked by
+  the parse-error latch like any other processed datagram's. The
+  exactly-one-reject-counter-per-`packets_rx` invariant is unchanged and still
+  holds in both directions.
+
 # RELEASED
 
 ## Dual-stack partial delivery (`TransmitDelivery`) (July 30th, 2026)

@@ -20,7 +20,7 @@ use core::{
 use mdns_proto::{
   CollectedAnswer, EndpointConfig, Instant, QueryHandle, QuerySpec, ServiceHandle, ServiceSpec,
   cache::CacheEntry,
-  endpoint::{Endpoint, EndpointEventEntry, FamilyDebt, ServiceRoute},
+  endpoint::{Endpoint, EndpointEventEntry, FamilyDebt, Provenance, Received, ServiceRoute},
   error::{RegisterServiceError, StartQueryError},
   event::{EndpointEvent, QueryUpdate, RouteEvent, ServiceUpdate},
   query::Query,
@@ -1451,7 +1451,19 @@ where
     let Self {
       endpoint, services, ..
     } = self;
-    let events = match endpoint.handle(now, src, local_ip, 0, data, caller_is_self) {
+    let events = match endpoint.handle(
+      now,
+      Received::new(
+        src,
+        data,
+        if caller_is_self {
+          Provenance::OwnEcho
+        } else {
+          Provenance::Unknown
+        },
+      )
+      .with_local_ip(local_ip),
+    ) {
       Ok(events) => events,
       Err(_) => return,
     };
