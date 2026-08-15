@@ -9135,6 +9135,35 @@ fn registration_accepts_a_trailing_dot_differing_service_type() {
   .expect("a trailing-dot-differing service type is the same owner on the wire");
 }
 
+/// RFC 6763 §4.1.2 defines `<Service>` as exactly two labels, so the DNS
+/// root can never be a valid service type — even though `Name::is_parent_of`
+/// correctly treats the root as the immediate parent of any single-label
+/// instance, which would otherwise let this registration through the
+/// parent-label-sequence check `try_register_service` runs next. This is the
+/// guard that must still catch it.
+#[test]
+fn registration_rejects_a_root_service_type() {
+  let mut e = build_endpoint();
+  let err = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    spec_with_names("", "printer"),
+    StdInstant::now(),
+  ) {
+    Ok(_) => panic!("a root service type must be rejected"),
+    Err(e) => e,
+  };
+  assert!(
+    matches!(
+      &err,
+      RegisterServiceError::ServiceTypeIsRoot(instance) if instance.as_str() == "printer"
+    ),
+    "expected ServiceTypeIsRoot, got {err:?}"
+  );
+  assert!(
+    e.services.iter().next().is_none(),
+    "a rejected registration must reserve no name"
+  );
+}
+
 /// A withdrawal item whose goodbye owns PTR/SRV/TXT, so its per-family resend
 /// budget is non-zero and the spend / keep / write-off table is actually
 /// exercised. Returns the handle and the item's token.

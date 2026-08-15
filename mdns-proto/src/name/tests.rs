@@ -276,3 +276,55 @@ fn is_parent_of_ignores_case_and_the_optional_root_dot() {
   assert!(service_type_no_dot.is_parent_of(&instance));
   assert!(service_type_no_dot.is_parent_of(&instance_no_dot));
 }
+
+/// THE regression this predicate exists to fix: the DNS root genuinely is the
+/// immediate parent of any single-label name — dropping that name's one
+/// label leaves exactly the root. A naive `split_once('.') == None` read of
+/// "other has no more labels" must not collapse this case into "no parent
+/// exists" (see `nothing_is_the_parent_of_the_root`, which is the case that
+/// reasoning is actually correct for).
+#[test]
+fn root_is_the_parent_of_a_single_label_name() {
+  let root = Name::try_from_str("").unwrap();
+  let local = Name::try_from_str("local").unwrap();
+  assert!(root.is_parent_of(&local));
+  // The child's optional trailing dot does not change the answer.
+  let local_dot = Name::try_from_str("local.").unwrap();
+  assert!(root.is_parent_of(&local_dot));
+}
+
+/// The root has zero labels, so — exactly like every other name
+/// (`is_parent_of_requires_exactly_one_more_label`'s "a name is not its own
+/// parent") — it is not its own parent: there is no label to drop to get
+/// from the root back to the root.
+#[test]
+fn root_is_not_its_own_parent() {
+  let root = Name::try_from_str("").unwrap();
+  assert!(!root.is_parent_of(&root));
+}
+
+/// The root is the topmost owner: it has no label for any candidate parent
+/// to have stripped, so nothing is ITS parent — not the root itself, not a
+/// single-label name, not a multi-label one. `X.is_parent_of(root)` is
+/// `false` for every `X`.
+#[test]
+fn nothing_is_the_parent_of_the_root() {
+  let root = Name::try_from_str("").unwrap();
+  let single = Name::try_from_str("local").unwrap();
+  let multi = Name::try_from_str("_ipp._tcp.local.").unwrap();
+  assert!(!root.is_parent_of(&root));
+  assert!(!single.is_parent_of(&root));
+  assert!(!multi.is_parent_of(&root));
+}
+
+/// Dropping a single-label `other`'s one label always leaves the root, so a
+/// NON-root single-label `self` can never be the parent — whether `self` and
+/// `other` are the same label or different ones. Only the root qualifies
+/// (`root_is_the_parent_of_a_single_label_name`).
+#[test]
+fn a_single_label_name_is_not_the_parent_of_another_single_label_name() {
+  let printer = Name::try_from_str("printer").unwrap();
+  let scanner = Name::try_from_str("scanner").unwrap();
+  assert!(!printer.is_parent_of(&scanner));
+  assert!(!printer.is_parent_of(&printer));
+}

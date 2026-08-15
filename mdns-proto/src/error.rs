@@ -337,6 +337,22 @@ cfg_heap! {
     #[error("record TTL {0} s is below the {min} s minimum a service can be advertised at", min = crate::constants::MIN_SERVICE_TTL_SECS)]
     TtlTooSmall(u32),
 
+    /// `service_type` is the DNS root (the empty [`Name`]). Carries the
+    /// instance name that was to be registered under it.
+    ///
+    /// RFC 6763 §4.1.2 defines `<Service>` as exactly two labels, e.g.
+    /// `_ipp._tcp` — never zero — so the root can never be a valid service
+    /// type. This is checked BEFORE, and independently of,
+    /// [`Self::ServiceTypeNotParent`]'s parent-label-sequence test below:
+    /// the root is genuinely the immediate parent of any single-label
+    /// `instance` (`Name::is_parent_of`), so that test alone would ACCEPT
+    /// this registration. Only the root is rejected here — the full
+    /// two-label `<Service>` rule is not otherwise enforced.
+    #[error(
+      "service type is the DNS root; RFC 6763 §4.1.2 requires a `<Service>` of two labels, so instance `{0}` has no valid service type to register under"
+    )]
+    ServiceTypeIsRoot(Name),
+
     /// `service_type` is not the parent label sequence of `instance`.
     ///
     /// RFC 6763 §4.1: a Service Instance Name is
@@ -346,6 +362,9 @@ cfg_heap! {
     /// case-insensitive and blind to the optional trailing root dot on either
     /// name, the same rule [`Name::same_owner`] applies to whole-name
     /// equality (see `Name::is_parent_of`).
+    ///
+    /// Not returned for a root `service_type` — see
+    /// [`Self::ServiceTypeIsRoot`], which is checked first.
     #[error(transparent)]
     ServiceTypeNotParent(ServiceTypeNotParentDetail),
 

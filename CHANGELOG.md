@@ -525,7 +525,14 @@ OTHER
   **accepted**. RFC 6763 §4.1.1 stores `<Instance>` as a single DNS label, so
   exactly one extra label is required — `a.b._ipp._tcp.local.` is not a valid
   instance of `_ipp._tcp.local.` even though the type names a real suffix of
-  it. New public `ServiceTypeNotParentDetail`.
+  it. New public `ServiceTypeNotParentDetail`. `service_type` being the DNS
+  root (the empty name) is rejected separately, as new
+  `RegisterServiceError::ServiceTypeIsRoot` carrying the instance name: RFC
+  6763 §4.1.2 defines `<Service>` as exactly two labels, so the root can never
+  be valid, even though the owner comparison above genuinely treats the root
+  as the immediate parent of any single-label instance and so would otherwise
+  accept it. Only the root is rejected here; the full two-label `<Service>`
+  rule is not otherwise enforced.
 
 # RELEASED
 

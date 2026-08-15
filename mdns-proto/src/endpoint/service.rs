@@ -136,6 +136,13 @@ where
   /// clamped — silently publishing a service at a lifetime the caller did not ask
   /// for is the kind of surprise a registration API should not hand back.
   ///
+  /// Returns [`RegisterServiceError::ServiceTypeIsRoot`] if `service_type` is
+  /// the DNS root (the empty [`Name`]). RFC 6763 §4.1.2 defines `<Service>` as
+  /// exactly two labels, so the root can never be valid — checked before, and
+  /// independently of, the parent-label-sequence test below, because the root
+  /// genuinely IS the immediate parent of any single-label `instance` and so
+  /// would otherwise pass it.
+  ///
   /// Returns [`RegisterServiceError::ServiceTypeNotParent`] if `service_type`
   /// is not the parent label sequence of `instance` — i.e. `instance` is not
   /// exactly one label longer than `service_type` (case-insensitively, and
@@ -182,6 +189,18 @@ where
     let ttl_secs = spec.records().ttl_secs();
     if ttl_secs < crate::constants::MIN_SERVICE_TTL_SECS {
       return Err(RegisterServiceError::TtlTooSmall(ttl_secs));
+    }
+    // `service_type` must not be the DNS root: RFC 6763 §4.1.2 defines
+    // `<Service>` as exactly two labels, so the root is structurally invalid
+    // regardless of what the parent-label-sequence check below says — and
+    // that check's `is_parent_of` correctly treats the root as the immediate
+    // parent of any single-label `instance`, so without this guard a root
+    // `service_type` would pass it. Checked before that call, same reason the
+    // TTL is checked before either: reject before the name is reserved.
+    if spec.records().service_type().is_empty() {
+      return Err(RegisterServiceError::ServiceTypeIsRoot(
+        spec.records().instance().clone(),
+      ));
     }
     // `service_type` must be the parent label sequence of `instance`
     // (`ServiceRecords::new` documents this but is an infallible constructor

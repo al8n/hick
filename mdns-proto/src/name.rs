@@ -208,23 +208,43 @@ impl Name {
   /// allow). `self.is_parent_of(other)` asks exactly that: drop `other`'s
   /// first label, and ask whether what remains is the same owner as `self`.
   ///
+  /// The DNS ROOT — the empty [`Name`] — is the one owner with no label to
+  /// drop. It can never itself be a valid CHILD: `X.is_parent_of(root)` is
+  /// `false` for every `X`, including `root`, because there is no label to
+  /// strip and so no shorter owner to compare against `X`. But the root
+  /// genuinely IS the immediate parent of every SINGLE-label name — dropping
+  /// that name's one label leaves exactly the root — so
+  /// `root.is_parent_of(single_label)` is `true`. An empty `other` and a
+  /// single-label `other` both leave no dot after trimming, but only the
+  /// former has no label to drop; the two must not be conflated.
+  ///
   /// Case-insensitive per label and blind to the optional trailing root dot on
   /// either side, extending [`Self::same_owner`]'s rule from whole-name
   /// equality to this one-label-shorter suffix relation rather than
   /// duplicating it.
-  pub fn is_parent_of(&self, other: &Self) -> bool {
+  ///
+  /// `pub(crate)`: a single-purpose structural check for
+  /// [`Endpoint::try_register_service`](crate::endpoint::Endpoint::try_register_service),
+  /// not a general-purpose DNS predicate — it has exactly one caller, and this
+  /// crate keeps public surface to demonstrated need.
+  pub(crate) fn is_parent_of(&self, other: &Self) -> bool {
     fn trim(s: &str) -> &str {
       match s.strip_suffix('.') {
         Some(rest) => rest,
         None => s,
       }
     }
-    match trim(other.as_str()).split_once('.') {
+    let other_trimmed = trim(other.as_str());
+    match other_trimmed.split_once('.') {
       // `rest` is everything after `other`'s first label — for `self` to be
       // the immediate parent, that must be exactly `self`.
       Some((_first_label, rest)) => trim(self.as_str()).eq_ignore_ascii_case(rest),
-      // `other` has only one label: no room for a parent above it.
-      None => false,
+      // `other` has at most one label left after trimming its optional
+      // trailing dot. An EMPTY `other` is the root itself: it has no label to
+      // drop, so nothing is its parent. A NON-EMPTY `other` is exactly one
+      // label, and dropping it leaves the root — so `self` qualifies only
+      // when `self` IS the root.
+      None => !other_trimmed.is_empty() && trim(self.as_str()).is_empty(),
     }
   }
 }
