@@ -4105,15 +4105,20 @@ fn a_withdrawn_services_echo_cannot_retire_its_replacement() {
 /// A service that survives one begins no withdrawal, and the registration that
 /// could take the vacated name has not happened yet — so nothing else advances
 /// the generation, and a delayed echo of the abandoned owner keeps classifying
-/// as `SelfLog::Current`. That is `Provenance::OwnEchoLikely`, which still
-/// ADJUDICATES: our own past then reaches §8.1 and §9 against whatever holds the
-/// vacated name next, and defeats it with rdata no live route of ours holds.
+/// as `SelfLog::Current`.
 ///
-/// `packets_dropped` is what pins the tier, exactly as in
-/// [`own_multicast_loopback_adjudicates_and_finds_no_conflict`]:
-/// `Endpoint::handle` bumps it on the "nothing admits this datagram" condition,
-/// which `OwnEcho` produces and `OwnEchoLikely` does not. The counter is behind
-/// `stats`, so that half of the assertion is too.
+/// WHAT THE ADVANCE BUYS IS THE STANDING PROPERTY, and that is what this test
+/// pins. Both tiers report `Provenance::OwnEchoLikely` — a content match is a
+/// content match whatever generation it names, and `SelfLog::Superseded` claims
+/// no better evidence — so the difference is not in the tier but in the LOG. A
+/// current entry is TAKE-ONCE: the first copy spends it and every copy behind it
+/// reads `SelfLog::None`, hence `NotFromUs`, hence full §10 cache population and
+/// §7.1/§7.3 quieting for records this engine has abandoned. A superseded entry
+/// is a standing tombstone, spent by none of them.
+///
+/// So the witness is the entry itself: still present, and still OWED its v4 copy
+/// after the echo has been answered. Under the defect the same claim would have
+/// consumed it.
 #[test]
 fn a_surviving_rename_supersedes_the_entries_recorded_before_it() {
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(31));
@@ -4174,7 +4179,7 @@ fn a_surviving_rename_supersedes_the_entries_recorded_before_it() {
   // RECENT_SEND_TTL, from a source the advertised-source fallback cannot catch,
   // so only the self-send log has anything to say about it.
   io.inbound.push_back((
-    announcement,
+    announcement.clone(),
     RecvMeta {
       src: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 99), 5353)),
       local: Some(MDNS_SOCKET_V4.ip()),
@@ -4182,17 +4187,30 @@ fn a_surviving_rename_supersedes_the_entries_recorded_before_it() {
       len: 0,
     },
   ));
-  #[cfg(feature = "stats")]
-  let dropped_before = engine.stats().packets_dropped;
+  let owed_v4 = |engine: &TestEngine| {
+    engine
+      .tx
+      .recent
+      .iter()
+      .filter(|s| s.data.as_slice() == announcement.as_slice() && s.owed[0])
+      .count()
+  };
+  let owed_before = owed_v4(&engine);
+  assert!(
+    owed_before > 0,
+    "precondition: the announcement's v4 loopback copy is still outstanding, or \
+     there is no credit left for the echo to spend and the test proves nothing"
+  );
   engine.pump(|| at(micros), &mut io, &mut scratch);
 
-  #[cfg(feature = "stats")]
   assert_eq!(
-    engine.stats().packets_dropped,
-    dropped_before + 1,
-    "the echo of the ABANDONED instance name still admitted something: the \
-     rename left the generation where it was, so the entry claimed as current \
-     and reached the adjudicating tier"
+    owed_v4(&engine),
+    owed_before,
+    "the echo of the ABANDONED instance name SPENT a credit: the rename left the \
+     generation where it was, so the entry claimed as current and take-once, and \
+     the next copy of those bytes reaches the proto layer as a peer's — our own \
+     abandoned records into our own cache, and our own retransmits deferred for \
+     them"
   );
   let mut terminal = false;
   while let Some(update) = engine.poll_service_update(handle) {
@@ -4207,20 +4225,28 @@ fn a_surviving_rename_supersedes_the_entries_recorded_before_it() {
   );
 }
 
-/// A REPLAYED WITHDRAWN ANNOUNCEMENT IS SUPPRESSED FOR EVERY COPY, AND THE
+/// A REPLAYED WITHDRAWN ANNOUNCEMENT IS DENIED THE CACHE FOR EVERY COPY, AND THE
 /// REPLACEMENT SURVIVES IT TWICE OVER.
 ///
 /// Exact equality with a past send establishes CONTENT, not ORIGIN: any peer can
 /// replay bytes it captured off the link. Take-once was the bound on that, and
 /// it was the wrong trade — the first copy consumed the entry and every copy
 /// behind it read `SelfLog::None`, which is `Provenance::NotFromUs` and full
-/// adjudication. Denying the replay bought nothing (mDNS is unauthenticated, so
+/// observation. Denying the replay bought nothing (mDNS is unauthenticated, so
 /// the same assertion can simply be forged) while the copy that lost the race
 /// carried our own withdrawn records into our own cache.
 ///
-/// So a superseded entry is now a STANDING tombstone: the flood below outruns
-/// every loopback copy the log genuinely owes, and not one round of it reaches
-/// the protocol layer.
+/// So a superseded entry is a STANDING tombstone: the flood below outruns every
+/// loopback copy the log genuinely owes, and not one round of it populates the
+/// cache with the records this engine gave up.
+///
+/// WHAT IT IS NOT is invisibility. A superseded match reports
+/// `Provenance::OwnEchoLikely`, which denies §10 observation and §7.1/§7.3
+/// quieting and ADJUDICATES — `OwnEcho` here was the same false axiom the proto's
+/// relinquished screen abandoned, and it made a live RFC 6762 §9 twin's defence,
+/// or a peer's replay of it, invisible for the whole entry lifetime. The
+/// replacement's survival never rested on that, which the paragraph below is
+/// about.
 ///
 /// The replacement is protected on the OTHER side too, and independently. Its
 /// survival does not rest on the log at all: the datagram asserts the shared host
@@ -4233,7 +4259,7 @@ fn a_surviving_rename_supersedes_the_entries_recorded_before_it() {
 /// Six rounds at the §8.1 probe interval is twice the replacement's whole
 /// probing window.
 #[test]
-fn a_replayed_superseded_response_is_suppressed_for_every_copy() {
+fn a_replayed_superseded_response_is_denied_the_cache_for_every_copy() {
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(53));
   let host = "shared.local.";
   let a = engine
@@ -4290,7 +4316,7 @@ fn a_replayed_superseded_response_is_suppressed_for_every_copy() {
   // A peer floods the captured response across the whole of B's three-probe
   // window. Six rounds at the §8.1 probe interval is twice that window.
   #[cfg(feature = "stats")]
-  let dropped_before = engine.stats().packets_dropped;
+  let inserts_before = engine.stats().cache_inserts;
   let mut micros = 5_300_000;
   for _ in 0..REPLAYS {
     io.inbound.push_back((
@@ -4330,15 +4356,243 @@ fn a_replayed_superseded_response_is_suppressed_for_every_copy() {
      next copy reaches the protocol layer as peer traffic carrying records this \
      engine no longer publishes"
   );
-  // EVERY copy was the whole-datagram reject `OwnEcho` produces, not just the
-  // `owed_v4` the log would have credited under take-once.
+  // EVERY copy was denied §10 observation, not just the `owed_v4` the log would
+  // have credited under take-once. That denial is the whole of what this tier
+  // buys, so it is the whole of what there is to assert: the records these bytes
+  // carry are ones this engine has given up, and a single one of them reaching
+  // the cache is our own past being served back to our own callers.
   #[cfg(feature = "stats")]
   assert_eq!(
-    engine.stats().packets_dropped,
-    dropped_before + REPLAYS as u64,
+    engine.stats().cache_inserts,
+    inserts_before,
     "the flood outran the loopback copies genuinely owed ({owed_v4}), so a \
-     take-once superseded credit would have let {} of these through",
+     take-once superseded credit would have let {} of these into the cache",
     REPLAYS - owed_v4
+  );
+}
+
+/// A SUPERSEDED SEND MAY NOT MAKE A PEER'S REPEATED DEFENCE VANISH.
+///
+/// `SelfLog::Superseded` mapped to `Provenance::OwnEcho`, which denies
+/// observation, quieting, adjudication AND the RFC 6762 §8.1 defence — the whole
+/// datagram, for every copy, because a superseded entry is deliberately
+/// non-consuming. That was the same false axiom `mdns-proto`'s relinquished
+/// screen had just abandoned, sitting one layer down: **exact payload equality
+/// proves CONTENT, not ORIGIN**. An old local responder and a live §9
+/// fault-tolerance twin publish the same bytes by design, and a peer may simply
+/// replay them off the link — so for the whole credit lifetime every matching
+/// peer defence was treated as local, and a successor could finish probing while
+/// the incumbent was invisible.
+///
+/// So the tier is `OwnEchoLikely` now: cache and quieting still denied, because
+/// a stale echo must reach neither, and ADJUDICATION allowed, because withholding
+/// it costs a name and admitting it costs at most one §8.2 second.
+///
+/// Here the arriving bytes are our own predecessor's announcement, which is
+/// exactly the case that is undecidable at lookup time — our own ghost and an
+/// incumbent twin send the identical datagram. `Endpoint` labels it
+/// `ConflictHistory::Relinquished` and the successor spends the label on §8.2's
+/// deferral: it re-probes the SAME name and does not advertise while the peer
+/// keeps answering. Under `OwnEcho` none of that ran, because nothing arrived.
+///
+/// The `record` below is the same call `poll_one_transmit` makes with the same
+/// bytes. The credit it stands for was recorded while A was live and retired by
+/// A's own withdrawal above — the genuine seam — but that credit would have been
+/// aged out by the goodbye drain long before B exists, so the pair is replayed
+/// here: `record` then `supersede`, the same two calls in the same order the
+/// live sequence made them.
+///
+/// **B's registration supersedes nothing, and this test must not read as if it
+/// did.** A registration only inserts a route; it mutates no record this engine
+/// has already asserted, so it advances no generation (see
+/// `Multicaster::supersede`). The property under test belongs to the SUPERSEDED
+/// tier, whatever put a credit there.
+#[test]
+fn a_superseded_send_no_longer_hides_a_peers_repeated_defence() {
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(71));
+  let a = engine.register_service(sample_spec(), at(0)).unwrap();
+  let mut io = MockUdp::default();
+  let mut scratch = [0u8; 1500];
+  for micros in pump_schedule() {
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+  }
+  let (_, announcement) = io.sent.last().cloned().expect("A announced");
+  while engine.poll_service_update(a).is_some() {}
+
+  // A retires. Its CONFIRMED announcement becomes this endpoint's relinquished
+  // history, and the instance name comes free once the §10.1 goodbye completes.
+  let mut micros = 5_100_000i64;
+  engine.unregister_service(a, at(micros));
+  for _ in 0..40 {
+    if !engine.services.contains_key(&a) {
+      break;
+    }
+    micros += 250_000;
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+  }
+  assert!(
+    !engine.services.contains_key(&a),
+    "precondition: A's goodbye must complete, or the name is not free to reuse \
+     and nothing below is the successor case"
+  );
+
+  // A's own credit and A's own withdrawal, replayed as the pair: the goodbye
+  // drain aged the live one out long before the successor can exist, so the
+  // `record` and the `begin_service_withdrawal` advance it crossed are made
+  // again here, in that order.
+  engine.tx.record(&announcement, at(micros), [true, true]);
+  engine.tx.supersede();
+
+  // The successor takes A's instance name with a DIFFERENT port, so A's own SRV
+  // is rdata it does not hold — an §8.1 conflict by every test but the history.
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("Test._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("test.local.").unwrap(),
+    8080,
+    120,
+  );
+  recs.add_a(Ipv4Addr::new(192, 168, 1, 10));
+  let b = engine
+    .register_service(ServiceSpec::new(recs), at(micros))
+    .expect("the completed goodbye freed the instance name");
+  assert_eq!(
+    engine.tx.claim(Family::V4, &announcement, at(micros)),
+    SelfLog::Superseded,
+    "precondition: the credit must sit at the SUPERSEDED tier, or this is a test \
+     about the CURRENT tier and proves nothing"
+  );
+
+  // A live incumbent answers every probe with the predecessor's own bytes, for
+  // longer than the successor's whole probing window.
+  let mut renamed = false;
+  for _ in 0..12 {
+    io.inbound.push_back((
+      announcement.clone(),
+      RecvMeta {
+        src: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 200), 5353)),
+        local: Some(MDNS_SOCKET_V4.ip()),
+        hop_limit: None,
+        len: 0,
+      },
+    ));
+    micros += 250_000;
+    engine.pump(|| at(micros), &mut io, &mut scratch);
+    while let Some(update) = engine.poll_service_update(b) {
+      renamed |= matches!(update, ServiceUpdate::Renamed(_));
+    }
+  }
+
+  // `Announcing` is where the harm begins, not `Established`: RFC 6762 §8.3's
+  // first announcement is the moment this endpoint asserts the name on the link.
+  assert!(
+    matches!(
+      engine
+        .services
+        .get(&b)
+        .expect("the successor keeps its slot")
+        .proto
+        .state(),
+      ServiceState::Init | ServiceState::Probing(_)
+    ),
+    "the defence vanished at the driver: every copy matched a superseded entry \
+     and was suppressed whole, so the successor announced a name a peer was \
+     defending throughout"
+  );
+  assert!(
+    !renamed,
+    "…and it must be §8.2's DEFERRAL, not §8.1's rename: the history label says \
+     these bytes may equally be our own ghost, and only the re-probe can tell"
+  );
+  assert!(
+    engine
+      .tx
+      .recent
+      .iter()
+      .any(|s| s.data.as_slice() == announcement.as_slice() && s.owed[0]),
+    "the tombstone still stands — adjudicating a copy must not spend it, or the \
+     next copy populates this engine's cache with records it gave up"
+  );
+}
+
+/// A SERVICE REGISTRATION IS NOT A PUBLICATION CHANGE, SO IT SUPERSEDES NOTHING.
+///
+/// This seam used to advance the generation and it was a falsehood. A
+/// registration only INSERTS a route: it mutates no record this engine has
+/// already asserted. There is no RFC 6762 §8.4 records mutator, a duplicate
+/// instance name and a name a collision goodbye still holds are both refused,
+/// and a live route publishing the same host name with a different A or AAAA set
+/// makes the registration FAIL (`Endpoint::host_addresses_disagree`). The
+/// negative assertions are covered as well — the encoder emits exactly one §6.1
+/// NSEC per service, owned by the INSTANCE name — so no sibling registration can
+/// flip a host-name NSEC's truth either.
+///
+/// What the falsehood cost is not one datagram. A superseded entry is a STANDING
+/// tombstone: it answers EVERY byte-identical copy for the rest of
+/// [`RECENT_SEND_TTL`] and no claim spends it. So one unrelated registration
+/// denied §10 observation and §7.1/§7.3 quieting to every copy of a LIVE
+/// service's own bytes for the whole window — to a conforming §9
+/// fault-tolerance twin's identical answers, and to a peer's TTL=0 §10.1
+/// goodbye burst, which then reaches no cache and leaves the entry it exists to
+/// retract standing for its full original TTL instead of §10.1's one-second
+/// clamp.
+///
+/// The body is response-shaped on purpose: only an ASSERTING entry can be
+/// superseded at all, so a body [`SendClass`] read as a QUESTION would make
+/// every assertion below pass while testing nothing.
+#[test]
+fn a_registration_leaves_a_live_services_entries_observable() {
+  const ANNOUNCEMENT: &[u8] = &[
+    // RFC 1035 §4.1.1 header: ID, flags (QR|AA), QDCOUNT, ANCOUNT, NSCOUNT,
+    // ARCOUNT — then one tag octet so these bytes are this test's alone.
+    0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xAB,
+  ];
+
+  let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(17));
+  let live = engine
+    .register_service(sample_spec(), at(0))
+    .expect("the live service registers");
+  // An entry for a datagram that LIVE service sent, on both families. Nothing
+  // below retires it.
+  engine.tx.record(ANNOUNCEMENT, at(1_000), [true, true]);
+
+  // An entirely unrelated service registers: different type, different instance,
+  // different host, so it asserts nothing the live route asserts and contradicts
+  // nothing it asserts.
+  engine
+    .register_service(
+      spec_for(
+        "_http._tcp.local.",
+        "Other._http._tcp.local.",
+        "other.local.",
+        Ipv4Addr::new(192, 168, 1, 11),
+      ),
+      at(2_000),
+    )
+    .expect("an unrelated registration");
+
+  assert_eq!(
+    engine.tx.claim(Family::V4, ANNOUNCEMENT, at(3_000)),
+    SelfLog::Current,
+    "the registration left nothing behind for this entry to describe, so it must \
+     still read at the CURRENT tier"
+  );
+  for copy in 2..=4i64 {
+    assert_eq!(
+      engine
+        .tx
+        .claim(Family::V4, ANNOUNCEMENT, at(3_000 + copy * 1_000)),
+      SelfLog::None,
+      "take-once must be intact across the registration: copy {copy} of these \
+       bytes is a PEER's — a §9 twin's answer or a §10.1 goodbye — and a \
+       tombstone standing here would deny it this engine's cache and quieting \
+       for the whole recency window"
+    );
+  }
+  assert!(
+    engine.services.contains_key(&live),
+    "precondition: the entry's own service is still LIVE, so this is the \
+     unrelated-registration case and not a withdrawal in disguise"
   );
 }
 
@@ -4461,11 +4715,10 @@ fn a_superseded_entry_disowns_every_copy_and_is_spent_by_none() {
 /// `SelfSend::owed` cannot answer that question. It decays: the superseded tier
 /// deliberately never consults it (a tombstone must answer every copy, not the
 /// first), so before the family precondition existed a superseded entry matched
-/// on bytes alone. A v4-only send then disowned IPv6 traffic, and `OwnEcho`
-/// denies observation, quieting, adjudication AND the §8.1 defence — so a peer's
-/// byte-identical §8.2 probe went invisible for the rest of `RECENT_SEND_TTL`.
-/// Five seconds is longer than the peer's whole probing window, so it would
-/// finish probing unopposed and both hosts would own the same records.
+/// on bytes alone. A v4-only send then disowned IPv6 traffic, and a disowned
+/// datagram loses its §10 cache contribution and its §7.1/§7.3 quieting for the
+/// rest of `RECENT_SEND_TTL` — five seconds of a peer's records unlearned and a
+/// peer's known answers unheard, over bytes this engine never put on that link.
 #[test]
 fn a_tombstone_never_answers_for_a_family_that_never_sent() {
   let mut tx: Multicaster<SmoltcpInstant> = Multicaster::new();
@@ -4482,7 +4735,8 @@ fn a_tombstone_never_answers_for_a_family_that_never_sent() {
       SelfLog::None,
       "copy {round} arrived on a family no `try_send` ever queued these bytes on, \
        so it cannot be a local echo of them; claimed, a peer's identical IPv6 \
-       probe is `OwnEcho` and invisible for the whole recency window"
+       traffic populates no cache entry and quiets nothing for the whole recency \
+       window"
     );
   }
   assert_eq!(
@@ -4555,8 +4809,8 @@ fn a_tombstone_still_answers_every_copy_on_the_family_that_sent() {
 /// still outstanding. The superseded branch then read only the immutable
 /// `sent_on` mask, so once the generation moved, the v4 credit this engine had
 /// ALREADY paid out came back as a standing tombstone: an identical GENUINE peer
-/// datagram on v4 mapped to `Provenance::OwnEcho`, which denies observation,
-/// quieting, adjudication AND the §8.1 defence, for up to `RECENT_SEND_TTL`.
+/// datagram on v4 was denied §10 cache population and §7.1/§7.3 quieting for up
+/// to `RECENT_SEND_TTL`.
 ///
 /// A loopback copy is owed once per family that transmitted. Once it has been
 /// answered, a later byte-identical arrival on that family is not this entry's
@@ -4638,15 +4892,15 @@ const PROBE_HICK_A: &[u8] = &[
 
 /// A QUESTION SURVIVES A PUBLICATION CHANGE AS A TAKE-ONCE ENTRY.
 ///
-/// The generation was applied to the whole log, so a service registration — or a
-/// withdrawal, or a §9 rename — retired every outstanding entry including the
-/// ones for datagrams that assert nothing. A superseded entry is deliberately
+/// The generation was applied to the whole log, so a withdrawal — or a §9
+/// rename — retired every outstanding entry including the ones for datagrams
+/// that assert nothing. A superseded entry is deliberately
 /// non-consuming and ignores [`SelfSend::owed`], so a query entry became a
 /// STANDING TOMBSTONE: every byte-identical copy read `SelfLog::Superseded`,
-/// which is `Provenance::OwnEcho`, which suppresses the whole datagram. A peer's
-/// query retransmission from port 5353 — RFC 6762 §5.2 schedules them, so these
-/// are ordinary traffic — was then invisible for the rest of `RECENT_SEND_TTL`
-/// instead of for the one copy take-once costs.
+/// which is `Provenance::OwnEchoLikely` — §10 cache population and §7.1/§7.3
+/// quieting denied. A peer's query retransmission from port 5353 — RFC 6762 §5.2
+/// schedules them, so these are ordinary traffic — then contributed neither for
+/// the rest of `RECENT_SEND_TTL` instead of for the one copy take-once costs.
 ///
 /// A question asserts nothing this engine publishes, so no lifecycle event can
 /// make its echo stale, and the take-once rule is the whole of what it needs.
@@ -4688,7 +4942,7 @@ fn a_question_entry_stays_take_once_across_a_publication_change() {
 
 /// The boundary is what the datagram ASSERTS, not the header's QR bit: an RFC
 /// 6762 §8.2 probe is a query that proposes records, and those records are
-/// exactly what a registration or a withdrawal can retire.
+/// exactly what a withdrawal or a rename can retire.
 ///
 /// So the tombstone still stands here, and it stands for every copy — the
 /// property the previous round bought, which this one must not spend.

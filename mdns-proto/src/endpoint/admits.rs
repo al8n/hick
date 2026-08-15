@@ -141,9 +141,90 @@ impl Admits {
       //     arms, or admitting a conflict arm that runs before it.
       //
       //  3. A CONFLICT CANDIDATE CARRYING RDATA THIS ENDPOINT RECENTLY
-      //     TRANSMITTED AND RELINQUISHED NEVER REACHES A SERVICE AT ALL — it is
-      //     screened out by `Endpoint::relinquished_asserts` in the conflict
-      //     fan-out, before any `HostConflict` or `ProbeConflict` is built.
+      //     TRANSMITTED AND RELINQUISHED IS LABELLED
+      //     `ConflictHistory::Relinquished` BY THE CONFLICT FAN-OUT, and what
+      //     that label buys depends on the RECEIVING CELL — on the lifecycle
+      //     phase and the consequence together, not on the label alone. The
+      //     screen is `Endpoint::relinquished_asserts`, consulted once per
+      //     record in `RouteEvents::relinquished_screens`; the spending is
+      //     `Service::handle_event`'s.
+      //
+      //     THE AXIOM "MATCH IMPLIES OURS" IS FALSE, and everything below is
+      //     downstream of that. A match says these bytes left this endpoint
+      //     recently and were given up. It does NOT say the datagram carrying
+      //     them now is ours. A conforming §9 fault-tolerance twin — the case §9
+      //     exists to protect, "more than one responder … capable of issuing
+      //     identical answers" — publishes byte-identical records BY DESIGN, so
+      //     its authoritative defence of the name and our own ghost's echo are
+      //     the same datagram at the instant of the lookup. Seven review rounds
+      //     hardened this screen's bookkeeping — exposure, rdata form, family,
+      //     per-family windows, ceilings — and none of them could harden this,
+      //     because it is not a bookkeeping defect. It is a false premise.
+      //
+      //     WHAT IS UNVERIFIABLE HERE, stated so nobody re-derives it: an
+      //     INSTANTANEOUS history lookup cannot learn what only a RE-PROBE can
+      //     find out. A ghost cannot answer a probe; a live incumbent can. That
+      //     is the only discriminator that exists, it is a fact about the FUTURE,
+      //     and no amount of recorded past substitutes for it. Do not add a
+      //     field, a window or a tier in the hope of settling provenance from
+      //     the record — ask the network.
+      //
+      //     SO THE CELLS DIFFER, by what a wrong guess costs and whether
+      //     anything can revisit it:
+      //
+      //       * PRE-AUTHORITATIVE INSTANCE (`ProbeConflict`, rows B / B′ of the
+      //         conflict matrix): DELIVERED, labelled, and spent as §8.2's
+      //         one-second regress — `tiebreak_lost`, same name, re-probe —
+      //         instead of §8.1's rename. This is the cell that was broken. It
+      //         used to suppress, and suppression is what let a successor B
+      //         probe and announce clean over a live incumbent P: A and P assert
+      //         identical R1, A relinquishes, B reuses the owner with R2, and
+      //         every authoritative R1 defence P sends matches A's history and
+      //         is discarded — while B completes probing and announcing well
+      //         inside the retention window and nothing replays P's lost
+      //         defences at expiry. Deferring instead asks §8.2's own question,
+      //         which §8.2 poses for exactly this input ("maybe from the host
+      //         itself … echoed back after a short delay by some Ethernet
+      //         switches"): against a GHOST the retry goes unanswered and the
+      //         name is claimed a second later; against a TWIN INCUMBENT the
+      //         retry is answered, and a defence renames us once the label
+      //         lapses. §8.1 is honoured late rather than never, and nothing is
+      //         claimed in between — `conflict_classified_unresolved` withholds
+      //         every claim to the name while the latch is pending.
+      //       * ESTABLISHED INSTANCE (`ProbeConflict`, row C): DROPPED, and
+      //         unchanged in effect — only the SITE moved, from the router into
+      //         the arm, because the pre-authoritative cell needs the same
+      //         record delivered. Deliberately not converted to a deferral: §9's
+      //         answer to a conflict is already defer-and-re-verify on the same
+      //         name behind `CONFLICT_REPROBE_MIN_INTERVAL`, so the cell is
+      //         near-free either way and widening the change would have taken
+      //         the blast radius past the cell that was actually broken.
+      //       * HOST (`HostConflict`, every row): DROPPED, in the router, and
+      //         the screen stays fully load-bearing there. The consequence is
+      //         TERMINAL and caller-visible, and host-name probing is
+      //         unimplemented — so there is no re-probe whose silence could
+      //         convict a ghost, and no cheap reversible move to spend the
+      //         label on. When host-name probing lands, this cell must be
+      //         re-argued: it is the one place the false axiom is still being
+      //         relied on, and it is relied on only because nothing better
+      //         exists yet.
+      //         WHAT IS DROPPED IS THE EVENT, NOT THE RECORD, and the two are
+      //         only the same thing while one name wears one role. The fan-out
+      //         tests the host rule first, so where a route's INSTANCE name IS
+      //         its host name a labelled A/AAAA matched the host branch and left
+      //         the loop — and A/AAAA under that name are members of the §8.2
+      //         proposal that service is probing with, which §8.1 owes a
+      //         deferral on as "any conflicting Multicast DNS response". A live
+      //         incumbent answering every probe was therefore discarded by role
+      //         precedence while the successor ran to Established: the
+      //         pre-authoritative usurpation again, entered through the other
+      //         door. So a labelled record whose owner is also the route's
+      //         instance name FALLS THROUGH to the instance rule and is
+      //         delivered as a labelled `ProbeConflict`; a route with no second
+      //         role to fall through to is skipped as before. Precedence chooses
+      //         which EVENT a record becomes and may not decide it is no
+      //         conflict at all.
+      //
       //     TRANSMITTED, not merely configured, and the distinction is the
       //     invariant's own boundary: the screen answers only for the record
       //     IDENTITIES a confirmed positive authoritative send actually emitted
@@ -227,10 +308,13 @@ impl Admits {
       //     "identical rdata is never a conflict", asked of the sets this
       //     ENDPOINT recently published as well as of the receiving service's
       //     own. Service B structurally cannot know that `A1` was ours; only the
-      //     endpoint can, so the endpoint decides it — over withdrawal items
+      //     endpoint can, so the endpoint STATES it — over withdrawal items
       //     still resident and a retention list of what has lapsed, ONE ROW PER
       //     RELINQUISHED GENERATION, each living to its own expiry. See the
-      //     `endpoint::relinquished` module.
+      //     `endpoint::relinquished` module. Stating is all it does: the endpoint
+      //     cannot see lifecycle state, so it labels and the service decides,
+      //     which is what keeps one fact from being read as three different
+      //     decisions.
       //     THE LIST'S CEILING DROPS NOTHING AND DISABLES NOTHING. Every live
       //     row is an obligation still owed, so reaching
       //     `MAX_RELINQUISHED_RRSETS` evicts none of them; the relinquishment is
@@ -279,7 +363,25 @@ impl Admits {
       //     old-name handoff is not enqueued; a conflict event built
       //     anywhere other than `RouteEvents::next_host_conflict` /
       //     `next_service_conflict`, which are the two sites that consult the
-      //     screen; a retention window (`EndpointConfig::relinquished_retention`)
+      //     screen; THE LABEL BEING SPENT AS A SUPPRESSION IN THE
+      //     PRE-AUTHORITATIVE INSTANCE CELL AGAIN — a `ProbeConflict` dropped
+      //     for carrying `ConflictHistory::Relinquished`, whether in the router
+      //     or in `handle_preauthoritative_conflict`, restores the usurpation
+      //     this cell was rewritten to close; THE HOST BRANCH OF
+      //     `next_service_conflict` CONSUMING A LABELLED RECORD THAT IS ALSO THE
+      //     ROUTE'S INSTANCE NAME — a `continue` taken there without first asking
+      //     `names_match_record(route.name(), r)` restores that same usurpation
+      //     through role precedence, which is a suppression wearing an
+      //     ordering's clothes; the same cell latching
+      //     `probe_defeated` rather than `tiebreak_lost` on a labelled record,
+      //     which renames on a switch echo and gives up the name §8.2 keeps; a
+      //     labelled `ProbeConflict` reaching a service WITHOUT the established
+      //     arm's drop, which would let this endpoint's own recent past push an
+      //     established service back into probing; the §8.2 deferral ceasing to
+      //     hold the name — the bound on the labelled loop is the retention
+      //     window lapsing, not the peer falling silent, and it is only safe
+      //     because `conflict_classified_unresolved` claims nothing while it
+      //     runs; a retention window (`EndpointConfig::relinquished_retention`)
       //     shorter than the driver's own self-send recency window, which would
       //     leave a stretch where the echo is neither recognised nor screened;
       //     `relinquished::asserts` drifting from
@@ -314,15 +416,55 @@ impl Admits {
       //     generations onto one owner pair or by evicting at the ceiling; or
       //     ANY capacity path answering for a record it cannot name — an
       //     eviction that lets a peer pick the victim by filling the table, or a
-      //     return to an endpoint-wide fallback.
+      //     return to an endpoint-wide fallback; or A DRIVER MAPPING A SUPERSEDED
+      //     CREDIT BACK TO `Provenance::OwnEcho` — `hick-smoltcp`'s
+      //     `SelfLog::Superseded`, or `SelfSendMatch::Superseded` in `hick-mio`,
+      //     `hick-compio` and `hick-reactor` — which re-imposes the false axiom
+      //     one layer below this file, where nothing here can see it, and for
+      //     every copy rather than one.
       //     The driver-side binding — a credit bound to the record generation it
-      //     was sent under, and a superseded credit DEMOTED to `OwnEcho` rather
-      //     than discarded — is still owed, and still documented on
-      //     `Provenance::OwnEchoLikely`. What it buys now is the second half of
-      //     the harm: a stale echo that reaches this arm also POPULATES THE
-      //     CACHE with records we no longer publish and QUIETS our own traffic,
-      //     and invariant 3 governs adjudication only. Losing it re-opens that,
-      //     not the terminal conflict.
+      //     was sent under, and a superseded credit KEPT rather than discarded —
+      //     is still owed, and still documented on `Provenance::OwnEchoLikely`.
+      //     What it buys now is the second half of the harm: a stale echo that
+      //     reaches this arm also POPULATES THE CACHE with records we no longer
+      //     publish and QUIETS our own traffic, and invariant 3 governs
+      //     adjudication only. Losing it re-opens that, not the terminal
+      //     conflict.
+      //     AND IT BUYS EXACTLY THAT, WHICH IS WHY A SUPERSEDED CREDIT REPORTS
+      //     `OwnEchoLikely` AND NOT `OwnEcho`. THE FALSE AXIOM ABOVE HAS A
+      //     DRIVER-SIDE TWIN, and it is the same sentence: a byte match proves
+      //     CONTENT, not origin. A superseded entry is deliberately
+      //     non-consuming, so reporting it as `OwnEcho` denied observation,
+      //     quieting, adjudication AND the §8.1 defence to EVERY copy of those
+      //     bytes for the credit's whole lifetime — and an old local responder
+      //     and a live §9 twin publish them alike, while a peer may simply replay
+      //     them. A successor could then finish probing while an incumbent's
+      //     defences were being deleted one layer below this file. The tier a
+      //     content match earns is `OwnEchoLikely` whatever generation it
+      //     matched, because staleness is a fact about OUR records and not
+      //     evidence about the sender: it may buy the denials that protect US and
+      //     not the one that costs a PEER its name. What `OwnEcho` used to stand
+      //     in front of — our own withdrawn generation terminally retiring the
+      //     service that replaced it — this invariant already holds, and holds
+      //     better: the labelled `HostConflict` is dropped in the fan-out and the
+      //     labelled pre-authoritative instance conflict defers instead of
+      //     renaming, both on local lifecycle rather than on recognition. Two
+      //     mechanisms were doing one job and only one of them could do it
+      //     correctly.
+      //     WHY THAT IS SAFE, stated as the check rather than the conclusion: a
+      //     stale self-echo reaching adjudication under `OwnEchoLikely` reaches
+      //     no irreversible outcome. The terminal `ServiceUpdate::HostConflict`
+      //     needs a QR=1 positive-TTL A/AAAA at a live route's host name — a
+      //     goodbye is TTL=0 and the fan-out drops it, and a QR=0 probe echo
+      //     carries `ConflictOrigin::TentativeProbe`, which the `HostConflict`
+      //     arm ignores — so it needs an ANNOUNCEMENT echo, whose generation
+      //     either is still published (invariant 2 drops it as identical) or was
+      //     relinquished under a confirmed send (invariant 3 labels it and the
+      //     fan-out drops it). `ServiceUpdate::Renamed` and the terminal
+      //     `Conflicting` are both reached only through `probe_defeated`, which a
+      //     labelled record never latches. What is left is §8.2's regress and
+      //     §9's re-verify — same name, reversible, claiming nothing while
+      //     pending — and one redundant truthful §8.1 defence.
       //
       //  4. Two live routes sharing a HOST NAME publish the SAME address set FOR
       //     EACH RRTYPE THEY BOTH PUBLISH — enforced at registration and rename

@@ -97,6 +97,39 @@ pub enum ConflictOrigin {
   AuthoritativeResponse,
 }
 
+/// Whether a [`ProbeConflict`]'s record repeats rdata this endpoint itself
+/// recently transmitted and then gave up.
+///
+/// This is a LABEL, not a decision. The endpoint is the only layer that can know
+/// the fact — a service structurally cannot recognise a predecessor's records —
+/// but the endpoint cannot see lifecycle state, and the fact means different
+/// things in different phases. So the router states it and the service spends
+/// it; see the conflict matrix on `Service::handle_preauthoritative_conflict`
+/// for the cell-by-cell rule.
+///
+/// # What it does NOT establish
+///
+/// That the record came from us. Nothing an instantaneous history lookup can do
+/// settles that: RFC 6762 §9 exists to protect a fault-tolerance twin "capable
+/// of issuing identical answers", and such a twin's defence is byte-identical to
+/// our own ghost's echo. Only FUTURE behaviour separates them — a ghost cannot
+/// answer a re-probe and a live incumbent can — which is why the
+/// pre-authoritative cell spends this label on §8.2's one-second deferral rather
+/// than on discarding the conflict.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, IsVariant)]
+#[non_exhaustive]
+pub enum ConflictHistory {
+  /// The record's rdata matches nothing this endpoint recently transmitted under
+  /// this owner name on this address family. It is a peer's record as far as
+  /// anything here can tell.
+  Unmatched,
+  /// The record's rdata repeats a set this endpoint recently transmitted and
+  /// relinquished — through a rename, an unregister, or a completed §10.1
+  /// goodbye. It may be our own delayed echo; it may equally be a §9 twin that
+  /// legitimately publishes the same bytes.
+  Relinquished,
+}
+
 /// Identifies the datagram a [`ProbeConflict`] arrived in.
 ///
 /// RFC 6762 §8.2's tiebreak input is one query's proposal — "the Authority
@@ -139,16 +172,30 @@ pub struct ProbeConflict<'a> {
   src: SocketAddr,
   record: Ref<'a>,
   datagram: DatagramId,
+  history: ConflictHistory,
 }
 impl<'a> ProbeConflict<'a> {
   #[allow(dead_code)]
   #[inline(always)]
-  pub(crate) const fn new(src: SocketAddr, record: Ref<'a>, datagram: DatagramId) -> Self {
+  pub(crate) const fn new(
+    src: SocketAddr,
+    record: Ref<'a>,
+    datagram: DatagramId,
+    history: ConflictHistory,
+  ) -> Self {
     Self {
       src,
       record,
       datagram,
+      history,
     }
+  }
+  /// Returns whether this record repeats rdata this endpoint recently
+  /// transmitted and relinquished. See [`ConflictHistory`] — it is a label the
+  /// router attaches and the receiving service spends, not a verdict.
+  #[inline(always)]
+  pub const fn history(&self) -> ConflictHistory {
+    self.history
   }
   /// Returns which datagram carried this record. See [`DatagramId`]: one
   /// datagram is one §8.2 proposal, and proposals are never merged across them.

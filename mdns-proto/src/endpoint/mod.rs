@@ -40,7 +40,7 @@ use crate::{
     RegisterServiceError, StartQueryError, StorageFullError, TransmitError,
   },
   event::{
-    ConflictOrigin, EndpointEvent, HostConflict, KnownAnswer, ProbeConflict,
+    ConflictHistory, ConflictOrigin, EndpointEvent, HostConflict, KnownAnswer, ProbeConflict,
     ProbeProposal, QueryEvent, QueryUpdate, RouteEvent, ServiceEvent, ServiceQuestion, ToQuery,
     ToService,
   },

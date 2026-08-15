@@ -198,7 +198,7 @@ where
   /// `retain_relinquished`, `sweep_relinquished` and the withdrawal lifecycle,
   /// none of which this iterator can reach. `now` is likewise fixed for the
   /// datagram — see the field.
-  pub(crate) relinquished_screen: Option<(RecordSlot, bool)>,
+  pub(crate) relinquished_screen: Option<(RecordSlot, ConflictHistory)>,
   /// How many times the screen was actually RUN, as opposed to answered from
   /// [`Self::relinquished_screen`]. The bound this cache exists for is a
   /// statement about work done, so it is asserted on directly rather than
@@ -431,16 +431,28 @@ where
   ///
   /// See [`Self::relinquished_screen`] for why the caching is load-bearing
   /// rather than an optimisation, and why the key alone is the invalidation.
-  fn relinquished_screens(&mut self, r: &crate::wire::Ref<'_>, slot: RecordSlot) -> bool {
+  ///
+  /// The answer is a [`ConflictHistory`] rather than a decision because the two
+  /// consumers spend it differently and only one of them may suppress: see the
+  /// note in [`Self::next_service_conflict`].
+  fn relinquished_screens(
+    &mut self,
+    r: &crate::wire::Ref<'_>,
+    slot: RecordSlot,
+  ) -> ConflictHistory {
     if let Some((cached, answer)) = self.relinquished_screen
       && cached == slot
     {
       return answer;
     }
-    let answer =
-      self
-        .endpoint
-        .relinquished_asserts(r, self.now, crate::transmit::Family::of(self.src));
+    let answer = if self
+      .endpoint
+      .relinquished_asserts(r, self.now, crate::transmit::Family::of(self.src))
+    {
+      ConflictHistory::Relinquished
+    } else {
+      ConflictHistory::Unmatched
+    };
     self.relinquished_screen = Some((slot, answer));
     #[cfg(test)]
     {
@@ -461,12 +473,12 @@ where
     if r.rclass() != ResourceClass::In {
       return None;
     }
-    // THE RELINQUISHED-RRSET SCREEN. See the note on the same call in
-    // `next_service_conflict`: a record this endpoint recently asserted and gave
-    // up is ours whatever a driver's send log did or did not recognise, and the
-    // service that now holds the owner name cannot know that. Asked of the
-    // family this datagram ARRIVED on, for the reason given there.
-    if self.relinquished_screens(r, slot) {
+    // THE RELINQUISHED-RRSET SCREEN, and this helper builds only `HostConflict`
+    // — the one consequence that still SUPPRESSES on a history match rather than
+    // being delivered labelled. See the note on the same call in
+    // `next_service_conflict` for why the two consequences part company here,
+    // and why this call is asked of the family the datagram ARRIVED on.
+    if self.relinquished_screens(r, slot).is_relinquished() {
       return None;
     }
     for (key, route) in self.endpoint.services.iter() {
@@ -510,6 +522,34 @@ where
     // still publishes. It is a whole-record answer, so it is taken once here
     // rather than per candidate route.
     //
+    // A LABEL FOR THE INSTANCE HALF, A SUPPRESSION FOR THE HOST HALF, and the
+    // asymmetry is the whole of this round's change. A match cannot mean "this
+    // was ours" — a §9 fault-tolerance twin publishing identical rdata is
+    // indistinguishable from our own ghost at the instant of the lookup, and §9
+    // exists to protect exactly that twin. What a match licenses therefore
+    // depends on what the receiver would DO with it:
+    //
+    //   * A pre-authoritative `ProbeConflict` costs, at most, §8.2's one-second
+    //     deferral — and §8.2's own script separates the two cases for us,
+    //     because a ghost cannot answer the re-probe and a live incumbent can.
+    //     So it is DELIVERED carrying [`ConflictHistory::Relinquished`] and the
+    //     service defers instead of renaming. Dropping it here instead let a
+    //     successor probe and announce clean over an incumbent inside the
+    //     retention window: a defence that never reaches a service is not merely
+    //     delayed, it is unappealable.
+    //   * A `HostConflict` is TERMINAL and caller-visible, and nothing in this
+    //     crate re-verifies it — host-name probing is unimplemented, so there is
+    //     no re-probe whose silence could convict a ghost. It stays suppressed.
+    //     Suppressing the EVENT is all that buys, though: where the owner is
+    //     also the route's instance name the record is still delivered as a
+    //     labelled `ProbeConflict`, because the instance role is the one being
+    //     probed and it owes §8.1 an answer for every type at that name.
+    //
+    // The router still cannot see lifecycle state and does not need to: it
+    // states the fact, and `Service::handle_event` — which knows the phase —
+    // decides. The ESTABLISHED instance cell still drops a labelled record, for
+    // the reason it always did, but it drops it there rather than here.
+    //
     // The gap it closes: a withdrawing route stops holding its host name for the
     // registration guard, so a replacement may take host `H` with address set
     // `A2` while the route that held `H` with `A1` is still draining its §10.1
@@ -537,9 +577,7 @@ where
     // vary with the route, but this helper is re-entered after every match the
     // cursor yields, so a record matching S services scanned the whole history
     // S + 1 times. See `RouteEvents::relinquished_screen`.
-    if self.relinquished_screens(r, slot) {
-      return None;
-    }
+    let history = self.relinquished_screens(r, slot);
     for (key, route) in self.endpoint.services.iter() {
       if key < start {
         continue;
@@ -563,6 +601,11 @@ where
       // keeps every A/AAAA-at-the-host-name decision the host rule's, and
       // confines the widening to records only the instance test claims.
       //
+      // Precedence over the EVENT, never over the CONFLICT. The one case where
+      // the host rule matches and still does not consume the record is a
+      // history-labelled record at a name that is this route's instance name
+      // too — see below.
+      //
       // `route_publishes_host_rtype` is the RRSET-OWNERSHIP half of the host
       // rule, and a route that fails it FALLS THROUGH to the instance test
       // rather than being skipped. That is deliberate: the two rules are
@@ -577,13 +620,42 @@ where
         && is_host_conflict_rtype(r.rtype())
         && route_publishes_host_rtype(route, r.rtype())
       {
-        return Some((
-          key,
-          RouteEvent::ToService(ToService::new(
-            route.handle(),
-            ServiceEvent::HostConflict(HostConflict::new(*r, origin)),
-          )),
-        ));
+        if !history.is_relinquished() {
+          return Some((
+            key,
+            RouteEvent::ToService(ToService::new(
+              route.handle(),
+              ServiceEvent::HostConflict(HostConflict::new(*r, origin)),
+            )),
+          ));
+        }
+        // THE LABELLED RECORD RAISES NO `HostConflict`, exactly as before the
+        // label existed — the terminal consequence is the cell that did not
+        // change.
+        //
+        // WHAT THE DROP MAY NOT ALSO DO is answer for the INSTANCE role. When
+        // this route's instance name IS its host name the record belongs to BOTH
+        // roles: A/AAAA under that name are members of the §8.2 proposal this
+        // service is probing with, and §8.1's "any conflicting Multicast DNS
+        // response" covers every type at a name being probed. Role precedence
+        // decides which EVENT a record becomes; it may not decide that the
+        // record is no conflict at all. An unconditional `continue` here —
+        // placed to stop a suppressed `HostConflict` sliding into the instance
+        // arm — discarded a live incumbent's defence of a name we were actively
+        // probing, and the successor then completed probing and announcing over
+        // it: precisely the usurpation the pre-authoritative cell was rewritten
+        // to close, reached through the other role.
+        //
+        // So a route wearing both roles for this owner FALLS THROUGH to the
+        // instance rule below and takes the labelled `ProbeConflict`. The
+        // lifecycle cells are unchanged by that: pre-authoritatively it is
+        // §8.2's one-second deferral on the SAME name, and an ESTABLISHED
+        // service drops every A/AAAA at its instance name in the §9 arm's own
+        // rtype screen, which asserts no form of either. A route with no second
+        // role to fall through to is skipped as before.
+        if !names_match_record(route.name(), r) {
+          continue;
+        }
       }
       // EVERY type at the instance name, not just SRV/TXT. A probing host owes
       // §8.1 a deferral on "any conflicting Multicast DNS response" for a name
@@ -606,7 +678,12 @@ where
           key,
           RouteEvent::ToService(ToService::new(
             route.handle(),
-            ServiceEvent::ProbeConflict(ProbeConflict::new(self.src, *r, self.datagram)),
+            ServiceEvent::ProbeConflict(ProbeConflict::new(
+              self.src,
+              *r,
+              self.datagram,
+              history,
+            )),
           )),
         ));
       }

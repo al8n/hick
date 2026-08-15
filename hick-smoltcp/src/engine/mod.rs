@@ -93,7 +93,7 @@ const RECENT_SEND_TTL: Duration = Duration::from_secs(5);
 /// was then suppressed rather than only the first. A peer's query retransmission
 /// from port 5353 is ordinary traffic under §5.2's retry schedule, so that made
 /// legitimate peer questions invisible for the whole of [`RECENT_SEND_TTL`],
-/// every time an unrelated service registered or withdrew.
+/// every time an unrelated service crossed a lifecycle seam.
 ///
 /// # It is on the ENTRY, and there is no second epoch
 ///
@@ -234,7 +234,7 @@ struct SelfSend<I> {
   /// it must still BE outstanding: a family whose one echo has already been
   /// answered at the current tier is owed nothing further, and resurrecting the
   /// spent credit as a tombstone means an identical GENUINE peer datagram on that
-  /// family is `Provenance::OwnEcho` and fully suppressed for the rest of
+  /// family populates no cache entry and quiets nothing for the rest of
   /// [`RECENT_SEND_TTL`]. `hick-udp` keeps a separate credit per family and
   /// removes the one a current claim spends, so it reports no credit for exactly
   /// this sequence; the two stacks answer it the same way. See
@@ -287,8 +287,9 @@ enum SelfLog {
   /// publishes.
   Current,
   /// Matched an ASSERTING datagram sent BEFORE the records changed under it — a
-  /// service registered, began withdrawing, or took an RFC 6762 §9 automatic
-  /// rename since the send.
+  /// service began withdrawing, or took an RFC 6762 §9 automatic rename, since
+  /// the send. A registration is not one of those seams: see
+  /// [`Multicaster::supersede`].
   ///
   /// A datagram that asserts nothing never reaches this tier however many
   /// generations have passed: see [`SendClass`] for what the generation is
@@ -315,27 +316,36 @@ enum SelfLog {
   /// RELINQUISHED (`EndpointConfig::relinquished_retention`), which turns on
   /// local lifecycle rather than on recognition.
   ///
-  /// So it maps to `Provenance::OwnEcho`, the only tier that denies OBSERVATION
-  /// and QUIETING. That is not a claim of stronger evidence than
-  /// [`SelfLog::Current`] carries — it is that a stale echo has nothing left it
-  /// may safely say, and admitted as a peer's it would write records this engine
-  /// no longer publishes into its own cache and defer its own retransmits. That
-  /// half no screen in `mdns-proto` covers, which is what this tier is for.
+  /// So it maps to `Provenance::OwnEchoLikely` — the tier that denies
+  /// OBSERVATION and QUIETING while still ADJUDICATING, which is exactly what a
+  /// stale echo may safely say and no more. Admitted as a peer's it would write
+  /// records this engine no longer publishes into its own cache and defer its own
+  /// retransmits, and that half no screen in `mdns-proto` covers; withheld from
+  /// adjudication it would take a name from a peer that holds one.
+  ///
+  /// **`OwnEcho` HERE WAS THE FALSE AXIOM, ONE LAYER DOWN.** This tier carries no
+  /// better evidence than [`SelfLog::Current`] — it is the same content
+  /// comparison, said of an older generation — and the proto's relinquished
+  /// screen has already abandoned the premise that a byte match proves origin. A
+  /// §9 fault-tolerance twin publishing the records we gave up sends exactly
+  /// these bytes by design, and a peer may replay them; under `OwnEcho` every
+  /// such datagram was invisible for the whole entry lifetime, so a successor
+  /// could finish probing while the incumbent's defences went unheard.
   ///
   /// # It is a STANDING TOMBSTONE, not a take-once credit
   ///
-  /// `OwnEcho` denies observation, quieting, adjudication AND the §8.1 defence,
-  /// so a datagram reported this way is invisible. Exact equality with a past
-  /// send establishes CONTENT, not origin: any peer can replay bytes it captured
-  /// off the link.
+  /// Exact equality with a past send establishes CONTENT, not origin: any peer
+  /// can replay bytes it captured off the link, and a conforming twin can produce
+  /// them without replaying anything.
   ///
   /// Take-once was the bound on that, and it was the wrong trade. What these
-  /// bytes assert is a record set this engine HAS GIVEN UP, so suppressing every
-  /// copy of them can only mask an assertion no live route holds, or a
-  /// byte-identical twin still asserting our withdrawn records — a bounded
-  /// detection delay either way, self-correcting from the twin's next datagram.
-  /// And it denies an attacker nothing: mDNS is unauthenticated, so a forger can
-  /// assert the same records without our bytes.
+  /// bytes assert is a record set this engine HAS GIVEN UP, so withholding
+  /// observation and quieting for every copy of them can only mask an assertion
+  /// no live route holds, or a byte-identical twin still asserting our withdrawn
+  /// records — a bounded cache-freshness delay either way, self-correcting from
+  /// the twin's next datagram, and it costs no conflict at all now that the tier
+  /// adjudicates. And it denies an attacker nothing: mDNS is unauthenticated, so
+  /// a forger can assert the same records without our bytes.
   ///
   /// What spending cost was real and needed no attacker: one send is credited
   /// once per family while the medium may deliver several copies — kernel
@@ -354,20 +364,20 @@ enum SelfLog {
   ///
   /// Two per-family facts gate it, and neither implies the other as a rule.
   /// [`SelfSend::sent_on`] is which families TRANSMITTED the datagram: a
-  /// tombstone speaks only for those. Total suppression of bytes this engine has
-  /// given up is affordable; total suppression of bytes it never put on that link
-  /// is not, because there the datagram cannot be an echo at all and the entry
-  /// would be silencing a peer purely for agreeing with us.
+  /// tombstone speaks only for those. Standing over bytes this engine has given
+  /// up is affordable; standing over bytes it never put on that link is not,
+  /// because there the datagram cannot be an echo at all and the entry would be
+  /// muting a peer's cache and quieting contribution purely for agreeing with us.
   ///
   /// [`SelfSend::owed`] is which of those echoes are still OUTSTANDING. A family
   /// that already took its one loopback copy at the current tier has had its echo
   /// accounted, and a generation change does not hand it back: standing for a
-  /// consumed credit means an identical GENUINE peer datagram on that family is
-  /// `OwnEcho` and invisible for the rest of [`RECENT_SEND_TTL`], which is the
-  /// suppression this tier's family precondition exists to refuse, one dimension
-  /// over. Nothing here CLEARS `owed`, so a tombstone that has one still answers
-  /// every copy of it — the standing property is intact for exactly the copies
-  /// the entry is owed.
+  /// consumed credit means an identical GENUINE peer datagram on that family
+  /// populates no cache entry and quiets nothing for the rest of
+  /// [`RECENT_SEND_TTL`], which is the suppression this tier's family
+  /// precondition exists to refuse, one dimension over. Nothing here CLEARS
+  /// `owed`, so a tombstone that has one still answers every copy of it — the
+  /// standing property is intact for exactly the copies the entry is owed.
   Superseded,
   /// Matched nothing this log still holds.
   None,
@@ -1229,8 +1239,9 @@ impl<I: Instant> Multicaster<I> {
       // standing tombstone, answering every copy inside the window rather than
       // the first — but it still requires there to BE one. This family's echo
       // was already answered while the entry was current, and a generation
-      // change does not hand the spent copy back: standing on it would map an
-      // identical GENUINE peer datagram to `OwnEcho` for the rest of
+      // change does not hand the spent copy back: standing on it would strip an
+      // identical GENUINE peer datagram of its §10 cache contribution and its
+      // §7.1/§7.3 quieting for the rest of
       // `RECENT_SEND_TTL`. `hick-udp` holds a separate credit per family and
       // removes the one a current claim spends, so it reports no credit here;
       // the two stacks must not disagree about the same sequence.
@@ -1290,6 +1301,35 @@ impl<I: Instant> Multicaster<I> {
   /// recorded that ASSERTS records describes a state it has left. See
   /// [`SelfLog::Superseded`].
   ///
+  /// # Where the engine must call it, which is TWO events
+  ///
+  /// At every mutation of what this engine publishes, and RFC 6762 §8.4 record
+  /// updating being unimplemented, that is the `begin_withdrawal` retiring a
+  /// route (however the retirement was reached) and the §9 AUTOMATIC RENAME,
+  /// taken at the `ServiceUpdate::Renamed` the engine observes. `hick-udp`'s
+  /// `SelfSendTracker::supersede` holds the same rule for the `std` drivers; the
+  /// two stacks keep their own send logs, so the rule is written out twice on
+  /// purpose and the two copies must be changed together.
+  ///
+  /// # A REGISTRATION IS NOT ONE OF THEM
+  ///
+  /// It was called here once, and it was wrong. A registration only INSERTS a
+  /// route: it mutates no record this engine has already asserted. There is no
+  /// §8.4 records mutator, a duplicate instance name and a name still held by a
+  /// collision goodbye are both refused, a live route publishing the same host
+  /// name with a different A or AAAA set makes the registration fail
+  /// (`Endpoint::host_addresses_disagree`), and the encoder emits exactly one
+  /// §6.1 NSEC per service — owned by the INSTANCE name — so no sibling
+  /// registration can flip a host-name NSEC's truth either. Nothing this engine
+  /// had asserted, positive or negative, changes truth-value there.
+  ///
+  /// What a spurious advance costs is not one datagram. A superseded entry is a
+  /// STANDING tombstone, so it denies observation and quieting to EVERY
+  /// byte-identical copy for the rest of [`RECENT_SEND_TTL`] — including a
+  /// peer's TTL=0 §10.1 goodbye burst, which then reaches no cache and leaves
+  /// the entry it exists to retract standing for its full original TTL instead
+  /// of §10.1's one-second clamp.
+  ///
   /// The advance is global to the log, but what it can retire is not: an entry
   /// for a datagram that asserts nothing is untouched by it, because there is
   /// nothing in a question for a publication change to invalidate. See
@@ -1298,6 +1338,15 @@ impl<I: Instant> Multicaster<I> {
   /// It does NOT clear the log: clearing would make exactly the echoes this
   /// protects against read as `NotFromUs` — full peer traffic, full adjudication
   /// — which is the failure it exists to prevent, only louder.
+  ///
+  /// # The residual: ONE generation for the whole log
+  ///
+  /// A genuine advance still demotes the outstanding entries of every service
+  /// the seam did not touch — sequentially withdrawing service N+1 demotes
+  /// service N's just-sent goodbye entry. Fixing it means a record-set delta
+  /// computed in `mdns-proto`, which becomes mandatory only if §8.4 record
+  /// updating lands; a wrong delta UNDER-supersedes, which is the harmful
+  /// direction. See `SelfSendTracker::supersede`, which states the same residual.
   fn supersede(&mut self) {
     self.generation = self.generation.wrapping_add(1);
   }
@@ -1442,11 +1491,11 @@ where
     let (handle, proto) = self
       .endpoint
       .try_register_service::<Slab<Transmit>, Slab<ServiceUpdate>>(spec, now)?;
-    // A new live route publishes records no log entry so far knows about, and
-    // the reverse: an in-flight echo of a WITHDRAWING route's announcement can
-    // now be routed to this one. After the `?`, so a rejected registration
-    // advances nothing. See `SelfLog::Superseded`.
-    self.tx.supersede();
+    // NO SUPERSEDE HERE. A registration only INSERTS a route: it mutates no
+    // record this engine has already asserted, positive or negative, so every
+    // entry in the log still describes a state the engine is in. See
+    // `Multicaster::supersede` for why superseding here declared a falsehood and
+    // what the tombstone then cost.
     self.services.insert(
       handle,
       ServiceSlot {
@@ -1991,6 +2040,20 @@ where
     // suspects is its own costs a name permanently and silently between two
     // conforming hosts; adjudicating our own echo costs at worst one §8.2 second.
     //
+    // **AND SO IS A SUPERSEDED MATCH**, for the same reason one dimension over.
+    // Nothing about it is better evidence than a current match carries — it is
+    // the same content comparison, said of an older generation — so it may deny
+    // OBSERVATION and QUIETING, where believing a peer poisons this engine's own
+    // cache with records it no longer publishes and defers its own retransmits,
+    // and it may not deny ADJUDICATION. `OwnEcho` here was the false axiom the
+    // proto's relinquished screen abandoned, sitting one layer down: byte
+    // equality read as proof of origin. A superseded entry is a STANDING
+    // tombstone, so under that mapping a §9 fault-tolerance twin publishing the
+    // bytes we gave up — or a peer replaying them — was invisible for every copy
+    // it sent, and a successor could finish probing while the incumbent went
+    // unheard. What the tier used to buy is bought better by the
+    // `relinquished_retention` screen: see `SelfLog::Superseded`.
+    //
     // `SelfLog::None` is a negative claim about this engine's own send log, which
     // is `NotFromUs` — and `NotFromUs` declines `trust_advertised_src_as_self`,
     // because a caller that logs what it sends has better evidence than a source
@@ -2009,7 +2072,7 @@ where
     let provenance = if src.port() == MDNS_PORT {
       match self.tx.claim(Family::of(src.ip()), data, now) {
         SelfLog::Current => Provenance::OwnEchoLikely,
-        SelfLog::Superseded => Provenance::OwnEcho,
+        SelfLog::Superseded => Provenance::OwnEchoLikely,
         SelfLog::None => Provenance::NotFromUs,
       }
     } else {
@@ -2107,9 +2170,10 @@ where
           //
           // UNCONDITIONALLY, and at the mutation. A rename that COLLIDES is torn
           // down through `begin_service_withdrawal`, which supersedes for its own
-          // reason; a SURVIVING one crosses no lifecycle seam at all, so until
-          // the next registration or withdrawal every entry for the abandoned
-          // owner still reads as `SelfLog::Current` and reaches
+          // reason; a SURVIVING one crosses no other seam at all, so until the
+          // next withdrawal or rename — a registration is not one of them and
+          // does not help here — every entry for the abandoned owner still reads
+          // as `SelfLog::Current` and reaches
           // `Provenance::OwnEchoLikely`, which ADJUDICATES. Whether a given stale
           // entry can then reach an adverse route is a routing question that
           // would have to be re-derived after every change to the routing; the

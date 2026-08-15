@@ -810,8 +810,9 @@ pub enum SelfSendMatch {
   /// An **asserting** credit matched, at either strength, but it was recorded
   /// **before the caller last called [`SelfSendTracker::supersede`]** — so these
   /// are our bytes from a generation of our own records that no longer exists,
-  /// because a service registered, began withdrawing, or took an RFC 6762 §9
-  /// automatic rename since the send.
+  /// because a service began withdrawing or took an RFC 6762 §9 automatic rename
+  /// since the send. A registration is not one of those seams — see
+  /// [`SelfSendTracker::supersede`].
   ///
   /// A datagram that asserts nothing never reaches this tier however many
   /// generations have passed: see [`SendClass`] for what the generation is
@@ -860,13 +861,24 @@ pub enum SelfSendMatch {
   ///
   /// # What a caller must still do with it
   ///
-  /// Suppress the datagram completely — the `OwnEcho` tier — and never the
-  /// adjudicating one. That is not a claim of stronger evidence: it is that a
-  /// superseded echo has nothing left it may safely say. What it is worth is
-  /// **defence in depth on the OTHER half of the harm**: a stale echo admitted
-  /// as a peer's writes records this endpoint no longer publishes into its own
-  /// cache and defers this endpoint's own retransmits, and no screen in
-  /// `mdns-proto` covers observation or quieting.
+  /// Report `Provenance::OwnEchoLikely`, the same tier [`Self::Degraded`] gets:
+  /// observation and quieting denied, adjudication and the RFC 6762 §8.1 defence
+  /// allowed. This carries no better evidence than `Degraded` — it is the same
+  /// content comparison, said of an older generation — so it may not deny more.
+  ///
+  /// What it is worth is **defence in depth on ONE half of the harm**: a stale
+  /// echo admitted as a peer's writes records this endpoint no longer publishes
+  /// into its own cache and defers this endpoint's own retransmits, and no screen
+  /// in `mdns-proto` covers observation or quieting.
+  ///
+  /// **NOT `OwnEcho`.** That was this module's own false axiom — byte equality
+  /// read as proof of origin — and a superseded entry is deliberately
+  /// non-consuming, so it applied to EVERY copy. An old local responder and a
+  /// live §9 twin can produce the same bytes, and a peer can replay them; under
+  /// `OwnEcho` all of them were invisible for the whole of [`SELF_SEND_TTL`], so
+  /// a successor could finish probing while the incumbent's defences went
+  /// unheard. The terminal outcome this tier once stood in front of is held by
+  /// `mdns-proto`'s relinquished screen instead, as the section above says.
   ///
   /// The cost is bounded: the datagram must still be byte-identical to one we
   /// sent, on the same family, from port 5353, inside [`SELF_SEND_TTL`].
@@ -907,7 +919,7 @@ impl SelfSendMatch {
 /// byte-identical copy was then suppressed rather than only the first. A peer's
 /// query retransmission from port 5353 is ordinary traffic under §5.2's retry
 /// schedule, so that made legitimate peer questions invisible for the whole of
-/// [`SELF_SEND_TTL`], every time an unrelated service registered or withdrew.
+/// [`SELF_SEND_TTL`], every time an unrelated service crossed a lifecycle seam.
 ///
 /// # It is on the ENTRY, and there is no second epoch
 ///
@@ -956,7 +968,7 @@ impl SendClass {
   /// * **AUTHORITY records in a query** — the RFC 6762 §8.2 probe proposal. This
   ///   is the whole reason the class cannot be the QR bit: a probe is a query by
   ///   the header and asserts by its content, and its proposal is exactly what a
-  ///   registration or a withdrawal retires;
+  ///   withdrawal or a rename retires;
   /// * **ADDITIONAL records in a query** — no §7.x query shape puts publishable
   ///   records there, so this is the unclassifiable case rather than a known
   ///   one, and it takes the supersedable reading;
@@ -1105,8 +1117,8 @@ pub struct SelfSendTracker {
   /// Which generation of this endpoint's own records new credits are recorded
   /// under. Advanced only by [`Self::supersede`].
   ///
-  /// `u64` at one advance per service registration or withdrawal cannot wrap in
-  /// any runtime this endpoint will see, and the comparison is equality rather
+  /// `u64` at one advance per service withdrawal or rename cannot wrap in any
+  /// runtime this endpoint will see, and the comparison is equality rather
   /// than ordering, so even a wrap would need 2⁶⁴ lifecycle events inside one
   /// two-second [`SELF_SEND_TTL`] to alias.
   generation: u64,
@@ -1160,12 +1172,10 @@ impl SelfSendTracker {
   ///
   /// # Where a driver must call this
   ///
-  /// At **every mutation of what this endpoint publishes**, which is three
-  /// events and no more, because RFC 6762 §8.4 record updating is unimplemented
-  /// and a `Service` exposes no records mutator:
+  /// At **every mutation of what this endpoint publishes**, which is two events
+  /// and no more, because RFC 6762 §8.4 record updating is unimplemented and a
+  /// `Service` exposes no records mutator:
   ///
-  /// * a service registration, which puts a live route's records on the wire
-  ///   that no earlier credit knows about;
   /// * the `begin_withdrawal` that retires a route, however that retirement was
   ///   reached (caller unregister, shutdown, rename collision, internal
   ///   retirement);
@@ -1173,11 +1183,11 @@ impl SelfSendTracker {
   ///   `ServiceUpdate::Renamed` — `Service::set_instance` has already rewritten
   ///   that service's records by the time the update is observed.
   ///
-  /// The rename is the one that reaches neither of the others when it SUCCEEDS,
-  /// and it is owed on the strength of being a MUTATION rather than on a
-  /// consequence traced from it. This type holds ONE generation for the whole
-  /// log, so the next registration or withdrawal demotes the renamer's stale
-  /// credit as well; what the advance at the rename closes is the stretch
+  /// The rename is the one that reaches neither the withdrawal nor any other
+  /// seam when it SUCCEEDS, and it is owed on the strength of being a MUTATION
+  /// rather than on a consequence traced from it. This type holds ONE generation
+  /// for the whole log, so the next seam of either kind demotes the renamer's
+  /// stale credit as well; what the advance at the rename closes is the stretch
   /// between it and that next seam, during which a credit for the abandoned
   /// instance name still claims as current and still adjudicates. Arguing from
   /// reachability instead is what left the rename off this list once already,
@@ -1190,14 +1200,43 @@ impl SelfSendTracker {
   /// against every receive path that could run in between. Advancing it at the
   /// mutation itself is true whatever the loop shape.
   ///
-  /// # Erring towards calling it is cheap; erring away is not
+  /// # A REGISTRATION IS NOT ONE OF THEM
   ///
-  /// A spurious advance costs at most the adjudication of one byte-identical
-  /// in-flight datagram, and a datagram byte-identical to one of ours ties under
-  /// §8.2.1 and is "never a conflict" under §9 — so there was nothing there to
-  /// lose. A missing advance lets a stale echo populate this endpoint's cache
-  /// with records it no longer publishes, and quiet its own traffic on their
-  /// behalf.
+  /// It was on this list, and it was wrong. A registration only INSERTS a route.
+  /// It mutates no record this endpoint has already asserted: there is no §8.4
+  /// records mutator, a duplicate instance name and a name still held by a
+  /// collision goodbye are both refused, and a live route that publishes the
+  /// same host name with a different A or AAAA set makes the registration fail
+  /// (`Endpoint::host_addresses_disagree`). The NEGATIVE assertions are covered
+  /// too: the encoder emits exactly one §6.1 NSEC per service and it is owned by
+  /// the INSTANCE name, so no sibling registration can flip a host-name NSEC's
+  /// truth. Nothing this endpoint had asserted, positive or negative, changes
+  /// truth-value at a registration — so calling this there declared a falsehood.
+  ///
+  /// Read the predicate, not the reachability. "A new route publishes records no
+  /// earlier credit knows about" is true and beside the point: the question this
+  /// type asks is whether an EARLIER credit still describes a state this endpoint
+  /// is in, and adding a route leaves every one of them describing one.
+  ///
+  /// # Erring towards calling it is NOT cheap
+  ///
+  /// It was documented as cheap on the reasoning that a spurious advance costs
+  /// at most the adjudication of one byte-identical in-flight datagram. That
+  /// costing predates the standing tombstone. A superseded credit is no longer
+  /// take-once: it answers EVERY byte-identical copy for the rest of
+  /// [`SELF_SEND_TTL`] and no claim spends it, so one spurious advance denies
+  /// observation and quieting to every copy of those bytes for the whole window
+  /// — to a conforming §9 fault-tolerance twin's identical answers, and to a
+  /// peer's TTL=0 §10.1 goodbye burst, which then reaches no cache at all and
+  /// leaves the entry it exists to retract standing for its full original TTL
+  /// instead of §10.1's one-second clamp.
+  ///
+  /// A missing advance is still the worse direction, and that is why the list
+  /// above is stated over MUTATIONS rather than over reachable harms: it lets a
+  /// stale echo populate this endpoint's cache with records it no longer
+  /// publishes, and quiet its own traffic on their behalf. But "when unsure,
+  /// call it" is not the rule. The rule is the predicate — call it where what
+  /// this endpoint publishes CHANGED.
   ///
   /// It no longer costs a live service a terminal `HostConflict`: that is
   /// screened in `mdns-proto` by `EndpointConfig::relinquished_retention`, which
@@ -1218,6 +1257,25 @@ impl SelfSendTracker {
   /// caller's decision — the class is read off each datagram's own bytes at
   /// [`Self::record`]. See [`SendClass`], which is also where the reason a
   /// SEPARATE query epoch would be worse than none is written down.
+  ///
+  /// # The residual: ONE generation for the whole log
+  ///
+  /// What it retires it retires INDISCRIMINATELY. There is one counter here, not
+  /// one per route, so a genuine advance also demotes the outstanding credits of
+  /// every service the seam did not touch. Sequential withdrawal is the sharp
+  /// case: tearing down service N+1 demotes service N's just-sent goodbye credit,
+  /// and the harm is the same pair as above — every byte-identical copy of N's
+  /// goodbye denied observation and quieting for the rest of [`SELF_SEND_TTL`].
+  ///
+  /// It is not fixed here, deliberately. Its preconditions are compound — a §9
+  /// fault-tolerance twin whose datagram is byte-identical to one this endpoint
+  /// itself sent inside the recency window, PLUS a lifecycle event inside that
+  /// same window, PLUS the whole of the twin's burst inside it — while fixing it
+  /// properly means computing a record-set delta in `mdns-proto` and retiring
+  /// only the credits that delta covers. That machinery becomes mandatory if
+  /// §8.4 record updating lands, and building it early is the wrong risk: a
+  /// delta that is wrong under-supersedes, which is the harmful direction this
+  /// whole type exists to avoid.
   pub fn supersede(&mut self) {
     self.generation = self.generation.wrapping_add(1);
   }

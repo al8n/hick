@@ -560,11 +560,11 @@ impl Mdns {
     let (handle, proto) = self
       .endpoint
       .try_register_service::<Slab<_>, Slab<_>>(spec, now)?;
-    // A new live route publishes records no credit recorded so far knows about,
-    // and the reverse: an in-flight echo of a WITHDRAWING route's announcement
-    // can now be routed to this one. After the `?`, so a rejected registration
-    // advances nothing.
-    self.selfsend.supersede();
+    // NO SUPERSEDE HERE. A registration only INSERTS a route: it mutates no
+    // record this endpoint has already asserted, positive or negative, so every
+    // credit in the log still describes a state this endpoint is in. See
+    // `SelfSendTracker::supersede` for why superseding here declared a falsehood
+    // and what the tombstone then cost.
     self.services.insert(
       handle,
       ServiceCtx {

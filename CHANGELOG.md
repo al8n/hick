@@ -11,32 +11,51 @@
   positive-TTL echo of `A1` — **our own bytes** — was then adjudicated against
   `A2` and retired a live service with a TERMINAL `ServiceUpdate::HostConflict`.
   Same-instance reuse with changed SRV/TXT reached a false §8.1 probe defeat the
-  same way. The screen reads two sources: withdrawal items still resident (a
-  withdrawing route's own set, and a §9 rename's abandoned instance name), and a
-  bounded retention list fed at withdrawal completion and at the rename.
-  Service B structurally cannot know the stale set was ours, so only the endpoint
-  can decide this.
+  same way. A match cannot settle whether the record really is a delayed echo of
+  ours: §9 exists to protect a fault-tolerance twin "capable of issuing identical
+  answers", and such a twin's defence is byte-for-byte what our own ghost's echo
+  would be, so only FUTURE behaviour — whether a re-probe gets answered — can
+  tell them apart. The screen therefore **labels** a match with new
+  `ConflictHistory::Relinquished` (read via new `ProbeConflict::history`) rather
+  than deciding it outright, and what the label buys depends on what the
+  receiving cell would otherwise do: a pre-authoritative instance conflict is
+  still delivered, and the service spends the label on RFC 6762 §8.2's existing
+  one-second defer-and-re-probe instead of an immediate §8.1 rename — a ghost
+  cannot answer the re-probe and a live incumbent can; an established instance
+  conflict is still dropped, exactly as before; and a `HostConflict` is still
+  dropped in the fan-out, because it is terminal and caller-visible and
+  host-name probing is unimplemented, so no re-probe's silence could convict a
+  ghost of it (a route whose instance name IS its host name still receives the
+  record as a labelled `ProbeConflict`, since A/AAAA under that name also belong
+  to that route's own §8.2 proposal). The screen reads two sources: withdrawal
+  items still resident (a withdrawing route's own set, and a §9 rename's
+  abandoned instance name), and a bounded retention list fed at withdrawal
+  completion and at the rename. Service B structurally cannot know the stale set
+  was ours; only the endpoint can state that fact, and only the service, which
+  alone can see lifecycle phase, can decide what the fact is worth.
 - `mdns-proto`: new `EndpointConfig::relinquished_retention` /
   `with_relinquished_retention`, defaulting to five seconds — long enough to
   outlast both a driver's self-send recency window and the §10.1 goodbye ceiling.
   `Duration::ZERO` disables the retention half. The residual is stated rather
   than hidden: a real peer asserting, within the window, rdata exactly equal to a
-  set we just relinquished at that same owner has its detection delayed by up to
-  that long. It self-corrects, and it is not an attack surface — mDNS is
-  unauthenticated, so a forger never needed our bytes.
+  set we just relinquished at that same owner has the conflict's resolution
+  delayed by up to that long, per the cell-by-cell rule above. It self-corrects, and
+  it is not an attack surface — mDNS is unauthenticated, so a forger never
+  needed our bytes.
 - `mdns-proto`, `hick-udp`, `hick-mio`, `hick-reactor`, `hick-compio`,
-  `hick-smoltcp`: the driver-side generation binding behind
-  `Provenance::OwnEcho`'s superseded route is now **defence in depth**, and every
-  doc that said otherwise is corrected. It cannot be the load-bearing check:
-  recognising the echo is defeasible three independent ways, none of which a
-  driver can close — an on-link peer replaying captured bytes reproduces every
-  signal a send log weighs, one send is credited once per family while the medium
-  may deliver several copies (kernel loopback plus an 802.11 base-station
-  re-broadcast, which §8.2 names), and credits are evicted under load. Each
-  leaves the GENUINE echo reading "no credit", hence `NotFromUs`, hence fully
-  adjudicated. What the binding still buys is the other half of the harm: a stale
-  echo must not populate this endpoint's cache with records it no longer
-  publishes, nor quiet its own traffic on their behalf.
+  `hick-smoltcp`: the driver-side generation binding — a self-send credit bound
+  to the record generation it was sent under, reported as
+  `Provenance::OwnEchoLikely` once superseded rather than kept at `OwnEcho` — is
+  **defence in depth**, and every doc that said otherwise is corrected. It
+  cannot be the load-bearing check: recognising the echo is defeasible three
+  independent ways, none of which a driver can close — an on-link peer replaying
+  captured bytes reproduces every signal a send log weighs, one send is credited
+  once per family while the medium may deliver several copies (kernel loopback
+  plus an 802.11 base-station re-broadcast, which §8.2 names), and credits are
+  evicted under load. Each leaves the GENUINE echo reading "no credit", hence
+  `NotFromUs`, hence fully adjudicated. What the binding still buys is the other
+  half of the harm: a stale echo must not populate this endpoint's cache with
+  records it no longer publishes, nor quiet its own traffic on their behalf.
 - `hick-udp`, `hick-smoltcp`: a SUPERSEDED self-send credit is a **standing
   tombstone** rather than a take-once one. Every byte-identical copy inside the
   recency window reports it, and no claim consumes it; only the TTL and the byte
@@ -53,6 +72,62 @@
   own cache. `hick-udp` also now prefers a CURRENT credit over a superseded copy
   of the same bytes, the rule `hick-smoltcp` already applied, without which a
   standing tombstone would shadow the current tier for the whole window.
+- `hick-mio`, `hick-reactor`, `hick-compio`, `hick-smoltcp` (and `hick-embassy`,
+  which inherits it): **a service registration no longer advances the self-send
+  generation.** The seam is deleted from all four drivers. `supersede` declares
+  that what this endpoint publishes has CHANGED, so every credit already recorded
+  describes a state it has left — and a registration only INSERTS a route. It
+  mutates no record already asserted: RFC 6762 §8.4 record updating is
+  unimplemented and a `Service` exposes no records mutator, a duplicate instance
+  name and a name a collision goodbye still holds are both refused, and a live
+  route publishing the same host name with a different A or AAAA set makes the
+  registration fail outright. The negative assertions are covered too — the
+  encoder emits exactly one §6.1 NSEC per service, owned by the INSTANCE name, so
+  no sibling registration can flip a host-name NSEC's truth. Nothing this
+  endpoint had asserted changed truth-value there, so the advance asserted
+  something false about its own records. With a superseded credit now a standing
+  tombstone, that falsehood was expensive rather than free: one unrelated
+  registration denied §10 observation and §7.1/§7.3 quieting to EVERY
+  byte-identical copy of a live service's own bytes for the whole recency
+  window — to a conforming §9 fault-tolerance twin's identical answers, and to a
+  genuine peer's TTL=0 §10.1 goodbye burst, which then reached no cache at all
+  and left the entry it exists to retract standing for its FULL original TTL
+  instead of §10.1's one-second clamp. The `begin_withdrawal` and §9 automatic
+  rename seams are untouched — those really are mutations, and the advance is
+  owed at both.
+- The residual of the above is stated rather than hidden, in the same spirit as
+  `relinquished_retention`'s: there is ONE generation for the whole send log, not
+  one per route, so a GENUINE advance still demotes the outstanding credits of
+  every service the seam did not touch. Sequential withdrawal is the sharp case —
+  tearing down service N+1 demotes service N's just-sent goodbye credit — and the
+  harm is the same pair, observation and quieting denied to every copy for the
+  rest of the window. Its preconditions are compound: a §9 fault-tolerance twin
+  whose datagram is byte-identical to one this endpoint itself sent inside the
+  window, plus a lifecycle event inside that same window, plus the whole of the
+  twin's burst inside it. Fixing it properly needs a record-set delta computed in
+  `mdns-proto`, which becomes mandatory only if §8.4 record updating lands; a
+  delta that is wrong UNDER-supersedes, which is the harmful direction, so it is
+  not built speculatively.
+- **BREAKING:** `Endpoint::unregister_service` — the sans-I/O core's
+  force-remove primitive, not the same-named wrapper each of the four bundled
+  drivers exposes over the ordinary withdrawal lifecycle — takes two new
+  required parameters, `asserted: Option<WithdrawalSnapshot>` and `now: I`, in
+  place of just a handle. Force removal frees the owner names the instant it
+  returns and sends no goodbye, so it was the one relinquishing path that used
+  to feed nothing to the screen above: a service force-removed right after a
+  confirmed positive send, with a replacement registered at the same owner
+  names in the very next statement, let a delayed echo of the removed
+  service's own records reach ordinary conflict adjudication and retire the
+  replacement. `asserted` is the removed service's `Service::withdrawal_snapshot`
+  — the same value `begin_withdrawal` already took, reporting what a confirmed
+  send actually emitted — and `now` anchors the `EndpointConfig::relinquished_retention`
+  window the same way it does when a normal withdrawal completes. Pass
+  `Some(..)` whenever the `Service` still exists; `None` is only for a caller
+  with no `Service` left to ask — the state machine already dropped, or its
+  goodbye already drained and retained by `drain_completed_withdrawals` when it
+  completed. None of the four bundled drivers call this method directly, so
+  this breaks only a direct caller of the `mdns-proto` core — exactly who has
+  no wrapper to shield them and no other way to learn of it.
 
 ## A typed trust tier for received datagrams
 
@@ -112,14 +187,18 @@ BREAKING
   makes no conflict at all, and it is the point of the change rather than a side
   effect: their self-detection was never strong enough to justify deleting a §8
   proposal. The one echo for which that does not hold — one sent before a
-  service registered, began withdrawing or took a §9 automatic rename, so it
-  may assert records no live route holds — reports `OwnEcho` and is suppressed
-  whole. That is not a
-  stronger claim about the evidence but a weaker claim about what the bytes may
-  still say.
+  service began withdrawing or took a §9 automatic rename, so it
+  may assert records no live route holds — reports the SAME `OwnEchoLikely`
+  tier rather than a stronger one: a stale match is no better evidence of
+  origin than a current one, so it may buy only the denials that protect this
+  endpoint (§10 cache population, §7.1/§7.3 quieting) and never the one that
+  costs a PEER its name. What a stale echo's worst reachable outcome once
+  turned on is held better and elsewhere — the `relinquished_retention` screen
+  above, on this endpoint's own lifecycle rather than on recognising a
+  datagram.
 - **`hick-smoltcp`'s self-send log becomes take-once, address-family keyed and
   source-port gated**, and `hick-embassy` inherits all three. It is what the
-  `OwnEcho` above may not be granted without: exact equality with a past send
+  `OwnEchoLikely` above may not be granted without: exact equality with a past send
   establishes CONTENT and not ORIGIN, so against a non-consuming log a peer
   replaying bytes it captured off the link matched for the whole five-second
   retention window, every copy — and during a same-name replacement an old
@@ -139,11 +218,14 @@ BREAKING
   byte-identical datagram produces, so it may not be trusted with a name. It is
   the whole of the match on Windows and on any kernel that delivers no timestamp
   cmsg. A match at EITHER strength against a credit recorded before a service
-  registered, began withdrawing or took a §9 automatic rename reports `OwnEcho`
-  as well, for the reason the bullet above gives: a stale echo may no longer adjudicate anything. No credit,
-  or a source port this endpoint never sends from, becomes `NotFromUs` rather
-  than `Unknown`, which additionally declines `trust_advertised_src_as_self` on
-  these drivers.
+  began withdrawing or took a §9 automatic rename reports
+  `OwnEchoLikely` as well, never `OwnEcho`: staleness is a fact about this
+  endpoint's own records, not evidence about the sender, so it may buy the
+  denials that protect this endpoint (§10 caching, §7.1/§7.3 quieting) and not
+  the one that costs a PEER its name — the reason the bullet above gives. No
+  credit, or a source port this endpoint never sends from, becomes `NotFromUs`
+  rather than `Unknown`, which additionally declines `trust_advertised_src_as_self`
+  on these drivers.
 
 OTHER
 
@@ -240,19 +322,26 @@ BREAKING
   withdrawing route is deliberately not blocked from replacement, so a service
   may take a host name while the route that previously held it is still
   draining its §10.1 goodbye, and a delayed echo of that route's own
-  announcement then carries rdata no live route holds. Suppressing such an
-  echo is still safe — take-once still spends the credit — but adjudicating it
-  is not: its §8.2 proposal is for a name this endpoint may no longer be
-  defending, and its §9 rdata is rdata no live route holds. A driver calls
-  `supersede` at every mutation of what it publishes — a service registration,
-  the withdrawal that retires a route however it was reached, and the §9
-  AUTOMATIC RENAME, which `Service::set_instance` has already applied by the
-  time the driver sees `ServiceUpdate::Renamed` and which reaches neither of the
-  other two when it succeeds — and maps `Superseded` onto `Provenance::OwnEcho`,
-  the only
-  tier that denies adjudication, rather than discarding the credit: discarding
-  would make the same echo read as `NoCredit`, full peer traffic and full
-  adjudication, the same failure louder. `SelfSendMatch` stays
+  announcement then carries rdata no live route holds. Its credit is kept
+  rather than discarded because keeping it still buys what a CURRENT echo's
+  credit buys — denial of observation and quieting, so admitting the echo as
+  peer traffic cannot write this endpoint's own withdrawn records into its own
+  cache or defer its own retransmits on their behalf — but adjudicating it is
+  safe rather than merely tolerated: its §8.2 proposal is for a name this
+  endpoint may no longer be defending and its §9 rdata is rdata no live route
+  holds, yet the worst that could otherwise cause, a stale announcement
+  retiring the service that replaced it, is what `mdns-proto`'s
+  relinquished-history screen closes independently, on this endpoint's own
+  lifecycle rather than on recognising the datagram. A driver calls `supersede`
+  at every mutation of what it publishes — a service registration, the
+  withdrawal that retires a route however it was reached, and the §9 AUTOMATIC
+  RENAME, which `Service::set_instance` has already applied by the time the
+  driver sees `ServiceUpdate::Renamed` and which reaches neither of the other
+  two when it succeeds — and maps `Superseded` onto `Provenance::OwnEchoLikely`,
+  the same tier a CURRENT content-only match gets, rather than discarding the
+  credit: discarding would make the same echo read as `NoCredit`, hence
+  `NotFromUs`, losing the cache and quieting denials without buying anything
+  back, since both tiers adjudicate alike. `SelfSendMatch` stays
   non-`#[non_exhaustive]`, so the new variant is itself the breaking change:
   every existing match over the type must add an arm.
 
@@ -264,6 +353,40 @@ OTHER
   what a self-send credit is keyed on, so the divergence became load-bearing.
   The rule is stated once, on `hick_udp::selfsend::RxDatagram`, and `recv_datagram`
   reports `InvalidData` rather than approximating.
+
+## A bind can no longer silently misapply an IPv4 multicast socket option
+
+OTHER
+
+- `hick-udp`: `try_bind_v4` now reads `IP_MULTICAST_LOOP` and `IP_MULTICAST_TTL`
+  back immediately after setting them, and **fails the bind** with new
+  `BindError::MulticastLoopNotApplied` / `BindError::MulticastTtlNotApplied` if
+  the kernel accepted the `setsockopt` call but holds a value other than the
+  one requested — the same read-back-and-fail policy the existing IPv6 twin,
+  `BindError::MulticastHopsNotApplied`, already used. A successful return code
+  is not proof the kernel stored the value: a wrong transport width on a target
+  where either scalar is a narrower field than this crate assumed, or a future
+  change that routes either setter onto a wrong level or constant, can each
+  leave `setsockopt` reporting success while the kernel keeps its own default.
+  That is worth failing the bind over rather than merely logging: a multicast
+  TTL silently held at 0 means nothing this responder ever sends leaves the
+  host, a complete and silent failure that is far harder to diagnose in the
+  field than a bind refused up front. `BindError` is `#[non_exhaustive]`, so
+  this is additive rather than a compile break — but a bind that previously
+  succeeded can now fail on an affected host, and nothing in an existing build
+  warns of the new failure mode.
+- `hick-udp`: `try_bind_v4` also reads `IP_MULTICAST_IF` back, but only WARNS
+  on a disagreement rather than failing the bind — deliberately asymmetric with
+  the two options above, not an inconsistency to line up with them later. This
+  option's GET direction could not be confirmed from source to round-trip
+  correctly on FreeBSD, DragonFly, OpenBSD or NetBSD — a kernel may
+  legitimately report the interface's primary address, or `INADDR_ANY`, which
+  would be indistinguishable here from a real drift — and three of those four
+  targets have no runner anywhere in this workspace, so a hard failure would
+  risk bricking the IPv4 bind on a conforming host with no way to find out
+  first. The historical silent-unset defect this guards against is already
+  closed upstream by the pre-existing `BindError::InterfaceNotFound`, which
+  fires when the requested interface index resolves to no IPv4 address at all.
 
 # RELEASED
 

@@ -11,6 +11,8 @@ use std::{net::Ipv4Addr, time::Instant as StdInstant};
 
 type TestQuery = Query<StdInstant, slab::Slab<CollectedAnswer>, slab::Slab<QueryUpdate>>;
 
+type TestSvc = crate::service::Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>;
+
 type TestEndp = Endpoint<
   StdInstant,
   rand::rngs::StdRng,
@@ -10899,27 +10901,87 @@ fn host_conflicted_from(
     .collect()
 }
 
-/// Every `ServiceHandle` this datagram raises a `ProbeConflict` on.
-fn probe_conflicted(e: &mut TestEndp, pkt: &[u8], now: StdInstant) -> std::vec::Vec<ServiceHandle> {
-  probe_conflicted_from(e, pkt, now, "192.168.1.99:5353")
+/// Every `ProbeConflict` this datagram raises, with the
+/// [`ConflictHistory`] label the router attached to it.
+///
+/// The instance half of the relinquished screen no longer suppresses: a record
+/// matching this endpoint's own recent history is DELIVERED carrying
+/// [`ConflictHistory::Relinquished`], and the receiving service spends that on
+/// RFC 6762 §8.2's one-second deferral rather than on §8.1's rename. So the
+/// screen tests assert the LABEL, which is what the router decides, instead of
+/// absence, which is what it used to decide and could not safely.
+fn probe_conflict_history(
+  e: &mut TestEndp,
+  pkt: &[u8],
+  now: StdInstant,
+) -> std::vec::Vec<(ServiceHandle, ConflictHistory)> {
+  probe_conflict_history_from(e, pkt, now, "192.168.1.99:5353")
 }
 
-/// [`probe_conflicted`], but from a named source — so a test can say which
+/// [`probe_conflict_history`], but from a named source — so a test can say which
 /// address FAMILY the datagram arrived on.
-fn probe_conflicted_from(
+fn probe_conflict_history_from(
   e: &mut TestEndp,
   pkt: &[u8],
   now: StdInstant,
   src: &str,
-) -> std::vec::Vec<ServiceHandle> {
+) -> std::vec::Vec<(ServiceHandle, ConflictHistory)> {
   let src: core::net::SocketAddr = src.parse().unwrap();
   e.handle(now, Received::new(src, pkt, Provenance::NotFromUs))
     .unwrap()
     .filter_map(Result::ok)
     .filter_map(|ev| match ev {
-      RouteEvent::ToService(ts) if ts.event().is_probe_conflict() => Some(ts.handle()),
+      RouteEvent::ToService(ts) => match ts.event() {
+        ServiceEvent::ProbeConflict(pc) => Some((ts.handle(), pc.history())),
+        _ => None,
+      },
       _ => None,
     })
+    .collect()
+}
+
+/// The handles a datagram raises a RELINQUISHED-labelled `ProbeConflict` on:
+/// [`probe_conflict_history`] filtered to the label, for the tests whose subject
+/// is which services the screen disowns the record for.
+fn probe_disowned(e: &mut TestEndp, pkt: &[u8], now: StdInstant) -> std::vec::Vec<ServiceHandle> {
+  probe_conflict_history(e, pkt, now)
+    .into_iter()
+    .filter(|(_, h)| h.is_relinquished())
+    .map(|(handle, _)| handle)
+    .collect()
+}
+
+/// [`probe_disowned`], from a named source.
+fn probe_disowned_from(
+  e: &mut TestEndp,
+  pkt: &[u8],
+  now: StdInstant,
+  src: &str,
+) -> std::vec::Vec<ServiceHandle> {
+  probe_conflict_history_from(e, pkt, now, src)
+    .into_iter()
+    .filter(|(_, h)| h.is_relinquished())
+    .map(|(handle, _)| handle)
+    .collect()
+}
+
+/// The handles a datagram raises an UNLABELLED `ProbeConflict` on — a genuine
+/// peer conflict, as far as the endpoint's history can tell.
+fn probe_unscreened(e: &mut TestEndp, pkt: &[u8], now: StdInstant) -> std::vec::Vec<ServiceHandle> {
+  probe_unscreened_from(e, pkt, now, "192.168.1.99:5353")
+}
+
+/// [`probe_unscreened`], from a named source.
+fn probe_unscreened_from(
+  e: &mut TestEndp,
+  pkt: &[u8],
+  now: StdInstant,
+  src: &str,
+) -> std::vec::Vec<ServiceHandle> {
+  probe_conflict_history_from(e, pkt, now, src)
+    .into_iter()
+    .filter(|(_, h)| h.is_unmatched())
+    .map(|(handle, _)| handle)
     .collect()
 }
 
@@ -11063,6 +11125,31 @@ fn a_completed_withdrawals_echo_does_not_retire_the_replacement_at_its_host() {
 
 /// The INSTANCE half of the same defect: same-name reuse with changed SRV rdata
 /// reaches a false RFC 6762 §8.1 probe defeat by the same route.
+///
+/// # This test used to assert the record was DROPPED, and that was wrong
+///
+/// Not wrong about the goal — a delayed echo of our own predecessor must not
+/// rename its successor away, and it still does not. Wrong about the PREMISE it
+/// used to reach that goal: it read a history match as proof the datagram was
+/// ours, and no history match can be that. RFC 6762 §9 protects a
+/// fault-tolerance twin "capable of issuing identical answers", so an incumbent
+/// peer defending this name with the same bytes our predecessor published sends
+/// a byte-identical datagram to the one our ghost would. At the instant of the
+/// lookup the two are the same record.
+///
+/// Dropping it therefore made the wrong guess UNAPPEALABLE: with a live
+/// incumbent P holding the name, every defence P sends matches the history and
+/// reaches nobody, while the successor completes its probes and announcements
+/// well inside the retention window — a usurpation, not a delay, because
+/// nothing replays P's lost defences when the window closes.
+///
+/// So the record is DELIVERED, labelled, and the pre-authoritative cell spends
+/// the label on §8.2's one-second deferral instead of §8.1's rename. That asks
+/// the only question capable of separating the two cases, and asks it of the
+/// network: a ghost cannot answer the re-probe, a live incumbent can. See
+/// `a_relinquished_echo_defers_the_successors_probe_rather_than_renaming_it` and
+/// `a_ghosts_echo_costs_the_successor_one_second_and_not_the_name` for the two
+/// outcomes.
 #[test]
 fn a_relinquished_instances_echo_does_not_defeat_the_probe_of_its_successor() {
   let now = StdInstant::now();
@@ -11097,17 +11184,429 @@ fn a_relinquished_instances_echo_does_not_defeat_the_probe_of_its_successor() {
   let mut buf = [0u8; 512];
   // The predecessor's own SRV (port 631) — rdata `B` does not hold.
   let n = build_instance_srv_response(&mut buf, &instance, 631, &target);
-  assert!(
-    probe_conflicted(&mut e, &buf[..n], now).is_empty(),
-    "an echo of the relinquished instance's own SRV must not reach its successor"
+  assert_eq!(
+    probe_conflict_history(&mut e, &buf[..n], now),
+    std::vec![(b_handle, ConflictHistory::Relinquished)],
+    "an echo of the relinquished instance's own SRV must REACH its successor \
+     carrying the history label — the successor may then defer and re-probe, \
+     which is the only move that can tell our own ghost from an incumbent twin"
   );
 
-  // A third port is nobody's record here, and still conflicts.
+  // A third port is nobody's record here, and conflicts UNLABELLED — §8.1's
+  // defeat, which renames rather than defers.
   let n = build_instance_srv_response(&mut buf, &instance, 1234, &target);
   assert_eq!(
-    probe_conflicted(&mut e, &buf[..n], now),
-    std::vec![b_handle],
+    probe_conflict_history(&mut e, &buf[..n], now),
+    std::vec![(b_handle, ConflictHistory::Unmatched)],
     "SRV rdata this endpoint never asserted at this instance is a real conflict"
+  );
+}
+
+/// Drive `svc` until one probe has actually reached a link and been confirmed,
+/// which is what opens RFC 6762 §8.1's window: a conflicting response arriving
+/// "before the first probe packet is sent MUST be silently ignored", so a
+/// fixture that wants a defence ACTED on has to get there first.
+fn probe_once_confirmed(svc: &mut TestSvc, start: StdInstant) -> StdInstant {
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = start;
+  for _ in 0..20 {
+    now = now
+      .checked_add(core::time::Duration::from_millis(300))
+      .unwrap();
+    svc.handle_timeout(now).unwrap();
+    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_delivery(now, TransmitDelivery::ALL);
+      return now;
+    }
+  }
+  panic!("no probe reached the wire; state={:?}", svc.state());
+}
+
+/// Route `pkt` through the endpoint and hand every event addressed to `handle`
+/// to `svc`, exactly as a driver's receive path does. Returns how many arrived.
+///
+/// The COUNT is the assertion these regression tests turn on: a conflict the
+/// router drops reaches no service, and a defence that reaches no service cannot
+/// be appealed, deferred or spent — it is simply gone.
+fn deliver_to_service(
+  e: &mut TestEndp,
+  svc: &mut TestSvc,
+  handle: ServiceHandle,
+  pkt: &[u8],
+  now: StdInstant,
+) -> usize {
+  let src: core::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
+  let events: std::vec::Vec<_> = e
+    .handle(now, Received::new(src, pkt, Provenance::NotFromUs))
+    .unwrap()
+    .filter_map(Result::ok)
+    .collect();
+  let mut delivered = 0usize;
+  for ev in events {
+    if let RouteEvent::ToService(ts) = ev
+      && ts.handle() == handle
+    {
+      svc.handle_event(ts.into_event(), now);
+      delivered = delivered.saturating_add(1);
+    }
+  }
+  delivered
+}
+
+/// Every `ServiceUpdate` `svc` has queued, drained.
+fn drain_updates(svc: &mut TestSvc) -> std::vec::Vec<ServiceUpdate> {
+  let mut out = std::vec::Vec::new();
+  while let Some(u) = svc.poll() {
+    out.push(u);
+  }
+  out
+}
+
+/// Register a successor at `instance` proposing SRV(`port`), and hand back its
+/// handle and `Service` so the fixture can drive its lifecycle.
+fn register_probing_successor(
+  e: &mut TestEndp,
+  instance: &Name,
+  target: &Name,
+  port: u16,
+  addr: Ipv4Addr,
+  now: StdInstant,
+) -> (ServiceHandle, TestSvc) {
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    instance.clone(),
+    target.clone(),
+    port,
+    120,
+  );
+  recs.add_a(addr);
+  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ServiceSpec::new(recs),
+    now,
+  )
+  .unwrap()
+}
+
+/// THE USURPATION, end to end — the scenario the history screen used to allow.
+///
+/// Local `A` and peer `P` both assert `R1` at one instance name. That is legal
+/// and RFC 6762 §9 protects it: "resource records with identical rdata are never
+/// considered inconsistent … to permit use of proxies and other fault-tolerance
+/// mechanisms that may cause more than one responder to be capable of issuing
+/// identical answers." `A` then relinquishes, so `R1` enters this endpoint's
+/// history, and successor `B` probes the SAME owner name with different rdata
+/// `R2`.
+///
+/// `P` is alive and defends, correctly, with `R1`. Every one of those defences
+/// matches `A`'s history — and while the screen SUPPRESSED on a match, every one
+/// of them was discarded before any service saw it. `B` then completed three
+/// probes and its announcements inside the retention window (~2.25 s against a
+/// 5 s default), and nothing replays a lost defence at expiry: `B` took a name a
+/// live peer already held, permanently and silently.
+///
+/// The label fixes the premise rather than the bookkeeping. A match cannot mean
+/// "ours" — `P`'s defence and `A`'s ghost are the same bytes — so the record is
+/// delivered LABELLED and `B` spends the label on §8.2's deferral. That asks the
+/// one question capable of separating them, and asks it of the network.
+#[test]
+fn a_relinquished_echo_defers_the_successors_probe_rather_than_renaming_it() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let target = Name::try_from_str("h.local.").unwrap();
+  let addr = Ipv4Addr::new(192, 168, 1, 5);
+
+  // `A` announced `R1` = SRV(631) at this name, then gave it up.
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  e.begin_withdrawal(a_handle, snap, now);
+  assert_eq!(
+    finish_withdrawal(&mut e, a_handle, now),
+    std::vec![a_handle],
+    "precondition: R1 is now this endpoint's relinquished history"
+  );
+
+  // `B` takes the same owner name with `R2` = SRV(9999) and starts probing.
+  let (b_handle, mut b) = register_probing_successor(&mut e, &instance, &target, 9999, addr, now);
+  let kept = b.name().as_str().to_owned();
+  let probed_at = probe_once_confirmed(&mut b, now);
+
+  // `P` defends with `R1`.
+  let mut buf = [0u8; 512];
+  let n = build_instance_srv_response(&mut buf, &instance, 631, &target);
+  assert_eq!(
+    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], probed_at),
+    1,
+    "P's defence must REACH B. Dropping it here is the defect: a conflict no \
+     service receives is not delayed, it is unappealable, and B goes on to \
+     announce over a peer that already holds the name"
+  );
+
+  let deferred_at = probed_at
+    .checked_add(core::time::Duration::from_millis(10))
+    .unwrap();
+  b.handle_timeout(deferred_at).unwrap();
+  assert_eq!(
+    b.name().as_str(),
+    kept,
+    "a history-labelled defeat is §8.2's deferral, which KEEPS the name — \
+     renaming on a switch echo is the churn §8.2's one second exists to avoid"
+  );
+  assert_eq!(
+    b.state(),
+    crate::ServiceState::Init,
+    "…and \"begins probing for this record again\" restarts the §8.1 sequence"
+  );
+  assert_eq!(
+    b.poll_timeout(),
+    deferred_at.checked_add(core::time::Duration::from_secs(1)),
+    "…after waiting one second exactly"
+  );
+  assert!(
+    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    "…and it is NOT a rename: §8.1's defeat is what renames, and this defeat is \
+     not yet known to be one"
+  );
+
+  // A SECOND defence inside the window is labelled too — the retention row does
+  // not lapse because it was read. So it defers again rather than renaming, and
+  // what bounds this loop is the WINDOW closing, not the peer falling silent.
+  let again_at = probe_once_confirmed(&mut b, deferred_at);
+  assert_eq!(
+    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], again_at),
+    1,
+    "the incumbent's next defence still reaches B"
+  );
+  let redeferred_at = again_at
+    .checked_add(core::time::Duration::from_millis(10))
+    .unwrap();
+  b.handle_timeout(redeferred_at).unwrap();
+  assert_eq!(
+    b.name().as_str(),
+    kept,
+    "still deferring while the label is live, and still claiming nothing: \
+     `conflict_classified_unresolved` withholds every claim to the name for the \
+     whole of it"
+  );
+
+  // Once the window closes the SAME defence arrives unlabelled, and that is
+  // §8.1's defeat: "the probing host MUST defer to the existing host, and SHOULD
+  // choose new names". The incumbent keeps its name; the successor renames.
+  let lapsed = now
+    .checked_add(EndpointConfig::new().relinquished_retention())
+    .unwrap()
+    .checked_add(core::time::Duration::from_millis(1))
+    .unwrap()
+    .max(redeferred_at);
+  let reprobed_at = probe_once_confirmed(&mut b, lapsed);
+  assert_eq!(
+    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], reprobed_at),
+    1,
+    "and it still reaches B once the label has lapsed"
+  );
+  b.handle_timeout(
+    reprobed_at
+      .checked_add(core::time::Duration::from_millis(10))
+      .unwrap(),
+  )
+  .unwrap();
+  assert_ne!(
+    b.name().as_str(),
+    kept,
+    "an UNLABELLED defeat renames — §8.1 is honoured, one window late rather \
+     than never, which is the whole of what the deferral costs"
+  );
+}
+
+/// The GHOST half of the same deferral: nothing answers the retry, so the name
+/// is claimed.
+///
+/// This is the case the screen was built for and the case §8.2 names as its own
+/// reason — a probe "maybe from the host itself … which may be echoed back after
+/// a short delay by some Ethernet switches and some 802.11 base stations". The
+/// deferral is what makes it survivable WITHOUT deciding, at lookup time, a
+/// question that cannot be decided at lookup time: our predecessor's echo cannot
+/// answer a probe, so one second later the name is ours.
+///
+/// The cost is that second, and nothing else — no rename, no goodbye, no cache
+/// churn, and no name given up.
+#[test]
+fn a_ghosts_echo_costs_the_successor_one_second_and_not_the_name() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let target = Name::try_from_str("h.local.").unwrap();
+  let addr = Ipv4Addr::new(192, 168, 1, 5);
+
+  let (a_handle, a_svc) =
+    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  e.begin_withdrawal(a_handle, snap, now);
+  assert_eq!(
+    finish_withdrawal(&mut e, a_handle, now),
+    std::vec![a_handle],
+    "precondition: R1 is now this endpoint's relinquished history"
+  );
+
+  let (b_handle, mut b) = register_probing_successor(&mut e, &instance, &target, 9999, addr, now);
+  let kept = b.name().as_str().to_owned();
+  let probed_at = probe_once_confirmed(&mut b, now);
+
+  // A DELAYED ECHO of the predecessor's own SRV — there is no `P` on this link.
+  let mut buf = [0u8; 512];
+  let n = build_instance_srv_response(&mut buf, &instance, 631, &target);
+  assert_eq!(
+    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], probed_at),
+    1,
+    "the echo reaches B — indistinguishable, here, from the incumbent's defence"
+  );
+
+  let deferred_at = probed_at
+    .checked_add(core::time::Duration::from_millis(10))
+    .unwrap();
+  b.handle_timeout(deferred_at).unwrap();
+  assert_eq!(
+    b.state(),
+    crate::ServiceState::Init,
+    "the labelled defeat defers rather than renaming"
+  );
+  assert_eq!(
+    b.poll_timeout(),
+    deferred_at.checked_add(core::time::Duration::from_secs(1)),
+    "…by exactly the one second §8.2 prescribes"
+  );
+
+  // Nothing answers the restarted sequence, because a ghost cannot answer a
+  // probe. B completes it and takes the name it never gave up.
+  let mut txbuf = std::vec![0u8; 4096];
+  let mut at = deferred_at;
+  for _ in 0..40 {
+    at = at
+      .checked_add(core::time::Duration::from_millis(300))
+      .unwrap();
+    b.handle_timeout(at).unwrap();
+    while let Ok(Some(_)) = b.poll_transmit(at, &mut txbuf) {
+      b.note_delivery(at, TransmitDelivery::ALL);
+    }
+    if b.state() == crate::ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(
+    b.state(),
+    crate::ServiceState::Established,
+    "the retry went unanswered, so the §8.1 sequence completes"
+  );
+  assert_eq!(
+    b.name().as_str(),
+    kept,
+    "…on the SAME name: a deferral that ends in silence costs one second and \
+     nothing else"
+  );
+  assert!(
+    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    "…and no rename was ever queued"
+  );
+}
+
+/// THE SAME USURPATION, REACHED THROUGH THE HOST ROLE — when the instance name
+/// and the host name are ONE name.
+///
+/// The conflict fan-out tests the host rule first, so a labelled A/AAAA under
+/// that name matched the host branch and was dropped there. The drop is right
+/// for the `HostConflict` — it is terminal and nothing re-verifies it — but the
+/// record belongs to BOTH roles here: A/AAAA under this name are members of the
+/// §8.2 proposal this service is probing with, and §8.1 owes a deferral on "any
+/// conflicting Multicast DNS response" for a name being probed, whatever its
+/// type. Role precedence decides which EVENT a record becomes; deciding that it
+/// is no conflict at all is a different power, and taking it let a live
+/// incumbent answer every one of the successor's probes while the successor went
+/// on to Established.
+///
+/// So the labelled record falls through to the instance rule and arrives as a
+/// labelled `ProbeConflict`, which the pre-authoritative cell spends on §8.2's
+/// one-second deferral. The unlabelled record is untouched and still the host
+/// rule's — asserted at the end, because a fix that widened past the label would
+/// be turning a terminal host conflict into a probe conflict for every peer.
+#[test]
+fn an_incumbents_labelled_defence_defers_a_successor_whose_instance_is_its_host() {
+  let now = StdInstant::now();
+  let mut e = build_endpoint();
+  // ONE name, worn as both roles — the configuration the fan-out's ordering
+  // comment calls pathological and routes for anyway.
+  let shared = Name::try_from_str("h.local.").unwrap();
+  let a1 = Ipv4Addr::new(192, 168, 1, 5);
+  let a2 = Ipv4Addr::new(192, 168, 1, 9);
+
+  // `A` announced `A1` under that name and gave it up.
+  let (a_handle, a_svc) = register_service_with_a(&mut e, "h.local.", "h.local.", a1);
+  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  e.begin_withdrawal(a_handle, snap, now);
+  assert_eq!(
+    finish_withdrawal(&mut e, a_handle, now),
+    std::vec![a_handle],
+    "precondition: A1 is now this endpoint's relinquished history"
+  );
+
+  // `B` takes the same name with `A2` and starts probing.
+  let (b_handle, mut b) = register_probing_successor(&mut e, &shared, &shared, 9999, a2, now);
+  let kept = b.name().as_str().to_owned();
+  let mut at = probe_once_confirmed(&mut b, now);
+
+  // The incumbent `P` defends the name with `A1`, for as long as the retention
+  // window lasts. Every one of those defences carries the history label, and
+  // every one of them must still reach `B`.
+  let mut buf = [0u8; 512];
+  let n = build_host_a_response(&mut buf, &shared, a1);
+  let window_ends = now
+    .checked_add(EndpointConfig::new().relinquished_retention())
+    .unwrap();
+  let mut rounds = 0usize;
+  while at < window_ends {
+    assert_eq!(
+      deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], at),
+      1,
+      "round {rounds}: the incumbent's defence must REACH B. The host rule owns \
+       which EVENT this record becomes, not whether it is a conflict — dropped \
+       here, B probes and announces over a peer that is defending correctly"
+    );
+    at = at.checked_add(core::time::Duration::from_millis(10)).unwrap();
+    b.handle_timeout(at).unwrap();
+    assert_ne!(
+      b.state(),
+      crate::ServiceState::Established,
+      "round {rounds}: a defended name is not this service's to advertise"
+    );
+    assert_eq!(
+      b.name().as_str(),
+      kept,
+      "round {rounds}: and a labelled defeat is §8.2's deferral, which KEEPS the \
+       name — the re-probe is the only thing that can tell our own ghost from an \
+       incumbent twin"
+    );
+    rounds = rounds.saturating_add(1);
+    at = probe_once_confirmed(&mut b, at);
+  }
+  assert!(
+    rounds >= 2,
+    "the window must have covered more than one probe/defence exchange, or this \
+     test proves nothing about a SUSTAINED defence"
+  );
+  assert!(
+    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    "…and no rename was queued for any of them"
+  );
+
+  // THE HOST CELL IS UNCHANGED. An address this endpoint never asserted carries
+  // no label, so the host rule still owns it and it is still the terminal
+  // `HostConflict` — the fall-through is the label's, and only the label's.
+  let n = build_host_a_response(&mut buf, &shared, Ipv4Addr::new(10, 0, 0, 99));
+  assert_eq!(
+    host_conflicted(&mut e, &buf[..n], at),
+    std::vec![b_handle],
+    "an UNLABELLED address at this owner is still the host rule's, and still \
+     terminal: role precedence over the event is exactly what did not change"
   );
 }
 
@@ -11175,10 +11674,12 @@ fn a_renamed_away_instances_echo_does_not_conflict_after_its_goodbye_is_reclaime
 
   let mut buf = [0u8; 512];
   let n = build_instance_srv_response(&mut buf, &old, 631, &target);
-  assert!(
-    probe_conflicted(&mut e, &buf[..n], now).is_empty(),
-    "the renamed-away name's own SRV echo must not conflict with the service \
-     that reclaimed the name"
+  assert_eq!(
+    probe_disowned(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "the renamed-away name's own SRV echo must reach the service that reclaimed \
+     the name LABELLED as this endpoint's own past — a deferral it can appeal by \
+     re-probing, never a drop it cannot"
   );
 }
 
@@ -11234,9 +11735,11 @@ fn a_force_removed_services_echo_does_not_retire_its_replacement() {
      the replacement at its host name"
   );
   let n = build_instance_srv_response(&mut buf, &instance, 631, &host);
-  assert!(
-    probe_conflicted(&mut e, &buf[..n], now).is_empty(),
-    "nor its own SRV defeat the replacement's probe at the instance name"
+  assert_eq!(
+    probe_disowned(&mut e, &buf[..n], now),
+    std::vec![b_handle],
+    "nor its own SRV RENAME the replacement at the instance name — it is labelled \
+     as ours, which buys §8.2's one-second re-probe instead"
   );
 
   // Still bounded, and still not a blanket suppression.
@@ -11365,9 +11868,10 @@ fn a_never_transmitted_withdrawal_does_not_screen_a_genuine_peer_conflict() {
   );
   let n = build_instance_srv_response(&mut buf, &instance, 631, &host);
   assert_eq!(
-    probe_conflicted(&mut e, &buf[..n], now),
+    probe_unscreened(&mut e, &buf[..n], now),
     std::vec![b_handle],
-    "and so is its SRV at the instance name the successor is probing"
+    "and so is its SRV at the instance name the successor is probing — UNLABELLED, \
+     so it is §8.1's defeat and renames"
   );
 }
 
@@ -11522,12 +12026,14 @@ fn a_relinquished_generation_is_disowned_only_on_the_family_that_carried_it() {
 
   // The INSTANCE half, by the same rule.
   let n = build_instance_srv_response(&mut buf, &instance, 631, &host);
-  assert!(
-    probe_conflicted_from(&mut e, &buf[..n], now, "192.168.1.99:5353").is_empty(),
-    "the IPv4 echo of the relinquished SRV is still disowned"
+  assert_eq!(
+    probe_disowned_from(&mut e, &buf[..n], now, "192.168.1.99:5353"),
+    std::vec![b_handle],
+    "the IPv4 echo of the relinquished SRV is still disowned — labelled, deferred, \
+     not renamed on"
   );
   assert_eq!(
-    probe_conflicted_from(&mut e, &buf[..n], now, "[fe80::99]:5353"),
+    probe_unscreened_from(&mut e, &buf[..n], now, "[fe80::99]:5353"),
     std::vec![b_handle],
     "an IPv6 responder asserting the old SRV must still defeat the successor's \
      probe — IPv6 never heard that SRV from us"
@@ -11682,10 +12188,11 @@ fn a_conforming_nsec_this_endpoint_never_encoded_is_not_disowned_as_its_own_echo
   let mut buf = [0u8; 512];
   let emitted_types = [ResourceType::Srv.to_u16(), ResourceType::Txt.to_u16()];
   let n = build_instance_nsec_response(&mut buf, &name, &emitted_types);
-  assert!(
-    probe_conflicted_from(&mut e, &buf[..n], now, "192.168.1.99:5353").is_empty(),
-    "the bitmap this endpoint DID encode is still its own echo — the screen is \
-     narrowed, not disabled"
+  assert_eq!(
+    probe_disowned_from(&mut e, &buf[..n], now, "192.168.1.99:5353"),
+    std::vec![successor],
+    "the bitmap this endpoint DID encode is still labelled its own echo — the \
+     screen is narrowed, not disabled"
   );
 
   let conforming_types = [
@@ -11696,11 +12203,11 @@ fn a_conforming_nsec_this_endpoint_never_encoded_is_not_disowned_as_its_own_echo
   ];
   let n = build_instance_nsec_response(&mut buf, &name, &conforming_types);
   assert_eq!(
-    probe_conflicted_from(&mut e, &buf[..n], now, "192.168.1.99:5353"),
+    probe_unscreened_from(&mut e, &buf[..n], now, "192.168.1.99:5353"),
     std::vec![successor],
     "a conforming responder's ACCURATE bitmap is a form this endpoint never put \
-     on any wire, so no history of ours may disown it — suppressing it lets a \
-     pre-authoritative successor announce over the peer that sent it"
+     on any wire, so no history of ours may label it — labelling it would cost \
+     the peer that sent it §8.1's immediate rename of our successor"
   );
 
   // The COMPACT tier decomposes to the same one form, or the two tiers would
@@ -11951,7 +12458,7 @@ fn the_relinquished_ceiling_spills_to_identities_rather_than_disabling_the_endpo
     &Name::try_from_str("elsewhere.local.").unwrap(),
   );
   assert_eq!(
-    probe_conflicted(&mut e, &buf[..n], overflow_at),
+    probe_unscreened(&mut e, &buf[..n], overflow_at),
     std::vec![live_handle],
     "a full retention list says nothing about an UNRELATED name — the conflict \
      for one this endpoint still holds must still be built"
@@ -12001,8 +12508,9 @@ fn the_relinquished_ceiling_spills_to_identities_rather_than_disabling_the_endpo
      representation, not an obligation"
   );
   let n = build_instance_srv_response(&mut buf, &spilled_instance, 631, &spilled_host);
-  assert!(
-    probe_conflicted(&mut e, &buf[..n], overflow_at).is_empty(),
+  assert_eq!(
+    probe_disowned(&mut e, &buf[..n], overflow_at),
+    std::vec![spilled_handle],
     "the compact tier answers for the INSTANCE identities too, not only addresses"
   );
 
@@ -12341,16 +12849,17 @@ fn every_relinquished_generation_of_one_owner_pair_screens_to_its_own_expiry() {
   let mut buf = [0u8; 512];
   for port in [631u16, 632, 633] {
     let n = build_instance_srv_response(&mut buf, &instance, port, &host);
-    assert!(
-      probe_conflicted(&mut e, &buf[..n], now).is_empty(),
-      "generation {port}'s own echo must not defeat the successor's probe while \
-       ITS window is still open"
+    assert_eq!(
+      probe_disowned(&mut e, &buf[..n], now),
+      std::vec![b_handle],
+      "generation {port}'s own echo must not RENAME the successor while ITS \
+       window is still open — it is labelled, so §8.2 defers and re-probes"
     );
   }
   // Still not a blanket suppression of the name.
   let n = build_instance_srv_response(&mut buf, &instance, 1234, &host);
   assert_eq!(
-    probe_conflicted(&mut e, &buf[..n], now),
+    probe_unscreened(&mut e, &buf[..n], now),
     std::vec![b_handle],
     "rdata no generation ever carried is a real conflict"
   );

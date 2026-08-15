@@ -20,35 +20,23 @@ use core::net::{IpAddr, SocketAddr};
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Provenance {
-  /// Our own bytes, by one of two routes — and only the first of them is a
-  /// claim about the strength of the evidence.
+  /// Our own bytes, ORDERED against our own `sendto`: the kernel stamped this
+  /// arrival at or after the send, so nothing else could have put these bytes on
+  /// the wire in between.
   ///
-  /// **Ordered.** A content match AND evidence that ORDERS it: the kernel
-  /// stamped this arrival at or after our own `sendto`, so nothing else could
-  /// have put these bytes on the wire in between.
+  /// **One route, and it is the ordering that earns it.** A content match with no
+  /// ordering evidence is [`Self::OwnEchoLikely`] however stale the generation it
+  /// matched — see that variant's obligation. A SUPERSEDED match was reported
+  /// here once, and it was the same false axiom `relinquished_retention`'s screen
+  /// abandoned: byte equality read as proof of origin. An old local responder and
+  /// a live RFC 6762 §9 fault-tolerance twin can put the same bytes on the link,
+  /// and a peer can replay them, so a stale-generation match says what the
+  /// datagram CONTAINS and not who sent it — and a driver's superseded entry is
+  /// typically non-consuming, so reporting it here made every matching peer
+  /// defence invisible for the credit's whole lifetime.
   ///
-  /// **Superseded.** A content match — ordered or NOT — against a datagram the
-  /// caller sent under a generation of its own records that no longer exists,
-  /// because what the caller publishes has been mutated since the send: a
-  /// service registered, a service began withdrawing, or a service took an RFC
-  /// 6762 §9 automatic rename. This
-  /// route claims no more evidence than [`Self::OwnEchoLikely`] carries; it
-  /// reports an echo that has less left it may safely say. A stale echo's RFC
-  /// 6762 §8.2 proposal is for a name this endpoint may no longer be defending
-  /// and its §9 rdata is rdata no live route holds, so it should reach neither
-  /// the cache nor the quieting rules, and this is the only tier that denies
-  /// every one of them.
-  ///
-  /// It is no longer what stops a withdrawn generation retiring the service
-  /// that REPLACED it: that is
-  /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention)'s
-  /// endpoint-side screen, which decides on what this endpoint published rather
-  /// than on whether one datagram was recognised. This tier still matters
-  /// because the screen governs ADJUDICATION only — a stale echo admitted as a
-  /// peer's still writes records we no longer publish into our own cache and
-  /// still defers our own retransmits.
-  ///
-  /// The only tier that suppresses everything.
+  /// The only tier that suppresses everything, which is why nothing but ordering
+  /// may reach it.
   OwnEcho,
   /// Content match with NO ordering evidence.
   ///
@@ -56,20 +44,38 @@ pub enum Provenance {
   /// fault-tolerance case, where two responders issue identical answers — matches
   /// exactly this way, so the claim cannot be trusted with a name.
   ///
-  /// **Obligation.** Report this tier only when the datagram matched a record
-  /// of something this endpoint sent under the record generation it still
-  /// publishes, and report a match against a superseded generation as
-  /// [`Self::OwnEcho`] instead.
+  /// **Obligation.** Report this tier for an unordered content match whether the
+  /// generation it matched is the one this endpoint still publishes or one it has
+  /// left behind. A SUPERSEDED match belongs here and not at [`Self::OwnEcho`]:
+  /// staleness is a fact about our records, not evidence about the sender, so it
+  /// may buy the denials that protect US — observation and quieting — and may not
+  /// buy the one that costs a PEER its name.
   ///
-  /// A generation is superseded by **every mutation of what this endpoint
-  /// publishes**, and a driver owes the advance at each of them, at the site
-  /// rather than once per loop: a service registration; the `begin_withdrawal`
-  /// that retires a route however that retirement was reached (caller
-  /// unregister, shutdown, rename collision, internal retirement); and the RFC
-  /// 6762 §9 automatic rename, taken at the driver's own
-  /// `ServiceUpdate::Renamed` — a successful rename reaches none of the other
-  /// two, and it has already mutated the service's records by the time the
-  /// update is observed.
+  /// A driver must still TRACK the generation, and still owes the advance at
+  /// **every mutation of what this endpoint publishes**, at the site rather than
+  /// once per loop: the `begin_withdrawal` that retires a route however that
+  /// retirement was reached (caller unregister, shutdown, rename collision,
+  /// internal retirement); and the RFC 6762 §9 automatic rename, taken at the
+  /// driver's own `ServiceUpdate::Renamed` — a successful rename reaches the
+  /// other seam not at all, and it has already mutated the service's records by
+  /// the time the update is observed. What the tracking buys is that a stale
+  /// credit is not mistaken for an ordered one; both stale and current unordered
+  /// matches land here.
+  ///
+  /// **A service REGISTRATION is not a mutation, and this list once said it
+  /// was** — against its own quantifier. A registration only inserts a route:
+  /// [`Endpoint::try_register_service`](super::Endpoint::try_register_service)
+  /// refuses a duplicate instance name, a name a collision goodbye still holds,
+  /// and a host name a live route publishes with a different A or AAAA set, and
+  /// there is no §8.4 records mutator for it to reach; the §6.1 NSEC an
+  /// announcement carries is owned by the INSTANCE name, so a sibling
+  /// registration cannot flip a host-name NSEC's truth either. Nothing this
+  /// endpoint had asserted changes truth-value there, so a driver advancing the
+  /// generation at a registration asserts something false about its own records
+  /// — and since a driver's superseded credit is typically a standing tombstone,
+  /// that falsehood then denies observation and quieting to EVERY byte-identical
+  /// copy for the credit's whole life, a genuine peer's TTL=0 §10.1 goodbye
+  /// burst included.
   ///
   /// **What that obligation is, and is not, worth.** It is DEFENCE IN DEPTH.
   /// What it buys is that a stale echo does not poison this endpoint's own cache

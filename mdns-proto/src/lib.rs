@@ -98,9 +98,9 @@ pub mod event;
 pub mod transmit;
 
 pub use event::{
-  ConflictOrigin, DatagramId, EndpointEvent, HostConflict, KnownAnswer, ProbeConflict,
-  ProbeProposal, QueryEvent, QueryUpdate, RouteEvent, ServiceEvent, ServiceQuestion, ToQuery,
-  ToService,
+  ConflictHistory, ConflictOrigin, DatagramId, EndpointEvent, HostConflict, KnownAnswer,
+  ProbeConflict, ProbeProposal, QueryEvent, QueryUpdate, RouteEvent, ServiceEvent, ServiceQuestion,
+  ToQuery, ToService,
 };
 pub use transmit::{FamilyAttempt, Transmit, TransmitConfirm, TransmitObligation};
 
