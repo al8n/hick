@@ -840,6 +840,18 @@ impl Mdns {
         match selfsend.claim(&rx) {
           SelfSendMatch::Ordered => Provenance::OwnEcho,
           SelfSendMatch::Degraded => Provenance::OwnEchoLikely,
+          // Our bytes, but from a generation of our own records that no longer
+          // exists — a service registered or began withdrawing since the send. It
+          // maps to `OwnEcho` because that is the only tier which denies
+          // ADJUDICATION, and adjudication is precisely what a stale echo must not
+          // have: its RFC 6762 §8.2 proposal is for a name this endpoint may no
+          // longer be defending, and its §9 rdata is rdata no live route holds, so
+          // routing it fans our own withdrawn generation into the REPLACEMENT
+          // service, which classifies it as differing host rdata and retires
+          // terminally. This is not a claim of stronger evidence than the match
+          // carried — see `SelfSendMatch::Superseded` and
+          // `SelfSendTracker::supersede`.
+          SelfSendMatch::Superseded => Provenance::OwnEcho,
           SelfSendMatch::NoCredit => Provenance::NotFromUs,
         }
       } else {

@@ -74,6 +74,40 @@ const RECENT_SEND_TTL: Duration = Duration::from_secs(5);
 struct SelfSend<I> {
   data: Vec<u8>,
   at: I,
+  /// Which generation of this engine's own records this datagram was sent
+  /// under. See [`Multicaster::generation`].
+  generation: u64,
+}
+
+/// What the self-send log says about an inbound datagram.
+///
+/// Three answers rather than a `bool`, because "these bytes are ours" and "these
+/// bytes WERE ours" are not the same permission — see [`SelfLog::Superseded`].
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+enum SelfLog {
+  /// Matched a datagram sent under the generation of records this engine still
+  /// publishes.
+  Current,
+  /// Matched a datagram sent BEFORE the records changed under it — a service
+  /// registered, or began withdrawing, since the send.
+  ///
+  /// A withdrawing route stops holding its host name for the registration
+  /// guard, so a replacement may take that name with a different address set
+  /// while the outgoing goodbye drains. A delayed echo of the old announcement
+  /// then reaches the replacement as differing host RDATA and retires it
+  /// terminally; same-instance reuse with changed SRV/TXT reaches a false probe
+  /// defeat the same way. RFC 6762 §8.4 record updating being unimplemented does
+  /// NOT rule this out, because replacement crosses generations rather than
+  /// mutating one.
+  ///
+  /// So it maps to `Provenance::OwnEcho`, the only tier that denies
+  /// ADJUDICATION. That is not a claim of stronger evidence than
+  /// [`SelfLog::Current`] carries — it is that a stale echo has nothing left it
+  /// may safely say, since its §8.2 proposal is for a name this engine may no
+  /// longer be defending and its §9 rdata is rdata no live route holds.
+  Superseded,
+  /// Matched nothing this log still holds.
+  None,
 }
 
 // Slab-backed pools (the `alloc` tier). Mirrors `hick-reactor`'s `ProtoEndpoint`.
@@ -517,6 +551,7 @@ fn record_into<I: Instant>(
   recent_bytes: &mut usize,
   data: &[u8],
   now: I,
+  generation: u64,
 ) {
   while let Some(front) = recent.front() {
     if now
@@ -539,6 +574,7 @@ fn record_into<I: Instant>(
   recent.push_back(SelfSend {
     data: data.to_vec(),
     at: now,
+    generation,
   });
 }
 
@@ -556,6 +592,9 @@ struct Multicaster<I> {
   recent: VecDeque<SelfSend<I>>,
   /// Total bytes buffered in `recent` (for the byte budget).
   recent_bytes: usize,
+  /// Which generation of this engine's own records new entries are recorded
+  /// under. Advanced by [`Multicaster::supersede`] and nothing else.
+  generation: u64,
 }
 
 impl<I: Instant> Multicaster<I> {
@@ -564,6 +603,7 @@ impl<I: Instant> Multicaster<I> {
       failing_since: [None; 2],
       recent: VecDeque::new(),
       recent_bytes: 0,
+      generation: 0,
     }
   }
 
@@ -752,10 +792,11 @@ impl<I: Instant> Multicaster<I> {
     }
   }
 
-  /// Whether `data` exactly matches a recent self-send within the recency window
-  /// — no hash collisions, bounded false-positive window.
+  /// What this log says about `data`: an exact byte match against a recent
+  /// self-send inside the recency window — no hash collisions, bounded
+  /// false-positive window — and whether that send is still current.
   ///
-  /// # This is `OwnEchoLikely` and can never be `OwnEcho`
+  /// # A CURRENT match is `OwnEchoLikely` and can never be `OwnEcho`
   ///
   /// Four things this test does not have, each one on its own enough to keep it
   /// out of the ordered tier:
@@ -772,21 +813,59 @@ impl<I: Instant> Multicaster<I> {
   ///  * the call site applies **no source-port gate**, so a datagram from a port
   ///    this endpoint never sends from is weighed like any other.
   ///
-  /// A match therefore means "these bytes look like ours", which is exactly what
-  /// `Provenance::OwnEchoLikely` means and nothing stronger. `false` is a
-  /// negative claim about this log and nothing else, which is `NotFromUs`.
-  fn is_self(&self, data: &[u8], now: I) -> bool {
-    self.recent.iter().any(|s| {
-      s.data.as_slice() == data
+  /// A current match therefore means "these bytes look like ours", which is
+  /// exactly what `Provenance::OwnEchoLikely` means and nothing stronger.
+  /// [`SelfLog::None`] is a negative claim about this log and nothing else,
+  /// which is `NotFromUs`.
+  ///
+  /// # A SUPERSEDED match is the one exception, and it goes the other way
+  ///
+  /// It is weaker evidence by every measure above and still suppresses MORE,
+  /// because the question it answers is not how strongly the bytes are ours but
+  /// whether what they assert is still ours to assert. See
+  /// [`SelfLog::Superseded`].
+  ///
+  /// The freshest match wins when several entries hold the same bytes: this log
+  /// is non-consuming and the same datagram can be recorded across a generation
+  /// change, so a later, still-current send must not be reported as superseded
+  /// by an older copy of itself.
+  fn classify(&self, data: &[u8], now: I) -> SelfLog {
+    let mut verdict = SelfLog::None;
+    for s in &self.recent {
+      let fresh = s.data.as_slice() == data
         && now
           .checked_duration_since(s.at)
-          .is_some_and(|age| age <= RECENT_SEND_TTL)
-    })
+          .is_some_and(|age| age <= RECENT_SEND_TTL);
+      if !fresh {
+        continue;
+      }
+      if s.generation == self.generation {
+        return SelfLog::Current;
+      }
+      verdict = SelfLog::Superseded;
+    }
+    verdict
   }
 
   /// Record a sent datagram for self-loopback detection (see [`record_into`]).
   fn record(&mut self, data: &[u8], now: I) {
-    record_into(&mut self.recent, &mut self.recent_bytes, data, now);
+    record_into(
+      &mut self.recent,
+      &mut self.recent_bytes,
+      data,
+      now,
+      self.generation,
+    );
+  }
+
+  /// Declare that what this engine publishes has changed, so every entry already
+  /// recorded describes a state it has left. See [`SelfLog::Superseded`].
+  ///
+  /// It does NOT clear the log: clearing would make exactly the echoes this
+  /// protects against read as `NotFromUs` — full peer traffic, full adjudication
+  /// — which is the failure it exists to prevent, only louder.
+  fn supersede(&mut self) {
+    self.generation = self.generation.wrapping_add(1);
   }
 }
 
@@ -929,6 +1008,11 @@ where
     let (handle, proto) = self
       .endpoint
       .try_register_service::<Slab<Transmit>, Slab<ServiceUpdate>>(spec, now)?;
+    // A new live route publishes records no log entry so far knows about, and
+    // the reverse: an in-flight echo of a WITHDRAWING route's announcement can
+    // now be routed to this one. After the `?`, so a rejected registration
+    // advances nothing. See `SelfLog::Superseded`.
+    self.tx.supersede();
     self.services.insert(
       handle,
       ServiceSlot {
@@ -1478,10 +1562,10 @@ where
     // `NotFromUs` — and `NotFromUs` declines `trust_advertised_src_as_self`,
     // because a caller that logs what it sends has better evidence than a source
     // address that any co-resident publisher matches.
-    let provenance = if self.tx.is_self(data, now) {
-      Provenance::OwnEchoLikely
-    } else {
-      Provenance::NotFromUs
+    let provenance = match self.tx.classify(data, now) {
+      SelfLog::Current => Provenance::OwnEchoLikely,
+      SelfLog::Superseded => Provenance::OwnEcho,
+      SelfLog::None => Provenance::NotFromUs,
     };
     // Split borrow: `endpoint.handle` holds `&mut self.endpoint` while the
     // route-event iterator is alive, so per-service routing reads
@@ -1662,6 +1746,10 @@ where
       // completes so a re-register cannot cancel it.
       self.endpoint.enqueue_rename_withdrawal(handoff, now, true);
     }
+    // The withdrawing route stops holding its host name for the registration
+    // guard, so a replacement may take that name with a DIFFERENT address set
+    // while this goodbye drains. See `SelfLog::Superseded`.
+    self.tx.supersede();
     self.endpoint.begin_withdrawal(handle, snap, now);
   }
 

@@ -5206,3 +5206,68 @@ fn a_renumbered_interface_is_picked_up_without_restarting_the_endpoint() {
     ),
   }
 }
+
+/// The two service-lifecycle seams advance the self-send generation, so a credit
+/// recorded before either one is reported as `Superseded` and maps to
+/// `Provenance::OwnEcho` rather than the adjudicating tier.
+///
+/// The seam is what this pins, not the tracker's own rule (that lives in
+/// `hick-udp`). `begin_service_withdrawal` is a free function taking only the
+/// endpoint and the service map — it does NOT reach `Mdns` — so the tracker had
+/// to be threaded into it, and a later refactor dropping that parameter would
+/// silently reopen the whole finding. `unregister_service` is the caller that
+/// proves the thread survives the split borrow it destructures through.
+#[test]
+fn the_service_lifecycle_seams_supersede_outstanding_credits() {
+  let Some(mut mdns) = test_support::loopback_mdns() else {
+    return;
+  };
+  let handle = mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-generation._tcp.local.",
+      8080,
+    ))
+    .expect("register_service");
+  // A credit for a datagram sent while that registration was live.
+  let sent = hick_udp::selfsend::ClockPair::now();
+  mdns
+    .selfsend
+    .record(Family::V4, b"announcement-of-generation-one", sent);
+  mdns.selfsend.seal();
+  // Retiring the service is the moment its route stops holding its host name
+  // for the registration guard, so a replacement may take that name with a
+  // different address set — which is exactly what the credit above must no
+  // longer be allowed to adjudicate against.
+  mdns.unregister_service(handle);
+  assert_eq!(
+    mdns.selfsend.claim(&RxDatagram::without_stamp(
+      Family::V4,
+      &b"announcement-of-generation-one"[..]
+    )),
+    SelfSendMatch::Superseded,
+    "beginning a withdrawal must supersede every outstanding credit"
+  );
+
+  // And the registration seam, the other direction: a credit recorded now, then
+  // a fresh registration, is equally stale.
+  let sent = hick_udp::selfsend::ClockPair::now();
+  mdns
+    .selfsend
+    .record(Family::V4, b"announcement-of-generation-two", sent);
+  mdns.selfsend.seal();
+  mdns
+    .register_service(test_support::service_spec(
+      "_hick-mio-generation-two._tcp.local.",
+      8081,
+    ))
+    .expect("register_service");
+  assert_eq!(
+    mdns.selfsend.claim(&RxDatagram::without_stamp(
+      Family::V4,
+      &b"announcement-of-generation-two"[..]
+    )),
+    SelfSendMatch::Superseded,
+    "registering a route must supersede every outstanding credit"
+  );
+  mdns.deregister().expect("deregister");
+}

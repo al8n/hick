@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant as StdInstant, SystemTime};
 
 use super::{
-  ClockPair, Credit, MAX_SELF_SEND_ENTRIES, RxDatagram, SELF_SEND_TTL, SelfSendMatch,
-  SelfSendTracker, WALL_STEP_TOLERANCE, fnv1a,
+  ClockPair, Credit, MAX_SELF_SEND_BYTES, MAX_SELF_SEND_ENTRIES, RxDatagram, SELF_SEND_TTL,
+  SelfSendMatch, SelfSendTracker, WALL_STEP_TOLERANCE,
 };
 use crate::Family;
 
@@ -61,10 +61,98 @@ fn recorded_and_sealed(t: &mut SelfSendTracker, family: Family, body: &[u8], sen
   t.seal_at(sent.mono);
 }
 
+/// Two SEMANTICALLY DIFFERENT, structurally valid mDNS responses that share one
+/// 64-bit FNV-1a fingerprint.
+///
+/// Both announce `hick.local. IN A`, one at `192.0.2.1` and one at `192.0.2.2`,
+/// followed by eight trailing bytes — which `MessageReader` never reads, since
+/// it bounds every section by the header counts and never requires the message
+/// to be consumed. So the collision is carried entirely in bytes the protocol
+/// layer ignores, and the two datagrams differ in exactly the field RFC 6762 §9
+/// classifies a host conflict on.
+///
+/// Found by Pollard rho over the top 56 bits of FNV-1a in **41 seconds**,
+/// single-threaded, on the machine this was written on; a full second-preimage
+/// against a fixed victim datagram (no attacker influence on our bytes at all)
+/// took **15 seconds** by meet-in-the-middle over FNV's invertible state update.
+/// Committed as constants rather than searched for at test time, so the test
+/// costs nothing to run and does not depend on the search.
+const COLLIDING_A: &[u8] = &[
+  0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x68, 0x69, 0x63,
+  0x6b, 0x05, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78,
+  0x00, 0x04, 0xc0, 0x00, 0x02, 0x01, 0x92, 0xd9, 0x91, 0xc8, 0xf7, 0xb1, 0x9e, 0x00,
+];
+const COLLIDING_B: &[u8] = &[
+  0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x68, 0x69, 0x63,
+  0x6b, 0x05, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78,
+  0x00, 0x04, 0xc0, 0x00, 0x02, 0x02, 0xcf, 0x84, 0x80, 0x92, 0x0b, 0x82, 0xd3, 0xac,
+];
+
+/// The fingerprint both of the above hash to, kept so this test proves the two
+/// bodies really are a collision rather than merely two different byte strings.
+fn fnv1a_64(data: &[u8]) -> u64 {
+  let mut h = 0xcbf2_9ce4_8422_2325u64;
+  for &b in data {
+    h ^= u64::from(b);
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+  }
+  h
+}
+
+/// A credit is the BYTES, not a digest of them.
+///
+/// The tracker fingerprinted its sends with 64-bit FNV-1a, whose state update is
+/// multiplication by an odd constant mod 2⁶⁴ and therefore a bijection — which
+/// makes a second-preimage a meet-in-the-middle rather than a search of the
+/// output space. An on-link sender who constructs a *different* valid DNS packet
+/// with the same fingerprint consumed the take-once credit, and every driver
+/// elevated the resulting ordered match to `Provenance::OwnEcho`, whose whole
+/// permission row is "deny": the forged datagram's own §8.2 proposal and §9
+/// conflict rdata were deleted with it, and the genuine echo arriving behind it
+/// found no credit left and reached the protocol layer as peer traffic.
+///
+/// Exact matching is what makes the standing argument for full suppression true
+/// rather than assumed: a datagram that claims a credit now carries the bytes we
+/// sent, so its proposal is ours and ties under §8.2.1, and its rdata is ours
+/// and is never a §9 conflict.
 #[test]
-fn hash_is_content_addressed() {
-  assert_eq!(fnv1a(b"abc"), fnv1a(b"abc"));
-  assert_ne!(fnv1a(b"abc"), fnv1a(b"abd"));
+fn a_colliding_datagram_cannot_claim_another_datagrams_credit() {
+  assert_ne!(
+    COLLIDING_A, COLLIDING_B,
+    "the fixture must be two datagrams"
+  );
+  assert_eq!(
+    fnv1a_64(COLLIDING_A),
+    fnv1a_64(COLLIDING_B),
+    "the fixture must be a real 64-bit FNV-1a collision, or this test proves \
+     nothing about the digest it replaced"
+  );
+
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, COLLIDING_A, sent);
+  // Ordered, inside the TTL, right family, right source port: everything the
+  // strongest tier asks for, and the ONLY thing separating this datagram from
+  // our own echo is its bytes.
+  let rx = sent.wall + Duration::from_millis(1);
+  let now = claim(sent, Duration::from_millis(1));
+  assert_eq!(
+    t.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, COLLIDING_B, rx),
+      now
+    ),
+    SelfSendMatch::NoCredit,
+    "a datagram that merely COLLIDES with ours must not be suppressed as ours"
+  );
+  // And the credit is still there for the datagram it was actually recorded for.
+  assert_eq!(
+    t.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, COLLIDING_A, rx),
+      now
+    ),
+    SelfSendMatch::Ordered,
+    "the genuine echo must still find its credit"
+  );
 }
 
 #[test]
@@ -710,10 +798,11 @@ fn a_backwards_wall_clock_step_cannot_evict_or_expire_a_credit() {
   )));
 }
 
-/// A credit matches only the body it fingerprints: the tracker is a content
-/// hash, so a byte-different datagram must not consume another's credit.
+/// A credit matches only the body it stored: the tracker is content-addressed
+/// on the bytes themselves, so a byte-different datagram must not consume
+/// another's credit.
 #[test]
-fn a_credit_matches_only_the_body_it_fingerprints() {
+fn a_credit_matches_only_the_body_it_stored() {
   let mut t = SelfSendTracker::new();
   let sent = send_stamps();
   recorded_and_sealed(&mut t, Family::V6, b"announcement", sent);
@@ -749,11 +838,15 @@ fn full_tracker(sent: ClockPair, aged_from: Option<StdInstant>) -> SelfSendTrack
     entries: (0..MAX_SELF_SEND_ENTRIES)
       .map(|i| Credit {
         family: Family::V4,
-        hash: fnv1a(&(i as u64).to_be_bytes()),
+        body: (i as u64).to_be_bytes().to_vec(),
+        generation: 0,
         sent,
         aged_from,
       })
       .collect(),
+    // Seeded straight into `entries`, so the byte accounting `admit` reads has
+    // to be seeded with it — eight bytes per credit, matching the bodies above.
+    bytes: MAX_SELF_SEND_ENTRIES.saturating_mul(8),
     ..SelfSendTracker::new()
   }
 }
@@ -1121,4 +1214,161 @@ fn recv_datagram_slices_the_body_to_its_own_receives_length() {
     "and the meta must agree with the body it was minted beside"
   );
   assert_eq!(rx.family(), Family::V4);
+}
+
+// ── the record generation ───────────────────────────────────────────────────
+//
+// A self-echo is safe to adjudicate only while it still describes records this
+// endpoint holds. Service replacement breaks that across generations with no
+// RFC 6762 §8.4 record-updating API involved: a route withdrawing at host H no
+// longer holds H for the registration guard, so a replacement takes H with a
+// different address set while the outgoing goodbye drains, and a delayed echo of
+// the old announcement is then differing host rdata against the replacement's
+// own records — a terminal `HostConflict` raised by our own past.
+
+/// A credit outlives the generation it was recorded in, and says so.
+///
+/// The match itself is untouched — same bytes, same family, same ordering
+/// evidence, inside the TTL — and that is the point: the credit is still ours,
+/// so it must still be SPENT and still suppress. What changes is that it may no
+/// longer adjudicate, which the caller reads off the variant.
+#[test]
+fn a_credit_recorded_before_a_supersede_is_reported_as_superseded() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"announce-generation-one", sent);
+  // The service that sent it is retired and a replacement registers.
+  t.supersede();
+  let rx = sent.wall + Duration::from_millis(1);
+  let now = claim(sent, Duration::from_millis(1));
+  assert_eq!(
+    t.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, &b"announce-generation-one"[..], rx),
+      now
+    ),
+    SelfSendMatch::Superseded,
+    "an echo of a datagram sent before the records changed must not reach the \
+     adjudicating tier"
+  );
+  assert!(
+    t.is_empty(),
+    "and it is still take-once: a superseded credit is spent, not skipped"
+  );
+}
+
+/// The other direction, so the generation cannot silently swallow every claim: a
+/// credit recorded AFTER the supersede reports its ordinary tier.
+#[test]
+fn a_credit_recorded_after_a_supersede_keeps_its_ordinary_tier() {
+  let mut t = SelfSendTracker::new();
+  t.supersede();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"announce-generation-two", sent);
+  let rx = sent.wall + Duration::from_millis(1);
+  let now = claim(sent, Duration::from_millis(1));
+  assert_eq!(
+    t.claim_at(
+      &RxDatagram::from_stamp_for_test(Family::V4, &b"announce-generation-two"[..], rx),
+      now
+    ),
+    SelfSendMatch::Ordered
+  );
+}
+
+/// A supersede does not DROP the credits it retires.
+///
+/// Dropping them would make exactly the echoes this protects against read as
+/// `NoCredit` — full peer traffic, full adjudication — which is the failure it
+/// exists to prevent, only louder.
+#[test]
+fn a_supersede_retires_credits_without_discarding_them() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"still-here", sent);
+  t.supersede();
+  assert_eq!(t.len(), 1, "the credit must survive the generation change");
+  assert_ne!(
+    t.claim_at(
+      &RxDatagram::without_stamp(Family::V4, &b"still-here"[..]),
+      claim(sent, Duration::from_millis(1))
+    ),
+    SelfSendMatch::NoCredit,
+    "a discarded credit would send our own echo to the protocol layer as a \
+     peer's datagram, which is strictly worse than not adjudicating it"
+  );
+}
+
+// ── the byte budget ─────────────────────────────────────────────────────────
+
+/// The byte budget refuses the NEW entry, exactly as the entry cap does, and
+/// never evicts a live credit to make room.
+#[test]
+fn the_byte_budget_drops_the_new_entry_not_a_live_one() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  // Two datagrams that together exceed the budget: the first fits, the second
+  // cannot, and the first is live.
+  let big = std::vec![0xa5u8; MAX_SELF_SEND_BYTES / 2 + 1];
+  let other = std::vec![0x5au8; MAX_SELF_SEND_BYTES / 2 + 1];
+  recorded_and_sealed(&mut t, Family::V4, &big, sent);
+  t.record(Family::V4, &other, sent);
+  assert_eq!(t.len(), 1, "the budget drops the NEW entry");
+  let now = claim(sent, Duration::from_millis(1));
+  assert!(!consumed(t.claim_at(
+    &RxDatagram::without_stamp(Family::V4, &other[..]),
+    now
+  )));
+  assert!(
+    consumed(t.claim_at(&RxDatagram::without_stamp(Family::V4, &big[..]), now)),
+    "the live credit is never displaced"
+  );
+}
+
+/// Dead credits are reclaimed to make room for a live send's, and the budget is
+/// what decides how many — one freed entry slot is not one freed kilobyte.
+#[test]
+fn the_byte_budget_reclaims_dead_credits_rather_than_refusing_a_new_one() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  for i in 0..4u8 {
+    let mut body = std::vec![0x11u8; MAX_SELF_SEND_BYTES / 4];
+    body.truncate((MAX_SELF_SEND_BYTES / 4).saturating_sub(usize::from(i)));
+    t.record(Family::V4, &body, sent);
+  }
+  t.seal();
+  assert_eq!(t.len(), 4, "the tracker must start at the budget");
+  std::thread::sleep(STALL_PAST_TTL);
+  // Every resident credit is dead now, so a live send must still get one — and
+  // it needs THREE of them reclaimed, not one, to fit.
+  let later = ClockPair::now();
+  let wide = std::vec![0x22u8; (MAX_SELF_SEND_BYTES / 4).saturating_mul(3)];
+  t.record(Family::V4, &wide, later);
+  let top = StdInstant::now();
+  t.seal_at(top);
+  assert!(
+    consumed(t.claim_at(
+      &RxDatagram::without_stamp(Family::V4, &wide[..]),
+      ClockPair::new(later.wall, top)
+    )),
+    "a budget full of corpses must not crowd out a live send's echo suppression"
+  );
+}
+
+/// A datagram larger than the whole budget is refused rather than emptying the
+/// tracker for something that still would not fit.
+#[test]
+fn a_datagram_larger_than_the_budget_is_refused_and_takes_nothing_with_it() {
+  let mut t = SelfSendTracker::new();
+  let sent = send_stamps();
+  recorded_and_sealed(&mut t, Family::V4, b"resident", sent);
+  let huge = std::vec![0u8; MAX_SELF_SEND_BYTES + 1];
+  t.record(Family::V4, &huge, sent);
+  assert_eq!(t.len(), 1, "the oversized entry is refused");
+  assert!(
+    consumed(t.claim_at(
+      &RxDatagram::without_stamp(Family::V4, &b"resident"[..]),
+      claim(sent, Duration::from_millis(1))
+    )),
+    "and a refusal leaves the tracker exactly as it found it"
+  );
 }
