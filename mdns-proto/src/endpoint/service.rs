@@ -321,9 +321,16 @@ where
   /// resident anywhere, and the caller may register a replacement at the same
   /// owner names in the very next statement. A delayed echo of the removed
   /// service's own records then reaches normal conflict adjudication and retires
-  /// the replacement — the exact class
-  /// [`Self::retain_relinquished`] exists to close, reached by the one path that
-  /// used to relinquish a record set WITHOUT retaining it.
+  /// the replacement.
+  ///
+  /// This call therefore RETAINS what it gives up. The records the removed
+  /// service actually put on a wire are kept for
+  /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention)
+  /// and screened out of conflict adjudication — on the family that carried
+  /// them, which is the only family an echo of them can arrive on — so a late
+  /// echo is read as this endpoint's own past rather than as a peer contesting
+  /// the replacement's name. Force-removal is the one relinquishing path that
+  /// used to skip that retention.
   ///
   /// So `asserted` is the removed service's
   /// [`Service::withdrawal_snapshot`](crate::service::Service::withdrawal_snapshot)
