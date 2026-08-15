@@ -163,6 +163,65 @@ pub(crate) fn set_multicast_ttl_v4(sock: &UdpSocket, ttl: u8) -> std::io::Result
   sock.set_multicast_ttl_v4(u32::from(ttl))
 }
 
+/// Read `IP_MULTICAST_LOOP` back, through the same `std` per-target alias
+/// [`set_multicast_loop_v4`] wrote it with. The only caller is
+/// `crate::multicast::verify_multicast_loop_v4`, immediately after the setter.
+///
+/// # Why a read-back through the SAME table is not circular
+///
+/// The alias governs the sockopt's **transport width**, not the kernel's
+/// **storage width**, and those are different things. On the 4.4BSD lineage the
+/// storage is a single `u_char` field on `ip_moptions`; a `setsockopt` whose
+/// transport width that kernel misparsed writes a wrong value into that field,
+/// and a `getsockopt` — at any width — reads the same field back. So a shared
+/// table cannot cancel the comparison: the error being caught is in the DERIVED
+/// value, not in the byte layout of the buffer either call hands over.
+///
+/// Deliberately `std` and not rustix: rustix is the crate with the width defect
+/// this whole option pair routes around (see [`set_multicast_loop_v4`]), so
+/// reading back through it would compare a value against the thing suspected of
+/// deriving it wrongly.
+pub(crate) fn get_multicast_loop_v4(sock: &UdpSocket) -> std::io::Result<bool> {
+  sock.multicast_loop_v4()
+}
+
+/// Read `IP_MULTICAST_TTL` back, through the same `std` per-target alias
+/// [`set_multicast_ttl_v4`] wrote it with. The twin of
+/// [`get_multicast_loop_v4`] above, which carries the argument.
+///
+/// Returns std's `u32` rather than narrowing to `u8`: the value is only ever
+/// compared with, or reported as, something that already failed to be what was
+/// asked for, and narrowing could mask how wrong it is.
+pub(crate) fn get_multicast_ttl_v4(sock: &UdpSocket) -> std::io::Result<u32> {
+  sock.multicast_ttl_v4()
+}
+
+/// Read `IP_MULTICAST_IF` back through rustix, the same crate [`bind_v4`] set it
+/// with. The only caller is `crate::multicast::try_bind_v4`, and what it does
+/// with a disagreement is WARN — never fail the bind.
+///
+/// # Why rustix here, when the two scalars deliberately avoid it
+///
+/// The scalars route around rustix because of a width defect
+/// (see [`set_multicast_loop_v4`]) and read back through `std` so the check does
+/// not lean on the crate under suspicion. This option has no such problem: its
+/// payload is a 4-byte `struct in_addr` in both directions
+/// (`backend/libc/net/sockopt.rs` sends `to_imr_addr` and reads `from_in_addr`),
+/// with no per-target narrowing anywhere and no `RawSocketBool` in the path. So
+/// the symmetric read is the honest one, and `std` exposes no getter for this
+/// option at all.
+///
+/// # What a caller may conclude from it, which is less than it looks
+///
+/// The GET direction's round-trip semantics could NOT be established from source
+/// for FreeBSD, DragonFly, OpenBSD or NetBSD — a kernel is free to report the
+/// interface's primary address, or `INADDR_ANY`, rather than the address it was
+/// handed. None of those four has a runner anywhere in this workspace, so a
+/// mismatch here is a report and not a verdict.
+pub(crate) fn get_multicast_if_v4(sock: &UdpSocket) -> std::io::Result<Ipv4Addr> {
+  sockopt::ip_multicast_if(sock.as_fd()).map_err(to_io)
+}
+
 /// Set the IPv6 multicast hop limit (`IPV6_MULTICAST_HOPS`, the v6 sibling of
 /// `IP_MULTICAST_TTL`).
 ///
@@ -404,8 +463,10 @@ pub(crate) fn set_recv_hoplimit_v6(_sock: &UdpSocket) -> std::io::Result<()> {
 /// so a naive `c_int` would not silently corrupt anything there specifically,
 /// but that is one host's observed leniency, not a portable guarantee across
 /// every BSD this crate targets.) `set_multicast_ttl_v4`/`set_multicast_loop_v4`
-/// stay on the rustix path for exactly this reason — don't move them here
-/// without re-verifying the accepted width on every target.
+/// stay on the `std` path for exactly this reason — don't move them here
+/// without re-verifying the accepted width on every target, and note that
+/// `crate::multicast::verify_multicast_loop_v4` reads both back on every bind
+/// precisely so such a move cannot be silent.
 fn set_int_sockopt(
   sock: &UdpSocket,
   level: libc::c_int,
@@ -459,11 +520,14 @@ fn set_bool_sockopt(
 ///     check is the only execution `build.rs`'s evidence item 1 can point at
 ///     there.
 ///
-/// Nothing else is read back. The remaining rustix-covered setters have no
-/// comparable known defect, and the remaining receive-cmsg enablers
-/// (`set_recv_timestamp`, `set_recv_ttl_v4`, `set_recv_hoplimit_v6`) are
-/// deliberately best-effort and feed only diagnostics, so confirming them would
-/// add a syscall without adding safety.
+/// Nothing else is read back THROUGH HERE. The two IPv4 multicast scalars are
+/// read back too — see `get_multicast_loop_v4` / `get_multicast_ttl_v4` — but
+/// through `std`, in both directions, because this chokepoint is `c_int`-only
+/// and their whole subject is that their width is not `c_int` everywhere. The
+/// remaining rustix-covered setters have no comparable known defect, and the
+/// remaining receive-cmsg enablers (`set_recv_timestamp`, `set_recv_ttl_v4`,
+/// `set_recv_hoplimit_v6`) are deliberately best-effort and feed only
+/// diagnostics, so confirming them would add a syscall without adding safety.
 ///
 /// Valid ONLY for genuinely `int`-sized options — the same caveat as
 /// `set_int_sockopt` above applies to the read side. A `getsockopt` that

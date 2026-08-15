@@ -420,8 +420,38 @@ fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
     multicast_if,
     255,
   )?;
-  platform::set_multicast_loop_v4(&std_sock, opts.multicast_loop())?;
-  platform::set_multicast_ttl_v4(&std_sock, opts.ttl())?;
+  // Read `IP_MULTICAST_IF` back and WARN — a different policy from the two
+  // scalars below, for the reasons on `warn_if_multicast_if_v4_drifted`. Only
+  // where an egress address was actually requested: with no interface index
+  // there is no `IP_MULTICAST_IF` call to check, and the kernel's `INADDR_ANY`
+  // is then the correct answer rather than a drift.
+  #[cfg(unix)]
+  if let Some(requested) = multicast_if {
+    let _ = warn_if_multicast_if_v4_drifted(requested, platform::get_multicast_if_v4(&std_sock));
+  }
+  // `loop_to_apply` and `ttl_to_apply` are `opts.multicast_loop()` and
+  // `opts.ttl()` in every real build. See `FORCE_APPLIED_MULTICAST_LOOP_V4` and
+  // `FORCE_APPLIED_MULTICAST_TTL_V4` for why the `#[cfg(test)]` overrides exist.
+  let loop_to_apply = opts.multicast_loop();
+  #[cfg(test)]
+  let loop_to_apply = FORCE_APPLIED_MULTICAST_LOOP_V4
+    .with(|cell| cell.get())
+    .unwrap_or(loop_to_apply);
+  platform::set_multicast_loop_v4(&std_sock, loop_to_apply)?;
+  // Read both scalars back. See `verify_multicast_loop_v4` for the two failures
+  // this guards — one of them on no target in today's matrix, the other on every
+  // target — and for why deleting it would be silent.
+  #[cfg(unix)]
+  verify_multicast_loop_v4(&std_sock, opts.multicast_loop())?;
+
+  let ttl_to_apply = opts.ttl();
+  #[cfg(test)]
+  let ttl_to_apply = FORCE_APPLIED_MULTICAST_TTL_V4
+    .with(|cell| cell.get())
+    .unwrap_or(ttl_to_apply);
+  platform::set_multicast_ttl_v4(&std_sock, ttl_to_apply)?;
+  #[cfg(unix)]
+  verify_multicast_ttl_v4(&std_sock, opts.ttl())?;
   // NOT best-effort where the option exists — and NOT because a silent failure
   // would make this socket deaf. It would do the opposite, which is exactly why
   // it has to fail HERE: `admits_ingress` passes a `Declined` witness the same
@@ -491,6 +521,190 @@ pub fn try_bind_v6(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   try_bind_v6_inner(opts).inspect_err(|_e| {
     hick_trace::warn!(error = %_e, "try_bind_v6 failed");
   })
+}
+
+/// Report an `IP_MULTICAST_IF` read-back that disagrees with the address
+/// `try_bind_v4` asked `platform::bind_v4` to set, and **never fail the bind on
+/// it**. Returns whether it warned.
+///
+/// # Why this one warns where the two scalars fail
+///
+/// It is not in their class, on either half of their argument. Its payload is a
+/// 4-byte `struct in_addr` in both directions with no per-target narrowing, so
+/// there is no width to get wrong and no big-endian case to guard; and the
+/// historical silent-unset defect — a bind that quietly egressed the OS default
+/// interface — is already closed upstream of here by
+/// [`BindError::InterfaceNotFound`], which fires when the requested index
+/// resolves to no IPv4 address at all.
+///
+/// What is left is worth reporting and NOT worth failing on: the GET direction's
+/// round-trip semantics could not be established from source for FreeBSD,
+/// DragonFly, OpenBSD or NetBSD. A kernel that answers with the interface's
+/// primary address, or with `INADDR_ANY`, would look exactly like a drift here —
+/// and three of those four targets have no runner anywhere in this workspace, so
+/// a hard failure would brick the IPv4 bind on them with no way to find out
+/// first. The scalars can afford `?` because their read-back's meaning is
+/// established in both directions; this one cannot.
+///
+/// **The bind cannot fail on this, structurally rather than by convention**: the
+/// return type is `bool`, so there is no error for `?` to propagate, and a later
+/// pass that wants a hard failure has to change the signature to get one.
+///
+/// A read-back that itself errors warns too, and is deliberately not silent: a
+/// `getsockopt` refused by a jail or a seccomp filter is a fact about the host
+/// worth a line, and it costs nothing here because nothing is decided on it.
+#[cfg(unix)]
+fn warn_if_multicast_if_v4_drifted(
+  requested: Ipv4Addr,
+  observed: std::io::Result<Ipv4Addr>,
+) -> bool {
+  match observed {
+    Ok(observed) if observed == requested => false,
+    Ok(_observed) => {
+      hick_trace::warn!(
+        requested = %requested,
+        observed = %_observed,
+        "IP_MULTICAST_IF read-back disagrees with the requested egress address; sends may leave \
+         on another interface. Some kernels report this option differently than they take it, so \
+         this is a report and not a verdict"
+      );
+      true
+    }
+    Err(_e) => {
+      hick_trace::warn!(
+        requested = %requested,
+        error = %_e,
+        "IP_MULTICAST_IF read-back failed; the egress interface this bind requested is unconfirmed"
+      );
+      true
+    }
+  }
+}
+
+/// Read `IP_MULTICAST_LOOP` back immediately after
+/// `platform::set_multicast_loop_v4` and fail the bind unless the kernel holds
+/// what was asked for.
+///
+/// # It guards TWO failures, and only one of them is exotic
+///
+/// Reading only the first of these invites a later pass to delete this as dead
+/// weight, because the first is unreachable on every target in today's matrix.
+///
+/// **One — the wrong-width `setsockopt` on a big-endian host.** These two IPv4
+/// scalars are a one-byte `u_char` on the 4.4BSD lineage and a four-byte
+/// `c_int` elsewhere; `std` is the only implementation that sizes them per
+/// target (see `crate::platform::unix::set_multicast_loop_v4` for the alias and
+/// the rustix defect it routes around). Work the wrong alias through: a `c_int`
+/// payload sent to a `u_char` kernel on a LITTLE-endian host puts the value in
+/// byte 0, so the kernel reads 255 and stores 255 — correct by accident, and
+/// there is nothing to detect. On a BIG-endian host the same payload is
+/// `00 00 00 FF`, the kernel reads byte 0 and stores 0, and a multicast TTL of 0
+/// means nothing this endpoint sends ever leaves the host. No return code says
+/// so. **Every target this workspace builds for today is little-endian**, which
+/// is exactly why this half of the check cannot be justified by any test that
+/// runs anywhere in this project — it guards a target not yet in the matrix.
+///
+/// The opposite width error — a one-byte payload to a kernel that accepts only
+/// an `int` — is believed to fail loudly at set time with `EINVAL` rather than
+/// silently, so it needs no read-back. That is **reasoned from the option's
+/// documented `optlen` handling, not verified against kernel sources**, and it
+/// is the weaker leg of the argument; the read-back below costs one syscall and
+/// does not depend on it.
+///
+/// **Two — a future re-route of these setters onto a wrong level or a wrong
+/// constant, on EVERY target.** This is not hypothetical in this crate: it is
+/// the exact shape `verify_multicast_hops_v6` exists for, where rustix passed
+/// `IPPROTO_IP` for an `IPV6_*` option and landed on Linux's unrelated
+/// `IP_PASSSEC` boolean — `setsockopt` returned success while the real value
+/// stayed at the kernel default. Both scalars here reach the kernel through
+/// `std` today, and a later change that moves either onto `set_int_sockopt`, a
+/// hand-rolled `setsockopt`, or a rustix call that has been "fixed" upstream
+/// re-opens precisely that failure. The read-back catches it on the host that
+/// runs the code, whatever target that is.
+///
+/// # Per option, not bundled
+///
+/// Two error variants, matching the per-option v6 twin
+/// [`BindError::MulticastHopsNotApplied`]: a report says which scalar the kernel
+/// did not take, and the two are set by two separate `setsockopt` calls that can
+/// fail independently.
+///
+/// # Unix only
+///
+/// Winsock defines both options as `DWORD` with no per-target narrowing, so
+/// there is no width ambiguity to detect on Windows; the crate sets them there
+/// through `socket2` at that one width.
+///
+/// **A disagreement is the failure, not an error return.** A `getsockopt` that
+/// itself errors — a jail or a seccomp filter that refuses it — propagates as
+/// [`BindError::Io`], the same as every other syscall in this bind. A successful
+/// read of the wrong value is the false success no return code could show.
+#[cfg(unix)]
+fn verify_multicast_loop_v4(sock: &UdpSocket, requested: bool) -> Result<(), BindError> {
+  let observed = platform::get_multicast_loop_v4(sock)?;
+  if observed != requested {
+    return Err(BindError::MulticastLoopNotApplied(
+      crate::error::MulticastLoopNotAppliedDetail::new(requested, observed),
+    ));
+  }
+  Ok(())
+}
+
+/// Read `IP_MULTICAST_TTL` back immediately after
+/// `platform::set_multicast_ttl_v4`, and fail the bind on a disagreement. The
+/// twin of [`verify_multicast_loop_v4`] above, which carries the whole argument
+/// for both.
+///
+/// RFC 6762 §11 requires multicast responses at TTL 255, so what this failure
+/// leaves behind when it is not caught is a socket sending at the kernel default
+/// of 1 — one hop, never past the first router — or at 0, which never reaches
+/// the wire at all.
+#[cfg(unix)]
+fn verify_multicast_ttl_v4(sock: &UdpSocket, requested: u8) -> Result<(), BindError> {
+  let observed = platform::get_multicast_ttl_v4(sock)?;
+  if observed != u32::from(requested) {
+    return Err(BindError::MulticastTtlNotApplied(
+      crate::error::MulticastTtlNotAppliedDetail::new(requested, observed),
+    ));
+  }
+  Ok(())
+}
+
+// Test-only seams for `try_bind_v4_inner`, above: when set with `.set(Some(v))`
+// from inside a test (on that test's own thread), each makes the bind apply `v`
+// to the kernel while still telling the matching verifier that `opts` asked for
+// its own value — forcing a genuine requested/observed disagreement through the
+// REAL production call sequence, and through a real `getsockopt` that reports
+// what the kernel really holds.
+//
+// A seam is unavoidable here, and that is the whole reason these exist. On a
+// correct kernel every value reachable through `MulticastOptionsV4` round-trips
+// faithfully, so no input to the public API can make a setter and its verifier
+// disagree — which means that without these, deleting the
+// `verify_multicast_loop_v4` / `verify_multicast_ttl_v4` lines from
+// `try_bind_v4_inner` would leave every test green. Those lines are the whole of
+// what a big-endian target has in place of a runner, and no such runner exists
+// anywhere in this project.
+//
+// Two cells rather than one pair, because the two options are set by two
+// independent `setsockopt` calls and each verifier must be pinnable on its own;
+// a single bundled override would let a test that forces one prove the other's
+// call site by accident.
+//
+// `None` (the default) means "apply what `opts` says", identical to production;
+// it is the ONLY possible value outside `#[cfg(test)]` builds, since the items
+// do not exist at all there. Thread-local rather than a plain `static` so
+// concurrent tests cannot interfere through them — and every setter resets
+// before asserting, because `--test-threads=1` (which the FreeBSD CI job uses)
+// runs every test on one thread, where a leaked override would reach the next
+// test. Same pattern as `FORCE_APPLIED_HOPS_V6` and
+// `FORCE_RX_DSTADDR_READBACK_V4`.
+#[cfg(test)]
+thread_local! {
+  static FORCE_APPLIED_MULTICAST_LOOP_V4: std::cell::Cell<Option<bool>> =
+    const { std::cell::Cell::new(None) };
+  static FORCE_APPLIED_MULTICAST_TTL_V4: std::cell::Cell<Option<u8>> =
+    const { std::cell::Cell::new(None) };
 }
 
 /// Read `IP_RECVDSTADDR` and `IP_RECVIF` back immediately after

@@ -24,7 +24,8 @@ mod family;
 
 pub use error::{
   AddressInUseDetail, BindError, BufferTooShortDetail, InterfaceNotFoundDetail, JoinError,
-  MulticastHopsNotAppliedDetail, ParseRecvMetaError, RxDestinationNotEnabledDetail,
+  MulticastHopsNotAppliedDetail, MulticastLoopNotAppliedDetail, MulticastTtlNotAppliedDetail,
+  ParseRecvMetaError, RxDestinationNotEnabledDetail,
 };
 pub use family::Family;
 
