@@ -201,7 +201,18 @@ impl BufferTooShortDetail {
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum BindError {
-  /// The requested interface was not found.
+  /// The requested interface was not found, or — on the IPv4 path — was found
+  /// and resolves no usable IPv4 address.
+  ///
+  /// Those two share a variant because the IPv4 bind cannot proceed from
+  /// either: the resolved address is the `IP_MULTICAST_IF` payload. The IPv6
+  /// bind raises this ONLY for an index that names no interface; an interface
+  /// that reports no IPv6 address is logged and the bind proceeds, because
+  /// `IPV6_MULTICAST_IF` takes the index and never needs the address.
+  ///
+  /// Neither path raises it for a look-up that FAILED. That is
+  /// [`BindError::Io`] carrying the platform's own kind, because a failed
+  /// address enumeration establishes nothing about the interface.
   #[error(transparent)]
   InterfaceNotFound(InterfaceNotFoundDetail),
 
@@ -293,7 +304,10 @@ pub enum BindError {
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum JoinError {
-  /// The requested interface was not found.
+  /// The requested interface was not found, or was found and resolves no
+  /// usable IPv4 address — with none there is no membership to add. A look-up
+  /// that FAILED is [`JoinError::Io`] instead, for the reason on
+  /// [`BindError::InterfaceNotFound`].
   #[error(transparent)]
   InterfaceNotFound(InterfaceNotFoundDetail),
 

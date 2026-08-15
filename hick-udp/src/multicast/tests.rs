@@ -2734,22 +2734,24 @@ fn multicast_if_v4_read_back_reports_a_drift_and_a_failed_read() {
   );
 }
 
-/// Regression test for `try_bind_v6_inner`'s interface-existence check — the
+/// Regression test for the ONE state `try_bind_v6_inner` hard-fails on — the
 /// v6 twin of `try_bind_v4_errors_on_nonzero_index_with_no_ipv4_interface`
-/// (in `multicast.rs`'s `r4_f5_tests` module), proving `try_bind_v6` now has
-/// the same guaranteed contract for a bad interface index that `try_bind_v4`
-/// already had.
+/// (in `multicast.rs`'s `r4_f5_tests` module), pinning the guaranteed contract
+/// for an interface index that names nothing at all.
 ///
 /// `u32::MAX` is reserved / unassignable — `getifs::interface_by_index`
-/// returns `Ok(None)` for it — so `ipv6_addr_for_index` resolves no address
-/// and the pre-check at the top of `try_bind_v6_inner` returns
-/// `BindError::InterfaceNotFound` before ever reaching `platform::bind_v6`.
-/// Before that check existed, this same call instead reached the kernel's own
-/// `IPV6_MULTICAST_IF` validation, which fails too — but as a bare
-/// `BindError::Io` no caller could distinguish from an unrelated I/O error,
-/// and which does not fire at all for an interface that exists but simply
-/// carries no IPv6 address (an IPv4-only NIC), the case this check also
-/// closes.
+/// returns `Ok(None)` for it — so the look-up reports `NoSuchInterface` and
+/// `check_egress_interface_v6` returns `BindError::InterfaceNotFound` before
+/// `platform::bind_v6` is ever reached. Before that check existed, this same
+/// call instead reached the kernel's own `IPV6_MULTICAST_IF` validation, which
+/// rejects it too — but as a bare `BindError::Io` no caller could distinguish
+/// from an unrelated I/O error.
+///
+/// This state is the whole of the guarantee. An interface that EXISTS and
+/// reports no IPv6 address is warned and the bind proceeds, as is a look-up
+/// that failed; both are decided over values in
+/// `interface_lookup_decision_tests`, because no CI host can be made to
+/// present either one.
 #[test]
 fn try_bind_v6_errors_on_nonzero_index_with_no_ipv6_interface() {
   let opts = MulticastOptionsV6::new(u32::MAX);

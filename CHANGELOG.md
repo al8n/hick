@@ -466,7 +466,9 @@ OTHER
   risk bricking the IPv4 bind on a conforming host with no way to find out
   first. The historical silent-unset defect this guards against is already
   closed upstream by the pre-existing `BindError::InterfaceNotFound`, which
-  fires when the requested interface index resolves to no IPv4 address at all.
+  fires when the requested interface index names no interface or carries no
+  IPv4 address at all (and by `BindError::Io` when that look-up itself failed —
+  see below).
 
 ## A bind that cannot honour the interface it was given now says so
 
@@ -480,22 +482,34 @@ OTHER
   release — hence now. A caller that matched it should match `BindError::Io`
   and inspect `ErrorKind::AddrInUse`, which is what the four bundled drivers'
   test helpers already did alongside the dead arm.
-- `hick-udp`: `try_bind_v6` now rejects a non-zero interface index that names
-  no IPv6-capable interface, with the existing `BindError::InterfaceNotFound`.
-  `try_bind_v4` has resolved its index and failed loudly for some time; the v6
-  path passed the index straight to `setsockopt(IPV6_MULTICAST_IF)`, and the
-  kernel validates that the index names a real device but **not** that the
-  device carries IPv6 — so an IPv4-only NIC was accepted and then silently
-  carried no IPv6 traffic. No new public API: the error and its detail type
-  already existed for the v4 path. This is deliberately a hard failure rather
-  than the warn-and-continue chosen for the socket-option *read-back* above;
-  the two are different categories. A read-back whose semantics are unverified
-  on four BSDs must not brick a bind that worked, whereas an interface that
-  could never carry the traffic is the case this crate already fails on
-  everywhere else. Link-local-only interfaces are unaffected and still bind:
-  the check uses the same "reports any IPv6 address" predicate the four
-  drivers already use to pick an interface, and that predicate includes
-  `fe80::/10`.
+- `hick-udp`: `try_bind_v6` now resolves a non-zero interface index before it
+  binds, and answers each of the three things that look-up can report on its
+  own terms. An index that names **no interface** is rejected with the existing
+  `BindError::InterfaceNotFound`, as `try_bind_v4` has done for some time: the
+  kernel rejects it too, but as a bare `BindError::Io` no caller can tell from
+  any other I/O error. An interface that reports **no IPv6 address**, and a
+  look-up that **failed**, are logged and the bind proceeds. That is not a
+  softer reading of how much those two matter — `IPV6_MULTICAST_IF` takes the
+  interface INDEX, so the address resolved here is evidence and never a
+  payload, nothing the bind does needs it, and a refusal on it would be bought
+  with no decision. Neither state is a reliable negative either: an addressless
+  interface is an IPv4-only NIC *or* one whose RA/SLAAC address has not landed
+  yet, and `getifs` returns `EINTR` by design when an address dump is
+  interrupted by DHCP, a VPN coming up or interface churn. Link-local-only
+  interfaces are unaffected and still bind silently: the "reports any IPv6
+  address" predicate includes `fe80::/10`.
+- `hick-udp`: `try_bind_v4` and `try_join_v4` now report an interface look-up
+  that **failed** as `BindError::Io` / `JoinError::Io`, carrying the platform's
+  own error kind plus the index and family, instead of `InterfaceNotFound`.
+  Both still fail on an index that names no interface and on one carrying no
+  IPv4 address — there the resolved address is the `IP_MULTICAST_IF` payload,
+  and each address is its own `IP_ADD_MEMBERSHIP`, so neither can proceed
+  without one — but an enumeration that could not be read establishes nothing
+  about the interface, and calling it "not found" sent a caller auditing an
+  interface nobody managed to read. `try_join_v4` runs at endpoint construction
+  in all three drivers that depend on this crate, where it surfaces as
+  `ServerError::BindV4`. No new public API in any of this: every error variant
+  and detail type used here already existed.
 - `mdns-proto`: `Endpoint::try_register_service` now rejects a `ServiceSpec`
   whose `service_type` is not the immediate parent of its instance name,
   with the new `RegisterServiceError::ServiceTypeNotParent` carrying both

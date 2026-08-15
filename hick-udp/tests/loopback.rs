@@ -243,12 +243,14 @@ impl Family {
 /// `UP + MULTICAST` on interfaces with no active link and no addresses at all
 /// (e.g. macOS's internal `anpiN` interfaces: `UP`/`RUNNING` with
 /// `media: none, status: inactive`). `try_bind_v4` has an explicit, guaranteed
-/// contract for this: `ipv4_addr_for_index` resolves no address, so it
-/// returns `BindError::InterfaceNotFound`. `try_bind_v6` has no equivalent
-/// resolution step and NO guaranteed error kind for an addressless interface
-/// — do not assume it is `EINVAL`, and do not treat "an addressless interface
-/// was picked" as license to widen `is_environment_refusal`'s allowlist: a
-/// real `EINVAL` from `try_bind_v6` may be exactly this crate's
+/// contract for this: an interface that resolves no IPv4 address gives
+/// `BindError::InterfaceNotFound`. `try_bind_v6` guarantees that only for an
+/// index that names NO INTERFACE; an interface that exists and reports no IPv6
+/// address is a warned proceed there, so that bind may well succeed, and if it
+/// fails it fails further downstream with NO guaranteed error kind — do not
+/// assume it is `EINVAL`, and do not treat "an addressless interface was
+/// picked" as license to widen `is_environment_refusal`'s allowlist: a real
+/// `EINVAL` from `try_bind_v6` may be exactly this crate's
 /// wrong-protocol-level rustix bug, and only the allowlisted error kinds may
 /// decide that — never a guess about the cause. A flags-only filter would
 /// pick one of these unusable interfaces, and every "real interface" test
