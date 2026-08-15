@@ -1,6 +1,5 @@
 //! Error types for `hick-udp` operations.
 
-use core::net::IpAddr;
 use derive_more::{Display, IsVariant, TryUnwrap, Unwrap};
 
 /// Detail for [`BindError::InterfaceNotFound`].
@@ -19,32 +18,6 @@ impl InterfaceNotFoundDetail {
   #[inline(always)]
   pub const fn index(&self) -> u32 {
     self.index
-  }
-}
-
-/// Detail for [`BindError::AddressInUse`].
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Display, thiserror::Error)]
-#[display("address {addr} already in use on interface {iface}")]
-pub struct AddressInUseDetail {
-  addr: IpAddr,
-  iface: u32,
-}
-impl AddressInUseDetail {
-  /// Build a new detail payload.
-  #[expect(dead_code, reason = "used by socket-bind helpers not yet wired in")]
-  #[inline(always)]
-  pub(crate) const fn new(addr: IpAddr, iface: u32) -> Self {
-    Self { addr, iface }
-  }
-  /// The address that was already in use.
-  #[inline(always)]
-  pub const fn addr(&self) -> IpAddr {
-    self.addr
-  }
-  /// The interface index involved.
-  #[inline(always)]
-  pub const fn iface(&self) -> u32 {
-    self.iface
   }
 }
 
@@ -231,10 +204,6 @@ pub enum BindError {
   /// The requested interface was not found.
   #[error(transparent)]
   InterfaceNotFound(InterfaceNotFoundDetail),
-
-  /// The address was already in use on the chosen interface.
-  #[error(transparent)]
-  AddressInUse(AddressInUseDetail),
 
   /// The kernel accepted the `IPV6_MULTICAST_HOPS` `setsockopt` call, but a
   /// read-back shows it did not actually apply the requested value.

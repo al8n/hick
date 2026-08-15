@@ -111,9 +111,9 @@ mod is_environment_refusal_classifier_tests {
 /// Classify the result of a multicast-bind attempt via
 /// [`is_environment_refusal`]: a refusal is printed and skipped (`None`); any
 /// other error is OUR bug and fails the test instead of being silently
-/// swallowed. `BindError`'s non-I/O variants (`InterfaceNotFound`,
-/// `AddressInUse`) are not expected from the call sites below (each resolves
-/// its interface index immediately beforehand), so they fail too.
+/// swallowed. `BindError`'s non-I/O variants (e.g. `InterfaceNotFound`) are
+/// not expected from the call sites below (each resolves its interface index
+/// immediately beforehand), so they fail too.
 #[track_caller]
 fn expect_bind_or_skip<T>(label: &str, result: Result<T, BindError>) -> Option<T> {
   match result {
