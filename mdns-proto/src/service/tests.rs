@@ -74,6 +74,7 @@ fn non_probing_service_announces_without_probing() {
       FakeInstant::zero(),
       [0u8; 32],
       false, // do not probe
+      true, // announce
     );
   assert!(
     matches!(svc.state(), ServiceState::Announcing(_)),
@@ -109,13 +110,72 @@ fn non_probing_service_announces_without_probing() {
   );
 }
 
+/// A non-announcing responder (`EndpointConfig::with_announce(false)`) starts
+/// established and never emits unsolicited traffic — no §8.1 probes, no §8.3
+/// announcements, no periodic re-announces — but still answers explicit
+/// queries for its records.
+#[test]
+fn non_announcing_responder_answers_questions_only() {
+  use crate::{event::ServiceQuestion, wire::QuestionRef};
+  let records = make_records(120);
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::try_new(
+      ServiceHandle::from_raw(0),
+      records,
+      FakeInstant::zero(),
+      [0u8; 32],
+      true, // probe — irrelevant, announce wins
+      false, // announce
+    );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "non-announcing service must start established"
+  );
+
+  // Many ticks with a successful-delivery driver: no lifecycle transmit
+  // (probe or announcement) may ever come out.
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+  for _ in 0..100 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    assert!(
+      svc.poll_transmit(now, &mut buf).unwrap().is_none(),
+      "non-announcing service must never emit unsolicited traffic"
+    );
+  }
+
+  // An explicit query IS answered (after the 20–120 ms jitter window).
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in "_ipp._tcp.local.".trim_end_matches('.').split('.') {
+    qbuf.push(label.len() as u8);
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8);
+  qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  let src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
+    now,
+  );
+  now = now.advance(200);
+  svc.handle_timeout(now).unwrap();
+  assert!(
+    svc.poll_transmit(now, &mut buf).unwrap().is_some(),
+    "non-announcing service must answer explicit queries"
+  );
+}
+
 /// Build a Service in Init state with last_now = FakeInstant::zero().
 fn make_service(
   ttl_secs: u32,
 ) -> Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> {
   let handle = ServiceHandle::from_raw(0);
   let records = make_records(ttl_secs);
-  Service::try_new(handle, records, FakeInstant::zero(), [0u8; 32], true)
+  Service::try_new(handle, records, FakeInstant::zero(), [0u8; 32], true, true)
 }
 
 /// One record of a peer's §8.2 proposal, as it goes on the wire.
@@ -861,7 +921,7 @@ fn advertised_host_addrs_are_the_emitted_subset_not_configured() {
       FakeInstant::zero(),
       [0u8; 32],
       true,
-    );
+    true);
   assert!(
     svc.advertised_a_addrs().is_empty(),
     "nothing advertised before any confirmed send"
@@ -2497,7 +2557,7 @@ fn host_conflict_for_identical_link_local_address_is_suppressed() {
         FakeInstant::zero(),
         [0u8; 32],
         true,
-      );
+      true);
     svc.handle_timeout(FakeInstant::zero()).unwrap();
     svc
   };
@@ -2567,7 +2627,7 @@ fn failed_conflict_rename_clears_stale_transmit_state() {
       FakeInstant::zero(),
       [0u8; 32],
       true,
-    );
+    true);
   // A probe on the wire first, then a conflicting RESPONSE — §8.1's rename is
   // the one that can FAIL here. A §8.2 tiebreak loss now defers and keeps the
   // name, so it never attempts the suffix at all.
@@ -2630,7 +2690,7 @@ fn a_terminal_service_still_surfaces_a_host_conflict() {
       FakeInstant::zero(),
       [0u8; 32],
       true,
-    );
+    true);
   let t0 = probe_once(&mut svc, FakeInstant::zero());
   deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
   svc.handle_timeout(t0.advance(500)).unwrap();
@@ -4909,7 +4969,7 @@ fn tiebreak_records_that_flatten_alike_are_not_a_tie() {
       FakeInstant::zero(),
       [0u8; 32],
       true,
-    );
+    true);
   let t0 = FakeInstant::zero();
   svc.handle_timeout(t0).unwrap(); // Init → Probing
   let original = svc.name().as_str().to_owned();
@@ -6130,7 +6190,7 @@ fn subtype_ptr_advertised_in_response() {
       FakeInstant::zero(),
       [0u8; 32],
       true,
-    );
+    true);
   let now = drive_to_established(&mut svc);
 
   // A question response carries the subtype PTR at positive TTL.
@@ -6237,7 +6297,7 @@ fn legacy_subtype_browse_gets_unicast_reply_with_subtype_ptr() {
       FakeInstant::zero(),
       [0u8; 32],
       true,
-    );
+    true);
   let now = drive_to_established(&mut svc);
 
   let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
@@ -10605,7 +10665,7 @@ fn a_record_outside_the_probes_qtype_is_still_proposed() {
         FakeInstant::zero(),
         [0u8; 32],
         true,
-      );
+      true);
     let t0 = FakeInstant::zero();
     svc.handle_timeout(t0).unwrap();
 
@@ -11044,7 +11104,7 @@ fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name(
       FakeInstant::zero(),
       [0u8; 32],
       true,
-    );
+    true);
   let start = probe_once(&mut svc, FakeInstant::zero());
 
   let nsec_record = |types: &[u16], buf: &mut [u8; 512]| -> std::vec::Vec<u8> {
@@ -11561,7 +11621,7 @@ fn make_service_with(
     FakeInstant::zero(),
     [0u8; 32],
     true,
-  )
+  true)
 }
 
 /// RFC 6762 §9 makes a conflict "the same name, **rrtype** and rrclass, but

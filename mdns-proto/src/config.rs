@@ -30,13 +30,15 @@ const DEFAULT_RELINQUISHED_RETENTION: core::time::Duration = core::time::Duratio
 pub struct EndpointConfig {
   probe_unique_names: bool,
   answer_questions: bool,
+  announce: bool,
   populate_cache: bool,
   trust_advertised_src_as_self: bool,
   relinquished_retention: core::time::Duration,
 }
 
 impl EndpointConfig {
-  /// Construct with defaults: probe on registration, answer questions, cache
+  /// Construct with defaults: probe on registration, answer questions,
+  /// announce (unsolicited §8.3 announcements + periodic re-announces), cache
   /// observations, DO NOT trust advertised-source matching as a self-
   /// loopback signal, and screen a relinquished record set's own echoes for five
   /// seconds (see [`Self::relinquished_retention`]). The default is appropriate
@@ -52,6 +54,7 @@ impl EndpointConfig {
     Self {
       probe_unique_names: true,
       answer_questions: true,
+      announce: true,
       populate_cache: true,
       trust_advertised_src_as_self: false,
       relinquished_retention: DEFAULT_RELINQUISHED_RETENTION,
@@ -107,6 +110,33 @@ impl EndpointConfig {
   #[must_use]
   pub const fn with_answer_questions(mut self, v: bool) -> Self {
     self.answer_questions = v;
+    self
+  }
+
+  /// Whether to send unsolicited announcements (the RFC 6762 §8.3 startup
+  /// burst and the periodic re-announce), including the §8.1 probe sequence
+  /// that precedes them.
+  ///
+  /// The default `true` is the conformant responder: probe for the name, then
+  /// announce it so peers learn of the service without asking.  `false`
+  /// switches to a **non-announcing responder**: the service starts established and
+  /// never puts anything on the wire unless an explicit query asks for its
+  /// records.  Useful for battery-sensitive or privacy-conscious devices that
+  /// want to be discoverable when asked but send no background traffic.
+  #[inline(always)]
+  pub const fn announce(&self) -> bool {
+    self.announce
+  }
+
+  /// Set whether to send unsolicited announcements; see [`Self::announce`].
+  ///
+  /// `false` also skips the §8.1 probe sequence: a non-announcing responder claims
+  /// nothing, so there is nothing to probe for.  §9 conflicts are ignored in
+  /// that mode (the name is never claimed, so a peer's claim is not fought
+  /// over) and the registered records are still answered on query.
+  #[must_use]
+  pub const fn with_announce(mut self, v: bool) -> Self {
+    self.announce = v;
     self
   }
 
