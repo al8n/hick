@@ -5,8 +5,8 @@ use std::future::Future;
 use agnostic_net::Net;
 use async_channel::Sender;
 use hick_udp::{
-  Family, MulticastOptionsV4, MulticastOptionsV6, try_bind_v4, try_bind_v6, try_join_v4,
-  try_join_v6,
+  Family, MulticastOptionsV4, MulticastOptionsV6, interfaces::{has_addr_in, pick_default_interface_index},
+  try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
 use mdns_proto::{QuerySpec, ServiceSpec};
 
@@ -320,136 +320,6 @@ fn map_join_to_bind_v6(e: hick_udp::JoinError) -> ServerError {
       ServerError::BindV6(hick_udp::BindError::InterfaceNotFound(d))
     }
     _ => ServerError::Io(std::io::Error::other("unknown JoinError variant")),
-  }
-}
-
-/// Pick a default interface index when the caller didn't pin one.
-///
-/// Dispatches to [`rank_candidates`], which probes a candidate's addresses only
-/// while its answer can still outrank the incumbent. An error is propagated
-/// when reading a candidate that could change the pick, preserving the rule
-/// that transient enumeration failures (e.g. `EINTR`) are hard errors and not
-/// mistaken for an absent family.
-fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> std::io::Result<Option<u32>> {
-  let ifs = getifs::interfaces()
-    .map_err(|e| std::io::Error::new(e.kind(), format!("enumerating network interfaces: {e}")))?;
-  rank_candidates(
-    ifs
-      .iter()
-      .filter_map(|i| Some((tier_base(i)?, i.index(), i))),
-    want_v4,
-    want_v6,
-    |iface, family| has_addr_in(iface, family),
-  )
-}
-
-/// The best tier `iface`'s FLAGS alone can qualify it for, or `None` when they
-/// disqualify it outright.
-///
-/// Tier 0 is an up, multicast-capable, non-loopback interface and tier 2 is an
-/// up loopback one; each tier's odd neighbour above it is the same interface
-/// serving only some of the requested families. Reading no address here is what
-/// keeps an interface the picker would never choose from costing a syscall — or
-/// failing one.
-fn tier_base(iface: &getifs::Interface) -> Option<u8> {
-  let f = iface.flags();
-  if f.contains(getifs::Flags::UP)
-    && f.contains(getifs::Flags::MULTICAST)
-    && !f.contains(getifs::Flags::LOOPBACK)
-    && iface.index() != 0
-  {
-    Some(0)
-  } else if f.contains(getifs::Flags::LOOPBACK) && f.contains(getifs::Flags::UP) {
-    Some(2)
-  } else {
-    None
-  }
-}
-
-/// Rank already-classified candidates and return the winner's interface index.
-///
-/// `candidates` yields `(tier_base, index, subject)`, where `subject` is
-/// whatever `has_addr` needs to read that candidate's addresses.
-///
-/// One pass over four preference tiers, lowest wins, first-seen wins within a
-/// tier. Probes for a family only while its answer can still outrank the
-/// incumbent.
-fn rank_candidates<S>(
-  candidates: impl IntoIterator<Item = (u8, u32, S)>,
-  want_v4: bool,
-  want_v6: bool,
-  mut has_addr: impl FnMut(&S, Family) -> std::io::Result<bool>,
-) -> std::io::Result<Option<u32>> {
-  let mut best: Option<(u8, u32)> = None;
-  'candidates: for (tier_base, index, subject) in candidates {
-    let mut reachable = tier_base;
-    let mut serves_any = false;
-    for (family, wanted) in [(Family::V4, want_v4), (Family::V6, want_v6)] {
-      if best.is_some_and(|(seen, _)| reachable >= seen) {
-        continue 'candidates;
-      }
-      let serves = wanted && has_addr(&subject, family)?;
-      serves_any |= serves;
-      if wanted && !serves {
-        reachable = tier_base + 1;
-      }
-    }
-    if !serves_any && reachable > tier_base {
-      continue;
-    }
-    if best.is_none_or(|(seen, _)| reachable < seen) {
-      best = Some((reachable, index));
-    }
-  }
-  Ok(best.map(|(_, index)| index))
-}
-
-/// Address presence for `family`. `false` only means Ok(empty); Err is not absence.
-fn has_addr_in(iface: &getifs::Interface, family: Family) -> std::io::Result<bool> {
-  let index = iface.index();
-  let (label, addrs) = match family {
-    Family::V4 => ("IPv4", iface.ipv4_addrs().map(|a| !a.is_empty())),
-    Family::V6 => ("IPv6", iface.ipv6_addrs().map(|a| !a.is_empty())),
-  };
-  #[cfg(test)]
-  let addrs = match forced_enumeration_error() {
-    Some(forced) if forced == family => {
-      Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
-    }
-    _ => addrs,
-  };
-  addrs.map_err(|e| {
-    std::io::Error::new(
-      e.kind(),
-      format!("reading the {label} addresses of interface {index}: {e}"),
-    )
-  })
-}
-
-#[cfg(test)]
-thread_local! {
-  static FORCED_ENUMERATION_ERROR: core::cell::Cell<Option<Family>> =
-    const { core::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn forced_enumeration_error() -> Option<Family> {
-  FORCED_ENUMERATION_ERROR.with(core::cell::Cell::get)
-}
-
-#[cfg(test)]
-fn force_enumeration_error_for_test(family: Family) -> ForcedEnumerationError {
-  FORCED_ENUMERATION_ERROR.with(|c| c.set(Some(family)));
-  ForcedEnumerationError
-}
-
-#[cfg(test)]
-struct ForcedEnumerationError;
-
-#[cfg(test)]
-impl Drop for ForcedEnumerationError {
-  fn drop(&mut self) {
-    FORCED_ENUMERATION_ERROR.with(|c| c.set(None));
   }
 }
 
