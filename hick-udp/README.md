@@ -30,6 +30,15 @@ It provides:
 - **Socket setup** — bind a multicast UDP socket to a chosen interface, join /
   leave the mDNS group (`224.0.0.251` / `ff02::fb`, port `5353`), and set
   TTL / multicast-loop / hop-limit options.
+- **Interface selection** — enumerate the interfaces that can actually carry
+  mDNS: `UP` **and** `RUNNING`, multicast-capable and non-loopback, and never a
+  point-to-point cellular interface on Android. One endpoint per NIC is a
+  single `interfaces::acceptable_mdns_interfaces()` call. The drivers' default
+  interface picker (`interfaces::pick_default_interface_index`) is deliberately
+  more lenient about `RUNNING` — `UP` alone suffices, so a host whose links are
+  up but not reported running still gets a default bind — and keeps loopback
+  only as its last-resort fallback
+  (`interfaces::is_loopback_fallback_interface`).
 - **Ancillary parsing** — recover the local address a datagram arrived on via
   `IP_PKTINFO` / `IPV6_PKTINFO`, plus TTL / hop-limit / timestamp control
   messages, through `recv_with_meta`.

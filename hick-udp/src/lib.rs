@@ -29,6 +29,8 @@ pub use error::{
 };
 pub use family::Family;
 
+/// Which interfaces can carry mDNS traffic, and how to enumerate them.
+pub mod interfaces;
 /// Multicast socket configuration + cmsg parsing.
 pub mod multicast;
 pub mod onlink;
