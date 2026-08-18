@@ -607,11 +607,17 @@ OTHER
   requested family at worst, yet its failure was propagated before IPv6 was ever
   read and the bind was refused over an answer the pick could not have used. It
   was order-dependent: probing IPv6 first on the same inputs succeeded. A
-  candidate's first failure is now held while its remaining requested families
-  are read, and raised only if the candidate could still have won whichever
-  answer the failed probe was going to give — decided by weighing the unread
-  family as **present**, the answer that ranks the candidate highest, so a
-  failure that could have changed the pick still surfaces (#130).
+  candidate's first failure is now held to the **end of the walk**, where the
+  winner is finally known, and raised only if that candidate would have won with
+  the family nobody could read weighed as **present** — the answer that ranks it
+  highest — so a failure that could have changed the pick still surfaces.
+  Judging it where it happens is not enough, because the incumbent at that
+  moment is not the winner and there may be no incumbent at all: `lo` is index 1
+  and a `getifs` dump comes back in index order, so the loopback fallback is the
+  first candidate walked on the usual Linux and macOS host, and a failed read
+  there aborted a pick that the real link enumerated after it wins outright.
+  Where several candidates could not be read, the first that still mattered is
+  the one raised, so the reported failure is the same every time (#130).
 - `hick-udp`: `pick_default_interface_index` now **ranks** `RUNNING` rather than
   ignoring it. Not requiring a carrier is what keeps a momentarily-down host
   bindable, but ignoring the flag also made a carrier-less link a full tier-0

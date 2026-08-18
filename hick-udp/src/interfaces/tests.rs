@@ -708,3 +708,129 @@ fn a_failure_a_later_family_leaves_decisive_still_surfaces() {
      the same probes run as in the discarding case"
   );
 }
+
+// Both of those weigh a failure against an incumbent that already exists. The
+// incumbent is not the winner, though, and a candidate can fail before there is
+// any incumbent at all: `lo` is index 1 and a `getifs` dump comes back in index
+// order, so the loopback fallback is the first candidate walked on the usual
+// Linux and macOS host. Judging a failure where it happens calls that one
+// decisive every time — there is nothing yet for it to lose to — and aborts a
+// pick the real link enumerated after it wins outright. The verdict therefore
+// waits for the end of the walk, and these three pin what it decides there.
+
+#[test]
+fn a_failure_before_any_incumbent_is_discarded_when_a_later_candidate_outranks_it() {
+  let mut asked = Vec::new();
+  let picked = rank_candidates(
+    [(4, 1, "lo0"), (0, 14, "en0")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("lo0", Family::V4) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        _ => Ok(true),
+      }
+    },
+  );
+  assert_eq!(
+    picked.expect(
+      "a real link at tier 0 beats a loopback fallback at tier 4 whatever the loopback's \
+       IPv4 held, so an EINTR on the loopback cannot abort the bind"
+    ),
+    Some(14)
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("lo0", Family::V4),
+      ("lo0", Family::V6),
+      ("en0", Family::V4),
+      ("en0", Family::V6)
+    ],
+    "the candidates after a failure must still be walked in full: the winner they settle is \
+     what the held failure is judged against"
+  );
+}
+
+#[test]
+fn a_failure_before_any_incumbent_still_surfaces_when_nothing_later_outranks_it() {
+  // The mirror of the above on the same two links, with the failure moved to
+  // the one that wins. Nothing walked after it reaches tier 0, so the pick
+  // really does turn on the family nobody could read.
+  let mut asked = Vec::new();
+  let err = rank_candidates(
+    [(0, 14, "en0"), (4, 1, "lo0")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("en0", Family::V4) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        _ => Ok(true),
+      }
+    },
+  )
+  .expect_err(
+    "the winner is the candidate whose address nobody read, so binding it on the assumption \
+     that the read would have said either thing is a guess the caller cannot see",
+  );
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::Interrupted,
+    "the platform's own kind must be carried over, not flattened, got {err:?}"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("en0", Family::V4),
+      ("en0", Family::V6),
+      ("lo0", Family::V4),
+      ("lo0", Family::V6)
+    ],
+    "a deferred candidate must not become the incumbent, or the loopback after it would be \
+     gated out on a rank that is still a guess"
+  );
+}
+
+#[test]
+fn several_deferred_failures_report_the_first_that_mattered() {
+  // `lo0` fails with no incumbent to lose to and is only settled by `eth0`
+  // winning at tier 1 two candidates later; `eth1` fails at tier 0 and would
+  // have taken the pick outright. Holding one failure per walk answers with
+  // whichever was kept — here, no failure at all — so each is kept and asked in
+  // turn, and the first that mattered is the one raised.
+  let mut asked = Vec::new();
+  let err = rank_candidates(
+    [(4, 1, "lo0"), (0, 8, "eth0"), (0, 9, "eth1")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("lo0", Family::V4) => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ("eth0", Family::V6) => Ok(false),
+        ("eth1", Family::V4) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        _ => Ok(true),
+      }
+    },
+  )
+  .expect_err("eth1 would have won at tier 0 had its IPv4 been there, so the pick turns on it");
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::Interrupted,
+    "the tier-4 loopback's failure lost its bearing on the pick and must be discarded; the \
+     tier-0 failure that kept its bearing is the one to report, got {err:?}"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("lo0", Family::V4),
+      ("lo0", Family::V6),
+      ("eth0", Family::V4),
+      ("eth0", Family::V6),
+      ("eth1", Family::V4),
+      ("eth1", Family::V6)
+    ]
+  );
+}

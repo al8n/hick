@@ -159,9 +159,9 @@ pub fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<
 /// One pass over six preference tiers, lowest wins, first-seen wins within a
 /// tier. Probes for a family only while its answer can still outrank the
 /// incumbent, and weighs a probe that fails the same way: the candidate's
-/// remaining requested families are read first, and the failure is raised only
-/// if the candidate could still have won whichever answer that probe was going
-/// to give.
+/// remaining requested families are read first, the failure is carried to the
+/// end of the walk, and only one that could have changed the winning index is
+/// raised.
 fn rank_candidates<S>(
   candidates: impl IntoIterator<Item = (u8, u32, S)>,
   want_v4: bool,
@@ -169,10 +169,18 @@ fn rank_candidates<S>(
   mut has_addr: impl FnMut(&S, Family) -> io::Result<bool>,
 ) -> io::Result<Option<u32>> {
   let mut best: Option<(u8, u32)> = None;
+  // Failures held for the end of the walk, each with the rank its candidate
+  // would have won at, in walk order. A failure cannot be judged where it
+  // happens: the incumbent at that moment is not the winner, and there may be
+  // no incumbent at all — `lo` is index 1 and a `getifs` dump comes back in
+  // index order, so on the usual Linux and macOS host the loopback fallback is
+  // the first candidate walked. Nothing is pushed on a run where no read fails,
+  // and an empty `Vec` does not allocate.
+  let mut deferred: Vec<(u8, io::Error)> = Vec::new();
   'candidates: for (tier_base, index, subject) in candidates {
     let mut reachable = tier_base;
     let mut serves_any = false;
-    let mut deferred: Option<io::Error> = None;
+    let mut failure: Option<io::Error> = None;
     for (family, wanted) in [(Family::V4, want_v4), (Family::V6, want_v6)] {
       if best.is_some_and(|(seen, _)| reachable >= seen) {
         continue 'candidates;
@@ -192,7 +200,7 @@ fn rank_candidates<S>(
         // arrives after the syscall failed.
         Err(e) => {
           serves_any = true;
-          deferred.get_or_insert(e);
+          failure.get_or_insert(e);
         }
       }
     }
@@ -200,21 +208,37 @@ fn rank_candidates<S>(
       continue;
     }
     // `reachable` and `serves_any` now describe the best this candidate could
-    // have done with any failed probe answered its own way, so this asks
-    // whether it could still have won, not whether it won.
-    let could_win = best.is_none_or(|(seen, _)| reachable < seen);
-    if let Some(e) = deferred {
-      // It could not have won on either answer, so the walk from here is the
-      // one the successful read would have produced: this candidate is not the
-      // incumbent in either world. Raising the failure would refuse a bind
-      // over information the pick could not have used.
-      if !could_win {
-        continue;
+    // have done with any failed probe answered its own way.
+    let takes_the_lead = best.is_none_or(|(seen, _)| reachable < seen);
+    if let Some(e) = failure {
+      // This is the half of the verdict that needs to know where the candidate
+      // sits in the walk, and it is false exactly when a candidate BEFORE this
+      // one already holds a rank this one can at best tie — a tie first-seen
+      // awards to the earlier candidate. A candidate that fails this can never
+      // win, whatever the unread family held, so its failure goes no further.
+      if takes_the_lead {
+        deferred.push((reachable, e));
       }
-      return Err(e);
+      // Never the incumbent either way. Leaving `best` to candidates whose
+      // rank is a fact rather than a guess is what makes the winner it ends up
+      // holding the one every held failure is judged against.
+      continue;
     }
-    if could_win {
+    if takes_the_lead {
       best = Some((reachable, index));
+    }
+  }
+  // A held failure mattered only if its candidate would have won with the
+  // family nobody could read weighed as present. It already beats every
+  // candidate before it — that is what reaching this list established — so it
+  // needs only to beat the winner, or to tie a winner that must therefore come
+  // after it. No winner at all is the same test against an unbeatable rank.
+  // The first that mattered is the one raised, so a host with several
+  // unreadable candidates reports the same failure every time rather than
+  // whichever one happened to be kept.
+  for (rank, e) in deferred {
+    if best.is_none_or(|(seen, _)| seen >= rank) {
+      return Err(e);
     }
   }
   Ok(best.map(|(_, index)| index))
