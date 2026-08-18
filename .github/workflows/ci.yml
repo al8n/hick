@@ -50,6 +50,22 @@ jobs:
       # Observability feature legs: verify tracing + metrics + stats compile clean.
       - run: cargo clippy --workspace --features tracing,metrics,stats -- -D warnings
 
+  # No job above builds the workspace's TEST targets at DEFAULT features on a
+  # host platform: `clippy` passes `--all-features`, so a mistake that only
+  # compiles under a non-default feature combination is invisible to it, and
+  # the only jobs that build test targets at default features are the
+  # `cross-check` FreeBSD/NetBSD/Android legs below — so a feature-gating slip
+  # surfaces first as a BSD/Android cross-compile failure, which reads like a
+  # platform problem and is not one. This step is cheap enough (seconds) that
+  # there is no reason to wait for a cross leg to find it.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
   # Native compile coverage on the other two tier-1 host families so the
   # platform `cfg`s (Apple `target_vendor`, Windows) and the `hick-udp/build.rs`
   # capability matrix are exercised, not just Linux.
