@@ -305,8 +305,10 @@ where
     self.rng.fill_bytes(&mut seed);
     // honor EndpointConfig::probe_unique_names — when disabled the
     // service skips the §8.1 probe sequence and announces immediately.
-    // EndpointConfig::announce(false) additionally switches the service to a
-    // non-announcing responder (established, no announcements at all).
+    // EndpointConfig::re_announce(false) switches the service to a
+    // non-announcing responder: the §8.3 startup burst still runs, but the
+    // periodic re-announce is suppressed, so nothing unsolicited is sent
+    // afterwards.
     let svc = {
       #[allow(unused_mut)]
       let mut s = Service::try_new(
@@ -315,7 +317,7 @@ where
         now,
         seed,
         self.config.probe_unique_names(),
-        self.config.announce(),
+        self.config.re_announce(),
       );
       #[cfg(feature = "stats")]
       s.set_stats(self.stats.clone());

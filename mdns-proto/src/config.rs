@@ -30,7 +30,7 @@ const DEFAULT_RELINQUISHED_RETENTION: core::time::Duration = core::time::Duratio
 pub struct EndpointConfig {
   probe_unique_names: bool,
   answer_questions: bool,
-  announce: bool,
+  re_announce: bool,
   populate_cache: bool,
   trust_advertised_src_as_self: bool,
   relinquished_retention: core::time::Duration,
@@ -38,7 +38,8 @@ pub struct EndpointConfig {
 
 impl EndpointConfig {
   /// Construct with defaults: probe on registration, answer questions,
-  /// announce (unsolicited §8.3 announcements + periodic re-announces), cache
+  /// keep periodically re-announcing at ~80% of the record TTL (so cached
+  /// copies never expire), cache
   /// observations, DO NOT trust advertised-source matching as a self-
   /// loopback signal, and screen a relinquished record set's own echoes for five
   /// seconds (see [`Self::relinquished_retention`]). The default is appropriate
@@ -54,7 +55,7 @@ impl EndpointConfig {
     Self {
       probe_unique_names: true,
       answer_questions: true,
-      announce: true,
+      re_announce: true,
       populate_cache: true,
       trust_advertised_src_as_self: false,
       relinquished_retention: DEFAULT_RELINQUISHED_RETENTION,
@@ -113,30 +114,40 @@ impl EndpointConfig {
     self
   }
 
-  /// Whether to send unsolicited announcements (the RFC 6762 §8.3 startup
-  /// burst and the periodic re-announce), including the §8.1 probe sequence
-  /// that precedes them.
+  /// Whether to keep periodically re-announcing established records at ~80%
+  /// of the record TTL — the RFC 6762 §8.3 periodic refresh that keeps peers'
+  /// cached copies from expiring.
   ///
   /// The default `true` is the conformant responder: probe for the name, then
-  /// announce it so peers learn of the service without asking.  `false`
-  /// switches to a **non-announcing responder**: the service starts established and
-  /// never puts anything on the wire unless an explicit query asks for its
-  /// records.  Useful for battery-sensitive or privacy-conscious devices that
-  /// want to be discoverable when asked but send no background traffic.
+  /// announce it so peers learn of the service without asking, and keep
+  /// re-announcing at ~80% of the record TTL so cached copies never expire.
+  /// `false` switches to a **non-announcing responder**: the §8.1 probe
+  /// sequence and the §8.3 startup burst still run once (so the name is
+  /// verified before it is claimed and peers learn of the service at
+  /// registration), but the periodic re-announce is suppressed, so afterwards
+  /// nothing is put on the wire unless an explicit query asks for the
+  /// service's records.  Useful for battery-sensitive or privacy-conscious
+  /// devices that want to be discoverable when asked but send no background
+  /// traffic.
   #[inline(always)]
-  pub const fn announce(&self) -> bool {
-    self.announce
+  pub const fn re_announce(&self) -> bool {
+    self.re_announce
   }
 
-  /// Set whether to send unsolicited announcements; see [`Self::announce`].
+  /// Set whether to periodically re-announce established records; see
+  /// [`Self::re_announce`].
   ///
-  /// `false` also skips the §8.1 probe sequence: a non-announcing responder claims
-  /// nothing, so there is nothing to probe for.  §9 conflicts are ignored in
-  /// that mode (the name is never claimed, so a peer's claim is not fought
-  /// over) and the registered records are still answered on query.
+  /// `false` suppresses only the post-startup periodic re-announce.  The
+  /// service still performs the RFC 6762 §8.1 probe sequence and the two §8.3
+  /// startup announcements once, then falls silent until queried.  §9
+  /// conflicts are still resolved normally: a conflicting record received
+  /// after establishment reverts the service to probing to re-verify the
+  /// name.  Orthogonal to [`Self::with_probe_unique_names`]: the latter
+  /// controls whether the §8.1 probe runs, the former controls whether the
+  /// name is re-announced after the startup burst.
   #[must_use]
-  pub const fn with_announce(mut self, v: bool) -> Self {
-    self.announce = v;
+  pub const fn with_re_announce(mut self, v: bool) -> Self {
+    self.re_announce = v;
     self
   }
 

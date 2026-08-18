@@ -978,12 +978,15 @@ cfg_heap! {
   pub struct Service<I, TQ, EV> {
   handle: ServiceHandle,
   state: ServiceState,
-  /// Whether to send unsolicited announcements (RFC 6762 §8.1 probes, §8.3
-  /// startup announcements and periodic re-announces).  When `false` the
-  /// service is a non-announcing responder: it starts in `Established` with no
-  /// lifecycle deadline and only ever emits question responses.  Set via
-  /// `EndpointConfig::with_announce(false)`.
-  announce: bool,
+  /// Whether to keep sending the periodic re-announce.  When `true` (the
+  /// default) the service runs the full RFC 6762 lifecycle: §8.1 probes, §8.3
+  /// startup announcements and the periodic re-announce that keeps peers'
+  /// caches fresh.  When `false` the service is a non-announcing responder: it
+  /// still probes and announces once at startup (RFC 6762 §8.1/§8.3), but the
+  /// periodic re-announce is suppressed, so after the startup burst nothing is
+  /// put on the wire unless an explicit query asks for its records.  Set via
+  /// `EndpointConfig::with_re_announce(false)`.
+  re_announce: bool,
   records: ServiceRecords,
   #[cfg(feature = "stats")]
   stats: Option<std::sync::Arc<hick_trace::stats::Stats>>,
@@ -1236,12 +1239,15 @@ where
   /// `Announcing(0)` and announces without the probe sequence. A later §9
   /// conflict still reverts it to probing to resolve the collision.
   ///
-  /// When `announce` is `false` the service is a non-announcing responder: it starts
-  /// directly in `Established` with **no** lifecycle deadline and never sends
-  /// unsolicited traffic — no probes, no announcements, no periodic
-  /// re-announces — only answers explicit queries for its records (§9
-  /// conflicts are ignored, since a non-announcing responder never claims its
-  /// name).  `announce` takes precedence over `probe`.
+  /// When `re_announce` is `false` the service is a non-announcing responder: it
+  /// runs the startup steps above exactly once — probing (§8.1) if `probe` is
+  /// `true`, then the two §8.3 announcements — and afterwards never sends
+  /// unsolicited traffic. The periodic re-announce is suppressed, so once the
+  /// startup burst is confirmed peers' cached records expire at their TTL and
+  /// the service is only findable by an explicit query.  `re_announce` and
+  /// `probe` are orthogonal: `re_announce` controls the post-startup
+  /// re-announce, `probe` controls whether the name is verified before it is
+  /// claimed.
   #[allow(dead_code)]
   pub(crate) fn try_new(
     handle: ServiceHandle,
@@ -1249,12 +1255,10 @@ where
     now: I,
     rng_seed: [u8; 32],
     probe: bool,
-    announce: bool,
+    re_announce: bool,
   ) -> Self {
     let mut rng = Rng::from_seed(rng_seed);
-    let (state, lifecycle_deadline) = if !announce {
-      (ServiceState::Established, None)
-    } else if probe {
+    let (state, lifecycle_deadline) = if probe {
       (ServiceState::Init, probe_deadline(now, 0, &mut rng))
     } else {
       (ServiceState::Announcing(0), announce_deadline(now, 0))
@@ -1262,7 +1266,7 @@ where
     Self {
       handle,
       state,
-      announce,
+      re_announce,
       records,
       #[cfg(feature = "stats")]
       stats: None,
@@ -2168,7 +2172,17 @@ where
   fn arm_announcement(&mut self, now: I, advance: PhaseAdvance) {
     let ttl_secs = self.records.ttl_secs();
     let base = match self.state {
-      ServiceState::Established => re_announce_deadline(now, ttl_secs),
+      ServiceState::Established => {
+        // A non-announcing responder's §8.3 startup burst is its LAST
+        // unsolicited traffic: peers' copies of the records are left to expire
+        // at the TTL, after which the service is findable only by explicit
+        // query.  No deadline means the lifecycle never fires again.
+        if !self.re_announce {
+          self.lifecycle_deadline = None;
+          return;
+        }
+        re_announce_deadline(now, ttl_secs)
+      }
       ServiceState::Announcing(_) => match advance {
         PhaseAdvance::Partial => {
           partial_announce_deadline(now, self.partial_announce_streak, ttl_secs)
@@ -3255,19 +3269,6 @@ where
         ServiceState::Announcing(_) | ServiceState::Established,
         ServiceEvent::ProbeConflict(pc),
       ) => {
-        // A non-announcing responder never claims its name (no probes, no
-        // announcements), so a peer's conflicting claim is not fought over —
-        // stay established and keep answering queries. The name is the
-        // caller's immutable identity (e.g. a node id), so a collision is
-        // effectively impossible anyway.
-        if !self.announce {
-          trace!(
-            target: "mdns_proto::service",
-            handle = self.handle.raw(),
-            "service: §9 conflict ignored — non-announcing responder claims nothing"
-          );
-          return;
-        }
         // RFC 6762 §9 post-establishment conflict — NOT the §8.2
         // lexicographic probe tiebreak. A §9 conflict is the same name/type/
         // class with DIFFERENT rdata; an identical record is consistent and
