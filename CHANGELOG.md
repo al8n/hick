@@ -616,8 +616,13 @@ OTHER
   and a `getifs` dump comes back in index order, so the loopback fallback is the
   first candidate walked on the usual Linux and macOS host, and a failed read
   there aborted a pick that the real link enumerated after it wins outright.
-  Where several candidates could not be read, the first that still mattered is
-  the one raised, so the reported failure is the same every time (#130).
+  Where several candidates could not be read, the held failures are weighed
+  against one another as well as against that winner — one whose worst possible
+  finish still beats another's best rules that other one out, and one that may
+  turn out to serve no requested family at all rules out nothing — and the first
+  that could still have won is the one raised. The error carries the interface
+  index and the family, so this is what keeps it naming a link the pick could
+  really have turned on rather than whichever failure came first (#130).
 - `hick-udp`: `pick_default_interface_index` now **ranks** `RUNNING` rather than
   ignoring it. Not requiring a carrier is what keeps a momentarily-down host
   bindable, but ignoring the flag also made a carrier-less link a full tier-0

@@ -834,3 +834,119 @@ fn several_deferred_failures_report_the_first_that_mattered() {
     ]
   );
 }
+
+// Held failures also have to be weighed against EACH OTHER. A walk where every
+// candidate that could have led is one that failed a read settles no winner at
+// all, and the winner is the only thing the two tests above judge a failure
+// against — so with nothing to judge them by, the first held failure was raised
+// however plainly a later one outranked it. The error names an interface and a
+// family, so that pointed a caller, or a person reading it, at the wrong link.
+
+#[test]
+fn a_held_failure_another_one_outranks_is_never_the_one_reported() {
+  // The #137 pair, both unreadable: an `eth0` with its cable out at base 2 and a
+  // working `wlan0` at base 0, each already serving IPv4 and each failing IPv6.
+  // `eth0` finishes at 2 or 3 and `wlan0` at 0 or 1, so `wlan0` beats it in
+  // every completion of either read and `eth0` could never have won.
+  let dead_link_failed = |name: &str, family| match (name, family) {
+    ("eth0", Family::V6) => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+    ("wlan0", Family::V6) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+    _ => Ok(true),
+  };
+  {
+    let mut asked = Vec::new();
+    let err = rank_candidates(
+      [(2, 7, "eth0"), (0, 8, "wlan0")],
+      true,
+      true,
+      |name, family| {
+        asked.push((*name, family));
+        dead_link_failed(name, family)
+      },
+    )
+    .expect_err("the pick turns on the IPv6 of the link that could have won it");
+    assert_eq!(
+      err.kind(),
+      std::io::ErrorKind::Interrupted,
+      "the reported failure must be the one from the candidate that could still have won, \
+       not whichever was held first: the error names an interface, and naming the link that \
+       was out of the running points a retry at the wrong one, got {err:?}"
+    );
+    assert_eq!(
+      asked,
+      vec![
+        ("eth0", Family::V4),
+        ("eth0", Family::V6),
+        ("wlan0", Family::V4),
+        ("wlan0", Family::V6)
+      ]
+    );
+  }
+  {
+    let mut asked = Vec::new();
+    let err = rank_candidates(
+      [(0, 8, "wlan0"), (2, 7, "eth0")],
+      true,
+      true,
+      |name, family| {
+        asked.push((*name, family));
+        dead_link_failed(name, family)
+      },
+    )
+    .expect_err("the pick turns on the IPv6 of the link that could have won it");
+    assert_eq!(
+      err.kind(),
+      std::io::ErrorKind::Interrupted,
+      "rank decides which held failure is reported, not walk order, got {err:?}"
+    );
+    assert_eq!(
+      asked,
+      vec![
+        ("wlan0", Family::V4),
+        ("wlan0", Family::V6),
+        ("eth0", Family::V4),
+        ("eth0", Family::V6)
+      ]
+    );
+  }
+}
+
+#[test]
+fn a_held_failure_that_may_serve_nothing_rules_no_other_one_out() {
+  // `wlan0` outranks `eth0` on tier and would rule it out — but BOTH of its
+  // requested families failed, so the completion where both come back absent
+  // leaves it serving nothing that was asked for, which is not a candidate at
+  // all. It cannot rule anything out from a rank it may never hold, and `eth0`
+  // is left as one that could still have won.
+  let mut asked = Vec::new();
+  let err = rank_candidates(
+    [(2, 7, "eth0"), (0, 8, "wlan0")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("eth0", Family::V4) => Ok(true),
+        ("eth0", Family::V6) => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+      }
+    },
+  )
+  .expect_err("both candidates could still have won, so the pick turns on a read that failed");
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::PermissionDenied,
+    "a candidate is only certain to be ranked at all if a requested family was SEEN present; \
+     weighing a failed read as present here too would let one that may serve nothing rule a \
+     real candidate out, got {err:?}"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("eth0", Family::V4),
+      ("eth0", Family::V6),
+      ("wlan0", Family::V4),
+      ("wlan0", Family::V6)
+    ]
+  );
+}

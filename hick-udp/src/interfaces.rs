@@ -160,8 +160,65 @@ pub fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<
 /// tier. Probes for a family only while its answer can still outrank the
 /// incumbent, and weighs a probe that fails the same way: the candidate's
 /// remaining requested families are read first, the failure is carried to the
-/// end of the walk, and only one that could have changed the winning index is
-/// raised.
+/// end of the walk, and only a failure whose candidate could still have won the
+/// pick is raised.
+/// A read that failed on a candidate that could still have taken the pick when
+/// it was walked, kept until the walk ends and the field it would have had to
+/// beat is complete.
+struct HeldFailure {
+  /// The rank its candidate would have finished at with every family it could
+  /// not read weighed as present — the best it could possibly have done, and so
+  /// what decides whether it could have won.
+  best_rank: u8,
+  /// The rank it would have finished at with those families weighed as absent
+  /// instead: its base plus the one step a requested family it cannot serve
+  /// costs. The worst it can do while still being a candidate at all, and so
+  /// what decides whether it rules ANOTHER held candidate out.
+  worst_rank: u8,
+  /// Whether a requested family was actually seen present, rather than failed
+  /// and assumed present. Without one, the completion where every failed read
+  /// says "absent" leaves the candidate serving nothing it was asked for, which
+  /// is not ranked at all — so such a candidate cannot rule another one out.
+  certainly_serves: bool,
+  /// The failure itself, carrying the interface and family that could not be
+  /// read.
+  error: io::Error,
+}
+
+/// The position of the first held failure that could still have taken the pick,
+/// or `None` when every one of them is ruled out.
+///
+/// A held failure is ruled out when some candidate beats it in **every**
+/// completion of the reads that failed: either the winner the fully read
+/// candidates settled, or another held candidate whose worst possible finish
+/// still beats this one's best. Held candidates have to be weighed against each
+/// other and not only against that winner, because a walk where several
+/// candidates could not be read may settle no winner at all — every one of them
+/// is kept out of the incumbency — and then the winner alone rules out nothing.
+///
+/// What this guarantees: a failure is never raised from a candidate that
+/// provably could not have won, so the interface and family the error names are
+/// a link the pick could really have turned on. What it does NOT prove is the
+/// converse — a candidate that would have won in every completion still raises
+/// its failure, since the family it could not read is one the caller is about
+/// to bind and every driver re-reads it anyway.
+fn first_unresolved_failure(deferred: &[HeldFailure], best: Option<(u8, u32)>) -> Option<usize> {
+  deferred
+    .iter()
+    .enumerate()
+    .find(|&(position, held)| {
+      let beaten_by_the_winner = best.is_some_and(|(seen, _)| seen < held.best_rank);
+      let ruled_out_by_a_rival = deferred.iter().enumerate().any(|(rival, other)| {
+        rival != position
+          && other.certainly_serves
+          && (other.worst_rank < held.best_rank
+            || (other.worst_rank == held.best_rank && rival < position))
+      });
+      !beaten_by_the_winner && !ruled_out_by_a_rival
+    })
+    .map(|(position, _)| position)
+}
+
 fn rank_candidates<S>(
   candidates: impl IntoIterator<Item = (u8, u32, S)>,
   want_v4: bool,
@@ -176,10 +233,13 @@ fn rank_candidates<S>(
   // index order, so on the usual Linux and macOS host the loopback fallback is
   // the first candidate walked. Nothing is pushed on a run where no read fails,
   // and an empty `Vec` does not allocate.
-  let mut deferred: Vec<(u8, io::Error)> = Vec::new();
+  let mut deferred: Vec<HeldFailure> = Vec::new();
   'candidates: for (tier_base, index, subject) in candidates {
     let mut reachable = tier_base;
-    let mut serves_any = false;
+    // Only a family SEEN present sets this. A failed read is weighed as present
+    // for the candidate's own rank, but weighing it that way here too would let
+    // a candidate that may serve nothing rule a real one out.
+    let mut known_to_serve = false;
     let mut failure: Option<io::Error> = None;
     for (family, wanted) in [(Family::V4, want_v4), (Family::V6, want_v6)] {
       if best.is_some_and(|(seen, _)| reachable >= seen) {
@@ -189,7 +249,7 @@ fn rank_candidates<S>(
         continue;
       }
       match has_addr(&subject, family) {
-        Ok(true) => serves_any = true,
+        Ok(true) => known_to_serve = true,
         Ok(false) => reachable = tier_base.saturating_add(1),
         // A read nobody completed is weighed as if it had said "present":
         // that is the answer that ranks this candidate highest, so it is the
@@ -199,16 +259,17 @@ fn rank_candidates<S>(
         // settles the failure as irrelevant, which is information that only
         // arrives after the syscall failed.
         Err(e) => {
-          serves_any = true;
           failure.get_or_insert(e);
         }
       }
     }
-    if !serves_any && reachable > tier_base {
+    // Serving nothing that was asked for is not a candidate at all — but a
+    // family nobody could read might have served, so a failure keeps it in.
+    if !known_to_serve && failure.is_none() && reachable > tier_base {
       continue;
     }
-    // `reachable` and `serves_any` now describe the best this candidate could
-    // have done with any failed probe answered its own way.
+    // `reachable` now describes the best this candidate could have done with
+    // any failed probe answered its own way.
     let takes_the_lead = best.is_none_or(|(seen, _)| reachable < seen);
     if let Some(e) = failure {
       // This is the half of the verdict that needs to know where the candidate
@@ -217,7 +278,12 @@ fn rank_candidates<S>(
       // awards to the earlier candidate. A candidate that fails this can never
       // win, whatever the unread family held, so its failure goes no further.
       if takes_the_lead {
-        deferred.push((reachable, e));
+        deferred.push(HeldFailure {
+          best_rank: reachable,
+          worst_rank: tier_base.saturating_add(1),
+          certainly_serves: known_to_serve,
+          error: e,
+        });
       }
       // Never the incumbent either way. Leaving `best` to candidates whose
       // rank is a fact rather than a guess is what makes the winner it ends up
@@ -228,18 +294,14 @@ fn rank_candidates<S>(
       best = Some((reachable, index));
     }
   }
-  // A held failure mattered only if its candidate would have won with the
-  // family nobody could read weighed as present. It already beats every
-  // candidate before it — that is what reaching this list established — so it
-  // needs only to beat the winner, or to tie a winner that must therefore come
-  // after it. No winner at all is the same test against an unbeatable rank.
-  // The first that mattered is the one raised, so a host with several
-  // unreadable candidates reports the same failure every time rather than
-  // whichever one happened to be kept.
-  for (rank, e) in deferred {
-    if best.is_none_or(|(seen, _)| seen >= rank) {
-      return Err(e);
-    }
+  // Every held failure already beats every candidate before it — that is what
+  // reaching this list established — so what remains is the winner the readable
+  // candidates settled and the other held candidates, both of which only the
+  // finished walk knows. The first that survives both is the one raised, so a
+  // host with several unreadable links reports the same failure every time.
+  let unresolved = first_unresolved_failure(&deferred, best);
+  if let Some(held) = unresolved.and_then(|position| deferred.into_iter().nth(position)) {
+    return Err(held.error);
   }
   Ok(best.map(|(_, index)| index))
 }
