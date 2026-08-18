@@ -20,37 +20,39 @@ fn up_running_multicast() -> Flags {
 //
 // The strict filter (`require_running = true`) is what
 // `is_acceptable_mdns_interface` / `is_loopback_fallback_interface` /
-// `acceptable_mdns_interfaces` expose; the default picker's lenient variant
-// (`require_running = false`) is covered in the next section.
+// `acceptable_mdns_interfaces` expose. `tier` is the default picker's, and
+// takes no such parameter: what the strict filter refuses for want of a
+// carrier it ranks instead, which the next section covers.
 
 #[test]
 fn an_up_running_multicast_interface_qualifies() {
   assert!(qualifies(INDEX, up_running_multicast(), true));
-  assert_eq!(tier(INDEX, up_running_multicast(), true), Some(0));
+  assert_eq!(tier(INDEX, up_running_multicast()), Some(0));
 }
 
 #[test]
 fn a_running_interface_that_is_not_up_does_not_qualify() {
   let f = Flags::RUNNING | Flags::MULTICAST;
   assert!(!qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), None);
+  assert_eq!(tier(INDEX, f), None);
 }
 
 #[test]
 fn an_up_interface_that_is_not_running_does_not_qualify() {
   // UP without RUNNING is a link with no carrier — a Wi-Fi NIC with no
   // association — which can never complete the multicast join. The strict
-  // filter refuses it; the default picker accepts it (see the next section).
+  // filter refuses it; the default picker ranks it below a link that has a
+  // carrier rather than refusing it (see the next section).
   let f = Flags::UP | Flags::MULTICAST;
   assert!(!qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), None);
+  assert_eq!(tier(INDEX, f), Some(2));
 }
 
 #[test]
 fn an_interface_without_multicast_does_not_qualify() {
   let f = Flags::UP | Flags::RUNNING;
   assert!(!qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), None);
+  assert_eq!(tier(INDEX, f), None);
 }
 
 #[test]
@@ -60,7 +62,7 @@ fn a_multicast_loopback_is_a_fallback_not_a_link() {
   let f = up_running_multicast() | Flags::LOOPBACK;
   assert!(!qualifies(INDEX, f, true));
   assert!(fallback_qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), Some(2));
+  assert_eq!(tier(INDEX, f), Some(4));
 }
 
 #[test]
@@ -68,7 +70,7 @@ fn a_loopback_without_multicast_is_still_a_fallback() {
   let f = Flags::UP | Flags::RUNNING | Flags::LOOPBACK;
   assert!(!qualifies(INDEX, f, true));
   assert!(fallback_qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), Some(2));
+  assert_eq!(tier(INDEX, f), Some(4));
 }
 
 #[test]
@@ -78,7 +80,7 @@ fn a_loopback_that_is_not_running_is_no_fallback_either() {
   let f = Flags::UP | Flags::LOOPBACK;
   assert!(!qualifies(INDEX, f, true));
   assert!(!fallback_qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), None);
+  assert_eq!(tier(INDEX, f), Some(4));
 }
 
 #[test]
@@ -94,10 +96,7 @@ fn index_zero_is_no_interface() {
     Flags::UP | Flags::RUNNING | Flags::LOOPBACK,
     true
   ));
-  assert_eq!(
-    tier(0, Flags::UP | Flags::RUNNING | Flags::LOOPBACK, true),
-    None
-  );
+  assert_eq!(tier(0, Flags::UP | Flags::RUNNING | Flags::LOOPBACK), None);
 }
 
 #[test]
@@ -105,28 +104,30 @@ fn point_to_point_is_refused_on_android_and_admitted_elsewhere() {
   let f = up_running_multicast() | Flags::POINTOPOINT;
   if cfg!(target_os = "android") {
     assert!(!qualifies(INDEX, f, true));
-    assert_eq!(tier(INDEX, f, true), None);
+    assert_eq!(tier(INDEX, f), None);
   } else {
     assert!(qualifies(INDEX, f, true));
-    assert_eq!(tier(INDEX, f, true), Some(0));
+    assert_eq!(tier(INDEX, f), Some(0));
   }
 }
 
-// ── the default picker ignores RUNNING ────────────────────────────────────────
+// ── the default picker ranks RUNNING rather than requiring it ────────────────
 
 // The strict filter above refuses links with no carrier (`UP` but not
-// `RUNNING`). The default picker is deliberately more lenient: requiring
-// `RUNNING` there regressed hosts whose links are up but not reported running
-// into "no multicast-capable interface found", so the picker accepts `UP`
-// alone. `require_running = false` is exactly what
-// `pick_default_interface_index` passes to the predicates.
+// `RUNNING`). Requiring `RUNNING` in the picker too regressed hosts whose links
+// are up but not reported running into "no multicast-capable interface found",
+// so it must not refuse them — but ignoring the flag made a dead link a full
+// tier-0 candidate, and first-seen wins within a tier, so an unplugged `eth0`
+// enumerated before a working `wlan0` won a pick that nothing migrates. The
+// flag is a rank instead: tier 0 with a carrier, tier 2 without, tier 4
+// loopback.
 
 #[test]
-fn the_picker_accepts_an_up_interface_that_is_not_running() {
+fn the_picker_admits_an_up_interface_that_is_not_running_at_a_worse_tier() {
   let f = Flags::UP | Flags::MULTICAST;
   assert!(!qualifies(INDEX, f, true));
   assert!(qualifies(INDEX, f, false));
-  assert_eq!(tier(INDEX, f, false), Some(0));
+  assert_eq!(tier(INDEX, f), Some(2));
 }
 
 #[test]
@@ -134,29 +135,131 @@ fn the_picker_still_falls_back_to_an_up_loopback_that_is_not_running() {
   let f = Flags::UP | Flags::LOOPBACK;
   assert!(!fallback_qualifies(INDEX, f, true));
   assert!(fallback_qualifies(INDEX, f, false));
-  assert_eq!(tier(INDEX, f, false), Some(2));
+  assert_eq!(tier(INDEX, f), Some(4));
 }
 
 #[test]
-fn the_picker_relaxes_only_the_running_requirement() {
-  // The lenient picker drops just the `RUNNING` check; everything else that
-  // makes an interface usable for mDNS still applies.
+fn the_picker_still_refuses_everything_but_a_missing_carrier() {
+  // Only `RUNNING` was demoted to a rank; everything else that makes an
+  // interface usable for mDNS still keeps it out of the pick entirely.
   let down = Flags::RUNNING | Flags::MULTICAST;
   assert!(!qualifies(INDEX, down, false));
-  assert_eq!(tier(INDEX, down, false), None);
+  assert_eq!(tier(INDEX, down), None);
   let no_multicast = Flags::UP | Flags::RUNNING;
   assert!(!qualifies(INDEX, no_multicast, false));
+  assert_eq!(tier(INDEX, no_multicast), None);
   let loopback = up_running_multicast() | Flags::LOOPBACK;
   assert!(!qualifies(INDEX, loopback, false));
   assert!(fallback_qualifies(INDEX, loopback, false));
   let f = up_running_multicast() | Flags::POINTOPOINT;
   if cfg!(target_os = "android") {
     assert!(!qualifies(INDEX, f, false));
-    assert_eq!(tier(INDEX, f, false), None);
+    assert_eq!(tier(INDEX, f), None);
   } else {
     assert!(qualifies(INDEX, f, false));
-    assert_eq!(tier(INDEX, f, false), Some(0));
+    assert_eq!(tier(INDEX, f), Some(0));
   }
+}
+
+/// Rank synthetic links exactly as the picker does — `tier` decides each base
+/// and `rank_candidates` the winner — with `addrs` answering for each index.
+/// Synthetic because `getifs::Interface` has no constructor a test can reach,
+/// and because which link wins must not depend on the host's own NICs.
+fn picked(
+  links: &[(u32, Flags)],
+  want_v4: bool,
+  want_v6: bool,
+  addrs: impl Fn(u32, Family) -> bool,
+) -> Option<u32> {
+  rank_candidates(
+    links
+      .iter()
+      .filter_map(|&(index, flags)| Some((tier(index, flags)?, index, index))),
+    want_v4,
+    want_v6,
+    |index, family| Ok(addrs(*index, family)),
+  )
+  .expect("a probe that cannot fail cannot fail the pick")
+}
+
+#[test]
+fn a_link_with_a_carrier_wins_in_either_enumeration_order() {
+  // `eth0` is up, multicast-capable and holds both requested families, but its
+  // cable is out; `wlan0` is associated and working. As equal tier-0
+  // candidates, enumeration order alone decided this, and the pick is a
+  // snapshot nothing migrates.
+  let unplugged = Flags::UP | Flags::MULTICAST;
+  let working = up_running_multicast();
+  let both = |_: u32, _: Family| true;
+  assert_eq!(
+    picked(&[(3, unplugged), (4, working)], true, true, both),
+    Some(4)
+  );
+  assert_eq!(
+    picked(&[(4, working), (3, unplugged)], true, true, both),
+    Some(4)
+  );
+}
+
+#[test]
+fn a_link_with_no_carrier_still_outranks_loopback() {
+  let unplugged = Flags::UP | Flags::MULTICAST;
+  let lo = Flags::UP | Flags::RUNNING | Flags::LOOPBACK;
+  let both = |_: u32, _: Family| true;
+  assert_eq!(
+    picked(&[(1, lo), (3, unplugged)], true, true, both),
+    Some(3)
+  );
+  assert_eq!(
+    picked(&[(3, unplugged), (1, lo)], true, true, both),
+    Some(3)
+  );
+}
+
+#[test]
+fn a_host_with_nothing_running_still_gets_a_bind() {
+  // The availability property the lenient filter exists for, and the whole
+  // reason `RUNNING` is ranked rather than required: a host whose links are
+  // momentarily down must not be told "no multicast-capable interface found"
+  // for the life of the process.
+  let both = |_: u32, _: Family| true;
+  assert_eq!(
+    picked(&[(3, Flags::UP | Flags::MULTICAST)], true, true, both),
+    Some(3)
+  );
+  assert_eq!(
+    picked(&[(1, Flags::UP | Flags::LOOPBACK)], true, true, both),
+    Some(1)
+  );
+}
+
+#[test]
+fn a_carrier_outranks_a_family_only_the_dead_link_serves() {
+  // Why the bases are two apart: `rank_candidates` lifts a candidate by one per
+  // requested family it has no address in, and that must never lift a link with
+  // no carrier past one that has it. An address on a link that cannot transmit
+  // the group join at all buys nothing.
+  let unplugged = Flags::UP | Flags::MULTICAST;
+  let working = up_running_multicast();
+  let v4_only_on_the_working_link = |index: u32, family: Family| index != 4 || family == Family::V4;
+  assert_eq!(
+    picked(
+      &[(3, unplugged), (4, working)],
+      true,
+      true,
+      v4_only_on_the_working_link
+    ),
+    Some(4)
+  );
+  assert_eq!(
+    picked(
+      &[(4, working), (3, unplugged)],
+      true,
+      true,
+      v4_only_on_the_working_link
+    ),
+    Some(4)
+  );
 }
 
 // ── the default interface picker ──────────────────────────────────────────────
@@ -185,7 +288,7 @@ fn the_default_interface_picker_reports_a_failed_address_enumeration() {
     eprintln!("skipping: this host will not enumerate its interfaces at all");
     return;
   };
-  let picker_qualifies = |i: &getifs::Interface| tier(i.index(), i.flags(), false).is_some();
+  let picker_qualifies = |i: &getifs::Interface| tier(i.index(), i.flags()).is_some();
   if !ifs.iter().any(picker_qualifies) {
     eprintln!("skipping: no interface the picker would consider");
     return;

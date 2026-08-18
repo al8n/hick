@@ -587,9 +587,10 @@ OTHER
 - `hick-udp`: the strict enumeration (`acceptable_mdns_interfaces`) requires
   `RUNNING` as well as `UP`, so a link with no carrier is not offered to a
   caller that intends to bind it. `pick_default_interface_index` is
-  deliberately **more lenient** and ignores `RUNNING`, so a host whose links
-  are momentarily down still gets a default bind instead of being stranded on
-  loopback for the life of the process. Thanks to @wkornewald (#131, #134).
+  deliberately **more lenient** and does not require `RUNNING` — it ranks it,
+  see below — so a host whose links are momentarily down still gets a default
+  bind instead of being stranded on loopback for the life of the process.
+  Thanks to @wkornewald (#131, #134).
 
   Note the standing limitation this makes visible: the default pick is a
   **snapshot** taken once at construction and nothing migrates it, so a device
@@ -611,6 +612,22 @@ OTHER
   answer the failed probe was going to give — decided by weighing the unread
   family as **present**, the answer that ranks the candidate highest, so a
   failure that could have changed the pick still surfaces (#130).
+- `hick-udp`: `pick_default_interface_index` now **ranks** `RUNNING` rather than
+  ignoring it. Not requiring a carrier is what keeps a momentarily-down host
+  bindable, but ignoring the flag also made a carrier-less link a full tier-0
+  candidate, and first-seen wins within a tier — so an `eth0` that is up,
+  multicast-capable and addressed with its cable out, enumerated before a
+  working `wlan0`, won the pick, and the pick is a snapshot nothing migrates.
+  The base tiers are now 0 for a `RUNNING` non-loopback link, 2 for one that is
+  up without a carrier and 4 for the loopback fallback; `rank_candidates` still
+  lifts each by one per requested family the candidate has no address in, so the
+  effective order is 0..=5 and lower still wins. A live link therefore beats a
+  dead one in either enumeration order, a dead real link still beats loopback,
+  and a host with nothing running still gets a bind rather than "no
+  multicast-capable interface found" — the availability property the lenient
+  filter exists for, kept strictly rather than by treating every link as equal.
+  The strict filter is untouched: `acceptable_mdns_interfaces` and
+  `is_acceptable_mdns_interface` still require `RUNNING` (#137).
 
 ## Dual-stack partial delivery (`TransmitDelivery`)
 

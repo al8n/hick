@@ -16,10 +16,11 @@
 //!   `FlagRunning` check Syncthing added to its beacon's multicast listener
 //!   (syncthing/syncthing#10504): `FlagUp` alone admits interfaces that can
 //!   never complete the join. The default interface picker
-//!   ([`interfaces::pick_default_interface_index`]) is deliberately more
-//!   lenient and ignores `RUNNING`, so a host whose links are up but not
-//!   running still gets a default bind instead of "no multicast-capable
-//!   interface found".
+//!   ([`interfaces::pick_default_interface_index`]) treats `RUNNING` as a
+//!   **rank** instead: a link with a carrier outranks one without, but one
+//!   without is still a candidate, so a host whose links are up but not
+//!   running gets a default bind instead of "no multicast-capable interface
+//!   found" — and never at the cost of a working link enumerated after it.
 //! * **Multicast-capable, and NOT loopback.** mDNS is multicast; an interface
 //!   without multicast support cannot participate, and loopback is not a link
 //!   peers are ever on. Loopback exists only as the default picker's last-resort
@@ -66,9 +67,10 @@ use crate::Family;
 /// [`acceptable_mdns_interfaces`].
 ///
 /// The default interface picker ([`pick_default_interface_index`]) is
-/// deliberately **more lenient** than this predicate: it ignores the `RUNNING`
-/// requirement, so an interface that fails here (an `UP` link without a
-/// reported carrier) can still be what the picker returns.
+/// deliberately **more lenient** than this predicate: an interface that fails
+/// here only for want of a carrier is still a candidate there, ranked below
+/// every link that has one, so it is what the picker returns when nothing
+/// better exists.
 pub fn is_acceptable_mdns_interface(iface: &getifs::Interface) -> bool {
   qualifies(iface.index(), iface.flags(), true)
 }
@@ -108,18 +110,23 @@ pub fn acceptable_mdns_interfaces() -> io::Result<Vec<getifs::Interface>> {
 
 /// Pick the default interface index to bind when the caller pinned none.
 ///
-/// Prefers an up, multicast-capable, non-loopback interface that satisfies
-/// **all** requested families, then one that satisfies at least one, then the
-/// same two rules over loopback. The loose fallback matters: without it an
-/// IPv4-only NIC on a host with no global IPv6 would be rejected even though
-/// it serves `with_ipv4(true).with_ipv6(true)` over v4 perfectly well.
+/// Prefers an up, multicast-capable, non-loopback interface with a carrier,
+/// then the same link without one, then loopback; within each, one that
+/// satisfies **all** requested families ranks above one that satisfies at
+/// least one. The loose fallback matters: without it an IPv4-only NIC on a
+/// host with no global IPv6 would be rejected even though it serves
+/// `with_ipv4(true).with_ipv6(true)` over v4 perfectly well.
 ///
-/// Unlike [`is_acceptable_mdns_interface`] and
-/// [`acceptable_mdns_interfaces`], this picker deliberately does **not** require
-/// `RUNNING`: `UP` is enough. Requiring a carrier here would regress hosts
-/// whose only links are up but not reported running into "no multicast-capable
-/// interface found", so the picker accepts them; consumers that want only links
-/// that can transmit right now should use the strict filter instead.
+/// Unlike [`is_acceptable_mdns_interface`] and [`acceptable_mdns_interfaces`],
+/// this picker does **not** require `RUNNING` — it ranks it. Refusing a
+/// carrier-less link outright would strand a host whose links are momentarily
+/// down on "no multicast-capable interface found"; admitting one as an equal,
+/// which is what ignoring the flag amounted to, let an `eth0` with its cable
+/// out beat a working `wlan0` enumerated after it, purely on first-seen order
+/// and for the life of a pick nothing migrates. A link that can transmit now
+/// therefore outranks one that cannot in either enumeration order, and a host
+/// with nothing running still gets a bind. Consumers that want only links that
+/// can transmit right now should use the strict filter instead.
 ///
 /// # `Ok(None)` is "nothing qualified"; an error is an error
 ///
@@ -137,7 +144,7 @@ pub fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<
   rank_candidates(
     ifs
       .iter()
-      .filter_map(|i| Some((tier(i.index(), i.flags(), false)?, i.index(), i))),
+      .filter_map(|i| Some((tier(i.index(), i.flags())?, i.index(), i))),
     want_v4,
     want_v6,
     |iface, family| has_addr_in(iface, family),
@@ -149,7 +156,7 @@ pub fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<
 /// `candidates` yields `(tier_base, index, subject)`, where `subject` is
 /// whatever `has_addr` needs to read that candidate's addresses.
 ///
-/// One pass over four preference tiers, lowest wins, first-seen wins within a
+/// One pass over six preference tiers, lowest wins, first-seen wins within a
 /// tier. Probes for a family only while its answer can still outrank the
 /// incumbent, and weighs a probe that fails the same way: the candidate's
 /// remaining requested families are read first, and the failure is raised only
@@ -301,7 +308,8 @@ impl Drop for ForcedEnumerationError {
 /// The decision behind [`is_acceptable_mdns_interface`], split out of it so
 /// the rules can be unit-tested without a `getifs::Interface` (which has no
 /// public constructor). `require_running` separates the strict link filter
-/// (true) from the default picker's deliberately lenient variant (false).
+/// (true) from the weaker question [`tier`] asks in order to rank a link with
+/// no carrier below one that has it (false).
 fn qualifies(index: u32, flags: getifs::Flags, require_running: bool) -> bool {
   // Index 0 is "no specific interface": the drivers use it as the unbound
   // marker, and `IP_MULTICAST_IF` cannot name it.
@@ -336,14 +344,26 @@ fn fallback_qualifies(index: u32, flags: getifs::Flags, require_running: bool) -
 
 /// The decision behind [`pick_default_interface_index`]'s per-candidate base
 /// tier, split out so it can be unit-tested without a `getifs::Interface`
-/// (which has no public constructor). Tier 0 is a non-loopback link, tier 2 a
-/// loopback fallback; `rank_candidates` later lifts each by one per requested
-/// family the candidate has no address in.
-fn tier(index: u32, flags: getifs::Flags, require_running: bool) -> Option<u8> {
-  if qualifies(index, flags, require_running) {
+/// (which has no public constructor). Tier 0 is a non-loopback link with a
+/// carrier — exactly what the strict filter accepts — tier 2 the same link
+/// without one, tier 4 the loopback fallback; `rank_candidates` later lifts
+/// each by one per requested family the candidate has no address in, so the
+/// effective order is 0..=5 and lower still wins.
+///
+/// Two apart rather than one, so that a family a candidate cannot serve never
+/// costs it more than a carrier does: an address on a link that cannot
+/// transmit the group join at all buys nothing.
+///
+/// There is no `require_running` here because both answers are wanted: it is
+/// what separates tier 0 from tier 2, and a link with no carrier loses to one
+/// that has it rather than being refused.
+fn tier(index: u32, flags: getifs::Flags) -> Option<u8> {
+  if qualifies(index, flags, true) {
     Some(0)
-  } else if fallback_qualifies(index, flags, require_running) {
+  } else if qualifies(index, flags, false) {
     Some(2)
+  } else if fallback_qualifies(index, flags, false) {
+    Some(4)
   } else {
     None
   }

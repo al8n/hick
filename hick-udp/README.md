@@ -34,10 +34,10 @@ It provides:
   mDNS: `UP` **and** `RUNNING`, multicast-capable and non-loopback, and never a
   point-to-point cellular interface on Android. One endpoint per NIC is a
   single `interfaces::acceptable_mdns_interfaces()` call. The drivers' default
-  interface picker (`interfaces::pick_default_interface_index`) is deliberately
-  more lenient about `RUNNING` — `UP` alone suffices, so a host whose links are
-  up but not reported running still gets a default bind — and keeps loopback
-  only as its last-resort fallback
+  interface picker (`interfaces::pick_default_interface_index`) ranks `RUNNING`
+  rather than requiring it — a link with a carrier wins, one without is still
+  bound when nothing better exists, so a host whose links are momentarily down
+  is never stranded — and keeps loopback only as its last-resort fallback
   (`interfaces::is_loopback_fallback_interface`).
 - **Ancillary parsing** — recover the local address a datagram arrived on via
   `IP_PKTINFO` / `IPV6_PKTINFO`, plus TTL / hop-limit / timestamp control
