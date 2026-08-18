@@ -805,9 +805,6 @@ cfg_heap! {
     /// `pub(crate)` because `EmittedRecords` is a crate-internal type; the
     /// endpoint (same crate) reads this directly, and a driver only ever moves
     /// the whole snapshot.
-    // `allow(dead_code)`: the field is read by the endpoint withdrawal state
-    // machine; suppress the false positive here.
-    #[allow(dead_code)]
     pub(crate) owned: [respond::EmittedRecords; 2],
     /// The MULTICAST subset of [`Self::owned`], and the ONLY half
     /// `Endpoint::relinquished_asserts` may read.

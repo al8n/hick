@@ -1943,6 +1943,12 @@ fn recv_matching(fd: std::os::fd::RawFd, want: &[u8]) -> Option<RecvMeta> {
       }
       // Not a timeout and not something to report as "no datagram": the receive
       // path itself failed, which is the defect these tests exist to catch.
+      #[expect(
+        clippy::panic,
+        reason = "test-only helper: an unexpected receive failure must abort the \
+                  test loudly rather than be folded into the None-means-timeout \
+                  return"
+      )]
       Err(e) => panic!("recv_with_meta failed while waiting for the probe datagram: {e:?}"),
     }
   }
@@ -2060,11 +2066,21 @@ fn bsd_ipv4_recv_witnesses_the_group_and_a_unicast_destination() {
     .port();
 
   let lo = up_loopback_index();
+  #[expect(
+    clippy::panic,
+    reason = "test setup: joining loopback is an environmental precondition this \
+              test asserts, not a Result its caller inspects"
+  )]
   try_join_v4(&sock, lo)
     .unwrap_or_else(|e| panic!("cannot join {group} on loopback index {lo}: {e:?}"));
 
   // 1) THE GROUP. Sent through loopback, so this needs no physical NIC.
   let group_payload = b"hick bsd ipv4 group probe";
+  #[expect(
+    clippy::panic,
+    reason = "test setup: sending the probe datagram is an environmental \
+              precondition this test asserts, not a Result its caller inspects"
+  )]
   send_from_interface(
     Ipv4Addr::LOCALHOST,
     SocketAddrV4::new(group, port),

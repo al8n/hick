@@ -742,9 +742,24 @@ fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
   #[cfg(has_ip_dstaddr_recvif)]
   verify_rx_dstaddr_recvif_v4(&std_sock)?;
   // Best-effort: enabling kernel receive timestamps must not fail the bind on
-  // platforms that lack the sockopt. A missing timestamp just leaves
-  // RecvMeta::rx_time as None.
-  let _ = platform::set_recv_timestamp(&std_sock);
+  // platforms that lack the sockopt — a missing timestamp just leaves
+  // RecvMeta::rx_time as None on every future receive. Unlike `set_recv_ttl_v4`
+  // below, that is not a harmless diagnostic gap: `selfsend.rs`'s
+  // `SelfSendTracker` degrades to content-only matching for the life of this
+  // socket without it, so a failed enable is reported rather than swallowed.
+  // No counter: try_bind_v4/try_bind_v6 are free functions with no
+  // per-endpoint `Stats` in reach — see the CHANGELOG for why that is
+  // deferred rather than solved with a process-wide counter here.
+  if let Err(_e) = platform::set_recv_timestamp(&std_sock) {
+    hick_trace::warn!(
+      interface_index = opts.interface_index(),
+      family = "IPv4",
+      error = %_e,
+      error_kind = ?_e.kind(),
+      "failed to enable kernel receive timestamps; self-send matching degrades \
+       to content-only for the life of this socket"
+    );
+  }
   // Best-effort: enabling IP_RECVTTL surfaces the inbound TTL as a diagnostic on
   // `RecvMeta::hop_limit`. No admission decision reads it — §11's receive test
   // is about the destination address — so a missing value costs nothing.
@@ -1150,9 +1165,24 @@ fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   // nothing survives it for the destination.
   platform::set_recv_pktinfo_v6(&std_sock)?;
   // Best-effort: enabling kernel receive timestamps must not fail the bind on
-  // platforms that lack the sockopt. A missing timestamp just leaves
-  // RecvMeta::rx_time as None.
-  let _ = platform::set_recv_timestamp(&std_sock);
+  // platforms that lack the sockopt — a missing timestamp just leaves
+  // RecvMeta::rx_time as None on every future receive. Unlike
+  // `set_recv_hoplimit_v6` below, that is not a harmless diagnostic gap:
+  // `selfsend.rs`'s `SelfSendTracker` degrades to content-only matching for
+  // the life of this socket without it, so a failed enable is reported rather
+  // than swallowed. No counter: try_bind_v4/try_bind_v6 are free functions
+  // with no per-endpoint `Stats` in reach — see the CHANGELOG for why that is
+  // deferred rather than solved with a process-wide counter here.
+  if let Err(_e) = platform::set_recv_timestamp(&std_sock) {
+    hick_trace::warn!(
+      interface_index = opts.interface_index(),
+      family = "IPv6",
+      error = %_e,
+      error_kind = ?_e.kind(),
+      "failed to enable kernel receive timestamps; self-send matching degrades \
+       to content-only for the life of this socket"
+    );
+  }
   // Best-effort: enabling IPV6_RECVHOPLIMIT surfaces the inbound hop limit as a
   // diagnostic on `RecvMeta::hop_limit`. No admission decision reads it — §11's
   // receive test is about the destination address — so a missing value costs
