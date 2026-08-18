@@ -151,17 +151,6 @@ pub fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<
   )
 }
 
-/// Rank already-classified candidates and return the winner's interface index.
-///
-/// `candidates` yields `(tier_base, index, subject)`, where `subject` is
-/// whatever `has_addr` needs to read that candidate's addresses.
-///
-/// One pass over six preference tiers, lowest wins, first-seen wins within a
-/// tier. Probes for a family only while its answer can still outrank the
-/// incumbent, and weighs a probe that fails the same way: the candidate's
-/// remaining requested families are read first, the failure is carried to the
-/// end of the walk, and only a failure whose candidate could still have won the
-/// pick is raised.
 /// A read that failed on a candidate that could still have taken the pick when
 /// it was walked, kept until the walk ends and the field it would have had to
 /// beat is complete.
@@ -219,6 +208,17 @@ fn first_unresolved_failure(deferred: &[HeldFailure], best: Option<(u8, u32)>) -
     .map(|(position, _)| position)
 }
 
+/// Rank already-classified candidates and return the winner's interface index.
+///
+/// `candidates` yields `(tier_base, index, subject)`, where `subject` is
+/// whatever `has_addr` needs to read that candidate's addresses.
+///
+/// One pass over six preference tiers, lowest wins, first-seen wins within a
+/// tier. Probes for a family only while its answer can still outrank the
+/// incumbent, and weighs a probe that fails the same way: the candidate's
+/// remaining requested families are read first, the failure is carried to the
+/// end of the walk, and only a failure whose candidate could still have won the
+/// pick is raised.
 fn rank_candidates<S>(
   candidates: impl IntoIterator<Item = (u8, u32, S)>,
   want_v4: bool,
