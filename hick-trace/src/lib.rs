@@ -276,7 +276,6 @@ pub mod stats {
     parse_errors: AtomicU64,
     send_errors: AtomicU64,
     recv_errors: AtomicU64,
-    recv_timestamp_enable_failed: AtomicU64,
     questions_rx: AtomicU64,
     answers_rx: AtomicU64,
     answers_collected: AtomicU64,
@@ -363,17 +362,6 @@ pub mod stats {
       // rising count is the degradation, and a count that stops rising while the
       // endpoint reports no traffic is the deafness.
       recv_errors => "mdns_recv_errors",
-      // A best-effort enable of kernel receive timestamps (`SO_TIMESTAMP` /
-      // `SO_TIMESTAMPNS`) failed at bind time. Every future receive on that
-      // socket then carries `RecvMeta::rx_time: None`, which degrades
-      // `hick_udp`'s self-send tracker to content-only matching for the life of
-      // the socket — the mechanism that keeps this endpoint's own multicast
-      // loopback from being mistaken for a peer — with no error and no log
-      // unless this is watched. `hick-udp`'s `try_bind_v4`/`try_bind_v6` are
-      // free functions with no per-endpoint `Stats` to write into, so this one
-      // is incremented through hick-udp's own process-wide counter instead of
-      // by a driver; see `hick_udp::multicast::bind_stats`.
-      recv_timestamp_enable_failed => "mdns_recv_timestamp_enable_failed",
       questions_rx => "mdns_questions_rx",
       answers_rx => "mdns_answers_rx",
       answers_collected => "mdns_answers_collected",
@@ -439,7 +427,6 @@ pub mod stats {
         parse_errors: self.parse_errors.load(Relaxed),
         send_errors: self.send_errors.load(Relaxed),
         recv_errors: self.recv_errors.load(Relaxed),
-        recv_timestamp_enable_failed: self.recv_timestamp_enable_failed.load(Relaxed),
         questions_rx: self.questions_rx.load(Relaxed),
         answers_rx: self.answers_rx.load(Relaxed),
         answers_collected: self.answers_collected.load(Relaxed),
@@ -504,12 +491,6 @@ pub mod stats {
     /// Receive calls that failed without consuming a datagram (see the counter
     /// declaration for why this is not `packets_dropped`).
     pub recv_errors: u64,
-    /// A best-effort enable of kernel receive timestamps failed at bind time,
-    /// degrading `hick_udp`'s self-send matching to content-only for the life
-    /// of that socket. Process-wide rather than per-endpoint: see the
-    /// counter's declaration for why `hick-udp` cannot increment a live
-    /// endpoint's `Stats` here.
-    pub recv_timestamp_enable_failed: u64,
     pub questions_rx: u64,
     pub answers_rx: u64,
     pub answers_collected: u64,

@@ -621,21 +621,6 @@ impl RecvMeta {
   }
 }
 
-/// hick-udp's own process-wide bind-time counters — currently only
-/// [`hick_trace::stats::StatsSnapshot::recv_timestamp_enable_failed`].
-///
-/// Distinct from a driver's per-endpoint `Stats`: `try_bind_v4`/`try_bind_v6`
-/// are free functions with no endpoint to hold one, and whether this
-/// process's kernel honours `SO_TIMESTAMP` is a fact about the process (really
-/// about the kernel underneath it), not about any one endpoint — every socket
-/// this crate binds gets the same answer.
-#[cfg(feature = "stats")]
-pub fn bind_stats() -> &'static hick_trace::stats::Stats {
-  static BIND_STATS: std::sync::LazyLock<hick_trace::stats::Stats> =
-    std::sync::LazyLock::new(hick_trace::stats::Stats::default);
-  &BIND_STATS
-}
-
 /// Bind an IPv4 mDNS multicast UDP socket with reuse options set BEFORE bind.
 ///
 /// On Unix, `SO_REUSEADDR` and `SO_REUSEPORT` MUST be set before `bind` for
@@ -761,8 +746,10 @@ fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
   // RecvMeta::rx_time as None on every future receive. Unlike `set_recv_ttl_v4`
   // below, that is not a harmless diagnostic gap: `selfsend.rs`'s
   // `SelfSendTracker` degrades to content-only matching for the life of this
-  // socket without it, so a failed enable is reported and counted instead of
-  // swallowed.
+  // socket without it, so a failed enable is reported rather than swallowed.
+  // No counter: try_bind_v4/try_bind_v6 are free functions with no
+  // per-endpoint `Stats` in reach — see the CHANGELOG for why that is
+  // deferred rather than solved with a process-wide counter here.
   if let Err(_e) = platform::set_recv_timestamp(&std_sock) {
     hick_trace::warn!(
       interface_index = opts.interface_index(),
@@ -772,8 +759,6 @@ fn try_bind_v4_inner(opts: MulticastOptionsV4) -> Result<UdpSocket, BindError> {
       "failed to enable kernel receive timestamps; self-send matching degrades \
        to content-only for the life of this socket"
     );
-    #[cfg(feature = "stats")]
-    bind_stats().recv_timestamp_enable_failed(1);
   }
   // Best-effort: enabling IP_RECVTTL surfaces the inbound TTL as a diagnostic on
   // `RecvMeta::hop_limit`. No admission decision reads it — §11's receive test
@@ -1184,8 +1169,10 @@ fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
   // RecvMeta::rx_time as None on every future receive. Unlike
   // `set_recv_hoplimit_v6` below, that is not a harmless diagnostic gap:
   // `selfsend.rs`'s `SelfSendTracker` degrades to content-only matching for
-  // the life of this socket without it, so a failed enable is reported and
-  // counted instead of swallowed.
+  // the life of this socket without it, so a failed enable is reported rather
+  // than swallowed. No counter: try_bind_v4/try_bind_v6 are free functions
+  // with no per-endpoint `Stats` in reach — see the CHANGELOG for why that is
+  // deferred rather than solved with a process-wide counter here.
   if let Err(_e) = platform::set_recv_timestamp(&std_sock) {
     hick_trace::warn!(
       interface_index = opts.interface_index(),
@@ -1195,8 +1182,6 @@ fn try_bind_v6_inner(opts: MulticastOptionsV6) -> Result<UdpSocket, BindError> {
       "failed to enable kernel receive timestamps; self-send matching degrades \
        to content-only for the life of this socket"
     );
-    #[cfg(feature = "stats")]
-    bind_stats().recv_timestamp_enable_failed(1);
   }
   // Best-effort: enabling IPV6_RECVHOPLIMIT surfaces the inbound hop limit as a
   // diagnostic on `RecvMeta::hop_limit`. No admission decision reads it — §11's
