@@ -28,10 +28,23 @@
 //!   absent from [`interfaces::acceptable_mdns_interfaces`].
 //! * **Not point-to-point on Android.** Cellular (LTE/5G) interfaces are
 //!   point-to-point on Android, and binding mDNS to one wakes the cellular
-//!   radio, which drains battery. VPN TUN interfaces are also point-to-point
-//!   but do not support multicast anyway, so nothing usable is lost. This is
-//!   the other half of syncthing/syncthing#10504, which skips point-to-point
-//!   interfaces on Android in its local-discovery beacon.
+//!   radio, which drains battery. This is the other half of
+//!   syncthing/syncthing#10504, which skips point-to-point interfaces on
+//!   Android in its local-discovery beacon.
+//!
+//!   The rule is POLICY, not a capability test, and it is a heuristic in both
+//!   directions. VPN TUN interfaces are point-to-point too and are refused by
+//!   the same rule; that is deliberate — we do not want mDNS crossing a VPN
+//!   tunnel — and NOT because they cannot carry it: Linux's
+//!   `tun_net_initialize` sets `IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST`,
+//!   so a TUN does advertise multicast. In the other direction the rule misses
+//!   some cellular links: `qmi_wwan_netdev_setup` only sets `IFF_POINTOPOINT`
+//!   on its raw-IP path, while its 802.3 path calls `ether_setup` and yields
+//!   `IFF_BROADCAST | IFF_MULTICAST` with no `IFF_POINTOPOINT`, so a QMI link
+//!   in Ethernet mode is not caught. Raw-IP is the norm on modern Android, so
+//!   the gap is narrow, but this rule should not be read as identifying every
+//!   cellular interface — that needs platform network capabilities, which this
+//!   crate cannot reach.
 //!
 //! # Snapshots
 //!
