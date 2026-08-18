@@ -517,3 +517,91 @@ fn a_failure_after_a_first_probe_that_left_the_pick_in_reach_still_surfaces() {
     "the higher-ranked candidate must actually have been probed"
   );
 }
+
+// The two above turn on a family read BEFORE the failing one, which is the only
+// order the fixed probe sequence used to handle: the tier already out of reach
+// when the syscall fails. These two are the other order — the failing probe
+// comes first, so what the candidate can still reach is unsettled at the moment
+// it fails and only the family read next can say whether the answer nobody
+// obtained could have changed the pick. Same candidates and the same four
+// probes either way; the second family's answer is the entire difference
+// between discarding the failure and raising it.
+
+#[test]
+fn a_failure_a_later_family_proves_irrelevant_does_not_fail_the_pick() {
+  let mut asked = Vec::new();
+  let picked = rank_candidates(
+    [(0, 7, "eth0"), (0, 8, "eth1")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("eth0", Family::V4) => Ok(true),
+        ("eth0", Family::V6) => Ok(false),
+        ("eth1", Family::V6) => Ok(false),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+      }
+    },
+  );
+  assert_eq!(
+    picked.expect(
+      "eth1 ties the incumbent at tier 1 if its IPv4 was there and serves no requested \
+       family at all if it was not, so no answer to the read that failed could have \
+       changed the pick"
+    ),
+    Some(7),
+    "first-seen-wins within a tier: the incumbent keeps the pick"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("eth0", Family::V4),
+      ("eth0", Family::V6),
+      ("eth1", Family::V4),
+      ("eth1", Family::V6)
+    ],
+    "a failed probe must not end its candidate: the family read after it is what proves \
+     the failure could not have mattered"
+  );
+}
+
+#[test]
+fn a_failure_a_later_family_leaves_decisive_still_surfaces() {
+  let mut asked = Vec::new();
+  let err = rank_candidates(
+    [(0, 7, "eth0"), (0, 8, "eth1")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("eth0", Family::V4) => Ok(true),
+        ("eth0", Family::V6) => Ok(false),
+        ("eth1", Family::V6) => Ok(true),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+      }
+    },
+  )
+  .expect_err(
+    "eth1 has the IPv6 the incumbent lacks, so the IPv4 nobody could read is exactly what \
+     decides tier 0 against a tier-1 tie; ranking it as having no IPv4 binds a link on an \
+     answer that was never obtained",
+  );
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::PermissionDenied,
+    "the platform's own kind must be carried over, not flattened, got {err:?}"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("eth0", Family::V4),
+      ("eth0", Family::V6),
+      ("eth1", Family::V4),
+      ("eth1", Family::V6)
+    ],
+    "the deferred failure is decided once the candidate's remaining families are read, so \
+     the same probes run as in the discarding case"
+  );
+}

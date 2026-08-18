@@ -151,7 +151,10 @@ pub fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<
 ///
 /// One pass over four preference tiers, lowest wins, first-seen wins within a
 /// tier. Probes for a family only while its answer can still outrank the
-/// incumbent.
+/// incumbent, and weighs a probe that fails the same way: the candidate's
+/// remaining requested families are read first, and the failure is raised only
+/// if the candidate could still have won whichever answer that probe was going
+/// to give.
 fn rank_candidates<S>(
   candidates: impl IntoIterator<Item = (u8, u32, S)>,
   want_v4: bool,
@@ -162,20 +165,48 @@ fn rank_candidates<S>(
   'candidates: for (tier_base, index, subject) in candidates {
     let mut reachable = tier_base;
     let mut serves_any = false;
+    let mut deferred: Option<io::Error> = None;
     for (family, wanted) in [(Family::V4, want_v4), (Family::V6, want_v6)] {
       if best.is_some_and(|(seen, _)| reachable >= seen) {
         continue 'candidates;
       }
-      let serves = wanted && has_addr(&subject, family)?;
-      serves_any |= serves;
-      if wanted && !serves {
-        reachable = tier_base.saturating_add(1);
+      if !wanted {
+        continue;
+      }
+      match has_addr(&subject, family) {
+        Ok(true) => serves_any = true,
+        Ok(false) => reachable = tier_base.saturating_add(1),
+        // A read nobody completed is weighed as if it had said "present":
+        // that is the answer that ranks this candidate highest, so it is the
+        // one that decides whether the failure could have mattered at all.
+        // Keep reading rather than propagating — a family read after it
+        // coming back absent puts the pick out of this candidate's reach and
+        // settles the failure as irrelevant, which is information that only
+        // arrives after the syscall failed.
+        Err(e) => {
+          serves_any = true;
+          deferred.get_or_insert(e);
+        }
       }
     }
     if !serves_any && reachable > tier_base {
       continue;
     }
-    if best.is_none_or(|(seen, _)| reachable < seen) {
+    // `reachable` and `serves_any` now describe the best this candidate could
+    // have done with any failed probe answered its own way, so this asks
+    // whether it could still have won, not whether it won.
+    let could_win = best.is_none_or(|(seen, _)| reachable < seen);
+    if let Some(e) = deferred {
+      // It could not have won on either answer, so the walk from here is the
+      // one the successful read would have produced: this candidate is not the
+      // incumbent in either world. Raising the failure would refuse a bind
+      // over information the pick could not have used.
+      if !could_win {
+        continue;
+      }
+      return Err(e);
+    }
+    if could_win {
       best = Some((reachable, index));
     }
   }

@@ -597,6 +597,20 @@ OTHER
   between WiFi and cellular — is not handled by it. Multi-interface binding is
   still not supported; see #133, which also records why "one endpoint per
   interface" is not a safe workaround as stated.
+- `hick-udp`: a failed address read on a candidate the default picker was about
+  to discard anyway no longer aborts `pick_default_interface_index`. Families
+  are probed in a fixed order, and the check that skips a candidate which can no
+  longer outrank the incumbent ran **before** each probe, against a tier the
+  candidate's unread families had not yet settled — so a candidate whose IPv4
+  read failed and whose IPv6 was absent ties the incumbent at best and serves no
+  requested family at worst, yet its failure was propagated before IPv6 was ever
+  read and the bind was refused over an answer the pick could not have used. It
+  was order-dependent: probing IPv6 first on the same inputs succeeded. A
+  candidate's first failure is now held while its remaining requested families
+  are read, and raised only if the candidate could still have won whichever
+  answer the failed probe was going to give — decided by weighing the unread
+  family as **present**, the answer that ranks the candidate highest, so a
+  failure that could have changed the pick still surfaces (#130).
 
 ## Dual-stack partial delivery (`TransmitDelivery`)
 
