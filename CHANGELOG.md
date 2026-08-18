@@ -549,6 +549,18 @@ OTHER
   list — so "no addresses" cannot be distinguished from "an address we could
   not parse", and degrading rather than failing is deliberate. Thanks to
   @myukitty (#128).
+- `hick-udp`: `try_bind_v4` and `try_bind_v6` now log and count a failed
+  best-effort enable of kernel receive timestamps (`SO_TIMESTAMP` /
+  `SO_TIMESTAMPNS`), instead of swallowing it silently. A missing timestamp
+  degrades `SelfSendTracker` matching to content-only for the life of the
+  socket — the mechanism that keeps this endpoint's own multicast loopback
+  from being mistaken for a peer — so a kernel that lacks or refuses the
+  sockopt now says so via `hick_trace::warn!` and the new
+  `StatsSnapshot::recv_timestamp_enable_failed` counter (new public
+  `hick_udp::multicast::bind_stats`), rather than degrading invisibly for the
+  socket's whole life. `set_recv_ttl_v4` / `set_recv_hoplimit_v6` are
+  unaffected: those remain genuine diagnostics that no admission decision
+  reads, so they stay silent.
 
 ## One home for interface selection, and an Android point-to-point rule
 
