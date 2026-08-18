@@ -978,6 +978,15 @@ cfg_heap! {
   pub struct Service<I, TQ, EV> {
   handle: ServiceHandle,
   state: ServiceState,
+  /// Whether to keep sending the periodic re-announce.  When `true` (the
+  /// default) the service runs the full RFC 6762 lifecycle: §8.1 probes, §8.3
+  /// startup announcements and the periodic re-announce that keeps peers'
+  /// caches fresh.  When `false` the service is a non-announcing responder: it
+  /// still probes and announces once at startup (RFC 6762 §8.1/§8.3), but the
+  /// periodic re-announce is suppressed, so after the startup burst nothing is
+  /// put on the wire unless an explicit query asks for its records.  Set via
+  /// `EndpointConfig::with_re_announce(false)`.
+  re_announce: bool,
   records: ServiceRecords,
   #[cfg(feature = "stats")]
   stats: Option<std::sync::Arc<hick_trace::stats::Stats>>,
@@ -1229,6 +1238,16 @@ where
   /// skipping probing in that case), so the service starts directly in
   /// `Announcing(0)` and announces without the probe sequence. A later §9
   /// conflict still reverts it to probing to resolve the collision.
+  ///
+  /// When `re_announce` is `false` the service is a non-announcing responder: it
+  /// runs the startup steps above exactly once — probing (§8.1) if `probe` is
+  /// `true`, then the two §8.3 announcements — and afterwards never sends
+  /// unsolicited traffic. The periodic re-announce is suppressed, so once the
+  /// startup burst is confirmed peers' cached records expire at their TTL and
+  /// the service is only findable by an explicit query.  `re_announce` and
+  /// `probe` are orthogonal: `re_announce` controls the post-startup
+  /// re-announce, `probe` controls whether the name is verified before it is
+  /// claimed.
   #[allow(dead_code)]
   pub(crate) fn try_new(
     handle: ServiceHandle,
@@ -1236,6 +1255,7 @@ where
     now: I,
     rng_seed: [u8; 32],
     probe: bool,
+    re_announce: bool,
   ) -> Self {
     let mut rng = Rng::from_seed(rng_seed);
     let (state, lifecycle_deadline) = if probe {
@@ -1246,6 +1266,7 @@ where
     Self {
       handle,
       state,
+      re_announce,
       records,
       #[cfg(feature = "stats")]
       stats: None,
@@ -2151,7 +2172,17 @@ where
   fn arm_announcement(&mut self, now: I, advance: PhaseAdvance) {
     let ttl_secs = self.records.ttl_secs();
     let base = match self.state {
-      ServiceState::Established => re_announce_deadline(now, ttl_secs),
+      ServiceState::Established => {
+        // A non-announcing responder's §8.3 startup burst is its LAST
+        // unsolicited traffic: peers' copies of the records are left to expire
+        // at the TTL, after which the service is findable only by explicit
+        // query.  No deadline means the lifecycle never fires again.
+        if !self.re_announce {
+          self.lifecycle_deadline = None;
+          return;
+        }
+        re_announce_deadline(now, ttl_secs)
+      }
       ServiceState::Announcing(_) => match advance {
         PhaseAdvance::Partial => {
           partial_announce_deadline(now, self.partial_announce_streak, ttl_secs)

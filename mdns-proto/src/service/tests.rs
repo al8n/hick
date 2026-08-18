@@ -74,6 +74,7 @@ fn non_probing_service_announces_without_probing() {
       FakeInstant::zero(),
       [0u8; 32],
       false, // do not probe
+      true,  // re-announce
     );
   assert!(
     matches!(svc.state(), ServiceState::Announcing(_)),
@@ -109,13 +110,157 @@ fn non_probing_service_announces_without_probing() {
   );
 }
 
+/// A non-announcing responder (`EndpointConfig::with_re_announce(false)`) runs
+/// the RFC 6762 §8.1/§8.3 startup sequence once — probing so the name is
+/// verified, then the two §8.3 announcements — and never sends the periodic
+/// re-announce.  Afterwards it is silent until an explicit query asks for its
+/// records, and a §9 conflict still reverts it to probing.
+#[test]
+fn non_announcing_responder_answers_questions_only() {
+  use crate::{
+    event::ServiceQuestion,
+    wire::{MessageReader, QuestionRef, ResourceType},
+  };
+  let records = make_records(120);
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::try_new(
+      ServiceHandle::from_raw(0),
+      records,
+      FakeInstant::zero(),
+      [0u8; 32],
+      true,  // probe
+      false, // re-announce
+    );
+
+  // The startup is the NORMAL conformant lifecycle: probe (§8.1), then the two
+  // §8.3 announcements, ending in Established with the caller's usual signals.
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+  let mut saw_probe = false;
+  let mut saw_announcement = false;
+  for _ in 0..30 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(tx)) = svc.poll_transmit(now, &mut buf) {
+      let reader = MessageReader::try_parse(buf.get(..tx.size()).unwrap()).unwrap();
+      if reader.header().flags().is_response() {
+        saw_announcement = true;
+      } else {
+        saw_probe = true;
+      }
+      svc.note_delivery(now, TransmitDelivery::ALL);
+    }
+    if svc.state() == ServiceState::Established {
+      break;
+    }
+  }
+  assert!(
+    saw_probe,
+    "non-announcing responder must still probe (§8.1) — the name is verified before it is claimed"
+  );
+  assert!(
+    saw_announcement,
+    "non-announcing responder must still announce at startup (§8.3)"
+  );
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "non-announcing responder must reach Established via the normal lifecycle"
+  );
+  assert!(
+    svc.has_fully_announced().get(),
+    "the startup burst must fully announce the records"
+  );
+  let mut established = false;
+  while let Some(u) = svc.poll() {
+    established |= matches!(u, ServiceUpdate::Established);
+  }
+  assert!(
+    established,
+    "the Established update must be queued by the normal Announcing → Established transition"
+  );
+
+  // Established arms NO periodic re-announce, and none ever fires — even far
+  // past the ~96 s refresh interval (0.8 × TTL 120) the service stays silent.
+  assert_eq!(
+    svc.lifecycle_deadline, None,
+    "a non-announcing responder must arm no periodic re-announce"
+  );
+  for _ in 0..300 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    assert!(
+      svc.poll_transmit(now, &mut buf).unwrap().is_none(),
+      "non-announcing responder must never emit unsolicited traffic after startup"
+    );
+  }
+
+  // An explicit query IS answered, with the full record set.  The unique
+  // records carry the cache-flush bit — the name was verified by the §8.1
+  // probe, so this is a legitimate assertion of uniqueness, not an
+  // unverified claim.
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in "_ipp._tcp.local.".trim_end_matches('.').split('.') {
+    qbuf.push(label.len() as u8);
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8);
+  qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  let src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
+    now,
+  );
+  now = now.advance(200);
+  svc.handle_timeout(now).unwrap();
+  let tx = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("non-announcing service must answer explicit queries");
+  let reader = MessageReader::try_parse(buf.get(..tx.size()).unwrap()).unwrap();
+  let mut answered = false;
+  for rr in reader.answers() {
+    let rr = rr.unwrap();
+    match rr.rtype() {
+      ResourceType::Srv | ResourceType::Txt | ResourceType::A | ResourceType::AAAA => {
+        assert!(
+          rr.cache_flush(),
+          "{:?} answer must carry the cache-flush bit — the name was verified by §8.1",
+          rr.rtype()
+        );
+      }
+      ResourceType::Ptr => {
+        assert!(
+          !rr.cache_flush(),
+          "PTR is a shared record — it must NOT carry the cache-flush bit"
+        );
+      }
+      _ => {}
+    }
+    answered = true;
+  }
+  assert!(answered, "the query response must carry records");
+  svc.note_delivery(now, TransmitDelivery::ALL);
+
+  // §9 conflicts are NOT ignored: a conflicting response still reverts the
+  // service to probing to re-verify the name.
+  deliver_losing_srv_conflict(&mut svc, now, ConflictOrigin::AuthoritativeResponse);
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "a §9 conflict must revert a non-announcing responder to re-probing"
+  );
+}
+
 /// Build a Service in Init state with last_now = FakeInstant::zero().
 fn make_service(
   ttl_secs: u32,
 ) -> Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> {
   let handle = ServiceHandle::from_raw(0);
   let records = make_records(ttl_secs);
-  Service::try_new(handle, records, FakeInstant::zero(), [0u8; 32], true)
+  Service::try_new(handle, records, FakeInstant::zero(), [0u8; 32], true, true)
 }
 
 /// One record of a peer's §8.2 proposal, as it goes on the wire.
@@ -860,6 +1005,7 @@ fn advertised_host_addrs_are_the_emitted_subset_not_configured() {
       records,
       FakeInstant::zero(),
       [0u8; 32],
+      true,
       true,
     );
   assert!(
@@ -2497,6 +2643,7 @@ fn host_conflict_for_identical_link_local_address_is_suppressed() {
         FakeInstant::zero(),
         [0u8; 32],
         true,
+        true,
       );
     svc.handle_timeout(FakeInstant::zero()).unwrap();
     svc
@@ -2567,6 +2714,7 @@ fn failed_conflict_rename_clears_stale_transmit_state() {
       FakeInstant::zero(),
       [0u8; 32],
       true,
+      true,
     );
   // A probe on the wire first, then a conflicting RESPONSE — §8.1's rename is
   // the one that can FAIL here. A §8.2 tiebreak loss now defers and keeps the
@@ -2629,6 +2777,7 @@ fn a_terminal_service_still_surfaces_a_host_conflict() {
       r,
       FakeInstant::zero(),
       [0u8; 32],
+      true,
       true,
     );
   let t0 = probe_once(&mut svc, FakeInstant::zero());
@@ -4909,6 +5058,7 @@ fn tiebreak_records_that_flatten_alike_are_not_a_tie() {
       FakeInstant::zero(),
       [0u8; 32],
       true,
+      true,
     );
   let t0 = FakeInstant::zero();
   svc.handle_timeout(t0).unwrap(); // Init → Probing
@@ -6130,6 +6280,7 @@ fn subtype_ptr_advertised_in_response() {
       FakeInstant::zero(),
       [0u8; 32],
       true,
+      true,
     );
   let now = drive_to_established(&mut svc);
 
@@ -6236,6 +6387,7 @@ fn legacy_subtype_browse_gets_unicast_reply_with_subtype_ptr() {
       records,
       FakeInstant::zero(),
       [0u8; 32],
+      true,
       true,
     );
   let now = drive_to_established(&mut svc);
@@ -10605,6 +10757,7 @@ fn a_record_outside_the_probes_qtype_is_still_proposed() {
         FakeInstant::zero(),
         [0u8; 32],
         true,
+        true,
       );
     let t0 = FakeInstant::zero();
     svc.handle_timeout(t0).unwrap();
@@ -11043,6 +11196,7 @@ fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name(
       records,
       FakeInstant::zero(),
       [0u8; 32],
+      true,
       true,
     );
   let start = probe_once(&mut svc, FakeInstant::zero());
@@ -11560,6 +11714,7 @@ fn make_service_with(
     r,
     FakeInstant::zero(),
     [0u8; 32],
+    true,
     true,
   )
 }
