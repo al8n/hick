@@ -1063,12 +1063,22 @@ impl IfaceWitness {
 
   /// The witnessed index, or `0` where nothing was witnessed.
   ///
-  /// **Never for an admission decision.** It flattens the three absences this
-  /// type exists to keep apart, and [`admits_ingress`] does not accept a `u32`
-  /// at all, so it cannot be reached from here. It is for the layers below the
-  /// trust boundary that take an interface index as a ROUTING hint — the
-  /// protocol core's `handle` among them — where `0` already means "unknown" and
-  /// nothing is admitted or refused on it.
+  /// **Never for THIS crate's admission decision.** It flattens the three
+  /// absences this type exists to keep apart, and [`admits_ingress`] does not
+  /// accept a `u32` at all, so it cannot be reached from there. It is for the
+  /// layers below the trust boundary that take an interface index as a
+  /// ROUTING hint — the protocol core's `handle` among them — where `0`
+  /// already means "unknown".
+  ///
+  /// That routing hint is not always inert, though: with
+  /// `mdns-proto`'s `EndpointConfig::with_trust_advertised_src_as_self`
+  /// enabled, `handle` passes it on to `src_matches_advertised`, which reads
+  /// it to scope IPv6 link-local self-classification — and that classification
+  /// gates whether a datagram is suppressed as this endpoint's own echo, which
+  /// **is** an admission-adjacent decision, just not one this crate makes. The
+  /// three absences this method flattens are not distinguishable to that
+  /// caller either: `Lost`, `Declined`, and `Blind` all arrive there as the
+  /// same `0`, "unknown".
   #[inline]
   #[must_use]
   pub const fn index_or_zero(self) -> u32 {

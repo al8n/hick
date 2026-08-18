@@ -50,6 +50,22 @@ jobs:
       # Observability feature legs: verify tracing + metrics + stats compile clean.
       - run: cargo clippy --workspace --features tracing,metrics,stats -- -D warnings
 
+  # No job above builds the workspace's TEST targets at DEFAULT features on a
+  # host platform: `clippy` passes `--all-features`, so a mistake that only
+  # compiles under a non-default feature combination is invisible to it, and
+  # the only jobs that build test targets at default features are the
+  # `cross-check` FreeBSD/NetBSD/Android legs below — so a feature-gating slip
+  # surfaces first as a BSD/Android cross-compile failure, which reads like a
+  # platform problem and is not one. This step is cheap enough (seconds) that
+  # there is no reason to wait for a cross leg to find it.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
   # Native compile coverage on the other two tier-1 host families so the
   # platform `cfg`s (Apple `target_vendor`, Windows) and the `hick-udp/build.rs`
   # capability matrix are exercised, not just Linux.
@@ -118,6 +134,31 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo check ${{ matrix.scope }} --all-targets --target ${{ matrix.target }}
+
+  # FreeBSD has no lint coverage anywhere else: `os-clippy` above is macOS and
+  # Windows only, `cross-check` above runs `cargo check` rather than clippy for
+  # its BSD/NetBSD/Android legs, and the `freebsd` VM job below runs `cargo
+  # test`. So a clippy-only lint can sit on `main` unseen until a BSD
+  # contributor happens to run it locally — three `clippy::panic` findings in
+  # hick-udp's test module did exactly that.
+  #
+  # A small job of its own rather than a step added to `cross-check`: that
+  # job's matrix and its per-target `scope` are already densely commented for
+  # what `cargo check` needs, and clippy is a different concern (a lint, not a
+  # compile-and-type-check) that does not share NetBSD's/Android's reasons for
+  # a narrower scope. A `--target` cross-compile is enough for clippy to run —
+  # it rides the same MIR as `cargo check`, no VM required — so this stays
+  # cheap.
+  freebsd-clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-freebsd
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-features --all-targets --target x86_64-unknown-freebsd -- -D warnings
 
   # The first NATIVE execution of this workspace's tests on a BSD. `cross-check`
   # above only COMPILES FreeBSD, so hick-udp's cmsg tests — the whole evidence

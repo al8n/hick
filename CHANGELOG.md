@@ -533,13 +533,72 @@ OTHER
   as the immediate parent of any single-label instance and so would otherwise
   accept it. Only the root is rejected here; the full two-label `<Service>`
   rule is not otherwise enforced.
+- `hick-compio`, `hick-reactor`: an address-enumeration **failure** is no longer
+  read as "this interface has no address in that family". Both crates decided
+  family support with `matches!(iface.ipv6_addrs(), Ok(a) if !a.is_empty())` and
+  a `_ => false` arm, so an interrupted enumeration — `getifs` returns `EINTR`
+  by design when a dump is interrupted by DHCP, VPN or interface churn, rather
+  than returning a partial list that would silently drop interfaces — became a
+  definite "no IPv6". `Ok(empty)` still degrades the family, so a dual-stack
+  request keeps working on an IPv4-only host; a failed read now surfaces
+  instead of ranking the wrong link. The default-interface picker's signature
+  changes from returning an `Option` to a `Result<Option<_>, io::Error>`
+  accordingly. Note that `Ok(empty)` remains genuinely ambiguous on BSD, where
+  the enumerator skips an individual address whose netmask is non-canonical
+  (point-to-point and tunnel interfaces) and returns a silently incomplete
+  list — so "no addresses" cannot be distinguished from "an address we could
+  not parse", and degrading rather than failing is deliberate. Thanks to
+  @myukitty (#128).
+- `hick-udp`: `try_bind_v4` and `try_bind_v6` now log a failed best-effort
+  enable of kernel receive timestamps (`SO_TIMESTAMP` / `SO_TIMESTAMPNS`) via
+  `hick_trace::warn!`, instead of swallowing it silently. A missing timestamp
+  degrades `SelfSendTracker` matching to content-only for the life of the
+  socket — the mechanism that keeps this endpoint's own multicast loopback
+  from being mistaken for a peer — so a kernel that lacks or refuses the
+  sockopt now says so, rather than degrading invisibly for the socket's whole
+  life. `set_recv_ttl_v4` / `set_recv_hoplimit_v6` are unaffected: those
+  remain genuine diagnostics that no admission decision reads, so they stay
+  silent. **Known limitation:** no counter accompanies the warning yet.
+  `try_bind_v4`/`try_bind_v6` are free functions with no per-endpoint `Stats`
+  in reach, so a counter here would need either a process-wide global (a
+  shape this crate has deliberately moved away from elsewhere) or a breaking
+  change threading a `Stats` reference through their public signatures;
+  both are deferred rather than blocking the warning on either.
 
-# RELEASED
+## One home for interface selection, and an Android point-to-point rule
 
-## Dual-stack partial delivery (`TransmitDelivery`) (July 30th, 2026)
+- `hick-udp`: **new public module** `interfaces`, exporting
+  `acceptable_mdns_interfaces`, `is_acceptable_mdns_interface`,
+  `is_loopback_fallback_interface`, `pick_default_interface_index` and
+  `has_addr_in`. The interface-filtering and default-picking rules previously
+  lived in three copies, one each in `hick-mio`, `hick-reactor` and
+  `hick-compio`; they are now stated once and the copies are deleted, so a
+  driver's pick and a consumer's own enumeration cannot disagree. Callers that
+  want one endpoint per NIC can enumerate with `acceptable_mdns_interfaces`
+  rather than reimplementing the predicate.
+- `hick-udp`: **on Android only**, an interface that is point-to-point is no
+  longer accepted. Cellular (LTE/5G) links are point-to-point there, and
+  binding mDNS to one wakes the cellular radio and drains the battery; this is
+  the other half of syncthing/syncthing#10504. The rule is **policy, not a
+  capability test**, and it is a heuristic in both directions — VPN TUN
+  interfaces are refused by it deliberately rather than because they cannot
+  carry multicast (they can), and a QMI cellular link in 802.3 mode carries no
+  point-to-point flag and so is not caught. The module documents both gaps.
+- `hick-udp`: the strict enumeration (`acceptable_mdns_interfaces`) requires
+  `RUNNING` as well as `UP`, so a link with no carrier is not offered to a
+  caller that intends to bind it. `pick_default_interface_index` is
+  deliberately **more lenient** and ignores `RUNNING`, so a host whose links
+  are momentarily down still gets a default bind instead of being stranded on
+  loopback for the life of the process. Thanks to @wkornewald (#131, #134).
 
-Published crates: `mdns-proto` 0.4.0, `hick` 0.3.0, `hick-reactor` 0.3.0,
-`hick-compio` 0.3.0, `hick-smoltcp` 0.3.0, `hick-embassy` 0.3.0.
+  Note the standing limitation this makes visible: the default pick is a
+  **snapshot** taken once at construction and nothing migrates it, so a device
+  that switches between links — a laptop moving between LAN and WiFi, a phone
+  between WiFi and cellular — is not handled by it. Multi-interface binding is
+  still not supported; see #133, which also records why "one endpoint per
+  interface" is not a safe workaround as stated.
+
+## Dual-stack partial delivery (`TransmitDelivery`)
 
 `mdns-proto`'s confirm APIs took a single boolean doing two jobs — advancing
 the RFC 6762 lifecycle phase (§8.1 probing / §8.3 announcing, plus the §5.2
@@ -755,6 +814,9 @@ caller's part)
 The dependent crates (`hick`, `hick-reactor`, `hick-compio`, `hick-smoltcp`,
 `hick-embassy`) bump to 0.3.0 to track the `mdns-proto` 0.4 public dependency;
 `hick-udp` and `hick-trace` are unaffected.
+
+
+# RELEASED
 
 ## Drop the `heapless` tier (June 8th, 2026)
 
