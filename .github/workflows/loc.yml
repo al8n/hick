@@ -49,6 +49,14 @@ jobs:
           done
 
       - name: Upload all loc to the gist in one request
+        # GitHub does not expose secrets to a `pull_request` run whose head repo
+        # is a fork, so `secrets.GIST_PAT` comes through empty there and this
+        # step fails every external contribution with "Input required and not
+        # supplied: github-token". A fork PR still gets the counting above (the
+        # useful half); only the write it cannot authenticate for is skipped.
+        # `github.event_name != 'pull_request'` is what lets a push to `main` —
+        # which carries no `pull_request` context at all — through unconditionally.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GIST_PAT }}
