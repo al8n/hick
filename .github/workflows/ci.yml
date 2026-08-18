@@ -135,6 +135,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check ${{ matrix.scope }} --all-targets --target ${{ matrix.target }}
 
+  # FreeBSD has no lint coverage anywhere else: `os-clippy` above is macOS and
+  # Windows only, `cross-check` above runs `cargo check` rather than clippy for
+  # its BSD/NetBSD/Android legs, and the `freebsd` VM job below runs `cargo
+  # test`. So a clippy-only lint can sit on `main` unseen until a BSD
+  # contributor happens to run it locally — three `clippy::panic` findings in
+  # hick-udp's test module did exactly that.
+  #
+  # A small job of its own rather than a step added to `cross-check`: that
+  # job's matrix and its per-target `scope` are already densely commented for
+  # what `cargo check` needs, and clippy is a different concern (a lint, not a
+  # compile-and-type-check) that does not share NetBSD's/Android's reasons for
+  # a narrower scope. A `--target` cross-compile is enough for clippy to run —
+  # it rides the same MIR as `cargo check`, no VM required — so this stays
+  # cheap.
+  freebsd-clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-freebsd
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-features --all-targets --target x86_64-unknown-freebsd -- -D warnings
+
   # The first NATIVE execution of this workspace's tests on a BSD. `cross-check`
   # above only COMPILES FreeBSD, so hick-udp's cmsg tests — the whole evidence
   # base behind the BSD IPv4 receive parsers — have until now executed on Linux
