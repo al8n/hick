@@ -1,9 +1,8 @@
 use crate::{
   Family,
   interfaces::{
-    force_enumeration_error_for_test, has_addr_in, is_acceptable_mdns_interface,
-    is_loopback_fallback_interface, pick_default_interface_index, qualifies, rank_candidates,
-    tier,
+    force_enumeration_error_for_test, has_addr_in, pick_default_interface_index, qualifies,
+    rank_candidates, tier,
   },
   onlink::collect_local_subnets,
 };
@@ -18,34 +17,40 @@ fn up_running_multicast() -> Flags {
 }
 
 // ── the acceptable-link predicate ─────────────────────────────────────────────
+//
+// The strict filter (`require_running = true`) is what
+// `is_acceptable_mdns_interface` / `is_loopback_fallback_interface` /
+// `acceptable_mdns_interfaces` expose; the default picker's lenient variant
+// (`require_running = false`) is covered in the next section.
 
 #[test]
 fn an_up_running_multicast_interface_qualifies() {
-  assert!(qualifies(INDEX, up_running_multicast()));
-  assert_eq!(tier(INDEX, up_running_multicast()), Some(0));
+  assert!(qualifies(INDEX, up_running_multicast(), true));
+  assert_eq!(tier(INDEX, up_running_multicast(), true), Some(0));
 }
 
 #[test]
 fn a_running_interface_that_is_not_up_does_not_qualify() {
   let f = Flags::RUNNING | Flags::MULTICAST;
-  assert!(!qualifies(INDEX, f));
-  assert_eq!(tier(INDEX, f), None);
+  assert!(!qualifies(INDEX, f, true));
+  assert_eq!(tier(INDEX, f, true), None);
 }
 
 #[test]
 fn an_up_interface_that_is_not_running_does_not_qualify() {
   // UP without RUNNING is a link with no carrier — a Wi-Fi NIC with no
-  // association — which can never complete the multicast join.
+  // association — which can never complete the multicast join. The strict
+  // filter refuses it; the default picker accepts it (see the next section).
   let f = Flags::UP | Flags::MULTICAST;
-  assert!(!qualifies(INDEX, f));
-  assert_eq!(tier(INDEX, f), None);
+  assert!(!qualifies(INDEX, f, true));
+  assert_eq!(tier(INDEX, f, true), None);
 }
 
 #[test]
 fn an_interface_without_multicast_does_not_qualify() {
   let f = Flags::UP | Flags::RUNNING;
-  assert!(!qualifies(INDEX, f));
-  assert_eq!(tier(INDEX, f), None);
+  assert!(!qualifies(INDEX, f, true));
+  assert_eq!(tier(INDEX, f, true), None);
 }
 
 #[test]
@@ -53,48 +58,104 @@ fn a_multicast_loopback_is_a_fallback_not_a_link() {
   // `lo` reports MULTICAST on Linux and macOS, so excluding it must be
   // explicit rather than "fails the multicast check".
   let f = up_running_multicast() | Flags::LOOPBACK;
-  assert!(!qualifies(INDEX, f));
-  assert!(fallback_qualifies(INDEX, f));
-  assert_eq!(tier(INDEX, f), Some(2));
+  assert!(!qualifies(INDEX, f, true));
+  assert!(fallback_qualifies(INDEX, f, true));
+  assert_eq!(tier(INDEX, f, true), Some(2));
 }
 
 #[test]
 fn a_loopback_without_multicast_is_still_a_fallback() {
   let f = Flags::UP | Flags::RUNNING | Flags::LOOPBACK;
-  assert!(!qualifies(INDEX, f));
-  assert!(fallback_qualifies(INDEX, f));
-  assert_eq!(tier(INDEX, f), Some(2));
+  assert!(!qualifies(INDEX, f, true));
+  assert!(fallback_qualifies(INDEX, f, true));
+  assert_eq!(tier(INDEX, f, true), Some(2));
 }
 
 #[test]
 fn a_loopback_that_is_not_running_is_no_fallback_either() {
+  // Strict again: an UP loopback with no carrier is no fallback for the strict
+  // filter. The lenient picker still falls back to it — see the next section.
   let f = Flags::UP | Flags::LOOPBACK;
-  assert!(!qualifies(INDEX, f));
-  assert!(!fallback_qualifies(INDEX, f));
-  assert_eq!(tier(INDEX, f), None);
+  assert!(!qualifies(INDEX, f, true));
+  assert!(!fallback_qualifies(INDEX, f, true));
+  assert_eq!(tier(INDEX, f, true), None);
 }
 
 #[test]
 fn a_non_loopback_interface_is_not_a_fallback() {
-  assert!(!fallback_qualifies(INDEX, up_running_multicast()));
+  assert!(!fallback_qualifies(INDEX, up_running_multicast(), true));
 }
 
 #[test]
 fn index_zero_is_no_interface() {
-  assert!(!qualifies(0, up_running_multicast()));
-  assert!(!fallback_qualifies(0, Flags::UP | Flags::RUNNING | Flags::LOOPBACK));
-  assert_eq!(tier(0, Flags::UP | Flags::RUNNING | Flags::LOOPBACK), None);
+  assert!(!qualifies(0, up_running_multicast(), true));
+  assert!(!fallback_qualifies(
+    0,
+    Flags::UP | Flags::RUNNING | Flags::LOOPBACK,
+    true
+  ));
+  assert_eq!(
+    tier(0, Flags::UP | Flags::RUNNING | Flags::LOOPBACK, true),
+    None
+  );
 }
 
 #[test]
 fn point_to_point_is_refused_on_android_and_admitted_elsewhere() {
   let f = up_running_multicast() | Flags::POINTOPOINT;
   if cfg!(target_os = "android") {
-    assert!(!qualifies(INDEX, f));
-    assert_eq!(tier(INDEX, f), None);
+    assert!(!qualifies(INDEX, f, true));
+    assert_eq!(tier(INDEX, f, true), None);
   } else {
-    assert!(qualifies(INDEX, f));
-    assert_eq!(tier(INDEX, f), Some(0));
+    assert!(qualifies(INDEX, f, true));
+    assert_eq!(tier(INDEX, f, true), Some(0));
+  }
+}
+
+// ── the default picker ignores RUNNING ────────────────────────────────────────
+
+// The strict filter above refuses links with no carrier (`UP` but not
+// `RUNNING`). The default picker is deliberately more lenient: requiring
+// `RUNNING` there regressed hosts whose links are up but not reported running
+// into "no multicast-capable interface found", so the picker accepts `UP`
+// alone. `require_running = false` is exactly what
+// `pick_default_interface_index` passes to the predicates.
+
+#[test]
+fn the_picker_accepts_an_up_interface_that_is_not_running() {
+  let f = Flags::UP | Flags::MULTICAST;
+  assert!(!qualifies(INDEX, f, true));
+  assert!(qualifies(INDEX, f, false));
+  assert_eq!(tier(INDEX, f, false), Some(0));
+}
+
+#[test]
+fn the_picker_still_falls_back_to_an_up_loopback_that_is_not_running() {
+  let f = Flags::UP | Flags::LOOPBACK;
+  assert!(!fallback_qualifies(INDEX, f, true));
+  assert!(fallback_qualifies(INDEX, f, false));
+  assert_eq!(tier(INDEX, f, false), Some(2));
+}
+
+#[test]
+fn the_picker_relaxes_only_the_running_requirement() {
+  // The lenient picker drops just the `RUNNING` check; everything else that
+  // makes an interface usable for mDNS still applies.
+  let down = Flags::RUNNING | Flags::MULTICAST;
+  assert!(!qualifies(INDEX, down, false));
+  assert_eq!(tier(INDEX, down, false), None);
+  let no_multicast = Flags::UP | Flags::RUNNING;
+  assert!(!qualifies(INDEX, no_multicast, false));
+  let loopback = up_running_multicast() | Flags::LOOPBACK;
+  assert!(!qualifies(INDEX, loopback, false));
+  assert!(fallback_qualifies(INDEX, loopback, false));
+  let f = up_running_multicast() | Flags::POINTOPOINT;
+  if cfg!(target_os = "android") {
+    assert!(!qualifies(INDEX, f, false));
+    assert_eq!(tier(INDEX, f, false), None);
+  } else {
+    assert!(qualifies(INDEX, f, false));
+    assert_eq!(tier(INDEX, f, false), Some(0));
   }
 }
 
@@ -116,17 +177,17 @@ fn pick_default_interface_index_runs_for_every_family_combo() {
 #[test]
 fn the_default_interface_picker_reports_a_failed_address_enumeration() {
   // Host precondition, checked before the behaviour runs: the picker only
-  // probes interfaces whose flags already qualify them, so a host with no
-  // acceptable mDNS interface has nothing to fail on.
+  // probes interfaces its own (lenient) flags tier accepts, so a host with no
+  // such interface has nothing to fail on. Mirrors the picker's rule rather
+  // than the strict link filter, or a host with only UP-not-RUNNING links
+  // would skip a path the picker really walks.
   let Ok(ifs) = getifs::interfaces() else {
     eprintln!("skipping: this host will not enumerate its interfaces at all");
     return;
   };
-  let qualifies = |i: &getifs::Interface| {
-    is_acceptable_mdns_interface(i) || is_loopback_fallback_interface(i)
-  };
-  if !ifs.iter().any(qualifies) {
-    eprintln!("skipping: no acceptable mDNS interface for the picker to consider");
+  let picker_qualifies = |i: &getifs::Interface| tier(i.index(), i.flags(), false).is_some();
+  if !ifs.iter().any(picker_qualifies) {
+    eprintln!("skipping: no interface the picker would consider");
     return;
   }
   let _forced = force_enumeration_error_for_test(Family::V6);
@@ -147,7 +208,8 @@ fn the_default_interface_picker_reports_a_failed_address_enumeration() {
 #[test]
 fn a_failed_address_enumeration_is_not_a_missing_address() {
   let Some(idx) = getifs::interfaces().ok().and_then(|ifs| {
-    ifs.into_iter()
+    ifs
+      .into_iter()
       .find(|i| i.flags().contains(getifs::Flags::UP))
       .map(|i| i.index())
   }) else {
@@ -183,7 +245,8 @@ fn a_failed_address_enumeration_is_not_a_missing_address() {
 #[test]
 fn the_forced_enumeration_error_is_scoped_to_one_family_and_disarms_on_drop() {
   let Some(idx) = getifs::interfaces().ok().and_then(|ifs| {
-    ifs.into_iter()
+    ifs
+      .into_iter()
       .find(|i| {
         i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP)
       })
@@ -207,6 +270,48 @@ fn the_forced_enumeration_error_is_scoped_to_one_family_and_disarms_on_drop() {
     has_addr_in(&iface, Family::V6).is_ok(),
     "the guard must disarm the injection, or it leaks into whatever runs next \
      on this thread"
+  );
+}
+
+/// A guard restores the injection it replaced on drop, so nested injections
+/// compose: dropping the inner one leaves the outer one armed, exactly as a
+/// stack of guards should.
+#[test]
+fn the_forced_enumeration_error_restores_the_injection_it_replaced() {
+  let Some(idx) = getifs::interfaces().ok().and_then(|ifs| {
+    ifs
+      .into_iter()
+      .find(|i| {
+        i.flags().contains(getifs::Flags::LOOPBACK) && i.flags().contains(getifs::Flags::UP)
+      })
+      .map(|i| i.index())
+  }) else {
+    eprintln!("skipping: no UP loopback interface reported by getifs");
+    return;
+  };
+  let iface = getifs::interface_by_index(idx)
+    .expect("looking up the loopback interface")
+    .expect("the loopback index just read back must name an interface");
+  {
+    let outer = force_enumeration_error_for_test(Family::V4);
+    {
+      let inner = force_enumeration_error_for_test(Family::V6);
+      assert!(has_addr_in(&iface, Family::V6).is_err());
+      drop(inner);
+    }
+    assert!(
+      has_addr_in(&iface, Family::V4).is_err(),
+      "dropping the inner guard must restore the outer injection, not disarm it"
+    );
+    assert!(
+      has_addr_in(&iface, Family::V6).is_ok(),
+      "the inner family's injection must be gone after its guard drops"
+    );
+    drop(outer);
+  }
+  assert!(
+    has_addr_in(&iface, Family::V4).is_ok(),
+    "dropping the outer guard must leave the thread clean"
   );
 }
 

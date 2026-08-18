@@ -6,13 +6,20 @@
 //! non-obvious rules that decide whether an interface can carry mDNS live in
 //! exactly one place instead of three drivers plus every app:
 //!
-//! * **Up AND running.** `UP` is administrative; a multicast group join has to
-//!   transmit IGMP/MLD, which cannot work on an interface that is up but has no
-//!   carrier — a Wi-Fi NIC with no association, a NIC with its cable out.
-//!   `RUNNING` is "resources allocated" (Linux `IFF_RUNNING`), i.e. the link
-//!   actually has a carrier. Requiring both is the `FlagRunning` check Syncthing
-//!   added to its beacon's multicast listener (syncthing/syncthing#10504):
-//!   `FlagUp` alone admits interfaces that can never complete the join.
+//! * **Up, and running for a real link.** `UP` is administrative; a multicast
+//!   group join has to transmit IGMP/MLD, which cannot work on an interface
+//!   that is up but has no carrier — a Wi-Fi NIC with no association, a NIC
+//!   with its cable out. `RUNNING` is "resources allocated" (Linux
+//!   `IFF_RUNNING`), i.e. the link actually has a carrier. The strict link
+//!   filter — [`interfaces::is_acceptable_mdns_interface`] and
+//!   [`interfaces::acceptable_mdns_interfaces`] — requires both, the
+//!   `FlagRunning` check Syncthing added to its beacon's multicast listener
+//!   (syncthing/syncthing#10504): `FlagUp` alone admits interfaces that can
+//!   never complete the join. The default interface picker
+//!   ([`interfaces::pick_default_interface_index`]) is deliberately more
+//!   lenient and ignores `RUNNING`, so a host whose links are up but not
+//!   running still gets a default bind instead of "no multicast-capable
+//!   interface found".
 //! * **Multicast-capable, and NOT loopback.** mDNS is multicast; an interface
 //!   without multicast support cannot participate, and loopback is not a link
 //!   peers are ever on. Loopback exists only as the default picker's last-resort
@@ -28,23 +35,29 @@
 //!
 //! # Snapshots
 //!
-//! `getifs` offers no change notification on any supported platform, so both
-//! functions return snapshots: re-run them after an interface comes up or goes
-//! down, and rebuild any endpoint pinned to a link that vanished.
+//! `getifs` offers no change notification on any supported platform, so the
+//! functions here return snapshots: re-run them after an interface comes up or
+//! goes down, and rebuild any endpoint pinned to a link that vanished.
 
 use std::io;
 
 use crate::Family;
 
-/// Whether `iface` can carry mDNS traffic as a real link.
+/// Whether `iface` can carry mDNS traffic as a real link, right now.
 ///
-/// See the [module docs](self) for the three rules. Loopback is never one of
-/// these — it is the picker's separate fallback (see
+/// See the [module docs](self) for the rules. This is the **strict** filter: it
+/// requires the link to be `RUNNING` as well as `UP`, because a multicast group
+/// join has to transmit IGMP/MLD on a link that actually has a carrier. Loopback
+/// is never one of these — it is the picker's separate fallback (see
 /// [`is_loopback_fallback_interface`]) and is deliberately not returned by
-/// [`acceptable_mdns_interfaces`]. Shared by the drivers' default interface
-/// picker, so a pick and a consumer's own enumeration can never disagree.
+/// [`acceptable_mdns_interfaces`].
+///
+/// The default interface picker ([`pick_default_interface_index`]) is
+/// deliberately **more lenient** than this predicate: it ignores the `RUNNING`
+/// requirement, so an interface that fails here (an `UP` link without a
+/// reported carrier) can still be what the picker returns.
 pub fn is_acceptable_mdns_interface(iface: &getifs::Interface) -> bool {
-  qualifies(iface.index(), iface.flags())
+  qualifies(iface.index(), iface.flags(), true)
 }
 
 /// Whether `iface` is the loopback fallback the default interface picker ranks
@@ -54,23 +67,10 @@ pub fn is_acceptable_mdns_interface(iface: &getifs::Interface) -> bool {
 /// [`acceptable_mdns_interfaces`]; this separate rule is what the pickers use
 /// so a host with no real NIC still gets a responder (and tests can run with
 /// no network). It applies the same `UP` + `RUNNING` requirements as
-/// [`is_acceptable_mdns_interface`].
+/// [`is_acceptable_mdns_interface`] — and, like that predicate, is stricter
+/// than the default picker, which accepts an `UP` loopback without `RUNNING`.
 pub fn is_loopback_fallback_interface(iface: &getifs::Interface) -> bool {
-  fallback_qualifies(iface.index(), iface.flags())
-}
-
-/// The default picker's tier for `iface`: `Some(0)` for an acceptable
-/// non-loopback link, `Some(2)` for the loopback fallback, or `None` when the
-/// interface can never carry mDNS.
-///
-/// The two tiers are ranked so that lower wins — a loopback fallback can never
-/// displace a real link, however the candidates are ordered — and
-/// [`pick_default_interface_index`] derives each candidate's
-/// `(tier, index, interface)` triple from this single answer. Shared with the
-/// other drivers and with consumers that rank interfaces themselves, so a pick
-/// and an app's own ranking can never disagree.
-pub fn interface_tier(iface: &getifs::Interface) -> Option<u8> {
-  tier(iface.index(), iface.flags())
+  fallback_qualifies(iface.index(), iface.flags(), true)
 }
 
 /// Enumerate every interface that can carry mDNS traffic as a real link.
@@ -80,6 +80,10 @@ pub fn interface_tier(iface: &getifs::Interface) -> Option<u8> {
 /// NIC: pass each returned interface's index to the server options of whichever
 /// driver you use. Loopback is deliberately excluded — see the module docs. A
 /// snapshot — re-run it to observe interface changes.
+///
+/// Note that this is the strict filter: it requires `RUNNING`, so it can return
+/// fewer interfaces than the default interface picker
+/// ([`pick_default_interface_index`]) would consider.
 pub fn acceptable_mdns_interfaces() -> io::Result<Vec<getifs::Interface>> {
   Ok(
     getifs::interfaces()?
@@ -91,11 +95,18 @@ pub fn acceptable_mdns_interfaces() -> io::Result<Vec<getifs::Interface>> {
 
 /// Pick the default interface index to bind when the caller pinned none.
 ///
-/// Prefers an up, running, multicast-capable, non-loopback interface that
-/// satisfies **all** requested families, then one that satisfies at least one,
-/// then the same two rules over loopback. The loose fallback matters: without
-/// it an IPv4-only NIC on a host with no global IPv6 would be rejected even
-/// though it serves `with_ipv4(true).with_ipv6(true)` over v4 perfectly well.
+/// Prefers an up, multicast-capable, non-loopback interface that satisfies
+/// **all** requested families, then one that satisfies at least one, then the
+/// same two rules over loopback. The loose fallback matters: without it an
+/// IPv4-only NIC on a host with no global IPv6 would be rejected even though
+/// it serves `with_ipv4(true).with_ipv6(true)` over v4 perfectly well.
+///
+/// Unlike [`is_acceptable_mdns_interface`] and
+/// [`acceptable_mdns_interfaces`], this picker deliberately does **not** require
+/// `RUNNING`: `UP` is enough. Requiring a carrier here would regress hosts
+/// whose only links are up but not reported running into "no multicast-capable
+/// interface found", so the picker accepts them; consumers that want only links
+/// that can transmit right now should use the strict filter instead.
 ///
 /// # `Ok(None)` is "nothing qualified"; an error is an error
 ///
@@ -113,7 +124,7 @@ pub fn pick_default_interface_index(want_v4: bool, want_v6: bool) -> io::Result<
   rank_candidates(
     ifs
       .iter()
-      .filter_map(|i| Some((interface_tier(i)?, i.index(), i))),
+      .filter_map(|i| Some((tier(i.index(), i.flags(), false)?, i.index(), i))),
     want_v4,
     want_v6,
     |iface, family| has_addr_in(iface, family),
@@ -191,14 +202,23 @@ pub fn has_addr_in(iface: &getifs::Interface, family: Family) -> io::Result<bool
 /// than global so tests running in parallel cannot see each other's injection —
 /// libtest gives every `#[test]` its own thread.
 ///
+/// The guard remembers the injection it replaced and restores it on drop, so
+/// nested injections compose: `let outer = force(...); let inner = force(...);
+/// drop(inner);` leaves the outer in force. The guard is `!Send`, so dropping
+/// it on another thread is a compile error rather than a way to leave the
+/// arming thread injected forever.
+///
 /// The condition is otherwise unreachable: `getifs` reads addresses straight
 /// from the kernel and no healthy host refuses. It is also exactly the
 /// condition whose mishandling the picker has had to fix repeatedly, so it must
 /// not go untested. Behind `test-support` so no shipped build can reach it.
 #[cfg(any(test, feature = "test-support"))]
 pub fn force_enumeration_error_for_test(family: Family) -> ForcedEnumerationError {
-  FORCED_ENUMERATION_ERROR.with(|c| c.set(Some(family)));
-  ForcedEnumerationError
+  let prev = FORCED_ENUMERATION_ERROR.with(|c| c.replace(Some(family)));
+  ForcedEnumerationError {
+    prev,
+    _not_send: core::marker::PhantomData,
+  }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -212,27 +232,41 @@ fn forced_enumeration_error() -> Option<Family> {
   FORCED_ENUMERATION_ERROR.with(core::cell::Cell::get)
 }
 
-/// Disarms [`force_enumeration_error_for_test`]'s injection on drop.
+/// The live [`force_enumeration_error_for_test`] injection on this thread.
 #[cfg(any(test, feature = "test-support"))]
-pub struct ForcedEnumerationError;
+#[must_use]
+pub struct ForcedEnumerationError {
+  /// The injection this guard replaced; restored on drop so nested injections
+  /// compose instead of one guard's drop disarming an outer one.
+  prev: Option<Family>,
+  /// The guard's `Drop` restores the *arming* thread's TLS, so it must be
+  /// dropped on that thread. A raw pointer is neither `Send` nor `Sync`, which
+  /// makes the guard `!Send` and `!Sync`: moving it to another thread is a
+  /// compile error rather than an injection left armed forever on the thread
+  /// that armed it.
+  _not_send: core::marker::PhantomData<*const ()>,
+}
 
 #[cfg(any(test, feature = "test-support"))]
 impl Drop for ForcedEnumerationError {
   fn drop(&mut self) {
-    FORCED_ENUMERATION_ERROR.with(|c| c.set(None));
+    FORCED_ENUMERATION_ERROR.with(|c| c.set(self.prev));
   }
 }
 
 /// The decision behind [`is_acceptable_mdns_interface`], split out of it so
 /// the rules can be unit-tested without a `getifs::Interface` (which has no
-/// public constructor).
-fn qualifies(index: u32, flags: getifs::Flags) -> bool {
+/// public constructor). `require_running` separates the strict link filter
+/// (true) from the default picker's deliberately lenient variant (false).
+fn qualifies(index: u32, flags: getifs::Flags, require_running: bool) -> bool {
   // Index 0 is "no specific interface": the drivers use it as the unbound
   // marker, and `IP_MULTICAST_IF` cannot name it.
   if index == 0 {
     return false;
   }
-  if !flags.contains(getifs::Flags::UP) || !flags.contains(getifs::Flags::RUNNING) {
+  if !flags.contains(getifs::Flags::UP)
+    || (require_running && !flags.contains(getifs::Flags::RUNNING))
+  {
     return false;
   }
   if cfg!(target_os = "android") && flags.contains(getifs::Flags::POINTOPOINT) {
@@ -246,20 +280,25 @@ fn qualifies(index: u32, flags: getifs::Flags) -> bool {
   flags.contains(getifs::Flags::MULTICAST) && !flags.contains(getifs::Flags::LOOPBACK)
 }
 
-/// The decision behind [`is_loopback_fallback_interface`].
-fn fallback_qualifies(index: u32, flags: getifs::Flags) -> bool {
+/// The decision behind [`is_loopback_fallback_interface`]. `require_running`
+/// separates the strict filter (true) from the picker's lenient variant
+/// (false), exactly as in [`qualifies`].
+fn fallback_qualifies(index: u32, flags: getifs::Flags, require_running: bool) -> bool {
   index != 0
     && flags.contains(getifs::Flags::LOOPBACK)
     && flags.contains(getifs::Flags::UP)
-    && flags.contains(getifs::Flags::RUNNING)
+    && (!require_running || flags.contains(getifs::Flags::RUNNING))
 }
 
-/// The decision behind [`interface_tier`], split out so it can be unit-tested
-/// without a `getifs::Interface`.
-fn tier(index: u32, flags: getifs::Flags) -> Option<u8> {
-  if qualifies(index, flags) {
+/// The decision behind [`pick_default_interface_index`]'s per-candidate base
+/// tier, split out so it can be unit-tested without a `getifs::Interface`
+/// (which has no public constructor). Tier 0 is a non-loopback link, tier 2 a
+/// loopback fallback; `rank_candidates` later lifts each by one per requested
+/// family the candidate has no address in.
+fn tier(index: u32, flags: getifs::Flags, require_running: bool) -> Option<u8> {
+  if qualifies(index, flags, require_running) {
     Some(0)
-  } else if fallback_qualifies(index, flags) {
+  } else if fallback_qualifies(index, flags, require_running) {
     Some(2)
   } else {
     None

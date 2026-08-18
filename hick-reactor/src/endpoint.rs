@@ -5,7 +5,8 @@ use std::future::Future;
 use agnostic_net::Net;
 use async_channel::Sender;
 use hick_udp::{
-  Family, MulticastOptionsV4, MulticastOptionsV6, interfaces::{has_addr_in, pick_default_interface_index},
+  Family, MulticastOptionsV4, MulticastOptionsV6,
+  interfaces::{has_addr_in, pick_default_interface_index},
   try_bind_v4, try_bind_v6, try_join_v4, try_join_v6,
 };
 use mdns_proto::{QuerySpec, ServiceSpec};
