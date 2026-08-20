@@ -183,48 +183,41 @@ pub(crate) fn write_probe(records: &ServiceRecords, out: &mut [u8]) -> Result<us
 }
 
 /// RFC 6762 §6.1 ("negative responses"): append an NSEC record for the service
-/// INSTANCE name to the Additional section, asserting the exact set of record
-/// types that exist there — `{SRV, TXT}`. A querier asking the instance name
-/// for any other type then receives an authoritative "no such record" instead
-/// of waiting out a retransmission timeout. The NSEC "Next Domain Name" is the
-/// owner name itself (§6.1), and the cache-flush bit is set (the instance SRV
-/// and TXT are unique records, §10.2).
+/// INSTANCE name to the Additional section, asserting the record types this
+/// record set publishes there. A querier asking that name for another type then
+/// receives a "no such record" answer instead of waiting out a retransmission
+/// timeout. The NSEC "Next Domain Name" is the owner name itself
+/// (§6.1), and the cache-flush bit is set (the records it describes are unique,
+/// §10.2).
 ///
-/// Only the instance NSEC is emitted — deliberately NOT a host NSEC. The
-/// instance name is owned by exactly one service (a duplicate instance name is
-/// a §9 conflict that triggers a rename), so `{SRV, TXT}` is provably the
-/// complete RRset and the negative is always accurate. The HOST name, by
-/// contrast, can be shared by several local services that advertise DIFFERENT
-/// address families (e.g. one IPv4-only, one IPv6-only — see the shared-host
-/// goodbye logic). This per-service encoder sees only its own `ServiceRecords`,
-/// so it cannot prove the host's complete address-family set; emitting a
-/// cache-flushed host NSEC from that partial view could publish a false
-/// negative (deny AAAA while a sibling actually owns it). Proving host
-/// completeness needs endpoint-wide union state the proto layer does not have,
-/// so the host NSEC is omitted rather than risk an inaccurate authoritative
-/// denial.
+/// WHAT it asserts is [`emitted_nsec_types`], the one home of that rule. This
+/// function only encodes the answer, so it cannot disagree with the recognition
+/// side about what our own NSEC says.
 ///
-/// Best-effort: the NSEC is an optional hint, so if it does not fit
-/// the remaining buffer the builder is rolled back to before it and the
-/// positive answers already written are sent unchanged — adding the hint must
-/// never turn a deliverable response into a dropped one.
+/// Only the instance NSEC is ever emitted, never a host NSEC: `write_probe`
+/// claims the instance name with an rrtype-ANY probe and §9 renames a duplicate,
+/// whereas a host name is never probed and may legitimately be shared. Where the
+/// two names COINCIDE the instance NSEC IS a host NSEC, and its bitmap names the
+/// address records this record set puts at that name — read
+/// [`emitted_nsec_types`] for what that bitmap can and cannot vouch for.
+///
+/// Best-effort: it rides the Additional section, so if it does not fit the
+/// remaining buffer the builder is rolled back to before it and the positive
+/// answers already written are sent unchanged — adding the record must never
+/// turn a deliverable response into a dropped one.
 ///
 /// Returns whether the NSEC actually made it into the message. The rollback is
-/// why that answer must be reported rather than assumed: exposure tracking asks
-/// "did this record reach the wire", and a rolled-back hint did not. See
+/// why that answer must be REPORTED rather than assumed: exposure tracking asks
+/// "did this record reach the wire", and a rolled-back record did not. See
 /// [`EmittedRecords::nsec`].
 fn push_service_nsec<const COMP_N: usize>(
   b: &mut MessageBuilder<'_, COMP_N>,
   records: &ServiceRecords,
 ) -> bool {
+  let types = emitted_nsec_types(records);
   let checkpoint = b.checkpoint();
   if b
-    .push_nsec_additional(
-      records.instance(),
-      records.ttl_secs(),
-      &INSTANCE_NSEC_TYPES,
-      true,
-    )
+    .push_nsec_additional(records.instance(), records.ttl_secs(), &types, true)
     .is_err()
   {
     b.restore(checkpoint);
@@ -233,15 +226,100 @@ fn push_service_nsec<const COMP_N: usize>(
   true
 }
 
-/// The exact RRset an instance NSEC asserts, in ONE place because two sides
-/// read it: [`push_service_nsec`] encodes it onto the wire, and
-/// [`our_nsec_identities`] reconstructs the same bytes to recognise our own NSEC
-/// coming back. A peer that publishes a byte-identical instance —
-/// a proxy or a fault-tolerance twin, the case RFC 6762 §9 names — sends this
-/// record too, and "identical rdata is never a conflict" has to cover it or a
-/// twin's NSEC alone renames us.
+/// The types a service instance name owns IN ITS OWN RIGHT: `{SRV, TXT}`
+/// (RFC 6763 §4).
+///
+/// The SEED of [`instance_rrset_types`], and only that. An instance name does
+/// not always hold just these two, so nothing may treat this constant as the
+/// answer to "what is at that name" — ask [`instance_rrset_types`] for what this
+/// record set puts there, and [`emitted_nsec_types`] for how far that may be
+/// asserted.
 pub(crate) const INSTANCE_NSEC_TYPES: [u16; 2] =
   [ResourceType::Srv.to_u16(), ResourceType::Txt.to_u16()];
+
+/// Every RRTYPE THIS RECORD SET puts at its INSTANCE name — this record set's
+/// view of that name, which is not the same thing as the name's contents; see
+/// [`emitted_nsec_types`] for the limits of what it may be used to assert.
+///
+/// [`INSTANCE_NSEC_TYPES`] — plus A and/or AAAA when the HOST name IS the
+/// instance name and the corresponding address slice is non-empty, because then
+/// [`write_announce`] emits those address records at this very name (it writes
+/// them at `records.host()`, and the two names are one).
+///
+/// ONE home for that union, because two sides read it and they used to keep a
+/// copy each: emission reaches it through [`emitted_nsec_types`] and recognition
+/// through [`our_nsec_identities`]. While they were separate, the emitted NSEC
+/// asserted `{SRV, TXT}` at a name the same datagram was putting addresses at —
+/// a §6.1 negative answer denying records its own announcement carried.
+fn instance_rrset_types(records: &ServiceRecords) -> std::vec::Vec<u16> {
+  let mut types: std::vec::Vec<u16> = INSTANCE_NSEC_TYPES.to_vec();
+  if records.instance().same_owner(records.host()) {
+    if !records.a_addrs_slice().is_empty() {
+      types.push(ResourceType::A.to_u16());
+    }
+    if !records.aaaa_addrs_slice().is_empty() {
+      types.push(ResourceType::AAAA.to_u16());
+    }
+  }
+  types
+}
+
+/// The RFC 6762 §6.1 type bitmap this crate asserts at `records`' instance name:
+/// [`instance_rrset_types`], every time.
+///
+/// # What one record set can vouch for, and what it cannot
+///
+/// The bitmap is what THIS RECORD SET publishes at that name, and that is the
+/// whole of its warrant. It is NOT a statement that the name holds nothing else
+/// on the link, because a `ServiceRecords` cannot see another route's records
+/// and the endpoint admits routes that can publish at this very name:
+///
+/// * a sibling sharing the HOST name, which `Endpoint::host_addresses_disagree`
+///   admits whenever the two publish disjoint address families — where that host
+///   name is also this instance name, the sibling's family is denied here
+///   (#147);
+/// * a route whose HOST name is this INSTANCE name: registration compares
+///   instance names to instance names and host names to host names, and never
+///   across the two roles (#147);
+/// * a PTR record at an instance name, which this bitmap never names — the
+///   DNS-SD meta PTR, or another route's service-type or subtype name (#145);
+/// * an NSEC outliving the owner that emitted it (#146).
+///
+/// What this bitmap DOES buy is the filed defect and only it: the §6.1 negative
+/// answer no longer denies records the SAME record set publishes at that name. A
+/// fixed `{SRV, TXT}` denied the A and AAAA records sitting in its own datagram
+/// every time the host name was the instance name — cache-flush bit set, so a
+/// querier stopped asking for addresses it had just been handed. The cross-route
+/// cases above are left to the endpoint-wide owner state the proto layer is not
+/// handed; #144 through #147 all wait on it. A reader must not take this bitmap
+/// as authoritative for the whole link.
+///
+/// # Why the answer is not to withhold the record
+///
+/// Because withholding removes a real negative response rather than a
+/// decoration. `endpoint::route` matches a question against a route's own unique
+/// names and, with answering enabled, routes it on THE NAME ALONE — there is no
+/// qtype filter. A query for an ABSENT type at an owned name therefore reaches
+/// the service, [`write_announce_filtered`] answers it with the record set, and
+/// the NSEC riding along is the only thing that tells the querier the type it
+/// asked for is not there. §6.1 asks a responder to *"respond asserting the
+/// nonexistence of that record using a DNS NSEC record"* and says nothing about
+/// which section carries it.
+///
+/// Withholding does not reach the residuals it would be traded for, either. They
+/// turn on what a SECOND route publishes, and
+/// `records.instance().same_owner(records.host())` — the only test one record
+/// set can run — cannot see one: the route whose HOST name is our INSTANCE name
+/// is invisible to that test, at a name this encoder writes at either way. So
+/// withholding suppresses accurate negatives where nothing is shared, and leaves
+/// the cross-route false negatives standing.
+///
+/// Of the two bitmaps available at a shared name, this is also the narrower
+/// denial: `{SRV, TXT, A}` denies one address family where `{SRV, TXT}` denied
+/// both.
+pub(crate) fn emitted_nsec_types(records: &ServiceRecords) -> std::vec::Vec<u16> {
+  instance_rrset_types(records)
+}
 
 /// The RFC 4034 §4.1.2 type-bitmap bytes for `present_types`, appended to `out`.
 ///
@@ -281,7 +359,7 @@ fn write_nsec_type_bitmap(present_types: &[u16], out: &mut std::vec::Vec<u8>) {
 /// for a peer's record: `next_name` — the owner name itself (§6.1) — in
 /// case-folded wire form, then the RFC 4034 §4.1.2 type bitmap.
 ///
-/// # Why a SET, when we emit exactly one
+/// # Why a SET, when we emit at most one
 ///
 /// RFC 6762 §9's "resource records with identical rdata are never considered
 /// inconsistent" exists for "proxies and other fault-tolerance mechanisms",
@@ -292,35 +370,27 @@ fn write_nsec_type_bitmap(present_types: &[u16], out: &mut std::vec::Vec<u8>) {
 /// They differ in exactly one configuration. When the host name IS the instance
 /// name, this service publishes its A/AAAA records at the instance name too (see
 /// `write_probe` and `proposal::our_proposal`, which counts them for the same
-/// reason), so the complete RRset at that name is `{SRV, TXT, A, AAAA}` and a
-/// conforming responder's NSEC says so. Ours says `{SRV, TXT}` — a false
-/// negative, denying address records we ourselves emit. That defect is in NSEC
-/// GENERATION, it predates this branch, and it is filed against `main` rather
-/// than patched here; fixing it changes what goes on the wire for every
-/// same-name deployment and belongs in its own change.
+/// reason), so [`instance_rrset_types`] is wider than `{SRV, TXT}` there — and
+/// the wider set is the one [`push_service_nsec`] writes.
 ///
-/// Its consequence on the CONFLICT side does not get to wait, because it is a
-/// rename: without the second form, a correct twin's correct bitmap reads as
-/// inconsistent rdata at a name we are probing, which is an RFC 6762 §8.1
-/// defeat. So this recognises both what we emit and what a conforming responder
-/// emits, and the two coincide — one entry — in every configuration where the
-/// host is a separate name.
+/// RECOGNITION MAY NOT FOLLOW EMISSION. An NSEC arriving at a name we are
+/// probing is adjudicated whether or not we would have written that exact
+/// bitmap, so both spellings must read as identical rdata — otherwise a twin's
+/// record is inconsistent rdata at a name we are probing, which is an RFC 6762
+/// §8.1 defeat. Both are kept for that reason: the bare `{SRV, TXT}` is what a
+/// twin treating the name as an ordinary instance name sends, the wider set is
+/// what one that notices the addresses sends, and neither is a conflict. The two
+/// coincide — one entry — in every configuration where the host is a separate
+/// name.
+///
+/// LENIENCE IS THE SAFE DIRECTION HERE, and the opposite of what HISTORY may
+/// claim about the same rrtype: see [`transmitted_rdata_forms`].
 pub(crate) fn our_nsec_identities(records: &ServiceRecords) -> std::vec::Vec<std::vec::Vec<u8>> {
   let mut forms = std::vec::Vec::new();
-  forms.push(emitted_nsec_identity(records));
-
-  if records.instance().same_owner(records.host()) {
-    let mut conforming: std::vec::Vec<u16> = INSTANCE_NSEC_TYPES.to_vec();
-    if !records.a_addrs_slice().is_empty() {
-      conforming.push(ResourceType::A.to_u16());
-    }
-    if !records.aaaa_addrs_slice().is_empty() {
-      conforming.push(ResourceType::AAAA.to_u16());
-    }
-    let conforming = nsec_identity(records, &conforming);
-    if !forms.contains(&conforming) {
-      forms.push(conforming);
-    }
+  forms.push(nsec_identity(records, &INSTANCE_NSEC_TYPES));
+  let published = nsec_identity(records, &instance_rrset_types(records));
+  if !forms.contains(&published) {
+    forms.push(published);
   }
   forms
 }
@@ -338,12 +408,14 @@ fn nsec_identity(records: &ServiceRecords, types: &[u16]) -> std::vec::Vec<u8> {
 /// form [`push_service_nsec`] writes, and the only NSEC bytes any echo of ours
 /// can carry.
 ///
-/// It is the first entry of [`our_nsec_identities`] BY CONSTRUCTION rather than
-/// by coincidence, which is the whole point of naming it: the two callers want
-/// opposite things from that list and only one of them may have the whole of it.
-/// See [`transmitted_rdata_forms`].
+/// It agrees with the encoder BY CONSTRUCTION rather than by coincidence, which
+/// is the whole point of naming it: both read [`emitted_nsec_types`], so neither
+/// can drift from the bitmap the other means. It is also an entry of
+/// [`our_nsec_identities`] — the two callers want opposite things from that list
+/// and only one of them may have the whole of it. See
+/// [`transmitted_rdata_forms`].
 pub(crate) fn emitted_nsec_identity(records: &ServiceRecords) -> std::vec::Vec<u8> {
-  nsec_identity(records, &INSTANCE_NSEC_TYPES)
+  nsec_identity(records, &emitted_nsec_types(records))
 }
 
 /// The canonical rdata forms `records` ACTUALLY TRANSMITS at its instance name
@@ -371,8 +443,10 @@ pub(crate) fn emitted_nsec_identity(records: &ServiceRecords) -> std::vec::Vec<u
 /// SRV and TXT DELEGATE, because each yields exactly one form there and that
 /// form IS the encoded one — `push_srv_answer` and `push_txt_answer` write the
 /// same bytes [`canonical_rdata_forms`] builds, which is what makes the §8.2
-/// byte-symmetry invariant hold. NSEC is the one rtype whose classifier list is
-/// strictly wider than what the encoder emits.
+/// byte-symmetry invariant hold. NSEC is the one rtype whose classifier list can
+/// be WIDER than what the encoder emits: where the instance name is also the
+/// host name it also accepts a twin's bare `{SRV, TXT}` spelling, which this
+/// crate does not write there, so history keeps the emitted bitmap alone.
 ///
 /// A type absent from every arm yields NOTHING, and that is the direction to
 /// fail in: retaining too little re-opens a stale echo for the identities
@@ -788,7 +862,7 @@ pub(crate) struct EmittedRecords {
   /// Tracked rather than derived, because the three encoders differ: an
   /// announcement always carries it, a §7.1-filtered response carries it only
   /// when some positive answer survived, a §6.7 legacy unicast reply never
-  /// carries it — and [`push_service_nsec`] can roll it back when the buffer is
+  /// carries it — and [`push_service_nsec`] rolls it back when the buffer is
   /// full. It is not a goodbye-able record (a §10.1 goodbye emits no NSEC), so
   /// it is deliberately outside [`Self::is_empty`] and
   /// `GoodbyeOwnership::any_instance`; what reads it is the endpoint's

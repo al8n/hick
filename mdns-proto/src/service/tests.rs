@@ -11291,6 +11291,119 @@ fn our_nsec_identities_match_what_the_builder_emits() {
   );
 }
 
+/// A QUERY FOR AN ABSENT TYPE IS ANSWERED, AND THE §6.1 NSEC IS THE ANSWER.
+///
+/// The negative response is not a decoration that only ever rides an
+/// announcement nobody asked for. `endpoint::route` matches a question against a
+/// route's own unique names and, with answering enabled, routes it ON THE NAME
+/// ALONE — there is no qtype filter — and the response cycle below queues a
+/// reply for any qtype. So a querier asking an owned name for a type that is not
+/// there reaches this responder, and the NSEC riding the reply is the only thing
+/// that tells it so. Withholding the record turns that into silence and a
+/// retransmission timeout.
+///
+/// Run at the name RFC 6762 §6.1's defect lived at — instance name IS host name,
+/// where the emitted bitmap now names the address families this record set
+/// publishes rather than denying them.
+#[test]
+fn a_query_for_an_absent_type_at_an_instance_host_name_is_answered_with_an_nsec() {
+  use crate::{
+    event::ServiceQuestion,
+    wire::{MessageReader, QuestionRef, ResourceType},
+  };
+  let name = Name::try_from_str("myprinter._ipp._tcp.local.").unwrap();
+  let mut records = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    name.clone(),
+    name.clone(),
+    631,
+    120,
+  );
+  records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::try_new(
+      ServiceHandle::from_raw(0),
+      records,
+      FakeInstant::zero(),
+      [0u8; 32],
+      true,  // probe
+      false, // re-announce
+    );
+
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+  for _ in 0..30 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_delivery(now, TransmitDelivery::ALL);
+    }
+    if svc.state() == ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "the fixture must reach the state that answers questions"
+  );
+  now = now.advance(500);
+  svc.handle_timeout(now).unwrap();
+  assert!(
+    svc.poll_transmit(now, &mut buf).unwrap().is_none(),
+    "the fixture must be silent before the question, or the NSEC found below \
+     could be an announcement's rather than the reply's"
+  );
+
+  // HINFO at the instance name: a type this responder holds no record of, and
+  // one no encoder here ever writes.
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in name.as_str().trim_end_matches('.').split('.') {
+    qbuf.push(u8::try_from(label.len()).unwrap());
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8);
+  qbuf.extend_from_slice(&ResourceType::Hinfo.to_u16().to_be_bytes());
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  let src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
+    now,
+  );
+  now = now.advance(200);
+  svc.handle_timeout(now).unwrap();
+  let tx = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("a question at an owned name is answered whatever its qtype");
+  let reader = MessageReader::try_parse(buf.get(..tx.size()).unwrap()).unwrap();
+
+  let nsec = reader
+    .additional()
+    .flatten()
+    .find(|rr| rr.rtype() == ResourceType::Nsec)
+    .expect("the §6.1 negative answer must ride the reply");
+  assert_eq!(
+    &*nsec.canonical_rdata_folded().unwrap(),
+    respond::emitted_nsec_identity(svc.records()).as_slice(),
+    "the negative answer must be the bitmap this record set publishes at that \
+     name"
+  );
+  assert!(
+    respond::emitted_nsec_types(svc.records()).contains(&ResourceType::A.to_u16()),
+    "the reply carries an A record at this very name, so the bitmap riding \
+     beside it must name A rather than deny it"
+  );
+  assert!(
+    reader
+      .answers()
+      .flatten()
+      .any(|rr| rr.rtype() == ResourceType::A),
+    "the same datagram really does assert the A record the bitmap names"
+  );
+}
+
 // ── the reader property the fold relies on ──
 
 /// The reader property the fold depends on, pinned rather than asserted in a

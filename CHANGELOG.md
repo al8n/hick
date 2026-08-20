@@ -1,5 +1,59 @@
 # UNRELEASED
 
+## The §6.1 NSEC no longer denies address records the same announcement carries
+
+- `mdns-proto`: **wire-visible.** Where a service's instance name IS its host
+  name — supported, and what `Endpoint::host_addresses_disagree` is written to
+  keep legal — both positive multicast encoders put the A and AAAA records at
+  that name *and* an RFC 6762 §6.1 NSEC at that same owner asserting `{SRV,
+  TXT}`. The negative answer denied, with the cache-flush bit set, records the
+  very same datagram was handing over: a querier that believed it would not ask
+  again for those addresses until the negative cache entry expired. The bitmap
+  now names each address family the record set publishes at that name — `{SRV,
+  TXT, A}`, `{SRV, TXT, AAAA}` or `{SRV, TXT, A, AAAA}` as configured. Nothing
+  changes on the wire for a service whose host name is a name of its own, which
+  is every other deployment: `{SRV, TXT}` exactly, as before.
+- `mdns-proto`: **no completeness claim is made for that bitmap, and none should
+  be read into it.** It is what ONE `ServiceRecords` publishes at that name, and
+  a second route on the same endpoint can publish there without its knowing.
+  Registration compares instance names to instance names and host names to host
+  names and never across the two roles, and `Endpoint::host_addresses_disagree`
+  deliberately admits a sibling sharing a host name whenever the two publish
+  disjoint address families — so a sibling's AAAA at a name where this record set
+  has only A is still denied. What the change buys is the filed defect and only
+  it: the §6.1 negative no longer denies records the SAME record set publishes at
+  that name. It is also the narrower denial of the two bitmaps available at a
+  shared name, since `{SRV, TXT, A}` denies one address family where `{SRV, TXT}`
+  denied both. The cross-route cases need endpoint-wide owner state the proto
+  layer is not handed, and are tracked separately: a sibling or a cross-role
+  route publishing at this name (#147), a PTR at an instance name (#145), and an
+  NSEC outliving the owner that emitted it (#146).
+- `mdns-proto`: **not withheld**, because the record is a real negative response
+  rather than a decoration. `endpoint::route` matches a question against a
+  route's own unique names and, with answering enabled, routes it on the name
+  alone — there is no qtype filter — and the response cycle queues a reply for
+  any qtype. A query for an ABSENT type at an owned name therefore reaches the
+  responder, and the NSEC riding that reply is the only thing telling the querier
+  the type is not there; withholding it leaves silence and a retransmission
+  timeout. Withholding would also not reach the cross-route cases it would be
+  traded for: `instance == host` is the only test one record set can run, and it
+  cannot see a second route whose HOST name is our INSTANCE name — a name this
+  encoder writes at either way.
+- `mdns-proto`: the emitted bitmap and the locally recognised one now derive
+  from **one** function. `respond::instance_rrset_types` is the single statement
+  of what a record set puts at its instance name, and
+  `respond::emitted_nsec_types` is what the §6.1 record asserts there. Emission,
+  the `emitted_nsec_identity` the endpoint's relinquished-RRset screen retains,
+  and `our_nsec_identities` all read it, so the emitted identity can no longer
+  disagree with the recognised one. Recognition stays deliberately **wider** than
+  emission: an NSEC arriving at a name we are probing is adjudicated whether or
+  not we would have written that exact bitmap, so an RFC 6762 §9 twin's bare
+  `{SRV, TXT}` at a name that also holds addresses still counts as identical
+  rdata — narrowing that would let a twin win §8.1 against us. History narrows in
+  step with emission instead: `transmitted_rdata_forms` names the one bitmap the
+  encoder wrote and no other, which is the direction that cannot suppress a
+  genuine peer's conflict.
+
 ## A persistent same-name peer no longer drives one record set's rename loop unthrottled
 
 - `mdns-proto`: a `Service` now applies RFC 6762 §8.1's flood limit — "if
@@ -222,11 +276,18 @@
   unimplemented and a `Service` exposes no records mutator, a duplicate instance
   name and a name a collision goodbye still holds are both refused, and a live
   route publishing the same host name with a different A or AAAA set makes the
-  registration fail outright. The negative assertions are covered too — the
-  encoder emits exactly one §6.1 NSEC per service, owned by the INSTANCE name, so
-  no sibling registration can flip a host-name NSEC's truth. Nothing this
-  endpoint had asserted changed truth-value there, so the advance asserted
-  something false about its own records. With a superseded credit now a standing
+  registration fail outright. The negative assertions are covered too, though
+  more narrowly than this entry once claimed: the encoder emits exactly one §6.1
+  NSEC per service, owned by the INSTANCE name, and a registration changes
+  neither the bytes an existing route has asserted nor the record set those
+  bytes describe. Whether such a bitmap is still ACCURATE for the whole link is a
+  separate question, and a registration CAN change that answer — nothing stops a
+  new route taking an existing instance name as its HOST name, because the guards
+  compare instance to instance and host to host and never across the two roles
+  (#147). Accuracy is not what the self-send generation tracks, though: it tracks
+  whether these bytes are still what this endpoint publishes, and they are.
+  Nothing this endpoint had asserted stopped being its own, so the advance
+  asserted something false about its own records. With a superseded credit now a standing
   tombstone, that falsehood was expensive rather than free: one unrelated
   registration denied §10 observation and §7.1/§7.3 quieting to EVERY
   byte-identical copy of a live service's own bytes for the whole recency
