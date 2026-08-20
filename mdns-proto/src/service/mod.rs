@@ -89,6 +89,10 @@ cfg_heap! {
   /// whatever sent it back. A §9 revert therefore meets both — this interval
   /// decides whether the revert happens, and [`CONFLICT_BACKOFF_MIN_WAIT`]
   /// floors the probe deadline that the revert, once allowed, arms.
+  ///
+  /// Both are scoped to ONE RECORD SET, which is the right scope for this rule —
+  /// §9's reset is about a specific conflicted record — and is short of the
+  /// scope §8.1's is stated at. [`CONFLICT_BURST_LEN`] states that shortfall.
   const CONFLICT_REPROBE_MIN_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
 
   /// How many conflicts RFC 6762 §8.1 counts before its flood limit applies:
@@ -103,16 +107,44 @@ cfg_heap! {
   /// them means anything alone. What is counted is CONFLICTS — not renames and
   /// not probes — so the count spans renames and probe restarts, which is what
   /// makes it a limit on the rename loop rather than a counter that loop resets.
+  ///
+  /// # Scope: this counter is PER RECORD SET; §8.1 obliges the HOST
+  ///
+  /// The ring lives on one [`Service`], so what it bounds is the restarts of one
+  /// record set. That is narrower than the sentence quoted above, and the
+  /// difference is not academic — three ways past it are known:
+  ///
+  /// * conflicts are not aggregated across record sets. Fifteen entries spaced
+  ///   `d` apart span `14·d`, so a service whose restarts are slower than
+  ///   10/14 ≈ 0.714 s never latches at all, and N services contending at that
+  ///   rate put N × 1.4 restarts per second on the link between them;
+  /// * a freshly registered service starts with an empty ring, and is not slowed
+  ///   by another service's backoff already being in force;
+  /// * the history dies with the `Service`. A `HostConflict` is TERMINAL and is
+  ///   surfaced for the caller to intervene, and the usual intervention —
+  ///   unregister, then re-register under a new host name — hands the
+  ///   replacement a clean ring. A loop closed through the driver layer that way
+  ///   evades even the per-record-set latch.
+  ///
+  /// Closing this means moving the ring up to the `Endpoint` and sharing only
+  /// the verdict, which is tracked as issue #140. That would make the limit
+  /// ENDPOINT-wide — still not host-wide, because a second `Endpoint`, or a
+  /// second process, on the same machine is beyond anything this library can
+  /// observe.
   const CONFLICT_BURST_LEN: usize = 15;
 
   /// The period [`CONFLICT_BURST_LEN`] conflicts must fall inside for §8.1's
   /// flood limit to apply — and, once it applies, the span of total quiet that
-  /// releases it again.
+  /// releases it again. Measured over ONE record set's conflicts; see
+  /// [`CONFLICT_BURST_LEN`] for what that scope leaves open.
   const CONFLICT_BURST_WINDOW: core::time::Duration = core::time::Duration::from_secs(10);
 
   /// The floor §8.1 puts under the start of each successive probe sequence once
   /// [`CONFLICT_BURST_LEN`] conflicts have fallen inside one
   /// [`CONFLICT_BURST_WINDOW`]: "the host MUST wait at least five seconds".
+  ///
+  /// Imposed on the record set that counted them, not on the host — see
+  /// [`CONFLICT_BURST_LEN`].
   const CONFLICT_BACKOFF_MIN_WAIT: core::time::Duration = core::time::Duration::from_secs(5);
 }
 
@@ -1208,21 +1240,27 @@ cfg_heap! {
   /// instant of the last conflict-driven revert-to-probe, used to
   /// rate-limit RFC 6762 §9 re-probing under a conflict flood.
   last_conflict_reprobe: Option<I>,
-  /// The instants of the last [`CONFLICT_BURST_LEN`] conflicts that sent this
-  /// service back through RFC 6762 §8's startup steps, written round-robin at
-  /// `conflict_burst_slot`.
+  /// The instants of the last [`CONFLICT_BURST_LEN`] conflicts that sent THIS
+  /// SERVICE — this one record set — back through RFC 6762 §8's startup steps,
+  /// written round-robin at `conflict_burst_slot`.
   ///
   /// A fixed array and not a growing list, because the question it answers needs
   /// no more: §8.1 asks whether the FIFTEENTH-most-recent conflict is within
   /// [`CONFLICT_BURST_WINDOW`] of now, and a sixteenth timestamp cannot change
   /// that answer.
+  ///
+  /// Per record set is narrower than the host scope §8.1 states, and this ring
+  /// also dies with the `Service` that holds it. [`CONFLICT_BURST_LEN`] states
+  /// both gaps and names the issue that closes them.
   conflict_burst: [Option<I>; CONFLICT_BURST_LEN],
   /// Next slot to write in `conflict_burst` (wraps at [`CONFLICT_BURST_LEN`]).
   /// Once the ring has filled, that same slot holds its OLDEST entry — the
   /// fifteenth-most-recent conflict, which is the one §8.1's test reads.
   conflict_burst_slot: usize,
-  /// RFC 6762 §8.1's flood limit is in force: "the host MUST wait at least five
-  /// seconds before each successive additional probe attempt".
+  /// RFC 6762 §8.1's flood limit is in force FOR THIS RECORD SET: "the host MUST
+  /// wait at least five seconds before each successive additional probe
+  /// attempt". Per record set is narrower than the obligation that sentence
+  /// states — see [`CONFLICT_BURST_LEN`].
   ///
   /// LATCHED rather than recomputed per probe, and that is the whole point. Once
   /// the limit spaces probes five seconds apart, conflicts can only arrive that
@@ -2709,7 +2747,9 @@ where
   /// It is also where RFC 6762 §8.1's flood limit is applied, for the same
   /// reason: all three rules are conflict-driven probe attempts, this is where
   /// each one gets its start time, and a fourth added later inherits the limit
-  /// without knowing it exists. See [`Service::note_conflict`].
+  /// without knowing it exists. See [`Service::note_conflict`], and
+  /// [`CONFLICT_BURST_LEN`] for why that limit is currently narrower than §8.1
+  /// states it.
   ///
   /// What every caller passes, and nothing else:
   ///
@@ -2777,12 +2817,13 @@ where
     // so a §6.7 reply queued while announcing would otherwise put the full
     // positive-TTL record set on the wire during the regress.
     self.clear_response_cycle_state();
-    // RFC 6762 §8.1's flood limit: "If fifteen conflicts occur within any
-    // ten-second period, then the host MUST wait at least five seconds before
-    // each successive additional probe attempt." The caller's schedule is a
-    // FLOOR away from, never a ceiling on, what it asked for — §8.2's one-second
-    // deferral is still owed in full, it is simply not enough on its own once
-    // the limit is in force.
+    // RFC 6762 §8.1's flood limit, over THIS RECORD SET's conflicts rather than
+    // the host's (`CONFLICT_BURST_LEN` states the shortfall): "If fifteen
+    // conflicts occur within any ten-second period, then the host MUST wait at
+    // least five seconds before each successive additional probe attempt." The
+    // caller's schedule is a FLOOR away from, never a ceiling on, what it asked
+    // for — §8.2's one-second deferral is still owed in full, it is simply not
+    // enough on its own once the limit is in force.
     self.lifecycle_deadline = if self.note_conflict(now) {
       match (deadline, now.checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)) {
         (Some(d), Some(floor)) => Some(d.max(floor)),
@@ -2802,12 +2843,17 @@ where
     self.assert_generation_replaced();
   }
 
-  /// Fold one conflict into RFC 6762 §8.1's flood test, and report whether its
-  /// five-second floor is now in force.
+  /// Fold one conflict into RFC 6762 §8.1's flood test FOR THIS RECORD SET, and
+  /// report whether its five-second floor is now in force.
   ///
   /// > If fifteen conflicts occur within any ten-second period, then the host
   /// > MUST wait at least five seconds before each successive additional probe
   /// > attempt.
+  ///
+  /// That sentence obliges the HOST, and this counter covers one record set.
+  /// [`CONFLICT_BURST_LEN`] states the shortfall — no aggregation across record
+  /// sets, and no history across a `Service`'s lifetime — and names the issue
+  /// that closes it.
   ///
   /// Called from [`Service::restart_probe_cycle`] and therefore counting exactly
   /// the conflicts that put a fresh probe sequence on the wire — §9's revert,

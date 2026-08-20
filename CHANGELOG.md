@@ -1,15 +1,15 @@
 # UNRELEASED
 
-## A persistent same-name peer can no longer drive an unthrottled rename loop
+## A persistent same-name peer no longer drives one record set's rename loop unthrottled
 
 - `mdns-proto`: a `Service` now applies RFC 6762 §8.1's flood limit — "if
   fifteen conflicts occur within any ten-second period, then the host MUST wait
-  at least five seconds before each successive additional probe attempt". Every
-  conflict-driven probe sequence was scheduled with §8.1's ordinary 0-250 ms
-  *startup* delay however many renames had already happened, so a peer that
-  defends each name the service renames itself to — hostile, or merely a
-  misconfigured twin — drove an unbounded rename → announce → probe loop, each
-  turn putting packets on the link. The count is of CONFLICTS, which is what
+  at least five seconds before each successive additional probe attempt" — **to
+  its own record set**. Every conflict-driven probe sequence was scheduled with
+  §8.1's ordinary 0-250 ms *startup* delay however many renames had already
+  happened, so a peer that defends each name the service renames itself to —
+  hostile, or merely a misconfigured twin — drove an unbounded rename → announce
+  → probe loop, each turn putting packets on the link. The count is of CONFLICTS, which is what
   §8.1 counts, so it deliberately spans renames and probe restarts: resetting it
   on a rename would reset it on the very event being throttled. It is kept in a
   fixed ring of fifteen instants — the condition is exactly "is the
@@ -26,6 +26,23 @@
   and is unchanged: it still bounds how often an established name may be sent
   back to probing at all, and a conflict it drops re-probes nothing and is
   counted by neither rule.
+- `mdns-proto`: **the scope of that limit is per record set, and §8.1 states its
+  obligation on the host.** The counter lives on one `Service`, so what it bounds
+  is one record set's restarts, and three ways past it are known and remain open.
+  Conflicts are not aggregated across record sets: fifteen entries spaced `d`
+  apart span `14·d`, so a service whose restarts are slower than 10/14 ≈ 0.714 s
+  never latches at all, and N services contending at that rate put N × 1.4
+  restarts per second on the link between them. A freshly registered service
+  starts with an empty ring and is not slowed by another service's backoff
+  already being in force. And the history dies with the `Service`: a
+  `HostConflict` is terminal and is surfaced for the caller to intervene, and the
+  usual intervention — unregister, then re-register under a new host name — hands
+  the replacement a clean ring, so a loop closed through the driver layer evades
+  even the per-record-set latch. Aggregating the ring at the `Endpoint` and
+  sharing only the verdict is tracked as **#140**; that will make the limit
+  endpoint-wide, which is still not host-wide, because a second `Endpoint`, or a
+  second process, on the same machine is beyond anything this library can
+  observe.
 
 ## A relinquished record set can no longer retire its own replacement
 
