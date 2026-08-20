@@ -1081,9 +1081,16 @@ cfg_heap! {
   rng: Rng,
   pending_tx: TQ,
   pending_updates: EV,
-  /// Most-recently-seen `now`, cached for use by `poll_transmit`'s KAS
-  /// filtering closure. Updated by both `handle_timeout` and `handle_event`
-  /// (`handle_event` now takes `now` directly).
+  /// Most-recently-seen `now`, kept for [`Self::poll_timeout`] — the one
+  /// clock-sensitive method with no `now` of its own. It answers "due
+  /// immediately" by naming an instant in the past, and this is the only
+  /// instant it has. Set at construction and refreshed by `handle_timeout` and
+  /// `handle_event`.
+  ///
+  /// It is NOT a clock for anything that receives one. A method given `now`
+  /// reads its parameter: this field only tracks the last call that happened to
+  /// carry an instant, and a caller may poll any number of times in between, so
+  /// it is a lower bound on the real time and never the real time.
   last_now: Option<I>,
   /// Ring buffer of observed known-answer hints (RFC 6762 §7.1).
   kas_hints: [Option<KasHint<I>>; KAS_RING_SIZE],
@@ -3465,9 +3472,10 @@ where
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
     self.assert_no_live_commit_token("Service::handle_event");
-    // always refresh last_now so that subsequent calls (e.g.
-    // Question→response_deadline, KnownAnswer→expiry) use a current reference
-    // even when handle_timeout has not recently fired.
+    // Refresh the instant `poll_timeout` reports as "due immediately" — an
+    // event can make a service due (a Question arms `response_deadline`) with
+    // no `handle_timeout` between it and the next `poll_timeout`. The arms
+    // below read this method's `now`, not this field.
     self.last_now = Some(now);
     trace!(
       target: "mdns_proto::service",
@@ -3956,10 +3964,6 @@ where
           return;
         }
 
-        // Item 5: store the KAS hint with expiration based on the record's TTL.
-        // `now` is available directly (parameter).
-        let last_now = now;
-
         // RFC 6762 §7.1 half-TTL rule: a known-answer MUST NOT suppress our
         // record if the querier's remaining TTL is less than half of our
         // authoritative TTL — their cache is about to expire, so suppressing
@@ -3971,8 +3975,10 @@ where
           return;
         }
 
+        // The hint expires on the arriving record's own TTL, counted from the
+        // instant this event carries.
         let ttl = core::time::Duration::from_secs(u64::from(ka.record().ttl()));
-        let expires_at = match last_now.checked_add_duration(ttl) {
+        let expires_at = match now.checked_add_duration(ttl) {
           Some(t) => t,
           None => return,
         };
@@ -4123,9 +4129,8 @@ where
     #[cfg(feature = "tracing")]
     let _span = hick_trace::trace_span!("service", handle = self.handle.raw()).entered();
     self.assert_no_live_commit_token("Service::handle_timeout");
-    // Cache latest `now` for use by poll_transmit's KAS filtering closure.
-    // handle_event now receives `now` directly, so this is only needed
-    // for the filtering closure in poll_transmit.
+    // Refresh the instant `poll_timeout` reports as "due immediately"; every
+    // other clock-sensitive path is handed a `now` of its own and reads that.
     self.last_now = Some(now);
 
     // Item 5: prune expired KAS hints.
@@ -4837,26 +4842,30 @@ where
         // path where peer B's hint suppresses peer A's answer.
         let single_questioner = self.questioner_srcs.len() <= 1;
         let hints = self.kas_hints;
-        let last_now = self.last_now;
         let (encoded, emitted) =
           respond::write_announce_filtered(&self.records, buf, |rtype, rdata| {
             if !single_questioner {
               return false;
             }
             let h = hash_rdata(rdata);
-            let now_ref = match last_now {
-              Some(t) => t,
-              None => return false,
-            };
+            // Expiry is judged against THIS call's `now`, never a cached one. A
+            // hint suppresses on the claim that the querier still holds the
+            // record, and that claim expires on the clock the caller is holding:
+            // a conforming Sans-I/O caller may queue a response and poll it with
+            // no `handle_event` or `handle_timeout` in between, so any cached
+            // instant can sit arbitrarily far behind the real one and keep an
+            // expired hint alive. Over-suppression is the terminal direction —
+            // §7.1 licenses withholding only a record the querier still has, and
+            // nobody else will send this one — so the parameter is the only
+            // admissible reading.
+            //
             // A hint may only suppress the RRset it actually names, and a stored
             // hint was already bound to the owner name its rtype sits at — see
             // `respond::emitted_owner_name`, which is what admitted it. So
             // matching the rtype here IS matching the owner, and there is no
             // second classification left to disagree with the first.
             let suppressed = hints.iter().any(|slot| match slot {
-              Some(hint) => {
-                hint.rtype == rtype && hint.rdata_hash == h && hint.expires_at > now_ref
-              }
+              Some(hint) => hint.rtype == rtype && hint.rdata_hash == h && hint.expires_at > now,
               None => false,
             });
             #[cfg(feature = "stats")]

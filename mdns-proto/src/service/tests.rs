@@ -4540,6 +4540,125 @@ fn kas_wrong_owner_known_answer_does_not_suppress() {
   );
 }
 
+/// A known-answer that has EXPIRED by the instant `poll_transmit` is given must
+/// not suppress, even though no `handle_timeout` or `handle_event` ran between
+/// the queueing of the response and the poll.
+///
+/// The hint's licence to suppress is the querier still holding the record, and
+/// that licence ends on the caller's clock — which `poll_transmit` receives as
+/// a parameter. Judging it against the last instant some OTHER method happened
+/// to carry lets a permitted Sans-I/O call order (question → `handle_timeout` →
+/// wait → `poll_transmit`) keep a long-dead hint alive: the querier's cache
+/// entry is gone, nobody else on the link will send our record, and RFC 6762
+/// §7.1 licenses no suppression there.
+///
+/// Run at BOTH name coincidences, because that is where an A hint became
+/// storable at all: while the emit side classified a candidate by rtype and
+/// ingest classified an arriving record by walking our names in order, an A at
+/// a name that is also the instance name or the service type bound to the wrong
+/// owner and could never match. Both now bind by rtype, so both reach this
+/// filter.
+#[test]
+fn an_expired_known_answer_does_not_suppress_at_polls_own_clock() {
+  use crate::{
+    event::ServiceQuestion,
+    wire::{MessageReader, QuestionRef, ResourceType},
+  };
+
+  /// Is the A record missing from the response? `host` is the name it sits at —
+  /// one of the two coincidences.
+  fn suppressed_after_expiry(host: &str) -> bool {
+    let our_ttl: u32 = 120;
+    let mut records = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("myprinter._ipp._tcp.local.").unwrap(),
+      Name::try_from_str(host).unwrap(),
+      631,
+      our_ttl,
+    );
+    records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+    let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+      Service::try_new(
+        ServiceHandle::from_raw(0),
+        records,
+        FakeInstant::zero(),
+        [0u8; 32],
+        true,
+        true,
+      );
+    let now = drive_to_established(&mut svc);
+    inject_question_to_set_response_deadline(&mut svc, now);
+
+    // A known-answer for our A record at exactly the §7.1 half-TTL threshold,
+    // so it is stored and expires 60 s after `now`.
+    let mut a_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+    make_a_record_ref(&mut a_buf, host, our_ttl / 2, [192, 168, 1, 10]);
+    let (a_ref, _) = Ref::try_parse(&a_buf, 0).unwrap();
+    svc.handle_event(
+      ServiceEvent::KnownAnswer(KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), a_ref)),
+      now,
+    );
+    assert!(
+      svc
+        .kas_hints
+        .iter()
+        .any(|s| s.map(|h| h.rtype == ResourceType::A).unwrap_or(false)),
+      "the A known-answer must be stored as a hint at host `{host}`"
+    );
+
+    // The question that pulls the A onto the wire, then the jitter window
+    // closes and the response is queued.
+    let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+    for label in "myprinter._ipp._tcp.local."
+      .trim_end_matches('.')
+      .split('.')
+    {
+      qbuf.push(label.len() as u8);
+      qbuf.extend_from_slice(label.as_bytes());
+    }
+    qbuf.push(0u8);
+    qbuf.extend_from_slice(&255u16.to_be_bytes()); // QTYPE ANY
+    qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+    let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+    let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
+    svc.handle_event(
+      ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
+      now,
+    );
+    let queued = now.advance(200);
+    svc.handle_timeout(queued).unwrap();
+    assert_eq!(
+      svc.pending_transmits[0],
+      Some(PendingTransmitKind::Response),
+      "a Response must be queued at host `{host}`"
+    );
+
+    // ONLY the clock handed to `poll_transmit` moves past the hint's expiry —
+    // no further event or timeout, which is what a Sans-I/O caller is allowed
+    // to do and what leaves any cached instant behind.
+    let polled = queued.advance(61_000);
+    let mut out = std::vec![0u8; 4096];
+    let transmit = svc
+      .poll_transmit(polled, &mut out)
+      .unwrap()
+      .expect("the queued response must still be emitted");
+    let reader = MessageReader::try_parse(&out[..transmit.size()]).unwrap();
+    !reader.answers().any(|rr| {
+      rr.map(|rec| rec.rtype() == ResourceType::A)
+        .unwrap_or(false)
+    })
+  }
+
+  assert!(
+    !suppressed_after_expiry("myprinter._ipp._tcp.local."),
+    "instance == host: an expired known-answer must not suppress the A record"
+  );
+  assert!(
+    !suppressed_after_expiry("_ipp._tcp.local."),
+    "service type == host: an expired known-answer must not suppress the A record"
+  );
+}
+
 // ── same-tick response + lifecycle both fire ──────────────────
 
 /// When both response_deadline and lifecycle_deadline are due at the same
