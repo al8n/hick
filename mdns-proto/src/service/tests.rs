@@ -11812,3 +11812,276 @@ fn a_host_aaaa_record_still_conflicts_when_we_own_an_aaaa_rrset() {
     "a different address inside an RRset we DO own is still a §9 conflict"
   );
 }
+
+// ── RFC 6762 §8.1's fifteen-conflicts-in-ten-seconds flood limit ─────
+
+/// Deliver one §9 conflict at an ESTABLISHED name: a peer's authoritative SRV
+/// for the name this service currently holds, on a port it does not publish.
+fn deliver_established_srv_conflict(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  now: FakeInstant,
+) {
+  let owner = svc.name().as_str().to_owned();
+  let mut buf = std::vec::Vec::new();
+  make_srv_record_ref(&mut buf, &owner, 120, 0, 0, 9999, "host.local.");
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+      ConflictRole::Instance,
+    )),
+    now,
+  );
+}
+
+/// Drive one turn of §8.1's conflict → rename → re-probe loop, and report the
+/// instant the rename happened at together with the deadline it armed for the
+/// restarted probe sequence.
+///
+/// Time advances only as far as the state machine's own schedule asks — each
+/// step jumps straight to the armed `lifecycle_deadline` — because the rule
+/// under test is how fast this loop may turn. A fixture with a tick of its own
+/// would be deciding that instead of the code, and a coarse one would spread
+/// fifteen conflicts past the ten-second window the limit is measured over.
+fn one_conflict_turn(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  from: FakeInstant,
+) -> (FakeInstant, FakeInstant) {
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = from;
+  let mut on_wire = false;
+  for _ in 0..8 {
+    let due = svc
+      .lifecycle_deadline
+      .expect("the probe loop must stay on a clock");
+    now = core::cmp::max(now, due);
+    svc.handle_timeout(now).unwrap();
+    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_delivery(now, TransmitDelivery::ALL);
+      on_wire = true;
+      break;
+    }
+  }
+  assert!(
+    on_wire,
+    "no probe of the restarted sequence reached the wire; state={:?}",
+    svc.state()
+  );
+  // §8.1: a conflicting authoritative RESPONSE inside the probing window, from a
+  // host that already holds the name. The peer defends the new name every time,
+  // which is the persistent same-name peer the limit exists for.
+  deliver_losing_srv_conflict(svc, now, ConflictOrigin::AuthoritativeResponse);
+  assert!(
+    svc.probe_defeated,
+    "the response must classify as a §8.1 defeat"
+  );
+  // Spend the classification: this timeout is the rename.
+  svc.handle_timeout(now).unwrap();
+  let armed = svc
+    .lifecycle_deadline
+    .expect("a rename must re-arm the clock");
+  (now, armed)
+}
+
+/// RFC 6762 §8.1:
+///
+/// > If fifteen conflicts occur within any ten-second period, then the host MUST
+/// > wait at least five seconds before each successive additional probe attempt.
+///
+/// This is the loop, not the counter: a peer that defends every name this
+/// service renames itself to drove an unthrottled rename → announce → probe
+/// cycle, each turn putting packets on the link, because every post-rename probe
+/// was scheduled with §8.1's ordinary 0-250 ms STARTUP delay however many
+/// renames had already happened.
+///
+/// Below the threshold that delay is exactly right and is asserted to survive —
+/// the limit exists to stop a flood, not to slow ordinary conflict resolution
+/// down. At the fifteenth conflict and at every one after it the restarted
+/// sequence is at least five seconds out, which is what bounds the loop.
+///
+/// "Each successive additional probe attempt" is every subsequent one, so the
+/// turns past the threshold are asserted individually rather than once: a limit
+/// re-derived per probe from the ring alone would pass the fifteenth and then
+/// come off two turns later, because five-second spacing is itself too slow to
+/// keep fifteen conflicts inside ten seconds.
+#[test]
+fn a_conflict_flood_clamps_every_successive_probe_attempt() {
+  let mut svc = make_service(120);
+  let mut now = FakeInstant::zero();
+  for turn in 1..=14u32 {
+    let (at, armed) = one_conflict_turn(&mut svc, now);
+    assert!(
+      armed.0.saturating_sub(at.0) <= 250,
+      "turn {turn}: below §8.1's fifteenth conflict a rename keeps the ordinary \
+       0-250 ms probe delay; this one armed {} ms out",
+      armed.0.saturating_sub(at.0)
+    );
+    now = at;
+  }
+  assert!(
+    now.0 < 10_000,
+    "the fixture must land fourteen conflicts inside §8.1's ten-second window, \
+     or it is not testing the rule; it took {} ms",
+    now.0
+  );
+  let (at, armed) = one_conflict_turn(&mut svc, now);
+  assert!(
+    armed.0.saturating_sub(at.0) >= 5_000,
+    "the fifteenth conflict inside ten seconds completes §8.1's condition, so \
+     the restarted sequence owes at least five seconds; it armed {} ms out",
+    armed.0.saturating_sub(at.0)
+  );
+  now = at;
+  for turn in 16..=20u32 {
+    let (at, armed) = one_conflict_turn(&mut svc, now);
+    assert!(
+      armed.0.saturating_sub(at.0) >= 5_000,
+      "turn {turn}: the five-second floor is owed before EACH successive \
+       additional probe attempt, not only the next one; this one armed {} ms out",
+      armed.0.saturating_sub(at.0)
+    );
+    now = at;
+  }
+  // The count is what §8.1 says it is — conflicts — so it spans the renames it
+  // is throttling. Resetting it on a rename is precisely the reset that would
+  // defeat the limit, since renaming is the loop being bounded.
+  assert!(
+    svc.rename_attempt >= 20,
+    "twenty conflicts, twenty renames: got {}",
+    svc.rename_attempt
+  );
+}
+
+/// …and the limit comes off again when the flood does.
+///
+/// §8.1's floor answers a peer that keeps answering. Once that peer falls silent
+/// for a whole ten-second window the condition it created is spent, and the next
+/// conflict — here §9's, at a name that had gone on to establish — starts over
+/// at the ordinary 0-250 ms schedule. A latch that never released would leave a
+/// service permanently slow to re-verify its own name because of one bad ten
+/// seconds it had at startup.
+#[test]
+fn the_flood_limit_comes_off_once_the_flood_stops() {
+  let mut svc = make_service(120);
+  let mut now = FakeInstant::zero();
+  for _ in 0..15 {
+    let (at, _) = one_conflict_turn(&mut svc, now);
+    now = at;
+  }
+  assert!(svc.conflict_backoff, "the flood limit must be in force");
+  // The peer gives up: probing now completes and the name establishes.
+  let mut buf = std::vec![0u8; 4096];
+  let mut established = None;
+  for _ in 0..40 {
+    let due = svc.lifecycle_deadline.expect("still on a clock");
+    now = core::cmp::max(now, due);
+    svc.handle_timeout(now).unwrap();
+    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_delivery(now, TransmitDelivery::ALL);
+    }
+    if svc.state() == ServiceState::Established {
+      established = Some(now);
+      break;
+    }
+  }
+  let established = established.expect("the service must establish once unopposed");
+  // A full window of quiet, and then a fresh §9 conflict.
+  let at = established.advance(10_000);
+  deliver_established_srv_conflict(&mut svc, at);
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "§9's revert is owed whether or not the flood limit was ever in force"
+  );
+  assert!(
+    !svc.conflict_backoff,
+    "a whole ten-second window with no conflict at all ends the burst §8.1 \
+     measured, so the floor it imposed is spent"
+  );
+  let armed = svc.lifecycle_deadline.unwrap();
+  assert!(
+    armed.0.saturating_sub(at.0) <= 250,
+    "…and the restarted sequence is back on §8.1's ordinary 0-250 ms delay; it \
+     armed {} ms out",
+    armed.0.saturating_sub(at.0)
+  );
+}
+
+/// §9's conflict interval and §8.1's flood limit are DIFFERENT rules over
+/// different quantities, and both are live at once.
+///
+/// §9's `CONFLICT_REPROBE_MIN_INTERVAL` bounds how often an established name may
+/// be sent back to probing at all; §8.1's floor bounds how soon each restarted
+/// sequence may begin, whatever sent it back. This pins the first one at exactly
+/// its own interval with the flood counter cold, so the floor cannot be mistaken
+/// for it — and pins that a conflict the §9 interval DROPPED is counted by
+/// neither, because it caused no probe attempt for §8.1 to space out.
+#[test]
+fn the_section9_revert_interval_is_unchanged_by_the_flood_limit() {
+  let mut svc = make_service(120);
+  let now = drive_to_established(&mut svc);
+  svc.last_conflict_reprobe = Some(now);
+  deliver_established_srv_conflict(&mut svc, now.advance(999));
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "a §9 conflict inside CONFLICT_REPROBE_MIN_INTERVAL is still dropped"
+  );
+  assert_eq!(
+    svc.conflict_burst.iter().filter(|s| s.is_some()).count(),
+    0,
+    "…and a dropped conflict re-probes nothing, so §8.1's flood test — which is \
+     about probe attempts — does not count it"
+  );
+  let at = now.advance(1_000);
+  deliver_established_srv_conflict(&mut svc, at);
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "one millisecond further on, the interval is served and §9 reverts"
+  );
+  assert_eq!(
+    svc.conflict_burst.iter().filter(|s| s.is_some()).count(),
+    1,
+    "…and THAT one is counted: it armed a probe sequence"
+  );
+  let armed = svc.lifecycle_deadline.unwrap();
+  assert!(
+    armed.0.saturating_sub(at.0) <= 250,
+    "with one conflict counted the flood limit is nowhere near in force, so \
+     §9's revert keeps its ordinary 0-250 ms probe delay; it armed {} ms out",
+    armed.0.saturating_sub(at.0)
+  );
+}
+
+/// A slow drip is not a flood, however long it goes on.
+///
+/// §8.1 counts fifteen conflicts "within any ten-second period", not fifteen
+/// conflicts. A counter that only ever incremented — or one whose window was
+/// anchored at the first conflict rather than at the fifteenth-most-recent —
+/// would clamp a service that had merely been unlucky over several minutes.
+#[test]
+fn conflicts_spread_wider_than_the_window_never_clamp() {
+  let mut svc = make_service(120);
+  let mut now = FakeInstant::zero();
+  for turn in 1..=20u32 {
+    let (at, armed) = one_conflict_turn(&mut svc, now);
+    assert!(
+      armed.0.saturating_sub(at.0) <= 250,
+      "turn {turn}: one conflict per second is not fifteen inside ten seconds; \
+       it armed {} ms out",
+      armed.0.saturating_sub(at.0)
+    );
+    // The next conflict is a second away, so no ten-second period ever holds
+    // more than ten of them.
+    now = at.advance(1_000);
+  }
+  assert!(
+    !svc.conflict_backoff,
+    "twenty conflicts at one per second must never meet §8.1's condition"
+  );
+}

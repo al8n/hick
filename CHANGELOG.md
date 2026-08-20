@@ -1,5 +1,32 @@
 # UNRELEASED
 
+## A persistent same-name peer can no longer drive an unthrottled rename loop
+
+- `mdns-proto`: a `Service` now applies RFC 6762 §8.1's flood limit — "if
+  fifteen conflicts occur within any ten-second period, then the host MUST wait
+  at least five seconds before each successive additional probe attempt". Every
+  conflict-driven probe sequence was scheduled with §8.1's ordinary 0-250 ms
+  *startup* delay however many renames had already happened, so a peer that
+  defends each name the service renames itself to — hostile, or merely a
+  misconfigured twin — drove an unbounded rename → announce → probe loop, each
+  turn putting packets on the link. The count is of CONFLICTS, which is what
+  §8.1 counts, so it deliberately spans renames and probe restarts: resetting it
+  on a rename would reset it on the very event being throttled. It is kept in a
+  fixed ring of fifteen instants — the condition is exactly "is the
+  fifteenth-most-recent conflict within ten seconds of now" — so nothing is
+  allocated. Once in force the floor applies to *each* successive attempt and is
+  released only by the flood stopping: a whole ten-second window with no
+  conflict at all. Re-deriving it per probe instead would come off two turns
+  later and hand the flood its speed back, because five-second spacing is itself
+  too slow to keep fifteen conflicts inside ten seconds. The floor is applied
+  where every restarted sequence gets its start time, so it covers §9's
+  revert-to-probing, §8.2's one-second deferral and §8.1's rename alike, and
+  raises each only when the limit is in force. §9's own
+  `CONFLICT_REPROBE_MIN_INTERVAL` is a different rule over a different quantity
+  and is unchanged: it still bounds how often an established name may be sent
+  back to probing at all, and a conflict it drops re-probes nothing and is
+  counted by neither rule.
+
 ## A relinquished record set can no longer retire its own replacement
 
 - `mdns-proto`: `Endpoint` screens every conflict candidate against the record

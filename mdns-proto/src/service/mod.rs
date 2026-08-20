@@ -82,8 +82,38 @@ cfg_heap! {
   /// Established/Announcing service (RFC 6762 §9 conflict rate-limiting). A
   /// conflict flood cannot reset us to Probing faster than this, so a hostile
   /// peer cannot prevent the service from ever (re)establishing.
+  ///
+  /// This is NOT the §8.1 flood limit below it, and both are live at once. This
+  /// one bounds how often an ESTABLISHED name may be sent back to probing at
+  /// all; §8.1's bounds how soon each restarted probe SEQUENCE may begin,
+  /// whatever sent it back. A §9 revert therefore meets both — this interval
+  /// decides whether the revert happens, and [`CONFLICT_BACKOFF_MIN_WAIT`]
+  /// floors the probe deadline that the revert, once allowed, arms.
   const CONFLICT_REPROBE_MIN_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
 
+  /// How many conflicts RFC 6762 §8.1 counts before its flood limit applies:
+  ///
+  /// > If fifteen conflicts occur within any ten-second period, then the host
+  /// > MUST wait at least five seconds before each successive additional probe
+  /// > attempt.  This is to help ensure that, in the event of software bugs or
+  /// > other unanticipated problems, errant hosts do not flood the network with
+  /// > a continuous stream of multicast traffic.
+  ///
+  /// Fifteen, ten and five are one rule and are kept together because no one of
+  /// them means anything alone. What is counted is CONFLICTS — not renames and
+  /// not probes — so the count spans renames and probe restarts, which is what
+  /// makes it a limit on the rename loop rather than a counter that loop resets.
+  const CONFLICT_BURST_LEN: usize = 15;
+
+  /// The period [`CONFLICT_BURST_LEN`] conflicts must fall inside for §8.1's
+  /// flood limit to apply — and, once it applies, the span of total quiet that
+  /// releases it again.
+  const CONFLICT_BURST_WINDOW: core::time::Duration = core::time::Duration::from_secs(10);
+
+  /// The floor §8.1 puts under the start of each successive probe sequence once
+  /// [`CONFLICT_BURST_LEN`] conflicts have fallen inside one
+  /// [`CONFLICT_BURST_WINDOW`]: "the host MUST wait at least five seconds".
+  const CONFLICT_BACKOFF_MIN_WAIT: core::time::Duration = core::time::Duration::from_secs(5);
 }
 
 cfg_heap! {
@@ -1178,6 +1208,35 @@ cfg_heap! {
   /// instant of the last conflict-driven revert-to-probe, used to
   /// rate-limit RFC 6762 §9 re-probing under a conflict flood.
   last_conflict_reprobe: Option<I>,
+  /// The instants of the last [`CONFLICT_BURST_LEN`] conflicts that sent this
+  /// service back through RFC 6762 §8's startup steps, written round-robin at
+  /// `conflict_burst_slot`.
+  ///
+  /// A fixed array and not a growing list, because the question it answers needs
+  /// no more: §8.1 asks whether the FIFTEENTH-most-recent conflict is within
+  /// [`CONFLICT_BURST_WINDOW`] of now, and a sixteenth timestamp cannot change
+  /// that answer.
+  conflict_burst: [Option<I>; CONFLICT_BURST_LEN],
+  /// Next slot to write in `conflict_burst` (wraps at [`CONFLICT_BURST_LEN`]).
+  /// Once the ring has filled, that same slot holds its OLDEST entry — the
+  /// fifteenth-most-recent conflict, which is the one §8.1's test reads.
+  conflict_burst_slot: usize,
+  /// RFC 6762 §8.1's flood limit is in force: "the host MUST wait at least five
+  /// seconds before each successive additional probe attempt".
+  ///
+  /// LATCHED rather than recomputed per probe, and that is the whole point. Once
+  /// the limit spaces probes five seconds apart, conflicts can only arrive that
+  /// slowly too — so a condition re-derived from the ring would go false two
+  /// probes later and hand the flood its speed back, oscillating between a fast
+  /// burst and a clamped pair for as long as the peer keeps answering. "Each
+  /// successive additional probe attempt" is every one of them, not the next.
+  ///
+  /// It is released by the flood STOPPING and by nothing else: a whole
+  /// [`CONFLICT_BURST_WINDOW`] in which no conflict arrived at all. A rename does
+  /// not release it — §8.1 counts what was received, and renaming is the loop
+  /// being throttled, so resetting on rename is exactly the reset that would
+  /// defeat the limit.
+  conflict_backoff: bool,
   /// One-shot handoff of the OLD instance name's TTL=0 goodbye when a §9 conflict
   /// renames an ANNOUNCED service. Set at the rename site (`handle_timeout`) with
   /// the OLD records and WHICH instance records that name actually advertised
@@ -1292,6 +1351,9 @@ where
       awaiting_confirm: None,
       pending_legacy: std::vec::Vec::new(),
       last_conflict_reprobe: None,
+      conflict_burst: [None; CONFLICT_BURST_LEN],
+      conflict_burst_slot: 0,
+      conflict_backoff: false,
       rename_goodbye_handoff: None,
       meta_response_deadline: None,
       meta_questioner_srcs: std::vec::Vec::new(),
@@ -2644,12 +2706,20 @@ where
   /// impossible to miss, because a caller has none to spell. A FOURTH regress
   /// path added later gets the whole set by construction.
   ///
+  /// It is also where RFC 6762 §8.1's flood limit is applied, for the same
+  /// reason: all three rules are conflict-driven probe attempts, this is where
+  /// each one gets its start time, and a fourth added later inherits the limit
+  /// without knowing it exists. See [`Service::note_conflict`].
+  ///
   /// What every caller passes, and nothing else:
   ///
-  /// * `deadline` — when the fresh §8.1 sequence may begin. §9 and a rename use
-  ///   the randomized `probe_deadline`; §8.2's loser uses `now +
-  ///   TIEBREAK_DEFER_WAIT`, which is the one second it "defers to the winning
-  ///   host by waiting".
+  /// * `now` — the instant the conflict is being resolved at. It dates the
+  ///   conflict for §8.1's flood test and anchors that test's five-second floor.
+  /// * `deadline` — when the fresh §8.1 sequence may begin, IF the flood limit
+  ///   is not in force; when it is, the later of this and `now +
+  ///   CONFLICT_BACKOFF_MIN_WAIT`. §9 and a rename pass the randomized
+  ///   `probe_deadline`; §8.2's loser passes `now + TIEBREAK_DEFER_WAIT`, which
+  ///   is the one second it "defers to the winning host by waiting".
   /// * `renamed_from` — `Some(old records)` ONLY when the name is changing, so a
   ///   parked datagram's confirm latches ownership under the name it actually
   ///   advertised. `None` for the two SAME-name regressions, where ownership
@@ -2659,7 +2729,12 @@ where
   /// `last_conflict_reprobe` (its own rate limit), and a rename also calls
   /// `set_instance` and `reset_advertised_name_state` (per-advertised-NAME state,
   /// which a same-name regression must NOT reset — see `fully_announced`).
-  fn restart_probe_cycle(&mut self, deadline: Option<I>, renamed_from: Option<ServiceRecords>) {
+  fn restart_probe_cycle(
+    &mut self,
+    now: I,
+    deadline: Option<I>,
+    renamed_from: Option<ServiceRecords>,
+  ) {
     // A parked datagram belongs to the generation this regress replaces, so its
     // confirm must not advance the fresh §8.1 sequence: `Init → Probing(0)` costs
     // no datagram, so an old probe confirming into it would claim the name after
@@ -2702,9 +2777,92 @@ where
     // so a §6.7 reply queued while announcing would otherwise put the full
     // positive-TTL record set on the wire during the regress.
     self.clear_response_cycle_state();
-    self.lifecycle_deadline = deadline;
+    // RFC 6762 §8.1's flood limit: "If fifteen conflicts occur within any
+    // ten-second period, then the host MUST wait at least five seconds before
+    // each successive additional probe attempt." The caller's schedule is a
+    // FLOOR away from, never a ceiling on, what it asked for — §8.2's one-second
+    // deferral is still owed in full, it is simply not enough on its own once
+    // the limit is in force.
+    self.lifecycle_deadline = if self.note_conflict(now) {
+      match (deadline, now.checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)) {
+        (Some(d), Some(floor)) => Some(d.max(floor)),
+        // The caller's own arithmetic overflowed the clock. The floor is still a
+        // legal start for the sequence, and conjunct 8 below says a regress that
+        // armed nothing would strand the service.
+        (None, floor) => floor,
+        // …and the other way round: the floor overflowed where the caller's
+        // deadline did not, so keep the deadline rather than drop the service
+        // off the clock over a limit that is about slowing it down.
+        (Some(d), None) => Some(d),
+      }
+    } else {
+      deadline
+    };
     #[cfg(debug_assertions)]
     self.assert_generation_replaced();
+  }
+
+  /// Fold one conflict into RFC 6762 §8.1's flood test, and report whether its
+  /// five-second floor is now in force.
+  ///
+  /// > If fifteen conflicts occur within any ten-second period, then the host
+  /// > MUST wait at least five seconds before each successive additional probe
+  /// > attempt.
+  ///
+  /// Called from [`Service::restart_probe_cycle`] and therefore counting exactly
+  /// the conflicts that put a fresh probe sequence on the wire — §9's revert,
+  /// §8.2's deferral, §8.1's rename. A conflict the §9 rate limit already
+  /// dropped is not counted, because it caused no probe attempt for the limit to
+  /// space out; a `HostConflict` is not counted either, since it renames nothing
+  /// and re-probes nothing, it is surfaced to the caller.
+  ///
+  /// The clock is assumed monotonic, as [`crate::Instant`] requires. Where it is
+  /// not, both tests below fail CLOSED: a `now` that ran backwards neither
+  /// releases the latch nor engages it.
+  fn note_conflict(&mut self, now: I) -> bool {
+    // The flood has stopped if a whole window has gone by with no conflict at
+    // all. Tested BEFORE this conflict is folded in, and against the previous
+    // newest — so a fresh burst from a peer that had fallen quiet starts over
+    // from an empty ring at §8.1's ordinary 0-250 ms schedule, and a burst that
+    // is still going never reaches this at all (the limit spaces its probes five
+    // seconds apart, so its conflicts arrive well inside the window).
+    if let Some(newest) = self.newest_conflict()
+      && now
+        .checked_duration_since(newest)
+        .is_some_and(|since| since >= CONFLICT_BURST_WINDOW)
+    {
+      self.conflict_burst = [None; CONFLICT_BURST_LEN];
+      self.conflict_burst_slot = 0;
+      self.conflict_backoff = false;
+    }
+    if let Some(slot) = self.conflict_burst.get_mut(self.conflict_burst_slot) {
+      *slot = Some(now);
+      self.conflict_burst_slot = self.conflict_burst_slot.saturating_add(1) % CONFLICT_BURST_LEN;
+    }
+    // Once the cursor has advanced it addresses the ring's OLDEST entry: the
+    // fifteenth-most-recent conflict, and `None` until fifteen have arrived. If
+    // that one is within the window then all fifteen occurred inside a single
+    // ten-second period, which is the whole of §8.1's condition.
+    if let Some(Some(oldest)) = self.conflict_burst.get(self.conflict_burst_slot).copied()
+      && now
+        .checked_duration_since(oldest)
+        .is_some_and(|span| span <= CONFLICT_BURST_WINDOW)
+    {
+      self.conflict_backoff = true;
+    }
+    self.conflict_backoff
+  }
+
+  /// The most recently recorded conflict, or `None` if none has been.
+  fn newest_conflict(&self) -> Option<I> {
+    // `conflict_burst_slot` is the NEXT slot to write, so the newest entry sits
+    // one before it — wrapping to the last slot while the ring is still filling
+    // from zero, where it reads `None` anyway.
+    let newest = self
+      .conflict_burst_slot
+      .checked_sub(1)
+      .unwrap_or(CONFLICT_BURST_LEN.saturating_sub(1));
+    self.conflict_burst.get(newest).copied().flatten()
   }
 
   /// The post-state [`Service::restart_probe_cycle`] owes, checked as a SET on
@@ -3419,7 +3577,7 @@ where
         // renamed-away predecessor's §10.1 goodbye, and any goodbye this name
         // could cancel was already cancelled when it first fully announced.
         let deadline = probe_deadline(now, 0, &mut self.rng);
-        self.restart_probe_cycle(deadline, None);
+        self.restart_probe_cycle(now, deadline, None);
       }
       (ServiceState::Established | ServiceState::Announcing(_), ServiceEvent::Question(sq)) => {
         let src = sq.src();
@@ -3881,6 +4039,7 @@ where
         // deferral — so `renamed_from` is `None` and a parked datagram's records
         // still latch into `goodbye` under it.
         self.restart_probe_cycle(
+          now,
           now.checked_add_duration(schedule::rfc::TIEBREAK_DEFER_WAIT),
           None,
         );
@@ -3970,7 +4129,7 @@ where
             // window, between the stale-token capture the regress does first and
             // the per-name reset below.
             let deadline = probe_deadline(now, 0, &mut self.rng);
-            self.restart_probe_cycle(deadline, Some(renamed_from));
+            self.restart_probe_cycle(now, deadline, Some(renamed_from));
             self.records.set_instance(new_name.clone());
             let _ = self.pending_updates.insert(ServiceUpdate::Renamed(
               crate::event::ServiceRenamed::new(new_name),
