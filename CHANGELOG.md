@@ -1,5 +1,78 @@
 # UNRELEASED
 
+## A persistent same-name peer no longer drives one record set's rename loop unthrottled
+
+- `mdns-proto`: a `Service` now applies RFC 6762 §8.1's flood limit — "if
+  fifteen conflicts occur within any ten-second period, then the host MUST wait
+  at least five seconds before each successive additional probe attempt" — **to
+  its own record set**. Every conflict-driven probe sequence was scheduled with
+  §8.1's ordinary 0-250 ms *startup* delay however many renames had already
+  happened, so a peer that defends each name the service renames itself to —
+  hostile, or merely a misconfigured twin — drove an unbounded rename → announce
+  → probe loop, each turn putting packets on the link. The count is of CONFLICTS, which is what
+  §8.1 counts, so it deliberately spans renames and probe restarts: resetting it
+  on a rename would reset it on the very event being throttled. It is kept in a
+  fixed ring of fifteen instants — the condition is exactly "is the
+  fifteenth-most-recent conflict within ten seconds of now" — so nothing is
+  allocated. Once in force the floor applies to *each* successive attempt and is
+  released only by the flood stopping: a whole ten-second window with no
+  conflict at all. Re-deriving it per probe instead would come off two turns
+  later and hand the flood its speed back, because five-second spacing is itself
+  too slow to keep fifteen conflicts inside ten seconds. The floor is applied
+  where every restarted sequence gets its start time, so it covers §9's
+  revert-to-probing, §8.2's one-second deferral and §8.1's rename alike, and
+  raises each only when the limit is in force. §9's own
+  `CONFLICT_REPROBE_MIN_INTERVAL` is a different rule over a different quantity
+  and is unchanged: it still bounds how often an established name may be sent
+  back to probing at all, and a conflict it drops re-probes nothing and is
+  counted by neither rule.
+- `mdns-proto`: **the scope of that limit is per record set, and §8.1 states its
+  obligation on the host.** The counter lives on one `Service`, so what it bounds
+  is one record set's restarts, and three ways past it are known and remain open.
+  Conflicts are not aggregated across record sets: fifteen entries spaced `d`
+  apart span `14·d`, so a service whose restarts are slower than 10/14 ≈ 0.714 s
+  never latches at all, and N services contending at that rate put N × 1.4
+  restarts per second on the link between them. A freshly registered service
+  starts with an empty ring and is not slowed by another service's backoff
+  already being in force. And the history dies with the `Service`: a
+  `HostConflict` is terminal and is surfaced for the caller to intervene, and the
+  usual intervention — unregister, then re-register under a new host name — hands
+  the replacement a clean ring, so a loop closed through the driver layer evades
+  even the per-record-set latch. Aggregating the ring at the `Endpoint` and
+  sharing only the verdict is tracked as **#140**; that will make the limit
+  endpoint-wide, which is still not host-wide, because a second `Endpoint`, or a
+  second process, on the same machine is beyond anything this library can
+  observe.
+- `mdns-proto`: the doc on `CONFLICT_REPROBE_MIN_INTERVAL` no longer claims that
+  a hostile peer "cannot prevent the service from ever (re)establishing". It
+  can. A peer that answers each first probe with conflicting authoritative data
+  for the current renamed instance restarts the sequence before probes two and
+  three go out, and those conflicts land pre-authoritatively, where §9's
+  interval does not apply — so a peer willing to conflict with every name
+  attempted keeps the service out of `Announcing` indefinitely. What the two
+  limits bound between them is the rate, not progress: once §8.1's floor is
+  latched the loop turns about once per five seconds. The denial of service
+  itself is inherent to a same-link name adversary; only the claim was wrong.
+- `mdns-proto`: when the flood limit is in force and the clock cannot represent
+  `now + 5 s`, a conflict-driven restart now arms **no deadline at all** instead
+  of falling back to the caller's shorter one. `Instant::checked_add_duration`
+  returns `Option`, so a bounded clock is part of the contract this crate
+  publishes rather than a pathological case — a wrapping millisecond counter is
+  an ordinary choice for a bare-metal driver, which is also where an unthrottled
+  flood costs the most. The old fallback discarded the MUST at exactly the moment
+  the limiter existed to hold a probe back, scheduling one as little as 250 ms
+  out on the rename and §9 paths and a second out on §8.2; and when the caller's
+  own deadline overflowed too it stored `None` and tripped the regress
+  invariant, turning a peer's proposal into a debug-build panic reachable
+  straight from network input. Saturating to the furthest representable instant
+  is not the fix either: at the end of the clock that instant can be `now`, which
+  schedules the probe immediately. Arming nothing is the only value that is never
+  sooner than an unrepresentable floor. The `Init` re-schedule applies the same
+  floor, so it re-evaluates each timeout rather than fabricating a fresh
+  0-250 ms delay for a sequence the limit is holding, and the regress invariant
+  now reads "armed, or the clock cannot express the wait §8.1 owes". Services
+  whose limit is not in force are untouched, overflow and all.
+
 ## A relinquished record set can no longer retire its own replacement
 
 - `mdns-proto`: `Endpoint` screens every conflict candidate against the record
