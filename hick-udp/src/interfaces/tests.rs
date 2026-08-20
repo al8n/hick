@@ -20,37 +20,39 @@ fn up_running_multicast() -> Flags {
 //
 // The strict filter (`require_running = true`) is what
 // `is_acceptable_mdns_interface` / `is_loopback_fallback_interface` /
-// `acceptable_mdns_interfaces` expose; the default picker's lenient variant
-// (`require_running = false`) is covered in the next section.
+// `acceptable_mdns_interfaces` expose. `tier` is the default picker's, and
+// takes no such parameter: what the strict filter refuses for want of a
+// carrier it ranks instead, which the next section covers.
 
 #[test]
 fn an_up_running_multicast_interface_qualifies() {
   assert!(qualifies(INDEX, up_running_multicast(), true));
-  assert_eq!(tier(INDEX, up_running_multicast(), true), Some(0));
+  assert_eq!(tier(INDEX, up_running_multicast()), Some(0));
 }
 
 #[test]
 fn a_running_interface_that_is_not_up_does_not_qualify() {
   let f = Flags::RUNNING | Flags::MULTICAST;
   assert!(!qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), None);
+  assert_eq!(tier(INDEX, f), None);
 }
 
 #[test]
 fn an_up_interface_that_is_not_running_does_not_qualify() {
   // UP without RUNNING is a link with no carrier — a Wi-Fi NIC with no
   // association — which can never complete the multicast join. The strict
-  // filter refuses it; the default picker accepts it (see the next section).
+  // filter refuses it; the default picker ranks it below a link that has a
+  // carrier rather than refusing it (see the next section).
   let f = Flags::UP | Flags::MULTICAST;
   assert!(!qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), None);
+  assert_eq!(tier(INDEX, f), Some(2));
 }
 
 #[test]
 fn an_interface_without_multicast_does_not_qualify() {
   let f = Flags::UP | Flags::RUNNING;
   assert!(!qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), None);
+  assert_eq!(tier(INDEX, f), None);
 }
 
 #[test]
@@ -60,7 +62,7 @@ fn a_multicast_loopback_is_a_fallback_not_a_link() {
   let f = up_running_multicast() | Flags::LOOPBACK;
   assert!(!qualifies(INDEX, f, true));
   assert!(fallback_qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), Some(2));
+  assert_eq!(tier(INDEX, f), Some(4));
 }
 
 #[test]
@@ -68,7 +70,7 @@ fn a_loopback_without_multicast_is_still_a_fallback() {
   let f = Flags::UP | Flags::RUNNING | Flags::LOOPBACK;
   assert!(!qualifies(INDEX, f, true));
   assert!(fallback_qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), Some(2));
+  assert_eq!(tier(INDEX, f), Some(4));
 }
 
 #[test]
@@ -78,7 +80,7 @@ fn a_loopback_that_is_not_running_is_no_fallback_either() {
   let f = Flags::UP | Flags::LOOPBACK;
   assert!(!qualifies(INDEX, f, true));
   assert!(!fallback_qualifies(INDEX, f, true));
-  assert_eq!(tier(INDEX, f, true), None);
+  assert_eq!(tier(INDEX, f), Some(4));
 }
 
 #[test]
@@ -94,10 +96,7 @@ fn index_zero_is_no_interface() {
     Flags::UP | Flags::RUNNING | Flags::LOOPBACK,
     true
   ));
-  assert_eq!(
-    tier(0, Flags::UP | Flags::RUNNING | Flags::LOOPBACK, true),
-    None
-  );
+  assert_eq!(tier(0, Flags::UP | Flags::RUNNING | Flags::LOOPBACK), None);
 }
 
 #[test]
@@ -105,28 +104,30 @@ fn point_to_point_is_refused_on_android_and_admitted_elsewhere() {
   let f = up_running_multicast() | Flags::POINTOPOINT;
   if cfg!(target_os = "android") {
     assert!(!qualifies(INDEX, f, true));
-    assert_eq!(tier(INDEX, f, true), None);
+    assert_eq!(tier(INDEX, f), None);
   } else {
     assert!(qualifies(INDEX, f, true));
-    assert_eq!(tier(INDEX, f, true), Some(0));
+    assert_eq!(tier(INDEX, f), Some(0));
   }
 }
 
-// ── the default picker ignores RUNNING ────────────────────────────────────────
+// ── the default picker ranks RUNNING rather than requiring it ────────────────
 
 // The strict filter above refuses links with no carrier (`UP` but not
-// `RUNNING`). The default picker is deliberately more lenient: requiring
-// `RUNNING` there regressed hosts whose links are up but not reported running
-// into "no multicast-capable interface found", so the picker accepts `UP`
-// alone. `require_running = false` is exactly what
-// `pick_default_interface_index` passes to the predicates.
+// `RUNNING`). Requiring `RUNNING` in the picker too regressed hosts whose links
+// are up but not reported running into "no multicast-capable interface found",
+// so it must not refuse them — but ignoring the flag made a dead link a full
+// tier-0 candidate, and first-seen wins within a tier, so an unplugged `eth0`
+// enumerated before a working `wlan0` won a pick that nothing migrates. The
+// flag is a rank instead: tier 0 with a carrier, tier 2 without, tier 4
+// loopback.
 
 #[test]
-fn the_picker_accepts_an_up_interface_that_is_not_running() {
+fn the_picker_admits_an_up_interface_that_is_not_running_at_a_worse_tier() {
   let f = Flags::UP | Flags::MULTICAST;
   assert!(!qualifies(INDEX, f, true));
   assert!(qualifies(INDEX, f, false));
-  assert_eq!(tier(INDEX, f, false), Some(0));
+  assert_eq!(tier(INDEX, f), Some(2));
 }
 
 #[test]
@@ -134,29 +135,131 @@ fn the_picker_still_falls_back_to_an_up_loopback_that_is_not_running() {
   let f = Flags::UP | Flags::LOOPBACK;
   assert!(!fallback_qualifies(INDEX, f, true));
   assert!(fallback_qualifies(INDEX, f, false));
-  assert_eq!(tier(INDEX, f, false), Some(2));
+  assert_eq!(tier(INDEX, f), Some(4));
 }
 
 #[test]
-fn the_picker_relaxes_only_the_running_requirement() {
-  // The lenient picker drops just the `RUNNING` check; everything else that
-  // makes an interface usable for mDNS still applies.
+fn the_picker_still_refuses_everything_but_a_missing_carrier() {
+  // Only `RUNNING` was demoted to a rank; everything else that makes an
+  // interface usable for mDNS still keeps it out of the pick entirely.
   let down = Flags::RUNNING | Flags::MULTICAST;
   assert!(!qualifies(INDEX, down, false));
-  assert_eq!(tier(INDEX, down, false), None);
+  assert_eq!(tier(INDEX, down), None);
   let no_multicast = Flags::UP | Flags::RUNNING;
   assert!(!qualifies(INDEX, no_multicast, false));
+  assert_eq!(tier(INDEX, no_multicast), None);
   let loopback = up_running_multicast() | Flags::LOOPBACK;
   assert!(!qualifies(INDEX, loopback, false));
   assert!(fallback_qualifies(INDEX, loopback, false));
   let f = up_running_multicast() | Flags::POINTOPOINT;
   if cfg!(target_os = "android") {
     assert!(!qualifies(INDEX, f, false));
-    assert_eq!(tier(INDEX, f, false), None);
+    assert_eq!(tier(INDEX, f), None);
   } else {
     assert!(qualifies(INDEX, f, false));
-    assert_eq!(tier(INDEX, f, false), Some(0));
+    assert_eq!(tier(INDEX, f), Some(0));
   }
+}
+
+/// Rank synthetic links exactly as the picker does — `tier` decides each base
+/// and `rank_candidates` the winner — with `addrs` answering for each index.
+/// Synthetic because `getifs::Interface` has no constructor a test can reach,
+/// and because which link wins must not depend on the host's own NICs.
+fn picked(
+  links: &[(u32, Flags)],
+  want_v4: bool,
+  want_v6: bool,
+  addrs: impl Fn(u32, Family) -> bool,
+) -> Option<u32> {
+  rank_candidates(
+    links
+      .iter()
+      .filter_map(|&(index, flags)| Some((tier(index, flags)?, index, index))),
+    want_v4,
+    want_v6,
+    |index, family| Ok(addrs(*index, family)),
+  )
+  .expect("a probe that cannot fail cannot fail the pick")
+}
+
+#[test]
+fn a_link_with_a_carrier_wins_in_either_enumeration_order() {
+  // `eth0` is up, multicast-capable and holds both requested families, but its
+  // cable is out; `wlan0` is associated and working. As equal tier-0
+  // candidates, enumeration order alone decided this, and the pick is a
+  // snapshot nothing migrates.
+  let unplugged = Flags::UP | Flags::MULTICAST;
+  let working = up_running_multicast();
+  let both = |_: u32, _: Family| true;
+  assert_eq!(
+    picked(&[(3, unplugged), (4, working)], true, true, both),
+    Some(4)
+  );
+  assert_eq!(
+    picked(&[(4, working), (3, unplugged)], true, true, both),
+    Some(4)
+  );
+}
+
+#[test]
+fn a_link_with_no_carrier_still_outranks_loopback() {
+  let unplugged = Flags::UP | Flags::MULTICAST;
+  let lo = Flags::UP | Flags::RUNNING | Flags::LOOPBACK;
+  let both = |_: u32, _: Family| true;
+  assert_eq!(
+    picked(&[(1, lo), (3, unplugged)], true, true, both),
+    Some(3)
+  );
+  assert_eq!(
+    picked(&[(3, unplugged), (1, lo)], true, true, both),
+    Some(3)
+  );
+}
+
+#[test]
+fn a_host_with_nothing_running_still_gets_a_bind() {
+  // The availability property the lenient filter exists for, and the whole
+  // reason `RUNNING` is ranked rather than required: a host whose links are
+  // momentarily down must not be told "no multicast-capable interface found"
+  // for the life of the process.
+  let both = |_: u32, _: Family| true;
+  assert_eq!(
+    picked(&[(3, Flags::UP | Flags::MULTICAST)], true, true, both),
+    Some(3)
+  );
+  assert_eq!(
+    picked(&[(1, Flags::UP | Flags::LOOPBACK)], true, true, both),
+    Some(1)
+  );
+}
+
+#[test]
+fn a_carrier_outranks_a_family_only_the_dead_link_serves() {
+  // Why the bases are two apart: `rank_candidates` lifts a candidate by one per
+  // requested family it has no address in, and that must never lift a link with
+  // no carrier past one that has it. An address on a link that cannot transmit
+  // the group join at all buys nothing.
+  let unplugged = Flags::UP | Flags::MULTICAST;
+  let working = up_running_multicast();
+  let v4_only_on_the_working_link = |index: u32, family: Family| index != 4 || family == Family::V4;
+  assert_eq!(
+    picked(
+      &[(3, unplugged), (4, working)],
+      true,
+      true,
+      v4_only_on_the_working_link
+    ),
+    Some(4)
+  );
+  assert_eq!(
+    picked(
+      &[(4, working), (3, unplugged)],
+      true,
+      true,
+      v4_only_on_the_working_link
+    ),
+    Some(4)
+  );
 }
 
 // ── the default interface picker ──────────────────────────────────────────────
@@ -185,7 +288,7 @@ fn the_default_interface_picker_reports_a_failed_address_enumeration() {
     eprintln!("skipping: this host will not enumerate its interfaces at all");
     return;
   };
-  let picker_qualifies = |i: &getifs::Interface| tier(i.index(), i.flags(), false).is_some();
+  let picker_qualifies = |i: &getifs::Interface| tier(i.index(), i.flags()).is_some();
   if !ifs.iter().any(picker_qualifies) {
     eprintln!("skipping: no interface the picker would consider");
     return;
@@ -515,5 +618,335 @@ fn a_failure_after_a_first_probe_that_left_the_pick_in_reach_still_surfaces() {
   assert!(
     asked.contains(&("eth0", Family::V4)),
     "the higher-ranked candidate must actually have been probed"
+  );
+}
+
+// The two above turn on a family read BEFORE the failing one, which is the only
+// order the fixed probe sequence used to handle: the tier already out of reach
+// when the syscall fails. These two are the other order — the failing probe
+// comes first, so what the candidate can still reach is unsettled at the moment
+// it fails and only the family read next can say whether the answer nobody
+// obtained could have changed the pick. Same candidates and the same four
+// probes either way; the second family's answer is the entire difference
+// between discarding the failure and raising it.
+
+#[test]
+fn a_failure_a_later_family_proves_irrelevant_does_not_fail_the_pick() {
+  let mut asked = Vec::new();
+  let picked = rank_candidates(
+    [(0, 7, "eth0"), (0, 8, "eth1")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("eth0", Family::V4) => Ok(true),
+        ("eth0", Family::V6) => Ok(false),
+        ("eth1", Family::V6) => Ok(false),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+      }
+    },
+  );
+  assert_eq!(
+    picked.expect(
+      "eth1 ties the incumbent at tier 1 if its IPv4 was there and serves no requested \
+       family at all if it was not, so no answer to the read that failed could have \
+       changed the pick"
+    ),
+    Some(7),
+    "first-seen-wins within a tier: the incumbent keeps the pick"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("eth0", Family::V4),
+      ("eth0", Family::V6),
+      ("eth1", Family::V4),
+      ("eth1", Family::V6)
+    ],
+    "a failed probe must not end its candidate: the family read after it is what proves \
+     the failure could not have mattered"
+  );
+}
+
+#[test]
+fn a_failure_a_later_family_leaves_decisive_still_surfaces() {
+  let mut asked = Vec::new();
+  let err = rank_candidates(
+    [(0, 7, "eth0"), (0, 8, "eth1")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("eth0", Family::V4) => Ok(true),
+        ("eth0", Family::V6) => Ok(false),
+        ("eth1", Family::V6) => Ok(true),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+      }
+    },
+  )
+  .expect_err(
+    "eth1 has the IPv6 the incumbent lacks, so the IPv4 nobody could read is exactly what \
+     decides tier 0 against a tier-1 tie; ranking it as having no IPv4 binds a link on an \
+     answer that was never obtained",
+  );
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::PermissionDenied,
+    "the platform's own kind must be carried over, not flattened, got {err:?}"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("eth0", Family::V4),
+      ("eth0", Family::V6),
+      ("eth1", Family::V4),
+      ("eth1", Family::V6)
+    ],
+    "the deferred failure is decided once the candidate's remaining families are read, so \
+     the same probes run as in the discarding case"
+  );
+}
+
+// Both of those weigh a failure against an incumbent that already exists. The
+// incumbent is not the winner, though, and a candidate can fail before there is
+// any incumbent at all: `lo` is index 1 and a `getifs` dump comes back in index
+// order, so the loopback fallback is the first candidate walked on the usual
+// Linux and macOS host. Judging a failure where it happens calls that one
+// decisive every time — there is nothing yet for it to lose to — and aborts a
+// pick the real link enumerated after it wins outright. The verdict therefore
+// waits for the end of the walk, and these three pin what it decides there.
+
+#[test]
+fn a_failure_before_any_incumbent_is_discarded_when_a_later_candidate_outranks_it() {
+  let mut asked = Vec::new();
+  let picked = rank_candidates(
+    [(4, 1, "lo0"), (0, 14, "en0")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("lo0", Family::V4) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        _ => Ok(true),
+      }
+    },
+  );
+  assert_eq!(
+    picked.expect(
+      "a real link at tier 0 beats a loopback fallback at tier 4 whatever the loopback's \
+       IPv4 held, so an EINTR on the loopback cannot abort the bind"
+    ),
+    Some(14)
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("lo0", Family::V4),
+      ("lo0", Family::V6),
+      ("en0", Family::V4),
+      ("en0", Family::V6)
+    ],
+    "the candidates after a failure must still be walked in full: the winner they settle is \
+     what the held failure is judged against"
+  );
+}
+
+#[test]
+fn a_failure_before_any_incumbent_still_surfaces_when_nothing_later_outranks_it() {
+  // The mirror of the above on the same two links, with the failure moved to
+  // the one that wins. Nothing walked after it reaches tier 0, so the pick
+  // really does turn on the family nobody could read.
+  let mut asked = Vec::new();
+  let err = rank_candidates(
+    [(0, 14, "en0"), (4, 1, "lo0")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("en0", Family::V4) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        _ => Ok(true),
+      }
+    },
+  )
+  .expect_err(
+    "the winner is the candidate whose address nobody read, so binding it on the assumption \
+     that the read would have said either thing is a guess the caller cannot see",
+  );
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::Interrupted,
+    "the platform's own kind must be carried over, not flattened, got {err:?}"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("en0", Family::V4),
+      ("en0", Family::V6),
+      ("lo0", Family::V4),
+      ("lo0", Family::V6)
+    ],
+    "a deferred candidate must not become the incumbent, or the loopback after it would be \
+     gated out on a rank that is still a guess"
+  );
+}
+
+#[test]
+fn several_deferred_failures_report_the_first_that_mattered() {
+  // `lo0` fails with no incumbent to lose to and is only settled by `eth0`
+  // winning at tier 1 two candidates later; `eth1` fails at tier 0 and would
+  // have taken the pick outright. Holding one failure per walk answers with
+  // whichever was kept — here, no failure at all — so each is kept and asked in
+  // turn, and the first that mattered is the one raised.
+  let mut asked = Vec::new();
+  let err = rank_candidates(
+    [(4, 1, "lo0"), (0, 8, "eth0"), (0, 9, "eth1")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("lo0", Family::V4) => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ("eth0", Family::V6) => Ok(false),
+        ("eth1", Family::V4) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        _ => Ok(true),
+      }
+    },
+  )
+  .expect_err("eth1 would have won at tier 0 had its IPv4 been there, so the pick turns on it");
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::Interrupted,
+    "the tier-4 loopback's failure lost its bearing on the pick and must be discarded; the \
+     tier-0 failure that kept its bearing is the one to report, got {err:?}"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("lo0", Family::V4),
+      ("lo0", Family::V6),
+      ("eth0", Family::V4),
+      ("eth0", Family::V6),
+      ("eth1", Family::V4),
+      ("eth1", Family::V6)
+    ]
+  );
+}
+
+// Held failures also have to be weighed against EACH OTHER. A walk where every
+// candidate that could have led is one that failed a read settles no winner at
+// all, and the winner is the only thing the two tests above judge a failure
+// against — so with nothing to judge them by, the first held failure was raised
+// however plainly a later one outranked it. The error names an interface and a
+// family, so that pointed a caller, or a person reading it, at the wrong link.
+
+#[test]
+fn a_held_failure_another_one_outranks_is_never_the_one_reported() {
+  // The #137 pair, both unreadable: an `eth0` with its cable out at base 2 and a
+  // working `wlan0` at base 0, each already serving IPv4 and each failing IPv6.
+  // `eth0` finishes at 2 or 3 and `wlan0` at 0 or 1, so `wlan0` beats it in
+  // every completion of either read and `eth0` could never have won.
+  let dead_link_failed = |name: &str, family| match (name, family) {
+    ("eth0", Family::V6) => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+    ("wlan0", Family::V6) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+    _ => Ok(true),
+  };
+  {
+    let mut asked = Vec::new();
+    let err = rank_candidates(
+      [(2, 7, "eth0"), (0, 8, "wlan0")],
+      true,
+      true,
+      |name, family| {
+        asked.push((*name, family));
+        dead_link_failed(name, family)
+      },
+    )
+    .expect_err("the pick turns on the IPv6 of the link that could have won it");
+    assert_eq!(
+      err.kind(),
+      std::io::ErrorKind::Interrupted,
+      "the reported failure must be the one from the candidate that could still have won, \
+       not whichever was held first: the error names an interface, and naming the link that \
+       was out of the running points a retry at the wrong one, got {err:?}"
+    );
+    assert_eq!(
+      asked,
+      vec![
+        ("eth0", Family::V4),
+        ("eth0", Family::V6),
+        ("wlan0", Family::V4),
+        ("wlan0", Family::V6)
+      ]
+    );
+  }
+  {
+    let mut asked = Vec::new();
+    let err = rank_candidates(
+      [(0, 8, "wlan0"), (2, 7, "eth0")],
+      true,
+      true,
+      |name, family| {
+        asked.push((*name, family));
+        dead_link_failed(name, family)
+      },
+    )
+    .expect_err("the pick turns on the IPv6 of the link that could have won it");
+    assert_eq!(
+      err.kind(),
+      std::io::ErrorKind::Interrupted,
+      "rank decides which held failure is reported, not walk order, got {err:?}"
+    );
+    assert_eq!(
+      asked,
+      vec![
+        ("wlan0", Family::V4),
+        ("wlan0", Family::V6),
+        ("eth0", Family::V4),
+        ("eth0", Family::V6)
+      ]
+    );
+  }
+}
+
+#[test]
+fn a_held_failure_that_may_serve_nothing_rules_no_other_one_out() {
+  // `wlan0` outranks `eth0` on tier and would rule it out — but BOTH of its
+  // requested families failed, so the completion where both come back absent
+  // leaves it serving nothing that was asked for, which is not a candidate at
+  // all. It cannot rule anything out from a rank it may never hold, and `eth0`
+  // is left as one that could still have won.
+  let mut asked = Vec::new();
+  let err = rank_candidates(
+    [(2, 7, "eth0"), (0, 8, "wlan0")],
+    true,
+    true,
+    |name, family| {
+      asked.push((*name, family));
+      match (*name, family) {
+        ("eth0", Family::V4) => Ok(true),
+        ("eth0", Family::V6) => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+      }
+    },
+  )
+  .expect_err("both candidates could still have won, so the pick turns on a read that failed");
+  assert_eq!(
+    err.kind(),
+    std::io::ErrorKind::PermissionDenied,
+    "a candidate is only certain to be ranked at all if a requested family was SEEN present; \
+     weighing a failed read as present here too would let one that may serve nothing rule a \
+     real candidate out, got {err:?}"
+  );
+  assert_eq!(
+    asked,
+    vec![
+      ("eth0", Family::V4),
+      ("eth0", Family::V6),
+      ("wlan0", Family::V4),
+      ("wlan0", Family::V6)
+    ]
   );
 }

@@ -587,9 +587,10 @@ OTHER
 - `hick-udp`: the strict enumeration (`acceptable_mdns_interfaces`) requires
   `RUNNING` as well as `UP`, so a link with no carrier is not offered to a
   caller that intends to bind it. `pick_default_interface_index` is
-  deliberately **more lenient** and ignores `RUNNING`, so a host whose links
-  are momentarily down still gets a default bind instead of being stranded on
-  loopback for the life of the process. Thanks to @wkornewald (#131, #134).
+  deliberately **more lenient** and does not require `RUNNING` — it ranks it,
+  see below — so a host whose links are momentarily down still gets a default
+  bind instead of being stranded on loopback for the life of the process.
+  Thanks to @wkornewald (#131, #134).
 
   Note the standing limitation this makes visible: the default pick is a
   **snapshot** taken once at construction and nothing migrates it, so a device
@@ -597,6 +598,47 @@ OTHER
   between WiFi and cellular — is not handled by it. Multi-interface binding is
   still not supported; see #133, which also records why "one endpoint per
   interface" is not a safe workaround as stated.
+- `hick-udp`: a failed address read on a candidate the default picker was about
+  to discard anyway no longer aborts `pick_default_interface_index`. Families
+  are probed in a fixed order, and the check that skips a candidate which can no
+  longer outrank the incumbent ran **before** each probe, against a tier the
+  candidate's unread families had not yet settled — so a candidate whose IPv4
+  read failed and whose IPv6 was absent ties the incumbent at best and serves no
+  requested family at worst, yet its failure was propagated before IPv6 was ever
+  read and the bind was refused over an answer the pick could not have used. It
+  was order-dependent: probing IPv6 first on the same inputs succeeded. A
+  candidate's first failure is now held to the **end of the walk**, where the
+  winner is finally known, and raised only if that candidate would have won with
+  the family nobody could read weighed as **present** — the answer that ranks it
+  highest — so a failure that could have changed the pick still surfaces.
+  Judging it where it happens is not enough, because the incumbent at that
+  moment is not the winner and there may be no incumbent at all: `lo` is index 1
+  and a `getifs` dump comes back in index order, so the loopback fallback is the
+  first candidate walked on the usual Linux and macOS host, and a failed read
+  there aborted a pick that the real link enumerated after it wins outright.
+  Where several candidates could not be read, the held failures are weighed
+  against one another as well as against that winner — one whose worst possible
+  finish still beats another's best rules that other one out, and one that may
+  turn out to serve no requested family at all rules out nothing — and the first
+  that could still have won is the one raised. The error carries the interface
+  index and the family, so this is what keeps it naming a link the pick could
+  really have turned on rather than whichever failure came first (#130).
+- `hick-udp`: `pick_default_interface_index` now **ranks** `RUNNING` rather than
+  ignoring it. Not requiring a carrier is what keeps a momentarily-down host
+  bindable, but ignoring the flag also made a carrier-less link a full tier-0
+  candidate, and first-seen wins within a tier — so an `eth0` that is up,
+  multicast-capable and addressed with its cable out, enumerated before a
+  working `wlan0`, won the pick, and the pick is a snapshot nothing migrates.
+  The base tiers are now 0 for a `RUNNING` non-loopback link, 2 for one that is
+  up without a carrier and 4 for the loopback fallback; `rank_candidates` still
+  lifts each by one per requested family the candidate has no address in, so the
+  effective order is 0..=5 and lower still wins. A live link therefore beats a
+  dead one in either enumeration order, a dead real link still beats loopback,
+  and a host with nothing running still gets a bind rather than "no
+  multicast-capable interface found" — the availability property the lenient
+  filter exists for, kept strictly rather than by treating every link as equal.
+  The strict filter is untouched: `acceptable_mdns_interfaces` and
+  `is_acceptable_mdns_interface` still require `RUNNING` (#137).
 
 ## Dual-stack partial delivery (`TransmitDelivery`)
 
