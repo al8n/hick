@@ -43,6 +43,16 @@
   endpoint-wide, which is still not host-wide, because a second `Endpoint`, or a
   second process, on the same machine is beyond anything this library can
   observe.
+- `mdns-proto`: the doc on `CONFLICT_REPROBE_MIN_INTERVAL` no longer claims that
+  a hostile peer "cannot prevent the service from ever (re)establishing". It
+  can. A peer that answers each first probe with conflicting authoritative data
+  for the current renamed instance restarts the sequence before probes two and
+  three go out, and those conflicts land pre-authoritatively, where §9's
+  interval does not apply — so a peer willing to conflict with every name
+  attempted keeps the service out of `Announcing` indefinitely. What the two
+  limits bound between them is the rate, not progress: once §8.1's floor is
+  latched the loop turns about once per five seconds. The denial of service
+  itself is inherent to a same-link name adversary; only the claim was wrong.
 
 ## A relinquished record set can no longer retire its own replacement
 

@@ -80,8 +80,24 @@ cfg_heap! {
 
   /// minimum interval between conflict-driven re-probes of an
   /// Established/Announcing service (RFC 6762 §9 conflict rate-limiting). A
-  /// conflict flood cannot reset us to Probing faster than this, so a hostile
-  /// peer cannot prevent the service from ever (re)establishing.
+  /// conflict flood cannot reset us to Probing more than once per interval.
+  ///
+  /// # That is a RATE bound, and it is not a guarantee of progress
+  ///
+  /// It does not follow, and this comment used to say it did, that the service
+  /// eventually (re)establishes. A peer that watches for each first probe and
+  /// answers it immediately with conflicting authoritative data for the CURRENT
+  /// renamed instance restarts the sequence before probes two and three ever go
+  /// out. Those conflicts arrive PRE-AUTHORITATIVELY — §8.1's rename and §8.2's
+  /// deferral adjudicate them, and this interval guards neither; it guards the
+  /// §9 established-state revert only. So a peer willing to conflict with every
+  /// name this service attempts keeps it out of `Announcing` indefinitely, and
+  /// no responder-side rule can stop that: denying a name on the local link is
+  /// something a same-link adversary can simply do.
+  ///
+  /// What the two limits bound between them is the COST of being denied. Once
+  /// §8.1's floor is latched, the loop turns roughly once per five seconds
+  /// instead of several times a second.
   ///
   /// This is NOT the §8.1 flood limit below it, and both are live at once. This
   /// one bounds how often an ESTABLISHED name may be sent back to probing at
