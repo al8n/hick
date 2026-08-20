@@ -12997,10 +12997,11 @@ fn build_instance_nsec_response(buf: &mut [u8], owner: &Name, types: &[u16]) -> 
 /// HISTORY ASSERTS TRANSMITTED BYTES, NOT CLASSIFIER-ACCEPTED FORMS.
 ///
 /// `respond::canonical_rdata_forms` names TWO instance-NSEC bitmaps where the
-/// instance name is also the host name and addresses are published: the fixed
-/// `{SRV, TXT}` this crate's encoder writes, and the accurate `{SRV, TXT, A,
-/// AAAA}` a CONFORMING responder writes at a name that really does hold all
-/// four. Accepting both is right for the LIVE classifier — such a twin is
+/// instance name is also the host name and addresses are published: the
+/// `{SRV, TXT, A, AAAA}` this crate's encoder writes there — the addresses are at
+/// that very name, so the negative answer may not deny them — and the bare
+/// `{SRV, TXT}` a §9 twin treating it as an ordinary instance name writes.
+/// Accepting both is right for the LIVE classifier: such a twin is
 /// indistinguishable from us there, and RFC 6762 §9's identical-rdata rule
 /// protects it from our rename.
 ///
@@ -13008,11 +13009,11 @@ fn build_instance_nsec_response(buf: &mut [u8], owner: &Name, types: &[u16]) -> 
 /// factual: these exact bytes left this endpoint, on this family, in this
 /// generation. Expanding the exposure BOOLEAN through the live list made the
 /// screen answer for a form no `push_service_nsec` ever encoded, so a GENUINE
-/// twin's conforming NSEC read as an old self-echo and the §8.1 / §9 conflict
-/// against the successor was withheld for the whole retention window.
+/// twin's NSEC read as an old self-echo and the §8.1 / §9 conflict against the
+/// successor was withheld for the whole retention window.
 ///
-/// The screen must be NARROWED, not disabled: our own `{SRV, TXT}` echo is
-/// still disowned.
+/// The screen must be NARROWED, not disabled: the bitmap this endpoint really
+/// did write is still disowned as its own echo.
 #[test]
 fn a_conforming_nsec_this_endpoint_never_encoded_is_not_disowned_as_its_own_echo() {
   use crate::wire::ResourceType;
@@ -13052,7 +13053,7 @@ fn a_conforming_nsec_this_endpoint_never_encoded_is_not_disowned_as_its_own_echo
   assert_eq!(
     crate::service::canonical_rdata_forms(&relinquished, ResourceType::Nsec).len(),
     2,
-    "the live classifier must still accept the conforming twin's bitmap — this \
+    "the live classifier must still accept the twin's narrower bitmap — this \
      test is about who ELSE may read that list"
   );
   assert_eq!(
@@ -13073,7 +13074,12 @@ fn a_conforming_nsec_this_endpoint_never_encoded_is_not_disowned_as_its_own_echo
   .unwrap();
 
   let mut buf = [0u8; 512];
-  let emitted_types = [ResourceType::Srv.to_u16(), ResourceType::Txt.to_u16()];
+  let emitted_types = [
+    ResourceType::Srv.to_u16(),
+    ResourceType::Txt.to_u16(),
+    ResourceType::A.to_u16(),
+    ResourceType::AAAA.to_u16(),
+  ];
   let n = build_instance_nsec_response(&mut buf, &name, &emitted_types);
   assert_eq!(
     probe_disowned_from(&mut e, &buf[..n], now, "192.168.1.99:5353"),
@@ -13082,18 +13088,13 @@ fn a_conforming_nsec_this_endpoint_never_encoded_is_not_disowned_as_its_own_echo
      screen is narrowed, not disabled"
   );
 
-  let conforming_types = [
-    ResourceType::Srv.to_u16(),
-    ResourceType::Txt.to_u16(),
-    ResourceType::A.to_u16(),
-    ResourceType::AAAA.to_u16(),
-  ];
-  let n = build_instance_nsec_response(&mut buf, &name, &conforming_types);
+  let twin_types = [ResourceType::Srv.to_u16(), ResourceType::Txt.to_u16()];
+  let n = build_instance_nsec_response(&mut buf, &name, &twin_types);
   assert_eq!(
     probe_unscreened_from(&mut e, &buf[..n], now, "192.168.1.99:5353"),
     std::vec![successor],
-    "a conforming responder's ACCURATE bitmap is a form this endpoint never put \
-     on any wire, so no history of ours may label it — labelling it would cost \
+    "a §9 twin's narrower bitmap is a form this endpoint never put on any wire \
+     at this name, so no history of ours may label it — labelling it would cost \
      the peer that sent it §8.1's immediate rename of our successor"
   );
 

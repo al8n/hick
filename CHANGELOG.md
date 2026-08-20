@@ -1,5 +1,127 @@
 # UNRELEASED
 
+## §7.1 known-answer suppression works again for host addresses at a same-name service
+
+- `mdns-proto`: **behaviour-visible.** Where a service's instance name IS its
+  host name, an inbound A or AAAA known-answer could never suppress the matching
+  address record. The two halves of RFC 6762 §7.1 suppression classified the
+  same record differently: the emit-side filter mapped the CANDIDATE's rtype to
+  an owner role (PTR to the service type, SRV/TXT to the instance, A/AAAA to the
+  host), while ingest classified the ARRIVING record by NAME, walking the
+  service-type, instance and host names in that order with the first match
+  consuming. At a same-name service the instance arm matched first, so an A
+  known-answer was stamped `Instance` against an A candidate stamped `Host` and
+  the owner test could never hold. A querier that already held our address
+  record was sent it again on every query.
+- `mdns-proto`: the direction was benign — the failure was to suppress, so the
+  cost was one redundant but truthful record on a link where §7.1 is a
+  SHOULD-level bandwidth optimisation — and the fix does not trade it for the
+  opposite failure. Over-suppression silences an answer the querier does not
+  hold and nobody else will give, so the regression pins both: a known-answer
+  under an owner that is none of ours, and one at our instance name for a record
+  that lives at our host name, still suppress nothing.
+- `mdns-proto`: both halves now read ONE statement of the rule.
+  `respond::emitted_owner_name` says which of our owner names a record of a
+  given rtype sits at, and it lives beside the encoders that make it true —
+  `the_owner_name_rule_is_the_one_the_encoders_write_at` walks a real message and
+  puts every record either positive multicast encoder writes to it. Ingest binds
+  a hint by asking it for the ARRIVING record's rtype and requiring that record
+  to carry the name it names; the emit-side filter then needs no owner test at
+  all, because a stored hint of a given rtype is by construction a hint at that
+  rtype's owner name. `KasOwner` and the owner field on `KasHint` are gone with
+  the second copy of the rule.
+- `mdns-proto`: nothing changes for a service whose host name is a name of its
+  own. The one further difference is in hint STORAGE, and it can only reduce
+  work: a known-answer whose name is one of ours but whose rtype belongs to a
+  different one of our names — `_svc._tcp.local A x`, say — used to occupy a slot
+  in the sixteen-entry ring where it could never match a candidate, and is now
+  dropped on arrival.
+
+## The §6.1 NSEC no longer denies address records the same announcement carries
+
+- `mdns-proto`: **wire-visible.** Where a service's instance name IS its host
+  name — supported, and what `Endpoint::host_addresses_disagree` is written to
+  keep legal — both positive multicast encoders put the A and AAAA records at
+  that name *and* an RFC 6762 §6.1 NSEC at that same owner asserting `{SRV,
+  TXT}`. The negative answer denied, with the cache-flush bit set, records the
+  very same datagram was handing over: a querier that believed it would not ask
+  again for those addresses until the negative cache entry expired. The bitmap
+  now names each address family the record set publishes at that name — `{SRV,
+  TXT, A}`, `{SRV, TXT, AAAA}` or `{SRV, TXT, A, AAAA}` as configured. Nothing
+  changes on the wire for a service whose host name is a name of its own, which
+  is every other deployment: `{SRV, TXT}` exactly, as before.
+- `mdns-proto`: **no completeness claim is made for that bitmap, and none should
+  be read into it.** It is what ONE `ServiceRecords` publishes at that name, and
+  a second route on the same endpoint can publish there without its knowing.
+  Registration compares instance names to instance names and host names to host
+  names and never across the two roles, and `Endpoint::host_addresses_disagree`
+  deliberately admits a sibling sharing a host name whenever the two publish
+  disjoint address families — so a sibling's AAAA at a name where this record set
+  has only A is still denied. What the change buys is the filed defect and only
+  it: the §6.1 negative no longer denies records the SAME record set publishes at
+  that name. It is also the narrower denial of the two bitmaps available at a
+  shared name, since `{SRV, TXT, A}` denies one address family where `{SRV, TXT}`
+  denied both. The cross-route cases need endpoint-wide owner state the proto
+  layer is not handed, and are tracked separately: a sibling or a cross-role
+  route publishing at this name (#147), a PTR at an instance name (#145), and an
+  NSEC outliving the owner that emitted it (#146).
+- `mdns-proto`: **not withheld**, because the record is a real negative response
+  rather than a decoration. `endpoint::route` matches a question against a
+  route's own unique names and, with answering enabled, routes it on the name
+  alone — there is no qtype filter — and the response cycle queues a reply for
+  any qtype. A query for an ABSENT type at an owned name therefore reaches the
+  responder, and the NSEC riding that reply is the only thing telling the querier
+  the type is not there; withholding it leaves silence and a retransmission
+  timeout. Withholding would also not reach the cross-route cases it would be
+  traded for: `instance == host` is the only test one record set can run, and it
+  cannot see a second route whose HOST name is our INSTANCE name — a name this
+  encoder writes at either way.
+- `mdns-proto`: the emitted bitmap and the locally recognised one now derive
+  from **one** function. `respond::instance_rrset_types` is the single statement
+  of what a record set puts at its instance name, and
+  `respond::emitted_nsec_types` is what the §6.1 record asserts there. Emission,
+  the `emitted_nsec_identity` the endpoint's relinquished-RRset screen retains,
+  and `our_nsec_identities` all read it, so the emitted identity can no longer
+  disagree with the recognised one. Recognition stays deliberately **wider** than
+  emission: an NSEC arriving at a name we are probing is adjudicated whether or
+  not we would have written that exact bitmap, so an RFC 6762 §9 twin's bare
+  `{SRV, TXT}` at a name that also holds addresses still counts as identical
+  rdata — narrowing that would let a twin win §8.1 against us. History narrows in
+  step with emission instead: `transmitted_rdata_forms` names the one bitmap the
+  encoder wrote and no other, which is the direction that cannot suppress a
+  genuine peer's conflict.
+
+## A known answer no longer suppresses past its own expiry
+
+- `mdns-proto`: **behaviour-visible.** Both RFC 6762 §7.1 suppression paths
+  decided whether a known answer was still held WITHOUT consulting the clock
+  `poll_transmit` was handed, so a conforming Sans-I/O caller — one that queues a
+  response and polls it with no `handle_event` or `handle_timeout` in between —
+  could withhold a record the querier no longer had. §7.1 licenses suppression
+  only for a record the querier STILL holds, and over-suppression is the
+  terminal direction: the answer is not sent, and nobody else on the link will
+  send it.
+- `mdns-proto`: the ordinary hint path compared each `KasHint::expires_at`
+  against `last_now`, a field refreshed only by `handle_event` and
+  `handle_timeout`, so it could sit arbitrarily far behind the caller's real
+  instant. `poll_transmit` already receives `now`; the filter now reads it, and
+  `last_now` is documented as what it actually remains for — the instant
+  `poll_timeout` names to report a service due immediately.
+- `mdns-proto`: the RFC 6763 §9 meta-query path stored no expiry at all.
+  `meta_known_answered` was a bare `bool`, set when a meta questioner's
+  known-answer section carried the meta-PTR for our service type and read back
+  as unconditional suppression however much later the reply was polled. The
+  arriving record's TTL was checked against the §7.1 half-TTL threshold on
+  arrival — which says the answer is fresh ENOUGH to suppress, not for how long.
+  With an authoritative TTL of 2 s and a 1 s known answer, a caller polling more
+  than a second later left the querier with no service-type enumeration response.
+  The field now holds the deadline, computed the way `KasHint::expires_at` is —
+  the record's own TTL from the instant its event carried, with an
+  un-representable sum dropping the hint rather than counting as valid — and
+  `poll_transmit` requires it to be ahead of its own `now`.
+- `mdns-proto`: nothing changes for a caller that polls on the instant it fired
+  the timeout, which is what the bundled drivers do.
+
 ## A persistent same-name peer no longer drives one record set's rename loop unthrottled
 
 - `mdns-proto`: a `Service` now applies RFC 6762 §8.1's flood limit — "if
@@ -222,11 +344,18 @@
   unimplemented and a `Service` exposes no records mutator, a duplicate instance
   name and a name a collision goodbye still holds are both refused, and a live
   route publishing the same host name with a different A or AAAA set makes the
-  registration fail outright. The negative assertions are covered too — the
-  encoder emits exactly one §6.1 NSEC per service, owned by the INSTANCE name, so
-  no sibling registration can flip a host-name NSEC's truth. Nothing this
-  endpoint had asserted changed truth-value there, so the advance asserted
-  something false about its own records. With a superseded credit now a standing
+  registration fail outright. The negative assertions are covered too, though
+  more narrowly than this entry once claimed: the encoder emits exactly one §6.1
+  NSEC per service, owned by the INSTANCE name, and a registration changes
+  neither the bytes an existing route has asserted nor the record set those
+  bytes describe. Whether such a bitmap is still ACCURATE for the whole link is a
+  separate question, and a registration CAN change that answer — nothing stops a
+  new route taking an existing instance name as its HOST name, because the guards
+  compare instance to instance and host to host and never across the two roles
+  (#147). Accuracy is not what the self-send generation tracks, though: it tracks
+  whether these bytes are still what this endpoint publishes, and they are.
+  Nothing this endpoint had asserted stopped being its own, so the advance
+  asserted something false about its own records. With a superseded credit now a standing
   tombstone, that falsehood was expensive rather than free: one unrelated
   registration denied §10 observation and §7.1/§7.3 quieting to EVERY
   byte-identical copy of a live service's own bytes for the whole recency

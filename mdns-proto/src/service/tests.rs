@@ -1797,12 +1797,24 @@ fn truncated_meta_query_delays_reply_to_400_500ms() {
   );
 }
 
+/// [`meta_reply_fires_at`] with the reply polled on the same instant the
+/// jittered deadline is fired, which is the ordinary driver shape.
+fn meta_reply_fires(with_ka: bool, ka_from_questioner: bool, ka_ttl: u32) -> bool {
+  meta_reply_fires_at(with_ka, ka_from_questioner, ka_ttl, 200)
+}
+
 /// Drive to Established, deliver a §9 meta-query from a 5353 source, optionally
 /// deliver a meta known-answer (PTR owned by the DNS-SD meta name, target =
-/// our service type) with the given TTL and source, then fire the jittered
-/// deadline. Returns whether a meta-PTR reply was emitted (the only thing
-/// `poll_transmit` can produce in this window — so `false` means suppressed).
-fn meta_reply_fires(with_ka: bool, ka_from_questioner: bool, ka_ttl: u32) -> bool {
+/// our service type) with the given TTL and source, fire the jittered deadline
+/// at 200 ms, then poll `poll_after_ms` after the meta-query arrived. Returns
+/// whether a meta-PTR reply was emitted (the only thing `poll_transmit` can
+/// produce in this window — so `false` means suppressed).
+fn meta_reply_fires_at(
+  with_ka: bool,
+  ka_from_questioner: bool,
+  ka_ttl: u32,
+  poll_after_ms: u64,
+) -> bool {
   use crate::{
     event::{KnownAnswer, ServiceQuestion},
     wire::{QuestionRef, Ref},
@@ -1866,8 +1878,39 @@ fn meta_reply_fires(with_ka: bool, ka_from_questioner: bool, ka_ttl: u32) -> boo
 
   let t = now.advance(200); // past the 20–120 ms meta jitter window
   svc.handle_timeout(t).unwrap();
+  // Only the clock handed to `poll_transmit` moves on from here — no further
+  // event or timeout, which is what a Sans-I/O caller is allowed to do.
+  let polled = now.advance(poll_after_ms);
   let mut buf = std::vec![0u8; 4096];
-  svc.poll_transmit(t, &mut buf).unwrap().is_some()
+  svc.poll_transmit(polled, &mut buf).unwrap().is_some()
+}
+
+/// A meta known-answer that has EXPIRED by the instant `poll_transmit` is given
+/// must not suppress the §9 service-type enumeration reply.
+///
+/// Same class as `an_expired_known_answer_does_not_suppress_at_polls_own_clock`,
+/// on the path that stored no deadline at all: the meta hint was a bare `bool`,
+/// so once set it suppressed on every later poll however long the caller waited.
+/// The half-TTL test at arrival says the answer is fresh ENOUGH to suppress; it
+/// does not say for how long. Over-suppression here is the worst direction in
+/// the crate — the querier gets no service-type enumeration from us, and unlike
+/// an instance record nobody else on the link advertises our type for us.
+#[test]
+fn an_expired_meta_known_answer_does_not_suppress_at_polls_own_clock() {
+  // Our TTL is 120, so a known answer at TTL 60 sits exactly on the §7.1
+  // half-TTL threshold: stored, and expiring 60 s after it arrived.
+  assert!(
+    !meta_reply_fires_at(true, true, 60, 200),
+    "control: a live meta known-answer at the half-TTL threshold must suppress"
+  );
+  assert!(
+    meta_reply_fires_at(true, true, 60, 61_000),
+    "a meta known-answer expired by poll time must NOT suppress the meta reply"
+  );
+  assert!(
+    !meta_reply_fires_at(true, true, 120, 61_000),
+    "control: a known-answer whose own TTL outlives the poll still suppresses"
+  );
 }
 
 /// (RFC 6763 §9 + §7.1): a meta questioner that already knows our
@@ -4513,8 +4556,8 @@ fn kas_wrong_owner_known_answer_does_not_suppress() {
   inject_question_to_set_response_deadline(&mut svc, now);
 
   // Bogus known-answer: an A record OWNED BY THE SERVICE-TYPE name, rdata = our
-  // host's A. It is stored (its name is one of ours) but bound to owner-kind
-  // ServiceType, so it can never match the host-owned A candidate.
+  // host's A. Our A candidate sits at the HOST name, so this names a different
+  // RRset and is dropped on ingest — it can never suppress the host-owned A.
   let mut a_buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut a_buf, "_ipp._tcp.local.", our_ttl, [192, 168, 1, 10]);
   let (a_ref, _) = Ref::try_parse(&a_buf, 0).unwrap();
@@ -4537,6 +4580,125 @@ fn kas_wrong_owner_known_answer_does_not_suppress() {
   assert!(
     a_present,
     "the host A must NOT be suppressed by a wrong-owner (_ipp._tcp.local) A known-answer"
+  );
+}
+
+/// A known-answer that has EXPIRED by the instant `poll_transmit` is given must
+/// not suppress, even though no `handle_timeout` or `handle_event` ran between
+/// the queueing of the response and the poll.
+///
+/// The hint's licence to suppress is the querier still holding the record, and
+/// that licence ends on the caller's clock — which `poll_transmit` receives as
+/// a parameter. Judging it against the last instant some OTHER method happened
+/// to carry lets a permitted Sans-I/O call order (question → `handle_timeout` →
+/// wait → `poll_transmit`) keep a long-dead hint alive: the querier's cache
+/// entry is gone, nobody else on the link will send our record, and RFC 6762
+/// §7.1 licenses no suppression there.
+///
+/// Run at BOTH name coincidences, because that is where an A hint became
+/// storable at all: while the emit side classified a candidate by rtype and
+/// ingest classified an arriving record by walking our names in order, an A at
+/// a name that is also the instance name or the service type bound to the wrong
+/// owner and could never match. Both now bind by rtype, so both reach this
+/// filter.
+#[test]
+fn an_expired_known_answer_does_not_suppress_at_polls_own_clock() {
+  use crate::{
+    event::ServiceQuestion,
+    wire::{MessageReader, QuestionRef, ResourceType},
+  };
+
+  /// Is the A record missing from the response? `host` is the name it sits at —
+  /// one of the two coincidences.
+  fn suppressed_after_expiry(host: &str) -> bool {
+    let our_ttl: u32 = 120;
+    let mut records = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("myprinter._ipp._tcp.local.").unwrap(),
+      Name::try_from_str(host).unwrap(),
+      631,
+      our_ttl,
+    );
+    records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+    let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+      Service::try_new(
+        ServiceHandle::from_raw(0),
+        records,
+        FakeInstant::zero(),
+        [0u8; 32],
+        true,
+        true,
+      );
+    let now = drive_to_established(&mut svc);
+    inject_question_to_set_response_deadline(&mut svc, now);
+
+    // A known-answer for our A record at exactly the §7.1 half-TTL threshold,
+    // so it is stored and expires 60 s after `now`.
+    let mut a_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+    make_a_record_ref(&mut a_buf, host, our_ttl / 2, [192, 168, 1, 10]);
+    let (a_ref, _) = Ref::try_parse(&a_buf, 0).unwrap();
+    svc.handle_event(
+      ServiceEvent::KnownAnswer(KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), a_ref)),
+      now,
+    );
+    assert!(
+      svc
+        .kas_hints
+        .iter()
+        .any(|s| s.map(|h| h.rtype == ResourceType::A).unwrap_or(false)),
+      "the A known-answer must be stored as a hint at host `{host}`"
+    );
+
+    // The question that pulls the A onto the wire, then the jitter window
+    // closes and the response is queued.
+    let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+    for label in "myprinter._ipp._tcp.local."
+      .trim_end_matches('.')
+      .split('.')
+    {
+      qbuf.push(label.len() as u8);
+      qbuf.extend_from_slice(label.as_bytes());
+    }
+    qbuf.push(0u8);
+    qbuf.extend_from_slice(&255u16.to_be_bytes()); // QTYPE ANY
+    qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+    let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+    let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
+    svc.handle_event(
+      ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
+      now,
+    );
+    let queued = now.advance(200);
+    svc.handle_timeout(queued).unwrap();
+    assert_eq!(
+      svc.pending_transmits[0],
+      Some(PendingTransmitKind::Response),
+      "a Response must be queued at host `{host}`"
+    );
+
+    // ONLY the clock handed to `poll_transmit` moves past the hint's expiry —
+    // no further event or timeout, which is what a Sans-I/O caller is allowed
+    // to do and what leaves any cached instant behind.
+    let polled = queued.advance(61_000);
+    let mut out = std::vec![0u8; 4096];
+    let transmit = svc
+      .poll_transmit(polled, &mut out)
+      .unwrap()
+      .expect("the queued response must still be emitted");
+    let reader = MessageReader::try_parse(&out[..transmit.size()]).unwrap();
+    !reader.answers().any(|rr| {
+      rr.map(|rec| rec.rtype() == ResourceType::A)
+        .unwrap_or(false)
+    })
+  }
+
+  assert!(
+    !suppressed_after_expiry("myprinter._ipp._tcp.local."),
+    "instance == host: an expired known-answer must not suppress the A record"
+  );
+  assert!(
+    !suppressed_after_expiry("_ipp._tcp.local."),
+    "service type == host: an expired known-answer must not suppress the A record"
   );
 }
 
@@ -11291,6 +11453,119 @@ fn our_nsec_identities_match_what_the_builder_emits() {
   );
 }
 
+/// A QUERY FOR AN ABSENT TYPE IS ANSWERED, AND THE §6.1 NSEC IS THE ANSWER.
+///
+/// The negative response is not a decoration that only ever rides an
+/// announcement nobody asked for. `endpoint::route` matches a question against a
+/// route's own unique names and, with answering enabled, routes it ON THE NAME
+/// ALONE — there is no qtype filter — and the response cycle below queues a
+/// reply for any qtype. So a querier asking an owned name for a type that is not
+/// there reaches this responder, and the NSEC riding the reply is the only thing
+/// that tells it so. Withholding the record turns that into silence and a
+/// retransmission timeout.
+///
+/// Run at the name RFC 6762 §6.1's defect lived at — instance name IS host name,
+/// where the emitted bitmap now names the address families this record set
+/// publishes rather than denying them.
+#[test]
+fn a_query_for_an_absent_type_at_an_instance_host_name_is_answered_with_an_nsec() {
+  use crate::{
+    event::ServiceQuestion,
+    wire::{MessageReader, QuestionRef, ResourceType},
+  };
+  let name = Name::try_from_str("myprinter._ipp._tcp.local.").unwrap();
+  let mut records = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    name.clone(),
+    name.clone(),
+    631,
+    120,
+  );
+  records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::try_new(
+      ServiceHandle::from_raw(0),
+      records,
+      FakeInstant::zero(),
+      [0u8; 32],
+      true,  // probe
+      false, // re-announce
+    );
+
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = FakeInstant::zero();
+  for _ in 0..30 {
+    now = now.advance(500);
+    svc.handle_timeout(now).unwrap();
+    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_delivery(now, TransmitDelivery::ALL);
+    }
+    if svc.state() == ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(
+    svc.state(),
+    ServiceState::Established,
+    "the fixture must reach the state that answers questions"
+  );
+  now = now.advance(500);
+  svc.handle_timeout(now).unwrap();
+  assert!(
+    svc.poll_transmit(now, &mut buf).unwrap().is_none(),
+    "the fixture must be silent before the question, or the NSEC found below \
+     could be an announcement's rather than the reply's"
+  );
+
+  // HINFO at the instance name: a type this responder holds no record of, and
+  // one no encoder here ever writes.
+  let mut qbuf: std::vec::Vec<u8> = std::vec::Vec::new();
+  for label in name.as_str().trim_end_matches('.').split('.') {
+    qbuf.push(u8::try_from(label.len()).unwrap());
+    qbuf.extend_from_slice(label.as_bytes());
+  }
+  qbuf.push(0u8);
+  qbuf.extend_from_slice(&ResourceType::Hinfo.to_u16().to_be_bytes());
+  qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+  let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
+  let src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
+    now,
+  );
+  now = now.advance(200);
+  svc.handle_timeout(now).unwrap();
+  let tx = svc
+    .poll_transmit(now, &mut buf)
+    .unwrap()
+    .expect("a question at an owned name is answered whatever its qtype");
+  let reader = MessageReader::try_parse(buf.get(..tx.size()).unwrap()).unwrap();
+
+  let nsec = reader
+    .additional()
+    .flatten()
+    .find(|rr| rr.rtype() == ResourceType::Nsec)
+    .expect("the §6.1 negative answer must ride the reply");
+  assert_eq!(
+    &*nsec.canonical_rdata_folded().unwrap(),
+    respond::emitted_nsec_identity(svc.records()).as_slice(),
+    "the negative answer must be the bitmap this record set publishes at that \
+     name"
+  );
+  assert!(
+    respond::emitted_nsec_types(svc.records()).contains(&ResourceType::A.to_u16()),
+    "the reply carries an A record at this very name, so the bitmap riding \
+     beside it must name A rather than deny it"
+  );
+  assert!(
+    reader
+      .answers()
+      .flatten()
+      .any(|rr| rr.rtype() == ResourceType::A),
+    "the same datagram really does assert the A record the bitmap names"
+  );
+}
+
 // ── the reader property the fold relies on ──
 
 /// The reader property the fold depends on, pinned rather than asserted in a
@@ -12452,5 +12727,117 @@ fn a_parked_section9_revert_is_reported_by_the_next_timeout() {
   assert!(
     matches!(svc.poll_transmit(at, &mut buf), Ok(None)),
     "and nothing goes on the wire in the meantime"
+  );
+}
+
+// ── §7.1 owner binding where the instance name IS the host name ──
+
+/// A service whose INSTANCE name IS its HOST name, with one A address — a
+/// supported configuration, and the one in which the two halves of §7.1
+/// suppression used to classify the same record differently.
+fn make_same_name_service(
+  ttl_secs: u32,
+) -> Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> {
+  let name = Name::try_from_str(PROBED_NAME).unwrap();
+  let mut records = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    name.clone(),
+    name,
+    631,
+    ttl_secs,
+  );
+  records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+  Service::try_new(
+    ServiceHandle::from_raw(0),
+    records,
+    FakeInstant::zero(),
+    [0u8; 32],
+    true,
+    true,
+  )
+}
+
+/// Drive `svc` to Established, open a response cycle, feed it an A known-answer
+/// owned by `ka_owner` carrying `addr`, and report whether our A record survived
+/// into the §7.1-filtered response.
+fn a_record_survives_known_answer(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  ka_owner: &str,
+  addr: [u8; 4],
+) -> bool {
+  use crate::wire::{MessageReader, ResourceType};
+
+  let now = drive_to_established(svc);
+  inject_question_to_set_response_deadline(svc, now);
+  let mut a_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  // TTL 120 == our TTL, comfortably over the §7.1 half-TTL threshold.
+  make_a_record_ref(&mut a_buf, ka_owner, 120, addr);
+  let (a_ref, _) = Ref::try_parse(&a_buf, 0).unwrap();
+  let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), a_ref);
+  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+
+  let now2 = now.advance(200);
+  svc.handle_timeout(now2).unwrap();
+  let mut out = std::vec![0u8; 4096];
+  let transmit = svc
+    .poll_transmit(now2, &mut out)
+    .unwrap()
+    .expect("a response must be emitted");
+  let reader = MessageReader::try_parse(&out[..transmit.size()]).unwrap();
+  reader.answers().any(|rr| {
+    rr.map(|rec| rec.rtype() == ResourceType::A)
+      .unwrap_or(false)
+  })
+}
+
+/// RFC 6762 §7.1 known-answer suppression, at a service whose instance name IS
+/// its host name.
+///
+/// The emit side owns the A candidate at `records.host()`. The ingest side used
+/// to stamp an arriving known-answer with the FIRST of our three names that
+/// matched it, and at this configuration that is the instance name — so
+/// `hint.owner == owner` could never hold, and a querier that already held our
+/// address record was sent it again on every query, at every same-name
+/// deployment.
+///
+/// The failure was to SUPPRESS, so its cost was one redundant but truthful
+/// record on a link where §7.1 is a SHOULD-level bandwidth optimisation. The
+/// opposite failure is not benign at all: suppressing a record the querier does
+/// not hold silences an answer nobody else will give. So the direction is pinned
+/// here too — a known-answer under a genuinely different owner must go on
+/// suppressing nothing, in either configuration.
+#[test]
+fn a_host_address_known_answer_suppresses_where_the_instance_name_is_the_host_name() {
+  let our_ttl: u32 = 120;
+  let ours = [192, 168, 1, 10];
+
+  // THE CONTROL — a host name of its own, which is where the two halves already
+  // agreed and where nothing about this changes.
+  let mut svc = make_service(our_ttl);
+  assert!(
+    !a_record_survives_known_answer(&mut svc, "host.local.", ours),
+    "instance != host: a known-answer at our host name names our A RRset and \
+     §7.1 must suppress it"
+  );
+
+  // THE DEFECT — one name owning the instance records and the addresses alike.
+  let mut svc = make_same_name_service(our_ttl);
+  assert!(
+    !a_record_survives_known_answer(&mut svc, PROBED_NAME, ours),
+    "instance == host: the A record sits at that one name, so a known-answer \
+     for it names our RRset and §7.1 must suppress it"
+  );
+
+  // THE DIRECTION — another owner is another RRset, and stays one.
+  let mut svc = make_same_name_service(our_ttl);
+  assert!(
+    a_record_survives_known_answer(&mut svc, "someone-else.local.", ours),
+    "a known-answer under an owner that is none of ours must suppress nothing"
+  );
+  let mut svc = make_service(our_ttl);
+  assert!(
+    a_record_survives_known_answer(&mut svc, PROBED_NAME, ours),
+    "instance != host: our A sits at the HOST name, so a same-rdata answer at \
+     the INSTANCE name is a different RRset and must not suppress it"
   );
 }

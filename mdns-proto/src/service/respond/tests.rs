@@ -544,8 +544,7 @@ fn instance_rtype_exposure_mirrors_the_canonical_forms() {
 /// transmitted form, or that type silently drops out of both retention tiers.
 #[test]
 fn transmitted_forms_never_widen_the_canonical_ones() {
-  let recs = same_name_records();
-  for rtype in [
+  let rtypes = [
     ResourceType::A,
     ResourceType::AAAA,
     ResourceType::Ptr,
@@ -556,32 +555,50 @@ fn transmitted_forms_never_widen_the_canonical_ones() {
     ResourceType::Cname,
     ResourceType::Any,
     ResourceType::Unknown(0xBEEF),
-  ] {
-    let live = super::canonical_rdata_forms(&recs, rtype);
-    let transmitted = super::transmitted_rdata_forms(&recs, rtype);
-    assert!(
-      transmitted.iter().all(|f| live.contains(f)),
-      "{rtype}: history claims a form the live classifier does not even accept; \
-       transmitted {transmitted:?}, live {live:?}"
-    );
+  ];
+  for recs in [dual_stack_records(), same_name_records()] {
+    for rtype in rtypes {
+      let live = super::canonical_rdata_forms(&recs, rtype);
+      let transmitted = super::transmitted_rdata_forms(&recs, rtype);
+      assert!(
+        transmitted.iter().all(|f| live.contains(f)),
+        "{rtype}: history claims a form the live classifier does not even accept; \
+         transmitted {transmitted:?}, live {live:?}"
+      );
+      assert_eq!(
+        !transmitted.is_empty(),
+        super::INSTANCE_CANONICAL_RTYPES.contains(&rtype),
+        "{rtype}: the stated domain of the instance-rdata rule disagrees with \
+         what history can name a transmitted form for"
+      );
+    }
+  }
+  // With a host name of its own there is no second spelling for any type, so the
+  // two lists coincide.
+  let separate_host = dual_stack_records();
+  for rtype in rtypes {
     assert_eq!(
-      !transmitted.is_empty(),
-      super::INSTANCE_CANONICAL_RTYPES.contains(&rtype),
-      "{rtype}: the stated domain of the instance-rdata rule disagrees with what \
-       history can name a transmitted form for"
+      super::transmitted_rdata_forms(&separate_host, rtype),
+      super::canonical_rdata_forms(&separate_host, rtype),
+      "{rtype}: with a host name of its own there is no conforming second \
+       spelling, so the two lists coincide"
     );
   }
-  // The point of the pair: at THIS record set the two lists differ, and they
-  // differ for exactly one type.
+  // The point of the pair: at an instance name that is ALSO the host name the
+  // two lists differ, and they differ for exactly one type. The live classifier
+  // keeps accepting a §9 twin's bare `{SRV, TXT}` — a twin that spells the same
+  // claim more narrowly is not a conflict — while history keeps the one bitmap
+  // the encoder actually wrote there.
+  let same_name = same_name_records();
   assert_eq!(
-    super::canonical_rdata_forms(&recs, ResourceType::Nsec).len(),
+    super::canonical_rdata_forms(&same_name, ResourceType::Nsec).len(),
     2,
-    "an instance name that is also the host name is where the conforming twin's \
+    "an instance name that is also the host name is where the twin's narrower \
      bitmap is a second accepted form"
   );
   assert_eq!(
-    super::transmitted_rdata_forms(&recs, ResourceType::Nsec),
-    std::vec![super::emitted_nsec_identity(&recs)],
+    super::transmitted_rdata_forms(&same_name, ResourceType::Nsec),
+    std::vec![super::emitted_nsec_identity(&same_name)],
     "history keeps the encoder's bitmap and nothing else"
   );
 }
@@ -592,29 +609,26 @@ fn transmitted_forms_never_widen_the_canonical_ones() {
 /// never sent, or stop answering for one it did.
 #[test]
 fn the_emitted_nsec_identity_is_the_bitmap_the_encoder_writes() {
-  let recs = same_name_records();
-  let mut msg = [0u8; 512];
-  let mut b =
-    crate::wire::MessageBuilder::<'_, 32>::try_new(&mut msg, crate::wire::Header::new()).unwrap();
-  assert!(
-    super::push_service_nsec(&mut b, &recs),
-    "the NSEC must fit a 512-byte buffer"
-  );
-  let n = b.finish().unwrap();
-  let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
-  let rec = reader.additional().flatten().next().unwrap();
-  let on_the_wire = rec.canonical_rdata_folded().unwrap();
-  assert_eq!(
-    super::emitted_nsec_identity(&recs).as_slice(),
-    &*on_the_wire,
-    "the identity history retains must be byte-identical to what the encoder put \
-     on the wire"
-  );
+  for recs in [
+    dual_stack_records(),
+    same_name_records(),
+    same_name_v4_only_records(),
+  ] {
+    let (wrote, on_the_wire) = encode_service_nsec(&recs);
+    assert!(wrote, "the NSEC must fit a 512-byte buffer");
+    assert_eq!(
+      on_the_wire,
+      std::vec![super::emitted_nsec_identity(&recs)],
+      "the identity history retains must be byte-identical to what the encoder \
+       put on the wire"
+    );
+  }
 }
 
 /// A record set whose INSTANCE name IS its HOST name, with both address
 /// families — the configuration in which `our_nsec_identities` names a second,
-/// CONFORMING bitmap that this crate's encoder never writes.
+/// narrower bitmap (a §9 twin's bare `{SRV, TXT}`) that this crate's encoder
+/// does not write there.
 fn same_name_records() -> crate::records::ServiceRecords {
   use core::net::{Ipv4Addr, Ipv6Addr};
   let name = crate::Name::try_from_str("MyPrinter._ipp._tcp.local.").unwrap();
@@ -1007,4 +1021,283 @@ fn the_envelope_is_the_one_the_encoders_actually_write() {
     proposed >= 4,
     "the probe proposes SRV, TXT and both addresses; saw {proposed}"
   );
+}
+
+// ── RFC 6762 §6.1: what we EMIT and what we RECOGNISE are one fact ──
+
+/// A record set whose INSTANCE name IS its HOST name with only ONE address
+/// family — the shape that shows the bitmap tracks what this record set
+/// actually publishes, and the shape whose residual `respond::emitted_nsec_types`
+/// states: a sibling may legally publish the OTHER family at that very name
+/// (`Endpoint::host_addresses_disagree` compares per rrtype precisely so that
+/// pair stays legal), and this bitmap cannot see it.
+fn same_name_v4_only_records() -> crate::records::ServiceRecords {
+  use core::net::Ipv4Addr;
+  let name = crate::Name::try_from_str("MyPrinter._ipp._tcp.local.").unwrap();
+  let mut r = crate::records::ServiceRecords::new(
+    crate::Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    name.clone(),
+    name,
+    631,
+    120,
+  );
+  r.add_a(Ipv4Addr::new(192, 168, 1, 5));
+  r
+}
+
+/// A record's owner name, lowercased and dot-joined — an owner IDENTITY two
+/// records of one message can be compared on without caring which of them the
+/// compression table pointed at.
+fn owner_key(rec: &Ref<'_>) -> std::string::String {
+  let mut out = std::string::String::new();
+  for label in rec.name().labels() {
+    let label = label.unwrap();
+    out.push_str(&std::string::String::from_utf8_lossy(label).to_lowercase());
+    out.push('.');
+  }
+  out
+}
+
+/// The rrtypes an NSEC's RFC 4034 §4.1.2 bitmap says DO exist, read back off the
+/// wire: `next_name` in wire form (length-prefixed labels, root 0x00), then the
+/// single window block RFC 6762 §6.1 restricts mDNS to.
+fn nsec_present_types(folded: &[u8]) -> std::vec::Vec<u16> {
+  let mut i = 0usize;
+  while let Some(&len) = folded.get(i) {
+    i += 1;
+    if len == 0 {
+      break;
+    }
+    i += usize::from(len);
+  }
+  assert_eq!(
+    folded.get(i),
+    Some(&0u8),
+    "RFC 6762 §6.1 restricts mDNS NSEC to type-bitmap window block 0"
+  );
+  let blen = usize::from(*folded.get(i + 1).expect("a block length byte"));
+  let mut out = std::vec::Vec::new();
+  for (byte_idx, byte) in folded[i + 2..i + 2 + blen].iter().enumerate() {
+    for bit in 0..8u16 {
+      if byte & (0x80u8 >> bit) != 0 {
+        out.push(u16::try_from(byte_idx).unwrap() * 8 + bit);
+      }
+    }
+  }
+  out
+}
+
+/// Check every NSEC in `msg` against the message's own positive answers, and
+/// return how many NSECs it carried.
+///
+/// The property: an NSEC may not deny an rrtype that the SAME message asserts at
+/// the NSEC's own owner name. That is RFC 6762 §6.1's whole premise — the
+/// responder "can legitimately assert that no record with that name, rrtype, and
+/// rrclass exists" — read back off the datagram instead of off a constant.
+fn nsec_count_after_checking_denials(msg: &[u8]) -> usize {
+  let reader = crate::wire::MessageReader::try_parse(msg).unwrap();
+  let asserted: std::vec::Vec<(std::string::String, u16)> = reader
+    .answers()
+    .flatten()
+    .map(|rr| (owner_key(&rr), rr.rtype().to_u16()))
+    .collect();
+  let mut seen = 0usize;
+  for rr in reader.additional().flatten() {
+    if rr.rtype() != ResourceType::Nsec {
+      continue;
+    }
+    seen += 1;
+    let owner = owner_key(&rr);
+    let folded = rr.canonical_rdata_folded().unwrap();
+    let present = nsec_present_types(&folded);
+    for (answer_owner, rtype) in &asserted {
+      if *answer_owner != owner {
+        continue;
+      }
+      assert!(
+        present.contains(rtype),
+        "the §6.1 NSEC at {owner} denies rrtype {rtype}, which this very message \
+         asserts at that same owner; the bitmap lists {present:?}"
+      );
+    }
+  }
+  seen
+}
+
+/// The bytes `write_announce` produces for `records`.
+fn announce_bytes(records: &crate::records::ServiceRecords) -> std::vec::Vec<u8> {
+  let mut buf = std::vec![0u8; 1500];
+  let (n, _) = super::write_announce(records, &mut buf).unwrap();
+  buf.truncate(n);
+  buf
+}
+
+/// The bytes `write_announce_filtered` produces for `records` with no §7.1 hint
+/// suppressing anything — the other positive multicast encoder, which reaches
+/// `push_service_nsec` through its own call site.
+fn filtered_bytes(records: &crate::records::ServiceRecords) -> std::vec::Vec<u8> {
+  let mut buf = std::vec![0u8; 1500];
+  let (n, _) = super::write_announce_filtered(records, &mut buf, |_, _| false).unwrap();
+  buf.truncate(n);
+  buf
+}
+
+/// The §6.1 NSEC this crate emits must not deny records the same announcement
+/// carries.
+///
+/// Both positive multicast encoders write the A and AAAA records at
+/// `records.host()` and the NSEC at `records.instance()`. Where those two names
+/// are ONE — a supported configuration — a `{SRV, TXT}` bitmap is a
+/// cache-flushed authoritative denial of address records sitting in the very
+/// same datagram, and a querier that believes it will not ask again for the
+/// addresses it was just handed until the negative cache entry expires.
+///
+/// Asserted over the DATAGRAM, not over a bitmap constant: whatever this crate
+/// decides to emit, no NSEC may deny a type its own message asserts at that
+/// owner. The count is pinned in the same breath, because the other way to stop
+/// denying a record is to stop answering at all.
+#[test]
+fn no_emitted_nsec_denies_a_type_the_same_message_carries() {
+  // The first fixture is the CONTROL — a host name of its own, which is how this
+  // crate is overwhelmingly deployed. The other two are the defect: the instance
+  // name IS the host name, so the addresses land at the NSEC's own owner.
+  for recs in [
+    dual_stack_records(),
+    same_name_records(),
+    same_name_v4_only_records(),
+  ] {
+    for msg in [announce_bytes(&recs), filtered_bytes(&recs)] {
+      assert_eq!(
+        nsec_count_after_checking_denials(&msg),
+        1,
+        "every positive multicast response carries its §6.1 NSEC"
+      );
+    }
+  }
+}
+
+/// Run `push_service_nsec` into a fresh message; hand back whether it reported
+/// writing, and the identity bytes of every NSEC that actually reached the wire.
+fn encode_service_nsec(
+  records: &crate::records::ServiceRecords,
+) -> (bool, std::vec::Vec<std::vec::Vec<u8>>) {
+  let mut msg = [0u8; 512];
+  let mut b =
+    crate::wire::MessageBuilder::<'_, 32>::try_new(&mut msg, crate::wire::Header::new()).unwrap();
+  let wrote = super::push_service_nsec(&mut b, records);
+  let n = b.finish().unwrap();
+  let reader = crate::wire::MessageReader::try_parse(&msg[..n]).unwrap();
+  let forms = reader
+    .additional()
+    .flatten()
+    .map(|rr| rr.canonical_rdata_folded().unwrap().to_vec())
+    .collect();
+  (wrote, forms)
+}
+
+/// The EMITTED identity and the LOCALLY RECOGNISED identities are two readings
+/// of ONE fact, and the defect was that each kept its own copy of it. Pinned
+/// against the FUNCTIONS rather than against a literal bitmap, so the two cannot
+/// drift apart again.
+///
+/// They are not EQUAL, and must not be: recognition is lenient where emission is
+/// exact, so `our_nsec_identities` also accepts a §9 twin's bare `{SRV, TXT}` at
+/// a name that holds addresses. What has to hold is that whatever the encoder
+/// puts on the wire is in that list — otherwise our own record comes back as
+/// inconsistent rdata at a name we are probing.
+#[test]
+fn whatever_the_encoder_writes_is_recognised_as_ours() {
+  for recs in [
+    dual_stack_records(),
+    same_name_records(),
+    same_name_v4_only_records(),
+  ] {
+    let recognised = super::our_nsec_identities(&recs);
+    let (wrote, on_the_wire) = encode_service_nsec(&recs);
+    assert!(wrote, "the §6.1 NSEC is written at every instance name");
+    assert_eq!(
+      on_the_wire.len(),
+      usize::from(wrote),
+      "the reported answer must be the number of NSECs that reached the wire"
+    );
+    for form in &on_the_wire {
+      assert!(
+        recognised.contains(form),
+        "the encoder wrote an NSEC the recogniser would not accept as ours: \
+         {form:?} is not among {recognised:?}"
+      );
+    }
+  }
+}
+
+/// The bitmap each shape of record set asserts, pinned by VALUE — what changed
+/// on the wire and what did not.
+#[test]
+fn the_emitted_bitmap_names_the_address_families_this_record_set_publishes() {
+  let srv = ResourceType::Srv.to_u16();
+  let txt = ResourceType::Txt.to_u16();
+  let a = ResourceType::A.to_u16();
+  let aaaa = ResourceType::AAAA.to_u16();
+  assert_eq!(
+    super::emitted_nsec_types(&dual_stack_records()),
+    std::vec![srv, txt],
+    "a host name of its own puts no address record at the instance name, so \
+     nothing changes on the wire there"
+  );
+  assert_eq!(
+    super::emitted_nsec_types(&same_name_records()),
+    std::vec![srv, txt, a, aaaa],
+    "the addresses this record set publishes at that name are named, not denied"
+  );
+  assert_eq!(
+    super::emitted_nsec_types(&same_name_v4_only_records()),
+    std::vec![srv, txt, a],
+    "and only the families it actually publishes — the bitmap describes this \
+     record set, not the name"
+  );
+}
+
+/// `emitted_owner_name` is the ONE statement of which of our names a record of a
+/// given rtype sits at, and THE ENCODERS ARE WHAT MAKE IT TRUE — so it is pinned
+/// against a real message rather than against a second hand-maintained list.
+/// Every record both positive multicast encoders write, in every section, must
+/// sit at the owner this rule names for its rtype.
+///
+/// An encoder that moves a record to another owner name, or adds a type the rule
+/// does not answer for, fails here rather than silently splitting §7.1's owner
+/// binding back into the two disagreeing copies it had.
+#[test]
+fn the_owner_name_rule_is_the_one_the_encoders_write_at() {
+  for recs in [dual_stack_records(), same_name_records()] {
+    for msg in [announce_bytes(&recs), filtered_bytes(&recs)] {
+      let reader = crate::wire::MessageReader::try_parse(&msg).unwrap();
+      let mut checked = 0usize;
+      for rr in reader
+        .answers()
+        .flatten()
+        .chain(reader.additional().flatten())
+      {
+        // The RFC 6763 §7.1 SUBTYPE PTRs are the documented exception: they are
+        // never offered as §7.1 candidates, so the rule does not answer for them.
+        if rr.rtype() == ResourceType::Ptr
+          && !crate::endpoint::names_match_record(recs.service_type(), &rr)
+        {
+          continue;
+        }
+        let owner = super::emitted_owner_name(&recs, rr.rtype()).unwrap_or_else(|| {
+          panic!("an encoder wrote a {} the owner rule names no owner for", rr.rtype())
+        });
+        assert!(
+          crate::endpoint::names_match_record(owner, &rr),
+          "the encoder wrote a {} at an owner name the rule does not name for it",
+          rr.rtype()
+        );
+        checked += 1;
+      }
+      assert!(
+        checked >= 4,
+        "the fixture must put several rtypes to the rule; only {checked} were checked"
+      );
+    }
+  }
 }
