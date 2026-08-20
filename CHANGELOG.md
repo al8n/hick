@@ -91,6 +91,37 @@
   encoder wrote and no other, which is the direction that cannot suppress a
   genuine peer's conflict.
 
+## A known answer no longer suppresses past its own expiry
+
+- `mdns-proto`: **behaviour-visible.** Both RFC 6762 §7.1 suppression paths
+  decided whether a known answer was still held WITHOUT consulting the clock
+  `poll_transmit` was handed, so a conforming Sans-I/O caller — one that queues a
+  response and polls it with no `handle_event` or `handle_timeout` in between —
+  could withhold a record the querier no longer had. §7.1 licenses suppression
+  only for a record the querier STILL holds, and over-suppression is the
+  terminal direction: the answer is not sent, and nobody else on the link will
+  send it.
+- `mdns-proto`: the ordinary hint path compared each `KasHint::expires_at`
+  against `last_now`, a field refreshed only by `handle_event` and
+  `handle_timeout`, so it could sit arbitrarily far behind the caller's real
+  instant. `poll_transmit` already receives `now`; the filter now reads it, and
+  `last_now` is documented as what it actually remains for — the instant
+  `poll_timeout` names to report a service due immediately.
+- `mdns-proto`: the RFC 6763 §9 meta-query path stored no expiry at all.
+  `meta_known_answered` was a bare `bool`, set when a meta questioner's
+  known-answer section carried the meta-PTR for our service type and read back
+  as unconditional suppression however much later the reply was polled. The
+  arriving record's TTL was checked against the §7.1 half-TTL threshold on
+  arrival — which says the answer is fresh ENOUGH to suppress, not for how long.
+  With an authoritative TTL of 2 s and a 1 s known answer, a caller polling more
+  than a second later left the querier with no service-type enumeration response.
+  The field now holds the deadline, computed the way `KasHint::expires_at` is —
+  the record's own TTL from the instant its event carried, with an
+  un-representable sum dropping the hint rather than counting as valid — and
+  `poll_transmit` requires it to be ahead of its own `now`.
+- `mdns-proto`: nothing changes for a caller that polls on the instant it fired
+  the timeout, which is what the bundled drivers do.
+
 ## A persistent same-name peer no longer drives one record set's rename loop unthrottled
 
 - `mdns-proto`: a `Service` now applies RFC 6762 §8.1's flood limit — "if
