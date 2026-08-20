@@ -4102,8 +4102,8 @@ where
   /// cannot be represented rather than a deadline merely failing to compute:
   /// when RFC 6762 §8.1's flood limit is in force and `now + 5 s` does not exist
   /// on this clock, the restarted probe sequence is parked with no deadline —
-  /// see [`Service::apply_backoff_floor`] — and this reports that rather than
-  /// leaving it indistinguishable from an idle tick. The condition is
+  /// see the backoff floor the restart path applies — and this reports that
+  /// rather than leaving it indistinguishable from an idle tick. The condition is
   /// re-evaluated on every subsequent call, so the error repeats for as long as
   /// the service stays parked and stops when it can be scheduled again.
   ///
