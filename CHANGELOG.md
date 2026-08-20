@@ -14,7 +14,14 @@
   on a rename would reset it on the very event being throttled. It is kept in a
   fixed ring of fifteen instants — the condition is exactly "is the
   fifteenth-most-recent conflict within ten seconds of now" — so nothing is
-  allocated. Once in force the floor applies to *each* successive attempt and is
+  allocated. Each is dated by when its conflict was **received**, not by when the
+  state machine got round to acting on it: a pre-authoritative conflict latches
+  on arrival and is spent on a later tick, so dating the ring by the later
+  instant measured a burst as wider than it was, and fifteen conflicts genuinely
+  inside ten seconds could be consumed just outside it, fail to latch, and probe
+  again in under five seconds. The five-second wait itself is still anchored to
+  the handler's current `now`, because scheduling it from a stale instant would
+  end it early. Once in force the floor applies to *each* successive attempt and is
   released only by the flood stopping: a whole ten-second window with no
   conflict at all. Re-deriving it per probe instead would come off two turns
   later and hand the flood its speed back, because five-second spacing is itself
@@ -72,6 +79,17 @@
   0-250 ms delay for a sequence the limit is holding, and the regress invariant
   now reads "armed, or the clock cannot express the wait §8.1 owes". Services
   whose limit is not in force are untouched, overflow and all.
+- `mdns-proto`: **`Service::handle_timeout` now returns the existing
+  `HandleTimeoutError::Overflow`** whenever it leaves a service parked — in
+  `Init` with no deadline because a mandated wait was unrepresentable — instead
+  of `Ok(())`, which a caller could not tell from an ordinary idle tick. The
+  condition is re-evaluated every call, so the error repeats for as long as the
+  park lasts and stops when the sequence can be scheduled again. The §9 revert
+  reached through `Service::handle_event` **cannot** report it: that method
+  returns `()` and `ServiceUpdate` has no variant meaning "parked". The park is
+  real on that path; it is traced, and the next `handle_timeout` reports it
+  properly. Giving `handle_event` an error channel, or `ServiceUpdate` a
+  variant, is a public-API decision and is deliberately not taken here.
 
 ## A relinquished record set can no longer retire its own replacement
 

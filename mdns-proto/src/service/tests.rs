@@ -11851,6 +11851,21 @@ fn one_conflict_turn(
   svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
   from: FakeInstant,
 ) -> (FakeInstant, FakeInstant) {
+  let (_arrived, consumed, armed) = conflict_turn_with_lag(svc, from, 0);
+  (consumed, armed)
+}
+
+/// One turn of the same loop, with `lag_ms` between the conflict being RECEIVED
+/// and the timeout that spends it — returning `(arrived, consumed, armed)`.
+///
+/// The lag is the whole of the boundary case. §8.1 counts conflicts by when they
+/// occur, and this crate acts on a pre-authoritative one on a later tick, so the
+/// two instants genuinely differ and only one of them is the RFC's.
+fn conflict_turn_with_lag(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  from: FakeInstant,
+  lag_ms: u64,
+) -> (FakeInstant, FakeInstant, FakeInstant) {
   let mut buf = std::vec![0u8; 4096];
   let mut now = from;
   let mut on_wire = false;
@@ -11880,11 +11895,52 @@ fn one_conflict_turn(
     "the response must classify as a §8.1 defeat"
   );
   // Spend the classification: this timeout is the rename.
-  svc.handle_timeout(now).unwrap();
+  let consumed = now.advance(lag_ms);
+  svc.handle_timeout(consumed).unwrap();
   let armed = svc
     .lifecycle_deadline
     .expect("a rename must re-arm the clock");
-  (now, armed)
+  (now, consumed, armed)
+}
+
+/// §8.1's condition is about when conflicts OCCUR, so a burst that satisfies it
+/// on arrival is still a burst when the last of them is acted on late.
+///
+/// The ring used to be dated by the instant each conflict was CONSUMED. Fifteen
+/// conflicts genuinely inside ten seconds could then be spent just outside it —
+/// one slow tick is enough — the measured span came out over the window, the
+/// latch stayed off, and the service probed again in under five seconds after a
+/// burst that had met the MUST.
+#[test]
+fn a_burst_inside_the_window_latches_even_when_the_last_is_spent_outside_it() {
+  let mut svc = make_service(120);
+  let mut now = FakeInstant::zero();
+  let mut first_arrival = None;
+  for _ in 0..14 {
+    let (arrived, consumed, _) = conflict_turn_with_lag(&mut svc, now, 0);
+    first_arrival.get_or_insert(arrived);
+    now = consumed;
+  }
+  let first = first_arrival.expect("fourteen turns ran");
+  let (arrived, consumed, armed) = conflict_turn_with_lag(&mut svc, now, 7_000);
+  assert!(
+    arrived.0.saturating_sub(first.0) <= 10_000,
+    "the fixture must land all fifteen conflicts INSIDE §8.1's ten seconds; the \
+     fifteenth arrived {} ms after the first",
+    arrived.0.saturating_sub(first.0)
+  );
+  assert!(
+    consumed.0.saturating_sub(first.0) > 10_000,
+    "…and must spend the fifteenth OUTSIDE that window, or this is not the \
+     boundary case; it was spent {} ms after the first arrived",
+    consumed.0.saturating_sub(first.0)
+  );
+  assert!(
+    armed.0.saturating_sub(consumed.0) >= 5_000,
+    "fifteen conflicts DID occur inside ten seconds, so the five-second floor is \
+     owed however late the fifteenth was acted on; it armed {} ms out",
+    armed.0.saturating_sub(consumed.0)
+  );
 }
 
 /// RFC 6762 §8.1:
@@ -12141,7 +12197,10 @@ fn bounded_probing_service(start: BoundedInstant, latched: bool) -> BoundedServi
 /// §8.2 rather than §8.1's rename because its wait is a FIXED one second. The
 /// rename's is a random 0-250 ms, which cannot say which overflow arm a fixture
 /// reached, and that is the whole question here.
-fn lose_bounded_tiebreak(svc: &mut BoundedService, at: BoundedInstant) {
+fn lose_bounded_tiebreak(
+  svc: &mut BoundedService,
+  at: BoundedInstant,
+) -> Result<(), crate::error::HandleTimeoutError> {
   let bytes = srv_txt_proposal(9999);
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   svc.handle_event(
@@ -12152,8 +12211,9 @@ fn lose_bounded_tiebreak(svc: &mut BoundedService, at: BoundedInstant) {
     svc.tiebreak_lost,
     "the proposal must classify as a §8.2 loss for the fixture to mean anything"
   );
-  svc.handle_timeout(at).unwrap();
+  let outcome = svc.handle_timeout(at);
   assert_eq!(svc.state(), ServiceState::Init, "…and restart the sequence");
+  outcome
 }
 
 /// The control: while the clock can still express the floor, the floor is what
@@ -12162,7 +12222,10 @@ fn lose_bounded_tiebreak(svc: &mut BoundedService, at: BoundedInstant) {
 fn a_representable_floor_is_armed_exactly() {
   let mut svc = bounded_probing_service(BoundedInstant(0), true);
   let at = BoundedInstant(BoundedInstant::CEILING - 10_000);
-  lose_bounded_tiebreak(&mut svc, at);
+  assert!(
+    lose_bounded_tiebreak(&mut svc, at).is_ok(),
+    "a floor this clock can express is not an overflow"
+  );
   assert_eq!(
     svc.lifecycle_deadline,
     Some(BoundedInstant(at.0 + 5_000)),
@@ -12191,7 +12254,14 @@ fn an_unrepresentable_floor_arms_nothing_rather_than_the_shorter_deadline() {
     at.checked_add_duration(Duration::from_secs(5)).is_none(),
     "…and §8.1's floor outside it, or it is not testing the (Some, None) arm"
   );
-  lose_bounded_tiebreak(&mut svc, at);
+  assert!(
+    matches!(
+      lose_bounded_tiebreak(&mut svc, at),
+      Err(crate::error::HandleTimeoutError::Overflow)
+    ),
+    "parking is not idleness: the caller must be told the wait could not be \
+     scheduled"
+  );
   assert!(
     svc.lifecycle_deadline.is_none(),
     "an unrepresentable floor arms NOTHING; it armed {:?}",
@@ -12202,7 +12272,13 @@ fn an_unrepresentable_floor_arms_nothing_rather_than_the_shorter_deadline() {
   // fabricate a start time for a sequence that has none, so it is driven here
   // rather than assumed inert.
   let mut buf = std::vec![0u8; 4096];
-  svc.handle_timeout(at).unwrap();
+  assert!(
+    matches!(
+      svc.handle_timeout(at),
+      Err(crate::error::HandleTimeoutError::Overflow)
+    ),
+    "…and told again on every tick it stays parked, not just the first"
+  );
   assert!(
     svc.lifecycle_deadline.is_none(),
     "the Init re-schedule must not hand a latched flood a fresh 0-250 ms delay; \
@@ -12214,7 +12290,13 @@ fn an_unrepresentable_floor_arms_nothing_rather_than_the_shorter_deadline() {
     "nothing may go on the wire while the mandated wait cannot be scheduled"
   );
   let ceiling = BoundedInstant(BoundedInstant::CEILING);
-  svc.handle_timeout(ceiling).unwrap();
+  assert!(
+    matches!(
+      svc.handle_timeout(ceiling),
+      Err(crate::error::HandleTimeoutError::Overflow)
+    ),
+    "…including at the last instant this clock has"
+  );
   assert!(
     svc.lifecycle_deadline.is_none(),
     "…still true at the last instant this clock has"
@@ -12245,7 +12327,13 @@ fn neither_the_deferral_nor_the_floor_representable_arms_nothing() {
     at.checked_add_duration(Duration::from_secs(5)).is_none(),
     "…along with §8.1's floor, or it is not testing the (None, None) arm"
   );
-  lose_bounded_tiebreak(&mut svc, at);
+  assert!(
+    matches!(
+      lose_bounded_tiebreak(&mut svc, at),
+      Err(crate::error::HandleTimeoutError::Overflow)
+    ),
+    "neither wait schedulable is still a reported overflow, not a silent park"
+  );
   assert_eq!(
     svc.name().as_str(),
     kept,
@@ -12271,10 +12359,98 @@ fn an_unlatched_service_is_not_touched_by_the_floor() {
   let mut svc = bounded_probing_service(BoundedInstant(0), false);
   assert!(!svc.conflict_backoff, "the fixture starts unlatched");
   let at = BoundedInstant(BoundedInstant::CEILING - 2_000);
-  lose_bounded_tiebreak(&mut svc, at);
+  assert!(
+    lose_bounded_tiebreak(&mut svc, at).is_ok(),
+    "a service the limit is not holding owes no floor and cannot overflow one"
+  );
   assert_eq!(
     svc.lifecycle_deadline,
     Some(BoundedInstant(at.0 + 1_000)),
     "§8.2's one second is owed in full and nothing else is"
+  );
+}
+
+/// Deliver one §9 conflict to a service on the bounded clock.
+fn deliver_bounded_srv_conflict(svc: &mut BoundedService, now: BoundedInstant) {
+  let owner = svc.name().as_str().to_owned();
+  let mut buf = std::vec::Vec::new();
+  make_srv_record_ref(&mut buf, &owner, 120, 0, 0, 9999, "host.local.");
+  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
+  let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeConflict(ProbeConflict::new(
+      peer,
+      rec,
+      dg(1),
+      ConflictHistory::Unmatched,
+      ConflictRole::Instance,
+    )),
+    now,
+  );
+}
+
+/// Drive a bounded-clock service to Established so a conflict reaches §9's arm
+/// rather than the pre-authoritative one.
+fn drive_bounded_to_established(svc: &mut BoundedService) -> BoundedInstant {
+  let mut buf = std::vec![0u8; 4096];
+  let mut now = BoundedInstant(0);
+  for _ in 0..20 {
+    now = BoundedInstant(now.0 + 500);
+    svc.handle_timeout(now).unwrap();
+    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+      svc.note_delivery(now, TransmitDelivery::ALL);
+    }
+    if svc.state() == ServiceState::Established {
+      return now;
+    }
+  }
+  panic!(
+    "bounded service did not establish within 20 ticks; state={:?}",
+    svc.state()
+  );
+}
+
+/// The §9 path parks the same way — and `handle_event` cannot say so.
+///
+/// `handle_event` returns `()`, and `ServiceUpdate` has no variant meaning "this
+/// service is parked because its clock cannot express a mandated wait". Adding
+/// one is a public-API decision and not this fix's to make, so what this pins is
+/// the honest arrangement: the park is real and observable, and the report comes
+/// from the next `handle_timeout`, which re-evaluates the same floor.
+#[test]
+fn a_parked_section9_revert_is_reported_by_the_next_timeout() {
+  let mut svc: BoundedService = Service::try_new(
+    ServiceHandle::from_raw(0),
+    make_records(120),
+    BoundedInstant(0),
+    [0u8; 32],
+    false,
+    true,
+  );
+  let _established = drive_bounded_to_established(&mut svc);
+  svc.conflict_backoff = true;
+  let at = BoundedInstant(BoundedInstant::CEILING - 1_000);
+  deliver_bounded_srv_conflict(&mut svc, at);
+  assert_eq!(
+    svc.state(),
+    ServiceState::Init,
+    "§9's revert happens whatever the clock can schedule"
+  );
+  assert!(
+    svc.lifecycle_deadline.is_none(),
+    "…and parks, because §8.1's floor is unrepresentable here; it armed {:?}",
+    svc.lifecycle_deadline
+  );
+  assert!(
+    matches!(
+      svc.handle_timeout(at),
+      Err(crate::error::HandleTimeoutError::Overflow)
+    ),
+    "the next timeout is where the park becomes reportable"
+  );
+  let mut buf = std::vec![0u8; 4096];
+  assert!(
+    matches!(svc.poll_transmit(at, &mut buf), Ok(None)),
+    "and nothing goes on the wire in the meantime"
   );
 }
