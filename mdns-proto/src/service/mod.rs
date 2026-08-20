@@ -2840,27 +2840,17 @@ where
     // caller's schedule is a FLOOR away from, never a ceiling on, what it asked
     // for — §8.2's one-second deferral is still owed in full, it is simply not
     // enough on its own once the limit is in force.
-    self.lifecycle_deadline = if self.note_conflict(now) {
-      match (deadline, now.checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)) {
-        (Some(d), Some(floor)) => Some(d.max(floor)),
-        // The caller's own arithmetic overflowed the clock. The floor is still a
-        // legal start for the sequence, and conjunct 8 below says a regress that
-        // armed nothing would strand the service.
-        (None, floor) => floor,
-        // …and the other way round: the floor overflowed where the caller's
-        // deadline did not, so keep the deadline rather than drop the service
-        // off the clock over a limit that is about slowing it down.
-        (Some(d), None) => Some(d),
-      }
-    } else {
-      deadline
-    };
+    self.note_conflict(now);
+    self.lifecycle_deadline = self.apply_backoff_floor(now, deadline);
     #[cfg(debug_assertions)]
-    self.assert_generation_replaced();
+    self.assert_generation_replaced(now);
   }
 
-  /// Fold one conflict into RFC 6762 §8.1's flood test FOR THIS RECORD SET, and
-  /// report whether its five-second floor is now in force.
+  /// Fold one conflict into RFC 6762 §8.1's flood test FOR THIS RECORD SET,
+  /// engaging `conflict_backoff` if this one completes the condition.
+  ///
+  /// Records; it does not schedule. [`Service::apply_backoff_floor`] reads the
+  /// latch and is what turns it into a deadline.
   ///
   /// > If fifteen conflicts occur within any ten-second period, then the host
   /// > MUST wait at least five seconds before each successive additional probe
@@ -2881,7 +2871,7 @@ where
   /// The clock is assumed monotonic, as [`crate::Instant`] requires. Where it is
   /// not, both tests below fail CLOSED: a `now` that ran backwards neither
   /// releases the latch nor engages it.
-  fn note_conflict(&mut self, now: I) -> bool {
+  fn note_conflict(&mut self, now: I) {
     // The flood has stopped if a whole window has gone by with no conflict at
     // all. Tested BEFORE this conflict is folded in, and against the previous
     // newest — so a fresh burst from a peer that had fallen quiet starts over
@@ -2912,7 +2902,52 @@ where
     {
       self.conflict_backoff = true;
     }
-    self.conflict_backoff
+  }
+
+  /// Raise a restarted sequence's start time to RFC 6762 §8.1's five-second
+  /// floor when this record set's flood limit is in force — and arm NOTHING when
+  /// the clock cannot represent that floor.
+  ///
+  /// # Failing closed is the whole of the overflow rule
+  ///
+  /// [`crate::Instant`] returns `Option` from `checked_add_duration`, so a
+  /// BOUNDED clock is part of the contract this crate publishes, not a
+  /// pathological case — a wrapping millisecond counter is an ordinary choice
+  /// for a bare-metal driver, and a bare-metal driver is where an unthrottled
+  /// flood costs the most. When `now + CONFLICT_BACKOFF_MIN_WAIT` does not exist
+  /// on that clock, every instant the clock CAN express is sooner than the wait
+  /// §8.1 mandates. There is therefore no deadline this may legally arm, and
+  /// `None` — do not schedule, do not transmit — is the only answer that is
+  /// never sooner than the floor.
+  ///
+  /// What it must NOT do is retain the caller's deadline as a consolation. That
+  /// is at most 250 ms out on the rename and §9 paths and about a second on
+  /// §8.2, so it discarded the MUST at exactly the moment the limiter existed to
+  /// hold one back.
+  ///
+  /// Saturating to the furthest representable instant is not the fix either, and
+  /// was considered: at the end of the clock that instant can be `now` itself,
+  /// which schedules the probe immediately — the flood, arriving by the door
+  /// meant to stop it.
+  ///
+  /// Read-only, and separate from [`Service::note_conflict`] for that reason:
+  /// the `Init` re-schedule in [`Service::handle_timeout`] also owes the floor,
+  /// and it must not record a fresh conflict every time it re-evaluates one.
+  ///
+  /// This never DEFERS a sequence the limit is not holding: with the latch off
+  /// the caller's deadline is returned untouched, overflow and all.
+  fn apply_backoff_floor(&self, now: I, deadline: Option<I>) -> Option<I> {
+    if !self.conflict_backoff {
+      return deadline;
+    }
+    let floor = now.checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)?;
+    Some(match deadline {
+      Some(d) => d.max(floor),
+      // Unreachable while every caller's own wait is shorter than the floor —
+      // a clock that cannot express `now + 1 s` cannot express `now + 5 s`
+      // either — and correct if one ever is not.
+      None => floor,
+    })
   }
 
   /// The most recently recorded conflict, or `None` if none has been.
@@ -2951,13 +2986,18 @@ where
   ///    to void: the RFC 6763 §9 meta-PTR is shared, claims nothing about this
   ///    instance, and its confirm only counts `responses_tx`;
   /// 8. the service is still on a clock — a regress that armed no deadline would
-  ///    strand it.
+  ///    strand it — UNLESS the clock cannot represent the wait §8.1's flood
+  ///    limit owes, in which case arming nothing is the REQUIRED outcome and
+  ///    being stranded is what failing closed looks like. The disjunct is the
+  ///    rule, not a hole in it: without it, a bounded clock reaching its end
+  ///    turns network input into a debug-build panic. See
+  ///    [`Service::apply_backoff_floor`].
   ///
   /// Debug-only: these are internal consistency facts and a release build pays
   /// nothing for them. `cargo test` builds with debug assertions on, so every
   /// test that drives any regress path checks the whole set.
   #[cfg(debug_assertions)]
-  fn assert_generation_replaced(&self) {
+  fn assert_generation_replaced(&self, now: I) {
     debug_assert_eq!(self.state, ServiceState::Init, "regress: state");
     debug_assert_eq!(self.probe_count, 0, "regress: probe_count");
     debug_assert_eq!(self.announce_count, 0, "regress: announce_count");
@@ -2986,7 +3026,8 @@ where
       "regress: a live commit token still carries lifecycle meaning"
     );
     debug_assert!(
-      self.lifecycle_deadline.is_some(),
+      self.lifecycle_deadline.is_some()
+        || now.checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT).is_none(),
       "regress: no lifecycle deadline"
     );
   }
@@ -4257,7 +4298,14 @@ where
     // For the Init state: if lifecycle_deadline is None (e.g. renamed before
     // first handle_timeout), synthesise a fresh probe deadline now.
     if self.state == ServiceState::Init && self.lifecycle_deadline.is_none() {
-      self.lifecycle_deadline = probe_deadline(now, 0, &mut self.rng);
+      // Through the SAME floor the regress used. This is the one path that can
+      // fabricate a start time for a sequence that has none, so it is also the
+      // one path that could hand a latched flood a fresh 0-250 ms delay and undo
+      // the wait §8.1 mandates. With the floor applied it re-evaluates instead:
+      // `None` again while the clock still cannot express `now + 5 s`, and a
+      // properly floored deadline once it can.
+      let base = probe_deadline(now, 0, &mut self.rng);
+      self.lifecycle_deadline = self.apply_backoff_floor(now, base);
       // lifecycle didn't "fire" a transmit here — just scheduled; fall through.
     }
 

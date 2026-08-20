@@ -12085,3 +12085,196 @@ fn conflicts_spread_wider_than_the_window_never_clamp() {
     "twenty conflicts at one per second must never meet §8.1's condition"
   );
 }
+
+// ── §8.1's floor on a clock that runs out ───────────────────────────
+
+/// An [`crate::Instant`] on a BOUNDED clock: milliseconds from zero, with
+/// nothing past [`Self::CEILING`] representable.
+///
+/// Not a pathological fixture. `checked_add_duration` returns `Option` precisely
+/// because a clock may run out, so a bounded one is part of the contract this
+/// crate publishes — a wrapping millisecond counter is an ordinary choice for a
+/// bare-metal driver, and that is also where an unthrottled flood costs the
+/// most.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct BoundedInstant(u64);
+
+impl BoundedInstant {
+  const CEILING: u64 = 60_000;
+}
+
+impl crate::Instant for BoundedInstant {
+  fn checked_add_duration(self, dur: Duration) -> Option<Self> {
+    let ms = u64::try_from(dur.as_millis()).ok()?;
+    let t = self.0.checked_add(ms)?;
+    (t <= Self::CEILING).then_some(Self(t))
+  }
+
+  fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
+    self.0.checked_sub(earlier.0).map(Duration::from_millis)
+  }
+}
+
+type BoundedService = Service<BoundedInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>;
+
+/// A probing service on the bounded clock, with §8.1's floor latched or not.
+///
+/// The latch is set directly: how it engages is what the fifteen-conflict tests
+/// above are for, and these fixtures are about the clock.
+fn bounded_probing_service(start: BoundedInstant, latched: bool) -> BoundedService {
+  let mut svc: BoundedService = Service::try_new(
+    ServiceHandle::from_raw(0),
+    make_records(120),
+    start,
+    [0u8; 32],
+    true,
+    true,
+  );
+  svc.conflict_backoff = latched;
+  svc
+}
+
+/// Stage RFC 6762 §8.2's deferral at `at` and spend it: the peer's proposal
+/// sorts later, so this service loses, keeps its name, and owes one second of
+/// silence before the restarted sequence.
+///
+/// §8.2 rather than §8.1's rename because its wait is a FIXED one second. The
+/// rename's is a random 0-250 ms, which cannot say which overflow arm a fixture
+/// reached, and that is the whole question here.
+fn lose_bounded_tiebreak(svc: &mut BoundedService, at: BoundedInstant) {
+  let bytes = srv_txt_proposal(9999);
+  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+  svc.handle_event(
+    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
+    at,
+  );
+  assert!(
+    svc.tiebreak_lost,
+    "the proposal must classify as a §8.2 loss for the fixture to mean anything"
+  );
+  svc.handle_timeout(at).unwrap();
+  assert_eq!(svc.state(), ServiceState::Init, "…and restart the sequence");
+}
+
+/// The control: while the clock can still express the floor, the floor is what
+/// gets armed — so "arms nothing" below cannot pass by being over-eager.
+#[test]
+fn a_representable_floor_is_armed_exactly() {
+  let mut svc = bounded_probing_service(BoundedInstant(0), true);
+  let at = BoundedInstant(BoundedInstant::CEILING - 10_000);
+  lose_bounded_tiebreak(&mut svc, at);
+  assert_eq!(
+    svc.lifecycle_deadline,
+    Some(BoundedInstant(at.0 + 5_000)),
+    "§8.2's one second is raised to §8.1's five, and not past them"
+  );
+}
+
+/// `(Some(deadline), None)`: the caller's own wait fits on this clock and
+/// §8.1's five seconds does not.
+///
+/// The old code kept the caller's deadline as a consolation — one second here,
+/// as little as 250 ms on the rename and §9 paths — which discarded the MUST at
+/// exactly the moment the limiter existed to hold a probe back. Nothing may be
+/// armed instead: every instant this clock can express is sooner than the wait
+/// §8.1 mandates.
+#[test]
+fn an_unrepresentable_floor_arms_nothing_rather_than_the_shorter_deadline() {
+  use crate::Instant as _;
+  let mut svc = bounded_probing_service(BoundedInstant(0), true);
+  let at = BoundedInstant(BoundedInstant::CEILING - 2_000);
+  assert!(
+    at.checked_add_duration(Duration::from_secs(1)).is_some(),
+    "the fixture must put §8.2's own one second INSIDE the clock…"
+  );
+  assert!(
+    at.checked_add_duration(Duration::from_secs(5)).is_none(),
+    "…and §8.1's floor outside it, or it is not testing the (Some, None) arm"
+  );
+  lose_bounded_tiebreak(&mut svc, at);
+  assert!(
+    svc.lifecycle_deadline.is_none(),
+    "an unrepresentable floor arms NOTHING; it armed {:?}",
+    svc.lifecycle_deadline
+  );
+
+  // …and it stays off the wire. The `Init` re-schedule is the one path that can
+  // fabricate a start time for a sequence that has none, so it is driven here
+  // rather than assumed inert.
+  let mut buf = std::vec![0u8; 4096];
+  svc.handle_timeout(at).unwrap();
+  assert!(
+    svc.lifecycle_deadline.is_none(),
+    "the Init re-schedule must not hand a latched flood a fresh 0-250 ms delay; \
+     it armed {:?}",
+    svc.lifecycle_deadline
+  );
+  assert!(
+    matches!(svc.poll_transmit(at, &mut buf), Ok(None)),
+    "nothing may go on the wire while the mandated wait cannot be scheduled"
+  );
+  let ceiling = BoundedInstant(BoundedInstant::CEILING);
+  svc.handle_timeout(ceiling).unwrap();
+  assert!(
+    svc.lifecycle_deadline.is_none(),
+    "…still true at the last instant this clock has"
+  );
+  assert!(
+    matches!(svc.poll_transmit(ceiling, &mut buf), Ok(None)),
+    "…and still nothing on the wire"
+  );
+}
+
+/// `(None, None)`: neither §8.2's deferral nor §8.1's floor is representable.
+///
+/// This case used to store `None` and then trip `assert_generation_replaced`, so
+/// a debug build turned a peer's proposal into a panic — reachable straight from
+/// network input. Passing under `cargo test`, which enables debug assertions, is
+/// half of what this asserts; the deadline is the other half.
+#[test]
+fn neither_the_deferral_nor_the_floor_representable_arms_nothing() {
+  use crate::Instant as _;
+  let mut svc = bounded_probing_service(BoundedInstant(0), true);
+  let kept = svc.name().as_str().to_owned();
+  let at = BoundedInstant(BoundedInstant::CEILING - 500);
+  assert!(
+    at.checked_add_duration(Duration::from_secs(1)).is_none(),
+    "the fixture must put §8.2's own one second outside the clock…"
+  );
+  assert!(
+    at.checked_add_duration(Duration::from_secs(5)).is_none(),
+    "…along with §8.1's floor, or it is not testing the (None, None) arm"
+  );
+  lose_bounded_tiebreak(&mut svc, at);
+  assert_eq!(
+    svc.name().as_str(),
+    kept,
+    "a §8.2 loss keeps the name, whatever the clock is doing"
+  );
+  assert!(
+    svc.lifecycle_deadline.is_none(),
+    "with neither wait representable, nothing may be armed; it armed {:?}",
+    svc.lifecycle_deadline
+  );
+  let mut buf = std::vec![0u8; 4096];
+  assert!(
+    matches!(svc.poll_transmit(at, &mut buf), Ok(None)),
+    "…and nothing goes on the wire"
+  );
+}
+
+/// With the latch OFF, the floor defers nothing — the fail-closed rule is scoped
+/// to the limit being in force, and applying it unconditionally would strand
+/// services that owe §8.1 no wait at all.
+#[test]
+fn an_unlatched_service_is_not_touched_by_the_floor() {
+  let mut svc = bounded_probing_service(BoundedInstant(0), false);
+  assert!(!svc.conflict_backoff, "the fixture starts unlatched");
+  let at = BoundedInstant(BoundedInstant::CEILING - 2_000);
+  lose_bounded_tiebreak(&mut svc, at);
+  assert_eq!(
+    svc.lifecycle_deadline,
+    Some(BoundedInstant(at.0 + 1_000)),
+    "§8.2's one second is owed in full and nothing else is"
+  );
+}

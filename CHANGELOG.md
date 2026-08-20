@@ -53,6 +53,25 @@
   limits bound between them is the rate, not progress: once §8.1's floor is
   latched the loop turns about once per five seconds. The denial of service
   itself is inherent to a same-link name adversary; only the claim was wrong.
+- `mdns-proto`: when the flood limit is in force and the clock cannot represent
+  `now + 5 s`, a conflict-driven restart now arms **no deadline at all** instead
+  of falling back to the caller's shorter one. `Instant::checked_add_duration`
+  returns `Option`, so a bounded clock is part of the contract this crate
+  publishes rather than a pathological case — a wrapping millisecond counter is
+  an ordinary choice for a bare-metal driver, which is also where an unthrottled
+  flood costs the most. The old fallback discarded the MUST at exactly the moment
+  the limiter existed to hold a probe back, scheduling one as little as 250 ms
+  out on the rename and §9 paths and a second out on §8.2; and when the caller's
+  own deadline overflowed too it stored `None` and tripped the regress
+  invariant, turning a peer's proposal into a debug-build panic reachable
+  straight from network input. Saturating to the furthest representable instant
+  is not the fix either: at the end of the clock that instant can be `now`, which
+  schedules the probe immediately. Arming nothing is the only value that is never
+  sooner than an unrepresentable floor. The `Init` re-schedule applies the same
+  floor, so it re-evaluates each timeout rather than fabricating a fresh
+  0-250 ms delay for a sequence the limit is holding, and the regress invariant
+  now reads "armed, or the clock cannot express the wait §8.1 owes". Services
+  whose limit is not in force are untouched, overflow and all.
 
 ## A relinquished record set can no longer retire its own replacement
 
