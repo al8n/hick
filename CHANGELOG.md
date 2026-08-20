@@ -1,5 +1,42 @@
 # UNRELEASED
 
+## §7.1 known-answer suppression works again for host addresses at a same-name service
+
+- `mdns-proto`: **behaviour-visible.** Where a service's instance name IS its
+  host name, an inbound A or AAAA known-answer could never suppress the matching
+  address record. The two halves of RFC 6762 §7.1 suppression classified the
+  same record differently: the emit-side filter mapped the CANDIDATE's rtype to
+  an owner role (PTR to the service type, SRV/TXT to the instance, A/AAAA to the
+  host), while ingest classified the ARRIVING record by NAME, walking the
+  service-type, instance and host names in that order with the first match
+  consuming. At a same-name service the instance arm matched first, so an A
+  known-answer was stamped `Instance` against an A candidate stamped `Host` and
+  the owner test could never hold. A querier that already held our address
+  record was sent it again on every query.
+- `mdns-proto`: the direction was benign — the failure was to suppress, so the
+  cost was one redundant but truthful record on a link where §7.1 is a
+  SHOULD-level bandwidth optimisation — and the fix does not trade it for the
+  opposite failure. Over-suppression silences an answer the querier does not
+  hold and nobody else will give, so the regression pins both: a known-answer
+  under an owner that is none of ours, and one at our instance name for a record
+  that lives at our host name, still suppress nothing.
+- `mdns-proto`: both halves now read ONE statement of the rule.
+  `respond::emitted_owner_name` says which of our owner names a record of a
+  given rtype sits at, and it lives beside the encoders that make it true —
+  `the_owner_name_rule_is_the_one_the_encoders_write_at` walks a real message and
+  puts every record either positive multicast encoder writes to it. Ingest binds
+  a hint by asking it for the ARRIVING record's rtype and requiring that record
+  to carry the name it names; the emit-side filter then needs no owner test at
+  all, because a stored hint of a given rtype is by construction a hint at that
+  rtype's owner name. `KasOwner` and the owner field on `KasHint` are gone with
+  the second copy of the rule.
+- `mdns-proto`: nothing changes for a service whose host name is a name of its
+  own. The one further difference is in hint STORAGE, and it can only reduce
+  work: a known-answer whose name is one of ours but whose rtype belongs to a
+  different one of our names — `_svc._tcp.local A x`, say — used to occupy a slot
+  in the sixteen-entry ring where it could never match a candidate, and is now
+  dropped on arrival.
+
 ## The §6.1 NSEC no longer denies address records the same announcement carries
 
 - `mdns-proto`: **wire-visible.** Where a service's instance name IS its host

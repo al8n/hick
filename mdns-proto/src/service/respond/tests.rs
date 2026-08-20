@@ -1256,3 +1256,48 @@ fn the_emitted_bitmap_names_the_address_families_this_record_set_publishes() {
      record set, not the name"
   );
 }
+
+/// `emitted_owner_name` is the ONE statement of which of our names a record of a
+/// given rtype sits at, and THE ENCODERS ARE WHAT MAKE IT TRUE — so it is pinned
+/// against a real message rather than against a second hand-maintained list.
+/// Every record both positive multicast encoders write, in every section, must
+/// sit at the owner this rule names for its rtype.
+///
+/// An encoder that moves a record to another owner name, or adds a type the rule
+/// does not answer for, fails here rather than silently splitting §7.1's owner
+/// binding back into the two disagreeing copies it had.
+#[test]
+fn the_owner_name_rule_is_the_one_the_encoders_write_at() {
+  for recs in [dual_stack_records(), same_name_records()] {
+    for msg in [announce_bytes(&recs), filtered_bytes(&recs)] {
+      let reader = crate::wire::MessageReader::try_parse(&msg).unwrap();
+      let mut checked = 0usize;
+      for rr in reader
+        .answers()
+        .flatten()
+        .chain(reader.additional().flatten())
+      {
+        // The RFC 6763 §7.1 SUBTYPE PTRs are the documented exception: they are
+        // never offered as §7.1 candidates, so the rule does not answer for them.
+        if rr.rtype() == ResourceType::Ptr
+          && !crate::endpoint::names_match_record(recs.service_type(), &rr)
+        {
+          continue;
+        }
+        let owner = super::emitted_owner_name(&recs, rr.rtype()).unwrap_or_else(|| {
+          panic!("an encoder wrote a {} the owner rule names no owner for", rr.rtype())
+        });
+        assert!(
+          crate::endpoint::names_match_record(owner, &rr),
+          "the encoder wrote a {} at an owner name the rule does not name for it",
+          rr.rtype()
+        );
+        checked += 1;
+      }
+      assert!(
+        checked >= 4,
+        "the fixture must put several rtypes to the rule; only {checked} were checked"
+      );
+    }
+  }
+}

@@ -4513,8 +4513,8 @@ fn kas_wrong_owner_known_answer_does_not_suppress() {
   inject_question_to_set_response_deadline(&mut svc, now);
 
   // Bogus known-answer: an A record OWNED BY THE SERVICE-TYPE name, rdata = our
-  // host's A. It is stored (its name is one of ours) but bound to owner-kind
-  // ServiceType, so it can never match the host-owned A candidate.
+  // host's A. Our A candidate sits at the HOST name, so this names a different
+  // RRset and is dropped on ingest — it can never suppress the host-owned A.
   let mut a_buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut a_buf, "_ipp._tcp.local.", our_ttl, [192, 168, 1, 10]);
   let (a_ref, _) = Ref::try_parse(&a_buf, 0).unwrap();
@@ -12565,5 +12565,117 @@ fn a_parked_section9_revert_is_reported_by_the_next_timeout() {
   assert!(
     matches!(svc.poll_transmit(at, &mut buf), Ok(None)),
     "and nothing goes on the wire in the meantime"
+  );
+}
+
+// ── §7.1 owner binding where the instance name IS the host name ──
+
+/// A service whose INSTANCE name IS its HOST name, with one A address — a
+/// supported configuration, and the one in which the two halves of §7.1
+/// suppression used to classify the same record differently.
+fn make_same_name_service(
+  ttl_secs: u32,
+) -> Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> {
+  let name = Name::try_from_str(PROBED_NAME).unwrap();
+  let mut records = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    name.clone(),
+    name,
+    631,
+    ttl_secs,
+  );
+  records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
+  Service::try_new(
+    ServiceHandle::from_raw(0),
+    records,
+    FakeInstant::zero(),
+    [0u8; 32],
+    true,
+    true,
+  )
+}
+
+/// Drive `svc` to Established, open a response cycle, feed it an A known-answer
+/// owned by `ka_owner` carrying `addr`, and report whether our A record survived
+/// into the §7.1-filtered response.
+fn a_record_survives_known_answer(
+  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  ka_owner: &str,
+  addr: [u8; 4],
+) -> bool {
+  use crate::wire::{MessageReader, ResourceType};
+
+  let now = drive_to_established(svc);
+  inject_question_to_set_response_deadline(svc, now);
+  let mut a_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+  // TTL 120 == our TTL, comfortably over the §7.1 half-TTL threshold.
+  make_a_record_ref(&mut a_buf, ka_owner, 120, addr);
+  let (a_ref, _) = Ref::try_parse(&a_buf, 0).unwrap();
+  let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), a_ref);
+  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+
+  let now2 = now.advance(200);
+  svc.handle_timeout(now2).unwrap();
+  let mut out = std::vec![0u8; 4096];
+  let transmit = svc
+    .poll_transmit(now2, &mut out)
+    .unwrap()
+    .expect("a response must be emitted");
+  let reader = MessageReader::try_parse(&out[..transmit.size()]).unwrap();
+  reader.answers().any(|rr| {
+    rr.map(|rec| rec.rtype() == ResourceType::A)
+      .unwrap_or(false)
+  })
+}
+
+/// RFC 6762 §7.1 known-answer suppression, at a service whose instance name IS
+/// its host name.
+///
+/// The emit side owns the A candidate at `records.host()`. The ingest side used
+/// to stamp an arriving known-answer with the FIRST of our three names that
+/// matched it, and at this configuration that is the instance name — so
+/// `hint.owner == owner` could never hold, and a querier that already held our
+/// address record was sent it again on every query, at every same-name
+/// deployment.
+///
+/// The failure was to SUPPRESS, so its cost was one redundant but truthful
+/// record on a link where §7.1 is a SHOULD-level bandwidth optimisation. The
+/// opposite failure is not benign at all: suppressing a record the querier does
+/// not hold silences an answer nobody else will give. So the direction is pinned
+/// here too — a known-answer under a genuinely different owner must go on
+/// suppressing nothing, in either configuration.
+#[test]
+fn a_host_address_known_answer_suppresses_where_the_instance_name_is_the_host_name() {
+  let our_ttl: u32 = 120;
+  let ours = [192, 168, 1, 10];
+
+  // THE CONTROL — a host name of its own, which is where the two halves already
+  // agreed and where nothing about this changes.
+  let mut svc = make_service(our_ttl);
+  assert!(
+    !a_record_survives_known_answer(&mut svc, "host.local.", ours),
+    "instance != host: a known-answer at our host name names our A RRset and \
+     §7.1 must suppress it"
+  );
+
+  // THE DEFECT — one name owning the instance records and the addresses alike.
+  let mut svc = make_same_name_service(our_ttl);
+  assert!(
+    !a_record_survives_known_answer(&mut svc, PROBED_NAME, ours),
+    "instance == host: the A record sits at that one name, so a known-answer \
+     for it names our RRset and §7.1 must suppress it"
+  );
+
+  // THE DIRECTION — another owner is another RRset, and stays one.
+  let mut svc = make_same_name_service(our_ttl);
+  assert!(
+    a_record_survives_known_answer(&mut svc, "someone-else.local.", ours),
+    "a known-answer under an owner that is none of ours must suppress nothing"
+  );
+  let mut svc = make_service(our_ttl);
+  assert!(
+    a_record_survives_known_answer(&mut svc, PROBED_NAME, ours),
+    "instance != host: our A sits at the HOST name, so a same-rdata answer at \
+     the INSTANCE name is a different RRset and must not suppress it"
   );
 }

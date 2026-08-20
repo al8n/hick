@@ -557,6 +557,57 @@ pub(crate) const fn transmitted_envelope(
   }
 }
 
+/// WHICH OF OUR OWNER NAMES a record of `rtype` sits at, or `None` for a type
+/// these encoders never write.
+///
+/// The ONE statement of the record-to-owner rule, and it lives beside the
+/// encoders because they are what make it true: [`write_announce`] and
+/// [`write_announce_filtered`] push the service-type PTR at
+/// `records.service_type()`, the SRV and TXT at `records.instance()`, every
+/// A / AAAA at `records.host()`, and [`push_service_nsec`] the §6.1 NSEC at
+/// `records.instance()`. `the_owner_name_rule_is_the_one_the_encoders_write_at`
+/// walks a real message and puts every record it emits to this answer, so an
+/// encoder that moves a record to another owner fails a test rather than
+/// silently splitting the rule in two.
+///
+/// # Both halves of §7.1 known-answer suppression read it
+///
+/// RFC 6762 §7.1 identifies an RRset by (name, type, class, rdata), so a
+/// known-answer may suppress one of our records only when it names the very
+/// owner that record sits at. A same-rtype, same-rdata answer under a DIFFERENT
+/// owner name is a DIFFERENT RRset and must not silence us — otherwise a
+/// querier could quiet our `host.local A x` by sending `_svc._tcp.local A x`.
+///
+/// Ingest binds a hint by asking this for the ARRIVING record's rtype and
+/// requiring that record's name to match; the emit-side filter then needs no
+/// owner test of its own, because a stored hint of the same rtype is by
+/// construction a hint at the same owner name. The two used to answer the
+/// question separately — ingest by walking our names in a precedence order,
+/// emission by matching on rtype — and where a service's instance name IS its
+/// host name they disagreed: an inbound A known-answer took the instance arm
+/// because that name matched first, while the A candidate was owned by the host,
+/// so `hint.owner == owner` could never hold and §7.1 suppression for host
+/// addresses silently never fired.
+///
+/// # What is deliberately outside it
+///
+/// The RFC 6763 §7.1 SUBTYPE PTRs, which [`write_announce_filtered`] does not
+/// KAS-filter: no candidate is ever offered under a `_sub` name, so a
+/// known-answer at one has nothing to suppress and this answers for the
+/// service-type PTR alone. And a type these encoders do not write at all, which
+/// gets `None` — the direction that can only fail to suppress.
+pub(crate) fn emitted_owner_name(
+  records: &ServiceRecords,
+  rtype: ResourceType,
+) -> Option<&crate::Name> {
+  match rtype {
+    ResourceType::Ptr => Some(records.service_type()),
+    ResourceType::Srv | ResourceType::Txt | ResourceType::Nsec => Some(records.instance()),
+    ResourceType::A | ResourceType::AAAA => Some(records.host()),
+    _ => None,
+  }
+}
+
 /// Write an unsolicited announcement: SRV, TXT, A, AAAA records.
 ///
 /// Returns the encoded length and whether the RFC 6762 §6.1 instance NSEC rode

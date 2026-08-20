@@ -18,26 +18,22 @@ mod state;
 cfg_heap! {}
 
 cfg_heap! {
-  /// Which of OUR owner names a known-answer's record name matched. §7.1
-  /// suppression is per RRset, and an RRset is identified by (name, type, class,
-  /// rdata). A known-answer with our rtype + rdata but a DIFFERENT owner name is a
-  /// DIFFERENT RRset and must NOT suppress our record — otherwise a querier could
-  /// silence our `host.local A x` by sending a same-rdata `_svc._tcp.local A x`.
-  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-  enum KasOwner {
-    /// The shared service-type name (owns the PTR).
-    ServiceType,
-    /// The service instance name (owns SRV + TXT).
-    Instance,
-    /// The host name (owns A + AAAA).
-    Host,
-  }
-
-  /// A single observed known-answer hint. KAS suppression checks records
-  /// against this list before emitting.
+  /// A single observed known-answer hint. §7.1 suppression checks each
+  /// candidate record against this list before emitting it.
+  ///
+  /// THERE IS NO OWNER FIELD, and that absence is the rule. RFC 6762 §7.1
+  /// identifies an RRset by (name, type, class, rdata), so a hint may suppress
+  /// one of our records only when it names the very owner that record sits at —
+  /// and [`respond::emitted_owner_name`] already answered that from the rtype
+  /// when the hint was ADMITTED, rejecting anything arriving at another name. A
+  /// stored hint is therefore a hint at the owner its rtype implies, and
+  /// matching the rtype IS matching the owner.
+  ///
+  /// While the owner was carried here it was classified TWICE by two different
+  /// rules — by name on the way in, by rtype on the way out — and the two
+  /// disagreed wherever a service's instance name is also its host name.
   #[derive(Debug, Clone, Copy)]
   struct KasHint<I> {
-    owner: KasOwner,
     rtype: crate::wire::ResourceType,
     rdata_hash: u64,
     expires_at: I,
@@ -3988,24 +3984,30 @@ where
           Err(_) => return, // malformed rdata / pointer cycle — drop the hint
         };
         let rdata_hash = hash_rdata(&canonical);
-        // a known-answer may only suppress an RRset WE own, so bind the
-        // hint to which of our owner names its record name matches. A KA whose
-        // name is none of ours suppresses nothing (dropped here); one whose name
-        // matches but under the wrong type (e.g. `_svc._tcp.local A x`) is kept
-        // but will never match a candidate, because the filter pairs each
-        // candidate's owner-kind with its rtype.
-        let owner = if crate::endpoint::names_match_record(self.records.service_type(), ka.record())
-        {
-          KasOwner::ServiceType
-        } else if crate::endpoint::names_match_record(self.records.instance(), ka.record()) {
-          KasOwner::Instance
-        } else if crate::endpoint::names_match_record(self.records.host(), ka.record()) {
-          KasOwner::Host
-        } else {
-          return; // not one of our RRset names — cannot suppress any of our records
+        // A known-answer may only suppress the RRset it actually NAMES — §7.1
+        // identifies one by name, type, class and rdata — so bind the hint by
+        // asking `respond::emitted_owner_name` which of our names a record of
+        // THIS rtype sits at, then requiring the arriving record to carry that
+        // name. A type these encoders never write has no such owner, and a
+        // record at any other name is a different RRset; either way it can
+        // suppress nothing, so it is dropped here rather than stored to be
+        // filtered out later.
+        //
+        // Deriving the owner from the RTYPE is what keeps this side and the
+        // emit-side filter from disagreeing: they read ONE rule, so the filter
+        // needs no owner test of its own. Classifying by NAME here — walking our
+        // three names in a precedence order, first match consuming — is what
+        // broke where the instance name IS the host name: an inbound A took the
+        // instance arm because that name matched first, while the A candidate
+        // was owned by the host, and §7.1 suppression for host addresses could
+        // never fire.
+        let Some(owner) = respond::emitted_owner_name(&self.records, ka.record().rtype()) else {
+          return; // a type these encoders never write — nothing of ours to suppress
         };
+        if !crate::endpoint::names_match_record(owner, ka.record()) {
+          return; // a different owner name is a different RRset (§7.1)
+        }
         let hint = KasHint {
-          owner,
           rtype: ka.record().rtype(),
           rdata_hash,
           expires_at,
@@ -4846,23 +4848,14 @@ where
               Some(t) => t,
               None => return false,
             };
-            // a hint may only suppress the RRset it actually names. Map
-            // this candidate's owner to its kind (PTR↦service-type, SRV/TXT↦
-            // instance, A/AAAA↦host) and require the hint to share it — so a
-            // same-rtype/same-rdata known-answer under a DIFFERENT owner name
-            // cannot silence our record.
-            let owner = match rtype {
-              crate::wire::ResourceType::Ptr => KasOwner::ServiceType,
-              crate::wire::ResourceType::Srv | crate::wire::ResourceType::Txt => KasOwner::Instance,
-              crate::wire::ResourceType::A | crate::wire::ResourceType::AAAA => KasOwner::Host,
-              _ => return false,
-            };
+            // A hint may only suppress the RRset it actually names, and a stored
+            // hint was already bound to the owner name its rtype sits at — see
+            // `respond::emitted_owner_name`, which is what admitted it. So
+            // matching the rtype here IS matching the owner, and there is no
+            // second classification left to disagree with the first.
             let suppressed = hints.iter().any(|slot| match slot {
               Some(hint) => {
-                hint.owner == owner
-                  && hint.rtype == rtype
-                  && hint.rdata_hash == h
-                  && hint.expires_at > now_ref
+                hint.rtype == rtype && hint.rdata_hash == h && hint.expires_at > now_ref
               }
               None => false,
             });
