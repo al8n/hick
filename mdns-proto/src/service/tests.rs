@@ -1797,12 +1797,24 @@ fn truncated_meta_query_delays_reply_to_400_500ms() {
   );
 }
 
+/// [`meta_reply_fires_at`] with the reply polled on the same instant the
+/// jittered deadline is fired, which is the ordinary driver shape.
+fn meta_reply_fires(with_ka: bool, ka_from_questioner: bool, ka_ttl: u32) -> bool {
+  meta_reply_fires_at(with_ka, ka_from_questioner, ka_ttl, 200)
+}
+
 /// Drive to Established, deliver a §9 meta-query from a 5353 source, optionally
 /// deliver a meta known-answer (PTR owned by the DNS-SD meta name, target =
-/// our service type) with the given TTL and source, then fire the jittered
-/// deadline. Returns whether a meta-PTR reply was emitted (the only thing
-/// `poll_transmit` can produce in this window — so `false` means suppressed).
-fn meta_reply_fires(with_ka: bool, ka_from_questioner: bool, ka_ttl: u32) -> bool {
+/// our service type) with the given TTL and source, fire the jittered deadline
+/// at 200 ms, then poll `poll_after_ms` after the meta-query arrived. Returns
+/// whether a meta-PTR reply was emitted (the only thing `poll_transmit` can
+/// produce in this window — so `false` means suppressed).
+fn meta_reply_fires_at(
+  with_ka: bool,
+  ka_from_questioner: bool,
+  ka_ttl: u32,
+  poll_after_ms: u64,
+) -> bool {
   use crate::{
     event::{KnownAnswer, ServiceQuestion},
     wire::{QuestionRef, Ref},
@@ -1866,8 +1878,39 @@ fn meta_reply_fires(with_ka: bool, ka_from_questioner: bool, ka_ttl: u32) -> boo
 
   let t = now.advance(200); // past the 20–120 ms meta jitter window
   svc.handle_timeout(t).unwrap();
+  // Only the clock handed to `poll_transmit` moves on from here — no further
+  // event or timeout, which is what a Sans-I/O caller is allowed to do.
+  let polled = now.advance(poll_after_ms);
   let mut buf = std::vec![0u8; 4096];
-  svc.poll_transmit(t, &mut buf).unwrap().is_some()
+  svc.poll_transmit(polled, &mut buf).unwrap().is_some()
+}
+
+/// A meta known-answer that has EXPIRED by the instant `poll_transmit` is given
+/// must not suppress the §9 service-type enumeration reply.
+///
+/// Same class as `an_expired_known_answer_does_not_suppress_at_polls_own_clock`,
+/// on the path that stored no deadline at all: the meta hint was a bare `bool`,
+/// so once set it suppressed on every later poll however long the caller waited.
+/// The half-TTL test at arrival says the answer is fresh ENOUGH to suppress; it
+/// does not say for how long. Over-suppression here is the worst direction in
+/// the crate — the querier gets no service-type enumeration from us, and unlike
+/// an instance record nobody else on the link advertises our type for us.
+#[test]
+fn an_expired_meta_known_answer_does_not_suppress_at_polls_own_clock() {
+  // Our TTL is 120, so a known answer at TTL 60 sits exactly on the §7.1
+  // half-TTL threshold: stored, and expiring 60 s after it arrived.
+  assert!(
+    !meta_reply_fires_at(true, true, 60, 200),
+    "control: a live meta known-answer at the half-TTL threshold must suppress"
+  );
+  assert!(
+    meta_reply_fires_at(true, true, 60, 61_000),
+    "a meta known-answer expired by poll time must NOT suppress the meta reply"
+  );
+  assert!(
+    !meta_reply_fires_at(true, true, 120, 61_000),
+    "control: a known-answer whose own TTL outlives the poll still suppresses"
+  );
 }
 
 /// (RFC 6763 §9 + §7.1): a meta questioner that already knows our

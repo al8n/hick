@@ -1347,10 +1347,19 @@ cfg_heap! {
   /// inject a known-answer that suppresses our meta reply. Bounded by
   /// `MAX_QUESTIONER_SRCS`; cleared when the meta reply fires or is suppressed.
   meta_questioner_srcs: std::vec::Vec<core::net::SocketAddr>,
-  /// (RFC 6763 §9 + §7.1): set when a meta questioner's known-answer
-  /// section already carries the meta-PTR for OUR service type — our pending
-  /// meta reply is then suppressed. Reset each meta cycle.
-  meta_known_answered: bool,
+  /// (RFC 6763 §9 + §7.1): when a meta questioner's known-answer section
+  /// already carries the meta-PTR for OUR service type, the instant that
+  /// known answer STOPS being one — the arriving record's own TTL counted from
+  /// the instant its event carried. Our pending meta reply is suppressed only
+  /// while `now` is still before it. Reset each meta cycle.
+  ///
+  /// A deadline rather than a flag for the same reason `KasHint::expires_at` is
+  /// one: §7.1 licenses withholding only a record the querier STILL holds, and a
+  /// conforming Sans-I/O caller may queue the meta reply and poll it with no
+  /// `handle_event` or `handle_timeout` in between, so an unconditional flag
+  /// could silence a service-type enumeration whose known answer had already
+  /// lapsed — leaving the querier with no answer at all, from us or from anyone.
+  meta_known_answered: Option<I>,
   /// Test-only: silence [`Service::assert_no_live_commit_token`] so a test can
   /// drive the entry points the way a NON-COMPLIANT driver would and pin what
   /// the release-mode backstops actually do. Those backstops only exist for a
@@ -1441,7 +1450,7 @@ where
       rename_goodbye_handoff: None,
       meta_response_deadline: None,
       meta_questioner_srcs: std::vec::Vec::new(),
-      meta_known_answered: false,
+      meta_known_answered: None,
       #[cfg(test)]
       contract_assertions_off: false,
     }
@@ -2632,7 +2641,7 @@ where
     // answer the meta-query while not authoritative.
     self.meta_response_deadline = None;
     self.meta_questioner_srcs.clear();
-    self.meta_known_answered = false;
+    self.meta_known_answered = None;
   }
 
   /// clear the state that is about a NAME, on a conflict-driven RENAME. The NEW
@@ -3930,7 +3939,21 @@ where
             && let Ok(crate::wire::Rdata::Ptr(p)) = ka.record().rdata_view()
             && crate::endpoint::names_match(self.records.service_type(), p.target())
           {
-            self.meta_known_answered = true;
+            // Date the hint, exactly as the ordinary §7.1 path dates a
+            // `KasHint`: the arriving record's own TTL from the instant this
+            // event carries. The half-TTL test above says the answer is fresh
+            // ENOUGH to suppress; it does not say for how long, and
+            // `poll_transmit` runs on a clock of its own.
+            //
+            // An un-representable deadline drops the hint rather than counting
+            // as valid: a TTL that overflows the clock is not evidence the
+            // querier holds anything, and failing to suppress costs one
+            // redundant but truthful meta-PTR, where suppressing wrongly costs
+            // the enumeration entirely.
+            let ttl = core::time::Duration::from_secs(u64::from(ka.record().ttl()));
+            if let Some(expires_at) = now.checked_add_duration(ttl) {
+              self.meta_known_answered = Some(expires_at);
+            }
           }
           return;
         }
@@ -4624,9 +4647,13 @@ where
       // this window — mirrors the guard for the normal response path. With several
       // coalesced meta queriers a single source that already has our type must
       // NOT suppress the multicast reply the others still need.
-      let suppressed = self.meta_known_answered && self.meta_questioner_srcs.len() == 1;
+      // Expiry is judged against THIS call's `now`, never a cached one, and
+      // never on the flag alone — see the field. A known answer that has lapsed
+      // by the time the jittered reply is polled suppresses nothing.
+      let suppressed = self.meta_known_answered.is_some_and(|until| now < until)
+        && self.meta_questioner_srcs.len() == 1;
       self.meta_questioner_srcs.clear();
-      self.meta_known_answered = false;
+      self.meta_known_answered = None;
       if !suppressed
         && let Ok(meta) = crate::Name::try_from_str(crate::endpoint::DNS_SD_META_QUERY_NAME)
         && let Ok(n) = respond::write_meta_response(&self.records, &meta, buf)
