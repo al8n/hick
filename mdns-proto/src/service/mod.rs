@@ -1291,6 +1291,32 @@ cfg_heap! {
   /// being throttled, so resetting on rename is exactly the reset that would
   /// defeat the limit.
   conflict_backoff: bool,
+  /// When the FIRST still-unresolved pre-authoritative conflict was RECEIVED.
+  ///
+  /// §8.1 counts conflicts by when they occur, and a pre-authoritative one does
+  /// not occur when it is acted on: `handle_event` latches `probe_defeated` /
+  /// `tiebreak_lost` on arrival, and `handle_timeout` spends the latch on a
+  /// later tick with a later `now`. Dating the ring by that later instant made
+  /// the measured burst wider than the real one, so fifteen conflicts genuinely
+  /// inside ten seconds could be consumed just outside it and fail to latch —
+  /// then probe again in under five seconds, which is the MUST.
+  ///
+  /// So the regress needs BOTH instants and they have different jobs. This one
+  /// dates the conflict for the flood test. The handler's own `now` anchors the
+  /// deadline arithmetic, and must: scheduling the five-second wait from a stale
+  /// instant would end it early, which is the wrong direction for a floor.
+  ///
+  /// FIRST, not latest: it is the instant the unresolved episode began. Where a
+  /// §8.2 loss is superseded by a §8.1 defeat before either is spent, the ring
+  /// still gets one entry — this crate records one conflict per regress, and a
+  /// superseding conflict has no regress of its own to be counted at. That
+  /// undercounts a burst that arrives faster than it is consumed, always in the
+  /// lenient direction, and #140 is where it stops being true: the `Endpoint`
+  /// counts at the arrival funnels, where every conflict is countable.
+  ///
+  /// Spent together with the two latches, in one `take` beside them, so no path
+  /// out of the decision block can carry a stale arrival into a later regress.
+  conflict_arrived_at: Option<I>,
   /// One-shot handoff of the OLD instance name's TTL=0 goodbye when a §9 conflict
   /// renames an ANNOUNCED service. Set at the rename site (`handle_timeout`) with
   /// the OLD records and WHICH instance records that name actually advertised
@@ -1408,6 +1434,7 @@ where
       conflict_burst: [None; CONFLICT_BURST_LEN],
       conflict_burst_slot: 0,
       conflict_backoff: false,
+      conflict_arrived_at: None,
       rename_goodbye_handoff: None,
       meta_response_deadline: None,
       meta_questioner_srcs: std::vec::Vec::new(),
@@ -2769,8 +2796,12 @@ where
   ///
   /// What every caller passes, and nothing else:
   ///
-  /// * `now` — the instant the conflict is being resolved at. It dates the
-  ///   conflict for §8.1's flood test and anchors that test's five-second floor.
+  /// * `now` — the instant the conflict is being RESOLVED at. It anchors the
+  ///   deadline arithmetic, including §8.1's five-second floor.
+  /// * `occurred_at` — the instant the conflict was RECEIVED, which is what
+  ///   §8.1's flood test counts. Equal to `now` for §9, which acts on arrival;
+  ///   earlier for the two pre-authoritative rules, which latch on arrival and
+  ///   are spent on a later tick. See `conflict_arrived_at`.
   /// * `deadline` — when the fresh §8.1 sequence may begin, IF the flood limit
   ///   is not in force; when it is, the later of this and `now +
   ///   CONFLICT_BACKOFF_MIN_WAIT`. §9 and a rename pass the randomized
@@ -2785,12 +2816,17 @@ where
   /// `last_conflict_reprobe` (its own rate limit), and a rename also calls
   /// `set_instance` and `reset_advertised_name_state` (per-advertised-NAME state,
   /// which a same-name regression must NOT reset — see `fully_announced`).
+  /// Returns `Err(HandleTimeoutError::Overflow)` when the clock could not
+  /// represent the wait §8.1 owes and the sequence was therefore parked with no
+  /// deadline — the fail-closed outcome, reported rather than left to look like
+  /// ordinary idleness. See [`Service::apply_backoff_floor`].
   fn restart_probe_cycle(
     &mut self,
     now: I,
+    occurred_at: I,
     deadline: Option<I>,
     renamed_from: Option<ServiceRecords>,
-  ) {
+  ) -> Result<(), HandleTimeoutError> {
     // A parked datagram belongs to the generation this regress replaces, so its
     // confirm must not advance the fresh §8.1 sequence: `Init → Probing(0)` costs
     // no datagram, so an old probe confirming into it would claim the name after
@@ -2840,10 +2876,14 @@ where
     // caller's schedule is a FLOOR away from, never a ceiling on, what it asked
     // for — §8.2's one-second deferral is still owed in full, it is simply not
     // enough on its own once the limit is in force.
-    self.note_conflict(now);
+    self.note_conflict(occurred_at);
     self.lifecycle_deadline = self.apply_backoff_floor(now, deadline);
     #[cfg(debug_assertions)]
     self.assert_generation_replaced(now);
+    if self.lifecycle_deadline.is_none() {
+      return Err(HandleTimeoutError::Overflow);
+    }
+    Ok(())
   }
 
   /// Fold one conflict into RFC 6762 §8.1's flood test FOR THIS RECORD SET,
@@ -3055,6 +3095,20 @@ where
   /// instance.
   fn conflict_classified_unresolved(&self) -> bool {
     self.probe_defeated || self.tiebreak_lost
+  }
+
+  /// Stamp `conflict_arrived_at` if the event just dispatched raised a
+  /// classification and none was already outstanding.
+  ///
+  /// Called from the two dispatch arms rather than from the classifiers, because
+  /// a classifier can also drop the record without latching anything and this
+  /// must not stamp then. Reading the latches afterwards asks the only question
+  /// that matters — is a conflict now outstanding — without either classifier
+  /// having to know this field exists.
+  fn note_conflict_arrival(&mut self, now: I) {
+    if self.conflict_classified_unresolved() && self.conflict_arrived_at.is_none() {
+      self.conflict_arrived_at = Some(now);
+    }
   }
 
   /// Whether this name is still PRE-AUTHORITATIVE: rows A and B of the §8
@@ -3515,6 +3569,7 @@ where
       // conflict here and then declining to spend its latch there would lose it.
       (_, ServiceEvent::ProbeConflict(pc)) if self.is_preauthoritative() => {
         self.handle_preauthoritative_conflict(&pc);
+        self.note_conflict_arrival(now);
       }
       // §8.2's tiebreak, and its only input. Folded on arrival; a proposal that
       // reaches a service already past adjudication is simply not compared,
@@ -3522,6 +3577,7 @@ where
       // being spent.
       (_, ServiceEvent::ProbeProposal(pp)) if self.is_preauthoritative() => {
         self.handle_probe_proposal(&pp);
+        self.note_conflict_arrival(now);
       }
       (
         ServiceState::Announcing(_) | ServiceState::Established,
@@ -3680,7 +3736,25 @@ where
         // renamed-away predecessor's §10.1 goodbye, and any goodbye this name
         // could cancel was already cancelled when it first fully announced.
         let deadline = probe_deadline(now, 0, &mut self.rng);
-        self.restart_probe_cycle(now, deadline, None);
+        // §9 acts on arrival, so the two instants coincide here.
+        //
+        // The parked outcome CANNOT be returned: `handle_event` has no error
+        // channel, and `ServiceUpdate` has no variant that means "this service
+        // is parked because its clock cannot express a mandated wait" — inventing
+        // one is a public-API decision, not this fix's. A `warn!` is what the
+        // path can honestly offer; `handle_timeout` reports it properly on every
+        // other route into this function, including the next tick of this one,
+        // whose `Init` re-schedule re-evaluates the same floor.
+        if self
+          .restart_probe_cycle(now, now, deadline, None)
+          .is_err()
+        {
+          warn!(
+            target: "mdns_proto::service",
+            handle = self.handle.raw(),
+            "service: §9 revert parked — the clock cannot express §8.1's mandated wait"
+          );
+        }
       }
       (ServiceState::Established | ServiceState::Announcing(_), ServiceEvent::Question(sq)) => {
         let src = sq.src();
@@ -4024,6 +4098,15 @@ where
 
   /// Drive timer-based transitions. Returns Ok unless arithmetic overflowed.
   ///
+  /// [`HandleTimeoutError::Overflow`] also covers the case where a mandated WAIT
+  /// cannot be represented rather than a deadline merely failing to compute:
+  /// when RFC 6762 §8.1's flood limit is in force and `now + 5 s` does not exist
+  /// on this clock, the restarted probe sequence is parked with no deadline —
+  /// see [`Service::apply_backoff_floor`] — and this reports that rather than
+  /// leaving it indistinguishable from an idle tick. The condition is
+  /// re-evaluated on every subsequent call, so the error repeats for as long as
+  /// the service stays parked and stops when it can be scheduled again.
+  ///
   /// # Contract
   ///
   /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
@@ -4082,6 +4165,13 @@ where
     if self.conflict_classified_unresolved() {
       let defeated_by_owner = core::mem::take(&mut self.probe_defeated);
       let lost_tiebreak = core::mem::take(&mut self.tiebreak_lost);
+      // Taken WITH them, so every path out of this block spends it — including
+      // the rename that fails and declares `Conflicting` without restarting
+      // anything, which leaves no regress for the conflict to be counted at and
+      // must not leave its arrival behind for a later one to inherit. The
+      // fallback is `now`, which is right for a latch raised and spent on the
+      // same tick.
+      let occurred_at = self.conflict_arrived_at.take().unwrap_or(now);
       // TWO WAYS TO LOSE, AND THEY DO DIFFERENT THINGS. Neither is re-derived
       // here; both were decided when the conflict was classified.
       //
@@ -4141,12 +4231,12 @@ where
         // waiting one second". The NAME is kept — that is the whole point of the
         // deferral — so `renamed_from` is `None` and a parked datagram's records
         // still latch into `goodbye` under it.
-        self.restart_probe_cycle(
+        return self.restart_probe_cycle(
           now,
+          occurred_at,
           now.checked_add_duration(schedule::rfc::TIEBREAK_DEFER_WAIT),
           None,
         );
-        return Ok(());
       }
       if defeated_by_owner {
         // if the OLD name had been announced, peers have its
@@ -4223,6 +4313,10 @@ where
         // commit token's records are cached under this name and nowhere else, and
         // by confirm time nothing here still says so.
         let renamed_from = self.records.clone();
+        // Carried out of the match rather than propagated with `?`: the rename's
+        // remaining work — the new name, the `Renamed` update, the per-name reset
+        // — is owed whether or not the restarted sequence could be scheduled.
+        let mut outcome: Result<(), HandleTimeoutError> = Ok(());
         match crate::Name::try_from_str(&new_name_str) {
           Ok(new_name) => {
             // The SAME regress as §9 and §8.2 — this is the third caller, and
@@ -4232,7 +4326,7 @@ where
             // window, between the stale-token capture the regress does first and
             // the per-name reset below.
             let deadline = probe_deadline(now, 0, &mut self.rng);
-            self.restart_probe_cycle(now, deadline, Some(renamed_from));
+            outcome = self.restart_probe_cycle(now, occurred_at, deadline, Some(renamed_from));
             self.records.set_instance(new_name.clone());
             let _ = self.pending_updates.insert(ServiceUpdate::Renamed(
               crate::event::ServiceRenamed::new(new_name),
@@ -4270,7 +4364,7 @@ where
             self.clear_response_cycle_state();
           }
         }
-        return Ok(());
+        return outcome;
       }
       // We win: continue probing as if no conflict happened.
     }
@@ -4425,6 +4519,15 @@ where
     }
     let _ = lifecycle_fired; // used for clarity
 
+    // ONE rule, stated once at the one exit the early returns do not take: a
+    // service left in `Init` with nothing armed is parked, not idle — the wait
+    // it owes is unrepresentable on this clock — and a caller that cannot tell
+    // the two apart will wait forever for a service that will never move. The
+    // conflict block's own returns carry the same verdict up from
+    // `restart_probe_cycle`; this covers the `Init` re-schedule above it.
+    if self.state == ServiceState::Init && self.lifecycle_deadline.is_none() {
+      return Err(HandleTimeoutError::Overflow);
+    }
     Ok(())
   }
 
