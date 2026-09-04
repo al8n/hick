@@ -227,15 +227,36 @@ impl<I: Instant> ConflictFlood<I> {
   /// is the loop being throttled, so resetting on a rename is the one reset that
   /// would defeat the limit.
   ///
-  /// A `now` earlier than the newest entry is outside [`Instant`]'s monotonicity
-  /// contract; the floor is reported NOT in force rather than armed off a
-  /// reading that cannot be trusted to bound anything.
+  /// # A `now` that precedes the newest entry FAILS CLOSED
+  ///
+  /// When the elapsed span cannot be computed because `now` is earlier than the
+  /// newest accepted conflict, the floor is reported IN FORCE. The two outcomes
+  /// are not symmetric and only one of them can be wrong in a way that matters:
+  /// failing open puts a probe on the wire inside the five seconds §8.1 says the
+  /// host MUST wait, while failing closed costs one probe a delay of at most
+  /// [`CONFLICT_BACKOFF_MIN_WAIT`]. The floor a caller then arms is ABSOLUTE —
+  /// `sequence_started_at + 5 s`, not `now + 5 s` — so it converges instead of
+  /// sliding, and the next read taken at or after the newest entry either serves
+  /// the wait or finds the latch released. A rate limit is the one place where
+  /// an unreadable clock belongs on the restrictive side.
+  ///
+  /// This is not a hypothetical clock fault. [`Instant`] is monotonic, but
+  /// nothing obliges a driver to weigh a decision against the SAME reading it
+  /// folded the conflict at: a driver that samples one instant for a pass and
+  /// then counts the fifteenth conflict of a burst at a later, per-datagram
+  /// reading hands this method an instant its own ring already sits ahead of, on
+  /// ordinary traffic. That is a defect in the driver and it is fixed there, but
+  /// it must not be able to spend the MUST on its way past.
+  ///
+  /// No conflict recorded AT ALL is a different question and still answers NOT
+  /// in force: there is no entry for `now` to precede, and nothing the limit
+  /// could be spacing out.
   pub(crate) fn in_force(&self, now: I) -> bool {
     self.latched
       && self.newest().is_some_and(|newest| {
         now
           .checked_duration_since(newest)
-          .is_some_and(|since| since <= CONFLICT_BURST_WINDOW)
+          .is_none_or(|since| since <= CONFLICT_BURST_WINDOW)
       })
   }
 }

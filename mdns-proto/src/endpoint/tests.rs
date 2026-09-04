@@ -13984,6 +13984,59 @@ fn fifteen_conflicts_spanning_exactly_ten_seconds_latch_and_one_millisecond_more
   );
 }
 
+/// An unreadable elapsed span fails CLOSED: a `now` the ring already sits ahead
+/// of reports the floor IN FORCE.
+///
+/// The condition is reachable without any clock fault. `Instant` is monotonic,
+/// but a driver may sample one instant for a pass and fold a conflict at a
+/// later, per-datagram one — so a fifteenth conflict counted mid-pass leaves the
+/// pass's own reading behind the ring's newest entry, and the very next
+/// `poll_service_transmit` of that pass asks this question with it.
+///
+/// The two answers are not symmetric. Reporting NOT in force there publishes a
+/// probe inside the five seconds RFC 6762 §8.1 says the host MUST wait; the
+/// other way costs one probe a delay bounded by the sequence's own absolute
+/// floor. Only one of them can violate the RFC.
+#[test]
+fn a_now_earlier_than_the_newest_conflict_keeps_the_floor_in_force() {
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let (_h, at) = flood_victim(
+    &mut e,
+    "Printer._ipp._tcp.local.",
+    "h.local.",
+    Ipv4Addr::new(192, 168, 1, 5),
+    now,
+  );
+
+  // The burst is counted a second AFTER the instant the stale reader carries,
+  // which is what makes `at` earlier than the ring's newest entry.
+  let latched_at = after(at, 1_000);
+  conflicts_at(&mut e, &instance, latched_at, 15);
+  assert_eq!(e.flood_for_test().counted(), 15);
+  assert!(
+    e.flood_for_test().in_force(latched_at),
+    "premise: fifteen conflicts inside one ten-second window latch the limit"
+  );
+
+  assert!(
+    e.flood_for_test().in_force(at),
+    "a reader whose instant precedes the newest counted conflict cannot \
+     compute the elapsed span, and a rate limit must answer that on the \
+     restrictive side — reporting NOT in force here is what let a queued first \
+     probe leave inside §8.1's five seconds"
+  );
+
+  // The other direction is a DIFFERENT question and must not move with it:
+  // there is no entry for `now` to precede, so there is nothing to space out.
+  let fresh = build_endpoint();
+  assert!(
+    !fresh.flood_for_test().in_force(now),
+    "no conflict has been counted at all, so the floor is not in force"
+  );
+}
+
 /// The verdict is folded at RECEIPT, inside `Endpoint::handle`, before the
 /// iterator yields anything — so a service due at the same instant as the
 /// fifteenth conflict reads the true verdict whichever way round the driver
@@ -14108,6 +14161,88 @@ fn a_service_due_at_the_fifteenth_conflict_is_floored_from_init_and_from_probing
       "ticked_first={ticked_first}: and the probe went out at or after it"
     );
   }
+}
+
+/// A driver that folds the fifteenth conflict at a LATER instant than the one it
+/// then hands the wire boundary still holds its queued first probe back.
+///
+/// This is the shape a bundled driver reached on ordinary traffic: one reading
+/// taken for a pass, each received datagram anchored to its own later reading,
+/// and the transmit stage handing the pass's — now stale — reading back to the
+/// core. The fifteenth conflict of a burst arrives inside that pass, so the
+/// endpoint is asked how long ago the burst was using an instant from before it
+/// was counted. Answering "not in force" there is a violated MUST; answering "in
+/// force" costs this probe at most the five seconds §8.1 already owes it.
+///
+/// The probe is QUEUED before the burst completes, which is what makes the wire
+/// boundary the last point that can hold it: the enqueue check ran while the
+/// limit was still off, and it was right to.
+#[test]
+fn a_first_probe_polled_on_an_instant_older_than_the_fifteenth_conflict_is_withheld() {
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let (_h, at) = flood_victim(
+    &mut e,
+    "Printer._ipp._tcp.local.",
+    "h.local.",
+    Ipv4Addr::new(192, 168, 1, 5),
+    now,
+  );
+  conflicts_at(&mut e, &instance, at, 14);
+
+  // A second record set, registered while the limit is still off, so it takes
+  // §8.1's ordinary 0-250 ms schedule.
+  let recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("Fresh._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("fresh-host.local.").unwrap(),
+    631,
+    120,
+  );
+  let fresh = e
+    .try_register_service(ServiceSpec::new(recs), at)
+    .expect("registration must succeed");
+  let floor = after(at, 5_000);
+
+  // Two of its own deadlines: `Init → Probing(0)` emits nothing, and
+  // `Probing(0)` ENQUEUES the first probe. Nothing is polled after the second,
+  // so the datagram is sitting in the queue with the limit still off.
+  let mut buf = std::vec![0u8; 4096];
+  let mut cur = e.poll_service_timeout(fresh).expect("Init is on a clock");
+  e.handle_service_timeout(fresh, cur).unwrap();
+  assert!(
+    matches!(e.poll_service_transmit(fresh, cur, &mut buf), Ok(None)),
+    "`Init → Probing(0)` is a free step that emits nothing"
+  );
+  cur = e
+    .poll_service_timeout(fresh)
+    .expect("Probing(0) is on a clock")
+    .max(cur);
+  assert!(cur < floor, "precondition: the probe is queued inside the floor");
+  e.handle_service_timeout(fresh, cur).unwrap();
+
+  // The burst completes AFTER the instant the stale pass carries.
+  let stale = cur;
+  let counted_at = after(stale, 1);
+  assert!(one_conflict(&mut e, &instance, counted_at) >= 1);
+  assert!(
+    e.flood_for_test().in_force(counted_at),
+    "premise: the fifteenth conflict engages the limit"
+  );
+
+  assert!(
+    matches!(e.poll_service_transmit(fresh, stale, &mut buf), Ok(None)),
+    "the wire boundary was handed an instant older than the conflict that \
+     engaged the floor, and let the first probe out inside the five seconds \
+     §8.1 mandates"
+  );
+  assert!(
+    e.poll_service_timeout(fresh)
+      .is_some_and(|due| due >= floor),
+    "and the dropped probe is re-armed to the sequence's ABSOLUTE floor, so the \
+     wait converges instead of sliding"
+  );
 }
 
 /// An ESTABLISHED name's RFC 6762 §9 conflict is counted, and it is counted
