@@ -205,7 +205,13 @@ cfg_heap! {
 
     /// Nothing is held. Used by tests that drive a `Service` with no route table
     /// behind it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// Gated to match its only callers — [`Service::tick_for_test`] and
+    /// `service/tests.rs`, whose `mod tests;` declaration carries this same
+    /// predicate. A `cfg_attr(not(test), allow(dead_code))` silenced only the
+    /// non-test build and left it compiled, and dead, in any `test` build that
+    /// reached this heap tier without `slab`.
+    #[cfg(all(test, any(feature = "alloc", feature = "std"), feature = "slab"))]
     pub(crate) const EMPTY: Self = Self { names: &[] };
 
     /// DNS-name equality, not string equality: a name differing only in the
@@ -1502,7 +1508,7 @@ where
   /// set's own state machine. An empty history is "the limit is not in force",
   /// which is what every test that is not about the limit means. The limit's own
   /// behaviour is pinned against the endpoint API, where it lives.
-  #[cfg(test)]
+  #[cfg(all(test, any(feature = "alloc", feature = "std"), feature = "slab"))]
   pub(crate) fn for_test(
     handle: ServiceHandle,
     records: ServiceRecords,
@@ -1525,14 +1531,14 @@ where
   /// Test-only: drive a timeout with an empty flood history and an empty
   /// name-in-use set. See [`Service::for_test`]; the name set is empty because
   /// there is no route table, so every rename candidate is free.
-  #[cfg(test)]
+  #[cfg(all(test, any(feature = "alloc", feature = "std"), feature = "slab"))]
   pub(crate) fn tick_for_test(&mut self, now: I) -> Result<(), HandleTimeoutError> {
     self.handle_timeout(now, &ConflictFlood::new(), &NamesInUse::EMPTY)
   }
 
   /// Test-only: dispatch one event with an empty flood history. See
   /// [`Service::for_test`].
-  #[cfg(test)]
+  #[cfg(all(test, any(feature = "alloc", feature = "std"), feature = "slab"))]
   pub(crate) fn feed_for_test(&mut self, event: ServiceEvent<'_>, now: I) {
     self.handle_event(event, now, &mut ConflictFlood::new());
   }

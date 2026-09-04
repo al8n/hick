@@ -612,8 +612,14 @@ cfg_heap! {
   ///
   /// Owned rather than borrowed because it outlives the datagram's reader, and
   /// flattened rather than storing the event because `ServiceEvent` borrows the
-  /// datagram. `cfg(test)`: it does not exist in a shipped build.
-  #[cfg(test)]
+  /// datagram. It does not exist in a shipped build.
+  ///
+  /// The whole cluster — this record, its kind, its accessors, the endpoint field
+  /// that holds them and the push site in `route.rs` — is gated to match
+  /// `endpoint/tests.rs`, its only reader, whose `mod tests;` declaration carries
+  /// this same predicate. A bare `cfg(test)` left the log compiled and recorded,
+  /// and never read, in any `test` build without `std` + `slab`.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   #[derive(Debug, Clone)]
   pub(crate) struct Dispatched {
     handle: ServiceHandle,
@@ -621,8 +627,9 @@ cfg_heap! {
     history: Option<ConflictHistory>,
   }
 
-  /// Test-only: which [`ServiceEvent`] a [`Dispatched`] record describes.
-  #[cfg(test)]
+  /// Test-only: which [`ServiceEvent`] a [`Dispatched`] record describes. Gated
+  /// with it.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   #[derive(Debug, Clone, Copy, Eq, PartialEq, derive_more::IsVariant)]
   pub(crate) enum DispatchedKind {
     Question,
@@ -632,7 +639,7 @@ cfg_heap! {
     ProbeProposal,
   }
 
-  #[cfg(test)]
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   impl Dispatched {
     /// Flatten one event at the instant it is dispatched.
     fn new(handle: ServiceHandle, event: &ServiceEvent<'_>) -> Self {
@@ -762,8 +769,9 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS> {
   pub(crate) history_screens: usize,
   /// Test-only: every [`ServiceEvent`] this endpoint has dispatched, in order.
   /// See [`Dispatched`]; a routing test reads this because a service event is no
-  /// longer observable from outside. `cfg(test)`: absent from a shipped build.
-  #[cfg(test)]
+  /// longer observable from outside. Absent from a shipped build, and gated with
+  /// the record it holds.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   pub(crate) dispatched: std::vec::Vec<Dispatched>,
   /// Scratch for the instance names a rename must avoid, refilled from the route
   /// table on the ticks a rename is actually imminent.
@@ -867,7 +875,7 @@ where
       flood: ConflictFlood::new(),
       #[cfg(test)]
       history_screens: 0,
-      #[cfg(test)]
+      #[cfg(all(test, feature = "std", feature = "slab"))]
       dispatched: std::vec::Vec::new(),
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       rename_scratch: std::vec::Vec::new(),

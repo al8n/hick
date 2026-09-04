@@ -479,7 +479,8 @@ where
   /// reads a history that already includes it.
   fn dispatch(&mut self, key: usize, event: ServiceEvent<'_>) {
     let now = self.now;
-    #[cfg(test)]
+    // Gated with the log it writes; see `Dispatched`.
+    #[cfg(all(test, feature = "std", feature = "slab"))]
     if let Some(route) = self.endpoint.services.get(key) {
       let record = super::Dispatched::new(route.handle(), &event);
       self.endpoint.dispatched.push(record);

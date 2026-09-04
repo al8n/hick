@@ -207,7 +207,11 @@ impl<I: Instant> ConflictFlood<I> {
   /// Test-only: how many conflicts the ring currently holds. The tests that
   /// pin the dedupe key assert on this directly, because "one datagram, one
   /// count" is a statement about the ring and not about any one service.
-  #[cfg(test)]
+  ///
+  /// Gated to match its only callers in `endpoint/tests.rs`, whose `mod tests;`
+  /// declaration carries this same predicate — a bare `cfg(test)` left it
+  /// compiled, and dead, in a `test` build reaching this module without `slab`.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   pub(crate) fn counted(&self) -> usize {
     self.ring.iter().flatten().count()
   }

@@ -510,7 +510,9 @@ where
     /// reports it: only that gates the reclaim, because only for a link the
     /// announcement actually reached does §10.2's cache-flush supersede the stale
     /// records the goodbye exists to retract.
-    #[cfg(test)]
+    /// Gated to match its only callers in `endpoint/tests.rs`, whose `mod tests;`
+    /// declaration carries this same predicate.
+    #[cfg(all(test, feature = "std", feature = "slab"))]
     pub(crate) fn note_service_announced_for_test(
       &mut self,
       handle: ServiceHandle,
