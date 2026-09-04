@@ -160,7 +160,7 @@ cfg_heap! {
   use rand::SeedableRng;
 
   use crate::error::{HandleTimeoutError, TransmitError};
-  use crate::event::{ServiceEvent, ServiceUpdate};
+  use crate::event::{DatagramId, ServiceEvent, ServiceUpdate};
   use crate::records::ServiceRecords;
   use crate::transmit::{
     FamilyAttempt, FamilyDelivery, Transmit, TransmitConfirm, TransmitDelivery, TransmitObligation,
@@ -1295,6 +1295,36 @@ cfg_heap! {
   /// it was consulted; an absolute `start + 5 s` converges — once `now` has
   /// reached it the wait is served, so it costs at most one re-arm per arm.
   sequence_started_at: I,
+  /// RFC 6762 §8.1 count eligibility for ONE received datagram, captured at the
+  /// first conflict that datagram produces: `(which datagram, was this
+  /// generation's first probe already on the wire)`.
+  ///
+  /// # Why the answer is per DATAGRAM and not per record
+  ///
+  /// §8.1's gate on counting — "apparently conflicting Multicast DNS responses
+  /// received *before* the first probe packet is sent MUST be silently ignored"
+  /// — is a question about the instant the datagram ARRIVED. One datagram
+  /// carries many records, and an earlier record of it can move the very state a
+  /// later record's gate reads: an established service whose instance and host
+  /// names differ is sent through §9's revert by a conflicting SRV at its
+  /// instance name, which shuts `probe_on_wire`, so a conflicting A at its host
+  /// name two records later was read as pre-authoritative and not counted. The
+  /// declared key is `(datagram, contested owner)` and those are two owners, so
+  /// the count depended on the order the two records happened to appear in.
+  ///
+  /// Captured once and re-read for the rest of that datagram, which is the rule
+  /// this crate already applies to the clock one field over: the router's `now`
+  /// is "not re-read per record. The datagram is one event with one processing
+  /// instant." Eligibility is the same kind of fact about the same event.
+  ///
+  /// Keyed by [`DatagramId`], so the next datagram simply replaces the capture
+  /// and no lifecycle transition has to remember to clear it.
+  ///
+  /// It gates COUNTING and nothing else. WHICH conflict rule a record falls
+  /// under is still decided from live state, because a regress genuinely does
+  /// shut §8.1's window for the generation it starts — see
+  /// [`Service::restart_probe_cycle`].
+  flood_eligibility: Option<(DatagramId, bool)>,
   /// One-shot handoff of the OLD instance name's TTL=0 goodbye when a §9 conflict
   /// renames an ANNOUNCED service. Set at the rename site (`handle_timeout`) with
   /// the OLD records and WHICH instance records that name actually advertised
@@ -1442,6 +1472,7 @@ where
       pending_legacy: std::vec::Vec::new(),
       last_conflict_reprobe: None,
       sequence_started_at: now,
+      flood_eligibility: None,
       rename_goodbye_handoff: None,
       meta_response_deadline: None,
       meta_questioner_srcs: std::vec::Vec::new(),
@@ -3012,6 +3043,23 @@ where
     })
   }
 
+  /// May a conflict carried by `datagram` be COUNTED against RFC 6762 §8.1's
+  /// flood limit? Decided once per datagram, at the first conflict it produces,
+  /// and re-read for every later record of it.
+  ///
+  /// See [`Service::flood_eligibility`] for why the answer belongs to the
+  /// datagram rather than to each record.
+  fn flood_eligible(&mut self, datagram: DatagramId) -> bool {
+    match self.flood_eligibility {
+      Some((seen, eligible)) if seen == datagram => eligible,
+      _ => {
+        let eligible = self.probe_on_wire;
+        self.flood_eligibility = Some((datagram, eligible));
+        eligible
+      }
+    }
+  }
+
   /// RFC 6762 §8.1's five-second floor, applied at the WIRE COMMIT BOUNDARY —
   /// the last point a queued first probe can still be held back.
   ///
@@ -3636,6 +3684,23 @@ where
     // no `handle_timeout` between it and the next `poll_timeout`. The arms
     // below read this method's `now`, not this field.
     self.last_now = Some(now);
+    // §8.1 COUNT ELIGIBILITY, settled here rather than in the arm that reads it.
+    //
+    // It is a fact about the datagram, so it must be captured before any arm of
+    // any record of that datagram has had the chance to move the state it is
+    // about — and the arm that does move it is not the arm that reads it. An
+    // established service's §9 revert (the `ProbeConflict` arm below) shuts
+    // §8.1's window, and it is the `HostConflict` arm of a LATER record that
+    // then finds it shut. Capturing at every conflict-bearing event, not only
+    // at the two that gate on the answer, is what makes the capture belong to
+    // the first record of the datagram whichever arm that record takes.
+    //
+    // The same rule the router applies to the clock: its `now` is "not re-read
+    // per record. The datagram is one event with one processing instant." See
+    // [`Service::flood_eligibility`].
+    if let Some(datagram) = event.datagram() {
+      let _ = self.flood_eligible(datagram);
+    }
     trace!(
       target: "mdns_proto::service",
       handle = self.handle.raw(),
@@ -3734,8 +3799,11 @@ where
         // §8.1 ignores a conflicting response received before this generation's
         // first probe packet is sent, and a conflict this service is required to
         // ignore is not one the host may count. `handle_preauthoritative_conflict`
-        // applies the same gate to the record itself.
-        if self.probe_on_wire {
+        // applies the same gate to the record itself — from LIVE state, because
+        // whether to act on the record is a question about the generation now
+        // running, while whether to COUNT it is a question about the datagram
+        // that arrived. See [`Service::flood_eligibility`].
+        if self.flood_eligible(pc.datagram()) {
           flood.accept(now, pc.datagram(), self.records.instance());
         }
         self.handle_preauthoritative_conflict(&pc);
@@ -4290,12 +4358,18 @@ where
         // name for the same reason, and a service whose instance name IS its
         // host name therefore counts SRV and A from one datagram once.
         //
-        // Gated on `probe_on_wire` exactly as the pre-authoritative instance
-        // cell is. Before this name's first probe reached a link, §8.1 has us
-        // ignore conflicting responses; this one is still SURFACED, because it
-        // is terminal and the caller must intervene, but it spaces out no probe
-        // attempt because a `Conflicting` service makes none.
-        if self.probe_on_wire {
+        // Gated on the DATAGRAM's eligibility, exactly as the pre-authoritative
+        // instance cell is. Before this name's first probe reached a link, §8.1
+        // has us ignore conflicting responses; this one is still SURFACED,
+        // because it is terminal and the caller must intervene, but it spaces
+        // out no probe attempt because a `Conflicting` service makes none.
+        //
+        // Reading live `probe_on_wire` here made one datagram's count depend on
+        // the order of its records: a conflicting SRV at the instance name runs
+        // §9's revert, which shuts §8.1's window, so a conflicting A at the host
+        // name behind it went uncounted while the same pair in the other order
+        // counted twice. See [`Service::flood_eligibility`].
+        if self.flood_eligible(hc.datagram()) {
           flood.accept(now, hc.datagram(), self.records.host());
         }
         let _ = self.pending_updates.insert(ServiceUpdate::HostConflict);

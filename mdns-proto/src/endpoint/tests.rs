@@ -14419,3 +14419,67 @@ fn unregistering_makes_the_service_inert_and_the_goodbye_still_drains() {
   );
   assert!(e.service(h).is_none(), "the route is gone");
 }
+
+/// One datagram's RFC 6762 §8.1 count must not depend on the ORDER of its
+/// records.
+///
+/// The declared key is `(datagram, contested owner)`: two distinct owners in one
+/// datagram are two conflicts. For an established service whose instance and
+/// host names differ, a conflicting SRV at the instance name runs §9's revert,
+/// which shuts §8.1's window — so a conflicting A at the host name behind it was
+/// read as pre-authoritative and dropped, while the same two records in the
+/// other order counted twice. Both arrived in one datagram, while the service
+/// was established; eligibility is a fact about the datagram, captured once,
+/// exactly as the router's `now` is.
+#[test]
+fn one_datagram_counts_two_owners_whatever_order_its_records_arrive_in() {
+  use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder};
+  for srv_first in [true, false] {
+    let mut e = build_endpoint();
+    let now = StdInstant::now();
+    let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+    let host = Name::try_from_str("printer-host.local.").unwrap();
+    let mut recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      instance.clone(),
+      host.clone(),
+      631,
+      120,
+    );
+    recs.add_a(Ipv4Addr::new(192, 168, 1, 5));
+    let h = e
+      .try_register_service(ServiceSpec::new(recs), now)
+      .expect("registration must succeed");
+    let at = drive_to_established(&mut e, h, now);
+    assert_eq!(svc_state(&e, h), crate::ServiceState::Established);
+    assert_eq!(e.flood_for_test().counted(), 0, "nothing yet");
+
+    let target = Name::try_from_str("rival-host.local.").unwrap();
+    let theirs = Ipv4Addr::new(192, 168, 1, 200);
+    let mut buf = std::vec![0u8; 512];
+    let mut hdr = Header::new();
+    hdr.flags_mut().set_response();
+    let n = {
+      let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+        MessageBuilder::try_new(&mut buf, hdr).unwrap();
+      if srv_first {
+        b.push_srv_answer(&instance, 120, 0, 0, 9999, &target, true)
+          .unwrap();
+        b.push_a_answer(&host, 120, theirs, true).unwrap();
+      } else {
+        b.push_a_answer(&host, 120, theirs, true).unwrap();
+        b.push_srv_answer(&instance, 120, 0, 0, 9999, &target, true)
+          .unwrap();
+      }
+      b.finish().unwrap()
+    };
+    deliver_to_service_any(&mut e, &buf[..n], at);
+    assert_eq!(
+      e.flood_for_test().counted(),
+      2,
+      "srv_first={srv_first}: two distinct contested owners in one datagram are \
+       two conflicts, and the §9 revert one of them runs must not un-count the \
+       other"
+    );
+  }
+}

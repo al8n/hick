@@ -441,6 +441,25 @@ pub enum ServiceEvent<'a> {
   KnownAnswer(KnownAnswer<'a>),
 }
 
+impl ServiceEvent<'_> {
+  /// Which datagram carried this event, for the three variants a conflict can
+  /// come from. `None` for the two that carry no conflict — a question and a
+  /// known-answer hint — because nothing per-datagram is decided for them.
+  ///
+  /// It exists so `Service::handle_event` can settle a per-DATAGRAM fact once,
+  /// before any arm has had a chance to move the state that fact is about. See
+  /// `Service::flood_eligibility`.
+  #[inline]
+  pub(crate) const fn datagram(&self) -> Option<DatagramId> {
+    match self {
+      Self::ProbeConflict(pc) => Some(pc.datagram()),
+      Self::ProbeProposal(pp) => Some(pp.datagram()),
+      Self::HostConflict(hc) => Some(hc.datagram()),
+      Self::Question(_) | Self::KnownAnswer(_) => None,
+    }
+  }
+}
+
 /// Events delivered from `Endpoint::handle()` to a `Query`.
 #[derive(Debug, Copy, Clone, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref)]
