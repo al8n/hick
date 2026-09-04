@@ -4437,9 +4437,30 @@ fn a_response_processed_after_the_drain_crossed_the_window_is_not_collected() {
     return;
   }
   tick_across_the_window(&mut mdns, started);
-  let answers: Vec<_> = mdns.endpoint.collected_answers(handle).cloned().collect();
+  // Read from the CALLER's queue rather than from the endpoint's collection.
+  // The same drain that crossed the window raises the tick's protocol instant to
+  // the instant it folded at, so stage 3 fires this query's deadline in the same
+  // tick and stage 5 delivers what it collected on the way out. That is the
+  // terminal the caller was promised, one tick earlier than a stale reading gave
+  // it, and the answers still pass through stage 5 ahead of it.
+  let mut answers: Vec<Vec<u8>> = Vec::new();
+  let mut terminated = false;
+  while let Some(ev) = mdns.next_event() {
+    match ev {
+      Event::QueryAnswer { handle: h, answer } if h == handle => {
+        answers.push(answer.rdata_slice().to_vec());
+      }
+      Event::QueryTerminal { handle: h, .. } if h == handle => terminated = true,
+      _ => {}
+    }
+  }
   mdns.deregister().expect("deregister");
 
+  assert!(
+    terminated,
+    "the query's own deadline is the only thing that may end it, and the tick \
+     that crossed it must deliver that terminal"
+  );
   assert_eq!(
     answers.len(),
     1,
@@ -4447,7 +4468,7 @@ fn a_response_processed_after_the_drain_crossed_the_window_is_not_collected() {
      collected; got {answers:?}"
   );
   assert_eq!(
-    answers[0].rdata_slice(),
+    answers[0].as_slice(),
     &[10, 0, 0, 7],
     "and it must not have evicted the answer collected inside the window: the \
      tick's instant is what makes a late datagram look in-window, and under the \
@@ -4492,15 +4513,22 @@ fn a_duplicate_question_after_the_drain_crossed_the_window_spends_no_slot() {
     mdns.deregister().expect("deregister");
     return;
   }
+  // The premise, stated BEFORE the tick: nothing inside it can retire this query
+  // ahead of stage 1, so a query live here is a query live at the drain — and
+  // that is what makes a zero count below mean the suppression was refused
+  // rather than that there was nothing left to suppress. It is read here rather
+  // than after because the same drain that crosses the window raises the tick's
+  // protocol instant to it, so stage 3 fires this query's deadline in the same
+  // tick and stage 5 retires it.
+  let live_at_the_drain = mdns.endpoint.query_accepted_count(handle).is_some();
   tick_across_the_window(&mut mdns, started);
   let suppressed = mdns.stats().duplicate_questions_suppressed;
-  let still_live = mdns.endpoint.query_accepted_count(handle).is_some();
   mdns.deregister().expect("deregister");
 
   assert!(
-    still_live,
-    "the query must still exist for the count below to mean the suppression was \
-     refused rather than that there was nothing left to suppress"
+    live_at_the_drain,
+    "the query must exist when the drain runs for the count below to mean the \
+     suppression was refused rather than that there was nothing left to suppress"
   );
   assert_eq!(
     suppressed, 0,
@@ -4823,6 +4851,68 @@ fn a_goodbye_begun_in_stage_seven_is_scheduled_from_stage_seven() {
      the debt still owed"
   );
   assert_goodbye_wire_spacing("a goodbye begun by a slow tick", &wire_times, ceiling_floor);
+}
+
+// ── the tick's protocol instant is never older than what stage 1 folded ─────
+//
+// Stage 1 anchors every effect of a datagram to a reading of its own, taken per
+// datagram and after however long the receive has already run. Among those
+// effects is RFC 6762 §8.1's endpoint-wide conflict ring, whose fifteenth entry
+// engages a five-second floor on the next probe sequence to start. Stages 3 and
+// 4 then ask the core to weigh that floor — and the tick's entry reading is
+// EARLIER than a conflict counted inside the receive, so the core is asked how
+// long ago the burst was using an instant from before it was counted. That
+// question has no answer, and this driver was asking it on ordinary traffic.
+//
+// The core now refuses it on the restrictive side, so the cost was a probe
+// delayed rather than a MUST violated. This pins the driver's own half: the
+// tick's instant is RAISED to whatever stage 1 folded at.
+
+/// The instant stages 3 and 4 are handed is never older than one stage 1 handed
+/// the core.
+///
+/// The stall is taken inside the drain — after the datagram has been read and
+/// admitted, with only `Endpoint::handle` left — so the fold really does happen
+/// at a reading the tick's entry precedes. A protocol instant still equal to the
+/// entry one means every event that datagram produced is being judged from
+/// before it happened.
+#[test]
+fn the_ticks_protocol_instant_is_never_older_than_what_the_receive_folded() {
+  const STALL_INSIDE_THE_DRAIN: Duration = Duration::from_millis(400);
+
+  let Some((mut mdns, mut poll)) = registered_v4_only() else {
+    return;
+  };
+  let body = a_response("hick-mio-folded-late.local.", Ipv4Addr::new(10, 0, 0, 9));
+  let queued = queue_peer_datagram(&mut mdns, &mut poll, &body, "the folded datagram");
+  if queued.is_none() {
+    mdns.deregister().expect("deregister");
+    return;
+  }
+  mdns.force_claim_delays_for_test(&[STALL_INSIDE_THE_DRAIN]);
+  mdns.tick().expect("tick");
+  let consumed = mdns.forced_claim_delays.is_empty();
+  let entered = mdns
+    .last_tick_instant
+    .expect("the tick records the instant it entered on");
+  let protocol = mdns
+    .last_protocol_instant
+    .expect("the tick records the instant it handed stages 3 and 4");
+  mdns.deregister().expect("deregister");
+
+  assert!(
+    consumed,
+    "the stall is consumed at the claim, so an unconsumed one means the datagram \
+     never reached `Endpoint::handle` and this test asserted nothing"
+  );
+  assert!(
+    protocol.saturating_duration_since(entered) >= STALL_INSIDE_THE_DRAIN,
+    "the tick handed its service and query paths an instant read {:?} after \
+     entry, while stage 1 folded a datagram {STALL_INSIDE_THE_DRAIN:?} into it — \
+     so an RFC 6762 §8.1 conflict counted inside the receive would be weighed \
+     against a reading from before it was counted",
+    protocol.saturating_duration_since(entered)
+  );
 }
 
 // ── a paid family owes no further goodbye ───────────────────────────────────

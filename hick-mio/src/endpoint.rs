@@ -287,7 +287,10 @@ pub struct Mdns {
   /// substitutes.
   #[cfg(test)]
   pub(crate) forced_launch_delays: std::collections::VecDeque<std::time::Duration>,
-  /// The instant [`Self::tick`] read at its top, on the last tick that ran.
+  /// The instant [`Self::tick`] read at its ENTRY, on the last tick that ran —
+  /// which is no longer the tick's protocol instant, since that one is read
+  /// after the receive stage. This is the entry reading and nothing weighs a
+  /// decision against it.
   ///
   /// The lookup tests that let a real clock cross a real window rest on a
   /// premise: the tick *began* inside the lookup's window, so whatever ended the
@@ -299,6 +302,16 @@ pub struct Mdns {
   /// instant than the one the tick used. This is the one the tick used.
   #[cfg(test)]
   pub(crate) last_tick_instant: Option<std::time::Instant>,
+  /// The PROTOCOL instant [`Self::tick`] handed stages 3 and 4, on the last tick
+  /// that ran — the one every core deadline in that tick was weighed against.
+  ///
+  /// Recorded separately from [`Self::last_tick_instant`] because the two are
+  /// deliberately different readings and the whole rule is the gap between them:
+  /// this one is taken BELOW the receive, so it is never older than an event
+  /// stage 1 folded into the core at its own, later reading. A test can state
+  /// that as a comparison; nothing else can observe it.
+  #[cfg(test)]
+  pub(crate) last_protocol_instant: Option<std::time::Instant>,
 }
 
 impl Mdns {
@@ -389,6 +402,8 @@ impl Mdns {
       forced_launch_delays: std::collections::VecDeque::new(),
       #[cfg(test)]
       last_tick_instant: None,
+      #[cfg(test)]
+      last_protocol_instant: None,
     })
   }
 

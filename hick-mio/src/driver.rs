@@ -57,13 +57,24 @@
 //! The rule sorts every instant in this crate into two kinds, and the second
 //! kind is small.
 //!
-//! **A protocol instant may be passed in.** [`Mdns::tick`] reads one at its top
-//! and every *protocol* deadline inside that tick is weighed against it — the
-//! endpoint's, each service's lifecycle, each query's RFC 6762 §5.2 retry. Those
-//! are schedules the core owns and nobody outside it can observe, so one stable
+//! **A protocol instant may be passed in.** [`Mdns::tick`] reads one and every
+//! *protocol* deadline inside that tick is weighed against it — the endpoint's,
+//! each service's lifecycle, each query's RFC 6762 §5.2 retry. Those are
+//! schedules the core owns and nobody outside it can observe, so one stable
 //! value per tick is the point: two stages that disagree about "now" can fire a
 //! deadline twice or skip it, while the quantization itself never leaves the
 //! core. Nothing real-time may be measured from it.
+//!
+//! **And it may never be older than an event this tick already folded.** Stable
+//! is not the same as early. Stage 1 anchors each datagram to a reading of its
+//! own, taken after however long the receive has already run, and
+//! `Endpoint::handle` applies that datagram's every effect at it — among them
+//! RFC 6762 §8.1's endpoint-wide conflict ring, whose fifteenth entry engages a
+//! five-second floor on the next probe sequence to start. An entry reading
+//! precedes a conflict counted inside the receive, so stages 3 and 4 would be
+//! asking the core how long ago a burst was using an instant from before it was
+//! counted. So the tick's instant is RAISED to whatever stage 1 folded at,
+//! and a tick that folded nothing keeps its entry reading unchanged.
 //!
 //! **A real-time instant may not.** Anything answering "how long has actually
 //! elapsed", and anything a **caller** was promised in wall-clock terms — a
@@ -519,8 +530,35 @@ impl Mdns {
     // from nothing earlier or later — so it is read inside the seal, after the
     // sweep that precedes it, rather than handed in from here.
     self.selfsend.seal();
-    self.drain_recv();
+    let folded_at = self.drain_recv();
     self.sweep();
+    // THE TICK'S PROTOCOL INSTANT, raised to whatever stage 1 already folded.
+    //
+    // One stable value for stages 3 and 4 is still the point — two stages that
+    // disagree about "now" can fire a deadline twice or skip it. What the entry
+    // reading may NOT be is older than an event this tick has already applied to
+    // the core: `drain_recv` anchors each datagram to its own, later reading, and
+    // `Endpoint::handle` folds that datagram's every effect at it. Among them is
+    // RFC 6762 §8.1's endpoint-wide conflict ring, whose fifteenth entry engages
+    // a five-second floor on the next probe sequence to start — and an entry
+    // reading precedes a conflict counted inside the receive, so the core is
+    // asked how long ago a burst was from an instant before it was counted. That
+    // question has no answer; the core now refuses it on the restrictive side,
+    // so the cost was a probe delayed rather than a MUST violated. The driver's
+    // half is not to ask it.
+    //
+    // Raised rather than re-read, and the difference is deliberate: this is a
+    // statement about ORDERING against the tick's own work, not a claim to be
+    // current. A tick that folded nothing keeps its entry reading exactly, which
+    // is what leaves every caller-facing window still decided by the live read
+    // taken beside the decision rather than by a reading the receive moved.
+    let now = folded_at.map_or(now, |folded| now.max(folded));
+    // Recorded, not consulted, and separate from the entry reading above: the
+    // gap between the two IS the rule, so a test states it as a comparison.
+    #[cfg(test)]
+    {
+      self.last_protocol_instant = Some(now);
+    }
     self.fire_timeouts(now);
     self.drain_transmits(now);
     // None of the three below takes `now`, and that is the fix rather than an
@@ -567,9 +605,20 @@ impl Mdns {
   /// before this stage ran, and up to `RECV_BUDGET` datagrams stale by the last
   /// of them — has nothing here to govern. See this module's clock rule and the
   /// read itself.
-  fn drain_recv(&mut self) {
+  ///
+  /// # It REPORTS the newest instant it folded at
+  ///
+  /// The tick's protocol instant is raised to it, because no later stage may
+  /// judge an event this one has already applied to the core from an instant
+  /// older than the application. `None` when nothing reached `Endpoint::handle`,
+  /// which leaves the tick's own reading exactly as it was.
+  fn drain_recv(&mut self) -> Option<StdInstant> {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
+
+    // The newest instant this stage handed to `Endpoint::handle`. Reported to
+    // the caller, which raises the tick's protocol instant to it.
+    let mut folded_at: Option<StdInstant> = None;
 
     for _ in 0..RECV_BUDGET {
       // Disjoint field borrows: the socket we read from, the buffer we read
@@ -618,7 +667,7 @@ impl Mdns {
         match sockets.recv_once(recv_buf.as_mut_slice(), &mut discarded) {
           RecvStep::Datagram(rx, meta) => break (rx, meta),
           RecvStep::Retry => {}
-          RecvStep::Idle => return,
+          RecvStep::Idle => return folded_at,
         }
       };
       let data = rx.body();
@@ -880,6 +929,11 @@ impl Mdns {
       // not reached. One stable protocol instant per tick, one live read per
       // caller-facing decision. See this module's clock rule.
       let processed_at = StdInstant::now();
+      // Recorded before the call rather than after it, and whatever the call
+      // returns: an `Err` still reaches the core, and this is a claim about
+      // which instants the core has been handed, not about which of them
+      // produced a route event.
+      folded_at = Some(processed_at);
 
       let route_events = match endpoint.handle(
         processed_at,
@@ -911,6 +965,7 @@ impl Mdns {
         }
       }
     }
+    folded_at
   }
 
   /// Lose the CPU where the drain really can: after a datagram has been read and
