@@ -86,9 +86,7 @@ pub use error::{
 };
 
 cfg_heap! {
-  pub use error::{
-    CancelQueryError, HandleServiceRenamedError, RegisterServiceError, ServiceTypeNotParentDetail,
-  };
+  pub use error::{CancelQueryError, RegisterServiceError, ServiceTypeNotParentDetail};
 }
 
 /// mDNS wire format — panic-free parser and encoder.
@@ -102,7 +100,7 @@ pub mod transmit;
 pub use event::{
   ConflictHistory, ConflictOrigin, ConflictRole, DatagramId, EndpointEvent, HostConflict,
   KnownAnswer, ProbeConflict, ProbeProposal, QueryEvent, QueryUpdate, RouteEvent, ServiceEvent,
-  ServiceQuestion, ToQuery, ToService,
+  ServiceQuestion, ToQuery,
 };
 pub use transmit::{FamilyAttempt, Transmit, TransmitConfirm, TransmitObligation};
 

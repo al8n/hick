@@ -2,16 +2,18 @@
 
 use super::*;
 
-impl<I, R, C, SR, QS, EV, AN, EvQ> Endpoint<I, R, C, SR, QS, EV, AN, EvQ>
+impl<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS> Endpoint<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>
 where
   I: Instant,
   R: Rng,
   C: Pool<CacheEntry<I>>,
-  SR: Pool<ServiceRoute>,
+  SR: Pool<ServiceRoute<I, TQ, EvS>>,
   QS: Pool<Query<I, AN, EvQ>>,
   EV: Pool<EndpointEventEntry>,
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
+  TQ: Pool<Transmit>,
+  EvS: Pool<ServiceUpdate>,
 {
   /// Start a new query.
   ///

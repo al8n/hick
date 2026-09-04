@@ -9,7 +9,7 @@ cfg_heap! {
   use crate::Name;
 }
 use crate::{
-  QueryHandle, ServiceHandle,
+  QueryHandle,
   wire::{MessageReader, QuestionRef, Questions, Records, Ref},
 };
 
@@ -352,17 +352,36 @@ impl<'a> ProbeProposal<'a> {
 pub struct HostConflict<'a> {
   record: Ref<'a>,
   origin: ConflictOrigin,
+  datagram: DatagramId,
 }
 impl<'a> HostConflict<'a> {
   #[allow(dead_code)]
   #[inline(always)]
-  pub(crate) const fn new(record: Ref<'a>, origin: ConflictOrigin) -> Self {
-    Self { record, origin }
+  pub(crate) const fn new(
+    record: Ref<'a>,
+    origin: ConflictOrigin,
+    datagram: DatagramId,
+  ) -> Self {
+    Self {
+      record,
+      origin,
+      datagram,
+    }
   }
   /// Returns the conflicting DNS record observed from a peer.
   #[inline(always)]
   pub const fn record(&self) -> &Ref<'a> {
     &self.record
+  }
+  /// Which datagram carried it. See [`DatagramId`].
+  ///
+  /// One datagram defending one host name is ONE conflict for RFC 6762 §8.1
+  /// however many A/AAAA records carry it, and however many registered services
+  /// share that host name — so the endpoint's flood history keys on
+  /// `(datagram, host name)` and this is the first half of that key.
+  #[inline(always)]
+  pub const fn datagram(&self) -> DatagramId {
+    self.datagram
   }
   /// Returns where the record was carried, which decides which RFC 6762 rule
   /// governs it. See [`ConflictOrigin`].
@@ -441,35 +460,6 @@ pub enum QueryEvent<'a> {
 
 /// A routing decision produced by `Endpoint::handle()`.
 #[derive(Debug, Copy, Clone)]
-pub struct ToService<'a> {
-  handle: ServiceHandle,
-  event: ServiceEvent<'a>,
-}
-impl<'a> ToService<'a> {
-  #[allow(dead_code)]
-  #[inline(always)]
-  pub(crate) const fn new(handle: ServiceHandle, event: ServiceEvent<'a>) -> Self {
-    Self { handle, event }
-  }
-  /// Returns the service handle this event is addressed to.
-  #[inline(always)]
-  pub const fn handle(&self) -> ServiceHandle {
-    self.handle
-  }
-  /// Returns a reference to the service event payload.
-  #[inline(always)]
-  pub const fn event(&self) -> &ServiceEvent<'a> {
-    &self.event
-  }
-  /// Consumes the routing decision and returns the inner event.
-  #[inline(always)]
-  pub const fn into_event(self) -> ServiceEvent<'a> {
-    self.event
-  }
-}
-
-/// A routing decision produced by `Endpoint::handle()`.
-#[derive(Debug, Copy, Clone)]
 pub struct ToQuery<'a> {
   handle: QueryHandle,
   event: QueryEvent<'a>,
@@ -498,13 +488,24 @@ impl<'a> ToQuery<'a> {
 }
 
 /// A routing decision yielded by `Endpoint::handle()`.
+///
+/// # There is no `ToService`
+///
+/// A [`ServiceEvent`] is never handed to a caller. `Endpoint` owns every
+/// [`Service`](crate::Service) and applies each routed event inside its own
+/// routing borrow, at the instant the datagram was received, exactly as it
+/// already applied a query answer inside one.
+///
+/// That is not a convenience. A caller standing between the router and the
+/// classifier is what made RFC 6762 §8.1's conflict-flood limit uncountable for
+/// the host, made a rename mutate a service's records before the route table
+/// could object, and made the instant a conflict was RECEIVED differ from the
+/// instant it was classified at.
 #[derive(Debug, Copy, Clone, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
 #[non_exhaustive]
 pub enum RouteEvent<'a> {
-  /// Route the event to the matched service.
-  ToService(ToService<'a>),
   /// Route the event to the matched query.
   ///
   /// Informational: `Endpoint::handle` has already offered this record to the

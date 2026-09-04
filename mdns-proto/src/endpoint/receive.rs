@@ -2,16 +2,18 @@
 
 use super::*;
 
-impl<I, R, C, SR, QS, EV, AN, EvQ> Endpoint<I, R, C, SR, QS, EV, AN, EvQ>
+impl<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS> Endpoint<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>
 where
   I: Instant,
   R: Rng,
   C: Pool<CacheEntry<I>>,
-  SR: Pool<ServiceRoute>,
+  SR: Pool<ServiceRoute<I, TQ, EvS>>,
   QS: Pool<Query<I, AN, EvQ>>,
   EV: Pool<EndpointEventEntry>,
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
+  TQ: Pool<Transmit>,
+  EvS: Pool<ServiceUpdate>,
 {
   /// Is `addr` advertised by any registered service?  Used by `handle` to
   /// detect multicast-loopback datagrams whose source address matches an
@@ -109,7 +111,7 @@ where
     &'e mut self,
     now: I,
     rx: Received<'a>,
-  ) -> Result<RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ>, HandleError> {
+  ) -> Result<RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>, HandleError> {
     let Received {
       src,
       data,
@@ -584,7 +586,6 @@ where
       answer_idx: 0,
       authority_idx: 0,
       pending_query: None,
-      pending_service_event: None,
       answer_query_cursor: None,
       answer_service_cursor: None,
       answer_service_done: false,

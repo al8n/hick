@@ -420,7 +420,10 @@ pub(crate) fn is_host_conflict_rtype(rt: ResourceType) -> bool {
 /// choice `host_addresses_disagree` makes, and for the same reason: what a
 /// service has advertised so far is a subset of what it may advertise next, and
 /// the classifier this gate feeds compares against the configured set too.
-pub(crate) fn route_publishes_host_rtype(route: &ServiceRoute, rt: ResourceType) -> bool {
+pub(crate) fn route_publishes_host_rtype<I, TQ, EvS>(
+  route: &ServiceRoute<I, TQ, EvS>,
+  rt: ResourceType,
+) -> bool {
   match rt {
     ResourceType::A => !route.a_addrs().is_empty(),
     ResourceType::AAAA => !route.aaaa_addrs().is_empty(),
