@@ -133,7 +133,7 @@ fn handle_rejects_a_malformed_packet_with_a_parse_error() {
 }
 
 #[test]
-fn note_service_announced_is_a_noop_for_an_unknown_handle() {
+fn mirroring_a_confirmed_announce_is_a_noop_for_an_unknown_handle() {
   let mut e = build_endpoint();
   // No registered service → the route lookup misses and the call returns early.
   e.note_service_announced_for_test(ServiceHandle::from_raw(0xDEAD), false, &[], &[]);
@@ -4123,9 +4123,11 @@ fn terminated_query_rejects_late_answers() {
     b.push_a_answer(&qn, 120, pre_terminal_addr, false).unwrap();
     let n = b.finish().unwrap();
     let pkt = &buf[..n];
-    let _ = route_events(&mut e, now,
-      Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .into_iter().count();
+    let _ = route_events(
+      &mut e,
+      now,
+      Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
+    );
   }
   assert_eq!(
     e.collected_answers(h).count(),
@@ -4963,7 +4965,7 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
 /// (optionally) mirror an advertised set into its route, returning its handle.
 /// `advertised == None` models a registered-but-never-announced sibling (its
 /// route advertised set stays EMPTY); `Some(addrs)` mirrors a confirmed
-/// announce via `note_service_announced`.
+/// announce via `note_service_transmit_outcome`.
 fn register_host_service(
   ep: &mut TestEndp,
   instance: &str,
@@ -6332,7 +6334,7 @@ fn surviving_rename_old_name_is_reclaimable_on_announce() {
   );
 }
 
-/// cancel-on-announce must NOT fire on a PROBE. `note_service_announced`
+/// cancel-on-announce must NOT fire on a PROBE. `note_service_transmit_outcome`
 /// is called after EVERY delivered service transmit (including probes); the
 /// reclaim-cancel is gated on `Service::has_fully_announced`, which is set only
 /// by a fully-delivered §8.3 announcement — never a probe — so a probe alone
@@ -12358,7 +12360,7 @@ fn a_unicast_only_generation_does_not_screen_a_genuine_peer_conflict() {
 
 /// The RFC 6762 §9 RENAME is the other point a record set stops being published,
 /// and its detached goodbye is not enough on its own: a SURVIVING rename's
-/// old-name goodbye is reclaim-cancelled by `note_service_announced` the moment
+/// old-name goodbye is reclaim-cancelled by `note_service_transmit_outcome` the moment
 /// a service fully announces that same name — which is exactly the moment a
 /// replacement has taken it. So `enqueue_rename_withdrawal` retains the set at
 /// the rename itself.
@@ -14202,4 +14204,23 @@ fn the_flood_limit_comes_off_once_the_flood_stops() {
     "a service must not be permanently slow to probe because of one bad ten \
      seconds it had at startup"
   );
+}
+
+/// `Endpoint` and the `Service`s it now owns stay `Send + Sync`.
+///
+/// The reactor spawns a `Send` future holding the endpoint, so this is
+/// load-bearing rather than decorative — and moving the `Service` inside the
+/// `Endpoint` is exactly the change that could have cost it. Nothing here is
+/// shared, atomic, locked or `!Send`: RFC 6762 §8.1's conflict history is plain
+/// fields on the endpoint, mutated under the `&mut self` that routing already
+/// holds. A design that had shared the verdict instead would have had to pay for
+/// it here.
+#[test]
+fn the_endpoint_and_its_services_are_send_and_sync() {
+  const fn assert_send_sync<T: Send + Sync>() {}
+  assert_send_sync::<TestEndp>();
+  assert_send_sync::<TestSvcRoute>();
+  assert_send_sync::<
+    crate::service::Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
+  >();
 }

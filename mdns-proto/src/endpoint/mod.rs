@@ -189,7 +189,7 @@ cfg_heap! {
   ///
   /// # Why an opaque token works here
   ///
-  /// Same shape as [`FullyAnnounced`]: `Copy`, no
+  /// Same shape as [`FullyAnnounced`](crate::FullyAnnounced): `Copy`, no
   /// public constructor, accessors only. A driver reads one; a driver cannot mint
   /// one. That is sound HERE — and not for a send outcome — because outstanding
   /// debt is a fact the **core** owns and spends. A driver has nothing to
@@ -348,7 +348,7 @@ cfg_heap! {
     /// It starts as the exposure exactly and only ever NARROWS: a reclaimable
     /// detached item is trimmed to the shared records a same-name replacement's
     /// announcement cannot supersede (see
-    /// [`Endpoint::note_service_announced`]). Narrowing is the safe direction
+    /// [`Endpoint::note_service_transmit_outcome`]). Narrowing is the safe direction
     /// for both readers — a goodbye retracts less, and the relinquished screen
     /// disowns less — while widening it past what was emitted is what
     /// `EmittedRecords` exists to prevent.
@@ -372,7 +372,7 @@ cfg_heap! {
     /// strength of bytes no multicast socket ever carried.
     ///
     /// It narrows exactly where `owned` does (see
-    /// [`Endpoint::note_service_announced`]), so it is a subset of `owned` at
+    /// [`Endpoint::note_service_transmit_outcome`]), so it is a subset of `owned` at
     /// every instant.
     #[allow(dead_code)]
     multicast: [crate::service::EmittedRecords; 2],
@@ -425,15 +425,16 @@ cfg_heap! {
     ///
     /// `false` (the default) is a SURVIVING rename's old name: reclaimable, so a
     /// fresh registration of the vacated name cancels the goodbye rather than being
-    /// blocked. `true` is a rename-COLLISION teardown's old
-    /// name: the service is DEAD, so its stale records must be retracted BEFORE the
-    /// name is reused; without the hold, the empty route-attached current-name
-    /// withdrawal completes first and a quick re-register cancels the only real
-    /// goodbye, leaving peers with stale PTR/SRV/TXT until TTL. A held name is
-    /// rejected by BOTH reuse paths — `try_register_service` and
-    /// `handle_service_renamed` — and is never cancelled by
-    /// [`Endpoint::note_service_announced`], so the dead service's goodbye always
-    /// drains before the name can be claimed again.
+    /// blocked. `true` is a rename that could not MOVE — the suffixed candidate
+    /// was not a valid DNS name, so the service went terminal under the name it
+    /// already had: the service is DEAD, so its stale records must be retracted
+    /// BEFORE the name is reused; without the hold, the empty route-attached
+    /// current-name withdrawal completes first and a quick re-register cancels
+    /// the only real goodbye, leaving peers with stale PTR/SRV/TXT until TTL. A
+    /// held name is rejected by BOTH reuse paths — `try_register_service` and a
+    /// rename's own name search — and is never cancelled by
+    /// [`Endpoint::note_service_transmit_outcome`], so the dead service's
+    /// goodbye always drains before the name can be claimed again.
     #[allow(dead_code)]
     holds_name: bool,
   }
@@ -494,7 +495,7 @@ pub struct ServiceRoute<I, TQ, EvS> {
   /// wire — the subset of `a_addrs` a peer truly holds in its cache.  EMPTY at
   /// registration (a never-announced service has advertised nothing); the
   /// driver mirrors the live `Service::advertised_a_addrs` set here via
-  /// [`Endpoint::note_service_announced`] after each confirmed announce.  This
+  /// [`Endpoint::note_service_transmit_outcome`] after each confirmed announce.  This
   /// (NOT the configured `a_addrs`) is what `sibling_retained_addrs` honours so
   /// a withdrawing service only retains addresses a LIVE same-host sibling
   /// genuinely owns in peer caches.
@@ -577,7 +578,7 @@ impl<I, TQ, EvS> ServiceRoute<I, TQ, EvS> {
     /// IPv4 host addresses this service has CONFIRMED-ADVERTISED on the wire.
     /// Distinct from [`Self::a_addrs`] (the configured set used for self-/
     /// loopback detection): this is the subset peers actually hold in cache, kept
-    /// current by [`Endpoint::note_service_announced`] and consumed by
+    /// current by [`Endpoint::note_service_transmit_outcome`] and consumed by
     /// sibling host-address retention during withdrawal.
     #[inline(always)]
     pub(crate) fn advertised_a(&self) -> &[Ipv4Addr] {

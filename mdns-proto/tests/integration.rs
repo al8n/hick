@@ -120,7 +120,7 @@ fn duplicate_service_registration_rejected() {
   let recs2 = ServiceRecords::new(stype, inst, host, 631, 120);
   let r2 = e.try_register_service(ServiceSpec::new(recs2), now);
   assert!(r2.is_err());
-  let err = r2.err().expect("expected Err but got Ok");
+  let err = r2.expect_err("expected Err but got Ok");
   assert!(err.is_name_already_registered());
 }
 

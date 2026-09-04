@@ -1025,7 +1025,7 @@ impl EmittedRecords {
   /// retraction, dropping everything else it recorded.
   ///
   /// The one caller is the reclaim-cancel in
-  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced),
+  /// [`Endpoint::note_service_transmit_outcome`](crate::Endpoint::note_service_transmit_outcome),
   /// and the asymmetry it needs is RFC 6762's own. A same-name replacement's
   /// §10.2 announcement carries the SRV and TXT with the cache-flush bit, so it
   /// SUPERSEDES the stale unique records at that instance name and the goodbye

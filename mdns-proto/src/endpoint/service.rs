@@ -347,16 +347,16 @@ where
     // NOTE: a reclaimable detached old-name goodbye for this instance name is NOT
     // cancelled here. Registration only RESERVES the name; the reclaiming service
     // probes (~750 ms, RFC 6762 §8.1) before it advertises. The reclaim-cancel now
-    // fires on the CERTAIN live event — `note_service_announced`, when this service
+    // fires on the CERTAIN live event — `note_service_transmit_outcome`, when this service
     // confirms it is announcing the name — not at register time, because the
     // reactor only async-commits a registration across its reply boundary and
     // cancelling here could lose the goodbye when the caller drops the registration
     // before owning the service. Until then the old goodbye keeps
     // draining; if this registration is orphaned or renames away before announcing,
     // the goodbye completes normally and retracts the old records. A name-HOLDING
-    // collision goodbye still blocks reuse via the duplicate-name + holds_name scans
-    // above. Auto-rename onto a reclaimable detached name is still
-    // reclaimed synchronously in `handle_service_renamed`.
+    // goodbye — one left by a rename that could not move off its own name — still
+    // blocks reuse via the duplicate-name + holds_name scans above, and a rename
+    // sees the same two lists through `collect_names_in_use`.
 
     debug!(
       target: "mdns_proto::endpoint",
@@ -613,10 +613,13 @@ where
   /// > [`Self::unregister_service`] — may be invoked until that datagram's
   /// > [`Self::note_service_transmit_outcome`].
   ///
-  /// This is the same contract [`Service::poll_transmit`] has always stated, now
-  /// stated where it is reached. RFC 6762 §8.1's flood limit rests on the
-  /// transmit half of it: probes leave this host only through this method, so
-  /// the floor applied where a probe is enqueued is a floor on the wire.
+  /// The core cannot type-check the ordering, so it is enforced by cheap
+  /// backstops rather than assumed: a `debug_assert!` at each entry point fails a
+  /// non-compliant driver loudly in its own test suite, and in release the single
+  /// commit-token slot keeps the damage defined. RFC 6762 §8.1's flood limit
+  /// rests on the transmit half of it: probes leave this host only through this
+  /// method, so the floor applied where a probe is enqueued is a floor on the
+  /// wire.
   ///
   /// `Ok(None)` when nothing is due, or the handle is not registered.
   pub fn poll_service_transmit(
@@ -638,9 +641,10 @@ where
   /// recently produced by [`Self::poll_service_transmit`] for `handle`.
   ///
   /// ALL lifecycle progression happens here rather than at the poll, so a send
-  /// that reached no link advances nothing. See [`Service::poll_transmit`] for
-  /// the full contract, including what [`TransmitConfirm::retire_producer`]
-  /// obliges the caller to do.
+  /// that reached no link advances nothing — neither the goodbye-ownership
+  /// latches for an announcement nor the RFC 6762 §8.1 probe sequence. See
+  /// [`Self::poll_service_transmit`] for the full contract, including what
+  /// [`TransmitConfirm::retire_producer`] obliges the caller to do.
   ///
   /// It also mirrors what the confirm latched into the route: the host addresses
   /// this service has now CONFIRMED-ADVERTISED (which is what a sibling's
@@ -648,7 +652,7 @@ where
   /// name has reached every obligated link — the reclaim of any detached
   /// old-name goodbye the announcement supersedes.
   ///
-  /// [`TransmitConfirm::NOTHING`] for an unknown handle.
+  /// An empty confirm for an unknown handle.
   pub fn note_service_transmit_outcome(
     &mut self,
     handle: ServiceHandle,

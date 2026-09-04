@@ -29,7 +29,7 @@ where
     /// re-announced) name. The OLD instance name of an in-flight §9 rename is NOT
     /// handled here — a rename hands its old-name goodbye off the instant it
     /// happens (the driver calls [`Self::enqueue_rename_withdrawal`] after
-    /// [`Self::handle_service_renamed`]), so it is already its own INDEPENDENT
+    /// the tick that renamed), so it is already its own INDEPENDENT
     /// detached item. A teardown DURING the rename window is therefore simply two
     /// independent single-name items — that earlier detached old-name one plus this
     /// route-attached current-name one: the two never share a
@@ -60,13 +60,10 @@ where
     ///
     /// # Contract
     ///
-    /// `snapshot` must come from a
-    /// [`Service::withdrawal_snapshot`](crate::service::Service::withdrawal_snapshot)
-    /// taken with no datagram outstanding — i.e. after the service's last
-    /// `poll_transmit` was confirmed. A snapshot taken mid-flight omits the
-    /// records that datagram is about to place in peer caches, and this goodbye
-    /// can only withdraw what the snapshot names. See
-    /// [`Service::poll_transmit`](crate::service::Service::poll_transmit).
+    /// `snapshot` must be taken with no datagram outstanding — i.e. after the
+    /// service's last [`Self::poll_service_transmit`] was confirmed. A snapshot
+    /// taken mid-flight omits the records that datagram is about to place in
+    /// peer caches, and this goodbye can only withdraw what the snapshot names.
     pub(crate) fn begin_withdrawal(
       &mut self,
       handle: ServiceHandle,
@@ -148,11 +145,10 @@ where
     /// Enqueue a DETACHED withdrawal item for the OLD instance name of a §9
     /// conflict rename (the renamed-away old name's TTL=0 goodbye).
     ///
-    /// The driver calls this immediately after [`Self::handle_service_renamed`],
-    /// passing the
-    /// [`RenameGoodbyeHandoff`](crate::service::RenameGoodbyeHandoff) it took from
-    /// [`Service::take_rename_goodbye_handoff`](crate::service::Service::take_rename_goodbye_handoff)
-    /// (the old name's records + the per-record ownership of what it advertised).
+    /// Called from [`Self::handle_service_timeout`] and
+    /// [`Self::unregister_service`] with the handoff the renaming `Service` left
+    /// behind (the old name's records + the per-record ownership of what it
+    /// advertised).
     /// This models the old-name goodbye as an INDEPENDENT single-name withdrawal
     /// item — its own per-family debt, schedule, ceiling, and loss-resilience
     /// resends — exactly like a teardown's detached item. A teardown DURING the
@@ -177,7 +173,7 @@ where
     /// so a delayed echo of them cannot be adjudicated against whatever takes
     /// the vacated name. The item's own residency is not enough on its own: a
     /// SURVIVING rename's detached goodbye is reclaim-cancelled by
-    /// [`Self::note_service_announced`] the moment a service fully announces
+    /// [`Self::note_service_transmit_outcome`] the moment a service fully announces
     /// that same name, which is precisely the moment a replacement has taken it
     /// and the evidence is most needed.
     pub(crate) fn enqueue_rename_withdrawal(

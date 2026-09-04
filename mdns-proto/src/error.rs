@@ -224,7 +224,7 @@ pub enum EncodeError {
   IntegerConversion(#[from] core::num::TryFromIntError),
 }
 
-/// Errors raised by [`Service::handle_timeout`](crate::service::Service::handle_timeout).
+/// Errors raised by [`Endpoint::handle_service_timeout`](crate::Endpoint::handle_service_timeout).
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
@@ -235,7 +235,7 @@ pub enum HandleTimeoutError {
   Overflow,
 }
 
-/// Errors raised by [`Service::poll_transmit`](crate::service::Service::poll_transmit).
+/// Errors raised by [`Endpoint::poll_service_transmit`](crate::Endpoint::poll_service_transmit).
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]

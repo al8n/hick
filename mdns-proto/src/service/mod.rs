@@ -996,7 +996,7 @@ cfg_heap! {
 cfg_heap! {
   /// Unforgeable proof of [`Service::has_fully_announced`] — the reclaim-cancel
   /// gate of
-  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced).
+  /// [`Endpoint::note_service_transmit_outcome`](crate::Endpoint::note_service_transmit_outcome).
   ///
   /// There is NO public constructor and no `From<bool>`: the only way a driver can
   /// obtain a value is to ask the `Service` that owns the fact. That is the whole
@@ -1014,7 +1014,7 @@ cfg_heap! {
   /// silently survive both the driver migration and any external upgrade.
   ///
   /// The token also NAMES the service it was minted from, and
-  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced)
+  /// [`Endpoint::note_service_transmit_outcome`](crate::Endpoint::note_service_transmit_outcome)
   /// takes no separate handle. An unforgeable fact is still transplantable while
   /// the subject is a second argument: a genuine `true` from service A, paired
   /// with service B's handle, would cancel B's reclaimable goodbye while an
@@ -1060,11 +1060,18 @@ cfg_heap! {
 cfg_heap! {
   /// Service state machine. One per registered service.
   ///
-  /// Driving one means honouring two call-ordering contracts: drain
-  /// [`Service::poll_transmit`] until it returns `Ok(None)`, and confirm each
-  /// datagram it hands out — via [`Service::note_transmit_outcome`] — before
-  /// invoking any other state-mutating entry point on this service.
-  /// [`Service::poll_transmit`] documents the second one in full.
+  /// One per registered service, OWNED by the
+  /// [`Endpoint`](crate::Endpoint) that registered it and driven through that
+  /// endpoint's `*_service*` accessors. [`Endpoint::service`](crate::Endpoint::service)
+  /// hands out this read-only view: the name it is probing for or holds, its
+  /// lifecycle state, its records, and what it has confirmed-advertised.
+  ///
+  /// Driving one means honouring two call-ordering contracts, both stated on
+  /// [`Endpoint::poll_service_transmit`](crate::Endpoint::poll_service_transmit):
+  /// drain it until it returns `Ok(None)`, and confirm each datagram it hands
+  /// out — via
+  /// [`Endpoint::note_service_transmit_outcome`](crate::Endpoint::note_service_transmit_outcome)
+  /// — before invoking any other state-mutating entry point for this service.
   pub struct Service<I, TQ, EV> {
   handle: ServiceHandle,
   state: ServiceState,
@@ -1591,7 +1598,7 @@ where
   /// by every family that was obligated to carry it.
   ///
   /// This is the reclaim-cancel gate the driver ferries into
-  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced):
+  /// [`Endpoint::note_service_transmit_outcome`](crate::Endpoint::note_service_transmit_outcome):
   /// only once every link the driver still obligates has heard the reclaiming
   /// name may that name's renamed-away predecessor stop sending its TTL=0
   /// goodbye. For every such link §10.2's cache-flush announcement supersedes the
@@ -1606,10 +1613,11 @@ where
   /// multicast the name. Only the Announcement confirm arm sets this, so no
   /// response of any kind can.
   ///
-  /// The result is wrapped in [`FullyAnnounced`] precisely so that the wrong fact
-  /// cannot be substituted at the call site; use [`FullyAnnounced::get`] to read
-  /// it. The token is stamped with THIS service's handle, so it also cannot be
-  /// applied to a different service.
+  /// The result is wrapped in [`FullyAnnounced`] so that the wrong fact cannot be
+  /// substituted where this one is meant; use [`FullyAnnounced::get`] to read it.
+  /// The endpoint reads the fact off the service itself when it decides whether
+  /// a detached old-name goodbye has been superseded, so the token never travels
+  /// between calls and cannot be paired with another service's handle at all.
   ///
   /// Reset by a §9 conflict rename: the new name has announced nothing.
   #[inline(always)]
