@@ -593,8 +593,12 @@ where
   /// names a rename may take is asserting the shipped rule rather than a
   /// restatement of it. What it skips is only the conflict that would normally
   /// cause the rename.
-  #[cfg(test)]
-  #[allow(dead_code)]
+  ///
+  /// Gated to match `endpoint/tests.rs`, its only consumer, whose `mod tests;`
+  /// declaration carries this same predicate. A bare `#[cfg(test)]` compiles it
+  /// dead in every `test` build without `std` + `slab`, where the paired
+  /// `#[allow(dead_code)]` — not the gate — was what kept `-D warnings` quiet.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   pub(crate) fn rename_service_for_test(&mut self, handle: ServiceHandle, new_name: Name) -> bool {
     let Some(key) = self.service_key(handle) else {
       return false;
@@ -793,8 +797,10 @@ where
 
   /// Test-only: RFC 6762 §8.1's conflict history, for the tests that are about
   /// the history itself rather than about what it does to a schedule.
-  #[cfg(test)]
-  #[allow(dead_code)]
+  ///
+  /// Gated like [`Self::rename_service_for_test`]: `endpoint/tests.rs` is the
+  /// only consumer, and its `mod tests;` declaration carries this predicate.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   pub(crate) fn flood_for_test(&self) -> &ConflictFlood<I> {
     &self.flood
   }
@@ -806,8 +812,10 @@ where
   /// comes from; this is for fixtures that need one specific event delivered at
   /// one specific instant and have no reason to encode a message to get it. The
   /// flood history is the endpoint's own, so what the event counts, it counts.
-  #[cfg(test)]
-  #[allow(dead_code)]
+  ///
+  /// Gated like [`Self::rename_service_for_test`]: `endpoint/tests.rs` is the
+  /// only consumer, and its `mod tests;` declaration carries this predicate.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   pub(crate) fn dispatch_service_event_for_test(
     &mut self,
     handle: ServiceHandle,
@@ -829,8 +837,10 @@ where
   ///
   /// [`Self::unregister_service`] takes this itself; a fixture reads it directly
   /// when the SNAPSHOT is the thing under test rather than the withdrawal.
-  #[cfg(test)]
-  #[allow(dead_code)]
+  ///
+  /// Gated like [`Self::rename_service_for_test`]: `endpoint/tests.rs` is the
+  /// only consumer, and its `mod tests;` declaration carries this predicate.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   pub(crate) fn service_withdrawal_snapshot_for_test(
     &mut self,
     handle: ServiceHandle,
@@ -848,8 +858,10 @@ where
 
   /// Test-only: confirm from a projected delivery SHAPE rather than a pair of
   /// per-family attempts.
-  #[cfg(test)]
-  #[allow(dead_code)]
+  ///
+  /// Gated like [`Self::rename_service_for_test`]: `endpoint/tests.rs` is the
+  /// only consumer, and its `mod tests;` declaration carries this predicate.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   pub(crate) fn note_service_delivery(
     &mut self,
     handle: ServiceHandle,

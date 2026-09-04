@@ -1493,7 +1493,11 @@ where
   /// rename does to the WITHDRAWAL lifecycle — which name is reserved, which
   /// goodbye survives — and which have no reason to stage a probe sequence and a
   /// peer's defence to get there.
-  #[cfg(test)]
+  ///
+  /// Gated to match its only caller, `Endpoint::rename_service_for_test`, which
+  /// carries `endpoint/tests.rs`'s predicate: a bare `#[cfg(test)]` left this
+  /// compiled and dead in every `test` build without `std` + `slab`.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
   pub(crate) fn rename_for_test(&mut self, new_name: crate::Name) {
     self.records.set_instance(new_name);
     self.reset_advertised_name_state();
@@ -1851,8 +1855,12 @@ where
   /// shape is what keeps them readable. The projection, the anchor fold and the
   /// retirement decision have their own tests, which build attempts explicitly
   /// and read the [`TransmitConfirm`] this one drops.
-  #[cfg(test)]
-  #[allow(dead_code)]
+  ///
+  /// Gated to match `service/tests.rs`, its only consumer, whose `mod tests;`
+  /// declaration carries this same predicate. A bare `#[cfg(test)]` compiles it
+  /// dead in any `test` build below that tier, where the paired
+  /// `#[allow(dead_code)]` — not the gate — was what kept `-D warnings` quiet.
+  #[cfg(all(test, any(feature = "alloc", feature = "std"), feature = "slab"))]
   pub(crate) fn note_delivery(&mut self, now: I, delivery: TransmitDelivery) {
     let (v4, v6) = delivery.as_attempts(now);
     let _ = self.note_transmit_outcome(now, v4, v6);
