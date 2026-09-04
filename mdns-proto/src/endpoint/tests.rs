@@ -14483,3 +14483,44 @@ fn one_datagram_counts_two_owners_whatever_order_its_records_arrive_in() {
     );
   }
 }
+
+/// A latched RFC 6762 §8.1 defeat must not RENAME the route while its §10.1
+/// goodbye is in flight.
+///
+/// This is the facet of a withdrawing service's inertness that only the
+/// `handle_service_timeout` gate closes. Discarding the queued transmits does
+/// not reach it: `probe_defeated` survives the teardown, and the rename is
+/// decided ABOVE every deadline check in the state machine — so one more tick
+/// would move the very name the in-flight goodbye is retracting, and the route
+/// table would mirror the move in the same borrow.
+#[test]
+fn a_latched_rename_cannot_move_the_name_a_goodbye_is_retracting() {
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let (h, at) = flood_victim(
+    &mut e,
+    "Printer._ipp._tcp.local.",
+    "h.local.",
+    Ipv4Addr::new(192, 168, 1, 5),
+    now,
+  );
+  // A conflicting authoritative response inside §8.1's window: the defeat is
+  // latched, and the next timeout is the one that would rename.
+  assert!(one_conflict(&mut e, &instance, at) >= 1);
+
+  e.unregister_service(h, at);
+  e.handle_service_timeout(h, after(at, 500)).unwrap();
+
+  assert_eq!(
+    e.service(h).map(crate::Service::name),
+    Some(&instance),
+    "a retiring route keeps the name its goodbye is built from"
+  );
+  while let Some(upd) = e.poll_service(h) {
+    assert!(
+      !upd.is_renamed(),
+      "and the caller is told of no rename, because none happened"
+    );
+  }
+}
