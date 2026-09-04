@@ -474,30 +474,7 @@ where
       .get(key)
       .is_some_and(|route| route.proto.rename_imminent())
     {
-      let Self {
-        services,
-        rename_scratch,
-        ..
-      } = self;
-      for (other, route) in services.iter() {
-        if other != key {
-          rename_scratch.push(route.name().clone());
-        }
-      }
-      // A rename-failure teardown's detached goodbye HOLDS its name until it
-      // drains — the dead service's stale records must be retracted before the
-      // name is claimed again — so a rename may not take it either. This is the
-      // same guard `try_register_service` applies to the same items.
-      let Self {
-        withdrawals,
-        rename_scratch,
-        ..
-      } = self;
-      for (_, item) in withdrawals.iter() {
-        if item.route.is_none() && item.holds_name {
-          rename_scratch.push(item.records.instance().clone());
-        }
-      }
+      self.collect_names_in_use(key);
     }
 
     let outcome = {
@@ -532,6 +509,69 @@ where
     // The renamed-away name's TTL=0 goodbye, modelled as its own detached item.
     self.drain_rename_goodbye(key, now);
     outcome
+  }
+
+  /// Fill [`Self::rename_scratch`] with every instance name this endpoint holds
+  /// except the one at route `except`.
+  ///
+  /// TWO kinds of holder, and both must be here or a rename can take a name that
+  /// is not free:
+  ///
+  /// * every other live route's instance name;
+  /// * every rename-failure teardown's detached goodbye that still HOLDS its
+  ///   name. The dead service's stale records must be retracted before that name
+  ///   is claimed again, which is the same guard [`Self::try_register_service`]
+  ///   applies to the same items.
+  ///
+  /// A route never collides with itself, which is what `except` is for.
+  fn collect_names_in_use(&mut self, except: usize) {
+    let Self {
+      services,
+      rename_scratch,
+      ..
+    } = self;
+    for (other, route) in services.iter() {
+      if other != except {
+        rename_scratch.push(route.name().clone());
+      }
+    }
+    let Self {
+      withdrawals,
+      rename_scratch,
+      ..
+    } = self;
+    for (_, item) in withdrawals.iter() {
+      if item.route.is_none() && item.holds_name {
+        rename_scratch.push(item.records.instance().clone());
+      }
+    }
+  }
+
+  /// Test-only: move a registered service onto `new_name`, refusing exactly what
+  /// a real rename refuses. Returns whether the name was free.
+  ///
+  /// It runs the SAME screen [`Self::handle_service_timeout`] hands to the state
+  /// machine — [`Self::collect_names_in_use`] — so a fixture that asserts which
+  /// names a rename may take is asserting the shipped rule rather than a
+  /// restatement of it. What it skips is only the conflict that would normally
+  /// cause the rename.
+  #[cfg(test)]
+  #[allow(dead_code)]
+  pub(crate) fn rename_service_for_test(&mut self, handle: ServiceHandle, new_name: Name) -> bool {
+    let Some(key) = self.service_key(handle) else {
+      return false;
+    };
+    self.rename_scratch.clear();
+    self.collect_names_in_use(key);
+    if NamesInUse::new(&self.rename_scratch).holds(&new_name) {
+      return false;
+    }
+    let Some(route) = self.services.get_mut(key) else {
+      return false;
+    };
+    route.proto.rename_for_test(new_name.clone());
+    route.name = new_name;
+    true
   }
 
   /// Take whatever RFC 6762 §10.1 goodbye a rename left behind for the OLD name
@@ -654,6 +694,61 @@ where
     #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
     let _ = announced_name;
     confirm
+  }
+
+  /// Test-only: RFC 6762 §8.1's conflict history, for the tests that are about
+  /// the history itself rather than about what it does to a schedule.
+  #[cfg(test)]
+  #[allow(dead_code)]
+  pub(crate) fn flood_for_test(&self) -> &ConflictFlood<I> {
+    &self.flood
+  }
+
+  /// Test-only: route one [`ServiceEvent`] to a registered service without
+  /// building a datagram for it.
+  ///
+  /// The shipped path is `RouteEvents::next`, which is where every real event
+  /// comes from; this is for fixtures that need one specific event delivered at
+  /// one specific instant and have no reason to encode a message to get it. The
+  /// flood history is the endpoint's own, so what the event counts, it counts.
+  #[cfg(test)]
+  #[allow(dead_code)]
+  pub(crate) fn dispatch_service_event_for_test(
+    &mut self,
+    handle: ServiceHandle,
+    event: ServiceEvent<'_>,
+    now: I,
+  ) {
+    let Some(key) = self.service_key(handle) else {
+      return;
+    };
+    let Self {
+      services, flood, ..
+    } = self;
+    if let Some(route) = services.get_mut(key) {
+      route.proto.handle_event(event, now, flood);
+    }
+  }
+
+  /// Test-only: what a registered service says a §10.1 goodbye must retract.
+  ///
+  /// [`Self::unregister_service`] takes this itself; a fixture reads it directly
+  /// when the SNAPSHOT is the thing under test rather than the withdrawal.
+  #[cfg(test)]
+  #[allow(dead_code)]
+  pub(crate) fn service_withdrawal_snapshot_for_test(
+    &mut self,
+    handle: ServiceHandle,
+  ) -> crate::service::WithdrawalSnapshot {
+    let key = self
+      .service_key(handle)
+      .expect("service must be registered");
+    self
+      .services
+      .get_mut(key)
+      .expect("route must resolve")
+      .proto
+      .withdrawal_snapshot()
   }
 
   /// Test-only: confirm from a projected delivery SHAPE rather than a pair of

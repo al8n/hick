@@ -11,23 +11,80 @@ use std::{net::Ipv4Addr, time::Instant as StdInstant};
 
 type TestQuery = Query<StdInstant, slab::Slab<CollectedAnswer>, slab::Slab<QueryUpdate>>;
 
-type TestSvc = crate::service::Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>;
+type TestSvcRoute = ServiceRoute<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>;
 
 type TestEndp = Endpoint<
   StdInstant,
   rand::rngs::StdRng,
   slab::Slab<CacheEntry<StdInstant>>,
-  slab::Slab<ServiceRoute>,
+  slab::Slab<TestSvcRoute>,
   slab::Slab<TestQuery>,
   slab::Slab<EndpointEventEntry>,
   slab::Slab<CollectedAnswer>,
   slab::Slab<QueryUpdate>,
+  slab::Slab<Transmit>,
+  slab::Slab<ServiceUpdate>,
 >;
 
 fn build_endpoint() -> TestEndp {
   use rand::SeedableRng;
   let rng = rand::rngs::StdRng::from_seed([99u8; 32]);
   TestEndp::try_new(EndpointConfig::new(), rng)
+}
+
+/// The lifecycle state of a registered service, through the endpoint's
+/// read-only view.
+fn svc_state(e: &TestEndp, h: ServiceHandle) -> crate::ServiceState {
+  e.service(h).expect("service must be registered").state()
+}
+
+/// Test-only mirror of everything one datagram DECIDED: the events the iterator
+/// yielded, plus the service dispatches it performed inside the endpoint.
+///
+/// A `ServiceEvent` never leaves the endpoint — [`RouteEvent`] has no
+/// `ToService`, because the router applies each one to the addressed service in
+/// its own borrow, at the datagram's receipt instant. A routing test still has
+/// to say WHICH service was told WHAT, so the dispatch log is folded back into
+/// this shape: the decision itself, read where the router made it.
+#[derive(Debug, Clone)]
+enum TestRoute<'a> {
+  ToService(Dispatched),
+  ToQuery(crate::event::ToQuery<'a>),
+  CacheUpdated,
+}
+
+/// Route one datagram and return every decision it made.
+///
+/// DISPATCHES FIRST, then the yielded events, each in its own order. The two
+/// are no longer interleaved because dispatch is not a yield; no test here turns
+/// on their relative order, and the order WITHIN each is what routing tests
+/// actually assert.
+fn route_events<'a>(
+  e: &mut TestEndp,
+  now: StdInstant,
+  rx: Received<'a>,
+) -> std::vec::Vec<Result<TestRoute<'a>, HandleError>> {
+  e.dispatched.clear();
+  let mut yielded: std::vec::Vec<Result<TestRoute<'a>, HandleError>> = std::vec::Vec::new();
+  match e.handle(now, rx) {
+    Ok(events) => {
+      for ev in events {
+        match ev {
+          Ok(crate::event::RouteEvent::ToQuery(q)) => yielded.push(Ok(TestRoute::ToQuery(q))),
+          Ok(crate::event::RouteEvent::CacheUpdated) => yielded.push(Ok(TestRoute::CacheUpdated)),
+          Err(err) => yielded.push(Err(err)),
+        }
+      }
+    }
+    Err(err) => return std::vec![Err(err)],
+  }
+  let mut out: std::vec::Vec<Result<TestRoute<'a>, HandleError>> =
+    core::mem::take(&mut e.dispatched)
+      .into_iter()
+      .map(|d| Ok(TestRoute::ToService(d)))
+      .collect();
+  out.extend(yielded);
+  out
 }
 
 #[test]
@@ -38,8 +95,8 @@ fn service_route_exposes_advertised_addresses() {
   let host = Name::try_from_str("h.local.").unwrap();
   let mut recs = ServiceRecords::new(st, inst, host, 631, 120);
   recs.add_a(Ipv4Addr::new(10, 0, 0, 5));
-  let (handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       StdInstant::now(),
     )
@@ -79,7 +136,7 @@ fn handle_rejects_a_malformed_packet_with_a_parse_error() {
 fn note_service_announced_is_a_noop_for_an_unknown_handle() {
   let mut e = build_endpoint();
   // No registered service → the route lookup misses and the call returns early.
-  e.note_service_announced(FullyAnnounced::new(ServiceHandle::from_raw(0xDEAD), false), &[], &[]);
+  e.note_service_announced_for_test(ServiceHandle::from_raw(0xDEAD), false, &[], &[]);
 }
 
 #[test]
@@ -133,7 +190,7 @@ fn src_matches_advertised_checks_route_addresses() {
   let host = Name::try_from_str("h.local.").unwrap();
   let mut recs = ServiceRecords::new(st, inst, host, 631, 120);
   recs.add_a(Ipv4Addr::new(10, 0, 0, 5));
-  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  e.try_register_service(
     ServiceSpec::new(recs),
     StdInstant::now(),
   )
@@ -165,96 +222,135 @@ fn handle_rejects_invalid_opcode_and_response_code() {
   ));
 }
 
+/// An RFC 6762 §8.1 rename is COMPLETE when `handle_service_timeout` returns:
+/// the service holds the new name and so does its route.
+///
+/// The two used to be updated by different parties — the `Service` renamed
+/// itself, emitted `Renamed`, and a driver then offered the name to the route
+/// table — so between those two calls the router was matching datagrams against
+/// a name nothing was probing for. Now the name is chosen and mirrored in one
+/// borrow, and `ServiceUpdate::Renamed` is a notification of a fact that is
+/// already true everywhere.
 #[test]
-fn handle_service_renamed_updates_route_name() {
+fn a_conflict_rename_updates_the_route_in_the_same_borrow() {
   let mut e = build_endpoint();
-  let stype = Name::try_from_str("_http._tcp.local.").unwrap();
-  let inst = Name::try_from_str("WebServer._http._tcp.local.").unwrap();
-  let host = Name::try_from_str("server.local.").unwrap();
-  let mut recs = ServiceRecords::new(stype, inst.clone(), host, 80, 120);
-  recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
   let now = StdInstant::now();
-  let (handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      now,
-    )
-    .unwrap();
+  let instance = Name::try_from_str("WebServer._ipp._tcp.local.").unwrap();
+  let target = Name::try_from_str("server.local.").unwrap();
+  let handle = register_probing_successor(
+    &mut e,
+    &instance,
+    &target,
+    80,
+    Ipv4Addr::new(10, 0, 0, 1),
+    now,
+  );
 
-  let new_name = Name::try_from_str("WebServer-2._http._tcp.local.").unwrap();
-  e.handle_service_renamed(handle, new_name.clone()).unwrap();
+  // §8.1's window opens only once a probe has actually reached a link.
+  let probed_at = probe_once_confirmed(&mut e, handle, now);
+  let mut buf = std::vec![0u8; 512];
+  let n = build_instance_srv_response(&mut buf, &instance, 9999, &target);
+  assert_eq!(
+    deliver_to_service(&mut e, handle, &buf[..n], probed_at),
+    1,
+    "precondition: an existing owner's authoritative SRV reaches the service"
+  );
 
-  // Verify the route was updated.
-  let found = e
+  // The timeout that spends the defeat is the rename.
+  e.handle_service_timeout(handle, probed_at).unwrap();
+  let renamed = e.service(handle).unwrap().name().clone();
+  assert_ne!(
+    renamed.as_str(),
+    instance.as_str(),
+    "a §8.1 defeat must give the name up"
+  );
+  let routed = e
     .services
     .iter()
     .find(|(_, route)| route.handle() == handle)
-    .map(|(_, route)| route.name().clone());
+    .map(|(_, route)| route.name().clone())
+    .expect("the route outlives the rename");
   assert_eq!(
-    found.as_ref().map(Name::as_str),
-    Some(new_name.as_str()),
-    "expected route name to be updated to the renamed instance"
+    routed.as_str(),
+    renamed.as_str(),
+    "the route table carries the new name already — there is no second call to \
+     make and no window in which the two disagree"
+  );
+  assert!(
+    drain_updates(&mut e, handle)
+      .iter()
+      .any(|u| matches!(u, ServiceUpdate::Renamed(r) if r.new_name().as_str() == renamed.as_str())),
+    "and the caller is TOLD, with the name that was actually taken"
   );
 }
 
+/// A rename never lands on a name this endpoint already holds.
+///
+/// It used to choose blind and let the route table refuse, and every driver
+/// carried the same reconciliation for that refusal. The names in use are read
+/// in the same call that picks the name now, so the collision has no state that
+/// can reach it: the rename simply steps over the taken suffix.
 #[test]
-fn handle_service_renamed_rejects_duplicate() {
-  use crate::error::HandleServiceRenamedError;
-
+fn a_rename_steps_over_a_name_the_endpoint_already_holds() {
   let mut e = build_endpoint();
   let now = StdInstant::now();
-
-  // Register first service.
-  let stype1 = Name::try_from_str("_http._tcp.local.").unwrap();
-  let inst1 = Name::try_from_str("Alpha._http._tcp.local.").unwrap();
-  let host1 = Name::try_from_str("alpha.local.").unwrap();
-  let mut recs1 = ServiceRecords::new(stype1, inst1.clone(), host1, 80, 120);
-  recs1.add_a(Ipv4Addr::new(10, 0, 0, 1));
-  let (handle1, _svc1) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs1),
-      now,
-    )
-    .unwrap();
-
-  // Register second service.
-  let stype2 = Name::try_from_str("_http._tcp.local.").unwrap();
-  let inst2 = Name::try_from_str("Beta._http._tcp.local.").unwrap();
-  let host2 = Name::try_from_str("beta.local.").unwrap();
-  let mut recs2 = ServiceRecords::new(stype2, inst2.clone(), host2, 80, 120);
-  recs2.add_a(Ipv4Addr::new(10, 0, 0, 2));
-  let (_handle2, _svc2) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs2),
-      now,
-    )
-    .unwrap();
-
-  // Attempt to rename handle1 to the name already used by handle2.
-  let result = e.handle_service_renamed(handle1, inst2.clone());
-  assert!(
-    result.is_err(),
-    "expected an error when renaming to an already-registered name"
+  let instance = Name::try_from_str("WebServer._ipp._tcp.local.").unwrap();
+  let target = Name::try_from_str("server.local.").unwrap();
+  let handle = register_probing_successor(
+    &mut e,
+    &instance,
+    &target,
+    80,
+    Ipv4Addr::new(10, 0, 0, 1),
+    now,
   );
-  assert!(
-    matches!(
-      result.unwrap_err(),
-      HandleServiceRenamedError::NameAlreadyRegistered(_)
-    ),
-    "expected NameAlreadyRegistered variant"
+  // The suffix a first rename would reach for is already taken by a sibling.
+  let taken = Name::try_from_str("WebServer-1._ipp._tcp.local.").unwrap();
+  // Same host name means the same address set — two live routes may share a
+  // host but may not disagree about what it publishes.
+  let sibling = register_probing_successor(
+    &mut e,
+    &taken,
+    &target,
+    81,
+    Ipv4Addr::new(10, 0, 0, 1),
+    now,
   );
 
-  // Verify handle1's name was NOT changed.
-  let found = e
-    .services
-    .iter()
-    .find(|(_, route)| route.handle() == handle1)
-    .map(|(_, route)| route.name().clone());
+  let probed_at = probe_once_confirmed(&mut e, handle, now);
+  let mut buf = std::vec![0u8; 512];
+  let n = build_instance_srv_response(&mut buf, &instance, 9999, &target);
   assert_eq!(
-    found.as_ref().map(Name::as_str),
-    Some(inst1.as_str()),
-    "handle1 name must remain unchanged after rejected rename"
+    deliver_to_service(&mut e, handle, &buf[..n], probed_at),
+    1,
+    "precondition: the defence reaches the service being renamed"
   );
+  e.handle_service_timeout(handle, probed_at).unwrap();
+
+  let renamed = e.service(handle).unwrap().name().clone();
+  assert_ne!(
+    renamed.as_str(),
+    taken.as_str(),
+    "the rename must not claim a name another live route holds"
+  );
+  assert_ne!(
+    renamed.as_str(),
+    instance.as_str(),
+    "…and it must still give up the contested one"
+  );
+  assert_eq!(
+    e.service(sibling).unwrap().name().as_str(),
+    taken.as_str(),
+    "the sibling keeps the name it registered"
+  );
+  // One name per route, still, and both routes name what their service does.
+  for (_, route) in e.services.iter() {
+    assert_eq!(
+      route.name().as_str(),
+      route.proto.name().as_str(),
+      "every route must name what its own service is probing for"
+    );
+  }
 }
 
 #[test]
@@ -266,16 +362,15 @@ fn service_route_has_host_field() {
   let recs = ServiceRecords::new(st, inst, host.clone(), 631, 120);
   let now = StdInstant::now();
   let _ = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
-  let route = e
+  let (_, route) = e
     .services
     .iter()
     .next()
-    .map(|(_, r)| r.clone())
     .expect("expected one registered route");
   assert_eq!(
     route.host().as_str(),
@@ -373,8 +468,8 @@ fn build_endpoint_with_printer() -> (TestEndp, ServiceHandle) {
   let mut recs = ServiceRecords::new(st, inst, host, 631, 120);
   recs.add_a(Ipv4Addr::new(192, 168, 7, 7));
   let now = StdInstant::now();
-  let (handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -386,7 +481,7 @@ fn build_endpoint_with_printer() -> (TestEndp, ServiceHandle) {
 /// the matching service as ServiceEvent::Question.
 #[test]
 fn host_question_routes_to_service() {
-  use crate::event::RouteEvent;
+
   use core::net::SocketAddr;
 
   let (mut e, expected_handle) = build_endpoint_with_printer();
@@ -397,19 +492,16 @@ fn host_question_routes_to_service() {
   let n = build_query_for_host(&mut buf, "printer-host.local.");
   let data = &buf[..n];
 
-  let mut events = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap();
+  let mut events = route_events(&mut e, StdInstant::now(),
+      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter();
   let ev = events
     .next()
     .expect("expected at least one routing event")
     .expect("expected Ok");
 
   match ev {
-    RouteEvent::ToService(ts) => {
+    TestRoute::ToService(ts) => {
       assert_eq!(
         ts.handle(),
         expected_handle,
@@ -421,7 +513,7 @@ fn host_question_routes_to_service() {
         ts.event()
       );
     }
-    other => panic!("expected RouteEvent::ToService(Question), got {:?}", other),
+    other => panic!("expected TestRoute::ToService(Question), got {:?}", other),
   }
 }
 
@@ -433,7 +525,7 @@ fn host_question_routes_to_service() {
 /// `ProbeConflict` is now responses only.
 #[test]
 fn authority_instance_name_routes_as_probe_proposal() {
-  use crate::event::RouteEvent;
+
   use core::net::SocketAddr;
 
   let (mut e, expected_handle) = build_endpoint_with_printer();
@@ -448,14 +540,11 @@ fn authority_instance_name_routes_as_probe_proposal() {
   // the QUESTION it must defend the name by answering, and the §8.2 PROPOSAL
   // its Authority Section makes. The question is routed first (Question Section
   // precedes Authority), so this scans rather than taking the head.
-  let proposal_handle = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let proposal_handle = route_events(&mut e, StdInstant::now(),
+      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .filter_map(|ev| match ev.expect("expected Ok") {
-      RouteEvent::ToService(ts) if ts.event().is_probe_proposal() => Some(ts.handle()),
+      TestRoute::ToService(ts) if ts.event().is_probe_proposal() => Some(ts.handle()),
       _ => None,
     })
     .next();
@@ -474,7 +563,7 @@ fn authority_instance_name_routes_as_probe_proposal() {
 /// an off-path / forged ephemeral-port packet must not force our rename.
 #[test]
 fn ephemeral_port_authority_record_does_not_trigger_conflict() {
-  use crate::event::RouteEvent;
+
   use core::net::SocketAddr;
 
   let (mut e, _handle) = build_endpoint_with_printer();
@@ -486,15 +575,12 @@ fn ephemeral_port_authority_record_does_not_trigger_conflict() {
   let n = build_probe_srv_authority(&mut buf, "Printer._ipp._tcp.local.");
   let data = &buf[..n];
 
-  let events = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap();
+  let events = route_events(&mut e, StdInstant::now(),
+      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter();
   for ev in events {
     let ev = ev.expect("expected Ok");
-    if let RouteEvent::ToService(ts) = ev {
+    if let TestRoute::ToService(ts) = ev {
       assert!(
         !ts.event().is_probe_conflict() && !ts.event().is_host_conflict(),
         "ephemeral-port authority record must not route as a conflict, got {:?}",
@@ -508,7 +594,7 @@ fn ephemeral_port_authority_record_does_not_trigger_conflict() {
 /// HostConflict — NOT as ProbeConflict. Service must NOT auto-rename.
 #[test]
 fn authority_host_name_routes_as_host_conflict() {
-  use crate::event::RouteEvent;
+
   use core::net::SocketAddr;
 
   let (mut e, expected_handle) = build_endpoint_with_printer();
@@ -519,19 +605,16 @@ fn authority_host_name_routes_as_host_conflict() {
   let n = build_probe_authority_for_host(&mut buf, "printer-host.local.");
   let data = &buf[..n];
 
-  let mut events = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap();
+  let mut events = route_events(&mut e, StdInstant::now(),
+      Received::new(src, data, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter();
   let ev = events
     .next()
     .expect("expected at least one routing event")
     .expect("expected Ok");
 
   match ev {
-    RouteEvent::ToService(ts) => {
+    TestRoute::ToService(ts) => {
       assert_eq!(ts.handle(), expected_handle);
       assert!(
         ts.event().is_host_conflict(),
@@ -540,7 +623,7 @@ fn authority_host_name_routes_as_host_conflict() {
       );
     }
     other => panic!(
-      "expected RouteEvent::ToService(HostConflict), got {:?}",
+      "expected TestRoute::ToService(HostConflict), got {:?}",
       other
     ),
   }
@@ -553,7 +636,6 @@ fn authority_host_name_routes_as_host_conflict() {
 #[test]
 fn txt_owned_by_host_name_does_not_route_host_conflict() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -572,14 +654,11 @@ fn txt_owned_by_host_name_does_not_route_host_conflict() {
     .unwrap();
   let n = b.finish().unwrap();
 
-  let events = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap();
+  let events = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter();
   for ev in events {
-    if let Ok(RouteEvent::ToService(ts)) = ev {
+    if let Ok(TestRoute::ToService(ts)) = ev {
       assert!(
         !ts.event().is_host_conflict() && !ts.event().is_probe_conflict(),
         "a TXT owned by the host name must not route a conflict, got {:?}",
@@ -653,7 +732,6 @@ fn additional_section_records_are_cached_and_delivered() {
 #[test]
 fn additional_section_srv_for_instance_routes_probe_conflict() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -678,15 +756,12 @@ fn additional_section_srv_for_instance_routes_probe_conflict() {
 
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let saw_conflict = e
-      .handle(
-        StdInstant::now(),
-        Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-      )
-      .unwrap()
+  let saw_conflict = route_events(&mut e, StdInstant::now(),
+        Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
       .filter_map(Result::ok)
       .any(|ev| {
-        matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_conflict())
+        matches!(ev, TestRoute::ToService(ts) if ts.handle() == expected && ts.event().is_probe_conflict())
       });
   assert!(
     saw_conflict,
@@ -702,7 +777,6 @@ fn additional_section_srv_for_instance_routes_probe_conflict() {
 fn additional_conflict_not_replayed_across_query_events() {
   use crate::{
     config::QuerySpec,
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder, ResourceType},
   };
   use core::net::SocketAddr;
@@ -735,13 +809,12 @@ fn additional_conflict_not_replayed_across_query_events() {
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let mut conflicts = 0usize;
   let mut to_query = 0usize;
-  for ev in e.handle(
-    now,
-    Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-  ).unwrap() {
+  for ev in route_events(&mut e, now,
+    Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter() {
     match ev.unwrap() {
-      RouteEvent::ToService(ts) if ts.event().is_probe_conflict() => conflicts += 1,
-      RouteEvent::ToQuery(_) => to_query += 1,
+      TestRoute::ToService(ts) if ts.event().is_probe_conflict() => conflicts += 1,
+      TestRoute::ToQuery(_) => to_query += 1,
       _ => {}
     }
   }
@@ -760,7 +833,7 @@ fn additional_conflict_not_replayed_across_query_events() {
 /// a ProbeConflict — exercised through the shared next_service_conflict gate.
 #[test]
 fn non_in_class_record_does_not_route_conflict() {
-  use crate::event::RouteEvent;
+
   use core::net::SocketAddr;
 
   let (mut e, _h) = build_endpoint_with_printer();
@@ -782,14 +855,11 @@ fn non_in_class_record_does_not_route_conflict() {
 
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  for ev in e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  for ev in route_events(&mut e, StdInstant::now(),
+      Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
   {
-    if let Ok(RouteEvent::ToService(ts)) = ev {
+    if let Ok(TestRoute::ToService(ts)) = ev {
       assert!(
         !ts.event().is_probe_conflict() && !ts.event().is_host_conflict(),
         "a non-IN-class record must not route a conflict, got {:?}",
@@ -822,8 +892,8 @@ fn query_answer_for_instance_name_emits_known_answer_only() {
   let mut recs = ServiceRecords::new(st, inst.clone(), host.clone(), 80, 120);
   recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
   let now = StdInstant::now();
-  let (_handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -842,15 +912,14 @@ fn query_answer_for_instance_name_emits_known_answer_only() {
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
   // No ProbeConflict events anywhere.
   for ev in &events {
-    if let RouteEvent::ToService(ts) = ev {
+    if let TestRoute::ToService(ts) = ev {
       assert!(
         !ts.event().is_probe_conflict(),
         "QR=0 answer-section MUST NOT emit ProbeConflict; got {events:?}"
@@ -860,7 +929,7 @@ fn query_answer_for_instance_name_emits_known_answer_only() {
   // But the KAS hint must reach the service.
   let kas_count = events
     .iter()
-    .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_known_answer()))
+    .filter(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_known_answer()))
     .count();
   assert!(
     kas_count >= 1,
@@ -887,8 +956,8 @@ fn qr0_answer_for_host_name_emits_host_conflict_not_probe_conflict() {
   let mut recs = ServiceRecords::new(st, inst.clone(), host.clone(), 80, 120);
   recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
   let now = StdInstant::now();
-  let (expected_handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let expected_handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -907,16 +976,15 @@ fn qr0_answer_for_host_name_emits_host_conflict_not_probe_conflict() {
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
   // QR=0 answer-section records MUST NOT emit HostConflict
   // or ProbeConflict.  Only KnownAnswer events fire (for KAS suppression).
   for ev in &events {
-    if let RouteEvent::ToService(ts) = ev {
+    if let TestRoute::ToService(ts) = ev {
       assert!(
         !ts.event().is_host_conflict() && !ts.event().is_probe_conflict(),
         "QR=0 answer-section MUST NOT emit conflict events; got {events:?}"
@@ -931,7 +999,7 @@ fn qr0_answer_for_host_name_emits_host_conflict_not_probe_conflict() {
   // The KAS hint must reach the service.
   let kas_count = events
     .iter()
-    .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_known_answer()))
+    .filter(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_known_answer()))
     .count();
   assert!(
     kas_count >= 1,
@@ -975,16 +1043,15 @@ fn qr0_answer_does_not_populate_query() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events = e.handle(
-    now,
-    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
-  ).unwrap();
+  let events = route_events(&mut e, now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter();
 
   // Drain all events. None should be a ToQuery(Answer).
   for ev in events {
     let ev = ev.unwrap();
     assert!(
-      !matches!(ev, RouteEvent::ToQuery(ref tq) if matches!(tq.event(), QueryEvent::Answer(_))),
+      !matches!(ev, TestRoute::ToQuery(ref tq) if matches!(tq.event(), QueryEvent::Answer(_))),
       "QR=0 answer records must NOT produce QueryEvent::Answer; got: {:?}",
       ev
     );
@@ -1264,7 +1331,7 @@ fn duplicate_suppresses_due_retry_independent_of_driver_order() {
 /// suppression.
 #[test]
 fn self_packet_does_not_route_as_probe_conflict() {
-  use crate::event::RouteEvent;
+
   use core::net::SocketAddr;
 
   let (mut e, _expected_handle) = build_endpoint_with_printer();
@@ -1280,10 +1347,9 @@ fn self_packet_does_not_route_as_probe_conflict() {
   // (1) Self-packet: the caller (driver) flags self-loopback via
   // `caller_is_self = true`; handle() must then yield zero routing events.
   let self_src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 5353));
-  let mut self_events = e.handle(
-    now,
-    Received::new(self_src, data, Provenance::OwnEcho).with_local_ip(local_ip),
-  ).unwrap();
+  let mut self_events = route_events(&mut e, now,
+    Received::new(self_src, data, Provenance::OwnEcho).with_local_ip(local_ip))
+    .into_iter();
   assert!(
     self_events.next().is_none(),
     "self-packet (caller_is_self = true) must yield zero routing events"
@@ -1294,14 +1360,11 @@ fn self_packet_does_not_route_as_probe_conflict() {
   // flag, not a broken routing path.
   let peer_src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 55), 5353));
   // The probe's own §8.1 question routes ahead of its §8.2 proposal, so scan.
-  let saw_proposal = e
-    .handle(
-      StdInstant::now(),
-      Received::new(peer_src, data, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let saw_proposal = route_events(&mut e, StdInstant::now(),
+      Received::new(peer_src, data, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .any(|ev| match ev.expect("control: routing event must be Ok") {
-      RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
+      TestRoute::ToService(ts) => ts.event().is_probe_proposal(),
       _ => false,
     });
   assert!(
@@ -1456,7 +1519,6 @@ fn cache_goodbye_matches_differently_encoded_and_cased_ptr() {
 #[test]
 fn ipv6_self_packet_detected_via_advertised_aaaa() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::{Ipv6Addr, SocketAddr};
@@ -1476,8 +1538,8 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   let our_v6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
   recs.add_aaaa(our_v6);
   let now = StdInstant::now();
-  let (_handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -1519,12 +1581,9 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
 
   // (1) Self-packet via membership: src matches our advertised AAAA.
   let self_src: SocketAddr = SocketAddr::from((our_v6, 5353));
-  let self_events: std::vec::Vec<_> = e
-    .handle(
-      now,
-      Received::new(self_src, data, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let self_events: std::vec::Vec<_> = route_events(&mut e, now,
+      Received::new(self_src, data, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(|ev| ev.expect("routing event must be Ok"))
     .collect();
   assert_eq!(
@@ -1532,7 +1591,7 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
       .iter()
       .filter(|ev| matches!(
         ev,
-        RouteEvent::ToService(ts) if ts.event().is_probe_proposal()
+        TestRoute::ToService(ts) if ts.event().is_probe_proposal()
       ))
       .count(),
     1,
@@ -1542,7 +1601,7 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   assert!(
     self_events.iter().any(|ev| matches!(
       ev,
-      RouteEvent::ToService(ts) if ts.event().is_question()
+      TestRoute::ToService(ts) if ts.event().is_question()
     )),
     "and so does the §8.1 defence: this datagram PROPOSES to take a unique name \
        we hold, and the guess matches every co-resident host publishing an \
@@ -1555,11 +1614,10 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   let peer_v6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0099);
   let peer_src: SocketAddr = SocketAddr::from((peer_v6, 5353));
   // The probe's §8.1 question routes ahead of its §8.2 proposal, so scan.
-  let saw_proposal = e
-    .handle(now, Received::new(peer_src, data, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let saw_proposal = route_events(&mut e, now, Received::new(peer_src, data, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .any(|ev| match ev.expect("control: routing event must be Ok") {
-      RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
+      TestRoute::ToService(ts) => ts.event().is_probe_proposal(),
       _ => false,
     });
   assert!(
@@ -1574,14 +1632,12 @@ fn ipv6_self_packet_detected_via_advertised_aaaa() {
   let mut qbuf = [0u8; 512];
   let qn = build_query_for_host(&mut qbuf, "Printer._ipp._tcp.local.");
   let mut routes_question = |src: SocketAddr| {
-    e.handle(
-      now,
-      Received::new(src, &qbuf[..qn], Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+    route_events(&mut e, now,
+      Received::new(src, &qbuf[..qn], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .any(|ev| matches!(
       ev.expect("routing event must be Ok"),
-      RouteEvent::ToService(ts) if ts.event().is_question()
+      TestRoute::ToService(ts) if ts.event().is_question()
     ))
   };
   assert!(
@@ -2051,7 +2107,7 @@ fn a_refused_answer_is_not_routed_to_its_query() {
   );
   recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
   let _ = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -2090,13 +2146,14 @@ fn a_refused_answer_is_not_routed_to_its_query() {
     let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
     let mut to_query = 0usize;
     let mut to_service = 0usize;
-    for ev in e.handle(
+    for ev in route_events(
+      e,
       at,
       Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
-    ).unwrap() {
+    ) {
       match ev {
-        Ok(ev) if ev.is_to_query() => to_query = to_query.saturating_add(1),
-        Ok(ev) if ev.is_to_service() => to_service = to_service.saturating_add(1),
+        Ok(TestRoute::ToQuery(_)) => to_query = to_query.saturating_add(1),
+        Ok(TestRoute::ToService(_)) => to_service = to_service.saturating_add(1),
         _ => {}
       }
     }
@@ -2216,12 +2273,11 @@ fn an_uncollected_answer_is_still_routed_to_its_query() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let to_query: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let to_query: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .filter_map(|ev| match ev {
-      RouteEvent::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_)) => Some(tq.handle()),
+      TestRoute::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_)) => Some(tq.handle()),
       _ => None,
     })
     .collect();
@@ -2351,12 +2407,11 @@ fn pre_poll_terminal_freeze_closes_race() {
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
 
-  let to_query_events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let to_query_events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .filter_map(|ev| match ev {
-      RouteEvent::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_)) => Some(tq.handle()),
+      TestRoute::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_)) => Some(tq.handle()),
       _ => None,
     })
     .collect();
@@ -2479,8 +2534,8 @@ fn qr0_ptr_known_answer_fans_out_to_all_same_type_services() {
     let host_str = std::format!("{}-host.local.", inst_label.to_ascii_lowercase());
     let host = Name::try_from_str(&host_str).unwrap();
     let recs = ServiceRecords::new(stype.clone(), inst, host, 631, 120);
-    let (h, _svc) = e
-      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    let h = e
+      .try_register_service(
         ServiceSpec::new(recs),
         now,
       )
@@ -2502,9 +2557,8 @@ fn qr0_ptr_known_answer_fans_out_to_all_same_type_services() {
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
@@ -2512,7 +2566,7 @@ fn qr0_ptr_known_answer_fans_out_to_all_same_type_services() {
   let kas_handles: std::vec::Vec<_> = events
     .iter()
     .filter_map(|ev| match ev {
-      RouteEvent::ToService(ts) if ts.event().is_known_answer() => Some(ts.handle()),
+      TestRoute::ToService(ts) if ts.event().is_known_answer() => Some(ts.handle()),
       _ => None,
     })
     .collect();
@@ -2564,8 +2618,8 @@ fn meta_ptr_known_answer_fans_out_to_all_services() {
       631,
       120,
     );
-    let (h, _svc) = e
-      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    let h = e
+      .try_register_service(
         ServiceSpec::new(recs),
         now,
       )
@@ -2585,16 +2639,15 @@ fn meta_ptr_known_answer_fans_out_to_all_services() {
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
   let kas_handles: std::vec::Vec<_> = events
     .iter()
     .filter_map(|ev| match ev {
-      RouteEvent::ToService(ts) if ts.event().is_known_answer() => Some(ts.handle()),
+      TestRoute::ToService(ts) if ts.event().is_known_answer() => Some(ts.handle()),
       _ => None,
     })
     .collect();
@@ -2635,8 +2688,8 @@ fn qr0_ttl_zero_does_not_emit_service_events() {
   let mut recs = ServiceRecords::new(st, inst.clone(), host.clone(), 631, 120);
   recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
   let now = StdInstant::now();
-  let (_h, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _h = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -2706,8 +2759,8 @@ fn authority_ttl_zero_does_not_emit_conflict_events() {
   let host = Name::try_from_str("printer-host.local.").unwrap();
   let recs = ServiceRecords::new(st, inst.clone(), host.clone(), 631, 120);
   let now = StdInstant::now();
-  let (_h, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _h = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -2825,8 +2878,8 @@ fn qr1_answer_for_instance_name_emits_probe_conflict() {
   let host = Name::try_from_str("alpha.local.").unwrap();
   let recs = ServiceRecords::new(st, inst.clone(), host.clone(), 80, 120);
   let now = StdInstant::now();
-  let (_handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -2847,15 +2900,14 @@ fn qr1_answer_for_instance_name_emits_probe_conflict() {
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
   let has_probe_conflict = events
     .iter()
-    .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_conflict()));
+    .any(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_probe_conflict()));
   assert!(
     has_probe_conflict,
     "QR=1 answer claiming our instance name must emit ProbeConflict; got {events:?}"
@@ -2881,8 +2933,8 @@ fn qr1_answer_for_host_name_emits_host_conflict() {
   // it — §9 compares the same name AND rrtype.
   recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
   let now = StdInstant::now();
-  let (_handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -2900,15 +2952,14 @@ fn qr1_answer_for_host_name_emits_host_conflict() {
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
   let has_host_conflict = events
     .iter()
-    .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_host_conflict()));
+    .any(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_host_conflict()));
   assert!(
     has_host_conflict,
     "QR=1 answer claiming our host name must emit HostConflict; got {events:?}"
@@ -3557,8 +3608,8 @@ fn answer_questions_false_suppresses_question_events() {
   let host = Name::try_from_str("web.local.").unwrap();
   let recs = ServiceRecords::new(st.clone(), inst.clone(), host, 80, 120);
   let now = StdInstant::now();
-  let (_h, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _h = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -3581,15 +3632,14 @@ fn answer_questions_false_suppresses_question_events() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
   let question_events: std::vec::Vec<_> = events
     .iter()
-    .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_question()))
+    .filter(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_question()))
     .collect();
   assert!(
     question_events.is_empty(),
@@ -3661,8 +3711,8 @@ fn answer_questions_false_still_defends_a_probed_unique_name() {
     80,
     120,
   );
-  let (_h, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _h = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -3673,10 +3723,10 @@ fn answer_questions_false_still_defends_a_probed_unique_name() {
   let mut questions_for = |qname: &str, with_authority: bool, src: SocketAddr| -> usize {
     let mut buf = [0u8; 512];
     let n = probe_for(qname, with_authority, &mut buf);
-    e.handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
-      .unwrap()
+    route_events(&mut e, now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
       .map(Result::unwrap)
-      .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_question()))
+      .filter(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_question()))
       .count()
   };
 
@@ -3822,8 +3872,8 @@ fn answer_questions_false_defends_only_against_a_real_proposal() {
     80,
     120,
   );
-  let (_h, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _h = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -3834,10 +3884,10 @@ fn answer_questions_false_defends_only_against_a_real_proposal() {
   let mut questions_for = |datagram: &[u8]| -> usize {
     // `filter_map` and not `unwrap`: the truncated-authority case below yields a
     // parse error of its own, which is not what this fixture is measuring.
-    e.handle(now, Received::new(peer, datagram, Provenance::Unknown).with_local_ip(local_ip))
-      .unwrap()
+    route_events(&mut e, now, Received::new(peer, datagram, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
       .filter_map(Result::ok)
-      .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_question()))
+      .filter(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_question()))
       .count()
   };
 
@@ -3928,8 +3978,8 @@ fn authority_host_conflict_fans_out_to_all_same_host_services() {
     // registration invariant lets them share a host name, and what makes each
     // of them an owner of the A RRset a peer's probe contends for.
     recs.add_a(Ipv4Addr::new(192, 168, 1, 5));
-    let (h, _svc) = e
-      .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    let h = e
+      .try_register_service(
         ServiceSpec::new(recs),
         now,
       )
@@ -3948,9 +3998,8 @@ fn authority_host_conflict_fans_out_to_all_same_host_services() {
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
@@ -3958,7 +4007,7 @@ fn authority_host_conflict_fans_out_to_all_same_host_services() {
   let conflict_handles: std::vec::Vec<_> = events
     .iter()
     .filter_map(|ev| match ev {
-      RouteEvent::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
+      TestRoute::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
       _ => None,
     })
     .collect();
@@ -4011,16 +4060,15 @@ fn qr1_ttl_zero_does_not_emit_to_query_events() {
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
   let to_query_count = events
     .iter()
     .filter(
-      |ev| matches!(ev, RouteEvent::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_))),
+      |ev| matches!(ev, TestRoute::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_))),
     )
     .count();
   assert_eq!(
@@ -4075,10 +4123,9 @@ fn terminated_query_rejects_late_answers() {
     b.push_a_answer(&qn, 120, pre_terminal_addr, false).unwrap();
     let n = b.finish().unwrap();
     let pkt = &buf[..n];
-    let _ = e.handle(
-      now,
-      Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
-    ).unwrap().count();
+    let _ = route_events(&mut e, now,
+      Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter().count();
   }
   assert_eq!(
     e.collected_answers(h).count(),
@@ -4110,9 +4157,8 @@ fn terminated_query_rejects_late_answers() {
   let n = b.finish().unwrap();
   let pkt = &buf2[..n];
 
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .map(Result::unwrap)
     .collect();
 
@@ -4120,7 +4166,7 @@ fn terminated_query_rejects_late_answers() {
   let to_query_events: std::vec::Vec<_> = events
     .iter()
     .filter_map(|ev| match ev {
-      RouteEvent::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_)) => Some(tq.handle()),
+      TestRoute::ToQuery(tq) if matches!(tq.event(), QueryEvent::Answer(_)) => Some(tq.handle()),
       _ => None,
     })
     .collect();
@@ -4447,7 +4493,6 @@ fn duplicate_questions_suppressed_only_on_real_suppression() {
 #[test]
 fn ipv6_link_local_self_check_is_interface_scoped() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::{Ipv6Addr, SocketAddr};
@@ -4469,8 +4514,8 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   // with src = fe80::1 must be treated as peer, not self.
   recs.add_aaaa_scoped(our_v6, 2);
   let now = StdInstant::now();
-  let (_handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -4506,27 +4551,24 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   let self_src: SocketAddr = SocketAddr::from((our_v6, 5353));
 
   // (1) Self-loopback: same address, same interface (ifindex=2).
-  let self_events: std::vec::Vec<_> = e
-    .handle(
-      now,
+  let self_events: std::vec::Vec<_> = route_events(&mut e, now,
       Received::new(self_src, data, Provenance::Unknown)
         .with_interface(Some(2))
-        .with_local_ip(local_ip),
-    )
-    .unwrap()
+        .with_local_ip(local_ip))
+    .into_iter()
     .map(|ev| ev.expect("event must be Ok"))
     .collect();
   assert!(
     self_events.iter().any(|ev| matches!(
       ev,
-      RouteEvent::ToService(ts) if ts.event().is_probe_proposal()
+      TestRoute::ToService(ts) if ts.event().is_probe_proposal()
     )),
     "its §8.2 proposal is still adjudicated"
   );
   assert!(
     self_events.iter().any(|ev| matches!(
       ev,
-      RouteEvent::ToService(ts) if ts.event().is_question()
+      TestRoute::ToService(ts) if ts.event().is_question()
     )),
     "…and so is its §8.1 defence: this datagram proposes to take a unique name \
        we hold, and the guess cannot tell a co-resident responder from our own \
@@ -4537,16 +4579,13 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   //     same numeric link-local.  This is the regression case — must
   //     route as ProbeConflict, not be silently dropped.
   // The probe's §8.1 question routes ahead of its §8.2 proposal, so scan.
-  let saw_proposal = e
-    .handle(
-      now,
+  let saw_proposal = route_events(&mut e, now,
       Received::new(self_src, data, Provenance::Unknown)
         .with_interface(Some(3))
-        .with_local_ip(local_ip),
-    )
-    .unwrap()
+        .with_local_ip(local_ip))
+    .into_iter()
     .any(|ev| match ev.expect("event must be Ok") {
-      RouteEvent::ToService(ts) => ts.event().is_probe_proposal(),
+      TestRoute::ToService(ts) => ts.event().is_probe_proposal(),
       _ => false,
     });
   assert!(
@@ -4561,16 +4600,14 @@ fn ipv6_link_local_self_check_is_interface_scoped() {
   let mut qbuf = [0u8; 512];
   let qn = build_query_for_host(&mut qbuf, "Printer._ipp._tcp.local.");
   let mut routes_question = |ifindex: u32| {
-    e.handle(
-      now,
+    route_events(&mut e, now,
       Received::new(self_src, &qbuf[..qn], Provenance::Unknown)
         .with_interface(Some(ifindex))
-        .with_local_ip(local_ip),
-    )
-    .unwrap()
+        .with_local_ip(local_ip))
+    .into_iter()
     .any(|ev| matches!(
       ev.expect("event must be Ok"),
-      RouteEvent::ToService(ts) if ts.event().is_question()
+      TestRoute::ToService(ts) if ts.event().is_question()
     ))
   };
   assert!(
@@ -4630,15 +4667,14 @@ fn response_answer_fans_out_to_type_compatible_queries() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events = e.handle(
-    now,
-    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
-  ).unwrap();
+  let events = route_events(&mut e, now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter();
 
   let mut answer_handles: std::vec::Vec<QueryHandle> = std::vec::Vec::new();
   for ev in events {
     let ev = ev.unwrap();
-    if let RouteEvent::ToQuery(tq) = ev
+    if let TestRoute::ToQuery(tq) = ev
       && let QueryEvent::Answer(_) = tq.event()
     {
       answer_handles.push(tq.handle());
@@ -4692,15 +4728,14 @@ fn response_answer_fans_out_to_any_and_specific_routes() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let events = e.handle(
-    now,
-    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip),
-  ).unwrap();
+  let events = route_events(&mut e, now,
+    Received::new(src, pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter();
 
   let mut answer_handles: std::vec::Vec<QueryHandle> = std::vec::Vec::new();
   for ev in events {
     let ev = ev.unwrap();
-    if let RouteEvent::ToQuery(tq) = ev
+    if let TestRoute::ToQuery(tq) = ev
       && let QueryEvent::Answer(_) = tq.event()
     {
       answer_handles.push(tq.handle());
@@ -4742,8 +4777,8 @@ fn begin_withdrawal_holds_the_name_and_keeps_services_active() {
   let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
   let host = Name::try_from_str("printer-host.local.").unwrap();
   let recs = ServiceRecords::new(st, inst.clone(), host, 631, 120);
-  let (handle, mut svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -4751,14 +4786,13 @@ fn begin_withdrawal_holds_the_name_and_keeps_services_active() {
 
   let before = ep.stats().services_active;
 
-  let snap = svc.withdrawal_snapshot();
-  ep.begin_withdrawal(handle, snap, now);
+  ep.unregister_service(handle, now);
 
   // services_active must NOT have changed.
   assert_eq!(
     ep.stats().services_active,
     before,
-    "begin_withdrawal must not decrement services_active"
+    "beginning a withdrawal must not decrement services_active"
   );
 
   // The route is still present — same-name re-registration is rejected.
@@ -4766,7 +4800,7 @@ fn begin_withdrawal_holds_the_name_and_keeps_services_active() {
   let inst2 = inst; // same name
   let host2 = Name::try_from_str("printer-host.local.").unwrap();
   let recs2 = ServiceRecords::new(st2, inst2, host2, 631, 120);
-  let result = ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let result = ep.try_register_service(
     ServiceSpec::new(recs2),
     now,
   );
@@ -4786,16 +4820,15 @@ fn begin_withdrawal_unknown_handle_is_noop() {
   let inst = Name::try_from_str("Ghost._ipp._tcp.local.").unwrap();
   let host = Name::try_from_str("ghost-host.local.").unwrap();
   let recs = ServiceRecords::new(st, inst, host, 631, 120);
-  let (_, mut svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _ = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
-  let snap = svc.withdrawal_snapshot();
   // Use a handle that was never registered.
   let bogus = ServiceHandle::from_raw(0xDEAD);
-  ep.begin_withdrawal(bogus, snap, now); // must not panic
+  ep.unregister_service(bogus, now); // must not panic
 }
 
 /// `poll_withdrawal_transmit` encodes the snapshot's TTL=0 goodbye and RETAINS
@@ -4824,8 +4857,8 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
   recs_a.add_a(unique);
   recs_a.add_subtype("_printer").unwrap();
   let sub = Name::try_from_str("_printer._sub._ipp._tcp.local.").unwrap();
-  let (a_handle, _svc_a) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let a_handle = ep
+    .try_register_service(
       ServiceSpec::new(recs_a.clone()),
       now,
     )
@@ -4844,8 +4877,8 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
   // each has ADVERTISED, which is exactly what retention keys on.
   recs_b.add_a(shared);
   recs_b.add_a(unique);
-  let (b_handle, _svc_b) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let b_handle = ep
+    .try_register_service(
       ServiceSpec::new(recs_b),
       now,
     )
@@ -4854,7 +4887,7 @@ fn poll_withdrawal_emits_ttl0_and_retains_sibling_host_addr() {
   // delivered), so the route's advertised set is non-empty — otherwise
   // retention would honour nothing and A would (wrongly) withdraw the shared
   // address.
-  ep.note_service_announced(FullyAnnounced::new(b_handle, true), &[shared], &[]);
+  ep.note_service_announced_for_test(b_handle, true, &[shared], &[]);
 
   // A's withdrawal snapshot: owns PTR/SRV/TXT, the subtype PTR, and both host
   // A addresses.
@@ -4948,14 +4981,14 @@ fn register_host_service(
   for a in configured_a {
     recs.add_a(*a);
   }
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       StdInstant::now(),
     )
     .unwrap();
   if let Some(adv) = advertised {
-    ep.note_service_announced(FullyAnnounced::new(h, true), adv, &[]);
+    ep.note_service_announced_for_test(h, true, adv, &[]);
   }
   h
 }
@@ -5199,8 +5232,8 @@ fn note_withdrawal_delivered_spends_failed_rearms() {
     631,
     120,
   );
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       now,
     )
@@ -5327,8 +5360,8 @@ fn withdrawal_not_freed_until_every_family_sent() {
     631,
     120,
   );
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       now,
     )
@@ -5387,7 +5420,7 @@ fn withdrawal_not_freed_until_every_family_sent() {
   );
   assert!(
     matches!(
-      ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ep.try_register_service(
         ServiceSpec::new(dup),
         now,
       ),
@@ -5425,7 +5458,7 @@ fn withdrawal_not_freed_until_every_family_sent() {
     120,
   );
   assert!(
-    ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ep.try_register_service(
       ServiceSpec::new(recs2),
       now,
     )
@@ -5458,8 +5491,8 @@ fn a_withdrawal_round_names_the_families_that_still_owe() {
     631,
     120,
   );
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       now,
     )
@@ -5589,8 +5622,8 @@ fn withdrawal_writeoff_family_completes() {
     631,
     120,
   );
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       now,
     )
@@ -5670,8 +5703,8 @@ fn withdrawal_retries_owed_family_at_backoff_when_other_is_paid() {
     631,
     120,
   );
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       now,
     )
@@ -5782,8 +5815,8 @@ fn writeoff_only_zeroes_its_own_family() {
     631,
     120,
   );
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       now,
     )
@@ -5847,8 +5880,8 @@ fn encode_failing_withdrawal_does_not_block_a_sibling() {
   // `write_goodbye` emits from the iterator using the host name — no need to
   // register the addresses on the route.
   let big_a: std::vec::Vec<Ipv4Addr> = (0..60u8).map(|i| Ipv4Addr::new(10, 0, 0, i)).collect();
-  let (a, _svc_a) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let a = ep
+    .try_register_service(
       ServiceSpec::new(recs_a.clone()),
       now,
     )
@@ -5880,8 +5913,8 @@ fn encode_failing_withdrawal_does_not_block_a_sibling() {
     632,
     120,
   );
-  let (b, _svc_b) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let b = ep
+    .try_register_service(
       ServiceSpec::new(recs_b.clone()),
       now,
     )
@@ -5973,8 +6006,8 @@ fn teardown_during_rename_goodbye_withdraws_old_and_new_name() {
   let mut recs_b = ServiceRecords::new(stype.clone(), new_name.clone(), host.clone(), 631, 120);
   recs_b.add_a(host_v4);
   recs_b.add_aaaa(host_v6);
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs_b.clone()),
       now,
     )
@@ -6188,7 +6221,7 @@ fn collision_old_name_holds_against_reregister_until_goodbye_completes() {
   let recs = ServiceRecords::new(stype.clone(), old_name.clone(), host.clone(), 631, 120);
   assert!(
     matches!(
-      ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ep.try_register_service(
         ServiceSpec::new(recs),
         now
       ),
@@ -6225,7 +6258,7 @@ fn collision_old_name_holds_against_reregister_until_goodbye_completes() {
   // Now the name is free: re-registration succeeds (retract-before-reuse done).
   let recs2 = ServiceRecords::new(stype, old_name, host, 631, 120);
   assert!(
-    ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ep.try_register_service(
       ServiceSpec::new(recs2),
       now
     )
@@ -6275,8 +6308,8 @@ fn surviving_rename_old_name_is_reclaimable_on_announce() {
   );
   // A fresh registration of the vacated name SUCCEEDS immediately (not blocked)...
   let recs = ServiceRecords::new(stype, old_name.clone(), host, 631, 120);
-  let (handle, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -6289,8 +6322,7 @@ fn surviving_rename_old_name_is_reclaimable_on_announce() {
   );
 
   // The reclaiming service CONFIRMS advertising its name → cancel-on-announce.
-  ep.note_service_announced(
-    FullyAnnounced::new(handle, true),
+  ep.note_service_announced_for_test(handle, true,
     &[Ipv4Addr::new(192, 168, 1, 10)],
     &[],
   );
@@ -6337,8 +6369,8 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
     false,
   );
   let recs = ServiceRecords::new(stype, old_name.clone(), host, 631, 120);
-  let (handle, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -6348,7 +6380,7 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
   // emitted yet) — and ALSO an address-less shape (empty address slices). The
   // goodbye MUST survive: if the reclaiming service drops/conflicts after probing
   // but before announcing, the old records still need retracting.
-  ep.note_service_announced(FullyAnnounced::new(handle, false), &[], &[]);
+  ep.note_service_announced_for_test(handle, false, &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_some(),
     "a probe (fully_announced=false) must NOT cancel the reclaimed goodbye"
@@ -6356,7 +6388,7 @@ fn probe_does_not_cancel_reclaimed_goodbye_only_a_confirmed_advertise_does() {
 
   // A CONFIRMED instance-advertise (fully_announced=true, still address-less)
   // cancels it.
-  ep.note_service_announced(FullyAnnounced::new(handle, true), &[], &[]);
+  ep.note_service_announced_for_test(handle, true, &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "a confirmed instance-advertise cancels the reclaimed goodbye (even address-less)"
@@ -6381,8 +6413,8 @@ fn rename_enqueues_a_detached_withdrawal_for_the_old_name() {
   // A live service that has just renamed Old → Old-1 (registered under the new
   // name). The rename produced a handoff for the OLD name's instance goodbye.
   let recs = ServiceRecords::new(stype.clone(), new_name.clone(), host.clone(), 631, 120);
-  let (_h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _h = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -6552,8 +6584,8 @@ fn rename_only_withdrawal_emits_old_name_goodbye() {
   // renamed away before re-announcing) — its snapshot has empty current
   // ownership and no host addresses.
   let cur_recs = ServiceRecords::new(stype.clone(), cur_name, host.clone(), 631, 120);
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(cur_recs.clone()),
       now,
     )
@@ -6709,8 +6741,8 @@ fn dual_name_each_fits_but_combined_would_not() {
   for _ in 0..4 {
     recs_b.add_txt_segment(big_seg());
   }
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs_b.clone()),
       now,
     )
@@ -6832,8 +6864,8 @@ fn independent_items_unencodable_current_does_not_starve_rename() {
   for _ in 0..4 {
     cur_recs.add_txt_segment(std::vec![b'x'; 240]);
   }
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(cur_recs.clone()),
       now,
     )
@@ -6958,8 +6990,8 @@ fn unregister_service_drops_route_attached_withdrawal_no_stale_goodbye() {
   let inst = Name::try_from_str("Svc._ipp._tcp.local.").unwrap();
 
   let recs = ServiceRecords::new(stype.clone(), inst.clone(), host, 631, 120);
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       now,
     )
@@ -6990,7 +7022,7 @@ fn unregister_service_drops_route_attached_withdrawal_no_stale_goodbye() {
 
   // Force-remove must drop the route-attached withdrawal item (no goodbye).
   assert!(
-    ep.unregister_service(h, None, now),
+    ep.force_remove_service(h, now),
     "the route was found and removed"
   );
   assert!(
@@ -6999,7 +7031,7 @@ fn unregister_service_drops_route_attached_withdrawal_no_stale_goodbye() {
   );
 
   // The SAME name is reusable, and no stale withdrawal exists to flush it.
-  ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  ep.try_register_service(
     ServiceSpec::new(ServiceRecords::new(
       stype,
       inst,
@@ -7033,8 +7065,8 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
   let cur_name = Name::try_from_str("Cur._ipp._tcp.local.").unwrap();
 
   let cur_recs = ServiceRecords::new(stype.clone(), cur_name, host.clone(), 631, 120);
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(cur_recs.clone()),
       now,
     )
@@ -7096,8 +7128,8 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
     700,
     120,
   );
-  let (dup_h, _dup_svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let dup_h = ep
+    .try_register_service(
       ServiceSpec::new(dup),
       now,
     )
@@ -7113,7 +7145,7 @@ fn reclaiming_a_detached_name_cancels_its_goodbye() {
 
   // The reclaiming service CONFIRMS advertising the name → cancel-on-announce
   // drops the goodbye, so no late TTL=0 goodbye can flush the new registration.
-  ep.note_service_announced(FullyAnnounced::new(dup_h, true), &[], &[]);
+  ep.note_service_announced_for_test(dup_h, true, &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&old_name).is_none(),
     "the detached old-name goodbye is cancelled when the reclaiming service announces"
@@ -7198,13 +7230,13 @@ fn a_reclaim_keeps_the_goodbye_a_dropped_subtype_still_needs() {
   // `_removed`, and fully announces on every obligated link.
   let mut new_records = ServiceRecords::new(stype, name.clone(), host, 631, 120);
   new_records.add_subtype("_kept").unwrap();
-  let (new_h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let new_h = ep
+    .try_register_service(
       ServiceSpec::new(new_records),
       t,
     )
     .expect("reclaiming a detached-reserved name succeeds");
-  ep.note_service_announced(FullyAnnounced::new(new_h, true), &[], &[]);
+  ep.note_service_announced_for_test(new_h, true, &[], &[]);
 
   assert_eq!(
     ep.detached_withdrawal_owed_for(&name),
@@ -7329,13 +7361,13 @@ fn a_reclaim_that_supersedes_every_shared_record_still_cancels_outright() {
   // re-asserted at its own owner name, and the unique ones are cache-flushed.
   let mut new_records = ServiceRecords::new(stype, name.clone(), host, 631, 120);
   new_records.add_subtype("_kept").unwrap();
-  let (new_h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let new_h = ep
+    .try_register_service(
       ServiceSpec::new(new_records),
       now,
     )
     .unwrap();
-  ep.note_service_announced(FullyAnnounced::new(new_h, true), &[], &[]);
+  ep.note_service_announced_for_test(new_h, true, &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&name).is_none(),
     "nothing survives the supersession, so the item is cancelled whole"
@@ -7362,8 +7394,8 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
     631,
     120,
   );
-  let (s, _svc_s) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let s = ep
+    .try_register_service(
       ServiceSpec::new(s_recs),
       now,
     )
@@ -7378,8 +7410,8 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
     632,
     120,
   );
-  let (h2, _svc2) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h2 = ep
+    .try_register_service(
       ServiceSpec::new(c2_recs.clone()),
       now,
     )
@@ -7432,8 +7464,10 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
 
   // S auto-renames onto `target`: the endpoint must NOT reject (the driver would
   // treat that as fatal —). The rename succeeds + applies.
-  ep.handle_service_renamed(s, target.clone())
-    .expect("an auto-rename onto a detached-reserved name succeeds (not rejected)");
+  assert!(
+    ep.rename_service_for_test(s, target.clone()),
+    "an auto-rename onto a detached-reserved name succeeds (not rejected)"
+  );
   // The rename only RESERVES `target`; it does NOT cancel the detached goodbye —
   // S still probes before advertising and may rename/conflict away again before
   // announcing, in which case the old records must still be retracted.
@@ -7443,7 +7477,7 @@ fn rename_onto_a_detached_name_cancels_it_not_kills_the_service() {
   );
   // When S CONFIRMS advertising its instance records under `target`,
   // cancel-on-announce drops the goodbye so no late TTL=0 send can flush S.
-  ep.note_service_announced(FullyAnnounced::new(s, true), &[], &[]);
+  ep.note_service_announced_for_test(s, true, &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&target).is_none(),
     "the detached goodbye is cancelled once S advertises the reclaimed name"
@@ -7473,8 +7507,8 @@ fn rename_onto_a_held_detached_name_is_rejected_reclaimable_is_not() {
     631,
     120,
   );
-  let (s, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let s = ep
+    .try_register_service(
       ServiceSpec::new(s_recs),
       now,
     )
@@ -7503,7 +7537,7 @@ fn rename_onto_a_held_detached_name_is_rejected_reclaimable_is_not() {
   // Renaming S onto the HELD name is REJECTED (retract-before-reuse, ); the
   // held goodbye is left intact.
   assert!(
-    ep.handle_service_renamed(s, held.clone()).is_err(),
+    !ep.rename_service_for_test(s, held.clone()),
     "a rename onto a HELD collision name must be rejected"
   );
   assert!(
@@ -7513,7 +7547,7 @@ fn rename_onto_a_held_detached_name_is_rejected_reclaimable_is_not() {
 
   // Renaming S onto the RECLAIMABLE name SUCCEEDS.
   assert!(
-    ep.handle_service_renamed(s, reclaimable.clone()).is_ok(),
+    ep.rename_service_for_test(s, reclaimable.clone()),
     "a rename onto a RECLAIMABLE detached name must succeed"
   );
   assert!(
@@ -7546,8 +7580,8 @@ fn owed_family_gets_a_final_attempt_at_ceiling() {
     631,
     120,
   );
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       t0,
     )
@@ -7641,7 +7675,7 @@ fn owed_family_gets_a_final_attempt_at_ceiling() {
     120,
   );
   assert!(
-    ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ep.try_register_service(
       ServiceSpec::new(recs2),
       ceiling,
     )
@@ -7665,8 +7699,8 @@ fn past_ceiling_owed_withdrawal_is_held_until_final_attempt() {
     631,
     120,
   );
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       t0,
     )
@@ -7728,14 +7762,14 @@ fn withdrawal_completes_frees_name_and_decrements_active() {
     631,
     120,
   );
-  let (h, mut svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
   let before = ep.stats().services_active;
-  ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+  ep.unregister_service(h, now);
 
   // Spend the whole per-family resend budget via dual-stack delivered
   // confirmations (both families Sent each round → owed reaches [0, 0]).
@@ -7770,7 +7804,7 @@ fn withdrawal_completes_frees_name_and_decrements_active() {
     120,
   );
   assert!(
-    ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ep.try_register_service(
       ServiceSpec::new(recs2),
       now,
     )
@@ -7792,13 +7826,13 @@ fn withdrawal_force_completes_at_ceiling() {
     631,
     120,
   );
-  let (h, mut svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
-  ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+  ep.unregister_service(h, now);
 
   // Never deliver; advance to the ceiling (now + WITHDRAWAL_CEILING).
   let at_ceiling = now.checked_add_duration(super::WITHDRAWAL_CEILING).unwrap();
@@ -7888,8 +7922,8 @@ fn retained_only_withdrawal_completes_and_does_not_block_a_sibling() {
     632,
     120,
   );
-  let (b, _svc_b) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let b = ep
+    .try_register_service(
       ServiceSpec::new(recs_b.clone()),
       now,
     )
@@ -7959,7 +7993,7 @@ fn retained_only_withdrawal_completes_and_does_not_block_a_sibling() {
     120,
   );
   assert!(
-    ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    ep.try_register_service(
       ServiceSpec::new(recs_a2),
       now,
     )
@@ -8039,26 +8073,23 @@ fn withdrawing_route_is_not_answered_but_still_blocks_reregister() {
     631,
     120,
   );
-  let (handle, mut svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
-  e.begin_withdrawal(handle, svc.withdrawal_snapshot(), now);
+  e.unregister_service(handle, now);
 
   // A question for the (withdrawing) host must NOT route to the service.
   let src: SocketAddr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 55), 5353));
   let local_ip = core::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
   let mut buf = [0u8; 512];
   let n = build_query_for_host(&mut buf, "printer-host.local.");
-  let routed_to_service = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
-    .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+  let routed_to_service = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
+    .any(|ev| matches!(ev, Ok(TestRoute::ToService(_))));
   assert!(
     !routed_to_service,
     "a withdrawing service must not be routed a question"
@@ -8074,7 +8105,7 @@ fn withdrawing_route_is_not_answered_but_still_blocks_reregister() {
   );
   assert!(
     matches!(
-      e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      e.try_register_service(
         ServiceSpec::new(recs2),
         now
       ),
@@ -8113,8 +8144,8 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
   // The host must OWN an A RRset for the peer's A at that name to reach it as a
   // §9 HostConflict at all.
   recs.add_a(Ipv4Addr::new(192, 168, 7, 7));
-  let (handle, mut svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -8168,73 +8199,55 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
 
   // POSITIVE CONTROL: while LIVE, both conflicts DO route a ToService — so the
   // negative assertions below actually exercise the withdrawing skip.
-  let live_host = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &host_pkt, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
-    .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+  let live_host = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &host_pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
+    .any(|ev| matches!(ev, Ok(TestRoute::ToService(_))));
   assert!(
     live_host,
     "sanity: a LIVE service must receive the HostConflict dispatch"
   );
-  let live_inst = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &inst_pkt, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
-    .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+  let live_inst = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &inst_pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
+    .any(|ev| matches!(ev, Ok(TestRoute::ToService(_))));
   assert!(
     live_inst,
     "sanity: a LIVE service must receive the ProbeConflict dispatch"
   );
-  let live_ka = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &ka_pkt, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
-    .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+  let live_ka = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &ka_pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
+    .any(|ev| matches!(ev, Ok(TestRoute::ToService(_))));
   assert!(
     live_ka,
     "sanity: a LIVE service must receive the meta-PTR KnownAnswer dispatch"
   );
 
   // Now retire the route via the endpoint-owned withdrawal.
-  e.begin_withdrawal(handle, svc.withdrawal_snapshot(), now);
+  e.unregister_service(handle, now);
 
   // While WITHDRAWING, neither conflict routes any ToService.
-  let wd_host = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &host_pkt, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
-    .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+  let wd_host = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &host_pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
+    .any(|ev| matches!(ev, Ok(TestRoute::ToService(_))));
   assert!(
     !wd_host,
     "a withdrawing service must not receive a HostConflict dispatch"
   );
-  let wd_inst = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &inst_pkt, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
-    .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+  let wd_inst = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &inst_pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
+    .any(|ev| matches!(ev, Ok(TestRoute::ToService(_))));
   assert!(
     !wd_inst,
     "a withdrawing service must not receive a ProbeConflict dispatch"
   );
-  let wd_ka = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &ka_pkt, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
-    .any(|ev| matches!(ev, Ok(crate::event::RouteEvent::ToService(_))));
+  let wd_ka = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &ka_pkt, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
+    .any(|ev| matches!(ev, Ok(TestRoute::ToService(_))));
   assert!(
     !wd_ka,
     "a withdrawing service must not receive a KnownAnswer dispatch"
@@ -8251,7 +8264,7 @@ fn withdrawing_route_receives_no_service_dispatch_but_still_blocks_reregister() 
   );
   assert!(
     matches!(
-      e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      e.try_register_service(
         ServiceSpec::new(recs2),
         now
       ),
@@ -8274,13 +8287,13 @@ fn poll_timeout_accounts_for_due_withdrawal() {
     631,
     120,
   );
-  let (h, mut svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
-  e.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+  e.unregister_service(h, now);
   assert_eq!(
     e.poll_timeout(),
     Some(now),
@@ -8302,15 +8315,15 @@ fn empty_withdrawal_completes_immediately() {
     631,
     120,
   );
-  let (h, mut svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
   let before = ep.stats().services_active;
   // Never announced → empty snapshot → owed == [0, 0].
-  ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+  ep.unregister_service(h, now);
   let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
   ep.drain_completed_withdrawals(now, &mut done);
   assert_eq!(
@@ -8340,8 +8353,8 @@ fn next_withdrawal_deadline_reflects_only_withdrawals() {
   let inst = Name::try_from_str("Svc._ipp._tcp.local.").unwrap();
   let host = Name::try_from_str("h.local.").unwrap();
   let recs = ServiceRecords::new(stype, inst, host, 631, 120);
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       now,
     )
@@ -8375,7 +8388,7 @@ fn next_withdrawal_deadline_reflects_only_withdrawals() {
   // Force-remove drops the route-attached item → the withdrawal deadline is gone
   // again, so a shutdown flush would exit (None) rather than wait on any cache
   // or query deadline.
-  assert!(ep.unregister_service(h, None, now));
+  assert!(ep.force_remove_service(h, now));
   assert_eq!(ep.next_withdrawal_deadline(), None);
   assert!(!ep.has_pending_withdrawals());
 }
@@ -8393,15 +8406,15 @@ fn begin_withdrawal_is_idempotent() {
     631,
     120,
   );
-  let (h, mut svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
-  ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+  ep.unregister_service(h, now);
   // Second retire of the same handle must be a no-op (no duplicate schedule).
-  ep.begin_withdrawal(h, svc.withdrawal_snapshot(), now);
+  ep.unregister_service(h, now);
   let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
   ep.drain_completed_withdrawals(now, &mut done);
   assert_eq!(
@@ -8424,7 +8437,6 @@ fn begin_withdrawal_is_idempotent() {
 #[test]
 fn qr0_known_answer_fans_out_to_a_later_matching_service() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -8437,8 +8449,8 @@ fn qr0_known_answer_fans_out_to_a_later_matching_service() {
   let inst0 = Name::try_from_str("Alpha._http._tcp.local.").unwrap();
   let host0 = Name::try_from_str("alpha.local.").unwrap();
   let recs0 = ServiceRecords::new(st0, inst0, host0, 80, 120);
-  let (_h0, _s0) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let _h0 = e
+    .try_register_service(
       ServiceSpec::new(recs0),
       now,
     )
@@ -8450,8 +8462,8 @@ fn qr0_known_answer_fans_out_to_a_later_matching_service() {
   let inst1 = Name::try_from_str("Beta._other._tcp.local.").unwrap();
   let host1 = Name::try_from_str("beta.local.").unwrap();
   let recs1 = ServiceRecords::new(st1, inst1.clone(), host1, 81, 120);
-  let (h1, _s1) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h1 = e
+    .try_register_service(
       ServiceSpec::new(recs1),
       now,
     )
@@ -8468,12 +8480,11 @@ fn qr0_known_answer_fans_out_to_a_later_matching_service() {
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let known_answers: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
+  let known_answers: std::vec::Vec<_> = route_events(&mut e, now, Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .filter_map(Result::ok)
     .filter_map(|ev| match ev {
-      RouteEvent::ToService(ts) if ts.event().is_known_answer() => Some(ts.handle()),
+      TestRoute::ToService(ts) if ts.event().is_known_answer() => Some(ts.handle()),
       _ => None,
     })
     .collect();
@@ -8495,7 +8506,7 @@ fn qr0_known_answer_fans_out_to_a_later_matching_service() {
 /// The header overstates ARCOUNT, so the iterator walks into truncated bytes.
 #[test]
 fn additional_section_malformed_record_surfaces_parse_error() {
-  use crate::{config::QuerySpec, event::RouteEvent, wire::ResourceType};
+  use crate::{config::QuerySpec, wire::ResourceType};
   use core::net::SocketAddr;
 
   let mut e = build_endpoint();
@@ -8523,12 +8534,11 @@ fn additional_section_malformed_record_surfaces_parse_error() {
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let mut saw_to_query = false;
   let mut saw_parse_err = false;
-  for ev in e.handle(
-    now,
-    Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip),
-  ).unwrap() {
+  for ev in route_events(&mut e, now,
+    Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter() {
     match ev {
-      Ok(RouteEvent::ToQuery(_)) => saw_to_query = true,
+      Ok(TestRoute::ToQuery(_)) => saw_to_query = true,
       Err(HandleError::Parse(_)) => saw_parse_err = true,
       _ => {}
     }
@@ -8550,7 +8560,7 @@ fn additional_section_malformed_record_surfaces_parse_error() {
 /// the resume-from-cursor advance across two records.
 #[test]
 fn additional_section_ttl0_withdrawal_skipped_then_later_record_delivered() {
-  use crate::{config::QuerySpec, event::RouteEvent, wire::ResourceType};
+  use crate::{config::QuerySpec, wire::ResourceType};
   use core::net::SocketAddr;
 
   let mut e = build_endpoint();
@@ -8582,10 +8592,9 @@ fn additional_section_ttl0_withdrawal_skipped_then_later_record_delivered() {
 
   let src: SocketAddr = "192.168.1.77:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let to_query = e
-    .handle(now, Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip))
-    .unwrap()
-    .filter(|r| matches!(r, Ok(RouteEvent::ToQuery(_))))
+  let to_query = route_events(&mut e, now, Received::new(src, &msg, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
+    .filter(|r| matches!(r, Ok(TestRoute::ToQuery(_))))
     .count();
   // Exactly one ToQuery: the TTL=0 record 0 is skipped (no ghost answer), the
   // positive-TTL record 1 is delivered.
@@ -8725,39 +8734,33 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
     false,
   );
 
-  // A fresh service reclaims the vacated name. The reclaim-cancel gate names its
-  // own service through the `FullyAnnounced` token, so no handle is needed here.
+  // A fresh service reclaims the vacated name.
   let mut recs = ServiceRecords::new(stype, name.clone(), host, 631, 120);
   recs.add_a(Ipv4Addr::new(192, 168, 1, 10));
-  let (_handle, mut svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
 
-  // Drive its §8.1 probes, every one fully delivered, and ferry the gate after
-  // each confirm exactly as a driver does.
+  // Drive its §8.1 probes, every one fully delivered. The gate is no longer
+  // ferried by anyone: the confirm itself carries it.
   let mut buf = std::vec![0u8; 4096];
   for _ in 0..20 {
-    if matches!(svc.state(), crate::ServiceState::Announcing(0)) {
+    if matches!(svc_state(&ep, h), crate::ServiceState::Announcing(0)) {
       break;
     }
-    now = svc.poll_timeout().unwrap_or(now).max(now);
-    svc.handle_timeout(now).unwrap();
-    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_delivery(now, TransmitDelivery::ALL);
-      ep.note_service_announced(
-        svc.has_fully_announced(),
-        svc.advertised_a_addrs(),
-        svc.advertised_aaaa_addrs(),
-      );
+    now = ep.poll_service_timeout(h).unwrap_or(now).max(now);
+    ep.handle_service_timeout(h, now).unwrap();
+    while let Ok(Some(_)) = ep.poll_service_transmit(h, now, &mut buf) {
+      ep.note_service_delivery(h, now, TransmitDelivery::ALL);
     }
   }
   assert!(
-    matches!(svc.state(), crate::ServiceState::Announcing(0)),
+    matches!(svc_state(&ep, h), crate::ServiceState::Announcing(0)),
     "expected the reclaiming service to finish probing; got {:?}",
-    svc.state()
+    svc_state(&ep, h)
   );
   assert!(
     ep.detached_withdrawal_owed_for(&name).is_some(),
@@ -8765,18 +8768,13 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
   );
 
   // The first announcement reaches IPv4 only.
-  now = svc.poll_timeout().unwrap_or(now).max(now);
-  svc.handle_timeout(now).unwrap();
-  assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_delivery(now, TransmitDelivery::V4_ONLY);
+  now = ep.poll_service_timeout(h).unwrap_or(now).max(now);
+  ep.handle_service_timeout(h, now).unwrap();
+  assert!(ep.poll_service_transmit(h, now, &mut buf).unwrap().is_some());
+  ep.note_service_delivery(h, now, TransmitDelivery::V4_ONLY);
   assert!(
-    svc.advertises_instance(),
+    ep.service(h).unwrap().advertises_instance(),
     "the v4 zone heard it, so ownership latched"
-  );
-  ep.note_service_announced(
-    svc.has_fully_announced(),
-    svc.advertised_a_addrs(),
-    svc.advertised_aaaa_addrs(),
   );
   assert!(
     ep.detached_withdrawal_owed_for(&name).is_some(),
@@ -8785,15 +8783,10 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
   );
 
   // IPv6 recovers and the next announcement reaches every obligated link.
-  now = svc.poll_timeout().unwrap_or(now).max(now);
-  svc.handle_timeout(now).unwrap();
-  assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
-  svc.note_delivery(now, TransmitDelivery::ALL);
-  ep.note_service_announced(
-    svc.has_fully_announced(),
-    svc.advertised_a_addrs(),
-    svc.advertised_aaaa_addrs(),
-  );
+  now = ep.poll_service_timeout(h).unwrap_or(now).max(now);
+  ep.handle_service_timeout(h, now).unwrap();
+  assert!(ep.poll_service_transmit(h, now, &mut buf).unwrap().is_some());
+  ep.note_service_delivery(h, now, TransmitDelivery::ALL);
   assert!(
     ep.detached_withdrawal_owed_for(&name).is_none(),
     "once every obligated link has heard the replacement, §10.2's cache-flush \
@@ -8801,74 +8794,16 @@ fn a_partially_announced_reclaim_does_not_cancel_the_old_name_goodbye() {
   );
 }
 
-/// The reclaim-cancel gate is reachable ONLY through a `FullyAnnounced`. This pins
-/// what a compile-time check cannot state from inside the crate: the fact round-
-/// trips whether it is ferried from `Service::has_fully_announced` or minted
-/// directly — `false` cancels nothing, `true` cancels, regardless of provenance.
-#[test]
-fn the_reclaim_cancel_gate_travels_as_an_unforgeable_fact() {
-  let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
-  let name = Name::try_from_str("Ghost._ipp._tcp.local.").unwrap();
-  let host = Name::try_from_str("ghost.local.").unwrap();
-
-  // A service that has announced nothing mints a `false` fact, which cancels
-  // nothing however it is delivered to the endpoint.
-  let mut ep = build_endpoint();
-  let now = StdInstant::now();
-  ep.enqueue_rename_withdrawal(
-    crate::service::RenameGoodbyeHandoff::announced(
-      ServiceRecords::new(stype.clone(), name.clone(), host.clone(), 631, 120),
-      on_both(
-        crate::service::EmittedRecords::new(
-          true,
-          true,
-          true,
-          std::vec::Vec::new(),
-          std::vec::Vec::new(),
-          false,
-          false,
-        ),
-        std::vec::Vec::new(),
-        std::vec::Vec::new(),
-      ),
-    ),
-    now,
-    false,
-  );
-  let recs = ServiceRecords::new(stype, name.clone(), host, 631, 120);
-  let (handle, svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      now,
-    )
-    .unwrap();
-  let fact = svc.has_fully_announced();
-  assert!(
-    !fact.get(),
-    "a freshly registered service has announced nothing"
-  );
-  ep.note_service_announced(fact, &[], &[]);
-  assert!(
-    ep.detached_withdrawal_owed_for(&name).is_some(),
-    "a `false` fact cancels nothing"
-  );
-
-  // A directly-minted `true` fact is the same code path as one ferried from a
-  // `Service` that has actually fully announced — it cancels.
-  ep.note_service_announced(FullyAnnounced::new(handle, true), &[], &[]);
-  assert!(
-    ep.detached_withdrawal_owed_for(&name).is_none(),
-    "a `true` fact cancels the reclaimable goodbye"
-  );
-}
-
-/// The reclaim-cancel gate routes on the handle INSIDE the `FullyAnnounced`, so
-/// one service's proof can only ever retire its OWN name's reclaimable goodbye.
+/// The reclaim-cancel gate reads the ALL-delivered fact off the service ITSELF,
+/// so it cannot be transplanted onto another service's name.
 ///
-/// An unforgeable fact is still transplantable while its subject is a separate
-/// argument: a genuine `true` from a service that fully announced, paired with a
-/// different service's handle, would cancel that other name's goodbye while an
-/// obligated family still needed it.
+/// It used to be a token a driver carried from one call to another, and a token
+/// in flight is a token that can be paired with the wrong handle: a genuine
+/// `true` from a service that had fully announced, offered alongside a DIFFERENT
+/// service's handle, cancelled that other name's goodbye while an obligated
+/// family still needed it. The endpoint owns both the service and the route now,
+/// so it reads the fact and the name from the same place and there is nothing to
+/// pair.
 #[test]
 fn a_fully_announced_proof_cancels_only_its_own_services_goodbye() {
   let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
@@ -8904,8 +8839,8 @@ fn a_fully_announced_proof_cancels_only_its_own_services_goodbye() {
   }
 
   // Both names are reclaimed by fresh services.
-  let (handle_a, _svc_a) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle_a = ep
+    .try_register_service(
       ServiceSpec::new(ServiceRecords::new(
         stype.clone(),
         name_a.clone(),
@@ -8916,16 +8851,26 @@ fn a_fully_announced_proof_cancels_only_its_own_services_goodbye() {
       now,
     )
     .unwrap();
-  let (_handle_b, _svc_b) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle_b = ep
+    .try_register_service(
       ServiceSpec::new(ServiceRecords::new(stype, name_b.clone(), host, 631, 120)),
       now,
     )
     .unwrap();
 
-  // Only A has fully announced. Its proof names A, and the endpoint has no other
-  // way to learn which service the fact is about.
-  ep.note_service_announced(FullyAnnounced::new(handle_a, true), &[], &[]);
+  // Neither has announced anything yet, so neither goodbye may be cancelled.
+  assert!(!ep.service(handle_a).unwrap().has_fully_announced().get());
+  assert!(!ep.service(handle_b).unwrap().has_fully_announced().get());
+  ep.note_service_announced_for_test(handle_a, false, &[], &[]);
+  ep.note_service_announced_for_test(handle_b, false, &[], &[]);
+  assert!(
+    ep.detached_withdrawal_owed_for(&name_a).is_some()
+      && ep.detached_withdrawal_owed_for(&name_b).is_some(),
+    "an incomplete announcement cancels nothing"
+  );
+
+  // Only A has fully announced, and the endpoint reads that off A.
+  ep.note_service_announced_for_test(handle_a, true, &[], &[]);
   assert!(
     ep.detached_withdrawal_owed_for(&name_a).is_none(),
     "A's own reclaimable goodbye is superseded by A's complete announcement"
@@ -8960,7 +8905,7 @@ fn spec_with_ttl(instance: &str, ttl_secs: u32) -> ServiceSpec {
 fn registration_rejects_a_ttl_below_the_advertisable_minimum() {
   for ttl in [0u32, 1] {
     let mut e = build_endpoint();
-    let err = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+    let err = match e.try_register_service(
       spec_with_ttl("P._ipp._tcp.local.", ttl),
       StdInstant::now(),
     ) {
@@ -8988,8 +8933,8 @@ fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
 
   let mut e = build_endpoint();
   let base = StdInstant::now();
-  let (_handle, mut svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = e
+    .try_register_service(
       spec_with_ttl("P._ipp._tcp.local.", crate::constants::MIN_SERVICE_TTL_SECS),
       base,
     )
@@ -8998,17 +8943,17 @@ fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
   let mut buf = std::vec![0u8; 4096];
   let mut now = base;
   for _ in 0..40 {
-    now = svc.poll_timeout().filter(|d| *d > now).unwrap_or(now);
-    svc.handle_timeout(now).unwrap();
-    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_delivery(now, TransmitDelivery::ALL);
+    now = e.poll_service_timeout(h).filter(|d| *d > now).unwrap_or(now);
+    e.handle_service_timeout(h, now).unwrap();
+    while let Ok(Some(_)) = e.poll_service_transmit(h, now, &mut buf) {
+      e.note_service_delivery(h, now, TransmitDelivery::ALL);
     }
-    if svc.state() == crate::ServiceState::Established {
+    if svc_state(&e, h) == crate::ServiceState::Established {
       break;
     }
   }
   assert_eq!(
-    svc.state(),
+    svc_state(&e, h),
     crate::ServiceState::Established,
     "a minimum-TTL service must still complete the §8.1/§8.3 sequence"
   );
@@ -9017,8 +8962,8 @@ fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
   // deadline the announce phase left and the one the refresh confirm installs
   // must clear the one-second floor.
   for round in 0..2 {
-    let due = svc
-      .poll_timeout()
+    let due = e
+      .poll_service_timeout(h)
       .expect("an Established service re-announces periodically");
     assert!(
       due >= now + Duration::from_secs(1),
@@ -9026,11 +8971,11 @@ fn the_minimum_ttl_registers_and_refreshes_no_faster_than_the_announce_floor() {
        floor, so the service repumps"
     );
     now = due;
-    svc.handle_timeout(now).unwrap();
+    e.handle_service_timeout(h, now).unwrap();
     let mut sent = 0usize;
-    while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
+    while let Ok(Some(_)) = e.poll_service_transmit(h, now, &mut buf) {
       sent += 1;
-      svc.note_delivery(now, TransmitDelivery::ALL);
+      e.note_service_delivery(h, now, TransmitDelivery::ALL);
     }
     assert_eq!(
       sent, 1,
@@ -9056,7 +9001,7 @@ fn spec_with_names(service_type: &str, instance: &str) -> ServiceSpec {
 #[test]
 fn registration_rejects_a_service_type_that_is_not_the_instance_parent() {
   let mut e = build_endpoint();
-  let err = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let err = match e.try_register_service(
     spec_with_names("_http._tcp.local.", "MyPrinter._ipp._tcp.local."),
     StdInstant::now(),
   ) {
@@ -9085,7 +9030,7 @@ fn registration_rejects_a_service_type_that_is_not_the_instance_parent() {
 #[test]
 fn registration_rejects_an_instance_with_more_than_one_extra_label() {
   let mut e = build_endpoint();
-  let err = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let err = match e.try_register_service(
     spec_with_names("_ipp._tcp.local.", "a.b._ipp._tcp.local."),
     StdInstant::now(),
   ) {
@@ -9105,7 +9050,7 @@ fn registration_rejects_an_instance_with_more_than_one_extra_label() {
 #[test]
 fn registration_accepts_a_case_differing_service_type() {
   let mut e = build_endpoint();
-  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  e.try_register_service(
     spec_with_names("_IPP._TCP.LOCAL.", "MyPrinter._ipp._tcp.local."),
     StdInstant::now(),
   )
@@ -9120,7 +9065,7 @@ fn registration_accepts_a_case_differing_service_type() {
 fn registration_accepts_a_trailing_dot_differing_service_type() {
   let mut e = build_endpoint();
   // service_type has no trailing dot; instance's parent portion does.
-  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  e.try_register_service(
     spec_with_names("_ipp._tcp.local", "MyPrinter._ipp._tcp.local."),
     StdInstant::now(),
   )
@@ -9128,7 +9073,7 @@ fn registration_accepts_a_trailing_dot_differing_service_type() {
 
   let mut e2 = build_endpoint();
   // The reverse: service_type has a trailing dot, the instance's does not.
-  e2.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  e2.try_register_service(
     spec_with_names("_ipp._tcp.local.", "MyPrinter._ipp._tcp.local"),
     StdInstant::now(),
   )
@@ -9144,7 +9089,7 @@ fn registration_accepts_a_trailing_dot_differing_service_type() {
 #[test]
 fn registration_rejects_a_root_service_type() {
   let mut e = build_endpoint();
-  let err = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let err = match e.try_register_service(
     spec_with_names("", "printer"),
     StdInstant::now(),
   ) {
@@ -9175,8 +9120,8 @@ fn withdrawing_route(ep: &mut TestEndp, now: StdInstant) -> (ServiceHandle, supe
     631,
     120,
   );
-  let (h, _svc) = ep
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let h = ep
+    .try_register_service(
       ServiceSpec::new(recs.clone()),
       now,
     )
@@ -9355,7 +9300,6 @@ fn a_zero_debt_family_report_is_masked() {
 #[test]
 fn a_probe_proposing_only_an_aaaa_still_delivers_a_proposal() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -9379,15 +9323,12 @@ fn a_probe_proposing_only_an_aaaa_still_delivers_a_proposal() {
 
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let saw = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let saw = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .filter_map(Result::ok)
     .any(|ev| {
-      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_proposal())
+      matches!(ev, TestRoute::ToService(ts) if ts.handle() == expected && ts.event().is_probe_proposal())
     });
   assert!(
     saw,
@@ -9409,7 +9350,6 @@ fn a_probe_proposing_only_an_aaaa_still_delivers_a_proposal() {
 #[test]
 fn a_response_of_any_type_at_our_instance_name_routes_a_conflict() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -9428,15 +9368,12 @@ fn a_response_of_any_type_at_our_instance_name_routes_a_conflict() {
 
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let saw = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let saw = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .filter_map(Result::ok)
     .any(|ev| {
-      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_conflict())
+      matches!(ev, TestRoute::ToService(ts) if ts.handle() == expected && ts.event().is_probe_conflict())
     });
   assert!(
     saw,
@@ -9455,7 +9392,6 @@ fn a_response_of_any_type_at_our_instance_name_routes_a_conflict() {
 #[test]
 fn a_host_address_response_still_routes_a_host_conflict() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -9474,15 +9410,12 @@ fn a_host_address_response_still_routes_a_host_conflict() {
 
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let saw = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let saw = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .filter_map(Result::ok)
     .any(|ev| {
-      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_host_conflict())
+      matches!(ev, TestRoute::ToService(ts) if ts.handle() == expected && ts.event().is_host_conflict())
     });
   assert!(
     saw,
@@ -9500,7 +9433,6 @@ fn a_host_address_response_still_routes_a_host_conflict() {
 #[test]
 fn an_authority_section_with_no_question_routes_no_proposal() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -9517,14 +9449,11 @@ fn an_authority_section_with_no_question_routes_no_proposal() {
 
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let saw = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let saw = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .filter_map(Result::ok)
-    .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
+    .any(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_probe_proposal()));
   assert!(
     !saw,
     "a QR=0 packet that asks no question proposes nothing, however its \
@@ -9537,7 +9466,6 @@ fn an_authority_section_with_no_question_routes_no_proposal() {
 #[test]
 fn a_question_for_another_name_routes_no_proposal_for_ours() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -9562,14 +9490,11 @@ fn a_question_for_another_name_routes_no_proposal_for_ours() {
 
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let saw = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let saw = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .filter_map(Result::ok)
-    .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
+    .any(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_probe_proposal()));
   assert!(
     !saw,
     "the query asks about Scanner, so its authority records are not a proposal \
@@ -9598,7 +9523,6 @@ fn a_question_for_another_name_routes_no_proposal_for_ours() {
 #[test]
 fn a_probe_proposing_a_ttl_zero_record_still_delivers_a_proposal() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -9622,15 +9546,12 @@ fn a_probe_proposing_a_ttl_zero_record_still_delivers_a_proposal() {
 
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-  let saw = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let saw = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .filter_map(Result::ok)
     .any(|ev| {
-      matches!(ev, RouteEvent::ToService(ts) if ts.handle() == expected && ts.event().is_probe_proposal())
+      matches!(ev, TestRoute::ToService(ts) if ts.handle() == expected && ts.event().is_probe_proposal())
     });
   assert!(
     saw,
@@ -9673,7 +9594,6 @@ fn a_probe_proposing_a_ttl_zero_record_still_delivers_a_proposal() {
 #[test]
 fn routing_over_approximates_what_the_fold_adjudicates() {
   use crate::{
-    event::RouteEvent,
     records::ServiceRecords,
     wire::{Header, MessageBuilder, ResourceClass, ResourceType},
   };
@@ -9889,14 +9809,11 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
     let (mut e, _h) = build_endpoint_with_printer();
     let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
     let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
-    let routed = e
-      .handle(
-        StdInstant::now(),
-        Received::new(src, &datagram, Provenance::Unknown).with_local_ip(local_ip),
-      )
-      .unwrap()
+    let routed = route_events(&mut e, StdInstant::now(),
+        Received::new(src, &datagram, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
       .filter_map(Result::ok)
-      .any(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()));
+      .any(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_probe_proposal()));
 
     // LAYER 2 — the fold, called for real rather than re-derived. Its terminal
     // value is the whole question: `PeerWins` and `WeHold` are §8.2.1's two
@@ -9942,7 +9859,7 @@ fn routing_over_approximates_what_the_fold_adjudicates() {
 /// probe, so a fixture whose registrations silently failed cannot pass.
 #[test]
 fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
-  use crate::event::RouteEvent;
+
   use core::net::SocketAddr;
 
   /// An endpoint with `n` distinct services registered, and the instance name of
@@ -9959,7 +9876,7 @@ fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
       }
       #[allow(clippy::cast_possible_truncation)]
       let recs = ServiceRecords::new(st, inst, host, 631 + i as u16, 120);
-      e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      e.try_register_service(
         ServiceSpec::new(recs),
         StdInstant::now(),
       )
@@ -9989,15 +9906,12 @@ fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
     let (mut e, _first) = endpoint_with(n);
     let mut proposals = 0usize;
     let mut events = 0usize;
-    for ev in e
-      .handle(
-        StdInstant::now(),
-        Received::new(src, &datagram, Provenance::Unknown).with_local_ip(local_ip),
-      )
-      .unwrap()
+    for ev in route_events(&mut e, StdInstant::now(),
+        Received::new(src, &datagram, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     {
       events = events.saturating_add(1);
-      if matches!(&ev, Ok(RouteEvent::ToService(ts)) if ts.event().is_probe_proposal()) {
+      if matches!(&ev, Ok(TestRoute::ToService(ts)) if ts.event().is_probe_proposal()) {
         proposals = proposals.saturating_add(1);
       }
     }
@@ -10035,14 +9949,11 @@ fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
   b.push_srv_authority(&first, 120, 0, 0, 9999, &target).unwrap();
   let n = b.finish().unwrap();
   let probe = buf[..n].to_vec();
-  let delivered = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &probe, Provenance::Unknown).with_local_ip(local_ip),
-    )
-    .unwrap()
+  let delivered = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &probe, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
     .filter_map(Result::ok)
-    .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()))
+    .filter(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_probe_proposal()))
     .count();
   assert_eq!(
     delivered, 1,
@@ -10076,14 +9987,14 @@ fn a_questionless_truncated_authority_packet_is_routed_to_no_service() {
 /// an accident.
 #[test]
 fn an_undecodable_question_section_routes_no_proposal_though_its_record_is_good() {
-  use crate::event::RouteEvent;
+
   use core::net::SocketAddr;
 
   let mut e = build_endpoint();
   let st = Name::try_from_str("_ipp._tcp.local.").unwrap();
   let inst = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
   let host = Name::try_from_str("printer-host.local.").unwrap();
-  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  e.try_register_service(
     ServiceSpec::new(ServiceRecords::new(st, inst.clone(), host, 631, 120)),
     StdInstant::now(),
   )
@@ -10142,13 +10053,11 @@ fn an_undecodable_question_section_routes_no_proposal_though_its_record_is_good(
   let src: SocketAddr = "192.168.1.55:5353".parse().unwrap();
   let local_ip: core::net::IpAddr = "192.168.1.1".parse().unwrap();
   let proposals = |e: &mut TestEndp, bytes: &[u8]| -> usize {
-    e.handle(
-      StdInstant::now(),
-      Received::new(src, bytes, Provenance::Unknown).with_local_ip(local_ip),
-    )
-      .unwrap()
+    route_events(e, StdInstant::now(),
+      Received::new(src, bytes, Provenance::Unknown).with_local_ip(local_ip))
+    .into_iter()
       .filter_map(Result::ok)
-      .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_probe_proposal()))
+      .filter(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_probe_proposal()))
       .count()
   };
 
@@ -10305,22 +10214,19 @@ fn probe_against_our_instance(buf: &mut [u8; 512]) -> (TestEndp, ServiceHandle, 
 /// our own echo, so this tier cannot be trusted with the name.
 #[test]
 fn own_echo_likely_still_adjudicates_the_proposal() {
-  use crate::event::RouteEvent;
+
   let mut buf = [0u8; 512];
   let (mut e, handle, n) = probe_against_our_instance(&mut buf);
   let src: core::net::SocketAddr = "192.0.2.1:5353".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::OwnEchoLikely),
-    )
-    .unwrap()
+  let events: std::vec::Vec<_> = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::OwnEchoLikely))
+    .into_iter()
     .map(|ev| ev.expect("event must be Ok"))
     .collect();
   assert!(
     events.iter().any(|ev| matches!(
       ev,
-      RouteEvent::ToService(ts)
+      TestRoute::ToService(ts)
         if ts.handle() == handle && ts.event().is_probe_proposal()
     )),
     "an unordered content match must still deliver the §8.2 proposal"
@@ -10353,21 +10259,18 @@ fn own_echo_admits_nothing_at_all() {
 /// and the question is withheld — the discovery half of answering is shut.
 #[test]
 fn own_echo_likely_withholds_an_ordinary_question() {
-  use crate::event::RouteEvent;
+
   let (mut e, _handle) = build_endpoint_with_printer();
   let mut buf = [0u8; 512];
   let n = build_query_for_host(&mut buf, "printer-host.local.");
   let src: core::net::SocketAddr = "192.0.2.1:5353".parse().unwrap();
-  let mut events = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::OwnEchoLikely),
-    )
-    .unwrap();
+  let mut events = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::OwnEchoLikely))
+    .into_iter();
   assert!(
     !events.any(|ev| matches!(
       ev.expect("event must be Ok"),
-      RouteEvent::ToService(ts) if ts.event().is_question()
+      TestRoute::ToService(ts) if ts.event().is_question()
     )),
     "a plain discovery question is not a §8.1 defence, so DefenceOnly withholds it"
   );
@@ -10379,7 +10282,7 @@ fn own_echo_likely_withholds_an_ordinary_question() {
 /// publishing an address we publish, including a peer that has taken it.
 #[test]
 fn not_from_us_declines_the_advertised_source_guess() {
-  use crate::event::RouteEvent;
+
   use rand::SeedableRng;
   let rng = rand::rngs::StdRng::from_seed([99u8; 32]);
   let mut e = TestEndp::try_new(
@@ -10396,8 +10299,8 @@ fn not_from_us_declines_the_advertised_source_guess() {
   );
   recs.add_a(our_v4);
   let now = StdInstant::now();
-  let (handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -10409,11 +10312,11 @@ fn not_from_us_declines_the_advertised_source_guess() {
   let src = core::net::SocketAddr::from((our_v4, 5353));
 
   let saw_question = |e: &mut TestEndp, prov| {
-    e.handle(now, Received::new(src, &buf[..n], prov))
-      .unwrap()
+    route_events(e, now, Received::new(src, &buf[..n], prov))
+    .into_iter()
       .any(|ev| matches!(
         ev.expect("event must be Ok"),
-        RouteEvent::ToService(ts) if ts.handle() == handle && ts.event().is_question()
+        TestRoute::ToService(ts) if ts.handle() == handle && ts.event().is_question()
       ))
   };
   assert!(
@@ -10438,7 +10341,7 @@ fn not_from_us_declines_the_advertised_source_guess() {
 /// peer finished probing onto a name we already hold — duplicate ownership.
 #[test]
 fn a_matched_advertised_source_still_defends_an_established_name() {
-  use crate::event::RouteEvent;
+
   use rand::SeedableRng;
   let rng = rand::rngs::StdRng::from_seed([99u8; 32]);
   let mut e = TestEndp::try_new(
@@ -10455,8 +10358,8 @@ fn a_matched_advertised_source_still_defends_an_established_name() {
   );
   recs.add_a(our_v4);
   let now = StdInstant::now();
-  let (handle, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -10469,11 +10372,11 @@ fn a_matched_advertised_source_still_defends_an_established_name() {
   let n = build_probe_for_host(&mut buf, "printer-host.local.", Ipv4Addr::new(10, 0, 0, 9));
   let src = core::net::SocketAddr::from((our_v4, 5353));
   assert!(
-    e.handle(now, Received::new(src, &buf[..n], Provenance::Unknown))
-      .unwrap()
+    route_events(&mut e, now, Received::new(src, &buf[..n], Provenance::Unknown))
+    .into_iter()
       .any(|ev| matches!(
         ev.expect("event must be Ok"),
-        RouteEvent::ToService(ts) if ts.handle() == handle && ts.event().is_question()
+        TestRoute::ToService(ts) if ts.handle() == handle && ts.event().is_question()
       )),
     "§8.1 requires the probe for a name we are using to be answered immediately; \
      an address guess must not be able to skip it"
@@ -10498,11 +10401,7 @@ fn register_with_addrs(
   for a in a_addrs {
     recs.add_a(*a);
   }
-  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-    ServiceSpec::new(recs),
-    StdInstant::now(),
-  )
-  .map(|(h, _svc)| h)
+  e.try_register_service(ServiceSpec::new(recs), StdInstant::now())
 }
 
 /// Two services may share a host name — that is how one machine advertises one
@@ -10629,10 +10528,7 @@ fn the_rename_duplicate_guard_sees_through_a_trailing_root_dot() {
   register_with_addrs(&mut e, "A._ipp._tcp.local.", "h.local.", &[]).unwrap();
   let b = register_with_addrs(&mut e, "B._ipp._tcp.local.", "h.local.", &[]).unwrap();
   assert!(
-    matches!(
-      e.handle_service_renamed(b, Name::try_from_str("A._ipp._tcp.local").unwrap()),
-      Err(HandleServiceRenamedError::NameAlreadyRegistered(_))
-    ),
+    !e.rename_service_for_test(b, Name::try_from_str("A._ipp._tcp.local").unwrap()),
     "renaming onto the same owner under a different spelling must be rejected"
   );
 }
@@ -10684,7 +10580,7 @@ fn a_held_goodbye_holds_its_name_through_a_trailing_root_dot() {
   );
   assert!(
     matches!(
-      ep.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+      ep.try_register_service(
         ServiceSpec::new(recs),
         now
       ),
@@ -10705,7 +10601,7 @@ fn sibling_host_retention_sees_through_a_trailing_root_dot() {
   let leaving = register_with_addrs(&mut e, "A._ipp._tcp.local.", "h.local.", &[shared]).unwrap();
   let staying = register_with_addrs(&mut e, "B._ipp._tcp.local.", "h.local", &[shared]).unwrap();
   // Only a CONFIRMED-ADVERTISED address is retained, so announce the sibling's.
-  e.note_service_announced(FullyAnnounced::new(staying, true), &[shared], &[]);
+  e.note_service_announced_for_test(staying, true, &[shared], &[]);
   assert_eq!(
     e.sibling_retained_addrs(leaving),
     std::vec![core::net::IpAddr::V4(shared)],
@@ -10735,11 +10631,7 @@ fn register_with_addr_sets(
   for a in aaaa_addrs {
     recs.add_aaaa(*a);
   }
-  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-    ServiceSpec::new(recs),
-    StdInstant::now(),
-  )
-  .map(|(h, _svc)| h)
+  e.try_register_service(ServiceSpec::new(recs), StdInstant::now())
 }
 
 /// RFC 6762 §9's conflict is over "the same name, **rrtype** and rrclass, but
@@ -10784,7 +10676,6 @@ fn an_ipv4_only_and_an_ipv6_only_service_may_share_a_host() {
 #[test]
 fn a_host_conflict_is_routed_only_to_routes_publishing_that_rrtype() {
   use crate::{
-    event::RouteEvent,
     wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder},
   };
   use core::net::SocketAddr;
@@ -10808,15 +10699,12 @@ fn a_host_conflict_is_routed_only_to_routes_publishing_that_rrtype() {
   let n = b.finish().unwrap();
 
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
-  let conflicted: std::vec::Vec<_> = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::NotFromUs),
-    )
-    .unwrap()
+  let conflicted: std::vec::Vec<_> = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::NotFromUs))
+    .into_iter()
     .filter_map(Result::ok)
     .filter_map(|ev| match ev {
-      RouteEvent::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
+      TestRoute::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
       _ => None,
     })
     .collect();
@@ -10836,7 +10724,7 @@ fn a_host_conflict_is_routed_only_to_routes_publishing_that_rrtype() {
 /// peer's probe for the shared host name takes.
 #[test]
 fn a_probe_host_conflict_is_routed_only_to_routes_publishing_that_rrtype() {
-  use crate::event::RouteEvent;
+
   use core::net::SocketAddr;
 
   let mut e = build_endpoint();
@@ -10856,15 +10744,12 @@ fn a_probe_host_conflict_is_routed_only_to_routes_publishing_that_rrtype() {
   let mut buf = [0u8; 512];
   let n = build_probe_authority_for_host(&mut buf, "h.local.");
   let src: SocketAddr = "192.168.1.99:5353".parse().unwrap();
-  let conflicted: std::vec::Vec<_> = e
-    .handle(
-      StdInstant::now(),
-      Received::new(src, &buf[..n], Provenance::NotFromUs),
-    )
-    .unwrap()
+  let conflicted: std::vec::Vec<_> = route_events(&mut e, StdInstant::now(),
+      Received::new(src, &buf[..n], Provenance::NotFromUs))
+    .into_iter()
     .filter_map(Result::ok)
     .filter_map(|ev| match ev {
-      RouteEvent::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
+      TestRoute::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
       _ => None,
     })
     .collect();
@@ -11105,11 +10990,11 @@ fn host_conflicted_from(
   src: &str,
 ) -> std::vec::Vec<ServiceHandle> {
   let src: core::net::SocketAddr = src.parse().unwrap();
-  e.handle(now, Received::new(src, pkt, Provenance::NotFromUs))
-    .unwrap()
+  route_events(e, now, Received::new(src, pkt, Provenance::NotFromUs))
+    .into_iter()
     .filter_map(Result::ok)
     .filter_map(|ev| match ev {
-      RouteEvent::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
+      TestRoute::ToService(ts) if ts.event().is_host_conflict() => Some(ts.handle()),
       _ => None,
     })
     .collect()
@@ -11141,14 +11026,15 @@ fn probe_conflict_history_from(
   src: &str,
 ) -> std::vec::Vec<(ServiceHandle, ConflictHistory)> {
   let src: core::net::SocketAddr = src.parse().unwrap();
-  e.handle(now, Received::new(src, pkt, Provenance::NotFromUs))
-    .unwrap()
+  route_events(e, now, Received::new(src, pkt, Provenance::NotFromUs))
+    .into_iter()
     .filter_map(Result::ok)
     .filter_map(|ev| match ev {
-      RouteEvent::ToService(ts) => match ts.event() {
-        ServiceEvent::ProbeConflict(pc) => Some((ts.handle(), pc.history())),
-        _ => None,
-      },
+      TestRoute::ToService(ts) if ts.event().is_probe_conflict() => Some((
+        ts.handle(),
+        ts.history()
+          .expect("a probe conflict always carries its history label"),
+      )),
       _ => None,
     })
     .collect()
@@ -11206,10 +11092,7 @@ fn register_service_with_a(
   instance: &str,
   host: &str,
   addr: Ipv4Addr,
-) -> (
-  ServiceHandle,
-  crate::service::Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
-) {
+) -> ServiceHandle {
   let mut recs = ServiceRecords::new(
     Name::try_from_str("_ipp._tcp.local.").unwrap(),
     Name::try_from_str(instance).unwrap(),
@@ -11218,7 +11101,7 @@ fn register_service_with_a(
     120,
   );
   recs.add_a(addr);
-  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  e.try_register_service(
     ServiceSpec::new(recs),
     StdInstant::now(),
   )
@@ -11247,9 +11130,8 @@ fn a_draining_predecessors_echo_does_not_retire_the_replacement_at_its_host() {
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
-  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  let a_handle = register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   let b_handle = register_with_addr_sets(
     &mut e,
@@ -11297,9 +11179,8 @@ fn a_completed_withdrawals_echo_does_not_retire_the_replacement_at_its_host() {
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
-  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  let a_handle = register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   // Drain it to completion: the route is freed and the item removed, so the
   // relinquished set survives only in the retention list.
@@ -11352,9 +11233,8 @@ fn dropping_a_labelled_host_match_increments_relinquished_host_conflicts_suppres
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
-  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  let a_handle = register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   let freed = finish_withdrawal(&mut e, a_handle, now);
   assert_eq!(
@@ -11436,9 +11316,8 @@ fn an_address_in_a_section_we_never_wrote_one_in_is_not_our_echo() {
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
-  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  let a_handle = register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   let freed = finish_withdrawal(&mut e, a_handle, now);
   assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
@@ -11510,9 +11389,8 @@ fn a_record_without_the_cache_flush_bit_is_not_our_echo() {
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
-  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  let a_handle = register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   let freed = finish_withdrawal(&mut e, a_handle, now);
   assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
@@ -11561,9 +11439,8 @@ fn the_instance_nsec_is_screened_in_the_section_it_was_written_in_and_no_other()
   let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
   let addr = Ipv4Addr::new(192, 168, 1, 5);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
-  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  let a_handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[addr]);
   e.begin_withdrawal(a_handle, snap, now);
   let freed = finish_withdrawal(&mut e, a_handle, now);
   assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
@@ -11636,9 +11513,8 @@ fn a_relinquished_instances_echo_does_not_defeat_the_probe_of_its_successor() {
   let target = Name::try_from_str("h.local.").unwrap();
   let addr = Ipv4Addr::new(192, 168, 1, 5);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
-  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  let a_handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[addr]);
   e.begin_withdrawal(a_handle, snap, now);
   let freed = finish_withdrawal(&mut e, a_handle, now);
   assert_eq!(freed, std::vec![a_handle], "the goodbye must have completed");
@@ -11652,8 +11528,8 @@ fn a_relinquished_instances_echo_does_not_defeat_the_probe_of_its_successor() {
     120,
   );
   recs.add_a(addr);
-  let (b_handle, _b_svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let b_handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -11684,64 +11560,52 @@ fn a_relinquished_instances_echo_does_not_defeat_the_probe_of_its_successor() {
 /// which is what opens RFC 6762 §8.1's window: a conflicting response arriving
 /// "before the first probe packet is sent MUST be silently ignored", so a
 /// fixture that wants a defence ACTED on has to get there first.
-fn probe_once_confirmed(svc: &mut TestSvc, start: StdInstant) -> StdInstant {
+fn probe_once_confirmed(e: &mut TestEndp, h: ServiceHandle, start: StdInstant) -> StdInstant {
   let mut buf = std::vec![0u8; 4096];
   let mut now = start;
   for _ in 0..20 {
     now = now
       .checked_add(core::time::Duration::from_millis(300))
       .unwrap();
-    svc.handle_timeout(now).unwrap();
-    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_delivery(now, TransmitDelivery::ALL);
+    e.handle_service_timeout(h, now).unwrap();
+    if let Ok(Some(_)) = e.poll_service_transmit(h, now, &mut buf) {
+      e.note_service_delivery(h, now, TransmitDelivery::ALL);
       return now;
     }
   }
-  panic!("no probe reached the wire; state={:?}", svc.state());
+  panic!("no probe reached the wire; state={:?}", svc_state(e, h));
 }
 
-/// Route `pkt` through the endpoint and hand every event addressed to `handle`
-/// to `svc`, exactly as a driver's receive path does. Returns how many arrived.
+/// Route `pkt` through the endpoint and report how many events it DISPATCHED to
+/// `handle` — the whole of what a driver's receive path does now.
 ///
 /// The COUNT is the assertion these regression tests turn on: a conflict the
 /// router drops reaches no service, and a defence that reaches no service cannot
 /// be appealed, deferred or spent — it is simply gone.
 fn deliver_to_service(
   e: &mut TestEndp,
-  svc: &mut TestSvc,
   handle: ServiceHandle,
   pkt: &[u8],
   now: StdInstant,
 ) -> usize {
   let src: core::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
-  let events: std::vec::Vec<_> = e
-    .handle(now, Received::new(src, pkt, Provenance::NotFromUs))
-    .unwrap()
-    .filter_map(Result::ok)
-    .collect();
-  let mut delivered = 0usize;
-  for ev in events {
-    if let RouteEvent::ToService(ts) = ev
-      && ts.handle() == handle
-    {
-      svc.handle_event(ts.into_event(), now);
-      delivered = delivered.saturating_add(1);
-    }
-  }
-  delivered
+  route_events(e, now, Received::new(src, pkt, Provenance::NotFromUs))
+    .into_iter()
+    .filter(|ev| matches!(ev, Ok(TestRoute::ToService(d)) if d.handle() == handle))
+    .count()
 }
 
-/// Every `ServiceUpdate` `svc` has queued, drained.
-fn drain_updates(svc: &mut TestSvc) -> std::vec::Vec<ServiceUpdate> {
+/// Every `ServiceUpdate` this service has queued, drained.
+fn drain_updates(e: &mut TestEndp, h: ServiceHandle) -> std::vec::Vec<ServiceUpdate> {
   let mut out = std::vec::Vec::new();
-  while let Some(u) = svc.poll() {
+  while let Some(u) = e.poll_service(h) {
     out.push(u);
   }
   out
 }
 
 /// Register a successor at `instance` proposing SRV(`port`), and hand back its
-/// handle and `Service` so the fixture can drive its lifecycle.
+/// handle so the fixture can drive its lifecycle through the endpoint.
 fn register_probing_successor(
   e: &mut TestEndp,
   instance: &Name,
@@ -11749,7 +11613,7 @@ fn register_probing_successor(
   port: u16,
   addr: Ipv4Addr,
   now: StdInstant,
-) -> (ServiceHandle, TestSvc) {
+) -> ServiceHandle {
   let mut recs = ServiceRecords::new(
     Name::try_from_str("_ipp._tcp.local.").unwrap(),
     instance.clone(),
@@ -11758,7 +11622,7 @@ fn register_probing_successor(
     120,
   );
   recs.add_a(addr);
-  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  e.try_register_service(
     ServiceSpec::new(recs),
     now,
   )
@@ -11795,9 +11659,8 @@ fn a_relinquished_echo_defers_the_successors_probe_rather_than_renaming_it() {
   let addr = Ipv4Addr::new(192, 168, 1, 5);
 
   // `A` announced `R1` = SRV(631) at this name, then gave it up.
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
-  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  let a_handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[addr]);
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(
     finish_withdrawal(&mut e, a_handle, now),
@@ -11806,15 +11669,15 @@ fn a_relinquished_echo_defers_the_successors_probe_rather_than_renaming_it() {
   );
 
   // `B` takes the same owner name with `R2` = SRV(9999) and starts probing.
-  let (b_handle, mut b) = register_probing_successor(&mut e, &instance, &target, 9999, addr, now);
-  let kept = b.name().as_str().to_owned();
-  let probed_at = probe_once_confirmed(&mut b, now);
+  let b_handle = register_probing_successor(&mut e, &instance, &target, 9999, addr, now);
+  let kept = e.service(b_handle).unwrap().name().as_str().to_owned();
+  let probed_at = probe_once_confirmed(&mut e, b_handle, now);
 
   // `P` defends with `R1`.
   let mut buf = [0u8; 512];
   let n = build_instance_srv_response(&mut buf, &instance, 631, &target);
   assert_eq!(
-    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], probed_at),
+    deliver_to_service(&mut e, b_handle, &buf[..n], probed_at),
     1,
     "P's defence must REACH B. Dropping it here is the defect: a conflict no \
      service receives is not delayed, it is unappealable, and B goes on to \
@@ -11824,25 +11687,25 @@ fn a_relinquished_echo_defers_the_successors_probe_rather_than_renaming_it() {
   let deferred_at = probed_at
     .checked_add(core::time::Duration::from_millis(10))
     .unwrap();
-  b.handle_timeout(deferred_at).unwrap();
+  e.handle_service_timeout(b_handle, deferred_at).unwrap();
   assert_eq!(
-    b.name().as_str(),
+    e.service(b_handle).unwrap().name().as_str(),
     kept,
     "a history-labelled defeat is §8.2's deferral, which KEEPS the name — \
      renaming on a switch echo is the churn §8.2's one second exists to avoid"
   );
   assert_eq!(
-    b.state(),
+    svc_state(&e, b_handle),
     crate::ServiceState::Init,
     "…and \"begins probing for this record again\" restarts the §8.1 sequence"
   );
   assert_eq!(
-    b.poll_timeout(),
+    e.poll_service_timeout(b_handle),
     deferred_at.checked_add(core::time::Duration::from_secs(1)),
     "…after waiting one second exactly"
   );
   assert!(
-    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    !drain_updates(&mut e, b_handle).iter().any(ServiceUpdate::is_renamed),
     "…and it is NOT a rename: §8.1's defeat is what renames, and this defeat is \
      not yet known to be one"
   );
@@ -11850,18 +11713,18 @@ fn a_relinquished_echo_defers_the_successors_probe_rather_than_renaming_it() {
   // A SECOND defence inside the window is labelled too — the retention row does
   // not lapse because it was read. So it defers again rather than renaming, and
   // what bounds this loop is the WINDOW closing, not the peer falling silent.
-  let again_at = probe_once_confirmed(&mut b, deferred_at);
+  let again_at = probe_once_confirmed(&mut e, b_handle, deferred_at);
   assert_eq!(
-    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], again_at),
+    deliver_to_service(&mut e, b_handle, &buf[..n], again_at),
     1,
     "the incumbent's next defence still reaches B"
   );
   let redeferred_at = again_at
     .checked_add(core::time::Duration::from_millis(10))
     .unwrap();
-  b.handle_timeout(redeferred_at).unwrap();
+  e.handle_service_timeout(b_handle, redeferred_at).unwrap();
   assert_eq!(
-    b.name().as_str(),
+    e.service(b_handle).unwrap().name().as_str(),
     kept,
     "still deferring while the label is live, and still claiming nothing: \
      `conflict_classified_unresolved` withholds every claim to the name for the \
@@ -11877,20 +11740,21 @@ fn a_relinquished_echo_defers_the_successors_probe_rather_than_renaming_it() {
     .checked_add(core::time::Duration::from_millis(1))
     .unwrap()
     .max(redeferred_at);
-  let reprobed_at = probe_once_confirmed(&mut b, lapsed);
+  let reprobed_at = probe_once_confirmed(&mut e, b_handle, lapsed);
   assert_eq!(
-    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], reprobed_at),
+    deliver_to_service(&mut e, b_handle, &buf[..n], reprobed_at),
     1,
     "and it still reaches B once the label has lapsed"
   );
-  b.handle_timeout(
+  e.handle_service_timeout(
+    b_handle,
     reprobed_at
       .checked_add(core::time::Duration::from_millis(10))
       .unwrap(),
   )
   .unwrap();
   assert_ne!(
-    b.name().as_str(),
+    e.service(b_handle).unwrap().name().as_str(),
     kept,
     "an UNLABELLED defeat renames — §8.1 is honoured, one window late rather \
      than never, which is the whole of what the deferral costs"
@@ -11917,9 +11781,8 @@ fn a_ghosts_echo_costs_the_successor_one_second_and_not_the_name() {
   let target = Name::try_from_str("h.local.").unwrap();
   let addr = Ipv4Addr::new(192, 168, 1, 5);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
-  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  let a_handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[addr]);
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(
     finish_withdrawal(&mut e, a_handle, now),
@@ -11927,15 +11790,15 @@ fn a_ghosts_echo_costs_the_successor_one_second_and_not_the_name() {
     "precondition: R1 is now this endpoint's relinquished history"
   );
 
-  let (b_handle, mut b) = register_probing_successor(&mut e, &instance, &target, 9999, addr, now);
-  let kept = b.name().as_str().to_owned();
-  let probed_at = probe_once_confirmed(&mut b, now);
+  let b_handle = register_probing_successor(&mut e, &instance, &target, 9999, addr, now);
+  let kept = e.service(b_handle).unwrap().name().as_str().to_owned();
+  let probed_at = probe_once_confirmed(&mut e, b_handle, now);
 
   // A DELAYED ECHO of the predecessor's own SRV — there is no `P` on this link.
   let mut buf = [0u8; 512];
   let n = build_instance_srv_response(&mut buf, &instance, 631, &target);
   assert_eq!(
-    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], probed_at),
+    deliver_to_service(&mut e, b_handle, &buf[..n], probed_at),
     1,
     "the echo reaches B — indistinguishable, here, from the incumbent's defence"
   );
@@ -11943,14 +11806,14 @@ fn a_ghosts_echo_costs_the_successor_one_second_and_not_the_name() {
   let deferred_at = probed_at
     .checked_add(core::time::Duration::from_millis(10))
     .unwrap();
-  b.handle_timeout(deferred_at).unwrap();
+  e.handle_service_timeout(b_handle, deferred_at).unwrap();
   assert_eq!(
-    b.state(),
+    svc_state(&e, b_handle),
     crate::ServiceState::Init,
     "the labelled defeat defers rather than renaming"
   );
   assert_eq!(
-    b.poll_timeout(),
+    e.poll_service_timeout(b_handle),
     deferred_at.checked_add(core::time::Duration::from_secs(1)),
     "…by exactly the one second §8.2 prescribes"
   );
@@ -11963,27 +11826,27 @@ fn a_ghosts_echo_costs_the_successor_one_second_and_not_the_name() {
     at = at
       .checked_add(core::time::Duration::from_millis(300))
       .unwrap();
-    b.handle_timeout(at).unwrap();
-    while let Ok(Some(_)) = b.poll_transmit(at, &mut txbuf) {
-      b.note_delivery(at, TransmitDelivery::ALL);
+    e.handle_service_timeout(b_handle, at).unwrap();
+    while let Ok(Some(_)) = e.poll_service_transmit(b_handle, at, &mut txbuf) {
+      e.note_service_delivery(b_handle, at, TransmitDelivery::ALL);
     }
-    if b.state() == crate::ServiceState::Established {
+    if svc_state(&e, b_handle) == crate::ServiceState::Established {
       break;
     }
   }
   assert_eq!(
-    b.state(),
+    svc_state(&e, b_handle),
     crate::ServiceState::Established,
     "the retry went unanswered, so the §8.1 sequence completes"
   );
   assert_eq!(
-    b.name().as_str(),
+    e.service(b_handle).unwrap().name().as_str(),
     kept,
     "…on the SAME name: a deferral that ends in silence costs one second and \
      nothing else"
   );
   assert!(
-    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    !drain_updates(&mut e, b_handle).iter().any(ServiceUpdate::is_renamed),
     "…and no rename was ever queued"
   );
 }
@@ -12022,9 +11885,8 @@ fn an_incumbents_response_reverts_a_successor_that_established_inside_the_window
 
   // `A` announced `R1` = SRV(631) at this name, then gave it up. Peer `P` is a
   // §9 fault-tolerance twin asserting that same `R1`, which §9 makes legal.
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
-  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  let a_handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[addr]);
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(
     finish_withdrawal(&mut e, a_handle, now),
@@ -12034,24 +11896,24 @@ fn an_incumbents_response_reverts_a_successor_that_established_inside_the_window
 
   // `B` takes the same owner name with `R2` = SRV(9999), and NOTHING reaches it
   // while it probes.
-  let (b_handle, mut b) = register_probing_successor(&mut e, &instance, &target, 9999, addr, now);
-  let kept = b.name().as_str().to_owned();
+  let b_handle = register_probing_successor(&mut e, &instance, &target, 9999, addr, now);
+  let kept = e.service(b_handle).unwrap().name().as_str().to_owned();
   let mut txbuf = std::vec![0u8; 4096];
   let mut at = now;
   for _ in 0..40 {
     at = at
       .checked_add(core::time::Duration::from_millis(300))
       .unwrap();
-    b.handle_timeout(at).unwrap();
-    while let Ok(Some(_)) = b.poll_transmit(at, &mut txbuf) {
-      b.note_delivery(at, TransmitDelivery::ALL);
+    e.handle_service_timeout(b_handle, at).unwrap();
+    while let Ok(Some(_)) = e.poll_service_transmit(b_handle, at, &mut txbuf) {
+      e.note_service_delivery(b_handle, at, TransmitDelivery::ALL);
     }
-    if b.state() == crate::ServiceState::Established {
+    if svc_state(&e, b_handle) == crate::ServiceState::Established {
       break;
     }
   }
   assert_eq!(
-    b.state(),
+    svc_state(&e, b_handle),
     crate::ServiceState::Established,
     "precondition: the loss let the successor finish probing and announce"
   );
@@ -12070,25 +11932,25 @@ fn an_incumbents_response_reverts_a_successor_that_established_inside_the_window
   let mut buf = [0u8; 512];
   let n = build_instance_srv_response(&mut buf, &instance, 631, &target);
   assert_eq!(
-    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], at),
+    deliver_to_service(&mut e, b_handle, &buf[..n], at),
     1,
     "the incumbent's response must reach B"
   );
   assert_eq!(
-    b.state(),
+    svc_state(&e, b_handle),
     crate::ServiceState::Init,
     "…and §9's immediate reset must be honoured on it. Dropping it for matching \
      this endpoint's own history left TWO responders owning one advertised \
      name, with nothing to replay the conflict at expiry"
   );
   assert_eq!(
-    b.name().as_str(),
+    e.service(b_handle).unwrap().name().as_str(),
     kept,
     "…and it is §9's revert, on the SAME name: the re-probe is the only thing \
      that can tell a live incumbent from our own ghost"
   );
   assert!(
-    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    !drain_updates(&mut e, b_handle).iter().any(ServiceUpdate::is_renamed),
     "…so nothing is renamed on the evidence of one response"
   );
 }
@@ -12126,9 +11988,8 @@ fn an_incumbents_labelled_defence_defers_a_successor_whose_instance_is_its_host(
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
   // `A` announced `A1` under that name and gave it up.
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "h._ipp._tcp.local.", "h._ipp._tcp.local.", a1);
-  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  let a_handle = register_service_with_a(&mut e, "h._ipp._tcp.local.", "h._ipp._tcp.local.", a1);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(
     finish_withdrawal(&mut e, a_handle, now),
@@ -12137,9 +11998,9 @@ fn an_incumbents_labelled_defence_defers_a_successor_whose_instance_is_its_host(
   );
 
   // `B` takes the same name with `A2` and starts probing.
-  let (b_handle, mut b) = register_probing_successor(&mut e, &shared, &shared, 9999, a2, now);
-  let kept = b.name().as_str().to_owned();
-  let mut at = probe_once_confirmed(&mut b, now);
+  let b_handle = register_probing_successor(&mut e, &shared, &shared, 9999, a2, now);
+  let kept = e.service(b_handle).unwrap().name().as_str().to_owned();
+  let mut at = probe_once_confirmed(&mut e, b_handle, now);
 
   // The incumbent `P` defends the name with `A1`, for as long as the retention
   // window lasts. Every one of those defences carries the history label, and
@@ -12152,28 +12013,28 @@ fn an_incumbents_labelled_defence_defers_a_successor_whose_instance_is_its_host(
   let mut rounds = 0usize;
   while at < window_ends {
     assert_eq!(
-      deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], at),
+      deliver_to_service(&mut e, b_handle, &buf[..n], at),
       1,
       "round {rounds}: the incumbent's defence must REACH B. The host rule owns \
        which EVENT this record becomes, not whether it is a conflict — dropped \
        here, B probes and announces over a peer that is defending correctly"
     );
     at = at.checked_add(core::time::Duration::from_millis(10)).unwrap();
-    b.handle_timeout(at).unwrap();
+    e.handle_service_timeout(b_handle, at).unwrap();
     assert_ne!(
-      b.state(),
+      svc_state(&e, b_handle),
       crate::ServiceState::Established,
       "round {rounds}: a defended name is not this service's to advertise"
     );
     assert_eq!(
-      b.name().as_str(),
+      e.service(b_handle).unwrap().name().as_str(),
       kept,
       "round {rounds}: and a labelled defeat is §8.2's deferral, which KEEPS the \
        name — the re-probe is the only thing that can tell our own ghost from an \
        incumbent twin"
     );
     rounds = rounds.saturating_add(1);
-    at = probe_once_confirmed(&mut b, at);
+    at = probe_once_confirmed(&mut e, b_handle, at);
   }
   assert!(
     rounds >= 2,
@@ -12181,7 +12042,7 @@ fn an_incumbents_labelled_defence_defers_a_successor_whose_instance_is_its_host(
      test proves nothing about a SUSTAINED defence"
   );
   assert!(
-    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    !drain_updates(&mut e, b_handle).iter().any(ServiceUpdate::is_renamed),
     "…and no rename was queued for any of them"
   );
 
@@ -12237,9 +12098,8 @@ fn an_incumbents_labelled_address_reverts_a_successor_whose_instance_is_its_host
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
   // `A` announced `A1` under the one name it wears as both roles, and gave it up.
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "h._ipp._tcp.local.", "h._ipp._tcp.local.", a1);
-  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  let a_handle = register_service_with_a(&mut e, "h._ipp._tcp.local.", "h._ipp._tcp.local.", a1);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(
     finish_withdrawal(&mut e, a_handle, now),
@@ -12248,24 +12108,24 @@ fn an_incumbents_labelled_address_reverts_a_successor_whose_instance_is_its_host
   );
 
   // `B` takes the same name with `A2`, and NOTHING reaches it while it probes.
-  let (b_handle, mut b) = register_probing_successor(&mut e, &shared, &shared, 9999, a2, now);
-  let kept = b.name().as_str().to_owned();
+  let b_handle = register_probing_successor(&mut e, &shared, &shared, 9999, a2, now);
+  let kept = e.service(b_handle).unwrap().name().as_str().to_owned();
   let mut txbuf = std::vec![0u8; 4096];
   let mut at = now;
   for _ in 0..40 {
     at = at
       .checked_add(core::time::Duration::from_millis(300))
       .unwrap();
-    b.handle_timeout(at).unwrap();
-    while let Ok(Some(_)) = b.poll_transmit(at, &mut txbuf) {
-      b.note_delivery(at, TransmitDelivery::ALL);
+    e.handle_service_timeout(b_handle, at).unwrap();
+    while let Ok(Some(_)) = e.poll_service_transmit(b_handle, at, &mut txbuf) {
+      e.note_service_delivery(b_handle, at, TransmitDelivery::ALL);
     }
-    if b.state() == crate::ServiceState::Established {
+    if svc_state(&e, b_handle) == crate::ServiceState::Established {
       break;
     }
   }
   assert_eq!(
-    b.state(),
+    svc_state(&e, b_handle),
     crate::ServiceState::Established,
     "precondition: the loss let the successor finish probing and announce"
   );
@@ -12283,13 +12143,13 @@ fn an_incumbents_labelled_address_reverts_a_successor_whose_instance_is_its_host
   let mut buf = [0u8; 512];
   let n = build_host_a_response(&mut buf, &shared, a1);
   assert_eq!(
-    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], at),
+    deliver_to_service(&mut e, b_handle, &buf[..n], at),
     1,
     "the incumbent's defence must REACH B — the fall-through already delivered \
      it, which is why the loss was silent"
   );
   assert_eq!(
-    b.state(),
+    svc_state(&e, b_handle),
     crate::ServiceState::Init,
     "…and §9's immediate reset must be honoured ON IT. Delivering it stripped of \
      the host role let row C's instance-authority gate answer 'we assert no A at \
@@ -12297,17 +12157,17 @@ fn an_incumbents_labelled_address_reverts_a_successor_whose_instance_is_its_host
      probing cell acted on was discarded the moment the service announced"
   );
   assert_eq!(
-    b.name().as_str(),
+    e.service(b_handle).unwrap().name().as_str(),
     kept,
     "…and it is §9's revert, on the SAME name: reversible, rate-limited, and \
      claiming nothing while it runs"
   );
   assert!(
-    !drain_updates(&mut b).iter().any(ServiceUpdate::is_renamed),
+    !drain_updates(&mut e, b_handle).iter().any(ServiceUpdate::is_renamed),
     "…so nothing is renamed on the evidence of one response"
   );
   assert!(
-    !drain_updates(&mut b)
+    !drain_updates(&mut e, b_handle)
       .iter()
       .any(ServiceUpdate::is_host_conflict),
     "…and the TERMINAL host consequence is still withheld: the fall-through \
@@ -12339,9 +12199,8 @@ fn a_labelled_address_this_service_publishes_is_no_conflict_at_a_shared_name() {
 
   // `A` announced this address at the shared name and gave it up, so the address
   // is this endpoint's own history…
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "h._ipp._tcp.local.", "h._ipp._tcp.local.", addr);
-  let snap = announced_snapshot(a_svc.records(), &[addr]);
+  let a_handle = register_service_with_a(&mut e, "h._ipp._tcp.local.", "h._ipp._tcp.local.", addr);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[addr]);
   e.begin_withdrawal(a_handle, snap, now);
   assert_eq!(
     finish_withdrawal(&mut e, a_handle, now),
@@ -12351,14 +12210,14 @@ fn a_labelled_address_this_service_publishes_is_no_conflict_at_a_shared_name() {
 
   // …and `B` re-registers the same name publishing the SAME address, which is
   // what makes the arriving record both labelled and consistent.
-  let (b_handle, mut b) = register_probing_successor(&mut e, &shared, &shared, 9999, addr, now);
-  let kept = b.name().as_str().to_owned();
-  let at = probe_once_confirmed(&mut b, now);
+  let b_handle = register_probing_successor(&mut e, &shared, &shared, 9999, addr, now);
+  let kept = e.service(b_handle).unwrap().name().as_str().to_owned();
+  let at = probe_once_confirmed(&mut e, b_handle, now);
 
   let mut buf = [0u8; 512];
   let n = build_host_a_response(&mut buf, &shared, addr);
   assert_eq!(
-    deliver_to_service(&mut e, &mut b, b_handle, &buf[..n], at),
+    deliver_to_service(&mut e, b_handle, &buf[..n], at),
     1,
     "precondition: the labelled record still reaches B as a `ProbeConflict` — \
      what changed is which classifier reads it, not whether it is delivered"
@@ -12366,16 +12225,16 @@ fn a_labelled_address_this_service_publishes_is_no_conflict_at_a_shared_name() {
   let after = at
     .checked_add(core::time::Duration::from_millis(10))
     .unwrap();
-  b.handle_timeout(after).unwrap();
+  e.handle_service_timeout(b_handle, after).unwrap();
   assert_ne!(
-    b.state(),
+    svc_state(&e, b_handle),
     crate::ServiceState::Init,
     "an address this service itself publishes is §9's 'never inconsistent', so \
      it must spend NO deferral — the instance classifier could not read an \
      address at all and called every one of them differing"
   );
   assert_eq!(
-    b.name().as_str(),
+    e.service(b_handle).unwrap().name().as_str(),
     kept,
     "…and the name is untouched either way"
   );
@@ -12407,8 +12266,7 @@ fn a_unicast_only_generation_does_not_screen_a_genuine_peer_conflict() {
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, mut a_svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", a1);
+  let a_handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", a1);
 
   // Probe to `Announcing(0)` and stop there. A probe is a QUESTION (§8.1) and
   // latches no exposure of any kind, so nothing this service has sent so far is
@@ -12419,16 +12277,16 @@ fn a_unicast_only_generation_does_not_screen_a_genuine_peer_conflict() {
     at = at
       .checked_add(core::time::Duration::from_millis(300))
       .unwrap();
-    a_svc.handle_timeout(at).unwrap();
-    if a_svc.state() == crate::ServiceState::Announcing(0) {
+    e.handle_service_timeout(a_handle, at).unwrap();
+    if svc_state(&e, a_handle) == crate::ServiceState::Announcing(0) {
       break;
     }
-    if let Ok(Some(_)) = a_svc.poll_transmit(at, &mut txbuf) {
-      a_svc.note_delivery(at, TransmitDelivery::ALL);
+    if let Ok(Some(_)) = e.poll_service_transmit(a_handle, at, &mut txbuf) {
+      e.note_service_delivery(a_handle, at, TransmitDelivery::ALL);
     }
   }
   assert_eq!(
-    a_svc.state(),
+    svc_state(&e, a_handle),
     crate::ServiceState::Announcing(0),
     "precondition: probing is done and nothing has been announced"
   );
@@ -12445,12 +12303,13 @@ fn a_unicast_only_generation_does_not_screen_a_genuine_peer_conflict() {
   qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-  a_svc.handle_event(
+  e.dispatch_service_event_for_test(
+    a_handle,
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x4242)),
     at,
   );
-  let tx = a_svc
-    .poll_transmit(at, &mut txbuf)
+  let tx = e
+    .poll_service_transmit(a_handle, at, &mut txbuf)
     .unwrap()
     .expect("the legacy reply drains first");
   assert_eq!(
@@ -12458,10 +12317,10 @@ fn a_unicast_only_generation_does_not_screen_a_genuine_peer_conflict() {
     legacy_src,
     "precondition: the one positive send went to a resolver's ephemeral port"
   );
-  a_svc.note_delivery(at, TransmitDelivery::ALL);
+  e.note_service_delivery(a_handle, at, TransmitDelivery::ALL);
 
   // …and is torn down, snapshot and all.
-  let snap = a_svc.withdrawal_snapshot();
+  let snap = e.service_withdrawal_snapshot_for_test(a_handle);
   assert!(
     !crate::transmit::Family::V4.pick_ref(&snap.owned).a_slice().is_empty(),
     "precondition: the goodbye's half DOES own the host address — the legacy \
@@ -12477,7 +12336,7 @@ fn a_unicast_only_generation_does_not_screen_a_genuine_peer_conflict() {
   // A successor takes the host name with a DIFFERENT address, and a genuine peer
   // multicasts the old one. Those bytes match this endpoint's unicast history
   // exactly — and cannot be an echo of it.
-  let (b_handle, _b_svc) = register_probing_successor(
+  let b_handle = register_probing_successor(
     &mut e,
     &Name::try_from_str("Other._ipp._tcp.local.").unwrap(),
     &host,
@@ -12511,16 +12370,18 @@ fn a_renamed_away_instances_echo_does_not_conflict_after_its_goodbye_is_reclaime
   let target = Name::try_from_str("h.local.").unwrap();
   let addr = Ipv4Addr::new(192, 168, 1, 5);
 
-  let (handle, svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
+  let handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", addr);
   // The service renames away; the driver hands the old name's goodbye over.
-  e.handle_service_renamed(
-    handle,
-    Name::try_from_str("Printer (2)._ipp._tcp.local.").unwrap(),
-  )
-  .unwrap();
+  let old_records = e.service(handle).unwrap().records().clone();
+  assert!(
+    e.rename_service_for_test(
+      handle,
+      Name::try_from_str("Printer (2)._ipp._tcp.local.").unwrap(),
+    ),
+    "the vacated name is free"
+  );
   let handoff = crate::service::RenameGoodbyeHandoff::announced(
-    svc.records().clone(),
+    old_records,
     on_both(
       crate::service::EmittedRecords::new(
         true,
@@ -12547,13 +12408,13 @@ fn a_renamed_away_instances_echo_does_not_conflict_after_its_goodbye_is_reclaime
     120,
   );
   recs.add_a(addr);
-  let (b_handle, _b_svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let b_handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
     .unwrap();
-  e.note_service_announced(FullyAnnounced::new(b_handle, true), &[addr], &[]);
+  e.note_service_announced_for_test(b_handle, true, &[addr], &[]);
   assert!(
     e.detached_withdrawal_owed_for(&old).is_none(),
     "the reclaim-cancel must have removed the old name's detached goodbye"
@@ -12589,14 +12450,15 @@ fn a_force_removed_services_echo_does_not_retire_its_replacement() {
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", a1);
-  // The caller holds the `Service`, so it can say exactly what was asserted.
-  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  let a_handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", a1);
+  // It has to actually ANNOUNCE: force-removal retains what the SERVICE reports
+  // having put on a wire, and a set nothing ever carried has no echo to disown.
+  let announced_at = drive_to_established(&mut e, a_handle, now);
   assert!(
-    e.unregister_service(a_handle, Some(snap), now),
+    e.force_remove_service(a_handle, announced_at),
     "the route was found and removed"
   );
+  let now = announced_at;
 
   // …and re-registers at BOTH owner names in the very next breath.
   let mut recs = ServiceRecords::new(
@@ -12607,8 +12469,8 @@ fn a_force_removed_services_echo_does_not_retire_its_replacement() {
     120,
   );
   recs.add_a(a2);
-  let (b_handle, _b_svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let b_handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -12650,16 +12512,15 @@ fn force_removing_a_draining_service_retains_the_item_it_drops() {
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
-  e.begin_withdrawal(a_handle, announced_snapshot(a_svc.records(), &[a1]), now);
+  let a_handle = register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  e.begin_withdrawal(a_handle, announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[a1]), now);
   assert!(
     e.route_withdrawal_owed(a_handle).is_some(),
     "the goodbye is still draining"
   );
   // No snapshot this time: the caller has nothing left to ask. The ITEM is the
   // description that must survive.
-  assert!(e.unregister_service(a_handle, None, now));
+  assert!(e.force_remove_service(a_handle, now));
   assert!(
     e.route_withdrawal_owed(a_handle).is_none(),
     "force-remove drops the route-attached item"
@@ -12710,9 +12571,8 @@ fn a_never_transmitted_withdrawal_does_not_screen_a_genuine_peer_conflict() {
   // `A` is registered and withdrawn with nothing on the wire, so its own
   // snapshot reports no exposure at all. This is the DEFAULT path — no test
   // fixture is needed to reach it.
-  let (a_handle, mut a_svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", a1);
-  let snap = a_svc.withdrawal_snapshot();
+  let a_handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "h.local.", a1);
+  let snap = e.service_withdrawal_snapshot_for_test(a_handle);
   assert!(
     snap.owned.iter().all(crate::service::EmittedRecords::is_empty),
     "a never-announced service must report no exposure"
@@ -12735,8 +12595,8 @@ fn a_never_transmitted_withdrawal_does_not_screen_a_genuine_peer_conflict() {
     120,
   );
   recs.add_a(a2);
-  let (b_handle, _b_svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let b_handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -12777,9 +12637,8 @@ fn a_zero_retention_window_keeps_only_the_resident_half_of_the_screen() {
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
-  let snap = announced_snapshot(a_svc.records(), &[a1]);
+  let a_handle = register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let snap = announced_snapshot(&e.service(a_handle).unwrap().records().clone(), &[a1]);
   e.begin_withdrawal(a_handle, snap, now);
   let b_handle = register_with_addr_sets(
     &mut e,
@@ -12858,10 +12717,9 @@ fn a_relinquished_generation_is_disowned_only_on_the_family_that_carried_it() {
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
   // `A` announces, IPv4 accepts, IPv6 refuses. Then it is torn down.
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "shared-host.local.", a1);
+  let a_handle = register_service_with_a(&mut e, "Printer._ipp._tcp.local.", "shared-host.local.", a1);
   let snap = crate::service::WithdrawalSnapshot::announced(
-    a_svc.records().clone(),
+    e.service(a_handle).unwrap().records().clone(),
     on_v4_only(
       crate::service::EmittedRecords::new(
         true,
@@ -12890,12 +12748,8 @@ fn a_relinquished_generation_is_disowned_only_on_the_family_that_carried_it() {
   );
   recs.add_a(a2);
   let b_handle = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      now,
-    )
-    .unwrap()
-    .0;
+    .try_register_service(ServiceSpec::new(recs), now)
+    .unwrap();
 
   let mut buf = [0u8; 512];
   let n = build_host_a_response(&mut buf, &host, a1);
@@ -12937,10 +12791,9 @@ fn a_draining_withdrawals_exposure_screens_only_the_family_it_reached() {
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
   let a2 = Ipv4Addr::new(192, 168, 1, 9);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
+  let a_handle = register_service_with_a(&mut e, "A._ipp._tcp.local.", "shared-host.local.", a1);
   let snap = crate::service::WithdrawalSnapshot::announced(
-    a_svc.records().clone(),
+    e.service(a_handle).unwrap().records().clone(),
     on_v4_only(
       crate::service::EmittedRecords::new(
         true,
@@ -13172,13 +13025,11 @@ fn the_history_screen_runs_once_per_record_however_many_services_match() {
   };
 
   let src: core::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
-  let mut events = e
-    .handle(now, Received::new(src, &buf[..n], Provenance::NotFromUs))
-    .unwrap();
-  let conflicts = events
-    .by_ref()
+  e.history_screens = 0;
+  let conflicts = route_events(&mut e, now, Received::new(src, &buf[..n], Provenance::NotFromUs))
+    .into_iter()
     .filter_map(Result::ok)
-    .filter(|ev| matches!(ev, RouteEvent::ToService(ts) if ts.event().is_host_conflict()))
+    .filter(|ev| matches!(ev, TestRoute::ToService(ts) if ts.event().is_host_conflict()))
     .count();
   assert_eq!(
     conflicts,
@@ -13187,7 +13038,7 @@ fn the_history_screen_runs_once_per_record_however_many_services_match() {
      conflict"
   );
   assert_eq!(
-    events.history_screens, RECORDS,
+    e.history_screens, RECORDS,
     "the screen's answer does not vary with the route, so it must be taken once \
      per record — re-deriving it per candidate service is what multiplies a \
      hostile packet's receive cost by the fan-out width"
@@ -13209,10 +13060,9 @@ fn a_family_that_carried_nothing_owes_no_goodbye() {
   let mut e = build_endpoint();
   let a1 = Ipv4Addr::new(192, 168, 1, 5);
 
-  let (a_handle, a_svc) =
-    register_service_with_a(&mut e, "A._ipp._tcp.local.", "h.local.", a1);
+  let a_handle = register_service_with_a(&mut e, "A._ipp._tcp.local.", "h.local.", a1);
   let snap = crate::service::WithdrawalSnapshot::announced(
-    a_svc.records().clone(),
+    e.service(a_handle).unwrap().records().clone(),
     on_v4_only(
       crate::service::EmittedRecords::new(
         true,
@@ -13383,12 +13233,8 @@ fn the_relinquished_ceiling_spills_to_identities_rather_than_disabling_the_endpo
   );
   successor.add_a(Ipv4Addr::new(10, 0, 0, 7));
   let spilled_handle = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(successor),
-      overflow_at,
-    )
-    .unwrap()
-    .0;
+    .try_register_service(ServiceSpec::new(successor), overflow_at)
+    .unwrap();
   let n = build_host_a_response(&mut buf, &spilled_host, addr);
   assert!(
     host_conflicted(&mut e, &buf[..n], overflow_at).is_empty(),
@@ -13480,7 +13326,7 @@ fn the_compact_relinquished_ceiling_costs_only_what_did_not_fit() {
     120,
   );
   successor.add_a(Ipv4Addr::new(10, 0, 0, 7));
-  e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  e.try_register_service(
     ServiceSpec::new(successor),
     at,
   )
@@ -13625,12 +13471,8 @@ fn a_merged_compact_identity_expires_on_each_familys_own_window() {
   );
   successor.add_a(Ipv4Addr::new(10, 0, 0, 7));
   let successor_handle = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(successor),
-      base,
-    )
-    .unwrap()
-    .0;
+    .try_register_service(ServiceSpec::new(successor), base)
+    .unwrap();
 
   // AFTER the IPv4 generation's window and BEFORE the IPv6 generation's.
   let between = base + window + gap / 2;
@@ -13727,8 +13569,8 @@ fn every_relinquished_generation_of_one_owner_pair_screens_to_its_own_expiry() {
     9999,
     120,
   );
-  let (b_handle, _b_svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
+  let b_handle = e
+    .try_register_service(
       ServiceSpec::new(recs),
       now,
     )
@@ -13802,5 +13644,562 @@ fn an_identical_relinquished_generation_merges_by_extending_its_window() {
     e.relinquished.first().map(|r| r.expires_at),
     later.checked_add(EndpointConfig::new().relinquished_retention()),
     "and it screens to the LATER of the two windows"
+  );
+}
+
+// ── RFC 6762 §8.1's fifteen-conflicts-in-ten-seconds flood limit ──────────────
+//
+// > If fifteen conflicts occur within any ten-second period, then the host MUST
+// > wait at least five seconds before each successive additional probe attempt.
+//
+// The obligation is the HOST's, so the history is the ENDPOINT's: it aggregates
+// across every record set this endpoint routes for, outlives any one `Service`,
+// and floors a fresh registration's first probe. Everything below drives it
+// through `Endpoint::handle` — the only door a conflict comes through — because
+// the whole point is that no caller sits between routing a conflict and spacing
+// the probe it caused.
+
+/// Register a service that owns `instance` at host `host` with `addr`, and get
+/// one probe onto the wire so RFC 6762 §8.1's window is OPEN for it: "apparently
+/// conflicting Multicast DNS responses received *before* the first probe packet
+/// is sent MUST be silently ignored".
+fn flood_victim(
+  e: &mut TestEndp,
+  instance: &str,
+  host: &str,
+  addr: Ipv4Addr,
+  now: StdInstant,
+) -> (ServiceHandle, StdInstant) {
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str(instance).unwrap(),
+    Name::try_from_str(host).unwrap(),
+    631,
+    120,
+  );
+  recs.add_a(addr);
+  let h = e
+    .try_register_service(ServiceSpec::new(recs), now)
+    .expect("registration must succeed");
+  let probed_at = probe_once_confirmed(e, h, now);
+  (h, probed_at)
+}
+
+/// Drive `h` all the way to `Established`, confirming every send on both
+/// families, and report the instant it got there.
+fn drive_to_established(e: &mut TestEndp, h: ServiceHandle, from: StdInstant) -> StdInstant {
+  let mut buf = std::vec![0u8; 4096];
+  let mut at = from;
+  for _ in 0..60 {
+    at = e.poll_service_timeout(h).filter(|d| *d > at).unwrap_or(at);
+    e.handle_service_timeout(h, at).unwrap();
+    while let Ok(Some(_)) = e.poll_service_transmit(h, at, &mut buf) {
+      e.note_service_delivery(h, at, TransmitDelivery::ALL);
+    }
+    if svc_state(e, h) == crate::ServiceState::Established {
+      return at;
+    }
+  }
+  panic!("the service never reached Established; state={:?}", svc_state(e, h));
+}
+
+/// One conflicting authoritative SRV response at `owner`, delivered as its OWN
+/// datagram at `at`. Returns how many service dispatches it produced.
+fn one_conflict(e: &mut TestEndp, owner: &Name, at: StdInstant) -> usize {
+  let target = Name::try_from_str("rival-host.local.").unwrap();
+  let mut buf = std::vec![0u8; 512];
+  let n = build_instance_srv_response(&mut buf, owner, 9999, &target);
+  deliver_to_service_any(e, &buf[..n], at)
+}
+
+/// Route `pkt` and report how many service dispatches it made, to any service.
+fn deliver_to_service_any(e: &mut TestEndp, pkt: &[u8], now: StdInstant) -> usize {
+  let src: core::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
+  route_events(e, now, Received::new(src, pkt, Provenance::NotFromUs))
+    .into_iter()
+    .filter(|ev| matches!(ev, Ok(TestRoute::ToService(_))))
+    .count()
+}
+
+/// `count` conflicts, one datagram each, all at `at`.
+fn conflicts_at(e: &mut TestEndp, owner: &Name, at: StdInstant, count: usize) {
+  for _ in 0..count {
+    assert!(
+      one_conflict(e, owner, at) >= 1,
+      "each conflict datagram must reach the service that owns the name"
+    );
+  }
+}
+
+/// `now + millis`, on the test clock.
+fn after(now: StdInstant, millis: u64) -> StdInstant {
+  now
+    .checked_add(core::time::Duration::from_millis(millis))
+    .expect("the test clock represents this")
+}
+
+/// Is the floor in force? Read off the one thing it changes for a NEW record
+/// set: "each successive additional probe attempt" covers a fresh registration's
+/// first probe, so a service registered while the limit holds is scheduled five
+/// seconds out instead of at §8.1's ordinary 0-250 ms.
+fn registration_is_floored(e: &mut TestEndp, instance: &str, at: StdInstant) -> bool {
+  let recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str(instance).unwrap(),
+    Name::try_from_str("probe-host.local.").unwrap(),
+    631,
+    120,
+  );
+  let h = e
+    .try_register_service(ServiceSpec::new(recs), at)
+    .expect("registration must succeed");
+  let due = e
+    .poll_service_timeout(h)
+    .expect("a probing service is on a clock");
+  due >= after(at, 5_000)
+}
+
+/// One datagram defending one name is ONE conflict, however many records carry
+/// it — and a record the receiver reads as IDENTICAL is no conflict at all, so
+/// it must not spend the datagram's one count and leave the differing record
+/// behind it uncounted.
+///
+/// This is why the dedupe is spent AFTER classification rather than at the
+/// router's emission point: there, the identical A and the differing A are
+/// indistinguishable.
+#[test]
+fn an_identical_then_differing_address_at_one_host_counts_once() {
+  use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder};
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let ours = Ipv4Addr::new(192, 168, 1, 5);
+  let (_h, at) = flood_victim(&mut e, "Printer._ipp._tcp.local.", "h.local.", ours, now);
+  assert_eq!(e.flood_for_test().counted(), 0, "nothing yet");
+
+  let host = Name::try_from_str("h.local.").unwrap();
+  let mut buf = std::vec![0u8; 512];
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let n = {
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(&mut buf, hdr).unwrap();
+    // The address we publish ourselves — §9 says identical rdata is never a
+    // conflict — followed by one that differs.
+    b.push_a_answer(&host, 120, ours, true).unwrap();
+    b.push_a_answer(&host, 120, Ipv4Addr::new(192, 168, 1, 200), true)
+      .unwrap();
+    b.finish().unwrap()
+  };
+  deliver_to_service_any(&mut e, &buf[..n], at);
+  assert_eq!(
+    e.flood_for_test().counted(),
+    1,
+    "one datagram, one contested host name, one conflict"
+  );
+}
+
+/// …and two DIFFERENT contested names in one datagram are two conflicts. The key
+/// is `(datagram, owner name)`, not the datagram alone.
+#[test]
+fn two_contested_host_names_in_one_datagram_count_twice() {
+  use crate::wire::{DEFAULT_COMPRESSION_TABLE, Header, MessageBuilder};
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let (_a, at) = flood_victim(
+    &mut e,
+    "A._ipp._tcp.local.",
+    "ha.local.",
+    Ipv4Addr::new(192, 168, 1, 5),
+    now,
+  );
+  let (_b, at_b) = flood_victim(
+    &mut e,
+    "B._ipp._tcp.local.",
+    "hb.local.",
+    Ipv4Addr::new(192, 168, 1, 6),
+    at,
+  );
+
+  let ha = Name::try_from_str("ha.local.").unwrap();
+  let hb = Name::try_from_str("hb.local.").unwrap();
+  let mut buf = std::vec![0u8; 512];
+  let mut hdr = Header::new();
+  hdr.flags_mut().set_response();
+  let n = {
+    let mut b: MessageBuilder<'_, DEFAULT_COMPRESSION_TABLE> =
+      MessageBuilder::try_new(&mut buf, hdr).unwrap();
+    b.push_a_answer(&ha, 120, Ipv4Addr::new(10, 0, 0, 1), true)
+      .unwrap();
+    b.push_a_answer(&hb, 120, Ipv4Addr::new(10, 0, 0, 2), true)
+      .unwrap();
+    b.finish().unwrap()
+  };
+  deliver_to_service_any(&mut e, &buf[..n], at_b);
+  assert_eq!(
+    e.flood_for_test().counted(),
+    2,
+    "two contested host names are two conflicts, in one datagram or in fifty"
+  );
+}
+
+/// Two services sharing ONE host name see one arriving address as two events,
+/// and the endpoint counts it once. That is what makes the count the HOST's
+/// rather than the fan-out's — and it is exactly the aggregation a per-record-set
+/// counter could not do in either direction.
+#[test]
+fn one_address_at_a_shared_host_name_counts_once_however_many_services_hold_it() {
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let shared = Ipv4Addr::new(192, 168, 1, 5);
+  let (_a, at) = flood_victim(&mut e, "A._ipp._tcp.local.", "shared.local.", shared, now);
+  let (_b, at_b) = flood_victim(&mut e, "B._ipp._tcp.local.", "shared.local.", shared, at);
+
+  let host = Name::try_from_str("shared.local.").unwrap();
+  let mut buf = std::vec![0u8; 512];
+  let mut hdr = crate::wire::Header::new();
+  hdr.flags_mut().set_response();
+  let n = {
+    let mut b: crate::wire::MessageBuilder<'_, { crate::wire::DEFAULT_COMPRESSION_TABLE }> =
+      crate::wire::MessageBuilder::try_new(&mut buf, hdr).unwrap();
+    b.push_a_answer(&host, 120, Ipv4Addr::new(10, 0, 0, 9), true)
+      .unwrap();
+    b.finish().unwrap()
+  };
+  let dispatched = deliver_to_service_any(&mut e, &buf[..n], at_b);
+  assert_eq!(
+    dispatched, 2,
+    "precondition: both services publishing that host name are told"
+  );
+  assert_eq!(
+    e.flood_for_test().counted(),
+    1,
+    "…and the HOST saw one conflict"
+  );
+}
+
+/// The threshold, and the floor it puts under a FRESH registration's first probe.
+///
+/// Fourteen conflicts leave §8.1's ordinary 0-250 ms schedule alone — the limit
+/// exists to stop a flood, not to slow ordinary conflict resolution down. The
+/// fifteenth engages it, and it covers "each successive additional probe
+/// attempt", which includes the first probe of a record set registered a moment
+/// later. That is the bypass a per-record-set counter structurally could not
+/// close: every fresh `Service` started with an empty history, so unregistering
+/// and re-registering — the ordinary response to a terminal conflict — walked
+/// straight past the limit.
+#[test]
+fn the_fifteenth_conflict_floors_even_a_fresh_registrations_first_probe() {
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let (_h, at) = flood_victim(
+    &mut e,
+    "Printer._ipp._tcp.local.",
+    "h.local.",
+    Ipv4Addr::new(192, 168, 1, 5),
+    now,
+  );
+
+  conflicts_at(&mut e, &instance, at, 14);
+  assert_eq!(e.flood_for_test().counted(), 14);
+  assert!(
+    !registration_is_floored(&mut e, "Below._ipp._tcp.local.", at),
+    "fourteen conflicts are below the threshold, and below it §8.1's ordinary \
+     startup delay is exactly right"
+  );
+
+  assert!(one_conflict(&mut e, &instance, at) >= 1);
+  assert_eq!(e.flood_for_test().counted(), 15);
+  assert!(
+    registration_is_floored(&mut e, "Above._ipp._tcp.local.", at),
+    "the fifteenth conflict engages the limit for the whole endpoint, including \
+     a record set that has not been registered yet"
+  );
+}
+
+/// The window boundary, in both directions.
+///
+/// The release test and the span test used to disagree about exactly ten
+/// seconds: fourteen conflicts at `T` and a fifteenth at `T + 10 s` took the
+/// RELEASE path — clearing the ring the span test would then have called
+/// qualifying — so fifteen conflicts genuinely inside ten seconds did not engage
+/// the floor. Reachable in ordinary use, and especially on an embedded clock
+/// with coarse integer ticks, where landing exactly on the boundary is common
+/// rather than a measure-zero coincidence.
+#[test]
+fn fifteen_conflicts_spanning_exactly_ten_seconds_latch_and_one_millisecond_more_does_not() {
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  // 14 @ T, 1 @ T + 10 s — fifteen conflicts inside ten seconds, so the MUST
+  // applies.
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let (_h, at) = flood_victim(
+    &mut e,
+    "Printer._ipp._tcp.local.",
+    "h.local.",
+    Ipv4Addr::new(192, 168, 1, 5),
+    now,
+  );
+  conflicts_at(&mut e, &instance, at, 14);
+  let boundary = after(at, 10_000);
+  assert!(one_conflict(&mut e, &instance, boundary) >= 1);
+  assert_eq!(
+    e.flood_for_test().counted(),
+    15,
+    "the boundary conflict must be INSERTED, not treated as the start of a \
+     fresh burst"
+  );
+  assert!(
+    registration_is_floored(&mut e, "X._ipp._tcp.local.", boundary),
+    "fifteen conflicts occurred within ten seconds, so the floor is owed"
+  );
+
+  // 14 @ T, 1 @ T + 10.001 s — the fifteenth is OUTSIDE, so the burst is over
+  // and the ring starts again from it.
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let (_h, at) = flood_victim(
+    &mut e,
+    "Printer._ipp._tcp.local.",
+    "h.local.",
+    Ipv4Addr::new(192, 168, 1, 5),
+    now,
+  );
+  conflicts_at(&mut e, &instance, at, 14);
+  let past = after(at, 10_001);
+  assert!(one_conflict(&mut e, &instance, past) >= 1);
+  assert_eq!(
+    e.flood_for_test().counted(),
+    1,
+    "a whole quiet window releases the history, so this conflict is the first \
+     of a new burst"
+  );
+  assert!(
+    !registration_is_floored(&mut e, "X._ipp._tcp.local.", past),
+    "one millisecond past ten seconds is not fifteen conflicts within ten \
+     seconds"
+  );
+}
+
+/// The verdict is folded at RECEIPT, inside `Endpoint::handle`, before the
+/// iterator yields anything — so a service due at the same instant as the
+/// fifteenth conflict reads the true verdict whichever way round the driver
+/// ticks, and neither order puts a probe on the wire inside the five seconds
+/// §8.1 mandates.
+///
+/// This is the property the split ownership could not have. While a caller stood
+/// between routing and classification, "was the limit in force when this probe
+/// was scheduled" was a question about the driver's loop order.
+///
+/// Both arms that could put the first probe out are covered: `Init`, where the
+/// sequence is scheduled, and `Probing(0)`, where it is ENQUEUED. `ticked_first`
+/// says how many of the service's own deadlines were spent before the fifteenth
+/// conflict landed, which is what puts it in one arm or the other.
+#[test]
+fn a_service_due_at_the_fifteenth_conflict_is_floored_from_init_and_from_probing() {
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+
+  for ticked_first in [0usize, 1] {
+    let mut e = build_endpoint();
+    let now = StdInstant::now();
+    let (_h, at) = flood_victim(
+      &mut e,
+      "Printer._ipp._tcp.local.",
+      "h.local.",
+      Ipv4Addr::new(192, 168, 1, 5),
+      now,
+    );
+    conflicts_at(&mut e, &instance, at, 14);
+
+    // A fresh service, registered while the limit is NOT yet in force, so it
+    // takes §8.1's ordinary 0-250 ms schedule and is due almost immediately.
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("Fresh._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("fresh-host.local.").unwrap(),
+      631,
+      120,
+    );
+    let fresh = e
+      .try_register_service(ServiceSpec::new(recs), at)
+      .expect("registration must succeed");
+    let start = at;
+    let floor = after(start, 5_000);
+    let mut cur = e.poll_service_timeout(fresh).expect("Init is on a clock");
+    assert!(
+      cur < floor,
+      "precondition: below the threshold a fresh service is scheduled at \
+       §8.1's ordinary startup delay"
+    );
+
+    let mut buf = std::vec![0u8; 4096];
+    // Spend `ticked_first` of its own deadlines before the burst completes, so
+    // the fifteenth conflict lands on a service sitting in `Init` (0) or in
+    // `Probing(0)` with no probe yet on the wire (1).
+    for _ in 0..ticked_first {
+      e.handle_service_timeout(fresh, cur).unwrap();
+      assert!(
+        matches!(e.poll_service_transmit(fresh, cur, &mut buf), Ok(None)),
+        "ticked_first={ticked_first}: `Init → Probing(0)` is a free step that \
+         emits nothing"
+      );
+      cur = e
+        .poll_service_timeout(fresh)
+        .expect("Probing(0) is on a clock")
+        .max(cur);
+    }
+    assert!(cur < floor, "precondition: still scheduled inside the floor");
+
+    // The fifteenth conflict lands at the very instant this service is due.
+    assert!(one_conflict(&mut e, &instance, cur) >= 1);
+
+    // Now follow the service's own schedule. Nothing may reach a wire before the
+    // floor, and the schedule must actually converge on it rather than sliding.
+    let mut steps = 0usize;
+    while cur < floor {
+      e.handle_service_timeout(fresh, cur).unwrap();
+      assert!(
+        matches!(e.poll_service_transmit(fresh, cur, &mut buf), Ok(None)),
+        "ticked_first={ticked_first}: no probe may leave inside the five \
+         seconds §8.1 mandates"
+      );
+      cur = e
+        .poll_service_timeout(fresh)
+        .expect("a floored service is still on a clock")
+        .max(cur);
+      steps = steps.saturating_add(1);
+      assert!(
+        steps <= 4,
+        "ticked_first={ticked_first}: the floor is ABSOLUTE — re-arming to \
+         `now + 5 s` instead would push the probe out again on every tick"
+      );
+    }
+    assert!(
+      cur >= floor,
+      "ticked_first={ticked_first}: the sequence must not begin before \
+       start + 5 s"
+    );
+
+    // …and once the wait is served the sequence runs normally.
+    let mut probed = false;
+    for _ in 0..8 {
+      e.handle_service_timeout(fresh, cur).unwrap();
+      while let Ok(Some(_)) = e.poll_service_transmit(fresh, cur, &mut buf) {
+        probed = true;
+        e.note_service_delivery(fresh, cur, TransmitDelivery::ALL);
+      }
+      if probed {
+        break;
+      }
+      cur = e
+        .poll_service_timeout(fresh)
+        .expect("still on a clock")
+        .max(cur);
+    }
+    assert!(
+      probed,
+      "ticked_first={ticked_first}: the floor is a wait, not a stall"
+    );
+    assert!(
+      cur >= floor,
+      "ticked_first={ticked_first}: and the probe went out at or after it"
+    );
+  }
+}
+
+/// An ESTABLISHED name's RFC 6762 §9 conflict is counted, and it is counted
+/// BEFORE §9's own re-probe interval decides whether to act on it.
+///
+/// #139's counter counted regresses rather than conflicts, so a conflict the
+/// interval dropped was invisible to the flood limit — and the two rules are
+/// over different quantities: §9's bounds how often an established name may be
+/// sent back to probing at all, while §8.1's counts what OCCURRED. Everything
+/// §9 would drop for not being a conflict at all — identical rdata, undecodable
+/// rdata, a type this service asserts nothing of at this name — has already
+/// returned before the count is taken.
+#[test]
+fn an_established_section9_conflict_is_counted() {
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    instance.clone(),
+    Name::try_from_str("h.local.").unwrap(),
+    631,
+    120,
+  );
+  recs.add_a(Ipv4Addr::new(192, 168, 1, 5));
+  let h = e
+    .try_register_service(ServiceSpec::new(recs), now)
+    .expect("registration must succeed");
+
+  // Drive it all the way to Established, where §9 governs.
+  let mut buf = std::vec![0u8; 4096];
+  let mut at = now;
+  for _ in 0..40 {
+    at = e.poll_service_timeout(h).filter(|d| *d > at).unwrap_or(at);
+    e.handle_service_timeout(h, at).unwrap();
+    while let Ok(Some(_)) = e.poll_service_transmit(h, at, &mut buf) {
+      e.note_service_delivery(h, at, TransmitDelivery::ALL);
+    }
+    if svc_state(&e, h) == crate::ServiceState::Established {
+      break;
+    }
+  }
+  assert_eq!(svc_state(&e, h), crate::ServiceState::Established);
+
+  assert!(one_conflict(&mut e, &instance, at) >= 1);
+  assert_eq!(
+    e.flood_for_test().counted(),
+    1,
+    "a peer's authoritative SRV at an established name is §9's conflict, and \
+     §8.1 counts it"
+  );
+  // The revert has put the name back under verification, so §8.1's own rule now
+  // governs: a conflicting response arriving before the restarted sequence's
+  // first probe reaches a link "MUST be silently ignored", and an ignored
+  // conflict is not one the host may count either.
+  assert!(one_conflict(&mut e, &instance, after(at, 10)) >= 1);
+  assert_eq!(
+    e.flood_for_test().counted(),
+    1,
+    "a response §8.1 requires be ignored is not counted"
+  );
+}
+
+/// The limit comes off when the flood does, and only then: a whole ten-second
+/// window with no conflict at all.
+///
+/// A rename does NOT release it — §8.1 counts what was received, and renaming is
+/// the loop being throttled, so resetting on a rename is the one reset that
+/// would defeat the limit.
+#[test]
+fn the_flood_limit_comes_off_once_the_flood_stops() {
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let instance = Name::try_from_str("Printer._ipp._tcp.local.").unwrap();
+  let (_h, at) = flood_victim(
+    &mut e,
+    "Printer._ipp._tcp.local.",
+    "h.local.",
+    Ipv4Addr::new(192, 168, 1, 5),
+    now,
+  );
+  conflicts_at(&mut e, &instance, at, 15);
+  assert!(registration_is_floored(&mut e, "During._ipp._tcp.local.", at));
+
+  // Still in force nine seconds later: the release is a whole quiet WINDOW, not
+  // a decay.
+  assert!(
+    registration_is_floored(&mut e, "Nine._ipp._tcp.local.", after(at, 9_000)),
+    "the floor holds for as long as the flood is inside its own window"
+  );
+  // And released once a whole window has gone by with nothing at all.
+  assert!(
+    !registration_is_floored(&mut e, "Later._ipp._tcp.local.", after(at, 10_001)),
+    "a service must not be permanently slow to probe because of one bad ten \
+     seconds it had at startup"
   );
 }

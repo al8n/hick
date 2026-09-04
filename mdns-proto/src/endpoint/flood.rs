@@ -222,6 +222,14 @@ impl<I: Instant> ConflictFlood<I> {
   /// A `now` earlier than the newest entry is outside [`Instant`]'s monotonicity
   /// contract; the floor is reported NOT in force rather than armed off a
   /// reading that cannot be trusted to bound anything.
+  /// Test-only: how many conflicts the ring currently holds. The tests that
+  /// pin the dedupe key assert on this directly, because "one datagram, one
+  /// count" is a statement about the ring and not about any one service.
+  #[cfg(test)]
+  pub(crate) fn counted(&self) -> usize {
+    self.ring.iter().flatten().count()
+  }
+
   pub(crate) fn in_force(&self, now: I) -> bool {
     self.latched
       && self.newest().is_some_and(|newest| {

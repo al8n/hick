@@ -491,6 +491,44 @@ where
     }
 
 
+    /// Test-only: install what a confirmed service transmit would have mirrored
+    /// into the route, without driving a real send.
+    ///
+    /// [`Self::note_service_transmit_outcome`] does this from a live confirm, and
+    /// is where the shipped path is exercised. The rules these fixtures are about
+    /// — sibling host-address retention, and the reclaim-cancel of a superseded
+    /// detached goodbye — turn on the route state, not on how it got there, and
+    /// reaching it through a real confirm would mean driving a whole §8.3
+    /// announcement just to set two vectors and a flag.
+    ///
+    /// `fully_announced` is the ALL-delivered fact, exactly as
+    /// [`Service::has_fully_announced`](crate::service::Service::has_fully_announced)
+    /// reports it: only that gates the reclaim, because only for a link the
+    /// announcement actually reached does §10.2's cache-flush supersede the stale
+    /// records the goodbye exists to retract.
+    #[cfg(test)]
+    pub(crate) fn note_service_announced_for_test(
+      &mut self,
+      handle: ServiceHandle,
+      fully_announced: bool,
+      a: &[Ipv4Addr],
+      aaaa: &[Ipv6Addr],
+    ) {
+      let name = {
+        let Some((_, route)) = self.services.iter_mut().find(|(_, r)| r.handle() == handle) else {
+          return;
+        };
+        route.advertised_a.clear();
+        route.advertised_a.extend_from_slice(a);
+        route.advertised_aaaa.clear();
+        route.advertised_aaaa.extend_from_slice(aaaa);
+        route.name().clone()
+      };
+      if fully_announced {
+        self.reclaim_detached_goodbyes(handle, &name);
+      }
+    }
+
     /// Retire everything a fully-announced replacement at `name` SUPERSEDES of
     /// the reclaimable detached goodbyes still draining for that name — and keep
     /// what it does not.

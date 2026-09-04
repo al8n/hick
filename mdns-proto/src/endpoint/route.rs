@@ -204,12 +204,6 @@ where
   /// none of which this iterator can reach. `now` is likewise fixed for the
   /// datagram — see the field.
   pub(crate) relinquished_screen: Option<(RecordSlot, ConflictHistory)>,
-  /// How many times the screen was actually RUN, as opposed to answered from
-  /// [`Self::relinquished_screen`]. The bound this cache exists for is a
-  /// statement about work done, so it is asserted on directly rather than
-  /// inferred from a wall clock.
-  #[cfg(test)]
-  pub(crate) history_screens: usize,
 }
 
 /// Which section record the conflict fan-out is currently visiting.
@@ -463,7 +457,7 @@ where
     self.relinquished_screen = Some((slot, answer));
     #[cfg(test)]
     {
-      self.history_screens = self.history_screens.saturating_add(1);
+      self.endpoint.history_screens = self.endpoint.history_screens.saturating_add(1);
     }
     answer
   }
@@ -485,6 +479,11 @@ where
   /// reads a history that already includes it.
   fn dispatch(&mut self, key: usize, event: ServiceEvent<'_>) {
     let now = self.now;
+    #[cfg(test)]
+    if let Some(route) = self.endpoint.services.get(key) {
+      let record = super::Dispatched::new(route.handle(), &event);
+      self.endpoint.dispatched.push(record);
+    }
     // A split borrow: the route holding the `Service` and the endpoint-wide
     // flood history are disjoint fields, so both are live at once without a
     // handoff between them.

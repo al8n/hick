@@ -595,8 +595,6 @@ where
       additional_service_done: false,
       additional_query_cursor: None,
       relinquished_screen: None,
-      #[cfg(test)]
-      history_screens: 0,
       admits,
       // A datagram no permission admits yields zero events, and is handed back
       // PRE-DRAINED rather than walked. The per-arm gates below would each

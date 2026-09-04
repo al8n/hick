@@ -357,11 +357,7 @@ pub struct HostConflict<'a> {
 impl<'a> HostConflict<'a> {
   #[allow(dead_code)]
   #[inline(always)]
-  pub(crate) const fn new(
-    record: Ref<'a>,
-    origin: ConflictOrigin,
-    datagram: DatagramId,
-  ) -> Self {
+  pub(crate) const fn new(record: Ref<'a>, origin: ConflictOrigin, datagram: DatagramId) -> Self {
     Self {
       record,
       origin,

@@ -213,7 +213,7 @@ cfg_heap! {
     /// test would let a rename claim a name the route table already holds. See
     /// [`crate::Name::same_owner`].
     #[inline]
-    fn holds(&self, candidate: &crate::Name) -> bool {
+    pub(crate) fn holds(&self, candidate: &crate::Name) -> bool {
       self.names.iter().any(|n| n.same_owner(candidate))
     }
 
@@ -1043,7 +1043,7 @@ cfg_heap! {
     /// endpoint routes on this instead of a caller-supplied handle, so the fact
     /// and its subject cannot be separated.
     #[inline(always)]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) const fn handle(self) -> ServiceHandle {
       self.handle
     }
@@ -1442,6 +1442,61 @@ where
       #[cfg(test)]
       contract_assertions_off: false,
     }
+  }
+
+  /// Test-only: take `new_name` without going through a conflict.
+  ///
+  /// The shipped rename is inside [`Service::handle_timeout`], where §8.1's
+  /// defeat is spent; this is for endpoint fixtures whose subject is what a
+  /// rename does to the WITHDRAWAL lifecycle — which name is reserved, which
+  /// goodbye survives — and which have no reason to stage a probe sequence and a
+  /// peer's defence to get there.
+  #[cfg(test)]
+  pub(crate) fn rename_for_test(&mut self, new_name: crate::Name) {
+    self.records.set_instance(new_name);
+    self.reset_advertised_name_state();
+  }
+
+  /// Test-only: build a `Service` with no endpoint behind it and therefore an
+  /// EMPTY RFC 6762 §8.1 flood history.
+  ///
+  /// The flood limit is the endpoint's, and these tests exercise one record
+  /// set's own state machine. An empty history is "the limit is not in force",
+  /// which is what every test that is not about the limit means. The limit's own
+  /// behaviour is pinned against the endpoint API, where it lives.
+  #[cfg(test)]
+  pub(crate) fn for_test(
+    handle: ServiceHandle,
+    records: ServiceRecords,
+    now: I,
+    rng_seed: [u8; 32],
+    probe: bool,
+    re_announce: bool,
+  ) -> Self {
+    Self::try_new(
+      handle,
+      records,
+      now,
+      rng_seed,
+      probe,
+      re_announce,
+      &ConflictFlood::new(),
+    )
+  }
+
+  /// Test-only: drive a timeout with an empty flood history and an empty
+  /// name-in-use set. See [`Service::for_test`]; the name set is empty because
+  /// there is no route table, so every rename candidate is free.
+  #[cfg(test)]
+  pub(crate) fn tick_for_test(&mut self, now: I) -> Result<(), HandleTimeoutError> {
+    self.handle_timeout(now, &ConflictFlood::new(), &NamesInUse::EMPTY)
+  }
+
+  /// Test-only: dispatch one event with an empty flood history. See
+  /// [`Service::for_test`].
+  #[cfg(test)]
+  pub(crate) fn feed_for_test(&mut self, event: ServiceEvent<'_>, now: I) {
+    self.handle_event(event, now, &mut ConflictFlood::new());
   }
 
   /// Test-only: opt this service out of the debug-build contract assertions.

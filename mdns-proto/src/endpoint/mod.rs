@@ -593,6 +593,77 @@ impl<I, TQ, EvS> ServiceRoute<I, TQ, EvS> {
   }
 }
 
+cfg_heap! {
+  /// Test-only: one [`ServiceEvent`] the router DISPATCHED, flattened into owned
+  /// facts.
+  ///
+  /// A service event never leaves the endpoint, so a routing test cannot observe
+  /// one by iterating [`RouteEvents`] any more. It reads this instead: the
+  /// routing decision itself — which service, which kind of event, and the few
+  /// labels the fan-out attaches — recorded at the moment of dispatch, which is
+  /// the same moment the old `RouteEvent::ToService` was constructed.
+  ///
+  /// Owned rather than borrowed because it outlives the datagram's reader, and
+  /// flattened rather than storing the event because `ServiceEvent` borrows the
+  /// datagram. `cfg(test)`: it does not exist in a shipped build.
+  #[cfg(test)]
+  #[derive(Debug, Clone)]
+  pub(crate) struct Dispatched {
+    handle: ServiceHandle,
+    kind: DispatchedKind,
+    history: Option<ConflictHistory>,
+  }
+
+  /// Test-only: which [`ServiceEvent`] a [`Dispatched`] record describes.
+  #[cfg(test)]
+  #[derive(Debug, Clone, Copy, Eq, PartialEq, derive_more::IsVariant)]
+  pub(crate) enum DispatchedKind {
+    Question,
+    KnownAnswer,
+    ProbeConflict,
+    HostConflict,
+    ProbeProposal,
+  }
+
+  #[cfg(test)]
+  impl Dispatched {
+    /// Flatten one event at the instant it is dispatched.
+    fn new(handle: ServiceHandle, event: &ServiceEvent<'_>) -> Self {
+      let (kind, history) = match event {
+        ServiceEvent::Question(_) => (DispatchedKind::Question, None),
+        ServiceEvent::KnownAnswer(_) => (DispatchedKind::KnownAnswer, None),
+        ServiceEvent::ProbeConflict(pc) => (DispatchedKind::ProbeConflict, Some(pc.history())),
+        ServiceEvent::HostConflict(_) => (DispatchedKind::HostConflict, None),
+        ServiceEvent::ProbeProposal(_) => (DispatchedKind::ProbeProposal, None),
+      };
+      Self {
+        handle,
+        kind,
+        history,
+      }
+    }
+
+    /// The service this event was addressed to.
+    pub(crate) const fn handle(&self) -> ServiceHandle {
+      self.handle
+    }
+
+    /// Which event it was. Named `event` because that is the question a routing
+    /// test asks of a dispatch, and the answer is the whole of what a
+    /// `ServiceEvent` was ever inspected for out here.
+    pub(crate) const fn event(&self) -> DispatchedKind {
+      self.kind
+    }
+
+    /// The RFC 6762 §9 relinquished-history label a conflict carried.
+    pub(crate) const fn history(&self) -> Option<ConflictHistory> {
+      self.history
+    }
+
+
+  }
+}
+
 /// Internal queued endpoint event.
 #[derive(Debug, Clone)]
 pub struct EndpointEventEntry(EndpointEvent);
@@ -675,6 +746,18 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS> {
   /// [`RouteEvents::next`], at the RECEIPT instant and after classification;
   /// read by every point that schedules a probe sequence.
   flood: ConflictFlood<I>,
+  /// Test-only: how many times the relinquished-history screen was actually RUN,
+  /// as opposed to answered from `RouteEvents`' per-record cache. The bound that
+  /// cache exists for is a statement about work done, so it is asserted on
+  /// directly rather than inferred from a wall clock. `cfg(test)`: absent from a
+  /// shipped build.
+  #[cfg(test)]
+  pub(crate) history_screens: usize,
+  /// Test-only: every [`ServiceEvent`] this endpoint has dispatched, in order.
+  /// See [`Dispatched`]; a routing test reads this because a service event is no
+  /// longer observable from outside. `cfg(test)`: absent from a shipped build.
+  #[cfg(test)]
+  pub(crate) dispatched: std::vec::Vec<Dispatched>,
   /// Scratch for the instance names a rename must avoid, refilled from the route
   /// table on the ticks a rename is actually imminent.
   ///
@@ -775,6 +858,10 @@ where
       next_txid,
       datagram_seq: 0,
       flood: ConflictFlood::new(),
+      #[cfg(test)]
+      history_screens: 0,
+      #[cfg(test)]
+      dispatched: std::vec::Vec::new(),
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       rename_scratch: std::vec::Vec::new(),
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]

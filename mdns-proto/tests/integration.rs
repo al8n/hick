@@ -6,7 +6,7 @@
 use std::{net::Ipv4Addr, time::Instant as StdInstant};
 
 use mdns_proto::{
-  CollectedAnswer, FamilyAttempt, Name, Query, QueryHandle, Service,
+  CollectedAnswer, FamilyAttempt, Name, Query, QueryHandle, ServiceHandle,
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec, ServiceSpec},
   endpoint::{Endpoint, EndpointEventEntry, Provenance, Received, ServiceRoute},
@@ -22,15 +22,16 @@ type Endp = Endpoint<
   StdInstant,
   rand::rngs::StdRng,
   slab::Slab<CacheEntry<StdInstant>>,
-  slab::Slab<ServiceRoute>,
+  slab::Slab<ServiceRoute<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>>,
   slab::Slab<TestQuery>,
   slab::Slab<EndpointEventEntry>,
   slab::Slab<CollectedAnswer>,
   slab::Slab<QueryUpdate>,
+  slab::Slab<Transmit>,
+  slab::Slab<ServiceUpdate>,
 >;
-type Svc = Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>;
 
-fn build_responder() -> (Endp, Svc) {
+fn build_responder() -> (Endp, ServiceHandle) {
   use rand::SeedableRng;
   let rng = rand::rngs::StdRng::from_seed([0u8; 32]);
   let mut e = Endp::try_new(EndpointConfig::new(), rng);
@@ -40,10 +41,8 @@ fn build_responder() -> (Endp, Svc) {
   let mut recs = ServiceRecords::new(stype, inst, host, 631, 120);
   recs.add_a(Ipv4Addr::new(192, 168, 1, 10));
   let now = StdInstant::now();
-  let (_h, svc) = e
-    .try_register_service::<slab::Slab<Transmit>, _>(ServiceSpec::new(recs), now)
-    .unwrap();
-  (e, svc)
+  let h = e.try_register_service(ServiceSpec::new(recs), now).unwrap();
+  (e, h)
 }
 
 fn build_querier() -> (Endp, QueryHandle) {
@@ -59,8 +58,8 @@ fn build_querier() -> (Endp, QueryHandle) {
 
 #[test]
 fn responder_starts_in_init_state() {
-  let (_, svc) = build_responder();
-  assert!(svc.state().is_init());
+  let (e, h) = build_responder();
+  assert!(e.service(h).unwrap().state().is_init());
 }
 
 #[test]
@@ -77,7 +76,7 @@ fn querier_emits_question_on_first_poll() {
 #[test]
 fn responder_advances_through_states_with_time() {
   use std::time::Duration;
-  let (_, mut svc) = build_responder();
+  let (mut e, h) = build_responder();
   // Push the clock forward in 300 ms increments to bypass the initial
   // 0–250 ms random wait and three subsequent 250 ms probe intervals.
   // probes (like announcements) advance only on a CONFIRMED send, so
@@ -86,9 +85,10 @@ fn responder_advances_through_states_with_time() {
   let mut buf = [0u8; 1500];
   for _ in 0..10 {
     now += Duration::from_millis(300);
-    let _ = svc.handle_timeout(now);
-    while svc.poll_transmit(now, &mut buf).unwrap().is_some() {
-      let _ = svc.note_transmit_outcome(
+    let _ = e.handle_service_timeout(h, now);
+    while e.poll_service_transmit(h, now, &mut buf).unwrap().is_some() {
+      let _ = e.note_service_transmit_outcome(
+        h,
         now,
         FamilyAttempt::Accepted { at: now },
         FamilyAttempt::Accepted { at: now },
@@ -98,9 +98,9 @@ fn responder_advances_through_states_with_time() {
   // After enough probe + announce ticks, we expect the service to have
   // moved past Init/Probing.
   assert!(
-    svc.state().is_announcing() || svc.state().is_established(),
+    e.service(h).unwrap().state().is_announcing() || e.service(h).unwrap().state().is_established(),
     "state was {:?}",
-    svc.state()
+    e.service(h).unwrap().state()
   );
 }
 
@@ -115,16 +115,10 @@ fn duplicate_service_registration_rejected() {
   let recs1 = ServiceRecords::new(stype.clone(), inst.clone(), host.clone(), 631, 120);
   let now = StdInstant::now();
   let _r1 = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs1),
-      now,
-    )
+    .try_register_service(ServiceSpec::new(recs1), now)
     .unwrap();
   let recs2 = ServiceRecords::new(stype, inst, host, 631, 120);
-  let r2 = e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-    ServiceSpec::new(recs2),
-    now,
-  );
+  let r2 = e.try_register_service(ServiceSpec::new(recs2), now);
   assert!(r2.is_err());
   let err = r2.err().expect("expected Err but got Ok");
   assert!(err.is_name_already_registered());
@@ -136,21 +130,21 @@ fn duplicate_service_registration_rejected() {
 fn service_polls_one_transmit_per_deadline() {
   use std::time::Duration;
 
-  let (_, mut svc) = build_responder();
+  let (mut e, h) = build_responder();
   let now = StdInstant::now();
 
   // First tick: Init -> Probing(0); schedules a probe delay (0-250 ms).
   // No transmit yet -- the probe fires when that delay elapses.
   let now1 = now + Duration::from_millis(300);
-  svc.handle_timeout(now1).unwrap();
+  e.handle_service_timeout(h, now1).unwrap();
   assert!(
-    svc.state().is_probing(),
+    e.service(h).unwrap().state().is_probing(),
     "expected Probing state after first tick"
   );
 
   let mut buf = [0u8; 1500];
   // poll_transmit returns None because transmit_pending is still false.
-  let before_probe = svc.poll_transmit(now1, &mut buf).unwrap();
+  let before_probe = e.poll_service_transmit(h, now1, &mut buf).unwrap();
   assert!(
     before_probe.is_none(),
     "expected no transmit before probe delay fires"
@@ -158,14 +152,14 @@ fn service_polls_one_transmit_per_deadline() {
 
   // Second tick: advance past the probe delay to fire the Probing(0) deadline.
   let now2 = now1 + Duration::from_millis(300);
-  svc.handle_timeout(now2).unwrap();
+  e.handle_service_timeout(h, now2).unwrap();
 
   // First poll_transmit: transmit_pending was set by handle_timeout -> Some.
-  let first = svc.poll_transmit(now2, &mut buf).unwrap();
+  let first = e.poll_service_transmit(h, now2, &mut buf).unwrap();
   assert!(first.is_some(), "expected first probe transmit");
 
   // Second poll_transmit at the same tick: transmit_pending is now false -> None.
-  let second = svc.poll_transmit(now2, &mut buf).unwrap();
+  let second = e.poll_service_transmit(h, now2, &mut buf).unwrap();
   assert!(second.is_none(), "expected no second transmit at same tick");
 }
 
@@ -176,7 +170,7 @@ fn service_polls_one_transmit_per_deadline() {
 #[test]
 fn service_emits_three_probes_before_announcement() {
   use std::time::Duration;
-  let (_, mut svc) = build_responder();
+  let (mut e, h) = build_responder();
   let mut now = StdInstant::now();
   let mut buf = [0u8; 1500];
   let mut probes_emitted = 0u32;
@@ -188,8 +182,8 @@ fn service_emits_three_probes_before_announcement() {
   // report delivery for each emitted datagram (as the driver does).
   for _ in 0..30 {
     now += Duration::from_millis(100);
-    svc.handle_timeout(now).unwrap();
-    while let Some(tx) = svc.poll_transmit(now, &mut buf).unwrap() {
+    e.handle_service_timeout(h, now).unwrap();
+    while let Some(tx) = e.poll_service_transmit(h, now, &mut buf).unwrap() {
       let msg = &buf[..tx.size()];
       let reader = mdns_proto::wire::MessageReader::try_parse(msg).unwrap();
       let hdr = reader.header();
@@ -198,7 +192,8 @@ fn service_emits_three_probes_before_announcement() {
       } else if hdr.flags().is_response() && hdr.answer_count() >= 1 {
         announcements_emitted = announcements_emitted.saturating_add(1);
       }
-      let _ = svc.note_transmit_outcome(
+      let _ = e.note_service_transmit_outcome(
+        h,
         now,
         FamilyAttempt::Accepted { at: now },
         FamilyAttempt::Accepted { at: now },
@@ -220,15 +215,16 @@ fn service_emits_three_probes_before_announcement() {
   // Continue for up to another 3 seconds and confirm at least one announcement.
   for _ in 0..30 {
     now += Duration::from_millis(100);
-    svc.handle_timeout(now).unwrap();
-    while let Some(tx) = svc.poll_transmit(now, &mut buf).unwrap() {
+    e.handle_service_timeout(h, now).unwrap();
+    while let Some(tx) = e.poll_service_transmit(h, now, &mut buf).unwrap() {
       let msg = &buf[..tx.size()];
       let reader = mdns_proto::wire::MessageReader::try_parse(msg).unwrap();
       let hdr = reader.header();
       if hdr.flags().is_response() && hdr.answer_count() >= 1 {
         announcements_emitted = announcements_emitted.saturating_add(1);
       }
-      let _ = svc.note_transmit_outcome(
+      let _ = e.note_service_transmit_outcome(
+        h,
         now,
         FamilyAttempt::Accepted { at: now },
         FamilyAttempt::Accepted { at: now },
@@ -445,33 +441,22 @@ fn r37_unregister_service_allows_reregister_same_name() {
 
   let recs = ServiceRecords::new(stype.clone(), inst.clone(), host.clone(), 631, 120);
   let now = StdInstant::now();
-  let (h, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      now,
-    )
-    .unwrap();
+  let h = e.try_register_service(ServiceSpec::new(recs), now).unwrap();
 
   // Second register with same name is rejected.
   let recs2 = ServiceRecords::new(stype.clone(), inst.clone(), host.clone(), 631, 120);
-  let result2 = e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-    ServiceSpec::new(recs2),
-    now,
-  );
+  let result2 = e.try_register_service(ServiceSpec::new(recs2), now);
   match result2 {
     Err(e) => assert!(e.is_name_already_registered()),
     Ok(_) => panic!("must reject duplicate name"),
   }
 
   // Unregister and re-register: this must succeed.
-  let removed = e.unregister_service(h, None, now);
-  assert!(removed, "unregister must report a removal");
+  let removed = e.force_remove_service(h, now);
+  assert!(removed, "force-removal must report a removal");
 
   let recs3 = ServiceRecords::new(stype, inst, host, 631, 120);
-  let (h2, _svc2) = match e.try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-    ServiceSpec::new(recs3),
-    now,
-  ) {
+  let h2 = match e.try_register_service(ServiceSpec::new(recs3), now) {
     Ok(ok) => ok,
     Err(_) => panic!("re-register after unregister must succeed"),
   };
@@ -492,19 +477,14 @@ fn r37_double_unregister_is_idempotent() {
     120,
   );
   let now = StdInstant::now();
-  let (h, _svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      now,
-    )
-    .unwrap();
+  let h = e.try_register_service(ServiceSpec::new(recs), now).unwrap();
   assert!(
-    e.unregister_service(h, None, now),
-    "first unregister removes the route"
+    e.force_remove_service(h, now),
+    "the first force-removal removes the route"
   );
   assert!(
-    !e.unregister_service(h, None, now),
-    "second unregister of the same handle is a no-op"
+    !e.force_remove_service(h, now),
+    "a second force-removal of the same handle is a no-op"
   );
 }
 

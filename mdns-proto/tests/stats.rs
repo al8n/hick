@@ -11,7 +11,7 @@ use std::{net::Ipv4Addr, time::Instant as StdInstant};
 use std::time::Duration;
 
 use mdns_proto::{
-  CollectedAnswer, FamilyAttempt, Name, Query,
+  CollectedAnswer, FamilyAttempt, Name, Query, ServiceHandle,
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec, ServiceSpec},
   endpoint::{Endpoint, EndpointEventEntry, Provenance, Received, ServiceRoute},
@@ -27,11 +27,13 @@ type Endp = Endpoint<
   StdInstant,
   rand::rngs::StdRng,
   slab::Slab<CacheEntry<StdInstant>>,
-  slab::Slab<ServiceRoute>,
+  slab::Slab<ServiceRoute<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>>,
   slab::Slab<TestQuery>,
   slab::Slab<EndpointEventEntry>,
   slab::Slab<CollectedAnswer>,
   slab::Slab<QueryUpdate>,
+  slab::Slab<Transmit>,
+  slab::Slab<ServiceUpdate>,
 >;
 
 fn make_endpoint(seed: u8) -> Endp {
@@ -75,12 +77,7 @@ fn stats_services_registered() {
   let mut recs = ServiceRecords::new(stype, inst, host, 631, 120);
   recs.add_a(Ipv4Addr::new(192, 168, 1, 42));
   let now = StdInstant::now();
-  let _ = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      now,
-    )
-    .unwrap();
+  let _ = e.try_register_service(ServiceSpec::new(recs), now).unwrap();
 
   let snap = e.stats();
   assert!(
@@ -184,12 +181,7 @@ fn stats_combined_exchange() {
   recs.add_a(Ipv4Addr::new(10, 0, 0, 1));
   let now = StdInstant::now();
 
-  let _ = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      now,
-    )
-    .unwrap();
+  let _ = e.try_register_service(ServiceSpec::new(recs), now).unwrap();
 
   // Feed an answer response.
   let _qh = e
@@ -222,10 +214,7 @@ fn stats_combined_exchange() {
 
 /// Helper: build a service that bypasses the probe sequence (starts directly
 /// in `Announcing`), registered via an `Endpoint` so stats are attached.
-fn make_no_probe_endpoint() -> (
-  Endp,
-  mdns_proto::Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
-) {
+fn make_no_probe_endpoint() -> (Endp, ServiceHandle) {
   use rand::SeedableRng;
   let rng = rand::rngs::StdRng::from_seed([7u8; 32]);
   let cfg = EndpointConfig::new().with_probe_unique_names(false);
@@ -236,26 +225,21 @@ fn make_no_probe_endpoint() -> (
   let mut recs = ServiceRecords::new(stype, inst, host, 631, 120);
   recs.add_a(Ipv4Addr::new(10, 0, 1, 1));
   let now = StdInstant::now();
-  let (_h, svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      now,
-    )
-    .unwrap();
-  (e, svc)
+  let h = e.try_register_service(ServiceSpec::new(recs), now).unwrap();
+  (e, h)
 }
 
 /// Helper: advance `now` far enough that the service fires its next deadline,
 /// call `handle_timeout`, then return `(ok_tx, now)` where `ok_tx` is whether
 /// `poll_transmit` produced a datagram.
-fn tick(
-  svc: &mut mdns_proto::Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
-  now: StdInstant,
-) -> (bool, StdInstant) {
+fn tick(e: &mut Endp, h: ServiceHandle, now: StdInstant) -> (bool, StdInstant) {
   let advanced = now + Duration::from_millis(1100);
-  svc.handle_timeout(advanced).unwrap();
+  e.handle_service_timeout(h, advanced).unwrap();
   let mut buf = vec![0u8; 4096];
-  let ok = svc.poll_transmit(advanced, &mut buf).unwrap().is_some();
+  let ok = e
+    .poll_service_transmit(h, advanced, &mut buf)
+    .unwrap()
+    .is_some();
   (ok, advanced)
 }
 
@@ -265,16 +249,17 @@ fn tick(
 /// have advanced.
 #[test]
 fn tx_counters_stay_zero_on_all_socket_failure() {
-  let (e, mut svc) = make_no_probe_endpoint();
+  let (mut e, h) = make_no_probe_endpoint();
 
   // Drive two announce cycles (service starts in Announcing; the no-probe
   // config fires the first announce at delay=0, the second at +1 s).
   let mut now = StdInstant::now();
   for _ in 0..6 {
-    let (ok, next) = tick(&mut svc, now);
+    let (ok, next) = tick(&mut e, h, now);
     now = next;
     if ok {
-      let _ = svc.note_transmit_outcome(
+      let _ = e.note_service_transmit_outcome(
+        h,
         now,
         FamilyAttempt::Refused { permanent: false },
         FamilyAttempt::Refused { permanent: false },
@@ -322,32 +307,30 @@ fn tx_counters_advance_on_confirmed_delivery() {
   let mut recs = ServiceRecords::new(stype, inst, host, 80, 120);
   recs.add_a(Ipv4Addr::new(10, 0, 2, 2));
   let start = StdInstant::now();
-  let (_h, mut svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      start,
-    )
+  let h = e
+    .try_register_service(ServiceSpec::new(recs), start)
     .unwrap();
 
   // Pump until Established, confirming every send.
   let mut now = start;
   for _ in 0..20 {
     now += Duration::from_millis(1100);
-    svc.handle_timeout(now).unwrap();
+    e.handle_service_timeout(h, now).unwrap();
     let mut buf = vec![0u8; 4096];
-    if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
-      let _ = svc.note_transmit_outcome(
+    if e.poll_service_transmit(h, now, &mut buf).unwrap().is_some() {
+      let _ = e.note_service_transmit_outcome(
+        h,
         now,
         FamilyAttempt::Accepted { at: now },
         FamilyAttempt::Accepted { at: now },
       );
     }
-    if svc.state() == mdns_proto::ServiceState::Established {
+    if e.service(h).unwrap().state() == mdns_proto::ServiceState::Established {
       break;
     }
   }
   assert_eq!(
-    svc.state(),
+    e.service(h).unwrap().state(),
     mdns_proto::ServiceState::Established,
     "service must reach Established within 20 ticks"
   );
@@ -389,11 +372,8 @@ fn excused_rounds_do_not_count_as_delivered_transmits() {
   let mut recs = ServiceRecords::new(stype, inst, host, 80, 120);
   recs.add_a(Ipv4Addr::new(10, 0, 2, 3));
   let start = StdInstant::now();
-  let (_h, mut svc) = e
-    .try_register_service::<slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>(
-      ServiceSpec::new(recs),
-      start,
-    )
+  let h = e
+    .try_register_service(ServiceSpec::new(recs), start)
     .unwrap();
 
   // Every round is partially delivered, so the lifecycle only ever moves on an
@@ -401,21 +381,22 @@ fn excused_rounds_do_not_count_as_delivered_transmits() {
   let mut now = start;
   for _ in 0..200 {
     now += Duration::from_millis(1100);
-    svc.handle_timeout(now).unwrap();
+    e.handle_service_timeout(h, now).unwrap();
     let mut buf = vec![0u8; 4096];
-    if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
-      let _ = svc.note_transmit_outcome(
+    if e.poll_service_transmit(h, now, &mut buf).unwrap().is_some() {
+      let _ = e.note_service_transmit_outcome(
+        h,
         now,
         FamilyAttempt::Accepted { at: now },
         FamilyAttempt::Refused { permanent: false },
       );
     }
-    if svc.state() == mdns_proto::ServiceState::Established {
+    if e.service(h).unwrap().state() == mdns_proto::ServiceState::Established {
       break;
     }
   }
   assert_eq!(
-    svc.state(),
+    e.service(h).unwrap().state(),
     mdns_proto::ServiceState::Established,
     "the bound must carry a permanently half-delivered service to Established"
   );
@@ -433,7 +414,7 @@ fn excused_rounds_do_not_count_as_delivered_transmits() {
     snap.announcements_tx
   );
   assert!(
-    !svc.has_fully_announced().get(),
+    !e.service(h).unwrap().has_fully_announced().get(),
     "and the reclaim-cancel gate stays shut for the same reason"
   );
 }
