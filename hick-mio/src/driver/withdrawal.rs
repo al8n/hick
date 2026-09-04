@@ -108,8 +108,8 @@ impl Mdns {
   ///
   /// Also the single place a goodbye is *begun*. `unregister_service` and
   /// `shutdown` hand theirs over directly, but the pipeline retires services on
-  /// its own — an encode-failure escalation, a conflict, a rename collision —
-  /// and those sites only mark the context. Scanning here for "retired but not
+  /// its own — an encode-failure escalation, a conflict — and those sites only
+  /// mark the context. Scanning here for "retired but not
   /// begun" means no retirement site can leak a route by forgetting to start the
   /// goodbye, which is what lets those sites leave a retired service holding its
   /// context and route.

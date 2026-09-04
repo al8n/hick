@@ -1,5 +1,6 @@
-//! Background driver task. Owns the [`mdns_proto::Endpoint`] + per-service /
-//! per-query state machines and pumps the I/O loop.
+//! Background driver task. Owns the [`mdns_proto::Endpoint`] — which itself
+//! owns every `Service` and `Query` state machine — plus the driver-side
+//! per-service / per-query bookkeeping, and pumps the I/O loop.
 
 use std::{
   collections::HashMap,
@@ -22,16 +23,15 @@ use hick_udp::{
 };
 use mdns_proto::{
   FamilyAttempt, Provenance, QueryHandle, QuerySpec, Received, ServiceHandle, ServiceSpec,
-  ServiceUpdate, TransmitConfirm, endpoint::FamilyDebt, event::RouteEvent,
+  ServiceUpdate, endpoint::FamilyDebt,
 };
 use rand::{SeedableRng, rngs::StdRng};
-use slab::Slab;
 
 use crate::{
   command::{Command, QueryStarted, ServiceRegistered},
   error::{RegisterError, StartQueryError},
   options::ServerOptions,
-  proto::{ProtoEndpoint, ProtoService},
+  proto::ProtoEndpoint,
   query::{QueryMailbox, new_mailbox},
   service::{ServiceMailbox, new_service_mailbox},
 };
@@ -158,8 +158,13 @@ struct Packet {
 }
 
 /// Driver-side state for a single registered service.
+///
+/// The `Service` state machine itself is NOT here: the endpoint owns it, keyed
+/// by the same [`ServiceHandle`] this map is keyed by, and every drive of it
+/// goes through an `endpoint.*_service*` method. What lives here is the state
+/// the endpoint has no business holding — the delivery mailbox, the retirement
+/// flag, the per-family wire gate, and the encode-failure counter.
 struct ServiceCtx {
-  proto: ProtoService,
   /// bounded/coalescing delivery buffer shared with the `Service` handle. The
   /// driver fills it (`push_update` for non-terminal updates, `set_terminal`
   /// for the `Conflict`/`HostConflict` retirement update) and rings `doorbell`.
@@ -180,7 +185,7 @@ struct ServiceCtx {
   encode_failures: u8,
   /// Set when this service has been RETIRED into an endpoint-owned RFC 6762
   /// §10.1 withdrawal (graceful unregister/drop, an encode-failure escalation,
-  /// or a rename-collision teardown). The proto state machine is finished, so
+  /// or a terminal conflict). The service's state machine is finished, so
   /// every subsequent loop skips it for transmits, deadlines, and the
   /// orphan-sweep — but the ctx is KEPT (the endpoint holds the route, reserving
   /// the name) until [`Endpoint::drain_completed_withdrawals`] reports the
@@ -350,7 +355,7 @@ impl<N: Net> DriverState<N> {
   /// Endpoint-owned withdrawal deadlines (the next due goodbye round and the 2 s
   /// anti-pin ceiling) are already folded into [`Endpoint::poll_timeout`], so the
   /// driver no longer tracks them here. A `withdrawing` service is skipped: its
-  /// proto state machine is finished, and its withdrawal schedule lives in the
+  /// service state machine is finished, and its withdrawal schedule lives in the
   /// endpoint.
   /// The earliest endpoint-owned WITHDRAWAL deadline (next due goodbye round or
   /// the 2 s anti-pin ceiling), or `None` when no withdrawal is in flight —
@@ -364,11 +369,11 @@ impl<N: Net> DriverState<N> {
 
   fn next_deadline(&self) -> Option<StdInstant> {
     let mut best: Option<StdInstant> = self.endpoint.poll_timeout();
-    for ctx in self.services.values() {
+    for (handle, ctx) in self.services.iter() {
       if ctx.withdrawing {
         continue;
       }
-      if let Some(t) = ctx.proto.poll_timeout() {
+      if let Some(t) = self.endpoint.poll_service_timeout(*handle) {
         best = Some(min_opt(best, t));
       }
     }
@@ -389,18 +394,19 @@ impl<N: Net> DriverState<N> {
         // orphan Service is left probing/announcing without a handle.
         //
         // The renamed-away old-name goodbye this registration RECLAIMS is no longer
-        // cancelled at register time: the reclaim-cancel moved to the endpoint's
-        // CANCEL-ON-ANNOUNCE (`note_service_announced`), a certain live event, so a
-        // dropped registration here cannot lose it — an orphan that never announces
-        // simply lets the old goodbye complete. The rollback therefore
-        // only removes the orphan service.
+        // cancelled at register time: the reclaim-cancel lives in the endpoint's
+        // CANCEL-ON-ANNOUNCE (inside `note_service_transmit_outcome`), a certain
+        // live event, so a dropped registration here cannot lose it — an orphan
+        // that never announces simply lets the old goodbye complete. The rollback
+        // therefore only removes the orphan service.
         let result = self.register_service(spec, now);
         if let Ok(ref ok) = result {
           let handle = ok.handle;
           if let Err(returned) = reply.send(result) {
             // returned is the (now-unowned) Result<ServiceRegistered, _>;
             // dropping it drops the receiver half of the per-handle channel, but the
-            // proto Service still lives in our map until we GC it here.
+            // endpoint still holds the route (and the `Service` in it) until the
+            // retirement here frees it.
             drop(returned);
             self.remove_service(handle, now);
             hick_trace::debug!(
@@ -455,9 +461,7 @@ impl<N: Net> DriverState<N> {
     spec: ServiceSpec,
     now: StdInstant,
   ) -> Result<ServiceRegistered, RegisterError> {
-    let (handle, svc) = self
-      .endpoint
-      .try_register_service::<Slab<_>, Slab<_>>(spec, now)?;
+    let handle = self.endpoint.try_register_service(spec, now)?;
     // NO SUPERSEDE HERE. A registration only INSERTS a route: it mutates no
     // record this endpoint has already asserted, positive or negative, so every
     // credit in the log still describes a state this endpoint is in. See
@@ -475,7 +479,6 @@ impl<N: Net> DriverState<N> {
     self.services.insert(
       handle,
       ServiceCtx {
-        proto: svc,
         mailbox: Arc::clone(&mailbox),
         doorbell: doorbell_tx,
         encode_failures: 0,
@@ -833,12 +836,7 @@ impl<N: Net> DriverState<N> {
     // collected inside the window.
     let now = StdInstant::now();
 
-    // Split-borrow: endpoint and services are disjoint fields.
-    let Self {
-      endpoint, services, ..
-    } = self;
-
-    let route_events = match endpoint.handle(
+    let route_events = match self.endpoint.handle(
       now,
       Received::new(pkt.src, pkt.rx.body(), provenance)
         .with_interface(interface_index)
@@ -853,21 +851,9 @@ impl<N: Net> DriverState<N> {
 
     for ev in route_events {
       match ev {
-        Ok(RouteEvent::ToService(ts)) => {
-          // Defense-in-depth for the no-dispatch-after-retirement invariant: the
-          // endpoint already skips withdrawing routes in every ToService path
-          // (question, conflict, known-answer), so this guards against a future
-          // dispatch regression feeding events into a proto whose updates the
-          // driver no longer drains — which would let a peer grow the proto event
-          // slab of a retiring service until GC.
-          if let Some(ctx) = services.get_mut(&ts.handle())
-            && !ctx.withdrawing
-          {
-            ctx.proto.handle_event(ts.into_event(), now);
-          }
-        }
-        // ToQuery answers are dispatched inside endpoint.handle();
-        // CacheUpdated is a future hook for cache subscribers; any new
+        // ToService and ToQuery are both dispatched inside endpoint.handle(),
+        // at this datagram's receipt instant, to state machines the endpoint
+        // owns; CacheUpdated is a future hook for cache subscribers; any new
         // RouteEvent variant added by mdns-proto is ignored until we wire
         // it up here.
         Ok(_) => {}
@@ -881,19 +867,23 @@ impl<N: Net> DriverState<N> {
 
   fn fire_timeouts(&mut self, now: StdInstant) {
     let _ = self.endpoint.handle_timeout(now);
-    for ctx in self.services.values_mut() {
-      // Don't tick a withdrawing service's proto: its lifecycle is finished and
-      // its goodbye schedule lives in the endpoint, so driving the dead driver
-      // proto here is pure waste. Mirrors the smoltcp/compio timeout paths, which
-      // skip errored/cancelled services.
+    // Split-borrow `endpoint` from `services` so the sweep iterates the service
+    // map in place — `handle_service_timeout` touches only the disjoint
+    // `endpoint` field — instead of snapshotting every handle into a fresh
+    // per-tick Vec.
+    let Self {
+      endpoint, services, ..
+    } = &mut *self;
+    for (&h, ctx) in services.iter() {
+      // Don't tick a withdrawing service: its lifecycle is finished and its
+      // goodbye schedule lives in the endpoint, so driving the dead state
+      // machine here is pure waste. Mirrors the smoltcp/compio timeout paths,
+      // which skip errored/cancelled services.
       if ctx.withdrawing {
         continue;
       }
-      let _ = ctx.proto.handle_timeout(now);
+      let _ = endpoint.handle_service_timeout(h, now);
     }
-    // Split-borrow `endpoint` from `queries` so the sweep iterates the query map
-    // in place — `handle_query_timeout` touches only the disjoint `endpoint`
-    // field — instead of snapshotting every handle into a fresh per-tick Vec.
     let Self {
       endpoint, queries, ..
     } = &mut *self;
@@ -909,12 +899,12 @@ impl<N: Net> DriverState<N> {
   /// (Established / Renamed / Conflict / HostConflict / Terminal) reach
   /// the caller as long as the receiver is alive.
   ///
-  /// (auto-rename routing): when
-  /// [`ServiceUpdate::Renamed`] is observed, update the endpoint's route
-  /// table BEFORE forwarding the event so callers can safely re-issue
-  /// queries at the new name. If the new name collides with another
-  /// registered service (proto returns `NameAlreadyRegistered`), drop the
-  /// service and emit a synthesized `Conflict` instead of a `Renamed`.
+  /// (auto-rename routing): [`ServiceUpdate::Renamed`] is a NOTIFICATION and
+  /// nothing more. The endpoint chose a name its own route table does not hold
+  /// and mirrored it into the route in the same borrow, so routing is already
+  /// consistent when the update surfaces here and a caller may re-issue queries
+  /// at the new name at once. There is no collision left for this driver to
+  /// reconcile and no old-name goodbye left for it to enqueue.
   ///
   /// (orphan sweep): also GC handles whose receiver has been
   /// closed even when there is no event to push (e.g. caller dropped a
@@ -939,7 +929,7 @@ impl<N: Net> DriverState<N> {
 
       // Service updates.
       for (handle, ctx) in services.iter_mut() {
-        // A service already withdrawing has a finished proto state machine and
+        // A service already withdrawing has a finished state machine and
         // the endpoint owns its goodbye schedule; skip it (the ctx is GC'd by
         // `drain_withdrawals` once the withdrawal completes).
         if ctx.withdrawing {
@@ -951,88 +941,41 @@ impl<N: Net> DriverState<N> {
           removed_services.push(*handle);
           continue;
         }
-        while let Some(upd) = ctx.proto.poll() {
-          // keep endpoint routing consistent on
-          // auto-rename. If the proto rejects the new name (already owned by
-          // another local service), the Service has already mutated its
-          // records — we cannot safely keep it. Emit Conflict, then remove.
-          let final_upd = match upd {
-            ServiceUpdate::Renamed(ref renamed) => {
-              // A §9 auto-rename is a PUBLISHED-RECORD MUTATION: the proto
-              // called `Service::set_instance` before it emitted this update, so
-              // every credit recorded under the abandoned instance name
-              // describes a state this endpoint has left. Advance at the
-              // mutation, and UNCONDITIONALLY — the collision arm below is
-              // retired through `begin_service_withdrawal`, which supersedes as
-              // well, but a SURVIVING rename crosses no other seam at all. The
-              // vacated name can then be taken by another local service, and
-              // THAT registration advances nothing whatever — a registration
-              // mutates no record this endpoint has already asserted — so
-              // without the advance here a delayed echo of the abandoned owner
-              // would still read as current, adjudicate, and defeat the new
-              // holder under RFC 6762 §8.1. See `SelfSendTracker::supersede`.
-              selfsend.supersede();
-              let rename_result =
-                endpoint.handle_service_renamed(*handle, renamed.new_name().clone());
-              // The §9 rename of an announced service hands its OLD-name TTL=0
-              // goodbye off as an INDEPENDENT detached withdrawal item, both for a
-              // SURVIVING rename and a COLLISION teardown. Take it the instant the
-              // rename is observed and enqueue it on the endpoint — the Service no
-              // longer drains the old-name goodbye itself.
-              if let Some(h) = ctx.proto.take_rename_goodbye_handoff() {
-                // A rename COLLISION (rename_result Err) tears the service down: its
-                // old name must HOLD until the goodbye completes, because the dead
-                // service will never re-announce and the goodbye is the only
-                // retraction the old name will ever get.
-                //
-                // A SURVIVING rename stays RECLAIMABLE. That is sound only because
-                // the sole thing that can cancel a reclaimable goodbye —
-                // `Endpoint::note_service_announced` — is gated on
-                // `Service::has_fully_announced`: a complete §8.3 announcement of
-                // the reclaiming name that reached EVERY family this driver still
-                // obligates. For each such family §10.2's cache-flush announcement
-                // supersedes the stale unique records the goodbye exists to retract,
-                // so cancelling loses nothing. A partially-delivered replacement
-                // announcement leaves the gate shut and the old goodbye keeps
-                // draining its per-family debt — which is exactly the case where the
-                // unserved family has heard neither the goodbye nor the replacement.
-                endpoint.enqueue_rename_withdrawal(h, now, rename_result.is_err());
-              }
-              match rename_result {
-                Ok(()) => upd,
-                Err(_) => {
-                  // The new name collides with another local service; the Service
-                  // has already rebranded and can't be kept. Synthesize a terminal
-                  // Conflict and fall through to the UNIFIED retirement below — the
-                  // OLD name's goodbye was already enqueued above as its own
-                  // detached item.
-                  hick_trace::warn!(
-                    handle = ?handle,
-                    new_name = %renamed.new_name(),
-                    "auto-rename collided with another registered service; emitting Conflict"
-                  );
-                  ServiceUpdate::Conflict
-                }
-              }
-            }
-            _ => upd,
-          };
+        while let Some(upd) = endpoint.poll_service(*handle) {
+          if upd.is_renamed() {
+            // A §9 auto-rename is a PUBLISHED-RECORD MUTATION: the state machine
+            // moved to the new instance name before it emitted this update, so
+            // every credit recorded under the abandoned instance name describes a
+            // state this endpoint has left. The vacated name can then be taken by
+            // another local service, and THAT registration advances nothing
+            // whatever — a registration mutates no record this endpoint has
+            // already asserted — so without the advance here a delayed echo of
+            // the abandoned owner would still read as current, adjudicate, and
+            // defeat the new holder under RFC 6762 §8.1. See
+            // `SelfSendTracker::supersede`.
+            //
+            // Nothing else is owed: the endpoint picked a name its own route
+            // table does not hold, mirrored it into the route in the same borrow,
+            // and enqueued the old name's §10.1 goodbye as its own detached
+            // withdrawal item — all inside `handle_service_timeout`.
+            selfsend.supersede();
+          }
           // The mailbox coalesces by kind (one Established, latest Renamed) and
           // reserves the terminal, so a hostile peer repeating an event cannot
           // grow it — no consecutive-duplicate bookkeeping needed here.
           //
-          // A terminal update — Conflict/HostConflict, whether emitted directly by
-          // the proto state machine (e.g. unresolvable §9 conflict, host-name
-          // claimed during probing) or synthesized above for a rebrand collision —
-          // RETIRES the service: deliver it into the reserved terminal slot, then
-          // begin the endpoint-owned §10.1 withdrawal so the ctx/route are GC'd and
-          // the proto stops serving. Without this a proto-emitted terminal left the
-          // service live (still answering queries) until the caller dropped the
-          // handle, and `Service::next` reported end-of-stream on a still-serving
-          // ctx. The mailbox outlives the ctx, so the terminal still
-          // reaches the host even after the withdrawal GCs the ctx.
-          let is_terminal = final_upd.is_conflict() || final_upd.is_host_conflict();
-          deliver_service_update(ctx, final_upd);
+          // A terminal update — Conflict/HostConflict, emitted by the service
+          // state machine for an unresolvable §9 conflict or a host name claimed
+          // during probing — RETIRES the service: deliver it into the reserved
+          // terminal slot, then begin the endpoint-owned §10.1 withdrawal so the
+          // ctx/route are GC'd and the service stops serving. Without this a
+          // terminal left the service live (still answering queries) until the
+          // caller dropped the handle, and `Service::next` reported
+          // end-of-stream on a still-serving ctx. The mailbox outlives the ctx,
+          // so the terminal still reaches the host even after the withdrawal GCs
+          // the ctx.
+          let is_terminal = upd.is_conflict() || upd.is_host_conflict();
+          deliver_service_update(ctx, upd);
           if is_terminal {
             removed_services.push(*handle);
             break;
@@ -1218,7 +1161,7 @@ impl<N: Net> DriverState<N> {
       // re-check liveness AT this handle so a drop / cancel
       // command racing with the per-loop sweep does not still emit a
       // transmit for an already-orphaned handle. A `withdrawing` service is
-      // also skipped: its proto state machine is finished and the endpoint
+      // also skipped: its state machine is finished and the endpoint
       // owns the TTL=0 goodbye schedule (pumped by `drain_withdrawals`).
       let live = services
         .get(&h)
@@ -1250,30 +1193,36 @@ impl<N: Net> DriverState<N> {
         // errors (e.g. records exceed `max_payload_size`) surface as
         // `ServiceUpdate::Conflict` instead of letting the lifecycle
         // tick to `Established` silently.
-        let tx = match services.get_mut(&h) {
-          Some(ctx) => match ctx.proto.poll_transmit(now, scratch) {
-            Ok(Some(t)) => {
+        if !services.contains_key(&h) {
+          break;
+        }
+        let tx = match endpoint.poll_service_transmit(h, now, scratch) {
+          Ok(Some(t)) => {
+            if let Some(ctx) = services.get_mut(&h) {
               ctx.encode_failures = 0;
-              t
             }
-            Ok(None) => {
+            t
+          }
+          Ok(None) => {
+            if let Some(ctx) = services.get_mut(&h) {
               ctx.encode_failures = 0;
-              break;
             }
-            Err(_e) => {
+            break;
+          }
+          Err(_e) => {
+            if let Some(ctx) = services.get_mut(&h) {
               ctx.encode_failures = ctx.encode_failures.saturating_add(1);
               hick_trace::warn!(
                 handle = ?h,
                 error = ?_e,
                 scratch_size = scratch.len(),
                 consecutive_failures = ctx.encode_failures,
-                "Service::poll_transmit failed"
+                "Endpoint::poll_service_transmit failed"
               );
-              hit_encode_error = true;
-              break;
             }
-          },
-          None => break,
+            hit_encode_error = true;
+            break;
+          }
         };
         let body_len = tx.size();
         // The gate is copied out and written back rather than borrowed across the
@@ -1303,13 +1252,18 @@ impl<N: Net> DriverState<N> {
         // wire: the core anchors at the earliest family acceptance whenever one
         // happened, so the healthy family's next refresh is never backdated by
         // however long the slowest one took.
-        let mut retire = false;
         if let Some(ctx) = services.get_mut(&h) {
           ctx.wire_gate = gate;
-          let confirm =
-            confirm_service_transmit(endpoint, ctx, StdInstant::now(), fanout.v4, fanout.v6);
-          retire = confirm.retire_producer();
         }
+        // The confirm is also where the endpoint mirrors this service's
+        // CONFIRMED-ADVERTISED host set into its route (so a sibling's §10.1
+        // retention honours what was actually announced) and cancels a
+        // renamed-away name's goodbye that a COMPLETE announcement of the new
+        // name has superseded. Both are the endpoint's, gated on facts only it
+        // holds, so the driver hands over the I/O outcome and nothing else.
+        let retire = endpoint
+          .note_service_transmit_outcome(h, StdInstant::now(), fanout.v4, fanout.v6)
+          .retire_producer();
         budget.charge(fanout.sent_count());
         served_here = true;
         // The core weighed the refusals against this datagram's obligation: no
@@ -1328,14 +1282,10 @@ impl<N: Net> DriverState<N> {
           if let Some(ctx) = services.get_mut(&h) {
             deliver_service_update(ctx, ServiceUpdate::Conflict);
             ctx.withdrawing = true;
-            if let Some(handoff) = ctx.proto.take_rename_goodbye_handoff() {
-              endpoint.enqueue_rename_withdrawal(handoff, now, true);
-            }
-            let snap = ctx.proto.withdrawal_snapshot();
             // Inlined withdrawal, so the supersede is inlined with it — see
             // `SelfSendTracker::supersede`.
             selfsend.supersede();
-            endpoint.begin_withdrawal(h, snap, now);
+            endpoint.unregister_service(h, now);
           }
           break;
         }
@@ -1361,25 +1311,16 @@ impl<N: Net> DriverState<N> {
           // snapshot is empty and the withdrawal completes on the next iteration
           // with no datagram on the wire (the records are fixed at registration
           // and the scratch is fixed, so an encode failure is permanent, not
-          // transient). `begin_withdrawal` is idempotent. Inlined (not via
+          // transient). `unregister_service` is idempotent. Inlined (not via
           // `begin_service_withdrawal`) because `self` is split-borrowed here into
           // `endpoint` + `services`.
           if let Some(ctx) = services.get_mut(&h) {
             deliver_service_update(ctx, ServiceUpdate::Conflict);
             ctx.withdrawing = true;
-            // Enqueue any pending §9 rename handoff before snapshotting: keep the old-name goodbye exactly-once on every retirement
-            // path, not just the update-drain site. (A persistently-encode-failing
-            // service never announced, so this is usually `None` — but uniform.)
-            if let Some(handoff) = ctx.proto.take_rename_goodbye_handoff() {
-              // Retirement = the service is dead: hold its old name until the
-              // goodbye completes.
-              endpoint.enqueue_rename_withdrawal(handoff, now, true);
-            }
-            let snap = ctx.proto.withdrawal_snapshot();
             // Inlined withdrawal, so the supersede is inlined with it — see
             // `SelfSendTracker::supersede`.
             selfsend.supersede();
-            endpoint.begin_withdrawal(h, snap, now);
+            endpoint.unregister_service(h, now);
           }
         }
       }
@@ -1624,10 +1565,10 @@ impl<N: Net> DriverState<N> {
   /// GCs the driver ctx. This withdrawal covers the records the service
   /// confirmed-emitted under its CURRENT name (host A/AAAA filtered against
   /// same-host siblings by the endpoint). An in-flight conflict-rename old-name
-  /// goodbye is a SEPARATE detached withdrawal item, enqueued the instant the
-  /// rename happened via [`Endpoint::enqueue_rename_withdrawal`]. A
-  /// never-announced service has an empty snapshot and completes on the next loop
-  /// iteration with no datagram on the wire.
+  /// goodbye is a SEPARATE detached withdrawal item the endpoint enqueued for
+  /// itself when it performed the rename. A never-announced service has an empty
+  /// snapshot and completes on the next loop iteration with no datagram on the
+  /// wire.
   ///
   /// The driver ctx is NOT removed here: it is kept (marked `withdrawing`) until
   /// the endpoint reports the withdrawal complete, then GC'd unconditionally. Any
@@ -1640,36 +1581,23 @@ impl<N: Net> DriverState<N> {
 
   /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: mark the
   /// ctx `withdrawing` (so every subsequent loop skips it for transmits,
-  /// deadlines, and the orphan-sweep), snapshot what its CURRENT name's goodbye
-  /// must retract ([`Service::withdrawal_snapshot`]), and hand it to
-  /// [`Endpoint::begin_withdrawal`]. The endpoint holds the route and drives the
-  /// resend schedule; the route is freed and the driver ctx GC'd when
-  /// [`Endpoint::drain_completed_withdrawals`] reports completion in the loop. Any
-  /// in-flight §9 rename old-name goodbye is a SEPARATE detached item already
-  /// enqueued via [`Endpoint::enqueue_rename_withdrawal`].
+  /// deadlines, and the orphan-sweep), then hand the retirement to
+  /// [`Endpoint::unregister_service`]. The endpoint takes the snapshot of what
+  /// the CURRENT name's goodbye must retract, drains any still-pending §9 rename
+  /// handoff into its own detached item, holds the route, and drives the resend
+  /// schedule; the route is freed and the driver ctx GC'd when
+  /// [`Endpoint::drain_completed_withdrawals`] reports completion in the loop.
   ///
-  /// `begin_withdrawal` is idempotent, so calling this for an already-withdrawing
-  /// service is a no-op. A no-op for an unknown driver handle.
+  /// `unregister_service` is idempotent, so calling this for an
+  /// already-withdrawing service is a no-op. A no-op for an unknown driver
+  /// handle.
   fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: StdInstant) {
-    // Scope the `ctx` borrow so it ends before `self.endpoint` is touched (the
-    // snapshot is owned, so no borrow of `self.services` outlives this block).
-    // ALSO take any pending §9 rename handoff here: a retirement that races a
-    // queued `Renamed` update (closed receiver / explicit unregister) never
-    // reaches the update-drain site that normally enqueues it, which would strand
-    // the old-name goodbye in a proto being GC'd. `.take()` makes the handoff
-    // exactly-once vs the update-drain path.
-    let (snap, handoff) = match self.services.get_mut(&handle) {
-      Some(ctx) => {
-        ctx.withdrawing = true;
-        let handoff = ctx.proto.take_rename_goodbye_handoff();
-        (ctx.proto.withdrawal_snapshot(), handoff)
-      }
+    // An unknown driver handle has nothing to retire, and must not reach the
+    // endpoint either: this is the only place the driver's own view of "retired"
+    // is set, so the two must not diverge.
+    match self.services.get_mut(&handle) {
+      Some(ctx) => ctx.withdrawing = true,
       None => return,
-    };
-    if let Some(handoff) = handoff {
-      // Retirement = the service is dead: hold its old name until the goodbye
-      // completes so a re-register cannot cancel it.
-      self.endpoint.enqueue_rename_withdrawal(handoff, now, true);
     }
     // The withdrawing route stops holding its host name for the registration
     // guard, so a replacement may take that name with a DIFFERENT address set
@@ -1677,7 +1605,7 @@ impl<N: Net> DriverState<N> {
     // recorded a credit for would then be differing host rdata against the
     // replacement. See `SelfSendTracker::supersede`.
     self.selfsend.supersede();
-    self.endpoint.begin_withdrawal(handle, snap, now);
+    self.endpoint.unregister_service(handle, now);
   }
 
   /// Pump every due endpoint-owned withdrawal goodbye, then free + GC every
@@ -1811,7 +1739,7 @@ impl<N: Net> DriverState<N> {
       .drain_completed_withdrawals(now, &mut self.completed_withdrawals);
     while let Some(handle) = self.completed_withdrawals.pop() {
       // UNCONDITIONAL GC: the route is freed, and any terminal queued at an
-      // internal retirement (rename-collision / encode-failure) already sits in
+      // internal retirement (terminal conflict / encode-failure) already sits in
       // the HANDLE-owned mailbox's reserved terminal slot. Because the `Service`
       // handle holds an `Arc` clone of that mailbox, dropping this ctx (and its
       // doorbell sender) does NOT drop the terminal — a live reader still drains
@@ -2087,44 +2015,6 @@ impl Fanout {
     usize::from(matches!(self.v4, FamilyAttempt::Accepted { .. }))
       + usize::from(matches!(self.v6, FamilyAttempt::Accepted { .. }))
   }
-}
-
-/// Confirm one service transmit: hand the core the delivery shape, then mirror
-/// the service's CONFIRMED-ADVERTISED host set into its endpoint route.
-///
-/// The mirror exists so sibling host-address retention (during a same-host
-/// withdrawal) honours what this service ACTUALLY announced rather than its
-/// configured addresses. That set grows exactly when ownership latches — on any
-/// delivery — so a round that reached no wire has nothing to mirror.
-///
-/// The reclaim-cancel gate is the ALL-delivered announcement fact the CORE
-/// computes, ferried verbatim. It is emphatically NOT
-/// `Service::advertises_instance()`: that latch fires on any delivery by any
-/// transmit kind, so a v4-only announcement — or an RFC 6762 §6.7 legacy unicast
-/// reply, which has one obligated link and is therefore all-delivered by
-/// construction — would cancel a renamed-away name's goodbye that the unserved
-/// family still needs. `FullyAnnounced` has no public constructor precisely so
-/// that substitution cannot compile, and it names the service it was minted from,
-/// so it cannot be applied to a different one either.
-///
-/// `endpoint` and `ctx` are disjoint fields of `DriverState`, so the split borrow
-/// this signature requires is sound at every call site.
-fn confirm_service_transmit(
-  endpoint: &mut ProtoEndpoint,
-  ctx: &mut ServiceCtx,
-  fallback_at: StdInstant,
-  v4: FamilyAttempt<StdInstant>,
-  v6: FamilyAttempt<StdInstant>,
-) -> TransmitConfirm {
-  let confirm = ctx.proto.note_transmit_outcome(fallback_at, v4, v6);
-  if confirm.any_delivered() {
-    endpoint.note_service_announced(
-      ctx.proto.has_fully_announced(),
-      ctx.proto.advertised_a_addrs(),
-      ctx.proto.advertised_aaaa_addrs(),
-    );
-  }
-  confirm
 }
 
 /// How long ONE address family's `send_to` may stay unaccepted before the
@@ -2908,8 +2798,8 @@ async fn driver_task<N: Net>(
     // fire above are charged to it too, which is the conservative direction.
     let mut budget = DrainBudget::new(now);
     let more_transmits_pending = state.drain_transmits(now, &mut budget, &mut scratch).await;
-    // `push_updates` may retire services (orphan drop, encode escalation, or a
-    // rename collision), each beginning an endpoint-owned withdrawal.
+    // `push_updates` may retire services (orphan drop or a terminal conflict),
+    // each beginning an endpoint-owned withdrawal.
     state.push_updates(now).await;
     // Pump every due endpoint-owned TTL=0 goodbye and GC each completed
     // withdrawal (route freed → driver ctx removed). `Endpoint::poll_timeout`

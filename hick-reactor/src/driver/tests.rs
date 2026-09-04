@@ -39,8 +39,9 @@ fn lock_mailbox_for_test(
 /// Confirm a send BOTH families carried, for tests that drive a service with no
 /// bound sockets and must still see the announce/host-latch guards fire.
 #[cfg(feature = "tokio")]
-fn deliver_both(proto: &mut ProtoService, now: StdInstant) {
-  let _ = proto.note_transmit_outcome(
+fn deliver_both(endpoint: &mut ProtoEndpoint, handle: ServiceHandle, now: StdInstant) {
+  let _ = endpoint.note_service_transmit_outcome(
+    handle,
     now,
     FamilyAttempt::Accepted { at: now },
     FamilyAttempt::Accepted { at: now },
@@ -1920,20 +1921,19 @@ async fn same_name_replacement_is_rejected_until_withdrawal_completes() {
     mdns_proto::ServiceSpec::new(r)
   };
 
-  // 1. Register A and drive its proto to an announced state so the withdrawal
+  // 1. Register A and drive it to an announced state so the withdrawal
   //    snapshot is NON-empty (records were confirmed-emitted). DestinationWitness is
   //    simulated via `deliver_both` so the announce/host guards latch (no
   //    sockets are bound).
   let a = state.register_service(mk(), now).unwrap().handle;
   {
-    let ctx = state.services.get_mut(&a).unwrap();
     let mut buf = vec![0u8; 4096];
     let mut t = now;
     for _ in 0..40 {
       t += Duration::from_millis(300);
-      let _ = ctx.proto.handle_timeout(t);
-      while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        deliver_both(&mut ctx.proto, t);
+      let _ = state.endpoint.handle_service_timeout(a, t);
+      while let Ok(Some(_)) = state.endpoint.poll_service_transmit(a, t, &mut buf) {
+        deliver_both(&mut state.endpoint, a, t);
       }
     }
   }
@@ -2031,18 +2031,17 @@ async fn queued_conflict_survives_withdrawal_gc() {
   let handle = reg.handle;
   let mailbox = Arc::clone(&reg.mailbox);
 
-  // 1. Drive the proto to an announced state so the withdrawal snapshot is
+  // 1. Drive the service to an announced state so the withdrawal snapshot is
   //    NON-empty (otherwise the withdrawal completes instantly with nothing to
   //    retract — we want the Conflict to outlive an in-flight withdrawal).
   {
-    let ctx = state.services.get_mut(&handle).unwrap();
     let mut buf = vec![0u8; 4096];
     let mut t = now;
     for _ in 0..40 {
       t += Duration::from_millis(300);
-      let _ = ctx.proto.handle_timeout(t);
-      while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        deliver_both(&mut ctx.proto, t);
+      let _ = state.endpoint.handle_service_timeout(handle, t);
+      while let Ok(Some(_)) = state.endpoint.poll_service_transmit(handle, t, &mut buf) {
+        deliver_both(&mut state.endpoint, handle, t);
       }
     }
   }
@@ -2054,15 +2053,14 @@ async fn queued_conflict_survives_withdrawal_gc() {
     deliver_service_update(ctx, ServiceUpdate::Conflict);
   }
 
-  // 3. Begin the endpoint-owned withdrawal — exactly what the rename-collision /
-  //    encode-failure retirement arms do (mark `withdrawing`, snapshot, hand to
-  //    the endpoint). From here `push_updates` skips this ctx.
+  // 3. Begin the endpoint-owned withdrawal — exactly what the terminal-conflict /
+  //    encode-failure retirement arms do (mark `withdrawing`, hand to the
+  //    endpoint). From here `push_updates` skips this ctx.
   {
     let ctx = state.services.get_mut(&handle).unwrap();
     ctx.withdrawing = true;
-    let snap = ctx.proto.withdrawal_snapshot();
-    state.endpoint.begin_withdrawal(handle, snap, now);
   }
+  state.endpoint.unregister_service(handle, now);
 
   // 4. Drive the withdrawal to completion. With no bound family each round
   //    fails to deliver, so the endpoint force-completes at the 2 s ceiling;
@@ -2115,7 +2113,6 @@ async fn dropped_reply_reclaiming_register_keeps_old_name_goodbye() {
 
   use mdns_proto::{
     Name, ServiceRecords, ServiceSpec,
-    event::RouteEvent,
     wire::{Header, MessageBuilder},
   };
 
@@ -2148,17 +2145,16 @@ async fn dropped_reply_reclaiming_register_keeps_old_name_goodbye() {
 
   // Drive "Old" to announced, so its rename hands off a NON-empty goodbye.
   {
-    let ctx = state.services.get_mut(&handle).unwrap();
     let mut t = now;
     for _ in 0..40 {
       t += Duration::from_millis(300);
-      let _ = ctx.proto.handle_timeout(t);
-      while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        deliver_both(&mut ctx.proto, t);
+      let _ = state.endpoint.handle_service_timeout(handle, t);
+      while let Ok(Some(_)) = state.endpoint.poll_service_transmit(handle, t, &mut buf) {
+        deliver_both(&mut state.endpoint, handle, t);
       }
     }
     assert!(
-      ctx.proto.advertises_host(),
+      state.endpoint.service(handle).unwrap().advertises_host(),
       "Old must announce before the rename (so the goodbye is non-empty)"
     );
   }
@@ -2184,41 +2180,32 @@ async fn dropped_reply_reclaiming_register_keeps_old_name_goodbye() {
   let src = SocketAddr::from(([192, 168, 1, 200], 5353));
   let local_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
 
-  // Feed the conflict + drive the proto until "Old" renames away (seeding the
-  // detached old-name goodbye via push_updates' surviving-rename handoff).
+  // Feed the conflict + drive the service until "Old" renames away. The endpoint
+  // enqueues the detached old-name goodbye for itself inside the tick that
+  // chooses the new name.
   let mut t = now;
   let mut renamed = false;
   for _ in 0..80 {
     t += Duration::from_millis(250);
     {
-      let ctx = state.services.get_mut(&handle).unwrap();
-      let _ = ctx.proto.handle_timeout(t);
-      while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        deliver_both(&mut ctx.proto, t);
+      let _ = state.endpoint.handle_service_timeout(handle, t);
+      while let Ok(Some(_)) = state.endpoint.poll_service_transmit(handle, t, &mut buf) {
+        deliver_both(&mut state.endpoint, handle, t);
       }
     }
-    {
-      let DriverState {
-        endpoint, services, ..
-      } = &mut state;
-      if let Ok(evs) = endpoint.handle(
-        t,
-        Received::new(src, &conflict, Provenance::Unknown).with_local_ip(local_ip),
-      ) {
-        for ev in evs {
-          if let Ok(RouteEvent::ToService(ts)) = ev
-            && let Some(ctx) = services.get_mut(&ts.handle())
-          {
-            ctx.proto.handle_event(ts.into_event(), t);
-          }
-        }
-      }
+    if let Ok(evs) = state.endpoint.handle(
+      t,
+      Received::new(src, &conflict, Provenance::Unknown).with_local_ip(local_ip),
+    ) {
+      // The endpoint applies each service event to the addressed service itself,
+      // as the iterator yields it, so the iterator must still be driven.
+      evs.for_each(drop);
     }
     state.push_updates(t).await;
     if state
-      .services
-      .get(&handle)
-      .map(|c| c.proto.name().as_str() != old_inst.as_str())
+      .endpoint
+      .service(handle)
+      .map(|s| s.name().as_str() != old_inst.as_str())
       .unwrap_or(true)
     {
       renamed = true;
@@ -2264,15 +2251,15 @@ async fn dropped_reply_reclaiming_register_keeps_old_name_goodbye() {
   drop(reg);
 }
 
-/// a terminal emitted DIRECTLY by the proto state machine — here
-/// a `HostConflict` (a peer claimed our host name with a different address, RFC
-/// 6762 §9) — must RETIRE the service through the SAME path as a synthesized
-/// rename-collision Conflict: deliver the terminal into the handle-owned mailbox,
-/// begin the endpoint-owned §10.1 withdrawal (so the proto stops serving), and GC
-/// the ctx UNCONDITIONALLY once the withdrawal completes. Before the fix the
-/// proto-emitted terminal was delivered to the mailbox but `withdrawing` was never
-/// set and the withdrawal never began, so a HostConflict left a zombie ctx/route
-/// (still answering queries) until the caller dropped the handle.
+/// A terminal emitted by the service state machine — here a `HostConflict` (a
+/// peer claimed our host name with a different address, RFC 6762 §9) — must
+/// RETIRE the service through the SAME path as an encode-failure escalation:
+/// deliver the terminal into the handle-owned mailbox, begin the endpoint-owned
+/// §10.1 withdrawal (so the service stops serving), and GC the ctx
+/// UNCONDITIONALLY once the withdrawal completes. Before the fix the terminal
+/// was delivered to the mailbox but `withdrawing` was never set and the
+/// withdrawal never began, so a HostConflict left a zombie ctx/route (still
+/// answering queries) until the caller dropped the handle.
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
@@ -2281,10 +2268,7 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
     time::Duration,
   };
 
-  use mdns_proto::{
-    event::RouteEvent,
-    wire::{Header, MessageBuilder},
-  };
+  use mdns_proto::wire::{Header, MessageBuilder};
 
   let opts = crate::options::ServerOptions::default();
   let sockets = BoundSockets::<agnostic_net::tokio::Net> {
@@ -2315,14 +2299,13 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   // 1. Drive the proto to announced (non-empty withdrawal snapshot; the conflict
   //    hits a SERVING service).
   {
-    let ctx = state.services.get_mut(&handle).unwrap();
     let mut buf = vec![0u8; 4096];
     let mut t = now;
     for _ in 0..40 {
       t += Duration::from_millis(300);
-      let _ = ctx.proto.handle_timeout(t);
-      while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        deliver_both(&mut ctx.proto, t);
+      let _ = state.endpoint.handle_service_timeout(handle, t);
+      while let Ok(Some(_)) = state.endpoint.poll_service_transmit(handle, t, &mut buf) {
+        deliver_both(&mut state.endpoint, handle, t);
       }
     }
   }
@@ -2361,10 +2344,8 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   // `push_updates` in between; a closure capturing `&mut state` would hold that
   // borrow across both calls.
   fn feed<N: agnostic_net::Net>(state: &mut DriverState<N>, now: StdInstant, datagram: &[u8]) {
-    let DriverState {
-      endpoint, services, ..
-    } = state;
-    let route_events = endpoint
+    let route_events = state
+      .endpoint
       .handle(
         now,
         Received::new(
@@ -2375,13 +2356,9 @@ async fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
         .with_local_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
       )
       .expect("endpoint.handle must accept the host-conflict packet");
-    for ev in route_events {
-      if let Ok(RouteEvent::ToService(ts)) = ev
-        && let Some(ctx) = services.get_mut(&ts.handle())
-      {
-        ctx.proto.handle_event(ts.into_event(), now);
-      }
-    }
+    // The endpoint applies each service event to the addressed service itself,
+    // as the iterator yields it, so the iterator must still be driven.
+    route_events.for_each(drop);
   }
 
   // ── QR=0 phase: a probe must NOT retire us ──
@@ -2491,17 +2468,16 @@ async fn terminal_survives_full_mailbox_and_immediate_ctx_gc() {
   let handle = reg.handle;
   let mailbox = Arc::clone(&reg.mailbox);
 
-  // 1. Drive the proto to an announced state so the withdrawal snapshot is
+  // 1. Drive the service to an announced state so the withdrawal snapshot is
   //    NON-empty (otherwise the withdrawal completes instantly).
   {
-    let ctx = state.services.get_mut(&handle).unwrap();
     let mut buf = vec![0u8; 4096];
     let mut t = now;
     for _ in 0..40 {
       t += Duration::from_millis(300);
-      let _ = ctx.proto.handle_timeout(t);
-      while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-        deliver_both(&mut ctx.proto, t);
+      let _ = state.endpoint.handle_service_timeout(handle, t);
+      while let Ok(Some(_)) = state.endpoint.poll_service_transmit(handle, t, &mut buf) {
+        deliver_both(&mut state.endpoint, handle, t);
       }
     }
   }
@@ -2519,14 +2495,13 @@ async fn terminal_survives_full_mailbox_and_immediate_ctx_gc() {
     mb.set_terminal(ServiceUpdate::Conflict);
   }
 
-  // 3. Begin the endpoint-owned withdrawal (rename-collision / encode-failure
+  // 3. Begin the endpoint-owned withdrawal (terminal-conflict / encode-failure
   //    retirement arm). `push_updates` now skips this ctx.
   {
     let ctx = state.services.get_mut(&handle).unwrap();
     ctx.withdrawing = true;
-    let snap = ctx.proto.withdrawal_snapshot();
-    state.endpoint.begin_withdrawal(handle, snap, now);
   }
+  state.endpoint.unregister_service(handle, now);
 
   // 4. Drive the withdrawal to completion. The ctx is GC'd IMMEDIATELY on
   //    completion — no park, no deferral, regardless of the full ring + the
@@ -2883,9 +2858,10 @@ fn generic_recv_error_does_not_increment_any_stats() {
 // ── The dual-stack delivery boundary (`FamilyAttempt`) ──────────────────────
 
 /// A driver state with NO bound family. The delivery-shape tests drive
-/// `confirm_service_transmit` directly — the exact seam `drain_transmits` uses —
-/// because the reactor's multi-task loop cannot be stepped deterministically and
-/// a real partial fan-out needs one family's socket to fail on demand.
+/// `Endpoint::note_service_transmit_outcome` directly — the exact seam
+/// `drain_transmits` uses — because the reactor's multi-task loop cannot be
+/// stepped deterministically and a real partial fan-out needs one family's
+/// socket to fail on demand.
 #[cfg(feature = "tokio")]
 fn delivery_test_state(probe: bool) -> DriverState<agnostic_net::tokio::Net> {
   let opts = crate::options::ServerOptions::default()
@@ -2924,16 +2900,17 @@ fn confirm_service_round<N: agnostic_net::Net>(
   buf: &mut [u8],
   fanout: Fanout,
 ) -> usize {
-  let DriverState {
-    endpoint, services, ..
-  } = state;
-  let Some(ctx) = services.get_mut(&h) else {
+  if !state.services.contains_key(&h) {
     return 0;
-  };
-  let _ = ctx.proto.handle_timeout(t);
+  }
+  let endpoint = &mut state.endpoint;
+  let _ = endpoint.handle_service_timeout(h, t);
   let mut rounds = 0;
-  while ctx.proto.poll_transmit(t, buf).is_ok_and(|tx| tx.is_some()) {
-    let _ = confirm_service_transmit(endpoint, ctx, t, fanout.v4, fanout.v6);
+  while endpoint
+    .poll_service_transmit(h, t, buf)
+    .is_ok_and(|tx| tx.is_some())
+  {
+    let _ = endpoint.note_service_transmit_outcome(h, t, fanout.v4, fanout.v6);
     rounds += 1;
   }
   rounds
@@ -3036,20 +3013,20 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
   let rounds = confirm_service_round(&mut state, h, now, &mut buf, partial_fanout(now));
   assert_eq!(rounds, 1, "one announcement should have been offered");
 
-  let ctx = state.services.get(&h).unwrap();
+  let svc = state.endpoint.service(h).unwrap();
   assert_eq!(
-    ctx.proto.state(),
+    svc.state(),
     ServiceState::Announcing(0),
     "a partial announcement must re-arm the SAME announcement — the unserved \
      family never heard it"
   );
   assert!(
-    ctx.proto.advertises_instance(),
+    svc.advertises_instance(),
     "the served family's peers may now cache these records, so §10.1 goodbye \
      ownership must latch on the PARTIAL round"
   );
   assert!(
-    !ctx.proto.has_fully_announced().get(),
+    !svc.has_fully_announced().get(),
     "a partial announcement must NOT open the reclaim-cancel gate"
   );
 
@@ -3088,18 +3065,18 @@ fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
   let rounds = confirm_service_round(&mut state, h, now, &mut buf, whole_fanout(now));
   assert_eq!(rounds, 1, "one announcement should have been offered");
 
-  let ctx = state.services.get(&h).unwrap();
+  let svc = state.endpoint.service(h).unwrap();
   assert_eq!(
-    ctx.proto.state(),
+    svc.state(),
     ServiceState::Announcing(1),
     "an all-delivered announcement advances the §8.3 sequence"
   );
   assert!(
-    ctx.proto.advertises_instance(),
+    svc.advertises_instance(),
     "a delivered announcement latches goodbye ownership"
   );
   assert!(
-    ctx.proto.has_fully_announced().get(),
+    svc.has_fully_announced().get(),
     "a complete announcement is the ONLY thing that opens the reclaim-cancel gate"
   );
 
@@ -3125,14 +3102,14 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
   let rounds = confirm_service_round(&mut state, h, now, &mut buf, failed_fanout());
   assert_eq!(rounds, 1, "one announcement should have been offered");
 
-  let ctx = state.services.get(&h).unwrap();
+  let svc = state.endpoint.service(h).unwrap();
   assert_eq!(
-    ctx.proto.state(),
+    svc.state(),
     ServiceState::Announcing(0),
     "a wholly-failed announcement must re-arm without advancing"
   );
   assert!(
-    !ctx.proto.advertises_instance(),
+    !svc.advertises_instance(),
     "nothing reached a wire, so no peer can hold these records and no goodbye \
      ownership may latch"
   );
@@ -3168,7 +3145,6 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
 
   use mdns_proto::{
     Name,
-    event::RouteEvent,
     wire::{Header, MessageBuilder},
   };
 
@@ -3188,7 +3164,11 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     confirm_service_round(&mut state, handle, t, &mut buf, whole_fanout(t));
   }
   assert!(
-    state.services[&handle].proto.advertises_instance(),
+    state
+      .endpoint
+      .service(handle)
+      .unwrap()
+      .advertises_instance(),
     "Old must announce before the rename (so the goodbye is non-empty)"
   );
 
@@ -3215,28 +3195,19 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   for _ in 0..80 {
     t += Duration::from_millis(250);
     confirm_service_round(&mut state, handle, t, &mut buf, whole_fanout(t));
-    {
-      let DriverState {
-        endpoint, services, ..
-      } = &mut state;
-      if let Ok(evs) = endpoint.handle(
-        t,
-        Received::new(src, &conflict, Provenance::Unknown).with_local_ip(local_ip),
-      ) {
-        for ev in evs {
-          if let Ok(RouteEvent::ToService(ts)) = ev
-            && let Some(ctx) = services.get_mut(&ts.handle())
-          {
-            ctx.proto.handle_event(ts.into_event(), t);
-          }
-        }
-      }
+    if let Ok(evs) = state.endpoint.handle(
+      t,
+      Received::new(src, &conflict, Provenance::Unknown).with_local_ip(local_ip),
+    ) {
+      // The endpoint applies each service event to the addressed service itself,
+      // as the iterator yields it, so the iterator must still be driven.
+      evs.for_each(drop);
     }
     state.push_updates(t).await;
     if state
-      .services
-      .get(&handle)
-      .map(|c| c.proto.name().as_str() != old_inst.as_str())
+      .endpoint
+      .service(handle)
+      .map(|s| s.name().as_str() != old_inst.as_str())
       .unwrap_or(true)
     {
       renamed = true;
@@ -3273,12 +3244,14 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   for _ in 0..12 {
     t += Duration::from_millis(300);
     confirm_service_round(&mut state, rh, t, &mut buf, whole_fanout(t));
-    if state.services[&rh].proto.state() == mdns_proto::service::ServiceState::Announcing(0) {
+    if state.endpoint.service(rh).unwrap().state()
+      == mdns_proto::service::ServiceState::Announcing(0)
+    {
       break;
     }
   }
   assert_eq!(
-    state.services[&rh].proto.state(),
+    state.endpoint.service(rh).unwrap().state(),
     mdns_proto::service::ServiceState::Announcing(0),
     "the replacement must reach its first announcement"
   );
@@ -3288,7 +3261,12 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   t += Duration::from_millis(300);
   confirm_service_round(&mut state, rh, t, &mut buf, partial_fanout(t));
   assert!(
-    !state.services[&rh].proto.has_fully_announced().get(),
+    !state
+      .endpoint
+      .service(rh)
+      .unwrap()
+      .has_fully_announced()
+      .get(),
     "a partial announcement must leave the reclaim-cancel gate shut"
   );
   assert!(
@@ -3306,7 +3284,12 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   t += Duration::from_secs(2);
   confirm_service_round(&mut state, rh, t, &mut buf, whole_fanout(t));
   assert!(
-    state.services[&rh].proto.has_fully_announced().get(),
+    state
+      .endpoint
+      .service(rh)
+      .unwrap()
+      .has_fully_announced()
+      .get(),
     "the replacement must have fully announced by now"
   );
   assert!(
@@ -3344,10 +3327,11 @@ async fn a_surviving_rename_retracts_its_old_name_on_both_families() {
 /// that argument has to be re-made after every change to the routing, and this
 /// one does not.
 ///
-/// The rename asserted here must SURVIVE. A rename COLLISION is retired through
-/// `begin_service_withdrawal`, which supersedes for a reason of its own, so a
-/// test that drifted onto the collision path would stay green with the mutation
-/// site deleted and prove nothing about it.
+/// The rename asserted here must SURVIVE, which every rename now does: the
+/// endpoint picks a name its own route table does not hold. A test that drifted
+/// onto a retirement path — which supersedes for a reason of its own — would
+/// stay green with the mutation site deleted and prove nothing about it, so the
+/// survival is asserted below rather than assumed.
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
@@ -3355,7 +3339,6 @@ async fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
 
   use mdns_proto::{
     Name,
-    event::RouteEvent,
     wire::{Header, MessageBuilder},
   };
 
@@ -3426,22 +3409,13 @@ async fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
   for _ in 0..80 {
     t += Duration::from_millis(250);
     confirm_service_round(&mut state, handle, t, &mut buf, whole_fanout(t));
-    {
-      let DriverState {
-        endpoint, services, ..
-      } = &mut state;
-      if let Ok(evs) = endpoint.handle(
-        t,
-        Received::new(src, &conflict, Provenance::Unknown).with_local_ip(local_ip),
-      ) {
-        for ev in evs {
-          if let Ok(RouteEvent::ToService(ts)) = ev
-            && let Some(ctx) = services.get_mut(&ts.handle())
-          {
-            ctx.proto.handle_event(ts.into_event(), t);
-          }
-        }
-      }
+    if let Ok(evs) = state.endpoint.handle(
+      t,
+      Received::new(src, &conflict, Provenance::Unknown).with_local_ip(local_ip),
+    ) {
+      // The endpoint applies each service event to the addressed service itself,
+      // as the iterator yields it, so the iterator must still be driven.
+      evs.for_each(drop);
     }
     state.push_updates(t).await;
     // Read off the handle-owned mailbox, so what is observed is the update
@@ -3467,12 +3441,11 @@ async fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
     .expect("a survived rename keeps its ctx");
   assert!(
     !ctx.withdrawing,
-    "this must be the SURVIVING path: a rename COLLISION is retired through \
-     `begin_service_withdrawal`, which supersedes for its own reason and would \
-     prove nothing about the rename"
+    "this must be the SURVIVING path: a retirement supersedes for its own reason \
+     and would prove nothing about the rename"
   );
   assert_ne!(
-    ctx.proto.name().as_str(),
+    state.endpoint.service(handle).unwrap().name().as_str(),
     old_inst.as_str(),
     "the survivor must hold the NEW instance name"
   );
@@ -3500,7 +3473,7 @@ async fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
 /// This seam used to advance the generation and it was a falsehood. A
 /// registration only INSERTS a route: it mutates no record this endpoint has
 /// already asserted. There is no RFC 6762 §8.4 records mutator, a duplicate
-/// instance name and a name a collision goodbye still holds are both refused,
+/// instance name and a name a detached goodbye still holds are both refused,
 /// and a live route publishing the same host name with a different A or AAAA set
 /// makes the registration FAIL (`Endpoint::host_addresses_disagree`). The
 /// negative assertions are covered as well — the encoder emits exactly one §6.1
@@ -4150,27 +4123,23 @@ async fn a_wedged_family_cannot_push_the_healthy_refresh_past_its_ttl() {
     whole_fanout(base + Duration::from_secs(1)),
   );
   assert_eq!(
-    state.services[&h].proto.state(),
+    state.endpoint.service(h).unwrap().state(),
     mdns_proto::service::ServiceState::Established
   );
 
   // Confirm the wedged round with exactly what the fan-out reported, the way
   // `drain_transmits` does.
-  let DriverState {
-    endpoint, services, ..
-  } = &mut state;
-  let ctx = services.get_mut(&h).unwrap();
-  let _ = ctx.proto.handle_timeout(anchor);
+  let endpoint = &mut state.endpoint;
+  let _ = endpoint.handle_service_timeout(h, anchor);
   assert!(
-    ctx
-      .proto
-      .poll_transmit(anchor, &mut buf)
+    endpoint
+      .poll_service_transmit(h, anchor, &mut buf)
       .is_ok_and(|t| t.is_some()),
     "the periodic re-announce must be due"
   );
-  let _ = confirm_service_transmit(endpoint, ctx, anchor, fanout.v4, fanout.v6);
+  let _ = endpoint.note_service_transmit_outcome(h, anchor, fanout.v4, fanout.v6);
 
-  let due = ctx.proto.poll_timeout().expect("re-armed");
+  let due = endpoint.poll_service_timeout(h).expect("re-armed");
   assert!(
     due.saturating_duration_since(anchor) <= REFRESH,
     "the core arms the next announcement one refresh interval after the confirm"
@@ -4216,21 +4185,19 @@ fn confirm_service_round_mixed(
   buf: &mut [u8],
   multicast_fanout: Fanout,
 ) -> usize {
-  let DriverState {
-    endpoint, services, ..
-  } = state;
-  let Some(ctx) = services.get_mut(&h) else {
+  if !state.services.contains_key(&h) {
     return 0;
-  };
-  let _ = ctx.proto.handle_timeout(t);
+  }
+  let endpoint = &mut state.endpoint;
+  let _ = endpoint.handle_service_timeout(h, t);
   let mut rounds = 0;
-  while let Ok(Some(tx)) = ctx.proto.poll_transmit(t, buf) {
+  while let Ok(Some(tx)) = endpoint.poll_service_transmit(h, t, buf) {
     let fanout = if tx.dst().ip().is_multicast() {
       multicast_fanout
     } else {
       unicast_fanout(t)
     };
-    let _ = confirm_service_transmit(endpoint, ctx, t, fanout.v4, fanout.v6);
+    let _ = endpoint.note_service_transmit_outcome(h, t, fanout.v4, fanout.v6);
     rounds += 1;
   }
   rounds
@@ -4248,7 +4215,6 @@ fn inject_ptr_query(
 ) {
   use mdns_proto::{
     Name,
-    event::RouteEvent,
     wire::{Header, MessageBuilder, ResourceClass, ResourceType},
   };
 
@@ -4262,22 +4228,15 @@ fn inject_ptr_query(
   };
   let query = qbuf[..n].to_vec();
   let local_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 10));
-  let DriverState {
-    endpoint, services, ..
-  } = state;
-  let Ok(evs) = endpoint.handle(
+  let Ok(evs) = state.endpoint.handle(
     t,
     Received::new(src, &query, Provenance::Unknown).with_local_ip(local_ip),
   ) else {
     panic!("the endpoint must accept a well-formed browse query");
   };
-  for ev in evs {
-    if let Ok(RouteEvent::ToService(ts)) = ev
-      && let Some(ctx) = services.get_mut(&ts.handle())
-    {
-      ctx.proto.handle_event(ts.into_event(), t);
-    }
-  }
+  // The endpoint applies each service event to the addressed service itself, as
+  // the iterator yields it, so the iterator must still be driven.
+  evs.for_each(drop);
 }
 
 /// Bypassing the bound for a one-shot datagram must not bypass the CORE confirm:
@@ -4298,7 +4257,7 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
   // The lifecycle reaches no wire at all, so nothing it sends can latch.
   confirm_service_round(&mut state, h, now, &mut buf, failed_fanout());
   assert!(
-    !state.services[&h].proto.advertises_instance(),
+    !state.endpoint.service(h).unwrap().advertises_instance(),
     "a wholly-failed announcement exposes nothing"
   );
 
@@ -4312,12 +4271,17 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
     "only the legacy reply is due this early"
   );
   assert!(
-    state.services[&h].proto.advertises_instance(),
+    state.endpoint.service(h).unwrap().advertises_instance(),
     "the reply put positive-TTL records on a wire, so §10.1 ownership latches — \
      the confirm reaches the core unchanged, it just skips the bound"
   );
   assert!(
-    !state.services[&h].proto.has_fully_announced().get(),
+    !state
+      .endpoint
+      .service(h)
+      .unwrap()
+      .has_fully_announced()
+      .get(),
     "an all-delivered UNICAST reply is still not a complete announcement"
   );
   drop(reg);
@@ -4497,9 +4461,9 @@ async fn a_family_that_paid_its_floor_before_its_own_send_is_not_gated() {
   // The pass carrying round 2 wakes when the core's re-arm falls due and reads its
   // clock ONCE, there — with a small overshoot so the deadline has genuinely
   // passed.
-  let due = state.services[&h]
-    .proto
-    .poll_timeout()
+  let due = state
+    .endpoint
+    .poll_service_timeout(h)
     .expect("the next announcement must be armed");
   let pass_clock = due + Duration::from_millis(20);
   assert!(
@@ -4968,8 +4932,8 @@ async fn repeated_budget_cuts_reach_every_producer() {
     state.fire_timeouts(StdInstant::now());
   }
   assert!(
-    state.services.values().all(|c| matches!(
-      c.proto.state(),
+    state.services.keys().all(|h| matches!(
+      state.endpoint.service(*h).unwrap().state(),
       mdns_proto::service::ServiceState::Probing(0)
     )),
     "every service must be probing and due before the budget is applied"
@@ -5237,12 +5201,12 @@ async fn a_permanently_oversized_sustained_datagram_retires_its_producer() {
     wire_at: StdInstant::now(),
   };
   let (mut state, h) = probing_service();
-  let ctx = state.services.get_mut(&h).unwrap();
-  let now = draw_first_probe(&mut ctx.proto, &mut buf);
+  let now = draw_first_probe(&mut state.endpoint, h, &mut buf);
   assert!(
-    ctx
-      .proto
-      .note_transmit_outcome(
+    state
+      .endpoint
+      .note_service_transmit_outcome(
+        h,
         now,
         attempt_of(Family::V4, &oversized, &refused),
         FamilyAttempt::NoSocket,
@@ -5256,12 +5220,12 @@ async fn a_permanently_oversized_sustained_datagram_retires_its_producer() {
   // other one failed. Retiring here would destroy a healthy advertisement over a
   // full send buffer.
   let (mut state, h) = probing_service();
-  let ctx = state.services.get_mut(&h).unwrap();
-  let now = draw_first_probe(&mut ctx.proto, &mut buf);
+  let now = draw_first_probe(&mut state.endpoint, h, &mut buf);
   assert!(
-    !ctx
-      .proto
-      .note_transmit_outcome(
+    !state
+      .endpoint
+      .note_service_transmit_outcome(
+        h,
         now,
         attempt_of(Family::V4, &oversized, &refused),
         FamilyAttempt::WouldBlock,
@@ -5306,14 +5270,22 @@ fn probing_service() -> (
 /// Arm and draw the first §8.1 probe, returning the instant it was drawn at. A
 /// fresh service waits out §8.1's random 0-250 ms initial delay first.
 #[cfg(feature = "tokio")]
-fn draw_first_probe(proto: &mut ProtoService, buf: &mut [u8]) -> StdInstant {
+fn draw_first_probe(
+  endpoint: &mut ProtoEndpoint,
+  handle: ServiceHandle,
+  buf: &mut [u8],
+) -> StdInstant {
   let start = StdInstant::now();
   for step in 1..=8u32 {
     let now = start
       .checked_add(std::time::Duration::from_millis(u64::from(step) * 100))
       .unwrap();
-    proto.handle_timeout(now).unwrap();
-    if proto.poll_transmit(now, buf).unwrap().is_some() {
+    endpoint.handle_service_timeout(handle, now).unwrap();
+    if endpoint
+      .poll_service_transmit(handle, now, buf)
+      .unwrap()
+      .is_some()
+    {
       return now;
     }
   }

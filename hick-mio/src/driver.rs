@@ -19,7 +19,7 @@
 //!   in, `MAX_SEND_CREDITS_PER_DRAIN` out — because their work is driven by a
 //!   peer, who is under no obligation to stop;
 //! * `push_updates` has **no** budget of its own. Its two drain loops
-//!   (`ctx.proto.poll()` and `endpoint.poll()`) terminate because the proto
+//!   (`endpoint.poll_service()` and `endpoint.poll()`) terminate because the proto
 //!   layer's event slabs are fixed-capacity pools and each poll removes an
 //!   entry, and because the only thing that refills them is `drain_recv`, which
 //!   *is* budgeted. The bound is the proto layer's, borrowed — not this
@@ -165,8 +165,7 @@
 use std::time::{Duration, Instant as StdInstant};
 
 use mdns_proto::{
-  FamilyAttempt, Provenance, QueryHandle, Received, ServiceHandle, ServiceUpdate, TransmitConfirm,
-  TransmitObligation, event::RouteEvent,
+  Provenance, QueryHandle, Received, ServiceHandle, ServiceUpdate, TransmitObligation,
 };
 
 use hick_udp::{onlink, selfsend::SelfSendMatch};
@@ -285,7 +284,7 @@ pub(crate) const fn datagram_cost(_families_sent: usize) -> usize {
   1
 }
 
-/// Consecutive `Service::poll_transmit` failures tolerated before a
+/// Consecutive `Endpoint::poll_service_transmit` failures tolerated before a
 /// registration is treated as structurally unusable.
 ///
 /// The proto layer retries the failed transmit on the next call, so three
@@ -380,13 +379,13 @@ impl Mdns {
     }
 
     let mut best: Option<StdInstant> = self.endpoint.poll_timeout();
-    for ctx in self.services.values() {
-      // A retired service's proto state machine is finished; its remaining
-      // schedule, if any, belongs to the endpoint.
+    for (&handle, ctx) in self.services.iter() {
+      // A retired service's state machine is finished; its remaining schedule,
+      // if any, belongs to the endpoint.
       if ctx.withdrawing {
         continue;
       }
-      if let Some(t) = ctx.proto.poll_timeout() {
+      if let Some(t) = self.endpoint.poll_service_timeout(handle) {
         best = Some(min_opt(best, t));
       }
     }
@@ -520,7 +519,7 @@ impl Mdns {
     // from nothing earlier or later — so it is read inside the seal, after the
     // sweep that precedes it, rather than handed in from here.
     self.selfsend.seal();
-    self.drain_recv(now);
+    self.drain_recv();
     self.sweep();
     self.fire_timeouts(now);
     self.drain_transmits(now);
@@ -557,16 +556,18 @@ impl Mdns {
   /// port 5353 can be this endpoint's own loopback copy, because that is the
   /// port both of its sockets send from.
   ///
-  /// # `now` is this stage's protocol instant, and the datagram's is not
+  /// # It takes no instant, and no caller may supply one
   ///
-  /// `now` is what the service events this stage routes are applied at — the
-  /// core's own response schedule, stable across the tick. Each datagram's
-  /// processing instant is read separately, immediately before the
-  /// `Endpoint::handle` that anchors the datagram's effects to it, because one of
-  /// those effects is a query's caller-facing
-  /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window. See
-  /// this module's clock rule and the read itself.
-  fn drain_recv(&mut self, now: StdInstant) {
+  /// Every effect this stage has is anchored to the datagram that caused it —
+  /// the service events the endpoint applies as it routes, and a query's
+  /// caller-facing
+  /// [`QuerySpec::with_timeout`](mdns_proto::QuerySpec::with_timeout) window
+  /// alike. So the instant is read per datagram, immediately before the
+  /// `Endpoint::handle` that anchors them, and the tick's own reading — taken
+  /// before this stage ran, and up to `RECV_BUDGET` datagrams stale by the last
+  /// of them — has nothing here to govern. See this module's clock rule and the
+  /// read itself.
+  fn drain_recv(&mut self) {
     #[cfg(feature = "stats")]
     let stats = self.stats.clone();
 
@@ -575,7 +576,6 @@ impl Mdns {
       // into, and the state machines we feed are all separate fields.
       let Self {
         endpoint,
-        services,
         sockets,
         selfsend,
         recv_buf,
@@ -898,17 +898,11 @@ impl Mdns {
 
       for ev in route_events {
         match ev {
-          Ok(RouteEvent::ToService(ts)) => {
-            // A retired service's proto no longer has its updates drained, so
-            // feeding it events would let a peer grow its event slab unbounded.
-            if let Some(ctx) = services.get_mut(&ts.handle())
-              && !ctx.withdrawing
-            {
-              ctx.proto.handle_event(ts.into_event(), now);
-            }
-          }
-          // Query answers are dispatched inside `endpoint.handle`; every other
-          // variant is a hook this crate does not consume yet.
+          // Service events and query answers are both applied inside
+          // `endpoint.handle`, at the datagram's own receipt instant; every
+          // remaining variant is a hook this crate does not consume yet. The
+          // iterator is still walked to completion, because it is what performs
+          // that dispatch.
           Ok(_) => {}
           Err(_e) => {
             hick_trace::debug!(error = %_e, "route event error mid-datagram; abandoning it");
@@ -969,18 +963,21 @@ impl Mdns {
   /// it must run before them even when nothing was received.
   fn fire_timeouts(&mut self, now: StdInstant) {
     let _ = self.endpoint.handle_timeout(now);
-    for ctx in self.services.values_mut() {
-      // A retired service's lifecycle is finished; driving its proto is waste.
+    // Split-borrow so both maps are walked in place: the two `handle_*_timeout`
+    // calls touch only the disjoint `endpoint` field.
+    let Self {
+      endpoint,
+      services,
+      queries,
+      ..
+    } = &mut *self;
+    for (&handle, ctx) in services.iter() {
+      // A retired service's lifecycle is finished; driving it is waste.
       if ctx.withdrawing {
         continue;
       }
-      let _ = ctx.proto.handle_timeout(now);
+      let _ = endpoint.handle_service_timeout(handle, now);
     }
-    // Split-borrow so the query map is walked in place: `handle_query_timeout`
-    // touches only the disjoint `endpoint` field.
-    let Self {
-      endpoint, queries, ..
-    } = &mut *self;
     for &handle in queries.keys() {
       let _ = endpoint.handle_query_timeout(handle, now);
     }
@@ -1091,38 +1088,42 @@ impl Mdns {
             if spent >= quantum {
               break true;
             }
-            let tx = match services.get_mut(&handle) {
-              Some(ctx) => match ctx.proto.poll_transmit(now, send_buf.as_mut_slice()) {
-                Ok(Some(tx)) => {
-                  ctx.encode_failures = 0;
-                  tx
-                }
-                Ok(None) => {
-                  ctx.encode_failures = 0;
-                  break false;
-                }
-                Err(_e) => {
-                  ctx.encode_failures = ctx.encode_failures.saturating_add(1);
-                  hick_trace::warn!(
-                    handle = ?handle,
-                    error = ?_e,
-                    consecutive_failures = ctx.encode_failures,
-                    "Service::poll_transmit failed"
-                  );
-                  hit_encode_error = true;
-                  // LEFTOVER WORK, not "nothing due". The core retries the same
-                  // datagram on the next `poll_transmit` and schedules no
-                  // deadline for one it has already armed, so nothing in
-                  // `next_timeout`'s fold speaks for it. Reporting `false` here
-                  // cleared `work_pending` and let the caller block in
-                  // `Poll::poll` on a datagram sitting in memory — and mio's
-                  // readiness is edge-triggered, so no event can ever wake it.
-                  // It would also stall the retirement below, which only counts
-                  // failures on ticks that reach this arm.
-                  break true;
-                }
-              },
-              None => break false,
+            // `services` and `endpoint` are disjoint fields of the split borrow
+            // above, so the context stays borrowed across the poll — the state
+            // machine itself lives in the endpoint, and only the encode-failure
+            // counter lives here.
+            let Some(ctx) = services.get_mut(&handle) else {
+              break false;
+            };
+            let tx = match endpoint.poll_service_transmit(handle, now, send_buf.as_mut_slice()) {
+              Ok(Some(tx)) => {
+                ctx.encode_failures = 0;
+                tx
+              }
+              Ok(None) => {
+                ctx.encode_failures = 0;
+                break false;
+              }
+              Err(_e) => {
+                ctx.encode_failures = ctx.encode_failures.saturating_add(1);
+                hick_trace::warn!(
+                  handle = ?handle,
+                  error = ?_e,
+                  consecutive_failures = ctx.encode_failures,
+                  "Endpoint::poll_service_transmit failed"
+                );
+                hit_encode_error = true;
+                // LEFTOVER WORK, not "nothing due". The core retries the same
+                // datagram on the next `poll_service_transmit` and schedules no
+                // deadline for one it has already armed, so nothing in
+                // `next_timeout`'s fold speaks for it. Reporting `false` here
+                // cleared `work_pending` and let the caller block in
+                // `Poll::poll` on a datagram sitting in memory — and mio's
+                // readiness is edge-triggered, so no event can ever wake it.
+                // It would also stall the retirement below, which only counts
+                // failures on ticks that reach this arm.
+                break true;
+              }
             };
             let len = tx.size().min(send_buf.len());
             // The gate is copied out and written back rather than borrowed
@@ -1141,15 +1142,15 @@ impl Mdns {
               tx.min_family_gap(),
             );
             // Confirmed here, before anything else can touch this service:
-            // the core holds a commit token from the `poll_transmit` above and
-            // every other entry point is forbidden until it is spent. The
-            // fallback instant is only reached when NO family accepted; the core
+            // the core holds a commit token from the `poll_service_transmit`
+            // above and every other entry point is forbidden until it is spent.
+            // The instant is only reached when NO family accepted; the core
             // anchors at the earliest acceptance whenever one did.
             let [v4, v6] = summary.attempts;
             if let Some(ctx) = services.get_mut(&handle) {
               ctx.wire_gate = gate;
             }
-            let confirm = confirm_service(endpoint, services, handle, StdInstant::now(), v4, v6);
+            let confirm = endpoint.note_service_transmit_outcome(handle, StdInstant::now(), v4, v6);
             spent = spent.saturating_add(datagram_cost(summary.sent));
             // The core weighed the refusals against this datagram's obligation
             // and says the producer cannot make progress: a probe or an §8.3
@@ -1349,13 +1350,13 @@ impl Mdns {
   ///
   /// # It takes no instant
   ///
-  /// An observed [`ServiceUpdate::Renamed`] enqueues the old instance name's RFC
-  /// 6762 §9 goodbye here, and a withdrawal item's schedule — its first send and
-  /// its 2 s anti-pin ceiling — is defined by the instant it is **created**. The
-  /// tick's `now` is not that instant: it is read before stages 1 through 4, so
-  /// handing it over charges every microsecond of them to a schedule that did
-  /// not exist yet. See this module's clock rule, and the live read at the
-  /// enqueue below.
+  /// Nothing here is scheduled. A [`ServiceUpdate::Renamed`] is a pure
+  /// NOTIFICATION by the time it reaches this stage: the endpoint chose a free
+  /// name, mirrored it into the route, and enqueued the old name's RFC 6762 §9
+  /// goodbye inside the timeout that renamed the service, all at that timeout's
+  /// own instant. This stage moves updates into the event queue and nothing
+  /// else, so there is no schedule for an instant to define and no reading to
+  /// get wrong.
   fn push_updates(&mut self) {
     let Self {
       endpoint,
@@ -1372,102 +1373,20 @@ impl Mdns {
       if ctx.withdrawing {
         continue;
       }
-      while let Some(update) = ctx.proto.poll() {
-        // A rename must reach the endpoint's routing table BEFORE any further
-        // datagram is routed, or questions for the new instance name would not
-        // reach this service.
-        let renamed_to = match &update {
-          ServiceUpdate::Renamed(renamed) => Some(renamed.new_name().clone()),
-          _ => None,
-        };
-        let update = match renamed_to {
-          Some(name) => {
-            // A §9 auto-rename is a PUBLISHED-RECORD MUTATION: the proto called
-            // `Service::set_instance` before it emitted this update, so every
-            // credit recorded under the abandoned instance name describes a
-            // state this endpoint has left. Advance at the mutation, and
-            // UNCONDITIONALLY — the collision arm below is retired through
-            // `begin_service_withdrawal`, which supersedes as well, but a
-            // SURVIVING rename crosses no other seam at all. The vacated name
-            // can then be taken by another local service, and THAT registration
-            // advances nothing whatever — a registration mutates no record this
-            // endpoint has already asserted — so without the advance here a
-            // delayed echo of the abandoned owner would still read as current,
-            // adjudicate, and defeat the new holder under RFC 6762 §8.1. See
-            // `SelfSendTracker::supersede`.
-            selfsend.supersede();
-            // Nothing the OLD name put in flight can still be outstanding here.
-            // Every datagram this service produced was confirmed inside the
-            // `poll_transmit` iteration that produced it — stage 4 — so there is
-            // no commit token to spend, no queued announcement to cancel, and
-            // nothing that could transmit an old-name positive-TTL record after
-            // the retraction taken below has been snapshotted without it. That
-            // is the property parking cost, and the reason this branch is now
-            // just the rename.
-            let routed = endpoint.handle_service_renamed(handle, name);
-            // RFC 6762 §9: the old instance name's PTR/SRV/TXT are still in every
-            // peer's cache, and the proto layer parks their TTL=0 retraction as a
-            // ONE-SHOT handoff the instant it renames. Take it on EVERY observed
-            // rename — the surviving one as much as the colliding one. A rename
-            // whose handoff is never taken leaves the old name advertised until
-            // its positive TTL expires, and the next rename overwrites the parked
-            // handoff, so the first name's retraction is lost outright.
-            if let Some(handoff) = ctx.proto.take_rename_goodbye_handoff() {
-              // HELD until the retraction completes, on EVERY rename — the
-              // surviving one as much as the colliding one.
-              //
-              // A reclaimable item is cancelled outright the moment any service
-              // confirm-advertises the same name (the endpoint's
-              // cancel-on-announce). That cancellation is all-or-nothing while
-              // the debt it discards is PER FAMILY: a goodbye that reached IPv4
-              // but not IPv6 still owes IPv6, and a replacement whose own
-              // announcement succeeded on IPv4 alone counts as advertised. The
-              // unpaid IPv6 debt is then dropped, and every peer that saw only
-              // the v6 side keeps the old name's records until their positive
-              // TTL expires.
-              //
-              // Superseding the debt instead of holding it cannot be made to
-              // work here either, because supersession is not a property the
-              // replacement can have: a record the old registration advertised
-              // and the new one does not — a subtype PTR it dropped, a TXT key
-              // it no longer sets — is retracted by nothing the replacement
-              // ever puts on the wire. Only the goodbye retracts it.
-              //
-              // So the name is held until every bound family has paid, which is
-              // the same per-family-debt invariant the withdrawal stage
-              // enforces, applied at the reclamation boundary. The cost is
-              // bounded by the endpoint's 2 s anti-pin ceiling: a re-registration
-              // of a just-vacated name is refused for at most that long, and
-              // typically only for the ~750 ms the resend schedule takes.
-              //
-              // A LIVE read, at the enqueue. This item's whole schedule is
-              // defined relative to the instant it is created — `next_at` IS
-              // that instant and the anti-pin ceiling is 2 s past it — so the
-              // instant handed over has to be the one at which it is actually
-              // created. Stages 1 through 4 all ran between the tick's own read
-              // and this line; charging them to the ceiling shortens the old
-              // name's retraction by exactly that much, and past ~1.75 s of it
-              // the next re-arm clamps below the 250 ms §10.1 interval and the
-              // item is force-completed with debt still owed.
-              endpoint.enqueue_rename_withdrawal(handoff, StdInstant::now(), true);
-            }
-            match routed {
-              Ok(()) => update,
-              Err(_e) => {
-                // The new name collides with another local registration. The
-                // service has already rebranded and cannot be kept, so report the
-                // collision as the terminal it is.
-                hick_trace::warn!(
-                  handle = ?handle,
-                  error = ?_e,
-                  "auto-rename collided with another registered service; reporting Conflict"
-                );
-                ServiceUpdate::Conflict
-              }
-            }
-          }
-          None => update,
-        };
+      while let Some(update) = endpoint.poll_service(handle) {
+        if matches!(update, ServiceUpdate::Renamed(_)) {
+          // A §9 auto-rename is a PUBLISHED-RECORD MUTATION: the state machine
+          // called `Service::set_instance` before it emitted this update, so
+          // every credit recorded under the abandoned instance name describes a
+          // state this endpoint has left. Advance at the mutation. The vacated
+          // name can then be taken by another local service, and THAT
+          // registration advances nothing whatever — a registration mutates no
+          // record this endpoint has already asserted — so without the advance
+          // here a delayed echo of the abandoned owner would still read as
+          // current, adjudicate, and defeat the new holder under RFC 6762 §8.1.
+          // See `SelfSendTracker::supersede`.
+          selfsend.supersede();
+        }
         let terminal = update.is_conflict() || update.is_host_conflict();
         events.push_terminal(Event::Service { handle, update });
         if terminal {
@@ -1572,62 +1491,6 @@ fn retire_service(
   if let Some(ctx) = services.get_mut(&handle) {
     ctx.withdrawing = true;
   }
-}
-
-/// Hand a service its per-family delivery result and, on any delivery, refresh
-/// the endpoint's record of what it has actually advertised.
-///
-/// One function because the two steps must not drift, and because **every** live
-/// service confirm goes through it — none can be added that quietly skips the
-/// mirror.
-///
-/// The delivery is handed over **verbatim**. Which family missed is what lets
-/// the core schedule the next announcement per link rather than per round, and a
-/// driver that folded it into an aggregate — or excused a family on its own
-/// round count — would put the core back to refreshing alternating families at
-/// twice the periodic interval. Bounding how long the lifecycle waits for a
-/// family that keeps missing is the core's own patience, applied inside the
-/// confirm. This driver writes no family off: the obligated set it reports turns
-/// on which sockets exist and which family the datagram was addressed to, and
-/// [`SendHealth`] — a caller-facing health signal — is no input to it.
-///
-/// `note_service_announced` reads the goodbye-ownership latch that
-/// `note_transmit_outcome` has just updated, and it is that latch — not the
-/// configured record set — that a sibling service's shared-host retention is
-/// computed from. It runs on `any_delivered`, because ownership latches for
-/// whatever reached a wire. Its first argument is the reclaim-cancel gate, and
-/// it is the ALL-delivered announcement fact the CORE computes, ferried
-/// verbatim. It is emphatically not `Service::advertises_instance()`: that latch
-/// fires on any delivery by any transmit kind, so a v4-only announcement — or an
-/// RFC 6762 §6.7 legacy unicast reply, which has one obligated link and is
-/// therefore all-delivered by construction — would cancel a renamed-away name's
-/// goodbye that the unserved family still needs. `FullyAnnounced` has no public
-/// constructor precisely so that substitution cannot compile, and it names the
-/// service it was minted from, so it cannot be applied to a different one.
-///
-/// `at` is the earliest instant some family accepted the datagram, falling back
-/// to post-attempt time for a round that reached no wire: the next deadline must
-/// run from when the datagram left, not from when it was encoded.
-fn confirm_service(
-  endpoint: &mut crate::proto::ProtoEndpoint,
-  services: &mut std::collections::HashMap<ServiceHandle, crate::endpoint::ServiceCtx>,
-  handle: ServiceHandle,
-  fallback_at: StdInstant,
-  v4: FamilyAttempt<StdInstant>,
-  v6: FamilyAttempt<StdInstant>,
-) -> TransmitConfirm {
-  let Some(ctx) = services.get_mut(&handle) else {
-    return TransmitConfirm::default();
-  };
-  let confirm = ctx.proto.note_transmit_outcome(fallback_at, v4, v6);
-  if confirm.any_delivered() {
-    endpoint.note_service_announced(
-      ctx.proto.has_fully_announced(),
-      ctx.proto.advertised_a_addrs(),
-      ctx.proto.advertised_aaaa_addrs(),
-    );
-  }
-  confirm
 }
 
 /// One participant in [`Mdns::drain_transmits`]'s round-robin: a registered

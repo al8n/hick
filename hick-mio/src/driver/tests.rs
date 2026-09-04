@@ -196,12 +196,11 @@ fn registering_a_service_schedules_a_deadline() {
   };
   let spec = test_support::service_spec("_hick-mio-test._tcp.local.", 8080);
   let handle = mdns.register_service(spec).expect("register_service");
-  let ctx = mdns.services.get(&handle).expect("the service context");
   // A freshly registered service carries its own §8.1 probe deadline, so the
   // fold alone is enough to bring the caller back — no zero-timeout override
   // is needed for it, unlike a freshly started query.
   assert!(
-    ctx.proto.poll_timeout().is_some(),
+    mdns.endpoint.poll_service_timeout(handle).is_some(),
     "a freshly registered service must be scheduled to probe"
   );
   // The tripwire for that rule: `work_pending` is queries-only. Without this,
@@ -366,8 +365,8 @@ fn next_timeout_never_overshoots_the_earliest_deadline() {
   let folded = mdns.next_timeout().expect("a folded deadline");
   let earliest = mdns
     .services
-    .values()
-    .filter_map(|ctx| ctx.proto.poll_timeout())
+    .keys()
+    .filter_map(|h| mdns.endpoint.poll_service_timeout(*h))
     .chain(
       mdns
         .queries
@@ -1491,11 +1490,16 @@ fn goodbyes_now(mdns: &mut Mdns) -> Vec<Vec<u8>> {
 /// name, so no withdrawal is begun for it, and the one-shot handoff is gone the
 /// moment the next rename overwrites it.
 ///
-/// Also pins the retention: the old name is **held** until that retraction is
-/// paid, and released the moment it is. Held is not permanent, and this is the
-/// half a wrong fix in the other direction gets backwards.
+/// Also pins the RECLAIMABILITY. A surviving rename VACATES its old name — the
+/// service is alive under a different one — so the detached goodbye does not
+/// hold that name against re-registration the way a dead service's does. A
+/// replacement may take it while the retraction is still owed, and the
+/// retraction still goes out. (A goodbye that HOLDS its name is the other case
+/// entirely: the service went terminal under the name it already had, so
+/// nothing is left to re-announce it and the retraction must land before the
+/// name can be reused.)
 #[test]
-fn a_surviving_rename_holds_the_old_name_until_its_retraction_is_paid() {
+fn a_surviving_rename_vacates_the_old_name_and_still_retracts_it() {
   let Some(mut mdns) = test_support::loopback_mdns() else {
     return;
   };
@@ -1517,15 +1521,28 @@ fn a_surviving_rename_holds_the_old_name_until_its_retraction_is_paid() {
       .get(&handle)
       .expect("a survived rename keeps its context")
       .withdrawing,
-    "this must be the SURVIVING path; a collision teardown would prove nothing about it"
+    "a rename must not retire the renamer; a retired service would prove \
+     nothing about the surviving path"
   );
 
   assert!(
     mdns.endpoint.has_pending_withdrawals(),
     "a surviving rename must leave the old name's goodbye owed"
   );
-  // Read past the resend interval: this tick has already pumped and confirmed
-  // the first round, and a confirmed round re-arms 250 ms out.
+  // Asserted while the retraction is STILL OWED, which is the whole point: a
+  // name held against reuse would refuse this, and a test that registered after
+  // the schedule drained would pass either way.
+  let replacement = mdns
+    .register_service(test_support::named_service_spec("survivor", ty, 9090))
+    .expect("a vacated name is reclaimable while its retraction is still owed");
+  assert_ne!(
+    replacement, handle,
+    "the replacement is a registration of its own, not the renamed service"
+  );
+
+  // And the reclaim costs the retraction nothing: it is still enqueued and still
+  // goes out. Read past the resend interval — this tick has already pumped and
+  // confirmed the first round, and a confirmed round re-arms 250 ms out.
   let first_round = Instant::now() + Duration::from_millis(400);
   let goodbyes = test_support::collect_goodbyes(&mut mdns, first_round);
   assert!(
@@ -1533,21 +1550,6 @@ fn a_surviving_rename_holds_the_old_name_until_its_retraction_is_paid() {
     "the renamed-away name must go out as a TTL=0 retraction; got {} datagram(s)",
     goodbyes.len()
   );
-
-  assert!(
-    matches!(
-      mdns.register_service(test_support::named_service_spec("survivor", ty, 9090)),
-      Err(RegisterError::NameAlreadyRegistered(_))
-    ),
-    "the vacated name must be held while its retraction is still owed"
-  );
-
-  // Released as soon as the debt is settled: the hold is the length of the
-  // goodbye schedule, not of the endpoint.
-  test_support::settle_goodbyes(&mut mdns, first_round);
-  mdns
-    .register_service(test_support::named_service_spec("survivor", ty, 9090))
-    .expect("a paid-off retraction must release the old name");
 }
 
 /// A rename the service **survives** SUPERSEDES every self-send credit recorded
@@ -1572,10 +1574,10 @@ fn a_surviving_rename_holds_the_old_name_until_its_retraction_is_paid() {
 /// that argument has to be re-made after every change to the routing, and this
 /// one does not.
 ///
-/// The rename asserted here must SURVIVE. A rename COLLISION is retired through
-/// `begin_service_withdrawal`, which supersedes for a reason of its own, so a
-/// test that drifted onto the collision path would stay green with the mutation
-/// site deleted and prove nothing about it.
+/// The rename asserted here must SURVIVE, and the assertion below pins that:
+/// a retirement supersedes for a reason of its own, so a test that drifted onto
+/// a retired service would stay green with the mutation site deleted and prove
+/// nothing about it.
 ///
 /// # Accepted residual
 ///
@@ -1623,9 +1625,9 @@ fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
       .get(&handle)
       .expect("a survived rename keeps its context")
       .withdrawing,
-    "this must be the SURVIVING path: a rename COLLISION is retired through \
-     `begin_service_withdrawal`, which supersedes for its own reason and would \
-     prove nothing about the rename"
+    "this must be the SURVIVING path: a retirement supersedes through \
+     `begin_service_withdrawal` for its own reason and would prove nothing \
+     about the rename"
   );
 
   assert_eq!(
@@ -1645,21 +1647,24 @@ fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
 }
 
 /// **The per-family case.** A goodbye that reached IPv4 but not IPv6 has not
-/// been paid, and the vacated name must stay held until it is.
+/// been paid, and the item stays alive owing exactly the family that missed.
 ///
-/// Cancelling the retraction on the replacement's announcement instead cannot be
-/// made safe: the cancellation is all-or-nothing while the debt is per family,
-/// and "the replacement supersedes it" is false for any record the replacement
-/// does not carry. This service advertises a subtype browse PTR and its
-/// replacement does not, so that PTR is retracted by the goodbye or by nothing
-/// at all — it would stay live in every IPv6 peer's cache for its whole positive
-/// TTL.
+/// The retraction is the only thing that will ever withdraw a record the
+/// replacement does not carry. This service advertises a subtype browse PTR and
+/// its replacement does not, so that PTR is retracted by the goodbye or by
+/// nothing at all — it would stay live in every IPv6 peer's cache for its whole
+/// positive TTL. So a v4 round that paid v4's debt must not be read as paying
+/// the item off.
+///
+/// The vacated name is reclaimable throughout, because a SURVIVING rename
+/// leaves a live service under a different name; the debt is what is per family
+/// here, not the name hold.
 ///
 /// The IPv6 failure is injected as a per-family withdrawal outcome rather than
 /// staged on a socket: no socket can be made to fail on demand, and the debt is
 /// the thing under test.
 #[test]
-fn an_unpaid_ipv6_retraction_holds_the_old_name_against_immediate_reuse() {
+fn an_unpaid_ipv6_retraction_keeps_owing_after_ipv4_has_paid() {
   let Some(mut mdns) = test_support::loopback_mdns() else {
     return;
   };
@@ -1683,8 +1688,8 @@ fn an_unpaid_ipv6_retraction_holds_the_old_name_against_immediate_reuse() {
   drive_to_rename(&mut mdns, &conflict).expect(RENAME_IS_NOT_ENVIRONMENTAL);
 
   // IPv4 pays, IPv6 fails, round after round: v4's debt runs out and v6's never
-  // does, which is exactly the state a same-name reuse must not be able to
-  // discard.
+  // does, which is exactly the state a per-family debt has to keep apart from
+  // "the goodbye is done".
   let base = Instant::now();
   let mut last_round = base;
   let mut retracted_subtype = false;
@@ -1709,26 +1714,24 @@ fn an_unpaid_ipv6_retraction_holds_the_old_name_against_immediate_reuse() {
     "IPv6 never sent, so the retraction is still owed"
   );
 
-  assert!(
-    matches!(
-      mdns.register_service(test_support::named_service_spec("reuse", ty, 9090)),
-      Err(RegisterError::NameAlreadyRegistered(_))
-    ),
-    "a replacement must not be able to reclaim the name while IPv6 still owes its retraction"
-  );
-
-  // IPv6 recovers inside the ceiling and pays what it owed; only then is the
-  // name free.
-  test_support::settle_goodbyes(&mut mdns, last_round);
+  // The name is the renamed service's to give up, and it gave it up: a
+  // replacement takes it while IPv6 still owes, and the owed round still goes
+  // out afterwards.
   mdns
     .register_service(test_support::named_service_spec("reuse", ty, 9090))
-    .expect("once every family has retracted, the name is reclaimable");
+    .expect("a surviving rename vacates its old name; the goodbye does not hold it");
+
+  // IPv6 recovers inside the ceiling and pays what it owed.
+  test_support::settle_goodbyes(&mut mdns, last_round);
+  assert!(
+    !mdns.endpoint.has_pending_withdrawals(),
+    "once every family has retracted, nothing is owed"
+  );
 }
 
 /// Consecutive renames each owe their own retraction. The handoff is one-shot
-/// and the proto overwrites it on the next rename, so a driver that takes it
-/// late — or not at all — retracts the second name and silently strands the
-/// first.
+/// and the next rename overwrites it, so an endpoint that drained it late — or
+/// not at all — would retract the second name and silently strand the first.
 #[test]
 fn consecutive_renames_each_retract_their_own_old_name() {
   let Some(mut mdns) = test_support::loopback_mdns() else {
@@ -1770,22 +1773,26 @@ fn consecutive_renames_each_retract_their_own_old_name() {
   );
 }
 
-/// A rename whose new name collides with another local registration tears the
-/// service down — and its old name must then be **held** until the retraction
-/// completes, so a same-name re-registration cannot cancel the only TTL=0 that
-/// name will ever get.
+/// A §9 auto-rename lands on a name **no local route holds**, and the route
+/// table agrees with the state machine about it.
 ///
-/// The mirror of the surviving case, and what stops the fix being "always pass
-/// reclaimable": the retention flag is the rename's own outcome, not a constant.
+/// The endpoint collects its own route table's instance names on the tick a
+/// rename is imminent, hands them to the state machine, and mirrors whatever
+/// name comes back into the route in the same borrow. So a suffix another local
+/// registration already owns is stepped over rather than claimed, the service
+/// survives its rename, and there is no window in which routing and the state
+/// machine disagree about which name is being probed. There is no collision for
+/// this driver to reconcile, and no path by which a rename retires the renamer.
 #[test]
-fn a_colliding_rename_holds_the_old_name_until_it_is_retracted() {
+fn a_rename_lands_on_a_free_name_and_the_route_table_agrees() {
   let Some(mut mdns) = test_support::loopback_mdns() else {
     return;
   };
   let ty = "_hick-mio-rn3._tcp.local.";
   let old = format!("clash.{ty}");
-  // Owns the name the rename will reach for, so the rebrand collides locally.
-  mdns
+  // Owns the FIRST suffix the rename would otherwise reach for, so a rename
+  // that did not consult the route table would claim a name already taken.
+  let rival = mdns
     .register_service(test_support::named_service_spec("clash-1", ty, 9090))
     .expect("register the rival");
   let handle = mdns
@@ -1796,145 +1803,50 @@ fn a_colliding_rename_holds_the_old_name_until_it_is_retracted() {
   }
 
   let conflict = test_support::conflict_response(&old);
-  let deadline = Instant::now() + Duration::from_secs(10);
-  let mut conflicted = false;
-  while Instant::now() < deadline && !conflicted {
-    test_support::ingest(&mut mdns, &conflict, Instant::now());
-    mdns.tick().expect("tick");
-    while let Some(ev) = mdns.next_event() {
-      if let Event::Service { handle: h, update } = ev
-        && h == handle
-        && update.is_conflict()
-      {
-        conflicted = true;
-      }
-    }
-    std::thread::sleep(Duration::from_millis(20));
-  }
-  assert!(
-    conflicted,
-    "the rival registration already owns the label this rename reaches for, and \
-     the conflicting probe is ingested without touching a socket, so the local \
-     collision is in-memory work that must happen"
+  let new_name = drive_to_rename(&mut mdns, &conflict).expect(RENAME_IS_NOT_ENVIRONMENTAL);
+  assert_ne!(
+    new_name,
+    format!("clash-1.{ty}"),
+    "the rival already holds that name; a rename that claims it puts two live \
+     routes on one instance name"
   );
 
   assert!(
-    matches!(
-      mdns.register_service(test_support::named_service_spec("clash", ty, 7070)),
-      Err(RegisterError::NameAlreadyRegistered(_))
-    ),
-    "a colliding rename must HOLD the old name until its retraction completes"
-  );
-  let goodbyes = goodbyes_now(&mut mdns);
-  assert!(
-    goodbyes.iter().any(|d| test_support::retracts(d, &old)),
-    "the torn-down service's old name must still be retracted"
-  );
-}
-
-/// Rename `handle` **without letting stage 5 see it**, so the one-shot §9
-/// handoff is still parked on the service when the caller unregisters it.
-///
-/// `push_updates` takes the handoff on every rename it observes, which is
-/// correct and is what production normally does. The window this reaches is the
-/// other one: a caller that unregisters a service in the same breath as the
-/// rename, so `begin_service_withdrawal` is the site holding both a handoff and
-/// a snapshot to enqueue. Running the §8.1 probe machinery through stages 3 and
-/// 4 alone — never `tick`, which would run stage 5 — is what holds that window
-/// open for the length of a test rather than a scheduler quantum.
-fn rename_leaving_the_handoff_parked(
-  mdns: &mut Mdns,
-  handle: mdns_proto::ServiceHandle,
-  old: &str,
-) -> bool {
-  /// Drain this service's own updates, reporting whether a rename was among
-  /// them. Draining is the point: an update stage 5 never sees is a handoff
-  /// stage 5 never takes.
-  fn took_the_rename(mdns: &mut Mdns, handle: mdns_proto::ServiceHandle) -> bool {
-    let mut renamed = false;
-    if let Some(ctx) = mdns.services.get_mut(&handle) {
-      while let Some(update) = ctx.proto.poll() {
-        renamed |= matches!(update, mdns_proto::ServiceUpdate::Renamed(_));
-      }
-    }
-    renamed
-  }
-
-  let conflict = test_support::conflict_response(old);
-  let deadline = Instant::now() + Duration::from_secs(10);
-  while Instant::now() < deadline {
-    test_support::ingest(mdns, &conflict, Instant::now());
-    if took_the_rename(mdns, handle) {
-      return true;
-    }
-    let now = Instant::now();
-    mdns.fire_timeouts(now);
-    mdns.drain_transmits(now);
-    if took_the_rename(mdns, handle) {
-      return true;
-    }
-    std::thread::sleep(Duration::from_millis(20));
-  }
-  false
-}
-
-/// The rename item and the service item are **two** schedules, so they take two
-/// creation instants.
-///
-/// A withdrawal item's `next_at` *is* the instant it was created, so an item is
-/// due at exactly that instant and not before. Polling at the earlier of the two
-/// therefore offers exactly one item — unless the two were created from one
-/// reading, in which case both are due at it and both go out. That is the whole
-/// observable difference, and this test is the whole of what is checkable from
-/// outside.
-///
-/// **Weak, and worth saying so.** It pins the *direction* — the service item's
-/// schedule begins after the rename item's, so the entire
-/// `enqueue_rename_withdrawal` is not charged to the service item's 2 s
-/// anti-pin ceiling — and nothing about the magnitude, which is one enqueue
-/// wide. Nothing here would catch a future site that shared a reading between
-/// two consumers a few instructions apart. The property that does is structural:
-/// each enqueue reads its own clock, adjacent to its own use, and there is no
-/// value in scope for a second consumer to reach for. This is the residual, and
-/// it is accepted rather than argued away.
-#[test]
-fn two_withdrawal_items_take_two_creation_instants() {
-  let Some(mut mdns) = test_support::loopback_mdns() else {
-    return;
-  };
-  let ty = "_hick-mio-two-anchors._tcp.local.";
-  let old = format!("anchors.{ty}");
-  let handle = mdns
-    .register_service(test_support::named_service_spec("anchors", ty, 8080))
-    .expect("register_service");
-  if !test_support::drive_to_advertised(&mut mdns, handle) {
-    return;
-  }
-  assert!(
-    rename_leaving_the_handoff_parked(&mut mdns, handle, &old),
-    "{RENAME_IS_NOT_ENVIRONMENTAL}"
-  );
-
-  // Both items are created inside this one call: the rename handoff's, then the
-  // service's own.
-  mdns.unregister_service(handle);
-  let first = mdns.endpoint.next_withdrawal_deadline().expect(
-    "unregistering an announced service that is still holding a parked rename \
-     handoff must enqueue both withdrawals, so one of them is due at an instant \
-     the endpoint can name",
-  );
-  let due = test_support::collect_goodbyes_as(
-    &mut mdns,
-    first,
-    FamilyAttempt::Refused { permanent: false },
-    FamilyAttempt::Refused { permanent: false },
+    !mdns
+      .services
+      .get(&handle)
+      .expect("a renamed service keeps its context")
+      .withdrawing,
+    "the rename is survivable: nothing may retire the renamer"
   );
   assert_eq!(
-    due.len(),
-    1,
-    "at the EARLIER item's own creation instant only that item is due; a second \
-     datagram here means both schedules were anchored at one reading, which \
-     charges the whole of the first enqueue to the second item's 2 s ceiling"
+    mdns
+      .endpoint
+      .service(handle)
+      .expect("the endpoint still owns the renamed service")
+      .name()
+      .as_str(),
+    new_name,
+    "the state machine's name is what the caller was told"
+  );
+  assert!(
+    matches!(
+      mdns.register_service(test_support::named_service_spec(
+        new_name
+          .split_once('.')
+          .expect("an instance name has a label")
+          .0,
+        ty,
+        7070
+      )),
+      Err(RegisterError::NameAlreadyRegistered(_))
+    ),
+    "the ROUTE holds the new name too: routing and the state machine were \
+     updated in one borrow, so a question for the new name reaches this service"
+  );
+  assert!(
+    mdns.endpoint.service(rival).is_some(),
+    "the rival keeps the name it registered"
   );
 }
 
@@ -2415,9 +2327,9 @@ fn a_refused_probe_does_not_advance_the_probe_sequence() {
 
   let state = |mdns: &Mdns| {
     mdns
-      .services
-      .get(&handle)
-      .map(|ctx| ctx.proto.state())
+      .endpoint
+      .service(handle)
+      .map(|svc| svc.state())
       .expect("the service is still registered")
   };
   assert_eq!(
@@ -2508,9 +2420,9 @@ fn a_probe_one_of_two_families_carried_advances_the_sequence() {
 
   let state = |mdns: &Mdns| {
     mdns
-      .services
-      .get(&handle)
-      .map(|ctx| ctx.proto.state())
+      .endpoint
+      .service(handle)
+      .map(|svc| svc.state())
       .expect("the service is still registered")
   };
   // `Init` is where a freshly registered service sits out §8.1's initial
@@ -2610,13 +2522,13 @@ fn a_family_that_gave_up_on_receiving_is_reported_as_degraded() {
 /// A confirm arriving after the rename would be applied to whatever commit token
 /// the *new* name holds — latching the old name's instance ownership onto a name
 /// that has announced nothing, and opening the reclaim-cancel gate with it. That
-/// is unreachable because every datagram is confirmed inside the `poll_transmit`
-/// iteration that produced it, so the rename observed in stage 5 can never land
-/// between a poll and its confirm.
+/// is unreachable because every datagram is confirmed inside the
+/// `poll_service_transmit` iteration that produced it, so the rename can never
+/// land between a poll and its confirm.
 ///
 /// Two things pin it. The core asserts the contract from its own side in debug
-/// builds — `Service::handle_event` and `Service::handle_timeout` panic outright
-/// if a commit token is live, and both run on **every** tick this test drives.
+/// builds — the inbound-event dispatch and the timeout tick panic outright if a
+/// commit token is live, and both run on **every** tick this test drives.
 /// And the renamed service must go on to complete a fresh §8 lifecycle under its
 /// new name, which a stuck token makes impossible: the core emits no further
 /// datagram at all until its single token slot is spent.
@@ -2648,9 +2560,9 @@ fn a_rename_leaves_no_transmit_still_awaiting_a_confirm() {
   while Instant::now() < deadline && !advertised {
     mdns.tick().expect("tick");
     advertised = mdns
-      .services
-      .get(&handle)
-      .is_some_and(|ctx| ctx.proto.advertises_instance());
+      .endpoint
+      .service(handle)
+      .is_some_and(|svc| svc.advertises_instance());
     std::thread::sleep(Duration::from_millis(20));
   }
   assert!(
@@ -2707,8 +2619,8 @@ fn the_receive_error_backoff_escalates_and_is_capped() {
 
 // ── an encode failure is leftover work ──────────────────────────────────────
 //
-// `Service::poll_transmit` failing leaves the datagram armed inside the proto
-// layer: the core retries the same one on the next call and schedules no
+// `Endpoint::poll_service_transmit` failing leaves the datagram armed inside the
+// core: it retries the same one on the next call and schedules no
 // deadline for something it has already armed. Nothing in `next_timeout`'s
 // deadline fold speaks for it, and mio's readiness is edge-triggered, so no
 // event can announce in-memory work either. If the drain reports the exit as
@@ -2963,9 +2875,9 @@ fn an_undeliverable_sustained_transmit_retires_the_service() {
   );
   assert!(
     mdns
-      .services
-      .get(&handle)
-      .is_none_or(|ctx| ctx.proto.state() == ServiceState::Probing(0)),
+      .endpoint
+      .service(handle)
+      .is_none_or(|svc| svc.state() == ServiceState::Probing(0)),
     "the §8.1 sequence never advanced: nothing reached a link"
   );
 }
@@ -3033,7 +2945,7 @@ fn a_transient_all_family_failure_retries_and_never_retires() {
     .sockets
     .force_send_wouldblock_for_test(Family::V4, false);
   let deadline = Instant::now() + Duration::from_secs(2);
-  let state = |mdns: &Mdns| mdns.services.get(&handle).map(|ctx| ctx.proto.state());
+  let state = |mdns: &Mdns| mdns.endpoint.service(handle).map(|svc| svc.state());
   while Instant::now() < deadline && state(&mdns) == Some(ServiceState::Probing(0)) {
     mdns.tick().expect("tick");
     std::thread::sleep(Duration::from_millis(20));
@@ -3108,7 +3020,7 @@ fn an_emsgsize_below_the_hard_limit_never_retires_a_sustained_producer() {
     mdns.sockets.force_send_emsgsize_for_test(family, false);
   }
   let deadline = Instant::now() + Duration::from_secs(2);
-  let state = |mdns: &Mdns| mdns.services.get(&handle).map(|ctx| ctx.proto.state());
+  let state = |mdns: &Mdns| mdns.endpoint.service(handle).map(|svc| svc.state());
   while Instant::now() < deadline && state(&mdns) == Some(ServiceState::Probing(0)) {
     mdns.tick().expect("tick");
     std::thread::sleep(Duration::from_millis(20));
@@ -3217,9 +3129,9 @@ fn an_undeliverable_one_shot_reply_costs_the_reply_and_not_the_service() {
   );
   assert!(
     mdns
-      .services
-      .get(&handle)
-      .is_some_and(|ctx| ctx.proto.advertises_instance()),
+      .endpoint
+      .service(handle)
+      .is_some_and(|svc| svc.advertises_instance()),
     "the service still owns and advertises its instance name"
   );
 }
@@ -5370,7 +5282,7 @@ fn the_withdrawal_seam_supersedes_outstanding_credits() {
 /// CHANGED, so every credit already recorded describes a state it has left. A
 /// registration only INSERTS a route. It mutates no record this endpoint has
 /// already asserted: there is no RFC 6762 §8.4 records mutator, a duplicate
-/// instance name and a name still held by a collision goodbye are both refused,
+/// instance name and a name a §10.1 goodbye still holds are both refused,
 /// and a live-route host disagreement is refused by
 /// `Endpoint::host_addresses_disagree`. The negative assertions are covered too
 /// — the encoder emits exactly one §6.1 NSEC per service and it is owned by the

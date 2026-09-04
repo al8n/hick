@@ -1,6 +1,7 @@
 //! The runtime-agnostic mDNS engine: a synchronous *pump* that drives the
-//! [`mdns_proto::Endpoint`] (plus the per-service / per-query state machines it
-//! hands back) over a [`UdpIo`] transport.
+//! [`mdns_proto::Endpoint`] — which owns every per-service and per-query state
+//! machine, reached through its `*_service*` / `*_query*` methods — over a
+//! [`UdpIo`] transport.
 //!
 //! A driver (e.g. `hick-embassy`, or a bare poll loop) calls [`Engine::pump`]
 //! whenever a packet arrives or a timer fires, sends nothing itself, and reads
@@ -22,9 +23,8 @@ use mdns_proto::{
   cache::CacheEntry,
   endpoint::{Endpoint, EndpointEventEntry, FamilyDebt, Provenance, Received, ServiceRoute},
   error::{RegisterServiceError, StartQueryError},
-  event::{EndpointEvent, QueryUpdate, RouteEvent, ServiceUpdate},
+  event::{EndpointEvent, QueryUpdate, ServiceUpdate},
   query::Query,
-  service::Service,
   slab::Slab,
   transmit::{FamilyAttempt, Transmit, TransmitConfirm, TransmitObligation},
 };
@@ -387,23 +387,31 @@ enum SelfLog {
 type AnswerPool = Slab<CollectedAnswer>;
 type UpdatePool = Slab<QueryUpdate>;
 type ProtoQuery<I> = Query<I, AnswerPool, UpdatePool>;
-type ProtoService<I> = Service<I, Slab<Transmit>, Slab<ServiceUpdate>>;
+/// One routing entry, which OWNS the `Service` state machine it routes to. The
+/// engine holds no `Service` of its own and reaches one only through the
+/// endpoint's `*_service*` methods.
+type ProtoServiceRoute<I> = ServiceRoute<I, Slab<Transmit>, Slab<ServiceUpdate>>;
 type ProtoEndpoint<I, R> = Endpoint<
   I,
   R,
   Slab<CacheEntry<I>>,
-  Slab<ServiceRoute>,
+  Slab<ProtoServiceRoute<I>>,
   Slab<ProtoQuery<I>>,
   Slab<EndpointEventEntry>,
   AnswerPool,
   UpdatePool,
+  Slab<Transmit>,
+  Slab<ServiceUpdate>,
 >;
 
-/// Per-service driver-side state: the proto state machine, a queue of
-/// app-facing updates, and an `errored` flag that drops a structurally-dead
-/// service out of every pump (so it can't busy-spin).
+/// Per-service driver-side state: a queue of app-facing updates, and an
+/// `errored` flag that drops a structurally-dead service out of every pump (so
+/// it can't busy-spin).
+///
+/// The state machine is NOT here — the endpoint owns every `Service`, and every
+/// transition runs through its `*_service*` methods. What a handle keeps here is
+/// the bookkeeping the endpoint has no opinion about.
 struct ServiceSlot<I: Instant> {
-  proto: ProtoService<I>,
   updates: VecDeque<ServiceUpdate>,
   errored: bool,
   /// When each family last ACCEPTED one of THIS service's gated datagrams, so
@@ -1302,9 +1310,9 @@ impl<I: Instant> Multicaster<I> {
   /// # Where the engine must call it, which is TWO events
   ///
   /// At every mutation of what this engine publishes, and RFC 6762 §8.4 record
-  /// updating being unimplemented, that is the `begin_withdrawal` retiring a
-  /// route (however the retirement was reached) and the §9 AUTOMATIC RENAME,
-  /// taken at the `ServiceUpdate::Renamed` the engine observes. `hick-udp`'s
+  /// updating being unimplemented, that is the withdrawal retiring a route
+  /// (however the retirement was reached) and the §9 AUTOMATIC RENAME, taken at
+  /// the `ServiceUpdate::Renamed` the engine observes. `hick-udp`'s
   /// `SelfSendTracker::supersede` holds the same rule for the `std` drivers; the
   /// two stacks keep their own send logs, so the rule is written out twice on
   /// purpose and the two copies must be changed together.
@@ -1479,16 +1487,15 @@ where
     );
   }
 
-  /// Register a service. The proto state machine is owned by the engine and
-  /// driven by [`Self::pump`]; updates are read via [`Self::poll_service_update`].
+  /// Register a service. The state machine is owned by the ENDPOINT and driven
+  /// by [`Self::pump`] through its `*_service*` methods; updates are read via
+  /// [`Self::poll_service_update`].
   pub fn register_service(
     &mut self,
     spec: ServiceSpec,
     now: I,
   ) -> Result<ServiceHandle, RegisterServiceError> {
-    let (handle, proto) = self
-      .endpoint
-      .try_register_service::<Slab<Transmit>, Slab<ServiceUpdate>>(spec, now)?;
+    let handle = self.endpoint.try_register_service(spec, now)?;
     // NO SUPERSEDE HERE. A registration only INSERTS a route: it mutates no
     // record this engine has already asserted, positive or negative, so every
     // entry in the log still describes a state the engine is in. See
@@ -1497,7 +1504,6 @@ where
     self.services.insert(
       handle,
       ServiceSlot {
-        proto,
         updates: VecDeque::new(),
         errored: false,
         route_freed: false,
@@ -1517,10 +1523,9 @@ where
   /// The withdrawal covers whatever the service must retract: the records it
   /// confirmed-emitted under its current name (host A/AAAA filtered against
   /// same-host siblings by the endpoint), AND — if a conflict rename left an
-  /// old-name withdrawal still pending — that old instance name too, in the SAME
-  /// goodbye ([`Service::withdrawal_snapshot`] captures both). A never-announced
-  /// service has an empty snapshot and completes on the next pump with no
-  /// datagram queued.
+  /// old-name goodbye still undrained — that old instance name too, as its own
+  /// independent item. A never-announced service has an empty snapshot and
+  /// completes on the next pump with no datagram queued.
   ///
   /// The driver slot is NOT removed here: it is kept (marked `errored`) so any
   /// already-queued `ServiceUpdate::Conflict` still reaches the host, and is GC'd
@@ -1780,9 +1785,10 @@ where
         // there against the transmit's own obligation — so nothing here needs to
         // read a meaning into the fan-out first.
         //
-        // Resolve the commit token FIRST, then act on the verdict. A service's
-        // `withdrawal_snapshot` reports only what a confirm has already latched,
-        // and a query's terminal transition is bound by the same contract, so
+        // Resolve the commit token FIRST, then act on the verdict. The
+        // withdrawal snapshot the endpoint takes reports only what a confirm has
+        // already latched, and a query's terminal transition is bound by the
+        // same contract, so
         // retiring under a live token would build the §10.1 goodbye from a
         // producer the core still considers mid-datagram.
         //
@@ -2001,8 +2007,11 @@ where
     }
   }
 
-  /// Feed one received datagram to the endpoint and route its `ToService`
-  /// events to the owning service state machine.
+  /// Feed one received datagram to the endpoint.
+  ///
+  /// The endpoint applies each service event to the service it addresses as the
+  /// route-event iterator is walked, at this datagram's receipt instant, so the
+  /// walk below is the dispatch and there is nothing here to forward.
   ///
   /// `now` carries a caller-facing bound as well as the core's schedules:
   /// `Endpoint::handle` weighs a query's `QuerySpec::with_timeout` window against
@@ -2075,28 +2084,19 @@ where
     } else {
       Provenance::NotFromUs
     };
-    // Split borrow: `endpoint.handle` holds `&mut self.endpoint` while the
-    // route-event iterator is alive, so per-service routing reads
-    // `self.services` through the disjoint field.
-    let Self {
-      endpoint, services, ..
-    } = self;
-    let events = match endpoint.handle(
+    let events = match self.endpoint.handle(
       now,
       Received::new(src, data, provenance).with_local_ip(local_ip),
     ) {
       Ok(events) => events,
       Err(_) => return,
     };
+    // Service events and query answers are both applied inside
+    // `Endpoint::handle`; every remaining variant is a hook this engine does not
+    // consume yet. The iterator is still walked to completion, because walking
+    // it is what performs that dispatch.
     for event in events {
       match event {
-        Ok(RouteEvent::ToService(to_service)) => {
-          if let Some(slot) = services.get_mut(&to_service.handle())
-            && !slot.errored
-          {
-            slot.proto.handle_event(to_service.into_event(), now);
-          }
-        }
         Ok(_) => {}
         Err(_) => break,
       }
@@ -2107,10 +2107,13 @@ where
   fn fire_timeouts(&mut self, now: I) {
     let _ = self.endpoint.handle_timeout(now);
 
-    // Split-borrow so the query sweep reads `queries` in place and ticks via the
+    // Split-borrow so both sweeps read their map in place and tick via the
     // disjoint `endpoint` field — no per-tick Vec snapshot.
     let Self {
-      endpoint, queries, ..
+      endpoint,
+      queries,
+      services,
+      ..
     } = &mut *self;
     for (&handle, slot) in queries.iter() {
       if slot.errored {
@@ -2118,32 +2121,26 @@ where
       }
       let _ = endpoint.handle_query_timeout(handle, now);
     }
-
-    for slot in self.services.values_mut() {
+    for (&handle, slot) in services.iter() {
       if !slot.errored {
-        let _ = slot.proto.handle_timeout(now);
+        let _ = endpoint.handle_service_timeout(handle, now);
       }
     }
   }
 
-  /// Drain each service's proto updates into its app-facing queue, performing
-  /// the RFC 6762 §9 auto-rename routing (`handle_service_renamed`) before
-  /// surfacing a `Renamed` update.
+  /// Drain each service's updates into its app-facing queue.
   ///
-  /// A §9 rename of an ANNOUNCED service needs a TTL=0 withdrawal of the OLD
-  /// instance name. The proto hands it off the instant the rename happens
-  /// (`Service::take_rename_goodbye_handoff`); this driver enqueues it as an
-  /// INDEPENDENT detached withdrawal item via
-  /// [`Endpoint::enqueue_rename_withdrawal`], for BOTH a surviving rename and a
-  /// collision teardown. The endpoint drives that item's goodbye schedule on the
-  /// normal withdrawal pump; the proto no longer emits the old-name goodbye from
-  /// its own `poll_transmit`.
+  /// A [`ServiceUpdate::Renamed`] arriving here is a pure NOTIFICATION. The
+  /// endpoint picked a name its own route table does not hold, mirrored it into
+  /// the route, and enqueued the old name's RFC 6762 §9 TTL=0 goodbye as an
+  /// independent detached withdrawal item — all inside the timeout that renamed
+  /// the service. There is no routing left to perform here and no collision to
+  /// reconcile, because the endpoint cannot produce one.
   ///
-  /// When the NEW name additionally collides with another LOCAL service
-  /// (`handle_service_renamed` returns Err) the service is also torn down: its
-  /// CURRENT name is withdrawn via the endpoint-owned withdrawal lifecycle
-  /// ([`Self::begin_service_withdrawal`]), which holds the route and resends
-  /// before freeing the name. (The old-name detached item was already enqueued.)
+  /// A TERMINAL update (an unresolvable §9 conflict, or the host name claimed
+  /// during probing) still retires the service here: the endpoint-owned §10.1
+  /// withdrawal is begun ([`Self::begin_service_withdrawal`]), which holds the
+  /// route and resends before freeing the name.
   fn drain_service_updates(&mut self, now: I) {
     self.svc_handle_scratch.clear();
     self
@@ -2153,76 +2150,33 @@ where
     while i < self.svc_handle_scratch.len() {
       let handle = self.svc_handle_scratch[i];
       i += 1;
-      while let Some(update) = self
-        .services
-        .get_mut(&handle)
-        .filter(|slot| !slot.errored)
-        .and_then(|slot| slot.proto.poll())
+      while self.services.get(&handle).is_some_and(|slot| !slot.errored)
+        && let Some(update) = self.endpoint.poll_service(handle)
       {
-        if let ServiceUpdate::Renamed(ref renamed) = update {
-          // A §9 auto-rename is a PUBLISHED-RECORD MUTATION: the proto called
-          // `Service::set_instance` before it emitted this update, so every
-          // entry recorded under the abandoned instance name describes a state
-          // this engine has left.
+        if matches!(update, ServiceUpdate::Renamed(_)) {
+          // A §9 auto-rename is a PUBLISHED-RECORD MUTATION: the state machine
+          // called `Service::set_instance` before it emitted this update, so
+          // every entry recorded under the abandoned instance name describes a
+          // state this engine has left.
           //
-          // UNCONDITIONALLY, and at the mutation. A rename that COLLIDES is torn
-          // down through `begin_service_withdrawal`, which supersedes for its own
-          // reason; a SURVIVING one crosses no other seam at all, so until the
-          // next withdrawal or rename — a registration is not one of them and
-          // does not help here — every entry for the abandoned owner still reads
-          // as `SelfLog::Current` and reaches
+          // UNCONDITIONALLY, and at the mutation. A rename crosses no other seam
+          // at all, so until the next withdrawal or rename — a registration is
+          // not one of them and does not help here — every entry for the
+          // abandoned owner still reads as `SelfLog::Current` and reaches
           // `Provenance::OwnEchoLikely`, which ADJUDICATES. Whether a given stale
           // entry can then reach an adverse route is a routing question that
           // would have to be re-derived after every change to the routing; the
           // invariant is stated over mutations so it does not have to be. See
           // `Multicaster::supersede`.
           self.tx.supersede();
-          let new_name = renamed.new_name().clone();
-          let rename_result = self.endpoint.handle_service_renamed(handle, new_name);
-          // The §9 rename of an announced service hands its OLD-name TTL=0 goodbye
-          // off as an INDEPENDENT detached withdrawal item, both for a SURVIVING
-          // rename and a COLLISION teardown. Take it from the proto the instant the
-          // rename is observed (into a local, releasing the `self.services` borrow
-          // before re-borrowing `self.endpoint`) and enqueue it — the Service no
-          // longer drains the old-name goodbye itself.
-          let handoff = self
-            .services
-            .get_mut(&handle)
-            .and_then(|slot| slot.proto.take_rename_goodbye_handoff());
-          if let Some(handoff) = handoff {
-            // A rename COLLISION (rename_result Err) tears the service down: its old
-            // name must HOLD until the goodbye completes so a quick re-register
-            // cannot cancel the only retraction. A SURVIVING rename
-            // stays reclaimable.
-            self
-              .endpoint
-              .enqueue_rename_withdrawal(handoff, now, rename_result.is_err());
-          }
-          if rename_result.is_err() {
-            // The new name collides with another local service; the service has
-            // already rebranded and can't be kept. Surface `Conflict` and mark it
-            // errored so every pump skips it for transmits. Begin the endpoint-owned
-            // withdrawal for the CURRENT name, which holds the route (keeping the
-            // name reserved) while it resends, and frees the name on completion. The
-            // OLD name's goodbye was already enqueued above as its own detached item.
-            // The slot stays until then so this queued `Conflict` still reaches the
-            // host (GC'd in `pump`).
-            if let Some(slot) = self.services.get_mut(&handle) {
-              slot.push_update(ServiceUpdate::Conflict);
-              slot.errored = true;
-            }
-            self.begin_service_withdrawal(handle, now);
-            break;
-          }
         }
-        // A terminal emitted DIRECTLY by the proto state machine (an unresolvable
-        // §9 conflict, or the host name claimed during probing) RETIRES the
-        // service, exactly like the rebrand-collision path above: queue the
-        // terminal, mark the slot errored so every pump skips it, begin the
-        // endpoint-owned §10.1 withdrawal (which holds the route and drives the
-        // goodbye resend, GC'ing the slot on completion), and stop draining.
-        // Without this a proto-emitted terminal left the smoltcp route registered
-        // and still answered/driven after the caller saw the terminal.
+        // A terminal (an unresolvable §9 conflict, or the host name claimed
+        // during probing) RETIRES the service: queue the terminal, mark the slot
+        // errored so every pump skips it, begin the endpoint-owned §10.1
+        // withdrawal (which holds the route and drives the goodbye resend,
+        // GC'ing the slot on completion), and stop draining. Without this a
+        // terminal left the smoltcp route registered and still answered/driven
+        // after the caller saw it.
         let is_terminal = update.is_conflict() || update.is_host_conflict();
         if let Some(slot) = self.services.get_mut(&handle) {
           slot.push_update(update);
@@ -2238,44 +2192,25 @@ where
     }
   }
 
-  /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle`: snapshot
-  /// what its CURRENT name's goodbye must retract
-  /// ([`Service::withdrawal_snapshot`]) and hand it to
-  /// [`Endpoint::begin_withdrawal`]. The endpoint KEEPS the route (holding the
-  /// name) and drives the resend schedule; the route is freed and the driver slot
-  /// GC'd when [`Endpoint::drain_completed_withdrawals`] reports completion in
-  /// [`Self::pump`]. Any in-flight §9 rename old-name goodbye is a SEPARATE
-  /// detached item already enqueued via [`Endpoint::enqueue_rename_withdrawal`].
+  /// Begin the endpoint-owned RFC 6762 §10.1 withdrawal for `handle` through
+  /// [`Endpoint::unregister_service`], which snapshots what the CURRENT name's
+  /// goodbye must retract and drains any still-undrained §9 rename goodbye into
+  /// its own independent detached item. The endpoint KEEPS the route (holding
+  /// the name) and drives the resend schedule; the route is freed and the driver
+  /// slot GC'd when [`Endpoint::drain_completed_withdrawals`] reports completion
+  /// in [`Self::pump`].
   ///
   /// The driver slot is left in place (the caller marks it `errored`) so a queued
   /// `ServiceUpdate::Conflict` still reaches the host before the slot is GC'd.
-  /// `begin_withdrawal` is idempotent, so calling this for an already-withdrawing
-  /// service is a no-op. A no-op for an unknown driver handle.
+  /// `unregister_service` is idempotent, so calling this for an
+  /// already-withdrawing service is a no-op, as is calling it for an unknown
+  /// handle.
   fn begin_service_withdrawal(&mut self, handle: ServiceHandle, now: I) {
-    // Scope the `slot` borrow so it ends before `self.endpoint` is touched (the
-    // snapshot is owned, so no borrow of `self.services` outlives this block).
-    // ALSO take any pending §9 rename handoff here: a retirement that races a
-    // queued `Renamed` update (closed receiver / explicit unregister) never
-    // reaches the update-drain site that normally enqueues it, which would strand
-    // the old-name goodbye in a proto being GC'd. `.take()` makes the handoff
-    // exactly-once vs the update-drain path.
-    let (snap, handoff) = match self.services.get_mut(&handle) {
-      Some(slot) => {
-        let handoff = slot.proto.take_rename_goodbye_handoff();
-        (slot.proto.withdrawal_snapshot(), handoff)
-      }
-      None => return,
-    };
-    if let Some(handoff) = handoff {
-      // Retirement = the service is dead: hold its old name until the goodbye
-      // completes so a re-register cannot cancel it.
-      self.endpoint.enqueue_rename_withdrawal(handoff, now, true);
-    }
     // The withdrawing route stops holding its host name for the registration
     // guard, so a replacement may take that name with a DIFFERENT address set
     // while this goodbye drains. See `SelfLog::Superseded`.
     self.tx.supersede();
-    self.endpoint.begin_withdrawal(handle, snap, now);
+    self.endpoint.unregister_service(handle, now);
   }
 
   /// This producer's per-family wire gate, copied out for a fan-out.
@@ -2331,29 +2266,28 @@ where
     while i < self.svc_handle_scratch.len() {
       let handle = self.svc_handle_scratch[i];
       i += 1;
-      // NLL note: the `slot` borrow is scoped to the `match` block so it ends
-      // before the post-match in-iteration `begin_withdrawal` call below.
+      // NLL note: the `slot` borrow is scoped to this block so it ends before
+      // the post-match in-iteration retirement call below.
       let escalated = {
-        let Some(slot) = self.services.get_mut(&handle) else {
-          continue;
-        };
-        if slot.errored {
+        if self.services.get(&handle).is_none_or(|slot| slot.errored) {
           continue;
         }
-        match slot.proto.poll_transmit(now, scratch) {
+        match self.endpoint.poll_service_transmit(handle, now, scratch) {
           Ok(Some(transmit)) => {
             return Some((transmit, Origin::Service(handle)));
           }
           Ok(None) => false,
           Err(_) => {
-            // The pending datagram can't be encoded into `scratch`; the proto
+            // The pending datagram can't be encoded into `scratch`; the core
             // re-offers it forever, so retire the service to avoid a stall.
             // Queue Conflict for the caller (unchanged — the host still learns the
             // service died) and mark the slot errored so every subsequent pump
             // skips it (no busy-spin). The `slot` borrow ends here, so the
-            // in-iteration `begin_withdrawal` call below is borrow-safe.
-            slot.push_update(ServiceUpdate::Conflict);
-            slot.errored = true;
+            // in-iteration retirement call below is borrow-safe.
+            if let Some(slot) = self.services.get_mut(&handle) {
+              slot.push_update(ServiceUpdate::Conflict);
+              slot.errored = true;
+            }
             true
           }
         }
@@ -2364,8 +2298,8 @@ where
         // cannot skip it. The endpoint KEEPS the route (holding the name) and
         // frees it when the goodbye completes; the slot is GC'd then. This
         // touches only `self.endpoint`, not `self.services`, so there is no
-        // iterator invalidation, and `begin_withdrawal` is idempotent. The slot
-        // is NOT removed here, so a queued `Conflict` still reaches the host.
+        // iterator invalidation, and the retirement is idempotent. The slot is
+        // NOT removed here, so a queued `Conflict` still reaches the host.
         self.begin_service_withdrawal(handle, now);
       }
     }
@@ -2422,37 +2356,9 @@ where
   ) -> TransmitConfirm {
     match origin {
       Origin::Service(handle) => {
-        let Some(slot) = self.services.get_mut(&handle) else {
-          return TransmitConfirm::default();
-        };
-        {
-          let confirm = slot.proto.note_transmit_outcome(fallback_at, v4, v6);
-          // Mirror the service's CONFIRMED-ADVERTISED host set into the endpoint
-          // route so sibling host-address retention (during a same-host
-          // withdrawal) honours what this service ACTUALLY announced, not its
-          // configured addresses. That set grows exactly when ownership latches,
-          // i.e. on any delivery, so a round that reached no wire has nothing to
-          // mirror and nothing to gate. Idempotent overwrite. `slot.proto` (read)
-          // and `self.endpoint` (mut) are disjoint fields, so this borrow is fine.
-          if confirm.any_delivered() {
-            // The reclaim-cancel gate is the ALL-delivered announcement fact the
-            // CORE computes, ferried verbatim. It is emphatically NOT
-            // `advertises_instance()` — that latch fires on any delivery by any
-            // transmit kind, so a v4-only announcement (or a §6.7 legacy unicast
-            // reply, which has one obligated link and is therefore all-delivered
-            // by construction) would cancel a renamed-away name's goodbye that
-            // the unserved family still needs. `FullyAnnounced` has no public
-            // constructor precisely so that substitution cannot compile, and it
-            // names the service it was minted from, so it cannot be applied to a
-            // different one either.
-            self.endpoint.note_service_announced(
-              slot.proto.has_fully_announced(),
-              slot.proto.advertised_a_addrs(),
-              slot.proto.advertised_aaaa_addrs(),
-            );
-          }
-          confirm
-        }
+        self
+          .endpoint
+          .note_service_transmit_outcome(handle, fallback_at, v4, v6)
       }
       Origin::Query(handle) => {
         self
@@ -2483,7 +2389,7 @@ where
         // name) and frees it on goodbye completion, decrementing services_active
         // then. The slot is NOT removed here, so the queued `Conflict` still
         // reaches the host; it is GC'd in `pump` on completion.
-        // `begin_withdrawal` is idempotent (safe on a double retirement) and a
+        // The retirement is idempotent (safe on a double retirement) and a
         // no-op for an unknown handle.
         self.begin_service_withdrawal(handle, now);
       }
@@ -2511,11 +2417,11 @@ where
   /// driver no longer tracks them here.
   pub fn poll_deadline(&self) -> Option<I> {
     let mut best = self.endpoint.poll_timeout();
-    for slot in self.services.values() {
+    for (&handle, slot) in &self.services {
       if slot.errored {
         continue;
       }
-      if let Some(deadline) = slot.proto.poll_timeout() {
+      if let Some(deadline) = self.endpoint.poll_service_timeout(handle) {
         best = Some(best.map_or(deadline, |b| b.min(deadline)));
       }
     }

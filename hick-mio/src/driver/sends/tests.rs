@@ -328,19 +328,27 @@ fn a_families_failure_streak_is_its_own() {
 fn a_chronically_failing_family_never_opens_the_fully_announced_gate() {
   use mdns_proto::ServiceState;
   use rand::{SeedableRng, rngs::StdRng};
-  use slab::Slab;
 
   use crate::{driver::test_support, options::ServerOptions, proto::ProtoEndpoint};
 
   let opts = ServerOptions::default();
   let mut endpoint = ProtoEndpoint::try_new(*opts.endpoint_config(), StdRng::seed_from_u64(0x6a7c));
   let mut now = StdInstant::now();
-  let (_handle, mut svc) = endpoint
-    .try_register_service::<Slab<_>, Slab<_>>(
+  let handle = endpoint
+    .try_register_service(
       test_support::service_spec("_hick-mio-gate._tcp.local.", 8080),
       now,
     )
     .expect("try_register_service");
+  // Read-only observation of the endpoint-owned state machine, re-borrowed at
+  // every use because every drive below mutates the endpoint.
+  macro_rules! svc {
+    () => {
+      endpoint
+        .service(handle)
+        .expect("the endpoint owns the registered service")
+    };
+  }
 
   let mut health = SendHealth::new();
   let mut buf = vec![0u8; 1500];
@@ -349,14 +357,16 @@ fn a_chronically_failing_family_never_opens_the_fully_announced_gate() {
     // Jump the virtual clock to whatever the service is next waiting for. The
     // extra millisecond is what makes a deadline of `now` due rather than
     // pending.
-    match svc.poll_timeout() {
+    match endpoint.poll_service_timeout(handle) {
       Some(due) => now = due.max(now) + Duration::from_millis(1),
       None => now += Duration::from_secs(1),
     }
-    svc.handle_timeout(now).expect("handle_timeout");
-    if svc
-      .poll_transmit(now, &mut buf)
-      .expect("poll_transmit")
+    endpoint
+      .handle_service_timeout(handle, now)
+      .expect("handle_service_timeout");
+    if endpoint
+      .poll_service_transmit(handle, now, &mut buf)
+      .expect("poll_service_transmit")
       .is_some()
     {
       let summary = settle(
@@ -370,27 +380,27 @@ fn a_chronically_failing_family_never_opens_the_fully_announced_gate() {
           SendOutcome::Failed,
         ),
       );
-      let _ = svc.note_transmit_outcome(
+      let _ = endpoint.note_service_transmit_outcome(
+        handle,
         now,
         summary.attempts[FAMILY_V4],
         summary.attempts[FAMILY_V6],
       );
-      let _ = svc.take_rename_goodbye_handoff();
       confirms = confirms.saturating_add(1);
     }
     assert!(
-      !svc.has_fully_announced().get(),
+      !svc!().has_fully_announced().get(),
       "the driver reported one family failing and nothing else; only a \
        complete announcement heard by EVERY obligated link may open the \
        reclaim-cancel gate, and IPv6 heard none of them"
     );
-    if svc.state() == ServiceState::Established {
+    if svc!().state() == ServiceState::Established {
       break;
     }
   }
 
   assert_eq!(
-    svc.state(),
+    svc!().state(),
     ServiceState::Established,
     "the core's own patience must still carry the lifecycle past a family that \
      never delivers; a test that never got here would assert nothing"
