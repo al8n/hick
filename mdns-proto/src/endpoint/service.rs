@@ -429,6 +429,13 @@ where
   /// Next deadline at which [`Self::handle_service_timeout`] must be called for
   /// this service. `None` if it is idle, WITHDRAWING, or no longer registered.
   ///
+  /// A service whose RFC 6762 §8 startup sequence is PARKED — nothing armed
+  /// because this clock cannot represent a wait the protocol mandates — is
+  /// reported as due IMMEDIATELY. It is not idle: it owes a probe it may not
+  /// schedule, and [`Self::handle_service_timeout`] is where that is reported as
+  /// [`HandleTimeoutError::Overflow`]. Reporting no deadline would let the caller
+  /// sleep on a service that will never move again.
+  ///
   /// A withdrawing service is reported as having no deadline because it has
   /// nothing left to do: its lifecycle is finished, and the RFC 6762 §10.1
   /// goodbye that outlives it is the endpoint's own withdrawal item, scheduled
@@ -476,6 +483,9 @@ where
   /// represent the five-second wait it mandates — in which case the service is
   /// PARKED with nothing armed, which is what failing closed looks like, and
   /// this reports it rather than leaving it indistinguishable from an idle tick.
+  /// [`Self::poll_service_timeout`] reports a parked service as due immediately,
+  /// so the error repeats until the wait can be armed rather than arriving once
+  /// and then never again.
   ///
   /// `Ok(())` for an unknown handle, and for one already WITHDRAWING: there is
   /// nothing to drive. A retired state machine driven on has nothing legitimate

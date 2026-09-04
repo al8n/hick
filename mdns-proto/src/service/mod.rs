@@ -2528,6 +2528,38 @@ where
     self.rename_goodbye_handoff.take()
   }
 
+  /// Is this service's RFC 6762 §8 startup sequence PARKED — nothing armed,
+  /// nothing queued, and nothing in flight?
+  ///
+  /// The one way to reach it is a clock that cannot represent a wait the
+  /// protocol mandates: §8.1's five-second flood floor, or the ordinary probe
+  /// interval at the very end of a bounded clock. Failing closed is the required
+  /// answer there — every instant such a clock can name is sooner than the wait —
+  /// so being stuck is what compliance looks like, and the whole of what is left
+  /// is to say so rather than to look idle.
+  ///
+  /// It is DERIVED and not latched. Every conjunct is a fact about the service's
+  /// own fields at the instant it is asked, so a flag would have to be spent at
+  /// each of the several places a deadline is armed and could go stale at any of
+  /// them — and the failure mode of a stale one is a service that reports itself
+  /// parked forever, which is the very stall this exists to report.
+  ///
+  /// `Announcing`, `Established` and `Conflicting` are excluded because none of
+  /// them owes a probe: a terminal state has nothing to schedule, and a service
+  /// past its probe sequence re-arms from its own confirms. A pending transmit or
+  /// a live commit token means there is work the driver has still to draw, so the
+  /// service is not silent whatever its deadline says.
+  fn startup_parked(&self) -> bool {
+    self.lifecycle_deadline.is_none()
+      && self.pending_transmits.iter().all(Option::is_none)
+      && self.awaiting_confirm.is_none()
+      && !self.probe_on_wire
+      && matches!(
+        self.state,
+        ServiceState::Init | ServiceState::Probing(_)
+      )
+  }
+
   /// Returns the next deadline at which `handle_timeout` should be called.
   ///
   /// This is the minimum of `lifecycle_deadline` and `response_deadline`
@@ -2543,6 +2575,16 @@ where
     // name, so a distant lifecycle deadline would stall the service rather than
     // merely delay a reply.
     if self.conflict_classified_unresolved() {
+      return self.last_now;
+    }
+    // A PARKED startup sequence is due immediately as well, and this is the only
+    // thing that keeps the caller awake for it. Nothing is armed, so every
+    // deadline below is `None` and a driver that folded them would park on some
+    // other producer — or sleep — and never call `handle_timeout` again, which is
+    // where the park is reported. The wakeup is what turns a silent stall into a
+    // repeating `HandleTimeoutError::Overflow`, and it stops of its own accord
+    // the moment a deadline can be armed. See [`Self::startup_parked`].
+    if self.startup_parked() {
       return self.last_now;
     }
     // Earliest of: lifecycle, response, and the meta-response deadline. The §9
@@ -3101,12 +3143,24 @@ where
   /// the next poll, so re-arming costs only the re-encode, while a probe left in
   /// slot 0 would also block the entry behind it.
   ///
-  /// A clock that cannot represent the floor drops the probe and leaves the
-  /// deadline alone. The next [`Service::handle_timeout`] reaches the same
-  /// `checked_add_duration` at its own commit-point check, parks the sequence
-  /// with nothing armed and reports [`HandleTimeoutError::Overflow`] — the
-  /// fail-closed outcome, at the one entry point that can report it. This method
-  /// returns no error, so parking silently here is the one thing it must not do.
+  /// # A clock that cannot represent the floor PARKS the sequence
+  ///
+  /// The probe is dropped and no deadline is armed, which is the required
+  /// fail-closed outcome: every instant such a clock can name is sooner than the
+  /// wait §8.1 mandates. What that must not be is SILENT. This method returns no
+  /// error, so the report is left to the two methods that can make one —
+  /// [`Service::poll_timeout`], which reports a parked sequence as due
+  /// immediately so the caller keeps coming back, and
+  /// [`Service::handle_timeout`], which re-evaluates the floor and returns
+  /// [`HandleTimeoutError::Overflow`] for as long as it cannot be armed.
+  ///
+  /// Leaving the existing deadline alone is not enough on its own, and that was
+  /// the defect: the enqueue arm queues the probe FIRST and only then assigns
+  /// `probe_deadline(..)`, which is itself `None` at the end of a bounded clock.
+  /// Dropping the probe then removed the service's only pending work from a
+  /// `Probing` state with no deadline behind it, and nothing woke the caller
+  /// again — not even after the flood expired. See [`Service::startup_parked`],
+  /// which is the state this leaves and the state both reports read.
   pub(crate) fn defer_first_probe_under_flood(&mut self, now: I, flood: &ConflictFlood<I>) {
     if self.awaiting_confirm.is_some()
       || self.probe_on_wire
@@ -4389,6 +4443,13 @@ where
   /// re-evaluated on every subsequent call, so the error repeats for as long as
   /// the service stays parked and stops when it can be scheduled again.
   ///
+  /// A sequence parked from `Probing` reports the same way and is re-scheduled
+  /// the same way, which is what closes the one route to a silent stall: the
+  /// wire-boundary floor can drop a queued first probe whose enqueue left no
+  /// deadline behind it (see
+  /// [`Service::defer_first_probe_under_flood`]), and [`Service::poll_timeout`]
+  /// is what keeps the caller coming back to hear about it.
+  ///
   /// # Contract
   ///
   /// Must NOT be called while a datagram from [`Self::poll_transmit`] is still
@@ -4697,15 +4758,25 @@ where
     };
 
     // Step 2: check lifecycle deadline (Init-synthesis + normal fire path).
-    // For the Init state: if lifecycle_deadline is None (e.g. renamed before
-    // first handle_timeout), synthesise a fresh probe deadline now.
-    if self.state == ServiceState::Init && self.lifecycle_deadline.is_none() {
-      // Through the SAME floor the regress used. This is the one path that can
-      // fabricate a start time for a sequence that has none, so it is also the
-      // one path that could hand a latched flood a fresh 0-250 ms delay and undo
-      // the wait §8.1 mandates. With the floor applied it re-evaluates instead:
-      // `None` again while the clock still cannot express `now + 5 s`, and a
-      // properly floored deadline once it can.
+    // A PARKED startup sequence — nothing armed, nothing queued, nothing in
+    // flight — is re-scheduled here, and this is the only place that can be.
+    //
+    // `Probing(n)` and not only `Init`. The `Init` case is the older one (a
+    // rename before the first `handle_timeout`, or a construction whose floor was
+    // unrepresentable), but a probe sequence can be left with nothing armed from
+    // `Probing` too: the enqueue arm below queues the probe FIRST and only then
+    // assigns `probe_deadline(..)`, which is itself `None` at the end of a
+    // bounded clock — and the wire-boundary floor then drops that queued probe.
+    // With the recovery reading `Init` alone, such a service kept its state, lost
+    // its only pending work, and was never called again.
+    //
+    // Through the SAME floor the regress used. This is the one path that can
+    // fabricate a start time for a sequence that has none, so it is also the
+    // one path that could hand a latched flood a fresh 0-250 ms delay and undo
+    // the wait §8.1 mandates. With the floor applied it re-evaluates instead:
+    // `None` again while the clock still cannot express the mandated wait, and a
+    // properly floored deadline once it can.
+    if self.startup_parked() {
       let base = probe_deadline(now, 0, &mut self.rng);
       self.lifecycle_deadline = self.apply_backoff_floor(now, base, flood);
       // lifecycle didn't "fire" a transmit here — just scheduled; fall through.
@@ -4878,15 +4949,20 @@ where
     let _ = lifecycle_fired; // used for clarity
 
     // ONE rule, stated once at the one exit the early returns do not take: a
-    // service left with nothing armed because §8.1's mandated wait is
+    // service left with nothing armed because a wait the protocol mandates is
     // unrepresentable on this clock is parked, not idle — and a caller that
     // cannot tell the two apart will wait forever for a service that will never
     // move. The conflict block's own returns carry the same verdict up from
-    // `restart_probe_cycle`; this covers the `Init` re-schedule and the
-    // commit-point floor above it, the latter reaching it from `Probing(n)` as
-    // well, which is why `parked` is carried here rather than re-derived from
-    // the state.
-    if parked || (self.state == ServiceState::Init && self.lifecycle_deadline.is_none()) {
+    // `restart_probe_cycle`.
+    //
+    // `parked` covers the commit-point floor above, which can leave a queued
+    // RESPONSE behind it — work the driver will still draw, so
+    // [`Self::startup_parked`] does not call that service parked even though its
+    // probe sequence is. The predicate covers the re-schedule and every other way
+    // this method can exit with a startup sequence that owes a probe and has
+    // nothing to draw it from, including the wire boundary's drop of a queued
+    // first probe on an earlier pass.
+    if parked || self.startup_parked() {
       return Err(HandleTimeoutError::Overflow);
     }
     Ok(())

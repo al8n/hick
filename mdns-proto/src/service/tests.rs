@@ -12219,3 +12219,116 @@ fn a_host_address_known_answer_suppresses_where_the_instance_name_is_the_host_na
      the INSTANCE name is a different RRset and must not suppress it"
   );
 }
+
+// ── a startup sequence a bounded clock cannot schedule is PARKED, not idle ──
+//
+// RFC 6762 §8.1's flood limit is the ENDPOINT's and its counting rule is pinned
+// there. What is pinned HERE is the other half: what one `Service` does when the
+// verdict is in force and its clock cannot express the five seconds §8.1
+// mandates. Arming nothing is the required answer — every instant such a clock
+// can name is sooner than the wait — so being stuck is what compliance looks
+// like, and the whole of what is left is to say so.
+
+/// A latched §8.1 history, built directly.
+///
+/// Fifteen conflicts at one instant, each in its own datagram, which is what the
+/// dedupe key counts. Built by hand because a `Service` driven in isolation has
+/// no route table to receive them through, and the verdict is all this test
+/// needs from the ring.
+fn latched_flood(at: FakeInstant, owner: &Name) -> ConflictFlood<FakeInstant> {
+  let mut flood = ConflictFlood::new();
+  for i in 0..CONFLICT_BURST_LEN as u64 {
+    assert!(
+      flood.accept(at, crate::event::DatagramId::new(i), owner),
+      "each datagram is its own conflict about this owner"
+    );
+  }
+  assert!(
+    flood.in_force(at),
+    "premise: fifteen conflicts inside one window latch the limit"
+  );
+  flood
+}
+
+/// The wire boundary drops a queued first probe whose enqueue left no fallback
+/// deadline behind it — and the service must REPORT that rather than go silent.
+///
+/// The enqueue arm queues the probe FIRST and only then assigns
+/// `probe_deadline(..)`, which does not exist at the very end of a bounded clock.
+/// Dropping the probe therefore takes away a `Probing` service's only pending
+/// work and leaves nothing armed behind it. Before this was closed, the
+/// re-schedule read `Init` alone and `poll_timeout` reported no deadline, so the
+/// caller was never called back: the service stayed stuck even once the flood
+/// had expired, with no error ever raised.
+#[test]
+fn a_probe_dropped_at_the_wire_with_no_fallback_deadline_reports_overflow() {
+  // Near the clock's end, so §8.1's five-second floor is unrepresentable for the
+  // whole of this test and failing closed is the only legal answer.
+  let start = FakeInstant(u64::MAX - 4_000);
+  assert!(
+    <FakeInstant as crate::Instant>::checked_add_duration(start, CONFLICT_BACKOFF_MIN_WAIT)
+      .is_none(),
+    "premise: this clock cannot represent the wait §8.1 mandates"
+  );
+
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::for_test(
+      ServiceHandle::from_raw(0),
+      make_records(120),
+      start,
+      [7u8; 32],
+      true,
+      true,
+    );
+  let owner = Name::try_from_str("myprinter._ipp._tcp.local.").unwrap();
+  let flood = latched_flood(start, &owner);
+
+  // `Init → Probing(0)`: a free step that queues nothing.
+  svc
+    .tick_for_test(FakeInstant(u64::MAX - 3_000))
+    .expect("scheduling the first probe overflows nothing");
+  assert_eq!(svc.state(), ServiceState::Probing(0));
+
+  // The enqueue, at the last instant this clock has. The probe is queued and the
+  // fallback deadline behind it does not exist.
+  let at_the_end = FakeInstant(u64::MAX);
+  svc
+    .tick_for_test(at_the_end)
+    .expect("a queued probe is work the caller can still draw, so not yet parked");
+  assert_eq!(
+    svc.poll_timeout(),
+    None,
+    "premise: the enqueue armed no fallback deadline, which is the whole of what \
+     the wire boundary is about to be the last thing standing between"
+  );
+
+  // The wire boundary: §8.1's floor is in force, the probe may not go out, and
+  // the floor it would be re-armed to does not exist.
+  svc.defer_first_probe_under_flood(at_the_end, &flood);
+  let mut buf = std::vec![0u8; 4096];
+  assert!(
+    matches!(svc.poll_transmit(at_the_end, &mut buf), Ok(None)),
+    "no probe may leave inside the five seconds §8.1 mandates"
+  );
+
+  assert_eq!(
+    svc.poll_timeout(),
+    Some(at_the_end),
+    "a parked sequence is due IMMEDIATELY: nothing is armed, so this is the only \
+     thing that brings the caller back to hear about it"
+  );
+  assert!(
+    matches!(
+      svc.handle_timeout(at_the_end, &flood, &NamesInUse::EMPTY),
+      Err(HandleTimeoutError::Overflow)
+    ),
+    "and the park is REPORTED — a service that owes a probe it may not schedule \
+     is not an idle tick"
+  );
+  assert_eq!(
+    svc.poll_timeout(),
+    Some(at_the_end),
+    "the verdict is re-derived, so it repeats for as long as the wait cannot be \
+     armed rather than arriving once"
+  );
+}
