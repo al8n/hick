@@ -14326,3 +14326,96 @@ fn a_queued_first_probe_is_held_by_a_latch_that_engaged_after_it_was_queued() {
     "once the wait is served the probe goes out"
   );
 }
+
+/// Unregistering makes an endpoint-owned service INERT at once, and the
+/// withdrawal's own goodbye still drains.
+///
+/// Retirement moved from the drivers into the endpoint, and each driver used to
+/// hold a `withdrawing` flag that stopped it ticking, polling and transmitting a
+/// service whose goodbye was in flight. The route outlives
+/// `unregister_service`, so a caller holding the handle can still reach every
+/// `*_service*` accessor and the endpoint has to close them itself: otherwise a
+/// positive-TTL datagram queued before the teardown is polled and confirmed
+/// AFTER the withdrawal snapshot was taken, and those records sit in peer caches
+/// with no goodbye naming them until their own TTL runs out.
+#[test]
+fn unregistering_makes_the_service_inert_and_the_goodbye_still_drains() {
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("Printer._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("h.local.").unwrap(),
+    631,
+    120,
+  );
+  recs.add_a(Ipv4Addr::new(192, 168, 1, 5));
+  let h = e
+    .try_register_service(ServiceSpec::new(recs), now)
+    .expect("registration must succeed");
+  // Announced, so the goodbye below has something real to retract.
+  let established_at = drive_to_established(&mut e, h, now);
+
+  // Queue a positive-TTL datagram — the periodic re-announce — and stop there.
+  let due = e
+    .poll_service_timeout(h)
+    .expect("an established service re-announces");
+  e.handle_service_timeout(h, due).unwrap();
+
+  e.unregister_service(h, due);
+
+  let mut buf = std::vec![0u8; 4096];
+  assert!(
+    matches!(e.poll_service_transmit(h, due, &mut buf), Ok(None)),
+    "a retiring service must not put a positive-TTL datagram on the wire: its \
+     withdrawal snapshot is already taken, so no goodbye could ever retract it"
+  );
+  assert_eq!(
+    e.poll_service_timeout(h),
+    None,
+    "a retired state machine is on no clock"
+  );
+  let later = after(due, 1_000);
+  e.handle_service_timeout(h, later).unwrap();
+  assert!(
+    matches!(e.poll_service_transmit(h, later, &mut buf), Ok(None)),
+    "and driving it on does not re-open it"
+  );
+  assert_eq!(
+    e.service(h).map(crate::Service::name),
+    Some(&Name::try_from_str("Printer._ipp._tcp.local.").unwrap()),
+    "nothing renamed the route out from under the goodbye in flight"
+  );
+  let _ = established_at;
+
+  // The withdrawal's OWN goodbye is the one thing that still leaves.
+  let mut sent = 0usize;
+  let mut done: std::vec::Vec<ServiceHandle> = std::vec::Vec::new();
+  let mut t = due;
+  for _ in 0..20 {
+    while let Some(round) = e.poll_withdrawal_transmit(t, &mut buf) {
+      sent = sent.saturating_add(1);
+      e.note_withdrawal_sends(
+        round.token(),
+        t,
+        super::WithdrawalSend::Sent,
+        super::WithdrawalSend::Sent,
+      );
+    }
+    e.drain_completed_withdrawals(t, &mut done);
+    if !done.is_empty() {
+      break;
+    }
+    t += core::time::Duration::from_millis(400);
+  }
+  assert!(
+    sent > 0,
+    "a graceful retirement owes a §10.1 goodbye, and it must still be sent"
+  );
+  assert_eq!(
+    done.as_slice(),
+    &[h],
+    "and the route is freed once that goodbye completes"
+  );
+  assert!(e.service(h).is_none(), "the route is gone");
+}

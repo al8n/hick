@@ -92,6 +92,14 @@ where
         return;
       };
       route.withdrawing = true;
+      // Positive-TTL work still queued on the state machine is DISCARDED, not
+      // merely left unreachable. The snapshot taken a moment ago names what
+      // peers hold, so anything emitted after it — a queued first announcement,
+      // a §6.7 legacy reply, a periodic re-announce — would put records in peer
+      // caches that this goodbye cannot mention and nothing else will retract.
+      // See `Endpoint::unregister_service` for the whole rule and the accessors
+      // it closes.
+      route.proto.quiesce_for_withdrawal();
 
       // next_at = now (first send fires immediately); ceiling_at = now +
       // WITHDRAWAL_CEILING (hard anti-pin deadline).

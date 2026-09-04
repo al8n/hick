@@ -506,10 +506,16 @@ pub struct ServiceRoute<I, TQ, EvS> {
   #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
   advertised_aaaa: std::vec::Vec<Ipv6Addr>,
   /// `true` once [`Endpoint::begin_withdrawal`] has been called for this
-  /// service.  The route is kept alive (name guard + dispatch) until the
-  /// goodbye sequence completes; this flag lets downstream code distinguish a
-  /// live service from one that is in the process of being torn down.
-  // Read by `poll_timeout` dispatch skip.
+  /// service.  The route is kept alive (name guard) until the goodbye sequence
+  /// completes, so this is what tells a live service from one being torn down.
+  ///
+  /// AUTHORITATIVE, set once and never cleared. Every inbound fan-out in
+  /// [`RouteEvents`] skips a route wearing it, and so does every mutating
+  /// `*_service*` accessor on [`Endpoint`] bar the confirm — see
+  /// [`Endpoint::unregister_service`], which lists them and says why that one
+  /// is the exception.
+  // Always present so those reads need no cfg of their own; only the heap
+  // builds have a withdrawal lifecycle to set it.
   #[allow(dead_code)]
   withdrawing: bool,
 }

@@ -3089,6 +3089,30 @@ where
     }
   }
 
+  /// Make this service INERT for the RFC 6762 §10.1 withdrawal about to begin:
+  /// discard every queued positive-TTL datagram and every deadline that could
+  /// produce one.
+  ///
+  /// The goodbye is the endpoint's own withdrawal item, not this queue, and it
+  /// is the only thing this name may still put on a link. Anything left here is
+  /// a positive-TTL claim to a name whose goodbye SNAPSHOT has already been
+  /// taken, so transmitting it would place records in peer caches that no
+  /// goodbye can ever retract — they would sit there until their own TTL ran
+  /// out. The §6.7 legacy queue goes too: a legacy reply is the FULL positive
+  /// record set, as much a claim to the name as an announcement.
+  ///
+  /// Called from `Endpoint::begin_withdrawal`, where `withdrawing` is set. From
+  /// that point the endpoint's own accessors refuse to drive this service at all,
+  /// so this leaves no state that is merely unreachable — it leaves none.
+  pub(crate) fn quiesce_for_withdrawal(&mut self) {
+    self.pending_transmits = [None, None];
+    self.lifecycle_deadline = None;
+    self.response_deadline = None;
+    // `pending_legacy`, the KAS ring, the questioner sets and the §9 meta-reply
+    // deadline, in the one place that owns clearing them.
+    self.clear_response_cycle_state();
+  }
+
   /// The post-state [`Service::restart_probe_cycle`] owes, checked as a SET on
   /// the way out of it.
   ///

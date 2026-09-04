@@ -412,16 +412,37 @@ where
   ///
   /// Returns `None` when the service has no pending update, or the handle no
   /// longer names a registered service.
+  ///
+  /// # Still open while the service is WITHDRAWING
+  ///
+  /// Every other `*_service*` entry point goes inert the moment
+  /// [`Self::unregister_service`] begins a §10.1 goodbye; this one does not.
+  /// It drains an update QUEUE and can put nothing on a link — a `Conflict` or
+  /// `HostConflict` raised just before the teardown is news the caller still has
+  /// to hear, and dropping it on the floor would be the only way it could be
+  /// lost.
   pub fn poll_service(&mut self, handle: ServiceHandle) -> Option<ServiceUpdate> {
     let key = self.service_key(handle)?;
     self.services.get_mut(key)?.proto.poll()
   }
 
   /// Next deadline at which [`Self::handle_service_timeout`] must be called for
-  /// this service. `None` if it is idle or no longer registered.
+  /// this service. `None` if it is idle, WITHDRAWING, or no longer registered.
+  ///
+  /// A withdrawing service is reported as having no deadline because it has
+  /// nothing left to do: its lifecycle is finished, and the RFC 6762 §10.1
+  /// goodbye that outlives it is the endpoint's own withdrawal item, scheduled
+  /// through [`Self::poll_withdrawal_transmit`] and reported by
+  /// [`Self::poll_timeout`]. Reporting the retired state machine's stale
+  /// deadline here is what kept a caller ticking it. See
+  /// [`Self::unregister_service`].
   pub fn poll_service_timeout(&self, handle: ServiceHandle) -> Option<I> {
     let key = self.service_key(handle)?;
-    self.services.get(key).and_then(|r| r.proto.poll_timeout())
+    let route = self.services.get(key)?;
+    if route.withdrawing {
+      return None;
+    }
+    route.proto.poll_timeout()
   }
 
   /// Drive timer-based transitions on a registered service — RFC 6762 §8.1's
@@ -456,7 +477,11 @@ where
   /// PARKED with nothing armed, which is what failing closed looks like, and
   /// this reports it rather than leaving it indistinguishable from an idle tick.
   ///
-  /// `Ok(())` for an unknown handle: there is nothing to drive.
+  /// `Ok(())` for an unknown handle, and for one already WITHDRAWING: there is
+  /// nothing to drive. A retired state machine driven on has nothing legitimate
+  /// left to do and one illegitimate thing it can still do — a §8.1 defeat would
+  /// rename the route mid-teardown, moving the very name whose goodbye is in
+  /// flight. See [`Self::unregister_service`].
   pub fn handle_service_timeout(
     &mut self,
     handle: ServiceHandle,
@@ -465,6 +490,9 @@ where
     let Some(key) = self.service_key(handle) else {
       return Ok(());
     };
+    if self.services.get(key).is_some_and(|route| route.withdrawing) {
+      return Ok(());
+    }
     // The names a rename must avoid — collected ONLY on a tick where one is
     // actually imminent, since it costs a clone per live route, and collected
     // BEFORE the route holding this service is mutably borrowed.
@@ -628,7 +656,15 @@ where
   /// no point after this one, which is why the check lives here — see
   /// `Service::defer_first_probe_under_flood`, which states the rule.
   ///
-  /// `Ok(None)` when nothing is due, or the handle is not registered.
+  /// A service that is WITHDRAWING transmits nothing at all. Its §10.1 goodbye
+  /// is the endpoint's own withdrawal item, drained through
+  /// [`Self::poll_withdrawal_transmit`]; anything still queued on the service is
+  /// a POSITIVE-TTL claim to a name whose goodbye snapshot has already been
+  /// taken, so no goodbye could ever retract it. See
+  /// [`Self::unregister_service`].
+  ///
+  /// `Ok(None)` when nothing is due, the service is withdrawing, or the handle
+  /// is not registered.
   pub fn poll_service_transmit(
     &mut self,
     handle: ServiceHandle,
@@ -644,6 +680,9 @@ where
     let Some(route) = services.get_mut(key) else {
       return Ok(None);
     };
+    if route.withdrawing {
+      return Ok(None);
+    }
     route.proto.defer_first_probe_under_flood(now, flood);
     route.proto.poll_transmit(now, buf)
   }
@@ -664,6 +703,23 @@ where
   /// old-name goodbye the announcement supersedes.
   ///
   /// An empty confirm for an unknown handle.
+  ///
+  /// # The ONE mutating accessor a withdrawal does not close
+  ///
+  /// [`Self::unregister_service`] makes every other `*_service*` entry point
+  /// inert, and this one deliberately stays open: it is the COMPLETION half of a
+  /// poll → confirm pair, and the commit token is a single slot. A datagram
+  /// handed out before the withdrawal began still owes its outcome, and refusing
+  /// it would leave that slot occupied for as long as the route lives while
+  /// stranding the route's confirmed-advertised mirror — which is what a
+  /// sibling's §10.1 retention screen reads. It advances a lifecycle that is
+  /// already retired and enqueues nothing: the transmit queue was emptied when
+  /// the withdrawal began and [`Self::poll_service_transmit`] can no longer fill
+  /// it.
+  ///
+  /// A conforming caller never reaches that state — the contract on
+  /// [`Self::unregister_service`] forbids retiring a service with a datagram
+  /// outstanding — so this is a backstop, not a path.
   pub fn note_service_transmit_outcome(
     &mut self,
     handle: ServiceHandle,
@@ -798,6 +854,27 @@ where
   /// Idempotent, and a no-op for an unknown handle: a driver may retire the same
   /// service more than once (an encode-failure escalation on an already-retiring
   /// service, say) and must not enqueue a duplicate.
+  ///
+  /// # The service goes INERT here, not when the caller stops calling it
+  ///
+  /// The route survives the call, so a caller holding its handle can still reach
+  /// every `*_service*` accessor. All of them are closed from this point, and
+  /// the endpoint closes them rather than trusting a caller to stop:
+  ///
+  /// * [`Self::poll_service_timeout`] reports no deadline;
+  /// * [`Self::handle_service_timeout`] drives nothing — in particular it cannot
+  ///   rename the route out from under the goodbye that is already in flight;
+  /// * [`Self::poll_service_transmit`] emits nothing, and the queued transmits
+  ///   and response deadlines are DISCARDED here rather than left unreachable;
+  /// * [`Self::note_service_transmit_outcome`] is the single exception, and its
+  ///   own documentation says why.
+  ///
+  /// The snapshot above names exactly what peers hold, so a positive-TTL
+  /// datagram emitted after it — a queued first announcement, a §6.7 legacy
+  /// reply, a periodic re-announce — would put records in peer caches that this
+  /// goodbye cannot mention and nothing else will ever retract. They would stand
+  /// until their own TTL expired. Each bundled driver used to hold a flag of its
+  /// own to prevent that; the flag belongs where the state machine now lives.
   ///
   /// # Contract
   ///
