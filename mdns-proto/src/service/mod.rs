@@ -3012,6 +3012,83 @@ where
     })
   }
 
+  /// RFC 6762 §8.1's five-second floor, applied at the WIRE COMMIT BOUNDARY —
+  /// the last point a queued first probe can still be held back.
+  ///
+  /// # Why a third application, and why this one is final
+  ///
+  /// The floor is applied where a fresh sequence is SCHEDULED
+  /// ([`Service::apply_backoff_floor`]) and again where a probe is ENQUEUED
+  /// ([`Service::handle_timeout`]'s commit-point check). Neither is the wire. A
+  /// probe enqueued while the limit was off survives the `Endpoint::handle` that
+  /// folds in the fifteenth conflict of a burst — a conflict about some OTHER
+  /// record set, since §8.1 counts for the whole host — and the latch that
+  /// engages there is one the queued datagram was never tested against. The
+  /// probe would then leave inside the five seconds §8.1 mandates while breaking
+  /// no documented contract, which is what the endpoint-wide limit's "exact, not
+  /// best-effort" claim rules out.
+  ///
+  /// `Endpoint::poll_service_transmit` is where the datagram is handed to the
+  /// caller for sending, so it is where the last test belongs; there is no later
+  /// point, and this check does not move again.
+  ///
+  /// # First probes only, and the floor stays ABSOLUTE
+  ///
+  /// Only while `!probe_on_wire`: §8.1 spaces the START of each successive probe
+  /// SEQUENCE, not the packets inside one already committed to. The floor is
+  /// `sequence_started_at + CONFLICT_BACKOFF_MIN_WAIT`, never `now + …`,
+  /// because this point is reached repeatedly while the limit holds — a relative
+  /// floor re-derived here would push the probe five seconds further out at
+  /// every poll and a service under a persistent flood would never probe at all.
+  /// An absolute one converges: once `now` has reached it the wait is served and
+  /// the probe goes out.
+  ///
+  /// # It cannot strand the commit token
+  ///
+  /// This runs BEFORE [`Service::poll_transmit`] stamps anything and refuses to
+  /// act while a token is live, so the deferral never leaves the single commit
+  /// slot outstanding and the documented poll → confirm → poll ordering is
+  /// untouched. The queued probe is DROPPED rather than parked at the head of
+  /// the queue: every datagram this crate emits is re-encoded from live state on
+  /// the next poll, so re-arming costs only the re-encode, while a probe left in
+  /// slot 0 would also block the entry behind it.
+  ///
+  /// A clock that cannot represent the floor drops the probe and leaves the
+  /// deadline alone. The next [`Service::handle_timeout`] reaches the same
+  /// `checked_add_duration` at its own commit-point check, parks the sequence
+  /// with nothing armed and reports [`HandleTimeoutError::Overflow`] — the
+  /// fail-closed outcome, at the one entry point that can report it. This method
+  /// returns no error, so parking silently here is the one thing it must not do.
+  pub(crate) fn defer_first_probe_under_flood(&mut self, now: I, flood: &ConflictFlood<I>) {
+    if self.awaiting_confirm.is_some()
+      || self.probe_on_wire
+      || !matches!(self.peek_pending(), Some(PendingTransmitKind::Probe))
+      || !flood.in_force(now)
+    {
+      return;
+    }
+    match self
+      .sequence_started_at
+      .checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)
+    {
+      Some(floor) if floor > now => {
+        let _ = self.pop_pending();
+        self.lifecycle_deadline = Some(floor);
+        debug!(
+          target: "mdns_proto::service",
+          handle = self.handle.raw(),
+          "service: §8.1 flood limit latched after this probe was queued — \
+           dropping it and re-arming to the sequence's five-second floor"
+        );
+      }
+      // The wait has been served: the probe goes out on this poll.
+      Some(_) => {}
+      None => {
+        let _ = self.pop_pending();
+      }
+    }
+  }
+
   /// The post-state [`Service::restart_probe_cycle`] owes, checked as a SET on
   /// the way out of it.
   ///

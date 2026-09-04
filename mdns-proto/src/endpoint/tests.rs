@@ -14224,3 +14224,105 @@ fn the_endpoint_and_its_services_are_send_and_sync() {
     crate::service::Service<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
   >();
 }
+
+/// A service, a rival, fourteen conflicts standing, and `b`'s FIRST probe
+/// sitting in the transmit queue unpolled.
+///
+/// Fourteen is one short of RFC 6762 §8.1's threshold, so the limit is OFF while
+/// `b` registers and is scheduled: its first probe is armed at §8.1's ordinary
+/// 0-250 ms, exactly as it would be on a quiet endpoint. Returns the endpoint,
+/// `b`, the instant its probe is due, the absolute floor `b`'s sequence would
+/// owe if the limit engaged, and the rival's instance name.
+fn queued_first_probe_fixture() -> (TestEndp, ServiceHandle, StdInstant, StdInstant, Name) {
+  let mut e = build_endpoint();
+  let now = StdInstant::now();
+  let rival = Name::try_from_str("Rival._ipp._tcp.local.").unwrap();
+  let (_a, at) = flood_victim(
+    &mut e,
+    "Rival._ipp._tcp.local.",
+    "rival-h.local.",
+    Ipv4Addr::new(192, 168, 1, 5),
+    now,
+  );
+  conflicts_at(&mut e, &rival, at, 14);
+
+  let mut recs = ServiceRecords::new(
+    Name::try_from_str("_ipp._tcp.local.").unwrap(),
+    Name::try_from_str("Queued._ipp._tcp.local.").unwrap(),
+    Name::try_from_str("queued-h.local.").unwrap(),
+    631,
+    120,
+  );
+  recs.add_a(Ipv4Addr::new(192, 168, 1, 6));
+  let b = e
+    .try_register_service(ServiceSpec::new(recs), at)
+    .expect("registration must succeed");
+
+  // Two ticks: `Init → Probing(0)` costs no datagram, and the second ENQUEUES
+  // the first probe. Nothing is polled, so it is still in the queue.
+  let mut due = at;
+  for _ in 0..2 {
+    due = e
+      .poll_service_timeout(b)
+      .expect("a probing service is on a clock");
+    e.handle_service_timeout(b, due).unwrap();
+  }
+  assert_eq!(svc_state(&e, b), crate::ServiceState::Probing(0));
+  // `sequence_started_at` is the registration instant, so this is the ABSOLUTE
+  // floor §8.1 owes this sequence.
+  (e, b, due, after(at, 5_000), rival)
+}
+
+/// A first probe queued while RFC 6762 §8.1's limit was OFF must not reach the
+/// wire because the latch engaged in between.
+///
+/// The obligation is the HOST's, so the fifteenth conflict of a burst can be
+/// about a record set this service has never heard of. `handle_service_timeout`
+/// reads the verdict where it ENQUEUES a probe, and `Endpoint::handle` can fold
+/// that fifteenth conflict in afterwards — the queued datagram was never tested
+/// against the latch that now holds. `poll_service_transmit` is the wire commit
+/// boundary and there is nowhere later, so the verdict is read again there.
+#[test]
+fn a_queued_first_probe_is_held_by_a_latch_that_engaged_after_it_was_queued() {
+  let mut buf = std::vec![0u8; 4096];
+
+  // Control: at fourteen the limit is off and the queued probe goes out at
+  // once — which is what makes the arm below a statement about the fifteenth
+  // conflict rather than about the fixture.
+  let (mut e, b, due, _floor, _rival) = queued_first_probe_fixture();
+  assert!(
+    matches!(e.poll_service_transmit(b, due, &mut buf), Ok(Some(_))),
+    "precondition: the first probe really is queued and otherwise due"
+  );
+
+  // The fifteenth conflict — for the OTHER service — lands between the enqueue
+  // and the poll.
+  let (mut e, b, due, floor, rival) = queued_first_probe_fixture();
+  assert!(one_conflict(&mut e, &rival, due) >= 1);
+  assert!(
+    matches!(e.poll_service_transmit(b, due, &mut buf), Ok(None)),
+    "a probe queued before the latch engaged must not go out after it"
+  );
+
+  // Held for the whole five seconds §8.1 owes the SEQUENCE, and re-armed to
+  // that floor exactly: an absolute floor converges, where a relative one would
+  // push the probe five seconds further out at every poll.
+  let just_before = floor - core::time::Duration::from_millis(1);
+  e.handle_service_timeout(b, just_before).unwrap();
+  assert!(
+    matches!(e.poll_service_transmit(b, just_before, &mut buf), Ok(None)),
+    "nothing goes out before the sequence start plus five seconds"
+  );
+  assert_eq!(
+    e.poll_service_timeout(b),
+    Some(floor),
+    "and the sequence is armed at that floor, not pushed past it"
+  );
+
+  // The floor is a wait, not a stall.
+  e.handle_service_timeout(b, floor).unwrap();
+  assert!(
+    matches!(e.poll_service_transmit(b, floor, &mut buf), Ok(Some(_))),
+    "once the wait is served the probe goes out"
+  );
+}

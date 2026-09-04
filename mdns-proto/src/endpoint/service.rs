@@ -616,10 +616,17 @@ where
   /// The core cannot type-check the ordering, so it is enforced by cheap
   /// backstops rather than assumed: a `debug_assert!` at each entry point fails a
   /// non-compliant driver loudly in its own test suite, and in release the single
-  /// commit-token slot keeps the damage defined. RFC 6762 §8.1's flood limit
-  /// rests on the transmit half of it: probes leave this host only through this
-  /// method, so the floor applied where a probe is enqueued is a floor on the
-  /// wire.
+  /// commit-token slot keeps the damage defined.
+  ///
+  /// # This is the WIRE COMMIT BOUNDARY
+  ///
+  /// Probes leave this host only through this method, so RFC 6762 §8.1's
+  /// five-second floor is re-read HERE and not only where a probe was enqueued.
+  /// The fifteenth conflict of a burst can land between the two — it is counted
+  /// endpoint-wide, so it need not even concern this service — and a probe
+  /// queued before that latch engaged has never been tested against it. There is
+  /// no point after this one, which is why the check lives here — see
+  /// `Service::defer_first_probe_under_flood`, which states the rule.
   ///
   /// `Ok(None)` when nothing is due, or the handle is not registered.
   pub fn poll_service_transmit(
@@ -631,10 +638,14 @@ where
     let Some(key) = self.service_key(handle) else {
       return Ok(None);
     };
-    match self.services.get_mut(key) {
-      Some(route) => route.proto.poll_transmit(now, buf),
-      None => Ok(None),
-    }
+    let Self {
+      services, flood, ..
+    } = self;
+    let Some(route) = services.get_mut(key) else {
+      return Ok(None);
+    };
+    route.proto.defer_first_probe_under_flood(now, flood);
+    route.proto.poll_transmit(now, buf)
   }
 
   /// Report what each address family's transport did with the datagram most
