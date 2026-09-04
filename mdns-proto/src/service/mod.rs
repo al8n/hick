@@ -901,8 +901,8 @@ cfg_heap! {
     /// own family transmitted.
     ///
     /// `pub(crate)` because `EmittedRecords` is a crate-internal type; the
-    /// endpoint (same crate) reads this directly, and a driver only ever moves
-    /// the whole snapshot.
+    /// endpoint (same crate) reads this directly, and the snapshot itself never
+    /// leaves the crate.
     pub(crate) owned: [respond::EmittedRecords; 2],
     /// The MULTICAST subset of [`Self::owned`], and the ONLY half
     /// `Endpoint::relinquished_asserts` may read.
@@ -951,14 +951,13 @@ cfg_heap! {
   /// The one-shot §9 conflict-rename goodbye handoff: the OLD instance name's
   /// records plus the per-record ownership of what that name actually advertised.
   ///
-  /// Produced by
-  /// [`Service::take_rename_goodbye_handoff`] the instant a conflict rename
-  /// happens, and handed straight to
+  /// Installed by the `Service` at the conflict rename, taken by the ENDPOINT
+  /// via [`Service::take_rename_goodbye_handoff`], and handed straight to
   /// [`Endpoint::enqueue_rename_withdrawal`](crate::Endpoint::enqueue_rename_withdrawal),
   /// which turns it into an independent DETACHED withdrawal item (the renamed-away
-  /// old name's TTL=0 goodbye). It is **opaque** to the driver — both fields are
-  /// crate-internal (`EmittedRecords` is `pub(crate)`) — so a driver only ever
-  /// moves the whole value between the two calls, exactly like
+  /// old name's TTL=0 goodbye). It never leaves the crate: the type and both its
+  /// fields are crate-internal (`EmittedRecords` is `pub(crate)`), and the whole
+  /// value only ever moves between those two calls, exactly like
   /// [`WithdrawalSnapshot`]. A rename never withdraws host A/AAAA (the host name is
   /// invariant), so this carries no host addresses.
   ///
@@ -1336,9 +1335,8 @@ cfg_heap! {
   /// the OLD records and WHICH instance records that name actually advertised
   /// (`EmittedRecords` with the instance bits set, addresses empty — a rename
   /// never withdraws host A/AAAA, the host name is invariant). The Service no
-  /// longer drains this itself: the driver takes it via
-  /// [`Self::take_rename_goodbye_handoff`] immediately after observing the
-  /// `Renamed` update and hands it to
+  /// longer drains this itself: the ENDPOINT takes it via
+  /// [`Self::take_rename_goodbye_handoff`] and hands it to
   /// [`crate::Endpoint::enqueue_rename_withdrawal`], which models the old-name
   /// goodbye as an INDEPENDENT detached withdrawal item (its own per-family debt,
   /// schedule, and loss-resilience resends). `None` when the renamed name had
@@ -1747,17 +1745,20 @@ where
   ///   replaced it.
   /// * **Nothing pending** — no-op.
   ///
-  /// # Drain contract for the rename goodbye handoff
+  /// # Who drains the rename goodbye handoff
   ///
-  /// A driver MUST call [`Self::take_rename_goodbye_handoff`] after EVERY call to
-  /// this method, not only after observing
-  /// [`ServiceUpdate::Renamed`](crate::event::ServiceUpdate). A confirm that
-  /// resolves a datagram parked across a §9 conflict rename can INSTALL a handoff
-  /// — the old name's records really are in peer caches and something must
-  /// withdraw them — and by then the `Renamed` update is long since drained, so
-  /// nothing else will ever look. The call is free and returns `None` for a
-  /// driver that confirms each datagram before polling the next one, which is
-  /// every driver that cannot park.
+  /// The ENDPOINT does, and it is the only thing that can: this method and
+  /// [`Self::take_rename_goodbye_handoff`] are both `pub(crate)`, so no driver
+  /// reaches either. A confirm that resolves a datagram parked across a §9
+  /// conflict rename can INSTALL a handoff — the old name's records really are
+  /// in peer caches and something must withdraw them — and by then the rename
+  /// that would otherwise have drained it is long past, so nothing else will
+  /// ever look. `Endpoint::note_service_transmit_outcome` therefore drains at
+  /// the end of EVERY confirm, which is one of the three drain points: the
+  /// rename itself (`Endpoint::handle_service_timeout`), this confirm, and the
+  /// teardown snapshot (`Endpoint::unregister_service`). Draining a confirm
+  /// that installed nothing is one `.take()` of a `None`, which is what every
+  /// transport that cannot park produces.
   ///
   /// # Advancing without a fully-delivered round
   ///
@@ -2232,10 +2233,12 @@ where
                   held.merge_instance(new);
                 }
               }
-              // The driver takes the handoff the instant it observes `Renamed`,
-              // and a parked confirm lands after that by construction, so
-              // installing a fresh one is the ordinary case rather than the
-              // exception. Draining it is the drain contract documented above.
+              // The endpoint drains the handoff at the rename itself, and a
+              // parked confirm lands after that by construction, so installing
+              // a fresh one is the ordinary case rather than the exception. The
+              // endpoint drains again at the end of this confirm — see the
+              // drain section on `note_transmit_outcome` — so the fresh handoff
+              // is enqueued here rather than waiting for the next timeout.
               None => {
                 self.rename_goodbye_handoff = Some(RenameGoodbyeHandoff {
                   records,
@@ -2257,11 +2260,11 @@ where
   /// The capture has to happen HERE, at the regression, because the fact does not
   /// survive to confirm time: by then `records` names the new instance,
   /// `goodbye` has been reset, and `rename_goodbye_handoff` has very likely
-  /// already been drained — drivers take it the instant they observe
-  /// `Renamed`, while a parked confirm lands later by construction. A token that
-  /// only knew it was stale could tell that it must not advance, but not whose
-  /// records it exposed, which is the one fact that decides between withdrawing
-  /// them and stranding them in every peer cache on the link.
+  /// already been drained — the endpoint takes it at the rename, while a parked
+  /// confirm lands later by construction. A token that only knew it was stale
+  /// could tell that it must not advance, but not whose records it exposed,
+  /// which is the one fact that decides between withdrawing them and stranding
+  /// them in every peer cache on the link.
   ///
   /// The token is REWRITTEN, never dropped. The single-token slot is what matches
   /// one confirm to one datagram by ordering: clearing it would let
@@ -2479,9 +2482,9 @@ where
   /// same-host siblings before encoding the actual goodbye datagram.
   ///
   /// The OLD instance name of an in-flight §9 conflict rename is NOT carried
-  /// here. A rename now hands its old-name goodbye off via
-  /// [`Self::take_rename_goodbye_handoff`] the instant it happens, and the driver
-  /// enqueues it as an INDEPENDENT detached withdrawal item
+  /// here. A rename hands its old-name goodbye off via
+  /// [`Self::take_rename_goodbye_handoff`], and the ENDPOINT enqueues it as an
+  /// INDEPENDENT detached withdrawal item
   /// ([`crate::Endpoint::enqueue_rename_withdrawal`]). A teardown during that
   /// window is therefore simply two independent items — the detached old-name
   /// item already enqueued, plus the route-attached current-name item this
@@ -2523,13 +2526,26 @@ where
   ///
   /// Returns the OLD name's `ServiceRecords` plus the per-record ownership
   /// (`EmittedRecords` with the instance bits the old name actually put on the
-  /// wire; host A/AAAA empty — a rename never withdraws host addresses). The
-  /// driver MUST call this immediately after observing
-  /// [`ServiceUpdate::Renamed`](crate::event::ServiceUpdate) from [`Self::poll`]
-  /// and hand the result to [`crate::Endpoint::enqueue_rename_withdrawal`], which
-  /// models the old-name goodbye as an independent detached withdrawal item. The
-  /// field is consumed (`.take()`) so the handoff happens exactly once. Returns
-  /// `None` when the renamed name had never advertised an instance record.
+  /// wire; host A/AAAA empty — a rename never withdraws host addresses).
+  ///
+  /// The ENDPOINT is the sole caller — this is `pub(crate)` — and it hands the
+  /// result to [`crate::Endpoint::enqueue_rename_withdrawal`], which models the
+  /// old-name goodbye as an independent detached withdrawal item. It calls at
+  /// all three points a handoff can be outstanding, because two of them install
+  /// one and the third must not tear down around one:
+  ///
+  /// * `Endpoint::handle_service_timeout`, right after the rename that installs
+  ///   the handoff;
+  /// * `Endpoint::note_service_transmit_outcome`, because a confirm resolving a
+  ///   datagram parked across the rename installs a FRESH handoff after that
+  ///   point — see [`Self::note_transmit_outcome`];
+  /// * `Endpoint::unregister_service`, before the teardown snapshot, since the
+  ///   old name's goodbye is a different name's and independent of the
+  ///   teardown's.
+  ///
+  /// The field is consumed (`.take()`) so the handoff happens exactly once, and
+  /// a call with nothing installed returns `None` — which is also the answer
+  /// when the renamed name had never advertised an instance record.
   pub(crate) fn take_rename_goodbye_handoff(&mut self) -> Option<RenameGoodbyeHandoff> {
     self.rename_goodbye_handoff.take()
   }

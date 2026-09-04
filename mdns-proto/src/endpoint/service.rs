@@ -714,6 +714,16 @@ where
   ///
   /// An empty confirm for an unknown handle.
   ///
+  /// # It also drains the §9 rename goodbye handoff
+  ///
+  /// A confirm that resolves a datagram PARKED across a conflict rename installs
+  /// a fresh handoff for the old name — its records really are in peer caches —
+  /// and it lands after the rename that would otherwise have drained it. Draining
+  /// here is what anchors the old name's detached goodbye, and its two-second
+  /// anti-pin ceiling, at the confirm rather than at whenever the next service
+  /// timeout happens to fall. A confirm that installed nothing drains a `None`,
+  /// which is every confirm from a transport that cannot park.
+  ///
   /// # The ONE mutating accessor a withdrawal does not close
   ///
   /// [`Self::unregister_service`] makes every other `*_service*` entry point
@@ -774,6 +784,10 @@ where
     }
     #[cfg(not(any(feature = "alloc", feature = "std", feature = "no-atomic")))]
     let _ = announced_name;
+    // A confirm can INSTALL a rename handoff (a datagram parked across the
+    // rename), and it lands after the rename's own drain, so the old name's
+    // goodbye is enqueued here rather than at the next service timeout.
+    self.drain_rename_goodbye(key, now);
     confirm
   }
 
