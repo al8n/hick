@@ -18,7 +18,8 @@ use mdns_proto::{
   cache::CacheEntry,
   config::{EndpointConfig, QuerySpec},
   endpoint::{Endpoint, EndpointEventEntry, Provenance, Received, ServiceRoute},
-  event::QueryUpdate,
+  event::{QueryUpdate, ServiceUpdate},
+  transmit::Transmit,
   wire::{Flags, Header, MessageBuilder, ResourceType},
 };
 use tracing::subscriber::with_default;
@@ -33,11 +34,13 @@ type Endp = Endpoint<
   StdInstant,
   rand::rngs::StdRng,
   slab::Slab<CacheEntry<StdInstant>>,
-  slab::Slab<ServiceRoute>,
+  slab::Slab<ServiceRoute<StdInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>>,
   slab::Slab<TestQuery>,
   slab::Slab<EndpointEventEntry>,
   slab::Slab<CollectedAnswer>,
   slab::Slab<QueryUpdate>,
+  slab::Slab<Transmit>,
+  slab::Slab<ServiceUpdate>,
 >;
 
 /// A minimal `tracing::Subscriber` that counts events and span-enters.

@@ -68,7 +68,7 @@ fn non_probing_service_announces_without_probing() {
   // reaches Established without ever entering Probing.
   let records = make_records(120);
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       records,
       FakeInstant::zero(),
@@ -87,7 +87,7 @@ fn non_probing_service_announces_without_probing() {
   let mut ever_probed = false;
   for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if matches!(svc.state(), ServiceState::Probing(_)) {
       ever_probed = true;
     }
@@ -123,7 +123,7 @@ fn non_announcing_responder_answers_questions_only() {
   };
   let records = make_records(120);
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       records,
       FakeInstant::zero(),
@@ -140,7 +140,7 @@ fn non_announcing_responder_answers_questions_only() {
   let mut saw_announcement = false;
   for _ in 0..30 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(tx)) = svc.poll_transmit(now, &mut buf) {
       let reader = MessageReader::try_parse(buf.get(..tx.size()).unwrap()).unwrap();
       if reader.header().flags().is_response() {
@@ -188,7 +188,7 @@ fn non_announcing_responder_answers_questions_only() {
   );
   for _ in 0..300 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     assert!(
       svc.poll_transmit(now, &mut buf).unwrap().is_none(),
       "non-announcing responder must never emit unsolicited traffic after startup"
@@ -209,12 +209,12 @@ fn non_announcing_responder_answers_questions_only() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
     now,
   );
   now = now.advance(200);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   let tx = svc
     .poll_transmit(now, &mut buf)
     .unwrap()
@@ -260,7 +260,7 @@ fn make_service(
 ) -> Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> {
   let handle = ServiceHandle::from_raw(0);
   let records = make_records(ttl_secs);
-  Service::try_new(handle, records, FakeInstant::zero(), [0u8; 32], true, true)
+  Service::for_test(handle, records, FakeInstant::zero(), [0u8; 32], true, true)
 }
 
 /// One record of a peer's §8.2 proposal, as it goes on the wire.
@@ -447,7 +447,7 @@ fn probe_once(
   let mut now = start;
   for _ in 0..10 {
     now = now.advance(300);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       svc.note_delivery(now, TransmitDelivery::ALL);
       return now;
@@ -677,7 +677,7 @@ fn service_resumes_probing_after_rename() {
   let mut svc = make_service(120);
 
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
   assert!(
     svc.last_now.is_some(),
     "last_now should be set after first handle_timeout"
@@ -699,7 +699,7 @@ fn service_resumes_probing_after_rename() {
   // Drive the decision: advance time so the next deadline fires and the stored
   // classification is spent. The existing owner wins → rename applied.
   let t1 = t0.advance(500);
-  svc.handle_timeout(t1).unwrap();
+  svc.tick_for_test(t1).unwrap();
 
   // After the decision handle_timeout: state must be Init.
   assert_eq!(
@@ -734,7 +734,7 @@ fn service_resumes_probing_after_rename() {
 
   // Advance time well past any probe delay (> 250 ms) and drive the machine.
   let t2 = t1.advance(500);
-  svc.handle_timeout(t2).unwrap();
+  svc.tick_for_test(t2).unwrap();
 
   // The service must have progressed past Init into Probing.
   assert!(
@@ -745,7 +745,7 @@ fn service_resumes_probing_after_rename() {
 
   // Drive once more to ensure we actually reach Probing.
   let t3 = t2.advance(500);
-  svc.handle_timeout(t3).unwrap();
+  svc.tick_for_test(t3).unwrap();
 
   // By now (1500 ms past start) we must be in Probing.
   assert!(
@@ -775,7 +775,7 @@ fn inject_question_to_set_response_deadline(
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
     now,
   );
@@ -802,7 +802,7 @@ fn kas_does_not_suppress_below_half_ttl() {
   make_a_record_ref(&mut buf, "host.local.", querier_ttl, [192, 168, 1, 10]);
   let (record_ref, _) = Ref::try_parse(&buf, 0).unwrap();
   let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), record_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   // The ring buffer must be empty — the hint was dropped due to half-TTL rule.
   let hint_count = svc.kas_hints.iter().filter(|s| s.is_some()).count();
@@ -828,7 +828,7 @@ fn kas_suppresses_at_or_above_half_ttl() {
   make_a_record_ref(&mut buf, "host.local.", querier_ttl, [192, 168, 1, 10]);
   let (record_ref, _) = Ref::try_parse(&buf, 0).unwrap();
   let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), record_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   // The hint should have been stored (suppression allowed).
   let hint_count = svc.kas_hints.iter().filter(|s| s.is_some()).count();
@@ -865,7 +865,7 @@ fn kas_wrong_class_known_answer_does_not_suppress() {
   buf.extend_from_slice(&[192, 168, 1, 10]);
   let (record_ref, _) = Ref::try_parse(&buf, 0).unwrap();
   let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), record_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   let hint_count = svc.kas_hints.iter().filter(|s| s.is_some()).count();
   assert_eq!(
@@ -888,7 +888,7 @@ fn drive_to_established(
   let mut now = FakeInstant::zero();
   for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     // Simulate the driver confirming a successful send so the
     // announce/host_advertised guards latch as they would in production.
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
@@ -917,7 +917,7 @@ fn empty_txt_encodes_as_single_zero_length_string() {
   let mut txt_rdata: Option<std::vec::Vec<u8>> = None;
   'drive: for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(tx)) = svc.poll_transmit(now, &mut buf) {
       let reader = crate::wire::MessageReader::try_parse(buf.get(..tx.size()).unwrap()).unwrap();
       for rec in reader.answers() {
@@ -958,7 +958,7 @@ fn rename_handoff_withdraws_only_advertised_instance_records() {
   // deferral → rename.
   deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
   let now = t0.advance(500);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(
     svc.name().as_str().contains("-1"),
     "service should have renamed"
@@ -1000,7 +1000,7 @@ fn advertised_host_addrs_are_the_emitted_subset_not_configured() {
   records.add_a(a1);
   records.add_a(a2);
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       records,
       FakeInstant::zero(),
@@ -1057,7 +1057,7 @@ fn announce_guards_latch_only_on_confirmed_delivery() {
   let mut held_unconfirmed_announcement = false;
   'drive: for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       if matches!(svc.awaiting_confirm, Some(AwaitingConfirm::Announcement(_))) {
         held_unconfirmed_announcement = true;
@@ -1102,7 +1102,7 @@ fn announce_phase_does_not_advance_without_confirmed_send() {
   // third probe is confirmed, before any announcement is emitted.
   for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -1124,7 +1124,7 @@ fn announce_phase_does_not_advance_without_confirmed_send() {
   // correctly return Ok(None) — the single-token contract.)
   for _ in 0..10 {
     now = now.advance(1000);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     assert!(
       svc.poll_transmit(now, &mut buf).unwrap().is_some(),
       "an announcement must be (re)emitted each cycle while unconfirmed"
@@ -1150,7 +1150,7 @@ fn announce_phase_does_not_advance_without_confirmed_send() {
 
   // Confirm one delivery → the phase finally advances.
   now = now.advance(1000);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
   svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
@@ -1177,7 +1177,7 @@ fn probe_sequence_does_not_advance_without_confirmed_send() {
   let mut probes_emitted = 0usize;
   for _ in 0..50 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       // The probe was ENCODED, but report that every socket send failed.
       if matches!(svc.awaiting_confirm, Some(AwaitingConfirm::Probe)) {
@@ -1208,7 +1208,7 @@ fn probe_sequence_does_not_advance_without_confirmed_send() {
   // Liveness: once a probe send IS confirmed, the sequence resumes — the
   // service is not permanently wedged by the earlier failures.
   now = now.advance(500);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
   svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
@@ -1230,7 +1230,7 @@ fn no_goodbye_after_final_probe_before_first_announcement() {
   let mut reached = false;
   for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if svc.state() == ServiceState::Announcing(0) {
       // Reached Announcing(0): the third probe was confirmed but no
       // announcement has been confirmed/emitted yet, so `announce_emitted`
@@ -1303,7 +1303,7 @@ fn delivered_response_before_first_announcement_latches_goodbye_ownership() {
   qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x4242)),
     now,
   );
@@ -1385,7 +1385,7 @@ fn a_legacy_unicast_reply_is_exposure_but_not_multicast_echo_provenance() {
   qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x4242)),
     now,
   );
@@ -1421,7 +1421,7 @@ fn a_legacy_unicast_reply_is_exposure_but_not_multicast_echo_provenance() {
   let mut announced = false;
   for _ in 0..20 {
     at = at.advance(300);
-    svc.handle_timeout(at).unwrap();
+    svc.tick_for_test(at).unwrap();
     if let Ok(Some(tx)) = svc.poll_transmit(at, &mut buf) {
       let dst = tx.dst();
       svc.note_delivery(at, TransmitDelivery::ALL);
@@ -1473,7 +1473,7 @@ fn legacy_a_query_reply_latches_full_set() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x55)),
     now,
   );
@@ -1647,12 +1647,12 @@ fn response_dst_for(qclass_raw: u16, src: core::net::SocketAddr) -> core::net::S
   qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
   qbuf.extend_from_slice(&qclass_raw.to_be_bytes());
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
     now,
   );
   now = now.advance(200); // past the jitter window
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   match svc.poll_transmit(now, &mut buf).unwrap() {
     Some(t) => t.dst(),
     None => panic!("expected a response transmit"),
@@ -1693,7 +1693,7 @@ fn truncated_query_delays_response_to_400_500ms() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0).with_truncated(true)),
     now,
   );
@@ -1701,7 +1701,7 @@ fn truncated_query_delays_response_to_400_500ms() {
   // 200 ms in: the normal 20–120 ms window would already have fired, but the
   // §7.2 TC delay (400–500 ms) must NOT have — no transmit yet.
   let t200 = now.advance(200);
-  svc.handle_timeout(t200).unwrap();
+  svc.tick_for_test(t200).unwrap();
   assert!(
     svc.poll_transmit(t200, &mut buf).unwrap().is_none(),
     "§7.2: a TC-bit response must not fire within the normal 20–120 ms window"
@@ -1709,7 +1709,7 @@ fn truncated_query_delays_response_to_400_500ms() {
 
   // By 500 ms the delayed response is due.
   let t500 = now.advance(500);
-  svc.handle_timeout(t500).unwrap();
+  svc.tick_for_test(t500).unwrap();
   assert!(
     svc.poll_transmit(t500, &mut buf).unwrap().is_some(),
     "§7.2: the delayed TC-bit response must fire by 500 ms"
@@ -1738,18 +1738,18 @@ fn truncated_then_normal_question_coalesces_to_earliest_deadline() {
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
   // TC question first → ~450 ms deadline.
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0).with_truncated(true)),
     now,
   );
   // Normal question second → coalesces onto the earlier 20–120 ms deadline.
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
     now,
   );
 
   let t200 = now.advance(200);
-  svc.handle_timeout(t200).unwrap();
+  svc.tick_for_test(t200).unwrap();
   assert!(
     svc.poll_transmit(t200, &mut buf).unwrap().is_some(),
     "coalesced response must fire in the normal 20–120 ms window, not wait for TC"
@@ -1778,19 +1778,19 @@ fn truncated_meta_query_delays_reply_to_400_500ms() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0).with_truncated(true)),
     now,
   );
 
   let t200 = now.advance(200);
-  svc.handle_timeout(t200).unwrap();
+  svc.tick_for_test(t200).unwrap();
   assert!(
     svc.poll_transmit(t200, &mut buf).unwrap().is_none(),
     "§7.2: a TC meta-query reply must not fire within 20–120 ms"
   );
   let t500 = now.advance(500);
-  svc.handle_timeout(t500).unwrap();
+  svc.tick_for_test(t500).unwrap();
   assert!(
     svc.poll_transmit(t500, &mut buf).unwrap().is_some(),
     "§7.2: the delayed TC meta-query reply must fire by 500 ms"
@@ -1837,7 +1837,7 @@ fn meta_reply_fires_at(
   qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, qsrc, 0)),
     now,
   );
@@ -1870,14 +1870,14 @@ fn meta_reply_fires_at(
       "192.0.2.99:5353".parse().unwrap()
     };
     let (rref, _) = Ref::try_parse(&kbuf, 0).unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::KnownAnswer(KnownAnswer::new(ka_src, rref)),
       now,
     );
   }
 
   let t = now.advance(200); // past the 20–120 ms meta jitter window
-  svc.handle_timeout(t).unwrap();
+  svc.tick_for_test(t).unwrap();
   // Only the clock handed to `poll_transmit` moves on from here — no further
   // event or timeout, which is what a Sans-I/O caller is allowed to do.
   let polled = now.advance(poll_after_ms);
@@ -1965,11 +1965,11 @@ fn meta_kas_not_suppressed_when_multiple_meta_questioners() {
   qbuf.extend_from_slice(&12u16.to_be_bytes()); // PTR
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src_a, 0)),
     now,
   );
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src_b, 0)),
     now,
   );
@@ -1996,13 +1996,13 @@ fn meta_kas_not_suppressed_when_multiple_meta_questioners() {
   kbuf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
   kbuf.extend_from_slice(&rdata);
   let (rref, _) = Ref::try_parse(&kbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::KnownAnswer(KnownAnswer::new(src_a, rref)),
     now,
   );
 
   let t = now.advance(200);
-  svc.handle_timeout(t).unwrap();
+  svc.tick_for_test(t).unwrap();
   let mut buf = std::vec![0u8; 4096];
   assert!(
     svc.poll_transmit(t, &mut buf).unwrap().is_some(),
@@ -2032,7 +2032,7 @@ fn legacy_response_echoes_id_and_question_and_caps_ttl() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "192.0.2.9:33333".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0x1234)),
     now,
   );
@@ -2083,7 +2083,7 @@ fn coalesced_legacy_queriers_each_get_a_response() {
   let b: core::net::SocketAddr = "192.0.2.11:40001".parse().unwrap();
   for s in [a, b] {
     let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::Question(ServiceQuestion::new(qref, s, 7)),
       now,
     );
@@ -2123,7 +2123,7 @@ fn same_source_distinct_legacy_transactions_each_reply() {
   let src: core::net::SocketAddr = "192.0.2.12:40000".parse().unwrap();
   for id in [11u16, 22u16] {
     let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::Question(ServiceQuestion::new(qref, src, id)),
       now,
     );
@@ -2162,7 +2162,7 @@ fn oversized_legacy_response_is_dropped_not_errored() {
   qbuf.extend_from_slice(&1u16.to_be_bytes());
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 1)),
     now,
   );
@@ -2206,7 +2206,7 @@ fn kas_rejects_hints_from_non_questioner_source() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src_a: core::net::SocketAddr = "10.0.0.1:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src_a, 0)),
     now,
   );
@@ -2220,7 +2220,7 @@ fn kas_rejects_hints_from_non_questioner_source() {
   let (record_ref, _) = Ref::try_parse(&rec_buf, 0).unwrap();
   let src_b: core::net::SocketAddr = "10.0.0.99:5353".parse().unwrap();
   let ka = KnownAnswer::new(src_b, record_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   // The hint MUST be dropped — src_b is not a questioner.
   let hint_count = svc.kas_hints.iter().filter(|s| s.is_some()).count();
@@ -2232,7 +2232,7 @@ fn kas_rejects_hints_from_non_questioner_source() {
 
   // Sanity: a hint from src_a (the legitimate questioner) DOES land.
   let ka2 = KnownAnswer::new(src_a, record_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka2), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka2), now);
   let hint_count = svc.kas_hints.iter().filter(|s| s.is_some()).count();
   assert_eq!(
     hint_count, 1,
@@ -2271,7 +2271,7 @@ fn kas_disabled_when_multiple_questioners_coalesced() {
       qbuf.extend_from_slice(&1u16.to_be_bytes());
       let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
       let src: core::net::SocketAddr = src.parse().unwrap();
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
         now,
       );
@@ -2289,11 +2289,11 @@ fn kas_disabled_when_multiple_questioners_coalesced() {
   let (record_ref, _) = Ref::try_parse(&rec_buf, 0).unwrap();
   let src_b: core::net::SocketAddr = "10.0.0.2:5353".parse().unwrap();
   let ka = KnownAnswer::new(src_b, record_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   // Fire the response_deadline.
   let rd = svc.response_deadline.unwrap();
-  svc.handle_timeout(rd).unwrap();
+  svc.tick_for_test(rd).unwrap();
 
   // Produce the response.
   let mut buf = std::vec![0u8; 4096];
@@ -2349,7 +2349,7 @@ fn kas_does_not_suppress_unsolicited_announcement() {
   make_a_record_ref(&mut rec_buf, "host.local.", querier_ttl, [192, 168, 1, 10]);
   let (record_ref, _) = Ref::try_parse(&rec_buf, 0).unwrap();
   let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), record_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   // Verify the hint was actually stored (so the test is meaningful).
   let hint_count = svc.kas_hints.iter().filter(|s| s.is_some()).count();
@@ -2360,7 +2360,7 @@ fn kas_does_not_suppress_unsolicited_announcement() {
   // response_deadline_active is false so the Established arm must choose
   // PendingTransmitKind::Announcement (no KAS filtering).
   let now_reannounce = now.advance(u64::from(our_ttl) * 1000 + 1000);
-  svc.handle_timeout(now_reannounce).unwrap();
+  svc.tick_for_test(now_reannounce).unwrap();
 
   // pending_transmits[0] must be Announcement (not Response).
   assert_eq!(
@@ -2407,7 +2407,7 @@ fn host_conflict_does_not_rename_instance() {
 
   // Give the service a last_now so timers are initialised.
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let original_name = svc.name().as_str().to_owned();
   let original_state = svc.state();
@@ -2416,8 +2416,8 @@ fn host_conflict_does_not_rename_instance() {
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut buf, "host.local.", 120, [192, 168, 1, 99]);
   let (record_ref, _) = Ref::try_parse(&buf, 0).unwrap();
-  let hc = HostConflict::new(record_ref, ConflictOrigin::AuthoritativeResponse);
-  svc.handle_event(ServiceEvent::HostConflict(hc), t0);
+  let hc = HostConflict::new(record_ref, ConflictOrigin::AuthoritativeResponse, dg(1));
+  svc.feed_for_test(ServiceEvent::HostConflict(hc), t0);
 
   // Instance name must be unchanged.
   assert_eq!(
@@ -2457,14 +2457,15 @@ fn host_conflict_does_not_rename_instance() {
 fn host_conflict_ignores_our_own_advertised_address() {
   use crate::event::{HostConflict, ServiceEvent};
   let mut svc = make_service(120); // host.local. advertises 192.168.1.10
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  svc.tick_for_test(FakeInstant::zero()).unwrap();
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut buf, "host.local.", 120, [192, 168, 1, 10]); // OUR address
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::HostConflict(HostConflict::new(
       rec,
       ConflictOrigin::AuthoritativeResponse,
+      dg(1),
     )),
     FakeInstant::zero(),
   );
@@ -2480,14 +2481,15 @@ fn host_conflict_ignores_our_own_advertised_address() {
 fn host_conflict_surfaces_for_different_address() {
   use crate::event::{HostConflict, ServiceEvent};
   let mut svc = make_service(120);
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  svc.tick_for_test(FakeInstant::zero()).unwrap();
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 99]); // NOT ours
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::HostConflict(HostConflict::new(
       rec,
       ConflictOrigin::AuthoritativeResponse,
+      dg(1),
     )),
     FakeInstant::zero(),
   );
@@ -2522,7 +2524,7 @@ fn section9_reprobe_clears_queued_legacy_reply() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let legacy_src: core::net::SocketAddr = "192.168.1.50:40000".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x99)),
     now,
   );
@@ -2544,7 +2546,7 @@ fn section9_reprobe_clears_queued_legacy_reply() {
   );
   let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       srec,
@@ -2584,7 +2586,7 @@ fn conflict_rename_hands_off_old_announced_name() {
   svc.goodbye.mark_instance(); // the original name was announced
 
   deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
-  svc.handle_timeout(t0.advance(500)).unwrap();
+  svc.tick_for_test(t0.advance(500)).unwrap();
   assert!(
     svc.name().as_str().contains("-1"),
     "service should have renamed"
@@ -2680,7 +2682,7 @@ fn host_conflict_for_identical_link_local_address_is_suppressed() {
     let mut r = ServiceRecords::new(stype, inst, host, 631, 120);
     r.add_a(core::net::Ipv4Addr::new(169, 254, 1, 1)); // link-local, advertised
     let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-      Service::try_new(
+      Service::for_test(
         ServiceHandle::from_raw(0),
         r,
         FakeInstant::zero(),
@@ -2688,7 +2690,7 @@ fn host_conflict_for_identical_link_local_address_is_suppressed() {
         true,
         true,
       );
-    svc.handle_timeout(FakeInstant::zero()).unwrap();
+    svc.tick_for_test(FakeInstant::zero()).unwrap();
     svc
   };
   let deliver =
@@ -2697,10 +2699,11 @@ fn host_conflict_for_identical_link_local_address_is_suppressed() {
       let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
       make_a_record_ref(&mut buf, "host.local.", 120, addr);
       let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::HostConflict(HostConflict::new(
           rec,
           ConflictOrigin::AuthoritativeResponse,
+          dg(1),
         )),
         FakeInstant::zero(),
       );
@@ -2751,7 +2754,7 @@ fn failed_conflict_rename_clears_stale_transmit_state() {
   let mut r = ServiceRecords::new(stype, inst, host, 631, 120);
   r.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       r,
       FakeInstant::zero(),
@@ -2768,7 +2771,7 @@ fn failed_conflict_rename_clears_stale_transmit_state() {
   svc.response_deadline = Some(t0.advance(50));
 
   deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
-  svc.handle_timeout(t0.advance(500)).unwrap();
+  svc.tick_for_test(t0.advance(500)).unwrap();
 
   assert_eq!(
     svc.state(),
@@ -2815,7 +2818,7 @@ fn a_terminal_service_still_surfaces_a_host_conflict() {
   let mut r = ServiceRecords::new(stype, inst, host, 631, 120);
   r.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       r,
       FakeInstant::zero(),
@@ -2825,7 +2828,7 @@ fn a_terminal_service_still_surfaces_a_host_conflict() {
     );
   let t0 = probe_once(&mut svc, FakeInstant::zero());
   deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
-  svc.handle_timeout(t0.advance(500)).unwrap();
+  svc.tick_for_test(t0.advance(500)).unwrap();
   assert_eq!(
     svc.state(),
     ServiceState::Conflicting,
@@ -2838,10 +2841,11 @@ fn a_terminal_service_still_surfaces_a_host_conflict() {
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 99]);
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::HostConflict(HostConflict::new(
       rec,
       ConflictOrigin::AuthoritativeResponse,
+      dg(1),
     )),
     t0.advance(600),
   );
@@ -2857,8 +2861,12 @@ fn a_terminal_service_still_surfaces_a_host_conflict() {
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 98]);
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
-    ServiceEvent::HostConflict(HostConflict::new(rec, ConflictOrigin::TentativeProbe)),
+  svc.feed_for_test(
+    ServiceEvent::HostConflict(HostConflict::new(
+      rec,
+      ConflictOrigin::TentativeProbe,
+      dg(1),
+    )),
     t0.advance(700),
   );
   assert!(
@@ -2886,7 +2894,7 @@ fn tiebreak_we_win_continues_probing() {
   let mut svc = make_service(120);
 
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
 
   // sub-check: the scope is ANY, so an A record at the probed name IS part of
   // the peer's proposal — and here it is the record that WINS us the round. A
@@ -2912,7 +2920,7 @@ fn tiebreak_we_win_continues_probing() {
       ],
     );
     let src_a: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, src_a, dg(1))),
       t0,
     );
@@ -2935,7 +2943,7 @@ fn tiebreak_we_win_continues_probing() {
   // One proposal carrying both records: SRV(port=80) — smaller than our 631, so
   // the peer loses on it — and the TXT(empty) a prober emits alongside.
   let bytes = srv_txt_proposal(80);
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src_win, dg(1))),
     t0,
   );
@@ -2950,7 +2958,7 @@ fn tiebreak_we_win_continues_probing() {
 
   // Trigger the tiebreak comparison.
   let t1 = t0.advance(500);
-  svc.handle_timeout(t1).unwrap();
+  svc.tick_for_test(t1).unwrap();
 
   // We won: state must not have reset to Init for rename; name unchanged.
   assert_eq!(
@@ -2990,13 +2998,13 @@ fn tiebreak_we_lose_defers_and_reprobes() {
   let mut svc = make_service(120); // our SRV: port=631
 
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
 
   // Peer proposes SRV(port=9999) — greater than our 631 — with the TXT(empty)
   // a prober emits alongside, so the comparison turns on the port alone.
   let bytes = srv_txt_proposal(9999);
   let peer_src_lose: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src_lose, dg(1))),
     t0,
   );
@@ -3006,7 +3014,7 @@ fn tiebreak_we_lose_defers_and_reprobes() {
 
   // Trigger the tiebreak: peer wins.
   let t1 = t0.advance(500);
-  svc.handle_timeout(t1).unwrap();
+  svc.tick_for_test(t1).unwrap();
 
   // INVERTED, deliberately, and the function was renamed with it
   // (`tiebreak_we_lose_renames` → `tiebreak_we_lose_defers_and_reprobes`). The
@@ -3054,7 +3062,7 @@ fn tiebreak_we_lose_defers_and_reprobes() {
 fn a_peers_empty_txt_rdata_is_compared_as_the_peer_sent_it() {
   let mut svc = make_service(120); // our SRV: port 631, target `host.local.`
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
 
   // A TXT record with RDLENGTH = 0 — no strings at all, which is what §6.1
   // forbids and what a normalising comparator would silently rewrite.
@@ -3077,7 +3085,7 @@ fn a_peers_empty_txt_rdata_is_compared_as_the_peer_sent_it() {
 
   let bytes = raw_proposal_bytes(&[txt, srv]);
   let peer: core::net::SocketAddr = "192.168.1.77:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -3118,7 +3126,7 @@ fn a_peers_empty_txt_rdata_is_compared_as_the_peer_sent_it() {
 fn a_peers_mixed_case_target_is_compared_as_the_peer_sent_it() {
   let mut svc = make_service(120); // our SRV: port 631, target `host.local.`
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
   let original = svc.name().as_str().to_owned();
 
   // One zero-length string: byte-for-byte what our own probe puts on the wire
@@ -3129,7 +3137,7 @@ fn a_peers_mixed_case_target_is_compared_as_the_peer_sent_it() {
   make_srv_record_ref(&mut srv, PROBED_NAME, 120, 0, 0, 631, "HOSU.local.");
   let bytes = raw_proposal_bytes(&[txt, srv]);
   let peer: core::net::SocketAddr = "192.168.1.77:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -3143,7 +3151,7 @@ fn a_peers_mixed_case_target_is_compared_as_the_peer_sent_it() {
   );
 
   let t1 = t0.advance(500);
-  svc.handle_timeout(t1).unwrap();
+  svc.tick_for_test(t1).unwrap();
   assert_eq!(
     svc.name().as_str(),
     original,
@@ -3170,7 +3178,7 @@ fn a_peers_mixed_case_target_is_compared_as_the_peer_sent_it() {
 fn an_unreadable_record_abandons_the_whole_proposal() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
   let original = svc.name().as_str().to_owned();
 
   let mut txt = std::vec::Vec::new();
@@ -3203,7 +3211,7 @@ fn an_unreadable_record_abandons_the_whole_proposal() {
 
   let bytes = raw_proposal_bytes(&[txt, srv, cname]);
   let peer: core::net::SocketAddr = "192.168.1.78:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -3216,7 +3224,7 @@ fn an_unreadable_record_abandons_the_whole_proposal() {
   );
 
   let t1 = t0.advance(500);
-  svc.handle_timeout(t1).unwrap();
+  svc.tick_for_test(t1).unwrap();
   assert_eq!(svc.name().as_str(), original, "…so nothing is deferred");
   assert!(
     matches!(svc.state(), ServiceState::Probing(_)),
@@ -3257,7 +3265,7 @@ fn the_tiebreak_deferral_stops_answering_for_the_name_it_re_verifies() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let legacy_src: core::net::SocketAddr = "192.168.1.50:40000".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x99)),
     now,
   );
@@ -3269,14 +3277,14 @@ fn the_tiebreak_deferral_stops_answering_for_the_name_it_re_verifies() {
   // Peer proposes SRV(port=9999) — greater than our 631 — so we lose.
   let bytes = srv_txt_proposal(9999);
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     now,
   );
   assert!(svc.tiebreak_lost, "precondition: the peer's proposal wins");
 
   let deferred_at = now.advance(500);
-  svc.handle_timeout(deferred_at).unwrap();
+  svc.tick_for_test(deferred_at).unwrap();
   assert_eq!(svc.state(), ServiceState::Init);
 
   assert!(
@@ -3319,7 +3327,7 @@ fn a_probe_parked_across_the_tiebreak_deferral_leaves_the_window_shut() {
 
   let bytes = srv_txt_proposal(9999);
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     at,
   );
@@ -3327,7 +3335,7 @@ fn a_probe_parked_across_the_tiebreak_deferral_leaves_the_window_shut() {
   let kept_name = svc.name().as_str().to_owned();
 
   let deferred_at = at.advance(300);
-  svc.handle_timeout(deferred_at).unwrap();
+  svc.tick_for_test(deferred_at).unwrap();
   assert!(
     !svc.probe_on_wire,
     "the deferral restarts the §8.1 sequence, so its window is shut"
@@ -3361,7 +3369,7 @@ fn a_probe_parked_across_the_tiebreak_deferral_leaves_the_window_shut() {
 fn tiebreak_tie_keeps_the_name_and_the_probe_sequence() {
   let mut svc = make_service(120); // SRV: priority 0, weight 0, port 631, host.local.
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
   let original_name = svc.name().as_str().to_owned();
 
   // The peer proposes exactly what `make_records` proposes. Enumerated
@@ -3379,7 +3387,7 @@ fn tiebreak_tie_keeps_the_name_and_the_probe_sequence() {
       },
     ],
   );
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -3389,7 +3397,7 @@ fn tiebreak_tie_keeps_the_name_and_the_probe_sequence() {
      recorded no loss"
   );
 
-  svc.handle_timeout(t0.advance(500)).unwrap();
+  svc.tick_for_test(t0.advance(500)).unwrap();
 
   assert_eq!(
     svc.name().as_str(),
@@ -3435,7 +3443,7 @@ fn tiebreak_tie_keeps_the_name_and_the_probe_sequence() {
 fn probe_conflict_before_our_first_probe_is_ignored() {
   let mut svc = make_service(120); // our SRV: port 631
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing(0): nothing on the wire yet
+  svc.tick_for_test(t0).unwrap(); // Init → Probing(0): nothing on the wire yet
   let original_name = svc.name().as_str().to_owned();
 
   // A peer whose list would beat ours outright (port 9999 > our 631), so
@@ -3452,7 +3460,7 @@ fn probe_conflict_before_our_first_probe_is_ignored() {
   );
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -3470,7 +3478,7 @@ fn probe_conflict_before_our_first_probe_is_ignored() {
   );
 
   let t1 = t0.advance(500);
-  svc.handle_timeout(t1).unwrap();
+  svc.tick_for_test(t1).unwrap();
   assert_eq!(
     svc.name().as_str(),
     original_name,
@@ -3493,7 +3501,7 @@ fn probe_conflict_before_our_first_probe_is_ignored() {
       target: "host.local.",
     }],
   );
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&proposal, peer, dg(1))),
     t1,
   );
@@ -3524,7 +3532,7 @@ fn probe_conflict_before_our_first_probe_is_ignored() {
   // the tentative probes that are actually its input.
   let t2 = probe_once(&mut svc, t1);
   let (rec_again, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec_again,
@@ -3544,7 +3552,7 @@ fn probe_conflict_before_our_first_probe_is_ignored() {
     "…and never as a §8.2 tiebreak entry: that rule is for two hosts probing at \
      once, and this peer is not probing"
   );
-  svc.handle_timeout(t2.advance(500)).unwrap();
+  svc.tick_for_test(t2.advance(500)).unwrap();
   assert_ne!(
     svc.name().as_str(),
     original_name,
@@ -3607,14 +3615,14 @@ fn a_response_beats_our_probe_even_when_our_records_sort_later() {
   {
     let mut as_if_probing = make_service(120); // same records as `svc`
     let p0 = FakeInstant::zero();
-    as_if_probing.handle_timeout(p0).unwrap(); // Init → Probing
+    as_if_probing.tick_for_test(p0).unwrap(); // Init → Probing
     let before = as_if_probing.name().as_str().to_owned();
     let bytes = srv_txt_proposal(80); // the peer's TXT(empty) + SRV(80)
-    as_if_probing.handle_event(
+    as_if_probing.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
       p0,
     );
-    as_if_probing.handle_timeout(p0.advance(500)).unwrap();
+    as_if_probing.tick_for_test(p0.advance(500)).unwrap();
     assert_eq!(
       as_if_probing.name().as_str(),
       before,
@@ -3624,7 +3632,7 @@ fn a_response_beats_our_probe_even_when_our_records_sort_later() {
   }
 
   for rref in [txt_ref, srv_ref] {
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeConflict(ProbeConflict::new(
         peer,
         rref,
@@ -3641,7 +3649,7 @@ fn a_response_beats_our_probe_even_when_our_records_sort_later() {
      whatever our records sort like"
   );
 
-  svc.handle_timeout(t0.advance(500)).unwrap();
+  svc.tick_for_test(t0.advance(500)).unwrap();
   assert_ne!(
     svc.name().as_str(),
     original_name,
@@ -3674,10 +3682,11 @@ fn a_peer_probing_our_host_name_does_not_retire_us() {
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 99]);
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::HostConflict(crate::event::HostConflict::new(
       rec,
       ConflictOrigin::TentativeProbe,
+      dg(1),
     )),
     now,
   );
@@ -3695,10 +3704,11 @@ fn a_peer_probing_our_host_name_does_not_retire_us() {
   // The same record in a RESPONSE is the §9 conflict, so the difference is the
   // origin and not the address.
   let (rec_resp, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::HostConflict(crate::event::HostConflict::new(
       rec_resp,
       ConflictOrigin::AuthoritativeResponse,
+      dg(1),
     )),
     now,
   );
@@ -3723,7 +3733,7 @@ fn renamed_update_means_probing_restarted_not_advertised() {
   // tiebreak loss now defers and keeps the name instead.
   let t0 = probe_once(&mut svc, FakeInstant::zero());
   deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
-  svc.handle_timeout(t0.advance(500)).unwrap();
+  svc.tick_for_test(t0.advance(500)).unwrap();
 
   let update = svc
     .poll()
@@ -3758,7 +3768,7 @@ fn renamed_update_means_probing_restarted_not_advertised() {
   let mut established = false;
   for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -3815,7 +3825,7 @@ fn a_peer_probing_our_established_name_does_not_revert_us() {
       target: "host.local.",
     }],
   );
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&proposal, peer, dg(1))),
     now,
   );
@@ -3834,7 +3844,7 @@ fn a_peer_probing_our_established_name_does_not_revert_us() {
   // The same rdata in a RESPONSE is a genuine §9 conflict, so the difference
   // really is the event and not the record.
   let (rec_resp, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec_resp,
@@ -3882,7 +3892,7 @@ fn the_section9_revert_shuts_the_pre_probe_window_again() {
   );
   let (txt_ref, _) = Ref::try_parse(&buf_txt, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       txt_ref,
@@ -3912,7 +3922,7 @@ fn the_section9_revert_shuts_the_pre_probe_window_again() {
     "host.local.",
   );
   let (srv_ref, _) = Ref::try_parse(&buf_srv, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       srv_ref,
@@ -3929,7 +3939,7 @@ fn the_section9_revert_shuts_the_pre_probe_window_again() {
      decided on the fragment of a response the revert split in half"
   );
 
-  svc.handle_timeout(now.advance(500)).unwrap();
+  svc.tick_for_test(now.advance(500)).unwrap();
   assert_eq!(
     svc.name().as_str(),
     original_name,
@@ -3964,7 +3974,7 @@ fn established_service_reprobes_on_different_rdata_conflict() {
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   let t = FakeInstant::zero().advance(100_000);
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -4014,7 +4024,7 @@ fn established_service_ignores_identical_rdata() {
   );
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -4044,7 +4054,7 @@ fn conflict_rename_resets_announce_emitted() {
 
   // An existing owner's differing SRV (port 9999 > 631) → §8.1 deferral → rename.
   deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
-  svc.handle_timeout(t0.advance(500)).unwrap();
+  svc.tick_for_test(t0.advance(500)).unwrap();
 
   assert!(
     svc.name().as_str().contains("-1"),
@@ -4078,7 +4088,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
   let mut now = FakeInstant::zero();
   loop {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -4099,7 +4109,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
 
   // ── 2. Fire the first announce (Announcing(0) → Announcing(1)) ────
   now = now.advance(500);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
     svc.note_delivery(now, TransmitDelivery::ALL);
   }
@@ -4110,7 +4120,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
       break;
     }
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -4135,7 +4145,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
   let sq = ServiceQuestion::new(qref, src, 0);
-  svc.handle_event(ServiceEvent::Question(sq), now);
+  svc.feed_for_test(ServiceEvent::Question(sq), now);
 
   assert!(
     svc.response_deadline.is_some(),
@@ -4146,13 +4156,13 @@ fn question_during_announcing_does_not_shortcut_sequence() {
   // response_deadline is already set by handle_event(Question), so we just
   // advance time past the jitter window and let it fire.
   now = now.advance(1); // tiny advance — response deadline may not be ripe yet
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   // response_deadline should be scheduled; it fires when we advance past it.
 
   // ── 5. Advance past the jitter window (max 120 ms) ───────────────
   // The response deadline fires before the announce interval (1000 ms).
   now = now.advance(200); // well past 120 ms jitter, well before 1000 ms announce
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
 
   // The kind fired should be Response (KAS-filtered), NOT Announcement.
   assert_eq!(
@@ -4173,7 +4183,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
 
   // ── 7. Final announce fires normally → Established ───────────────
   now = now.advance(2000); // past the 1 s announce interval
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert_eq!(
     svc.pending_transmits[0],
     Some(PendingTransmitKind::Announcement),
@@ -4202,7 +4212,7 @@ fn question_during_announcing_does_not_shortcut_sequence() {
 fn tiebreak_two_peers_one_wins_we_lose() {
   let mut svc = make_service(120); // our SRV: port=631
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
 
   // Peer A (src=.10) proposes TXT(empty) + SRV(80) → Peer A loses (our 631 > 80).
   //
@@ -4212,7 +4222,7 @@ fn tiebreak_two_peers_one_wins_we_lose() {
   // winner and the rename below was never evidence that Peer B was consulted.
   let peer_a: core::net::SocketAddr = "192.168.1.10:5353".parse().unwrap();
   let bytes_a = srv_txt_proposal(80);
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes_a, peer_a, dg(1))),
     t0,
   );
@@ -4225,7 +4235,7 @@ fn tiebreak_two_peers_one_wins_we_lose() {
   // Peer B (src=.200) proposes TXT(empty) + SRV(9999) → Peer B wins (9999 > 631).
   let peer_b: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   let bytes_b = srv_txt_proposal(9999);
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes_b, peer_b, dg(1))),
     t0,
   );
@@ -4239,7 +4249,7 @@ fn tiebreak_two_peers_one_wins_we_lose() {
 
   // Trigger the tiebreak: Peer B wins → we defer to it.
   let t1 = t0.advance(500);
-  svc.handle_timeout(t1).unwrap();
+  svc.tick_for_test(t1).unwrap();
 
   // INVERTED, deliberately. The old claim was "a §8.2 loss renames"; the
   // admitted outcome now is that a §8.2 loss KEEPS the name and re-probes it
@@ -4323,7 +4333,7 @@ fn question_does_not_push_out_announce_deadline() {
   let mut now = FakeInstant::zero();
   loop {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -4369,7 +4379,7 @@ fn question_does_not_push_out_announce_deadline() {
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
   let sq = ServiceQuestion::new(qref, src, 0);
-  svc.handle_event(ServiceEvent::Question(sq), now);
+  svc.feed_for_test(ServiceEvent::Question(sq), now);
 
   assert!(
     svc.response_deadline.is_some(),
@@ -4386,7 +4396,7 @@ fn question_does_not_push_out_announce_deadline() {
   // Advance past the max jitter window (120 ms) but well before the announce
   // interval (1000 ms). Since lifecycle is now + 1000ms, now+200 < lifecycle.
   now = now.advance(200);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert_eq!(
     svc.pending_transmits[0],
     Some(PendingTransmitKind::Response),
@@ -4416,7 +4426,7 @@ fn question_does_not_push_out_announce_deadline() {
   // Jump to the original lifecycle_deadline. The announce must fire at that
   // original time, not at now + interval.
   let original_announce = announce_deadline_before.unwrap();
-  svc.handle_timeout(original_announce).unwrap();
+  svc.tick_for_test(original_announce).unwrap();
   assert_eq!(
     svc.pending_transmits[0],
     Some(PendingTransmitKind::Announcement),
@@ -4473,7 +4483,7 @@ fn srv_kas_hint_suppresses_srv_in_filtered_response() {
   );
   let (srv_ref, _) = Ref::try_parse(&srv_buf, 0).unwrap();
   let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), srv_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   // Verify the SRV hint was stored.
   let srv_hint_count = svc
@@ -4500,7 +4510,7 @@ fn srv_kas_hint_suppresses_srv_in_filtered_response() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
     now,
   );
@@ -4511,7 +4521,7 @@ fn srv_kas_hint_suppresses_srv_in_filtered_response() {
 
   // Fire the response (advance past the max 120 ms jitter window).
   let now2 = now.advance(200);
-  svc.handle_timeout(now2).unwrap();
+  svc.tick_for_test(now2).unwrap();
   assert_eq!(
     svc.pending_transmits[0],
     Some(PendingTransmitKind::Response),
@@ -4562,11 +4572,11 @@ fn kas_wrong_owner_known_answer_does_not_suppress() {
   make_a_record_ref(&mut a_buf, "_ipp._tcp.local.", our_ttl, [192, 168, 1, 10]);
   let (a_ref, _) = Ref::try_parse(&a_buf, 0).unwrap();
   let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), a_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   // Fire the response (past the jitter window) and confirm the host A survives.
   let now2 = now.advance(200);
-  svc.handle_timeout(now2).unwrap();
+  svc.tick_for_test(now2).unwrap();
   let mut out = std::vec![0u8; 4096];
   let transmit = svc
     .poll_transmit(now2, &mut out)
@@ -4621,7 +4631,7 @@ fn an_expired_known_answer_does_not_suppress_at_polls_own_clock() {
     );
     records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
     let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-      Service::try_new(
+      Service::for_test(
         ServiceHandle::from_raw(0),
         records,
         FakeInstant::zero(),
@@ -4637,7 +4647,7 @@ fn an_expired_known_answer_does_not_suppress_at_polls_own_clock() {
     let mut a_buf: std::vec::Vec<u8> = std::vec::Vec::new();
     make_a_record_ref(&mut a_buf, host, our_ttl / 2, [192, 168, 1, 10]);
     let (a_ref, _) = Ref::try_parse(&a_buf, 0).unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::KnownAnswer(KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), a_ref)),
       now,
     );
@@ -4664,12 +4674,12 @@ fn an_expired_known_answer_does_not_suppress_at_polls_own_clock() {
     qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
     let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
     let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
       now,
     );
     let queued = now.advance(200);
-    svc.handle_timeout(queued).unwrap();
+    svc.tick_for_test(queued).unwrap();
     assert_eq!(
       svc.pending_transmits[0],
       Some(PendingTransmitKind::Response),
@@ -4723,7 +4733,7 @@ fn same_tick_response_and_lifecycle_both_fire() {
   let mut buf4096 = std::vec![0u8; 4096];
   loop {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -4762,7 +4772,7 @@ fn same_tick_response_and_lifecycle_both_fire() {
     qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
     let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
     let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
       now,
     );
@@ -4778,7 +4788,7 @@ fn same_tick_response_and_lifecycle_both_fire() {
   let state_before = svc.state();
 
   // Fire handle_timeout at announce_dl (both deadlines due simultaneously).
-  svc.handle_timeout(announce_dl).unwrap();
+  svc.tick_for_test(announce_dl).unwrap();
 
   // invariant: BOTH transmits must be queued — the two-slot
   // queue holds both the lifecycle (Announcement) and the response (Response).
@@ -4844,7 +4854,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
   let mut now = FakeInstant::zero();
   loop {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf4096) {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -4874,7 +4884,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
     qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
     let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
     let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
       now,
     );
@@ -4882,7 +4892,7 @@ fn same_tick_both_transmits_are_queued_and_drained() {
   svc.response_deadline = Some(announce_dl); // align with lifecycle
 
   // Fire handle_timeout with both deadlines at the same instant.
-  svc.handle_timeout(announce_dl).unwrap();
+  svc.tick_for_test(announce_dl).unwrap();
 
   // both slots must be occupied — slot 0 = Announcement, slot 1 = Response.
   assert_eq!(
@@ -4954,7 +4964,7 @@ fn announcement_sets_cache_flush_on_unique_records() {
 
   // Jump far forward to trigger the periodic re-announce.
   let now_reannounce = now.advance(u64::from(our_ttl) * 1000 + 1000);
-  svc.handle_timeout(now_reannounce).unwrap();
+  svc.tick_for_test(now_reannounce).unwrap();
 
   assert_eq!(
     svc.pending_transmits[0],
@@ -5116,13 +5126,13 @@ fn tiebreak_always_includes_empty_txt() {
     // loss. So Case B alone still fails if the TXT is ever dropped again.
     let mut svc = make_service(120);
     let t0 = FakeInstant::zero();
-    svc.handle_timeout(t0).unwrap(); // Init → Probing
+    svc.tick_for_test(t0).unwrap(); // Init → Probing
     let original = svc.name().as_str().to_owned();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src, dg(1))),
       t0,
     );
-    svc.handle_timeout(t0.advance(500)).unwrap();
+    svc.tick_for_test(t0.advance(500)).unwrap();
     assert_eq!(
       svc.name().as_str(),
       original,
@@ -5150,14 +5160,14 @@ fn tiebreak_always_includes_empty_txt() {
     // → the peer's first record is greater → we lose.
     let mut svc = make_service(120);
     let t0 = FakeInstant::zero();
-    svc.handle_timeout(t0).unwrap(); // Init → Probing
+    svc.tick_for_test(t0).unwrap(); // Init → Probing
     let original = svc.name().as_str().to_owned();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src, dg(1))),
       t0,
     );
     let spent = t0.advance(500);
-    svc.handle_timeout(spent).unwrap();
+    svc.tick_for_test(spent).unwrap();
     // INVERTED, deliberately: the LOSS is unchanged, what a loss DOES changed.
     // The old claim was "a §8.2 loss renames" and this asserted the name moved;
     // the admitted outcome now is that a §8.2 loss KEEPS the name and re-probes
@@ -5214,7 +5224,7 @@ fn tiebreak_records_that_flatten_alike_are_not_a_tie() {
   let mut our = ServiceRecords::new(stype, inst, host, PORT, 120);
   our.add_txt_segment(std::vec![b'k', b'=', b'v']);
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       our,
       FakeInstant::zero(),
@@ -5223,7 +5233,7 @@ fn tiebreak_records_that_flatten_alike_are_not_a_tie() {
       true,
     );
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
   let original = svc.name().as_str().to_owned();
 
   // Every byte below is enumerated, so the collision is established by
@@ -5292,12 +5302,12 @@ fn tiebreak_records_that_flatten_alike_are_not_a_tie() {
      payload, so the comparison under test really is the colliding one"
   );
 
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src, dg(1))),
     t0,
   );
   let spent = t0.advance(500);
-  svc.handle_timeout(spent).unwrap();
+  svc.tick_for_test(spent).unwrap();
 
   // INVERTED, deliberately. The old claim was "a §8.2 loss renames" and this
   // asserted the name moved; the admitted outcome now is that a §8.2 loss KEEPS
@@ -5359,14 +5369,14 @@ fn a_retransmitted_probe_is_not_a_longer_proposal() {
   {
     let mut svc = make_service(120);
     let t0 = FakeInstant::zero();
-    svc.handle_timeout(t0).unwrap();
+    svc.tick_for_test(t0).unwrap();
     let original = svc.name().as_str().to_owned();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
       t0,
     );
     let spent = t0.advance(500);
-    svc.handle_timeout(spent).unwrap();
+    svc.tick_for_test(spent).unwrap();
     assert_tiebreak_deferred(
       &mut svc,
       &original,
@@ -5383,10 +5393,10 @@ fn a_retransmitted_probe_is_not_a_longer_proposal() {
   {
     let mut svc = make_service(120);
     let t0 = FakeInstant::zero();
-    svc.handle_timeout(t0).unwrap();
+    svc.tick_for_test(t0).unwrap();
     let original = svc.name().as_str().to_owned();
     for datagram in [dg(1), dg(2)] {
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, datagram)),
         t0,
       );
@@ -5397,7 +5407,7 @@ fn a_retransmitted_probe_is_not_a_longer_proposal() {
        is scored as exactly the {{TXT, SRV}} the peer actually proposed"
     );
     let spent = t0.advance(500);
-    svc.handle_timeout(spent).unwrap();
+    svc.tick_for_test(spent).unwrap();
     assert_tiebreak_deferred(
       &mut svc,
       &original,
@@ -5459,7 +5469,7 @@ fn an_identical_defending_response_never_costs_a_probing_service_its_name() {
       let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
       identical(&mut buf, srv);
       let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::ProbeConflict(ProbeConflict::new(
           peer,
           rec,
@@ -5475,7 +5485,7 @@ fn an_identical_defending_response_never_costs_a_probing_service_its_name() {
       "row B: a defending response carrying OUR OWN rdata is not a conflict, so \
        it must not latch a §8.1 deferral"
     );
-    svc.handle_timeout(t0.advance(500)).unwrap();
+    svc.tick_for_test(t0.advance(500)).unwrap();
     assert_eq!(
       svc.name().as_str(),
       original,
@@ -5511,7 +5521,7 @@ fn an_identical_defending_response_never_costs_a_probing_service_its_name() {
       let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
       identical(&mut buf, srv);
       let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::ProbeConflict(ProbeConflict::new(
           peer,
           rec,
@@ -5527,7 +5537,7 @@ fn an_identical_defending_response_never_costs_a_probing_service_its_name() {
       "row B′: the rule is a property of the RECORDS, so a re-probe screens \
        identical rdata exactly as initial probing does"
     );
-    svc.handle_timeout(now.advance(500)).unwrap();
+    svc.tick_for_test(now.advance(500)).unwrap();
     assert_eq!(
       svc.name().as_str(),
       original,
@@ -5584,7 +5594,7 @@ fn a_section9_reprobe_classifies_the_same_in_both_driver_orders() {
     let mut now = established_at;
     for _ in 0..12 {
       now = svc.poll_timeout().unwrap_or(now.advance(250));
-      svc.handle_timeout(now).unwrap();
+      svc.tick_for_test(now).unwrap();
       let mut buf = std::vec![0u8; 4096];
       while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
         svc.note_delivery(now, TransmitDelivery::ALL);
@@ -5604,7 +5614,7 @@ fn a_section9_reprobe_classifies_the_same_in_both_driver_orders() {
     let bytes = srv_txt_proposal(9999);
     let peer: core::net::SocketAddr = "192.168.1.66:5353".parse().unwrap();
     let deliver = |svc: &mut Service<_, _, _>| {
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
         due,
       );
@@ -5615,15 +5625,15 @@ fn a_section9_reprobe_classifies_the_same_in_both_driver_orders() {
     // from that instant.
     let spent = if rx_first {
       deliver(&mut svc);
-      svc.handle_timeout(due).unwrap();
+      svc.tick_for_test(due).unwrap();
       due
     } else {
-      svc.handle_timeout(due).unwrap();
+      svc.tick_for_test(due).unwrap();
       deliver(&mut svc);
       due.advance(500)
     };
 
-    svc.handle_timeout(due.advance(500)).unwrap();
+    svc.tick_for_test(due.advance(500)).unwrap();
     // INVERTED, deliberately. The old claim was "a §8.2 loss renames" and this
     // asserted the name moved; the admitted outcome now is that a §8.2 loss
     // KEEPS the name and re-probes it after one second — RFC 6762 §8.2: "it
@@ -5673,9 +5683,9 @@ fn a_queued_announcement_cannot_overtake_a_classified_conflict() {
   }
   // Close the settling window, then queue the first announcement.
   now = svc.poll_timeout().expect("settling re-arms");
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   now = svc.poll_timeout().expect("the announcement is due");
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(
     svc
       .pending_transmits
@@ -5697,7 +5707,7 @@ fn a_queued_announcement_cannot_overtake_a_classified_conflict() {
   );
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.44:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -5726,7 +5736,7 @@ fn a_queued_announcement_cannot_overtake_a_classified_conflict() {
      cannot be told otherwise"
   );
 
-  svc.handle_timeout(now.advance(500)).unwrap();
+  svc.tick_for_test(now.advance(500)).unwrap();
   assert_ne!(
     svc.name().as_str(),
     original,
@@ -5783,7 +5793,7 @@ fn the_conflict_classification_is_independent_of_driver_loop_order() {
     let bytes = srv_txt_proposal(9999);
     let peer: core::net::SocketAddr = "192.168.1.55:5353".parse().unwrap();
     let deliver = |svc: &mut Service<_, _, _>| {
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
         due,
       );
@@ -5795,17 +5805,17 @@ fn the_conflict_classification_is_independent_of_driver_loop_order() {
     let spent = if rx_first {
       // hick-mio / hick-reactor shape.
       deliver(&mut svc);
-      svc.handle_timeout(due).unwrap();
+      svc.tick_for_test(due).unwrap();
       due
     } else {
       // hick-smoltcp shape: the deadline transition runs BEFORE the queued
       // datagram is drained, so the conflict is seen in `Announcing(0)`.
-      svc.handle_timeout(due).unwrap();
+      svc.tick_for_test(due).unwrap();
       deliver(&mut svc);
       due.advance(500)
     };
 
-    svc.handle_timeout(due.advance(500)).unwrap();
+    svc.tick_for_test(due.advance(500)).unwrap();
     // INVERTED, deliberately. The old claim was "a §8.2 loss renames" and this
     // asserted the name moved; the admitted outcome now is that a §8.2 loss
     // KEEPS the name and re-probes it after one second — RFC 6762 §8.2: "it
@@ -5868,7 +5878,7 @@ fn a_record_repeated_within_one_proposal_is_compared_as_sent() {
   {
     let mut svc = make_service(120);
     let t0 = FakeInstant::zero();
-    svc.handle_timeout(t0).unwrap();
+    svc.tick_for_test(t0).unwrap();
     let original = svc.name().as_str().to_owned();
     // ONE datagram: this is a repeat within a single proposal.
     let bytes = proposal_bytes(
@@ -5879,12 +5889,12 @@ fn a_record_repeated_within_one_proposal_is_compared_as_sent() {
         Rec::Txt(&[b"k=v"]),
       ],
     );
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
       t0,
     );
     let spent = t0.advance(500);
-    svc.handle_timeout(spent).unwrap();
+    svc.tick_for_test(spent).unwrap();
     assert_tiebreak_deferred(
       &mut svc,
       &original,
@@ -5904,7 +5914,7 @@ fn a_record_repeated_within_one_proposal_is_compared_as_sent() {
   {
     let mut svc = make_service(120);
     let t0 = FakeInstant::zero();
-    svc.handle_timeout(t0).unwrap();
+    svc.tick_for_test(t0).unwrap();
     let original = svc.name().as_str().to_owned();
     let bytes = proposal_bytes(
       "myprinter._ipp._tcp.local.",
@@ -5920,12 +5930,12 @@ fn a_record_repeated_within_one_proposal_is_compared_as_sent() {
         },
       ],
     );
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
       t0,
     );
     let spent = t0.advance(500);
-    svc.handle_timeout(spent).unwrap();
+    svc.tick_for_test(spent).unwrap();
     assert_tiebreak_deferred(
       &mut svc,
       &original,
@@ -5950,14 +5960,14 @@ fn two_proposals_from_one_source_are_compared_separately() {
   let peer: core::net::SocketAddr = "192.168.1.91:5353".parse().unwrap();
   let mut svc = make_service(120); // SRV(631) + empty TXT
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
   let original = svc.name().as_str().to_owned();
 
   // Proposal A: {TXT(empty)} alone — runs out first, so WE win.
   // Proposal B: {SRV(80)} alone — starts `00 21` against our `00 10`, so it wins.
   // Their union {TXT, SRV(80)} would compare equal-then-lower and hand us a win.
   let bytes_a = proposal_bytes("myprinter._ipp._tcp.local.", &[Rec::Txt(&[])]);
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes_a, peer, dg(1))),
     t0,
   );
@@ -5973,7 +5983,7 @@ fn two_proposals_from_one_source_are_compared_separately() {
       target: "host.local.",
     }],
   );
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes_b, peer, dg(2))),
     t0,
   );
@@ -5984,7 +5994,7 @@ fn two_proposals_from_one_source_are_compared_separately() {
      scored on its own rather than folded into A"
   );
   let spent = t0.advance(500);
-  svc.handle_timeout(spent).unwrap();
+  svc.tick_for_test(spent).unwrap();
   // INVERTED, deliberately. The old claim was "a §8.2 loss renames" and this
   // asserted the name moved; the admitted outcome now is that a §8.2 loss KEEPS
   // the name and re-probes it after one second — RFC 6762 §8.2: "it defers to
@@ -6061,13 +6071,13 @@ fn the_section81_window_stays_open_250ms_past_the_third_probe() {
       }],
     );
     match origin {
-      ConflictOrigin::TentativeProbe => svc.handle_event(
+      ConflictOrigin::TentativeProbe => svc.feed_for_test(
         ServiceEvent::ProbeProposal(probe_proposal(&proposal, peer, dg(1))),
         inside,
       ),
       ConflictOrigin::AuthoritativeResponse => {
         let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-        svc.handle_event(
+        svc.feed_for_test(
           ServiceEvent::ProbeConflict(ProbeConflict::new(
             peer,
             rec,
@@ -6086,7 +6096,7 @@ fn the_section81_window_stays_open_250ms_past_the_third_probe() {
     );
 
     let spent = inside.advance(500);
-    svc.handle_timeout(spent).unwrap();
+    svc.tick_for_test(spent).unwrap();
     // The two origins part company HERE, and that contrast is the point of
     // running both. INVERTED for the §8.2 half only: the old claim was "a §8.2
     // loss renames", and the admitted outcome now is that a §8.2 loss KEEPS the
@@ -6146,15 +6156,15 @@ fn tiebreak_the_list_with_records_remaining_wins() {
   let run = |recs: &[Rec<'_>]| -> bool {
     let mut svc = make_service(120);
     let t0 = FakeInstant::zero();
-    svc.handle_timeout(t0).unwrap(); // Init → Probing
+    svc.tick_for_test(t0).unwrap(); // Init → Probing
     let original = svc.name().as_str().to_owned();
     let bytes = proposal_bytes("myprinter._ipp._tcp.local.", recs);
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer_src, dg(1))),
       t0,
     );
     let spent = t0.advance(500);
-    svc.handle_timeout(spent).unwrap();
+    svc.tick_for_test(spent).unwrap();
     assert_eq!(
       svc.name().as_str(),
       original,
@@ -6219,7 +6229,7 @@ fn poll_transmit_does_not_lose_pending_on_buffer_too_small() {
   let mut probe_pending = false;
   for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if svc
       .pending_transmits
       .contains(&Some(PendingTransmitKind::Probe))
@@ -6358,7 +6368,7 @@ fn poll_transmit_blocks_until_confirmation() {
   let mut emitted = false;
   for _ in 0..10 {
     now = now.advance(300);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
       emitted = true;
       break;
@@ -6394,7 +6404,7 @@ fn failed_established_reannounce_retries_within_one_second() {
     due.checked_duration_since(est).is_some(),
     "the re-announce is scheduled into the future"
   );
-  svc.handle_timeout(due).unwrap();
+  svc.tick_for_test(due).unwrap();
   // Emit the re-announcement, then report the send as FAILED.
   assert!(
     svc
@@ -6436,7 +6446,7 @@ fn subtype_ptr_advertised_in_response() {
   records.add_subtype("_printer").unwrap();
   let sub = Name::try_from_str("_printer._sub._ipp._tcp.local.").unwrap();
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       records,
       FakeInstant::zero(),
@@ -6449,7 +6459,7 @@ fn subtype_ptr_advertised_in_response() {
   // A question response carries the subtype PTR at positive TTL.
   inject_question_to_set_response_deadline(&mut svc, now);
   let now2 = now.advance(200);
-  svc.handle_timeout(now2).unwrap();
+  svc.tick_for_test(now2).unwrap();
   let mut buf = std::vec![0u8; 4096];
   let tx = svc
     .poll_transmit(now2, &mut buf)
@@ -6495,7 +6505,7 @@ fn meta_query_is_answered_with_service_type_ptr() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
     now,
   );
@@ -6544,7 +6554,7 @@ fn legacy_subtype_browse_gets_unicast_reply_with_subtype_ptr() {
   records.add_subtype("_printer").unwrap();
   let sub = Name::try_from_str("_printer._sub._ipp._tcp.local.").unwrap();
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       records,
       FakeInstant::zero(),
@@ -6567,7 +6577,7 @@ fn legacy_subtype_browse_gets_unicast_reply_with_subtype_ptr() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let legacy_src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x33)),
     now,
   );
@@ -6615,7 +6625,7 @@ fn legacy_meta_query_gets_unicast_meta_ptr() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let legacy_src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x44)),
     now,
   );
@@ -6679,7 +6689,7 @@ fn make_bad_srv_record_ref(buf: &mut std::vec::Vec<u8>, owner_str: &str) {
 fn probing_conflict_drops_malformed_rdata() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap(); // Init → Probing
+  svc.tick_for_test(t0).unwrap(); // Init → Probing
   let original = svc.name().as_str().to_owned();
 
   // The two well-formed records, then the malformed SRV appended by hand — the
@@ -6705,7 +6715,7 @@ fn probing_conflict_drops_malformed_rdata() {
   bytes[8..10].copy_from_slice(&(nscount + 1).to_be_bytes());
 
   let src: core::net::SocketAddr = "192.168.1.88:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, src, dg(1))),
     t0,
   );
@@ -6714,7 +6724,7 @@ fn probing_conflict_drops_malformed_rdata() {
     "a record whose rdata will not canonicalize is not a member of the peer's \
      list, so an otherwise byte-identical proposal stays a tie"
   );
-  svc.handle_timeout(t0.advance(500)).unwrap();
+  svc.tick_for_test(t0.advance(500)).unwrap();
   assert_eq!(
     svc.name().as_str(),
     original,
@@ -6732,7 +6742,7 @@ fn post_establishment_conflict_drops_non_srv_txt_record() {
   make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 9]);
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -6763,7 +6773,7 @@ fn post_establishment_conflict_ignores_identical_srv() {
   );
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -6788,7 +6798,7 @@ fn post_establishment_conflict_drops_malformed_srv() {
   make_bad_srv_record_ref(&mut buf, "myprinter._ipp._tcp.local.");
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -6825,7 +6835,7 @@ fn post_establishment_conflict_is_rate_limited() {
   );
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -6881,7 +6891,7 @@ fn post_establishment_conflict_is_not_exempted_by_the_history_label() {
   );
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -6926,7 +6936,7 @@ fn a_history_labelled_post_establishment_conflict_is_still_rate_limited() {
   );
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -7009,7 +7019,7 @@ fn poll_transmit_announcement_surfaces_buffer_too_small() {
   let mut tiny = std::vec![0u8; 12];
   for _ in 0..6 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Err(TransmitError::BufferTooSmall(_)) = svc.poll_transmit(now, &mut tiny) {
       return;
     }
@@ -7027,7 +7037,7 @@ fn poll_transmit_question_response_surfaces_buffer_too_small() {
   let mut now = now0;
   for _ in 0..10 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Err(TransmitError::BufferTooSmall(_)) = svc.poll_transmit(now, &mut tiny) {
       return;
     }
@@ -7057,7 +7067,7 @@ fn withdrawal_snapshot_after_rename_captures_only_current() {
   // `myprinter-1`.
   deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
   let now = t0.advance(500);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(
     svc.name().as_str().contains("-1"),
     "service should have renamed to `myprinter-1`"
@@ -7142,7 +7152,7 @@ fn duplicate_legacy_question_is_deduped() {
     qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
     qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
     let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x4242)),
       now,
     );
@@ -7204,7 +7214,7 @@ fn partial_kas_suppression_counter_is_delivery_gated() {
       );
       let (srv_ref, _) = Ref::try_parse(&srv_buf, 0).unwrap();
       let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), srv_ref);
-      svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+      svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
     };
 
   // Helper: inject a Question that will trigger a multicast response.
@@ -7224,7 +7234,7 @@ fn partial_kas_suppression_counter_is_delivery_gated() {
       qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
       let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
       let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
         now,
       );
@@ -7233,7 +7243,7 @@ fn partial_kas_suppression_counter_is_delivery_gated() {
   // ── Cycle 1: partial suppression, then delivery=false ──
   inject_srv_hint(&mut svc, now);
   inject_any_question(&mut svc, now);
-  svc.handle_timeout(now.advance(200)).unwrap();
+  svc.tick_for_test(now.advance(200)).unwrap();
 
   let mut buf = std::vec![0u8; 4096];
   let now2 = now.advance(200);
@@ -7256,7 +7266,7 @@ fn partial_kas_suppression_counter_is_delivery_gated() {
   // ── Cycle 2: same partial suppression, then delivery=true ──
   inject_srv_hint(&mut svc, now2);
   inject_any_question(&mut svc, now2);
-  svc.handle_timeout(now2.advance(200)).unwrap();
+  svc.tick_for_test(now2.advance(200)).unwrap();
   let now3 = now2.advance(200);
   let tx2 = svc.poll_transmit(now3, &mut buf).unwrap();
   assert!(
@@ -7330,7 +7340,7 @@ fn full_kas_suppression_counts_at_suppression_not_delivery() {
   }
   let (ptr_ref, _) = Ref::try_parse(&ptr_buf, 0).unwrap();
   let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), ptr_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   // Also suppress SRV.
   {
@@ -7346,7 +7356,7 @@ fn full_kas_suppression_counts_at_suppression_not_delivery() {
     );
     let (srv_ref, _) = Ref::try_parse(&srv_buf, 0).unwrap();
     let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), srv_ref);
-    svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+    svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
   }
 
   // Inject a Question to arm a response, then fire the deadline.
@@ -7364,14 +7374,14 @@ fn full_kas_suppression_counts_at_suppression_not_delivery() {
     qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
     let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
     let src: core::net::SocketAddr = "0.0.0.0:5353".parse().unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
       now,
     );
   }
 
   let now2 = now.advance(200);
-  svc.handle_timeout(now2).unwrap();
+  svc.tick_for_test(now2).unwrap();
 
   let before = stats.snapshot().answers_suppressed_kas;
   let mut buf = std::vec![0u8; 4096];
@@ -7432,7 +7442,7 @@ fn multicast_meta_response_counts_responses_tx() {
   let qbuf = build_meta_question_bytes();
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "192.0.2.1:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
     now,
   );
@@ -7464,7 +7474,7 @@ fn multicast_meta_response_counts_responses_tx() {
   let qbuf2 = build_meta_question_bytes();
   let (qref2, _) = QuestionRef::try_parse(&qbuf2, 0).unwrap();
   let src2: core::net::SocketAddr = "192.0.2.2:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref2, src2, 0)),
     now2,
   );
@@ -7503,7 +7513,7 @@ fn legacy_meta_response_counts_responses_tx() {
   let qbuf = build_meta_question_bytes();
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "192.0.2.50:12345".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 42)),
     now,
   );
@@ -7535,7 +7545,7 @@ fn legacy_meta_response_counts_responses_tx() {
   let qbuf2 = build_meta_question_bytes();
   let (qref2, _) = QuestionRef::try_parse(&qbuf2, 0).unwrap();
   let src2: core::net::SocketAddr = "192.0.2.51:12345".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref2, src2, 43)),
     now,
   );
@@ -7588,7 +7598,7 @@ fn withdrawal_snapshot_of_never_announced_service_is_empty() {
   // host addresses.
   let mut svc = make_service(120);
   // Kick off probing (Init → Probing) but do NOT confirm any sends.
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  svc.tick_for_test(FakeInstant::zero()).unwrap();
 
   let snap = svc.withdrawal_snapshot();
 
@@ -7640,7 +7650,7 @@ fn drive_to_announcing_zero(
   let mut now = FakeInstant::zero();
   for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -7665,7 +7675,7 @@ fn emit_announcement(
     .poll_timeout()
     .expect("an announcing service always has a lifecycle deadline");
   let at = if due > now { due } else { now };
-  svc.handle_timeout(at).unwrap();
+  svc.tick_for_test(at).unwrap();
   svc
     .poll_transmit(at, &mut buf)
     .unwrap()
@@ -7952,7 +7962,7 @@ fn partial_probe_re_arms_the_same_probe_and_latches_nothing() {
   // distinguishable from never having started.
   'reach: for _ in 0..20 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       svc.note_delivery(now, TransmitDelivery::ALL);
       if matches!(svc.state(), ServiceState::Probing(1)) {
@@ -7970,7 +7980,7 @@ fn partial_probe_re_arms_the_same_probe_and_latches_nothing() {
   // index. (The bound's own escape is asserted separately.)
   for _ in 0..MAX_PARTIAL_ROUNDS {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
     svc.note_delivery(now, TransmitDelivery::V4_ONLY);
     assert!(
@@ -7990,7 +8000,7 @@ fn partial_probe_re_arms_the_same_probe_and_latches_nothing() {
 
   // Lossless recovery: the very next fully-delivered probe resumes at index 1.
   now = now.advance(500);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(svc.poll_transmit(now, &mut buf).unwrap().is_some());
   svc.note_delivery(now, TransmitDelivery::ALL);
   assert!(
@@ -8061,7 +8071,7 @@ fn a_legacy_unicast_reply_never_opens_the_reclaim_cancel_gate() {
   qbuf.extend_from_slice(&12u16.to_be_bytes()); // QTYPE PTR
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = crate::wire::QuestionRef::try_parse(&qbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(crate::event::ServiceQuestion::new(qref, legacy_src, 0x4242)),
     at,
   );
@@ -8102,7 +8112,7 @@ fn a_conflict_rename_closes_the_reclaim_cancel_gate() {
   // An existing owner's differing SRV (port 9999 > ours 631) → rename.
   deliver_losing_srv_conflict(&mut svc, t0, ConflictOrigin::AuthoritativeResponse);
   let later = t0.advance(500);
-  svc.handle_timeout(later).unwrap();
+  svc.tick_for_test(later).unwrap();
   assert!(
     svc.name().as_str().contains("-1"),
     "the service should have renamed; name={}",
@@ -8153,7 +8163,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
   let mut announcements = 0u32;
   for _ in 0..40 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Some(tx) = svc.poll_transmit(now, &mut buf).unwrap() {
       match &svc.awaiting_confirm {
         Some(AwaitingConfirm::Probe) => {
@@ -8190,7 +8200,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
   now = svc
     .poll_timeout()
     .expect("an Established service re-announces periodically");
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   let re_announce = svc
     .poll_transmit(now, &mut buf)
     .unwrap()
@@ -8212,7 +8222,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
   now = svc
     .poll_timeout()
     .expect("a question arms the jittered response deadline");
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   let response = svc
     .poll_transmit(now, &mut buf)
     .unwrap()
@@ -8232,7 +8242,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
   let legacy_src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
   let qbuf = question_bytes("_ipp._tcp.local.", 12); // QTYPE PTR
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x55)),
     now,
   );
@@ -8256,7 +8266,7 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
   // ── The RFC 6763 §9 meta-response, unicast then multicast ───────────────
   let meta_q = question_bytes("_services._dns-sd._udp.local.", 12);
   let (qref, _) = QuestionRef::try_parse(&meta_q, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x56)),
     now,
   );
@@ -8273,12 +8283,12 @@ fn transmit_obligation_is_a_function_of_the_commit_token() {
 
   let meta_src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
   let (qref, _) = QuestionRef::try_parse(&meta_q, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, meta_src, 0)),
     now,
   );
   now = now.advance(200); // past the 20–120 ms meta jitter window
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   let meta = svc
     .poll_transmit(now, &mut buf)
     .unwrap()
@@ -8307,7 +8317,7 @@ fn emit_probe(
     .poll_timeout()
     .expect("a probing service always has a lifecycle deadline");
   let at = if due > now { due } else { now };
-  svc.handle_timeout(at).unwrap();
+  svc.tick_for_test(at).unwrap();
   svc
     .poll_transmit(at, &mut buf)
     .unwrap()
@@ -8327,7 +8337,7 @@ fn drive_to_probing_zero(
   let mut now = FakeInstant::zero();
   for _ in 0..8 {
     now = now.advance(300);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if matches!(svc.state(), ServiceState::Probing(0)) {
       return now;
     }
@@ -8389,7 +8399,7 @@ fn the_first_probe_of_a_sequence_keeps_the_random_initial_wait() {
   // wire, so the deadline is drawn from the initial-wait range, not the interval.
   let mut now = FakeInstant::zero();
   now = now.advance(300);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   let armed = svc
     .lifecycle_deadline
     .expect("Init always schedules a probe deadline");
@@ -8607,7 +8617,7 @@ fn a_response_confirm_cannot_move_the_partial_bound() {
   let legacy_src: core::net::SocketAddr = "192.0.2.9:40000".parse().unwrap();
   let qbuf = question_bytes("_ipp._tcp.local.", 12); // QTYPE PTR
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, legacy_src, 0x55)),
     now,
   );
@@ -8626,7 +8636,7 @@ fn a_response_confirm_cannot_move_the_partial_bound() {
   now = svc
     .response_deadline
     .expect("the response deadline is armed");
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   svc
     .poll_transmit(now, &mut buf)
     .unwrap()
@@ -8684,7 +8694,7 @@ fn a_conflict_rename_clears_the_partial_bound() {
   );
   let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       srec,
@@ -8695,7 +8705,7 @@ fn a_conflict_rename_clears_the_partial_bound() {
     now,
   );
   now = now.advance(300);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
 
   assert!(
     svc.name().as_str().contains("-1"),
@@ -8737,7 +8747,7 @@ fn the_section9_revert_to_probe_clears_the_partial_bound() {
   );
   let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       srec,
@@ -8819,7 +8829,7 @@ fn deliver_losing_srv_conflict(
           target: "host.local.",
         }],
       );
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
         now,
       );
@@ -8836,7 +8846,7 @@ fn deliver_losing_srv_conflict(
         "host.local.",
       );
       let (srec, _) = Ref::try_parse(&sbuf, 0).unwrap();
-      svc.handle_event(
+      svc.feed_for_test(
         ServiceEvent::ProbeConflict(ProbeConflict::new(
           peer,
           srec,
@@ -8914,7 +8924,7 @@ fn no_rename_is_reachable_with_an_announcement_parked_across_a_section9_revert()
   );
 
   let now = at.advance(300);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(
     svc
       .poll_transmit(now, &mut std::vec![0u8; 4096])
@@ -8974,7 +8984,7 @@ fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
   // keeps the name.
   deliver_losing_srv_conflict(&mut svc, at, ConflictOrigin::AuthoritativeResponse);
   now = at.advance(300);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(
     svc.name().as_str().contains("-1"),
     "the service must have renamed; name={}",
@@ -8984,7 +8994,7 @@ fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
   // The fresh sequence takes its free step — no transmit, so the parked probe is
   // still the only datagram outstanding.
   now = svc.poll_timeout().expect("the renamed service re-probes");
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(matches!(svc.state(), ServiceState::Probing(0)));
 
   svc.note_delivery(now, TransmitDelivery::ALL);
@@ -9001,7 +9011,7 @@ fn a_stale_probe_confirm_does_not_advance_the_new_names_sequence() {
   let mut wire_probes = 0usize;
   for _ in 0..12 {
     now = svc.poll_timeout().expect("still probing");
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       wire_probes += 1;
       svc.note_delivery(now, TransmitDelivery::ALL);
@@ -9142,13 +9152,13 @@ fn a_regression_leaves_a_meta_response_token_alone() {
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let qsrc: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, qsrc, 0)),
     now,
   );
 
   let at = now.advance(200); // past the 20–120 ms meta jitter window
-  svc.handle_timeout(at).unwrap();
+  svc.tick_for_test(at).unwrap();
   let mut buf = std::vec![0u8; 4096];
   svc
     .poll_transmit(at, &mut buf)
@@ -9424,7 +9434,7 @@ fn drive_to_established_with(
       Some(due) if due > now => due,
       _ => now.advance(250),
     };
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       svc.note_delivery(now, delivery);
     }
@@ -9846,7 +9856,7 @@ fn establish_under(delivery: TransmitDelivery) -> (FakeInstant, usize, usize) {
     {
       now = due;
     }
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       rounds = rounds.saturating_add(1);
       if matches!(svc.awaiting_confirm, Some(AwaitingConfirm::Announcement(_))) {
@@ -9990,7 +10000,7 @@ fn a_recovered_family_is_owed_the_whole_bound_again() {
   now = svc
     .poll_timeout()
     .expect("the §8.1 settling window always re-arms");
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(
     matches!(svc.state(), ServiceState::Announcing(0)),
     "the settling window closes into announcing; got {:?}",
@@ -10066,7 +10076,7 @@ fn a_lifecycle_timeout_queues_nothing_while_a_datagram_is_unconfirmed() {
   let due = svc
     .poll_timeout()
     .expect("the probe deadline is re-armed at the fire site");
-  svc.handle_timeout(due).unwrap();
+  svc.tick_for_test(due).unwrap();
   assert!(
     svc.peek_pending().is_none(),
     "a lifecycle deadline firing under a live commit token must queue nothing; \
@@ -10106,7 +10116,7 @@ fn accumulated_lifecycle_deadlines_cannot_burst_after_the_confirm() {
 
   for _ in 0..3 {
     at = svc.poll_timeout().expect("the probe deadline stays armed");
-    svc.handle_timeout(at).unwrap();
+    svc.tick_for_test(at).unwrap();
   }
   svc.note_delivery(at, TransmitDelivery::ALL);
   assert_eq!(
@@ -10147,7 +10157,7 @@ fn an_established_refresh_queues_nothing_while_a_datagram_is_unconfirmed() {
   let next = svc
     .poll_timeout()
     .expect("the refresh deadline is re-armed at the fire site");
-  svc.handle_timeout(next).unwrap();
+  svc.tick_for_test(next).unwrap();
   assert!(
     svc.peek_pending().is_none(),
     "queue={:?}",
@@ -10172,7 +10182,7 @@ fn handle_timeout_under_a_live_commit_token_trips_the_contract_assertion() {
   let mut svc = make_service(120);
   let now = drive_to_probing_zero(&mut svc);
   let at = emit_probe(&mut svc, now);
-  let _ = svc.handle_timeout(at.advance(300));
+  let _ = svc.tick_for_test(at.advance(300));
 }
 
 #[cfg(debug_assertions)]
@@ -10391,7 +10401,7 @@ fn a_permanently_oversized_one_shot_reply_never_retires_a_service() {
   // Drive to Established so the next due datagram is not a lifecycle one.
   for _ in 0..40 {
     now = now.advance(300);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if svc.poll_transmit(now, &mut buf).unwrap().is_some() {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -10404,7 +10414,7 @@ fn a_permanently_oversized_one_shot_reply_never_retires_a_service() {
   // A §6 multicast reply to an on-link question.
   inject_question_to_set_response_deadline(&mut svc, now);
   now = now.advance(1_000);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   let tx = svc
     .poll_transmit(now, &mut buf)
     .unwrap()
@@ -10443,7 +10453,7 @@ fn draw_first_probe(
   let mut now = FakeInstant::zero();
   for _ in 0..8 {
     now = now.advance(100);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if svc.poll_transmit(now, buf).unwrap().is_some() {
       return now;
     }
@@ -10549,12 +10559,12 @@ fn winning_pair() -> (std::vec::Vec<u8>, std::vec::Vec<u8>) {
 fn the_winning_pair_control_really_does_lose_the_round() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let (txt, srv) = winning_pair();
   let bytes = raw_proposal_bytes(&[txt, srv]);
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -10580,7 +10590,7 @@ fn the_winning_pair_control_really_does_lose_the_round() {
 fn an_undecodable_owner_name_abandons_the_whole_proposal() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let (txt, srv) = winning_pair();
   // The third record sits after the two readable ones; its owner name is a
@@ -10591,7 +10601,7 @@ fn an_undecodable_owner_name_abandons_the_whole_proposal() {
   let bytes = raw_proposal_bytes(&[txt, srv, cyclic]);
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -10614,7 +10624,7 @@ fn an_undecodable_owner_name_abandons_the_whole_proposal() {
 fn an_undecodable_nsec_next_name_abandons_the_proposal() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let (txt, srv) = winning_pair();
   // The NSEC's rdata begins after its owner name (PROBED_NAME uncompressed),
@@ -10631,7 +10641,7 @@ fn an_undecodable_nsec_next_name_abandons_the_proposal() {
   let bytes = raw_proposal_bytes(&[txt, srv, nsec]);
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -10665,7 +10675,7 @@ fn an_undecodable_nsec_next_name_abandons_the_proposal() {
 fn an_unparsed_compressible_type_abandons_the_proposal() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let (txt, srv) = winning_pair();
   // A DNAME (type 39) at the probed name whose rdata is a compression pointer.
@@ -10686,7 +10696,7 @@ fn an_unparsed_compressible_type_abandons_the_proposal() {
   let bytes = raw_proposal_bytes(&[txt, srv, dname]);
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -10709,7 +10719,7 @@ fn an_unparsed_compressible_type_abandons_the_proposal() {
 fn a_proposal_with_no_question_is_not_adjudicated() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let (txt, srv) = winning_pair();
   let mut bytes = raw_proposal_bytes(&[txt, srv]);
@@ -10720,7 +10730,7 @@ fn a_proposal_with_no_question_is_not_adjudicated() {
   bytes.drain(12..12 + qlen);
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -10749,7 +10759,7 @@ fn a_proposal_with_no_question_is_not_adjudicated() {
 fn a_question_asking_in_another_class_proposes_nothing_about_ours() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let (txt, srv) = winning_pair();
   // QCLASS 3 = CH (Chaos). The §5.4 unicast-response bit is the top bit and is
@@ -10764,7 +10774,7 @@ fn a_question_asking_in_another_class_proposes_nothing_about_ours() {
   );
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -10782,13 +10792,13 @@ fn a_question_asking_in_another_class_proposes_nothing_about_ours() {
 fn a_question_for_another_name_proposes_nothing_about_ours() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let (txt, srv) = winning_pair();
   let bytes = raw_proposal_bytes_asking("someone-else._ipp._tcp.local.", &[txt, srv]);
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -10828,14 +10838,14 @@ fn a_question_for_another_name_proposes_nothing_about_ours() {
 fn a_narrowed_qtype_still_proposes_the_whole_authority_section() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let (txt, srv) = winning_pair();
   let bytes =
     raw_proposal_bytes_asking_type(PROBED_NAME, crate::wire::ResourceType::Txt, &[txt, srv]);
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -10913,7 +10923,7 @@ fn a_record_outside_the_probes_qtype_is_still_proposed() {
     );
     records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
     let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-      Service::try_new(
+      Service::for_test(
         ServiceHandle::from_raw(0),
         records,
         FakeInstant::zero(),
@@ -10922,14 +10932,14 @@ fn a_record_outside_the_probes_qtype_is_still_proposed() {
         true,
       );
     let t0 = FakeInstant::zero();
-    svc.handle_timeout(t0).unwrap();
+    svc.tick_for_test(t0).unwrap();
 
     let mut cname = std::vec::Vec::new();
     make_cname_record_ref(&mut cname, PROBED_NAME, 120, "elsewhere.local.");
     let bytes = raw_proposal_bytes_asking_type(PROBED_NAME, qtype, &[cname]);
 
     let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
       t0,
     );
@@ -10954,14 +10964,14 @@ fn a_record_outside_the_probes_qtype_is_still_proposed() {
 fn a_record_outside_the_qtype_still_loses_a_round_it_sorts_earlier_than() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   let mut cname = std::vec::Vec::new();
   make_cname_record_ref(&mut cname, PROBED_NAME, 120, "elsewhere.local.");
   let bytes = raw_proposal_bytes_asking_type(PROBED_NAME, crate::wire::ResourceType::A, &[cname]);
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -10993,7 +11003,7 @@ fn a_probe_queued_before_the_loss_does_not_escape_the_deferral() {
   let mut queued = false;
   for _ in 0..8 {
     now = now.advance(100);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     if svc.peek_pending().is_some() {
       queued = true;
       break;
@@ -11004,7 +11014,7 @@ fn a_probe_queued_before_the_loss_does_not_escape_the_deferral() {
   // The winning proposal arrives before the queue is drained.
   let bytes = srv_txt_proposal(9999);
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     now,
   );
@@ -11042,7 +11052,7 @@ fn a_probe_queued_before_the_loss_does_not_escape_the_deferral() {
 fn a_shared_ptr_only_response_does_not_close_the_preauthoritative_window() {
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
 
   // A confirmed Response that emitted the shared PTRs and NOTHING the instance
   // owns — what §7.1 leaves after suppressing a querier's known SRV and TXT.
@@ -11076,7 +11086,7 @@ fn a_shared_ptr_only_response_does_not_close_the_preauthoritative_window() {
   // adjudicated.
   let bytes = srv_txt_proposal(9999);
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -11106,7 +11116,7 @@ fn a_response_of_any_type_at_our_instance_name_defeats_the_probe() {
   make_a_record_ref(&mut buf, PROBED_NAME, 120, [10, 0, 0, 7]);
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -11164,7 +11174,7 @@ fn a_malformed_record_at_the_probed_name_is_not_a_conflict() {
   let mut svc = make_service(120);
   let start = probe_once(&mut svc, FakeInstant::zero());
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -11207,7 +11217,7 @@ fn an_identical_twins_instance_nsec_is_never_a_conflict() {
   let rec = reader.additional().flatten().next().unwrap();
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -11267,7 +11277,7 @@ fn a_differing_instance_nsec_reverts_an_established_service() {
   let rec = reader.additional().flatten().next().unwrap();
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -11305,7 +11315,7 @@ fn a_shared_ptr_at_the_instance_name_still_makes_no_established_conflict() {
   let rec = reader.answers().flatten().next().unwrap();
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -11353,7 +11363,7 @@ fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name(
   records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
   records.add_aaaa(core::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       records,
       FakeInstant::zero(),
@@ -11385,7 +11395,7 @@ fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name(
   let reader = crate::wire::MessageReader::try_parse(&conforming).unwrap();
   let rec = reader.additional().flatten().next().unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -11407,7 +11417,7 @@ fn a_conforming_twins_nsec_is_not_a_conflict_when_the_host_is_the_instance_name(
   let foreign = nsec_record(&[ResourceType::Ptr.to_u16()], &mut buf2);
   let reader2 = crate::wire::MessageReader::try_parse(&foreign).unwrap();
   let rec2 = reader2.additional().flatten().next().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec2,
@@ -11483,7 +11493,7 @@ fn a_query_for_an_absent_type_at_an_instance_host_name_is_answered_with_an_nsec(
   );
   records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
   let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
-    Service::try_new(
+    Service::for_test(
       ServiceHandle::from_raw(0),
       records,
       FakeInstant::zero(),
@@ -11496,7 +11506,7 @@ fn a_query_for_an_absent_type_at_an_instance_host_name_is_answered_with_an_nsec(
   let mut now = FakeInstant::zero();
   for _ in 0..30 {
     now = now.advance(500);
-    svc.handle_timeout(now).unwrap();
+    svc.tick_for_test(now).unwrap();
     while let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
       svc.note_delivery(now, TransmitDelivery::ALL);
     }
@@ -11510,7 +11520,7 @@ fn a_query_for_an_absent_type_at_an_instance_host_name_is_answered_with_an_nsec(
     "the fixture must reach the state that answers questions"
   );
   now = now.advance(500);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   assert!(
     svc.poll_transmit(now, &mut buf).unwrap().is_none(),
     "the fixture must be silent before the question, or the NSEC found below \
@@ -11529,12 +11539,12 @@ fn a_query_for_an_absent_type_at_an_instance_host_name_is_answered_with_an_nsec(
   qbuf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
   let (qref, _) = QuestionRef::try_parse(&qbuf, 0).unwrap();
   let src: core::net::SocketAddr = "192.0.2.7:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::Question(ServiceQuestion::new(qref, src, 0)),
     now,
   );
   now = now.advance(200);
-  svc.handle_timeout(now).unwrap();
+  svc.tick_for_test(now).unwrap();
   let tx = svc
     .poll_transmit(now, &mut buf)
     .unwrap()
@@ -11612,9 +11622,9 @@ fn an_unparseable_question_section_surfaces_no_authority_records() {
   // otherwise have taken the round (see `the_winning_pair_control_really_does_lose_the_round`).
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -11683,14 +11693,14 @@ fn an_abandoned_proposal_behaves_exactly_like_we_hold() {
   let t0 = FakeInstant::zero();
   let mut held = make_service(120);
   let mut abandoned = make_service(120);
-  held.handle_timeout(t0).unwrap();
-  abandoned.handle_timeout(t0).unwrap();
+  held.tick_for_test(t0).unwrap();
+  abandoned.tick_for_test(t0).unwrap();
 
-  held.handle_event(
+  held.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&holds, peer, dg(1))),
     t0,
   );
-  abandoned.handle_event(
+  abandoned.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&abandons, peer, dg(1))),
     t0,
   );
@@ -11723,8 +11733,8 @@ fn an_abandoned_proposal_behaves_exactly_like_we_hold() {
   let mut now = t0;
   for tick in 0..20 {
     now = now.advance(500);
-    held.handle_timeout(now).unwrap();
-    abandoned.handle_timeout(now).unwrap();
+    held.tick_for_test(now).unwrap();
+    abandoned.tick_for_test(now).unwrap();
     let h = held.poll_transmit(now, &mut held_buf).unwrap();
     let a = abandoned.poll_transmit(now, &mut abandoned_buf).unwrap();
     assert_eq!(
@@ -11777,7 +11787,7 @@ fn a_compressed_kx_abandons_rather_than_lengthening_the_peers_list() {
   for rtype in [36u16, 17, 18, 21, 26] {
     let mut svc = make_service(120);
     let t0 = FakeInstant::zero();
-    svc.handle_timeout(t0).unwrap();
+    svc.tick_for_test(t0).unwrap();
 
     // A TIE on SRV and TXT, so the round turns entirely on the third record.
     let mut txt = std::vec::Vec::new();
@@ -11804,7 +11814,7 @@ fn a_compressed_kx_abandons_rather_than_lengthening_the_peers_list() {
     let bytes = raw_proposal_bytes(&[txt, srv, exotic]);
 
     let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-    svc.handle_event(
+    svc.feed_for_test(
       ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
       t0,
     );
@@ -11864,9 +11874,9 @@ fn a_pointer_named_question_abandons_even_when_another_question_admits() {
 
   let mut svc = make_service(120);
   let t0 = FakeInstant::zero();
-  svc.handle_timeout(t0).unwrap();
+  svc.tick_for_test(t0).unwrap();
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
     t0,
   );
@@ -11915,7 +11925,7 @@ fn a_malformed_response_does_not_defeat_the_probe() {
 
   let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::ProbeConflict(ProbeConflict::new(
       peer,
       rec,
@@ -11932,7 +11942,7 @@ fn a_malformed_response_does_not_defeat_the_probe() {
      DIFFERING rdata and latch an §8.1 defeat"
   );
   let spent = start.advance(500);
-  svc.handle_timeout(spent).unwrap();
+  svc.tick_for_test(spent).unwrap();
   assert_eq!(
     svc.name().as_str(),
     before,
@@ -11984,7 +11994,7 @@ fn make_service_with(
   for addr in aaaa {
     r.add_aaaa(*addr);
   }
-  Service::try_new(
+  Service::for_test(
     ServiceHandle::from_raw(0),
     r,
     FakeInstant::zero(),
@@ -12009,14 +12019,15 @@ fn a_host_a_record_is_not_a_conflict_for_a_service_publishing_no_a() {
     &[],
     &[core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)],
   );
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  svc.tick_for_test(FakeInstant::zero()).unwrap();
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_a_record_ref(&mut buf, "host.local.", 120, [10, 0, 0, 99]);
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::HostConflict(HostConflict::new(
       rec,
       ConflictOrigin::AuthoritativeResponse,
+      dg(1),
     )),
     FakeInstant::zero(),
   );
@@ -12031,7 +12042,7 @@ fn a_host_a_record_is_not_a_conflict_for_a_service_publishing_no_a() {
 fn a_host_aaaa_record_is_not_a_conflict_for_a_service_publishing_no_aaaa() {
   use crate::event::{HostConflict, ServiceEvent};
   let mut svc = make_service_with(&[core::net::Ipv4Addr::new(192, 168, 1, 5)], &[]);
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  svc.tick_for_test(FakeInstant::zero()).unwrap();
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_aaaa_record_ref(
     &mut buf,
@@ -12042,10 +12053,11 @@ fn a_host_aaaa_record_is_not_a_conflict_for_a_service_publishing_no_aaaa() {
     ],
   );
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::HostConflict(HostConflict::new(
       rec,
       ConflictOrigin::AuthoritativeResponse,
+      dg(1),
     )),
     FakeInstant::zero(),
   );
@@ -12064,7 +12076,7 @@ fn a_host_aaaa_record_still_conflicts_when_we_own_an_aaaa_rrset() {
     &[],
     &[core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)],
   );
-  svc.handle_timeout(FakeInstant::zero()).unwrap();
+  svc.tick_for_test(FakeInstant::zero()).unwrap();
   let mut buf: std::vec::Vec<u8> = std::vec::Vec::new();
   make_aaaa_record_ref(
     &mut buf,
@@ -12075,10 +12087,11 @@ fn a_host_aaaa_record_still_conflicts_when_we_own_an_aaaa_rrset() {
     ],
   );
   let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  svc.handle_event(
+  svc.feed_for_test(
     ServiceEvent::HostConflict(HostConflict::new(
       rec,
       ConflictOrigin::AuthoritativeResponse,
+      dg(1),
     )),
     FakeInstant::zero(),
   );
@@ -12088,647 +12101,12 @@ fn a_host_aaaa_record_still_conflicts_when_we_own_an_aaaa_rrset() {
   );
 }
 
-// ── RFC 6762 §8.1's fifteen-conflicts-in-ten-seconds flood limit ─────
-
-/// Deliver one §9 conflict at an ESTABLISHED name: a peer's authoritative SRV
-/// for the name this service currently holds, on a port it does not publish.
-fn deliver_established_srv_conflict(
-  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
-  now: FakeInstant,
-) {
-  let owner = svc.name().as_str().to_owned();
-  let mut buf = std::vec::Vec::new();
-  make_srv_record_ref(&mut buf, &owner, 120, 0, 0, 9999, "host.local.");
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(
-      peer,
-      rec,
-      dg(1),
-      ConflictHistory::Unmatched,
-      ConflictRole::Instance,
-    )),
-    now,
-  );
-}
-
-/// Drive one turn of §8.1's conflict → rename → re-probe loop, and report the
-/// instant the rename happened at together with the deadline it armed for the
-/// restarted probe sequence.
-///
-/// Time advances only as far as the state machine's own schedule asks — each
-/// step jumps straight to the armed `lifecycle_deadline` — because the rule
-/// under test is how fast this loop may turn. A fixture with a tick of its own
-/// would be deciding that instead of the code, and a coarse one would spread
-/// fifteen conflicts past the ten-second window the limit is measured over.
-fn one_conflict_turn(
-  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
-  from: FakeInstant,
-) -> (FakeInstant, FakeInstant) {
-  let (_arrived, consumed, armed) = conflict_turn_with_lag(svc, from, 0);
-  (consumed, armed)
-}
-
-/// One turn of the same loop, with `lag_ms` between the conflict being RECEIVED
-/// and the timeout that spends it — returning `(arrived, consumed, armed)`.
-///
-/// The lag is the whole of the boundary case. §8.1 counts conflicts by when they
-/// occur, and this crate acts on a pre-authoritative one on a later tick, so the
-/// two instants genuinely differ and only one of them is the RFC's.
-fn conflict_turn_with_lag(
-  svc: &mut Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>,
-  from: FakeInstant,
-  lag_ms: u64,
-) -> (FakeInstant, FakeInstant, FakeInstant) {
-  let mut buf = std::vec![0u8; 4096];
-  let mut now = from;
-  let mut on_wire = false;
-  for _ in 0..8 {
-    let due = svc
-      .lifecycle_deadline
-      .expect("the probe loop must stay on a clock");
-    now = core::cmp::max(now, due);
-    svc.handle_timeout(now).unwrap();
-    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_delivery(now, TransmitDelivery::ALL);
-      on_wire = true;
-      break;
-    }
-  }
-  assert!(
-    on_wire,
-    "no probe of the restarted sequence reached the wire; state={:?}",
-    svc.state()
-  );
-  // §8.1: a conflicting authoritative RESPONSE inside the probing window, from a
-  // host that already holds the name. The peer defends the new name every time,
-  // which is the persistent same-name peer the limit exists for.
-  deliver_losing_srv_conflict(svc, now, ConflictOrigin::AuthoritativeResponse);
-  assert!(
-    svc.probe_defeated,
-    "the response must classify as a §8.1 defeat"
-  );
-  // Spend the classification: this timeout is the rename.
-  let consumed = now.advance(lag_ms);
-  svc.handle_timeout(consumed).unwrap();
-  let armed = svc
-    .lifecycle_deadline
-    .expect("a rename must re-arm the clock");
-  (now, consumed, armed)
-}
-
-/// §8.1's condition is about when conflicts OCCUR, so a burst that satisfies it
-/// on arrival is still a burst when the last of them is acted on late.
-///
-/// The ring used to be dated by the instant each conflict was CONSUMED. Fifteen
-/// conflicts genuinely inside ten seconds could then be spent just outside it —
-/// one slow tick is enough — the measured span came out over the window, the
-/// latch stayed off, and the service probed again in under five seconds after a
-/// burst that had met the MUST.
-#[test]
-fn a_burst_inside_the_window_latches_even_when_the_last_is_spent_outside_it() {
-  let mut svc = make_service(120);
-  let mut now = FakeInstant::zero();
-  let mut first_arrival = None;
-  for _ in 0..14 {
-    let (arrived, consumed, _) = conflict_turn_with_lag(&mut svc, now, 0);
-    first_arrival.get_or_insert(arrived);
-    now = consumed;
-  }
-  let first = first_arrival.expect("fourteen turns ran");
-  let (arrived, consumed, armed) = conflict_turn_with_lag(&mut svc, now, 7_000);
-  assert!(
-    arrived.0.saturating_sub(first.0) <= 10_000,
-    "the fixture must land all fifteen conflicts INSIDE §8.1's ten seconds; the \
-     fifteenth arrived {} ms after the first",
-    arrived.0.saturating_sub(first.0)
-  );
-  assert!(
-    consumed.0.saturating_sub(first.0) > 10_000,
-    "…and must spend the fifteenth OUTSIDE that window, or this is not the \
-     boundary case; it was spent {} ms after the first arrived",
-    consumed.0.saturating_sub(first.0)
-  );
-  assert!(
-    armed.0.saturating_sub(consumed.0) >= 5_000,
-    "fifteen conflicts DID occur inside ten seconds, so the five-second floor is \
-     owed however late the fifteenth was acted on; it armed {} ms out",
-    armed.0.saturating_sub(consumed.0)
-  );
-}
-
-/// RFC 6762 §8.1:
-///
-/// > If fifteen conflicts occur within any ten-second period, then the host MUST
-/// > wait at least five seconds before each successive additional probe attempt.
-///
-/// This is the loop, not the counter: a peer that defends every name this
-/// service renames itself to drove an unthrottled rename → announce → probe
-/// cycle, each turn putting packets on the link, because every post-rename probe
-/// was scheduled with §8.1's ordinary 0-250 ms STARTUP delay however many
-/// renames had already happened.
-///
-/// Below the threshold that delay is exactly right and is asserted to survive —
-/// the limit exists to stop a flood, not to slow ordinary conflict resolution
-/// down. At the fifteenth conflict and at every one after it the restarted
-/// sequence is at least five seconds out, which is what bounds the loop.
-///
-/// "Each successive additional probe attempt" is every subsequent one, so the
-/// turns past the threshold are asserted individually rather than once: a limit
-/// re-derived per probe from the ring alone would pass the fifteenth and then
-/// come off two turns later, because five-second spacing is itself too slow to
-/// keep fifteen conflicts inside ten seconds.
-#[test]
-fn a_conflict_flood_clamps_every_successive_probe_attempt() {
-  let mut svc = make_service(120);
-  let mut now = FakeInstant::zero();
-  for turn in 1..=14u32 {
-    let (at, armed) = one_conflict_turn(&mut svc, now);
-    assert!(
-      armed.0.saturating_sub(at.0) <= 250,
-      "turn {turn}: below §8.1's fifteenth conflict a rename keeps the ordinary \
-       0-250 ms probe delay; this one armed {} ms out",
-      armed.0.saturating_sub(at.0)
-    );
-    now = at;
-  }
-  assert!(
-    now.0 < 10_000,
-    "the fixture must land fourteen conflicts inside §8.1's ten-second window, \
-     or it is not testing the rule; it took {} ms",
-    now.0
-  );
-  let (at, armed) = one_conflict_turn(&mut svc, now);
-  assert!(
-    armed.0.saturating_sub(at.0) >= 5_000,
-    "the fifteenth conflict inside ten seconds completes §8.1's condition, so \
-     the restarted sequence owes at least five seconds; it armed {} ms out",
-    armed.0.saturating_sub(at.0)
-  );
-  now = at;
-  for turn in 16..=20u32 {
-    let (at, armed) = one_conflict_turn(&mut svc, now);
-    assert!(
-      armed.0.saturating_sub(at.0) >= 5_000,
-      "turn {turn}: the five-second floor is owed before EACH successive \
-       additional probe attempt, not only the next one; this one armed {} ms out",
-      armed.0.saturating_sub(at.0)
-    );
-    now = at;
-  }
-  // The count is what §8.1 says it is — conflicts — so it spans the renames it
-  // is throttling. Resetting it on a rename is precisely the reset that would
-  // defeat the limit, since renaming is the loop being bounded.
-  assert!(
-    svc.rename_attempt >= 20,
-    "twenty conflicts, twenty renames: got {}",
-    svc.rename_attempt
-  );
-}
-
-/// …and the limit comes off again when the flood does.
-///
-/// §8.1's floor answers a peer that keeps answering. Once that peer falls silent
-/// for a whole ten-second window the condition it created is spent, and the next
-/// conflict — here §9's, at a name that had gone on to establish — starts over
-/// at the ordinary 0-250 ms schedule. A latch that never released would leave a
-/// service permanently slow to re-verify its own name because of one bad ten
-/// seconds it had at startup.
-#[test]
-fn the_flood_limit_comes_off_once_the_flood_stops() {
-  let mut svc = make_service(120);
-  let mut now = FakeInstant::zero();
-  for _ in 0..15 {
-    let (at, _) = one_conflict_turn(&mut svc, now);
-    now = at;
-  }
-  assert!(svc.conflict_backoff, "the flood limit must be in force");
-  // The peer gives up: probing now completes and the name establishes.
-  let mut buf = std::vec![0u8; 4096];
-  let mut established = None;
-  for _ in 0..40 {
-    let due = svc.lifecycle_deadline.expect("still on a clock");
-    now = core::cmp::max(now, due);
-    svc.handle_timeout(now).unwrap();
-    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_delivery(now, TransmitDelivery::ALL);
-    }
-    if svc.state() == ServiceState::Established {
-      established = Some(now);
-      break;
-    }
-  }
-  let established = established.expect("the service must establish once unopposed");
-  // A full window of quiet, and then a fresh §9 conflict.
-  let at = established.advance(10_000);
-  deliver_established_srv_conflict(&mut svc, at);
-  assert_eq!(
-    svc.state(),
-    ServiceState::Init,
-    "§9's revert is owed whether or not the flood limit was ever in force"
-  );
-  assert!(
-    !svc.conflict_backoff,
-    "a whole ten-second window with no conflict at all ends the burst §8.1 \
-     measured, so the floor it imposed is spent"
-  );
-  let armed = svc.lifecycle_deadline.unwrap();
-  assert!(
-    armed.0.saturating_sub(at.0) <= 250,
-    "…and the restarted sequence is back on §8.1's ordinary 0-250 ms delay; it \
-     armed {} ms out",
-    armed.0.saturating_sub(at.0)
-  );
-}
-
-/// §9's conflict interval and §8.1's flood limit are DIFFERENT rules over
-/// different quantities, and both are live at once.
-///
-/// §9's `CONFLICT_REPROBE_MIN_INTERVAL` bounds how often an established name may
-/// be sent back to probing at all; §8.1's floor bounds how soon each restarted
-/// sequence may begin, whatever sent it back. This pins the first one at exactly
-/// its own interval with the flood counter cold, so the floor cannot be mistaken
-/// for it — and pins that a conflict the §9 interval DROPPED is counted by
-/// neither, because it caused no probe attempt for §8.1 to space out.
-#[test]
-fn the_section9_revert_interval_is_unchanged_by_the_flood_limit() {
-  let mut svc = make_service(120);
-  let now = drive_to_established(&mut svc);
-  svc.last_conflict_reprobe = Some(now);
-  deliver_established_srv_conflict(&mut svc, now.advance(999));
-  assert_eq!(
-    svc.state(),
-    ServiceState::Established,
-    "a §9 conflict inside CONFLICT_REPROBE_MIN_INTERVAL is still dropped"
-  );
-  assert_eq!(
-    svc.conflict_burst.iter().filter(|s| s.is_some()).count(),
-    0,
-    "…and a dropped conflict re-probes nothing, so §8.1's flood test — which is \
-     about probe attempts — does not count it"
-  );
-  let at = now.advance(1_000);
-  deliver_established_srv_conflict(&mut svc, at);
-  assert_eq!(
-    svc.state(),
-    ServiceState::Init,
-    "one millisecond further on, the interval is served and §9 reverts"
-  );
-  assert_eq!(
-    svc.conflict_burst.iter().filter(|s| s.is_some()).count(),
-    1,
-    "…and THAT one is counted: it armed a probe sequence"
-  );
-  let armed = svc.lifecycle_deadline.unwrap();
-  assert!(
-    armed.0.saturating_sub(at.0) <= 250,
-    "with one conflict counted the flood limit is nowhere near in force, so \
-     §9's revert keeps its ordinary 0-250 ms probe delay; it armed {} ms out",
-    armed.0.saturating_sub(at.0)
-  );
-}
-
-/// A slow drip is not a flood, however long it goes on.
-///
-/// §8.1 counts fifteen conflicts "within any ten-second period", not fifteen
-/// conflicts. A counter that only ever incremented — or one whose window was
-/// anchored at the first conflict rather than at the fifteenth-most-recent —
-/// would clamp a service that had merely been unlucky over several minutes.
-#[test]
-fn conflicts_spread_wider_than_the_window_never_clamp() {
-  let mut svc = make_service(120);
-  let mut now = FakeInstant::zero();
-  for turn in 1..=20u32 {
-    let (at, armed) = one_conflict_turn(&mut svc, now);
-    assert!(
-      armed.0.saturating_sub(at.0) <= 250,
-      "turn {turn}: one conflict per second is not fifteen inside ten seconds; \
-       it armed {} ms out",
-      armed.0.saturating_sub(at.0)
-    );
-    // The next conflict is a second away, so no ten-second period ever holds
-    // more than ten of them.
-    now = at.advance(1_000);
-  }
-  assert!(
-    !svc.conflict_backoff,
-    "twenty conflicts at one per second must never meet §8.1's condition"
-  );
-}
-
-// ── §8.1's floor on a clock that runs out ───────────────────────────
-
-/// An [`crate::Instant`] on a BOUNDED clock: milliseconds from zero, with
-/// nothing past [`Self::CEILING`] representable.
-///
-/// Not a pathological fixture. `checked_add_duration` returns `Option` precisely
-/// because a clock may run out, so a bounded one is part of the contract this
-/// crate publishes — a wrapping millisecond counter is an ordinary choice for a
-/// bare-metal driver, and that is also where an unthrottled flood costs the
-/// most.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct BoundedInstant(u64);
-
-impl BoundedInstant {
-  const CEILING: u64 = 60_000;
-}
-
-impl crate::Instant for BoundedInstant {
-  fn checked_add_duration(self, dur: Duration) -> Option<Self> {
-    let ms = u64::try_from(dur.as_millis()).ok()?;
-    let t = self.0.checked_add(ms)?;
-    (t <= Self::CEILING).then_some(Self(t))
-  }
-
-  fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
-    self.0.checked_sub(earlier.0).map(Duration::from_millis)
-  }
-}
-
-type BoundedService = Service<BoundedInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>>;
-
-/// A probing service on the bounded clock, with §8.1's floor latched or not.
-///
-/// The latch is set directly: how it engages is what the fifteen-conflict tests
-/// above are for, and these fixtures are about the clock.
-fn bounded_probing_service(start: BoundedInstant, latched: bool) -> BoundedService {
-  let mut svc: BoundedService = Service::try_new(
-    ServiceHandle::from_raw(0),
-    make_records(120),
-    start,
-    [0u8; 32],
-    true,
-    true,
-  );
-  svc.conflict_backoff = latched;
-  svc
-}
-
-/// Stage RFC 6762 §8.2's deferral at `at` and spend it: the peer's proposal
-/// sorts later, so this service loses, keeps its name, and owes one second of
-/// silence before the restarted sequence.
-///
-/// §8.2 rather than §8.1's rename because its wait is a FIXED one second. The
-/// rename's is a random 0-250 ms, which cannot say which overflow arm a fixture
-/// reached, and that is the whole question here.
-fn lose_bounded_tiebreak(
-  svc: &mut BoundedService,
-  at: BoundedInstant,
-) -> Result<(), crate::error::HandleTimeoutError> {
-  let bytes = srv_txt_proposal(9999);
-  let peer: core::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeProposal(probe_proposal(&bytes, peer, dg(1))),
-    at,
-  );
-  assert!(
-    svc.tiebreak_lost,
-    "the proposal must classify as a §8.2 loss for the fixture to mean anything"
-  );
-  let outcome = svc.handle_timeout(at);
-  assert_eq!(svc.state(), ServiceState::Init, "…and restart the sequence");
-  outcome
-}
-
-/// The control: while the clock can still express the floor, the floor is what
-/// gets armed — so "arms nothing" below cannot pass by being over-eager.
-#[test]
-fn a_representable_floor_is_armed_exactly() {
-  let mut svc = bounded_probing_service(BoundedInstant(0), true);
-  let at = BoundedInstant(BoundedInstant::CEILING - 10_000);
-  assert!(
-    lose_bounded_tiebreak(&mut svc, at).is_ok(),
-    "a floor this clock can express is not an overflow"
-  );
-  assert_eq!(
-    svc.lifecycle_deadline,
-    Some(BoundedInstant(at.0 + 5_000)),
-    "§8.2's one second is raised to §8.1's five, and not past them"
-  );
-}
-
-/// `(Some(deadline), None)`: the caller's own wait fits on this clock and
-/// §8.1's five seconds does not.
-///
-/// The old code kept the caller's deadline as a consolation — one second here,
-/// as little as 250 ms on the rename and §9 paths — which discarded the MUST at
-/// exactly the moment the limiter existed to hold a probe back. Nothing may be
-/// armed instead: every instant this clock can express is sooner than the wait
-/// §8.1 mandates.
-#[test]
-fn an_unrepresentable_floor_arms_nothing_rather_than_the_shorter_deadline() {
-  use crate::Instant as _;
-  let mut svc = bounded_probing_service(BoundedInstant(0), true);
-  let at = BoundedInstant(BoundedInstant::CEILING - 2_000);
-  assert!(
-    at.checked_add_duration(Duration::from_secs(1)).is_some(),
-    "the fixture must put §8.2's own one second INSIDE the clock…"
-  );
-  assert!(
-    at.checked_add_duration(Duration::from_secs(5)).is_none(),
-    "…and §8.1's floor outside it, or it is not testing the (Some, None) arm"
-  );
-  assert!(
-    matches!(
-      lose_bounded_tiebreak(&mut svc, at),
-      Err(crate::error::HandleTimeoutError::Overflow)
-    ),
-    "parking is not idleness: the caller must be told the wait could not be \
-     scheduled"
-  );
-  assert!(
-    svc.lifecycle_deadline.is_none(),
-    "an unrepresentable floor arms NOTHING; it armed {:?}",
-    svc.lifecycle_deadline
-  );
-
-  // …and it stays off the wire. The `Init` re-schedule is the one path that can
-  // fabricate a start time for a sequence that has none, so it is driven here
-  // rather than assumed inert.
-  let mut buf = std::vec![0u8; 4096];
-  assert!(
-    matches!(
-      svc.handle_timeout(at),
-      Err(crate::error::HandleTimeoutError::Overflow)
-    ),
-    "…and told again on every tick it stays parked, not just the first"
-  );
-  assert!(
-    svc.lifecycle_deadline.is_none(),
-    "the Init re-schedule must not hand a latched flood a fresh 0-250 ms delay; \
-     it armed {:?}",
-    svc.lifecycle_deadline
-  );
-  assert!(
-    matches!(svc.poll_transmit(at, &mut buf), Ok(None)),
-    "nothing may go on the wire while the mandated wait cannot be scheduled"
-  );
-  let ceiling = BoundedInstant(BoundedInstant::CEILING);
-  assert!(
-    matches!(
-      svc.handle_timeout(ceiling),
-      Err(crate::error::HandleTimeoutError::Overflow)
-    ),
-    "…including at the last instant this clock has"
-  );
-  assert!(
-    svc.lifecycle_deadline.is_none(),
-    "…still true at the last instant this clock has"
-  );
-  assert!(
-    matches!(svc.poll_transmit(ceiling, &mut buf), Ok(None)),
-    "…and still nothing on the wire"
-  );
-}
-
-/// `(None, None)`: neither §8.2's deferral nor §8.1's floor is representable.
-///
-/// This case used to store `None` and then trip `assert_generation_replaced`, so
-/// a debug build turned a peer's proposal into a panic — reachable straight from
-/// network input. Passing under `cargo test`, which enables debug assertions, is
-/// half of what this asserts; the deadline is the other half.
-#[test]
-fn neither_the_deferral_nor_the_floor_representable_arms_nothing() {
-  use crate::Instant as _;
-  let mut svc = bounded_probing_service(BoundedInstant(0), true);
-  let kept = svc.name().as_str().to_owned();
-  let at = BoundedInstant(BoundedInstant::CEILING - 500);
-  assert!(
-    at.checked_add_duration(Duration::from_secs(1)).is_none(),
-    "the fixture must put §8.2's own one second outside the clock…"
-  );
-  assert!(
-    at.checked_add_duration(Duration::from_secs(5)).is_none(),
-    "…along with §8.1's floor, or it is not testing the (None, None) arm"
-  );
-  assert!(
-    matches!(
-      lose_bounded_tiebreak(&mut svc, at),
-      Err(crate::error::HandleTimeoutError::Overflow)
-    ),
-    "neither wait schedulable is still a reported overflow, not a silent park"
-  );
-  assert_eq!(
-    svc.name().as_str(),
-    kept,
-    "a §8.2 loss keeps the name, whatever the clock is doing"
-  );
-  assert!(
-    svc.lifecycle_deadline.is_none(),
-    "with neither wait representable, nothing may be armed; it armed {:?}",
-    svc.lifecycle_deadline
-  );
-  let mut buf = std::vec![0u8; 4096];
-  assert!(
-    matches!(svc.poll_transmit(at, &mut buf), Ok(None)),
-    "…and nothing goes on the wire"
-  );
-}
-
-/// With the latch OFF, the floor defers nothing — the fail-closed rule is scoped
-/// to the limit being in force, and applying it unconditionally would strand
-/// services that owe §8.1 no wait at all.
-#[test]
-fn an_unlatched_service_is_not_touched_by_the_floor() {
-  let mut svc = bounded_probing_service(BoundedInstant(0), false);
-  assert!(!svc.conflict_backoff, "the fixture starts unlatched");
-  let at = BoundedInstant(BoundedInstant::CEILING - 2_000);
-  assert!(
-    lose_bounded_tiebreak(&mut svc, at).is_ok(),
-    "a service the limit is not holding owes no floor and cannot overflow one"
-  );
-  assert_eq!(
-    svc.lifecycle_deadline,
-    Some(BoundedInstant(at.0 + 1_000)),
-    "§8.2's one second is owed in full and nothing else is"
-  );
-}
-
-/// Deliver one §9 conflict to a service on the bounded clock.
-fn deliver_bounded_srv_conflict(svc: &mut BoundedService, now: BoundedInstant) {
-  let owner = svc.name().as_str().to_owned();
-  let mut buf = std::vec::Vec::new();
-  make_srv_record_ref(&mut buf, &owner, 120, 0, 0, 9999, "host.local.");
-  let (rec, _) = Ref::try_parse(&buf, 0).unwrap();
-  let peer: core::net::SocketAddr = "192.168.1.50:5353".parse().unwrap();
-  svc.handle_event(
-    ServiceEvent::ProbeConflict(ProbeConflict::new(
-      peer,
-      rec,
-      dg(1),
-      ConflictHistory::Unmatched,
-      ConflictRole::Instance,
-    )),
-    now,
-  );
-}
-
-/// Drive a bounded-clock service to Established so a conflict reaches §9's arm
-/// rather than the pre-authoritative one.
-fn drive_bounded_to_established(svc: &mut BoundedService) -> BoundedInstant {
-  let mut buf = std::vec![0u8; 4096];
-  let mut now = BoundedInstant(0);
-  for _ in 0..20 {
-    now = BoundedInstant(now.0 + 500);
-    svc.handle_timeout(now).unwrap();
-    if let Ok(Some(_)) = svc.poll_transmit(now, &mut buf) {
-      svc.note_delivery(now, TransmitDelivery::ALL);
-    }
-    if svc.state() == ServiceState::Established {
-      return now;
-    }
-  }
-  panic!(
-    "bounded service did not establish within 20 ticks; state={:?}",
-    svc.state()
-  );
-}
-
-/// The §9 path parks the same way — and `handle_event` cannot say so.
-///
-/// `handle_event` returns `()`, and `ServiceUpdate` has no variant meaning "this
-/// service is parked because its clock cannot express a mandated wait". Adding
-/// one is a public-API decision and not this fix's to make, so what this pins is
-/// the honest arrangement: the park is real and observable, and the report comes
-/// from the next `handle_timeout`, which re-evaluates the same floor.
-#[test]
-fn a_parked_section9_revert_is_reported_by_the_next_timeout() {
-  let mut svc: BoundedService = Service::try_new(
-    ServiceHandle::from_raw(0),
-    make_records(120),
-    BoundedInstant(0),
-    [0u8; 32],
-    false,
-    true,
-  );
-  let _established = drive_bounded_to_established(&mut svc);
-  svc.conflict_backoff = true;
-  let at = BoundedInstant(BoundedInstant::CEILING - 1_000);
-  deliver_bounded_srv_conflict(&mut svc, at);
-  assert_eq!(
-    svc.state(),
-    ServiceState::Init,
-    "§9's revert happens whatever the clock can schedule"
-  );
-  assert!(
-    svc.lifecycle_deadline.is_none(),
-    "…and parks, because §8.1's floor is unrepresentable here; it armed {:?}",
-    svc.lifecycle_deadline
-  );
-  assert!(
-    matches!(
-      svc.handle_timeout(at),
-      Err(crate::error::HandleTimeoutError::Overflow)
-    ),
-    "the next timeout is where the park becomes reportable"
-  );
-  let mut buf = std::vec![0u8; 4096];
-  assert!(
-    matches!(svc.poll_transmit(at, &mut buf), Ok(None)),
-    "and nothing goes on the wire in the meantime"
-  );
-}
+// RFC 6762 §8.1's fifteen-conflicts-in-ten-seconds flood limit is the
+// ENDPOINT's, not one record set's: its history aggregates across every record
+// set an endpoint routes for, outlives any one `Service`, and floors a fresh
+// registration's first probe. Its tests live with it, in `endpoint::tests` —
+// driving one `Service` in isolation cannot state the rule, because the
+// quantity it bounds is not visible from here.
 
 // ── §7.1 owner binding where the instance name IS the host name ──
 
@@ -12747,7 +12125,7 @@ fn make_same_name_service(
     ttl_secs,
   );
   records.add_a(core::net::Ipv4Addr::new(192, 168, 1, 10));
-  Service::try_new(
+  Service::for_test(
     ServiceHandle::from_raw(0),
     records,
     FakeInstant::zero(),
@@ -12774,10 +12152,10 @@ fn a_record_survives_known_answer(
   make_a_record_ref(&mut a_buf, ka_owner, 120, addr);
   let (a_ref, _) = Ref::try_parse(&a_buf, 0).unwrap();
   let ka = KnownAnswer::new("0.0.0.0:5353".parse().unwrap(), a_ref);
-  svc.handle_event(ServiceEvent::KnownAnswer(ka), now);
+  svc.feed_for_test(ServiceEvent::KnownAnswer(ka), now);
 
   let now2 = now.advance(200);
-  svc.handle_timeout(now2).unwrap();
+  svc.tick_for_test(now2).unwrap();
   let mut out = std::vec![0u8; 4096];
   let transmit = svc
     .poll_transmit(now2, &mut out)
@@ -12839,5 +12217,118 @@ fn a_host_address_known_answer_suppresses_where_the_instance_name_is_the_host_na
     a_record_survives_known_answer(&mut svc, PROBED_NAME, ours),
     "instance != host: our A sits at the HOST name, so a same-rdata answer at \
      the INSTANCE name is a different RRset and must not suppress it"
+  );
+}
+
+// ── a startup sequence a bounded clock cannot schedule is PARKED, not idle ──
+//
+// RFC 6762 §8.1's flood limit is the ENDPOINT's and its counting rule is pinned
+// there. What is pinned HERE is the other half: what one `Service` does when the
+// verdict is in force and its clock cannot express the five seconds §8.1
+// mandates. Arming nothing is the required answer — every instant such a clock
+// can name is sooner than the wait — so being stuck is what compliance looks
+// like, and the whole of what is left is to say so.
+
+/// A latched §8.1 history, built directly.
+///
+/// Fifteen conflicts at one instant, each in its own datagram, which is what the
+/// dedupe key counts. Built by hand because a `Service` driven in isolation has
+/// no route table to receive them through, and the verdict is all this test
+/// needs from the ring.
+fn latched_flood(at: FakeInstant, owner: &Name) -> ConflictFlood<FakeInstant> {
+  let mut flood = ConflictFlood::new();
+  for i in 0..CONFLICT_BURST_LEN as u64 {
+    assert!(
+      flood.accept(at, crate::event::DatagramId::new(i), owner),
+      "each datagram is its own conflict about this owner"
+    );
+  }
+  assert!(
+    flood.in_force(at),
+    "premise: fifteen conflicts inside one window latch the limit"
+  );
+  flood
+}
+
+/// The wire boundary drops a queued first probe whose enqueue left no fallback
+/// deadline behind it — and the service must REPORT that rather than go silent.
+///
+/// The enqueue arm queues the probe FIRST and only then assigns
+/// `probe_deadline(..)`, which does not exist at the very end of a bounded clock.
+/// Dropping the probe therefore takes away a `Probing` service's only pending
+/// work and leaves nothing armed behind it. Before this was closed, the
+/// re-schedule read `Init` alone and `poll_timeout` reported no deadline, so the
+/// caller was never called back: the service stayed stuck even once the flood
+/// had expired, with no error ever raised.
+#[test]
+fn a_probe_dropped_at_the_wire_with_no_fallback_deadline_reports_overflow() {
+  // Near the clock's end, so §8.1's five-second floor is unrepresentable for the
+  // whole of this test and failing closed is the only legal answer.
+  let start = FakeInstant(u64::MAX - 4_000);
+  assert!(
+    <FakeInstant as crate::Instant>::checked_add_duration(start, CONFLICT_BACKOFF_MIN_WAIT)
+      .is_none(),
+    "premise: this clock cannot represent the wait §8.1 mandates"
+  );
+
+  let mut svc: Service<FakeInstant, slab::Slab<Transmit>, slab::Slab<ServiceUpdate>> =
+    Service::for_test(
+      ServiceHandle::from_raw(0),
+      make_records(120),
+      start,
+      [7u8; 32],
+      true,
+      true,
+    );
+  let owner = Name::try_from_str("myprinter._ipp._tcp.local.").unwrap();
+  let flood = latched_flood(start, &owner);
+
+  // `Init → Probing(0)`: a free step that queues nothing.
+  svc
+    .tick_for_test(FakeInstant(u64::MAX - 3_000))
+    .expect("scheduling the first probe overflows nothing");
+  assert_eq!(svc.state(), ServiceState::Probing(0));
+
+  // The enqueue, at the last instant this clock has. The probe is queued and the
+  // fallback deadline behind it does not exist.
+  let at_the_end = FakeInstant(u64::MAX);
+  svc
+    .tick_for_test(at_the_end)
+    .expect("a queued probe is work the caller can still draw, so not yet parked");
+  assert_eq!(
+    svc.poll_timeout(),
+    None,
+    "premise: the enqueue armed no fallback deadline, which is the whole of what \
+     the wire boundary is about to be the last thing standing between"
+  );
+
+  // The wire boundary: §8.1's floor is in force, the probe may not go out, and
+  // the floor it would be re-armed to does not exist.
+  svc.defer_first_probe_under_flood(at_the_end, &flood);
+  let mut buf = std::vec![0u8; 4096];
+  assert!(
+    matches!(svc.poll_transmit(at_the_end, &mut buf), Ok(None)),
+    "no probe may leave inside the five seconds §8.1 mandates"
+  );
+
+  assert_eq!(
+    svc.poll_timeout(),
+    Some(at_the_end),
+    "a parked sequence is due IMMEDIATELY: nothing is armed, so this is the only \
+     thing that brings the caller back to hear about it"
+  );
+  assert!(
+    matches!(
+      svc.handle_timeout(at_the_end, &flood, &NamesInUse::EMPTY),
+      Err(HandleTimeoutError::Overflow)
+    ),
+    "and the park is REPORTED — a service that owes a probe it may not schedule \
+     is not an idle tick"
+  );
+  assert_eq!(
+    svc.poll_timeout(),
+    Some(at_the_end),
+    "the verdict is re-derived, so it repeats for as long as the wait cannot be \
+     armed rather than arriving once"
   );
 }

@@ -16,7 +16,6 @@ use std::{collections::HashMap, io, net::IpAddr, time::Instant as StdInstant};
 use mdns_proto::{QueryHandle, QuerySpec, ServiceHandle, ServiceSpec};
 use mio::{Registry, Token};
 use rand::{SeedableRng, rngs::StdRng};
-use slab::Slab;
 
 use hick_udp::{
   onlink::{collect_local_subnets, is_loopback_interface},
@@ -31,24 +30,26 @@ use crate::{
   error::{RegisterError, ServerError, StartQueryError},
   event::{Event, EventQueue},
   options::ServerOptions,
-  proto::{ProtoEndpoint, ProtoService},
+  proto::ProtoEndpoint,
   socket::Sockets,
 };
 
 /// Driver-side state for one registered service.
+///
+/// The `mdns-proto` state machine is NOT here: the endpoint owns every
+/// `Service` and every transition runs through its `*_service*` methods. What a
+/// handle keeps here is the bookkeeping the endpoint has no opinion about — how
+/// many encodes in a row failed, whether this driver has retired it, and when
+/// each family last carried one of its datagrams.
 pub(crate) struct ServiceCtx {
-  /// The `mdns-proto` state machine owning this service's §8 probe/announce
-  /// schedule and its response generation.
-  pub(crate) proto: ProtoService,
-  /// Consecutive `Service::poll_transmit` failures. Reset by any successful
-  /// poll; past [`crate::driver::MAX_CONSECUTIVE_ENCODE_ERRORS`] the
+  /// Consecutive `Endpoint::poll_service_transmit` failures. Reset by any
+  /// successful poll; past [`crate::driver::MAX_CONSECUTIVE_ENCODE_ERRORS`] the
   /// registration is treated as structurally unusable and retired with a
   /// [`mdns_proto::ServiceUpdate::Conflict`], so the caller is told instead of
   /// waiting forever for an `Established` that cannot come.
   pub(crate) encode_failures: u8,
-  /// Set once this service has been retired. Its proto state machine is
-  /// finished, so every later stage skips it for transmits, deadlines, update
-  /// draining, and inbound event dispatch.
+  /// Set once this service has been retired. Its state machine is finished, so
+  /// every later stage skips it for transmits, deadlines, and update draining.
   pub(crate) withdrawing: bool,
   /// Set once this service's RFC 6762 §10.1 goodbye has been handed to the
   /// endpoint by [`begin_service_withdrawal`].
@@ -286,7 +287,10 @@ pub struct Mdns {
   /// substitutes.
   #[cfg(test)]
   pub(crate) forced_launch_delays: std::collections::VecDeque<std::time::Duration>,
-  /// The instant [`Self::tick`] read at its top, on the last tick that ran.
+  /// The instant [`Self::tick`] read at its ENTRY, on the last tick that ran —
+  /// which is no longer the tick's protocol instant, since that one is read
+  /// after the receive stage. This is the entry reading and nothing weighs a
+  /// decision against it.
   ///
   /// The lookup tests that let a real clock cross a real window rest on a
   /// premise: the tick *began* inside the lookup's window, so whatever ended the
@@ -298,6 +302,16 @@ pub struct Mdns {
   /// instant than the one the tick used. This is the one the tick used.
   #[cfg(test)]
   pub(crate) last_tick_instant: Option<std::time::Instant>,
+  /// The PROTOCOL instant [`Self::tick`] handed stages 3 and 4, on the last tick
+  /// that ran — the one every core deadline in that tick was weighed against.
+  ///
+  /// Recorded separately from [`Self::last_tick_instant`] because the two are
+  /// deliberately different readings and the whole rule is the gap between them:
+  /// this one is taken BELOW the receive, so it is never older than an event
+  /// stage 1 folded into the core at its own, later reading. A test can state
+  /// that as a comparison; nothing else can observe it.
+  #[cfg(test)]
+  pub(crate) last_protocol_instant: Option<std::time::Instant>,
 }
 
 impl Mdns {
@@ -388,6 +402,8 @@ impl Mdns {
       forced_launch_delays: std::collections::VecDeque::new(),
       #[cfg(test)]
       last_tick_instant: None,
+      #[cfg(test)]
+      last_protocol_instant: None,
     })
   }
 
@@ -557,9 +573,7 @@ impl Mdns {
       return Err(RegisterError::ShuttingDown);
     }
     let now = StdInstant::now();
-    let (handle, proto) = self
-      .endpoint
-      .try_register_service::<Slab<_>, Slab<_>>(spec, now)?;
+    let handle = self.endpoint.try_register_service(spec, now)?;
     // NO SUPERSEDE HERE. A registration only INSERTS a route: it mutates no
     // record this endpoint has already asserted, positive or negative, so every
     // credit in the log still describes a state this endpoint is in. See
@@ -568,7 +582,6 @@ impl Mdns {
     self.services.insert(
       handle,
       ServiceCtx {
-        proto,
         encode_failures: 0,
         withdrawing: false,
         goodbye_begun: false,
@@ -815,39 +828,32 @@ fn alloc_buf(size: usize, setting: &'static str) -> Result<Vec<u8>, ServerError>
 /// Retire `handle` and hand its RFC 6762 §10.1 goodbye to the endpoint.
 ///
 /// A free function over the two fields it needs, so the pipeline stages can
-/// call it while `Mdns` is split-borrowed. Follows
-/// `hick-reactor/src/driver/mod.rs:1072-1094`:
+/// call it while `Mdns` is split-borrowed:
 ///
 /// * mark the context `withdrawing`, so every pipeline stage stops driving the
-///   proto state machine — but keep the context, because the endpoint still
-///   holds this service's name and reports the handle back only on completion;
-/// * take any pending §9 rename handoff. `push_updates` takes it the instant a
-///   `Renamed` update is observed, which is the normal path; this is the
-///   backstop for a retirement that lands while a `Renamed` is still queued in
-///   the proto's update pool — that update is never drained, so the old-name
-///   goodbye would be dropped with the proto. The handoff is one-shot, so the
-///   two sites cannot both claim it, and both hold the old name until the
-///   retraction is paid on every bound family (see `push_updates` for why
-///   reclaiming it early loses an unpaid family's debt);
-/// * hand the current name's snapshot to `begin_withdrawal`, which keeps the
-///   route (holding the name against a same-name re-registration) and owns the
-///   resend schedule from here on.
+///   service — but keep the context, because the endpoint still holds this
+///   service's name and reports the handle back only on completion;
+/// * call [`Endpoint::unregister_service`](mdns_proto::Endpoint::unregister_service),
+///   which takes the current name's withdrawal snapshot, drains any pending §9
+///   rename goodbye into its own detached item, keeps the route (holding the
+///   name against a same-name re-registration) and owns the resend schedule
+///   from here on.
 ///
 /// # The snapshot is already the last word
 ///
-/// The snapshot is taken from the goodbye-ownership latch, so records that
-/// really are cached must be in it and nothing of this service's may still be
-/// able to reach a wire after it. Both hold **structurally**: every datagram
-/// this service produced was sent and confirmed inside the `poll_transmit`
-/// iteration that produced it, so at this point there is no unresolved send
-/// whose delivery the latch has not seen, and nothing left anywhere that could
-/// transmit a positive-TTL record after the retraction. That is what the
-/// outbound queue cost and what its deletion bought: there is no cancel step
-/// here because there is nothing to cancel, and no teardown confirm because
-/// there is no live commit token.
+/// The snapshot the endpoint takes comes from the goodbye-ownership latch, so
+/// records that really are cached must be in it and nothing of this service's
+/// may still be able to reach a wire after it. Both hold **structurally**:
+/// every datagram this service produced was sent and confirmed inside the
+/// `poll_service_transmit` iteration that produced it, so at this point there is
+/// no unresolved send whose delivery the latch has not seen, and nothing left
+/// anywhere that could transmit a positive-TTL record after the retraction. That
+/// is what the outbound queue cost and what its deletion bought: there is no
+/// cancel step here because there is nothing to cancel, and no teardown confirm
+/// because there is no live commit token.
 ///
 /// Idempotent at both levels: the `goodbye_begun` flag skips a service already
-/// handed over, and `begin_withdrawal` itself no-ops for a handle that already
+/// handed over, and `unregister_service` itself no-ops for a handle that already
 /// has a route-attached item. A no-op for an unknown handle.
 ///
 /// # It takes no instant, and no caller may supply one
@@ -893,37 +899,17 @@ pub(crate) fn begin_service_withdrawal(
   selfsend: &mut SelfSendTracker,
   handle: ServiceHandle,
 ) {
-  // Scoped so the borrow of `services` ends before `endpoint` is touched; the
-  // snapshot and the handoff are both owned.
-  let (snapshot, handoff) = match services.get_mut(&handle) {
+  match services.get_mut(&handle) {
     Some(ctx) if !ctx.goodbye_begun => {
       ctx.withdrawing = true;
       ctx.goodbye_begun = true;
-      (
-        ctx.proto.withdrawal_snapshot(),
-        ctx.proto.take_rename_goodbye_handoff(),
-      )
     }
     _ => return,
-  };
-  // TWO items, two creation instants, each read where its own schedule is
-  // defined. A reading is spent by its first consumer: the rename item's
-  // schedule spends the first read, and the whole of `enqueue_rename_withdrawal`
-  // — opening the item, holding the name's route, arming its 250 ms interval and
-  // its 2 s ceiling — then runs before the service item exists at all. One
-  // reading shared between them charged every microsecond of that to the second
-  // item's ceiling, which is the same error every deleted caller parameter made,
-  // one call frame further in.
-  if let Some(handoff) = handoff {
-    // The service is dead, so its old name must be held until that goodbye
-    // completes: a re-registration must not be able to cancel the only TTL=0
-    // retraction the renamed-away name will ever get.
-    endpoint.enqueue_rename_withdrawal(handoff, StdInstant::now(), true);
   }
   // After the early return above, so an unknown or already-withdrawing handle
   // changes nothing and advances nothing.
   selfsend.supersede();
-  endpoint.begin_withdrawal(handle, snapshot, StdInstant::now());
+  endpoint.unregister_service(handle, StdInstant::now());
 }
 
 /// The degraded fallback for a caller that never ran the

@@ -307,16 +307,30 @@ fn a_legacy_unicast_reply_never_opens_the_reclaim_cancel_gate() {
   let mut t = 0i64;
   for _ in 0..200 {
     t = pump_to_next_round(&mut engine, &mut io, &mut scratch, t);
-    if engine.services[&handle].proto.advertises_instance() {
+    if engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .advertises_instance()
+    {
       break;
     }
   }
   assert!(
-    engine.services[&handle].proto.advertises_instance(),
+    engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .advertises_instance(),
     "the v4-only announcement must have latched instance ownership"
   );
   assert!(
-    !engine.services[&handle].proto.has_fully_announced().get(),
+    !engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .has_fully_announced()
+      .get(),
     "a partially-delivered announcement must NOT open the reclaim-cancel gate"
   );
 
@@ -340,7 +354,12 @@ fn a_legacy_unicast_reply_never_opens_the_reclaim_cancel_gate() {
     io.sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
   );
   assert!(
-    !engine.services[&handle].proto.has_fully_announced().get(),
+    !engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .has_fully_announced()
+      .get(),
     "an all-delivered UNICAST reply must not open the reclaim-cancel gate — only \
      a complete announcement that reached every obligated family may"
   );
@@ -1121,7 +1140,11 @@ fn pump_to_next_round(
 /// The current proto lifecycle state of a registered service, read through the
 /// driver slot — the phase observable the invariant pair keys on.
 fn service_state(engine: &TestEngine, handle: ServiceHandle) -> ServiceState {
-  engine.services[&handle].proto.state()
+  engine
+    .endpoint
+    .service(handle)
+    .expect("the endpoint owns the registered service")
+    .state()
 }
 
 #[test]
@@ -1169,7 +1192,11 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
     io.sent.iter().map(|(d, _)| *d).collect::<Vec<_>>()
   );
   assert!(
-    engine.services[&handle].proto.advertises_instance(),
+    engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .advertises_instance(),
     "a v4-only announcement exposes the instance records to v4 peers, so \
      goodbye ownership must latch on the PARTIAL round"
   );
@@ -1276,11 +1303,20 @@ fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
     "a fully-delivered dual-stack service must reach Established"
   );
   assert!(
-    engine.services[&handle].proto.advertises_instance(),
+    engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .advertises_instance(),
     "a delivered announcement latches goodbye ownership"
   );
   assert!(
-    engine.services[&handle].proto.has_fully_announced().get(),
+    engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .has_fully_announced()
+      .get(),
     "an all-delivered announcement is what sets the reclaim-cancel gate"
   );
 }
@@ -1318,7 +1354,11 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
      round, so no obligation may be written off"
   );
   assert!(
-    !engine.services[&handle].proto.advertises_instance(),
+    !engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .advertises_instance(),
     "nothing was exposed, so goodbye ownership must not latch"
   );
   // The withdrawal therefore has nothing to retract: it completes with no
@@ -1377,7 +1417,12 @@ fn the_bounded_partial_policy_fires_instead_of_pinning_the_phase() {
     "the bound must let the healthy family finish the lifecycle"
   );
   assert!(
-    !engine.services[&handle].proto.has_fully_announced().get(),
+    !engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .has_fully_announced()
+      .get(),
     "no announcement ever reached v6, so the excused advances must NOT have \
      opened the reclaim-cancel gate — an excused advance is not a delivery"
   );
@@ -1422,7 +1467,12 @@ fn a_recovered_family_resumes_the_obligated_set_on_its_next_send() {
     "the lifecycle resumes from where it stood once every family delivers"
   );
   assert!(
-    engine.services[&handle].proto.has_fully_announced().get(),
+    engine
+      .endpoint
+      .service(handle)
+      .expect("the endpoint owns the registered service")
+      .has_fully_announced()
+      .get(),
     "the recovered family carries the announcements on their own merit, so the \
      all-delivered credit an excused round never earns is earned here"
   );
@@ -1495,9 +1545,8 @@ fn build_probe_a_authority(host_str: &str, addr: [u8; 4]) -> Vec<u8> {
 // invalid_suffix_rename_goodbye_also_routes_through_per_family_queue) were
 // REMOVED in the endpoint-owned-withdrawal migration. They asserted against the
 // deleted driver-side goodbye queue (engine.goodbyes + per-family owed budget).
-// A rename of a SURVIVING service now emits its old-name goodbye via the proto's
-// own poll_transmit schedule (confirmed in the normal TX loop); a rename whose
-// new name collides locally is torn down through the endpoint-owned withdrawal
+// A rename's old-name goodbye is now an independent detached withdrawal item the
+// endpoint enqueues as it renames, driven by the endpoint-owned withdrawal
 // lifecycle, whose spend/re-arm bookkeeping is covered by the proto-level tests.
 
 #[test]
@@ -1928,15 +1977,13 @@ fn reported_hop_limit_255_does_not_admit_off_prefix_unicast() {
   );
 }
 
-/// a terminal emitted DIRECTLY by the proto state machine — here a
-/// HostConflict (a peer claims our host name with a different address, RFC 6762
-/// §9) — must RETIRE the smoltcp service through the SAME path as a synthesized
-/// rename-collision Conflict: queue the terminal, mark the slot errored, begin the
-/// endpoint-owned §10.1 withdrawal (so the route stops being driven/answered), and
-/// GC the slot once the goodbye completes and the caller has drained the terminal.
-/// Before the fix a proto-emitted terminal was only queued (errored stayed false,
-/// no withdrawal), leaving a zombie route that kept answering after the caller saw
-/// the terminal.
+/// A terminal update — here a HostConflict (a peer claims our host name with a
+/// different address, RFC 6762 §9) — must RETIRE the smoltcp service: queue the
+/// terminal, mark the slot errored, begin the endpoint-owned §10.1 withdrawal (so
+/// the route stops being driven/answered), and GC the slot once the goodbye
+/// completes and the caller has drained the terminal. A terminal that was only
+/// queued (errored left false, no withdrawal) leaves a zombie route that keeps
+/// answering after the caller has seen the terminal.
 #[test]
 fn proto_emitted_host_conflict_retires_and_gcs_the_smoltcp_service() {
   let mut engine: TestEngine = Engine::new(EndpointConfig::new(), StdRng::seed_from_u64(83));
@@ -4171,7 +4218,7 @@ fn a_surviving_rename_supersedes_the_entries_recorded_before_it() {
       .get(&handle)
       .expect("a survived rename keeps its slot")
       .errored,
-    "this must be the SURVIVING rename; a collision teardown supersedes through \
+    "this must be the SURVIVING rename; a retirement supersedes through \
      `begin_service_withdrawal` and would prove nothing about the rename itself"
   );
 
@@ -4488,10 +4535,9 @@ fn a_superseded_send_no_longer_hides_a_peers_repeated_defence() {
   assert!(
     matches!(
       engine
-        .services
-        .get(&b)
-        .expect("the successor keeps its slot")
-        .proto
+        .endpoint
+        .service(b)
+        .expect("the successor keeps its route")
         .state(),
       ServiceState::Init | ServiceState::Probing(_)
     ),
@@ -4520,7 +4566,7 @@ fn a_superseded_send_no_longer_hides_a_peers_repeated_defence() {
 /// This seam used to advance the generation and it was a falsehood. A
 /// registration only INSERTS a route: it mutates no record this engine has
 /// already asserted. There is no RFC 6762 §8.4 records mutator, a duplicate
-/// instance name and a name a collision goodbye still holds are both refused,
+/// instance name and a name a §10.1 goodbye still holds are both refused,
 /// and a live route publishing the same host name with a different A or AAAA set
 /// makes the registration FAIL (`Endpoint::host_addresses_disagree`). The
 /// negative assertions are covered as well — the encoder emits exactly one §6.1

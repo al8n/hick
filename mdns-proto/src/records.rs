@@ -231,7 +231,7 @@ impl ServiceRecords {
   /// same-name replacement has PARTLY superseded keeps draining for the subtype
   /// PTRs the replacement does not publish, so its record set must stop naming
   /// the ones it does. See
-  /// [`Endpoint::note_service_announced`](crate::Endpoint::note_service_announced).
+  /// [`Endpoint::note_service_transmit_outcome`](crate::Endpoint::note_service_transmit_outcome).
   ///
   /// This narrows what a set ADVERTISES and nothing else. A subtype PTR is a
   /// shared record at its own browse name, so dropping one drops a record this

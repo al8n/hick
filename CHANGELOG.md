@@ -1,5 +1,106 @@
 # UNRELEASED
 
+## §8.1's five seconds now run from the instant the limit ENGAGED
+
+- `mdns-proto`: the floor was anchored to the probe sequence's own start alone,
+  so it could already be in the past when the limit latched. Fourteen conflicts
+  at `T`, a record set registered at `T` with its first probe queued, and the
+  fifteenth conflict at `T + 6 s`: the limit was in force, but that sequence's
+  floor was `T + 5 s`, so the probe went straight out on the poll that read the
+  latch — and every service whose sequence had begun more than five seconds
+  earlier burst through together at that instant, on an ordinary monotonic
+  clock. §8.1 owes the wait "before each successive additional probe attempt"
+  from when the condition started holding, so the endpoint now records the
+  instant the latch transitions false→true and every floor is
+  `max(sequence start, latch epoch) + 5 s`. The epoch moves only on that
+  transition, so the floor stays absolute within one latch episode — a flood
+  still cannot push a probe out indefinitely, and buying another five seconds
+  costs an attacker fifteen fresh conflicts.
+
+## §8.1's flood window no longer disagrees with itself at exactly ten seconds
+
+- `mdns-proto`: the ring's two comparisons answered opposite questions about the
+  boundary. The RELEASE test ran before an arriving conflict was inserted and
+  cleared the history at `since >= 10 s`, while the SPAN test that engages the
+  floor accepted `span <= 10 s`. So fourteen conflicts at `T` followed by a
+  fifteenth at exactly `T + 10 s` took the release path — the ring was wiped and
+  the fifteenth became its only entry — where the span test, had the entry been
+  inserted, would have called that same burst qualifying. Fifteen conflicts
+  genuinely occurred within ten seconds and the floor was not engaged: a direct
+  under-count of the MUST, and one that is common rather than a measure-zero
+  coincidence on an embedded clock with coarse integer ticks. The release is now
+  `> 10 s` and the span stays `<= 10 s`, so the pair agrees, and both directions
+  are pinned: `14 @ T, 1 @ T + 10 s` latches, `14 @ T, 1 @ T + 10.001 s` does
+  not. Closes **#151**.
+
+## The `Endpoint` owns every `Service` (BREAKING)
+
+- `mdns-proto`: **`Endpoint` now holds the `Service` state machines and drives
+  them, exactly as it has always held and driven the `Query` ones.**
+  `try_register_service` returns a `ServiceHandle` and nothing else;
+  `ServiceRoute` carries the state machine; and the caller drives each service
+  through the `*_service*` accessors that mirror the `*_query*` family —
+  `poll_service`, `poll_service_timeout`, `handle_service_timeout`,
+  `poll_service_transmit`, `note_service_transmit_outcome`,
+  `unregister_service`, plus a read-only `service(handle)` view. The query family
+  is the precedent, not a new architecture: the `Endpoint` docs already described
+  the asymmetry — "per-handle state machines for Service (caller-driven) and
+  Query (Endpoint-owned)" — and this removes it. Closes **#140** and **#151**.
+- `mdns-proto`: the asymmetry was not cosmetic. A caller standing between routing
+  and classification is where three separate defects came from, and all three go
+  with it. RFC 6762 §8.1's conflict-flood limit could not be counted for the
+  HOST, because no single owner saw every conflict (**#140**). A rename mutated
+  the service's records before the route table could object, so every driver
+  carried its own reconciliation for a collision the route table might raise.
+  And the instant a conflict was RECEIVED was not the instant it was classified
+  at, so the flood window was measured from whenever the caller got round to
+  forwarding the event.
+- `mdns-proto`: **`RouteEvent::ToService` and `ToService` are removed.** A
+  `ServiceEvent` is applied to the addressed service inside `RouteEvents::next`,
+  at the datagram's receipt instant, before the iterator yields anything — the
+  same shape a query answer already had. A driver dispatches nothing; it still
+  must DRIVE the iterator, because that is where the events are applied.
+- `mdns-proto`: **a rename now picks a name the route table does not hold, in the
+  same borrow that mirrors it there.** The instance names in use are collected on
+  the ticks a rename is actually imminent and handed to the state machine, which
+  steps over the taken suffixes. `Endpoint::handle_service_renamed` and
+  `HandleServiceRenamedError` are gone, and so is the collision arm every driver
+  reconciled: there is no second party to refuse the name and no window in which
+  the service and the router disagree about which name is being probed. The old
+  name's §10.1 goodbye is enqueued by the same call.
+- `mdns-proto`: `Endpoint::note_service_announced` is removed — the confirm does
+  that work itself. `note_service_transmit_outcome` mirrors the
+  confirmed-advertised host addresses into the route (what sibling withdrawal
+  retention honours) and, once a COMPLETE announcement of the name has reached
+  every obligated link, cancels the detached old-name goodbye it supersedes. The
+  `FullyAnnounced` token no longer travels between calls, so it can no longer be
+  paired with another service's handle.
+- `mdns-proto`: `Endpoint::unregister_service` is now the GRACEFUL teardown — it
+  takes the withdrawal snapshot and begins the §10.1 goodbye itself, draining any
+  pending rename handoff into its own detached item first — and the old
+  no-goodbye primitive is renamed `force_remove_service(handle, now)`, taking its
+  own snapshot rather than an `asserted` argument. `Endpoint::begin_withdrawal`
+  and `Endpoint::enqueue_rename_withdrawal` are crate-internal, as are
+  `Service::{handle_event, handle_timeout, poll, poll_timeout, poll_transmit,
+  note_transmit_outcome, withdrawal_snapshot, take_rename_goodbye_handoff}` and
+  the `WithdrawalSnapshot` / `RenameGoodbyeHandoff` types.
+- `mdns-proto`: `Endpoint` gains two type parameters — `TQ: Pool<Transmit>` and
+  `EvS: Pool<ServiceUpdate>` — and `ServiceRoute` becomes
+  `ServiceRoute<I, TQ, EvS>`. It already carried `AN` and `EvQ` for the query
+  family; these are the service family's, and they follow that precedent
+  exactly.
+- `mdns-proto`: nothing about the wire changes, and no RFC rule is relaxed. What
+  changes is who holds the state machine.
+- `hick-reactor`, `hick-compio`, `hick-mio`, `hick-smoltcp`: each driver's
+  per-service context loses its `proto` field and drives the service through the
+  endpoint. Their `RouteEvent::ToService` arms, their rename reconciliation
+  (`handle_service_renamed` and the retire-the-renamer branch behind it,
+  `take_rename_goodbye_handoff`, `enqueue_rename_withdrawal`) and their
+  `note_service_announced` plumbing are deleted; a `ServiceUpdate::Renamed` is
+  now a notification the driver surfaces and nothing more, and every teardown
+  site collapses to one `unregister_service`. Production source across the four
+  drivers loses 478 lines net.
+
 ## §7.1 known-answer suppression works again for host addresses at a same-name service
 
 - `mdns-proto`: **behaviour-visible.** Where a service's instance name IS its
@@ -122,56 +223,72 @@
 - `mdns-proto`: nothing changes for a caller that polls on the instant it fired
   the timeout, which is what the bundled drivers do.
 
-## A persistent same-name peer no longer drives one record set's rename loop unthrottled
+## A conflict flood no longer drives an endpoint's rename loops unthrottled
 
-- `mdns-proto`: a `Service` now applies RFC 6762 §8.1's flood limit — "if
-  fifteen conflicts occur within any ten-second period, then the host MUST wait
-  at least five seconds before each successive additional probe attempt" — **to
-  its own record set**. Every conflict-driven probe sequence was scheduled with
-  §8.1's ordinary 0-250 ms *startup* delay however many renames had already
-  happened, so a peer that defends each name the service renames itself to —
+- `mdns-proto`: an `Endpoint` applies RFC 6762 §8.1's flood limit — "if fifteen
+  conflicts occur within any ten-second period, then the host MUST wait at least
+  five seconds before each successive additional probe attempt" — **across every
+  record set it routes for**. Every conflict-driven probe sequence was scheduled
+  with §8.1's ordinary 0-250 ms *startup* delay however many renames had already
+  happened, so a peer that defends each name a service renames itself to —
   hostile, or merely a misconfigured twin — drove an unbounded rename → announce
-  → probe loop, each turn putting packets on the link. The count is of CONFLICTS, which is what
-  §8.1 counts, so it deliberately spans renames and probe restarts: resetting it
-  on a rename would reset it on the very event being throttled. It is kept in a
-  fixed ring of fifteen instants — the condition is exactly "is the
+  → probe loop, each turn putting packets on the link. The count is of CONFLICTS,
+  which is what §8.1 counts, so it deliberately spans renames and probe restarts:
+  resetting it on a rename would reset it on the very event being throttled. It
+  is kept in a fixed ring of fifteen instants — the condition is exactly "is the
   fifteenth-most-recent conflict within ten seconds of now" — so nothing is
-  allocated. Each is dated by when its conflict was **received**, not by when the
-  state machine got round to acting on it: a pre-authoritative conflict latches
-  on arrival and is spent on a later tick, so dating the ring by the later
-  instant measured a burst as wider than it was, and fifteen conflicts genuinely
-  inside ten seconds could be consumed just outside it, fail to latch, and probe
-  again in under five seconds. The five-second wait itself is still anchored to
-  the handler's current `now`, because scheduling it from a stale instant would
-  end it early. Once in force the floor applies to *each* successive attempt and is
-  released only by the flood stopping: a whole ten-second window with no
-  conflict at all. Re-deriving it per probe instead would come off two turns
-  later and hand the flood its speed back, because five-second spacing is itself
-  too slow to keep fifteen conflicts inside ten seconds. The floor is applied
-  where every restarted sequence gets its start time, so it covers §9's
-  revert-to-probing, §8.2's one-second deferral and §8.1's rename alike, and
-  raises each only when the limit is in force. §9's own
-  `CONFLICT_REPROBE_MIN_INTERVAL` is a different rule over a different quantity
-  and is unchanged: it still bounds how often an established name may be sent
-  back to probing at all, and a conflict it drops re-probes nothing and is
-  counted by neither rule.
-- `mdns-proto`: **the scope of that limit is per record set, and §8.1 states its
-  obligation on the host.** The counter lives on one `Service`, so what it bounds
-  is one record set's restarts, and three ways past it are known and remain open.
-  Conflicts are not aggregated across record sets: fifteen entries spaced `d`
-  apart span `14·d`, so a service whose restarts are slower than 10/14 ≈ 0.714 s
-  never latches at all, and N services contending at that rate put N × 1.4
-  restarts per second on the link between them. A freshly registered service
-  starts with an empty ring and is not slowed by another service's backoff
-  already being in force. And the history dies with the `Service`: a
-  `HostConflict` is terminal and is surfaced for the caller to intervene, and the
-  usual intervention — unregister, then re-register under a new host name — hands
-  the replacement a clean ring, so a loop closed through the driver layer evades
-  even the per-record-set latch. Aggregating the ring at the `Endpoint` and
-  sharing only the verdict is tracked as **#140**; that will make the limit
-  endpoint-wide, which is still not host-wide, because a second `Endpoint`, or a
-  second process, on the same machine is beyond anything this library can
-  observe.
+  allocated. Each is dated by when its conflict was **received**, which is the
+  instant `Endpoint::handle` was called with: the router classifies and counts a
+  conflict in the same borrow, so the ring cannot be dated by a later tick and a
+  burst cannot be measured as wider than it was. Once in force the floor applies
+  to *each* successive attempt and is released only by the flood stopping: a
+  whole ten-second window with no conflict at all. Re-deriving it per probe
+  instead would come off two turns later and hand the flood its speed back,
+  because five-second spacing is itself too slow to keep fifteen conflicts inside
+  ten seconds. The floor is applied where every restarted sequence gets its start
+  time — §9's revert-to-probing, §8.2's one-second deferral and §8.1's rename
+  alike — and again at the COMMIT POINT where a probe would actually be enqueued,
+  so a burst that completes after a service was scheduled still spaces its first
+  probe. §9's own `CONFLICT_REPROBE_MIN_INTERVAL` is a different rule over a
+  different quantity and is unchanged: it still bounds how often an established
+  name may be sent back to probing at all. A conflict it drops re-probes nothing,
+  and IS counted by §8.1 — the count is taken above the interval, because §8.1
+  counts what occurred.
+- `mdns-proto`: **the scope of that limit is the ENDPOINT, because §8.1 states
+  its obligation on the host** (**#140**). The ring is a field of `Endpoint`,
+  mutated under the `&mut self` routing already holds, so the count aggregates
+  across record sets, outlives any one `Service`, and floors a fresh
+  registration's first probe. All three ways past a per-record-set counter are
+  closed with it: conflicts spaced further apart than 10/14 ≈ 0.714 s no longer
+  escape by being spread over N services, a freshly registered service is no
+  longer handed a clean ring while another's backoff is in force, and the
+  unregister-then-re-register that a terminal `HostConflict` normally provokes no
+  longer resets the history through the driver layer. Endpoint-wide is still not
+  host-wide: a second `Endpoint`, or a second process, on the same machine is
+  beyond anything this library can observe, and that is the only sense in which
+  RFC 6762's "host" is approximated.
+- `mdns-proto`: **the limit is EXACT within the contract this crate already
+  states, not best-effort.** It asks nothing of a driver beyond what every
+  sans-I/O method here already requires: each received datagram reaches
+  `Endpoint::handle` with a monotonic `now` taken at receipt,
+  `Endpoint::handle_service_timeout` runs by the instant
+  `Endpoint::poll_service_timeout` reports, and probes leave the host only
+  through `Endpoint::poll_service_transmit`. Routing, classification, the ring,
+  the receipt instant and the floor are one state machine under one `&mut self`
+  and one `now`, so nothing sits between counting a conflict and spacing the
+  probe it caused, and no driver loop order can decide the answer.
+- `mdns-proto`: the conflicts counted are the ones a receiving service has
+  CLASSIFIED, deduped per `(datagram, contested owner name)`. One datagram
+  defending one name carries every record it holds there, so counting per record
+  inflated one conflict fourfold; two different contested names in one datagram
+  are still two. The dedupe is spent after classification and never at the
+  router's emission point, because there a record the receiver reads as
+  identical, undecodable, unowned, or arriving before its own first probe is
+  indistinguishable from a genuine conflict — and spending the datagram's one
+  count on it would leave the real conflict behind it uncounted. Two services
+  sharing a host name therefore see one arriving address as two events and the
+  host counts it once, which is what makes the count the host's rather than the
+  fan-out's.
 - `mdns-proto`: the doc on `CONFLICT_REPROBE_MIN_INTERVAL` no longer claims that
   a hostile peer "cannot prevent the service from ever (re)establishing". It
   can. A peer that answers each first probe with conflicting authoritative data
@@ -183,7 +300,8 @@
   latched the loop turns about once per five seconds. The denial of service
   itself is inherent to a same-link name adversary; only the claim was wrong.
 - `mdns-proto`: when the flood limit is in force and the clock cannot represent
-  `now + 5 s`, a conflict-driven restart now arms **no deadline at all** instead
+  the sequence's own `start + 5 s`, a conflict-driven restart arms **no deadline
+  at all** instead
   of falling back to the caller's shorter one. `Instant::checked_add_duration`
   returns `Option`, so a bounded clock is part of the contract this crate
   publishes rather than a pathological case — a wrapping millisecond counter is

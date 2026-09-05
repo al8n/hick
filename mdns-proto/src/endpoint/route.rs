@@ -4,24 +4,31 @@ use super::*;
 
 /// Iterator over routing decisions for a single incoming datagram.
 ///
-/// Borrows the endpoint mutably for the duration of iteration so that
-/// `QueryEvent::Answer` events can be applied to the internal
-/// [`Query`] state machines as they are yielded —
-/// callers do not need to dispatch query events themselves.  Service
-/// events still flow to the caller via the yielded [`RouteEvent`]s.
-pub struct RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ>
+/// Borrows the endpoint mutably for the duration of iteration, and DISPATCHES —
+/// it does not merely describe. A [`ServiceEvent`] is applied to the addressed
+/// [`Service`] inside this borrow, at the `now` [`Endpoint::handle`] was called
+/// with, before any event is yielded; `QueryEvent::Answer` was already applied
+/// eagerly in `handle`, and [`RouteEvent::ToQuery`] reports it.
+///
+/// So a caller dispatches nothing. That is what makes the datagram's receipt
+/// instant the instant its conflicts are classified and counted at — RFC 6762
+/// §8.1's flood history is folded here, synchronously — rather than whenever a
+/// caller got round to forwarding an event it had been handed.
+pub struct RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>
 where
   I: Instant,
   R: Rng,
   C: Pool<CacheEntry<I>>,
-  SR: Pool<ServiceRoute>,
+  SR: Pool<ServiceRoute<I, TQ, EvS>>,
   QS: Pool<Query<I, AN, EvQ>>,
   EV: Pool<EndpointEventEntry>,
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
+  TQ: Pool<Transmit>,
+  EvS: Pool<ServiceUpdate>,
 {
   pub(crate) src: SocketAddr,
-  pub(crate) endpoint: &'e mut Endpoint<I, R, C, SR, QS, EV, AN, EvQ>,
+  pub(crate) endpoint: &'e mut Endpoint<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>,
   pub(crate) reader: MessageReader<'a>,
   /// The instant [`Endpoint::handle`] processed this datagram at, carried in so
   /// the query fan-out weighs the caller's `QuerySpec::with_timeout` window
@@ -73,7 +80,7 @@ where
   pub(crate) answer_idx: u16,
   pub(crate) authority_idx: u16,
   /// Stashed query event behind a higher-priority service event (e.g. a
-  /// `ProbeConflict` or `KnownAnswer` returns first and the first matching
+  /// `ProbeConflict` or `KnownAnswer` is dispatched first and the first matching
   /// `QueryEvent::Answer` for the same record drains on the next call).
   pub(crate) pending_query: Option<RouteEvent<'a>>,
   /// cursor for fanning out additional matching query routes for
@@ -122,10 +129,6 @@ where
   /// peer probe for a shared host name to only one of the services sharing that
   /// host; the rest would never see the HostConflict.
   pub(crate) authority_service_cursor: Option<usize>,
-  /// When a QUERY-packet answer matches a registered service for both a
-  /// ProbeConflict and a KnownAnswer event, we emit ProbeConflict first and
-  /// stash the KnownAnswer here for the subsequent call.
-  pub(crate) pending_service_event: Option<RouteEvent<'a>>,
   /// index into the ADDITIONAL section, plus the
   /// service-conflict and query fan-out cursors for the current additional
   /// record (same shape as the answer-section cursors). DNS-SD responders carry
@@ -201,12 +204,6 @@ where
   /// none of which this iterator can reach. `now` is likewise fixed for the
   /// datagram — see the field.
   pub(crate) relinquished_screen: Option<(RecordSlot, ConflictHistory)>,
-  /// How many times the screen was actually RUN, as opposed to answered from
-  /// [`Self::relinquished_screen`]. The bound this cache exists for is a
-  /// statement about work done, so it is asserted on directly rather than
-  /// inferred from a wall clock.
-  #[cfg(test)]
-  pub(crate) history_screens: usize,
 }
 
 /// Which section record the conflict fan-out is currently visiting.
@@ -252,16 +249,19 @@ pub(crate) enum Section {
   Done,
 }
 
-impl<'a, I, R, C, SR, QS, EV, AN, EvQ> RouteEvents<'a, '_, I, R, C, SR, QS, EV, AN, EvQ>
+impl<'a, I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>
+  RouteEvents<'a, '_, I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>
 where
   I: Instant,
   R: Rng,
   C: Pool<CacheEntry<I>>,
-  SR: Pool<ServiceRoute>,
+  SR: Pool<ServiceRoute<I, TQ, EvS>>,
   QS: Pool<Query<I, AN, EvQ>>,
   EV: Pool<EndpointEventEntry>,
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
+  TQ: Pool<Transmit>,
+  EvS: Pool<ServiceUpdate>,
 {
   /// Does this datagram's Authority Section carry at least one record proposing
   /// something about `name`? A §8.2 proposal is only worth delivering if it
@@ -457,9 +457,43 @@ where
     self.relinquished_screen = Some((slot, answer));
     #[cfg(test)]
     {
-      self.history_screens = self.history_screens.saturating_add(1);
+      self.endpoint.history_screens = self.endpoint.history_screens.saturating_add(1);
     }
     answer
+  }
+
+  /// Apply one routed [`ServiceEvent`] to the service at route key `key`.
+  ///
+  /// This is the whole of what replaced `RouteEvent::ToService`. Two properties
+  /// follow from doing it HERE rather than handing the event out:
+  ///
+  /// * `now` is [`Endpoint::handle`]'s own `now` — the datagram's RECEIPT
+  ///   instant. RFC 6762 §8.1 counts conflicts by when they occur, and a
+  ///   caller-dispatched event occurred whenever the caller got round to it;
+  /// * the [`ConflictFlood`] is mutable in the same borrow as the service that
+  ///   classifies the conflict, so the count and the classification are one
+  ///   step. No acknowledgement can be dropped and no verdict can be stale.
+  ///
+  /// Every event this datagram raises is folded before the iterator yields
+  /// anything, so a timeout that runs afterwards — in either driver order —
+  /// reads a history that already includes it.
+  fn dispatch(&mut self, key: usize, event: ServiceEvent<'_>) {
+    let now = self.now;
+    // Gated with the log it writes; see `Dispatched`.
+    #[cfg(all(test, feature = "std", feature = "slab"))]
+    if let Some(route) = self.endpoint.services.get(key) {
+      let record = super::Dispatched::new(route.handle(), &event);
+      self.endpoint.dispatched.push(record);
+    }
+    // A split borrow: the route holding the `Service` and the endpoint-wide
+    // flood history are disjoint fields, so both are live at once without a
+    // handoff between them.
+    let Endpoint {
+      services, flood, ..
+    } = &mut *self.endpoint;
+    if let Some(route) = services.get_mut(key) {
+      route.proto.handle_event(event, now, flood);
+    }
   }
 
   /// The HOST half of the conflict fan-out, for the QR=0 authority path whose
@@ -470,7 +504,7 @@ where
     start: usize,
     origin: ConflictOrigin,
     slot: RecordSlot,
-  ) -> Option<(usize, RouteEvent<'a>)> {
+  ) -> Option<(usize, ServiceEvent<'a>)> {
     if r.rclass() != ResourceClass::In {
       return None;
     }
@@ -496,10 +530,7 @@ where
       {
         return Some((
           key,
-          RouteEvent::ToService(ToService::new(
-            route.handle(),
-            ServiceEvent::HostConflict(HostConflict::new(*r, origin)),
-          )),
+          ServiceEvent::HostConflict(HostConflict::new(*r, origin, self.datagram)),
         ));
       }
     }
@@ -532,7 +563,7 @@ where
     start: usize,
     origin: ConflictOrigin,
     slot: RecordSlot,
-  ) -> Option<(usize, RouteEvent<'a>)> {
+  ) -> Option<(usize, ServiceEvent<'a>)> {
     if r.rclass() != ResourceClass::In {
       return None;
     }
@@ -668,10 +699,7 @@ where
         if !history.is_relinquished() {
           return Some((
             key,
-            RouteEvent::ToService(ToService::new(
-              route.handle(),
-              ServiceEvent::HostConflict(HostConflict::new(*r, origin)),
-            )),
+            ServiceEvent::HostConflict(HostConflict::new(*r, origin, self.datagram)),
           ));
         }
         // THE LABELLED RECORD RAISES NO `HostConflict`: the terminal
@@ -747,15 +775,12 @@ where
       if names_match_record(route.name(), r) {
         return Some((
           key,
-          RouteEvent::ToService(ToService::new(
-            route.handle(),
-            ServiceEvent::ProbeConflict(ProbeConflict::new(
-              self.src,
-              *r,
-              self.datagram,
-              history,
-              role,
-            )),
+          ServiceEvent::ProbeConflict(ProbeConflict::new(
+            self.src,
+            *r,
+            self.datagram,
+            history,
+            role,
           )),
         ));
       }
@@ -764,27 +789,26 @@ where
   }
 }
 
-impl<'a, I, R, C, SR, QS, EV, AN, EvQ> Iterator
-  for RouteEvents<'a, '_, I, R, C, SR, QS, EV, AN, EvQ>
+impl<'a, I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS> Iterator
+  for RouteEvents<'a, '_, I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>
 where
   I: Instant,
   R: Rng,
   C: Pool<CacheEntry<I>>,
-  SR: Pool<ServiceRoute>,
+  SR: Pool<ServiceRoute<I, TQ, EvS>>,
   QS: Pool<Query<I, AN, EvQ>>,
   EV: Pool<EndpointEventEntry>,
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
+  TQ: Pool<Transmit>,
+  EvS: Pool<ServiceUpdate>,
 {
   type Item = Result<RouteEvent<'a>, HandleError>;
 
   fn next(&mut self) -> Option<Self::Item> {
-    // Flush pending stashed events in priority order before processing the
-    // next record.  Order: ProbeConflict / KnownAnswer stash (service event)
-    // first, then query Answer stash.
-    if let Some(ev) = self.pending_service_event.take() {
-      return Some(Ok(ev));
-    }
+    // Flush a stashed query event before processing the next record. Service
+    // events are never stashed: they are dispatched where they are found, so
+    // nothing has to be held back for a later `next()`.
     if let Some(ev) = self.pending_query.take() {
       return Some(Ok(ev));
     }
@@ -873,7 +897,7 @@ where
           // match. This allows ALL services sharing the same PTR name to each
           // receive a ServiceEvent::Question for this question before we move on.
           let cursor = self.service_cursor;
-          let mut found: Option<(usize, RouteEvent<'a>)> = None;
+          let mut found: Option<(usize, ServiceEvent<'a>)> = None;
           // The §8.1 defence gate's answer for THIS question, taken at most once.
           // Every route reached below matched on a name equal to this question's
           // own QNAME, so the Authority Section proposes for one of them exactly
@@ -939,16 +963,13 @@ where
             {
               found = Some((
                 key,
-                RouteEvent::ToService(ToService::new(
-                  route.handle(),
-                  ServiceEvent::Question(
-                    ServiceQuestion::new(q, self.src, self.reader.header().id())
-                      // RFC 6762 §7.2: a TC-bit query spreads its known answers
-                      // across multiple packets — the responder delays longer so
-                      // the follow-up packets accumulate before it suppresses.
-                      .with_truncated(self.reader.header().flags().is_truncated()),
-                  ),
-                )),
+                ServiceEvent::Question(
+                  ServiceQuestion::new(q, self.src, self.reader.header().id())
+                    // RFC 6762 §7.2: a TC-bit query spreads its known answers
+                    // across multiple packets — the responder delays longer so
+                    // the follow-up packets accumulate before it suppresses.
+                    .with_truncated(self.reader.header().flags().is_truncated()),
+                ),
               ));
               break;
             }
@@ -957,7 +978,8 @@ where
             // Advance the service cursor past this key so the next call picks up
             // where we left off within the same question.
             self.service_cursor = key.saturating_add(1);
-            return Some(Ok(ev));
+            self.dispatch(key, ev);
+            continue;
           }
           // No more matching services for this question: advance to the next
           // question and reset the per-question service cursor.
@@ -1071,7 +1093,7 @@ where
               // none of our RRset names, so fan it out to EVERY service (mirrors
               // how the meta QUESTION routes to all of them); each
               // service decides whether the PTR target matches its own type.
-              let mut found: Option<(usize, RouteEvent<'a>)> = None;
+              let mut found: Option<(usize, ServiceEvent<'a>)> = None;
               for (key, route) in self.endpoint.services.iter() {
                 if key < start {
                   continue;
@@ -1088,13 +1110,7 @@ where
                   || names_match_record(route.service_type(), &r)
                   || is_meta_query_name(r.name())
                 {
-                  found = Some((
-                    key,
-                    RouteEvent::ToService(ToService::new(
-                      route.handle(),
-                      ServiceEvent::KnownAnswer(KnownAnswer::new(self.src, r)),
-                    )),
-                  ));
+                  found = Some((key, ServiceEvent::KnownAnswer(KnownAnswer::new(self.src, r))));
                   break;
                 }
               }
@@ -1102,7 +1118,8 @@ where
             };
             if let Some((key, ev)) = next_event {
               self.answer_service_cursor = Some(key.saturating_add(1));
-              return Some(Ok(ev));
+              self.dispatch(key, ev);
+              continue;
             }
             // service-side fan-out exhausted for THIS record. Mark
             // it done (not just reset the cursor to None, which is ambiguous
@@ -1184,7 +1201,7 @@ where
             continue;
           }
           let start = self.proposal_service_cursor.unwrap_or(0);
-          let mut found: Option<(usize, RouteEvent<'a>)> = None;
+          let mut found: Option<(usize, ServiceEvent<'a>)> = None;
           for (key, route) in self.endpoint.services.iter() {
             if key < start {
               continue;
@@ -1196,13 +1213,10 @@ where
             if self.authority_proposes_for(route.name()) {
               found = Some((
                 key,
-                RouteEvent::ToService(ToService::new(
-                  route.handle(),
-                  ServiceEvent::ProbeProposal(ProbeProposal::new(
-                    self.src,
-                    self.reader,
-                    self.datagram,
-                  )),
+                ServiceEvent::ProbeProposal(ProbeProposal::new(
+                  self.src,
+                  self.reader,
+                  self.datagram,
                 )),
               ));
               break;
@@ -1210,7 +1224,8 @@ where
           }
           if let Some((key, ev)) = found {
             self.proposal_service_cursor = Some(key.saturating_add(1));
-            return Some(Ok(ev));
+            self.dispatch(key, ev);
+            continue;
           }
           self.section = Section::Authority;
           continue;
@@ -1308,7 +1323,8 @@ where
           };
           if let Some((key, ev)) = next {
             self.authority_service_cursor = Some(key.saturating_add(1));
-            return Some(Ok(ev));
+            self.dispatch(key, ev);
+            continue;
           }
           // No more matching services for this authority record.
           // Advance to the next authority record.
@@ -1381,7 +1397,8 @@ where
             };
             if let Some((key, ev)) = next_event {
               self.additional_service_cursor = Some(key.saturating_add(1));
-              return Some(Ok(ev));
+              self.dispatch(key, ev);
+              continue;
             }
             // mark the service phase done for this record so a later
             // query event can't re-enter and replay the conflict events.

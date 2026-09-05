@@ -2,8 +2,9 @@
 //!
 //! Holds an [`Rc<EndpointInner>`] + the proto-layer [`ServiceHandle`] + a
 //! handle-owned `ServiceMailbox` the driver fills with [`ServiceUpdate`]s.
-//! The driver task owns the proto `Service` state machine inside
-//! `State.services`; this handle drains the shared mailbox under a brief borrow,
+//! The `Service` state machine lives in the proto endpoint, keyed by that
+//! [`ServiceHandle`]; the driver keeps only its own per-service bookkeeping in
+//! `State.services`. This handle drains the shared mailbox under a brief borrow,
 //! then parks on the shared driver notifier when no update is ready.
 //!
 //! The mailbox is shared `Rc<RefCell<ServiceMailbox>>` between the driver ctx

@@ -257,16 +257,17 @@ impl Service {
   }
 
   // an in-place `rename` API was removed because the proto-layer
-  // `Service` exposes no atomic "rename instance" operation. The driver
-  // would have to drop the proto Service and reconstruct one with the new
-  // ServiceSpec, which changes the underlying `ServiceHandle` and forces a
-  // full probing round anyway — better to express that as
-  // `unregister` + `Endpoint::register_service(new_spec).await` at the
-  // caller site so the handle invalidation is explicit.
+  // `Service` exposes no atomic "rename instance" operation. Renaming would
+  // mean unregistering and registering a new `ServiceSpec`, which changes the
+  // underlying `ServiceHandle` and forces a full probing round anyway — better
+  // to express that as `unregister` + `Endpoint::register_service(new_spec)
+  // .await` at the caller site so the handle invalidation is explicit.
   //
   // The auto-rename path (`ServiceUpdate::Renamed`) is still observed via
-  // `next().await`; the driver keeps the endpoint's route table in sync
-  // before forwarding the event so post-rename queries route correctly.
+  // `next().await`. It is a NOTIFICATION: the endpoint chose a name its own
+  // route table does not hold and mirrored it into the route in the same
+  // borrow, so post-rename queries route correctly the moment the update is
+  // observable.
 
   /// Explicitly unregister the service. Equivalent to dropping the handle
   /// but returns an error if the driver task has already exited.

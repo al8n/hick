@@ -2,16 +2,18 @@
 
 use super::*;
 
-impl<I, R, C, SR, QS, EV, AN, EvQ> Endpoint<I, R, C, SR, QS, EV, AN, EvQ>
+impl<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS> Endpoint<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>
 where
   I: Instant,
   R: Rng,
   C: Pool<CacheEntry<I>>,
-  SR: Pool<ServiceRoute>,
+  SR: Pool<ServiceRoute<I, TQ, EvS>>,
   QS: Pool<Query<I, AN, EvQ>>,
   EV: Pool<EndpointEventEntry>,
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
+  TQ: Pool<Transmit>,
+  EvS: Pool<ServiceUpdate>,
 {
   /// Is `addr` advertised by any registered service?  Used by `handle` to
   /// detect multicast-loopback datagrams whose source address matches an
@@ -63,14 +65,17 @@ where
   ///
   /// # Contract
   ///
-  /// The routing decisions this yields are fed to
-  /// [`Service::handle_event`](crate::service::Service::handle_event) /
-  /// [`Query::handle_event`](crate::query::Query::handle_event), so the
-  /// confirm-before-anything contract reaches the receive path too: do not drive
-  /// this loop for a service or query whose datagram from `poll_transmit` has not
-  /// been confirmed via `note_transmit_outcome`. A driver that sends and confirms
-  /// as one step satisfies this by construction. See
-  /// [`Service::poll_transmit`](crate::service::Service::poll_transmit).
+  /// This APPLIES what it routes: a service event is dispatched to the addressed
+  /// service inside the iteration, and a query answer was applied eagerly here.
+  /// So the confirm-before-anything contract reaches the receive path too — do
+  /// not drive this loop while a datagram from
+  /// [`Self::poll_service_transmit`] or [`Self::poll_query_transmit`] is still
+  /// awaiting its confirm. A driver that sends and confirms as one step
+  /// satisfies this by construction.
+  ///
+  /// The iterator must be driven to exhaustion. What it yields is informational;
+  /// what it DOES — dispatching each service event at this `now`, which is what
+  /// dates RFC 6762 §8.1's conflict history — happens as it advances.
   ///
   /// `now` is the instant this datagram is PROCESSED at, and every effect it has
   /// is anchored to that one reading: cached records expire from it, an active
@@ -109,7 +114,7 @@ where
     &'e mut self,
     now: I,
     rx: Received<'a>,
-  ) -> Result<RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ>, HandleError> {
+  ) -> Result<RouteEvents<'a, 'e, I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>, HandleError> {
     let Received {
       src,
       data,
@@ -584,7 +589,6 @@ where
       answer_idx: 0,
       authority_idx: 0,
       pending_query: None,
-      pending_service_event: None,
       answer_query_cursor: None,
       answer_service_cursor: None,
       answer_service_done: false,
@@ -594,8 +598,6 @@ where
       additional_service_done: false,
       additional_query_cursor: None,
       relinquished_screen: None,
-      #[cfg(test)]
-      history_screens: 0,
       admits,
       // A datagram no permission admits yields zero events, and is handed back
       // PRE-DRAINED rather than walked. The per-arm gates below would each

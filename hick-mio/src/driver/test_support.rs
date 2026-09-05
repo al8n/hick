@@ -12,7 +12,6 @@ use std::{
 
 use mdns_proto::{
   FamilyAttempt, Name, Provenance, QuerySpec, Received, ServiceHandle, ServiceRecords, ServiceSpec,
-  event::RouteEvent,
   wire::{Header, MessageBuilder, MessageReader, NameRef, ResourceType},
 };
 
@@ -221,9 +220,9 @@ pub(crate) fn drive_to_advertised(mdns: &mut Mdns, handle: ServiceHandle) -> boo
   while StdInstant::now() < deadline {
     mdns.tick().expect("tick");
     if mdns
-      .services
-      .get(&handle)
-      .is_some_and(|ctx| ctx.proto.advertises_instance())
+      .endpoint
+      .service(handle)
+      .is_some_and(|svc| svc.advertises_instance())
     {
       return true;
     }
@@ -283,13 +282,13 @@ pub(crate) fn conflict_response(instance: &str) -> Vec<u8> {
 /// Written here rather than behind a production seam because the two gates it
 /// skips are the trust boundary, not the dispatch: reproducing them needs a peer
 /// on a real link delivering a TTL cmsg, which is exactly what a unit test does
-/// not have. The dispatch itself — route the events, skip a retired service — is
-/// reproduced in full.
+/// not have. The dispatch itself is the endpoint's — a service event is applied
+/// to the addressed service inside `Endpoint::handle`'s iterator — so walking
+/// that iterator to completion is the whole of what this has to reproduce.
 pub(crate) fn ingest(mdns: &mut Mdns, data: &[u8], now: StdInstant) {
   let peer = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), 5353));
   let Mdns {
     endpoint,
-    services,
     bound_interface,
     ..
   } = mdns;
@@ -301,14 +300,7 @@ pub(crate) fn ingest(mdns: &mut Mdns, data: &[u8], now: StdInstant) {
         .with_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     )
     .expect("the endpoint must accept a well-formed probe");
-  for ev in route_events {
-    if let Ok(RouteEvent::ToService(ts)) = ev
-      && let Some(ctx) = services.get_mut(&ts.handle())
-      && !ctx.withdrawing
-    {
-      ctx.proto.handle_event(ts.into_event(), now);
-    }
-  }
+  for _ev in route_events {}
 }
 
 /// Pump every RFC 6762 §10.1 goodbye that is due, confirming each round as

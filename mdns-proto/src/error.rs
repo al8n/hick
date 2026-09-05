@@ -13,7 +13,7 @@ use crate::{name::LabelTooLongDetail, wire::*};
 // error enums below, so gate the import to match (no_std + bare no-default have
 // no `Name`).
 cfg_heap! {
-  use crate::{Name, QueryHandle, ServiceHandle};
+  use crate::{Name, QueryHandle};
 }
 
 /// Detail payload for "buffer too short": a parser ran out of bytes.
@@ -224,7 +224,7 @@ pub enum EncodeError {
   IntegerConversion(#[from] core::num::TryFromIntError),
 }
 
-/// Errors raised by [`Service::handle_timeout`](crate::service::Service::handle_timeout).
+/// Errors raised by [`Endpoint::handle_service_timeout`](crate::Endpoint::handle_service_timeout).
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
@@ -235,7 +235,7 @@ pub enum HandleTimeoutError {
   Overflow,
 }
 
-/// Errors raised by [`Service::poll_transmit`](crate::service::Service::poll_transmit).
+/// Errors raised by [`Endpoint::poll_service_transmit`](crate::Endpoint::poll_service_transmit).
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
 #[unwrap(ref)]
 #[try_unwrap(ref)]
@@ -386,36 +386,6 @@ pub enum StartQueryError {
 }
 
 cfg_heap! {
-  /// Errors raised by
-  /// [`Endpoint::handle_service_renamed`](crate::endpoint::Endpoint::handle_service_renamed).
-  #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap, thiserror::Error)]
-  #[unwrap(ref)]
-  #[try_unwrap(ref)]
-  #[non_exhaustive]
-  pub enum HandleServiceRenamedError {
-    /// The new name is already registered to a different service.
-    #[error("name `{0}` is already registered to a different service")]
-    NameAlreadyRegistered(Name),
-
-    /// Applying the rename would leave this route sharing a HOST name with
-    /// another live route that publishes a different A/AAAA set. Carries the
-    /// host name. See [`RegisterServiceError::HostAddressesDiffer`].
-    ///
-    /// **Not reachable today, and deliberately kept.** A rename replaces a
-    /// route's INSTANCE name and touches neither its host name nor its
-    /// addresses, so it cannot break an invariant registration already
-    /// established. The check is the invariant's second enforcement point rather
-    /// than dead weight: it becomes reachable the moment a rename is allowed to
-    /// carry new records, which is exactly the change that would otherwise
-    /// re-open the terminal-`HostConflict`-on-every-sibling-echo path silently.
-    #[error("host `{0}` is already published with a different address set")]
-    HostAddressesDiffer(Name),
-
-    /// The handle does not refer to a registered service.
-    #[error("service handle {0} not found")]
-    ServiceNotFound(ServiceHandle),
-  }
-
   /// Errors raised by query-handle lookups on `Endpoint` (`poll_query_*`,
   /// `handle_query_timeout`, `cancel_query`, …) when the handle no longer
   /// corresponds to an active query.  A query disappears from the endpoint

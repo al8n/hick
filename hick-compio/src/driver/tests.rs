@@ -1343,10 +1343,10 @@ fn establish_service(
   let mut buf = vec![0u8; 4096];
   for _ in 0..40 {
     t += Duration::from_millis(300);
-    let ctx = s.services.get_mut(&handle).unwrap();
-    let _ = ctx.proto.handle_timeout(t);
-    while let Ok(Some(_)) = ctx.proto.poll_transmit(t, &mut buf) {
-      let _ = ctx.proto.note_transmit_outcome(
+    let _ = s.endpoint.handle_service_timeout(handle, t);
+    while let Ok(Some(_)) = s.endpoint.poll_service_transmit(handle, t, &mut buf) {
+      let _ = s.endpoint.note_service_transmit_outcome(
+        handle,
         t,
         FamilyAttempt::Accepted { at: t },
         FamilyAttempt::Accepted { at: t },
@@ -1354,9 +1354,9 @@ fn establish_service(
     }
   }
   assert!(
-    s.services
-      .get(&handle)
-      .map(|c| c.proto.advertises_host())
+    s.endpoint
+      .service(handle)
+      .map(|svc| svc.advertises_host())
       .unwrap_or(false),
     "service must advertise at least one record before withdrawal"
   );
@@ -1862,7 +1862,7 @@ fn same_name_replacement_is_rejected_until_withdrawal_completes() {
 /// buffer and asserts: (a) the failure counter climbs one per call, (b) at the
 /// threshold the reserved terminal `Conflict` is set and `errored` is set, and
 /// (c) a subsequent `poll_one_transmit` skips the errored service (returns `None`
-/// when it's the only one) rather than re-polling its dead proto.
+/// when it's the only one) rather than re-polling its dead state machine.
 #[test]
 fn oversized_service_escalates_to_conflict_not_silent_stall() {
   use mdns_proto::{Name, ServiceRecords, ServiceSpec};
@@ -1951,7 +1951,7 @@ fn oversized_service_escalates_to_conflict_not_silent_stall() {
   }
 
   // A subsequent pump must SKIP the errored service. With it the only registered
-  // service (and no queries), the result is `None` — proving the dead proto is
+  // service (and no queries), the result is `None` — proving the dead service is
   // no longer re-polled (no busy-spin) and the counter is frozen.
   assert!(
     s.poll_one_transmit(now, &mut scratch).is_none(),
@@ -2267,27 +2267,23 @@ fn multi_service_encode_failure_frees_route_even_with_sibling_transmit() {
   );
 }
 
-/// regression (endpoint-owned-withdrawal form): when a service's
-/// auto-rename (§9 conflict) collides with another LOCAL service that already
-/// owns the candidate name, `push_service_updates` retires the colliding service
-/// into an endpoint-owned withdrawal. The endpoint HOLDS the route (reserving the
-/// old name) until the withdrawal completes, THEN frees it — so `services_active`
-/// is decremented and the old name becomes re-registerable on COMPLETION, not at
-/// the collision instant. A's `Conflict` lands in the handle-owned mailbox
-/// regardless.
+/// A §9 auto-rename may NEVER take a name a local service already owns, and the
+/// route table is consistent the instant the rename is observed.
 ///
-/// The original bug: the compio `push_service_updates` break'd out of the rename
-/// loop without retiring the service, leaking the proto route for the colliding
-/// service. The migration replaces the immediate `unregister_service` with
-/// `begin_service_withdrawal` (route held → freed on completion).
+/// The endpoint collects the instance names its own route table holds on exactly
+/// the ticks a rename is imminent, hands them to the state machine, and mirrors
+/// the chosen name into the route in the SAME borrow. So the candidate a sibling
+/// already owns is simply skipped, and there is no window in which the service
+/// and the router disagree about which name is being probed.
 ///
-/// Verification: after the collision A is errored + `Conflict` is queued and the
-/// route is still HELD (services_active stays 2, old name rejected); after
-/// driving the withdrawal to completion, services_active drops to 1 and A's old
-/// name is re-registerable.
+/// This is what the driver's rename reconciliation used to exist for: it offered
+/// the new name to the endpoint, and on a refusal retired the renamer with a
+/// synthesized `Conflict`. That collision is now unreachable, so what is asserted
+/// here is its absence — A survives, B is untouched, and the name A moved to is
+/// one the route table now refuses to hand out again.
 #[cfg(feature = "stats")]
 #[test]
-fn rename_collision_with_local_service_frees_proto_route() {
+fn a_rename_skips_a_name_a_local_service_already_owns() {
   use std::time::Duration;
 
   use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2298,9 +2294,6 @@ fn rename_collision_with_local_service_frees_proto_route() {
     wire::{Header, MessageBuilder},
   };
 
-  // Build an mDNS authority-section packet that claims our instance name
-  // with different SRV rdata — this is the §8.2 conflict signal that forces
-  // the proto to revert to probing and eventually rename.
   // A QR=1 RESPONSE claiming our instance name with different SRV rdata: the
   // RFC 6762 §9 conflict signal, which is what reverts an ESTABLISHED service
   // to probing and eventually renames it. §9 is explicit that a response is
@@ -2329,7 +2322,7 @@ fn rename_collision_with_local_service_frees_proto_route() {
 
   let now = std::time::Instant::now();
 
-  // Service A: "First._ipp._tcp.local." — will be driven to rename to "First (2)".
+  // Service A: "First._ipp._tcp.local." — will be driven to rename away.
   let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
   let inst_a = Name::try_from_str("First._ipp._tcp.local.").unwrap();
   let host_a = Name::try_from_str("first.local.").unwrap();
@@ -2339,15 +2332,15 @@ fn rename_collision_with_local_service_frees_proto_route() {
     .test_register_service(ServiceSpec::new(recs_a), now)
     .unwrap();
 
-  // Service B: pre-register "First-1._ipp._tcp.local." so the rename
-  // collision fires when A tries to rename to it.
-  // The proto uses a `-N` suffix (rename_with_suffix): "First._ipp._tcp.local."
-  // with rename_attempt=1 → "First-1._ipp._tcp.local.".
+  // Service B: pre-register the FIRST candidate A's rename would otherwise
+  // reach. The proto uses a `-N` suffix (`rename_with_suffix`), so
+  // "First._ipp._tcp.local." with rename_attempt=1 is "First-1._ipp._tcp.local.".
   let inst_b = Name::try_from_str("First-1._ipp._tcp.local.").unwrap();
   let host_b = Name::try_from_str("second.local.").unwrap();
-  let mut recs_b = ServiceRecords::new(stype, inst_b, host_b, 80, 120);
+  let mut recs_b = ServiceRecords::new(stype.clone(), inst_b.clone(), host_b, 80, 120);
   recs_b.add_a([192, 168, 1, 2].into());
-  s.test_register_service(ServiceSpec::new(recs_b), now)
+  let handle_b = s
+    .test_register_service(ServiceSpec::new(recs_b), now)
     .unwrap();
 
   // Both registered: services_active == 2.
@@ -2388,7 +2381,7 @@ fn rename_collision_with_local_service_frees_proto_route() {
     pump_transmits(&mut s, t, &mut buf);
     s.push_service_updates(t);
     // Drain the handle-owned mailbox (what Service::next reads); detect the
-    // Established and discard the rest so a fresh Conflict is detectable below.
+    // Established and discard the rest so a later Renamed is detectable.
     while let Some(u) = a_mailbox.borrow_mut().drain_for_test() {
       if matches!(u, ServiceUpdate::Established) {
         a_established = true;
@@ -2398,11 +2391,10 @@ fn rename_collision_with_local_service_frees_proto_route() {
       break;
     }
   }
-  let _ = a_established;
+  assert!(a_established, "A must reach Established before the rename");
 
-  // Inject a peer conflict for "First._ipp._tcp.local." repeatedly until
-  // `push_service_updates` drives A to rename and collide with B, at which point
-  // A's terminal Conflict is set in the mailbox and A is flagged errored.
+  // Inject a peer conflict for "First._ipp._tcp.local." repeatedly until A
+  // renames away from it.
   let conflict = conflict_for("First._ipp._tcp.local.");
   let peer = RecvMeta::new(
     SocketAddr::from(([192, 168, 1, 200], 5353)),
@@ -2412,7 +2404,7 @@ fn rename_collision_with_local_service_frees_proto_route() {
     Some(255),
     conflict.len(),
   );
-  let mut conflicted = false;
+  let mut renamed = false;
   for _ in 0..80 {
     t += Duration::from_millis(300);
     s.fire_timeouts(t);
@@ -2421,118 +2413,91 @@ fn rename_collision_with_local_service_frees_proto_route() {
     s.push_service_updates(t);
 
     if s
-      .services
-      .get(&handle_a)
-      .map(|c| c.errored)
-      .unwrap_or(false)
+      .endpoint
+      .service(handle_a)
+      .is_some_and(|svc| !svc.name().same_owner(&inst_a))
     {
-      conflicted = true;
+      renamed = true;
       break;
     }
   }
+  assert!(renamed, "A must rename away under sustained conflict");
 
+  // The name it landed on is NOT B's, and A is still LIVE — the retirement the
+  // old reconciliation performed on a refused rename has nothing left to fire on.
+  let new_name = s.endpoint.service(handle_a).unwrap().name().clone();
   assert!(
-    conflicted,
-    "A must be driven to rename-collision-Conflict within 60 iterations"
+    !new_name.same_owner(&inst_b),
+    "the rename must skip the name a local service already owns, got {new_name}"
+  );
+  assert!(
+    !s.services.get(&handle_a).map(|c| c.errored).unwrap_or(true),
+    "A survives its rename: there is no collision to retire it for"
+  );
+  assert!(
+    !a_mailbox.borrow().has_terminal(),
+    "no terminal Conflict may be synthesized for a rename that succeeded"
   );
 
-  // A's route is HELD by the in-flight withdrawal — services_active stays 2
-  // (B live + A withdrawing), and A's terminal Conflict is set for Service::next.
+  // B is untouched: it keeps the name A was refused.
+  assert!(
+    s.endpoint
+      .service(handle_b)
+      .is_some_and(|svc| svc.name().same_owner(&inst_b)),
+    "B must keep the name the rename skipped"
+  );
+  assert!(
+    !s.services.get(&handle_b).map(|c| c.errored).unwrap_or(true),
+    "B is not a party to A's rename"
+  );
+
+  // Both routes are still live: nothing was retired.
   assert_eq!(
     s.stats.snapshot().services_active,
     2,
-    "services_active must still be 2 while A's rename-collision withdrawal holds \
-       the route (B live + A withdrawing)"
-  );
-  assert!(
-    a_mailbox.borrow().has_terminal(),
-    "A's reserved-slot Conflict must be set for Service::next"
-  );
-  // The GC is UNCONDITIONAL now, so the ctx need not be drained first — but the
-  // terminal Conflict survives in `a_mailbox` regardless (asserted after).
-
-  // Drive A's withdrawal to completion (no sockets → force-finished at the 2 s
-  // ceiling), then GC the freed ctx.
-  let mut scratch = vec![0u8; 4096];
-  let mut completed = false;
-  for _ in 0..64 {
-    t += Duration::from_millis(250);
-    while let Some(round) = s.poll_one_withdrawal(t, &mut scratch) {
-      // No sockets bound in this State-level test: model BOTH families as
-      // transiently undeliverable (Retry) so the per-family budget stays intact
-      // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
-      // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
-      // instead, defeating the ceiling assertion.)
-      s.note_withdrawal_result(
-        round.token(),
-        t,
-        FamilyAttempt::Refused { permanent: false },
-        FamilyAttempt::Refused { permanent: false },
-      );
-    }
-    s.drain_completed_withdrawals(t);
-    if !s.services.contains_key(&handle_a) {
-      completed = true;
-      break;
-    }
-  }
-  assert!(completed, "A's rename-collision withdrawal must complete");
-
-  // On completion the route is freed: services_active drops to 1 (B only).
-  assert_eq!(
-    s.stats.snapshot().services_active,
-    1,
-    "services_active must be 1 once A's withdrawal completes (B still live)"
-  );
-  // A's terminal Conflict survived the unconditional ctx GC and is drainable by
-  // a live reader.
-  assert!(
-    matches!(
-      a_mailbox.borrow_mut().drain_for_test(),
-      Some(ServiceUpdate::Conflict)
-    ),
-    "A's reserved Conflict survives the ctx GC and is drainable by Service::next"
+    "no service was retired, so services_active must still be 2"
   );
 
-  // A's old name must now be re-registerable (route was freed on completion).
-  let mut recs_a2 = ServiceRecords::new(
-    Name::try_from_str("_ipp._tcp.local.").unwrap(),
-    inst_a,
-    host_a,
+  // THE ROUTE TABLE AGREES: registering A's NEW name is refused, which can only
+  // be true if the route mirrors what the state machine is probing.
+  let mut dup = ServiceRecords::new(
+    stype,
+    new_name.clone(),
+    Name::try_from_str("dup.local.").unwrap(),
     80,
     120,
   );
-  recs_a2.add_a([192, 168, 1, 10].into());
-  s.test_register_service(ServiceSpec::new(recs_a2), t)
-    .expect("A's old name must be re-registerable once the rename-collision withdrawal completes");
+  dup.add_a([192, 168, 1, 3].into());
+  assert!(
+    matches!(
+      s.test_register_service(ServiceSpec::new(dup), t),
+      Err(mdns_proto::error::RegisterServiceError::NameAlreadyRegistered(_))
+    ),
+    "the route table must hold A's new name {new_name}"
+  );
 }
 
-/// regression (endpoint-owned-withdrawal form): when an ANNOUNCED service A
-/// is driven to auto-rename and its candidate new name collides with a local
-/// service B, the proto hands off A's OLD instance name goodbye (TTL=0). The OLD
-/// driver stole that goodbye into its own queue before freeing the old name,
-/// then guarded against replaying it on A's drop. The endpoint now enforces this
-/// STRUCTURALLY: the driver takes the handoff and enqueues it as an INDEPENDENT
-/// detached withdrawal item (`Endpoint::enqueue_rename_withdrawal`) that HOLDS
-/// the OLD name for the whole withdrawal — so a replacement R cannot register
-/// (and evict the old name from peer caches) until that goodbye completes. The
-/// rename-collision teardown additionally begins an endpoint-owned withdrawal
-/// for the CURRENT name. No steal, no replay-guard needed.
+/// A SURVIVING §9 rename of an ANNOUNCED service leaves the OLD name's RFC 6762
+/// §10.1 TTL=0 goodbye enqueued as an INDEPENDENT detached withdrawal item —
+/// enqueued by the endpoint itself, inside the same tick that chose the new name,
+/// with no step owed by the driver.
 ///
-/// (That the proto hands off the OLD name's records + ownership is covered at the
-/// proto level by `conflict_rename_hands_off_old_announced_name`, and that the
-/// handoff becomes a detached item by
-/// `rename_enqueues_a_detached_withdrawal_for_the_old_name`.)
+/// The driver used to own that handoff: take it off the state machine the instant
+/// a `Renamed` surfaced, and enqueue it name-HOLDING or reclaimable depending on
+/// whether the rename had collided. A rename cannot collide any more, so the item
+/// is always the reclaimable kind and the endpoint enqueues it where it renames.
 ///
 /// Asserts:
-/// 1. After collision retirement A is errored + the endpoint holds the OLD name,
-///    so a same-name re-register is rejected (`NameAlreadyRegistered`).
-/// 2. Once the withdrawal completes (route freed + ctx GC'd), the OLD name is
-///    re-registerable — and re-registering R THEN does not depend on any
-///    driver-side replayed goodbye.
+/// 1. A goodbye round is DUE the moment the rename is observed, before the driver
+///    has touched the withdrawal machinery at all.
+/// 2. A is alive under its new name — this is the surviving path, not a teardown.
+/// 3. The vacated OLD name is RECLAIMABLE: a replacement R registers under it at
+///    once, superseding the goodbye rather than being blocked by it. (A name a
+///    goodbye HOLDS is the rename-FAILURE case, where the service never moved off
+///    it — covered at the proto level.)
 #[cfg(feature = "stats")]
 #[test]
-fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
+fn a_surviving_rename_enqueues_the_old_names_detached_goodbye() {
   use std::time::Duration;
 
   use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2544,13 +2509,10 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
   };
 
   // A QR=1 RESPONSE claiming our instance name with different SRV rdata: the
-  // RFC 6762 §9 conflict signal, which is what reverts an ESTABLISHED service
-  // to probing and eventually renames it. §9 is explicit that a response is
-  // what does this — "it receives a Multicast DNS response message containing a
-  // record with the same name, rrtype and rrclass, but inconsistent rdata" — so
-  // the same rdata in the Authority section of a peer's QUERY would not, and
-  // must not: that peer is merely probing, and the answer to a probe for a name
-  // we own is to defend it.
+  // RFC 6762 §9 conflict signal, which is what reverts an ESTABLISHED service to
+  // probing and eventually renames it. The same rdata in the Authority section
+  // of a peer's QUERY would not, and must not: that peer is merely probing, and
+  // the answer to a probe for a name we own is to defend it.
   fn conflict_for(instance: &str) -> Vec<u8> {
     let mut buf = [0u8; 512];
     let name = Name::try_from_str(instance).unwrap();
@@ -2570,7 +2532,7 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
 
   let now = std::time::Instant::now();
 
-  // Service A: will be announced then driven to rename-collision.
+  // Service A: announced, then driven to rename away.
   let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
   let inst_a = Name::try_from_str("First._ipp._tcp.local.").unwrap();
   let host_a = Name::try_from_str("first.local.").unwrap();
@@ -2578,14 +2540,6 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
   recs_a.add_a([192, 168, 1, 1].into());
   let handle_a = s
     .test_register_service(ServiceSpec::new(recs_a), now)
-    .unwrap();
-
-  // Service B: owns the name A will try to rename to.
-  let inst_b = Name::try_from_str("First-1._ipp._tcp.local.").unwrap();
-  let host_b = Name::try_from_str("second.local.").unwrap();
-  let mut recs_b = ServiceRecords::new(stype.clone(), inst_b, host_b, 80, 120);
-  recs_b.add_a([192, 168, 1, 2].into());
-  s.test_register_service(ServiceSpec::new(recs_b), now)
     .unwrap();
 
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
@@ -2605,8 +2559,8 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
     }
   }
 
-  // Advance A to Established so the proto hands off an old-name goodbye on
-  // rename (only an ANNOUNCED service has one — that's the bug scenario).
+  // Advance A to Established: only an ANNOUNCED service has an old-name goodbye
+  // to hand off, so this is the precondition the whole test rests on.
   let a_mailbox = Rc::clone(&s.services.get(&handle_a).unwrap().mailbox);
   let mut buf = [0u8; 1500];
   let mut t = now;
@@ -2616,8 +2570,6 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
     s.fire_timeouts(t);
     pump_transmits(&mut s, t, &mut buf);
     s.push_service_updates(t);
-    // Drain the handle-owned mailbox; detect Established and discard the rest so
-    // a fresh Conflict is detectable below.
     while let Some(u) = a_mailbox.borrow_mut().drain_for_test() {
       if matches!(u, ServiceUpdate::Established) {
         a_established = true;
@@ -2629,11 +2581,11 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
   }
   assert!(
     a_established,
-    "A must reach Established before the rename-collision test can verify the goodbye"
+    "A must reach Established before the rename, or there is no goodbye to hand off"
   );
 
-  // Inject peer conflicts for A's original name until push_service_updates drives
-  // the rename and detects the local collision.
+  // Inject peer conflicts for A's original name until it renames away. NOTHING
+  // in this loop touches the withdrawal machinery.
   let conflict = conflict_for("First._ipp._tcp.local.");
   let peer = RecvMeta::new(
     SocketAddr::from(([192, 168, 1, 200], 5353)),
@@ -2643,7 +2595,7 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
     Some(255),
     conflict.len(),
   );
-  let mut conflicted = false;
+  let mut renamed = false;
   for _ in 0..80 {
     t += Duration::from_millis(300);
     s.fire_timeouts(t);
@@ -2652,86 +2604,50 @@ fn rename_collision_drains_old_name_goodbye_before_name_reuse() {
     s.push_service_updates(t);
 
     if s
-      .services
-      .get(&handle_a)
-      .map(|c| c.errored)
-      .unwrap_or(false)
+      .endpoint
+      .service(handle_a)
+      .is_some_and(|svc| !svc.name().same_owner(&inst_a))
     {
-      conflicted = true;
+      renamed = true;
       break;
     }
   }
+  assert!(renamed, "A must rename away under sustained conflict");
+
+  // ASSERTION 2 (stated first because the rest reads against it): this is the
+  // SURVIVING path. A is live under a new name, not torn down.
   assert!(
-    conflicted,
-    "A must be driven to rename-collision-Conflict within 80 iterations"
+    !s.services.get(&handle_a).map(|c| c.errored).unwrap_or(true),
+    "a rename that succeeded must not retire its service"
   );
 
-  // ASSERTION 1: the endpoint holds A's OLD name for the whole withdrawal, so a
-  // same-name re-register is rejected — a replacement cannot announce a fresh
-  // positive TTL ahead of the stale TTL=0 (and evict the old name from peer
-  // caches). This is the structural ordering guarantee that replaces the old
-  // steal-before-reuse dance.
-  {
-    let mut dup = ServiceRecords::new(stype.clone(), inst_a.clone(), host_a.clone(), 80, 120);
-    dup.add_a([192, 168, 1, 1].into());
-    assert!(
-      matches!(
-        s.test_register_service(ServiceSpec::new(dup), t),
-        Err(mdns_proto::error::RegisterServiceError::NameAlreadyRegistered(_))
-      ),
-      "A's OLD name must be held by the in-flight withdrawal (NameAlreadyRegistered)"
-    );
-  }
-
-  // The collision Conflict lives in the handle-owned mailbox; the ctx GC is now
-  // UNCONDITIONAL, so it need not be drained first.
-
-  // Drive A's withdrawal to completion (no sockets → force-finished at the 2 s
-  // anti-pin ceiling), then GC the freed ctx.
+  // ASSERTION 1: the old name's goodbye is already an enqueued withdrawal item,
+  // due now, and no driver step put it there.
   let mut scratch = vec![0u8; 4096];
-  let mut completed = false;
-  for _ in 0..64 {
-    t += Duration::from_millis(250);
-    while let Some(round) = s.poll_one_withdrawal(t, &mut scratch) {
-      // No sockets bound in this State-level test: model BOTH families as
-      // transiently undeliverable (Retry) so the per-family budget stays intact
-      // and the withdrawal force-completes at its 2 s anti-pin ceiling — exactly
-      // the pre-fix "not delivered" behaviour. (WriteOff would complete it at once
-      // instead, defeating the ceiling assertion.)
-      s.note_withdrawal_result(
-        round.token(),
-        t,
-        FamilyAttempt::Refused { permanent: false },
-        FamilyAttempt::Refused { permanent: false },
-      );
-    }
-    s.drain_completed_withdrawals(t);
-    if !s.services.contains_key(&handle_a) {
-      completed = true;
-      break;
-    }
-  }
-  assert!(completed, "A's rename-collision withdrawal must complete");
+  assert!(
+    s.poll_one_withdrawal(t, &mut scratch).is_some(),
+    "the renamed-away name's §10.1 goodbye must already be enqueued and due"
+  );
 
-  // ASSERTION 2: once the withdrawal completes, A's OLD name is freed → a
-  // replacement R registers successfully under it.
+  // ASSERTION 3: a SURVIVING rename's old name is RECLAIMABLE — the service is
+  // alive under a new name, so a fresh registration of the vacated one supersedes
+  // the goodbye instead of being blocked by it.
   let host_r = Name::try_from_str("replacement.local.").unwrap();
   let mut recs_r = ServiceRecords::new(stype, inst_a, host_r, 80, 120);
   recs_r.add_a([192, 168, 1, 10].into());
   s.test_register_service(ServiceSpec::new(recs_r), t)
-    .expect("replacement R must register under A's old name once the withdrawal completes");
+    .expect("a surviving rename leaves its old name reclaimable");
 }
 
-/// a terminal emitted DIRECTLY by the proto state machine —
-/// here a `HostConflict` (a peer claimed our host name with a different address,
-/// RFC 6762 §9) — must RETIRE the service through the SAME path as a synthesized
-/// rename-collision Conflict: deliver the terminal into the handle-owned mailbox,
-/// begin the endpoint-owned §10.1 withdrawal (so the proto stops serving), and GC
-/// the ctx UNCONDITIONALLY once the withdrawal completes. Before the fix a
-/// proto-emitted terminal was only pushed into the mailbox: `errored` was never
-/// set and the withdrawal never began, so `Service::next` reported end-of-stream
-/// while the ctx/route stayed live (still answering queries) until the handle
-/// dropped.
+/// A terminal emitted by the service state machine — here a `HostConflict` (a
+/// peer claimed our host name with a different address, RFC 6762 §9) — must
+/// RETIRE the service through the SAME path as an encode-failure escalation:
+/// deliver the terminal into the handle-owned mailbox, begin the endpoint-owned
+/// §10.1 withdrawal (so the service stops serving), and GC the ctx
+/// UNCONDITIONALLY once the withdrawal completes. Before the fix a terminal was
+/// only pushed into the mailbox: `errored` was never set and the withdrawal never
+/// began, so `Service::next` reported end-of-stream while the ctx/route stayed
+/// live (still answering queries) until the handle dropped.
 #[test]
 fn proto_emitted_host_conflict_retires_and_gcs_the_service() {
   use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -3353,9 +3269,8 @@ fn a_query_ended_past_its_deadline_wakes_the_next_parked_on_it() {
       inner.notify.notify();
     }
     assert!(
-      s.services[&svc]
-        .proto
-        .poll_timeout()
+      s.endpoint
+        .poll_service_timeout(svc)
         .is_some_and(|at| at > t_past),
       "premise: the earlier producer's own next tick is its §8.3 re-announcement, \
        far beyond this window — it cannot stand in for the wake the query owes"
@@ -3745,27 +3660,25 @@ fn normal_non_truncated_datagram_routes_to_proto() {
 /// Loop-ordering guard (endpoint-owned-withdrawal form): the withdrawal
 /// pump (`drain_withdrawals`) MUST run AFTER `push_service_updates`, not before.
 ///
-/// When a rename collision is detected inside `push_service_updates`, the
-/// teardown enqueues the old name's detached goodbye
-/// (`enqueue_rename_withdrawal`) AND begins an endpoint-owned withdrawal for the
-/// current name (`begin_service_withdrawal`), each due IMMEDIATELY
-/// (`next_at = now`).
-/// Under the wrong order —
-/// withdrawal pump first, then `push_service_updates` — the pump would run
-/// before the withdrawal exists, deferring its first goodbye to the NEXT
-/// iteration (whose Phase-1 transmit pump runs first). The endpoint holds the
-/// OLD name throughout, so a replacement still cannot overtake the goodbye, but
-/// running the pump after push keeps the stale TTL=0 promptly on the wire.
+/// A TERMINAL update drained by `push_service_updates` — here RFC 6762 §9's
+/// `HostConflict`, which the state machine never auto-resolves — retires the
+/// service through `begin_service_withdrawal`, whose first goodbye round is due
+/// IMMEDIATELY (`next_at = now`). Under the wrong order — withdrawal pump first,
+/// then `push_service_updates` — the pump would run before the withdrawal
+/// exists, deferring its first goodbye to the NEXT iteration (whose Phase-1
+/// transmit pump runs first). The endpoint holds the name throughout, so a
+/// replacement still cannot overtake the goodbye, but running the pump after
+/// push keeps the stale TTL=0 promptly on the wire.
 ///
-/// This test proves the ordering at the State seam by stopping the drive loop
-/// on the decisive (collision) iteration and probing whether a withdrawal
-/// datagram is DUE before vs after `push_service_updates`. `poll_one_withdrawal`
-/// is non-destructive to the resend schedule (it only encodes into scratch;
+/// This test proves the ordering at the State seam by stopping the drive loop on
+/// the decisive (terminal) iteration and probing whether a withdrawal datagram is
+/// DUE before vs after `push_service_updates`. `poll_one_withdrawal` is
+/// non-destructive to the resend schedule (it only encodes into scratch;
 /// `next_at` advances only in `note_withdrawal_result`, which we do NOT call
 /// here), so before/after probes are side-effect-free:
 ///
 ///   before push: no withdrawal exists yet → `poll_one_withdrawal` == None.
-///   after push: the collision withdrawal is queued, first round due now →
+///   after push: the terminal's withdrawal is queued, first round due now →
 ///                `poll_one_withdrawal` == Some (the pump would drain it this
 ///                iteration).
 #[cfg(feature = "stats")]
@@ -3781,49 +3694,21 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     wire::{Header, MessageBuilder},
   };
 
-  // A QR=1 RESPONSE claiming our instance name with different SRV rdata: the
-  // RFC 6762 §9 conflict signal, which is what reverts an ESTABLISHED service
-  // to probing and eventually renames it. §9 is explicit that a response is
-  // what does this — "it receives a Multicast DNS response message containing a
-  // record with the same name, rrtype and rrclass, but inconsistent rdata" — so
-  // the same rdata in the Authority section of a peer's QUERY would not, and
-  // must not: that peer is merely probing, and the answer to a probe for a name
-  // we own is to defend it.
-  fn conflict_for(instance: &str) -> Vec<u8> {
-    let mut buf = [0u8; 512];
-    let name = Name::try_from_str(instance).unwrap();
-    let target = Name::try_from_str("rival.local.").unwrap();
-    let mut header = Header::new();
-    header.flags_mut().set_response();
-    let mut b = MessageBuilder::<'_, 32>::try_new(&mut buf, header).unwrap();
-    b.push_srv_answer(&name, 120, 0, 0, 9999, &target, true)
-      .unwrap();
-    let n = b.finish().unwrap();
-    buf[..n].to_vec()
-  }
-
   let mut s = State::new(mdns_proto::EndpointConfig::default(), 1500, 9000);
   s.local_subnets = vec![(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)), 24)];
   s.bound_interface = 1;
 
   let now = std::time::Instant::now();
 
-  // Service A: will be announced then driven to rename-collision.
+  // The service under test: announced, then retired by a §9 HOST conflict, which
+  // is terminal because a host name has no auto-rename.
   let stype = Name::try_from_str("_ipp._tcp.local.").unwrap();
-  let inst_a = Name::try_from_str("Alpha._ipp._tcp.local.").unwrap();
-  let host_a = Name::try_from_str("alpha.local.").unwrap();
-  let mut recs_a = ServiceRecords::new(stype.clone(), inst_a.clone(), host_a, 80, 120);
-  recs_a.add_a([192, 168, 1, 1].into());
-  let handle_a = s
-    .test_register_service(ServiceSpec::new(recs_a), now)
-    .unwrap();
-
-  // Service B: already owns the name A will try to rename into.
-  let inst_b = Name::try_from_str("Alpha-1._ipp._tcp.local.").unwrap();
-  let host_b = Name::try_from_str("beta.local.").unwrap();
-  let mut recs_b = ServiceRecords::new(stype, inst_b, host_b, 80, 120);
-  recs_b.add_a([192, 168, 1, 2].into());
-  s.test_register_service(ServiceSpec::new(recs_b), now)
+  let inst = Name::try_from_str("Alpha._ipp._tcp.local.").unwrap();
+  let host = Name::try_from_str("alpha.local.").unwrap();
+  let mut recs = ServiceRecords::new(stype, inst, host.clone(), 80, 120);
+  recs.add_a([192, 168, 1, 1].into());
+  let handle = s
+    .test_register_service(ServiceSpec::new(recs), now)
     .unwrap();
 
   fn pump_transmits(s: &mut State, t: StdInstant, buf: &mut [u8]) {
@@ -3848,35 +3733,44 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     s.poll_one_withdrawal(t, scratch).is_some()
   }
 
-  // Advance A to Established so the proto hands off an old-name goodbye on
-  // rename (only an ANNOUNCED service has one).
-  let a_mailbox = Rc::clone(&s.services.get(&handle_a).unwrap().mailbox);
+  // Advance to Established so the retirement has a non-empty snapshot and its
+  // goodbye is a real datagram rather than an item that completes at once.
+  let mailbox = Rc::clone(&s.services.get(&handle).unwrap().mailbox);
   let mut buf = [0u8; 1500];
   let mut t = now;
-  let mut a_established = false;
+  let mut established = false;
   for _ in 0..60 {
     t += Duration::from_millis(300);
     s.fire_timeouts(t);
     pump_transmits(&mut s, t, &mut buf);
     s.push_service_updates(t);
-    // Drain the handle-owned mailbox; detect Established and discard the rest.
-    while let Some(u) = a_mailbox.borrow_mut().drain_for_test() {
+    while let Some(u) = mailbox.borrow_mut().drain_for_test() {
       if matches!(u, ServiceUpdate::Established) {
-        a_established = true;
+        established = true;
       }
     }
-    if a_established {
+    if established {
       break;
     }
   }
   assert!(
-    a_established,
-    "A must reach Established before the ordering test can verify the goodbye timing"
+    established,
+    "the service must reach Established before the ordering test can verify the goodbye timing"
   );
 
-  // Inject peer conflicts. On the decisive iteration (the one that WILL collide
-  // A with B), probe withdrawal-due BEFORE and AFTER push_service_updates.
-  let conflict = conflict_for("Alpha._ipp._tcp.local.");
+  // A peer claims our HOST name with a different address in an authoritative
+  // RESPONSE: §9's conflict, and terminal because `Endpoint` has no auto-rename
+  // for a host name.
+  let conflict = {
+    let mut cbuf = [0u8; 512];
+    let mut header = Header::new();
+    header.flags_mut().set_response();
+    let mut b = MessageBuilder::<'_, 32>::try_new(&mut cbuf, header).unwrap();
+    b.push_a_answer(&host, 120, Ipv4Addr::new(10, 0, 0, 99), true)
+      .unwrap();
+    let n = b.finish().unwrap();
+    cbuf[..n].to_vec()
+  };
   let peer = RecvMeta::new(
     SocketAddr::from(([192, 168, 1, 200], 5353)),
     IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)),
@@ -3902,36 +3796,31 @@ fn withdrawal_pump_runs_after_push_service_updates_loop_order() {
     // Probe AFTER push_service_updates (correct-order pump position).
     let after = withdrawal_due(&mut s, t, &mut scratch);
 
-    if s
-      .services
-      .get(&handle_a)
-      .map(|c| c.errored)
-      .unwrap_or(false)
-    {
+    if s.services.get(&handle).map(|c| c.errored).unwrap_or(false) {
       decisive_before = Some(before);
       decisive_after = Some(after);
       break;
     }
   }
 
-  let before = decisive_before
-    .expect("A must be driven to rename-collision-Conflict within the iteration limit");
+  let before =
+    decisive_before.expect("the service must be driven to a terminal within the iteration limit");
   let after = decisive_after.unwrap();
 
-  // CORE ORDERING ASSERTION: the collision withdrawal is begun BY
-  // push_service_updates. Before push no withdrawal is due (would have drained
-  // nothing); after push its first goodbye round is due, so the pump (which runs
-  // after push) flushes it this iteration.
+  // CORE ORDERING ASSERTION: the terminal's withdrawal is begun BY
+  // push_service_updates. Before push no withdrawal is due (the pump would have
+  // drained nothing); after push its first goodbye round is due, so the pump
+  // (which runs after push) flushes it this iteration.
   assert!(
     after,
     "a withdrawal datagram must be DUE after push_service_updates begins the \
-       rename-collision withdrawal (so the post-push withdrawal pump drains it this \
+       terminal's withdrawal (so the post-push withdrawal pump drains it this \
        iteration)"
   );
   assert!(
     !before,
     "no withdrawal must be due BEFORE push_service_updates on the decisive \
-       iteration (the collision withdrawal is begun by push, not by a prior sweep)"
+       iteration (the withdrawal is begun by push, not by a prior sweep)"
   );
 }
 
@@ -4093,18 +3982,18 @@ fn a_partial_fan_out_latches_ownership_without_advancing_the_phase() {
   );
 
   assert_eq!(
-    s.services[&h].proto.state(),
+    s.endpoint.service(h).unwrap().state(),
     ServiceState::Announcing(0),
     "a partial announcement must re-arm the SAME announcement — the unserved \
      family never heard it"
   );
   assert!(
-    s.services[&h].proto.advertises_instance(),
+    s.endpoint.service(h).unwrap().advertises_instance(),
     "the served family's peers may now cache these records, so §10.1 goodbye \
      ownership must latch on the PARTIAL round"
   );
   assert!(
-    !s.services[&h].proto.has_fully_announced().get(),
+    !s.endpoint.service(h).unwrap().has_fully_announced().get(),
     "a partial announcement must NOT open the reclaim-cancel gate"
   );
 
@@ -4144,16 +4033,16 @@ fn a_fully_delivered_fan_out_latches_ownership_and_advances_the_phase() {
   );
 
   assert_eq!(
-    s.services[&h].proto.state(),
+    s.endpoint.service(h).unwrap().state(),
     ServiceState::Announcing(1),
     "an all-delivered announcement advances the §8.3 sequence"
   );
   assert!(
-    s.services[&h].proto.advertises_instance(),
+    s.endpoint.service(h).unwrap().advertises_instance(),
     "a delivered announcement latches goodbye ownership"
   );
   assert!(
-    s.services[&h].proto.has_fully_announced().get(),
+    s.endpoint.service(h).unwrap().has_fully_announced().get(),
     "a complete announcement is the ONLY thing that opens the reclaim-cancel gate"
   );
 }
@@ -4183,12 +4072,12 @@ fn a_wholly_failed_fan_out_neither_latches_nor_advances() {
   );
 
   assert_eq!(
-    s.services[&h].proto.state(),
+    s.endpoint.service(h).unwrap().state(),
     ServiceState::Announcing(0),
     "a wholly-failed announcement must re-arm without advancing"
   );
   assert!(
-    !s.services[&h].proto.advertises_instance(),
+    !s.endpoint.service(h).unwrap().advertises_instance(),
     "nothing reached a wire, so no peer can hold these records and no goodbye \
      ownership may latch"
   );
@@ -4240,7 +4129,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     confirm_service_round(&mut s, handle, t, &mut buf, whole_fanout(t));
   }
   assert!(
-    s.services[&handle].proto.advertises_instance(),
+    s.endpoint.service(handle).unwrap().advertises_instance(),
     "Old must announce before the rename (so the goodbye is non-empty)"
   );
 
@@ -4276,9 +4165,9 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
     confirm_service_round(&mut s, handle, t, &mut buf, whole_fanout(t));
     s.push_service_updates(t);
     if s
-      .services
-      .get(&handle)
-      .map(|c| c.proto.name().as_str() != old_inst.as_str())
+      .endpoint
+      .service(handle)
+      .map(|svc| svc.name().as_str() != old_inst.as_str())
       .unwrap_or(true)
     {
       renamed = true;
@@ -4313,12 +4202,12 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   for _ in 0..12 {
     t += Duration::from_millis(300);
     confirm_service_round(&mut s, rh, t, &mut buf, whole_fanout(t));
-    if s.services[&rh].proto.state() == ServiceState::Announcing(0) {
+    if s.endpoint.service(rh).unwrap().state() == ServiceState::Announcing(0) {
       break;
     }
   }
   assert_eq!(
-    s.services[&rh].proto.state(),
+    s.endpoint.service(rh).unwrap().state(),
     ServiceState::Announcing(0),
     "the replacement must reach its first announcement"
   );
@@ -4328,7 +4217,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   t += Duration::from_millis(300);
   confirm_service_round(&mut s, rh, t, &mut buf, partial_fanout(t));
   assert!(
-    !s.services[&rh].proto.has_fully_announced().get(),
+    !s.endpoint.service(rh).unwrap().has_fully_announced().get(),
     "a partial announcement must leave the reclaim-cancel gate shut"
   );
   assert!(
@@ -4343,7 +4232,7 @@ fn a_surviving_rename_retracts_its_old_name_on_both_families() {
   t += Duration::from_secs(2);
   confirm_service_round(&mut s, rh, t, &mut buf, whole_fanout(t));
   assert!(
-    s.services[&rh].proto.has_fully_announced().get(),
+    s.endpoint.service(rh).unwrap().has_fully_announced().get(),
     "the replacement must have fully announced by now"
   );
   assert!(
@@ -4490,12 +4379,11 @@ fn a_surviving_rename_supersedes_the_credits_recorded_before_it() {
     .expect("a survived rename keeps its ctx");
   assert!(
     !ctx.errored,
-    "this must be the SURVIVING path: a rename COLLISION is retired through \
-     `begin_service_withdrawal`, which supersedes for its own reason and would \
-     prove nothing about the rename"
+    "this must be the SURVIVING path: a retirement supersedes for its own reason \
+     and would prove nothing about the rename"
   );
   assert_ne!(
-    ctx.proto.name().as_str(),
+    s.endpoint.service(handle).unwrap().name().as_str(),
     old_inst.as_str(),
     "the survivor must hold the NEW instance name"
   );
@@ -5488,7 +5376,7 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
   // The lifecycle reaches no wire at all, so nothing it sends can latch.
   confirm_service_round(&mut s, h, now, &mut buf, failed_fanout());
   assert!(
-    !s.services[&h].proto.advertises_instance(),
+    !s.endpoint.service(h).unwrap().advertises_instance(),
     "a wholly-failed announcement exposes nothing"
   );
 
@@ -5502,12 +5390,12 @@ fn a_one_shot_confirm_still_latches_goodbye_ownership() {
     "only the legacy reply is due this early"
   );
   assert!(
-    s.services[&h].proto.advertises_instance(),
+    s.endpoint.service(h).unwrap().advertises_instance(),
     "the reply put positive-TTL records on a wire, so §10.1 ownership latches — \
      the confirm reaches the core unchanged, it just skips the bound"
   );
   assert!(
-    !s.services[&h].proto.has_fully_announced().get(),
+    !s.endpoint.service(h).unwrap().has_fully_announced().get(),
     "an all-delivered UNICAST reply is still not a complete announcement"
   );
 }
@@ -5578,13 +5466,17 @@ fn a_question_drawn_past_the_callers_window_is_withheld_inside_the_pump() {
     .test_register_service(delivery_test_spec("earlier"), t0)
     .unwrap();
   for _ in 0..8 {
-    let ctx = s.services.get_mut(&svc).unwrap();
-    if ctx.proto.poll_timeout().is_none_or(|at| at > t0) {
+    if s
+      .endpoint
+      .poll_service_timeout(svc)
+      .is_none_or(|at| at > t0)
+    {
       break;
     }
-    let _ = ctx.proto.handle_timeout(t0);
-    while let Ok(Some(_)) = ctx.proto.poll_transmit(t0, &mut buf) {
-      let _ = ctx.proto.note_transmit_outcome(
+    let _ = s.endpoint.handle_service_timeout(svc, t0);
+    while let Ok(Some(_)) = s.endpoint.poll_service_transmit(svc, t0, &mut buf) {
+      let _ = s.endpoint.note_service_transmit_outcome(
+        svc,
         t0,
         FamilyAttempt::Accepted { at: t0 },
         FamilyAttempt::Accepted { at: t0 },
@@ -5607,9 +5499,8 @@ fn a_question_drawn_past_the_callers_window_is_withheld_inside_the_pump() {
     .poll_query_timeout(qh)
     .expect("a query given a window publishes its absolute deadline");
   assert!(
-    s.services[&svc]
-      .proto
-      .poll_timeout()
+    s.endpoint
+      .poll_service_timeout(svc)
       .is_some_and(|at| at > deadline),
     "premise: the earlier producer must have nothing due inside the caller's \
      window, or the pump would return ITS datagram and never reach the query"
@@ -5749,9 +5640,13 @@ fn a_permanently_oversized_sustained_datagram_retires_its_producer() {
     now = t0
       .checked_add(Duration::from_millis(u64::from(step) * 100))
       .unwrap();
-    let ctx = s.services.get_mut(&h).unwrap();
-    ctx.proto.handle_timeout(now).unwrap();
-    if ctx.proto.poll_transmit(now, &mut buf).unwrap().is_some() {
+    s.endpoint.handle_service_timeout(h, now).unwrap();
+    if s
+      .endpoint
+      .poll_service_transmit(h, now, &mut buf)
+      .unwrap()
+      .is_some()
+    {
       drawn = true;
       break;
     }

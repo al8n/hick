@@ -13,6 +13,8 @@ mod tests;
 
 mod admits;
 pub(crate) use admits::{Admits, Answering};
+pub(crate) mod flood;
+pub(crate) use flood::ConflictFlood;
 mod matching;
 pub(crate) use matching::*;
 mod route;
@@ -36,17 +38,16 @@ use crate::{
   cache::{Cache, CacheEntry},
   config::{EndpointConfig, QuerySpec, ServiceSpec},
   error::{
-    CancelQueryError, HandleError, HandleServiceRenamedError, HandleTimeoutError,
-    RegisterServiceError, ServiceTypeNotParentDetail, StartQueryError, StorageFullError,
-    TransmitError,
+    CancelQueryError, HandleError, HandleTimeoutError, RegisterServiceError,
+    ServiceTypeNotParentDetail, StartQueryError, StorageFullError, TransmitError,
   },
   event::{
     ConflictHistory, ConflictOrigin, ConflictRole, EndpointEvent, HostConflict, KnownAnswer,
     ProbeConflict, ProbeProposal, QueryEvent, QueryUpdate, RouteEvent, ServiceEvent,
-    ServiceQuestion, ToQuery, ToService,
+    ServiceQuestion, ServiceUpdate, ToQuery,
   },
   query::{CollectedAnswer, Query},
-  service::{FullyAnnounced, Service},
+  service::{NamesInUse, Service},
   trace::*,
   transmit::{FamilyAttempt, Transmit, TransmitConfirm},
   wire::{MessageReader, NameRef, QuestionRef, ResourceClass, ResourceType},
@@ -188,7 +189,7 @@ cfg_heap! {
   ///
   /// # Why an opaque token works here
   ///
-  /// Same shape as [`FullyAnnounced`]: `Copy`, no
+  /// Same shape as [`FullyAnnounced`](crate::FullyAnnounced): `Copy`, no
   /// public constructor, accessors only. A driver reads one; a driver cannot mint
   /// one. That is sound HERE — and not for a send outcome — because outstanding
   /// debt is a fact the **core** owns and spends. A driver has nothing to
@@ -330,10 +331,9 @@ cfg_heap! {
   ///     when it settles it is simply removed, reported to NOBODY.
   ///
   /// Stored as a parallel `Vec` rather than inline on [`ServiceRoute`] because
-  /// `ServiceRoute` has no generic parameter: it is a public struct used by
-  /// every downstream crate as `Pool<ServiceRoute>`, and adding `I` would
-  /// require updating every type alias / `Slab<ServiceRoute>` declaration
-  /// across the whole workspace — including external users.
+  /// the relationship is not one-to-one: a teardown DURING a rename owes TWO
+  /// goodbyes (a route-attached current-name one and a detached old-name one),
+  /// and a detached item outlives — indeed never has — a route at all.
   struct WithdrawalItem<I> {
     /// The service records (names, port, TXT) for this name's goodbye sends.
     // Read by `poll_withdrawal_transmit`.
@@ -348,7 +348,7 @@ cfg_heap! {
     /// It starts as the exposure exactly and only ever NARROWS: a reclaimable
     /// detached item is trimmed to the shared records a same-name replacement's
     /// announcement cannot supersede (see
-    /// [`Endpoint::note_service_announced`]). Narrowing is the safe direction
+    /// [`Endpoint::note_service_transmit_outcome`]). Narrowing is the safe direction
     /// for both readers — a goodbye retracts less, and the relinquished screen
     /// disowns less — while widening it past what was emitted is what
     /// `EmittedRecords` exists to prevent.
@@ -372,7 +372,7 @@ cfg_heap! {
     /// strength of bytes no multicast socket ever carried.
     ///
     /// It narrows exactly where `owned` does (see
-    /// [`Endpoint::note_service_announced`]), so it is a subset of `owned` at
+    /// [`Endpoint::note_service_transmit_outcome`]), so it is a subset of `owned` at
     /// every instant.
     #[allow(dead_code)]
     multicast: [crate::service::EmittedRecords; 2],
@@ -425,23 +425,44 @@ cfg_heap! {
     ///
     /// `false` (the default) is a SURVIVING rename's old name: reclaimable, so a
     /// fresh registration of the vacated name cancels the goodbye rather than being
-    /// blocked. `true` is a rename-COLLISION teardown's old
-    /// name: the service is DEAD, so its stale records must be retracted BEFORE the
-    /// name is reused; without the hold, the empty route-attached current-name
-    /// withdrawal completes first and a quick re-register cancels the only real
-    /// goodbye, leaving peers with stale PTR/SRV/TXT until TTL. A held name is
-    /// rejected by BOTH reuse paths — `try_register_service` and
-    /// `handle_service_renamed` — and is never cancelled by
-    /// [`Endpoint::note_service_announced`], so the dead service's goodbye always
-    /// drains before the name can be claimed again.
+    /// blocked. `true` is a rename that could not MOVE — the suffixed candidate
+    /// was not a valid DNS name, so the service went terminal under the name it
+    /// already had: the service is DEAD, so its stale records must be retracted
+    /// BEFORE the name is reused; without the hold, the empty route-attached
+    /// current-name withdrawal completes first and a quick re-register cancels
+    /// the only real goodbye, leaving peers with stale PTR/SRV/TXT until TTL. A
+    /// held name is rejected by BOTH reuse paths — `try_register_service` and a
+    /// rename's own name search — and is never cancelled by
+    /// [`Endpoint::note_service_transmit_outcome`], so the dead service's
+    /// goodbye always drains before the name can be claimed again.
     #[allow(dead_code)]
     holds_name: bool,
   }
 }
 
-/// Routing metadata for a registered service.
-#[derive(Debug, Clone)]
-pub struct ServiceRoute {
+/// Routing metadata for a registered service, and the [`Service`] state machine
+/// it routes to.
+///
+/// # Why the state machine lives HERE
+///
+/// It used to be the caller's: `try_register_service` handed a `Service` back
+/// and the driver drove it, while the `Endpoint` kept only the routing metadata.
+/// That split put a caller between routing and classification, and three
+/// separate defects came out of it — RFC 6762 §8.1's flood limit could not be
+/// counted for the host because no single owner saw every conflict; a rename
+/// mutated the service's records before the route table could object, so every
+/// driver carried its own collision reconciliation; and the instant a conflict
+/// was RECEIVED was not the instant it was classified at.
+///
+/// Holding the `Service` here makes routing, classification, the flood history,
+/// the receipt instant and the schedule one state machine under one `&mut self`
+/// and one `now`. It is the same shape [`Query`] has always had, driven through
+/// the same kind of handle-addressed accessors on [`Endpoint`].
+pub struct ServiceRoute<I, TQ, EvS> {
+  /// The service state machine this route addresses. Driven ONLY through the
+  /// `*_service*` accessors on [`Endpoint`]; [`Endpoint::service`] hands out a
+  /// read-only view.
+  pub(crate) proto: Service<I, TQ, EvS>,
   /// DNS-SD service-type PTR owner (e.g. `_ipp._tcp.local.`).
   service_type: Name,
   /// Instance name (e.g. `MyPrinter._ipp._tcp.local.`).
@@ -474,7 +495,7 @@ pub struct ServiceRoute {
   /// wire — the subset of `a_addrs` a peer truly holds in its cache.  EMPTY at
   /// registration (a never-announced service has advertised nothing); the
   /// driver mirrors the live `Service::advertised_a_addrs` set here via
-  /// [`Endpoint::note_service_announced`] after each confirmed announce.  This
+  /// [`Endpoint::note_service_transmit_outcome`] after each confirmed announce.  This
   /// (NOT the configured `a_addrs`) is what `sibling_retained_addrs` honours so
   /// a withdrawing service only retains addresses a LIVE same-host sibling
   /// genuinely owns in peer caches.
@@ -485,15 +506,35 @@ pub struct ServiceRoute {
   #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
   advertised_aaaa: std::vec::Vec<Ipv6Addr>,
   /// `true` once [`Endpoint::begin_withdrawal`] has been called for this
-  /// service.  The route is kept alive (name guard + dispatch) until the
-  /// goodbye sequence completes; this flag lets downstream code distinguish a
-  /// live service from one that is in the process of being torn down.
-  // Read by `poll_timeout` dispatch skip.
+  /// service.  The route is kept alive (name guard) until the goodbye sequence
+  /// completes, so this is what tells a live service from one being torn down.
+  ///
+  /// AUTHORITATIVE, set once and never cleared. Every inbound fan-out in
+  /// [`RouteEvents`] skips a route wearing it, and so does every mutating
+  /// `*_service*` accessor on [`Endpoint`] bar the confirm — see
+  /// [`Endpoint::unregister_service`], which lists them and says why that one
+  /// is the exception.
+  // Always present so those reads need no cfg of their own; only the heap
+  // builds have a withdrawal lifecycle to set it.
   #[allow(dead_code)]
   withdrawing: bool,
 }
 
-impl ServiceRoute {
+impl<I, TQ, EvS> core::fmt::Debug for ServiceRoute<I, TQ, EvS> {
+  /// The ROUTING metadata only. The state machine is driven through
+  /// [`Endpoint`] and has no `Debug` of its own; a route's identifying facts are
+  /// its names and its handle.
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("ServiceRoute")
+      .field("handle", &self.handle)
+      .field("service_type", &self.service_type)
+      .field("name", &self.name)
+      .field("host", &self.host)
+      .finish_non_exhaustive()
+  }
+}
+
+impl<I, TQ, EvS> ServiceRoute<I, TQ, EvS> {
   /// The DNS-SD service-type (PTR owner), e.g. `_ipp._tcp.local.`.
   #[inline(always)]
   pub fn service_type(&self) -> &Name {
@@ -543,7 +584,7 @@ impl ServiceRoute {
     /// IPv4 host addresses this service has CONFIRMED-ADVERTISED on the wire.
     /// Distinct from [`Self::a_addrs`] (the configured set used for self-/
     /// loopback detection): this is the subset peers actually hold in cache, kept
-    /// current by [`Endpoint::note_service_announced`] and consumed by
+    /// current by [`Endpoint::note_service_transmit_outcome`] and consumed by
     /// sibling host-address retention during withdrawal.
     #[inline(always)]
     pub(crate) fn advertised_a(&self) -> &[Ipv4Addr] {
@@ -559,6 +600,84 @@ impl ServiceRoute {
   }
 }
 
+cfg_heap! {
+  /// Test-only: one [`ServiceEvent`] the router DISPATCHED, flattened into owned
+  /// facts.
+  ///
+  /// A service event never leaves the endpoint, so a routing test cannot observe
+  /// one by iterating [`RouteEvents`] any more. It reads this instead: the
+  /// routing decision itself — which service, which kind of event, and the few
+  /// labels the fan-out attaches — recorded at the moment of dispatch, which is
+  /// the same moment the old `RouteEvent::ToService` was constructed.
+  ///
+  /// Owned rather than borrowed because it outlives the datagram's reader, and
+  /// flattened rather than storing the event because `ServiceEvent` borrows the
+  /// datagram. It does not exist in a shipped build.
+  ///
+  /// The whole cluster — this record, its kind, its accessors, the endpoint field
+  /// that holds them and the push site in `route.rs` — is gated to match
+  /// `endpoint/tests.rs`, its only reader, whose `mod tests;` declaration carries
+  /// this same predicate. A bare `cfg(test)` left the log compiled and recorded,
+  /// and never read, in any `test` build without `std` + `slab`.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
+  #[derive(Debug, Clone)]
+  pub(crate) struct Dispatched {
+    handle: ServiceHandle,
+    kind: DispatchedKind,
+    history: Option<ConflictHistory>,
+  }
+
+  /// Test-only: which [`ServiceEvent`] a [`Dispatched`] record describes. Gated
+  /// with it.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
+  #[derive(Debug, Clone, Copy, Eq, PartialEq, derive_more::IsVariant)]
+  pub(crate) enum DispatchedKind {
+    Question,
+    KnownAnswer,
+    ProbeConflict,
+    HostConflict,
+    ProbeProposal,
+  }
+
+  #[cfg(all(test, feature = "std", feature = "slab"))]
+  impl Dispatched {
+    /// Flatten one event at the instant it is dispatched.
+    fn new(handle: ServiceHandle, event: &ServiceEvent<'_>) -> Self {
+      let (kind, history) = match event {
+        ServiceEvent::Question(_) => (DispatchedKind::Question, None),
+        ServiceEvent::KnownAnswer(_) => (DispatchedKind::KnownAnswer, None),
+        ServiceEvent::ProbeConflict(pc) => (DispatchedKind::ProbeConflict, Some(pc.history())),
+        ServiceEvent::HostConflict(_) => (DispatchedKind::HostConflict, None),
+        ServiceEvent::ProbeProposal(_) => (DispatchedKind::ProbeProposal, None),
+      };
+      Self {
+        handle,
+        kind,
+        history,
+      }
+    }
+
+    /// The service this event was addressed to.
+    pub(crate) const fn handle(&self) -> ServiceHandle {
+      self.handle
+    }
+
+    /// Which event it was. Named `event` because that is the question a routing
+    /// test asks of a dispatch, and the answer is the whole of what a
+    /// `ServiceEvent` was ever inspected for out here.
+    pub(crate) const fn event(&self) -> DispatchedKind {
+      self.kind
+    }
+
+    /// The RFC 6762 §9 relinquished-history label a conflict carried.
+    pub(crate) const fn history(&self) -> Option<ConflictHistory> {
+      self.history
+    }
+
+
+  }
+}
+
 /// Internal queued endpoint event.
 #[derive(Debug, Clone)]
 pub struct EndpointEventEntry(EndpointEvent);
@@ -571,12 +690,33 @@ impl EndpointEventEntry {
   }
 }
 
-/// The orchestrator. Holds routing metadata + cache + per-handle state
-/// machines for Service (caller-driven) and Query (Endpoint-owned).
+/// The orchestrator. Holds routing metadata + cache + the per-handle state
+/// machines for Service and Query, both Endpoint-owned.
 ///
-/// The `Query` state machines live in the `QS` pool — callers receive only
-/// a `QueryHandle` from [`Self::try_start_query`] and drive each query via
-/// the `*_query*` accessors on `Endpoint`.
+/// The `Query` state machines live in the `QS` pool and the `Service` state
+/// machines inside the [`ServiceRoute`]s of the `SR` pool — callers receive only
+/// a [`QueryHandle`] from [`Self::try_start_query`] or a [`ServiceHandle`] from
+/// [`Self::try_register_service`], and drive each through the `*_query*` /
+/// `*_service*` accessors on `Endpoint`.
+///
+/// # RFC 6762 §8.1's conflict-flood limit
+///
+/// > If fifteen conflicts occur within any ten-second period, then the host MUST
+/// > wait at least five seconds before each successive additional probe attempt.
+///
+/// That limit is enforced INSIDE this type and asks nothing of a driver beyond
+/// what every sans-I/O method here already requires: each received datagram
+/// reaches [`Self::handle`] with a monotonic `now` taken at receipt,
+/// [`Self::handle_service_timeout`] runs by the instant
+/// [`Self::poll_service_timeout`] reports, and probes leave the host only
+/// through [`Self::poll_service_transmit`]. Within that contract the limit is
+/// EXACT, not best-effort.
+///
+/// It is ENDPOINT-WIDE: it aggregates across every record set this endpoint
+/// routes for, outlives any one service, and floors a fresh registration's first
+/// probe. A second `Endpoint`, or a second process, on the same machine is
+/// outside anything this library can observe, and that is the only sense in
+/// which RFC 6762's "host" is approximated.
 ///
 /// # Query lifecycle and cleanup
 ///
@@ -596,7 +736,7 @@ impl EndpointEventEntry {
 ///
 /// Failing to clean up exhausts a fixed-capacity `QS` pool just as the
 /// leak would have, so this contract must be honoured.
-pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
+pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS> {
   config: EndpointConfig,
   rng: R,
   services: SR,
@@ -613,15 +753,43 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   /// only ever compared for equality between conflicts buffered inside one
   /// probe round, and 2^64 datagrams cannot arrive within one.
   datagram_seq: u64,
+  /// RFC 6762 §8.1's fifteen-in-ten conflict history for this whole endpoint.
+  ///
+  /// Plain fields under the `&mut self` routing already holds — see
+  /// [`ConflictFlood`]. Written by the service dispatch inside
+  /// [`RouteEvents::next`], at the RECEIPT instant and after classification;
+  /// read by every point that schedules a probe sequence.
+  flood: ConflictFlood<I>,
+  /// Test-only: how many times the relinquished-history screen was actually RUN,
+  /// as opposed to answered from `RouteEvents`' per-record cache. The bound that
+  /// cache exists for is a statement about work done, so it is asserted on
+  /// directly rather than inferred from a wall clock. `cfg(test)`: absent from a
+  /// shipped build.
+  #[cfg(test)]
+  pub(crate) history_screens: usize,
+  /// Test-only: every [`ServiceEvent`] this endpoint has dispatched, in order.
+  /// See [`Dispatched`]; a routing test reads this because a service event is no
+  /// longer observable from outside. Absent from a shipped build, and gated with
+  /// the record it holds.
+  #[cfg(all(test, feature = "std", feature = "slab"))]
+  pub(crate) dispatched: std::vec::Vec<Dispatched>,
+  /// Scratch for the instance names a rename must avoid, refilled from the route
+  /// table on the ticks a rename is actually imminent.
+  ///
+  /// Held on the endpoint rather than allocated per rename because the route
+  /// holding the renaming `Service` is mutably borrowed while the rename runs,
+  /// so the names have to be collected first — and a conflict flood is exactly
+  /// when a fresh allocation per tick is least welcome.
+  #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+  rename_scratch: std::vec::Vec<Name>,
   /// In-progress withdrawal items, keyed by an opaque [`WithdrawalToken`].  Each
   /// entry is ONE name's TTL=0 goodbye lifecycle; a route-attached item keeps its
   /// route in `self.services` alive until the goodbye sequence completes (so the
   /// name guard continues to reject same-name re-registration).
   ///
   /// Stored as a `Vec` rather than as an inline field on [`ServiceRoute`]
-  /// because `ServiceRoute` is non-generic (adding `I` there would require
-  /// updating every `Pool<ServiceRoute>` / `Slab<ServiceRoute>` site across
-  /// the whole workspace, including external users).
+  /// because an item need not have a route: a rename's detached old-name goodbye
+  /// holds none, and a teardown mid-rename owes two items for one route.
   #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
   withdrawals: std::vec::Vec<(WithdrawalToken, WithdrawalItem<I>)>,
   /// Monotonic source of [`WithdrawalToken`] values. Incremented on every item
@@ -636,10 +804,9 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   /// [`EndpointConfig::relinquished_retention`](crate::EndpointConfig::relinquished_retention)
   /// for how long a row lives.
   ///
-  /// A `Vec` for the same reason [`Self::withdrawals`] is one: [`ServiceRoute`]
-  /// is non-generic public API, so state that needs the endpoint's `I` cannot be
-  /// hung off it without adding a parameter to every downstream
-  /// `Pool<ServiceRoute>` declaration.
+  /// A `Vec` for the same reason [`Self::withdrawals`] is one: what it records
+  /// OUTLIVES the route that asserted it — that is the whole point of a
+  /// relinquishment — so it cannot be hung off a route at all.
   #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
   relinquished: std::vec::Vec<Relinquished<I>>,
   /// The COMPACT tier of the same screen: the record IDENTITIES of
@@ -666,19 +833,21 @@ pub struct Endpoint<I, R, C, SR, QS, EV, AN, EvQ> {
   /// `cfg(test)`: it does not exist in a shipped build.
   #[cfg(all(test, feature = "std"))]
   pub(crate) query_resolve_stall: Option<core::time::Duration>,
-  _phantom: core::marker::PhantomData<(AN, EvQ)>,
+  _phantom: core::marker::PhantomData<(AN, EvQ, TQ, EvS)>,
 }
 
-impl<I, R, C, SR, QS, EV, AN, EvQ> Endpoint<I, R, C, SR, QS, EV, AN, EvQ>
+impl<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS> Endpoint<I, R, C, SR, QS, EV, AN, EvQ, TQ, EvS>
 where
   I: Instant,
   R: Rng,
   C: Pool<CacheEntry<I>>,
-  SR: Pool<ServiceRoute>,
+  SR: Pool<ServiceRoute<I, TQ, EvS>>,
   QS: Pool<Query<I, AN, EvQ>>,
   EV: Pool<EndpointEventEntry>,
   AN: Pool<CollectedAnswer>,
   EvQ: Pool<QueryUpdate>,
+  TQ: Pool<Transmit>,
+  EvS: Pool<ServiceUpdate>,
 {
   /// Build a new endpoint.
   pub fn try_new(config: EndpointConfig, mut rng: R) -> Self {
@@ -703,6 +872,13 @@ where
       next_query_handle: 0,
       next_txid,
       datagram_seq: 0,
+      flood: ConflictFlood::new(),
+      #[cfg(test)]
+      history_screens: 0,
+      #[cfg(all(test, feature = "std", feature = "slab"))]
+      dispatched: std::vec::Vec::new(),
+      #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
+      rename_scratch: std::vec::Vec::new(),
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
       withdrawals: std::vec::Vec::new(),
       #[cfg(any(feature = "alloc", feature = "std", feature = "no-atomic"))]
