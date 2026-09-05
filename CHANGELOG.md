@@ -81,7 +81,7 @@
   no-goodbye primitive is renamed `force_remove_service(handle, now)`, taking its
   own snapshot rather than an `asserted` argument. `Endpoint::begin_withdrawal`
   and `Endpoint::enqueue_rename_withdrawal` are crate-internal, as are
-  `Service::{handle_event, handle_timeout, poll, poll_transmit,
+  `Service::{handle_event, handle_timeout, poll, poll_timeout, poll_transmit,
   note_transmit_outcome, withdrawal_snapshot, take_rename_goodbye_handoff}` and
   the `WithdrawalSnapshot` / `RenameGoodbyeHandoff` types.
 - `mdns-proto`: `Endpoint` gains two type parameters — `TQ: Pool<Transmit>` and

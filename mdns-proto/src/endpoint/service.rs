@@ -384,13 +384,30 @@ where
 
   /// A READ-ONLY view of a registered service's state machine.
   ///
-  /// Everything a caller needs to observe — [`Service::name`],
-  /// [`Service::state`], [`Service::has_fully_announced`],
-  /// [`Service::advertised_a_addrs`], [`Service::advertised_aaaa_addrs`] — and
-  /// nothing that mutates. Every state-mutating entry point is a `*_service*`
-  /// method on `Endpoint`, because each of them has to be paired with something
-  /// the endpoint owns: the flood history, the route table's names, or the
-  /// withdrawal lifecycle.
+  /// Everything a caller needs to observe — [`Service::handle`],
+  /// [`Service::name`], [`Service::records`], [`Service::state`],
+  /// [`Service::advertises_host`], [`Service::advertises_instance`],
+  /// [`Service::has_fully_announced`], [`Service::advertised_a_addrs`],
+  /// [`Service::advertised_aaaa_addrs`] — and nothing that mutates. Every
+  /// state-mutating entry point is a `*_service*` method on `Endpoint`, because
+  /// each of them has to be paired with something the endpoint owns: the flood
+  /// history, the route table's names, or the withdrawal lifecycle.
+  ///
+  /// # `&self` is not the whole test: a SCHEDULE is not an observation
+  ///
+  /// This view is open for a WITHDRAWING route as well, so every method reached
+  /// through it must be harmless for one — and "harmless" is not the same as
+  /// "does not mutate". A reader that reports a DEADLINE is a caller's
+  /// instruction to come back and drive, and driving a withdrawing service is
+  /// exactly what [`Self::poll_service_timeout`] refuses. `Service::poll_timeout`
+  /// was `pub` and reported a quiesced Init/probing service as due immediately —
+  /// its deadlines and queues are cleared, which is what a parked startup
+  /// sequence looks like — so a driver following it busy-woke forever on a
+  /// service the endpoint would not tick, and starved the §10.1 goodbye that
+  /// frees the route. It is crate-private now, and the endpoint's gate is the
+  /// only door. The methods listed above report what this record set IS and what
+  /// it has already put in peer caches; none of them names an instant, and every
+  /// one of them stays true and useful while the goodbye drains.
   ///
   /// `None` for a handle whose route has been freed.
   #[inline]

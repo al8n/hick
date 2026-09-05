@@ -2601,7 +2601,22 @@ where
   /// This is the minimum of `lifecycle_deadline` and `response_deadline`
   /// (either or both may be `None`). The caller should drive `handle_timeout`
   /// when this instant is reached.
-  pub fn poll_timeout(&self) -> Option<I> {
+  ///
+  /// # Crate-private: the WITHDRAWAL gate is on the endpoint
+  ///
+  /// `Endpoint::poll_service_timeout` reports no deadline for a route whose
+  /// §10.1 goodbye is in flight, because the state machine behind it is retired
+  /// and only the endpoint's own withdrawal item may still put anything on a
+  /// link. This method cannot know that — it sees a `Service`, not a route — and
+  /// while it was `pub` a caller holding the `&Service` from
+  /// `Endpoint::service` could reach past that gate. It reported a withdrawing
+  /// Init/probing service as due IMMEDIATELY, too: quiescing clears its
+  /// deadlines and queues, which is exactly [`Self::startup_parked`], so the
+  /// stale `last_now` came back on every poll while endpoint-side timeout
+  /// handling was inert — a driver following the public API busy-woke forever
+  /// and starved the goodbye that frees the route. Public plus a stale deadline
+  /// is not inert. One door in, and it is the endpoint's.
+  pub(crate) fn poll_timeout(&self) -> Option<I> {
     // a queued legacy unicast response is due immediately (no jitter).
     if !self.pending_legacy.is_empty() {
       return self.last_now;
