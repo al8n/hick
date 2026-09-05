@@ -1,5 +1,22 @@
 # UNRELEASED
 
+## §8.1's five seconds now run from the instant the limit ENGAGED
+
+- `mdns-proto`: the floor was anchored to the probe sequence's own start alone,
+  so it could already be in the past when the limit latched. Fourteen conflicts
+  at `T`, a record set registered at `T` with its first probe queued, and the
+  fifteenth conflict at `T + 6 s`: the limit was in force, but that sequence's
+  floor was `T + 5 s`, so the probe went straight out on the poll that read the
+  latch — and every service whose sequence had begun more than five seconds
+  earlier burst through together at that instant, on an ordinary monotonic
+  clock. §8.1 owes the wait "before each successive additional probe attempt"
+  from when the condition started holding, so the endpoint now records the
+  instant the latch transitions false→true and every floor is
+  `max(sequence start, latch epoch) + 5 s`. The epoch moves only on that
+  transition, so the floor stays absolute within one latch episode — a flood
+  still cannot push a probe out indefinitely, and buying another five seconds
+  costs an attacker fifteen fresh conflicts.
+
 ## §8.1's flood window no longer disagrees with itself at exactly ten seconds
 
 - `mdns-proto`: the ring's two comparisons answered opposite questions about the

@@ -1293,12 +1293,14 @@ cfg_heap! {
   /// When the CURRENT RFC 6762 §8 startup sequence began — set at construction
   /// and re-set by every regress that starts a fresh one.
   ///
-  /// It anchors §8.1's five-second flood floor, and it is anchored to the
-  /// SEQUENCE rather than re-derived from each tick's `now` because the floor is
-  /// re-evaluated at more than one point. A relative `now + 5 s` re-applied at
-  /// the commit point would push the probe five seconds further out every time
-  /// it was consulted; an absolute `start + 5 s` converges — once `now` has
-  /// reached it the wait is served, so it costs at most one re-arm per arm.
+  /// It is one of the two anchors under §8.1's five-second flood floor — the
+  /// other being the instant the limit engaged, whichever is LATER — and it is
+  /// a fact about the SEQUENCE rather than each tick's `now` because the floor
+  /// is re-evaluated at more than one point. A relative `now + 5 s` re-applied
+  /// at the commit point would push the probe five seconds further out every
+  /// time it was consulted; an absolute floor converges — once `now` has reached
+  /// it the wait is served, so it costs at most one re-arm per arm. See
+  /// [`Service::backoff_floor`].
   sequence_started_at: I,
   /// RFC 6762 §8.1 count eligibility for ONE received datagram, captured at the
   /// first conflict that datagram produces: `(which datagram, was this
@@ -1426,17 +1428,21 @@ where
     let (state, lifecycle_deadline) = if probe {
       let base = probe_deadline(now, 0, &mut rng);
       // The floor, applied at the one point a fresh sequence has: its start.
-      // `None` when the clock cannot express `now + 5 s` is the same fail-closed
+      // Anchored to the LATER of this sequence's start and the instant the limit
+      // engaged, which is the same anchor [`Service::backoff_floor`] uses
+      // everywhere else — here `now` is the sequence start, and a latch epoch
+      // ahead of it belongs to a caller reading on a stale instant.
+      // `None` when the clock cannot express that floor is the same fail-closed
       // answer the regress gives — every instant such a clock can name is sooner
       // than the wait §8.1 mandates, so there is no deadline this may arm. The
       // service is then parked in `Init`, and `handle_timeout`'s `Init`
       // re-schedule re-evaluates it on every tick.
-      let deadline = if flood.in_force(now) {
-        now
+      let deadline = match flood.latch_epoch(now) {
+        Some(epoch) => now
+          .max(epoch)
           .checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)
-          .map(|floor| base.map_or(floor, |d| d.max(floor)))
-      } else {
-        base
+          .map(|floor| base.map_or(floor, |d| d.max(floor))),
+        None => base,
       };
       (ServiceState::Init, deadline)
     } else {
@@ -2967,8 +2973,8 @@ where
   ///   sequence's `sequence_started_at` and anchors the deadline arithmetic,
   ///   including §8.1's five-second floor.
   /// * `deadline` — when the fresh §8.1 sequence may begin, IF the flood limit
-  ///   is not in force; when it is, the later of this and `now +
-  ///   CONFLICT_BACKOFF_MIN_WAIT`. §9 and a rename pass the randomized
+  ///   is not in force; when it is, the later of this and
+  ///   [`Service::backoff_floor`]. §9 and a rename pass the randomized
   ///   `probe_deadline`; §8.2's loser passes `now + TIEBREAK_DEFER_WAIT`, which
   ///   is the one second it "defers to the winning host by waiting".
   /// * `renamed_from` — `Some(old records)` ONLY when the name is changing, so a
@@ -3042,29 +3048,64 @@ where
     self.sequence_started_at = now;
     self.lifecycle_deadline = self.apply_backoff_floor(now, deadline, flood);
     #[cfg(debug_assertions)]
-    self.assert_generation_replaced();
+    self.assert_generation_replaced(now, flood);
     if self.lifecycle_deadline.is_none() {
       return Err(HandleTimeoutError::Overflow);
     }
     Ok(())
   }
 
+  /// The instant RFC 6762 §8.1's five-second wait expires for this service's
+  /// current probe sequence, or `None` when this clock cannot represent it.
+  ///
+  /// # Two anchors, and the LATER one wins
+  ///
+  /// §8.1 owes its wait "before each successive additional probe attempt" from
+  /// the moment fifteen conflicts have fallen inside ten seconds, so the wait is
+  /// measured from the LATCH — while the sequence's own start is what keeps the
+  /// floor from moving once a sequence is already waiting. Taking the maximum
+  /// honours both: a sequence that started after the latch waits five seconds
+  /// from its own start, and one that started long before it waits five seconds
+  /// from the latch instead of clearing a floor already in the past. Anchoring
+  /// on `sequence_started_at` alone was the defect — fourteen conflicts, a
+  /// registration, then the fifteenth conflict six seconds later, and the
+  /// service's floor had expired before the limit even engaged.
+  ///
+  /// Both anchors are instants already past, never `now`, so the floor is
+  /// ABSOLUTE: it is the same answer at every read within one latch episode and
+  /// the schedule converges on it, where a floor re-derived from `now` would
+  /// push the probe five seconds further out at every poll and a service under a
+  /// persistent flood would never probe at all. See
+  /// [`ConflictFlood::latch_epoch`] for why the epoch itself cannot be pushed.
+  ///
+  /// With the limit NOT in force the sequence's own start is the anchor, which
+  /// is the arithmetic the ordinary schedule already uses; the callers that
+  /// enforce the floor all gate on the verdict first, and the one caller that
+  /// does not is asking only whether the floor is REPRESENTABLE.
+  fn backoff_floor(&self, now: I, flood: &ConflictFlood<I>) -> Option<I> {
+    let anchor = match flood.latch_epoch(now) {
+      Some(epoch) if epoch > self.sequence_started_at => epoch,
+      _ => self.sequence_started_at,
+    };
+    anchor.checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)
+  }
+
   /// Raise a sequence's start time to RFC 6762 §8.1's five-second floor when the
   /// endpoint's flood limit is in force — and arm NOTHING when the clock cannot
   /// represent that floor.
   ///
-  /// # An ABSOLUTE floor, anchored to the sequence
+  /// # An ABSOLUTE floor
   ///
-  /// The floor is `sequence_started_at + CONFLICT_BACKOFF_MIN_WAIT`, not
-  /// `now + CONFLICT_BACKOFF_MIN_WAIT`, because this is consulted at more than
-  /// one instant in one sequence: the regress that starts it, and again at the
-  /// commit point where the first probe would go out. A relative floor
-  /// re-evaluated at the second point would push the probe five seconds further
-  /// out every time it was consulted, so a service whose flood never quite stops
-  /// would never probe at all. An absolute one converges — once `now` has
-  /// reached it the wait is served and the deadline passes through untouched —
-  /// which bounds the deferral to one re-arm per arm. At the regress the two
-  /// agree, because the regress sets `sequence_started_at = now` first.
+  /// The floor is [`Service::backoff_floor`] — the later of this sequence's
+  /// start and the instant the limit engaged, plus
+  /// [`CONFLICT_BACKOFF_MIN_WAIT`] — and never `now + …`, because this is
+  /// consulted at more than one instant in one sequence: the regress that starts
+  /// it, and again at the commit point where the first probe would go out. A
+  /// relative floor re-evaluated at the second point would push the probe five
+  /// seconds further out every time it was consulted, so a service whose flood
+  /// never quite stops would never probe at all. An absolute one converges —
+  /// once `now` has reached it the wait is served and the deadline passes
+  /// through untouched — which bounds the deferral to one re-arm per arm.
   ///
   /// # Failing closed is the whole of the overflow rule
   ///
@@ -3103,9 +3144,7 @@ where
     if !flood.in_force(now) {
       return deadline;
     }
-    let floor = self
-      .sequence_started_at
-      .checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)?;
+    let floor = self.backoff_floor(now, flood)?;
     Some(match deadline {
       Some(d) => d.max(floor),
       // Unreachable while every caller's own wait is shorter than the floor —
@@ -3156,8 +3195,8 @@ where
   ///
   /// Only while `!probe_on_wire`: §8.1 spaces the START of each successive probe
   /// SEQUENCE, not the packets inside one already committed to. The floor is
-  /// `sequence_started_at + CONFLICT_BACKOFF_MIN_WAIT`, never `now + …`,
-  /// because this point is reached repeatedly while the limit holds — a relative
+  /// [`Service::backoff_floor`] — instants already past, never `now + …` —
+  /// because this point is reached repeatedly while the limit holds: a relative
   /// floor re-derived here would push the probe five seconds further out at
   /// every poll and a service under a persistent flood would never probe at all.
   /// An absolute one converges: once `now` has reached it the wait is served and
@@ -3199,10 +3238,7 @@ where
     {
       return;
     }
-    match self
-      .sequence_started_at
-      .checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)
-    {
+    match self.backoff_floor(now, flood) {
       Some(floor) if floor > now => {
         let _ = self.pop_pending();
         self.lifecycle_deadline = Some(floor);
@@ -3210,7 +3246,7 @@ where
           target: "mdns_proto::service",
           handle = self.handle.raw(),
           "service: §8.1 flood limit latched after this probe was queued — \
-           dropping it and re-arming to the sequence's five-second floor"
+           dropping it and re-arming to the five-second floor"
         );
       }
       // The wait has been served: the probe goes out on this poll.
@@ -3280,7 +3316,7 @@ where
   /// nothing for them. `cargo test` builds with debug assertions on, so every
   /// test that drives any regress path checks the whole set.
   #[cfg(debug_assertions)]
-  fn assert_generation_replaced(&self) {
+  fn assert_generation_replaced(&self, now: I, flood: &ConflictFlood<I>) {
     debug_assert_eq!(self.state, ServiceState::Init, "regress: state");
     debug_assert_eq!(self.probe_count, 0, "regress: probe_count");
     debug_assert_eq!(self.announce_count, 0, "regress: announce_count");
@@ -3309,11 +3345,7 @@ where
       "regress: a live commit token still carries lifecycle meaning"
     );
     debug_assert!(
-      self.lifecycle_deadline.is_some()
-        || self
-          .sequence_started_at
-          .checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)
-          .is_none(),
+      self.lifecycle_deadline.is_some() || self.backoff_floor(now, flood).is_none(),
       "regress: no lifecycle deadline"
     );
   }
@@ -4842,10 +4874,7 @@ where
       && self.lifecycle_deadline.is_some_and(|due| now >= due)
       && flood.in_force(now)
     {
-      match self
-        .sequence_started_at
-        .checked_add_duration(CONFLICT_BACKOFF_MIN_WAIT)
-      {
+      match self.backoff_floor(now, flood) {
         // Re-armed to the ABSOLUTE floor and NOTHING is enqueued. Absolute, so
         // this costs one re-arm per arm rather than sliding the probe forward
         // every tick the limit stays in force.

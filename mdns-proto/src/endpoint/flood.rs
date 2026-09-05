@@ -56,8 +56,8 @@ pub(crate) const CONFLICT_BACKOFF_MIN_WAIT: core::time::Duration =
 /// endpoint owning every `Service` is that the ring, the classification that
 /// feeds it and the schedule that reads it happen in one borrow at one `now`.
 ///
-/// [`Self::accept`] is the only writer and [`Self::in_force`] the only reader,
-/// and the latter re-derives the verdict at every read — so no reader can see a
+/// [`Self::accept`] is the only writer and [`Self::latch_epoch`] the only reader
+/// of the verdict, and the latter re-derives it at every read — so no reader can see a
 /// latch that a quiet window has already released, and there is no separate
 /// release deadline to arm, miss or leave stale.
 pub(crate) struct ConflictFlood<I> {
@@ -73,7 +73,8 @@ pub(crate) struct ConflictFlood<I> {
   /// Once the ring has filled, that same slot holds its OLDEST entry — the
   /// fifteenth-most-recent conflict, which is the one §8.1's test reads.
   slot: usize,
-  /// Whether fifteen accepted conflicts have fallen inside one window.
+  /// When fifteen accepted conflicts first fell inside one window — the instant
+  /// §8.1's limit ENGAGED — and `None` while it has not.
   ///
   /// LATCHED rather than recomputed from the ring's span alone, and that is the
   /// whole point. Once the limit spaces probes five seconds apart, conflicts can
@@ -84,8 +85,34 @@ pub(crate) struct ConflictFlood<I> {
   /// every one of them, not the next.
   ///
   /// It is released by the flood STOPPING and by nothing else — see
-  /// [`Self::in_force`], which is where the release is decided.
-  latched: bool,
+  /// [`Self::latch_epoch`], which is where the release is decided.
+  ///
+  /// # Why an INSTANT and not a flag: the five seconds start HERE
+  ///
+  /// §8.1 puts its wait before "each successive additional probe attempt" once
+  /// the condition holds, so the wait runs from the moment the condition STARTED
+  /// holding. A floor anchored to a probe sequence's own start alone is already
+  /// in the PAST whenever that sequence began more than
+  /// [`CONFLICT_BACKOFF_MIN_WAIT`] before the fifteenth conflict landed: a
+  /// service registered at `T` with the latch engaging at `T + 6 s` clears a
+  /// `T + 5 s` floor on the very poll the limit engaged, and every service older
+  /// than five seconds bursts through together at that instant. Readers
+  /// therefore anchor to
+  /// `max(sequence start, latch epoch) + CONFLICT_BACKOFF_MIN_WAIT`.
+  ///
+  /// # Why that is still a floor a flood cannot push
+  ///
+  /// This is written ONLY on a false→true transition, never re-stamped by a
+  /// conflict arriving while it already holds. Within one latch episode it is
+  /// fixed, which keeps the floor ABSOLUTE — the property the sequence anchor
+  /// was bought for. A floor re-derived from `now`, or re-anchored to the newest
+  /// conflict, would slide five seconds further out at every read, and a service
+  /// under a persistent flood would never probe at all. This epoch moves again
+  /// only after the flood has stopped for a whole [`CONFLICT_BURST_WINDOW`] and
+  /// a fresh fifteen-in-ten burst has re-engaged the limit, so postponing one
+  /// probe by another five seconds costs an attacker fifteen new conflicts —
+  /// which is the throttle §8.1 asks for rather than a way around it.
+  latched_at: Option<I>,
   /// The datagram [`Self::accepted`] describes, or `None` before the first
   /// conflict. A different id empties `accepted`, so the dedupe set never
   /// outlives the datagram it is about.
@@ -116,7 +143,7 @@ impl<I: Copy> ConflictFlood<I> {
     Self {
       ring: [None; CONFLICT_BURST_LEN],
       slot: 0,
-      latched: false,
+      latched_at: None,
       datagram: None,
       accepted: std::vec::Vec::new(),
     }
@@ -184,7 +211,7 @@ impl<I: Instant> ConflictFlood<I> {
     {
       self.ring = [None; CONFLICT_BURST_LEN];
       self.slot = 0;
-      self.latched = false;
+      self.latched_at = None;
     }
     if let Some(slot) = self.ring.get_mut(self.slot) {
       *slot = Some(now);
@@ -198,8 +225,12 @@ impl<I: Instant> ConflictFlood<I> {
       && now
         .checked_duration_since(oldest)
         .is_some_and(|span| span <= CONFLICT_BURST_WINDOW)
+      // Stamped on the false→true transition ONLY. A conflict arriving while the
+      // limit already holds must not move the epoch, or the wait it anchors
+      // would slide forward with every packet the flood sends.
+      && self.latched_at.is_none()
     {
-      self.latched = true;
+      self.latched_at = Some(now);
     }
     true
   }
@@ -216,7 +247,8 @@ impl<I: Instant> ConflictFlood<I> {
     self.ring.iter().flatten().count()
   }
 
-  /// Is §8.1's five-second floor in force at `now`?
+  /// The instant §8.1's five-second floor ENGAGED, or `None` if it is not in
+  /// force at `now`.
   ///
   /// RE-DERIVED AT EVERY READ, which is what makes the release need no schedule.
   /// The latch is spent only by the flood stopping — a whole
@@ -231,6 +263,16 @@ impl<I: Instant> ConflictFlood<I> {
   /// is the loop being throttled, so resetting on a rename is the one reset that
   /// would defeat the limit.
   ///
+  /// # The epoch is HALF of the floor a caller then arms
+  ///
+  /// The wait §8.1 mandates runs from here, not from whenever the sequence being
+  /// spaced out happened to start, so a caller floors at
+  /// `max(sequence start, this) + CONFLICT_BACKOFF_MIN_WAIT`. See
+  /// [`Self::latched_at`] for why anchoring on the sequence alone let every
+  /// service older than five seconds through the moment the limit engaged, and
+  /// for why an epoch that moves only on a false→true transition keeps the floor
+  /// absolute.
+  ///
   /// # A `now` that precedes the newest entry FAILS CLOSED
   ///
   /// When the elapsed span cannot be computed because `now` is earlier than the
@@ -239,10 +281,10 @@ impl<I: Instant> ConflictFlood<I> {
   /// failing open puts a probe on the wire inside the five seconds §8.1 says the
   /// host MUST wait, while failing closed costs one probe a delay of at most
   /// [`CONFLICT_BACKOFF_MIN_WAIT`]. The floor a caller then arms is ABSOLUTE —
-  /// `sequence_started_at + 5 s`, not `now + 5 s` — so it converges instead of
-  /// sliding, and the next read taken at or after the newest entry either serves
-  /// the wait or finds the latch released. A rate limit is the one place where
-  /// an unreadable clock belongs on the restrictive side.
+  /// anchored to instants already past, not to `now` — so it converges instead
+  /// of sliding, and the next read taken at or after the newest entry either
+  /// serves the wait or finds the latch released. A rate limit is the one place
+  /// where an unreadable clock belongs on the restrictive side.
   ///
   /// This is not a hypothetical clock fault. [`Instant`] is monotonic, but
   /// nothing obliges a driver to weigh a decision against the SAME reading it
@@ -250,25 +292,38 @@ impl<I: Instant> ConflictFlood<I> {
   /// then counts the fifteenth conflict of a burst at a later, per-datagram
   /// reading hands this method an instant its own ring already sits ahead of, on
   /// ordinary traffic. That is a defect in the driver and it is fixed there, but
-  /// it must not be able to spend the MUST on its way past.
+  /// it must not be able to spend the MUST on its way past. Such a reader is
+  /// held to the EPOCH, which is later than its own `now`, so the fail-closed
+  /// verdict actually costs it the wait rather than a floor it has already
+  /// passed.
   ///
   /// No conflict recorded AT ALL is a different question and still answers NOT
   /// in force: there is no entry for `now` to precede, and nothing the limit
   /// could be spacing out.
-  pub(crate) fn in_force(&self, now: I) -> bool {
-    self.latched
-      && self.newest().is_some_and(|newest| {
+  pub(crate) fn latch_epoch(&self, now: I) -> Option<I> {
+    self.latched_at.filter(|_| {
+      self.newest().is_some_and(|newest| {
         now
           .checked_duration_since(newest)
           .is_none_or(|since| since <= CONFLICT_BURST_WINDOW)
       })
+    })
+  }
+
+  /// Is §8.1's five-second floor in force at `now`?
+  ///
+  /// The verdict alone, for the callers that only gate on it. Everything that
+  /// decides it — and the epoch the floor is measured from — is in
+  /// [`Self::latch_epoch`].
+  pub(crate) fn in_force(&self, now: I) -> bool {
+    self.latch_epoch(now).is_some()
   }
 }
 
 impl<I> core::fmt::Debug for ConflictFlood<I> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("ConflictFlood")
-      .field("latched", &self.latched)
+      .field("latched", &self.latched_at.is_some())
       .field("accepted", &self.accepted.len())
       .finish_non_exhaustive()
   }

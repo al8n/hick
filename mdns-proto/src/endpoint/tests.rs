@@ -14366,8 +14366,8 @@ fn the_endpoint_and_its_services_are_send_and_sync() {
 /// Fourteen is one short of RFC 6762 §8.1's threshold, so the limit is OFF while
 /// `b` registers and is scheduled: its first probe is armed at §8.1's ordinary
 /// 0-250 ms, exactly as it would be on a quiet endpoint. Returns the endpoint,
-/// `b`, the instant its probe is due, the absolute floor `b`'s sequence would
-/// owe if the limit engaged, and the rival's instance name.
+/// `b`, the instant `b`'s sequence started, the instant its probe is due, and
+/// the rival's instance name.
 fn queued_first_probe_fixture() -> (TestEndp, ServiceHandle, StdInstant, StdInstant, Name) {
   let mut e = build_endpoint();
   let now = StdInstant::now();
@@ -14403,9 +14403,7 @@ fn queued_first_probe_fixture() -> (TestEndp, ServiceHandle, StdInstant, StdInst
     e.handle_service_timeout(b, due).unwrap();
   }
   assert_eq!(svc_state(&e, b), crate::ServiceState::Probing(0));
-  // `sequence_started_at` is the registration instant, so this is the ABSOLUTE
-  // floor §8.1 owes this sequence.
-  (e, b, due, after(at, 5_000), rival)
+  (e, b, at, due, rival)
 }
 
 /// A first probe queued while RFC 6762 §8.1's limit was OFF must not reach the
@@ -14424,7 +14422,7 @@ fn a_queued_first_probe_is_held_by_a_latch_that_engaged_after_it_was_queued() {
   // Control: at fourteen the limit is off and the queued probe goes out at
   // once — which is what makes the arm below a statement about the fifteenth
   // conflict rather than about the fixture.
-  let (mut e, b, due, _floor, _rival) = queued_first_probe_fixture();
+  let (mut e, b, _at, due, _rival) = queued_first_probe_fixture();
   assert!(
     matches!(e.poll_service_transmit(b, due, &mut buf), Ok(Some(_))),
     "precondition: the first probe really is queued and otherwise due"
@@ -14432,21 +14430,24 @@ fn a_queued_first_probe_is_held_by_a_latch_that_engaged_after_it_was_queued() {
 
   // The fifteenth conflict — for the OTHER service — lands between the enqueue
   // and the poll.
-  let (mut e, b, due, floor, rival) = queued_first_probe_fixture();
+  let (mut e, b, _at, due, rival) = queued_first_probe_fixture();
   assert!(one_conflict(&mut e, &rival, due) >= 1);
+  // The wait runs from the LATCH, which is later than this sequence's start:
+  // §8.1 owes five seconds from the instant the limit engaged.
+  let floor = after(due, 5_000);
   assert!(
     matches!(e.poll_service_transmit(b, due, &mut buf), Ok(None)),
     "a probe queued before the latch engaged must not go out after it"
   );
 
-  // Held for the whole five seconds §8.1 owes the SEQUENCE, and re-armed to
+  // Held for the whole five seconds §8.1 owes from the latch, and re-armed to
   // that floor exactly: an absolute floor converges, where a relative one would
   // push the probe five seconds further out at every poll.
   let just_before = floor - core::time::Duration::from_millis(1);
   e.handle_service_timeout(b, just_before).unwrap();
   assert!(
     matches!(e.poll_service_transmit(b, just_before, &mut buf), Ok(None)),
-    "nothing goes out before the sequence start plus five seconds"
+    "nothing goes out before the latch plus five seconds"
   );
   assert_eq!(
     e.poll_service_timeout(b),
@@ -14460,6 +14461,184 @@ fn a_queued_first_probe_is_held_by_a_latch_that_engaged_after_it_was_queued() {
     matches!(e.poll_service_transmit(b, floor, &mut buf), Ok(Some(_))),
     "once the wait is served the probe goes out"
   );
+}
+
+/// RFC 6762 §8.1's five seconds run from the instant the LIMIT ENGAGED, so a
+/// probe sequence that began long before the latch is still held for the whole
+/// wait.
+///
+/// The sequence: fourteen conflicts standing, a record set registered at `T`
+/// whose first probe is queued at §8.1's ordinary 0-250 ms, and the fifteenth
+/// conflict at `T + 6 s`. Anchoring the floor on that sequence's own start puts
+/// it at `T + 5 s` — already in the PAST when the limit engaged — so the queued
+/// probe walked out on the very poll the latch was read, and every service whose
+/// sequence had begun more than five seconds earlier burst through together at
+/// that instant. Nothing about that needs a misbehaving clock: it is one
+/// ordinary monotonic timeline.
+///
+/// "The host MUST wait at least five seconds before each successive additional
+/// probe attempt" is owed from when the condition started holding, so the floor
+/// is `T + 11 s` and the boundary is checked on both sides of it.
+#[test]
+fn a_probe_queued_before_the_latch_waits_five_seconds_from_the_latch() {
+  let mut buf = std::vec![0u8; 4096];
+  let (mut e, b, at, _due, rival) = queued_first_probe_fixture();
+
+  // Six seconds of quiet: the sequence is older than the wait §8.1 mandates
+  // before the limit is in force at all, which is the whole shape of the defect.
+  let latched_at = after(at, 6_000);
+  assert!(
+    latched_at > after(at, 5_000),
+    "premise: this sequence's own five seconds are already past when the \
+     fifteenth conflict lands"
+  );
+  assert!(one_conflict(&mut e, &rival, latched_at) >= 1);
+
+  let floor = after(latched_at, 5_000);
+  assert!(
+    matches!(e.poll_service_transmit(b, latched_at, &mut buf), Ok(None)),
+    "the probe was queued before the latch engaged and may not go out on the \
+     poll that reads it — a floor anchored on the sequence alone had already \
+     expired and let it straight through"
+  );
+  assert_eq!(
+    e.poll_service_timeout(b),
+    Some(floor),
+    "and it is re-armed to the latch plus five seconds"
+  );
+
+  // The near side of the boundary.
+  let just_before = floor - core::time::Duration::from_millis(1);
+  e.handle_service_timeout(b, just_before).unwrap();
+  assert!(
+    matches!(e.poll_service_transmit(b, just_before, &mut buf), Ok(None)),
+    "nothing may reach a wire inside the five seconds"
+  );
+  assert_eq!(
+    e.poll_service_timeout(b),
+    Some(floor),
+    "the floor is ABSOLUTE: re-reading it inside the wait must not push it out \
+     again, or a service under a persistent flood would never probe at all"
+  );
+
+  // The far side: the floor is a wait, not a stall.
+  e.handle_service_timeout(b, floor).unwrap();
+  assert!(
+    matches!(e.poll_service_transmit(b, floor, &mut buf), Ok(Some(_))),
+    "once the wait is served the probe goes out"
+  );
+}
+
+/// The same five seconds, at the other site that enforces them: the SCHEDULE.
+///
+/// `handle_service_timeout` is where a due sequence is advanced and a probe
+/// enqueued, and it reads §8.1's verdict there for the same reason the wire
+/// boundary does. A sequence that started at `T` and a latch at `T + 6 s` left
+/// that check comparing `now` against `T + 5 s`, so it fell through, enqueued
+/// the probe, and the wire boundary — reading the same expired floor — passed it
+/// too. Both arms that can enqueue one are covered: `Init`, where the sequence
+/// is scheduled, and `Probing(0)`, where the probe is queued.
+#[test]
+fn a_sequence_older_than_the_wait_is_rescheduled_five_seconds_from_the_latch() {
+  let instance = Name::try_from_str("Rival._ipp._tcp.local.").unwrap();
+
+  for ticked_first in [0usize, 1] {
+    let mut e = build_endpoint();
+    let now = StdInstant::now();
+    let (_a, at) = flood_victim(
+      &mut e,
+      "Rival._ipp._tcp.local.",
+      "rival-h.local.",
+      Ipv4Addr::new(192, 168, 1, 5),
+      now,
+    );
+    conflicts_at(&mut e, &instance, at, 14);
+
+    let recs = ServiceRecords::new(
+      Name::try_from_str("_ipp._tcp.local.").unwrap(),
+      Name::try_from_str("Fresh._ipp._tcp.local.").unwrap(),
+      Name::try_from_str("fresh-host.local.").unwrap(),
+      631,
+      120,
+    );
+    let fresh = e
+      .try_register_service(ServiceSpec::new(recs), at)
+      .expect("registration must succeed");
+
+    let mut buf = std::vec![0u8; 4096];
+    let mut cur = e.poll_service_timeout(fresh).expect("Init is on a clock");
+    for _ in 0..ticked_first {
+      e.handle_service_timeout(fresh, cur).unwrap();
+      assert!(
+        matches!(e.poll_service_transmit(fresh, cur, &mut buf), Ok(None)),
+        "ticked_first={ticked_first}: `Init → Probing(0)` is a free step that \
+         emits nothing"
+      );
+      cur = e
+        .poll_service_timeout(fresh)
+        .expect("Probing(0) is on a clock")
+        .max(cur);
+    }
+    assert!(
+      cur < after(at, 5_000),
+      "ticked_first={ticked_first}: precondition: the sequence is scheduled at \
+       §8.1's ordinary startup delay, well inside its own five seconds"
+    );
+
+    // The limit engages six seconds after this sequence began, so its own floor
+    // is spent and the latch's is not.
+    let latched_at = after(at, 6_000);
+    assert!(one_conflict(&mut e, &instance, latched_at) >= 1);
+    let floor = after(latched_at, 5_000);
+
+    e.handle_service_timeout(fresh, latched_at).unwrap();
+    assert!(
+      matches!(e.poll_service_transmit(fresh, latched_at, &mut buf), Ok(None)),
+      "ticked_first={ticked_first}: a due sequence must not enqueue a probe on \
+       the tick the limit engaged"
+    );
+    assert_eq!(
+      e.poll_service_timeout(fresh),
+      Some(floor),
+      "ticked_first={ticked_first}: it is re-armed to the latch plus five \
+       seconds"
+    );
+
+    let just_before = floor - core::time::Duration::from_millis(1);
+    e.handle_service_timeout(fresh, just_before).unwrap();
+    assert!(
+      matches!(e.poll_service_transmit(fresh, just_before, &mut buf), Ok(None)),
+      "ticked_first={ticked_first}: nothing may reach a wire inside the five \
+       seconds"
+    );
+    assert_eq!(
+      e.poll_service_timeout(fresh),
+      Some(floor),
+      "ticked_first={ticked_first}: and the floor does not slide while it is \
+       being waited out"
+    );
+
+    let mut probed = false;
+    let mut cur = floor;
+    for _ in 0..8 {
+      e.handle_service_timeout(fresh, cur).unwrap();
+      while let Ok(Some(_)) = e.poll_service_transmit(fresh, cur, &mut buf) {
+        probed = true;
+        e.note_service_delivery(fresh, cur, TransmitDelivery::ALL);
+      }
+      if probed {
+        break;
+      }
+      cur = e
+        .poll_service_timeout(fresh)
+        .expect("still on a clock")
+        .max(cur);
+    }
+    assert!(
+      probed,
+      "ticked_first={ticked_first}: the floor is a wait, not a stall"
+    );
+  }
 }
 
 /// Unregistering makes an endpoint-owned service INERT at once, and the
