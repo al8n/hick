@@ -37,7 +37,7 @@ hick-trace.workspace = true
 mdns-proto.workspace = true
 defmt = { workspace = true, optional = true }
 rand_core.workspace = true
-smoltcp = { version = "0.13", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
   "medium-ethernet",
   "medium-ip",
   "proto-ipv4",
@@ -47,7 +47,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-smoltcp = { version = "0.13", default-features = false, features = ["alloc"] }
+smoltcp = { version = "0.14", default-features = false, features = ["alloc"] }
 rand = { workspace = true, features = [
   "std",
   "std_rng",
