@@ -409,7 +409,7 @@ jobs:
         # What bounds both is blast radius: `permissions: contents: read` and no
         # persisted credentials, so the worst case is a false green rather than
         # a write to the repository.
-        uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           # Must name a conf file bundled in the action: resolution is a literal
           # `conf/<release>.conf` lookup with no branch-to-latest step, so a
