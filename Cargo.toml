@@ -25,7 +25,7 @@ rand_core = { version = "0.10", default-features = false }
 smol_str = { version = "0.3", default-features = false }
 slab = { version = "0.4", default-features = false }
 futures = { version = "0.3", default-features = false }
-getifs = { version = "0.6" }
+getifs = { version = "0.7" }
 libc = { version = "0.2" }
 mio = { version = "1", default-features = false }
 tracing-core = { version = "0.1" }
